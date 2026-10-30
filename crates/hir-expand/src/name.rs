@@ -43,10 +43,7 @@ impl fmt::Debug for Name {
 impl Ord for Name {
     #[inline]
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.symbol == other.symbol {
-            return std::cmp::Ordering::Equal;
-        }
-        self.symbol.as_str().cmp(other.symbol.as_str())
+        self.symbol.cmp_order(&other.symbol)
     }
 }
 

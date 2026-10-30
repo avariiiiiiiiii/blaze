@@ -15,7 +15,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{
-        Budget, Counts, Key, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+        Budget, Counts, Key, NodeRef, Nodes, Plane, PlaneConfig, PlaneInput, PlaneOutput,
+        RequestId, RequestStats,
     },
     trace::{Trace, render},
 };
@@ -401,6 +402,130 @@ fn a_run_says_whether_it_is_on_the_critical_path() {
     close(&mut plane, 1);
     assert_eq!(critical(&built(&mut plane, 1)), [(2, false)]);
     assert_eq!(critical(&built(&mut plane, 3)), [(4, true)]);
+}
+
+/// Nodes as specs, the same nodes from `first` on.
+fn as_nodes(first: u32, specs: &[Spec]) -> Nodes {
+    let names = specs.iter().map(|it| it.name.len()).sum();
+    let deps = specs.iter().map(|it| it.deps.len()).sum();
+    let mut nodes = Nodes::with_capacity(NodeId(first), specs.len(), names, deps);
+    for spec in specs {
+        let id = nodes.push(NodeRef {
+            kind: spec.kind,
+            name: &spec.name,
+            deps: &spec.deps,
+            pool: spec.pool,
+            cost: spec.cost,
+            key: spec.key,
+            memory: spec.memory,
+        });
+        assert_eq!(id, spec.id);
+    }
+    nodes
+}
+
+/// Batches as columns say what the same batches as specs say, refusals too: deps out of
+/// order, cycles, unknown deps, ids given before, single flight and two requests.
+#[test]
+fn nodes_as_columns_say_what_nodes_as_specs_say() {
+    let kinds = [NodeKind::Codegen, NodeKind::Std, NodeKind::Link];
+    for seed in 0..300 {
+        let mut random = SplitMix(seed);
+        let config = config(1 + random.below(2) as usize, 1 + random.below(3) as usize);
+        let mut specs = Plane::new(config.clone()).unwrap();
+        let mut columns = Plane::new(config).unwrap();
+        let mut both = |input: PlaneInput, columns_input: PlaneInput| {
+            let said = specs.step(input);
+            assert_eq!(said, columns.step(columns_input), "seed {seed}");
+            said
+        };
+        for request in 1..=2 {
+            let id = RequestId(request);
+            let open = PlaneInput::Open { at_ns: 0, request: id, weight: request, keep_going: true };
+            both(open.clone(), open).unwrap();
+        }
+        let mut next = 1u32;
+        let mut known: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+        let mut running: Vec<u32> = Vec::new();
+        for step in 0..40u64 {
+            if running.is_empty() || random.one_in(2) {
+                let r = random.below(2) as usize;
+                // Now and then a run that starts on an id given before.
+                let first = if next > 1 && random.one_in(8) {
+                    1 + random.below(u64::from(next - 1)) as u32
+                } else {
+                    next
+                };
+                let count = 1 + random.below(6) as u32;
+                let batch: Vec<Spec> = (first..first + count)
+                    .map(|id| {
+                        let mut deps = Vec::new();
+                        for _ in 0..random.below(3) {
+                            let dep = match random.below(10) {
+                                0 => 1_000_000,
+                                1..=4 if !known[r].is_empty() => {
+                                    known[r][random.below(known[r].len() as u64) as usize]
+                                }
+                                _ => first + random.below(u64::from(count)) as u32,
+                            };
+                            if dep != id && !deps.contains(&dep) {
+                                deps.push(dep);
+                            }
+                        }
+                        let key = random.one_in(3).then(|| key(random.below(4) as u8));
+                        let pool = if random.one_in(4) { Pool::Io } else { Pool::Work };
+                        let mut spec = node(id, &deps, pool, random.below(50), key, 0);
+                        spec.kind = kinds[random.below(3) as usize];
+                        spec.name = format!("{}é{id}", "x".repeat(random.below(4) as usize));
+                        spec
+                    })
+                    .collect();
+                let request = RequestId(r as u32 + 1);
+                let nodes = as_nodes(first, &batch);
+                let said = both(
+                    PlaneInput::Add { at_ns: step, request, nodes: batch },
+                    PlaneInput::AddNodes { at_ns: step, request, nodes },
+                );
+                if let Ok(out) = said {
+                    known[r].extend(first..first + count);
+                    next = next.max(first + count);
+                    running.extend(runs(&out));
+                }
+            } else {
+                let id = running.swap_remove(random.below(running.len() as u64) as usize);
+                let outcome = if random.one_in(5) {
+                    Outcome::Failed { why: "no".to_owned() }
+                } else {
+                    Outcome::Built
+                };
+                let out =
+                    both(done(id, outcome.clone(), Vec::new()), done(id, outcome, Vec::new()))
+                        .unwrap();
+                running.extend(runs(&out));
+            }
+        }
+    }
+}
+
+/// A trace holds nodes as columns and gives back the same; columns that disagree are refused.
+#[test]
+fn nodes_read_from_a_trace_are_checked() {
+    let nodes = as_nodes(7, &[work(7, &[], 1), work(8, &[7], 2), keyed(9, &[7, 8], 3, 1)]);
+    let json = serde_json::to_value(&nodes).unwrap();
+    assert_eq!(serde_json::from_value::<Nodes>(json.clone()).unwrap(), nodes);
+    let broken = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut it = json.clone();
+        edit(&mut it);
+        serde_json::from_value::<Nodes>(it).unwrap_err().to_string()
+    };
+    let refused = broken(&|it| it["costs"].as_array_mut().unwrap().truncate(2));
+    assert!(refused.contains("3 nodes but 2 costs"), "{refused}");
+    let refused = broken(&|it| it["deps_at"][1] = 3.into());
+    assert!(refused.contains("deps_at goes back"), "{refused}");
+    let refused = broken(&|it| it["name_at"].as_array_mut().unwrap().pop().map(drop).unwrap());
+    assert!(refused.contains("name_at of 3 offsets"), "{refused}");
+    let refused = broken(&|it| it["first"] = u32::MAX.into());
+    assert!(refused.contains("past u32"), "{refused}");
 }
 
 /// The plane keeps no results of its own: without a database a key done before runs again.

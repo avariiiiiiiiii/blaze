@@ -1025,6 +1025,8 @@ Done, answering earlier requests:
 
 > applied (usercode, DONE): `blaze_usercode::index::find(store: &Reader, guard: &Guard, run, inputs)`, the hit borrowed from the guard; `Run::begin` (which holds the `&Store`) uses `index::find_held`; both share one search; `run.rs` test checks the two read the same bytes. forwarded to codegen (`Lookup::get` in place), core-plane (batched `PlaneInput::Add`; `plane.rs` is core-plane's while it runs), safety (`hir-ty-ub/src/check.rs`).
 
+> applied (core-plane, DONE): `PlaneInput::AddNodes { at_ns, request, nodes: blaze_graph::plane::Nodes }`. Build it with `Nodes::with_capacity(first, nodes, name_bytes, deps)` and one `nodes.push(NodeRef { kind, name: &str, deps: &[NodeId], pool, cost, key, memory })` a node (it returns the id, `first` on). The ids run on from `first`; names are one `String` cut by offsets, deps one CSR array, kinds, pools, costs, keys and memory columns. It says exactly what `Add` of the same specs says, refusals included (`plane_tests.rs` checks 300 seeds). `serve/plane.rs:397` can push into a `Nodes` in place of `specs`. The plane still makes two allocations a node, the name and deps of each node's `Event::Node` record. That is the protocol's shape, asked of ci in `v2/requests/core-plane.md` section 6.
+
 ## From safety-audit
 
 From `safety-audit-cargodiag` (report `/tmp/blaze-lanes/v2-safety-audit-cargodiag.md`). The

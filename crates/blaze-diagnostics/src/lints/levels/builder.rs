@@ -34,12 +34,24 @@ use crate::{
 /// Where rustc's walk of the crate comes to a node: [`attrs::place`].
 type Place = Vec<(u32, u32)>;
 
+/// Which of rustc's builders gives a diagnostic of lint levels. Each says what is wrong on the
+/// command line; the pre-expansion one and the early one also say what is wrong with an
+/// attribute that is not a lint (E0452, E0710), the pre-expansion one only of the crate's
+/// root file as parsed; only the early one gives the lints of the attributes
+/// (`lint_added_lints`). Written in full (`-Z deduplicate-diagnostics=no`), each is a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum When {
+    /// rustc's pre-expansion lint pass, after the parser.
+    Pre,
+    /// The early lint pass, after resolution, as it comes to the node.
+    Early,
+    /// The HIR's levels of the crate's root, first asked for as the analysis starts.
+    Hir,
+}
+
 /// A diagnostic of lint levels, and when rustc gives it.
 pub(super) struct Emitted {
-    /// Whether rustc's pre-expansion lint pass gives it, which runs on the crate's root file
-    /// as parsed: the command line's and the malformed attributes of that file. The rest come
-    /// as the early lint pass comes to them.
-    pub(super) pre: bool,
+    pub(super) when: When,
     /// Where the walk of the crate comes to the node; nothing for the command line's.
     pub(super) place: Place,
     pub(super) diag: Diag,
@@ -93,12 +105,12 @@ pub(super) struct Levels {
 const _: () = assert!(size_of::<(InFile<SyntaxNodePtr>, SetId)>() <= 28);
 
 impl Levels {
-    /// The builder with the command line's levels (rustc's `add_command_line`), and what the
-    /// early one says of the names on it.
-    pub(super) fn new(sh: &mut Shared<'_, '_, '_>, early: bool) -> Levels {
+    /// The builder with the command line's levels (rustc's `add_command_line`), and, when it
+    /// `speaks`, what it says of the names on it; one that does not is for levels alone.
+    pub(super) fn new(sh: &mut Shared<'_, '_, '_>, early: bool, speaks: bool) -> Levels {
         let mut levels = Levels {
             early,
-            walking: true,
+            walking: speaks,
             start: vec![0],
             parent: vec![NO_SET],
             ids: Vec::with_capacity(sh.cmd.opts.len()),
@@ -110,17 +122,17 @@ impl Levels {
         };
         let cmd = sh.cmd;
         for (name, level) in &cmd.opts {
-            levels.command_line(sh, name, *level);
+            levels.command_line(sh, name, *level, speaks);
         }
         levels
     }
 
-    fn command_line(&mut self, sh: &mut Shared<'_, '_, '_>, name: &str, level: Level) {
+    fn command_line(&mut self, sh: &mut Shared<'_, '_, '_>, name: &str, level: Level, speaks: bool) {
         let (tool, only) = match name.split_once("::") {
             Some((tool, only)) => (Some(tool), only),
             None => (None, name),
         };
-        if self.early {
+        if speaks {
             let requested = format!("requested on the command line with `{} {name}`", level.to_cmd_flag());
             if only == "warnings" && level == Level::ForceWarn {
                 let mut diag = Diag::new(
@@ -263,21 +275,21 @@ impl Levels {
     /// rustc's `add`: the attributes of one node.
     fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, node: &InFile<SyntaxNode>, reads: Vec<Read>, is_crate: bool) {
         let says = self.early && self.walking;
-        let pre = node.file_id == sh.root;
+        let in_root = node.file_id == sh.root;
         let cx = sh.cx;
         let file = node.file_id;
         let span = |range: TextRange| cx.span(InFile::new(file, range));
         let mut known: Option<Place> = None;
         let mut place = || known.get_or_insert_with(|| attrs::place(cx.sema, node)).clone();
         for read in reads {
-            let (level, mut items) = match read {
+            let (level, mut items, pre) = match read {
                 Read::Allows(name) => {
                     let lint = registry::lint(name).unwrap_or_else(|| panic!("no lint `{name}`"));
                     let spec = Spec { level: Level::Allow, expect: None, source: SourceId::DEFAULT };
                     self.insert(set, LintId::of(lint), spec);
                     continue;
                 }
-                Read::Level(level, items) => (level, items),
+                Read::Level(level, items, direct) => (level, items, in_root && direct),
             };
             let tail = match items.last() {
                 None => continue,
@@ -542,8 +554,18 @@ impl Levels {
         }
     }
 
+    /// `diag` as each builder rustc has for this one gives it: the HIR's once; the early
+    /// one's also as the pre-expansion pass when it is `pre`, of the command line or of the
+    /// root file as parsed.
     fn push(&mut self, pre: bool, place: Place, diag: Diag) {
-        self.emitted.push(Emitted { pre, place, diag });
+        if !self.early {
+            self.emitted.push(Emitted { when: When::Hir, place, diag });
+            return;
+        }
+        if pre {
+            self.emitted.push(Emitted { when: When::Pre, place: place.clone(), diag: diag.clone() });
+        }
+        self.emitted.push(Emitted { when: When::Early, place, diag });
     }
 
     /// The level of `lint` in `set`: rustc's `reveal_actual_level_spec`, with `warnings` and

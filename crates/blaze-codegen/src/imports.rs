@@ -11,9 +11,10 @@
 //! takes. Only the build's driver knows what code without a summary reaches, and says it
 //! ([`close`]).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::VecDeque;
 
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     InstanceKey,
@@ -98,7 +99,7 @@ impl std::error::Error for ImportError {}
 /// backend reaches. A summary is made external ([`Summary::external`] is a fact of the build,
 /// not of the function), so a build that does not close its summaries gets no whole-program
 /// facts, never wrong ones.
-pub fn close(summaries: &mut BTreeMap<InstanceKey, Summary>, outside: &BTreeSet<InstanceKey>) {
+pub fn close(summaries: &mut FxHashMap<InstanceKey, Summary>, outside: &FxHashSet<InstanceKey>) {
     for (key, summary) in summaries {
         summary.external = outside.contains(key);
     }
@@ -111,13 +112,14 @@ pub fn close(summaries: &mut BTreeMap<InstanceKey, Summary>, outside: &BTreeSet<
 /// A callee without a summary (not an LLVM unit of this build) is imported by nothing and
 /// assumed nothing of.
 ///
-/// The summaries become columns over dense node numbers in key order ([`Graph`]) once; every
-/// answer is then a function of those numbers, so it is the same whatever the map's history.
-/// Each importer's imports are chosen on its own, in parallel, into the worker's scratch.
+/// The summaries become columns over dense node numbers in key order ([`Graph`]) once, the
+/// keys sorted there; every answer is then a function of those numbers, so it is the same
+/// whatever the map's history. Each importer's imports are chosen on its own, in parallel,
+/// into the worker's scratch.
 pub fn decide(
-    summaries: &BTreeMap<InstanceKey, Summary>,
+    summaries: &FxHashMap<InstanceKey, Summary>,
     limits: &Limits,
-) -> Result<BTreeMap<InstanceKey, Imports>, ImportError> {
+) -> Result<FxHashMap<InstanceKey, Imports>, ImportError> {
     let graph = Graph::of(summaries)?;
     let attrs = graph.attrs();
     let constants = graph.constants();
@@ -215,13 +217,15 @@ struct Graph<'a> {
 impl<'a> Graph<'a> {
     /// The columns of `summaries`, checking each as it goes, in key order: the first
     /// inconsistency in that order is the error.
-    fn of(summaries: &'a BTreeMap<InstanceKey, Summary>) -> Result<Graph<'a>, ImportError> {
+    fn of(summaries: &'a FxHashMap<InstanceKey, Summary>) -> Result<Graph<'a>, ImportError> {
         let len = summaries.len();
         assert!(len < NONE as usize, "more than 2^32 - 1 summaries");
-        let keys: Vec<InstanceKey> = summaries.keys().copied().collect();
+        let mut summaries: Vec<(&'a InstanceKey, &'a Summary)> = summaries.iter().collect();
+        summaries.sort_unstable_by_key(|it| *it.0);
+        let keys: Vec<InstanceKey> = summaries.iter().map(|it| *it.0).collect();
         let index = Index::of(&keys);
-        let params: Vec<u32> = summaries.values().map(|it| it.params).collect();
-        let calls: usize = summaries.values().map(|it| it.calls.len()).sum();
+        let params: Vec<u32> = summaries.iter().map(|it| it.1.params).collect();
+        let calls: usize = summaries.iter().map(|it| it.1.calls.len()).sum();
         let mut graph = Graph {
             summaries: Vec::with_capacity(len),
             start: Vec::with_capacity(len + 1),

@@ -1,23 +1,39 @@
 //! An image's state: its pieces, where each is, what every symbol is defined as, and the
-//! bytes of every region. Cloning it is cheap ([`CowVec`], shared buffers), so a stage
-//! works on a copy and the state it started from stays whole: a stage that fails leaves
-//! nothing behind, and a rollback is the state before.
+//! bytes of every region. Cloning it is cheap (a pointer per 1024 entries of each column, per
+//! 64 KiB of each list arena, per 16 KiB page of each region), so a stage works on a copy and
+//! the state it started from stays whole: a stage that fails leaves nothing behind, and a
+//! rollback is the state before. A stage copies only the chunks and pages it writes.
+//!
+//! A piece is a row of columns: [`Hot`] (32 bytes: what placement, relocation and the writers
+//! read of every piece), [`What`] (16), [`Sort`] (16), and its lists (fixups, weak targets,
+//! symbols it defines, what its last write left for the loader) as [`ListRef`]s into shared
+//! arenas. A symbol's definition is a 16-byte [`Def`]; the pieces referring to it are a list in
+//! another arena, grown by doubling.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line};
 use blaze_ids::ContentId;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
-use crate::cow::CowVec;
+use crate::cow::{CowBytes, CowList, CowVec, ListRef};
 use crate::model::{Class, Fixup, Import, Library, NativeFile, Region, Special, Sym, Tls};
 use crate::position::SpanTable;
 use crate::reloc::GotKind;
-use crate::symbols::{Obj, Symbols};
+use crate::symbols::{IdNo, NameId, Obj, Symbols};
 use crate::{NativeKind, Output};
 
 pub(crate) type PieceId = u32;
+pub(crate) type FuncId = u32;
+/// What a write left for the loader to bind: offset in the piece, import, addend.
+pub(crate) type Bind = (u64, u32, i64);
+
+/// An index into the image's table of classes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(crate) struct ClassId(pub u16);
 
 /// What a symbol is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,39 +54,57 @@ pub(crate) enum Def {
     Special(u32),
 }
 
-/// One thing placed in a region: a function's code, a datum, a static, a native section, a
-/// GOT cell, a call frame record.
-#[derive(Clone, Debug)]
-pub(crate) struct Piece {
-    pub sym: Sym,
-    /// The class it goes in in a full link.
-    pub class: Class,
-    pub rank: u32,
-    /// Native pieces: the input's place on the link line, its member and section; others
-    /// sort after them.
-    pub order: [u32; 3],
-    pub align: u64,
-    pub size: u64,
-    /// In a zeroed region: no bytes.
-    pub zero: bool,
-    /// Index into [`State::spaces`].
-    pub region: u32,
+const LIVE: u8 = 1;
+const ZERO: u8 = 2;
+
+/// What every pass reads of a piece.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Hot {
     pub addr: u64,
-    pub fixups: Arc<[Fixup]>,
-    /// The fixups' targets it refers to weakly: 0 when nothing defines them.
-    pub weak: Arc<[Sym]>,
-    /// Symbols besides its own defined in it (a native section's), which move with it.
-    pub defines: Arc<[Sym]>,
-    pub what: What,
-    /// What its last write left for the loader: offsets in it of slid addresses, and binds
-    /// (offset, import, addend).
-    pub rebase: Arc<[u64]>,
-    pub binds: Arc<[(u64, u32, i64)]>,
+    pub size: u64,
+    pub sym: Sym,
+    /// Index into [`State::spaces`]; `u32::MAX` until placed.
+    pub region: u32,
+    /// The class it goes in in a full link.
+    pub class: ClassId,
+    align_log2: u8,
+    flags: u8,
 }
 
-#[derive(Clone, Debug)]
+impl Hot {
+    #[inline]
+    pub fn align(&self) -> u64 {
+        1 << self.align_log2
+    }
+
+    /// In a zeroed region: no bytes.
+    #[inline]
+    pub fn zero(&self) -> bool {
+        self.flags & ZERO != 0
+    }
+
+    #[inline]
+    pub fn live(&self) -> bool {
+        self.flags & LIVE != 0
+    }
+
+    #[inline]
+    pub fn set_zero(&mut self, zero: bool) {
+        self.flags = if zero { self.flags | ZERO } else { self.flags & !ZERO };
+    }
+
+    #[inline]
+    pub fn placed(&self) -> bool {
+        self.region != u32::MAX
+    }
+}
+
+/// One thing placed in a region: a function's code, a datum, a static, a native section, a
+/// GOT cell, a call frame record.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum What {
-    Function(Arc<FunctionInfo>),
+    /// [`State::function`] of this.
+    Function(FuncId),
     /// Shared by what refers to it and gone with the last: read-only data merged by content,
     /// a panic location, a file name, a CIE. [`State::users`] counts the fixups to it.
     Shared,
@@ -85,25 +119,184 @@ pub(crate) enum What {
     WinInfo,
     /// A Mach-O TLV descriptor of a thread-local static.
     Tlv,
-    /// The jump table's cells and generation cell, its stubs, the live descriptor and its
-    /// directory: made once per full link.
+    /// The jump table's generation cell and stubs, the live descriptor and its directory:
+    /// made once per full link.
     Fixed,
+    /// The jump table's cells: no fixups. Entry `slot` holds the address of
+    /// [`State::cell`] of it.
+    Cells,
 }
 
-#[derive(Clone, Debug)]
+/// A full link's order within a class: rank, then for native pieces the input's place on the
+/// link line, its member and section (others sort after them).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct Sort {
+    pub rank: u32,
+    pub order: [u32; 3],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Lists {
+    fixups: ListRef,
+    /// The fixups' targets it refers to weakly: 0 when nothing defines them.
+    weak: ListRef,
+    /// Symbols besides its own defined in it (a native section's), which move with it.
+    defines: ListRef,
+}
+
+/// What its last write left for the loader: offsets in it of slid addresses, and binds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Loader {
+    rebase: ListRef,
+    binds: ListRef,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct FunctionInfo {
     pub key: InstanceKey,
+    pub id: IdNo,
     pub fde: Option<Sym>,
     /// Windows: its `UNWIND_INFO` piece, and its handler and data.
     pub windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
-    pub lines: Vec<Line>,
+    /// [`State::lines`] of it.
+    pub lines: ListRef,
+}
+
+/// Of each symbol, besides its definition: the pieces referring to it (a list with room to
+/// grow), the first jump-table slot running it, and whether resolution looks at it.
+#[derive(Clone, Copy, Debug)]
+struct SymCold {
+    refs: ListRef,
+    room: u32,
+    slot: u32,
+    seen: bool,
+}
+
+const COLD: SymCold = SymCold { refs: ListRef::EMPTY, room: 0, slot: u32::MAX, seen: false };
+
+/// Of each interned id: the debug name of the function it is, and the span table of the
+/// anchor it is.
+#[derive(Clone, Debug)]
+struct IdCold {
+    debug_name: Option<NameId>,
+    spans: Option<Arc<SpanTable>>,
+}
+
+const _: () = assert!(size_of::<Def>() == 16);
+const _: () = assert!(size_of::<Hot>() == 32);
+const _: () = assert!(size_of::<What>() == 16);
+const _: () = assert!(size_of::<Sort>() == 16);
+const _: () = assert!(size_of::<Lists>() == 36);
+const _: () = assert!(size_of::<Loader>() == 24);
+const _: () = assert!(size_of::<SymCold>() == 24);
+const _: () = assert!(size_of::<FunctionInfo>() <= 88);
+
+/// A piece to add: [`State::add`] copies its lists into the arenas.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewPiece<'x> {
+    pub sym: Sym,
+    pub class: ClassId,
+    pub rank: u32,
+    pub order: [u32; 3],
+    pub align: u64,
+    pub size: u64,
+    pub zero: bool,
+    pub fixups: &'x [Fixup],
+    pub weak: &'x [Sym],
+    pub defines: &'x [Sym],
+    pub what: What,
+}
+
+/// A piece as read: its [`Hot`] fields through `Deref`, the rest by method.
+#[derive(Clone, Copy)]
+pub(crate) struct PieceRef<'s> {
+    pub id: PieceId,
+    hot: &'s Hot,
+    state: &'s State,
+}
+
+impl std::ops::Deref for PieceRef<'_> {
+    type Target = Hot;
+
+    fn deref(&self) -> &Hot {
+        self.hot
+    }
+}
+
+impl<'s> PieceRef<'s> {
+    pub fn hot(self) -> &'s Hot {
+        self.hot
+    }
+
+    pub fn class(self) -> &'s Class {
+        self.state.class(self.hot.class)
+    }
+
+    pub fn what(self) -> What {
+        *self.state.what.get(self.id as usize).expect("a piece's kind")
+    }
+
+    pub fn sort(self) -> Sort {
+        *self.state.sort.get(self.id as usize).expect("a piece's order")
+    }
+
+    pub fn rank(self) -> u32 {
+        self.sort().rank
+    }
+
+    pub fn order(self) -> [u32; 3] {
+        self.sort().order
+    }
+
+    fn lists(self) -> Lists {
+        *self.state.lists.get(self.id as usize).expect("a piece's lists")
+    }
+
+    pub fn fixups(self) -> &'s [Fixup] {
+        self.state.fixups.get(self.lists().fixups)
+    }
+
+    pub fn weak(self) -> &'s [Sym] {
+        self.state.syms.get(self.lists().weak)
+    }
+
+    pub fn defines(self) -> &'s [Sym] {
+        self.state.syms.get(self.lists().defines)
+    }
+
+    pub fn rebase(self) -> &'s [u64] {
+        let loader = self.state.loader.get(self.id as usize).expect("a piece's loader lists");
+        self.state.rebase.get(loader.rebase)
+    }
+
+    pub fn binds(self) -> &'s [Bind] {
+        let loader = self.state.loader.get(self.id as usize).expect("a piece's loader lists");
+        self.state.binds.get(loader.binds)
+    }
+
+    pub fn function(self) -> Option<&'s FunctionInfo> {
+        match self.what() {
+            What::Function(id) => Some(self.state.function(id)),
+            _ => None,
+        }
+    }
+
+    /// The bytes it has now in its region (none when zeroed or unplaced).
+    pub fn bytes(self) -> Cow<'s, [u8]> {
+        let Some(space) = self.state.spaces.get(self.hot.region as usize) else { return Cow::Borrowed(&[]) };
+        if space.zero || self.hot.zero() {
+            return Cow::Borrowed(&[]);
+        }
+        let at = (self.hot.addr - space.region.addr) as usize;
+        space.bytes.read(at, self.hot.size as usize)
+    }
 }
 
 /// A region of the image and its bytes (empty for a zeroed one).
 #[derive(Clone, Debug)]
 pub(crate) struct Space {
     pub region: Region,
-    pub bytes: Arc<Vec<u8>>,
+    pub bytes: CowBytes,
     pub zero: bool,
     /// Where it is in the file.
     pub offset: Option<u64>,
@@ -132,7 +325,7 @@ pub(crate) struct Resolved {
     /// The native call frame records in the image: section and start.
     pub frames: FxHashSet<(Obj, u32, u32)>,
     /// The commons, by name: size and alignment.
-    pub commons: BTreeMap<Box<str>, (u64, u64)>,
+    pub commons: BTreeMap<NameId, (u64, u64)>,
     /// What the objects' `/EXPORT` directives export: the name, the symbol, and whether it
     /// is data.
     pub exports: Vec<(String, String, bool)>,
@@ -141,23 +334,12 @@ pub(crate) struct Resolved {
 #[derive(Clone)]
 pub(crate) struct State {
     pub generation: u64,
-    pub pieces: CowVec<Option<Piece>>,
-    /// Of each [`What::Shared`] piece, the fixups to it.
-    pub users: CowVec<u32>,
-    /// Per symbol shard ([`Symbols::split`]): each symbol's definition and the pieces whose
-    /// fixups refer to it.
-    pub defs: Vec<CowVec<Def>>,
-    pub refs: Vec<CowVec<Vec<PieceId>>>,
     pub specials: Vec<Special>,
     pub spaces: Vec<Space>,
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
-    pub names: Arc<BTreeMap<String, Sym>>,
-    /// Every name a piece has referred to: what resolution looks at.
-    pub seen: Arc<BTreeSet<Sym>>,
-    pub debug_names: Arc<FxHashMap<InstanceKey, Arc<str>>>,
+    pub names: Arc<BTreeMap<NameId, Sym>>,
     /// wasm: what codegen's functions and statics say each name is imported as.
-    pub wasm_imports: Arc<BTreeMap<Box<str>, blaze_codegen::wasm::Import>>,
-    pub spans: Arc<FxHashMap<ContentId, Arc<SpanTable>>>,
+    pub wasm_imports: Arc<FxHashMap<NameId, blaze_codegen::wasm::Import>>,
     pub inputs: Arc<Vec<Input>>,
     pub resolved: Arc<Resolved>,
     /// The jump table: slots given out, and how many there are room for.
@@ -171,23 +353,42 @@ pub(crate) struct State {
     /// What the image is across its generations: its first full link's.
     pub lineage: [u8; 16],
     pub laid_out: bool,
+
+    hot: CowVec<Hot>,
+    what: CowVec<What>,
+    sort: CowVec<Sort>,
+    lists: CowVec<Lists>,
+    loader: CowVec<Loader>,
+    /// Of each [`What::Shared`] piece, the fixups to it.
+    users: CowVec<u32>,
+    fixups: CowList<Fixup>,
+    syms: CowList<Sym>,
+    rebase: CowList<u64>,
+    binds: CowList<Bind>,
+    /// Per symbol shard ([`Symbols::split`]).
+    defs: Vec<CowVec<Def>>,
+    cold: Vec<CowVec<SymCold>>,
+    ref_items: CowList<PieceId>,
+    /// Every name a piece has referred to, in the order first seen.
+    seen: CowVec<Sym>,
+    classes: Arc<Vec<Class>>,
+    functions: CowVec<FunctionInfo>,
+    lines: CowList<Line>,
+    /// Per id shard ([`Symbols::split_id`]).
+    ids: Vec<CowVec<IdCold>>,
+    /// Per slot: the body it runs, and the next slot running the same body.
+    cells: CowVec<Sym>,
+    slot_next: CowVec<u32>,
 }
 
 impl State {
     pub fn new() -> State {
         State {
             generation: blaze_live::patch::FIRST_GENERATION,
-            pieces: CowVec::default(),
-            users: CowVec::default(),
-            defs: vec![CowVec::default(); Symbols::SHARDS],
-            refs: vec![CowVec::default(); Symbols::SHARDS],
             specials: Vec::new(),
             spaces: Vec::new(),
             names: Arc::default(),
-            seen: Arc::default(),
-            debug_names: Arc::default(),
             wasm_imports: Arc::default(),
-            spans: Arc::default(),
             inputs: Arc::default(),
             resolved: Arc::default(),
             slots: 0,
@@ -198,9 +399,32 @@ impl State {
             parts: Arc::default(),
             lineage: [0; 16],
             laid_out: false,
+            hot: CowVec::default(),
+            what: CowVec::default(),
+            sort: CowVec::default(),
+            lists: CowVec::default(),
+            loader: CowVec::default(),
+            users: CowVec::default(),
+            fixups: CowList::default(),
+            syms: CowList::default(),
+            rebase: CowList::default(),
+            binds: CowList::default(),
+            defs: vec![CowVec::default(); Symbols::SHARDS],
+            cold: vec![CowVec::default(); Symbols::SHARDS],
+            ref_items: CowList::default(),
+            seen: CowVec::default(),
+            classes: Arc::default(),
+            functions: CowVec::default(),
+            lines: CowList::default(),
+            ids: vec![CowVec::default(); Symbols::SHARDS],
+            cells: CowVec::default(),
+            slot_next: CowVec::default(),
         }
     }
 
+    // Symbols.
+
+    #[inline]
     pub fn def(&self, sym: Sym) -> Def {
         let (shard, at) = Symbols::split(sym);
         self.defs[shard].get(at).copied().unwrap_or(Def::None)
@@ -211,73 +435,17 @@ impl State {
         self.defs[shard].set(at, def, || Def::None);
     }
 
-    pub fn refs(&self, sym: Sym) -> &[PieceId] {
+    fn cold(&self, sym: Sym) -> SymCold {
         let (shard, at) = Symbols::split(sym);
-        self.refs[shard].get(at).map_or(&[], |it| it.as_slice())
+        self.cold[shard].get(at).copied().unwrap_or(COLD)
     }
 
-    fn refs_mut(&mut self, sym: Sym) -> &mut Vec<PieceId> {
+    fn cold_mut(&mut self, sym: Sym) -> &mut SymCold {
         let (shard, at) = Symbols::split(sym);
-        if self.refs[shard].len() <= at {
-            self.refs[shard].set(at, Vec::new(), Vec::new);
+        if self.cold[shard].len() <= at {
+            self.cold[shard].set(at, COLD, || COLD);
         }
-        self.refs[shard].get_mut(at).expect("grown to it")
-    }
-
-    pub fn piece(&self, id: PieceId) -> Option<&Piece> {
-        self.pieces.get(id as usize).and_then(Option::as_ref)
-    }
-
-    pub fn piece_mut(&mut self, id: PieceId) -> Option<&mut Piece> {
-        self.pieces.get_mut(id as usize).and_then(Option::as_mut)
-    }
-
-    /// The symbols a piece's fixups refer to, once each.
-    pub fn targets(piece: &Piece) -> Vec<Sym> {
-        let mut out: Vec<Sym> =
-            piece.fixups.iter().flat_map(|it| std::iter::once(it.target).chain(it.minus)).collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-
-    /// Adds a piece and its references; the caller defines its symbols.
-    pub fn add(&mut self, piece: Piece) -> PieceId {
-        let id = self.pieces.len() as PieceId;
-        for target in Self::targets(&piece) {
-            self.refs_mut(target).push(id);
-        }
-        self.pieces.push(Some(piece));
-        self.users.push(0);
-        id
-    }
-
-    /// Removes a piece, its references and its symbols' definitions.
-    pub fn remove(&mut self, id: PieceId) -> Option<Piece> {
-        let piece = self.pieces.get_mut(id as usize)?.take()?;
-        for target in Self::targets(&piece) {
-            self.refs_mut(target).retain(|it| *it != id);
-        }
-        for sym in std::iter::once(piece.sym).chain(piece.defines.iter().copied()) {
-            if matches!(self.def(sym), Def::Piece { piece, .. } if piece == id) {
-                self.set_def(sym, Def::None);
-            }
-        }
-        Some(piece)
-    }
-
-    /// Replaces a piece's fixups, keeping the reverse index right.
-    pub fn set_fixups(&mut self, id: PieceId, fixups: Arc<[Fixup]>) {
-        let old = Self::targets(self.piece(id).expect("a live piece"));
-        for target in old {
-            self.refs_mut(target).retain(|it| *it != id);
-        }
-        let piece = self.piece_mut(id).expect("a live piece");
-        piece.fixups = fixups;
-        let new = Self::targets(piece);
-        for target in new {
-            self.refs_mut(target).push(id);
-        }
+        self.cold[shard].get_mut(at).expect("grown to it")
     }
 
     /// The piece a symbol is in, through aliases.
@@ -292,9 +460,351 @@ impl State {
         None
     }
 
-    pub fn live_pieces(&self) -> impl Iterator<Item = (PieceId, &Piece)> {
-        self.pieces.iter().enumerate().filter_map(|(id, it)| it.as_ref().map(|it| (id as PieceId, it)))
+    /// Where a symbol is in the image as placed: its piece's address plus its offset.
+    pub fn addr_of(&self, sym: Sym) -> Option<u64> {
+        let (piece, offset) = self.home(sym)?;
+        Some(self.piece(piece)?.addr + offset)
     }
+
+    /// The live pieces whose fixups refer to `sym`, each once, in the order each started to.
+    pub fn refs(&self, sym: Sym) -> impl Iterator<Item = PieceId> + '_ {
+        self.ref_items.get(self.cold(sym).refs).iter().copied().filter(|it| self.is_live(*it))
+    }
+
+    fn ref_push(&mut self, sym: Sym, id: PieceId) {
+        let cold = *self.cold_mut(sym);
+        let len = cold.refs.len();
+        if len < cold.room as usize {
+            let whole = ListRef { len: cold.room, ..cold.refs };
+            self.ref_items.get_mut(whole)[len] = id;
+            self.cold_mut(sym).refs.len += 1;
+            return;
+        }
+        let room = (cold.room as usize * 2).max(4);
+        let mut grown: SmallVec<[PieceId; 32]> = SmallVec::with_capacity(room);
+        grown.extend_from_slice(self.ref_items.get(cold.refs));
+        grown.push(id);
+        grown.resize(room, PieceId::MAX);
+        let list = self.ref_items.push(&grown);
+        if cold.room > 0 {
+            self.ref_items.free(ListRef { len: cold.room, ..cold.refs });
+        }
+        let it = self.cold_mut(sym);
+        it.refs = ListRef { len: len as u32 + 1, ..list };
+        it.room = room as u32;
+    }
+
+    fn ref_remove(&mut self, sym: Sym, id: PieceId) {
+        let cold = self.cold(sym);
+        if cold.refs.is_empty() {
+            return;
+        }
+        let items = self.ref_items.get(cold.refs);
+        let Some(at) = items.iter().position(|it| *it == id) else { return };
+        let last = items.len() - 1;
+        let items = self.ref_items.get_mut(cold.refs);
+        items.swap(at, last);
+        self.cold_mut(sym).refs.len -= 1;
+    }
+
+    /// Every name a piece has referred to (what resolution looks at), in the order first seen.
+    pub fn seen(&self) -> impl Iterator<Item = Sym> + '_ {
+        self.seen.iter().copied()
+    }
+
+    pub fn is_seen(&self, sym: Sym) -> bool {
+        self.cold(sym).seen
+    }
+
+    /// Marks a name as referred to; whether it was not before.
+    pub fn see(&mut self, sym: Sym) -> bool {
+        let cold = self.cold_mut(sym);
+        if cold.seen {
+            return false;
+        }
+        cold.seen = true;
+        self.seen.push(sym);
+        true
+    }
+
+    // Pieces.
+
+    #[inline]
+    fn is_live(&self, id: PieceId) -> bool {
+        self.hot.get(id as usize).is_some_and(Hot::live)
+    }
+
+    pub fn piece_count(&self) -> u32 {
+        self.hot.len() as u32
+    }
+
+    /// A live piece.
+    #[inline]
+    pub fn piece(&self, id: PieceId) -> Option<PieceRef<'_>> {
+        let hot = self.hot.get(id as usize).filter(|it| it.live())?;
+        Some(PieceRef { id, hot, state: self })
+    }
+
+    /// A piece live or removed: a removed piece's columns stay as they were.
+    pub fn any(&self, id: PieceId) -> Option<PieceRef<'_>> {
+        let hot = self.hot.get(id as usize)?;
+        Some(PieceRef { id, hot, state: self })
+    }
+
+    pub fn hot_mut(&mut self, id: PieceId) -> &mut Hot {
+        self.hot.get_mut(id as usize).expect("a piece")
+    }
+
+    pub fn live_pieces(&self) -> impl Iterator<Item = PieceRef<'_>> + '_ {
+        self.hot.iter().enumerate().filter(|(_, it)| it.live()).map(|(id, hot)| PieceRef { id: id as PieceId, hot, state: self })
+    }
+
+    /// The symbols a piece's fixups refer to, once each.
+    pub fn targets(piece: PieceRef<'_>) -> SmallVec<[Sym; 8]> {
+        let mut out: SmallVec<[Sym; 8]> =
+            piece.fixups().iter().flat_map(|it| std::iter::once(it.target).chain(it.minus)).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Adds a piece, live and not placed, and its references; the caller defines its symbols.
+    pub fn add(&mut self, piece: &NewPiece<'_>) -> PieceId {
+        let id = self.hot.len() as PieceId;
+        let align_log2 = piece.align.max(1).next_power_of_two().trailing_zeros() as u8;
+        self.hot.push(Hot {
+            addr: 0,
+            size: piece.size,
+            sym: piece.sym,
+            region: u32::MAX,
+            class: piece.class,
+            align_log2,
+            flags: LIVE | if piece.zero { ZERO } else { 0 },
+        });
+        self.what.push(piece.what);
+        self.sort.push(Sort { rank: piece.rank, order: piece.order });
+        let lists = Lists {
+            fixups: self.fixups.push(piece.fixups),
+            weak: self.syms.push(piece.weak),
+            defines: self.syms.push(piece.defines),
+        };
+        self.lists.push(lists);
+        self.loader.push(Loader::default());
+        self.users.push(0);
+        let targets = Self::targets(self.any(id).expect("just added"));
+        for target in targets {
+            self.ref_push(target, id);
+        }
+        id
+    }
+
+    /// Removes a piece and its symbols' definitions. Its columns stay readable through
+    /// [`State::any`]; its stale entries in referrer lists are skipped by [`State::refs`].
+    pub fn remove(&mut self, id: PieceId) -> bool {
+        let Some(piece) = self.piece(id) else { return false };
+        let syms: SmallVec<[Sym; 8]> = std::iter::once(piece.sym).chain(piece.defines().iter().copied()).collect();
+        let lists = piece.lists();
+        let loader = *self.loader.get(id as usize).expect("a piece's loader lists");
+        self.hot_mut(id).flags &= !LIVE;
+        for sym in syms {
+            if matches!(self.def(sym), Def::Piece { piece, .. } if piece == id) {
+                self.set_def(sym, Def::None);
+            }
+        }
+        self.fixups.free(lists.fixups);
+        self.syms.free(lists.weak);
+        self.syms.free(lists.defines);
+        self.rebase.free(loader.rebase);
+        self.binds.free(loader.binds);
+        true
+    }
+
+    /// Replaces a live piece's fixups, keeping the referrer lists right.
+    pub fn set_fixups(&mut self, id: PieceId, fixups: &[Fixup]) {
+        let piece = self.piece(id).expect("a live piece");
+        let old = Self::targets(piece);
+        let list = piece.lists().fixups;
+        for target in old {
+            self.ref_remove(target, id);
+        }
+        self.fixups.free(list);
+        let list = self.fixups.push(fixups);
+        self.lists.get_mut(id as usize).expect("a piece's lists").fixups = list;
+        let new = Self::targets(self.piece(id).expect("a live piece"));
+        for target in new {
+            self.ref_push(target, id);
+        }
+    }
+
+    pub fn set_defines(&mut self, id: PieceId, defines: &[Sym]) {
+        let old = self.lists.get(id as usize).expect("a piece's lists").defines;
+        self.syms.free(old);
+        let list = self.syms.push(defines);
+        self.lists.get_mut(id as usize).expect("a piece's lists").defines = list;
+    }
+
+    pub fn set_weak(&mut self, id: PieceId, weak: &[Sym]) {
+        let old = self.lists.get(id as usize).expect("a piece's lists").weak;
+        self.syms.free(old);
+        let list = self.syms.push(weak);
+        self.lists.get_mut(id as usize).expect("a piece's lists").weak = list;
+    }
+
+    /// What a piece's write left for the loader.
+    pub fn set_loader(&mut self, id: PieceId, rebase: &[u64], binds: &[Bind]) {
+        let old = *self.loader.get(id as usize).expect("a piece's loader lists");
+        if self.rebase.get(old.rebase) == rebase && self.binds.get(old.binds) == binds {
+            return;
+        }
+        self.rebase.free(old.rebase);
+        self.binds.free(old.binds);
+        let new = Loader { rebase: self.rebase.push(rebase), binds: self.binds.push(binds) };
+        *self.loader.get_mut(id as usize).expect("a piece's loader lists") = new;
+    }
+
+    /// Of a [`What::Shared`] piece, the fixups referring to it.
+    pub fn users(&self, id: PieceId) -> u32 {
+        self.users.get(id as usize).copied().unwrap_or(0)
+    }
+
+    pub fn users_mut(&mut self, id: PieceId) -> &mut u32 {
+        self.users.get_mut(id as usize).expect("a piece's count")
+    }
+
+    /// Whether the list arenas are mostly garbage: then [`State::compact`] pays for itself.
+    pub fn wants_compaction(&self) -> bool {
+        let over = |garbage: usize, live: usize| garbage > live + (1 << 16);
+        over(self.fixups.garbage(), self.fixups.live())
+            || over(self.syms.garbage(), self.syms.live())
+            || over(self.ref_items.garbage(), self.ref_items.live())
+            || over(self.rebase.garbage(), self.rebase.live())
+    }
+
+    /// Copies every live list into fresh arenas and rebuilds the referrer lists, dropping
+    /// what removed pieces left: O(image), done when the garbage outweighs the rest.
+    pub fn compact(&mut self) {
+        let old = self.clone();
+        self.fixups = CowList::default();
+        self.syms = CowList::default();
+        self.rebase = CowList::default();
+        self.binds = CowList::default();
+        self.ref_items = CowList::default();
+        self.lines = CowList::default();
+        for at in 0..self.functions.len() {
+            self.functions.get_mut(at).expect("in range").lines = ListRef::EMPTY;
+        }
+        for shard in &mut self.cold {
+            let len = shard.len();
+            for at in 0..len {
+                let it = shard.get(at).copied().expect("in range");
+                if it.room > 0 {
+                    *shard.get_mut(at).expect("in range") = SymCold { refs: ListRef::EMPTY, room: 0, ..it };
+                }
+            }
+        }
+        for id in 0..old.piece_count() {
+            let piece = old.any(id).expect("in range");
+            let (lists, loader) = if piece.live() {
+                let lists = Lists {
+                    fixups: self.fixups.push(piece.fixups()),
+                    weak: self.syms.push(piece.weak()),
+                    defines: self.syms.push(piece.defines()),
+                };
+                let loader = Loader { rebase: self.rebase.push(piece.rebase()), binds: self.binds.push(piece.binds()) };
+                (lists, loader)
+            } else {
+                (Lists::default(), Loader::default())
+            };
+            *self.lists.get_mut(id as usize).expect("in range") = lists;
+            *self.loader.get_mut(id as usize).expect("in range") = loader;
+            if piece.live() {
+                for target in Self::targets(piece) {
+                    self.ref_push(target, id);
+                }
+                if let What::Function(function) = piece.what() {
+                    let lines = self.lines.push(old.lines(old.function(function)));
+                    self.functions.get_mut(function as usize).expect("a function").lines = lines;
+                }
+            }
+        }
+    }
+
+    // Classes.
+
+    pub fn find_class(&self, class: &Class) -> Option<ClassId> {
+        self.classes.iter().position(|it| it == class).map(|it| ClassId(it as u16))
+    }
+
+    pub fn class_id(&mut self, class: &Class) -> ClassId {
+        if let Some(id) = self.find_class(class) {
+            return id;
+        }
+        let classes = Arc::make_mut(&mut self.classes);
+        let id = u16::try_from(classes.len()).expect("fewer than 2^16 classes");
+        classes.push(class.clone());
+        ClassId(id)
+    }
+
+    pub fn class(&self, id: ClassId) -> &Class {
+        &self.classes[id.0 as usize]
+    }
+
+    // Functions, debug names, span tables.
+
+    pub fn add_function(
+        &mut self,
+        key: InstanceKey,
+        id: IdNo,
+        fde: Option<Sym>,
+        windows: Option<(Sym, Option<Sym>, Option<Sym>)>,
+        lines: &[Line],
+    ) -> FuncId {
+        let lines = self.lines.push(lines);
+        self.functions.push(FunctionInfo { key, id, fde, windows, lines }) as FuncId
+    }
+
+    pub fn function(&self, id: FuncId) -> &FunctionInfo {
+        self.functions.get(id as usize).expect("a function")
+    }
+
+    pub fn lines(&self, info: &FunctionInfo) -> &[Line] {
+        self.lines.get(info.lines)
+    }
+
+    fn id_cold_mut(&mut self, id: IdNo) -> &mut IdCold {
+        let (shard, at) = Symbols::split_id(id);
+        let empty = || IdCold { debug_name: None, spans: None };
+        if self.ids[shard].len() <= at {
+            self.ids[shard].set(at, empty(), empty);
+        }
+        self.ids[shard].get_mut(at).expect("grown to it")
+    }
+
+    fn id_cold(&self, id: IdNo) -> Option<&IdCold> {
+        let (shard, at) = Symbols::split_id(id);
+        self.ids[shard].get(at)
+    }
+
+    /// The name debuggers and backtraces show for a function, by its interned key.
+    pub fn debug_name(&self, function: IdNo) -> Option<NameId> {
+        self.id_cold(function)?.debug_name
+    }
+
+    pub fn set_debug_name(&mut self, function: IdNo, name: NameId) {
+        if self.debug_name(function) != Some(name) {
+            self.id_cold_mut(function).debug_name = Some(name);
+        }
+    }
+
+    pub fn span_table(&self, anchor: IdNo) -> Option<&SpanTable> {
+        self.id_cold(anchor)?.spans.as_deref()
+    }
+
+    pub fn set_span_table(&mut self, anchor: IdNo, table: SpanTable) {
+        self.id_cold_mut(anchor).spans = Some(Arc::new(table));
+    }
+
+    // Regions.
 
     pub fn regions(&self) -> Vec<Region> {
         self.spaces.iter().map(|it| it.region.clone()).collect()
@@ -305,13 +815,81 @@ impl State {
     }
 
     /// The bytes a placed piece has now.
-    pub fn bytes(&self, piece: &Piece) -> &[u8] {
-        let space = &self.spaces[piece.region as usize];
-        if space.zero || piece.zero {
-            return &[];
+    pub fn bytes(&self, id: PieceId) -> Cow<'_, [u8]> {
+        self.any(id).map_or(Cow::Borrowed(&[][..]), PieceRef::bytes)
+    }
+
+    // The jump table.
+
+    /// Gives out the next slot, empty.
+    pub fn new_slot(&mut self, sym: Sym) -> u32 {
+        let slot = self.slots;
+        self.slots += 1;
+        self.slot_syms.push(sym);
+        self.cells.push(crate::symbols::NO_SYM);
+        self.slot_next.push(u32::MAX);
+        slot
+    }
+
+    /// The body a slot runs.
+    pub fn cell(&self, slot: u32) -> Option<Sym> {
+        self.cells.get(slot as usize).copied().filter(|it| *it != crate::symbols::NO_SYM)
+    }
+
+    /// Puts a body in a slot (or empties it), keeping each body's list of slots.
+    pub fn set_cell(&mut self, slot: u32, body: Option<Sym>) {
+        let old = self.cell(slot);
+        if old == body {
+            return;
         }
-        let at = (piece.addr - space.region.addr) as usize;
-        &space.bytes[at..at + piece.size as usize]
+        if let Some(old) = old {
+            let next = *self.slot_next.get(slot as usize).expect("a slot");
+            let head = self.cold(old).slot;
+            if head == slot {
+                self.cold_mut(old).slot = next;
+            } else {
+                let mut at = head;
+                while at != u32::MAX {
+                    let after = *self.slot_next.get(at as usize).expect("a slot");
+                    if after == slot {
+                        *self.slot_next.get_mut(at as usize).expect("a slot") = next;
+                        break;
+                    }
+                    at = after;
+                }
+            }
+        }
+        *self.cells.get_mut(slot as usize).expect("a slot") = body.unwrap_or(crate::symbols::NO_SYM);
+        let next = match body {
+            Some(body) => {
+                let cold = self.cold_mut(body);
+                std::mem::replace(&mut cold.slot, slot)
+            }
+            None => u32::MAX,
+        };
+        *self.slot_next.get_mut(slot as usize).expect("a slot") = next;
+    }
+
+    /// The slots running a body.
+    pub fn slots_of(&self, body: Sym) -> impl Iterator<Item = u32> + '_ {
+        let mut at = self.cold(body).slot;
+        std::iter::from_fn(move || {
+            if at == u32::MAX {
+                return None;
+            }
+            let slot = at;
+            at = *self.slot_next.get(slot as usize).expect("a slot");
+            Some(slot)
+        })
+    }
+
+    /// Every slot given out that runs a body, in slot order.
+    pub fn filled_cells(&self) -> impl Iterator<Item = (u32, Sym)> + '_ {
+        self.cells
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| **it != crate::symbols::NO_SYM)
+            .map(|(slot, it)| (slot as u32, *it))
     }
 }
 

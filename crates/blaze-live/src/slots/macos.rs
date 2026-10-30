@@ -27,7 +27,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::__register_frame,
+    unix::{__register_frame, image_base, in_image},
 };
 
 #[repr(C)]
@@ -116,6 +116,8 @@ pub(super) struct Os {
     protection: i32,
     /// The protection of the table cell's region.
     cell: i32,
+    /// Where the image is loaded, which every data write is checked to be in.
+    base: u64,
 }
 
 impl Os {
@@ -143,7 +145,9 @@ impl Os {
             at = region.end;
         }
         let (_, cell) = region_at(layout.cell())?;
-        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell })
+        let base = image_base(layout.cell())
+            .ok_or_else(|| format!("no image has the table cell at {:#x}", layout.cell()))?;
+        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell, base })
     }
 }
 
@@ -174,6 +178,7 @@ impl Memory for Os {
         let mut region: Option<(Range<u64>, i32)> = None;
         let mut run: Option<(Range<u64>, i32)> = None;
         for span in writes.spans {
+            in_image(&span.range(), self.base)?;
             let mut at = span.at;
             while at < span.end() {
                 let (found, protection) = match &region {
@@ -186,9 +191,13 @@ impl Memory for Os {
                 };
                 let piece = at..found.end.min(span.end());
                 at = piece.end;
+                if protection & READ == 0 {
+                    return Err(format!("data at {:#x}, in pages with no access", piece.start));
+                }
                 if protection & WRITE != 0 {
-                    // SAFETY: mapped and writable; nothing else of the program's writes the
-                    // image's data a patch writes while `poll` writes it.
+                    // SAFETY: the image's (checked above), mapped and writable; no other thread
+                    // uses the bytes a patch rewrites while `poll` writes them (the rule
+                    // `Live::poll` gives the program).
                     unsafe { writes.put(&piece, piece.start as *mut u8) };
                     continue;
                 }
@@ -199,8 +208,9 @@ impl Memory for Os {
                     }
                     _ => {
                         if let Some((done, protection)) = run.replace((pages, protection)) {
-                            // SAFETY: read-only pages of the image, which nothing writes; the
-                            // copy mapped over them has the rest of their bytes as they are.
+                            // SAFETY: read-only pages of the image (checked above), which nothing
+                            // writes; the copy mapped over them in one step has the rest of
+                            // their bytes as they are, so a reader sees the old page or the new.
                             unsafe { swap(&done, protection, |copy| writes.fill(&done, copy))? };
                         }
                     }
@@ -216,8 +226,9 @@ impl Memory for Os {
 
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
         for &start in starts {
-            // SAFETY: an FDE in the patch's writes (the switch checked), which stay mapped:
-            // the unwinder reads it from now on.
+            // SAFETY: an FDE in the patch's writes (the switch checked), mapped and never
+            // written again (the switch's `Lasting`): the unwinder reads it from now on, and
+            // nothing takes it back.
             unsafe { __register_frame(start as *const u8) };
         }
         Ok(())
@@ -246,8 +257,10 @@ impl Os {
     fn swap_code(&self, writes: &Writes<'_>, run: &Range<u64>) -> Result<(), String> {
         debug_assert!(run.start >= self.code.start && run.end <= self.code.end);
         // SAFETY: the pages are the patch code region's, mapped with one protection
-        // (`Os::new` checked, and every swap keeps it); the bytes written are where no kept
-        // generation's code is, and the rest of the pages is copied as it is.
+        // (`Os::new` checked, and every swap keeps it). The bytes written are over no code
+        // the cell ever pointed at nor any registered unwind entry (the switch's `Lasting`),
+        // and the rest of the pages is copied as it is, so a thread running there runs the
+        // same bytes before and after.
         unsafe { swap(run, self.protection, |copy| writes.fill(run, copy)) }
     }
 }

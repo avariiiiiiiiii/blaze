@@ -1,8 +1,14 @@
+use base_db::SourceDatabase;
+use blaze_format::Persist;
 use expect_test::{Expect, expect};
+use hir_expand::HirFileId;
 use span::Edition;
 use test_fixture::WithFixture;
 
-use crate::test_db::TestDB;
+use crate::{
+    item_tree::{ItemTree, ModItemKind},
+    test_db::TestDB,
+};
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
@@ -292,8 +298,6 @@ fn crate_attrs_with_disabled_cfg_in_source() {
 fn use_trees_expand_in_order_of_their_syntax() {
     use la_arena::{Idx, RawIdx};
 
-    use crate::item_tree::ModItemKind;
-
     let (db, file_id) = TestDB::with_single_file("use a::{b, c::{d, *}, self, e as f};");
     let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
     let [item] = tree.top_level_items() else { panic!("one item") };
@@ -319,7 +323,7 @@ fn use_trees_expand_in_order_of_their_syntax() {
 
 #[test]
 fn struct_constructors_have_the_least_visibility_of_their_fields() {
-    use crate::item_tree::{ModItemKind, RawVisibility, StructValueNsCtor};
+    use crate::item_tree::{RawVisibility, StructValueNsCtor};
 
     let (db, file_id) = TestDB::with_single_file(
         r#"
@@ -436,11 +440,11 @@ m!();
 "#;
     let lower = |text: &str| {
         let (db, file_id) = TestDB::with_single_file(text);
-        (owned_tree(&db, file_id.into()).1, db.test_crate())
+        owned_tree(&db, file_id.into()).1
     };
-    let (first, _) = lower(small);
+    let first = lower(small);
     lower(big);
-    let (again, _) = lower(small);
+    let again = lower(small);
     assert_eq!(again, first, "a tree lowered after a bigger one on the same thread");
 }
 

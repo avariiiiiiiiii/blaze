@@ -1,147 +1,263 @@
 //! The end of a stage: the writer's synthetic regions and headers, then the byte ranges of
-//! the file a commit writes, and what was there before (for a rollback).
+//! the file a commit writes, and which of the old file's ranges they overwrite (for a
+//! rollback).
+//!
+//! A full link writes the file as runs of at most [`RUN`] bytes, built in parallel, which the
+//! commit submits together. An incremental link writes what changed: each piece it wrote whose
+//! bytes differ from before, each jump-table cell it set (8 bytes, not the cells array), the
+//! synthetic regions' changed blocks and the changed headers, with ranges closer than [`GAP`]
+//! merged into one write. Every range's bytes are copied once, from the regions' pages
+//! straight into the write. The undo is only ranges: the state the history keeps holds the
+//! old bytes, read when a rollback needs them ([`restore`]).
 
-use std::sync::Arc;
+use std::borrow::Cow;
 
+use rayon::prelude::*;
+
+use crate::LinkError;
+use crate::cow::CowBytes;
 use crate::model::Class;
 use crate::stage::{Stage, error};
-use crate::state::State;
-use crate::LinkError;
+use crate::state::{Space, State, What};
 
 /// What a stage leaves for its commit.
 pub(crate) struct Finished {
     pub state: State,
     pub full: bool,
     pub len: u64,
-    /// Ranges of the file and their bytes.
+    /// Ranges of the file and their bytes, by offset, none overlapping.
     pub writes: Vec<(u64, Vec<u8>)>,
-    /// The same ranges as the file had them before, and its length.
-    pub undo: Vec<(u64, Vec<u8>)>,
+    /// The ranges of the old file the writes overwrite, clipped to its length: empty for a
+    /// full link, whose undo is the whole old file.
+    pub undo: Vec<(u64, u64)>,
     pub old_len: u64,
-    /// The message for running programs.
-    pub message: Option<blaze_live::patch::Message>,
+    /// The encoded message for running programs.
+    pub message: Option<Vec<u8>>,
 }
 
+/// The longest write of a full link: large enough to keep a device's queue full in few
+/// writes, small enough that the writes of one file run side by side.
+const RUN: u64 = 8 << 20;
+/// Ranges of an incremental link closer than this are one write, the bytes between included.
+const GAP: u64 = 4096;
+/// The block a synthetic region is compared in.
 const BLOCK: usize = 4096;
 
-/// The bytes of `state`'s file in `at..at + len`: zero where nothing is.
-pub(crate) fn file_bytes(state: &State, at: u64, len: u64) -> Vec<u8> {
-    let mut out = vec![0; len as usize];
-    let end = at + len;
-    let mut copy = |offset: u64, bytes: &[u8]| {
-        let from = offset.max(at);
-        let to = (offset + bytes.len() as u64).min(end);
-        if from < to {
+/// Where each byte of a state's file comes from: its regions in the file and the writer's
+/// parts, each sorted by offset. Parts are copied after regions, so they win where both are.
+struct Layout<'s> {
+    spaces: Vec<(u64, u64, &'s CowBytes)>,
+    parts: Vec<(u64, &'s [u8])>,
+}
+
+impl<'s> Layout<'s> {
+    fn of(state: &'s State) -> Layout<'s> {
+        let mut spaces: Vec<(u64, u64, &CowBytes)> = state
+            .spaces
+            .iter()
+            .filter_map(|space| {
+                let offset = space.offset.filter(|_| !space.zero)?;
+                let len = space.region.size.min(space.bytes.len() as u64);
+                (len > 0).then_some((offset, len, &space.bytes))
+            })
+            .collect();
+        spaces.sort_unstable_by_key(|it| it.0);
+        let mut parts: Vec<(u64, &[u8])> =
+            state.parts.iter().filter(|it| !it.1.is_empty()).map(|(at, bytes)| (*at, &bytes[..])).collect();
+        parts.sort_by_key(|it| it.0);
+        Layout { spaces, parts }
+    }
+
+    /// The file's bytes in `at..at + out.len()` copied into `out`, which is zeros.
+    fn copy(&self, at: u64, out: &mut [u8]) {
+        let end = at + out.len() as u64;
+        let first = self.spaces.partition_point(|it| it.0 + it.1 <= at);
+        for &(offset, len, bytes) in self.spaces[first..].iter().take_while(|it| it.0 < end) {
+            let from = offset.max(at);
+            let to = (offset + len).min(end);
+            bytes.copy_to((from - offset) as usize, &mut out[(from - at) as usize..(to - at) as usize]);
+        }
+        let first = self.parts.partition_point(|it| it.0 + it.1.len() as u64 <= at);
+        for &(offset, bytes) in self.parts[first..].iter().take_while(|it| it.0 < end) {
+            let from = offset.max(at);
+            let to = (offset + bytes.len() as u64).min(end);
             out[(from - at) as usize..(to - at) as usize]
                 .copy_from_slice(&bytes[(from - offset) as usize..(to - offset) as usize]);
         }
-    };
-    for space in &state.spaces {
-        if let (Some(offset), false) = (space.offset, space.zero) {
-            copy(offset, &space.bytes[..(space.region.size as usize).min(space.bytes.len())]);
+    }
+
+    fn bytes(&self, at: u64, len: u64) -> Vec<u8> {
+        let mut out = vec![0; len as usize];
+        self.copy(at, &mut out);
+        out
+    }
+
+    /// Every range of the file anything is in, merged where closer than `gap`.
+    fn extents(&self, gap: u64) -> Vec<(u64, u64)> {
+        let mut all: Vec<(u64, u64)> = self.spaces.iter().map(|it| (it.0, it.1)).collect();
+        all.extend(self.parts.iter().map(|it| (it.0, it.1.len() as u64)));
+        merge(all, gap)
+    }
+}
+
+/// Sorts ranges and merges those that overlap or are closer than `gap`.
+fn merge(mut ranges: Vec<(u64, u64)>, gap: u64) -> Vec<(u64, u64)> {
+    ranges.retain(|it| it.1 > 0);
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (at, len) in ranges {
+        match merged.last_mut() {
+            Some(last) if at <= last.0 + last.1 + gap => last.1 = last.1.max(at + len - last.0),
+            _ => merged.push((at, len)),
         }
     }
-    for (offset, bytes) in state.parts.iter() {
-        copy(*offset, bytes);
+    merged
+}
+
+/// Splits ranges into runs of at most [`RUN`] bytes, cut at multiples of it.
+fn runs(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(mut at, len) in ranges {
+        let end = at + len;
+        while at < end {
+            let cut = ((at / RUN) + 1) * RUN;
+            let to = cut.min(end);
+            out.push((at, to - at));
+            at = to;
+        }
     }
     out
 }
 
-/// Every byte of `state`'s file, as writes.
+/// The bytes of `ranges` of `layout`'s file, built in parallel.
+fn fill(layout: &Layout<'_>, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {
+    ranges.par_iter().with_min_len(4).map(|&(at, len)| (at, layout.bytes(at, len))).collect()
+}
+
+/// The bytes of `state`'s file in `at..at + len`: zero where nothing is.
+pub(crate) fn file_bytes(state: &State, at: u64, len: u64) -> Vec<u8> {
+    Layout::of(state).bytes(at, len)
+}
+
+/// Every byte of `state`'s file, as runs of at most [`RUN`] bytes. The gaps between regions
+/// are zeros in a file just truncated, so runs span them up to a page.
 pub(crate) fn whole(state: &State) -> Vec<(u64, Vec<u8>)> {
-    let mut out = Vec::new();
-    for space in &state.spaces {
-        if let (Some(offset), false) = (space.offset, space.zero) {
-            let size = (space.region.size as usize).min(space.bytes.len());
-            if size > 0 {
-                out.push((offset, space.bytes[..size].to_vec()));
-            }
-        }
+    let layout = Layout::of(state);
+    fill(&layout, &runs(&layout.extents(GAP)))
+}
+
+/// The writes that put back `state`'s file where a commit overwrote `ranges` of it (the whole
+/// file when it was a full link): a rollback's.
+pub(crate) fn restore(state: &State, full: bool, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {
+    if full {
+        return whole(state);
     }
-    out.extend(state.parts.iter().cloned());
-    out
+    fill(&Layout::of(state), ranges)
+}
+
+/// A region's placed bytes, borrowed when its pages are.
+fn contents(space: &Space) -> Cow<'_, [u8]> {
+    if space.zero {
+        return Cow::Borrowed(&[]);
+    }
+    let size = space.region.size.min(space.bytes.len() as u64) as usize;
+    if size == space.bytes.len() { space.bytes.contiguous() } else { space.bytes.read(0, size) }
 }
 
 impl<'a> Stage<'a> {
     pub fn finish(mut self) -> Result<Finished, LinkError> {
+        self.update_lists()?;
         let mut parts = self.parts()?;
+        let contents: Vec<Cow<'_, [u8]>> = self.new.spaces.iter().map(contents).collect();
         let synthetic = {
-            let contents: Vec<&[u8]> = self.new.spaces.iter().map(|it| self.contents(it)).collect();
+            let refs: Vec<&[u8]> = contents.iter().map(|it| &**it).collect();
             let symbol = |name: &str| self.address_of(&parts.regions, name);
-            let placed = parts.placed(&self, &contents, &symbol);
+            let placed = parts.placed(&self, &refs, &symbol);
             self.writer.synthesize(&placed)?
         };
-        for (class, bytes) in synthetic {
+        let mut homes = Vec::with_capacity(synthetic.len());
+        for (class, bytes) in &synthetic {
             let at = self
                 .new
-                .space_of(&class)
+                .space_of(class)
                 .ok_or_else(|| error(None, format!("the writer filled {class:?}, which the image has no region for")))?;
-            let space = &mut self.new.spaces[at];
-            if bytes.len() as u64 > space.region.capacity {
+            let capacity = self.new.spaces[at].region.capacity;
+            if bytes.len() as u64 > capacity {
                 return Err(error(
                     None,
                     format!(
-                        "{class:?} is {} bytes and has room for {}: link the image from scratch",
-                        bytes.len(),
-                        space.region.capacity
+                        "{class:?} is {} bytes and has room for {capacity}: link the image from scratch",
+                        bytes.len()
                     ),
                 ));
             }
-            space.region.size = bytes.len() as u64;
-            space.bytes = Arc::new(bytes);
+            parts.regions[at].size = bytes.len() as u64;
+            homes.push(at);
         }
-        parts.regions = self.new.regions();
         let (offsets, file) = {
-            let contents: Vec<&[u8]> = self.new.spaces.iter().map(|it| self.contents(it)).collect();
+            let mut refs: Vec<&[u8]> = contents.iter().map(|it| &**it).collect();
+            for (at, (_, bytes)) in homes.iter().zip(&synthetic) {
+                refs[*at] = bytes.as_slice();
+            }
             let symbol = |name: &str| self.address_of(&parts.regions, name);
-            let placed = parts.placed(&self, &contents, &symbol);
-            let offsets: Vec<Option<u64>> =
-                self.new.spaces.iter().map(|it| self.writer.offset(&placed, &it.region)).collect();
+            let placed = parts.placed(&self, &refs, &symbol);
+            let offsets: Vec<Option<u64>> = parts.regions.iter().map(|it| self.writer.offset(&placed, it)).collect();
             (offsets, self.writer.file(&placed)?)
         };
+        drop(contents);
+        for (at, (_, bytes)) in homes.into_iter().zip(synthetic) {
+            let space = &mut self.new.spaces[at];
+            space.region.size = bytes.len() as u64;
+            space.bytes = CowBytes::from_vec(bytes);
+        }
         for (space, offset) in self.new.spaces.iter_mut().zip(offsets) {
             space.offset = if space.zero { None } else { offset };
         }
         self.new.file_len = file.len;
-        self.new.parts = Arc::new(file.parts);
+        self.new.parts = std::sync::Arc::new(file.parts);
         let message = self.output.live.is_some().then(|| self.message());
         let writes = if self.full { whole(&self.new) } else { self.dirty() };
-        let (undo, old_len) = if self.old.laid_out {
-            if self.full {
-                (whole(self.old), self.old.file_len)
-            } else {
+        let (undo, old_len) = match (self.old.laid_out, self.full) {
+            (false, _) => (Vec::new(), 0),
+            (true, true) => (Vec::new(), self.old.file_len),
+            (true, false) => {
                 let len = self.old.file_len;
                 let undo = writes
                     .iter()
                     .filter(|(at, _)| *at < len)
-                    .map(|(at, bytes)| (*at, file_bytes(self.old, *at, (bytes.len() as u64).min(len - at))))
+                    .map(|(at, bytes)| (*at, (bytes.len() as u64).min(len - at)))
                     .collect();
                 (undo, len)
             }
-        } else {
-            (Vec::new(), 0)
         };
         Ok(Finished { full: self.full, len: self.new.file_len, writes, undo, old_len, message, state: self.new })
     }
 
-    fn contents<'s>(&self, space: &'s crate::state::Space) -> &'s [u8] {
-        if space.zero {
-            return &[];
-        }
-        &space.bytes[..(space.region.size as usize).min(space.bytes.len())]
-    }
-
-    /// The ranges of the file an incremental link changes.
+    /// The ranges of the file an incremental link changes, and their bytes.
     fn dirty(&self) -> Vec<(u64, Vec<u8>)> {
-        let mut ranges: Vec<(u64, u64)> = Vec::new();
-        for id in &self.write {
-            let Some(piece) = self.new.piece(*id) else { continue };
-            let space = &self.new.spaces[piece.region as usize];
-            if let (Some(offset), false, false) = (space.offset, space.zero, piece.zero) {
-                if piece.size > 0 {
-                    ranges.push((offset + piece.addr - space.region.addr, piece.size));
-                }
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(self.write.len() + self.new.spaces.len());
+        for id in self.write.iter() {
+            let Some(piece) = self.new.piece(id) else { continue };
+            let Some(space) = self.new.spaces.get(piece.region as usize) else { continue };
+            let (Some(offset), false, false) = (space.offset, space.zero, piece.zero()) else { continue };
+            let at = offset + piece.addr - space.region.addr;
+            if piece.what() == What::Cells {
+                ranges.extend(self.dirty_cells.iter().map(|slot| (at + u64::from(slot) * 8, 8)));
+                continue;
             }
+            if piece.size == 0 {
+                continue;
+            }
+            let same_place = !self.fresh.contains(id)
+                && self.old.piece(id).is_some_and(|old| {
+                    old.addr == piece.addr
+                        && old.region == piece.region
+                        && self.old.spaces.get(old.region as usize).is_some_and(|it| it.offset == space.offset)
+                });
+            if same_place && self.old.bytes(id) == self.new.bytes(id) {
+                continue;
+            }
+            ranges.push((at, piece.size));
         }
         for (at, space) in self.new.spaces.iter().enumerate() {
             let Some(offset) = space.offset else { continue };
@@ -153,7 +269,7 @@ impl<'a> Stage<'a> {
                         ranges.push((offset + size, old.region.size - size));
                     }
                     if matches!(space.region.class, Class::Synthetic(_)) {
-                        let (a, b) = (self.contents(old), self.contents(space));
+                        let (a, b) = (contents(old), contents(space));
                         for start in (0..b.len()).step_by(BLOCK) {
                             let end = (start + BLOCK).min(b.len());
                             if a.get(start..end) != Some(&b[start..end]) {
@@ -165,20 +281,80 @@ impl<'a> Stage<'a> {
                 _ => ranges.push((offset, size.max(old.map_or(0, |it| it.region.size)))),
             }
         }
+        let mut old_parts: Vec<(u64, &[u8])> = self.old.parts.iter().map(|(at, bytes)| (*at, &bytes[..])).collect();
+        old_parts.sort_by_key(|it| it.0);
         for (offset, bytes) in self.new.parts.iter() {
-            if !self.old.parts.iter().any(|(o, b)| o == offset && b == bytes) {
+            let same = old_parts
+                .binary_search_by_key(offset, |it| it.0)
+                .is_ok_and(|at| old_parts[at].1 == &bytes[..]);
+            if !same {
                 ranges.push((*offset, bytes.len() as u64));
             }
         }
-        ranges.retain(|it| it.1 > 0);
-        ranges.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::new();
-        for (at, len) in ranges {
-            match merged.last_mut() {
-                Some(last) if at <= last.0 + last.1 => last.1 = last.1.max(at + len - last.0),
-                _ => merged.push((at, len)),
-            }
+        fill(&Layout::of(&self.new), &merge(ranges, GAP))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges_merge_across_small_gaps_only() {
+        let merged = merge(vec![(100, 8), (0, 10), (8, 4), (5000, 1), (100, 0), (9000, 10)], GAP);
+        assert_eq!(merged, [(0, 108), (5000, 4010)]);
+        assert_eq!(merge(vec![(0, 10), (10 + GAP + 1, 1)], GAP), [(0, 10), (10 + GAP + 1, 1)]);
+        assert_eq!(merge(vec![(0, 10), (10 + GAP, 1)], GAP), [(0, 11 + GAP)]);
+    }
+
+    #[test]
+    fn runs_cut_at_run_boundaries() {
+        assert_eq!(runs(&[(10, 20)]), [(10, 20)]);
+        assert_eq!(runs(&[(RUN - 4, 8)]), [(RUN - 4, 4), (RUN, 4)]);
+        let long = runs(&[(1, 3 * RUN)]);
+        assert_eq!(long.len(), 4);
+        assert_eq!(long.iter().map(|it| it.1).sum::<u64>(), 3 * RUN);
+        assert!(long.windows(2).all(|it| it[0].0 + it[0].1 == it[1].0));
+        assert!(long[1..].iter().all(|it| it.0 % RUN == 0));
+    }
+
+    /// The layout's copy against a reference that writes every region then every part into
+    /// one buffer of the whole file.
+    #[test]
+    fn layout_reads_what_a_whole_buffer_holds() {
+        let regions: Vec<(u64, CowBytes)> = vec![
+            (0x1000, CowBytes::from_vec((0..300u32).map(|it| it as u8).collect())),
+            (0x1200, CowBytes::from_vec(vec![7; 0x900])),
+            (0x4000, CowBytes::from_vec(vec![9; 10])),
+        ];
+        let parts: Vec<(u64, Vec<u8>)> = vec![(0, vec![1; 64]), (0x1100, vec![2; 4]), (0x5000, vec![3; 3])];
+        let layout = Layout {
+            spaces: regions.iter().map(|(at, bytes)| (*at, bytes.len() as u64, bytes)).collect(),
+            parts: parts.iter().map(|(at, bytes)| (*at, &bytes[..])).collect(),
+        };
+        let mut reference = vec![0u8; 0x5003];
+        for (at, bytes) in &regions {
+            let mut all = vec![0; bytes.len()];
+            bytes.copy_to(0, &mut all);
+            reference[*at as usize..*at as usize + all.len()].copy_from_slice(&all);
         }
-        merged.into_iter().map(|(at, len)| (at, file_bytes(&self.new, at, len))).collect()
+        for (at, bytes) in &parts {
+            reference[*at as usize..*at as usize + bytes.len()].copy_from_slice(bytes);
+        }
+        for (at, len) in [(0, 0x5003), (0x10f0, 0x20), (0x1fff, 2), (0x3000, 0x1001), (0x5002, 1), (0x5003, 5)] {
+            let mut want = vec![0u8; len];
+            let end = (at + len).min(reference.len());
+            if at < end {
+                want[..end - at].copy_from_slice(&reference[at..end]);
+            }
+            assert_eq!(layout.bytes(at as u64, len as u64), want, "{at:#x}+{len:#x}");
+        }
+        let extents = layout.extents(GAP);
+        assert_eq!(extents, [(0, 0x1b00), (0x4000, 0x1003)]);
+        let mut rebuilt = vec![0u8; 0x5003];
+        for (at, bytes) in fill(&layout, &runs(&extents)) {
+            rebuilt[at as usize..at as usize + bytes.len()].copy_from_slice(&bytes);
+        }
+        assert_eq!(rebuilt, reference);
     }
 }

@@ -53,6 +53,7 @@ pub type FnSigKind<'db> = rustc_type_ir::FnSigKind<DbInterner<'db>>;
 
 /// Every interned [`Ty`]. A `GenericArg` holds a row in 30 bits.
 static TYS: table::Rows<TyKind<'static>> = table::Rows::new("tys", table::LAST_ROW);
+table::erase!(TyKind);
 
 /// A type: its row in [`TYS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,9 +85,6 @@ impl<'db> Ty<'db> {
 
     #[inline]
     pub(super) fn intern(kind: TyKind<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe { std::mem::transmute::<TyKind<'db>, TyKind<'static>>(kind) };
         Self::at(TYS.intern(kind, || {
             let computed = FlagComputation::for_kind(&kind);
             table::RowInfo {
@@ -922,8 +920,7 @@ impl<'db> IntoKind for Ty<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Ty` is a row of `TYS`; the lifetime is as in `intern`.
-        unsafe { std::mem::transmute::<TyKind<'static>, TyKind<'db>>(TYS.kind(self.index)) }
+        TYS.kind(self.index)
     }
 }
 
@@ -1124,14 +1121,12 @@ impl<'db> Relate<DbInterner<'db>> for Ty<'db> {
 impl<'db> Flags for Ty<'db> {
     #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        // SAFETY: a `Ty` is a row of `TYS`.
-        unsafe { TYS.flags(self.index) }
+        TYS.flags(self.index)
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: as in `flags`.
-        unsafe { TYS.binder(self.index) }
+        TYS.binder(self.index)
     }
 }
 

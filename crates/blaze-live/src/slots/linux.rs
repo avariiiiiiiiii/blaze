@@ -23,7 +23,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::__register_frame,
+    unix::{__register_frame, image_base, in_image},
 };
 use crate::patch::MESSAGE_PREFIX;
 
@@ -85,6 +85,8 @@ pub(super) struct Os {
     code: Range<u64>,
     alias: u64,
     maps: Maps,
+    /// Where the image is loaded, which every data write is checked to be in.
+    base: u64,
 }
 
 impl Os {
@@ -118,7 +120,8 @@ impl Os {
             cell = protection;
             Ok(())
         })?;
-        Ok(Os { page, cell, code, alias, maps })
+        let base = image_base(at).ok_or_else(|| format!("no image has the table cell at {at:#x}"))?;
+        Ok(Os { page, cell, code, alias, maps, base })
     }
 
     fn pages(&self, range: &Range<u64>) -> Range<u64> {
@@ -139,8 +142,9 @@ impl Os {
                 std::io::Error::last_os_error()
             ));
         }
-        // SAFETY: the pages are writable now; nothing else of the program's writes the
-        // image's data a patch writes while `poll` writes it.
+        // SAFETY: the pages are the image's (`data` checked) and writable now; no other
+        // thread uses the bytes a patch rewrites while `poll` writes them (the rule
+        // `Live::poll` gives the program, the switch's module doc).
         unsafe { writes.put(pages, pages.start as *mut u8) };
         // SAFETY: as for making them writable: their protection from before.
         if unsafe { mprotect(start, len, protection) } != 0 {
@@ -223,7 +227,8 @@ impl Memory for Os {
         let to = self.alias + (hull.start - self.code.start);
         // SAFETY: the spans are in the patch code region (the switch checked), which `alias`
         // maps writable at the same offsets for as long as the program runs. The bytes
-        // written are where no kept generation's code is, so no thread runs them.
+        // written are over no code the cell ever pointed at nor any registered unwind entry
+        // (the switch's `Lasting`), so no thread runs them and no unwinder reads them.
         unsafe { writes.put(&hull, to as *mut u8) };
         flush(writes.spans.iter().map(|it| it.range()), self.alias.wrapping_sub(self.code.start));
         Ok(())
@@ -232,11 +237,15 @@ impl Memory for Os {
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         let mut run: Option<(Range<u64>, i32)> = None;
         for span in writes.spans {
+            in_image(&span.range(), self.base)?;
             self.maps.each(&span.range(), |piece, protection| {
+                if protection & PROT_READ == 0 {
+                    return Err(format!("data at {:#x}, in pages with no access", piece.start));
+                }
                 if protection & PROT_WRITE != 0 {
-                    // SAFETY: the piece is mapped writable (read at start); the image's data a
-                    // patch writes is written by nothing else of the program's while `poll`
-                    // writes it.
+                    // SAFETY: the piece is the image's (checked above) and mapped writable
+                    // (read at start); no other thread uses the bytes a patch rewrites while
+                    // `poll` writes them (the rule `Live::poll` gives the program).
                     unsafe { writes.put(&piece, piece.start as *mut u8) };
                     return Ok(());
                 }
@@ -263,7 +272,8 @@ impl Memory for Os {
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
         for &start in starts {
             // SAFETY: a run of entries in the patch's writes ending in a zero length (the
-            // switch checked), which stays mapped: the unwinder reads it from now on.
+            // switch checked), mapped and never written again (the switch's `Lasting`): the
+            // unwinder reads it from now on, and nothing takes it back.
             unsafe { __register_frame(start as *const u8) };
         }
         Ok(())

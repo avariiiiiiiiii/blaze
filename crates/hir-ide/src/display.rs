@@ -2457,7 +2457,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
         owner: ExpressionStoreOwnerId,
         store: &ExpressionStore,
     ) -> Result {
-        match &store[*self] {
+        match store.type_ref(*self) {
             TypeRef::Never => write!(f, "!")?,
             TypeRef::TypeParam(param) => {
                 let generic_params = GenericParams::of(f.db, param.parent());
@@ -2472,8 +2472,8 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                                 .filter_map(|it| match it {
                                     WherePredicate::TypeBound { lifetimes: _, target, bound }
                                         if matches!(
-                                            store[*target],
-                                            TypeRef::TypeParam(t) if t == *param
+                                            store.type_ref(*target),
+                                            TypeRef::TypeParam(t) if t == param
                                         ) =>
                                     {
                                         Some(bound)
@@ -2564,7 +2564,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeRefId {
                         write!(f, "{}...", if fn_.params.len() == 1 { "" } else { ", " })?;
                     }
                     write!(f, ")")?;
-                    match &store[*return_type] {
+                    match store.type_ref(*return_type) {
                         TypeRef::Tuple(tup) if tup.is_empty() => {}
                         _ => {
                             write!(f, " -> ")?;
@@ -2756,7 +2756,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for Path {
                         // First argument will be a tuple, which already includes the parentheses.
                         // If the tuple only contains 1 item, write it manually to avoid the trailing `,`.
                         let tuple = match generic_args.args[0] {
-                            hir_def::expr_store::path::GenericArg::Type(ty) => match &store[ty] {
+                            hir_def::expr_store::path::GenericArg::Type(ty) => match store.type_ref(ty) {
                                 TypeRef::Tuple(it) => Some(it),
                                 _ => None,
                             },
@@ -2772,7 +2772,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for Path {
                             }
                         }
                         if let Some(ret) = generic_args.bindings[0].type_ref
-                            && !matches!(&store[ret], TypeRef::Tuple(v) if v.is_empty())
+                            && !matches!(store.type_ref(ret), TypeRef::Tuple(v) if v.is_empty())
                         {
                             write!(f, " -> ")?;
                             ret.hir_fmt(f, owner, store)?;

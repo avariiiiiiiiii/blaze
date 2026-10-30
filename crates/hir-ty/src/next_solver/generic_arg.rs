@@ -603,19 +603,19 @@ impl<'db> rustc_type_ir::inherent::GenericArgs<DbInterner<'db>> for GenericArgs<
     fn type_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Ty {
         self.get(i)
             .and_then(|g| g.as_type())
-            .unwrap_or_else(|| Ty::new_error(DbInterner::conjure(), ErrorGuaranteed))
+            .unwrap_or_else(|| super::default_types().types.error)
     }
 
     fn region_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Region {
         self.get(i)
             .and_then(|g| g.as_region())
-            .unwrap_or_else(|| Region::error(DbInterner::conjure()))
+            .unwrap_or_else(|| super::default_types().regions.error)
     }
 
     fn const_at(self, i: usize) -> <DbInterner<'db> as rustc_type_ir::Interner>::Const {
         self.get(i)
             .and_then(|g| g.as_const())
-            .unwrap_or_else(|| Const::error(DbInterner::conjure()))
+            .unwrap_or_else(|| super::default_types().consts.error)
     }
 
     fn split_closure_args(self) -> rustc_type_ir::ClosureArgsParts<DbInterner<'db>> {

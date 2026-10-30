@@ -28,14 +28,14 @@ mod builder;
 use std::num::NonZeroU32;
 
 use cfg::CfgOptions;
-use hir::HirFileId;
+use hir::{HirFileId, InFile};
 use hir_def::unstable_features::UnstableFeatures;
 use rustc_hash::FxHashMap;
-use syntax::{TextRange, ast};
+use syntax::{SyntaxNodePtr, TextRange, ast};
 
 pub use crate::lints::registry::Level;
 
-use self::builder::{Levels, owner_rank, root_file};
+use self::builder::{Levels, When, owner_rank, root_file};
 use crate::{
     cx::Cx,
     lints::{
@@ -182,7 +182,26 @@ pub(super) struct Shared<'a, 'b, 'db> {
     fulfilled: Vec<u64>,
 }
 
-impl Shared<'_, '_, '_> {
+impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
+    fn new(cx: &'a Cx<'b, 'db>, cmd: &'a CommandLine, cfg: &'a CfgOptions, root: HirFileId) -> Self {
+        let registered_tools = ast::AnyHasAttrs::cast(cx.sema.parse_or_expand(root))
+            .map(|it| attrs::registered_tools(&it, cfg, cx.edition))
+            .unwrap_or_default();
+        Shared {
+            cx,
+            cmd,
+            store: Store { internal: false, registered_tools },
+            features: UnstableFeatures::query(cx.db, cx.krate.base()),
+            cfg,
+            root,
+            cmd_warnings: cmd.opts.iter().find(|(it, _)| it == "warnings").map(|&(_, it)| it),
+            warnings: LintId::of(registry::lint("warnings").expect("a builtin lint")),
+            sources: vec![Source::Default],
+            expects: FxHashMap::default(),
+            fulfilled: Vec::new(),
+        }
+    }
+
     pub(super) fn source(&mut self, source: Source) -> SourceId {
         let id = SourceId(u32::try_from(self.sources.len()).expect("fewer than 2^32 lint names"));
         self.sources.push(source);
@@ -305,39 +324,26 @@ impl Shared<'_, '_, '_> {
 /// root file as the pre-expansion lint pass runs, after the parser's errors; the rest of what
 /// is said of the attributes as the early lint pass comes to them, before the early lints;
 /// the `#[expect]`s nothing fulfilled after everything, unless `aborted`. When `aborted`,
-/// what is of [`Phase::Late`] is dropped.
+/// what is of [`Phase::Late`] is dropped. What more than one of rustc's builders says is here
+/// as many times, for `-Z deduplicate-diagnostics=no`: see [`builder::When`].
 pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, aborted: bool) -> Vec<Diag> {
     let walk = Walk::of(cx);
     let root = root_file(cx).expect("a crate's root module is a file");
-    let registered_tools = walk
-        .tree(root)
-        .and_then(|it| ast::AnyHasAttrs::cast(it.root.clone()))
-        .map(|it| attrs::registered_tools(&it, walk.cfg, cx.edition))
-        .unwrap_or_default();
-    let mut sh = Shared {
-        cx,
-        cmd,
-        store: Store { internal: false, registered_tools },
-        features: UnstableFeatures::query(cx.db, cx.krate.base()),
-        cfg: walk.cfg,
-        root,
-        cmd_warnings: cmd.opts.iter().find(|(it, _)| it == "warnings").map(|&(_, it)| it),
-        warnings: LintId::of(registry::lint("warnings").expect("a builtin lint")),
-        sources: vec![Source::Default],
-        expects: FxHashMap::default(),
-        fulfilled: Vec::new(),
-    };
-    let mut early = Levels::new(&mut sh, true);
+    let mut sh = Shared::new(cx, cmd, walk.cfg, root);
+    let mut early = Levels::new(&mut sh, true, true);
     early.walk(&mut sh, &walk);
-    let mut late = Levels::new(&mut sh, false);
+    let mut late = Levels::new(&mut sh, false, true);
     late.walk(&mut sh, &walk);
 
-    let (mut pre, mut during): (Vec<_>, Vec<_>) = std::mem::take(&mut early.emitted).into_iter().partition(|it| it.pre);
+    let (mut pre, mut during): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut early.emitted).into_iter().partition(|it| it.when == When::Pre);
     pre.sort_by(|a, b| a.place.cmp(&b.place));
     during.sort_by(|a, b| a.place.cmp(&b.place));
-    let extra = pre.len() + during.len();
+    let hir = std::mem::take(&mut late.emitted);
+    let extra = pre.len() + during.len() + hir.len();
     let mut pre = pre.into_iter().map(|it| it.diag);
     let mut during = during.into_iter().map(|it| it.diag);
+    let mut hir = hir.into_iter().map(|it| it.diag);
 
     let mut found = found;
     if aborted {
@@ -348,6 +354,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         .iter()
         .position(|it| it.phase > Phase::Resolve || (it.phase == Phase::Resolve && it.diag.is_lint()))
         .unwrap_or(found.len());
+    let hir_at = found.iter().position(|it| it.phase > Phase::Resolve).unwrap_or(found.len());
     let mut out = Vec::with_capacity(found.len() + extra + late.expectations.len());
     for (index, it) in found.into_iter().enumerate() {
         if index == pre_at {
@@ -355,6 +362,9 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         }
         if index == early_at {
             out.extend(during.by_ref());
+        }
+        if index == hir_at {
+            out.extend(hir.by_ref());
         }
         let lint = it.diag.lint_name().map(|name| {
             registry::declared(name).unwrap_or_else(|| panic!("`{name}` is not a lint of rustc's"))
@@ -373,6 +383,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     }
     out.extend(pre);
     out.extend(during);
+    out.extend(hir);
     if aborted {
         return out;
     }
@@ -399,4 +410,82 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         out.extend(sh.finish(unfulfilled, spec, diag));
     }
     out
+}
+
+/// The level rustc's HIR levels give the lint `lint` at the node `at` (`lint_level_at_node`):
+/// the attributes on it and around it, the command line `cmd`, `warnings` and `--cap-lints`.
+/// For a pass that must know a level before it can say what to emit (`missing_unsafe`'s
+/// `unsafe_op_in_unsafe_fn`). It reads the attributes of `at` and of each node out from it,
+/// with no walk of the crate and nothing said of the names: call it once for a diagnostic,
+/// not once for each node.
+pub(crate) fn level_at(cx: &Cx<'_, '_>, cmd: &CommandLine, lint: &str, at: InFile<SyntaxNodePtr>) -> Level {
+    let lint = registry::declared(lint).unwrap_or_else(|| panic!("`{lint}` is not a lint"));
+    let root = root_file(cx).expect("a crate's root module is a file");
+    let mut sh = Shared::new(cx, cmd, cx.krate.cfg(cx.db), root);
+    let mut levels = Levels::new(&mut sh, false, false);
+    let set = levels.set_of(&mut sh, at);
+    levels.spec(&sh, lint, set).level
+}
+
+#[cfg(test)]
+mod tests {
+    use hir::Semantics;
+    use syntax::AstNode;
+
+    use super::*;
+
+    /// [`level_at`] of `lint` at each function of the first workspace crate of `fixture`, by
+    /// name, with the lint flags `args`.
+    fn levels_of_fns(fixture: &str, args: &[&str], lint: &str) -> Vec<(String, Level)> {
+        let checked = crate::tests::checked(fixture);
+        let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+        let cmd = CommandLine::parse(&args).unwrap();
+        let db = &checked.db;
+        hir::attach_db(db, || {
+            let sema = Semantics::new_dyn(db);
+            let krate = hir::check::workspace_crates(db)[0];
+            let cx = Cx::new(&sema, krate, &checked.names);
+            let walk = Walk::of(&cx);
+            let mut out = Vec::new();
+            for tree in &walk.trees {
+                for node in &tree.nodes {
+                    let Some(name) = ast::Fn::cast(node.clone()).and_then(|it| it.name()) else { continue };
+                    let at = InFile::new(tree.file, SyntaxNodePtr::new(node));
+                    out.push((name.text().to_owned(), level_at(&cx, &cmd, lint, at)));
+                }
+            }
+            out
+        })
+    }
+
+    #[test]
+    fn level_at_a_node_has_its_attributes_the_command_line_and_the_cap() {
+        let fixture = r#"
+//- /main.rs crate:main edition:2021
+#![deny(unsafe_op_in_unsafe_fn)]
+mod m {
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub fn allowed() {}
+    pub fn denied() {}
+}
+#[expect(unsafe_op_in_unsafe_fn)]
+fn expected() {}
+fn main() {}
+"#;
+        let lint = "unsafe_op_in_unsafe_fn";
+        let named = |levels: &[(&str, Level)]| -> Vec<(String, Level)> {
+            levels.iter().map(|&(name, level)| (name.to_owned(), level)).collect()
+        };
+        assert_eq!(
+            levels_of_fns(fixture, &[], lint),
+            named(&[("allowed", Level::Allow), ("denied", Level::Deny), ("expected", Level::Expect), ("main", Level::Deny)])
+        );
+        assert_eq!(
+            levels_of_fns(fixture, &["--cap-lints", "warn"], lint),
+            named(&[("allowed", Level::Allow), ("denied", Level::Warn), ("expected", Level::Expect), ("main", Level::Warn)])
+        );
+        let plain = "//- /main.rs crate:main edition:2021\nfn main() {}\n";
+        assert_eq!(levels_of_fns(plain, &[], lint), named(&[("main", Level::Allow)]));
+        assert_eq!(levels_of_fns(plain, &["-F", "unsafe-op-in-unsafe-fn"], lint), named(&[("main", Level::Forbid)]));
+    }
 }

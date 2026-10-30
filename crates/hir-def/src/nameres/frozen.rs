@@ -1509,7 +1509,7 @@ impl Enc<'_> {
             self.extern_crate(it)?;
         }
         let mut legacy: Vec<_> = legacy_macros.iter().collect();
-        legacy.sort_unstable_by(|a, b| a.0.symbol().as_str().cmp(b.0.symbol().as_str()));
+        legacy.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
         self.usize(legacy.len())?;
         for (name, ids) in legacy {
             self.name(name)?;
@@ -1765,7 +1765,7 @@ impl Enc<'_> {
             self.symbol(it)?;
         }
         let mut features: Vec<Symbol> = unstable_features.iter().collect();
-        features.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        features.sort_unstable_by(Symbol::cmp_order);
         self.usize(features.len())?;
         for it in &features {
             self.symbol(it)?;
@@ -1811,7 +1811,7 @@ impl Enc<'_> {
             enc.option(use_, Self::use_id)
         })?;
         let mut macro_use: Vec<_> = macro_use_prelude.iter().collect();
-        macro_use.sort_unstable_by(|a, b| a.0.symbol().as_str().cmp(b.0.symbol().as_str()));
+        macro_use.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
         self.usize(macro_use.len())?;
         for (name, &(id, extern_crate)) in macro_use {
             self.name(name)?;

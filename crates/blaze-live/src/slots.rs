@@ -298,8 +298,10 @@ impl Live {
 
     /// Takes every message that came since the last call, in order, answers each, and says
     /// what became of the last. Call it where nothing of the program's is half done, such as
-    /// between two frames: code is only written here, and a function running when its patch
-    /// lands finishes as it was. While nothing came it is one atomic load.
+    /// between two frames. Code is only written here, never over code a thread can be in, so
+    /// a function running on any thread when its patch lands finishes as it was. Data a patch
+    /// changes in place (a static's new value) is written with plain stores, so no other
+    /// thread may use it while this runs. While nothing came it is one atomic load.
     pub fn poll(&mut self) -> Option<Outcome> {
         let mut last = None;
         loop {

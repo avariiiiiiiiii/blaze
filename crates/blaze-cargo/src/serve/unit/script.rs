@@ -13,6 +13,8 @@
 //!
 //! [`Lowered::ran`]: load_cargo::v2::Lowered::ran
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::BTreeMap,
     ffi::OsString,

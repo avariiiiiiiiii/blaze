@@ -596,7 +596,7 @@ impl Store {
     /// The lints registered, in rustc's order.
     pub fn lints(&self) -> impl Iterator<Item = &'static Lint> {
         let internal: &'static [Lint] = if self.internal { lints::INTERNAL } else { &[] };
-        lints::BUILTIN.iter().chain(internal)
+        lints::BUILTIN.iter().chain(lints::BLAZE).chain(internal)
     }
 
     /// The groups, in rustc's order, aliases included.
@@ -646,6 +646,7 @@ impl Store {
         if let Some(tool) = tool
             && tool != "rustc"
             && tool != "rustdoc"
+            && tool != BLAZE_TOOL
             && !PREDEFINED_TOOLS.contains(&tool)
             && !self.registered_tools.iter().any(|it| it == tool)
         {

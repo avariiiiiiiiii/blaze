@@ -47,6 +47,11 @@ impl LatePass for PtrNullChecks {
         let store = b.store();
         match store.expr(expr) {
             Expr::Call { callee, args } => {
+                // Every function of rustc's tables takes a raw pointer first.
+                let Some(&first) = args.first() else { return };
+                if !matches!(util::ty_adjusted(b, first).kind(), TyKind::RawPtr(..)) {
+                    return;
+                }
                 let Some(name) = callee_item(b, callee) else { return };
                 if matches!(name.as_str(), "ptr_const_is_null" | "ptr_is_null")
                     && let [arg] = args
@@ -90,8 +95,9 @@ impl LatePass for PtrNullChecks {
                     out.push(b.lint(diag, Phase::Late, at));
                 }
             }
-            Expr::MethodCall { receiver, .. } => {
-                if matches!(method_item(b, expr).as_ref().map(Symbol::as_str), Some("ptr_const_is_null" | "ptr_is_null"))
+            Expr::MethodCall { receiver, args: &[], .. } => {
+                if matches!(util::ty_adjusted(b, receiver).kind(), TyKind::RawPtr(..))
+                    && matches!(method_item(b, expr).as_ref().map(Symbol::as_str), Some("ptr_const_is_null" | "ptr_is_null"))
                     && let Some(useless) = useless_check(b, receiver)
                 {
                     emit_useless(b, expr, useless, out);

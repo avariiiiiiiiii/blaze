@@ -154,6 +154,8 @@ the pinned nightly, and value-only ones (`_mm_sfence`, `_mm512_cvtepu8_epi64`, `
 are safe, which is how ops are counted here. One comment above a `let` covers every single-op block
 in that statement's tuple or array (clippy walks up through expressions to the `let`).
 
+> forwarded to concurrency: `blaze-cas` and `blaze-reclaim` are its while it runs.
+
 ### blaze-cas
 
 - `crates/blaze-cas/src/chunk.rs:94` unsafe fn `cut_avx512`: no `# Safety`. Proposed, after its doc: `///\n/// # Safety\n///\n/// The CPU has AVX-512F: `cut` and `paths` call it only after `is_x86_feature_detected!("avx512f")`.`
@@ -207,3 +209,51 @@ in that statement's tuple or array (clippy walks up through expressions to the `
 
 - `crates/blaze-reclaim/src/lib.rs:95` block `unsafe { &*other }`: no SAFETY of its own (the comment above line 94 is the `drop` statement's). Proposed, above it: `// SAFETY: `other` is the block another thread linked on: leaked with `Box::into_raw` and never freed, so it lives for the process.` and narrow line 93 to `// SAFETY: `new` was never published, so this is its only owner.`
 - Checked, no other finding. Each of the other six blocks does one op and names what keeps its memory alive: a linked block is leaked and never freed (`:66`, `:91`), and a test node is freed only after a grace that its reader's task is inside (`tests.rs:140`, `:158`, `:171`).
+
+## Status of what was forwarded here (concurrency, 2026-10-29)
+
+- C6: done in `lib.rs` (`put_hashed`, `take_fetched` parses the frame in place and hashes once)
+  and `segment.rs` (`Own::put` takes the content and `&[u8]`). A fetch's `Done::Read` now
+  carries the whole answer frame (8-byte length, then the answer).
+- C1-C5, C7, C8: child `concurrency-remote` (owns `remote.rs`); report
+  `/tmp/blaze-lanes/v2-concurrency-remote.md`.
+- safety-audit findings for `blaze-cas` and `blaze-reclaim`: child `concurrency-safety`;
+  report `/tmp/blaze-lanes/v2-concurrency-safety.md`.
+- core-linux item 6 (packs written as block-aligned `WriteAt`): done; `Op::Append` is now
+  `Op::WritePack`, a `Truncate` then a `WriteAt` at the committed end.
+- usercode-concurrency item 3 (`blaze_cas::Reader`): exists, from `Store::reader()`.
+- Root `Cargo.toml` `blaze-reclaim = { path = "crates/blaze-reclaim" }`: already there.
+
+## Requests from concurrency (2026-10-29)
+
+### R1. format: the lock ban in `crates/blaze-ids/` and `crates/intern/`
+
+clippy reads only the nearest `clippy.toml`, so the hot-crate ban needs a copy per crate. Copy
+`crates/blaze-cas/clippy.toml` to `crates/blaze-ids/clippy.toml` and `crates/intern/clippy.toml`,
+landing with the fixes for the audit findings in `v2/requests/format.md` (until then the copy
+fails clippy on the locks those findings name).
+
+### R2. core: the lock ban in `crates/blaze-graph/`, and each job a reclamation boundary
+
+- Copy `crates/blaze-cas/clippy.toml` to `crates/blaze-graph/clippy.toml`, with the fixes for the
+  findings in `v2/requests/core.md`.
+- Take `let _task = blaze_reclaim::enter();` around each job `crates/blaze-graph/src/pool.rs`
+  `Local::run` (~line 778) runs, and add `blaze-reclaim.workspace = true` to blaze-graph's
+  `Cargo.toml`. Then every plane task is a quiescent boundary, and a store read inside a job can
+  take `blaze_reclaim::enter()` for free (guards nest). Without it, values the store retires are
+  freed only when the threads that read them next leave a guard they took themselves.
+
+### R3. fastcompile-global: frame the answers `blaze-global`'s `Remote` hands the store
+
+`crates/blaze-global/src/client.rs:663` and `:684` build `Done::Read(Answer::...encode())`.
+The store now reads a fetch's `Done::Read` as the whole frame (8-byte LE length, then the
+answer), so a remote can hand on the receive buffer without a copy (C5). Once
+`concurrency-remote` lands `Answer::encode_framed`, use it at both sites. Until then those
+answers are refused as malformed (an error, never a wrong value).
+
+### R4. store (or the coordinator): `docs/v2-store.md`
+
+It still describes `put` appending to memory under one writer, `Append`, and flags indexed by
+row with a delta entry of 48 bytes. Describe instead: `Reader` and `Writer`, per-worker
+segments, spots retargeted to packs after mapping, `WriteAt` pack writes, and point at
+`docs/v2/plan/lanes/concurrency/store.md`.

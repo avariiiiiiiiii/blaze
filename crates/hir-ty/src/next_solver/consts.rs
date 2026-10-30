@@ -31,6 +31,7 @@ pub type UnevaluatedConst<'db> = rustc_type_ir::UnevaluatedConst<DbInterner<'db>
 
 /// Every interned [`Const`]. A `GenericArg` holds a row in 30 bits.
 static CONSTS: table::Rows<ConstKind<'static>> = table::Rows::new("consts", table::LAST_ROW);
+table::erase!(ConstKind);
 
 /// A constant: its row in [`CONSTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,9 +61,6 @@ impl<'db> Const<'db> {
 
     #[inline]
     pub(super) fn intern(kind: ConstKind<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe { std::mem::transmute::<ConstKind<'db>, ConstKind<'static>>(kind) };
         Self::at(CONSTS.intern(kind, || {
             let computed = FlagComputation::for_const_kind(&kind);
             table::RowInfo {
@@ -265,10 +263,7 @@ impl<'db> IntoKind for Const<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Const` is a row of `CONSTS`; the lifetime is as in `intern`.
-        unsafe {
-            std::mem::transmute::<ConstKind<'static>, ConstKind<'db>>(CONSTS.kind(self.index))
-        }
+        CONSTS.kind(self.index)
     }
 }
 
@@ -370,14 +365,12 @@ impl<'db> Relate<DbInterner<'db>> for Const<'db> {
 impl<'db> Flags for Const<'db> {
     #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        // SAFETY: a `Const` is a row of `CONSTS`.
-        unsafe { CONSTS.flags(self.index) }
+        CONSTS.flags(self.index)
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: as in `flags`.
-        unsafe { CONSTS.binder(self.index) }
+        CONSTS.binder(self.index)
     }
 }
 

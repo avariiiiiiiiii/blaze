@@ -71,9 +71,14 @@ v2 interface; what changed from it is below.
   a failed append or sync, is made again as a rewrite from the state then, which holds every
   commit recorded since. The rewrite ends with a sequence record, so the numbers of removals
   it drops are not given out again after recovery.
-- Recovery rebuilds the tree and heads, skips damaged stretches, drops a head whose root did
-  not survive (falling back to its latest earlier move that did), and cuts a torn tail before
-  the first append.
+- Recovery loads a prefix: it stops at the first record that is not whole, fails its checksum
+  or is malformed, and never looks for records past it, since a torn record's payload can be
+  another journal whose records verify. It cuts the file there before the first append, so a
+  record past the damage cannot load later once the node it named is made again. Malformed
+  covers a sequence number at or above 2^63, which no journal reaches, so the next one never
+  overflows, and a directory record whose names are not distinct single components in tree
+  order. A head whose root is not loaded (only a forged file has one) is dropped, falling back
+  to its latest earlier move, and the file is rewritten without it.
 
 ## The disk as input
 

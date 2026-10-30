@@ -277,6 +277,9 @@ fn sse2() -> Option<Matcher> {
     is_x86_feature_detected!("sse2").then_some(lanes as Matcher)
 }
 
+/// # Safety
+///
+/// The CPU has SSE2: `sse2` hands it out only after detecting it.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn lanes_sse2(group: &[u8; GROUP], byte: u8) -> u16 {
@@ -297,6 +300,10 @@ fn neon() -> Option<Matcher> {
 }
 
 /// The comparison narrowed to 64 bits, four a lane, as NEON has no byte movemask.
+///
+/// # Safety
+///
+/// The CPU has NEON: `neon` hands it out only after detecting it.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn lanes_neon(group: &[u8; GROUP], byte: u8) -> u16 {

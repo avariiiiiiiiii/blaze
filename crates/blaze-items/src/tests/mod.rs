@@ -1,5 +1,6 @@
 //! Tests over fixtures: `test-fixture`'s `WithFixture` builds [`db::TestDB`] from text.
 
+mod coherence;
 mod db;
 mod facts;
 mod form;

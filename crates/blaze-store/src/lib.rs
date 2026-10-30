@@ -290,8 +290,10 @@ fn free_space(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         let path = std::ffi::CString::new(there.as_os_str().as_encoded_bytes()).ok()?;
-        // SAFETY: `path` ends in a zero and lives through the call, which fills `stats`.
+        // SAFETY: `libc::statvfs` is a C struct of integers, for which all zero bytes is a
+        // valid value.
         let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `path` ends in a zero and lives through the call, which fills `stats`.
         if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
             return None;
         }

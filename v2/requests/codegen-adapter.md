@@ -334,3 +334,39 @@ codegen-adapter's, but no brief gives these to it. Say whether they are codegen-
 each a lane's worth), and `Built::reached`/`NativeLib` in `blaze-codegen` come first.
 
 > forwarded to codegen: its lane decides which child owns these.
+
+## Done for the parent's codegen-changes.md (2026-10-29)
+
+- Interface: `CompiledFunction::{unwind, lines}`, `Unwind`, `Static`/`Init`, `Target::Weak`
+  (a static's `extern_weak` pointee) and the `DescribedStatic` fields were in already.
+- 6, 7: `v2/convert.rs` maps Cranelift's TLS relocations (`ElfX86_64TlsGd`, `MachOX86_64Tlv`,
+  `MachOAarch64TlsAdrPage21`/`PageOff12`, `Aarch64TlsDesc*`, `X86SecRel`) and ELF 19, 22, 23,
+  541, 542, 549, 551 and the four TLSDESC types onto the new kinds, and ELF 277, 278, 284, 285, 286
+  and 299 to `PageOffset12`. ELF 550 (`TLSLE_ADD_TPREL_LO12`, which checks for overflow) stays
+  an error: `TpLo12` is the unchecked form.
+- 8: the allocator shim is `Kind::Allocator(v2::allocator::Forward)`, one instance an entry
+  (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`, `__rust_alloc_zeroed`,
+  `__rust_alloc_error_handler`, `__rust_no_alloc_shim_is_unstable_v2`), its symbol in
+  `Described::symbol`, calling `Target::Extern` of the `#[global_allocator]`'s export or of
+  std's `__rdl_*`. `HirFrontend::allocator_shim(krate)` gives the entries and the
+  allocator's exported functions as roots; whoever builds a program's roots (a `main` or a
+  `cdylib`) adds them. Two `#[global_allocator]`s in one program are an error.
+- 11: variable scopes are in the side table (version 2): `side::Scopes` is made at prepare
+  time from the body (v1's `describe_scopes`), each scope's code from the line rows at emit,
+  and the shape (version 4) holds them.
+- 4: noted; `places.rs` still refuses writable data, and the programs it hits are reported
+  when the tree first runs (nothing can run before then).
+
+> applied: noted; a status report to codegen, nothing for the coordinator.
+
+## To codegen-release: `side::encode` takes the scopes
+
+`crates/hir-ty-codegen/v2/release.rs:263`:
+```rust
+let side = super::side::of(&function.variables, &function.scopes, code).map_err(|e| failed(unit, e))?;
+```
+(`side::of` gives the code's line rows and length to `side::encode`; the old two-argument
+`encode` is gone.) The header of `release.rs` cites `docs/v2-codegen.md`, now
+`docs/v2/plan/lanes/codegen.md`.
+
+> forwarded to codegen: its lane decides which child owns these.

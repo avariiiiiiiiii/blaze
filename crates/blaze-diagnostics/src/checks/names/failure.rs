@@ -261,7 +261,7 @@ fn similar_module_or_crate(cx: &Cx<'_, '_>, place: &At<'_>, name: &str) -> Optio
         }
     }
     candidates.retain(|it| !it.as_str().is_empty());
-    candidates.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    candidates.sort_unstable_by(|a, b| a.symbol().cmp_order(b.symbol()));
     candidates.dedup();
     let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
     find_best_match_for_name(&candidates, name, None).filter(|it| *it != name).map(str::to_owned)

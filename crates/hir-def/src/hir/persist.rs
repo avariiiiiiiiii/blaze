@@ -607,10 +607,11 @@ pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
         return None;
     }
     // SAFETY: `from_u32` needs a context of this database. `raw` is what `into_u32` gave in
-    // the database that wrote the buffer, which is the one reading it (the module's docs);
-    // `u32::MAX`, which `from_u32` would turn into an overflow, is refused above. Not yet
-    // upheld for a corrupted buffer: v2/requests/format.md, "format-hir-encode: untrusted
-    // salsa indices".
+    // the database that wrote the buffer, which is the one reading it (the module's docs):
+    // bytes from outside this process reach a `read` only through
+    // `blaze_format::read_verified`, which checks their content hash first, so a corrupted
+    // buffer is refused before any context is decoded. `u32::MAX`, which `from_u32` would turn
+    // into an overflow, is refused above.
     Some(unsafe { SyntaxContext::from_u32(raw) })
 }
 

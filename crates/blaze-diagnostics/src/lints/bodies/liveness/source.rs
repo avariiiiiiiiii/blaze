@@ -64,8 +64,9 @@ impl Source {
         let store = b.store();
         let mut source =
             Source { decls: FxHashMap::default(), assigns: FxHashMap::default(), assigned_by_value: FxHashMap::default() };
-        for &param in b.body.params.iter() {
-            source.matched(b, param, MirSpan::PatId(param));
+        for param in b.body.params.iter() {
+            source.matched(b, param.formal, MirSpan::PatId(param.formal));
+            source.matched(b, param.user_written, MirSpan::PatId(param.user_written));
         }
         for (id, expr) in store.exprs() {
             match expr {

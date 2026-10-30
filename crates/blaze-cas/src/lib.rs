@@ -905,6 +905,19 @@ impl Store {
     /// wherever it is, and a put whose bytes differ from the value kept is an error the caller
     /// sees (a key that misses an input).
     pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+        let content = content_of(&bytes);
+        self.put_hashed(unit, key, kind, content, &bytes)
+    }
+
+    /// [`Store::put_in`] of `bytes` whose hash the caller has: `content`.
+    fn put_hashed(
+        &mut self,
+        unit: Unit,
+        key: Key,
+        kind: Kind,
+        content: ContentId,
+        bytes: &[u8],
+    ) -> Result<Ticket, Mismatch> {
         assert!(unit.0 as usize <= self.tiers[0].units.len(), "{unit:?} is not one this store gave");
         assert!(self.tiers[0].opened, "a put into a store that is not open");
         self.tidy();
@@ -913,11 +926,12 @@ impl Store {
             && bytes.len() < cold::LONG_FROM
             && look.kept(&key).is_none()
             && look.dictionary_of(kind).is_none()
-            && look.columns_of(&bytes).is_none();
+            && look.columns_of(bytes).is_none();
         if sample {
-            self.sample(kind, &bytes);
+            self.sample(kind, bytes);
         }
-        let put = self.own.put(Look::new(&self.shared, Held::writer(&*self.shared)), unit, key, kind, bytes);
+        let look = Look::new(&self.shared, Held::writer(&*self.shared));
+        let put = self.own.put(look, unit, key, kind, content, bytes);
         if let Some(why) = self.own.segment().failed() {
             let (dir, why) = (self.tiers[0].dir.clone(), why.to_owned());
             self.fail(dir, why);
@@ -2261,16 +2275,21 @@ impl Store {
         self.finish_batches();
     }
 
+    /// A fetch's answer, as its frame came (its length, then the answer), read in place: the
+    /// value is hashed once, and copied once, into the store's segment.
     fn take_fetched(&mut self, key: Key, done: Done) -> Fetched {
-        let bytes = match done {
-            Done::Read(bytes) => bytes,
+        let frame = match done {
+            Done::Read(frame) => frame,
             done => return Fetched::Refused(describe(&done)),
         };
-        match remote::Answer::decode(&bytes) {
+        let Some(answer) = frame.get(8..) else {
+            return Fetched::Refused("its frame is shorter than its length".into());
+        };
+        match remote::parse(answer) {
             Err(why) => Fetched::Refused(why),
-            Ok(remote::Answer::Missing { key: it }) if it == key => Fetched::Missing,
-            Ok(remote::Answer::Value { key: it, kind, content, bytes }) if it == key => {
-                let found = content_of(&bytes);
+            Ok(remote::Parsed::Missing { key: it }) if it == key => Fetched::Missing,
+            Ok(remote::Parsed::Value { key: it, kind, content, bytes }) if it == key => {
+                let found = content_of(bytes);
                 if found != content {
                     return Fetched::Refused(format!(
                         "its bytes hash to {found:x}, not the {content:x} they were sent as"
@@ -2279,7 +2298,7 @@ impl Store {
                 if !self.tiers[0].opened || self.broken.is_some() {
                     return Fetched::Refused("the store is not open".into());
                 }
-                match self.put(key, kind, bytes) {
+                match self.put_hashed(Unit::SHARED, key, kind, content, bytes) {
                     Ok(ticket) => Fetched::Kept(ticket),
                     Err(mismatch) => Fetched::Refused(format!(
                         "the store keeps {:x} under it, not the {:x} sent",

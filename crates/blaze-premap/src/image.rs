@@ -8,7 +8,7 @@
 //! 16   key (32 bytes)
 //! 48   base u64, page u64
 //! 64   directory: SECTIONS x (offset u64, length u64)
-//! 224  the sections, each 64-byte aligned; segment bytes page-aligned, last
+//! 240  the sections, each 64-byte aligned; segment bytes page-aligned, last
 //! ```
 
 use blaze_codegen::Arch;
@@ -31,8 +31,9 @@ const FINI: usize = 5;
 const TLS: usize = 6;
 const UNWIND: usize = 7;
 const STRINGS: usize = 8;
-const BYTES: usize = 9;
-const SECTIONS: usize = 10;
+const THREAD_VARS: usize = 9;
+const BYTES: usize = 10;
+const SECTIONS: usize = 11;
 
 const DIRECTORY: usize = 64;
 const HEADER: usize = DIRECTORY + SECTIONS * 16;
@@ -48,7 +49,7 @@ const ENTRY: usize = 96;
 const TLS_RECORD: usize = 32;
 const UNWIND_RECORD: usize = 16;
 
-const _: () = assert!(HEADER == 224);
+const _: () = assert!(HEADER == 240);
 const _: () = assert!(4 + 12 + 64 + 8 + 4 + 4 == ENTRY);
 
 /// What an image is of.
@@ -117,19 +118,25 @@ pub(crate) fn encode(meta: &Meta, linked: &Prelinked, entries: &[(SymbolId, Def)
             tls.extend_from_slice(&it.to_le_bytes());
         }
     }
-    let mut unwind = Vec::with_capacity(linked.unwind.len() * UNWIND_RECORD);
-    for (addr, len) in &linked.unwind {
-        unwind.extend_from_slice(&addr.to_le_bytes());
-        unwind.extend_from_slice(&len.to_le_bytes());
-    }
+    let ranges = |list: &[(u64, u64)]| {
+        let mut out = Vec::with_capacity(list.len() * UNWIND_RECORD);
+        for (addr, len) in list {
+            out.extend_from_slice(&addr.to_le_bytes());
+            out.extend_from_slice(&len.to_le_bytes());
+        }
+        out
+    };
+    let unwind = ranges(&linked.unwind);
+    let thread_vars = ranges(&linked.thread_vars);
 
-    let small: [&[u8]; STRINGS + 1] = [&[], &table, &binds, &libraries, &init, &fini, &tls, &unwind, &strings];
+    let small: [&[u8]; THREAD_VARS + 1] =
+        [&[], &table, &binds, &libraries, &init, &fini, &tls, &unwind, &strings, &thread_vars];
     let mut at = HEADER;
     let mut directory = [(0u64, 0u64); SECTIONS];
     // The segment records come first, and their size is known before the bytes' offsets are.
     directory[SEGMENTS] = (at as u64, (linked.segments.len() * SEGMENT) as u64);
     at = align(at + linked.segments.len() * SEGMENT, 64);
-    for section in TABLE..=STRINGS {
+    for section in TABLE..=THREAD_VARS {
         directory[section] = (at as u64, small[section].len() as u64);
         at = align(at + small[section].len(), 64);
     }
@@ -163,7 +170,7 @@ pub(crate) fn encode(meta: &Meta, linked: &Prelinked, entries: &[(SymbolId, Def)
         out.push(prot_tag(segment.prot));
         out.extend_from_slice(&[0; 7]);
     }
-    for section in TABLE..=STRINGS {
+    for section in TABLE..=THREAD_VARS {
         out.resize(directory[section].0 as usize, 0);
         out.extend_from_slice(small[section]);
     }
@@ -257,6 +264,7 @@ impl<'a> View<'a> {
             (INIT, ENTRY),
             (FINI, ENTRY),
             (UNWIND, UNWIND_RECORD),
+            (THREAD_VARS, UNWIND_RECORD),
         ] {
             if directory[section].1 % record != 0 {
                 return bad(format!("has section {section} of no whole records"));
@@ -335,7 +343,30 @@ impl<'a> View<'a> {
                 return bad(format!("has call frame information at {addr:#x} outside its segments"));
             }
         }
+        for (addr, len) in view.thread_vars() {
+            if addr % 8 != 0 || len % 24 != 0 || !view.inside(addr, len, true) {
+                return bad(format!("has thread-local descriptors at {addr:#x} outside its writable segments"));
+            }
+        }
         Ok(view)
+    }
+
+    /// `bytes` [`View::parse`] accepted under `key` before, read again with no checks: for the
+    /// bytes an opened image keeps, which nothing writes. Bytes that were not checked so may
+    /// panic on a read, never more.
+    pub(crate) fn reopen(bytes: &'a [u8], key: ImageKey) -> View<'a> {
+        let format = format_of(bytes[12]).expect("checked when opened");
+        let arch = arch_of(bytes[13]).expect("checked when opened");
+        let meta = Meta { key, format, arch, base: u64_at(bytes, 48), page: u64_at(bytes, 56) };
+        let mut directory = [(0usize, 0usize); SECTIONS];
+        for (section, slot) in directory.iter_mut().enumerate() {
+            *slot = (
+                u64_at(bytes, DIRECTORY + section * 16) as usize,
+                u64_at(bytes, DIRECTORY + section * 16 + 8) as usize,
+            );
+        }
+        let table = TableView::trusted(&bytes[directory[TABLE].0..][..directory[TABLE].1]);
+        View { bytes, meta, directory, table }
     }
 
     pub fn meta(&self) -> Meta {
@@ -416,9 +447,18 @@ impl<'a> View<'a> {
     }
 
     pub fn unwind(&self) -> impl Iterator<Item = (u64, u64)> + 'a {
+        self.ranges(UNWIND)
+    }
+
+    /// Mach-O: the thread-local descriptors (three words each) the run's loader fills.
+    pub fn thread_vars(&self) -> impl Iterator<Item = (u64, u64)> + 'a {
+        self.ranges(THREAD_VARS)
+    }
+
+    fn ranges(&self, section: usize) -> impl Iterator<Item = (u64, u64)> + 'a {
         let view = *self;
-        (0..self.directory[UNWIND].1 / UNWIND_RECORD).map(move |at| {
-            let record = view.record(UNWIND, UNWIND_RECORD, at);
+        (0..self.directory[section].1 / UNWIND_RECORD).map(move |at| {
+            let record = view.record(section, UNWIND_RECORD, at);
             (u64_at(record, 0), u64_at(record, 8))
         })
     }

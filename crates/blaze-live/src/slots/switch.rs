@@ -10,6 +10,20 @@
 //! it. A rollback is the same towards an older generation, and only the cell's store when a
 //! table holds that generation still, or when it is the one the program started at (the
 //! loader's table).
+//!
+//! What a patch may write over:
+//! - Code goes only into the patch code region, and never over code of a generation whose
+//!   unwind entries were registered or that the cell may have pointed at ([`Lasting`]): a
+//!   thread can still be in that code however long ago the program left it, rolled back or
+//!   not.
+//! - Nothing goes over an unwind entry once registered, nor over the zero length ending a
+//!   registered run: the unwinder reads them from then on.
+//! - Data goes outside the patch code region, the table cell and the loader's table; the
+//!   platform checks that it is in the image.
+//! - Data writes are plain stores. While [`crate::slots::Live::poll`] runs, no other thread
+//!   may read or write the bytes a patch's data rewrites. That holds for data no code reaches
+//!   before the cell's store, such as a new static or a new unwind entry. For data running
+//!   code can reach, such as a static's new value, it is the program's to keep.
 
 use std::{
     ops::Range,
@@ -27,7 +41,7 @@ pub(crate) const KEPT: usize = 64;
 /// How many tables of its own a switch writes generations into, reused oldest first. A
 /// table is written while the cell points at another, and a thread that loaded the cell
 /// before it left this one reads each slot whole, of the generation it was in or the one
-/// it is brought to, both code that is written and stays mapped.
+/// it is brought to, both code that is written and never written again ([`Lasting`]).
 pub(crate) const POOL: usize = 4;
 const MOST_SLOTS: u64 = 1 << 26;
 const MOST_DIR: u64 = 4096;
@@ -242,7 +256,9 @@ impl<'a> Writes<'a> {
 }
 
 /// What a platform does to the memory of a running image. Every address is in memory
-/// (slid), and the switch has checked each is where the descriptor allows.
+/// (slid). The switch has checked that code is in the patch code region, that data is
+/// outside it, the cell and the loader's table, and that neither is over lasting memory
+/// (the module's rules). Whether data is in the image is the platform's to check.
 pub(crate) trait Memory {
     const DWARF: Dwarf;
     /// Whether the unwinder takes Windows `RUNTIME_FUNCTION`s.
@@ -320,6 +336,65 @@ impl Log {
     }
 }
 
+/// What a lasting range holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Holds {
+    Code,
+    Unwind,
+}
+
+/// Memory that never changes again, in memory, sorted and none overlapping: the code of
+/// every generation whose unwind entries were registered or that the cell may have pointed
+/// at (a thread can be in it however long ago the program left it), and every unwind entry
+/// registered (the unwinder reads it from then on, and not every platform can take one
+/// back). Each range is of one generation, by number.
+#[derive(Default)]
+struct Lasting {
+    ranges: Vec<(Range<u64>, u64, Holds)>,
+}
+
+impl Lasting {
+    /// The first lasting range `range` overlaps: a binary search.
+    fn hit(&self, range: &Range<u64>) -> Option<&(Range<u64>, u64, Holds)> {
+        let at = self.ranges.partition_point(|it| it.0.end <= range.start);
+        self.ranges.get(at).filter(|it| it.0.start < range.end)
+    }
+
+    /// Adds `range` of generation `number`, merged with what it overlaps: only ranges of the
+    /// same generation can, since a patch over a lasting range is refused.
+    fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
+        if range.is_empty() {
+            return;
+        }
+        let at = self.ranges.partition_point(|it| it.0.end <= range.start);
+        let (mut merged, mut holds, mut end) = (range, holds, at);
+        while let Some((next, _, other)) = self.ranges.get(end).filter(|it| it.0.start < merged.end) {
+            merged = merged.start.min(next.start)..merged.end.max(next.end);
+            if *other == Holds::Code {
+                holds = Holds::Code;
+            }
+            end += 1;
+        }
+        self.ranges.splice(at..end, [(merged, number, holds)]);
+    }
+}
+
+/// Why a write of `kind` over `hit` is refused, in linked addresses.
+fn over(kind: &str, hit: &(Range<u64>, u64, Holds), slide: u64) -> String {
+    let (range, number, holds) = hit;
+    let (start, end) = (range.start.wrapping_sub(slide), range.end.wrapping_sub(slide));
+    match holds {
+        Holds::Code => format!(
+            "{kind} over generation {number}'s code at {start:#x}..{end:#x}, which the program \
+             can be running"
+        ),
+        Holds::Unwind => format!(
+            "{kind} over generation {number}'s unwind entries at {start:#x}..{end:#x}, which \
+             the unwinder reads"
+        ),
+    }
+}
+
 /// A table of the switch's own: the generation whose slots it holds, and the count of
 /// publishes when the cell last pointed at it.
 struct Pooled {
@@ -337,9 +412,11 @@ struct Scratch {
     slots: Vec<u32>,
     fdes: Vec<(u64, u64)>,
     starts: Vec<u64>,
+    /// The zero length ending each run of entries registered, for `Dwarf::Sections`.
+    ends: Vec<u64>,
     functions: Vec<(u64, u64, u64)>,
-    lineage: Vec<u32>,
-    dropped: Vec<u32>,
+    /// Each RUNTIME_FUNCTION's unwind information.
+    unwinds: Vec<Range<u64>>,
     path: Vec<u32>,
 }
 
@@ -358,6 +435,7 @@ pub(crate) struct Switch<M: Memory> {
     /// The table the cell points at: the image's, or one of the pool.
     on: Option<usize>,
     published: u64,
+    lasting: Lasting,
     scratch: Scratch,
 }
 
@@ -381,6 +459,7 @@ impl<M: Memory> Switch<M> {
             pool: Vec::with_capacity(POOL),
             on: None,
             published: 0,
+            lasting: Lasting::default(),
             scratch: Scratch::default(),
         })
     }
@@ -498,10 +577,15 @@ impl<M: Memory> Switch<M> {
                 ));
             }
             if !bytes.is_empty() {
-                s.code.push(place(message, at, bytes, slide)?);
+                let placed = place(message, at, bytes, slide)?;
+                if let Some(hit) = self.lasting.hit(&placed.range()) {
+                    return Err(over("code", hit, slide));
+                }
+                s.code.push(placed);
             }
         }
         let cell = layout.table..layout.table.saturating_add(8);
+        let loaders = self.image..self.image.saturating_add(layout.slots.saturating_mul(8));
         s.data.clear();
         for (at, bytes) in patch.data {
             let range = span(at, bytes.len())?;
@@ -515,7 +599,17 @@ impl<M: Memory> Switch<M> {
                 return Err(format!("data over the jump table's cell at {:#x}", cell.start));
             }
             if !bytes.is_empty() {
-                s.data.push(place(message, at, bytes, slide)?);
+                let placed = place(message, at, bytes, slide)?;
+                if overlap(&placed.range(), &loaders) {
+                    return Err(format!(
+                        "data over the loader's jump table at {:#x}",
+                        loaders.start.wrapping_sub(slide)
+                    ));
+                }
+                if let Some(hit) = self.lasting.hit(&placed.range()) {
+                    return Err(over("data", hit, slide));
+                }
+                s.data.push(placed);
             }
         }
         // Code is inside the code region and data outside it, so only writes of one kind can
@@ -524,18 +618,6 @@ impl<M: Memory> Switch<M> {
             spans.sort_unstable_by_key(|it| it.at);
             if let Some(pair) = spans.windows(2).find(|it| it[1].at < it[0].end()) {
                 return Err(format!("two writes at {:#x}", pair[1].at.wrapping_sub(slide)));
-            }
-        }
-        s.lineage.clear();
-        s.lineage.extend(self.lineage());
-        for &generation in &s.lineage {
-            if let Some(range) = self.log.code(generation).iter().find(|it| hits(&s.code, it)) {
-                return Err(format!(
-                    "code over generation {}'s at {:#x}..{:#x}, which the program can be running",
-                    self.log.number[generation as usize],
-                    range.start.wrapping_sub(slide),
-                    range.end.wrapping_sub(slide)
-                ));
             }
         }
         s.slots.clear();
@@ -566,23 +648,32 @@ impl<M: Memory> Switch<M> {
                 ));
             }
         }
-        frames::<M>(patch, message, &s.code, &s.data, slide, &mut s.fdes, &mut s.starts)?;
+        frames::<M>(patch, message, &s.code, &s.data, slide, &mut s.fdes, &mut s.starts, &mut s.ends)?;
         if patch.windows().len() != 0 && !M::SEH {
             return Err("RUNTIME_FUNCTIONs, which this platform's unwinder doesn't take".to_owned());
         }
         s.functions.clear();
+        s.unwinds.clear();
         for (begin, end, unwind) in patch.windows() {
             let (slid_begin, slid_unwind) = (begin.wrapping_add(slide), unwind.wrapping_add(slide));
             if begin >= end || find(message, &s.code, slid_begin, end - begin).is_none() {
                 return Err(format!("a RUNTIME_FUNCTION of {begin:#x}..{end:#x}, not in the code"));
             }
-            if find(message, &s.code, slid_unwind, 4)
-                .or_else(|| find(message, &s.data, slid_unwind, 4))
-                .is_none()
-            {
+            let written = |len: u64| {
+                find(message, &s.code, slid_unwind, len)
+                    .or_else(|| find(message, &s.data, slid_unwind, len))
+            };
+            let Some(header) = written(4) else {
                 return Err(format!("unwind information at {unwind:#x}, in none of the writes"));
+            };
+            let len = unwind_len(header);
+            if written(len).is_none() {
+                return Err(format!(
+                    "unwind information at {unwind:#x} runs past the patch's writes ({len} bytes)"
+                ));
             }
             s.functions.push((slid_begin, end.wrapping_add(slide), slid_unwind));
+            s.unwinds.push(slid_unwind..slid_unwind + len);
         }
         let cells = patch.cells();
         if u32::try_from(self.log.slot.len() + cells.len()).is_err()
@@ -592,28 +683,24 @@ impl<M: Memory> Switch<M> {
             return Err("more generations, cells or code than this program counts".to_owned());
         }
 
-        // What was rolled back and this overwrites can't be gone back to, nor what was
-        // applied on it. Kept generations are in the order applied, a parent before its
-        // children, so one pass finds the descendants too.
-        s.dropped.clear();
-        for &generation in &self.kept {
-            if s.lineage.contains(&generation) {
-                continue;
-            }
-            let parent = self.log.parent[generation as usize];
-            if self.log.code(generation).iter().any(|it| hits(&s.code, it))
-                || (parent != generation && s.dropped.contains(&parent))
-            {
-                s.dropped.push(generation);
-            }
-        }
-        for &generation in &s.dropped {
-            self.forget(generation);
-        }
-
         let rebase = &s.rebase;
         self.memory.code(&Writes { message, spans: &s.code, rebase, slide })?;
         self.memory.data(&Writes { message, spans: &s.data, rebase, slide })?;
+        // From here the unwinder or a thread may read what this generation wrote, whatever
+        // becomes of the rest.
+        let number = patch.generation;
+        for span in &s.code {
+            self.lasting.add(span.range(), number, Holds::Code);
+        }
+        for &(at, len) in &s.fdes {
+            self.lasting.add(at..at + len, number, Holds::Unwind);
+        }
+        for &at in &s.ends {
+            self.lasting.add(at..at + 4, number, Holds::Unwind);
+        }
+        for unwind in &s.unwinds {
+            self.lasting.add(unwind.clone(), number, Holds::Unwind);
+        }
         self.memory.frames(&s.starts)?;
         self.memory.functions(&s.functions)?;
 
@@ -645,7 +732,8 @@ impl<M: Memory> Switch<M> {
         let slots = self.layout.slots as usize;
         // SAFETY: `slots` code addresses (the descriptor's count), 8-aligned (`Switch::new`
         // checked), in the image's data, mapped as long as it is. Nothing writes it: the
-        // switch stores only to the cell and its own tables.
+        // switch stores only to the cell and its own tables, and refuses data over it
+        // (`apply`).
         unsafe { std::slice::from_raw_parts(self.image as *const u64, slots) }
     }
 
@@ -762,13 +850,6 @@ impl<M: Memory> Switch<M> {
         Ok(())
     }
 
-    fn forget(&mut self, generation: u32) {
-        if let Some(at) = self.kept.iter().position(|it| *it == generation) {
-            self.kept.remove(at);
-            self.log.kept[generation as usize] = false;
-        }
-    }
-
     /// The newest generation of the current lineage with code at one of `pcs` (in memory),
     /// and its base, when that is kept to go back to.
     pub(crate) fn tie(&self, pcs: &[u64]) -> Option<(u64, u64)> {
@@ -856,7 +937,8 @@ fn place(message: &[u8], at: u64, bytes: &[u8], slide: u64) -> Result<Span, Stri
 
 /// Checks the FDEs of `patch` against the bytes it writes (`code` and `data`) and puts in
 /// `starts` what to register at, in memory: each FDE, or the start of each run of entries
-/// that ends in a zero length.
+/// that ends in a zero length, and in `ends` where each such zero length is.
+#[allow(clippy::too_many_arguments)]
 fn frames<M: Memory>(
     patch: PatchView<'_>,
     message: &[u8],
@@ -865,9 +947,11 @@ fn frames<M: Memory>(
     slide: u64,
     fdes: &mut Vec<(u64, u64)>,
     starts: &mut Vec<u64>,
+    ends: &mut Vec<u64>,
 ) -> Result<(), String> {
     fdes.clear();
     starts.clear();
+    ends.clear();
     if patch.frames().len() == 0 {
         return Ok(());
     }
@@ -913,6 +997,7 @@ fn frames<M: Memory>(
                 loop {
                     let field = length(at)?;
                     if field == 0 {
+                        ends.push(at);
                         break;
                     }
                     if field == u32::MAX {
@@ -945,11 +1030,24 @@ fn find<'m>(message: &'m [u8], spans: &[Span], at: u64, len: u64) -> Option<&'m 
     (end <= span.len as u64).then(|| &message[span.from + offset as usize..span.from + end as usize])
 }
 
-/// Whether any of `spans` (sorted, not overlapping) overlaps `range`: a binary search.
-fn hits(spans: &[Span], range: &Range<u64>) -> bool {
-    spans
-        .get(spans.partition_point(|it| it.end() <= range.start))
-        .is_some_and(|it| it.at < range.end)
+/// The length of the UNWIND_INFO whose first 4 bytes are `header`: the fixed part, the unwind
+/// codes (2 bytes each, an even count), then the handler's address or the chained
+/// RUNTIME_FUNCTION. Not counted: a handler's data after its address, whose length only the
+/// handler knows.
+fn unwind_len(header: &[u8]) -> u64 {
+    const EHANDLER: u8 = 1;
+    const UHANDLER: u8 = 2;
+    const CHAININFO: u8 = 4;
+    let flags = header[0] >> 3;
+    let codes = u64::from(header[2]).next_multiple_of(2);
+    let after = if flags & CHAININFO != 0 {
+        12
+    } else if flags & (EHANDLER | UHANDLER) != 0 {
+        4
+    } else {
+        0
+    };
+    4 + 2 * codes + after
 }
 
 fn span(at: u64, len: usize) -> Result<Range<u64>, String> {

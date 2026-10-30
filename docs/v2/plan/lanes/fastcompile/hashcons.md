@@ -1,0 +1,158 @@
+---
+status: plan
+summary: blaze v2 lane fastcompile, idea 5 (hash-consing of query values): crates/blaze-hashcons, its sharded append-only interner with lock-free reads, fingerprints computed once at intern, persistence by content, the hooks in blaze-query and salsa, and the state of the art it matches or beats.
+date: 2026-10-29
+---
+# fastcompile: hash-consing of query values (`crates/blaze-hashcons`)
+
+Idea 5 of [compile-time.md](../../design/compile-time.md): equal values are stored once, so
+comparing two is comparing IDs, and a value's fingerprint is computed once, when it is
+interned. Early cutoff no longer hashes whole values.
+
+## What it is
+
+- **`Consed`**: a type that can be hash-consed. It names its hash domain
+  (`blaze_ids::Domain`, `"blaze v2 <what> <n>"`) and feeds its content to a
+  `blaze_ids::Hasher`: its own bytes, and each interned part by its content ID
+  (`Interned::hash_into`), never by its index. So a composite's content is a Merkle hash of its
+  parts: interning one costs its direct parts, not the whole tree under it.
+- **`HashCons<T>`**: the interner. `intern(value)` computes the value's `ContentId` once
+  (`content_of`) and returns an `Interned<'_, T>`; `get`, `handle` and `lookup` go from an
+  `Idx<T>` or a `ContentId` to the value. It also implements `blaze_ids::Interner<T>`, checking
+  the content ID it is handed against the value's.
+- **`Interned<'a, T>`**: one pointer to the node (content ID, index, value). `==` is pointer
+  equality; `Hash` writes the 128-bit fingerprint; no `Ord`; `Deref` to `T`. `idx()` gives the
+  dense `blaze_ids::Idx<T>` for columns of this run.
+- **Persistence by content** (`persist.rs`): `Interned<'static, T>` is `Persist` as `T`'s own
+  bytes and schema. `Load` makes a value again from its bytes, interning its parts again;
+  `HashCons::load` / `load_verified` intern one value, `write_pack` / `load_pack` /
+  `load_pack_verified` a whole interner.
+
+No second fingerprint type and no second ID type: the content ID, its first 128 bits as
+`blaze_ids::Fingerprint` (the same as `ContentId::fingerprint` everywhere), and `blaze_ids::Idx`.
+
+## The table
+
+- **Shards**: `blaze_ids::shard_count()` of them (a power of two, at least 4 per core), picked
+  by fingerprint bits 0..32, each padded to 128 bytes.
+- **Per-shard arena**: append-only chunks, chunk `k` holding `64 << k` slots, so a node never
+  moves and a handle lives as long as the interner. A slot is a `OnceLock<Node<T>>` set once
+  under the shard's lock.
+- **Per-shard index**: an open-addressed table of `AtomicU64`s, each the fingerprint's bits
+  32..64 as a tag and the arena place plus one. A probe starts at bits 64..128 and loads a node
+  only when the tag matches. A table at half load is copied into one twice its size under the
+  lock and published with one release store of its level; tables it outgrew stay until the
+  interner is dropped (at most as much again), so readers never wait for a resize.
+- **IDs**: `Idx` raw = arena place shifted past the shard bits, ored with the shard. An index
+  to `&T` is index arithmetic and two acquire loads: no lock, no shared write.
+- **Reads** (`get`, `handle`, `lookup`, and an `intern` of a value already there): acquire
+  loads only. **Inserts** of a new value lock its one shard to look again, append and publish
+  the entry with a release store, and run no code of `T` under the lock (the comparison and
+  drop of a value found on the second look happen after it is let go of).
+- **Collisions**: every fingerprint match is checked on intern. Equal fingerprints with
+  different content IDs (a 128-bit collision) or equal content IDs with unequal values (a
+  `hash_content` that misses something `Eq` compares) stop the process naming the type, since
+  either would alias two values in every memo that compares fingerprints. The odds of a real
+  collision among n values are about n²/2¹²⁹ for the fingerprint: for 2³² values in one
+  interner, 2⁻⁶⁵. The check still runs, as it costs one 32-byte compare and one `Eq` per hit,
+  and the `Eq` of a value of interned parts is a few pointer compares.
+
+The crate has no unsafe code of its own (`#![deny(unsafe_code)]`; `record!` writes the pack's
+`unsafe impl Record`, allowed on that one module). A slot without `OnceLock` (a
+`MaybeUninit` published by the shard's length) would save 8 bytes and one load per node; it is
+not taken without a measurement that says it pays ([unsafe.md](../../design/unsafe.md)).
+
+## Determinism: where the types enforce it
+
+IDs depend on the order threads interned in; content IDs and fingerprints don't. The rule of
+[crates.md](../../reference/crates.md) (a dense index never goes into a hash, a key or an
+output) holds by types:
+
+- `blaze_ids::Hasher` takes bytes and content IDs only, so a content hash can't include an
+  `Idx` but by spelling out `Idx::raw`; `Consed::hash_content` feeds parts through
+  `Interned::hash_into`, which feeds the content ID.
+- `Idx` is neither `Serialize` nor a `blaze_format::Record`, so it can't be written into CBOR or
+  a format buffer. `Interned` persists as its value's bytes.
+- `Interned`'s `Hash` is its fingerprint, the same in every run, so a salsa value fingerprint or
+  a map's hash of it is deterministic. It has no `Ord`; ordering goes through
+  `Interned::content`, and `HashCons::sorted` and `write_pack` are in content ID order.
+- What remains by convention: `Idx`'s own `Hash` and `Ord` (blaze-ids', for maps and columns of
+  one run). Iterating a map keyed by `Idx` into an output would leak the order; nothing in this
+  crate does.
+
+The determinism test interns the same values from 8 threads in 8 shuffled orders and from one
+thread in reverse, and checks equal content IDs, fingerprints and pack bytes.
+
+## The hooks
+
+- **blaze-query** (request `fastcompile-ident-hashcons 1`, `crates/blaze-query/src/lib.rs`,
+  `Query::fingerprint` and `run_query`): early cutoff there already compares fingerprints
+  (`Database::verify`); the whole-value cost is the default `fingerprint`, which serializes the
+  value a second time and BLAKE3s it. Handed the bytes already written, the default writes
+  once (cheaper than today for every query), and a query with `type Value =
+  Interned<'static, T>` returns `value.fingerprint()`, computed once at intern.
+- **salsa** (request `fastcompile-ident-hashcons 2`): no change. `backdate_if_appropriate`
+  (`vendor/salsa/src/function/backdate.rs`) calls the generated `values_equal`
+  (`old_value == new_value`), which for an `Interned` output is one pointer compare, and on an
+  evicted value `Fingerprint::of_value`, which for one hashes 16 bytes. A tracked function opts
+  in by its output type; the rest are unchanged.
+- **Lifetime**: an interner lives as long as the database whose values it holds and is leaked
+  with it (as `crates/intern`'s are), so `Interned<'static, T>` is a `'static` salsa value. At
+  the settle swap the image's values are made again by content (`load_pack`), so a long-lived
+  daemon's interners don't grow without bound across generations.
+
+## The state of the art, and how this compares
+
+- **rustc's interners** (`CtxtInterners`, `InternedSet` over a `ShardedHashMap`, values in a
+  `DroplessArena`, `Interned<'tcx, T>` compared and hashed by address): lookups lock their shard
+  in the parallel front end, and the address hash is meaningful in one process only. Here a
+  lookup takes no lock and writes nothing, and the hash is the content fingerprint, the same in
+  every run.
+- **rustc's cached stable hashes** (`WithCachedTypeInfo::stable_hash`, kept beside interned
+  types under incremental compilation) and **its red-green graph** (`DepGraph`, `hash_result`
+  over the whole result on each execution, `try_mark_green` comparing dependencies'
+  fingerprints): rustc computes the fingerprint once per type but hashes every query result
+  again. Here every hash-consed value, of any type, gets its fingerprint once at intern, a
+  composite from its parts' content IDs, and blaze-query's cutoff reads it.
+- **salsa's interned structs** (`#[salsa::interned]`: sharded tables behind locks, IDs valid
+  within one database and revision-tracked): IDs to values are lock-free there too, but a
+  lookup by value takes its shard's lock, and IDs can't be persisted. Here a lookup by content
+  is lock-free, and persistence goes by content.
+- **The `hashconsing` crate** (a weak table `HashMap<T, Weak<…>>` with a unique `u64` id per
+  value, `Arc`-counted handles, freed when the last handle drops): each handle clone is a shared
+  counter write, and ids hash differently per run. Here a handle is a plain pointer copy, with
+  no count, and lives as long as the interner; memory is reclaimed by generation (the settle
+  swap), not per value.
+- **egg's e-graph hash-consing** (`memo: HashMap<L, Id>` over e-nodes whose children are
+  union-find `Id`s, canonicalized when rebuilding): single-threaded, with ids that depend on
+  insertion order. Here children are named by content ID (Merkle, as Unison names definitions),
+  so a composite's identity is the same in every run and on disk; there is no congruence
+  closure, as query values are never rewritten.
+- **Concurrent hash tables**: folly's `ConcurrentHashMap` (segment locks for writers, hazard
+  pointers for readers), `papaya` (lock-free with incremental resizing and epoch reclamation via
+  `seize`), `scc` (`HashIndex`: lock-free reads, EBR). They pay for deletion: hazard-pointer
+  stores or epoch pins on every read. An append-only hash-cons never deletes, so a read here is
+  acquire loads and no store of any kind, and a resize copies under the shard lock while
+  readers go on probing the old level. Sylvan's lock-free unique table for BDD nodes inserts by
+  compare-and-swap; here a miss locks its one shard, which also serializes the equality check of
+  a racing equal value (a CAS insert would need a node published before its check). That is the
+  measurement to make next: under a many-thread cold intern, whether shard contention shows
+  (shards are 4 per core).
+
+## Tests (`crates/blaze-hashcons/src/tests.rs`)
+
+- Unit: one handle and index per value, both ways between index, content and value, chunks
+  cover every place, tables grow and keep every value, values never move.
+- Property: 20 000 random leaves and pairs (a composite of interned leaves) from a small domain,
+  checked against a sequential model (a `BTreeMap` from value to its first handle):
+  `intern(a) == intern(b)` exactly when `a == b`.
+- Stress: 16 threads interning one value 2 000 times each and 10 000 shared values in rotated
+  orders: one index per value, every thread's indices naming its values.
+- Collisions: a type whose `hash_content` ignores a field stops on its twin; the `Interner`
+  impl refuses a content ID that isn't the value's.
+- Persistence: a handle's bytes are its value's; a value loads and loads verified (a wrong key is
+  `FormatError::Hash`); a pack loads into fresh interners (pairs through their leaves' interner)
+  and writes the same bytes again; a pack refuses another schema, a wrong key, and a value whose
+  content isn't its entry's (before interning it).
+- Determinism: 8 threads in shuffled orders against one thread in reverse give the same content
+  IDs, fingerprints and pack bytes.

@@ -326,6 +326,7 @@ impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'d
 
 /// Every interned [`ValTree`], kept whole: [`ValTree::inner`] hands out a reference.
 static VALTREES: table::Values<ValTreeKind<'static>> = table::Values::new("valtrees");
+table::erase!(ValTreeKind);
 
 /// A value tree: its row in [`VALTREES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -378,18 +379,12 @@ impl<'db> IntoKind for ValTree<'db> {
 impl<'db> ValTree<'db> {
     #[inline]
     pub fn new(kind: ValTreeKind<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe { std::mem::transmute::<ValTreeKind<'db>, ValTreeKind<'static>>(kind) };
         Self::at(VALTREES.intern(kind))
     }
 
     #[inline]
     pub fn inner(&self) -> &ValTreeKind<'db> {
-        // SAFETY: a `ValTree` is a row of `VALTREES`.
-        let inner = unsafe { VALTREES.get(self.index) };
-        // SAFETY: as in `new`.
-        unsafe { std::mem::transmute::<&ValTreeKind<'static>, &ValTreeKind<'db>>(inner) }
+        VALTREES.get(self.index)
     }
 
     pub fn from_scalar_int(_interner: DbInterner<'db>, i: ScalarInt) -> Self {

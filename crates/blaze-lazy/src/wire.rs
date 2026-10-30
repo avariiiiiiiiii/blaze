@@ -39,6 +39,8 @@ pub enum WireError {
     Trailing { kind: u32, extra: usize },
     LongWhy(usize),
     Utf8,
+    /// An answer sent to the daemon, which only asks come to.
+    Unasked,
 }
 
 impl fmt::Display for WireError {
@@ -53,6 +55,7 @@ impl fmt::Display for WireError {
             }
             WireError::LongWhy(len) => write!(f, "a failure reason of {len} bytes, past {MOST_WHY}"),
             WireError::Utf8 => write!(f, "a failure reason that is not UTF-8"),
+            WireError::Unasked => write!(f, "an answer frame from the run process, which only asks"),
         }
     }
 }
@@ -124,6 +127,16 @@ impl Frame<'_> {
             }
         }
     }
+}
+
+/// A `Ready` frame, on the stack: an ask of a published function allocates nothing.
+pub fn ready(request: u64, lazy: u32, target: u64) -> [u8; READY_LEN] {
+    let mut out = [0; READY_LEN];
+    out[0..4].copy_from_slice(&READY.to_le_bytes());
+    out[4..8].copy_from_slice(&lazy.to_le_bytes());
+    out[8..16].copy_from_slice(&request.to_le_bytes());
+    out[16..24].copy_from_slice(&target.to_le_bytes());
+    out
 }
 
 fn head(out: &mut Vec<u8>, kind: u32, lazy: u32, request: u64) {

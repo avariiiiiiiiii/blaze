@@ -12,4 +12,4 @@ pub use self::intern_slice::{
     HeaderSlice, HeaderWithLength, InternSliceStorage, InternedSlice, InternedSliceRef,
     SliceInternable, impl_slice_internable,
 };
-pub use self::symbol::{Symbol, symbols as sym};
+pub use self::symbol::{Symbol, order_key, symbols as sym};

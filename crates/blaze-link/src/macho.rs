@@ -16,8 +16,8 @@
 //! descriptors by their section's type (`S_THREAD_LOCAL_VARIABLES`): they are all in
 //! [`Class::ThreadVars`], C objects' too.
 //!
-//! Names in Mach-O carry a leading underscore and the core's don't ([`core_name`],
-//! [`macho_name`]); a Mach-O name without one (`section$start$...`) is the core's with a
+//! Names in Mach-O carry a leading underscore and the core's don't ([`push_core_name`],
+//! [`spelled`]); a Mach-O name without one (`section$start$...`) is the core's with a
 //! leading `\x01`, as LLVM writes a name taken as it is.
 
 mod archive;
@@ -87,8 +87,8 @@ struct MachO {
     cache: Option<Mutex<sign::Cache>>,
 }
 
-/// The name the core knows a Mach-O symbol by: without its leading underscore, or with a
-/// leading `\x01` when it has none.
+/// [`push_core_name`] as a `String`: the readers' tests compare against it.
+#[cfg(test)]
 pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
     let name = std::str::from_utf8(name)
         .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;
@@ -98,13 +98,24 @@ pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
     })
 }
 
-/// [`core_name`] added to a file's `names`: no `String` of its own, but for the rare name
-/// without an underscore, which gains a `\x01`.
+/// The name the core knows a Mach-O symbol by, added to a file's `names`: without its leading
+/// underscore, or with a leading `\x01` when it has none. No `String` of its own: a name
+/// without an underscore (clang's kept `ltmp0`, `l_` labels) gains its `\x01` on the stack.
 pub(super) fn push_core_name(names: &mut Names, name: &[u8]) -> Result<Name, String> {
     let text = std::str::from_utf8(name)
         .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;
-    match text.strip_prefix('_') {
-        Some(rest) => names.push(rest),
+    if let Some(rest) = text.strip_prefix('_') {
+        return names.push(rest);
+    }
+    let mut buffer = [0u8; 256];
+    match buffer.get_mut(1..=text.len()) {
+        Some(tail) => {
+            tail.copy_from_slice(text.as_bytes());
+            buffer[0] = 1;
+            let marked = std::str::from_utf8(&buffer[..=text.len()])
+                .expect("`\\x01` and a `str` are UTF-8");
+            names.push(marked)
+        }
         None => names.push(&format!("\x01{text}")),
     }
 }

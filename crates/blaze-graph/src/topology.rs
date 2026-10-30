@@ -14,10 +14,12 @@
 //! Group ids are dense from 0 and stable for a machine: sorted by their first CPU.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs, io,
     path::{Path, PathBuf},
 };
+
+use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cpu {
@@ -66,7 +68,7 @@ impl Topology {
         let online = list(&read(&root.join("online"))?)
             .map_err(|why| at(&root.join("online"), why))?;
         let mut found = Vec::with_capacity(online.len());
-        let mut capacities = BTreeMap::new();
+        let mut capacities: FxHashMap<u32, u64> = FxHashMap::default();
         for &id in &online {
             let cpu = root.join(format!("cpu{id}"));
             let cache = last_level(&cpu)?.map(|it| &it & &online);
@@ -89,13 +91,15 @@ impl Topology {
             }
             found.push((id, share, socket.unwrap_or(0), node_of(&cpu)?));
         }
-        let node: BTreeMap<u32, u32> = found.iter().map(|&(id, _, _, node)| (id, node)).collect();
+        let node: FxHashMap<u32, u32> =
+            found.iter().map(|&(id, _, _, node)| (id, node)).collect();
         let fastest = capacities.values().copied().max();
-        let mut sets: BTreeMap<BTreeSet<u32>, u32> = BTreeMap::new();
+        // Groups are numbered in the order they are first met, so the map's order is never read.
+        let mut sets: FxHashMap<Vec<u32>, u32> = FxHashMap::default();
         let mut cpus = Vec::with_capacity(found.len());
         for (id, share, socket, home) in found {
             // A cache shared across nodes is split by node: a group's memory is all local.
-            let share: BTreeSet<u32> =
+            let share: Vec<u32> =
                 share.into_iter().filter(|it| node.get(it) == Some(&home)).collect();
             let next = u32::try_from(sets.len()).unwrap_or(u32::MAX);
             let group = *sets.entry(share).or_insert(next);
@@ -137,16 +141,18 @@ impl Topology {
     /// its NUMA node, then of its socket, then the rest, each nearest by id first (ties to the
     /// lower). Empty for a group the topology does not have.
     pub fn steal_order(&self, group: u32) -> Vec<u32> {
-        let mut place_of: BTreeMap<u32, (u32, u32)> = BTreeMap::new();
+        let mut place_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
         for cpu in &self.cpus {
             place_of.entry(cpu.group).or_insert((cpu.socket, cpu.node));
         }
         let Some(&(socket, node)) = place_of.get(&group) else { return Vec::new() };
-        let mut rest: Vec<u32> = place_of.keys().copied().filter(|&it| it != group).collect();
-        rest.sort_by_key(|&it| {
-            let (its_socket, its_node) = place_of[&it];
+        let mut rest: Vec<(u32, (u32, u32))> =
+            place_of.into_iter().filter(|&(it, _)| it != group).collect();
+        // The key ends in the group id, which is unique: a total order, whatever the map's.
+        rest.sort_unstable_by_key(|&(it, (its_socket, its_node))| {
             (its_socket != socket, its_node != node, it.abs_diff(group), it)
         });
+        let rest = rest.into_iter().map(|(it, _)| it);
         std::iter::once(group).chain(rest).collect()
     }
 
@@ -163,7 +169,7 @@ impl Topology {
 /// `cpus` by id, their groups numbered from 0 in the order of their first CPU.
 fn dense(mut cpus: Vec<Cpu>) -> Topology {
     cpus.sort_by_key(|it| it.id);
-    let mut renamed: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut renamed: FxHashMap<u32, u32> = FxHashMap::default();
     for cpu in &mut cpus {
         let next = u32::try_from(renamed.len()).unwrap_or(u32::MAX);
         cpu.group = *renamed.entry(cpu.group).or_insert(next);
@@ -230,6 +236,8 @@ fn node_of(cpu: &Path) -> io::Result<u32> {
     }
     Ok(0)
 }
+
+// BTreeSet for CPU lists: intersections (`&`) and iteration in CPU order, which a group's key needs.
 
 /// The level 3 cache's CPUs, where the CPU says.
 fn last_level(cpu: &Path) -> io::Result<Option<BTreeSet<u32>>> {
@@ -605,6 +613,28 @@ mod tests {
         assert_eq!(topology.nodes(), [0, 0, 1, 1, 2, 2, 3, 3]);
         assert_eq!(topology.steal_order(2), [2, 3, 1, 0, 4, 5, 6, 7]);
         assert_eq!(topology.steal_order(5), [5, 4, 6, 7, 3, 2, 1, 0]);
+    }
+
+    /// Groups given out of order and spread over sockets and nodes: the steal order is the same
+    /// whatever order the CPUs are listed in.
+    #[test]
+    fn the_steal_order_does_not_depend_on_the_order_cpus_are_listed() {
+        let cpu = |id, group, socket, node| Cpu { id, group, socket, node, fast: true };
+        let mut cpus: Vec<Cpu> =
+            (0..32u32).map(|id| cpu(id, (id * 7) % 16, (id * 7) % 16 / 8, (id * 7) % 16 / 4)).collect();
+        let forward = Topology { cpus: cpus.clone() };
+        cpus.reverse();
+        let backward = Topology { cpus };
+        for group in 0..16 {
+            let order = forward.steal_order(group);
+            assert_eq!(order, backward.steal_order(group));
+            let mut expected: Vec<u32> = (0..16).filter(|&it| it != group).collect();
+            expected.sort_by_key(|&it| {
+                (it / 8 != group / 8, it / 4 != group / 4, it.abs_diff(group), it)
+            });
+            expected.insert(0, group);
+            assert_eq!(order, expected);
+        }
     }
 
     #[test]

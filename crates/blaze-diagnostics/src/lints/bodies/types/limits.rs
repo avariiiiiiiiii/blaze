@@ -9,12 +9,15 @@
 
 mod literal;
 
+use base_db::Crate;
 use hir_def::{
-    AdtId, HasModule as _,
-    hir::{BinaryOp, CmpOp, Expr, ExprId, Ordering, UnaryOp},
+    AdtId, EnumId, HasModule as _,
+    hir::{BinaryOp, CmpOp, Expr, ExprId, Literal, Ordering, Pat, PatId, UnaryOp},
+    lang_item::lang_items,
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
 use intern::Symbol;
+use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 use syntax::{AstNode as _, ast};
 
@@ -26,18 +29,91 @@ use crate::{
 };
 
 pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
-    vec![Box::new(TypeLimits::default())]
+    vec![Box::new(TypeLimits::new())]
 }
 
-#[derive(Default)]
+/// The pass runs at every expression of every body, so each check is gated on what costs least
+/// first: the expression's kind (a `u8` tag of the store's columns), then the type inference
+/// gave it (an index into `InferenceResult`), then the lowered literal's value. Syntax, spans,
+/// paths, the trait solver and strings are reached only by an expression that lints, or that
+/// only the source can tell apart (a pattern's literal, whose `-` the lowering folded in).
+/// Nothing is allocated on the path that doesn't lint; the per-crate caches are filled once.
 struct TypeLimits {
-    last_visited_negation: Option<Negation>,
+    /// rustc's `negated_expr_id`: the last `-` visited, and its operand. Its span is built only
+    /// when the operand overflows.
+    last_negation: Option<(ExprId, ExprId)>,
+    /// The literals of the pattern last visited: a literal pattern's, or a range's ends. The
+    /// walker visits them right after their pattern.
+    pat_lits: [Option<ExprId>; 2],
+    names: Names,
+    /// Per crate: the pointer width `isize` and `usize` have, and `Option`.
+    krate: Option<Crate>,
+    pointer_bits: Option<u16>,
+    option: Option<EnumId>,
+    /// Whether an ADT is `NonNull` (its diagnostic item), looked up once per ADT compared as a
+    /// pointer: about 16 bytes an entry, one FxHash probe a lookup.
+    non_null: FxHashMap<AdtId, bool>,
 }
 
-/// A `-` expression, and its operand.
-struct Negation {
-    span: Span,
-    negated: ExprId,
+/// The diagnostic items the pass compares with, interned once: a comparison is a pointer
+/// compare.
+struct Names {
+    nan: [Symbol; 4],
+    non_null: Symbol,
+    cmpops: [(Symbol, ComparisonOp); 10],
+}
+
+impl TypeLimits {
+    fn new() -> TypeLimits {
+        let names = Names {
+            nan: ["f16_nan", "f32_nan", "f64_nan", "f128_nan"].map(Symbol::intern),
+            non_null: Symbol::intern("NonNull"),
+            cmpops: [
+                ("cmp_ord_max", ComparisonOp::Other),
+                ("cmp_ord_min", ComparisonOp::Other),
+                ("ord_cmp_method", ComparisonOp::Other),
+                ("cmp_partialord_cmp", ComparisonOp::Other),
+                ("cmp_partialeq_eq", ComparisonOp::BinOp(Cmp::Eq)),
+                ("cmp_partialeq_ne", ComparisonOp::BinOp(Cmp::Ne)),
+                ("cmp_partialord_ge", ComparisonOp::BinOp(Cmp::Ge)),
+                ("cmp_partialord_gt", ComparisonOp::BinOp(Cmp::Gt)),
+                ("cmp_partialord_le", ComparisonOp::BinOp(Cmp::Le)),
+                ("cmp_partialord_lt", ComparisonOp::BinOp(Cmp::Lt)),
+            ]
+            .map(|(name, op)| (Symbol::intern(name), op)),
+        };
+        TypeLimits {
+            last_negation: None,
+            pat_lits: [None; 2],
+            names,
+            krate: None,
+            pointer_bits: None,
+            option: None,
+            non_null: FxHashMap::default(),
+        }
+    }
+
+    fn crate_of(&mut self, b: &BodyCx<'_, '_>) {
+        let db = b.db();
+        let krate = b.owner.krate(db);
+        if self.krate != Some(krate) {
+            self.krate = Some(krate);
+            self.pointer_bits = literal::pointer_width(b);
+            self.option = lang_items(db, krate).Option;
+            self.non_null.clear();
+        }
+    }
+
+    /// rustc's `diag_item_cmpop`: the comparison a method of `Ord`, `PartialOrd` or `PartialEq`
+    /// is.
+    fn cmpop(&self, item: Symbol) -> Option<ComparisonOp> {
+        self.names.cmpops.iter().find(|(name, _)| *name == item).map(|&(_, op)| op)
+    }
+
+    fn is_non_null(&mut self, b: &BodyCx<'_, '_>, adt: AdtId) -> bool {
+        let name = self.names.non_null;
+        *self.non_null.entry(adt).or_insert_with(|| util::diagnostic_item(b.db(), adt.into()) == Some(name))
+    }
 }
 
 /// rustc's `hir::BinOpKind` of a comparison.
@@ -91,18 +167,35 @@ impl Cmp {
     }
 }
 
-/// rustc's `diag_item_cmpop`: the comparison a method of `Ord`, `PartialOrd` or `PartialEq` is.
-fn diag_item_cmpop(item: &str) -> Option<ComparisonOp> {
-    Some(match item {
-        "cmp_ord_max" | "cmp_ord_min" | "ord_cmp_method" | "cmp_partialord_cmp" => ComparisonOp::Other,
-        "cmp_partialeq_eq" => ComparisonOp::BinOp(Cmp::Eq),
-        "cmp_partialeq_ne" => ComparisonOp::BinOp(Cmp::Ne),
-        "cmp_partialord_ge" => ComparisonOp::BinOp(Cmp::Ge),
-        "cmp_partialord_gt" => ComparisonOp::BinOp(Cmp::Gt),
-        "cmp_partialord_le" => ComparisonOp::BinOp(Cmp::Le),
-        "cmp_partialord_lt" => ComparisonOp::BinOp(Cmp::Lt),
-        _ => return None,
-    })
+/// What a comparison's operand's type, its references peeled, says of the lints that can
+/// apply to it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operand {
+    Float,
+    /// A raw pointer or an ADT (`NonNull`, `Option<fn()>`): wide and function pointers.
+    PtrOrAdt,
+    Fn,
+    Other,
+}
+
+impl Operand {
+    fn of(ty: Ty<'_>) -> Operand {
+        match peel_refs(ty).0.kind() {
+            TyKind::Float(_) => Operand::Float,
+            TyKind::RawPtr(..) | TyKind::Adt(..) => Operand::PtrOrAdt,
+            TyKind::FnDef(..) | TyKind::FnPtr(..) => Operand::Fn,
+            _ => Operand::Other,
+        }
+    }
+}
+
+fn peel_refs(mut ty: Ty<'_>) -> (Ty<'_>, usize) {
+    let mut refs = 0;
+    while let TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = inner;
+        refs += 1;
+    }
+    (ty, refs)
 }
 
 impl LatePass for TypeLimits {
@@ -110,93 +203,138 @@ impl LatePass for TypeLimits {
         "TypeLimits"
     }
 
+    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+        self.crate_of(b);
+    }
+
+    fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, _out: &mut Vec<Found>) {
+        match b.store().pat(pat) {
+            Pat::Lit(expr) => self.pat_lits = [Some(expr), None],
+            Pat::Range { start, end, .. } => self.pat_lits = [start, end],
+            _ => {}
+        }
+    }
+
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        let Some(at) = b.expr_node(expr) else { return };
         match b.store().expr(expr) {
-            Expr::Literal(_) => {
-                let negation = match &self.last_visited_negation {
-                    Some(it) if it.negated == expr => Some(it.span.clone()),
+            Expr::Literal(lit) => {
+                let negation = match self.last_negation {
+                    Some((negation, operand)) if operand == expr => Some(negation),
                     _ => None,
                 };
-                literal::lint_literal(b, expr, negation, out);
+                let may_overflow = match self.pat_lits.contains(&Some(expr)) {
+                    true => literal::pat_may_overflow(b, expr, lit, self.pointer_bits),
+                    false => literal::may_overflow(b, expr, lit, negation.is_some(), self.pointer_bits),
+                };
+                if may_overflow {
+                    literal::lint_literal(b, expr, negation, out);
+                }
             }
             Expr::UnaryOp { expr: operand, op: UnaryOp::Neg } => {
-                if let Some(span) = util::span(b, expr) {
-                    self.last_visited_negation = Some(Negation { span, negated: operand });
+                if self.last_negation.is_none_or(|(_, negated)| negated != expr) {
+                    self.last_negation = Some((expr, operand));
                 }
             }
             Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::CmpOp(op)) } => {
                 let op = Cmp::of(op);
-                let Some(span) = util::span(b, expr) else { return };
                 if !check_limits(b, op, lhs, rhs) {
+                    let (Some(at), Some(span)) = (b.expr_node(expr), util::span(b, expr)) else { return };
                     let diag = Diag::lint("unused_comparisons", "comparison is useless due to type limits", span);
                     out.push(b.lint(diag, Phase::Late, at));
-                } else {
-                    let cmpop = ComparisonOp::BinOp(op);
-                    out.extend(lint_nan(b, expr, &span, op, lhs, rhs));
-                    out.extend(lint_wide_pointer(b, expr, &span, cmpop, lhs, rhs));
-                    out.extend(lint_fn_pointer(b, expr, &span, cmpop, lhs, rhs));
+                    return;
                 }
+                let (l, r) = (Operand::of(util::ty(b, lhs)), Operand::of(util::ty(b, rhs)));
+                if l == Operand::Other && r == Operand::Other {
+                    return;
+                }
+                let cmpop = ComparisonOp::BinOp(op);
+                if l == Operand::Float || r == Operand::Float {
+                    out.extend(self.lint_nan(b, expr, op, lhs, rhs));
+                }
+                self.pointers(b, expr, l, cmpop, lhs, rhs, out);
             }
-            Expr::Call { args, .. } if args.len() == 2 => {
-                let Some((item, args)) = util::called_item(b, expr) else { return };
-                let Some(cmpop) = diag_item_cmpop(&item) else { return };
-                let Some(span) = util::span(b, expr) else { return };
-                out.extend(lint_wide_pointer(b, expr, &span, cmpop, args[0], args[1]));
-                out.extend(lint_fn_pointer(b, expr, &span, cmpop, args[0], args[1]));
+            Expr::Call { args: &[l, r], .. } => {
+                let operand = Operand::of(util::ty(b, l));
+                if !matches!(operand, Operand::PtrOrAdt | Operand::Fn) {
+                    return;
+                }
+                let Some((item, _)) = util::called_item(b, expr) else { return };
+                let Some(cmpop) = self.cmpop(item) else { return };
+                self.pointers(b, expr, operand, cmpop, l, r, out);
             }
-            Expr::MethodCall { receiver, args, .. } if args.len() == 1 => {
+            Expr::MethodCall { receiver, args: &[arg], .. } => {
+                let operand = Operand::of(util::ty(b, receiver));
+                if !matches!(operand, Operand::PtrOrAdt | Operand::Fn) {
+                    return;
+                }
                 let Some(def) = util::method_fn(b, expr) else { return };
-                let Some(cmpop) = util::fn_item(b.db(), def).as_ref().map(Symbol::as_str).and_then(diag_item_cmpop) else { return };
-                let Some(span) = util::span(b, expr) else { return };
-                out.extend(lint_wide_pointer(b, expr, &span, cmpop, receiver, args[0]));
-                out.extend(lint_fn_pointer(b, expr, &span, cmpop, receiver, args[0]));
+                let Some(cmpop) = util::fn_item(b.db(), def).and_then(|it| self.cmpop(it)) else { return };
+                self.pointers(b, expr, operand, cmpop, receiver, arg, out);
             }
             _ => {}
         }
     }
 }
 
-/// The value of the integer literal `expr`, and whether it is suffixed with a signed type or
-/// none (rustc's `LitKind::Int` and its `LitIntType`); none for a byte or char literal.
-fn int_literal(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(u128, bool)> {
-    let node = util::syntax(b, expr)?;
-    let lit = ast::Literal::cast(node.value)?;
-    let ast::LiteralKind::IntNumber(number) = lit.kind() else { return None };
-    let signed_or_none = match number.suffix() {
-        None => true,
-        Some(suffix) if suffix.starts_with('i') => true,
-        Some(suffix) if suffix.starts_with('u') => false,
-        Some(_) => return None,
-    };
-    Some((number.value().ok()?, signed_or_none))
+impl TypeLimits {
+    /// The wide and function pointer lints of a comparison whose left operand is `l`.
+    #[allow(clippy::too_many_arguments)]
+    fn pointers(
+        &mut self,
+        b: &BodyCx<'_, '_>,
+        e: ExprId,
+        l: Operand,
+        cmpop: ComparisonOp,
+        lhs: ExprId,
+        rhs: ExprId,
+        out: &mut Vec<Found>,
+    ) {
+        if l == Operand::PtrOrAdt {
+            out.extend(self.lint_wide_pointer(b, e, cmpop, lhs, rhs));
+        }
+        if matches!(l, Operand::PtrOrAdt | Operand::Fn) {
+            out.extend(self.lint_fn_pointer(b, e, cmpop, lhs, rhs));
+        }
+    }
 }
 
 /// rustc's `check_limits`: whether a comparison of an integer with a literal is not decided by
-/// the integer's type alone.
+/// the integer's type alone. It reads the lowered literal; only a comparison it would lint
+/// reads the source, to tell a byte literal (`b'a'`, lowered as `97u8`), which rustc's
+/// `LitKind::Byte` leaves alone, from an integer.
 fn check_limits(b: &BodyCx<'_, '_>, op: Cmp, l: ExprId, r: ExprId) -> bool {
-    let is_lit = |it: ExprId| matches!(b.store().expr(it), Expr::Literal(_));
-    let (lit, expr, swap) = if is_lit(l) {
-        (l, r, true)
-    } else if is_lit(r) {
-        (r, l, false)
-    } else {
-        return true;
+    let store = b.store();
+    let (lit_expr, lit, expr, swap) = match (store.expr(l), store.expr(r)) {
+        (Expr::Literal(lit), _) => (l, lit, r, true),
+        (_, Expr::Literal(lit)) => (r, lit, l, false),
+        _ => return true,
     };
     let norm = if swap { op.rev() } else { op };
-    match util::ty(b, expr).kind() {
+    let valid = match util::ty(b, expr).kind() {
         TyKind::Int(t) => {
+            let &Literal::Int(value, _) = lit else { return true };
             let (min, max) = literal::int_ty_range(t);
-            let Some((value, true)) = int_literal(b, lit) else { return true };
-            norm.is_valid(value as i128, min, max)
-        }
-        TyKind::Uint(t) => {
-            let (min, max) = literal::uint_ty_range(t);
-            let Some((value, _)) = int_literal(b, lit) else { return true };
             norm.is_valid(value, min, max)
         }
-        _ => true,
-    }
+        TyKind::Uint(t) => {
+            let value = match *lit {
+                Literal::Int(value, _) => value as u128,
+                Literal::Uint(value, _) => value,
+                _ => return true,
+            };
+            let (min, max) = literal::uint_ty_range(t);
+            norm.is_valid(value, min, max)
+        }
+        _ => return true,
+    };
+    valid || !is_int_number(b, lit_expr)
+}
+
+/// Whether the literal `expr` is written as an integer (rustc's `LitKind::Int`).
+fn is_int_number(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+    let Some(node) = util::syntax(b, expr) else { return false };
+    let Some(lit) = ast::Literal::cast(node.value) else { return false };
+    matches!(lit.kind(), ast::LiteralKind::IntNumber(_))
 }
 
 /// rustc's `Span::until`: from the start of `span` to the start of `end`.
@@ -204,244 +342,241 @@ fn until(span: &Span, end: &Span) -> Span {
     span.with_hi(end.lo.max(span.lo))
 }
 
-/// rustc's `lint_nan`.
-fn lint_nan(b: &BodyCx<'_, '_>, e: ExprId, e_span: &Span, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
-    let is_nan = |expr: ExprId| {
-        let expr = util::peel_borrows(b, util::peel_blocks(b, expr));
-        matches!(util::path_item(b, expr).as_ref().map(Symbol::as_str), Some("f16_nan" | "f32_nan" | "f64_nan" | "f128_nan"))
-    };
-    const EQ_NE: &str = "incorrect NaN comparison, NaN cannot be directly compared to itself";
-    const HELP: &str = "use `f32::is_nan()` or `f64::is_nan()` instead";
-    let spans = || {
-        let l = util::span(b, l)?;
-        let r = util::span(b, r)?;
-        Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?))
-    };
-    let eq_ne = |parts: &dyn Fn(Span, Span) -> Vec<(Span, String)>| {
-        let mut diag = Diag::lint("invalid_nan_comparisons", EQ_NE, e_span.clone());
-        match spans() {
-            Some((l_span, r_span)) => {
-                diag.suggestion_with_style(
-                    parts(l_span, r_span),
-                    HELP,
-                    Applicability::MachineApplicable,
-                    SuggestionStyle::ShowAlways,
-                );
-            }
-            None => {
-                diag.help(HELP);
-            }
-        }
-        diag
-    };
-    let ne = op == Cmp::Ne;
-    let diag = match op {
-        Cmp::Eq | Cmp::Ne if is_nan(l) => eq_ne(&|l_span, r_span| {
-            let mut parts = Vec::new();
-            if ne {
-                parts.push((r_span.shrink_to_lo(), "!".to_owned()));
-            }
-            parts.push((r_span.shrink_to_hi(), ".is_nan()".to_owned()));
-            parts.push((until(&l_span, &r_span), String::new()));
-            parts
-        }),
-        Cmp::Eq | Cmp::Ne if is_nan(r) => eq_ne(&|l_span, r_span| {
-            let mut parts = Vec::new();
-            if ne {
-                parts.push((l_span.shrink_to_lo(), "!".to_owned()));
-            }
-            parts.push((l_span.shrink_to_hi(), ".is_nan()".to_owned()));
-            parts.push((l_span.shrink_to_hi().to(&r_span), String::new()));
-            parts
-        }),
-        Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge if is_nan(l) || is_nan(r) => {
-            Diag::lint("invalid_nan_comparisons", "incorrect NaN comparison, NaN is not orderable", e_span.clone())
-        }
-        _ => return None,
-    };
-    Some(b.lint(diag, Phase::Late, b.expr_node(e)?))
+/// Which side of a comparison is NaN, for `lint_nan`'s cases.
+enum Nan {
+    EqLeft,
+    EqRight,
+    Ord,
 }
 
-/// rustc's `lint_wide_pointer`.
-fn lint_wide_pointer<'db>(
-    b: &BodyCx<'_, 'db>,
-    e: ExprId,
-    e_span: &Span,
-    cmpop: ComparisonOp,
-    l: ExprId,
-    r: ExprId,
-) -> Option<Found> {
-    const LINT: &str = "ambiguous_wide_pointer_comparisons";
-    const MESSAGE: &str =
-        "ambiguous wide pointer comparison, the comparison includes metadata which may not be expected";
-    let mut solver: Option<Solver<'db>> = None;
-    let mut ptr_unsized = |mut ty: Ty<'db>| -> Option<(usize, &'static str, bool)> {
-        let mut refs = 0;
-        while let TyKind::Ref(_, inner, _) = ty.kind() {
-            ty = inner;
-            refs += 1;
+impl TypeLimits {
+    /// rustc's `is_nan` of `lint_nan`: a path to `f32::NAN` and the rest, through blocks and
+    /// borrows. A path is resolved only when it is one.
+    fn is_nan(&self, b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
+        let expr = util::peel_borrows(b, util::peel_blocks(b, expr));
+        if !matches!(b.store().expr(expr), Expr::Path(_)) {
+            return false;
         }
-        let mut modifiers = "";
-        let pointee = match (ty.kind(), ty.as_adt()) {
-            (TyKind::RawPtr(pointee, _), _) => pointee,
-            (_, Some((adt, args))) if util::diagnostic_item(b.db(), adt.into()).as_deref() == Some("NonNull") => {
-                modifiers = ".as_ptr()";
-                args.type_at(0)
-            }
+        util::path_item(b, expr).is_some_and(|it| self.names.nan.contains(&it))
+    }
+
+    /// rustc's `lint_nan`.
+    fn lint_nan(&self, b: &BodyCx<'_, '_>, e: ExprId, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
+        let nan = match op {
+            Cmp::Eq | Cmp::Ne if self.is_nan(b, l) => Nan::EqLeft,
+            Cmp::Eq | Cmp::Ne if self.is_nan(b, r) => Nan::EqRight,
+            Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge if self.is_nan(b, l) || self.is_nan(b, r) => Nan::Ord,
+            _ => return None,
+        };
+        const LINT: &str = "invalid_nan_comparisons";
+        const HELP: &str = "use `f32::is_nan()` or `f64::is_nan()` instead";
+        let at = b.expr_node(e)?;
+        let e_span = util::span(b, e)?;
+        if let Nan::Ord = nan {
+            let diag = Diag::lint(LINT, "incorrect NaN comparison, NaN is not orderable", e_span);
+            return Some(b.lint(diag, Phase::Late, at));
+        }
+        let mut diag =
+            Diag::lint(LINT, "incorrect NaN comparison, NaN cannot be directly compared to itself", e_span.clone());
+        let spans = util::span(b, l)
+            .zip(util::span(b, r))
+            .and_then(|(l, r)| Some((util::ancestor_inside(&l, &e_span)?, util::ancestor_inside(&r, &e_span)?)));
+        let Some((l_span, r_span)) = spans else {
+            diag.help(HELP);
+            return Some(b.lint(diag, Phase::Late, at));
+        };
+        let (operand, removed) = match nan {
+            Nan::EqLeft => (r_span.clone(), until(&l_span, &r_span)),
+            _ => (l_span.clone(), l_span.shrink_to_hi().to(&r_span)),
+        };
+        let mut parts = Vec::with_capacity(3);
+        if op == Cmp::Ne {
+            parts.push((operand.shrink_to_lo(), "!".to_owned()));
+        }
+        parts.push((operand.shrink_to_hi(), ".is_nan()".to_owned()));
+        parts.push((removed, String::new()));
+        diag.suggestion_with_style(parts, HELP, Applicability::MachineApplicable, SuggestionStyle::ShowAlways);
+        Some(b.lint(diag, Phase::Late, at))
+    }
+}
+
+impl TypeLimits {
+    /// rustc's `ptr_unsized` of `lint_wide_pointer`: the references around a raw pointer or a
+    /// `NonNull` to an unsized type, what gives its pointer, and whether the type is `dyn`.
+    fn ptr_unsized<'db>(
+        &mut self,
+        b: &BodyCx<'_, 'db>,
+        solver: &mut Option<Solver<'db>>,
+        ty: Ty<'db>,
+    ) -> Option<(usize, &'static str, bool)> {
+        let (ty, refs) = peel_refs(ty);
+        let (pointee, modifiers) = match (ty.kind(), ty.as_adt()) {
+            (TyKind::RawPtr(pointee, _), _) => (pointee, ""),
+            (_, Some((adt, args))) if self.is_non_null(b, adt) => (args.type_at(0), ".as_ptr()"),
             _ => return None,
         };
         let solver = solver.get_or_insert_with(|| Solver::of(b));
         (!solver.is_sized(pointee)).then(|| (refs, modifiers, matches!(pointee.kind(), TyKind::Dynamic(..))))
-    };
-    let l = util::peel_borrows(b, l);
-    let r = util::peel_borrows(b, r);
-    let (l_refs, l_modifiers, l_dyn) = ptr_unsized(b.infer.type_of_expr_or_pat(l.into())?)?;
-    let (r_refs, r_modifiers, r_dyn) = ptr_unsized(b.infer.type_of_expr_or_pat(r.into())?)?;
-    let at = b.expr_node(e)?;
-    let mut diag = Diag::lint(LINT, MESSAGE, e_span.clone());
-    let spans = util::span(b, l)
-        .zip(util::span(b, r))
-        .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
-    let Some((l_span, r_span)) = spans else {
-        diag.help("use explicit `std::ptr::eq` method to compare metadata and addresses");
-        diag.help("use `std::ptr::addr_eq` or untyped pointers to only compare their addresses");
-        return Some(b.lint(diag, Phase::Late, at));
-    };
-    let ne = if cmpop == ComparisonOp::BinOp(Cmp::Ne) { "!" } else { "" };
-    let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
-    let is_dyn_comparison = l_dyn && r_dyn;
-    let via_method_call = matches!(b.store().expr(e), Expr::MethodCall { .. } | Expr::Call { .. });
-    let left = until(&e_span.shrink_to_lo(), &l_span.shrink_to_lo());
-    let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
-    let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
-    let deref_left = "*".repeat(l_refs);
-    let deref_right = "*".repeat(r_refs);
-    let verbose = |diag: &mut Diag, message: &str, parts: Vec<(Span, String)>| {
-        diag.suggestion_with_style(parts, message, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
-    };
-    let eq_parts = |function: &str| {
-        vec![
-            (left.clone(), format!("{ne}std::ptr::{function}({deref_left}")),
-            (middle.clone(), format!("{l_modifiers}, {deref_right}")),
-            (right.clone(), format!("{r_modifiers})")),
-        ]
-    };
-    if is_eq_ne {
-        verbose(
-            &mut diag,
-            "use `std::ptr::addr_eq` or untyped pointers to only compare their addresses",
-            eq_parts("addr_eq"),
-        );
-        if !is_dyn_comparison {
-            verbose(&mut diag, "use explicit `std::ptr::eq` method to compare metadata and addresses", eq_parts("eq"));
-        }
-    } else {
-        let paren_left = if l_refs != 0 { ")" } else { "" };
-        let paren_right = if r_refs != 0 { ")" } else { "" };
-        let mut parts = Vec::new();
-        if l_refs != 0 {
-            parts.push((l_span.shrink_to_lo(), format!("({deref_left}")));
-        }
-        parts.push((l_span.shrink_to_hi(), format!("{l_modifiers}{paren_left}.cast::<()>()")));
-        if r_refs != 0 {
-            parts.push((r_span.shrink_to_lo(), format!("({deref_right}")));
-        }
-        parts.push((r_span.shrink_to_hi(), format!("{r_modifiers}{paren_right}.cast::<()>()")));
-        verbose(&mut diag, "use untyped pointers to only compare their addresses", parts);
-        let (open, close) = if via_method_call { ("", "") } else { ("(", ")") };
-        verbose(
-            &mut diag,
-            "or expect the lint to compare the pointers metadata and addresses",
-            vec![
-                (
-                    e_span.shrink_to_lo(),
-                    format!(r#"{{ #[expect(ambiguous_wide_pointer_comparisons, reason = "...")] {open}"#),
-                ),
-                (e_span.shrink_to_hi(), format!("{close} }}")),
-            ],
-        );
     }
-    Some(b.lint(diag, Phase::Late, at))
-}
 
-/// rustc's `lint_fn_pointer`.
-fn lint_fn_pointer<'db>(
-    b: &BodyCx<'_, 'db>,
-    e: ExprId,
-    e_span: &Span,
-    cmpop: ComparisonOp,
-    l: ExprId,
-    r: ExprId,
-) -> Option<Found> {
-    const LINT: &str = "unpredictable_function_pointer_comparisons";
-    let peel_refs = |mut ty: Ty<'db>| {
-        let mut refs = 0;
-        while let TyKind::Ref(_, inner, _) = ty.kind() {
-            ty = inner;
-            refs += 1;
-        }
-        (ty, refs)
-    };
-    let is_fn = |ty: Ty<'db>| matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..));
-    let l = util::peel_borrows(b, l);
-    let r = util::peel_borrows(b, r);
-    let (l_ty, l_refs) = peel_refs(b.infer.type_of_expr_or_pat(l.into())?);
-    let (r_ty, r_refs) = peel_refs(b.infer.type_of_expr_or_pat(r.into())?);
-    let at = b.expr_node(e)?;
-    let warn = || {
-        let mut diag = Diag::lint(
-            LINT,
-            "function pointer comparisons do not produce meaningful results since their addresses are not guaranteed to be unique",
-            e_span.clone(),
-        );
-        diag.note("the address of the same function can vary between different codegen units");
-        diag.note("furthermore, different functions could have the same address after being merged together");
-        diag.note("for more information visit <https://doc.rust-lang.org/nightly/core/ptr/fn.fn_addr_eq.html>");
-        diag
-    };
-    if !(is_fn(l_ty) && is_fn(r_ty)) {
-        let option = interner(b).lang_items().Option;
-        let some_fn = |ty: Ty<'db>| match ty.as_adt() {
-            Some((adt, args)) => option.is_some_and(|it| AdtId::from(it) == adt) && is_fn(args.type_at(0)),
-            None => false,
+    /// rustc's `lint_wide_pointer`.
+    fn lint_wide_pointer<'db>(
+        &mut self,
+        b: &BodyCx<'_, 'db>,
+        e: ExprId,
+        cmpop: ComparisonOp,
+        l: ExprId,
+        r: ExprId,
+    ) -> Option<Found> {
+        const LINT: &str = "ambiguous_wide_pointer_comparisons";
+        const MESSAGE: &str =
+            "ambiguous wide pointer comparison, the comparison includes metadata which may not be expected";
+        let mut solver = None;
+        let l = util::peel_borrows(b, l);
+        let r = util::peel_borrows(b, r);
+        let (l_refs, l_modifiers, l_dyn) = self.ptr_unsized(b, &mut solver, util::ty(b, l))?;
+        let (r_refs, r_modifiers, r_dyn) = self.ptr_unsized(b, &mut solver, util::ty(b, r))?;
+        let e_span = &util::span(b, e)?;
+        let at = b.expr_node(e)?;
+        let mut diag = Diag::lint(LINT, MESSAGE, e_span.clone());
+        let spans = util::span(b, l)
+            .zip(util::span(b, r))
+            .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
+        let Some((l_span, r_span)) = spans else {
+            diag.help("use explicit `std::ptr::eq` method to compare metadata and addresses");
+            diag.help("use `std::ptr::addr_eq` or untyped pointers to only compare their addresses");
+            return Some(b.lint(diag, Phase::Late, at));
         };
-        if some_fn(l_ty) && some_fn(r_ty) {
+        let ne = if cmpop == ComparisonOp::BinOp(Cmp::Ne) { "!" } else { "" };
+        let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
+        let is_dyn_comparison = l_dyn && r_dyn;
+        let via_method_call = matches!(b.store().expr(e), Expr::MethodCall { .. } | Expr::Call { .. });
+        let left = until(&e_span.shrink_to_lo(), &l_span.shrink_to_lo());
+        let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
+        let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
+        let deref_left = "*".repeat(l_refs);
+        let deref_right = "*".repeat(r_refs);
+        let verbose = |diag: &mut Diag, message: &str, parts: Vec<(Span, String)>| {
+            diag.suggestion_with_style(parts, message, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
+        };
+        let eq_parts = |function: &str| {
+            vec![
+                (left.clone(), format!("{ne}std::ptr::{function}({deref_left}")),
+                (middle.clone(), format!("{l_modifiers}, {deref_right}")),
+                (right.clone(), format!("{r_modifiers})")),
+            ]
+        };
+        if is_eq_ne {
+            verbose(
+                &mut diag,
+                "use `std::ptr::addr_eq` or untyped pointers to only compare their addresses",
+                eq_parts("addr_eq"),
+            );
+            if !is_dyn_comparison {
+                verbose(&mut diag, "use explicit `std::ptr::eq` method to compare metadata and addresses", eq_parts("eq"));
+            }
+        } else {
+            let paren_left = if l_refs != 0 { ")" } else { "" };
+            let paren_right = if r_refs != 0 { ")" } else { "" };
+            let mut parts = Vec::new();
+            if l_refs != 0 {
+                parts.push((l_span.shrink_to_lo(), format!("({deref_left}")));
+            }
+            parts.push((l_span.shrink_to_hi(), format!("{l_modifiers}{paren_left}.cast::<()>()")));
+            if r_refs != 0 {
+                parts.push((r_span.shrink_to_lo(), format!("({deref_right}")));
+            }
+            parts.push((r_span.shrink_to_hi(), format!("{r_modifiers}{paren_right}.cast::<()>()")));
+            verbose(&mut diag, "use untyped pointers to only compare their addresses", parts);
+            let (open, close) = if via_method_call { ("", "") } else { ("(", ")") };
+            verbose(
+                &mut diag,
+                "or expect the lint to compare the pointers metadata and addresses",
+                vec![
+                    (
+                        e_span.shrink_to_lo(),
+                        format!(r#"{{ #[expect(ambiguous_wide_pointer_comparisons, reason = "...")] {open}"#),
+                    ),
+                    (e_span.shrink_to_hi(), format!("{close} }}")),
+                ],
+            );
+        }
+        Some(b.lint(diag, Phase::Late, at))
+    }
+
+    /// rustc's `lint_fn_pointer`.
+    fn lint_fn_pointer<'db>(
+        &self,
+        b: &BodyCx<'_, 'db>,
+        e: ExprId,
+        cmpop: ComparisonOp,
+        l: ExprId,
+        r: ExprId,
+    ) -> Option<Found> {
+        const LINT: &str = "unpredictable_function_pointer_comparisons";
+        let is_fn = |ty: Ty<'db>| matches!(ty.kind(), TyKind::FnDef(..) | TyKind::FnPtr(..));
+        let l = util::peel_borrows(b, l);
+        let r = util::peel_borrows(b, r);
+        let (l_ty, l_refs) = peel_refs(util::ty(b, l));
+        let (r_ty, r_refs) = peel_refs(util::ty(b, r));
+        if !(is_fn(l_ty) && is_fn(r_ty)) {
+            let some_fn = |ty: Ty<'db>| match ty.as_adt() {
+                Some((adt, args)) => self.option.is_some_and(|it| AdtId::from(it) == adt) && is_fn(args.type_at(0)),
+                None => false,
+            };
+            if !(some_fn(l_ty) && some_fn(r_ty)) {
+                return None;
+            }
+        }
+        let at = b.expr_node(e)?;
+        let e_span = &util::span(b, e)?;
+        let warn = || {
+            let mut diag = Diag::lint(
+                LINT,
+                "function pointer comparisons do not produce meaningful results since their addresses are not guaranteed to be unique",
+                e_span.clone(),
+            );
+            diag.note("the address of the same function can vary between different codegen units");
+            diag.note("furthermore, different functions could have the same address after being merged together");
+            diag.note("for more information visit <https://doc.rust-lang.org/nightly/core/ptr/fn.fn_addr_eq.html>");
+            diag
+        };
+        if !(is_fn(l_ty) && is_fn(r_ty)) {
             return Some(b.lint(warn(), Phase::Late, at));
         }
-        return None;
+        let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
+        let spans = util::span(b, l)
+            .zip(util::span(b, r))
+            .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
+        let (true, Some((l_span, r_span))) = (is_eq_ne, spans) else {
+            return Some(b.lint(warn(), Phase::Late, at));
+        };
+        let ne = if cmpop == ComparisonOp::BinOp(Cmp::Ne) { "!" } else { "" };
+        let deref_left = "*".repeat(l_refs);
+        let deref_right = "*".repeat(r_refs);
+        let left = until(&e_span.shrink_to_lo(), &l_span.shrink_to_lo());
+        let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
+        let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
+        let close = if matches!(r_ty.kind(), TyKind::FnPtr(..)) {
+            ")".to_owned()
+        } else {
+            let sig = r_ty.callable_sig(interner(b))?;
+            let fn_ptr = Ty::new_fn_ptr(interner(b), sig);
+            format!(" as {})", util::print_ty(b, r, fn_ptr)?)
+        };
+        let mut diag = warn();
+        diag.suggestion_with_style(
+            vec![
+                (left, format!("{ne}std::ptr::fn_addr_eq({deref_left}")),
+                (middle, format!(", {deref_right}")),
+                (right, close),
+            ],
+            "refactor your code, or use `std::ptr::fn_addr_eq` to suppress the lint",
+            Applicability::MaybeIncorrect,
+            SuggestionStyle::ShowAlways,
+        );
+        Some(b.lint(diag, Phase::Late, at))
     }
-    let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(Cmp::Eq | Cmp::Ne));
-    let spans = util::span(b, l)
-        .zip(util::span(b, r))
-        .and_then(|(l, r)| Some((util::ancestor_inside(&l, e_span)?, util::ancestor_inside(&r, e_span)?)));
-    let (true, Some((l_span, r_span))) = (is_eq_ne, spans) else {
-        return Some(b.lint(warn(), Phase::Late, at));
-    };
-    let ne = if cmpop == ComparisonOp::BinOp(Cmp::Ne) { "!" } else { "" };
-    let deref_left = "*".repeat(l_refs);
-    let deref_right = "*".repeat(r_refs);
-    let left = until(&e_span.shrink_to_lo(), &l_span.shrink_to_lo());
-    let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
-    let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
-    let close = if matches!(r_ty.kind(), TyKind::FnPtr(..)) {
-        ")".to_owned()
-    } else {
-        let sig = r_ty.callable_sig(interner(b))?;
-        let fn_ptr = Ty::new_fn_ptr(interner(b), sig);
-        format!(" as {})", util::print_ty(b, r, fn_ptr)?)
-    };
-    let mut diag = warn();
-    diag.suggestion_with_style(
-        vec![
-            (left, format!("{ne}std::ptr::fn_addr_eq({deref_left}")),
-            (middle, format!(", {deref_right}")),
-            (right, close),
-        ],
-        "refactor your code, or use `std::ptr::fn_addr_eq` to suppress the lint",
-        Applicability::MaybeIncorrect,
-        SuggestionStyle::ShowAlways,
-    );
-    Some(b.lint(diag, Phase::Late, at))
 }
 
 fn interner<'db>(b: &BodyCx<'_, 'db>) -> DbInterner<'db> {

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: the bigger changes for the fastest compile times: tiered compilation and idle cores always working, lazy per-function compilation, copy-and-patch codegen, no binary on disk for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT.
+summary: blaze v2: the bigger changes for the fastest compile times: reachability-only codegen, a persistent trait cache, the nightly's own solver, proc macros on our own compiler, tiered compilation and idle cores always working, lazy per-function compilation, copy-and-patch codegen, no binary on disk for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT.
 date: 2026-10-29
 ---
 # The fastest compile times
@@ -120,6 +120,59 @@ hooks.
 
     Profiles only choose tiers and optimizations, never meaning. A wrong guess costs background
     compile time, and the next run's counters correct it.
+
+## Less work in every build
+
+16. **Compile only what the binary reaches, release builds too.** Before any codegen, a
+    reachability pass runs from the roots over the whole crate graph:
+    - **Roots:** `main`, the tests, exported symbols, `#[used]` statics, `#[no_mangle]` and
+      `export_name` items, and dynamic-library exports.
+    - **Edges:** calls, function pointers, vtables, statics, and items named from `asm!` or
+      linked by name.
+
+    Only reached functions are compiled. A dependency's public functions that nothing reaches
+    are never compiled, though rustc compiles them all. Lazy compilation (change 1) is the dev
+    version of this. Linking by name, `#[used]` and `-C link-dead-code` keep rustc's meaning.
+17. **A persistent trait-solver cache.** Solved goals in canonical form (goal, param env,
+    solver mode, and the solver's version) are pure functions of their inputs. They are stored
+    by hash and reused by every crate and every later build. Cycle results and goals whose
+    answer depends on inference variables stay per query, as the solver's own global cache
+    requires.
+18. **The trait solver and `rustc_type_ir` come from the pinned nightly.** They are taken from
+    `compiler/rustc_next_trait_solver` and `compiler/rustc_type_ir` at the rustc commit of
+    `harness/toolchain`, not rust-analyzer's crates.io release with backports. Our changes
+    (`u32`-indexed tables, SoA) are a patch series on top. `tools/v2/solver_sync.py` replays
+    them on every daily toolchain bump, so trait resolution is rustc's at the pinned nightly
+    by construction.
+19. **JIT for const eval.** Const evaluation goes through the tiers of change 13: the MIR
+    evaluator first, then copy-and-patch for hot const functions. The const-eval rules (UB
+    checks, limits, `const_eval_select`) are kept exactly, in both tiers.
+20. **Proc macros run on our own compiler, in process, isolated by construction.** A proc
+    macro is Rust, so blaze compiles it with its own front end and runs it on the MIR
+    evaluator and the copy-and-patch tier, the same machinery as const eval. It's the real
+    macro's code, so its output is exactly the macro's, with no hand-written fast paths.
+    Isolation comes from the runtime:
+    - the evaluator checks every access;
+    - the compiled tiers bound memory the way wasm engines do;
+    - the only way out is the proc-macro bridge's shims, plus traced reads of files the
+      sandbox allows;
+    - anything else (a raw syscall, FFI to an unknown symbol) stops with an error naming the
+      macro.
+
+    It replaces spawning a sandboxed process per macro server, which keeps sandbox-everything
+    with nothing outside the sandbox. Outputs are cached by input tokens and macro version.
+21. **Generic instances shared across the workspace.** An instance is compiled once per
+    workspace, keyed by its instance key, and every crate that uses it links to that copy:
+    rustc's `-Zshare-generics`, always on. Symbol names and visibility follow what rustc does
+    with share-generics, so linking by name and dynamic libraries behave the same.
+22. **Debug info on demand.** Builds emit what backtraces and panics need (line tables and
+    symbols). Full DWARF (types, variables, scopes) is generated from MIR and the debug side
+    table when a debugger attaches, `blaze build` is asked for it, or the profile's `debug`
+    setting requires it in the output file. An output file always has what its profile says.
+23. **The critical path runs on performance cores.** Critical-path tasks run at the highest
+    QoS (`QOS_CLASS_USER_INTERACTIVE` on macOS, high priority with the performance cores'
+    affinity on hybrid Intel), and background tiers and prefetching at the lowest, so the
+    operating system places them on the right cores.
 
 ## Make blaze itself faster
 

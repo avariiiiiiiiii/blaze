@@ -65,7 +65,6 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use intern::Interned;
 use la_arena::{Idx, RawIdx};
 use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use stdx::never;
@@ -307,7 +306,7 @@ pub struct ItemTree {
     ctor_vis: Box<[RawVisibilityId]>,
 
     names: Box<[Name]>,
-    paths: Box<[Interned<ModPath>]>,
+    paths: Box<[ModPath]>,
     vis: Box<[RawVisibility]>,
 
     /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
@@ -443,9 +442,9 @@ impl Index<NameId> for ItemTree {
 }
 
 impl Index<PathId> for ItemTree {
-    type Output = Interned<ModPath>;
+    type Output = ModPath;
     #[inline]
-    fn index(&self, id: PathId) -> &Interned<ModPath> {
+    fn index(&self, id: PathId) -> &ModPath {
         &self.paths[id.raw as usize]
     }
 }
@@ -677,18 +676,18 @@ pub enum UseTreeKind<'a> {
     /// use path::to::Item as Renamed;
     /// use path::to::Trait as _;
     /// ```
-    Single { path: &'a Interned<ModPath>, alias: Option<ImportAlias> },
+    Single { path: &'a ModPath, alias: Option<ImportAlias> },
 
     /// ```ignore
     /// use *;  // (invalid, but can occur in nested tree)
     /// use path::*;
     /// ```
-    Glob { path: Option<&'a Interned<ModPath>> },
+    Glob { path: Option<&'a ModPath> },
 
     /// ```ignore
     /// use prefix::{self, Item, ...};
     /// ```
-    Prefixed { prefix: Option<&'a Interned<ModPath>>, list: &'a [UseTreeId] },
+    Prefixed { prefix: Option<&'a ModPath>, list: &'a [UseTreeId] },
 }
 
 blaze_format::record! {
@@ -773,7 +772,7 @@ impl FieldsShape {
 pub enum RawVisibility {
     /// `pub(in module)`, `pub(crate)` or `pub(super)`. Also private, which is
     /// equivalent to `pub(self)`.
-    Module(Interned<ModPath>, VisibilityExplicitness),
+    Module(ModPath, VisibilityExplicitness),
     /// `pub(self)`.
     PubSelf(VisibilityExplicitness),
     /// `pub(crate)`.

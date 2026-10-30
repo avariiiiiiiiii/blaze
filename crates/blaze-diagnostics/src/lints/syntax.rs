@@ -37,7 +37,7 @@ use hir_def::AdtId;
 use rustc_hash::FxHashMap;
 use syntax::{
     AstNode, SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent,
-    ast::{self, HasName as _},
+    ast::{self, HasAttrs as _, HasName as _},
 };
 
 use crate::{
@@ -65,6 +65,10 @@ pub(crate) enum Pass {
     /// The early lint pass's own as it leaves a node (`check_item_post`, `check_crate_post`,
     /// ..).
     Post,
+    /// What attribute parsing buffers as the AST is lowered, emitted after every other
+    /// diagnostic of its phase, by the item it is of (`emit_delayed_lints`, after
+    /// `check_mod_attrs`).
+    Delayed,
 }
 
 /// A diagnostic found by one of this module's parts, and when rustc emits it.
@@ -111,6 +115,8 @@ pub(crate) struct Tree {
     pub(crate) off: Vec<SyntaxNode>,
     /// The items an attribute macro replaces with its expansion.
     pub(crate) replaced: Vec<SyntaxNode>,
+    /// The ranges of `off` and `replaced`, disjoint, by where they start.
+    skips: Vec<TextRange>,
     /// Where the walk comes to the tree: the places of the `mod` items and macro calls it is
     /// reached through, outermost first.
     place: Vec<(u32, u32)>,
@@ -125,7 +131,8 @@ impl Tree {
     /// Whether `range` is in what rustc's walk never sees: a node `cfg` removes or an item an
     /// attribute macro replaces.
     pub(crate) fn skipped(&self, range: TextRange) -> bool {
-        self.off.iter().chain(&self.replaced).any(|it| it.text_range().contains_range(range))
+        let after = self.skips.partition_point(|it| it.start() <= range.start());
+        after > 0 && self.skips[after - 1].contains_range(range)
     }
 
     /// `node` of the tree, as the [`InFile`] the rest of the crate takes.
@@ -141,13 +148,21 @@ pub(crate) struct Walk<'db> {
     /// The crate's cfg: `--cfg` and the target's.
     pub(crate) cfg: &'db CfgOptions,
     index: FxHashMap<HirFileId, usize>,
+    /// Each module of the crate by the order rustc checks it in (`checks::modules`).
+    modules: FxHashMap<hir::Module, usize>,
 }
 
 impl<'db> Walk<'db> {
     pub(crate) fn of(cx: &Cx<'_, 'db>) -> Walk<'db> {
-        let mut walk = Walk { trees: Vec::new(), cfg: cx.krate.cfg(cx.db), index: FxHashMap::default() };
+        let modules = crate::checks::modules(cx);
+        let mut walk = Walk {
+            trees: Vec::new(),
+            cfg: cx.krate.cfg(cx.db),
+            index: FxHashMap::default(),
+            modules: modules.iter().enumerate().map(|(rank, it)| (*it, rank)).collect(),
+        };
         let mut places: FxHashMap<HirFileId, Vec<(u32, u32)>> = FxHashMap::default();
-        for module in crate::checks::modules(cx) {
+        for module in modules {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file_id = HirFileId::from(file);
             if walk.index.contains_key(&file_id) {
@@ -186,6 +201,7 @@ impl<'db> Walk<'db> {
                 continue;
             }
             if let Some(item) = ast::Item::cast(node.clone())
+                && item.attrs().next().is_some()
                 && let Some(expanded) = cx.sema.expand_attr_macro(&item)
             {
                 expansions.push((entered(node.text_range()), expanded.value));
@@ -220,8 +236,10 @@ impl<'db> Walk<'db> {
                 }
             }
         }
+        let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
+        skips.sort_unstable_by_key(|it| it.start());
         self.index.insert(file, self.trees.len());
-        self.trees.push(Tree { file, root, call: file.macro_file(), nodes, off, replaced, place: place.clone() });
+        self.trees.push(Tree { file, root, call: file.macro_file(), nodes, off, replaced, skips, place: place.clone() });
         for (at, expanded) in expansions {
             let mut place = place.clone();
             place.push(at);
@@ -382,13 +400,49 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
     let mut keyed: Vec<_> = emitted
         .into_iter()
         .map(|Emitted { found, pass, place }| {
+            let group = match pass {
+                Pass::PreExpansion => 0u8,
+                Pass::Delayed => 2,
+                _ => 1,
+            };
+            let module = match (found.phase, place) {
+                (Phase::Items, Some(at)) => checked_in(cx, &walk.modules, at),
+                _ => (0, false),
+            };
             let place = place.map(|at| walk.place(cx, at, pass)).unwrap_or_default();
             let rank = found.diag.lint_name().map_or(EARLY_PASSES.len(), pass_rank);
-            ((found.phase, pass != Pass::PreExpansion, place, pass, rank), found)
+            ((found.phase, group, module, place, pass, rank), found)
         })
         .collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     keyed.into_iter().map(|(_, found)| found).collect()
+}
+
+/// Where rustc's `check_mod_attrs` comes to `at`: it checks each module in turn (`modules`,
+/// rustc's `par_hir_for_each_module`), in it every item whose module it is, then for the
+/// crate root the crate's own attributes. A module file's inner attributes are of its `mod`
+/// item, checked in the module that has it.
+fn checked_in(cx: &Cx<'_, '_>, modules: &FxHashMap<hir::Module, usize>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
+    let node = cx.syntax(at);
+    let rank = |module: hir::Module| modules.get(&module).copied().unwrap_or(usize::MAX);
+    if let Some(file) = ast::SourceFile::cast(node.value.clone()) {
+        let Some(module) = cx.sema.to_def2(node.with_value(&file)) else { return (usize::MAX, false) };
+        return match module.parent(cx.db) {
+            None => (rank(module), true),
+            Some(parent) => (rank(parent), false),
+        };
+    }
+    for ancestor in cx.sema.ancestors_with_macros_file(node.clone()).skip(1) {
+        if let Some(module) = ast::Module::cast(ancestor.value.clone())
+            && module.item_list().is_some()
+        {
+            return (cx.sema.to_def2(ancestor.with_value(&module)).map_or(usize::MAX, rank), false);
+        }
+        if let Some(file) = ast::SourceFile::cast(ancestor.value.clone()) {
+            return (cx.sema.to_def2(ancestor.with_value(&file)).map_or(usize::MAX, rank), false);
+        }
+    }
+    (usize::MAX, false)
 }
 
 /// The lints of the passes of rustc's `BuiltinCombinedEarlyLintPass`, in the order it runs

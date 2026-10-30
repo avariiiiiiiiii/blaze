@@ -77,3 +77,16 @@
   `build.rs` match with `..`.
 
 > forwarded to cargo: the daemon's match is lane cargo's (cargo.md, "From core").
+
+## 6. A batch of nodes as one record (ci)
+
+- What: an `Event::Nodes { first: u32, kinds: Vec<NodeKind>, names: String, name_at: Vec<u32>,
+  deps: Vec<u32>, deps_at: Vec<u32> }` in `blaze-protocol`, meaning the nodes `first..` each
+  as an `Event::Node` would say (name `i` is `names[name_at[i]..name_at[i + 1]]`, its deps
+  likewise). Readers of `Event::Node` (`blaze-ui/src/lib.rs:578`, `blaze-graph/src/trace.rs:61`,
+  `blaze-web/assets/records.js`) take it as that many nodes.
+- Where: `crates/blaze-protocol/src/events.rs`, and its readers.
+- Why: cargo.md section 16. `PlaneInput::AddNodes` takes a batch as columns, but the plane
+  still says one `Event::Node` a node, each owning a `String` and a `Vec<u32>`: a 10k-unit
+  build still makes 20k small allocations, now in the plane. With `Event::Nodes`, the plane
+  says one record a batch, copied from the columns it was given.

@@ -131,9 +131,10 @@ impl<'db> ExprValidator<'db> {
         }
 
         for (id, expr) in body.exprs() {
-            if let Some((variant, missed_fields)) =
-                record_literal_missing_fields(db, self.infer, id, expr)
-            {
+            let missing = record_literal_missing_fields(db, self.infer, id, expr).or_else(|| {
+                Some((record_literal_spread_only(self.infer, id, expr)?, Vec::new()))
+            });
+            if let Some((variant, missed_fields)) = missing {
                 self.diagnostics.push(BodyValidationDiagnostic::RecordMissingFields {
                     record: Either::Left(id),
                     variant,
@@ -685,6 +686,17 @@ pub fn record_literal_missing_fields<'db>(
         return None;
     }
     Some((variant_def, missed_fields))
+}
+
+/// A struct expression with `..` and no base that leaves out no field without a default:
+/// rustc still gives E0797 for it (the `..` is needless, or needs `default_field_values`).
+fn record_literal_spread_only(
+    infer: &InferenceResult<'_>,
+    id: ExprId,
+    expr: Expr<'_>,
+) -> Option<VariantId> {
+    let Expr::RecordLit { spread: RecordSpread::FieldDefaults, .. } = expr else { return None };
+    infer.variant_resolution_for_expr(id).filter(|it| !matches!(it, VariantId::UnionId(_)))
 }
 
 pub fn record_pattern_missing_fields<'db>(

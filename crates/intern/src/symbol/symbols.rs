@@ -1,7 +1,11 @@
 //! Module defining all known symbols required by the rest of rust-analyzer.
 #![allow(non_upper_case_globals)]
 
-use crate::{Symbol, arena::Store, symbol::prefill_one};
+use crate::{
+    Symbol,
+    arena::Store,
+    symbol::{Text, prefill_one},
+};
 
 macro_rules! last {
     ( $($elems:literal,)+ ) => {
@@ -32,8 +36,8 @@ macro_rules! define_symbols {
             pub enum $list_type_name {}
             impl $list_type_name {
                 // Ensure we covered all numbers.
-                const LIST: &[&str; last!($($list_idx,)+) + 1] = {
-                    static LIST: [&str; last!($($list_idx,)+) + 1] = [ $( concat!($list_prefix, $list_idx), )* ];
+                const LIST: &[Text; last!($($list_idx,)+) + 1] = {
+                    static LIST: [Text; last!($($list_idx,)+) + 1] = [ $( Text::new(concat!($list_prefix, $list_idx)), )* ];
                     &LIST
                 };
 
@@ -56,13 +60,13 @@ macro_rules! define_symbols {
         // The strings should be in `static`s so that symbol equality holds.
         $(
             pub const $name: Symbol = {
-                static SYMBOL_STR: &str = stringify!($name);
+                static SYMBOL_STR: Text = Text::new(stringify!($name));
                 Symbol::from_static(&SYMBOL_STR)
             };
         )*
         $(
             pub const $alias: Symbol = {
-                static SYMBOL_STR: &str = $value;
+                static SYMBOL_STR: Text = Text::new($value);
                 Symbol::from_static(&SYMBOL_STR)
             };
         )*

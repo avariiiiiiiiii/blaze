@@ -123,12 +123,16 @@ fn begin(spec: &confine::Spec) -> Result<Live, String> {
 fn given() -> Vec<&'static str> {
     let mut out = Vec::new();
     for fd in 0..3 {
+        // SAFETY: `libc::stat` is integers only, for which all-zero bytes are a valid value.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `stat` is a `struct stat` for `fstat` to fill.
+        // SAFETY: `stat` is a live `struct stat` of this frame for `fstat` to fill, and the
+        // call writes nothing else; a descriptor that is not open is an error return.
         if unsafe { libc::fstat(fd, &mut stat) } < 0 {
             continue;
         }
         let kind = stat.st_mode & libc::S_IFMT;
+        // SAFETY: `fcntl(F_GETFL)` takes integers only, reads no memory of this process and
+        // changes nothing of the descriptor.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         let readable = flags >= 0 && flags & libc::O_ACCMODE != libc::O_WRONLY;
         if readable && (kind == libc::S_IFREG || kind == libc::S_IFDIR) {

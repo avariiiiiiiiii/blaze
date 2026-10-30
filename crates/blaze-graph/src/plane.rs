@@ -51,7 +51,7 @@ use std::{
     hash::{BuildHasherDefault, Hash, Hasher},
 };
 
-use blaze_protocol::events::{Event, Level, NodeState, Record};
+use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,9 @@ pub enum PlaneInput {
     Open { at_ns: u64, request: RequestId, weight: u32, keep_going: bool },
     /// Nodes of the request, besides those it had. Their deps are nodes of the same request.
     Add { at_ns: u64, request: RequestId, nodes: Vec<Spec> },
+    /// [`PlaneInput::Add`] of a run of ids as columns, one allocation a column rather than
+    /// two a node: the same nodes in the same order say the same.
+    AddNodes { at_ns: u64, request: RequestId, nodes: Nodes },
     /// No more nodes are added to the request but by [`PlaneInput::Done`].
     Close { at_ns: u64, request: RequestId },
     /// The task the plane asked to run as `id` is done, on the thread group `group` where the
@@ -154,10 +157,263 @@ impl PlaneInput {
         match self {
             PlaneInput::Open { at_ns, .. }
             | PlaneInput::Add { at_ns, .. }
+            | PlaneInput::AddNodes { at_ns, .. }
             | PlaneInput::Close { at_ns, .. }
             | PlaneInput::Done { at_ns, .. }
             | PlaneInput::Held { at_ns, .. } => *at_ns,
         }
+    }
+}
+
+/// Nodes with the ids `first`, `first + 1`, and on, as columns: the names one string, the deps
+/// one array, each cut by offsets. Built by [`Nodes::push`], or read from a trace and checked,
+/// so the columns always agree.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(try_from = "Columns")]
+pub struct Nodes {
+    first: NodeId,
+    kinds: Vec<NodeKind>,
+    /// Node `i`'s name is `names[name_at[i]..name_at[i + 1]]`.
+    names: String,
+    name_at: Vec<u32>,
+    /// Node `i`'s deps are `deps[deps_at[i]..deps_at[i + 1]]`.
+    deps: Vec<NodeId>,
+    deps_at: Vec<u32>,
+    pools: Vec<Pool>,
+    costs: Vec<u64>,
+    keys: Vec<Option<Key>>,
+    memory: Vec<u64>,
+}
+
+/// A node for [`Nodes::push`]: a [`Spec`] whose id is the next of the run, borrowing its name
+/// and deps.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeRef<'a> {
+    pub kind: NodeKind,
+    pub name: &'a str,
+    pub deps: &'a [NodeId],
+    pub pool: Pool,
+    pub cost: u64,
+    pub key: Option<Key>,
+    pub memory: u64,
+}
+
+impl Nodes {
+    pub fn new(first: NodeId) -> Nodes {
+        Nodes::with_capacity(first, 0, 0, 0)
+    }
+
+    /// Room for `nodes` nodes, `name_bytes` bytes of names and `deps` deps in all.
+    pub fn with_capacity(first: NodeId, nodes: usize, name_bytes: usize, deps: usize) -> Nodes {
+        let mut name_at = Vec::with_capacity(nodes + 1);
+        name_at.push(0);
+        let mut deps_at = Vec::with_capacity(nodes + 1);
+        deps_at.push(0);
+        Nodes {
+            first,
+            kinds: Vec::with_capacity(nodes),
+            names: String::with_capacity(name_bytes),
+            name_at,
+            deps: Vec::with_capacity(deps),
+            deps_at,
+            pools: Vec::with_capacity(nodes),
+            costs: Vec::with_capacity(nodes),
+            keys: Vec::with_capacity(nodes),
+            memory: Vec::with_capacity(nodes),
+        }
+    }
+
+    /// Adds the next node of the run: its id.
+    pub fn push(&mut self, node: NodeRef<'_>) -> NodeId {
+        let id = u32::try_from(self.kinds.len())
+            .ok()
+            .and_then(|at| self.first.0.checked_add(at))
+            .unwrap_or_else(|| panic!("ids from {} past u32", self.first.0));
+        self.names.push_str(node.name);
+        self.name_at.push(u32::try_from(self.names.len()).expect("a batch's names under 4 GiB"));
+        self.deps.extend_from_slice(node.deps);
+        self.deps_at.push(u32::try_from(self.deps.len()).expect("a batch's deps under 2^32"));
+        self.kinds.push(node.kind);
+        self.pools.push(node.pool);
+        self.costs.push(node.cost);
+        self.keys.push(node.key);
+        self.memory.push(node.memory);
+        NodeId(id)
+    }
+
+    pub fn first(&self) -> NodeId {
+        self.first
+    }
+
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    /// The id of the node at `at`.
+    pub fn id(&self, at: usize) -> NodeId {
+        assert!(at < self.len(), "node {at} of {}", self.len());
+        NodeId(self.first.0 + at as u32)
+    }
+
+    pub fn name(&self, at: usize) -> &str {
+        &self.names[self.name_at[at] as usize..self.name_at[at + 1] as usize]
+    }
+
+    pub fn deps(&self, at: usize) -> &[NodeId] {
+        &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize]
+    }
+
+    /// The node at `at` as a [`Spec`].
+    pub fn spec(&self, at: usize) -> Spec {
+        Spec {
+            id: self.id(at),
+            kind: self.kinds[at],
+            name: self.name(at).to_owned(),
+            deps: self.deps(at).to_vec(),
+            pool: self.pools[at],
+            cost: self.costs[at],
+            key: self.keys[at],
+            memory: self.memory[at],
+        }
+    }
+
+    /// What the plane takes of the node at `at`: the name and deps copied, for its record.
+    fn parts(&self, at: usize) -> Parts {
+        Parts {
+            id: self.id(at),
+            kind: self.kinds[at],
+            name: self.name(at).to_owned(),
+            deps: self.deps(at).iter().map(|it| it.0).collect(),
+            pool: self.pools[at],
+            cost: self.costs[at],
+            key: self.keys[at],
+            memory: self.memory[at],
+        }
+    }
+}
+
+/// [`Nodes`] as a trace holds it, not yet checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Columns {
+    first: NodeId,
+    kinds: Vec<NodeKind>,
+    names: String,
+    name_at: Vec<u32>,
+    deps: Vec<NodeId>,
+    deps_at: Vec<u32>,
+    pools: Vec<Pool>,
+    costs: Vec<u64>,
+    keys: Vec<Option<Key>>,
+    memory: Vec<u64>,
+}
+
+impl TryFrom<Columns> for Nodes {
+    type Error = String;
+
+    fn try_from(it: Columns) -> Result<Nodes, String> {
+        let len = it.kinds.len();
+        let columns = [
+            ("pools", it.pools.len()),
+            ("costs", it.costs.len()),
+            ("keys", it.keys.len()),
+            ("memory", it.memory.len()),
+        ];
+        for (column, its) in columns {
+            if its != len {
+                return Err(format!("{len} nodes but {its} {column}"));
+            }
+        }
+        if u32::try_from(len).ok().and_then(|len| it.first.0.checked_add(len)).is_none() {
+            return Err(format!("{len} ids from {} past u32", it.first.0));
+        }
+        let cuts = |column: &str, at: &[u32], end: usize| {
+            if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
+                let offsets = at.len();
+                return Err(format!("{column} of {offsets} offsets for {len} nodes and {end} entries"));
+            }
+            match at.windows(2).position(|pair| pair[0] > pair[1]) {
+                Some(i) => Err(format!("{column} goes back at node {i}")),
+                None => Ok(()),
+            }
+        };
+        cuts("name_at", &it.name_at, it.names.len())?;
+        cuts("deps_at", &it.deps_at, it.deps.len())?;
+        if let Some(i) = it.name_at.iter().position(|&at| !it.names.is_char_boundary(at as usize)) {
+            return Err(format!("name_at cuts a character at node {i}"));
+        }
+        Ok(Nodes {
+            first: it.first,
+            kinds: it.kinds,
+            names: it.names,
+            name_at: it.name_at,
+            deps: it.deps,
+            deps_at: it.deps_at,
+            pools: it.pools,
+            costs: it.costs,
+            keys: it.keys,
+            memory: it.memory,
+        })
+    }
+}
+
+/// What [`Plane::add_one`] takes of a node, from a [`Spec`] or from [`Nodes`]: the name and deps
+/// owned for the node's record.
+struct Parts {
+    id: NodeId,
+    kind: NodeKind,
+    name: String,
+    deps: Vec<u32>,
+    pool: Pool,
+    cost: u64,
+    key: Option<Key>,
+    memory: u64,
+}
+
+impl From<Spec> for Parts {
+    fn from(spec: Spec) -> Parts {
+        let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
+        let deps = deps.into_iter().map(|it| it.0).collect();
+        Parts { id, kind, name, deps, pool, cost, key, memory }
+    }
+}
+
+/// The nodes of one input as [`Plane::check`] reads them.
+trait Given {
+    fn len(&self) -> usize;
+    fn id(&self, at: usize) -> NodeId;
+    fn deps(&self, at: usize) -> &[NodeId];
+}
+
+impl Given for [Spec] {
+    fn len(&self) -> usize {
+        <[Spec]>::len(self)
+    }
+
+    fn id(&self, at: usize) -> NodeId {
+        self[at].id
+    }
+
+    fn deps(&self, at: usize) -> &[NodeId] {
+        &self[at].deps
+    }
+}
+
+impl Given for Nodes {
+    fn len(&self) -> usize {
+        Nodes::len(self)
+    }
+
+    fn id(&self, at: usize) -> NodeId {
+        Nodes::id(self, at)
+    }
+
+    fn deps(&self, at: usize) -> &[NodeId] {
+        Nodes::deps(self, at)
     }
 }
 
@@ -443,7 +699,7 @@ struct Batch {
 impl Batch {
     /// Kahn's order over a batch with a dep on a later node of it, into `order`, the first
     /// given first among those that can go; or the ids of the nodes in a cycle, sorted.
-    fn sort(&mut self, nodes: &[Spec]) -> Result<(), Vec<NodeId>> {
+    fn sort(&mut self, nodes: &(impl Given + ?Sized)) -> Result<(), Vec<NodeId>> {
         let len = nodes.len();
         self.waiting.clear();
         self.waiting.resize(len, 0);
@@ -491,7 +747,7 @@ impl Batch {
         }
         if self.order.len() < len {
             let mut cycle: Vec<NodeId> =
-                (0..len).filter(|&at| self.waiting[at] > 0).map(|at| nodes[at].id).collect();
+                (0..len).filter(|&at| self.waiting[at] > 0).map(|at| nodes.id(at)).collect();
             cycle.sort();
             self.order.clear();
             return Err(cycle);
@@ -773,8 +1029,17 @@ impl Plane {
                 if self.requests[r as usize].closed {
                     return Err(Error::Closed);
                 }
-                self.check(r, &nodes)?;
+                self.check(r, &nodes[..])?;
                 self.add(at, r, nodes, out);
+                touched.push(r);
+            }
+            PlaneInput::AddNodes { request, nodes, .. } => {
+                let r = self.open_request(request)?;
+                if self.requests[r as usize].closed {
+                    return Err(Error::Closed);
+                }
+                self.check(r, &nodes)?;
+                self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
                 touched.push(r);
             }
             PlaneInput::Close { request, .. } => {
@@ -799,7 +1064,7 @@ impl Plane {
                 };
                 let runner = self.tasks[task as usize].runner;
                 let r = self.rows[runner as usize].request;
-                self.check(r, &added)?;
+                self.check(r, &added[..])?;
                 self.finish_task(at, task, outcome, group, out, touched);
                 self.add(at, r, added, out);
                 touched.push(r);
@@ -908,17 +1173,19 @@ impl Plane {
     /// the index as places of the batch ([`NEW`]), and [`Plane::batch`] says each one's deps
     /// and the order to add them in: each after its deps of them, the first given first among
     /// those that can go. If not, nothing is changed.
-    fn check(&mut self, r: u32, nodes: &[Spec]) -> Result<(), Error> {
+    fn check(&mut self, r: u32, nodes: &(impl Given + ?Sized)) -> Result<(), Error> {
         let batch = &mut self.batch;
         batch.deps.clear();
         batch.deps_at.clear();
         batch.order.clear();
-        if nodes.is_empty() {
+        let len = nodes.len();
+        if len == 0 {
             return Ok(());
         }
-        assert!(nodes.len() < NEW as usize, "{} nodes in one input", nodes.len());
-        for (at, spec) in nodes.iter().enumerate() {
-            let fresh = match self.index.entry(spec.id) {
+        assert!(len < NEW as usize, "{len} nodes in one input");
+        for at in 0..len {
+            let id = nodes.id(at);
+            let fresh = match self.index.entry(id) {
                 Entry::Occupied(_) => false,
                 Entry::Vacant(it) => {
                     it.insert(NEW | at as u32);
@@ -926,14 +1193,14 @@ impl Plane {
                 }
             };
             if !fresh {
-                unindex(&mut self.index, &nodes[..at]);
-                return Err(Error::Twice(spec.id));
+                unindex(&mut self.index, nodes, at);
+                return Err(Error::Twice(id));
             }
         }
         let mut in_order = true;
-        for (at, spec) in nodes.iter().enumerate() {
+        for at in 0..len {
             batch.deps_at.push(batch.deps.len() as u32);
-            for dep in &spec.deps {
+            for dep in nodes.deps(at) {
                 match self.index.get(dep) {
                     Some(&it) if it & NEW != 0 => {
                         in_order &= (it & !NEW) < at as u32;
@@ -941,8 +1208,8 @@ impl Plane {
                     }
                     Some(&it) if self.rows[it as usize].request == r => batch.deps.push(it),
                     _ => {
-                        unindex(&mut self.index, nodes);
-                        return Err(Error::UnknownDep { node: spec.id, dep: *dep });
+                        unindex(&mut self.index, nodes, len);
+                        return Err(Error::UnknownDep { node: nodes.id(at), dep: *dep });
                     }
                 }
             }
@@ -950,7 +1217,7 @@ impl Plane {
         batch.deps_at.push(batch.deps.len() as u32);
         // Given each after its deps of them, the order is the order given.
         if !in_order && let Err(cycle) = batch.sort(nodes) {
-            unindex(&mut self.index, nodes);
+            unindex(&mut self.index, nodes, len);
             return Err(Error::Cycle(cycle));
         }
         Ok(())
@@ -958,23 +1225,38 @@ impl Plane {
 
     /// Adds the nodes [`Plane::check`] took to request `r`.
     fn add(&mut self, at: u64, r: u32, mut nodes: Vec<Spec>, out: &mut Vec<PlaneOutput>) {
-        if nodes.is_empty() {
+        if !self.batch.order.is_empty() {
+            permute(&mut nodes, &mut self.batch.order);
+        }
+        let len = nodes.len();
+        let mut nodes = nodes.into_iter();
+        self.add_with(at, r, len, |_| Parts::from(nodes.next().expect("a node a place")), out);
+    }
+
+    /// Adds the `len` nodes [`Plane::check`] took to request `r`, in its order: `part` gives the
+    /// node at each place, called once a place.
+    fn add_with(
+        &mut self,
+        at: u64,
+        r: u32,
+        len: usize,
+        mut part: impl FnMut(usize) -> Parts,
+        out: &mut Vec<PlaneOutput>,
+    ) {
+        if len == 0 {
             return;
         }
         let mut batch = std::mem::take(&mut self.batch);
-        if !batch.order.is_empty() {
-            permute(&mut nodes, &mut batch.order);
-        }
         batch.slots.clear();
-        batch.slots.resize(nodes.len(), NONE);
+        batch.slots.resize(len, NONE);
         let mut added = std::mem::take(&mut self.added);
         added.clear();
-        for (at_node, spec) in nodes.into_iter().enumerate() {
+        for at_node in 0..len {
             let place = match batch.order.get(at_node) {
                 Some(&place) => (place & !NEW) as usize,
                 None => at_node,
             };
-            let me = self.add_one(at, r, spec, &batch, place, out);
+            let me = self.add_one(at, r, part(place), &batch, place, out);
             batch.slots[place] = me;
             added.push(me);
         }
@@ -1023,12 +1305,12 @@ impl Plane {
         &mut self,
         at: u64,
         r: u32,
-        spec: Spec,
+        parts: Parts,
         batch: &Batch,
         place: usize,
         out: &mut Vec<PlaneOutput>,
     ) -> u32 {
-        let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
+        let Parts { id, kind, name, deps, pool, cost, key, memory } = parts;
         let me = match self.free_nodes.pop() {
             Some(me) => me,
             None => {
@@ -1116,7 +1398,7 @@ impl Plane {
         out.push(said(
             request_id,
             at,
-            Event::Node { id: id.0, kind, name, deps: deps.into_iter().map(|it| it.0).collect() },
+            Event::Node { id: id.0, kind, name, deps },
         ));
         *self.index.get_mut(&id).expect("a checked node in the index") = me;
         let seq = self.seq();
@@ -1798,10 +2080,10 @@ fn new_task(
     }
 }
 
-/// Takes the ids of a batch refused back out of the index.
-fn unindex(index: &mut FxHashMap<NodeId, u32>, nodes: &[Spec]) {
-    for spec in nodes {
-        index.remove(&spec.id);
+/// Takes the ids of the first `len` nodes of a batch refused back out of the index.
+fn unindex(index: &mut FxHashMap<NodeId, u32>, nodes: &(impl Given + ?Sized), len: usize) {
+    for at in 0..len {
+        index.remove(&nodes.id(at));
     }
 }
 

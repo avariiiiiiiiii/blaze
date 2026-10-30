@@ -187,7 +187,8 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
             match current {
                 Some(it) if glob_binding(&it) => {
                     let public = first_item.public && first.vis == Visibility::Public;
-                    if !public || !uses.public_modules.contains(&module) {
+                    let exported = it.import.is_some_and(|it| uses.exported_names.contains(&(it, name.clone(), ns)));
+                    if !public || !exported {
                         continue;
                     }
                     let Some(&(_, other_tree, _)) = imported.iter().find(|(_, _, it)| it.def != first.def) else {

@@ -28,6 +28,10 @@ impl LatePass for EnumIntrinsicsNonEnums {
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
         let Expr::Call { callee, args } = store.expr(expr) else { return };
+        // `mem::discriminant` takes one argument, `mem::variant_count` none.
+        if args.len() > 1 {
+            return;
+        }
         let Expr::Path(_) = store.expr(callee) else { return };
         let Some(name) = util::path_item(b, callee) else { return };
         let discriminant = match name.as_str() {

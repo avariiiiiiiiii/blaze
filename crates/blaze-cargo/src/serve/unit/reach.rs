@@ -9,6 +9,8 @@
 //! that changed; the tests are matched against a hash set of the old code hashes of what
 //! changed, `O(1)` per hash a test reached.
 
+#![forbid(unsafe_code)]
+
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use hir_ty::db::HirDatabase;

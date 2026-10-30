@@ -33,6 +33,8 @@ crates must change to keep building and to lower the new MIR.
   (whatever derive `MirOptLevel` uses to be a query argument; `MirOptLevel` needs `PartialOrd`
   for `at`, or compare with `matches!(level, MirOptLevel::Release)`.)
 
+> forwarded to db (db-ty): `crates/hir-ty/src/mir.rs` is its.
+
 ## 2. hir-ty `src/db.rs` and hir-ide `src/impl_db_macro.rs` (db-ty-db)
 
 The level argument of the optimized queries becomes `options: MirOptions` (db.rs 127, 133, 139,
@@ -52,6 +54,8 @@ fn monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(&'db self, def: I
 Same return types as the runtime coroutine twins. `crates/hir/src/evict.rs` (46–61): evict the
 four new queries too.
 
+> applied (hir-ide): `impl_hir_database!` passes `options: MirOptions` to the four optimized queries and maps the four coroutine twins to `mir::*_query`, as written here. forwarded to db for `hir-ty/src/db.rs` and `hir/src/evict.rs`.
+
 ## 3. hir-def `src/lang_item.rs` (beside 611/616) and the symbols
 
 ```
@@ -64,6 +68,8 @@ with the four symbols interned in `intern`'s `sym`. (core: `SizedTypeProperties:
 carry `#[lang = "mem_size_const"]`/`"mem_align_const"`; rustc's checks read them as
 unevaluated constants; the collector already takes associated consts, as for `RangeMin`.)
 
+> forwarded to db (`hir-def/src/lang_item.rs`; `intern`'s `sym` is format's, db asks it or adds the four symbols with the lang items).
+
 ## 4. Other exhaustive matches on `AssertKind`/`CastKind` outside hir-ty-mir
 
 - `crates/blaze-items/src/form.rs:2630` hashes `AssertKind` into the code-identity hash: each
@@ -74,6 +80,8 @@ unevaluated constants; the collector already takes associated consts, as for `Ra
 - `crates/hir-ty-codegen/fncache/dispatch.rs:399`, `mod.rs:12418` (casts) and `mod.rs:13362`
   (asserts): see 5.
 - hir-ty and hir-ty-borrowck: any exhaustive match on either enum.
+
+> applied (items DONE): `blaze-items/src/form.rs` hashes the four new `AssertKind`s with tags 5-8 and their operands; casts hash `CastKind` by `Debug`, so `Transmute` is in already. forwarded to diagnostics (`panics.rs:518`), codegen (`hir-ty-codegen`), db (hir-ty, hir-ty-borrowck).
 
 ## 5. Codegen must lower (speed-backend-lower, `crates/hir-ty-codegen/mod.rs`)
 
@@ -96,6 +104,8 @@ unevaluated constants; the collector already takes associated consts, as for `Ra
   the new optimized coroutine queries (they insert only the checks; coroutines are not
   optimized further, as today).
 
+> forwarded to codegen.
+
 ## 6. Refs walk (codegen-adapter-refs, `crates/hir-ty-codegen/v2/refs.rs`)
 
 - `refs.rs:978` (assert panics): list `panic_misaligned_pointer_dereference`,
@@ -105,6 +115,8 @@ unevaluated constants; the collector already takes associated consts, as for `Ra
 - The checks read `<T as SizedTypeProperties>::SIZE`/`ALIGN` as unevaluated constants: the walk
   must evaluate or list them like any other unevaluated constant operand.
 
+> forwarded to codegen.
+
 ## 7. The adapter's `v2::build::Build`
 
 Carries, per unit, the `MirOptions` its bodies are asked with: the crate's MIR level
@@ -112,11 +124,15 @@ Carries, per unit, the `MirOptions` its bodies are asked with: the crate's MIR l
 `lifetime_markers: true`. Each is part of the MIR query's key, so nothing else is needed for
 the memo to see it.
 
+> forwarded to codegen.
+
 ## 8. Callers of the optimized queries
 
 `crates/hir-ide/src/tests/mir/eval.rs:65` and `tests/mir/optimize.rs:69`,
 `crates/blaze-engine/src/mirdump.rs:157,176`: pass `MirOptions::at(level)` where they pass
 `level`.
+
+> applied: `hir-ide/src/tests/mir/eval.rs` and `optimize.rs` pass `MirOptions::at(level)`. forwarded to codegen for `blaze-engine/src/mirdump.rs`.
 
 ## 9. `name_sources` (engine, `crates/blaze-engine/src/lib.rs:827`; parent's)
 
@@ -132,3 +148,5 @@ hir_ty_codegen::name_sources(
 `Resolver::of` holds a `&RootDatabase` there; the call moves to where the engine still has the
 database mutably (before it is shared), or `Resolver::of` takes `&mut`. The re-export at
 `hir-ty-codegen/mod.rs:87` stays as is.
+
+> forwarded to codegen (`blaze-engine` is its).

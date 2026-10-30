@@ -18,6 +18,9 @@ blaze-codegen.workspace = true
 blaze-items.workspace = true
 rustc-hash.workspace = true
 
+[dev-dependencies]
+blaze-ids.workspace = true
+
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 

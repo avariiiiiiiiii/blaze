@@ -38,6 +38,7 @@ impl<T> RangeMap<T> {
         self.v.last().map_or(0, |x| x.range.end)
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.v.len()
     }

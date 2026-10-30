@@ -257,6 +257,10 @@ impl<I: Interner, T: TypeFoldable<I>, E: TypeFoldable<I>> TypeFoldable<I> for Re
     }
 }
 
+/// Folds the `T` in `arc` in place when `arc` is its only owner, so a fold allocates no new
+/// `Arc` and clones nothing; `tests::fold_arc_matches_the_safe_fold` checks it against
+/// `Arc::new(fold(Arc::unwrap_or_clone(arc))?)`.
+#[allow(unsafe_code)]
 fn fold_arc<T: Clone, E>(
     mut arc: Arc<T>,
     fold: impl FnOnce(T) -> Result<T, E>,
@@ -264,6 +268,12 @@ fn fold_arc<T: Clone, E>(
     // We merely want to replace the contained `T`, if at all possible,
     // so that we don't needlessly allocate a new `Arc` or indeed clone
     // the contained type.
+    // SAFETY: `Arc::make_mut` leaves `arc` the one owner of its `T`, so `get_mut` is `Some`.
+    // `ManuallyDrop<T>` is `repr(transparent)` over `T`, so the two `Arc` casts name one
+    // allocation of one layout. The `T` moved out by `ManuallyDrop::take` is replaced before
+    // the `Arc` is cast back. If `fold` fails or unwinds, the slot is never dropped as a `T`
+    // (it is a `ManuallyDrop`): the moved-out value is dropped once, by `fold`, and never
+    // twice.
     unsafe {
         // First step is to ensure that we have a unique reference to
         // the contained type, which `Arc::make_mut` will accomplish (by
@@ -552,5 +562,53 @@ where
 
     fn fold_clauses(&mut self, c: I::Clauses) -> I::Clauses {
         if c.has_regions() { c.super_fold_with(self) } else { c }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::fold_arc;
+
+    /// The safe fold `fold_arc` must give the same value as.
+    fn safe_fold<T: Clone, E>(arc: Arc<T>, fold: impl FnOnce(T) -> Result<T, E>) -> Result<Arc<T>, E> {
+        Ok(Arc::new(fold(Arc::unwrap_or_clone(arc))?))
+    }
+
+    fn double(values: Vec<u32>) -> Result<Vec<u32>, ()> {
+        Ok(values.into_iter().map(|it| it * 2).collect())
+    }
+
+    #[test]
+    fn fold_arc_matches_the_safe_fold() {
+        let unique = Arc::new(vec![1, 2, 3]);
+        let at = Arc::as_ptr(&unique);
+        let folded = fold_arc(unique, double).unwrap();
+        assert_eq!(folded, safe_fold(Arc::new(vec![1, 2, 3]), double).unwrap());
+        assert_eq!(Arc::as_ptr(&folded), at, "a unique `Arc` is folded in place");
+
+        let shared = Arc::new(vec![4, 5]);
+        let kept = Arc::clone(&shared);
+        let folded = fold_arc(shared, double).unwrap();
+        assert_eq!(folded, safe_fold(Arc::clone(&kept), double).unwrap());
+        assert_eq!(*kept, vec![4, 5], "a shared `Arc`'s other owners keep the old value");
+    }
+
+    #[test]
+    fn a_failed_fold_drops_the_value_once() {
+        struct Counted(Arc<()>);
+        impl Clone for Counted {
+            fn clone(&self) -> Counted {
+                Counted(Arc::clone(&self.0))
+            }
+        }
+        let alive = Arc::new(());
+        let result = fold_arc(Arc::new(Counted(Arc::clone(&alive))), |it| {
+            drop(it);
+            Err(())
+        });
+        assert!(result.is_err());
+        assert_eq!(Arc::strong_count(&alive), 1, "dropped by the fold, and not again");
     }
 }

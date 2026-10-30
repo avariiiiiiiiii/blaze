@@ -102,7 +102,7 @@ fn mismatch(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: &InFile<SyntaxNode
         _ => "mismatched types",
     };
     let mut diag = Diag::error(Some("E0308"), message, span.clone());
-    diag.span_label(span.clone(), sorts(cx, &d.expected, &d.actual));
+    diag.span_label(span.clone(), print::sorts(cx, &d.expected, &d.actual));
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     match &context {
         Context::MatchArm { match_expr, prior } => {
@@ -175,17 +175,6 @@ fn mismatch(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: &InFile<SyntaxNode
         suggest(cx, &node.with_value(expr), &d.expected, &d.actual, &mut diag);
     }
     diag
-}
-
-/// rustc's `TypeError::Sorts`: "expected `u32`, found `&str`", "found a different" when the
-/// two read the same.
-fn sorts(cx: &Cx<'_, '_>, expected: &hir::Type<'_>, found: &hir::Type<'_>) -> String {
-    let (e, f) = (print::sort_string(cx, expected), print::sort_string(cx, found));
-    if e == f {
-        format!("expected {e}, found a different {f}")
-    } else {
-        format!("expected {e}, found {f}")
-    }
 }
 
 /// rustc's `note_expected_found`: the two types in full, aligned, unless both are simple.
@@ -518,7 +507,7 @@ fn no_tail(
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let span = in_file(ret.syntax().text_range());
     let mut diag = Diag::error(Some("E0308"), "mismatched types", span.clone());
-    diag.span_label(span, sorts(cx, &d.expected, &d.actual));
+    diag.span_label(span, print::sorts(cx, &d.expected, &d.actual));
     if let Some(name) = item.name() {
         diag.span_label(
             in_file(name.syntax().text_range()),
@@ -549,7 +538,7 @@ fn no_else(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>, node: &InFile<SyntaxNode>
     let span = in_file(if_expr.syntax().text_range());
     let (expected, found) = (&d.actual, &d.expected);
     let mut diag = Diag::error(Some("E0317"), "`if` may be missing an `else` clause", span.clone());
-    diag.span_label(span, sorts(cx, expected, found));
+    diag.span_label(span, print::sorts(cx, expected, found));
     match coercion_reason(cx, node, if_expr.syntax(), expected) {
         Some((at, label)) => {
             diag.span_label(at, label);

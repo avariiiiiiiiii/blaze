@@ -63,6 +63,7 @@ use super::{
 };
 use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
+pub mod machine;
 mod shim;
 
 macro_rules! from_bytes {

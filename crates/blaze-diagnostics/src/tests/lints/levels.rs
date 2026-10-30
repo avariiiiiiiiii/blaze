@@ -1,6 +1,6 @@
 //! Lint levels from attributes, the command line and `--cap-lints`, and what rustc says of the
-//! lint names in them, against rustc's UI tests. Those with `-Z deduplicate-diagnostics=no`
-//! (compiletest's default) show each diagnostic once, as blaze writes it.
+//! lint names in them, against rustc's UI tests as they are, under compiletest's flags
+//! (`-Z deduplicate-diagnostics=no` with them).
 
 use crate::{
     Options,
@@ -8,36 +8,19 @@ use crate::{
     lints::{CommandLine, Level},
     lower::mutable_ref_binding::BUILT_ON,
     model,
-    tests::{checked, checked_with, normalized},
+    tests::{Mode, checked, checked_with, compiletest, normalized, ui_with},
 };
 
-/// Whether a UI test passes (`//@ check-pass`): compiletest gives it more flags.
-#[derive(Clone, Copy)]
-enum Test {
-    Passes,
-    Fails,
-}
-
-/// compiletest's lint flags (`runtest.rs`, `make_compile_args`), with `-A unused -W
-/// unused_attributes` before them for a test that passes, then the test's `compile-flags`.
-fn compiletest(test: Test, flags: &[&str]) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if let Test::Passes = test {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    args.extend(flags);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+/// The options of a test's own `//@ compile-flags`, its lint flags `flags`.
+fn flags(flags: &[&str]) -> Options {
+    let args: Vec<String> = flags.iter().map(|it| (*it).to_owned()).collect();
     Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
 }
 
 /// What rustc writes to stderr for the one-file crate `source` named `$DIR/<name>`, in edition
-/// 2015, under compiletest's flags and `flags`.
-fn ui(name: &str, test: Test, flags: &[&str], source: &str) -> String {
-    let fixture = format!("//- /{name} crate:main edition:2015\n{source}");
-    let stderr = checked_with(&fixture, "$DIR/", &compiletest(test, flags))
-        .stderr_with(Style { ui_testing: true, ..Style::default() });
-    normalized(&stderr).replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
+/// 2015, as compiletest runs it with the test's lint flags `own`.
+fn ui(name: &str, own: &[&str], source: &str) -> String {
+    ui_with(name, "2015", source, &flags(own)).replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
 }
 
 #[test]
@@ -63,7 +46,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0453`.
 "##;
-    assert_eq!(ui("lint-forbid-attr.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("lint-forbid-attr.rs", &[], source), expected);
 }
 
 #[test]
@@ -97,7 +80,7 @@ LL | #[deny(unused)]
 error: aborting due to 1 previous error; 1 warning emitted
 
 "##;
-    assert_eq!(ui("lint-renamed.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("lint-renamed.rs", &[], source), expected);
 }
 
 #[test]
@@ -134,7 +117,7 @@ LL | #[deny(unused_variables)]
 error: aborting due to 1 previous error; 1 warning emitted
 
 "##;
-    assert_eq!(ui("lint-removed.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("lint-removed.rs", &[], source), expected);
 }
 
 #[test]
@@ -222,7 +205,10 @@ error: aborting due to 7 previous errors; 1 warning emitted
 
 For more information about this error, try `rustc --explain E0452`.
 "##;
-    assert_eq!(ui("reasons-erroneous.rs", Test::Fails, &[], source), expected);
+    let options = Options { keep_duplicates: false, ..compiletest(Mode::Other, &Options::default()) };
+    let fixture = format!("//- /reasons-erroneous.rs crate:main edition:2015\n{source}");
+    let stderr = checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    assert_eq!(normalized(&stderr), expected);
 }
 
 /// rustc's test panics in `main` with std's macro; here `main` loops, on the same line, as the
@@ -283,7 +269,7 @@ LL | #[deny(rust_2018_idiots)]
 warning: 4 warnings emitted
 
 "##;
-    assert_eq!(ui("suggestions.rs", Test::Passes, &[], source), expected);
+    assert_eq!(ui("suggestions.rs", &[], source), expected);
 }
 
 #[test]
@@ -332,7 +318,7 @@ LL | #[allow(uncommon_codepoints)]
 error: aborting due to 3 previous errors
 
 "##;
-    assert_eq!(ui("crate_level_only_lint.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("crate_level_only_lint.rs", &[], source), expected);
 }
 
 #[test]
@@ -442,7 +428,7 @@ LL |     #[allow(nonex_lint_fn)]
 error: aborting due to 7 previous errors
 
 "##;
-    assert_eq!(ui("unknown-lints-in-cfg-attr-97094.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("unknown-lints-in-cfg-attr-97094.rs", &[], source), expected);
 }
 
 #[test]
@@ -470,7 +456,7 @@ LL | #![expect(unused_variables, reason = "<This should fail and display this re
 warning: 1 warning emitted
 
 "##;
-    assert_eq!(ui("expect_with_reason.rs", Test::Passes, &[], source), expected);
+    assert_eq!(ui("expect_with_reason.rs", &[], source), expected);
 }
 
 #[test]
@@ -581,7 +567,7 @@ LL | #[expect(unused_variables)]
 error: aborting due to 1 previous error; 4 warnings emitted
 
 "##;
-    assert_eq!(ui("expect_nested_lint_levels.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("expect_nested_lint_levels.rs", &[], source), expected);
 }
 
 #[test]
@@ -612,7 +598,7 @@ LL | #![warn(unknown_lints)]
 warning: 1 warning emitted
 
 "##;
-    assert_eq!(ui("warn-unknown-unstable-lint-inline.rs", Test::Passes, &[], source), expected);
+    assert_eq!(ui("warn-unknown-unstable-lint-inline.rs", &[], source), expected);
 }
 
 #[test]
@@ -635,11 +621,20 @@ LL | #![warn(abc::my_lint)]
    |
    = help: add `#![register_tool(abc)]` to the crate root
 
-error: aborting due to 1 previous error
+error[E0710]: unknown tool name `abc` found in scoped lint: `abc::my_lint`
+  --> $DIR/register-tool-lint.rs:5:9
+   |
+LL | #![warn(abc::my_lint)]
+   |         ^^^
+   |
+   = help: add `#![register_tool(abc)]` to the crate root
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0710`.
 "##;
-    assert_eq!(ui("register-tool-lint.rs", Test::Fails, &[], source), expected);
+    assert_eq!(ui("register-tool-lint.rs", &[], source), expected);
 }
 
 #[test]
@@ -662,6 +657,18 @@ fn main() { let unused = (); } //~ ERROR unused variable: `unused`
    = note: requested on the command line with `-D bare_trait_object`
    = note: `#[warn(renamed_and_removed_lints)]` on by default
 
+warning: lint `bare_trait_object` has been renamed to `bare_trait_objects`
+   |
+   = help: use the new name `bare_trait_objects`
+   = note: requested on the command line with `-D bare_trait_object`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+warning: lint `bare_trait_object` has been renamed to `bare_trait_objects`
+   |
+   = help: use the new name `bare_trait_objects`
+   = note: requested on the command line with `-D bare_trait_object`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
 error: unused variable: `unused`
   --> $DIR/lint-renamed-cmdline.rs:5:17
    |
@@ -675,10 +682,10 @@ LL | #[deny(unused)]
    |        ^^^^^^
    = note: `#[deny(unused_variables)]` implied by `#[deny(unused)]`
 
-error: aborting due to 1 previous error; 1 warning emitted
+error: aborting due to 1 previous error; 3 warnings emitted
 
 "##;
-    assert_eq!(ui("lint-renamed-cmdline.rs", Test::Fails, &["-D", "bare_trait_object"], source), expected);
+    assert_eq!(ui("lint-renamed-cmdline.rs", &["-D", "bare_trait_object"], source), expected);
 }
 
 #[test]
@@ -705,6 +712,16 @@ fn main() { let unused = (); } //~ ERROR unused variable: `unused`
    = note: requested on the command line with `-D raw_pointer_derive`
    = note: requested on the command line with `-D renamed-and-removed-lints`
 
+error: lint `raw_pointer_derive` has been removed: using derive with raw pointers is ok
+   |
+   = note: requested on the command line with `-D raw_pointer_derive`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: lint `raw_pointer_derive` has been removed: using derive with raw pointers is ok
+   |
+   = note: requested on the command line with `-D raw_pointer_derive`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
 error: unused variable: `unused`
   --> $DIR/lint-removed-cmdline-deny.rs:10:17
    |
@@ -718,11 +735,11 @@ LL | #[deny(warnings)]
    |        ^^^^^^^^
    = note: `#[deny(unused_variables)]` implied by `#[deny(warnings)]`
 
-error: aborting due to 2 previous errors
+error: aborting due to 4 previous errors
 
 "##;
     let flags = ["-D", "renamed-and-removed-lints", "-D", "raw_pointer_derive"];
-    assert_eq!(ui("lint-removed-cmdline-deny.rs", Test::Fails, &flags, source), expected);
+    assert_eq!(ui("lint-removed-cmdline-deny.rs", &flags, source), expected);
 }
 
 #[test]
@@ -747,11 +764,21 @@ fn main() {}
    = note: requested on the command line with `--force-warn foo_qux`
    = note: `#[warn(unknown_lints)]` on by default
 
-warning: 1 warning emitted
+warning[E0602]: unknown lint: `foo_qux`
+   |
+   = note: requested on the command line with `--force-warn foo_qux`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+warning[E0602]: unknown lint: `foo_qux`
+   |
+   = note: requested on the command line with `--force-warn foo_qux`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+warning: 3 warnings emitted
 
 For more information about this error, try `rustc --explain E0602`.
 "##;
-    assert_eq!(ui("cli-unknown-force-warn.rs", Test::Passes, &["--force-warn", "foo-qux"], source), expected);
+    assert_eq!(ui("cli-unknown-force-warn.rs", &["--force-warn", "foo-qux"], source), expected);
 }
 
 #[test]
@@ -768,11 +795,21 @@ fn main() {}
    |
    = note: requested on the command line with `-A unknown_tool::foo`
 
-error: aborting due to 1 previous error
+error[E0602]: unknown lint tool: `unknown_tool`
+   |
+   = note: requested on the command line with `-A unknown_tool::foo`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error[E0602]: unknown lint tool: `unknown_tool`
+   |
+   = note: requested on the command line with `-A unknown_tool::foo`
+   = note: duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`
+
+error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0602`.
 "##;
-    let stderr = ui("command-line-register-unknown-lint-tool.rs", Test::Fails, &["-A", "unknown_tool::foo"], source);
+    let stderr = ui("command-line-register-unknown-lint-tool.rs", &["-A", "unknown_tool::foo"], source);
     assert_eq!(stderr, expected);
 }
 
@@ -826,6 +863,16 @@ fn main() { from_dep(); from_here(); }
     let unused: Vec<_> = checked.diags.iter().filter(|it| it.lint_name() == Some("unused_variables")).collect();
     assert_eq!(unused.len(), 1, "{:?}", checked.messages());
     assert_eq!(unused[0].span.primary[0].file, "main.rs", "{:?}", checked.messages());
+}
+
+/// `blaze` is a tool every crate has, with the one lint `blaze::const_impure`: naming it is
+/// quiet, and any other `blaze::` name is an unknown lint of a known tool.
+#[test]
+fn blaze_tool_lints() {
+    let fixture = "//- /main.rs crate:main\n#![deny(blaze::const_impure)]\n#![allow(blaze::const_purity)]\nfn main() {}\n";
+    let messages = checked(fixture).messages();
+    let unknown: Vec<_> = messages.iter().filter(|it| it.contains("unknown lint")).collect();
+    assert_eq!(unknown, ["unknown_lints: unknown lint: `blaze::const_purity`"], "{messages:?}");
 }
 
 #[test]

@@ -1039,7 +1039,7 @@ fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[(Symbol, boo
         }
     }
     let mut known = known.into_iter().collect::<Vec<_>>();
-    known.sort_unstable_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    known.sort_unstable_by(|a, b| a.0.cmp_order(&b.0));
     known.into()
 }
 

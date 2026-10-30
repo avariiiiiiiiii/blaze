@@ -23,6 +23,11 @@ pub struct Request<'a> {
     pub output: &'a Output,
     /// The address of the image's first byte: it is never slid.
     pub base: u64,
+    /// Where the run's loader keeps the program's thread-locals ([`blaze_inproc::TlsReserve`]):
+    /// the image's are at `tls_bias + offset`, from offset 0 (from the thread pointer on ELF,
+    /// from the start of the module's block on PE; 0 on Mach-O, whose descriptors hold the
+    /// offset into the template).
+    pub tls_bias: i64,
     pub functions: &'a [&'a CompiledFunction],
     pub statics: &'a [&'a Static],
     pub names: &'a [(String, Target)],
@@ -166,6 +171,8 @@ pub struct Prelinked {
     pub tls: Option<Tls>,
     /// Call frame information (`.eh_frame`, `__eh_frame`) to register, as address and length.
     pub unwind: Vec<(u64, u64)>,
+    /// Mach-O: the thread-local descriptors (`__thread_vars`) the run's loader fills.
+    pub thread_vars: Vec<(u64, u64)>,
 }
 
 /// The address every image of an output is placed at: far from where loaders put
@@ -180,10 +187,13 @@ pub fn base(format: Format, arch: Arch) -> Result<u64, PremapError> {
     }
 }
 
-/// The page every segment is aligned to.
+/// The granule every segment is aligned to: the largest a system of the target maps a memory
+/// object by (16 KiB pages on Apple silicon, 64 KiB pages on AArch64 Linux kernels built so,
+/// Windows' 64 KiB allocation granularity for a view's address and offset).
 pub fn page(format: Format, arch: Arch) -> u64 {
     match (format, arch) {
         (Format::MachO, Arch::Aarch64) => 16 << 10,
+        (Format::Pe, _) | (_, Arch::Aarch64) => 64 << 10,
         _ => 4 << 10,
     }
 }
@@ -249,9 +259,17 @@ fn check(request: &Request<'_>, linked: &Prelinked, page: u64) -> Result<(), Pre
             return fail(format!("placed a segment at {:#x}, not page-aligned after {end:#x}", segment.addr));
         }
         if (segment.bytes.len() as u64) > segment.size || segment.size == 0 {
-            return fail(format!("made a segment at {:#x} of {} bytes in {}", segment.addr, segment.bytes.len(), segment.size)) ;
+            return fail(format!(
+                "made a segment at {:#x} of {} bytes in {}",
+                segment.addr,
+                segment.bytes.len(),
+                segment.size
+            ));
         }
-        end = segment.addr.checked_add(segment.size).ok_or_else(|| PremapError::new("a segment past the end of the address space".to_owned()))?;
+        end = match segment.addr.checked_add(segment.size) {
+            Some(end) => end,
+            None => return fail(format!("made a segment at {:#x} past the end of the address space", segment.addr)),
+        };
     }
     let inside = |addr: u64, len: u64, writable: bool| {
         linked.segments.iter().any(|it| {
@@ -296,6 +314,11 @@ fn check(request: &Request<'_>, linked: &Prelinked, page: u64) -> Result<(), Pre
     for (addr, len) in &linked.unwind {
         if !inside(*addr, *len, false) {
             return fail(format!("made call frame information at {addr:#x} outside its segments"));
+        }
+    }
+    for (addr, len) in &linked.thread_vars {
+        if addr % 8 != 0 || len % 24 != 0 || !inside(*addr, *len, true) {
+            return fail(format!("made thread-local descriptors at {addr:#x} outside its writable segments"));
         }
     }
     Ok(())

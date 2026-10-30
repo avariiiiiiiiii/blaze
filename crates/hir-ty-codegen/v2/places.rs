@@ -2,7 +2,7 @@
 //! for each, the same whether the IR builder or the walk of the MIR ([`super::refs`]) asks.
 //! Equal references are one place, so both go through here.
 
-use std::hash::BuildHasher as _;
+use std::{borrow::Cow, cell::OnceCell, hash::BuildHasher as _};
 
 use blaze_codegen::{Target, backend::FrontRef, template::Refs};
 use cranelift_codegen::ir;
@@ -147,20 +147,31 @@ pub(crate) fn personality_ref() -> Ref {
 }
 /// The places of a list of references: a function's, which the walk made and nothing is
 /// added to, or a static's, made as its requests come.
-pub(crate) struct Placer {
-    refs: Vec<Ref>,
+pub(crate) struct Placer<'a> {
+    /// A function's: the walk's list as the database memoizes it, borrowed.
+    refs: Cow<'a, [Ref]>,
     /// Each place, found by its reference's hash and checked against `refs`, so no reference is
     /// cloned into a key: 4 bytes and a control byte a place, one probe a lookup.
     index: HashTable<u32>,
     open: bool,
 }
 
+/// A reference's hash: a symbol's is of its name alone, so [`Placer::symbol`] finds one
+/// by a `&str` without making the reference.
 fn hash(it: &Ref) -> u64 {
-    FxBuildHasher.hash_one(it)
+    match it {
+        FrontRef::Extern(name) => symbol_hash(name),
+        other => FxBuildHasher.hash_one(other),
+    }
 }
 
-impl Placer {
-    pub(crate) fn listed(refs: Vec<Ref>) -> Placer {
+fn symbol_hash(name: &str) -> u64 {
+    FxBuildHasher.hash_one(name)
+}
+
+impl<'a> Placer<'a> {
+    pub(crate) fn listed(refs: impl Into<Cow<'a, [Ref]>>) -> Placer<'a> {
+        let refs = refs.into();
         let mut index = HashTable::with_capacity(refs.len());
         for (place, it) in refs.iter().enumerate() {
             let hashed = hash(it);
@@ -171,8 +182,8 @@ impl Placer {
         Placer { refs, index, open: false }
     }
 
-    pub(crate) fn open() -> Placer {
-        Placer { refs: Vec::new(), index: HashTable::new(), open: true }
+    pub(crate) fn open() -> Placer<'a> {
+        Placer { refs: Cow::Owned(Vec::new()), index: HashTable::new(), open: true }
     }
 
     pub(crate) fn place(&mut self, it: Ref) -> Result<u32, String> {
@@ -181,11 +192,26 @@ impl Placer {
         if let Some(&place) = self.index.find(hashed, |&at| refs[at as usize] == it) {
             return Ok(place);
         }
+        self.add(hashed, it)
+    }
+
+    /// The place of the symbol `name`, which is made a reference only when it is new.
+    pub(crate) fn symbol(&mut self, name: &str) -> Result<u32, String> {
+        let hashed = symbol_hash(name);
+        let refs = &self.refs;
+        let same = |&at: &u32| matches!(&refs[at as usize], FrontRef::Extern(it) if it == name);
+        if let Some(&place) = self.index.find(hashed, same) {
+            return Ok(place);
+        }
+        self.add(hashed, FrontRef::Extern(name.to_owned()))
+    }
+
+    fn add(&mut self, hashed: u64, it: Ref) -> Result<u32, String> {
         if !self.open {
             return Err(format!("the IR asks for {it:?}, which its references do not list"));
         }
         let place = self.refs.len() as u32;
-        self.refs.push(it);
+        self.refs.to_mut().push(it);
         let refs = &self.refs;
         self.index.insert_unique(hashed, place, |&at| hash(&refs[at as usize]));
         Ok(place)
@@ -196,7 +222,7 @@ impl Placer {
     }
 
     pub(crate) fn into_refs(self) -> Vec<Ref> {
-        self.refs
+        self.refs.into_owned()
     }
 }
 
@@ -205,12 +231,16 @@ pub(crate) fn place_requests(
     db: &dyn HirDatabase,
     homes: &mut Homes,
     hashes: &dyn Hashes,
-    placer: &mut Placer,
+    placer: &mut Placer<'_>,
     requests: &mut Requests,
 ) -> Result<Places, String> {
     let mut funcs = Vec::with_capacity(requests.funcs.len());
     for request in &requests.funcs {
-        funcs.push(placer.place(func_ref(db, homes, &request.target)?)?);
+        let place = match &request.target {
+            FuncTarget::Symbol(symbol) => placer.symbol(symbol)?,
+            target => placer.place(func_ref(db, homes, target)?)?,
+        };
+        funcs.push(place);
     }
     let mut datas = Vec::with_capacity(requests.datas.len());
     for request in &mut requests.datas {
@@ -287,11 +317,26 @@ pub(crate) fn resolve<T>(
         Some(DataPlace::Nowhere) => Ok(DataTarget::Nowhere),
         None => Err(format!("data {index} has no place")),
     };
+    // The places of the symbols, made on the first relocation at one: most functions have
+    // none (a libcall, the personality), and one has a probe each after.
+    let symbols = OnceCell::new();
     let symbol = |name: &str| {
-        refs.iter()
-            .find(|it| matches!(it, Target::Extern(it) if it == name))
-            .cloned()
-            .ok_or_else(|| format!("the code calls `{name}`, which its references do not list"))
+        let symbols = symbols.get_or_init(|| {
+            let mut index: HashTable<(u64, u32)> = HashTable::new();
+            for (at, it) in refs.iter().enumerate() {
+                if let Target::Extern(it) = it {
+                    let hashed = symbol_hash(it);
+                    index.insert_unique(hashed, (hashed, at as u32), |it| it.0);
+                }
+            }
+            index
+        });
+        let same =
+            |&(_, at): &(u64, u32)| matches!(&refs[at as usize], Target::Extern(it) if it == name);
+        match symbols.find(symbol_hash(name), same) {
+            Some(&(_, at)) => Ok(refs[at as usize].clone()),
+            None => Err(format!("the code calls `{name}`, which its references do not list")),
+        }
     };
     let body = || match refs.len().checked_sub(1) {
         Some(last) if last == places.refs as usize => Ok(refs[last].clone()),

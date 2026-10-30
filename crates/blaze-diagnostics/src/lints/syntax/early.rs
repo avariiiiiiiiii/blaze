@@ -69,14 +69,15 @@ pub(crate) fn allows_unsafe(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) 
 }
 
 /// The trees of the walk by the macro call (or the item or attribute of an attribute macro or
-/// derive) they are the expansion of.
+/// derive) they are the expansion of: one FxHash probe per lookup, built once per crate with
+/// its size known.
 pub(crate) struct Expansions<'w> {
     by_call: FxHashMap<InFile<SyntaxNodePtr>, &'w Tree>,
 }
 
 impl<'w> Expansions<'w> {
     pub(crate) fn of(cx: &Cx<'_, '_>, walk: &'w Walk<'_>) -> Expansions<'w> {
-        let mut by_call = FxHashMap::default();
+        let mut by_call = FxHashMap::with_capacity_and_hasher(walk.trees.len(), Default::default());
         for tree in &walk.trees {
             let Some(call) = tree.call else { continue };
             let node = call.loc(cx.db).to_node(cx.db);

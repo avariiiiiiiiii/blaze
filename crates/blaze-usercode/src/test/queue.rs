@@ -32,11 +32,13 @@
 use std::{
     borrow::Cow,
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     path::PathBuf,
     time::Duration,
 };
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
@@ -231,7 +233,8 @@ struct Server {
     /// The job each test name of the hello is, for the scope of a record's line: one hash of
     /// the borrowed scope per line, nothing allocated for it.
     by_scope: HashMap<String, u32>,
-    running: BTreeSet<u64>,
+    /// Sorted by id where it is drained, so the tests a lost server takes end in that order.
+    running: FxHashSet<u64>,
     /// How far the record has been read, and a last line not yet whole.
     at: u64,
     partial: Vec<u8>,
@@ -288,16 +291,18 @@ pub struct Queue {
     config: Config,
     bins: Vec<Bin>,
     /// Not started: the longest expected first, then by binary and job.
+    // BTreeSet: iterated in order and removed from while it changes.
     pending: BTreeSet<(Reverse<Duration>, usize, usize)>,
     /// What of `pending` can start now (its server said hello, or it is a binary run
     /// whole), in the same order: the next test is its first, with no scan past those of
     /// servers still starting.
+    // BTreeSet: a priority queue (`pop_first`).
     ready: BTreeSet<(Reverse<Duration>, usize, usize)>,
     /// Servers with frames or timers in `outbox` and `timers`.
     dirty: Vec<usize>,
-    attempts: BTreeMap<u64, Attempt>,
+    attempts: FxHashMap<u64, Attempt>,
     tries: HashMap<(usize, usize), Tries>,
-    tags: BTreeMap<Tag, For>,
+    tags: FxHashMap<Tag, For>,
     next_tag: u64,
     next_id: u64,
     busy: usize,
@@ -316,9 +321,9 @@ impl Queue {
             pending: BTreeSet::new(),
             ready: BTreeSet::new(),
             dirty: Vec::new(),
-            attempts: BTreeMap::new(),
+            attempts: FxHashMap::default(),
             tries: HashMap::new(),
-            tags: BTreeMap::new(),
+            tags: FxHashMap::default(),
             next_tag: 0,
             next_id: 0,
             busy: 0,
@@ -514,7 +519,7 @@ impl Queue {
             frames: Frames::new(),
             job_index: Vec::new(),
             by_scope: HashMap::new(),
-            running: BTreeSet::new(),
+            running: FxHashSet::default(),
             at: 0,
             partial: Vec::new(),
             scoped: Vec::new(),
@@ -979,7 +984,8 @@ impl Queue {
         if let Some(listen) = self.server(b).listen {
             effects.push(Effect::Unlisten { tag: listen });
         }
-        let running: Vec<u64> = std::mem::take(&mut self.server(b).running).into_iter().collect();
+        let mut running: Vec<u64> = std::mem::take(&mut self.server(b).running).into_iter().collect();
+        running.sort_unstable();
         let why = match was {
             Phase::Quitting if running.is_empty() => return,
             _ => format!("{}: {why}", self.bins[b].plan.name),

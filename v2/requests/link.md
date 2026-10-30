@@ -396,3 +396,208 @@ COFF build it the same way.
 
 Why: the work becomes proportional to the imports, not the exports, and is done once per parsed
 input rather than per link.
+
+> forwarded to link.
+
+## From safety-audit
+
+From `safety-audit-linkgen` (children `-live` for blaze-live). Every file below was BUSY (owners
+`link`, `speed-link-edge-live`, `fastcompile-*`), so nothing was edited: these are comments,
+`# Safety` sections and block splits only, no behavior change, unless a line says MAY BE UNSOUND.
+Full reasoning: `/tmp/blaze-lanes/v2-safety-audit-linkgen.md` and `-linkgen-live.md`.
+`blaze-link` is clean (11 blocks, each one op with a real SAFETY comment).
+
+> forwarded to link: `blaze-splice`, `blaze-in-place`, `blaze-live` are its.
+
+### blaze-splice
+- `crates/blaze-splice/src/sha256.rs:83` block: 8 ops (`vld1q_u32` x3, `.add(4)` x2, `vld1q_u8` in the `load` closure, `vst1q_u32` x2). Split, in the same order (the value intrinsics `vrev32q_u8`, `vsha256*`, `vaddq_u32` are safe fns in the pinned stdarch and need no block):
+  - `// SAFETY: \`state\` is 8 \`u32\`s, so its first 4 are the 16 readable bytes \`vld1q_u32\` reads.` then `let mut abcd = unsafe { vld1q_u32(state.as_ptr()) };`
+  - `// SAFETY: \`state\` is 8 \`u32\`s, so 4 past its start is inside it.` then `let upper = unsafe { state.as_ptr().add(4) };`
+  - `// SAFETY: \`upper\` is the last 4 of \`state\`'s 8 \`u32\`s, the 16 bytes \`vld1q_u32\` reads.` then `let mut efgh = unsafe { vld1q_u32(upper) };`
+  - in `load`: `// SAFETY: \`at\` is 0, 16, 32 or 48 of a 64-byte block, so 16 bytes from it are in \`block\`; \`vld1q_u8\` reads them at any alignment.` then `let bytes = unsafe { vld1q_u8(block[at..].as_ptr()) }; vreinterpretq_u32_u8(vrev32q_u8(bytes))`
+  - `// SAFETY: \`group < 16\`, so \`K[group * 4..]\` has at least the 4 \`u32\`s \`vld1q_u32\` reads.` then `let round = unsafe { vld1q_u32(K[group * 4..].as_ptr()) }; let mixed = vaddq_u32(words[at], round);`
+  - `// SAFETY: \`state\` is 8 writable \`u32\`s; the first 4 are the 16 bytes \`vst1q_u32\` writes.` then `unsafe { vst1q_u32(state.as_mut_ptr(), abcd) };`
+  - `// SAFETY: \`state\` is 8 \`u32\`s, so 4 past its start is inside it.` then `let upper = unsafe { state.as_mut_ptr().add(4) };`, then `// SAFETY: \`upper\` is the last 4 of \`state\`'s 8 \`u32\`s, the 16 bytes \`vst1q_u32\` writes.` then `unsafe { vst1q_u32(upper, efgh) };`
+
+### blaze-in-place
+- `crates/blaze-in-place/src/lib.rs:59` block: no SAFETY. Proposed: `// SAFETY: \`lseek\` only moves the offset of \`fd\`, which \`source\` keeps open for this whole function; were it closed, the call would fail with EBADF, not touch memory.`
+- `crates/blaze-in-place/src/lib.rs:67` block: no SAFETY. Proposed: `// SAFETY: \`fd\` and \`out\` are \`source\`'s and \`target\`'s descriptors, open until this function returns; \`source\` and \`target\` are locals the kernel reads and advances, and \`len\` bounds no memory of ours.`
+
+### blaze-live
+
+`crates/blaze-live` doesn't take `[lints] workspace = true`; it was audited as if it did. The
+numbers in "MAY BE UNSOUND (n)" below refer to this list:
+
+1. Failed `apply` reuses live memory (`linux.rs` `apply` 155-250, `macos.rs` 193-265, `windows.rs`
+   154-210). `process.next` only moves, and is only published, after every step succeeds. If a step
+   fails after the patch's memory is mapped (`register_frames`, `first_values`, or a `self.write` in
+   the undo or redirect loops), some jumps may already point into that memory, and on Linux some
+   frames may already be registered. The daemon still sees the old `next`, so it lays out the next
+   patch at the same `base`. That patch then maps over the memory (MAP_FIXED, FIXED|OVERWRITE, or
+   MEM_COMMIT over committed pages), and any thread calling a redirected function runs the new
+   bytes at the old offsets until the new jumps are written.
+2. Jumps are written under running threads (`linux.rs:319`, `windows.rs:292`, `macos.rs:313` and
+   `swap_pages`, and the same for putting originals back). On x86-64, `copy_nonoverlapping` of a
+   5-byte `jmp rel32` is not one atomic store, and another core can fetch a half-written jump
+   (Intel's cross-modifying-code rule). On every platform, a thread stopped inside the first N bytes
+   of the old function resumes in the middle of the new jump. On AArch64 the far jump is 3
+   instructions (`blaze-splice` `far_jump`, macho `Code::stub`: `adrp; ldr|add; br x16`), so a thread
+   at entry+4 or +8 runs `br x16` with a garbage x16. The lib.rs doc says "a function that is
+   running when its patch lands finishes as it was", but that holds only for the thread calling
+   `poll`, and not at all under `apply_as_they_come`.
+3. Original bytes are read at an unchecked address (`linux.rs:233`, `macos.rs:247`, `windows.rs:193`).
+   `write.address` comes from the patch file and is never checked to lie in the executable's image,
+   although `Image` knows the range (`start..end`, `base..base+len`). The comments ("the executable's,
+   which is mapped") are not upheld. Also, the `&[u8]` over a static that other threads write is a
+   data race.
+4. macOS bounds math is unchecked (`macos.rs:195`, `:207`). `code.base + len.next_multiple_of(PAGE)`
+   and `code.base + self.slide` use `+`, where `linux.rs` and `windows.rs` use `checked_add`. In
+   release, a wrapped `end` passes `end > self.process.end`, and `mach_vm_allocate(FIXED | OVERWRITE)`
+   then maps over whatever is at the wrapped address.
+5. macOS registers an FDE that runs past its section (`macos.rs:594`). `register_frames` calls
+   `__register_frame` before checking that `at + 4 + length <= section.len()`; `linux.rs:607` does
+   check this. Apple's libunwind then parses past the patch's text.
+6. Linux uses the wrong `__register_frame` convention (`linux.rs:615`). It registers each FDE
+   separately, which is Apple's convention. On Linux, libgcc (and LLVM's libunwind on ELF) takes a
+   run of entries ending in a zero length; `slots/` knows this (`Dwarf::Sections`). Each call
+   registers from that FDE on to a zero terminator that the loop never requires inside the patch, so
+   the unwinder can read past the section, and overlapping runs are registered once per FDE.
+7. Unwind tables are never deregistered from memory that gets rewritten (`slots/linux.rs:266`,
+   `slots/macos.rs:221`, `slots/windows.rs:266`). The switch lets a patch write code over a
+   generation that is no longer kept (rolled back, dropped, or evicted past `KEPT`). The FDEs or
+   RUNTIME_FUNCTIONs registered for that generation stay registered and now point at other bytes.
+   There is no `__deregister_frame` or `RtlDeleteFunctionTable`. The comments say the memory "stays
+   mapped", but the unwinder needs it to stay unchanged.
+8. Code is written over a generation that may still be running (`slots/switch.rs:531-540`; the
+   comments at `slots/linux.rs:224-226`, `slots/macos.rs:248-250` and `slots/windows.rs:208-210`).
+   `apply` refuses only writes over the current lineage. A thread that entered a function of a
+   generation before it was rolled back or evicted, and has not returned (a loop, a blocking call),
+   runs bytes being overwritten. "No kept generation's code is there" does not mean no thread runs
+   it, and `poll`'s "call where nothing is half done" covers only the calling thread.
+9. Data writes race other threads (`slots/linux.rs:142-144`, `:237-240`; `slots/macos.rs:190-192`;
+   `slots/windows.rs:208-211`, `:343-345`; legacy `write`). `Writes::put` requires that nothing else
+   reads *or writes* the memory. The comments assert only "nothing else of the program's writes ...
+   while `poll` writes it". Nothing enforces even that, since other threads keep running during
+   `poll`, and nothing covers readers. A static that another thread uses during the write is a data
+   race.
+10. Data spans are never checked against the data region or the image (`slots/switch.rs:505-520`).
+    The `Memory` doc says "the switch has checked each is where the descriptor allows", and the
+    platform comments say "the image's data". In fact `apply` checks data spans only against the code
+    region and the cell, so a span can land anywhere mapped: the heap, a stack, another library, or
+    the loader's jump table, which `Switch::image` (`:649`) reads as `&[u64]` under "Nothing writes
+    it". `layout.data` is never used for this.
+11. Counters are read racily (`sample.rs:245`). `read_volatile` runs while other threads do
+    non-atomic adds to `blaze_live_counters`. Volatile is not atomic, so this is a data race in the
+    Rust memory model. (On AArch64 an aligned u64 read does not tear.)
+12. The Windows legacy runtime does not check the function table's range (`windows.rs:271-273`).
+    `register_functions` checks that `len` is whole entries and that `start` is 4-aligned, but not
+    that `start + len` lies in the `len` bytes just mapped. `RtlAddFunctionTable` then reads past the
+    patch. `linux.rs` and `macos.rs` bound the same range with `text.get(..)`.
+
+#### crates/blaze-live (crate)
+- `crates/blaze-live/Cargo.toml` crate: no `[lints] workspace = true`, so `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks` and `clippy::multiple_unsafe_ops_per_block` aren't denied here. Add `[lints]\nworkspace = true` once the findings below are in. The crate has unsafe in compiled code, so no `#![forbid(unsafe_code)]`.
+- `crates/blaze-live/src/lib.rs:157` `#[unsafe(no_mangle)]`: not checked by the lint; proposed anyway: `// SAFETY: the \`blaze_live_\` prefix is this crate's, so no other item of a program exports \`blaze_live_counters\`; a second one would fail the link or bind the daemon's code to the wrong counters.`
+
+#### crates/blaze-live/src/linux.rs
+- `crates/blaze-live/src/linux.rs:170` block: no SAFETY. Proposed: `// SAFETY: MAP_FIXED maps fresh read-write pages over \`len\` bytes at the page-aligned \`mapped\` (\`code.base\` whole pages, checked), all inside the room \`reserve\` set aside (\`process.next..process.end\`, checked above): nothing below \`next\` (earlier patches' code, which threads may run) or above \`end\` (statics of \`first_values\`) is replaced, and no thread jumps here before the writes below; the room is never unmapped, so the patch lives as long as the process; if the range left the room, MAP_FIXED would replace live code or data.` (See MAY BE UNSOUND 1 for a failed earlier apply.)
+- `crates/blaze-live/src/linux.rs:186` block: no SAFETY. Proposed: `// SAFETY: \`mapped..mapped + len\` was mapped read-write just above (checked to be at \`mapped\`), page-aligned so any \`u8\` alignment holds, and nothing else refers to it yet: no jump reaches it before the writes below; the slice is not written after the text is made read-and-run.`
+- `crates/blaze-live/src/linux.rs:193` block: no SAFETY. Put it on the line between `if text_len != 0` and `&& unsafe {` (the `if` stops the lint's walk up). Proposed: `// SAFETY: \`text_len\` bytes (whole pages, checked) at the page-aligned start of the mapping made above; taking write away affects only \`memory\`, which writes nothing after this, and no thread runs the pages yet.`
+- `crates/blaze-live/src/linux.rs:202` block: no SAFETY. Put it on the line between `if data_len != 0` and `&& unsafe {`. Proposed: `// SAFETY: \`data_len\` bytes at \`mapped + text_len\`, page-aligned since \`text_len\` is whole pages, of the mapping made above; they were read-write already.`
+- `crates/blaze-live/src/linux.rs:233` block: MAY BE UNSOUND: `address` is `write.address + slide` from the patch file, never checked to lie in the executable's image (`Image::start..end`, not kept in `Live`), and the slice over a static that other threads write races (MAY BE UNSOUND 3). Proposed after a bounds check: `// SAFETY: \`address..address + bytes.len()\` is in the executable's image (checked against \`image\` above), mapped readable as long as the process runs; only this thread writes code there.`
+- `crates/blaze-live/src/linux.rs:269` block: no SAFETY. Proposed: `// SAFETY: \`page\` is page-aligned, at or above this patch's \`end\` and below \`room_end\` (checked above), and not in \`lasting_pages\`, so MAP_FIXED replaces only untouched room that no patch's code or static uses; it is never unmapped, so later patches can refer to the static there for the life of the process.`
+- `crates/blaze-live/src/linux.rs:293` block: no SAFETY. Proposed: `// SAFETY: \`address..address + bytes.len()\` is in pages mapped read-write above or by an earlier patch (\`lasting_pages\`); no code refers to this static before this patch's jumps are written below (a patch has every static it refers to, and none before gave this one), so no other thread reads it; \`bytes\` is a local, so they don't overlap; bytes need no alignment.`
+- `crates/blaze-live/src/linux.rs:310` block: no SAFETY. Proposed: `// SAFETY: \`page..page + len\` covers \`address..address + bytes.len()\`, which a patch names in the executable (MAY BE UNSOUND 3: not checked here); adding write keeps read and run, so a thread running code on those pages keeps running; \`old\` gives the protection back below.`
+- `crates/blaze-live/src/linux.rs:319` block: no SAFETY, and MAY BE UNSOUND (2): a byte copy over a function's entry is not atomic for another core fetching it, and a thread stopped inside the overwritten bytes resumes mid-jump. Proposed (states what does hold): `// SAFETY: the pages were made writable above; \`bytes\` is a local buffer, so they don't overlap, and a byte copy needs no alignment.` plus the cross-modifying-code invariant once there is one (all other threads stopped, or a single aligned atomic store of the jump).
+- `crates/blaze-live/src/linux.rs:320` block: no SAFETY. Proposed: `// SAFETY: the same pages as above, given back the protection /proc/self/maps had at \`address\` (read-and-run when it had none); nothing holds a reference into them.`
+- `crates/blaze-live/src/linux.rs:468` block: no SAFETY. Proposed: `// SAFETY: MAP_FIXED_NOREPLACE fails rather than replace anything mapped, and PROT_NONE makes the pages inaccessible, so this takes only address space nothing uses; the room is never unmapped, so patches mapped in it later live as long as the process.`
+- `crates/blaze-live/src/linux.rs:493` block: no SAFETY. Proposed: `// SAFETY: signal 0 sends nothing and only asks whether \`pid\` exists; no memory is involved.`
+- `crates/blaze-live/src/linux.rs:615` block: no SAFETY, and MAY BE UNSOUND (6, 1): this registers each FDE on its own (Apple's convention), but glibc's libgcc `__register_frame` takes a run of entries ending in a zero length; nothing here checks that one ends inside `section`, and runs overlap. Fix: register each run's start once, after checking for its zero terminator, as `slots/switch.rs` `frames` does for `Dwarf::Sections`. Proposed comment once it does: `// SAFETY: \`section[at..]\` is a run of CIEs and FDEs ending in a zero length inside the patch (checked above), in memory mapped and unchanged for the rest of the process; the unwinder reads it from now on.`
+
+#### crates/blaze-live/src/macos.rs
+- `crates/blaze-live/src/macos.rs:103` block: 2 ops (`_dyld_get_image_header`, `_dyld_get_image_vmaddr_slide`). Split: `let header = unsafe { _dyld_get_image_header(0) };` (SAFETY: `// SAFETY: it takes an index and returns null past the last image; image 0 is the executable, which dyld loaded before anything ran.`) then `let slide = unsafe { _dyld_get_image_vmaddr_slide(0) } as u64;` (SAFETY: `// SAFETY: it takes an index and returns 0 past the last image; image 0's slide stays the same for the life of the process.`).
+- `crates/blaze-live/src/macos.rs:206` block: no SAFETY. Proposed: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release; it can't fail.`
+- `crates/blaze-live/src/macos.rs:209` block: 5 ops (`mach_vm_allocate`, `slice::from_raw_parts_mut`, `mach_vm_protect`, `sys_icache_invalidate`, `register_frames`), one comment for all. The comment also says nothing of lifetime, of what a failed earlier apply left (MAY BE UNSOUND 1), or of unchecked `+` (MAY BE UNSOUND 4). Split, in the same order: (a) `unsafe { check(mach_vm_allocate(task, &mut at, len.next_multiple_of(PAGE), FIXED | OVERWRITE)) }.map_err(|it| format!("mapping the patch: {it}"))?;` with `// SAFETY: OVERWRITE replaces whole pages at the page-aligned \`at\` (\`code.base\` whole pages, checked), inside the room \`reserve\` set aside, above every earlier patch (\`code.base >= process.next\`) and below the statics (\`end <= process.end\`): no code a thread may run and no static is replaced, and no jump reaches it before the writes below; the room is never deallocated, so the patch lives as long as the process.`; (b) `let memory = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len as usize) };` with `// SAFETY: \`at..at + len\` was just allocated read-write and zeroed, page-aligned so any \`u8\` alignment holds, and nothing else refers to it until jumps are written below.`; (c) inside `if !code.text.is_empty()`: `unsafe { check(mach_vm_protect(task, at, code.text.len() as u64, 0, READ | EXECUTE)) }.map_err(|it| format!("making the patch executable: {it}"))?;` with `// SAFETY: the text pages of the allocation above (whole pages, checked); no thread runs them yet and \`memory\` writes nothing there after this.`; (d) `unsafe { sys_icache_invalidate(at as *mut c_void, code.text.len()) };` with `// SAFETY: invalidates the instruction cache over the text just written and made runnable; it changes no memory.`; (e) `unsafe { register_frames(&memory[..code.text.len()], code.frames) }?;` with `// SAFETY: \`memory[..text.len()]\` is this patch's text, mapped for the life of the process and not written again (see \`register_frames\`).`
+- `crates/blaze-live/src/macos.rs:195` and `:207`: MAY BE UNSOUND (4): `code.base + len.next_multiple_of(PAGE)` and `code.base + self.slide` are unchecked; in release a wrapped `end` passes the room check, and the `FIXED | OVERWRITE` allocation then lands outside the room. Use `checked_add`, as `linux.rs:159` and `windows.rs:159` do.
+- `crates/blaze-live/src/macos.rs:247` block: MAY BE UNSOUND (3): the comment "what a patch writes over is the executable's, which is mapped" isn't upheld: `write.address` is never checked against `image.start..image.end` (passed only to the sampler), and the slice over a static that other threads write races. Proposed after a check: `// SAFETY: \`address..address + bytes.len()\` is in the executable's image (checked against \`image\` above), mapped readable as long as the process runs; only this thread writes code there.`
+- `crates/blaze-live/src/macos.rs:270` block: no SAFETY. Proposed: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release; it can't fail.`
+- `crates/blaze-live/src/macos.rs:286` block: comment lacks lifetime and where it's upheld. Proposed: `// SAFETY: \`page\` is page-aligned, at or above this patch's \`end\` and below \`room_end\` (checked above), and not in \`lasting_pages\`, so OVERWRITE replaces only untouched room that no patch's code or static uses; it is never deallocated, so later patches may refer to the static there for the life of the process.`
+- `crates/blaze-live/src/macos.rs:297` block: comment lacks why no other thread reads it. Proposed: `// SAFETY: \`address..address + len\` is in pages allocated read-write above or by an earlier patch; no code refers to this static before this patch's jumps are written below (a patch has every static it refers to, and none before gave this one), so no other thread reads it; \`bytes\` is a local, and a byte copy needs no alignment.`
+- `crates/blaze-live/src/macos.rs:313` block: 2 ops (`ptr::copy_nonoverlapping`, `swap_pages`). Split, same control flow: `if protection & WRITE != 0 {` / `unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };` (SAFETY: `// SAFETY: \`address\` is mapped writable (\`protection_at\`); \`bytes\` is a local buffer, and a byte copy needs no alignment; a static another thread uses meanwhile races (MAY BE UNSOUND 9).`) / `return Ok(());` / `}` / `unsafe { swap_pages(address, bytes, protection) }` (SAFETY: `// SAFETY: \`address\` is mapped with \`protection\`, which isn't writable, so nothing writes those pages meanwhile; see \`swap_pages\`.`). Also, `protection_at` reads only the region at `address`, but a write running into the next region gets that region's pages copied and remapped with the first region's protection; check the whole range.
+- `crates/blaze-live/src/macos.rs:345` block: 2 ops (`header.add`, `read_unaligned`). Split: `let u32_at = |at: usize| { let p = unsafe { header.add(at) } as *const u32; unsafe { p.read_unaligned() } };` with `// SAFETY: \`at\` is within the header and the load commands after it, which dyld mapped and checked against \`sizeofcmds\` before loading the image.` then `// SAFETY: \`p\` is 4 bytes in those mapped load commands; the read is unaligned, of a \`u32\` any bits make.`
+- `crates/blaze-live/src/macos.rs:346` block: no SAFETY (the comment above 345 doesn't reach the next line), and 2 ops (`header.add`, `read_unaligned`). Split as for 345, with `*const u64` and `// SAFETY: \`p\` is 8 bytes in those mapped load commands; the read is unaligned, of a \`u64\` any bits make.`
+- `crates/blaze-live/src/macos.rs:366` block: 2 ops (`header.add`, deref). Split: `let p = unsafe { header.add(at + 8 + nth) };` (SAFETY: `// SAFETY: an LC_UUID command is 24 bytes (dyld checked \`cmdsize\`), the last 16 the UUID, so \`at + 8 + nth\` for \`nth < 16\` is inside it.`) then `*byte = unsafe { *p };` (SAFETY: `// SAFETY: \`p\` is a byte of the mapped load commands.`).
+- `crates/blaze-live/src/macos.rs:384` block: no SAFETY. Proposed: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release; it can't fail.`
+- `crates/blaze-live/src/macos.rs:390` block: no SAFETY. Proposed: `// SAFETY: \`address..address + ROOM\` is the allocation just made; taking all access away affects nothing else and keeps the room for patches, which map over it later.`
+- `crates/blaze-live/src/macos.rs:515` block: no SAFETY. Proposed: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release; it can't fail.`
+- `crates/blaze-live/src/macos.rs:540` unsafe fn `swap_pages`: no `# Safety`. Proposed: `/// # Safety\n///\n/// \`address..address + bytes.len()\` lies in pages of this task mapped readable with \`protection\`, which isn't writable, and nothing writes or remaps them while this runs (the copy, then the remap, would lose such a write). A thread may run code on the pages while they are swapped: it sees the old pages or the new, so \`bytes\` must be valid code at every instruction boundary a thread can be stopped at (MAY BE UNSOUND 2).`
+- `crates/blaze-live/src/macos.rs:543` block: no SAFETY. Proposed: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release; it can't fail.`
+- `crates/blaze-live/src/macos.rs:545` block: no SAFETY, and 7 ops (`mach_vm_allocate`, 2 × `ptr::copy_nonoverlapping`, and inside the closure `mach_vm_protect` and `mach_vm_remap`, then `mach_vm_deallocate` and `sys_icache_invalidate`). Split, same order: `check(unsafe { mach_vm_allocate(task, &mut scratch, len, ANYWHERE) })?;` (`// SAFETY: ANYWHERE takes no address in use; the new address goes to \`scratch\`.`); `unsafe { std::ptr::copy_nonoverlapping(page as *const u8, scratch as *mut u8, len as usize) };` (`// SAFETY: \`page..page + len\` is mapped readable and not written meanwhile (the caller's); \`scratch\` is \`len\` new bytes, so they don't overlap.`); `unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (scratch + (address - page)) as *mut u8, bytes.len()) };` (`// SAFETY: \`address - page + bytes.len() <= len\`, so the write is inside \`scratch\`; \`bytes\` is the caller's buffer, not \`scratch\`.`); in the closure `check(unsafe { mach_vm_protect(task, scratch, len, 0, protection) })?;` (`// SAFETY: \`scratch\` is the allocation above, \`len\` bytes, which only this function refers to.`) and `check(unsafe { mach_vm_remap(task, &mut target, len, 0, FIXED | OVERWRITE, task, scratch, 0, &mut current, &mut max, INHERIT_NONE) })` (`// SAFETY: maps the copy over \`page..page + len\` (whole pages) in one call, so a thread running or reading them sees the old pages or the new, never a mix within a page, with the protection they had.`); then `unsafe { mach_vm_deallocate(task, scratch, len) };` (`// SAFETY: \`scratch\` is the allocation above, which nothing points into now; the remap holds its own reference to the pages.`); `swapped.map_err(...)?;`; inside `if protection & EXECUTE != 0`, `unsafe { sys_icache_invalidate(address as *mut c_void, bytes.len()) };` (`// SAFETY: invalidates the instruction cache over the bytes just written; it changes no memory.`).
+- `crates/blaze-live/src/macos.rs:581` unsafe fn `register_frames`: no `# Safety`. Proposed: `/// # Safety\n///\n/// \`text\` is the patch's code, mapped and unchanged for the rest of the process (the unwinder keeps pointers into it), and \`frames\` names well-formed CIEs and FDEs inside it, each FDE's CIE pointer inside \`text\`.`
+- `crates/blaze-live/src/macos.rs:594` block: MAY BE UNSOUND (5, 1): `__register_frame` is called before the loop checks that `at + 4 + length <= section.len()` (as `linux.rs:607` does), so an FDE running past the text is registered and parsed past it; and "which stays mapped" is not enough: after a failed apply (MAY BE UNSOUND 1) the next patch maps over it. Proposed once the bound is checked first: `// SAFETY: \`section[at..at + 4 + length]\` is one FDE inside the patch's text (checked above), which is mapped and unchanged for the rest of the process (the caller's); Apple's libunwind takes one FDE and keeps a pointer to it.`
+
+#### crates/blaze-live/src/sample.rs
+- `crates/blaze-live/src/sample.rs:193` block: 2 ops (`mach_absolute_time`, `mach_wait_until`). Split, keeping the comment about falling behind: `let now = unsafe { mach_absolute_time() };` (`// SAFETY: a clock read; it takes nothing and changes nothing.`), the `if next < now` block, then `unsafe { mach_wait_until(next) };` (`// SAFETY: waits until \`next\`, returning at once for a time that has passed; it touches no memory.`).
+- `crates/blaze-live/src/sample.rs:204` block: 2 ops (`mach_task_self`, `mach_port_deallocate`). Split: `let task = unsafe { mach_task_self() };` (`// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release.`) then `unsafe { mach_port_deallocate(task, me) };` (`// SAFETY: \`me\` is the right \`mach_thread_self\` gave at the start of \`run\`, given back once, here.`).
+- `crates/blaze-live/src/sample.rs:245` block: 2 ops (`start.add`, `read_volatile`), and MAY BE UNSOUND (11): other threads add to the counters non-atomically while this reads with `read_volatile`, which is not atomic: a data race in the Rust memory model. Split: `.map(|at| { let counter = unsafe { start.add(at) }; (at as u32, unsafe { counter.read_volatile() }) })` with `// SAFETY: \`at < used <= COUNTERS\`, the length of the static array \`start\` points at, so the offset stays inside it.` and `// SAFETY: \`counter\` is an aligned \`u64\` of that static, valid for the life of the program.` The race needs a decision: `AtomicU64::from_ptr(counter).load(Relaxed)`, with the daemon's code adding atomically.
+- `crates/blaze-live/src/sample.rs:278` block: 4 ops (`mach_task_self`, `task_threads`, `slice::from_raw_parts`, `vm_deallocate`). Split, same order, same early return: `let task = unsafe { mach_task_self() };` (`// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release.`); `if unsafe { task_threads(task, &mut list, &mut count) } != 0 { return; }` (`// SAFETY: \`list\` and \`count\` are what the call fills in: an array the kernel allocates in this task, and its length.`); `let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();` (`// SAFETY: the kernel gave \`count\` ports at \`list\`, page-aligned memory of this task; they are copied out before it is given back.`); `unsafe { vm_deallocate(task, list as usize, count as usize * size_of::<u32>()) };` (`// SAFETY: \`list\` is the kernel's array of \`count\` ports, copied out above and not used after; the rights to the ports are given back by \`give_back\`.`). Keep the existing comment's last clause on the last one.
+- `crates/blaze-live/src/sample.rs:301` block: the comment above it ("each port is one `task_threads` gave a right to") is about the `mach_port_deallocate` at 303, not about `mach_task_self`. Proposed for 301: `// SAFETY: \`mach_task_self\` takes nothing and returns this task's port name, which needs no release.`
+- `crates/blaze-live/src/sample.rs:303` block: no SAFETY. Proposed (moved from 301): `// SAFETY: each port is one \`task_threads\` gave a right to, given back once: \`drain\` takes it out of \`all\`.`
+
+#### crates/blaze-live/src/windows.rs
+- `crates/blaze-live/src/windows.rs:193` block: MAY BE UNSOUND (3): `write.address` is never checked to lie in `loaded..loaded + image.len`, so "the bytes are of the executable's image" isn't upheld; a static that other threads write races. Proposed after a check: `// SAFETY: \`address..address + bytes.len()\` is in the executable's image (checked against \`loaded..loaded + len\` above), loaded as long as the process runs; only this thread writes code there.`
+- `crates/blaze-live/src/windows.rs:217` block: comment lacks lifetime and where it's upheld. Proposed: `// SAFETY: commits \`len\` bytes at the page-aligned \`mapped\` (checked), in the room \`reserve\` reserved, within \`process.next..process.end\` (checked by \`apply\`), so no earlier patch's code a thread may run is in them; the room is never released, so the patch lives as long as the process.` (See MAY BE UNSOUND 1: committing over a failed patch's pages keeps their bytes, which jumps may already reach.)
+- `crates/blaze-live/src/windows.rs:227` block: comment lacks alignment and who else can see it. Proposed: `// SAFETY: the pages were just committed read-write at \`mapped\`, page-aligned so any \`u8\` alignment holds; no thread reaches them before the jumps \`apply\` writes after \`map\` returns, and the slice doesn't outlive \`map\`.`
+- `crates/blaze-live/src/windows.rs:236` block: comment lacks who else can see it. Proposed: `// SAFETY: \`text_len\` bytes (whole pages, checked) at the page-aligned start of the pages committed above; \`memory\` writes nothing there after this, and no thread runs them yet.`
+- `crates/blaze-live/src/windows.rs:251` block: 2 ops (`GetCurrentProcess`, `FlushInstructionCache`). Split: `let process = unsafe { GetCurrentProcess() };` (`// SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no closing.`) then `unsafe { FlushInstructionCache(process, mapped as *const c_void, text_len as usize) };` (`// SAFETY: flushes the instruction cache over the code just written; it changes no memory.`).
+- `crates/blaze-live/src/windows.rs:273` block: MAY BE UNSOUND (12, 7): `start + len` is never checked to lie in the `len` bytes just mapped, so `RtlAddFunctionTable` can read past the patch; and the table is never deleted when a failed apply's pages are reused (MAY BE UNSOUND 1). Proposed once bounded: `// SAFETY: \`len / FUNCTION\` RUNTIME_FUNCTIONs at the 4-aligned \`mapped + start\`, inside the patch's pages (checked above), which are never released or rewritten; their addresses are relative to \`loaded\`.`
+- `crates/blaze-live/src/windows.rs:282` block: comment unchecked (MAY BE UNSOUND 3). Proposed: `// SAFETY: \`address..address + bytes.len()\` is in the executable's image (once checked, MAY BE UNSOUND 3); PAGE_EXECUTE_READWRITE keeps read and run, so a thread running code on those pages keeps running; \`old\` is given back below.`
+- `crates/blaze-live/src/windows.rs:292` block: MAY BE UNSOUND (2): a byte copy of a 5-byte `jmp` over a function's entry is not atomic for another core fetching it, and a thread stopped inside it resumes mid-jump. What holds: `// SAFETY: the bytes were made writable above; \`bytes\` is a local buffer, so they don't overlap, and a byte copy needs no alignment.`, plus the cross-modifying-code invariant once there is one.
+- `crates/blaze-live/src/windows.rs:295` block: "as above" names nothing. Proposed: `// SAFETY: the same bytes as above, given back the protection \`old\` that VirtualProtect said they had; nothing holds a reference into them.`
+- `crates/blaze-live/src/windows.rs:302` block: 2 ops (`GetCurrentProcess`, `FlushInstructionCache`). Split as for 251: `let process = unsafe { GetCurrentProcess() };` (`// SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no closing.`) then `unsafe { FlushInstructionCache(process, address as *const c_void, bytes.len()) };` (`// SAFETY: flushes the instruction cache over the bytes just written; it changes no memory.`).
+
+#### crates/blaze-live/src/slots/ (owner is editing these now; lines as of 18:40 PT)
+- `crates/blaze-live/src/slots/unix.rs:74` block (`(!path.is_null()).then(|| unsafe { CStr::from_ptr(path) })`): the SAFETY comment is two lines up, above `let path =`. The lint should walk up through the closure and method calls to the `let`, but to be sure, put the comment on the line between `let path =` and `(!path.is_null())`. Text unchanged.
+- `crates/blaze-live/src/slots/switch.rs:531` (`apply`'s lineage check) and the comments at `slots/linux.rs:224-226`, `slots/macos.rs:248-250` and `slots/windows.rs:208-210`: MAY BE UNSOUND (8): only the current lineage's code is protected from being overwritten. A thread still inside code of a generation rolled back, dropped or evicted past `KEPT` runs bytes being rewritten. "No kept generation's code is there, so no thread runs them" does not follow. It needs a rule (never reuse code of a generation once published, or wait until no thread can be in it) and the comments should name it.
+- `crates/blaze-live/src/slots/linux.rs:266`, `slots/macos.rs:221`, `slots/windows.rs:266`: MAY BE UNSOUND (7): FDEs and RUNTIME_FUNCTIONs are never deregistered, yet the switch lets a later patch write over the code region they are in (a generation no longer kept). The unwinder then parses whatever bytes are there. "Which stays mapped" must become "which stays unchanged", with `__deregister_frame` or `RtlDeleteFunctionTable` before reuse, or no reuse.
+- `crates/blaze-live/src/slots/linux.rs:142-144`, `:237-240`; `slots/macos.rs:190-192`; `slots/windows.rs:208-211`, `:343-345`: MAY BE UNSOUND (9): `Writes::put`'s `# Safety` asks that nothing else reads or writes the memory. These comments claim only that nothing else writes the image's data while `poll` writes it, which nothing enforces (other threads keep running during `poll`), and they say nothing of readers. A static another thread uses during the write is a data race. Name the rule the program must keep (for example, other threads touch no static a patch rewrites while it is applied), or stop them.
+- `crates/blaze-live/src/slots/switch.rs:505-520` (data spans) with the `Memory` trait doc at `:244-245` and `Switch::image` at `:646-649`: MAY BE UNSOUND (10): data spans are checked only against the code region and the cell, not against `layout.data` or the image, so "the switch has checked each is where the descriptor allows", the platforms' "the image's data", and `image()`'s "Nothing writes it" (the loader's table) aren't upheld. Check data spans against `layout.data` (and the loader's table), or reword the comments to say the linker is trusted for it.
+- `crates/blaze-live/src/slots/tests.rs:69` block: "as for code" leans on "the switch checked it is in the region the descriptor names", which isn't true for data (see above). Proposed: `// SAFETY: every data write the tests make is to a buffer of their \`Program\`, which outlives the switch; the switch checks only that it misses the code region and the cell.`
+
+## Re-check after speed-link-edge-live's note (18:25 PT)
+
+`speed-link-edge-live` says `slots/` now follows `docs/v2/design/unsafe.md`: the message is read,
+not mapped, and every block has one op and a SAFETY comment (details in
+`docs/v2/plan/lanes/link/speed-link-edge-live.md`, section "Unsafe"). A rescan agrees: in `slots/`,
+the three lints leave only `slots/unix.rs:74`, where the comment's placement is worth a check (two
+lines above the block). The scan's other `slots/` hits are its false positives on `extern` blocks.
+The `slots/` soundness findings still stand on the current code:
+- MAY BE UNSOUND 7: nothing deregisters frames or function tables.
+- MAY BE UNSOUND 8: `switch.rs:530` still protects only the lineage.
+- MAY BE UNSOUND 9: the comments at `slots/linux.rs:142` and `:238`, `slots/macos.rs:190` and
+  `slots/windows.rs:210` still claim only that nothing else writes.
+- MAY BE UNSOUND 10: data spans are still not checked against `layout.data`.
+
+Their note also confirms that the older modules (`linux.rs`, `macos.rs`, `windows.rs`, `sample.rs`,
+`lib.rs`) were kept as they were, so every finding on those stands. Every file is still BUSY under
+`owners.py` (`link` BLOCKED, `fastcompile-*` with no report), so I still edited nothing.
+
+> forwarded to link.
+
+## 11. From speed-link-edge-macho (found by speed-link-edge-macho-input2): `Class::Named` allocates per section
+
+Status: open, does not block. For lead `link` (`crates/blaze-link/src/model.rs`).
+
+What is slow: `Class::Named { name: String, .. }`. The Mach-O reader makes one per Mach-O section
+that is `__LD,__compact_unwind` (every C object has one: `macho.rs` `compact_unwind()`),
+`__DATA,__thread_init` or a `#[link_section]` one (`macho.rs` `classify`, `format!` at ~271), and
+clones it into every other atom of a section split into atoms. ELF and COFF named sections pay
+the same. `Class` is also compared and hashed as a key by the core (`Writer::order`, region
+lookup), each time comparing the `String`.
+
+The change: `Class::Named`'s name interned once per link: a `u32` into a link-wide table of
+section names (or `Arc<str>` as a first step, so the clone per atom is a count bump), with
+`Writer::section`/`classify` returning the interned id. Fixed names (`__LD,__compact_unwind`,
+`__DATA,__thread_init`) become constants of that table.
+
+Why: no allocation per named section or per atom of one, and class comparisons on the core's
+sorting and lookups become one `u32` compare.

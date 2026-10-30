@@ -3,6 +3,8 @@
 //! output's uplifted copy where cargo makes one (`target/debug/foo` for `deps/foo-0123`), the
 //! executable, the profile it was built with.
 
+#![forbid(unsafe_code)]
+
 use blaze_api::{Artifact, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{

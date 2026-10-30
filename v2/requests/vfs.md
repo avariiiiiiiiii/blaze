@@ -247,6 +247,78 @@ name first, then bytewise), but these are not, so each one is reordered on every
 
 > applied: 1, as lane vfs is DONE: `Op::Write { mode, path, bytes }`, `Edit { at, len, path, bytes }`, `Rename { to, from }`, `Change { kind, path }` in `crates/blaze-vfs/src/lib.rs`. `Change`'s `Ord` was derived from field order, so it is now written out as path, then kind, as before. The `plain` exemption in `blaze-api/src/frames/identity.rs` is left to its owner (speed-link-edge-wire): it covers maps generally. 2 needs a `SCHEMA` bump: not now, as asked.
 
+
+## From safety-fuzz-vfs: four journal recovery bugs, found by reading (2026-10-29)
+
+Fuzz targets `fuzz/targets/vfs_journal_{bytes,records,model}.rs` (safety lane) feed
+`Vfs::recover`. Each input below is in `fuzz/corpus/<target>/`, so that target's plain `#[test]`
+fails until the bug is fixed. Nothing was run; I traced each input through `src/journal.rs` by
+hand. The model target's input format is described in `Run::step`, `op` and `Run::crash`.
+
+1. **A torn record whose payload holds journal records makes recovery load them (high).**
+   `recover` resyncs after a bad record by scanning for the next `MAGIC`, including inside the
+   payload of the record it just refused. A file whose bytes are a journal (a test fixture, a
+   copy of `.blaze/`, the fuzz corpus itself) holds whole records with good checksums. When the
+   append holding that file is torn inside its FILE record (the ordinary power-cut case), the
+   scan lands in the payload and loads the embedded HEAD records. With sequence numbers above
+   the real ones, a head moves to a root it was never committed to. This breaks "recovers a
+   prefix of the committed transactions and nothing else" for a plain torn tail.
+   Input: `fuzz/corpus/vfs_journal_model/torn-inside-a-file-that-is-a-journal.hex`. It commits
+   `a` to {a: xyz} and then {a: q}, settled. It then commits to `b` a file holding another
+   VFS's journal, in which `a` moves to {a: xyz} eight times (sequences 1 to 8). The append is
+   torn after 555 of its 675 bytes. That is inside the 559-byte FILE record, after the whole
+   embedded journal. Recovery gives `a` at {a: xyz} with sequence 8; the durable state is
+   {a: q}.
+   Fix: only resync where a record can start. A record whose header is whole but which runs
+   past the end of the file is a torn tail: drop everything from there. Otherwise chain the
+   checksums (each record's checksum also covers the previous one's), so that a record copied
+   into a payload never verifies where it sits. Stopping at the first bad record would also
+   make mid-file damage recover a prefix, which skipping past it does not (see 2).
+2. **A head that recovery dropped comes back once its root is made again (medium).** When
+   damage loses a node, recovery drops each head whose root needed it and falls back to that
+   head's earlier move. Before appending, though, it only cuts after the last good record, so
+   the head record naming the lost root stays in the file. If a later commit makes the same
+   root again (same files), its nodes are written again. The next recovery then resolves the
+   old head record (heads are resolved after every record is read) and moves the head forward
+   to a state the VFS had dropped.
+   Input: `fuzz/corpus/vfs_journal_model/lost-node-made-again-after-recovery.hex`. `a` moves to
+   {a: xyz}, then to {a: xyz, b: w}. One bit of the record of `w` (byte 145) is flipped.
+   Recovery gives `a` at {a: xyz}, as it should. Then `b` is committed as {a: xyz, b: w} and
+   settled, and the next recovery gives `a` at {a: xyz, b: w}.
+   Fix: when recovery skipped anything or dropped a head, ask for a rewrite (`compact = true`)
+   rather than a cut, so the file holds exactly the recovered heads. Or append a head record
+   at a new sequence number for each head that fell back.
+3. **A sequence number of `u64::MAX` in the file overflows the next commit (low: it needs a
+   forged record).** `load` takes any sequence from HEAD, REMOVE and SEQUENCE records into
+   `sequence`, and `record_head` and `record_removal` then do `self.sequence += 1`. That panics
+   with overflow checks on. Without them it wraps to 0, so the new move sorts below the old one
+   and is lost at the next recovery.
+   Inputs (records target, framed with good checksums by the target):
+   `fuzz/corpus/vfs_journal_records/sequence-at-the-largest.hex` (`04 ffffffffffffffff`, a
+   SEQUENCE record) and `head-at-the-largest-sequence.hex` (`02 ffffffffffffffff 00 01 61`,
+   HEAD `a` at the empty root).
+   Fix: refuse such a record in `load`, or make the increment a checked add that refuses the
+   commit.
+4. **A DIR record that names one entry twice, or a name no path can reach, is accepted (low:
+   forged record).** `load`'s DIR arm builds `tree.dir(entries)` whatever the names are, but
+   `Tree::dir` requires distinct names. With a duplicate, the node's ID depends on
+   `sort_unstable`'s order of equal names, and `rebuild` carries both entries into every root
+   made from it. Names that are empty, `.`, `..` or contain `/` load too, though `parts` refuses
+   every path to them. Fix: refuse the record when, after sorting, two names are equal or any
+   name is not one `parts` accepts. Seed in `vfs_journal_records.rs` (`seeds`, "a directory
+   naming one file twice").
+
+Status (vfs, 2026-10-29): all four fixed in `crates/blaze-vfs/src/journal.rs`, not yet run.
+1 and 2: recovery now loads a prefix and stops at the first bad record, with no resync, and
+the existing cut removes everything after it. A head dropped for a missing root (forged files
+only) asks for a rewrite. 3: `load` refuses any sequence at or above 2^63, and `next` asserts
+the bound, so it cannot overflow. 4: a DIR record's names must each be one `parts` component,
+in strictly increasing byte order (as `write_node` writes them). Regression tests are in
+`src/tests.rs`, one per bug plus a dropped head. `framed` and `KINDS` are new
+`#[cfg(test)]` helpers in `journal.rs`. The four corpus inputs should now pass their targets.
+
+> applied: all four are fixed in `crates/blaze-vfs/src/journal.rs` as of 18:29 (recovery stops at the first refused record and cuts there; a dropped head asks for a rewrite; sequence numbers at or above `SEQUENCES` = 2^63 are refused and `next` asserts below it; a DIR record's names must be single `parts` components in strictly increasing order), each with a test in `src/tests.rs` (`a_torn_file_that_is_a_journal_loads_none_of_its_records`, `a_head_lost_to_damage_does_not_come_back_when_its_root_is_made_again`, `a_sequence_number_no_journal_reaches_is_refused`, `a_directory_record_naming_an_entry_twice_or_no_path_is_refused`).
+
 ## From safety-audit (2026-10-29, safety-audit-edge)
 
 The workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks`
@@ -259,3 +331,5 @@ and `clippy::multiple_unsafe_ops_per_block`.
 
 Status (safety-audit-edge, `crates/vfs` and `crates/vfs-notify`): done by speed-runtime, as
 proposed (`#![forbid(unsafe_code)]` at each crate root; neither has any `unsafe`).
+
+> applied: done by speed-runtime, as its status line says; nothing left.

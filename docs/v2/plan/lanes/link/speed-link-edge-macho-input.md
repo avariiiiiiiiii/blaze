@@ -62,25 +62,40 @@ sections overlap in address is refused when its `__eh_frame` has a pc-relative p
 relocation ("sections X and Y overlap"), since which atom an address names would be ambiguous.
 Before, the first section in file order was taken. clang and `ld -r` never write such objects.
 
-### What the contract still forces (and the change that removes it)
+### On the zero-copy contract (second pass, `speed-link-edge-macho-input2`)
 
-Per atom: a `String` for `Section::name` (a clone of the Mach-O section's `SEG,SECT`), a
-`Vec<u8>` copy of its bytes (`Data::Bytes`), a `Vec<NativeFixup>` when it has fixups. Per
-symbol: a `String` (`Symbol::name`, from `core_name`). mold and wild allocate none of these.
+`model.rs` now has the reader contract this lane asked for (`v2/requests/link.md` items 5, 5a,
+7), and the reader is on it:
 
-- `v2/requests/link.md` item 5 (open, lead `link`): `Data::Input(Range<u64>)` takes the bytes
-  copy away (the ranges are valid against the slice `Writer::read` was given even when this
-  reader copies it to an 8-aligned buffer, as offsets are the same), and the `names` arena with
-  `Name { at, len }` takes the per-symbol `String` away. Once applied, the reader edits are: the
-  atom's `Data::Bytes(bytes[start..end].to_vec())` becomes `Data::Input(base + start..base + end)`
-  with `base` the section's file offset (`header.offset(LE)`); `core_name` writes into
-  `Object::names` and returns a `Name`.
-- Not yet requested by anyone, filed with my parent: `Section::name` as a `Name` into the same
-  arena (one `SEG,SECT` per Mach-O section, shared by its atoms), and `Section::fixups` as a
-  range of one per-object `Vec<NativeFixup>` (CSR), which removes the per-atom `Vec`.
+| per | before this pass | after |
+|---|---|---|
+| atom | a `String` clone of `SEG,SECT`, a `Vec<u8>` copy of its bytes, a `Vec<NativeFixup>` when it has fixups | nothing: `Section::name` is the Mach-O section's one `Name` (8 B, `Copy`), `Data::Input(offset + start..offset + end)` a range of the input (the section's `file_range` offset), `Section::fixups` a `Range<u32>` run of `Object::fixups` |
+| Mach-O section | a `format!` of `SEG,SECT` | one push into the arena, through one reused 33-byte buffer |
+| symbol | a `String` (`core_name`) | one `Name` pushed into the arena (`push_core_name`); a section symbol shares the one `""` name |
+| object | the columns of the first pass | the same, plus the arena (sized once from the name column: every core name is at most a byte longer than its Mach-O name, every `SEG,SECT` at most 33 bytes, so it never grows) and one `Vec<NativeFixup>` collected from the sorted `(atom, fixup)` column |
 
-After those three, an object read allocates a constant number of times (the columns above, the
-arena, the object's `sections`/`symbols`/`fixups`), as wild does.
+Bytes copied per object: none (was every atom's, and the whole file when its slice wasn't
+8-aligned, as an archive member's often isn't). `object` is built with feature `unaligned`, so
+every Mach-O struct has alignment 1 and is read in place at any address; the reader's own
+aligned copy is gone, as is `macho.rs`'s.
+
+The kind (`SectionKind`) moves into a section's last atom rather than being cloned into each:
+a `Class::Named` holds a `String`, so only the other atoms of a split named section clone it.
+
+What still allocates per item, outside these files (filed with the parent
+`speed-link-edge-macho`, in `v2/requests/speed-link-edge-macho.md`):
+
+- `macho.rs` `push_core_name`: a `format!("\x01{text}")` for every name without a leading
+  underscore, which is every assembler-local label clang keeps (`ltmp0`…, `l_…`). The fix is a
+  push of two parts into one `Name` (`Names::push_parts(&["\x01", text])` in `model.rs`, or a
+  scratch buffer the caller passes in).
+- `macho.rs` `classify`: a `format!` for each `Class::Named` section (`__LD,__compact_unwind` in
+  every C object, `__thread_init`, `#[link_section]` ones), and a clone per extra atom of a split
+  one. The fix is a model change: `Class::Named`'s name as an interned id or `&'static str`/`Arc<str>`.
+
+With those, an object read allocates a constant number of times (the columns, the arena, the
+object's `sections`, `symbols` and `fixups`), as wild does; it already does for any object whose
+symbols all start with `_` and that has no named sections.
 
 ## Archives (`archive.rs`)
 
@@ -90,11 +105,14 @@ arena, the object's `sections`/`symbols`/`fixups`), as wild does.
 | members | listed in place; one `String` a member name (the contract's `Member::name`) | unchanged |
 | index entry → member | `ArchiveFile::member(offset)` re-parsed the member's header (and its `#1/` name) for every index entry, then a binary search of the members' data offsets | binary search of the members' header offsets, taken in place from `ArchiveMember::header()` while listing: no parse per entry, `O(log m)` |
 | index `Vec` | grown from empty | `with_capacity` from the iterator's exact `size_hint` |
-| index names | one `String` each (`core_name`, the contract's `(String, u32)`) | unchanged |
+| index names | one `String` each (`core_name`, the contract's `(String, u32)`) | second pass: `(Name, u32)` pairs (12 B an entry) into the archive's one `Names` arena, sized by one in-place pass over the index |
+| member names | one `String` each | second pass: a `Name` into the same arena |
 
 The core turns the index into an `FxHashMap<&str, u32>` once per archive (`native.rs`), so
-lookup by name is one hash. What remains per entry is the `String`; with item 5's arena an
-archive's index becomes one `names` string and `(Name, u32)` pairs, as mold keeps them.
+lookup by name is one hash. After the second pass an archive read allocates a constant number
+of times (`heads`, `members`, `index`, the arena; the arena may grow once for the members'
+names), as mold keeps them; the `format!` of `push_core_name` for an index name without a
+leading underscore is the one per-entry allocation left (see above).
 
 ## unsafe
 
@@ -114,6 +132,15 @@ fields, `Cursor::take` for `__eh_frame`, a length check for archive members
   atoms, alignments, bytes, fixups and symbols. And `eh_frame_fdes_find_their_cie_and_section_by_search`:
   two CIEs, three FDEs pointing into atoms of two sections, each `pc_begin` made explicit to the
   right atom.
+- Second pass, `input.rs`: every test now reads names through `Object::name`, bytes through
+  `Data::bytes(input)` and fixups through `Object::section_fixups`; the model keeps the old
+  per-atom copy. The differential test also checks that the arena holds exactly each Mach-O
+  section's name and each symbol's, and that the fixup runs tile `Object::fixups` in atom order.
+  Added `every_input_range_holds_the_bytes_the_old_copy_held`: 256 seeded objects read from
+  slices shifted by 0, 1, 3 and 7 bytes; every atom is `Data::Input` (or `Data::Zero` where the
+  old one was), its range holds exactly the old copy's bytes, and the ranges are the same
+  whatever the slice's alignment.
 - `archive.rs`: added 64 seeded BSD archives (1 to 20 members, short and long names, up to 50
   index entries) whose index must map to the members written, and an index entry naming no
-  member header refused.
+  member header refused. Second pass: names compared through `Archive::name`, and the arena must
+  hold exactly the members' and the index's names.

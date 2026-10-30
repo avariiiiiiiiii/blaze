@@ -57,11 +57,11 @@ impl LatePass for MutableTransmutes {
 /// names the intrinsic `transmute` (rustc's `qpath_res` of it is a `DefKind::Fn`).
 fn transmute_types<'db>(b: &BodyCx<'_, 'db>, path: ExprId) -> Option<(Ty<'db>, Ty<'db>)> {
     let Expr::Path(_) = b.store().expr(path) else { return None };
+    let TyKind::FnDef(_, args) = util::ty(b, path).kind() else { return None };
     let ValueNs::FunctionId(def) = util::path_value(b, path)? else { return None };
     if !super::is_transmute(b.db(), def) {
         return None;
     }
-    let TyKind::FnDef(_, args) = util::ty(b, path).kind() else { return None };
     Some((args.type_at(0), args.type_at(1)))
 }
 

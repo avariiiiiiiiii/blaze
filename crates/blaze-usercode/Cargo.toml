@@ -22,6 +22,7 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-query.workspace = true
 postcard.workspace = true
+rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

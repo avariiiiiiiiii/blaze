@@ -1,7 +1,8 @@
 //! The lints of rustc's `BuiltinCombinedEarlyLintPass` written in `rustc_lint/src/builtin.rs`,
 //! `redundant_semicolon.rs` and `precedence.rs`, against rustc's UI tests.
 
-use super::{Test, ui, ui_core, ui_std};
+use super::{ui_core, ui_std};
+use crate::tests::ui;
 
 #[test]
 fn while_true_follows_the_level_of_warnings() {
@@ -64,7 +65,7 @@ LL | #[forbid(warnings)]
 error: aborting due to 2 previous errors; 1 warning emitted
 
 "#;
-    assert_eq!(ui("lint-change-warnings.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("lint-change-warnings.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -97,7 +98,7 @@ LL |     struct Bar {};
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("item-stmt-semi.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("item-stmt-semi.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -151,7 +152,7 @@ error: aborting due to 2 previous errors; 2 warnings emitted
 
 For more information about this error, try `rustc --explain E0583`.
 "#;
-    assert_eq!(ui("special_module_name.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("special_module_name.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -214,7 +215,7 @@ warning: 3 warnings emitted
 "#;
     let std_items = "pub mod string {\n    pub struct String;\n}\n";
     let prelude = "pub use crate::string::String;";
-    assert_eq!(ui_std("anon-params-deprecated.rs", "2015", Test::Passes, "sized", (std_items, prelude), source), stderr);
+    assert_eq!(ui_std("anon-params-deprecated.rs", "2015", "sized", (std_items, prelude), source), stderr);
 }
 
 #[test]
@@ -268,7 +269,7 @@ LL |         &1...2 => {}
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("inclusive-range-pattern-syntax.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("inclusive-range-pattern-syntax.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -316,7 +317,7 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0783`.
 "#;
-    assert_eq!(ui("exclusive-range-patterns-2021.rs", "2021", Test::Fails, source), stderr);
+    assert_eq!(ui("exclusive-range-patterns-2021.rs", "2021", source), stderr);
 }
 
 #[test]
@@ -374,7 +375,7 @@ LL |     let _y = -(-(-x));
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_core("lint-double-negations.rs", "2015", Test::Passes, "unary_ops", source), stderr);
+    assert_eq!(ui_core("lint-double-negations.rs", "2015", "unary_ops", source), stderr);
 }
 
 #[test]
@@ -411,5 +412,5 @@ LL | #![deny(unsafe_code)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("unsafe-extern-blocks.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("unsafe-extern-blocks.rs", "2015", source), stderr);
 }

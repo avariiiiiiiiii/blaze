@@ -89,6 +89,11 @@ fn cut_from(bytes: &[u8], mut at: usize, mut hash: u64, middle: usize, end: usiz
 /// [`cut_scalar`], 8 positions at a time. Over a block `p..p+8` with `g[k] = GEAR[b[p+k]]`,
 /// `h[p+k] = (h[p-1] << (k+1)) + s[k]` where `s[k] = sum over j <= k of g[j] << (k-j)`, which
 /// a log-step scan computes.
+///
+/// # Safety
+///
+/// The CPU has AVX-512F: `cut` and `paths` call it only after
+/// `is_x86_feature_detected!("avx512f")`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn cut_avx512(bytes: &[u8]) -> usize {
@@ -135,6 +140,11 @@ unsafe fn cut_avx512(bytes: &[u8]) -> usize {
 
 /// The AVX-512 path in NEON: the 8 lanes of a block as 4 pairs, and the table words loaded one at
 /// a time, as there is no gather.
+///
+/// # Safety
+///
+/// The CPU has NEON: `cut` and `paths` call it only after
+/// `is_aarch64_feature_detected!("neon")`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn cut_neon(bytes: &[u8]) -> usize {

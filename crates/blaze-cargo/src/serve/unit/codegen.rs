@@ -4,6 +4,8 @@
 //! `blaze_codegen::driver::Build`, and the link into an image kept between jobs, so the next
 //! link of the same file relinks only what changed.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::BTreeMap,
     path::PathBuf,

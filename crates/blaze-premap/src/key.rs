@@ -2,8 +2,9 @@
 //!
 //! - [`GraphKey`]: everything below the workspace members that is not the set of instances:
 //!   the dependency units (package, target, features, cfg, rustflags), the toolchain, the
-//!   codegen settings, the linker and the output it links for, the base address, the C
-//!   objects and libraries of the link line and the span tables positions are filled from.
+//!   codegen settings, the linker and the output it links for, the base address, the run
+//!   loader's thread-local bias, the C objects and libraries of the link line and the span
+//!   tables positions are filled from.
 //!   Images of one graph differ only in which instances they hold.
 //! - [`ImageKey`]: the graph key and the instances: every function by its instance key and
 //!   code hash, every static by its item, instance and definition, every name the image
@@ -67,6 +68,9 @@ pub struct GraphInputs<'a> {
     pub linker: ContentId,
     pub output: &'a Output,
     pub base: u64,
+    /// Where the run's loader keeps the program's thread-locals: the image's code reaches
+    /// them at this bias.
+    pub tls_bias: i64,
     pub natives: &'a [NativeInput],
     /// The span side tables positions are filled from: each anchor and its table's content ID.
     pub spans: &'a [(ContentId, ContentId)],
@@ -101,7 +105,7 @@ pub struct ImageInputs<'a> {
 
 impl GraphKey {
     pub fn of(inputs: &GraphInputs<'_>) -> GraphKey {
-        let GraphInputs { units, toolchain, settings, linker, output, base, natives, spans } = inputs;
+        let GraphInputs { units, toolchain, settings, linker, output, base, tls_bias, natives, spans } = inputs;
         let mut hasher = Hasher::new(GRAPH_DOMAIN);
 
         let mut order: Vec<usize> = (0..units.len()).collect();
@@ -131,7 +135,7 @@ impl GraphKey {
 
         hasher.id(linker);
         output_into(&mut hasher, output);
-        hasher.update(&base.to_le_bytes());
+        hasher.update(&base.to_le_bytes()).update(&tls_bias.to_le_bytes());
 
         let mut natives: Vec<&NativeInput> = natives.iter().collect();
         natives.sort_unstable_by_key(|it| it.order);

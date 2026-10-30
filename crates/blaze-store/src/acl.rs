@@ -71,8 +71,11 @@ impl Drop for Descriptor {
 /// The identifier of the user this process runs as, in the buffer that holds it.
 fn user() -> io::Result<Vec<u64>> {
     let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: the process handle is this process's, and `token` is where a handle goes.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    // SAFETY: `GetCurrentProcess` takes nothing and returns this process's pseudo-handle,
+    // which needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: `process` is this process's handle, and `token` is where a handle goes.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let token = Token(token);
@@ -99,11 +102,12 @@ fn user() -> io::Result<Vec<u64>> {
 /// `sid` and `user` have to point at valid identifiers.
 unsafe fn trusted(sid: PSID, user: PSID) -> bool {
     // SAFETY: both are valid identifiers, by what the caller says.
-    unsafe {
-        EqualSid(sid, user) != 0
-            || IsWellKnownSid(sid, WinLocalSystemSid) != 0
-            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
-    }
+    let is_user = unsafe { EqualSid(sid, user) != 0 };
+    is_user
+        // SAFETY: `sid` is a valid identifier, by what the caller says.
+        || unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 }
+        // SAFETY: as above.
+        || unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0 }
 }
 
 /// Why what `file` is could have been written by someone other than the user this process
@@ -164,10 +168,12 @@ pub(super) fn others_write(file: &File) -> Option<&'static str> {
         }
         // SAFETY: the identifier of an entry that lets in starts after the mask.
         let sid: PSID = unsafe { entry.byte_add(std::mem::offset_of!(Entry, sid_start)) };
-        // SAFETY: `sid` is in the list, `user` in its buffer; the owner's own rights are
-        // those of the owner, who was found to be trusted.
-        let known =
-            unsafe { trusted(sid, user) || IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };
+        // SAFETY: `sid` is in the list, which the descriptor keeps alive, and `user` in its
+        // buffer.
+        let known = unsafe { trusted(sid, user) }
+            // SAFETY: `sid` is a valid identifier, as above; the owner's own rights are those
+            // of the owner, who was found to be trusted.
+            || unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };
         if !known {
             return Some("can be written to by other users");
         }

@@ -373,10 +373,14 @@ fn a_handle_hashes_as_its_fingerprint() {
     let cons = HashCons::<Leaf>::new();
     let a = cons.intern(leaf(1, "a"));
     let other = HashCons::<Leaf>::new();
-    other.intern(leaf(9, "first, so the index differs"));
+    for n in 0..1_000 {
+        other.intern(leaf(n + 10, "others first"));
+    }
     let b = other.intern(leaf(1, "a"));
-    let hash = |handle: Interned<'_, Leaf>| BuildHasherDefault::<DefaultHasher>::default().hash_one(handle);
-    assert_eq!(hash(a), hash(b), "two interners, two indices, one hash");
+    fn hash(handle: Interned<'_, Leaf>) -> u64 {
+        BuildHasherDefault::<DefaultHasher>::default().hash_one(handle)
+    }
+    assert_eq!(hash(a), hash(b), "two interners, one hash");
     let mut expected = DefaultHasher::new();
     std::hash::Hasher::write_u128(&mut expected, a.fingerprint().0);
     assert_eq!(hash(a), std::hash::Hasher::finish(&expected));

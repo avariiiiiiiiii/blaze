@@ -7,6 +7,8 @@
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", feature(associated_type_defaults, rustc_attrs, negative_impls))]
 // tidy-alphabetical-end
+// docs/v2/plan/design/unsafe.md: the one `unsafe` is `fold::fold_arc`, allowed there.
+#![deny(unsafe_code)]
 
 extern crate self as rustc_type_ir;
 

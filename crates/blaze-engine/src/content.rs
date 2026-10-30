@@ -209,7 +209,7 @@ impl Contents {
 
         // In the order of their names: the order they are listed in is the build's.
         let mut dependencies: Vec<_> = data.dependencies.iter().collect();
-        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        dependencies.sort_unstable_by(|a, b| a.name.symbol().cmp_order(b.name.symbol()));
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());
@@ -270,7 +270,7 @@ impl Contents {
         field(cfgs.join("\n").as_bytes());
         field(format!("{:?}", process_reads(krate)).as_bytes());
         let mut dependencies: Vec<_> = krate.data(db).dependencies.iter().collect();
-        dependencies.sort_unstable_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+        dependencies.sort_unstable_by(|a, b| a.name.symbol().cmp_order(b.name.symbol()));
         for dependency in dependencies {
             let on = dependency.crate_id;
             field(dependency.name.as_str().as_bytes());

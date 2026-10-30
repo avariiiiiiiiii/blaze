@@ -436,9 +436,11 @@ impl Vfs {
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Recovered {
     pub records: usize,
-    /// Bytes that were not a whole record with a good checksum.
+    /// Bytes from the first record that was not whole, failed its checksum or was malformed, to
+    /// the end: none of them is loaded, and they are cut before the next append.
     pub skipped: usize,
-    /// Head records whose root did not survive, dropped.
+    /// Head records whose root was not loaded, dropped; the journal is then rewritten without
+    /// them.
     pub heads_dropped: usize,
 }
 

@@ -13,13 +13,16 @@ use std::hash::{Hash as _, Hasher};
 use blaze_codegen::backend::Shape;
 use cranelift_codegen::ir::{self, UserExternalName};
 
-use super::{Built, DataPlace, Function, Places, side::Variable};
+use super::{
+    Built, DataPlace, Function, Places,
+    side::{Scopes, SpanScope, Variable},
+};
 use crate::{
     ConstBlob, DataIdentity,
     fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// Where data is in a shape, as the names of its IR have it.
 mod namespace {
@@ -40,6 +43,7 @@ mod part {
     pub(super) const VARIABLES: u8 = 7;
     pub(super) const HINT: u8 = 8;
     pub(super) const VALUE: u8 = 9;
+    pub(super) const SCOPES: u8 = 10;
 }
 
 pub(crate) fn of(function: &Function) -> Result<Shape, String> {
@@ -107,6 +111,8 @@ pub(crate) fn of(function: &Function) -> Result<Shape, String> {
     }
     out.u8(part::VARIABLES);
     variables(&mut out, &function.variables);
+    out.u8(part::SCOPES);
+    scopes(&mut out, &function.scopes);
     out.u8(part::HINT);
     out.u8(match function.hint {
         Hint::None => 0,
@@ -150,7 +156,8 @@ fn estimate(function: &Function) -> usize {
         }
         Built::Assembled(code, _) => code.bytes.len() + 24 * code.relocs.len(),
     };
-    256 + code + data + 36 * function.spans.len() + 48 * function.variables.len()
+    let scopes = 5 * function.scopes.parents.len() + 5 * function.scopes.of_span.len();
+    256 + code + data + 36 * function.spans.len() + 53 * function.variables.len() + scopes
 }
 
 /// The shape being written. As a [`Hasher`] it keeps every byte it is given: the stencil's
@@ -309,12 +316,35 @@ fn variables(out: &mut Out, variables: &[Variable]) {
         out.u8(u8::from(variable.param));
         out.raw(&variable.ty.0);
         out.u32(variable.slot);
-        match variable.pointer {
-            Some(offset) => {
-                out.u8(1);
-                out.u32(offset);
+        option(out, variable.pointer);
+        option(out, variable.scope);
+    }
+}
+
+fn scopes(out: &mut Out, scopes: &Scopes) {
+    out.u32(scopes.parents.len() as u32);
+    for &parent in &scopes.parents {
+        option(out, parent);
+    }
+    out.u32(scopes.of_span.len() as u32);
+    for &of in &scopes.of_span {
+        match of {
+            SpanScope::Before => out.u8(0),
+            SpanScope::Outside => out.u8(1),
+            SpanScope::In(scope) => {
+                out.u8(2);
+                out.u32(scope);
             }
-            None => out.u8(0),
         }
+    }
+}
+
+fn option(out: &mut Out, it: Option<u32>) {
+    match it {
+        Some(it) => {
+            out.u8(1);
+            out.u32(it);
+        }
+        None => out.u8(0),
     }
 }

@@ -162,3 +162,24 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 - Checked, no other finding. blaze-api, blaze-ci (`src/lib.rs` and `src/bin/blaze-ci.rs`), blaze-protocol and blaze-ui have no `unsafe` and already say `#![forbid(unsafe_code)]` at each root. blaze-web's 24 blocks are all in `flecs.rs` (`#![allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]`). Each does one op, and each comment names the invariant and where it is upheld (a live world and entity checked by `alive`, layouts checked in `new`, reads borrowed `&self` while writes take `&mut self`).
 
 > applied (ci DONE): `crates/blaze-web/build.rs` says `#![forbid(unsafe_code)]`.
+
+## From safety-fuzz-api (2026-10-29)
+
+Targets `fuzz/targets/api_*.rs` now fuzz `blaze_protocol::cbor`, its frames, `blaze_api::frames`,
+`Envelope<Request>`/`<Response>` and `http`'s parsers. Reading for them found no panic, unchecked
+length or read past the input. One thing to decide, not a crash:
+
+- **One envelope has many canonical items.** `cbor::check` passes each of these and
+  `frames::decode::<Request>` reads all three as `Envelope { schema: 7, id: 3, body: Status }`:
+  - `a3 626964 03 64626f6479 66537461747573 66736368656d61 07` (what `frames::encode` writes)
+  - `a3 00 07 01 03 02 66537461747573`: fields named by their index (serde_derive's field
+    visitor takes `visit_u64`, and also `visit_bytes`, so `h'6964'` names `id` too)
+  - `a4 617a f6 626964 03 ...`: an unknown field `z`, passed over.
+
+  A missing `Option` field also reads as `None`, and a variant can be named by its index. So
+  "one value has one encoding" holds for what blaze writes, but not for what it accepts: two
+  clients can send different bytes for one request. If that matters (hashing recorded sessions
+  of client bytes), the fix is in `cbor/de.rs`: a `deserialize_identifier` that takes text
+  only, plus `#[serde(deny_unknown_fields)]` on the API's types. `api_envelope` checks
+  re-encoding only up to this (decode, encode, decode gives the same value), and its corpus
+  holds these inputs (`status-by-field-index.hex`, `status-with-an-unknown-field.hex`).

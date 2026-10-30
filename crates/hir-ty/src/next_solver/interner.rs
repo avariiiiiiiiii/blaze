@@ -75,6 +75,13 @@ macro_rules! interned_slice {
             fn _ensure_correct_types<'db: 'static>(v: $ty_db) -> $ty_static { v }
         };
 
+        // SAFETY: `$ty_static` is `$ty_db` with `'db` as `'static` (`_ensure_correct_types`
+        // above), which bounds no reference in it (`table::Erase`).
+        #[allow(unused_lifetimes)]
+        unsafe impl<'db> $crate::next_solver::interner::table::Erase for $ty_db {
+            type Static = $ty_static;
+        }
+
         /// Where every interned [`$name`] is.
         pub struct $storage;
 
@@ -122,9 +129,6 @@ macro_rules! interned_slice {
             /// needs to intern the global slice as well.
             #[inline]
             pub(crate) fn new_from_slice_no_empty_check(slice: &[$ty_db]) -> Self {
-                // SAFETY: the two types differ only in their lifetime, which an interned value
-                // does not depend on (it is never freed).
-                let slice = unsafe { ::std::mem::transmute::<&[$ty_db], &[$ty_static]>(slice) };
                 Self::at($storage::table().intern(slice))
             }
 
@@ -141,10 +145,7 @@ macro_rules! interned_slice {
 
             #[inline]
             pub fn as_slice(self) -> &'db [$ty_db] {
-                // SAFETY: `index` was given by the table's `intern`.
-                let slice = unsafe { $storage::table().get(self.index) };
-                // SAFETY: as in `new_from_slice_no_empty_check`.
-                unsafe { ::std::mem::transmute::<&[$ty_static], &'db [$ty_db]>(slice) }
+                $storage::table().get(self.index)
             }
 
             #[inline]
@@ -262,7 +263,8 @@ macro_rules! impl_stored_interned_slice {
             }
         }
 
-        // SAFETY: It is safe to store this type in queries (but not `$name`).
+        // SAFETY: `$stored_name` is a row number and borrows nothing, and the row it names is
+        // never freed, so it is valid in every revision (unlike `$name`, which carries `'db`).
         unsafe impl salsa::SalsaValue for $stored_name {}
 
         impl std::fmt::Debug for $stored_name {
@@ -399,7 +401,9 @@ pub struct DbInterner<'db> {
     regions: bool,
 }
 
-// FIXME: very wrong, see https://github.com/rust-lang/rust/pull/144808
+// FIXME(safety): unsound, see https://github.com/rust-lang/rust/pull/144808: `&dyn HirDatabase`
+// is neither `Send` nor `Sync`, so nothing upholds these. Removing them is requested in
+// `v2/requests/db-ty-types.md`.
 unsafe impl Send for DbInterner<'_> {}
 unsafe impl Sync for DbInterner<'_> {}
 
@@ -408,6 +412,9 @@ impl<'db> DbInterner<'db> {
     #[doc(hidden)]
     pub fn conjure() -> DbInterner<'db> {
         crate::with_attached_db(|db| DbInterner {
+            // FIXME(safety): unsound: nothing ties `'db` to the attachment, so the interner can
+            // outlive the database it points to. Replacing `conjure` is requested in
+            // `v2/requests/db-ty-types.md`.
             db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
             krate: None,
             lang_items: None,
@@ -816,6 +823,7 @@ pub type PatternKind<'db> = rustc_type_ir::PatternKind<DbInterner<'db>>;
 
 /// Every interned [`Pattern`].
 static PATTERNS: table::Rows<PatternKind<'static>> = table::Rows::new("patterns", table::LAST_ROW);
+table::erase!(PatternKind);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -835,9 +843,6 @@ impl<'db> Pattern<'db> {
 
     #[inline]
     pub(super) fn intern(kind: PatternKind<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe { std::mem::transmute::<PatternKind<'db>, PatternKind<'static>>(kind) };
         Self::at(PATTERNS.intern(kind, || {
             let (flags, binder) = pattern_flags(kind);
             table::RowInfo { tag: persist::tag(&kind), flags, binder }
@@ -881,14 +886,12 @@ impl<'db> std::fmt::Debug for Pattern<'db> {
 impl<'db> Flags for Pattern<'db> {
     #[inline]
     fn flags(&self) -> TypeFlags {
-        // SAFETY: a `Pattern` is a row of `PATTERNS`.
-        unsafe { PATTERNS.flags(self.index) }
+        PATTERNS.flags(self.index)
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: as in `flags`.
-        unsafe { PATTERNS.binder(self.index) }
+        PATTERNS.binder(self.index)
     }
 }
 
@@ -896,10 +899,7 @@ impl<'db> rustc_type_ir::inherent::IntoKind for Pattern<'db> {
     type Kind = rustc_type_ir::PatternKind<DbInterner<'db>>;
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: as in `flags`; the lifetime is as in `intern`.
-        unsafe {
-            std::mem::transmute::<PatternKind<'static>, PatternKind<'db>>(PATTERNS.kind(self.index))
-        }
+        PATTERNS.kind(self.index)
     }
 }
 
@@ -2625,7 +2625,11 @@ mod tls_db {
         fn with<R>(&self, op: impl FnOnce(&dyn HirDatabase) -> R) -> R {
             let db = self.database.get().expect("Tried to use attached db, but no db is attached");
 
-            // SAFETY: The db is attached, so it must be valid.
+            // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
+            // which borrows the database for that long and puts back the pointer before it on
+            // drop, unwinding too; `op` runs within, and the reference it gets, of a lifetime
+            // of its own, cannot leave it. (`DbInterner::conjure` breaks this: see the request
+            // in `v2/requests/db-ty-types.md`.)
             op(unsafe { db.as_ref() })
         }
     }
@@ -3638,7 +3642,7 @@ pub(crate) mod table {
 
                 // Lengths up to 2500 cross the first segments' ends.
                 let items: Vec<u32> = (0..(n * 13 % 2500) as u32).map(|i| i ^ n as u32).collect();
-                let row = LISTS.intern(&items);
+                let row = LISTS.intern(&items[..]);
                 assert_eq!(row, lists.intern(items.clone()));
                 assert_eq!(LISTS.get::<u32>(row), &lists.get(row)[..]);
 
@@ -3657,8 +3661,8 @@ pub(crate) mod table {
         #[should_panic(expected = "row 3 of the unwritten rows table was never written")]
         fn reading_a_row_not_written_panics() {
             static ROWS: Rows<u32> = Rows::new("unwritten rows", 10);
-            ROWS.intern(1, tagged(0));
-            ROWS.intern(2, tagged(0));
+            ROWS.intern(1u32, tagged(0));
+            ROWS.intern(2u32, tagged(0));
             ROWS.flags(NonZeroU32::new(3).unwrap());
         }
 
@@ -3666,7 +3670,7 @@ pub(crate) mod table {
         #[should_panic(expected = "row 2 of the unwritten lists table was never written")]
         fn reading_a_list_not_written_panics() {
             static LISTS: Lists<u32> = Lists::new("unwritten lists");
-            LISTS.intern(&[1u32]);
+            LISTS.intern(&[1u32][..]);
             LISTS.get::<u32>(NonZeroU32::new(2).unwrap());
         }
 
@@ -3681,7 +3685,7 @@ pub(crate) mod table {
         #[should_panic(expected = "the lists of lists without flags have no flags")]
         fn the_flags_of_a_table_without_them_panic() {
             static LISTS: Lists<u32> = Lists::new("lists without flags");
-            let row = LISTS.intern(&[1u32]);
+            let row = LISTS.intern(&[1u32][..]);
             LISTS.flags(row);
         }
 
@@ -3689,13 +3693,13 @@ pub(crate) mod table {
         #[should_panic(expected = "the flags of a list of lists with flags")]
         fn a_list_without_flags_in_a_table_with_them_panics() {
             static LISTS: Lists<u32> = Lists::with_flags("lists with flags");
-            LISTS.intern(&[1u32]);
+            LISTS.intern(&[1u32][..]);
         }
 
         #[test]
         fn a_list_keeps_its_flags() {
             static LISTS: Lists<u32> = Lists::with_flags("flagged lists");
-            let row = LISTS.intern_with(&[4u32, 5], || {
+            let row = LISTS.intern_with(&[4u32, 5][..], || {
                 (TypeFlags::HAS_TY_INFER, DebruijnIndex::from_u32(2))
             });
             assert_eq!(LISTS.flags(row), TypeFlags::HAS_TY_INFER);
@@ -3743,7 +3747,7 @@ pub(crate) mod table {
         #[test]
         fn a_row_keeps_its_flags() {
             static ROWS: Rows<u32> = Rows::new("test rows with flags", 10);
-            let row = ROWS.intern(5, || RowInfo {
+            let row = ROWS.intern(5u32, || RowInfo {
                 tag: 2,
                 flags: TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_ERROR,
                 binder: DebruijnIndex::from_u32(3),
@@ -3757,7 +3761,7 @@ pub(crate) mod table {
         #[should_panic(expected = "the tiny table holds 2 rows")]
         fn a_full_table_says_so() {
             static ROWS: Rows<u32> = Rows::new("tiny", 2);
-            for value in 0..3 {
+            for value in 0u32..3 {
                 ROWS.intern(value, tagged(0));
             }
         }
@@ -3766,16 +3770,16 @@ pub(crate) mod table {
         fn a_list_interned_twice_is_one_list() {
             static LISTS: Lists<u64> = Lists::new("test lists");
             let lists: [&[u64]; 4] = [&[], &[1], &[1, 2], &[2, 1]];
-            let rows: Vec<_> = lists.iter().map(|items| LISTS.intern(items)).collect();
+            let rows: Vec<_> = lists.iter().map(|&items| LISTS.intern(items)).collect();
             for (items, &row) in lists.iter().zip(&rows) {
-                assert_eq!(LISTS.intern(items), row);
+                assert_eq!(LISTS.intern(*items), row);
                 assert_eq!(LISTS.get::<u64>(row), *items);
                 assert!(LISTS.published(row));
             }
             assert_eq!(rows.iter().collect::<HashSet<_>>().len(), lists.len());
             // A list longer than a first segment's free room starts in a later segment.
             let long: Vec<u64> = (0..5000).collect();
-            let row = LISTS.intern(&long);
+            let row = LISTS.intern(&long[..]);
             assert_eq!(LISTS.get::<u64>(row), &long[..]);
         }
 

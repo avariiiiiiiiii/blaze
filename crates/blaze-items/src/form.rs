@@ -2650,6 +2650,17 @@ impl<'db> Cx<'db> {
                         f.u8(4);
                         self.operand(f, c, it);
                     }
+                    AssertKind::MisalignedPointerDereference { required, found } => {
+                        f.u8(5);
+                        self.operand(f, c, required);
+                        self.operand(f, c, found);
+                    }
+                    AssertKind::NullPointerDereference => f.u8(6),
+                    AssertKind::NullReferenceConstructed => f.u8(7),
+                    AssertKind::InvalidEnumConstruction(it) => {
+                        f.u8(8);
+                        self.operand(f, c, it);
+                    }
                 }
                 self.block(f, c, Some(*target));
                 self.block(f, c, *cleanup);

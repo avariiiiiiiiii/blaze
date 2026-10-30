@@ -31,7 +31,7 @@ use syntax::{
 use super::{
     def_span,
     visibility::{self, Def},
-    walk::{Container, Item},
+    walk::{self, Container, Item},
 };
 use crate::{
     cx::Cx,
@@ -411,7 +411,7 @@ impl Checker<'_, '_, '_> {
                 let mut check = self.check(item, def, node.clone(), descr_kind(item, false), vis, ev);
                 self.generics(&mut check, &item.node.value);
                 self.clauses(&mut check, &item.node.value);
-                for field in fields(item) {
+                for field in walk::fields(item) {
                     self.field(item, field, |_| (vis, ev));
                 }
             }
@@ -420,7 +420,7 @@ impl Checker<'_, '_, '_> {
                 self.generics(&mut check, &item.node.value);
                 self.clauses(&mut check, &item.node.value);
                 let levels = self.levels;
-                for field in fields(item) {
+                for field in walk::fields(item) {
                     self.field(item, field, |field| (min(cx, vis, nominal(cx, field)), levels.get(field)));
                 }
             }
@@ -803,17 +803,6 @@ impl Checker<'_, '_, '_> {
             }
         }
     }
-}
-
-/// The fields of a struct, a union or an enum's variants, in the order they are written.
-fn fields(item: &Item) -> Vec<InFile<SyntaxNode>> {
-    let mut fields: Vec<InFile<SyntaxNode>> = item
-        .own::<ast::RecordField>()
-        .map(|it| it.map(|it| it.syntax().clone()))
-        .chain(item.own::<ast::TupleField>().map(|it| it.map(|it| it.syntax().clone())))
-        .collect();
-    fields.sort_by_key(|it| (it.file_id != item.node.file_id, it.value.text_range().start()));
-    fields
 }
 
 /// rustc's `def_descr` of a walked item, `assoc` when it is an item of a trait or an impl.

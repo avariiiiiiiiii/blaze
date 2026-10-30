@@ -24,6 +24,7 @@ use test_fixture::WithFixture;
 
 use super::{
     Backends, Body, BuildTime, Databases, Hashes, HirFrontend, HirInstance, Kind,
+    allocator::{self, Forward},
     backend::built,
     build::{self, Build},
     places::{Placer, place_requests},
@@ -293,4 +294,31 @@ fn a_reference_left_out_of_the_walk_is_an_error() {
         let placed = place_requests(db, homes, &ById, &mut placer, &mut pending.wants.requests);
         assert!(placed.is_err());
     });
+}
+
+/// An entry of the allocator shim is built against what its walk lists, the function it
+/// calls by symbol, and is another code for another callee.
+#[test]
+fn an_allocator_entry_calls_what_its_walk_lists() {
+    let (db, frontend) = frontend(REFERRING);
+    let krate = db.test_crate();
+    let entry = |to| Forward { symbol: "__rust_alloc", to, params: 2, returns: true, krate };
+    let ours = HirInstance(Kind::Allocator(entry(Some("__blaze_global_alloc"))));
+    let defaults = entry(Some("__rdl_alloc"));
+    assert_ne!(allocator::code(&defaults), allocator::code(&entry(Some("__blaze_global_alloc"))));
+    assert!(allocator::walk(&entry(None)).is_empty());
+    let spec = spec();
+    frontend.with(|db, homes| {
+        let walked = refs::walk(db, &ours, homes).expect("the walk");
+        assert_eq!(walked, vec![FrontRef::Extern("__blaze_global_alloc".to_owned())]);
+        let mut code = build::with(Build::of(&spec), || built(db, &ours, false))
+            .and_then(|it| it)
+            .expect("the IR");
+        let super::Built::Ir(pending) = &mut code else { panic!("asm") };
+        let mut placer = Placer::listed(walked);
+        place_requests(db, homes, &ById, &mut placer, &mut pending.wants.requests)
+            .expect("what the walk lists");
+    });
+    // The fixture links no `alloc`: its program has no shim.
+    assert!(frontend.allocator_shim(krate).expect("the shim").is_empty());
 }

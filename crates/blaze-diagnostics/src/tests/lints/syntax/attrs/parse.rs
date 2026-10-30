@@ -5,30 +5,21 @@
 use crate::{
     Options,
     emit::Style,
-    lints::CommandLine,
-    tests::{checked_with, normalized},
+    tests::{Mode, checked_with, compiletest, normalized, ui_with},
 };
 
-/// The lint flags compiletest gives every UI test (`runtest.rs`, `make_compile_args`), with
-/// `-A unused -W unused_attributes` before them for a test that passes.
-fn compiletest(passes: bool) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if passes {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
+/// What rustc writes compiling the UI test `source`, named `$DIR/<name>`, of edition 2015 (with
+/// no flags of its own), with `files` (path, text) beside it.
+fn ui(name: &str, source: &str, files: &[(&str, &str)]) -> String {
+    if files.is_empty() {
+        return ui_with(name, "2015", source, &Options::default());
     }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
-}
-
-/// What rustc writes compiling the UI test `source`, named `$DIR/<name>`, of edition 2015,
-/// with `files` (path, text) beside it.
-fn ui(name: &str, source: &str, files: &[(&str, &str)], options: &Options) -> String {
     let mut fixture = format!("//- /{name} crate:main edition:2015\n{source}");
     for (path, text) in files {
         fixture.push_str(&format!("//- /{path}\n{text}"));
     }
-    normalized(&checked_with(&fixture, "$DIR/", options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+    let options = compiletest(Mode::Other, &Options::default());
+    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// The messages of `lints` that `source`, of edition 2021, gets, with their lint names.
@@ -82,7 +73,7 @@ LL | #[crate_type = "bin"] fn main() {}
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("lint-misplaced-attr.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("lint-misplaced-attr.rs", source, &[]), expected);
 }
 
 /// `tests/ui/attributes/crate-only-as-outer.rs`.
@@ -126,7 +117,7 @@ LL |     #![crate_name = "iwi"]
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("crate-only-as-outer.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("crate-only-as-outer.rs", source, &[]), expected);
 }
 
 /// `tests/ui/attributes/crate-root-path-in-different-file.rs`.
@@ -159,7 +150,7 @@ LL | #![deny(unused_attributes)]
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("crate-root-path-in-different-file.rs", source, &[("auxiliary/submod.rs", aux)], &compiletest(false)), expected);
+    assert_eq!(ui("crate-root-path-in-different-file.rs", source, &[("auxiliary/submod.rs", aux)]), expected);
 }
 
 /// `tests/ui/attributes/invalid-crate-type.rs`.
@@ -376,7 +367,7 @@ LL | #![crate_type="procedural-macro"]
 error: aborting due to 18 previous errors
 
 "##;
-    assert_eq!(ui("invalid-crate-type.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("invalid-crate-type.rs", source, &[]), expected);
 }
 
 /// `tests/ui/lint/unused/unused-attr-macro-rules.rs`.
@@ -458,7 +449,7 @@ LL | | }
 error: aborting due to 3 previous errors
 
 "##;
-    assert_eq!(ui("unused-attr-macro-rules.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("unused-attr-macro-rules.rs", source, &[]), expected);
 }
 
 /// `tests/ui/lint/inert-attr-macro.rs`.
@@ -534,7 +525,7 @@ LL |     #[allow(warnings)] #[inline] foo!();
 warning: 3 warnings emitted
 
 "##;
-    assert_eq!(ui("inert-attr-macro.rs", source, &[], &compiletest(true)), expected);
+    assert_eq!(ui("inert-attr-macro.rs", source, &[]), expected);
 }
 
 /// `tests/ui/attributes/attr-on-mac-call.rs`.
@@ -1001,7 +992,7 @@ error: aborting due to 4 previous errors; 30 warnings emitted
 
 For more information about this error, try `rustc --explain E0658`.
 "##;
-    assert_eq!(ui("attr-on-mac-call.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("attr-on-mac-call.rs", source, &[]), expected);
 }
 
 /// `tests/ui/rust-2024/unsafe-attributes/in_2024_compatibility.rs`.
@@ -1039,7 +1030,7 @@ LL | #[unsafe(no_mangle)]
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("in_2024_compatibility.rs", source, &[], &compiletest(false)), expected);
+    assert_eq!(ui("in_2024_compatibility.rs", source, &[]), expected);
 }
 
 #[test]

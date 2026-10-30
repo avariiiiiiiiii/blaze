@@ -1,12 +1,16 @@
-//! `--check-cfg` ([`CheckCfg`]) and the lints of the cfgs a crate is built and checked with:
-//! `explicit_builtin_cfgs_in_flags` on the `--cfg`s that set what rustc sets itself, and
-//! `unexpected_cfgs` on every name and value a `cfg` evaluates that `--check-cfg` does not
-//! expect (`unexpected`).
+//! `--check-cfg` and what rustc lints with it: the names and values it expects ([`CheckCfg`]),
+//! `unexpected_cfgs` on every cfg rustc reads, and `explicit_builtin_cfgs_in_flags` on a
+//! `--cfg` that sets one of rustc's own.
 //!
-//! Follows rustc's `compiler/rustc_interface/src/interface.rs` (`parse_cfg`, `parse_check_cfg`),
-//! `compiler/rustc_session/src/config/cfg.rs` (`CheckCfg`, `ExpectedValues`, `fill_well_known`,
-//! `disallow_cfgs`) and `compiler/rustc_session/src/errors.rs` (`UnexpectedBuiltinCfg`) (MIT or
-//! Apache-2.0).
+//! - `meta`: rustc's meta items, read from a command line's spec or a `cfg_select!`'s tokens.
+//! - `unexpected`: where rustc reads a cfg, and what `unexpected_cfgs` says of one.
+//! - `well_known`: the names and values rustc expects whatever the command line says.
+//!
+//! Follows rustc's `compiler/rustc_interface/src/interface.rs` (`parse_cfg`,
+//! `parse_check_cfg`), `compiler/rustc_session/src/config/cfg.rs` (`CheckCfg`,
+//! `ExpectedValues`, `disallow_cfgs`) and `compiler/rustc_session/src/diagnostics.rs`
+//! (`UnexpectedBuiltinCfg`) (MIT or Apache-2.0). The nightly has no unstable form of
+//! `--check-cfg` left: every one `add` takes is stable.
 
 mod meta;
 mod unexpected;
@@ -14,487 +18,370 @@ mod well_known;
 
 use std::borrow::Cow;
 
-use hir::{HirFileId, InFile};
-use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{Edition, SyntaxKind, SyntaxNodePtr};
+use rustc_hash::FxHashSet;
+use syntax::Edition;
 
-use self::{
-    meta::{Item, Kind, LitKind, Parser},
-    well_known::{DISALLOWED, DISALLOWED_PANIC, Start, WELL_KNOWN},
-};
 use super::{Emitted, Pass, Walk};
 use crate::{
     cx::Cx,
+    emit::{Sources, Style},
     lints::CommandLine,
     lower::Phase,
     model::{Code, Diag, Level},
 };
 
-/// The names and values a crate's `cfg`s are checked against: rustc's `CheckCfg`, built from
-/// the `--check-cfg` arguments in order ([`CheckCfg::add`]), with the well-known names and
-/// values rustc adds to it once any is given.
+/// What `--check-cfg` says the expected cfg names and values are.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckCfg {
-    /// Whether any `--check-cfg` is given: only then are `cfg`s checked.
+    /// Whether any `--check-cfg` was given: only then are cfgs checked, against what is given
+    /// and the names and values rustc knows.
     given: bool,
-    /// Whether `cfg(any())` is given: any name is expected (`exhaustive_names` off).
-    any_name: bool,
-    /// The names given, in the order first given, each with its values.
-    names: Vec<(Box<str>, Values)>,
-    index: FxHashMap<Box<str>, usize>,
-    /// The arguments that name an identifier the edition reserves after 2015, each with the
-    /// first edition that refuses it.
-    edition_keywords: Vec<(Box<str>, Edition)>,
-    /// The `--cfg` arguments, in order, as given ([`CheckCfg::add_cfg`]).
-    cfgs: Vec<Box<str>>,
-    /// `-Z check-cfg-all-expected`: the lint lists every name and value expected, the
-    /// well-known ones included.
-    pub all_expected: bool,
-    /// Whether the crate is built by cargo (rustc's `CARGO_CRATE_NAME` is set), which changes
-    /// what the lint suggests.
-    pub from_cargo: bool,
+    /// Whether a name not expected is linted: `cfg(any())` was not given.
+    exhaustive_names: bool,
+    /// The names given, in the order first given, with their values.
+    expecteds: Vec<(String, Values)>,
+    /// rustc is run by cargo (`CARGO_CRATE_NAME` is set), as it is under blaze: the lint's help
+    /// says what to write in `Cargo.toml` and `build.rs` rather than on the command line.
+    pub cargo: bool,
 }
 
-/// The values a name is expected with: rustc's `ExpectedValues`.
+/// rustc's `ExpectedValues`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Values {
+pub(crate) enum Values {
+    /// `values(any())`.
     Any,
-    /// `none`: the name is expected without a value. `values`: sorted, each once.
-    Some { none: bool, values: Vec<Box<str>> },
+    /// Each value expected, `None` for the name alone; each once.
+    Some(Vec<Option<String>>),
 }
 
 const VISIT: &str = "visit <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more details";
-const EXPECTED: &str = "expected `cfg(name, values(\"value1\", \"value2\", ... \"valueN\"))`";
-
-/// rustc's fatal error on the `--check-cfg` argument `spec`, its notes after the message, a
-/// line each.
-fn invalid(spec: &str, notes: &[&str]) -> String {
-    let mut out = format!("invalid `--check-cfg` argument: `{spec}`");
-    for note in notes.iter().copied().chain([VISIT]) {
-        out.push('\n');
-        out.push_str(note);
-    }
-    out
-}
-
-/// rustc's fatal error on an argument of `spec` (`error!(in arg, ..)`).
-fn invalid_in(spec: &str, arg: &Item<'_>, reason: &str) -> String {
-    let printed = meta::to_string(arg);
-    let what = match arg {
-        Item::Lit(lit) => {
-            let (article, descr) = lit.kind.describe();
-            format!("`{printed}` is {article} {descr} literal")
-        }
-        Item::Meta(_) => format!("`{printed}` is invalid"),
-    };
-    invalid(spec, &[&what, reason])
-}
 
 impl CheckCfg {
-    /// Adds the `--check-cfg` argument `spec`, as rustc's `parse_check_cfg` does, or says why
-    /// rustc refuses it: the message on the first line, a note on each after
-    /// ([`error_diag`]). On an error nothing is added.
+    /// One `--check-cfg` value, as rustc parses it in the default edition (2015); the error
+    /// is rustc's, as it writes it.
     pub fn add(&mut self, spec: &str) -> Result<(), String> {
-        let expected = || invalid(spec, &[EXPECTED]);
-        let toks = meta::lex(spec, Edition::Edition2015).ok_or_else(expected)?;
-        let mut parser = Parser::new(&toks, Edition::Edition2015);
-        let meta = parser.meta().filter(|_| parser.at_end()).ok_or_else(expected)?;
-        let Kind::List(args) = &meta.kind else { return Err(expected()) };
-        if !meta.has_name("cfg") {
+        self.add_in(spec, Edition::Edition2015)
+    }
+
+    /// One `--check-cfg` value, as rustc parses it for a crate of `edition` (which decides
+    /// which names are keywords).
+    pub fn add_in(&mut self, spec: &str, edition: Edition) -> Result<(), String> {
+        self.add_diag(spec, edition).map_err(|it| rendered(&it))
+    }
+
+    /// Whether any `--check-cfg` was given.
+    pub fn is_given(&self) -> bool {
+        self.given
+    }
+
+    /// The names given, with their values, in the order first given.
+    pub(crate) fn expecteds(&self) -> &[(String, Values)] {
+        &self.expecteds
+    }
+
+    pub(crate) fn exhaustive_names(&self) -> bool {
+        self.exhaustive_names
+    }
+
+    /// [`CheckCfg::add_in`], its error rustc's fatal error. Nothing is added when it fails.
+    pub(crate) fn add_diag(&mut self, spec: &str, edition: Edition) -> Result<(), Diag> {
+        let error = |reason: &str| invalid(spec, vec![reason.to_owned()]);
+        let in_arg = |arg: &meta::Inner<'_>, reason: &str| {
+            let shown = arg.to_text();
+            let what = match arg.lit() {
+                Some(lit) => {
+                    let (article, descr) = lit.kind.described();
+                    format!("`{shown}` is {article} {descr} literal")
+                }
+                None => format!("`{shown}` is invalid"),
+            };
+            invalid(spec, vec![what, reason.to_owned()])
+        };
+        let expected = || error("expected `cfg(name, values(\"value1\", \"value2\", ... \"valueN\"))`");
+
+        let tokens = meta::lex(spec, edition).ok_or_else(expected)?;
+        let mut parser = meta::Parser::new(&tokens, edition);
+        let item = parser.meta_item().ok_or_else(expected)?;
+        if !parser.at_end() {
+            return Err(expected());
+        }
+        let Some(args) = item.list() else { return Err(expected()) };
+        if !item.has_name("cfg") {
             return Err(expected());
         }
 
         let mut names: Vec<&str> = Vec::new();
-        let mut values: FxHashSet<Option<Cow<'_, str>>> = FxHashSet::default();
-        let mut any_specified = false;
-        let mut values_specified = false;
-        let mut values_any_specified = false;
+        let mut values: Vec<Option<Cow<'_, str>>> = Vec::new();
+        fn insert<'s>(values: &mut Vec<Option<Cow<'s, str>>>, value: Option<Cow<'s, str>>) {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        let (mut any_specified, mut values_specified, mut values_any_specified) = (false, false, false);
         for arg in args {
-            match arg {
-                Item::Meta(it) if matches!(it.kind, Kind::Word) && it.word().is_some() => {
-                    if values_specified {
-                        return Err(invalid(spec, &["`cfg()` names cannot be after values"]));
-                    }
-                    let ident = it.word().unwrap();
-                    if ident.keyword {
-                        return Err(invalid(spec, &["malformed `cfg` input, expected a valid identifier"]));
-                    }
-                    names.push(ident.name);
+            if arg.is_word()
+                && let Some(ident) = arg.ident()
+            {
+                if values_specified {
+                    return Err(error("`cfg()` names cannot be after values"));
                 }
-                Item::Lit(lit) if lit.kind == LitKind::Bool => {
-                    if values_specified {
-                        return Err(invalid(spec, &["`cfg()` names cannot be after values"]));
-                    }
-                    names.push(lit.text);
+                if meta::is_path_segment_keyword(ident.name) {
+                    return Err(error("malformed `cfg` input, expected a valid identifier"));
                 }
-                Item::Meta(it) if it.has_name("any") && matches!(it.kind, Kind::List(_)) => {
-                    if any_specified {
-                        return Err(invalid(spec, &["`any()` cannot be specified multiple times"]));
-                    }
-                    any_specified = true;
-                    if matches!(&it.kind, Kind::List(args) if !args.is_empty()) {
-                        return Err(invalid_in(spec, arg, "`any()` takes no argument"));
-                    }
+                names.push(ident.name);
+            } else if let Some(boolean) = arg.boolean_literal() {
+                if values_specified {
+                    return Err(error("`cfg()` names cannot be after values"));
                 }
-                Item::Meta(it) if it.has_name("values") && matches!(it.kind, Kind::List(_)) => {
-                    if names.is_empty() {
-                        return Err(invalid(spec, &["`values()` cannot be specified before the names"]));
-                    } else if values_specified {
-                        return Err(invalid(spec, &["`values()` cannot be specified multiple times"]));
-                    }
-                    values_specified = true;
-                    let Kind::List(args) = &it.kind else { continue };
-                    for arg in args {
-                        match arg {
-                            Item::Lit(lit) if lit.kind == LitKind::Str => {
-                                let Some(value) = lit.str_value() else { return Err(expected()) };
-                                values.insert(Some(value));
-                            }
-                            Item::Meta(it) if it.has_name("any") && matches!(it.kind, Kind::List(_)) => {
-                                if values_any_specified {
-                                    return Err(invalid_in(
-                                        spec,
-                                        arg,
-                                        "`any()` in `values()` cannot be specified multiple times",
-                                    ));
-                                }
-                                values_any_specified = true;
-                                if matches!(&it.kind, Kind::List(args) if !args.is_empty()) {
-                                    return Err(invalid_in(spec, arg, "`any()` in `values()` takes no argument"));
-                                }
-                            }
-                            Item::Meta(it) if it.has_name("none") && matches!(it.kind, Kind::List(_)) => {
-                                values.insert(None);
-                                if matches!(&it.kind, Kind::List(args) if !args.is_empty()) {
-                                    return Err(invalid_in(spec, arg, "`none()` in `values()` takes no argument"));
-                                }
-                            }
-                            _ => {
-                                return Err(invalid_in(
-                                    spec,
-                                    arg,
-                                    "`values()` arguments must be string literals, `none()` or `any()`",
-                                ));
-                            }
+                names.push(if boolean { "true" } else { "false" });
+            } else if arg.has_name("any")
+                && let Some(list) = arg.list()
+            {
+                if any_specified {
+                    return Err(error("`any()` cannot be specified multiple times"));
+                }
+                any_specified = true;
+                if !list.is_empty() {
+                    return Err(in_arg(arg, "`any()` takes no argument"));
+                }
+            } else if arg.has_name("values")
+                && let Some(list) = arg.list()
+            {
+                if names.is_empty() {
+                    return Err(error("`values()` cannot be specified before the names"));
+                } else if values_specified {
+                    return Err(error("`values()` cannot be specified multiple times"));
+                }
+                values_specified = true;
+                for arg in list {
+                    if let Some(value) = arg.lit().and_then(|it| it.value_str()) {
+                        insert(&mut values, Some(value));
+                    } else if arg.has_name("any")
+                        && let Some(list) = arg.list()
+                    {
+                        if values_any_specified {
+                            return Err(in_arg(arg, "`any()` in `values()` cannot be specified multiple times"));
                         }
+                        values_any_specified = true;
+                        if !list.is_empty() {
+                            return Err(in_arg(arg, "`any()` in `values()` takes no argument"));
+                        }
+                    } else if arg.has_name("none")
+                        && let Some(list) = arg.list()
+                    {
+                        insert(&mut values, None);
+                        if !list.is_empty() {
+                            return Err(in_arg(arg, "`none()` in `values()` takes no argument"));
+                        }
+                    } else {
+                        return Err(in_arg(arg, "`values()` arguments must be string literals, `none()` or `any()`"));
                     }
                 }
-                _ => {
-                    return Err(invalid_in(
-                        spec,
-                        arg,
-                        "`cfg()` arguments must be simple identifiers, `any()` or `values(...)`",
-                    ));
-                }
+            } else {
+                return Err(in_arg(arg, "`cfg()` arguments must be simple identifiers, `any()` or `values(...)`"));
             }
         }
 
         if !values_specified && !any_specified {
-            values.insert(None);
+            insert(&mut values, None);
         } else if !values.is_empty() && values_any_specified {
-            return Err(invalid(
-                spec,
-                &["`values()` arguments cannot specify string literals and `any()` at the same time"],
-            ));
+            return Err(error("`values()` arguments cannot specify string literals and `any()` at the same time"));
         }
         if any_specified && !(names.is_empty() && values.is_empty() && !values_specified && !values_any_specified) {
-            return Err(invalid(spec, &["`cfg(any())` can only be provided in isolation"]));
+            return Err(error("`cfg(any())` can only be provided in isolation"));
         }
 
-        self.given = true;
-        if let Some(since) = reserved_since(&toks) {
-            self.edition_keywords.push((spec.into(), since));
+        if !self.given {
+            self.given = true;
+            self.exhaustive_names = true;
         }
         if any_specified {
-            self.any_name = true;
+            self.exhaustive_names = false;
             return Ok(());
         }
-        let none = values.contains(&None);
-        let mut strings: Vec<&str> = values.iter().filter_map(|it| it.as_deref()).collect();
-        strings.sort_unstable();
         for name in names {
-            let at = match self.index.get(name) {
-                Some(&at) => at,
-                None => {
-                    let values = match values_any_specified {
-                        true => Values::Any,
-                        false => Values::Some { none: false, values: Vec::new() },
-                    };
-                    self.index.insert(name.into(), self.names.len());
-                    self.names.push((name.into(), values));
-                    self.names.len() - 1
-                }
+            let given = || match values_any_specified {
+                true => Values::Any,
+                false => Values::Some(values.iter().map(|it| it.as_deref().map(str::to_owned)).collect()),
             };
-            let entry = &mut self.names[at].1;
-            match entry {
-                Values::Some { .. } if values_any_specified => *entry = Values::Any,
-                Values::Some { none: has_none, values } => {
-                    *has_none |= none;
-                    for &value in &strings {
-                        if let Err(at) = values.binary_search_by(|it| (**it).cmp(value)) {
-                            values.insert(at, value.into());
+            match self.expecteds.iter_mut().find(|(it, _)| it == name) {
+                None => self.expecteds.push((name.to_owned(), given())),
+                Some((_, expected)) => match expected {
+                    Values::Some(old) if !values_any_specified => {
+                        for value in &values {
+                            let value = value.as_deref().map(str::to_owned);
+                            if !old.contains(&value) {
+                                old.push(value);
+                            }
                         }
                     }
-                }
-                Values::Any => {}
+                    Values::Some(_) => *expected = Values::Any,
+                    Values::Any => {}
+                },
             }
         }
         Ok(())
     }
-
-    /// Records the `--cfg` argument `spec`, which [`parse_cfg`] reads with the crate's edition:
-    /// `explicit_builtin_cfgs_in_flags` is on those that set what rustc sets itself.
-    pub fn add_cfg(&mut self, spec: &str) {
-        self.cfgs.push(spec.into());
-    }
-
-    /// Whether a name no `--check-cfg` gives is linted (`exhaustive_names`).
-    fn exhaustive_names(&self) -> bool {
-        self.given && !self.any_name
-    }
-
-    /// What `name` is expected with, the well-known values added (`fill_well_known`: a name
-    /// given keeps what it was given, and gets the well-known values too).
-    fn expected(&self, name: &str) -> Option<Expected<'_>> {
-        let known = well_known(name);
-        let user = self.index.get(name).map(|&it| &self.names[it].1);
-        Some(match (user, known) {
-            (Some(Values::Any), _) => Expected::Any,
-            (Some(Values::Some { none, values }), known) => {
-                Expected::Some(Set { none: *none, user: values, known: known.map_or(&[], |it| it.2) })
-            }
-            (None, Some((_, start, known))) => {
-                Expected::Some(Set { none: *start == Start::NoValue, user: &[], known })
-            }
-            (None, None) => return None,
-        })
-    }
-
-    /// Every name expected, in the order rustc interns them: the well-known ones (which rustc
-    /// has from the start) by name, then those given, in the order given.
-    fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = WELL_KNOWN.iter().map(|it| it.0).collect();
-        names.sort_unstable();
-        names.extend(self.names.iter().map(|it| &*it.0).filter(|it| well_known(it).is_none()));
-        names
-    }
 }
 
-/// What a name is expected with.
-enum Expected<'a> {
-    Any,
-    Some(Set<'a>),
-}
-
-/// The values a name is expected with: those given and the well-known ones.
-struct Set<'a> {
-    none: bool,
-    user: &'a [Box<str>],
-    known: &'static [&'static str],
-}
-
-impl<'a> Set<'a> {
-    fn contains(&self, value: Option<&str>) -> bool {
-        match value {
-            None => self.none,
-            Some(value) => {
-                self.user.binary_search_by(|it| (**it).cmp(value)).is_ok() || known_contains(self.known, value)
-            }
-        }
+/// rustc's fatal error on a `--check-cfg` it cannot read.
+fn invalid(spec: &str, notes: Vec<String>) -> Diag {
+    let mut diag = Diag::new(Level::Error, None, format!("invalid `--check-cfg` argument: `{spec}`"));
+    for note in notes {
+        diag.note(note);
     }
-
-    /// The values, sorted, each once, `none` left out.
-    fn values(&self) -> Vec<&'a str> {
-        let mut values: Vec<&'a str> = self.user.iter().map(|it| &**it).chain(self.known.iter().copied()).collect();
-        values.sort_unstable();
-        values.dedup();
-        values
-    }
+    diag.note(VISIT);
+    diag
 }
 
-/// The well-known name `name`, if it is one.
-fn well_known(name: &str) -> Option<&'static (&'static str, Start, &'static [&'static str])> {
-    WELL_KNOWN.iter().find(|it| it.0 == name)
+/// An error of the command line as rustc writes it: it points into no file.
+fn rendered(diag: &Diag) -> String {
+    crate::emit::rendered(diag, &mut Sources::of(std::iter::empty()), Style::default())
 }
 
-/// Whether the well-known values `known` have `value`: the long lists are sorted.
-fn known_contains(known: &[&str], value: &str) -> bool {
-    if known.len() > SORTED_FROM {
-        known.binary_search(&value).is_ok()
-    } else {
-        known.contains(&value)
-    }
-}
-
-/// The length from which the well-known value lists are sorted.
-const SORTED_FROM: usize = 32;
-
-/// The first edition that reserves an identifier `toks` names unraw, which rustc's parser then
-/// refuses where it parses the argument.
-fn reserved_since(toks: &[meta::Tok<'_>]) -> Option<Edition> {
-    toks.iter()
-        .filter(|it| it.kind == SyntaxKind::IDENT)
-        .filter_map(|it| match it.text {
-            "async" | "await" | "dyn" | "try" => Some(Edition::Edition2018),
-            "gen" => Some(Edition::Edition2024),
-            _ => None,
-        })
-        .min()
-}
-
-/// The `--cfg` argument `spec`: its name and value, as rustc's `parse_cfg` reads it, or
-/// rustc's fatal error on it.
+/// One `--cfg` value as rustc parses it for a crate of `edition`: its name, and its value
+/// when it has one; the error is rustc's, as it writes it.
 pub fn parse_cfg(spec: &str, edition: Edition) -> Result<(String, Option<String>), String> {
-    let error = |reason: &str| Err(format!("invalid `--cfg` argument: `{spec}` ({reason})"));
-    if let Some(toks) = meta::lex(spec, edition) {
-        let mut parser = Parser::new(&toks, edition);
-        if let Some(meta) = parser.meta()
+    parse_cfg_diag(spec, edition).map_err(|it| rendered(&it))
+}
+
+/// [`parse_cfg`], its error rustc's fatal error.
+pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Option<String>), Diag> {
+    let error = |reason: &str| Diag::new(Level::Error, None, format!("invalid `--cfg` argument: `{spec}` ({reason})"));
+    if let Some(tokens) = meta::lex(spec, edition) {
+        let mut parser = meta::Parser::new(&tokens, edition);
+        if let Some(item) = parser.meta_item()
             && parser.at_end()
         {
-            if meta.root || meta.path.len() != 1 {
-                return error("argument key must be an identifier");
+            if item.global || item.path.len() != 1 {
+                return Err(error("argument key must be an identifier"));
             }
-            match &meta.kind {
-                Kind::List(_) => {}
-                Kind::NameValue(lit) if lit.kind != LitKind::Str => {
-                    return error("argument value must be a string");
+            match &item.kind {
+                meta::Kind::List(_) => {}
+                meta::Kind::NameValue(lit) if !matches!(lit.kind, meta::LitKind::Str | meta::LitKind::StrRaw) => {
+                    return Err(error("argument value must be a string"));
                 }
-                Kind::NameValue(_) | Kind::Word => {
-                    let ident = meta.path[0];
-                    if ident.keyword {
-                        return error("malformed `cfg` input, expected a valid identifier");
+                meta::Kind::NameValue(_) | meta::Kind::Word => {
+                    let name = item.path[0].name;
+                    if meta::is_path_segment_keyword(name) {
+                        return Err(error("malformed `cfg` input, expected a valid identifier"));
                     }
-                    let value = match &meta.kind {
-                        Kind::NameValue(lit) => lit.str_value().map(Cow::into_owned),
+                    let value = match &item.kind {
+                        meta::Kind::NameValue(lit) => lit.value_str().map(Cow::into_owned),
                         _ => None,
                     };
-                    return Ok((ident.name.to_owned(), value));
+                    return Ok((name.to_owned(), value));
                 }
             }
         }
     }
     if spec.contains('=') && !spec.contains("=\"") && !spec.ends_with('"') {
-        error(concat!(
+        return Err(error(concat!(
             r#"expected `key` or `key="value"`, ensure escaping is appropriate"#,
             r#" for your shell, try 'key="value"' or key=\"value\""#
-        ))
-    } else {
-        error(r#"expected `key` or `key="value"`"#)
+        )));
     }
+    Err(error(r#"expected `key` or `key="value"`"#))
 }
 
-/// The fatal error `error` of [`CheckCfg::add`] or [`parse_cfg`] as rustc writes it: its first
-/// line the message, each other a note.
-pub fn error_diag(error: &str) -> Diag {
-    let mut lines = error.split('\n');
-    let mut diag = Diag::new(Level::Error, None, lines.next().unwrap_or_default());
-    for note in lines {
-        diag.note(note);
-    }
-    diag
-}
-
-/// `name` as rustc writes an identifier of `edition`: `r#` before one the edition reserves
-/// (`Ident`'s `Display`, `is_raw_guess`).
-fn ident(name: &str, edition: Edition) -> Cow<'_, str> {
-    let raw = !matches!(name, "crate" | "self" | "Self" | "super")
-        && SyntaxKind::from_keyword(name, edition).is_some();
-    match raw {
-        true => Cow::Owned(format!("r#{name}")),
-        false => Cow::Borrowed(name),
-    }
-}
-
-/// `items` as rustc lists them in a message (`DiagSymbolList`): "`a`", "`a` and `b`",
-/// "`a`, `b`, and `c`".
-fn list<S: AsRef<str>>(items: &[S]) -> String {
-    let mut out = String::new();
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            out.push_str(match items.len() {
-                2 => " and ",
-                n if i == n - 1 => ", and ",
-                _ => ", ",
-            });
-        }
-        out.push('`');
-        out.push_str(item.as_ref());
-        out.push('`');
-    }
-    out
-}
-
-/// The lints of the crate's `--cfg`s and `cfg`s, in the order rustc buffers them; or, when
-/// rustc refuses a `--cfg` or `--check-cfg` argument for the crate's edition, its fatal error
-/// alone.
+/// What this module lints: `explicit_builtin_cfgs_in_flags` of each `--cfg`, as the session is
+/// made, then `unexpected_cfgs` as expansion reads each cfg, when a `--check-cfg` was given.
 pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut emitted = Vec::new();
-    let check = &cmd.check_cfg;
-    let mut cfgs: Vec<(String, Option<String>)> = Vec::new();
-    for spec in &check.cfgs {
-        match parse_cfg(spec, cx.edition) {
-            Ok(cfg) => cfgs.push(cfg),
-            Err(error) => return vec![Emitted::unplaced(error_diag(&error), Phase::Parse, Pass::Buffered)],
-        }
-    }
-    if let Some((spec, _)) = check.edition_keywords.iter().find(|it| cx.edition >= it.1) {
-        let error = invalid(spec, &[EXPECTED]);
-        return vec![Emitted::unplaced(error_diag(&error), Phase::Parse, Pass::Buffered)];
-    }
-    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return emitted };
-    let Some(root) = walk.tree(HirFileId::from(root)) else { return emitted };
-    let krate = root.ptr(&root.root);
-    builtin(cx, &cfgs, krate, &mut emitted);
-    if check.given {
-        unexpected::lints(cx, check, walk, &mut emitted);
+    let mut emitted = builtin_cfgs(cx, cmd, walk);
+    if cmd.check_cfg.is_given() {
+        emitted.extend(unexpected::lints(cx, &cmd.check_cfg, walk));
     }
     emitted
 }
 
-/// `explicit_builtin_cfgs_in_flags` on each `--cfg` that sets a cfg rustc sets itself
-/// (`disallow_cfgs`), each once, at the crate.
-fn builtin(cx: &Cx<'_, '_>, cfgs: &[(String, Option<String>)], krate: InFile<SyntaxNodePtr>, out: &mut Vec<Emitted>) {
-    let mut seen: FxHashSet<(&str, Option<&str>)> = FxHashSet::default();
-    for (name, value) in cfgs {
-        if !seen.insert((name, value.as_deref())) {
+/// rustc's `disallow_cfgs`: a `--cfg` setting a cfg rustc sets itself, buffered for the crate.
+/// A `--cfg` rustc cannot read was refused as the command line was read.
+fn builtin_cfgs(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
+    let mut emitted = Vec::new();
+    if cmd.cfg.is_empty() {
+        return emitted;
+    }
+    let root = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
+    let Some(tree) = walk.tree(root) else { return emitted };
+    let at = tree.ptr(&tree.root);
+    let mut seen: FxHashSet<(String, Option<String>)> = FxHashSet::default();
+    for spec in &cmd.cfg {
+        let Ok(cfg) = parse_cfg_diag(spec, cx.edition) else { continue };
+        if !seen.insert(cfg.clone()) {
             continue;
         }
-        let flag = match name.as_str() {
-            "panic" => value.as_deref().filter(|it| DISALLOWED_PANIC.contains(it)).map(|_| "-C panic"),
-            name => DISALLOWED
-                .iter()
-                .find(|it| it.0 == name && it.1.is_none_or(|with_value| with_value == value.is_some()))
-                .map(|it| it.2),
-        };
-        let Some(flag) = flag else { continue };
-        let cfg = match value {
+        let (name, value) = cfg;
+        let Some(controlled_by) = controlled_by(&name, value.as_deref()) else { continue };
+        let shown = match &value {
             Some(value) => format!(r#"{name}="{value}""#),
             None => name.clone(),
         };
         let mut diag = Diag::new(
             Level::Warning,
             Some(Code::Lint("explicit_builtin_cfgs_in_flags".to_owned())),
-            format!("unexpected `--cfg {cfg}` flag"),
+            format!("unexpected `--cfg {shown}` flag"),
         );
-        diag.note(format!(
-            "config `{}` is only supposed to be controlled by `{flag}`",
-            ident(name, cx.edition)
-        ));
+        diag.note(format!("config `{name}` is only supposed to be controlled by `{controlled_by}`"));
         diag.note("manually setting a built-in cfg can and does create incoherent behaviors");
-        out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate));
+        emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
+    }
+    emitted
+}
+
+/// The flag that sets the builtin cfg `name` (with `value`), if rustc refuses it on the
+/// command line.
+fn controlled_by(name: &str, value: Option<&str>) -> Option<&'static str> {
+    if name == "panic" {
+        return value.is_some_and(|it| well_known::DISALLOWED_PANIC.contains(&it)).then_some("-C panic");
+    }
+    let &(_, with_value, flag) = well_known::DISALLOWED.iter().find(|(it, ..)| *it == name)?;
+    match with_value {
+        Some(with_value) if with_value != value.is_some() => None,
+        _ => Some(flag),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SORTED_FROM, WELL_KNOWN};
+    use super::*;
 
     #[test]
-    fn long_well_known_value_lists_are_sorted() {
-        for (name, _, values) in WELL_KNOWN {
-            if values.len() > SORTED_FROM {
-                assert!(values.is_sorted(), "the values of `{name}` are not sorted");
-            }
-        }
+    fn a_builtin_cfg_is_refused_as_rustc_refuses_it() {
+        assert_eq!(controlled_by("unix", None), Some("--target"));
+        assert_eq!(controlled_by("unix", Some("x")), None);
+        assert_eq!(controlled_by("target_os", Some("linux")), Some("--target"));
+        assert_eq!(controlled_by("target_os", None), None);
+        assert_eq!(controlled_by("target_env", None), Some("--target"));
+        assert_eq!(controlled_by("panic", Some("abort")), Some("-C panic"));
+        assert_eq!(controlled_by("panic", Some("other")), None);
+        assert_eq!(controlled_by("panic", None), None);
+        assert_eq!(controlled_by("test", None), None);
+        assert_eq!(controlled_by("feature", Some("std")), None);
+    }
+
+    #[test]
+    fn cfg_values_parse_as_rustc_parses_them() {
+        let parse = |it: &str| parse_cfg_diag(it, Edition::Edition2021).map_err(|it| it.message);
+        assert_eq!(parse("unix"), Ok(("unix".to_owned(), None)));
+        assert_eq!(parse(r#"feature="std""#), Ok(("feature".to_owned(), Some("std".to_owned()))));
+        assert_eq!(parse(r#"x = "a\"b""#), Ok(("x".to_owned(), Some("a\"b".to_owned()))));
+        assert_eq!(parse("r#async"), Ok(("async".to_owned(), None)));
+        assert_eq!(parse("a::b"), Err("invalid `--cfg` argument: `a::b` (argument key must be an identifier)".to_owned()));
+        assert_eq!(parse("a = 1"), Err("invalid `--cfg` argument: `a = 1` (argument value must be a string)".to_owned()));
+        assert_eq!(
+            parse("self"),
+            Err("invalid `--cfg` argument: `self` (malformed `cfg` input, expected a valid identifier)".to_owned())
+        );
+        assert_eq!(parse("a(b)"), Err(r#"invalid `--cfg` argument: `a(b)` (expected `key` or `key="value"`)"#.to_owned()));
+        assert_eq!(
+            parse("a=b"),
+            Err(concat!(
+                r#"invalid `--cfg` argument: `a=b` (expected `key` or `key="value"`, ensure escaping is appropriate"#,
+                r#" for your shell, try 'key="value"' or key=\"value\")"#
+            )
+            .to_owned())
+        );
+        assert!(parse("async").is_err());
+        assert_eq!(parse_cfg_diag("async", Edition::Edition2015).map_err(|it| it.message), Ok(("async".to_owned(), None)));
     }
 }

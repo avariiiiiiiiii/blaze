@@ -40,22 +40,25 @@ impl LatePass for InteriorMutableConsts {
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
-        let (method, receiver) = match store.expr(expr) {
-            Expr::MethodCall { receiver, .. } => (util::method_fn(b, expr), receiver),
+        let (callee, receiver) = match store.expr(expr) {
+            Expr::MethodCall { receiver, .. } => (None, receiver),
             Expr::Call { callee, args: &[first, ..] } => {
                 let Expr::Ref { expr: receiver, .. } = store.expr(first) else { return };
                 let Expr::Path(_) = store.expr(callee) else { return };
-                let method = match util::path_value(b, callee) {
-                    Some(ValueNs::FunctionId(it)) => Some(it),
-                    _ => None,
-                };
-                (method, receiver)
+                (Some(callee), receiver)
             }
             _ => return,
         };
-        let Some(method) = method else { return };
         let Expr::Path(_) = store.expr(receiver) else { return };
         let Some(ValueNs::ConstId(konst)) = util::path_value(b, receiver) else { return };
+        let method = match callee {
+            None => util::method_fn(b, expr),
+            Some(callee) => match util::path_value(b, callee) {
+                Some(ValueNs::FunctionId(it)) => Some(it),
+                _ => None,
+            },
+        };
+        let Some(method) = method else { return };
         // A deref can do anything, such as reach a thread local (rust-lang/rust#150157).
         if b.infer.expr_adjustment(receiver).is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_)))) {
             return;

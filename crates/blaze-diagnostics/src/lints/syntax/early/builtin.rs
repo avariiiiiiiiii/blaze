@@ -11,6 +11,8 @@
 //! `compiler/rustc_parse/src/parser/stmt.rs` (`parse_full_stmt`: which `;` is a statement of
 //! its own) (MIT or Apache-2.0).
 
+use std::ops::ControlFlow;
+
 use hir::{HirFileId, InFile};
 use hir_expand::{MacroDefKind, builtin::BuiltinFnLikeExpander};
 use span::Edition;
@@ -27,32 +29,52 @@ use crate::{
     model::{Applicability, Diag, SuggestionStyle},
 };
 
+/// rustc's combined early pass: one walk over each tree's pre-order node column, each node
+/// dispatched once on its kind to the checks that look at that kind, the shadowing of labels
+/// (`labels::shadowing`) included. Nothing is allocated per node: a statement buffer is reused
+/// across blocks, and a diagnostic's strings are built only once it is given.
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     let expansions = Expansions::of(cx, walk);
     let mut out = Vec::new();
     special_module_names(cx, walk, &expansions, &mut out);
+    let anonymous = cx.edition == Edition::Edition2015;
+    let mut stmts: Vec<Stmt> = Vec::new();
     for tree in &walk.trees {
         global_asm(cx, tree, &mut out);
         // The range pattern whose `...` was linted with the `&` before it: nothing in it is
         // linted again (`EllipsisInclusiveRangePatterns::node_id`).
         let mut linted_ref: Option<TextRange> = None;
         for node in &tree.nodes {
-            unsafe_code(cx, walk, tree, node, &mut out);
-            if cx.edition == Edition::Edition2015 {
-                anonymous_parameters(cx, tree, node, &mut out);
+            match node.kind() {
+                SyntaxKind::BLOCK_EXPR
+                | SyntaxKind::TRAIT
+                | SyntaxKind::IMPL
+                | SyntaxKind::EXTERN_BLOCK
+                | SyntaxKind::MACRO_RULES
+                | SyntaxKind::MACRO_DEF => unsafe_code(cx, walk, tree, node, &mut out),
+                SyntaxKind::FN => {
+                    unsafe_code(cx, walk, tree, node, &mut out);
+                    if anonymous {
+                        anonymous_parameters(cx, tree, node, &mut out);
+                    }
+                }
+                SyntaxKind::REF_PAT | SyntaxKind::RANGE_PAT => {
+                    if linted_ref.is_some_and(|range| !range.contains_range(node.text_range())) {
+                        linted_ref = None;
+                    }
+                    if linted_ref.is_none() {
+                        linted_ref = ellipsis_range(cx, tree, node, &mut out);
+                    }
+                }
+                SyntaxKind::WHILE_EXPR => while_true(cx, tree, node, &mut out),
+                SyntaxKind::STMT_LIST => redundant_semicolons(cx, &expansions, tree, node, &mut stmts, &mut out),
+                SyntaxKind::PREFIX_EXPR => {
+                    ambiguous_negative_literal(cx, tree, node, &mut out);
+                    double_negation(cx, tree, node, &mut out);
+                }
+                SyntaxKind::LABEL => super::labels::shadowing(cx, tree, node, &mut out),
+                _ => {}
             }
-            if let Some(range) = linted_ref
-                && !range.contains_range(node.text_range())
-            {
-                linted_ref = None;
-            }
-            if linted_ref.is_none() {
-                linted_ref = ellipsis_range(cx, tree, node, &mut out);
-            }
-            while_true(cx, tree, node, &mut out);
-            redundant_semicolons(cx, &expansions, tree, node, &mut out);
-            ambiguous_negative_literal(cx, tree, node, &mut out);
-            double_negation(cx, tree, node, &mut out);
         }
     }
     out
@@ -99,61 +121,63 @@ fn while_true(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emi
 }
 
 /// `unsafe` blocks, traits, impls, `extern` blocks and functions, and
-/// `#[allow_internal_unsafe]` on a macro: `UnsafeCode`.
+/// `#[allow_internal_unsafe]` on a macro: `UnsafeCode`. Called only for the kinds it checks, one
+/// cast each.
 fn unsafe_code(cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
-    let mut report = |range: TextRange, message: &str| {
-        if allows_unsafe(cx, tree.file, range) {
-            return;
+    let unsafe_token = |kind: SyntaxKind| node.children_with_tokens().any(|it| it.kind() == kind);
+    let (range, message) = match node.kind() {
+        SyntaxKind::BLOCK_EXPR if unsafe_token(T![unsafe]) => (range_of(node), "usage of an `unsafe` block"),
+        SyntaxKind::TRAIT if unsafe_token(T![unsafe]) => (range_of(node), "declaration of an `unsafe` trait"),
+        SyntaxKind::IMPL
+            if unsafe_token(T![unsafe]) && ast::Impl::cast(node.clone()).is_some_and(|it| it.trait_().is_some()) =>
+        {
+            (range_of(node), "implementation of an `unsafe` trait")
         }
-        let diag = Diag::lint("unsafe_code", message, cx.span(InFile::new(tree.file, range)));
-        out.push(emitted(cx, diag, Pass::Early, tree.ptr(node)));
-    };
-    if let Some(it) = ast::BlockExpr::cast(node.clone())
-        && it.unsafe_token().is_some()
-    {
-        report(range_of(node), "usage of an `unsafe` block");
-    }
-    if let Some(it) = ast::Trait::cast(node.clone())
-        && it.unsafe_token().is_some()
-    {
-        report(range_of(node), "declaration of an `unsafe` trait");
-    }
-    if let Some(it) = ast::Impl::cast(node.clone())
-        && it.unsafe_token().is_some()
-        && it.trait_().is_some()
-    {
-        report(range_of(node), "implementation of an `unsafe` trait");
-    }
-    if let Some(it) = ast::ExternBlock::cast(node.clone())
-        && it.unsafe_token().is_some()
-    {
-        report(range_of(node), "usage of an `unsafe extern` block");
-    }
-    if (ast::MacroRules::can_cast(node.kind()) || ast::MacroDef::can_cast(node.kind()))
-        && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
-    {
-        let attr = walk.attrs(&owner).into_iter().find(|(meta, _)| meta.simple_name().as_deref() == Some("allow_internal_unsafe"));
-        if let Some((meta, attr)) = attr {
-            // An attribute `cfg_attr` gives is spanned by what `cfg_attr` holds of it.
-            let written = attr.meta().is_some_and(|it| it.syntax() == meta.syntax());
-            let range = if written { attr.syntax().text_range() } else { meta.syntax().text_range() };
-            report(
+        SyntaxKind::EXTERN_BLOCK if unsafe_token(T![unsafe]) => (range_of(node), "usage of an `unsafe extern` block"),
+        SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => {
+            let Some(range) = allow_internal_unsafe(walk, node) else { return };
+            (
                 range,
                 "`allow_internal_unsafe` allows defining macros using unsafe without triggering the `unsafe_code` lint at their call site",
-            );
+            )
         }
+        SyntaxKind::FN if unsafe_token(T![unsafe]) => {
+            let message = match node.parent().map(|it| it.kind()) {
+                Some(SyntaxKind::EXTERN_ITEM_LIST) => return,
+                Some(SyntaxKind::ASSOC_ITEM_LIST) if !node.children().any(|it| it.kind() == SyntaxKind::BLOCK_EXPR) => {
+                    "declaration of an `unsafe` method"
+                }
+                Some(SyntaxKind::ASSOC_ITEM_LIST) => "implementation of an `unsafe` method",
+                _ => "declaration of an `unsafe` function",
+            };
+            (range_of(node), message)
+        }
+        _ => return,
+    };
+    if allows_unsafe(cx, tree.file, range) {
+        return;
     }
-    if let Some(it) = ast::Fn::cast(node.clone())
-        && it.unsafe_token().is_some()
-    {
-        let message = match node.parent().map(|it| it.kind()) {
-            Some(SyntaxKind::EXTERN_ITEM_LIST) => return,
-            Some(SyntaxKind::ASSOC_ITEM_LIST) if it.body().is_none() => "declaration of an `unsafe` method",
-            Some(SyntaxKind::ASSOC_ITEM_LIST) => "implementation of an `unsafe` method",
-            _ => "declaration of an `unsafe` function",
-        };
-        report(range_of(node), message);
+    let diag = Diag::lint("unsafe_code", message, cx.span(InFile::new(tree.file, range)));
+    out.push(emitted(cx, diag, Pass::Early, tree.ptr(node)));
+}
+
+/// The range rustc spans `#[allow_internal_unsafe]` of a macro definition by: the attribute, or
+/// what `cfg_attr` holds of it. A definition without attributes costs one scan of its children.
+fn allow_internal_unsafe(walk: &Walk<'_>, node: &SyntaxNode) -> Option<TextRange> {
+    if !node.children().any(|it| it.kind() == SyntaxKind::ATTR) {
+        return None;
     }
+    let owner = ast::AnyHasAttrs::cast(node.clone())?;
+    hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || walk.cfg, |meta, attr| {
+        let named = meta.path().filter(|it| it.qualifier().is_none()).and_then(|it| it.segment()).and_then(|it| {
+            it.syntax().first_token()
+        });
+        if named.is_none_or(|it| it.text() != "allow_internal_unsafe") {
+            return ControlFlow::Continue(());
+        }
+        let written = attr.meta().is_some_and(|it| it.syntax() == meta.syntax());
+        ControlFlow::Break(if written { attr.syntax().text_range() } else { meta.syntax().text_range() })
+    })
 }
 
 /// A call of `global_asm!`, the item it expands to: `UnsafeCode`'s `ItemKind::GlobalAsm`.
@@ -401,7 +425,8 @@ fn ambiguous_negative_literal(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, o
 }
 
 /// A statement of a block as rustc's AST has it once expanded: an empty one (a `;` of its
-/// own) where it is written, or any other.
+/// own) where it is written, or any other. One per statement, in a buffer reused across blocks.
+#[derive(Clone, Copy)]
 enum Stmt {
     Empty(InFile<TextRange>),
     Other,
@@ -413,14 +438,12 @@ fn redundant_semicolons(
     expansions: &Expansions<'_>,
     tree: &Tree,
     node: &SyntaxNode,
+    stmts: &mut Vec<Stmt>,
     out: &mut Vec<Emitted>,
 ) {
-    if node.kind() != SyntaxKind::STMT_LIST {
-        return;
-    }
     let Some(block) = node.parent() else { return };
-    let mut stmts = Vec::new();
-    statements(tree, node, expansions, &mut stmts);
+    stmts.clear();
+    statements(tree, node, expansions, stmts);
     let mut seq: Option<(InFile<TextRange>, bool)> = None;
     let mut flush = |seq: &mut Option<(InFile<TextRange>, bool)>| {
         let Some((range, multiple)) = seq.take() else { return };
@@ -439,7 +462,7 @@ fn redundant_semicolons(
         }
         out.push(emitted(cx, diag, Pass::Early, tree.ptr(&block)));
     };
-    for stmt in stmts {
+    for &stmt in stmts.iter() {
         let Stmt::Empty(range) = stmt else {
             flush(&mut seq);
             continue;
@@ -474,12 +497,16 @@ fn statements<'w>(tree: &'w Tree, parent: &SyntaxNode, expansions: &Expansions<'
         if matches!(child.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT) || tree.skipped(child.text_range()) {
             continue;
         }
-        let call = match ast::ExprStmt::cast(child.clone()).and_then(|it| it.expr()) {
-            Some(ast::Expr::MacroExpr(it)) => it.macro_call().map(|it| it.syntax().clone()),
-            _ => ast::MacroExpr::cast(child.clone())
-                .and_then(|it| it.macro_call())
-                .map(|it| it.syntax().clone())
-                .or_else(|| ast::MacroCall::can_cast(child.kind()).then(|| child.clone())),
+        let macro_call = |expr: &SyntaxNode| expr.children().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
+        let call = match child.kind() {
+            SyntaxKind::EXPR_STMT => child
+                .children()
+                .find(|it| it.kind() != SyntaxKind::ATTR)
+                .filter(|it| it.kind() == SyntaxKind::MACRO_EXPR)
+                .and_then(|it| macro_call(&it)),
+            SyntaxKind::MACRO_EXPR => macro_call(&child),
+            SyntaxKind::MACRO_CALL => Some(child),
+            _ => None,
         };
         if let Some(call) = call
             && let Some(expanded) = expansions.of_call(tree.file, &call)

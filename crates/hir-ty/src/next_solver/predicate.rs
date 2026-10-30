@@ -180,9 +180,13 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for BoundExistentialPre
     }
 }
 
+/// What a [`Predicate`] is.
+type PredicateRow<'db> = Binder<'db, PredicateKind<'db>>;
+
 /// Every interned [`Predicate`].
-static PREDICATES: table::Rows<Binder<'static, PredicateKind<'static>>> =
+static PREDICATES: table::Rows<PredicateRow<'static>> =
     table::Rows::new("predicates", table::LAST_ROW);
+table::erase!(PredicateRow, Clause);
 
 /// A predicate: its row in [`PREDICATES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -203,14 +207,6 @@ impl<'db> Predicate<'db> {
 
     #[inline]
     pub(super) fn intern(kind: Binder<'db, PredicateKind<'db>>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe {
-            std::mem::transmute::<
-                Binder<'db, PredicateKind<'db>>,
-                Binder<'static, PredicateKind<'static>>,
-            >(kind)
-        };
         Self::at(PREDICATES.intern(kind, || {
             let computed = FlagComputation::for_predicate(kind);
             table::RowInfo {
@@ -266,7 +262,7 @@ pub struct ClausesStorage;
 impl ClausesStorage {
     #[inline]
     fn table() -> &'static table::Lists<Clause<'static>> {
-        static TABLE: table::Lists<Clause<'static>> = table::Lists::new("Clauses");
+        static TABLE: table::Lists<Clause<'static>> = table::Lists::with_flags("Clauses");
         &TABLE
     }
 }
@@ -308,9 +304,6 @@ impl<'db> Clauses<'db> {
     /// needs to intern the global slice as well.
     #[inline]
     pub(crate) fn new_from_slice_no_empty_check(slice: &[Clause<'db>]) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let slice = unsafe { ::std::mem::transmute::<&[Clause<'db>], &[Clause<'static>]>(slice) };
         Self::at(ClausesStorage::table().intern_with(slice, || {
             let computed = FlagComputation::<DbInterner<'db>>::for_clauses(slice);
             (computed.flags, computed.outer_exclusive_binder)
@@ -353,10 +346,7 @@ impl<'db> Clauses<'db> {
 
     #[inline]
     pub fn as_slice(self) -> &'db [Clause<'db>] {
-        // SAFETY: `index` was given by the table's `intern_with`.
-        let slice = unsafe { ClausesStorage::table().get(self.index) };
-        // SAFETY: as in `new_from_slice_no_empty_check`.
-        unsafe { ::std::mem::transmute::<&[Clause<'static>], &'db [Clause<'db>]>(slice) }
+        ClausesStorage::table().get(self.index)
     }
 
     #[inline]
@@ -468,14 +458,12 @@ impl<'db, V: super::WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Cla
 impl<'db> rustc_type_ir::Flags for Clauses<'db> {
     #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        // SAFETY: a `Clauses` is a row the table's `intern_with` gave.
-        unsafe { ClausesStorage::table().flags(self.index) }
+        ClausesStorage::table().flags(self.index)
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: as in `flags`.
-        unsafe { ClausesStorage::table().binder(self.index) }
+        ClausesStorage::table().binder(self.index)
     }
 }
 
@@ -613,14 +601,12 @@ impl<'db> Elaboratable<DbInterner<'db>> for Predicate<'db> {
 impl<'db> Flags for Predicate<'db> {
     #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        // SAFETY: a `Predicate` is a row of `PREDICATES`.
-        unsafe { PREDICATES.flags(self.index) }
+        PREDICATES.flags(self.index)
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: as in `flags`.
-        unsafe { PREDICATES.binder(self.index) }
+        PREDICATES.binder(self.index)
     }
 }
 
@@ -629,13 +615,7 @@ impl<'db> IntoKind for Predicate<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Predicate` is a row of `PREDICATES`; the lifetime is as in `intern`.
-        unsafe {
-            std::mem::transmute::<
-                Binder<'static, PredicateKind<'static>>,
-                Binder<'db, PredicateKind<'db>>,
-            >(PREDICATES.kind(self.index))
-        }
+        PREDICATES.kind(self.index)
     }
 }
 

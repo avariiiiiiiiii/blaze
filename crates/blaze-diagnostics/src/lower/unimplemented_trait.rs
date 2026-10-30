@@ -167,7 +167,7 @@ fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
     let self_text = self_ty.as_ref().map(|it| cx.ty(it)).unwrap_or_default();
     format!(
         "the {unstable}trait `{}` is not implemented for{desc} `{self_text}`",
-        print::trait_path(cx, &tr)
+        print::trait_path_sugared(cx, pred)
     )
 }
 
@@ -251,11 +251,7 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
     let required = |pred: &hir::TraitPredicate<'_>| {
         let tr = pred.trait_ref();
         let self_ty = tr.get_type_argument(0).map(|it| cx.ty(&it)).unwrap_or_default();
-        let modifier = match pred.polarity() {
-            hir::PredicatePolarity::Positive => "",
-            hir::PredicatePolarity::Negative => "!",
-        };
-        format!("required for `{self_ty}` to implement `{modifier}{}`", print::trait_path(cx, &tr))
+        format!("required for `{self_ty}` to implement `{}`", print::trait_path_sugared(cx, pred))
     };
     let mut seen: Vec<hir::Trait> = Vec::new();
     let mut i = 0;

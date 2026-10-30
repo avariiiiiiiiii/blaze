@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "fuzz"]
 # `blaze-wasm` turns on a feature of `hir-ty-codegen` that swaps the code generator's output, which
 # must not be unified into a build of the native crates.
 exclude = [
@@ -117,6 +117,13 @@ blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-link = { path = "crates/blaze-link" }
+# fastcompile (docs/v2/plan/lanes/fastcompile/notes.md)
+blaze-global = { path = "crates/blaze-global" }
+blaze-hashcons = { path = "crates/blaze-hashcons" }
+blaze-history = { path = "crates/blaze-history" }
+blaze-inproc = { path = "crates/blaze-inproc" }
+blaze-lazy = { path = "crates/blaze-lazy" }
+blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-usercode = { path = "crates/blaze-usercode" }

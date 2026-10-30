@@ -1,6 +1,7 @@
 //! `unused_labels` and the warning of a shadowed label, against rustc's UI tests.
 
-use super::{Test, ui, ui_core};
+use super::ui_core;
+use crate::tests::ui;
 
 #[test]
 fn unused_labels_and_a_shadowed_label_are_warned_of() {
@@ -156,7 +157,7 @@ LL |     'unused_block_label: {
 warning: 9 warnings emitted
 
 "#;
-    assert_eq!(ui_core("unused_labels.rs", "2015", Test::Passes, "range, iterator, option, eq", source), stderr);
+    assert_eq!(ui_core("unused_labels.rs", "2015", "range, iterator, option, eq", source), stderr);
 }
 
 #[test]
@@ -172,5 +173,5 @@ fn main() {
     }
 }
 "#;
-    assert_eq!(ui("label-beginning-with-underscore.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("label-beginning-with-underscore.rs", "2015", source), "");
 }

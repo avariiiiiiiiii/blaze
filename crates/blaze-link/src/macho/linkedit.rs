@@ -2,6 +2,8 @@
 //! addresses it slides (rebase) and which it binds to a symbol of a library, the trie of what
 //! the image exports, and the starts of its functions.
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 
 use object::macho;

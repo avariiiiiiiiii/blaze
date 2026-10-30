@@ -231,7 +231,8 @@ impl Writer {
         kind: Kind,
         bytes: Vec<u8>,
     ) -> Result<Ticket, Mismatch> {
-        self.own.put(Look::new(&self.shared, Held::task(guard)), unit, key, kind, bytes)
+        let content = content_of(&bytes);
+        self.own.put(Look::new(&self.shared, Held::task(guard)), unit, key, kind, content, &bytes)
     }
 
     /// Whether the put that got `ticket` (from any writer of the store) is durable.
@@ -268,15 +269,16 @@ impl Own {
         &self.segment
     }
 
+    /// Keeps `bytes`, whose hash is `content`, under `key`.
     pub(crate) fn put(
         &mut self,
         look: Look<'_>,
         unit: Unit,
         key: Key,
         kind: Kind,
-        bytes: Vec<u8>,
+        content: ContentId,
+        bytes: &[u8],
     ) -> Result<Ticket, Mismatch> {
-        let content = content_of(&bytes);
         if let Some((kept, ticket)) = look.kept(&key) {
             return match kept == content {
                 true => Ok(ticket),
@@ -296,7 +298,7 @@ impl Own {
         };
         let won = if kind == Kind::Output && bytes.len() >= CHUNK_FROM {
             let mut refs = Vec::new();
-            for range in chunk::chunks(&bytes) {
+            for range in chunk::chunks(bytes) {
                 let piece = &bytes[range];
                 let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
                 let kept = look.kept(&chunk);
@@ -329,28 +331,28 @@ impl Own {
             self.claim(look, unit, record(Form::Chunked, 0, &payload), &payload, ticket)
         } else if !kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM {
             // Its bytes ride in the segment; the store writes them as the file at the commit.
-            self.claim(look, unit, record(Form::External, 0, &bytes), &bytes, ticket)
-        } else if let Some(columns) = look.columns_of(&bytes).filter(|_| kind.cold()) {
-            match cold_columns(columns.as_ref(), &bytes) {
+            self.claim(look, unit, record(Form::External, 0, bytes), bytes, ticket)
+        } else if let Some(columns) = look.columns_of(bytes).filter(|_| kind.cold()) {
+            match cold_columns(columns.as_ref(), bytes) {
                 Ok(payload) => self.claim(look, unit, record(Form::ColdColumns, 0, &payload), &payload, ticket),
                 Err(why) => return Ok(self.fail(kind, why)),
             }
         } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
-            match cold::compress_long(&bytes) {
+            match cold::compress_long(bytes) {
                 Ok(stored) => self.claim(look, unit, record(Form::Zstd, NO_DICTIONARY, &stored), &stored, ticket),
                 Err(why) => return Ok(self.fail(kind, why)),
             }
         } else if kind.cold()
             && let Some((number, dictionary)) = look.dictionary_of(kind)
         {
-            match cold::compress(dictionary, &bytes) {
+            match cold::compress(dictionary, bytes) {
                 Ok(stored) => self.claim(look, unit, record(Form::Zstd, number, &stored), &stored, ticket),
                 Err(why) => return Ok(self.fail(kind, why)),
             }
         } else {
             // A cold kind with no dictionary yet is kept raw and sampled, and its dictionary
             // trained on the samples.
-            self.claim(look, unit, record(Form::Raw, 0, &bytes), &bytes, ticket)
+            self.claim(look, unit, record(Form::Raw, 0, bytes), bytes, ticket)
         };
         self.end_put();
         match won {

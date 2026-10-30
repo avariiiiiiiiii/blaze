@@ -104,31 +104,56 @@ fn scalar(a: &[u8], b: &[u8], from: usize) -> Option<usize> {
 // the input (overlapping bytes already found equal, so the first difference in it is the
 // first of all); inputs shorter than `W` go to `scalar`, or a masked load on AVX-512.
 
+/// # Safety
+///
+/// The CPU has AVX-512BW, which `first_difference_with` asserts, and `b` is at least as long as
+/// `a`: every read is below `a.len()` in both.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
     use std::arch::x86_64::{__m512i, _mm512_cmpneq_epi8_mask, _mm512_loadu_si512, _mm512_maskz_loadu_epi8};
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
+    /// # Safety
+    ///
+    /// The CPU has AVX-512BW, and `pa` and `pb` each point at 64 readable bytes.
     #[inline]
     #[target_feature(enable = "avx512bw")]
     unsafe fn differ(pa: *const u8, pb: *const u8) -> u64 {
-        // SAFETY: the caller has 64 bytes at each pointer; the loads are unaligned.
-        unsafe { _mm512_cmpneq_epi8_mask(_mm512_loadu_si512(pa.cast::<__m512i>()), _mm512_loadu_si512(pb.cast::<__m512i>())) }
+        // SAFETY: the caller has 64 readable bytes at `pa`; the load is unaligned.
+        let x = unsafe { _mm512_loadu_si512(pa.cast::<__m512i>()) };
+        // SAFETY: as above, at `pb`.
+        let y = unsafe { _mm512_loadu_si512(pb.cast::<__m512i>()) };
+        _mm512_cmpneq_epi8_mask(x, y)
     }
     if n < 64 {
         let keep = (1u64 << n) - 1;
-        // SAFETY: masked-off lanes are not read (AVX-512 masked loads touch only the lanes of
-        // `keep`, the first `n` bytes of each slice), and both lanes read zero there.
-        let differ = unsafe { _mm512_cmpneq_epi8_mask(_mm512_maskz_loadu_epi8(keep, pa.cast()), _mm512_maskz_loadu_epi8(keep, pb.cast())) };
+        // SAFETY: the masked load touches only the lanes of `keep`, the first `n` bytes of `a`,
+        // and reads zero in the others.
+        let x = unsafe { _mm512_maskz_loadu_epi8(keep, pa.cast()) };
+        // SAFETY: as above, for `b`, as long as `a`.
+        let y = unsafe { _mm512_maskz_loadu_epi8(keep, pb.cast()) };
+        let differ = _mm512_cmpneq_epi8_mask(x, y);
         return (differ != 0).then(|| differ.trailing_zeros() as usize);
     }
     let mut at = 0;
     while at + 256 <= n {
-        // SAFETY: `at + 256 <= n`, the length of both slices.
-        let m = unsafe {
-            [differ(pa.add(at), pb.add(at)), differ(pa.add(at + 64), pb.add(at + 64)),
-             differ(pa.add(at + 128), pb.add(at + 128)), differ(pa.add(at + 192), pb.add(at + 192))]
-        };
+        // SAFETY: `at + 256 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 64 bytes from each end at or before `at + 256 <= n`.
+        let m0 = unsafe { differ(a0, b0) };
+        // SAFETY: as above.
+        let (a1, b1) = (unsafe { pa.add(at + 64) }, unsafe { pb.add(at + 64) });
+        // SAFETY: as above.
+        let m1 = unsafe { differ(a1, b1) };
+        // SAFETY: as above.
+        let (a2, b2) = (unsafe { pa.add(at + 128) }, unsafe { pb.add(at + 128) });
+        // SAFETY: as above.
+        let m2 = unsafe { differ(a2, b2) };
+        // SAFETY: as above.
+        let (a3, b3) = (unsafe { pa.add(at + 192) }, unsafe { pb.add(at + 192) });
+        // SAFETY: as above.
+        let m3 = unsafe { differ(a3, b3) };
+        let m = [m0, m1, m2, m3];
         if m[0] | m[1] | m[2] | m[3] != 0 {
             let k = m.iter().position(|&w| w != 0).expect("one of the four differs");
             return Some(at + 64 * k + m[k].trailing_zeros() as usize);
@@ -136,8 +161,10 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 256;
     }
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`.
-        let m = unsafe { differ(pa.add(at), pb.add(at)) };
+        // SAFETY: `at + 64 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 64 bytes from each end at or before `n`.
+        let m = unsafe { differ(a0, b0) };
         if m != 0 {
             return Some(at + m.trailing_zeros() as usize);
         }
@@ -145,8 +172,10 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 64;
-        // SAFETY: `n >= 64`, so `last + 64 == n`.
-        let m = unsafe { differ(pa.add(last), pb.add(last)) };
+        // SAFETY: `n >= 64`, so `last + 64 == n` and `last` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // SAFETY: the 64 bytes from each end at `n`.
+        let m = unsafe { differ(a0, b0) };
         if m != 0 {
             return Some(last + m.trailing_zeros() as usize);
         }
@@ -154,31 +183,51 @@ unsafe fn avx512(a: &[u8], b: &[u8]) -> Option<usize> {
     None
 }
 
+/// # Safety
+///
+/// The CPU has AVX2, which `first_difference_with` asserts, and `b` is at least as long as
+/// `a`: every read is below `a.len()` in both.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
     use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
     /// A bit per byte, set where the bytes are equal.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has AVX2, and `pa` and `pb` each point at 32 readable bytes.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn same(pa: *const u8, pb: *const u8) -> u32 {
-        // SAFETY: the caller has 32 bytes at each pointer; the loads are unaligned.
-        unsafe {
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(pa.cast::<__m256i>()), _mm256_loadu_si256(pb.cast::<__m256i>())))
-                as u32
-        }
+        // SAFETY: the caller has 32 readable bytes at `pa`; the load is unaligned.
+        let x = unsafe { _mm256_loadu_si256(pa.cast::<__m256i>()) };
+        // SAFETY: as above, at `pb`.
+        let y = unsafe { _mm256_loadu_si256(pb.cast::<__m256i>()) };
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32
     }
     if n < 32 {
         return scalar(a, b, 0);
     }
     let mut at = 0;
     while at + 128 <= n {
-        // SAFETY: `at + 128 <= n`, the length of both slices.
-        let m = unsafe {
-            [same(pa.add(at), pb.add(at)), same(pa.add(at + 32), pb.add(at + 32)),
-             same(pa.add(at + 64), pb.add(at + 64)), same(pa.add(at + 96), pb.add(at + 96))]
-        };
+        // SAFETY: `at + 128 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 32 bytes from each end at or before `at + 128 <= n`.
+        let m0 = unsafe { same(a0, b0) };
+        // SAFETY: as above.
+        let (a1, b1) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        // SAFETY: as above.
+        let m1 = unsafe { same(a1, b1) };
+        // SAFETY: as above.
+        let (a2, b2) = (unsafe { pa.add(at + 64) }, unsafe { pb.add(at + 64) });
+        // SAFETY: as above.
+        let m2 = unsafe { same(a2, b2) };
+        // SAFETY: as above.
+        let (a3, b3) = (unsafe { pa.add(at + 96) }, unsafe { pb.add(at + 96) });
+        // SAFETY: as above.
+        let m3 = unsafe { same(a3, b3) };
+        let m = [m0, m1, m2, m3];
         if m[0] & m[1] & m[2] & m[3] != u32::MAX {
             let all = u128::from(m[0]) | (u128::from(m[1]) << 32) | (u128::from(m[2]) << 64) | (u128::from(m[3]) << 96);
             return Some(at + (!all).trailing_zeros() as usize);
@@ -186,8 +235,10 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 128;
     }
     while at + 32 <= n {
-        // SAFETY: `at + 32 <= n`.
-        let m = unsafe { same(pa.add(at), pb.add(at)) };
+        // SAFETY: `at + 32 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 32 bytes from each end at or before `n`.
+        let m = unsafe { same(a0, b0) };
         if m != u32::MAX {
             return Some(at + (!m).trailing_zeros() as usize);
         }
@@ -195,8 +246,10 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 32;
-        // SAFETY: `n >= 32`, so `last + 32 == n`.
-        let m = unsafe { same(pa.add(last), pb.add(last)) };
+        // SAFETY: `n >= 32`, so `last + 32 == n` and `last` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // SAFETY: the 32 bytes from each end at `n`.
+        let m = unsafe { same(a0, b0) };
         if m != u32::MAX {
             return Some(last + (!m).trailing_zeros() as usize);
         }
@@ -204,30 +257,51 @@ unsafe fn avx2(a: &[u8], b: &[u8]) -> Option<usize> {
     None
 }
 
+/// # Safety
+///
+/// The CPU has SSE2, which `first_difference_with` asserts, and `b` is at least as long as
+/// `a`: every read is below `a.len()` in both.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
     use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
     /// A bit per byte in the low 16, set where the bytes are equal.
+    ///
+    /// # Safety
+    ///
+    /// The CPU has SSE2, and `pa` and `pb` each point at 16 readable bytes.
     #[inline]
     #[target_feature(enable = "sse2")]
     unsafe fn same(pa: *const u8, pb: *const u8) -> u16 {
-        // SAFETY: the caller has 16 bytes at each pointer; the loads are unaligned.
-        unsafe {
-            _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(pa.cast::<__m128i>()), _mm_loadu_si128(pb.cast::<__m128i>()))) as u16
-        }
+        // SAFETY: the caller has 16 readable bytes at `pa`; the load is unaligned.
+        let x = unsafe { _mm_loadu_si128(pa.cast::<__m128i>()) };
+        // SAFETY: as above, at `pb`.
+        let y = unsafe { _mm_loadu_si128(pb.cast::<__m128i>()) };
+        _mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u16
     }
     if n < 16 {
         return scalar(a, b, 0);
     }
     let mut at = 0;
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`, the length of both slices.
-        let m = unsafe {
-            [same(pa.add(at), pb.add(at)), same(pa.add(at + 16), pb.add(at + 16)),
-             same(pa.add(at + 32), pb.add(at + 32)), same(pa.add(at + 48), pb.add(at + 48))]
-        };
+        // SAFETY: `at + 64 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 16 bytes from each end at or before `at + 64 <= n`.
+        let m0 = unsafe { same(a0, b0) };
+        // SAFETY: as above.
+        let (a1, b1) = (unsafe { pa.add(at + 16) }, unsafe { pb.add(at + 16) });
+        // SAFETY: as above.
+        let m1 = unsafe { same(a1, b1) };
+        // SAFETY: as above.
+        let (a2, b2) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        // SAFETY: as above.
+        let m2 = unsafe { same(a2, b2) };
+        // SAFETY: as above.
+        let (a3, b3) = (unsafe { pa.add(at + 48) }, unsafe { pb.add(at + 48) });
+        // SAFETY: as above.
+        let m3 = unsafe { same(a3, b3) };
+        let m = [m0, m1, m2, m3];
         if m[0] & m[1] & m[2] & m[3] != u16::MAX {
             let all = u64::from(m[0]) | (u64::from(m[1]) << 16) | (u64::from(m[2]) << 32) | (u64::from(m[3]) << 48);
             return Some(at + (!all).trailing_zeros() as usize);
@@ -235,8 +309,10 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 64;
     }
     while at + 16 <= n {
-        // SAFETY: `at + 16 <= n`.
-        let m = unsafe { same(pa.add(at), pb.add(at)) };
+        // SAFETY: `at + 16 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 16 bytes from each end at or before `n`.
+        let m = unsafe { same(a0, b0) };
         if m != u16::MAX {
             return Some(at + (!m).trailing_zeros() as usize);
         }
@@ -244,8 +320,10 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 16;
-        // SAFETY: `n >= 16`, so `last + 16 == n`.
-        let m = unsafe { same(pa.add(last), pb.add(last)) };
+        // SAFETY: `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // SAFETY: the 16 bytes from each end at `n`.
+        let m = unsafe { same(a0, b0) };
         if m != u16::MAX {
             return Some(last + (!m).trailing_zeros() as usize);
         }
@@ -253,6 +331,10 @@ unsafe fn sse2(a: &[u8], b: &[u8]) -> Option<usize> {
     None
 }
 
+/// # Safety
+///
+/// The CPU has NEON, which `first_difference_with` asserts, and `b` is at least as long as
+/// `a`: every read is below `a.len()` in both.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
@@ -260,11 +342,18 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
         uint8x16_t, vandq_u8, vceqq_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16,
     };
     let (n, pa, pb) = (a.len(), a.as_ptr(), b.as_ptr());
+    /// # Safety
+    ///
+    /// The CPU has NEON, and `pa` and `pb` each point at 16 readable bytes.
     #[inline]
     #[target_feature(enable = "neon")]
     unsafe fn eq(pa: *const u8, pb: *const u8) -> uint8x16_t {
-        // SAFETY: the caller has 16 bytes at each pointer; `vld1q_u8` has no alignment requirement.
-        unsafe { vceqq_u8(vld1q_u8(pa), vld1q_u8(pb)) }
+        // SAFETY: the caller has 16 readable bytes at `pa`; `vld1q_u8` has no alignment
+        // requirement.
+        let x = unsafe { vld1q_u8(pa) };
+        // SAFETY: as above, at `pb`.
+        let y = unsafe { vld1q_u8(pb) };
+        vceqq_u8(x, y)
     }
     /// Four bits per byte (shift right and narrow), all set where the bytes are equal: the
     /// movemask NEON lacks, one instruction.
@@ -278,11 +367,23 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 64 <= n {
-        // SAFETY: `at + 64 <= n`, the length of both slices.
-        let e = unsafe {
-            [eq(pa.add(at), pb.add(at)), eq(pa.add(at + 16), pb.add(at + 16)),
-             eq(pa.add(at + 32), pb.add(at + 32)), eq(pa.add(at + 48), pb.add(at + 48))]
-        };
+        // SAFETY: `at + 64 <= n`, the length of both slices, so `at` is inside both.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 16 bytes from each end at or before `at + 64 <= n`.
+        let e0 = unsafe { eq(a0, b0) };
+        // SAFETY: as above.
+        let (a1, b1) = (unsafe { pa.add(at + 16) }, unsafe { pb.add(at + 16) });
+        // SAFETY: as above.
+        let e1 = unsafe { eq(a1, b1) };
+        // SAFETY: as above.
+        let (a2, b2) = (unsafe { pa.add(at + 32) }, unsafe { pb.add(at + 32) });
+        // SAFETY: as above.
+        let e2 = unsafe { eq(a2, b2) };
+        // SAFETY: as above.
+        let (a3, b3) = (unsafe { pa.add(at + 48) }, unsafe { pb.add(at + 48) });
+        // SAFETY: as above.
+        let e3 = unsafe { eq(a3, b3) };
+        let e = [e0, e1, e2, e3];
         if same(vandq_u8(vandq_u8(e[0], e[1]), vandq_u8(e[2], e[3]))) != u64::MAX {
             for (k, &e) in e.iter().enumerate() {
                 let m = same(e);
@@ -295,8 +396,10 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
         at += 64;
     }
     while at + 16 <= n {
-        // SAFETY: `at + 16 <= n`.
-        let m = same(unsafe { eq(pa.add(at), pb.add(at)) });
+        // SAFETY: `at + 16 <= n`, so `at` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });
+        // SAFETY: the 16 bytes from each end at or before `n`.
+        let m = same(unsafe { eq(a0, b0) });
         if m != u64::MAX {
             return Some(at + (!m).trailing_zeros() as usize / 4);
         }
@@ -304,8 +407,10 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     }
     if at < n {
         let last = n - 16;
-        // SAFETY: `n >= 16`, so `last + 16 == n`.
-        let m = same(unsafe { eq(pa.add(last), pb.add(last)) });
+        // SAFETY: `n >= 16`, so `last + 16 == n` and `last` is inside both slices.
+        let (a0, b0) = (unsafe { pa.add(last) }, unsafe { pb.add(last) });
+        // SAFETY: the 16 bytes from each end at `n`.
+        let m = same(unsafe { eq(a0, b0) });
         if m != u64::MAX {
             return Some(last + (!m).trailing_zeros() as usize / 4);
         }

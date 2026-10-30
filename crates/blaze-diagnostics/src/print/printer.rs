@@ -133,10 +133,6 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         let _ = write!(self.out, "{}", name.display_no_db(edition));
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.out.len()
-    }
-
     /// rustc's `should_truncate`: more types printed than the length limit allows.
     pub(crate) fn should_truncate(&self) -> bool {
         self.mode.type_limit.is_some_and(|limit| self.printed_type_count > limit)

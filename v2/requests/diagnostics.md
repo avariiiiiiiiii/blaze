@@ -1835,6 +1835,8 @@ in each to keep only the first: the others stop early (at their own site, or at 
 placeholder), but they still re-walk part of the signature and, for E0109, re-resolve the
 path's prefixes. With the group at the source, lowering is one pass per error.
 
+> forwarded to db (`hir-ty` `lower/path.rs`, `infer`, `hir`).
+
 ## diagnostics-bodies-members: what E0599 of a path and `..` without a base need from hir (crates/hir `diagnostics.rs`, crates/hir-ty `infer/path.rs`, crates/hir-ide `diagnostics/expr.rs`)
 
 From `diagnostics-bodies-members` (report `/tmp/blaze-lanes/v2-diagnostics-bodies-members.md`).
@@ -1856,6 +1858,8 @@ From `diagnostics-bodies-members` (report `/tmp/blaze-lanes/v2-diagnostics-bodie
    `lower/missing_fields.rs` gives E0797 only when a field without a default is missing; with
    the variant it gives these forms in `default_fields`.
 
+> applied (hir-ide): `ExprValidator` also reports a struct expression with `..`, no base, and no field without a default left out, as `RecordMissingFields` with an empty `missed_fields` (`record_literal_spread_only` in `diagnostics/expr.rs`); `record_literal_missing_fields`, which the IDE reads, still answers `None` there. forwarded to db: item 1, and for item 2 `hir`'s conversion (`hir/src/diagnostics.rs:1792`) giving `MissingFields` its `variant` and making one for an empty list (`ide-diagnostics`' handler must then skip an empty list).
+
 ## diagnostics-lints-bodies-calls-desugar: typeck's prelude-collision lints (crates/hir-ty `method_resolution`, crates/hir `diagnostics.rs`)
 
 From `diagnostics-lints-bodies-calls-desugar` (report
@@ -1876,6 +1880,8 @@ qualified call. Why:
 warn there; `ShadowedIntoIter` is a different lint and sees `MyIntoIter::into_iter`. Its test
 in `tests/lints/bodies/calls/desugar.rs` is `#[ignore]`d until this lands.
 
+> forwarded to db (inference and `hir`; `method_resolution.rs` is items' file, held now by speed-types-probe, which db asks for the pick).
+
 ## diagnostics-lints-bodies-calls-desugar: the UI harness's `std` ignores its `#[lang]` items (crates/blaze-diagnostics `tests/lints/bodies/calls.rs`, `tests/lints/bodies/calls/items.rs`)
 
 For `diagnostics-lints-bodies-calls` and `diagnostics-lints-bodies-calls-items`.
@@ -1890,6 +1896,8 @@ Also in `calls.rs`: compiletest gives `-A unused -W unused_attributes` to every 
 `check-pass` ones; `Test::Fails` should get them too (`crate::tests::compiletest(Mode::Other,
 ..)` already does this).
 
+> forwarded to diagnostics: its own tests.
+
 ## diagnostics-lints-bodies-calls-desugar: coroutine witness types for significant drops (crates/hir-ty)
 
 No new request: `db-ty` item 7 (`coroutine_witnesses`) covers it. `IfLetRescope`'s list of
@@ -1898,12 +1906,16 @@ witness through `Interner::coroutine_hidden_types`, as rustc's `NeedsDropTypes` 
 `mir_coroutine_witnesses`; it is empty today, so an `if let` on a future holding a significant
 drop across an `.await` is not linted until that lands.
 
+> applied: noted; no new request (db-ty 7, forwarded to db and codegen in pass 1).
+
 ## diagnostics-lints-bodies-calls-desugar: `#[rustc_insignificant_dtor]` as an attribute flag (crates/hir-def `attrs.rs`)
 
 What: `AttrFlags::RUSTC_INSIGNIFICANT_DTOR`, read for ADTs. Why: `significant_drop.rs` reads
 the attribute by expanding the ADT's attributes (once per ADT per body); a flag is a lookup
 and matches how `rustc_skip_during_method_dispatch` is read. Optional: the lint is correct
 without it.
+
+> forwarded to db (`hir-def/src/attrs.rs`).
 
 ## diagnostics-lints-levels: a lint's `LintId` on `Found` (`lower/mod.rs`, `diagnostics`)
 
@@ -1913,3 +1925,81 @@ lint is made (`registry::lint("name")` once, in a `static` or `OnceLock` per pas
 hashes each lint's name (`registry::declared`) to find its lint, because the name in
 `Code::Lint(String)` is all a `Found` has. With the id it is a 2-byte read. Until then it is one
 FxHash of a short name per lint found, which is correct.
+
+> forwarded to diagnostics: its own crate.
+
+## diagnostics-lints-bodies-types: the per-item diagnostic item is in use; three more for speed
+
+From diagnostics-lints-bodies-types, 2026-10-29. `lints/bodies/types/util.rs` now calls
+`AttrFlags::diagnostic_item` (the source reader is gone) and returns `Symbol`s, compared by
+pointer against symbols each pass interns once. The reverse map is still wanted.
+
+1. **db (`crates/hir-def/src/expr_store/scope.rs`)**: make `ScopeEntry::hygiene` public, or add
+   `ExprScopes::resolve_local(scope, name, hygiene) -> Option<BindingId>`. Why: `util::path_value`
+   (rustc's `qpath_res`) answers a path from type checking's tables or its `FnDef` type when it
+   can't name a local, but a one-segment path a binding in scope shares a name with (`&x`,
+   `x.f()`, every local read) still builds a `Resolver`, because only the hygiene tells that
+   binding from an item. With the hygiene it is a walk of the scope chain, no allocation.
+   Better still, and asked by `-casts` above: type checking records each value path's
+   resolution in `InferenceResult`, as rustc's typeck results do, so it is one lookup.
+2. **db (`crates/hir-def/src/attrs.rs`)**: `AttrFlags` bits `RUSTC_AS_PTR`,
+   `RUSTC_NO_IMPLICIT_AUTOREFS`, `RUSTC_NEVER_RETURNS_NULL_PTR`. Why: `pointers::has_attr` reads
+   them from the function's source with `expand_cfg_attr` on each question (behind cheap gates,
+   but uncached); with the bits it is one test of a memoized word.
+3. **the parent (`crates/blaze-diagnostics/src/lints/bodies.rs`)**: the late walker allocates a
+   `Vec` of children at every expression and pattern it does not special-case, and calls every
+   pass through `Box<dyn LatePass>` at every node. The fastest known way is rustc's own
+   `declare_combined_late_lint_pass!` (one struct of all passes, static dispatch, inlined
+   `check_*`). Here: walk the store's columns directly (children as the CSR slices the view
+   gives, or one reused stack), and dispatch by the expression's kind tag to only the passes
+   that read that kind (`types` reads literals, unary `-`, comparisons, calls, method calls,
+   casts, borrows, derefs, fields, indexing and closures), as a static list. A per-body memo of
+   each call's callee (def and diagnostic item), shared by the passes, would save the repeated
+   `path_value` of one callee that several passes ask about.
+
+> for: db (1, 2), diagnostics (3).
+
+## diagnostics-lints-names-imports: what name resolution's lints need recorded (crates/hir-def `nameres`, `item_scope.rs`; crates/blaze-diagnostics `model.rs`, `lints/syntax.rs`)
+
+From diagnostics-lints-names-imports, 2026-10-29. `lints/names/imports/used.rs` recomputes
+rustc's `record_use` by resolving every path of the crate again, segment by segment, in
+hir-def's scopes and checking it against what hir resolved; where the two can't be matched it
+counts every candidate import as used, so it never lints what rustc may find used. Each item
+below replaces a guess with a record, or lets a lint that is now never emitted be decided.
+
+1. **db (`crates/hir-def/src/nameres`)**: a per-crate query `used_imports(krate) ->
+   FxHashMap<ImportOrExternCrate, Used>` (rustc's `import_use_map`, `Used::{Scope, Other}`),
+   filled where name resolution and body lowering resolve a path segment through an import, an
+   `extern crate` item or a `#[macro_use]` import, with the chain of imports it went through
+   (rustc's `record_use` and `find_transitive_imports`). Why: then `unused_imports`,
+   `unused_extern_crates`, `redundant_imports` and `macro_use_extern_crate` read one map, and
+   the re-resolution in `used.rs` (and its taint-on-doubt) goes.
+2. **db (`crates/hir-def/src/item_scope.rs`)**: keep every glob a name is found through when
+   two globs give it different definitions (rustc's ambiguity binding), per namespace, with
+   each glob's visibility. Why: `ambiguous_glob_imports` and `ambiguous_import_visibilities`
+   can't be decided without it (hir-def keeps the first glob), and `ambiguous_glob_reexports`
+   and `redundant_imports` now look the globs up again from the `use` items.
+3. **db (`crates/hir-def/src/item_scope.rs`)**: record the `use a::Tr as _` imports (unnamed
+   trait imports) with their visibility, and each import's own binding before it is
+   overwritten by a later one of the same name. Why: rustc's `max_vis` of a glob counts every
+   binding the glob makes, unnamed ones included; `globs.rs` now skips a glob whose source has
+   unnamed trait imports rather than guess.
+4. **db (`crates/hir-def/src/nameres.rs`)**: make `DefMap::prelude()` (the std prelude a module
+   sees) and the extern prelude readable from a `ModuleId`. Why: `redundant_imports` through the
+   std prelude (`use std::option::Option;`) is not linted now, because what the prelude gives
+   can't be asked.
+5. **diagnostics (`crates/blaze-diagnostics/src/model.rs`)**: let a lint carry an error code
+   (`Code` holds one of the two now). Why: rustc's `pub_use_of_private_extern_crate` prints as
+   `error[E0365]: ...`; it is emitted without `[E0365]` until then.
+6. **diagnostics-lints-syntax (`crates/blaze-diagnostics/src/lints/syntax.rs`)**: expose
+   `Tree::place` (or a `Walk::place(InFile<SyntaxNodePtr>)`). Why: `lints/names/imports.rs`
+   rebuilds the same places (`Places`) to interleave its buffered lints with the early pass
+   in rustc's order; one shared definition keeps the two orders from drifting.
+7. **db (`crates/hir-def/src/nameres/collector.rs`)**: record, per macro call, whether it was
+   resolved through `macro_rules!` textual scope or a path, and through which `#[macro_use]`
+   import; and per derive helper attribute whether it was used before its derive. Why:
+   `private_macro_use`, `out_of_scope_macro_calls`,
+   `macro_expanded_macro_exports_accessed_by_absolute_paths` and `legacy_derive_helpers` are
+   never emitted now.
+
+> for: db (1, 2, 3, 4, 7), diagnostics (5), diagnostics-lints-syntax (6).

@@ -32,8 +32,8 @@ const NONE: u32 = u32::MAX;
 
 /// A thin (not universal) Mach-O relocatable object (`MH_OBJECT`) for `arch`.
 pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, String> {
-    let mut buffer = Vec::new();
-    let data = aligned(bytes, &mut buffer);
+    // `object` reads every Mach-O struct in place at any alignment (feature `unaligned`).
+    let data = bytes;
     let magic = match data {
         [a, b, c, d, ..] => u32::from_be_bytes([*a, *b, *c, *d]),
         _ => return Err(format!("{name}: too short for a Mach-O header")),
@@ -277,17 +277,6 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
         libraries,
         directives: Vec::new(),
     })
-}
-
-/// `bytes`, or a copy of them 8-aligned: `object`'s structs are read in place.
-fn aligned<'a>(bytes: &'a [u8], buffer: &'a mut Vec<u8>) -> &'a [u8] {
-    if (bytes.as_ptr() as usize).is_multiple_of(8) {
-        return bytes;
-    }
-    buffer.resize(bytes.len() + 7, 0);
-    let start = (8 - buffer.as_ptr() as usize % 8) % 8;
-    buffer[start..start + bytes.len()].copy_from_slice(bytes);
-    &buffer[start..start + bytes.len()]
 }
 
 fn text<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str, String> {
@@ -1829,12 +1818,24 @@ mod tests {
         }
     }
 
+    /// An atom as the reader had it before it read in place: its section's name, its alignment,
+    /// a copy of its bytes (`Data::Bytes`) or `Data::Zero`, its own fixups.
     type Atom = (String, u64, Data, Vec<NativeFixup>);
+
+    /// A symbol with its name spelled out: name, definition, binding, kind, hidden.
+    type Seen = (String, SymbolDef, Binding, SymbolKind, bool);
+
+    fn seen(object: &Object) -> Vec<Seen> {
+        (object.symbols.iter())
+            .map(|it| (object.name(it.name).to_owned(), it.def, it.binding, it.kind, it.hidden))
+            .collect()
+    }
 
     /// The reader's rules for atoms, symbol sizes, section symbols and fixups, written the plain
     /// way the reader had them before its atoms became one sorted column: a `Vec` of starts and
-    /// of bounds per Mach-O section, linear scans, fixups pushed into each atom and sorted there.
-    fn model(obj: &Obj) -> (Vec<Atom>, Vec<Symbol>) {
+    /// of bounds per Mach-O section, linear scans, fixups pushed into each atom and sorted there,
+    /// each atom's bytes copied out of its section.
+    fn model(obj: &Obj) -> (Vec<Atom>, Vec<Seen>) {
         let n = obj.sections.len();
         let splits = |s: usize| obj.subsections && obj.sections[s].flags != macho::S_CSTRING_LITERALS;
         let mut starts: Vec<Vec<u64>> = vec![vec![0]; n];
@@ -1894,14 +1895,13 @@ mod tests {
             } else {
                 (SymbolDef::Undefined, SymbolKind::Other)
             };
-            symbols.push(Symbol {
-                name: crate::macho::core_name(sym.name.as_bytes()).unwrap(),
+            symbols.push((
+                crate::macho::core_name(sym.name.as_bytes()).unwrap(),
                 def,
-                binding: if sym.n_type & EXT != 0 { Binding::Global } else { Binding::Local },
+                if sym.n_type & EXT != 0 { Binding::Global } else { Binding::Local },
                 kind,
-                hidden: false,
-                import: None,
-            });
+                false,
+            ));
         }
 
         let mut section_symbols: Vec<Option<u32>> = vec![None; atoms.len()];
@@ -1926,14 +1926,13 @@ mod tests {
                     let j = atom(t, offset);
                     let at_atom = first[t] + j;
                     let symbol = *section_symbols[at_atom].get_or_insert_with(|| {
-                        symbols.push(Symbol {
-                            name: String::new(),
-                            def: SymbolDef::Section { section: at_atom as u32, value: 0, size: atoms[at_atom].2.len() },
-                            binding: Binding::Local,
-                            kind: SymbolKind::Section,
-                            hidden: false,
-                            import: None,
-                        });
+                        symbols.push((
+                            String::new(),
+                            SymbolDef::Section { section: at_atom as u32, value: 0, size: atoms[at_atom].2.len() },
+                            Binding::Local,
+                            SymbolKind::Section,
+                            false,
+                        ));
                         symbols.len() as u32 - 1
                     });
                     (Apply::Abs64, symbol, (offset - starts[t][j]) as i64)
@@ -2032,17 +2031,72 @@ mod tests {
     fn seeded_objects_read_as_the_per_section_model_reads_them() {
         for seed in 0..256 {
             let obj = seeded(seed);
-            let object = obj.read(Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let input = obj.bytes();
+            let object = read("test.o", &input, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
             let (atoms, symbols) = model(&obj);
             assert_eq!(object.sections.len(), atoms.len(), "seed {seed}");
             for (i, (got, (name, align, data, fixups))) in object.sections.iter().zip(&atoms).enumerate() {
                 assert_eq!(
-                    (&got.name, got.align, &got.data, &got.fixups, got.retain),
-                    (name, *align, data, fixups, false),
+                    (
+                        object.name(got.name),
+                        got.align,
+                        got.data.len(),
+                        got.data.bytes(&input),
+                        object.section_fixups(got),
+                        got.retain,
+                    ),
+                    (name.as_str(), *align, data.len(), data.bytes(&[]), &fixups[..], false),
                     "seed {seed}, atom {i}"
                 );
             }
-            assert_eq!(object.symbols, symbols, "seed {seed}");
+            assert_eq!(seen(&object), symbols, "seed {seed}");
+            // The arena holds each Mach-O section's name once and each symbol's, nothing else.
+            let named = (obj.sections.iter()).map(|it| it.segment.len() + 1 + it.name.len()).sum::<usize>()
+                + symbols.iter().map(|it| it.0.len()).sum::<usize>();
+            assert_eq!(object.names.bytes(), named, "seed {seed}");
+            // Every fixup is in exactly one atom's run, in atom order.
+            let mut next = 0;
+            for section in &object.sections {
+                if !section.fixups.is_empty() {
+                    assert_eq!(section.fixups.start, next, "seed {seed}");
+                    next = section.fixups.end;
+                }
+            }
+            assert_eq!(next as usize, object.fixups.len(), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn every_input_range_holds_the_bytes_the_old_copy_held() {
+        for seed in 0..256 {
+            let obj = seeded(seed);
+            let bytes = obj.bytes();
+            let (atoms, _) = model(&obj);
+            let aligned = read("test.o", &bytes, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            // From unaligned slices too, read in place: the ranges are of the slice given.
+            for shift in [0, 1, 3, 7] {
+                let mut shifted = vec![0u8; shift];
+                shifted.extend_from_slice(&bytes);
+                let input = &shifted[shift..];
+                let object = read("test.o", input, Arch::Aarch64).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+                assert_eq!(object.sections.len(), atoms.len(), "seed {seed}");
+                for (i, (got, atom)) in object.sections.iter().zip(&atoms).enumerate() {
+                    match (&got.data, &atom.2) {
+                        (Data::Input(range), Data::Bytes(copy)) => {
+                            let held = usize::try_from(range.start)
+                                .ok()
+                                .zip(usize::try_from(range.end).ok())
+                                .and_then(|(start, end)| input.get(start..end));
+                            assert_eq!(held, Some(&copy[..]), "seed {seed}, shift {shift}, atom {i}");
+                            assert_eq!(got.data, aligned.sections[i].data, "seed {seed}, shift {shift}, atom {i}");
+                        }
+                        (Data::Zero(got), Data::Zero(want)) => {
+                            assert_eq!(got, want, "seed {seed}, shift {shift}, atom {i}");
+                        }
+                        (got, want) => panic!("seed {seed}, shift {shift}, atom {i}: {got:?}, the old copy {want:?}"),
+                    }
+                }
+            }
         }
     }
 }

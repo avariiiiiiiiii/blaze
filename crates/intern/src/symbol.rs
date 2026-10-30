@@ -1,12 +1,14 @@
 //! Interned strings: symbols declared at compile time ([`symbols`]) and ones interned at
 //! runtime, both never freed.
 //!
-//! A [`Symbol`] points at a `&'static str`: a declared symbol's is a `static`, a runtime one's
-//! sits in the append-only arena of [`crate::arena`] beside its bytes. The table is filled with
-//! the declared symbols first, so interning a declared symbol's text gives the declared symbol.
+//! A [`Symbol`] points at a [`Text`]: its `&'static str` and its order key. A declared symbol's
+//! is a `static`, a runtime one's sits in the append-only arena of [`crate::arena`] beside its
+//! bytes. The table is filled with the declared symbols first, so interning a declared symbol's
+//! text gives the declared symbol.
 
 use std::{
     alloc::Layout,
+    cmp::Ordering,
     fmt,
     hash::BuildHasher,
     ptr::NonNull,
@@ -19,16 +21,47 @@ use crate::arena::{Entry, Store};
 
 pub mod symbols;
 
-/// # Invariant
-///
-/// `repr` points at a `&'static str` that never moves, changes or is freed: a `static`, or one
-/// in [`STORE`]'s arena. Two symbols are one string exactly when they are one pointer.
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
-pub struct Symbol {
-    repr: NonNull<&'static str>,
+/// The order key of a name: its first 8 bytes big-endian, zero-padded. Two keys compare as the
+/// names' first 8 bytes do, so `order_key(a) < order_key(b)` implies `a < b` and only equal
+/// keys need the bytes compared.
+#[inline]
+pub const fn order_key(bytes: &[u8]) -> u64 {
+    let mut key = [0u8; 8];
+    let mut i = 0;
+    while i < 8 && i < bytes.len() {
+        key[i] = bytes[i];
+        i += 1;
+    }
+    u64::from_be_bytes(key)
 }
 
-// SAFETY: A `Symbol` is a shared reference to a `&'static str` that is never written again.
+/// What a [`Symbol`] points at: 24 bytes, the order key read by [`Symbol::cmp_order`] beside
+/// the text.
+#[repr(C)]
+pub(crate) struct Text {
+    key: u64,
+    str: &'static str,
+}
+
+const _: () = assert!(size_of::<Text>() == 8 + size_of::<&str>());
+
+impl Text {
+    pub(crate) const fn new(str: &'static str) -> Text {
+        Text { key: order_key(str.as_bytes()), str }
+    }
+}
+
+/// # Invariant
+///
+/// `repr` points at a [`Text`] that never moves, changes or is freed: a `static`, or one in
+/// [`STORE`]'s arena, its `key` the [`order_key`] of its `str`. Two symbols are one string
+/// exactly when they are one pointer.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct Symbol {
+    repr: NonNull<Text>,
+}
+
+// SAFETY: A `Symbol` is a shared reference to a `Text` that is never written again.
 unsafe impl Send for Symbol {}
 unsafe impl Sync for Symbol {}
 
@@ -55,8 +88,8 @@ fn hash(s: &str) -> u64 {
 /// Makes `symbol` the one `Symbol::intern` gives for its text, unless one is already.
 fn prefill_one(store: &Store, symbol: Symbol) {
     let s = symbol.as_str();
-    // SAFETY: Every value of the store is a `&'static str`, as `Symbol::repr` points at.
-    let same = |at: NonNull<u8>| unsafe { *at.cast::<&'static str>().as_ref() == s };
+    // SAFETY: Every value of the store is a `Text`, as `Symbol::repr` points at.
+    let same = |at: NonNull<u8>| unsafe { at.cast::<Text>().as_ref().str == s };
     if let Entry::Vacant(vacant) = store.entry(hash(s), same) {
         vacant.publish(symbol.repr.cast());
     }
@@ -64,31 +97,32 @@ fn prefill_one(store: &Store, symbol: Symbol) {
 
 impl Symbol {
     /// The symbol of the `static` `r`.
-    pub(crate) const fn from_static(r: &'static &'static str) -> Symbol {
+    pub(crate) const fn from_static(r: &'static Text) -> Symbol {
         // SAFETY: A reference is not null.
-        Symbol { repr: unsafe { NonNull::new_unchecked((r as *const &'static str).cast_mut()) } }
+        Symbol { repr: unsafe { NonNull::new_unchecked((r as *const Text).cast_mut()) } }
     }
 
     pub fn intern(s: &str) -> Self {
         let store = store();
-        // SAFETY: Every value of the store is a `&'static str`.
-        let same = |at: NonNull<u8>| unsafe { *at.cast::<&'static str>().as_ref() == s };
+        // SAFETY: Every value of the store is a `Text`.
+        let same = |at: NonNull<u8>| unsafe { at.cast::<Text>().as_ref().str == s };
         let at = match store.entry(hash(s), same) {
             Entry::Found(at) => at,
             Entry::Vacant(vacant) => {
-                let (layout, bytes_at) = Layout::new::<&'static str>()
+                let (layout, bytes_at) = Layout::new::<Text>()
                     .extend(Layout::array::<u8>(s.len()).expect("a symbol's layout"))
                     .expect("a symbol's layout");
+                let key = order_key(s.as_bytes());
                 vacant.insert(layout, |to| {
-                    // SAFETY: `to` is fresh memory of `layout`: a `&str` and, at `bytes_at`,
+                    // SAFETY: `to` is fresh memory of `layout`: a `Text` and, at `bytes_at`,
                     // `s.len()` bytes. Neither moves or is freed, so the `&str` written points
                     // at bytes that live for `'static`.
                     unsafe {
                         let bytes = to.as_ptr().add(bytes_at);
                         bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
                         let bytes = std::slice::from_raw_parts(bytes, s.len());
-                        let text: &'static str = std::str::from_utf8_unchecked(bytes);
-                        to.cast::<&'static str>().write(text);
+                        let str: &'static str = std::str::from_utf8_unchecked(bytes);
+                        to.cast::<Text>().write(Text { key, str });
                     }
                 })
             }
@@ -102,13 +136,32 @@ impl Symbol {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        // SAFETY: `repr`'s invariant.
-        unsafe { *self.repr.as_ref() }
+        self.as_static().str
     }
 
-    /// The `&'static str` the symbol points at.
+    /// The symbol's [`order_key`], stored beside it when it was interned.
     #[inline]
-    pub(crate) fn as_static(&self) -> &'static &'static str {
+    pub fn order_key(&self) -> u64 {
+        self.as_static().key
+    }
+
+    /// The order of `self.as_str().cmp(other.as_str())`: the order keys first, the bytes only
+    /// when they tie.
+    #[inline]
+    pub fn cmp_order(&self, other: &Symbol) -> Ordering {
+        if self == other {
+            return Ordering::Equal;
+        }
+        let (a, b) = (self.as_static(), other.as_static());
+        match a.key.cmp(&b.key) {
+            Ordering::Equal => a.str.as_bytes().cmp(b.str.as_bytes()),
+            unequal => unequal,
+        }
+    }
+
+    /// The `Text` the symbol points at.
+    #[inline]
+    pub(crate) fn as_static(&self) -> &'static Text {
         // SAFETY: `repr`'s invariant.
         unsafe { self.repr.as_ref() }
     }
@@ -205,5 +258,87 @@ mod tests {
                 assert_eq!(symbol, seen[0][n as usize]);
             }
         }
+    }
+
+    #[test]
+    fn order_keys() {
+        assert_eq!(order_key(b""), 0);
+        assert_eq!(order_key(b"a"), 0x61 << 56);
+        assert_eq!(order_key(b"abcdefgh"), u64::from_be_bytes(*b"abcdefgh"));
+        assert_eq!(order_key(b"abcdefghij"), u64::from_be_bytes(*b"abcdefgh"));
+        assert_eq!(order_key(b"a\0"), order_key(b"a"));
+        for s in ["", "a", "self", "a much longer runtime symbol", "ünïcödé"] {
+            assert_eq!(Symbol::intern(s).order_key(), order_key(s.as_bytes()));
+        }
+        assert_eq!(sym::self_.order_key(), order_key(b"self"));
+        assert_eq!(sym::Integer::get(42).order_key(), order_key(b"42"));
+        assert_eq!(sym::RaGeneratedName::get(7).order_key(), order_key(b"<ra@gennew>7"));
+    }
+
+    fn check_order(names: &[&str]) {
+        let symbols: Vec<Symbol> = names.iter().map(|s| Symbol::intern(s)).collect();
+        for a in &symbols {
+            for b in &symbols {
+                assert_eq!(a.cmp_order(b), a.as_str().cmp(b.as_str()), "{a:?} against {b:?}");
+            }
+        }
+        let mut by_key = symbols.clone();
+        by_key.sort_by(Symbol::cmp_order);
+        let mut by_str = symbols;
+        by_str.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(by_key, by_str);
+    }
+
+    #[test]
+    fn cmp_order_is_str_order() {
+        check_order(&[
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "a\0b",
+            "a\u{1}",
+            "ab",
+            "abcdefgh",
+            "abcdefgh\0",
+            "abcdefgha",
+            "abcdefghb",
+            "abcdefgi",
+            "self",
+            "Self",
+            "_",
+            "~",
+            "\u{7f}",
+            "ünïcödé",
+            "ü",
+            "0",
+            "255",
+            "256",
+            "<ra@gennew>3",
+            "<ra@gennew>30",
+        ]);
+    }
+
+    #[test]
+    fn cmp_order_matches_str_order_on_random_names() {
+        // A splitmix64 stream: seeded, so a failure reproduces.
+        let mut state = 0x5eed_0f0d_e5u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        // Few letters and lengths around 8 so that many names share an order key.
+        let alphabet = ['\0', 'a', 'b', 'é', '_'];
+        let names: Vec<String> = (0..400)
+            .map(|_| {
+                let len = (next() % 13) as usize;
+                (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect()
+            })
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        check_order(&names);
     }
 }

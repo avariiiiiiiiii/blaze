@@ -4,12 +4,25 @@ use super::*;
 
 #[test]
 fn lint_ids_are_dense_and_round_trip() {
-    let all = lints().iter().chain(internal_lints()).chain(unregistered());
+    let all = lints().iter().chain(blaze_lints()).chain(internal_lints()).chain(unregistered());
     for (at, lint) in all.enumerate() {
         let id = LintId::of(lint);
         assert_eq!(usize::from(id.0), at, "{}", lint.name);
         assert!(std::ptr::eq(id.lint(), lint), "{}", lint.name);
     }
+}
+
+#[test]
+fn blaze_is_a_tool_with_one_lint() {
+    let store = Store::default();
+    let lint = lint("blaze::const_impure").expect("blaze's lint");
+    assert_eq!(lint.default_level, Level::Warn);
+    assert_eq!(blaze_lints().len(), 1);
+    assert_eq!(store.check("const_impure", Some(BLAZE_TOOL)), Checked::Tool(vec![lint], None));
+    assert_eq!(store.find_lints("blaze::const_impure"), Some(vec![lint]));
+    assert!(matches!(store.check("const_purity", Some(BLAZE_TOOL)), Checked::NoLint(_)));
+    assert_eq!(store.check("const_impure", Some("blazer")), Checked::NoTool);
+    assert_eq!(store.group_of(lint), None);
 }
 
 #[test]

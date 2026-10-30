@@ -48,6 +48,27 @@ fn image_of(address: *const c_void) -> Option<(u64, *const c_char)> {
     (unsafe { dladdr(address, &mut info) } != 0).then_some((info.fbase as u64, info.fname))
 }
 
+/// Where the image that has `address` starts, for the platforms' check that a patch's data
+/// is in the image it was linked for.
+pub(super) fn image_base(address: u64) -> Option<u64> {
+    image_of(address as *const c_void).map(|it| it.0)
+}
+
+/// Checks that the first and the last byte of `range` are in the image at `base`. The loader
+/// maps an image as one run of addresses; a gap within it is refused by the platform's walk
+/// of the mappings (unmapped, or mapped with no access).
+pub(super) fn in_image(range: &std::ops::Range<u64>, base: u64) -> Result<(), String> {
+    let last = range.end.saturating_sub(1).max(range.start);
+    if image_base(range.start) == Some(base) && image_base(last) == Some(base) {
+        Ok(())
+    } else {
+        Err(format!(
+            "data at {:#x}..{:#x}, outside the image at {base:#x}",
+            range.start, range.end
+        ))
+    }
+}
+
 /// The descriptor of the image `base` from `handle`, if that is where `handle` finds it.
 fn lookup(handle: *mut c_void, name: &CStr, base: u64) -> Option<u64> {
     if handle.is_null() {

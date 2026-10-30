@@ -25,10 +25,10 @@ use syntax::{
 
 use crate::item_tree::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, Impl,
-    ImportAlias, Interned, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId,
+    ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId,
     ModPath, NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias,
     Union, Use, UseTree, UseTreeId, VisibilityExplicitness,
-    attrs::{OutlineFn, lower_attrs_into},
+    attrs::lower_attrs_into,
 };
 
 /// The index of the next element of an array `len` long, as a tree's `u32` ids count. The top
@@ -101,7 +101,7 @@ struct TreeBuilder {
     ctor_vis: Vec<RawVisibilityId>,
 
     names: FxIndexSet<Name>,
-    paths: FxIndexSet<Interned<ModPath>>,
+    paths: FxIndexSet<ModPath>,
     vis: FxIndexSet<RawVisibility>,
 
     attr_owners: Vec<AttrOwner>,
@@ -162,7 +162,7 @@ impl TreeBuilder {
         NameId { raw: id(self.names.insert_full(name).0) }
     }
 
-    fn path(&mut self, path: Interned<ModPath>) -> PathId {
+    fn path(&mut self, path: ModPath) -> PathId {
         PathId { raw: id(self.paths.insert_full(path).0) }
     }
 
@@ -423,10 +423,7 @@ impl<'db> Ctx<'db> {
             // FIXME: Handle `global_asm!()`.
             ast::Item::AsmExpr(_) => return None,
         };
-        match item {
-            ast::Item::Fn(func) => self.lower_attrs(mod_item, &OutlineFn(func.clone())),
-            _ => self.lower_attrs(mod_item, item),
-        }
+        self.lower_attrs(mod_item, item);
 
         Some(mod_item)
     }
@@ -637,9 +634,8 @@ impl<'db> Ctx<'db> {
         let span_map = self.span_map();
         let path = m.path()?;
         let range = path.syntax().text_range();
-        let path = Interned::new(ModPath::from_src(self.db, path, &mut |range| {
-            span_map.span_for_range(range).ctx
-        })?);
+        let path =
+            ModPath::from_src(self.db, path, &mut |range| span_map.span_for_range(range).ctx)?;
         let ast_id = self.source_ast_id_map.ast_id(m);
         let expand_to = hir_expand::ExpandTo::from_call_site(m);
         let res = MacroCall {
@@ -686,10 +682,7 @@ impl<'db> Ctx<'db> {
                 ast::ExternItem::MacroCall(call) => self.lower_macro_call(call),
             };
             let Some(mod_item) = mod_item else { continue };
-            match &item {
-                ast::ExternItem::Fn(func) => self.lower_attrs(mod_item, &OutlineFn(func.clone())),
-                _ => self.lower_attrs(mod_item, &item),
-            }
+            self.lower_attrs(mod_item, &item);
             self.tree.pending_items.push(mod_item);
         }
         let children = self.tree.items_since(mark);
@@ -776,7 +769,7 @@ impl UseTreeLowering<'_> {
             }
 
             let path = match prefix {
-                Some(prefix) => self.tree.path(Interned::new(prefix)),
+                Some(prefix) => self.tree.path(prefix),
                 None => PathId::NONE,
             };
             let list = self.tree.use_tree_list_since(mark);
@@ -810,7 +803,7 @@ impl UseTreeLowering<'_> {
                     }
                     self.map(&tree);
                     let path = match path {
-                        Some(path) => self.tree.path(Interned::new(path)),
+                        Some(path) => self.tree.path(path),
                         None => PathId::NONE,
                     };
                     Some(self.tree.use_tree(UseTree {
@@ -826,7 +819,7 @@ impl UseTreeLowering<'_> {
                 (None, Some(_), false) => None,
                 (Some(path), alias, false) => {
                     self.map(&tree);
-                    let path = self.tree.path(Interned::new(path));
+                    let path = self.tree.path(path);
                     let alias = self.tree.alias(alias);
                     Some(self.tree.use_tree(UseTree {
                         kind: UseTree::SINGLE,
@@ -878,5 +871,5 @@ pub(crate) fn visibility_from_ast(
         }
         ast::VisibilityKind::Pub => return RawVisibility::Public,
     };
-    RawVisibility::Module(Interned::new(path), VisibilityExplicitness::Explicit)
+    RawVisibility::Module(path, VisibilityExplicitness::Explicit)
 }

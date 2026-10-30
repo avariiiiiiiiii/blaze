@@ -152,6 +152,8 @@ the loads (`_mm512_loadu_si512`, `_mm512_maskz_loadu_epi8`, `_mm256_loadu_si256`
 function with the feature, so each load and each `add` is one op. One comment above a `let` covers
 every single-op block in that statement's tuple.
 
+> applied (proof DONE): `bytes.rs`: `# Safety` on the four vector paths and their inner compares; every load, `add` and call in its own block, in the same order, with the proposed comments; `main.rs` says `#![forbid(unsafe_code)]`.
+
 ### blaze-v2-proof
 
 - `crates/blaze-v2-proof/src/bytes.rs:109` `avx512`, `:159` `avx2`, `:209` `sse2`, `:258` `neon`: no `# Safety`. Proposed, above each `#[cfg]`: `/// # Safety\n///\n/// The CPU has AVX-512BW (AVX2, SSE2, NEON), which `first_difference_with` asserts, and `b` is at least as long as `a`: every read is below `a.len()` in both.`

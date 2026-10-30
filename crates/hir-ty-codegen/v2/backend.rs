@@ -15,11 +15,20 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use cranelift_codegen::{ir, isa::TargetIsa};
-use smallvec::SmallVec;
 use hir_def::{
-    DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body, signatures::FunctionSignature,
+    DefWithBodyId, HasModule,
+    attrs::AttrFlags,
+    expr_store::{
+        Body,
+        scope::{ExprScopes, ScopeId},
+    },
+    hir::BindingId,
+    signatures::FunctionSignature,
 };
 use hir_ty::{ParamEnvAndCrate, db::HirDatabase, next_solver::ParamEnv};
+use hir_ty_mir::mir::MirSpan;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     Built, DataPlace, Function, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
@@ -176,11 +185,11 @@ impl Backends<'_> {
             _ => Vec::new(),
         };
         let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
-        let variables = match (&source, variables) {
-            (Some((owner, _)), Some((_, variables))) if told => {
-                named(db, hashes, *owner, &variables).map_err(fail)?
+        let (variables, scopes) = match (&source, variables) {
+            (Some((owner, spans)), Some((_, variables))) if told => {
+                named(db, hashes, *owner, &variables, spans).map_err(fail)?
             }
-            _ => Vec::new(),
+            _ => Default::default(),
         };
         if let Built::Ir(pending) = &mut code {
             if !lines {
@@ -195,6 +204,7 @@ impl Backends<'_> {
             places,
             spans,
             variables,
+            scopes,
             hint: hint(db, instance),
             release: Default::default(),
             foldable: foldable(db, instance),
@@ -280,30 +290,105 @@ fn assembled(text: &str) -> Result<Built, String> {
     Ok(Built::Assembled(code, Requests::default()))
 }
 
-/// The named locals a debugger is told of: a name a macro of the compiler's made up is no
-/// name of the source.
+/// The named locals a debugger is told of, and the scopes of the body they are bound in: a
+/// name a macro of the compiler's made up is no name of the source. `spans` are the
+/// statements the function's line rows are of.
 fn named(
     db: &dyn HirDatabase,
     hashes: &dyn Hashes,
     owner: DefWithBodyId,
     variables: &[fragment::Variable],
-) -> Result<Vec<side::Variable>, String> {
+    spans: &[MirSpan],
+) -> Result<(Vec<side::Variable>, side::Scopes), String> {
     let body = Body::of(db, owner);
+    let variables: Vec<_> =
+        variables.iter().filter(|it| !body[it.binding].name.as_str().starts_with('<')).collect();
+    let (scopes, of_binding) = scoped(db, owner, &variables, spans);
     let mut named = Vec::with_capacity(variables.len());
     for variable in variables {
-        let name = body[variable.binding].name.as_str();
-        if name.starts_with('<') {
-            continue;
-        }
         named.push(side::Variable {
-            name: name.to_owned(),
+            name: body[variable.binding].name.as_str().to_owned(),
             param: variable.param,
             ty: hashes.ty(db, variable.ty.as_ref())?,
             slot: variable.slot,
             pointer: variable.pointer,
+            scope: of_binding.get(&variable.binding).copied(),
         });
     }
-    Ok(named)
+    Ok((named, scopes))
+}
+
+/// The scopes of the body of `owner` that `variables` are bound in, outer ones first, which
+/// of them each binding is of, and which each of `spans` is of. A binding of the outermost
+/// scope, which a parameter is, is known in all of the function and is of none. The code that
+/// tries the pattern of an arm is of the scope its `match` is in; other code of no expression
+/// is of the scope of the code before it.
+fn scoped(
+    db: &dyn HirDatabase,
+    owner: DefWithBodyId,
+    variables: &[&fragment::Variable],
+    spans: &[MirSpan],
+) -> (side::Scopes, FxHashMap<BindingId, u32>) {
+    let scopes = ExprScopes::of(db, owner);
+    let body = Body::of(db, owner);
+    let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
+    let mut bound = FxHashMap::default();
+    let mut seen = FxHashSet::default();
+    for (_, &scope) in scopes.scope_by_expr().iter() {
+        for scope in scopes.scope_chain(Some(scope)).take_while(|&it| seen.insert(it)) {
+            bound.extend(scopes.entries(scope).iter().map(|entry| (entry.binding(), scope)));
+        }
+    }
+    let mut told: FxHashMap<ScopeId, u32> = FxHashMap::default();
+    let mut parents = Vec::new();
+    let mut of_binding = FxHashMap::default();
+    for variable in variables {
+        let Some(&scope) = bound.get(&variable.binding).filter(|&&it| Some(it) != outermost) else {
+            continue;
+        };
+        let mut chain: Vec<ScopeId> = scopes
+            .scope_chain(Some(scope))
+            .take_while(|it| Some(*it) != outermost && !told.contains_key(it))
+            .filter(|&it| it == scope || !scopes.entries(it).is_empty())
+            .collect();
+        chain.reverse();
+        for scope in chain {
+            let parent =
+                scopes.scope_chain(Some(scope)).skip(1).find_map(|it| told.get(&it).copied());
+            told.insert(scope, parents.len() as u32);
+            parents.push(parent);
+        }
+        of_binding.insert(variable.binding, told[&scope]);
+    }
+    if told.is_empty() {
+        return (side::Scopes::default(), of_binding);
+    }
+    let mut tried = FxHashMap::default();
+    for (expr, it) in body.exprs() {
+        if let hir_def::hir::Expr::Match { arms, .. } = it {
+            for arm in arms.iter() {
+                body.walk_pats(arm.pat, &mut |pat| drop(tried.insert(pat, expr)));
+            }
+        }
+    }
+    let innermost = |scope: Option<ScopeId>| {
+        match scopes.scope_chain(scope).find_map(|it| told.get(&it)) {
+            Some(&index) => side::SpanScope::In(index),
+            None => side::SpanScope::Outside,
+        }
+    };
+    let of_span = spans
+        .iter()
+        .map(|span| match *span {
+            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => innermost(scopes.scope_for(expr)),
+            MirSpan::PatId(pat) => match tried.get(&pat) {
+                Some(&of) => innermost(scopes.scope_for(of)),
+                None => side::SpanScope::Before,
+            },
+            _ => side::SpanScope::Before,
+        })
+        .collect();
+    (side::Scopes { parents, of_span }, of_binding)
 }
 
 /// Makes every call and every address of blaze's own code and data direct: in v2 the linker
@@ -374,16 +459,29 @@ pub(crate) fn emit_cranelift(
             ),
         ));
     }
-    let Function { code, places, spans, variables, .. } = &mut *function;
+    let Function { code, places, spans, variables, scopes, .. } = &mut *function;
+    let named = Named { spans, variables, scopes };
     match code {
         Built::Ir(pending) => {
             let func = std::mem::replace(&mut pending.func, ir::Function::new());
             let code = compiled(unit, func, &pending.named)?;
-            told(unit, places, &pending.wants.requests, &code, refs, spans, variables)
+            told(unit, places, &pending.wants.requests, &code, refs, named)
         }
-        Built::Assembled(code, requests) => {
-            told(unit, places, requests, code, refs, spans, variables)
-        }
+        Built::Assembled(code, requests) => told(unit, places, requests, code, refs, named),
+    }
+}
+
+/// What a debugger is told of a function: [`Function::spans`], `variables` and `scopes`.
+#[derive(Clone, Copy)]
+struct Named<'a> {
+    spans: &'a [SpanRef],
+    variables: &'a [side::Variable],
+    scopes: &'a side::Scopes,
+}
+
+impl Function {
+    fn named(&self) -> Named<'_> {
+        Named { spans: &self.spans, variables: &self.variables, scopes: &self.scopes }
     }
 }
 
@@ -395,8 +493,7 @@ pub(crate) fn emitted(
     code: &fragment::Code,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
-    let requests = function.requests();
-    told(unit, &function.places, requests, code, refs, &function.spans, &function.variables)
+    told(unit, &function.places, function.requests(), code, refs, function.named())
 }
 
 fn told(
@@ -405,8 +502,7 @@ fn told(
     requests: &Requests,
     code: &fragment::Code,
     refs: &Refs,
-    spans: &[SpanRef],
-    variables: &[side::Variable],
+    Named { spans, variables, scopes }: Named<'_>,
 ) -> Result<Emitted, CodegenError> {
     let fail = |what: String| failed(unit, what);
     if refs.len() < places.refs as usize {
@@ -417,7 +513,7 @@ fn told(
         )));
     }
     let isa = isa(unit)?;
-    let side = side::encode(variables, &code.slots).map_err(fail)?;
+    let side = side::of(variables, scopes, code).map_err(fail)?;
     let compiled = resolve(places, refs, |resolve| {
         super::convert::function(
             unit.instance.key(),
@@ -456,7 +552,9 @@ fn emit_ir(
     };
     if thunk {
         let code = compiled(unit, ir, &[])?;
-        told(unit, &function.places, function.requests(), &code, refs, &[], &[])
+        let none = side::Scopes::default();
+        let named = Named { spans: &[], variables: &[], scopes: &none };
+        told(unit, &function.places, function.requests(), &code, refs, named)
     } else {
         let code = compiled(unit, ir, &pending.named)?;
         emitted(unit, function, &code, refs)

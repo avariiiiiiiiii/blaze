@@ -810,6 +810,8 @@ Sites, about 73: hir-ty `lower.rs` 27, `lower/path.rs` 4, `generics.rs` 2 (lane 
 hir-ty-borrowck `regions.rs` 30 (lane db); hir `display.rs` 6, `diagnostics.rs` 2,
 `semantics.rs` 1, `lib.rs` 1 (lane items). These land with the expression change.
 
+> applied (hir-ide): `display.rs`'s five type-ref reads (`TypeRefId::hir_fmt`, its where-clause and return-type checks, the paren-sugar tuple and return) are `store.type_ref(t)` with view fields by value. forwarded to db: the hir-ty, hir-ty-borrowck and `hir` sites (`crates/hir/` is lane db's in `crates.md`, not items').
+
 ## From safety-audit
 
 From `safety-audit-front` (child of `safety-audit`, lane `safety`). The workspace is about to deny
@@ -818,6 +820,8 @@ From `safety-audit-front` (child of `safety-audit`, lane `safety`). The workspac
 Comments, `# Safety` sections, block splits and crate-root attributes only: no behavior change.
 A split keeps the order of evaluation and binds only `Copy` values. Line numbers are as of
 2026-10-29 18:45.
+
+> forwarded to format: every crate named is its.
 
 ### intern
 
@@ -913,3 +917,13 @@ A split keeps the order of evaluation and binds only `Copy` values. Line numbers
 - `blaze-format`: `Record`'s `# Safety` (`lib.rs:48`) asks for `#[repr(C)]` or a primitive, no padding, no pointer, and every bit pattern `check` accepts being a value. Every impl meets it: `plain!` (primitives, and `ContentId`, `Fingerprint`, `SchemaHash`, each `#[repr(transparent)]` over a byte array or an integer), `bool` (`check` accepts only 0 and 1), `[T; N]`, `Rel<T>` and `Slice<T>` (`#[repr(C)]` integers and a ZST), `SpanRef` (`#[repr(C)]`, size asserted 36), and `record!` (asserts no padding; `SAFETY` written inside the macro body). Its blocks are single-op and commented. The same holds for `blaze-query/src/tests.rs:27`'s `Word`.
 - `parser` (`syntax_kind.rs:20`, `lexed_str/scan.rs`), `span` (`hygiene.rs`) and format's `hir-def` files (`hir/persist.rs:615`, `expr_store/lower.rs:2808`, `:3085`, `item_tree/persist.rs:122`; `item_tree.rs` has no unsafe of its own left, using `record!`): ok.
 - `#[salsa::interned(unsafe(no_lifetime))]` (a salsa option, not Rust `unsafe`): `span/src/hygiene.rs:62`.
+
+## From safety-fuzz-macrowasm (2026-10-29): `tt::Literal::new` panics on a suffix over 255 bytes
+
+`crates/tt/src/lib.rs:408` (and `:467`): `suffix_len: suffix.len().try_into().unwrap()` with
+`suffix_len: u8`. Any literal with a suffix of 256+ bytes panics. rustc lexes it, then reports
+an invalid suffix. It is reached from blaze-macro-wasm's lexer and wire reader, with any text
+`1` followed by 256 letters (usercode is told, item 6 of its request). Source code through
+syntax-bridge may reach it too. Input: `fuzz/corpus/macro_wasm_lex/suffix-256.hex`.
+What: store a longer suffix (a `u16`/`u32` length, or the split kept in the symbol), or give
+the callers a fallible constructor.

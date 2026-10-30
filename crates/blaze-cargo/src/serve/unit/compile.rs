@@ -9,6 +9,8 @@
 //! colour of its diagnostics. A unit whose record and outputs are all in the store is fresh:
 //! its diagnostics are replayed as cargo replays a fresh unit's, and nothing runs.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeSet;
 
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};

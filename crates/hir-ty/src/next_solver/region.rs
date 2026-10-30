@@ -23,6 +23,7 @@ pub type RegionConstraint<'db> = rustc_type_ir::RegionConstraint<DbInterner<'db>
 
 /// Every interned [`Region`]. A `GenericArg` holds a row in 30 bits.
 static REGIONS: table::Rows<RegionKind<'static>> = table::Rows::new("regions", table::LAST_ROW);
+table::erase!(RegionKind);
 
 /// A region: its row in [`REGIONS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,9 +52,6 @@ impl<'db> Region<'db> {
 
     #[inline]
     pub(super) fn intern(kind: RegionKind<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let kind = unsafe { std::mem::transmute::<RegionKind<'db>, RegionKind<'static>>(kind) };
         Self::at(REGIONS.intern(kind, || table::RowInfo {
             tag: persist::tag(&kind),
             flags: region_flags(kind),
@@ -148,8 +146,7 @@ impl<'db> Region<'db> {
 
     #[inline]
     pub fn type_flags(&self) -> TypeFlags {
-        // SAFETY: a `Region` is a row of `REGIONS`.
-        unsafe { REGIONS.flags(self.index) }
+        REGIONS.flags(self.index)
     }
 }
 
@@ -256,10 +253,7 @@ impl<'db> IntoKind for Region<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Region` is a row of `REGIONS`; the lifetime is as in `intern`.
-        unsafe {
-            std::mem::transmute::<RegionKind<'static>, RegionKind<'db>>(REGIONS.kind(self.index))
-        }
+        REGIONS.kind(self.index)
     }
 }
 
@@ -301,8 +295,7 @@ impl<'db> Flags for Region<'db> {
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        // SAFETY: a `Region` is a row of `REGIONS`.
-        unsafe { REGIONS.binder(self.index) }
+        REGIONS.binder(self.index)
     }
 }
 

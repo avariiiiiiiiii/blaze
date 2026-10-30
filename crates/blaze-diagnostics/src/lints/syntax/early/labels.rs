@@ -39,10 +39,10 @@ fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
         for (_, expr) in body.exprs() {
             match expr {
                 Expr::Loop { label: Some(label), .. } | Expr::Block { label: Some(label), .. } => {
-                    declared.push(*label)
+                    declared.push(label)
                 }
                 Expr::Break { label: Some(label), .. } | Expr::Continue { label: Some(label) } => {
-                    used.insert(*label);
+                    used.insert(label);
                 }
                 _ => {}
             }

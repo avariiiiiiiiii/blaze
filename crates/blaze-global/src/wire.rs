@@ -9,7 +9,7 @@
 //!   record and pieces. Answered by `BLZGPA` and, for each, its key and `0` (kept) or `1` and
 //!   why, as a `u16` length and at most [`REASON_MOST`] bytes of UTF-8.
 //! - **bundle** (`POST /v1/bundle`): `BLZGBQ` and a [`crate::BundleId`]; answered by `BLZGBA`
-//!   and `0` (missing) or `1` and its [`crate::Manifest`]. **bundle publish**
+//!   and `0` (missing) or `2` and its [`crate::Manifest`]. **bundle publish**
 //!   (`POST /v1/bundle/publish`): `BLZGBP` and the manifest; answered as a publish of one.
 //!
 //! **Pieces**: a value is its count of pieces as a `u32`, then each piece: `0`, its length as a

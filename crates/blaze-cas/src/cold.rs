@@ -66,6 +66,10 @@ pub(crate) struct Prepared {
 // in `new` and never hands out a way to change them. zstd-safe 7.3 does not say so itself
 // (v2/requests/store.md).
 unsafe impl Send for Prepared {}
+// SAFETY: as for `Send`: `&Prepared` reaches only `bytes` (a `Vec<u8>`) and the two digested
+// dictionaries, which zstd only reads once made (zstd.h: a `ZSTD_CDict` and a `ZSTD_DDict` can be
+// shared by many threads at once); `Prepared` has no method that changes them, so threads sharing
+// it never race inside zstd.
 unsafe impl Sync for Prepared {}
 
 impl Prepared {

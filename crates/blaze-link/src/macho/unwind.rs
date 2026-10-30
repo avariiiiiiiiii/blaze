@@ -11,6 +11,8 @@
 //! into the entries; a second-level page is compressed (4-byte entries indexing the common
 //! encodings or the page's own, as ld64 writes) unless a regular page holds more entries.
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 
 use blaze_codegen::Arch;

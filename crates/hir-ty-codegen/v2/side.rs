@@ -5,12 +5,12 @@
 use blaze_ids::ContentId;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::debuginfo::{SlotPlaces, VariablePlace};
+use crate::debuginfo::{LineRow, SlotPlaces, VariablePlace};
 
 /// The encoding's version: a change to what is below is a new one.
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
-const SIDE_DOMAIN: &str = "blaze v2 side 1";
+const SIDE_DOMAIN: &str = "blaze v2 side 2";
 
 /// A named local of a function, as its IR was built: in a stack slot, or at an address the
 /// slot holds.
@@ -23,6 +23,29 @@ pub(crate) struct Variable {
     pub(crate) slot: u32,
     /// The slot holds an address, the local is this far from it.
     pub(crate) pointer: Option<u32>,
+    /// The scope its name is known in, among [`Scopes::parents`]: `None` is all of the
+    /// function, as a parameter's is.
+    pub(crate) scope: Option<u32>,
+}
+
+/// The scopes of a function's body its named locals are bound in, as the body says them:
+/// which code each is of is known once the code is, from its line rows.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Scopes {
+    /// The scope each is inside of, which comes before it.
+    pub(crate) parents: Vec<Option<u32>>,
+    /// By the statement a line row is of (`LineRow::span`): which scope its code is of.
+    pub(crate) of_span: Vec<SpanScope>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum SpanScope {
+    /// Of the scope of the code before it: code of no expression, or of a pattern.
+    Before,
+    /// Of none of the scopes.
+    Outside,
+    /// Of this scope and those it is inside of.
+    In(u32),
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -30,7 +53,17 @@ pub(crate) struct Side {
     pub(crate) version: u32,
     /// The DWARF expression of what [`Place::Frame`] and `DW_OP_fbreg` count from.
     pub(crate) frame_base: Vec<u8>,
+    pub(crate) scopes: Vec<Scope>,
     pub(crate) variables: Vec<Told>,
+}
+
+/// A part of the function its names are looked up in: a block, what follows a `let`.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Scope {
+    pub(crate) parent: Option<u32>,
+    /// The code of the scope and of the scopes inside it, from the first offset up to the
+    /// second, in the order of the offsets.
+    pub(crate) ranges: Vec<(u32, u32)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -39,6 +72,7 @@ pub(crate) struct Told {
     pub(crate) param: bool,
     pub(crate) ty: ContentId,
     pub(crate) place: Place,
+    pub(crate) scope: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -50,10 +84,14 @@ pub(crate) enum Place {
 }
 
 /// The side table of a function whose variables Cranelift put where `slots` says, with its
-/// content ID; `None` for one with nothing to tell.
+/// content ID; `None` for one with nothing to tell. The code of each scope is from `lines`,
+/// the function's line rows, and `len`, where its code ends.
 pub(crate) fn encode(
     variables: &[Variable],
+    scopes: &Scopes,
     slots: &SlotPlaces,
+    lines: &[LineRow],
+    len: u32,
 ) -> Result<Option<(Vec<u8>, ContentId)>, String> {
     let told: Vec<Told> = variables
         .iter()
@@ -67,16 +105,72 @@ pub(crate) fn encode(
                 VariablePlace::Frame(offset) => Place::Frame(offset),
                 VariablePlace::Ranges(ranges) => Place::Ranges(ranges),
             };
-            Some(Told { name: variable.name.clone(), param: variable.param, ty: variable.ty, place })
+            Some(Told {
+                name: variable.name.clone(),
+                param: variable.param,
+                ty: variable.ty,
+                place,
+                scope: variable.scope,
+            })
         })
         .collect();
     if told.is_empty() {
         return Ok(None);
     }
-    let side = Side { version: VERSION, frame_base: slots.frame_base.clone(), variables: told };
+    let scopes = ranges(scopes, lines, len)?;
+    let frame_base = slots.frame_base.clone();
+    let side = Side { version: VERSION, frame_base, scopes, variables: told };
     let bytes = postcard::to_allocvec(&side).map_err(|e| e.to_string())?;
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
     Ok(Some((bytes, id)))
+}
+
+/// [`encode`] of a function's `variables` and `scopes`, where its `code` put them.
+pub(crate) fn of(
+    variables: &[Variable],
+    scopes: &Scopes,
+    code: &crate::fragment::Code,
+) -> Result<Option<(Vec<u8>, ContentId)>, String> {
+    let len = u32::try_from(code.bytes.len()).map_err(|e| e.to_string())?;
+    encode(variables, scopes, &code.slots, &code.lines, len)
+}
+
+/// The code of each scope: that of each line row whose statement is of it or of a scope
+/// inside it, up to the next row's offset or `len`.
+fn ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Scope>, String> {
+    let mut out: Vec<Scope> =
+        scopes.parents.iter().map(|&parent| Scope { parent, ranges: Vec::new() }).collect();
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let mut scope = None;
+    let ends = lines.iter().skip(1).map(|row| row.offset).chain([len]);
+    for (row, to) in lines.iter().zip(ends) {
+        match scopes.of_span.get(row.span as usize) {
+            Some(SpanScope::Before) => {}
+            Some(SpanScope::Outside) => scope = None,
+            Some(&SpanScope::In(it)) => scope = Some(it),
+            None => return Err(format!("a line row of statement {}, which has no scope", row.span)),
+        }
+        let from = row.offset;
+        if from >= to {
+            continue;
+        }
+        let mut at = scope;
+        // Each scope's parent comes before it, so the chain ends within as many steps.
+        for _ in 0..out.len() {
+            let Some(index) = at else { break };
+            let Some(Scope { parent, ranges }) = out.get_mut(index as usize) else {
+                return Err(format!("scope {index} of {}", scopes.parents.len()));
+            };
+            match ranges.last_mut() {
+                Some(last) if last.1 == from => last.1 = to,
+                _ => ranges.push((from, to)),
+            }
+            at = *parent;
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Side, String> {
@@ -104,19 +198,38 @@ mod tests {
             ty,
             slot,
             pointer,
+            scope: None,
         };
         let variables = [variable("a", 0, None), variable("gone", 1, None), variable("b", 2, Some(4))];
-        let (bytes, id) = encode(&variables, &slots).expect("encoded").expect("variables");
+        let encoded = || encode(&variables, &Scopes::default(), &slots, &[], 16);
+        let (bytes, id) = encoded().expect("encoded").expect("variables");
         let side = decode(&bytes).expect("decoded");
         let names: Vec<_> = side.variables.iter().map(|it| it.name.as_str()).collect();
         assert_eq!(names, ["a", "b"]);
         assert_eq!(side.variables[0].place, Place::Frame(-16));
         assert!(matches!(side.variables[1].place, Place::Ranges(_)));
-        assert_eq!(encode(&variables, &slots).expect("encoded").expect("variables").1, id);
+        assert_eq!(encoded().expect("encoded").expect("variables").1, id);
     }
 
     #[test]
     fn nothing_to_tell_is_no_table() {
-        assert_eq!(encode(&[], &SlotPlaces::default()), Ok(None));
+        assert_eq!(encode(&[], &Scopes::default(), &SlotPlaces::default(), &[], 0), Ok(None));
+    }
+
+    /// A scope's code is that of its rows and of its inner scopes', joined where they meet;
+    /// a row of no expression stays in the scope before it.
+    #[test]
+    fn a_scope_is_the_code_of_its_rows() {
+        let scopes = Scopes {
+            parents: vec![None, Some(0)],
+            of_span: vec![SpanScope::Outside, SpanScope::In(0), SpanScope::In(1), SpanScope::Before],
+        };
+        let row = |offset, span| LineRow { offset, span };
+        let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 3), row(16, 0)];
+        let ranges = ranges(&scopes, &lines, 20).expect("the ranges");
+        assert_eq!(ranges[0], Scope { parent: None, ranges: vec![(4, 16)] });
+        assert_eq!(ranges[1], Scope { parent: Some(0), ranges: vec![(8, 16)] });
+        let unknown = [row(0, 9)];
+        assert!(super::ranges(&scopes, &unknown, 4).is_err());
     }
 }

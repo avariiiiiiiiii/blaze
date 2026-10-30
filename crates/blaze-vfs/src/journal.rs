@@ -13,10 +13,14 @@
 //!   they are then and so every move the batch recorded; its tickets go with it. A batch half
 //!   written by a failed append is replaced with the rest of the file, and a record written
 //!   twice loads once (a node is interned, a head keeps the highest sequence).
-//! - **Recovery** reads the file from the start, skips a damaged stretch by looking for the next
-//!   record whose checksum holds, and drops a head whose root's nodes did not survive. Before
-//!   appending it cuts the file after the last good record and syncs the cut: a torn record
-//!   followed by new ones can borrow their first bytes and pass its checksum, hiding them.
+//! - **Recovery** loads a prefix: it reads records from the start and stops at the first that
+//!   is not whole, fails its checksum or is malformed. It never looks for a record past one it
+//!   refused, as a torn record's payload may hold whole records of another journal (a file that
+//!   is one) that would verify. Before appending it cuts the file after the last good record and
+//!   syncs the cut, so nothing past it (a record naming a node it lost) loads later once that
+//!   node is made again; a torn record followed by new ones could also borrow their first bytes
+//!   and pass its checksum, hiding them. A head whose root's nodes are not there (only a forged
+//!   file has one) is dropped, and the file is rewritten as the heads recovered.
 //! - **Compaction**: after a collection, the next flush replaces the whole file, in one
 //!   [`Effect::Write`], with the nodes the heads reach and one record per head. Nothing is
 //!   appended while it is in flight; a failed one is made again from the state then.
@@ -27,11 +31,11 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Mode, Recovered, Ticket,
-    tree::{DIR_MODE, NodeId, Tree},
+    tree::{DIR_MODE, NodeId, Tree, parts},
 };
 
 const MAGIC: [u8; 4] = *b"BZJ3";
-const HEADER: usize = MAGIC.len() + 4 + 1;
+pub(crate) const HEADER: usize = MAGIC.len() + 4 + 1;
 const CHECKSUM: usize = 8;
 const CHECKSUM_DOMAIN: &str = "blaze v2 vfs journal record 1";
 
@@ -41,6 +45,10 @@ const HEAD: u8 = 3;
 const REMOVE: u8 = 4;
 /// The sequence a rewrite was made at, so the numbers of removals it drops are not given again.
 const SEQUENCE: u8 = 5;
+
+/// Sequence numbers are below this: one more per head move from 0 never reaches it, so a
+/// record at or above it is forged, and the next number never overflows.
+const SEQUENCES: u64 = 1 << 63;
 
 const APPEND: u64 = 0;
 const SYNC: u64 = 1;
@@ -129,29 +137,14 @@ impl Journal {
         let mut moves: FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>> = FxHashMap::default();
         let mut sequence = 0;
         let mut valid = 0;
-        let mut at = 0;
-        while at < bytes.len() {
-            match record(&bytes[at..]) {
-                Some((kind, payload, len)) => {
-                    if load(&mut tree, kind, payload, &mut moves, &mut sequence).is_some() {
-                        found.records += 1;
-                        at += len;
-                        valid = at;
-                        continue;
-                    }
-                    found.skipped += len;
-                    at += len;
-                }
-                None => {
-                    let next = bytes[at + 1..]
-                        .windows(MAGIC.len())
-                        .position(|it| it == MAGIC)
-                        .map_or(bytes.len(), |it| at + 1 + it);
-                    found.skipped += next - at;
-                    at = next;
-                }
+        while let Some((kind, payload, len)) = record(&bytes[valid..]) {
+            if load(&mut tree, kind, payload, &mut moves, &mut sequence).is_none() {
+                break;
             }
+            found.records += 1;
+            valid += len;
         }
+        found.skipped = bytes.len() - valid;
         let mut journal = Journal {
             file,
             tags,
@@ -161,6 +154,7 @@ impl Journal {
             open: Batch::default(),
             flight: Flight::Idle,
             cut: (valid < bytes.len()).then_some(valid as u64),
+            // Set below if a head is dropped.
             compact: false,
             dirty: !bytes.is_empty(),
             next_ticket: 0,
@@ -176,6 +170,9 @@ impl Journal {
                 let Some(root) = root else { break };
                 let Some(root) = tree.node(&root).filter(|it| tree.is_dir(*it)) else {
                     found.heads_dropped += 1;
+                    // Its record stays in the prefix: rewrite the file as the heads are, or it
+                    // comes back once a commit makes that root again.
+                    journal.compact = true;
                     continue;
                 };
                 heads.insert(name.clone(), root);
@@ -191,7 +188,7 @@ impl Journal {
     pub(crate) fn record_head(&mut self, tree: &Tree, head: &str, root: NodeId) -> Ticket {
         self.written.grow(tree.len());
         write_node(tree, &mut self.written, &mut self.open.bytes, root);
-        self.sequence += 1;
+        self.sequence = next(self.sequence);
         self.heads.insert(head.into(), self.sequence);
         head_record(&mut self.open.bytes, self.sequence, Some(&tree.id(root)), head);
         self.ticket()
@@ -199,7 +196,7 @@ impl Journal {
 
     /// Records that `head` is gone.
     pub(crate) fn record_removal(&mut self, head: &str) -> Ticket {
-        self.sequence += 1;
+        self.sequence = next(self.sequence);
         self.heads.remove(head);
         head_record(&mut self.open.bytes, self.sequence, None, head);
         self.ticket()
@@ -340,6 +337,13 @@ impl Journal {
     }
 }
 
+/// The sequence number after `sequence`, which is below [`SEQUENCES`].
+fn next(sequence: u64) -> u64 {
+    let next = sequence + 1;
+    assert!(next < SEQUENCES, "2^63 head moves in one journal");
+    next
+}
+
 /// Records `node` and everything under it not recorded yet, children first, so a record only
 /// names nodes recorded before it. Each record is framed in place in `out`.
 fn write_node(tree: &Tree, written: &mut Written, out: &mut Vec<u8>, node: NodeId) {
@@ -401,6 +405,17 @@ fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) {
     out.extend_from_slice(&sum);
 }
 
+/// One record of `kind` holding `payload`, framed with a good checksum: for tests that forge one.
+#[cfg(test)]
+pub(crate) fn framed(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    frame(&mut out, kind, |out| out.extend_from_slice(payload));
+    out
+}
+
+#[cfg(test)]
+pub(crate) const KINDS: (u8, u8, u8, u8, u8) = (FILE, DIR, HEAD, REMOVE, SEQUENCE);
+
 /// The record at the start of `bytes`, its payload and its whole length, if it is a whole record
 /// with a good checksum.
 fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
@@ -415,8 +430,9 @@ fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
     (checksum(kind, payload) == *sum).then_some((kind, payload, end + CHECKSUM))
 }
 
-/// Loads one record; `None` when it names a node that is not there or is malformed. `sequence`
-/// becomes the largest any record names.
+/// Loads one record; `None` when it names a node that is not there or is malformed (a
+/// directory's names not distinct path components in order, a sequence number at or above
+/// [`SEQUENCES`]). `sequence` becomes the largest any record names.
 fn load(
     tree: &mut Tree,
     kind: u8,
@@ -431,9 +447,15 @@ fn load(
         DIR => {
             let mut entries = Vec::new();
             let mut rest = payload;
+            let mut last: Option<&str> = None;
             while !rest.is_empty() {
                 let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
                 let name = std::str::from_utf8(rest.get(4..4 + len)?).ok()?;
+                // As the tree writes them: one component each, sorted by bytes, so distinct.
+                if parts(name).ok()?.len() != 1 || last.is_some_and(|it| it >= name) {
+                    return None;
+                }
+                last = Some(name);
                 let code = u32::from_le_bytes(rest.get(4 + len..8 + len)?.try_into().ok()?);
                 let id = ContentId(rest.get(8 + len..8 + len + 32)?.try_into().ok()?);
                 rest = &rest[8 + len + 32..];
@@ -450,23 +472,29 @@ fn load(
             tree.dir(entries);
         }
         HEAD => {
-            let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            let at = sequence_at(payload)?;
             let root = ContentId(payload.get(8..40)?.try_into().ok()?);
             let name = std::str::from_utf8(&payload[40..]).ok()?;
             moves.entry(name.into()).or_default().push((at, Some(root)));
             *sequence = (*sequence).max(at);
         }
         REMOVE => {
-            let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+            let at = sequence_at(payload)?;
             let name = std::str::from_utf8(&payload[8..]).ok()?;
             moves.entry(name.into()).or_default().push((at, None));
             *sequence = (*sequence).max(at);
         }
         SEQUENCE => {
-            let at = u64::from_le_bytes(payload.try_into().ok()?);
+            let at = sequence_at(payload).filter(|_| payload.len() == 8)?;
             *sequence = (*sequence).max(at);
         }
         _ => return None,
     }
     Some(())
+}
+
+/// The sequence number a record's payload starts with, if it is below [`SEQUENCES`].
+fn sequence_at(payload: &[u8]) -> Option<u64> {
+    let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
+    (at < SEQUENCES).then_some(at)
 }

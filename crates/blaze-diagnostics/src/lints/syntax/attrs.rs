@@ -275,7 +275,7 @@ fn attributes(walk: &Walk<'_>, file: HirFileId, owner: &ast::AnyHasAttrs) -> Vec
 pub(crate) fn parsed(diag: Diag, owner: &Owner) -> Emitted {
     match &owner.buffered_at {
         Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()),
-        None => Emitted::new(diag, Phase::Items, Pass::Early, owner.at()),
+        None => Emitted::new(diag, Phase::Items, Pass::Delayed, owner.at()),
     }
 }
 

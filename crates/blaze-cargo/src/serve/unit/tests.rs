@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{ffi::OsString, path::PathBuf, sync::OnceLock};
 
 use blaze_api::{Artifact, Level, UnitProfile};

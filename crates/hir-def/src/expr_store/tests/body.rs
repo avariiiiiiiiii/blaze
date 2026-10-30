@@ -1015,3 +1015,15 @@ fn foo() {
             }"#]],
     );
 }
+
+#[test]
+fn ids_are_the_ids_of_the_decoded_nodes() {
+    let (db, def) = lower(EVERY_VARIANT);
+    let body = Body::of(&db, def);
+    assert_eq!(body.expr_ids().len(), body.expr_count());
+    assert!(body.expr_ids().eq(body.exprs().map(|(id, _)| id)));
+    assert_eq!(body.pat_ids().len(), body.pat_count());
+    assert!(body.pat_ids().eq(body.pats().map(|(id, _)| id)));
+    assert_eq!(ExpressionStore::empty().expr_ids().len(), 0);
+    assert_eq!(ExpressionStore::empty().pat_ids().len(), 0);
+}

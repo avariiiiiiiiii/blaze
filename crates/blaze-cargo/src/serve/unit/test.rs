@@ -9,6 +9,8 @@
 //! would, and [`evaluate`] runs one in blaze's MIR evaluator under the checker of undefined
 //! behavior (`hir_ty_ub::run_test`).
 
+#![forbid(unsafe_code)]
+
 use std::{
     ffi::OsString,
     path::PathBuf,

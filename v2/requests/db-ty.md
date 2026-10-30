@@ -202,3 +202,19 @@ asks one per crate of its traits in scope instead of one `trait_value_item` per 
 `kinds_are_distinct_and_hir_tys` finds every tracked function in the source and fails without
 these lines. Numbers `0x2457`..`0x245f`, `0x247b`..`0x247d` and `0x2487`..`0x248a` are kept for
 speed-types-probe's children (layout, coherence and opaques), which will request their own lines.
+
+## From speed-types-probe-layout (2026-10-29): one query kind (`crates/hir-ty/src/db.rs`)
+
+What: in `kinds!`, after `DESTRUCTOR = 0x2456, "destructor";`:
+
+```rust
+        STRUCT_TAIL_MAY_BE_UNSIZED = 0x2457, "struct_tail_may_be_unsized";
+```
+
+Why: a new tracked function in `crates/hir-ty/src/layout.rs` (items' file, free):
+`struct_tail_may_be_unsized(db, StructId, Crate) -> bool`, the `Sized` check of a struct's last
+field that `layout_of_adt` ran on every instantiation (an interner reading lang items and the def
+map, an inference context, the trait environment, a `Sized` goal) though it reads only the
+struct's identity field type and the crate. Now once per struct and crate.
+`kinds_are_distinct_and_hir_tys` / `every_query_has_a_kind` fail without this line. `0x2457` is
+from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay unused.

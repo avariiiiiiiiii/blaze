@@ -292,6 +292,15 @@ impl Plane {
                 self.add(at, r, nodes, &mut out);
                 touched.push(r);
             }
+            PlaneInput::AddNodes { request, nodes, .. } => {
+                let r = self.open_request(request)?;
+                if self.requests[r].closed {
+                    return Err(Error::Closed);
+                }
+                let nodes = self.check(r, (0..nodes.len()).map(|at| nodes.spec(at)).collect())?;
+                self.add(at, r, nodes, &mut out);
+                touched.push(r);
+            }
             PlaneInput::Close { request, .. } => {
                 let r = self.open_request(request)?;
                 if self.requests[r].closed {

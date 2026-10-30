@@ -248,12 +248,12 @@ const CONTROL_C_EXIT: i32 = 0xC000_013A_u32 as i32;
 /// Ends the process the way the signal would have, had nothing waited for it.
 #[cfg(unix)]
 fn end_by(signal: i32) -> ! {
-    // SAFETY: setting a signal to what it does by default and raising it are both safe to
-    // do from any thread.
-    unsafe {
-        libc::signal(signal, libc::SIG_DFL);
-        libc::raise(signal);
-    }
+    // SAFETY: setting a signal back to its default action is safe from any thread, and
+    // `signal` is one the runtime reported.
+    unsafe { libc::signal(signal, libc::SIG_DFL) };
+    // SAFETY: raising a signal is safe from any thread; with the default action in place it
+    // ends the process as the signal would have.
+    unsafe { libc::raise(signal) };
     std::process::exit(128 + signal)
 }
 

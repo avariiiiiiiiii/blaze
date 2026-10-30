@@ -143,6 +143,12 @@ impl<'db> Places<'db> {
         (at != NONE).then_some((at, rest))
     }
 
+    /// Whether `place` is behind a reference out of a checked place: rustc's self-assignments
+    /// of one are not.
+    pub(super) fn is_indirect(&self, place: &StoredPlace) -> bool {
+        self.get(place.local, place.projection.as_slice()).is_some_and(|(_, extra)| is_indirect(extra))
+    }
+
     fn is_by_ref_capture(&self, at: Index) -> bool {
         matches!(self.kinds[at as usize], Kind::Capture { by_ref: true, .. })
     }

@@ -6,6 +6,7 @@
 //!
 //! `blaze-v2-proof '{"first": "a", "second": "b"}'` compares two files byte for byte instead
 //! (`blaze_v2_proof::bytes`, by the CPU's SIMD) and prints where they first differ.
+#![forbid(unsafe_code)]
 
 use std::{
     fs,

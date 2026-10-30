@@ -503,6 +503,23 @@ fn without(
                 return Some((found.def, Some(span), true));
             }
         } else if let Some(found) = entry(&at.def_map(db).module(db, at).name_in_scope(db, name), ns) {
+            if let Some(Binding::Glob(_)) = found.import {
+                let differs = uses
+                    .items
+                    .iter()
+                    .filter(|it| it.module == at)
+                    .flat_map(|it| it.trees.iter())
+                    .filter_map(|tree| match (tree.kind, tree.source) {
+                        (TreeKind::Glob, Some(ModuleDefId::ModuleId(from))) => {
+                            entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns)
+                        }
+                        _ => None,
+                    })
+                    .any(|it| it.vis.is_visible_from(db, at) && it.def != found.def);
+                if differs {
+                    return None;
+                }
+            }
             let (span, import) = binding_span(cx, uses, found)?;
             return Some((found.def, Some(span), import));
         }

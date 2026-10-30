@@ -1900,6 +1900,25 @@ impl ExpressionStore {
         self.expr_only.as_deref().map_or(0, |it| it.columns.expr_count())
     }
 
+    /// How many patterns the store holds.
+    #[inline]
+    pub fn pat_count(&self) -> usize {
+        self.expr_only.as_deref().map_or(0, |it| it.columns.pat_count())
+    }
+
+    /// Every expression's id, in order, without decoding any: for a scan that wants the ids
+    /// (or tests only some of them), where [`Self::exprs`] decodes every node.
+    #[inline]
+    pub fn expr_ids(&self) -> impl DoubleEndedIterator<Item = ExprId> + ExactSizeIterator {
+        (0..self.expr_count() as u32).map(|raw| ExprId::from_raw(la_arena::RawIdx::from_u32(raw)))
+    }
+
+    /// Every pattern's id, in order, without decoding any.
+    #[inline]
+    pub fn pat_ids(&self) -> impl DoubleEndedIterator<Item = PatId> + ExactSizeIterator {
+        (0..self.pat_count() as u32).map(|raw| PatId::from_raw(la_arena::RawIdx::from_u32(raw)))
+    }
+
     /// The store's columns, `None` for a store without expressions.
     #[cfg(test)]
     pub(crate) fn hir_columns(&self) -> Option<&crate::hir::columns::HirColumns> {

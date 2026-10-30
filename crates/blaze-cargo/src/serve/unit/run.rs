@@ -3,6 +3,8 @@
 //! `default-run`, then the only one), run with its arguments in the sandbox tests run in, its
 //! end reported as [`Response::Ran`].
 
+#![forbid(unsafe_code)]
+
 use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Response};

@@ -182,6 +182,8 @@ and `clippy::multiple_unsafe_ops_per_block`. Each finding below is comments, blo
 crate-root attribute only, in the original evaluation order (`||` short-circuits as before). Every
 `windows-sys` and `libc` function is an `unsafe fn`, one op per call.
 
+> applied (store DONE): `blaze-store` `acl.rs` (three splits; `trusted`'s first call bound to `is_user` so the `||` chain still parses as one expression), `lib.rs` `statvfs` zeroed comment, `examples/store_open.rs` `#![forbid(unsafe_code)]`; `blaze-cargo/src/remote/keeper.rs` `end_by` split.
+
 ### blaze-store
 
 - `crates/blaze-store/src/acl.rs:75` block: 2 ops (`GetCurrentProcess`, `OpenProcessToken`). Split:

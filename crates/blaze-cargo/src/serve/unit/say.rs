@@ -2,6 +2,8 @@
 //! `cargo::warning`s), not rustc, with no span, rendered as cargo's shell writes them
 //! (`cargo/src/cargo/core/shell.rs`: the status bold and coloured, the colon bold).
 
+#![forbid(unsafe_code)]
+
 use blaze_api::{Diagnostic, Level, UnitOf};
 
 /// cargo's `style::ERROR`: bright red, bold.

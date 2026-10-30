@@ -97,6 +97,9 @@ field is a `()` and `DbInterner`'s two `debug_assert_*_args_compatible` are empt
 lands.
 
 > forwarded to db: `vendor/rustc_type_ir` is lane db's.
+>
+> landed (2026-10-29): `persist.rs` now uses `from_checked_parts`; `assemble!` and its
+> `MaybeUninit` are gone.
 
 ## 3. Lane db (optional): flags of `GenericArgs` tested in blocks
 
@@ -108,6 +111,42 @@ lane db wants arguments tested in one read, the change is `type GenericArgs: .. 
 intern `GenericArgs` with `intern_with`, as `Clauses` is.
 
 > forwarded to db: `vendor/rustc_type_ir` is lane db's.
+
+## 4. Safety lane and db-ty-solver: remove `unsafe impl Send/Sync for DbInterner`
+
+What: delete these two lines in `crates/hir-ty/src/next_solver/interner.rs` (my file; I leave
+them only because I cannot build to find what needs them):
+
+```rust
+unsafe impl Send for DbInterner<'_> {}
+unsafe impl Sync for DbInterner<'_> {}
+```
+
+Why: they are unsound (`docs/v2/plan/design/unsafe.md`). `DbInterner` holds a
+`&'db dyn HirDatabase`, and a salsa database is `Send` but not `Sync`. So `&dyn HirDatabase` is
+neither, and these impls let two threads use one database at once. They buy no speed.
+`rustc_type_ir::Interner` does not require `Send` or `Sync`. Whoever needs them has to stop
+needing them:
+
+- the safety lane, with a build, finds what breaks when the impls go;
+- db-ty-solver's `tls_cache.rs` comment (line 51) assumes `DbInterner` is `Send` and `Sync` and
+  must be revisited, since that file is not mine.
+
+The usual fix is to keep a `Send` part (crate, lang items, limits) apart from the database
+handle, which stays on its thread.
+
+## 5. Every lane calling `DbInterner::conjure`: stop, then the method goes
+
+What: `DbInterner::conjure()` (`interner.rs`) transmutes the attached database reference to an
+arbitrary `'db`, so the interner it returns can outlive `attach_db` and read a freed database.
+It is marked `FIXME(safety)` and has no sound `// SAFETY:` comment. Its callers:
+
+- `crates/hir/src/lib.rs`: lines 4629, 4643, 4663, 4749, 4786 and 5986 (lane db / db-ty-hir);
+- `crates/hir-ty/src/infer.rs:2628` (db-ty-infer).
+
+Each should take a `DbInterner` from its caller (`DbInterner::new_no_crate(db)`) instead. My own
+three uses (`generic_arg.rs` `type_at`/`region_at`/`const_at`) now read `default_types()`, which
+needs no database. Once the list above is empty, I delete `conjure`.
 
 ## Applied requests of others
 

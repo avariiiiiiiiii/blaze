@@ -54,18 +54,16 @@ pub fn layout_of_adt_query(
     let (repr, niche_optimizations, enum_variants) = match def {
         AdtId::StructId(s) => {
             push_variant(s.into())?;
-            (
-                AttrFlags::repr(db, s.into()).unwrap_or_default(),
-                // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
-                if flags.is_some_and(|it| {
-                    it.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED)
-                }) {
-                    NicheOptimizations::Disabled
-                } else {
-                    NicheOptimizations::Enabled
-                },
-                &[][..],
-            )
+            // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
+            let hides_niches = flags.is_some_and(|it| {
+                it.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED)
+            });
+            let niches = if hides_niches {
+                NicheOptimizations::Disabled
+            } else {
+                NicheOptimizations::Enabled
+            };
+            (AttrFlags::repr(db, s.into()).unwrap_or_default(), niches, &[][..])
         }
         AdtId::UnionId(id) => {
             let repr = AttrFlags::repr(db, id.into());
@@ -77,7 +75,8 @@ pub fn layout_of_adt_query(
             for &v in variants {
                 push_variant(v.into())?;
             }
-            (AttrFlags::repr(db, e.into()).unwrap_or_default(), NicheOptimizations::Enabled, variants)
+            let repr = AttrFlags::repr(db, e.into()).unwrap_or_default();
+            (repr, NicheOptimizations::Enabled, variants)
         }
     };
     let maybe_unsized = match def {
@@ -214,4 +213,93 @@ fn repr_discr(
     } else {
         (cmp::max(signed_fit, at_least), true)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::tests::{Seed, sized_fields, unsized_field};
+
+    type Variants<'a, 'b> = IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, &'a &'b Layout>>;
+
+    /// What `layout_of_adt` did before: per variant a `Vec` of layouts, a `Vec` of references
+    /// and an `IndexVec`.
+    fn nested_with_vecs(
+        variants: &[Vec<Arc<Layout>>],
+        layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
+    ) -> Result<Layout, LayoutError> {
+        let variants = variants
+            .iter()
+            .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
+            .collect::<SmallVec<[_; 1]>>();
+        let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
+        layout(&variants)
+    }
+
+    fn flat(
+        variants: &[Vec<Arc<Layout>>],
+        layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
+    ) -> Result<Layout, LayoutError> {
+        let mut fields = SmallVec::<[Arc<Layout>; FIELDS_INLINE]>::new();
+        let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
+        for variant in variants {
+            fields.extend(variant.iter().cloned());
+            ends.push(fields.len() as u32);
+        }
+        let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
+        layout(&variants_of(&refs, &ends))
+    }
+
+    #[test]
+    fn one_flat_buffer_matches_a_buffer_per_variant() {
+        let dl = TargetDataLayout::default();
+        let cx = LayoutCx::new(&dl);
+        let pool = sized_fields(&dl);
+        let tail = unsized_field(&dl);
+        let repr = ReprOptions::default();
+        let discr = |min: std::ops::RangeFrom<i128>, max: std::ops::RangeToInclusive<u128>| {
+            repr_discr(&dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false))
+        };
+        let mut seed = Seed(0x2545_f491_4f6c_dd1d);
+        for case in 0..400 {
+            let mut field = || pool[seed.below(pool.len())].clone();
+            let mut seed_len = Seed(case as u64 + 1);
+            let count = match case % 3 {
+                // An enum: up to six variants, a variant without fields among them.
+                0 => seed_len.below(7),
+                // A struct or a union.
+                _ => 1,
+            };
+            let mut variants: Vec<Vec<Arc<Layout>>> = (0..count)
+                .map(|_| (0..seed_len.below(6)).map(|_| field()).collect())
+                .collect();
+            let unsized_tail = case % 3 == 2 && seed_len.below(2) == 0;
+            if unsized_tail {
+                variants[0].push(tail.clone());
+            }
+            let is_enum = case % 3 == 0;
+            let struct_or_enum = |variants: &Variants<'_, '_>| -> Result<Layout, LayoutError> {
+                Ok(cx.calc.layout_of_struct_or_enum(
+                    &repr,
+                    variants,
+                    is_enum,
+                    NicheOptimizations::Enabled,
+                    discr,
+                    (0..variants.len()).map(|it| (RustcEnumVariantIdx(it), it as u128)),
+                    !is_enum && !unsized_tail,
+                )?)
+            };
+            assert_eq!(
+                flat(&variants, struct_or_enum),
+                nested_with_vecs(&variants, struct_or_enum),
+                "case {case}: {count} variants",
+            );
+            if case % 3 == 1 {
+                let union = |variants: &Variants<'_, '_>| -> Result<Layout, LayoutError> {
+                    Ok(cx.calc.layout_of_union(&repr, variants)?)
+                };
+                assert_eq!(flat(&variants, union), nested_with_vecs(&variants, union), "case {case}");
+            }
+        }
+    }
 }

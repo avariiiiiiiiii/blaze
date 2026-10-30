@@ -573,7 +573,10 @@ fn a_fetched_value_is_verified_before_it_is_kept() {
     let missing = store.fetch(&key(3), &mut remote, &mut effects).unwrap();
     let failed = store.fetch(&key(4), &mut remote, &mut effects).unwrap();
     assert_eq!(remote.0.len(), 4);
-    let answer = |answer: remote::Answer| Done::Read(answer.encode());
+    let answer = |answer: remote::Answer| {
+        let body = answer.encode();
+        Done::Read([(body.len() as u64).to_le_bytes().as_slice(), &body].concat())
+    };
     let value = |key, bytes: &[u8], content| remote::Answer::Value {
         key,
         kind: Kind::Code,
@@ -1275,4 +1278,178 @@ fn what_the_mover_leaves_warm_or_hot_reads_in_place_for_every_column_shape() {
             .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
         assert!(checked > 100, "{checked} shapes");
     }
+}
+
+/// Calls `tidy` until the store's limbo is empty and no index swap is waiting on writers. Other
+/// tests of this process hold guards of their own, so a grace can take a moment to pass.
+fn reclaim_all(store: &mut Store) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !store.limbo.is_empty() || store.migrating.is_some() {
+        store.tidy();
+        assert!(std::time::Instant::now() < deadline, "a grace never passed with no task of this test open");
+        std::thread::yield_now();
+    }
+}
+
+/// A worker's task reads each value it puts and holds what it read, while the store takes one
+/// batch of completions at a time through commits that move those values out of their
+/// segments, swap the index and retire views, spots and chunks. What the task read stays whole
+/// until it ends; then all of it is freed, every put is durable, and the store reopens with
+/// every value.
+#[test]
+fn what_a_task_read_stays_whole_through_every_step_of_commits_and_is_freed_after() {
+    for seed in 0..16 {
+        let mut sim = Sim::new(200 + seed, quiet());
+        let mut store = open(&mut sim, "store");
+        let mut writer = store.writer();
+        let reader = store.reader();
+        let guard = enter();
+        let (mut values, mut read, mut tickets) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut effects, mut out) = (Vec::new(), Vec::new());
+        for n in 0..INDEX_AFTER as u64 * 3 {
+            let (kind, bytes) = match n % 9 {
+                // Outputs alike but for their ends: their chunks are put once.
+                0 => (Kind::Output, noise(CHUNK_FROM + 1000 + n as usize, seed)),
+                1 => (Kind::Query, noise(EXTERNAL_FROM + n as usize, n)),
+                _ => (Kind::Query, noise(40 + (n as usize * 53) % 3000, n)),
+            };
+            tickets.push(writer.put(&guard, key(n), kind, bytes.clone()).unwrap());
+            let entry = reader.get(&guard, &key(n)).unwrap().expect("a put is read at once");
+            assert_eq!(entry.bytes, bytes.as_slice(), "seed {seed}");
+            read.push(entry.bytes);
+            values.push(bytes);
+            match sim.rng().below(3) {
+                0 => store.flush(&mut effects),
+                _ => {
+                    sim.submit(&mut effects);
+                    sim.poll(&mut out, Duration::ZERO);
+                    for completion in out.drain(..) {
+                        if store.owns(completion.tag) {
+                            store.complete(completion, &mut effects);
+                        }
+                    }
+                }
+            }
+            if n % 16 == 15 {
+                for (at, bytes) in read.iter().enumerate() {
+                    assert_eq!(*bytes, values[at].as_slice(), "seed {seed}: value {at} changed under its task");
+                }
+            }
+        }
+        drive(&mut sim, &mut store, &mut effects);
+        flush(&mut sim, &mut store);
+        for (at, bytes) in read.iter().enumerate() {
+            assert_eq!(*bytes, values[at].as_slice(), "seed {seed}: value {at} changed under its task");
+        }
+        assert!(store.tiers[0].head.index.is_some(), "seed {seed}: an index was written");
+        assert!(!store.limbo.is_empty(), "seed {seed}: what the task can still read is held");
+        drop(read);
+        drop(guard);
+        reclaim_all(&mut store);
+        assert!(store.tiers[0].prev.is_none(), "seed {seed}: the swap ended");
+        flush(&mut sim, &mut store);
+        assert!(tickets.iter().all(|it| store.durable(*it)), "seed {seed}: a put is not durable");
+        drop(writer);
+        drop(store);
+        let store = open(&mut sim, "store");
+        for (n, bytes) in values.iter().enumerate() {
+            assert_eq!(bytes_of(&store, &key(n as u64)).as_ref(), Some(bytes), "seed {seed}: {n}");
+        }
+        assert_eq!(store.verify(None), Vec::new(), "seed {seed}");
+    }
+}
+
+/// Four writers on threads of their own put every key at once, each from another place in
+/// the list, so they race to claim keys and the chunks their outputs share; two readers read
+/// every key the while; and the store's thread commits, settles and swaps its index under
+/// them. Every value read is whole and what was put, every put is durable after the last
+/// flush, and the store reopens with every value.
+#[test]
+fn writers_and_readers_on_other_threads_go_on_through_commits_settles_and_index_swaps() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const WRITERS: u64 = 4;
+    const KEYS: u64 = 240;
+    let values: Arc<Vec<(Kind, Vec<u8>)>> = Arc::new(
+        (0..KEYS)
+            .map(|n| match n % 20 {
+                0 => {
+                    let mut bytes = noise(CHUNK_FROM + (200 << 10), 7);
+                    let at = (n as usize * 4099) % bytes.len();
+                    bytes[at] ^= 0x5a;
+                    (Kind::Output, bytes)
+                }
+                1 => (Kind::Query, noise(EXTERNAL_FROM + n as usize, n)),
+                2 | 3 => (Kind::Run, run_output(n)),
+                _ => (Kind::Query, noise(32 + (n as usize * 37) % 2000, n)),
+            })
+            .collect(),
+    );
+    let mut sim = Sim::new(300, quiet());
+    let mut store = open(&mut sim, "store");
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..2u64)
+        .map(|first| {
+            let (reader, values, stop) = (store.reader(), values.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut found, mut at) = (0u64, first);
+                while !stop.load(Ordering::Relaxed) {
+                    let guard = enter();
+                    for _ in 0..16 {
+                        at = (at + 31) % KEYS;
+                        let (kind, bytes) = &values[at as usize];
+                        let entry = reader.get(&guard, &key(at)).unwrap_or_else(|corrupt| panic!("{corrupt}"));
+                        if let Some(entry) = entry {
+                            assert_eq!((entry.kind, entry.bytes), (*kind, bytes.as_slice()), "key {at}");
+                            found += 1;
+                        }
+                    }
+                    drop(guard);
+                }
+                found
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..WRITERS)
+        .map(|number| {
+            let (mut writer, values) = (store.writer(), values.clone());
+            std::thread::spawn(move || {
+                let mut tickets = Vec::new();
+                for i in 0..KEYS {
+                    let n = (i + number * KEYS / WRITERS) % KEYS;
+                    let (kind, bytes) = &values[n as usize];
+                    let guard = enter();
+                    tickets.push(writer.put(&guard, key(n), *kind, bytes.clone()).unwrap());
+                }
+                tickets
+            })
+        })
+        .collect();
+    let mut rounds = 0u32;
+    while !writers.iter().all(|it| it.is_finished()) {
+        flush(&mut sim, &mut store);
+        if rounds % 4 == 3 {
+            settle(&mut sim, &mut store);
+        }
+        rounds += 1;
+        std::thread::yield_now();
+    }
+    let tickets: Vec<Ticket> = writers.into_iter().flat_map(|it| it.join().unwrap()).collect();
+    flush(&mut sim, &mut store);
+    assert!(store.broken().is_none(), "{:?}", store.broken());
+    assert_eq!(tickets.len() as u64, WRITERS * KEYS);
+    assert!(tickets.iter().all(|it| store.durable(*it)), "every put is durable after the last flush");
+    stop.store(true, Ordering::Relaxed);
+    let found: u64 = readers.into_iter().map(|it| it.join().unwrap()).sum();
+    assert!(found > 0, "the readers read");
+    for (n, (kind, bytes)) in values.iter().enumerate() {
+        let entry = store.get(&key(n as u64)).unwrap().unwrap();
+        assert_eq!((entry.kind, entry.bytes), (*kind, bytes.as_slice()), "{n}");
+    }
+    assert!(store.tiers[0].head.index.is_some(), "the index was swapped under them");
+    drop(store);
+    let store = open(&mut sim, "store");
+    for (n, (_, bytes)) in values.iter().enumerate() {
+        assert_eq!(bytes_of(&store, &key(n as u64)).as_ref(), Some(bytes), "{n}");
+    }
+    assert_eq!(store.verify(None), Vec::new());
 }

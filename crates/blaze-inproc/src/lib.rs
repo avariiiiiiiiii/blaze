@@ -411,12 +411,13 @@ impl CodeMemory {
             return Ok(0);
         }
         self.post();
+        let births = self.fences.births();
         for process in &mut self.processes {
             sys::threads(process.pid, &mut process.threads)?;
         }
         let lists: Vec<(u32, &[u64])> =
             self.processes.iter().map(|it| (it.pid, it.threads.as_slice())).collect();
-        let oldest = self.fences.oldest(&lists);
+        let oldest = self.fences.oldest(births, &lists);
         let Some(oldest) = oldest else { return Ok(0) };
         let mut freed = 0;
         let mut index = 0;

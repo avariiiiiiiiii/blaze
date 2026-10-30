@@ -26,11 +26,11 @@ use rustc_type_ir::{
     fold_regions,
     inherent::{
         BoundExistentialPredicates as _, Clause as _, GenericArgs as _, IntoKind as _,
-        Safety as _, Ty as _,
+        Safety as _, Term as _, Ty as _,
     },
 };
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
 
 use super::{
     paths::{self, Def, Parent},
@@ -269,26 +269,40 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     self.write_fmt(format_args!("{}:{lo_line}:{lo_col}: {hi_line}:{hi_col}", span.file));
                 }
             }
-            Some(Site::Path(path)) => self.print_parent(&path, parent_args),
-            None => self.write_str("{unknown}"),
+            Site::Path(path) => self.print_parent(&path, parent_args),
         }
     }
 
     /// rustc's `def_span` of a closure-like definition: from the start of a closure (its
     /// `for<..>`, `move` and `async` included, its attributes not) to the end of its
-    /// parameters or return type; all of an `async` or `gen` block.
-    fn site(&self, loc: InternedClosure<'t>) -> Option<Site> {
+    /// parameters or return type; all of an `async` or `gen` block. The coroutine of an
+    /// `async` closure's body has the closure's: it has no syntax of its own, and is the body
+    /// of the closure.
+    fn site(&self, loc: InternedClosure<'t>) -> Site {
         let db = self.db;
         let owner = loc.owner.expression_store_owner(db);
-        let (_, map) = hir_def::expr_store::ExpressionStore::with_source_map(db, owner);
-        let src = map.expr_syntax(loc.expr).ok()?;
+        let (store, map) = hir_def::expr_store::ExpressionStore::with_source_map(db, owner);
+        let src = map
+            .expr_syntax(loc.expr)
+            .or_else(|err| match loc.kind {
+                HirClosureKind::Coroutine { source: CoroutineSource::Closure, .. } => store
+                    .exprs()
+                    .find_map(|(id, expr)| match expr {
+                        hir_def::hir::Expr::Closure { body, .. } if body == loc.expr => Some(id),
+                        _ => None,
+                    })
+                    .map_or(Err(err), |closure| map.expr_syntax(closure)),
+                _ => Err(err),
+            })
+            .expect("a closure-like expression not desugared from a function has syntax");
         let node = self.cx.node(src);
         let syntax = node.value.syntax().clone();
         let local = hir::Crate::from(hir_def::HasModule::krate(&owner, db)) == self.cx.krate;
         if !local {
-            return paths::closure_path(self.cx, syntax).map(Site::Path);
+            let path = paths::closure_path(self.cx, syntax).expect("a closure is written in a body");
+            return Site::Path(path);
         }
-        Some(Site::Span(self.cx.span(node.with_value(decl_range(&syntax)))))
+        Site::Span(self.cx.span(node.with_value(decl_range(&syntax))))
     }
 
     /// `[for<'a> ]fn(..) -> T {path}`, with a function's late-bound lifetimes by their names.
@@ -579,7 +593,11 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             }
         };
         if let Some((item, term)) = item {
-            traits[index].1.push((item, term.skip_binder()));
+            let assoc = &mut traits[index].1;
+            match assoc.iter_mut().find(|(it, _)| *it == item) {
+                Some(entry) => entry.1 = term.skip_binder(),
+                None => assoc.push((item, term.skip_binder())),
+            }
         }
     }
 
@@ -841,26 +859,19 @@ pub(super) fn string_with_limit(cx: &Cx<'_, '_>, ty: Ty<'_>, limit: usize, mode:
     }
 }
 
-/// rustc's `Ty::sort_string`: what kind of type `ty` is, or the type in backticks.
+/// rustc's `Ty::sort_string`: what kind of type `ty` is, or the type in backticks, at most
+/// `max(diagnostic_width / 4, 40)` bytes long with rustc's default width.
 pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
     let db = cx.db;
     match ty.kind() {
         TyKind::Foreign(it) => format!("extern type `{}`", path_string(cx, Def::TypeAlias(it.0), mode)),
-        TyKind::FnDef(def, _) => match def.0 {
-            hir_ty::CallableDefId::StructId(_) => "struct constructor".to_owned(),
-            hir_ty::CallableDefId::EnumVariantId(_) => "enum constructor".to_owned(),
-            hir_ty::CallableDefId::FunctionId(_) => "fn item".to_owned(),
-        },
+        TyKind::FnDef(def, _) => fn_def_kind(def).to_owned(),
         TyKind::FnPtr(..) => "fn pointer".to_owned(),
-        TyKind::UnsafeBinder(_) => "unsafe binder".to_owned(),
-        TyKind::Dynamic(preds, _) => match preds.principal() {
-            Some(principal) => {
-                format!("`dyn {}`", path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode))
-            }
-            None => "trait object".to_owned(),
-        },
+        TyKind::Dynamic(preds, _) if let Some(principal) = preds.principal() => {
+            format!("`dyn {}`", path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode))
+        }
+        TyKind::Dynamic(..) => "trait object".to_owned(),
         TyKind::Closure(..) => "closure".to_owned(),
-        TyKind::CoroutineClosure(..) => "async closure".to_owned(),
         TyKind::Coroutine(id, _) => coroutine_desc(id.0.loc(db).kind, true),
         TyKind::CoroutineWitness(..) => "coroutine witness".to_owned(),
         TyKind::Infer(InferTy::TyVar(_)) => "inferred type".to_owned(),
@@ -871,72 +882,70 @@ pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
         TyKind::Infer(InferTy::FreshTy(_)) => "fresh type".to_owned(),
         TyKind::Infer(InferTy::FreshIntTy(_)) => "fresh integral type".to_owned(),
         TyKind::Infer(InferTy::FreshFloatTy(_)) => "fresh floating-point type".to_owned(),
-        TyKind::Alias(alias) => match alias.kind {
-            AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } => "associated type".to_owned(),
-            AliasTyKind::Opaque { def_id } if is_future(cx, def_id.0) => "future".to_owned(),
-            AliasTyKind::Opaque { .. } => "opaque type".to_owned(),
-            AliasTyKind::Free { .. } => format!("`{}`", string_with_limit(cx, ty, 40, mode)),
-        },
+        TyKind::Alias(alias) if matches!(alias.kind, AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }) => {
+            "associated type".to_owned()
+        }
         TyKind::Param(_) => format!("type parameter `{}`", string(cx, ty, mode)),
+        TyKind::Alias(alias) if let AliasTyKind::Opaque { def_id } = alias.kind => {
+            if is_future(cx, def_id.0) { "future".to_owned() } else { "opaque type".to_owned() }
+        }
         TyKind::Error(_) => "type error".to_owned(),
         _ => format!("`{}`", string_with_limit(cx, ty, 40, mode)),
+    }
+}
+
+fn fn_def_kind(def: CallableIdWrapper) -> &'static str {
+    match def.0 {
+        hir_ty::CallableDefId::StructId(_) => "struct constructor",
+        hir_ty::CallableDefId::EnumVariantId(_) => "enum constructor",
+        hir_ty::CallableDefId::FunctionId(_) => "fn item",
     }
 }
 
 /// rustc's `Ty::prefix_string`: the kind of type `ty` is, for `expected X, found Y`.
 pub(super) fn prefix_string(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
     let db = cx.db;
-    match ty.kind() {
-        TyKind::Infer(InferTy::IntVar(_) | InferTy::FreshIntTy(_))
+    let s = match ty.kind() {
+        TyKind::Infer(_)
+        | TyKind::Error(_)
+        | TyKind::Bool
+        | TyKind::Char
         | TyKind::Int(_)
-        | TyKind::Uint(_) => "integer".to_owned(),
-        TyKind::Infer(InferTy::FloatVar(_) | InferTy::FreshFloatTy(_)) | TyKind::Float(_) => {
-            "floating-point number".to_owned()
-        }
-        TyKind::Bool => "bool".to_owned(),
-        TyKind::Char => "char".to_owned(),
-        TyKind::Str => "str".to_owned(),
-        TyKind::Never => "never type".to_owned(),
-        TyKind::Tuple(tys) if tys.as_slice().is_empty() => "unit type".to_owned(),
-        TyKind::Tuple(_) => "tuple".to_owned(),
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never => "type",
+        TyKind::Tuple(tys) if tys.as_slice().is_empty() => "unit type",
         TyKind::Adt(def, _) => match def.def_id() {
-            AdtId::StructId(_) => "struct".to_owned(),
-            AdtId::UnionId(_) => "union".to_owned(),
-            AdtId::EnumId(_) => "enum".to_owned(),
+            AdtId::StructId(_) => "struct",
+            AdtId::UnionId(_) => "union",
+            AdtId::EnumId(_) => "enum",
         },
-        TyKind::Foreign(_) => "extern type".to_owned(),
-        TyKind::Array(..) => "array".to_owned(),
-        TyKind::Pat(..) => "pattern type".to_owned(),
-        TyKind::Slice(_) => "slice".to_owned(),
-        TyKind::RawPtr(..) => "raw pointer".to_owned(),
-        TyKind::Ref(_, inner, m) => match (inner.kind(), m) {
-            (TyKind::Param(_), Mutability::Mut) => "mutable reference".to_owned(),
-            (TyKind::Param(_), Mutability::Not) => "reference".to_owned(),
-            _ => format!("&{}", prefix_string(cx, inner)),
-        },
-        TyKind::FnDef(def, _) => match def.0 {
-            hir_ty::CallableDefId::StructId(_) => "struct constructor".to_owned(),
-            hir_ty::CallableDefId::EnumVariantId(_) => "enum constructor".to_owned(),
-            hir_ty::CallableDefId::FunctionId(_) => "fn item".to_owned(),
-        },
-        TyKind::FnPtr(..) => "fn pointer".to_owned(),
-        TyKind::UnsafeBinder(_) => "unsafe binder".to_owned(),
-        TyKind::Dynamic(..) => "trait object".to_owned(),
-        TyKind::Closure(..) => "closure".to_owned(),
-        TyKind::CoroutineClosure(..) => "async closure".to_owned(),
-        TyKind::Coroutine(id, _) => coroutine_desc(id.0.loc(db).kind, true),
-        TyKind::CoroutineWitness(..) => "coroutine witness".to_owned(),
-        TyKind::Infer(InferTy::TyVar(_) | InferTy::FreshTy(_)) => "type".to_owned(),
-        TyKind::Bound(..) | TyKind::Placeholder(_) => "type".to_owned(),
-        TyKind::Param(_) => "type parameter".to_owned(),
+        TyKind::Foreign(_) => "extern type",
+        TyKind::Array(..) => "array",
+        TyKind::Pat(..) => "pattern type",
+        TyKind::Slice(_) => "slice",
+        TyKind::RawPtr(..) => "raw pointer",
+        TyKind::Ref(_, _, Mutability::Mut) => "mutable reference",
+        TyKind::Ref(..) => "reference",
+        TyKind::FnDef(def, _) => fn_def_kind(def),
+        TyKind::FnPtr(..) => "fn pointer",
+        TyKind::UnsafeBinder(_) => "unsafe binder",
+        TyKind::Dynamic(..) => "trait object",
+        TyKind::Closure(..) | TyKind::CoroutineClosure(..) => "closure",
+        TyKind::Coroutine(id, _) => return coroutine_desc(id.0.loc(db).kind, true),
+        TyKind::CoroutineWitness(..) => "coroutine witness",
+        TyKind::Tuple(_) => "tuple",
+        TyKind::Placeholder(_) => "higher-ranked type",
+        TyKind::Bound(..) => "bound type variable",
         TyKind::Alias(alias) => match alias.kind {
-            AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } | AliasTyKind::Free { .. } => {
-                "associated type".to_owned()
-            }
-            AliasTyKind::Opaque { .. } => "opaque type".to_owned(),
+            AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } => "associated type",
+            AliasTyKind::Free { .. } => "type alias",
+            AliasTyKind::Opaque { .. } => "opaque type",
         },
-        TyKind::Error(_) => "type error".to_owned(),
-    }
+        TyKind::Param(_) => "type parameter",
+    };
+    s.to_owned()
 }
 
 /// Whether an opaque type is bounded by `Future`: rustc's `is_impl_trait_future`.
@@ -950,7 +959,7 @@ fn is_future(cx: &Cx<'_, '_>, id: InternedOpaqueTyId<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextSize, line_col};
+    use super::line_col;
 
     #[test]
     fn columns_count_chars_from_one() {
@@ -958,6 +967,5 @@ mod tests {
         let at = text.find('|').unwrap() as u32;
         assert_eq!(line_col(text, at), (2, 13));
         assert_eq!(line_col(text, 0), (1, 1));
-        let _ = TextSize::from(at);
     }
 }

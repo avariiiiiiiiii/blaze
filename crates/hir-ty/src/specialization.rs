@@ -7,7 +7,9 @@ use hir_def::{
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
-    TypeVisitor, fast_reject::DeepRejectCtxt, inherent::IntoKind as _,
+    TypeVisitor,
+    fast_reject::{DeepRejectCtxt, TreatParams, simplify_type},
+    inherent::IntoKind as _,
 };
 use smallvec::SmallVec;
 use tracing::debug;
@@ -16,9 +18,9 @@ use crate::{
     Span,
     db::HirDatabase,
     lower::GenericPredicates,
-    method_resolution::TraitImpls,
+    method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
-        ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
+        AnyImplId, ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
         infer::{DbInternerInferExt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
         util::clauses_as_obligations,
@@ -183,17 +185,37 @@ pub(crate) fn specialized_ancestor(
     // As rustc's `overlapping_impls` rejects a pair before relating it, with the parameters as
     // `specializes_query` has them: the specializing impl's rigid, the parent's inference
     // variables. A pair rejected here is one whose trait refs that query fails to equate.
-    let reject = DeepRejectCtxt::relate_rigid_infer(DbInterner::new_no_crate(db));
+    let interner = DbInterner::new_no_crate(db);
+    let reject = DeepRejectCtxt::relate_rigid_infer(interner);
     let headers_may_unify = |ancestor: ImplId| {
         db.impl_trait(ancestor).is_some_and(|parent| {
             let parent = parent.instantiate_identity().skip_norm_wip();
             reject.args_may_unify(trait_ref.args, parent.args)
         })
     };
+    // An impl `impl_id` specializes is at least as general: a blanket impl, or one for the
+    // same simplified self type. The closest is the one that specializes every other, so the
+    // order these come in (blanket impls of every crate first) picks the same one.
+    let (krate, trait_id) = (impl_id.krate(db), trait_ref.def_id.0);
+    let for_self_ty =
+        match simplify_type(interner, trait_ref.self_ty(), TreatParams::InstantiateWithInfer) {
+            Some(self_ty) => TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
+                db,
+                krate,
+                trait_id,
+                SelfTyKey(self_ty),
+            ),
+            None => &[],
+        };
+    let for_self_ty = for_self_ty.iter().filter_map(|&it| match it {
+        AnyImplId::ImplId(it) => Some(it),
+        AnyImplId::BuiltinDeriveImplId(_) => None,
+    });
     let ancestors: SmallVec<[ImplId; 4]> =
-        TraitImpls::in_crate_and_deps_for_trait(db, impl_id.krate(db), trait_ref.def_id.0)
+        TraitImpls::blanket_in_crate_and_deps(db, krate, trait_id)
             .iter()
             .copied()
+            .chain(for_self_ty)
             .filter(|&ancestor| {
                 ancestor != impl_id
                     && has_item(ancestor)

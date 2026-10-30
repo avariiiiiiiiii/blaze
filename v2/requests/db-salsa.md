@@ -426,3 +426,4 @@ database's limbo, `blaze_reclaim`), and `reclaim`/`settle` free the rest at once
 are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an append-only column.
 
 > for blaze-cargo, blaze-units, blaze-tree and lane db.
+> forwarded to cargo (the nine call sites) and db (`query-database.md`).

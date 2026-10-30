@@ -67,7 +67,24 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   only moves the source map. This is the per-definition granularity of Unison's content-addressed
   code, with positions kept apart. `expr_store/tests/invalidation.rs` tests the three cases.
 
+- **Expression scopes** (`scope.rs`, built for every body inference reads): one entries array
+  with a range per scope, and a dense `ExprId`-indexed scope column (4 bytes, was 8 in an
+  `ArenaMap` of `Option`). Per scope 17 bytes in columns, where before it was about 32 plus a
+  `Box` per macro scope. Built in per-thread scratch and copied out exactly.
+- **`body_syntax`** (re-run for every body of a file on each edit of it) built the relative
+  `AstIdMap` and span map once per body. It now builds them once per anchor, shared by its bodies:
+  for an `impl` of \(M\) methods and \(n\) nodes, \(O(Mn) \to O(n + M)\) per edit.
+- **Scans**: `expr_ids()` / `pat_ids()` give a store's ids without decoding, for the id-only
+  whole-store scans in `hir-ty-borrowck` (request in `v2/requests/db.md`).
+
 ## Still short, and what it takes
+
+- **Signatures re-lower on every edit of their file.** `FunctionSignature::with_source_map` and
+  the other signatures lower from the file's AST with absolute pointers, so any edit re-runs them
+  and they backdate. Making signatures relative to an anchor, as bodies are, removes that
+  (`signatures.rs`, speed-hir-defs).
+- **A path interns its `ModPath` per lowering** (`lower/path.rs`, `Interned::new`), one hash per
+  path. This is the next step after `Path` columns.
 
 - **`Option<Idx>` is 8 bytes.** `la_arena::Idx` has no niche, so `Statement` stays 32 bytes,
   `MatchArm` 16 and `RefType` 16. A raw index that can't be `u32::MAX` (a `NonMaxU32`-style

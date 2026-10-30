@@ -32,8 +32,10 @@ pub(super) enum Read {
     /// `#[automatically_derived]` (`single_use_lifetimes`) or `#[doc(hidden)]`
     /// (`missing_docs`): a lint allowed with no attribute naming it.
     Allows(&'static str),
-    /// `#[allow(..)]`, `#[expect(..)]`, `#[warn(..)]`, `#[deny(..)]`, `#[forbid(..)]`.
-    Level(Level, Items),
+    /// `#[allow(..)]`, `#[expect(..)]`, `#[warn(..)]`, `#[deny(..)]`, `#[forbid(..)]`, and
+    /// whether it is written as itself rather than made by a `cfg_attr`, which rustc's
+    /// pre-expansion lint pass sees unexpanded.
+    Level(Level, Items, bool),
 }
 
 /// The elements of a list, inline for the usual few.
@@ -151,8 +153,9 @@ fn attrs_of(owner: &ast::AnyHasAttrs) -> impl Iterator<Item = ast::Attr> {
 /// order.
 pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Vec<Read> {
     let mut found = Vec::new();
-    hir_expand::attrs::expand_cfg_attr(attrs_of(owner), || cfg, |meta, _| {
-        if let Some(read) = read_meta(&meta, edition) {
+    hir_expand::attrs::expand_cfg_attr(attrs_of(owner), || cfg, |meta, top| {
+        let direct = top.meta().is_some_and(|it| it.syntax() == meta.syntax());
+        if let Some(read) = read_meta(&meta, edition, direct) {
             found.push(read);
         }
         ControlFlow::<()>::Continue(())
@@ -160,7 +163,7 @@ pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition)
     found
 }
 
-fn read_meta(meta: &ast::Meta, edition: Edition) -> Option<Read> {
+fn read_meta(meta: &ast::Meta, edition: Edition, direct: bool) -> Option<Read> {
     let name = |path: Option<ast::Path>| path.and_then(|it| it.as_single_name_ref());
     match meta {
         ast::Meta::PathMeta(it) if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") => {
@@ -175,7 +178,7 @@ fn read_meta(meta: &ast::Meta, edition: Edition) -> Option<Read> {
             };
             let items = list(&it.token_tree()?, edition)?;
             match level {
-                Some(level) => Some(Read::Level(level, items)),
+                Some(level) => Some(Read::Level(level, items, direct)),
                 None => {
                     let hidden = items.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
                     hidden.then_some(Read::Allows("missing_docs"))

@@ -112,7 +112,8 @@ impl LatePass for InvalidValue {
 fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
     let store = b.store();
     match store.expr(expr) {
-        Expr::Call { callee, args } => {
+        // `mem::zeroed()` and `mem::uninitialized()` take no argument, `transmute` one.
+        Expr::Call { callee, args } if args.len() <= 1 => {
             let Expr::Path(_) = store.expr(callee) else { return None };
             match util::path_item(b, callee)?.as_str() {
                 "mem_zeroed" => Some(Init::Zeroed),
@@ -121,13 +122,13 @@ fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
                 _ => None,
             }
         }
-        Expr::MethodCall { receiver, .. } => {
+        Expr::MethodCall { receiver, args: &[], .. } => {
+            let Expr::Call { callee, args: &[] } = store.expr(receiver) else { return None };
+            let Expr::Path(_) = store.expr(callee) else { return None };
             let def = util::method_fn(b, expr)?;
             if util::fn_item(b.db(), def).as_ref().map(Symbol::as_str) != Some("assume_init") {
                 return None;
             }
-            let Expr::Call { callee, .. } = store.expr(receiver) else { return None };
-            let Expr::Path(_) = store.expr(callee) else { return None };
             match util::path_item(b, callee)?.as_str() {
                 "maybe_uninit_zeroed" => Some(Init::Zeroed),
                 "maybe_uninit_uninit" => Some(Init::Uninit),

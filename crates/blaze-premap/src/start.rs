@@ -9,104 +9,64 @@
 //! - **Libraries** load in link-line order, each once: the image's and the workspace's lists
 //!   merged by their place on the line. Each list holds what its link uses (an `as_needed`
 //!   library neither uses is in neither), so the union is the whole link's list.
-//! - **Thread-locals.** One static block: the image's part first (nearest the thread pointer,
-//!   so the offsets its link computed alone hold), the workspace's after ([`TlsBlock`]).
+//! - **Thread-locals.** The run's loader keeps one area aside in every thread's static block
+//!   ([`TlsReserve`]); a program's thread-locals are at `bias + offset` in it. The image's
+//!   part is at offset 0, so the offsets its link computed alone hold in every run; the
+//!   workspace's part follows it ([`workspace_tls_offset`]). On Mach-O the same offsets are
+//!   into the one template the loader's descriptors point at.
 //! - **Init and fini** pieces of both, merged in the whole link's order (rank, link-line
 //!   order, tie), each piece's pointers in address order; fini runs last to first.
 
-use blaze_codegen::Arch;
-use blaze_link::Format;
+use blaze_inproc::TlsReserve;
 
 use crate::PremapError;
 use crate::image::View;
 use crate::prelink::{BindKind, InitEntry, Library, Tls};
 use crate::table::{Def, Kind, Strength, SymbolId};
 
-/// How a target lays out the static thread-local block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Variant {
-    /// Below the thread pointer, the first module's block nearest it (x86-64 ELF, variant II).
-    Below,
-    /// Above the thread pointer after a control block of `tcb` bytes, the first module's
-    /// block first (AArch64 ELF, variant I, 16 bytes); Mach-O's TLV and PE's `.tls`, whose
-    /// offsets are from the start of the template (0).
-    Above { tcb: u64 },
-}
-
-pub fn variant(format: Format, arch: Arch) -> Result<Variant, PremapError> {
-    match (format, arch) {
-        (Format::Elf, Arch::X86_64) => Ok(Variant::Below),
-        (Format::Elf, Arch::Aarch64) => Ok(Variant::Above { tcb: 16 }),
-        (Format::MachO | Format::Pe, Arch::X86_64 | Arch::Aarch64) => Ok(Variant::Above { tcb: 0 }),
-        (format, arch) => Err(PremapError::new(format!("no dependency image for {format:?} on {arch:?}"))),
-    }
-}
-
-/// One part of the block: the template's bytes at `template`, `init` initialized and zeroes
-/// to `size`, copied to `offset` from the thread pointer.
+/// One part of the program's thread-local area: the template's bytes at `template`, `init`
+/// initialized and zeroes to `size`, copied to `offset` in the area.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TlsPart {
     pub template: u64,
     pub init: u64,
     pub size: u64,
-    pub offset: i64,
+    pub offset: u64,
 }
 
-/// The run's static thread-local block.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TlsBlock {
-    pub variant: Variant,
-    /// The image's part first.
-    pub parts: Vec<TlsPart>,
-    /// The bytes from the lowest part's start to the highest part's end.
-    pub size: u64,
-    /// The thread pointer's alignment.
-    pub align: u64,
+/// Where the workspace's thread-locals start in the area, after the image's. The workspace
+/// link places them there (`v2/requests/fastcompile.md`, fastcompile-premap 2) and says where
+/// it put them ([`WorkspaceLink::tls_offset`]); [`plan`] refuses a difference.
+pub fn workspace_tls_offset(image: Option<&Tls>, align: u64) -> u64 {
+    image.map_or(0, |it| it.size.next_multiple_of(align.max(1)))
 }
 
-/// Where the image's thread-locals start from the thread pointer: as its link computed them,
-/// alone, as the first module.
-pub fn image_tls_start(variant: Variant, image: &Tls) -> i64 {
-    match variant {
-        Variant::Below => -(image.size.next_multiple_of(image.align) as i64),
-        Variant::Above { tcb } => tcb.next_multiple_of(image.align) as i64,
-    }
-}
-
-/// Where the workspace's thread-locals start from the thread pointer, after the image's.
-/// The workspace link computes the same (`v2/requests/fastcompile.md`, fastcompile-premap 2)
-/// and says what it got ([`WorkspaceLink::tls_start`]); [`plan`] refuses a difference.
-pub fn workspace_tls_start(variant: Variant, image: Option<&Tls>, size: u64, align: u64) -> i64 {
-    match (variant, image) {
-        (Variant::Below, None) => -(size.next_multiple_of(align) as i64),
-        (Variant::Below, Some(image)) => {
-            let end = image_tls_start(variant, image);
-            let start = end - size as i64;
-            start - start.rem_euclid(align as i64)
-        }
-        (Variant::Above { tcb }, None) => tcb.next_multiple_of(align) as i64,
-        (Variant::Above { .. }, Some(image)) => {
-            let end = image_tls_start(variant, image) as u64 + image.size;
-            end.next_multiple_of(align) as i64
-        }
-    }
-}
-
-pub fn tls_block(variant: Variant, image: Option<&Tls>, workspace: Option<(&Tls, i64)>) -> TlsBlock {
+/// The parts of the area, the image's first, checked against what the loader keeps aside.
+pub fn tls_parts(
+    reserve: &TlsReserve,
+    image: Option<&Tls>,
+    workspace: Option<(&Tls, u64)>,
+) -> Result<Vec<TlsPart>, PremapError> {
     let mut parts = Vec::with_capacity(2);
-    let mut align = 1;
-    if let Some(image) = image {
-        let offset = image_tls_start(variant, image);
-        parts.push(TlsPart { template: image.template, init: image.init, size: image.size, offset });
-        align = align.max(image.align);
+    if let Some(tls) = image {
+        parts.push((tls, 0));
     }
     if let Some((tls, offset)) = workspace {
-        parts.push(TlsPart { template: tls.template, init: tls.init, size: tls.size, offset });
-        align = align.max(tls.align);
+        parts.push((tls, offset));
     }
-    let low = parts.iter().map(|it| it.offset).min().unwrap_or(0);
-    let high = parts.iter().map(|it| it.offset + it.size as i64).max().unwrap_or(0);
-    TlsBlock { variant, parts, size: (high - low) as u64, align }
+    let mut out = Vec::with_capacity(parts.len());
+    for (tls, offset) in parts {
+        let end = offset.checked_add(tls.size);
+        if tls.align > reserve.align || !offset.is_multiple_of(tls.align) || end.is_none_or(|end| end > reserve.size) {
+            return Err(PremapError::new(format!(
+                "the run's loader keeps {} bytes aligned to {} for thread-locals, and they need {} bytes \
+                 aligned to {} at {offset}",
+                reserve.size, reserve.align, tls.size, tls.align
+            )));
+        }
+        out.push(TlsPart { template: tls.template, init: tls.init, size: tls.size, offset });
+    }
+    Ok(out)
 }
 
 /// What the workspace link made, as the run's start needs it (blaze-link's layout of the
@@ -118,8 +78,10 @@ pub struct WorkspaceLink<'a> {
     pub init: &'a [InitEntry],
     pub fini: &'a [InitEntry],
     pub tls: Option<Tls>,
-    /// Where its link put its thread-locals from the thread pointer.
-    pub tls_start: Option<i64>,
+    /// Where its link put its thread-locals in the run's area.
+    pub tls_offset: Option<u64>,
+    /// Mach-O: its thread-local descriptors (`__thread_vars`), as address and length.
+    pub thread_vars: &'a [(u64, u64)],
     pub libraries: &'a [Library],
     pub unwind: &'a [(u64, u64)],
 }
@@ -142,7 +104,10 @@ pub struct Start<'a> {
     /// 8-byte cells to write: `(address, value)`.
     pub writes: Vec<(u64, u64)>,
     pub lookups: Vec<Lookup<'a>>,
-    pub tls: TlsBlock,
+    /// The program's thread-local area, the image's part first.
+    pub tls: Vec<TlsPart>,
+    /// Mach-O: thread-local descriptors the loader fills (its thunk, a key, the offset kept).
+    pub thread_vars: Vec<(u64, u64)>,
     /// Call frame information to register: address and length.
     pub unwind: Vec<(u64, u64)>,
     /// Cells holding the functions to call, in order, with `argc`, `argv` and `envp`.
@@ -151,10 +116,13 @@ pub struct Start<'a> {
     pub fini: Vec<u64>,
 }
 
-/// The run's start for `image` mapped beside `workspace`.
-pub fn plan<'a>(image: &View<'a>, workspace: &WorkspaceLink<'a>) -> Result<Start<'a>, PremapError> {
-    let meta = image.meta();
-    let variant = variant(meta.format, meta.arch)?;
+/// The run's start for `image` mapped beside `workspace`, in a loader that keeps `reserve`
+/// for thread-locals.
+pub fn plan<'a>(
+    image: &View<'a>,
+    workspace: &WorkspaceLink<'a>,
+    reserve: &TlsReserve,
+) -> Result<Start<'a>, PremapError> {
     if !workspace.names.is_sorted_by(|a, b| a.0 < b.0) {
         return Err(PremapError::new("the workspace link's names are not sorted, each once".to_owned()));
     }
@@ -218,18 +186,18 @@ pub fn plan<'a>(image: &View<'a>, workspace: &WorkspaceLink<'a>) -> Result<Start
     let mut seen = rustc_hash::FxHashSet::default();
     let libraries = libraries.into_iter().filter(|it| seen.insert(it.1)).map(|it| it.1).collect();
 
-    let tls = match (workspace.tls, workspace.tls_start) {
-        (Some(tls), Some(start)) => {
-            let expected = workspace_tls_start(variant, image_tls.as_ref(), tls.size, tls.align);
-            if start != expected {
+    let tls = match (workspace.tls, workspace.tls_offset) {
+        (Some(tls), Some(offset)) => {
+            let expected = workspace_tls_offset(image_tls.as_ref(), tls.align);
+            if offset != expected {
                 return Err(PremapError::new(format!(
-                    "the workspace link put its thread-locals at {start} from the thread pointer, and \
-                     after the dependency image's they start at {expected}"
+                    "the workspace link put its thread-locals at {offset} in the run's area, and after \
+                     the dependency image's they start at {expected}"
                 )));
             }
-            tls_block(variant, image_tls.as_ref(), Some((&tls, start)))
+            tls_parts(reserve, image_tls.as_ref(), Some((&tls, offset)))?
         }
-        (None, None) => tls_block(variant, image_tls.as_ref(), None),
+        (None, None) => tls_parts(reserve, image_tls.as_ref(), None)?,
         _ => {
             return Err(PremapError::new(
                 "the workspace link has a thread-local template and no place for it, or a place and none".to_owned(),
@@ -243,7 +211,9 @@ pub fn plan<'a>(image: &View<'a>, workspace: &WorkspaceLink<'a>) -> Result<Start
     let fini = merged(&image_fini, workspace.fini)?;
     let mut unwind: Vec<(u64, u64)> = image.unwind().collect();
     unwind.extend_from_slice(workspace.unwind);
-    Ok(Start { libraries, writes, lookups, tls, unwind, init, fini })
+    let mut thread_vars: Vec<(u64, u64)> = image.thread_vars().collect();
+    thread_vars.extend_from_slice(workspace.thread_vars);
+    Ok(Start { libraries, writes, lookups, tls, thread_vars, unwind, init, fini })
 }
 
 /// The cells of both sides' pieces in a whole link's order.

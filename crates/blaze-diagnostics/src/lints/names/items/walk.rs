@@ -84,6 +84,17 @@ pub(super) fn source_order(module: &[u32], lo: u32) -> Vec<u32> {
     key
 }
 
+/// The fields of a struct, a union or an enum's variants, in the order they are written.
+pub(super) fn fields(item: &Item) -> Vec<InFile<SyntaxNode>> {
+    let mut fields: Vec<InFile<SyntaxNode>> = item
+        .own::<ast::RecordField>()
+        .map(|it| it.map(|it| it.syntax().clone()))
+        .chain(item.own::<ast::TupleField>().map(|it| it.map(|it| it.syntax().clone())))
+        .collect();
+    fields.sort_by_key(|it| (it.file_id != item.node.file_id, it.value.text_range().start()));
+    fields
+}
+
 /// The items of `cx.krate` in the order rustc visits them.
 pub(super) fn items(cx: &Cx<'_, '_>) -> Vec<Item> {
     let mut walk = Walk { cx, items: Vec::new() };

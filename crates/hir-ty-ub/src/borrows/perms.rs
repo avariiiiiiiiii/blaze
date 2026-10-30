@@ -252,6 +252,7 @@ impl Permission {
         self.inner.compatible_with_protector()
     }
 
+    #[cfg(test)]
     pub(super) fn is_reserved_frz_with_conflicted(self, conflicted: bool) -> bool {
         match self.inner {
             ReservedFrz => !conflicted,

@@ -13,7 +13,7 @@
 
 use hir::{HasAttrs as _, InFile, ModuleDef, PathResolution};
 use span::Edition;
-use syntax::{AstNode, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
 
 use super::{
     Signature,
@@ -44,8 +44,12 @@ impl Source {
             let is_trait = imp.trait_().is_some_and(|it| it.syntax() == ty.syntax());
             return if is_trait { Source::Trait } else { Source::Type };
         }
-        if let Some(anchor) = ast::TypeAnchor::cast(parent)
-            && anchor.path_type().is_some_and(|it| it.syntax() == ty.syntax())
+        // `<T as Trait>`: the type after `as` is the trait.
+        if ast::TypeAnchor::can_cast(parent.kind())
+            && parent
+                .children_with_tokens()
+                .find(|it| it.kind() == SyntaxKind::AS_KW)
+                .is_some_and(|it| it.text_range().start() < ty.syntax().text_range().start())
         {
             return Source::Trait;
         }
@@ -119,12 +123,22 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
             Some(PathResolution::Def(def @ ModuleDef::Adt(hir::Adt::Enum(_)))) if at + 2 == prefixes.len() => {
                 module = Some(def);
             }
-            Some(_) => return None,
+            Some(res) => {
+                let name = &segments[offset + at].name;
+                if at == 0
+                    && offset == 0
+                    && is_from_outer(cx, signature, &res)
+                    && let Some(diag) = outer::check(cx, signature, prefix, name, false)
+                {
+                    return Some(found(cx, diag, signature, current, name));
+                }
+                return None;
+            }
             None => {
                 let name = &segments[offset + at].name;
                 if at == 0
                     && offset == 0
-                    && let Some(diag) = outer::check(cx, signature, prefix, name)
+                    && let Some(diag) = outer::check(cx, signature, prefix, name, false)
                 {
                     return Some(found(cx, diag, signature, current, name));
                 }
@@ -141,6 +155,12 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
         .as_ref()
         .and_then(|it| it.type_ns.clone().or_else(|| it.value_ns.clone()).or_else(|| it.macro_ns.clone()));
     if let Some(res) = res {
+        if segments.len() == 1
+            && is_from_outer(cx, signature, &res)
+            && let Some(diag) = outer::check(cx, signature, path, &last.name, true)
+        {
+            return Some(found(cx, diag, signature, current, &last.name));
+        }
         if source.is_expected(&res) {
             return privacy::check(cx, signature, &prefixes, &segments[offset..], current)
                 .map(|diag| found(cx, diag, signature, current, &last.name));
@@ -158,7 +178,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
     }
 
     let single = segments.len() == 1;
-    if single && let Some(diag) = outer::check(cx, signature, path, &last.name) {
+    if single && let Some(diag) = outer::check(cx, signature, path, &last.name, true) {
         return Some(found(cx, diag, signature, current, &last.name));
     }
     let mut expected = source.expected();
@@ -210,6 +230,27 @@ fn found(cx: &Cx<'_, '_>, mut diag: Diag, signature: &Signature, module: hir::Mo
     Found::new(diag, Phase::Resolve)
 }
 
+/// Whether a generic parameter or `Self` the path resolves to is declared outside the item
+/// rustc resolves it in (the signature's item, or the impl or trait around an associated one).
+fn is_from_outer(cx: &Cx<'_, '_>, signature: &Signature, res: &PathResolution<'_>) -> bool {
+    let declared: Option<InFile<TextRange>> = match res {
+        PathResolution::TypeParam(it) => cx.sema.source(it.merge()).map(|it| it.map(|it| either_range(&it))),
+        PathResolution::ConstParam(it) => cx.sema.source(it.merge()).map(|it| it.map(|it| either_range(&it))),
+        PathResolution::SelfType(it) => cx.sema.source(*it).map(|it| it.map(|it| it.syntax().text_range())),
+        _ => return false,
+    };
+    let Some(declared) = declared else { return false };
+    let inner = outer::inner_item(&signature.node.value);
+    declared.file_id == signature.node.file_id && !inner.text_range().contains_range(declared.value)
+}
+
+fn either_range(node: &either::Either<ast::TypeOrConstParam, ast::Trait>) -> TextRange {
+    match node {
+        either::Either::Left(it) => it.syntax().text_range(),
+        either::Either::Right(it) => it.syntax().text_range(),
+    }
+}
+
 fn module_of(def: Option<ModuleDef>) -> Option<hir::Module> {
     match def {
         Some(ModuleDef::Module(it)) => Some(it),
@@ -259,7 +300,7 @@ fn res_descr(cx: &Cx<'_, '_>, res: &PathResolution<'_>) -> &'static str {
 }
 
 /// rustc's `Res::descr` of an item.
-fn def_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<&'static str> {
+pub(super) fn def_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<&'static str> {
     Some(match def {
         ModuleDef::Module(_) => "module",
         ModuleDef::Function(_) => "function",
@@ -282,7 +323,7 @@ fn def_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<&'static str> {
 
 /// Where a type parameter is declared: its name.
 fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
-    let source = cx.sema.source(param)?;
+    let source = cx.sema.source(param.merge())?;
     let range = match &source.value {
         either::Either::Left(ast::TypeOrConstParam::Type(it)) => it.name()?.syntax().text_range(),
         _ => return None,
@@ -290,9 +331,10 @@ fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
     Some(cx.span(source.with_value(range)))
 }
 
-/// The span rustc labels a typo candidate's definition with: the head of its item.
-fn def_span(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<Span> {
+/// The span rustc points at an item's definition with: the head of its item.
+pub(super) fn def_span(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<Span> {
     let source: InFile<SyntaxNode> = match def {
+        ModuleDef::Module(it) => it.declaration_source(cx.db)?.map(|it| it.syntax().clone()),
         ModuleDef::Adt(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
         ModuleDef::Trait(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
         ModuleDef::TypeAlias(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
@@ -530,6 +572,7 @@ fn in_edition(cx: &Cx<'_, '_>, path: String) -> String {
 /// in, the first `use` item there or else its first item, and whether it was a `use`.
 fn use_placement(cx: &Cx<'_, '_>, module: hir::Module) -> Option<(Span, bool)> {
     use ast::HasModuleItem as _;
+    use syntax::AstToken as _;
     let module = module.nearest_non_block_module(cx.db);
     let source = module.definition_source(cx.db);
     let items: Vec<ast::Item> = match &source.value {

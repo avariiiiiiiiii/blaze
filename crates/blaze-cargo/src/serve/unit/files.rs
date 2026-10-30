@@ -3,6 +3,8 @@
 //! through the VFS's reader, never from the disk; and the name rustc gives a file in a
 //! diagnostic, from the root of the workspace when it is below it.
 
+#![forbid(unsafe_code)]
+
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use base_db::FileId;

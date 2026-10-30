@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Change, ChangeKind, CommitError, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket,
-    Vfs, View, Watched, Watcher,
+    Vfs, View, Watched, Watcher, journal,
     tree::{DIR_MODE, NodeId, Tree},
 };
 
@@ -1047,6 +1047,146 @@ fn a_recovered_journal_cuts_its_torn_tail_before_appending() {
         matches!(effects.as_slice(), [Effect::Truncate { len, .. }] if *len == valid),
         "{effects:?}"
     );
+}
+
+/// safety-fuzz-vfs 1 (`vfs_journal_model/torn-inside-a-file-that-is-a-journal.hex`): an
+/// append torn inside a file whose bytes are another journal loads none of that journal.
+#[test]
+fn a_torn_file_that_is_a_journal_loads_none_of_its_records() {
+    let mut sim = Sim::new(4, Faults::default());
+    let file = name("j");
+
+    // Another VFS's journal, in which `a` moves to {a: xyz} eight times.
+    let mut other = Vfs::recover(name("other"), 0, &[]).0;
+    let forged = other.commit("a", other.empty(), &[write("a", "xyz")]).unwrap().root;
+    for _ in 0..7 {
+        other.set_head("a", forged).unwrap();
+    }
+    let mut other_sim = Sim::new(5, Faults::default());
+    settle(&mut other_sim, &mut other, &mut Vec::new());
+    let embedded = other_sim.contents(&name("other"));
+
+    let mut vfs = Vfs::recover(file.clone(), 0, &[]).0;
+    let first = vfs.commit("a", vfs.empty(), &[write("a", "xyz")]).unwrap().root;
+    let q = vfs.commit("a", first, &[write("a", "q")]).unwrap().root;
+    settle(&mut sim, &mut vfs, &mut Vec::new());
+    let before = sim.contents(&file).len();
+    let ops = [Op::Write { path: "j".into(), bytes: embedded.clone(), mode: Mode::Regular }];
+    vfs.commit("b", vfs.empty(), &ops).unwrap();
+    settle(&mut sim, &mut vfs, &mut Vec::new());
+    let all = sim.contents(&file);
+    // The append's first record is the file's: torn after the whole embedded journal.
+    let torn = &all[..before + journal::HEADER + embedded.len()];
+    assert_eq!(&torn[before + journal::HEADER..], &embedded[..]);
+
+    let (recovered, found) = Vfs::recover(file, 0, torn);
+    assert_eq!(recovered.head("a"), Some(q), "the durable state, not the embedded one");
+    assert_eq!(recovered.sequence("a"), Some(2));
+    assert_eq!(recovered.head("b"), None);
+    assert_eq!(found.skipped, torn.len() - before);
+}
+
+/// safety-fuzz-vfs 2 (`vfs_journal_model/lost-node-made-again-after-recovery.hex`): a head
+/// record past damage stays gone after the root it named is made again.
+#[test]
+fn a_head_lost_to_damage_does_not_come_back_when_its_root_is_made_again() {
+    let mut sim = Sim::new(6, Faults::default());
+    let file = name("j");
+    let mut vfs = Vfs::recover(file.clone(), 0, &[]).0;
+    let first = vfs.commit("a", vfs.empty(), &[write("a", "xyz")]).unwrap().root;
+    settle(&mut sim, &mut vfs, &mut Vec::new());
+    let before = sim.contents(&file).len();
+    let both = vfs.commit("a", first, &[write("b", "w")]).unwrap().root;
+    settle(&mut sim, &mut vfs, &mut Vec::new());
+    let mut damaged = sim.contents(&file);
+    // The first record of the second append is `w`'s file: flip a bit of its payload.
+    assert_eq!(damaged[before + journal::HEADER], b'w');
+    damaged[before + journal::HEADER] ^= 1;
+
+    let (mut vfs, found) = Vfs::recover(file.clone(), 0, &damaged);
+    assert_eq!(vfs.head("a"), Some(first));
+    assert_eq!(found.skipped, damaged.len() - before);
+    let mut sim = Sim::new(7, Faults::default());
+    sim.change(&file, &damaged);
+    let made = vfs.commit("b", vfs.empty(), &[write("a", "xyz"), write("b", "w")]).unwrap().root;
+    assert_eq!(made, both);
+    settle(&mut sim, &mut vfs, &mut Vec::new());
+
+    let (again, found) = Vfs::recover(file.clone(), 0, &sim.contents(&file));
+    assert_eq!((found.skipped, found.heads_dropped), (0, 0));
+    assert_eq!(again.head("a"), Some(first), "the dropped move stays dropped");
+    assert_eq!(again.head("b"), Some(both));
+}
+
+/// safety-fuzz-vfs 3 (`vfs_journal_records/sequence-at-the-largest.hex`,
+/// `head-at-the-largest-sequence.hex`): a sequence number no journal reaches is refused, so the
+/// next commit's never overflows.
+#[test]
+fn a_sequence_number_no_journal_reaches_is_refused() {
+    let (_, _, head, _, sequence) = journal::KINDS;
+    let largest = journal::framed(sequence, &u64::MAX.to_le_bytes());
+    let (mut vfs, found) = Vfs::recover(name("j"), 0, &largest);
+    assert_eq!((found.records, found.skipped), (0, largest.len()));
+    vfs.commit("w", vfs.empty(), &[write("a", "1")]).unwrap();
+    assert_eq!(vfs.sequence("w"), Some(1));
+
+    let empty = Vfs::recover(name("j"), 0, &[]).0.empty();
+    let mut payload = u64::MAX.to_le_bytes().to_vec();
+    payload.extend_from_slice(&empty.0);
+    payload.push(b'a');
+    let moved = journal::framed(head, &payload);
+    let (vfs, found) = Vfs::recover(name("j"), 0, &moved);
+    assert_eq!((found.records, vfs.head("a")), (0, None));
+
+    // The largest a journal can reach is taken.
+    let high = journal::framed(sequence, &((1u64 << 63) - 2).to_le_bytes());
+    let (mut vfs, found) = Vfs::recover(name("j"), 0, &high);
+    assert_eq!(found.records, 1);
+    vfs.commit("w", vfs.empty(), &[write("a", "1")]).unwrap();
+    assert_eq!(vfs.sequence("w"), Some((1 << 63) - 1));
+}
+
+/// A head record naming a root the file never held is dropped, and the file is rewritten without
+/// it rather than kept, so a later commit making that root cannot bring the head back.
+#[test]
+fn a_dropped_head_is_rewritten_out_of_the_journal() {
+    let (_, _, head, _, _) = journal::KINDS;
+    let mut payload = 1u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&ContentId::of(DIR_DOMAIN, b"never made").0);
+    payload.push(b'a');
+    let bytes = journal::framed(head, &payload);
+    let (mut vfs, found) = Vfs::recover(name("j"), 0, &bytes);
+    assert_eq!((found.records, found.skipped, found.heads_dropped), (1, 0, 1));
+    assert_eq!(vfs.head("a"), None);
+    let mut effects = Vec::new();
+    vfs.flush(&mut effects);
+    assert!(matches!(effects.as_slice(), [Effect::Write { .. }]), "{effects:?}");
+}
+
+/// safety-fuzz-vfs 4: a directory record whose names are not distinct path components in the
+/// order the tree writes them ends recovery there.
+#[test]
+fn a_directory_record_naming_an_entry_twice_or_no_path_is_refused() {
+    let (file, dir, _, _, _) = journal::KINDS;
+    let x = journal::framed(file, b"x");
+    let id = ContentId::of(FILE_DOMAIN, b"x");
+    let entry = |name: &str| {
+        let mut out = (name.len() as u32).to_le_bytes().to_vec();
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&Mode::Regular.git().to_le_bytes());
+        out.extend_from_slice(&id.0);
+        out
+    };
+    let good = [entry("a"), entry("b")].concat();
+    let bytes = [x.clone(), journal::framed(dir, &good)].concat();
+    assert_eq!(Vfs::recover(name("j"), 0, &bytes).1.records, 2);
+    let refused: [&[&str]; 6] = [&["f", "f"], &["b", "a"], &[""], &["."], &[".."], &["a/b"]];
+    for names in refused {
+        let payload: Vec<u8> = names.iter().flat_map(|it| entry(it)).collect();
+        let bytes = [x.clone(), journal::framed(dir, &payload)].concat();
+        let (_, found) = Vfs::recover(name("j"), 0, &bytes);
+        assert_eq!((found.records, found.skipped), (1, bytes.len() - x.len()), "{names:?}");
+    }
 }
 
 #[test]

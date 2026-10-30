@@ -197,6 +197,10 @@ by value wherever `Interned<ModPath>` is stored, and drop the `Interned::new(..)
   Status (`assoc.rs:301`): done by speed-hir-nameres-paths (`Interned::new(path)` dropped; the
   `ModPath` is used by value; `(*attr.path).clone()` is `ModPath::clone(&attr.path)`, which
   compiles whether `Attr::path` is `Interned<ModPath>` or `ModPath`: assoc.rs is ready for the switch).
+  Status (all of speed-hir-nameres' paths): ready, checked by speed-hir-nameres (10-29): `rg
+  'Interned|\(\*attr\.path\)|&\*path'` finds nothing in `nameres.rs`, `nameres/`, `item_scope.rs`,
+  `per_ns.rs`, `visibility.rs`, `resolver.rs`, `find_path.rs`, `import_map.rs`; `collector.rs:1070,
+  1675,3188` read the paths by method or `ModPath::clone(&..)`, which compiles either way.
 - speed-hir-defs: `lib.rs:1608,1612` (`AstIdWithPath::path`).
   Status (`AstIdWithPath`): done by speed-hir (children done). `lib.rs`: field and `new` take
   `ModPath`. Callers in `collector.rs` (derive paths passed by value, `ModPath::clone(&attr.path)`,
@@ -205,6 +209,9 @@ by value wherever `Interned<ModPath>` is stored, and drop the `Interned::new(..)
   `Attr`'s paths are still `Interned<ModPath>` or `ModPath`. Unused `Interned` imports removed
   from `lib.rs` and `collector.rs`. Still to do: `collector.rs` `Interned` uses elsewhere (none
   left), the item tree's (speed-hir-items) and the store's (speed-hir-store) sites.
+  Checked by speed-hir-defs (10-29): no `Interned` left in its paths (`lib.rs`, `attrs*`,
+  `signatures.rs`, `lang_item.rs`, `upvars.rs`, `src.rs`, `builtin_*.rs`), and none dereferences
+  `Attr::path`, so the switch to `ModPath` needs nothing more there.
 - Outside hir-def: `crates/hir/src/semantics.rs:2843` (lane hir; I'll forward once you agree).
 
 Reads keep compiling where they call methods (`path.segments()`, `path.as_ident()`, auto-deref);
@@ -269,7 +276,9 @@ signature's `Box<[TypeRefId]>`); `set_pat` and `exprs_since` are unused.
    lowering keeps marks balanced (each `with_lists(mark, ..)`/`truncate_to(mark)` pops what it
    pushed), and an unbalanced mark would otherwise leak ids into the next body's lists silently.
 
-Status: open
+Status: done by speed-hir-store-core (items 1-7, names as written; `ListMark` and `Lists` are
+`pub` with private fields, in `expr_store.rs`; `finish` and `put_lists` `debug_assert` that every
+stack is empty, naming the first that isn't).
 
 > forwarded to speed: between speed's children (and format-hir-core's contract, format DONE).
 
@@ -376,7 +385,10 @@ children are done). One construction is left, in your file:
 (`Interned<ModPath>` in the item tree's paths and `RawVisibility::Module`) is still yours to
 decide.
 
-Status: open
+Status: done by speed-hir-items (`attrs.rs:130` as written, `Interned` import dropped; the item
+tree's `paths`, `Index<PathId>`, `UseTreeKind` and `RawVisibility::Module` hold `ModPath` by
+value, the builder's `paths: FxIndexSet<ModPath>`; `rg Interned` over `item_tree*` finds
+nothing; persisted bytes unchanged, so the schema stays at version 2).
 
 ## for speed-hir-items (from format-hir, relaying the lead)
 
@@ -397,7 +409,9 @@ check for every caller. The item tree's own copy should go:
      becomes `ast::ExternItem::Fn(func) => self.lower_attrs(mod_item, func),`
    (`lower_attrs` takes `&dyn ast::HasAttrs`; `func` is `&ast::Fn` there. If it is matched by
    value, write `&func`.)
-Status: open.
+Status: done by speed-hir-items (`OutlineFn`, `may_start_with_inner_attr`, `block_comment_len`
+and their tests are gone from `attrs.rs`; `lower.rs` passes the `ast::Item`/`ast::ExternItem`
+straight to `lower_attrs`, whose `HasAttrs` dispatches to `ast::Fn`'s for a `fn`).
 
 ## for speed-hir-store-core (from format-hir, relaying the lead)
 
@@ -424,4 +438,5 @@ new:
     // into an overflow, is refused above.
 ```
 The callers that read store or item-tree buffers from the store or the remote cache must use
-`read_verified` (lane store). Status: open.
+`read_verified` (lane store). Status: done by speed-hir-store-core (comment as written; the
+callers' switch to `read_verified` is lane store's).

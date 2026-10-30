@@ -48,6 +48,8 @@ pub(crate) enum Parsed {
     RustcPassIndirectlyInNonRusticAbis,
     /// What one `#[doc(..)]` says that the checks read.
     Doc(Doc),
+    /// `#[macro_export]`, `#[macro_export(local_inner_macros)]`.
+    MacroExport,
 }
 
 /// rustc's `InlineAttr`.

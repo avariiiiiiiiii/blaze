@@ -410,6 +410,8 @@ Design and the mapping onto `MemoData`/`Edge`: `docs/v2/plan/lanes/db/speed-sals
 
 134 sites in 14 files (expressions, patterns and type refs). The rule: `v2/requests/format.md`, "## format-hir: expressions and patterns become columns"; for type refs (`store[t]` -> `store.type_ref(t)`), the addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`. Both have landed in `crates/hir-def/src/{hir.rs,hir/type_ref.rs,expr_store.rs}`: `Index<ExprId>`, `Index<PatId>` and `Index<TypeRefId>` are gone, `Index<BindingId|LabelId|LifetimeRefId|PathId>` stay. `InferenceContext::store` and `TyLoweringContext::store` are `&'db ExpressionStore`, so every view borrows the store, not `self`: no borrow conflict changes anywhere below. `mir.rs` is speed-types' file now (its brief); its one edit is here.
 
+> forwarded to db: every file is db's (none of items' hir-ty files).
+
 ### crates/hir-ty/src/db.rs  (4 sites)
 - ~L547, ~L581, ~L615 (all three occurrences, in `InternedClosureId::new`, `InternedCoroutineId::new`, `InternedCoroutineClosureId::new`)  `let expr = &store[loc.expr];`  ->  `let expr = store.expr(loc.expr);`
 - ~L724  `hir_def::expr_store::ExpressionStore::of(db, loc.owner)[loc.expr],`  ->  `hir_def::expr_store::ExpressionStore::of(db, loc.owner).expr(loc.expr),`
@@ -694,6 +696,8 @@ Status: open
 
 109 sites in 6 files (97 expression/pattern, 12 type ref, all type-ref ones in `regions.rs`). The rule: `v2/requests/format.md`, "## format-hir: expressions and patterns become columns"; type refs per the addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md` (landed). `Ctx::store` is `&'a ExpressionStore`, so views borrow the store, not `self`: no borrow conflict changes. Two edits are not mechanical: `loans.rs` ~L439 `once(&receiver)` (now `ExprId` beside `args.iter()`'s `&ExprId`), and `regions.rs` ~L2026 deletes `let args = args.clone();` (was a `Box<[PatId]>` clone per tuple pattern; now a slice).
 
+> forwarded to db.
+
 ### crates/hir-ty-borrowck/src/regions.rs  (52 sites: 40 expr/pat, 12 type ref)
 - ~L1823, L1857, L1958 (3 occurrences, replace all)  `= &self.ctx.store[closure]`  ->  `= self.ctx.store.expr(closure)`
 - ~L1904  `let local = match self.ctx.store[pat] {`  ->  `let local = match self.ctx.store.pat(pat) {`
@@ -813,6 +817,8 @@ Status: open
 
 1 site in 1 file, a type ref (rule: addendum of `~/restart-2026-10-28/briefs/v2/speed-hir-store-consumers.md`, landed: `Index<TypeRefId>` is gone).
 
+> forwarded to db.
+
 ### crates/hir-ty-wfcheck/src/lib.rs  (1 site, 2 edits, type ref; the where-clause `position` search)
 - ~L576  `let on_target = match (&store[*target], param) {`  ->  `let on_target = match (store.type_ref(*target), param) {`
 - ~L577  `(TypeRef::TypeParam(id), Some(param)) => *id == param,`  ->  `(TypeRef::TypeParam(id), Some(param)) => id == param,`
@@ -830,6 +836,8 @@ From `safety-audit-front` (child of `safety-audit`, lane `safety`). The workspac
 Comments, `# Safety` sections, block splits and crate-root attributes only: no behavior change.
 A split keeps the order of evaluation and binds only `Copy` values (pointers, integers, the
 references the code already made). Line numbers are as of 2026-10-29 18:40.
+
+> forwarded to db: every crate named is db's.
 
 ### blaze-query
 
@@ -883,6 +891,16 @@ The `to_static`/`to_db` calls all follow the house style `expr_store/lower.rs:28
 - `crates/hir-def/src/dyn_map.rs:187`, `:194`, `nameres/tests/paths.rs:772-794`: ok. `lib.rs:407` `#[salsa::interned(unsafe(no_lifetime))]`: a salsa option, not Rust unsafe.
 
 ### hir-ty (db's files)
+
+Update 18:55: `next_solver/interner.rs`'s `mod table` was rewritten while this was written (one
+op per block, `wrapping_add`, the `Erase` trait, safe `Rows::kind`/`flags`/`binder`), so the
+items below for `interner.rs:2754`, `:2786`, `:2800`, `:2814`, `:2828`, `:2844`, `:3129`,
+`:3274`, `:3308`, `:3432`, `:3452` are done, and the five `kind()` splits (`interner.rs:900`,
+`ty.rs:926`, `consts.rs:269`, `region.rs:260`, `predicate.rs:633`) need nothing once
+`X.kind(..)` is the safe call: each block is then one `transmute` (or none, through `Erase`).
+The new `mod table` passes: `Erase`'s `# Safety`, the `erase!` and test `erase_static!` impls'
+comments, and every block. The items for `:266`, `:403`, `:404`, `:411` and `solver.rs:42`
+still stand.
 
 - `crates/hir-ty/src/next_solver/interner.rs:266` `unsafe impl salsa::SalsaValue for $stored_name` (in `impl_stored_interned!`): its comment says only that it is safe. Proposed: `` // SAFETY: a `$stored_name` is a row index (a `NonZeroU32`) into a process-wide table that is never freed or rewritten, so one kept from an older revision names the same value in every newer one, and it holds no `'db` reference (what `SalsaValue`'s `# Safety` forbids). `$name` is not stored: its `'db` marks where it is meant to be used. ``
 - `crates/hir-ty/src/next_solver/interner.rs:403`, `:404` `unsafe impl Send`/`Sync for DbInterner<'_>`: no SAFETY, only `// FIXME: very wrong` (rust-lang/rust#144808). Every field is already `Send + Sync`: `&'db dyn HirDatabase` (blaze's `salsa::Database: Send + Sync`, `vendor/salsa/src/database.rs:38`), `Option<&'db LangItems>` (ids), `Option<Crate>`, `u32`, `tls_cache::Solved` (a `u64`) and `bool`. So the impls assert only what the compiler derives. Preferred: delete both impls and the FIXME (no behavior change, and the build then proves it). Otherwise: `` // SAFETY: every field is `Send` and `Sync` (`&dyn HirDatabase` because `salsa::Database: Send + Sync`; the rest are ids and integers), so this only states what the auto trait would derive. A field that is not would make an interner moved to another thread a data race. `` and `` // SAFETY: as for `Send`: every field is `Sync`. ``
@@ -1053,3 +1071,16 @@ still holds the old `Rc`, `make_mut` copies once. The results are the same set a
   (`it` is `&Rc<FxHashSet<TraitId>>`; both arms must be `&FxHashSet<TraitId>`.)
 
 This is the only caller (`rg get_traits_in_scope crates/`). Status: open
+
+## speed-hir-store: id-only scans of a store (from speed-hir-store)
+
+With expressions as columns, `store.exprs()` decodes every node. `ExpressionStore` now also has
+`expr_ids()` / `pat_ids()` (ids in order, nothing decoded; `ExactSizeIterator`) and
+`expr_count()` / `pat_count()`. Where a scan wants only ids, use them:
+- `crates/hir-ty-borrowck/src/regions.rs` `synthesized()` (~L825) and `path_arguments`
+  (~L2085): `store.exprs().map(|(id, _)| id)` / `for (id, _) in store.exprs()` ->
+  `store.expr_ids()` / `for id in store.expr_ids()`.
+- The seven whole-store `exprs()` scans per body in `hir-ty-borrowck` (`matched`, `tested_at`,
+  `union_literals`, `guard_borrows`, `scrutinee_of`, `guard_bindings`, `statement_values`):
+  better done once per body into one pass that fills all seven, since each decodes every node.
+Found by speed-hir-store-ty.

@@ -8,7 +8,7 @@
 use hir::InFile;
 use hir_def::{
     HasModule,
-    hir::{Expr, ExprId},
+    hir::{Expr, ExprId, Literal},
 };
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_apfloat::{
@@ -36,9 +36,95 @@ struct Lit {
     span: Span,
 }
 
-/// rustc's `lint_literal` of the literal `expr`, `negation` the span of the `-` expression it
-/// is the operand of, or of the pattern literal it is with its `-`.
-pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<Span>, out: &mut Vec<Found>) {
+/// Whether the literal `expr` of an expression, `lit` lowered, may be out of the range of its
+/// type: its lowered value against the type's range, with no syntax, no span and no
+/// allocation. A literal that wrapped when lowered (`as i128` of one above `i128::MAX`) is
+/// negative and goes to [`lint_literal`], which reads it as written. `negated`: it is the
+/// operand of a `-`; `pointer_bits`: the crate's pointer width.
+pub(super) fn may_overflow(
+    b: &BodyCx<'_, '_>,
+    expr: ExprId,
+    lit: &Literal,
+    negated: bool,
+    pointer_bits: Option<u16>,
+) -> bool {
+    let value = match *lit {
+        Literal::Int(value, _) => match u128::try_from(value) {
+            Ok(value) => value,
+            Err(_) => return true,
+        },
+        Literal::Uint(value, _) => value,
+        Literal::Float(..) => return float_overflows(b, expr, lit),
+        _ => return false,
+    };
+    int_overflows(b, expr, value, negated, pointer_bits)
+}
+
+/// [`may_overflow`] of the literal `expr` of a pattern, whose `-` the lowering folded into its
+/// value. The folded value is exact unless the literal wrapped, which needs at least 34
+/// characters (`0x` and 32 hex digits for `2^127`; 39 decimal digits): the length of the
+/// literal's syntax pointer, which costs no parse, tells.
+pub(super) fn pat_may_overflow(b: &BodyCx<'_, '_>, expr: ExprId, lit: &Literal, pointer_bits: Option<u16>) -> bool {
+    let (value, negated) = match *lit {
+        Literal::Int(value, _) => (value.unsigned_abs(), value < 0),
+        Literal::Uint(value, _) => (value, false),
+        Literal::Float(..) => return float_overflows(b, expr, lit),
+        _ => return false,
+    };
+    let Some(at) = b.expr_node(expr) else { return false };
+    if u32::from(at.value.text_range().len()) >= 34 {
+        return true;
+    }
+    int_overflows(b, expr, value, negated, pointer_bits)
+}
+
+/// Whether an integer literal of magnitude `value` is out of the range of the type of `expr`
+/// (rustc's checks of `lint_int_literal` and `lint_uint_literal`, before they read the source).
+fn int_overflows(b: &BodyCx<'_, '_>, expr: ExprId, value: u128, negated: bool, pointer_bits: Option<u16>) -> bool {
+    match util::ty(b, expr).kind() {
+        TyKind::Int(t) => {
+            let t = match (t, pointer_bits) {
+                (IntTy::Isize, Some(bits)) => t.normalize(bits),
+                (IntTy::Isize, None) => return false,
+                _ => t,
+            };
+            let max = int_ty_range(t).1 as u128;
+            if negated { value > max + 1 } else { value > max }
+        }
+        TyKind::Uint(t) => {
+            let t = match (t, pointer_bits) {
+                (UintTy::Usize, Some(bits)) => t.normalize(bits),
+                (UintTy::Usize, None) => return false,
+                _ => t,
+            };
+            !negated && value > uint_ty_range(t).1
+        }
+        _ => false,
+    }
+}
+
+/// Whether the float literal `expr`, `lit` lowered, is infinite in its type: rustc's
+/// `float_is_infinite`, on the lowered literal's text.
+fn float_overflows(b: &BodyCx<'_, '_>, expr: ExprId, lit: &Literal) -> bool {
+    let (TyKind::Float(t), Literal::Float(value, _)) = (util::ty(b, expr).kind(), lit) else { return false };
+    match t {
+        FloatTy::F16 => value.to_f16().is_infinite(),
+        FloatTy::F32 => value.to_f32().is_infinite(),
+        FloatTy::F64 => value.to_f64().is_infinite(),
+        FloatTy::F128 => value.to_f128().is_infinite(),
+    }
+}
+
+/// rustc's `lint_literal` of the literal `expr`, `negation` the `-` expression it is the
+/// operand of; a pattern's literal says itself whether it has a `-`.
+pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<ExprId>, out: &mut Vec<Found>) {
+    let negation = match negation {
+        Some(it) => match util::span(b, it) {
+            Some(span) => Some(span),
+            None => return,
+        },
+        None => None,
+    };
     let Some((lit, negated_pat)) = literal(b, expr) else { return };
     let negation = if negated_pat { Some(lit.span.clone()) } else { negation };
     match util::ty(b, expr).kind() {
@@ -115,7 +201,7 @@ fn snippet(b: &BodyCx<'_, '_>, span: &Span) -> Option<String> {
 }
 
 /// The width of a pointer of the crate's target, in bits, that `isize` and `usize` have.
-fn pointer_width(b: &BodyCx<'_, '_>) -> Option<u16> {
+pub(super) fn pointer_width(b: &BodyCx<'_, '_>) -> Option<u16> {
     let db = b.db();
     let layout = db.target_data_layout(b.owner.krate(db)).ok()?;
     u16::try_from(layout.pointer_size().bits()).ok()

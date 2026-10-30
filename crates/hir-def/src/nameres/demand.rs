@@ -433,7 +433,7 @@ fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
     match expander {
         MacroExpander::Declarative { .. } => {
             let mut words = words(&node);
-            words.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+            words.sort_unstable_by(Symbol::cmp_order);
             words.dedup();
             MacroText::Words(words)
         }
@@ -535,6 +535,6 @@ pub fn macros_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Box<[Sym
     let settled = settle(found, calling, |word| known.contains(word));
     known.extend(settled);
     let mut names: Vec<Symbol> = known.into_iter().collect();
-    names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    names.sort_unstable_by(Symbol::cmp_order);
     names.into()
 }

@@ -249,7 +249,8 @@ fn names_cross_the_edge_both_ways() {
     }
     assert!(core_name(&[b'_', 0xff]).is_err());
     let mut names = crate::model::Names::default();
-    for raw in [&b"_main"[..], b"__mh_execute_header", b"section$start$__DATA$__x", b"_", b"x"] {
+    let (fits, long) = ("l".repeat(255), "l".repeat(256));
+    for raw in [&b"_main"[..], b"__mh_execute_header", b"section$start$__DATA$__x", b"_", b"x", b"", fits.as_bytes(), long.as_bytes()] {
         let name = super::push_core_name(&mut names, raw).unwrap();
         assert_eq!(names.at(name), core_name(raw).unwrap());
     }

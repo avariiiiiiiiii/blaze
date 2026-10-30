@@ -9,6 +9,7 @@
 #![allow(rustc::usage_of_type_ir_inherent)]
 #![allow(rustc::usage_of_type_ir_traits)]
 // tidy-alphabetical-end
+#![forbid(unsafe_code)]
 
 pub mod canonical;
 pub mod coherence;

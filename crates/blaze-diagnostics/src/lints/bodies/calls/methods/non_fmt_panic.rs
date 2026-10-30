@@ -19,10 +19,7 @@ use hir::{InFile, MacroCallId, db::HirDatabase};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, HasModule as _, ModuleDefId, TraitId,
     attrs::AttrFlags,
-    hir::{
-        Expr, ExprId, Literal,
-        type_ref::{Mutability, Rawness},
-    },
+    hir::{Expr, ExprId, Literal, type_ref::Rawness},
     nameres::crate_def_map,
 };
 use hir_expand::{
@@ -95,10 +92,7 @@ impl LatePass for NonPanicFmt {
                 self.check_panic(b, expr, &f, arg, out);
             }
         } else if from.as_deref() == Some("unreachable_2015_macro") {
-            let Expr::Ref { expr: arg, rawness: Rawness::Ref, mutability: Mutability::Shared } = b.store().expr(arg)
-            else {
-                return;
-            };
+            let Expr::Ref { expr: arg, rawness: Rawness::Ref, .. } = b.store().expr(arg) else { return };
             self.check_panic(b, expr, &f, arg, out);
         }
     }

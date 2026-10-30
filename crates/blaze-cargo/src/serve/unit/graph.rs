@@ -8,6 +8,8 @@
 //! (`closure`, `linked_in`) is one pass with a bitset of `N/64` words and no other allocation.
 //! Building it is `O(N + E)` plus cargo's `to_link` once per unit with one shared memo.
 
+#![forbid(unsafe_code)]
+
 use std::hash::{Hash, Hasher};
 
 use blaze_build_script::apply::{GraphUnit, to_link};

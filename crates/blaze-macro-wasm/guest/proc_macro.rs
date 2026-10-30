@@ -1376,13 +1376,24 @@ pub mod __blaze {
         static ROOM: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// The `len` bytes the host wrote at `ptr`, found among the room [`alloc`] gave out rather
+    /// than read through the pointer, so a caller of the safe `expand1` or `expand2` can't
+    /// make it read memory that is not an input. A length of 0 is no bytes, found nowhere: the
+    /// host passes a null pointer with it when there is no attribute.
     fn input(ptr: *const u8, len: usize) -> TokenStream {
-        // SAFETY: `ptr`..`ptr + len` is what the host wrote the input into (`alloc`), live in
-        // `ROOM` until the expansion ends; the exports pass only that. `expand1` and `expand2` are
-        // safe `pub fn`s that don't require it of other callers (v2/requests/usercode.md,
-        // safety-audit MAY BE UNSOUND 5), though a wrong pointer stays inside this instance.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-        wire::Reader::new(bytes).stream()
+        if len == 0 {
+            return wire::Reader::new(&[]).stream();
+        }
+        ROOM.with(|room| {
+            let room = room.borrow();
+            let Some(bytes) = room.iter().find(|it| std::ptr::eq(it.as_ptr(), ptr)) else {
+                panic!("the host gave an input at {ptr:?}, which is no room `alloc` gave out");
+            };
+            let Some(bytes) = bytes.get(..len) else {
+                panic!("the host gave an input of {len} bytes in room of {}", bytes.len());
+            };
+            wire::Reader::new(bytes).stream()
+        })
     }
 
     fn hook() {

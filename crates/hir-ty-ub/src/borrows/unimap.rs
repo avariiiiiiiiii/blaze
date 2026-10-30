@@ -65,6 +65,7 @@ impl<K: Hash + Eq> UniKeyMap<K> {
         self.mapping.get(key).map(|&idx| UniIndex { idx })
     }
 
+    #[cfg(test)]
     pub(super) fn get_or_insert(&mut self, key: K) -> UniIndex {
         match self.get(&key) {
             Some(idx) => idx,
@@ -111,10 +112,6 @@ impl<V: PartialEq> PartialEq for UniValMap<V> {
 }
 
 impl<V> UniValMap<V> {
-    pub(super) fn contains_idx(&self, idx: UniIndex) -> bool {
-        self.data.get(idx.index()).is_some_and(Option::is_some)
-    }
-
     fn extend_to_length(&mut self, len: usize) {
         if len > self.data.len() {
             self.data.resize_with(len, || None);
@@ -138,17 +135,6 @@ impl<V> UniValMap<V> {
 
     pub(super) fn remove(&mut self, idx: UniIndex) -> Option<V> {
         self.data.get_mut(idx.index()).and_then(Option::take)
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.data.iter().all(Option::is_none)
-    }
-
-    pub(super) fn iter(&self) -> impl Iterator<Item = (UniIndex, &V)> {
-        self.data
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| v.as_ref().map(|r| (UniIndex { idx: i as u32 }, r)))
     }
 
     /// The value at `idx`, inserting `default` first if there is none. Miri:

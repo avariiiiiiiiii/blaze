@@ -4,9 +4,9 @@
 //!   (`invalid_type_param_default`, `uninhabited_static`: `statics`) and resolve's late pass
 //!   over lifetimes (`unused_lifetimes`, `single_use_lifetimes`: `lifetimes`);
 //! - after it, `rustc_privacy`'s `check_private_in_public` (`private_interfaces`,
-//!   `private_bounds`: `privacy`), `rustc_lint`'s late module pass over each item
-//!   (`naming`, `derives`, `bounds`, `mangle`, `publicity`, `docs`, `traits`), and
-//!   `clashing_extern_declarations` (`externs`).
+//!   `private_bounds`, E0446: `privacy`), `rustc_lint`'s late module pass over each item
+//!   (`externs`' `improper_ctypes`, `naming`, `derives`, `bounds`, `mangle`, `publicity`,
+//!   `docs`, `traits`), and `clashing_extern_declarations` (`externs`).
 //!
 //! `walk` gives the items in the order rustc's passes visit them; `visibility` their effective
 //! visibilities, as `rustc_privacy` computes them.
@@ -66,6 +66,7 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     let mut found = docs::krate(cx);
     found.extend(naming::krate(cx));
     for item in &items {
+        found.extend(externs::ctypes_item(cx, item));
         found.extend(naming::item(cx, item));
         found.extend(derives::copy(cx, item, &effective));
         found.extend(bounds::type_alias(cx, item));
@@ -75,6 +76,7 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
         found.extend(derives::debug(cx, item, &effective));
         found.extend(docs::item(cx, item, &effective));
         found.extend(traits::async_fn(cx, item, &effective));
+        found.extend(externs::ctypes_nested(cx, item));
     }
     found
 }

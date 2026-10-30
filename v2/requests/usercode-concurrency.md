@@ -111,9 +111,14 @@ names the unchecked assumption and points at the finding:
   module is loaded as machine code unchecked. Proposed fix, mine to make when allowed: load
   machine code only from the store (`get_lasting`, checksummed), or hash the file and compare
   it with the store's entry under `key` before `deserialize_file`.
-- MAY BE UNSOUND 5 (`blaze-macro-wasm/guest/proc_macro.rs`, `__blaze::expand1`/`expand2`):
+- MAY BE UNSOUND 5: taken by usercode-safety (2026-10-29), who owns `guest/proc_macro.rs`
+  from now on; I added only `// SAFETY:` comment lines there (35, one per block, the
+  `GlobalAlloc` impl, and `__blaze::input`'s naming this finding), no code. As proposed
+  (`blaze-macro-wasm/guest/proc_macro.rs`, `__blaze::expand1`/`expand2`):
   make them `unsafe fn` with a `# Safety` on the input pointers, and the exports that
   `macro_list.rs` generates (lane cargo's / codegen's `crates/blaze-engine/src/macro_list.rs`)
-  call them in an `unsafe {}` block. The two changes must land together.
+  call them in an `unsafe {}` block, as must blaze-expand's native copy
+  (`native/proc_macro/lib.rs`, called from `native/mod.rs`, both mine). The changes must
+  land together.
 
 > forwarded to coordinator: lane core is DONE; parking a task on an event is new plane work for a lane the coordinator names.

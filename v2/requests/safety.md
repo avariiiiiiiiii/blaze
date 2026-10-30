@@ -26,6 +26,7 @@ DONE, or the coordinator's first build will stop at the crates it could not edit
   `hir-ty`, `hir-ty-mir`, `intern`).
 
 > applied: `hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }` in the root `[workspace.dependencies]` (its own dependencies are all workspace ones). `members` gains `"fuzz"` when `fuzz/` exists: a member path that doesn't exist stops the workspace from loading.
+> applied: `members = ["crates/*", "fuzz"]` now that `fuzz/` has its `Cargo.toml` and `src/lib.rs`.
 
 ## 3. Coordinator: `docs/v2/plan/reference/crates.md`
 
@@ -269,6 +270,8 @@ The fuzz target, the model, the seed corpus and the bounds:
   a tree decodes, then trips a debug assertion in `ItemTree::index`. That is a panic, not UB,
   and the fix is asked of span in `v2/requests/format.md` ("## format-hir-tree").
 
+> forwarded to safety: notes for its fuzz and audit children.
+
 ## From speed-backend-code (2026-10-29): `unsafe.md` in its paths
 
 No `unsafe` in `crates/hir-ty-codegen/{fragment,promote,overlap,copies,home,settled,places,
@@ -289,6 +292,7 @@ asked here.
 No parser of untrusted bytes in these paths.
 
 > for safety-audit-linkgen-cg: the two `dispatch.rs` blocks are documented; nothing else to find in the files above.
+> forwarded to safety: a note for safety-audit-linkgen-cg.
 
 ## From speed-runtime-vfs (2026-10-29): `crates/blaze-vfs` under unsafe.md, for safety-audit-edge and safety-model
 
@@ -308,12 +312,16 @@ No parser of untrusted bytes in these paths.
   checksum; nothing is viewed zero-copy from it (a file's bytes are copied into an `Arc`).
   safety-fuzz-vfs's entry point is `Vfs::recover(file, tags, bytes)`.
 
+> forwarded to safety: notes for safety-audit-edge, safety-model and safety-fuzz-vfs.
+
 ## From safety-audit: coordinator
 
 From `safety-audit-coord` (2026-10-29). The coordinator's crates, read block by block against
 `docs/v2/plan/design/unsafe.md` and the three lints. Comments, splits and crate-root attributes
 only; nothing here changes what code does except where a line says "owner's choice". Line
 numbers are as of this audit. Full table: `/tmp/blaze-lanes/v2-safety-audit-coord.md`.
+
+> applied for `requests`' paths: `crates/test-fixture/src/lib.rs` already says `#![forbid(unsafe_code)]`; `hir-ide` and `ide-db` need nothing, as it says. forwarded to coordinator: every other crate here (blaze-bench, blaze-manifest, blaze-metadata, blaze-resolve, blaze-source, cfg, edition, macros, toolchain, blaze-new, blaze-lints, blaze-cache-macros, blaze-doc, test-utils, stdx, profile, paths, rustc_abi, blaze-fuzz, blaze-registry, blaze-fmt, blaze-cache, blaze-wasm) is not among `requests`' paths.
 
 ### Crate roots: `#![forbid(unsafe_code)]`
 
@@ -482,6 +490,8 @@ The merge gate (blaze.yaml) needs nothing new: each target's seed corpus runs th
 Why: docs/v2/plan/design/unsafe.md "Done when": every untrusted-bytes parser has a fuzz target
 that has run its time budget in CI with no finding. `.github/` is the coordinator's.
 
+> forwarded to coordinator: `.github/` is its.
+
 ### F2. Codegen (`v2/requests/codegen.md`, adds to S2): what the fuzz engine relies on
 
 The engine (`fuzz/src/raw.rs`) is itself instrumented, like every crate of a fuzz build. For it
@@ -507,10 +517,14 @@ to work, S2's instrumentation must also:
 
 Why: fuzz/README.md; without 1 the fuzz build recurses, without 2-3 it stops with an error.
 
+> forwarded to codegen.
+
 ### F3. Cargo (`v2/requests/cargo.md`, adds to item 2 of "From safety")
 
 Pass `-Zsanitizer-coverage=...` and `-Csanitizer-coverage-level=N` through to codegen (with
 `-Zsanitizer`), and `cfg(sanitize = "address")` to the crates, once S2 lands.
+
+> forwarded to cargo.
 
 ## From safety-race
 
@@ -542,3 +556,120 @@ these (read the doc comment at the top of `race.rs` for the per-event protocol):
   self, thread: EvalThread) -> MResult<()>`, and on `Access::Atomic` a way to say "this read is
   a failed compare-exchange" (e.g. `Access::Atomic { ord, rmw: false, cxchg_failed: true }`),
   plus `Machine::thread_name(&mut self, thread, name: &[u8])` for `pthread_setname_np`.
+
+> forwarded to codegen (codegen-mir, the evaluator's `Machine`).
+
+## From speed-hir-nameres: lifetime-erasing `unsafe` in hir-def name resolution (2026-10-29)
+
+Every `unsafe` block in hir-def's `nameres.rs`, `nameres/{collector,frozen,demand}.rs`,
+`visibility.rs` and `find_path.rs` (16 blocks) is one of two calls: `ModuleIdLt::to_static` /
+`BlockIdLt::to_static` and `ModuleId::to_db` (`crates/hir-def/src/lib.rs:656-760`, owned by
+speed-hir-defs). It's a transmute that erases a salsa tracked struct's `'db`. None of it buys
+speed (unsafe.md's first rule): it comes from ids that carry a lifetime. Each block now has a
+`// SAFETY:` comment naming one of three invariants. (a) The id was read from `db` and is used
+only while `db` is borrowed. (b) The def-map query creating the tracked struct keeps it only in
+its own result. (c) A `Visibility` was resolved in the borrowed `db`. These are tracked structs,
+which salsa deletes when their creating query reruns, so the conversion can't simply be made
+safe. The design fix that removes all of them is for ids to carry no lifetime. Either make
+`ModuleIdLt`/`BlockIdLt` interned with `revisions = usize::MAX` (never freed, as
+query-database.md says of interned values), so `to_static`/`to_db` become safe `fn`s. Or make
+them content-keyed ids in blaze-query. Then the 16 blocks become plain calls. Two checks would
+prove the comments: a `blaze test --ub` run of `nameres/tests/{backdate,incremental,worklist}.rs`
+(reruns that delete and recreate modules), and a stale-id test that keeps a `ModuleId` across a
+revision that deletes it and asserts salsa panics rather than reads a reused slot.
+
+## From codegen-mir (2026-10-29): S1, the evaluator's `Machine`
+
+`crates/hir-ty-mir/src/mir/eval/machine.rs` has the trait, `Plain` and the types, exported from
+`hir_ty_mir::mir` (`AtomicOrd` and `MResult` too). It is the notes' text with safety-check's C3
+and safety-race's requests taken in:
+- `require_init` is now on `Machine` (C3.2), not `Shadow`.
+- `protect` is added (C3.4), with the call/ret order as C3.3 says.
+- `Access::Atomic` gains `cxchg_failed`.
+- `atomic_store` takes the `old` bytes it replaces.
+- `detach`, `yield_now` and `thread_name` are added.
+
+No `live_tags` (C3.6), because between two `step`s every value is in memory. Answer these before
+I restructure the evaluator around them:
+
+1. **`spawn` takes the id.** I changed it to `fn spawn(&mut self, thread: EvalThread) ->
+   MResult<()>`: the evaluator numbers threads in creation order, main thread 0. `Plain` is a ZST
+   and can't hand out distinct ids, so a machine-chosen id doesn't fit. OK?
+2. **There is no unwinding today.** A panic is `MirEvalError::Panic` and ends the whole run.
+   Cleanup blocks are ignored, and there is no `catch_unwind` intrinsic. std's `thread::spawn`
+   wraps the thread's body in `catch_unwind`, so threads, `JoinHandle::join() -> Err`,
+   `#[should_panic]` and every `Drop` that runs during a panic all need it. I'd write it as part
+   of S1:
+   - A panic unwinds through the cleanup blocks.
+   - `catch_unwind` catches it and returns the payload.
+   - A panicking thread's join gets `Err`.
+   - Each frame unwound calls `ret` and frees its locals as a return would.
+
+   Is that the contract you want? Is a panic that escapes the main thread a plain
+   `MirEvalError::Panic` (no `finish`)?
+3. **When threads can switch.** Today several calls run as a nested Rust-level `interpret_mir`,
+   not as frames on the code stack:
+   - closure calls, including a spawned thread's body;
+   - diverging calls;
+   - `Drop` impls inside drop glue;
+   - shim callbacks (`clone` of fields, `Fn*` trait calls).
+
+   Inside one of those no other thread can run, so a `Mutex::lock` that blocks there would
+   deadlock. I'll make all of these frames, so `schedule` runs at every terminator, including
+   inside drops. Two nested runs stay:
+   - an anonymous constant evaluated inside a body;
+   - `std::fmt::format` for a panic message.
+
+   Neither can block. If either does block, the evaluator stops with an error naming the
+   function. OK?
+4. **Zero-sized locals.** The evaluator gives a ZST local no memory: its address is its
+   alignment, as rustc's const eval does. Under a machine I'd do the same: no `alloc`, and every
+   pointer to it is `Ptr { addr: align, prov: None }`, so `typed` sees a dangling but aligned
+   reference to a ZST, which is valid. Miri gives each ZST local its own allocation instead.
+   Does `Checker` need the allocation (for example, to report a use of a ZST local after
+   `StorageDead`)? If so, I'll give each ZST local a distinct, never-reused address with
+   `alloc(size: 0)`.
+5. **Scope of "real threads".** Running std's own `thread::spawn` also needs shims for:
+   - `pthread_attr_*`;
+   - `pthread_getattr_np`/`pthread_get_stack*_np` and `sigaltstack`, for stack guards;
+   - `mmap`/`munmap` of the guard page;
+   - `#[thread_local]` statics, one copy per thread (`MemKind::Machine`, freed at thread exit).
+
+   I'll write them all. Do your tests run on real std, minicore (C3.7), or both? It decides
+   which spawn path I test first.
+6. **`MachineStop` dependency.** Mapping `Stop` needs `MirEvalError::MachineStop`, which db-ty
+   forwarded to lane db (`v2/requests/db-ty.md`, "From safety"). Until it lands, a non-`Plain`
+   machine's stop has no error to become, and the generic evaluator doesn't build.
+
+## From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz
+
+Paths: `crates/hir-def/src/{hir.rs,hir/,expr_store.rs,expr_store/}`. Three `unsafe` blocks,
+each with a `// SAFETY:` naming the invariant and where it is upheld; none is new in the
+columns work:
+- `hir/persist.rs` `syntax_context(raw)`: `SyntaxContext::from_u32` behind a safe function,
+  the one place persisted contexts are trusted (the item tree's decode calls it too). It refuses
+  `u32::MAX`; any other value is trusted because the store's `blaze_format::read_verified`
+  checks the buffer's content hash before `read`.
+- `expr_store/lower.rs` `module_path` (~L2812) and `collect_block_` (~L3089): `to_static` on
+  salsa ids that don't outlive the query they were made in (the comments say why). This is
+  the same lifetime erasure as speed-hir-nameres' section above, and the same fix applies
+  wherever that one lands.
+`hir-def` has `unsafe` in other modules (`lib.rs`, `nameres/`, `dyn_map.rs`, `visibility.rs`),
+so `#![forbid(unsafe_code)]` on the crate is not possible yet.
+
+Parsers of untrusted bytes, in `expr_store/persist.rs`:
+`<ExpressionStore as Persist>::read` then `ExpressionStoreRef::decode()`, `<Body as Persist>::read`
+then `BodyRef::decode()`, `<ExpressionStoreSourceMap as Persist>::read` then `.decode()`, and
+`<BodySourceMap as Persist>::read` then `.decode()`, each giving `Result<_, FormatError>`.
+- Zero-copy: the `Ref` types read kinds, counts and the sorted source-key columns in place,
+  bounds-checked by `Slice::follow`. `read` checks kind bytes, one data word per kind, the
+  side-table offsets, and the source keys' strict order. `decode` copies each column once and
+  runs `HirColumns::check` / `TypeColumns::check` (every id, list range and side-table index in
+  bounds). A bad id that gets past them panics on use (slice indexing); it is never UB.
+- **For a fuzz target**: decoding arbitrary bytes is safe, but the contexts it yields through
+  `syntax_context` are only trusted because of the hash check. So a target that skips
+  `read_verified` must not hand decoded `SyntaxContext`s (hygiene ids, spans) to a database:
+  compare and drop them. Or it should fuzz behind `read_verified` and mutate only payloads
+  whose hash it recomputes.
+- Seeds: the encoded stores from `expr_store/tests/body.rs` (`EVERY_VARIANT`) and
+  `tests/signatures.rs`, through `assert_store_round_trip`.

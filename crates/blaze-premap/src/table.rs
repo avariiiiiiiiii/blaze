@@ -145,6 +145,11 @@ impl<'a> TableView<'a> {
         Ok(view)
     }
 
+    /// A table [`TableView::parse`] accepted before, with no checks.
+    pub(crate) fn trusted(bytes: &'a [u8]) -> TableView<'a> {
+        TableView { bytes, mask: bytes.len() / SLOT - 1 }
+    }
+
     pub fn get(&self, id: &SymbolId) -> Option<Def> {
         let at = self.find(&id.0)?;
         let slot = &self.bytes[at * SLOT..(at + 1) * SLOT];

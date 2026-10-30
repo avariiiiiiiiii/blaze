@@ -23,7 +23,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -268,7 +268,7 @@ struct Prep {
     config: Arc<BuildConfig>,
     queries: ViewId,
     /// Every fetch's `at` this view's load asked for: asked again once mounted is a loop.
-    asked: BTreeSet<String>,
+    asked: FxHashSet<String>,
 }
 
 /// A view made ready: lowered, or planned only for the work that walks the plan.
@@ -342,7 +342,7 @@ struct Job {
     stage: Stage,
     values: FxHashMap<NodeId, Value>,
     /// Index files and git repositories reported as `Updating`, once each.
-    updating: BTreeSet<String>,
+    updating: FxHashSet<String>,
     /// Opened by the job and closed as it finishes.
     queries: Vec<ViewId>,
     placing: usize,
@@ -362,14 +362,18 @@ pub struct Jobs {
     setup: Setup,
     started: Vec<(JobId, Option<Opened>, Work)>,
     cancels: Vec<JobId>,
-    jobs: BTreeMap<JobId, Job>,
+    /// Walked in id order through [`Jobs::order`] wherever the walk says something.
+    jobs: FxHashMap<JobId, Job>,
+    /// The jobs' ids sorted, reused by each walk that must go in id order.
+    order: Vec<JobId>,
     /// Whose each batch of nodes is, by its first id: (how many, the job). A node's batch is
     /// the last one starting at or below it, O(log batches) with nothing kept per node.
+    // BTreeMap: range queries by node id.
     nodes: BTreeMap<u32, (u32, JobId)>,
     by_request: FxHashMap<RequestId, JobId>,
     library: Option<String>,
     library_failed: Option<ApiError>,
-    fetch_failed: BTreeMap<String, ApiError>,
+    fetch_failed: FxHashMap<String, ApiError>,
     /// The store's placements: the job, and whether it is executable.
     placing: FxHashMap<Tag, (JobId, bool)>,
     /// The job of each lock write and mode of the loop's own.
@@ -405,12 +409,13 @@ impl Jobs {
             setup,
             started: Vec::new(),
             cancels: Vec::new(),
-            jobs: BTreeMap::new(),
+            jobs: FxHashMap::default(),
+            order: Vec::new(),
             nodes: BTreeMap::new(),
             by_request: FxHashMap::default(),
             library: None,
             library_failed: None,
-            fetch_failed: BTreeMap::new(),
+            fetch_failed: FxHashMap::default(),
             placing: FxHashMap::default(),
             own: FxHashMap::default(),
             next_own: 0,
@@ -429,7 +434,18 @@ impl Jobs {
 
     /// The roots the jobs' views read, kept by a collection.
     pub fn roots(&self) -> Vec<ContentId> {
-        self.jobs.values().flat_map(|it| it.views.iter().map(|view| view.view.root)).collect()
+        let mut jobs: Vec<(&JobId, &Job)> = self.jobs.iter().collect();
+        jobs.sort_unstable_by_key(|(id, _)| id.0);
+        jobs.into_iter().flat_map(|(_, it)| it.views.iter().map(|view| view.view.root)).collect()
+    }
+
+    /// The jobs' ids in order, in [`Jobs::order`]'s buffer: give it back once done.
+    fn sorted(&mut self) -> Vec<JobId> {
+        let mut order = std::mem::take(&mut self.order);
+        order.clear();
+        order.extend(self.jobs.keys().copied());
+        order.sort_unstable_by_key(|it| it.0);
+        order
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
@@ -482,7 +498,7 @@ impl Jobs {
             cancelled: Arc::new(AtomicBool::new(false)),
             stage: Stage::Over,
             values: FxHashMap::default(),
-            updating: BTreeSet::new(),
+            updating: FxHashSet::default(),
             queries: Vec::new(),
             placing: 0,
             batches: Vec::new(),
@@ -518,12 +534,12 @@ impl Jobs {
         }
         let job = self.jobs.get(&id).expect("a job being prepared");
         let opened = job.views[job.ready.len()];
-        let prep = self.open(w, id, opened, BTreeSet::new());
+        let prep = self.open(w, id, opened, FxHashSet::default());
         self.plan(w, id, prep);
     }
 
     /// The view opened in the database with its build configuration as the mounts are now.
-    fn open(&mut self, w: &mut World<'_>, id: JobId, opened: Opened, asked: BTreeSet<String>) -> Prep {
+    fn open(&mut self, w: &mut World<'_>, id: JobId, opened: Opened, asked: FxHashSet<String>) -> Prep {
         let job = self.jobs.get_mut(&id).expect("a job opening a view");
         let targets = targets_of(&job.work);
         let root_dir = match targets.and_then(|it| it.cargo.as_ref()) {
@@ -1370,7 +1386,9 @@ impl Jobs {
     /// runs; and a snapshot once all it waits for is durable.
     fn wind_up(&mut self, w: &mut World<'_>) {
         let mut over = Vec::new();
-        for (id, job) in &mut self.jobs {
+        let order = self.sorted();
+        for id in &order {
+            let job = self.jobs.get_mut(id).expect("a job in the order");
             if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
                 && w.db.settled()
                 && store.is_none_or(|it| w.store.durable(it))
@@ -1385,6 +1403,7 @@ impl Jobs {
                 over.push((*id, *ok, error.take()));
             }
         }
+        self.order = order;
         for (id, ok, error) in over {
             let job = self.jobs.remove(&id).expect("a job over");
             for queries in job.queries {
@@ -1567,5 +1586,43 @@ mod tests {
         assert_eq!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "aa")));
         assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "bb")));
         assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/s/serde-1.0.0", "aa")));
+    }
+
+    #[test]
+    fn jobs_are_walked_in_id_order_whatever_their_hashes() {
+        let setup = Setup { views: "/v".into(), host: "h".into(), env: Vec::new(), color: false, tags: 0, runs: 0, runs_end: 0 };
+        let mut jobs = Jobs::new(setup);
+        let ids = [9u64, 1, 300, 2, 1 << 40, 0, 77];
+        for id in ids {
+            let job = Job {
+                work: Work::Snapshot,
+                views: Vec::new(),
+                ready: Vec::new(),
+                request: None,
+                closed: false,
+                finished: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                stage: Stage::Over,
+                values: FxHashMap::default(),
+                updating: FxHashSet::default(),
+                queries: Vec::new(),
+                placing: 0,
+                batches: Vec::new(),
+                runs: 0,
+                over: None,
+                stats: RequestStats::default(),
+                fresh: 0,
+                compiled: 0,
+            };
+            jobs.jobs.insert(JobId(id), job);
+        }
+        let mut want: Vec<JobId> = ids.iter().map(|it| JobId(*it)).collect();
+        want.sort();
+        let order = jobs.sorted();
+        assert_eq!(order, want);
+        jobs.order = order;
+        jobs.jobs.remove(&JobId(300));
+        want.retain(|it| it.0 != 300);
+        assert_eq!(jobs.sorted(), want);
     }
 }

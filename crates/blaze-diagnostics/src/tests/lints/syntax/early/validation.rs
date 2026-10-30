@@ -4,7 +4,7 @@
 //! `non_camel_case_types`, the type parameters the early pass checks with the items the
 //! declarations check gives.
 
-use super::{Test, ui};
+use crate::tests::ui;
 
 const PARSE_ERRORS: &str = r#"//@ check-fail
 //@ run-rustfix
@@ -151,7 +151,7 @@ LL |         unsafe extern "C" fn f(_: ...) {}
    |                                ++
 
 "#;
-    assert_eq!(ui("parse-errors.rs", "2015", Test::Fails, PARSE_ERRORS), stderr);
+    assert_eq!(ui("parse-errors.rs", "2015", PARSE_ERRORS), stderr);
 }
 
 #[test]
@@ -293,7 +293,7 @@ LL |         unsafe extern "C" fn f(_: ...) {}
    |                                ++
 
 "#;
-    assert_eq!(ui("parse-errors.rs", "2018", Test::Fails, PARSE_ERRORS), stderr);
+    assert_eq!(ui("parse-errors.rs", "2018", PARSE_ERRORS), stderr);
 }
 
 #[test]
@@ -345,7 +345,7 @@ LL | #![deny(missing_unsafe_on_extern)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("unsafe-extern-suggestion.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("unsafe-extern-suggestion.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -395,7 +395,7 @@ LL | unsafe extern "C" {
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("safe-unsafe-on-unadorned-extern-block.rs", "2021", Test::Fails, source), stderr);
+    assert_eq!(ui("safe-unsafe-on-unadorned-extern-block.rs", "2021", source), stderr);
 }
 
 #[test]
@@ -440,7 +440,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0642`.
 "#;
-    assert_eq!(ui("no-patterns-in-args-2.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("no-patterns-in-args-2.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -483,7 +483,7 @@ LL |             break '_l ($f);
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("issue-87812.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("issue-87812.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -501,7 +501,7 @@ fn main () {
     };
 }
 "#;
-    assert_eq!(ui("break-with-label-and-unsafe-block.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("break-with-label-and-unsafe-block.rs", "2015", source), "");
 }
 
 #[test]
@@ -595,7 +595,7 @@ LL |             (loop { break 42; });
 error: aborting due to 2 previous errors; 1 warning emitted
 
 "#;
-    assert_eq!(ui("lifetime_starts_expressions.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("lifetime_starts_expressions.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -624,7 +624,7 @@ fn main() {
     xyz();
 }
 "#;
-    assert_eq!(ui("break-label-with-parens-147542.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("break-label-with-parens-147542.rs", "2015", source), "");
 }
 
 #[test]
@@ -698,7 +698,7 @@ LL | unsafe extern {}
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui("feature-gate-explicit-extern-abis.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("feature-gate-explicit-extern-abis.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -770,7 +770,7 @@ LL | foo!();
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui("unused-visibilities.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("unused-visibilities.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -877,7 +877,7 @@ LL |     type Assoc3 where = () where;
 warning: 5 warnings emitted
 
 "#;
-    assert_eq!(ui("where-clause-placement-assoc-type-in-impl.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("where-clause-placement-assoc-type-in-impl.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -930,7 +930,7 @@ LL +     type Assoc2 = () where i32: Copy, u32: Copy;
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("where-clause-placement-assoc-type-in-trait.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("where-clause-placement-assoc-type-in-trait.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -1037,7 +1037,7 @@ LL | fn f<ty>(_: ty) {}
 error: aborting due to 9 previous errors
 
 "#;
-    assert_eq!(ui("lint-non-camel-case-types.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("lint-non-camel-case-types.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -1054,7 +1054,7 @@ pub enum Foo {
 
 fn main() {}
 "#;
-    assert_eq!(ui("lint-non-camel-case-variant.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("lint-non-camel-case-variant.rs", "2015", source), "");
 }
 
 #[test]
@@ -1071,7 +1071,7 @@ type Foo_ = isize;
 
 pub fn main() { }
 "#;
-    assert_eq!(ui("lint-non-camel-case-with-trailing-underscores.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("lint-non-camel-case-with-trailing-underscores.rs", "2015", source), "");
 }
 
 #[test]
@@ -1092,5 +1092,5 @@ struct X___ {}
 
 fn main() { }
 "#;
-    assert_eq!(ui("issue-54099-camel-case-underscore-types.rs", "2015", Test::Passes, source), "");
+    assert_eq!(ui("issue-54099-camel-case-underscore-types.rs", "2015", source), "");
 }

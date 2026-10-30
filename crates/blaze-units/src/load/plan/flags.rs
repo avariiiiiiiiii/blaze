@@ -8,7 +8,7 @@ use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags};
 use blaze_manifest::manifest::Manifest;
 use blaze_resolve::Cfg;
-use cargo_util_schemas::manifest::TomlLintLevel;
+use cargo_util_schemas::manifest::{TomlLintLevel, TomlManifest};
 
 use crate::load::load_error;
 use crate::query::LoadError;
@@ -96,9 +96,13 @@ pub(super) fn cfgs(profile_rustflags: &[String], features: &[String], rustflags:
 /// cargo's `check_cfg_args`: what follows each `--check-cfg`, the package's features (its
 /// summary's, the implicit ones of optional dependencies too) sorted by name.
 pub(super) fn check_cfg(manifest: &Manifest) -> Vec<String> {
-    let mut feature = String::with_capacity(manifest.features.len() * 7 + 25);
+    check_cfg_of(manifest.features.keys().map(String::as_str))
+}
+
+pub(super) fn check_cfg_of<'a>(features: impl ExactSizeIterator<Item = &'a str>) -> Vec<String> {
+    let mut feature = String::with_capacity(features.len() * 7 + 25);
     feature.push_str("cfg(feature, values(");
-    for (at, name) in manifest.features.keys().enumerate() {
+    for (at, name) in features.enumerate() {
         if at != 0 {
             feature.push_str(", ");
         }
@@ -114,9 +118,11 @@ pub(super) fn check_cfg(manifest: &Manifest) -> Vec<String> {
 /// flags sorted by priority, then by name backwards, then by flag; and what follows each
 /// `--check-cfg` of `[lints.rust.unexpected_cfgs] check-cfg`.
 pub(super) fn lints(manifest: &Manifest) -> Result<(Vec<String>, Vec<String>), LoadError> {
-    let name = &manifest.package_id.name;
-    let lints = manifest
-        .normalized_toml
+    lints_of(&manifest.package_id.name, &manifest.normalized_toml)
+}
+
+pub(super) fn lints_of(name: &str, toml: &TomlManifest) -> Result<(Vec<String>, Vec<String>), LoadError> {
+    let lints = toml
         .normalized_lints()
         .map_err(|_| error(format!("the `[lints]` of `{name}` were not inherited from the workspace")))?;
     let Some(lints) = lints else { return Ok((Vec::new(), Vec::new())) };

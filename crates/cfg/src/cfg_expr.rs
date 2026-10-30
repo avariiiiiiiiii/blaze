@@ -27,11 +27,11 @@ impl PartialOrd for CfgAtom {
 impl Ord for CfgAtom {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
-            (CfgAtom::Flag(a), CfgAtom::Flag(b)) => a.as_str().cmp(b.as_str()),
+            (CfgAtom::Flag(a), CfgAtom::Flag(b)) => a.cmp_order(b),
             (CfgAtom::Flag(_), CfgAtom::KeyValue { .. }) => std::cmp::Ordering::Less,
             (CfgAtom::KeyValue { .. }, CfgAtom::Flag(_)) => std::cmp::Ordering::Greater,
             (CfgAtom::KeyValue { key, value }, CfgAtom::KeyValue { key: key2, value: value2 }) => {
-                key.as_str().cmp(key2.as_str()).then(value.as_str().cmp(value2.as_str()))
+                key.cmp_order(key2).then_with(|| value.cmp_order(value2))
             }
         }
     }

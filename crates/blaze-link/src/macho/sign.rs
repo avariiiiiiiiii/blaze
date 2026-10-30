@@ -6,6 +6,8 @@
 //! assembles the file first. They are hashed in parallel, and an incremental link hashes only
 //! the pages whose bytes differ from the last signature's ([`Cache`]).
 
+#![forbid(unsafe_code)]
+
 use rayon::prelude::*;
 
 use super::sha256;

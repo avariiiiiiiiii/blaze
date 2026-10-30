@@ -11,14 +11,11 @@
 //! process may write ([`Pool::live`]), read by scope after each answer
 //! ([`crate::trace::assemble`]).
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    ffi::OsString,
-    path::PathBuf,
-};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf};
 
 use blaze_core::{Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag};
 use blaze_ids::{ContentId, Hasher};
+use rustc_hash::FxHashMap;
 
 use crate::confine::LIVE;
 
@@ -122,9 +119,9 @@ struct Process {
 pub struct Pool {
     config: Config,
     next: u64,
-    servers: BTreeMap<Server, Process>,
+    servers: FxHashMap<Server, Process>,
     asked: HashMap<Tag, Asked>,
-    idle: BTreeMap<WarmKey, Vec<Server>>,
+    idle: FxHashMap<WarmKey, Vec<Server>>,
     count: u32,
 }
 

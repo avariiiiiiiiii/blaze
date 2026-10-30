@@ -486,3 +486,81 @@ for every later process, so stub misses undercount what a test ran; only per-pro
 zeroed at fork, are exact. Code that ran before the fork reaches every test. With these hooks,
 usercode adds the executed set to the fork server's `Ended` frame and feeds `Reached` from it.
 Until then, `Reached` is whatever the daemon gives today, which is sound when it is a superset.
+
+## From safety-fuzz-macrowasm (2026-10-29): bugs in `blaze-macro-wasm` found by reading, and three public functions to fuzz
+
+Targets: `fuzz/targets/macro_wasm_{validate,host,wire,lex}.rs` (shared module
+`macro_wasm_guest.rs`). Each input below is kept in `fuzz/corpus/<target>/` and fails that
+target's seeds test until fixed. The host-target inputs are programs for the fuzz guest:
+phase byte, record count, 37-byte records (an op byte, then nine `i32`s), then data. Its
+input buffer is at `0x8000`, so the data after one record is at `0x8027`.
+
+1. **`read_bytes` (`lib.rs:324`) allocates `len` before checking it against memory.**
+   `output`, `panicked`, `ts_from_str` and `literal_from_str` with `len = 0xffffffff` make the
+   host allocate and zero 4 GiB, then fail. Fix: check `ptr + len <= memory.data_size()`
+   first, or copy from `memory.data(&caller).get(ptr..ptr + len)`.
+   Input: `macro_wasm_host/output-believes-its-length.hex`.
+2. **`random_get` (`wasi.rs:400`) makes `len` random bytes before checking the buffer.**
+   That is up to 4 GiB and 512M hash rounds per call. Fix: take the checked slice first,
+   then fill it in place. Input: `macro_wasm_host/random-get-believes-its-length.hex`.
+3. **`ts_from_str` and `literal_from_str` (`lib.rs:579`, `:600`) panic outside an expansion.**
+   They `expect` the call site to be numbered. During a `Session`'s `_initialize` and during
+   `Wasm::list`, `sites` is `[0; 3]`. A module that parses a `TokenStream` in a static
+   initializer, or in its list export, therefore panics the host. `load` and `prepare` run the
+   list. Fix: return the error (`-1 - give(msg)`), or give a call site there.
+   Input: `macro_wasm_host/ts-from-str-in-initialize.hex` (`01 01 15 27800000 01000000 ...` with data `78`).
+4. **`fd_pread` with a negative offset panics (`wasi.rs:449`).** `from = u64::MAX as usize`,
+   so `from + len` overflows: a debug panic. In release the wrapped end is below the start,
+   giving `bytes[file_len..4]`, which also panics. Fix: `from = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len())`
+   and `saturating_add`. Input: `macro_wasm_host/fd-pread-negative-offset.hex`
+   (`fd_pread(4, iov, 1, -1, 0x300)`).
+5. **`lex::literal` (`lex.rs:90`) panics on an unterminated raw string at the end of the text.**
+   The inputs are `r"`, `r#`, `br"`, `br#`, `cr"` and `cr#`. The lexer gives
+   `n_hashes: None` with the token only its prefix, so `lit[2..1]` (or `[3..2]`) panics. Any
+   module reaches it through `"r\"".parse::<TokenStream>()`, where rustc gives a `LexError`, and
+   so does the public `tokens`. Fix: an `Err` when `n_hashes` is `None` or a quoted literal is
+   unterminated. Inputs: `macro_wasm_lex/raw-string-unterminated.hex` (`7222`),
+   `raw-string-hash-at-end.hex` (`7223`), `raw-byte-string-unterminated.hex` (`627222`),
+   `macro_wasm_host/ts-from-str-unterminated-raw-string.hex`.
+6. **A literal suffix over 255 bytes panics `tt::Literal::new`.** The panic is
+   `suffix_len: u8 = suffix.len().try_into().unwrap()` (`crates/tt/src/lib.rs:408`, `:467`,
+   format's). It is reached from `lex::literal` (text `1` then 256 letters) and from
+   `wire::Reader` (a literal the module wrote with a long suffix). Fix here: refuse it (`Err`)
+   in both until tt holds longer suffixes; format is told. Inputs:
+   `macro_wasm_lex/suffix-256.hex`, `macro_wasm_wire/literal-suffix-256.hex`,
+   `macro_wasm_host/literal-from-str-long-suffix.hex`.
+7. **`wire::Reader::stream` (`wire.rs:253`) believes a stream's count.** It reserves
+   `count.min(1 << 16)` trees on a 4-byte count, about 5.7 MB at roughly 88 bytes a `Tree`.
+   Each nested group's stream does the same, so 18 bytes a level hold 5.7 MB a level live: 100
+   levels (1.8 KB of output) is 570 MB. Fix: cap the reservation at `(bytes.len() - at) / 10`,
+   the fewest bytes a tree takes. Input: `macro_wasm_wire/count-believed.hex` (`ffff0000`).
+8. **Unbounded recursion in the wire decoder.** `Reader::tree`/`stream`, `wire::flatten`,
+   `placed` and the drop of `Vec<Tree>` recurse once per nested group, at 18 bytes a level.
+   A module output of a few MB overflows the expanding thread's stack, which aborts the
+   process rather than panicking. Fix: decode with an explicit stack, or stop with an error
+   at a depth bound. The input is too big for the corpus: `01000000`, then
+   `00 00 01000000 01000000 01000000 01000000` repeated 500000 times, then `00000000`.
+9. **Overflow-checked arithmetic on guest numbers (panics in debug builds only).**
+   - `fd_write` (`wasi.rs:425`): `total += len as u32` overflows when iovecs sum past 4 GiB
+     (16385 iovecs over the whole memory). Input: `macro_wasm_host/fd-write-total-overflows-u32.hex`.
+   - `environ_get` (`wasi.rs:363`, `:370`): `environ + 4 * index as i32` and
+     `at += entry.len() as i32` overflow `i32` for pointers near 2 GiB in a memory over 2 GiB.
+
+   Fix: wrapping or checked `u32` arithmetic, giving `EINVAL` where it would overflow.
+10. **Note, not a request:** the engine has no epoch or fuel. A module that loops in
+    `_initialize` or its list hangs `load`/`prepare`, as a native proc macro hangs rustc. For
+    that reason `macro_wasm_validate` never runs the module it is given.
+
+Public functions the targets need, to feed bytes without a wasm instance (each is a thin
+wrapper of what is private now). The targets go through `Wasm::at`, `Session::expand` and
+`tokens` until these exist:
+- `pub fn carried_list(bytes: &[u8]) -> Option<String>` (the private one at `lib.rs` `fn carried_list`).
+  `prepare_soon` runs it on every module before compiling it. Today it can only be reached
+  through `prepare_soon`, which starts an unjoined thread, or `prepare`, which runs the module.
+- `pub fn decode(bytes: &[u8], sites: [Span; 3]) -> Result<tt::TopSubtree, String>`:
+  `Reader::new(bytes, &spans).stream()` over `Spans` of the three sites (numbers 1, 2, 3), then
+  `wire::top_subtree(trees, sites[1])`. This is the wire decoder without an instance per input.
+- `pub fn check_module(bytes: &[u8]) -> Result<(), String>`: `Module::new(engine(), bytes)`
+  then the linker of `Wasm::compile` (`wasi::add`, `add_host`, `wasi::rest`) and
+  `instantiate_pre`. Unlike `Wasm::at`, it neither caches in `COMPILED`, which keeps every
+  module a fuzz run loads, nor writes machine code beside a file.

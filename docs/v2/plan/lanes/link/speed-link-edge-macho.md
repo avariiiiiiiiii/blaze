@@ -27,11 +27,11 @@ covers the writer (`macho.rs`, `linkedit.rs`, `sign.rs`, `sha256.rs`) and sums u
 
 | phase | before | after | against the benchmark |
 |---|---|---|---|
-| parse: objects | atoms found by two `Vec<u64>` per section and a linear scan per symbol for its size (quadratic per section); a `Vec` of relocations per section; `__eh_frame` pointers resolved by linear scans | one sorted column of atom bounds and starts per file, sizes and address→atom by binary search; nlists and relocations read in place; fixups one column with one sort; `__eh_frame` by binary search ([input notes](speed-link-edge-macho-input.md)). Still a `Vec<u8>` per atom and a `String` per symbol, forced by `model.rs` | as lld's `ObjFile` on passes and lookups; behind mold and wild on copies until `v2/requests/link.md` items 5 and 5a land (bytes and names in place, fixups as CSR) |
-| parse: archives | each index entry re-parsed its member's header | members by binary search over header offsets, index preallocated | as lld |
+| parse: objects | atoms found by two `Vec<u64>` per section and a linear scan per symbol for its size (quadratic per section); a `Vec` of relocations per section; `__eh_frame` pointers resolved by linear scans | one sorted column of atom bounds and starts per file, sizes and address→atom by binary search; nlists and relocations read in place; `__eh_frame` by binary search. On the zero-copy contract: an atom's bytes a range of the input (`Data::Input`), every name a `Name` in one `Names` arena sized once from the nlists, each Mach-O section's `SEG,SECT` pushed once and shared by its atoms, fixups one column (`Object::fixups`) with each atom's run a `Range<u32>`: no allocation per atom, per section or per symbol ([input notes](speed-link-edge-macho-input.md)). Left: a `String` per *named* Mach-O section (`__LD,__compact_unwind`, `#[link_section]`), `Class::Named`'s (`v2/requests/link.md` item 11) | as lld's `ObjFile` on passes and lookups, and as mold and wild on copies (none) |
+| parse: archives | each index entry re-parsed its member's header; a `String` per member and per index name | members by binary search over header offsets; the index and members' names in one `Names` arena sized by one pass over the index | as lld |
 | parse: where an input starts | a member not at a multiple of 8 (GNU-format archives, `llvm-ar`'s) was copied whole into an aligned buffer before it was read (`aligned`, one `unsafe` block) | read in place at any byte: the workspace builds `object` with `unaligned`, so its Mach-O structures are byte arrays, which arm64 and x86-64 load unaligned at no cost; `macho.rs` asserts at compile time that every structure the readers view has alignment 1. A universal file's object is read in its slice and its `Data::Input` ranges moved onto the whole file, so the core reads them in place too | as wild and mold: no copy of any input |
-| parse: `.tbd`, dylibs | a parse tree of `String`s and `Vec`s per YAML node | see [dylib notes](speed-link-edge-macho-dylib.md) | |
-| resolve | the core's, fed `String` names | the same until item 5 | as above |
+| parse: `.tbd`, dylibs | a parse tree of `String`s and `Vec`s per YAML node; at least 4 allocations and 6 char-decoding passes per kept symbol; a `String` per export of a dylib | `.tbd`: a byte lexer (8 bytes a step) onto a flat 12-byte tape, three passes, one hash and about 1.5 probes per kept name, the names straight into a `Names` arena sized once from the tape; dylibs: the export trie walked in place into an arena; no allocation per symbol in either ([dylib notes](speed-link-edge-macho-dylib.md)) | beats lld's and ld-prime's (LLVM's YAMLIO: a node tree and a `std::string` per symbol); beats mold's hand-written YAML-subset reader, the fastest in a linker, which has the same zero-copy scalars but a `vector` per node and a byte-at-a-time scan |
+| resolve | the core's, fed `String` names | the core's, fed `Name`s of each file's arena and `Copy` symbols (`SharedSymbol` 16 bytes); a hash index per `Shared` (`v2/requests/link.md` item 7, which `tbd.rs`'s dedup table already is) is still open, so the core hashes every export of every library per link | as lld once item 7 lands: lookups proportional to the imports, not the exports |
 | layout | `synthetic` sizes `__unwind_info` from counts only: no pass over the image | unchanged | as lld |
 | copy | the core's | unchanged | the core's |
 | relocate | every Mach-O relocation is read into an `Apply` the core applies; `Writer::apply` refuses the rest | unchanged | as lld: relocation types decoded once, at read |
@@ -53,6 +53,11 @@ covers the writer (`macho.rs`, `linkedit.rs`, `sign.rs`, `sha256.rs`) and sums u
   asks for it. With it, the chain is written as pieces are placed, page starts and the imports
   table in one pass from counts known up front, and a relink rewrites only the slots whose
   target or neighbour changed.
+- **The debug info is copied once** into the `__DWARF` part: `File::parts` owns its bytes
+  (`Vec<(u64, Vec<u8>)>`) and `Placed::debug` is borrowed, so one copy of every debug section
+  is forced per link (the signature hashes them in place). A part that names a debug section
+  by index instead of holding its bytes would remove it; mold writes them straight into the
+  mapped output.
 - **The symbol table and the trie are rebuilt on every relink**: `Writer::synthesize` and
   `Writer::file` are pure functions of `Placed`, which does not say what changed since the last
   link. Both are linear after one sort of the names (O(n log n) string compares, n the

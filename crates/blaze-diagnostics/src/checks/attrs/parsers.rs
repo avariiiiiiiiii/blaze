@@ -4,12 +4,14 @@
 //! - [`codegen`]: `codegen_attrs.rs`, `inline.rs`, `link_attrs.rs`, `instruction_set.rs`,
 //!   `repr.rs`, `cfi_encoding.rs`, `rustc_allocator.rs`, `unroll.rs`, `splat.rs`,
 //!   `autodiff.rs`, `prototype.rs`, `loop_match.rs`, `body.rs`.
-//! - [`stability`]: `stability.rs`, `deprecation.rs`, `allow_unstable.rs`, `rustc_internal.rs`,
-//!   `rustc_dump.rs`, `confusables.rs`, `lint_helpers.rs`, `traits.rs`, `transparency.rs`,
-//!   `semantics.rs`, `pin_v2.rs`, `dummy.rs`, `must_not_suspend.rs`, `no_implicit_prelude.rs`.
+//! - [`stability`]: `stability.rs`, `deprecation.rs`, `allow_unstable.rs`, `rustc_dump.rs`,
+//!   `confusables.rs`, `lint_helpers.rs`, `traits.rs`, `transparency.rs`, `semantics.rs`,
+//!   `pin_v2.rs`, `dummy.rs`, `must_not_suspend.rs`, `no_implicit_prelude.rs`.
+//! - [`internal`]: `rustc_internal.rs`.
 //! - [`misc`]: `crate_level.rs`, `macro_attrs.rs`, `test_attrs.rs`, `proc_macro_attrs.rs`,
-//!   `doc.rs`, `debugger.rs`, `path.rs`, `must_use.rs`, `no_link.rs`, `non_exhaustive.rs`,
-//!   `prelude.rs`, `diagnostic/`.
+//!   `debugger.rs`, `path.rs`, `must_use.rs`, `no_link.rs`, `non_exhaustive.rs`, `prelude.rs`,
+//!   and expansion's checks of the attributes no parser takes (`validate_attr.rs`).
+//! - [`doc`]: `doc.rs` and `diagnostic/`.
 //!
 //! A module takes the attributes of its paths ([`codegen::PATHS`], ..): a single parser's
 //! conversion is [`Accepted::Single`], and `checks/attrs.rs` keeps the first and says what a
@@ -22,6 +24,8 @@
 //! (`ATTRIBUTE_PARSERS`, `FinalizeContext`, `FinalizeCheckContext`) (MIT or Apache-2.0).
 
 pub(crate) mod codegen;
+pub(crate) mod doc;
+pub(crate) mod internal;
 pub(crate) mod misc;
 pub(crate) mod stability;
 
@@ -61,7 +65,9 @@ pub(crate) enum GroupId {
 pub(crate) struct Node {
     pub(crate) codegen: codegen::State,
     pub(crate) stability: stability::State,
+    pub(crate) internal: internal::State,
     pub(crate) misc: misc::State,
+    pub(crate) doc: doc::State,
 }
 
 /// The module whose parser takes `path`.
@@ -69,7 +75,9 @@ pub(crate) struct Node {
 pub(crate) enum Module {
     Codegen,
     Stability,
+    Internal,
     Misc,
+    Doc,
 }
 
 pub(crate) fn module(path: &[&str]) -> Option<Module> {
@@ -78,8 +86,12 @@ pub(crate) fn module(path: &[&str]) -> Option<Module> {
         Some(Module::Codegen)
     } else if is(stability::PATHS) {
         Some(Module::Stability)
+    } else if is(internal::PATHS) {
+        Some(Module::Internal)
     } else if is(misc::PATHS) {
         Some(Module::Misc)
+    } else if is(doc::PATHS) {
+        Some(Module::Doc)
     } else {
         None
     }
@@ -90,7 +102,9 @@ pub(crate) fn accept(node: &mut Node, module: Module, cx: &mut Accept<'_, '_, '_
     match module {
         Module::Codegen => codegen::accept(&mut node.codegen, cx, args),
         Module::Stability => stability::accept(&mut node.stability, cx, args),
+        Module::Internal => internal::accept(&mut node.internal, cx, args),
         Module::Misc => misc::accept(&mut node.misc, cx, args),
+        Module::Doc => doc::accept(&mut node.doc, cx, args),
     }
 }
 
@@ -100,7 +114,9 @@ pub(crate) fn finalize(node: &mut Node, module: Module, group: &'static str, fx:
     match module {
         Module::Codegen => codegen::finalize(&mut node.codegen, group, fx),
         Module::Stability => stability::finalize(&mut node.stability, group, fx),
+        Module::Internal => internal::finalize(&mut node.internal, group, fx),
         Module::Misc => misc::finalize(&mut node.misc, group, fx),
+        Module::Doc => doc::finalize(&mut node.doc, group, fx),
     }
 }
 
@@ -111,7 +127,9 @@ pub(crate) fn check(module: Module, group: GroupId, first: usize, fx: &mut Final
     match module {
         Module::Codegen => codegen::check(group, first, fx, parsed),
         Module::Stability => stability::check(group, first, fx, parsed),
+        Module::Internal => internal::check(group, first, fx, parsed),
         Module::Misc => misc::check(group, first, fx, parsed),
+        Module::Doc => doc::check(group, first, fx, parsed),
     }
 }
 
@@ -241,11 +259,23 @@ mod tests {
     fn every_builtin_parser_is_in_one_module() {
         for builtin in table::builtins() {
             let path = builtin.path;
-            let modules = [super::codegen::PATHS, super::stability::PATHS, super::misc::PATHS];
+            let modules = [
+                super::codegen::PATHS,
+                super::stability::PATHS,
+                super::internal::PATHS,
+                super::misc::PATHS,
+                super::doc::PATHS,
+            ];
             let owning = modules.iter().filter(|it| it.contains(&path)).count();
             assert_eq!(owning, 1, "{path:?} is taken by {owning} modules");
         }
-        for paths in [super::codegen::PATHS, super::stability::PATHS, super::misc::PATHS] {
+        for paths in [
+            super::codegen::PATHS,
+            super::stability::PATHS,
+            super::internal::PATHS,
+            super::misc::PATHS,
+            super::doc::PATHS,
+        ] {
             for path in paths {
                 assert!(table::builtin(path).is_some(), "{path:?} is not a builtin parser's path");
             }

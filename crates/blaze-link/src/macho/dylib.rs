@@ -728,6 +728,23 @@ mod tests {
         assert!(shared.inputs.is_empty());
     }
 
+    /// `macho.rs` hands the slice over where it starts in the input, at any alignment (an
+    /// archive member's, a universal file's slice): every offset reads the same.
+    #[test]
+    fn any_alignment() {
+        let trie = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
+        let expected = exports(&read("libfoo.dylib", &trie, Arch::Aarch64).unwrap());
+        let mut buffer = Vec::with_capacity(trie.len() + 16);
+        for shift in 1..16 {
+            buffer.clear();
+            buffer.resize(shift, 0xa5);
+            buffer.extend_from_slice(&trie);
+            let shared = read("libfoo.dylib", &buffer[shift..], Arch::Aarch64).unwrap();
+            assert_eq!(shared.name, "/usr/lib/libfoo.dylib");
+            assert_eq!(exports(&shared), expected, "at {shift}");
+        }
+    }
+
     #[test]
     fn wrong_cpu() {
         let bytes = with_trie(macho::CPU_TYPE_ARM64, &sample_trie());
@@ -801,6 +818,13 @@ mod tests {
                 sym("abs", SymbolKind::Data, false),
             ]
         );
+        let expected = exports(&shared);
+        for shift in 1..16 {
+            let mut buffer = vec![0x5a; shift];
+            buffer.extend_from_slice(&bytes);
+            let shifted = read("libsym.dylib", &buffer[shift..], Arch::Aarch64).unwrap();
+            assert_eq!(exports(&shifted), expected, "at {shift}");
+        }
     }
 
     /// The walk as it was before the one-buffer walk: a stack of owned prefixes, a hash set

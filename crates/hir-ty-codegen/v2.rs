@@ -136,6 +136,8 @@ pub(crate) struct Function {
     pub(crate) spans: Vec<SpanRef>,
     /// Its named locals, for a debugger: empty unless the unit's debug info has them.
     pub(crate) variables: Vec<side::Variable>,
+    /// The scopes `variables` are bound in.
+    pub(crate) scopes: side::Scopes,
     /// What its `#[inline]` asks of LLVM; `None` for closures, glue and shims.
     pub(crate) hint: fragment::Hint,
     /// Where [`release::summarize`] leaves what [`release::emit`] takes up.

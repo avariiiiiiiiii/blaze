@@ -38,6 +38,7 @@ impl_foldable_for_interned_slice!(SolverDefIds);
 /// Every interned [`ExternalConstraints`], kept whole: it derefs to its data.
 static EXTERNAL_CONSTRAINTS: table::Values<ExternalConstraintsData<'static>> =
     table::Values::new("external constraints");
+table::erase!(ExternalConstraintsData);
 
 /// Solver constraints: their row in [`EXTERNAL_CONSTRAINTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -52,26 +53,12 @@ const _: () = assert!(size_of::<Option<ExternalConstraints<'static>>>() == 4);
 impl<'db> ExternalConstraints<'db> {
     #[inline]
     pub fn new(_interner: DbInterner<'db>, data: ExternalConstraintsData<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let data = unsafe {
-            std::mem::transmute::<ExternalConstraintsData<'db>, ExternalConstraintsData<'static>>(
-                data,
-            )
-        };
         ExternalConstraints { index: EXTERNAL_CONSTRAINTS.intern(data), _db: PhantomData }
     }
 
     #[inline]
     pub fn inner(&self) -> &ExternalConstraintsData<'db> {
-        // SAFETY: an `ExternalConstraints` is a row of `EXTERNAL_CONSTRAINTS`.
-        let inner = unsafe { EXTERNAL_CONSTRAINTS.get(self.index) };
-        // SAFETY: as in `new`.
-        unsafe {
-            std::mem::transmute::<&ExternalConstraintsData<'static>, &ExternalConstraintsData<'db>>(
-                inner,
-            )
-        }
+        EXTERNAL_CONSTRAINTS.get(self.index)
     }
 }
 

@@ -853,3 +853,230 @@ impl CoroutineFrame {
         self.upvars
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ops::ControlFlow;
+
+    use hir_def::{ConstId, TypeAliasId};
+    use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
+    use salsa::plumbing::FromId;
+
+    use super::*;
+    use crate::{
+        db::GeneralConstId,
+        next_solver::{
+            AliasTyKind, ClosureIdWrapper, GeneralConstIdWrapper, Mutability, Region, RegionKind,
+            ScalarInt, TraitAssocTyId, Tys, UnevaluatedConst, ValTreeKind,
+        },
+    };
+
+    /// A deterministic stream of choices: xorshift64.
+    pub(super) struct Seed(pub(super) u64);
+
+    impl Seed {
+        pub(super) fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    /// Field layouts of every shape the calculator treats apart: niches (`bool`, `char`, a
+    /// reference), plain integers, a zero-sized and an uninhabited field, an array, a wide
+    /// pointer.
+    pub(super) fn sized_fields(dl: &TargetDataLayout) -> Vec<Arc<Layout>> {
+        let cx = LayoutCx::new(dl);
+        let int = |i: Integer| Layout::scalar(dl, scalar_unit(dl, Primitive::Int(i, false)));
+        let mut ptr = scalar_unit(dl, Primitive::Pointer(AddressSpace::ZERO));
+        ptr.valid_range_mut().start = 1;
+        let usize = scalar_unit(dl, Primitive::Int(dl.ptr_sized_integer(), false));
+        let u32 = int(Integer::I32);
+        let array = cx.calc.layout_of_array_like::<_, _, ()>(&u32, Some(3)).unwrap();
+        [
+            Layout::scalar(
+                dl,
+                Scalar::Initialized {
+                    value: Primitive::Int(Integer::I8, false),
+                    valid_range: WrappingRange { start: 0, end: 1 },
+                },
+            ),
+            Layout::scalar(
+                dl,
+                Scalar::Initialized {
+                    value: Primitive::Int(Integer::I32, false),
+                    valid_range: WrappingRange { start: 0, end: 0x10FFFF },
+                },
+            ),
+            Layout::scalar(dl, ptr),
+            int(Integer::I8),
+            int(Integer::I16),
+            u32,
+            int(Integer::I64),
+            int(Integer::I128),
+            LayoutData::unit(dl, true),
+            LayoutData::never_type(dl),
+            array,
+            LayoutData::scalar_pair(dl, ptr, usize),
+        ]
+        .into_iter()
+        .map(Arc::new)
+        .collect()
+    }
+
+    /// `[u8]`: a field that can only be last.
+    pub(super) fn unsized_field(dl: &TargetDataLayout) -> Arc<Layout> {
+        let u8 = Layout::scalar(dl, scalar_unit(dl, Primitive::Int(Integer::I8, false)));
+        Arc::new(LayoutCx::new(dl).calc.layout_of_array_like::<_, _, ()>(&u8, None).unwrap())
+    }
+
+    /// What `layout_of_ty` did before: three heap buffers.
+    fn univariant_with_vecs(
+        cx: &LayoutCx<'_>,
+        fields: &[Arc<Layout>],
+        kind: StructKind,
+    ) -> Result<Layout, LayoutError> {
+        let fields = fields.to_vec();
+        let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
+        let fields = fields.iter().collect::<IndexVec<_, _>>();
+        Ok(cx.calc.layout_of_univariant(&fields, &ReprOptions::default(), kind)?)
+    }
+
+    #[test]
+    fn univariant_on_the_stack_matches_the_vecs() {
+        let dl = TargetDataLayout::default();
+        let cx = LayoutCx::new(&dl);
+        let pool = sized_fields(&dl);
+        let tail = unsized_field(&dl);
+        let mut seed = Seed(0x9e37_79b9_7f4a_7c15);
+        for case in 0..400 {
+            // Up to twelve fields, past the eight kept on the stack.
+            let len = seed.below(13);
+            let mut fields: Vec<_> = (0..len).map(|_| pool[seed.below(pool.len())].clone()).collect();
+            let kinds: &[StructKind] = match case % 3 {
+                // A closure: every field free to move.
+                0 => &[StructKind::AlwaysSized],
+                // A tuple: the last field stays last.
+                1 => &[StructKind::MaybeUnsized, StructKind::AlwaysSized],
+                // A tuple with an unsized tail.
+                _ => {
+                    fields.push(tail.clone());
+                    &[StructKind::MaybeUnsized]
+                }
+            };
+            for &kind in kinds {
+                assert_eq!(
+                    univariant_of(&cx, &fields, kind),
+                    univariant_with_vecs(&cx, &fields, kind),
+                    "case {case}, {len} fields",
+                );
+            }
+        }
+    }
+
+    /// Whether folding `ty` can reach an alias or an unevaluated constant: what
+    /// `deeply_normalize` rewrites.
+    struct FindsAlias;
+
+    impl<'db> TypeVisitor<DbInterner<'db>> for FindsAlias {
+        type Result = ControlFlow<()>;
+
+        fn visit_ty(&mut self, ty: Ty<'db>) -> ControlFlow<()> {
+            if let TyKind::Alias(..) = ty.kind() {
+                return ControlFlow::Break(());
+            }
+            ty.super_visit_with(self)
+        }
+
+        fn visit_const(&mut self, ct: Const<'db>) -> ControlFlow<()> {
+            if let ConstKind::Unevaluated(..) = ct.kind() {
+                return ControlFlow::Break(());
+            }
+            ct.super_visit_with(self)
+        }
+    }
+
+    fn id<T: FromId>(index: u32) -> T {
+        T::from_id(salsa::Id::from_bits(u64::from(index)))
+    }
+
+    fn ty<'db>(kind: TyKind<'db>) -> Ty<'db> {
+        Ty::new_without_interner(kind)
+    }
+
+    fn args<'db>(tys: &[Ty<'db>]) -> GenericArgs<'db> {
+        GenericArgs::new_from_slice(&tys.iter().map(|&it| it.into()).collect::<Vec<_>>())
+    }
+
+    fn tuple<'db>(tys: &[Ty<'db>]) -> Ty<'db> {
+        ty(TyKind::Tuple(Tys::new_from_slice(tys)))
+    }
+
+    fn closure<'db>(upvars: &[Ty<'db>]) -> Ty<'db> {
+        ty(TyKind::Closure(ClosureIdWrapper(id(7)), args(upvars)))
+    }
+
+    fn reference<'db>(to: Ty<'db>) -> Ty<'db> {
+        ty(TyKind::Ref(Region::new_without_interner(RegionKind::ReStatic), to, Mutability::Not))
+    }
+
+    /// `<_ as Trait>::Assoc` over `args`.
+    fn projection<'db>(args: GenericArgs<'db>) -> Ty<'db> {
+        let alias: TypeAliasId = id(5);
+        ty(TyKind::Alias(rustc_type_ir::AliasTy::from_checked_parts(
+            AliasTyKind::Projection { def_id: TraitAssocTyId(alias) },
+            args,
+        )))
+    }
+
+    fn unevaluated<'db>(args: GenericArgs<'db>) -> Const<'db> {
+        let def = GeneralConstIdWrapper(GeneralConstId::ConstId(id::<ConstId>(6)));
+        Const::new_without_interner(ConstKind::Unevaluated(UnevaluatedConst { def, args }))
+    }
+
+    #[test]
+    fn skipping_normalization_is_exactly_the_alias_free_types() {
+        let u8 = ty(TyKind::Uint(UintTy::U8));
+        let seven = Const::new_without_interner(ConstKind::Value(ValueConst::new(
+            u8,
+            ValTreeKind::Leaf(ScalarInt::from(7u8)),
+        )));
+
+        let assoc = projection(args(&[u8]));
+        let uneval_array = ty(TyKind::Array(u8, unevaluated(GenericArgs::empty())));
+        let alias_free = [
+            u8,
+            ty(TyKind::Bool),
+            ty(TyKind::Str),
+            ty(TyKind::Never),
+            tuple(&[]),
+            tuple(&[u8, ty(TyKind::Char)]),
+            ty(TyKind::Array(u8, seven)),
+            ty(TyKind::Slice(u8)),
+            reference(ty(TyKind::Slice(u8))),
+            ty(TyKind::RawPtr(tuple(&[u8, ty(TyKind::Str)]), Mutability::Mut)),
+            closure(&[u8, reference(u8)]),
+            tuple(&[closure(&[tuple(&[u8])]), ty(TyKind::Array(u8, seven))]),
+        ];
+        let with_aliases = [
+            assoc,
+            projection(args(&[assoc])),
+            tuple(&[u8, assoc]),
+            tuple(&[u8, tuple(&[ty(TyKind::Slice(assoc))])]),
+            reference(assoc),
+            closure(&[u8, assoc]),
+            closure(&[tuple(&[reference(assoc)])]),
+            uneval_array,
+            tuple(&[u8, uneval_array]),
+            ty(TyKind::Array(u8, unevaluated(args(&[u8])))),
+            ty(TyKind::Slice(uneval_array)),
+            closure(&[uneval_array]),
+        ];
+        for (index, &it) in alias_free.iter().chain(&with_aliases).enumerate() {
+            let model = it.visit_with(&mut FindsAlias).is_break();
+            assert_eq!(needs_normalizing(it), model, "type {index}");
+            assert_eq!(model, index >= alias_free.len(), "type {index}");
+        }
+    }
+}

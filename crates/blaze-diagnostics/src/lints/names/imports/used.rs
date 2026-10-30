@@ -181,8 +181,10 @@ pub(super) struct Uses {
     pub(super) typeck: FxHashSet<Binding>,
     /// The bindings the crate re-exports: rustc's `effective_visibilities.is_exported`.
     pub(super) exported: FxHashSet<Binding>,
+    /// Each name in a namespace a binding is re-exported as.
+    pub(super) exported_names: FxHashSet<(Binding, Name, Ns)>,
     /// The modules reachable from other crates, through public names from the root.
-    pub(super) public_modules: FxHashSet<ModuleId>,
+    public_modules: FxHashSet<ModuleId>,
     /// The `#[macro_use]` imports used: of every macro (`None`) or of one.
     pub(super) macro_uses: FxHashSet<(ExternCrateId, Option<Name>)>,
     /// The macros invoked: by a call, an attribute or a derive.
@@ -207,6 +209,7 @@ impl Uses {
             candidates: Vec::new(),
             typeck: FxHashSet::default(),
             exported: FxHashSet::default(),
+            exported_names: FxHashSet::default(),
             public_modules: FxHashSet::default(),
             macro_uses: FxHashSet::default(),
             macros: FxHashSet::default(),
@@ -1017,9 +1020,10 @@ impl Uses {
                     }
                     let mut at = found.import;
                     while let Some(binding) = at {
-                        if !self.is_local(cx, binding) || !self.exported.insert(binding) {
+                        if !self.is_local(cx, binding) || !self.exported_names.insert((binding, name.clone(), ns)) {
                             break;
                         }
+                        self.exported.insert(binding);
                         at = self
                             .next(cx, binding, &name, ns)
                             .filter(|it| it.vis == Visibility::Public)

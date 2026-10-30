@@ -60,7 +60,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner]) -> Vec<F
     found.extend(attributes::expansion(cx, walk, owners, &features));
     found.extend(staged(cx, owners, &features, &flags));
     found.extend(gates::check(cx, walk, &features, &flags));
-    found.extend(library::check(cx, walk, owners, &features));
+    found.extend(library::check(cx, owners, &features));
     found
 }
 

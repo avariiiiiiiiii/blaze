@@ -23,7 +23,8 @@ use blaze_graph::{
     Budget, Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
     admission::{Estimates, TaskKind},
     arena,
-    machine::{NodeId, Outcome, Pool, Spec},
+    machine::{NodeId, Outcome, Pool},
+    plane::{NodeRef, Nodes},
 };
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -70,9 +71,23 @@ pub enum Task {
 
 const _: () = assert!(std::mem::size_of::<Task>() == 12);
 
-pub struct Node {
-    pub spec: Spec,
-    pub task: Task,
+/// A batch of nodes being made ([`Plane::fresh`]): the ids reserved for it, the plane's
+/// columns of it, and each node's task, filled by [`Plane::push`] and added whole by
+/// [`Plane::add`].
+pub struct Fresh {
+    nodes: Nodes,
+    tasks: Vec<Task>,
+    count: u32,
+}
+
+impl Fresh {
+    pub fn first(&self) -> NodeId {
+        self.nodes.first()
+    }
+
+    pub fn len(&self) -> u32 {
+        self.count
+    }
 }
 
 /// What the plane did, for the loop to act on, in order.
@@ -335,13 +350,34 @@ impl<T: Send + 'static> Plane<T> {
         self.graph.stats(request)
     }
 
-    /// The first of `count` consecutive node ids no node of this plane has, for one
-    /// [`Plane::add`].
+    /// A batch of `count` nodes with consecutive ids no node of this plane has, its columns
+    /// sized for `name_bytes` of names and `deps` deps in all.
     ///
     /// # Panics
     ///
     /// When the ids wrapped around onto a batch that has not settled, after 2^32 nodes.
-    pub fn reserve(&mut self, count: u32) -> NodeId {
+    pub fn fresh(&mut self, count: u32, name_bytes: usize, deps: usize) -> Fresh {
+        let first = self.reserve(count);
+        let nodes = Nodes::with_capacity(first, count as usize, name_bytes, deps);
+        Fresh { nodes, tasks: Vec::with_capacity(count as usize), count }
+    }
+
+    /// The next node of `fresh`, its id; a thread task's memory raised to what its kind is
+    /// predicted to hold.
+    ///
+    /// # Panics
+    ///
+    /// When `fresh` has all the nodes it was made for.
+    pub fn push(&self, fresh: &mut Fresh, mut node: NodeRef<'_>, task: Task) -> NodeId {
+        assert!((fresh.tasks.len() as u32) < fresh.count, "a batch of {} nodes given another", fresh.count);
+        if let Task::Thread { kind, .. } = task {
+            node.memory = node.memory.max(self.estimates.predict(kind));
+        }
+        fresh.tasks.push(task);
+        fresh.nodes.push(node)
+    }
+
+    fn reserve(&mut self, count: u32) -> NodeId {
         let first = match self.next_node.checked_add(count) {
             Some(_) => self.next_node,
             None => 0,
@@ -379,37 +415,24 @@ impl<T: Send + 'static> Plane<T> {
         request
     }
 
-    /// Nodes of `request` with the ids [`Plane::reserve`] gave from `first`, in order, their
-    /// thread tasks run by `work`; each thread task's memory raised to what its kind is
-    /// predicted to hold. An error (a cycle, a dep of another request) adds none of them.
+    /// The nodes of `fresh` added to `request`, in one input to the plane, their thread tasks
+    /// run by `work`. An error (a cycle, a dep of another request) adds none of them.
     ///
     /// # Panics
     ///
-    /// When a node's id is not `first` plus its place, or a thread task has no `work`.
-    pub fn add(
-        &mut self,
-        at: Duration,
-        request: RequestId,
-        first: NodeId,
-        nodes: Vec<Node>,
-        work: Option<Work<T>>,
-    ) -> Result<(), Error> {
-        let mut specs = Vec::with_capacity(nodes.len());
-        let mut tasks = Vec::with_capacity(nodes.len());
-        for (offset, Node { mut spec, task }) in (0u32..).zip(nodes) {
-            assert_eq!(spec.id.0, first.0 + offset, "a batch's nodes are the ids reserved for it, in order");
-            if let Task::Thread { kind, .. } = task {
-                assert!(work.is_some(), "a batch with thread tasks is given their work");
-                spec.memory = spec.memory.max(self.estimates.predict(kind));
-            }
-            tasks.push(task);
-            specs.push(spec);
+    /// When `fresh` has fewer nodes than it was made for, or a thread task has no `work`.
+    pub fn add(&mut self, at: Duration, request: RequestId, fresh: Fresh, work: Option<Work<T>>) -> Result<(), Error> {
+        let Fresh { nodes, tasks, count } = fresh;
+        assert_eq!(tasks.len() as u32, count, "a batch is added with every node it was made for");
+        assert!(
+            work.is_some() || !tasks.iter().any(|it| matches!(it, Task::Thread { .. })),
+            "a batch with thread tasks is given their work"
+        );
+        let first = nodes.first();
+        if count > 0 {
+            self.batches.insert(first.0, Batch { tasks, live: count, work });
         }
-        if !tasks.is_empty() {
-            let live = tasks.len() as u32;
-            self.batches.insert(first.0, Batch { tasks, live, work });
-        }
-        match self.step(PlaneInput::Add { at_ns: ns(at), request, nodes: specs }) {
+        match self.step(PlaneInput::AddNodes { at_ns: ns(at), request, nodes }) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.batches.remove(&first.0);

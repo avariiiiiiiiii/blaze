@@ -68,6 +68,8 @@ unsafe extern "system" {
 const FROM_ADDRESS: u32 = 0x4;
 const UNCHANGED_REFCOUNT: u32 = 0x2;
 const MEM_COMMIT: u32 = 0x1000;
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_GUARD: u32 = 0x100;
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_WRITECOPY: u32 = 0x08;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
@@ -203,11 +205,22 @@ impl Memory for Os {
         let mut run: Option<(Range<u64>, Region)> = None;
         for span in writes.spans {
             regions(&span.range(), |piece, region| {
+                if region.allocation != self.base {
+                    return Err(format!(
+                        "a write at {:#x}..{:#x}, outside the image at {:#x}",
+                        piece.start, piece.end, self.base
+                    ));
+                }
                 let protect = region.protect & 0xff;
+                if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
+                    return Err(format!("a write at {:#x}, in pages with no access", piece.start));
+                }
                 if protect & WRITABLE != 0 {
-                    // SAFETY: the piece is committed and writable (`regions` read it); the
-                    // patch code bytes written are where no kept generation's code is, and the
-                    // data nothing else of the program's writes while `poll` writes it.
+                    // SAFETY: the piece is the image's, committed and writable (`regions` read
+                    // it). Code bytes written are over no code the cell ever pointed at nor any
+                    // registered unwind entry (the switch's `Lasting`); no other thread uses
+                    // the data bytes a patch rewrites while `poll` writes them (the rule
+                    // `Live::poll` gives the program).
                     unsafe { writes.put(&piece, piece.start as *mut u8) };
                     if protect & EXECUTABLE != 0 {
                         flush(&piece);
@@ -260,8 +273,8 @@ impl Memory for Os {
             .collect::<Result<Vec<_>, String>>()?;
         table.sort_by_key(|it| it.begin);
         let count = u32::try_from(table.len()).map_err(|_| "too many RUNTIME_FUNCTIONs")?;
-        // The unwinder reads the table from now on, for as long as the code is mapped, which
-        // is as long as the program runs: it is never freed.
+        // The unwinder reads the table from now on, and the code and unwind information it
+        // names are never written again (the switch's `Lasting`): it is never freed.
         let table: &'static [RuntimeFunction] = Box::leak(table.into_boxed_slice());
         // SAFETY: `count` entries, sorted, relative to `base`, alive forever.
         if unsafe { RtlAddFunctionTable(table.as_ptr(), count, self.base) } == 0 {
@@ -340,8 +353,9 @@ fn regions(
 /// which isn't writable: made writable once for the write, then given it back.
 fn protected(writes: &Writes<'_>, pages: &Range<u64>, protect: u32) -> Result<(), String> {
     let put = || {
-        // SAFETY: the pages are writable while this runs (`writable`), and nothing else of
-        // the program's writes them while `poll` does.
+        // SAFETY: the pages are the image's and writable while this runs (`writable`); no
+        // other thread uses the bytes a patch rewrites while `poll` writes them (the rule
+        // `Live::poll` gives the program), and the code bytes are over no lasting code.
         unsafe { writes.put(pages, pages.start as *mut u8) }
     };
     // SAFETY: the pages are the image's, committed with `protect` (`regions` read it).

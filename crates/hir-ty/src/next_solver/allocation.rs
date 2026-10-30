@@ -10,6 +10,7 @@ use crate::{
 
 /// Every interned [`Allocation`], kept whole: it derefs to its data.
 static ALLOCATIONS: table::Values<AllocationData<'static>> = table::Values::new("allocations");
+table::erase!(AllocationData);
 
 /// An allocation: its row in [`ALLOCATIONS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,10 +24,6 @@ const _: () = assert!(size_of::<Option<Allocation<'static>>>() == 4);
 
 impl<'db> Allocation<'db> {
     pub fn new(data: AllocationData<'db>) -> Self {
-        // SAFETY: the two types differ only in their lifetime, which an interned value does not
-        // depend on (it is never freed).
-        let data =
-            unsafe { std::mem::transmute::<AllocationData<'db>, AllocationData<'static>>(data) };
         Self::at(ALLOCATIONS.intern(data))
     }
 
@@ -41,10 +38,7 @@ impl<'db> std::ops::Deref for Allocation<'db> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        // SAFETY: an `Allocation` is a row of `ALLOCATIONS`.
-        let inner = unsafe { ALLOCATIONS.get(self.index) };
-        // SAFETY: as in `new`.
-        unsafe { std::mem::transmute::<&AllocationData<'static>, &AllocationData<'db>>(inner) }
+        ALLOCATIONS.get(self.index)
     }
 }
 

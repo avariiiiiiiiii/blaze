@@ -203,8 +203,8 @@ impl Client {
     /// The next response off the connection.
     fn read(&mut self) -> Result<Envelope<Response>, ClientError> {
         loop {
-            if let Some(item) = self.frames.next().map_err(ClientError::Refused)? {
-                return self.decoded(&item);
+            if let Some(envelope) = self.next_envelope()? {
+                return Ok(envelope);
             }
             if !self.more()? {
                 let said = "nothing more is coming: every request sent over HTTP has had its Done";
@@ -216,8 +216,7 @@ impl Client {
     /// Reads the rest of the HTTP response outstanding, keeping its responses.
     fn drain(&mut self) -> Result<(), ClientError> {
         loop {
-            while let Some(item) = self.frames.next().map_err(ClientError::Refused)? {
-                let envelope = self.decoded(&item)?;
+            while let Some(envelope) = self.next_envelope()? {
                 self.kept.push_back(envelope);
             }
             if !self.more()? {
@@ -226,13 +225,15 @@ impl Client {
         }
     }
 
-    fn decoded(&mut self, item: &[u8]) -> Result<Envelope<Response>, ClientError> {
-        let (schema, _) = frames::head(item).map_err(|refused| ClientError::Refused(refused.error))?;
-        if schema != SCHEMA {
-            return Err(ClientError::Schema { theirs: schema });
-        }
-        let envelope: Envelope<Response> =
-            frames::decode(item).map_err(|refused| ClientError::Refused(refused.error))?;
+    /// The next whole response in the frames, decoded where it lies.
+    fn next_envelope(&mut self) -> Result<Option<Envelope<Response>>, ClientError> {
+        let Some(item) = self.frames.next_ref().map_err(ClientError::Refused)? else {
+            return Ok(None);
+        };
+        let envelope = frames::decode::<Response>(item).map_err(|refused| match frames::head(item) {
+            Ok((theirs, _)) if theirs != SCHEMA => ClientError::Schema { theirs },
+            _ => ClientError::Refused(refused.error),
+        })?;
         if let Link::Http(link) = &mut self.link
             && link.waiting == Some(envelope.id)
             && matches!(envelope.body, Response::Done { .. })

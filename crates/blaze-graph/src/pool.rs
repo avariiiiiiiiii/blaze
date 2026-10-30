@@ -555,7 +555,7 @@ mod tests {
         for job in 0..1000usize {
             let tx = tx.clone();
             let near = (job % 4 != 3).then_some((job % 4) as u32);
-            pool.submit(near, move || group(), move |it| _ = tx.send((job, it.unwrap())));
+            pool.submit(near, group, move |it| _ = tx.send((job, it.unwrap())));
         }
         let mut seen = vec![0u32; 1000];
         for _ in 0..1000 {

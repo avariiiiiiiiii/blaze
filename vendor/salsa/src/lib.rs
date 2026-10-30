@@ -163,7 +163,27 @@
 //! database retains its result. Re-execution may update or replace the value; reclaiming the key or
 //! dropping the database removes it. The `lru` option additionally evicts least-recently-used
 //! results at the start of a new revision, but retains their memo entries so a later call can
-//! recompute the value.
+//! recompute the value. `lru = 0` sets no cap.
+//!
+//! A function with `lru` and without `no_eq` must return a type that implements [`Hash`], and that
+//! hash must cover everything its [`PartialEq`] compares and nothing address-dependent (a pointer,
+//! an allocation's address). Each memo keeps a [`Fingerprint`] of its value, and each read of such
+//! a function records the fingerprint it saw. Both survive eviction, so:
+//!
+//! - a value that was evicted and recomputes to the same fingerprint is backdated as if it had been
+//!   compared with [`PartialEq`];
+//! - a reader whose input changed and then returned to the fingerprint the reader saw is unchanged,
+//!   provided that input is now at least as durable as the reader.
+//!
+//! Neither holds when the durability dropped: a value that becomes less durable is never
+//! backdated, so its readers run again and take the lower durability.
+//!
+//! Every function with `lru` also has `FUNCTION::evict_values(db)`, which drops every value it
+//! holds now regardless of the cap, and, for a function of one Salsa struct,
+//! `FUNCTION::evict_values_of(db, keys)`, which drops the values of those keys only. Both keep
+//! fingerprints and dependency edges and return how many values were dropped. Without `no_eq` a
+//! dropped value that recomputes equal is backdated by its fingerprint; with `no_eq` it counts as
+//! changed.
 //!
 //! The [return mode](#return-modes) controls whether callers receive an owned result or borrow it
 //! from the memo.

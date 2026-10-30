@@ -908,6 +908,188 @@ where
     }
 }
 
+/// A token of a flat tree.
+#[derive(Debug, Clone, Copy)]
+struct FlatTok<'t> {
+    kind: SyntaxKind,
+    range: TextRange,
+    text: &'t str,
+}
+
+/// The tokens of a node of a flat tree in order, through the parts of the lazy nodes in it
+/// (parsing them) and the part of the node itself if it is lazy.
+struct FlatTokens<'t> {
+    /// The trees being walked, the innermost last: each with its next element and the element
+    /// its walk ends before.
+    stack: Vec<(&'t FlatTree, u32, u32)>,
+}
+
+impl<'t> FlatTokens<'t> {
+    fn new(tree: &'t FlatTree, at: u32) -> FlatTokens<'t> {
+        let mut tokens = FlatTokens { stack: Vec::new() };
+        tokens.enter(tree, at);
+        tokens
+    }
+
+    fn enter(&mut self, tree: &'t FlatTree, at: u32) {
+        if tree.is_lazy(at) {
+            let part: &'t FlatTree = tree.part(at);
+            self.stack.push((part, 0, part.end(0)));
+        } else {
+            self.stack.push((tree, at, tree.end(at)));
+        }
+    }
+}
+
+impl<'t> Iterator for FlatTokens<'t> {
+    type Item = FlatTok<'t>;
+
+    fn next(&mut self) -> Option<FlatTok<'t>> {
+        loop {
+            let (tree, next, end) = self.stack.last_mut()?;
+            if *next >= *end {
+                self.stack.pop();
+                continue;
+            }
+            let (tree, at) = (*tree, *next);
+            *next += 1;
+            if tree.is_token(at) {
+                let kind = SyntaxKind::from(tree.kind(at).0);
+                return Some(FlatTok { kind, range: tree.range(at), text: tree.token_text(at) });
+            }
+            if tree.is_lazy(at) {
+                self.enter(tree, at);
+            }
+        }
+    }
+}
+
+/// Converts a node of a flat tree, reading its tokens from the tree's arrays.
+struct FlatConverter<'t, SpanMap> {
+    tokens: FlatTokens<'t>,
+    current: Option<FlatTok<'t>>,
+    punct_offset: Option<(FlatTok<'t>, TextSize)>,
+    /// Used to make the emitted text ranges in the spans relative to the span anchor.
+    map: SpanMap,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+}
+
+impl<'t, SpanMap> FlatConverter<'t, SpanMap> {
+    fn new(
+        tree: &'t FlatTree,
+        at: u32,
+        map: SpanMap,
+        call_site: Span,
+        mode: DocCommentDesugarMode,
+    ) -> Self {
+        let mut tokens = FlatTokens::new(tree, at);
+        let current = tokens.next();
+        FlatConverter { tokens, current, punct_offset: None, map, call_site, mode }
+    }
+}
+
+#[derive(Debug)]
+enum FlatToken<'t> {
+    Ordinary(FlatTok<'t>),
+    Punct { token: FlatTok<'t>, offset: usize },
+}
+
+impl<'t> FlatToken<'t> {
+    fn token(&self) -> &FlatTok<'t> {
+        match self {
+            FlatToken::Ordinary(it) | FlatToken::Punct { token: it, offset: _ } => it,
+        }
+    }
+}
+
+impl<'t, SpanMap> SrcToken<FlatConverter<'t, SpanMap>> for FlatToken<'t> {
+    fn kind(&self, _ctx: &FlatConverter<'t, SpanMap>) -> SyntaxKind {
+        match self {
+            FlatToken::Ordinary(token) => token.kind,
+            FlatToken::Punct { token, offset: i } => {
+                SyntaxKind::from_char(token.text.chars().nth(*i).unwrap()).unwrap()
+            }
+        }
+    }
+    fn to_char(&self, _ctx: &FlatConverter<'t, SpanMap>) -> Option<char> {
+        match self {
+            FlatToken::Ordinary(_) => None,
+            FlatToken::Punct { token, offset: i } => token.text.chars().nth(*i),
+        }
+    }
+    fn to_text(&self, _ctx: &FlatConverter<'t, SpanMap>) -> SmolStr {
+        self.token().text.into()
+    }
+}
+
+impl<'t, SpanMap> TokenConverter for FlatConverter<'t, SpanMap>
+where
+    SpanMap: SpanMapper,
+{
+    type Token = FlatToken<'t>;
+    fn convert_doc_comment(
+        &self,
+        token: &Self::Token,
+        is_inner: bool,
+        span: Span,
+        builder: &mut tt::TopSubtreeBuilder,
+    ) {
+        convert_doc_comment(token.token().text, is_inner, span, self.mode, builder);
+    }
+
+    fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
+        if let Some((punct, offset)) = self.punct_offset
+            && usize::from(offset) + 1 < punct.text.len()
+        {
+            let offset = offset + TextSize::of('.');
+            self.punct_offset = Some((punct, offset));
+            let range = TextRange::at(punct.range.start() + offset, TextSize::of('.'));
+            return Some((FlatToken::Punct { token: punct, offset: usize::from(offset) }, range));
+        }
+
+        let curr = self.current?;
+        self.current = self.tokens.next();
+        let token = if curr.kind.is_punct() {
+            self.punct_offset = Some((curr, 0.into()));
+            let range = TextRange::at(curr.range.start(), TextSize::of('.'));
+            (FlatToken::Punct { token: curr, offset: 0_usize }, range)
+        } else {
+            self.punct_offset = None;
+            (FlatToken::Ordinary(curr), curr.range)
+        };
+        Some(token)
+    }
+
+    fn peek(&self) -> Option<Self::Token> {
+        if let Some((punct, offset)) = self.punct_offset {
+            let offset = offset + TextSize::of('.');
+            if usize::from(offset) < punct.text.len() {
+                return Some(FlatToken::Punct { token: punct, offset: usize::from(offset) });
+            }
+        }
+
+        let curr = self.current?;
+        let token = if curr.kind.is_punct() {
+            FlatToken::Punct { token: curr, offset: 0_usize }
+        } else {
+            FlatToken::Ordinary(curr)
+        };
+        Some(token)
+    }
+
+    fn span_for(&self, range: TextRange) -> Span {
+        self.map.span_for(range)
+    }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        self.map.fragment_bounds(range)
+    }
+    fn call_site(&self) -> Span {
+        self.call_site
+    }
+}
+
 struct TtTreeSink<'a> {
     buf: String,
     cursor: Cursor<'a>,

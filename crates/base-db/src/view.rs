@@ -8,9 +8,10 @@
 //! were made with ([`FileSetConfig`]) puts it in.
 //!
 //! The content ID a view gives is blaze-vfs's ([`blaze_vfs::FILE_DOMAIN`], of the bytes
-//! alone), checked against the bytes; a file's [`FileText::content`] is another thing (the text
-//! and the module the compiler appends, framed), so both are kept: blaze-vfs's to tell next time
-//! that a file is unchanged without reading it, the text's in the input.
+//! alone), checked against the bytes: the one time a file's bytes are hashed. A file's
+//! [`FileText::content`] is built on it ([`FileText::content_of_file`], adding the module the
+//! compiler appends), and blaze-vfs's is kept to tell next time that a file is unchanged without
+//! reading it.
 
 use std::fmt;
 
@@ -139,7 +140,7 @@ impl Files {
                     bytes,
                 });
             }
-            let text = std::str::from_utf8(file.file.bytes).ok();
+            let text = std::str::from_utf8(file.file.bytes).ok().map(|text| (text, file.file.id));
             let (id, root) = match (known, in_root) {
                 (Some(id), Some(root)) => (id, root),
                 _ => {
@@ -196,8 +197,8 @@ impl Files {
                 change.added.push(id);
             }
             let unchanged = match (text, self.files.get(&id).map(|it| *it)) {
-                (Some(text), Some(input)) => {
-                    FileText::content_of(text, input.appended_root_module(&*db))
+                (Some((_, file)), Some(input)) => {
+                    FileText::content_of_file(file, input.appended_root_module(&*db))
                         == input.content(&*db)
                 }
                 (None, None) => true,

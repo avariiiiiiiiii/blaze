@@ -1,6 +1,6 @@
 [package]
 name = "blaze-expand"
-description = "blaze's proc-macro expansions kept in the store, so that a daemon that loads a workspace again expands no macro it expanded before"
+description = "blaze's proc-macro expansions, keyed by what they were given and what their sandbox traced them reading, and kept in the store; native expanders for verified macro crates"
 publish = false
 
 version.workspace = true
@@ -16,14 +16,17 @@ doctest = false
 [dependencies]
 postcard.workspace = true
 rustc-hash.workspace = true
-sha2 = "0.10"
+serde.workspace = true
 
 base-db.workspace = true
+blaze-cas.workspace = true
+blaze-core.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
 hir-expand.workspace = true
 load-cargo.workspace = true
 paths.workspace = true
 proc-macro-api.workspace = true
-blaze-store.workspace = true
 span.workspace = true
 tt.workspace = true
 

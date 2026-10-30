@@ -701,15 +701,15 @@ mod tests {
     #[test]
     fn a_measure_says_what_its_work_held_at_most() {
         let (held, peak) = measure(|| {
-            let big = vec![1u8; 4 * MB];
+            let big = std::hint::black_box(vec![1u8; 4 * MB]);
             drop(big);
-            vec![2u8; MB]
+            std::hint::black_box(vec![2u8; MB])
         });
         assert!(peak >= 4 * MB as u64, "{peak}");
         assert!(peak < 5 * MB as u64, "{peak}");
         assert_eq!(held.len(), MB);
         // What was held before it and freed in it lowers what it holds.
-        let before = vec![3u8; 4 * MB];
+        let before = std::hint::black_box(vec![3u8; 4 * MB]);
         let ((), peak) = measure(|| {
             drop(before);
             let again = vec![4u8; MB];

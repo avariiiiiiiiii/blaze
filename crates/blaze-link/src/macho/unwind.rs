@@ -149,7 +149,7 @@ pub(super) fn build(placed: &Placed<'_>, arch: Arch) -> Result<Vec<u8>, LinkErro
         entries.push(Entry { addr: start, rank: 1, kind: Kind::Dwarf { fde: fde.offset } });
         ends.push(fde.end);
     }
-    let mut last = 0u64;
+    let mut last = base;
     for function in placed.functions {
         entries.push(Entry { addr: function.addr, rank: 2, kind: Kind::None });
         last = last.max(function.addr.saturating_add(function.size));
@@ -378,7 +378,8 @@ fn region_bytes<'p>(
 fn offset(base: u64, addr: u64, what: &str) -> Result<u32, LinkError> {
     addr.checked_sub(base).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| {
         error(format!(
-            "__unwind_info: {what} at {addr:#x} is not within 4 GiB above the image's base {base:#x}"
+            "__unwind_info: {what} at {addr:#x} is not within 4 GiB above the image's base \
+             {base:#x}"
         ))
     })
 }
@@ -405,9 +406,13 @@ fn error(what: String) -> LinkError {
 #[cfg(test)]
 mod tests {
     use blaze_codegen::Arch;
-    use gimli::write::{Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable};
+    use gimli::write::{
+        Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
+    };
 
-    use super::{ARM64_MODE_DWARF, HAS_LSDA, PERSONALITY_MASK, X86_64_MODE_DWARF, bound, build, u32_at};
+    use super::{
+        ARM64_MODE_DWARF, HAS_LSDA, PERSONALITY_MASK, X86_64_MODE_DWARF, bound, build, u32_at,
+    };
     use crate::model::{Bind, Class, Function, Placed, Plan, Prot, Region};
     use crate::output::{Debug, Format, Output, OutputKind};
 
@@ -450,6 +455,10 @@ mod tests {
         Region { class, addr, capacity: size, size, prot: Prot::R, align: 8 }
     }
 
+    fn compact_region(bytes: &[u8]) -> Region {
+        region(super::super::compact_unwind(), COMPACT, bytes.len() as u64)
+    }
+
     fn function(addr: u64, size: u64, name: &str) -> Function {
         Function { addr, size, fde: None, windows: None, name: Some(name.into()) }
     }
@@ -457,13 +466,15 @@ mod tests {
     /// An `__eh_frame` at [`EH_FRAME`] of one CIE and an FDE for each range, its addresses
     /// pc-relative; and each FDE's offset in it.
     fn eh_frame(ranges: &[(u64, u32)]) -> (Vec<u8>, Vec<u64>) {
-        let encoding = gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
+        let encoding =
+            gimli::Encoding { address_size: 8, format: gimli::Format::Dwarf32, version: 1 };
         let mut cie = CommonInformationEntry::new(encoding, 4, -8, gimli::Register(30));
         cie.fde_address_encoding = gimli::DW_EH_PE_pcrel | gimli::DW_EH_PE_sdata4;
         let mut table = FrameTable::default();
         let cie = table.add_cie(cie);
         for &(addr, len) in ranges {
-            table.add_fde(cie, FrameDescriptionEntry::new(Address::Constant(addr.wrapping_sub(EH_FRAME)), len));
+            let start = Address::Constant(addr.wrapping_sub(EH_FRAME));
+            table.add_fde(cie, FrameDescriptionEntry::new(start, len));
         }
         let mut section = EhFrame(EndianVec::new(gimli::LittleEndian));
         table.write_eh_frame(&mut section).unwrap();
@@ -518,7 +529,8 @@ mod tests {
         fn index(&self) -> Vec<(u32, u32, u32)> {
             let at = self.word(20);
             (0..self.word(24))
-                .map(|i| (self.word(at + 12 * i), self.word(at + 12 * i + 4), self.word(at + 12 * i + 8)))
+                .map(|i| at + 12 * i)
+                .map(|at| (self.word(at), self.word(at + 4), self.word(at + 8)))
                 .collect()
         }
 
@@ -544,8 +556,10 @@ mod tests {
             let (_, at, _) = index[page];
             let start = at + u32::from(self.half(at + 4));
             let count = u32::from(self.half(at + 6));
-            let entries: Vec<(u32, u32)> =
-                (0..count).map(|i| (self.word(start + 8 * i), self.word(start + 8 * i + 4))).collect();
+            let entries: Vec<(u32, u32)> = (0..count)
+                .map(|i| start + 8 * i)
+                .map(|at| (self.word(at), self.word(at + 4)))
+                .collect();
             let found = entries.iter().rposition(|it| it.0 <= pc)?;
             let (function, encoding) = entries[found];
             if encoding & HAS_LSDA == 0 {
@@ -586,7 +600,7 @@ mod tests {
         let regions = [
             region(Class::Text, TEXT, 0x1000),
             region(Class::EhFrame, EH_FRAME, eh.len() as u64),
-            region(super::super::compact_unwind(), COMPACT, cu.len() as u64),
+            compact_region(&cu),
         ];
         let contents: [&[u8]; 3] = [&[], &eh, &cu];
         let functions = [
@@ -652,7 +666,10 @@ mod tests {
         );
         assert!(!entries.iter().any(|it| it.0 == off(f6)), "f6 merged into f5");
         assert!(entries.iter().all(|it| it.0 != 0), "the dead-stripped entry left out");
-        assert!(entries.iter().all(|it| it.1 & PERSONALITY_MASK != 2 << 28));
+        assert!(
+            entries.iter().all(|it| matches!(it.1 & PERSONALITY_MASK, 0 | 0x1000_0000)),
+            "one personality, index 1"
+        );
 
         let index = table.index();
         assert_eq!(index.len(), 2, "one page and the sentinel");
@@ -672,7 +689,8 @@ mod tests {
     #[test]
     fn x86_64_dwarf_mode() {
         let (eh, fde) = eh_frame(&[(TEXT, 0x10), (TEXT + 0x10, 0x10)]);
-        let regions = [region(Class::Text, TEXT, 0x20), region(Class::EhFrame, EH_FRAME, eh.len() as u64)];
+        let regions =
+            [region(Class::Text, TEXT, 0x20), region(Class::EhFrame, EH_FRAME, eh.len() as u64)];
         let contents: [&[u8]; 2] = [&[], &eh];
         let functions = [function(TEXT, 0x10, "a"), function(TEXT + 0x10, 0x10, "b")];
         let output = output(Arch::X86_64);
@@ -681,8 +699,9 @@ mod tests {
         let bytes = build(&placed, Arch::X86_64).unwrap();
         assert!(bytes.len() as u64 <= bound(2, 0));
         let table = Table { bytes: &bytes };
-        assert_eq!(table.lookup(off(TEXT)), Some((X86_64_MODE_DWARF | fde[0] as u32, None)));
-        assert_eq!(table.lookup(off(TEXT) + 0x18), Some((X86_64_MODE_DWARF | fde[1] as u32, None)));
+        let dwarf = |n: usize| Some((X86_64_MODE_DWARF | fde[n] as u32, None));
+        assert_eq!(table.lookup(off(TEXT)), dwarf(0));
+        assert_eq!(table.lookup(off(TEXT) + 0x18), dwarf(1));
         assert_eq!(table.lookup(off(TEXT) + 0x20), None);
         assert!(table.personalities().is_empty());
     }
@@ -691,11 +710,12 @@ mod tests {
     fn many_functions_span_pages() {
         let functions: Vec<Function> =
             (0..2000).map(|i| function(TEXT + 0x10 * i, 0x10, "f")).collect();
-        let entries: Vec<(u64, u32, u32, u64, u64)> = (0..2000)
-            .map(|i| (TEXT + 0x10 * i, 0x10, FRAMELESS + (i as u32 % 2) * 0x1000, 0, if i % 3 == 0 { LSDA + i } else { 0 }))
-            .collect();
+        let encoding = |i: u64| FRAMELESS + (i as u32 % 2) * 0x1000;
+        let lsda = |i: u64| if i % 3 == 0 { LSDA + i } else { 0 };
+        let entries: Vec<(u64, u32, u32, u64, u64)> =
+            (0..2000).map(|i| (TEXT + 0x10 * i, 0x10, encoding(i), 0, lsda(i))).collect();
         let cu = compact(&entries);
-        let regions = [region(Class::Text, TEXT, 0x10 * 2000), region(super::super::compact_unwind(), COMPACT, cu.len() as u64)];
+        let regions = [region(Class::Text, TEXT, 0x10 * 2000), compact_region(&cu)];
         let contents: [&[u8]; 2] = [&[], &cu];
         let output = output(Arch::Aarch64);
         let plan = plan();
@@ -706,15 +726,16 @@ mod tests {
         assert!(table.index().len() > 2, "more than one page");
         for i in (0..2000).step_by(7) {
             let lsda = (i % 3 == 0).then(|| off(LSDA + i));
-            let encoding = FRAMELESS + (i as u32 % 2) * 0x1000 | if lsda.is_some() { HAS_LSDA } else { 0 };
-            assert_eq!(table.lookup(off(TEXT + 0x10 * i) + 4), Some((encoding, lsda)), "function {i}");
+            let encoding = encoding(i) | if lsda.is_some() { HAS_LSDA } else { 0 };
+            let found = table.lookup(off(TEXT + 0x10 * i) + 4);
+            assert_eq!(found, Some((encoding, lsda)), "function {i}");
         }
     }
 
     #[test]
     fn a_bound_personality_is_its_import() {
         let cu = compact(&[(TEXT, 0x10, FRAME, 0, 0), (TEXT + 0x10, 0x10, FRAME, 0, 0)]);
-        let regions = [region(Class::Text, TEXT, 0x20), region(super::super::compact_unwind(), COMPACT, cu.len() as u64)];
+        let regions = [region(Class::Text, TEXT, 0x20), compact_region(&cu)];
         let contents: [&[u8]; 2] = [&[], &cu];
         let functions = [function(TEXT, 0x10, "a"), function(TEXT + 0x10, 0x10, "b")];
         let binds = [
@@ -727,7 +748,7 @@ mod tests {
         let bytes = build(&placed, Arch::Aarch64).unwrap();
         let table = Table { bytes: &bytes };
         assert_eq!(table.personalities(), vec![off(COMPACT + 16)]);
-        assert_eq!(table.lookup(off(TEXT + 0x10)), Some((FRAME | 1 << 28, None)));
+        assert_eq!(table.lookup(off(TEXT + 0x10)), Some((FRAME | (1 << 28), None)));
     }
 
     #[test]
@@ -738,9 +759,10 @@ mod tests {
             (TEXT + 0x20, 0x10, FRAME, PERSONALITY + 0x20, 0),
             (TEXT + 0x30, 0x10, FRAME, PERSONALITY + 0x30, 0),
         ]);
-        let regions = [region(Class::Text, TEXT, 0x40), region(super::super::compact_unwind(), COMPACT, cu.len() as u64)];
+        let regions = [region(Class::Text, TEXT, 0x40), compact_region(&cu)];
         let contents: [&[u8]; 2] = [&[], &cu];
-        let functions: Vec<Function> = (0..4).map(|i| function(TEXT + 0x10 * i, 0x10, "f")).collect();
+        let functions: Vec<Function> =
+            (0..4).map(|i| function(TEXT + 0x10 * i, 0x10, "f")).collect();
         let output = output(Arch::Aarch64);
         let plan = plan();
         let placed = placed(&output, &plan, &regions, &contents, &functions, &[]);
@@ -756,7 +778,7 @@ mod tests {
         let regions = [
             region(Class::Text, TEXT, 0x20),
             region(Class::EhFrame, EH_FRAME, eh.len() as u64),
-            region(super::super::compact_unwind(), COMPACT, cu.len() as u64),
+            compact_region(&cu),
         ];
         let contents: [&[u8]; 3] = [&[], &eh, &cu];
         let functions = [function(TEXT, 0x10, "a"), function(TEXT + 0x10, 0x10, "b")];

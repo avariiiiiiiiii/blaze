@@ -6,23 +6,28 @@
 //! for one; a walk that reads many elements reads them here, by number, and makes a cursor
 //! only of what it keeps ([`crate::cursor::SyntaxNode::flat`]).
 //!
-//! What an element costs, about 8.5 bytes:
+//! What an element costs: a token 4 bytes, a node 8, and every element 0.7 more:
 //!
-//! - one `u32` word: its kind in the low 16 bits, whether it is a node, a token or a lazy node
-//!   in the next 2, and in the top 14 a token's or lazy node's length in bytes or a node's
-//!   subtree size in elements. A value of 2^14 - 1 or more is kept in a side table sorted by
-//!   element (8 bytes an entry), which a file has few entries in: tokens of 16 KiB or more, and
-//!   nodes of more than 16 thousand elements, which are the few ancestors of large parts;
-//! - its parent's number, a `u32`: ancestors, `index` and the sibling moves step up, and
-//!   finding a parent from the words alone would be a scan back over its earlier children;
+//! - one `u32` word each. Its low 10 bits are the kind (Rust's are fewer than 400) and the
+//!   next 2 say whether it is a node, a token or a lazy node. A token's or lazy node's top 20
+//!   are its length in bytes (10 bits) and how many elements back its parent is (10 bits); a
+//!   node's are its subtree size in elements. A value that does not fit is in a side table
+//!   sorted by element, which a file has few entries in: tokens of 1 KiB or more, nodes of a
+//!   million elements or more, and tokens whose parent is a thousand elements or more back
+//!   (those between large items or statements: the whitespace of a file's top level, the
+//!   brace closing a long block). Every step to a token's parent is a subtraction.
+//! - a node's parent's number (`u32`), in a column of nodes only, found by the node's rank:
+//!   a bit per element says which are nodes, and a `u32` per 64 elements counts those before
+//!   it (1.5 bits an element), so a rank is one load and a popcount.
 //! - an eighth of a `u32`: the start of every eighth element, from which an element's start
 //!   is that plus the lengths of up to seven elements before it, so [`FlatTree::range`] reads
 //!   at most fifteen words. The binary searches of the child at a range search these starts
 //!   and then step through at most eight elements, so they need no column of their own.
 //!
-//! That is against 14 bytes for a kind, a start, an end and a parent each, and no copy of the
-//! text: a tree's ranges index a source it shares ([`FlatTree::source`]), the whole file's for
-//! a file's tree and its parts.
+//! That is about 6.5 bytes an element in Rust, where a little over half are tokens, against
+//! 14 for a kind, a start, an end and a parent each; and no copy of the text: a tree's ranges
+//! index a source it shares ([`FlatTree::source`]), the whole file's for a file's tree and its
+//! parts.
 //!
 //! A lazy node is a node whose children are not in the arrays (a body an outline parse left
 //! unparsed): its text is parsed by the tree's [`Expand`] the first time its part is asked for
@@ -41,13 +46,25 @@ use crate::{GreenNode, GreenNodeBuilder, NodeCache, SyntaxKind, TextRange, TextS
 /// Every how many elements a start is kept.
 const MARK: u32 = 8;
 const NO_PARENT: u32 = u32::MAX;
-const TAG: u32 = 0b11 << 16;
+/// The kind's bits, and the kind of an element whose kind is in [`FlatTree::kinds`].
+const FAR_KIND: u32 = (1 << 10) - 1;
+const TAG: u32 = 0b11 << 10;
 const NODE: u32 = 0;
-const TOKEN: u32 = 1 << 16;
-const LAZY: u32 = 2 << 16;
-const SHIFT: u32 = 18;
-/// The payload of an element whose length or size is in the side table.
-const BIG: u32 = u32::MAX >> SHIFT;
+const TOKEN: u32 = 1 << 10;
+const LAZY: u32 = 2 << 10;
+/// Where a token's length and a node's size start.
+const VALUE: u32 = 12;
+/// A token's length's bits, and the length of one whose length is in [`FlatTree::big`].
+const LONG: u32 = (1 << 10) - 1;
+/// Where a token's distance back to its parent starts.
+const UP: u32 = 22;
+/// The distance of a token whose parent is in [`FlatTree::far`]; 0 is no parent.
+const FAR: u32 = (1 << 10) - 1;
+/// The size of a node whose size is in [`FlatTree::big`].
+const HUGE: u32 = (1 << 20) - 1;
+const _: () = assert!(
+    FAR_KIND & TAG == 0 && (LONG << VALUE) & (FAR << UP) == 0 && UP + 10 == 32 && VALUE + 20 == 32
+);
 
 /// What parses a lazy node: called with the node's kind, its text and the tree's `data`, it
 /// gives a tree whose root is a node of that kind over exactly that text.

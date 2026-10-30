@@ -121,6 +121,10 @@ name = "accumulated_backdate"
 path = "tests/accumulated_backdate.rs"
 
 [[test]]
+name = "backdate_durability_drop"
+path = "tests/backdate_durability_drop.rs"
+
+[[test]]
 name = "backdate_untracked_db_field"
 path = "tests/backdate_untracked_db_field.rs"
 
@@ -277,6 +281,10 @@ name = "elided-lifetime-in-tracked-fn"
 path = "tests/elided-lifetime-in-tracked-fn.rs"
 
 [[test]]
+name = "evict_values"
+path = "tests/evict_values.rs"
+
+[[test]]
 name = "expect_reuse_field_x_of_a_tracked_struct_changes_but_fn_depends_on_field_y"
 path = "tests/expect_reuse_field_x_of_a_tracked_struct_changes_but_fn_depends_on_field_y.rs"
 
@@ -331,6 +339,10 @@ path = "tests/lru.rs"
 [[test]]
 name = "lru_cycle"
 path = "tests/lru_cycle.rs"
+
+[[test]]
+name = "lru_fingerprint"
+path = "tests/lru_fingerprint.rs"
 
 [[test]]
 name = "manual_registration"

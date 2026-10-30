@@ -68,6 +68,11 @@ pub struct DescribedStatic<I, S> {
     pub instance: ContentId,
     /// The content ID of its evaluated value and its layout: the key of its bytes.
     pub value: ContentId,
+    /// `static mut`, or a type with interior mutability.
+    pub mutable: bool,
+    pub thread_local: bool,
+    /// `#[link_section]`, as written.
+    pub section: Option<String>,
     pub origin: Origin,
     pub symbol: Option<String>,
     pub refs: Vec<FrontRef<I, S>>,

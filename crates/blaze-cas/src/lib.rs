@@ -22,6 +22,8 @@
 
 mod chunk;
 mod cold;
+mod copy;
+mod crc;
 mod disk;
 pub mod remote;
 #[cfg(test)]
@@ -40,14 +42,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::disk::{
-    CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
-    INDEX_DOMAIN, IndexRef, Loc, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, Table,
+    BLOCK, CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
+    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, Table,
     content_of,
 };
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
 /// both; nothing reads it as this one.
-pub(crate) const FORMAT: u32 = 1;
+pub(crate) const FORMAT: u32 = 2;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -563,7 +565,16 @@ impl Store {
                 let piece = &bytes[range];
                 let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
                 if self.find_kept(&chunk).is_none() {
-                    self.append(chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);
+                    let len = piece.len() as u64;
+                    match cold::lz4(piece) {
+                        Some(stored) => {
+                            let content = content_of(piece);
+                            self.append_value(chunk, Kind::Output, Form::Lz4, 0, content, len, &stored);
+                        }
+                        None => {
+                            self.append(chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);
+                        }
+                    }
                 }
                 refs.push((chunk, piece.len() as u64));
             }
@@ -580,6 +591,13 @@ impl Store {
                 committed: false,
             });
             self.append_value(key, kind, Form::External, 0, content, raw, &[]);
+        } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
+            match cold::compress_long(&bytes) {
+                Ok(stored) => {
+                    self.append_value(key, kind, Form::Zstd, NO_DICTIONARY, content, raw, &stored);
+                }
+                Err(why) => self.cannot_compress(kind, why),
+            }
         } else if kind.cold() {
             match self.dictionary_of(kind) {
                 Some(number) => {
@@ -591,10 +609,7 @@ impl Store {
                         Ok(stored) => {
                             self.append_value(key, kind, Form::Zstd, number, content, raw, &stored);
                         }
-                        Err(why) => {
-                            self.problems.push(format!("a {} value: {why}", kind.name()));
-                            self.append(key, kind, Form::Raw, 0, content, &bytes);
-                        }
+                        Err(why) => self.cannot_compress(kind, why),
                     }
                 }
                 None => {
@@ -628,14 +643,14 @@ impl Store {
         let nothing = Key(ContentId::default());
         for (tier_at, tier) in self.tiers.iter().enumerate() {
             if let (None, Some(index), Some(mapping)) = (kind, tier.head.index, &tier.index) {
-                let found = ContentId::of(INDEX_DOMAIN, mapping.bytes());
-                if found != index.hash {
+                let found = crc::crc32c(mapping.bytes());
+                if found != index.check {
                     out.push(Corrupt {
                         key: nothing,
                         pack: tier.index_file(),
                         what: format!(
-                            "the index hashes to {found:x}, not the {:x} its head names",
-                            index.hash
+                            "the index's CRC-32C is {found:08x}, not the {:08x} its head names",
+                            index.check
                         ),
                     });
                 }
@@ -702,7 +717,11 @@ impl Store {
                 Some(external) if loc.form == Form::External && external.committed => {
                     Plan::Clone(external.file.clone())
                 }
-                _ => Plan::Write(entry.bytes.to_vec()),
+                _ => {
+                    let mut bytes = Vec::new();
+                    copy::append(&mut bytes, entry.bytes);
+                    Plan::Write(bytes)
+                }
             },
         };
         let tag = self.tags.fresh();
@@ -856,7 +875,7 @@ impl Store {
 
     fn read(&self, tier: usize, key: &Key, loc: Loc) -> Result<Entry<'_>, Corrupt> {
         let id = location(tier, loc.pack, loc.offset);
-        if matches!(loc.form, Form::Zstd | Form::Chunked) {
+        if matches!(loc.form, Form::Zstd | Form::Chunked | Form::Lz4) {
             if let Some((content, bytes)) = self.cached(id) {
                 return Ok(Entry { key: *key, kind: loc.kind, content, bytes });
             }
@@ -902,6 +921,10 @@ impl Store {
             .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
         let bytes: Cow<'a, [u8]> = match header.form {
             Form::Raw => Cow::Borrowed(payload),
+            Form::Zstd if header.dictionary == NO_DICTIONARY => {
+                Cow::Owned(cold::decompress_long(payload, header.raw).map_err(corrupt)?)
+            }
+            Form::Lz4 => Cow::Owned(cold::unlz4(payload, header.raw).map_err(corrupt)?),
             Form::Zstd => {
                 let dictionary = tier.dictionaries.get(header.dictionary as usize).ok_or_else(
                     || corrupt(format!("it names dictionary {} the store does not have", header.dictionary)),
@@ -924,8 +947,8 @@ impl Store {
                     let (chunk_tier, chunk_loc) = self
                         .find(&chunk)
                         .ok_or_else(|| corrupt(format!("its chunk {} is not in the store", chunk.0)))??;
-                    if chunk_loc.form != Form::Raw {
-                        return Err(corrupt(format!("its chunk {} is not kept raw", chunk.0)));
+                    if !matches!(chunk_loc.form, Form::Raw | Form::Lz4) {
+                        return Err(corrupt(format!("its chunk {} is not kept as a chunk", chunk.0)));
                     }
                     let (_, piece) = self.value(chunk_tier, &chunk, chunk_loc, memo)?;
                     if piece.len() as u64 != len {
@@ -1106,6 +1129,13 @@ impl Store {
         self.append_value(key, kind, form, dictionary, content, bytes.len() as u64, bytes)
     }
 
+    /// zstd refusing a value is a broken build of it (a missing feature), not something a
+    /// value can cause: the store stops rather than keep the value another way.
+    fn cannot_compress(&mut self, kind: Kind, why: String) {
+        let dir = self.tiers[0].dir.clone();
+        self.fail(dir, format!("compressing a {} value: {why}", kind.name()));
+    }
+
     fn dictionary_of(&self, kind: Kind) -> Option<u32> {
         self.tiers[0]
             .dictionaries
@@ -1169,6 +1199,13 @@ impl Store {
 
     fn start_commit(&mut self, effects: &mut Vec<Effect>) {
         debug_assert!(self.commit.is_none());
+        for pack in &mut self.tiers[0].packs {
+            if pack.end > pack.committed {
+                let padded = disk::blocks(pack.end);
+                pack.memory.resize(pack.memory.len() + (padded - pack.end) as usize, 0);
+                pack.end = padded;
+            }
+        }
         let own = &self.tiers[0];
         let packs: Vec<(usize, u64)> = own
             .packs
@@ -1236,7 +1273,7 @@ impl Store {
             head.index = Some(IndexRef {
                 slot,
                 len: bytes.len() as u64,
-                hash: ContentId::of(INDEX_DOMAIN, &bytes),
+                check: crc::crc32c(&bytes),
                 count: entries.len() as u64,
             });
             for pack in &mut head.packs {
@@ -1575,6 +1612,10 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         if mapping.bytes().len() as u64 != index.len {
             return Err((file, format!("it is not the {} bytes its head names", index.len)));
         }
+        let check = crc::crc32c(mapping.bytes());
+        if check != index.check {
+            return Err((file, format!("its CRC-32C is {check:08x}, not the {:08x} its head names", index.check)));
+        }
         let table = Table::new(mapping.bytes()).map_err(|why| (file.clone(), why.to_owned()))?;
         if table.count() != index.count {
             return Err((file, format!("it holds {} values, not the {} its head names", table.count(), index.count)));
@@ -1588,6 +1629,14 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         disk::check_pack_header(all, pack.kind).map_err(|why| fail(why.into()))?;
         let mut at = pack.indexed.max(PACK_HEADER);
         while at < pack.committed {
+            if all[at as usize..at as usize + 4] == [0; 4] {
+                let next = disk::blocks(at);
+                if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
+                    return Err(fail(format!("at {at} is neither a record nor the zeros that end a commit")));
+                }
+                at = next;
+                continue;
+            }
             let header = RecordHeader::decode(&all[at as usize..])
                 .map_err(|why| fail(format!("the record at {at}: {why}")))?;
             let end = at.checked_add(header.span()).filter(|&end| end <= pack.committed).ok_or_else(

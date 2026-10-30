@@ -1,5 +1,5 @@
-//! The content IDs of the front end's inputs (docs/v2/crates.md, "IDs"; docs/v2/README.md
-//! section 2): every input carries the [`ContentId`] of what it is, so a result can be keyed
+//! The content IDs of the front end's inputs (docs/v2/crates.md, "IDs"; docs/v2/plan/model.md):
+//! every input carries the [`ContentId`] of what it is, so a result can be keyed
 //! by the hashes of what it read rather than by revision, and two views with equal inputs share
 //! it. Only content is hashed, never a `FileId`, `Crate`, `SourceRootId` or other dense index: a
 //! file is named by its path, another input by its own content ID.

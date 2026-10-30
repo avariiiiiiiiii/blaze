@@ -107,15 +107,16 @@ impl ImplEntry {
     pub fn value(&self) -> ContentId {
         let mut hasher = Hasher::new(IMPLS_DOMAIN);
         match self {
-            ImplEntry::TraitAbsent => hasher.part(b"absent"),
+            ImplEntry::TraitAbsent => {
+                hasher.part(b"absent");
+            }
             ImplEntry::Impls(impls) => {
                 hasher.part(b"impls").update(&(impls.len() as u64).to_le_bytes());
                 for (key, interface) in impls.iter() {
                     hasher.id(&key.0).id(&interface.0);
                 }
-                &mut hasher
             }
-        };
+        }
         hasher.finish()
     }
 }
@@ -362,13 +363,10 @@ fn trait_impls_in(db: &dyn HirDatabase, krate: Crate, trait_: TraitId) -> Box<[G
     found.into()
 }
 
-/// The impls of `trait_` in every crate that can see it, sorted by key.
+/// The impls of `trait_` in every crate, sorted by key.
 #[salsa::tracked(returns(deref))]
 pub(crate) fn trait_impls(db: &dyn HirDatabase, trait_: TraitId) -> Box<[Grouped]> {
-    let mut found: Vec<Grouped> = trait_
-        .module(db)
-        .krate(db)
-        .transitive_rev_deps(db)
+    let mut found: Vec<Grouped> = base_db::all_crates(db)
         .iter()
         .flat_map(|&krate| trait_impls_in(db, krate, trait_).iter().copied())
         .collect();
@@ -492,7 +490,7 @@ pub(crate) enum ScopeOwner {
 /// Every name of `owner` with what it is there, sorted by the name's hash.
 #[salsa::tracked(returns(deref))]
 fn scope_names(db: &dyn HirDatabase, owner: ScopeOwner, _: ()) -> Box<[(NameHash, ScopeEntry)]> {
-    let found: Vec<(NameHash, ScopeEntry)> = match owner {
+    let mut found: Vec<(NameHash, ScopeEntry)> = match owner {
         ScopeOwner::Module(module) => module_names(db, module),
         ScopeOwner::Enum(it) => it
             .enum_variants(db)
@@ -526,7 +524,6 @@ fn scope_names(db: &dyn HirDatabase, owner: ScopeOwner, _: ()) -> Box<[(NameHash
         ScopeOwner::Trait(it) => assoc_names(db, &it.trait_items(db).items),
         ScopeOwner::Impl(it) => assoc_names(db, &it.impl_items(db).items),
     };
-    let mut found = found;
     found.sort_unstable_by_key(|(name, _)| *name);
     found.into()
 }
@@ -537,7 +534,7 @@ fn assoc_names(
 ) -> Vec<(NameHash, ScopeEntry)> {
     let mut by_name: BTreeMap<NameHash, Vec<(ItemKey, Vis)>> = BTreeMap::new();
     for (name, item) in items {
-        let key = key::item_key(db, assoc_item(*item));
+        let key = key::item_key(db, ItemId::from(*item));
         by_name
             .entry(key::name_hash(name.as_str()))
             .or_default()
@@ -550,14 +547,6 @@ fn assoc_names(
             (name, ScopeEntry::Assoc(items.into()))
         })
         .collect()
-}
-
-pub(crate) fn assoc_item(item: AssocItemId) -> ItemId {
-    match item {
-        AssocItemId::FunctionId(it) => ItemId::Function(it),
-        AssocItemId::ConstId(it) => ItemId::Const(it),
-        AssocItemId::TypeAliasId(it) => ItemId::Alias(it),
-    }
 }
 
 #[derive(Default)]

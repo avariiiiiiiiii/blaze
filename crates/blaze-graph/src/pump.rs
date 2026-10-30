@@ -438,11 +438,14 @@ mod tests {
             (Ok(value), Err(Cancelled)) => (second.0, (first.0, value)),
             other => panic!("not one cancelled and one done: {other:?}"),
         };
-        assert_eq!(done.1, 12);
+        // Each one's value is its own key's run over the other's key run inline: 2 + 10 for
+        // A, 1 + 10 for B.
+        let value_of = |name: char| if name == 'a' { 12 } else { 11 };
+        assert_eq!(done.1, value_of(done.0));
         post(cancelled, None);
         let (name, again) = heard();
         assert_eq!(name, cancelled);
-        assert_eq!(again, Ok(12));
+        assert_eq!(again, Ok(value_of(cancelled)));
         assert_eq!(flights.running(), 0);
     }
 
@@ -536,7 +539,7 @@ mod tests {
                 let (world, asks, tx) = (world.clone(), tasks[task].clone(), tx.clone());
                 pool.submit(
                     None,
-                    move || {
+                    move || -> Result<(), Cancelled> {
                         for key in asks {
                             let value = world.get(key)?;
                             assert_eq!(value, world.expected[key]);

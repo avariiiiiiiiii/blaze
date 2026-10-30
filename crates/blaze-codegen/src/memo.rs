@@ -75,6 +75,8 @@ mod tests {
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
+            unwind: None,
+            lines: Vec::new(),
             refs: 0,
         }
     }

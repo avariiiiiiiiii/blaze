@@ -21,9 +21,11 @@
 use std::{
     collections::{BTreeSet, HashMap},
     ffi::OsString,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
+use blaze_usercode::trace::{self, Seen};
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
@@ -31,6 +33,11 @@ pub mod linux;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+
+#[cfg(windows)]
+pub mod windows;
+
+pub mod v2;
 
 /// The subcommand of `blaze` that runs a program in a sandbox.
 pub const COMMAND: &str = "sandbox";
@@ -40,6 +47,16 @@ pub const COMMAND: &str = "sandbox";
 /// the sandbox takes the calls of that thread in between to be the test's. Never a path of
 /// the record. Outside a sandbox it is one failed `access` a test.
 pub const MARK: &str = "/.blaze-test/";
+
+/// What the interposer a traced run's processes load (`sandbox/linux_interpose.c` on Linux)
+/// looks up to tell the supervisor what a seccomp filter can't see, each one failed
+/// `access(path, F_OK)`, never a path of the record: a variable read by name after it
+/// ([`ENV_MARK`]), a realtime clock read ([`CLOCK_MARK`]), and, as it loads, that it is in the
+/// process ([`LOADED_MARK`]). Randomness the filter sees itself (`getrandom`, an open of
+/// `/dev/random` or `/dev/urandom`).
+pub const ENV_MARK: &str = "/.blaze-env/";
+pub const CLOCK_MARK: &str = "/.blaze-clock";
+pub const LOADED_MARK: &str = "/.blaze-loaded";
 
 /// The status a sandbox that could not be made ends with, as `env` ends when it can't run
 /// what it is given.
@@ -200,9 +217,24 @@ impl Reached {
             _ => return None,
         })
     }
+
+    /// What the record of the form `blaze sandbox SPEC -- PROGRAM` has for what a sandbox saw,
+    /// which is a [`trace::Line`]: a listing is a read there, and variables and what can't be
+    /// traced are not in it (that form loads no interposer and keys by none of them).
+    fn of_seen(seen: Seen) -> Option<Reached> {
+        Some(match seen {
+            Seen::Read | Seen::Listed => Reached::Read,
+            Seen::Looked => Reached::Looked,
+            Seen::RefusedWrite => Reached::Write,
+            Seen::RefusedNet => Reached::Net,
+            Seen::Incomplete => Reached::Incomplete,
+            Seen::Env | Seen::Untraceable => return None,
+        })
+    }
 }
 
-/// A line of a record: `R`, `L`, `W`, `N` or `X`, the test, and the path, the address or why, by
+/// A line of the record `blaze sandbox SPEC -- PROGRAM` writes ([`Spec::record`]), made from
+/// the same [`trace::Line`]s the live record of `--v2` has: `R`, `L`, `W`, `N` or `X`, the test, and the path, the address or why, by
 /// tabs. The test is libtest's name of the one whose thread made the call, as [`MARK`] said,
 /// or empty when that is not known (another thread, a child process, the program before or
 /// after its tests): what has an empty test is taken to be every test's of the run. A record

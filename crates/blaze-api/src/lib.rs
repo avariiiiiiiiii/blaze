@@ -95,6 +95,28 @@ pub enum Request {
     Status,
     /// Cancels the request `id` of this connection.
     Cancel { id: u64 },
+    /// Resolves a view to its root and keeps it open until [`Request::Close`] or the
+    /// connection ends; answered with [`Response::Opened`].
+    Open { view: ViewRef },
+    Close { root: ContentId },
+    /// What the change from `from` to `to` reaches (items, facts, functions compiled again,
+    /// tests), building nothing; answered with [`Response::Reached`].
+    Reach { from: ViewRef, to: ViewRef, targets: Targets },
+    /// Each candidate's ops applied to `base` as a what-if, checked (and tested, with `test`),
+    /// all at once: each candidate's responses as [`Response::Of`], then [`Response::Ranked`].
+    BestOf {
+        base: ViewRef,
+        candidates: Vec<Vec<Op>>,
+        targets: Targets,
+        test: bool,
+        filter: Vec<String>,
+    },
+    /// The production oracle: the view built again from nothing and compared; answered with
+    /// [`Response::Verified`].
+    Verify { view: ViewRef, targets: Targets },
+    /// The daemon's state made durable, before the VM snapshots itself; answered with
+    /// [`Response::Snapshotted`] once it is.
+    Snapshot,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -112,6 +134,15 @@ pub enum Response {
     /// The request is over; `ok` false after an error or a failed build.
     Done { ok: bool },
     Error(ApiError),
+    Opened { root: ContentId },
+    Reached(Reach),
+    /// A response of candidate `candidate` of a best-of-N.
+    Of { candidate: u32, response: Box<Response> },
+    /// Best first.
+    Ranked(Vec<Ranked>),
+    Verified { mismatches: Vec<Mismatch> },
+    /// Every head's root, as made durable.
+    Snapshotted { heads: Vec<(String, ContentId)> },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -122,6 +153,9 @@ pub struct Diagnostic {
     pub message: String,
     pub spans: Vec<Span>,
     pub children: Vec<Diagnostic>,
+    /// The facts the query that gave it read: what to change to make it go away, and why it
+    /// came back after an edit.
+    pub facts: Vec<FactRead>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -221,7 +255,8 @@ pub struct ReachedItem {
 }
 
 /// One candidate of a best-of-N, as it was ranked: fewest errors, then fewest failed tests,
-/// then most passed, then fewest warnings, then its place in the request.
+/// then most passed, then fewest warnings, then its place in the request; a candidate whose
+/// ops did not apply or whose job could not run goes after every one that ran.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Ranked {
     pub candidate: u32,

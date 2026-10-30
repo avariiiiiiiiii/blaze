@@ -14,13 +14,13 @@ impl Things<'_> {
     #[salsa::tracked]
     pub fn implicit(db: &dyn salsa::Database, _: Other<'_>) -> Things<'_> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 
     #[salsa::tracked(returns(copy))]
     pub fn implicit2(db: &dyn salsa::Database, _: Other<'_>) -> Things<'_> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 }
 
@@ -29,25 +29,25 @@ impl<'db> Things<'db> {
     #[salsa::tracked]
     pub fn explicit(db: &'db dyn salsa::Database, _: Other<'db>) -> Things<'db> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 
     #[salsa::tracked(returns(copy))]
     pub fn explicit2(db: &'db dyn salsa::Database, _: Other<'db>) -> Things<'db> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 
     #[salsa::tracked]
     pub fn implicit3(db: &dyn salsa::Database, _: Other<'_>) -> Things<'_> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 
     #[salsa::tracked(returns(copy))]
     pub fn implicit4(db: &dyn salsa::Database, _: Other<'_>) -> Things<'_> {
         _ = db;
-        todo!()
+        Things { v: std::marker::PhantomData }
     }
 
     #[salsa::tracked(returns(copy))]
@@ -78,8 +78,9 @@ impl<'a> Things<'a> {
     // pointers (which is unpredictable and only incidental to this test).
     #[salsa::tracked(returns(copy), no_eq, unsafe(non_salsa_values))]
     fn hrtb(db: &'a dyn salsa::Database) -> for<'db> fn(&'a (), &'db ()) {
+        fn ignore(_: &(), _: &()) {}
         _ = db;
-        unimplemented!()
+        ignore
     }
 
     // An elided, independent input lifetime (`Other<'_>`) must be tied to the db
@@ -87,7 +88,7 @@ impl<'a> Things<'a> {
     #[salsa::tracked(returns(copy))]
     fn named_return(db: &'a dyn salsa::Database, other: Other<'_>) -> Things<'a> {
         _ = (db, other);
-        unimplemented!()
+        Things { v: std::marker::PhantomData }
     }
 }
 

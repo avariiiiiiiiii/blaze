@@ -11,7 +11,7 @@ use blaze_items::{CodeHash, ItemKey};
 
 use super::*;
 use crate::{
-    Arch, Backend, RelocKind,
+    Arch, Backend, Init, RelocKind,
     plan::{Mode, OptLevel, Override, Profile},
     settings::{DebugInfo, Panic, Relocation, Toolchain},
     summary::{Attrs, Call, Hint},
@@ -29,7 +29,8 @@ struct Function {
 #[derive(Default)]
 struct Program {
     functions: HashMap<u32, Function>,
-    statics: HashMap<u32, u8>,
+    /// Each static's value byte and section.
+    statics: HashMap<u32, (u8, Option<String>)>,
 }
 
 impl Program {
@@ -89,11 +90,14 @@ impl Frontend for Program {
     }
 
     fn describe_static(&self, id: &u32) -> Result<DescribedStatic<u32, u32>, CodegenError> {
-        let value = self.statics[id];
+        let (value, section) = &self.statics[id];
         Ok(DescribedStatic {
             item: static_item(*id),
             instance: ContentId::default(),
-            value: ContentId::of("blaze v2 test value 1", &[value]),
+            value: ContentId::of("blaze v2 test value 1", &[*value]),
+            mutable: false,
+            thread_local: false,
+            section: section.clone(),
             origin: Origin::Member("app".to_owned()),
             symbol: None,
             refs: Vec::new(),
@@ -202,6 +206,8 @@ impl Prepare for Machine {
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
+            unwind: None,
+            lines: Vec::new(),
         };
         Ok(Emitted { function, side: None })
     }
@@ -224,17 +230,18 @@ impl Prepare for Machine {
         _: &Spec,
         id: &u32,
         _: &crate::template::Refs,
-    ) -> Result<CompiledStatic, CodegenError> {
+    ) -> Result<Static, CodegenError> {
         self.statics.fetch_add(1, Ordering::Relaxed);
-        Ok(CompiledStatic {
+        let (value, section) = &program.statics[id];
+        Ok(Static {
             item: static_item(*id),
             instance: ContentId::default(),
             align: 8,
-            bytes: vec![program.statics[id]; 8],
-            relocs: Vec::new(),
+            init: Init::Bytes { bytes: vec![*value; 8], relocs: Vec::new() },
             data: Vec::new(),
-            writable: false,
+            mutable: false,
             thread_local: false,
+            section: section.clone(),
         })
     }
 }
@@ -375,8 +382,8 @@ fn equal_code_is_one_function_unless_its_address_is_significant() {
 fn statics_are_kept_by_which_they_are() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let mut program = program();
-    program.statics.insert(7, 0xaa);
-    program.statics.insert(8, 0xaa);
+    program.statics.insert(7, (0xaa, None));
+    program.statics.insert(8, (0xaa, None));
     program.functions.get_mut(&4).unwrap().statics = vec![7, 8];
     let machine = Machine::default();
     let mut store = Store::default();
@@ -392,6 +399,25 @@ fn statics_are_kept_by_which_they_are() {
     let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
     assert_eq!(warm.statics.load(Ordering::Relaxed), 0);
     assert_eq!(again.statics, built.statics);
+}
+
+#[test]
+fn a_static_is_kept_with_its_section() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    program.statics.insert(7, (0xaa, None));
+    program.statics.insert(8, (0xaa, Some(".init_array".to_owned())));
+    program.functions.get_mut(&4).unwrap().statics = vec![7, 8];
+    let mut store = Store::default();
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&built.puts);
+    let warm = Machine::default();
+    let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(warm.statics.load(Ordering::Relaxed), 0);
+    let sections: Vec<_> = again.statics.iter().map(|it| it.section.clone()).collect();
+    let item_order = static_item(7) < static_item(8);
+    let want = if item_order { vec![None, Some(".init_array".to_owned())] } else { vec![Some(".init_array".to_owned()), None] };
+    assert_eq!(sections, want);
 }
 
 #[test]

@@ -472,6 +472,60 @@ fn model_apply(model: &mut BTreeMap<String, (Mode, Vec<u8>)>, op: &Op) -> bool {
 }
 
 #[test]
+fn the_reader_reads_every_root_as_the_vfs_does() {
+    let mut vfs = new_vfs();
+    let reader = vfs.reader();
+    let empty = vfs.empty();
+    assert_eq!(reader.list(empty, ""), Some(Vec::new()), "the empty root is there from the start");
+    let ops = [
+        write("src/lib.rs", "fn a() {}"),
+        write_as("run.sh", "echo", Mode::Executable),
+        write_as("link", "run.sh", Mode::Symlink),
+    ];
+    let root = vfs.commit("w", empty, &ops).unwrap().root;
+    let view = vfs.open(View { root }).unwrap();
+    for path in ["src/lib.rs", "run.sh", "link", "src", "", "nope", "src/lib.rs/x", "a//b", "../x"] {
+        let file = vfs.read(view, path).map(|it| (it.id, it.mode, it.bytes.to_vec()));
+        let read = reader.file(root, path).map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
+        assert_eq!(read, file, "{path}");
+    }
+    for path in ["", "src", "run.sh", "nope"] {
+        assert_eq!(reader.list(root, path), vfs.list(view, path), "{path}");
+    }
+    let file_id = vfs.lookup(view, "run.sh").unwrap();
+    assert_eq!(reader.list(file_id, ""), None, "a file is no root");
+    assert_eq!(reader.file(file_id, ""), None);
+
+    // A what-if is readable as soon as `apply` gives its ID; another thread reads while the
+    // tree goes on.
+    let what_if = vfs.apply(root, &[edit("src/lib.rs", 0, 2, "pub fn")]).unwrap();
+    std::thread::scope(|scope| {
+        let reader = reader.clone();
+        let reading = scope.spawn(move || {
+            (0..1000).all(|_| {
+                reader.file(what_if, "src/lib.rs").map(|it| it.2.to_vec())
+                    == Some(b"pub fn a() {}".to_vec())
+            })
+        });
+        for at in 0..100 {
+            vfs.commit("w", vfs.head("w").unwrap(), &[write(&format!("f{at}"), "x")]).unwrap();
+        }
+        assert!(reading.join().unwrap());
+    });
+
+    // Collection takes from the reader what it takes from the tree.
+    vfs.close(view);
+    vfs.remove_head("w");
+    vfs.collect(&[what_if]);
+    assert!(vfs.has(what_if) && !vfs.has(root));
+    assert_eq!(reader.file(root, "run.sh"), None);
+    assert_eq!(reader.list(root, ""), None);
+    assert_eq!(reader.file(what_if, "run.sh").map(|it| it.1), Some(Mode::Executable));
+    let next = vfs.commit("w", empty, &[write("after", "1")]).unwrap().root;
+    assert_eq!(reader.file(next, "after").map(|it| it.2.to_vec()), Some(b"1".to_vec()));
+}
+
+#[test]
 fn modes_are_git_modes() {
     assert_eq!(
         [Mode::Regular, Mode::Executable, Mode::Symlink].map(Mode::git),

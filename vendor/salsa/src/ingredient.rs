@@ -215,7 +215,7 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         _zalsa: &'db Zalsa,
         _f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
-        unimplemented!("called `serialize` on ingredient where `should_serialize` returns `false`")
+        unreachable!("called `serialize` on ingredient where `should_serialize` returns `false`")
     }
 
     /// Deserialize the ingredient.
@@ -225,7 +225,7 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
         _zalsa: &mut Zalsa,
         _deserializer: &mut dyn erased_serde::Deserializer,
     ) -> Result<(), erased_serde::Error> {
-        unimplemented!(
+        unreachable!(
             "called `deserialize` on ingredient where `should_serialize` returns `false`"
         )
     }

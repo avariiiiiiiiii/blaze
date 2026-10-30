@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_build_script::Watched;
 use blaze_core::Traced;
 
 use crate::trace::{self, Inputs, PACKAGE, TREE};
@@ -64,17 +65,19 @@ pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -
     Ok(())
 }
 
-/// The rule of a script whose output named `rerun_if_changed` and `rerun_if_env_changed`, in
-/// its package at `package_dir`.
-pub fn of_directives(
-    package_dir: &Path,
-    rerun_if_changed: &[PathBuf],
-    rerun_if_env_changed: &[OsString],
-) -> CargoRule {
-    CargoRule {
-        paths: rerun_if_changed.iter().map(|it| crate::index::whole(package_dir, it)).collect(),
-        package: rerun_if_changed.is_empty().then(|| package_dir.to_owned()),
-        env: rerun_if_env_changed.to_vec(),
+impl CargoRule {
+    /// The rule of what cargo [`watched`](blaze_build_script::watched) of a script.
+    pub fn of(watched: Watched) -> CargoRule {
+        let env = watched.env.into_iter().map(OsString::from).collect();
+        if watched.whole_package {
+            return CargoRule { paths: Vec::new(), package: watched.paths.into_iter().next(), env };
+        }
+        CargoRule { paths: watched.paths, package: None, env }
+    }
+
+    /// The whole package at `package_dir`.
+    pub fn package(package_dir: &Path) -> CargoRule {
+        CargoRule { paths: Vec::new(), package: Some(package_dir.to_owned()), env: Vec::new() }
     }
 }
 
@@ -82,10 +85,20 @@ pub fn of_directives(
 mod tests {
     use std::{collections::BTreeMap, ffi::OsStr};
 
+    use blaze_build_script::{Output, watched};
     use blaze_core::Untraceable;
 
     use super::*;
     use crate::{index::Shape, trace::DIRECTORY};
+
+    fn of_directives(rerun_if_changed: &[&str], rerun_if_env_changed: &[&str]) -> CargoRule {
+        let output = Output {
+            rerun_if_changed: rerun_if_changed.iter().map(PathBuf::from).collect(),
+            rerun_if_env_changed: rerun_if_env_changed.iter().map(|it| it.to_string()).collect(),
+            ..Output::default()
+        };
+        CargoRule::of(watched(&output, Path::new("/p")))
+    }
 
     #[derive(Default)]
     struct Fixed {
@@ -140,7 +153,7 @@ mod tests {
     fn a_run_traced_whole_keeps_only_what_it_read() {
         let mut traced = Traced { files: vec![("/p/build.rs".into(), Some([1; 32]))], ..Traced::default() };
         let before = traced.clone();
-        widen(&mut traced, &of_directives(Path::new("/p"), &[], &[]), &mut fixed()).unwrap();
+        widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
         assert_eq!(traced, before);
     }
 
@@ -152,7 +165,7 @@ mod tests {
             ..Traced::default()
         };
         let mut traced = clock();
-        widen(&mut traced, &of_directives(Path::new("/p"), &[], &[]), &mut fixed()).unwrap();
+        widen(&mut traced, &of_directives(&[], &[]), &mut fixed()).unwrap();
         assert_eq!(traced.dirs.len(), 1);
         assert_eq!(traced.dirs[0].0, Path::new("/p").join(PACKAGE));
         let mut changed = fixed();
@@ -162,7 +175,7 @@ mod tests {
         assert_ne!(shape.values(&mut changed).unwrap(), traced);
 
         let mut named = clock();
-        let rule = of_directives(Path::new("/p"), &["data".into(), "build.rs".into()], &["VERSION".into()]);
+        let rule = of_directives(&["data", "build.rs"], &["VERSION"]);
         widen(&mut named, &rule, &mut fixed()).unwrap();
         assert_eq!(named.files, vec![("/p/build.rs".into(), Some([1; 32]))]);
         assert_eq!(named.dirs[0].0, Path::new("/p/data").join(TREE));
@@ -173,5 +186,10 @@ mod tests {
         assert_ne!(shape.values(&mut data).unwrap(), named);
         // What the rule does not name is not watched.
         assert_eq!(shape.values(&mut changed).unwrap(), named);
+
+        let mut env_only = clock();
+        widen(&mut env_only, &of_directives(&[], &["VERSION"]), &mut fixed()).unwrap();
+        assert!(env_only.dirs.is_empty());
+        assert_eq!(env_only.env, vec![("VERSION".into(), Some("1".into()))]);
     }
 }

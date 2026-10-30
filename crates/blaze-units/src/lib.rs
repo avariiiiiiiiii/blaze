@@ -18,8 +18,13 @@
 
 mod graph;
 mod order;
+#[cfg(feature = "query")]
+pub mod load;
+#[cfg(feature = "query")]
 pub mod query;
 pub mod schema;
+#[cfg(feature = "query")]
+pub mod stdlib;
 
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::Profiles;

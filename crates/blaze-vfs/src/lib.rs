@@ -16,6 +16,7 @@
 //!   workspace's head ([`Watcher`]).
 
 mod journal;
+mod reader;
 mod rebase;
 mod tree;
 pub mod watch;
@@ -31,7 +32,10 @@ use crate::{
     journal::{Journal, Loaded},
     tree::{NodeId, Tree},
 };
-pub use crate::watch::{Watched, Watcher};
+pub use crate::{
+    reader::Reader,
+    watch::{Watched, Watcher},
+};
 
 pub const FILE_DOMAIN: &str = "blaze v2 vfs file 1";
 pub const DIR_DOMAIN: &str = "blaze v2 vfs directory 2";
@@ -196,14 +200,25 @@ pub struct Vfs {
     /// By view: its root while it is open. A closed view's number is not given out again.
     views: Vec<Option<NodeId>>,
     journal: Journal,
+    /// Every node of `tree`, published after each change, for readers on other threads.
+    reader: Reader,
 }
 
 impl Vfs {
     /// A VFS recovered from its journal's bytes (empty for a new one), and what it found.
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
-        let Loaded { tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
-        (Vfs { tree, heads, views: Vec::new(), journal }, found)
+        let Loaded { mut tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
+        let reader = Reader::default();
+        tree.publish(&reader);
+        (Vfs { tree, heads, views: Vec::new(), journal, reader }, found)
+    }
+
+    /// A handle that reads any root this tree has, from any thread, without the `Vfs`: what
+    /// the query database's `blaze_query::Tree` is over. A root is in it before any call that
+    /// gives its ID returns.
+    pub fn reader(&self) -> Reader {
+        self.reader.clone()
     }
 
     /// The root `head` is at, if it was ever written.
@@ -253,6 +268,7 @@ impl Vfs {
             (Cow::Owned(rebase::rebase(&self.tree, base, at, ops)?), true)
         };
         let root = self.tree.apply(at, &ops)?;
+        self.tree.publish(&self.reader);
         self.heads.insert(head.into(), root);
         let ticket = self.journal.record_head(&self.tree, head, root);
         Ok(Commit { root: self.tree.id(root), rebased, ticket })
@@ -275,6 +291,7 @@ impl Vfs {
     pub fn apply(&mut self, base: ContentId, ops: &[Op]) -> Result<ContentId, OpError> {
         let base = self.root(base).ok_or_else(|| OpError::NotFound(format!("root {base:x}")))?;
         let root = self.tree.apply(base, ops)?;
+        self.tree.publish(&self.reader);
         Ok(self.tree.id(root))
     }
 
@@ -380,6 +397,8 @@ impl Vfs {
             self.views[at] = live.next();
         }
         self.journal.collected(&renumbered, self.tree.len());
+        self.reader.retain(|id| self.tree.node(id).is_some());
+        self.tree.publish(&self.reader);
     }
 }
 

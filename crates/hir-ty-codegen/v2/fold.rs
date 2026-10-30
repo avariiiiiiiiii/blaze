@@ -24,11 +24,14 @@ use blaze_codegen::{
     settings::Spec,
     template::Refs,
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use cranelift_codegen::{
     cursor::{Cursor as _, FuncCursor},
     ir::{self, InstBuilder as _, InstructionData, Opcode},
 };
+
+use super::{DataPlace, Function};
+use crate::{DataIdentity, fragment::DataRequest};
 
 /// The namespace of the name a thunk calls the merged body by: the last of the references it
 /// is compiled against, [`Group::thunk_refs`]'s [`blaze_codegen::Target::Direct`] of the body.
@@ -39,30 +42,78 @@ pub(crate) const BODY: u32 = u32::MAX - 1;
 pub(crate) enum Name {
     /// The `n`th of the instance's references: a function or a static.
     Place(u32),
-    /// Anything else, by what it is: a data object by its bytes with what it points at by
-    /// target (never by place), a position by its span. Equal for two functions only when it
-    /// is the same thing in both.
+    /// Anything else, by what it is: a data object by its bytes and what it points at, a
+    /// position by its span. Equal for two functions only when it is the same thing in both.
     Fixed(ContentId),
 }
 
-/// A prepared Cranelift function, as the adapter holds it.
-pub(crate) trait Source {
-    fn function(&self) -> &ir::Function;
-    /// What `name`, a name of [`Source::function`]'s, is; `None` for one that is neither a
-    /// place nor something [`Name::Fixed`] can say (a callee still to be inlined).
-    fn name(&self, name: ir::UserExternalName) -> Option<Name>;
+/// The constants of a prepared Cranelift function masked, for
+/// [`blaze_codegen::fold::groups`]. `None` for one that can't take parameters: an assembly
+/// function, one without a body or with a dynamic stack slot, one naming a static by a place
+/// that is the base of another global value or a patchable callee by a place, and one with
+/// data whose content can't be told without the build's targets (data of its own that points
+/// at a function or static, or is not shared by content). A C-variadic function, and one
+/// whose address is significant ([`blaze_codegen::backend::Address::Significant`]), are the
+/// caller's to leave out.
+pub(crate) fn masked(function: &Function) -> Option<Masked> {
+    masked_ir(function.ir()?, &|it| name(function, it))
 }
 
-/// The constants of `func` masked, for [`blaze_codegen::fold::groups`]. `None` for a function
-/// that can't take parameters: without a body, with a dynamic stack slot, a static named by
-/// a place that is the base of another global value, a patchable callee named by a place, or
-/// a name `names` doesn't know. A C-variadic or naked function, and one whose address is
-/// significant, are the caller's to leave out.
-pub(crate) fn masked(
+/// [`masked`] of `func`, whose names `names` says.
+pub(crate) fn masked_ir(
     func: &ir::Function,
     names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
 ) -> Option<Masked> {
     walk(func, names).map(|it| it.masked)
+}
+
+const FOLD_DATA_DOMAIN: &str = "blaze v2 fold data 1";
+
+/// What a name of `function`'s IR is: namespace 0 its function requests, 1 its data
+/// requests. `None` for a callee still to be inlined, and for data [`masked`] refuses.
+pub(crate) fn name(function: &Function, name: ir::UserExternalName) -> Option<Name> {
+    match name.namespace {
+        0 => function.places.funcs.get(name.index as usize).map(|&it| Name::Place(it)),
+        1 => data(function, name.index as usize),
+        _ => None,
+    }
+}
+
+fn data(function: &Function, index: usize) -> Option<Name> {
+    let mut hasher = Hasher::new(FOLD_DATA_DOMAIN);
+    match function.places.datas.get(index)? {
+        DataPlace::Place(place) => return Some(Name::Place(*place)),
+        DataPlace::Position(span) => {
+            hasher.update(&[0]).id(&span.anchor).update(&span.index.to_le_bytes());
+        }
+        DataPlace::Text(text) => {
+            hasher.update(&[1]).part(text.as_bytes());
+        }
+        DataPlace::Own => {
+            let (DataRequest::Blob { blob, identity: DataIdentity::Shared }
+            | DataRequest::Vtable { blob, .. }) = function.requests().datas.get(index)?
+            else {
+                return None;
+            };
+            // A function's or static's address in it is a place, which is another target in
+            // another member; a `TypeId`'s bytes are not written yet.
+            if !blob.fn_relocs.is_empty() || !blob.type_ids.is_empty() {
+                return None;
+            }
+            hasher.update(&[2]).update(&blob.align.to_le_bytes()).part(&blob.bytes);
+            hasher.update(&(blob.relocs.len() as u64).to_le_bytes());
+            for &(at, target, addend) in &blob.relocs {
+                // Only data before it, so the walk ends.
+                let target = target.as_u32() as usize;
+                if target >= index {
+                    return None;
+                }
+                let Name::Fixed(id) = data(function, target)? else { return None };
+                hasher.update(&at.to_le_bytes()).id(&id).update(&addend.to_le_bytes());
+            }
+        }
+    }
+    Some(Name::Fixed(hasher.finish()))
 }
 
 /// Where a masked constant is in the function.
@@ -332,7 +383,11 @@ pub(crate) type Member<'a> =
 /// Builds `group`'s body from its first member and a thunk for each. Every member's masked IR
 /// must be the group's, with the group's values of its varying constants and equal values
 /// (a place by its target) of the rest.
-pub(crate) fn build(group: &Group, members: &[Member<'_>], pointer: ir::Type) -> Result<Built, String> {
+pub(crate) fn build(
+    group: &Group,
+    members: &[Member<'_>],
+    pointer: ir::Type,
+) -> Result<Built, String> {
     if members.is_empty()
         || members.len() != group.members.len()
         || members.len() != group.constants.len()
@@ -363,7 +418,8 @@ pub(crate) fn build(group: &Group, members: &[Member<'_>], pointer: ir::Type) ->
         {
             if let Some((_, &value)) = varying.next_if(|it| *it.0 as usize == index) {
                 if mine != value {
-                    return Err(format!("member {at}'s constant {index} is {mine:?}, not {value:?}"));
+                    let what = format!("member {at}'s constant {index} is {mine:?}, not {value:?}");
+                    return Err(what);
                 }
                 continue;
             }
@@ -376,7 +432,7 @@ pub(crate) fn build(group: &Group, members: &[Member<'_>], pointer: ir::Type) ->
                 (mine, firsts) => mine == firsts,
             };
             if !equal {
-                return Err(format!("member {at}'s constant {index} varies, and is not a parameter"));
+                return Err(format!("member {at}'s constant {index} varies, but is no parameter"));
             }
         }
         if varying.next().is_some() {
@@ -517,7 +573,8 @@ fn thunk(
     body: &ir::Signature,
     pointer: ir::Type,
 ) -> Result<ir::Function, String> {
-    let mut thunk = ir::Function::with_name_signature(member.name.clone(), member.signature.clone());
+    let mut thunk =
+        ir::Function::with_name_signature(member.name.clone(), member.signature.clone());
     let mut made = Vec::with_capacity(params as usize);
     for param in 0..params {
         let at = reads.iter().position(|&it| it == param).expect("each parameter is read");
@@ -530,7 +587,8 @@ fn thunk(
             (Site::Inst(_), Constant::F64(bits)) => Made::F64(bits),
             (Site::Func(callee), Constant::Place(_)) => {
                 let data = &member.dfg.ext_funcs[callee];
-                let signature = thunk.import_signature(member.dfg.signatures[data.signature].clone());
+                let signature =
+                    thunk.import_signature(member.dfg.signatures[data.signature].clone());
                 let name = copied(member, &data.name, &mut thunk);
                 let colocated = data.colocated;
                 Made::Func(thunk.import_function(ir::ExtFuncData {
@@ -556,7 +614,7 @@ fn thunk(
         });
     }
     let signature = thunk.import_signature(body.clone());
-    let name = thunk.declare_imported_user_function(ir::UserExternalName { namespace: BODY, index: 0 });
+    let name = thunk.declare_imported_user_function(ir::UserExternalName::new(BODY, 0));
     let callee = thunk.import_function(ir::ExtFuncData {
         name: ir::ExternalName::user(name),
         signature,
@@ -589,15 +647,15 @@ fn thunk(
 }
 
 /// Compiles `group`: its body from the first member, a thunk for each member, each with
-/// `emit`, the adapter's compile of a prepared function's IR (here `func` in place of the
-/// prepared one) against `refs`, its names in the prepared function's. The body is emitted
-/// as the first member against its references and keyed [`Group::key`]; thunk `i` as member
-/// `i` against [`Group::thunk_refs`] of its own, where [`BODY`] is the last.
-pub(crate) fn merge<P: Source>(
+/// `emit`, the adapter's Cranelift compile of a prepared function with `func` in place of its
+/// IR, `func`'s names being the prepared function's (and [`BODY`] the last of `refs`). The
+/// body is emitted as the first member against its references and keyed [`Group::key`];
+/// thunk `i` as member `i` against [`Group::thunk_refs`] of its own.
+pub(crate) fn merge(
     group: &Group,
-    members: &[(&Unit, &Spec, &P, &Refs)],
+    members: &[(&Unit, &Spec, &Function, &Refs)],
     pointer: ir::Type,
-    emit: impl Fn(&Unit, &Spec, &P, ir::Function, &Refs) -> Result<Emitted, CodegenError>,
+    emit: impl Fn(&Unit, &Spec, &Function, ir::Function, &Refs) -> Result<Emitted, CodegenError>,
 ) -> Result<Merged, CodegenError> {
     let &(first, ..) = members.first().expect("a group has members");
     let fail = |what: String| CodegenError {
@@ -612,15 +670,15 @@ pub(crate) fn merge<P: Source>(
     }
     let names: Vec<_> = members
         .iter()
-        .map(|&(_, _, prepared, _)| move |name: ir::UserExternalName| prepared.name(name))
+        .map(|&(_, _, prepared, _)| move |it: ir::UserExternalName| name(prepared, it))
         .collect();
-    let sources: Vec<Member<'_>> = members
-        .iter()
-        .zip(&names)
-        .map(|(&(_, _, prepared, refs), names)| {
-            (prepared.function(), names as &dyn Fn(ir::UserExternalName) -> Option<Name>, refs)
-        })
-        .collect();
+    let mut sources: Vec<Member<'_>> = Vec::with_capacity(members.len());
+    for (at, (&(_, _, prepared, refs), names)) in members.iter().zip(&names).enumerate() {
+        let Some(func) = prepared.ir() else {
+            return Err(fail(format!("member {at} is assembly, which has no IR to fold")));
+        };
+        sources.push((func, names as &dyn Fn(ir::UserExternalName) -> Option<Name>, refs));
+    }
     let Built { body, thunks } = build(group, &sources, pointer).map_err(fail)?;
     let (unit, spec, prepared, refs) = members[0];
     let mut body = emit(unit, spec, prepared, body, refs)?;
@@ -687,8 +745,8 @@ mod tests {
         };
         let name = user(&mut func, 0, callee);
         let signature = func.import_signature(signature());
-        let callee =
-            func.import_function(ir::ExtFuncData { name, signature, colocated: true, patchable: false });
+        let data = ir::ExtFuncData { name, signature, colocated: true, patchable: false };
+        let callee = func.import_function(data);
         let name = user(&mut func, 0, stat);
         let stat = func.create_global_value(ir::GlobalValueData::Symbol {
             name,
@@ -729,7 +787,7 @@ mod tests {
     #[test]
     fn numbering_is_not_the_shape() {
         let (a, b) = (grow(8, 0, 1, false), grow(8, 0, 1, true));
-        let (a, b) = (masked(&a, &names).unwrap(), masked(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
         assert_eq!(a, b);
         assert_eq!(a.constants, vec![
             Constant::Int { bits: 64, value: 8 },
@@ -742,7 +800,7 @@ mod tests {
     #[test]
     fn constants_are_masked() {
         let (a, b) = (grow(8, 0, 1, false), grow(-4, 2, 3, false));
-        let (a, b) = (masked(&a, &names).unwrap(), masked(&b, &names).unwrap());
+        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
         assert_eq!(a.shape, b.shape);
         assert_eq!(b.constants[0], Constant::Int { bits: 64, value: u128::from(-4i64 as u64) });
         assert_eq!(b.constants[1], Constant::Place(2));
@@ -763,32 +821,21 @@ mod tests {
         cursor.func.layout.remove_inst(ret);
         let mut cursor = cursor.at_bottom(next);
         cursor.ins().return_(&[sum]);
-        let a = masked(&grow(8, 0, 1, false), &names).unwrap();
-        assert_ne!(masked(&other, &names).unwrap().shape, a.shape);
+        let a = masked_ir(&grow(8, 0, 1, false), &names).unwrap();
+        assert_ne!(masked_ir(&other, &names).unwrap().shape, a.shape);
     }
 
     #[test]
     fn what_has_no_parameters_is_not_masked() {
-        assert!(masked(&ir::Function::new(), &names).is_none());
-        assert!(masked(&grow(8, 0, 1, false), &|_| None).is_none());
-    }
-
-    struct Prepared(ir::Function);
-
-    impl Source for Prepared {
-        fn function(&self) -> &ir::Function {
-            &self.0
-        }
-
-        fn name(&self, name: ir::UserExternalName) -> Option<Name> {
-            names(name)
-        }
+        assert!(masked_ir(&ir::Function::new(), &names).is_none());
+        assert!(masked_ir(&grow(8, 0, 1, false), &|_| None).is_none());
     }
 
     fn verified(func: &ir::Function) {
         let flags = settings::Flags::new(settings::builder());
         if let Err(errors) = cranelift_codegen::verify_function(func, &flags) {
-            panic!("{}", cranelift_codegen::print_errors::pretty_verifier_error(func, None, errors));
+            let shown = cranelift_codegen::print_errors::pretty_verifier_error(func, None, errors);
+            panic!("{shown}");
         }
         let mut ctx = cranelift_codegen::Context::for_function(func.clone());
         assert!(!crate::emit(&mut ctx).unwrap().bytes.is_empty());
@@ -798,10 +845,10 @@ mod tests {
     fn two_members_merge_into_a_body_and_thunks() {
         let pointer = crate::target().unwrap().pointer_type();
         // Two sizes, two callees, one static (place 1 of both).
-        let (a, b) = (Prepared(grow(8, 0, 1, false)), Prepared(grow(24, 0, 1, true)));
+        let (a, b) = (grow(8, 0, 1, false), grow(24, 0, 1, true));
         let refs_a = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
         let refs_b = vec![Target::Function(key(11)), Target::Extern("STATIC".to_owned())];
-        let (ma, mb) = (masked(&a.0, &names).unwrap(), masked(&b.0, &names).unwrap());
+        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
         let found = groups(
@@ -810,10 +857,7 @@ mod tests {
         );
         let group = &found[0];
         assert_eq!(group.varying, vec![0, 1]);
-        let names_a = |name: ir::UserExternalName| a.name(name);
-        let names_b = |name: ir::UserExternalName| b.name(name);
-        let members: [Member<'_>; 2] =
-            [(&a.0, &names_a, &refs_a[..]), (&b.0, &names_b, &refs_b[..])];
+        let members: [Member<'_>; 2] = [(&a, &names, &refs_a[..]), (&b, &names, &refs_b[..])];
         let Built { body, thunks } = build(group, &members, pointer).unwrap();
 
         let mut want = signature();
@@ -833,7 +877,7 @@ mod tests {
         assert_eq!(opcodes.iter().filter(|&&it| it == Opcode::SymbolValue).count(), 2);
         verified(&body);
 
-        for ((thunk, member), size) in thunks.iter().zip([&a.0, &b.0]).zip([8, 24]) {
+        for ((thunk, member), size) in thunks.iter().zip([&a, &b]).zip([8, 24]) {
             assert_eq!(thunk.signature, member.signature);
             let block = thunk.layout.entry_block().unwrap();
             let insts: Vec<ir::Inst> = thunk.layout.block_insts(block).collect();
@@ -871,10 +915,13 @@ mod tests {
         let (a, b) = (grow(8, 0, 1, false), grow(24, 0, 1, false));
         let refs = vec![Target::Function(key(10)), Target::Extern("STATIC".to_owned())];
         let other = vec![Target::Function(key(10)), Target::Extern("OTHER".to_owned())];
-        let (ma, mb) = (masked(&a, &names).unwrap(), masked(&b, &names).unwrap());
+        let (ma, mb) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
         let settings = Settings(ContentId([1; 32]));
         let limits = Limits { thunk_size: 0, ..Limits::default() };
-        let found = groups(&[(key(1), settings, &ma, &refs[..]), (key(2), settings, &mb, &refs[..])], &limits);
+        let found = groups(
+            &[(key(1), settings, &ma, &refs[..]), (key(2), settings, &mb, &refs[..])],
+            &limits,
+        );
         let group = &found[0];
         assert_eq!(group.varying, vec![0]);
         // The static differs, but the group was made with it equal.

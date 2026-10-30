@@ -33,6 +33,12 @@ pub(crate) fn comparing() -> bool {
     COMPARING.with(Cell::get)
 }
 
+/// Whether this process compares the servers: then nothing is kept, so that each call is
+/// expanded by both.
+pub(crate) fn enabled() -> bool {
+    std::env::var_os("BLAZE_PROC_MACRO_COMPARE").is_some()
+}
+
 struct Compare {
     server: ProcMacroClient,
     libs: PathBuf,

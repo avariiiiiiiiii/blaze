@@ -19,6 +19,18 @@ pub trait Tree: Send + Sync {
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>>;
 }
 
+/// The VFS's files: [`blaze_vfs::Vfs::reader`], a shared handle on its immutable nodes by
+/// content ID. Here rather than in blaze-vfs because blaze-query depends on blaze-vfs.
+impl Tree for blaze_vfs::Reader {
+    fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
+        blaze_vfs::Reader::file(self, root, path)
+    }
+
+    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+        blaze_vfs::Reader::list(self, root, path)
+    }
+}
+
 /// A tree in memory, for tests and for what-ifs built without the VFS. Its roots are content
 /// IDs of the sorted list of paths, modes and file IDs (not the VFS's Merkle IDs).
 #[derive(Default)]

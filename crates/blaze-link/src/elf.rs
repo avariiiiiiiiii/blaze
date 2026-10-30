@@ -356,7 +356,7 @@ impl Writer for Elf {
     }
 
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
-        Ok(dynamic::Tables::of(self, placed)?.regions())
+        Ok(dynamic::Tables::of(self, placed)?.regions(&self.output))
     }
 
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {

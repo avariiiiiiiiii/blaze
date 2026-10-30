@@ -228,7 +228,16 @@ enum Msg {
     Found { request: RequestId, tasks: Vec<Task> },
     Close { request: RequestId },
     Cancel { request: RequestId },
-    Done { at_ns: u64, id: NodeId, request: RequestId, kind: TaskKind, did: Did, peak: Option<u64>, group: Option<u32> },
+    Done {
+        at_ns: u64,
+        id: NodeId,
+        request: RequestId,
+        kind: TaskKind,
+        did: Did,
+        /// What its arena held at most; `None` when it panicked.
+        peak: Option<u64>,
+        group: Option<u32>,
+    },
     Estimates { reply: Sender<Estimates> },
     Stop,
 }
@@ -508,8 +517,7 @@ impl Owner {
                     spec.memory = spec.memory.max(self.estimates.predict(kind));
                 }
                 let peak = peak.unwrap_or(0);
-                let input =
-                    PlaneInput::Done { at_ns, id, outcome, added: added.clone(), group, peak };
+                let input = PlaneInput::Done { at_ns, id, outcome, added, group, peak };
                 if !self.step(request, input) {
                     // What it found could not be added: the node fails rather than run forever.
                     let why = format!("what node {id} found could not be added to {request}");

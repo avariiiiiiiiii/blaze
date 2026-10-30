@@ -127,3 +127,58 @@ so no Cargo.toml edit is needed).
 Optional, not needed to build: `impl_internable!(gc; X)` and `impl_slice_internable!(gc; X, H, S)`
 are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*.rs`); the
 `gc;` can be dropped from those calls whenever someone touches them.
+
+## format-hir
+
+1. **hir-def depends on blaze-format and blaze-ids** — `crates/hir-def/Cargo.toml` (lane db).
+   Old text:
+   ```toml
+   syntax-bridge.workspace = true
+
+   # This is a transitive dep, but we need to specify this
+   ```
+   New text:
+   ```toml
+   syntax-bridge.workspace = true
+   blaze-format.workspace = true
+   blaze-ids.workspace = true
+
+   # This is a transitive dep, but we need to specify this
+   ```
+   Why: `hir/persist.rs`, `item_tree/persist.rs` and `expr_store/persist.rs` implement
+   `blaze_format::Persist` for `ItemTree`, `ExpressionStore`, `Body` and their source maps
+   (docs/v2/format.md section 5). Both crates are already workspace dependencies
+   (`Cargo.toml`: `blaze-format = { path = "crates/blaze-format" }`, `blaze-ids = ...`).
+   hir-def doesn't build without it.
+
+2. **Inner attributes of a lazy body, for every caller** — `crates/syntax/src/ast/traits.rs`,
+   `HasAttrs::inner_attributes_node` (format-parse). Today the `ast::Fn` arm
+   (`it.body()?.stmt_list()?`) enters the body, so every `attrs_including_inner` /
+   `attrs_with_doc_including_inner` of a `fn` parses an outline's lazy body: hir-def's
+   `attrs.rs` (`AttrFlags`, docs) does so for every fn it is asked about (lane items' file).
+   The item tree no longer goes through it (`item_tree/attrs.rs` `OutlineFn`: when
+   `body_is_lazy()`, it reads the body's text and enters the body only when the text after
+   `{`, whitespace and comments starts with `#` or a non-ASCII character). The same check
+   belongs in the trait, so every caller gets it. Exact edit, in `inner_attributes_node`:
+   ```rust
+   ast::Fn(it) => it.body()?.stmt_list()?.syntax().clone(),
+   ```
+   becomes
+   ```rust
+   ast::Fn(it) => {
+       let body = it.body()?;
+       if body.syntax().is_lazy() && !may_start_with_inner_attr(body.syntax()) {
+           return None;
+       }
+       body.stmt_list()?.syntax().clone()
+   },
+   ```
+   with `may_start_with_inner_attr` reading `&tree.source()[tree.range(at)]` from
+   `node.flat()` as `crates/hir-def/src/item_tree/attrs.rs`'s `may_start_with_inner_attr` and
+   `block_comment_len` do (copy them with their tests). Then `OutlineFn` can go: tell
+   format-hir and it removes it. Why: #1294, nothing that doesn't lower a body may parse it.
+
+3. **Test dependence, no edit**: `crates/hir-def/src/expr_store/tests/outline.rs` builds a crate
+   with `new_source_root:library` (so `CrateOrigin::Library`) and asserts its file is parsed
+   as an outline: it fails, naming base-db's parse query, until the lead's request 1 above is
+   applied.

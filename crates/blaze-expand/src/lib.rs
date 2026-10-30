@@ -31,7 +31,6 @@ pub mod native;
 
 use std::{
     any::Any,
-    ffi::OsString,
     sync::{
         Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -339,7 +338,10 @@ pub fn server_failed() -> Option<&'static str> {
 }
 
 impl Kept {
-    fn failed(&self, expanded: Result<tt::TopSubtree, ProcMacroExpansionError>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    fn failed(
+        &self,
+        expanded: Result<tt::TopSubtree, ProcMacroExpansionError>,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         match expanded {
             Err(ProcMacroExpansionError::System(why)) => Err(system(format!(
                 "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
@@ -458,7 +460,11 @@ impl Kept {
 
     /// What the expansion read, when it can be kept by it: `None` when it can't be, counted
     /// by why.
-    fn keepable(&self, traced: Option<Result<Traced, String>>, asked: usize) -> Result<Option<Traced>, ProcMacroExpansionError> {
+    fn keepable(
+        &self,
+        traced: Option<Result<Traced, String>>,
+        asked: u64,
+    ) -> Result<Option<Traced>, ProcMacroExpansionError> {
         let traced = match traced {
             Some(Ok(traced)) => traced,
             Some(Err(why)) => return Err(self.error(why)),
@@ -729,14 +735,6 @@ pub fn report() -> Option<String> {
         said += &format!("; {compared}");
     }
     Some(said)
-}
-
-/// The environment a call is checked against for a warm server, for a caller that keys
-/// expansions itself.
-pub fn seen(env: &Env) -> Vec<(OsString, OsString)> {
-    let call: Vec<(String, String)> =
-        env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
-    Environment::seen(&installed().expansions.environment.passed(), &call)
 }
 
 #[cfg(test)]

@@ -685,20 +685,36 @@ pub(super) fn fold_known_branches(
     }
 }
 
-/// The value of `value`, where it is a constant through extensions and comparisons with one.
-fn known_value(func: &ir::Function, value: ir::Value) -> Option<i64> {
+/// The value of `value`, where it is a constant through extensions, sums, products, shifts
+/// and comparisons with one, as the bits of its type.
+pub(super) fn known_value(func: &ir::Function, value: ir::Value) -> Option<i64> {
     use cranelift_codegen::ir::{InstructionData, condcodes::IntCC};
     let inst = func.dfg.value_def(value).inst()?;
+    let bits = func.dfg.value_type(value).bits();
+    let wrapped = |it: i64| if bits >= 64 { it } else { it & ((1i64 << bits) - 1) };
     match func.dfg.insts[inst] {
-        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
-            let bits = func.dfg.value_type(value).bits();
-            let imm = imm.bits();
-            Some(if bits >= 64 { imm } else { imm & ((1i64 << bits) - 1) })
-        }
+        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => Some(wrapped(imm.bits())),
         InstructionData::Unary { opcode: Opcode::Uextend | Opcode::Ireduce, arg } => {
-            let bits = func.dfg.value_type(value).bits();
-            let known = known_value(func, arg)?;
-            Some(if bits >= 64 { known } else { known & ((1i64 << bits) - 1) })
+            Some(wrapped(known_value(func, arg)?))
+        }
+        InstructionData::Binary { opcode: opcode @ (Opcode::Iadd | Opcode::Imul), args: [l, r] } => {
+            let (l, r) = (known_value(func, l)?, known_value(func, r)?);
+            Some(wrapped(match opcode {
+                Opcode::Iadd => l.wrapping_add(r),
+                _ => l.wrapping_mul(r),
+            }))
+        }
+        InstructionData::BinaryImm64 {
+            opcode: opcode @ (Opcode::IaddImm | Opcode::ImulImm | Opcode::IshlImm),
+            arg,
+            imm,
+        } => {
+            let (known, imm) = (known_value(func, arg)?, imm.bits());
+            Some(wrapped(match opcode {
+                Opcode::IaddImm => known.wrapping_add(imm),
+                Opcode::ImulImm => known.wrapping_mul(imm),
+                _ => known.wrapping_shl((imm as u32) & (bits - 1)),
+            }))
         }
         InstructionData::IntCompare { opcode: Opcode::Icmp, cond, args: [l, r] } => {
             let (l, r) = (known_value(func, l)?, known_value(func, r)?);

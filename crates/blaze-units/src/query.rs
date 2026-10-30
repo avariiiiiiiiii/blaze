@@ -290,7 +290,7 @@ pub struct LockWrite {
 
 /// The standard library's units for one platform and profile, loaded from `library/` as one
 /// more workspace (`-Zbuild-std`'s graph), keyed by nothing of the view.
-/// `impl Query for StdUnits` (cargo-std, `crate::std`): key [`StdKey`], value
+/// `impl Query for StdUnits` (cargo-std, `crate::stdlib`): key [`StdKey`], value
 /// `Cbor<StdPlanned>`, kind [`kinds::STD_UNITS`].
 pub struct StdUnits;
 
@@ -344,6 +344,19 @@ pub struct StdGraph {
     pub packages: Vec<PackagePlan>,
     /// Each crate of [`StdKey::crates`] by name, with its unit's index.
     pub roots: Vec<(String, usize)>,
+}
+
+/// Registers every query of the load and of the standard library's graph.
+pub fn register(db: &mut blaze_query::Database) {
+    crate::load::register(db);
+    crate::stdlib::register(db);
+}
+
+/// A query's `blaze_query::Query::PRODUCER`: its name and a version, `"blaze v2 cargo <query>
+/// <n>"`, the number raised with every change to what the query computes, so no memo of the
+/// old code is taken for the new.
+pub const fn producer(what: &str) -> ContentId {
+    blaze_format::schema(what).0
 }
 
 /// A query key's content ID (`blaze_query::Query::input`): its deterministic CBOR under

@@ -11,7 +11,7 @@ pub struct SourceTree<'db> {}
 impl<'db> SourceTree<'db> {
     #[salsa::tracked(returns(ref))]
     pub fn all_items(self, _db: &'db dyn Db) -> Vec<Item> {
-        todo!()
+        Vec::new()
     }
 }
 

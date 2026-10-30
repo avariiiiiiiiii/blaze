@@ -32,8 +32,185 @@ const fn gear() -> [u64; 256] {
     out
 }
 
-/// Where the chunk that starts `bytes` ends.
+/// Where the chunk that starts `bytes` ends, on the fastest path this CPU has. Every path gives
+/// the cut [`cut_scalar`] gives.
 fn cut(bytes: &[u8]) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        // SAFETY: `avx512f` was just detected.
+        return unsafe { cut_avx512(bytes) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        // SAFETY: `neon` was just detected.
+        return unsafe { cut_neon(bytes) };
+    }
+    cut_scalar(bytes)
+}
+
+/// Every `cut` this CPU can run, the scalar one first, for the differential tests.
+#[cfg(test)]
+pub(crate) fn paths() -> Vec<(&'static str, fn(&[u8]) -> usize)> {
+    let mut out: Vec<(&'static str, fn(&[u8]) -> usize)> = vec![("scalar", cut_scalar)];
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512f") {
+        fn avx512(bytes: &[u8]) -> usize {
+            // SAFETY: listed only after `avx512f` was detected.
+            unsafe { cut_avx512(bytes) }
+        }
+        out.push(("avx512f", avx512));
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        fn neon(bytes: &[u8]) -> usize {
+            // SAFETY: listed only after `neon` was detected.
+            unsafe { cut_neon(bytes) }
+        }
+        out.push(("neon", neon));
+    }
+    out
+}
+
+/// The scalar loop from `at` with the hash of the bytes before it, for what the vector paths
+/// leave: the positions after the last full block of 8.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn cut_from(bytes: &[u8], mut at: usize, mut hash: u64, middle: usize, end: usize) -> usize {
+    while at < end {
+        hash = (hash << 1).wrapping_add(GEAR[bytes[at] as usize]);
+        let mask = if at < middle { MASK_SMALL } else { MASK_LARGE };
+        if hash & mask == 0 {
+            return at + 1;
+        }
+        at += 1;
+    }
+    end
+}
+
+/// [`cut_scalar`], 8 positions at a time. Over a block `p..p+8` with `g[k] = GEAR[b[p+k]]`,
+/// `h[p+k] = (h[p-1] << (k+1)) + s[k]` where `s[k] = sum over j <= k of g[j] << (k-j)`, which
+/// a log-step scan computes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn cut_avx512(bytes: &[u8]) -> usize {
+    use std::arch::x86_64::*;
+
+    if bytes.len() <= MIN {
+        return bytes.len();
+    }
+    let end = bytes.len().min(MAX);
+    let middle = end.min(AVERAGE);
+    let table: &'static [u64; 256] = &GEAR;
+    let lanes = _mm512_set_epi64(7, 6, 5, 4, 3, 2, 1, 0);
+    let shifts = _mm512_set_epi64(8, 7, 6, 5, 4, 3, 2, 1);
+    let last = _mm512_set1_epi64(7);
+    let middles = _mm512_set1_epi64(middle as i64);
+    let small = _mm512_set1_epi64(MASK_SMALL as i64);
+    let large = _mm512_set1_epi64(MASK_LARGE as i64);
+    let zero = _mm512_setzero_si512();
+    let mut previous = zero;
+    let mut at = MIN;
+    while at + 8 <= end {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        let indices = _mm512_cvtepu8_epi64(_mm_cvtsi64_si128(word as i64));
+        // SAFETY: every index is a byte, so below 256, and `table` has 256 words.
+        let gear = unsafe { _mm512_i64gather_epi64::<8>(indices, table.as_ptr().cast()) };
+        let mut scan = gear;
+        scan = _mm512_add_epi64(scan, _mm512_slli_epi64::<1>(_mm512_alignr_epi64::<7>(scan, zero)));
+        scan = _mm512_add_epi64(scan, _mm512_slli_epi64::<2>(_mm512_alignr_epi64::<6>(scan, zero)));
+        scan = _mm512_add_epi64(scan, _mm512_slli_epi64::<4>(_mm512_alignr_epi64::<4>(scan, zero)));
+        let hash = _mm512_add_epi64(_mm512_sllv_epi64(previous, shifts), scan);
+        let positions = _mm512_add_epi64(_mm512_set1_epi64(at as i64), lanes);
+        let masks =
+            _mm512_mask_blend_epi64(_mm512_cmplt_epu64_mask(positions, middles), large, small);
+        let cuts = !_mm512_test_epi64_mask(hash, masks);
+        if cuts != 0 {
+            return at + cuts.trailing_zeros() as usize + 1;
+        }
+        previous = _mm512_permutexvar_epi64(last, hash);
+        at += 8;
+    }
+    let hash = _mm_cvtsi128_si64(_mm512_castsi512_si128(previous)) as u64;
+    cut_from(bytes, at, hash, middle, end)
+}
+
+/// [`cut_avx512`] in NEON: the 8 lanes of a block as 4 pairs, and the table words loaded one at
+/// a time, as there is no gather.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn cut_neon(bytes: &[u8]) -> usize {
+    use std::arch::aarch64::*;
+
+    if bytes.len() <= MIN {
+        return bytes.len();
+    }
+    let end = bytes.len().min(MAX);
+    let middle = end.min(AVERAGE);
+    let zero = vdupq_n_u64(0);
+    let shifts = [
+        vcombine_s64(vcreate_s64(1), vcreate_s64(2)),
+        vcombine_s64(vcreate_s64(3), vcreate_s64(4)),
+        vcombine_s64(vcreate_s64(5), vcreate_s64(6)),
+        vcombine_s64(vcreate_s64(7), vcreate_s64(8)),
+    ];
+    let lanes = vcombine_u64(vcreate_u64(0), vcreate_u64(1));
+    let middles = vdupq_n_u64(middle as u64);
+    let small = vdupq_n_u64(MASK_SMALL);
+    let large = vdupq_n_u64(MASK_LARGE);
+    let mut previous = zero;
+    let mut at = MIN;
+    while at + 8 <= end {
+        let block = &bytes[at..at + 8];
+        let pair = |k: usize| (GEAR[block[k] as usize], GEAR[block[k + 1] as usize]);
+        let (g0, g1, g2, g3) = (pair(0), pair(2), pair(4), pair(6));
+        let s0 = vcombine_u64(vcreate_u64(g0.0), vcreate_u64(g0.1));
+        let s1 = vcombine_u64(vcreate_u64(g1.0), vcreate_u64(g1.1));
+        let s2 = vcombine_u64(vcreate_u64(g2.0), vcreate_u64(g2.1));
+        let s3 = vcombine_u64(vcreate_u64(g3.0), vcreate_u64(g3.1));
+
+        let (s0, s1, s2, s3) = (
+            vaddq_u64(s0, vshlq_n_u64::<1>(vextq_u64::<1>(zero, s0))),
+            vaddq_u64(s1, vshlq_n_u64::<1>(vextq_u64::<1>(s0, s1))),
+            vaddq_u64(s2, vshlq_n_u64::<1>(vextq_u64::<1>(s1, s2))),
+            vaddq_u64(s3, vshlq_n_u64::<1>(vextq_u64::<1>(s2, s3))),
+        );
+        let (s1, s2, s3) = (
+            vaddq_u64(s1, vshlq_n_u64::<2>(s0)),
+            vaddq_u64(s2, vshlq_n_u64::<2>(s1)),
+            vaddq_u64(s3, vshlq_n_u64::<2>(s2)),
+        );
+        let (s2, s3) = (vaddq_u64(s2, vshlq_n_u64::<4>(s0)), vaddq_u64(s3, vshlq_n_u64::<4>(s1)));
+
+        let hashes = [
+            vaddq_u64(vshlq_u64(previous, shifts[0]), s0),
+            vaddq_u64(vshlq_u64(previous, shifts[1]), s1),
+            vaddq_u64(vshlq_u64(previous, shifts[2]), s2),
+            vaddq_u64(vshlq_u64(previous, shifts[3]), s3),
+        ];
+        let mut cuts = [zero; 4];
+        for (n, hash) in hashes.into_iter().enumerate() {
+            let positions = vaddq_u64(vdupq_n_u64((at + 2 * n) as u64), lanes);
+            let masks = vbslq_u64(vcltq_u64(positions, middles), small, large);
+            cuts[n] = vceqzq_u64(vandq_u64(hash, masks));
+        }
+        let any = vorrq_u64(vorrq_u64(cuts[0], cuts[1]), vorrq_u64(cuts[2], cuts[3]));
+        if vmaxvq_u32(vreinterpretq_u32_u64(any)) != 0 {
+            for (n, cut) in cuts.into_iter().enumerate() {
+                if vgetq_lane_u64::<0>(cut) != 0 {
+                    return at + 2 * n + 1;
+                }
+                if vgetq_lane_u64::<1>(cut) != 0 {
+                    return at + 2 * n + 2;
+                }
+            }
+        }
+        previous = vdupq_laneq_u64::<1>(hashes[3]);
+        at += 8;
+    }
+    cut_from(bytes, at, vgetq_lane_u64::<0>(previous), middle, end)
+}
+
+/// Where the chunk that starts `bytes` ends: the reference every other path matches.
+fn cut_scalar(bytes: &[u8]) -> usize {
     if bytes.len() <= MIN {
         return bytes.len();
     }

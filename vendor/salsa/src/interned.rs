@@ -1926,14 +1926,14 @@ mod _static_assertions {
         where
             S: plumbing::serde::Serializer,
         {
-            unimplemented!()
+            unreachable!("`PERSIST` is false, so fields are never serialized")
         }
 
         fn deserialize<'de, D>(_: D) -> Result<Self::Fields<'static>, D::Error>
         where
             D: plumbing::serde::Deserializer<'de>,
         {
-            unimplemented!()
+            unreachable!("`PERSIST` is false, so fields are never deserialized")
         }
     }
 }
@@ -1961,14 +1961,14 @@ mod tests {
         where
             S: plumbing::serde::Serializer,
         {
-            unimplemented!()
+            unreachable!("`PERSIST` is false, so fields are never serialized")
         }
 
         fn deserialize<'de, D>(_deserializer: D) -> Result<Self::Fields<'static>, D::Error>
         where
             D: plumbing::serde::Deserializer<'de>,
         {
-            unimplemented!()
+            unreachable!("`PERSIST` is false, so fields are never deserialized")
         }
     }
 

@@ -8,8 +8,8 @@
 //! Every fact of the whole program that is not an import ([`Imports::constants`],
 //! [`Imports::dead`]) is about what a function's callers do, so it holds only of a function
 //! whose every caller has a summary: one with `external == false` whose address no summary
-//! takes. The driver marks a function external when something without a summary refers to
-//! it ([`called_from_outside`]): a static's value, a unit of another backend.
+//! takes. Only the build's driver knows what code without a summary reaches, and says it
+//! ([`close`]).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -91,17 +91,14 @@ impl std::fmt::Display for ImportError {
 
 impl std::error::Error for ImportError {}
 
-/// Marks as external every function of `outside`: what something without a summary refers
-/// to (a static's value, a vtable built as data, a unit of another backend), whose callers
-/// the summaries don't show.
-pub fn called_from_outside(
-    summaries: &mut BTreeMap<InstanceKey, Summary>,
-    outside: impl IntoIterator<Item = InstanceKey>,
-) {
-    for key in outside {
-        if let Some(summary) = summaries.get_mut(&key) {
-            summary.external = true;
-        }
+/// Says of every summary whether code the summaries don't show can call it: `outside` is
+/// every function an exported symbol, a patchable slot, a static's value or a unit of another
+/// backend reaches. A summary is made external ([`Summary::external`] is a fact of the build,
+/// not of the function), so a build that does not close its summaries gets no whole-program
+/// facts, never wrong ones.
+pub fn close(summaries: &mut BTreeMap<InstanceKey, Summary>, outside: &BTreeSet<InstanceKey>) {
+    for (key, summary) in summaries {
+        summary.external = outside.contains(key);
     }
 }
 
@@ -560,7 +557,8 @@ mod tests {
         caller.calls = vec![Call { callee: key(2), count: 1, args: vec![int(4)] }];
         let mut summaries = build(vec![caller, callee]);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![(0, int(4))]);
-        called_from_outside(&mut summaries, [key(2)]);
+        close(&mut summaries, &BTreeSet::from([key(2)]));
+        assert!(summaries[&key(2)].external && !summaries[&key(1)].external);
         assert_eq!(decide(&summaries, &Limits::default()).unwrap()[&key(2)].constants, vec![]);
     }
 

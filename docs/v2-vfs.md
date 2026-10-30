@@ -40,6 +40,12 @@ v2 interface; what changed from it is below.
 - A CI job's checkout is `apply(empty, writes)` of the commit's files (each with git's mode),
   opened as a view or set as a head. `empty` is the empty directory's root, always known.
 - The view arena is the one every crate uses: a `ViewId` is what `Vfs::open` gave.
+- **Readers on other threads**: `Vfs::reader` is a cloneable handle (`Send`, `Sync`) on every
+  node by content ID behind one read-write lock, which the query database reads as its
+  `blaze_query::Tree` (the impl is in blaze-query, which depends on blaze-vfs). After each
+  change the tree publishes the nodes it made, before the call that gives the new root's ID
+  returns; collection drops from it what it drops from the tree. A file's bytes are the tree's
+  own `Arc`; a directory's entries are copied once. A read takes the lock once per call.
 
 ## The journal
 

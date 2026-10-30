@@ -4718,15 +4718,9 @@ fn compile_as<'db>(
     let isa = &**target()?;
     let mut cg = Recorder::new(db, isa, selected_target()?, checked);
     let tally = backend::Tally::global();
-    /// `BLAZE_PROMOTE=0` leaves every local in its slot of the frame.
-    static PROMOTE: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("BLAZE_PROMOTE").is_none_or(|it| it != "0"));
     let mut ctx = tally.step(Step::Translate, || {
         let mut ctx = build(&mut cg, env, body, tracked, fill)?;
-        inline(&mut ctx, &cg.inlined)?;
-        if *PROMOTE {
-            promote::promote(&mut ctx.func, cg.named_slots());
-        }
+        settle(&mut ctx, &cg)?;
         Result::Ok(ctx)
     })?;
     let code = match cg.naked.take() {
@@ -4791,6 +4785,23 @@ fn compile_as<'db>(
         variables,
         layouts,
     }))
+}
+
+/// What the IR `build` gives goes through before a backend compiles it: the bodies `cg` built
+/// in put where they are called, the locals a register holds taken out of the frame, and the
+/// copies of a known small size made loads and stores, as LLVM's -O0 makes them.
+fn settle(ctx: &mut cranelift_codegen::Context, cg: &Recorder) -> Result<()> {
+    /// `BLAZE_PROMOTE=0` leaves every local in its slot of the frame.
+    static PROMOTE: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("BLAZE_PROMOTE").is_none_or(|it| it != "0"));
+    inline(ctx, &cg.inlined)?;
+    if *PROMOTE {
+        promote::promote(&mut ctx.func, cg.named_slots());
+    }
+    if copies::lower_small(&mut ctx.func) && *PROMOTE {
+        promote::promote(&mut ctx.func, cg.named_slots());
+    }
+    Ok(())
 }
 
 /// What `compile_as` gives: the code, or, for a compile at a level above 1, what LLVM makes

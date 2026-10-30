@@ -16,9 +16,13 @@ doctest = false
 [dependencies]
 blaze-protocol.workspace = true
 crossbeam-channel.workspace = true
+crossbeam-deque.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 expect-test.workspace = true

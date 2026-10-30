@@ -70,7 +70,7 @@ fn budget(bytes: u64) -> Option<Budget> {
 
 fn open(plane: &mut Plane, request: u32, weight: u32, keep_going: bool) {
     let input = PlaneInput::Open { at_ns: 0, request: RequestId(request), weight, keep_going };
-    assert_eq!(plane.step(input).unwrap(), []);
+    assert!(plane.step(input).unwrap().is_empty());
 }
 
 fn add(plane: &mut Plane, request: u32, nodes: Vec<Spec>) -> Vec<PlaneOutput> {
@@ -186,7 +186,7 @@ fn one_request(config: Config) -> Plane {
         weight: 1,
         keep_going: config.keep_going,
     };
-    assert_eq!(plane.step(input).unwrap(), []);
+    assert!(plane.step(input).unwrap().is_empty());
     plane
 }
 
@@ -200,7 +200,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
     for input in &trace.inputs {
         outputs.extend(as_machine(plane.step(as_plane(input.clone())).unwrap()));
     }
-    assert_eq!(render(&outputs), include_str!("../traces/cold-small.out"));
+    assert_eq!(render(&outputs).trim_end(), include_str!("../traces/cold-small.out").trim_end());
 
     for seed in 0..300u64 {
         let mut random = SplitMix(seed);
@@ -338,8 +338,8 @@ fn a_cancelled_request_skips_what_has_not_started_and_lets_what_runs_finish() {
         moves(&out),
         [(2, NodeState::Skipped { because: 1 }), (3, NodeState::Skipped { because: 1 })]
     );
-    assert_eq!(finished(&out), []);
-    assert_eq!(plane.cancel(6, RequestId(1)).unwrap(), []);
+    assert!(finished(&out).is_empty());
+    assert!(plane.cancel(6, RequestId(1)).unwrap().is_empty());
     assert_eq!(
         plane.step(PlaneInput::Add { at_ns: 6, request: RequestId(1), nodes: vec![work(9, &[], 1)] }),
         Err(Error::Closed)
@@ -367,7 +367,7 @@ fn a_cancel_leaves_another_request_on_the_task_it_ran() {
     add(&mut plane, 2, vec![keyed(2, &[], 1, 4)]);
     close(&mut plane, 2);
     let out = plane.cancel(1, RequestId(1)).unwrap();
-    assert_eq!(moves(&out), []);
+    assert!(moves(&out).is_empty());
     assert_eq!(plane.state(NodeId(2)), Some(&NodeState::Running));
     let out = built(&mut plane, 1);
     assert_eq!(moves(&out), [(1, NodeState::Built), (2, NodeState::Built)]);

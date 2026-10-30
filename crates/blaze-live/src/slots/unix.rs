@@ -7,6 +7,7 @@ use super::hook::FRAMES;
 use crate::patch::DESCRIPTOR;
 
 #[repr(C)]
+#[allow(dead_code)]
 struct DlInfo {
     fname: *const c_char,
     fbase: *mut c_void,

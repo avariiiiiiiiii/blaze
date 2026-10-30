@@ -21,12 +21,12 @@ use std::{
 };
 
 use blaze_cas::{Key, Kind};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
 use rayon::prelude::*;
 
 use crate::{
-    CodegenError, CompiledFunction, Instance, InstanceKey, Target, Unit,
+    CodegenError, CompiledFunction, Instance, InstanceKey, Static, Target, Unit,
     backend::{
         Address, Described, DescribedStatic, Emitted, FrontRef, Frontend, Import, Prepare, Shape,
         release_refs,
@@ -40,7 +40,7 @@ use crate::{
     query::keys,
     settings::Spec,
     summary::{Imports, Summary},
-    template::{CompiledStatic, StaticTemplate, Template},
+    template::{StaticTemplate, Template},
 };
 
 /// The store as a build reads it.
@@ -87,7 +87,7 @@ pub struct Built {
     /// By key, after dedupe.
     pub functions: Vec<CompiledFunction>,
     /// By item and instance.
-    pub statics: Vec<CompiledStatic>,
+    pub statics: Vec<Static>,
     pub roots: Vec<InstanceKey>,
     /// Functions outside code names, with their symbols.
     pub symbols: Vec<(InstanceKey, String)>,
@@ -165,7 +165,7 @@ enum Read<T> {
 #[derive(Default)]
 struct Out {
     functions: Vec<CompiledFunction>,
-    statics: Vec<CompiledStatic>,
+    statics: Vec<Static>,
     puts: Vec<Put>,
     errors: Vec<CodegenError>,
     stats: Stats,
@@ -236,7 +236,7 @@ impl Out {
         }
     }
 
-    fn finish(mut self) -> (Vec<CompiledFunction>, Vec<CompiledStatic>, Vec<Put>, Stats, Vec<CodegenError>) {
+    fn finish(mut self) -> (Vec<CompiledFunction>, Vec<Static>, Vec<Put>, Stats, Vec<CodegenError>) {
         self.puts.sort_by(|a, b| a.key.cmp(&b.key));
         self.puts.dedup_by(|a, b| a.key == b.key);
         self.errors.sort_by_key(|it| (it.unit, it.item));
@@ -345,7 +345,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                             next_statics.push(value.clone());
                         }
                     }
-                    FrontRef::Extern(_) => {}
+                    FrontRef::Extern(_) | FrontRef::Weak(_) => {}
                 }
             }
         };
@@ -410,6 +410,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                         Some(Target::Static { item, instance })
                     }
                     FrontRef::Extern(name) => Some(Target::Extern(name.clone())),
+                    FrontRef::Weak(name) => Some(Target::Weak(name.clone())),
                 })
                 .collect::<Option<Vec<_>>>()
         };
@@ -975,7 +976,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
         let mut missing = Vec::new();
         for (id, node) in statics {
-            let key = keys::static_value(&node.described.value, &node.spec.settings());
+            let key = keys::static_value(&definition(&node.described), &node.spec.settings());
             let unit = unit_of(node);
             match out.read(store, &key, &unit, |it| blob::decode_static(it).map_err(|e| e.to_string())) {
                 Read::Hit(template) => {
@@ -998,12 +999,24 @@ impl<'a, B: Prepare> Build<'a, B> {
             .collect();
         for (id, node, key, made) in compiled {
             let unit = unit_of(node);
+            let described = &node.described;
             let value = match made {
-                Ok(it) if (it.item, it.instance) == *id => it,
-                Ok(_) => {
+                Ok(it) if (it.item, it.instance) != *id => {
                     out.errors.push(error(unit.instance.key(), id.0, "compiled as another static"));
                     continue;
                 }
+                Ok(it)
+                    if (it.mutable, it.thread_local, &it.section)
+                        != (described.mutable, described.thread_local, &described.section) =>
+                {
+                    out.errors.push(error(
+                        unit.instance.key(),
+                        id.0,
+                        "compiled with another mutability, thread-locality or section than the front end described",
+                    ));
+                    continue;
+                }
+                Ok(it) => it,
                 Err(why) => {
                     out.errors.push(why);
                     continue;
@@ -1019,6 +1032,20 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
     }
+}
+
+pub const STATIC_DEFINITION_DOMAIN: &str = "blaze v2 static definition 1";
+
+/// Everything a static's compiled definition is made of besides which static it is: what
+/// its template is kept under.
+fn definition<I, S>(described: &DescribedStatic<I, S>) -> ContentId {
+    let mut hasher = Hasher::new(STATIC_DEFINITION_DOMAIN);
+    hasher.id(&described.value).update(&[described.mutable as u8, described.thread_local as u8]);
+    match &described.section {
+        Some(section) => hasher.update(&[1]).part(section.as_bytes()),
+        None => hasher.update(&[0]),
+    };
+    hasher.finish()
 }
 
 /// The memo shared by every build of a daemon.

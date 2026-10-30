@@ -192,7 +192,7 @@ impl Files {
     /// Sets the text of `file_id`, given with the blaze-vfs ID of its bytes, or that it has none
     /// (`None`), with its content ID, and returns that ID. The source roots that have the file
     /// are left to the caller.
-    pub(crate) fn write_text(
+    fn write_text(
         &self,
         db: &mut dyn SourceDatabase,
         file_id: vfs::FileId,

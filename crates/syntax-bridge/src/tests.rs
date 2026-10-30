@@ -1,7 +1,12 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use expect_test::expect;
 use rustc_hash::FxHashMap;
-use span::Span;
-use syntax::{AstNode, ast};
+use span::{Edition, Span};
+use syntax::{AstNode, SyntaxNode, ast};
 use test_utils::extract_annotations;
 use tt::{Leaf, Punct, Spacing, buffer::Cursor};
 
@@ -145,4 +150,88 @@ fn main() {
         error 11..11: illegal float literal
     "#]]
     .assert_eq(&parse.debug_dump());
+}
+
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|it| it.expect("a directory entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|it| it == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The parser's test data without errors and the `syntax` crate's own sources.
+fn corpus() -> Vec<(PathBuf, Arc<str>)> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut paths = Vec::new();
+    for dir in ["parser/test_data/parser/ok", "parser/test_data/parser/inline/ok", "syntax/src"] {
+        rust_files(&crates.join(dir), &mut paths);
+    }
+    assert!(paths.len() > 300, "the corpus is {} files", paths.len());
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            (path, Arc::from(text))
+        })
+        .collect()
+}
+
+fn token_tree(node: &SyntaxNode) -> tt::TopSubtree {
+    syntax_node_to_token_tree(node, DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe)
+}
+
+#[test]
+fn an_outline_has_the_token_trees_of_a_full_parse() {
+    for (path, text) in corpus() {
+        let path = path.display();
+        let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node();
+        let green = SyntaxNode::new_root(full.green().to_owned());
+        let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT).syntax_node();
+        let mut in_full = FxHashMap::default();
+        for node in full.descendants() {
+            in_full.entry((node.kind(), node.text_range())).or_insert(node);
+        }
+        let in_full = |node: &SyntaxNode| {
+            in_full
+                .get(&(node.kind(), node.text_range()))
+                .unwrap_or_else(|| panic!("{path}: {node:?} is not in the full parse"))
+        };
+
+        let (tree, _) = outline.flat().expect("an outline is a flat tree");
+        let lazies: Vec<u32> = tree.lazies().collect();
+        for &at in &lazies {
+            let body = outline.flat_element(at).into_node().expect("a lazy element is a node");
+            assert!(body.is_lazy(), "{path}: {body:?} was parsed before it was asked about");
+            assert_eq!(token_tree(&body), token_tree(in_full(&body)), "{path}: {body:?}");
+            assert!(tree.is_parsed(at), "{path}: {body:?}");
+            let owner = body.parent().expect("a body has an owner");
+            assert_eq!(token_tree(&owner), token_tree(in_full(&owner)), "{path}: {owner:?}");
+        }
+
+        let expected = token_tree(&full);
+        assert_eq!(token_tree(&outline), expected, "{path}");
+        assert_eq!(token_tree(&green), expected, "{path}");
+    }
+}
+
+#[test]
+fn a_lazy_body_in_a_node_is_parsed_for_its_token_tree() {
+    let text: Arc<str> = Arc::from("struct S;\nfn f() { let x = 1 + 2; g(x) }\n");
+    let outline = ast::SourceFile::parse_outline(text.clone(), Edition::CURRENT).syntax_node();
+    let (tree, _) = outline.flat().expect("an outline is a flat tree");
+    let lazies: Vec<u32> = tree.lazies().collect();
+    assert_eq!(lazies.len(), 1);
+    assert!(!tree.is_parsed(lazies[0]));
+    let full = ast::SourceFile::parse_shared(text, Edition::CURRENT).syntax_node();
+    assert_eq!(token_tree(&outline), token_tree(&full));
+    assert!(tree.is_parsed(lazies[0]));
 }

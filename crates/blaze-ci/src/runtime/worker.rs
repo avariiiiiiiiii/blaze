@@ -194,6 +194,11 @@ fn read(mut stream: UnixStream, socket: &str, to: &mpsc::Sender<Command>) {
 /// The commit's tree as a root held open on the pin connection: fetched, diffed from `from`
 /// (the empty tree for `None`), applied to `from`'s root as what-ifs; with `head`, the same
 /// ops committed to that head, which must reach the same root.
+///
+/// The what-ifs run on a connection of the checkout's own, so checkouts of many jobs apply at
+/// once; only the result goes through the pin connection, as one cheap open of a root the
+/// daemon already has. Git's lock covers only the fetch: reading objects while another fetch
+/// writes packs is safe in git.
 fn checkout(
     shared: &Shared,
     commit: &str,
@@ -201,37 +206,45 @@ fn checkout(
     from: Option<&Checkout>,
     head: Option<&str>,
 ) -> Result<ContentId, String> {
-    let token = shared
-        .github
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .token()
-        .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
-    let ops = {
-        let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner);
-        git.fetch(fetch, Some(&token)).map_err(|error| {
-            format!("fetching {} into {} failed: {error}", fetch.join(" "), git.dir.display())
-        })?;
+    let same = from.is_some_and(|from| from.commit == commit);
+    let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let ops = if same {
+        Vec::new()
+    } else {
+        let token = shared
+            .github
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .token()
+            .map_err(|error| format!("minting the installation token to fetch {commit} failed: {error}"))?;
+        {
+            let git = shared.git.lock().unwrap_or_else(PoisonError::into_inner);
+            git.fetch(fetch, Some(&token)).map_err(|error| {
+                format!("fetching {} into {} failed: {error}", fetch.join(" "), git.dir.display())
+            })?;
+        }
         git.ops(from.map(|it| it.commit.as_str()), commit).map_err(|error| {
             let from = from.map_or("the empty tree".to_owned(), |it| it.commit.clone());
             format!("diffing {from} to {commit} in {} failed: {error}", git.dir.display())
         })?
     };
+    let socket = shared.socket.display();
+    let mut client = Client::unix(&shared.socket)
+        .map_err(|error| format!("could not reach the daemon at {socket} to check out {commit}: {error}"))?;
     let base = match from {
         Some(from) => from.root,
-        None => pin(shared, ViewRef::Head(EMPTY_HEAD.to_owned()))
+        None => open(&mut client, &shared.socket, ViewRef::Head(EMPTY_HEAD.to_owned()))
             .map_err(|why| format!("opening the empty tree ({EMPTY_HEAD}) failed: {why}"))?,
     };
-    let root = apply(shared, base, &ops);
-    if from.is_none() {
-        unpin(shared, base);
-    }
-    let root = root.map_err(|why| match from {
+    let root = apply(&mut client, &shared.socket, base, &ops).map_err(|why| match from {
         Some(from) => format!("applying the diff from {} to root {:x} failed: {why}", from.commit, from.root),
         None => format!("writing the tree of {commit} failed: {why}"),
     })?;
+    // Held on the pin connection before this one ends and lets go of it.
+    let root = pin(shared, ViewRef::Root(View { root }))
+        .map_err(|why| format!("holding the tree of {commit} (root {root:x}) open failed: {why}"))?;
     if let Some(head) = head
-        && let Err(why) = commit_head(shared, head, commit, base, &ops, root)
+        && let Err(why) = commit_head(&mut client, &shared.socket, head, commit, base, &ops, root)
     {
         unpin(shared, root);
         return Err(why);
@@ -239,19 +252,21 @@ fn checkout(
     Ok(root)
 }
 
-/// `ops` applied to `base` as what-ifs, a batch at a time; the result is held once, and nothing
-/// in between is.
-fn apply(shared: &Shared, base: ContentId, ops: &[Op]) -> Result<ContentId, String> {
+/// [`pins::open`] on the checkout's connection.
+fn open(client: &mut Client, socket: &std::path::Path, view: ViewRef) -> Result<ContentId, String> {
+    pins::open(client, view).map_err(|error| format!("the daemon at {}: {error}", socket.display()))?
+}
+
+/// `ops` applied to `base` as what-ifs, a batch at a time, each result held on `client` until
+/// it ends.
+fn apply(client: &mut Client, socket: &std::path::Path, base: ContentId, ops: &[Op]) -> Result<ContentId, String> {
     let mut at = base;
-    let mut between = false;
     for batch in batches(ops, MOST_BATCH)? {
-        let view = ViewRef::WhatIf { base: Box::new(ViewRef::Root(View { root: at })), ops: batch };
-        let next = pin(shared, view);
-        if between {
-            unpin(shared, at);
+        if batch.is_empty() {
+            continue;
         }
-        at = next?;
-        between = true;
+        let view = ViewRef::WhatIf { base: Box::new(ViewRef::Root(View { root: at })), ops: batch };
+        at = open(client, socket, view)?;
     }
     Ok(at)
 }
@@ -259,16 +274,15 @@ fn apply(shared: &Shared, base: ContentId, ops: &[Op]) -> Result<ContentId, Stri
 /// Commits `ops` to `head` from `base`, a batch at a time, and checks the head reached `root`:
 /// one that was not at `base` is rebased to a tree that is not the commit's, an error.
 fn commit_head(
-    shared: &Shared,
+    client: &mut Client,
+    socket: &std::path::Path,
     head: &str,
     commit: &str,
     base: ContentId,
     ops: &[Op],
     root: ContentId,
 ) -> Result<(), String> {
-    let socket = shared.socket.display();
-    let mut client = Client::unix(&shared.socket)
-        .map_err(|error| format!("could not reach the daemon at {socket} to commit {head}: {error}"))?;
+    let socket = socket.display();
     let mut at = base;
     for batch in batches(ops, MOST_BATCH)? {
         let mut committed = None;

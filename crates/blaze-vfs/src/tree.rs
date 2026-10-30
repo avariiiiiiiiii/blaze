@@ -15,7 +15,10 @@ use std::{
 use blaze_ids::{ContentId, Hasher};
 use rustc_hash::FxHashMap;
 
-use crate::{Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError};
+use crate::{
+    Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
+    reader::{Entry as SharedEntry, Reader, Shared},
+};
 
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -83,9 +86,11 @@ pub(crate) fn parts(path: &str) -> Result<Vec<&str>, OpError> {
 pub(crate) struct Tree {
     nodes: Vec<Node>,
     by_id: FxHashMap<ContentId, NodeId>,
-    names: Vec<Box<str>>,
-    name_ids: FxHashMap<Box<str>, NameId>,
+    names: Vec<Arc<str>>,
+    name_ids: FxHashMap<Arc<str>, NameId>,
     empty: NodeId,
+    /// Nodes made since the last [`Tree::publish`].
+    fresh: Vec<NodeId>,
 }
 
 impl Tree {
@@ -96,6 +101,7 @@ impl Tree {
             names: Vec::new(),
             name_ids: FxHashMap::default(),
             empty: NodeId(0),
+            fresh: Vec::new(),
         };
         tree.empty = tree.dir(Vec::new());
         tree
@@ -144,8 +150,9 @@ impl Tree {
             return id;
         }
         let id = NameId(u32::try_from(self.names.len()).expect("fewer than 2^32 names"));
-        self.names.push(name.into());
-        self.name_ids.insert(name.into(), id);
+        let name: Arc<str> = name.into();
+        self.names.push(name.clone());
+        self.name_ids.insert(name, id);
         id
     }
 
@@ -160,7 +167,33 @@ impl Tree {
         let at = NodeId(u32::try_from(self.nodes.len()).expect("fewer than 2^32 nodes"));
         self.nodes.push(node());
         self.by_id.insert(id, at);
+        self.fresh.push(at);
         at
+    }
+
+    /// Gives `reader` the nodes made since the last publish.
+    pub(crate) fn publish(&mut self, reader: &Reader) {
+        let made = std::mem::take(&mut self.fresh)
+            .into_iter()
+            .map(|node| {
+                let shared = match &self.nodes[node.0 as usize] {
+                    Node::File { bytes, .. } => Shared::File(bytes.clone()),
+                    Node::Dir { entries, .. } => Shared::Dir(
+                        entries
+                            .iter()
+                            .map(|&(name, child, mode)| SharedEntry {
+                                name: self.names[name.0 as usize].clone(),
+                                id: self.id(child),
+                                mode,
+                                dir: self.is_dir(child),
+                            })
+                            .collect(),
+                    ),
+                };
+                (self.id(node), shared)
+            })
+            .collect();
+        reader.publish(made);
     }
 
     /// The node of a file with these bytes.
@@ -637,6 +670,13 @@ impl Tree {
         self.by_id =
             self.nodes.iter().enumerate().map(|(at, node)| (node.id(), NodeId(at as u32))).collect();
         self.empty = renumbered[self.empty.0 as usize].expect("the empty root is kept");
+        self.fresh.retain_mut(|node| match renumbered[node.0 as usize] {
+            Some(now) => {
+                *node = now;
+                true
+            }
+            None => false,
+        });
         for root in live {
             *root = renumbered[root.0 as usize].expect("a live root is kept");
         }

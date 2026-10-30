@@ -15,6 +15,8 @@ package = false
 
 [tool.uv.workspace]
 members = ["python/*"]
+# Its own project with its own lock, so torch stays out of this one.
+exclude = ["tools/similar"]
 
 [tool.uv.sources]
 typed-input = { workspace = true }
@@ -38,6 +40,7 @@ include = [
   "harness/toolchain_bump.py",
   "harness/v2",
   "python/**/*.py",
+  "tools/similar",
   "tools/v2",
 ]
 

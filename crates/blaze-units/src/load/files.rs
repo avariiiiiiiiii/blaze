@@ -992,7 +992,16 @@ impl<'r, 'db> Reader<'r, 'db> {
 
     /// `then` of the listing of the directory at `path` (normal), read once a step.
     fn dir<T>(&self, path: &str, then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T) -> Option<T> {
+        self.listing(path, true, then)
+    }
+
+    /// [`Reader::dir`], where `record` says whether a listing under no mount makes the step's
+    /// answer the error naming it: not when the caller answers without it as well as with it.
+    fn listing<T>(&self, path: &str, record: bool, then: impl FnOnce(&Found<Vec<(&'db str, bool)>>) -> T) -> Option<T> {
         if let Some(found) = self.dirs.borrow().get(path) {
+            if record && matches!(found, Found::Unmounted) {
+                self.saw_unmounted(path);
+            }
             return Some(then(found));
         }
         let kept = match &self.fixed {
@@ -1009,7 +1018,8 @@ impl<'r, 'db> Reader<'r, 'db> {
                 self.ask(|cx| Ok(cx.get::<FixedDir>(&key)?.bytes()))?
             }
         };
-        let found = self.seen(path, lent_names(kept));
+        let found = lent_names(kept);
+        let found = if record { self.seen(path, found) } else { found };
         let answer = then(&found);
         // alloc: the listing's path, once a step; its names stay the database's.
         self.dirs.borrow_mut().insert(path.to_owned(), found);
@@ -1109,7 +1119,9 @@ impl Files for Snap<'_, '_> {
         let path = normal_ref(path)?;
         if let Some((parent, name)) = path.rsplit_once('/') {
             let parent = if parent.is_empty() { "/" } else { parent };
-            let listed = self.0.dir(parent, |found| match found {
+            // The parent's listing only saves the reads below: a parent under no mount (the
+            // home directory above a known `$CARGO_HOME`) is no error of the load's.
+            let listed = self.0.listing(parent, false, |found| match found {
                 Found::Here(names) => Some(names.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| match names[at].1 {
                     true => FileKind::Dir,
                     false => FileKind::File,

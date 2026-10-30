@@ -55,7 +55,9 @@ class Input:
     crates: tuple[str, ...] = ()
     # Crates left out: deleted at integration, or not ours.
     skip: tuple[str, ...] = ("ide", "ide-assists", "ide-completion", "ide-db", "ide-diagnostics",
-                             "ide-ssr", "rust-analyzer", "test-fixture", "test-utils")
+                             "ide-ssr", "hir-ide", "rust-analyzer", "test-fixture", "test-utils",
+                             "blaze-store", "blaze-splice", "blaze-in-place", "vfs", "vfs-notify",
+                             "load-cargo", "project-model")
     model: str = "Alibaba-NLP/gte-modernbert-base"
     device: Literal["auto", "mps", "cuda", "cpu"] = "auto"
     max_tokens: int = 512

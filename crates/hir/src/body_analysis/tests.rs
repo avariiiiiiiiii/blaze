@@ -68,7 +68,10 @@ fn find<'t, N: AstNode + Typed>(
     root: view::Node<'t>,
     file: HirFileId,
     text: &str,
-) -> (N::Of<'t>, InFile<AstPtr<N>>) {
+) -> (N::Of<'t>, InFile<AstPtr<N>>)
+where
+    N::Of<'t>: Copy,
+{
     let node = root
         .descendants()
         .filter_map(<N::Of<'t> as view::AstNode<'t>>::cast)

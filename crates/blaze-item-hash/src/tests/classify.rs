@@ -11,7 +11,7 @@ use base_db::{Crate, Db, all_crates};
 use blaze_alloc_count::assert_at_most;
 use blaze_format::Aligned;
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{Fact, ItemId, facts, key};
+use blaze_items::{Fact, ItemId, auto_traits, const_value, implements, key, method};
 use hir_def::{
     AdtId, DefWithBodyId, HasModule, ImplId, ModuleDefId,
     deps::{ImageBuf, ImageStore},
@@ -267,7 +267,7 @@ fn items_facts_change_through_value() {
                 let (ItemId::Trait(t), ItemId::Adt(s)) = (named(db, "T"), named(db, "S")) else {
                     panic!("`T` and `S` are a trait and a struct")
                 };
-                items_fact(facts::implements(db, t, &adt_type(s)))
+                items_fact(implements(db, t, &adt_type(s)))
             },
         },
         Pair {
@@ -279,7 +279,7 @@ fn items_facts_change_through_value() {
                 let (ItemId::Trait(t), ItemId::Adt(s)) = (named(db, "T"), named(db, "S")) else {
                     panic!("`T` and `S` are a trait and a struct")
                 };
-                items_fact(facts::implements(db, t, &adt_type(s)))
+                items_fact(implements(db, t, &adt_type(s)))
             },
         },
         Pair {
@@ -289,7 +289,7 @@ fn items_facts_change_through_value() {
             changes: true,
             of: |db| {
                 let ItemId::Adt(s) = named(db, "S") else { panic!("`S` is a struct") };
-                items_fact(facts::method(db, &adt_type(s), &Name::new_root("m")))
+                items_fact(method(db, &adt_type(s), &Name::new_root("m")))
             },
         },
         Pair {
@@ -299,7 +299,7 @@ fn items_facts_change_through_value() {
             changes: true,
             of: |db| {
                 let ItemId::Const(c) = named(db, "C") else { panic!("`C` is a const") };
-                items_fact(facts::const_value(db, c))
+                items_fact(const_value(db, c))
             },
         },
         Pair {
@@ -309,7 +309,7 @@ fn items_facts_change_through_value() {
             changes: false,
             of: |db| {
                 let ItemId::Const(c) = named(db, "C") else { panic!("`C` is a const") };
-                items_fact(facts::const_value(db, c))
+                items_fact(const_value(db, c))
             },
         },
         Pair {
@@ -317,14 +317,14 @@ fn items_facts_change_through_value() {
             before: "pub struct P(*const u8);\npub fn f() -> impl Sized { 1u8 }",
             after: "pub struct P(*const u8);\npub fn f() -> impl Sized { P(0 as *const u8) }",
             changes: true,
-            of: |db| items_fact(facts::auto_traits(db, named(db, "f"), 0)),
+            of: |db| items_fact(auto_traits(db, named(db, "f"), 0)),
         },
         Pair {
             what: "an opaque type's hidden type changed, still Send",
             before: "pub fn f() -> impl Sized { 1u8 }",
             after: "pub fn f() -> impl Sized { 1u16 }",
             changes: false,
-            of: |db| items_fact(facts::auto_traits(db, named(db, "f"), 0)),
+            of: |db| items_fact(auto_traits(db, named(db, "f"), 0)),
         },
     ]);
 }

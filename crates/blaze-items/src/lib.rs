@@ -389,26 +389,3 @@ pub struct ScopeIndexKey {
     pub scope: Scope,
     pub name: NameHash,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn item(n: u8) -> ItemKey {
-        ItemKey(ContentId([n; 32]))
-    }
-
-    #[test]
-    fn facts_of_one_item_have_distinct_keys() {
-        let facts = [Fact::Signature(item(1)), Fact::Layout(item(1)), Fact::Code(item(1))];
-        let keys: std::collections::BTreeSet<QueryKey> = facts.iter().map(Fact::key).collect();
-        assert_eq!(keys.len(), facts.len());
-    }
-
-    #[test]
-    fn a_field_fact_names_its_field() {
-        let a = Fact::Field { ty: item(1), field: 0 }.key();
-        let b = Fact::Field { ty: item(1), field: 1 }.key();
-        assert_ne!(a, b);
-    }
-}

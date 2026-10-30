@@ -6,7 +6,7 @@ use hir_expand::fixture;
 
 use super::*;
 use crate::{
-    deps::{ImageRef, ImageStore, keys, serve, store, write_image},
+    deps::{DepImages, ImageRef, ImageStore, keys, serve, store, write_image},
     test_db::{TestDB, TestDBExt},
 };
 

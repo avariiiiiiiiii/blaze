@@ -697,7 +697,7 @@ fn an_unlabeled_jump_in_a_labeled_block_is_e0695() {
         assert_eq!(jumps("continue_crossing"), [false]);
         assert!(!outside("continue_crossing"));
         for name in ["labeled", "in_inner_loop", "in_try", "in_closure"] {
-            assert_eq!(jumps(name), [], "{name}");
+            assert_eq!(jumps(name), Vec::<bool>::new(), "{name}");
             assert!(!outside(name), "{name}");
         }
     });
@@ -1490,15 +1490,15 @@ fn a_path_that_names_nothing_reports_its_first_failing_segment() {
         assert_eq!(segments("prefix"), [0], "`page_size` is E0433");
         assert_eq!(segments("middle"), [1], "`nothere` in `a` is E0433");
         assert_eq!(segments("last"), [1], "the last segment is E0425");
-        assert_eq!(segments("found"), []);
-        assert_eq!(segments("assoc"), [], "an unknown associated item is E0599's");
-        assert_eq!(segments("other_namespace"), [], "a struct used as a value is E0423's");
+        assert_eq!(segments("found"), Vec::<u32>::new());
+        assert_eq!(segments("assoc"), Vec::<u32>::new(), "an unknown associated item is E0599's");
+        assert_eq!(segments("other_namespace"), Vec::<u32>::new(), "a struct used as a value is E0423's");
         assert_eq!(segments("literal"), [1]);
-        assert_eq!(segments("literal_found"), []);
+        assert_eq!(segments("literal_found"), Vec::<u32>::new());
         assert_eq!(segments("single_literal"), [0]);
         assert_eq!(segments("tuple_pattern"), [1]);
         assert_eq!(segments("record_pattern"), [1]);
-        assert_eq!(segments("ident"), [], "one identifier stays `UnresolvedIdent`");
+        assert_eq!(segments("ident"), Vec::<u32>::new(), "one identifier stays `UnresolvedIdent`");
         let (_, ident) = infer(&db, "ident");
         assert!(
             ident

@@ -1,6 +1,6 @@
 //! How the database reads a view's files: a [`Tree`] answers for any root, from any thread.
 
-use std::{collections::BTreeMap, ops::Bound, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_vfs::{Bytes, Corrupt, Mode};
@@ -59,11 +59,57 @@ impl Tree for blaze_vfs::Reader {
 /// IDs of the sorted list of paths, modes and file IDs (not the VFS's Merkle IDs).
 #[derive(Default)]
 pub struct MemTree {
-    roots: ShortLock<FxMap<ContentId, Arc<Files>>>,
+    roots: ShortLock<FxMap<ContentId, Arc<MemRoot>>>,
 }
 
-// BTreeMap: hashed in path order into the root's ID, and listed by prefix range.
+// BTreeMap: hashed in path order into the root's ID.
 type Files = BTreeMap<String, (ContentId, Mode, Bytes)>;
+
+/// A root's files and each of its directories' names, sorted, made with the root: a listing is
+/// lent as the VFS lends one, nothing made per read.
+struct MemRoot {
+    files: Files,
+    dirs: FxHashMap<String, Vec<(String, bool)>>,
+}
+
+impl MemRoot {
+    fn new(files: Files) -> MemRoot {
+        // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
+        let mut dirs: FxHashMap<String, Vec<(String, bool)>> = FxHashMap::default();
+        dirs.insert(String::new(), Vec::new()); // alloc: see above
+        for path in files.keys() {
+            let (mut parent, mut from) = (0, 0);
+            loop {
+                let listing = dirs.entry(path[..parent].to_owned()).or_default(); // alloc: see above
+                match path[from..].find('/') {
+                    Some(at) => {
+                        listing.push((path[from..from + at].to_owned(), true)); // alloc: see above
+                        parent = from + at;
+                        from = parent + 1;
+                    }
+                    None => {
+                        listing.push((path[from..].to_owned(), false)); // alloc: see above
+                        break;
+                    }
+                }
+            }
+        }
+        for names in dirs.values_mut() {
+            // A name that is a directory under one path and a file at another is a directory.
+            names.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            names.dedup_by(|later, first| later.0 == first.0);
+        }
+        MemRoot { files, dirs }
+    }
+
+    /// The names in the directory at `path`, sorted; `None` for none or a file.
+    fn names(&self, path: &str) -> Option<&[(String, bool)]> {
+        if self.files.contains_key(path) {
+            return None;
+        }
+        self.dirs.get(path).map(Vec::as_slice)
+    }
+}
 
 pub const MEM_ROOT_DOMAIN: &str = "blaze v2 db memory root 2";
 
@@ -89,51 +135,30 @@ impl MemTree {
             hasher.part(path.as_bytes()).update(&mode.git().to_le_bytes()).id(id);
         }
         let root = hasher.finish();
-        self.roots.lock().insert(root, Arc::new(files)); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
+        self.roots.lock().insert(root, Arc::new(MemRoot::new(files))); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         root
     }
 
-    fn files(&self, root: ContentId) -> Option<Arc<Files>> {
+    fn files(&self, root: ContentId) -> Option<Arc<MemRoot>> {
         self.roots.lock().get(&root).cloned()
     }
 
     /// The names in the directory at `path` under `root`, sorted, each with whether it is a
     /// directory; `None` for none or a file.
+    #[cfg(test)]
     fn names(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        let files = self.files(root)?;
-        if files.contains_key(path) {
-            return None;
-        }
-        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") }; // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-        let mut names: FxHashMap<String, bool> = FxHashMap::default();
-        let under = files.range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded));
-        for (name, _) in under {
-            let Some(rest) = name.strip_prefix(&prefix) else { break };
-            match rest.split_once('/') {
-                Some((dir, _)) => {
-                    names.insert(dir.to_owned(), true); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-                }
-                None => {
-                    names.entry(rest.to_owned()).or_insert(false); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-                }
-            }
-        }
-        if names.is_empty() && !path.is_empty() {
-            return None;
-        }
-        let mut names: Vec<(String, bool)> = names.into_iter().collect(); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
-        names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        Some(names)
+        self.files(root)?.names(path).map(<[_]>::to_vec)
     }
 }
 
 impl Tree for MemTree {
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
-        Ok(self.files(root).and_then(|files| files.get(path).cloned()))
+        Ok(self.files(root).and_then(|it| it.files.get(path).cloned()))
     }
 
     fn read_dir(&self, root: ContentId, path: &str, read: &mut dyn FnMut(Names<'_, '_>)) -> bool { // dyn: see `Tree::read_dir`
-        let Some(names) = self.names(root, path) else { return false };
+        let Some(files) = self.files(root) else { return false };
+        let Some(names) = files.names(path) else { return false };
         read(&mut names.iter().map(|(name, dir)| (name.as_str(), *dir)));
         true
     }

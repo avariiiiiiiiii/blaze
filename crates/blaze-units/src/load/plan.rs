@@ -432,6 +432,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
                 checked_as_test: unit.checked_as_test,
                 metadata: meta.metadata(),
                 extra_filename: meta.extra_filename(),
+                unit_id: meta.unit_id(),
                 cfgs: Vec::new(),
                 check_cfg: Vec::new(),
                 rustflags: Vec::new(),
@@ -508,6 +509,7 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             checked_as_test: unit.checked_as_test,
             metadata: meta.metadata(),
             extra_filename: meta.extra_filename(),
+            unit_id: meta.unit_id(),
             cfgs: flags::cfgs(&unit.profile.rustflags, &unit.features, &info.rustflags),
             check_cfg,
             rustflags,
@@ -552,7 +554,7 @@ fn meta_of<F: Files>(
         None => {
             let plan = input.std_plans[at].as_ref().expect("a unit planned elsewhere has its plan");
             let what = format!("the standard library's unit of `{}`", unit.pkg_id);
-            Meta::read(&plan.metadata, &plan.extra_filename, &what)?
+            Meta::read(&plan.metadata, &plan.unit_id, &plan.extra_filename, &what)?
         }
         Some(it) => {
             let mut dep_metas = Vec::with_capacity(deps.of(at).len());

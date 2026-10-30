@@ -61,9 +61,9 @@ use crate::{
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
         sub_namespace_match,
         trait_items::trait_item_per_ns,
-        uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use},
+        uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use as NameUse},
     },
-    per_ns::{Item, PerNs},
+    per_ns::{Item, Namespace, PerNs},
     tt,
     visibility::{RawVisibility, Visibility, VisibilityExplicitness},
 };
@@ -2897,7 +2897,7 @@ impl<'db> DefCollector<'db> {
             };
             let shadow = BuiltinShadowMode::Module;
             def_map.path_uses(q, module_id, &import.path, shadow, None, ns, true, &mut found);
-            uses.extend(found.drain(..).filter(|it: &Use| it.import != own));
+            uses.extend(found.drain(..).filter(|it: &NameUse| it.import != own));
             if kind == ImportKind::Glob
                 && !import.source.is_prelude
                 && let Some(ModuleDefId::ModuleId(target)) = status.namespaces().take_types()

@@ -187,7 +187,7 @@ impl Sources {
                 Found::Absent => return Ok(Err(anyhow!("config.json not found"))),
                 Found::Unmounted => {
                     return Ok(Ok(Located::Needs(Fetch {
-                        what: format!("{} config.json", from.display_index()),
+                        what: from.display_index(),
                         url: format!("{base}config.json"),
                         kind: FetchKind::IndexFile,
                         at: config_path,
@@ -267,7 +267,7 @@ impl Sources {
                     Found::Absent => IndexFile::Absent,
                     Found::Unmounted if self.offline.is_some() => IndexFile::Absent,
                     Found::Unmounted => IndexFile::Needs(Fetch {
-                        what: format!("{} file of `{name}`", from.display_index()),
+                        what: from.display_index(),
                         url: format!("{base}{relative}"),
                         kind: FetchKind::IndexFile,
                         at,

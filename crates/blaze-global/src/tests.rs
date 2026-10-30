@@ -213,10 +213,10 @@ impl World {
     /// Puts `bytes` in the cache's store as `publisher` signed it.
     fn seed(&mut self, key: Key, kind: Kind, bytes: &[u8]) -> Signed {
         let signed = publisher(1).sign(Record::of(key, kind, bytes));
-        let cache = self.cache();
-        cache.store.put(key, kind, bytes.to_vec()).unwrap();
-        cache.store.put(record_key(&key), Kind::Query, signed.encode().to_vec()).unwrap();
-        cache.store.flush(&mut self.effects);
+        let store = &mut self.cache.as_mut().expect("a world with the cache's server").store;
+        store.put(key, kind, bytes.to_vec()).unwrap();
+        store.put(record_key(&key), Kind::Query, signed.encode().to_vec()).unwrap();
+        store.flush(&mut self.effects);
         self.run();
         signed
     }
@@ -904,8 +904,8 @@ fn a_manifest_no_pinned_key_signed_is_refused_and_nothing_is_fetched() {
 
 #[test]
 fn a_value_a_manifest_lists_is_checked_against_its_listed_record() {
-    let values = values();
-    let listed = manifest(&values);
+    let served = values();
+    let listed = manifest(&served);
     let id = listed.id;
     let mut world = World::raw(25, move |path, body| {
         let mut out = Vec::new();
@@ -918,7 +918,7 @@ fn a_value_a_manifest_lists_is_checked_against_its_listed_record() {
             let items: Vec<(Key, Item)> = keys
                 .iter()
                 .map(|key| {
-                    let (_, kind, bytes) = values.iter().find(|it| it.0 == *key).unwrap();
+                    let (_, kind, bytes) = served.iter().find(|it| it.0 == *key).unwrap();
                     let mut other = bytes.clone();
                     other.push(1);
                     let signed = signed_by(1, *key, *kind, &other);

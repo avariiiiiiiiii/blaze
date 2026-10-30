@@ -60,7 +60,7 @@ fn body_named(db: &Db, name: &str) -> DefWithBodyId {
         .into_iter()
         .find_map(|def| match def {
             hir::ModuleDef::Function(it) if it.name(db).as_str() == name => {
-                Some(DefWithBodyId::FunctionId(it.into()))
+                Some(DefWithBodyId::FunctionId(it.try_into().expect("a function of the source")))
             }
             _ => None,
         })

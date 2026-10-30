@@ -1,6 +1,7 @@
 //! The facts: what an edit changes and what it keeps.
 
 use blaze_ids::ContentId;
+use blaze_query::QueryKey;
 use hir_def::{
     AdtId, DefWithBodyId, ModuleId, TraitId, expr_store::Body, hir::Expr, nameres::crate_def_map,
 };
@@ -12,7 +13,7 @@ use hir_expand::fixture;
 
 use super::{TestDB, edit, item, single};
 use crate::{
-    Fact, ItemId, ScopeEntry, ScopeIndexKey, captures, code, const_value, const_value_of_static,
+    Fact, ItemId, ItemKey, ScopeEntry, ScopeIndexKey, captures, code, const_value, const_value_of_static,
     discriminant, drop_check, hidden_types, implements, item_key, key, method, name, scope,
     signature, value, vtable,
 };
@@ -249,7 +250,7 @@ const C: u32 = 3;
     assert_ne!(val(&db, fact), before);
 }
 
-fn closure(db: &TestDB, path: &str) -> InternedClosureId<'_> {
+fn closure<'db>(db: &'db TestDB, path: &str) -> InternedClosureId<'db> {
     let ItemId::Function(func) = item(db, path) else { panic!("`{path}` is no fn") };
     let owner = DefWithBodyId::from(func);
     let found: Vec<_> = Body::of(db, owner)
@@ -484,4 +485,22 @@ fn batched_name_hashes_are_the_single_ones() {
     let names = ["", "a", "self", "r#type", "über", long.as_str()];
     let single: Vec<_> = names.iter().map(|it| key::name_hash(it)).collect();
     assert_eq!(crate::index::name_hashes(names.iter().copied()), single);
+}
+
+fn key_of(n: u8) -> ItemKey {
+    ItemKey(ContentId([n; 32]))
+}
+
+#[test]
+fn facts_of_one_item_have_distinct_keys() {
+    let facts = [Fact::Signature(key_of(1)), Fact::Layout(key_of(1)), Fact::Code(key_of(1))];
+    let keys: std::collections::BTreeSet<QueryKey> = facts.iter().map(Fact::key).collect();
+    assert_eq!(keys.len(), facts.len());
+}
+
+#[test]
+fn a_field_fact_names_its_field() {
+    let a = Fact::Field { ty: key_of(1), field: 0 }.key();
+    let b = Fact::Field { ty: key_of(1), field: 1 }.key();
+    assert_ne!(a, b);
 }

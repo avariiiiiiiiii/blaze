@@ -677,6 +677,11 @@ fn merge_std(
         for dep in &mut unit.dependencies {
             dep.index += offset;
         }
+        // The library was planned with `--target` its platform's triple: its target units are
+        // of the build's `platform` (none for the host's), its build scripts the host's.
+        if unit.platform.is_some() {
+            unit.platform.clone_from(platform);
+        }
         graph.units.push(unit);
     }
     plans.reserve(std.plans.len());

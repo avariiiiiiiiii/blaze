@@ -66,8 +66,8 @@ fn a_stub_hands_every_value_to_the_dispatcher_with_its_id_and_frame() {
     let func = stub(7, &sig, CallConv::SystemV).unwrap();
     verified(&func);
     assert_eq!(func.signature, sig);
-    assert_eq!(count(&func, Opcode::StackStore), 3, "vmctx too");
-    assert_eq!(count(&func, Opcode::StackLoad), 4);
+    assert_eq!(count(&func, Opcode::Store), 3, "vmctx too");
+    assert_eq!(count(&func, Opcode::Load), 4);
     assert_eq!(count(&func, Opcode::GetFramePointer), 1);
     let slot = func.sized_stack_slots.values().next().unwrap();
     assert_eq!(slot.size, 4 * SLOT, "as many slots as the wider side");

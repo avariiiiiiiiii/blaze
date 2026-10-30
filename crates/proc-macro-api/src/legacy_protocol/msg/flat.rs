@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn a_nested_tree_reads_back_as_written() {
-        let span = |start| Span {
+        let span = |start: u32| Span {
             range: TextRange::empty(start.into()),
             anchor: SpanAnchor {
                 file_id: span::EditionedFileId::new(

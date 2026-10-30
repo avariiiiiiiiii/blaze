@@ -1356,8 +1356,12 @@ mod tests {
     #[test]
     fn a_comment_leaves_the_canonical_form() {
         let one = "[package]\nname = \"a\" # the name\nversion = \"0.1.0\"\n";
-        let two = "# a comment\n[package]\nversion = \"0.1.0\"\nname    = \"a\"\n";
+        let two = "# a comment\n[package]\nname    = \"a\"\n\nversion = \"0.1.0\"\n";
         assert_eq!(canonical_toml(one.as_bytes()), canonical_toml(two.as_bytes()));
+        // A table keeps the file's order (`package.metadata`'s is `cargo metadata`'s), so
+        // keys moved are another form.
+        let moved = "[package]\nversion = \"0.1.0\"\nname = \"a\"\n";
+        assert_ne!(canonical_toml(one.as_bytes()), canonical_toml(moved.as_bytes()));
         assert_eq!(canonical_toml(b"[package"), None);
     }
 }

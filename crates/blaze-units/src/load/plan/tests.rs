@@ -181,17 +181,20 @@ fn config(cwd: &Path, env: &[(&str, &str)], cli: &[&str]) -> Config<Disk> {
 #[test]
 fn rustflags_precedence() {
     let dir = Scratch::new("rustflags");
-    let cli = ["build.rustflags=['-Cconfig']", "target-applies-to-host=true"];
+    let cli = ["build.rustflags=['-Clink-arg=config']", "target-applies-to-host=true"];
     let rustflags = |env: &[(&str, &str)], target: Option<&str>, kind: Option<&str>| {
         flags::kind_info(&config(&dir.0, env, &cli), HOST, target, kind).unwrap().rustflags
     };
-    assert_eq!(rustflags(&[], None, None), ["-Cconfig"]);
-    assert_eq!(rustflags(&[("RUSTFLAGS", "-Cenv  -Cmore")], None, None), ["-Cenv", "-Cmore"]);
-    let both = [("RUSTFLAGS", "-Cenv"), ("CARGO_ENCODED_RUSTFLAGS", "-Ca b\x1f-Cc")];
-    assert_eq!(rustflags(&both, None, None), ["-Ca b", "-Cc"]);
-    assert_eq!(rustflags(&[], Some(TARGET), Some(TARGET)), ["-Cconfig"]);
+    assert_eq!(rustflags(&[], None, None), ["-Clink-arg=config"]);
+    assert_eq!(
+        rustflags(&[("RUSTFLAGS", "-Clink-arg=env  -Clink-arg=more")], None, None),
+        ["-Clink-arg=env", "-Clink-arg=more"]
+    );
+    let both = [("RUSTFLAGS", "-Clink-arg=env"), ("CARGO_ENCODED_RUSTFLAGS", "-Clink-arg=a b\x1f-Clink-arg=c")];
+    assert_eq!(rustflags(&both, None, None), ["-Clink-arg=a b", "-Clink-arg=c"]);
+    assert_eq!(rustflags(&[], Some(TARGET), Some(TARGET)), ["-Clink-arg=config"]);
     assert!(rustflags(&[], Some(TARGET), None).is_empty());
-    assert!(rustflags(&[("RUSTFLAGS", "-Cenv")], Some(TARGET), None).is_empty());
+    assert!(rustflags(&[("RUSTFLAGS", "-Clink-arg=env")], Some(TARGET), None).is_empty());
 }
 
 // A `[target.'cfg(..)']` rustflag that only matches with a cfg the rustflags give: cargo's
@@ -199,9 +202,9 @@ fn rustflags_precedence() {
 #[test]
 fn rustflags_of_target_cfg() {
     let dir = Scratch::new("target-cfg");
-    let cli = ["build.rustflags=['--cfg=blaze']", "target.'cfg(blaze)'.rustflags=['-Cmatched']"];
+    let cli = ["build.rustflags=['--cfg=blaze']", "target.'cfg(blaze)'.rustflags=['-Clink-arg=matched']"];
     let info = flags::kind_info(&config(&dir.0, &[], &cli), HOST, None, None).unwrap();
-    assert_eq!(info.rustflags, ["-Cmatched"]);
+    assert_eq!(info.rustflags, ["-Clink-arg=matched"]);
     assert!(!info.cfg_lines.iter().any(|it| it == "blaze"));
 }
 
@@ -599,7 +602,13 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     let units = app_units(target);
     let std_plans = vec![None; units.len()];
     let config = config();
-    let base_profile = BaseProfile { root: ProfileRoot::Debug, ..BaseProfile::default() };
+    // cargo's `default_dev`, as far as the `Finished` line reads it.
+    let base_profile = BaseProfile {
+        name: "dev".to_owned(),
+        root: ProfileRoot::Debug,
+        debuginfo: blaze_manifest::profiles::DebugInfo::Resolved(cargo_util_schemas::manifest::TomlDebugInfo::Full),
+        ..BaseProfile::default()
+    };
     let target_dir = ws.join("target");
     let unsandboxed: FxHashSet<&str> = ["app"].into_iter().collect();
     let input = PlanInput {
@@ -777,8 +786,13 @@ fn refusals() {
     assert_eq!(hash::HashedProfile::of(&unit.profile).unwrap().trim_paths, hash::TrimPaths::All);
     unit.profile.panic = "sideways".to_owned();
     assert!(hash::HashedProfile::of(&unit.profile).is_err());
-    assert!(hash::Meta::read("0123", "-0123456789abcdef", "std").is_err());
-    assert!(hash::Meta::read(H, "", "std").is_err());
-    let meta = hash::Meta::read(H, &format!("-{H}"), "std").unwrap();
+    assert!(hash::Meta::read("0123", H, "", "std").is_err());
+    assert!(hash::Meta::read(H, "", "", "std").is_err());
+    let other = "fedcba9876543210";
+    assert!(hash::Meta::read(H, H, &format!("-{other}"), "std").is_err());
+    let meta = hash::Meta::read(H, H, &format!("-{H}"), "std").unwrap();
     assert_eq!((meta.metadata(), meta.extra_filename()), (H.to_owned(), format!("-{H}")));
+    // A build script's unit has no extra filename; its unit id is still read.
+    let script = hash::Meta::read(H, other, "", "std").unwrap();
+    assert_eq!((script.unit_id(), script.extra_filename()), (other.to_owned(), String::new()));
 }

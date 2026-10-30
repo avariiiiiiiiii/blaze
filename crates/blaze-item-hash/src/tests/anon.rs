@@ -16,7 +16,7 @@ use hir_ty::{
 };
 
 use super::perturb::{body, db, with_dep};
-use crate::{identity::identity, keys, presentation};
+use crate::{identity::identity, keys, presentation::presentation};
 
 /// The identity and presentation hash of the body of the function `name`.
 #[track_caller]

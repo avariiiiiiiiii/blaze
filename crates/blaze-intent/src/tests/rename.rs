@@ -258,10 +258,10 @@ fn renaming_an_associated_fn_and_then_editing_names_the_view_as_it_was() {
 #[test]
 fn a_rename_stops_at_what_it_cant_place_or_do() {
     let (db, files) = view(GRAPH, &PATHS);
-    let error = apply(&db, &files, &[rename("shapes.rs", "area", "fn")]).unwrap_err();
+    let error = apply(&db, &files, &[rename("shapes.rs", "area", "fn")]).err().expect("the edits are refused");
     assert!(error.what.contains("is no identifier"), "{error:?}");
     let edit = Edit::AddItem { file: "lib.rs".to_owned(), into: None, text: "fn x() {}".to_owned() };
-    let error = apply(&db, &files, &[edit, rename("shapes.rs", "area", "surface")]).unwrap_err();
+    let error = apply(&db, &files, &[edit, rename("shapes.rs", "area", "surface")]).err().expect("the edits are refused");
     assert!(error.what.contains("renames come first"), "{error:?}");
 
     let fixture = r#"
@@ -271,7 +271,7 @@ pub fn area() -> u32 { 1 }
 pub fn both() -> u32 { twice!() }
 "#;
     let (db, files) = view(fixture, &["lib.rs"]);
-    let error = apply(&db, &files, &[rename("lib.rs", "area", "surface")]).unwrap_err();
+    let error = apply(&db, &files, &[rename("lib.rs", "area", "surface")]).err().expect("the edits are refused");
     assert!(error.what.contains("lib.rs:1: in tokens no macro expanded"), "{error:?}");
 
     let fixture = r#"
@@ -282,7 +282,7 @@ impl Shape for S { fn area(&self) -> u32 { 1 } }
 fn total(s: &S) -> u32 { s.area() }
 "#;
     let (db, files) = view(fixture, &["lib.rs"]);
-    let error = apply(&db, &files, &[rename("lib.rs", "<S as Shape>::area", "size")]).unwrap_err();
+    let error = apply(&db, &files, &[rename("lib.rs", "<S as Shape>::area", "size")]).err().expect("the edits are refused");
     assert!(error.what.contains("rename it in the trait"), "{error:?}");
     let made = apply(&db, &files, &[rename("lib.rs", "Shape::area", "size")]).unwrap();
     let mut after = texts(&files);

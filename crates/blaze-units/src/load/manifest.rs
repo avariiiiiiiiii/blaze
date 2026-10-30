@@ -23,7 +23,7 @@ use crate::query::{Cbor, LoadError, Versioned, producer};
 /// A manifest as its [`ManifestQuery`] parsed it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub(crate) enum Parsed {
-    Here(TomlManifest),
+    Here(#[serde(with = "in_order")] TomlManifest),
     Absent,
     /// Under no mount of the view.
     Unmounted,
@@ -32,7 +32,71 @@ pub(crate) enum Parsed {
 }
 
 impl Versioned for Parsed {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest parsed 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo manifest parsed 2");
+}
+
+/// A manifest kept with every table in the file's order. The deterministic encoding sorts a
+/// map's keys, but `package.metadata` and `workspace.metadata` keep the file's order (as
+/// `cargo metadata` prints them), so each table is kept as the list of its entries.
+mod in_order {
+    use cargo_util_schemas::manifest::TomlManifest;
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use toml::Value;
+
+    #[derive(Serialize, Deserialize)]
+    enum Kept {
+        String(String),
+        Integer(i64),
+        /// The float's bits, so every one (a NaN's sign, `-0.0`) reads back as it was.
+        Float(u64),
+        Boolean(bool),
+        Datetime(String),
+        Array(Vec<Kept>),
+        Table(Vec<(String, Kept)>),
+    }
+
+    fn kept(value: Value) -> Kept {
+        match value {
+            Value::String(it) => Kept::String(it),
+            Value::Integer(it) => Kept::Integer(it),
+            Value::Float(it) => Kept::Float(it.to_bits()),
+            Value::Boolean(it) => Kept::Boolean(it),
+            Value::Datetime(it) => Kept::Datetime(it.to_string()),
+            Value::Array(it) => Kept::Array(it.into_iter().map(kept).collect()),
+            Value::Table(it) => Kept::Table(it.into_iter().map(|(key, value)| (key, kept(value))).collect()),
+        }
+    }
+
+    fn value(kept: Kept) -> Result<Value, String> {
+        Ok(match kept {
+            Kept::String(it) => Value::String(it),
+            Kept::Integer(it) => Value::Integer(it),
+            Kept::Float(it) => Value::Float(f64::from_bits(it)),
+            Kept::Boolean(it) => Value::Boolean(it),
+            Kept::Datetime(it) => Value::Datetime(it.parse().map_err(|e| format!("the kept datetime `{it}`: {e}"))?),
+            Kept::Array(it) => Value::Array(it.into_iter().map(value).collect::<Result<_, _>>()?),
+            Kept::Table(it) => {
+                let mut table = toml::Table::with_capacity(it.len());
+                for (key, kept) in it {
+                    if table.insert(key.clone(), value(kept)?).is_some() {
+                        return Err(format!("the kept table has the key `{key}` twice"));
+                    }
+                }
+                Value::Table(table)
+            }
+        })
+    }
+
+    pub fn serialize<S: Serializer>(manifest: &TomlManifest, to: S) -> Result<S::Ok, S::Error> {
+        kept(Value::try_from(manifest).map_err(S::Error::custom)?).serialize(to)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<TomlManifest, D::Error> {
+        let value = value(Kept::deserialize(from)?).map_err(D::Error::custom)?;
+        value.try_into().map_err(D::Error::custom)
+    }
 }
 
 /// A manifest by absolute path, read with a configuration's mounts, parsed as blaze-manifest's
@@ -43,7 +107,7 @@ pub(crate) struct ManifestQuery;
 impl Query for ManifestQuery {
     const KIND: QueryKind = QueryKind(0x6016);
     const NAME: &'static str = "cargo manifest";
-    const PRODUCER: ContentId = producer("blaze v2 cargo manifest 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo manifest 3");
     type Key = PathKey;
     type Value = Cbor<Parsed>;
 

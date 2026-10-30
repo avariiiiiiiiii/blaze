@@ -102,7 +102,7 @@ fn a_shadowed_primitive_type_is_resolved() {
 }
 
 /// The owners of the attributes of [`generic_items`]`(8)`.
-fn with_owners<R>(check: impl FnOnce(&Cx<'_, '_>, &[Owner<'_>]) -> R) -> R {
+fn with_owners<R>(check: impl for<'db> FnOnce(&Cx<'_, 'db>, &[Owner<'db>]) -> R) -> R {
     with_cx(&generic_items(8), |cx| {
         let owners = owners(cx, cx.walk());
         assert!(owners.iter().map(|it| it.attrs.len()).sum::<usize>() >= 32, "the fixture has attributes");

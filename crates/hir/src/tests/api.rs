@@ -252,8 +252,8 @@ fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
         assert_eq!(at("bad", false), Some(SignatureMismatchAt::Param(0)), "`Text` is no stream");
         assert_eq!(at("not_safe", false), Some(SignatureMismatchAt::Signature));
         let bad = func(&db, "bad").proc_macro_signature_mismatch(&db, false).unwrap();
-        let shown = |sig: crate::FnSignature<'_>| {
-            let params = sig.params(&db);
+        let shown = |sig| {
+            let params = crate::FnSignature::params(&sig, &db);
             show(&db, &params[0], target(&db, func(&db, "bad")))
         };
         assert_eq!((shown(bad.expected), shown(bad.found)), ("TokenStream".into(), "Text".into()));

@@ -460,7 +460,8 @@ mod tests {
         let platform: blaze_resolve::Platform = "cfg(unix)".parse().unwrap();
         let mut path_dep = dep("helper", "*", DepKind::Normal);
         path_dep.path = Some(PathBuf::from("/w/m/../helper"));
-        let mut registry_dep = dep("serde_json", "^1.0", DepKind::Development);
+        // Optional, so a normal dependency: cargo refuses an optional dev-dependency.
+        let mut registry_dep = dep("serde_json", "^1.0", DepKind::Normal);
         registry_dep.rename = Some("json");
         registry_dep.optional = true;
         registry_dep.uses_default_features = false;
@@ -513,7 +514,7 @@ mod tests {
         let deps = read.summary.dependencies();
         let [helper, json, cc] = deps else { panic!("{} dependencies", deps.len()) };
         assert!(helper.source_id().is_path());
-        assert_eq!((json.name_in_toml().as_str(), json.kind()), ("json", DepKind::Development));
+        assert_eq!((json.name_in_toml().as_str(), json.kind()), ("json", DepKind::Normal));
         assert!(json.is_optional() && !json.uses_default_features() && json.platform() == Some(&platform));
         assert_eq!(json.features().iter().map(|it| it.as_str()).collect::<Vec<_>>(), ["serde"]);
         assert!(json.source_id().is_registry());

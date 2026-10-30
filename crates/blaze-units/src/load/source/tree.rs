@@ -11,7 +11,6 @@ use blaze_resolve::PackageId;
 use rustc_hash::FxHashSet;
 use semver::Version;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::load::files::{Found, normal_text as normalize, read_dir, read_file};
 
@@ -155,7 +154,7 @@ fn read_nested(
         Some(toml::Value::String(it)) => Version::parse(it).ok(),
         Some(toml::Value::Table(it)) if it.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
             workspace.as_ref().and_then(|(_, table)| {
-                let version = table.get("package")?.get("version")?.as_str()?;
+                let version = table.get("workspace")?.get("package")?.get("version")?.as_str()?;
                 Version::parse(version).ok()
             })
         }
@@ -417,7 +416,7 @@ fn verify(cx: &mut Cx<'_>, package: &Vendored) -> Result<anyhow::Result<()>, Can
             return Ok(Err(anyhow!("No such file or directory (os error 2)")
                 .context(format!("failed to calculate checksum of: {path}"))));
         };
-        let actual: String = Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
+        let actual: String = blaze_sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect();
         if &actual != expected {
             return Ok(Err(anyhow!(
                 "the listed checksum of `{path}` has changed:\nexpected: {expected}\nactual:   \

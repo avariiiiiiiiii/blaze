@@ -265,12 +265,13 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 4");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 5");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Fetch {
-    /// What it is, as cargo's `Downloaded serde v1.0.219` names it.
+    /// What it is, as cargo's `Downloaded serde v1.0.219` and `Updating crates.io index` name
+    /// it: every file of one index is the index, which cargo reports updating once.
     pub what: String,
     pub url: String,
     pub kind: FetchKind,
@@ -324,7 +325,7 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 5");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 6");
 }
 
 /// What cargo passes and writes for one unit.
@@ -335,6 +336,10 @@ pub struct UnitPlan {
     /// cargo's `-C metadata` and `-C extra-filename` (`-0123456789abcdef`, or "").
     pub metadata: String,
     pub extra_filename: String,
+    /// cargo's `Metadata::unit_id`, 16 hex digits: what dependents hash, and what names the
+    /// unit's `-C extra-filename` and package directory when it has them (a build script's
+    /// has no extra filename, so this is the only place a plan read back finds it).
+    pub unit_id: String,
     /// The `--cfg`s cargo passes (`feature="x"`, those of the rustflags) and `--check-cfg`s.
     pub cfgs: Vec<String>,
     pub check_cfg: Vec<String>,
@@ -475,7 +480,7 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 4");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 5");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on

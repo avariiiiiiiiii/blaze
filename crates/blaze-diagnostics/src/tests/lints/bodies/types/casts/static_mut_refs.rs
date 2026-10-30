@@ -1,7 +1,8 @@
 //! `static_mut_refs`: rustc's `tests/ui/lint/static-mut-refs*.rs` and the UI tests of
 //! `tests/ui/statics/` that give it.
 
-use super::{Mode, Ui, ui};
+use super::{Ui, ui};
+use crate::tests::Mode;
 
 #[test]
 fn static_mut_shared_parens() {

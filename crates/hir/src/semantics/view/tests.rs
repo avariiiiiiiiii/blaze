@@ -179,8 +179,8 @@ fn types_and_resolutions_of_every_node() {
                 }
                 if let Some(v) = view::Path::cast(node) {
                     line("resolve_path", &vsema.resolve_path(v));
-                    let per_ns = |it: crate::PathResolutionPerNs<'_>| (it.type_ns, it.value_ns, it.macro_ns);
-                    line("resolve_path_per_ns", &vsema.resolve_path_per_ns(v).map(per_ns));
+                    let per_ns = vsema.resolve_path_per_ns(v).map(|it| (it.type_ns, it.value_ns, it.macro_ns));
+                    line("resolve_path_per_ns", &per_ns);
                     let scope = vsema.scope(v.syntax()).expect("a path has a scope");
                     line("speculative_resolve_view", &scope.speculative_resolve_view(v));
                     paths += 1;

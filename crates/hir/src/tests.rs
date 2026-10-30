@@ -22,7 +22,7 @@ use hir_ty::{
     db::HirDatabase,
     infer::persist::InferenceRecord,
     next_solver::{
-        DbInterner, GenericArgs, ParamEnv, Ty, TypingMode,
+        DbInterner, GenericArg, GenericArgs, ParamEnv, Ty, TypingMode,
         infer::{DbInternerInferExt, select::EvaluationResult},
         persist::{TyTableReader, TyTableWriter},
     },
@@ -558,7 +558,7 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
         let (a, b, c) = (adt("A"), adt("B"), adt("C"));
         let interner = DbInterner::new_with(&db, krate);
         let leaf = |adt| Ty::new_adt(interner, adt, GenericArgs::empty());
-        let wrap = |ty: Ty<'_>| Ty::new_adt(interner, b, GenericArgs::new_from_slice(&[ty.into()]));
+        let wrap = |ty| Ty::new_adt(interner, b, GenericArgs::new_from_slice(&[GenericArg::from(ty)]));
         let goals = [
             (leaf(a), true),
             (leaf(c), false),

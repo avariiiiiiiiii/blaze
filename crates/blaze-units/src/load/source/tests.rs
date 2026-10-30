@@ -237,7 +237,7 @@ fn a_lock_file_without_checksums_takes_the_index_s() {
     assert_eq!(
         needs(locate(&[], vec![], &serde)),
         Fetch {
-            what: "crates.io index file of `serde`".to_owned(),
+            what: "crates.io index".to_owned(),
             url: "https://index.crates.io/se/rd/serde".to_owned(),
             kind: FetchKind::IndexFile,
             at: index_file.clone(),
@@ -362,7 +362,7 @@ fn the_resolver_reads_the_index_files_mounted_and_asks_for_the_rest() {
     assert_eq!(
         none.needs,
         [Fetch {
-            what: "crates.io index file of `serde`".to_owned(),
+            what: "crates.io index".to_owned(),
             url: "https://index.crates.io/se/rd/serde".to_owned(),
             kind: FetchKind::IndexFile,
             at: index_file.clone(),

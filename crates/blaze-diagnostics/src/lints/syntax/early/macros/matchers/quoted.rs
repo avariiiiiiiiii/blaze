@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn a_specifier_is_read_in_its_edition() {
         let file = SourceFile::parse("macro_rules! m { ($p:pat $e:expr) => {}; }", Edition::Edition2018);
-        let (tokens, m, rules) = rules(&file, Edition::Edition2018);
-        let tts = lhs_tts(&m, &rules[0]);
+        let (tokens, m, read) = rules(&file, Edition::Edition2018);
+        let tts = lhs_tts(&m, &read[0]);
         let kinds: Vec<_> = tts
             .iter()
             .map(|it| match it {

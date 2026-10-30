@@ -62,6 +62,7 @@ fn plan(extra: &str, outputs: &[&str]) -> UnitPlan {
         checked_as_test: false,
         metadata: extra.trim_start_matches('-').to_owned(),
         extra_filename: extra.to_owned(),
+        unit_id: format!("{:0>16}", extra.trim_start_matches('-')),
         cfgs: Vec::new(),
         check_cfg: Vec::new(),
         rustflags: Vec::new(),

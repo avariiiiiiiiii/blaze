@@ -11,7 +11,8 @@ use hir_ty::{
     next_solver::{BoundVariableKind, DbInterner, Symbol, Ty},
 };
 use rustc_type_ir::{
-    BoundRegionKind, BoundVarIndexKind, RegionKind, TyKind, UintTy, inherent::IntoKind as _,
+    Binder, BoundRegionKind, BoundVarIndexKind, RegionKind, TraitRef, TyKind, UintTy,
+    inherent::IntoKind as _,
 };
 use hir_expand::fixture;
 
@@ -315,7 +316,7 @@ type U = unsafe<'a, 'b> &'a &'b u8;
             })
             .collect();
         assert_eq!(names, ["a", "b"]);
-        let var = |ty: Ty<'_>| match ty.kind() {
+        let var = |ty| match Ty::kind(ty) {
             TyKind::Ref(region, inner, _) => match region.kind() {
                 RegionKind::ReBound(BoundVarIndexKind::Bound(binder), it) => {
                     ((binder.as_u32(), it.var.as_u32()), inner)
@@ -474,12 +475,12 @@ trait G where Self: D + E {}
             let (_, ModuleDefId::TraitId(trait_)) = type_item(&db, name) else {
                 panic!("`{name}` is a trait")
             };
+            let identity = Binder::dummy(TraitRef::identity(interner, trait_.into()));
             let mut elaborated: Vec<_> =
-                rustc_type_ir::elaborate::supertrait_def_ids(interner, trait_.into())
-                    .map(|it| it.0)
-                    .collect();
+                rustc_type_ir::elaborate::supertraits(interner, identity).map(|it| it.def_id().0).collect();
             let mut memo = hir_ty::all_super_traits(&db, trait_).to_vec();
             elaborated.sort();
+            elaborated.dedup();
             memo.sort();
             assert_eq!(elaborated, memo, "`{name}`");
         }

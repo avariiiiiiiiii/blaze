@@ -268,7 +268,7 @@ fn checked_with(
 
 fn stderr(db: &Db, names: &HashMap<FileId, String>, root: &str, diags: &[Diag]) -> String {
     let sources = Sources::of(
-        names.iter().map(|(file, name)| (Files::relative(name, root).to_owned(), db.file_text(*file).text(db).to_owned())),
+        names.iter().map(|(file, name)| (Files::relative(name, root).to_owned(), db.file_text(*file).text(db).as_str().to_owned())),
     );
     diags.iter().map(|it| crate::emit::written(it, &sources, Style::default())).collect()
 }

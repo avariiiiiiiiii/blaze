@@ -30,7 +30,8 @@ fn package(name: &str, extra: &str) -> String {
     format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[lib]\ntest = false\nbench = false\n\n{extra}")
 }
 
-/// A standard library of eight crates, laid out and locked as library/ is (cargo-std's).
+/// A standard library of eight crates, laid out and locked as library/ is (cargo-std's), with
+/// compiler_builtins' build script.
 pub(crate) fn library(tree: &MemTree) -> ContentId {
     let manifest = "cargo-features = [\"profile-rustflags\"]\n\n[workspace]\nresolver = \"1\"\nmembers = [\"std\", \"sysroot\"]\n\n\
                     [profile.dev.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n\n\
@@ -76,6 +77,7 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
         ("core/src/lib.rs", lib),
         ("compiler-builtins/compiler-builtins/Cargo.toml", builtins.as_bytes()),
         ("compiler-builtins/compiler-builtins/src/lib.rs", lib),
+        ("compiler-builtins/compiler-builtins/build.rs", b"fn main() {}\n".as_slice()),
         ("alloc/Cargo.toml", alloc.as_bytes()),
         ("alloc/src/lib.rs", lib),
         ("panic_abort/Cargo.toml", panic_abort.as_bytes()),
@@ -254,12 +256,29 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     assert!(units.plans[bin_at].outputs.iter().any(|it| it == "/home/u/ws/target/debug/a"), "{:?}", units.plans[bin_at]);
     assert!(bin.dependencies.iter().any(|it| it.index == lib_at && it.extern_crate_name == "a"));
 
-    // cargo's `attach_std_deps`: every unit but a build script's run gets std, as
-    // `noprelude`, `public` and `nounused`.
-    let std = bin.dependencies.iter().find(|it| units.graph.units[it.index].is_std).expect("std");
-    assert_eq!(std.extern_crate_name, "std");
-    assert_eq!((std.public, std.noprelude, std.nounused), (Some(true), Some(true), Some(true)));
-    assert!(units.graph.units.iter().filter(|it| it.is_std).all(|it| it.platform.is_none()));
+    // cargo's `attach_std_deps`: every unit but a build script's run gets each of the
+    // library's roots, as `noprelude`, `public` and `nounused`.
+    let std_deps: Vec<_> = bin.dependencies.iter().filter(|it| units.graph.units[it.index].is_std).collect();
+    let names: Vec<&str> = std_deps.iter().map(|it| it.extern_crate_name.as_str()).collect();
+    assert_eq!(names, ["alloc", "compiler_builtins", "core", "panic_unwind", "proc_macro", "std"]);
+    assert!(std_deps.iter().all(|it| (it.public, it.noprelude, it.nounused) == (Some(true), Some(true), Some(true))));
+    let std_platforms: Vec<_> = units.graph.units.iter().filter(|it| it.is_std).map(|it| (&it.target.name, it.mode, &it.platform)).collect();
+    assert!(std_platforms.iter().all(|(_, _, it)| it.is_none()), "{std_platforms:?}");
+
+    // compiler_builtins' build script has no `-C extra-filename` (cargo's new build-dir
+    // layout), yet its plan names its unit id, which its run's and its library's hashes take.
+    let script_at = units
+        .graph
+        .units
+        .iter()
+        .position(|it| it.is_std && it.target.is_custom_build() && it.mode == Mode::Build)
+        .expect("compiler_builtins' build script");
+    let script = &units.plans[script_at];
+    assert_eq!(script.extra_filename, "", "{script:?}");
+    assert_eq!(script.unit_id.len(), 16, "{script:?}");
+    for plan in &units.plans {
+        assert!(plan.extra_filename.is_empty() || plan.extra_filename == format!("-{}", plan.unit_id), "{plan:?}");
+    }
 }
 
 #[test]
@@ -755,6 +774,12 @@ fn a_warm_load_allocates_nothing() {
     assert!(blaze_alloc_count::assert_at_most(0, "the plan found", || pinned.get::<Plan>(view, &()).is_ok()));
     drop(pinned);
 
+    let again = fixture.open(&ask(&files));
+    let pinned = fixture.db.pin();
+    eprintln!("DEBUG measuring");
+    let (_, used) = blaze_alloc_count::measure(|| pinned.get::<Plan>(again, &()).is_ok());
+    eprintln!("DEBUG second view {used:?}");
+    drop(pinned);
     let again = fixture.open(&ask(&files));
     let pinned = fixture.db.pin();
     assert!(blaze_alloc_count::assert_at_most(0, "an unchanged plan verified", || pinned.get::<Plan>(again, &()).is_ok()));

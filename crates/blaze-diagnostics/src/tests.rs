@@ -36,7 +36,7 @@ impl Checked {
     /// The sources of the fixture's files, by the names diagnostics give them.
     pub(crate) fn sources(&self) -> Sources {
         let files = self.names.iter().map(|(file, name)| {
-            (name.clone(), self.db.file_text(*file).text(&self.db).to_owned())
+            (name.clone(), self.db.file_text(*file).text(&self.db).as_str().to_owned())
         });
         Sources::of(files)
     }

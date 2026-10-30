@@ -650,9 +650,18 @@ mod tests {
     use super::*;
 
     /// The library of `proc-macro-test-impl` blaze linked for these tests, by
-    /// `proc-macro-libraries` in this package's manifest.
+    /// `proc-macro-libraries` in this package's manifest. That is a blaze extension, so a build
+    /// that doesn't set the variable (cargo) compiles these tests but they stop here.
     fn library() -> paths::Utf8PathBuf {
-        env!("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL").into()
+        match option_env!("BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL") {
+            Some(path) => path.into(),
+            None => panic!(
+                "BLAZE_PROC_MACRO_LIBRARY_PROC_MACRO_TEST_IMPL was not set when compiling \
+                 proc-macro-srv-cli's tests: only blaze links `proc-macro-test-impl` as a library \
+                 (`[package.metadata.blaze] proc-macro-libraries` in crates/proc-macro-srv-cli/Cargo.toml); \
+                 run them with `blaze test -p proc-macro-srv-cli`"
+            ),
+        }
     }
 
     fn span(start: u32) -> Span {

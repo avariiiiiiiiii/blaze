@@ -461,19 +461,24 @@ pub(super) struct Meta {
 }
 
 impl Meta {
-    /// A plan made elsewhere (the standard library's), read back.
-    pub fn read(metadata: &str, extra_filename: &str, what: &str) -> Result<Meta, LoadError> {
+    /// A plan made elsewhere (the standard library's), read back. Only its hashes are read:
+    /// `pkg_dir` names a directory of the plan's own, which nothing here makes.
+    pub fn read(metadata: &str, unit_id: &str, extra_filename: &str, what: &str) -> Result<Meta, LoadError> {
         let hex = |text: &str| {
             u64::from_str_radix(text, 16)
                 .ok()
                 .filter(|_| text.len() == 16)
                 .ok_or_else(|| error(format!("{what}'s hash `{text}` is not 16 hex digits")))
         };
-        let unit_id = match extra_filename.strip_prefix('-') {
-            Some(it) => hex(it)?,
-            None => return Err(error(format!("{what} has no `-C extra-filename`, so its unit id is unknown"))),
-        };
-        Ok(Meta { unit_id, c_metadata: hex(metadata)?, c_extra_filename: true, pkg_dir: true })
+        let meta = Meta { unit_id: hex(unit_id)?, c_metadata: hex(metadata)?, c_extra_filename: !extra_filename.is_empty(), pkg_dir: true };
+        if meta.extra_filename() != extra_filename {
+            return Err(error(format!("{what}'s `-C extra-filename` `{extra_filename}` is not of its unit id `{unit_id}`")));
+        }
+        Ok(meta)
+    }
+
+    pub fn unit_id(&self) -> String {
+        format!("{:016x}", self.unit_id)
     }
 
     pub fn metadata(&self) -> String {

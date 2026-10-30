@@ -86,7 +86,7 @@ fn a_key_index_refuses_a_key_naming_two_things() {
     index_of(&[(key, 1), (key, 2)]);
 }
 
-fn hashes(n: u8) -> ItemHashes {
+fn row_hashes(n: u8) -> ItemHashes {
     ItemHashes {
         kind: ItemKind::Struct,
         interface: InterfaceHash(ContentId([n; 32])),
@@ -101,7 +101,7 @@ fn hash_columns_answer_as_a_map_of_their_rows() {
     let all = keys(300, 17, PREFIX);
     let (hashed, unhashable) = all.split_at(290);
     let mut rows: Vec<(ItemKey, ItemHashes)> =
-        hashed.iter().enumerate().map(|(n, &key)| (key, hashes(n as u8))).collect();
+        hashed.iter().enumerate().map(|(n, &key)| (key, row_hashes(n as u8))).collect();
     let model: HashMap<ItemKey, ItemHashes> = rows.iter().copied().collect();
     let item = items(&single("struct S;").0)[0];
     let mut missing: Vec<(ItemKey, Unhashable)> =

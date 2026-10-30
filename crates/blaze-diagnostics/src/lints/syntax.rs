@@ -599,7 +599,7 @@ mod tests {
     use super::*;
 
     /// `check` given the walk of the first workspace crate of `fixture`.
-    fn walked(fixture: &str, check: impl FnOnce(&Cx<'_, '_>, &Walk<'_>)) {
+    fn walked(fixture: &str, check: impl for<'db> FnOnce(&Cx<'_, 'db>, &Walk<'db>)) {
         let checked = crate::tests::checked(fixture);
         let db = &checked.db;
         hir::attach_db(db, || {

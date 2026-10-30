@@ -35,6 +35,12 @@ fn opcodes(func: &ir::Function) -> Vec<Opcode> {
     func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).map(|i| func.dfg.insts[i].opcode()).collect()
 }
 
+/// Whether `inst` adds a constant, as `iadd_imm` builds it: an `iadd` of an `iconst`.
+fn adds_a_constant(func: &ir::Function, inst: ir::Inst) -> bool {
+    func.dfg.insts[inst].opcode() == Opcode::Iadd
+        && func.dfg.value_def(func.dfg.inst_args(inst)[1]).inst().is_some_and(|it| func.dfg.insts[it].opcode() == Opcode::Iconst)
+}
+
 fn code(_: u32, _: Use) -> Result<Name, Stop> {
     Ok(Name::Code)
 }
@@ -77,8 +83,8 @@ fn every_access_goes_through_a_chain_of_its_own_at_offset_zero() {
         assert_eq!(func.dfg.insts[low].opcode(), Opcode::Ireduce);
     }
     assert_eq!(seen, 3);
-    let ops = opcodes(&func);
-    assert_eq!(ops.iter().filter(|&&it| it == Opcode::IaddImm).count(), 2, "the two offsets, one each");
+    let insts: Vec<ir::Inst> = func.layout.blocks().flat_map(|b| func.layout.block_insts(b)).collect();
+    assert_eq!(insts.iter().filter(|&&it| adds_a_constant(&func, it)).count(), 2, "the two offsets, one each");
     assert_eq!(func.signature.params.last().unwrap().purpose, ArgumentPurpose::VMContext);
 }
 
@@ -205,7 +211,7 @@ fn a_struct_parameter_is_copied_to_the_shadow_frame_and_used_there() {
     let guest = confined_operand(&func, arg);
     assert_ne!(guest, incoming, "the body reads the frame's copy");
     let frame = func.dfg.value_def(guest).unwrap_inst();
-    assert_eq!(func.dfg.insts[frame].opcode(), Opcode::IaddImm, "the copy's place in the frame");
+    assert!(adds_a_constant(&func, frame), "the copy's place in the frame");
 }
 
 #[test]

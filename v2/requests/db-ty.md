@@ -25,7 +25,8 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
 - `blaze check` (`errors_of`, `crates/blaze-engine/src/lib.rs` around line 6615): check through
   `hir::check::check_crate(db, krate, style_lints, Some(&asked))` for each of
   `hir::check::workspace_crates(db)` (or `check_workspace`), and render the `AnyDiagnostic`s
-  with ide-diagnostics' handlers, in place of `semantic_diagnostics_of_bodies` per file. It
+  as cargo prints them (ide-diagnostics' handlers do it today; with no IDE, whatever replaces
+  them), in place of `semantic_diagnostics_of_bodies` per file. It
   never asks for a dependency's bodies (#1293); `crates/hir/src/tests.rs`
   `check_infers_only_workspace_bodies` holds it to that. ide-diagnostics would need a `pub fn`
   that renders a `Vec<AnyDiagnostic>` (its `match` over `AnyDiagnostic` at line ~489).
@@ -46,8 +47,9 @@ Why: `InferenceResult::for_body`/`for_anon_const` are now free tracked fns `infe
 
 ## 5. Link (live patch)
 
-Before committing a speculative patch, call `hir_ty_borrowck::Pending::finish(db)` on another
-thread with its own database handle (a clone), and roll the patch back on `Err(Refused)`; the
+Before committing a speculative patch, run `hir_ty_borrowck::Pending::finish(db)` as a plane
+task beside the patch, sharing the database by reference (docs/v2/decisions.md: no per-thread
+handles), and roll the patch back on `Err(Refused)`; the
 `Refused` names the body and the errors to report.
 
 ## 6. Items lane and `crates/rustc_abi` (from child db-ty-hashmir, `v2/requests/db-ty-hashmir.md`)

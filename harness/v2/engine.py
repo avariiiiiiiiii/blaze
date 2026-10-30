@@ -130,7 +130,7 @@ class Work:
 
 @dataclass(frozen=True)
 class Table:
-    """One of the daemon's long-lived tables (docs/v2/README.md section 17): how many elements
+    """One of the daemon's long-lived tables (docs/v2/plan/data.md): how many elements
     it holds and the bytes of all its columns and side tables together."""
 
     elements: int
@@ -306,7 +306,7 @@ class Engine(ABC):
     @abstractmethod
     def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
         """The daemon's tables for `ws` by name (`token`, `syntax-node`, `hir-expr`,
-        `mir-statement`, `memo`, `memo-edge`, `relocation`), for section 17's size budgets."""
+        `mir-statement`, `memo`, `memo-edge`, `relocation`), for docs/v2/plan/data.md's size budgets."""
 
     @abstractmethod
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:

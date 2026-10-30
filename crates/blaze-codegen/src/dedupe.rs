@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use blaze_ids::ContentId;
 
-use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, content::code_id};
+use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, Unwind, content::code_id};
 
 /// What became of a build's functions.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -26,23 +26,48 @@ fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey>) -> Insta
     kept.get(key).copied().unwrap_or(*key)
 }
 
+fn rename_target(
+    target: &Target,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
+) -> Target {
+    match target {
+        Target::Function(key) => Target::Function(renamed(key, kept)),
+        Target::Direct(key) => Target::Direct(renamed(key, kept)),
+        Target::Data(id) => Target::Data(data.get(id).copied().unwrap_or(*id)),
+        other => other.clone(),
+    }
+}
+
 fn rename_relocs(
     relocs: &[Reloc],
     kept: &HashMap<InstanceKey, InstanceKey>,
     data: &HashMap<ContentId, ContentId>,
 ) -> Vec<Reloc> {
-    relocs
-        .iter()
-        .map(|reloc| {
-            let target = match &reloc.target {
-                Target::Function(key) => Target::Function(renamed(key, kept)),
-                Target::Direct(key) => Target::Direct(renamed(key, kept)),
-                Target::Data(id) => Target::Data(data.get(id).copied().unwrap_or(*id)),
-                other => other.clone(),
-            };
-            Reloc { target, ..reloc.clone() }
-        })
-        .collect()
+    relocs.iter().map(|reloc| Reloc { target: rename_target(&reloc.target, kept, data), ..reloc.clone() }).collect()
+}
+
+fn rename_unwind(
+    unwind: &Unwind,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
+) -> Unwind {
+    let routine = |it: &Option<Target>| it.as_ref().map(|it| rename_target(it, kept, data));
+    let area = |it: &Option<ContentId>| it.map(|id| data.get(&id).copied().unwrap_or(id));
+    match unwind {
+        Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => Unwind::Dwarf {
+            code_align: *code_align,
+            data_align: *data_align,
+            return_address: *return_address,
+            cie: cie.clone(),
+            fde: fde.clone(),
+            personality: routine(personality),
+            lsda: area(lsda),
+        },
+        Unwind::Windows { info, handler, lsda } => {
+            Unwind::Windows { info: info.clone(), handler: routine(handler), lsda: area(lsda) }
+        }
+    }
 }
 
 /// `function` with what it calls renamed by `kept`, its data's IDs made again; `None` when
@@ -51,13 +76,16 @@ fn rename(
     function: &CompiledFunction,
     kept: &HashMap<InstanceKey, InstanceKey>,
 ) -> Option<CompiledFunction> {
-    let names_one = |relocs: &[Reloc]| {
-        relocs.iter().any(|it| match &it.target {
-            Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
-            _ => false,
-        })
+    let names = |target: &Target| match target {
+        Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
+        _ => false,
     };
-    if !names_one(&function.relocs) && !function.data.iter().any(|it| names_one(&it.relocs)) {
+    let names_one = |relocs: &[Reloc]| relocs.iter().any(|it| names(&it.target));
+    let routine_named = match &function.unwind {
+        Some(Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. }) => names(it),
+        _ => false,
+    };
+    if !names_one(&function.relocs) && !function.data.iter().any(|it| names_one(&it.relocs)) && !routine_named {
         return None;
     }
     let mut ids = HashMap::new();
@@ -69,6 +97,7 @@ fn rename(
     }
     Some(CompiledFunction {
         relocs: rename_relocs(&function.relocs, kept, &ids),
+        unwind: function.unwind.as_ref().map(|it| rename_unwind(it, kept, &ids)),
         data,
         ..function.clone()
     })
@@ -140,7 +169,37 @@ mod tests {
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
+            unwind: None,
+            lines: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_lsda_follows_its_data_and_a_personality_its_function() {
+        // 2 and 3 are equal; 9's personality is 3 and its LSDA points at 3.
+        let lsda = |to: u8| {
+            Data::new(4, vec![0; 4], vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }])
+        };
+        let mut caller = function(9, 0x55, &[]);
+        let area = lsda(3);
+        caller.unwind = Some(Unwind::Dwarf {
+            code_align: 1,
+            data_align: -8,
+            return_address: 16,
+            cie: Vec::new(),
+            fde: Vec::new(),
+            personality: Some(Target::Direct(key(3))),
+            lsda: Some(area.id),
+        });
+        caller.data.push(area);
+        let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
+        dedupe(&mut functions, &|it| *it != key(9));
+        let caller = functions.iter().find(|it| it.key == key(9)).unwrap();
+        assert!(matches!(
+            &caller.unwind,
+            Some(Unwind::Dwarf { personality: Some(Target::Direct(it)), lsda: Some(id), .. })
+                if *it == key(2) && *id == lsda(2).id
+        ));
     }
 
     #[test]

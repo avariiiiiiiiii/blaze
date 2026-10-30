@@ -99,6 +99,61 @@ fn another_schema_is_refused_before_its_body_is_read() {
 }
 
 #[test]
+fn another_schema_whose_body_reads_as_this_ones_is_refused_too() {
+    let item = blaze_protocol::cbor::to_vec(&Envelope { schema: SCHEMA + 1, id: 8, body: Request::Status })
+        .unwrap();
+    let refused = decode::<Request>(&item).unwrap_err();
+    assert_eq!(refused.id, Some(8));
+    assert!(refused.error.what.starts_with(&format!("schema {}", SCHEMA + 1)), "{refused:?}");
+}
+
+#[test]
+fn an_item_in_place_is_the_item() {
+    let mut frames = Frames::new();
+    frames.push(&encode(&Envelope::new(2, Request::Status)).unwrap());
+    frames.push(&encode(&Envelope::new(3, Request::Status)).unwrap());
+    assert_eq!(frames.next_ref().unwrap(), Some(&item(2, Request::Status)[..]));
+    assert_eq!(frames.next_ref().unwrap(), Some(&item(3, Request::Status)[..]));
+    assert_eq!(frames.next_ref().unwrap(), None);
+}
+
+#[test]
+fn reads_grow_only_as_fast_as_a_frame_arrives() {
+    let least = 64 << 10;
+    let mut frames = Frames::new();
+    assert_eq!(frames.wanted(least), least);
+    frames.push(&(10u32 << 20).to_be_bytes());
+    assert_eq!(frames.wanted(least), least, "a head alone grows nothing");
+    let mut held = 4;
+    let mut reads = 0;
+    while held < 4 + (10 << 20) {
+        let wanted = frames.wanted(least);
+        assert!(wanted <= held.max(least), "{wanted} asked with {held} here");
+        let here = wanted.min(4 + (10 << 20) - held);
+        frames.push(&vec![0; here]);
+        held += here;
+        reads += 1;
+    }
+    assert!(reads < 16, "{reads} reads for 10 MiB");
+    assert_eq!(frames.next().unwrap().map(|it| it.len()), Some(10 << 20));
+    assert_eq!(frames.wanted(least), least);
+}
+
+#[test]
+fn a_fill_reads_straight_into_the_frames() {
+    let frame = encode(&Envelope::new(4, Request::Status)).unwrap();
+    let mut from = &frame[..];
+    let mut frames = Frames::new();
+    assert_eq!(frames.fill(&mut from, 3).unwrap(), 3);
+    assert_eq!(frames.next().unwrap(), None);
+    assert_eq!(frames.held(), 3);
+    assert_eq!(frames.fill(&mut from, 1 << 16).unwrap(), frame.len() - 3);
+    assert_eq!(frames.next().unwrap(), Some(item(4, Request::Status)));
+    assert_eq!(frames.fill(&mut from, 1 << 16).unwrap(), 0);
+    assert_eq!(frames.held(), 0);
+}
+
+#[test]
 fn non_deterministic_cbor_is_refused_naming_the_offence() {
     let mut item = item(5, Request::Status);
     // The id 5 as `18 05`, a longer head than it needs.

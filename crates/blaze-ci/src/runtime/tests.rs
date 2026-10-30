@@ -8,7 +8,7 @@ use std::{
 
 use blaze_api::http;
 use blaze_ids::ContentId;
-use blaze_vfs::Op;
+use blaze_vfs::{Mode, Op};
 
 use super::{
     Post, batches, listen, load, post, save,
@@ -28,7 +28,7 @@ fn temp(name: &str) -> std::path::PathBuf {
 
 fn cost(op: &Op) -> usize {
     match op {
-        Op::Write { path, bytes } | Op::Edit { path, bytes, .. } => path.len() + bytes.len() + super::OP_OVERHEAD,
+        Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => path.len() + bytes.len() + super::OP_OVERHEAD,
         Op::Delete { path } => path.len() + super::OP_OVERHEAD,
         Op::Rename { from, to } => from.len() + to.len() + super::OP_OVERHEAD,
     }
@@ -38,7 +38,7 @@ fn cost(op: &Op) -> usize {
 fn no_ops_are_one_empty_batch_and_small_ops_one_batch() {
     assert_eq!(batches(&[], 1000).unwrap(), vec![Vec::<Op>::new()]);
     let ops = vec![
-        Op::Write { path: "a".to_owned(), bytes: vec![1; 10] },
+        Op::Write { path: "a".to_owned(), bytes: vec![1; 10], mode: Mode::Regular },
         Op::Delete { path: "b".to_owned() },
         Op::Rename { from: "c".to_owned(), to: "d".to_owned() },
     ];
@@ -47,7 +47,7 @@ fn no_ops_are_one_empty_batch_and_small_ops_one_batch() {
 
 #[test]
 fn batches_stay_under_the_bound_and_keep_the_order() {
-    let ops: Vec<Op> = (0..50).map(|n| Op::Write { path: format!("f{n:02}"), bytes: vec![n; 100] }).collect();
+    let ops: Vec<Op> = (0..50).map(|n| Op::Write { path: format!("f{n:02}"), bytes: vec![n; 100], mode: Mode::Regular }).collect();
     let cut = batches(&ops, 500).unwrap();
     assert!(cut.len() > 1);
     for batch in &cut {
@@ -62,8 +62,8 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
     let bytes: Vec<u8> = (0..2500u32).map(|n| n as u8).collect();
     let ops = vec![
         Op::Delete { path: "gone".to_owned() },
-        Op::Write { path: "big".to_owned(), bytes: bytes.clone() },
-        Op::Write { path: "small".to_owned(), bytes: vec![7] },
+        Op::Write { path: "big".to_owned(), bytes: bytes.clone(), mode: Mode::Executable },
+        Op::Write { path: "small".to_owned(), bytes: vec![7], mode: Mode::Regular },
     ];
     let cut = batches(&ops, 1000).unwrap();
     let flat = cut.concat();
@@ -71,8 +71,9 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
     let mut rebuilt = Vec::new();
     for op in &flat[1..flat.len() - 1] {
         match op {
-            Op::Write { path, bytes } => {
+            Op::Write { path, bytes, mode } => {
                 assert_eq!(path, "big");
+                assert_eq!(*mode, Mode::Executable);
                 assert!(rebuilt.is_empty());
                 rebuilt.extend_from_slice(bytes);
             }
@@ -85,7 +86,7 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
         }
     }
     assert_eq!(rebuilt, bytes);
-    assert_eq!(flat.last(), Some(&Op::Write { path: "small".to_owned(), bytes: vec![7] }));
+    assert_eq!(flat.last(), Some(&Op::Write { path: "small".to_owned(), bytes: vec![7], mode: Mode::Regular }));
     for batch in &cut {
         assert!(batch.iter().map(cost).sum::<usize>() <= 1000, "{batch:?}");
     }
@@ -93,7 +94,7 @@ fn a_file_too_large_for_one_request_is_written_then_appended() {
 
 #[test]
 fn a_path_longer_than_a_request_is_refused_naming_it() {
-    let ops = vec![Op::Write { path: "p".repeat(2000), bytes: vec![0; 10] }];
+    let ops = vec![Op::Write { path: "p".repeat(2000), bytes: vec![0; 10], mode: Mode::Regular }];
     assert!(batches(&ops, 1000).unwrap_err().contains("ppp"));
 }
 

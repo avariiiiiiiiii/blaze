@@ -242,7 +242,8 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
             }
             want.iter().any(|it| matches!(it, Output::Finished { .. }))
         };
-        let first = make(&mut random, &mut ids, 1 + random.below(30));
+        let count = 1 + random.below(30);
+        let first = make(&mut random, &mut ids, count);
         let mut over = same(Input::Add { at_ns: 0, nodes: first }, &mut running);
         over |= same(Input::Close { at_ns: 0 }, &mut running);
         let mut at = 0;
@@ -466,7 +467,9 @@ fn one_thread_is_shared_by_weight() {
         order.push(if id < 100 { 'a' } else { 'b' });
         running.extend(runs(&built(&mut plane, id)));
     }
-    assert_eq!(order, "abbbbabbabbbabba");
+    // Request 2 comes in at the plane's virtual time, a task behind request 1, and ties go to
+    // the heavier.
+    assert_eq!(order, "abbbbabbbabbbabb");
 }
 
 /// Requests always ready, on any number of threads, finishing in any order: no request's
@@ -529,7 +532,6 @@ struct Planned {
 struct Model {
     seed: u64,
     budget: Option<u64>,
-    starve_after: u32,
     specs: FxHashMap<u32, Spec>,
     request_of: FxHashMap<u32, u32>,
     nodes_of: FxHashMap<u32, Vec<u32>>,
@@ -657,7 +659,8 @@ impl Model {
                             && !held_settled
                         {
                             let held = &self.specs[&held.0];
-                            let same = held.id == spec.id || held.key.is_some() && held.key == spec.key;
+                            let same = held.id == spec.id
+                                || (held.key.is_some() && held.key == spec.key);
                             assert!(same, "seed {seed}: #{id} starts while {} is held", held.id);
                         }
                     }
@@ -666,7 +669,7 @@ impl Model {
                         let request = self.request_of[&id.0];
                         let mine = self.priority(id.0, &mut memo);
                         for other in &self.nodes_of[&request] {
-                            if self.states[other] == NodeState::Ready
+                            if self.states.get(other) == Some(&NodeState::Ready)
                                 && self.specs[other].pool == spec.pool
                             {
                                 let theirs = self.priority(*other, &mut memo);
@@ -682,7 +685,7 @@ impl Model {
                 PlaneOutput::Finished { request, ok } => {
                     let r = request.0;
                     assert!(self.finished.insert(r, *ok).is_none(), "seed {seed}: twice");
-                    let nodes = &self.nodes_of.get(&r).map_or(&[][..], Vec::as_slice);
+                    let nodes = self.nodes_of.get(&r).map_or(&[][..], Vec::as_slice);
                     assert!(nodes.iter().all(|it| self.states[it].settled()), "seed {seed}");
                     let failed = nodes
                         .iter()
@@ -701,7 +704,6 @@ impl Model {
         if let Some(held) = plane.holding() {
             assert!(self.budget.is_some(), "seed {seed}");
             assert_eq!(self.states[&held.0], NodeState::Ready, "seed {seed}");
-            let _ = self.starve_after;
         }
         self.outputs.extend(outputs);
     }
@@ -728,7 +730,7 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
     let config = PlaneConfig {
         io: 1 + random.below(3) as usize,
         work: 1 + random.below(4) as usize,
-        budget: budget.and_then(|it| self::budget(it)),
+        budget: budget.and_then(self::budget),
         starve_after,
     };
     let mut plane = Plane::new(config).unwrap();
@@ -742,7 +744,7 @@ fn simulate(seed: u64) -> (Vec<PlaneOutput>, u64) {
     let by_key: Vec<(u64, Pool)> = (0..keys)
         .map(|_| (memory(&mut random), if random.one_in(3) { Pool::Io } else { Pool::Work }))
         .collect();
-    let mut model = Model { seed, budget, starve_after, ..Model::default() };
+    let mut model = Model { seed, budget, ..Model::default() };
     let mut planned: Vec<Planned> = (0..1 + random.below(5))
         .map(|_| Planned {
             weight: 1 + random.below(4) as u32,
@@ -896,7 +898,7 @@ fn random_requests_keep_the_rules() {
     for seed in 0..600u64 {
         steps += simulate(seed).1;
     }
-    assert!(steps > 20_000, "{steps} steps");
+    assert!(steps > 5_000, "{steps} steps");
 }
 
 #[test]

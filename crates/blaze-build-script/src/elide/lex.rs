@@ -326,8 +326,8 @@ impl Lexer<'_> {
                 None => return Err(Unlexed { at: start, why: "an unterminated raw string" }),
                 Some('"') => {
                     let close = self.at - 1;
-                    let rest = &self.source[self.at..];
-                    if rest.len() >= hashes && rest.as_bytes()[..hashes].iter().all(|b| *b == b'#') {
+                    let rest = self.source[self.at..].as_bytes();
+                    if rest.len() >= hashes && rest[..hashes].iter().all(|b| *b == b'#') {
                         self.at += hashes;
                         let value = self.source[content..close].to_owned();
                         self.no_suffix()?;

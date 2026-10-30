@@ -97,6 +97,8 @@ struct HttpLink {
     waiting: Option<u64>,
     /// Bytes read past the end of the last response.
     rest: Vec<u8>,
+    /// What each read reads into.
+    buffer: Vec<u8>,
 }
 
 impl Client {
@@ -119,6 +121,7 @@ impl Client {
             checked: false,
             waiting: None,
             rest: Vec::new(),
+            buffer: vec![0; RECEIVE],
         })))
     }
 
@@ -245,12 +248,11 @@ impl Client {
         let link = match &mut self.link {
             #[cfg(unix)]
             Link::Unix(stream) => {
-                let bytes = read_some(stream)?;
-                if bytes.is_empty() {
+                let most = self.frames.wanted(RECEIVE);
+                if self.frames.fill(stream, most)? == 0 {
                     let said = "the daemon hung up";
                     return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, said)));
                 }
-                self.frames.push(&bytes);
                 return Ok(true);
             }
             Link::Http(link) => link,
@@ -270,8 +272,8 @@ impl Client {
             }
             return Ok(false);
         }
-        let bytes = read_some(&mut link.stream)?;
-        response.push(&bytes).map_err(invalid)?;
+        let bytes = read_some(&mut link.stream, &mut link.buffer)?;
+        response.push(bytes).map_err(invalid)?;
         if !link.checked
             && let Some((status, headers)) = response.head()
         {
@@ -279,8 +281,8 @@ impl Client {
             if status != 200 {
                 let mut body = response.take_body();
                 while !response.finished() {
-                    let bytes = read_some(&mut link.stream)?;
-                    response.push(&bytes).map_err(invalid)?;
+                    let bytes = read_some(&mut link.stream, &mut link.buffer)?;
+                    response.push(bytes).map_err(invalid)?;
                     body.extend(response.take_body());
                 }
                 link.rest = response.rest();
@@ -313,15 +315,11 @@ fn invalid(error: http::HttpError) -> ClientError {
     ClientError::Io(io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// What one read gives: empty once the peer has hung up.
-fn read_some(from: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut buffer = vec![0; RECEIVE];
+/// What one read into `buffer` gives: empty once the peer has hung up.
+fn read_some<'a>(from: &mut impl Read, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
     loop {
-        match from.read(&mut buffer) {
-            Ok(read) => {
-                buffer.truncate(read);
-                return Ok(buffer);
-            }
+        match from.read(buffer) {
+            Ok(read) => return Ok(&buffer[..read]),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }

@@ -2,9 +2,9 @@
 //! the head. Every number is little-endian, every record 16-byte aligned, so a pack is read in
 //! place wherever it is mapped.
 
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
 
-use crate::{Key, Kind};
+use crate::{Key, Kind, crc};
 
 pub(crate) const ALIGN: u64 = 16;
 
@@ -12,14 +12,20 @@ pub(crate) const fn aligned(n: u64) -> u64 {
     (n + ALIGN - 1) & !(ALIGN - 1)
 }
 
+/// Every commit leaves each pack a whole number of blocks long, so every append starts and
+/// ends on a block and can be written with `O_DIRECT`. The rest of a commit's last block is
+/// zeros, which a record header never starts with.
+pub(crate) const BLOCK: u64 = 4096;
+
+pub(crate) const fn blocks(n: u64) -> u64 {
+    (n + BLOCK - 1) & !(BLOCK - 1)
+}
+
 /// The domain of [`crate::Entry::content`]: what a value's bytes hash to.
 pub(crate) const VALUE_DOMAIN: &str = "blaze v2 store value 1";
 /// The domain of a chunk's key: a chunk is kept under the hash of its bytes.
 pub(crate) const CHUNK_DOMAIN: &str = "blaze v2 store chunk 1";
 pub(crate) const DICTIONARY_DOMAIN: &str = "blaze v2 store dictionary 1";
-const RECORD_DOMAIN: &str = "blaze v2 store record 1";
-const HEAD_DOMAIN: &str = "blaze v2 store head 1";
-pub(crate) const INDEX_DOMAIN: &str = "blaze v2 store index 1";
 
 pub(crate) fn content_of(bytes: &[u8]) -> ContentId {
     ContentId::of(VALUE_DOMAIN, bytes)
@@ -39,7 +45,7 @@ fn id_at(bytes: &[u8], at: usize) -> ContentId {
 
 // Packs.
 
-pub(crate) const PACK_MAGIC: [u8; 8] = *b"BLZPACK\x02";
+pub(crate) const PACK_MAGIC: [u8; 8] = *b"BLZPACK\x03";
 /// A pack starts with its magic and its kind; records follow.
 pub(crate) const PACK_HEADER: u64 = 16;
 
@@ -81,14 +87,19 @@ pub(crate) const HEAD_FILE: &str = "head";
 pub(crate) enum Form {
     /// The value's bytes, as they are: read in place.
     Raw,
-    /// zstd with the dictionary of its kind numbered by [`RecordHeader::dictionary`].
+    /// zstd with the dictionary of its kind numbered by [`RecordHeader::dictionary`], or, for a
+    /// long value ([`crate::cold::LONG_FROM`]), with no dictionary ([`NO_DICTIONARY`]) and
+    /// long-distance matching.
     Zstd,
-    /// A list of chunks ([`CHUNK_REF`] bytes each), each a raw value of its own.
+    /// A list of chunks ([`CHUNK_REF`] bytes each), each a value of its own, raw or LZ4.
     Chunked,
     /// The value is a file of its own, [`external_file`] of its content: placed by cloning it.
     External,
     /// A compression dictionary, listed in the head; not a value.
     Dictionary,
+    /// LZ4 (a block, no frame): for chunks, which are copied out anyway when their value is
+    /// assembled, so decompressing them costs little more than the copy.
+    Lz4,
 }
 
 impl Form {
@@ -99,6 +110,7 @@ impl Form {
             Form::Chunked => 2,
             Form::External => 3,
             Form::Dictionary => 4,
+            Form::Lz4 => 5,
         }
     }
 
@@ -109,18 +121,23 @@ impl Form {
             2 => Some(Form::Chunked),
             3 => Some(Form::External),
             4 => Some(Form::Dictionary),
+            5 => Some(Form::Lz4),
             _ => None,
         }
     }
 }
 
-pub(crate) const RECORD_HEADER: u64 = 112;
+pub(crate) const RECORD_HEADER: u64 = 96;
+/// [`RecordHeader::dictionary`] of a value compressed without one.
+pub(crate) const NO_DICTIONARY: u32 = u32::MAX;
 const RECORD_MAGIC: [u8; 4] = *b"BLZR";
+/// Where a record header keeps its CRC-32C, taken over the header with these bytes zero.
+const RECORD_CHECK: std::ops::Range<usize> = 12..16;
 /// A chunk in a chunked value's payload: its key and its length.
 pub(crate) const CHUNK_REF: usize = 40;
 
-/// What a record starts with. Its last 16 bytes check the rest, so a torn append is found
-/// without reading the payload.
+/// What a record starts with. Its CRC-32C finds a torn append without reading the payload;
+/// the payload is checked against `content` when it is read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct RecordHeader {
     pub kind: Kind,
@@ -145,8 +162,8 @@ impl RecordHeader {
         out[24..32].copy_from_slice(&self.raw.to_le_bytes());
         out[32..64].copy_from_slice(&self.key.0.0);
         out[64..96].copy_from_slice(&self.content.0);
-        let check = record_check(&out[..96]);
-        out[96..].copy_from_slice(&check);
+        let check = crc::crc32c(&out);
+        out[RECORD_CHECK].copy_from_slice(&check.to_le_bytes());
         out
     }
 
@@ -158,7 +175,10 @@ impl RecordHeader {
         if bytes[..4] != RECORD_MAGIC {
             return Err("its header has no record's magic");
         }
-        if bytes[96..] != record_check(&bytes[..96]) {
+        let mut unchecked = [0; RECORD_HEADER as usize];
+        unchecked.copy_from_slice(bytes);
+        unchecked[RECORD_CHECK].fill(0);
+        if u32_at(bytes, RECORD_CHECK.start) != crc::crc32c(&unchecked) {
             return Err("its header does not match its check");
         }
         let kind = Kind::from_code(bytes[4]).ok_or("its header names no kind")?;
@@ -178,11 +198,6 @@ impl RecordHeader {
     pub(crate) fn span(&self) -> u64 {
         aligned(RECORD_HEADER + self.stored)
     }
-}
-
-fn record_check(bytes: &[u8]) -> [u8; 16] {
-    let id = Hasher::new(RECORD_DOMAIN).update(bytes).finish();
-    id.0[..16].try_into().expect("16 bytes")
 }
 
 /// A whole record: header, payload, zeros to the next alignment.
@@ -216,7 +231,7 @@ pub(crate) fn decode_chunks(payload: &[u8]) -> Result<Vec<(Key, u64)>, &'static 
 
 // The index table.
 
-const INDEX_MAGIC: [u8; 8] = *b"BLZINDX\x02";
+const INDEX_MAGIC: [u8; 8] = *b"BLZINDX\x03";
 pub(crate) const INDEX_HEADER: usize = 64;
 pub(crate) const SLOT: usize = 64;
 const EMPTY: u32 = u32::MAX;
@@ -353,19 +368,19 @@ fn decode_slot(slot: &[u8]) -> Result<Loc, &'static str> {
 
 // The head.
 
-const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x02";
-const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 32 + 8 + 4 + 4 + 4 + 4;
+const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x03";
+const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
 const PACK_REF: usize = 24;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
-const HEAD_CHECK: usize = 32;
+const HEAD_CHECK: usize = 4;
 
-/// The index table a head names: which of the two slots, its length and its hash.
+/// The index table a head names: which of the two slots, its length and its CRC-32C.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct IndexRef {
     pub slot: u8,
     pub len: u64,
-    pub hash: ContentId,
+    pub check: u32,
     pub count: u64,
 }
 
@@ -420,12 +435,13 @@ impl Head {
         let index = self.index.unwrap_or(IndexRef {
             slot: u8::MAX,
             len: 0,
-            hash: ContentId::default(),
+            check: 0,
             count: 0,
         });
         out.extend_from_slice(&u64::from(index.slot).to_le_bytes());
         out.extend_from_slice(&index.len.to_le_bytes());
-        out.extend_from_slice(&index.hash.0);
+        out.extend_from_slice(&index.check.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&index.count.to_le_bytes());
         out.extend_from_slice(&(self.packs.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.dictionaries.len() as u32).to_le_bytes());
@@ -449,8 +465,8 @@ impl Head {
             out.extend_from_slice(&external.content.0);
             out.extend_from_slice(&external.len.to_le_bytes());
         }
-        let check = Hasher::new(HEAD_DOMAIN).update(&out).finish();
-        out.extend_from_slice(&check.0);
+        let check = crc::crc32c(&out);
+        out.extend_from_slice(&check.to_le_bytes());
         out
     }
 
@@ -467,7 +483,7 @@ impl Head {
             ));
         }
         let (body, check) = bytes.split_at(bytes.len() - HEAD_CHECK);
-        if Hasher::new(HEAD_DOMAIN).update(body).finish().0 != check {
+        if crc::crc32c(body).to_le_bytes() != check {
             return Err("it does not match its check".into());
         }
         let generation = u64_at(body, 16);
@@ -476,15 +492,15 @@ impl Head {
             0 | 1 => Some(IndexRef {
                 slot: slot as u8,
                 len: u64_at(body, 32),
-                hash: id_at(body, 40),
-                count: u64_at(body, 72),
+                check: u32_at(body, 40),
+                count: u64_at(body, 48),
             }),
             s if s == u64::from(u8::MAX) => None,
             _ => return Err("it names an index slot there is not".into()),
         };
-        let packs = u32_at(body, 80) as usize;
-        let dictionaries = u32_at(body, 84) as usize;
-        let externals = u32_at(body, 88) as usize;
+        let packs = u32_at(body, 56) as usize;
+        let dictionaries = u32_at(body, 60) as usize;
+        let externals = u32_at(body, 64) as usize;
         let want = packs
             .checked_mul(PACK_REF)
             .zip(dictionaries.checked_mul(DICTIONARY_REF))

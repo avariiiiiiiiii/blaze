@@ -18,6 +18,7 @@
 
 mod graph;
 mod order;
+pub mod query;
 pub mod schema;
 
 use blaze_manifest::manifest::Manifest;

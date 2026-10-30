@@ -12,8 +12,8 @@ use syntax_tree::Direction;
 
 use crate::{
     AstNode, SyntaxError,
-    SyntaxKind::{CONST, FN, INT_NUMBER, TYPE_ALIAS},
-    SyntaxNode, SyntaxToken, T, TextSize, algo,
+    SyntaxKind::{BLOCK_EXPR, CONST, FN, INT_NUMBER, TYPE_ALIAS},
+    SyntaxNode, SyntaxToken, T, TextRange, TextSize, WalkEvent, algo,
     ast::{self, HasAttrs, HasVisibility, IsString, RangeItem},
     match_ast,
 };
@@ -25,25 +25,58 @@ pub(crate) fn validate(root: &SyntaxNode, errors: &mut Vec<SyntaxError>) {
     // * Add validation of doc comments are being attached to nodes
 
     for node in root.descendants() {
-        match_ast! {
-            match node {
-                ast::Literal(it) => validate_literal(it, errors),
-                ast::Const(it) => validate_const(it, errors),
-                ast::BlockExpr(it) => block::validate_block_expr(it, errors),
-                ast::FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
-                ast::RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
-                ast::Visibility(it) => validate_visibility(it, errors),
-                ast::RangeExpr(it) => validate_range_expr(it, errors),
-                ast::PathSegment(it) => validate_path_keywords(it, errors),
-                ast::RefType(it) => validate_trait_object_ref_ty(it, errors),
-                ast::PtrType(it) => validate_trait_object_ptr_ty(it, errors),
-                ast::FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
-                ast::MacroRules(it) => validate_macro_rules(it, errors),
-                ast::LetExpr(it) => validate_let_expr(it, errors),
-                ast::DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
-                ast::ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
-                _ => (),
+        validate_node(node, errors);
+    }
+}
+
+/// [`validate`] for an outline: `lazies` are its lazy nodes, by range and number in preorder.
+/// A lazy node and what is in it are validated when `body` says so, which first adds the
+/// body's parser errors; `body` is asked before anything walks into the node.
+pub(crate) fn validate_outline(
+    root: &SyntaxNode,
+    lazies: &[(TextRange, u32)],
+    body: &mut dyn FnMut(u32, &mut Vec<SyntaxError>) -> bool,
+    errors: &mut Vec<SyntaxError>,
+) {
+    let _p = tracing::info_span!("parser::validate_outline").entered();
+    let mut lazies = lazies.iter().peekable();
+    let mut preorder = root.preorder();
+    while let Some(event) = preorder.next() {
+        let WalkEvent::Enter(node) = event else { continue };
+        if let Some(&&(range, at)) = lazies.peek()
+            && node.kind() == BLOCK_EXPR
+            && node.text_range() == range
+        {
+            lazies.next();
+            preorder.skip_subtree();
+            if body(at, errors) {
+                validate(&node, errors);
             }
+            continue;
+        }
+        validate_node(node, errors);
+    }
+}
+
+fn validate_node(node: SyntaxNode, errors: &mut Vec<SyntaxError>) {
+    match_ast! {
+        match node {
+            ast::Literal(it) => validate_literal(it, errors),
+            ast::Const(it) => validate_const(it, errors),
+            ast::BlockExpr(it) => block::validate_block_expr(it, errors),
+            ast::FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
+            ast::RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
+            ast::Visibility(it) => validate_visibility(it, errors),
+            ast::RangeExpr(it) => validate_range_expr(it, errors),
+            ast::PathSegment(it) => validate_path_keywords(it, errors),
+            ast::RefType(it) => validate_trait_object_ref_ty(it, errors),
+            ast::PtrType(it) => validate_trait_object_ptr_ty(it, errors),
+            ast::FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
+            ast::MacroRules(it) => validate_macro_rules(it, errors),
+            ast::LetExpr(it) => validate_let_expr(it, errors),
+            ast::DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
+            ast::ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
+            _ => (),
         }
     }
 }

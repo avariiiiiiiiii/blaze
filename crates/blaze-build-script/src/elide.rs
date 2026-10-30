@@ -74,7 +74,13 @@ fn inert_codegen(option: &str) -> bool {
         Some(("opt-level", level)) => matches!(level, "0" | "1" | "2" | "3" | "s" | "z"),
         Some(("debuginfo", level)) => matches!(
             level,
-            "0" | "1" | "2" | "none" | "line-directives-only" | "line-tables-only" | "limited" | "full"
+            "0" | "1"
+                | "2"
+                | "none"
+                | "line-directives-only"
+                | "line-tables-only"
+                | "limited"
+                | "full"
         ),
         _ => false,
     }

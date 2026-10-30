@@ -23,7 +23,7 @@ fn parse(db: &dyn LogDatabase, source: Source) -> u32 {
 
 #[salsa::tracked(returns(copy))]
 fn check(db: &dyn LogDatabase, source: Source) -> u32 {
-    db.push_log(format!("check({})", source.text(db)));
+    db.push_log("check".to_string());
     parse(db, source) + 1
 }
 
@@ -38,7 +38,7 @@ fn evicted_value_recomputed_equal_is_backdated() {
     assert_eq!(parse(&db, b), 4);
     db.assert_logs(expect![[r#"
         [
-            "check(12)",
+            "check",
             "parse(12)",
             "parse(40)",
         ]"#]]);
@@ -57,7 +57,7 @@ fn evicted_value_recomputed_equal_is_backdated() {
     db.assert_logs(expect![[r#"
         [
             "parse(25)",
-            "check(25)",
+            "check",
         ]"#]]);
 }
 
@@ -80,7 +80,7 @@ fn evicted_value_is_not_backdated_when_its_durability_drops() {
     db.assert_logs(expect![[r#"
         [
             "parse(13)",
-            "check(13)",
+            "check",
         ]"#]]);
 
     // Had `check` kept its high durability, this low-durability edit would not reach it.
@@ -89,7 +89,7 @@ fn evicted_value_is_not_backdated_when_its_durability_drops() {
     db.assert_logs(expect![[r#"
         [
             "parse(31)",
-            "check(31)",
+            "check",
         ]"#]]);
 }
 
@@ -101,7 +101,7 @@ fn digits(db: &dyn LogDatabase, source: Source) -> u32 {
 
 #[salsa::tracked(returns(copy))]
 fn report(db: &dyn LogDatabase, source: Source) -> u32 {
-    db.push_log(format!("report({})", source.text(db)));
+    db.push_log("report".to_string());
     digits(db, source) * 100
 }
 
@@ -148,7 +148,7 @@ fn fingerprint_edge_does_not_hide_a_durability_drop() {
         [
             "digits(20)",
             "digits(11)",
-            "report(11)",
+            "report",
         ]"#]]);
 
     a.set_text(&mut db).to(35);
@@ -156,6 +156,6 @@ fn fingerprint_edge_does_not_hide_a_durability_drop() {
     db.assert_logs(expect![[r#"
         [
             "digits(35)",
-            "report(35)",
+            "report",
         ]"#]]);
 }

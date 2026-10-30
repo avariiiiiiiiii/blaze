@@ -16,8 +16,10 @@
 //! [`Response::Done`] with `ok` false under its id (0 when unreadable), and the connection
 //! carries on; a frame too long, or bytes that are no HTTP, are answered and then hung up on.
 //!
-//! One receive at a time per connection, and one send; later replies queue behind it, and a
-//! peer that lets more than 64 MiB queue (it stopped reading) is hung up on.
+//! One receive at a time per connection, of 64 KiB, or on the Unix socket up to what the frame
+//! under way still lacks, at most as much as has come of it; and one send, later replies
+//! queueing behind it. A peer that lets more than 64 MiB queue (it stopped reading) is hung up
+//! on.
 
 use std::{collections::BTreeMap, fmt, net::SocketAddr};
 
@@ -306,16 +308,18 @@ impl Server {
     /// read now.
     fn receive(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
         let Some(connection) = self.conns.get(&conn) else { return };
-        let held = match &connection.reader {
-            Reader::Http { parser, answering: Some(_) } => parser.held() > MOST_HELD,
-            _ => false,
+        let (most, held) = match &connection.reader {
+            Reader::Unix(frames) => (frames.wanted(RECEIVE), false),
+            Reader::Http { parser, answering } => {
+                (RECEIVE, answering.is_some() && parser.held() > MOST_HELD)
+            }
         };
         if connection.receiving.is_some() || connection.closing || held {
             return;
         }
         let tag = self.tag();
         self.pending.insert(tag, Pending::Recv(conn));
-        effects.push(Effect::Recv { conn, most: RECEIVE, tag });
+        effects.push(Effect::Recv { conn, most, tag });
         if let Some(connection) = self.conns.get_mut(&conn) {
             connection.receiving = Some(tag);
         }
@@ -375,15 +379,17 @@ impl Server {
             else {
                 return;
             };
-            match frames.next() {
+            let decoded = match frames.next_ref() {
                 Ok(None) => return,
-                Ok(Some(item)) => match frames::decode::<Request>(&item) {
-                    Ok(envelope) => self.told.push(Arrived::Request {
-                        from: RequestRef { conn, id: envelope.id },
-                        request: envelope.body,
-                    }),
-                    Err(refused) => self.refuse(conn, refused, effects),
-                },
+                Ok(Some(item)) => Ok(frames::decode::<Request>(item)),
+                Err(error) => Err(error),
+            };
+            match decoded {
+                Ok(Ok(envelope)) => self.told.push(Arrived::Request {
+                    from: RequestRef { conn, id: envelope.id },
+                    request: envelope.body,
+                }),
+                Ok(Err(refused)) => self.refuse(conn, refused, effects),
                 Err(error) => {
                     self.refuse(conn, Refused { id: None, error }, effects);
                     self.close(conn);

@@ -54,6 +54,7 @@ fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
     let fn_def = fn_def.unwrap().into();
 
     expect.assert_eq(&Body::of(&db, fn_def).pretty_print(&db, fn_def, Edition::CURRENT));
+    round_trip(&db, fn_def);
 }
 
 fn def_map_at(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {

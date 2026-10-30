@@ -346,7 +346,7 @@ pub fn store_key(db: &dyn HirDatabase, store: ExpressionStoreOwnerId) -> ItemKey
 
 /// The key of an anonymous constant (an array length, a const argument): its store's and its
 /// root expression's index there.
-pub fn anon_const_key(db: &dyn HirDatabase, anon: AnonConstId<'_>) -> ItemKey {
+pub fn anon_const_key<'db>(db: &'db dyn HirDatabase, anon: AnonConstId<'db>) -> ItemKey {
     let loc = anon.loc(db);
     let mut h = Hasher::new(KEY_DOMAIN);
     h.id(&store_key(db, loc.owner).0)
@@ -366,25 +366,25 @@ fn closure_key_of(
     ItemKey(h.finish())
 }
 
-fn store_of(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> ExpressionStoreOwnerId {
+fn store_of<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> ExpressionStoreOwnerId {
     owner.expression_store_owner(db)
 }
 
 /// The key of a closure: its store's and its place among the store's closures (an edit before
 /// it in the body keeps it, as [`ClosureKey`] does).
-pub fn closure_key(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> ItemKey {
+pub fn closure_key<'db>(db: &'db dyn HirDatabase, closure: InternedClosureId<'db>) -> ItemKey {
     let loc = closure.loc(db);
     closure_key_of(db, store_of(db, loc.owner), b"closure", ClosureKey::nth(db, loc))
 }
 
-pub fn coroutine_key(db: &dyn HirDatabase, coroutine: InternedCoroutineId<'_>) -> ItemKey {
+pub fn coroutine_key<'db>(db: &'db dyn HirDatabase, coroutine: InternedCoroutineId<'db>) -> ItemKey {
     let loc = coroutine.loc(db);
     closure_key_of(db, store_of(db, loc.owner), b"coroutine", ClosureKey::nth(db, loc))
 }
 
-pub fn coroutine_closure_key(
-    db: &dyn HirDatabase,
-    closure: InternedCoroutineClosureId<'_>,
+pub fn coroutine_closure_key<'db>(
+    db: &'db dyn HirDatabase,
+    closure: InternedCoroutineClosureId<'db>,
 ) -> ItemKey {
     let loc = closure.loc(db);
     closure_key_of(db, store_of(db, loc.owner), b"coroutine closure", ClosureKey::nth(db, loc))
@@ -398,7 +398,7 @@ pub fn opaque_key(db: &dyn HirDatabase, owner: ItemId, index: u32) -> ItemKey {
     ItemKey(h.finish())
 }
 
-fn opaque_of(db: &dyn HirDatabase, opaque: InternedOpaqueTyId<'_>) -> (ItemId, u32) {
+fn opaque_of<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
     match opaque.loc(db) {
         ImplTraitId::ReturnTypeImplTrait(f, index) => {
             (ItemId::Function(f), index.into_raw().into_u32())
@@ -409,7 +409,7 @@ fn opaque_of(db: &dyn HirDatabase, opaque: InternedOpaqueTyId<'_>) -> (ItemId, u
     }
 }
 
-pub fn opaque_ty_key(db: &dyn HirDatabase, opaque: InternedOpaqueTyId<'_>) -> ItemKey {
+pub fn opaque_ty_key<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> ItemKey {
     let (owner, index) = opaque_of(db, opaque);
     opaque_key(db, owner, index)
 }
@@ -427,7 +427,7 @@ pub fn builtin_derive_key(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> Item
 }
 
 /// The key of anything the solver names by a `SolverDefId`.
-pub fn def_key(db: &dyn HirDatabase, def: SolverDefId<'_>) -> ItemKey {
+pub fn def_key<'db>(db: &'db dyn HirDatabase, def: SolverDefId<'db>) -> ItemKey {
     match def {
         SolverDefId::AdtId(it) => item_key(db, ItemId::Adt(it)),
         SolverDefId::ConstId(it) => item_key(db, ItemId::Const(it)),
@@ -460,9 +460,9 @@ pub fn name_hash(name: &str) -> NameHash {
 }
 
 /// A simplified self type ([`crate::ImplIndexKey`]), with its def named by key.
-pub fn simplified(
-    db: &dyn HirDatabase,
-    ty: &hir_ty::next_solver::SimplifiedType<'_>,
+pub fn simplified<'db>(
+    db: &'db dyn HirDatabase,
+    ty: &hir_ty::next_solver::SimplifiedType<'db>,
 ) -> SimplifiedType {
     use rustc_type_ir::fast_reject::SimplifiedType as S;
     let mut h = Hasher::new(SIMPLIFIED_DOMAIN);

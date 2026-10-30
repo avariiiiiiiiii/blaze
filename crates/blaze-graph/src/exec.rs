@@ -197,9 +197,9 @@ pub type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
 
 /// A node of a [`Scheduler`]'s request, with its work.
 ///
-/// Nodes a task finds are added with [`Handle::add`] by the work itself, before it returns
-/// (their deps may be the task's own node): a [`Did::added`] carries no work, so a task whose
-/// `Did` has any fails, saying so.
+/// The nodes a task finds go in its [`Did::added`] as [`Handle::found`] gives them, which
+/// gives the scheduler their work first; a found node with no work fails the task that found
+/// it, saying so.
 #[derive(Clone)]
 pub struct Task {
     pub spec: Spec,
@@ -225,6 +225,7 @@ pub struct Opened {
 enum Msg {
     Open { request: RequestId, weight: u32, keep_going: bool, heard: Sender<Heard> },
     Add { request: RequestId, tasks: Vec<Task> },
+    Found { request: RequestId, tasks: Vec<Task> },
     Close { request: RequestId },
     Cancel { request: RequestId },
     Done { at_ns: u64, id: NodeId, request: RequestId, kind: TaskKind, did: Did, peak: Option<u64>, group: Option<u32> },
@@ -239,6 +240,8 @@ struct Job {
     kind: TaskKind,
     work: Work,
     tx: Sender<Msg>,
+    /// The IO threads' queue, for an IO task posted again.
+    io: Option<Sender<Arc<Job>>>,
     start: Instant,
 }
 
@@ -273,6 +276,15 @@ impl Handle {
     /// the scheduler's estimates predict for its kind.
     pub fn add(&self, request: RequestId, tasks: Vec<Task>) {
         _ = self.tx.send(Msg::Add { request, tasks });
+    }
+
+    /// Gives the scheduler the work of the nodes a running task of `request` found, called by
+    /// that task's work on its own thread before it returns; what it gives back goes in the
+    /// task's [`Did::added`]. A request closed takes new nodes only so.
+    pub fn found(&self, request: RequestId, tasks: Vec<Task>) -> Vec<Spec> {
+        let specs = tasks.iter().map(|it| it.spec.clone()).collect();
+        _ = self.tx.send(Msg::Found { request, tasks });
+        specs
     }
 
     /// No more tasks are added to `request` but by its tasks.
@@ -339,8 +351,9 @@ impl Scheduler {
                 thread::Builder::new()
                     .name(format!("blaze-io-{at}"))
                     .spawn(move || {
+                        // Ends once the owner is gone and no queued task can post itself again.
                         for job in io_rx {
-                            run_io(&job);
+                            run_io(job);
                         }
                     })
                     .unwrap_or_else(|why| panic!("an IO thread of the scheduler: {why}"))
@@ -462,6 +475,12 @@ impl Owner {
                     }
                 }
             }
+            Msg::Found { request, tasks } => {
+                for Task { spec, kind, work } in tasks {
+                    // Found again by a task posted again: the first keeps its work.
+                    self.works.entry(spec.id).or_insert(Entry { request, kind, work });
+                }
+            }
             Msg::Close { request } => _ = self.step(request, PlaneInput::Close { at_ns, request }),
             Msg::Cancel { request } => {
                 let outputs = self.plane.cancel(at_ns, request);
@@ -471,26 +490,33 @@ impl Owner {
                 if let Some(peak) = peak {
                     self.estimates.observe(kind, peak);
                 }
-                let outcome = if did.added.is_empty() {
-                    did.outcome
-                } else {
-                    Outcome::Failed {
+                let (mut outcome, mut added) = (did.outcome, did.added);
+                let workless = added.iter().map(|spec| spec.id).find(|found| {
+                    !self.works.get(found).is_some_and(|it| it.request == request)
+                });
+                if let Some(found) = workless {
+                    outcome = Outcome::Failed {
                         why: format!(
-                            "the work of node {id} found {} nodes in its `Did`, which carries no \
-                             work: a scheduler's task adds what it finds with `Handle::add`",
-                            did.added.len()
+                            "node {found} found by node {id} has no work: a scheduler's task \
+                             gives the work of what it finds with `Handle::found`"
                         ),
-                    }
-                };
-                let input = PlaneInput::Done {
-                    at_ns,
-                    id,
-                    outcome,
-                    added: Vec::new(),
-                    group,
-                    peak: peak.unwrap_or(0),
-                };
-                self.step(request, input);
+                    };
+                    added.clear();
+                }
+                for spec in &mut added {
+                    let kind = self.works[&spec.id].kind;
+                    spec.memory = spec.memory.max(self.estimates.predict(kind));
+                }
+                let peak = peak.unwrap_or(0);
+                let input =
+                    PlaneInput::Done { at_ns, id, outcome, added: added.clone(), group, peak };
+                if !self.step(request, input) {
+                    // What it found could not be added: the node fails rather than run forever.
+                    let why = format!("what node {id} found could not be added to {request}");
+                    let outcome = Outcome::Failed { why };
+                    let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
+                    self.step(request, input);
+                }
                 let held = PlaneInput::Held { at_ns: ns(self.start), bytes: arena::held() };
                 self.step(request, held);
             }
@@ -537,6 +563,8 @@ impl Owner {
             }
             PlaneOutput::Run { id, pool, near } => self.run(id, pool, near),
             PlaneOutput::Finished { request, ok } => {
+                // Work found by a task that then gave way, and never added.
+                self.works.retain(|_, it| it.request != request);
                 if let Some(heard) = self.heard.remove(&request) {
                     _ = heard.send(Heard::Finished { ok });
                 }
@@ -559,12 +587,14 @@ impl Owner {
             });
             return;
         };
+        let io = (pool == Pool::Io).then(|| self.io.clone());
         let job = Arc::new(Job {
             id,
             request: entry.request,
             kind: entry.kind,
             work: entry.work.clone(),
             tx: self.tx.clone(),
+            io,
             start: self.start,
         });
         match pool {
@@ -590,15 +620,17 @@ fn post(pool: &'static Workers, near: Option<u32>, job: Arc<Job>) {
     );
 }
 
-/// Runs an IO task on this thread, again while its work gives way, each time after what is
-/// already queued of this thread's turn: an IO task waits rather than computes.
-fn run_io(job: &Job) {
-    loop {
-        match catch_unwind(AssertUnwindSafe(|| arena::measure(|| (job.work)()))) {
-            Ok((Ok(did), peak)) => return job.done(did, Some(peak), None),
-            Ok((Err(Cancelled), _)) => thread::yield_now(),
-            Err(panic) => return job.done(Did::failed(panicked(&*panic)), None, None),
+/// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
+/// while its work gives way.
+fn run_io(job: Arc<Job>) {
+    match catch_unwind(AssertUnwindSafe(|| arena::measure(|| (job.work)()))) {
+        Ok((Ok(did), peak)) => job.done(did, Some(peak), None),
+        Ok((Err(Cancelled), _)) => {
+            if let Some(io) = job.io.clone() {
+                _ = io.send(job);
+            }
         }
+        Err(panic) => job.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
 
@@ -620,7 +652,7 @@ mod tests {
     use crate::{
         Cancelled, Key,
         admission::{Estimates, TaskKind},
-        machine::{Config, Machine, NodeId, Pool, Spec},
+        machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
         topology::Topology,
@@ -765,12 +797,15 @@ mod tests {
             it.event,
             Event::Moved { id: 7, state: NodeState::Built }
         )));
-        assert!(scheduler.estimates().by_kind.contains_key(&TaskKind(1)));
+        // Measured once: the tries that gave way taught nothing.
+        let estimates = scheduler.estimates();
+        assert_eq!(estimates.by_kind.get(&TaskKind(1)).map(|it| it.seen), Some(1));
     }
 
-    /// Nodes a task finds are added by its work, through a handle, and wait for it.
+    /// Nodes a task finds, their work given through a handle, run after it once the request is
+    /// closed; a found node with no work fails the task that found it.
     #[test]
-    fn a_task_adds_what_it_finds_through_its_handle() {
+    fn a_task_gives_the_work_of_what_it_finds() {
         let scheduler = scheduler(2);
         let opened = scheduler.open(2, false);
         let (request, handle) = (opened.request, scheduler.handle());
@@ -782,13 +817,26 @@ mod tests {
                 ran.store(true, Ordering::SeqCst);
                 Ok(Did::built())
             });
-            handle.add(request, vec![task(21, &[20], None, found)]);
-            Ok(Did::built())
+            let added = handle.found(request, vec![task(21, &[20], None, found)]);
+            Ok(Did { outcome: Outcome::Built, added })
         });
         scheduler.add(request, vec![task(20, &[], None, finder)]);
         scheduler.close(request);
         assert!(finish(&opened).0);
         assert!(found_ran.load(Ordering::SeqCst));
+
+        let opened = scheduler.open(1, true);
+        let workless: Work = Arc::new(|| {
+            Ok(Did { outcome: Outcome::Built, added: vec![spec(41, &[40], Pool::Work, None)] })
+        });
+        scheduler.add(opened.request, vec![task(40, &[], None, workless)]);
+        scheduler.close(opened.request);
+        let (ok, records) = finish(&opened);
+        assert!(!ok);
+        assert!(records.iter().any(|it| matches!(
+            &it.event,
+            Event::Moved { id: 40, state: NodeState::Failed { why } } if why.contains("no work")
+        )));
     }
 
     #[test]

@@ -304,21 +304,21 @@ pub(crate) fn batches(ops: &[Op], most: usize) -> Result<Vec<Vec<Op>>, String> {
     };
     for op in ops {
         match op {
-            Op::Write { path, bytes } if path.len() + bytes.len() + OP_OVERHEAD > most => {
+            Op::Write { path, bytes, mode } if path.len() + bytes.len() + OP_OVERHEAD > most => {
                 let piece = most.checked_sub(path.len() + OP_OVERHEAD).filter(|it| *it > 0).ok_or_else(|| {
                     format!("the path {path} is too long for a request of the daemon's")
                 })?;
                 let mut pieces = bytes.chunks(piece);
                 let first = pieces.next().unwrap_or_default().to_vec();
                 let mut at = first.len() as u64;
-                add(Op::Write { path: path.clone(), bytes: first }, most, &mut batches);
+                add(Op::Write { path: path.clone(), bytes: first, mode: *mode }, most, &mut batches);
                 for piece in pieces {
                     let edit = Op::Edit { path: path.clone(), at, len: 0, bytes: piece.to_vec() };
                     at += piece.len() as u64;
                     add(edit, most, &mut batches);
                 }
             }
-            Op::Write { path, bytes } | Op::Edit { path, bytes, .. } => {
+            Op::Write { path, bytes, .. } | Op::Edit { path, bytes, .. } => {
                 add(op.clone(), path.len() + bytes.len() + OP_OVERHEAD, &mut batches);
             }
             Op::Delete { path } => add(op.clone(), path.len() + OP_OVERHEAD, &mut batches),

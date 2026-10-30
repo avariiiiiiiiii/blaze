@@ -12,11 +12,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
 use stdx::{format_to, never};
 use syntax::{
-    Parse, PreorderWithTokens, SmolStr, SyntaxElement,
+    FlatTree, Parse, PreorderWithTokens, SmolStr, SyntaxElement,
     SyntaxKind::{self, *},
-    SyntaxNode, SyntaxToken, SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent,
-    ast::make::tokens::doc_comment,
-    format_smolstr,
+    SyntaxNode, SyntaxToken, SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
 };
 use tt::{Punct, buffer::Cursor, token_to_literal};
 
@@ -129,6 +127,10 @@ pub enum DocCommentDesugarMode {
 
 /// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
 /// subtree's spans.
+///
+/// A node of a flat tree is read from its arrays, through the parts of the lazy nodes in it
+/// (a macro's input may hold a fn body an outline left unparsed); a node of a green tree, one
+/// being edited, through the cursor.
 pub fn syntax_node_to_token_tree<SpanMap>(
     node: &SyntaxNode,
     map: SpanMap,
@@ -138,6 +140,9 @@ pub fn syntax_node_to_token_tree<SpanMap>(
 where
     SpanMap: SpanMapper,
 {
+    if let Some((tree, at)) = node.flat() {
+        return convert_tokens(&mut FlatConverter::new(tree, at, map, span, mode));
+    }
     let mut c =
         Converter::new(node, map, Default::default(), Default::default(), span, mode, |_, _| {
             (true, Vec::new())
@@ -478,8 +483,9 @@ pub fn desugar_doc_comment_text(text: &str, mode: DocCommentDesugarMode) -> (Sym
     }
 }
 
+/// Desugars the doc comment `text` into the attribute it stands for.
 fn convert_doc_comment(
-    token: &syntax::SyntaxToken,
+    text: &str,
     is_inner: bool,
     span: Span,
     mode: DocCommentDesugarMode,
@@ -492,8 +498,7 @@ fn convert_doc_comment(
     let mk_punct =
         |c: char| tt::Leaf::from(tt::Punct { char: c, spacing: tt::Spacing::Alone, span });
 
-    let mk_doc_literal = |token: &SyntaxToken| {
-        let text = token.text();
+    let mk_doc_literal = |text: &str| {
         let from_end = if text.starts_with("/*") && text.ends_with("*/") { 2 } else { 0 };
         let text = &text[3..text.len() - from_end];
 
@@ -504,7 +509,7 @@ fn convert_doc_comment(
     };
 
     // Make `doc="\" Comments\""
-    let meta_tkns = [mk_ident("doc"), mk_punct('='), mk_doc_literal(token)];
+    let meta_tkns = [mk_ident("doc"), mk_punct('='), mk_doc_literal(text)];
 
     // Make `#![]`
     builder.push(mk_punct('#'));
@@ -607,7 +612,7 @@ impl TokenConverter for RawConverter<'_> {
         builder: &mut tt::TopSubtreeBuilder,
     ) {
         let text = self.lexed.text(token);
-        convert_doc_comment(&doc_comment(text), is_inner, span, self.mode, builder);
+        convert_doc_comment(text, is_inner, span, self.mode, builder);
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
@@ -649,7 +654,7 @@ impl TokenConverter for StaticRawConverter<'_> {
         builder: &mut tt::TopSubtreeBuilder,
     ) {
         let text = self.lexed.text(token);
-        convert_doc_comment(&doc_comment(text), is_inner, span, self.mode, builder);
+        convert_doc_comment(text, is_inner, span, self.mode, builder);
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
@@ -829,7 +834,7 @@ where
         span: Span,
         builder: &mut tt::TopSubtreeBuilder,
     ) {
-        convert_doc_comment(token.token(), is_inner, span, self.mode, builder);
+        convert_doc_comment(token.token().text(), is_inner, span, self.mode, builder);
     }
 
     fn bump(&mut self) -> Option<(Self::Token, TextRange)> {

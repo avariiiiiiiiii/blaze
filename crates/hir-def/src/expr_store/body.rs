@@ -347,6 +347,13 @@ impl BodySyntax {
         (tree_hash(&root) == self.tree).then_some(root)
     }
 
+    /// Whether the anchor parsed alone is the tree it is in the file, so that
+    /// [`BodySyntax::root`] needs nothing of the file's tree.
+    #[cfg(test)]
+    pub(crate) fn reparses_alone(&self) -> bool {
+        self.reparse().is_some()
+    }
+
     /// The anchor from the tree of its file, for one that parses differently alone.
     fn from_file(&self, db: &dyn SourceDatabase) -> SyntaxNode {
         if check_relative() {

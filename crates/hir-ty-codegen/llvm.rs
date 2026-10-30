@@ -41,6 +41,7 @@ use super::{
 mod emitted;
 mod lower;
 mod rebase;
+pub(crate) mod release;
 
 /// What runs again where [`rebase::rebase`] said what addresses are based on: what is stored
 /// through one and loaded again is forwarded, and a slot that is then only written goes.

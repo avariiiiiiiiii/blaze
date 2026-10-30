@@ -353,6 +353,14 @@ enum Op {
         bytes: Vec<u8>,
         put: usize,
     },
+    /// `bytes` at `at` of a file, through a descriptor of its own: the one kept for the file
+    /// appends wherever it is told to write.
+    WriteAt {
+        fd: OwnedFd,
+        at: u64,
+        bytes: Vec<u8>,
+        put: usize,
+    },
     Sync {
         fd: RawFd,
     },
@@ -459,19 +467,13 @@ impl Spawning {
     fn end(self) -> Done {
         let Spawning { pid, pidfd, finish, stdout, stderr, failed, .. } = self;
         let program = finish.command.program.display().to_string();
-        let reaped = crate::process::reap(pid);
+        // Reaps it, and removes what was made for it even where it failed whatever it says.
+        let exited = finish.exited(pid, stdout, stderr);
         drop(pidfd);
-        match (reaped, failed) {
-            (Err(error), _) => Done::Failed(IoError(format!("reaping {program}: {error}"))),
-            (Ok((status, rusage)), Some(why)) => {
-                // Only to remove what was made for it; it failed whatever it says.
-                _ = finish.exited(status, &rusage, stdout, stderr);
-                Done::Failed(IoError(format!("{program}: {why}")))
-            }
-            (Ok((status, rusage)), None) => match finish.exited(status, &rusage, stdout, stderr) {
-                Ok(exit) => Done::Exited(Box::new(exit)),
-                Err(error) => Done::Failed(IoError(error.to_string())),
-            },
+        match (exited, failed) {
+            (_, Some(why)) => Done::Failed(IoError(format!("{program}: {why}"))),
+            (Ok(exit), None) => Done::Exited(Box::new(exit)),
+            (Err(error), None) => Done::Failed(IoError(error.to_string())),
         }
     }
 }
@@ -611,6 +613,15 @@ impl Uring {
                 off: u64::MAX,
                 addr: bytes[*put..].as_ptr() as u64,
                 len: (bytes.len() - put) as u32,
+                user_data,
+                ..Sqe::default()
+            },
+            Op::WriteAt { fd, at, bytes, put } => Sqe {
+                opcode: OP_WRITE,
+                fd: fd.as_raw_fd(),
+                off: at + *put as u64,
+                addr: bytes[*put..].as_ptr() as u64,
+                len: (bytes.len() - put).min(u32::MAX as usize) as u32,
                 user_data,
                 ..Sqe::default()
             },
@@ -827,6 +838,17 @@ impl Uring {
                     (true, _) => Step::Again,
                 }
             }
+            Op::WriteAt { bytes, put, .. } => {
+                if res < 0 {
+                    return Step::Ends(failed(res));
+                }
+                *put += res as usize;
+                match (*put < bytes.len(), res) {
+                    (false, _) => Step::Ends(Some(Done::Written)),
+                    (true, 0) => Step::Ends(failed(-libc::EIO)),
+                    (true, _) => Step::Again,
+                }
+            }
             Op::Sync { .. } if res < 0 => Step::Ends(failed(res)),
             Op::Sync { .. } => Step::Ends(Some(Done::Synced)),
             Op::Timer { .. } if res == -libc::ETIME || res == 0 => Step::Ends(Some(Done::Fired)),
@@ -1034,10 +1056,8 @@ impl Uring {
             Err(error) => {
                 let program = finish.command.program.display().to_string();
                 crate::process::kill(pid);
-                if let Ok((status, rusage)) = crate::process::reap(pid) {
-                    // Only to remove what was made for it.
-                    _ = finish.exited(status, &rusage, Vec::new(), Vec::new());
-                }
+                // Only to reap it and remove what was made for it.
+                _ = finish.exited(pid, Vec::new(), Vec::new());
                 return Err(io::Error::new(
                     error.kind(),
                     format!("{program}: no pidfd of it, to learn of its exit: {error}"),
@@ -1232,9 +1252,14 @@ fn open(path: &Path, make: bool) -> io::Result<OwnedFd> {
 
 /// A file made for writing, that was not there.
 fn create(path: &Path) -> io::Result<OwnedFd> {
+    open_to_write(path, libc::O_CREAT | libc::O_EXCL)
+}
+
+/// A file opened for writing where it is told to; `flags` added to the opening's.
+fn open_to_write(path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    let flags = libc::O_WRONLY | libc::O_CLOEXEC | flags;
     // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
     let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::c_uint) };
     if fd < 0 {
@@ -1308,6 +1333,26 @@ impl Driver for Uring {
                     crate::fs::link(&at(&from), &at(&to)).map(|()| Some(Done::Linked))
                 }
                 Effect::Stat { file, .. } => crate::fs::stat(&at(&file)).map(|it| Some(Done::Stat(it))),
+                Effect::List { dir, .. } => {
+                    crate::fs::list(&at(&dir), &dir).map(|it| Some(Done::Listed(it)))
+                }
+                Effect::WriteAt { file, at: offset, bytes, .. } => {
+                    open_to_write(&at(&file), 0).map(|fd| match bytes.is_empty() {
+                        true => Some(Done::Written),
+                        false => {
+                            self.start(tag, Op::WriteAt { fd, at: offset, bytes, put: 0 });
+                            None
+                        }
+                    })
+                }
+                Effect::Rename { from, to, .. } => {
+                    self.forget(&from);
+                    self.forget(&to);
+                    crate::fs::rename(&at(&from), &at(&to)).map(|()| Some(Done::Renamed))
+                }
+                Effect::Mode { file, mode, .. } => {
+                    crate::fs::set_mode(&at(&file), mode).map(|()| Some(Done::Moded))
+                }
                 Effect::Remove { file, .. } => {
                     self.forget(&file);
                     crate::fs::remove(&at(&file)).map(|()| Some(Done::Removed))
@@ -1665,7 +1710,7 @@ mod tests {
         assert_eq!(exited(3).signal, Some(libc::SIGKILL));
         let four = exited(4);
         assert_eq!(four.code, Some(0));
-        assert!(four.stdout.starts_with(b"300000\n"), "{:?}", &four.stdout[..10]);
+        assert!(four.stdout.starts_with(b"300000\n"), "{:?}", four.stdout.get(..10));
         assert_eq!(four.stdout.len(), 7 + 200_000);
         assert!(matches!(&ring[&5], Done::Failed(why) if why.0.contains("no Confine")), "{:?}", ring[&5]);
         assert!(

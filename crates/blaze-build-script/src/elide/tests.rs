@@ -1,8 +1,6 @@
 //! Elision of real build scripts (a census of crates.io's and this tree's, each named by where
 //! it is from, its source as published), of the forms it reads, and of each form it refuses.
 
-use std::path::Path;
-
 use super::*;
 use crate::{
     output::{self, Context, Output},

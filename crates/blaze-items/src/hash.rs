@@ -422,7 +422,7 @@ pub fn hashes(db: &dyn HirDatabase, id: ItemId) -> Result<ItemHashes, Unhashable
 }
 
 /// The item a closure or coroutine is written in.
-fn owner_of(db: &dyn HirDatabase, loc: InternedClosure<'_>) -> ItemId {
+fn owner_of<'db>(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> ItemId {
     match loc.owner {
         InferBodyId::DefWithBodyId(body) => ItemId::of_body(db, body),
         InferBodyId::AnonConstId(anon) => key::generic_def_item(anon.loc(db).owner.generic_def(db)),
@@ -431,9 +431,9 @@ fn owner_of(db: &dyn HirDatabase, loc: InternedClosure<'_>) -> ItemId {
 
 /// The code hash of one closure, for its codegen alone: its own MIR, signature and captures
 /// (#906), each ref by its interface hash.
-pub fn closure_code(
-    db: &dyn HirDatabase,
-    closure: InternedClosureId<'_>,
+pub fn closure_code<'db>(
+    db: &'db dyn HirDatabase,
+    closure: InternedClosureId<'db>,
 ) -> Result<CodeHash, Unhashable> {
     closure_code_of(db, closure).map(CodeHash)
 }
@@ -449,9 +449,9 @@ fn closure_code_of<'db>(
 
 /// The code hash of one coroutine (an `async` block or fn body, a `gen` block), with its
 /// saved locals.
-pub fn coroutine_code(
-    db: &dyn HirDatabase,
-    coroutine: InternedCoroutineId<'_>,
+pub fn coroutine_code<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
 ) -> Result<CodeHash, Unhashable> {
     coroutine_code_of(db, coroutine).map(CodeHash)
 }

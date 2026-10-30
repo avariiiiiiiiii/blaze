@@ -22,7 +22,7 @@
 //! - [`columns`]: the exact round trip every column encoding must make.
 //!
 //! A trace of nushell has millions of results and tens of millions of edges, so it is columns
-//! over `u32` indices (docs/v2/README.md section 17): keys sorted once, flags as bitsets, edges
+//! over `u32` indices (docs/v2/plan/data.md): keys sorted once, flags as bitsets, edges
 //! as one CSR array.
 
 pub mod bytes;

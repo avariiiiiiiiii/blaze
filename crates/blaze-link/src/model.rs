@@ -465,6 +465,9 @@ pub(crate) struct Tls {
 /// An image placed and relocated, as a writer reads it.
 pub(crate) struct Placed<'a> {
     pub output: &'a Output,
+    /// The image's file name, the last component of where it is written: a code signature's
+    /// identifier, an import library's DLL.
+    pub name: &'a str,
     pub plan: &'a Plan,
     /// In address order; each region's bytes are [`Placed::bytes`] of it.
     pub regions: &'a [Region],

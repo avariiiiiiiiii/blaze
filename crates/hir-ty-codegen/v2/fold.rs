@@ -157,7 +157,8 @@ fn walk(func: &ir::Function, names: &dyn Fn(ir::UserExternalName) -> Option<Name
 
 impl Canon<'_> {
     fn inst(&mut self, inst: ir::Inst) {
-        let dfg = &self.func.dfg;
+        let func = self.func;
+        let dfg = &func.dfg;
         let constant = match dfg.insts[inst] {
             InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
                 let bits = dfg.ctrl_typevar(inst).bits() as u8;
@@ -430,7 +431,8 @@ fn body(
             Site::Inst(inst) => alias(&mut body, inst, param)?,
             Site::Func(callee) => {
                 for &inst in &insts {
-                    match body.dfg.insts[inst] {
+                    let data = body.dfg.insts[inst];
+                    match data {
                         InstructionData::FuncAddr { func_ref, .. } if func_ref == callee => {
                             alias(&mut body, inst, param)?
                         }
@@ -457,8 +459,8 @@ fn body(
             }
             Site::Global(global) => {
                 for &inst in &insts {
-                    if let InstructionData::UnaryGlobalValue { global_value, .. } =
-                        body.dfg.insts[inst]
+                    let data = body.dfg.insts[inst];
+                    if let InstructionData::UnaryGlobalValue { global_value, .. } = data
                         && global_value == global
                     {
                         alias(&mut body, inst, param)?;
@@ -608,7 +610,10 @@ pub(crate) fn merge<P: Source>(
             return Err(fail(format!("member {at} is not the group's")));
         }
     }
-    let names: Vec<_> = members.iter().map(|&(_, _, prepared, _)| move |name| prepared.name(name)).collect();
+    let names: Vec<_> = members
+        .iter()
+        .map(|&(_, _, prepared, _)| move |name: ir::UserExternalName| prepared.name(name))
+        .collect();
     let sources: Vec<Member<'_>> = members
         .iter()
         .zip(&names)
@@ -702,17 +707,13 @@ mod tests {
         func.layout.append_block(block);
         let arg = func.dfg.append_block_param(block, types::I64);
         let mut cursor = FuncCursor::new(&mut func).at_bottom(block);
-        let (size, scaled) = if shuffled {
-            let at = cursor.ins().iconst(types::I64, 0);
-            let size = cursor.ins().iconst(types::I64, size);
-            let inst = cursor.func.dfg.value_def(at).unwrap_inst();
+        if shuffled {
+            let dead = cursor.ins().iconst(types::I64, 0);
+            let inst = cursor.func.dfg.value_def(dead).unwrap_inst();
             cursor.func.layout.remove_inst(inst);
-            (size, cursor.ins().imul(arg, size))
-        } else {
-            let size = cursor.ins().iconst(types::I64, size);
-            (size, cursor.ins().imul(arg, size))
-        };
-        let _ = size;
+        }
+        let size = cursor.ins().iconst(types::I64, size);
+        let scaled = cursor.ins().imul(arg, size);
         let call = cursor.ins().call(callee, &[scaled]);
         let called = cursor.func.dfg.first_result(call);
         let address = cursor.ins().func_addr(ptr, callee);
@@ -735,7 +736,7 @@ mod tests {
             Constant::Place(0),
             Constant::Place(1),
         ]);
-        assert_eq!(a.size, 9);
+        assert_eq!(a.size, 10);
     }
 
     #[test]
@@ -809,8 +810,8 @@ mod tests {
         );
         let group = &found[0];
         assert_eq!(group.varying, vec![0, 1]);
-        let names_a = |name| a.name(name);
-        let names_b = |name| b.name(name);
+        let names_a = |name: ir::UserExternalName| a.name(name);
+        let names_b = |name: ir::UserExternalName| b.name(name);
         let members: [Member<'_>; 2] =
             [(&a.0, &names_a, &refs_a[..]), (&b.0, &names_b, &refs_b[..])];
         let Built { body, thunks } = build(group, &members, pointer).unwrap();

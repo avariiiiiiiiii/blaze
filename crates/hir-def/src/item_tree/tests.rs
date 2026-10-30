@@ -9,6 +9,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     let item_tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
     let pretty = item_tree.pretty_print(&db, Edition::CURRENT);
     expect.assert_eq(&pretty);
+    crate::item_tree::persist::assert_round_trip(&item_tree);
 }
 
 #[test]

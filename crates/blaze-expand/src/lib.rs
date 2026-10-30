@@ -1,98 +1,153 @@
-//! Proc-macro expansions kept in the store, so that a daemon that loads a workspace again
-//! expands no macro it expanded before.
+//! Proc-macro expansions kept in the store (docs/v2/usercode.md section 6.5), so that no
+//! macro is expanded twice for the same inputs, on this machine or, through the store's
+//! remote, another.
 //!
-//! An expansion is a function of what the macro is given, as long as it asks nothing of the
-//! database while it runs. Its key is the content of the macro's dylib, the macro's name and
-//! kind, the input (and the attribute's input) with each span replaced by its place in a
-//! table of the distinct spans of the call (`def_site`, `call_site`, `mixed_site`, then the
-//! input's), that table's spans, the environment and the current directory it is given. A
-//! span is in the key as its byte range, which is from the item it is anchored to, and which
-//! of the call's anchors and syntax contexts it has, numbered as they first appear: the
-//! next call with the same key has other anchors and contexts, as another database or
-//! another revision numbers them, in the same places. What a macro makes of spans without
-//! asking (joins them, parses a string at the call site) is a function of the key, and the
-//! value is the output with its spans written the same way. What else a macro learns of a
-//! span (its text, file or line) it asks the database for, and an expansion that asked is not
-//! kept.
+//! An expansion is a run of user code ([`blaze_usercode::RunKey`]): its code is the content ID
+//! of the macro's library, and what it is given ([`given`]) is the macro's name and kind, its
+//! input and attribute tokens, the variables of the crate it expands for, the directory it
+//! runs in, the toolchain and the proc-macro ABI. Spans are given relative: each as its byte
+//! range from the item it is anchored to and which of the call's anchors and syntax contexts
+//! it has, numbered as they first appear, so the next call with the same input in another
+//! database or revision has the same key. The value is the output with its spans written the
+//! same way. What else it read (files, variables of the shell, a listing) its server's
+//! sandbox traced ([`proc_macro_api::warm`]), and the result is found and kept by exactly
+//! those through [`blaze_usercode::index`]. Every kind of macro is kept.
 //!
-//! Neither is one that failed, nor one whose output has an anchor or a context the input has
-//! not, which the next call could not be given back. A macro that reads files or the
-//! environment by itself does so without asking. Derives and
-//! attributes are kept, as rustc's `-Zcache-proc-macros` keeps derives; function-like macros,
-//! where such reading is (a query checked against a database, a directory put in the
-//! program), only with `BLAZE_PROC_MACRO_CACHE=all`. A macro named in
-//! `BLAZE_PROC_MACRO_CACHE_SKIP` is never kept, `BLAZE_PROC_MACRO_CACHE=check` expands every
-//! call anyway and says which macro gave other output than it kept, and
-//! `BLAZE_PROC_MACRO_CACHE=off` keeps nothing and still counts.
+//! Not kept: an expansion that asked the database about a span (its text, file or line),
+//! since the key does not say what it was told; one whose output has an anchor or a context
+//! its input has not, which the next call could not be given back; one that read what can't
+//! be traced (the clock, randomness); one its server could not trace (`BLAZE_SANDBOX=off`);
+//! and one that failed. `BLAZE_PROC_MACRO_CACHE=check` expands every call it finds kept
+//! anyway, and an output other than the kept one is an error naming the macro.
 //!
-//! The store's own key adds the build of blaze and the toolchain, whose proc-macro server
-//! expands.
+//! A macro of a crate blaze has a native expander for ([`native`]) is expanded by it, and not
+//! kept: `BLAZE_NATIVE_MACROS=verify` expands it both ways and fails the expansion where they
+//! differ; `BLAZE_NATIVE_MACROS=off` uses none.
 //!
 //! [`compare`] holds the toolchain's server against blaze's, and keeps nothing while it does.
 
 mod compare;
+pub mod native;
 
 use std::{
     any::Any,
+    ffi::OsString,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base_db::{Env, SourceDatabase};
-use blaze_store::{KEY, Store};
+use blaze_cas::Store;
+use blaze_core::Traced;
+use blaze_ids::ContentId;
+use blaze_usercode::{
+    Given, RunKey, RunKind,
+    index::{self, FindError, Found, KeepError},
+    inputs::Disk,
+};
 use hir_expand::proc_macro::{ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::{
     legacy_protocol::msg::{FlatTree, SpanDataIndexMap},
     version::CURRENT_API_VERSION,
+    warm::{self, Environment},
 };
 use rustc_hash::FxHashMap;
-use sha2::{Digest, Sha256};
 use span::{Span, SpanAnchor, SyntaxContext, TextRange};
 
-/// What the key of an expansion starts with: another number when the key or the value is
-/// made otherwise.
-const DOMAIN: &[u8] = b"blaze proc-macro expansion 2";
+/// What the content ID of a macro's library is made with.
+pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
 
-#[derive(Clone, Copy, PartialEq)]
-enum Mode {
-    Off,
-    /// Derives and attributes: what a function-like macro is given is the code it reads, and
-    /// the ones that read more than that (a query checked against a database, a directory
-    /// put in the program) are of that kind.
-    On,
-    All,
+/// The variable that says to check kept expansions.
+pub const CACHE: &str = "BLAZE_PROC_MACRO_CACHE";
+
+/// The variable that says how native expanders are used.
+pub const NATIVE: &str = "BLAZE_NATIVE_MACROS";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// What is found is used.
+    Keep,
+    /// What is found is expanded again and compared.
     Check,
 }
 
-struct Config {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Native {
+    On,
+    Verify,
+    Off,
+}
+
+impl Mode {
+    /// The mode `value` of [`CACHE`] says.
+    pub fn of(value: Option<&str>) -> Result<Mode, String> {
+        match value {
+            None => Ok(Mode::Keep),
+            Some("check") => Ok(Mode::Check),
+            Some(other) => Err(format!(
+                "{CACHE}={other:?} is not a mode: every expansion that can be kept is, and \
+                 `check` expands what was kept again and compares"
+            )),
+        }
+    }
+}
+
+impl Native {
+    /// The use `value` of [`NATIVE`] says.
+    pub fn of(value: Option<&str>) -> Result<Native, String> {
+        match value {
+            None => Ok(Native::On),
+            Some("verify") => Ok(Native::Verify),
+            Some("off") => Ok(Native::Off),
+            Some(other) => {
+                Err(format!("{NATIVE}={other:?} is not `verify` or `off` (or unset, to use them)"))
+            }
+        }
+    }
+}
+
+/// Where expansions are kept, and what they are keyed by besides their call.
+pub struct Expansions {
+    pub store: Arc<RwLock<Store>>,
+    /// The toolchain whose proc-macro ABI and library the macros are built with.
+    pub toolchain: ContentId,
+    /// What warm servers pass through to the expansions, which they are checked against.
+    pub environment: Arc<Environment>,
+}
+
+struct Installed {
+    expansions: Expansions,
     mode: Mode,
-    skip: Vec<Box<str>>,
-    compare: bool,
+    native: Native,
+    /// The machine's files, hashed once per change of what `stat` says of them.
+    disk: Mutex<Disk>,
 }
 
-fn config() -> &'static Config {
-    static CONFIG: OnceLock<Config> = OnceLock::new();
-    CONFIG.get_or_init(|| {
-        let mode = match std::env::var("BLAZE_PROC_MACRO_CACHE").as_deref() {
-            Ok("off" | "0") => Mode::Off,
-            Ok("all") => Mode::All,
-            Ok("check") => Mode::Check,
-            _ => Mode::On,
-        };
-        let skip = std::env::var("BLAZE_PROC_MACRO_CACHE_SKIP").unwrap_or_default();
-        let skip = skip.split(',').map(str::trim).filter(|it| !it.is_empty()).map(Into::into);
-        let compare = std::env::var_os("BLAZE_PROC_MACRO_COMPARE").is_some();
-        Config { mode, skip: skip.collect(), compare }
-    })
-}
+static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
-/// Puts the cache around every proc macro the workspaces load from here on.
-pub fn install() {
+/// Keeps every proc-macro expansion of the workspaces loaded from here on in `expansions`.
+/// Says why not when [`CACHE`] or [`NATIVE`] has a value that is not one, or it was installed
+/// before.
+pub fn install(expansions: Expansions) -> Result<(), String> {
+    let var = |name: &str| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")),
+    };
+    let mode = Mode::of(var(CACHE)?.as_deref())?;
+    let native = Native::of(var(NATIVE)?.as_deref())?;
+    let installed = Installed { expansions, mode, native, disk: Mutex::new(Disk::new(Vec::new())) };
+    INSTALLED.set(installed).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
     load_cargo::wrap_expanders(wrap);
+    Ok(())
+}
+
+fn installed() -> &'static Installed {
+    INSTALLED.get().expect("an expander is wrapped only once install has been")
 }
 
 fn wrap(
@@ -101,38 +156,41 @@ fn wrap(
     name: &str,
     kind: ProcMacroKind,
 ) -> Arc<dyn ProcMacroExpander> {
-    let skipped = match config().mode {
-        Mode::Off => true,
-        Mode::On => kind == ProcMacroKind::Bang,
-        Mode::All | Mode::Check => false,
-    } || inner.requires_session()
-        || config().compare
-        || config().skip.iter().any(|it| **it == *name);
-    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, skipped })
+    let native = match installed().native {
+        Native::Off => Ok(None),
+        Native::On | Native::Verify => native::find(dylib, name, kind),
+    };
+    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, native })
 }
 
-/// A dylib of proc macros, hashed the first time one of its macros expands.
+/// A library of proc macros, hashed the first time one of its macros expands.
 #[derive(Debug)]
 struct Dylib {
     path: AbsPathBuf,
-    hash: OnceLock<Option<[u8; KEY]>>,
+    code: OnceLock<Result<ContentId, String>>,
 }
 
 impl Dylib {
-    /// The one dylib at `path`: the macros of a dylib share its hash.
+    /// The one library at `path` as it is now: the macros of a library share its hash, and a
+    /// library built again where it was is another.
     fn at(path: &AbsPath) -> Arc<Dylib> {
-        static DYLIBS: Mutex<Option<FxHashMap<AbsPathBuf, Arc<Dylib>>>> = Mutex::new(None);
+        type Seen = (AbsPathBuf, Option<(SystemTime, u64)>);
+        static DYLIBS: Mutex<Option<FxHashMap<Seen, Arc<Dylib>>>> = Mutex::new(None);
+        let stamp = std::fs::metadata(path).ok().and_then(|it| Some((it.modified().ok()?, it.len())));
         let mut dylibs = DYLIBS.lock().unwrap_or_else(|it| it.into_inner());
         let dylibs = dylibs.get_or_insert_default();
-        let dylib = dylibs.entry(path.to_path_buf());
-        dylib
-            .or_insert_with(|| Arc::new(Dylib { path: path.to_path_buf(), hash: OnceLock::new() }))
+        dylibs
+            .entry((path.to_path_buf(), stamp))
+            .or_insert_with(|| Arc::new(Dylib { path: path.to_path_buf(), code: OnceLock::new() }))
             .clone()
     }
 
-    fn hash(&self) -> Option<&[u8; KEY]> {
-        let hash = || Some(Sha256::digest(std::fs::read(&self.path).ok()?).into());
-        self.hash.get_or_init(hash).as_ref()
+    fn code(&self) -> Result<ContentId, String> {
+        let code = || match std::fs::read(&self.path) {
+            Ok(bytes) => Ok(ContentId::of(LIBRARY, &bytes)),
+            Err(error) => Err(format!("the proc-macro library {} can't be read: {error}", self.path)),
+        };
+        self.code.get_or_init(code).clone()
     }
 }
 
@@ -142,23 +200,18 @@ struct Kept {
     dylib: Arc<Dylib>,
     name: Box<str>,
     kind: ProcMacroKind,
-    skipped: bool,
-}
-
-/// What the expansion of a call is kept under, and the anchors and contexts of its spans,
-/// which the output is written against.
-struct Call {
-    key: [u8; KEY],
-    spans: Spans,
+    /// Its native expander, when blaze has one for it, or why finding one failed.
+    native: Result<Option<native::Macro>, String>,
 }
 
 /// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
 /// context among the call's.
-type Shape = [u32; 4];
+pub type Shape = [u32; 4];
 
-/// The anchors and syntax contexts of a call's spans, in the order they first appear.
-#[derive(Default)]
-struct Spans {
+/// The anchors and syntax contexts of a call's spans, in the order they first appear: what
+/// its output is written against.
+#[derive(Default, Debug)]
+pub struct Spans {
     anchors: Vec<SpanAnchor>,
     contexts: Vec<SyntaxContext>,
 }
@@ -194,101 +247,236 @@ impl Spans {
     }
 }
 
+/// One call of a macro, as its key is made of it.
+pub struct Call<'a> {
+    pub name: &'a str,
+    pub kind: ProcMacroKind,
+    pub subtree: &'a tt::TopSubtree,
+    pub attrs: Option<&'a tt::TopSubtree>,
+    pub env: &'a Env,
+    pub def_site: Span,
+    pub call_site: Span,
+    pub mixed_site: Span,
+    pub current_dir: &'a str,
+}
+
+fn kind_byte(kind: ProcMacroKind) -> u8 {
+    match kind {
+        ProcMacroKind::CustomDerive => 0,
+        ProcMacroKind::Attr => 1,
+        ProcMacroKind::Bang => 2,
+    }
+}
+
+fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
+    postcard::to_allocvec(value).expect("a flat tree and a list of numbers encode")
+}
+
+/// What `call` gives the macro, for its [`RunKey::given`] with the toolchain `toolchain`, and
+/// the anchors and contexts its output is written against. A wasm macro's caller adds what
+/// else it gives a module.
+pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
+    let mut table = SpanDataIndexMap::default();
+    for span in [call.def_site, call.call_site, call.mixed_site] {
+        table.insert(span);
+    }
+    let input = FlatTree::from_subtree(call.subtree.view(), CURRENT_API_VERSION, &mut table);
+    let attrs =
+        call.attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
+    let mut spans = Spans::default();
+    let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
+    let mut given = Given::new(RunKind::ProcMacro);
+    given
+        .part("name", call.name.as_bytes())
+        .part("kind", &[kind_byte(call.kind)])
+        .part("abi", &CURRENT_API_VERSION.to_le_bytes())
+        .id("toolchain", toolchain)
+        .part("input", &encoded(&input))
+        .part("attrs", &encoded(&attrs))
+        .part("spans", &encoded(&shapes))
+        .part("dir", call.current_dir.as_bytes());
+    for (name, value) in call.env.iter() {
+        given.env(name, value);
+    }
+    (given, spans)
+}
+
+/// The output with its spans as shapes of the call's, or `None` when it has an anchor or a
+/// context the call has not.
+pub fn written(output: &tt::TopSubtree, spans: &Spans) -> Option<Vec<u8>> {
+    let mut table = SpanDataIndexMap::default();
+    let flat = FlatTree::from_subtree(output.view(), CURRENT_API_VERSION, &mut table);
+    let shapes: Option<Vec<Shape>> = table.iter().map(|span| spans.shape(span)).collect();
+    Some(encoded(&(shapes?, flat)))
+}
+
+/// What [`written`] wrote, against the call's `spans`.
+pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
+    let (shapes, flat): (Vec<Shape>, FlatTree) =
+        postcard::from_bytes(bytes).map_err(|error| format!("not a kept expansion: {error}"))?;
+    let table: Option<SpanDataIndexMap> = shapes.into_iter().map(|it| spans.span(it)).collect();
+    let table = table.ok_or("a kept expansion has a span of an anchor or context its call has not")?;
+    Ok(flat.to_subtree_resolved(CURRENT_API_VERSION, &table))
+}
+
+/// The first expansion that failed for a reason that is not the macro's own (its server died,
+/// the store is broken): what is said of it.
+static SERVER_FAILED: OnceLock<String> = OnceLock::new();
+
+fn system(said: String) -> ProcMacroExpansionError {
+    if SERVER_FAILED.set(said.clone()).is_ok() {
+        eprintln!("proc macros: {said}");
+    }
+    ProcMacroExpansionError::System(said)
+}
+
+/// What is said of the first expansion in this process that failed for a reason that is not
+/// the macro's own, when one did. The macros of that call did not expand, so what is built
+/// from them is not the program: a build fails with this, at the point it is first seen,
+/// rather than with a name the expansion would have defined (no-fallback).
+pub fn server_failed() -> Option<&'static str> {
+    SERVER_FAILED.get().map(String::as_str)
+}
+
 impl Kept {
+    fn failed(&self, expanded: Result<tt::TopSubtree, ProcMacroExpansionError>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        match expanded {
+            Err(ProcMacroExpansionError::System(why)) => Err(system(format!(
+                "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
+                 expand is missing from the program, so nothing is built from it",
+                self.name, self.dylib.path
+            ))),
+            other => other,
+        }
+    }
+
+    fn error(&self, why: impl std::fmt::Display) -> ProcMacroExpansionError {
+        system(format!("the expansion of `{}` of {}: {why}", self.name, self.dylib.path))
+    }
+
+    /// Expands by the macro's server or module, through the store.
     #[allow(clippy::too_many_arguments)]
-    fn call(
+    fn kept(
         &self,
+        db: &dyn SourceDatabase,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
-        current_dir: &str,
-    ) -> Option<Call> {
-        let mut table = SpanDataIndexMap::default();
-        for span in [def_site, call_site, mixed_site] {
-            table.insert(span);
-        }
-        let input = FlatTree::from_subtree(subtree.view(), CURRENT_API_VERSION, &mut table);
-        let attrs =
-            attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
-        let mut spans = Spans::default();
-        let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
-        let mut env: Vec<_> = env.iter().collect();
-        env.sort_unstable();
-        let mut hasher = Sha256::new();
-        let mut field = |bytes: &[u8]| {
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
+        current_dir: String,
+    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+        let installed = installed();
+        let start = Instant::now();
+        let call = Call {
+            name: &self.name,
+            kind: self.kind,
+            subtree,
+            attrs,
+            env,
+            def_site,
+            call_site,
+            mixed_site,
+            current_dir: &current_dir,
         };
-        field(DOMAIN);
-        field(self.dylib.hash()?);
-        field(self.name.as_bytes());
-        field(&[self.kind as u8]);
-        field(&CURRENT_API_VERSION.to_le_bytes());
-        field(&postcard::to_allocvec(&input).ok()?);
-        field(&postcard::to_allocvec(&attrs).ok()?);
-        field(&postcard::to_allocvec(&shapes).ok()?);
-        field(&(env.len() as u64).to_le_bytes());
-        for (name, value) in env {
-            field(name.as_bytes());
-            field(value.as_bytes());
+        let (given, spans) = given(&installed.expansions.toolchain, &call);
+        let code = self.dylib.code().map_err(|why| self.error(why))?;
+        let run = RunKey { code, given: given.finish() };
+        let call_env: Vec<(String, String)> =
+            env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+        let seen = Environment::seen(&installed.expansions.environment.passed(), &call_env);
+        let found = {
+            let store = installed.expansions.store.read().unwrap_or_else(|it| it.into_inner());
+            let mut disk = installed.disk.lock().unwrap_or_else(|it| it.into_inner());
+            disk.set_env(seen);
+            match index::find(&store, &run, &mut *disk) {
+                Ok(Found::Hit { value, .. }) => Some(value.to_vec()),
+                Ok(Found::Miss { .. }) => None,
+                Err(FindError::Corrupt(corrupt)) => return Err(self.error(corrupt)),
+                Err(FindError::NotAShape { key, why }) => {
+                    return Err(self.error(format!("the store's {key:?} is not a shape: {why}")));
+                }
+                Err(FindError::Inputs(unreadable)) => return Err(self.error(unreadable)),
+            }
+        };
+        COUNTS.keyed.add(start.elapsed());
+        if let Some(bytes) = &found
+            && installed.mode == Mode::Keep
+        {
+            let output = read(bytes, &spans).map_err(|why| self.error(why))?;
+            COUNTS.found.add(start.elapsed());
+            return Ok(output);
         }
-        field(current_dir.as_bytes());
-        Some(Call { key: hasher.finalize().into(), spans })
-    }
-}
-
-/// The output with its spans as shapes of the call's, or `None` when it has an anchor or a
-/// context the call has not.
-fn written(output: &tt::TopSubtree, spans: &Spans) -> Option<Vec<u8>> {
-    let mut table = SpanDataIndexMap::default();
-    let flat = FlatTree::from_subtree(output.view(), CURRENT_API_VERSION, &mut table);
-    let shapes: Option<Vec<Shape>> = table.iter().map(|span| spans.shape(span)).collect();
-    postcard::to_allocvec(&(shapes?, flat)).ok()
-}
-
-fn read(bytes: &[u8], spans: &Spans) -> Option<tt::TopSubtree> {
-    let (shapes, flat): (Vec<Shape>, FlatTree) = postcard::from_bytes(bytes).ok()?;
-    let table: Option<SpanDataIndexMap> = shapes.into_iter().map(|it| spans.span(it)).collect();
-    Some(flat.to_subtree_resolved(CURRENT_API_VERSION, &table?))
-}
-
-/// The store, once the daemon has told it the toolchain: asked before that, it would be
-/// opened without one, which is not to have one for as long as the process runs.
-fn store() -> Option<&'static Store> {
-    blaze_store::toolchain()?;
-    Store::global()
-}
-
-/// The first expansion the proc-macro server itself failed, not the macro: what is said of it.
-static SERVER_FAILED: OnceLock<String> = OnceLock::new();
-
-impl Kept {
-    /// Keeps what is said of `expanded` when the server failed it: a server that died or
-    /// answered nothing expands no macro after it, and each call it failed is an error the
-    /// database keeps, so every build of the process fails with it ([`server_failed`]).
-    fn failed(&self, expanded: &Result<tt::TopSubtree, ProcMacroExpansionError>) {
-        if let Err(ProcMacroExpansionError::System(why)) = expanded {
-            let said = format!(
-                "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
-                 expand is missing from the program, so nothing is built from it",
-                self.name, self.dylib.path
-            );
-            if SERVER_FAILED.set(said).is_ok() {
-                eprintln!("proc macros: {}", SERVER_FAILED.get().map_or("", String::as_str));
+        let asked = load_cargo::asked();
+        let expand = Instant::now();
+        let expanded =
+            self.inner.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir);
+        let traced = warm::take_traced();
+        COUNTS.expanded.add(expand.elapsed());
+        COUNTS.kinds[kind_byte(self.kind) as usize].add(expand.elapsed());
+        let output = match self.failed(expanded) {
+            Ok(output) => output,
+            Err(error) => {
+                COUNTS.failed.add(Duration::ZERO);
+                return Err(error);
+            }
+        };
+        let bytes = written(&output, &spans);
+        if let Some(kept) = &found {
+            if bytes.as_ref() != Some(kept) {
+                return Err(self.error(format!(
+                    "{CACHE}=check: it expanded otherwise than the store kept it, under a key \
+                     of every input it was traced to read"
+                )));
+            }
+            COUNTS.checked.add(Duration::ZERO);
+            return Ok(output);
+        }
+        let traced = match self.keepable(traced, asked) {
+            Ok(Some(traced)) => traced,
+            Ok(None) => return Ok(output),
+            Err(error) => return Err(error),
+        };
+        let Some(bytes) = bytes else {
+            COUNTS.unspanned.add(Duration::ZERO);
+            return Ok(output);
+        };
+        let mut store = installed.expansions.store.write().unwrap_or_else(|it| it.into_inner());
+        match index::keep(&mut store, &run, &traced, bytes) {
+            Ok(_) => COUNTS.kept.add(Duration::ZERO),
+            Err(KeepError::Corrupt(corrupt)) => return Err(self.error(corrupt)),
+            Err(KeepError::Mismatch(mismatch)) => {
+                return Err(self.error(format!(
+                    "the store has another expansion under the same key of every input it read, \
+                     so the key misses an input or the macro is not deterministic: {mismatch:?}"
+                )));
             }
         }
+        Ok(output)
     }
-}
 
-/// What is said of the first expansion the proc-macro server failed in this process, when
-/// one did. The macros of that call and of every one after it did not expand, so what is built
-/// from them is not the program: a build fails with this, at the point it is first seen,
-/// rather than with a name the expansion would have defined (no-fallback).
-pub fn server_failed() -> Option<&'static str> {
-    SERVER_FAILED.get().map(String::as_str)
+    /// What the expansion read, when it can be kept by it: `None` when it can't be, counted
+    /// by why.
+    fn keepable(&self, traced: Option<Result<Traced, String>>, asked: usize) -> Result<Option<Traced>, ProcMacroExpansionError> {
+        let traced = match traced {
+            Some(Ok(traced)) => traced,
+            Some(Err(why)) => return Err(self.error(why)),
+            None => {
+                COUNTS.untraced.add(Duration::ZERO);
+                return Ok(None);
+            }
+        };
+        if load_cargo::asked() != asked {
+            COUNTS.asked.add(Duration::ZERO);
+            return Ok(None);
+        }
+        if index::untraceable(&traced) {
+            COUNTS.untraceable.add(Duration::ZERO);
+            return Ok(None);
+        }
+        Ok(Some(traced))
+    }
 }
 
 impl ProcMacroExpander for Kept {
@@ -318,44 +506,53 @@ impl ProcMacroExpander for Kept {
                 mixed_site,
                 current_dir,
             );
-            self.failed(&expanded);
-            return expanded;
+            return self.failed(expanded);
         }
-        let start = Instant::now();
-        let mode = config().mode;
-        let store = (!self.skipped).then(store).flatten();
-        let call = store.and_then(|_| {
-            self.call(subtree, attrs, env, def_site, call_site, mixed_site, &current_dir)
-        });
-        if call.is_some() {
-            COUNTS.keyed.add(start.elapsed());
+        let native = match &self.native {
+            Ok(native) => native.as_ref(),
+            Err(why) => return Err(self.error(format!("its native expander: {why}"))),
+        };
+        if let Some(native) = native {
+            let start = Instant::now();
+            let natively =
+                native.expand(db, subtree, attrs, env, def_site, call_site, mixed_site);
+            COUNTS.native.add(start.elapsed());
+            if installed().native != Native::Verify {
+                return natively;
+            }
+            let normally = self.kept(
+                db,
+                subtree,
+                attrs,
+                env,
+                def_site,
+                call_site,
+                mixed_site,
+                current_dir,
+            )?;
+            let natively = natively.map_err(|error| {
+                self.error(format!("{NATIVE}=verify: its native expander failed: {error:?}"))
+            })?;
+            if let Some(difference) = native::difference(&natively, &normally) {
+                return Err(self.error(format!(
+                    "{NATIVE}=verify: its native expander's output differs from the macro's: \
+                     {difference}"
+                )));
+            }
+            COUNTS.verified.add(Duration::ZERO);
+            return Ok(normally);
         }
-        let found = store.zip(call.as_ref()).and_then(|(store, call)| store.get(&call.key));
-        if let (Some(bytes), Some(call)) = (&found, &call)
-            && mode != Mode::Check
-            && let Some(output) = read(bytes, &call.spans)
-        {
-            COUNTS.found.add(start.elapsed());
-            return Ok(output);
-        }
-        // What was found and could not be read is written again.
-        let found = found.filter(|_| mode == Mode::Check);
-        let asked = load_cargo::asked();
-        let expand = Instant::now();
-        let expanded = self.inner.expand(
-            db,
-            subtree,
-            attrs,
-            env,
-            def_site,
-            call_site,
-            mixed_site,
-            current_dir.clone(),
-        );
-        COUNTS.expanded.add(expand.elapsed());
-        COUNTS.kinds[kind_index(self.kind)].add(expand.elapsed());
-        self.failed(&expanded);
-        if config().compare {
+        if compare::enabled() {
+            let expanded = self.inner.expand(
+                db,
+                subtree,
+                attrs,
+                env,
+                def_site,
+                call_site,
+                mixed_site,
+                current_dir.clone(),
+            );
             compare::again(
                 &self.dylib.path,
                 &self.name,
@@ -370,33 +567,9 @@ impl ProcMacroExpander for Kept {
                 &current_dir,
                 &expanded,
             );
+            return self.failed(expanded);
         }
-        let (Some(store), Some(call), Ok(output)) = (store, &call, &expanded) else {
-            if expanded.is_err() {
-                COUNTS.failed.add(Duration::ZERO);
-            }
-            return expanded;
-        };
-        if load_cargo::asked() != asked {
-            COUNTS.asked.add(Duration::ZERO);
-            return expanded;
-        }
-        let Some(bytes) = written(output, &call.spans) else {
-            COUNTS.unspanned.add(Duration::ZERO);
-            return expanded;
-        };
-        match found {
-            Some(kept) if kept != bytes => {
-                COUNTS.differed.add(Duration::ZERO);
-                eprintln!("proc macros: `{}` expanded otherwise than it was kept", self.name);
-            }
-            Some(_) => COUNTS.found.add(Duration::ZERO),
-            None => {
-                store.insert(&call.key, &bytes);
-                COUNTS.kept.add(Duration::ZERO);
-            }
-        }
-        expanded
+        self.kept(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)
     }
 
     fn expand_in(
@@ -423,7 +596,8 @@ impl ProcMacroExpander for Kept {
                 current_dir,
             );
         }
-        // Neither an output-cache hit nor a diagnostic second run can replay guest state.
+        // A module that keeps state between calls keeps its sessions itself
+        // (blaze-macro-wasm's `Verdict`): its output is a function of the calls before it.
         let start = Instant::now();
         let expanded = self.inner.expand_in(
             db,
@@ -437,12 +611,11 @@ impl ProcMacroExpander for Kept {
             current_dir,
         );
         COUNTS.expanded.add(start.elapsed());
-        COUNTS.kinds[kind_index(self.kind)].add(start.elapsed());
+        COUNTS.kinds[kind_byte(self.kind) as usize].add(start.elapsed());
         if expanded.is_err() {
             COUNTS.failed.add(Duration::ZERO);
         }
-        self.failed(&expanded);
-        expanded
+        self.failed(expanded)
     }
 
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
@@ -474,19 +647,26 @@ impl Count {
 }
 
 struct Counts {
-    /// Calls given a key, with the time that took.
+    /// Calls given a key and looked for, with the time that took.
     keyed: Count,
-    /// Expanded by the proc-macro server, kept or not.
+    /// Expanded by the macro's server or module, kept or not.
     expanded: Count,
-    /// The same, by [`kind_index`].
+    /// The same, by [`kind_byte`].
     kinds: [Count; 3],
-    /// Read from the store instead (and, under `check`, expanded and the same).
+    /// Read from the store instead.
     found: Count,
+    /// Expanded again under `check`, and the same as kept.
+    checked: Count,
+    /// Expanded by a native expander.
+    native: Count,
+    /// Expanded both ways under `verify`, and the same.
+    verified: Count,
     kept: Count,
     asked: Count,
     unspanned: Count,
+    untraced: Count,
+    untraceable: Count,
     failed: Count,
-    differed: Count,
 }
 
 static COUNTS: Counts = Counts {
@@ -494,32 +674,30 @@ static COUNTS: Counts = Counts {
     expanded: Count::new(),
     kinds: [Count::new(), Count::new(), Count::new()],
     found: Count::new(),
+    checked: Count::new(),
+    native: Count::new(),
+    verified: Count::new(),
     kept: Count::new(),
     asked: Count::new(),
     unspanned: Count::new(),
+    untraced: Count::new(),
+    untraceable: Count::new(),
     failed: Count::new(),
-    differed: Count::new(),
 };
-
-fn kind_index(kind: ProcMacroKind) -> usize {
-    match kind {
-        ProcMacroKind::CustomDerive => 0,
-        ProcMacroKind::Attr => 1,
-        ProcMacroKind::Bang => 2,
-    }
-}
 
 /// The expansions so far, for the daemon's log: `None` before the first.
 pub fn report() -> Option<String> {
     let (expanded, expanding) = COUNTS.expanded.get();
     let (found, finding) = COUNTS.found.get();
-    if expanded + found == 0 {
+    let (native, natively) = COUNTS.native.get();
+    if expanded + found + native == 0 {
         return None;
     }
     let (_, keying) = COUNTS.keyed.get();
     let mut said = format!(
         "proc macros: {expanded} expanded in {expanding:.2}s, {found} from the store in \
-         {finding:.2}s, {keying:.2}s to key them"
+         {finding:.2}s, {keying:.2}s to key and look for them, {native} natively in \
+         {natively:.2}s"
     );
     let kinds = ["derives", "attributes", "function-like"].iter().zip(&COUNTS.kinds);
     let kinds: Vec<_> = kinds
@@ -533,10 +711,13 @@ pub fn report() -> Option<String> {
     }
     let rest = [
         ("kept", &COUNTS.kept),
+        ("checked against what was kept", &COUNTS.checked),
+        ("verified against their native expander", &COUNTS.verified),
         ("not kept, as they asked the database", &COUNTS.asked),
         ("not kept, as their output has spans the call has not", &COUNTS.unspanned),
+        ("not kept, as their server traces nothing (BLAZE_SANDBOX=off)", &COUNTS.untraced),
+        ("not kept, as they read the clock or randomness", &COUNTS.untraceable),
         ("failed", &COUNTS.failed),
-        ("expanded otherwise than kept", &COUNTS.differed),
     ];
     for (what, count) in rest {
         let (calls, _) = count.get();
@@ -549,3 +730,14 @@ pub fn report() -> Option<String> {
     }
     Some(said)
 }
+
+/// The environment a call is checked against for a warm server, for a caller that keys
+/// expansions itself.
+pub fn seen(env: &Env) -> Vec<(OsString, OsString)> {
+    let call: Vec<(String, String)> =
+        env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
+    Environment::seen(&installed().expansions.environment.passed(), &call)
+}
+
+#[cfg(test)]
+mod tests;

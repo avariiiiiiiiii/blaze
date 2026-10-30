@@ -407,3 +407,77 @@ impl RealSpanMap {
         self.starts[at]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use blaze_ids::ContentId;
+
+    use super::*;
+    use crate::FileId;
+
+    fn file() -> EditionedFileId {
+        EditionedFileId::current_edition(FileId::from_raw(0))
+    }
+
+    fn at(offset: u32) -> TextSize {
+        TextSize::new(offset)
+    }
+
+    fn range(start: u32, end: u32) -> TextRange {
+        TextRange::new(at(start), at(end))
+    }
+
+    fn id(raw: u32) -> ErasedFileAstId {
+        ErasedFileAstId::from_raw(raw)
+    }
+
+    /// Anchors at 0, `first` and `first + 15`, in a text that ends 15 past the last.
+    fn map(first: u32) -> RealSpanMap {
+        let pairs = [(at(0), ROOT_ERASED_FILE_AST_ID), (at(first), id(1)), (at(first + 15), id(2))];
+        RealSpanMap::from_file(file(), Box::new(pairs), at(first + 30))
+    }
+
+    #[test]
+    fn an_offset_has_the_last_anchor_at_or_before_it() {
+        let map = map(10);
+        assert_eq!(map.anchor_at(at(0)), (at(0), ROOT_ERASED_FILE_AST_ID));
+        assert_eq!(map.anchor_at(at(9)), (at(0), ROOT_ERASED_FILE_AST_ID));
+        assert_eq!(map.anchor_at(at(10)), (at(10), id(1)));
+        assert_eq!(map.anchor_at(at(24)), (at(10), id(1)));
+        assert_eq!(map.anchor_at(at(25)), (at(25), id(2)));
+        assert_eq!(map.end(), at(40));
+
+        // An item at the very start of the file is the anchor there, not the root.
+        let pairs = [(at(0), ROOT_ERASED_FILE_AST_ID), (at(0), id(1))];
+        let map = RealSpanMap::from_file(file(), Box::new(pairs), at(5));
+        assert_eq!(map.anchor_at(at(0)), (at(0), id(1)));
+    }
+
+    #[test]
+    fn what_is_kept_is_lengths() {
+        // The text before the first item grew: only the root's length is another.
+        let (map, moved) = (map(10), map(12));
+        assert_ne!(map, moved);
+        assert_eq!(map.anchors[1..], moved.anchors[1..]);
+        assert_eq!(map.within(range(10, 40)), moved.within(range(12, 42)));
+        let within = map.within(range(10, 40));
+        assert_eq!(within.anchor_at(at(0)), (at(0), id(1)));
+        assert_eq!(within.anchor_at(at(15)), (at(15), id(2)));
+        assert_eq!(within.end(), at(30));
+    }
+
+    #[test]
+    fn spans_are_written_relative_to_their_anchor() {
+        let anchor = ContentId::of("blaze v2 test 1", b"an item");
+        let spans = map(10).write_spans(anchor, id(1), [range(12, 15), range(10, 40), range(30, 31)]);
+        assert_eq!(spans.anchor, anchor);
+        let spans: Vec<_> = spans.spans.iter().map(|it| (it.start, it.len)).collect();
+        assert_eq!(spans, [(2, 3), (0, 30), (20, 1)]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn a_span_before_its_anchor_is_refused() {
+        map(10).write_spans(ContentId::default(), id(2), [range(12, 15)]);
+    }
+}

@@ -265,6 +265,8 @@ pub(super) struct Inlinable {
     pub(super) pointees: Vec<(u32, Pointee)>,
     /// The bodies of what it calls that LLVM is shown, as [`Recorder::seen`].
     pub(super) seen: Vec<Seen>,
+    /// The instances whose bodies it has in it, as [`Recorder::built_in`].
+    pub(super) built_in: Vec<Instance>,
 }
 
 impl Inlinable {
@@ -276,6 +278,7 @@ impl Inlinable {
         requests: Requests,
         pointees: Vec<(u32, Pointee)>,
         seen: Vec<Seen>,
+        built_in: Vec<Instance>,
     ) -> Option<Inlinable> {
         let hashed_later = requests.datas.iter().any(|it| match it {
             DataRequest::Blob { blob, .. } | DataRequest::Vtable { blob, .. } => {
@@ -288,6 +291,7 @@ impl Inlinable {
             requests,
             pointees,
             seen,
+            built_in,
         })
     }
 }
@@ -339,6 +343,10 @@ pub(super) struct Recorder<'db> {
     pub(super) target: &'static Target,
     /// Whether the crate compiling the function has `-C overflow-checks`.
     pub(super) checked: bool,
+    /// `-C debug-assertions` of the crate compiling the function, which `ub_checks()` is
+    /// there, where the one that builds it knows (v2's `Spec::debug_assertions`). `None`:
+    /// the crate of the environment's, as [`super::ub_checks_of`] reads it.
+    pub(super) debug_assertions: Option<bool>,
     /// What it asks for, which is all a producer of its code needs of this.
     pub(super) wants: Wants,
     vtables: FxHashMap<(StoredTy, Option<(TraitId, StoredGenericArgs)>), DataId>,
@@ -361,6 +369,9 @@ pub(super) struct Recorder<'db> {
     /// The bodies of the callees that are built into their callers, which call them by their
     /// place here in [`INLINED`] until [`inline`](super::inline) puts the bodies there.
     pub(super) inlined: Vec<ir::Function>,
+    /// The instances whose bodies are in [`Self::inlined`], and the ones those have in them,
+    /// each once: a change to the code of one is a change to this function's.
+    pub(super) built_in: Vec<Instance>,
     /// The function is built to be put in its callers, whose statements its instructions
     /// are then of: it marks none with a statement of its own.
     pub(super) unlocated: bool,
@@ -629,20 +640,12 @@ impl Wants {
         self.isa.triple().binary_format == target_lexicon::BinaryFormat::Coff
     }
 
-    /// Whether a call names its callee in place, for the linker to send through a stub of
-    /// its own when the callee turns out to be another library's, rather than load the
-    /// callee's address from a slot first. An x86-64 ELF linker does that for a `call`.
-    fn calls_in_place(&self) -> bool {
-        let triple = self.isa.triple();
-        self.within_image()
-            || (triple.binary_format == target_lexicon::BinaryFormat::Elf
-                && triple.architecture == target_lexicon::Architecture::X86_64)
-    }
-
     /// Names a requested function in `func`, to call it. Whether the function ends up in
-    /// this object is not known here.
+    /// this object is not known here: the call names its callee in place, as rustc's do,
+    /// and the linker (or the splice) sends it through a stub of its own where the callee
+    /// is another library's or out of a branch's reach.
     pub(super) fn declare_func_in_func(&self, id: FuncId, func: &mut ir::Function) -> ir::FuncRef {
-        self.declare_func(id, func, self.calls_in_place())
+        self.declare_func(id, func, true)
     }
 
     /// Names a requested function in `func`, to take its address: it is reached the way a
@@ -702,6 +705,7 @@ impl<'db> Recorder<'db> {
             isa,
             target,
             checked,
+            debug_assertions: None,
             wants: Wants::new(isa),
             vtables: FxHashMap::default(),
             statics: FxHashMap::default(),
@@ -714,6 +718,7 @@ impl<'db> Recorder<'db> {
             named: Vec::new(),
             frame_locals: None,
             inlined: Vec::new(),
+            built_in: Vec::new(),
             unlocated: false,
             opaque: false,
         }
@@ -929,9 +934,15 @@ impl<'db> Recorder<'db> {
     /// it asked for asked for here.
     pub(super) fn declare_inlined(
         &mut self,
+        instance: &Instance,
         body: &Inlinable,
         func: &mut ir::Function,
     ) -> ir::FuncRef {
+        for it in std::iter::once(instance).chain(&body.built_in) {
+            if !self.built_in.contains(it) {
+                self.built_in.push(it.clone());
+            }
+        }
         let callee = self.moved(body);
         let signature = func.import_signature(callee.signature.clone());
         let name = func.declare_imported_user_function(ir::UserExternalName {

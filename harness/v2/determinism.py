@@ -1,5 +1,5 @@
 """determinism.py: every corpus build twice, on different core counts, byte for byte the same
-(docs/v2/README.md section 1, "Deterministic", and docs/v2/proof.md). Linux only: a build is
+(docs/v2/plan/principles.md, "Deterministic", and docs/v2/proof.md). Linux only: a build is
 pinned to its cores with the scheduler's affinity, as `taskset -c` pins one.
 
     uv run --frozen python harness/v2/determinism.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/determinism.json"}'

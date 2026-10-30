@@ -12,11 +12,11 @@ use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 
 use crate::{
-    CodegenError, CompiledFunction, InstanceKey, Unit,
+    CodegenError, CompiledFunction, InstanceKey, Static, Unit,
     plan::Origin,
     settings::Spec,
     summary::{Imports, Summary},
-    template::{CompiledStatic, Refs},
+    template::Refs,
 };
 
 /// Whether a function's address is something the program can tell apart from another's.
@@ -37,6 +37,8 @@ pub enum FrontRef<I, S> {
     Static(S),
     /// A symbol outside blaze's code, by its link name.
     Extern(String),
+    /// The same, linked weakly (`#[linkage = "extern_weak"]`).
+    Weak(String),
 }
 
 /// What the front end says of a function instance, without compiling it.
@@ -212,5 +214,5 @@ pub trait Prepare: Sync {
         spec: &Spec,
         value: &<Self::Frontend as Frontend>::Static,
         refs: &Refs,
-    ) -> Result<CompiledStatic, CodegenError>;
+    ) -> Result<Static, CodegenError>;
 }

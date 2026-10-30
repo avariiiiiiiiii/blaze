@@ -20,7 +20,7 @@ layout (field order under a derive, `repr`, a private field's type), names a pro
 a panic's location), cfgs and features, a build script's environment and `option_env!`. Its
 tests pass or fail by the state, so a stale test result shows too.
 
-`budget_zero` marks the slots whose edits section 1 says compile nothing (formatting, comments,
+`budget_zero` marks the slots whose edits docs/v2/plan/targets.md says compile nothing (formatting, comments,
 a rename or a move no program reads, the `PATH` a build is run with, #805).
 """
 

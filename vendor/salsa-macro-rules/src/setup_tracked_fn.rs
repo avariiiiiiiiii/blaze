@@ -547,7 +547,7 @@ macro_rules! setup_tracked_fn {
                             db: &mut dyn $Db,
                             keys: impl ::std::iter::IntoIterator<Item = ($($interned_input_ty),*)>,
                         ) -> usize where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
-                            let keys: ::std::vec::Vec<::salsa::Id> = keys
+                            let keys: ::std::vec::Vec<$zalsa::Id> = keys
                                 .into_iter()
                                 .map(|key| $zalsa::AsId::as_id(&key))
                                 .collect();

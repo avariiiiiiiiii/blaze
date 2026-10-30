@@ -74,7 +74,7 @@ impl Rig {
     fn receiving(&self, conn: Conn) -> Option<Tag> {
         self.in_flight.iter().find_map(|it| match it {
             Effect::Recv { conn: of, most, tag } if *of == conn => {
-                assert_eq!(*most, 64 << 10);
+                assert!((64 << 10..=LONGEST_REQUEST as usize).contains(most), "{most}");
                 Some(*tag)
             }
             _ => None,
@@ -218,6 +218,39 @@ fn a_request_split_across_many_receives_arrives_once() {
         rig.deliver(conn, std::slice::from_ref(byte));
     }
     assert_eq!(rig.arrived(), [asked(conn, 7, Request::Cancel { id: 3 })]);
+}
+
+#[test]
+fn receives_of_a_large_frame_grow_with_what_has_come_of_it() {
+    let mut rig = Rig::new(config(true, false));
+    let conn = rig.accept(true, 1);
+    let ops = vec![blaze_vfs::Op::Write { path: "big.rs".to_owned(), bytes: vec![0; 4 << 20] }];
+    let request = Request::Commit { head: "main".to_owned(), base: Default::default(), ops };
+    let bytes = frame_of(1, request.clone());
+    let mut at = 0;
+    let mut receives = 0;
+    while at < bytes.len() {
+        let most = rig
+            .in_flight
+            .iter()
+            .find_map(|it| match it {
+                Effect::Recv { conn: of, most, .. } if *of == conn => Some(*most),
+                _ => None,
+            })
+            .unwrap();
+        assert!(most <= (64 << 10).max(at), "{most} asked with {at} here");
+        let here = most.min(bytes.len() - at);
+        rig.deliver(conn, &bytes[at..at + here]);
+        at += here;
+        receives += 1;
+    }
+    assert!(receives < 16, "{receives} receives");
+    assert_eq!(rig.arrived(), [asked(conn, 1, request)]);
+    let most = rig.in_flight.iter().find_map(|it| match it {
+        Effect::Recv { most, .. } => Some(*most),
+        _ => None,
+    });
+    assert_eq!(most, Some(64 << 10), "back to the least once the frame is in");
 }
 
 #[test]

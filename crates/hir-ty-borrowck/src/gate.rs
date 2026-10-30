@@ -8,7 +8,7 @@
 //! Live patching alone may have code before the check finishes (#1302, #276): [`speculate`] is
 //! its entry point, and gives an [`Unchecked`], whose MIR is an [`UncheckedMir`] that no
 //! [`CheckedMir`] can be made of, and a [`Pending`] check. The patch applies the code, finishes
-//! the check beside it (on another thread with a handle of its own to the database) and rolls
+//! the check beside it (a plane task sharing the database by reference) and rolls
 //! back when [`Pending::finish`] refuses. A build's codegen takes [`CheckedMir`] and a build's
 //! reuse of stored code takes a [`Checked`], so nothing the live path made can reach one by its
 //! types.
@@ -226,7 +226,7 @@ impl<'db> std::ops::Deref for UncheckedMir<'db> {
 }
 
 /// The borrow check a live patch waits on. It names no revision of the database, so it can be
-/// sent to the thread that finishes it.
+/// sent to the task that finishes it.
 #[derive(PartialEq, Eq, Debug)]
 #[must_use = "a live patch is rolled back unless its borrow check finishes without error"]
 pub struct Pending {

@@ -358,7 +358,8 @@ impl<M: Memory> Switch<M> {
             };
             let mut value = [0; 8];
             value.copy_from_slice(field);
-            field.copy_from_slice(&u64::from_le_bytes(value).wrapping_add(layout.slide).to_le_bytes());
+            let value = u64::from_le_bytes(value).wrapping_add(layout.slide);
+            field.copy_from_slice(&value.to_le_bytes());
         }
         let frames = frames::<M>(patch, &code, &data)?;
         if !patch.windows.is_empty() && !M::SEH {
@@ -459,14 +460,14 @@ impl<M: Memory> Switch<M> {
 
     /// Points the cell at the table of `to`, a kept generation.
     pub(crate) fn roll_back(&mut self, to: u64) -> Result<(), String> {
-        let Some(generation) = self.find(to) else {
+        let Some(table) = self.find(to).map(|it| it.table.address()) else {
             let kept: Vec<String> = self.kept.iter().map(|it| it.number.to_string()).collect();
             return Err(format!("generation {to} is not kept; kept are {}", kept.join(", ")));
         };
         if to == self.current {
             return Ok(());
         }
-        self.publish(generation.table.address())?;
+        self.publish(table)?;
         self.current = to;
         Ok(())
     }
@@ -505,7 +506,8 @@ impl<M: Memory> Switch<M> {
             .filter_map(|number| self.find(number))
             .filter(|it| it.base < it.number && self.find(it.base).is_some())
             .filter(|it| {
-                it.code.iter().any(|range| pcs.iter().any(|pc| range.contains(&pc.wrapping_sub(slide))))
+                let unslid = |pc: &u64| pc.wrapping_sub(slide);
+                it.code.iter().any(|range| pcs.iter().any(|pc| range.contains(&unslid(pc))))
             })
             .map(|it| (it.number, it.base))
             .max()
@@ -590,7 +592,7 @@ fn frames<M: Memory>(
     let mut fdes = patch.frames.clone();
     fdes.sort_unstable();
     for pair in fdes.windows(2) {
-        if pair[1].0 < pair[0].0 + pair[0].1 {
+        if pair[1].0 < pair[0].0.saturating_add(pair[0].1) {
             return Err(format!("two unwind entries at {:#x}", pair[1].0));
         }
     }

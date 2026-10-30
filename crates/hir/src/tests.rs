@@ -147,24 +147,23 @@ fn a_check_takes_no_mir_of_another_body() {
 #[test]
 fn a_live_patch_has_code_before_the_check_that_refuses_it() {
     let db = TestDB::with_files(MOVED_TWICE);
-    let bad = crate::attach_db(&db, || function(&db, "moved_twice"));
-    let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
-    let beside = db.clone();
-    let finished = std::thread::spawn(move || {
-        crate::attach_db(&beside, || pending.finish(&beside).map(Checked::owner))
-    });
     crate::attach_db(&db, || {
-        let mir = unchecked.mir(&db, db.mir_body(InferBodyId::DefWithBodyId(bad))).unwrap();
-        assert_eq!(mir.unchecked().owner(), bad);
-        assert!(!mir.basic_blocks.is_empty());
-    });
-    match finished.join().unwrap() {
-        Err(Refused::Errors { owner, errors }) => {
-            assert_eq!(owner, bad);
-            assert!(errors.iter().any(|it| it.code == "E0382"), "{errors:?}");
+        let bad = function(&db, "moved_twice");
+        let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
+        let executed = db.executed(|| {
+            let mir = unchecked.mir(&db, db.mir_body(InferBodyId::DefWithBodyId(bad))).unwrap();
+            assert_eq!(mir.unchecked().owner(), bad);
+            assert!(!mir.basic_blocks.is_empty());
+        });
+        assert_eq!(count(&executed, "borrowck"), 0, "the code comes before the check");
+        match pending.finish(&db) {
+            Err(Refused::Errors { owner, errors }) => {
+                assert_eq!(owner, bad);
+                assert!(errors.iter().any(|it| it.code == "E0382"), "{errors:?}");
+            }
+            other => panic!("the patch must be rolled back, got {other:?}"),
         }
-        other => panic!("the patch must be rolled back, got {other:?}"),
-    }
+    });
 }
 
 #[test]

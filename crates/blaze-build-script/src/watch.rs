@@ -34,7 +34,8 @@ pub struct Watched {
 /// What `output` makes cargo watch, for the package whose directory is `package_dir`.
 pub fn watched(output: &Output, package_dir: &Path) -> Watched {
     if output.rerun_if_changed.is_empty() && output.rerun_if_env_changed.is_empty() {
-        return Watched { paths: vec![package_dir.to_owned()], whole_package: true, env: Vec::new() };
+        let paths = vec![package_dir.to_owned()];
+        return Watched { paths, whole_package: true, env: Vec::new() };
     }
     let mut paths: Vec<PathBuf> = Vec::new();
     for path in &output.rerun_if_changed {

@@ -16,6 +16,10 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 rustc-hash.workspace = true
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-protocol.workspace = true
+blaze-query.workspace = true
 blaze-manifest.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 cargo-util-schemas = "=0.14.3"

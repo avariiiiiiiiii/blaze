@@ -7,8 +7,8 @@ build from scratch of the same sources (docs/v2/proof.md).
     uv run --frozen python harness/v2/oracle.py selftest
 
 The workspace is fixture.py's: three crates whose source is a vector of slots, one for each
-kind of edit of section 6 (bodies, signatures, impls added and removed, renames, moves,
-formatting, comments, cfgs and features, closure captures, a file `include_str!` reads deleted,
+kind of edit of docs/v2/items.md section 6 (bodies, signatures, impls added and removed,
+renames, moves, formatting, comments, cfgs and features, closure captures, a file `include_str!` reads deleted,
 whitespace in literals, names `type_name` and `module_path!` read, positions `line!` and
 `#[track_caller]` read, the environment of a build). A sequence starts from a state and edits
 one slot at a time. Each step:
@@ -29,7 +29,7 @@ from that:
 
 - `rustc/...` fails where the build from scratch differs from cargo's: not an invalidation bug
   but a wrong compiler, found here first;
-- `over/...` fails where an edit section 1 says compiles nothing (`fixture.Slot.budget_zero`:
+- `over/...` fails where an edit docs/v2/plan/targets.md says compiles nothing (`fixture.Slot.budget_zero`:
   formatting, comments, a rename or move nothing reads, PATH) compiled something. What every
   other kind of edit compiled is measured and summed by kind in the result (`work_by_kind`).
 
@@ -608,7 +608,7 @@ def record(out: report.Report, ran: Ran, gaps: dict[str, tuple[report.Verdict, s
             by_kind.setdefault(step.kind, []).append(step.compiled)
             if step.budget_zero and step.compiled > 0:
                 out.add(f"over/{step.name}", "fail",
-                        f"{step.edit}: section 1 says this compiles nothing; it compiled {step.compiled} functions",
+                        f"{step.edit}: docs/v2/plan/targets.md says this compiles nothing; it compiled {step.compiled} functions",
                         kind=step.kind, compiled=step.compiled, budget=0)
     for verdict, why in ran.gaps:
         gaps.setdefault(why.split(":")[0], (verdict, why))

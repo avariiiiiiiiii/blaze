@@ -1,0 +1,203 @@
+//! blaze v2's codegen of the front end (docs/v2/codegen.md): this crate's IR builder behind
+//! [`blaze_codegen`]'s per-function interfaces.
+//!
+//! [`HirFrontend`] says what an instance is and what it refers to, without compiling it: its
+//! item and code by content ([`Hashes`]), whose code it is, and its references in the order
+//! of its MIR ([`refs`]). [`Backends`] builds the instance's IR against those references by
+//! place ([`places`]), says what the IR is with nothing in it of the build or the run
+//! ([`shape`]), and compiles it with Cranelift or LLVM ([`release`]), the code by place and
+//! data by content ([`convert`]).
+
+use base_db::Crate;
+use blaze_codegen::{CodegenError, InstanceKey, Unit};
+use blaze_format::SpanRef;
+use blaze_ids::ContentId;
+use blaze_items::{CodeHash, ItemId, ItemKey};
+use cranelift_codegen::ir;
+use hir_def::{DefWithBodyId, FunctionId, StaticId};
+use hir_ty::{db::HirDatabase, next_solver::Ty, traits::StoredParamEnvAndCrate};
+use hir_ty_mir::mir::MirSpan;
+
+use crate::{Instance, Pending, fragment};
+
+pub(crate) mod backend;
+pub(crate) mod convert;
+pub(crate) mod fold;
+pub(crate) mod frontend;
+pub(crate) mod places;
+pub(crate) mod refs;
+pub(crate) mod release;
+pub(crate) mod shape;
+pub(crate) mod side;
+#[cfg(test)]
+mod tests;
+pub(crate) mod unwind;
+
+pub use backend::Backends;
+pub use frontend::{Databases, HirFrontend};
+
+/// What the items lane says of the front end's items by content (docs/v2/items.md): the
+/// keys the code generator puts in place of the database's dense ids, which differ from one
+/// run to the next.
+pub trait Hashes: Sync {
+    /// Which item `item` is, by its path and kind.
+    fn item(&self, db: &dyn HirDatabase, item: ItemId) -> Result<ItemKey, String>;
+    /// What a body is: its normalized MIR, each callee and type by content.
+    fn code(&self, db: &dyn HirDatabase, body: Body) -> Result<CodeHash, String>;
+    /// A type by content: an ADT by its item and its layout's facts, never by its name.
+    /// Regions are erased.
+    fn ty<'db>(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, String>;
+    /// Where a statement or expression of `owner`'s body is, in its item's span table.
+    fn span(
+        &self,
+        db: &dyn HirDatabase,
+        owner: DefWithBodyId,
+        span: MirSpan,
+    ) -> Result<SpanRef, String>;
+    /// Where a function is declared: what a call through a pointer to a `#[track_caller]`
+    /// function passes as its caller's location.
+    fn declaration(&self, db: &dyn HirDatabase, func: FunctionId) -> Result<SpanRef, String>;
+    /// The name a file is known by in the program (`file!()`, a panic location): the path
+    /// relative to its package's root, as rustc prints it.
+    fn file_name(&self, db: &dyn HirDatabase, file: base_db::FileId) -> Result<String, String>;
+}
+
+/// A body whose code [`Hashes::code`] says. The ids are salsa's interned closures and
+/// coroutines (`InternedClosureId`, `InternedCoroutineId`), without their database lifetime.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Body {
+    Item(DefWithBodyId),
+    Closure(salsa::Id),
+    /// The `Future::poll` of an `async` block.
+    Coroutine(salsa::Id),
+    /// The future an `async` closure gives when called by value though it could be again.
+    CoroutineByMove(salsa::Id),
+}
+
+/// A function instance as the front end holds it.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct HirInstance(pub(crate) Kind);
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Kind {
+    /// What the IR builder compiles: a function, closure, coroutine or shim with its generic
+    /// arguments, regions erased, in the environment of the crate it is compiled as
+    /// ([`crate::home::Homes`]). `checked` is always `false`: a unit's overflow checks are
+    /// its [`blaze_codegen::settings::Spec`]'s.
+    Code(Instance, StoredParamEnvAndCrate),
+    /// The function a `global_asm!` or `naked_asm!` defines, by its text.
+    Asm(String),
+    /// The C `main` that runs the program's `fn main`.
+    Start(FunctionId),
+}
+
+/// A static as the front end holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct HirStatic(pub StaticId);
+
+/// A function whose IR is built, waiting for its backend.
+pub(crate) enum Prepared {
+    Cranelift(Box<Function>),
+    Llvm(Box<Function>),
+}
+
+impl Prepared {
+    pub(crate) fn function(&self) -> &Function {
+        match self {
+            Prepared::Cranelift(it) | Prepared::Llvm(it) => it,
+        }
+    }
+
+    pub(crate) fn into_function(self) -> Box<Function> {
+        match self {
+            Prepared::Cranelift(it) | Prepared::Llvm(it) => it,
+        }
+    }
+}
+
+/// One prepared function: its IR and what each of its requests is in the build.
+pub(crate) struct Function {
+    pub(crate) code: Built,
+    pub(crate) places: Places,
+    /// The positions of its source locations, by the number Cranelift's `SourceLoc` holds.
+    pub(crate) spans: Vec<SpanRef>,
+    /// Its named locals, for a debugger: empty unless the unit's debug info has them.
+    pub(crate) variables: Vec<side::Variable>,
+}
+
+pub(crate) enum Built {
+    /// The IR, with the requests the IR builder made of it (`pending.wants`).
+    Ir(Pending),
+    /// An assembly function: its code, which no backend compiles.
+    Assembled(fragment::Code, fragment::Requests),
+}
+
+impl Function {
+    /// The IR, for what reads or rewrites it before the backend (fold, release).
+    pub(crate) fn ir(&self) -> Option<&ir::Function> {
+        match &self.code {
+            Built::Ir(pending) => Some(&pending.func),
+            Built::Assembled(..) => None,
+        }
+    }
+
+    pub(crate) fn ir_mut(&mut self) -> Option<&mut ir::Function> {
+        match &mut self.code {
+            Built::Ir(pending) => Some(&mut pending.func),
+            Built::Assembled(..) => None,
+        }
+    }
+
+    pub(crate) fn requests(&self) -> &fragment::Requests {
+        match &self.code {
+            Built::Ir(pending) => &pending.wants.requests,
+            Built::Assembled(_, requests) => requests,
+        }
+    }
+}
+
+/// What each request of a function's IR is in the build: its references by their place in
+/// [`blaze_codegen::backend::Described::refs`], its data by content.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Places {
+    /// By the function request's number (`FuncId`): its place.
+    pub(crate) funcs: Vec<u32>,
+    /// By the data request's number (`DataId`).
+    pub(crate) datas: Vec<DataPlace>,
+    /// How many references the function was prepared against.
+    pub(crate) refs: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum DataPlace {
+    /// A static, or one of an `extern` block, by its place.
+    Place(u32),
+    /// Read-only data of the function's own, made of the request's blob.
+    Own,
+    /// A position the program observes: a `#[track_caller]` location, a panic's.
+    Position(SpanRef),
+    /// The bytes of a `&str` made at compile time: `file!()`, with what is `concat!`ed to it.
+    Text(String),
+}
+
+/// A crate the build compiles for its build scripts and proc macros, not for the program.
+#[derive(Clone, Default, Debug)]
+pub struct BuildTime(pub rustc_hash::FxHashSet<Crate>);
+
+/// The error of `unit`, saying `what`.
+pub(crate) fn failed(unit: &Unit, what: impl std::fmt::Display) -> CodegenError {
+    CodegenError { unit: unit.instance.key(), item: unit.item, what: what.to_string() }
+}
+
+/// The error of an instance that is not keyed yet, while it is described.
+pub(crate) fn undescribed(
+    instance: &impl std::fmt::Debug,
+    item: Option<ItemKey>,
+    what: impl std::fmt::Display,
+) -> CodegenError {
+    CodegenError {
+        unit: InstanceKey(ContentId::default()),
+        item: item.unwrap_or(ItemKey(ContentId::default())),
+        what: format!("{instance:?}: {what}"),
+    }
+}

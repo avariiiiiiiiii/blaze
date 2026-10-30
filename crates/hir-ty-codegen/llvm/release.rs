@@ -8,12 +8,10 @@
 //! a parameter the summary calls unused is passed `poison` by the callers, and is unused in
 //! the code only because it is the same IR.
 
-use std::ffi::CStr;
-
 use blaze_codegen::summary::{Arg, Attrs};
 use cranelift_codegen::ir;
 use inkwell::{
-    attributes::{Attribute, AttributeLoc},
+    attributes::AttributeLoc,
     context::Context,
     llvm_sys::{core, prelude::LLVMValueRef},
     memory_buffer::MemoryBuffer,
@@ -21,7 +19,7 @@ use inkwell::{
     passes::PassBuilderOptions,
     targets::{FileType, TargetMachine},
     types::BasicTypeEnum,
-    values::{AsValueRef as _, BasicValue as _, BasicValueEnum, FunctionValue, InstructionOpcode},
+    values::{AsValueRef as _, BasicValueEnum, FunctionValue, InstructionOpcode},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -449,7 +447,7 @@ pub(crate) fn compile(
             Ok::<_, Unhandled>(())
         })?;
         let function = module.get_function(OWN).ok_or(Unhandled::Shape("a module without its function"))?;
-        apply(context, &module, function, given)?;
+        apply(context, &module, function, given, pointer as u32 * 8)?;
         if wrapped {
             function.as_global_value().set_name(INNER);
             wrap(context, &module, function, None)?;
@@ -478,11 +476,13 @@ pub(crate) fn compile(
 }
 
 /// Gives `function` and the functions of `module` it calls what `given` says of them.
+/// `pointer` is the width of an address, in bits.
 fn apply<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     function: FunctionValue<'ctx>,
     given: &Given,
+    pointer: u32,
 ) -> Result<(), Unhandled> {
     for &(at, arg) in &given.constants {
         let param = function
@@ -496,7 +496,7 @@ fn apply<'ctx>(
             BasicTypeEnum::IntType(ty) if ty.get_bit_width() == u32::from(bits) => {
                 ty.const_int(value, false).into()
             }
-            BasicTypeEnum::PointerType(ty) if u32::from(bits) == pointer_bits(module) => {
+            BasicTypeEnum::PointerType(ty) if u32::from(bits) == pointer => {
                 context.custom_width_int_type(u32::from(bits)).const_int(value, false).const_to_pointer(ty).into()
             }
             _ => return Err(Unhandled::Shape("a constant of another type than its parameter")),
@@ -563,15 +563,6 @@ fn apply<'ctx>(
         }
     }
     Ok(())
-}
-
-fn pointer_bits(module: &Module<'_>) -> u32 {
-    // SAFETY: the module is live; its data layout outlives the call.
-    let layout = unsafe { CStr::from_ptr(core::LLVMGetDataLayoutStr(module.as_mut_ptr())) };
-    // The layout's `p:<size>`, 64 where it says none, as LLVM's default.
-    let text = layout.to_string_lossy();
-    let pointer = text.split('-').find_map(|it| it.strip_prefix("p:").or_else(|| it.strip_prefix("p0:")));
-    pointer.and_then(|it| it.split(':').next()?.parse().ok()).unwrap_or(64)
 }
 
 #[cfg(test)]
@@ -676,7 +667,7 @@ declare i32 @"blaze.f.1"(i32)
             ],
             dead: vec![(1, vec![0])],
         };
-        apply(&context, &module, function, &given).unwrap();
+        apply(&context, &module, function, &given, 64).unwrap();
         module.verify().unwrap();
         let text = function.print_to_string().to_string_lossy().into_owned();
         assert!(text.contains("@blaze.f.1(i32 poison, i32 5)"), "{text}");
@@ -704,7 +695,7 @@ declare void @"blaze.f.1"(ptr noundef nonnull)
         );
         let function = module.get_function(OWN).unwrap();
         let given = Given { dead: vec![(1, vec![0])], ..Given::default() };
-        apply(&context, &module, function, &given).unwrap();
+        apply(&context, &module, function, &given, 64).unwrap();
         module.verify().unwrap();
         let all = module.print_to_string().to_string_lossy().into_owned();
         assert!(all.contains("@blaze.f.1(ptr poison)"), "{all}");

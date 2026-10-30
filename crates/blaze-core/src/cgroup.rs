@@ -105,6 +105,18 @@ impl Cgroup {
                 ),
             ));
         }
+        // Asked of it once the process has exited; refused now rather than after the run.
+        // A kernel that keeps it (5.19) also has `cgroup.kill` (5.14), which its end needs.
+        if !self.dir.join("memory.peak").exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{} has no memory.peak: Linux 5.19 or later keeps it, and this is Linux {}",
+                    self.dir.display(),
+                    kernel()
+                ),
+            ));
+        }
         write(&max, &limit.to_string())?;
         let swap = self.dir.join("memory.swap.max");
         match write(&swap, "0") {
@@ -436,8 +448,7 @@ mod tests {
         std::fs::File::from(started.stdout).read_to_end(&mut stdout).unwrap();
         let mut stderr = Vec::new();
         std::fs::File::from(started.stderr).read_to_end(&mut stderr).unwrap();
-        let (status, rusage) = crate::process::reap(started.pid).unwrap();
-        started.finish.exited(status, &rusage, stdout, stderr).unwrap()
+        started.finish.exited(started.pid, stdout, stderr).unwrap()
     }
 
     /// Where a delegated cgroup is writable: a cgroup is made with its limit, measured and

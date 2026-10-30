@@ -182,22 +182,24 @@ impl Files {
         durability: Option<Durability>,
     ) {
         self.view_ids.remove(&file_id);
+        let text = text.map(|text| (text, ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes())));
         let content = self.write_text(db, file_id, text, durability);
         let mut changed = Vec::new();
         self.index_file(file_id, content, &mut changed);
         self.write_root_contents(db, &changed);
     }
 
-    /// Sets the text of `file_id`, or that it has none (`None`), with its content ID, and
-    /// returns that ID. The source roots that have the file are left to the caller.
-    fn write_text(
+    /// Sets the text of `file_id`, given with the blaze-vfs ID of its bytes, or that it has none
+    /// (`None`), with its content ID, and returns that ID. The source roots that have the file
+    /// are left to the caller.
+    pub(crate) fn write_text(
         &self,
         db: &mut dyn SourceDatabase,
         file_id: vfs::FileId,
-        text: Option<&str>,
+        text: Option<(&str, ContentId)>,
         durability: Option<Durability>,
     ) -> ContentId {
-        let Some(text) = text else {
+        let Some((text, file)) = text else {
             // Nothing reads the text left behind: `file_text` no longer has the file.
             if let Some((_, input)) = self.files.remove(&file_id) {
                 set(input.set_text_field(db), durability, Arc::from(""));
@@ -212,7 +214,7 @@ impl Files {
         };
         match existing {
             Some(input) => {
-                let content = FileText::content_of(text, input.appended_root_module(&*db));
+                let content = FileText::content_of_file(file, input.appended_root_module(&*db));
                 set(input.set_text_field(db), durability, Arc::from(text));
                 if input.content(&*db) != content {
                     set(input.set_content_field(db), durability, InputId(content));
@@ -221,7 +223,7 @@ impl Files {
                 content
             }
             None => {
-                let content = FileText::content_of(text, None);
+                let content = FileText::content_of_file(file, None);
                 let builder = FileText::builder(Arc::from(text), file_id, InputId(content));
                 let builder = match durability {
                     Some(durability) => builder.durability(durability),
@@ -675,16 +677,27 @@ pub struct FileText {
 }
 
 impl FileText {
-    /// A file text's content ID is of its text, then of its appended root module (0, or 1 and
-    /// the module), which changes what the crate root is. The file's ID and path are not in it.
-    pub const DOMAIN: &'static str = "blaze v2 file text 1";
+    /// A file text's content ID is of the blaze-vfs ID of its text's bytes
+    /// (`ContentId::of(blaze_vfs::FILE_DOMAIN, ..)`), then of its appended root module (0, or 1
+    /// and the module), which changes what the crate root is. Building on the vfs ID means a
+    /// view's file, whose vfs ID is given and checked, is hashed once. The file's ID and path
+    /// are not in it.
+    pub const DOMAIN: &'static str = "blaze v2 file text 2";
     /// The content ID a file of a source root has when it has no text (bytes that are not
     /// UTF-8, or none loaded): what the front end sees of it is that it has none.
     pub const NO_TEXT_DOMAIN: &'static str = "blaze v2 file without text 1";
 
     pub fn content_of(text: &str, appended_root_module: Option<&str>) -> ContentId {
+        FileText::content_of_file(
+            ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes()),
+            appended_root_module,
+        )
+    }
+
+    /// [`FileText::content_of`] from the blaze-vfs ID of the text's bytes, without reading them.
+    pub fn content_of_file(file: ContentId, appended_root_module: Option<&str>) -> ContentId {
         let mut hasher = Hasher::new(FileText::DOMAIN);
-        hasher.part(text.as_bytes());
+        hasher.id(&file);
         content::opt(&mut hasher, appended_root_module);
         hasher.finish()
     }

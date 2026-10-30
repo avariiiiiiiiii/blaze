@@ -47,11 +47,9 @@ use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, BoundRegion, BoundRegionKind, BoundTyKind, BoundVar, BoundVarIndexKind,
     DebruijnIndex, ExistentialPredicate, ExistentialProjection, ExistentialTraitRef, FnSig,
-    Interner, OutlivesPredicate, TermKind, TyKind, TypeFoldable, TypeFolder, TypeSuperFoldable,
-    TypeVisitableExt, Upcast, UpcastFrom, elaborate,
-    inherent::{
-        Clause as _, GenericArg as _, GenericArgs as _, IntoKind as _, Region as _, Ty as _,
-    },
+    Interner, OutlivesClause, PredicateProxy, TermKind, TyKind, TypeFoldable, TypeFolder,
+    TypeSuperFoldable, TypeVisitableExt, Upcast, UpcastFrom, elaborate,
+    inherent::{Clause as _, GenericArg as _, GenericArgs as _, IntoKind as _, Ty as _},
     shift_vars,
 };
 use salsa::SalsaValue;
@@ -66,17 +64,18 @@ pub(crate) use hir_def::TrackedStructToken;
 use crate::{
     ImplTraitId, Span, TyLoweringDiagnostic,
     consteval::{create_anon_const, path_to_const},
-    db::{AnonConstId, GeneralConstId, HirDatabase, InternedOpaqueTyId},
+    db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
     generics::{Generics, SingleGenerics, generics},
     infer::unify::InferenceTable,
     next_solver::{
-        AliasTy, Binder, BoundConst, BoundExistentialPredicates, BoundTy, BoundVarKinds,
-        BoundVariableKind, Clause, ClauseKind, Clauses, Const, ConstKind, DbInterner, DefaultAny,
-        EarlyBinder, EarlyParamRegion, ErrorGuaranteed, FnSigKind, FxIndexMap, GenericArg,
-        GenericArgKind, GenericArgs, ParamConst, ParamEnv, PatList, Pattern, PolyFnSig, Predicate,
-        Region, RegionKind, StoredClauses, StoredConst, StoredEarlyBinder, StoredGenericArg,
-        StoredGenericArgs, StoredPolyFnSig, StoredTraitRef, StoredTy, TraitPredicate, TraitRef, Ty,
-        Tys, Unnormalized, abi::Safety, default_types, mk_param, util::BottomUpFolder,
+        AliasConstKind, AliasTy, AnonConstIdWrapper, Binder, BoundConst, BoundExistentialPredicates,
+        BoundTy, BoundVarKinds, BoundVariableKind, Clause, ClauseKind, Clauses, Const, ConstExt,
+        ConstKind, DbInterner, DefaultAny, EarlyBinder, EarlyParamRegion, ErrorGuaranteed,
+        FnSigKind, FxIndexMap, GenericArg, GenericArgKind, GenericArgs, IsRigid, ParamConst,
+        ParamEnv, PatList, Pattern, PolyFnSig, Predicate, Region, RegionExt, RegionKind,
+        StoredClauses, StoredConst, StoredEarlyBinder, StoredGenericArg, StoredGenericArgs,
+        StoredPolyFnSig, StoredTraitRef, StoredTy, TraitClause, TraitRef, Ty, Tys, Unnormalized,
+        abi::Safety, default_types, mk_param, util::BottomUpFolder,
     },
 };
 
@@ -684,8 +683,8 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         );
 
         if let Ok(konst) = konst
-            && let ConstKind::Unevaluated(konst) = konst.kind()
-            && let GeneralConstId::AnonConstId(konst) = konst.def.0
+            && let ConstKind::Alias(_, konst) = konst.kind()
+            && let AliasConstKind::Anon { def_id: AnonConstIdWrapper(konst) } = konst.kind
         {
             self.defined_anon_consts.push(konst);
         }
@@ -862,7 +861,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                             self.impl_trait_mode.opaque_type_data.len() as u32,
                         ));
                         self.impl_trait_mode.opaque_type_data.push(SelfAndAssocBounds {
-                            bounds: StoredEarlyBinder::bind(Clauses::empty().store()),
+                            bounds: StoredEarlyBinder::bind_no_rigid_aliases(
+                                Clauses::empty().store(),
+                            ),
                             assoc_ty_bounds_start: 0,
                         });
 
@@ -937,6 +938,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                         );
                         Ty::new_alias(
                             self.interner,
+                            IsRigid::No,
                             AliasTy::new_from_args(
                                 self.interner,
                                 AliasTyKind::Opaque { def_id: opaque_ty_id.into() },
@@ -1027,12 +1029,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             interner,
             Binder::bind_with_vars(
                 FnSig {
-                    fn_sig_kind: FnSigKind::new(
-                        fn_.abi,
-                        if fn_.is_unsafe { Safety::Unsafe } else { Safety::Safe },
-                        fn_.is_varargs,
-                        // FIXME(splat): handle splatted arguments
-                    ),
+                    fn_sig_kind: FnSigKind::dummy()
+                        .set_abi(fn_.abi)
+                        .set_safety(if fn_.is_unsafe { Safety::Unsafe } else { Safety::Safe })
+                        .set_c_variadic(fn_.is_varargs),
                     inputs_and_output: Tys::new_from_slice(&args),
                 },
                 binder,
@@ -1188,7 +1188,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 Clause(Predicate::new(
                     self.interner,
                     Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                        rustc_type_ir::ClauseKind::RegionOutlives(OutlivesPredicate(
+                        rustc_type_ir::ClauseKind::RegionOutlives(OutlivesClause(
                             self.lower_lifetime(target),
                             self.lower_lifetime(bound),
                         )),
@@ -1237,9 +1237,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                         interner,
                         Binder::bind_with_vars(
                             rustc_type_ir::PredicateKind::Clause(rustc_type_ir::ClauseKind::Trait(
-                                TraitPredicate {
+                                TraitClause {
                                     trait_ref,
-                                    polarity: rustc_type_ir::PredicatePolarity::Positive,
+                                    polarity: rustc_type_ir::ClausePolarity::Positive,
                                 },
                             )),
                             binder,
@@ -1302,7 +1302,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                     self.interner,
                     Binder::bind_with_vars(
                         rustc_type_ir::PredicateKind::Clause(
-                            rustc_type_ir::ClauseKind::TypeOutlives(OutlivesPredicate(
+                            rustc_type_ir::ClauseKind::TypeOutlives(OutlivesClause(
                                 self_ty, lifetime,
                             )),
                         ),
@@ -1453,7 +1453,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
                     let bound_predicate = clause.kind();
                     match bound_predicate.skip_binder() {
-                        ClauseKind::TypeOutlives(OutlivesPredicate(ty, outlived))
+                        ClauseKind::TypeOutlives(OutlivesClause(ty, outlived))
                             if ty == dummy_self_ty && !outlived.has_escaping_bound_vars() =>
                         {
                             if region_of_trait.is_none() || outlived.is_static() {
@@ -1615,6 +1615,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let args = GenericArgs::identity_for_item(interner, def_id.into());
         let self_ty = Ty::new_alias(
             self.interner,
+            IsRigid::No,
             AliasTy::new_from_args(interner, rustc_type_ir::Opaque { def_id: def_id.into() }, args),
         );
         let prev_is_lowering_impl_trait_bounds =
@@ -1642,9 +1643,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 Clause(Predicate::new(
                     interner,
                     Binder::dummy(rustc_type_ir::PredicateKind::Clause(
-                        rustc_type_ir::ClauseKind::Trait(TraitPredicate {
+                        rustc_type_ir::ClauseKind::Trait(TraitClause {
                             trait_ref,
-                            polarity: rustc_type_ir::PredicatePolarity::Positive,
+                            polarity: rustc_type_ir::ClausePolarity::Positive,
                         }),
                     )),
                 ))
@@ -1657,7 +1658,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
         self.is_lowering_impl_trait_bounds = prev_is_lowering_impl_trait_bounds;
         SelfAndAssocBounds {
-            bounds: StoredEarlyBinder::bind(Clauses::new_from_slice(&predicates).store()),
+            bounds: StoredEarlyBinder::bind(interner, Clauses::new_from_slice(&predicates).store()),
             assoc_ty_bounds_start,
         }
     }

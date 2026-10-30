@@ -173,7 +173,7 @@ enum Tail {
 }
 
 /// What a reference, `Box` or wide raw pointer needs of its pointee type, computed once.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct Pointee<'db> {
     ty: Ty<'db>,
     freeze: bool,
@@ -212,7 +212,7 @@ enum Op<'db> {
 }
 
 /// An enum's tag and variants (rustc `read_discriminant`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct EnumPlan {
     tag_at: u64,
     tag_size: u8,
@@ -556,8 +556,8 @@ impl<'db> Run<'_, '_, '_, 'db> {
                         format!("encountered {:#x}[noalloc], but expected a vtable pointer", meta),
                     ));
                 };
-                let layout = self.plans.layout(self.cx, concrete)?;
-                (layout.size.bytes(), layout.align.abi.bytes(), Some(concrete))
+                let (size, align) = self.plans.size_align(self.cx, concrete)?;
+                (size, align, Some(concrete))
             }
         };
         // rustc `size_and_align_from_meta`: each struct level from the tail out.
@@ -582,7 +582,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         let noun = kind.noun();
         let addr = self.scalar(at, self.ptr, kind.expected(), path)? as u64;
         let prov = self.shadow.prov_at(at as usize, self.ptr as usize);
-        let info = self.plans.pointees[pointee as usize].clone();
+        let info = self.plans.pointees[pointee as usize];
         let wide = matches!(info.shape, Shape::Unsized { .. });
         if wide {
             self.require_init(at + self.ptr, self.ptr, kind.expected(), path)?;
@@ -747,7 +747,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
 
     /// rustc `read_discriminant`, then the variant's fields.
     fn enum_value(&mut self, at: u64, plan: u32, path: u32, tag_path: u32) -> R {
-        let e = self.plans.enums[plan as usize].clone();
+        let e = self.plans.enums[plan as usize];
         let tag_at = at + e.tag_at;
         let size = e.tag_size as u64;
         let expected = if e.tag_ptr { Expected::RawPtr } else { Expected::Int };
@@ -770,7 +770,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 if !contains(bits) {
                     return Err(invalid_tag(self));
                 }
-                match self.plans.variants[variants.clone()].iter().position(|v| v.discr == bits) {
+                match self.plans.variants[range(e.variants)].iter().position(|v| v.discr == bits) {
                     Some(i) => i as u32,
                     None => return Err(invalid_tag(self)),
                 }
@@ -854,15 +854,29 @@ impl<'db> Run<'_, '_, '_, 'db> {
 }
 
 impl<'db> Plans<'db> {
+    /// For building a plan, once per type.
     fn layout(&mut self, cx: &TypedCx<'_, 'db>, ty: Ty<'db>) -> R<Arc<Layout>> {
         if let Some(it) = self.layouts.get(&ty) {
+            // clone: plan building, once per type and use; the per-copy path is `size_align`.
             return Ok(it.clone());
         }
         let layout = cx.db.layout_of_ty(ty.store(), cx.env.store()).map_err(|e| {
+            // alloc: error path.
             Fail::Unsupported(format!("the layout of `{}`: {e:?}", type_name(cx.db, ty)))
         })?;
+        // clone: a layout's first use, the cache's copy.
         self.layouts.insert(ty, layout.clone());
         Ok(layout)
+    }
+
+    /// The size and alignment of `ty`, read from the cached layout without cloning it: a
+    /// `dyn` pointee's concrete type is looked up on every typed copy of the pointer.
+    fn size_align(&mut self, cx: &TypedCx<'_, 'db>, ty: Ty<'db>) -> R<(u64, u64)> {
+        let layout = match self.layouts.get(&ty) {
+            Some(it) => it,
+            None => &self.layout(cx, ty)?,
+        };
+        Ok((layout.size.bytes(), layout.align.abi.bytes()))
     }
 
     fn infcx(&mut self, env: ParamEnvAndCrate<'db>, db: &'db dyn HirDatabase) -> &InferCtxt<'db> {

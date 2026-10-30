@@ -59,8 +59,8 @@ use crate::{
 
 use super::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirPhase, MirSpan,
-    Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
-    TerminatorKind, UnOp, return_slot,
+    Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind,
+    StoredPlace, TerminatorKind, UnOp, return_slot,
 };
 use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
@@ -316,6 +316,8 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// old locals that we normally want to drop here, to reuse their allocations
     /// later.
     unused_locals_store: RefCell<FxHashMap<InferBodyId<'db>, Vec<Locals<'db>>>>,
+    /// [`Self::storage_marked`] of each body run under a machine, by the body's address.
+    storage_marked: RefCell<FxHashMap<usize, Arc<FxHashSet<LocalId>>>>,
     cached_ptr_size: usize,
     cached_fn_trait_func: Option<FunctionId>,
     cached_fn_mut_trait_func: Option<FunctionId>,
@@ -778,6 +780,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             not_special_fn_cache: RefCell::new(Default::default()),
             mir_or_dyn_index_cache: RefCell::new(Default::default()),
             unused_locals_store: RefCell::new(Default::default()),
+            storage_marked: RefCell::default(),
             cached_ptr_size,
             cached_fn_trait_func: lang_items.Fn_call,
             cached_fn_mut_trait_func: lang_items.FnMut_call_mut,
@@ -1066,19 +1069,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         });
                     }
                     for statement in &current_block.statements {
-                        match &statement.kind {
-                            StatementKind::Assign(l, r) => {
-                                let addr = self.place_addr(l, locals)?;
-                                let result = self.eval_rvalue(r, locals)?;
-                                self.copy_from_interval_or_owned(addr, result)?;
-                            }
-                            StatementKind::Deinit(_) => not_supported!("de-init statement"),
-                            StatementKind::InlineAsm(_) => not_supported!("inline assembly"),
-                            StatementKind::StorageLive(_)
-                            | StatementKind::FakeRead(_)
-                            | StatementKind::StorageDead(_)
-                            | StatementKind::Nop => (),
-                        }
+                        self.exec_statement(statement, locals)?;
                     }
                     let Some(terminator) = current_block.terminator.as_ref() else {
                         not_supported!("block without terminator");
@@ -1236,6 +1227,27 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
         }
+    }
+
+    fn exec_statement(
+        &mut self,
+        statement: &'db Statement,
+        locals: &mut Locals<'db>,
+    ) -> Result<'db, ()> {
+        match &statement.kind {
+            StatementKind::Assign(l, r) => {
+                let addr = self.place_addr(l, locals)?;
+                let result = self.eval_rvalue(r, locals)?;
+                self.copy_from_interval_or_owned(addr, result)?;
+            }
+            StatementKind::Deinit(_) => not_supported!("de-init statement"),
+            StatementKind::InlineAsm(_) => not_supported!("inline assembly"),
+            StatementKind::StorageLive(_)
+            | StatementKind::FakeRead(_)
+            | StatementKind::StorageDead(_)
+            | StatementKind::Nop => (),
+        }
+        Ok(())
     }
 
     /// Gives back the stack above `len`, of the frames that returned: nothing points there

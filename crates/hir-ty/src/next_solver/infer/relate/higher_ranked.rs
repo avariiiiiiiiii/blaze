@@ -4,7 +4,7 @@
 use rustc_type_ir::{TypeFoldable, TypeVisitableExt, UniverseIndex};
 use tracing::{debug, instrument};
 
-use crate::next_solver::fold::FnMutDelegate;
+use crate::next_solver::fold::BoundVarReplacerDelegate;
 use crate::next_solver::infer::InferCtxt;
 use crate::next_solver::infer::relate::RelateResult;
 use crate::next_solver::infer::snapshot::CombinedSnapshot;
@@ -37,17 +37,7 @@ impl<'db> InferCtxt<'db> {
 
         let next_universe = self.create_next_universe();
 
-        let delegate = FnMutDelegate {
-            regions: &mut |br: BoundRegion<'db>| {
-                Region::new_placeholder(self.interner, PlaceholderRegion::new(next_universe, br))
-            },
-            types: &mut |bound_ty: BoundTy<'db>| {
-                Ty::new_placeholder(self.interner, PlaceholderType::new(next_universe, bound_ty))
-            },
-            consts: &mut |bound: BoundConst<'db>| {
-                Const::new_placeholder(self.interner, PlaceholderConst::new(next_universe, bound))
-            },
-        };
+        let delegate = ToPlaceholders { interner: self.interner, universe: next_universe };
 
         debug!(?next_universe);
         self.interner.replace_bound_vars_uncached(binder, delegate)
@@ -94,5 +84,28 @@ impl<'db> InferCtxt<'db> {
             max_universe,
             only_consider_snapshot,
         )
+    }
+}
+
+/// Replaces each bound variable with a placeholder in `universe`, by static dispatch.
+struct ToPlaceholders<'db> {
+    interner: DbInterner<'db>,
+    universe: UniverseIndex,
+}
+
+impl<'db> BoundVarReplacerDelegate<DbInterner<'db>> for ToPlaceholders<'db> {
+    #[inline]
+    fn replace_region(&mut self, br: BoundRegion<'db>) -> Region<'db> {
+        Region::new_placeholder(self.interner, PlaceholderRegion::new(self.universe, br))
+    }
+
+    #[inline]
+    fn replace_ty(&mut self, bound_ty: BoundTy<'db>) -> Ty<'db> {
+        Ty::new_placeholder(self.interner, PlaceholderType::new(self.universe, bound_ty))
+    }
+
+    #[inline]
+    fn replace_const(&mut self, bound: BoundConst<'db>) -> Const<'db> {
+        Const::new_placeholder(self.interner, PlaceholderConst::new(self.universe, bound))
     }
 }

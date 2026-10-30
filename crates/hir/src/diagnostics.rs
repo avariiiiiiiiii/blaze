@@ -744,8 +744,8 @@ pub struct PatternArgInExternFn {
 #[derive(Debug)]
 pub struct UnimplementedTrait<'db> {
     pub span: SpanSyntax,
-    pub trait_predicate: crate::TraitPredicate<'db>,
-    pub parent_trait_predicates: Vec<crate::TraitPredicate<'db>>,
+    pub trait_predicate: crate::TraitClause<'db>,
+    pub parent_trait_predicates: Vec<crate::TraitClause<'db>>,
 }
 
 #[derive(Debug)]
@@ -1932,7 +1932,8 @@ impl<'db> AnyDiagnostic<'db> {
             ExprOrPatId::ExprId(expr) => expr_syntax(expr),
             ExprOrPatId::PatId(pat) => pat_syntax(pat),
         };
-        let new_ty = |ty| Type { owner: type_owner, ty: EarlyBinder::bind(ty) };
+        let interner = DbInterner::new_no_crate(db);
+        let new_ty = |ty| Type { owner: type_owner, ty: EarlyBinder::bind(interner, ty) };
         let span_syntax = |span| Self::span_syntax(span, source_map);
         Some(match d {
             &InferenceDiagnostic::NoSuchField { field: expr, private, variant } => {
@@ -1957,7 +1958,10 @@ impl<'db> AnyDiagnostic<'db> {
                 let pat = pat_syntax(*pat)?.map(Into::into);
                 ExpectedArrayOrSlicePat {
                     pat,
-                    found: Type { owner: type_owner, ty: EarlyBinder::bind(found.as_ref()) },
+                    found: Type {
+                        owner: type_owner,
+                        ty: EarlyBinder::bind(interner, found.as_ref()),
+                    },
                 }
                 .into()
             }
@@ -2208,8 +2212,14 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr_or_pat = expr_or_pat_syntax(node.unpack())?;
                 TypeMismatch {
                     expr_or_pat,
-                    expected: Type { owner: type_owner, ty: EarlyBinder::bind(expected.as_ref()) },
-                    actual: Type { owner: type_owner, ty: EarlyBinder::bind(found.as_ref()) },
+                    expected: Type {
+                        owner: type_owner,
+                        ty: EarlyBinder::bind(interner, expected.as_ref()),
+                    },
+                    actual: Type {
+                        owner: type_owner,
+                        ty: EarlyBinder::bind(interner, found.as_ref()),
+                    },
                 }
                 .into()
             }
@@ -2307,13 +2317,13 @@ impl<'db> AnyDiagnostic<'db> {
                 trait_predicate,
                 parent_trait_predicates,
             } => {
-                let trait_predicate = crate::TraitPredicate {
+                let trait_predicate = crate::TraitClause {
                     inner: trait_predicate.get(interner),
                     owner: type_owner,
                 };
                 let parent_trait_predicates = parent_trait_predicates
                     .iter()
-                    .map(|trait_predicate| crate::TraitPredicate {
+                    .map(|trait_predicate| crate::TraitClause {
                         inner: trait_predicate.get(interner),
                         owner: type_owner,
                     })

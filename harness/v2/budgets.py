@@ -93,6 +93,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -230,6 +231,10 @@ ROWS = (
         "x the critical path", COLD_BLAZE),
     Row("ci", "ci", "blaze", "blaze's own CI, small PR: a body edit, `blaze build` and the affected tests, warm", 120,
         True, "s", "30 min+"),
+    Row("restart-first-answer-clean", "restart", "blaze", "restart to first answer after a clean stop (blaze): "
+        "the warm answer plus a few ms", 0, True, "ms", "35 s (nushell); up to 238 s in CI"),
+    Row("restart-first-answer-kill9", "restart", "blaze", "restart to first answer after kill -9 (blaze): "
+        "the warm answer plus a few ms", 0, True, "ms", "35 s (nushell); up to 238 s in CI"),
     Row("memory-kloc", "memory", "nushell", "memory per thousand lines (nushell's own source): blaze's cold peak "
         "at most cargo's", 0, True, "MB per kloc", "nushell 12.5 GB (#734)"),
     *(Row(f"layout-{table}", "layout", "nushell", f"bytes per {what} (nushell)", size, True, "bytes", today)
@@ -1112,6 +1117,9 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
             judge(rep, rows["cold-critical"], critical)
         if "ci" in rows:
             judge(rep, rows["ci"], lambda: ci(eng, args, ws, env))
+        for how in get_args(Restart):
+            if (key := f"restart-first-answer-{how}") in rows:
+                judge(rep, rows[key], lambda: restart(eng, args, ws, env, how))
     finally:
         try:
             eng.stop(ws, env)
@@ -1149,6 +1157,104 @@ def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str]) -> Measur
             write_edit(str(ws), varied(changes, n), True)
         served(eng, f"the CI edit {n + 1} taken back", eng.build(f"the CI edit {n + 1} taken back", ws, env))
     return timed(seconds, "s", tests_run=ran_tests, edited=edit.file)
+
+
+def daemon_pid(status: str) -> int:
+    """The daemon's process in what `blaze status` printed."""
+    found = DAEMON_PID.findall(status)
+    if len(found) != 1:
+        raise engine.Failed(f"`blaze status` names {len(found)} daemon processes, not one:\n{status[-1000:]}")
+    return int(found[0])
+
+
+def restart_limit(warm_ms: float, files: int, slack_ms: float, sweeps: bool) -> float:
+    """The restart budget: the warm answer, `slack_ms` over it, and where no journal survives a
+    restart (Linux) the statx sweep of `files`."""
+    return warm_ms + slack_ms + (files * STATX_US_PER_FILE / 1000 if sweeps else 0.0)
+
+
+def source_files(ws: Path) -> int:
+    """Files of `ws` outside its target directories and `.git`: what a statx sweep looks at."""
+    total = 0
+    for _, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in ("target", "target-ref", ".git")]
+        total += len(files)
+    return total
+
+
+def until_gone(what: str, running: Callable[[], bool]) -> None:
+    began = time.monotonic()
+    while running():
+        if time.monotonic() - began > GONE_SECS:
+            raise engine.Failed(f"{what} still runs {GONE_SECS:.0f} s on")
+        time.sleep(0.002)
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The number is another user's process now: the daemon is gone.
+        return False
+    return True
+
+
+def group_runs(group: int) -> bool:
+    try:
+        os.killpg(group, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def kill_group(pid: int) -> int:
+    """`kill -9 -PGID` of the daemon's process group: the daemon and every process it started
+    (workers, test fork servers, macro runtimes), at once. Its group."""
+    if not hasattr(os, "killpg"):
+        raise engine.Failed(f"no process groups on {sys.platform}: the kill -9 budget is POSIX's")
+    group = os.getpgid(pid)
+    if group == os.getpgrp():
+        raise engine.Failed(f"the daemon {pid} is in the harness's process group {group}: a SIGKILL to it would "
+                            "kill the harness (the daemon is started in a group of its own)")
+    os.killpg(group, signal.SIGKILL)
+    return group
+
+
+def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how: Restart) -> Measured:
+    """`runs` times: a warm no-op `blaze check`, the daemon stopped (`how`), and the first answer
+    after it, a no-op `blaze check` timed from the command to its result."""
+
+    def check(step: str) -> float:
+        began = time.monotonic()
+        served(eng, step, eng.build(step, ws, env, [], "check"))
+        return (time.monotonic() - began) * 1000
+
+    said = {"clean": "a clean stop", "kill9": "kill -9 of the daemon's process group"}[how]
+    check("the no-op check that warms up")
+    warm: list[float] = []
+    first: list[float] = []
+    for n in range(args.runs):
+        warm.append(check(f"warm no-op check {n + 1}"))
+        status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
+        pid = daemon_pid(status.stdout)
+        if how == "clean":
+            eng.stop(ws, env)
+            until_gone(f"the daemon {pid} after `blaze stop`", lambda: alive(pid))
+        else:
+            group = kill_group(pid)
+            until_gone(f"the process group {group} of the daemon {pid} after SIGKILL", lambda: group_runs(group))
+        first.append(check(f"the first answer after {said} {n + 1}"))
+    files = source_files(ws)
+    sweeps = sys.platform == "linux"
+    warm_ms = statistics.median(warm)
+    limit = restart_limit(warm_ms, files, args.restart_slack_ms, sweeps)
+    got = timed(first, "ms", warm_median_ms=round(warm_ms, 3), warm_samples_ms=samples(warm), files=files,
+                slack_ms=args.restart_slack_ms, **spread(warm, "ms", "warm_"))
+    sweep = f" + the statx sweep of {files} files at {STATX_US_PER_FILE} us each" if sweeps else ""
+    return Measured(got.value, limit, f"after {said}: the warm no-op check's median {warm_ms:.4g} ms + "
+                    f"{args.restart_slack_ms:.4g} ms{sweep}", got.numbers, got.interval)
 
 
 def main(args: Input) -> None:
@@ -1307,6 +1413,41 @@ def selftest() -> None:
     expect("median_low_ms" not in timed([1.0, 2, 3], "ms").numbers, "no interval is reported from 3 runs")
     expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
                                     "relocation"}, f"the tables of docs/v2/plan/design/data.md: {TABLES}")
+    v2_status = "pid: 41\nrequests: 2 (7, 9)\nviews: 1\nmemory: 1.5 GiB of 8.0 GiB\n"
+    v1_status = "daemon: pid 123, version 0.1, exits never, no limit\n  worker: pid 456, ready, log /h/w/1/log\n"
+    expect(daemon_pid(v2_status) == 41 and daemon_pid(v1_status) == 123, "the daemon's pid in v2's and v1's status")
+    for status in ("no daemon is running\n", "requests: 0\n  pid: 9\n", v2_status + "pid: 42\n"):
+        try:
+            daemon_pid(status)
+            expect(False, f"a status naming no one daemon is refused: {status!r}")
+        except engine.Failed:
+            pass
+    expect(restart_limit(12.0, 100_000, 5.0, True) == 67.0, "the restart budget with Linux's statx sweep")
+    expect(restart_limit(12.0, 100_000, 5.0, False) == 17.0, "the restart budget where a journal survives")
+    restarts = {row.key: row for row in ROWS if row.budget == "restart"}
+    expect(set(restarts) == {f"restart-first-answer-{how}" for how in get_args(Restart)},
+           f"a restart row for each way the daemon stops: {sorted(restarts)}")
+    expect(all(row.project == "blaze" and row.at_most and row.unit == "ms" for row in restarts.values()),
+           "the restart rows: blaze, at most, in ms")
+    spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
+    given = parse(Input, spec + ', "budgets": ["restart"], "restart_slack_ms": 3.5}', SCRIPT)
+    expect(given.budgets == ("restart",) and given.restart_slack_ms == 3.5, f"the restart input: {given}")
+    expect(parse(Input, spec + "}", SCRIPT).restart_slack_ms == 5.0, "the restart slack is 5 ms unless given")
+    for bad in (', "restart_slack_ms": 5}', ', "budgets": ["restart-clean"]}'):
+        try:
+            parse(Input, spec + bad, SCRIPT)
+            expect(False, f"the input {bad!r} is refused")
+        except SystemExit:
+            pass
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    expect(alive(os.getpid()) and not alive(child.pid), "a running process is alive and a reaped one not")
+    if hasattr(os, "killpg"):
+        try:
+            kill_group(os.getpid())
+            expect(False, "a SIGKILL to the harness's own process group is refused")
+        except engine.Failed:
+            pass
     print(f"{SCRIPT} selftest: ok")
 
 

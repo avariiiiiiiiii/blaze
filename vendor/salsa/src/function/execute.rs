@@ -771,7 +771,7 @@ fn complete_cycle_participant(
 
     let mut completed_query = complete_cycle_query(zalsa, active_query, iteration);
 
-    *completed_query.revisions.verified_final.get_mut() = false;
+    completed_query.revisions.set_verified_final(false);
     completed_query
         .revisions
         .set_cycle_heads(cycle_heads, iteration);
@@ -801,9 +801,9 @@ fn try_complete_cycle_head(
 
     // It's important to force a re-execution of the cycle if `changed_at` or `durability` has changed
     // to ensure the reduced durability and changed propagates to all queries depending on this head.
-    let metadata_converged = last_provisional_revisions.durability
-        == completed_query.revisions.durability
-        && last_provisional_revisions.changed_at == completed_query.revisions.changed_at
+    let metadata_converged = last_provisional_revisions.durability()
+        == completed_query.revisions.durability()
+        && last_provisional_revisions.changed_at() == completed_query.revisions.changed_at()
         && last_provisional_revisions.is_derived_untracked()
             == completed_query.revisions.is_derived_untracked();
 
@@ -821,7 +821,7 @@ fn try_complete_cycle_head(
         completed_query
             .revisions
             .set_cycle_converged(this_converged);
-        *completed_query.revisions.verified_final.get_mut() = false;
+        completed_query.revisions.set_verified_final(false);
 
         // Transfer ownership of this query to the outer cycle, so that it can claim it
         // and other threads don't compete for the same lock.
@@ -869,7 +869,7 @@ fn try_complete_cycle_head(
             }
         }
 
-        *completed_query.revisions.verified_final.get_mut() = true;
+        completed_query.revisions.set_verified_final(true);
 
         zalsa.event(&|| {
             Event::new(EventKind::DidFinalizeCycle {
@@ -917,7 +917,7 @@ fn try_complete_cycle_head(
     completed_query
         .revisions
         .set_cycle_heads(cycle_heads, iteration);
-    *completed_query.revisions.verified_final.get_mut() = false;
+    completed_query.revisions.set_verified_final(false);
 
     Err((completed_query, iteration))
 }
@@ -974,8 +974,7 @@ fn complete_cycle_query(
     assert!(
         completed_query
             .revisions
-            .accumulated_inputs
-            .load()
+            .accumulated_inputs()
             .is_empty(),
         "Fixpoint iteration doesn't support accumulated values because it doesn't preserve the original query dependency tree."
     );

@@ -20,7 +20,7 @@ use crate::fingerprint::Fingerprint;
 use crate::graph::{self, EdgeSpan, Graph, Relocation, TaskGraph};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
-use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use crate::sync::atomic::{AtomicU32, AtomicU64};
 use crate::table::{PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
 use crate::zalsa::{IngredientIndex, Zalsa};
@@ -1285,7 +1285,8 @@ impl OriginAndExtra {
     /// The value fingerprints the inputs had when read; see [`QueryRevisions::edge_fingerprint`].
     #[inline]
     fn fingerprints(&self) -> &[EdgeFingerprint] {
-        self.head().map_or(&[], |head| &head.fingerprints)
+        self.head()
+            .map_or(&[][..], |head| head.fingerprints.as_slice())
     }
 
     /// The fingerprints, boxing the origin if they are written.
@@ -1770,8 +1771,8 @@ impl<'me> ActiveQueryGuard<'me> {
 
     /// Append the given `outputs` to the query's output list.
     pub(crate) fn seed_iteration(&self, zalsa: &Zalsa, previous: &QueryRevisions) {
-        let durability = previous.durability;
-        let changed_at = previous.changed_at;
+        let durability = previous.durability();
+        let changed_at = previous.changed_at();
         let edges = previous.origin(zalsa.graph()).edges();
         let untracked_read = previous.is_derived_untracked();
 
@@ -1917,11 +1918,13 @@ pub(crate) mod persistence {
     use super::QueryOriginRef;
     use thin_vec::ThinVec;
 
+    #[cfg(feature = "accumulator")]
+    use super::InputAccumulatedValues;
     use super::{OriginAndExtra, QueryEdge, QueryEdges, QueryRevisions, QueryRevisionsExtra};
     use crate::DatabaseKeyIndex;
     use crate::graph::{Graph, TaskGraph};
-    use crate::sync::atomic::{AtomicBool, Ordering};
     use crate::{Durability, Revision};
+    use std::sync::atomic::Ordering;
 
     impl OriginAndExtra {
         /// A persisted origin, its edges written into `graph`.
@@ -2035,34 +2038,24 @@ pub(crate) mod persistence {
         durability: Durability,
         #[serde(rename = "origin")]
         origin: PersistentQueryOrigin,
-        #[serde(with = "verified_final")]
-        verified_final: AtomicBool,
+        verified_final: bool,
         extra: Option<&'a super::QueryRevisionsExtraInner>,
     }
 
     impl QueryRevisions {
+        // Accumulated inputs are not serialized (accumulators aren't yet). The value fingerprint
+        // is computed again from the deserialized value, and the serialized origin's edges are
+        // not the recorded ones, so no fingerprint is persisted either.
         pub(crate) fn with_origin(
             &self,
             serialized_origin: PersistentQueryOrigin,
         ) -> MappedQueryRevisions<'_> {
-            let QueryRevisions {
-                changed_at,
-                durability,
-                ref verified_final,
-                #[cfg(feature = "accumulator")]
-                    accumulated_inputs: _, // TODO: Support serializing accumulators
-                ref origin_and_extra,
-                // The value fingerprint is computed again from the deserialized value, and the
-                // serialized origin's edges are not the recorded ones, so neither is persisted.
-                fingerprints: _,
-            } = *self;
-
             MappedQueryRevisions {
-                changed_at,
-                durability,
-                extra: origin_and_extra.extra(),
+                changed_at: self.changed_at(),
+                durability: self.durability(),
+                extra: self.origin_and_extra.extra(),
                 origin: serialized_origin,
-                verified_final: AtomicBool::new(verified_final.load(Ordering::Relaxed)),
+                verified_final: self.verified_final(Ordering::Relaxed),
             }
         }
     }
@@ -2076,41 +2069,21 @@ pub(crate) mod persistence {
         durability: Durability,
         #[serde(rename = "origin")]
         origin: PersistentQueryOrigin,
-        #[serde(with = "verified_final")]
-        verified_final: AtomicBool,
+        verified_final: bool,
         extra: QueryRevisionsExtra,
     }
 
     impl PersistedRevisions {
         pub(crate) fn record(self, graph: &Graph, task: &TaskGraph) -> QueryRevisions {
-            QueryRevisions {
-                changed_at: self.changed_at,
-                durability: self.durability,
-                origin_and_extra: OriginAndExtra::recorded(self.origin, self.extra, graph, task),
+            QueryRevisions::new(
+                self.changed_at,
+                self.durability,
+                OriginAndExtra::recorded(self.origin, self.extra, graph, task),
+                self.verified_final,
                 #[cfg(feature = "accumulator")]
-                accumulated_inputs: Default::default(), // TODO: Support serializing accumulators
-                verified_final: self.verified_final,
-                fingerprints: ThinVec::new(),
-            }
-        }
-    }
-
-    // A workaround the fact that `shuttle` atomic types do not implement `serde::{Serialize, Deserialize}`.
-    pub(super) mod verified_final {
-        use crate::sync::atomic::{AtomicBool, Ordering};
-
-        pub fn serialize<S>(value: &AtomicBool, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: serde::Serializer,
-        {
-            serde::Serialize::serialize(&value.load(Ordering::Relaxed), serializer)
-        }
-
-        pub fn deserialize<'de, D>(deserializer: D) -> Result<AtomicBool, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            serde::Deserialize::deserialize(deserializer).map(AtomicBool::new)
+                InputAccumulatedValues::Empty,
+                ThinVec::new(),
+            )
         }
     }
 }

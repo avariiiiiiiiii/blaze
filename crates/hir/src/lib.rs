@@ -6294,7 +6294,7 @@ pub trait HasVisibility {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PredicatePolarity {
+pub enum ClausePolarity {
     /// `T: Trait`
     Positive,
     /// `T: !Trait`
@@ -6302,16 +6302,16 @@ pub enum PredicatePolarity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TraitPredicate<'db> {
-    inner: hir_ide::next_solver::TraitPredicate<'db>,
+pub struct TraitClause<'db> {
+    inner: hir_ide::next_solver::TraitClause<'db>,
     owner: TypeOwnerId,
 }
 
-impl<'db> TraitPredicate<'db> {
-    pub fn polarity(&self) -> PredicatePolarity {
+impl<'db> TraitClause<'db> {
+    pub fn polarity(&self) -> ClausePolarity {
         match self.inner.polarity {
-            rustc_type_ir::PredicatePolarity::Positive => PredicatePolarity::Positive,
-            rustc_type_ir::PredicatePolarity::Negative => PredicatePolarity::Negative,
+            rustc_type_ir::ClausePolarity::Positive => ClausePolarity::Positive,
+            rustc_type_ir::ClausePolarity::Negative => ClausePolarity::Negative,
         }
     }
 

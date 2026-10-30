@@ -232,6 +232,9 @@ struct Keywords {
     declared: Box<[u8]>,
     /// The keywords whose symbols are not declared ones, and their places plus one.
     other: FxHashMap<Symbol, u8>,
+    /// Bit `n` set when some keyword in `other` is `n` bytes long: most identifiers are no
+    /// keyword's length and skip the map.
+    other_lengths: u64,
     kinds: Box<[IdentKinds]>,
 }
 
@@ -244,6 +247,7 @@ impl Keywords {
         texts.dedup();
         let mut declared = Vec::new();
         let mut other = FxHashMap::default();
+        let mut other_lengths = 0u64;
         let mut kinds = Vec::with_capacity(texts.len());
         for text in texts {
             kinds.push(std::array::from_fn(|edition| {
@@ -260,18 +264,20 @@ impl Keywords {
                     declared[at] = place;
                 }
                 None => {
+                    assert!(text.len() < 64, "a keyword of {} bytes", text.len());
+                    other_lengths |= 1 << text.len();
                     other.insert(symbol, place);
                 }
             }
         }
-        Keywords { declared: declared.into(), other, kinds: kinds.into() }
+        Keywords { declared: declared.into(), other, other_lengths, kinds: kinds.into() }
     }
 
     #[inline]
     fn of(&self, symbol: Symbol, edition: Edition) -> (SyntaxKind, SyntaxKind) {
         let place = match symbol.declared_index() {
             Some(at) => self.declared.get(usize::from(at)).copied().unwrap_or(0),
-            None if self.other.is_empty() => 0,
+            None if self.other_lengths & 1 << symbol.as_str().len().min(63) == 0 => 0,
             None => self.other.get(&symbol).copied().unwrap_or(0),
         };
         match place {

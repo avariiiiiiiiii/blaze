@@ -13,6 +13,8 @@
   once. `Env::get` is the binary search. Every other caller compiles unchanged:
   `.vars.iter()`, `.vars.into_iter().collect()` and `Env::apply` read the same order.
 
+> forwarded to cargo (told by tmux).
+
 ## 2. blaze-cargo: judge a run by borrowing (optional, speed)
 
 - What: in `judge` (around line 289), replace building a `blaze_build_script::run::Ran` from
@@ -25,6 +27,8 @@
 - Why: `finish` copies nothing but both clones are whole outputs, and it writes the files with
   `std::fs` on the daemon's thread, which blocks it.
 
+> forwarded to cargo (told by tmux).
+
 ## 3. blaze-cargo: begin an elided run without cloning its output (optional, speed)
 
 - What: in `ScriptRun::start` (around line 608), call `blaze_build_script::run::begin(&start.unit)`
@@ -36,6 +40,8 @@
 - Why: `elided` only wraps `begin` and the stdout given; the clone is thrown away. `begin`
   calls `create_dir_all` and `fs::write` on the daemon's thread.
 
+> forwarded to cargo (told by tmux).
+
 ## 4. blaze-usercode: read what reruns a script without parsing everything (optional, speed)
 
 - What: in `cargo_rule`, replace `match output::parse(&exit.stdout, &cx)` with
@@ -46,9 +52,13 @@
 - Why: `watched_in` reads the output in the same pass and keeps only the `rerun-if-*` values,
   borrowed; `parse` copies every directive into an `Output` that is then dropped.
 
+> forwarded to usercode (told by tmux).
+
 ## 5. docs/README.md: index the new plan doc (required)
 
 - What: run `python3 tools/docs.py write` so the index lists
   `docs/v2/plan/lanes/usercode/scripts.md`.
 - Where: `docs/README.md` (generated).
 - Why: the doc is new, and `tools/docs.py check` fails on a stale index.
+
+> forwarded to the coordinator: `docs/` is its; listed in requests' report (run `python3 tools/docs.py write`).

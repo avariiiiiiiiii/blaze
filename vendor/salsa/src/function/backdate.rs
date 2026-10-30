@@ -11,7 +11,7 @@ where
     C: Configuration,
 {
     /// If the value/durability of this memo is equal to what is found in `revisions`/`value`,
-    /// then update `revisions.changed_at` to match `self.revisions.changed_at`. This is invoked
+    /// then update `revisions.changed_at()` to match `self.revisions.changed_at()`. This is invoked
     /// on an old memo when a new memo has been produced to check whether there have been changed.
     ///
     /// When the old value is present, [`Configuration::values_equal`] decides. When it was
@@ -63,20 +63,20 @@ impl MemoHeader {
             // used to be, that is a "breaking change" that our
             // consumers must be aware of. Becoming *more* durable
             // is not. See the test `durable_to_less_durable`.
-            && revisions.durability >= self.revisions.durability
+            && revisions.durability() >= self.revisions.durability()
     }
 
     fn backdate(&self, index: DatabaseKeyIndex, revisions: &mut QueryRevisions) {
         crate::tracing::debug!(
             "{index:?} value is equal, back-dating to {:?}",
-            self.revisions.changed_at,
+            self.revisions.changed_at(),
         );
 
-        if self.revisions.changed_at > revisions.changed_at {
-            report_backdate_violation(index, self.revisions.changed_at, revisions.changed_at);
+        if self.revisions.changed_at() > revisions.changed_at() {
+            report_backdate_violation(index, self.revisions.changed_at(), revisions.changed_at());
         }
 
-        revisions.changed_at = self.revisions.changed_at;
+        revisions.set_changed_at(self.revisions.changed_at());
     }
 }
 

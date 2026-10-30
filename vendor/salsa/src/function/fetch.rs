@@ -33,14 +33,14 @@ where
         let revisions = &memo.header.revisions;
         zalsa_local.report_tracked_read(
             database_key_index,
-            revisions.durability,
-            revisions.changed_at,
+            revisions.durability(),
+            revisions.changed_at(),
             revisions.value_fingerprint(),
             memo.header.cycle_heads(),
             #[cfg(feature = "accumulator")]
             revisions.accumulated().is_some(),
             #[cfg(feature = "accumulator")]
-            &revisions.accumulated_inputs,
+            revisions.accumulated_inputs(),
         );
 
         memo_value

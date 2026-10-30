@@ -1271,6 +1271,7 @@ Besides the sites below:
 - `Cargo.lock` and blaze-wasm's own lock still name `ra-ap-rustc_type_ir_macros` at the old version.
 
 > refused (regenerated list): every `display.rs` site is ported already (`TyKind::Alias(_, a)`, `Ty::new_alias(.., is_rigid, ..)`, `FnDef` args read once with `no_bound_vars().unwrap()`); the new suggestions add a third field `TyKind::Alias` does not have. `builtin_derives.rs` already prints `TraitClause(` (re-bless at the first compile). `crates/macros` and the locks are the coordinator's, listed in requests' report.
+> applied (requests): `crates/hir-ide/src/display.rs` has no old name left (`TraitClause`, `ClausePolarity`, `OutlivesClause`, `TyKind::Alias(IsRigid, _)` with `write_projection` keeping the flag it matched, `ConstKind::Alias` over `AliasConstKind` with no `StaticId` arm, `FnDef` args through `no_bound_vars().unwrap()`); `crates/hir-ide/src/tests/builtin_derives.rs` has all 48 `value: TraitPredicate(` as `value: TraitClause(` (re-bless at the first build). > forwarded to the coordinator: `crates/macros/src/lib.rs` `generic_type_visitable_derive` (`unsafe_bound_impl`, wrapped in `#[allow(unsafe_code)]` with R11's SAFETY comment) is its crate, not `requests'`; I had written it and took it back out, so the file is as in HEAD. The two locks are the coordinator's too.
 
 
 ### `crates/hir-ide/src/display.rs`

@@ -14,30 +14,42 @@
 //!   with it, never cloned); a collection fills a [`Building`] it alone holds. A reader reaches
 //!   a table only through a [`Snapshot`], which is in a task ([`blaze_reclaim::enter`]) for as
 //!   long as anything it lends lives; a replaced table is freed once every such task has ended.
-//! - Names are interned once for the tree's life, as spans of one byte column.
+//! - Names are interned once, as spans of one byte column; a table hands its names on to the
+//!   next generation with their numbers.
+//! - A table restored from the daemon's image (docs/v2/plan/design/restore.md) starts with a
+//!   **base**: its nodes, entries, names and both indexes are the image's own bytes, checked
+//!   once ([`Base::check`]) and read in place; nodes made after are appended in the columns
+//!   with numbers after the base's, and the index of the appended ones is probed after the
+//!   base's. A file of the base is a range of the image's blobs section, checked by its page
+//!   groups' CRC32C the first time it is read ([`Mapped::read`]).
 //!
 //! Why unsafe: the columns are read while the writer appends, with no lock (one acquire load
 //! and a compare per read). The safe version, a `RwLock<Vec<_>>` per column or a table copied
 //! per commit, costs every read a shared write (the lock's count) or every commit a copy of the
-//! tree.
+//! tree. A base is borrowed from the mapped image the table holds, for as long as it holds it.
 //!
 //! Costs: a node is 32 bytes of ID plus an 8-byte [`Shape`], and 4 bytes of index place at
 //! most half full; a directory entry is 9 bytes (name, node, mode byte) in three columns; a
-//! file's bytes are one `Arc<[u8]>` shared with every reader. Finding a root is one probe of
-//! about 1.5 places; a path component is a binary search over the directory's name column.
+//! file's bytes are one `Arc<[u8]>` shared with every reader, or a range of the image. Finding
+//! a root is one probe of about 1.5 places (two when a base is there and the node is not in
+//! it); a path component is a binary search over the directory's name column. A base costs
+//! nothing in memory: it is the image's pages, read when something reads them.
 
 use std::{
     marker::PhantomData,
-    mem::{MaybeUninit, needs_drop},
+    mem::{MaybeUninit, needs_drop, size_of_val},
     ptr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
+use blaze_core::Mapping;
 use blaze_ids::ContentId;
+use blaze_image::{Corrupt, Image, Section};
 use blaze_reclaim::{Guard, Limbo};
 
 use crate::{
     Mode,
+    image::Bytes,
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},

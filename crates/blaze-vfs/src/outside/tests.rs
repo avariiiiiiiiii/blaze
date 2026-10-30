@@ -131,6 +131,9 @@ fn a_lost_event_stops_vouching() {
     round(&mut sim, &mut outside, &mut effects);
     assert!(!dirs.unchanged_since(path("/tc/lib/a.h"), generation));
     assert!(!dirs.unchanged_since(path("/tc/x"), generation), "lost names nothing: all of it");
+    // What was dropped may have been its own end: it is watched and confirmed again.
+    assert!(dirs.dir(0).since() > generation);
+    assert!(dirs.unchanged_since(path("/tc/lib/a.h"), dirs.generation()));
 }
 
 #[test]

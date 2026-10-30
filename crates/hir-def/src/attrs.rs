@@ -335,6 +335,19 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     }
                     Some(Word::rustc_nounwind) if single => AttrFlags::RUSTC_NOUNWIND,
                     Some(Word::rustc_comptime) if single => AttrFlags::RUSTC_COMPTIME,
+                    Some(Word::rustc_insignificant_dtor) if single => {
+                        AttrFlags::RUSTC_INSIGNIFICANT_DTOR
+                    }
+                    Some(Word::rustc_as_ptr) if single => AttrFlags::RUSTC_AS_PTR,
+                    Some(Word::rustc_no_implicit_autorefs) if single => {
+                        AttrFlags::RUSTC_NO_IMPLICIT_AUTOREFS
+                    }
+                    Some(Word::rustc_never_returns_null_ptr) if single => {
+                        AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR
+                    }
+                    Some(Word::rustc_canonical_symbol) if single => {
+                        AttrFlags::RUSTC_CANONICAL_SYMBOL
+                    }
                     _ => return ControlFlow::Continue(()),
                 };
                 attr_flags.insert(flag);
@@ -531,7 +544,9 @@ name_set! {
     rustc_allocator,
     rustc_allocator_zeroed,
     rustc_allow_incoherent_impl,
+    rustc_as_ptr,
     rustc_builtin_macro,
+    rustc_canonical_symbol,
     rustc_coinductive,
     rustc_comptime,
     rustc_const_panic_str,
@@ -541,12 +556,15 @@ name_set! {
     rustc_force_inline,
     rustc_has_incoherent_inherent_impls,
     rustc_inherit_overflow_checks,
+    rustc_insignificant_dtor,
     rustc_intrinsic,
     rustc_intrinsic_must_be_overridden,
     rustc_layout_scalar_valid_range_end,
     rustc_layout_scalar_valid_range_start,
     rustc_legacy_const_generics,
     rustc_must_implement_one_of,
+    rustc_never_returns_null_ptr,
+    rustc_no_implicit_autorefs,
     rustc_nounwind,
     rustc_paren_sugar,
     rustc_pass_indirectly_in_non_rustic_abis,
@@ -676,6 +694,18 @@ bitflags::bitflags! {
         const PANIC_HANDLER = 1 << 71;
         /// `#[stable(..)]`: [`stability::stability`].
         const IS_STABLE = 1 << 72;
+        // One segment each, as rustc's parsers of these words read them.
+        /// `#[rustc_insignificant_dtor]` on an ADT: its drop matters only through its type
+        /// arguments.
+        const RUSTC_INSIGNIFICANT_DTOR = 1 << 73;
+        /// `#[rustc_as_ptr]`.
+        const RUSTC_AS_PTR = 1 << 74;
+        /// `#[rustc_no_implicit_autorefs]`.
+        const RUSTC_NO_IMPLICIT_AUTOREFS = 1 << 75;
+        /// `#[rustc_never_returns_null_ptr]`.
+        const RUSTC_NEVER_RETURNS_NULL_PTR = 1 << 76;
+        /// `#[rustc_canonical_symbol]` on a foreign function of `core` or `std`.
+        const RUSTC_CANONICAL_SYMBOL = 1 << 77;
     }
 }
 

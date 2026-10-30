@@ -76,7 +76,7 @@ impl VerifyResult {
             #[cfg(feature = "accumulator")]
             match revisions.accumulated() {
                 Some(_) => InputAccumulatedValues::Any,
-                None => revisions.accumulated_inputs.load(),
+                None => revisions.accumulated_inputs(),
             },
         )
     }
@@ -214,7 +214,7 @@ where
                 #[cfg(feature = "detailed-trace")]
                 old_memo.has_value(),
             ) {
-                return ColdResult::Verified(if old_header.revisions.changed_at > revision {
+                return ColdResult::Verified(if old_header.revisions.changed_at() > revision {
                     VerifyResult::changed()
                 } else {
                     VerifyResult::unchanged_for_memo(&old_header.revisions)
@@ -264,7 +264,7 @@ where
                 }
 
                 let memo = self.execute(db, claim_guard, Some(old_memo))?;
-                let changed_at = memo.header.revisions.changed_at;
+                let changed_at = memo.header.revisions.changed_at();
 
                 // Always assume that a provisional value has changed.
                 //
@@ -338,7 +338,7 @@ impl<'db> UnclaimedFrame<'db> {
     /// Every input was unchanged: the memo is verified.
     fn finish(&self, zalsa: &Zalsa) {
         #[cfg(feature = "accumulator")]
-        self.header.revisions.accumulated_inputs.store(self.inputs);
+        self.header.revisions.store_accumulated_inputs(self.inputs);
         self.header.mark_as_verified(zalsa, self.key);
     }
 }
@@ -347,7 +347,7 @@ impl MemoHeader {
     /// What a reader verified at `revision` learns from this memo, now verified.
     #[inline]
     fn verify_result_after(&self, revision: Revision) -> VerifyResult {
-        if self.revisions.changed_at > revision {
+        if self.revisions.changed_at() > revision {
             VerifyResult::changed()
         } else {
             VerifyResult::unchanged_for_memo(&self.revisions)
@@ -468,7 +468,7 @@ impl MemoHeader {
         if can_shallow_update.yes() && !self.may_be_provisional() {
             self.update_shallow(zalsa, database_key_index, can_shallow_update);
 
-            Some(if self.revisions.changed_at > revision {
+            Some(if self.revisions.changed_at() > revision {
                 VerifyResult::changed()
             } else {
                 VerifyResult::unchanged_for_memo(&self.revisions)
@@ -557,7 +557,7 @@ impl MemoHeader {
         database_key_index: DatabaseKeyIndex,
         verified_at: Revision,
     ) -> ShallowUpdate {
-        let last_changed = zalsa.last_changed_revision(self.revisions.durability);
+        let last_changed = zalsa.last_changed_revision(self.revisions.durability());
         crate::tracing::trace!(
             "{database_key_index:?}: check_durability({database_key_index:#?}, last_changed={:?} <= verified_at={:?}) = {:?}",
             last_changed,
@@ -834,7 +834,7 @@ fn deep_verify_edges(
     // This value is only read once the memo is verified. It's therefore safe
     // to write a non-final value here.
     #[cfg(feature = "accumulator")]
-    old_revisions.accumulated_inputs.store(inputs);
+    old_revisions.store_accumulated_inputs(inputs);
 
     result
 }
@@ -857,7 +857,7 @@ fn unchanged_by_fingerprint(
     let revisions = &header.revisions;
     (header.verified_at.load() == zalsa.current_revision()
         && !header.may_be_provisional()
-        && revisions.durability >= reader.durability
+        && revisions.durability() >= reader.durability()
         && revisions.value_fingerprint() == saw)
         .then(|| VerifyResult::unchanged_for_memo(revisions))
 }
@@ -914,7 +914,7 @@ fn validate_provisional(
     }
     // Relaxed is sufficient here because there are no other writes we need to ensure have
     // happened before marking this memo as verified-final.
-    memo_revisions.verified_final.store(true, Ordering::Relaxed);
+    memo_revisions.mark_verified_final(Ordering::Relaxed);
     true
 }
 

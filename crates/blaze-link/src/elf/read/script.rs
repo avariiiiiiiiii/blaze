@@ -2,7 +2,7 @@
 //! `GROUP ( /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/x86_64-linux-gnu/libc_nonshared.a
 //! AS_NEEDED ( /lib64/ld-linux-x86-64.so.2 ) )`. Only the commands that name inputs are read.
 
-use crate::model::Shared;
+use crate::model::{Names, Shared};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Token<'a> {
@@ -60,7 +60,14 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Shared, String> {
     if inputs.is_empty() {
         return Err(format!("{name}: a linker script that names no inputs"));
     }
-    Ok(Shared { name: super::file_name(name), symbols: Vec::new(), more: Vec::new(), inputs })
+    Ok(Shared {
+        name: super::file_name(name),
+        symbols: Vec::new(),
+        names: Names::default(),
+        versions: Vec::new(),
+        more: Vec::new(),
+        inputs,
+    })
 }
 
 /// Reads the file names of a `GROUP`, `INPUT` or `AS_NEEDED` from `at`, just past its `(`, into

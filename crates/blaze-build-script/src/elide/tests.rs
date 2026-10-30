@@ -701,3 +701,24 @@ fn on_demand_elision_says_what_the_whole_list_said() {
     }
     assert!(read > 1_000 && refused > 1_000, "{read} read, {refused} refused");
 }
+
+/// A placeholder may name its argument any number of times, so what a script prints can grow
+/// as the square of its source: past [`PRINTED_PER_BYTE`] bytes per byte of the root file it is
+/// run, not read. The input is safety-fuzz-usercode's
+/// (`fuzz/corpus/usercode_script_elide/a-placeholder-reused-past-the-bound.hex`): 9046 bytes
+/// that would print 6 MB.
+#[test]
+fn a_placeholder_reused_past_the_bound_is_run() {
+    let script = |times: usize| {
+        let (spec, arg) = ("{0}".repeat(times), "a".repeat(3000));
+        format!("fn main() {{ println!(\"cargo:warning={spec}\", \"{arg}\"); }}\n")
+    };
+    let source = script(2000);
+    assert_eq!(source.len(), 9046);
+    assert_eq!(elided(&source), None);
+    assert_eq!(elided(&script(2)).unwrap(), format!("cargo:warning={}\n", "a".repeat(6000)));
+    // 15 copies print 45,015 bytes from 3,091 (the bound is 49,456); 17 print 51,015 from
+    // 3,097 (the bound is 49,552).
+    assert_eq!(elided(&script(15)).map(|it| it.len()), Some(45_015));
+    assert_eq!(elided(&script(17)), None);
+}

@@ -75,6 +75,8 @@ Order:
   `blaze-global`) and `tools/pgo/`, with hooks in other lanes' crates by request.
 - **`frontend`**: makes `plan/design/frontend.md` (rust-analyzer's design, fixed) and
   `plan/design/restore.md` (instant restore) true across lanes, building what no lane started.
+- **`mem`**: `plan/design/memory.md`, game-engine memory management: builds `crates/blaze-mem` and
+  moves the hot crates onto it.
 
 ## 19. How the coordinator integrates
 

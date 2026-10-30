@@ -876,7 +876,7 @@ impl memo::MemoHeader {
         let iteration = self.revisions.iteration();
         let verified_at = self.verified_at.load();
 
-        if self.revisions.verified_final.load(Ordering::Relaxed) {
+        if self.revisions.verified_final(Ordering::Relaxed) {
             ProvisionalStatus::Final {
                 iteration,
                 verified_at,
@@ -900,7 +900,7 @@ impl memo::MemoHeader {
     }
 
     fn finalize_cycle_head(&self) {
-        self.revisions.verified_final.store(true, Ordering::Release);
+        self.revisions.mark_verified_final(Ordering::Release);
     }
 
     fn cycle_converged(&self) -> bool {

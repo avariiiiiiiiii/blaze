@@ -13,9 +13,9 @@
 //!   directory becomes an [`Effect::Watch`], confirmed by an [`Effect::Stat`] of it asked
 //!   right after, which every driver runs after the watch is in place (the order
 //!   [`crate::Watcher::start`] relies on: each driver sets a watch up as it is submitted).
-//!   A change bumps the generation and marks its directory; an end, a failure or a change
-//!   naming the directory itself (it was replaced or moved, or may have been) stops it
-//!   vouching at once.
+//!   A change bumps the generation and marks its directory; an end, a failure, a lost report
+//!   or a change naming the directory itself (it was replaced or moved, or may have been)
+//!   stops it vouching at once, and it is watched again.
 //! - Events come after the change that made them (FSEvents' queue, a thread reading inotify),
 //!   so a round of [`Effect::Flush`]es ([`Outside::flush`]) is the barrier: until every flush
 //!   of the round is in, nothing vouches, and once it is, every change made before the round
@@ -147,6 +147,10 @@ impl Dirs {
     /// Whether nothing at `path` can have changed since `generation` was read: a directory at
     /// or above it has been watched without a break since before then and heard of no change
     /// under it after, and the last round of flushes is in. False is "look at the disk".
+    ///
+    /// Ancestors are found by bytes, as `path` is named: ask only of a canonical path (no
+    /// symlink in it, none of `.` or `..`), since a watch hears nothing of a symlink's target
+    /// outside it, nor of a symlink above it being pointed elsewhere.
     pub fn unchanged_since(&self, path: &Path, generation: u64) -> bool {
         if !self.hot.settled.load(Ordering::Acquire) {
             return false;
@@ -173,7 +177,7 @@ impl Dirs {
     /// Adds `dir` to watch, if it is not there already: the driver watches it from its next
     /// [`Outside::start`] or round. The file system's root is not watched (a watch of every
     /// file on the machine would hear every write): a path that only it covers is looked at
-    /// on the disk at each check.
+    /// on the disk at each check. `dir` is canonical, as [`Dirs::unchanged_since`] asks.
     pub fn want(&self, dir: &Path) {
         let dir = dir.components().as_path();
         if dir.parent().is_none() {
@@ -458,11 +462,11 @@ impl<'d> Outside<'d> {
         let round = self.round;
         let watch = &mut self.watches[at];
         match (kind, completion.done) {
-            (WATCH, Done::Changed { files, .. }) => {
+            (WATCH, Done::Changed { files, lost }) => {
                 dir.changed.fetch_max(dirs.bump(), Ordering::AcqRel);
-                if watch.file.as_ref().is_some_and(|it| files.contains(it)) {
-                    // Replaced or moved, or may have been: its watch may hear nothing more of
-                    // what is at its name.
+                if lost || watch.file.as_ref().is_some_and(|it| files.contains(it)) {
+                    // Replaced or moved, or may have been (what was dropped may be its own
+                    // end): its watch may hear nothing more of what is at its name.
                     unconfirm(dir, watch);
                     watch.restart = true;
                 } else if watch.state == State::Watching

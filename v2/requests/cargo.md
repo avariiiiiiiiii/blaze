@@ -2078,3 +2078,64 @@ and the unknown-command help lists `serve, stop, status and daemon`.
 
 v1's daemon (`crates/blaze-cargo/src/cargo/daemon.rs:798-800,1364+`, `cargo/client.rs`) keeps
 its spawn: it is v1's, deleted with v1, and no unit starts it.
+
+## frontend-text: file text shares the VFS's bytes, and `line_column` on base-db's line index (frontend.md item 6; 2026-10-29)
+
+Goes with the request of the same name in `v2/requests/db.md` (section 3 there changes
+`base_db::ViewFile` to `{ path, id, bytes: &Arc<[u8]> }` and adds `base_db::line_index`); land
+both together. `blaze_vfs::text_of` (new, `crates/blaze-vfs/src/text.rs`) turns the tree's
+`Arc<[u8]>` into the file's `Arc<str>` without a copy.
+
+### 1. `crates/load-cargo/src/v2.rs`, `set_files`
+
+Old:
+
+```rust
+        let file = blaze_vfs::File { id: file.id, mode: blaze_vfs::Mode::Regular, bytes: &file.bytes };
+        view.push(ViewFile { path, file });
+```
+
+New:
+
+```rust
+        view.push(ViewFile { path, id: file.id, bytes: &file.bytes });
+```
+
+(`files::Loaded::bytes` is already the tree's `Arc<[u8]>`, from `Reader::file`.)
+
+### 2. `crates/load-cargo/src/v2/db.rs`: `line_column` on `base_db::line_index`
+
+Old (the `line_column` method of `impl SourceDatabase for Db`, and the free `fn line_index`
+below `hir::impl_hir_database!(Db);` with its `LinedFile` and inner query):
+
+```rust
+    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()> {
+        let at = line_index(self, file).try_line_col(offset).ok_or(())?;
+        Ok((at.line, at.col))
+    }
+```
+
+New:
+
+```rust
+    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()> {
+        let text = self.file_text(file);
+        let place = base_db::line_index(self, text).place(offset).ok_or(())?;
+        let column = place.char_column(text.text(self)).ok_or(())?;
+        Ok((place.line().checked_sub(1).ok_or(())?, column - 1))
+    }
+```
+
+and delete the free `fn line_index(db: &dyn SourceDatabase, file: FileId) -> &Arc<line_index::LineIndex>`
+whole. Then `line-index.workspace = true` leaves `crates/load-cargo/Cargo.toml` (`rg line_index
+crates/load-cargo/src` finds nothing else), and `Arc`, if now unused in `v2/db.rs`, leaves its
+imports.
+
+Why, besides one index per text: `line_column` answers proc macros' `Span::line`/`column`
+(`load-cargo/src/lib.rs`, `SubRequest::LineColumn`, adds 1 to each). rustc's are
+`lookup_char_pos(lo).line` and `.col + 1`, columns in chars; the `line_index` crate's `col` is
+UTF-8 bytes, so a span after a non-ASCII char on its line got a column past rustc's. `Place`'s
+are rustc's (`places_are_rustcs` in `crates/span/src/lines/tests.rs`). A text with nothing after
+its byte order mark has rustc's line 0, which this trait's 0-based line can't say; that is
+`Err(())`, a place no token can be at.
+Status: open

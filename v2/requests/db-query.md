@@ -13,6 +13,8 @@
   hits already allocate nothing. Once it exists, blaze-query keeps one buffer per thread in its
   thread-local run stacks (`lib.rs`, `Stacks`).
 
+> applied (format is DONE): `Writer::with_buffer(schema, bytes)` in `crates/blaze-format/src/lib.rs`, which clears `bytes`, keeps its capacity and writes the header; `Writer::new` is it over a fresh 4 KiB `Vec`. No `finish_into`: `Writer::finish` already returns the buffer by value, so hand that back to `with_buffer`. Test `a_reused_buffer_writes_the_same_bytes_in_its_own_allocation` (`tests.rs`).
+
 ## 2. Interface note, no action needed: `Query::fingerprint` takes the value's bytes
 
 `Query::fingerprint(value)` is now `Query::fingerprint(value, bytes)`, with `bytes` the value as
@@ -20,3 +22,5 @@ written, and its default hashes those bytes instead of writing the value a secon
 crate in the tree overrides it (`rg 'fn fingerprint' crates` finds no `impl Query` that does),
 so no caller changes. If `docs/v2/plan/reference/crates.md` ever lists the trait's methods, it
 should show the new signature.
+
+> applied: nothing to change; `docs/v2/plan/reference/crates.md` lists no `Query` methods.

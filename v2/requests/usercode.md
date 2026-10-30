@@ -613,6 +613,17 @@ the daemon must not be taken down by a dependency's source.
 
 > forwarded to usercode: its own crate.
 
+> applied (usercode-fast-scripts): `crates/blaze-build-script/src/elide.rs`. What is printed is
+> a `Printed { text, limit }` with `limit = PRINTED_PER_BYTE * source.len()` (16, the root
+> file's bytes before normalizing); its `push` gives `None` once `text.len()` plus the piece
+> about to be pushed passes the limit, checked before every push in `format` and `write_arg`
+> (format-string runs, each argument, the newline), so `printed` and `elide` give `None` and
+> the script is run. An escaped string argument is decoded into a reused scratch buffer
+> first, so its length is known before the push. Test:
+> `elide/tests.rs::a_placeholder_reused_past_the_bound_is_run` (the 9046-byte input gives
+> `None`; 15 copies of `{0}` are still read, 17 are not). Not compiled or run yet (no builds
+> in this lane); the seeds test of `usercode_script_elide` should pass on that file once built.
+
 ## 9. fastcompile: `Inputs::env_all` lends the environment (`crates/blaze-testsel/src/select/tests.rs`)
 
 What: `blaze_usercode::trace::Inputs::env_all` is now `fn env_all(&mut self) -> &[(OsString, OsString)]`,
@@ -676,3 +687,38 @@ that path. A reader takes no lock and writes nothing shared. Each check takes
 lives.
 
 > forwarded to cargo (told by tmux).
+
+## frontend-tokens: send token trees over the proc-macro wire as their columns
+
+From frontend-tokens (docs/v2/plan/design/frontend.md item 4, notes in
+docs/v2/plan/lanes/frontend/tokens.md). Your crates, so a request, not an edit.
+
+What exists now in `crates/tt` (mine): `tt::TopSubtree::write_wire(&self, &mut Vec<u8>)` and
+`tt::TopSubtree::read_wire(&[u8], &mut dyn FnMut(tt::WirePart) -> Result<(SpanAnchor,
+SyntaxContext), String>) -> Result<(TopSubtree, usize), tt::WireError>`. The bytes are the
+tree's own columns (8-byte nodes, 8-byte packed spans, the span-part table, symbol offsets, the
+two top spans, then the symbols' UTF-8), laid out in `crates/tt/src/storage/wire.rs`'s module
+doc. Writing copies the columns and builds no token tree. Reading checks every rule the tree's
+methods rely on, and that the columns are exactly the builder's for those token trees, so a
+tree read compares and hashes as the one built. It allocates at most a constant times its input,
+and it refuses any span part the callback refuses: `WirePart` holds raw file, AST and context ids,
+and only the reading side knows which of them it handed out. Tests in `tt/src/storage/tests.rs`
+`check_wire` read back every random tree, refuse every prefix of its bytes, and for every flipped
+bit either refuse it or re-encode the same bytes.
+
+Asked:
+1. `crates/proc-macro-api/src/legacy_protocol/msg/flat.rs` and `bidirectional_protocol.rs`: for
+   a server that speaks it (a new protocol version), send `write_wire` bytes in place of
+   `FlatTree::from_subtree`. Resolve parts with a callback that accepts only the parts of the
+   trees the request sent, plus call, def and mixed site; anything else is an error naming the
+   part. An older server keeps the JSON `FlatTree`, as protocol versions do today. That is a
+   version negotiation, not a fallback.
+2. `crates/proc-macro-srv`: read the request with `read_wire`, taking parts as they come (the
+   server mints no contexts), and write the result with `write_wire`.
+3. `crates/blaze-macro-wasm/src/wire.rs`: the guest reads the same layout instead of
+   `Writer`'s. Spans become the packed span words as they are, so the `Spans` map
+   (an `FxHashMap` per span) goes away. `read_wire` checks the result.
+4. The in-process path (`blaze-expand` native) passes the `TopSubtree` itself, with no bytes.
+
+Why: item 4 is one token format from the lexer to the proc macro. A proc-macro call then costs
+a copy of the columns each way, not a token tree per token, a hash per span and JSON.

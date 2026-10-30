@@ -351,3 +351,21 @@ under 7 no longer read (`served_lang_items` panics on the count). The version no
 the encoder that changes it.
 
 > forwarded to codegen: `crates/blaze-engine/` is its.
+
+## db-expand: `hir` wrappers for deprecation and stability (db-ty, `crates/hir`)
+
+What: `hir` methods over `hir_def::attrs::stability::{deprecation_entry, stability}` for every
+`hir` definition and field (`StabilityDef::Def(AttrDefId)`, `StabilityDef::Field(FieldId)`).
+Then `blaze-diagnostics/src/lints/names/stability/lookup.rs` (diagnostics') drops its source
+walk and calls them. Why: the queries landed (dispatch task 10); hir-def has no `hir` types.
+
+> forwarded to db: `crates/hir` is db-ty's lane.
+
+## db-expand: `trait_impls_without_reservation` in method resolution (items, `crates/hir-ty/src/method_resolution.rs`)
+
+What: `collect_def_map` (`method_resolution.rs:1655-1670`) iterates
+`scope.trait_impls_without_reservation()` and drops its `AttrFlags::query(..).contains(
+RUSTC_RESERVATION_IMPL)` for each impl. Why: the item scope keeps the bit beside each impl
+(dispatch task 9), so the filter costs a bit test rather than a query per impl.
+
+> forwarded to items.

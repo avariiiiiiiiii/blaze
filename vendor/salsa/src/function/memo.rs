@@ -226,7 +226,7 @@ pub(super) struct MemoHeader {
 impl MemoHeader {
     fn new(revision_now: Revision, revisions: QueryRevisions) -> Self {
         debug_assert!(
-            !revisions.verified_final.load(Ordering::Relaxed) || revisions.cycle_heads().is_empty(),
+            !revisions.verified_final(Ordering::Relaxed) || revisions.cycle_heads().is_empty(),
             "Memo must be finalized if it has no cycle heads"
         );
         Self {
@@ -258,7 +258,7 @@ impl MemoHeader {
         // `false` to `true`), and changing it to `true` on memos with cycle heads where it was
         // ever `false` is purely an optimization; if we read an out-of-date `false`, it just means
         // we might go validate it again unnecessarily.
-        !self.revisions.verified_final.load(Ordering::Relaxed)
+        !self.revisions.verified_final(Ordering::Relaxed)
     }
 
     /// Cycle heads that should be propagated to dependent queries.

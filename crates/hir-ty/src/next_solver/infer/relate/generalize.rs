@@ -1,7 +1,9 @@
 //! Type generation code.
 
+use std::hash::Hash;
 use std::mem;
 
+use arrayvec::ArrayVec;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::error::TypeError;
 use rustc_type_ir::inherent::{IntoKind, Term as _, Ty as _};
@@ -135,7 +137,6 @@ impl<'db> InferCtxt<'db> {
         )
     }
 
-    #[instrument(level = "debug", skip(self, relation))]
     fn instantiate_var<R: PredicateEmittingRelation<InferCtxt<'db>>>(
         &self,
         relation: &mut R,
@@ -336,7 +337,41 @@ struct Generalizer<'me, 'db> {
     /// hold by either normalizing the outer or the inner associated type.
     in_alias: bool,
 
-    cache: FxHashMap<(Ty<'db>, Variance, bool), Ty<'db>>,
+    cache: GeneralizeCache<(Ty<'db>, Variance, bool), Ty<'db>>,
+}
+
+const CACHE_INLINE: usize = 8;
+
+/// Generalized types already computed in one generalization, keyed by the source type, the
+/// ambient variance and `in_alias`. A generalization touches few distinct types, so the
+/// first `CACHE_INLINE` entries live in place and nothing is allocated unless it spills.
+struct GeneralizeCache<K, V> {
+    inline: ArrayVec<(K, V), CACHE_INLINE>,
+    spill: FxHashMap<K, V>,
+}
+
+impl<K, V> Default for GeneralizeCache<K, V> {
+    fn default() -> Self {
+        GeneralizeCache { inline: ArrayVec::new(), spill: FxHashMap::default() }
+    }
+}
+
+impl<K: Eq + Hash, V: Copy> GeneralizeCache<K, V> {
+    #[inline]
+    fn get(&self, key: &K) -> Option<V> {
+        if let Some((_, v)) = self.inline.iter().find(|(k, _)| k == key) {
+            return Some(*v);
+        }
+        if self.spill.is_empty() { None } else { self.spill.get(key).copied() }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, value: V) {
+        if let Err(full) = self.inline.try_push((key, value)) {
+            let (key, value) = full.element();
+            self.spill.insert(key, value);
+        }
+    }
 }
 
 /// Do we need to generalize this type?
@@ -454,7 +489,6 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
         if args == a_args { Ok(a_ty) } else { Ok(mk(args)) }
     }
 
-    #[instrument(level = "debug", skip(self, variance, b), ret)]
     fn relate_with_variance<T: Relate<DbInterner<'db>>>(
         &mut self,
         variance: Variance,
@@ -470,7 +504,6 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
         r
     }
 
-    #[instrument(level = "debug", skip(self, t2), ret)]
     fn tys(&mut self, t: Ty<'db>, t2: Ty<'db>) -> RelateResult<'db, Ty<'db>> {
         assert_eq!(t, t2); // we are misusing TypeRelation here; both LHS and RHS ought to be ==
 
@@ -478,7 +511,7 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
             return Ok(t);
         }
 
-        if let Some(&result) = self.cache.get(&(t, self.ambient_variance, self.in_alias)) {
+        if let Some(result) = self.cache.get(&(t, self.ambient_variance, self.in_alias)) {
             return Ok(result);
         }
 
@@ -588,7 +621,6 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
         Ok(g)
     }
 
-    #[instrument(level = "debug", skip(self, r2), ret)]
     fn regions(&mut self, r: Region<'db>, r2: Region<'db>) -> RelateResult<'db, Region<'db>> {
         assert_eq!(r, r2); // we are misusing TypeRelation here; both LHS and RHS ought to be ==
 
@@ -627,7 +659,6 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
         Ok(self.infcx.next_region_var_in_universe(self.for_universe, self.span))
     }
 
-    #[instrument(level = "debug", skip(self, c2), ret)]
     fn consts(&mut self, c: Const<'db>, c2: Const<'db>) -> RelateResult<'db, Const<'db>> {
         assert_eq!(c, c2); // we are misusing TypeRelation here; both LHS and RHS ought to be ==
 
@@ -692,7 +723,6 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
         }
     }
 
-    #[instrument(level = "debug", skip(self), ret)]
     fn binders<T>(
         &mut self,
         a: Binder<'db, T>,
@@ -718,4 +748,34 @@ struct Generalization<T> {
     /// otherwise very easily result in infinite
     /// recursion.
     pub value_may_be_infer: T,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CACHE_INLINE, GeneralizeCache};
+
+    #[test]
+    fn cache_finds_inline_and_spilled_entries() {
+        let mut cache = GeneralizeCache::<(u32, bool), u32>::default();
+        let n = CACHE_INLINE as u32 * 3;
+        for i in 0..n {
+            assert_eq!(cache.get(&(i, true)), None);
+            cache.insert((i, true), i + 100);
+        }
+        assert_eq!(cache.inline.len(), CACHE_INLINE);
+        assert_eq!(cache.spill.len(), n as usize - CACHE_INLINE);
+        for i in 0..n {
+            assert_eq!(cache.get(&(i, true)), Some(i + 100));
+            assert_eq!(cache.get(&(i, false)), None);
+        }
+    }
+
+    #[test]
+    fn small_cache_does_not_allocate() {
+        let mut cache = GeneralizeCache::<u32, u32>::default();
+        for i in 0..CACHE_INLINE as u32 {
+            cache.insert(i, i);
+        }
+        assert_eq!(cache.spill.capacity(), 0);
+    }
 }

@@ -619,6 +619,152 @@ mod tests {
         assert_eq!(LexedStr::single_token(Edition::CURRENT, &long_string).map(|it| it.0), Some(STRING));
     }
 
+    fn tokens(edition: Edition, text: &str) -> Vec<(SyntaxKind, &str, Option<String>)> {
+        let lexed = LexedStr::new(edition, text);
+        let mut start = 0;
+        (0..lexed.len())
+            .map(|i| {
+                let len = lexed.text_len(i);
+                let error = lexed.error(i).map(str::to_owned);
+                let token = (lexed.kind(i), &text[start..start + len], error);
+                start += len;
+                token
+            })
+            .collect()
+    }
+
+    /// rustc's `report_unknown_prefix`: an error from 2021, before it only the lint, and the
+    /// prefix is the identifier or lifetime it spells in every edition.
+    #[test]
+    fn unknown_prefixes_are_errors_from_2021() {
+        for edition in Edition::iter() {
+            let error = |prefix: &str| {
+                edition.at_least_2021().then(|| format!("prefix `{prefix}` is unknown"))
+            };
+            let got = tokens(edition, "z\"hey\" hey#1 'foo#x match\"x\"");
+            let kinds: Vec<_> = got.iter().map(|it| (it.0, it.1)).collect();
+            assert_eq!(
+                kinds,
+                [
+                    (IDENT, "z"),
+                    (STRING, "\"hey\""),
+                    (WHITESPACE, " "),
+                    (IDENT, "hey"),
+                    (POUND, "#"),
+                    (INT_NUMBER, "1"),
+                    (WHITESPACE, " "),
+                    (LIFETIME_IDENT, "'foo"),
+                    (POUND, "#"),
+                    (IDENT, "x"),
+                    (WHITESPACE, " "),
+                    (MATCH_KW, "match"),
+                    (STRING, "\"x\""),
+                ],
+                "{edition:?}"
+            );
+            for (at, prefix) in [(0, "z"), (3, "hey"), (7, "'foo"), (11, "match")] {
+                assert_eq!(got[at].2, error(prefix), "{edition:?} {prefix}");
+            }
+            assert_eq!(tokens(edition, "builtin#x")[0], (IDENT, "builtin", None));
+        }
+    }
+
+    /// rustc's `next_token_from_cursor` before 2021: `c"…"` and `cr"…"` are the identifier and
+    /// then the rest, lexed again; from 2021 one C string.
+    #[test]
+    fn c_strings_are_split_before_2021() {
+        for edition in Edition::iter() {
+            let got = tokens(edition, "c\"x\" cr\"y\" cr#\"z\"#");
+            if edition.at_least_2021() {
+                assert_eq!(
+                    got,
+                    [
+                        (C_STRING, "c\"x\"", None),
+                        (WHITESPACE, " ", None),
+                        (C_STRING, "cr\"y\"", None),
+                        (WHITESPACE, " ", None),
+                        (C_STRING, "cr#\"z\"#", None),
+                    ]
+                );
+                assert_eq!(LexedStr::single_token(edition, "c\"x\""), Some((C_STRING, None)));
+            } else {
+                assert_eq!(
+                    got,
+                    [
+                        (IDENT, "c", None),
+                        (STRING, "\"x\"", None),
+                        (WHITESPACE, " ", None),
+                        (IDENT, "cr", None),
+                        (STRING, "\"y\"", None),
+                        (WHITESPACE, " ", None),
+                        (IDENT, "cr", None),
+                        (POUND, "#", None),
+                        (STRING, "\"z\"", None),
+                        (POUND, "#", None),
+                    ],
+                    "{edition:?}"
+                );
+                assert_eq!(LexedStr::single_token(edition, "c\"x\""), None, "{edition:?}");
+            }
+        }
+    }
+
+    /// rustc's `RawLifetime` arm: before 2021 `'r`, `#` and the name; from 2021 one lifetime,
+    /// with rustc's errors for a quote after it and for a name that can't be raw.
+    #[test]
+    fn raw_lifetimes_are_split_before_2021() {
+        for edition in [Edition::Edition2015, Edition::Edition2018] {
+            assert_eq!(
+                tokens(edition, "'r#lt"),
+                [(LIFETIME_IDENT, "'r", None), (POUND, "#", None), (IDENT, "lt", None)]
+            );
+            assert_eq!(tokens(edition, "'r#_")[0], (LIFETIME_IDENT, "'r", None));
+            assert_eq!(LexedStr::single_token(edition, "'r#lt"), None);
+        }
+        for edition in [Edition::Edition2021, Edition::Edition2024] {
+            assert_eq!(tokens(edition, "'r#lt"), [(LIFETIME_IDENT, "'r#lt", None)]);
+            assert_eq!(
+                LexedStr::single_token(edition, "'r#lt"),
+                Some((LIFETIME_IDENT, None))
+            );
+            for name in ["_", "self", "Self", "super", "crate"] {
+                let text = format!("'r#{name}");
+                let message = format!("`{name}` cannot be a raw lifetime");
+                assert_eq!(
+                    tokens(edition, &text),
+                    [(LIFETIME_IDENT, &*text, Some(message))],
+                    "{edition:?}"
+                );
+            }
+            let got = tokens(edition, "'r#a'");
+            assert_eq!(
+                got[0],
+                (
+                    LIFETIME_IDENT,
+                    "'r#a",
+                    Some("character literal may only contain one codepoint".to_owned())
+                )
+            );
+        }
+    }
+
+    /// rustc's `CannotBeRawIdent`, in every edition.
+    #[test]
+    fn path_keywords_cannot_be_raw_identifiers() {
+        for edition in Edition::iter() {
+            for name in ["_", "self", "Self", "super", "crate"] {
+                let text = format!("r#{name}");
+                let message = format!("`{name}` cannot be a raw identifier");
+                assert_eq!(tokens(edition, &text), [(IDENT, &*text, Some(message))]);
+            }
+            assert_eq!(tokens(edition, "r#fn r#async"), [
+                (IDENT, "r#fn", None),
+                (WHITESPACE, " ", None),
+                (IDENT, "r#async", None),
+            ]);
+        }
+    }
+
     /// Two lexings' input, one after the other, is the input of their texts lexed as one, split
     /// at any token boundary.
     #[test]

@@ -124,6 +124,15 @@ blaze_format::record! {
     }
 }
 
+/// What a table's section means beyond [`Root`]: the columns, the index and [`value_hash`].
+/// A change to any of them changes this text, and so every table's schema.
+pub(crate) const LAYOUT: &str = "intern table 1: Root at 0; starts u32, keys u64, live u64 bits, \
+     ctrl u64 groups of 8 tags (0x80 | hash >> 57) probed linearly from hash & mask, ids u32, \
+     free u32 ascending, bytes; value_hash multiply-rotate with murmur3 finalizer";
+
+/// [`Root`]'s record schema.
+pub(crate) const ROOT: blaze_format::SchemaHash = <Root as blaze_format::Record>::SCHEMA;
+
 /// The table's part in the image this process restored, read in place; empty for a fresh one.
 #[derive(Default)]
 struct Base {

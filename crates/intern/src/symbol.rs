@@ -1,23 +1,20 @@
 //! Interned strings: symbols declared at compile time ([`symbols`]) and ones interned at
-//! runtime, both never freed.
+//! runtime, as `u32` IDs that mean the same in every process that restores one image.
 //!
-//! A [`Symbol`] points at a [`Text`]: its `&'static str` and its order key. A declared symbol's
-//! is a `static`, a runtime one's sits in the append-only arena of [`crate::arena`] beside its
-//! bytes. The table is filled with the declared symbols first, so interning a declared symbol's
-//! text gives the declared symbol.
+//! A [`Symbol`] is an ID in the symbol [`Table`]: `1..=STATIC` are the compiled-in texts of
+//! [`symbols::TEXTS`] (the declared symbols, then each list's), every other one a text interned
+//! at runtime or restored from an image ([`restore_symbols`]), read in place. The table holds
+//! the compiled-in texts first, so interning a declared symbol's text gives the declared
+//! symbol. A symbol is never freed while the process runs; the image's GC ([`write_symbols`])
+//! keeps only the ones the other sections still name, each at its own ID.
 
-use std::{
-    alloc::Layout,
-    cmp::Ordering,
-    fmt,
-    hash::BuildHasher,
-    ptr::NonNull,
-    sync::OnceLock,
-};
+use std::{cmp::Ordering, fmt, num::NonZeroU32, sync::Arc, sync::OnceLock};
 
-use rustc_hash::FxBuildHasher;
+use blaze_format::SchemaHash;
+use blaze_ids::Hasher;
+use blaze_image::{Builder, Image, SectionId, Stable};
 
-use crate::arena::{Entry, Store};
+use crate::table::{Live, RestoreError, Shape, Table};
 
 pub mod symbols;
 
@@ -35,15 +32,12 @@ pub const fn order_key(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(key)
 }
 
-/// What a [`Symbol`] points at: 24 bytes, the order key read by [`Symbol::cmp_order`] beside
-/// the text.
-#[repr(C)]
+/// A compiled-in symbol's text and its order key, read by [`Symbol::cmp_order`] without the
+/// table.
 pub(crate) struct Text {
     key: u64,
     str: &'static str,
 }
-
-const _: () = assert!(size_of::<Text>() == 8 + size_of::<&str>());
 
 impl Text {
     pub(crate) const fn new(str: &'static str) -> Text {
@@ -53,18 +47,13 @@ impl Text {
 
 /// # Invariant
 ///
-/// `repr` points at a [`Text`] that never moves, changes or is freed: a `static`, or one in
-/// [`STORE`]'s arena, its `key` the [`order_key`] of its `str`. Two symbols are one string
-/// exactly when they are one pointer.
+/// `id` names a text of the symbol table: compiled in (`id <= STATIC`), or made or restored
+/// by this process, which never frees it. Two symbols are one string exactly when they are
+/// one ID.
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Symbol {
-    repr: NonNull<Text>,
+    id: NonZeroU32,
 }
-
-// SAFETY: A `Symbol` is a shared reference to a `Text` that is never written again.
-unsafe impl Send for Symbol {}
-// SAFETY: As for `Send`: a `Symbol` is a shared reference to a `Text` that is never written again.
-unsafe impl Sync for Symbol {}
 
 impl fmt::Debug for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -72,67 +61,113 @@ impl fmt::Debug for Symbol {
     }
 }
 
-const _: () = assert!(size_of::<Symbol>() == size_of::<NonNull<()>>());
-const _: () = assert!(align_of::<Symbol>() == align_of::<NonNull<()>>());
-const _: () = assert!(size_of::<Option<Symbol>>() == size_of::<NonNull<()>>());
+const _: () = assert!(size_of::<Symbol>() == size_of::<u32>());
+const _: () = assert!(size_of::<Option<Symbol>>() == size_of::<u32>());
 
-static STORE: OnceLock<Store> = OnceLock::new();
+static TABLE: OnceLock<Table> = OnceLock::new();
 
-fn store() -> &'static Store {
-    STORE.get_or_init(symbols::prefill)
+fn shape() -> Shape {
+    Shape {
+        statics: symbols::STATIC as u32,
+        static_bytes: |id| symbols::TEXTS[id as usize - 1].str.as_bytes(),
+        key: order_key,
+        align: 1,
+        text: true,
+    }
 }
 
-fn hash(s: &str) -> u64 {
-    FxBuildHasher.hash_one(s)
+#[inline]
+fn table() -> &'static Table {
+    TABLE.get_or_init(|| Table::new(shape()))
 }
 
-/// Makes `symbol` the one `Symbol::intern` gives for its text, unless one is already.
-fn prefill_one(store: &Store, symbol: Symbol) {
-    let s = symbol.as_str();
-    // SAFETY: Every value of the store is a `Text`, as `Symbol::repr` points at.
-    let same = |at: NonNull<u8>| unsafe { at.cast::<Text>().as_ref().str == s };
-    if let Entry::Vacant(vacant) = store.entry(hash(s), same) {
-        vacant.publish(symbol.repr.cast());
+/// The schema of the symbol section: the table's layout and every compiled-in text, so an
+/// image is restored only by a blaze whose `STATIC` IDs are the same texts.
+pub fn symbols_schema() -> SchemaHash {
+    static SCHEMA: OnceLock<SchemaHash> = OnceLock::new();
+    *SCHEMA.get_or_init(|| {
+        let mut hasher = Hasher::new("blaze intern symbols");
+        hasher.update(crate::table::LAYOUT.as_bytes()).update(&crate::table::ROOT.0.0);
+        for text in &symbols::TEXTS {
+            hasher.update(&(text.str.len() as u64).to_le_bytes()).update(text.str.as_bytes());
+        }
+        SchemaHash(hasher.finish())
+    })
+}
+
+/// Makes the symbols of `image`'s [`SectionId::SYMBOLS`] this process's, read in place: every
+/// symbol a restored value names means the text it meant when the image was written. Must run
+/// before any symbol is interned or read; the image stays mapped until the process exits.
+///
+/// On an error no symbol was restored, so no other section of `image` that names symbols may
+/// be used: every one of them is recomputed from a cold start. The section is checked whole
+/// here, since every value depends on it.
+pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>) -> Result<(), RestoreError> {
+    let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
+    restore_into(&TABLE, image)
+}
+
+fn restore_into<S: Stable>(cell: &OnceLock<Table>, image: &'static Image<S>) -> Result<(), RestoreError> {
+    let started = RestoreError::Started { section: SectionId::SYMBOLS };
+    if cell.get().is_some() {
+        return Err(started);
+    }
+    let section = image.section(SectionId::SYMBOLS, symbols_schema())?;
+    let table = Table::restore(shape(), image, &section)?;
+    cell.set(table).map_err(|_| started)
+}
+
+/// Writes the symbol section into `builder`: every symbol `live` marks at its ID, every other
+/// ID free for the next process. The symbols interned while this runs are not in it.
+pub fn write_symbols(live: &Live, builder: &mut Builder) {
+    let mut out = builder.section(SectionId::SYMBOLS, symbols_schema());
+    table().write(live, &mut out);
+}
+
+impl Live {
+    /// Keeps `symbol` in the next image.
+    #[inline]
+    pub fn mark(&mut self, symbol: Symbol) {
+        self.mark_id(symbol.id());
     }
 }
 
 impl Symbol {
-    /// The symbol of the `static` `r`.
-    pub(crate) const fn from_static(r: &'static Text) -> Symbol {
-        // SAFETY: A reference is not null.
-        Symbol { repr: unsafe { NonNull::new_unchecked((r as *const Text).cast_mut()) } }
+    /// Compiled-in symbol `index` of [`symbols::TEXTS`].
+    pub(crate) const fn from_index(index: usize) -> Symbol {
+        assert!(index < symbols::STATIC);
+        match NonZeroU32::new(index as u32 + 1) {
+            Some(id) => Symbol { id },
+            None => unreachable!(),
+        }
     }
 
     pub fn intern(s: &str) -> Self {
-        let store = store();
-        // SAFETY: Every value of the store is a `Text`.
-        let same = |at: NonNull<u8>| unsafe { at.cast::<Text>().as_ref().str == s };
-        let at = match store.entry(hash(s), same) {
-            Entry::Found(at) => at,
-            Entry::Vacant(vacant) => {
-                let (layout, bytes_at) = Layout::new::<Text>()
-                    .extend(Layout::array::<u8>(s.len()).expect("a symbol's layout"))
-                    .expect("a symbol's layout");
-                let key = order_key(s.as_bytes());
-                vacant.insert(layout, |to| {
-                    // SAFETY: `to` is fresh memory of `layout`, and `bytes_at` is where
-                    // `Layout::extend` put the bytes in it, so the pointer stays in the allocation.
-                    let bytes = unsafe { to.as_ptr().add(bytes_at) };
-                    // SAFETY: `bytes` has room for `s.len()` bytes (the array part of `layout`)
-                    // and is fresh memory, so it cannot overlap `s`.
-                    unsafe { bytes.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
-                    // SAFETY: The `s.len()` bytes at `bytes` were just written, and the arena
-                    // never moves, writes or frees them, so they live for `'static`.
-                    let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes, s.len()) };
-                    // SAFETY: `bytes` is a copy of `s`, a `&str`, so it is UTF-8.
-                    let str: &'static str = unsafe { std::str::from_utf8_unchecked(bytes) };
-                    // SAFETY: `layout` starts with a `Text` (`Layout::new`), so `to` is aligned
-                    // for it and has room, and nothing was there to drop.
-                    unsafe { to.cast::<Text>().write(Text { key, str }) };
-                })
-            }
-        };
-        Symbol { repr: at.cast() }
+        Symbol::from_table(table().intern(s.as_bytes()))
+    }
+
+    /// The symbol of `s`, if one was interned or restored.
+    pub fn find(s: &str) -> Option<Symbol> {
+        table().find(s.as_bytes()).map(Symbol::from_table)
+    }
+
+    fn from_table(id: u32) -> Symbol {
+        Symbol { id: NonZeroU32::new(id).expect("the table never gives ID 0") }
+    }
+
+    /// The symbol's ID: what a persisted value stores, the same in every process that restored
+    /// the image it was written with.
+    #[inline]
+    pub fn id(self) -> u32 {
+        self.id.get()
+    }
+
+    /// The symbol of a stored ID, `None` when it names no symbol in this process.
+    #[inline]
+    pub fn from_id(id: u32) -> Option<Symbol> {
+        let id = NonZeroU32::new(id)?;
+        let known = id.get() as usize <= symbols::STATIC || table().get(id.get()).is_some();
+        known.then_some(Symbol { id })
     }
 
     pub fn empty() -> Self {
@@ -140,14 +175,23 @@ impl Symbol {
     }
 
     #[inline]
-    pub fn as_str(&self) -> &str {
-        self.as_static().str
+    pub fn as_str(&self) -> &'static str {
+        if let Some(text) = self.text() {
+            return text.str;
+        }
+        let bytes = table().bytes(self.id());
+        // SAFETY: a symbol's bytes are a copy of the `&str` it was interned from, or were
+        // checked to be UTF-8 when the image holding them was restored (`Shape::text`).
+        unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
     /// The symbol's [`order_key`], stored beside it when it was interned.
     #[inline]
     pub fn order_key(&self) -> u64 {
-        self.as_static().key
+        match self.text() {
+            Some(text) => text.key,
+            None => table().key(self.id()),
+        }
     }
 
     /// The order of `self.as_str().cmp(other.as_str())`: the order keys first, the bytes only
@@ -157,27 +201,32 @@ impl Symbol {
         if self == other {
             return Ordering::Equal;
         }
-        let (a, b) = (self.as_static(), other.as_static());
-        match a.key.cmp(&b.key) {
-            Ordering::Equal => a.str.as_bytes().cmp(b.str.as_bytes()),
+        match self.order_key().cmp(&other.order_key()) {
+            Ordering::Equal => self.as_str().as_bytes().cmp(other.as_str().as_bytes()),
             unequal => unequal,
         }
     }
 
-    /// The symbol's index in [`symbols::Declared`] when it is a declared one, from one
-    /// pointer subtraction and a bounds check; `None` for one interned at run time or of a list
-    /// such as [`symbols::Integer`]. Interning a declared symbol's text gives the declared
-    /// symbol, so a name read from source has its index too.
+    /// The symbol's index in [`symbols::Declared`] when it is a declared one, from one compare;
+    /// `None` for one interned at run time or of a list such as [`symbols::Integer`].
+    /// Interning a declared symbol's text gives the declared symbol, so a name read from source
+    /// has its index too.
     #[inline]
     pub fn declared_index(&self) -> Option<u16> {
-        symbols::declared_index(self.as_static()).map(|it| it as u16)
+        let index = self.id() as usize - 1;
+        (index < symbols::DECLARED).then_some(index as u16)
     }
 
-    /// The `Text` the symbol points at.
+    /// The symbol's index in [`symbols::TEXTS`] when it is compiled in.
     #[inline]
-    pub(crate) fn as_static(&self) -> &'static Text {
-        // SAFETY: `repr`'s invariant.
-        unsafe { self.repr.as_ref() }
+    pub(crate) fn static_index(&self) -> Option<usize> {
+        let index = self.id() as usize - 1;
+        (index < symbols::STATIC).then_some(index)
+    }
+
+    #[inline]
+    fn text(&self) -> Option<&'static Text> {
+        symbols::TEXTS.get(self.id() as usize - 1)
     }
 }
 
@@ -189,8 +238,8 @@ impl fmt::Display for Symbol {
 
 /// A fixed set of declared symbols (lang items, builtin attributes, target features) as the
 /// `u16` index of each in the set: a table by [`Symbol::declared_index`], built by `const fn`,
-/// so recognizing a member is a pointer subtraction and one load, with no hash and no string
-/// compared. 2 bytes a declared symbol.
+/// so recognizing a member is one compare and one load, with no hash and no string compared.
+/// 2 bytes a declared symbol.
 pub struct KnownNames {
     by_declared: [u16; symbols::DECLARED],
 }
@@ -240,7 +289,7 @@ mod tests {
         let q = Symbol::intern("?");
         assert_eq!(Symbol::intern("!"), bang);
         assert_eq!(Symbol::intern("hello"), hello);
-        assert!(store().len() >= 4);
+        assert!(table().end() as usize > symbols::STATIC + 1);
         assert_ne!(hello, world);
         assert_ne!(bang, q);
         let default = Symbol::intern("default");
@@ -256,9 +305,14 @@ mod tests {
         for s in ["self", "Self", "", "fn", "0", "255", "256", "a new symbol", "ünïcödé", "x"] {
             assert_eq!(Symbol::intern(s).as_str(), s);
             assert_eq!(Symbol::intern(s), Symbol::intern(&s.to_owned()));
+            assert_eq!(Symbol::find(s), Some(Symbol::intern(s)));
+            assert_eq!(Symbol::from_id(Symbol::intern(s).id()), Some(Symbol::intern(s)));
         }
         let long = "y".repeat(1 << 20);
         assert_eq!(Symbol::intern(&long).as_str(), long);
+        assert_eq!(Symbol::find("never interned anywhere"), None);
+        assert_eq!(Symbol::from_id(0), None);
+        assert_eq!(Symbol::from_id(u32::MAX - 1), None);
     }
 
     #[test]
@@ -288,13 +342,15 @@ mod tests {
     }
 
     /// No two declared symbols share a text, and none is a list's: interning each text gives
-    /// its own declared symbol, which tables by declared index and compares with `sym::` rely on.
+    /// its own declared symbol, which tables by declared index and compares with `sym::` rely
+    /// on. A list's text gives its list symbol.
     #[test]
-    fn every_declared_text_interns_to_itself() {
-        assert_eq!(symbols::TEXTS.len(), sym::DECLARED);
+    fn every_compiled_in_text_interns_to_itself() {
+        assert_eq!(symbols::TEXTS.len(), sym::STATIC);
         for (at, text) in symbols::TEXTS.iter().enumerate() {
             let symbol = Symbol::intern(text.str);
-            assert_eq!(symbol.declared_index(), Some(at as u16), "{:?}", text.str);
+            assert_eq!(symbol, Symbol::from_index(at), "{:?}", text.str);
+            assert_eq!(symbol.declared_index(), (at < sym::DECLARED).then_some(at as u16));
             assert_eq!(symbol.order_key(), order_key(text.str.as_bytes()));
         }
     }
@@ -324,6 +380,7 @@ mod tests {
         }
         assert_eq!(sym::Integer::as_uint(&sym::self_), None);
         assert_eq!(sym::Integer::as_uint(&Symbol::intern("12a")), None);
+        assert_eq!(sym::Integer::as_uint(&sym::RaGeneratedName::get(3)), None);
         assert_eq!(sym::RaGeneratedName::get(3).as_str(), "<ra@gennew>3");
         assert_eq!(sym::RaGeneratedName::get(300).as_str(), "<ra@gennew>300");
         assert_eq!(sym::RaGeneratedName::get(300), Symbol::intern("<ra@gennew>300"));
@@ -433,5 +490,37 @@ mod tests {
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         check_order(&names);
+    }
+
+    /// Restoring into a table that already interned is refused: its IDs may be the image's.
+    #[test]
+    fn a_restore_after_interning_is_refused() {
+        let image = image_of(&Table::new(shape()), &Live::new());
+        let cell = OnceLock::new();
+        let _ = cell.get_or_init(|| Table::new(shape()));
+        assert_eq!(restore_into(&cell, image), Err(RestoreError::Started { section: SectionId::SYMBOLS }));
+        let fresh = OnceLock::new();
+        assert_eq!(restore_into(&fresh, image), Ok(()));
+        assert_eq!(fresh.get().unwrap().find(b"self"), Some(sym::self_.id()));
+    }
+
+    /// A symbol section written by a blaze with other compiled-in texts is refused by schema.
+    #[test]
+    fn another_symbol_list_is_refused() {
+        let mut builder = Builder::new();
+        let other = SchemaHash(Hasher::new("blaze intern symbols").finish());
+        Table::new(shape()).write(&Live::new(), &mut builder.section(SectionId::SYMBOLS, other));
+        let image: &'static Image<Vec<u8>> =
+            Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()));
+        assert!(matches!(
+            restore_into(&OnceLock::new(), image),
+            Err(RestoreError::Refused(blaze_image::Refused::Schema { .. }))
+        ));
+    }
+
+    fn image_of(table: &Table, live: &Live) -> &'static Image<Vec<u8>> {
+        let mut builder = Builder::new();
+        table.write(live, &mut builder.section(SectionId::SYMBOLS, symbols_schema()));
+        Box::leak(Box::new(Image::open(builder.finish().unwrap()).unwrap()))
     }
 }

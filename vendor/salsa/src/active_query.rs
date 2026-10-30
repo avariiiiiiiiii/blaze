@@ -14,7 +14,6 @@ use crate::graph::Graph;
 use crate::hash::FxIndexSet;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
-use crate::sync::atomic::AtomicBool;
 use crate::tracked_struct::{Disambiguator, DisambiguatorMap, IdentityHash, IdentityMap};
 use crate::zalsa::Zalsa;
 use crate::zalsa_local::{

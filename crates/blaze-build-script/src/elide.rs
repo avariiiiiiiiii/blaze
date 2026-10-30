@@ -41,8 +41,9 @@ use crate::Error;
 /// ones [`flags_allow`] accepts.
 pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>> {
     let source = std::str::from_utf8(files.get(root)?).ok()?;
+    let limit = PRINTED_PER_BYTE * source.len();
     let source = lex::normalize(source);
-    let printed = printed(Tokens::new(&source).ok()?)?;
+    let printed = printed(Tokens::new(&source).ok()?, limit)?;
     directives_only(&printed).then(|| printed.into_bytes())
 }
 
@@ -136,8 +137,33 @@ fn next<'a>(tokens: &mut Tokens<'a>) -> Option<Token<'a>> {
     tokens.next()?.ok()
 }
 
-/// What the script of `tokens` prints, if it is of the forms read.
-fn printed(mut tokens: Tokens<'_>) -> Option<String> {
+/// What a script may print per byte of its root file for elision to read it. A placeholder
+/// names its argument any number of times, so what is printed can grow as the square of the
+/// source; past this bound the script is run instead, whose output the sandbox bounds. It
+/// keeps every allocation elision makes under `blaze_fuzz::allowed` (1 MiB and 64 bytes per
+/// input byte) with room for `String`'s doubling, and no real script comes near it.
+const PRINTED_PER_BYTE: usize = 16;
+
+/// What is printed so far, never longer than `limit` bytes.
+struct Printed {
+    text: String,
+    limit: usize,
+}
+
+impl Printed {
+    /// `piece` added, or `None` when that would pass the limit.
+    fn push(&mut self, piece: &str) -> Option<()> {
+        if self.text.len() + piece.len() > self.limit {
+            return None;
+        }
+        self.text.push_str(piece);
+        Some(())
+    }
+}
+
+/// What the script of `tokens` prints, if it is of the forms read and prints no more than
+/// `limit` bytes.
+fn printed(mut tokens: Tokens<'_>, limit: usize) -> Option<String> {
     let mut token = next(&mut tokens)?;
     while token.kind == Kind::InnerDoc {
         token = next(&mut tokens)?;
@@ -153,7 +179,7 @@ fn printed(mut tokens: Tokens<'_>) -> Option<String> {
     if !head_ok {
         return None;
     }
-    let mut out = String::new();
+    let mut out = Printed { text: String::new(), limit };
     let mut args: Vec<Token<'_>> = Vec::new();
     let mut scratch = Scratch::default();
     let mut token = next(&mut tokens)?;
@@ -197,7 +223,7 @@ fn printed(mut tokens: Tokens<'_>) -> Option<String> {
             }
         }
     }
-    tokens.next().is_none().then_some(out)
+    tokens.next().is_none().then_some(out.text)
 }
 
 /// What [`format`] reuses from one macro call to the next.
@@ -207,6 +233,8 @@ struct Scratch {
     spec: String,
     /// Which arguments a placeholder used.
     used: Vec<bool>,
+    /// A string argument's value, when an escape made it differ from its text.
+    arg: String,
 }
 
 /// What `format_args!` (with `println!`'s newline) makes of `args`, added to `out`. The
@@ -215,7 +243,7 @@ struct Scratch {
 fn format(
     args: &[Token<'_>],
     newline: bool,
-    out: &mut String,
+    out: &mut Printed,
     scratch: &mut Scratch,
 ) -> Option<()> {
     let (spec, rest) = args.split_first()?;
@@ -248,12 +276,12 @@ fn format(
     while at < bytes.len() {
         match bytes[at] {
             brace @ (b'{' | b'}') if bytes.get(at + 1) == Some(&brace) => {
-                out.push_str(&spec[copied..=at]);
+                out.push(&spec[copied..=at])?;
                 at += 2;
                 copied = at;
             }
             b'{' => {
-                out.push_str(&spec[copied..at]);
+                out.push(&spec[copied..at])?;
                 let close = at + 1 + memchr::memchr(b'}', &bytes[at + 1..])?;
                 let argument = &spec[at + 1..close];
                 let index = if argument.is_empty() {
@@ -269,7 +297,7 @@ fn format(
                 if index >= count {
                     return None;
                 }
-                write_arg(&rest[1 + 2 * index], out)?;
+                write_arg(&rest[1 + 2 * index], out, &mut scratch.arg)?;
                 used[index] = true;
                 at = close + 1;
                 copied = at;
@@ -278,12 +306,12 @@ fn format(
             _ => at += 1,
         }
     }
-    out.push_str(&spec[copied..]);
+    out.push(&spec[copied..])?;
     if used.contains(&false) {
         return None;
     }
     if newline {
-        out.push('\n');
+        out.push("\n")?;
     }
     Some(())
 }
@@ -298,15 +326,18 @@ fn displayable(token: &Token<'_>) -> bool {
     }
 }
 
-/// A literal as `Display` shows it, added to `out`: a string's value, a character, a number
-/// in decimal, `true` or `false`.
-fn write_arg(token: &Token<'_>, out: &mut String) -> Option<()> {
+/// A literal as `Display` shows it, added to `out`: a string's value (decoded into `scratch`
+/// when it has escapes), a character, a number in decimal, `true` or `false`.
+fn write_arg(token: &Token<'_>, out: &mut Printed, scratch: &mut String) -> Option<()> {
     match token.kind {
-        Kind::Str { .. } | Kind::RawStr { .. } => token.push_value(out),
-        Kind::Char(c) => {
-            out.push(c);
-            Some(())
+        Kind::Str { escaped: false, .. } => out.push(&token.text[1..token.text.len() - 1]),
+        Kind::Str { escaped: true, .. } => {
+            scratch.clear();
+            token.push_value(scratch)?;
+            out.push(scratch)
         }
+        Kind::RawStr { value } => out.push(value),
+        Kind::Char(c) => out.push(c.encode_utf8(&mut [0; 4])),
         Kind::Int(value) if value <= i32::MAX as u128 => {
             let mut digits = [0u8; 10];
             let (mut value, mut at) = (value as u32, digits.len());
@@ -318,13 +349,9 @@ fn write_arg(token: &Token<'_>, out: &mut String) -> Option<()> {
                     break;
                 }
             }
-            out.extend(digits[at..].iter().map(|it| char::from(*it)));
-            Some(())
+            out.push(std::str::from_utf8(&digits[at..]).ok()?)
         }
-        Kind::Ident if token.text == "true" || token.text == "false" => {
-            out.push_str(token.text);
-            Some(())
-        }
+        Kind::Ident if token.text == "true" || token.text == "false" => out.push(token.text),
         _ => None,
     }
 }

@@ -6,7 +6,6 @@ use crate::active_query::CompletedQuery;
 use crate::function::memo::Memo;
 use crate::function::sync::{ClaimResult, Reentrancy};
 use crate::function::{Configuration, IngredientImpl};
-use crate::sync::atomic::AtomicBool;
 use crate::table::memo::MemoSlot;
 use crate::tracked_struct::TrackedStructInDb;
 use crate::zalsa::{Zalsa, ZalsaDatabase};
@@ -111,15 +110,15 @@ where
 
         let is_provisional = !cycle_heads.is_empty();
         let mut completed_query = CompletedQuery {
-            revisions: QueryRevisions {
-                changed_at: current_deps.changed_at,
-                durability: current_deps.durability,
-                origin_and_extra: OriginAndExtra::assigned(active_query_key),
+            revisions: QueryRevisions::new(
+                current_deps.changed_at,
+                current_deps.durability,
+                OriginAndExtra::assigned(active_query_key),
+                !is_provisional,
                 #[cfg(feature = "accumulator")]
-                accumulated_inputs: Default::default(),
-                verified_final: AtomicBool::new(!is_provisional),
-                fingerprints: ThinVec::new(),
-            },
+                InputAccumulatedValues::Empty,
+                ThinVec::new(),
+            ),
             stale_tracked_structs: Vec::new(),
         };
         if is_provisional {
@@ -186,6 +185,5 @@ pub(super) fn validate_specified_value(
     #[cfg(feature = "accumulator")]
     header
         .revisions
-        .accumulated_inputs
-        .store(InputAccumulatedValues::Empty);
+        .store_accumulated_inputs(InputAccumulatedValues::Empty);
 }

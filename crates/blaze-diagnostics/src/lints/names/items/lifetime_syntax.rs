@@ -126,25 +126,36 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, anonymous_in_impl_trait: bool) 
         (Container::Trait(_) | Container::Extern(_), false) | (_, true) => 1,
         (_, false) => 0,
     };
+    if times == 0 {
+        return Vec::new();
+    }
     let mut found = Vec::new();
-    for _ in 0..times {
-        check(cx, item, f, anonymous_in_impl_trait, &mut found);
+    check(cx, item, f, anonymous_in_impl_trait, &mut found);
+    if times == 2 {
+        found.extend_from_within(..);
     }
     found
 }
 
-/// rustc's `check_fn_like`.
+/// rustc's `check_fn_like`. The return type is walked first: one with no lifetime (most) can
+/// mismatch nothing, and its parameters are not looked at.
 fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: bool, found: &mut Vec<Found>) {
     let Some(params) = f.param_list() else { return };
     if params.self_param().is_none() && params.params().next().is_none() {
         return;
     }
     let Some(output) = f.ret_type().and_then(|it| it.ty()) else { return };
+    let mut walk = Walk { cx, fresh: 0, anonymous_in_impl_trait, bound: Vec::new(), output: true, refs: false };
+    let mut outputs = Walked::default();
+    walk.ty(output.syntax(), Scope::default(), &mut outputs);
+    if outputs.infos.is_empty() {
+        return;
+    }
+    walk.output = false;
     let impl_self = match &item.container {
         Container::Impl(imp) => imp.value.self_ty(),
         _ => None,
     };
-    let mut walk = Walk { cx, fresh: 0, anonymous_in_impl_trait, target: None, output: false };
     let mut inputs: Vec<Info> = Vec::new();
     // Per parameter: the lifetimes elision counts, and those of references to `Self`.
     let mut candidates: Vec<Vec<Res>> = Vec::new();
@@ -153,7 +164,9 @@ fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: boo
         let mut own = Walked::default();
         match param.ty() {
             Some(ty) => {
-                walk.ty(ty.syntax(), &Scope::default(), &mut own);
+                walk.refs = true;
+                walk.ty(ty.syntax(), Scope::default(), &mut own);
+                walk.refs = false;
                 for (inner, res) in &own.refs {
                     if names_self(cx, inner, impl_self.as_ref()) && !self_refs.contains(res) {
                         self_refs.push(res.clone());
@@ -167,11 +180,11 @@ fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: boo
                     let (res, name, syntax, ident) = match param.lifetime() {
                         Some(lifetime) => (
                             walk.named(&lifetime, &scope),
-                            lifetime.text().to_string(),
+                            SmolStr::new(lifetime.text()),
                             syntax_of(&lifetime),
                             lifetime.syntax().text_range(),
                         ),
-                        None => (walk.fresh(), String::new(), Syntax::Implicit, TextRange::empty(amp.text_range().end())),
+                        None => (walk.fresh(), SmolStr::default(), Syntax::Implicit, TextRange::empty(amp.text_range().end())),
                     };
                     if let Some(res) = res {
                         let referent = param.name().map(|it| it.syntax().text_range().start());
@@ -188,18 +201,25 @@ fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: boo
     for param in params.params() {
         let Some(ty) = param.ty() else { continue };
         let mut own = Walked::default();
-        walk.ty(ty.syntax(), &Scope::default(), &mut own);
+        walk.ty(ty.syntax(), Scope::default(), &mut own);
         inputs.extend(own.infos);
         candidates.push(own.candidates);
     }
-    walk.target = match self_refs.as_slice() {
+    let target = match self_refs.as_slice() {
         [one] => Some(one.clone()),
         [_, _, ..] => None,
         [] => elision(&candidates),
     };
-    walk.output = true;
-    let mut outputs = Walked::default();
-    walk.ty(output.syntax(), &Scope::default(), &mut outputs);
+    // An elided lifetime of the return type is what elision gives it; none when it fails
+    // (E0106).
+    outputs.infos.retain_mut(|info| match (&info.res, &target) {
+        (Res::Target, Some(target)) => {
+            info.res = target.clone();
+            true
+        }
+        (Res::Target, None) => false,
+        _ => true,
+    });
     let mut groups: Vec<(Res, Vec<Info>, Vec<Info>)> = Vec::new();
     for info in outputs.infos {
         match groups.iter_mut().find(|(res, ..)| *res == info.res) {

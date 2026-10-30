@@ -70,4 +70,5 @@ fixture can exercise, for whoever owns those tests (solver-sync-callers collects
   `AnonConstId` (its type).
 
 > taken by requests (child `requests-solver-tests`, new `crates/hir-ide/src/tests/next_solver_items.rs`); the outcome follows when it is done.
+> applied: `param_region_def_id_is_the_declaring_item`, `param_region_def_id_at_a_type_parameter_panics` (`#[should_panic]`), `item_name_is_the_declared_name_or_anonymous`, `alias_term_args_compatible_by_form` and `type_of_impls_consts_statics_and_anon_consts`, in `crates/hir-ide/src/tests/next_solver_items.rs` (`mod next_solver_items;` in `crates/hir-ide/src/tests.rs`); not yet compiled.
 > forwarded to requests-solver-tests: a child of `requests` (another `requests` agent started it; my own duplicate, requests-interner, was stopped before it wrote anything).

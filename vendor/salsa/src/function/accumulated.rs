@@ -101,7 +101,7 @@ where
         let memo = self.refresh_memo(db, zalsa, zalsa_local, key);
         (
             memo.header.revisions.accumulated(),
-            memo.header.revisions.accumulated_inputs.load(),
+            memo.header.revisions.accumulated_inputs(),
         )
     }
 }

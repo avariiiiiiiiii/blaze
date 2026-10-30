@@ -8,6 +8,9 @@
 //! one. Each definition is public at all levels or at none of them below `Reachable` here: a
 //! level is the least of its visibility and its parent's, and only `pub` is public.
 //!
+//! Both sets are bitsets over the definitions; the impls' fixpoint reads what each impl is of
+//! from `Defs`, resolved once, so a round costs a few bit tests per impl not yet public.
+//!
 //! Follows `compiler/rustc_resolve/src/effective_visibilities.rs` (the public paths),
 //! `compiler/rustc_privacy/src/lib.rs` (`EmbargoVisitor::check_def_id`,
 //! `ReachEverythingInTheInterfaceVisitor`, `EffectiveVisibility::of_impl`) and
@@ -18,23 +21,29 @@
 
 use hir::GenericDef;
 use hir_def::{AdtId, ModuleDefId, ModuleId, item_scope::ItemScope, visibility::Visibility};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode,
     ast::{self, HasVisibility as _, VisibilityKind},
 };
 
-use super::defs::{DefIdx, Defs, Id, Kind, Parent};
+use super::defs::{Bits, DefIdx, Defs, Id, ImplOf, Kind, Parent};
 use crate::cx::Cx;
 
 pub(super) struct Reach {
-    public: Vec<bool>,
+    public: Bits,
 }
 
 impl Reach {
     pub(super) fn of(cx: &Cx<'_, '_>, defs: &Defs) -> Reach {
-        let nominal = (0..defs.len()).map(|def| nominal_pub(cx, defs, def)).collect();
-        let mut walk = Walk { cx, defs, nominal, public: vec![false; defs.len()], queue: Vec::new() };
+        let mut walk = Walk {
+            cx,
+            defs,
+            nominal: nominal_pub(cx, defs),
+            public: Bits::new(defs.len()),
+            queue: Vec::new(),
+            named: Vec::new(),
+        };
         walk.paths();
         walk.interfaces();
         Reach { public: walk.public }
@@ -42,7 +51,7 @@ impl Reach {
 
     /// rustc's `is_public_at_level(def, Level::Reachable)`, and `is_reachable`.
     pub(super) fn is_reachable(&self, def: DefIdx) -> bool {
-        self.public[def]
+        self.public.get(def)
     }
 }
 
@@ -50,24 +59,25 @@ struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     defs: &'c Defs,
     /// Whether a definition's own visibility is `pub`: the most its level can be.
-    nominal: Vec<bool>,
-    public: Vec<bool>,
+    nominal: Bits,
+    public: Bits,
     /// Definitions made public whose interfaces are still to be walked.
     queue: Vec<DefIdx>,
+    /// The definitions a type names, reused from type to type.
+    named: Vec<Id>,
 }
 
 impl Walk<'_, '_, '_> {
     /// rustc's `update` of `def` from a public parent: public when its own visibility allows.
     fn update(&mut self, def: DefIdx) {
-        if self.nominal[def] {
+        if self.nominal.get(def) {
             self.set(def);
         }
     }
 
     /// `update_eff_vis` with no visibility of its own (`max_vis: None`).
     fn set(&mut self, def: DefIdx) {
-        if !self.public[def] {
-            self.public[def] = true;
+        if self.public.insert(def) {
             self.queue.push(def);
         }
     }
@@ -83,13 +93,17 @@ impl Walk<'_, '_, '_> {
     fn paths(&mut self) {
         let db = self.cx.db;
         let defs = self.defs;
+        let index: FxHashMap<hir::Module, u32> =
+            defs.module_ids.iter().enumerate().map(|(at, &module)| (module, at as u32)).collect();
+        let mut public_modules = vec![false; defs.module_ids.len()];
         let root: ModuleId = self.cx.krate.root_module(db).into();
         let mut seen: FxHashSet<ModuleId> = FxHashSet::default();
         let mut stack = vec![root];
         seen.insert(root);
-        let mut public_modules: FxHashSet<hir::Module> = FxHashSet::default();
         while let Some(module) = stack.pop() {
-            public_modules.insert(module.into());
+            if let Some(&at) = index.get(&hir::Module::from(module)) {
+                public_modules[at as usize] = true;
+            }
             let scope: &ItemScope = module.def_map(db).module(db, module).scope(db);
             for (_, per_ns) in scope.entries() {
                 let types = per_ns.types.filter(|it| it.vis == Visibility::Public).map(|it| it.def);
@@ -117,10 +131,10 @@ impl Walk<'_, '_, '_> {
                 }
             }
         }
-        for def in 0..defs.len() {
+        for def in defs.all() {
             if defs[def].kind == Kind::Use
                 && defs[def].parent == Parent::Module
-                && public_modules.contains(&defs.module_ids[defs.module_of[def]])
+                && public_modules[defs.module_of[def as usize] as usize]
             {
                 self.update(def);
             }
@@ -130,17 +144,24 @@ impl Walk<'_, '_, '_> {
     /// `EmbargoVisitor`'s fixed point: the interface of each public definition, and the impls
     /// whose self type and trait are public, until nothing changes.
     fn interfaces(&mut self) {
-        let impls: Vec<DefIdx> =
-            (0..self.defs.len()).filter(|&it| matches!(self.defs[it].kind, Kind::Impl { .. })).collect();
+        let mut pending: Vec<ImplOf> = self.defs.impls().to_vec();
         loop {
             while let Some(def) = self.queue.pop() {
                 self.check(def);
             }
-            for &impl_ in &impls {
-                if !self.public[impl_] && self.impl_is_public(impl_) {
-                    self.set(impl_);
+            pending.retain(|it| {
+                if self.public.get(it.def) {
+                    return false;
                 }
-            }
+                let public = |part: Option<DefIdx>| part.is_none_or(|it| self.public.get(it));
+                if public(it.self_adt) && public(it.self_dyn) && public(it.trait_) {
+                    if self.public.insert(it.def) {
+                        self.queue.push(it.def);
+                    }
+                    return false;
+                }
+                true
+            });
             if self.queue.is_empty() {
                 break;
             }
@@ -177,7 +198,7 @@ impl Walk<'_, '_, '_> {
                 for it in trait_.direct_supertraits(db) {
                     self.trait_(it);
                 }
-                for &item in &d.children {
+                for &item in defs.children(def) {
                     self.update(item);
                 }
             }
@@ -193,18 +214,18 @@ impl Walk<'_, '_, '_> {
             (Id::Derive(_), _) => self.impl_items(def),
             (Id::Adt(adt), Kind::Enum) => {
                 self.generics(GenericDef::Adt(adt.into()));
-                for &variant in &d.children {
+                for &variant in defs.children(def) {
                     self.update(variant);
                 }
             }
             (Id::Adt(adt), _) => {
                 self.generics(GenericDef::Adt(adt.into()));
-                for &field in &d.children {
+                for &field in defs.children(def) {
                     self.update(field);
                 }
             }
             (Id::Variant(_), _) => {
-                for &field in &d.children {
+                for &field in defs.children(def) {
                     self.update(field);
                 }
             }
@@ -218,33 +239,11 @@ impl Walk<'_, '_, '_> {
     fn impl_items(&mut self, impl_: DefIdx) {
         let defs = self.defs;
         let of_trait = matches!(defs[impl_].kind, Kind::Impl { of_trait: true });
-        for &item in &defs[impl_].children {
+        for &item in defs.children(impl_) {
             match of_trait {
                 true => self.set(item),
                 false => self.update(item),
             }
-        }
-    }
-
-    /// `EffectiveVisibility::of_impl::<true>`: an impl is as public as the least public of the
-    /// outermost definition of its self type (none for a reference, a tuple, ..) and its trait,
-    /// those of other crates being public.
-    fn impl_is_public(&self, impl_: DefIdx) -> bool {
-        let db = self.cx.db;
-        let public = |id: Id| self.defs.get(id).is_none_or(|it| self.public[it]);
-        match self.defs[impl_].id {
-            Id::Impl(id) => {
-                let impl_ = hir::Impl::from(id);
-                let self_ty = impl_.self_ty(db);
-                let self_public = match (self_ty.as_adt(), self_ty.as_dyn_trait()) {
-                    (Some(adt), _) => public(Id::Adt(AdtId::from(adt))),
-                    (None, Some(trait_)) => public(Id::Trait(trait_.into())),
-                    (None, None) => true,
-                };
-                self_public && impl_.trait_(db).is_none_or(|it| public(Id::Trait(it.into())))
-            }
-            Id::Derive(id) => public(Id::Adt(id.loc(db).adt)),
-            _ => false,
         }
     }
 
@@ -275,7 +274,7 @@ impl Walk<'_, '_, '_> {
     /// and its `impl Trait`s, in its arguments too.
     fn ty(&mut self, ty: &hir::Type<'_>) {
         let db = self.cx.db;
-        let mut named: Vec<Id> = Vec::new();
+        let mut named = std::mem::take(&mut self.named);
         ty.walk(db, |it| {
             if let Some(adt) = it.as_adt() {
                 named.push(Id::Adt(AdtId::from(adt)));
@@ -290,9 +289,10 @@ impl Walk<'_, '_, '_> {
                 named.extend(traits.map(|it| Id::Trait(it.into())));
             }
         });
-        for id in named {
+        for id in named.drain(..) {
             self.update_id(id);
         }
+        self.named = named;
     }
 }
 
@@ -310,27 +310,32 @@ fn module_def_id(def: ModuleDefId) -> Option<Id> {
     })
 }
 
-/// Whether the visibility `def` has of its own is `pub`: rustc's `local_visibility` is
-/// `Visibility::Public`. A variant and its fields have their enum's, a trait's item its trait's;
-/// an impl and a trait impl's items have none of their own (`max_vis: None`).
-fn nominal_pub(cx: &Cx<'_, '_>, defs: &Defs, def: DefIdx) -> bool {
-    let d = &defs[def];
-    let parent = match d.parent {
-        Parent::Def(it) => Some(it),
-        Parent::Module | Parent::Anon(_) => None,
-    };
-    match (d.kind, parent.map(|it| defs[it].kind)) {
-        (Kind::Variant, _) => parent.is_some_and(|it| nominal_pub(cx, defs, it)),
-        (Kind::Field, Some(Kind::Variant)) => parent.is_some_and(|it| nominal_pub(cx, defs, it)),
-        (_, Some(Kind::Trait)) => parent.is_some_and(|it| nominal_pub(cx, defs, it)),
-        (_, Some(Kind::Impl { of_trait: true })) | (Kind::Impl { .. }, _) => true,
-        _ => match d.node {
-            Some(node) => {
+/// Of each definition, whether the visibility it has of its own is `pub`: rustc's
+/// `local_visibility` is `Visibility::Public`. A variant and its fields have their enum's, a
+/// trait's item its trait's; an impl and a trait impl's items have none of their own
+/// (`max_vis: None`). One pass in definition order: a parent is numbered before its children.
+fn nominal_pub(cx: &Cx<'_, '_>, defs: &Defs) -> Bits {
+    let mut nominal = Bits::new(defs.len());
+    for def in defs.all() {
+        let d = &defs[def];
+        let parent = match d.parent {
+            Parent::Def(it) => Some(it),
+            Parent::Module | Parent::Anon(_) => None,
+        };
+        debug_assert!(parent.is_none_or(|it| it < def), "a parent is numbered before its children");
+        let inherited = parent.is_some_and(|it| nominal.get(it));
+        let public = match (d.kind, parent.map(|it| defs[it].kind)) {
+            (Kind::Variant, _) | (Kind::Field, Some(Kind::Variant)) | (_, Some(Kind::Trait)) => inherited,
+            (_, Some(Kind::Impl { of_trait: true })) | (Kind::Impl { .. }, _) => true,
+            _ => d.node.is_some_and(|node| {
                 let node = cx.syntax(node);
                 let vis = ast::AnyHasVisibility::cast(node.value).and_then(|it| it.visibility());
                 vis.is_some_and(|it| matches!(it.kind(), VisibilityKind::Pub))
-            }
-            None => false,
-        },
+            }),
+        };
+        if public {
+            nominal.insert(def);
+        }
     }
+    nominal
 }

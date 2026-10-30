@@ -972,3 +972,159 @@ worker (the database is `Sync`, decided), once db answers item 2 of "frontend: w
 frontend.md items 7-12 still need" in `v2/requests/db.md`.
 
 > forwarded to codegen.
+
+## frontend-text: caller locations, debug-info rows and blaze-engine's lines on the one line index (frontend.md item 6; 2026-10-29)
+
+`span::LineIndex` is new (lane `frontend-text`, `crates/span/src/lines.rs`): a bitmap of a
+text's `\n` bytes made with SIMD (AVX-512BW/AVX2/SSE2/NEON, chosen at run time, each checked
+against the scalar path) and a rank table per 512 bytes, so an offset's line is one rank and a
+line's start one select, with no `Vec` of line starts. `place(offset)` gives a `span::Place`
+whose `line()`, `char_column(text)`, `display_column(text)` and `byte_column(text)` are
+rustc's (`lookup_char_pos`; tested against a model of `rustc_span::SourceFile` at every char
+boundary); `row(offset)` gives the row and row start in a text that is part of a file. The
+per-file query is `base_db::line_index(db, FileText) -> &LineIndex` (request in
+`v2/requests/db.md`, same lane): made once per text, the first time anything asks. Today
+hir-ty-mir and hir-ty-codegen each scan texts into `Vec`s of line starts, and blaze-engine uses
+ide-db's `line_index` (going away with ide-db). Land after the db request.
+
+### 1. `crates/hir-ty-mir/src/mir/location.rs`
+
+Old (from `/// File, line and column of where a range of a file begins.` to the end of
+`column_width`):
+
+```rust
+/// File, line and column of where a range of a file begins.
+pub fn line_and_column(
+    db: &dyn HirDatabase,
+    FileRange { file_id, range }: FileRange,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let file_id = file_id.file_id(db);
+    let text = db.file_text(file_id);
+    let starts = line_starts(db, text);
+    let at = u32::from(range.start());
+    let line = starts.partition_point(|&start| start <= at);
+    let line_start = *starts.get(line.checked_sub(1)?)?;
+    let written = text.text(db).get(line_start as usize..at as usize)?;
+    Some((file_id, line as u32, written.chars().map(column_width).sum::<usize>() as u32 + 1))
+}
+
+/// Where each line of a file begins, the first of them at 0.
+#[salsa::tracked(returns(ref))]
+fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> { ... }
+
+/// How many columns rustc counts a character of a source line as ... 
+pub fn column_width(ch: char) -> usize { ... }
+```
+
+New:
+
+```rust
+/// File, line and column of where a range of a file begins: rustc's line, and its
+/// `col_display + 1` (what `Location::caller` and debug info are given).
+pub fn line_and_column(
+    db: &dyn HirDatabase,
+    FileRange { file_id, range }: FileRange,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let file_id = file_id.file_id(db);
+    let text = db.file_text(file_id);
+    let place = base_db::line_index(db, text).place(range.start())?;
+    Some((file_id, place.line(), place.display_column(text.text(db))?))
+}
+```
+
+and drop `use unicode_width::UnicodeWidthChar;` (nothing else in hir-ty-mir uses it; then
+`unicode-width.workspace = true` can leave `crates/hir-ty-mir/Cargo.toml`). `span::char_width`
+is `column_width` moved, the same match.
+
+### 2. `crates/hir-ty-codegen/mod.rs`
+
+In the `pub use hir_ty_mir::mir::location::{...}` list (~L94) drop `column_width,`.
+
+### 3. `crates/hir-ty-codegen/places.rs`: the body anchor's rows
+
+Old (`anchor_rows` and `anchored`):
+
+```rust
+/// Where each row of the anchor of the body begins.
+#[salsa::tracked(returns(ref))]
+fn anchor_rows(db: &dyn HirDatabase, owner: DefWithBodyId) -> Option<Box<[u32]>> {
+    let text = body_syntax(db, owner).as_ref()?.text();
+    let ends = text.bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
+    Some(std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect())
+}
+
+/// The place of `offset` in the anchor of the body.
+fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
+    let starts = anchor_rows(db, owner).as_ref()?;
+    let text = body_syntax(db, owner).as_ref()?.text();
+    let at = u32::from(offset);
+    let row = starts.partition_point(|&start| start <= at).checked_sub(1)?;
+    let written = text.get(starts[row] as usize..at as usize)?;
+    let column = written.chars().map(column_width).sum::<usize>() as u32;
+    Some(Place::Anchored { row: row as u32, column })
+}
+```
+
+New:
+
+```rust
+/// Where the rows of the anchor of the body are.
+#[salsa::tracked(returns(ref))]
+fn anchor_rows(db: &dyn HirDatabase, owner: DefWithBodyId) -> Option<span::LineIndex> {
+    Some(span::LineIndex::new(body_syntax(db, owner).as_ref()?.text()))
+}
+
+/// The place of `offset` in the anchor of the body.
+fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
+    let (row, start) = anchor_rows(db, owner).as_ref()?.row(offset)?;
+    let text = body_syntax(db, owner).as_ref()?.text();
+    let written = text.get(usize::from(start)..usize::from(offset))?;
+    Some(Place::Anchored { row, column: span::display_width(written) })
+}
+```
+
+`row` counts the newlines before `offset` and starts a row after a last `\n`, as the old
+`starts` did, and `display_width` is the old sum of `column_width` (ASCII as a length plus 3
+per tab), so `Place::Anchored` is the same for every offset.
+
+### 4. `crates/blaze-engine`: ide-db's `line_index` -> base-db's
+
+- `src/mirdump.rs`, `impl_place`:
+  `let line = ide_db::line_index(self.db, file).line_col(at).line + 1;` ->
+  ```rust
+  let text = self.db.file_text(file);
+  let line = base_db::line_index(self.db, text).place(at).map_or(1, |it| it.line());
+  ```
+  (`at` is where an `impl` is written, always in the text; `map_or` only keeps the old
+  infallible shape: if you prefer, `.expect("an impl is in its file")`.)
+- `src/test_harness.rs` (~L158):
+  ```rust
+  let text = db.file_text(file);
+  let lines = base_db::line_index(db, text);
+  let at = |offset| {
+      let place = lines.place(offset).expect("a test's name is in its file");
+      let column = place.char_column(text.text(db)).expect("on a char boundary");
+      (place.line() as usize, column as usize)
+  };
+  ```
+  libtest's `start_line`/`start_col`/`end_line`/`end_col` are rustc's `span_to_location_info`:
+  1-based lines and `col + 1` in chars; the old `line_col` gave UTF-8 byte columns, wrong after a
+  non-ASCII char on the line.
+- `src/doctest/extract.rs`, `line_of`:
+  ```rust
+  let text = self.db.file_text(file);
+  let line = base_db::line_index(self.db, text).place(at)?.line();
+  Some((self.path(file)?, line as usize))
+  ```
+- Add `base-db.workspace = true` to `crates/blaze-engine/Cargo.toml` if it is not there; drop
+  `ide-db` when nothing else uses it.
+
+Why: frontend.md item 6 ("line and column are computed only when a diagnostic or debug info
+needs them, from a newline bitmap built with SIMD on first use"). One index per text, built
+once, ~0.13 bytes per byte of text, instead of a `Vec<u32>` per query per text.
+`places_match_the_old_line_starts` and `rows_are_newlines_before` in
+`crates/span/src/lines/tests.rs` are the differentials against the code removed here; the old
+and new places differ only where the old was not rustc's (at the `\n` of a `\r\n`, at the end
+of a text ending in `\n`, in a text with nothing after its byte order mark), none of which a
+call or a statement can be at.
+Status: open

@@ -183,7 +183,7 @@ impl Printer<'_> {
         self.word(" ");
     }
 
-    fn generic_params(&mut self, params: impl Iterator<Item = ast::GenericParam<'_>>) {
+    fn generic_params<'t>(&mut self, params: impl Iterator<Item = ast::GenericParam<'t>>) {
         self.word("<");
         for (i, param) in params.enumerate() {
             if i != 0 {

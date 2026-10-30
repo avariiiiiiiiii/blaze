@@ -326,9 +326,9 @@ pub(super) fn joined(witnesses: &[String]) -> String {
 /// The rest of rustc's `is_const_pat_that_looks_like_binding` for a pattern hir found is a
 /// constant named by one identifier: its source text is a plain name. With the constant's name
 /// and the span of its definition.
-pub(super) fn const_like_binding(
+pub(super) fn const_like_binding<'t>(
     cx: &Cx<'_, '_>,
-    pat: impl ast::AstNode<'_>,
+    pat: impl ast::AstNode<'t>,
     konst: hir::Const,
 ) -> Option<(String, Span)> {
     if !all_chars(pat.syntax(), |c| c.is_alphanumeric() || c == '_') {

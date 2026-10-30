@@ -89,7 +89,7 @@ fn whose_at(db: &Db, interned: &Interned, edited: &Edited, id: Id, depth: u32, i
         "FunctionId" => own(within(db, edited, FunctionId::from_id(id).lookup(db).id)),
         "MacroCallId" => own(interned.get(&id) == Some(&edited.index)),
         "EditionedFileId" if EditionedFileId::from_id(id).file_id(db) == edited.vfs => Whose::File,
-        "FileText" if FileText::from_id(id).file_id(db) == edited.vfs => Whose::File,
+        "FileText" if *FileText::from_id(id).file_id(db) == edited.vfs => Whose::File,
         _ if depth == 0 => Whose::Other,
         _ => {
             let start = ids.len();

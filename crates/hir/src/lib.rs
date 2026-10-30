@@ -686,6 +686,12 @@ impl Module {
         self.id.def_map(db).module(db, self.id).origin.file_id()
     }
 
+    /// The range of this module's items: its file, or for an inline module or a block, its
+    /// item list or block.
+    pub fn definition_source_range(self, db: &Db) -> InFile<TextRange> {
+        self.id.def_map(db).module(db, self.id).definition_source_range(db)
+    }
+
     /// The file this module's items are written in: its own, or for an inline module or a
     /// block, the file holding it.
     pub fn definition_source_file_id(self, db: &Db) -> HirFileId {

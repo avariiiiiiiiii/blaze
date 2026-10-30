@@ -16,7 +16,11 @@ use hir_def::{
     resolver::{self, Resolver, TypeNs},
 };
 use hir_expand::{EditionedFileId, HirFileId, mod_path::ModPath};
-use hir_ty::{InferBodyId, InferenceResult, db::AnonConstId, next_solver::AnyImplId};
+use hir_ty::{
+    InferBodyId, InferenceResult,
+    db::{AnonConstId, HirDatabase as _},
+    next_solver::AnyImplId,
+};
 use hir_ty_unsafeck::unsafe_operations;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::FileId;

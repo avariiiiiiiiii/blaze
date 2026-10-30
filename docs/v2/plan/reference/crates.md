@@ -74,7 +74,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | format | `crates/blaze-ids/`, `crates/blaze-format/`, `crates/syntax-tree/`, `crates/syntax/`, `crates/parser/`, `crates/span/`, `crates/intern/`, `crates/tt/`, `crates/mbe/`, `crates/syntax-bridge/`, `crates/const-ast/`; in `crates/hir-def/src/`: `expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/` |
 | db | `crates/blaze-query/`, `vendor/salsa/`, `vendor/rustc_type_ir/`, `vendor/rustc_next_trait_solver/`, `vendor/salsa-macros/`, `vendor/salsa-macro-rules/`, `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` but format's files, `crates/hir-ty/` but items' and codegen's files, `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` |
 | items | `crates/blaze-items/`; in `crates/hir-ty/src/`: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `layout.rs`, `layout/`, `drop.rs` |
-| store | `crates/blaze-cas/`, `crates/blaze-store/`, `crates/blaze-cargo/src/remote/`, `crates/blaze-cargo/src/remote.rs` |
+| store | `crates/blaze-cas/` |
 | codegen | `crates/blaze-codegen/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`, `crates/blaze-engine/`, `vendor/llvm-sys/`; in `crates/hir-ty/src/`: `mir.rs`, `mir/` (the MIR types, whose layout is codegen's, [data.md](../design/data.md)) |
 | link | `crates/blaze-link/`, `crates/blaze-live/`, `vendor/cranelift-object/` |
 | usercode | `crates/blaze-usercode/`, `crates/blaze-build-script/`, `crates/blaze-macro-wasm/`, `crates/blaze-wasi/`, `crates/proc-macro-api/`, `crates/proc-macro-srv/`, `crates/blaze-cargo/src/sandbox.rs`, `crates/blaze-cargo/src/sandbox/` |
@@ -95,7 +95,7 @@ coordinator's: a change there is a request.
 |---|---|---|
 | `blaze-core` | changed: the new effects' drivers (Linux, macOS, simulation) | core |
 | `blaze-graph` | changed: the plane becomes the one scheduler, `Machine` its one-request case; the executor's cache-aware groups | core |
-| `blaze-store` | replaced by `blaze-cas`, deleted at integration | store |
+| `blaze-store` | replaced by `blaze-cas`; deleted at integration, 2026-10-30, with blaze-cargo's v1 remote (`src/remote.rs`, `src/remote/`): the read-through tier is `blaze_cas::remote` | store |
 | `blaze-cargo` | changed: its daemon and client move onto `blaze-core`, `blaze-graph`'s plane and `blaze-api` at integration; its sandbox gains tracing (usercode); its remote store becomes the read-through tier (store) | coordinator, usercode, store |
 | `blaze-engine` | replaced: the crate-at-a-time codegen tail becomes per-function units; tail deleted at integration, 2026-10-30. Stays as the `blaze` program only, the binary the release ships: `program.rs` (the sandbox launcher, the build-script `rustc`/`rustdoc` stand-ins on v2's front end in `as_rustc`, the pinned release, `pin`/`version-*`), `pin.rs`, `versions.rs`, in front of `blaze_cargo::cli` | codegen |
 | `hir-ty-codegen` | changed: compiles one `Unit` to one `CompiledFunction` | codegen |

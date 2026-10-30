@@ -1,0 +1,23 @@
+{
+  "id": "01101",
+  "from_lane": "coord-1030",
+  "owner": "core",
+  "paths": [
+    "crates/blaze-graph/"
+  ],
+  "what": "Main #1539/#1568 (a worker admits its program builds by the memory budget; one not yet measured runs alone) had its home in the deleted blaze-engine admit.rs; v2 home is blaze-graph plane admission (admission::Estimates). Check v2 admits program builds (codegen + link of a program) against the budget the same way, so cold builds on CI runners do not OOM.",
+  "state": "open",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-30T16:46:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

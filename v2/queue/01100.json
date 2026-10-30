@@ -1,0 +1,24 @@
+{
+  "id": "01100",
+  "from_lane": "coord-1030",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2/roots.rs",
+    "crates/hir-ty-codegen/v2/allocator.rs"
+  ],
+  "what": "Port main #1552 (link only the crates a program code names, as rustc loads them) to v2 live path: hir_ty_codegen::v2 roots.rs/allocator.rs (driven by blaze-cargo serve/unit/codegen.rs) still link every dependency (renamed depended_crates in the merge 2112eaf01f), so unnamed crates constructors, #[used] statics and #[global_allocator] are linked unlike rustc. hir::named_dependencies (ported to v2 in crates/hir/src/named.rs) needs to be reachable from codegen, ideally as a memoised query (hir is only a dev-dependency of hir-ty-codegen). harness/unnamedcrates.py checks it.",
+  "state": "open",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-30T16:46:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

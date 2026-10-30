@@ -21,7 +21,7 @@ and by the keys of the crates it is built on), and the tests job takes those fro
 again. Each line of
 the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
-its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
+its tests failed. `blaze-diagnostics` is the daemon's errors (its diagnostics are the verdict).
 `hir-ty-mir` has rust-analyzer's type inference tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
@@ -32,7 +32,7 @@ import memory
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
     "hir-ty-codegen", "blaze-cas", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-cargo", "blaze-engine",
-    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "ide-diagnostics",
+    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "blaze-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
 # What the build job ships blaze with: LLVM as a second code producer.
@@ -318,7 +318,7 @@ def main():
     open_ = OPEN if plain else OPEN | OPEN_BLAZE
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
     env = {"CARGO_TARGET_DIR": os.path.join(ROOT, "target"), **os.environ}
-    # blaze's frames are larger than rustc's, and ide-diagnostics' 5204-arm test overflows the
+    # blaze's frames are larger than rustc's, and blaze-diagnostics' 5204-arm test overflows the
     # 2 MiB a test thread has, which aborts its whole program
     # (https://github.com/indexable-inc/blaze/issues/894). Not a `--skip`: an argument to the
     # tests has blaze run every test, not those an edit reached.

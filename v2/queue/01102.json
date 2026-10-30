@@ -1,0 +1,23 @@
+{
+  "id": "01102",
+  "from_lane": "coord-1030",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-units/"
+  ],
+  "what": "Main #1519 (dep-keys: a dependency is named by what it is built with: features, build-script cfgs, env vars and files it read) was in the deleted blaze-engine content.rs. Audit that v2 unit keys (blaze-units) and item hashes cover a dependency features, build-script cfgs/env/written files; harness/depkeys.py (merged) tests it. Also #1546 (a late include! of a proc macro OUT_DIR file must not restart warm builds) should be moot in v2; verify.",
+  "state": "open",
+  "created": "2026-10-30T16:46:07Z",
+  "updated": "2026-10-30T16:46:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:46:07Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -10,6 +10,7 @@
 
 use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use cfg::CfgExpr;
 use hir::{HirFileId, InFile, ModuleSource};
 use hir_def::{
@@ -541,9 +542,9 @@ impl Walk<'_, '_, '_> {
             }
         }
         let Some(mut derives) = self.derives.get(&adt).cloned() else { return };
-        derives.sort_by_key(|it| {
+        radix::sort_by_key(&mut derives, |it| {
             let loc = it.loc(db);
-            (loc.derive_attr_id.item_tree_index(), loc.derive_index)
+            radix::pack_32(loc.derive_attr_id.item_tree_index(), loc.derive_index)
         });
         for derive in derives {
             let trait_ = derive.loc(db).trait_;

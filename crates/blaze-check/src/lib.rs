@@ -19,6 +19,7 @@ mod explore;
 pub mod hint;
 pub mod linear;
 mod path;
+mod rng;
 mod rt;
 pub mod sync;
 pub mod thread;

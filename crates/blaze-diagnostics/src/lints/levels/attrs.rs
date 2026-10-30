@@ -23,7 +23,7 @@ use syntax::{
 };
 
 use crate::{
-    lints::registry::Level,
+    lints::registry::{Level, LintId},
     model::{MacroKind, Span},
 };
 
@@ -31,7 +31,7 @@ use crate::{
 pub(super) enum Read {
     /// `#[automatically_derived]` (`single_use_lifetimes`) or `#[doc(hidden)]`
     /// (`missing_docs`): a lint allowed with no attribute naming it.
-    Allows(&'static str),
+    Allows(LintId),
     /// `#[allow(..)]`, `#[expect(..)]`, `#[warn(..)]`, `#[deny(..)]`, `#[forbid(..)]`, and
     /// whether it is written as itself rather than made by a `cfg_attr`, which rustc's
     /// pre-expansion lint pass sees unexpanded.
@@ -163,25 +163,35 @@ pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition)
     found
 }
 
+/// The attributes the lint levels read: the five that set a level, at the indices of their
+/// levels in [`LEVELS`], then `doc` and `automatically_derived`.
+const ATTR_NAMES: &[&str] = &["allow", "expect", "warn", "deny", "forbid", "doc", "automatically_derived"];
+const LEVELS: [Level; 5] = [Level::Allow, Level::Expect, Level::Warn, Level::Deny, Level::Forbid];
+const DOC: usize = 5;
+const AUTOMATICALLY_DERIVED: usize = 6;
+
+blaze_phf::phf_table!(static ATTRS = ATTR_NAMES;);
+
 fn read_meta(meta: &ast::Meta, edition: Edition, direct: bool) -> Option<Read> {
     let name = |path: Option<ast::Path>| path.and_then(|it| it.as_single_name_ref());
     match meta {
-        ast::Meta::PathMeta(it) if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") => {
-            Some(Read::Allows("single_use_lifetimes"))
+        ast::Meta::PathMeta(it) => {
+            let name = name(it.path())?;
+            (ATTRS.get(name.text()) == Some(AUTOMATICALLY_DERIVED)).then_some(Read::Allows(LintId::SINGLE_USE_LIFETIMES))
         }
         ast::Meta::TokenTreeMeta(it) => {
             let name = name(it.path())?;
-            let name = name.text();
-            let level = match name {
-                "doc" => None,
-                _ => Some(Level::of_attr(name)?),
+            let level = match ATTRS.get(name.text())? {
+                DOC => None,
+                at if at < LEVELS.len() => Some(LEVELS[at]),
+                _ => return None,
             };
             let items = list(&it.token_tree()?, edition)?;
             match level {
                 Some(level) => Some(Read::Level(level, items, direct)),
                 None => {
                     let hidden = items.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
-                    hidden.then_some(Read::Allows("missing_docs"))
+                    hidden.then_some(Read::Allows(LintId::MISSING_DOCS))
                 }
             }
         }
@@ -392,5 +402,77 @@ pub(super) fn external(span: &Span) -> bool {
             let call = &expansion.call_site;
             span.file == call.file && span.lo == call.lo && span.hi == call.hi
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use syntax::{AstNode, SourceFile};
+
+    use super::*;
+
+    /// What a [`Read`] says, to compare two.
+    fn plain(read: Option<Read>) -> Option<(Option<Level>, Option<LintId>, usize, bool)> {
+        read.map(|it| match it {
+            Read::Allows(id) => (None, Some(id), 0, false),
+            Read::Level(level, items, direct) => (Some(level), None, items.len(), direct),
+        })
+    }
+
+    /// `read_meta` as it was, by string `match`.
+    fn by_match(meta: &ast::Meta, edition: Edition, direct: bool) -> Option<Read> {
+        let name = |path: Option<ast::Path>| path.and_then(|it| it.as_single_name_ref());
+        match meta {
+            ast::Meta::PathMeta(it) if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") => {
+                Some(Read::Allows(LintId::SINGLE_USE_LIFETIMES))
+            }
+            ast::Meta::TokenTreeMeta(it) => {
+                let name = name(it.path())?;
+                let name = name.text();
+                let level = match name {
+                    "doc" => None,
+                    "allow" => Some(Level::Allow),
+                    "expect" => Some(Level::Expect),
+                    "warn" => Some(Level::Warn),
+                    "deny" => Some(Level::Deny),
+                    "forbid" => Some(Level::Forbid),
+                    _ => return None,
+                };
+                let items = list(&it.token_tree()?, edition)?;
+                match level {
+                    Some(level) => Some(Read::Level(level, items, direct)),
+                    None => {
+                        let hidden = items.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
+                        hidden.then_some(Read::Allows(LintId::MISSING_DOCS))
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn attribute_names_are_read_as_matched() {
+        let names = [
+            "allow", "expect", "warn", "deny", "forbid", "doc", "automatically_derived", "Allow", "allows", "allo",
+            "force_warn", "cfg", "derive", "automatically_derive", "docs", "deny_", "x", "inline", "rustfmt",
+        ];
+        let mut text = String::new();
+        for name in names {
+            for args in ["", "(dead_code)", "(hidden)", "(a, b, reason = \"r\")", " = \"v\"", "()"] {
+                text.push_str(&format!("#[{name}{args}]\n#[rustc::{name}{args}]\n"));
+            }
+        }
+        text.push_str("fn f() {}\n");
+        let edition = Edition::Edition2021;
+        let file = SourceFile::parse(&text, edition).tree();
+        let mut seen = 0;
+        for meta in file.syntax().descendants().filter_map(ast::Meta::cast) {
+            for direct in [false, true] {
+                assert_eq!(plain(read_meta(&meta, edition, direct)), plain(by_match(&meta, edition, direct)), "{meta}");
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, names.len() * 6 * 2);
     }
 }

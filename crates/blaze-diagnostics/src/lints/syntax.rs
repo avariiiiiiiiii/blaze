@@ -30,6 +30,7 @@ pub use check_cfg::CheckCfg;
 
 use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
@@ -237,7 +238,7 @@ impl<'db> Walk<'db> {
             }
         }
         let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
-        skips.sort_unstable_by_key(|it| it.start());
+        radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
         self.index.insert(file, self.trees.len());
         self.trees.push(Tree { file, root, call: file.macro_file(), nodes, off, replaced, skips, place: place.clone() });
         for (at, expanded) in expansions {

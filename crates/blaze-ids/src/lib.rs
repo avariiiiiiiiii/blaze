@@ -10,21 +10,20 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
-use std::{
-    fmt, hash,
-    marker::PhantomData,
-    sync::{
-        Mutex, OnceLock, PoisonError,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    },
-};
+use std::{fmt, hash, marker::PhantomData};
 
 use blake3::hazmat::{self, ContextKey, HasherExt};
 use serde::{Deserialize, Serialize};
 
+use crate::sync::{
+    Mutex, OnceLock, PoisonError,
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
+
 mod many;
 pub mod names;
 pub mod radix;
+mod sync;
 
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -584,6 +583,7 @@ mod tests {
         assert!(interner.shards.iter().all(|shard| shard.tables.iter().all(|it| it.get().is_none())));
     }
 
+    #[cfg(not(blaze_check))]
     #[test]
     fn many_domains_keep_their_own_keys() {
         let names: Vec<&'static str> =
@@ -628,6 +628,7 @@ mod tests {
         assert_eq!(interner.len(), 2);
     }
 
+    #[cfg(not(blaze_check))]
     #[test]
     fn indices_are_dense_but_for_each_shards_last_block() {
         let interner = Sharded::<u64>::new();
@@ -666,6 +667,7 @@ mod tests {
         assert!(chunk_of(u32::MAX).0 < CHUNKS);
     }
 
+    #[cfg(not(blaze_check))]
     #[test]
     fn an_interner_maps_both_ways() {
         let interner = Sharded::<u64>::new();
@@ -682,6 +684,7 @@ mod tests {
         assert_eq!(interner.len(), 20_000);
     }
 
+    #[cfg(not(blaze_check))]
     #[test]
     fn values_never_move() {
         let interner = Sharded::<String>::new();
@@ -693,6 +696,7 @@ mod tests {
         assert!(std::ptr::eq(at, interner.get(first)));
     }
 
+    #[cfg(not(blaze_check))]
     #[test]
     fn threads_intern_one_index_per_value() {
         let interner = Sharded::<u64>::new();

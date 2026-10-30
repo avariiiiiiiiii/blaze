@@ -1654,6 +1654,9 @@ pub(crate) struct InferenceContext<'db> {
     pub(crate) features: &'db UnstableFeatures,
     /// The traits in scope, disregarding block modules. This is used for caching purposes.
     traits_in_scope: FxHashSet<TraitId>,
+    /// The traits in scope in the innermost block module that adds some: which module, whether
+    /// it adds any, and `traits_in_scope` together with the block's.
+    block_traits: RefCell<(Option<hir_def::ModuleId>, bool, std::rc::Rc<FxHashSet<TraitId>>)>,
     pub(crate) result: InferenceTables<'db>,
     tuple_field_accesses_rev:
         IndexSet<Tys<'db>, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>,
@@ -1759,6 +1762,7 @@ impl<'db> InferenceContext<'db> {
             identity_args: OnceCell::new(),
             store,
             traits_in_scope: resolver.traits_in_scope(db),
+            block_traits: RefCell::new((None, false, std::rc::Rc::default())),
             resolver,
             diverges: Diverges::Maybe,
             breakables: Vec::new(),
@@ -2625,7 +2629,7 @@ impl<'db> InferenceContext<'db> {
         }
 
         let mut path_ctx = ctx.at_path(path, node);
-        let interner = DbInterner::conjure();
+        let interner = path_ctx.interner();
         let (resolution, unresolved) = if value_ns {
             let Some(res) = path_ctx.resolve_path_in_value_ns(HygieneId::ROOT) else {
                 return (self.types.types.error, None);
@@ -2893,10 +2897,27 @@ impl<'db> InferenceContext<'db> {
         Some(struct_.into())
     }
 
-    pub(crate) fn get_traits_in_scope(&self) -> Either<FxHashSet<TraitId>, &FxHashSet<TraitId>> {
-        let mut b_traits = self.resolver.traits_in_scope_from_block_scopes(self.db).peekable();
-        if b_traits.peek().is_some() {
-            Either::Left(self.traits_in_scope.iter().copied().chain(b_traits).collect())
+    /// Filled once each time the walk enters a block module that adds traits; every method call
+    /// inside it then takes an `Rc` clone, with no allocation or hashing.
+    pub(crate) fn get_traits_in_scope(
+        &self,
+    ) -> Either<std::rc::Rc<FxHashSet<TraitId>>, &FxHashSet<TraitId>> {
+        let module = self.resolver.module();
+        let mut cache = self.block_traits.borrow_mut();
+        let (key, has_block_traits, traits) = &mut *cache;
+        if *key != Some(module) {
+            *key = Some(module);
+            let mut b_traits = self.resolver.traits_in_scope_from_block_scopes(self.db).peekable();
+            *has_block_traits = b_traits.peek().is_some();
+            if *has_block_traits {
+                let set = std::rc::Rc::make_mut(traits);
+                set.clear();
+                set.extend(self.traits_in_scope.iter().copied());
+                set.extend(b_traits);
+            }
+        }
+        if *has_block_traits {
+            Either::Left(traits.clone())
         } else {
             Either::Right(&self.traits_in_scope)
         }

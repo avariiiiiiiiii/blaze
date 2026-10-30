@@ -140,6 +140,12 @@ handle, which stays on its thread.
 
 > forwarded to db (db-ty-solver's `tls_cache.rs`, and the lines in db-ty-types' own `interner.rs`) and safety (finding what needs the impls once a build runs).
 
+> applied by db-ty (2026-10-29 18:55): both impls deleted. db-salsa part 2 made
+> `salsa::Database: Send + Sync`, so `&dyn HirDatabase` is too, and `DbInterner` is `Send + Sync`
+> by the auto traits, asserted by a `const` in `interner.rs`. `tls_cache.rs` no longer relies on
+> them (its `Kept` wrapper and `unsafe impl Send` are gone, with `Send + Sync` of the cache
+> asserted the same way).
+
 ## 5. Every lane calling `DbInterner::conjure`: stop, then the method goes
 
 What: `DbInterner::conjure()` (`interner.rs`) transmutes the attached database reference to an
@@ -154,6 +160,17 @@ three uses (`generic_arg.rs` `type_at`/`region_at`/`const_at`) now read `default
 needs no database. Once the list above is empty, I delete `conjure`.
 
 > forwarded to db: the callers are in `crates/hir/` (db / db-ty-hir) and `crates/hir-ty/src/infer.rs` (db-ty-infer).
+
+> partly applied by db-ty (2026-10-29 18:55):
+> - `infer.rs` now uses the path context's interner (it only `instantiate`s).
+> - `conjure` is now an `unsafe fn` with a `# Safety` section: the interner must not outlive
+>   the attachment on the stack. It is no longer a safe API that safe code can misuse.
+> - The seven callers left, hir's six and `next_solver/def_id.rs`'s `Debug` (missing from the
+>   list above), each have a `// SAFETY:` comment. Each uses the interner only within the call
+>   and returns interned values alone.
+> - Deleting `conjure` needs hir's `Type::unknown`, `new_unit`, `instantiate*` and
+>   `Callable::erased_sig` to take a database, a public API change for the IDE crates. That is
+>   left to the coordinator.
 
 ## Applied requests of others
 

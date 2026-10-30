@@ -742,3 +742,5 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
   `Vec<u32>` and is a record of its own through `say`: two allocations and one record a crate. One
   `Event::Nodes` is five allocations and one record for the whole graph, as the plane now says a
   batch.
+
+> forwarded to codegen: written by `requests`' child requests-nodes, which told the lane.

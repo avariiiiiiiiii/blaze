@@ -493,7 +493,12 @@ fn every_name_is_found_as_by_a_scan() {
 
 #[test]
 fn check_is_as_by_a_scan() {
-    let names = names_and_misses();
+    // Each unknown name costs a search for a similar one: the near misses of every eighth name.
+    let mut names: Vec<String> = every_name().into_iter().map(str::to_owned).collect();
+    let misses: Vec<String> = every_name().into_iter().step_by(8).flat_map(near_misses).collect();
+    names.extend(misses);
+    names.extend(["", "warnings", "unused", "bad_style", "rustc", "clippy::", "::", "a"].map(str::to_owned));
+    names.push("x".repeat(index::LONGEST + 1));
     let tools = [None, Some("rustc"), Some("rustdoc"), Some("blaze"), Some("clippy"), Some("tool"), Some("nope")];
     for internal in [false, true] {
         let store = Store { internal, registered_tools: vec!["tool".to_owned()] };

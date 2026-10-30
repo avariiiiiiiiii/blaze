@@ -199,6 +199,8 @@ pub(crate) struct Runtime {
     pub(crate) candidates: Vec<u16>,
     /// Store histories of ended executions, reused.
     pub(crate) spare: Vec<std::collections::VecDeque<memory::Store>>,
+    /// Raw bytes tracked by `cell::read`, `write` and `free`.
+    pub(crate) bytes: memory::ByteMap,
 }
 
 impl Runtime {
@@ -217,6 +219,7 @@ impl Runtime {
             max_threads: max_threads.clamp(1, MAX_THREADS),
             candidates: Vec::new(),
             spare: Vec::new(),
+            bytes: memory::ByteMap::default(),
         }
     }
 
@@ -236,6 +239,7 @@ impl Runtime {
         self.last_sc_write = Clock::ZERO;
         self.spawned.clear();
         self.finding = None;
+        self.bytes.clear();
     }
 
     /// Ends an execution: what its objects hold is dropped or kept for the next.

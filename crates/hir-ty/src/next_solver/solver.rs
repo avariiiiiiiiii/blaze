@@ -38,8 +38,10 @@ pub(crate) struct SolverContext<'db>(pub(crate) InferCtxt<'db>);
 
 impl<'a, 'db> From<&'a InferCtxt<'db>> for &'a SolverContext<'db> {
     fn from(infcx: &'a InferCtxt<'db>) -> Self {
-        // SAFETY: `repr(transparent)`
-        unsafe { std::mem::transmute(infcx) }
+        // SAFETY: `SolverContext` is `repr(transparent)` over `InferCtxt<'db>`, so the two
+        // references have one layout and validity; the borrow `'a` and `'db` are kept as they
+        // are. rustc's `SolverDelegate` is the same cast.
+        unsafe { std::mem::transmute::<&'a InferCtxt<'db>, &'a SolverContext<'db>>(infcx) }
     }
 }
 

@@ -1048,6 +1048,17 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn bytes_of_equals_the_words_copied_out_byte_by_byte() {
+        for len in [0usize, 1, 2, 7, 64] {
+            let words: Vec<u128> = (0..len as u128)
+                .map(|it| it.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C834) ^ !it)
+                .collect();
+            let copied: Vec<u8> = words.iter().flat_map(|it| it.to_ne_bytes()).collect();
+            assert_eq!(bytes_of(&words), &copied[..], "{len} words");
+        }
+    }
+
     fn id(index: u32) -> salsa::Id {
         salsa::Id::from_bits(u64::from(index) | (3 << 32))
     }

@@ -24,6 +24,7 @@ mod json;
 use std::borrow::Cow;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
+use blaze_ids::radix;
 use rustc_hash::FxBuildHasher;
 use smallvec::{SmallVec, smallvec};
 
@@ -602,7 +603,7 @@ fn collect_annotations<'a>(span: &'a MultiSpan, extra: Labels<'a>, placed: &Plac
         }
     }
     for (.., annotations) in &mut output {
-        annotations.sort_by_key(|it| it.line);
+        radix::sort_by_key(annotations, |it| it.line);
     }
     output
 }
@@ -667,7 +668,7 @@ fn substitutions<'a>(
                 snippet: Cow::Borrowed(snippet.as_str()),
             })
             .collect();
-        kept.sort_by_key(|it| it.lo);
+        radix::sort_by_key(&mut kept, |it| it.lo);
         kept.retain(|it| is_different(file, &it.snippet, it.lo, it.hi));
         if !kept.is_empty() {
             out.push((name, file, kept));

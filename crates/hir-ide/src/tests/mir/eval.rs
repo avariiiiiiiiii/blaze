@@ -421,6 +421,40 @@ fn main() {
 }
 
 #[test]
+fn write_box_via_move() {
+    // `vec!`'s intrinsic: the value is moved into the box, which is given back.
+    check_pass(
+        r#"
+//- minicore: drop
+#![feature(lang_items)]
+
+fn should_not_reach() {
+    _ // FIXME: replace this function with panic when that works
+}
+
+#[rustc_intrinsic]
+#[rustc_intrinsic_must_be_overridden]
+pub fn box_new<T>(_x: T) -> Box<T>;
+
+#[rustc_intrinsic]
+pub fn write_box_via_move<T>(b: Box<T>, x: T) -> Box<T>;
+
+#[lang = "owned_box"]
+pub struct Box<T: ?Sized> {
+    inner: *mut T,
+}
+
+fn main() {
+    let b = write_box_via_move(box_new(1u64), 7u64);
+    if unsafe { *b.inner } != 7 {
+        should_not_reach();
+    }
+}
+        "#,
+    );
+}
+
+#[test]
 fn drop_glue_of_closures_tuples_arrays_and_enums() {
     // `Vec::extend_trusted` writes the length back in the `Drop` of a guard the closure it
     // passes to `for_each` captures: a closure's captures are dropped with it.

@@ -631,6 +631,9 @@ impl Module {
         while id.is_block_module(db) {
             id = id.containing_module(db).expect("block without parent module");
         }
+        // SAFETY: `hir`'s `Module` holds `'static` ids, as `self.id` already is. A salsa
+        // interned id is never freed (db-salsa: interned values are never collected), so the
+        // id names the same module for as long as the database lives, past any query.
         Module { id: unsafe { id.to_static() } }
     }
 
@@ -4626,7 +4629,9 @@ impl<'db> Type<'db> {
 
     /// Replace any generic parameters with error types.
     pub fn instantiate_with_errors(&self) -> Self {
-        let interner = DbInterner::conjure();
+        // SAFETY: the interner stays in this call, inside the attachment on the stack now; the
+        // `Type` returned holds interned values only.
+        let interner = unsafe { DbInterner::conjure() };
         let krate = self.krate(interner.db());
         let args = match self.owner {
             TypeOwnerId::GenericDefId(def) => GenericArgs::error_for_item(interner, def.into()),
@@ -4640,7 +4645,8 @@ impl<'db> Type<'db> {
 
     // FIXME: Find some way with const params, maybe even lifetimes?
     pub fn instantiate(&self, args: impl IntoIterator<Item: Borrow<Type<'db>>>) -> Type<'db> {
-        let interner = DbInterner::conjure();
+        // SAFETY: as in `instantiate_with_errors`.
+        let interner = unsafe { DbInterner::conjure() };
         let (args, owner) = match self.owner {
             TypeOwnerId::GenericDefId(def) => generic_args_from_tys(interner, def.into(), args),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
@@ -4660,7 +4666,8 @@ impl<'db> Type<'db> {
         args: impl IntoIterator<Item: Borrow<Type<'db>>>,
     ) -> Type<'db> {
         let TypeOwnerId::GenericDefId(def) = self.owner else { return self.clone() };
-        let interner = DbInterner::conjure();
+        // SAFETY: as in `instantiate_with_errors`.
+        let interner = unsafe { DbInterner::conjure() };
         let mut args = args.into_iter();
         let args = GenericArgs::for_item(interner, def.into(), |index, id, _, _| match id {
             GenericParamId::TypeParamId(_) => match args.next() {
@@ -4746,7 +4753,8 @@ impl<'db> Type<'db> {
     }
 
     pub fn unknown() -> Self {
-        let interner = DbInterner::conjure();
+        // SAFETY: as in `instantiate_with_errors`.
+        let interner = unsafe { DbInterner::conjure() };
         Type::no_params(
             Self::builtin_type_crate(interner.db()),
             Ty::new_error(interner, ErrorGuaranteed),
@@ -4783,7 +4791,8 @@ impl<'db> Type<'db> {
     }
 
     pub fn new_unit() -> Self {
-        let interner = DbInterner::conjure();
+        // SAFETY: as in `instantiate_with_errors`.
+        let interner = unsafe { DbInterner::conjure() };
         Type::no_params(Self::builtin_type_crate(interner.db()), Ty::new_unit(interner))
     }
 
@@ -5983,7 +5992,9 @@ pub enum CallableKind<'db> {
 
 impl<'db> Callable<'db> {
     fn erased_sig(&self) -> FnSig<'db> {
-        DbInterner::conjure().instantiate_bound_regions_with_erased(self.sig)
+        // SAFETY: the interner stays in this call, inside the attachment on the stack now; the
+        // signature returned holds interned values only.
+        unsafe { DbInterner::conjure() }.instantiate_bound_regions_with_erased(self.sig)
     }
 
     pub fn kind(&self) -> CallableKind<'db> {

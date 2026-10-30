@@ -208,6 +208,8 @@ struct Process {
     pid: u32,
     /// Its threads, as the OS listed them at the last [`CodeMemory::collect`]; reused.
     threads: Vec<u64>,
+    /// It forks children the fence does not see ([`CodeMemory::attach_forking`]).
+    forks: bool,
 }
 
 /// One memory object of code, writable here and executable in each run process it is mapped
@@ -249,6 +251,7 @@ impl CodeMemory {
         let control = sys::Object::create(&format!("{name}.fence"), control_len)?;
         let control_view = control.map_here(Access::Shared)?;
         let fences = Fences::new(control_view);
+        let base = choose_base(len)?;
         Ok(CodeMemory {
             object,
             view,
@@ -257,7 +260,7 @@ impl CodeMemory {
             image,
             arena: alloc::Arena::new(image, arena),
             limbo: Vec::new(),
-            base: None,
+            base: Some(base),
             processes: Vec::new(),
             page,
         })
@@ -411,6 +414,9 @@ impl CodeMemory {
             return Ok(0);
         }
         self.post();
+        if self.processes.iter().any(|it| it.forks) {
+            return Ok(0);
+        }
         let births = self.fences.births();
         for process in &mut self.processes {
             sys::threads(process.pid, &mut process.threads)?;
@@ -443,7 +449,9 @@ impl CodeMemory {
         self.limbo.iter().map(|(_, range)| range.len).sum()
     }
 
-    /// Where offset 0 is in every run process, once one has started.
+    /// Where offset 0 is in every run process: chosen when the memory is made, at random in
+    /// [`BASES`], so every process a launch starts maps it at the same place, and code can be
+    /// placed for run-process addresses before any process exists.
     pub fn base(&self) -> Option<u64> {
         self.base
     }
@@ -460,7 +468,7 @@ impl CodeMemory {
     }
 
     /// Records that the run process `pid` mapped the memory at `base`. Every process maps it at
-    /// one base: the first sets it, and a later one elsewhere is an error.
+    /// [`CodeMemory::base`]: elsewhere is an error.
     pub fn attach(&mut self, pid: u32, base: u64) -> Result<(), Error> {
         match self.base {
             Some(at) if at != base => {
@@ -471,7 +479,19 @@ impl CodeMemory {
             _ => self.base = Some(base),
         }
         if !self.processes.iter().any(|it| it.pid == pid) {
-            self.processes.push(Process { pid, threads: Vec::new() });
+            self.processes.push(Process { pid, threads: Vec::new(), forks: false });
+        }
+        Ok(())
+    }
+
+    /// As [`CodeMemory::attach`], for a process that forks children which run the program's
+    /// code (a test binary's fork server): the fence can't see a child before it is told of
+    /// it, so nothing retired is freed until this process and its children have exited
+    /// ([`CodeMemory::exited`], called once the last of them ended).
+    pub fn attach_forking(&mut self, pid: u32, base: u64) -> Result<(), Error> {
+        self.attach(pid, base)?;
+        if let Some(process) = self.processes.iter_mut().find(|it| it.pid == pid) {
+            process.forks = true;
         }
         Ok(())
     }
@@ -523,7 +543,11 @@ impl CodeMemory {
     }
 
     fn describe_processes(&self) -> String {
-        let pids: Vec<String> = self.processes.iter().map(|it| it.pid.to_string()).collect();
+        let pids: Vec<String> = self
+            .processes
+            .iter()
+            .map(|it| if it.forks { format!("{} (which forks: until it and its children exit)", it.pid) } else { it.pid.to_string() })
+            .collect();
         format!("processes {}", pids.join(", "))
     }
 
@@ -549,6 +573,27 @@ impl CodeMemory {
         }
         Ok(())
     }
+}
+
+/// The addresses run processes map a code memory at: above a 4 GiB zero page, the dyld shared
+/// cache and non-PIE images, below the top of a 39-bit address space (the smallest AArch64
+/// Linux configures), and away from where Linux, macOS and Windows put mmaps, heaps and PIE
+/// images in a process as small as the loader. A base taken in a process is an error naming it.
+pub const BASES: std::ops::Range<u64> = 0x10_0000_0000..0x40_0000_0000;
+const BASE_ALIGN: u64 = 2 << 20;
+
+fn choose_base(len: u64) -> Result<u64, Error> {
+    let room = (BASES.end - BASES.start).checked_sub(len.next_multiple_of(BASE_ALIGN)).ok_or_else(|| {
+        Error::new(format!(
+            "a code memory of {len:#x} bytes does not fit {:#x}..{:#x}, where run processes map code memory",
+            BASES.start, BASES.end
+        ))
+    })?;
+    let mut random = [0u8; 16];
+    sys::random(&mut random)?;
+    let [a, b, c, d, e, f, g, h, ..] = random;
+    let pick = u64::from_le_bytes([a, b, c, d, e, f, g, h]);
+    Ok(BASES.start + (pick % (room / BASE_ALIGN + 1)) * BASE_ALIGN)
 }
 
 /// Whether AArch64 lets one thread change `instruction` while another may run it (Arm ARM

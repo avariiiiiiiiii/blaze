@@ -11,9 +11,10 @@
 //!   has it.
 //!
 //! Cost: a node with no attribute costs the walk a check of its kind. A lint found costs one
-//! FxHash of its name to its lint, one of its node (or of each node out to the nearest one
-//! seen), and a scan of the 2-byte lint ids of each set of levels from there out; a level is a
-//! 12-byte `Spec`. Nothing is allocated for a lint unless it is shown.
+//! perfect hash of its name to its lint, one FxHash of its node (or of each node out to the
+//! nearest one seen), and one bit test for a lint no attribute nor flag names; else one bit
+//! test of each set of levels from there out and a scan of the 2-byte lint ids of the one that
+//! has it. A level is a 12-byte `Spec`. Nothing is allocated for a lint unless it is shown.
 //!
 //! Follows rustc's `compiler/rustc_session/src/config.rs` (`get_cmd_lint_options`),
 //! `compiler/rustc_middle/src/lint.rs` (`emit_lint_base`, `explain_lint_level_source`),
@@ -57,12 +58,14 @@ pub struct CommandLine {
     pub cap: Option<Level>,
     /// `--check-cfg`.
     pub check_cfg: CheckCfg,
+    /// Each `--cfg` value as given, in order.
+    pub cfg: Vec<String>,
 }
 
 impl CommandLine {
     /// The lint flags among rustc's arguments `args`: `-A x`, `-Ax`, `--allow x`,
-    /// `--allow=x` and so on, `--cap-lints` and `--check-cfg`. The other arguments are not
-    /// lint flags and are passed by.
+    /// `--allow=x` and so on, `--cap-lints`, `--check-cfg` and `--cfg`. The other arguments
+    /// are not lint flags and are passed by.
     pub fn parse(args: &[String]) -> Result<CommandLine, String> {
         let mut flags = CommandLine::default();
         let mut args = args.iter();
@@ -99,6 +102,10 @@ impl CommandLine {
             }
             if let Some(spec) = value("--check-cfg")? {
                 flags.check_cfg.add(&spec)?;
+                continue;
+            }
+            if let Some(cfg) = value("--cfg")? {
+                flags.cfg.push(cfg);
                 continue;
             }
             let mut found = None;
@@ -195,7 +202,7 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
             cfg,
             root,
             cmd_warnings: cmd.opts.iter().find(|(it, _)| it == "warnings").map(|&(_, it)| it),
-            warnings: LintId::of(registry::lint("warnings").expect("a builtin lint")),
+            warnings: LintId::WARNINGS,
             sources: vec![Source::Default],
             expects: FxHashMap::default(),
             fulfilled: Vec::new(),
@@ -292,7 +299,7 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
                     let given = given.replace('_', "-");
                     once(diag, Sublevel::Note, format!("`{flag} {hyphens}` implied by `{flag} {given}`"));
                     if matches!(flagged, Level::Warn | Level::Deny) {
-                        let help = match name == "dead_code" {
+                        let help = match lint.id() == LintId::DEAD_CODE {
                             true => format!("to override `{flag} {given}` add `#[expect({name})]` or `#[allow({name})]`"),
                             false => format!("to override `{flag} {given}` add `#[allow({name})]`"),
                         };
@@ -388,7 +395,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         return out;
     }
 
-    let unfulfilled = registry::lint("unfulfilled_lint_expectations").expect("a builtin lint");
+    let unfulfilled = LintId::UNFULFILLED_LINT_EXPECTATIONS.lint();
     let mut expectations: Vec<_> = std::mem::take(&mut late.expectations)
         .into_iter()
         .map(|it| ((owner_rank(&sh, &it.node), attrs::place(cx.sema, &it.node)), it))

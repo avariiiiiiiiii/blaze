@@ -14,6 +14,8 @@ Ask: store `(attr index, TextRange)` (or `InFile<TextRange>`) in `Doc`'s fields,
 `Accept::index`, so `check_doc` calls `fx.span(index, range)` directly. I would then drop
 `span_at`.
 
+> forwarded to diagnostics: between its own children.
+
 ## 2. A gate per cfg predicate (features owner: `checks/features/attributes/cfg.rs`)
 
 `cfg_entry` gives the gates of a whole predicate at once, but rustc gives each gate where
@@ -23,3 +25,5 @@ on one leaf at a time, building a `MetaItem` for an empty `target()` and one for
 `pub(crate) fn try_gate_cfg(cx, features, file, name, range) -> Option<Diag>` and a
 `pub(crate) fn target_compact(cx, features, file, range) -> Option<Diag>` would avoid the
 synthetic items. This is not blocking: the current API gives the right output.
+
+> forwarded to diagnostics: between its own children.

@@ -228,11 +228,12 @@ fn place_expand(
     pick: fn((u32, u32)) -> u32,
 ) -> ExpandResult<tt::TopSubtree> {
     let err = (!tt.token_trees().is_empty())
-        .then(|| ExpandError::other(span, format!("{name} takes no arguments")));
+        .then(|| ExpandError::other(span, format!("`{name}` takes no arguments")));
     let value = match written_place(db, id) {
         Some(place) => pick(place),
         None => {
-            let err = ExpandError::other(span, format!("{name}: the call is not in its file's text"));
+            let err =
+                ExpandError::other(span, format!("`{name}`: the call is not in its file's text"));
             return ExpandResult::new(tt::TopSubtree::empty(DelimSpan::from_single(span)), err);
         }
     };

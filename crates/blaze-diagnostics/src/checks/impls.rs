@@ -18,6 +18,7 @@
 mod builtin;
 mod compare;
 
+use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::HasSource as _;
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
@@ -199,7 +200,7 @@ fn impls(cx: &Cx<'_, '_>) -> Vec<(hir::Impl, Origin)> {
             let at = cx.span(derive.loc(db).source(db)).lo;
             here.push((at, hir::Impl::from(derive), Origin::Derive { id: derive, adt }));
         }
-        here.sort_by_key(|(at, _, _)| *at);
+        radix::sort_by_key(&mut here, |(at, _, _)| *at);
         all.extend(here.into_iter().map(|(_, impl_, origin)| (impl_, origin)));
     }
     all

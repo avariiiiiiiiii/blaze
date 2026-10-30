@@ -261,12 +261,12 @@ fn main() {
 #[rustc_intrinsic]
 pub fn bitreverse(x: u32) -> u32; // Safe intrinsic
 #[rustc_intrinsic]
-pub unsafe fn floorf32(x: f32) -> f32; // Unsafe intrinsic
+pub unsafe fn unchecked_add(x: u32, y: u32) -> u32; // Unsafe intrinsic
 
 fn main() {
     let _ = bitreverse(12);
-    let _ = floorf32(12.0);
-          //^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
+    let _ = unchecked_add(1, 2);
+          //^^^^^^^^^^^^^^^^^^^💡 error: call to unsafe function is unsafe and requires an unsafe function or block
 }
 "#,
         );

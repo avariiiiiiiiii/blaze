@@ -46,6 +46,7 @@ mod emitted;
 mod lower;
 mod rebase;
 pub(crate) mod release;
+pub(crate) mod sanitize;
 
 /// What runs again where [`rebase::rebase`] said what addresses are based on: what is stored
 /// through one and loaded again is forwarded, and a slot that is then only written goes.
@@ -994,7 +995,6 @@ impl Kept {
     /// `Module::run_passes` would with `PassBuilderOptions::set_loop_slp_vectorization(slp)`
     /// and nothing else set.
     fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
-        use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
         // SAFETY: `self.0` is live until `Drop`, and `Kept` is `!Send` (a `NonNull`), so only
         // the thread that made it uses it; `module` is live for the call and the wrapper
         // refuses one of another context (`vendor/llvm-sys/wrappers/passes.cpp`); `passes` is
@@ -1008,11 +1008,33 @@ impl Kept {
                 i32::from(slp),
             )
         };
+        Kept::taken(failed)
+    }
+
+    /// Instruments `module` for `wanted`: SanitizerCoverage, then MemorySanitizer,
+    /// ThreadSanitizer and AddressSanitizer, as clang orders them.
+    fn instrument(
+        &self,
+        module: &Module<'_>,
+        wanted: &inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeSanitizers,
+    ) -> Result<(), Unhandled> {
+        use inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeRunSanitizers;
+        // SAFETY: `self.0` is live and used by this thread only (as in `run`); `module` is live
+        // for the call and the wrapper refuses one of another context; `wanted` is a live
+        // `#[repr(C)]` struct of the wrapper's layout, read during the call only.
+        let failed =
+            unsafe { LLVMBlazeRunSanitizers(self.0.as_ptr(), module.as_mut_ptr(), wanted) };
+        Kept::taken(failed)
+    }
+
+    /// The error a `LLVMBlaze*` call returned, null for none, as an `Unhandled`.
+    fn taken(failed: inkwell::llvm_sys::error::LLVMErrorRef) -> Result<(), Unhandled> {
+        use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
         if failed.is_null() {
             return Ok(());
         }
-        // SAFETY: `failed` is the non-null error LLVMBlazeRunPasses just returned, owned here;
-        // LLVMGetErrorMessage consumes it and returns a message this code owns.
+        // SAFETY: `failed` is a non-null error a wrapper just returned, owned here and taken
+        // once; LLVMGetErrorMessage consumes it and returns a message this code owns.
         let raw = unsafe { LLVMGetErrorMessage(failed) };
         // SAFETY: `raw` is NUL-terminated and live until disposed of below.
         let message = unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned();
@@ -1046,6 +1068,15 @@ impl Machinery {
     /// Runs the pipeline `passes` over `module`, vectorizing straight-line code if `slp`.
     fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
         self.passes.run(module, passes, slp)
+    }
+
+    /// Instruments `module` for the sanitizers `wanted` ([`sanitize::instrument`]).
+    fn instrument(
+        &self,
+        module: &Module<'_>,
+        wanted: &inkwell::llvm_sys::transforms::pass_builder::LLVMBlazeSanitizers,
+    ) -> Result<(), Unhandled> {
+        self.passes.instrument(module, wanted)
     }
 }
 

@@ -3684,7 +3684,7 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn add_definition_to_binding(&mut self, binding_id: BindingId, pat_id: PatId) {
-        self.store.binding_definitions.entry(binding_id).or_default().push(pat_id);
+        self.store.binding_definitions.push((binding_id, pat_id));
     }
 
     // region: labels

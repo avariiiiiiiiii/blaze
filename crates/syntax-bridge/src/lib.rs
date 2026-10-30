@@ -936,9 +936,9 @@ struct FlatTok<'t> {
 /// The tokens of a node of a flat tree in order, through the parts of the lazy nodes in it
 /// (parsing them) and the part of the node itself if it is lazy.
 struct FlatTokens<'t> {
-    /// The trees being walked, the innermost last: each with its next element and the element
-    /// its walk ends before.
-    stack: Vec<(&'t FlatTree, u32, u32)>,
+    /// The trees being walked, the innermost last: each with its next element, the element its
+    /// walk ends before, and where the next element starts.
+    stack: Vec<(&'t FlatTree, u32, u32, u32)>,
 }
 
 impl<'t> FlatTokens<'t> {
@@ -951,16 +951,16 @@ impl<'t> FlatTokens<'t> {
     /// How many elements the walk has left in its outermost tree: its tokens, its nodes and its
     /// lazy nodes, not what those hold.
     fn len_hint(&self) -> usize {
-        self.stack.first().map_or(0, |&(_, next, end)| (end - next) as usize)
+        self.stack.first().map_or(0, |&(_, next, end, _)| (end - next) as usize)
     }
 
     fn enter(&mut self, tree: &'t FlatTree, at: u32) {
-        if tree.is_lazy(at) {
-            let part: &'t FlatTree = tree.part(at);
-            self.stack.push((part, 0, part.end(0)));
-        } else {
-            self.stack.push((tree, at, tree.end(at)));
-        }
+        let (tree, at) = match tree.is_lazy(at) {
+            true => (tree.part(at), 0),
+            false => (tree, at),
+        };
+        let start = u32::from(tree.range(at).start());
+        self.stack.push((tree, at, tree.end(at), start));
     }
 }
 
@@ -969,16 +969,19 @@ impl<'t> Iterator for FlatTokens<'t> {
 
     fn next(&mut self) -> Option<FlatTok<'t>> {
         loop {
-            let (tree, next, end) = self.stack.last_mut()?;
+            let (tree, next, end, start) = self.stack.last_mut()?;
             if *next >= *end {
                 self.stack.pop();
                 continue;
             }
             let (tree, at) = (*tree, *next);
+            let len = tree.text_len(at);
+            let range = TextRange::at(TextSize::from(*start), TextSize::from(len));
             *next += 1;
+            *start += len;
             if tree.is_token(at) {
                 let kind = SyntaxKind::from(tree.kind(at).0);
-                let range = tree.range(at);
+                debug_assert_eq!(range, tree.range(at));
                 return Some(FlatTok { kind, range, text: &tree.text()[range] });
             }
             if tree.is_lazy(at) {

@@ -27,6 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
+use blaze_ids::radix;
 use blaze_protocol::events::{Event, How, Record};
 use rustc_hash::FxHashMap;
 
@@ -240,7 +241,7 @@ impl World {
         for (from, calls) in program.out.iter().enumerate() {
             sorted.clear();
             sorted.extend_from_slice(calls);
-            sorted.sort_unstable();
+            radix::sort(&mut sorted);
             for &to in &sorted {
                 out.extend((from as u32).to_le_bytes());
                 out.extend(to.to_le_bytes());
@@ -362,7 +363,7 @@ impl World {
                 at = waiting.next;
             }
         }
-        named.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut named, |it| it.0);
         calls.extend(named.iter().map(|&(_, from, to)| (from, to)));
         for &(call, from) in &unnamed {
             let at = program.waiting.len() as u32;
@@ -399,7 +400,7 @@ impl World {
                 self.flecs.add_calls(crates.0, crates.1);
             }
         }
-        changed.sort_unstable();
+        radix::sort(&mut changed);
         changed.dedup();
         let mut callees = std::mem::take(&mut self.scratch.callees);
         for &at in &changed {
@@ -408,7 +409,7 @@ impl World {
             callees.extend(out.iter().map(|&to| program.nodes[to as usize].entity));
             self.flecs.set_callees(program.nodes[at as usize].entity, &callees);
         }
-        changed_modules.sort_unstable();
+        radix::sort(&mut changed_modules);
         changed_modules.dedup();
         for &module in &changed_modules {
             self.flecs.set_callees(module, &program.module_calls[&module]);

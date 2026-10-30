@@ -2663,8 +2663,8 @@ mod tls_db {
             // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
             // which borrows the database for that long and puts back the pointer before it on
             // drop, unwinding too; `op` runs within, and the reference it gets, of a lifetime
-            // of its own, cannot leave it. (`DbInterner::conjure` breaks this: see the request
-            // in `v2/requests/db-ty-types.md`.)
+            // of its own, cannot leave it. (`DbInterner::conjure`, an `unsafe fn`, stretches it,
+            // and its callers keep it within the attachment, per its `# Safety`.)
             op(unsafe { db.as_ref() })
         }
     }

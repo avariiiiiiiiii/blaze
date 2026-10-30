@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 
+use blaze_ids::radix;
 use hir::InFile;
 use rustc_hash::FxHashMap;
 use span::Edition;
@@ -304,7 +305,7 @@ fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScri
                 continue 'sets;
             }
         }
-        chars.sort_unstable();
+        radix::sort_copy_by_key(&mut chars, |&c| u32::from(c));
         chars.dedup();
         reports.insert((symbols[symbol].order, chars), (symbol, set));
     }

@@ -179,7 +179,7 @@ fn encode(
         }
         TokenTree::Leaf(Leaf::Literal(Literal { text_and_suffix, span, kind, suffix_len })) => {
             if matches!(kind, LitKind::Str | LitKind::StrRaw(0 | 1) | LitKind::Integer)
-                && u32::from(suffix_len) <= n_bits_mask(4)
+                && suffix_len <= n_bits_mask(4)
             {
                 let mut control_byte = match kind {
                     LitKind::Str => 0b0_011,
@@ -188,7 +188,7 @@ fn encode(
                     LitKind::Integer => 0b1_100,
                     _ => unreachable!(),
                 };
-                control_byte |= suffix_len << 4;
+                control_byte |= (suffix_len as u8) << 4;
                 encode_symbol(w, &text_and_suffix, 0, symbols_map);
                 w.u8(control_byte);
             } else {
@@ -208,7 +208,7 @@ fn encode(
                 };
                 control_byte |= kind << 3;
                 encode_symbol(w, &text_and_suffix, 0, symbols_map);
-                w.u8(suffix_len);
+                w.u32(suffix_len);
                 if let Some(raw_count) = raw_count {
                     w.u8(raw_count);
                 }
@@ -591,7 +591,7 @@ fn decode(r: &mut Reader<'_>, compressed: &[CompressedSpanPart], symbols: &[Symb
                 0b10 => LitKind::StrRaw(1),
                 _ => LitKind::Integer,
             };
-            let suffix_len = (extra >> 2) as u8;
+            let suffix_len = extra >> 2;
             TokenTree::Leaf(Leaf::Literal(Literal { text_and_suffix, span, kind, suffix_len }))
         }
         0b111 => {
@@ -609,7 +609,7 @@ fn decode(r: &mut Reader<'_>, compressed: &[CompressedSpanPart], symbols: &[Symb
                 10 => LitKind::Err(()),
                 _ => unreachable!("literal kind {extra}"),
             };
-            let suffix_len = r.u8();
+            let suffix_len = r.u32();
             let first_byte = r.u8();
             let text_and_suffix = decode_symbol(r, first_byte, symbols);
             TokenTree::Leaf(Leaf::Literal(Literal { text_and_suffix, span, kind, suffix_len }))

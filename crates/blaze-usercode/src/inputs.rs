@@ -9,6 +9,7 @@
 //! out.
 
 use std::{
+    borrow::Cow,
     ffi::{OsStr, OsString},
     fmt, io,
     path::{Path, PathBuf},
@@ -335,7 +336,7 @@ pub struct ViewInputs<'a, 'db> {
 impl ViewInputs<'_, '_> {
     /// `path` as the view names it, when it is in the view: borrowed from `path` when its
     /// rest is already the view's name for it, `/`-separated with nothing to drop.
-    fn in_view<'p>(&self, path: &'p Path) -> Option<std::borrow::Cow<'p, str>> {
+    fn in_view<'p>(&self, path: &'p Path) -> Option<Cow<'p, str>> {
         let rest = path.strip_prefix(self.root).ok()?;
         let named = |text: &str| {
             text.is_empty()
@@ -345,7 +346,7 @@ impl ViewInputs<'_, '_> {
         if let Some(text) = rest.to_str()
             && named(text)
         {
-            return Some(std::borrow::Cow::Borrowed(text));
+            return Some(Cow::Borrowed(text));
         }
         let mut name = String::new();
         for part in rest.components() {
@@ -355,7 +356,7 @@ impl ViewInputs<'_, '_> {
             }
             name.push_str(part.to_str()?);
         }
-        Some(std::borrow::Cow::Owned(name))
+        Some(Cow::Owned(name))
     }
 }
 

@@ -369,14 +369,15 @@ pub struct Literal {
     pub text_and_suffix: Symbol,
     pub span: Span,
     pub kind: LitKind,
-    pub suffix_len: u8,
+    /// Any length: a suffix is an identifier, and a proc macro may be given one of any size.
+    pub suffix_len: u32,
 }
 
 impl Literal {
     #[inline]
     pub fn text_and_suffix(&self) -> (&str, &str) {
         let text_and_suffix = self.text_and_suffix.as_str();
-        text_and_suffix.split_at(text_and_suffix.len() - usize::from(self.suffix_len))
+        text_and_suffix.split_at(text_and_suffix.len() - self.suffix_len as usize)
     }
 
     #[inline]
@@ -405,7 +406,7 @@ impl Literal {
             Symbol::intern(&text_and_suffix)
         };
 
-        Self { text_and_suffix, span, kind, suffix_len: suffix.len().try_into().unwrap() }
+        Self { text_and_suffix, span, kind, suffix_len: text_len(suffix) }
     }
 
     #[inline]
@@ -464,9 +465,14 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
             text_and_suffix: Symbol::intern(text),
             span,
             kind,
-            suffix_len: suffix.len().try_into().unwrap(),
+            suffix_len: text_len(suffix),
         },
     }
+}
+
+/// A token's length as a `u32`, as every offset into a source text is.
+fn text_len(text: &str) -> u32 {
+    u32::try_from(text.len()).expect("a token of 4 GiB or more")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

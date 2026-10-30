@@ -822,11 +822,7 @@ struct Builder<'c, 'a, 'db> {
 fn synthesized(ctx: &Ctx<'_, '_>) -> FxHashSet<hir_def::hir::ExprId> {
     let InferBodyId::DefWithBodyId(def) = ctx.owner else { return FxHashSet::default() };
     let source_map = hir_def::expr_store::Body::unmoved_source_map(ctx.db, def);
-    ctx.store
-        .exprs()
-        .map(|(expr, _)| expr)
-        .filter(|&expr| source_map.expr_syntax(expr).is_err())
-        .collect()
+    ctx.store.expr_ids().filter(|&expr| source_map.expr_syntax(expr).is_err()).collect()
 }
 
 fn aggregate_temps(body: &MirBody<'_>) -> FxHashSet<LocalId> {
@@ -2082,8 +2078,9 @@ impl<'db> Builder<'_, '_, 'db> {
     fn path_arguments(&mut self) {
         use rustc_type_ir::inherent::GenericArg as _;
         let store = self.ctx.store;
-        let mut parent = FxHashMap::default();
-        for (expr, _) in store.exprs() {
+        let mut parent =
+            FxHashMap::with_capacity_and_hasher(store.expr_count(), Default::default());
+        for expr in store.expr_ids() {
             store.walk_child_exprs(expr, |child| {
                 parent.insert(child, expr);
             });

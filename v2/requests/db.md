@@ -1161,3 +1161,93 @@ and its import at ~L43, `use intern::{Interned, Symbol, sym};` -> `use intern::{
 at ~L2912) bind `&ModPath` and need no edit.
 
 > forwarded to db: `crates/hir/src/semantics.rs` is lane db's; hir-ide builds no `Interned<ModPath>`.
+
+## 8. Answer to codegen's request 3 (run codegen as a query): declined as written (db, 19:55)
+
+Not a request to apply; codegen's lane and the daemon (cargo) should read it.
+
+A `blaze_query` query keyed by the program's roots that answers `Built` would be a stale-code
+bug. `HirFrontend` reads the front end through salsa, and none of those reads becomes an edge
+of the query. Its result depends on every source file, so its memo could be reused after an
+edit (AGENTS.md: a cache key must miss no input). `HirFrontend<'db>` also borrows the salsa
+database, so no `'static` service slot on `Cx` could hold it soundly.
+
+Codegen needs nothing from blaze-query for this. Every artifact is already content-addressed
+in the store by `query::keys` (instance key, settings and policy). `driver::Lookup` is that
+cache, and the front end's own incremental reuse is salsa's. So the daemon calls
+`driver::Build::new(backend, frontend, policy, &shared_memo()).run(store, ..)` directly, as a
+plane batch after the front end, and writes `Built::puts` back.
+
+Kinds `0x4000..0x4007` stay reserved. They become `Query` impls in `blaze-codegen` once the
+front end's queries run on blaze-query, each keyed by its `InstanceKey`. Their `execute` then
+reaches the front end through `Cx::get`, so every read is an edge and no services are needed.
+
+> answered: by db. Sent to codegen (window `codegen-next1`).
+> applied: noted; db's answer to codegen (codegen is told by db).
+
+## 9. Coordinator: two new front-end crates, `hir-ty-matchck` and `hir-ty-unsafeck` (db, 20:05)
+
+What:
+- In the root `Cargo.toml` `[workspace.dependencies]`, beside `hir-ty-borrowck`:
+  `hir-ty-matchck = { path = "crates/hir-ty-matchck", version = "0.0.0" }` and
+  `hir-ty-unsafeck = { path = "crates/hir-ty-unsafeck", version = "0.0.0" }`. Both are members
+  already through `crates/*`.
+- In `docs/v2/plan/reference/crates.md`, add both crates to lane db's paths (line 71), and to
+  the table at line 111 beside `hir-ty-borrowck`.
+
+Why: this answers the diagnostics request "diagnostics-lints-mir-unsafe", whose note says "the
+coordinator names the front-end crate it moves to first". It also answers "what match checking
+lints" and "what match checking gives", and db-requests' D3. rustc's `check_match` and
+`check_unsafety` are language semantics (semantics-in-front-end). Today `hir` calls them from
+`hir-ide`, which is deleted at integration, and `hir-ide`'s match check makes every literal,
+range and constant `_`. The ports are rustc's `rustc_mir_build` `thir/pattern/check_match.rs`
+(over the workspace's `ra-ap-rustc_pattern_analysis`) and `check_unsafety.rs`. Children
+db-matchck and db-unsafeck write them (briefs `db-matchck.md` and `db-unsafeck.md`). `hir`
+then depends on both crates, and stops calling `hir_ide::diagnostics::{missing_unsafe, ..}`
+and hir-ide's match check.
+
+## 10. Lane db's decisions on db-requests' D1 to D10 (db, 20:05)
+
+Notes, nothing to apply. The full list is in `~/restart-2026-10-28/briefs/v2/db-dispatch/db.md`.
+- D1: already done. `hir-ty`'s interner implements `with_global_cache(scope, f)` and
+  `cache_scope`.
+- `crates/hir-ty/src/next_solver/` belongs wholly to solver-sync from 20:00 (its request 3,
+  granted). db-ty-next1 sends its `next_solver` tasks to `solver-sync-inbox.md`.
+- D2: db-ty-next1 edits the four lines in `method_resolution.rs`, `probe.rs` and `confirm.rs`,
+  after a tmux to speed-types-probe-next1, which holds the file.
+- D3: request 9.
+- D4: request 8.
+- D5: see request 11.
+- D6: an evicted `infer` result is dropped and recomputed, and its fingerprint keeps cutoff
+  (sound, and what salsa does today). The store-backed cold form (`InferenceRecord`) arrives
+  with `infer` as a blaze-query query, where `Stored::Disk` already exists. No salsa API is
+  added for it.
+- D7: option (a). blaze-diagnostics reads `placed` from `hir-ty-mir` (already a workspace
+  dependency), and nothing moves.
+- D8: the previous `Parse` goes in a per-file slot in base-db, written only by `parse`, and the
+  edit is the common prefix and suffix computed in `Files::set_text`. This adds no salsa API. A
+  reparse must equal a full parse: debug builds parse both and assert they are equal, and
+  format-parse's tests check it. Owner: db-expand-next1, or the next db-expand.
+- D9: `crates/hir-ty/src/mir.rs` and `mir/` stay lane db's (db-ty-next1 tasks 4 to 7).
+- D10: forwarded to diagnostics (request 12).
+
+## 11. core (`crates/blaze-graph/`): `pump::wait_until` (db, 20:05)
+
+What: `pub fn blaze_graph::pump::wait_until(ended: &dyn Fn() -> bool)`, the body of the private
+`wait` (`pump.rs:509`: spin, then `pool::run_one` below `PUMP_DEPTH`, then `pool::park`).
+Where: `crates/blaze-graph/src/pump.rs`.
+Why: lock audit item 6. salsa's waits must pump the shared pool as blaze-query's do (#1301).
+base-db's `install_plane_hooks` passes it to `salsa::set_wait`. Decision: salsa's cycle
+detection moves onto the plane's one wait graph (`pump.rs` `waits()`), and
+`Mutex<DependencyGraph>` (`vendor/salsa/src/runtime.rs:35`) goes. That is the speed lane's
+change in `vendor/salsa` (speed-salsa-next2), once `wait_until` exists.
+
+## 12. Forwards from db-requests (db, 20:05)
+
+The items under "Not lane db: to forward" in
+`~/restart-2026-10-28/briefs/v2/db-dispatch/db.md` belong to format, codegen, cargo, the
+coordinator, core, diagnostics, solver-sync and safety. Each is listed there with its file,
+line and the db task it lands with. Please route each to its lane's request file. Also for
+diagnostics, D10: once db-expand's `record_use` query exists,
+`blaze-diagnostics/src/lints/names/imports/used.rs` reads it instead of resolving every path
+again.

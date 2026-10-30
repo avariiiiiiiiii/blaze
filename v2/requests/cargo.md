@@ -650,6 +650,7 @@ of the view by absolute path in another source root. The standard library, which
 (`core` reads `library/stdarch`), is one source root and is not affected.
 
 > forwarded to cargo: `stdlib/target.rs` `data_layout` is inside lane cargo (cargo-std). > forwarded to db: `BuiltDependency::with_prelude` (`crates/base-db/src/input.rs`) and the `#[path]` outside the package gap are lane db's.
+> applied by db-expand: `BuiltDependency::with_prelude(name, crate_id, prelude, sysroot)` (`crates/base-db/src/input.rs`); both flags were already in the crate's content id. Test `a_dependency_added_outside_the_prelude_says_so` (`base-db/src/tests.rs`).
 
 ## 13. From cargo-daemon (to ci, core, coordinator, cargo-load and cargo-cli)
 
@@ -1334,3 +1335,5 @@ For **cargo-std** (`stdlib/`):
   - Any `match` on `Event` added in blaze-cargo must take `Event::Nodes`; none is exhaustive today.
 - Why: section 16 here. `AddNodes` took a batch as columns, but the plane still made two allocations
   a node for its `Event::Node`; now a batch is one record with no copy.
+
+> forwarded to cargo: written by `requests`' child requests-nodes, which told the lane.

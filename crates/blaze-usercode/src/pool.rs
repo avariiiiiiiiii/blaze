@@ -11,7 +11,7 @@
 //! process may write ([`Pool::live`]), read by scope after each answer
 //! ([`crate::trace::assemble`]).
 
-use std::{collections::HashMap, ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, path::PathBuf};
 
 use blaze_core::{Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -38,10 +38,10 @@ impl WarmKey {
             hasher.part(crate::trace::os_bytes(arg));
         }
         hasher.part(crate::trace::os_bytes(command.dir.as_os_str()));
-        let mut set = set.to_vec();
-        set.sort();
+        let mut set: Vec<&(OsString, OsString)> = set.iter().collect();
+        set.sort_unstable();
         hasher.update(&(set.len() as u64).to_le_bytes());
-        for (name, value) in &set {
+        for (name, value) in set {
             hasher.part(crate::trace::os_bytes(name)).part(crate::trace::os_bytes(value));
         }
         match &command.sandbox {
@@ -120,7 +120,7 @@ pub struct Pool {
     config: Config,
     next: u64,
     servers: FxHashMap<Server, Process>,
-    asked: HashMap<Tag, Asked>,
+    asked: FxHashMap<Tag, Asked>,
     idle: FxHashMap<WarmKey, Vec<Server>>,
     count: u32,
 }
@@ -131,7 +131,7 @@ impl Pool {
             config,
             next: 0,
             servers: FxHashMap::default(),
-            asked: HashMap::new(),
+            asked: FxHashMap::default(),
             idle: FxHashMap::default(),
             count: 0,
         }

@@ -502,6 +502,12 @@ impl BuiltDependency {
         Self { name, crate_id, prelude: true, sysroot: false }
     }
 
+    /// A dependency of a crate added after the graph was built, saying whether it is in the
+    /// extern prelude (not for cargo's `noprelude`) and whether it is a sysroot crate.
+    pub fn with_prelude(name: CrateName, crate_id: Crate, prelude: bool, sysroot: bool) -> Self {
+        Self { name, crate_id, prelude, sysroot }
+    }
+
     /// Whether this dependency is to be added to the depending crate's extern prelude.
     pub fn is_prelude(&self) -> bool {
         self.prelude

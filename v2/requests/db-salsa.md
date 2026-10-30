@@ -128,6 +128,7 @@ no per-thread handles; all parallel work is plane tasks"); a write no longer wai
 handle to drop, and no handle per thread is made or kept.
 
 > forwarded to db: `vendor/salsa` and `base-db` are lane db's; hir-ide's `TestDB` (mine) follows whatever db lands.
+> applied by db-expand: `impl Clone for TestDB` (`hir-def/src/test_db.rs`) and `#[derive(Clone)]` on base-db's `TestDb` (`base-db/src/tests.rs`) are deleted; no test in base-db, hir-expand or hir-def clones or forks a database.
 
 ## Set salsa's task depth to the plane's (lane db, base-db; cargo daemon)
 

@@ -1,8 +1,12 @@
 //! Tests for `builtin_fn_macro.rs` from `hir_expand`.
 
 use expect_test::expect;
+use test_fixture::WithFixture;
 
-use crate::macro_expansion_tests::check;
+use crate::{
+    ModuleDefId, expr_store::Body, macro_expansion_tests::check, nameres::crate_def_map,
+    test_db::TestDB,
+};
 
 #[test]
 fn test_column_expand() {
@@ -17,7 +21,7 @@ fn main() { column!(); }
 #[rustc_builtin_macro]
 macro_rules! column {() => {}}
 
-fn main() { 0u32; }
+fn main() { 13u32; }
 "#]],
     );
 }
@@ -94,8 +98,57 @@ fn main() { line!() }
 #[rustc_builtin_macro]
 macro_rules! line {() => {}}
 
-fn main() { 0u32 }
+fn main() { 4u32 }
 "#]],
+    );
+}
+
+/// rustc's `expansion_cause`: a call that a macro's body writes is where that macro is called, a
+/// call passed to a macro is where it is written, and a column counts code points.
+#[test]
+fn line_and_column_are_where_the_call_is_written() {
+    let db = TestDB::with_files(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! line {() => {}}
+#[rustc_builtin_macro]
+macro_rules! column {() => {}}
+macro_rules! here { () => { (line!(), column!()) } }
+macro_rules! pass { ($e:expr) => { $e } }
+
+fn main() {
+    let 人之初 = here!();
+    let _ = pass!(column!());
+    let _ = line!(column);
+}
+"#,
+    );
+    let krate = db.fetch_test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let main = def_map.module(&db, def_map.root).scope(&db).declarations().find_map(|it| match it {
+        ModuleDefId::FunctionId(it) => Some(it),
+        _ => None,
+    });
+    let (_, source_map) = Body::with_source_map(&db, main.unwrap().into());
+    let mut placed = source_map
+        .macro_calls()
+        .map(|(_, call)| {
+            let written = call.loc(&db).to_node(&db).value.to_string();
+            let expansion = call.parse_macro_expansion(&db);
+            (written, expansion.value.0.syntax_node().to_string(), expansion.err.is_some())
+        })
+        .filter(|(_, expanded, _)| expanded.ends_with("u32"))
+        .collect::<Vec<_>>();
+    placed.sort();
+    let placed = placed.iter().map(|(a, b, c)| (a.as_str(), b.as_str(), *c)).collect::<Vec<_>>();
+    assert_eq!(
+        placed,
+        [
+            ("column!()", "15u32", false),
+            ("column!()", "19u32", false),
+            ("line!()", "9u32", false),
+            ("line!(column)", "11u32", true),
+        ]
     );
 }
 

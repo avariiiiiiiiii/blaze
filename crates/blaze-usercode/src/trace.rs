@@ -9,6 +9,7 @@
 //! the sandbox's launcher leaves for the driver that ran it.
 
 use std::{
+    borrow::Cow,
     ffi::{OsStr, OsString},
     fmt,
     path::{Path, PathBuf},
@@ -522,16 +523,24 @@ pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     }
 }
 
-/// The path [`os_bytes`] gave `bytes` of, borrowed in place where a path is its bytes.
-pub(crate) fn path_in(bytes: &[u8]) -> Result<std::borrow::Cow<'_, Path>, String> {
+/// The name [`os_bytes`] gave `bytes` of, borrowed in place where a name is its bytes.
+pub(crate) fn os_in(bytes: &[u8]) -> Result<Cow<'_, OsStr>, String> {
     #[cfg(unix)]
     {
-        Ok(std::borrow::Cow::Borrowed(Path::new(std::os::unix::ffi::OsStrExt::from_bytes(bytes))))
+        Ok(Cow::Borrowed(std::os::unix::ffi::OsStrExt::from_bytes(bytes)))
     }
     #[cfg(not(unix))]
     {
-        Ok(std::borrow::Cow::Owned(PathBuf::from(os_from(bytes)?)))
+        Ok(Cow::Owned(os_from(bytes)?))
     }
+}
+
+/// The path [`os_bytes`] gave `bytes` of, borrowed in place where a path is its bytes.
+pub(crate) fn path_in(bytes: &[u8]) -> Result<Cow<'_, Path>, String> {
+    Ok(match os_in(bytes)? {
+        Cow::Borrowed(name) => Cow::Borrowed(Path::new(name)),
+        Cow::Owned(name) => Cow::Owned(PathBuf::from(name)),
+    })
 }
 
 /// The UTF-16 units of WTF-8 `bytes` (UTF-8 that may also hold a lone surrogate), which is

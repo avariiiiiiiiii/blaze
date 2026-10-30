@@ -62,7 +62,7 @@ impl CompressedSpanPart {
 /// - a punct: its spacing (2 bits); `data` is its character;
 /// - an ident: whether it is raw (1 bit); `data` is its symbol's index;
 /// - a literal: its kind (4 bits), the hashes of a raw one (8 bits) and its suffix's length
-///   (8 bits); `data` is its symbol's index.
+///   (the 18 bits left, below [`MAX_SUFFIX`]); `data` is its symbol's index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Node {
     head: u32,
@@ -78,6 +78,9 @@ const IDENT: u32 = 2;
 const LITERAL: u32 = 3;
 const ORDINAL_SHIFT: u32 = 4;
 const MAX_ORDINAL: u32 = u32::MAX >> ORDINAL_SHIFT;
+const SUFFIX_SHIFT: u32 = 14;
+/// The longest suffix a literal node holds: 256 KiB, against rustc's none.
+const MAX_SUFFIX: u32 = u32::MAX >> SUFFIX_SHIFT;
 
 impl Node {
     #[inline]
@@ -139,7 +142,11 @@ impl Node {
     }
 
     #[inline]
-    fn literal(kind: LitKind, suffix_len: u8, symbol: u32) -> Node {
+    fn literal(kind: LitKind, suffix_len: u32, symbol: u32) -> Node {
+        assert!(
+            suffix_len <= MAX_SUFFIX,
+            "a literal with a suffix of {suffix_len} bytes: a token tree holds at most {MAX_SUFFIX}"
+        );
         let (code, hashes) = match kind {
             LitKind::Byte => (0, 0),
             LitKind::Char => (1, 0),
@@ -154,7 +161,7 @@ impl Node {
             LitKind::Err(()) => (10, 0),
         };
         Node {
-            head: LITERAL | code << 2 | u32::from(hashes) << 6 | u32::from(suffix_len) << 14,
+            head: LITERAL | code << 2 | u32::from(hashes) << 6 | suffix_len << SUFFIX_SHIFT,
             data: symbol,
         }
     }
@@ -178,8 +185,8 @@ impl Node {
     }
 
     #[inline]
-    fn suffix_len(self) -> u8 {
-        (self.head >> 14) as u8
+    fn suffix_len(self) -> u32 {
+        self.head >> SUFFIX_SHIFT
     }
 }
 

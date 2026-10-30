@@ -10,6 +10,7 @@
 
 use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use cfg::CfgExpr;
 use hir::{HirFileId, InFile, ModuleSource};
 use syntax::{
@@ -91,7 +92,9 @@ pub(super) fn fields(item: &Item) -> Vec<InFile<SyntaxNode>> {
         .map(|it| it.map(|it| it.syntax().clone()))
         .chain(item.own::<ast::TupleField>().map(|it| it.map(|it| it.syntax().clone())))
         .collect();
-    fields.sort_by_key(|it| (it.file_id != item.node.file_id, it.value.text_range().start()));
+    radix::sort_by_key(&mut fields, |it| {
+        radix::pack_32(u32::from(it.file_id != item.node.file_id), it.value.text_range().start().into())
+    });
     fields
 }
 

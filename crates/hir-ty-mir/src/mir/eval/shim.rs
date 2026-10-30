@@ -616,7 +616,7 @@ impl<'db> Evaluator<'db> {
         span: MirSpan,
     ) -> Result<'db, bool> {
         match intrinsic {
-            Intrinsic::Atomic(op) => {
+            Intrinsic::Atomic(op, _) => {
                 return self
                     .exec_atomic_intrinsic(op, args, generic_args, destination, locals, span)
                     .map(|()| true);
@@ -1408,6 +1408,15 @@ impl<'db> Evaluator<'db> {
                 let site = self.caller_site(locals, span)?;
                 let location = self.location_of(site, locals)?;
                 destination.write_from_bytes(self, &location.to_bytes())
+            }
+            Intrinsic::BoxNew => {
+                let ty = generic_args.type_at(0);
+                let Some((size, align)) = self.size_align_of(ty, locals)? else {
+                    not_supported!("unsized box initialization");
+                };
+                let addr = self.allocate(size, align, Origin::Allocator)?;
+                self.copy_from_interval(addr, args[0].interval)?;
+                destination.write_from_bytes(self, &addr.to_bytes()[..self.ptr_size()])
             }
             Intrinsic::WriteBoxViaMove => {
                 let [boxed, value] = args else {

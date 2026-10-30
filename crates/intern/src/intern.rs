@@ -17,12 +17,14 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     ptr::{self, NonNull},
-    sync::OnceLock,
 };
 
 use rustc_hash::FxBuildHasher;
 
-use crate::arena::{Entry, Store};
+use crate::{
+    arena::{Entry, Store},
+    sync::OnceLock,
+};
 
 pub struct Interned<T: Internable> {
     /// Points into `T::storage()`, which never moves or frees a value.
@@ -288,6 +290,7 @@ mod tests {
 
     /// A value interned from many threads at once is one value: every thread gets the handle
     /// interned before them, and values first interned by racing threads are one per value.
+    #[cfg(not(blaze_check))]
     #[test]
     fn interned_from_many_threads() {
         let held: Vec<_> = (0..64).map(|i| Interned::new(Name(i))).collect();
@@ -308,11 +311,14 @@ mod tests {
         assert!(after == held);
     }
 
+    #[cfg(not(blaze_check))]
     #[derive(PartialEq, Eq, Hash, Debug)]
     struct Racing(u64);
+    #[cfg(not(blaze_check))]
     impl_internable!(Racing);
 
     /// Threads interning overlapping new values in different orders get pointer-equal handles.
+    #[cfg(not(blaze_check))]
     #[test]
     fn new_values_race_to_one_handle() {
         const THREADS: u64 = 16;
@@ -339,12 +345,15 @@ mod tests {
         }
     }
 
+    #[cfg(not(blaze_check))]
     #[derive(PartialEq, Eq, Hash, Debug)]
     struct Text(String);
+    #[cfg(not(blaze_check))]
     impl_internable!(Text);
 
     /// Enough values to fill many chunks of every shard: the first handles still read their
     /// values and are still what interning them again gives.
+    #[cfg(not(blaze_check))]
     #[test]
     fn handles_stay_valid() {
         let early: Vec<_> = (0..256).map(|n| Interned::new(Text(format!("early {n}")))).collect();
@@ -401,5 +410,122 @@ mod tests {
         assert_eq!(unsafe { Interned::from_raw(raw) }, owned);
         let longer: InternedRef<'static, GcString> = r.change_lifetime();
         assert_eq!(longer, r);
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
+/// model_`): a type's first interns racing to make its store, against a set: the copy kept is
+/// the first intern's of each value, every other copy is dropped once, and equal values get one
+/// handle.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+    };
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
+    use super::*;
+
+    /// A value that says when it is dropped. An interned value never is, so a copy dropped by
+    /// the time `Interned::new` returns was found there already.
+    struct Counted {
+        value: u64,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Counted {
+        fn new(value: u64) -> (Counted, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (Counted { value, dropped: dropped.clone() }, dropped)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            assert!(!self.dropped.swap(true, Relaxed), "a copy dropped twice");
+        }
+    }
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Counted) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl Hash for Counted {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
+        }
+    }
+
+    /// This execution's storage. A `static` one would keep the store the first execution made,
+    /// whose atomics each later execution starts again from null while its values stay.
+    static CURRENT: AtomicPtr<InternStorage<Counted>> = AtomicPtr::new(ptr::null_mut());
+
+    impl Internable for Counted {
+        fn storage() -> &'static InternStorage<Counted> {
+            // SAFETY: `model_first_interns_race` points `CURRENT` at a storage it frees only after
+            // joining every thread that interns, and clears it first. The model's threads are
+            // coroutines on its one OS thread, so this `Relaxed` load sees that store.
+            unsafe { CURRENT.load(Relaxed).as_ref() }.expect("a model's storage")
+        }
+    }
+
+    /// The sequential interner: bit `v` is set when value `v` is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u8);
+
+    impl Spec for Set {
+        /// The value interned.
+        type Op = u64;
+        /// Whether this call's copy is the one kept: the value was not there.
+        type Ret = bool;
+
+        fn apply(&mut self, &value: &u64) -> bool {
+            let new = self.0 & (1 << value) == 0;
+            self.0 |= 1 << value;
+            new
+        }
+    }
+
+    fn intern(history: &History<Set>, value: u64) -> Interned<Counted> {
+        let mut handle = None;
+        history.record(value, |&value| {
+            let (copy, dropped) = Counted::new(value);
+            let interned = Interned::new(copy);
+            assert_eq!(interned.value, value, "a handle reads its value whole");
+            handle = Some(interned);
+            !dropped.load(Relaxed)
+        });
+        handle.expect("a recorded intern")
+    }
+
+    #[test]
+    fn model_first_interns_race() {
+        blaze_check::model(|| {
+            let storage = Box::new(InternStorage::<Counted>::new());
+            CURRENT.store(ptr::from_ref(&*storage).cast_mut(), Relaxed);
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let history = history.clone();
+                thread::spawn(move || [1, 2].map(|value| intern(&history, value)))
+            };
+            let two = intern(&history, 2);
+            let one = intern(&history, 1);
+            let [one_there, two_there] = other.join().unwrap();
+            history.check(Set::default());
+            assert!(one == one_there && two == two_there, "equal values, one handle");
+            assert!(one != two, "two values, two handles");
+            assert_eq!(storage.get().len(), 2, "one store, made once");
+            CURRENT.store(ptr::null_mut(), Relaxed);
+            drop(storage);
+        });
     }
 }

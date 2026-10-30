@@ -11,6 +11,7 @@
 //! `ParentInfo`, `IgnoredDerivedImpls`, `ChangeFields`, `EnumVariantSameName`,
 //! `DeadCodePubInBinaryNote`) (MIT or Apache-2.0).
 
+use blaze_ids::radix;
 use hir::InFile;
 use hir_def::{AdtId, signatures::{StructFlags, StructSignature}};
 use syntax::{
@@ -204,7 +205,7 @@ impl Report<'_, '_, '_, '_> {
         if dead_codes.is_empty() {
             return;
         }
-        dead_codes.sort_by_key(|it| it.level.level);
+        radix::sort_by_key(&mut dead_codes, |it| it.level.level as u8);
         for group in dead_codes.chunk_by(|a, b| a.level == b.level) {
             self.lint_at_single_level(group, participle, Some(parent), report_on);
         }

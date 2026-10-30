@@ -11,6 +11,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use blaze_ids::radix;
 use hir_ty_codegen::wasm::{INDEX_LEN, WasmFunction, WasmSignature, WasmType};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -164,7 +165,7 @@ impl<'a> Symbols<'a> {
             };
             let content = section.data().map_err(|e| format!("object: {e}"))?;
             let mut relocs: Vec<_> = section.relocations().collect();
-            relocs.sort_unstable_by_key(|it| it.0);
+            radix::sort_by_key(&mut relocs, |it| it.0);
             for symbol in file.symbols().filter(|it| it.section_index() == Some(section.index())) {
                 if symbol.kind() == SymbolKind::Section {
                     continue;

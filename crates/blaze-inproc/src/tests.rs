@@ -321,16 +321,20 @@ fn the_arena_hands_out_aligned_ranges_after_the_image() {
 #[test]
 fn every_process_maps_the_memory_at_one_base() {
     let Some(mut memory) = memory(1, 1) else { return };
-    assert_eq!(memory.base(), None);
-    assert_eq!(memory.address(0), None);
-    memory.attach(100, 0x7000_0000).unwrap();
-    memory.attach(101, 0x7000_0000).unwrap();
-    assert!(memory.attach(102, 0x7100_0000).is_err());
-    assert_eq!(memory.address(0x10), Some(0x7000_0010));
+    let base = memory.base().unwrap();
+    assert!(crate::BASES.contains(&base) && base + memory.len() <= crate::BASES.end);
+    assert!(base.is_multiple_of(memory.page()));
+    assert_eq!(memory.address(0x10), Some(base + 0x10));
+    memory.attach(100, base).unwrap();
+    memory.attach(101, base).unwrap();
+    assert!(memory.attach(102, base + memory.page()).is_err());
     assert_eq!(memory.address(memory.len()), None);
-    assert_eq!(memory.offset_of(0x7000_0010), Some(0x10));
-    assert_eq!(memory.offset_of(0x6fff_ffff), None);
-    assert_eq!(memory.offset_of(0x7000_0000 + memory.len()), None);
+    assert_eq!(memory.offset_of(base + 0x10), Some(0x10));
+    assert_eq!(memory.offset_of(base - 1), None);
+    assert_eq!(memory.offset_of(base + memory.len()), None);
+    let bases: std::collections::HashSet<u64> =
+        (0..8).filter_map(|_| CodeMemory::new("test", 1, 1).ok()).filter_map(|it| it.base()).collect();
+    assert!(bases.len() > 1, "every code memory got one base");
 }
 
 #[test]
@@ -339,7 +343,7 @@ fn retired_code_waits_for_the_threads_of_a_live_process() {
     let image = memory.image_len();
     let arena = memory.len() - image;
     let pid = std::process::id();
-    memory.attach(pid, 0x7000_0000).unwrap();
+    memory.attach(pid, memory.base().unwrap()).unwrap();
     let all = memory.reserve(arena, 16).unwrap();
     memory.retire(all).unwrap();
     assert_eq!(memory.held(), arena);
@@ -648,8 +652,9 @@ mod linux {
             read_grant(frame.body).unwrap()
         };
         assert_eq!(grant.image_len, memory.image_len());
+        assert_eq!(Some(grant.base), memory.base());
         let granted = sys::recv_objects(&mut channel, grant.objects.len()).unwrap();
-        let at = sys::reserve(&mut channel, granted[0].len(), None).unwrap();
+        let at = sys::reserve(&mut channel, granted[0].len(), Some(grant.base)).unwrap();
         let base = granted[0].map(&mut channel, 0, granted[0].len(), at, Access::Execute).unwrap();
         let mut started = Vec::new();
         Writer::new(&mut started).u64(base).u64(sys::thread_id());

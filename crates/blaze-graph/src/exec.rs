@@ -6,7 +6,7 @@
 //! scheduler: it owns the [`Plane`] and steps it on a thread of its own, the owner thread, whose
 //! one wait is for the next input; it never waits for a worker. Its tasks run on the process's
 //! [`shared`] pool, near the group the plane names, inside [`arena::measure`], and what each
-//! held teaches the [`Estimates`] the next task of its kind is admitted by.
+//! held and how long it ran teach the [`Predict`] the next task's cost and memory come from.
 
 use std::{
     any::Any,
@@ -26,8 +26,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Cancelled,
-    admission::{Estimates, TaskKind},
+    Cancelled, Key,
+    admission::{Predict, TaskKind},
     arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
@@ -268,12 +268,14 @@ enum Msg {
         id: NodeId,
         request: RequestId,
         kind: TaskKind,
+        key: Option<Key>,
         did: Did,
-        /// What its arena held at most; `None` when it panicked.
-        peak: Option<u64>,
+        /// What its last run held and took; `None` when it panicked.
+        measure: Option<Measure>,
         group: Option<u32>,
     },
-    Estimates { reply: Sender<Estimates> },
+    /// What the predictor learned, as [`Predict::encode`] gives it.
+    Estimates { reply: Sender<Vec<u8>> },
     /// How many slots the owner's table has made.
     #[cfg(test)]
     Slots { reply: Sender<usize> },
@@ -291,11 +293,20 @@ struct Ctx {
     start: Instant,
 }
 
+/// What a task's run that ended held at most, and the time it ran (its own, not the tries
+/// that gave way before it).
+#[derive(Debug, Clone, Copy)]
+struct Measure {
+    peak: u64,
+    ran_ns: u64,
+}
+
 /// A run under way: the node, and the work it runs (a clone the owner made and drops).
 struct Live {
     id: NodeId,
     request: RequestId,
     kind: TaskKind,
+    key: Option<Key>,
     /// On its request's critical path, as the plane said when it ran it.
     critical: bool,
     work: Work,
@@ -408,7 +419,7 @@ impl Ran {
     }
 
     /// Says what came of the run. Its last touch of the slot is reading it for the message.
-    fn done(self, did: Did, peak: Option<u64>, group: Option<u32>) {
+    fn done(self, did: Did, measure: Option<Measure>, group: Option<u32>) {
         let (run, live) = (self.run(), self.live());
         let ctx = run.ctx;
         let msg = Msg::Done {
@@ -417,8 +428,9 @@ impl Ran {
             id: live.id,
             request: live.request,
             kind: live.kind,
+            key: live.key,
             did,
-            peak,
+            measure,
             group,
         };
         _ = ctx.tx.send(msg);
@@ -443,8 +455,9 @@ impl Handle {
         Opened { request, heard }
     }
 
-    /// Tasks of `request`, besides those it had; each one's predicted memory is at least what
-    /// the scheduler's estimates predict for its kind.
+    /// Tasks of `request`, besides those it had; each one's spec takes the scheduler's
+    /// [`Prediction`](crate::admission::Prediction) for its kind and key (its memory never
+    /// under the predicted peak, its cost the predicted one when there is one).
     pub fn add(&self, request: RequestId, tasks: Vec<Task>) {
         _ = self.tx.send(Msg::Add { request, tasks });
     }
@@ -469,12 +482,13 @@ impl Handle {
         _ = self.tx.send(Msg::Cancel { request });
     }
 
-    /// The estimates as they are now, to be kept in the daemon's image.
+    /// What the scheduler's predictor has learned, as its [`Predict::encode`] gives it, to be
+    /// kept in the daemon's image.
     ///
     /// # Panics
     ///
     /// When the scheduler is gone.
-    pub fn estimates(&self) -> Estimates {
+    pub fn estimates(&self) -> Vec<u8> {
         let (reply, estimates) = crossbeam_channel::bounded(1);
         _ = self.tx.send(Msg::Estimates { reply });
         estimates.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
@@ -501,7 +515,10 @@ impl Handle {
 /// A task's work runs in its thread's task arena ([`arena::task`]: a pool worker's is on its
 /// NUMA node, in huge pages, and reset when the task ends) inside [`arena::measure`], and its
 /// `Done` gives the plane the peak it held and the group it ran on; after each `Done` the plane
-/// hears what the process holds ([`arena::held`]). A task the plane says is on its request's
+/// hears what the process holds ([`arena::held`]). The scheduler's [`Predict`] gives each task
+/// added or found its cost and memory before the plane sees it, and learns the peak and own run
+/// time of each run that ends with a result (a run that gave way and one that panicked teach it
+/// nothing), under the task's kind and its spec's key. A task the plane says is on its request's
 /// critical path runs on a fast group of the pool ([`Workers::submit_critical`]). Work that
 /// returns [`Cancelled`] is posted again (the plane still sees it running), behind what is
 /// ready on its group. The clock is read here, never by the plane.
@@ -516,13 +533,14 @@ pub struct Scheduler {
 
 impl Scheduler {
     /// A scheduler of the plane `config` says, on the process's [`shared`] pool. The plane
-    /// asks `memo`, the database's, whether a key is settled before it runs a node of it.
+    /// asks `memo`, the database's, whether a key is settled before it runs a node of it;
+    /// `predict` gives each task's cost and memory and learns from each run that ends.
     pub fn new(
         config: PlaneConfig,
-        estimates: Estimates,
+        predict: Box<dyn Predict>,
         memo: Box<dyn Memo + Send>,
     ) -> Result<Scheduler, Error> {
-        Scheduler::with_pool(config, estimates, memo, shared())
+        Scheduler::with_pool(config, predict, memo, shared())
     }
 
     /// A scheduler whose tasks run on `pool`.
@@ -532,7 +550,7 @@ impl Scheduler {
     /// When a thread cannot be started, as [`std::thread::spawn`].
     pub fn with_pool(
         config: PlaneConfig,
-        estimates: Estimates,
+        predict: Box<dyn Predict>,
         memo: Box<dyn Memo + Send>,
         pool: &'static Workers,
     ) -> Result<Scheduler, Error> {
@@ -558,7 +576,7 @@ impl Scheduler {
             Box::leak(Box::new(Ctx { tx: tx.clone(), io: io_tx, pool, start: Instant::now() }));
         let owner = Owner {
             plane,
-            estimates,
+            predict,
             heard: FxHashMap::default(),
             works: FxHashMap::default(),
             ctx,
@@ -596,7 +614,7 @@ impl Scheduler {
         self.handle.cancel(request);
     }
 
-    pub fn estimates(&self) -> Estimates {
+    pub fn estimates(&self) -> Vec<u8> {
         self.handle.estimates()
     }
 }
@@ -616,13 +634,14 @@ impl Drop for Scheduler {
 struct Entry {
     request: RequestId,
     kind: TaskKind,
+    key: Option<Key>,
     work: Work,
 }
 
 /// The owner thread's: the plane and everything only it changes.
 struct Owner {
     plane: Plane,
-    estimates: Estimates,
+    predict: Box<dyn Predict>,
     heard: FxHashMap<RequestId, Sender<Heard>>,
     /// The work of each node added and not settled.
     works: FxHashMap<NodeId, Entry>,
@@ -680,10 +699,10 @@ impl Owner {
                 let mut nodes = Vec::with_capacity(tasks.len());
                 let mut new = Vec::with_capacity(tasks.len());
                 for Task { mut spec, kind, work } in tasks {
-                    spec.memory = spec.memory.max(self.estimates.predict(kind));
+                    self.predict.predict(kind, spec.key).apply(&mut spec);
                     // A node added twice is refused by the plane: the first keeps its work.
                     if !self.works.contains_key(&spec.id) {
-                        self.works.insert(spec.id, Entry { request, kind, work });
+                        self.works.insert(spec.id, Entry { request, kind, key: spec.key, work });
                         new.push(spec.id);
                     }
                     nodes.push(spec);
@@ -697,7 +716,8 @@ impl Owner {
             Msg::Found { request, tasks } => {
                 for Task { spec, kind, work } in tasks {
                     // Found again by a task posted again: the first keeps its work.
-                    self.works.entry(spec.id).or_insert(Entry { request, kind, work });
+                    let key = spec.key;
+                    self.works.entry(spec.id).or_insert(Entry { request, kind, key, work });
                 }
             }
             Msg::Close { request } => _ = self.step(request, PlaneInput::Close { at_ns, request }),
@@ -705,12 +725,12 @@ impl Owner {
                 let outputs = self.plane.cancel(at_ns, request);
                 self.outputs(request, outputs);
             }
-            Msg::Done { at_ns, slot, id, request, kind, did, peak, group } => {
+            Msg::Done { at_ns, slot, id, request, kind, key, did, measure, group } => {
                 if let Some(slot) = slot {
                     self.table.free(slot);
                 }
-                if let Some(peak) = peak {
-                    self.estimates.observe(kind, peak);
+                if let Some(Measure { peak, ran_ns }) = measure {
+                    self.predict.observe(kind, key, ran_ns, peak);
                 }
                 let (mut outcome, mut added) = (did.outcome, did.added);
                 let workless = added.iter().map(|spec| spec.id).find(|found| {
@@ -727,9 +747,9 @@ impl Owner {
                 }
                 for spec in &mut added {
                     let kind = self.works[&spec.id].kind;
-                    spec.memory = spec.memory.max(self.estimates.predict(kind));
+                    self.predict.predict(kind, spec.key).apply(spec);
                 }
-                let peak = peak.unwrap_or(0);
+                let peak = measure.map_or(0, |it| it.peak);
                 let input = PlaneInput::Done { at_ns, id, outcome, added, group, peak };
                 if !self.step(request, input) {
                     // What it found could not be added: the node fails rather than run forever.
@@ -741,7 +761,7 @@ impl Owner {
                 let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::held() };
                 self.step(request, held);
             }
-            Msg::Estimates { reply } => _ = reply.send(self.estimates.clone()),
+            Msg::Estimates { reply } => _ = reply.send(self.predict.encode()),
             #[cfg(test)]
             Msg::Slots { reply } => _ = reply.send(self.table.chunks.len() * RUNS),
             Msg::Stop => return false,
@@ -805,14 +825,15 @@ impl Owner {
                 id,
                 request: RequestId(u32::MAX),
                 kind: TaskKind(u32::MAX),
+                key: None,
                 did: Did::failed(format!("node {id} was run with no work")),
-                peak: None,
+                measure: None,
                 group: None,
             });
             return;
         };
-        let live =
-            Live { id, request: entry.request, kind: entry.kind, critical, work: entry.work.clone() };
+        let (request, kind, key, work) = (entry.request, entry.kind, entry.key, entry.work.clone());
+        let live = Live { id, request, kind, key, critical, work };
         let run = self.table.take(self.ctx, live);
         match pool {
             Pool::Work => post(self.ctx, near, critical, run),
@@ -843,22 +864,25 @@ unsafe fn run_pooled(header: NonNull<Header>) {
     let result = catch_unwind(AssertUnwindSafe(|| measured(run.live())));
     let group = pool::group();
     match result {
-        Ok((Ok(did), peak)) => run.done(did, Some(peak), group),
+        Ok((Ok(did), measure)) => run.done(did, Some(measure), group),
         Ok((Err(Cancelled), _)) => post(ctx, group, critical, run),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, group),
     }
 }
 
-/// `live`'s work in this thread's task arena, reset when it ends, and the peak it held.
-fn measured(live: &Live) -> (Result<Did, Cancelled>, u64) {
-    arena::measure(|| arena::task(|| (live.work)()))
+/// `live`'s work in this thread's task arena, reset when it ends, the peak it held and the
+/// time it took.
+fn measured(live: &Live) -> (Result<Did, Cancelled>, Measure) {
+    let start = Instant::now();
+    let (did, peak) = arena::measure(|| arena::task(|| (live.work)()));
+    (did, Measure { peak, ran_ns: ns(start) })
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
 /// while its work gives way.
 fn run_io(run: Ran) {
     match catch_unwind(AssertUnwindSafe(|| measured(run.live()))) {
-        Ok((Ok(did), peak)) => run.done(did, Some(peak), None),
+        Ok((Ok(did), measure)) => run.done(did, Some(measure), None),
         Ok((Err(Cancelled), _)) => {
             let ctx = run.run().ctx;
             _ = ctx.io.send(Some(run));
@@ -887,7 +911,7 @@ mod tests {
     use super::{Did, Heard, Opened, RUNS, SPARE, Scheduler, Task, Work, Workers, drive};
     use crate::{
         Cancelled, Key,
-        admission::{Estimates, TaskKind},
+        admission::{Estimates, Predict, Prediction, TaskKind},
         arena,
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
@@ -924,6 +948,13 @@ mod tests {
 
     /// A scheduler on a pool of `topology`'s shape, and the pool.
     fn scheduler_on(topology: &Topology) -> ((Scheduler, Db), &'static Workers) {
+        scheduler_with(topology, Box::new(Estimates::default()))
+    }
+
+    fn scheduler_with(
+        topology: &Topology,
+        predict: Box<dyn Predict>,
+    ) -> ((Scheduler, Db), &'static Workers) {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
@@ -932,7 +963,101 @@ mod tests {
             let db = db.clone();
             move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
         };
-        ((Scheduler::with_pool(config, Estimates::default(), Box::new(memo), pool).unwrap(), db), pool)
+        ((Scheduler::with_pool(config, predict, Box::new(memo), pool).unwrap(), db), pool)
+    }
+
+    /// What a [`Recorder`] was asked and told, in order.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Asked {
+        Predict(TaskKind, Option<Key>),
+        Observe { kind: TaskKind, key: Option<Key>, ran_ns: u64 },
+    }
+
+    /// A predictor that keeps what it is asked and told, and predicts `prediction` for all.
+    struct Recorder {
+        asked: Arc<Mutex<Vec<Asked>>>,
+        prediction: Prediction,
+    }
+
+    impl Predict for Recorder {
+        fn predict(&self, kind: TaskKind, key: Option<Key>) -> Prediction {
+            self.asked.lock().unwrap().push(Asked::Predict(kind, key));
+            self.prediction
+        }
+
+        fn observe(&mut self, kind: TaskKind, key: Option<Key>, ran_ns: u64, _peak: u64) {
+            self.asked.lock().unwrap().push(Asked::Observe { kind, key, ran_ns });
+        }
+
+        fn encode(&self) -> Vec<u8> {
+            self.asked.lock().unwrap().len().to_le_bytes().to_vec()
+        }
+    }
+
+    /// The scheduler asks its predictor of each task added and found, with the task's kind and
+    /// key, and tells it the own run time of each run that ended: a task that gave way twice
+    /// is observed once, for the run that finished, not the tries before it. Its estimates are
+    /// the predictor's bytes.
+    #[test]
+    fn the_scheduler_asks_its_predictor_and_teaches_it_each_run() {
+        let asked: Arc<Mutex<Vec<Asked>>> = Arc::default();
+        let recorder = Recorder {
+            asked: asked.clone(),
+            prediction: Prediction { cost: Some(5), peak: 1 << 10 },
+        };
+        let ((scheduler, _), _) = scheduler_with(&Topology::flat(2), Box::new(recorder));
+        let opened = scheduler.open(1, false);
+        let (request, handle) = (opened.request, scheduler.handle());
+        let tries = Arc::new(AtomicU32::new(0));
+        let counted = tries.clone();
+        let slow: Work = Arc::new(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) < 2 {
+                std::thread::sleep(Duration::from_millis(200));
+                return Err(Cancelled);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            Ok(Did::built())
+        });
+        let finder: Work = Arc::new(move || {
+            let found = Task {
+                spec: spec(52, &[51], Pool::Work, Some(9)),
+                kind: TaskKind(3),
+                work: Arc::new(|| Ok(Did::built())),
+            };
+            let added = handle.found(request, vec![found]);
+            Ok(Did { outcome: Outcome::Built, added })
+        });
+        let mut keyed = task(51, &[50], Some(8), finder);
+        keyed.kind = TaskKind(2);
+        scheduler.add(request, vec![task(50, &[], None, slow), keyed]);
+        scheduler.close(request);
+        assert!(finish(&opened).0);
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        let asked = asked.lock().unwrap().clone();
+        let key = |it: u8| Some(Key([it; 32]));
+        let predicted: Vec<_> =
+            asked.iter().filter(|it| matches!(it, Asked::Predict(..))).cloned().collect();
+        assert_eq!(predicted, [
+            Asked::Predict(TaskKind(1), None),
+            Asked::Predict(TaskKind(2), key(8)),
+            Asked::Predict(TaskKind(3), key(9)),
+        ]);
+        let observed: Vec<(TaskKind, Option<Key>, u64)> = asked
+            .iter()
+            .filter_map(|it| match *it {
+                Asked::Observe { kind, key, ran_ns } => Some((kind, key, ran_ns)),
+                Asked::Predict(..) => None,
+            })
+            .collect();
+        let kinds: Vec<_> = observed.iter().map(|&(kind, key, _)| (kind, key)).collect();
+        assert_eq!(kinds, [(TaskKind(1), None), (TaskKind(2), key(8)), (TaskKind(3), key(9))]);
+        let slow_ns = observed[0].2;
+        assert!(
+            (5_000_000..200_000_000).contains(&slow_ns),
+            "the run that finished took {slow_ns} ns, not the tries that gave way"
+        );
+        assert_eq!(scheduler.estimates(), 6usize.to_le_bytes());
     }
 
     /// A chain of five tasks on a machine of P and E cores: each, the only work of its request
@@ -1172,7 +1297,7 @@ mod tests {
             Event::Moved { id: 7, state: NodeState::Built }
         )));
         // Measured once: the tries that gave way taught nothing.
-        let estimates = scheduler.estimates();
+        let estimates = Estimates::decode(&scheduler.estimates()).unwrap();
         assert_eq!(estimates.by_kind.get(&TaskKind(1)).map(|it| it.seen), Some(1));
     }
 

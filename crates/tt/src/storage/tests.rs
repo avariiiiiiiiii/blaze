@@ -126,7 +126,7 @@ impl Gen {
                 let len = self.rng.below(40) as usize;
                 let text: String =
                     (0..len).map(|_| char::from(b'a' + self.rng.below(26) as u8)).collect();
-                let suffix_len = self.rng.below(len.min(30) as u64 + 1) as u8;
+                let suffix_len = self.rng.below(len.min(30) as u64 + 1) as u32;
                 Leaf::Literal(Literal { text_and_suffix: Symbol::intern(&text), span, kind, suffix_len })
             }
         }
@@ -436,6 +436,24 @@ fn spans_too_wide_to_pack_and_more_parts_than_fit() {
     let tree = check(&tokens, &mut Rng(5));
     assert!(tree.parts.len() > NARROW_LIMIT as usize);
     assert!(!tree.wide.is_empty());
+}
+
+#[test]
+fn a_literal_keeps_a_suffix_of_any_length_a_node_holds() {
+    let ctx = SyntaxContext::root(Edition::Edition2021);
+    let span = Span { range: TextRange::empty(TextSize::new(0)), anchor: anchor(0, 0), ctx };
+    let mut tokens = vec![TokenTree::Subtree(Subtree {
+        delimiter: Delimiter { open: span, close: span, kind: DelimiterKind::Invisible },
+        len: 4,
+    })];
+    for len in [255, 256, 70_000, MAX_SUFFIX as usize] {
+        let suffix = "s".repeat(len);
+        let literal = token_to_literal(&format!("1{suffix}"), span);
+        assert_eq!((literal.text(), literal.suffix().len()), ("1", len));
+        assert_eq!(Literal::new("ab", span, LitKind::Str, &suffix).suffix(), suffix);
+        tokens.push(TokenTree::Leaf(Leaf::Literal(literal)));
+    }
+    check(&tokens, &mut Rng(9));
 }
 
 #[test]

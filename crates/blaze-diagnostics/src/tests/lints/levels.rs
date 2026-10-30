@@ -911,4 +911,9 @@ fn command_line_errors() {
     assert_eq!(parse(&["--cap-lints", "loud"]), Err("unknown lint level: `loud`".to_owned()));
     assert_eq!(parse(&["-D"]), Err("Argument to option 'D' missing".to_owned()));
     assert_eq!(parse(&["--allow"]), Err("Argument to option 'allow' missing".to_owned()));
+    assert_eq!(
+        parse(&["--cfg", "unix", "-Awarnings", "--cfg=feature=\"std\"", "--cfgx"]).map(|it| it.cfg),
+        Ok(vec!["unix".to_owned(), "feature=\"std\"".to_owned()])
+    );
+    assert_eq!(parse(&["--cfg"]), Err("Argument to option 'cfg' missing".to_owned()));
 }

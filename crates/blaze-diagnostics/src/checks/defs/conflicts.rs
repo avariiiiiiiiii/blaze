@@ -11,6 +11,7 @@
 
 use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use blaze_items::ItemId;
 use cfg::CfgExpr;
 use either::Either;
@@ -390,7 +391,10 @@ fn module_scope(cx: &Cx<'_, '_>, module: hir::Module) -> Scope {
         true => (0, it.range.value.start()),
         false => (1, TextSize::from(0)),
     };
-    defs.sort_by_key(order);
+    radix::sort_by_key(&mut defs, |it| {
+        let (tier, at) = order(it);
+        radix::pack_32(tier, u32::from(at))
+    });
     for decl in module.use_decls(db) {
         let source = decl.source(db);
         defs.extend(import_bindings(cx, cx.node(source.as_ref().map(AstPtr::new))));

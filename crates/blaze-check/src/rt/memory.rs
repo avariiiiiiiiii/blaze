@@ -5,7 +5,10 @@
 //! `UnsafeCell`, and each atomic's non-atomic accesses (`get_mut`, `into_inner`), keeps its last
 //! write and each thread's last read, checked against the accessing thread's clock.
 
-use std::{collections::VecDeque, sync::atomic::Ordering};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::atomic::Ordering,
+};
 
 use super::{At, Object, Runtime};
 use crate::clock::{Clock, MAX_THREADS, Stamp, Tid};
@@ -58,6 +61,7 @@ pub(crate) struct Atomic {
     pub(crate) dirty: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Cell {
     write: Stamp,
     write_at: Option<At>,
@@ -346,42 +350,180 @@ impl Runtime {
     pub(crate) fn cell_read(&mut self, obj: u32, at: At) -> Result<(), String> {
         let thread = self.tick();
         let clock = self.threads[thread].clock;
-        let cell = self.cell_mut(obj);
-        if !cell.write.before(&clock) {
-            return Err(format!(
-                "data race on an `UnsafeCell`: a read at {at} by thread {thread} races with the \
-                 write at {} by thread {}",
-                place(cell.write_at),
-                cell.write.thread
-            ));
-        }
-        cell.reads.set(thread, clock.get(thread));
-        cell.reads_at[thread] = Some(at);
-        Ok(())
+        self.cell_mut(obj).read(thread, &clock, at, &|| "an `UnsafeCell`".to_owned())
     }
 
     /// A write of an `UnsafeCell`: the last write and every read must happen before it.
     pub(crate) fn cell_write(&mut self, obj: u32, at: At) -> Result<(), String> {
         let thread = self.tick();
         let clock = self.threads[thread].clock;
-        let cell = self.cell_mut(obj);
-        if !cell.write.before(&clock) {
-            return Err(format!(
-                "data race on an `UnsafeCell`: a write at {at} by thread {thread} races with the \
-                 write at {} by thread {}",
-                place(cell.write_at),
-                cell.write.thread
-            ));
+        self.cell_mut(obj).write(thread, &clock, at, &|| "an `UnsafeCell`".to_owned())
+    }
+
+    /// A non-atomic access of the bytes `addr..addr + len` (`cell::read`, `write`, `free`),
+    /// checked as a cell's against every span of them, to the byte.
+    pub(crate) fn bytes_access(&mut self, addr: usize, len: usize, at: At, kind: Bytes) -> Result<(), String> {
+        let Some(end) = addr.checked_add(len) else {
+            return Err(format!("`cell::{kind:?}` at {at} of {len} bytes at {addr:#x} wraps the address space"));
+        };
+        if len == 0 {
+            return Ok(());
         }
-        if let Some(other) = clock.behind(&cell.reads) {
-            return Err(format!(
-                "data race on an `UnsafeCell`: a write at {at} by thread {thread} races with the \
-                 read at {} by thread {other}",
-                place(cell.reads_at[other])
-            ));
+        let thread = self.tick();
+        let clock = self.threads[thread].clock;
+        self.bytes.split(addr);
+        self.bytes.split(end);
+        for (&start, span) in self.bytes.spans.range_mut(addr..end) {
+            let what = || format!("the bytes at {start:#x}..{:#x}", span.end);
+            if span.freed {
+                let found = match kind {
+                    Bytes::Read => "use after free: a read",
+                    Bytes::Free => "double free: a free",
+                    Bytes::Write => continue,
+                };
+                return Err(format!(
+                    "{found} at {at} by thread {thread} of {} freed at {} by thread {}",
+                    what(),
+                    place(span.shadow.write_at),
+                    span.shadow.write.thread
+                ));
+            }
+            match kind {
+                Bytes::Read => span.shadow.read(thread, &clock, at, &what)?,
+                Bytes::Write | Bytes::Free => span.shadow.write(thread, &clock, at, &what)?,
+            }
         }
-        cell.write = Stamp { thread: thread as u8, at: clock.get(thread) };
-        cell.write_at = Some(at);
+        match kind {
+            Bytes::Read => self.bytes.fill(addr, end, thread, &clock, at),
+            // A write over freed bytes is a new allocation there: the allocator that reused them
+            // ordered it after the free, out of the model's sight.
+            Bytes::Write | Bytes::Free => {
+                let mut shadow = Cell::new();
+                shadow.write = Stamp { thread: thread as u8, at: clock.get(thread) };
+                shadow.write_at = Some(at);
+                self.bytes.replace(addr, end, Span { end, shadow, freed: kind == Bytes::Free });
+            }
+        }
         Ok(())
+    }
+}
+
+impl Cell {
+    fn read(&mut self, thread: Tid, clock: &Clock, at: At, what: &dyn Fn() -> String) -> Result<(), String> {
+        if !self.write.before(clock) {
+            return Err(format!(
+                "data race on {}: a read at {at} by thread {thread} races with the write at {} by \
+                 thread {}",
+                what(),
+                place(self.write_at),
+                self.write.thread
+            ));
+        }
+        self.reads.set(thread, clock.get(thread));
+        self.reads_at[thread] = Some(at);
+        Ok(())
+    }
+
+    fn write(&mut self, thread: Tid, clock: &Clock, at: At, what: &dyn Fn() -> String) -> Result<(), String> {
+        if !self.write.before(clock) {
+            return Err(format!(
+                "data race on {}: a write at {at} by thread {thread} races with the write at {} by \
+                 thread {}",
+                what(),
+                place(self.write_at),
+                self.write.thread
+            ));
+        }
+        if let Some(other) = clock.behind(&self.reads) {
+            return Err(format!(
+                "data race on {}: a write at {at} by thread {thread} races with the read at {} by \
+                 thread {other}",
+                what(),
+                place(self.reads_at[other])
+            ));
+        }
+        self.write = Stamp { thread: thread as u8, at: clock.get(thread) };
+        self.write_at = Some(at);
+        Ok(())
+    }
+}
+
+/// What a `cell::read`, `write` or `free` of raw bytes does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Bytes {
+    Read,
+    Write,
+    Free,
+}
+
+/// A run of bytes with one shadow: every byte in it was last written, and read by each thread,
+/// at the same events.
+#[derive(Clone)]
+pub(crate) struct Span {
+    end: usize,
+    shadow: Cell,
+    /// Freed by `cell::free`: a read is a use after free, a write a new allocation.
+    freed: bool,
+}
+
+/// The tracked raw bytes of an execution, as runs keyed by their first address: a write of a
+/// whole buffer is one entry, and a run is split only where accesses differ (an interval map,
+/// where a shadow per byte or per 8-byte granule would cost a hash entry each, or race falsely
+/// across a published boundary inside a granule).
+#[derive(Default)]
+pub(crate) struct ByteMap {
+    spans: BTreeMap<usize, Span>,
+    /// The runs of one access, reused.
+    scratch: Vec<(usize, usize)>,
+}
+
+impl ByteMap {
+    pub(crate) fn clear(&mut self) {
+        self.spans.clear();
+    }
+
+    /// Makes `at` a boundary between runs, if a run covers it.
+    fn split(&mut self, at: usize) {
+        let Some((_, span)) = self.spans.range_mut(..at).next_back() else { return };
+        if span.end <= at {
+            return;
+        }
+        let right = span.clone();
+        span.end = at;
+        self.spans.insert(at, right);
+    }
+
+    /// Puts one run over `start..end`, whose edges are boundaries.
+    fn replace(&mut self, start: usize, end: usize, span: Span) {
+        self.scratch.clear();
+        self.scratch.extend(self.spans.range(start..end).map(|(&at, _)| (at, 0)));
+        for &(at, _) in &self.scratch {
+            self.spans.remove(&at);
+        }
+        debug_assert_eq!(span.end, end);
+        self.spans.insert(start, span);
+    }
+
+    /// Records a read by `thread` over `start..end`, whose edges are boundaries: never-written
+    /// gaps get runs of their own first (an initial value happens before everything).
+    fn fill(&mut self, start: usize, end: usize, thread: Tid, clock: &Clock, at: At) {
+        self.scratch.clear();
+        let mut cursor = start;
+        for (&from, span) in self.spans.range(start..end) {
+            if from > cursor {
+                self.scratch.push((cursor, from));
+            }
+            cursor = span.end;
+        }
+        if cursor < end {
+            self.scratch.push((cursor, end));
+        }
+        for &(from, to) in &self.scratch {
+            self.spans.insert(from, Span { end: to, shadow: Cell::new(), freed: false });
+        }
+        for span in self.spans.range_mut(start..end).map(|(_, span)| span) {
+            span.shadow.reads.set(thread, clock.get(thread));
+            span.shadow.reads_at[thread] = Some(at);
+        }
     }
 }

@@ -13,8 +13,11 @@
 //!   is the snapshot a query keeps, so a later query runs blaze-manifest again over exactly those
 //!   files, and a `Cargo.toml` kept in its canonical form makes a comment edit cut off.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 use std::path::{Component, Path};
 use std::rc::Rc;
 
@@ -23,13 +26,14 @@ use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use blaze_format::SchemaHash;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Deserializer, Visitor};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::invocation::Invocation;
 use crate::query::{Cbor, Mount, Origin, Versioned, key_input, producer};
 
 /// What a path is.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Found<T> {
     /// Under no mount of the view: not fetched yet.
     Unmounted,
@@ -37,19 +41,102 @@ pub(crate) enum Found<T> {
     Here(T),
 }
 
-impl Versioned for Found<Vec<u8>> {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo found file 1");
+/// [`Found`] as written: a file's bytes are one CBOR byte string, not an array of integers.
+#[derive(Serialize, Deserialize)]
+enum Written<T> {
+    Unmounted,
+    Absent,
+    Here(T),
 }
 
-impl Versioned for Found<Vec<(String, bool)>> {
+impl<T> Found<T> {
+    fn written<'a, W>(&'a self, how: impl FnOnce(&'a T) -> W) -> Written<W> {
+        match self {
+            Found::Unmounted => Written::Unmounted,
+            Found::Absent => Written::Absent,
+            Found::Here(it) => Written::Here(how(it)),
+        }
+    }
+
+    fn read<W>(written: Written<W>, how: impl FnOnce(W) -> T) -> Found<T> {
+        match written {
+            Written::Unmounted => Found::Unmounted,
+            Written::Absent => Found::Absent,
+            Written::Here(it) => Found::Here(how(it)),
+        }
+    }
+}
+
+impl Serialize for Found<Vec<u8>> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        self.written(|bytes| Raw(Cow::Borrowed(bytes))).serialize(to)
+    }
+}
+
+impl<'de> Deserialize<'de> for Found<Vec<u8>> {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Self, D::Error> {
+        Ok(Found::read(Written::<Raw<'de>>::deserialize(from)?, |raw| raw.0.into_owned()))
+    }
+}
+
+impl Serialize for Found<Names> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        self.written(|names| names).serialize(to)
+    }
+}
+
+impl<'de> Deserialize<'de> for Found<Names> {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Self, D::Error> {
+        Ok(Found::read(Written::<Names>::deserialize(from)?, |names| names))
+    }
+}
+
+/// Bytes written as one CBOR byte string and read in place where the decoder can.
+pub(crate) struct Raw<'a>(pub Cow<'a, [u8]>);
+
+impl Serialize for Raw<'_> {
+    fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
+        to.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Raw<'a> {
+    fn deserialize<D: Deserializer<'de>>(from: D) -> Result<Self, D::Error> {
+        struct Bytes<'a>(PhantomData<&'a ()>);
+        impl<'de: 'a, 'a> Visitor<'de> for Bytes<'a> {
+            type Value = Raw<'a>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a byte string")
+            }
+            fn visit_borrowed_bytes<E: de::Error>(self, bytes: &'de [u8]) -> Result<Raw<'a>, E> {
+                Ok(Raw(Cow::Borrowed(bytes)))
+            }
+            fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> Result<Raw<'a>, E> {
+                Ok(Raw(Cow::Owned(bytes.to_vec())))
+            }
+            fn visit_byte_buf<E: de::Error>(self, bytes: Vec<u8>) -> Result<Raw<'a>, E> {
+                Ok(Raw(Cow::Owned(bytes)))
+            }
+        }
+        from.deserialize_bytes(Bytes(PhantomData))
+    }
+}
+
+impl Versioned for Found<Vec<u8>> {
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo found file 2");
+}
+
+impl Versioned for Found<Names> {
     const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo found dir 1");
 }
 
-/// Where every directory cargo names is, and what the client sent of the rest.
+/// Where every directory cargo names is, and what the client sent of the rest. `mounts` and
+/// `outside` are sorted by path, so a lookup is a binary search per ancestor.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct MountTable {
     pub mounts: Vec<Mount>,
     /// The files outside every mount the client sent, by absolute path.
+    #[serde(with = "outside_bytes")]
     pub outside: Vec<(String, Vec<u8>)>,
     /// The directories outside every mount whose files cargo looks for (the view's and the
     /// cwd's ancestors, `$CARGO_HOME`): a file of one the client did not send is absent.
@@ -57,7 +144,58 @@ pub(crate) struct MountTable {
 }
 
 impl Versioned for MountTable {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo mount table 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo mount table 2");
+}
+
+mod outside_bytes {
+    use std::borrow::Cow;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::Raw;
+
+    pub fn serialize<S: Serializer>(files: &[(String, Vec<u8>)], to: S) -> Result<S::Ok, S::Error> {
+        to.collect_seq(files.iter().map(|(at, bytes)| (at, Raw(Cow::Borrowed(bytes)))))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<Vec<(String, Vec<u8>)>, D::Error> {
+        let files = Vec::<(String, Raw<'de>)>::deserialize(from)?;
+        Ok(files.into_iter().map(|(at, raw)| (at, raw.0.into_owned())).collect())
+    }
+}
+
+/// A [`MountTable`] read where its bytes lie: what a file read looks its path up in, with
+/// nothing of the table copied.
+#[derive(Deserialize)]
+struct TableRef<'a> {
+    #[serde(borrow)]
+    mounts: Vec<MountRef<'a>>,
+    #[serde(borrow)]
+    outside: Vec<(&'a str, Raw<'a>)>,
+    #[serde(borrow)]
+    known: Vec<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct MountRef<'a> {
+    at: &'a str,
+    origin: Origin,
+    under: &'a str,
+}
+
+impl<'a> TableRef<'a> {
+    fn of(table: &'a MountTable) -> TableRef<'a> {
+        TableRef {
+            mounts: table.mounts.iter().map(|it| MountRef { at: &it.at, origin: it.origin, under: &it.under }).collect(),
+            outside: table.outside.iter().map(|(at, bytes)| (at.as_str(), Raw(Cow::Borrowed(bytes.as_slice())))).collect(),
+            known: table.known.iter().map(String::as_str).collect(),
+        }
+    }
+
+    fn view(bytes: &'a [u8]) -> TableRef<'a> {
+        blaze_protocol::cbor::from_slice(bytes)
+            .unwrap_or_else(|error| panic!("a kept mount table does not decode: {error}"))
+    }
 }
 
 /// The view's [`MountTable`]: of the invocation, the mounts alone, so a change to the command
@@ -96,12 +234,12 @@ impl Query for LoadFile {
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
-        let table = cx.get::<Mounts>(&())?.get();
-        Ok(Cbor(file_through(cx, &table, path, true)?))
+        let table = cx.get::<Mounts>(&())?.bytes();
+        Ok(Cbor(file_through(cx, &TableRef::view(table), path, true)?))
     }
 }
 
-fn file_through(cx: &mut Cx<'_>, table: &MountTable, path: &str, view: bool) -> Result<Found<Vec<u8>>, Cancelled> {
+fn file_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -> Result<Found<Vec<u8>>, Cancelled> {
     Ok(match locate(&table.mounts, path) {
         Some((Origin::View, under)) if view => match cx.file(&under)? {
             Some(file) => Found::Here(file.bytes.to_vec()),
@@ -112,10 +250,10 @@ fn file_through(cx: &mut Cx<'_>, table: &MountTable, path: &str, view: bool) -> 
             Some(file) => Found::Here(file.bytes.to_vec()),
             None => Found::Absent,
         },
-        None => match table.outside.iter().find(|(at, _)| at == path) {
-            Some((_, bytes)) => Found::Here(bytes.clone()),
-            None if known_file(&table.known, path) => Found::Absent,
-            None => Found::Unmounted,
+        None => match table.outside.binary_search_by(|(at, _)| (*at).cmp(path)) {
+            Ok(at) => Found::Here(table.outside[at].1.0.to_vec()),
+            Err(_) if known_file(&table.known, path) => Found::Absent,
+            Err(_) => Found::Unmounted,
         },
     })
 }
@@ -135,51 +273,60 @@ impl Query for LoadDir {
     }
 
     fn execute(cx: &mut Cx<'_>, path: &String) -> Result<Cbor<Found<Vec<(String, bool)>>>, Cancelled> {
-        let table = cx.get::<Mounts>(&())?.get();
-        Ok(Cbor(dir_through(cx, &table, path, true)?))
+        let table = cx.get::<Mounts>(&())?.bytes();
+        Ok(Cbor(dir_through(cx, &TableRef::view(table), path, true)?))
     }
 }
 
 type Names = Vec<(String, bool)>;
 
-fn dir_through(cx: &mut Cx<'_>, table: &MountTable, path: &str, view: bool) -> Result<Found<Names>, Cancelled> {
+/// A listing sorted by name, so [`Snap::kind`] finds a name by binary search; the tree's are
+/// already, which the sort sees in one pass.
+fn sorted(names: &[(String, bool)]) -> Found<Names> {
+    let mut names = names.to_vec();
+    names.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    Found::Here(names)
+}
+
+fn dir_through(cx: &mut Cx<'_>, table: &TableRef<'_>, path: &str, view: bool) -> Result<Found<Names>, Cancelled> {
     Ok(match locate(&table.mounts, path) {
         Some((Origin::View, under)) if view => match cx.dir(&under)? {
-            Some(names) => Found::Here(names.to_vec()),
+            Some(names) => sorted(names),
             None => Found::Absent,
         },
         Some((Origin::View, _)) => Found::Unmounted,
         Some((Origin::Root(root), under)) => match cx.dir_at(root, &under)? {
-            Some(names) => Found::Here(names.to_vec()),
+            Some(names) => sorted(names),
             None => Found::Absent,
         },
-        None if table.known.iter().any(|it| it == path) => {
-            let prefix = if path == "/" { "/".to_owned() } else { format!("{path}/") };
-            let mut names: FxHashMap<String, bool> = FxHashMap::default();
-            for mount in &table.mounts {
-                let Some(rest) = mount.at.strip_prefix(&prefix) else { continue };
+        None if table.known.binary_search(&path).is_ok() => {
+            let prefix: Cow<'_, str> = if path == "/" { Cow::Borrowed("/") } else { Cow::Owned(format!("{path}/")) };
+            let mut names: FxHashMap<&str, bool> = FxHashMap::default();
+            let first = table.mounts.partition_point(|it| it.at < &*prefix);
+            for mount in table.mounts[first..].iter().take_while(|it| it.at.starts_with(&*prefix)) {
+                let rest = &mount.at[prefix.len()..];
                 match rest.split_once('/') {
-                    Some((first, _)) => names.insert(first.to_owned(), true),
+                    Some((first, _)) => names.insert(first, true),
                     // A mount of one file (a sparse index's) is a file of the directory.
                     None => {
                         let dir = match mount.origin {
-                            Origin::View if view => cx.file(&mount.under)?.is_none(),
+                            Origin::View if view => cx.file(mount.under)?.is_none(),
                             Origin::View => continue,
-                            Origin::Root(root) => cx.file_at(root, &mount.under)?.is_none(),
+                            Origin::Root(root) => cx.file_at(root, mount.under)?.is_none(),
                         };
-                        names.insert(rest.to_owned(), dir)
+                        names.insert(rest, dir)
                     }
                 };
             }
-            for (at, _) in &table.outside {
-                if let Some(rest) = at.strip_prefix(&prefix) {
-                    match rest.split_once('/') {
-                        Some((dir, _)) => names.insert(dir.to_owned(), true),
-                        None => names.insert(rest.to_owned(), false),
-                    };
-                }
+            let first = table.outside.partition_point(|(at, _)| *at < &*prefix);
+            for (at, _) in table.outside[first..].iter().take_while(|(at, _)| at.starts_with(&*prefix)) {
+                let rest = &at[prefix.len()..];
+                match rest.split_once('/') {
+                    Some((dir, _)) => names.insert(dir, true),
+                    None => names.insert(rest, false),
+                };
             }
-            let mut names: Names = names.into_iter().collect();
+            let mut names: Names = names.into_iter().map(|(name, dir)| (name.to_owned(), dir)).collect();
             names.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
             Found::Here(names)
         }

@@ -1084,17 +1084,52 @@ aarch64.neon.facgt.i32.f16: facgt h0, h1, h2 [\"neon\", \"fp16\"]
         let shorts = Lanes { count: 4, bits: 16, float: false };
         let singles = Lanes::floats(32, 4);
         let text = |op, r, a, signed| half_vector(op, r, a, signed).map(|it| it.text);
-        assert_eq!(text("simd_div", halves, halves, true).unwrap(), "fdiv v0.4h, v1.4h, v2.4h");
-        assert_eq!(text("simd_lt", shorts, halves, true).unwrap(), "fcmgt v0.4h, v2.4h, v1.4h");
+        assert_eq!(text(SimdOp::Div, halves, halves, true).unwrap(), "fdiv v0.4h, v1.4h, v2.4h");
+        assert_eq!(text(SimdOp::Lt, shorts, halves, true).unwrap(), "fcmgt v0.4h, v2.4h, v1.4h");
         assert_eq!(
-            text("simd_fma", Lanes::floats(16, 8), Lanes::floats(16, 8), true).unwrap(),
+            text(SimdOp::Fma, Lanes::floats(16, 8), Lanes::floats(16, 8), true).unwrap(),
             "mov v0.16b, v3.16b\nfmla v0.8h, v2.8h, v1.8h"
         );
-        assert_eq!(text("simd_cast", halves, singles, true).unwrap(), "fcvtn v0.4h, v1.4s");
-        assert_eq!(text("simd_cast", halves, shorts, false).unwrap(), "ucvtf v0.4h, v1.4h");
-        assert_eq!(text("simd_cast", shorts, halves, true).unwrap(), "fcvtzs v0.4h, v1.4h");
-        assert_eq!(text("simd_cast", Lanes::floats(16, 8), Lanes::floats(32, 8), true), None);
-        assert_eq!(text("simd_ne", shorts, halves, true), None);
+        assert_eq!(text(SimdOp::Cast, halves, singles, true).unwrap(), "fcvtn v0.4h, v1.4s");
+        assert_eq!(text(SimdOp::Cast, halves, shorts, false).unwrap(), "ucvtf v0.4h, v1.4h");
+        assert_eq!(text(SimdOp::Cast, shorts, halves, true).unwrap(), "fcvtzs v0.4h, v1.4h");
+        assert_eq!(text(SimdOp::Cast, Lanes::floats(16, 8), Lanes::floats(32, 8), true), None);
+        assert_eq!(text(SimdOp::Ne, shorts, halves, true), None);
+        assert_eq!(text(SimdOp::As, halves, singles, true), None);
+    }
+
+    /// Every name the table of [`half_vector`] took as a string is the `SimdOp` it takes now,
+    /// and lowers to the same instruction.
+    #[test]
+    fn every_old_name_of_a_half_vector_is_still_admitted() {
+        use hir_ty::intrinsic::Intrinsic;
+        let halves = Lanes::floats(16, 4);
+        let shorts = Lanes { count: 4, bits: 16, float: false };
+        for (name, r, a, expected) in [
+            ("simd_add", halves, halves, "fadd v0.4h, v1.4h, v2.4h"),
+            ("simd_sub", halves, halves, "fsub v0.4h, v1.4h, v2.4h"),
+            ("simd_mul", halves, halves, "fmul v0.4h, v1.4h, v2.4h"),
+            ("simd_div", halves, halves, "fdiv v0.4h, v1.4h, v2.4h"),
+            ("simd_eq", shorts, halves, "fcmeq v0.4h, v1.4h, v2.4h"),
+            ("simd_ge", shorts, halves, "fcmge v0.4h, v1.4h, v2.4h"),
+            ("simd_gt", shorts, halves, "fcmgt v0.4h, v1.4h, v2.4h"),
+            ("simd_le", shorts, halves, "fcmge v0.4h, v2.4h, v1.4h"),
+            ("simd_lt", shorts, halves, "fcmgt v0.4h, v2.4h, v1.4h"),
+            ("simd_neg", halves, halves, "fneg"),
+            ("simd_fabs", halves, halves, "fabs"),
+            ("simd_fsqrt", halves, halves, "fsqrt"),
+            ("simd_floor", halves, halves, "frintm"),
+            ("simd_ceil", halves, halves, "frintp"),
+            ("simd_fma", halves, halves, "mov v0.16b, v3.16b\nfmla"),
+            ("simd_cast", shorts, halves, "fcvtzs"),
+        ] {
+            let Some(Intrinsic::Simd(op)) = Intrinsic::from_symbol(&intern::Symbol::intern(name))
+            else {
+                panic!("{name} is no `simd_*` intrinsic");
+            };
+            let lowered = half_vector(op, r, a, true).unwrap_or_else(|| panic!("{name}"));
+            assert!(lowered.text.starts_with(expected), "{name}: {}", lowered.text);
+        }
     }
 
     /// Each lane of each of NEON's fused multiply-adds is what LLVM's instruction for it

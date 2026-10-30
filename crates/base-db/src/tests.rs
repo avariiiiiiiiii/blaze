@@ -11,7 +11,7 @@ use vfs::{
 };
 
 use crate::{
-    ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
+    BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateWorkspaceData, CratesMap, DependencyBuilder, Env, FileSourceRootInput, FileText, Files,
     Nonce, SourceDatabase, SourceRoot, SourceRootId, SourceRootInput, TargetKind, ViewChange,
     ViewError, ViewFile, ViewRoot, all_crates_content, cfg_options_content,
@@ -19,7 +19,6 @@ use crate::{
 };
 
 #[salsa::db]
-#[derive(Clone)]
 struct TestDb {
     storage: salsa::Storage<Self>,
     files: Arc<Files>,
@@ -287,6 +286,32 @@ fn a_dependencys_change_changes_its_dependents_ids() {
 
     b.set_env(&mut db, Env::default());
     assert_eq!(ids(&db), before);
+}
+
+#[test]
+fn a_dependency_added_outside_the_prelude_says_so() {
+    let mut db = TestDb::new();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let b = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    let crates = graph.set_in_db(&mut db);
+    let (a, b): (Crate, Crate) = (crates[&a], crates[&b]);
+    let name = CrateName::new("b").unwrap();
+    let depend_on = |db: &mut TestDb, dependency: BuiltDependency| {
+        let mut data = a.data(&*db).clone();
+        data.dependencies = vec![dependency];
+        a.set_data(db, data);
+        a.content(&*db)
+    };
+
+    let in_prelude = depend_on(&mut db, BuiltDependency::new(name.clone(), b));
+    let outside = depend_on(&mut db, BuiltDependency::with_prelude(name.clone(), b, false, true));
+    let dependency = &a.data(&db).dependencies[0];
+    assert!(!dependency.is_prelude());
+    assert!(dependency.is_sysroot());
+    assert_ne!(outside, in_prelude);
+    assert_eq!(depend_on(&mut db, BuiltDependency::with_prelude(name, b, true, false)), in_prelude);
 }
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.

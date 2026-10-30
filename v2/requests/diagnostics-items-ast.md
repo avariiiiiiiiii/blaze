@@ -8,6 +8,7 @@ rustc's validator walks to their node (an item's own checks, then what is in it;
 given on leaving an `impl Trait` after what is in it), the order the early lints already use.
 
 > for: diagnostics-items (owner of `lints/syntax.rs`: diagnostics-lints-syntax-early).
+> forwarded to diagnostics: between its own children.
 
 ## diagnostics-items-ast: rustc's pretty printer reachable as `crate::lints::syntax::pretty`
 
@@ -32,6 +33,7 @@ printer prints them. One printer, not a second copy.
 
 > for: diagnostics-items (owner of `lints/syntax/early/validation/pretty.rs`:
 > diagnostics-lints-syntax-early).
+> forwarded to diagnostics: between its own children.
 
 ## diagnostics-items-ast: the order of the AST validation errors hir gives
 
@@ -54,6 +56,7 @@ Two ways, the first preferred:
    of hir and of `checks::ast_validation` by `Walk::place`.
 
 > for: diagnostics-items (owners of `lower/` and `check.rs`).
+> forwarded to diagnostics: between its own children.
 
 ## diagnostics-items-ast: no second E0197 or E0449 or "at least one trait"
 
@@ -71,6 +74,7 @@ What:
 Why: no error twice.
 
 > for: diagnostics-items (owners of `lower/`).
+> forwarded to diagnostics: between its own children.
 
 ## diagnostics-items-ast: `missing_abi` in a future edition
 
@@ -80,3 +84,4 @@ blaze's `Edition` has no future edition, so `lints/syntax/early/validation.rs`' 
 is right as it is; when one is added, that error is the validator's and belongs here.
 
 > for: diagnostics-items (note).
+> forwarded to diagnostics: between its own children.

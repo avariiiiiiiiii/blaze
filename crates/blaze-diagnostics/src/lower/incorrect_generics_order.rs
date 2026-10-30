@@ -9,6 +9,7 @@
 //! (`GenericParamDefKind::descr`) and `compiler/rustc_ast/src/ast.rs` (`ParamKindOrd`) (MIT or
 //! Apache-2.0).
 
+use blaze_ids::radix;
 use either::Either;
 use hir::{GenericArgKind, GenericDef, HasSource as _, InFile, ModuleDef, PathResolution};
 use syntax::{
@@ -175,7 +176,7 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
                 _ => {
                     let mut present: Vec<(u8, &Param)> =
                         params.iter().map(|it| (kind_ord(it.kind), it)).collect();
-                    present.sort_by_key(|(ord, _)| *ord);
+                    radix::sort_by_key(&mut present, |(ord, _)| *ord);
                     let mut ords: Vec<u8> = present.iter().map(|(ord, _)| *ord).collect();
                     ords.dedup();
                     let help = format!(

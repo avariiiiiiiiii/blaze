@@ -570,3 +570,29 @@ wrapper of what is private now). The targets go through `Wasm::at`, `Session::ex
   module a fuzz run loads, nor writes machine code beside a file.
 
 > forwarded to usercode: `crates/blaze-macro-wasm/` is lane usercode's.
+
+## From safety-fuzz-usercode (2026-10-29): `elide` allocates the square of a script's size
+
+What: `crates/blaze-build-script/src/elide.rs`, `format`. A placeholder `{N}` may name one
+argument any number of times, so a root file of n bytes can elide to about n²/12 bytes, all
+built in the daemon (outside any sandbox) before `directives_only` judges it. A 9 KB script
+(`println!("cargo:warning={0}{0}…")` with 2000 `{0}` and a 3000-byte argument) makes a 6 MB
+`String`; a 1 MB `build.rs` in a dependency would ask for about 80 GB and abort the daemon.
+Running such a script is fine (its output is bounded by the sandbox); reading it is not.
+
+Fix: in `format` (and so `printed`), give `None` (the script is run, as for any form not read)
+once `out.len()` plus what is about to be pushed passes a bound linear in the source, checked
+before each `push_str`: `16 * source.len()` keeps every allocation elision makes under
+`blaze_fuzz::allowed(len)` (1 MiB + 64 bytes per input byte), with room for `String`'s
+doubling. No real script comes near it: every one in `elide/tests.rs`'s census prints less
+than its source.
+
+Input (the root file, as hex: `fuzz/corpus/usercode_script_elide/a-placeholder-reused-past-the-bound.hex`,
+9046 bytes): `fn main() { println!("cargo:warning=` + `{0}` × 2000 + `", "` + `a` × 3000 + `"); }\n`.
+Target `usercode_script_elide` checks `largest_allocation(elide) <= allowed(len)`, so its seeds
+test fails on that file until this is fixed.
+
+Why: docs/v2/plan/design/unsafe.md "Done when" (every parser of untrusted bytes is bounded);
+the daemon must not be taken down by a dependency's source.
+
+> forwarded to usercode: its own crate.

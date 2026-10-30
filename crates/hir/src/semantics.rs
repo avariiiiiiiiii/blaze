@@ -40,7 +40,7 @@ use hir_ide::{
         format_proof_tree::{ProofTreeData, dump_proof_tree_structured},
     },
 };
-use intern::{Interned, Symbol, sym};
+use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
@@ -2840,7 +2840,7 @@ impl<'db> SemanticsScope<'db> {
             self.db,
             &self.resolver,
             self.infer_body,
-            &Path::BarePath(Interned::new(ModPath::from_segments(kind, segments))),
+            &Path::BarePath(ModPath::from_segments(kind, segments)),
             HygieneId::ROOT,
             None,
         )

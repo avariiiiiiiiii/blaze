@@ -76,8 +76,8 @@ impl Shape {
         for name in &self.env {
             if name == ALL_ENV_NAME {
                 let all = inputs.env_all();
-                traced.env.push((ALL_ENV_NAME.into(), Some(trace::names_hash(&all).into())));
-                traced.env.extend(all.into_iter().map(|(name, value)| (name, Some(value))));
+                traced.env.push((ALL_ENV_NAME.into(), Some(trace::names_hash(all).into())));
+                traced.env.extend(all.iter().map(|(name, value)| (name.clone(), Some(value.clone()))));
             } else {
                 traced.env.push((name.clone(), inputs.env(name)));
             }
@@ -200,17 +200,103 @@ fn search<'s, I: Inputs>(
 ) -> Result<Found<'s>, FindError<I::Error>> {
     let mut n = 0;
     loop {
-        let key = slot(run, n);
-        let Some(bytes) = get(&key).map_err(FindError::Corrupt)? else {
+        let at = slot(run, n);
+        let Some(bytes) = get(&at).map_err(FindError::Corrupt)? else {
             return Ok(Found::Miss { shapes: n });
         };
-        let shape = Shape::decode(bytes).map_err(|why| FindError::NotAShape { key, why })?;
-        let traced = shape.values(inputs).map_err(FindError::Inputs)?;
-        let key = result_key(run, &traced);
-        if let Some(value) = get(&key).map_err(FindError::Corrupt)? {
-            return Ok(Found::Hit { traced, key, value });
+        let keyed = keyed(bytes, run, inputs).map_err(|error| match error {
+            Keyed::NotAShape(why) => FindError::NotAShape { key: at, why },
+            Keyed::Inputs(error) => FindError::Inputs(error),
+        })?;
+        if let Some(key) = keyed.map(Key)
+            && let Some(value) = get(&key).map_err(FindError::Corrupt)?
+        {
+            return Ok(Found::Hit { key, value });
         }
         n += 1;
+    }
+}
+
+enum Keyed<E> {
+    NotAShape(String),
+    Inputs(E),
+}
+
+/// The key of the result of `run` that read what the shape `bytes` is, with its inputs as
+/// `inputs` has them now: the shape read in place and each input hashed into the key as it is
+/// asked, so a check builds no [`Traced`] and copies no name. `None` when a directory of the
+/// shape is no longer one: what read it then has no result that read this.
+///
+/// What it hashes is what [`RunKey::traced`] of [`Shape::values`] hashes: the shape is the
+/// normalized order, and the whole environment, sorted as [`Inputs::env_all`] lends it, is
+/// merged into the names the run asked for by the same order.
+fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option<ContentId>, Keyed<I::Error>> {
+    let bad = Keyed::NotAShape;
+    let rest = bytes.strip_prefix(SHAPE_MAGIC.as_slice()).ok_or_else(|| bad("not a shape".to_owned()))?;
+    let mut at = At(rest);
+    let mut keyer = trace::Keyer::new(run);
+    for _ in 0..at.len().map_err(bad)? {
+        let path = at.part().map_err(bad)?;
+        let hash = inputs.file(&trace::path_in(path).map_err(bad)?).map_err(Keyed::Inputs)?;
+        keyer.file(path, hash.as_ref());
+    }
+    for _ in 0..at.len().map_err(bad)? {
+        let bytes = at.part().map_err(bad)?;
+        let path = trace::path_in(bytes).map_err(bad)?;
+        let hash = match trace::walked(&path) {
+            Some((dir, package)) => trace::walk(inputs, dir, package),
+            None => inputs.dir(&path),
+        };
+        match hash.map_err(Keyed::Inputs)? {
+            Some(hash) => keyer.dir(bytes, &hash),
+            None => return Ok(None),
+        }
+    }
+    let names = at.len().map_err(bad)?;
+    let mut asked = At(at.0);
+    let mut whole = false;
+    for _ in 0..names {
+        whole |= asked.part().map_err(bad)? == ALL_ENV_NAME.as_bytes();
+    }
+    if whole {
+        let all = inputs.env_all();
+        let hex = trace::names_hex(all);
+        let mut all = all.iter().peekable();
+        for _ in 0..names {
+            let name = at.part().map_err(bad)?;
+            while let Some((set, value)) = all.next_if(|it| trace::os_bytes(&it.0) < name) {
+                keyer.env(trace::os_bytes(set), Some(trace::os_bytes(value)));
+            }
+            if name == ALL_ENV_NAME.as_bytes() {
+                keyer.env(name, Some(&hex));
+            } else if let Some((_, value)) = all.next_if(|it| trace::os_bytes(&it.0) == name) {
+                keyer.env(name, Some(trace::os_bytes(value)));
+            } else {
+                // What the whole environment has not is not set.
+                keyer.env(name, None);
+            }
+        }
+        for (set, value) in all {
+            keyer.env(trace::os_bytes(set), Some(trace::os_bytes(value)));
+        }
+    } else {
+        for _ in 0..names {
+            let name = at.part().map_err(bad)?;
+            let value = inputs.env(&trace::os_in(name).map_err(bad)?);
+            keyer.env(name, value.as_deref().map(trace::os_bytes));
+        }
+    }
+    for _ in 0..at.len().map_err(bad)? {
+        let name = at.part().map_err(bad)?;
+        std::str::from_utf8(name)
+            .ok()
+            .and_then(trace::untraceable_of)
+            .ok_or_else(|| bad(format!("no untraceable is {:?}", String::from_utf8_lossy(name))))?;
+        keyer.untraceable(name);
+    }
+    match at.0.is_empty() {
+        true => Ok(Some(keyer.finish())),
+        false => Err(bad("the shape has bytes after its end".to_owned())),
     }
 }
 
@@ -336,6 +422,77 @@ mod tests {
         assert_ne!(shape.values(&mut env).unwrap(), traced);
         let mut added = Env(vec![("A".into(), "1".into()), ("B".into(), "2".into())]);
         assert_ne!(shape.values(&mut added).unwrap(), traced);
+    }
+
+    /// The key a check streams from a shape's bytes is the key of the [`Traced`] the shape's
+    /// values are, for each way the inputs can have changed; a directory gone is no key.
+    #[test]
+    fn a_check_keys_a_shape_as_its_values_are_keyed() {
+        use std::{collections::BTreeMap, ffi::OsStr};
+
+        #[derive(Clone)]
+        struct World {
+            files: BTreeMap<PathBuf, [u8; 32]>,
+            dirs: BTreeMap<PathBuf, [u8; 32]>,
+            env: Vec<(OsString, OsString)>,
+        }
+        impl Inputs for World {
+            type Error = ();
+            fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(self.files.get(path).copied())
+            }
+            fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(self.dirs.get(path).copied())
+            }
+            fn env(&mut self, name: &OsStr) -> Option<OsString> {
+                self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+            }
+            fn env_all(&mut self) -> &[(OsString, OsString)] {
+                self.env.sort();
+                &self.env
+            }
+            fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, ()> {
+                Ok(None)
+            }
+        }
+        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"run"), given: ContentId::default() };
+        let world = World {
+            files: [("/a".into(), [1; 32]), ("/b".into(), [2; 32])].into(),
+            dirs: [("/d".into(), [3; 32])].into(),
+            env: vec![("B".into(), "2".into()), ("A".into(), "1".into())],
+        };
+        for whole in [false, true] {
+            let mut traced = Traced {
+                files: vec![("/a".into(), Some([1; 32])), ("/b".into(), Some([2; 32])), ("/gone".into(), None)],
+                dirs: vec![("/d".into(), [3; 32])],
+                env: vec![("A".into(), Some("1".into())), ("UNSET".into(), None)],
+                untraceable: vec![Untraceable::Clock],
+            };
+            if whole {
+                let hash = trace::names_hash(&world.clone().env_all().to_vec());
+                traced.env.push((ALL_ENV_NAME.into(), Some(hash.into())));
+                traced.env.push(("B".into(), Some("2".into())));
+            }
+            let shape = Shape::of(&traced).encode();
+            let changes: [&dyn Fn(&mut World); 5] = [
+                &|_: &mut World| {},
+                &|it: &mut World| _ = it.files.insert("/b".into(), [9; 32]),
+                &|it: &mut World| _ = it.files.insert("/gone".into(), [9; 32]),
+                &|it: &mut World| it.env.push(("UNSET".into(), "now".into())),
+                &|it: &mut World| it.env.push(("C".into(), "3".into())),
+            ];
+            for change in changes {
+                let mut now = world.clone();
+                change(&mut now);
+                let values = Shape::decode(&shape).unwrap().values(&mut now.clone()).unwrap();
+                let streamed = keyed(&shape, &run, &mut now).ok().unwrap();
+                assert_eq!(streamed, Some(run.traced(&values)), "whole {whole}");
+            }
+            assert_eq!(keyed(&shape, &run, &mut world.clone()).ok().unwrap(), Some(run.traced(&traced)));
+            let mut gone = world.clone();
+            gone.dirs.clear();
+            assert_eq!(keyed(&shape, &run, &mut gone).ok().unwrap(), None);
+        }
     }
 
     #[test]

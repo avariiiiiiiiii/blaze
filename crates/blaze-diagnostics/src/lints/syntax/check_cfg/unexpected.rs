@@ -16,8 +16,9 @@
 //! `compiler/rustc_expand/src/expand.rs` (`InvocationCollector`: `take_first_attr`,
 //! `expand_cfg_true`, `expand_cfg_attr`, `assign_id!`) (MIT or Apache-2.0).
 
-use std::{cmp::Reverse, ops::ControlFlow};
+use std::ops::ControlFlow;
 
+use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
@@ -229,7 +230,9 @@ impl Lints<'_, '_> {
         }
         read.extend(tree.off.iter().map(|it| (it, Read::Attrs)));
         read.extend(tree.replaced.iter().map(|it| (it, Read::Replaced)));
-        read.sort_by_key(|(it, _)| (it.text_range().start(), Reverse(it.text_range().end())));
+        radix::sort_by_key(&mut read, |(it, _)| {
+            radix::pack_32(it.text_range().start().into(), !u32::from(it.text_range().end()))
+        });
         for (node, what) in read {
             match what {
                 Read::Attrs => self.attrs(tree, node, None),

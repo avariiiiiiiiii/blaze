@@ -234,6 +234,86 @@ impl Session {
     }
 }
 
+/// How long a started process's loader may take to connect and start the program.
+const START: Duration = Duration::from_secs(60);
+
+/// A program placed in a code memory, which any number of processes run: what the daemon's
+/// dev `run` and test paths hold where they held an executable's path. Each
+/// [`Program::command`] is a launch, spawned as the command it gives; a thread of its own waits
+/// for the loader, attaches the process to the memory and hands the session on (to
+/// `blaze-lazy`'s runner, which serves the process's requests on its channel).
+pub struct Program {
+    host: Arc<Host>,
+    memory: Arc<Mutex<CodeMemory>>,
+    format: Format,
+    sessions: mpsc::Sender<Result<Session, Error>>,
+}
+
+impl Program {
+    pub fn new(
+        host: Arc<Host>,
+        memory: Arc<Mutex<CodeMemory>>,
+        format: Format,
+        sessions: mpsc::Sender<Result<Session, Error>>,
+    ) -> Program {
+        Program { host, memory, format, sessions }
+    }
+
+    pub fn memory(&self) -> &Arc<Mutex<CodeMemory>> {
+        &self.memory
+    }
+
+    /// The command that runs what `command` would have, loaded from the memory: its program
+    /// path becomes the program's `argv[0]`, and its arguments, environment, directory, stdin,
+    /// sandbox and memory limit stay. `forks` says the process forks children that run the
+    /// program (a fork server): see [`CodeMemory::attach_forking`].
+    pub fn command(&self, command: Command, forks: bool) -> Result<Command, Error> {
+        let (command, pending) = {
+            let memory = lock(&self.memory);
+            let launch = Launch {
+                image: &memory,
+                format: self.format,
+                maps: Vec::new(),
+                argv0: command.program.into_os_string(),
+                args: command.args,
+                env: command.env,
+                dir: command.dir,
+                stdin: command.stdin,
+                sandbox: command.sandbox,
+                memory: command.memory,
+            };
+            self.host.launch(&launch)?
+        };
+        let memory = self.memory.clone();
+        let sessions = self.sessions.clone();
+        std::thread::Builder::new()
+            .name("blaze-inproc start".to_owned())
+            .spawn(move || {
+                let session = pending.wait(START).and_then(|session| {
+                    let mut memory = lock(&memory);
+                    match forks {
+                        true => memory.attach_forking(session.pid, session.base)?,
+                        false => memory.attach(session.pid, session.base)?,
+                    }
+                    Ok(session)
+                });
+                let _ = sessions.send(session);
+            })
+            .map_err(|it| Error::new(format!("starting the thread that waits for a loader: {it}")))?;
+        Ok(command)
+    }
+
+    /// The process `pid` this program's commands started exited, and every child it forked
+    /// too: its threads hold no fence any more.
+    pub fn exited(&self, pid: u32) {
+        lock(&self.memory).exited(pid);
+    }
+}
+
+fn lock(memory: &Mutex<CodeMemory>) -> std::sync::MutexGuard<'_, CodeMemory> {
+    memory.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);

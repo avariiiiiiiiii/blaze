@@ -31,6 +31,7 @@ mod recursion;
 mod types;
 mod unsafety;
 
+use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{InFile, db::HirDatabase};
 use hir_expand::MacroCallKind;
@@ -393,7 +394,9 @@ fn body_owners(cx: &Cx<'_, '_>) -> Vec<DefWithBodyId> {
             (rank.get(&file).copied().unwrap_or(usize::MAX), at.range.start(), index, owner)
         })
         .collect();
-    owners.sort_by_key(|&(file, at, index, _)| (file, at, index));
+    radix::sort_by_key(&mut owners, |&(file, at, _, _)| {
+        radix::pack_64(file as u64, u64::from(u32::from(at)))
+    });
     owners.into_iter().map(|(.., owner)| owner).collect()
 }
 
@@ -473,7 +476,7 @@ fn late_passes() -> Vec<Box<dyn LatePass>> {
             .position(|it| *it == name)
             .unwrap_or_else(|| panic!("the late pass `{name}` is not in `PASS_ORDER`"))
     };
-    passes.sort_by_key(|it| place(it));
+    radix::sort_by_key(&mut passes, |it| place(it));
     passes
 }
 

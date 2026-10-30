@@ -445,8 +445,10 @@ impl FlatTree {
     }
 
     /// The bytes of text the element holds itself: a token's or lazy node's, none for a node.
+    /// A walk of the elements in order adds these to the first one's start to have each one's
+    /// range in O(1), where [`FlatTree::range`] counts from the last mark.
     #[inline]
-    fn text_len(&self, at: u32) -> u32 {
+    pub fn text_len(&self, at: u32) -> u32 {
         let word = self.words[at as usize];
         if word & TAG == NODE {
             return 0;

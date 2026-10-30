@@ -206,6 +206,8 @@ A crate-level error at the attribute is the one place that names the feature and
 does it nowhere else, because a new `AnyDiagnostic` variant would break the exhaustive matches
 in `ide-diagnostics/src/lib.rs` and `blaze-diagnostics/src/lower/mod.rs`.
 
+> forwarded to diagnostics: `crates/blaze-diagnostics/src/checks/features.rs` is lane diagnostics'.
+
 ## 12. db-salsa (through lane db): interned values may hash their address
 
 `/tmp/blaze-lanes/v2-db-salsa.md` says `intern::Symbol` and `Interned<T>` hashes are unsound for

@@ -171,6 +171,7 @@ ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
 # The trait solver, with fixes of rustc's backported.
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
+rustc_type_ir_macros = { path = "vendor/rustc_type_ir_macros", version = "0.0.0" }
 rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
 
 # rust-analyzer's libraries, from crates.io
@@ -267,7 +268,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
-thin-vec = "0.2.16"
+thin-vec = "0.2.21"
 hashbrown = { version = "0.17.0", features = [
     "inline-more",
 ], default-features = false }

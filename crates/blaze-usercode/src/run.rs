@@ -159,12 +159,15 @@ impl Run {
             Found::Hit { value, .. } => Some(Value::decode(value).map_err(RunError::BadValue)?),
             Found::Miss { .. } => None,
         };
-        if let (Some(value), Mode::Normal) = (&kept, spec.mode) {
-            if let Some(out_dir) = &spec.out_dir {
-                restore(out_dir, &value.files).map_err(RunError::OutDir)?;
+        let kept = match (kept, spec.mode) {
+            (Some(value), Mode::Normal) => {
+                if let Some(out_dir) = &spec.out_dir {
+                    restore(out_dir, &value.files).map_err(RunError::OutDir)?;
+                }
+                return Ok(Begun::Reused(value));
             }
-            return Ok(Begun::Reused(value.clone()));
-        }
+            (kept, _) => kept,
+        };
         match &mut spec.command.sandbox {
             Sandbox::On { trace, write, .. } => {
                 *trace = true;

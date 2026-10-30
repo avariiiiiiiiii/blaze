@@ -1746,9 +1746,12 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
 
         for diag in source_map.diagnostics() {
             self.acc.push(match diag {
-                ExpressionStoreDiagnostics::InactiveCode { node, cfg, opts } => {
-                    InactiveCode { node: *node, cfg: cfg.clone(), opts: opts.clone() }.into()
+                ExpressionStoreDiagnostics::InactiveCode { node, cfg } => InactiveCode {
+                    node: *node,
+                    cfg: cfg.clone(),
+                    opts: self.krate.cfg_options(self.db).clone(),
                 }
+                .into(),
                 ExpressionStoreDiagnostics::UnresolvedMacroCall { node, path } => {
                     UnresolvedMacroCall {
                         range: node.map(|ptr| ptr.text_range()),

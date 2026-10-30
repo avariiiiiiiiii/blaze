@@ -36,7 +36,6 @@ use hir_ty_mir::mir::{
     location::{located_concats, track_caller},
     monomorphized_promoted_mir_body_query,
 };
-use intern::sym;
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxBuildHasher, FxHashSet};
@@ -1137,6 +1136,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             self.operand(pointer)?;
             return self.drop_value(generic_args.type_at(0));
         }
+        let signature = FunctionSignature::of(db, func);
+        if intrinsic.is_none() && FunctionSignature::is_intrinsic(db, func) {
+            return Err(format!(
+                "a call of the intrinsic `{}` that MIR lowering did not recognize",
+                signature.name.as_str()
+            ));
+        }
         if intrinsic == Some(Intrinsic::ConstEvalSelect) {
             let [tuple, _, runtime] = args else {
                 return Err(format!("const_eval_select with {} arguments", args.len()));
@@ -1154,10 +1160,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let fields: Tys<'db> = fields.iter().collect();
             return self.call_direct(runtime, runtime_args, &fields, dst_ty);
         }
-        let signature = FunctionSignature::of(db, func);
-        let name = signature.name.symbol();
-        if func.krate(db).data(db).origin.is_lang()
-            && (*name == sym::check_language_ub || *name == sym::check_library_ub)
+        if intrinsic.is_none()
+            && func.krate(db).data(db).origin.is_lang()
+            && crate::is_ub_check(signature.name.symbol())
         {
             return Ok(());
         }
@@ -1165,10 +1170,13 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             if self.intrinsic(intrinsic, generic_args, args, dst_ty)? {
                 return Ok(());
             }
-            let overridden = AttrFlags::query(db, func.into())
-                .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN);
-            if overridden || crate::compile_time_only(db, func) || !signature.has_body() {
-                return Err(format!("intrinsic `{intrinsic}`"));
+            if AttrFlags::query(db, func.into())
+                .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN)
+            {
+                return Err(format!("intrinsic `{intrinsic}`, which must be overridden"));
+            }
+            if crate::compile_time_only(db, func) || !signature.has_body() {
+                return Err(format!("intrinsic `{intrinsic}`, which has no body to run"));
             }
         }
         if let Some(name) = crate::link_name(db, func)

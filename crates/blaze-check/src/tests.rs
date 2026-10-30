@@ -721,6 +721,14 @@ fn a_history_outside_a_model_checks_too() {
 }
 
 #[test]
+fn the_generator_is_splitmix64() {
+    let mut rng = crate::rng::Rng::new(0);
+    assert_eq!(rng.next_u64(), 0xE220_A839_7B1D_CDAF);
+    assert_eq!(rng.next_u64(), 0x6E78_9E6A_A1B9_65F4);
+    assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
+}
+
+#[test]
 fn a_schedule_reads_back_as_it_was_written() {
     let path = crate::path::Path::replay("01a0{30}+-.", 100).unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(path.len(), 8);

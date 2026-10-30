@@ -49,6 +49,7 @@ use hir_def::CallableDefId;
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    intrinsic::Intrinsic,
     mir::{
         AggregateKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
         TerminatorKind,
@@ -1899,13 +1900,10 @@ fn fn_from_data(
 ) -> Option<MirSpan> {
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, args, destination, .. } = &terminator.kind else {
+        let TerminatorKind::Call { args, destination, intrinsic, .. } = &terminator.kind else {
             continue;
         };
-        let Some((callee, _)) = fn_item(func) else { continue };
-        let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
-        if FunctionSignature::is_intrinsic(db, callee)
-            && matches!(name.as_str(), "transmute" | "transmute_unchecked")
+        if matches!(intrinsic, Some(Intrinsic::Transmute | Intrinsic::TransmuteUnchecked))
             && destination.projection.as_slice().is_empty()
             && matches!(body.locals[destination.local].ty.as_ref().kind(), TyKind::FnPtr(..))
             && !args.first().is_some_and(|it| dispatch::loaded_from(db, body, it, cache))

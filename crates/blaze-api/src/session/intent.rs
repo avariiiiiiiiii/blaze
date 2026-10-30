@@ -8,7 +8,7 @@
 //! when its deadline passes. A taken-over intent runs to its end.
 
 use blaze_core::Conn;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use rustc_hash::FxHashMap;
 
 use crate::build::{Builder, JobId, Opened};
@@ -57,7 +57,7 @@ impl Intents {
     /// A request builds `root`: every open intent on it is taken over.
     pub(super) fn take_over(&mut self, builder: &mut dyn Builder, root: ContentId) {
         let mut jobs = self.jobs_where(|intent| intent.opened.view.root == root);
-        jobs.sort_unstable();
+        radix::sort_copy_by_key(&mut jobs, |it| it.0);
         for job in jobs {
             self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
             builder.promote(job);
@@ -72,7 +72,7 @@ impl Intents {
         let mut jobs = self.jobs_where(|intent| {
             intent.head.as_deref() == Some(head) && intent.opened.view.root == root
         });
-        jobs.sort_unstable();
+        radix::sort_copy_by_key(&mut jobs, |it| it.0);
         for job in jobs {
             self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
             builder.promote(job);
@@ -110,7 +110,7 @@ impl Intents {
 
     fn cancel_where(&mut self, builder: &mut dyn Builder, keep: impl FnMut(&Intent) -> bool) {
         let mut jobs = self.jobs_where(keep);
-        jobs.sort_unstable();
+        radix::sort_copy_by_key(&mut jobs, |it| it.0);
         for job in jobs {
             self.by_job.get_mut(&job).expect("a job just found").cancelled = true;
             builder.cancel(job);

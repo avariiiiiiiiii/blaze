@@ -24,7 +24,7 @@ use super::{
 };
 use crate::{
     lints::{
-        registry::{self, Checked, Level, Lint, LintId},
+        registry::{self, Checked, Level, Lint, LintId, LintSet},
         syntax::Walk,
     },
     lower::mutable_ref_binding::BUILT_ON,
@@ -78,10 +78,11 @@ const NO_SET: SetId = SetId::MAX;
 /// The levels of a crate as one of rustc's builders has them.
 ///
 /// The sets are CSR columns: set `s` gives the lints `ids[start[s]..start[s + 1]]` (to the
-/// end for the last) the levels at the same indices of `specs`, inside set `parent[s]`. That
-/// is 8 bytes a set and 14 a lint in one, against rustc's `FxIndexMap` per set; finding a
-/// lint's level scans the 2-byte ids of each set from the node out, which are few (a set is
-/// made only for a node with lint attributes) and short.
+/// end for the last) the levels at the same indices of `specs`, inside set `parent[s]`, and
+/// `has[s]` is the set of those lints as a bitset. That is 48 bytes a set and 14 a lint in
+/// one, against rustc's `FxIndexMap` per set. Finding a lint's level is one bit test of
+/// `anywhere` for a lint no set names (most of them), else one bit test of each set from the
+/// node out and a scan of the 2-byte ids of the one that has it.
 pub(super) struct Levels {
     /// rustc's `lint_added_lints`: the early lint pass's builder, which says what is wrong with
     /// the attributes and holds to a `forbid`; the HIR's does neither and has no lint attributes
@@ -92,8 +93,15 @@ pub(super) struct Levels {
     walking: bool,
     start: Vec<u32>,
     parent: Vec<SetId>,
+    /// By set: the lints it has a level for.
+    has: Vec<LintSet>,
     ids: Vec<LintId>,
     specs: Vec<Spec>,
+    /// The lints some set has a level for: any other is at its default level everywhere.
+    anywhere: LintSet,
+    /// The command line's lints at each level, by `Level as usize`: each lint it names is in
+    /// the one of its level.
+    cmd_at: [LintSet; LEVELS],
     /// The set in force at each node seen, by one FxHash of the node: 28 bytes a node.
     at: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
     /// The nodes between one asked of and the nearest seen, kept for its capacity.
@@ -104,27 +112,43 @@ pub(super) struct Levels {
 
 const _: () = assert!(size_of::<(InFile<SyntaxNodePtr>, SetId)>() <= 28);
 
+/// The number of [`Level`]s.
+const LEVELS: usize = Level::Forbid as usize + 1;
+
 impl Levels {
     /// The builder with the command line's levels (rustc's `add_command_line`), and, when it
     /// `speaks`, what it says of the names on it; one that does not is for levels alone.
     pub(super) fn new(sh: &mut Shared<'_, '_, '_>, early: bool, speaks: bool) -> Levels {
-        let mut levels = Levels {
-            early,
-            walking: speaks,
-            start: vec![0],
-            parent: vec![NO_SET],
-            ids: Vec::with_capacity(sh.cmd.opts.len()),
-            specs: Vec::with_capacity(sh.cmd.opts.len()),
-            at: HashTable::new(),
-            chain: Vec::new(),
-            emitted: Vec::new(),
-            expectations: Vec::new(),
-        };
+        let mut levels = Levels::empty(early, speaks, sh.cmd.opts.len());
         let cmd = sh.cmd;
         for (name, level) in &cmd.opts {
             levels.command_line(sh, name, *level, speaks);
         }
         levels
+    }
+
+    /// The builder with an empty command line's set, room for `cmd` levels in it.
+    fn empty(early: bool, walking: bool, cmd: usize) -> Levels {
+        Levels {
+            early,
+            walking,
+            start: vec![0],
+            parent: vec![NO_SET],
+            has: vec![LintSet::EMPTY],
+            ids: Vec::with_capacity(cmd),
+            specs: Vec::with_capacity(cmd),
+            anywhere: LintSet::EMPTY,
+            cmd_at: [LintSet::EMPTY; LEVELS],
+            at: HashTable::new(),
+            chain: Vec::new(),
+            emitted: Vec::new(),
+            expectations: Vec::new(),
+        }
+    }
+
+    /// The command line's lints at `level`.
+    pub(super) fn command_line_at(&self, level: Level) -> &LintSet {
+        &self.cmd_at[level as usize]
     }
 
     fn command_line(&mut self, sh: &mut Shared<'_, '_, '_>, name: &str, level: Level, speaks: bool) {
@@ -193,9 +217,9 @@ impl Levels {
         }
         let Some(lints) = sh.store.find_lints(name) else { return };
         let source = sh.source(Source::CommandLine { name: name.into(), level });
-        for lint in lints {
-            let id = LintId::of(lint);
-            if self.own(COMMAND_LINE, id).is_some_and(|it| matches!(it.level, Level::ForceWarn | Level::Forbid)) {
+        for &lint in lints {
+            let id = lint.id();
+            if self.command_line_at(Level::ForceWarn).contains(id) || self.command_line_at(Level::Forbid).contains(id) {
                 continue;
             }
             if self.gated(sh, COMMAND_LINE, lint, None, &mut Vec::new) {
@@ -260,16 +284,29 @@ impl Levels {
             return parent;
         }
         let is_crate = node.value.kind() == SyntaxKind::SOURCE_FILE && node.file_id == sh.root;
+        let set = self.open(parent);
+        self.add(sh, set, node, reads, is_crate);
+        self.close(set)
+    }
+
+    /// A new set inside `parent`, the last, for [`Levels::insert`].
+    fn open(&mut self, parent: SetId) -> SetId {
         let set = SetId::try_from(self.start.len()).expect("fewer than 2^32 sets");
         self.start.push(u32::try_from(self.ids.len()).expect("fewer than 2^32 levels"));
         self.parent.push(parent);
-        self.add(sh, set, node, reads, is_crate);
-        if self.range(set).is_empty() {
-            self.start.pop();
-            self.parent.pop();
-            return parent;
-        }
+        self.has.push(LintSet::EMPTY);
         set
+    }
+
+    /// The set in force where `set`, the last, was opened: itself, or its parent when it has
+    /// no level (and is dropped).
+    fn close(&mut self, set: SetId) -> SetId {
+        if !self.range(set).is_empty() {
+            return set;
+        }
+        self.start.pop();
+        self.has.pop();
+        self.parent.pop().expect("an open set")
     }
 
     /// rustc's `add`: the attributes of one node.
@@ -283,10 +320,9 @@ impl Levels {
         let mut place = || known.get_or_insert_with(|| attrs::place(cx.sema, node)).clone();
         for read in reads {
             let (level, mut items, pre) = match read {
-                Read::Allows(name) => {
-                    let lint = registry::lint(name).unwrap_or_else(|| panic!("no lint `{name}`"));
+                Read::Allows(id) => {
                     let spec = Spec { level: Level::Allow, expect: None, source: SourceId::DEFAULT };
-                    self.insert(set, LintId::of(lint), spec);
+                    self.insert(set, id, spec);
                     continue;
                 }
                 Read::Level(level, items, direct) => (level, items, in_root && direct),
@@ -409,7 +445,7 @@ impl Levels {
                 };
                 let source =
                     sh.source(Source::Node { name: named.into_boxed_str(), span: at.clone(), reason: reason.clone() });
-                for &lint in &lints {
+                for &lint in lints {
                     if self.gated(sh, set, lint, Some(&at), &mut place) {
                         self.insert_spec(sh, set, lint, Spec { level, expect, source }, &mut place);
                     }
@@ -418,7 +454,7 @@ impl Levels {
                     && !self.early
                     && self.walking
                 {
-                    let is_unfulfilled = matches!(&lints[..], [only] if only.name == "unfulfilled_lint_expectations");
+                    let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
                     let reason = reason.clone();
                     self.expectations.push(Expectation { id, key: at, reason, is_unfulfilled, node: node.clone() });
                 }
@@ -492,7 +528,7 @@ impl Levels {
                 return;
             }
         }
-        if spec.level == Level::Expect && lint.name == "unfulfilled_lint_expectations" {
+        if spec.level == Level::Expect && lint.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS {
             return;
         }
         let spec = match (old.level, spec.level) {
@@ -500,7 +536,7 @@ impl Levels {
             (Level::ForceWarn, _) => Spec { level: Level::ForceWarn, expect: None, source: old.source },
             _ => spec,
         };
-        self.insert(set, LintId::of(lint), spec);
+        self.insert(set, lint.id(), spec);
     }
 
     /// rustc's `check_gated_lint`: whether `lint` is not behind a feature the crate lacks; the
@@ -571,7 +607,7 @@ impl Levels {
     /// The level of `lint` in `set`: rustc's `reveal_actual_level_spec`, with `warnings` and
     /// `--cap-lints`.
     pub(super) fn spec(&self, sh: &Shared<'_, '_, '_>, lint: &'static Lint, set: SetId) -> Spec {
-        let mut spec = self.raw(LintId::of(lint), set).unwrap_or(Spec {
+        let mut spec = self.raw(lint.id(), set).unwrap_or(Spec {
             level: lint.default_level(sh.cx.edition),
             expect: None,
             source: SourceId::DEFAULT,
@@ -604,11 +640,15 @@ impl Levels {
         self.start[set] as usize..end
     }
 
+    /// The level of `id` set in `set` or a set around it, the innermost.
     fn raw(&self, id: LintId, set: SetId) -> Option<Spec> {
+        if !self.anywhere.contains(id) {
+            return None;
+        }
         let mut at = set;
         while at != NO_SET {
-            if let Some(spec) = self.own(at, id) {
-                return Some(spec);
+            if self.has[at as usize].contains(id) {
+                return self.own(at, id);
             }
             at = self.parent[at as usize];
         }
@@ -627,11 +667,21 @@ impl Levels {
         let range = self.range(set);
         let start = range.start;
         match self.ids[range].iter().position(|&it| it == id) {
-            Some(at) => self.specs[start + at] = spec,
+            Some(at) => {
+                if set == COMMAND_LINE {
+                    self.cmd_at[self.specs[start + at].level as usize].remove(id);
+                }
+                self.specs[start + at] = spec;
+            }
             None => {
                 self.ids.push(id);
                 self.specs.push(spec);
+                self.has[set as usize].insert(id);
+                self.anywhere.insert(id);
             }
+        }
+        if set == COMMAND_LINE {
+            self.cmd_at[spec.level as usize].insert(id);
         }
     }
 }
@@ -688,4 +738,89 @@ pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> 
 /// The crate's root file, which is the root module's.
 pub(super) fn root_file(cx: &crate::cx::Cx<'_, '_>) -> Option<HirFileId> {
     cx.krate.root_module(cx.db).as_source_file_id(cx.db).map(HirFileId::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_LEVELS: [Level; LEVELS] =
+        [Level::Allow, Level::Expect, Level::Warn, Level::ForceWarn, Level::Deny, Level::Forbid];
+
+    /// [`Levels::raw`] as it was: a scan of the ids of each set from `set` out.
+    fn raw_by_scan(levels: &Levels, id: LintId, set: SetId) -> Option<Spec> {
+        let mut at = set;
+        while at != NO_SET {
+            let range = levels.range(at);
+            let start = range.start;
+            if let Some(found) = levels.ids[range].iter().position(|&it| it == id) {
+                return Some(levels.specs[start + found]);
+            }
+            at = levels.parent[at as usize];
+        }
+        None
+    }
+
+    #[test]
+    fn bitsets_find_what_the_scan_finds() {
+        // A splitmix64 stream: seeded, so a failure reproduces.
+        let mut state = 0x6c65_7665_6c73u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let ids: Vec<LintId> = registry::lints()
+            .iter()
+            .chain(registry::blaze_lints())
+            .chain(registry::internal_lints())
+            .chain(registry::unregistered())
+            .map(|it| it.id())
+            .collect();
+        // Few lints named, so that sets name the same ones and many are named nowhere.
+        let pool: Vec<LintId> = (0..24).map(|_| ids[(next() % ids.len() as u64) as usize]).collect();
+        let mut source = 0u32;
+        let mut spec = |level: Level| {
+            source += 1;
+            Spec { level, expect: None, source: SourceId(source) }
+        };
+        let mut levels = Levels::empty(true, false, 0);
+        for _ in 0..40 {
+            let id = pool[(next() % pool.len() as u64) as usize];
+            let level = ALL_LEVELS[(next() % LEVELS as u64) as usize];
+            levels.insert(COMMAND_LINE, id, spec(level));
+        }
+        for &id in &ids {
+            for level in ALL_LEVELS {
+                let scanned = levels.own(COMMAND_LINE, id).is_some_and(|it| it.level == level);
+                assert_eq!(levels.command_line_at(level).contains(id), scanned, "{} at {level:?}", id.lint().name);
+            }
+        }
+        let mut sets = vec![COMMAND_LINE];
+        for _ in 0..300 {
+            let parent = sets[(next() % sets.len() as u64) as usize];
+            let set = levels.open(parent);
+            for _ in 0..next() % 5 {
+                let id = pool[(next() % pool.len() as u64) as usize];
+                let level = ALL_LEVELS[(next() % LEVELS as u64) as usize];
+                levels.insert(set, id, spec(level));
+            }
+            let set = levels.close(set);
+            assert!(set == parent || set as usize == levels.start.len() - 1);
+            sets.push(set);
+        }
+        assert_eq!(levels.has.len(), levels.start.len());
+        assert_eq!(levels.parent.len(), levels.start.len());
+        for &set in &sets {
+            for &id in &ids {
+                assert_eq!(levels.raw(id, set), raw_by_scan(&levels, id, set), "{} in set {set}", id.lint().name);
+            }
+        }
+        for &id in &ids {
+            let named = (0..levels.start.len() as SetId).any(|set| levels.own(set, id).is_some());
+            assert_eq!(levels.anywhere.contains(id), named, "{}", id.lint().name);
+        }
+    }
 }

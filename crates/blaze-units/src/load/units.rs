@@ -125,6 +125,10 @@ pub(crate) fn units(
         .filter(|(id, _)| all_ids.contains(id))
         .map(|(id, (_, manifest))| (*id, Package { manifest, is_member: resolved.member_ids.contains(id) }))
         .collect();
+    let packages_by_spec: BySpec<'_> = by_id
+        .iter()
+        .map(|(id, package)| (id.to_spec().to_string(), (*id, Package { manifest: package.manifest, is_member: package.is_member })))
+        .collect();
     let request = Request {
         packages: &by_id,
         resolve: &resolved.resolve,
@@ -141,7 +145,7 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
-    if let Some(error) = artifact_refusal(&graph, &by_id, &resolved) {
+    if let Some(error) = artifact_refusal(&graph, &packages_by_spec, &resolved) {
         return Ok(Staged::Failed(error));
     }
     if spec.run {
@@ -183,7 +187,7 @@ pub(crate) fn units(
     let mut std_plans: Vec<Option<UnitPlan>> = vec![None; graph.units.len()];
     let mut std_packages: Vec<PackagePlan> = Vec::new();
     match &spec.foreign {
-        Some(ask) => foreign_units(&mut graph, &by_id, ask),
+        Some(ask) => foreign_units(&mut graph, &packages_by_spec, ask),
         None => {
             let base = match schema_profile(&profiles) {
                 Ok(it) => it,
@@ -198,7 +202,7 @@ pub(crate) fn units(
                     Some(_) => target_flags.clone(),
                     None => host_flags.clone(),
                 };
-                let key = match std_key(spec, &graph, &by_id, &base, &profiles, &triple, rustflags) {
+                let key = match std_key(spec, &graph, &packages_by_spec, &base, &profiles, &triple, rustflags) {
                     Ok(it) => it,
                     Err(error) => return Ok(Staged::Failed(error)),
                 };
@@ -215,10 +219,6 @@ pub(crate) fn units(
         }
     }
 
-    let packages_by_spec: FxHashMap<String, (PackageId, Package<'_>)> = by_id
-        .iter()
-        .map(|(id, package)| (id.to_spec().to_string(), (*id, Package { manifest: package.manifest, is_member: package.is_member })))
-        .collect();
     let (out_dir, out_build) = match &spec.foreign {
         Some(_) => (PathBuf::from(FOREIGN_TARGET), PathBuf::from(FOREIGN_TARGET)),
         None => (target_dir.clone(), build_dir.clone()),
@@ -470,11 +470,17 @@ fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
     }
 }
 
+/// The packages by the spec a unit's `pkg_id` names them by.
+type BySpec<'a> = FxHashMap<String, (PackageId, Package<'a>)>;
+
 /// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
 /// does not build: refused, naming both. Units that depend on none build.
-fn artifact_refusal(graph: &schema::UnitGraph, packages: &FxHashMap<PackageId, Package<'_>>, resolved: &Resolved<'_>) -> Option<LoadError> {
+fn artifact_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, resolved: &Resolved<'_>) -> Option<LoadError> {
     for unit in &graph.units {
-        let Some((id, package)) = packages.iter().find(|(id, _)| id.to_spec().to_string() == unit.pkg_id) else { continue };
+        let Some((id, package)) = packages.get(unit.pkg_id.as_str()) else { continue };
+        if !package.manifest.dependencies.iter().any(|dep| dep.artifact.is_some()) {
+            continue;
+        }
         let script = unit.target.is_custom_build() && unit.mode != Mode::RunCustomBuild;
         let dev = matches!(unit.mode, Mode::Test) || unit.target.kind.iter().any(|it| matches!(it.as_str(), "test" | "bench" | "example"));
         let used = |kind: blaze_resolve::DepKind| match kind {
@@ -482,10 +488,9 @@ fn artifact_refusal(graph: &schema::UnitGraph, packages: &FxHashMap<PackageId, P
             blaze_resolve::DepKind::Development => dev && !script,
             blaze_resolve::DepKind::Normal => !script && unit.mode != Mode::RunCustomBuild,
         };
-        let resolved_deps: Vec<String> = resolved.resolve.deps(*id).map(|(dep, _)| dep.name().to_string()).collect();
         for dep in &package.manifest.dependencies {
             let Some(artifact) = &dep.artifact else { continue };
-            if !used(dep.kind) || !resolved_deps.iter().any(|it| *it == dep.name) {
+            if !used(dep.kind) || !resolved.resolve.deps(*id).any(|(it, _)| it.name().as_str() == dep.name.as_str()) {
                 continue;
             }
             return Some(LoadError {
@@ -529,7 +534,7 @@ fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
 fn std_key(
     spec: &Spec,
     graph: &schema::UnitGraph,
-    packages: &FxHashMap<PackageId, Package<'_>>,
+    packages: &BySpec<'_>,
     base: &schema::Profile,
     profiles: &Profiles,
     triple: &str,
@@ -574,8 +579,8 @@ fn std_key(
 }
 
 /// Whether the test `unit` runs in libtest's harness: its target's `harness`.
-fn harness_of(unit: &Unit, packages: &FxHashMap<PackageId, Package<'_>>) -> bool {
-    let Some((_, package)) = packages.iter().find(|(id, _)| id.to_spec().to_string() == unit.pkg_id) else { return false };
+fn harness_of(unit: &Unit, packages: &BySpec<'_>) -> bool {
+    let Some((_, package)) = packages.get(unit.pkg_id.as_str()) else { return false };
     package.manifest.targets.iter().any(|target| {
         target.name == unit.target.name && target.harness && kind_name(&target.kind) == unit.target.kind.first().map(String::as_str)
     })
@@ -635,14 +640,14 @@ fn merge_std(
 
 /// The units of a foreign workspace as its ask says: every one `is_std` when asked, the
 /// packages that always abort built to abort, each unit's profile named as the build's.
-fn foreign_units(graph: &mut schema::UnitGraph, packages: &FxHashMap<PackageId, Package<'_>>, ask: &ForeignAsk) {
-    let names: FxHashMap<String, String> =
-        packages.keys().map(|id| (id.to_spec().to_string(), id.name().to_string())).collect();
+fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &ForeignAsk) {
     for unit in &mut graph.units {
         unit.is_std = ask.is_std;
         unit.profile.name.clone_from(&ask.profile.name);
         let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
-        let aborts = names.get(&unit.pkg_id).is_some_and(|name| ask.panic_abort.contains(name));
+        let aborts = packages
+            .get(unit.pkg_id.as_str())
+            .is_some_and(|(id, _)| ask.panic_abort.iter().any(|it| it.as_str() == id.name().as_str()));
         if aborts && !script {
             unit.profile.panic = "abort".to_owned();
         }

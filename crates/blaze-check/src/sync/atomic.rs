@@ -1,7 +1,8 @@
 //! `std::sync::atomic`'s types. In a model each operation is a schedule point and a load reads
 //! any store the C11 rules leave it (`rt/memory.rs`); outside one each is `std`'s. A shim holds
 //! `std`'s atomic (the value outside a model, and the newest store inside one), the value it
-//! was made with (a `static`'s starts again from it in each execution), and its object id.
+//! was made with (every execution starts from it), and its object id. Memory zeroed by an
+//! allocator is a valid shim holding 0, as it is a valid `std` atomic.
 
 use std::{
     cell::Cell,
@@ -29,10 +30,10 @@ struct Loc<'a, P: Plain> {
 
 impl<P: Plain> Loc<'_, P> {
     fn object(&self, rt: &mut Runtime) -> u32 {
-        // Made in this execution, or never touched by one: its value now. Touched by an earlier
-        // execution (a `static`): the value it was made with.
-        let initial = if self.id.load(Relaxed) == 0 { self.real.get() } else { self.init };
-        rt.atomic(self.id, initial)
+        // Each execution starts it from the value it was made with: a `static` touched by an
+        // earlier execution, or outside any model (another test in the process), brings none of
+        // that in, so a model's outcomes never depend on what ran before it.
+        rt.atomic(self.id, self.init)
     }
 
     fn run<R>(

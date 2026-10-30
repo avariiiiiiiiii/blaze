@@ -14,6 +14,7 @@
 //! it recovers): what it reports in a form rustc has is written as rustc writes it, the rest in
 //! the parser's own words, always an error (`v2/requests/diagnostics.md`).
 
+use blaze_ids::radix;
 use rustc_hash::FxHashSet;
 use span::FileId;
 use syntax::{AstNode, Edition, LexedStr, SyntaxError, SyntaxKind, TextRange, TextSize, ast};
@@ -152,8 +153,8 @@ fn lower_file(
     for error in literals {
         found.push(Found::new(Diag::error(None, error.to_string(), f.at(error.range())), Phase::Parse));
     }
-    parser_errors.sort_by_key(|it| it.range().start());
-    validation.sort_by_key(|it| it.range().start());
+    radix::sort_by_key(&mut parser_errors, |it| u32::from(it.range().start()));
+    radix::sort_by_key(&mut validation, |it| u32::from(it.range().start()));
 
     for error in parser_errors {
         let (diag, recovered) = f.parser_error(&error.to_string(), error.range().start());
@@ -988,7 +989,7 @@ impl Trees<'_, '_, '_, '_> {
                 (TextRange::new(open.start(), close.start()), file.same_indentation(open, close))
             })
             .collect();
-        matched.sort_by_key(|(range, _)| range.start());
+        radix::sort_copy_by_key(&mut matched, |(range, _)| u32::from(range.start()));
         for i in 0..matched.len() {
             let (block, same) = matched[i];
             if same {

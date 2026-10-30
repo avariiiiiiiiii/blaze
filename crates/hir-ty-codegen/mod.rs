@@ -19825,6 +19825,21 @@ mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
+    /// core's two UB checks are known by their pre-interned symbols, however the name was
+    /// interned; `ub_checks` is the intrinsic, not one of them.
+    #[test]
+    fn ub_checks_are_known_by_symbol() {
+        use super::{Intrinsic, is_ub_check};
+        use intern::Symbol;
+        assert!(is_ub_check(&intern::sym::check_language_ub));
+        assert!(is_ub_check(&Symbol::intern("check_library_ub")));
+        assert!(!is_ub_check(&Symbol::intern("ub_checks")));
+        assert!(!is_ub_check(&Symbol::intern("contract_checks")));
+        assert_eq!(Intrinsic::from_symbol(&Symbol::intern("ub_checks")), Some(Intrinsic::UbChecks));
+        assert_eq!(Intrinsic::from_symbol(&Symbol::intern("contract_checks")), None);
+        assert_eq!(Intrinsic::from_symbol(&intern::sym::check_language_ub), None);
+    }
+
     /// A layout kept for a build is the database's own, not a copy: lent from the `Arc` the
     /// query gave, however many more the build keeps after it. Seeded layouts of every
     /// integer width, enough for the list to grow many times.

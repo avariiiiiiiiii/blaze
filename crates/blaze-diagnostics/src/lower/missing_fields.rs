@@ -14,6 +14,7 @@
 //! (`check_struct_pat_fields`, `error_unmentioned_fields`, `error_no_accessible_fields`)
 //! (MIT or Apache-2.0).
 
+use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{HasAttrs as _, HasVisibility as _, InFile, LangItem};
 use syntax::{
@@ -366,7 +367,7 @@ fn private_fields(cx: &Cx<'_, '_>, record: &Record, variant: hir::Variant, priva
             None::<()>
         });
     }
-    constructors.sort_by_key(|(later, _, _)| *later);
+    radix::sort_by_key(&mut constructors, |(later, _, _)| u8::from(*later));
     let call = |name: &str, args: usize| format!("::{name}({})", vec!["_"; args].join(", "));
     match constructors.as_slice() {
         [] => {}

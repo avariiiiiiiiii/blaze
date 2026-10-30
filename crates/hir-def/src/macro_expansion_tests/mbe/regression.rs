@@ -1080,7 +1080,7 @@ macro_rules! concat {}
 macro_rules! line {}
 
 fn main() {
-    "event 0";
+    "event 10";
 }
 
 "##]],

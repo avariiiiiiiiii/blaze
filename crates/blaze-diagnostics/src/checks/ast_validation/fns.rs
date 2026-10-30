@@ -23,6 +23,7 @@
 
 use std::borrow::Cow;
 
+use blaze_ids::radix;
 use syntax::{
     AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
     ast::{self, HasName as _},
@@ -321,7 +322,7 @@ fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: 
         if found.is_empty() {
             continue;
         }
-        found.sort_by_key(|(range, _)| range.start());
+        radix::sort_copy_by_key(&mut found, |(range, _)| u32::from(range.start()));
         for (range, doc) in found {
             let span = v.span(range);
             let diag = if doc {

@@ -10,6 +10,8 @@
 //! function's signature, an impl's header). Each item is a query of its own, as the borrow checker's bodies are;
 //! `docs/borrowck.md` in the repository describes what is checked.
 
+#![forbid(unsafe_code)]
+
 extern crate rustc_type_ir;
 
 mod outlives;

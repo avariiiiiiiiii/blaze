@@ -4,12 +4,11 @@
 
 use std::{any::Any, env, rc::Rc, str::FromStr};
 
-use blaze_core::sim::Rng;
-
 use crate::{
     clock::MAX_THREADS,
     coro::{self, Coroutine, Ran},
     path::{Mode, Path, Pct},
+    rng::Rng,
     rt::{self, Runtime},
 };
 

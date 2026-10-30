@@ -31,6 +31,8 @@ plan/
     data.md              data-oriented layout, compression tiers
     hardware.md          SIMD, huge pages, io_uring, no GPU
     concurrency.md       reads never lock, immutable values, task-boundary reclamation, no build lock
+    frontend.md          rust-analyzer's design choices that cost a compiler, and v2's fixes
+    restore.md           instant restore: mapped image, stable IDs, OS change journals
     compile-time.md      lazy per-function compiles, copy-and-patch, no binary on disk, global cache, semantic edits
     unsafe.md            unsafe only where it pays, behind safe APIs, proved by our own Miri, sanitizers, model checking, fuzzing
   lanes/                 who builds which part

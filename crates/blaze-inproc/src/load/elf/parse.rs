@@ -100,6 +100,9 @@ const DF_TEXTREL: u64 = 4;
 
 const DW_EH_PE_OMIT: u8 = 0xff;
 
+/// Version indexes are 15 bits.
+const MOST_VERSIONS: usize = 0x7fff;
+
 /// The architectures the loader runs: the image's has to be the host's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Machine {
@@ -911,6 +914,9 @@ impl<'a> Elf<'a> {
                 let other = u16_at(table, at + 6).ok_or_else(|| missing(at))?;
                 let name = u32_at(table, at + 8).ok_or_else(|| missing(at))?;
                 let following = u32_at(table, at + 12).ok_or_else(|| missing(at))?;
+                if versions.len() >= MOST_VERSIONS {
+                    return Err(bad(format!("DT_VERNEED names more than the {MOST_VERSIONS} versions ELF numbers")));
+                }
                 versions.push((other & 0x7fff, name));
                 if following == 0 {
                     break;

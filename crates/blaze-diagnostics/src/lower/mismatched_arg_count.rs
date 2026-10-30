@@ -11,6 +11,7 @@
 
 use std::cmp::{self, Ordering};
 
+use blaze_ids::radix;
 use either::Either;
 use hir::{AsAssocItem as _, CallableKind, HasSource as _, HirFileId, InFile, LangItem, PathResolution};
 use hir_ty::next_solver::TyKind;
@@ -308,7 +309,7 @@ impl ArgMatrix {
                         real[src_input] = Some((dst_arg, dst_input));
                         matched[dst_arg] = Some(src_input);
                     }
-                    idxs.sort();
+                    radix::sort(&mut idxs);
                     idxs.reverse();
                     for i in idxs {
                         self.satisfy_input(i, i);
@@ -1102,7 +1103,7 @@ impl<'a, 'b, 'db> CallCx<'a, 'b, 'db> {
             }
         }
         for ((span, name), uses) in generics.iter().zip(&mut generic_uses) {
-            uses.sort();
+            radix::sort(uses);
             uses.dedup();
             if let Some(list) = listify(uses, |&idx| params[idx].display.clone()) {
                 let quantifier = if uses.len() == 2 { "both" } else { "all" };

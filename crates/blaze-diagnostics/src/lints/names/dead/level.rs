@@ -16,7 +16,7 @@ use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 
 use crate::{
     cx::Cx,
-    lints::registry::{self, Level, Named},
+    lints::registry::{self, Level, LintId, Named},
 };
 
 /// The `#[expect]` a level comes from: the node of the attribute's owner and the lint's place
@@ -81,7 +81,7 @@ fn level_at(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> LevelPlus {
 }
 
 fn default_level() -> Level {
-    registry::lint("dead_code").map_or(Level::Warn, |it| it.default_level)
+    LintId::DEAD_CODE.lint().default_level
 }
 
 /// The nodes whose attributes set the level at `node`, innermost first: `node`, its ancestors,
@@ -165,8 +165,8 @@ fn set_level(slot: &mut Option<LevelPlus>, set: LevelPlus) {
 /// renamed to one of those.
 fn names_dead_code(name: &str) -> bool {
     match registry::named(name) {
-        Named::Lint(lint) => lint.name == "dead_code",
-        Named::Group(group) => group.lints.iter().any(|it| it.name == "dead_code"),
+        Named::Lint(lint) => lint.id() == LintId::DEAD_CODE,
+        Named::Group(group) => group.has(LintId::DEAD_CODE),
         Named::Renamed(new) => new != name && names_dead_code(new),
         _ => false,
     }

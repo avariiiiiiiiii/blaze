@@ -301,7 +301,7 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
 impl Persist for ItemTree {
     const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
         Part::Str("ItemTree"),
-        Part::U64(2),
+        Part::U64(3),
         Part::Schema(<Root as Record>::SCHEMA),
     ]);
     type Ref<'a> = ItemTreeRef<'a>;
@@ -617,9 +617,9 @@ impl Code for tt::Literal {
         let text_and_suffix = r.symbol()?;
         let span = r.get()?;
         let kind = r.get()?;
-        let suffix_len: u8 = r.get()?;
+        let suffix_len: u32 = r.get()?;
         let text = text_and_suffix.as_str();
-        let split = text.len().checked_sub(usize::from(suffix_len));
+        let split = text.len().checked_sub(suffix_len as usize);
         match split.is_some_and(|at| text.is_char_boundary(at)) {
             true => Ok(tt::Literal { text_and_suffix, span, kind, suffix_len }),
             false => Err(r.invalid("a literal suffix that is not the end of its text")),

@@ -65,17 +65,16 @@ pub struct RunKey {
 }
 
 impl RunKey {
-    pub const DOMAIN: &'static str = "blaze v2 run traced 1";
+    pub const DOMAIN: &'static str = "blaze v2 run traced 2";
 
     /// The store's key of the result: this and the hash of what the run read.
     pub fn traced(&self, traced: &Traced) -> ContentId {
+        if trace::normal(traced) {
+            return trace::Keyer::new(self).traced(traced);
+        }
         let mut traced = traced.clone();
         trace::normalize(&mut traced);
-        Hasher::new(RunKey::DOMAIN)
-            .id(&self.code)
-            .id(&self.given)
-            .part(&trace::encode(&trace::Report::Ran(Some(traced))))
-            .finish()
+        trace::Keyer::new(self).traced(&traced)
     }
 }
 
@@ -89,21 +88,24 @@ pub struct Given {
     args: Vec<OsString>,
     // BTreeMap: hashed in order into the cache key `RunKey::given`, and `vars` hands it out in order.
     env: BTreeMap<OsString, OsString>,
-    stdin: Vec<u8>,
-    // BTreeMap: hashed in order into the cache key `RunKey::given`.
-    parts: BTreeMap<&'static str, Vec<u8>>,
+    /// The hash of the standard input: given bytes are hashed once, as they are given, and
+    /// never copied.
+    stdin: [u8; 32],
+    /// Each part's hash by its name, sorted by name: hashed in order into `RunKey::given`.
+    parts: Vec<(&'static str, [u8; 32])>,
 }
 
 impl Given {
-    pub const DOMAIN: &'static str = "blaze v2 run given 1";
+    pub const DOMAIN: &'static str = "blaze v2 run given 2";
+    const PART: &'static str = "blaze v2 run given part 1";
 
     pub fn new(kind: RunKind) -> Given {
         Given {
             kind,
             args: Vec::new(),
             env: BTreeMap::new(),
-            stdin: Vec::new(),
-            parts: BTreeMap::new(),
+            stdin: Hasher::new(Given::PART).finish().0,
+            parts: Vec::new(),
         }
     }
 
@@ -119,14 +121,18 @@ impl Given {
     }
 
     pub fn stdin(&mut self, bytes: &[u8]) -> &mut Given {
-        self.stdin = bytes.to_vec();
+        self.stdin = Hasher::new(Given::PART).update(bytes).finish().0;
         self
     }
 
     /// Something else the run is a function of, by a name of the caller's: a macro's input
     /// tokens, its kind and name, the target. Named twice, the last is kept.
     pub fn part(&mut self, name: &'static str, bytes: &[u8]) -> &mut Given {
-        self.parts.insert(name, bytes.to_vec());
+        let hash = Hasher::new(Given::PART).update(bytes).finish().0;
+        match self.parts.binary_search_by(|it| it.0.cmp(name)) {
+            Ok(at) => self.parts[at].1 = hash,
+            Err(at) => self.parts.insert(at, (name, hash)),
+        }
         self
     }
 
@@ -145,10 +151,10 @@ impl Given {
         for (name, value) in &self.env {
             hasher.part(trace::os_bytes(name)).part(trace::os_bytes(value));
         }
-        hasher.part(&self.stdin);
+        hasher.update(&self.stdin);
         hasher.update(&(self.parts.len() as u64).to_le_bytes());
-        for (name, bytes) in &self.parts {
-            hasher.part(name.as_bytes()).part(bytes);
+        for (name, hash) in &self.parts {
+            hasher.part(name.as_bytes()).update(hash);
         }
         hasher.finish()
     }

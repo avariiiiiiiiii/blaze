@@ -3,9 +3,10 @@
 //! on a candidate's position (the candidates are a function of the path before them) and with a
 //! replay and a random mode over the same branches.
 
-use blaze_core::sim::Rng;
-
-use crate::clock::{MAX_THREADS, Tid};
+use crate::{
+    clock::{MAX_THREADS, Tid},
+    rng::Rng,
+};
 
 /// What a thread is at a schedule branch (loom's `path::Thread`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

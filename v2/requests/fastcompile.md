@@ -126,6 +126,7 @@ crate. Notes: `docs/v2/plan/lanes/fastcompile/sched.md`.
 > written by fastcompile-sched (the `admission.rs` part): core and all its children report
 > `STATUS: DONE` and nobody had `admission.rs` open. The `exec.rs` part is not written.
 > forwarded to requests-nodes: core is DONE, and `exec.rs` is that child's now (with core-plane 6).
+> applied (requests-nodes, 2026-10-29, the `exec.rs` part): `Scheduler::new`/`with_pool` take a `Box<dyn Predict>` in place of `Estimates`; the owner applies `predict(kind, spec.key)` with `Prediction::apply` to every task added and every task found (where `Estimates::predict` raised memory); a run is timed around its work in the task arena (`Measure { peak, ran_ns }`, carried in `Done` with the key), so a run that gave way is reposted untimed and only the run that finished is observed, `observe(kind, key, ran_ns, peak)`; a panicked run teaches nothing, as before. `Handle::estimates`/`Scheduler::estimates` (the `Estimates` message) return `Vec<u8>`, the predictor's `encode()`. No caller outside `exec.rs` builds a `Scheduler`. Test `the_scheduler_asks_its_predictor_and_teaches_it_each_run` (a recording predictor: predicted for added and found tasks with their kinds and keys, three observes in order, the reposted task's time is its last run's, the bytes are `encode`'s); the give-way test decodes the bytes with `Estimates::decode`.
 
 ## fastcompile-sched 2: cargo: the daemon's plane runs on history (`crates/blaze-cargo/src/serve/plane.rs`, `serve/daemon.rs`, `Cargo.toml`)
 
@@ -805,3 +806,144 @@ process, panics and unwinding included. The region is the record `blaze_testsel:
 reads (`Record::of_region`).
 
 > forwarded to link: `crates/blaze-live/` and blaze-link's slot stubs are lane link's.
+
+## fastcompile-intent 1: ci: edits by meaning and declared intent in the agent API (`crates/blaze-api/`, `crates/blaze-ui/src/api.rs`)
+
+What:
+
+- `blaze-api/src/intent.rs`, re-exported from `lib.rs`: `Target { file, item }`; `Edit`
+  (`ReplaceBody`, `ReplaceSignature`, `ReplaceItem`, `AddField`, `RemoveField`, `AddItem`,
+  `RemoveItem`, `AddUse`, `Rename`); `Edited { ops, items }`;
+  `EditedItem { how, key, file, path }`; `How` (`Body`, `Signature`, `Fields`, `Whole`,
+  `Added`, `Removed`, `Renamed`, `Scope`).
+- `Request::Edit { base, head, edits }`, `Request::WillTest { view, filter, targets, wait_ms }`
+  and `Request::WillSave { ops, head, test, targets, wait_ms }`.
+- `Response::Edited(Edited)` and `Response::Announced { root }`. `SCHEMA` goes to 9.
+- `build.rs`: `Work::Edit(Vec<Edit>)`, `Work::Ahead { targets, filter }`, and
+  `Builder::speculate(job, view, work)` and `Builder::promote(job)`.
+- `session.rs`:
+  - An edit is a job on its base (`Kind::Edit`). Its `ok` finish commits the reported ops to
+    its head and then waits on the ticket as a commit does. A failed, cancelled or gone edit
+    commits nothing. An `ok` finish that reported no `Edited` fails, naming the job.
+  - Intents (`session/intent.rs`) are jobs of no request, answered with `Announced` then
+    `Done` at once.
+  - An intent is taken over (promoted once) by a request that builds its root incrementally
+    (check, build, test, run, codegen inputs, trace, a best-of candidate), or by a commit to
+    its head that makes its root.
+  - An intent not taken over is cancelled by a newer intent of the same connection, a commit
+    to its head that makes another root, the connection's end, or its `wait_ms` passing.
+  - New `Session::tick(cx, now_ns)`, `Session::deadline()` and
+    `Session::head_moved(cx, head, root)`.
+- `frames/identity.rs` generates every new variant. blaze-ui prints `Edited` and `Announced`.
+
+Why: ideas 9 and 10 of `docs/v2/plan/design/compile-time.md`
+(`docs/v2/plan/lanes/fastcompile/intent.md`). `crates/blaze-intent` is written against this
+shape.
+
+> written by fastcompile-intent (ci and its children DONE). Tests are in
+> `session/tests.rs`:
+> - an edit commits its reported ops once durable;
+> - a failed, cancelled, silent or gone edit commits nothing;
+> - an intent is answered at once and taken over by a request on its root, while a reach,
+>   verify or tables request takes nothing over;
+> - a save of the same root takes the intent over and one of another root cancels it;
+> - a newer intent, the connection's end and the wait each cancel;
+> - a 200-seed simulation: each intent is taken over or cancelled at most once, never both,
+>   never after its end, and every view is freed;
+> - the existing simulation, which sends no intent, now also asserts that nothing was
+>   speculated or promoted.
+>
+> The safety fuzz target `fuzz/targets/api_envelope.rs` has no variant list to extend.
+> applied: by fastcompile-intent, as written above (ci DONE); `SCHEMA` 9 includes ident-select 8's `TestResult::cached`.
+
+## fastcompile-intent 2: core: an idle class, promotion and yielding in the plane (`crates/blaze-graph/src/plane.rs`: `PlaneInput::Open`, `PlaneInput`, `PlaneOutput`)
+
+What:
+
+- `PlaneInput::Open` gains `idle: bool`.
+  - An idle request's ready task starts only when no task of a non-idle request is ready
+    and fits that pool and memory.
+  - Its starts do not move a non-idle request's virtual time.
+  - The starvation count (`starve_after`) never holds a non-idle task back for an idle one.
+- New `PlaneInput::Promote { at_ns, request }`. The request is non-idle from then on, at the
+  plane's virtual time, as a request returning from idle is. A second promote, or one of a
+  finished request, does nothing.
+- New `PlaneOutput::Yield { id }`. When a non-idle task is ready and can't start only
+  because running idle tasks hold the threads or memory it needs, the plane names the
+  newest such idle task. The executor cancels it, and its node goes back to Ready in its
+  request, its memory given back when it ends.
+- A non-idle request's node that joins an idle request's not-started task makes the task
+  ready at the joiner's priority. "Ready in every member's request at that member's
+  priority" already says so; please keep it true for idle requests.
+- Tests:
+  - with a foreground request that has a ready task, an idle request starts nothing;
+  - on free threads it starts;
+  - a promote enters fair share;
+  - a yield frees the thread for the foreground task;
+  - a simulated trace (`traces/cold-small`) finishes the foreground request in the same
+    virtual time with or without a busy idle request beside it.
+  - With no idle request, the outputs are unchanged.
+
+Why: declared intent (idea 10) builds ahead "at low priority, never delaying real work".
+`Builder::speculate` in blaze-api opens its plane request idle, and `Builder::promote` sends
+`Promote` (request 4). Without a strict class, speculation would take a weighted share from
+real requests.
+
+> forwarded to requests-nodes: core is DONE and `plane.rs` is that child's now.
+
+## fastcompile-intent 3: db: the front end takes a tree parsed in place (`crates/base-db/src/editioned_file_id.rs`, `EditionedFileId::parse`)
+
+What:
+
+- A bounded seed table on the source database, with
+  `SourceDatabase::seed_parse(&self, content: ContentId, edition: Edition, parse: Parse<ast::SourceFile>)`.
+  It is keyed by the `FileText` content (`FileText::content_of(text, appended_root_module)`,
+  which covers the text and the appended module) and the edition.
+- `EditionedFileId::parse` first takes the seed for
+  `(db.file_text(file_id).content(db), edition)`, removing it, and parses otherwise.
+- The seeds come from `blaze_intent::Applied::seeds`. Each is a tree with no errors whose
+  green tree equals `SourceFile::parse` of exactly those bytes; blaze-intent's
+  `tests::assert_fresh` checks this for every edit kind. So the query's value is the same
+  whether or not a seed was there. Please add a debug assertion, or a test in base-db, that
+  a seeded parse equals a fresh one.
+
+Why: idea 9 reparses only the edited subtree (`Parse::reparse`). Without a seed, the first
+query after the commit parses the whole file again, which is the cost the idea removes.
+
+> forwarded to db: `crates/base-db/` is lane db's.
+
+## fastcompile-intent 4: cargo: the daemon makes edits and builds intent ahead (`crates/blaze-cargo/src/serve/job.rs` `impl Builder for Jobs`, `serve/daemon.rs`, `serve/heads.rs`, `Cargo.toml`)
+
+What:
+
+- Add the dependency `blaze-intent = { workspace = true }`.
+- `Builder::speculate(job, view, work)`: as `start`, with the plane request opened idle
+  (request 2). Its reports go to the session, which drops them.
+- `Builder::promote(job)`: `PlaneInput::Promote` for the job's request.
+- `Work::Edit(edits)` runs on the job's view with its lowered front end
+  (`hir::db::HirDatabase`).
+  - Implement `blaze_intent::Files` over the view: a path to its `FileId` and the bytes the
+    VFS has, and a `FileId` back to its path, `None` outside the view.
+  - Call `blaze_intent::apply(db, &files, &edits)`.
+  - On `Ok`: report `Response::Edited(applied.edited)`, seed each of `applied.seeds`
+    (request 3), and finish `ok`. On `Err`: finish with the error.
+  - It builds nothing.
+- `Work::Ahead { targets, filter }` runs no test.
+  - Find the test units of `targets` as `Work::Test` does.
+  - Call `blaze_intent::ahead::plan(binaries, &filter)`, with each test's last executed
+    functions (blaze-testsel's record) as `reached`.
+  - Build and link `plan.units`, compiling `plan.hot` first under lazy codegen.
+- The exhaustive `Work` matches need the two new variants: `command_of`, `goal_of`,
+  `targets_of` and the answer match near `Work::Tables`. `Edit` has no targets and only
+  needs the view lowered; `Ahead` is the test command without the run.
+- Call `Session::tick(cx, now_ns)` with the daemon's monotonic clock before every other
+  `Session` call. Wake at `Session::deadline()`.
+- Call `Session::head_moved(cx, head, root)` after each commit the daemon makes itself (the
+  watcher's), so a save from the editor takes over or cancels its `WillSave`.
+- In `heads.rs` `named`, `Request::WillTest { view, .. }` reads its view's heads and
+  `Request::WillSave { head, .. }` reads `head`. `Request::Edit` names a root and reads none.
+
+Why: the daemon's half of ideas 9 and 10. The session (request 1) decides what to commit,
+promote and cancel; the daemon runs the work.
+
+> forwarded to cargo.

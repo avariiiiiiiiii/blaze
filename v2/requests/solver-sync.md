@@ -31,6 +31,8 @@ nightly, whole.
 Why: change 18 of `docs/v2/plan/design/compile-time.md`. The solver follows the pinned nightly
 instead of rust-analyzer's crates.io release.
 
+> forwarded to coordinator: `harness/` is its.
+
 ## 2. Owner of `Cargo.toml` and `Cargo.lock`: the vendored solver's dependencies
 
 - `Cargo.toml` `[workspace.dependencies]`: `thin-vec = "0.2.21"` (from `"0.2.16"`). The nightly's
@@ -49,6 +51,8 @@ Why: the vendored manifests now follow upstream's (`vendor/<crate>/Cargo.toml`, 
 Note: `crates/rustc_abi` is upstream's at nightly-2026-10-25, not -27. The nightly's
 `rustc_type_ir` builds against it (each item it uses is there). The next `toolchain_bump.py`
 copies both from one commit.
+
+> applied: root `[workspace.dependencies]` `thin-vec = "0.2.21"` and `rustc_type_ir_macros = { path = "vendor/rustc_type_ir_macros", version = "0.0.0" }` beside `rustc_type_ir`. `Cargo.lock` is not edited here: the thin-vec 0.2.21 bump, the new path package and `ra-ap-rustc_type_ir_macros` leaving are on the lock additions list in `/tmp/blaze-lanes/v2-requests.md`.
 
 ## 3. db-ty siblings (db-ty-next1): next_solver files outside solver-sync's children
 
@@ -73,3 +77,5 @@ Each item, with the port rule (rustc's rule, no compat aliases):
 
 Why: these files implement or call the solver's traits, so they fail to compile until they move.
 Questions: window `solver-sync`.
+
+> forwarded to db: db-ty-next1 is its child.

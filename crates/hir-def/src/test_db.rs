@@ -79,18 +79,6 @@ impl Default for TestDB {
     }
 }
 
-impl Clone for TestDB {
-    fn clone(&self) -> Self {
-        Self {
-            storage: self.storage.clone(),
-            files: self.files.clone(),
-            crates_map: self.crates_map.clone(),
-            events: self.events.clone(),
-            nonce: self.nonce,
-        }
-    }
-}
-
 #[salsa::db]
 impl salsa::Database for TestDB {}
 

@@ -12,38 +12,39 @@
 
 use std::{convert::Infallible, marker::PhantomData, num::NonZeroU32};
 
-use blaze_format::{FormatError, HEADER_LEN, Record, Slice, Writer};
+use blaze_format::{
+    FormatError, HEADER_LEN, Part, Record, SchemaHash, Slice, Writer, schema_of,
+};
 use hir_def::{AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId};
 use la_arena::{Idx, RawIdx};
 use rustc_abi::{ExternAbi, Size};
 use rustc_ast_ir::{FloatTy, IntTy, Mutability, UintTy};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
-    AliasRelationDirection, BoundConstness, BoundVar, BoundVarIndexKind, ConstVid, DebruijnIndex,
-    FloatVid, InferConst, InferTy, IntVid, PredicatePolarity, RegionVid, TyVid, TypeVisitable,
-    UniverseIndex,
+    Alias, AliasConstKind, BoundConstness, BoundVar, BoundVarIndexKind, ClausePolarity, ConstVid,
+    DebruijnIndex, FloatVid, InferConst, InferTy, IntVid, IsRigid, RegionVid, TyVid,
+    TypeVisitable, UniverseIndex,
     inherent::IntoKind,
 };
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
 use super::{
-    AdtDef, AliasTerm, AliasTermKind, AliasTy, AliasTyKind, Binder, BoundConst,
-    BoundExistentialPredicate, BoundExistentialPredicates, BoundRegion, BoundRegionKind, BoundTy,
-    BoundTyKind, BoundVarKinds, BoundVariableKind, CallableIdWrapper, Clause, ClauseKind, Clauses,
-    ClosureIdWrapper, CoercePredicate, Const, ConstKind, Consts, CoroutineClosureIdWrapper,
-    CoroutineIdWrapper, Ctor, DbInterner, EarlyParamRegion, ErrorGuaranteed, ExistentialPredicate,
-    ExistentialProjection, ExistentialTraitRef, ExprConst, FnHeader, FnSigKind, FreeConstAliasId,
-    FreeTermAliasId, FreeTyAliasId, GeneralConstIdWrapper, GenericArg, GenericArgKind,
-    GenericArgs, HostEffectPredicate, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId,
-    ImplOrTraitAssocTyId, InherentAssocConstId, InherentAssocTermId, InherentAssocTyId,
-    LateParamRegion, NormalizesTo, OpaqueTyIdWrapper, OutlivesPredicate, ParamConst, ParamTy,
+    AdtDef, AliasTermKind, AliasTyKind, Binder, BoundConst, BoundExistentialPredicate,
+    BoundExistentialPredicates, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, BoundVarKinds,
+    BoundVariableKind, CallableIdWrapper, Clause, ClauseKind, Clauses, ClosureIdWrapper,
+    CoercePredicate, Const, ConstKind, Consts, CoroutineClosureIdWrapper, CoroutineIdWrapper, Ctor,
+    DbInterner, EarlyParamRegion, ErrorGuaranteed, ExistentialPredicate, ExistentialProjection,
+    ExistentialTraitRef, ExprConst, FnHeader, FnSigKind, FreeConstAliasId, FreeTermAliasId,
+    FreeTyAliasId, GeneralConstIdWrapper, GenericArg, GenericArgKind, GenericArgs,
+    HostEffectClause, ImplOrTraitAssocConstId, ImplOrTraitAssocTermId, ImplOrTraitAssocTyId,
+    InherentAssocConstId, InherentAssocTermId, InherentAssocTyId, InternedConst, InternedRegion,
+    LateParamRegion, NormalizesTo, OpaqueTyIdWrapper, OutlivesClause, ParamConst, ParamTy,
     PatList, Pattern, PatternKind, PlaceholderConst, PlaceholderRegion, PlaceholderType, Predicate,
-    PredicateKind, ProjectionPredicate, Region, RegionKind, ScalarInt, SolverDefId,
-    SubtypePredicate, Term, TermKind, TraitAssocConstId, TraitAssocTermId, TraitAssocTyId,
-    TraitIdWrapper, TraitPredicate, TraitRef, Ty, TyKind, TypeAliasIdWrapper, Tys,
-    UnevaluatedConst, ValTree, ValTreeKind, ValueConst, abi::Safety, ensure_sufficient_stack,
-    interner::Symbol,
+    PredicateKind, ProjectionClause, Region, RegionKind, ScalarInt, SolverDefId, SubtypePredicate,
+    Term, TermKind, TraitAssocConstId, TraitAssocTermId, TraitAssocTyId, TraitClause,
+    TraitIdWrapper, TraitRef, Ty, TyKind, TypeAliasIdWrapper, Tys, ValTree, ValTreeKind,
+    ValueConst, abi::Safety, ensure_sufficient_stack, interner::Symbol,
 };
 
 /// Where a value's words go.
@@ -300,12 +301,9 @@ enum_code!(UintTy {
     5 => UintTy::U128,
 });
 enum_code!(FloatTy { 0 => FloatTy::F16, 1 => FloatTy::F32, 2 => FloatTy::F64, 3 => FloatTy::F128 });
-enum_code!(PredicatePolarity { 0 => PredicatePolarity::Positive, 1 => PredicatePolarity::Negative });
+enum_code!(ClausePolarity { 0 => ClausePolarity::Positive, 1 => ClausePolarity::Negative });
 enum_code!(BoundConstness { 0 => BoundConstness::Const, 1 => BoundConstness::Maybe });
-enum_code!(AliasRelationDirection {
-    0 => AliasRelationDirection::Equate,
-    1 => AliasRelationDirection::Subtype,
-});
+enum_code!(IsRigid { 0 => IsRigid::Yes, 1 => IsRigid::No });
 
 /// Structs whose fields are all public: their fields in order.
 macro_rules! struct_code {
@@ -328,14 +326,13 @@ struct_code! {
     ParamConst { id, index },
     EarlyParamRegion { id, index },
     LifetimeParamId { parent, local_id },
-    LateParamRegion<'db> { scope, bound_region },
+    LateParamRegion<'db> { scope, kind },
     BoundRegion<'db> { var, kind },
     BoundTy<'db> { var, kind },
-    UnevaluatedConst<'db> { def, args },
     ValueConst<'db> { ty, value },
-    TraitPredicate<'db> { trait_ref, polarity },
-    ProjectionPredicate<'db> { projection_term, term },
-    HostEffectPredicate<'db> { trait_ref, constness },
+    TraitClause<'db> { trait_ref, polarity },
+    ProjectionClause<'db> { projection_term, term },
+    HostEffectClause<'db> { trait_ref, constness },
     SubtypePredicate<'db> { a_is_expected, a, b },
     CoercePredicate<'db> { a, b },
     NormalizesTo<'db> { alias, term },
@@ -539,27 +536,15 @@ impl<'db> Code<'db> for ExistentialProjection<'db> {
     }
 }
 
-impl<'db> Code<'db> for AliasTy<'db> {
+impl<'db, K: Code<'db> + Copy> Code<'db> for Alias<DbInterner<'db>, K> {
     fn put(&self, sink: &mut impl Sink<'db>) {
         self.args.put(sink);
         self.kind.put(sink);
     }
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let args = Code::get(source)?;
-        let kind = Code::get(source)?;
-        Ok(AliasTy::from_checked_parts(kind, args))
-    }
-}
-
-impl<'db> Code<'db> for AliasTerm<'db> {
-    fn put(&self, sink: &mut impl Sink<'db>) {
-        self.args.put(sink);
-        self.kind.put(sink);
-    }
-    fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
-        let args = Code::get(source)?;
-        let kind = Code::get(source)?;
-        Ok(AliasTerm::from_checked_parts(kind, args))
+        let kind = K::get(source)?;
+        Ok(Alias::from_checked_parts(kind, args))
     }
 }
 
@@ -614,7 +599,7 @@ impl<'db> Code<'db> for AliasTermKind<'db> {
                 sink.word(3);
                 def_id.put(sink);
             }
-            AliasTermKind::UnevaluatedConst { def_id } => {
+            AliasTermKind::AnonConst { def_id } => {
                 sink.word(4);
                 def_id.put(sink);
             }
@@ -626,8 +611,12 @@ impl<'db> Code<'db> for AliasTermKind<'db> {
                 sink.word(6);
                 def_id.put(sink);
             }
-            AliasTermKind::InherentConst { def_id } => {
+            AliasTermKind::InherentConstSelf { def_id } => {
                 sink.word(7);
+                def_id.put(sink);
+            }
+            AliasTermKind::InherentConstImpl { def_id } => {
+                sink.word(8);
                 def_id.put(sink);
             }
         }
@@ -638,11 +627,49 @@ impl<'db> Code<'db> for AliasTermKind<'db> {
             1 => AliasTermKind::InherentTy { def_id: Code::get(source)? },
             2 => AliasTermKind::OpaqueTy { def_id: Code::get(source)? },
             3 => AliasTermKind::FreeTy { def_id: Code::get(source)? },
-            4 => AliasTermKind::UnevaluatedConst { def_id: Code::get(source)? },
+            4 => AliasTermKind::AnonConst { def_id: Code::get(source)? },
             5 => AliasTermKind::ProjectionConst { def_id: Code::get(source)? },
             6 => AliasTermKind::FreeConst { def_id: Code::get(source)? },
-            7 => AliasTermKind::InherentConst { def_id: Code::get(source)? },
+            7 => AliasTermKind::InherentConstSelf { def_id: Code::get(source)? },
+            8 => AliasTermKind::InherentConstImpl { def_id: Code::get(source)? },
             _ => return Err(source.invalid("an alias term kind")),
+        })
+    }
+}
+
+impl<'db> Code<'db> for AliasConstKind<DbInterner<'db>> {
+    fn put(&self, sink: &mut impl Sink<'db>) {
+        match *self {
+            AliasConstKind::Projection { def_id } => {
+                sink.word(0);
+                def_id.put(sink);
+            }
+            AliasConstKind::InherentSelf { def_id } => {
+                sink.word(1);
+                def_id.put(sink);
+            }
+            AliasConstKind::InherentImpl { def_id } => {
+                sink.word(2);
+                def_id.put(sink);
+            }
+            AliasConstKind::Free { def_id } => {
+                sink.word(3);
+                def_id.put(sink);
+            }
+            AliasConstKind::Anon { def_id } => {
+                sink.word(4);
+                def_id.put(sink);
+            }
+        }
+    }
+    fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+        Ok(match source.word()? {
+            0 => AliasConstKind::Projection { def_id: Code::get(source)? },
+            1 => AliasConstKind::InherentSelf { def_id: Code::get(source)? },
+            2 => AliasConstKind::InherentImpl { def_id: Code::get(source)? },
+            3 => AliasConstKind::Free { def_id: Code::get(source)? },
+            4 => AliasConstKind::Anon { def_id: Code::get(source)? },
+            _ => return Err(source.invalid("an alias constant kind")),
         })
     }
 }
@@ -934,7 +961,7 @@ impl<'db> Code<'db> for Clause<'db> {
     }
 }
 
-impl<'db, A: Code<'db>> Code<'db> for OutlivesPredicate<'db, A> {
+impl<'db, A: Code<'db>> Code<'db> for OutlivesClause<'db, A> {
     fn put(&self, sink: &mut impl Sink<'db>) {
         self.0.put(sink);
         self.1.put(sink);
@@ -942,7 +969,7 @@ impl<'db, A: Code<'db>> Code<'db> for OutlivesPredicate<'db, A> {
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let a = A::get(source)?;
         let region = Code::get(source)?;
-        Ok(rustc_type_ir::OutlivesPredicate(a, region))
+        Ok(rustc_type_ir::OutlivesClause(a, region))
     }
 }
 
@@ -1069,8 +1096,9 @@ impl<'db> Code<'db> for TyKind<'db> {
                 sink.word(22);
                 tys.put(sink);
             }
-            TyKind::Alias(alias) => {
+            TyKind::Alias(is_rigid, alias) => {
                 sink.word(23);
+                is_rigid.put(sink);
                 alias.put(sink);
             }
             TyKind::Param(param) => {
@@ -1122,7 +1150,7 @@ impl<'db> Code<'db> for TyKind<'db> {
             20 => TyKind::CoroutineWitness(Code::get(source)?, Code::get(source)?),
             21 => TyKind::Never,
             22 => TyKind::Tuple(Code::get(source)?),
-            23 => TyKind::Alias(Code::get(source)?),
+            23 => TyKind::Alias(Code::get(source)?, Code::get(source)?),
             24 => TyKind::Param(Code::get(source)?),
             25 => TyKind::Bound(Code::get(source)?, Code::get(source)?),
             26 => TyKind::Placeholder(Code::get(source)?),
@@ -1201,9 +1229,10 @@ impl<'db> Code<'db> for ConstKind<'db> {
                 sink.word(3);
                 placeholder.put(sink);
             }
-            ConstKind::Unevaluated(unevaluated) => {
+            ConstKind::Alias(is_rigid, alias) => {
                 sink.word(4);
-                unevaluated.put(sink);
+                is_rigid.put(sink);
+                alias.put(sink);
             }
             ConstKind::Value(value) => {
                 sink.word(5);
@@ -1226,7 +1255,7 @@ impl<'db> Code<'db> for ConstKind<'db> {
             1 => ConstKind::Infer(Code::get(source)?),
             2 => ConstKind::Bound(Code::get(source)?, Code::get(source)?),
             3 => ConstKind::Placeholder(Code::get(source)?),
-            4 => ConstKind::Unevaluated(Code::get(source)?),
+            4 => ConstKind::Alias(Code::get(source)?, Code::get(source)?),
             5 => ConstKind::Value(Code::get(source)?),
             6 => ConstKind::Error(Code::get(source)?),
             7 => ConstKind::Expr(Code::get(source)?),
@@ -1349,12 +1378,6 @@ impl<'db> Code<'db> for PredicateKind<'db> {
                 sink.word(6);
                 predicate.put(sink);
             }
-            PredicateKind::AliasRelate(a, b, direction) => {
-                sink.word(7);
-                a.put(sink);
-                b.put(sink);
-                direction.put(sink);
-            }
         }
     }
 
@@ -1367,11 +1390,6 @@ impl<'db> Code<'db> for PredicateKind<'db> {
             4 => PredicateKind::ConstEquate(Code::get(source)?, Code::get(source)?),
             5 => PredicateKind::Ambiguous,
             6 => PredicateKind::NormalizesTo(Code::get(source)?),
-            7 => PredicateKind::AliasRelate(
-                Code::get(source)?,
-                Code::get(source)?,
-                Code::get(source)?,
-            ),
             _ => return Err(source.invalid("a predicate")),
         })
     }
@@ -1434,11 +1452,35 @@ macro_rules! row_node {
 
 row_node!(
     Ty: TyKind<'db>,
-    Region: RegionKind<'db>,
-    Const: ConstKind<'db>,
     Pattern: PatternKind<'db>,
     Predicate: Binder<'db, PredicateKind<'db>>,
 );
+
+/// Regions and constants are `rustc_type_ir`'s structs over a handle: a node is the handle's
+/// row, and its words are the row's kind.
+macro_rules! handle_node {
+    ($($ty:ident($handle:ident): $kind:ty),* $(,)?) => {$(
+        impl<'db> Node<'db> for $ty<'db> {
+            const KIND: Kind = Kind::$ty;
+            #[inline]
+            fn row(self) -> NonZeroU32 {
+                self.0.row()
+            }
+            #[inline]
+            fn at(row: NonZeroU32) -> Self {
+                rustc_type_ir::$ty($handle::at(row))
+            }
+            fn put_node(self, sink: &mut impl Sink<'db>) {
+                self.kind().put(sink);
+            }
+            fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+                Ok(rustc_type_ir::$ty($handle::intern(<$kind>::get(source)?)))
+            }
+        }
+    )*};
+}
+
+handle_node!(Region(InternedRegion): RegionKind<'db>, Const(InternedConst): ConstKind<'db>);
 
 impl<'db> Node<'db> for ValTree<'db> {
     const KIND: Kind = Kind::ValTree;
@@ -1523,11 +1565,24 @@ blaze_format::record! {
     /// A persisted table of types and the other interned values they hold, each after the
     /// values it holds. A value's words end where the next value's start.
     #[derive(Clone, Copy, Debug)]
-    struct TableRec: 1 {
+    struct TableRec: 2 {
         nodes: Slice<NodeRec>,
         words: Slice<u32>,
     }
 }
+
+/// The version of the words a table holds: of the codec, which follows the variant order of the
+/// kinds of the pinned `rustc_type_ir`. Changes with any change to a `Code` impl.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// The schema of a persisted type table, for the schema of a buffer that holds one: a table
+/// written by another codec reads as a schema mismatch, never as other values.
+pub const TABLE_SCHEMA: SchemaHash = schema_of(&[
+    Part::Str("hir_ty::next_solver::persist::TyTable"),
+    Part::U64(FORMAT_VERSION),
+    Part::Schema(<TableRec as Record>::SCHEMA),
+    Part::Schema(<NodeRec as Record>::SCHEMA),
+]);
 
 /// Writes the types (and regions, constants, lists and clauses) of a query result into a table
 /// of its own, each once: each is named by its place in the table, from the `u32` its method
@@ -1688,22 +1743,21 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
             // A value's children are places of values read before it, so reading one is
             // shallow: no stack check.
             let row = match kind {
-                Kind::Ty => Ty::get_node(&mut source).map(Ty::row),
-                Kind::Region => Region::get_node(&mut source).map(Region::row),
-                Kind::Const => Const::get_node(&mut source).map(Const::row),
-                Kind::Pattern => Pattern::get_node(&mut source).map(Pattern::row),
-                Kind::Predicate => Predicate::get_node(&mut source).map(Predicate::row),
-                Kind::ValTree => ValTree::get_node(&mut source).map(ValTree::row),
-                Kind::GenericArgs => GenericArgs::get_node(&mut source).map(GenericArgs::row),
-                Kind::Tys => Tys::get_node(&mut source).map(Tys::row),
-                Kind::Consts => Consts::get_node(&mut source).map(Consts::row),
-                Kind::BoundVarKinds => {
-                    BoundVarKinds::get_node(&mut source).map(BoundVarKinds::row)
+                Kind::Ty => Ty::get_node(&mut source).map(Node::row),
+                Kind::Region => Region::get_node(&mut source).map(Node::row),
+                Kind::Const => Const::get_node(&mut source).map(Node::row),
+                Kind::Pattern => Pattern::get_node(&mut source).map(Node::row),
+                Kind::Predicate => Predicate::get_node(&mut source).map(Node::row),
+                Kind::ValTree => ValTree::get_node(&mut source).map(Node::row),
+                Kind::GenericArgs => GenericArgs::get_node(&mut source).map(Node::row),
+                Kind::Tys => Tys::get_node(&mut source).map(Node::row),
+                Kind::Consts => Consts::get_node(&mut source).map(Node::row),
+                Kind::BoundVarKinds => BoundVarKinds::get_node(&mut source).map(Node::row),
+                Kind::PatList => PatList::get_node(&mut source).map(Node::row),
+                Kind::BoundExistentialPredicates => {
+                    BoundExistentialPredicates::get_node(&mut source).map(Node::row)
                 }
-                Kind::PatList => PatList::get_node(&mut source).map(PatList::row),
-                Kind::BoundExistentialPredicates => BoundExistentialPredicates::get_node(&mut source)
-                    .map(BoundExistentialPredicates::row),
-                Kind::Clauses => Clauses::get_node(&mut source).map(Clauses::row),
+                Kind::Clauses => Clauses::get_node(&mut source).map(Node::row),
             }?;
             if !source.words.is_empty() {
                 return Err(FormatError::Invalid { at, what: "a type table value with words left over" });
@@ -1823,6 +1877,25 @@ mod tests {
     use super::*;
     use crate::{db::GeneralConstId, next_solver::TermId};
 
+    #[test]
+    fn record_at_views_only_checked_bytes_in_bounds_and_aligned() {
+        let mut bytes = vec![0u8; HEADER_LEN + 24];
+        bytes[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&0x0123_4567_89AB_CDEFu64.to_ne_bytes());
+        bytes[HEADER_LEN + 8] = 1;
+        bytes[HEADER_LEN + 9] = 2;
+        let buffer = Aligned::copy_from(&bytes);
+        let at = HEADER_LEN as u64;
+        // The view equals the bytes read out safely.
+        let copied = u64::from_ne_bytes(bytes[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap());
+        assert_eq!(*record_at::<u64>(&buffer, at).unwrap(), copied);
+        assert!(*record_at::<bool>(&buffer, at + 8).unwrap());
+        assert!(record_at::<bool>(&buffer, at + 9).is_err(), "2 is no `bool`");
+        assert!(record_at::<u64>(&buffer, at + 1).is_err(), "misaligned");
+        assert!(record_at::<u64>(&buffer, at - 8).is_err(), "in the header");
+        assert!(record_at::<u64>(&buffer, bytes.len() as u64).is_err(), "past the end");
+        assert!(record_at::<u64>(&buffer, u64::MAX).is_err(), "past any buffer");
+    }
+
     fn id<T: FromId>(index: u32) -> T {
         T::from_id(salsa::Id::from_bits(u64::from(index)))
     }
@@ -1845,9 +1918,17 @@ mod tests {
         args: GenericArgs<'db>,
     }
 
+    fn region<'db>(kind: RegionKind<'db>) -> Region<'db> {
+        rustc_type_ir::Region(InternedRegion::intern(kind))
+    }
+
+    fn konst<'db>(kind: ConstKind<'db>) -> Const<'db> {
+        rustc_type_ir::Const(InternedConst::intern(kind))
+    }
+
     fn samples<'db>() -> Samples<'db> {
         let u8 = Ty::intern(TyKind::Uint(UintTy::U8));
-        let statik = Region::intern(RegionKind::ReStatic);
+        let statik = region(RegionKind::ReStatic);
         let function: FunctionId = id(3);
         let generic = GenericDefId::FunctionId(function);
         let param = TypeParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(0) });
@@ -1867,7 +1948,7 @@ mod tests {
             BoundVariableKind::Ty(BoundTyKind::Param(SolverDefId::TypeAliasId(alias))),
             BoundVariableKind::Const,
         ]);
-        let seven = Const::intern(ConstKind::Value(ValueConst::new(
+        let seven = konst(ConstKind::Value(ValueConst::new(
             u8,
             ValTreeKind::Leaf(ScalarInt::from(7u8)),
         )));
@@ -1875,6 +1956,8 @@ mod tests {
         let trait_ref = TraitRef::from_checked_parts(trait_, args);
         let alias_term = |kind| AliasTerm::from_checked_parts(kind, args);
         let alias_ty = |kind| AliasTy::from_checked_parts(kind, args);
+        let alias_const = |kind| AliasConst::from_checked_parts(kind, args);
+        let anon: AnonConstId<'db> = general;
         let bound_ty = |var, kind| BoundTy { var: BoundVar::from_u32(var), kind };
         let bound_region = |var, kind| BoundRegion { var: BoundVar::from_u32(var), kind };
         let range = PatternKind::Range { start: seven, end: seven };
@@ -1894,7 +1977,11 @@ mod tests {
             TyKind::Slice(u8),
             TyKind::RawPtr(u8, Mutability::Mut),
             TyKind::Ref(statik, u8, Mutability::Not),
-            TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), args),
+            TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), Binder::dummy(args)),
+            TyKind::FnDef(
+                CallableIdWrapper(CallableDefId::FunctionId(function)),
+                Binder::bind_with_vars(args, vars),
+            ),
             TyKind::FnPtr(
                 Binder::bind_with_vars(rustc_type_ir::FnSigTys { inputs_and_output: pair }, vars),
                 FnHeader { fn_sig_kind: FnSigKind::new(ExternAbi::C { unwind: false }, Safety::Safe, true) },
@@ -1930,10 +2017,23 @@ mod tests {
             TyKind::Never,
             TyKind::Tuple(pair),
             TyKind::Tuple(Tys::empty()),
-            TyKind::Alias(alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId(alias) })),
-            TyKind::Alias(alias_ty(AliasTyKind::Inherent { def_id: InherentAssocTyId(alias) })),
-            TyKind::Alias(alias_ty(AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(id(10)) })),
-            TyKind::Alias(alias_ty(AliasTyKind::Free { def_id: FreeTyAliasId(alias) })),
+            TyKind::Alias(
+                IsRigid::No,
+                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId(alias) }),
+            ),
+            TyKind::Alias(
+                IsRigid::Yes,
+                alias_ty(AliasTyKind::Projection { def_id: TraitAssocTyId(alias) }),
+            ),
+            TyKind::Alias(
+                IsRigid::No,
+                alias_ty(AliasTyKind::Inherent { def_id: InherentAssocTyId(alias) }),
+            ),
+            TyKind::Alias(
+                IsRigid::Yes,
+                alias_ty(AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(id(10)) }),
+            ),
+            TyKind::Alias(IsRigid::No, alias_ty(AliasTyKind::Free { def_id: FreeTyAliasId(alias) })),
             TyKind::Param(ParamTy { id: param, index: 0 }),
             TyKind::Bound(BoundVarIndexKind::Bound(INNERMOST), bound_ty(4, BoundTyKind::Anon)),
             TyKind::Bound(
@@ -1962,7 +2062,7 @@ mod tests {
             RegionKind::ReBound(BoundVarIndexKind::Canonical, bound_region(0, BoundRegionKind::Anon)),
             RegionKind::ReLateParam(LateParamRegion {
                 scope: SolverDefId::FunctionId(function),
-                bound_region: bound_region(1, BoundRegionKind::ClosureEnv),
+                kind: LATE_PARAM_KIND,
             }),
             RegionKind::ReStatic,
             RegionKind::ReVar(RegionVid::from_u32(9)),
@@ -1984,7 +2084,23 @@ mod tests {
                 UniverseIndex::ROOT,
                 BoundConst::new(BoundVar::from_u32(0)),
             )),
-            ConstKind::Unevaluated(UnevaluatedConst { def: general, args }),
+            ConstKind::Alias(
+                IsRigid::No,
+                alias_const(AliasConstKind::Projection { def_id: TraitAssocConstId(id(6)) }),
+            ),
+            ConstKind::Alias(
+                IsRigid::Yes,
+                alias_const(AliasConstKind::InherentSelf { def_id: InherentAssocConstId(id(6)) }),
+            ),
+            ConstKind::Alias(
+                IsRigid::No,
+                alias_const(AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id(6)) }),
+            ),
+            ConstKind::Alias(
+                IsRigid::No,
+                alias_const(AliasConstKind::Free { def_id: FreeConstAliasId(id(6)) }),
+            ),
+            ConstKind::Alias(IsRigid::Yes, alias_const(AliasConstKind::Anon { def_id: anon })),
             ConstKind::Value(ValueConst::new(u8, ValTreeKind::Leaf(ScalarInt::from(7u8)))),
             ConstKind::Value(ValueConst::new(
                 Ty::intern(TyKind::Tuple(pair)),
@@ -2005,19 +2121,19 @@ mod tests {
             Binder::dummy(PredicateKind::NormalizesTo(NormalizesTo { alias: alias_term(kind), term }))
         };
         let predicates = vec![
-            clause(ClauseKind::Trait(TraitPredicate { trait_ref, polarity: PredicatePolarity::Positive })),
-            clause(ClauseKind::Trait(TraitPredicate { trait_ref, polarity: PredicatePolarity::Negative })),
-            clause(ClauseKind::RegionOutlives(rustc_type_ir::OutlivesPredicate(statik, statik))),
-            clause(ClauseKind::TypeOutlives(rustc_type_ir::OutlivesPredicate(u8, statik))),
-            clause(ClauseKind::Projection(ProjectionPredicate {
+            clause(ClauseKind::Trait(TraitClause { trait_ref, polarity: ClausePolarity::Positive })),
+            clause(ClauseKind::Trait(TraitClause { trait_ref, polarity: ClausePolarity::Negative })),
+            clause(ClauseKind::RegionOutlives(rustc_type_ir::OutlivesClause(statik, statik))),
+            clause(ClauseKind::TypeOutlives(rustc_type_ir::OutlivesClause(u8, statik))),
+            clause(ClauseKind::Projection(ProjectionClause {
                 projection_term: alias_term(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(alias) }),
                 term: u8.into(),
             })),
             clause(ClauseKind::ConstArgHasType(seven, u8)),
             clause(ClauseKind::WellFormed(u8.into())),
             clause(ClauseKind::ConstEvaluatable(seven)),
-            clause(ClauseKind::HostEffect(HostEffectPredicate { trait_ref, constness: BoundConstness::Const })),
-            clause(ClauseKind::HostEffect(HostEffectPredicate { trait_ref, constness: BoundConstness::Maybe })),
+            clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Const })),
+            clause(ClauseKind::HostEffect(HostEffectClause { trait_ref, constness: BoundConstness::Maybe })),
             clause(ClauseKind::UnstableFeature(Symbol)),
             Binder::dummy(PredicateKind::DynCompatible(trait_)),
             Binder::dummy(PredicateKind::Subtype(SubtypePredicate { a_is_expected: true, a: u8, b: u8 })),
@@ -2027,20 +2143,22 @@ mod tests {
             normalizes(AliasTermKind::InherentTy { def_id: InherentAssocTyId(alias) }, u8.into()),
             normalizes(AliasTermKind::OpaqueTy { def_id: OpaqueTyIdWrapper(id(10)) }, u8.into()),
             normalizes(AliasTermKind::FreeTy { def_id: FreeTyAliasId(alias) }, u8.into()),
-            normalizes(AliasTermKind::UnevaluatedConst { def_id: general }, seven.into()),
+            normalizes(AliasTermKind::ProjectionTy { def_id: TraitAssocTyId(alias) }, u8.into()),
+            normalizes(AliasTermKind::AnonConst { def_id: anon }, seven.into()),
             normalizes(AliasTermKind::ProjectionConst { def_id: TraitAssocConstId(id(6)) }, seven.into()),
             normalizes(AliasTermKind::FreeConst { def_id: FreeConstAliasId(id(6)) }, seven.into()),
-            normalizes(AliasTermKind::InherentConst { def_id: InherentAssocConstId(id(6)) }, seven.into()),
-            Binder::dummy(PredicateKind::AliasRelate(
-                u8.into(),
+            normalizes(
+                AliasTermKind::InherentConstSelf { def_id: InherentAssocConstId(id(6)) },
                 seven.into(),
-                AliasRelationDirection::Subtype,
-            )),
-            Binder::dummy(PredicateKind::AliasRelate(u8.into(), u8.into(), AliasRelationDirection::Equate)),
+            ),
+            normalizes(
+                AliasTermKind::InherentConstImpl { def_id: InherentAssocConstId(id(6)) },
+                seven.into(),
+            ),
             Binder::bind_with_vars(
-                PredicateKind::Clause(ClauseKind::Trait(TraitPredicate {
+                PredicateKind::Clause(ClauseKind::Trait(TraitClause {
                     trait_ref,
-                    polarity: PredicatePolarity::Positive,
+                    polarity: ClausePolarity::Positive,
                 })),
                 vars,
             ),

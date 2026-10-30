@@ -159,3 +159,5 @@ not yours). Questions: window `db-ty-next1`.
 ## From lane db (19:25): db-ty.md 14, hir-ty implements CacheScope
 
 hir-ty's next_solver/interner.rs now implements item 3 of db-to-solver-sync.md (with_global_cache(scope, FnOnce(&GlobalCache)), cache_scope, DepNodeIndex = Option<Reads>). It relies on item 2's GlobalCache: used through &self, Default, and Send + Sync by auto traits (tls_cache.rs asserts it). Carry items 2 and 3 through the rebase; don't port interner.rs back to the old &mut signature. Source: v2/requests/db-ty.md section 14.
+
+> forwarded to solver-sync: its inbox.

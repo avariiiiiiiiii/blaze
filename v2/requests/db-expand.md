@@ -245,3 +245,24 @@ section above.
 > applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` runs `run_all` in order on the calling thread, as asked.
 > applied (items): the `fork` added to `crates/blaze-items/src/tests/db.rs` for the section above is removed, as `SourceDatabase` no longer has it.
 > forwarded to codegen: `crates/hir-ty-codegen/v2/tests/db.rs` has no `run_all`.
+
+## `line!()` and `column!()` are real values in hir-expand (db-expand-next1, for codegen)
+
+What: `hir-expand`'s `line!()`/`column!()` now expand to the call's real line and column as a
+`u32` literal (rustc's `expansion_cause`; `crates/hir-expand/src/builtin/fn_macro.rs`
+`place_expand`), no longer the `0u32` placeholder. Drop `BuiltinFnLikeExpander::Line`/`Column`
+from `crates/hir-ty-mir/src/mir/location.rs` (`location_macros`, `located_concats`, `placed`) and
+from `crates/hir-ty-codegen/mod.rs` (`builtin_location`, `located_concat`, `mentions_location`),
+keeping `file!` (and `concat!` with `file!`). A `concat!` of `line!()` already holds the number.
+
+Why: the override is now wrong, not only redundant. `location.rs`'s column counts display width
+(`column_width`), which is what `#[track_caller]`'s `Location::column` counts (rustc's
+`col_display`), but `column!` counts code points (std's docs: `"人之初性本善"` gives the same
+column as `"foobar"`, `col.to_usize() + 1` in rustc's `expand_column`). Keep `column_width` for
+`track_caller`. `hir_expand::builtin::{written_place, line_and_column, line_starts}` are public if
+anything still needs the place of a call.
+
+Also (db, `crates/hir/src/semantics.rs:601`): `expand_allowed_builtins` may drop `Column` from its
+skip list, since its expansion is no longer a dummy.
+
+> forwarded to codegen: a note for it from db-expand.

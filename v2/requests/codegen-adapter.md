@@ -519,3 +519,5 @@ own `Homes`. Devspeed item 1 holds: `backend::built` goes through `instance_code
     still reaches `ItemHashes` and fails loudly. To codegen-mir: evaluate `Expr` constants in
     `Filler::try_fold_const` once their operands are values, as rustc's
     `normalize_erasing_regions` does.
+
+> applied: noted; a status report to codegen.

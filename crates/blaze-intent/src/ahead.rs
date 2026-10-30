@@ -3,7 +3,8 @@
 //! them reached first. The daemon builds those units at low priority and, with lazy codegen,
 //! compiles those functions first; it runs nothing.
 //!
-//! Selection is libtest's: a test is selected when its name contains any of the filters.
+//! Selection is libtest's: a test is selected when its name contains any of the filters, and
+//! every test when there are none.
 
 use blaze_items::CodeHash;
 use rustc_hash::FxHashMap;
@@ -42,7 +43,7 @@ pub fn plan(binaries: &[Binary<'_>], filters: &[String]) -> Plan {
     for binary in binaries {
         let mut selected = false;
         for test in binary.tests {
-            let mut hit = false;
+            let mut hit = filters.is_empty();
             for (at, filter) in filters.iter().enumerate() {
                 if test.name.contains(filter.as_str()) {
                     matched[at] = true;
@@ -96,8 +97,12 @@ mod tests {
     }
 
     #[test]
-    fn no_filter_selects_nothing() {
-        let tests = [Test { name: "t", reached: &[] }];
-        assert_eq!(plan(&[Binary { unit: 0, tests: &tests }], &[]), Plan::default());
+    fn no_filter_selects_every_test_as_libtest_does() {
+        let (a, b) = (hash(1), hash(2));
+        let first = [Test { name: "t", reached: &[a] }];
+        let second = [Test { name: "u", reached: &[a, b] }];
+        let binaries = [Binary { unit: 0, tests: &first }, Binary { unit: 1, tests: &second }];
+        let plan = plan(&binaries, &[]);
+        assert_eq!((plan.units, plan.hot, plan.unmatched), (vec![0, 1], vec![a, b], Vec::<String>::new()));
     }
 }

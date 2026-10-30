@@ -73,6 +73,8 @@ Order:
 - **`fastcompile`**: the twelve changes in `plan/design/compile-time.md`, in new crates
   (`blaze-stencil`, `blaze-lazy`, `blaze-premap`, `blaze-intent`, `blaze-history`,
   `blaze-global`) and `tools/pgo/`, with hooks in other lanes' crates by request.
+- **`frontend`**: makes `plan/design/frontend.md` (rust-analyzer's design, fixed) and
+  `plan/design/restore.md` (instant restore) true across lanes, building what no lane started.
 
 ## 19. How the coordinator integrates
 

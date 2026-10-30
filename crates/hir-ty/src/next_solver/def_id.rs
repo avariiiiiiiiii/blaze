@@ -50,7 +50,9 @@ pub enum SolverDefId<'db> {
 
 impl std::fmt::Debug for SolverDefId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let interner = DbInterner::conjure();
+        // SAFETY: the interner and its database are used only in this call, inside the
+        // attachment that is on the stack now.
+        let interner = unsafe { DbInterner::conjure() };
         let db = interner.db;
         match *self {
             SolverDefId::AdtId(AdtId::StructId(id)) => {

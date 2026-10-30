@@ -779,3 +779,5 @@ For safety-check (`check.rs`, `check/valid.rs`); no change to the parent's files
 - `RetagMode::Raw`/`None` and a `&mut`/`Box` to a `!Unpin` pointee are no-ops (`Ok(None)`).
   Accesses, frees and retags of a non-empty range of a dead allocation panic: memory checks
   liveness first.
+
+> forwarded to safety: between its children.

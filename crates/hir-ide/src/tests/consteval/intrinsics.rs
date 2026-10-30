@@ -1203,61 +1203,128 @@ fn discriminant_value() {
 }
 
 #[test]
-fn likely() {
-    check_number(
-        r#"
-        #[rustc_intrinsic]
-        pub const fn likely(b: bool) -> bool {
-            b
-        }
-
-        #[rustc_intrinsic]
-        pub const fn unlikely(b: bool) -> bool {
-            b
-        }
-
-        const GOAL: bool = likely(true) && unlikely(true) && !likely(false) && !unlikely(false);
-        "#,
-        1,
-    );
-}
-
-#[test]
 fn floating_point() {
     // FIXME(#17451): Add `f16` and `f128` tests once intrinsics are added.
+    // The pinned nightly's float intrinsics are generic over the float: the width is the
+    // argument's.
     check_number(
         r#"
         #[rustc_intrinsic]
-        pub fn sqrtf32(x: f32) -> f32;
+        pub fn sqrt<T>(x: T) -> T;
         #[rustc_intrinsic]
-        pub fn powf32(a: f32, x: f32) -> f32;
+        pub fn powf<T>(a: T, x: T) -> T;
         #[rustc_intrinsic]
-        pub fn fmaf32(a: f32, b: f32, c: f32) -> f32;
+        pub fn fma<T>(a: T, b: T, c: T) -> T;
 
-        const GOAL: f32 = sqrtf32(1.2) + powf32(3.4, 5.6) + fmaf32(-7.8, 1.3, 2.4);
+        const GOAL: f32 = sqrt(1.2f32) + powf(3.4f32, 5.6f32) + fma(-7.8f32, 1.3f32, 2.4f32);
         "#,
         i128::from_le_bytes(pad16(
             &f32::to_le_bytes(1.2f32.sqrt() + 3.4f32.powf(5.6) + (-7.8f32).mul_add(1.3, 2.4)),
             IsSigned::Yes,
         )),
     );
-    // FIXME: this should be an `expect`, but that currently results in `lint_expectation_unfulfilled`
-    #[allow(clippy::unnecessary_min_or_max, reason = "for symmetry with the expression in `GOAL`")]
+    // `copysignf64` carries its width in its name.
     check_number(
         r#"
         #[rustc_intrinsic]
-        pub fn powif64(a: f64, x: i32) -> f64;
+        pub fn powi<T>(a: T, x: i32) -> T;
         #[rustc_intrinsic]
-        pub fn sinf64(x: f64) -> f64;
+        pub fn sin<T>(x: T) -> T;
         #[rustc_intrinsic]
-        pub fn minnumf64(x: f64, y: f64) -> f64;
+        pub fn copysignf64(x: f64, y: f64) -> f64;
 
-        const GOAL: f64 = powif64(1.2, 5) + sinf64(3.4) + minnumf64(-7.8, 1.3);
+        const GOAL: f64 = powi(1.2f64, 5) + sin(3.4f64) + copysignf64(-7.8, 1.3);
         "#,
         i128::from_le_bytes(pad16(
-            &f64::to_le_bytes(1.2f64.powi(5) + 3.4f64.sin() + (-7.8f64).min(1.3)),
+            &f64::to_le_bytes(1.2f64.powi(5) + 3.4f64.sin() + (-7.8f64).copysign(1.3)),
             IsSigned::Yes,
         )),
+    );
+    // Rounds half to even, where `round` rounds half away from zero.
+    check_number(
+        r#"
+        #[rustc_intrinsic]
+        pub fn round_ties_even<T>(x: T) -> T;
+        #[rustc_intrinsic]
+        pub fn round<T>(x: T) -> T;
+
+        const GOAL: f64 = round_ties_even(2.5f64) * 10.0 + round(2.5f64);
+        "#,
+        i128::from_le_bytes(pad16(&f64::to_le_bytes(23.0), IsSigned::Yes)),
+    );
+}
+
+#[test]
+fn float_intrinsic_of_f16_is_refused_naming_it() {
+    check_fail(
+        r#"
+        #[rustc_intrinsic]
+        pub fn sqrt<T>(x: T) -> T;
+
+        const GOAL: f16 = sqrt(1.0f16);
+        "#,
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::NotSupported(it)) if it.contains("sqrt")
+            )
+        },
+    );
+}
+
+#[test]
+fn unknown_intrinsic_is_a_lowering_error_naming_it() {
+    // An older nightly's name, which the pinned nightly's rustc refuses (E0093).
+    check_fail(
+        r#"
+        #[rustc_intrinsic]
+        pub fn sqrtf32(x: f32) -> f32;
+
+        const GOAL: f32 = sqrtf32(1.2);
+        "#,
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirLowerError(MirLowerError::UnknownIntrinsic(name))
+                    if name.as_str() == "sqrtf32"
+            )
+        },
+    );
+}
+
+#[test]
+fn intrinsic_with_a_fallback_body_runs_it() {
+    // `minimum_number_nsz_f64` is not one the evaluator implements: its body runs, as rustc
+    // runs an intrinsic's fallback body.
+    check_number(
+        r#"
+        #[rustc_intrinsic]
+        pub const fn minimum_number_nsz_f64(x: f64, y: f64) -> f64 {
+            if x != x || y <= x { y } else { x }
+        }
+
+        const GOAL: f64 = minimum_number_nsz_f64(-7.8, 1.3);
+        "#,
+        i128::from_le_bytes(pad16(&f64::to_le_bytes(-7.8), IsSigned::Yes)),
+    );
+}
+
+#[test]
+fn intrinsic_with_no_body_and_no_implementation_is_refused_naming_it() {
+    check_fail(
+        r#"
+        #[rustc_intrinsic]
+        pub fn breakpoint();
+
+        const GOAL: u8 = { breakpoint(); 0 };
+        "#,
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::NotSupported(it))
+                    if it.contains("breakpoint")
+            )
+        },
     );
 }
 
@@ -1682,7 +1749,6 @@ const SIMD: &str = r#"
     #[rustc_intrinsic] pub const unsafe fn simd_relaxed_fma<T>(x: T, y: T, z: T) -> T;
     #[rustc_intrinsic] pub const unsafe fn simd_minimum_number_nsz<T>(x: T, y: T) -> T;
     #[rustc_intrinsic] pub const unsafe fn simd_maximum_number_nsz<T>(x: T, y: T) -> T;
-    #[rustc_intrinsic] pub const unsafe fn simd_fmin<T>(x: T, y: T) -> T;
     #[rustc_intrinsic] pub const unsafe fn simd_eq<T, U>(x: T, y: T) -> U;
     #[rustc_intrinsic] pub const unsafe fn simd_ne<T, U>(x: T, y: T) -> U;
     #[rustc_intrinsic] pub const unsafe fn simd_lt<T, U>(x: T, y: T) -> U;
@@ -1932,10 +1998,6 @@ fn simd_float_arithmetic() {
     check(
         &format!("const GOAL: f32x4 = unsafe {{ simd_maximum_number_nsz({nans}) }};"),
         f32s([1.0, 1.0, 2.0, NAN32]),
-    );
-    check(
-        &format!("const GOAL: f32x4 = unsafe {{ simd_fmin({nans}) }};"),
-        f32s([1.0, 1.0, -3.0, NAN32]),
     );
     check(
         "const GOAL: f32x4 = unsafe { simd_neg(f32x4([1.0, -0.0, 2.5, 1.0 / 0.0])) };",

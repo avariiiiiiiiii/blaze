@@ -25,6 +25,7 @@
 
 use std::num::{IntErrorKind, NonZeroU32};
 
+use blaze_ids::radix;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;
 use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
@@ -797,7 +798,9 @@ pub(crate) fn crate_checks(
             keyed.push((key, at, diag));
         }
     }
-    keyed.sort_by_key(|it| it.0);
+    radix::sort_by_key(&mut keyed, |&((def, kind), _, _)| {
+        radix::pack_64(def as u64, u64::from(kind))
+    });
     keyed.into_iter().map(|(_, at, diag)| (at, diag)).collect()
 }
 

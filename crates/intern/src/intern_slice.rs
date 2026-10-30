@@ -12,12 +12,14 @@ use std::{
     marker::PhantomData,
     ops::Deref,
     ptr::{self, NonNull},
-    sync::OnceLock,
 };
 
 use rustc_hash::FxBuildHasher;
 
-use crate::arena::{Entry, Store};
+use crate::{
+    arena::{Entry, Store},
+    sync::OnceLock,
+};
 
 /// A header followed by a slice, laid out as one value.
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -360,9 +362,11 @@ mod tests {
         }
     }
 
+    #[cfg(not(blaze_check))]
     crate::impl_slice_internable!(Racing, (), u64);
 
     /// Threads interning overlapping new slices in different orders get pointer-equal handles.
+    #[cfg(not(blaze_check))]
     #[test]
     fn slices_race_to_one_handle() {
         const THREADS: u64 = 16;
@@ -397,9 +401,11 @@ mod tests {
         }
     }
 
+    #[cfg(not(blaze_check))]
     crate::impl_slice_internable!(Kept, String, u16);
 
     /// Enough slices to fill many chunks of every shard: the first still read their contents.
+    #[cfg(not(blaze_check))]
     #[test]
     fn slice_handles_stay_valid() {
         let early: Vec<_> = (0..256u16)
@@ -419,5 +425,138 @@ mod tests {
                 InternedSlice::<Kept>::from_header_and_slice(format!("early {n}"), &[n, n + 1])
             );
         }
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
+/// model_`): a slice type's first interns racing to make its store, against a set: the header
+/// kept is the first intern's of each value, every other header is dropped once, equal slices
+/// get one handle, and a handle reads its header, length and items whole.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicPtr, Ordering::Relaxed},
+    };
+
+    use blaze_check::{
+        linear::{History, Spec},
+        thread,
+    };
+
+    use super::*;
+
+    /// A header that says when it is dropped. An interned header never is, so one dropped by
+    /// the time `from_header_and_slice` returns was found there already.
+    struct Counted {
+        value: u64,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Counted {
+        fn new(value: u64) -> (Counted, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (Counted { value, dropped: dropped.clone() }, dropped)
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            assert!(!self.dropped.swap(true, Relaxed), "a header dropped twice");
+        }
+    }
+
+    impl PartialEq for Counted {
+        fn eq(&self, other: &Counted) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl Hash for Counted {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
+        }
+    }
+
+    struct Modeled;
+
+    /// This execution's storage. A `static` one would keep the store the first execution made,
+    /// whose atomics each later execution starts again from null while its values stay.
+    static CURRENT: AtomicPtr<InternSliceStorage<Modeled>> = AtomicPtr::new(ptr::null_mut());
+
+    impl SliceInternable for Modeled {
+        type Header = Counted;
+        type SliceType = u64;
+
+        fn storage() -> &'static InternSliceStorage<Modeled> {
+            // SAFETY: `model_first_slices_race` points `CURRENT` at a storage it frees only after
+            // joining every thread that interns, and clears it first. The model's threads are
+            // coroutines on its one OS thread, so this `Relaxed` load sees that store.
+            unsafe { CURRENT.load(Relaxed).as_ref() }.expect("a model's storage")
+        }
+    }
+
+    /// `value`'s items: one more than the value, so each value has its own layout.
+    fn items(value: u64) -> Vec<u64> {
+        (0..=value).map(|i| value * 100 + i).collect()
+    }
+
+    /// The sequential interner: bit `v` is set when value `v`'s slice is in it.
+    #[derive(Clone, PartialEq, Eq, Hash, Default)]
+    struct Set(u8);
+
+    impl Spec for Set {
+        /// The value whose header and items are interned.
+        type Op = u64;
+        /// Whether this call's header is the one kept: the slice was not there.
+        type Ret = bool;
+
+        fn apply(&mut self, &value: &u64) -> bool {
+            let new = self.0 & (1 << value) == 0;
+            self.0 |= 1 << value;
+            new
+        }
+    }
+
+    fn intern(history: &History<Set>, value: u64) -> InternedSlice<Modeled> {
+        let mut handle = None;
+        history.record(value, |&value| {
+            let (header, dropped) = Counted::new(value);
+            let items = items(value);
+            let interned = InternedSlice::<Modeled>::from_header_and_slice(header, &items);
+            assert!(
+                interned.header.header.value == value
+                    && interned.header.length == items.len()
+                    && interned.slice == items[..],
+                "a handle reads its header, length and items whole"
+            );
+            handle = Some(interned.to_owned());
+            !dropped.load(Relaxed)
+        });
+        handle.expect("a recorded intern")
+    }
+
+    #[test]
+    fn model_first_slices_race() {
+        blaze_check::model(|| {
+            let storage = Box::new(InternSliceStorage::<Modeled>::new());
+            CURRENT.store(ptr::from_ref(&*storage).cast_mut(), Relaxed);
+            let history = Arc::new(History::<Set>::new());
+            let other = {
+                let history = history.clone();
+                thread::spawn(move || [1, 2].map(|value| intern(&history, value)))
+            };
+            let two = intern(&history, 2);
+            let one = intern(&history, 1);
+            let [one_there, two_there] = other.join().unwrap();
+            history.check(Set::default());
+            assert!(one == one_there && two == two_there, "equal slices, one handle");
+            assert!(one != two, "two slices, two handles");
+            assert_eq!(storage.get().len(), 2, "one store, made once");
+            CURRENT.store(ptr::null_mut(), Relaxed);
+            drop(storage);
+        });
     }
 }

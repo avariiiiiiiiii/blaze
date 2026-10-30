@@ -12,6 +12,7 @@
 //! `psess.gated_spans.gate`, and `ungate_last` of `specialization` for a `default fn`), and
 //! `compiler/rustc_session/src/parse.rs` (`GatedSpans`) (MIT or Apache-2.0).
 
+use blaze_ids::radix;
 use hir::InFile;
 use syntax::{
     AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T, TextRange,
@@ -81,7 +82,7 @@ pub(super) fn spans(walk: &Walk<'_>) -> Spans {
             };
             gates_of(&node, &mut push);
         }
-        found.sort_by_key(|it| it.0);
+        radix::sort_by_key(&mut found, |it| it.0);
         for &(_, pre, gated) in &found {
             spans[pre as usize].push(gated);
         }

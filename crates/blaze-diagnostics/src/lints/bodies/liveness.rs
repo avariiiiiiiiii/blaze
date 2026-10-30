@@ -30,6 +30,7 @@
 mod flow;
 mod source;
 
+use blaze_ids::radix;
 use hir::InFile;
 use hir_def::hir::{BindingId, Expr, ExprId, Pat, PatId};
 use hir_ty::{
@@ -211,7 +212,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let mut named: Vec<Named<'db>> = Vec::new();
         let mut bindings: Vec<(LocalId, BindingId)> =
             mir.binding_locals.iter().map(|(binding, &local)| (local, binding)).collect();
-        bindings.sort_by_key(|&(local, _)| flow::raw_local(local));
+        radix::sort_copy_by_key(&mut bindings, |&(local, _)| flow::raw_local(local));
         for (local, binding) in bindings {
             let Some(var) = source::var(b, binding) else { continue };
             if ignored(&var.name) {

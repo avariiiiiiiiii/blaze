@@ -1735,6 +1735,15 @@ bytes are rust-analyzer's placeholder. So `[0; 3][line!() as usize]` is linted b
 by blaze. When it is reachable, `eval_operand` reads the placed value instead.
 
 > forwarded to db and codegen: `hir-expand`'s builtins are db's, `hir-ty-mir` codegen's.
+> applied by db-expand-next1 (hir-expand): `line!()` and `column!()` now expand to their real
+> `u32` (`builtin/fn_macro.rs` `place_expand`, rustc's `expansion_cause`: the outermost call whose
+> tokens a macro body wrote, stopping in an `include!`d file; lines from 1, columns in code points
+> from 1, a leading BOM skipped; arguments are rustc's "`line!` takes no arguments" and the value
+> is still given). The literal is an ordinary `Literal`, so `is_placed` and `placed` no longer need
+> to special-case them; `hir_expand::builtin::{written_place, line_and_column, line_starts}` are
+> public. What waits: codegen drops `Line`/`Column` from `location.rs`'s `location_macros`,
+> `located_concats` and `placed` and from `hir-ty-codegen/mod.rs` `builtin_location`/
+> `located_concat` (keeping `file!`), asked in `v2/requests/db-expand.md`.
 
 ## diagnostics-lints-bodies-calls-methods-asm: drop the label lints from `lints/syntax/early/macros/asm.rs` (`diagnostics-lints-syntax-early-macros`)
 
@@ -2456,3 +2465,4 @@ Why: rustc parses these and refuses them in `rustc_ast_passes`; until the parser
 `checks/ast_validation` cannot give those errors.
 
 > for: parser (front end).
+> forwarded to format: `crates/parser` is lane format's.

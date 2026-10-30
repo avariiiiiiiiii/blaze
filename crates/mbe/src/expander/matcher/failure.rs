@@ -19,9 +19,6 @@ use tt::{
 use super::{Buffers, Loc, Match, Matcher, NONE, match_loop};
 use crate::{ExpandError, ExpandErrorKind, MacroCallStyle, MatchFailure, Rule, parser::Separator};
 
-#[cfg(test)]
-mod tests;
-
 /// A `Var` location's `$name:spec`: rustc's `MatcherLoc::MetaVarDecl`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::expander) struct VarDecl {

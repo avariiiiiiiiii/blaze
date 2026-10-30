@@ -542,6 +542,7 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug)]
     struct Value {
         key: u64,
         n: u64,

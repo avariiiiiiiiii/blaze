@@ -10,7 +10,11 @@ use syntax::{
 };
 
 use super::reference::{self, ItemSource};
-use crate::{ExpandResult, builtin::quote::dollar_crate, tt};
+use crate::{
+    ExpandResult,
+    builtin::quote::{dollar_crate, emit},
+    tt,
+};
 
 fn span_at(range: TextRange, ctx: SyntaxContext) -> Span {
     Span {
@@ -336,7 +340,15 @@ fn coerce_pointee_impls_match_nested_quotes() {
     let text = "#[repr(transparent)] struct Ptr<'a, T: ?Sized, const N: usize>(&'a T) where T: Tr;";
     let (adt, map) = item(text);
     let parse = parsed(text);
-    let self_for_traits = quote! {span => Ptr<'a, __S, N> };
+    let lifetime = emit(|b: &mut tt::TopSubtreeBuilder| {
+        b.push(tt::Leaf::Punct(tt::Punct { char: '\'', spacing: tt::Spacing::Joint, span }));
+        b.push(tt::Leaf::Ident(tt::Ident {
+            sym: intern::Symbol::intern("a"),
+            span,
+            is_raw: tt::IdentIsRaw::No,
+        }));
+    });
+    let self_for_traits = quote! {span => Ptr<#lifetime, __S, N> };
     let frame = &Frame::new(Tag::Expand).expect("a test's frame");
     let new = super::write_coerce_pointee_impls(
         frame,

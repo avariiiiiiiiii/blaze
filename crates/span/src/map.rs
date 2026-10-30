@@ -869,7 +869,8 @@ mod tests {
     /// The slices lent are the pairs the map was made of: each id with its length, and starts.
     #[test]
     fn anchors_are_lent_as_the_pairs_they_were_made_of() {
-        let (ids, starts) = map(10).anchors();
+        let map = map(10);
+        let (ids, starts) = map.anchors();
         let root = ROOT_ERASED_FILE_AST_ID.into_raw();
         assert_eq!(ids, [[root, 10], [1, 15], [2, 15]]);
         assert_eq!(starts, [0, 10, 25]);
@@ -1161,7 +1162,7 @@ mod tests {
         }
         let mut hint = u32::MAX;
         for _ in 0..50 {
-            let offset = at(rng.below(u64::from(last)) as u32);
+            let offset = at(rng.below(u64::from(u32::from(last))) as u32);
             assert_eq!(map.span_at_from(offset, &mut hint), pairs.span_at(offset), "at {offset:?}");
         }
         let ctx = SyntaxContext::root(crate::Edition::CURRENT);
@@ -1175,7 +1176,7 @@ mod tests {
             assert_eq!(containing, pairs.ranges_with(span, false), "{span:?}");
         }
         for _ in 0..50 {
-            let start = rng.below(u64::from(last)) as u32;
+            let start = rng.below(u64::from(u32::from(last))) as u32;
             let range = range(start, start + rng.below(12) as u32);
             assert_eq!(map.spans_for_range(range).collect::<Vec<_>>(), pairs.spans_for_range(range));
         }

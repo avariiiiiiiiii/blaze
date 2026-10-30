@@ -576,7 +576,7 @@ mod tests {
 
     use crate::{
         AstNode, Text,
-        ast::{self, make},
+        ast::{self, HasGenericParams as _, make},
     };
 
     use super::*;

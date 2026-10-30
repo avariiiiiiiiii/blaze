@@ -81,7 +81,7 @@ fn an_edge_keeps_its_node_and_whether_it_is_public() {
 
 #[test]
 fn bits_grow_and_forget() {
-    let mut bits = Bits::new(3);
+    let mut bits: Bits<usize> = Bits::new(3);
     assert!(bits.insert_growing(2));
     assert!(!bits.insert_growing(2));
     assert!(bits.insert_growing(130));

@@ -269,6 +269,7 @@ fn compare_exchange_elects_one_winner() {
 /// like std's, so the claim that sharing is safe is the wrapper's, and the model checks it.
 struct Shared<T>(UnsafeCell<T>);
 
+#[allow(unsafe_code)]
 // SAFETY: every access goes through `with`/`with_mut`, which the model checks for races.
 unsafe impl<T: Send> Sync for Shared<T> {}
 

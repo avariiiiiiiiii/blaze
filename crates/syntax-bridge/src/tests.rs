@@ -586,7 +586,7 @@ fn assert_words_same_as_reference(
     edition: &mut impl FnMut(span::SyntaxContext) -> Edition,
     what: &impl Fn() -> String,
 ) {
-    let whole_panics = caught(|| reference::to_matcher_input(tree.view(), &mut *edition)).is_none();
+    let whole_panics = caught(|| reference::to_matcher_input(tree.as_token_trees(), &mut *edition)).is_none();
     let mut copy = parser::Input::with_capacity(0);
     for view in every_view(tree) {
         for fragments in [true, false] {

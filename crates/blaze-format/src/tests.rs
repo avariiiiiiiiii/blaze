@@ -359,12 +359,25 @@ record! {
     }
 }
 
+// A tree's kids are their own record, not `Tree`: a record holding a slice of itself has no
+// `SCHEMA`, which would hash its own hash.
+record! {
+    #[derive(Clone, Copy, Debug)]
+    struct Kid: 1 {
+        name: crate::Sym,
+        pad: u32,
+        path: Slice<crate::Sym>,
+        named: Rel<Named>,
+        pad2: u32,
+    }
+}
+
 record! {
     #[derive(Clone, Copy, Debug)]
     struct Tree: 1 {
         name: crate::Sym,
         pad: u32,
-        kids: Slice<Tree>,
+        kids: Slice<Kid>,
         path: Slice<crate::Sym>,
         named: Rel<Named>,
         pad2: u32,
@@ -372,13 +385,16 @@ record! {
 }
 
 /// Every `Sym` a value reaches is found, inline, behind a `Rel`, in a slice of plain records
-/// and in a slice of the record itself; a type that holds none is not walked.
+/// and in a slice of records that hold them behind references; a type that holds none is not
+/// walked.
 #[test]
 fn symbols_are_found_wherever_a_value_holds_them() {
     use crate::Sym;
     const { assert!(<Sym as Record>::SYMBOLS && <Sym as Record>::PLAIN) };
     const { assert!(<Named as Record>::PLAIN && <Named as Record>::SYMBOLS_INLINE) };
+    const { assert!(<Kid as Record>::SYMBOLS && !<Kid as Record>::SYMBOLS_INLINE) };
     const { assert!(<Tree as Record>::SYMBOLS && !<Tree as Record>::SYMBOLS_INLINE) };
+    const { assert!(<Slice<Kid> as Record>::SYMBOLS) };
     const { assert!(<Slice<Named> as Record>::SYMBOLS && <[Sym; 2] as Record>::SYMBOLS) };
     const { assert!(!<u32 as Record>::SYMBOLS && !<Slice<u32> as Record>::SYMBOLS) };
     const { assert!(!<crate::RelSpan as Record>::SYMBOLS && !<Rel<Leaf> as Record>::SYMBOLS_INLINE) };
@@ -386,12 +402,11 @@ fn symbols_are_found_wherever_a_value_holds_them() {
     let mut out = Writer::new(Tree::SCHEMA);
     let path = out.push_slice(&[Sym(11), Sym(12)]);
     let named = out.push(&Named { sym: Sym(20), pad: 0 });
-    let kid_at = out.next::<Tree>();
-    let kid = Tree {
+    let kid_at = out.next::<Kid>();
+    let kid = Kid {
         name: Sym(10),
         pad: 0,
-        kids: Slice::EMPTY,
-        path: Slice::between(kid_at + offset_of!(Tree, path) as u64, path, 2),
+        path: Slice::between(kid_at + offset_of!(Kid, path) as u64, path, 2),
         named: Rel::NONE,
         pad2: 0,
     };

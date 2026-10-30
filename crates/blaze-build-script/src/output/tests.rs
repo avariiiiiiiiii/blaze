@@ -379,9 +379,9 @@ fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
         b" ", b"\t", b"\x0b", b"\x0c", b"\r", "\u{a0}".as_bytes(), "\u{85}".as_bytes(),
         "\u{2003}".as_bytes(), b"cargo:", b"cargo", b":", b"x=y", b"\xff", b"\xc2",
     ];
-    let cargo = |line: &[u8]| {
+    fn cargo(line: &[u8]) -> Option<&str> {
         std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
-    };
+    }
     let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
     for _ in 0..50_000 {
         let mut line = Vec::new();
@@ -563,7 +563,7 @@ fn a_value_borrows_the_output_unless_its_out_dir_moved() {
             rustc_bootstrap: None,
         };
         let mut directives: Vec<Directive<'_>> = Vec::new();
-        read(printed, &cx, &mut directives).unwrap();
+        super::read(printed, &cx, &mut directives).unwrap();
         directives
     };
     let borrowed = |it: &Cow<'_, str>| matches!(it, Cow::Borrowed(_));

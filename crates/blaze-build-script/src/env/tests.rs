@@ -334,11 +334,11 @@ fn set_from_the_unit_or_passed_through() {
     let other_set: BTreeMap<_, _> =
         other.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
     // The dynamic library path keeps what cargo's environment had of it after the unit's.
-    let without_dylib = |it: &BTreeMap<&OsStr, &OsStr>| {
+    fn without_dylib<'a>(it: &BTreeMap<&'a OsStr, &'a OsStr>) -> BTreeMap<&'a OsStr, &'a OsStr> {
         let mut it = it.clone();
         it.remove(OsStr::new("LD_LIBRARY_PATH"));
         it
-    };
+    }
     let set: BTreeMap<&OsStr, &OsStr> = set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
     let other_set: BTreeMap<&OsStr, &OsStr> =
         other_set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();

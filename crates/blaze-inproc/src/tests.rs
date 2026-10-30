@@ -312,7 +312,7 @@ fn a_grant_is_checked_against_the_image_relative_to_its_header() {
     refused(&|it| it.overlays[0].len = P, "not a code segment");
     refused(&|it| it.overlays[0].place = Place::Reserved, "not inside a reservation");
     refused(&|it| it.overlays[1].at = 0x10_0000 + 4 * P, "not inside a reservation");
-    refused(&|it| it.overlays.remove(0), "has no overlay");
+    refused(&|it| drop(it.overlays.remove(0)), "has no overlay");
     refused(&|it| it.span.end += P, "not the executable the daemon wrote");
     refused(&|it| it.format = Format::MachO, "a grant for a MachO image");
     refused(&|it| it.overlays[2].len = P / 2, "not whole pages");

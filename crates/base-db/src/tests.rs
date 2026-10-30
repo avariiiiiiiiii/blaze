@@ -308,10 +308,10 @@ fn an_equal_graph_keeps_the_crate_attr_files_and_writes_nothing() {
     let files = load(&mut db, 0, FILES);
     let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
     let before = a.crate_attr_files(&db).to_vec();
-    let revision = revision(&db);
+    let then = revision(&db);
     assert_eq!(set_attrs(&mut db, &files, &["no_std", "feature(x)"]), a);
     assert_eq!(a.crate_attr_files(&db), before);
-    assert_eq!(revision(&db), revision);
+    assert_eq!(revision(&db), then);
 }
 
 #[test]
@@ -476,11 +476,11 @@ fn setting_a_view_twice_writes_nothing() {
     assert_eq!(&**db.file_text(a).text(&db), "fn f() {}");
     assert_eq!(db.file_source_root(a).source_root_id(&db), SourceRootId(0));
 
-    let revision = revision(&db);
+    let then = revision(&db);
     let root = db.source_root(SourceRootId(0)).content(&db);
     let second = set_view(&mut db, &base, &partition, VIEW).unwrap();
     assert_eq!(second, ViewChange::default());
-    assert_eq!(revision(&db), revision);
+    assert_eq!(revision(&db), then);
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
 }
 
@@ -558,7 +558,7 @@ fn bytes_that_are_not_utf8_are_a_file_without_text() {
 fn a_content_id_that_is_not_its_bytes_is_refused() {
     let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
-    let revision = revision(&db);
+    let then = revision(&db);
     let (lib, main) = (vfs_bytes(b"mod a;"), vfs_bytes(b"fn main() {}"));
     let files = [
         view_file("src/lib.rs", &lib),
@@ -572,7 +572,7 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
         ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
     let error = db.set_view_root(view).unwrap_err();
     assert!(matches!(&error, ViewError::Mismatch { path, .. } if path == "src/main.rs"));
-    assert_eq!(revision(&db), revision);
+    assert_eq!(revision(&db), then);
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
 
@@ -723,27 +723,27 @@ fn what_queries_note_is_kept_once_and_sorted() {
     let crates = graph.set_in_db(&mut db);
     let (a, c) = (crates[&a], crates[&c]);
     for (krate, key) in [(c, "B"), (a, "B"), (a, "A"), (c, "B"), (a, "B")] {
-        db.files.env_is_read(krate, key);
+        db.files().env_is_read(krate, key);
     }
-    db.files.env_is_unset(a, "X");
-    db.files.env_is_unset(a, "X");
+    db.files().env_is_unset(a, "X");
+    db.files().env_is_unset(a, "X");
     let mut expected = vec![(a, "A".to_owned()), (a, "B".to_owned()), (c, "B".to_owned())];
     expected.sort();
-    assert_eq!(db.files.env_read(), expected);
-    assert_eq!(db.files.env_unset(), vec![(a, "X".to_owned())]);
+    assert_eq!(db.files().env_read(), expected);
+    assert_eq!(db.files().env_unset(), vec![(a, "X".to_owned())]);
 
     let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
     let (x, y) = (dir.join("blaze-base-db-x.rs"), dir.join("blaze-base-db-y.rs"));
     for (path, krate) in [(&y, a), (&x, c), (&y, a), (&y, c)] {
-        db.files.include_source(path, SourceRootId(0), krate);
+        db.files().include_source(path, SourceRootId(0), krate);
     }
     assert_eq!(
-        db.files.included_sources(),
+        db.files().included_sources(),
         vec![(x.clone(), SourceRootId(0)), (y.clone(), SourceRootId(0))]
     );
     let mut named = vec![(a, y.clone()), (c, x.clone()), (c, y.clone())];
     named.sort();
-    assert_eq!(db.files.sources_included_by(), named);
+    assert_eq!(db.files().sources_included_by(), named);
 }
 
 /// A file `include_bytes!` names that can't be read keeps why, in `std::io::Error`'s words

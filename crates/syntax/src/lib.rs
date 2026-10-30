@@ -287,15 +287,17 @@ impl Parse<SyntaxNode> {
     }
 }
 
-impl Parse<SourceFile> {
+impl<T> Parse<T> {
     pub fn debug_dump(&self) -> String {
-        let mut buf = format!("{:#?}", self.tree().syntax());
+        let mut buf = format!("{:#?}", self.syntax_node());
         for err in self.errors() {
             format_to!(buf, "error {:?}: {}\n", err.range(), err);
         }
         buf
     }
+}
 
+impl Parse<SourceFile> {
     /// Every error of the file, bodies included: for an outline, its errors and those of every
     /// lazy body, each body parsed if it was not yet. They are the errors of a full parse of
     /// the text, in another order: each body's come where its walk reaches it.

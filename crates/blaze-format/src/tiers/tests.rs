@@ -453,7 +453,8 @@ fn tree_buffer(rng: &mut Rng, nodes: usize) -> (Aligned, Vec<WordTable>) {
     let mut placed = Vec::new();
     for n in 0..nodes {
         let len = rng.below(300) as usize;
-        let spread = 1 + rng.below(1 << rng.below(32)) as u32;
+        let bits = rng.below(32);
+        let spread = 1 + rng.below(1 << bits) as u32;
         let words: Vec<u32> = (0..len).map(|_| rng.below(spread as u64) as u32).collect();
         let at = out.push_slice(&words);
         if len > 0 {

@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "view/accessors.rs"]
 mod accessors;
 
 use std::{
@@ -52,7 +53,7 @@ fn corpus() -> Vec<(PathBuf, String)> {
 }
 
 fn parses(text: &str) -> [Parse<SourceFile>; 2] {
-    [SourceFile::parse(text, Edition::CURRENT), SourceFile::parse_outline(text.into(), Edition::CURRENT)]
+    [SourceFile::parse(text, Edition::CURRENT), SourceFile::parse_outline(text, Edition::CURRENT)]
 }
 
 type Key = (syntax::SyntaxKind, TextRange);
@@ -178,7 +179,7 @@ fn views_answer_as_handles_on_every_fixture_and_file() {
 fn an_outline_walked_by_views_parses_what_handles_parse() {
     for (path, text) in corpus().into_iter().take(200) {
         let [full, _] = parses(&text);
-        let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+        let outline = SourceFile::parse_outline(text.as_str(), Edition::CURRENT);
         // Walked by views only: every lazy body is parsed by the walk, to the full parse's tree.
         let walked: Vec<Key> = outline.root().descendants_with_tokens().map(view_key).collect();
         let whole: Vec<Key> = full.root().descendants_with_tokens().map(view_key).collect();

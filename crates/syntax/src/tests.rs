@@ -400,7 +400,7 @@ fn exact_errors_allocate_only_their_box() {
         std::hint::black_box(clean.errors_exact());
     });
 
-    let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+    let outline = SourceFile::parse_outline(text, Edition::CURRENT);
     let want = outline.errors_with_bodies();
     assert_eq!(outline.errors_with_bodies_exact().as_deref(), Some(&want[..]));
     assert_eq!(outline.errors_exact().as_deref().unwrap_or_default(), &outline.errors()[..]);

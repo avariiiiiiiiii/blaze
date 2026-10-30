@@ -1257,7 +1257,6 @@ fn run_io<R: Runner>(run: Ran<R>) {
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
-        collections::BTreeSet,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, AtomicU32, Ordering},
@@ -1269,7 +1268,7 @@ mod tests {
     use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use blaze_mem::{Tag as MemTag, frame};
 
@@ -1550,7 +1549,7 @@ mod tests {
             };
             assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
             let ran = ran.into_inner().unwrap();
-            let on = |nodes: &[u32]| -> BTreeSet<ThreadId> {
+            let on = |nodes: &[u32]| -> FxHashSet<ThreadId> {
                 ran.iter().filter(|(id, _)| nodes.contains(id)).map(|&(_, at)| at).collect()
             };
             assert_eq!(ran.len(), 4);

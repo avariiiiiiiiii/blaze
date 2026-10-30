@@ -405,6 +405,7 @@ fn spoke(fd: i64) -> bool {
 /// given. macOS has no descriptor for a process, so a kill names it by ID: one sent after the
 /// process was reaped and its ID reused would reach another process, and its launcher must
 /// not reap it while it may still be killed.
+#[derive(Debug)]
 pub(crate) struct Remote {
     pid: u32,
 }

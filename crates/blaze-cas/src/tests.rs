@@ -1088,7 +1088,7 @@ impl OneColumn {
         if warm.len() < WARM_HEAD || warm[8..40] != self.warm_schema.0.0 {
             return Err("not warm columns of the schema".into());
         }
-        let words = warm[WARM_HEAD..].chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap()));
+        let words = warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
         let packed = blaze_format::tiers::Packed {
             min: u32::from_le_bytes(word(warm, 40)),
             bits: u32::from_le_bytes(word(warm, 44)),
@@ -1329,7 +1329,7 @@ fn a_pack_whose_header_names_another_unit_stops_the_store() {
 fn movable_column(column: &[u32]) -> Vec<u32> {
     let times = match column.len() {
         0 => 1,
-        len => (8 << 10usize).div_ceil(4 * len),
+        len => (8usize << 10).div_ceil(4 * len),
     };
     column.repeat(times)
 }
@@ -1429,7 +1429,7 @@ fn moved_once(column: &[u32]) -> InPlace {
         Heat::Hot => InPlace::Hot(entry.bytes.to_vec()),
         Heat::Warm => {
             let warm = entry.bytes;
-            let words = warm[WARM_HEAD..].chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap()));
+            let words = warm[WARM_HEAD..].chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap()));
             InPlace::Warm(blaze_format::tiers::Packed {
                 min: u32::from_le_bytes(word(warm, 40)),
                 bits: u32::from_le_bytes(word(warm, 44)),

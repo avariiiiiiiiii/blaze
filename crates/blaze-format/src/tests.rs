@@ -392,8 +392,9 @@ fn symbols_are_found_wherever_a_value_holds_them() {
     use crate::Sym;
     const { assert!(<Sym as Record>::SYMBOLS && <Sym as Record>::PLAIN) };
     const { assert!(<Named as Record>::PLAIN && <Named as Record>::SYMBOLS_INLINE) };
-    const { assert!(<Kid as Record>::SYMBOLS && !<Kid as Record>::SYMBOLS_INLINE) };
-    const { assert!(<Tree as Record>::SYMBOLS && !<Tree as Record>::SYMBOLS_INLINE) };
+    const { assert!(<Kid as Record>::SYMBOLS && <Kid as Record>::SYMBOLS_INLINE) };
+    const { assert!(<Tree as Record>::SYMBOLS && <Tree as Record>::SYMBOLS_INLINE) };
+    const { assert!(!<Slice<crate::Sym> as Record>::SYMBOLS_INLINE) };
     const { assert!(<Slice<Kid> as Record>::SYMBOLS) };
     const { assert!(<Slice<Named> as Record>::SYMBOLS && <[Sym; 2] as Record>::SYMBOLS) };
     const { assert!(!<u32 as Record>::SYMBOLS && !<Slice<u32> as Record>::SYMBOLS) };

@@ -753,7 +753,7 @@ impl Last {
         let before = from.checked_sub(1).map(|at| self.rows[at]);
         self.window.clear();
         self.window_lsdas.clear();
-        merge(placed.plan.base, placed.functions, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
+        merge(placed.plan.base, dwarf_mode, columns, before, &mut self.window, &mut self.window_lsdas).ok()?;
         if self.window.len() != to - from {
             return None;
         }
@@ -1094,8 +1094,7 @@ impl<'c> Columns<'c> {
     /// What [`merge`] needs of the row its walk of these columns leaves last: the encoding of
     /// their greatest address (its compact entry's, its FDE's or 0), which the last row has
     /// whether that address added one or not, as an entry adds none only with the encoding
-    /// before and no LSDA. None for no entries, or an FDE past DWARF mode's offsets (the
-    /// merge's error).
+    /// before and no LSDA. None for no entries.
     fn tail(&self, dwarf_mode: u32) -> Option<Row> {
         let heads = [
             self.covered.last().map(|it| it.addr),
@@ -1107,9 +1106,9 @@ impl<'c> Columns<'c> {
         let compact = self.covered.partition_point(|it| it.addr < at);
         let encoding = match self.covered.get(compact).filter(|it| it.addr == at) {
             Some(Covered { kind: Kind::Compact { encoding, .. }, .. }) => *encoding,
-            Some(Covered { kind: Kind::Dwarf { fde }, .. }) => dwarf_encoding(dwarf_mode, *fde)?,
+            Some(Covered { kind: Kind::Dwarf { fde }, .. }) => dwarf_encoding(dwarf_mode, *fde),
             None => match self.fdes.binary_search_by_key(&at, |it| it.addr) {
-                Ok(found) => dwarf_encoding(dwarf_mode, self.fdes[found].offset)?,
+                Ok(found) => dwarf_encoding(dwarf_mode, self.fdes[found].offset),
                 Err(_) => 0,
             },
         };
@@ -1117,9 +1116,16 @@ impl<'c> Columns<'c> {
     }
 }
 
-/// The DWARF-mode encoding naming the FDE at `fde` in `__eh_frame`: none past its 24 bits.
-fn dwarf_encoding(dwarf_mode: u32, fde: u64) -> Option<u32> {
-    u32::try_from(fde).ok().filter(|it| *it <= DWARF_OFFSET_MASK).map(|it| dwarf_mode | it)
+/// The DWARF-mode encoding naming the FDE at `fde` in `__eh_frame`. An FDE past the field's
+/// 24 bits gets offset 0: libunwind takes the offset only as where to start looking, and with
+/// 0 scans `__eh_frame` from its start and caches the FDE it finds
+/// (`UnwindCursor::getInfoFromDwarfSection`), so a program of more than 16 MiB of frames
+/// unwinds.
+fn dwarf_encoding(dwarf_mode: u32, fde: u64) -> u32 {
+    match u32::try_from(fde) {
+        Ok(offset) if offset <= DWARF_OFFSET_MASK => dwarf_mode | offset,
+        _ => dwarf_mode,
+    }
 }
 
 /// Below two of this many function starts the merge is one; a piece covers at least a quarter
@@ -1159,7 +1165,7 @@ fn rows(
         let mut rows: Vec<Row> = Vec::with_capacity(columns.len());
         // An LSDA is a compact entry's: at most one each.
         let mut lsdas = Vec::with_capacity(covered.len());
-        let greatest = merge(base, functions, dwarf_mode, columns, None, &mut rows, &mut lsdas)?;
+        let greatest = merge(base, dwarf_mode, columns, None, &mut rows, &mut lsdas)?;
         return Ok(Rows { rows, lsdas, last: last.max(greatest), sorted });
     }
     // alloc: once per link, one cut per piece
@@ -1181,7 +1187,7 @@ fn rows(
         };
         // alloc: once per piece, its rows and LSDAs
         let (mut rows, mut lsdas) = (Vec::with_capacity(these.len()), Vec::with_capacity(these.covered.len()));
-        let greatest = merge(base, functions, dwarf_mode, these, before, &mut rows, &mut lsdas)?;
+        let greatest = merge(base, dwarf_mode, these, before, &mut rows, &mut lsdas)?;
         Ok((rows, lsdas, greatest))
     };
     // alloc: once per link, one result per piece
@@ -1203,10 +1209,9 @@ fn rows(
 /// them: of one address the compact entry wins, then the FDE, then a function without either
 /// (encoding 0), then the end of a covered range (encoding 0); an entry with the encoding of
 /// the one before and neither with an LSDA adds nothing (as ld64). The greatest address seen.
-/// `base` is the image's and `functions` [`Placed::functions`], for an error's names.
+/// `base` is the image's.
 fn merge(
     base: u64,
-    functions: &[Function],
     dwarf_mode: u32,
     columns: Columns<'_>,
     before: Option<Row>,
@@ -1251,18 +1256,7 @@ fn merge(
         greatest = greatest.max(at);
         let (encoding, lsda) = match kind {
             Some(Kind::Compact { encoding, lsda }) => (encoding, lsda),
-            Some(Kind::Dwarf { fde }) => {
-                let Some(fde) = u32::try_from(fde).ok().filter(|it| *it <= DWARF_OFFSET_MASK)
-                else {
-                    // alloc: error path
-                    return Err(error(format!(
-                        "__unwind_info: the FDE of {} is at {fde:#x} in __eh_frame, past the 24 \
-                         bits DWARF mode has for it",
-                        named_in(functions, at)
-                    )));
-                };
-                (dwarf_mode | fde, 0)
-            }
+            Some(Kind::Dwarf { fde }) => (dwarf_encoding(dwarf_mode, fde), 0),
             None => (0, 0),
         };
         if previous == Some(encoding) && !lsda_last && lsda == 0 {
@@ -2141,6 +2135,34 @@ mod tests {
         assert_eq!(table.lookup(off(far) + 4), Some((FRAMELESS, None)));
     }
 
+    /// A program of more than 16 MiB of frames (bun's base, #173, has 20 MiB): an FDE past
+    /// DWARF mode's 24-bit offset is DWARF mode with offset 0, which libunwind scans
+    /// `__eh_frame` from the start for, and one within keeps its offset.
+    #[test]
+    fn an_fde_past_24_bits_of_eh_frame_is_dwarf_mode_from_the_start() {
+        let mut eh = record(&[0, 0, 0, 0, 1, 0, 1, 0x78, 30]);
+        let mut padded = [TEXT.to_le_bytes(), 0x10u64.to_le_bytes()].concat();
+        // DW_CFA_nop, enough to take the next FDE past the field.
+        padded.resize(padded.len() + DWARF_OFFSET_MASK as usize + 1, 0);
+        push_fde(&mut eh, 0, &padded);
+        push_fde(&mut eh, 0, &[(TEXT + 0x10).to_le_bytes(), 0x10u64.to_le_bytes()].concat());
+        let fde = fde_offsets(&eh);
+        assert!(fde[0] <= u64::from(DWARF_OFFSET_MASK) && fde[1] > u64::from(DWARF_OFFSET_MASK));
+        let regions = [region(Class::Text, TEXT, 0x20), region(Class::EhFrame, EH_FRAME, eh.len() as u64)];
+        let contents: [&[u8]; 2] = [&[], &eh];
+        let functions = [function(TEXT, 0x10, "near"), function(TEXT + 0x10, 0x10, "far")];
+        for (arch, mode) in [(Arch::Aarch64, ARM64_MODE_DWARF), (Arch::X86_64, X86_64_MODE_DWARF)] {
+            let output = output(arch);
+            let plan = plan();
+            let placed = placed(&output, &plan, &regions, &contents, &functions, &[]);
+            let bytes = build(&placed, arch).unwrap();
+            let table = Table { bytes: &bytes };
+            assert_eq!(table.lookup(off(TEXT) + 4), Some((mode | fde[0] as u32, None)), "{arch:?}");
+            assert_eq!(table.lookup(off(TEXT) + 0x14), Some((mode, None)), "{arch:?}");
+            assert_eq!(table.lookup(off(TEXT) + 0x20), None, "{arch:?}");
+        }
+    }
+
     #[test]
     fn a_bound_personality_is_its_import() {
         let cu = compact(&[(TEXT, 0x10, FRAME, 0, 0), (TEXT + 0x10, 0x10, FRAME, 0, 0)]);
@@ -2664,7 +2686,7 @@ mod tests {
                 let got = super::rows(&placed, ARM64_MODE_DWARF, &covered, &fdes, &ends).unwrap();
                 let columns = super::Columns { covered: &covered, fdes: &fdes, starts: super::Starts::Placed(&functions), ends: &ends };
                 let (mut rows, mut lsdas) = (Vec::new(), Vec::new());
-                let greatest = super::merge(BASE, &functions, ARM64_MODE_DWARF, columns, None, &mut rows, &mut lsdas).unwrap();
+                let greatest = super::merge(BASE, ARM64_MODE_DWARF, columns, None, &mut rows, &mut lsdas).unwrap();
                 assert!(rows.len() < functions.len(), "seed {seed}: some entries add no row");
                 assert_eq!(got.rows, rows, "seed {seed}");
                 assert_eq!(got.lsdas, lsdas, "seed {seed}");
@@ -2950,17 +2972,7 @@ mod tests {
         for entry in &entries {
             let (encoding, lsda) = match entry.kind {
                 OldKind::Compact { encoding, lsda } => (encoding, lsda),
-                OldKind::Dwarf { fde } => {
-                    let Some(fde) = u32::try_from(fde).ok().filter(|it| *it <= DWARF_OFFSET_MASK)
-                    else {
-                        return Err(error(format!(
-                            "__unwind_info: the FDE of {} is at {fde:#x} in __eh_frame, past the \
-                             24 bits DWARF mode has for it",
-                            named(placed, entry.addr)
-                        )));
-                    };
-                    (dwarf_mode | fde, None)
-                }
+                OldKind::Dwarf { fde } => (super::dwarf_encoding(dwarf_mode, fde), None),
                 OldKind::None => (0, None),
             };
             if let Some(previous) = rows.last()

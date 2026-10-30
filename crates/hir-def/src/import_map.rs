@@ -709,12 +709,12 @@ mod tests {
     use base_db::all_crates;
     use expect_test::{Expect, expect};
     use itertools::Itertools;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         ItemContainerId, Lookup,
         nameres::assoc::TraitItems,
-        test_db::{TestDB, TestDBExt},
+        test_db::TestDBExt,
     };
 
     use super::*;
@@ -748,7 +748,7 @@ mod tests {
         query: Query,
         expect: Expect,
     ) {
-        let db = TestDB::with_files(ra_fixture);
+        let db = fixture::db(ra_fixture).into_db();
         let all_crates = all_crates(&db);
         let krate = all_crates
             .iter()
@@ -828,7 +828,7 @@ mod tests {
     }
 
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-        let db = TestDB::with_files(ra_fixture);
+        let db = fixture::db(ra_fixture).into_db();
         let all_crates = all_crates(&db);
 
         let actual = all_crates
@@ -1701,7 +1701,7 @@ pub mod fmt {
         for seed in 0..16u64 {
             let shape = Shape { private_modules: seed % 2 == 0, private_imports: seed % 3 != 0 };
             let fixture = gen_fixture(seed, shape);
-            let db = TestDB::with_files(&fixture);
+            let db = fixture::db(&fixture).into_db();
             let mut names = Vec::new();
             for &krate in all_crates(&db).iter() {
                 let new = ImportMap::of(&db, krate);
@@ -1873,7 +1873,7 @@ pub mod fmt {
     /// allocates nothing.
     #[test]
     fn warm_search_allocates_nothing() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 //- /main.rs crate:main deps:dep
 //- /dep.rs crate:dep
@@ -1883,7 +1883,8 @@ pub mod fmt {
     pub fn format() {}
 }
 "#,
-        );
+        )
+        .into_db();
         let main = *all_crates(&db)
             .iter()
             .find(|krate| {
@@ -1918,7 +1919,7 @@ pub mod fmt {
     /// was searched before.
     #[test]
     fn each_is_free_and_in_a_fixed_order() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 //- /main.rs crate:main deps:dep,other
 //- /dep.rs crate:dep
@@ -1927,7 +1928,8 @@ pub mod fmt { pub fn format() {} pub use super::Fmt as Formatter; }
 //- /other.rs crate:other
 pub fn fmt() {}
 "#,
-        );
+        )
+        .into_db();
         let main = *all_crates(&db)
             .iter()
             .find(|krate| {
@@ -1960,7 +1962,7 @@ pub fn fmt() {}
     /// else: the collection, the counting sort's cursors, the sort and the keys are the frame's.
     #[test]
     fn build_is_its_columns() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 //- /main.rs crate:main
 pub struct S;
@@ -1968,7 +1970,8 @@ pub enum E { A }
 pub trait T { fn m(); }
 pub mod m { pub fn f() {} pub use super::S as R; }
 "#,
-        );
+        )
+        .into_db();
         let krate = db.fetch_test_crate();
         let memo = ImportMap::of(&db, krate);
         let built = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {

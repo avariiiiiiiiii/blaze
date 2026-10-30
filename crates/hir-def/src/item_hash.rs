@@ -7,9 +7,13 @@
 //!
 //! Each id the bytes name is an [`Entry`] of the table, in the order the bytes first name it:
 //! what an id is in this database, which the identity hashes by what it is in every database.
+//!
+//! The bytes are anonymous (section 3.3): every binding's and label's name is written empty,
+//! and so are the leading segments of each path the caller hashes as what they resolve to, so
+//! that a rename keeps them.
 
 use base_db::{Crate, Db};
-use hir_expand::MacroCallId;
+use hir_expand::{MacroCallId, mod_path::ModPath};
 use salsa::plumbing::{AsId, FromId};
 use span::SyntaxContext;
 
@@ -18,7 +22,10 @@ use crate::{
     ModuleId, ProcMacroId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
     deps::signatures::table::relocate_store,
     expr_store::{Body, ExpressionStore},
-    hir::persist::{Kind, Relocation, relocating, syntax_context},
+    hir::{
+        ExprId,
+        persist::{Anonymous, Kind, Relocation, anonymous, relocating, syntax_context},
+    },
     nameres::frozen::Enc,
 };
 
@@ -55,9 +62,9 @@ pub struct PortableBody {
 }
 
 impl PortableBody {
-    /// The store's buffer, its ids moved to their entries, then the parameters: their count,
-    /// each formal and user-written pattern, and `1` and the `self` binding's two or `0`, each
-    /// a little-endian `u32`.
+    /// The store's buffer, anonymous, its ids moved to their entries, then the parameters: their
+    /// count, each formal and user-written pattern, and `1` and the `self` binding's two or `0`,
+    /// each a little-endian `u32`.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -129,11 +136,24 @@ fn id<T: FromId>(bits: u64) -> T {
 }
 
 /// `body` written as [`PortableBody::bytes`] describes, with the table of what it names.
-pub fn portable_body(body: &Body) -> PortableBody {
+/// `blank` holds, for each path of the store by [`mod_path_index`], how many of its leading
+/// segments the caller hashes by what they resolve to; they are written empty. Each literal of
+/// `slots` (what a location macro expanded to, whose value the records fill from where the
+/// body is) is written as its kind and type, not its value.
+pub fn portable_body(body: &Body, blank: &[u16], slots: &[ExprId]) -> PortableBody {
     let Body { store, params, self_param } = body;
     let mut table = Relocation::new();
+    let mut anonymous_as = Anonymous {
+        // alloc: the scope's copy of `blank`, once per identity computed
+        blank: blank.to_vec(),
+        // alloc: the scope's slots, once per identity of a body that calls a location macro
+        slots: slots.iter().map(|it| it.into_raw().into_u32()).collect(),
+    };
+    anonymous_as.slots.sort_unstable();
     // alloc: the one buffer of the body, once per identity computed
-    let mut bytes = relocating(&mut table, || blaze_format::to_bytes::<ExpressionStore>(store));
+    let mut bytes = anonymous(&mut anonymous_as, || {
+        relocating(&mut table, || blaze_format::to_bytes::<ExpressionStore>(store))
+    });
     relocate_store(&mut bytes, &mut table);
     let mut word = |word: u32| bytes.extend_from_slice(&word.to_le_bytes());
     word(u32::try_from(params.len()).expect("more than 2^32 parameters"));
@@ -150,6 +170,21 @@ pub fn portable_body(body: &Body) -> PortableBody {
         None => word(0),
     }
     PortableBody { bytes, table }
+}
+
+/// How many paths `store` has: the length of [`portable_body`]'s `blank` that names each.
+pub fn path_count(store: &ExpressionStore) -> usize {
+    store.types.paths.mod_paths.len()
+}
+
+/// The index of `path` among `store`'s paths, for [`portable_body`]'s `blank`: `None` for a
+/// path that is not one of them (one of another store).
+pub fn mod_path_index(store: &ExpressionStore, path: &ModPath) -> Option<usize> {
+    let all = &store.types.paths.mod_paths[..];
+    let start = all.as_ptr() as usize;
+    let at = (path as *const ModPath as usize).checked_sub(start)?;
+    let size = size_of::<ModPath>();
+    (at % size == 0 && at / size < all.len()).then_some(at / size)
 }
 
 fn entry(kind: Kind, bits: u64) -> Entry {

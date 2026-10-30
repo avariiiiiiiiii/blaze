@@ -64,11 +64,11 @@ impl PathInterner {
     }
 
     fn place(&mut self, index: usize, id: FileId) -> FileId {
-        let slot = id.0 as usize;
+        let slot = id.index() as usize;
         if slot >= self.paths.len() {
             self.paths.resize(slot + 1, NO_PATH);
         }
-        assert_eq!(self.paths[slot], NO_PATH, "file ID {} is already a path's", id.0);
+        assert_eq!(self.paths[slot], NO_PATH, "file ID {} is already a path's", id.index());
         self.paths[slot] = u32::try_from(index).expect("path indices fit in u32");
         debug_assert_eq!(self.ids.len(), index);
         self.ids.push(id);
@@ -81,8 +81,8 @@ impl PathInterner {
     ///
     /// Panics if `id` does not exist in `self`.
     pub(crate) fn lookup(&self, id: FileId) -> &VfsPath {
-        let index = self.paths[id.0 as usize];
-        assert_ne!(index, NO_PATH, "no path has file ID {}", id.0);
+        let index = self.paths[id.index() as usize];
+        assert_ne!(index, NO_PATH, "no path has file ID {}", id.index());
         self.map.get_index(index as usize).unwrap()
     }
 }

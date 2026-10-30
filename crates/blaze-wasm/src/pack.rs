@@ -10,7 +10,7 @@ use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacrosBuilder,
 };
-use ide_db::base_db::{
+use base_db::{
     CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
     DependencyBuilder, Env, LangCrateOrigin, SourceRoot, TargetKind,
     target::{Arch, TargetData},
@@ -19,7 +19,7 @@ use intern::Symbol;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use span::{Edition, Span};
-use vfs::{AbsPathBuf, FileId, VfsPath, file_set::FileSet};
+use base_db::{AbsPathBuf, FileId, FileSet, VfsPath};
 
 #[cfg(not(target_family = "wasm"))]
 mod record;

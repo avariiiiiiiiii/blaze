@@ -13,7 +13,7 @@
 //! allocator counts the bytes live, and an expansion that leaves some behind tells the host
 //! ([`Verdict`]). A module none of whose expansions did is stateless: each expansion is a
 //! fresh instance ([`expand`]), a run of user code kept by what it was given and what it read
-//! ([`blaze_usercode::index`], in blaze-expand's store), and crates that call it are frozen as
+//! ([`blaze_usercode::index`], in the store [`proc_macro_api::kept`] reads), and crates that call it are frozen as
 //! any other. A module one of whose expansions did, or
 //! one not seen yet, keeps an instance per calling crate for one database revision
 //! ([`Session`]): its statics, stored tokens and their spans survive its calls, a source
@@ -29,10 +29,12 @@
 //! One that was given a span it was not ([`Value`]) is not kept, nor one that read the clock or
 //! randomness, which it is given as a native macro is.
 //!
-//! Which macros run as modules is [`rule`]'s.
+//! Which macros run as modules is [`rule`]'s. [`native`] is the same `proc_macro` answered in
+//! process, for the macros that run on blaze's own compiler.
 
 pub mod bench;
 mod keyed;
+pub mod native;
 pub mod rule;
 mod wasi;
 
@@ -55,15 +57,17 @@ use std::{
 
 use base_db::{Db, Crate, Env, Nonce};
 use blaze_core::Traced;
-use blaze_expand::{
-    Mode, Put,
+use proc_macro_api::{
     bridge::{
         lex,
         spans::{self, range, spanned},
         wire::{self, NONE, Part, Parts, Tree},
     },
-    tally::{Mine, Tally},
-    verdict::{STATEFUL, STATELESS, Seen, Verdict},
+    kept::{
+        self, Mode, Put,
+        tally::{Mine, Tally},
+        verdict::{STATEFUL, STATELESS, Seen, Verdict},
+    },
 };
 use blaze_ids::{ContentId, Hasher, Idx, Interner, Sharded};
 use blaze_usercode::{
@@ -77,7 +81,7 @@ use hir_expand::proc_macro::{
     ProcMacroLoadResult,
 };
 use intern::Symbol;
-use load_cargo::{SubRequest, SubResponse};
+use blaze_lower::{SubRequest, SubResponse};
 use paths::AbsPath;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -96,11 +100,11 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 /// imports and exports, then the API the in-process bridge's `proc_macro` includes too.
 pub const GUEST: &str = concat!(
     include_str!("../guest/proc_macro.rs"),
-    include_str!("../../blaze-expand/src/native/proc_macro/api.rs"),
+    include_str!("../native/proc_macro/api.rs"),
 );
 
 /// The functions a module of proc macros exports, which blaze puts in the crate
-/// (`crates/blaze-engine/src/macro_list.rs`).
+/// (`crates/hir-ty-codegen/v2/roots/proc_macros.rs`).
 pub mod exports {
     /// `(len) -> ptr`: room for an input of `len` bytes.
     pub const ALLOC: &str = "blaze_proc_macro_alloc";
@@ -336,7 +340,7 @@ impl State {
         // functions, this one's callers, run only synchronously
         // inside it, on its thread. So the database is live and only shared-borrowed here;
         // read after `run`, the pointer would dangle.
-        Some(load_cargo::answer(unsafe { &*db.0 }, req))
+        Some(blaze_lower::answer(unsafe { &*db.0 }, req))
     }
 
     /// Asks the database `value` of `span`, and notes the question and its answer, or that
@@ -345,7 +349,7 @@ impl State {
     fn ask_value(&mut self, value: Value, span: Span) -> Option<SubResponse> {
         // SAFETY: as in `ask`: `self.db` is `Some` only while `Session::run` holds the database
         // it points to, and this runs only inside that call, on its thread.
-        let answer = self.db.map(|db| load_cargo::answer(unsafe { &*db.0 }, value.request(span)));
+        let answer = self.db.map(|db| blaze_lower::answer(unsafe { &*db.0 }, value.request(span)));
         let anchor = self.anchors.iter().position(|it| *it == span.anchor);
         let context = self.contexts.iter().position(|it| *it == span.ctx);
         match anchor.zip(context) {
@@ -930,14 +934,14 @@ impl Wasm {
     /// The module at `path`, compiled once a process, and its machine code kept in `store`
     /// under [`code_key`], which says the host it is for: unlike the module, the code is for
     /// one kind of host.
-    pub fn at(path: &Path, store: Option<&blaze_store::Store>) -> Result<&'static Wasm, String> {
+    pub fn at(path: &Path, store: Option<&blaze_cas::Handle>) -> Result<&'static Wasm, String> {
         Wasm::at_kind(path, store, Kind::Session)
     }
 
     /// As [`Wasm::at`], for instances of `kind`.
     fn at_kind(
         path: &Path,
-        store: Option<&blaze_store::Store>,
+        store: Option<&blaze_cas::Handle>,
         kind: Kind,
     ) -> Result<&'static Wasm, String> {
         // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
@@ -954,7 +958,7 @@ impl Wasm {
         path: &Path,
         known: Known,
         bytes: Option<&[u8]>,
-        store: Option<&blaze_store::Store>,
+        store: Option<&blaze_cas::Handle>,
         kind: Kind,
     ) -> Result<&'static Wasm, String> {
         // A module being compiled (`prepare_soon`) is waited for, not compiled again.
@@ -966,7 +970,7 @@ impl Wasm {
         let once = compiled.get(at);
         let wasm = once.get_or_init(|| Wasm::compile(path, known, bytes, store, kind));
         let wasm = wasm.as_ref().map_err(Clone::clone)?;
-        wasm.keep_code(store);
+        wasm.keep_code(store)?;
         Ok(wasm)
     }
 
@@ -974,7 +978,7 @@ impl Wasm {
         path: &Path,
         Known { digest, identity }: Known,
         given: Option<&[u8]>,
-        store: Option<&blaze_store::Store>,
+        store: Option<&blaze_cas::Handle>,
         kind: Kind,
     ) -> Result<Wasm, String> {
         let start = Instant::now();
@@ -985,23 +989,10 @@ impl Wasm {
         let engine = engine_of(kind);
         let key = code_key(&digest, engine);
         let stats = std::env::var_os("BLAZE_STATS").is_some();
-        // Machine code is loaded only from the store, which checks what it gives against its
-        // checksum: a file anyone can write is never run as code.
-        let kept = store.and_then(|it| it.get_lasting(&key)).map(|code| {
-            // SAFETY: `code` is what the store keeps under `key`, checked against its checksum
-            // as it was read, and only `serialize` of this module on an engine of
-            // `code_key`'s compatibility hash puts under `key`; Wasmtime refuses code of
-            // another version, configuration or CPU. Other bytes would run as machine code.
-            unsafe { Module::deserialize(engine, &code) }.map_err(|e| {
-                // alloc: the message of machine code refused.
-                format!(
-                    "{}: the store's machine code of it, under a key of this engine's \
-                     configuration, is refused: {e:#}",
-                    path.display()
-                )
-            })
-        });
-        let kept = kept.transpose()?;
+        let kept = match store {
+            Some(store) => kept_module(store, &key, engine, path)?,
+            None => None,
+        };
         let (module, was_kept) = match kept {
             Some(module) => (module, true),
             None => {
@@ -1015,8 +1006,7 @@ impl Wasm {
                 }
                 if let Some(store) = store {
                     let code = module.serialize().map_err(failed)?;
-                    store.insert_lasting(&key, &code);
-                    store.flush();
+                    keep_machine_code(store, key, code, path)?;
                 }
                 (module, store.is_some())
             }
@@ -1032,28 +1022,27 @@ impl Wasm {
         // alloc: setup, once a module: its path, for what it says of itself.
         let path = path.to_owned();
         let wasm = Wasm { path, digest, identity, kind, pre, exports, compiled_in, kept };
-        wasm.keep_code(store);
         count(Counted::Loaded, start.elapsed());
         Ok(wasm)
     }
 
-    /// Keeps its machine code in `store`, if it has not: a module compiled before the daemon
-    /// told the store the toolchain is kept once it has.
-    fn keep_code(&self, store: Option<&blaze_store::Store>) {
-        let Some(store) = store else { return };
+    /// Keeps its machine code in `store`, if it has not: a module compiled in a process with no
+    /// store at the time is kept by the first load with one.
+    fn keep_code(&self, store: Option<&blaze_cas::Handle>) -> Result<(), String> {
+        let Some(store) = store else { return Ok(()) };
         // A plain load first: every lookup of a module passes here, and a swap would write
         // the shared line each time.
         if self.kept.load(Ordering::Relaxed) || self.kept.swap(true, Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         let module = self.pre.module();
-        if let Ok(code) = module.serialize() {
-            store.insert_lasting(&code_key(&self.digest, module.engine()), &code);
-            store.flush();
-            if std::env::var_os("BLAZE_STATS").is_some() {
-                eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
-            }
+        // alloc: the message of machine code that can't be serialized.
+        let code = module.serialize().map_err(|e| format!("{}: {e:#}", self.path.display()))?;
+        keep_machine_code(store, code_key(&self.digest, module.engine()), code, &self.path)?;
+        if std::env::var_os("BLAZE_STATS").is_some() {
+            eprintln!("blaze: the store keeps the machine code of {}", self.path.display());
         }
+        Ok(())
     }
 
     /// An instance, its C library set up: a module linked as a library (a WASI reactor) is
@@ -1199,7 +1188,7 @@ impl Wasm {
         db: Option<&Db>,
         call: &Call<'_>,
     ) -> Ran {
-        expand(blaze_expand::keeping(), &code(&self.digest), &|| Ok(self), index, listed, db, call)
+        expand(kept::keeping(), &code(&self.digest), &|| Ok(self), index, listed, db, call)
     }
 }
 
@@ -1330,34 +1319,106 @@ impl Session {
 /// and what Wasmtime says code must match to load (its version, its configuration, the
 /// target and the CPU features it compiled for, [`CPU_FEATURES`] rather than the host's),
 /// and nothing of the checkout, the build of blaze or the toolchain, so every checkout and
-/// every host of the same kind shares it. `engine` is the one the code is for.
-fn code_key(digest: &[u8; 32], engine: &Engine) -> [u8; 32] {
+/// every host of the same kind shares it. `engine` is the one the code is for: it is the
+/// producer, the module the one input.
+fn code_key(digest: &[u8; 32], engine: &Engine) -> blaze_cas::Key {
     use std::hash::Hash as _;
-    struct Fields<'a>(&'a mut keyed::Key);
-    impl std::hash::Hasher for Fields<'_> {
-        fn write(&mut self, bytes: &[u8]) {
-            self.0.field(bytes);
+    let mut producer = Feed(Hasher::new("blaze v2 wasmtime engine of proc-macro modules 1"));
+    let arch = std::env::consts::ARCH.as_bytes();
+    producer.0.update(&(arch.len() as u64).to_le_bytes()).update(arch);
+    engine.precompile_compatibility_hash().hash(&mut producer);
+    blaze_cas::Key::of(MACHINE_CODE, producer.0.finish(), &[ContentId(*digest)])
+}
+
+/// The schema of a module's machine code as the store keeps it: what Wasmtime's `serialize`
+/// writes, which only a Wasmtime of the producer's compatibility hash loads.
+const MACHINE_CODE: blaze_format::SchemaHash = blaze_format::schema("wasmtime serialized module of a proc-macro module 1");
+
+/// The module whose machine code `store` keeps under `key`, for `engine`. Committed code is a
+/// file of its own ([`blaze_cas::Kind::Machine`]), mapped copy-on-write by Wasmtime with its
+/// pages read only as its code runs; code this process put since the daemon's last commit is
+/// still in the store's memory, and is loaded from its bytes.
+fn kept_module(
+    store: &blaze_cas::Handle,
+    key: &blaze_cas::Key,
+    engine: &Engine,
+    path: &Path,
+) -> Result<Option<Module>, String> {
+    // Machine code is loaded only from the store, which checks what it gives against its
+    // content hash: a file anyone can write is never run as code.
+    let pinned = store.pinned(key).map_err(|e| {
+        // alloc: the message of a store that can't be read.
+        format!("{}: the store's machine code of it: {e}", path.display())
+    })?;
+    let Some(pinned) = pinned else { return Ok(None) };
+    let refused = |e: wasmtime::Error| {
+        // alloc: the message of machine code refused.
+        format!(
+            "{}: the store's machine code of it, under a key of this engine's configuration, \
+             is refused: {e:#}",
+            path.display()
+        )
+    };
+    let module = match pinned.file() {
+        Some(file) => {
+            let at = store.path_of(file);
+            let open = open_code(&at).map_err(|e| {
+                // alloc: the message of a store's file that can't be opened.
+                format!("{}: the store's file {} of its machine code: {e}", path.display(), at.display())
+            })?;
+            // SAFETY: the file is the store's of the value under `key`, whose bytes were checked
+            // against their content hash as they were pinned; the store names it by that hash
+            // and only ever renames a file of the same bytes over it, and nothing else writes
+            // the store's directory. Only `serialize` of this module on an engine of
+            // `code_key`'s compatibility hash puts under `key`; Wasmtime refuses code of
+            // another version, configuration or CPU. Other bytes would run as machine code.
+            unsafe { Module::deserialize_open_file(engine, open) }.map_err(refused)?
         }
-        fn finish(&self) -> u64 {
-            0
-        }
+        // SAFETY: as above, of the value's checked bytes, which Wasmtime copies.
+        None => unsafe { Module::deserialize(engine, &*pinned) }.map_err(refused)?,
+    };
+    Ok(Some(module))
+}
+
+/// The store's file of a module's machine code, opened as Wasmtime maps it: readable, and on
+/// Windows executable too.
+fn open_code(at: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, which Wasmtime's mapping of it needs.
+        options.access_mode(0x0012_0089 | 0x0012_00A0);
     }
-    let mut key = keyed::Key::new("wasmtime machine code of a proc-macro module 2");
-    key.field(digest).field(std::env::consts::ARCH.as_bytes());
-    engine.precompile_compatibility_hash().hash(&mut Fields(&mut key));
-    key.done()
+    options.open(at)
+}
+
+/// Keeps `code`, the machine code of the module at `path`, under `key`: durable once the
+/// daemon commits. Other code under the same key is a key that misses an input of the code.
+fn keep_machine_code(store: &blaze_cas::Handle, key: blaze_cas::Key, code: Vec<u8>, path: &Path) -> Result<(), String> {
+    store.put(key, blaze_cas::Kind::Machine, code).map(drop).map_err(|it| {
+        // alloc: the message of a key that misses an input.
+        format!(
+            "{}: the store keeps other machine code under the key of this module and engine \
+             ({:x}, not {:x}): the key misses an input of the code",
+            path.display(),
+            it.kept,
+            it.given
+        )
+    })
 }
 
 /// The kind of the instances of the module of `digest` in this process, as a load decides it
 /// ([`Lazy::new`]): what readies it compiles it for the same engine, so the load waits for that
 /// compile rather than making another.
-fn kind_for(digest: &[u8; 32]) -> Kind {
-    Kind::of(verdict(digest))
+fn kind_for(digest: &[u8; 32]) -> Result<Kind, String> {
+    verdict(digest).map(Kind::of)
 }
 
 /// Whether `store` has machine code of the module of `digest` for this process's engine.
-fn has_code(store: &blaze_store::Store, digest: &[u8; 32]) -> bool {
-    store.has_lasting(&code_key(digest, engine_of(kind_for(digest))))
+fn has_code(store: &blaze_cas::Handle, digest: &[u8; 32]) -> Result<bool, String> {
+    Ok(store.has(&code_key(digest, engine_of(kind_for(digest)?))))
 }
 
 /// Writes `bytes` to `path` whole or not at all: a process that reads it while it is written
@@ -1374,17 +1435,18 @@ fn write_whole(path: &Path, bytes: &[u8]) {
 /// made it: compiles it with Cranelift (or finds its machine code in `store`), keeps the code
 /// in `store`, and writes the list of its macros beside it, so that a load with the store
 /// compiles nothing and reads the list without running it.
-pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), String> {
+pub fn prepare(path: &Path, store: Option<&blaze_cas::Handle>) -> Result<(), String> {
     let start = Instant::now();
     if let Some((known, _)) = listing(path)
-        && store.is_some_and(|it| has_code(it, &known.digest))
+        && let Some(store) = store
+        && has_code(store, &known.digest)?
     {
         return Ok(());
     }
     // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let known = Known { digest: keyed::sha256(&bytes), identity: None };
-    let wasm = Wasm::known(path, known, Some(&bytes), store, kind_for(&known.digest))?;
+    let wasm = Wasm::known(path, known, Some(&bytes), store, kind_for(&known.digest)?)?;
     list(path, wasm, &wasm.list()?);
     if std::env::var_os("BLAZE_STATS").is_some() {
         eprintln!(
@@ -1399,9 +1461,10 @@ pub fn prepare(path: &Path, store: Option<&blaze_store::Store>) -> Result<(), St
 /// As [`prepare`], but a module that carries its list of macros ([`exports::LIST_SECTION`]) is
 /// compiled on a thread of its own: its list is written now, and the first of its macros to
 /// expand in this process waits for the compile.
-pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> Result<(), String> {
+pub fn prepare_soon(path: &Path, store: Option<&'static blaze_cas::Handle>) -> Result<(), String> {
     if let Some((known, _)) = listing(path)
-        && store.is_some_and(|it| has_code(it, &known.digest))
+        && let Some(store) = store
+        && has_code(store, &known.digest)?
     {
         return Ok(());
     }
@@ -1414,7 +1477,7 @@ pub fn prepare_soon(path: &Path, store: Option<&'static blaze_store::Store>) -> 
     // alloc: setup, once a module: its path, for the thread that compiles it.
     let path = path.to_owned();
     let known = Known { digest, identity: Some(identity) };
-    let kind = kind_for(&digest);
+    let kind = kind_for(&digest)?;
     std::thread::spawn(move || {
         let start = Instant::now();
         let done = Wasm::known(&path, known, Some(&bytes), store, kind);
@@ -1686,8 +1749,8 @@ impl Shapes {
         self.contexts.clear();
         self.bytes.clear();
         for &(anchor, ctx) in parts {
-            let anchor = blaze_expand::number(&mut self.anchors, anchor);
-            let context = blaze_expand::number(&mut self.contexts, ctx);
+            let anchor = kept::number(&mut self.anchors, anchor);
+            let context = kept::number(&mut self.contexts, ctx);
             for it in [anchor, context] {
                 self.bytes.extend_from_slice(&u32::to_le_bytes(it));
             }
@@ -1802,7 +1865,7 @@ struct Room {
 fn answer(read: &str, shapes: &Shapes, db: Option<&Db>, out: &mut String) {
     match Value::parse(read, shapes) {
         Some((value, span)) => {
-            let answer = db.map(|db| load_cargo::answer(db, value.request(span)));
+            let answer = db.map(|db| blaze_lower::answer(db, value.request(span)));
             value.said(answer.as_ref(), out);
         }
         None => out.push('?'),
@@ -2006,11 +2069,11 @@ impl Drop for Scratched {
 /// fresh instance: what is kept of it when the store has it, else by running it in what
 /// `wasm` gives, which is asked for only then, and keeps what it made by what it read
 /// ([`what_it_read`]) unless it read what can't be traced or left state behind, where
-/// `keeping` says ([`blaze_expand::keeping`]). Nothing is kept where blaze-expand was not
+/// `keeping` says ([`kept::keeping`]). Nothing is kept where expansions were not
 /// installed (a bench).
 #[allow(clippy::too_many_arguments)]
 fn expand<'a>(
-    keeping: Option<blaze_expand::Keeping>,
+    keeping: Option<kept::Keeping>,
     code: &ContentId,
     wasm: &impl Fn() -> Result<&'a Wasm, String>,
     index: u32,
@@ -2078,7 +2141,7 @@ fn expand<'a>(
                         kept.set(parts);
                         Err(read)
                     }
-                    Found::Hit { value, .. } => Ok(Some(blaze_expand::checked(value))),
+                    Found::Hit { value, .. } => Ok(Some(kept::checked(value))),
                     Found::Miss { .. } => Ok(None),
                 },
             );
@@ -2135,12 +2198,12 @@ fn expand<'a>(
         let value = shapes.written(&state.parts, &state.output);
         std::mem::swap(parts, &mut state.parts);
         if let Some(kept) = &found {
-            if value.as_deref().map(blaze_expand::checked).as_ref() != Some(kept) {
+            if value.as_deref().map(kept::checked).as_ref() != Some(kept) {
                 // alloc: the message of an expansion that failed.
                 return Err(failed(format!(
                     "{}=check: it expanded otherwise than the store kept it, under a key of \
                      every input it read",
-                    blaze_expand::CACHE
+                    kept::CACHE
                 )));
             }
             return Ok(restore(tree));
@@ -2158,7 +2221,7 @@ fn expand<'a>(
             (Some(traced), Some(value)) => {
                 // alloc: what names an output the store keeps, made only when the macro ran.
                 let what = format!("the wasm proc macro `{}`", listed.name);
-                blaze_expand::put(Put { run, traced, value, what });
+                kept::put(Put { run, traced, value, what });
                 count(Counted::Kept, Duration::ZERO);
             }
             (Some(_), None) => {}
@@ -2169,21 +2232,49 @@ fn expand<'a>(
     Ran { output, found: false, retained, took: start.elapsed() }
 }
 
-/// The key a module's [`Verdict`] is kept under in the store, by the module's digest, for every
-/// process and machine that loads the same module. A stateful module is one an expansion of
-/// left what it allocated live, for a later one to find.
-fn verdict_key(digest: &[u8; 32]) -> [u8; 32] {
-    let mut key = keyed::Key::new("whether a proc-macro module keeps state 1");
-    key.field(digest);
-    key.done()
+/// The key the store says `verdict` ([`STATEFUL`] or [`STATELESS`]) of the module of `digest`
+/// under, for every process and machine that loads the same module. A stateful module is one
+/// an expansion of left what it allocated live, for a later one to find. Each verdict has its
+/// own key, so neither is ever put under a key that holds the other.
+fn verdict_key(digest: &[u8; 32], verdict: &[u8]) -> blaze_cas::Key {
+    let producer = ContentId::of("blaze v2 proc-macro module verdicts of blaze-macro-wasm 1", &[]);
+    let said = ContentId::of("blaze v2 proc-macro module verdict 1", verdict);
+    blaze_cas::Key::of(VERDICT, producer, &[ContentId(*digest), said])
 }
 
-fn verdict(digest: &[u8; 32]) -> Verdict {
-    match store().and_then(|it| it.get_lasting(&verdict_key(digest))).as_deref() {
-        Some(STATELESS) => Verdict::Stateless,
-        Some(STATEFUL) => Verdict::Stateful,
-        _ => Verdict::Unseen,
-    }
+/// The schema of a module's verdict as the store keeps it: the verdict's own bytes.
+const VERDICT: blaze_format::SchemaHash = blaze_format::schema("whether a proc-macro module keeps state 2");
+
+/// What the store says of the module of `digest`: stateful once any process saw it keep state,
+/// whatever another said before.
+fn verdict(digest: &[u8; 32]) -> Result<Verdict, String> {
+    let Some(store) = store() else { return Ok(Verdict::Unseen) };
+    let says = |verdict: &'static [u8]| {
+        let said = store.read(&verdict_key(digest, verdict), |it| it.bytes == verdict);
+        match said {
+            Ok(Some(true)) => Ok(true),
+            Ok(None) => Ok(false),
+            // alloc: the message of a store that can't be read.
+            Ok(Some(false)) => Err(format!("the store keeps another verdict under the key of {verdict:?}")),
+            // alloc: the message of a store that can't be read.
+            Err(corrupt) => Err(corrupt.to_string()),
+        }
+    };
+    Ok(if says(STATEFUL)? {
+        Verdict::Stateful
+    } else if says(STATELESS)? {
+        Verdict::Stateless
+    } else {
+        Verdict::Unseen
+    })
+}
+
+/// Tells the store `verdict` of the module of `digest`, durable once the daemon commits.
+fn tell(store: &blaze_cas::Handle, digest: &[u8; 32], verdict: &'static [u8]) -> Result<(), String> {
+    // alloc: once a module a build, a verdict.
+    let put = store.put(verdict_key(digest, verdict), blaze_cas::Kind::Query, verdict.to_vec());
+    // alloc: the message of a key that misses an input.
+    put.map(drop).map_err(|it| format!("the store keeps other bytes than {verdict:?} under its key: {:x}", it.kept))
 }
 
 /// The modules loaded in this process, for [`flush`] to tell the store what it saw of them.
@@ -2304,18 +2395,18 @@ fn seat_id(of: &(Nonce, Crate)) -> ContentId {
 }
 
 impl Lazy {
-    fn new(path: &Path, known: Known) -> Lazy {
-        Lazy {
+    fn new(path: &Path, known: Known) -> Result<Lazy, String> {
+        Ok(Lazy {
             // alloc: setup, once a module: its path, compiled from when it first expands.
             path: path.to_owned(),
             known,
             compiled: OnceLock::new(),
-            seen: Seen::new(verdict(&known.digest)),
+            seen: Seen::new(verdict(&known.digest)?),
             seats: Sharded::new(),
             // alloc: none, an empty list until a crate expands in a session.
             made: Mutex::new(Vec::new()),
             swept: Mutex::new(FxHashMap::default()),
-        }
+        })
     }
 
     /// The seat of `of`, made the first time it is asked for.
@@ -2376,7 +2467,7 @@ impl Lazy {
             Wasm::known(&self.path, self.known, None, store(), self.kind())
         });
         let wasm = *compiled.as_ref().map_err(Clone::clone)?;
-        wasm.keep_code(store());
+        wasm.keep_code(store())?;
         Ok(wasm)
     }
 
@@ -2393,14 +2484,13 @@ impl Lazy {
 
     /// Notes what an expansion that ran did. One that left state is told the store at once;
     /// that none did, by [`flush`], once a build has run them.
-    fn saw(&self, ran: &Ran) {
+    fn saw(&self, ran: &Ran) -> Result<(), String> {
         if ran.found || ran.output.is_err() {
-            return;
+            return Ok(());
         }
-        let Some(contradicted) = self.seen.saw(ran.retained) else { return };
+        let Some(contradicted) = self.seen.saw(ran.retained) else { return Ok(()) };
         if let Some(store) = store() {
-            store.insert_lasting(&verdict_key(&self.known.digest), STATEFUL);
-            store.flush();
+            tell(store, &self.known.digest, STATEFUL)?;
         }
         if contradicted {
             eprintln!(
@@ -2409,6 +2499,7 @@ impl Lazy {
                 self.path.display()
             );
         }
+        Ok(())
     }
 }
 
@@ -2429,14 +2520,14 @@ impl fmt::Debug for Expander {
 }
 
 /// What is counted of macro expansions and loaded modules for the daemon's build statistics,
-/// each with the time it took, on the thread that did it ([`blaze_expand::tally`]).
+/// each with the time it took, on the thread that did it ([`kept::tally`]).
 #[derive(Clone, Copy)]
 enum Counted {
     /// Expansions run in a module, from their call.
     Ran,
     /// Expansions the store had, from their call.
     Found,
-    /// Expansions left for the store's owner to keep ([`blaze_expand::take_puts`]).
+    /// Expansions left for the store's owner to keep ([`kept::take_puts`]).
     Kept,
     /// Expansions run that were not kept, as they asked the database what their key does not
     /// say or met a file they could not read.
@@ -2495,29 +2586,24 @@ pub fn report() -> Option<String> {
 }
 
 /// Writes out that a module whose expansions ran and none of which left state is stateless,
-/// for the next process to find: the store holds what is added in memory until it is flushed.
-pub fn flush() {
-    let Some(store) = store() else { return };
-    let mut told = false;
+/// for the next process to find: durable once the daemon commits what it was given.
+pub fn flush() -> Result<(), String> {
+    let Some(store) = store() else { return Ok(()) };
     let mut modules = MODULES.lock().unwrap_or_else(|e| e.into_inner());
     modules.retain(|it| it.strong_count() != 0);
     for lazy in modules.iter().filter_map(std::sync::Weak::upgrade) {
         // Another process that saw one leave state may have told the store since the load.
-        if lazy.seen.flush() && verdict(&lazy.known.digest) == Verdict::Unseen {
-            store.insert_lasting(&verdict_key(&lazy.known.digest), STATELESS);
-            told = true;
+        if lazy.seen.flush() && verdict(&lazy.known.digest)? == Verdict::Unseen {
+            tell(store, &lazy.known.digest, STATELESS)?;
         }
     }
-    if told {
-        store.flush();
-    }
+    Ok(())
 }
 
-/// The store of modules' machine code and of what was seen of their state, once the daemon has
-/// told it the toolchain. Expansions are kept in blaze-expand's ([`blaze_expand::keeping`]).
-fn store() -> Option<&'static blaze_store::Store> {
-    blaze_store::toolchain()?;
-    blaze_store::Store::global()
+/// The store of modules' machine code and of what was seen of their state: the process's, once
+/// the daemon has installed it. Expansions are kept where [`kept::keeping`] says.
+fn store() -> Option<&'static blaze_cas::Handle> {
+    blaze_cas::Handle::installed()
 }
 
 impl ProcMacroExpander for Expander {
@@ -2541,9 +2627,9 @@ impl ProcMacroExpander for Expander {
         // has neither loads nor compiles it.
         let wasm = || self.wasm.get();
         let code = code(&self.wasm.known.digest);
-        let keeping = blaze_expand::keeping();
+        let keeping = kept::keeping();
         let ran = expand(keeping, &code, &wasm, self.index, &self.listed, Some(db), &call);
-        self.wasm.saw(&ran);
+        self.wasm.saw(&ran).map_err(ProcMacroExpansionError::System)?;
         ran.output
     }
 
@@ -2585,7 +2671,7 @@ impl ProcMacroExpander for Expander {
         let session = session.as_mut().map_err(|e| ProcMacroExpansionError::System(e.clone()))?;
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
         let ran = session.expand(self.index, &self.listed, Some(db), &call);
-        self.wasm.saw(&ran);
+        self.wasm.saw(&ran).map_err(ProcMacroExpansionError::System)?;
         ran.output
     }
 
@@ -2604,8 +2690,8 @@ pub fn tokens(text: &str, span: Span) -> Result<tt::TopSubtree, String> {
     Ok(wire::top_subtree(lex::stream(text, span)?, span))
 }
 
-/// The macros of the module at `path`, for rust-analyzer: what blaze registers with
-/// [`load_cargo::wasm_macros_with`].
+/// The macros of the module at `path`: the expanders the front end sets for a proc macro's
+/// crate compiled to WebAssembly.
 pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     let failed = |e: String| {
         base_db::ProcMacroLoadingError::ProcMacroSrvError(
@@ -2615,18 +2701,18 @@ pub fn load(path: &AbsPath) -> ProcMacroLoadResult {
     };
     let path: &Path = path.as_ref();
     let (lazy, text) = match listing(path) {
-        Some((known, text)) => (Lazy::new(path, known), text),
+        Some((known, text)) => (Lazy::new(path, known).map_err(failed)?, text),
         None => {
             // alloc: setup, once a module: its bytes, or the message of a file that can't be read.
             let bytes = std::fs::read(path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
             let digest = keyed::sha256(&bytes);
             let known = Known { digest, identity: None };
-            let wasm = Wasm::known(path, known, Some(&bytes), store(), kind_for(&digest))
-                .map_err(failed)?;
+            let kind = kind_for(&digest).map_err(failed)?;
+            let wasm = Wasm::known(path, known, Some(&bytes), store(), kind).map_err(failed)?;
             let text = wasm.list().map_err(failed)?;
             list(path, wasm, &text);
             let known = Known { digest: wasm.digest, identity: Some(wasm.identity) };
-            let lazy = Lazy::new(path, known);
+            let lazy = Lazy::new(path, known).map_err(failed)?;
             // The load's own verdict, so the kind it was compiled for, unless the store was
             // told otherwise meanwhile: then `get` compiles for the other.
             if lazy.kind() == wasm.kind {
@@ -2680,7 +2766,7 @@ mod tests {
 
     #[test]
     fn the_guest_is_its_own_text_then_the_bridges_api() {
-        let api = include_str!("../../blaze-expand/src/native/proc_macro/api.rs");
+        let api = include_str!("../native/proc_macro/api.rs");
         assert!(GUEST.ends_with(api));
         assert_eq!(GUEST.matches("\nfn taken(").count(), 1);
         assert!(GUEST[..GUEST.len() - api.len()].ends_with('\n'), "the API starts a line");
@@ -2867,9 +2953,8 @@ mod tests {
     #[test]
     fn a_prepared_module_is_loaded_without_compiling_or_reading_it() {
         let dir = scratch("prepared");
-        blaze_store::compiles_against("blaze-macro-wasm tests");
-        let store: &'static blaze_store::Store =
-            Box::leak(Box::new(blaze_store::Store::open_at(&dir.join("store")).unwrap()));
+        let mut driven = blaze_cas::Driven::open(&dir.join("store")).unwrap();
+        let store: &'static blaze_cas::Handle = Box::leak(Box::new(driven.handle()));
         let path = dir.join("m.wasm");
         let list = "0\tSerialize\tserde\n";
         let mut module = b"\0asm\x01\0\0\0".to_vec();
@@ -2884,18 +2969,21 @@ mod tests {
         assert_eq!(known.digest, keyed::sha256(&module));
         // Waits for the compile `prepare_soon` started, which keeps the code in the store, under
         // a key of no path, and nowhere beside the module.
-        let kind = kind_for(&known.digest);
+        let kind = kind_for(&known.digest).unwrap();
         Wasm::known(&path, known, None, Some(store), kind).unwrap();
         let key = code_key(&known.digest, engine_of(kind));
-        assert!(store.has_lasting(&key));
+        assert!(store.has(&key));
         let beside: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|it| it.unwrap().file_name())
             .filter(|it| it.to_string_lossy().ends_with(".cwasm"))
             .collect();
         assert!(beside.is_empty(), "{beside:?}");
-        store.seal();
-        assert!(store.get_lasting(&key).is_some());
+        // Once committed, the code is a file of its own, which Wasmtime maps rather than copies.
+        driven.flush().unwrap();
+        let pinned = store.pinned(&key).unwrap().expect("the code is kept");
+        assert!(pinned.file().is_some(), "committed machine code is a file of its own");
+        assert!(kept_module(store, &key, engine_of(kind), &path).unwrap().is_some());
         // Another write of the module, even of the same bytes, is listed again.
         std::fs::write(&path, &module).unwrap();
         let later = std::time::SystemTime::now() + Duration::from_secs(5);
@@ -3275,13 +3363,13 @@ mod tests {
         store
     }
 
-    fn keeping_in(store: &blaze_cas::Store) -> blaze_expand::Keeping {
-        let expansions = blaze_expand::Expansions {
+    fn keeping_in(store: &blaze_cas::Store) -> proc_macro_api::kept::Keeping {
+        let expansions = proc_macro_api::kept::Expansions {
             store: store.reader(),
             toolchain: ContentId::default(),
             environment: Arc::new(proc_macro_api::warm::Environment::default()),
         };
-        blaze_expand::Keeping { expansions: Box::leak(Box::new(expansions)), mode: Mode::Keep }
+        proc_macro_api::kept::Keeping { expansions: Box::leak(Box::new(expansions)), mode: Mode::Keep }
     }
 
     /// A kept expansion that read a file of its package, a variable and the line of a span is
@@ -3316,7 +3404,7 @@ mod tests {
         // A miss runs the module and leaves what it made to keep.
         let ran = expand(Some(keeping_in(&store)), &code, &module, 0, &listed, None, &call);
         assert!(ran.output.unwrap() == input && !ran.found);
-        let put = blaze_expand::take_puts().into_iter().find(|it| it.run.code == code).unwrap();
+        let put = proc_macro_api::kept::take_puts().into_iter().find(|it| it.run.code == code).unwrap();
         // Kept as having read more than the echo does, so the hit looks each up.
         let question = read_of(Value::LineColumn, [0, 1, 0, 0]);
         let mut traced = Traced {
@@ -3346,7 +3434,7 @@ mod tests {
         file.set_modified(later).unwrap();
         let ran = expand(keeping, &code, &module, 0, &listed, None, &call);
         assert!(!ran.found && ran.output.unwrap() == input);
-        _ = blaze_expand::take_puts();
+        _ = proc_macro_api::kept::take_puts();
         _ = std::fs::remove_dir_all(&dir);
     }
 

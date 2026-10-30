@@ -98,9 +98,8 @@ hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
 rustc-symbols = { path = "crates/rustc-symbols" }
-blaze-expand = { path = "crates/blaze-expand" }
-# The `proc_macro` blaze's native expanders are built against (crates/blaze-expand/src/native/).
-native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-expand/src/native/proc_macro" }
+# The `proc_macro` of blaze's in-process proc-macro bridge (crates/blaze-macro-wasm/src/native.rs).
+native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-macro-wasm/native/proc_macro" }
 blaze-macro-wasm = { path = "crates/blaze-macro-wasm" }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
 blaze-store = { path = "crates/blaze-store" }
@@ -112,6 +111,7 @@ blaze-metadata = { path = "crates/blaze-metadata" }
 blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
+blaze-lower = { path = "crates/blaze-lower" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
@@ -159,8 +159,6 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
 # Flecs's C and its read-only REST, for the build page's world (vendor/flecs-c/SOURCE.md).
 flecs-c = { path = "vendor/flecs-c" }
-hir-ide = { path = "crates/hir-ide", version = "0.0.0" }
-ide-db = { path = "crates/ide-db", version = "0.0.0" }
 intern = { path = "crates/intern", version = "0.0.0" }
 load-cargo = { path = "crates/load-cargo", version = "0.0.0" }
 mbe = { path = "crates/mbe", version = "0.0.0" }
@@ -176,7 +174,6 @@ syntax = { path = "crates/syntax", version = "0.0.0" }
 const-ast = { path = "crates/const-ast", version = "0.0.0" }
 syntax-bridge = { path = "crates/syntax-bridge", version = "0.0.0" }
 target-features = { path = "crates/target-features", version = "0.0.0" }
-test-fixture = { path = "crates/test-fixture", version = "0.0.0" }
 test-utils = { path = "crates/test-utils", version = "0.0.0" }
 toolchain = { path = "crates/toolchain", version = "0.0.0" }
 tt = { path = "crates/tt", version = "0.0.0" }
@@ -253,7 +250,7 @@ expect-test = "1.5.1"
 # (docs/contributing.md, vendor/hegeltest/SOURCE.md).
 hegeltest = { path = "vendor/hegeltest", default-features = false, features = ["static-engine"] }
 indexmap = { version = "2.9.0", features = ["serde"] }
-# hir-ty's MIR and display provider tables, which hir-ty-mir and hir-ide register into.
+# hir-ty's MIR provider table, which hir-ty-mir registers into.
 inventory = "0.3.24"
 itertools = "0.15.0"
 libc = "0.2.172"

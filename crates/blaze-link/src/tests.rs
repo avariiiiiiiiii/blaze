@@ -1262,6 +1262,8 @@ mod premap;
 
 mod sanitize;
 
+mod splice;
+
 /// The state's columns, read and written as a stage does.
 mod columns {
     use blaze_codegen::Line;

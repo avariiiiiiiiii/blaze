@@ -16,7 +16,7 @@ use syntax::{
     AstPtr, SyntaxKind, TextSize, ast as tag,
     view::{self as ast, AstNode},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::resolve_macro_call_id;
 use crate::{
@@ -59,7 +59,7 @@ pub(super) fn macro_calls(db: &TestDB) -> Vec<MacroCallId> {
 #[track_caller]
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let mut errors: Vec<(TextSize, String)> = Vec::new();
     for call in macro_calls(&db) {
         let Some(err) = &call.parse_macro_expansion(&db).err else { continue };
@@ -272,14 +272,15 @@ builtin-macro-error: expected a byte literal
 
 #[test]
 fn concat_bytes_literal_has_the_call_span() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #[rustc_builtin_macro]
 macro_rules! concat_bytes {() => {}}
 
 fn main() { concat_bytes!(b'A', [66]); }
 "#,
-    );
+    )
+    .into_db();
     let [call] = macro_calls(&db)[..] else { panic!("one call") };
     let (parse, map) = &call.parse_macro_expansion(&db).value;
     let literal = parse
@@ -317,7 +318,7 @@ builtin-macro-error: macro expansion ignores `;` and any tokens following
 /// is an expression, so statements are not what it can expand to.
 #[test]
 fn a_blocks_last_call_expands_to_an_expression() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 macro_rules! m { () => { let x = 1; x } }
 
@@ -325,7 +326,8 @@ fn f() -> i32 { m!() }
 fn g() { m!(); }
 fn h() -> i32 { m! {} }
 "#,
-    );
+    )
+    .into_db();
     let mut found = Vec::new();
     for call in macro_calls(&db) {
         let MacroCallKind::FnLike { expand_to, .. } = call.loc(&db).kind else {
@@ -351,7 +353,7 @@ fn main() {
     let z = n!();
 }
 "#;
-    let db = TestDB::with_files(text);
+    let db = fixture::db(text).into_db();
     let mut found = Vec::new();
     for call in macro_calls(&db) {
         let map = call.expansion_span_map(&db);
@@ -383,7 +385,7 @@ fn main() {{
 }}
 "#
     );
-    let db = TestDB::with_files(&text);
+    let db = fixture::db(&text).into_db();
     let errors: Vec<_> = macro_calls(&db)
         .into_iter()
         .filter_map(|call| call.parse_macro_expansion(&db).err.clone())
@@ -404,7 +406,7 @@ macro_rules! n { ($a:ident, $b:ident) => {} }
 m!(x);
 n!(x y);
 "#;
-    let db = TestDB::with_files(text);
+    let db = fixture::db(text).into_db();
     let mut found = Vec::new();
     for call in macro_calls(&db) {
         let err = call.parse_macro_expansion(&db).err.clone().expect("no rule matches");
@@ -462,7 +464,7 @@ fn main() {
     m!(let x = 1);
 }
 "#;
-    let db = TestDB::with_files(text);
+    let db = fixture::db(text).into_db();
     let [call] = macro_calls(&db)[..] else { panic!("one call") };
     let (parse, map) = &call.parse_macro_expansion(&db).value;
     let stmt = parse
@@ -487,7 +489,7 @@ fn main() {
     m!(x);
 }
 "#;
-    let db = TestDB::with_files(text);
+    let db = fixture::db(text).into_db();
     let [call] = macro_calls(&db)[..] else { panic!("one call") };
     let (parse, map) = &call.parse_macro_expansion(&db).value;
     let made = parse

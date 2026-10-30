@@ -4,10 +4,8 @@
 #![forbid(unsafe_code)]
 
 use cfg::CfgAtom;
-use ide_db::{
-    FxHashMap, FxHashSet,
-    base_db::{CrateBuilderId, CrateGraphBuilder, CrateOrigin, LangCrateOrigin},
-};
+use base_db::{CrateBuilderId, CrateGraphBuilder, CrateOrigin, LangCrateOrigin};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 use vfs::{AbsPath, AbsPathBuf};
 

@@ -15,7 +15,7 @@ compiling is allowed, and every sibling's cases go through them.
 
 | file | what it does |
 |---|---|
-| [rejections.py](../../../../../harness/v2/rejections.py) | adds primary spans: `Span`, `place`, `primary_spans`, `span_mismatches`, the category `other spans`; rustc's answers kept with their spans (`rustc-spans`); `run_batch(command="build")`; `rustc_argv(emit, output, extra)` |
+| `rejections.py` (deleted 2026-10-30) | adds primary spans: `Span`, `place`, `primary_spans`, `span_mismatches`, the category `other spans`; rustc's answers kept with their spans (`rustc-spans`); `run_batch(command="build")`; `rustc_argv(emit, output, extra)` |
 | [frontend/cases.py](../../../../../harness/v2/frontend/cases.py) | the case runner; `Runner.compare` is the one comparison that fuzz.py uses too |
 | `frontend/fuzz.py` (deleted 2026-10-30) | the seeded generator, the shrinker, and the cases it writes to `cases/fuzz/` |
 | [frontend/cases/nameres/](../../../../../harness/v2/frontend/cases/nameres) | section 1's cases (72): E0425, E0432, E0433, E0412, E0659, E0603, E0252, E0255, E0364, E0405, E0411, E0422, E0423, E0428, E0434, E0531, E0599, `cannot find macro`; glob shadowing and glob cycles; macro-expanded `use`; `macro_rules!` textual scope and `#[macro_use]`; `$crate`; 2015 against 2018 paths and the 2021 prelude; a directory module |

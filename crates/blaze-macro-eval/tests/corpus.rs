@@ -1,19 +1,20 @@
-//! Real proc macros expanded by blaze-macro-eval and by references, token for token.
+//! Real proc macros expanded by blaze-macro-eval, held to what the corpus says of them.
 //!
 //! The fixture workspace (`tests/corpus/ws`) calls serde_derive, thiserror, tokio-macros and its
 //! own macros (one of each kind, one that panics, one that reads a file of the calling package,
 //! one that reads its variables, one that counts its calls), each from the registry at the
 //! version its `Cargo.lock` pins. Its calls are expanded as the front end expands them (each
-//! calling crate's def map) with every macro blaze-macro-eval's, and each call is run again by:
-//! the toolchain's proc-macro server with rustc's library of the macro (every macro), blaze's
-//! WebAssembly host where a module is named, and the fixture's own macros built into this test
-//! against blaze's in-process bridge (`corpus/native.rs`). Every output must be the same as each
-//! reference's, every token tree with its span's shape, and a panic's message the same.
+//! calling crate's def map) with every macro blaze-macro-eval's. These tests check that every
+//! call expands, each panic says the macro's message, and the macros that read files,
+//! variables and state read the caller's. Where blaze has another host of the same macro
+//! (blaze's WebAssembly host where a module is named, and the fixture's own macros built into
+//! this test against blaze's in-process bridge, `corpus/native.rs`), the outputs must be the
+//! same token for token, spans' shapes included. What each expansion does is held by the
+//! fixture's own tests (`ws/calls/src/tests.rs`), which the harness runs on blaze's build.
 //!
 //! What it needs is one JSON value in `BLAZE_MACRO_CORPUS` (`corpus/config.rs`): the harness
 //! fetches the workspace's packages, builds it with `blaze build -p corpus-calls` (so each build
-//! script, std's among them, has run), builds rustc's library of each proc-macro crate with the
-//! pinned nightly and runs these with `--ignored`.
+//! script, std's among them, has run) and runs these with `--ignored`.
 
 extern crate native_proc_macro as proc_macro;
 
@@ -34,7 +35,6 @@ use std::sync::OnceLock;
 use base_db::{AbsPathBuf, Crate};
 use hir_def::nameres::{crate_def_map, diagnostics::DefDiagnosticKind};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroKind, ProcMacroLoadResult};
-use proc_macro_api::ProcMacroClient;
 
 use config::Corpus;
 use record::{Outcome, Record, Recorder, Referee, Reference};
@@ -56,21 +56,16 @@ fn expanded() -> &'static Expanded {
     }
 }
 
-/// The macros of crate `krate` that `what` (a reference's library) has.
+/// The macros of crate `krate` that `what` (another host's library) has.
 fn loaded(what: &str, krate: &str, loaded: ProcMacroLoadResult) -> Result<Vec<ProcMacro>, String> {
     loaded.map_err(|error| format!("loading {what} of `{krate}`: {error}"))
 }
 
 fn expand() -> Result<Expanded, String> {
     let config = Corpus::read()?;
-    let server_at = AbsPathBuf::assert_utf8(config.server()?.into());
-    let none: [(&str, &Option<&str>); 0] = [];
-    let server = ProcMacroClient::spawn(&server_at, none, None, 1)
-        .map_err(|error| format!("spawning the proc-macro server {server_at}: {error}"))?;
     let records = record::Records::default();
-    let workspace = load::lower(&config.workspace, &config.cargo_home, |krate, macros| {
-        wrap(&config, &server, krate, macros, &records)
-    })?;
+    let workspace =
+        load::lower(&config.workspace, &config.cargo_home, |krate, macros| wrap(&config, krate, macros, &records))?;
     let calls = workspace.krate("corpus-calls")?;
     let panics = workspace.krate("corpus-panics")?;
     let db = workspace.lowered.db();
@@ -85,17 +80,9 @@ fn expand() -> Result<Expanded, String> {
     Ok(Expanded { records, calls, panics, diagnostics })
 }
 
-/// Each of blaze-macro-eval's macros of crate `krate`, recording its calls with each
-/// reference's.
-fn wrap(
-    config: &Corpus,
-    server: &ProcMacroClient,
-    krate: &str,
-    macros: Vec<ProcMacro>,
-    records: &record::Records,
-) -> Result<Vec<ProcMacro>, String> {
-    let dylib = AbsPathBuf::assert_utf8(config.dylib(krate)?.into());
-    let toolchain = loaded("rustc's library", krate, load_cargo::load_proc_macro(server, &dylib, &[]))?;
+/// Each of blaze-macro-eval's macros of crate `krate`, recording its calls with what blaze's
+/// other hosts of it give.
+fn wrap(config: &Corpus, krate: &str, macros: Vec<ProcMacro>, records: &record::Records) -> Result<Vec<ProcMacro>, String> {
     let wasm = match config.wasm.get(krate) {
         Some(module) => loaded("blaze's module", krate, blaze_macro_wasm::load(&AbsPathBuf::assert_utf8(module.into())))?,
         None => Vec::new(),
@@ -105,11 +92,6 @@ fn wrap(
         .map(|eval| {
             let name = eval.name.as_str();
             let mut references = Vec::new();
-            let theirs = toolchain
-                .iter()
-                .find(|it| it.name == eval.name && it.kind == eval.kind)
-                .ok_or_else(|| format!("rustc's library of `{krate}` has no {:?} `{name}`", eval.kind))?;
-            references.push(Referee::Expander(Reference::Toolchain, theirs.expander.clone()));
             if !wasm.is_empty() {
                 let theirs = wasm
                     .iter()
@@ -187,7 +169,7 @@ const COVERED: &[(&str, &str, &str)] = &[
 ];
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn every_call_is_expanded() {
     let expanded = expanded();
     assert!(expanded.diagnostics.is_empty(), "corpus-calls' def map: {:#?}", expanded.diagnostics);
@@ -200,19 +182,20 @@ fn every_call_is_expanded() {
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
-fn every_call_matches_its_references() {
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
+fn every_call_is_the_same_on_blazes_other_hosts() {
     let expanded = expanded();
-    assert!(!expanded.records.is_empty(), "no proc macro was called");
+    let held: Vec<&Record> = expanded.records.iter().filter(|it| !it.references.is_empty()).collect();
+    assert!(!held.is_empty(), "no call ran on another host of blaze's");
     let mut differences = Vec::new();
-    for record in &expanded.records {
+    for record in &held {
         record.differences(&mut differences);
     }
-    assert!(differences.is_empty(), "{} of {} calls differ:\n{}", differences.len(), expanded.records.len(), differences.join("\n"));
+    assert!(differences.is_empty(), "{} of {} calls differ:\n{}", differences.len(), held.len(), differences.join("\n"));
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn the_fixture_is_held_against_itself_natively() {
     let calls = expanded().calls;
     for (name, subject) in [("Describe", "Described"), ("label", "labelled"), ("label", "labelled_again"), ("make_fn", "answer"), ("make_fn", "greeting")] {
@@ -226,7 +209,7 @@ fn the_fixture_is_held_against_itself_natively() {
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn a_panic_is_its_message() {
     let panics = expanded().panics;
     let mut boom: Vec<&Record> = calls_of("corpus_macros", "boom", panics).collect();
@@ -248,7 +231,7 @@ fn a_panic_is_its_message() {
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn a_static_counts_calls_in_rustcs_order() {
     let calls = expanded().calls;
     let counted: Vec<(String, Vec<String>)> = calls_of("corpus_state", "counter", calls)
@@ -259,7 +242,7 @@ fn a_static_counts_calls_in_rustcs_order() {
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn a_macro_reads_its_callers_file_and_variables() {
     let calls = expanded().calls;
     let data = record::literals(output(call_on("corpus_macros", "include_data", calls, "DATA")));
@@ -273,7 +256,7 @@ fn a_macro_reads_its_callers_file_and_variables() {
 }
 
 #[test]
-#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze, rustc's libraries of its macros and the toolchain's proc-macro server"]
+#[ignore = "needs BLAZE_MACRO_CORPUS: the fixture workspace built by blaze"]
 fn every_macro_kind_is_called() {
     let expanded = expanded();
     for kind in [ProcMacroKind::CustomDerive, ProcMacroKind::Attr, ProcMacroKind::Bang] {

@@ -2,7 +2,7 @@
 
 use blaze_codegen::{plan::Mode, settings::Panic};
 use hir_def::{AssocItemId, test_items};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{
     super::{
@@ -11,7 +11,6 @@ use super::{
     RootKind, Roots,
 };
 
-type TestDB = base_db::Db;
 
 /// What a test of `harness` is given as usercode's fork server: its two names, no more.
 const FORK_SERVER: &str = "\n    pub mod fork_server {\n        \
@@ -27,7 +26,7 @@ fn fork_server(_: bool) -> &'static str {
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(fixture: &str) -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_files(fixture)));
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(fixture).into_db()));
     let frontend =
         HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default())));
     (db, frontend)
@@ -35,25 +34,25 @@ fn frontend(fixture: &str) -> (&'static TestDB, HirFrontend<'static>) {
 
 fn roots(fixture: &str, kind: RootKind) -> (&'static TestDB, HirFrontend<'static>, Roots) {
     let (db, frontend) = frontend(fixture);
-    let roots = frontend.roots(db.test_crate(), kind).expect("the roots");
+    let roots = frontend.roots(fixture::test_crate(&db), kind).expect("the roots");
     (db, frontend, roots)
 }
 
 fn refusal(fixture: &str, kind: RootKind) -> String {
     let (db, frontend) = frontend(fixture);
-    frontend.roots(db.test_crate(), kind).expect_err("a refusal").what
+    frontend.roots(fixture::test_crate(&db), kind).expect_err("a refusal").what
 }
 
 #[track_caller]
 fn function(db: &TestDB, frontend: &HirFrontend<'_>, name: &str) -> HirInstance {
-    frontend.root(test_items::function(db, db.test_crate(), name))
+    frontend.root(test_items::function(db, fixture::test_crate(db), name))
 }
 
 /// `fixture`, a crate with `cfg(test)`, with the harness `roots` asks for at the end of its
 /// root file.
 fn with_harness(fixture: &str) -> String {
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
+    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("the crate has `cfg(test)`");
     format!("{fixture}{harness}")
 }
@@ -73,11 +72,11 @@ static KEPT: u8 = 0;
 "#,
         RootKind::Executable,
     );
-    let main = test_items::function(db, db.test_crate(), "main");
+    let main = test_items::function(db, fixture::test_crate(&db), "main");
     assert_eq!(roots.roots[0], HirInstance(Kind::Start(main)));
     assert!(roots.roots.contains(&function(db, &frontend, "exported")));
     assert!(!roots.roots.contains(&function(db, &frontend, "unused")));
-    let kept = test_items::static_item(db, db.test_crate(), "KEPT");
+    let kept = test_items::static_item(db, fixture::test_crate(&db), "KEPT");
     assert_eq!(roots.statics, [HirStatic(kept)]);
     assert!(roots.tests.is_empty());
 }
@@ -109,7 +108,7 @@ fn a_program_without_main_is_refused_as_rustc_refuses_it() {
 #[test]
 fn a_test_without_a_harness_is_an_executable() {
     let (db, _, roots) = roots("//- /main.rs crate:main\nfn main() {}\n", RootKind::Test);
-    let main = test_items::function(db, db.test_crate(), "main");
+    let main = test_items::function(db, fixture::test_crate(&db), "main");
     assert_eq!(roots.roots[0], HirInstance(Kind::Start(main)));
     assert!(roots.tests.is_empty());
 }
@@ -141,7 +140,7 @@ pub fn uses_inside() {
     for name in ["private", "not_reexported"] {
         assert!(!roots.roots.contains(&function(db, &frontend, name)), "{name} is not a root");
     }
-    let imp = test_items::impls(db, db.test_crate())[0];
+    let imp = test_items::impls(db, fixture::test_crate(&db))[0];
     let methods: Vec<HirInstance> = (imp.impl_items(db).items.iter())
         .filter_map(|&(_, it)| match it {
             AssocItemId::FunctionId(it) => Some(frontend.root(it)),
@@ -210,7 +209,7 @@ fn a_crate_with_tests_and_no_harness_is_refused() {
 #[test]
 fn a_harness_with_panic_abort_is_refused() {
     let (db, frontend) = frontend("//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n");
-    let what = frontend.harness(db.test_crate(), Panic::Abort, Mode::Output, fork_server).expect_err("refused");
+    let what = frontend.harness(fixture::test_crate(&db), Panic::Abort, Mode::Output, fork_server).expect_err("refused");
     assert!(what.what.contains("-Zpanic-abort-tests"), "{}", what.what);
 }
 
@@ -246,7 +245,7 @@ fn a_proc_macro_crate_needs_to_be_one() {
 fn the_text_on_disk_is_before_what_blaze_appends() {
     let fixture = "//- /lib.rs crate:main cfg:test\n#[test]\nfn a() {}\n";
     let (db, frontend) = frontend(fixture);
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
+    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     let harness = harness.expect("a harness").expect("cfg(test)");
     let text = format!("fn a() {{}}\n{harness}");
     assert_eq!(HirFrontend::on_disk(&text), "fn a() {}\n");
@@ -256,7 +255,7 @@ fn the_text_on_disk_is_before_what_blaze_appends() {
 #[test]
 fn a_crate_without_cfg_test_has_no_harness() {
     let (db, frontend) = frontend("//- /main.rs crate:main\nfn main() {}\n");
-    let harness = frontend.harness(db.test_crate(), Panic::Unwind, Mode::Output, fork_server);
+    let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, Mode::Output, fork_server);
     assert_eq!(harness.expect("no refusal"), None);
 }
 
@@ -271,7 +270,7 @@ fn a_harness_records_where_its_binary_has_slots() {
         }
     };
     for (mode, record) in [(Mode::Output, false), (Mode::Live, true), (Mode::Tiered, true)] {
-        let harness = frontend.harness(db.test_crate(), Panic::Unwind, mode, asked);
+        let harness = frontend.harness(fixture::test_crate(&db), Panic::Unwind, mode, asked);
         let harness = harness.expect("a harness").expect("cfg(test)");
         let wanted = if record { "// recorded" } else { "// unrecorded" };
         assert!(harness.contains(wanted), "{mode:?}: {harness}");

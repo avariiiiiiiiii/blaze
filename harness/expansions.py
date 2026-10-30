@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """expansions.py: a daemon that loads a workspace again finds its proc-macro expansions in the
-store instead of expanding them (crates/blaze-expand).
+store instead of expanding them (crates/proc-macro-api/src/kept.rs).
 
 A workspace with a proc-macro crate of its own (a derive, an attribute, and a derive that reads
 the text of a span, which asks the database) is built by three daemons on one store:

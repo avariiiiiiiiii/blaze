@@ -193,7 +193,7 @@ pub fn fetch() -> Result<Library, String> {
         (None, Some(_)) => checkout().to_string_lossy().into_owned(),
         // The release this blaze is: its version, which only the engine's build.rs knows
         // (`BLAZE_RELEASE`), so that no release changes this crate.
-        (None, None) => format!("{RELEASES}/v{}", crate::engine::get().version),
+        (None, None) => format!("{RELEASES}/v{}", crate::release::get().version),
     };
     let fetched = fetch_into(&dir, &from, digest()).map_err(|e| {
         format!(

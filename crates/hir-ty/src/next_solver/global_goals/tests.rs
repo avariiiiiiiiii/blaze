@@ -15,7 +15,7 @@ use hir_def::{
     signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature},
 };
 use rustc_type_ir::{Interner as _, MayBeErased, Upcast, inherent::Ty as _};
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{GoalKey, mode_tag, shape, switch, table::Table};
 use crate::{
@@ -207,8 +207,7 @@ fn generated(seed: u64, count: usize) -> String {
 }
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 

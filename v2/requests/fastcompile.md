@@ -4229,7 +4229,8 @@ found again only when every input matches). They are `#[ignore]`d without the co
 nothing runs them until this script exists. The dev-dependencies they need are in
 `crates/blaze-macro-eval/Cargo.toml`.
 
-Status: open
+Status: done (`harness/v2/macroeval_corpus.py`; since queue 00956 it holds the corpus to its own
+expectations and the fixture's tests, not to rustc's build)
 
 > taken by requests (pass 43; lane proof is DONE): child `requests-macroeval` writes it as `harness/v2/macroeval_corpus.py` (proof's directory; `harness/` outside `v2/` is the coordinator's). Its outcome line follows when done.
 

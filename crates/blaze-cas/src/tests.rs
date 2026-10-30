@@ -1660,3 +1660,112 @@ fn a_pinned_value_is_held_in_place_past_its_task_and_its_store() {
     }
     assert_eq!(&*read, values[0].as_slice());
 }
+
+/// A module of machine code is a file of its own however short, never moved colder, and once
+/// committed its pin names that file, whose bytes are exactly the value's; a record of a pack
+/// names none.
+#[test]
+fn a_module_of_machine_code_is_a_file_of_its_own_that_its_pin_names() {
+    let mut sim = Sim::new(34, quiet());
+    let mut store = open(&mut sim, "store");
+    let code = noise(5000, 34);
+    store.put(key(1), Kind::Machine, code.clone()).unwrap();
+    store.put(key(2), Kind::Code, text(2, 5000)).unwrap();
+    assert_eq!(form_of(&store, &key(1)), Form::External);
+    let in_segment = store.pinned(&key(1)).unwrap().unwrap();
+    assert_eq!(in_segment.file(), None, "no file until its commit writes it");
+    assert_eq!(&*in_segment, code.as_slice());
+    flush(&mut sim, &mut store);
+    let file = name(&format!("store/{}", disk::external_file(&content_of(&code))));
+    assert_eq!(sim.contents(&file), code);
+    let pinned = store.pinned(&key(1)).unwrap().unwrap();
+    assert!(pinned.in_place());
+    assert_eq!(pinned.file(), Some(&file));
+    assert_eq!(&*pinned, code.as_slice());
+    assert_eq!(store.pinned(&key(2)).unwrap().unwrap().file(), None, "a record of a pack is no file of its own");
+    for _ in 0..4 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(form_of(&store, &key(1)), Form::External, "machine code is never compressed");
+    drop((pinned, in_segment, store));
+    let store = open(&mut sim, "store");
+    let reopened = store.pinned(&key(1)).unwrap().unwrap();
+    assert_eq!((reopened.file(), &*reopened), (Some(&file), code.as_slice()));
+}
+
+/// A handle reads beside the store and puts through a writer of its own: what it puts is read
+/// at once, by it and by the store, refused with other bytes under the same key, durable with
+/// the store's next flush and there after reopening. A hit through it allocates nothing.
+#[test]
+fn a_handle_reads_and_puts_beside_the_store_and_its_puts_are_durable_with_a_flush() {
+    let mut sim = Sim::new(35, quiet());
+    let mut store = open(&mut sim, "store");
+    store.put(key(1), Kind::Query, b"the store's".to_vec()).unwrap();
+    let root = std::path::PathBuf::from("/state");
+    let handle = Handle::new(&mut store, root.clone());
+    assert_eq!(handle.read(&key(1), |it| it.bytes.to_vec()).unwrap().unwrap(), b"the store's");
+    assert!(handle.has(&key(1)) && !handle.has(&key(2)));
+    assert!(handle.read(&key(2), |_| ()).unwrap().is_none());
+    let code = noise(3000, 35);
+    let ticket = handle.put(key(2), Kind::Machine, code.clone()).unwrap();
+    assert!(!handle.durable(ticket));
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), code);
+    assert_eq!(&*handle.pinned(&key(2)).unwrap().unwrap(), code.as_slice());
+    assert_eq!(handle.put(key(2), Kind::Machine, code.clone()), Ok(ticket), "the same bytes again are the first put");
+    assert!(handle.put(key(2), Kind::Machine, b"other".to_vec()).is_err());
+    flush(&mut sim, &mut store);
+    assert!(handle.durable(ticket));
+    let pinned = handle.pinned(&key(2)).unwrap().unwrap();
+    let file = pinned.file().expect("a module of machine code is a file of its own");
+    assert_eq!(handle.path_of(file), root.join(file.as_str()));
+    assert_eq!(sim.contents(file), code);
+    _ = handle.read(&key(1), |it| it.bytes.len());
+    blaze_alloc_count::assert_at_most(0, "hits through a handle", || {
+        assert_eq!(handle.read(&key(1), |it| it.bytes.len()).unwrap(), Some(11));
+        assert!(handle.has(&key(2)));
+    });
+    drop((pinned, handle, store));
+    let store = open(&mut sim, "store");
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), code);
+}
+
+/// On this machine's disk, under the native driver: a module of machine code put through a
+/// handle is, after a flush, a file at the handle's path of its pin holding exactly its bytes,
+/// and there in a store opened again.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_driven_store_keeps_machine_code_as_a_file_on_disk() {
+    let root = std::env::temp_dir().join(format!("blaze-cas-driven-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    let code = noise(70_000, 37);
+    {
+        let mut driven = Driven::open(&root).unwrap();
+        let handle = driven.handle();
+        handle.put(key(1), Kind::Machine, code.clone()).unwrap();
+        handle.put(key(2), Kind::Query, b"a query's result".to_vec()).unwrap();
+        driven.flush().unwrap();
+        let pinned = handle.pinned(&key(1)).unwrap().unwrap();
+        let file = pinned.file().expect("committed machine code is a file of its own");
+        assert_eq!(std::fs::read(handle.path_of(file)).unwrap(), code);
+    }
+    let mut driven = Driven::open(&root).unwrap();
+    let handle = driven.handle();
+    let pinned = handle.pinned(&key(1)).unwrap().unwrap();
+    assert_eq!(&*pinned, code.as_slice());
+    assert_eq!(std::fs::read(handle.path_of(pinned.file().unwrap())).unwrap(), code);
+    assert_eq!(handle.read(&key(2), |it| it.bytes.to_vec()).unwrap().unwrap(), b"a query's result");
+    drop((pinned, handle, driven));
+    _ = std::fs::remove_dir_all(&root);
+}
+
+/// A process has one installed handle: the first, which [`Handle::installed`] gives; a second
+/// is refused, naming the first.
+#[test]
+fn a_process_installs_one_handle() {
+    let mut sim = Sim::new(36, quiet());
+    let mut store = open(&mut sim, "store");
+    let first = Handle::install(Handle::new(&mut store, "/first".into())).unwrap();
+    assert!(std::ptr::eq(first, Handle::installed().unwrap()));
+    let refused = Handle::install(Handle::new(&mut store, "/second".into())).err().unwrap();
+    assert!(refused.contains("/first"), "{refused}");
+}

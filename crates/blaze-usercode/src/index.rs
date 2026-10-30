@@ -220,7 +220,7 @@ pub fn find<'s, I: Inputs>(
 }
 
 /// [`find`], with a hit's [`values`] hashed in the same pass as its key: what a caller that
-/// reports what the run read (`hir_def::deps`, through blaze-expand) asks, at no second read
+/// reports what the run read (`hir_def::deps`, through `proc_macro_api::kept`) asks, at no second read
 /// of any input.
 pub fn find_reads<'s, I: Inputs>(
     store: &'s Reader,

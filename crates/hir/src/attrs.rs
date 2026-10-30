@@ -20,7 +20,7 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use hir_ide::{
+use hir_ty::{
     db::HirDatabase,
     method_resolution::{
         self, CandidateId, MethodError, MethodResolutionContext, TraitSet, TraitsInScope,
@@ -284,8 +284,8 @@ impl HasAttrs for crate::ExternBlock {
 impl HasAttrs for Impl {
     fn attr_id(self, _db: &Db) -> AttrsOwner {
         match self.id {
-            hir_ide::next_solver::AnyImplId::ImplId(id) => AttrsOwner::AttrDef(id.into()),
-            hir_ide::next_solver::AnyImplId::BuiltinDeriveImplId(..) => AttrsOwner::Dummy,
+            hir_ty::next_solver::AnyImplId::ImplId(id) => AttrsOwner::AttrDef(id.into()),
+            hir_ty::next_solver::AnyImplId::BuiltinDeriveImplId(..) => AttrsOwner::Dummy,
         }
     }
 }
@@ -565,8 +565,8 @@ fn resolve_impl_trait_item<'db>(
             )),
             edition: krate.data(db).edition,
             features,
-            call_span: hir_ide::Span::Dummy,
-            receiver_span: hir_ide::Span::Dummy,
+            call_span: hir_ty::Span::Dummy,
+            receiver_span: hir_ty::Span::Dummy,
             frame,
         };
         ctx.probe_for_name(method_resolution::Mode::Path, *name, ty.ty.skip_binder())

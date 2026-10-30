@@ -193,6 +193,7 @@ fn only_a_crates_io_package_with_a_checksum_has_a_public_origin() {
         default_run: None,
         checksum: None,
         tests: blaze_units::query::TestSandbox::default(),
+        const_macros: None,
     };
     assert_eq!(origin(&package(false, None), Some([3; 32])), Some(serde()));
     assert_eq!(origin(&package(false, None), None), None);

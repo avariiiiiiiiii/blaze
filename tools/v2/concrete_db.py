@@ -185,10 +185,10 @@ def salsa_database_path(crate: str, manifest: Path) -> str | None:
 
 def hir_database_path(crate: str, manifest: Path) -> str | None:
     """How `crate`'s files name `HirDatabase`: its own `db` module, or the nearest dependency's."""
-    if crate in ("hir-ty", "hir", "hir-ide"):
+    if crate in ("hir-ty", "hir"):
         return "crate::db::HirDatabase"
     deps = manifest.read_text() if manifest.is_file() else ""
-    for dep, path in (("hir-ty", "hir_ty"), ("hir", "hir"), ("hir-ide", "hir_ide")):
+    for dep, path in (("hir-ty", "hir_ty"), ("hir", "hir")):
         if re.search(rf"^{dep}\s*[.=]", deps, re.MULTILINE):
             return f"{path}::db::HirDatabase"
     return None

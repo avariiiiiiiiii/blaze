@@ -5,7 +5,7 @@
 //! defaults, variances, unused parameters, supertraits).
 
 use hir_def::ModuleDefId;
-use hir_ide::{
+use hir_ty::{
     TyDefId,
     db::HirDatabase,
     next_solver::{BoundVariableKind, DbInterner, Symbol, Ty},
@@ -13,7 +13,7 @@ use hir_ide::{
 use rustc_type_ir::{
     BoundRegionKind, BoundVarIndexKind, RegionKind, TyKind, UintTy, inherent::IntoKind as _,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{db::TestDB, type_item};
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
 
 /// Every diagnostic the check of the workspace found, given to `f`.
 fn check(fixture: &str, f: impl FnOnce(&TestDB, &[AnyDiagnostic<'_>])) {
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     crate::attach_db(&db, || {
         let found = crate::check::check_workspace(&db, false);
         let found: Vec<_> = found.into_iter().flat_map(|(_, it)| it).collect();
@@ -261,12 +261,13 @@ fn g<T>(_: T::<u8>) {}
 
 #[test]
 fn a_for_lifetime_binds_its_name() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 type F = for<'x, 'y> fn(&'x u8, &'y u8);
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "F") else {
             panic!("`F` is a type alias")
@@ -290,12 +291,13 @@ type F = for<'x, 'y> fn(&'x u8, &'y u8);
 /// rustc's `unsafe<'a> T`: `Ty::new_unsafe_binder` over `T`, with `'a` bound by the binder.
 #[test]
 fn an_unsafe_binder_binds_its_lifetimes() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 type U = unsafe<'a, 'b> &'a &'b u8;
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "U") else {
             panic!("`U` is a type alias")
@@ -330,12 +332,13 @@ type U = unsafe<'a, 'b> &'a &'b u8;
 
 #[test]
 fn a_lifetime_is_the_innermost_binders_that_names_it() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 type G = for<'a> fn(&'a u8, for<'a, 'b> fn(&'a u8, &'b u8));
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "G") else {
             panic!("`G` is a type alias")
@@ -363,12 +366,13 @@ type G = for<'a> fn(&'a u8, for<'a, 'b> fn(&'a u8, &'b u8));
 
 #[test]
 fn const_parameters_between_type_parameters_have_their_types() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 struct S<T, const N: usize, U, const M: bool>([T; N], U);
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
         let def = hir_def::GenericDefId::AdtId(adt);
@@ -394,12 +398,13 @@ struct S<T, const N: usize, U, const M: bool>([T; N], U);
 
 #[test]
 fn defaults_follow_the_parameters_they_are_of() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 struct S<A, B = u8, C = u16>(A, B, C);
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
         let defaults = db.generic_defaults(hir_def::GenericDefId::AdtId(adt));
@@ -410,12 +415,13 @@ struct S<A, B = u8, C = u16>(A, B, C);
 
 #[test]
 fn the_variances_of_many_parameters() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R>(&'a A, fn(B), fn(C) -> C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         use rustc_type_ir::Variance::{Contravariant, Covariant, Invariant};
         let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
@@ -428,27 +434,28 @@ struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R>(&'a A, fn(B),
 
 #[test]
 fn a_parameter_a_projection_constrains_is_used() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 trait T { type X; }
 struct S<A, B, C>(A);
 struct U<P, Q>(P) where P: T<X = Q>;
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let adt = |name| match type_item(&db, name) {
             (_, ModuleDefId::AdtId(it)) => it,
             it => panic!("`{name}` is an ADT, not {it:?}"),
         };
-        assert_eq!(hir_ide::adt_unused_params(&db, adt("S")).len(), 2);
-        assert!(hir_ide::adt_unused_params(&db, adt("U")).is_empty());
+        assert_eq!(hir_ty::adt_unused_params(&db, adt("S")).len(), 2);
+        assert!(hir_ty::adt_unused_params(&db, adt("U")).is_empty());
     });
 }
 
 #[test]
 fn the_memo_supertraits_are_what_elaboration_finds() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 trait A {}
@@ -459,7 +466,8 @@ trait F<'a> {}
 trait E: for<'a> F<'a> {}
 trait G where Self: D + E {}
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         for name in ["A", "B", "C", "D", "E", "F", "G"] {
@@ -470,7 +478,7 @@ trait G where Self: D + E {}
                 rustc_type_ir::elaborate::supertrait_def_ids(interner, trait_.into())
                     .map(|it| it.0)
                     .collect();
-            let mut memo = hir_ide::all_super_traits(&db, trait_).to_vec();
+            let mut memo = hir_ty::all_super_traits(&db, trait_).to_vec();
             elaborated.sort();
             memo.sort();
             assert_eq!(elaborated, memo, "`{name}`");
@@ -484,7 +492,7 @@ trait G where Self: D + E {}
 #[test]
 fn a_dyn_incompatible_trait_s_violations_point_where_rustc_s_do() {
     use crate::{DynCompatibilitySite, DynCompatibilityViolation, Trait};
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: dispatch_from_dyn
 trait Sup<T> {}
@@ -497,7 +505,8 @@ trait Bad: Sized + Sup<Self> {
     type A: Sup<Self>;
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::TraitId(id)) = type_item(&db, "Bad") else { panic!("`Bad`") };
         let found: Vec<(String, Vec<String>)> = Trait { id }

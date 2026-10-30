@@ -2,7 +2,7 @@
 //! `with_source_map`'s and as the item's file lowered given `of`'s blocks, and no read of it
 //! runs a query that builds a map.
 
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{
@@ -265,7 +265,7 @@ fn of_is_the_lowering_with_the_source_map() {
         }};
     }
     for fixture in FIXTURES {
-        let db = TestDB::with_files(fixture);
+        let db = fixture::db(fixture).into_db();
         let (signatures, variants) = defs(&db);
         assert!(!signatures.is_empty(), "no signature in {fixture}");
         for def in signatures {
@@ -300,7 +300,7 @@ fn of_is_the_lowering_with_the_source_map() {
 #[test]
 fn of_builds_no_source_map() {
     for fixture in FIXTURES {
-        let db = TestDB::with_files(fixture);
+        let db = fixture::db(fixture).into_db();
         let (signatures, variants) = defs(&db);
         let log = db.executed_in_read_order(|| {
             for &def in &signatures {
@@ -321,7 +321,7 @@ fn of_builds_no_source_map() {
 /// `TraitFlags::DENY_EXPLICIT_IMPL`; a path to it or an argument does not.
 #[test]
 fn deny_explicit_impl_is_a_trait_flag() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #[rustc_deny_explicit_impl] pub trait D {}
 #[cfg_attr(all(), rustc_deny_explicit_impl)] pub trait C {}
@@ -330,7 +330,8 @@ fn deny_explicit_impl_is_a_trait_flag() {
 #[rustc_deny_explicit_impl(x)] pub trait Arg {}
 pub trait Plain {}
 "#,
-    );
+    )
+    .into_db();
     let mut seen = Vec::new();
     for decl in declarations(&db, db.fetch_test_crate()) {
         let ModuleDefId::TraitId(it) = decl else { continue };

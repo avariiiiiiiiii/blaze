@@ -195,7 +195,7 @@ pub struct Compiled {
     pub artifact: Option<Artifact>,
     /// A proc macro's expanders, loaded from what it compiled to (or why there are none):
     /// the loop asks the job's [`Writer::macros`] with them. None for any other unit.
-    pub macros: Option<load_cargo::v2::ProcMacroLoadResult>,
+    pub macros: Option<blaze_lower::ProcMacroLoadResult>,
 }
 
 /// The build of one job, as the daemon has it: one value for every job. Its associated types
@@ -296,12 +296,12 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// write is asked for and not applied, when the loop holds the task instead.
     fn reader(&self) -> Option<S::Reader>;
     /// Asks for the run of build script unit `run` applied to the units depending on it
-    /// (`load_cargo::v2::Lowered::ran`): checked now, an error naming what is wrong with it,
+    /// (`blaze_lower::Lowered::ran`): checked now, an error naming what is wrong with it,
     /// and applied by [`Writer::apply`].
-    fn ran(&mut self, run: usize, ran: load_cargo::v2::Ran) -> Result<(), ApiError>;
-    /// Asks for proc-macro unit `unit`'s expanders set (`load_cargo::v2::Lowered::macros`):
+    fn ran(&mut self, run: usize, ran: blaze_lower::Ran) -> Result<(), ApiError>;
+    /// Asks for proc-macro unit `unit`'s expanders set (`blaze_lower::Lowered::macros`):
     /// checked now, applied by [`Writer::apply`].
-    fn macros(&mut self, unit: usize, macros: load_cargo::v2::ProcMacroLoadResult) -> Result<(), ApiError>;
+    fn macros(&mut self, unit: usize, macros: blaze_lower::ProcMacroLoadResult) -> Result<(), ApiError>;
     /// Whether a write was asked for and is not applied yet.
     fn waiting(&self) -> bool;
     /// Every write asked for, applied as one, in the order asked, if no reader is alive:

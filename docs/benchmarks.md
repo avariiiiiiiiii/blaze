@@ -336,13 +336,14 @@ state.
 | Edit a generic function | a statement in a generic function used at many types (ripgrep and nushell) | | incremental |
 | Add a function | a new function in the main crate, called from the function of "Edit a function" | | incremental |
 | Add a struct field | a struct gets one more field (`_bench_edit: ()`) and every place that builds it sets it; in a library crate where there is one (nushell's `nu-protocol::Alias`, built in `nu-parser`) | | incremental |
-| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to end the same way under both | | |
+| Tests | (`--tests`) the project's test suite, or the crates of it named in `PROJECTS`, after the edits: `blaze test` and `cargo test`, run twice each, the second timed; every test has to pass under blaze by its own verdict (cargo is only timed) | | |
 | Runtime | (ripgrep) the program blaze linked, cargo's debug build and cargo's release build run the same search over the toolchain's own library source | | |
 
 The edits do not change what the program does. After the first edit of each kind the program
-blaze linked is run and has to print what cargo's prints (exit status, stdout and stderr); in
-the runtime phase all three programs have to print the same. A run in which any program differs
-is not published (`benchreport.py` refuses it and the workflow fails).
+blaze linked is run and has to print what the program of blaze's cold build printed (exit
+status, stdout and stderr); in the runtime phase each of the three programs has to exit 0. cargo
+is the speed baseline, not the answer (2026-10-30: no harness compares blaze's output with
+cargo's). A run in which a program is wrong is not published (`benchreport.py` refuses it and the workflow fails).
 
 Each edit is made and taken back `--runs` times (5 in CI). The summary tables show the median of
 the edits; the results below also show the fastest and slowest run of each side, and the raw JSON keeps

@@ -6,11 +6,10 @@
 use base_db::all_crates;
 use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_ty::{MissingLifetimeKind, TyLoweringDiagnostic, db::HirDatabase as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{BorrowckResult, Mode, borrowck_in_mode};
 
-type TestDB = base_db::Db;
 
 const FIXTURE: &str = r#"
 //- minicore: sized, copy
@@ -72,7 +71,9 @@ fn function(db: &TestDB, name: &str) -> FunctionId {
 
 /// Whether `name`'s signature fails lifetime elision, and its borrow check in each mode.
 fn checked(name: &str) -> (bool, [BorrowckResult; 2]) {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let function = function(&db, name);
         let elision_failure =

@@ -21,7 +21,7 @@ use hegel::generators as gs;
 use hegel::{Hegel, Settings, TestCase};
 use intern::Symbol;
 use span::Edition;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     nameres::{
@@ -44,7 +44,7 @@ fn path(kind: PathKind, segments: &[&str]) -> ModPath {
 
 /// The crate the shapes are of, and a dependency for `$crate` paths into another crate.
 fn crates() -> (TestDB, Crate, Crate) {
-    let db = TestDB::with_files("//- /main.rs crate:main deps:dep\n//- /dep.rs crate:dep\n");
+    let db = fixture::db("//- /main.rs crate:main deps:dep\n//- /dep.rs crate:dep\n").into_db();
     let all = base_db::all_crates(&db);
     assert_eq!(all.len(), 2, "the fixture has two crates");
     let (this, other) = (all[0], all[1]);

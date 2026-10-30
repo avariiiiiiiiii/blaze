@@ -1308,7 +1308,7 @@ impl<'db> Sink<'db> for StepSink<'db, '_> {
 #[cfg(test)]
 mod tests {
     use base_db::Crate;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::{
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn a_call_of_another_modules_macro_resolves_at_round_zero_and_its_items_join_round_one() {
-        let (db, _) = TestDB::with_many_files(
+        let fx = fixture::db(
             r#"
 //- /lib.rs
 mod a;
@@ -1357,6 +1357,8 @@ macro_rules! make { () => { pub struct Made; } }
 crate::make!();
 "#,
         );
+        let _ = fx.files().to_vec();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let b = module_named(&db, krate, "b");
         let first = step(&db, b, krate, 0);
@@ -1370,7 +1372,7 @@ crate::make!();
 
     #[test]
     fn an_eager_call_naming_a_macro_not_yet_defined_is_deferred() {
-        let (db, _) = TestDB::with_many_files(
+        let fx = fixture::db(
             r#"
 //- /lib.rs
 #[rustc_builtin_macro]
@@ -1378,6 +1380,8 @@ macro_rules! concat { () => {} }
 concat!(not_yet!());
 "#,
         );
+        let _ = fx.files().to_vec();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let root = module_named(&db, krate, "");
         let first = step(&db, root, krate, 0);
@@ -1393,7 +1397,7 @@ concat!(not_yet!());
 
     #[test]
     fn an_eager_calls_nested_calls_are_recorded_after_it_in_order() {
-        let (db, _) = TestDB::with_many_files(
+        let fx = fixture::db(
             r#"
 //- /lib.rs
 #[rustc_builtin_macro]
@@ -1410,6 +1414,8 @@ macro_rules! two { () => { "2" } }
 crate::concat!(crate::one!(), crate::two!());
 "#,
         );
+        let _ = fx.files().to_vec();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let b = module_named(&db, krate, "b");
         let first = step(&db, b, krate, 0);
@@ -1433,13 +1439,15 @@ crate::concat!(crate::one!(), crate::two!());
 
     #[test]
     fn an_unresolved_attribute_is_found_and_its_reseed_collects_the_item() {
-        let (db, _) = TestDB::with_many_files(
+        let fx = fixture::db(
             r#"
 //- /lib.rs
 #[not_an_attribute]
 struct S;
 "#,
         );
+        let _ = fx.files().to_vec();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let root = module_named(&db, krate, "");
         let key = FactKey::new(&db, root, krate, 0);
@@ -1472,7 +1480,7 @@ struct S;
 
     #[test]
     fn a_step_with_nothing_pending_makes_no_op() {
-        let (db, _) = TestDB::with_many_files(
+        let fx = fixture::db(
             r#"
 //- /lib.rs
 mod a;
@@ -1481,6 +1489,8 @@ pub struct X;
 pub fn f() {}
 "#,
         );
+        let _ = fx.files().to_vec();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let modules = queries::round_modules(&db, RoundKey::new(&db, krate, 0));
         assert_eq!(modules.stepping().count(), 0, "no module has a directive, so none steps");

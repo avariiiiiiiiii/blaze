@@ -13,7 +13,7 @@
 
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
-use load_cargo::v2::Db;
+use blaze_lower::Db;
 use rustc_hash::FxHashSet;
 
 use super::Job;

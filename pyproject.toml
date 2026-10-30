@@ -72,5 +72,5 @@ include = [
 ]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
-# harness/v2's scripts import `engine`, `report` and `blaze_cli` as siblings off `sys.path`.
-extraPaths = ["harness", "harness/v2"]
+# harness/v2's scripts import `engine`, `report`, `blaze_cli` and `cases` as siblings off `sys.path`.
+extraPaths = ["harness", "harness/v2", "harness/v2/frontend"]

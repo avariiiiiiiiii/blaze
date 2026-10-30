@@ -9,21 +9,21 @@ use blaze_ids::ContentId;
 use blaze_items::{ItemId, item_key};
 use hir_def::{DefWithBodyId, FunctionId, expr_store::Body as BodyStore};
 use hir_ty_mir::mir::MirSpan;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::v2::{BuildTime, Databases, ItemHashes};
 use db::TestDB;
 
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
     let hashes = HashSource::Items(ItemHashes::new(Box::new(|_| Some("src/lib.rs".to_owned()))));
     (db, HirFrontend::new(Databases::new(db), hashes, std::sync::Arc::new(BuildTime(Default::default()))))
 }
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 fn lib(name: &str, kind: NativeLibKind) -> NativeLib {
@@ -44,7 +44,7 @@ extern "C" {}
 extern "C" {}
 "#,
     );
-    let libs = frontend.linked(db.test_crate()).unwrap();
+    let libs = frontend.linked(fixture::test_crate(&db)).unwrap();
     assert_eq!(
         libs,
         [
@@ -70,7 +70,7 @@ fn a_link_blaze_cannot_make_is_an_error_naming_it() {
         ("extern \"C\" {\n    #[link_ordinal(2)]\n    static ORDINAL: u8;\n}", "`#[link_ordinal(..)]` on `ORDINAL`"),
     ] {
         let (db, frontend) = frontend(text);
-        let error = frontend.linked(db.test_crate()).unwrap_err();
+        let error = frontend.linked(fixture::test_crate(&db)).unwrap_err();
         assert!(error.what.contains(named), "{text}: {}", error.what);
     }
 }
@@ -154,7 +154,9 @@ fn a_position_of_no_table_the_build_has_is_an_error() {
 
 #[test]
 fn a_reformat_changes_a_table_and_not_its_anchor() {
-    let (db, file) = TestDB::with_single_file(SPANNED);
+    let fx = fixture::db(SPANNED);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let mut db = db;
     let file = file.file_id(&db);
     let owner = |db: &TestDB| DefWithBodyId::FunctionId(function(db, "f"));

@@ -760,7 +760,7 @@ impl<'a> Look<'a> {
         let found = found?;
         let entry = self.read(found, key)?;
         let bytes = match self.mapping_holding(found, &entry) {
-            Some((mapping, start)) => PinnedBytes::Mapped { mapping, start, len: entry.bytes.len() },
+            Some((mapping, start, file)) => PinnedBytes::Mapped { mapping, start, len: entry.bytes.len(), file },
             // alloc: a value made whole and held past the task: one aligned copy per pin
             None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
         };
@@ -770,26 +770,32 @@ impl<'a> Look<'a> {
     /// The mapping `entry`'s bytes are a range of, and where in it they start, when they are
     /// one and start at a multiple of [`disk::ALIGN`]: a raw record of a pack, or a file of its
     /// own. A value made whole (decompressed, from chunks or columns) or still in a writer's
-    /// segment is in none.
-    fn mapping_holding(self, found: Found<'a>, entry: &Entry<'a>) -> Option<(Mapping, usize)> {
+    /// segment is in none. For a file of its own, also the file, which holds the value whole.
+    fn mapping_holding(self, found: Found<'a>, entry: &Entry<'a>) -> Option<(Mapping, usize, Option<FileName>)> {
         let Place::Pack(loc) = found.place else { return None };
         if entry.bytes.is_empty() || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize) {
             return None;
         }
-        let of = |view: &'a View| -> Option<&'a Mapping> {
+        let of = |view: &'a View| -> Option<(&'a Mapping, Option<&'a FileName>)> {
             let tier = view.tiers.get(found.tier)?;
             match loc.form {
-                Form::Raw => tier.packs.get(loc.pack as usize)?.mapping.as_ref(),
-                Form::External => tier.externals.get(&entry.content)?.mapping.as_ref(),
+                Form::Raw => Some((tier.packs.get(loc.pack as usize)?.mapping.as_ref()?, None)),
+                Form::External => {
+                    let external = tier.externals.get(&entry.content)?;
+                    Some((external.mapping.as_ref()?, Some(&external.file)))
+                }
                 _ => None,
             }
         };
-        [of(found.view), of(self.view())].into_iter().flatten().find_map(|mapping| {
+        [of(found.view), of(self.view())].into_iter().flatten().find_map(|(mapping, file)| {
             let held = mapping.bytes().as_ptr_range();
             let (start, end) = (entry.bytes.as_ptr(), entry.bytes.as_ptr_range().end);
+            let whole = start == held.start && end == held.end;
+            // clone: a count of the name of a file of its own, once per pin
+            let file = file.filter(|_| whole).cloned();
             (held.start <= start && end <= held.end)
                 // clone: a count of the mapping, which keeps the file mapped while the value is held
-                .then(|| (mapping.clone(), start as usize - held.start as usize))
+                .then(|| (mapping.clone(), start as usize - held.start as usize, file))
         })
     }
 }
@@ -811,7 +817,8 @@ pub struct Pinned {
 
 #[derive(Clone)]
 enum PinnedBytes {
-    Mapped { mapping: Mapping, start: usize, len: usize },
+    /// `file` is the file of its own the value is the whole of, when it is one.
+    Mapped { mapping: Mapping, start: usize, len: usize, file: Option<FileName> },
     Copied(Arc<Aligned>),
 }
 
@@ -819,6 +826,18 @@ impl Pinned {
     /// Whether its bytes are the store's own, in place, rather than a copy.
     pub fn in_place(&self) -> bool {
         matches!(self.bytes, PinnedBytes::Mapped { .. })
+    }
+
+    /// The file under the driver's root whose bytes are exactly the value, when the value is a
+    /// file of its own and mapped (a [`crate::Kind::Machine`] once committed, or any value of
+    /// a hot kind from 4 MiB): a loader that maps code itself opens it rather than copy the
+    /// bytes. The bytes were checked against the content hash as they were pinned; the store
+    /// names such a file by that hash and only ever renames a file of the same bytes over it.
+    pub fn file(&self) -> Option<&FileName> {
+        match &self.bytes {
+            PinnedBytes::Mapped { file, .. } => file.as_ref(),
+            PinnedBytes::Copied(_) => None,
+        }
     }
 }
 
@@ -828,7 +847,7 @@ impl std::ops::Deref for Pinned {
     #[inline]
     fn deref(&self) -> &[u8] {
         match &self.bytes {
-            PinnedBytes::Mapped { mapping, start, len } => &mapping.bytes()[*start..*start + *len],
+            PinnedBytes::Mapped { mapping, start, len, .. } => &mapping.bytes()[*start..*start + *len],
             PinnedBytes::Copied(bytes) => bytes,
         }
     }

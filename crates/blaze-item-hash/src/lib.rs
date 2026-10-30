@@ -10,15 +10,23 @@
 //!   fact, or refused.
 //! - [`values`]: each fact's value now (section 5), lane items' and this crate's own.
 //! - [`keys`]: the item key of a definition a record names, and back.
+//! - [`impls`]: the identities of impls and head defs that the impl-set hashes name them by,
+//!   installed once per database ([`impls::install`]).
+//! - [`presentation`](mod@presentation): the names and positions of a body that reach the output (section 3.7),
+//!   hashed apart from its identity, for codegen to key debuginfo, symbols and locations by.
 //!
 //! [`Bodies`] is what the driver gives `hir_ty::body_store::install`.
 
 #![forbid(unsafe_code)]
 
 pub mod identity;
+pub mod impls;
 pub mod keys;
+pub mod presentation;
 pub mod reads;
 pub mod values;
+
+pub use presentation::presentation;
 
 #[cfg(test)]
 mod tests;
@@ -59,11 +67,11 @@ impl BodyFacts for Bodies {
         values::value(db, fact)
     }
 
-    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId {
-        keys::def_key(db, def)
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+        keys::def_key(db, body, def)
     }
 
-    fn def_of<'db>(&self, db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>> {
-        keys::def_of(db, key)
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+        keys::def_of(db, body, key)
     }
 }

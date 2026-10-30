@@ -5,7 +5,7 @@
 //! [`ModuleData::declaration_source_view`] those of [`ModuleData::declaration_source`].
 
 use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, view};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId,
@@ -122,7 +122,7 @@ fn compare_def_map(db: &TestDB, def_map: &DefMap, seen: &mut Seen) {
 
 #[test]
 fn a_modules_source_views_are_its_handles() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /lib.rs
 mod file;
@@ -156,7 +156,8 @@ fn in_file() {
     struct InFile;
 }
 "#,
-    );
+    )
+    .into_db();
     let mut seen = Seen::default();
     compare_def_map(&db, crate_def_map(&db, db.fetch_test_crate()), &mut seen);
     assert_eq!(seen.crate_root, 1);

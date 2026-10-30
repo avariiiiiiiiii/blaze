@@ -32,7 +32,7 @@ stdx.workspace = true
 blaze-alloc-count.workspace = true
 # The tests' database links hir-ty-mir for the MIR providers the constants patterns name need.
 hir-ty-mir.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

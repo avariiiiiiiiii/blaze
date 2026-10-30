@@ -1,5 +1,6 @@
 //! `SourceToDefCtx`'s walks from syntax to defs, over views: the same containers, the same dyn
-//! maps (shared with the handle `Semantics`, keyed by `AstPtr` kind tags) and the same answers.
+//! maps (in [`SemanticsImpl`](crate::SemanticsImpl)'s cache, keyed by `AstPtr` kind tags) and
+//! the same answers.
 //! A view's pointer is `AstPtr::of(view)`, so no lookup makes a handle.
 
 use std::{convert::Infallible, iter, mem, ops::ControlFlow};
@@ -45,7 +46,7 @@ use crate::{
     },
 };
 
-/// A view a def is found from: [`crate::semantics::ToDef`] over views.
+/// A view a def is found from.
 pub trait ToDef<'db>: AstNode<'db> + Copy {
     type Def;
     fn to_def(sema: &Semantics<'db>, src: InFile<Self>) -> Option<Self::Def>;
@@ -174,7 +175,7 @@ impl<'db> Semantics<'db> {
         self.to_def(u)
     }
 
-    /// The container `node` is a child of, as `SourceToDefCtx::find_container` finds it.
+    /// The container `node` is a child of.
     pub(super) fn find_container(&self, node: InFile<Node<'db>>) -> Option<ChildContainer> {
         self.with_ctx(|ctx| ctx.find_container(node))
     }

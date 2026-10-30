@@ -8,7 +8,7 @@ use hir_expand::name::Name;
 use intern::Symbol;
 use salsa::plumbing::AsId;
 use syntax::view::{self as ast, AstNode};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AdtId, ImplId, Lookup, ModuleDefId, ModuleId, nameres::facts::impls::module_impls,
@@ -61,7 +61,7 @@ fn ran_for(db: &TestDB, f: impl FnOnce()) -> Vec<salsa::Id> {
 
 #[test]
 fn lists_a_modules_impls_in_order() {
-    let (db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /main.rs crate:main deps:core
 use core::{Clone, Copy, derive};
@@ -102,6 +102,8 @@ pub macro Copy {}
 pub macro Clone {}
 "#,
     );
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let main = db.module_for_file(files[0].file_id(&db));
     let impls = module_impls(&db, main);
     assert_eq!(
@@ -132,7 +134,7 @@ pub macro Clone {}
 
 #[test]
 fn reruns_only_for_the_module_edited() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /main.rs crate:main
 mod a;
@@ -149,6 +151,8 @@ pub struct B;
 impl crate::Tr for B {}
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let (a_file, b_file) = (files[1].file_id(&db), files[2].file_id(&db));
     let (a, b) = (db.module_for_file(a_file), db.module_for_file(b_file));
     let a_before = snapshot(&db, a);
@@ -192,7 +196,7 @@ impl crate::Tr for B {}
 /// Allocation budget: a memo hit of `module_impls` and reading what it holds allocate nothing.
 #[test]
 fn a_memo_hit_allocates_nothing() {
-    let (db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /main.rs crate:main
 pub trait Tr {}
@@ -202,6 +206,8 @@ impl Tr for S {}
 impl Tr for () {}
 "#,
     );
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let main = db.module_for_file(files[0].file_id(&db));
     let warm = module_impls(&db, main);
     assert_eq!((warm.trait_impls.len(), warm.inherent_impls.len()), (2, 1), "too small to measure");

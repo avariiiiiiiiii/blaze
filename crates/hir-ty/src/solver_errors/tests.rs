@@ -1,7 +1,7 @@
 use base_db::Db;
 use hir_def::{ImplId, nameres::crate_def_map, signatures::TraitSignature};
 use rustc_type_ir::{BoundConstness, TypingMode};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::non_const_impl;
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 
 /// The impl of the trait named `trait_name`; the fixture has one.
 fn impl_of(db: &Db, trait_name: &str) -> ImplId {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(module, _)| module.scope(db).impls().collect::<Vec<_>>())
         .find(|&impl_| {
@@ -32,7 +32,7 @@ fn impl_of(db: &Db, trait_name: &str) -> ImplId {
 /// names that impl ("trait `Tr` is implemented but not `const`"); a `const` impl names none.
 #[test]
 fn a_const_goal_names_the_impl_that_is_not_const() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 #![feature(const_trait_impl)]
@@ -41,9 +41,10 @@ const trait Const {}
 impl Plain for u8 {}
 impl const Const for u8 {}
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let named = |trait_name| {
             let impl_ = impl_of(&db, trait_name);

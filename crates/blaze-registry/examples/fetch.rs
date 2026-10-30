@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
     let mut config = SourceConfig::default();
     let mut files = Vec::new();
     let mut print_roots = false;
+    let mut driven: Option<&'static mut blaze_cas::Driven> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--offline" => context.net.offline = true,
@@ -48,9 +49,10 @@ fn main() -> anyhow::Result<()> {
             }
             "--store" => {
                 let dir = PathBuf::from(args.next().context("--store needs a directory")?);
-                blaze_store::compiles_against("blaze-registry");
-                let store = blaze_store::Store::global_or(Some(&dir)).context("the store")?;
-                context.store = Some(store);
+                let opened = blaze_cas::Driven::open(&dir).map_err(anyhow::Error::msg)?;
+                let opened = Box::leak(Box::new(opened));
+                context.store = Some(Box::leak(Box::new(opened.handle())));
+                driven = Some(opened);
             }
             other => bail!("unknown argument `{other}`"),
         }
@@ -104,8 +106,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
     println!("{}", serde_json::to_string(&counts)?);
-    if let Some(store) = blaze_store::Store::global() {
-        store.flush();
+    if let Some(driven) = driven {
+        driven.flush().map_err(anyhow::Error::msg).context("the store")?;
     }
     Ok(())
 }

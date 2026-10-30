@@ -27,8 +27,9 @@ Each app is checked out, its dependencies put beside it and its setup run as app
 (`checkout`, `prepare`, `localize`, `setup`). blaze builds it with `BLAZE_ITEM_STORE=verify`:
 every body step the item store holds is run fresh as well and a difference stops the build with
 an error naming the body. blaze also builds the same source from nothing, with
-`BLAZE_ITEM_STORE=off`: a home, a store and a `target-scratch` of its own, made for the step and
-removed after it (as budgets.py's `wrong`). Then each step changes the source, one of:
+`BLAZE_ITEM_STORE=off`: a home and a store of its own, made for the step and removed after it
+(as budgets.py's `wrong`), into the same target path, the other build's waiting aside (as
+oracle.py's `bytes`), then moved to `target-scratch`. Then each step changes the source, one of:
 
     apply       one of the app's `edits` (pick_edits.py's file, old, new) not yet made
     revert      one made, undone
@@ -36,27 +37,40 @@ removed after it (as budgets.py's `wrong`). Then each step changes the source, o
     impl-add    a struct, an inherent impl and a `Display` impl of it added to the crate root
     impl-remove one of those taken out again
     move        a function at the top of a file moved to the file's end
+    rename-local  a `let` binding of such a function renamed, with every use after it
+    rename-fn   a private function at the top of a file renamed, with every call and path of it
+                in the app's sources
     earlier     every file back to what it held after an earlier step
 
-and both sides build again. One outcome per step, `<app>: step <i>: <what>`:
+A rename is by words, only where every use of the name is one a rename by words gets right (no
+string, char, comment or format string on its line, no field, method, macro, module or `use` of
+the name, no app edit's text holding it); a renamed name ends in `_item_store_<step>`. Both sides
+build again. One outcome per step, `<app>: step <i>: <what>`:
 
     pass   both builds succeed and the check prints the same from both programs (apps.App's
            behaviour: status, stdout and stderr, scrubbed as the app's `scrub` says), or both
            builds fail (the edit is one Rust rejects, as a synthetic one may be)
     fail   the build with the item store fails and the one from nothing does not (an item store
            mismatch is one: the detail has blaze's error), or the other way round, or the
-           outputs differ
+           outputs differ; or, after a move or a rename of a tree the step before built, the
+           build with the item store's program is not the same bytes as the one built from
+           nothing (names and places are the presentation layer's, docs/v2/plan/design/item-hash.md
+           section 3.7), or it reran an inference, MIR or borrow check step (a body's identity is
+           anonymous, section 3.3, so every lookup hits). A `rename-fn` of a function something
+           calls is held to the bytes alone: its callers' identities name it by key (a fact of it
+           is keyed so) and rerun, and the note counts a whole build, not a body
     error  the harness could not say (a command timed out, the daemon did not answer)
 
 Each outcome's numbers are what the build said: `reran`, `green`, `compiled`, `found` from its
-`blaze-work` line, and the item store's `written`, `kept`, `slots_full` and `refused` (the
-steps kept out by reads neither covered nor a fact, summed) from its `-v` note
-(blaze-cargo's `deps::noted`), None where it printed none. The item store reports no hits or
-misses of a build, so none are counted. `extra.steps` has every step's reads that kept steps
-out, by name. Files are put back as the checkout had them when an app ends.
+`blaze-work` line, the item store's `written`, `kept`, `slots_full` and `refused` (the steps
+kept out by reads neither covered nor a fact, summed) from its `-v` note (blaze-cargo's
+`deps::noted`) of what the flush of the build before did, and `hits` and `ran` of this build's
+lookups, summed over the steps, None where it printed none. `extra.steps` has every step's
+reads that kept steps out, by name, and its lookups by step. Files are put back as the
+checkout had them when an app ends.
 
 `selftest` checks the parts that need neither blaze, cargo nor the network: the input, the
-edits made here, the reading of the note, the verdict.
+edits made here (renames among them), the reading of the note, the verdict.
 """
 
 import json
@@ -79,15 +93,28 @@ import engine, report  # noqa: E402
 
 SCRIPT = "item_store.py"
 type Check = Literal["edit", "runs"]
-type Action = Literal["first", "apply", "revert", "statement", "impl-add", "impl-remove", "move", "earlier"]
+type Action = Literal["first", "apply", "revert", "statement", "impl-add", "impl-remove", "move", "rename-local",
+                      "rename-fn", "earlier"]
+# The edits after which nothing but names and places changed: the front end reruns no step and
+# the program is the same bytes as the one built from nothing.
+ANONYMOUS: tuple[Action, ...] = ("move", "rename-local", "rename-fn")
 ITEM_STORE = "BLAZE_ITEM_STORE"
 PROBE = "ItemStoreProbe"
+RENAMED = "_item_store_"
 # The `-v` note of blaze-cargo's `deps::noted`.
 NOTE = re.compile(r"the item store: (\d+) written, (\d+) kept, (\d+) with every slot full")
-KEPT_OUT = re.compile(r"steps kept out by reads of (.*?)(?:; \d+ |$)")
+KEPT_OUT = re.compile(r"steps kept out by reads of (.*?)(?:; \d+ |; the item store, this build|$)")
 KEPT_OUT_READ = re.compile(r"`([^`]+)` \((\d+)\)")
+STEP_NAMES = ("inference", "MIR", "borrow check")
+STEPS = re.compile(r"the item store, this build: " + "; ".join(
+    f"{name} (\\d+) hit, (\\d+) ran, (\\d+) refused" for name in STEP_NAMES))
 STATEMENT = re.compile(r"^( {8,})let [^\n]*;\n$")
 TOP_FN = re.compile(r"^(?:pub(?:\([^)]*\))? )?(?:(?:const|async|unsafe|extern \"[^\"]*\") )*fn \w+")
+LET_NAME = re.compile(r"^\s+let (?:mut )?([a-z_][a-z0-9_]*)\s*[:=;]")
+PRIVATE_FN = re.compile(r"^(?:(?:const|async|unsafe) )*fn ([a-z_][a-z0-9_]*)\b")
+# A line a rename leaves alone: a word in it may be text (a string, a char, a comment, a
+# format string's capture), which a rename by words would get wrong.
+TEXTUAL = re.compile(r"[\"'#]|//|/\*")
 
 
 @dataclass(frozen=True)
@@ -129,12 +156,15 @@ class Tree:
 
 @dataclass(frozen=True)
 class Step:
-    """What one step did to the tree: its action, said for the report, and the app edit it made
-    or reverted, whose `check` it runs."""
+    """What one step did to the tree: its action, said for the report, the app edit it made or
+    reverted, whose `check` it runs, and for a rename or a move whether bodies other than the
+    edited ones change identity and rerun (`rename-fn` of a function something calls: a body's
+    identity has each item a path names by key)."""
 
     action: Action
     what: str
     edit: int | None = None
+    reruns: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,11 +179,16 @@ class Tally:
     kept: int | None = None
     slots_full: int | None = None
     refused_by: tuple[tuple[str, int], ...] = ()
+    # This build's item store lookups, per step of `STEP_NAMES`: (hits, ran, refused).
+    steps: tuple[tuple[int, int, int], ...] | None = None
 
     def numbers(self) -> dict[str, report.Number]:
         refused = sum(n for _, n in self.refused_by) if self.written is not None else None
+        hits = sum(h for h, _, _ in self.steps) if self.steps is not None else None
+        ran = sum(r for _, r, _ in self.steps) if self.steps is not None else None
         return dict(reran=self.reran, green=self.green, compiled=self.compiled, found=self.found,
-                    written=self.written, kept=self.kept, slots_full=self.slots_full, refused=refused)
+                    written=self.written, kept=self.kept, slots_full=self.slots_full, refused=refused,
+                    hits=hits, ran=ran)
 
 
 def edits_of(spec: dict[str, Any]) -> list[Edit]:
@@ -223,6 +258,102 @@ def move_function(text: str, span: tuple[int, int]) -> str:
     return tail + ("" if tail.endswith("\n") else "\n") + "\n" + "".join(block)
 
 
+def word(name: str) -> re.Pattern[str]:
+    return re.compile(rf"(?<![\w$']){re.escape(name)}(?!\w)")
+
+
+def renamable(lines: list[str], name: str, decl: int | None) -> bool:
+    """Whether every use of `name` in `lines` is a name a rename by words renames right: none in
+    a line that may hold text (`TEXTUAL`), after `.` or `::` (a field, a method, another path's
+    segment), before `!`, `::` or a lone `:` (a macro, a module, a field of a literal; `decl`'s
+    line, the binding's own, may have its type), or alone between `{`/`,` and `}`/`,` (a field
+    shorthand)."""
+    pattern = word(name)
+    for at, line in enumerate(lines):
+        for use in pattern.finditer(line):
+            before, after = line[:use.start()].rstrip(), line[use.end():].lstrip()
+            if TEXTUAL.search(line) or before.endswith((".", "::")) or after.startswith(("!", "::")):
+                return False
+            if after.startswith(":") and at != decl:
+                return False
+            if before.endswith(("{", ",")) and after.startswith(("}", ",")):
+                return False
+    return True
+
+
+def local_renames(text: str) -> list[tuple[int, int, str]]:
+    """Each `let` binding of a function `functions` lists that can be renamed by words from its
+    line to the function's end, as (its line, the line after the function, its name): its name
+    is in no line of the function before it, and every use is one `renamable` takes."""
+    lines = text.splitlines(keepends=True)
+    found: list[tuple[int, int, str]] = []
+    for first, after in functions(text):
+        for at in range(first, after):
+            m = LET_NAME.match(lines[at])
+            if m is None or m[1] == "_" or RENAMED in m[1]:
+                continue
+            name = m[1]
+            # Once on its own line: the name in its initializer is another thing's.
+            if any(word(name).search(l) for l in lines[first:at]) or len(word(name).findall(lines[at])) != 1:
+                continue
+            if renamable(lines[at:after], name, 0):
+                found.append((at, after, name))
+    return found
+
+
+def rename_local(text: str, site: tuple[int, int, str], n: int) -> str:
+    at, after, name = site
+    lines = text.splitlines(keepends=True)
+    pattern = word(name)
+    lines[at:after] = [pattern.sub(f"{name}{RENAMED}{n}", l) for l in lines[at:after]]
+    return "".join(lines)
+
+
+def fn_renames(files: dict[str, str], sources: list[str]) -> list[str]:
+    """The names of the private functions at the top of `sources` that can be renamed by words in
+    all of them: no attribute above (a test, an exported name), not `main`, no module or `use` of
+    the name, and every use one `renamable` takes, so each is a call or a path of the crate's own."""
+    names: set[str] = set()
+    for s in sources:
+        lines = files[s].splitlines(keepends=True)
+        for at, line in enumerate(lines):
+            m = PRIVATE_FN.match(line)
+            if m and m[1] != "main" and RENAMED not in m[1] and not (at > 0 and lines[at - 1].startswith("#[")):
+                names.add(m[1])
+    found: list[str] = []
+    for name in sorted(names):
+        pattern = word(name)
+        ok = True
+        for s in sources:
+            lines = files[s].splitlines(keepends=True)
+            used = [l for l in lines if pattern.search(l)]
+            if any(l.lstrip().startswith(("use ", "pub use ", "mod ", "pub mod ")) for l in used):
+                ok = False
+            # A `fn` of the name in an impl or a trait is a method, called with `.`.
+            if any(re.match(rf"\s+(?:pub(?:\([^)]*\))? )?(?:(?:const|async|unsafe) )*fn {re.escape(name)}\b", l)
+                   for l in used):
+                ok = False
+            if not ok or not renamable(used, name, None):
+                ok = False
+                break
+        if ok:
+            found.append(name)
+    return found
+
+
+def called_elsewhere(files: dict[str, str], sources: list[str], name: str) -> bool:
+    """Whether `name` is written anywhere in `sources` but its own `fn` line: a call or a path
+    of it (a recursive call too), in a body whose identity then names another item."""
+    pattern = word(name)
+    return sum(len(pattern.findall(files[s])) for s in sources) > 1
+
+
+def rename_fn(files: dict[str, str], sources: list[str], name: str, n: int) -> None:
+    pattern = word(name)
+    for s in sources:
+        files[s] = pattern.sub(f"{name}{RENAMED}{n}", files[s])
+
+
 def sources_of(ws: Path, dirs: list[Path]) -> list[str]:
     """The Rust files under each of `dirs`, by path under `ws`, leaving out build outputs and
     hidden directories."""
@@ -237,10 +368,25 @@ def sources_of(ws: Path, dirs: list[Path]) -> list[str]:
 
 def leftovers(text: str) -> bool:
     """Whether `text` holds an edit of this script, left by a run that did not put it back."""
-    return PROBE in text or "_item_store_" in text
+    return PROBE in text or RENAMED in text
 
 
 # The sequence.
+
+def untouched(name: str, edits: list[Edit]) -> bool:
+    """Whether renaming `name` leaves every app edit's `old` and `new` as they are, so each can
+    still be made and undone."""
+    pattern = word(name)
+    return not any(pattern.search(e.old) or pattern.search(e.new) for e in edits)
+
+
+def local_sites(tree: Tree, edits: list[Edit], sources: list[str]) -> list[tuple[str, tuple[int, int, str]]]:
+    return [(s, site) for s in sources for site in local_renames(tree.files[s]) if untouched(site[2], edits)]
+
+
+def fn_sites(tree: Tree, edits: list[Edit], sources: list[str]) -> list[str]:
+    return [name for name in fn_renames(tree.files, sources) if untouched(name, edits)]
+
 
 def choices(tree: Tree, edits: list[Edit], sources: list[str], root: str | None, synthetic: bool,
             earlier: int) -> list[Action]:
@@ -259,6 +405,10 @@ def choices(tree: Tree, edits: list[Edit], sources: list[str], root: str | None,
             out.append("impl-remove")
         if any(functions(tree.files[s]) for s in sources):
             out.append("move")
+        if local_sites(tree, edits, sources):
+            out.append("rename-local")
+        if fn_sites(tree, edits, sources):
+            out.append("rename-fn")
     if earlier > 0:
         out.append("earlier")
     return out
@@ -306,6 +456,16 @@ def step(rng: random.Random, tree: Tree, history: list[Tree], edits: list[Edit],
         name = cast(re.Match[str], re.search(r"fn (\w+)", "".join(tree.files[path].splitlines(keepends=True)[span[0]:span[1]])))[1]
         tree.files[path] = move_function(tree.files[path], span)
         return Step(action, f"{path}: fn {name} moved to the end")
+    if action == "rename-local":
+        path, site = rng.choice(local_sites(tree, edits, sources))
+        tree.files[path] = rename_local(tree.files[path], site, n)
+        return Step(action, f"{path}:{site[0] + 1}: `{site[2]}` renamed to `{site[2]}{RENAMED}{n}`")
+    if action == "rename-fn":
+        name = rng.choice(fn_sites(tree, edits, sources))
+        called = called_elsewhere(tree.files, sources, name)
+        rename_fn(tree.files, sources, name, n)
+        return Step(action, f"fn {name} renamed to {name}{RENAMED}{n} everywhere"
+                    + (", its callers with it" if called else ", nothing calls it"), reruns=called)
     back = rng.randrange(len(history) - 1)
     then = history[back]
     tree.files, tree.made, tree.probes = dict(then.files), set(then.made), list(then.probes)
@@ -345,7 +505,11 @@ def tally(ran: engine.Ran) -> Tally:
             counts[name] = value if isinstance(value, int) and not isinstance(value, bool) else None
     written = kept = full = None
     by: dict[str, int] = {}
+    steps: tuple[tuple[int, int, int], ...] | None = None
     for text in texts_of(ran.stdout + "\n" + ran.stderr):
+        if (counted := STEPS.search(text)) is not None:
+            values = [int(x) for x in counted.groups()]
+            steps = tuple((values[at], values[at + 1], values[at + 2]) for at in range(0, len(values), 3))
         if (note := NOTE.search(text)) is None:
             continue
         written, kept, full = (int(x) for x in note.groups())
@@ -353,16 +517,35 @@ def tally(ran: engine.Ran) -> Tally:
         if (out := KEPT_OUT.search(text, note.end())) is not None:
             by = {name: int(count) for name, count in KEPT_OUT_READ.findall(out[1])}
     return Tally(counts["reran"], counts["green"], counts["compiled"], counts["found"], written, kept, full,
-                 tuple(sorted(by.items(), key=lambda it: (-it[1], it[0]))))
+                 tuple(sorted(by.items(), key=lambda it: (-it[1], it[0]))), steps)
+
+
+def unchanged(said: Tally, apart: str, reruns: bool = False) -> str:
+    """Why a build after a rename or a move (`ANONYMOUS`) did not do what one must, or '': the
+    program is the same bytes as the one built from nothing (`apart`, `engine.first_difference`'s
+    words) and, unless other bodies change identity with it (`reruns`, `Step.reruns`), the
+    front end reran no step (the edited bodies' identities are the same, so every lookup hits).
+    The note counts a whole build, not a body, so a step whose callers rerun is held to the
+    bytes alone."""
+    problems: list[str] = []
+    if apart != "the same":
+        problems.append(f"the program is not the same bytes as the one built from nothing: {apart}")
+    if not reruns:
+        if said.steps is None:
+            problems.append("the build's `-v` note has no item store step counts")
+        elif reran := [f"{name} {r}" for name, (_, r, _) in zip(STEP_NAMES, said.steps) if r]:
+            problems.append(f"the front end reran steps: {', '.join(reran)}")
+    return "; ".join(problems)
 
 
 type Behaviour = tuple[object, bytes, bytes]
 
 
 def verdict(blaze_ok: bool, fresh_ok: bool, blaze_said: str, fresh_said: str,
-            seen: list[tuple[str, Behaviour, Behaviour]]) -> tuple[report.Verdict, str]:
+            seen: list[tuple[str, Behaviour, Behaviour]], unlike: str = "") -> tuple[report.Verdict, str]:
     """A step's verdict from both builds and, when both built, each check's behaviour from the
-    program built from nothing and the one built with the item store."""
+    program built from nothing and the one built with the item store, and after a rename or a
+    move what `unchanged` found (`unlike`)."""
     if blaze_ok != fresh_ok:
         if fresh_ok:
             return "fail", f"the build with the item store failed and the one from nothing did not:\n{blaze_said[-2500:]}"
@@ -374,6 +557,8 @@ def verdict(blaze_ok: bool, fresh_ok: bool, blaze_said: str, fresh_said: str,
             import mixed
             return "fail", (f"`{name}` differs: the program built from nothing exits {want[0]!r}, the one built "
                             f"with the item store {got[0]!r}: {mixed.symptom(want, got)}")
+    if unlike:
+        return "fail", f"after a rename or a move: {unlike}"
     return "pass", ""
 
 
@@ -431,12 +616,28 @@ class App:
 
     def build(self, label: str) -> tuple[engine.Ran, engine.Ran]:
         """The build with the item store, then blaze's build of the same source from nothing,
-        whose home, store and target directory stay until `forget_fresh`."""
+        whose home, store and target directory stay until `forget_fresh`. The one from nothing
+        is made at the same target path, the other's waiting aside, so that the two programs can
+        be the same bytes; then it moves to its own."""
         ran = self.eng.build(label, self.ws, self.env, [*self.args, "-v", "--message-format=json"])
         self.forget_fresh()
-        self.fresh_env = self.eng.env(self.fresh_home, self.fresh_store, self.fresh_target, self.fresh_extra)
-        fresh = self.eng.build(f"{label}: from nothing", self.ws, self.fresh_env, self.args)
+        aside = self.ws / f"{self.blaze_target.name}-aside"
+        shutil.rmtree(aside, ignore_errors=True)
+        self.blaze_target.mkdir(parents=True, exist_ok=True)
+        os.rename(self.blaze_target, aside)
+        try:
+            self.fresh_env = self.eng.env(self.fresh_home, self.fresh_store, self.blaze_target, self.fresh_extra)
+            fresh = self.eng.build(f"{label}: from nothing", self.ws, self.fresh_env, self.args)
+        finally:
+            if self.blaze_target.exists():
+                os.rename(self.blaze_target, self.fresh_target)
+            os.rename(aside, self.blaze_target)
         return ran, fresh
+
+    def apart(self) -> str:
+        """Where the program built from nothing and the one built with the item store first
+        differ, in `engine.first_difference`'s words ("the same" when they do not)."""
+        return engine.first_difference(self.fresh_program, self.blaze_program)
 
     def forget_fresh(self) -> None:
         """Stops the daemon of the build from nothing and removes its home, store and target
@@ -482,6 +683,7 @@ def run_app(eng: engine.Engine, name: str, spec: dict[str, Any], args: Input, wo
     rng = random.Random(f"item-store:{args.seed}:{name}")
     tree = Tree(dict(app.originals))
     history = [tree.copy()]
+    was_built = False
     try:
         for i in range(args.steps + 1):
             made = Step("first", "the first build")
@@ -493,18 +695,29 @@ def run_app(eng: engine.Engine, name: str, spec: dict[str, Any], args: Input, wo
                 label = f"{name}: step {i}: {made.action}"
                 app.write(tree)
                 ran, fresh = app.build(label)
-                seen = app.behaviours(made) if ran.returncode == 0 and fresh.returncode == 0 else []
-            except (engine.Failed, SystemExit) as e:
+                built = ran.returncode == 0 and fresh.returncode == 0
+                seen = app.behaviours(made) if built else []
+                # After a step that did not build, a step's result may never have been stored (a
+                # failing borrow check, a MIR error): only a rename or move of a tree that built
+                # is held to rerunning nothing.
+                held = built and was_built and made.action in ANONYMOUS
+                was_built = built
+                apart = app.apart() if held else "the same"
+            except (engine.Failed, SystemExit, OSError) as e:
                 rep.add(label, "error", f"{made.what}\n{e}")
                 break
             finally:
                 app.forget_fresh()
             said = tally(ran)
-            verdict_, detail = verdict(ran.returncode == 0, fresh.returncode == 0, ran.said(), fresh.said(), seen)
+            unlike = unchanged(said, apart, made.reruns) if held else ""
+            verdict_, detail = verdict(ran.returncode == 0, fresh.returncode == 0, ran.said(), fresh.said(), seen,
+                                       unlike)
             rep.add(label, verdict_, f"{made.what}" + (f"\n{detail}" if detail else ""),
                     blaze_s=round(ran.seconds, 2), fresh_s=round(fresh.seconds, 2), **said.numbers())
             kept.append(dict(app=name, step=i, action=made.action, what=made.what, verdict=verdict_,
-                             refused_by=dict(said.refused_by)))
+                             refused_by=dict(said.refused_by),
+                             lookups=None if said.steps is None else {
+                                 of: dict(hits=h, ran=r, refused=f) for of, (h, r, f) in zip(STEP_NAMES, said.steps)}))
             if verdict_ != "pass" and not args.keep_going:
                 break
     finally:
@@ -627,13 +840,60 @@ def test_functions() -> None:
     assert functions("fn decl();\nfn x() {\n}\nstruct S;\n") == [(1, 3)]
 
 
+HELPERS = """
+fn double(x: u32) -> u32 {
+    let twice = x * 2;
+    let shown = format!("{twice}");
+    twice + double_of(shown.len() as u32)
+}
+
+fn double_of(n: u32) -> u32 {
+    n
+}
+
+impl Wrap {
+    fn double(&self) -> u32 {
+        self.0
+    }
+}
+"""
+
+
+def test_local_renames() -> None:
+    sites = local_renames(SAMPLE + HELPERS)
+    assert [name for _, _, name in sites] == ["sum", "open"], sites
+    renamed = rename_local(SAMPLE, sites[0], 4)
+    assert "    let sum_item_store_4 = a + b;\n    sum_item_store_4\n}" in renamed, renamed
+    assert renamed.count("sum") == 2 and leftovers(renamed), renamed
+    # `total` and `call` are read by a format string, `twice` too, `shown` by a method call.
+    assert not any(name in ("total", "call", "twice") for _, _, name in sites)
+    lines = ["    let s = S { x };\n"]
+    assert not renamable(lines, "x", None) and not renamable(["    p.x\n"], "x", None)
+    assert renamable(["    let x: u32 = 1;\n", "    f(x, 2)\n"], "x", 0)
+    assert not renamable(["    let x: u32 = 1;\n", "    S { x: 1 }\n"], "x", 0)
+
+
+def test_fn_renames() -> None:
+    files = {"src/main.rs": SAMPLE + HELPERS}
+    # `double` is a method too, `add` is public, `main` is `main`, `helper` is in a module.
+    assert fn_renames(files, ["src/main.rs"]) == ["double_of"], fn_renames(files, ["src/main.rs"])
+    assert called_elsewhere(files, ["src/main.rs"], "double_of")
+    assert not called_elsewhere({"a.rs": "fn alone() {\n}\n"}, ["a.rs"], "alone")
+    rename_fn(files, ["src/main.rs"], "double_of", 2)
+    text = files["src/main.rs"]
+    assert "fn double_of_item_store_2(n: u32)" in text and "double_of_item_store_2(shown.len()" in text, text
+    assert fn_renames(files, ["src/main.rs"]) == [], "a renamed function is not renamed again"
+    used = {"a.rs": "fn f() {\n}\n", "b.rs": "use crate::a::f;\nfn g() {\n    f();\n}\n"}
+    assert fn_renames(used, ["a.rs", "b.rs"]) == ["g"], "a name a `use` names is left"
+
+
 def test_sequence() -> None:
     edits = [Edit("src/main.rs", "    let total = add(1, 2);\n", "    let total = add(1, 3);\n", "a number"),
              Edit("src/main.rs", "    sum\n", "    sum + 0\n")]
 
     def run(seed: int) -> list[Step]:
         rng = random.Random(f"item-store:{seed}:sample")
-        tree = Tree({"src/main.rs": SAMPLE})
+        tree = Tree({"src/main.rs": SAMPLE + HELPERS})
         history = [tree.copy()]
         made: list[Step] = []
         for n in range(1, 41):
@@ -647,7 +907,8 @@ def test_sequence() -> None:
     assert first == run(1), "a seed gives one sequence"
     assert first != run(2)
     every = {s.action for seed in range(6) for s in run(seed)}
-    assert every == {"apply", "revert", "statement", "impl-add", "impl-remove", "move", "earlier"}, every
+    assert every == {"apply", "revert", "statement", "impl-add", "impl-remove", "move", "rename-local", "rename-fn",
+                     "earlier"}, every
 
 
 def test_only_app_edits() -> None:
@@ -679,9 +940,22 @@ def test_tally() -> None:
                                                                     "rendered": note + "\n"}})
     assert tally(ran(work + "\n" + message + "\n")) == got
     plain = tally(ran("", "note: the item store: 0 written, 2 kept, 0 with every slot full\n"))
-    assert (plain.written, plain.kept, plain.refused_by, plain.reran) == (0, 2, (), None), plain
+    assert (plain.written, plain.kept, plain.refused_by, plain.reran, plain.steps) == (0, 2, (), None, None), plain
     none = tally(ran("", "error: something\n", 101))
-    assert none == Tally() and none.numbers()["refused"] is None, none
+    assert none == Tally() and none.numbers()["refused"] is None and none.numbers()["ran"] is None, none
+    this = ("; the item store, this build: inference 6 hit, 1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; "
+            "borrow check 0 hit, 0 ran, 0 refused")
+    counted = tally(ran("", note + this + "\n"))
+    assert counted.steps == ((6, 1, 0), (5, 2, 1), (0, 0, 0)), counted
+    assert counted.refused_by == got.refused_by and counted.numbers()["ran"] == 3, counted
+    first = tally(ran("", "note: " + this.removeprefix("; ") + "\n"))
+    assert first.steps == counted.steps and first.written is None, first
+    assert unchanged(first, "the same") == "the front end reran steps: inference 1, MIR 2"
+    assert unchanged(Tally(steps=((3, 0, 0),) * 3), "the same") == ""
+    assert "no item store step counts" in unchanged(Tally(), "the same")
+    assert "not the same bytes" in unchanged(Tally(steps=((3, 0, 0),) * 3), "byte 0x10: 0x01 against 0x02")
+    assert unchanged(first, "the same", reruns=True) == "", "callers of a renamed function rerun"
+    assert "not the same bytes" in unchanged(first, "one ends at byte 0x8", reruns=True)
 
 
 def test_verdict() -> None:
@@ -693,6 +967,9 @@ def test_verdict() -> None:
     assert verdict(True, False, "", "error[E0308]", [])[0] == "fail"
     v, d = verdict(True, True, "", "", [("--help", same, (1, b"out", b""))])
     assert v == "fail" and "`--help` differs" in d, d
+    v, d = verdict(True, True, "", "", [("x", same, same)], "the front end reran steps: MIR 1")
+    assert v == "fail" and d == "after a rename or a move: the front end reran steps: MIR 1", d
+    assert verdict(False, False, "e", "e", [], "ignored")[0] == "pass"
 
 
 def test_tree_written() -> None:
@@ -724,8 +1001,9 @@ def refused_failed(fn: Callable[[], object]) -> str:
     raise AssertionError("not refused")
 
 
-SELFTESTS = (test_input, test_statement, test_statement_in_a_body, test_probe, test_sources, test_functions, test_sequence,
-             test_only_app_edits, test_tally, test_verdict, test_tree_written)
+SELFTESTS = (test_input, test_statement, test_statement_in_a_body, test_probe, test_sources, test_functions,
+             test_local_renames, test_fn_renames, test_sequence, test_only_app_edits, test_tally, test_verdict,
+             test_tree_written)
 
 
 def selftest() -> int:

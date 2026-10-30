@@ -11,7 +11,7 @@ use hir_def::{
 use rustc_abi::Size;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{IntTy, Mutability, UintTy};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{codec, *};
 use crate::{
@@ -249,7 +249,7 @@ fn const_named(db: &Db, krate: Crate, name: &str) -> ConstId {
 /// A database of [`FIXTURE`] keeping `lib`'s constants in `store`, filed under `base`, and
 /// `lib::SEVEN`.
 fn kept(store: &Arc<Memory>, base: Option<ContentId>, mode: Mode) -> (Db, Crate, ConstId) {
-    let mut db = Db::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
     let seven = const_named(&db, lib, "SEVEN");
     let crates = FxHashMap::from_iter([(lib, base)]);

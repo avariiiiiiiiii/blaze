@@ -1,6 +1,6 @@
 //! The `proc_macro` crate of a proc macro blaze compiles to WebAssembly, as dtolnay's watt
 //! runs one: blaze puts this text, then the API it shares with the in-process bridge's
-//! `proc_macro` (`crates/blaze-expand/src/native/proc_macro/api.rs`; both are
+//! `proc_macro` (`crates/blaze-macro-wasm/native/proc_macro/api.rs`; both are
 //! `blaze_macro_wasm::GUEST`), in place of the standard library's `library/proc_macro` root
 //! when it compiles a proc-macro crate for `wasm32-wasip1` (`crates/blaze-macro-wasm/src/lib.rs`
 //! says how the module is run). This file holds only the module's imports (`sys`), its
@@ -115,7 +115,7 @@ unsafe impl std::alloc::GlobalAlloc for Counted {
 static ALLOCATOR: Counted = Counted;
 
 
-/// What blaze's list of a crate's macros calls (`crates/blaze-engine/src/macro_list.rs`): the
+/// What blaze's list of a crate's macros calls (`crates/hir-ty-codegen/v2/roots/proc_macros.rs`): the
 /// module's exports run a macro through these.
 #[doc(hidden)]
 pub mod __blaze {

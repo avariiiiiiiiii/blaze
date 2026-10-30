@@ -11,9 +11,9 @@ use hir_ty_mir::mir::{
     TypedCx, run_function,
 };
 use rustc_type_ir::inherent::IntoKind as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 const INIT: u8 = 1;
 /// A byte of a pointer, which carries the pointer's provenance.
@@ -419,7 +419,9 @@ struct Run {
 /// Runs `name` with `Plain` and with the recorder, which must agree on the result and the
 /// output.
 fn run(program: &str, name: &str) -> Run {
-    let (db, _) = TestDB::with_single_file(&fixture(program));
+    let fx = fixture::db(&fixture(program));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, name);
         let (plain, plain_out, _) = run_function(&db, func, Plain);

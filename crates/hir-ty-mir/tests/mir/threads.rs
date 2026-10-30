@@ -6,9 +6,9 @@
 //! until it blocks or ends, so what each prints comes in one order.
 
 use hir_ty_mir::mir::{Plain, run_function};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 /// What every program may use: the pthread, futex, clock and `errno` shims, `write`, and the
 /// atomics.
@@ -92,7 +92,9 @@ macro_rules! program {
 
 /// Runs the program's `main` and gives how it ended and what it printed.
 fn run(fixture: &str) -> (Result<(), String>, String) {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);

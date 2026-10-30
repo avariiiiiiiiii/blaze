@@ -24,7 +24,7 @@ use hir_def::{
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::Ty as _;
 use salsa::Setter;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{
     Answer, FactObject, FactRef, Flushed, GoalFacts, SOLVER_FILES, install, lookup, lookup_goal,
@@ -120,8 +120,7 @@ struct Knob {
 }
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 

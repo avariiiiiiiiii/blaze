@@ -3,11 +3,11 @@
 
 use base_db::Db;
 use intern::Symbol;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     nameres::crate_def_map,
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
     unstable_features::UnstableFeatures,
 };
 
@@ -29,7 +29,7 @@ fn names(features: &UnstableFeatures) -> Vec<String> {
 }
 
 fn db() -> Db {
-    TestDB::with_files(FIXTURE)
+    fixture::db(FIXTURE).into_db()
 }
 
 #[test]
@@ -61,7 +61,9 @@ fn reading_the_roots_features_builds_no_def_map() {
 
 #[test]
 fn a_crate_without_features_has_none() {
-    let (db, _) = TestDB::with_single_file("//- /lib.rs crate:foo\npub struct A;\n");
+    let fx = fixture::db("//- /lib.rs crate:foo\npub struct A;\n");
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let of_root = UnstableFeatures::of_root(&db, krate);
     assert!(names(of_root).is_empty());

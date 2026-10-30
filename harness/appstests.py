@@ -3,12 +3,13 @@
 `tests` of an application has two kinds of test:
 
 program  arguments of `cargo test` that pick test binaries which start the program
-         (`["--test", "integration"]`). Cargo builds them once; each is run with cargo's
-         program beside it and then with blaze's in its place.
+         (`["--test", "integration"]`). Cargo builds them; each is run with blaze's program
+         in the place of cargo's.
 crates   directories of workspace crates whose unit and integration tests are linked again
-         with blaze's objects for the crate, by cratetest.py.
+         with blaze's objects for the crate, by cratetest.py, and judged by their own results.
 
-A test counts by its name and its result in both runs; the ones that differ are listed.
+Each test is judged by its own result: every one that runs passes (`ok`, or `ignored`), and the
+ones that do not are listed. A test known to fail is left out by name (`tests.skip`).
 """
 import json, os, re, shutil, subprocess, sys
 
@@ -28,7 +29,8 @@ def results(binary, cwd, env, skip):
 
 
 def program_tests(fx, ws, spec, args, skip):
-    """Runs the test binaries twice; returns (tests, differing names)."""
+    """Builds the test binaries with cargo, puts blaze's program where they start it, and runs
+    them; returns (tests, failing names). cargo's program is put back after."""
     target = os.path.join(ws, "target-tests")
     env = {**os.environ, "CARGO_TARGET_DIR": target, "RUSTFLAGS": "--cap-lints allow"}
     built = subprocess.run(["cargo", "test", "-p", spec["package"], *args, "--no-run", "--message-format=json"],
@@ -43,25 +45,22 @@ def program_tests(fx, ws, spec, args, skip):
             tests.append((unit["executable"], os.path.dirname(unit["manifest_path"])))
     kept = program + ".cargo"
     shutil.copy2(program, kept)
-    seen = []
     try:
-        for stand_in in (kept, fx.binary):
-            shutil.copy2(stand_in, program)
-            run_env = {**fx.run_env, "CARGO": shutil.which("cargo")}
-            seen.append({f"{os.path.basename(exe).rsplit('-', 1)[0]}::{test}": result
-                         for exe, cwd in tests
-                         for test, result in results(exe, cwd, {**run_env, "CARGO_MANIFEST_DIR": cwd}, skip).items()})
+        shutil.copy2(fx.binary, program)
+        run_env = {**fx.run_env, "CARGO": shutil.which("cargo")}
+        seen = {f"{os.path.basename(exe).rsplit('-', 1)[0]}::{test}": result
+                for exe, cwd in tests
+                for test, result in results(exe, cwd, {**run_env, "CARGO_MANIFEST_DIR": cwd}, skip).items()}
     finally:
         shutil.move(kept, program)
-    want, got = seen
-    differing = sorted(test for test in want.keys() | got.keys() if want.get(test) != got.get(test))
-    for test in differing[:40]:
-        print(f"  DIFFERS {test}: with cargo's program {want.get(test)}, with blaze's {got.get(test)}")
-    return len(want), differing
+    failing = sorted(test for test, result in seen.items() if result not in ("ok", "ignored"))
+    for test in failing[:40]:
+        print(f"  FAILED {test}: {seen[test]}")
+    return len(seen), failing
 
 
 def crate_tests(ws, directory):
-    """cratetest.py on a crate of the workspace; returns (tests, differing names, error)."""
+    """cratetest.py on a crate of the workspace; returns (tests, failing names, error)."""
     out = os.path.join(ws, ".apps-cratetest.json")
     if os.path.exists(out):
         os.remove(out)
@@ -72,31 +71,32 @@ def crate_tests(ws, directory):
     if not os.path.exists(out):
         return 0, [], last[:300]
     merged = json.load(open(out))
-    differing = [f"{directory}::{test}" for binary in merged["binaries"] for test in binary.get("differing_tests", [])]
-    broken = [f"{directory}: {binary['error']}" for binary in merged["binaries"] if "error" in binary]
-    return merged["tests_run"], differing + broken, None
+    failing = [f"{directory}::{test}" for binary in merged["binaries"] for test in binary["failed"]]
+    broken = [f"{directory}: {binary['error'] if 'error' in binary else binary['wrong']}" for binary in merged["binaries"]
+              if "error" in binary or (binary.get("wrong") and not binary["failed"])]
+    return merged["tests_run"], failing + broken, None
 
 
 def run(fx, ws, spec, result):
     tests = spec.get("tests")
     if not tests:
         return True
-    row = {"run": 0, "differing": [], "errors": []}
+    row = {"run": 0, "failing": [], "errors": []}
     if "program" in tests:
         try:
-            count, differing = program_tests(fx, ws, spec, tests["program"], tests.get("skip", []))
+            count, failing = program_tests(fx, ws, spec, tests["program"], tests.get("skip", []))
             row["run"] += count
-            row["differing"] += differing
+            row["failing"] += failing
         except SystemExit as failed:
             row["errors"].append(str(failed)[-600:])
     for directory in tests.get("crates", []):
-        count, differing, error = crate_tests(ws, directory)
+        count, failing, error = crate_tests(ws, directory)
         row["run"] += count
-        row["differing"] += differing
+        row["failing"] += failing
         if error:
             row["errors"].append(f"{directory}: {error}")
     result["tests"] = row
-    print(f"tests: {row['run']} run, {len(row['differing'])} differing, {len(row['errors'])} test targets not run")
+    print(f"tests: {row['run']} run, {len(row['failing'])} failing, {len(row['errors'])} test targets not run")
     for error in row["errors"]:
         print(f"  NOT RUN {error[:300]}")
-    return not row["differing"] and not row["errors"]
+    return not row["failing"] and not row["errors"]

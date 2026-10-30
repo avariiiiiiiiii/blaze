@@ -29,7 +29,7 @@ span.workspace = true
 # The tests' database links hir-ty-mir for the MIR providers.
 hir-ty-mir.workspace = true
 syntax.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 test-utils.workspace = true
 
 [features]

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use base_db::{Db, RunOrder, all_crates, set_run_order};
 use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{Plan, Queue, Ran};
 use crate::check::{check_module, every_body, file_modules, workspace_crates};
@@ -76,7 +76,7 @@ fn function(db: &Db, name: &str) -> DefWithBodyId {
 /// The kinds of `BODIES`' diagnostics, checked by a plan in `order`, with every body posted as
 /// reached, last first, when `reach`.
 fn checked(order: RunOrder, reach: bool) -> Vec<String> {
-    let db = Db::with_files(BODIES);
+    let db = fixture::db(BODIES).into_db();
     let before = set_run_order(order);
     let found = crate::attach_db(&db, || {
         let krate = workspace_crates(&db)[0];
@@ -114,7 +114,7 @@ fn a_check_is_the_same_whatever_order_its_bodies_ran_in() {
 
 #[test]
 fn a_check_by_bodies_is_the_collector_walking_each_module_whole() {
-    let db = Db::with_files(BODIES);
+    let db = fixture::db(BODIES).into_db();
     let before = set_run_order(RunOrder::Strided(3));
     crate::attach_db(&db, || {
         let krate = workspace_crates(&db)[0];
@@ -132,7 +132,7 @@ fn a_check_by_bodies_is_the_collector_walking_each_module_whole() {
 
 #[test]
 fn a_plan_lists_the_bodies_a_module_meets_at_its_level() {
-    let db = Db::with_files(BODIES);
+    let db = fixture::db(BODIES).into_db();
     crate::attach_db(&db, || {
         let krate = workspace_crates(&db)[0];
         let listed = Plan::new(&db, &[krate], &every_body).listed();
@@ -155,7 +155,7 @@ fn unused() { let _: u32 = true; }
 
 #[test]
 fn a_type_error_nothing_reaches_still_fails_the_check() {
-    let db = Db::with_files(UNREACHED);
+    let db = fixture::db(UNREACHED).into_db();
     crate::attach_db(&db, || {
         let krate = workspace_crates(&db)[0];
         let [main, used, unused] = ["main", "used", "unused"].map(|it| function(&db, it));
@@ -179,7 +179,7 @@ fn d() {}
 #[test]
 fn reached_bodies_are_checked_before_the_others() {
     for order in [RunOrder::InOrder, RunOrder::Reversed, RunOrder::Strided(2)] {
-        let db = Db::with_files(FOUR);
+        let db = fixture::db(FOUR).into_db();
         let before = set_run_order(order);
         crate::attach_db(&db, || {
             let krate = workspace_crates(&db)[0];
@@ -202,7 +202,7 @@ fn reached_bodies_are_checked_before_the_others() {
 
 #[test]
 fn a_body_the_plan_does_not_list_is_passed_over() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 //- /dep.rs crate:dep library
@@ -210,7 +210,8 @@ pub fn there() { let _: u8 = (); }
 //- /main.rs crate:main deps:dep
 fn main() { dep::there(); }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let krate = workspace_crates(&db)[0];
         let [main, there] = ["main", "there"].map(|it| function(&db, it));

@@ -2286,7 +2286,7 @@ impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A
 mod tests {
     use hir_expand::name::Name;
     use intern::Symbol;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         ModuleId,
@@ -2305,7 +2305,7 @@ mod tests {
     /// Every round-0 key of the test crate, root first, in DFS preorder.
     fn keys(db: &TestDB) -> Vec<DeclKey> {
         let mut out = Vec::new();
-        let mut stack = vec![queries::root_decl(db, db.test_crate())];
+        let mut stack = vec![queries::root_decl(db, fixture::test_crate(db))];
         while let Some(key) = stack.pop() {
             out.push(key);
             stack.extend(queries::module_decls(db, key).children.iter().rev().copied());
@@ -2315,7 +2315,7 @@ mod tests {
 
     /// Replaying each module's round-0 log gives the scope its collection held at the end.
     fn assert_replay(fixture: &str) -> TestDB {
-        let db = TestDB::with_files(fixture);
+        let db = fixture::db(fixture).into_db();
         for key in keys(&db) {
             let decl = key.decl(&db);
             let decls = queries::module_decls(&db, key);
@@ -2328,7 +2328,7 @@ mod tests {
     }
 
     fn root_key(db: &TestDB) -> DeclKey {
-        queries::root_decl(db, db.test_crate())
+        queries::root_decl(db, fixture::test_crate(db))
     }
 
     fn child_key(db: &TestDB, parent: DeclKey, child: &str) -> DeclKey {

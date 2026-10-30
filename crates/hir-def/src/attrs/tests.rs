@@ -4,17 +4,16 @@ use base_db::Db;
 use either::Either;
 use hir_expand::{
     HirFileId, Lookup,
-    attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr, expand_cfg_attr_view},
+    attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr_view},
 };
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use span::Edition;
 use syntax::{
-    AstNode, AstPtr, Parse, SourceFile,
-    ast::{self, HasAttrs},
+    AstNode, AstPtr, Parse, SourceFile, ast,
     view::{self, AstNode as _, HasAttrs as _, HasName as _, Typed},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{
     AttrFlags, Completions, CrateAttrFlags, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier,
@@ -35,7 +34,9 @@ fn crate_attrs() {
     let fixture = r#"
 //- /lib.rs crate:foo crate-attr:no_std crate-attr:cfg(target_arch="x86")
         "#;
-    let (db, file_id) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     let module = db.module_for_file(file_id.file_id(&db));
     let attrs = AttrFlags::query(&db, AttrDefId::ModuleId(module));
     assert!(attrs.contains(AttrFlags::IS_NO_STD | AttrFlags::HAS_CFG));
@@ -161,7 +162,8 @@ fn old_match_attr_flags(
     match attr {
         ast::Meta::CfgMeta(_) => attr_flags.insert(AttrFlags::HAS_CFG),
         ast::Meta::KeyValueMeta(attr) => {
-            let Some(key) = attr.path().as_one_segment() else { return ControlFlow::Continue(()) };
+            let path = attr.path().map(|it| view_of(root, &it));
+            let Some(key) = path.as_one_segment() else { return ControlFlow::Continue(()) };
             match &*key {
                 "deprecated" => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                 "ignore" => attr_flags.insert(AttrFlags::IS_IGNORE),
@@ -171,7 +173,7 @@ fn old_match_attr_flags(
                 "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
                 "rustc_reservation_impl" => attr_flags.insert(AttrFlags::RUSTC_RESERVATION_IMPL),
                 "export_name" => {
-                    if let Some(value) = attr.value_string()
+                    if let Some(value) = view_of(root, &attr).value_string()
                         && *value == *"main"
                     {
                         attr_flags.insert(AttrFlags::IS_EXPORT_NAME_MAIN);
@@ -181,8 +183,9 @@ fn old_match_attr_flags(
             }
         }
         ast::Meta::TokenTreeMeta(attr) => {
+            let path = attr.path().map(|it| view_of(root, &it));
             let (Some((first_segment, second_segment)), Some(tt)) =
-                (attr.path().as_up_to_two_segment(), attr.token_tree())
+                (path.as_up_to_two_segment(), attr.token_tree())
             else {
                 return ControlFlow::Continue(());
             };
@@ -252,7 +255,8 @@ fn old_match_attr_flags(
                 attr_flags.insert(AttrFlags::IS_TEST);
             }
 
-            let Some((first_segment, second_segment)) = attr.path().as_up_to_two_segment() else {
+            let path = attr.path().map(|it| view_of(root, &it));
+            let Some((first_segment, second_segment)) = path.as_up_to_two_segment() else {
                 return ControlFlow::Continue(());
             };
             match second_segment {
@@ -341,7 +345,7 @@ fn old_match_attr_flags(
 
 /// The flags that gate a value query: set exactly where that query, reading the source, finds
 /// its attribute (a key-value or a word attribute whose path `is1` the name).
-fn gating_flags(meta: &ast::Meta) -> AttrFlags {
+fn gating_flags(root: view::Node<'_>, meta: &ast::Meta) -> AttrFlags {
     const KEY_VALUE: &[(&str, AttrFlags)] = &[
         ("export_name", AttrFlags::HAS_EXPORT_NAME),
         ("link_name", AttrFlags::HAS_LINK_NAME),
@@ -378,6 +382,7 @@ fn gating_flags(meta: &ast::Meta) -> AttrFlags {
         ast::Meta::TokenTreeMeta(meta) if meta.token_tree().is_some() => (meta.path(), TOKEN_TREE),
         _ => return AttrFlags::empty(),
     };
+    let path = path.map(|it| view_of(root, &it));
     let optimize_none = match meta {
         ast::Meta::TokenTreeMeta(meta) if path.is1("optimize") => {
             meta.token_tree().is_some_and(|tt| {
@@ -525,7 +530,7 @@ fn the_word_index_flags_every_attribute_as_the_string_match_did() {
         let mut new = AttrFlags::empty();
         let _ = match_attr_flags(&mut new, meta_in(&parse));
         assert_eq!(new - GATING, old, "{attr}");
-        assert_eq!(new & GATING, gating_flags(&old_meta), "{attr}");
+        assert_eq!(new & GATING, gating_flags(parse.root(), &old_meta), "{attr}");
     }
 }
 
@@ -587,7 +592,7 @@ fn gating_flags_of_known_shapes() {
 }
 
 fn functions(db: &TestDB) -> Vec<(String, FunctionId)> {
-    let def_map = crate_def_map(db, db.test_crate());
+    let def_map = crate_def_map(db, fixture::test_crate(db));
     let mut functions: Vec<_> = def_map
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
@@ -626,7 +631,7 @@ extern "C" {
 
 #[test]
 fn gated_queries_read_what_the_source_says() {
-    let db = TestDB::with_single_file(GATED).0;
+    let db = fixture::db(GATED).into_db();
     let functions = functions(&db);
     let by_name = |name: &str| {
         functions.iter().find(|(it, _)| it == name).unwrap_or_else(|| panic!("no fn {name}")).1
@@ -686,7 +691,7 @@ fn gated_queries_read_what_the_source_says() {
 
 #[test]
 fn field_flags_are_indexed_by_field() {
-    let db = TestDB::with_single_file(
+    let db = fixture::db(
         r#"
 pub struct S {
     #[cfg(any())] gone: u8,
@@ -696,8 +701,8 @@ pub struct S {
 }
 "#,
     )
-    .0;
-    let def_map = crate_def_map(&db, db.test_crate());
+    .into_db();
+    let def_map = crate_def_map(&db, fixture::test_crate(&db));
     let strukt = def_map
         .modules(&db)
         .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
@@ -718,7 +723,7 @@ pub struct S {
 
 #[test]
 fn inner_docs_of_a_fn_body() {
-    let db = TestDB::with_single_file(
+    let db = fixture::db(
         r#"
 /// outer
 pub fn documented() {
@@ -727,7 +732,7 @@ pub fn documented() {
 }
 "#,
     )
-    .0;
+    .into_db();
     let (_, func) = functions(&db).into_iter().find(|(name, _)| name == "documented").unwrap();
     let docs = AttrFlags::docs(&db, func.into()).expect("docs");
     assert!(docs.docs().contains("outer") && docs.docs().contains("inner"), "{:?}", docs.docs());
@@ -1122,7 +1127,7 @@ fn link_keeps_what_blaze_cannot_link() {
 
 #[test]
 fn rustc_words_are_flags() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #[rustc_insignificant_dtor]
 pub struct Insignificant;
@@ -1143,7 +1148,8 @@ extern "C" {
 #[a::rustc_as_ptr]
 pub fn two_segments() {}
 "#,
-    );
+    )
+    .into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let scope = def_map.module(&db, def_map.root).scope(&db);
     let flags = |name: &str| {
@@ -1196,7 +1202,7 @@ fn root_owners(db: &TestDB) -> Vec<AttrDefId> {
 /// Each word `has_word` answers by a flag gives what the walk of the source gives.
 #[test]
 fn has_word_flags_match_the_source() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #[marker] pub trait M {}
 #[automatically_derived] impl M for u8 {}
@@ -1211,7 +1217,8 @@ pub enum E { #[default] A, B }
 #[a::rustc_deny_explicit_impl] pub trait Q {}
 pub struct Plain;
 "#,
-    );
+    )
+    .into_db();
     let owners = root_owners(&db);
     for word in [
         "marker",
@@ -1241,7 +1248,7 @@ pub struct Plain;
 /// memo read and a bit test, no allocation.
 #[test]
 fn warm_attribute_lookups_allocate_nothing() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #![feature(lang_items)]
 #[repr(C)]
@@ -1260,7 +1267,8 @@ pub trait Sized {}
 #[export_name = "named"]
 pub fn f() {}
 "#,
-    );
+    )
+    .into_db();
     let (mut strukt, mut trait_, mut func) = (None, None, None);
     for owner in root_owners(&db) {
         match owner {
@@ -1307,7 +1315,7 @@ fn live_flags(db: &TestDB, owner: AttrDefId) -> AttrFlags {
 /// leaves out, keeps (an inner attribute may start them) or that are bodies themselves.
 #[test]
 fn outline_flags_are_the_live_flags() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #![doc(hidden)]
 #[inline] pub fn a() -> u32 { 1 }
@@ -1325,7 +1333,8 @@ pub const C: u8 = { 1 };
 pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
 #[automatically_derived] impl S { #[inline] pub fn method(&self) { let _ = 3; } }
 "#,
-    );
+    )
+    .into_db();
     let owners = root_owners(&db);
     for &owner in &owners {
         assert_eq!(AttrFlags::query(&db, owner), live_flags(&db, owner), "{owner:?}");
@@ -1377,7 +1386,9 @@ fn a_body_edit_runs_no_attribute_query() {
         }
         flags
     }
-    let (mut db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let before = read(&db);
     db.set_file_text(file.file_id(&db), &CODE.replace("{ 1 }", "{ 1 + 2 }"));
     let mut after = Vec::new();
@@ -1463,7 +1474,7 @@ mod file;
 /// body, a macro's expansion and the modules is in its column.
 #[test]
 fn column_flags_are_the_walked_flags() {
-    let db = TestDB::with_files(EVERY_OWNER);
+    let db = fixture::db(EVERY_OWNER).into_db();
     let owners = all_owners(&db);
     let mut cursor = CrateAttrFlags::new(&db);
     let mut in_columns = 0;
@@ -1494,7 +1505,7 @@ fn column_flags_are_the_walked_flags() {
 /// A warm column read, through the query or the cursor, allocates nothing.
 #[test]
 fn warm_column_reads_allocate_nothing() {
-    let db = TestDB::with_files(EVERY_OWNER);
+    let db = fixture::db(EVERY_OWNER).into_db();
     let owners = all_owners(&db);
     let read = || {
         let mut cursor = CrateAttrFlags::new(&db);
@@ -1524,9 +1535,11 @@ fn root_attrs_with_files(db: &TestDB, module: crate::ModuleId) -> Vec<(String, H
 
 #[test]
 fn crate_attrs_follow_the_roots_own() {
-    let (db, file_id) = TestDB::with_single_file(
+    let fx = fixture::db(
         "//- /lib.rs crate:foo crate-attr:feature(a) crate-attr:no_std\n#![doc(hidden)]\n",
     );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let files = base_db::crate_attr_files(&db, krate);
     assert_eq!(files.len(), 2);
@@ -1550,9 +1563,11 @@ fn crate_attrs_follow_the_roots_own() {
 /// A crate attribute rustc refuses is not applied and has its error; the others still are.
 #[test]
 fn a_refused_crate_attr_is_not_applied() {
-    let (db, file_id) = TestDB::with_single_file(
+    let fx = fixture::db(
         "//- /lib.rs crate:foo crate-attr:no_std crate-attr:a,b crate-attr:feature(x)\n",
     );
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let files = base_db::crate_attr_files(&db, krate);
     assert_eq!(files.len(), 3);
@@ -1567,18 +1582,19 @@ fn a_refused_crate_attr_is_not_applied() {
     assert!(flags.contains(AttrFlags::IS_NO_STD));
 }
 
-/// `AttrFlags::is_cfg_enabled_for` as it was, on handles.
+/// `AttrFlags::is_cfg_enabled_for` as it was: the first `cfg` of the expanded attributes that
+/// is off.
 fn old_is_cfg_enabled_for(
-    owner: &impl HasAttrs,
+    owner: view::AnyHasAttrs<'_>,
     cfg_options: &cfg::CfgOptions,
 ) -> Result<(), cfg::CfgExpr> {
-    let result = expand_cfg_attr(
-        ast::attrs_including_inner(owner),
+    let result = expand_cfg_attr_view(
+        view::attrs_including_inner(&owner),
         || cfg_options,
         |attr, _| {
-            if let ast::Meta::CfgMeta(attr) = attr
+            if let view::Meta::CfgMeta(attr) = attr
                 && let Some(cfg_predicate) = attr.cfg_predicate()
-                && let cfg = cfg::CfgExpr::parse_from_ast(cfg_predicate)
+                && let cfg = cfg::CfgExpr::parse_from_view(cfg_predicate)
                 && cfg_options.check(&cfg) == Some(false)
             {
                 ControlFlow::Break(cfg)
@@ -1593,10 +1609,11 @@ fn old_is_cfg_enabled_for(
     }
 }
 
-/// On views, `is_cfg_enabled_for` gives every attribute owner the answer, and stops at the
-/// `cfg`, the handle walk gave: through `cfg_attr` nests, inner attributes and fields.
+/// `is_cfg_enabled_for` gives every attribute owner the answer, and stops at the `cfg`, the
+/// walk over the expanded attributes gives: through `cfg_attr` nests, inner attributes and
+/// fields.
 #[test]
-fn is_cfg_enabled_for_views_as_handles() {
+fn is_cfg_enabled_for_as_the_expanded_walk() {
     let text = r#"
 #![cfg(x)]
 #[cfg(x)] fn a() {}
@@ -1621,10 +1638,10 @@ fn k<#[cfg(x)] 'a, #[cfg(y)] T>() { match () { #[cfg(y)] () => {} } }
     let mut cfg_options = cfg::CfgOptions::default();
     cfg_options.insert_atom(Symbol::intern("x"));
     let (mut owners, mut disabled) = (0, 0);
-    for handle in parse.tree().syntax().descendants().filter_map(ast::AnyHasAttrs::cast) {
-        let want = old_is_cfg_enabled_for(&handle, &cfg_options);
-        let got = AttrFlags::is_cfg_enabled_for(view_of(parse.root(), &handle), &cfg_options);
-        assert_eq!(got, want, "{}", handle.syntax());
+    for owner in parse.root().descendants().filter_map(view::AnyHasAttrs::cast) {
+        let want = old_is_cfg_enabled_for(owner, &cfg_options);
+        let got = AttrFlags::is_cfg_enabled_for(owner, &cfg_options);
+        assert_eq!(got, want, "{}", owner.syntax().text());
         owners += 1;
         disabled += usize::from(want.is_err());
     }
@@ -1646,7 +1663,7 @@ fn match_attr_flags_allocates_nothing() {
 mod stability {
     use hir_expand::Lookup;
     use intern::Symbol;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         AdtId, AttrDefId, DefWithBodyId, FieldId, ModuleDefId, ModuleId, VariantId,
@@ -1732,7 +1749,7 @@ mod stability {
 
     #[test]
     fn deprecation_is_inherited_from_the_definition_an_item_is_in() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #[deprecated(note = "old")]
 pub mod m {
@@ -1747,7 +1764,8 @@ pub fn k() { pub struct InK; }
 pub struct T { #[deprecated(since = "2.0", note = "field")] pub f: u8 }
 pub struct U;
 "#,
-        );
+        )
+        .into_db();
         let m = def(&db, "m");
         let s = def(&db, "m::S");
         let entry = deprecation_entry(&db, s).unwrap();
@@ -1782,7 +1800,7 @@ pub struct U;
 
     #[test]
     fn stability_is_inherited_when_unstable_or_by_a_field_or_variant() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #![feature(staged_api)]
 #![stable(feature = "root", since = "1.0.0")]
@@ -1804,7 +1822,8 @@ pub fn d() {}
 #[deprecated(since = "1.5.0")]
 pub fn without_note() {}
 "#,
-        );
+        )
+        .into_db();
         let m = stability(&db, def(&db, "m")).unwrap();
         let StabilityLevel::Unstable { issue, is_soft, .. } = &m.level else { panic!("{m:?}") };
         assert_eq!((m.feature.as_str(), *issue, *is_soft), ("m", None, true));
@@ -1847,7 +1866,7 @@ pub fn without_note() {}
 
     #[test]
     fn a_macros_own_stability_and_deprecation_inherit_nothing() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #![feature(staged_api)]
 #![stable(feature = "root", since = "1.0.0")]
@@ -1858,7 +1877,8 @@ pub mod m {
     macro_rules! old { () => {} }
 }
 "#,
-        );
+        )
+        .into_db();
         let m = def(&db, "m");
         let plain = macro_in(&db, m, "plain");
         assert_eq!(feature(&db, plain), Some("m"), "`stability` inherits the module's");
@@ -1874,7 +1894,7 @@ pub mod m {
 mod sanitize {
     use hir_expand::Lookup;
     use syntax::view::HasName;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         AssocItemId, DefWithBodyId, FunctionId, ModuleDefId,
@@ -1973,9 +1993,9 @@ pub mod m {
 
     #[test]
     fn disabled_sanitizers_take_the_nearest_sanitize_of_each_parent() {
-        let db = TestDB::with_single_file(FIXTURE).0;
+        let db = fixture::db(FIXTURE).into_db();
         let mut functions = Vec::new();
-        every_function(&db, crate_def_map(&db, db.test_crate()), &mut functions);
+        every_function(&db, crate_def_map(&db, fixture::test_crate(&db)), &mut functions);
         let off = |name: &str| {
             let (_, func) = functions
                 .iter()

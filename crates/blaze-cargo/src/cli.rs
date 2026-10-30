@@ -190,7 +190,7 @@ fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), Str
     let cwd = std::env::current_dir().map_err(|error| format!("the current directory: {error}"))?;
     let env = place::env(std::env::vars_os())?;
     let place = place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
-    let home = crate::cargo::home::cargo_home();
+    let home = blaze_registry::cargo_home();
     let files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
     let width = place::width(|name| std::env::var(name).ok(), io::stderr().is_terminal(), place::stderr_columns)?;
     let cargo = place::cargo(asked, &place, env, files, color, width)?;

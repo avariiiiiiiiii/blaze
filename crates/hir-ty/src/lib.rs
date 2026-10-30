@@ -42,6 +42,8 @@ pub mod const_valtree;
 pub mod consteval;
 pub mod coroutine_obligations;
 pub mod db;
+pub mod diagnostics;
+pub mod display;
 pub mod drop;
 pub mod dyn_compatibility;
 pub mod effects;

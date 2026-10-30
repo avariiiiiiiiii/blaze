@@ -18,12 +18,6 @@ pub(crate) struct Corpus {
     pub(crate) scratch: Option<String>,
     /// The `CARGO_HOME` the packages were fetched into and the build ran with.
     pub(crate) cargo_home: String,
-    /// The toolchain's own proc-macro server, of the pinned nightly.
-    pub(crate) server: Option<String>,
-    /// rustc's library of each proc-macro crate of the workspace by crate name
-    /// (`serde_derive`), built by the pinned nightly's cargo.
-    #[serde(default)]
-    pub(crate) dylibs: BTreeMap<String, String>,
     /// blaze's WebAssembly module of a proc-macro crate, by crate name, where one was built.
     #[serde(default)]
     pub(crate) wasm: BTreeMap<String, String>,
@@ -41,15 +35,7 @@ impl Corpus {
         serde_json::from_str(&text).map_err(|error| format!("{VAR}: {error}"))
     }
 
-    pub(crate) fn server(&self) -> Result<&str, String> {
-        self.server.as_deref().ok_or_else(|| format!("{VAR} names no `server`: the toolchain's proc-macro server"))
-    }
-
     pub(crate) fn scratch(&self) -> Result<&str, String> {
         self.scratch.as_deref().ok_or_else(|| format!("{VAR} names no `scratch`: a built copy of the workspace to change"))
-    }
-
-    pub(crate) fn dylib(&self, krate: &str) -> Result<&str, String> {
-        self.dylibs.get(krate).map(String::as_str).ok_or_else(|| format!("{VAR} names no rustc library of `{krate}` in `dylibs`"))
     }
 }

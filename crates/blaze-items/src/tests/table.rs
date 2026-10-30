@@ -2,7 +2,7 @@
 //! facts they were made of.
 
 use blaze_ids::ContentId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{edit, items, single};
 use crate::{
@@ -124,7 +124,7 @@ pub const C: u32 = 1;
 fn g() { fn inner() {} }
 "#,
     );
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let columns = owned(crate_hashes(&db, krate));
     assert_eq!(&columns, crate_hashes(&db, krate));
     assert!(columns.unhashable().is_empty(), "{:?}", columns.unhashable());
@@ -169,7 +169,7 @@ pub fn f(s: &S) -> u32 { s.x }
 fn g() { fn inner() {} }
 "#,
     );
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let before = owned(crate_hashes(&db, krate));
     edit(
         &mut db,

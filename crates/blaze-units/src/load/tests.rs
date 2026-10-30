@@ -701,6 +701,43 @@ fn the_tests_opt_ins_are_the_manifests() {
     );
 }
 
+// A package's const macros as the plan carries them: the file its `[package.metadata.blaze]`
+// names, absolute, once the workspace turns the experiment on; refused while it is off.
+#[test]
+fn a_packages_const_macros_are_its_manifests() {
+    let fixture = Fixture::new();
+    let root = |experimental: &str| {
+        format!(
+            "[workspace]\nmembers = [\"a\", \"c\"]\nresolver = \"3\"\n\n[workspace.metadata.blaze]\n\
+             experimental = [{experimental}]\n"
+        )
+    };
+    let package = |name: &str, extra: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}");
+    let a = package("a", "\n[package.metadata.blaze]\nconst-macros = \"src/macros.rs\"\n");
+    let c = package("c", "");
+    let on = root("\"const-macros\"");
+    let files = [
+        ("ws/Cargo.toml", on.as_str()),
+        ("ws/a/Cargo.toml", a.as_str()),
+        ("ws/a/src/lib.rs", ""),
+        ("ws/a/src/macros.rs", ""),
+        ("ws/c/Cargo.toml", c.as_str()),
+        ("ws/c/src/lib.rs", ""),
+    ];
+    let units = ready(fixture.plan(fixture.open(&ask(&files))));
+    let of = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap();
+    assert_eq!(of("a").const_macros.as_deref(), Some("/home/u/ws/a/src/macros.rs"));
+    assert_eq!(of("c").const_macros, None);
+
+    let off = root("");
+    let files = [("ws/Cargo.toml", off.as_str()), ("ws/a/Cargo.toml", a.as_str()), ("ws/a/src/lib.rs", ""), ("ws/c/Cargo.toml", c.as_str()), ("ws/c/src/lib.rs", "")];
+    let error = failed(fixture.plan(fixture.open(&ask(&files))));
+    assert!(
+        error.starts_with("`const-macros` under [package.metadata.blaze] in /home/u/ws/a/Cargo.toml is an experiment"),
+        "{error}"
+    );
+}
+
 // The load's warm path: a file query found, the plan found, and the plan of an unchanged build
 // in a new view verified, none allocating.
 #[test]

@@ -19,9 +19,9 @@ from pathlib import Path
 RB = Path("/root/rb")
 SRC, BIN, CTREE = RB / "src", RB / "bin", RB / "c"
 PATCH = {"a": None, "b": RB / "body.patch", "c": RB / "sig.patch"}
-CRATES = ["hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
-          "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "hir-ide", "ide-diagnostics"]
-# Stack overflows of blaze-built hir-ide (selfhost lane's), skipped in both arms.
+CRATES = ["hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-cargo", "blaze-engine",
+          "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "ide-diagnostics"]
+# Stack overflows of blaze-built hir-ty-mir (selfhost lane's), skipped in both arms.
 SKIP = ["--", "--skip", "infer_std_crash_5", "--skip", "recursive_vars"]
 BOUND = 4 * 3600
 SPEC = "blaze+https://blaze-gateway.indexable.workers.dev/t/rcache-test/v3"

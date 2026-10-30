@@ -232,6 +232,45 @@ fn in_scope() -> bool {
     RELOCATION.with(|slot| slot.borrow().is_some())
 }
 
+thread_local! {
+    /// What the [`anonymous`] scope this thread is in leaves out, if it is in one.
+    static ANONYMOUS: RefCell<Option<Anonymous>> = const { RefCell::new(None) };
+}
+
+/// What an [`anonymous`] scope writes as the empty name: every binding's and label's name, and
+/// for each path of the store (by its index in the store's paths) its first `blank[i]`
+/// segments, whose meaning the caller hashes as what they resolve to. A path past `blank` is
+/// written whole. Each literal expression of `slots` (raw expression ids, sorted) is written as
+/// a slot: its kind and type, not its value.
+#[derive(Default)]
+pub(crate) struct Anonymous {
+    pub(crate) blank: Vec<u16>,
+    pub(crate) slots: Vec<u32>,
+}
+
+/// Runs `f` with what [`Words`] writes anonymous as `it` says. Scopes do not nest. Only a
+/// write that is hashed, never read back, may be anonymous: it does not round-trip.
+pub(crate) fn anonymous<T>(it: &mut Anonymous, f: impl FnOnce() -> T) -> T {
+    stdx::lend(&ANONYMOUS, it, f)
+}
+
+/// Whether names of bindings and labels are written empty.
+pub(crate) fn names_blank() -> bool {
+    ANONYMOUS.with(|slot| slot.borrow().is_some())
+}
+
+/// How many leading segments of the store's path `at` are written empty.
+pub(crate) fn blank_segments(at: usize) -> usize {
+    ANONYMOUS.with(|slot| {
+        slot.borrow().as_ref().map_or(0, |it| it.blank.get(at).map_or(0, |&n| usize::from(n)))
+    })
+}
+
+/// `f` of the [`Anonymous::slots`] of the scope this thread is in, empty outside one.
+pub(crate) fn with_slots<T>(f: impl FnOnce(&[u32]) -> T) -> T {
+    ANONYMOUS.with(|slot| f(slot.borrow().as_ref().map_or(&[][..], |it| &it.slots[..])))
+}
+
 blaze_format::record! {
     /// One element of an arena: which of its type's variants it is, and the word its fields
     /// begin at.

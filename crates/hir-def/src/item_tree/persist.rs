@@ -944,14 +944,15 @@ mod tests {
         Edition, EditionedFileId, ErasedFileAstId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor,
         SyntaxContext, TextRange, TextSize,
     };
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
-    use crate::test_db::TestDB;
 
     fn round_trip_fixture(fixture: &str) {
-        let (db, file_id) = TestDB::with_single_file(fixture);
-        let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+        let fx = fixture::db(fixture);
+        let file_id = fx.only_file();
+        let db = fx.into_db();
+        let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
         assert_round_trip(tree);
     }
 
@@ -1204,14 +1205,16 @@ fn f() {}
 
     #[test]
     fn a_corrupted_buffer_is_refused() {
-        let (db, file_id) = TestDB::with_single_file(
+        let fx = fixture::db(
             r#"
 extern "C" { fn f(); }
 pub(in crate::m) fn g() {}
 use a::{b, c};
 "#,
         );
-        let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+        let file_id = fx.only_file();
+        let db = fx.into_db();
+        let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
         assert_round_trip(tree);
         let bytes = blaze_format::to_bytes(tree);
         let buffer = blaze_format::Aligned::copy_from(&bytes);
@@ -1269,8 +1272,10 @@ use a::{b, c};
 
     #[test]
     fn a_corrupted_token_tree_is_refused() {
-        let (db, file_id) = TestDB::with_single_file("#[custom(a, b)] fn f() {}");
-        let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+        let fx = fixture::db("#[custom(a, b)] fn f() {}");
+        let file_id = fx.only_file();
+        let db = fx.into_db();
+        let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
         assert_round_trip(tree);
         let bytes = blaze_format::to_bytes(tree);
         let buffer = blaze_format::Aligned::copy_from(&bytes);

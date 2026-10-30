@@ -8,7 +8,7 @@ use hir_def::{
     signatures::{FunctionSignature, TraitSignature},
 };
 use rustc_type_ir::{BoundConstness, ClauseKind, inherent::IntoKind as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     ImplTraitId,
@@ -31,7 +31,7 @@ const fn make() -> impl [const] Tr + Plain {}
 "#;
 
 fn declarations(db: &Db) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .collect()
@@ -79,7 +79,7 @@ fn has_host_effect(clauses: &[Clause<'_>]) -> bool {
 
 #[test]
 fn an_associated_type_and_an_opaque_imply_their_const_bounds() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         let tr = trait_named(&db, "Tr");
         let out = trait_named(&db, "Holder")

@@ -37,14 +37,13 @@ index 72e3f00b40..a8367248cc 100644
          symbols::__empty
      }
  
-diff --git a/crates/test-fixture/src/lib.rs b/crates/test-fixture/src/lib.rs
-index 3c895457d5..965db7884e 100644
---- a/crates/test-fixture/src/lib.rs
-+++ b/crates/test-fixture/src/lib.rs
-@@ -1055,7 +1055,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
+diff --git a/crates/hir-expand/src/fixture.rs b/crates/hir-expand/src/fixture.rs
+--- a/crates/hir-expand/src/fixture.rs
++++ b/crates/hir-expand/src/fixture.rs
+@@ -1027,7 +1027,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
+         fn modify_leaf(leaf: &mut Leaf) {
+             match leaf {
                  Leaf::Literal(it) => {
-                     // XXX Currently replaces any literals with an empty string, but supporting
-                     // "shortening" other literals would be nice.
 -                    it.text_and_suffix = Symbol::empty();
 +                    it.text_and_suffix = Symbol::empty("fixture");
                      it.suffix_len = 0;

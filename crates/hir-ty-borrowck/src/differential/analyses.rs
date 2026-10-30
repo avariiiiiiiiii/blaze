@@ -22,7 +22,7 @@ use hir_ty::{
     mir::{LocalId, MirBody, MirSpan, OperandKind, PlaceElem, StatementKind, TerminatorKind},
     next_solver::DbInterner,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::old;
 use crate::{
@@ -245,7 +245,9 @@ struct Compared {
 
 /// Compares the analyses on every body of every function of `fixture` that borrowck checks.
 fn compare_fixture(fixture: &str) -> Vec<Compared> {
-    let (db, _) = Db::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut compared = Vec::new();
         for (name, def) in budget::functions(&db) {
@@ -632,7 +634,9 @@ const DIAGNOSED: &[(&str, Diagnosed, &[&str])] = &[
 #[test]
 fn borrowck_reports_rustcs_codes_at_rustcs_spans_in_both_modes() {
     for &(fixture, diagnosed, unused_mut) in DIAGNOSED {
-        let (db, _) = Db::with_single_file(fixture);
+        let fx = fixture::db(fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
         hir_ty::attach_db(&db, || {
             for (name, def) in budget::functions(&db) {
                 let declared = |after: char| fixture.contains(&format!("fn {name}{after}"));

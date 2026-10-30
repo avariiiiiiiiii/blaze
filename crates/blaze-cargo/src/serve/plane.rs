@@ -101,7 +101,7 @@ impl Fresh {
 pub enum Happened<T> {
     /// What a thread task's expansions put, for the store's one owner to keep: before the
     /// task's [`Happened::Did`] and its node's settling.
-    Kept { id: NodeId, puts: Vec<blaze_expand::Put> },
+    Kept { id: NodeId, puts: Vec<proc_macro_api::kept::Put> },
     /// A thread task's value, before its node settles.
     Did { id: NodeId, value: T },
     /// A thread task was posted: it starts.
@@ -127,7 +127,7 @@ pub struct Ran<T> {
     /// whose tasks take no time.
     pub ran_ns: u64,
     /// What the task's expansions left for the store's owner to keep.
-    pub puts: Vec<blaze_expand::Put>,
+    pub puts: Vec<proc_macro_api::kept::Put>,
 }
 
 pub enum Ended<T> {
@@ -254,14 +254,14 @@ fn run_measured<W: Work>(
     work: &W,
     arg: u32,
     readers: W::Readers,
-) -> (Option<Ended<W::Value>>, u64, u64, Vec<blaze_expand::Put>) {
+) -> (Option<Ended<W::Value>>, u64, u64, Vec<proc_macro_api::kept::Put>) {
     let start = Instant::now();
     let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work.run(arg, readers))));
     let ran_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     match result {
         Ok(None) => (None, peak, ran_ns, Vec::new()),
-        Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, blaze_expand::take_puts()),
-        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, ran_ns, blaze_expand::take_puts()),
+        Ok(Some(did)) => (Some(Ended::Did(did)), peak, ran_ns, proc_macro_api::kept::take_puts()),
+        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, ran_ns, proc_macro_api::kept::take_puts()),
     }
 }
 
@@ -733,9 +733,9 @@ mod tests {
 
     use super::*;
 
-    fn put(what: &str) -> blaze_expand::Put {
+    fn put(what: &str) -> proc_macro_api::kept::Put {
         let id = ContentId::of("blaze-cargo plane test put", what.as_bytes());
-        blaze_expand::Put {
+        proc_macro_api::kept::Put {
             run: RunKey { code: id, given: id },
             traced: Traced::default(),
             value: what.as_bytes().to_vec(),
@@ -744,7 +744,7 @@ mod tests {
     }
 
     /// Puts of other tests may come with a take as orphans: only this test's are compared.
-    fn ours<'a>(puts: &'a [blaze_expand::Put], prefix: &str) -> Vec<&'a str> {
+    fn ours<'a>(puts: &'a [proc_macro_api::kept::Put], prefix: &str) -> Vec<&'a str> {
         puts.iter().map(|it| it.what.as_str()).filter(|it| it.starts_with(prefix)).collect()
     }
 
@@ -798,10 +798,10 @@ mod tests {
             let gave_way = gave_way.clone();
             move |_| {
                 if !gave_way.swap(true, Ordering::AcqRel) {
-                    blaze_expand::put(put("plane-a before"));
+                    proc_macro_api::kept::put(put("plane-a before"));
                     return None;
                 }
-                blaze_expand::put(put("plane-a after"));
+                proc_macro_api::kept::put(put("plane-a after"));
                 built(0)
             }
         }));
@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn a_task_that_reads_and_gave_way_leaves_its_puts_for_the_next_take() {
         let work = Arc::new(Each(|_| {
-            blaze_expand::put(put("plane-b gave way"));
+            proc_macro_api::kept::put(put("plane-b gave way"));
             None
         }));
         let task = Posting { id: NodeId(8), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: true };
@@ -829,7 +829,7 @@ mod tests {
         runner.take(&mut ran);
         let [Ran { ended: Ended::GaveWay { .. }, puts, .. }] = ran.as_slice() else { panic!("the task gives way") };
         assert!(puts.is_empty());
-        assert_eq!(ours(&blaze_expand::take_puts(), "plane-b"), ["plane-b gave way"]);
+        assert_eq!(ours(&proc_macro_api::kept::take_puts(), "plane-b"), ["plane-b gave way"]);
     }
 
     type Asked = Vec<(TaskKind, Option<Key>)>;

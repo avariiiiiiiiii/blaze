@@ -9,7 +9,7 @@ use blaze_api::{Edit, EditedItem, How, Target};
 use blaze_items::{ItemKey, key::Resolved};
 use blaze_vfs::Op;
 use syntax::{Edition, NodeOrToken, SourceFile, SyntaxKind};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{applied, assert_fresh, db::TestDB, roots};
 use crate::{Applied, Files, apply};
@@ -67,7 +67,9 @@ impl Files for View {
 }
 
 fn view(fixture: &str, paths: &[&str]) -> (TestDB, View) {
-    let (db, files) = TestDB::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     assert_eq!(files.len(), paths.len());
     let files = files
         .iter()

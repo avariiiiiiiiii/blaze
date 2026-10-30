@@ -1319,7 +1319,7 @@ fn project_json_to_crate_graph(
 }
 
 /// The name a package's const macros depend on blaze's copy of `const-ast` by, the views they
-/// read a flat syntax tree with (`hir_ide::const_macro::CONST_AST_NAME`).
+/// read a flat syntax tree with (`hir_ty_mir::const_macro::CONST_AST_NAME`).
 pub const CONST_AST_CRATE: &str = "const_ast";
 
 /// Whether a package of `cargo` has const macros.
@@ -1329,7 +1329,7 @@ fn has_const_macros(cargo: &CargoWorkspace) -> bool {
 
 /// Where the crate graph of a workspace of `sysroot` has blaze's copy of `const-ast`, the crate
 /// every package's const macros depend on: a directory of the sysroot that is not on disk, whose
-/// files the loader is given the text of (`hir_ide::const_macro::CONST_AST`).
+/// files the loader is given the text of (`hir_ty_mir::const_macro::CONST_AST`).
 pub fn const_ast_dir(sysroot: &Sysroot) -> Option<AbsPathBuf> {
     Some(sysroot.root()?.join("lib/rustlib/blaze/const-ast"))
 }

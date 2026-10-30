@@ -81,7 +81,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent), str(HERE.parent.parent)]
@@ -558,19 +558,19 @@ def json_line(line: str) -> dict[str, Any] | None:
         value: Any = json.loads(line)
     except ValueError:
         return None
-    return value if isinstance(value, dict) else None
+    return cast(dict[str, Any], value) if isinstance(value, dict) else None
 
 
 def error_key(diagnostic: Any) -> str | None:
     """The key of a diagnostic (rustc's JSON shape) that is an error; None for anything else."""
     if not isinstance(diagnostic, dict):
         return None
-    d: dict[str, Any] = diagnostic
+    d = cast(dict[str, Any], diagnostic)
     message = d.get("message")
     if d.get("level") != "error" or not isinstance(message, str) or message.startswith("aborting due to"):
         return None
     code = d.get("code")
-    name = code.get("code") if isinstance(code, dict) else None
+    name: Any = cast(dict[str, Any], code).get("code") if isinstance(code, dict) else None
     return key_of(name if isinstance(name, str) else None, message)
 
 
@@ -593,7 +593,7 @@ def messages_of(stdout: str) -> Messages:
         if m is None:
             continue
         target: Any = m.get("target")
-        name: Any = target.get("name") if isinstance(target, dict) else None
+        name: Any = cast(dict[str, Any], target).get("name") if isinstance(target, dict) else None
         if m.get("reason") == "compiler-message" and (key := error_key(m.get("message"))):
             every.add(key)
             if isinstance(name, str):

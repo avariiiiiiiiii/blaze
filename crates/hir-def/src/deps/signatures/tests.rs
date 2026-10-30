@@ -2,7 +2,7 @@ use std::sync::Mutex;
 
 use blaze_format::Aligned;
 use rustc_hash::{FxHashMap, FxHashSet};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{
@@ -157,7 +157,7 @@ impl ImageStore for Memory {
 
 /// A store with the images of a fresh database of `fixture`, every dependency written.
 fn stored(fixture: &str) -> Memory {
-    let mut db = TestDB::with_files(fixture);
+    let mut db = fixture::db(fixture).into_db();
     let memory = Memory::default();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
@@ -169,7 +169,7 @@ fn stored(fixture: &str) -> Memory {
 
 /// A fresh database of `fixture` reading every dependency from `memory`, in `mode`.
 fn served_db(fixture: &str, memory: &Memory, mode: Mode) -> TestDB {
-    let mut db = TestDB::with_files(fixture);
+    let mut db = fixture::db(fixture).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, memory, mode).unwrap();
     assert!(served.hits.contains(&crate_named(&db, "lib")));
@@ -288,7 +288,7 @@ fn signatures_with_blocks_read_back() {
 fn the_part_is_the_same_bytes_in_every_database() {
     for fixture in [FIXTURE, BLOCKS] {
         let part = || {
-            let db = TestDB::with_files(fixture);
+            let db = fixture::db(fixture).into_db();
             encode(&db, crate_named(&db, "lib"), &mut Vec::new())
         };
         let first = part();
@@ -420,7 +420,7 @@ where
 
 #[test]
 fn a_relocated_store_reads_back_as_it_was() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let krate = crate_named(&db, "lib");
     let mut relocated = 0;
     for item in items(&db, krate) {
@@ -465,7 +465,7 @@ fn a_relocated_store_reads_back_as_it_was() {
 /// names no id is the same bytes inside one.
 #[test]
 fn a_store_outside_a_relocation_is_written_as_before() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let krate = crate_named(&db, "lib");
     for item in items(&db, krate) {
         let (store, source_map) = match item {
@@ -536,7 +536,7 @@ fn function_f(db: &TestDB) -> FunctionId {
 /// `memory` with the image of `lib` in a database of `fixture`, its signatures part replaced
 /// by `part`.
 fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
     let image = memory.images.lock().unwrap()[&key].clone();
@@ -547,7 +547,7 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
 
 /// The signatures part of `lib` in a fresh database of `fixture`.
 fn part_of(fixture: &str) -> Vec<u8> {
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     encode(&db, crate_named(&db, "lib"), &mut Vec::new()).unwrap()
 }
 
@@ -598,7 +598,7 @@ fn a_signatures_part_that_does_not_open_is_corrupt() {
 
 #[test]
 fn a_record_of_another_query_is_refused() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let krate = crate_named(&db, "lib");
     let f = function_f(&db);
     let what = Item::Function(f).what();
@@ -618,7 +618,7 @@ fn a_key_names_one_item_and_is_the_same_in_every_database() {
         let keys = items.iter().map(|&item| key::of(db, item).unwrap().1).collect();
         (keys, distinct.len())
     };
-    let (keys, items) = keys_of(&TestDB::with_files(FIXTURE));
+    let (keys, items) = keys_of(&fixture::db(FIXTURE).into_db());
     assert_eq!(keys.len(), items, "one key per item");
-    assert_eq!(keys_of(&TestDB::with_files(FIXTURE)).0, keys);
+    assert_eq!(keys_of(&fixture::db(FIXTURE).into_db()).0, keys);
 }

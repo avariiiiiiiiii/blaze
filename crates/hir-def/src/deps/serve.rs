@@ -47,7 +47,7 @@ pub trait ImageStore: Sync {
 
     /// The hash of the values that the names `shape` an expansion server encoded (an
     /// `ExpansionReads::Traced` shape) have now, as the server hashed them when the expansion
-    /// ran: `blaze_expand::reads_now`. A variable is the calling crate's (`env`, what the
+    /// ran: `proc_macro_api::kept::reads_now`. A variable is the calling crate's (`env`, what the
     /// expansion was given) before the process's. `Err` when one of them can't be read.
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String>;
 

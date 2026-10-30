@@ -1,6 +1,6 @@
 use base_db::all_crates;
 use rustc_hash::FxHashMap;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{MacroReachable, Reached, macro_reach_module};
 use crate::{
@@ -125,7 +125,7 @@ fn main_def_map(db: &TestDB) -> &DefMap {
 
 #[test]
 fn only_an_opaque_macro_of_a_module_takes_part() {
-    let db = TestDB::with_files(CRATE);
+    let db = fixture::db(CRATE).into_db();
     let def_map = main_def_map(&db);
     let names = Names::of(&db, &[def_map]);
     let blocks = body_blocks(&db, names.function("g"));
@@ -142,7 +142,7 @@ fn only_an_opaque_macro_of_a_module_takes_part() {
 
 #[test]
 fn a_plain_macro_rules_takes_no_part() {
-    let db = TestDB::with_files(CRATE);
+    let db = fixture::db(CRATE).into_db();
     let def_map = main_def_map(&db);
     let rules = def_map
         .module(&db, def_map.root_module_id())
@@ -158,7 +158,7 @@ fn a_plain_macro_rules_takes_no_part() {
 /// each later one the next ancestor, until the crate root has been walked.
 #[test]
 fn each_pass_walks_one_module_further_up() {
-    let db = TestDB::with_files(CRATE);
+    let db = fixture::db(CRATE).into_db();
     let def_map = main_def_map(&db);
     let names = Names::of(&db, &[def_map]);
     let defining = macro_reach_module(&db, names.macros["mac"]).unwrap();
@@ -184,7 +184,7 @@ fn each_pass_walks_one_module_further_up() {
 /// modules the first did again, asking what its own module can see.
 #[test]
 fn walked_modules_are_kept_per_macros_module() {
-    let db = TestDB::with_files(CRATE);
+    let db = fixture::db(CRATE).into_db();
     let def_map = main_def_map(&db);
     let names = Names::of(&db, &[def_map]);
     let m = names.module("m");

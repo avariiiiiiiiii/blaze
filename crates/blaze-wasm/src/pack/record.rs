@@ -11,16 +11,13 @@ use hir_expand::proc_macro::{
     CrateProcMacros, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
     ProcMacros,
 };
-use ide_db::{
-    RootDatabase,
-    base_db::{Crate, CrateOrigin, Db, Env, salsa::Setter as _},
-};
+use base_db::{Crate, CrateOrigin, Db, Env, salsa::Setter as _};
 use intern::Symbol;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
 use project_model::{CargoConfig, CfgOverrides, ProjectManifest, ProjectWorkspace, RustLibSource};
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::Span;
-use vfs::AbsPathBuf;
+use base_db::AbsPathBuf;
 
 use super::{Call, Dep, Expansion, Expansions, File, Kind, Krate, Macro, Origin, Pack, Root};
 
@@ -67,7 +64,7 @@ impl ProcMacroExpander for Recorder {
     fn expand_in(
         &self,
         db: &Db,
-        calling_crate: ide_db::base_db::Crate,
+        calling_crate: base_db::Crate,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -123,7 +120,7 @@ impl Recorder {
     }
 }
 
-fn name(db: &RootDatabase, krate: Crate) -> Option<String> {
+fn name(db: &Db, krate: Crate) -> Option<String> {
     krate.extra_data(db).display_name.as_ref().map(|it| it.to_string())
 }
 
@@ -134,7 +131,7 @@ pub fn record(
     project: &Path,
     target: &str,
     main: &str,
-    expand: impl FnOnce(&RootDatabase, &[Crate]),
+    expand: impl FnOnce(&Db, &[Crate]),
     // dyn: an error, once per pack recorded.
 ) -> Result<Pack, Box<dyn std::error::Error>> {
     // The program links against what cargo built, so its crates are configured as cargo's.
@@ -157,8 +154,6 @@ pub fn record(
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: true,
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
-        prefill_caches: false,
-        num_worker_threads: 1,
         proc_macro_processes: 1,
     };
     let mut workspace = ProjectWorkspace::load(manifest, &cargo_config)?;
@@ -167,14 +162,14 @@ pub fn record(
     let (mut db, vfs, _server) = load_workspace(workspace, &cargo_config.extra_env, &load_config)?;
 
     // The crates of the program, dependencies first.
-    let all = ide_db::base_db::all_crates(&db);
+    let all = base_db::all_crates(&db);
     let program = *all
         .iter()
         .find(|&&it| it.data(&db).origin.is_local() && name(&db, it).as_deref() == Some(main))
         .ok_or_else(|| format!("no crate `{main}` in the workspace"))?;
     let mut crates = Vec::new();
     let mut seen = FxHashSet::default();
-    fn visit(db: &RootDatabase, krate: Crate, seen: &mut FxHashSet<Crate>, out: &mut Vec<Crate>) {
+    fn visit(db: &Db, krate: Crate, seen: &mut FxHashSet<Crate>, out: &mut Vec<Crate>) {
         if seen.insert(krate) {
             // Of a proc macro crate only what its macros expand to is needed.
             let deps = &krate.data(db).dependencies;
@@ -208,7 +203,7 @@ pub fn record(
             (
                 krate,
                 triomphe::Arc::new(CrateProcMacros::new(
-                    macros.ok_or_else(|| ide_db::base_db::ProcMacroLoadingError::NotYetBuilt),
+                    macros.ok_or_else(|| base_db::ProcMacroLoadingError::NotYetBuilt),
                 )),
             )
         })

@@ -15,7 +15,7 @@ use hir_ty::{
     },
 };
 use salsa::plumbing::AsId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{TestDB, edit, item, items, single, table::every_kind};
 use crate::{
@@ -78,7 +78,7 @@ pub trait B {}
 #[test]
 fn the_crate_key_changes_when_a_lang_item_moves() {
     let (mut db, file) = single(LANG_ON_A);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let trait_of = |db: &TestDB, path: &str| match item(db, path) {
         ItemId::Trait(it) => it,
         other => panic!("`{path}` is {other:?}"),
@@ -182,7 +182,7 @@ fn a_read_of_an_items_query_stands_for_its_signature() {
     assert_eq!(read("ItemBounds::of", alias.as_id()), signature(ItemId::Trait(tr)), "its trait");
     assert_eq!(read("fn_sig_for_fn", f.as_id()), signature(ItemId::Function(f)));
 
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let target = read("target_data_layout_query", krate.as_id());
     assert_eq!(target, Some(Fact::Target(key::crate_key(&db, krate))));
     assert_eq!(target, Some(crate::target(&db, krate)));
@@ -215,7 +215,7 @@ impl Tr for S { fn f() {} }
 #[test]
 fn a_read_of_the_impls_of_a_trait_stands_for_its_implements_fact() {
     let (db, _) = single(SPECIALIZING);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let ItemId::Trait(tr) = item(&db, "Tr") else { panic!("`Tr` is no trait") };
     let adt = |path: &str| match item(&db, path) {
         ItemId::Adt(it) => HirSimplifiedType::Adt(it.into()),
@@ -271,7 +271,7 @@ fn a_read_of_the_impls_of_a_trait_stands_for_its_implements_fact() {
 #[test]
 fn a_read_of_specialization_stands_for_its_fact() {
     let (db, _) = single(SPECIALIZING);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let all: Vec<ImplId> = items(&db)
         .into_iter()
         .filter_map(|it| match it {
@@ -304,7 +304,9 @@ pub struct M;
 
 #[test]
 fn the_crate_key_changes_when_the_crate_loads_another() {
-    let (mut db, files) = TestDB::with_many_files(LOADS);
+    let fx = fixture::db(LOADS);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let main_file = files[1].file_id(&db);
     let main = *base_db::all_crates(&db)
         .iter()
@@ -338,7 +340,9 @@ fn crate_named(db: &TestDB, name: &str) -> base_db::Crate {
 
 #[test]
 fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
-    let (mut db, files) = TestDB::with_many_files(CRATES);
+    let fx = fixture::db(CRATES);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let [dep_root, notes, _, other_root] = [0, 1, 2, 3].map(|at| files[at].file_id(&db));
     let (main, dep, other) =
         (crate_named(&db, "main"), crate_named(&db, "dep"), crate_named(&db, "other"));
@@ -378,7 +382,7 @@ fn a_crate_fact_changes_with_its_dependencies_files_and_cfg_alone() {
 fn a_facts_value_is_the_one_its_parts_read_back_to() {
     let (db, _) = single(ITEMS);
     let Fixture { imp, .. } = fixture(&db);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     for fact in [Fact::Signature(item_key(&db, ItemId::Impl(imp))), crate::target(&db, krate)] {
         assert_eq!(Goals.value(&db, fact_ref(&fact)), value(&db, &fact).ok(), "{fact:?}");
         assert!(Goals.value(&db, fact_ref(&fact)).is_some(), "{fact:?}");
@@ -414,7 +418,7 @@ pub type T = u8;
 fn a_facts_value_is_one_query() {
     let (db, _) = single(ITEMS);
     let Fixture { imp, f, .. } = fixture(&db);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     for fact in [
         Fact::Signature(item_key(&db, ItemId::Impl(imp))),
         Fact::Signature(item_key(&db, ItemId::Function(f))),
@@ -487,7 +491,7 @@ mod old {
 #[test]
 fn a_lang_items_key_is_the_one_each_old_copy_gave() {
     let (db, _) = single(LANG_OF_EACH_KIND);
-    let lang = lang_items(&db, db.test_crate());
+    let lang = lang_items(&db, fixture::test_crate(&db));
     let mut seen = 0;
     for item in hir_def::lang_item::LangItemEnum::ALL {
         let Some(target) = item.from_lang_items(lang) else { continue };

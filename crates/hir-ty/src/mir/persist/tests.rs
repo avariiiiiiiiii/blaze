@@ -24,7 +24,7 @@ use la_arena::{Arena, ArenaMap};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::Ty as _;
 use smallvec::smallvec;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{MirRoot, SCHEMA, idx, read, write};
 use crate::{
@@ -56,8 +56,7 @@ pub fn owner(s: S) -> u32 { let c = |y: u32| y + s.a; c(1) }
 "#;
 
 fn db() -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+    let db = fixture::db(FIXTURE).into_db();
     db
 }
 
@@ -498,11 +497,11 @@ fn all_bin_ops() -> [BinOp; 20] {
 }
 
 fn written(db: &Db, body: &MirBody<'_>) -> Vec<u8> {
-    write(db, body).expect("the sample body has a word for everything")
+    write(db, body, None).expect("the sample body has a word for everything")
 }
 
 fn read_back<'db>(db: &'db Db, bytes: &[u8]) -> Result<MirBody<'db>, FormatError> {
-    read(db, &Aligned::copy_from(bytes))
+    read(db, &Aligned::copy_from(bytes), None)
 }
 
 #[test]
@@ -585,17 +584,18 @@ fn a_description_lowering_does_not_make_is_refused() {
     let it = items(&db);
     let mut body = sample(&db, &it);
     body.unreachable_after_calls[0].descr = "statement";
-    assert!(write(&db, &body).is_err());
+    assert!(write(&db, &body, None).is_err());
 }
 
 #[test]
-fn an_allocation_into_a_static_is_refused_in_a_relocating_scope() {
+fn an_allocation_into_a_static_is_relocated_in_a_relocating_scope() {
     let db = db();
     let it = items(&db);
     let body = sample(&db, &it);
     let mut table = crate::check_cache::ids::Table::default();
-    let written = crate::check_cache::ids::relocating(&mut table, || write(&db, &body));
-    assert_eq!(written.unwrap_err(), "an allocation pointing into a static");
+    let relocated = crate::check_cache::ids::relocating(&mut table, || write(&db, &body, None))
+        .expect("a static an allocation points into is written by its place in the table");
+    assert_ne!(relocated, written(&db, &body), "the static is by its table index, not its salsa bits");
 }
 
 /// Where the words column starts in `bytes`, and how many bytes it has.
@@ -716,8 +716,8 @@ fn a_read_allocates_only_the_body_it_makes() {
     let body = sample(&db, &it);
     let bytes = Aligned::copy_from(&written(&db, &body));
     // Warm: every type, projection and allocation is interned already, as after a first read.
-    drop(read(&db, &bytes).unwrap());
-    let (again, used) = measure(|| read(&db, &bytes).unwrap());
+    drop(read(&db, &bytes, None).unwrap());
+    let (again, used) = measure(|| read(&db, &bytes, None).unwrap());
     assert_eq!(again, body);
     // The reader's own: the type table's places and the allocations' slots. Each allocation
     // read is made whole (its bytes and its map's columns) before interning finds it.

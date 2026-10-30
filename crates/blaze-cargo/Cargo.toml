@@ -67,7 +67,6 @@ blaze-lints.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
-blaze-expand.workspace = true
 blaze-global.workspace = true
 blaze-graph.workspace = true
 blaze-history.workspace = true
@@ -88,9 +87,7 @@ blaze-registry = { path = "../blaze-registry" }
 blaze-source.workspace = true
 blaze-build-script = { path = "../blaze-build-script" }
 cargo-util-schemas = "=0.14.3"
-ide-db.workspace = true
 project-model.workspace = true
-vfs.workspace = true
 triomphe.workspace = true
 paths.workspace = true
 syntax.workspace = true
@@ -151,7 +148,7 @@ blaze-codegen.workspace = true
 blaze-testsel.workspace = true
 blaze-lazy.workspace = true
 blaze-link.workspace = true
-load-cargo.workspace = true
+blaze-lower.workspace = true
 base-db.workspace = true
 crossbeam-channel.workspace = true
 # `extended`: the `mi_collect` binding.

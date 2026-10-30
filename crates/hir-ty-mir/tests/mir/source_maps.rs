@@ -5,7 +5,7 @@
 
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::{MirOptLevel, MirOptions};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -84,7 +84,9 @@ fn place_of(text: &str, needle: &str) -> (u32, u32) {
 
 #[test]
 fn lowering_a_body_builds_no_source_map() {
-    let (db, _) = TestDB::with_single_file(PLAIN);
+    let fx = fixture::db(PLAIN);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, "add");
         let executed = db.log_executed(|| {
@@ -99,7 +101,9 @@ fn lowering_a_body_builds_no_source_map() {
 
 #[test]
 fn evaluating_a_constant_without_location_macros_builds_no_source_map() {
-    let (db, _) = TestDB::with_single_file(PLAIN);
+    let fx = fixture::db(PLAIN);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let executed = db.log_executed(|| {
             assert_eq!(bytes(&db, "GOAL"), 6u32.to_le_bytes());
@@ -110,7 +114,9 @@ fn evaluating_a_constant_without_location_macros_builds_no_source_map() {
 
 #[test]
 fn evaluating_line_and_column_builds_no_source_map() {
-    let (db, _) = TestDB::with_single_file(PLACED);
+    let fx = fixture::db(PLACED);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let executed = db.log_executed(|| {
             bytes(&db, "LINE");
@@ -122,7 +128,9 @@ fn evaluating_line_and_column_builds_no_source_map() {
 
 #[test]
 fn location_macros_are_where_they_are_written() {
-    let (db, file) = TestDB::with_single_file(PLACED);
+    let fx = fixture::db(PLACED);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let written = file.file_id(&db);
     let source = db.file_text(written).text(&db).to_string();
     let (line, _) = place_of(&source, "line!();");

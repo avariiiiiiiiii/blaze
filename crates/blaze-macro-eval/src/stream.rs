@@ -5,12 +5,12 @@
 //! a space (`print.rs`).
 //!
 //! A stream is the call's input, made from the database's tree ([`Stream::of_call`]), or what
-//! the client built of trees it was given back. The output goes back as the tree blaze-expand
+//! the client built of trees it was given back. The output goes back as the tree the kept layer
 //! writes ([`Stream::into_top`]).
 
 use std::rc::Rc;
 
-use blaze_expand::bridge::wire;
+use proc_macro_api::bridge::wire;
 use intern::Symbol;
 use span::Span;
 
@@ -158,7 +158,7 @@ impl Stream {
         }])
     }
 
-    /// The tree blaze-expand reads an output as: the stream's one group, or the stream in a
+    /// The tree the kept layer reads an output as: the stream's one group, or the stream in a
     /// group without delimiters at `call_site` (`wire::top_subtree`, as the wasm host gives
     /// its output back).
     pub(crate) fn into_top(self, call_site: Span) -> tt::TopSubtree {
@@ -311,7 +311,7 @@ fn leaf_tree(leaf: tt::Leaf) -> Tree {
     }
 }
 
-/// A stream as blaze-expand's trees, for the output.
+/// A stream as the bridge's trees, for the output.
 fn wire_trees(stream: Stream) -> Vec<wire::Tree> {
     // alloc: the output, made once per expansion that runs.
     let mut out = Vec::with_capacity(stream.trees().len());

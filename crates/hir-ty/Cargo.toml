@@ -68,7 +68,8 @@ blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-test-fixture.workspace = true
+expect-test.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree"]

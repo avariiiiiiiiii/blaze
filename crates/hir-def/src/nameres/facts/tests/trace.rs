@@ -10,7 +10,7 @@
 use base_db::Db;
 use rustc_hash::FxHashSet;
 use salsa::plumbing::FromId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{Exempt, compare_db, new_crate_local_def_map};
 use crate::{
@@ -113,7 +113,9 @@ fn set(paths: &[&str]) -> FxHashSet<String> {
 /// A database of [`FIXTURE`] with the new map collected, then `file` set to `text`: the
 /// resolver queries the next collection executes.
 fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, salsa::Id)>) {
-    let (mut db, files) = TestDB::with_many_files(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     new_crate_local_def_map(&db, krate);
     let file_id = files[file].file_id(&db);
@@ -175,7 +177,9 @@ fn a_negative_fact_flips_when_the_name_appears() {
 
 #[test]
 fn a_negative_fact_holds_before_the_name_appears() {
-    let (db, _) = TestDB::with_many_files(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let map = new_crate_local_def_map(&db, krate).def_map(&db);
     let (b_id, b) = map
@@ -204,7 +208,9 @@ fn an_edit_inside_a_body_reruns_no_resolver_query() {
 #[test]
 fn removing_a_read_name_reruns_its_reader() {
     // `b` reads `a::foo` once it exists; removing it again flips the fact back.
-    let (mut db, files) = TestDB::with_many_files(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     let a = files[A].file_id(&db);
     db.set_file_text(a, "pub struct A;\npub fn helper() { let _ = 0; }\npub fn foo() {}\n");

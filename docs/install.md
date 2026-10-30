@@ -79,9 +79,9 @@ cargo +nightly-2026-10-25 install --locked blaze-engine
 
 This compiles blaze from source with the nightly it is pinned to, which takes a few minutes (blaze
 is built and tested with that nightly only; `rustup toolchain install nightly-2026-10-25` gets
-it), and puts three
-programs in `~/.cargo/bin`: `blaze`, `blaze-engine` (blaze's engine) and `blaze-rustc`. They find each other by being in the same directory, so
-keep them together.
+it), and puts two
+programs in `~/.cargo/bin`: `blaze` and `blaze-engine`, the same program under the name blaze's
+tooling knows it by.
 `cargo binstall blaze-engine` installs a release's build instead of compiling it.
 
 ## With Nix

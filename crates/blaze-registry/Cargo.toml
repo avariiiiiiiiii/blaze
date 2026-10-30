@@ -31,7 +31,9 @@ sha2 = "0.10"
 flate2 = "1"
 tar = { version = "0.4.46", default-features = false }
 filetime = "0.2.29"
-blaze-store.workspace = true
+# Where `.crate` files are kept, by their sha256.
+blaze-cas.workspace = true
+blaze-ids.workspace = true
 # The configuration credentials are read from, as cargo's `GlobalContext` holds it.
 blaze-manifest.workspace = true
 toml.workspace = true

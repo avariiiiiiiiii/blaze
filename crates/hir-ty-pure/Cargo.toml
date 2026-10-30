@@ -36,7 +36,7 @@ span.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]
 workspace = true

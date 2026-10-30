@@ -18,7 +18,7 @@ use hir_expand::{
 };
 use intern::Symbol;
 use span::Edition;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AdtId, Lookup, ModuleDefId, ModuleId,
@@ -529,7 +529,9 @@ fn gen_path(rng: &mut SplitMix64) -> ModPath {
 /// in every mode and shadow mode, with `resolve_path_fp_with_macro` and with the reference.
 /// Returns how many lookups resolved something.
 fn check_fixture(fixture: &str, paths: &mut impl FnMut() -> Vec<ModPath>) -> usize {
-    let (db, position) = TestDB::with_position(fixture);
+    let fx = fixture::db(fixture);
+    let position = fx.position();
+    let db = fx.into_db();
     let db = &db;
     let block_module = db.module_at_position(position);
     let krate = block_module.krate(db);
@@ -663,7 +665,7 @@ fn three_segment_lookup(db: &TestDB) -> (&DefMap, &LocalDefMap, ModPath) {
 
 #[test]
 fn one_probe_per_segment() {
-    let db = TestDB::with_files(THREE_SEGMENTS);
+    let db = fixture::db(THREE_SEGMENTS).into_db();
     let (map, local, path) = three_segment_lookup(&db);
     let mut reads = Vec::new();
     let res = map.resolve_path_fp_recording(
@@ -696,7 +698,7 @@ fn one_probe_per_segment() {
 
 #[test]
 fn resolved_path_allocates_nothing() {
-    let db = TestDB::with_files(THREE_SEGMENTS);
+    let db = fixture::db(THREE_SEGMENTS).into_db();
     let (map, local, path) = three_segment_lookup(&db);
     let resolve = || {
         Res::from(map.resolve_path_fp_with_macro(
@@ -760,7 +762,9 @@ pub mod prelude {
 /// and out to its crate): 0 allocations.
 #[test]
 fn every_shape_of_resolved_path_allocates_nothing() {
-    let (db, position) = TestDB::with_position(SHAPES);
+    let fx = fixture::db(SHAPES);
+    let position = fx.position();
+    let db = fx.into_db();
     let db = &db;
     let block_module = db.module_at_position(position);
     let pair = crate_local_def_map(db, block_module.krate(db));

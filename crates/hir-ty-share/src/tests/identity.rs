@@ -28,7 +28,7 @@ use rustc_type_ir::{
     PatternKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{TestDB, alias, declarations, function};
 use crate::{code, identity, is_plain_data};
@@ -606,7 +606,7 @@ fn old_is_plain_data<'db>(
 }
 
 fn fixture(text: &str) -> TestDB {
-    TestDB::with_single_file(&format!("//- minicore: {MINICORE}\n{text}")).0
+    fixture::db(&format!("//- minicore: {MINICORE}\n{text}")).into_db()
 }
 
 /// The types of the corpus: each type alias's, then the type of each local of each function.
@@ -682,7 +682,7 @@ fn the_identity_tells_apart_what_both_old_spellings_did() {
 fn constants_and_argument_lists_agree_with_the_old_spellings() {
     let db = fixture(CORPUS);
     hir_ty::attach_db(&db, || {
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(&db);
         let konsts: Vec<Const<'_>> =
             [0, 1, 1, 2, u32::MAX as u128].map(|it| usize_const(&db, Some(it), krate)).to_vec();
         let names: Vec<String> = konsts.iter().map(|it| format!("{it:?}")).collect();
@@ -731,7 +731,9 @@ fn coroutine_local<'db>(db: &'db TestDB, func: &str) -> Ty<'db> {
 /// spelling and the one change, and share's old one did not (the missed input).
 #[test]
 fn a_coroutines_identity_holds_its_binding_names() {
-    let (mut db, file) = TestDB::with_single_file(&format!("//- minicore: {MINICORE}\n{ASYNC}"));
+    let fx = fixture::db(&format!("//- minicore: {MINICORE}\n{ASYNC}"));
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let file = file.file_id(&db);
     let spelled = |db: &TestDB| {
         hir_ty::attach_db(db, || {
@@ -757,7 +759,7 @@ fn a_coroutines_identity_holds_its_binding_names() {
 fn is_plain_data_is_the_code_generators() {
     let db = fixture(CORPUS);
     hir_ty::attach_db(&db, || {
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate };

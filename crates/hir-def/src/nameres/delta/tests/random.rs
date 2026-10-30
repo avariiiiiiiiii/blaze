@@ -19,9 +19,9 @@ use std::{
 use blaze_ids::rng::SplitMix64;
 use hegel::generators as gs;
 use hegel::{Hegel, Settings, TestCase};
+use hir_expand::fixture;
 use span::FileId;
-use test_fixture::ChangeFixture;
-use test_utils::{FixtureWithProjectMeta, MiniCore};
+use test_utils::FixtureWithProjectMeta;
 
 use super::{Loaded, check_db, facts_exempt, summary};
 use crate::nameres::facts::tests::{
@@ -273,13 +273,9 @@ fn all_fixtures() -> &'static [(String, &'static str, Exempt)] {
         let mut out = Vec::new();
         for &(file, source) in NAMERES.iter().chain(MACRO_EXPANSION) {
             for fixture in fixtures(file, source) {
-                // `ChangeFixture` panics on text it can't read as a fixture; that literal is not one.
+                // `fixture::db` panics on text it can't read as a fixture; that literal is not one.
                 let loads = panic::catch_unwind(|| {
-                    drop(ChangeFixture::parse_with_proc_macros(
-                        fixture.text,
-                        MiniCore::RAW_SOURCE,
-                        extra_proc_macros(),
-                    ))
+                    drop(fixture::db_with_proc_macros(fixture.text, extra_proc_macros()))
                 })
                 .is_ok();
                 if !loads {

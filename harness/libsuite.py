@@ -13,8 +13,8 @@ macro it is in, whose users go in a later round. What was deleted is counted by 
 that deleted it and written to `<work>/<suite>/pruned.json`. Nothing is rewritten: a test either
 runs as the Rust project wrote it or is not there.
 
-The package that is left is then given to cratetest.py, which builds each test binary with
-rustc and again with blaze's objects in front, runs both and compares every test by name.
+The package that is left is then given to cratetest.py, which builds each test binary the
+mixed way with blaze's objects in front, runs it and judges every test by its own result.
 """
 import argparse, collections, json, os, re, shutil, subprocess, sys
 

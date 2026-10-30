@@ -186,13 +186,12 @@ step that ends its use lands. A
 project's own pin does not change which Rust blaze builds with
 ([#269](https://github.com/indexable-inc/blaze/issues/269)). blaze's manifest reader, registry,
 resolver and unit graph (`crates/blaze-manifest`, `blaze-registry`, `blaze-resolve`,
-`blaze-units`) replace `cargo metadata`, `cargo build --unit-graph` and cargo's fetching, held
-equal to cargo's by `harness/resolve.py`; with them K needs no cargo to plan a build. Since
-2026-10-27 the standard library's workspace is read by them too (`OwnMetadata.library`,
-`harness/resolve.py sysroot`), a workspace load's questions of the toolchain and configuration
+`blaze-units`) replace `cargo metadata`, `cargo build --unit-graph` and cargo's fetching (held
+equal to cargo's by `harness/resolve.py` until it was deleted, 2026-10-30); with them K needs no cargo to plan a build. Since
+2026-10-27 the standard library's workspace is read by them too (`OwnMetadata.library`), a workspace load's questions of the toolchain and configuration
 (`cargo --version`, `cargo config get` in TOML for rust-analyzer and the rustflags `plan.rs`
 reads, `cargo rustc --print cfg` and `target-spec-json`) are blaze's
-(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest, `resolve.py toolchain`), and
+(`crates/blaze-cargo/src/answers/cargo.rs` over blaze-manifest), and
 `plan.rs` plans each load from blaze-units' graph with no `cargo build --unit-graph`
 (`resolve.py units`); and a load's build scripts and proc macros are built and run by blaze
 over that graph, with no `cargo check --compile-time-deps` (`cargo/compile_time.rs`,
@@ -583,12 +582,12 @@ enable`. What stays with cargo for now: what the frontend turns down as unsuppor
 link that failed). An error in a file written before the worker loaded the workspace is blaze's
 too since 2026-10-23: the worker leaves it beside its socket and every build of the checkout
 fails with it until a source is written. The lints followed: a lint the source denies fails the
-build for the eight lints `harness/lints_ui.py` finds rust-analyzer reports only where rustc does
+build for the eight lints `harness/lints_ui.py` (deleted 2026-10-30) found rust-analyzer reports only where rustc does
 (on rustc's UI tests that deny or forbid a lint, 2026-10-23: non_snake_case 31 right, 0 wrong,
 9 missed; non_camel_case_types 22, 0, 2; unused_must_use 14, 0, 30; non_upper_case_globals 9,
 0, 4; deprecated_safe_2024 3, 0, 0; elided_lifetimes_in_paths 1, 0, 0; unsafe_op_in_unsafe_fn
 1, 0, 0; the same against 1.99.0 and the nightly of 2026-10-09). The last three have few UI
-tests, so `harness/lints_probes` has a unit for each place they apply (a parameter, a return
+tests, so `harness/lints_probes` had a unit for each place they apply (a parameter, a return
 type, a `let`, a closure, a trait method, a macro, an `unsafe fn`, editions 2021 and 2024; 85
 units with the brace lints): elided_lifetimes_in_paths 25, 0, 6; unsafe_op_in_unsafe_fn 10, 0,
 1; deprecated_safe_2024 8, 0, 2. Five had been wrong first: rust-analyzer's case rules were
@@ -597,7 +596,7 @@ rustc's of an old commit, its `unused_must_use` looked into `if` and `match` arm
 before 2024) in an `unsafe fn` for the lint, which rustc reports there only where
 `unsafe_op_in_unsafe_fn` is not allowed. The eighth, since 2026-10-24, is `unused_mut`, which
 the borrow checker gives and `BLAZE_BORROWCK_REFUSE=0` turns off with its errors. Few UI tests
-deny it, so `lints_ui.py --deny unused_mut` scores it on every UI test, each read with
+deny it, so `lints_ui.py --deny unused_mut` scored it on every UI test, each read with
 `#![deny(unused_mut)]` first: 51 right, 0 wrong, 5 missed against the nightly of 2026-10-09
 (6,446 units in scope), 49, 0, 5 against 1.99.0, and 71, 0, 3 on its 25 units in
 `harness/lints_probes` (closures, `mut self`, patterns, `ref mut`, later assignment, autoref,
@@ -609,7 +608,7 @@ its `inout` registers were not mutated, and a body whose array length fails to e
 linted, which rustc's is not. The misses are in macro expansions and that body's length.
 None of the eight is denied by default, so the level
 is the source's, which only `--cap-lints` and `--force-warn` undo; with either among the flags
-no lint fails a build. A lint in what a macro expands to does not, and `lints_ui.py` does not
+no lint fails a build. A lint in what a macro expands to does not, and `lints_ui.py` did not
 count one (rustc reports it in the macro's definition). The other lints are not blaze's
 verdict yet: a crate that denies one rust-analyzer does not find runs code rustc turns down.
 Those with the most errors in rustc's UI tests are `dead_code` (294), `explicit_outlives_requirements`
@@ -661,8 +660,8 @@ before, 41 after, 11 compiles both times).
 Owner of bun's classes: the `bun-e` lane (2026-10-22). It compiles what bun leaves to rustc
 today: `adt_const_params` constants, `core::mem::type_info`, inherent associated types,
 `lol_html`'s macros, `core`'s methods in `no_std` crates and the rest of #35's table, plus what
-bun's whole-program report finds after them. Each class lands with its `bun_repros.py` fixture
-(#75) expecting `compiled`. Done when bun's whole-program report (`runbench.py bun`) leaves no
+bun's whole-program report finds after them. Each class landed with its `bun_repros.py` fixture
+(#75, deleted 2026-10-30) expecting `compiled`. Done when bun's whole-program report (`runbench.py bun`) leaves no
 function to rustc but those step G removes ("no rustc symbol"). On Linux x86-64 it leaves none
 (2026-10-22, `857eab0e9b`: 68,315 functions compiled, the program links and each of
 `apps.json`'s runs matches cargo's); macOS arm64 is to be run again.
@@ -1074,9 +1073,9 @@ Where J stands (2026-10-24):
 - `BLAZE_PROC_MACRO_COMPARE` (`crates/blaze-expand/src/compare.rs`) names that server, and
   `BLAZE_PROC_MACRO_LIBS` a directory of blaze's libraries: each call the toolchain's server
   expands with rustc's library is expanded again by blaze's server with blaze's library of
-  the crate, and the outputs, spans included, are compared. `harness/macroserver.py` builds
+  the crate, and the outputs, spans included, are compared. `harness/macroserver.py` (deleted 2026-10-30) built
   the server and the libraries of serde_derive, thiserror-impl, tokio-macros and clap_derive,
-  and holds every call of a package of derives with helper attributes, attributes and
+  and held every call of a package of derives with helper attributes, attributes and
   function-like macros equal (on dev-aws-11: the server linked in 10.6 s, each library in
   11-14 s). A proc-macro crate has no entry point: rust-analyzer took tokio's
   `#[proc_macro_attribute] pub fn main` for one.
@@ -1089,7 +1088,7 @@ Where J stands (2026-10-24):
   library blaze links names libc, as rustc's does. A crate rustc compiles there that links
   one (a proc macro that uses another, as `serde_with_macros` uses `darling_macro`, or a
   build script's dependency) has rustc compile the proc macro again over blaze's, as rustc
-  loads only its own; blaze's is kept beside its record. `macroserver.py all` builds fd,
+  loads only its own; blaze's is kept beside its record. `macroserver.py all` built fd,
   bat, hyperfine, just, nushell and helix whole that way and again with rustc's proc macros
   and the toolchain's server, each from an empty store, and expands every call with both
   (on dev-aws-8): 3,465 calls (3,192 derives, 149 attributes, 124 function-like), all the
@@ -1106,7 +1105,7 @@ Where J stands (2026-10-24):
   macro is compiled again by rustc. A script or proc macro blaze cannot build, or a proc
   macro with no server beside blaze, fails the load with why. A crate cargo built before the
   directory was seeded from it is described from cargo's records. `BLAZE_PROC_MACRO_SERVER=0`
-  is kept for `macroserver.py`'s reference build alone, which rustc builds whole, into a
+  was kept for `macroserver.py`'s reference build alone, which rustc built whole, into a
   directory of its own (`target/rust-analyzer-rustc`): cargo does not fingerprint the
   variable, and in one directory rustc read the empty files (#460). The variable is part of
   which build and worker it is, so the daemon never keeps the mode it was started with. On blaze's
@@ -1126,8 +1125,8 @@ Where J stands (2026-10-24):
   once) and expands with that; one blaze cannot make is said and left to rustc's library
   and the toolchain's server. A library is kept in the store by the description of what it
   was linked from and the digests of the files its dep-info names, so a second target
-  directory takes it from there. `macroserver.py all` builds each app a third time, into an
-  empty target directory over the first build's store, and fails if a library is linked
+  directory takes it from there. `macroserver.py all` built each app a third time, into an
+  empty target directory over the first build's store, and failed if a library is linked
   again: 3,465 calls the same on all three, every library from the store the third time
   (hyperfine 35.1 s to 9.5 s, nushell 123.0 s to 79.3 s). On fd, the daemon's load started
   blaze's server and no other, and made `clap_derive` in 19 s from an empty store, then took
@@ -1195,7 +1194,7 @@ build`, no rustc base. See [the cold start](#the-cold-start-without-rustc).
   reads what it printed as cargo does, and links each proc macro for blaze's server. It fills
   project-model's `OwnBuildScripts` hook, as `OwnMetadata` does for `cargo metadata`; what it
   cannot build or run fails the load, naming the package. `harness/resolve.py ctdeps`
-  ([resolve.md](resolve.md)) holds what the load reads (cfgs, variables, `OUT_DIR`'s files,
+  (deleted 2026-10-30) held what the load reads (cfgs, variables, `OUT_DIR`'s files,
   the proc macros) to cargo's: equal on 10 of the 14, and on fd too with the build-script
   sandbox off, whose environment is not cargo's ([resolve.md](resolve.md)); biome
   stops at a syn-1 proc macro blaze cannot compile (#327), and zed and bun fail for both, at a

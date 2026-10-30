@@ -13,7 +13,7 @@ use hir_ty_mir::mir::{
     Evaluator, MirEvalError,
     foreign::{Claimed, Foreign},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{db::TestDB, function};
 
@@ -100,7 +100,9 @@ fn u32_of(bytes: &[u8]) -> u32 {
 
 /// Runs `test` with an evaluator of `PROGRAM`'s `owner` and the database.
 fn with_evaluator(owner: &str, test: impl FnOnce(&TestDB, Evaluator<'_>)) {
-    let (db, _) = TestDB::with_single_file(PROGRAM);
+    let fx = fixture::db(PROGRAM);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let owner = function(&db, owner);
         let eval = Evaluator::new(&db, owner.into(), false, None).expect("an evaluator");
@@ -200,7 +202,7 @@ fn the_budget_is_the_embedders() {
 #[test]
 fn changed_statics_are_reported_from_their_preset() {
     with_evaluator("bump", |db, mut eval| {
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(&db);
         let count = hir_def::test_items::static_item(db, krate, "COUNT");
         let ptr = hir_def::test_items::static_item(db, krate, "PTR");
         eval.track_statics();

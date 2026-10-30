@@ -3,7 +3,7 @@
 
 use hir_ty::{db::HirDatabase, next_solver::GenericArgs};
 use hir_ty_mir::mir::location::name_sources;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{constant, db::TestDB};
 
@@ -32,7 +32,9 @@ fn goal(db: &TestDB) -> String {
 
 #[test]
 fn file_follows_the_names_the_build_gives() {
-    let (mut db, _) = TestDB::with_single_file(PROGRAM);
+    let fx = fixture::db(PROGRAM);
+    let _ = fx.only_file();
+    let mut db = fx.into_db();
     goal(&db);
     name_sources(&mut db, "first", |_, _| Some("src/first.rs".to_owned()));
     assert_eq!(goal(&db), "src/first.rs");
@@ -42,7 +44,9 @@ fn file_follows_the_names_the_build_gives() {
 
 #[test]
 fn the_same_key_is_the_same_naming() {
-    let (mut db, _) = TestDB::with_single_file(PROGRAM);
+    let fx = fixture::db(PROGRAM);
+    let _ = fx.only_file();
+    let mut db = fx.into_db();
     name_sources(&mut db, "build", |_, _| Some("src/lib.rs".to_owned()));
     assert_eq!(goal(&db), "src/lib.rs");
     name_sources(&mut db, "build", |_, _| Some("src/other.rs".to_owned()));
@@ -51,7 +55,9 @@ fn the_same_key_is_the_same_naming() {
 
 #[test]
 fn each_file_gets_its_own_name() {
-    let (mut db, file) = TestDB::with_single_file(PROGRAM);
+    let fx = fixture::db(PROGRAM);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let named = file.file_id(&db);
     name_sources(&mut db, "build", move |_, file| (file == named).then(|| "src/lib.rs".to_owned()));
     assert_eq!(goal(&db), "src/lib.rs");

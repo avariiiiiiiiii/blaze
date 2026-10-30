@@ -13,6 +13,7 @@ use blaze_hashcons::Interned;
 use blaze_mem::Frame;
 
 use crate::{
+    consteval::discriminants::enum_discriminants,
     db::HirDatabase,
     layout::{
         InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
@@ -68,7 +69,7 @@ fn layout_of_adt_in(
         AdtId::StructId(s) => Some(struct_flags(db, s)),
         AdtId::UnionId(_) | AdtId::EnumId(_) => None,
     };
-    let (repr, niche_optimizations, enum_variants) = match def {
+    let (repr, niche_optimizations, discriminants) = match def {
         AdtId::StructId(s) => {
             push_variant(s.into())?;
             // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
@@ -80,12 +81,12 @@ fn layout_of_adt_in(
             } else {
                 NicheOptimizations::Enabled
             };
-            (AttrFlags::repr(db, s.into()).unwrap_or_default(), niches, &[][..])
+            (AttrFlags::repr(db, s.into()).unwrap_or_default(), niches, None)
         }
         AdtId::UnionId(id) => {
             let repr = AttrFlags::repr(db, id.into());
             push_variant(id.into())?;
-            (repr.unwrap_or_default(), NicheOptimizations::Enabled, &[][..])
+            (repr.unwrap_or_default(), NicheOptimizations::Enabled, None)
         }
         AdtId::EnumId(e) => {
             let variants = enum_variant_ids(db, e);
@@ -93,7 +94,7 @@ fn layout_of_adt_in(
                 push_variant(v.into())?;
             }
             let repr = AttrFlags::repr(db, e.into()).unwrap_or_default();
-            (repr, NicheOptimizations::Enabled, variants)
+            (repr, NicheOptimizations::Enabled, Some(enum_discriminants(db, e)))
         }
     };
     let maybe_unsized = match def {
@@ -112,9 +113,8 @@ fn layout_of_adt_in(
             matches!(def, AdtId::EnumId(..)),
             niche_optimizations,
             |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
-            enum_variants.iter().enumerate().filter_map(|(index, &v)| {
-                let d = db.const_eval_discriminant(v).ok()?;
-                Some((RustcEnumVariantIdx(index), discr_size.truncate(d as u128)))
+            discriminants.iter().flat_map(|it| it.iter()).enumerate().filter_map(|(index, d)| {
+                Some((RustcEnumVariantIdx(index), discr_size.truncate(d.ok()? as u128)))
             }),
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?

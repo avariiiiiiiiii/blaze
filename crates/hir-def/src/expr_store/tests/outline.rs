@@ -5,7 +5,7 @@ use base_db::{Crate, all_crates};
 use hir_expand::name::Name;
 use span::Edition;
 use syntax::FlatTree;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AssocItemId, DefWithBodyId, ModuleDefId,
@@ -63,10 +63,11 @@ pub mod m {
 /// The same code as a library crate, whose file is an outline, and as the crate that uses it,
 /// whose file is parsed whole.
 fn db() -> TestDB {
-    TestDB::with_files(&format!(
+    fixture::db(&format!(
         "//- /dep.rs crate:dep new_source_root:library\n{CODE}\n\
          //- /main.rs crate:main deps:dep new_source_root:local\n{CODE}\n"
     ))
+    .into_db()
 }
 
 fn krate(db: &TestDB, name: &str) -> Crate {

@@ -283,17 +283,17 @@ mod tests {
     use expect_test::{Expect, expect};
     use itertools::Itertools;
     use span::Edition;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
-        test_db::TestDB, upvars::upvars_mentioned,
+        upvars::upvars_mentioned,
     };
 
     #[track_caller]
     fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
-        let db = TestDB::with_files(ra_fixture);
-        let def_map = crate_def_map(&db, db.test_crate());
+        let db = fixture::db(ra_fixture).into_db();
+        let def_map = crate_def_map(&db, fixture::test_crate(&db));
         let func = def_map
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations())
@@ -336,8 +336,8 @@ mod tests {
     /// As [`check`], without the closures' ranges: each closure with upvars, in source order.
     #[track_caller]
     fn check_names(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
-        let db = TestDB::with_files(ra_fixture);
-        let def_map = crate_def_map(&db, db.test_crate());
+        let db = fixture::db(ra_fixture).into_db();
+        let def_map = crate_def_map(&db, fixture::test_crate(&db));
         let func = def_map
             .modules(&db)
             .flat_map(|(_, module)| module.scope(&db).declarations())

@@ -87,6 +87,7 @@ fn package(id: &str, name: &str, dir: &str) -> PackagePlan {
         default_run: None,
         checksum: None,
         tests: TestSandbox::default(),
+        const_macros: None,
     }
 }
 

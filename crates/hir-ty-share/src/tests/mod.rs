@@ -21,7 +21,7 @@ use hir_ty::{
     next_solver::{GenericArg, GenericArgs, ParamEnv},
 };
 use hir_ty_mir::mir::{monomorphized, monomorphized_args, print_mir_body};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     BodyOptions, Class, OptionsSet, ShareDef, ShareInstance, ShareKey, Unshared, classify,
@@ -121,11 +121,11 @@ pub fn pong<T>(n: u32) -> u32 { if n == 0 { 1 } else { ping::<T>(n - 1) } }
 "#;
 
 fn fixture() -> TestDB {
-    TestDB::with_single_file(&format!("//- minicore: {MINICORE}\n{PROGRAM}")).0
+    fixture::db(&format!("//- minicore: {MINICORE}\n{PROGRAM}")).into_db()
 }
 
 fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .collect()
@@ -173,7 +173,7 @@ enum Arg {
 }
 
 fn instance<'db>(db: &'db TestDB, func: &str, args: &[Arg]) -> ShareInstance {
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(db);
     let args: Vec<GenericArg<'db>> = args
         .iter()
         .map(|arg| match *arg {
@@ -188,7 +188,7 @@ fn instance<'db>(db: &'db TestDB, func: &str, args: &[Arg]) -> ShareInstance {
 }
 
 fn env(db: &TestDB) -> hir_ty::traits::StoredParamEnvAndCrate {
-    ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: db.test_crate() }.store()
+    ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: fixture::test_crate(db) }.store()
 }
 
 fn key_at(

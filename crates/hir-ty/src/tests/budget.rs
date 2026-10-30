@@ -7,7 +7,7 @@ use blaze_alloc_count::{assert_at_most, measure};
 use blaze_mem::{Tag, frame};
 use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
 use salsa::{Database, Durability};
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use crate::{InferenceResult, infer::infer_body_in};
 
@@ -81,8 +81,7 @@ fn main() {
 );
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 

@@ -11,7 +11,7 @@ use hir_expand::{
 };
 use intern::Symbol;
 use rustc_hash::FxHashSet;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AssocItemId, DefWithBodyId, TraitId,
@@ -70,7 +70,9 @@ fn path(segments: &[&str]) -> ModPath {
 
 /// The database and the impl's `go`.
 fn fixture() -> (TestDB, DefWithBodyId) {
-    let (db, position) = TestDB::with_position(CODE);
+    let fx = fixture::db(CODE);
+    let position = fx.position();
+    let db = fx.into_db();
     let krate = db.module_at_position(position).krate(&db);
     let map = crate_def_map(&db, krate);
     let impl_ = map

@@ -7,7 +7,7 @@ use hir_def::{
     DefWithBodyId, FunctionId, ModuleDefId, expr_store::Body, hir::ExprId,
     nameres::crate_def_map, signatures::FunctionSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{Adjust, InferBodyId, InferenceResult, next_solver::Ty};
 
@@ -54,7 +54,7 @@ fn reference<'db>(infer: &InferenceResult<'db>, e: ExprId) -> Ty<'db> {
 
 #[test]
 fn an_expressions_adjusted_type_is_what_both_old_copies_said() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "f"));
         let body = Body::of(&db, def);

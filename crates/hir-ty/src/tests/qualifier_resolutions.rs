@@ -13,7 +13,7 @@ use hir_def::{
     resolver::TypeNs,
     signatures::FunctionSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{InferBodyId, InferenceResult};
 
@@ -95,7 +95,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 
 #[test]
 fn a_type_relative_value_path_records_its_qualifier() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         let cases = [
             ("adt", Expected::Adt("S")),

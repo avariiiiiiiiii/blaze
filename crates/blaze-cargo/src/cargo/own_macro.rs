@@ -491,7 +491,7 @@ fn module_of(sysroot: &Path, library: &Path, described: &Path) -> Result<PathBuf
     own_script::compile_described(sysroot, &description, &made, dir)?;
     // Here, as soon as it is built and beside the other modules' builds, rather than in the
     // load, which loads one module after another.
-    blaze_macro_wasm::prepare(&made.exe, own_script::store())?;
+    blaze_macro_wasm::prepare(&made.exe, blaze_cas::Handle::installed())?;
     Ok(made.exe)
 }
 

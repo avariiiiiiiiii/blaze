@@ -5,7 +5,7 @@ use syntax::{
     ast::{self as tag, make},
     view::{self as ast, AstNode as _},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     expr_store::{
@@ -23,7 +23,9 @@ use crate::{
 };
 
 fn lower_path(path: ast::Path<'_>) -> (TestDB, ExpressionStore, Option<PathIdx>) {
-    let (db, file_id) = TestDB::with_single_file("");
+    let fx = fixture::db("");
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let mut ctx = ExprCollector::new(
         &db,
@@ -82,7 +84,9 @@ fn check_lower_path_twin(text: &str) {
     let handle = make::path_from_text(text);
     let (db, store, lowered) = with_path(text, lower_path);
     let (db_handle, store_handle, lowered_handle) = {
-        let (db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let db = fx.into_db();
         let krate = db.fetch_test_crate();
         let mut ctx = ExprCollector::new(
             &db,
@@ -128,7 +132,9 @@ fn lower_path_twin_lowers_as_the_view() {
 /// pools and go back when it is dropped, and the path's names and `ModPath` are interner hits.
 #[test]
 fn a_warm_plain_path_lookup_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file("");
+    let fx = fixture::db("");
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let module = crate_def_map(&db, krate).root_module_id();
     with_path("a::b::C", |path| {

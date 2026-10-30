@@ -137,7 +137,7 @@ pub(super) fn encode<'db>(
     let mut table = Table::default();
     let record = ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));
     let mut locs = TyTableWriter::new(interner);
-    let mut items = Keyed::new(db, facts);
+    let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
 
     let mut writer = Writer::with_buffer(SCHEMA, mem::take(out));
@@ -183,7 +183,7 @@ pub(super) fn decode<'db>(
     let record = root.record.follow(bytes).map_err(format_error)?;
     let keys = root.items.follow(bytes).map_err(format_error)?;
     let kinds = root.kinds.follow(bytes).map_err(format_error)?;
-    let items = items_of(db, facts, keys, kinds)?;
+    let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
     ids::relocating(&mut table, || InferenceRecord::read(record)?.to_result(interner)).map_err(format_error)
@@ -195,6 +195,7 @@ pub(super) fn items_of(
     db: &Db,
     // dyn: as `decode`
     facts: &dyn BodyFacts,
+    body: DefWithBodyId,
     keys: &[ContentId],
     kinds: &[u8],
 ) -> R<Vec<(IdKind, u64)>> {
@@ -204,7 +205,7 @@ pub(super) fn items_of(
     }
     keys.iter()
         .zip(kinds)
-        .map(|(key, &kind)| item_in(db, facts, key, kind))
+        .map(|(key, &kind)| item_in(db, facts, body, key, kind))
         // alloc: the items of the result, one per item it names: part of decoding it
         .collect()
 }
@@ -214,11 +215,12 @@ fn item_in(
     db: &Db,
     // dyn: as `decode`
     facts: &dyn BodyFacts,
+    body: DefWithBodyId,
     key: &ContentId,
     kind: u8,
 ) -> R<(IdKind, u64)> {
     let kind = ids::item_kind_of(kind).ok_or("an item of no kind")?;
-    let Some(def) = facts.def_of(db, *key) else {
+    let Some(def) = facts.def_of(db, body, *key) else {
         // alloc: the reason an answer does not read
         return Err(format!("it names item {key:x}, which this database does not have"));
     };
@@ -235,6 +237,8 @@ pub(super) struct Keyed<'a, 'db> {
     db: &'db Db,
     // dyn: as `encode`
     facts: &'a dyn BodyFacts,
+    /// The body whose result this is: keys are relative to it.
+    body: DefWithBodyId,
     /// Each item's key, at its index.
     pub(super) keys: Vec<ContentId>,
     /// Each item's kind, as an `IdKind`'s number, at its index.
@@ -248,9 +252,10 @@ impl<'a, 'db> Keyed<'a, 'db> {
         db: &'db Db,
         // dyn: as `encode`
         facts: &'a dyn BodyFacts,
+        body: DefWithBodyId,
     ) -> Keyed<'a, 'db> {
         // alloc: empty until an item is named; once per body offered
-        Keyed { db, facts, keys: Vec::new(), kinds: Vec::new(), seen: FxHashMap::default() }
+        Keyed { db, facts, body, keys: Vec::new(), kinds: Vec::new(), seen: FxHashMap::default() }
     }
 }
 
@@ -262,7 +267,7 @@ impl ItemSink for Keyed<'_, '_> {
     fn index(&mut self, kind: IdKind, bits: u64) -> R<u32> {
         // alloc: the reason a result is not stored
         let def = solver_def(kind, bits).ok_or_else(|| format!("a {kind:?} is no item"))?;
-        let key = self.facts.def_key(self.db, def);
+        let key = self.facts.def_key(self.db, self.body, def);
         match self.seen.entry(key) {
             Entry::Occupied(found) => match *found.get() {
                 (was, was_bits, index) if (was, was_bits) == (kind, bits) => Ok(index),

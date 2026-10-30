@@ -324,7 +324,7 @@ pub struct Units {
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 4");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 5");
 }
 
 /// What cargo passes and writes for one unit.
@@ -382,6 +382,10 @@ pub struct PackagePlan {
     /// What a member's `[package.metadata.blaze.sandbox]` says of its tests; nothing for any
     /// other package.
     pub tests: TestSandbox,
+    /// The file `[package.metadata.blaze] const-macros` names, absolute: a crate of macros the
+    /// front end runs, which every crate of the package depends on (docs/future/const-macros.md,
+    /// the workspace's experiment `const-macros`). Whether it is there is the front end's to say.
+    pub const_macros: Option<String>,
 }
 
 impl PackagePlan {

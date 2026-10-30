@@ -2,7 +2,7 @@
 //! same frozen bytes), so the def maps of the crates that depend on it are not run again.
 
 use base_db::{Crate, all_crates};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::nameres::{crate_def_map, frozen, tests::{TestDB, TestDBExt}};
 
@@ -51,7 +51,9 @@ struct Edited {
 /// Collects both crates, writes `lib.rs` as `edited`, and collects them again: `lib` first, then
 /// `main` on its own, so what `main` runs is only what `lib`'s def map changing made it run.
 fn edit_lib(edited: &str) -> Edited {
-    let (mut db, files) = TestDB::with_many_files(&fixture());
+    let fx = fixture::db(&fixture());
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let lib = crate_named(&db, "lib");
     let main = crate_named(&db, "main");
     crate_def_map(&db, main);

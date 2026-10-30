@@ -1,7 +1,7 @@
 use base_db::{Crate, all_crates};
 use intern::Symbol;
 use syntax::view::HasName;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{crate_diagnostic_items, diagnostic_items};
 use crate::{
@@ -92,7 +92,7 @@ fn names(items: &super::DiagnosticItems) -> Vec<String> {
 
 #[test]
 fn every_owner_is_found() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     let core = crate_named(&db, "core");
     let items = crate_diagnostic_items(&db, core);
     assert_eq!(
@@ -133,7 +133,7 @@ fn every_owner_is_found() {
 
 #[test]
 fn only_bodies_that_may_say_one_are_lowered() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     let core = crate_named(&db, "core");
     let macros: Vec<_> =
         macros_writing_diagnostic_items(&db, core).iter().map(|it| it.as_str()).collect();
@@ -148,7 +148,7 @@ fn only_bodies_that_may_say_one_are_lowered() {
 
 #[test]
 fn a_crate_sees_its_dependencies_items() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     let main = crate_named(&db, "main");
     let items = diagnostic_items(&db, main);
     let names = names(items);
@@ -164,7 +164,7 @@ fn a_crate_sees_its_dependencies_items() {
 
 #[test]
 fn a_name_given_twice_keeps_the_nearest() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /core.rs crate:core
 #[rustc_diagnostic_item = "Twice"]
@@ -177,7 +177,8 @@ pub fn first() {}
 #[rustc_diagnostic_item = "Again"]
 pub fn second() {}
 "#,
-    );
+    )
+    .into_db();
     let lib = crate_named(&db, "lib");
     let own = crate_diagnostic_items(&db, lib);
     assert_eq!(own.duplicates.len(), 1, "{:?}", own.duplicates);

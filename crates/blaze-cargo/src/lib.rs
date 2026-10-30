@@ -19,6 +19,7 @@ pub mod cli;
 pub mod content;
 pub mod dep_info;
 pub mod deps;
+pub mod directives;
 pub mod doctest;
 pub mod engine;
 pub mod errors;
@@ -30,6 +31,7 @@ pub mod plan;
 pub mod process;
 #[allow(unsafe_code, reason = "the kernel calls std has no wrapper for, behind safe functions")]
 pub mod raw;
+pub mod release;
 #[allow(unsafe_code, reason = "the remote store's own")]
 pub mod remote;
 pub mod renamed;
@@ -42,8 +44,8 @@ pub mod serve;
 pub mod socket;
 pub mod stub;
 pub mod symbols;
+pub mod toolchain;
 pub mod trace;
-pub mod tree;
 pub mod unstable;
 pub mod weaken;
 
@@ -87,9 +89,9 @@ pub fn end_with_reader() {
 }
 
 /// `blaze 0.20261028.9 (fb82b09 2026-10-28)` for a release, `blaze 0.0.0-dev (fb82b09)` for a
-/// build of the tree: the engine's (`engine::Engine::version_line`, from its build.rs).
+/// build of the tree ([`release::Release::line`]).
 pub fn version() -> String {
-    engine::get().version_line.to_owned()
+    release::get().line.to_owned()
 }
 
 /// What a worker that was started before its build was known is told on its standard input.

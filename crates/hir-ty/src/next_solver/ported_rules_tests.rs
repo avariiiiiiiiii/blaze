@@ -10,7 +10,7 @@ use hir_expand::name::Name;
 use intern::Symbol;
 use la_arena::RawIdx;
 use rustc_type_ir::Interner as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     ImplTraitId,
@@ -84,7 +84,7 @@ fn first_rpit(db: &Db, func: FunctionId) -> SolverDefId<'_> {
 
 #[test]
 fn a_trait_item_has_a_definition_only_when_it_writes_one() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 #![feature(associated_type_defaults)]
 trait Tr {
@@ -94,9 +94,10 @@ trait Tr {
     const DEFAULTED: u32 = 1;
 }
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let tr = trait_(&db, "Tr");
         for (name, expected) in
             [("Bare", false), ("Defaulted", true), ("BARE", false), ("DEFAULTED", true)]
@@ -113,7 +114,7 @@ trait Tr {
 
 #[test]
 fn an_impl_self_is_guaranteed_unsized_when_its_struct_tail_is_dyn_a_slice_or_str() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 trait Tr {}
@@ -136,9 +137,10 @@ impl OnAlias for Wrap<Bytes> {}
 impl OnU8 for Wrap<u8> {}
 impl<T: ?Sized> OnParam for Wrap<T> {}
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         for (trait_name, expected) in [
             ("OnStr", true),
             ("OnSlice", true),
@@ -161,15 +163,16 @@ impl<T: ?Sized> OnParam for Wrap<T> {}
 
 #[test]
 fn a_function_has_target_features_when_it_enables_one() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 #[target_feature(enable = "neon")]
 fn enables() {}
 fn plain() {}
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         for (name, expected) in [("enables", true), ("plain", false)] {
             let def = CallableIdWrapper(function(&db, name).into());
             assert_eq!(interner.has_target_features(def), expected, "`{name}`");
@@ -190,9 +193,9 @@ fn plain_rpit() -> impl Copy { 0u8 }
 
 #[test]
 fn an_alias_is_conditionally_const_as_its_trait_or_function_is() {
-    let db = Db::with_files(CONST_ALIASES);
+    let db = fixture::db(CONST_ALIASES).into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let item = |trait_name| assoc_type(&db, trait_(&db, trait_name), "Item").into();
         assert!(interner.alias_has_const_conditions(item("Plain")));
         assert!(!interner.alias_has_const_conditions(item("NotConst")));
@@ -203,9 +206,9 @@ fn an_alias_is_conditionally_const_as_its_trait_or_function_is() {
 
 #[test]
 fn an_alias_that_writes_no_const_bound_implies_none() {
-    let db = Db::with_files(CONST_ALIASES);
+    let db = fixture::db(CONST_ALIASES).into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let plain = assoc_type(&db, trait_(&db, "Plain"), "Item").into();
         let rpit = first_rpit(&db, function(&db, "const_rpit"));
         for def in [plain, rpit] {
@@ -217,9 +220,9 @@ fn an_alias_that_writes_no_const_bound_implies_none() {
 
 #[test]
 fn an_alias_implies_the_const_bounds_it_writes() {
-    let db = Db::with_files(CONST_ALIASES);
+    let db = fixture::db(CONST_ALIASES).into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let bounded = assoc_type(&db, trait_(&db, "Bounded"), "Item").into();
         let traits: Vec<TraitId> = interner
             .explicit_implied_const_bounds(bounded)
@@ -233,14 +236,15 @@ fn an_alias_implies_the_const_bounds_it_writes() {
 
 #[test]
 fn a_type_alias_impl_trait_is_never_conditionally_const() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 #![feature(type_alias_impl_trait)]
 type Opaque = impl Sized;
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
-        let interner = DbInterner::new_with(&db, db.test_crate());
+        let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let alias = modules(&db)
             .into_iter()
             .flat_map(|module| module.scope(&db).declarations().collect::<Vec<_>>())
@@ -280,7 +284,7 @@ fn an_item_is_local_only_to_the_crate_that_defines_it() {
     use hir_def::HasModule;
     use rustc_type_ir::inherent::DefId as _;
 
-    let db = Db::with_files(TWO_CRATES);
+    let db = fixture::db(TWO_CRATES).into_db();
     crate::next_solver::attach_db(&db, || {
         let (up, mine) = (trait_(&db, "Up"), trait_(&db, "Mine"));
         let main = DbInterner::new_with(&db, function(&db, "here").krate(&db));
@@ -303,7 +307,7 @@ fn coherence_leaves_a_goal_only_an_upstream_crate_could_implement_ambiguous() {
     };
     use rustc_type_ir::TypingMode;
 
-    let db = Db::with_files(TWO_CRATES);
+    let db = fixture::db(TWO_CRATES).into_db();
     crate::next_solver::attach_db(&db, || {
         let up = trait_(&db, "Up");
         let foreign = foreign_struct(&db);

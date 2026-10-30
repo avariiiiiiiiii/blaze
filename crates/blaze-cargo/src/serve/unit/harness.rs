@@ -12,7 +12,7 @@ use blaze_api::ApiError;
 use blaze_ids::radix;
 use blaze_units::schema::Mode;
 use hir_ty_codegen::v2::HirFrontend;
-use load_cargo::v2::{Appended, LowerError, Lowered};
+use blaze_lower::{Appended, LowerError, Lowered};
 
 use super::{Job, codegen, graph::Waits, lower_error};
 
@@ -50,7 +50,7 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
     let paths = Arc::clone(lowered.paths());
     let tested = units.into_iter().filter(|&unit| tested(job, unit as usize));
     let made = lowered.append_roots(tested, |db, unit, krate| {
-        if !load_cargo::v2::macros_loaded(db, krate) {
+        if !blaze_lower::macros_loaded(db, krate) {
             return Ok(None);
         }
         let at = || match job.unit(unit) {
@@ -103,7 +103,7 @@ pub(super) fn macros_applied(lowered: &mut Lowered, job: &Job, waits: &Waits, lo
     write(lowered, job, reached)
 }
 
-/// Whether `unit`'s crate is built with `cfg(test)`, as load-cargo makes it: a test, or a check
+/// Whether `unit`'s crate is built with `cfg(test)`, as blaze-lower makes it: a test, or a check
 /// of one (`cargo check --tests`).
 fn tested(job: &Job, unit: usize) -> bool {
     job.unit(unit).is_ok_and(|it| it.mode == Mode::Test) || job.plan(unit).is_ok_and(|it| it.checked_as_test)

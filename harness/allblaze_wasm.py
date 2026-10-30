@@ -8,10 +8,10 @@ standard library included, and linked by blaze (`--exe`) with the toolchain's `r
 and the wasi-libc the toolchain ships (C, as glibc is on Linux). A wasm32-unknown-unknown
 `cdylib` is linked too (`--shared`), and a `#![no_std]` guest of a host with its own panic
 handler and simd128/relaxed-simd code, each export called with `wasmtime run --invoke`; both
-are built again by `blaze build`, with the `blaze` beside blaze. Nothing
-blaze could not compile may be left in a module. What each prints and how it exits, under
-`wasmtime run`, has to be what cargo's build of the same source does; the sizes of both are
-printed.
+are built again by `blaze build`, with the `blaze` beside blaze, and so are the programs. Nothing
+blaze could not compile may be left in a module. What each prints and how it exits under
+`wasmtime run`, or what each export answers, has to be the same built either way; the sizes
+are printed.
 
 The standard library of each target is compiled once into a store that starts empty, as a
 unit, and taken from it by the programs after the first.
@@ -204,7 +204,7 @@ GUEST_CALLS = [("guest_dot", ["7", "-3"]), ("guest_dot", ["2147483647", "2"]), (
 
 def run(cmd, cwd, what, env=None):
     start = time.monotonic()
-    # cargo's build is read from the package's own target directory.
+    # `blaze build` writes to the package's own target directory.
     env = {**os.environ, "RUST_BACKTRACE": "0", **(env or {})}
     for name in ("CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "RUSTFLAGS"):
         env.pop(name, None)
@@ -257,7 +257,7 @@ def blaze(root, crate, out, exe, target, store, *extra):
 
 def blaze_build(root, what, store, runtime, target):
     """`blaze build` as a user runs it, the `blaze` beside blaze first on the path
-    and a daemon of its own, in a copy of the package without cargo's build. Returns the copy
+    and a daemon of its own, in a copy of the package. Returns the copy
     and how long the build took."""
     env = {"PATH": os.path.dirname(os.path.abspath(BLAZE)) + os.pathsep + os.environ["PATH"],
            "BLAZE_CACHE": store, "XDG_RUNTIME_DIR": runtime}
@@ -312,54 +312,49 @@ def main():
         for name, source, runs, panic in PROGRAMS:
             manifest = '[profile.dev]\npanic = "abort"\n' if panic == "abort" else ""
             root = package(work, name, manifest, "main.rs", source)
-            run(["cargo", "build", "-q", "--target", WASI], root, f"cargo build of {name}")
-            theirs = os.path.join(root, "target", WASI, "debug", f"{name}.wasm")
-            expected = [outcome(theirs, args, root) for args in runs]
             ours = os.path.join(work, f"{name}.wasm")
             ran, took = blaze(root, name, os.path.join(work, f"{name}.o"), ours, WASI, store)
             std = nothing_of_rustc(ran, name)
             link_took = linked(ran, name)
-            for args, want in zip(runs, expected):
-                got = outcome(ours, args, root)
-                if got != want:
-                    raise SystemExit(f"FAIL: {name} {' '.join(args)} differs from cargo's:\n"
-                                     f"cargo:  {want}\nblaze: {got}")
+            expected = [outcome(ours, args, root) for args in runs]
             lines.append(f"{name} ({WASI}): built and linked in {took:.2f} s, the standard library "
-                         f"{std}, the link {link_took}, {len(runs)} runs as cargo's; "
-                         f"{kib(ours)}, cargo's {kib(theirs)}")
+                         f"{std}, the link {link_took}; {kib(ours)}")
+            copy, took = blaze_build(root, name, store, runtime, WASI)
+            served = os.path.join(copy, "target", WASI, "debug", f"{name}.wasm")
+            for args, want in zip(runs, expected):
+                got = outcome(served, args, root)
+                if got != want:
+                    raise SystemExit(f"FAIL: {name} {' '.join(args)} by `blaze build` differs from the link of `--exe`:\n"
+                                     f"--exe:       {want}\nblaze build: {got}")
+            lines.append(f"{name} by `blaze build`: {took:.2f} s, {len(runs)} runs as the link of `--exe`'s; "
+                         f"{kib(served)}")
         cdylib = '[lib]\ncrate-type = ["cdylib"]\n'
         for name, what, source, config, calls in [
             ("shared", "the cdylib", LIBRARY, None, CALLS),
             ("guest", "the no_std SIMD guest", GUEST, GUEST_CONFIG, GUEST_CALLS),
         ]:
             root = package(work, name, cdylib, "lib.rs", source, config)
-            run(["cargo", "build", "-q", "--target", UNKNOWN], root, f"cargo build of {what}")
-            theirs = os.path.join(root, "target", UNKNOWN, "debug", f"{name}.wasm")
-            expected = invoked(theirs, root, calls)
-            if any(code != 0 for code, _ in expected):
-                raise SystemExit(f"FAIL: cargo's build of {what} did not answer: {expected}")
             ours = os.path.join(work, f"{name}.wasm")
             ran, took = blaze(root, name, os.path.join(work, f"{name}.o"), ours, UNKNOWN, store,
                                "--shared")
             std = nothing_of_rustc(ran, what)
             link_took = linked(ran, what)
-            got = invoked(ours, root, calls)
-            if got != expected:
-                raise SystemExit(f"FAIL: {what} differs from cargo's:\ncargo:  {expected}\nblaze: {got}")
+            expected = invoked(ours, root, calls)
+            if any(code != 0 for code, _ in expected):
+                raise SystemExit(f"FAIL: {what} did not answer: {expected}")
             lines.append(f"{what} ({UNKNOWN}): built and linked in {took:.2f} s, the standard "
-                         f"library {std}, the link {link_took}, {len(calls)} calls as cargo's; "
-                         f"{kib(ours)}, cargo's {kib(theirs)}")
+                         f"library {std}, the link {link_took}; {kib(ours)}")
             copy, took = blaze_build(root, what, store, runtime, UNKNOWN)
             served = os.path.join(copy, "target", UNKNOWN, "debug", f"{name}.wasm")
             got = invoked(served, root, calls)
             if got != expected:
-                raise SystemExit(f"FAIL: blaze's {what} differs from cargo's:\n"
-                                 f"cargo: {expected}\nblaze: {got}")
+                raise SystemExit(f"FAIL: {what} by `blaze build` differs from the link of `--shared`:\n"
+                                 f"--shared:    {expected}\nblaze build: {got}")
             lines.append(f"{what} by `blaze build`: {took:.2f} s, {len(calls)} calls as "
-                         f"cargo's; {kib(served)}")
+                         f"the link of `--shared`'s; {kib(served)}")
         print("\n".join(lines))
         print(f"PASS: {len(PROGRAMS)} {WASI} programs, a {UNKNOWN} cdylib and a no_std SIMD guest "
-              "with nothing of rustc's, the last two by `blaze build` too")
+              "with nothing of rustc's, each by `blaze build` too")
         passed = True
     finally:
         if passed:

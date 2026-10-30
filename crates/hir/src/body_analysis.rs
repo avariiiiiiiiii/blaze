@@ -33,7 +33,7 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use hir_ide::{
+use hir_ty::{
     InferBodyId, InferenceResult, ParamEnvAndCrate,
     infer::closure::analysis::expr_use_visitor::moved_locals,
     next_solver::{DbInterner, EarlyBinder, GenericArgs, Ty, TyKind},
@@ -189,7 +189,7 @@ impl<'db> BodyAnalysis<'db> {
         let infer = self.infer();
         let adjusts = infer.expr_adjustment(id.as_expr()?)?;
         let mut source = self.ty(infer.expr_or_pat_ty(id));
-        let adjustment = |adjust: &hir_ide::Adjustment| {
+        let adjustment = |adjust: &hir_ty::Adjustment| {
             let target = self.ty(adjust.target.as_ref());
             let kind = Adjust::from(adjust.kind);
             // clone: the next adjustment's source, as `Semantics::expr_adjustments` does

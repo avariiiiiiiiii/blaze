@@ -771,7 +771,7 @@ impl Sig for Variants {
 
 #[cfg(test)]
 mod tests {
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::{
@@ -779,14 +779,15 @@ mod tests {
         expr_store::path::{Names, UseArgs},
         hir::columns::idx,
         nameres::crate_def_map,
-        test_db::{TestDB, TestDBExt},
+        test_db::TestDBExt,
     };
 
     #[test]
     fn a_where_predicate_or_bound_past_its_store_is_refused() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             "trait Tr<'a> {}\nfn f<'x, T>() where for<'a> T: Tr<'a>, T: 'x, 'x: 'x {}",
-        );
+        )
+        .into_db();
         let krate = db.fetch_test_crate();
         let def_map = crate_def_map(&db, krate);
         let mut function = None;
@@ -840,10 +841,11 @@ mod tests {
 
     #[test]
     fn splatted_counts_the_parameters_cfg_leaves() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             "fn f(#[cfg(any())] x: u8, a: u8, #[rustc_splat] b: (u8,)) {}\nfn g(a: u8) {}\n\
              unsafe extern \"C\" { fn v(#[rustc_splat] a: (u8,), ...); }",
-        );
+        )
+        .into_db();
         let krate = db.fetch_test_crate();
         let mut found = Vec::new();
         for (_, module) in crate_def_map(&db, krate).modules(&db) {
@@ -861,7 +863,7 @@ mod tests {
 
     #[test]
     fn a_record_id_past_its_store_is_refused() {
-        let db = TestDB::with_files("fn f<const C: usize = 1>(_: (), _: u8) {}");
+        let db = fixture::db("fn f<const C: usize = 1>(_: (), _: u8) {}").into_db();
         let krate = db.fetch_test_crate();
         let mut function = None;
         for (_, module) in crate_def_map(&db, krate).modules(&db) {

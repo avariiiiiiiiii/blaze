@@ -5,7 +5,7 @@
 //! an associated item named through a type, an enum variant), else resolved with the one
 //! [`Resolver`] the walk keeps at the scope it is in, as inference resolves it: moved into each
 //! block as the walk enters it, and into the scope of each path for its resolution. Each path
-//! resolves as `hir::Semantics` resolves the node it was lowered from (inference first, then
+//! resolves as `hir::view::Semantics` resolves the node it was lowered from (inference first, then
 //! values first in an expression and types first elsewhere), with no `SourceAnalyzer` built,
 //! no syntax node found and no path lowered again for it. Syntax is read only for a
 //! self-assignment about to be linted, an `offset_of!`, and a closure or an anonymous constant
@@ -49,7 +49,7 @@ use crate::{
     model::Diag,
 };
 
-/// Where a path is, which decides how `hir::Semantics` resolves it.
+/// Where a path is, which decides how `hir::view::Semantics` resolves it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Site {
     Value,
@@ -337,7 +337,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         self.m.handle_res(r.qualifier);
     }
 
-    /// `path` at `at`, resolved as `hir::Semantics` resolves the node it was lowered from.
+    /// `path` at `at`, resolved as `hir::view::Semantics` resolves the node it was lowered from.
     fn resolve(&mut self, at: Option<ExprOrPatId>, path: Path<'_>, site: Site, hygiene: HygieneId) -> Resolved {
         let Some(mod_path) = path.mod_path() else { return Resolved::NONE };
         let defs = self.m.k.defs;

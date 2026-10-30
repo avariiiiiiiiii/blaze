@@ -3,11 +3,11 @@
 
 use base_db::EditionedFileId;
 use blaze_alloc_count::assert_at_most;
-use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, TextRange, ast, view};
-use test_fixture::WithFixture;
+use syntax::{SyntaxKind, SyntaxNodePtr, TextRange, view};
+use hir_expand::fixture;
 
 use super::db::TestDB;
-use crate::{Adt, Crate, ModuleDef, Semantics, Variant};
+use crate::{Adt, Crate, ModuleDef, Variant, semantics::view::Semantics};
 
 const FIXTURE: &str = r#"
 //- /main.rs crate:main
@@ -95,15 +95,14 @@ fn targets(db: &TestDB, file_id: EditionedFileId) -> Targets {
     }
 }
 
-// `Semantics`' API still takes handles, so each test turns a target into one at the call and
-// nowhere else: `token_at` and `node_at` go when frontend-tree moves `Semantics` to views.
-
-fn token_at(file: &ast::SourceFile, range: TextRange) -> syntax::SyntaxToken {
+fn token_at<'db>(file: view::SourceFile<'db>, range: TextRange) -> view::Token<'db> {
+    use view::AstNode as _;
     file.syntax().covering_element(range).into_token().expect("a token's range covers a token")
 }
 
-fn node_at<N: AstNode>(file: &ast::SourceFile, ptr: SyntaxNodePtr) -> N {
-    N::cast(ptr.to_node(file.syntax())).expect("a pointer's kind is the node's")
+fn node_at<'db, N: view::AstNode<'db>>(file: view::SourceFile<'db>, ptr: SyntaxNodePtr) -> N {
+    use view::AstNode as _;
+    N::cast(view::to_node(ptr, file.syntax())).expect("a pointer's kind is the node's")
 }
 
 /// Runs `f` once to warm the database, the thread's shelves and the carried `Semantics`
@@ -126,49 +125,53 @@ fn warm_then_free<R>(db: &TestDB, what: &str, mut f: impl FnMut(&Semantics<'_>) 
 
 #[test]
 fn descend_into_macros_on_a_warm_file_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     crate::attach_db(&db, || {
         let at = targets(&db, file_id);
-        warm_then_free(&db, "descend_into_macros", |sema| {
+        warm_then_free(&db, "descend_into_macros_exact", |sema| {
             let file = sema.parse(file_id);
-            let origin = sema.descend_into_macros(token_at(&file, at.origin));
+            let origin = sema.descend_into_macros_exact(token_at(file, at.origin));
             assert!(!origin.is_empty());
-            let in_macro = token_at(&file, at.p_in_macro);
-            let mut found = 0u32;
-            sema.descend_into_macros_cb(in_macro, |_, _| found += 1);
-            assert_eq!(found, 1, "`p` maps to one token of the expansion");
+            let in_macro = sema.descend_into_macros_exact(token_at(file, at.p_in_macro));
+            assert_eq!(in_macro.len(), 1, "`p` maps to one token of the expansion");
         });
     });
 }
 
 #[test]
 fn resolve_path_through_semantics_on_a_warm_file_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     crate::attach_db(&db, || {
         let at = targets(&db, file_id);
         warm_then_free(&db, "resolve_path", |sema| {
             let file = sema.parse(file_id);
-            let path: ast::Path = node_at(&file, at.dot_path);
-            assert!(sema.resolve_path(&path).is_some(), "`Shape::Dot` resolves");
-            let ty_path: ast::Path = node_at(&file, at.point_ty);
-            assert!(sema.resolve_path(&ty_path).is_some(), "`Point` resolves");
+            let path: view::Path<'_> = node_at(file, at.dot_path);
+            assert!(sema.resolve_path(path).is_some(), "`Shape::Dot` resolves");
+            let ty_path: view::Path<'_> = node_at(file, at.point_ty);
+            assert!(sema.resolve_path(ty_path).is_some(), "`Point` resolves");
         });
     });
 }
 
 #[test]
 fn to_def_on_a_cached_node_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
     crate::attach_db(&db, || {
         let at = targets(&db, file_id);
         warm_then_free(&db, "to_def", |sema| {
             let file = sema.parse(file_id);
-            let strukt: ast::Struct = node_at(&file, at.strukt);
-            let def = sema.to_struct_def(&strukt).expect("`Point` has a def");
-            let field: ast::RecordField = node_at(&file, at.field);
-            assert!(sema.to_def(&field).is_some(), "`x` has a def");
-            let module: ast::Module = node_at(&file, at.module);
-            assert!(sema.to_module_def(&module).is_some(), "`inner` has a def");
+            let strukt: view::Struct<'_> = node_at(file, at.strukt);
+            let def = sema.to_struct_def(strukt).expect("`Point` has a def");
+            let field: view::RecordField<'_> = node_at(file, at.field);
+            assert!(sema.to_def(field).is_some(), "`x` has a def");
+            let module: view::Module<'_> = node_at(file, at.module);
+            assert!(sema.to_module_def(module).is_some(), "`inner` has a def");
             def
         });
     });
@@ -176,7 +179,7 @@ fn to_def_on_a_cached_node_allocates_nothing() {
 
 #[test]
 fn the_accessors_iterator_forms_allocate_nothing() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::attach_db(&db, || {
         let krate = Crate::all(&db).into_iter().next().expect("a crate");
         let root = krate.root_module(&db);
@@ -238,7 +241,7 @@ fn the_accessors_iterator_forms_allocate_nothing() {
 
 #[test]
 fn a_warm_completion_search_allocates_nothing() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main deps:dep
 fn main() {}
@@ -247,7 +250,8 @@ pub struct Needle;
 pub fn needle_fn() {}
 pub mod needles { pub struct Inner; }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let main = Crate::all(&db)
             .into_iter()

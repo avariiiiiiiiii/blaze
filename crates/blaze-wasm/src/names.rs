@@ -7,15 +7,15 @@ use std::{borrow::Cow, path::PathBuf};
 use hir::Crate;
 use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
 use hir_ty_codegen::{SymbolResolver, exported_symbol, link_name};
-use ide_db::{RootDatabase, base_db::Db};
+use base_db::Db;
 use intern::Symbol;
 use rustc_symbols::{Paths, Places, StaticPath};
-use vfs::FileId;
+use base_db::FileId;
 
 use crate::symbols::SymbolTable;
 
 pub(crate) struct Resolver<'a> {
-    pub(crate) db: &'a RootDatabase,
+    pub(crate) db: &'a Db,
     pub(crate) table: &'a SymbolTable,
     pub(crate) places: Places,
 }
@@ -48,7 +48,7 @@ impl Resolver<'_> {
     }
 
     /// rustc's `StableCrateId` of a crate it built something of.
-    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn rustc_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
         self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
@@ -60,7 +60,7 @@ impl Resolver<'_> {
     }
 
     /// What stands for a crate rustc built nothing of, the same after every edit: its name.
-    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn own_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
         if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
             return None;
         }
@@ -106,7 +106,7 @@ impl SymbolResolver for Resolver<'_> {
         self.table.defines(symbol)
     }
 
-    fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn stable_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
         self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
     }
 
@@ -139,7 +139,7 @@ impl SymbolResolver for Resolver<'_> {
     }
 }
 
-fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
+fn crate_root_file(db: &Db, krate: Crate) -> Option<PathBuf> {
     let file = krate.root_file(db);
     let source_root = db.file_source_root(file).source_root_id(db);
     let source_root = db.source_root(source_root).source_root(db);

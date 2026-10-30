@@ -837,14 +837,14 @@ language_item_table! { LangItems =>
 mod tests {
     use intern::{Symbol, sym};
     use salsa::plumbing::FromId;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::{LangItemEnum, LangItemTarget, LangItems, crate_lang_items};
     use crate::{
         AttrDefId, ConstId, FunctionId, StructId, TraitId,
         attrs::AttrFlags,
         signatures::{ConstSignature, FunctionSignature, StructSignature, TraitSignature},
-        test_db::{TestDB, TestDBExt},
+        test_db::TestDBExt,
     };
 
     #[test]
@@ -908,7 +908,7 @@ mod tests {
     /// three types, as the pinned nightly's `library/` declares them.
     #[test]
     fn check_and_layout_lang_items_are_found() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #![feature(lang_items)]
 #[lang = "panic_null_reference_constructed"]
@@ -928,7 +928,8 @@ pub struct Global;
 #[lang = "maybe_dangling"]
 pub struct MaybeDangling<P: ?Sized>(P);
 "#,
-        );
+        )
+        .into_db();
         let items = crate_lang_items(&db, db.fetch_test_crate()).unwrap();
         let function =
             |id: Option<FunctionId>| FunctionSignature::of(&db, id.unwrap()).name.clone();
@@ -964,7 +965,7 @@ pub struct MaybeDangling<P: ?Sized>(P);
     /// item's own `AttrFlags::lang_item` says.
     #[test]
     fn lang_items_off_the_columns_are_each_items_own() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 //- /lib.rs crate:test
 #![feature(lang_items)]
@@ -988,7 +989,8 @@ pub struct RangeFull;
 #[lang = "panic_fmt"]
 pub fn panic_fmt() {}
 "#,
-        );
+        )
+        .into_db();
         let items = crate_lang_items(&db, db.fetch_test_crate()).unwrap();
         let own = |target: LangItemTarget, name: &str| {
             let owner = match target {
@@ -1016,7 +1018,7 @@ pub fn panic_fmt() {}
     /// A lang-item lookup is a memo read and a field load.
     #[test]
     fn lang_item_lookup_allocates_nothing() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #![feature(lang_items)]
 #[lang = "sized"]
@@ -1024,7 +1026,8 @@ pub trait Sized {}
 #[lang = "global_alloc_ty"]
 pub struct Global;
 "#,
-        );
+        )
+        .into_db();
         let krate = db.fetch_test_crate();
         let _ = super::lang_items(&db, krate);
         let (sized, global) = blaze_alloc_count::assert_at_most(0, "a warm lang-item lookup", || {
@@ -1037,13 +1040,14 @@ pub struct Global;
     /// A miss of `crate_notable_traits`, its inputs warm, allocates its box and nothing else.
     #[test]
     fn notable_traits_miss_is_its_result() {
-        let db = TestDB::with_files(
+        let db = fixture::db(
             r#"
 #[doc(notable_trait)]
 pub trait Read {}
 pub trait Other {}
 "#,
-        );
+        )
+        .into_db();
         let krate = db.fetch_test_crate();
         let def_map = crate::nameres::crate_def_map(&db, krate);
         for (_, module) in def_map.modules(&db) {

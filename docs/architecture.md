@@ -1,6 +1,8 @@
 ---
-status: current
-summary: A map of the code: the worker, the cargo drop-in, the splice, and how a build and an edit flow through them.
+status: superseded
+summary: A map of blaze v1's code: the worker, the cargo drop-in, the splice, and how a build and an edit flowed through them.
+date: 2026-10-30
+superseded_by: v2/plan.md
 ---
 # How blaze works
 

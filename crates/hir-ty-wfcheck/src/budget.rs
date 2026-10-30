@@ -3,7 +3,7 @@
 
 use blaze_alloc_count::measure;
 use hir_def::{GenericDefId, ModuleDefId, nameres::crate_def_map};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{WfResult, outlives::tests::db::TestDB, wfcheck};
 
@@ -42,7 +42,9 @@ fn owned_blocks(result: &WfResult) -> u64 {
 
 #[test]
 fn checking_an_item_allocates_its_diagnostics_alone() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let defs = items(&db);
         let mut reported = 0;
@@ -61,7 +63,9 @@ fn checking_an_item_allocates_its_diagnostics_alone() {
 
 #[test]
 fn asking_again_allocates_nothing() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         for def in items(&db) {
             wfcheck(&db, def);

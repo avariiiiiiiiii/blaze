@@ -1,7 +1,8 @@
 //! Built MIR through the item store: a body's MIR and its closure's, built and flushed in one
 //! database, are read in a fresh one whose ids differ with no MIR built, equal to the same MIR
 //! built there; both databases encode it to the same bytes; a lowering error is never stored; a
-//! corrupt answer is an error naming the body; a hit allocates only what decoding makes.
+//! corrupt answer is an error naming the body; a hit allocates only what decoding makes; a
+//! record holds a slot for each location literal and reads it where the body is now.
 //!
 //! hir-ty's test binary links no MIR lowering, so the MIR is built by hand, inside a query as
 //! the built-MIR queries run it, so its reads are captured.
@@ -14,8 +15,8 @@ use blaze_format::Aligned;
 use hir_def::{
     AdtId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StructId, VariantId,
     deps::ImageStore,
-    expr_store::ExpressionStore,
-    hir::{ClosureKind, Expr},
+    expr_store::{Body, ExpressionStore},
+    hir::{BindingId, ClosureKind, Expr, ExprId},
     nameres::{crate_def_map, demand::crate_body_owners},
     signatures::FunctionSignature,
 };
@@ -27,15 +28,15 @@ use salsa::Setter;
 
 use super::{RAN, built, decode, encode, lookup_mir, place};
 use crate::{
-    CallableDefId, InferBodyId,
+    CallableDefId, InferBodyId, MemoryMap,
     body_store::{
-        BodyFacts, Flushed, Lookup, Mode, Step,
+        BodyFacts, Flushed, Lookup, Mode, Step, StepCounts,
         record::{self, AnswerKey, ShapeRef},
-        tests::{BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session},
+        tests::{BUILD, Defs, FIXTURE, Memory, Session, db_of, function, second, session, without_steps},
     },
     db::{InternedClosure, InternedClosureId},
     mir::{
-        AggregateKind, BasicBlock, Inlined, Local, MirBody, MirLowerError, MirOwner, MirPhase,
+        AggregateKind, BasicBlock, Inlined, Local, LocalId, MirBody, MirLowerError, MirOwner, MirPhase,
         MirSpan, Operand, OperandKind, Place, Projection, ProjectionElem, Rvalue, Statement,
         StatementKind, Terminator, TerminatorKind,
     },
@@ -320,7 +321,9 @@ fn stored_mir_is_read_in_a_fresh_database_without_building_it() {
         assert_eq!(*read, mir_of(&fresh.db, owner), "{owner:?} reads back as the MIR built here");
         assert_eq!(stable(&fresh, owner), forms[usize::from(closure)], "{owner:?}: both databases write the same bytes");
     }
-    assert_eq!(fresh.installed.flush().unwrap(), Flushed::default(), "a hit offers nothing");
+    let flushed = fresh.installed.flush().unwrap();
+    assert_eq!(flushed.steps[Step::Mir as usize], StepCounts { hits: 2, ..StepCounts::default() }, "the body and its closure hit");
+    assert_eq!(without_steps(flushed), Flushed::default(), "a hit offers nothing");
 }
 
 #[test]
@@ -330,7 +333,7 @@ fn a_lowering_error_is_never_stored() {
     let mut first = session(db_of(FIXTURE), &memory, &defs, None, Mode::Serve);
     let failing = Ask::new(&first.db, function(&first.db, "closures"), false, true);
     assert!(built_mir(&first.db, failing).is_err());
-    assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "an error is never offered");
+    assert_eq!(without_steps(first.installed.flush().unwrap()), Flushed::default(), "an error is never offered");
     assert_eq!(memory.len(), 0);
 
     failing.set_fails(&mut first.db).to(false);
@@ -370,7 +373,7 @@ fn verify_builds_every_hit_and_a_difference_is_an_error_naming_the_body() {
         let _ = built_mir(&same.db, ask(&same, closure));
     }
     assert_eq!(ran(), 2, "every hit is built as well");
-    assert_eq!(same.installed.flush().unwrap(), Flushed::default(), "each stored MIR is the one built");
+    assert_eq!(without_steps(same.installed.flush().unwrap()), Flushed::default(), "each stored MIR is the one built");
     drop(same);
 
     // The body's answer swapped for its closure's: it decodes, and differs.
@@ -411,6 +414,173 @@ fn a_hit_allocates_only_the_decoded_mir() {
             decoding.allocations
         );
     }
+}
+
+const MAIN: &str = "//- /main.rs crate:main deps:core,other new_source_root:local\n";
+
+/// A body with `line!`, `column!` and a `concat!` of a `line!` in it, `down` lines below where
+/// it starts, its locals named after `names`.
+fn located(down: usize, names: [&str; 3]) -> String {
+    let [here, at, said] = names;
+    format!(
+        r#"
+//- minicore: sized, copy, fn, add
+//- /other.rs crate:other deps:core new_source_root:library
+pub fn o1() -> u32 {{ 1 }}
+{MAIN}#[rustc_builtin_macro]
+macro_rules! line {{ () => {{}} }}
+#[rustc_builtin_macro]
+macro_rules! column {{ () => {{}} }}
+#[rustc_builtin_macro]
+macro_rules! concat {{ () => {{}} }}
+{}pub fn located() -> u32 {{
+    let {here} = line!();
+    let {at} = column!();
+    let {said} = concat!("at ", line!());
+    {here} + {at}
+}}
+pub fn matched(x: u32) -> bool {{ match x {{ line!() => true, _ => false }} }}
+"#,
+        "// moved\n".repeat(down),
+    )
+}
+
+/// Where `call` is first written in `main.rs` of `fixture`: its line and column, 1-based, as
+/// rustc's `line!` and `column!` give them for ASCII text.
+fn written_at(fixture: &str, call: &str) -> (u32, u32) {
+    let text = fixture.split_once(MAIN).expect("a `main.rs`").1;
+    let before = &text[..text.find(call).expect("the call is written")];
+    let line = before.matches('\n').count() + 1;
+    let column = before.len() - before.rfind('\n').map_or(0, |it| it + 1) + 1;
+    (line as u32, column as u32)
+}
+
+/// The MIR lowering builds of `located` in `fixture`: each location literal's constant made of
+/// where its call is written, the operand and statement spans its literal.
+fn located_mir<'db>(db: &'db Db, def: DefWithBodyId, fixture: &str) -> MirBody<'db> {
+    let types = &default_types().types;
+    let (line, _) = written_at(fixture, "line!()");
+    let (_, column) = written_at(fixture, "column!()");
+    let (concat_line, _) = written_at(fixture, "line!())");
+    let literals: Vec<ExprId> = Body::of(db, def)
+        .exprs()
+        .filter_map(|(id, expr)| matches!(expr, Expr::Literal(_)).then_some(id))
+        .collect();
+    let [line_at, column_at, said_at] = literals[..] else {
+        panic!("`located` has three literals: {literals:?}");
+    };
+    let said = format!("at {concat_line}");
+    let mut fat = Vec::new();
+    fat.extend_from_slice(&0u64.to_le_bytes());
+    fat.extend_from_slice(&(said.len() as u64).to_le_bytes());
+    let constants = [
+        (line_at, Operand::from_bytes(Box::from(line.to_le_bytes()), types.u32), types.u32),
+        (column_at, Operand::from_bytes(Box::from(column.to_le_bytes()), types.u32), types.u32),
+        (
+            said_at,
+            Operand::from_concrete_const(fat.into(), MemoryMap::simple(said.as_bytes().into()), types.static_str_ref),
+            types.static_str_ref,
+        ),
+    ];
+    let mut locals = Arena::new();
+    let ret = locals.alloc(Local { ty: types.u32.store() });
+    let place = |local| Place::<'db> { local, projection: Projection::new_from_slice(&[]) }.store();
+    let mut binding_locals = ArenaMap::<BindingId, LocalId>::default();
+    let mut statements = Vec::new();
+    for (binding, (expr, mut operand, ty)) in constants.into_iter().enumerate() {
+        let local = locals.alloc(Local { ty: ty.store() });
+        binding_locals.insert(idx(binding as u32), local);
+        operand.span = Some(MirSpan::ExprId(expr));
+        statements.push(Statement { kind: StatementKind::Assign(place(local), Rvalue::Use(operand)), span: MirSpan::ExprId(expr) });
+    }
+    let here = binding_locals[idx(0)];
+    statements.push(Statement {
+        kind: StatementKind::Assign(place(ret), Rvalue::Use(Operand { kind: OperandKind::Copy(place(here)), span: None })),
+        span: MirSpan::Unknown,
+    });
+    let mut basic_blocks = Arena::new();
+    let start = basic_blocks.alloc(BasicBlock {
+        statements,
+        terminator: Some(Terminator { span: MirSpan::Unknown, kind: TerminatorKind::Return }),
+        is_cleanup: false,
+    });
+    MirBody {
+        basic_blocks,
+        locals,
+        start_block: start,
+        owner: InferBodyId::DefWithBodyId(def),
+        binding_locals,
+        upvar_locals: FxHashMap::default(),
+        param_locals: Vec::new(),
+        promoted_locals: Vec::new(),
+        closures: Vec::new(),
+        coroutine: None,
+        unreached: Vec::new(),
+        scope_ends: Vec::new(),
+        inherits_overflow_checks: false,
+        phase: MirPhase::Built,
+        upvars_in_place: Vec::new(),
+        panic_unwinds: Vec::new(),
+        promoted_constants: Vec::new(),
+        unreachable_after_calls: Vec::new(),
+        guard_refs: Vec::new(),
+        capture_copies: Vec::new(),
+        inlined: Inlined::default(),
+    }
+}
+
+#[test]
+fn a_moved_body_with_renamed_locals_reads_its_locations_from_where_it_is_now() {
+    let memory = Arc::new(Memory::default());
+    let defs = Defs::default();
+    let before = located(0, ["here", "at", "said"]);
+    let after = located(5, ["there", "col", "told"]);
+    assert_eq!(written_at(&after, "line!()").0, written_at(&before, "line!()").0 + 5);
+
+    let first = session(db_of(&before), &memory, &defs, None, Mode::Serve);
+    let def = function(&first.db, "located");
+    let mut record = Vec::new();
+    encode(&first.db, &*first.facts, def, &located_mir(&first.db, def, &before), &mut record).expect("a location literal is a slot");
+
+    let moved = session(second(&after), &memory, &defs, None, Mode::Serve);
+    let def = function(&moved.db, "located");
+    let fresh = located_mir(&moved.db, def, &after);
+    reset_ran();
+    let read = decode(&moved.db, &*moved.facts, def, &Aligned::copy_from(&record)).expect("the record reads in the moved body");
+    assert_eq!(ran(), 0, "no MIR is built");
+    assert_eq!(read, fresh, "each location is where the call is now");
+    let mut again = Vec::new();
+    encode(&moved.db, &*moved.facts, def, &fresh, &mut again).unwrap();
+    assert!(again == record, "the record holds no line, column or text a location macro made");
+}
+
+#[test]
+fn a_location_constant_that_is_not_its_literals_is_refused() {
+    let fixture = located(0, ["here", "at", "said"]);
+    let s = session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    let def = function(&s.db, "located");
+    let mut body = located_mir(&s.db, def, &fixture);
+    let Rvalue::Use(operand) = match &mut body.basic_blocks[body.start_block].statements[0].kind {
+        StatementKind::Assign(_, rvalue) => rvalue,
+        _ => unreachable!("the first statement assigns the line"),
+    } else {
+        unreachable!("of a constant")
+    };
+    *operand = Operand { span: operand.span, ..Operand::from_bytes(Box::new([0; 4]), default_types().types.u32) };
+    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a line that is not the literal's");
+    assert!(error.contains("location"), "{error}");
+}
+
+#[test]
+fn a_location_macro_in_a_pattern_is_refused() {
+    let fixture = located(0, ["here", "at", "said"]);
+    let s = session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
+    let def = function(&s.db, "matched");
+    let mut body = located_mir(&s.db, function(&s.db, "located"), &fixture);
+    body.owner = InferBodyId::DefWithBodyId(def);
+    body.basic_blocks[body.start_block].statements.clear();
+    let error = encode(&s.db, &*s.facts, def, &body, &mut Vec::new()).expect_err("a pattern's line has no slot");
+    assert!(error.contains("pattern"), "{error}");
 }
 
 #[test]

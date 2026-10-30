@@ -18,11 +18,9 @@ use std::fmt::Write as _;
 use base_db::{Crate, Db, Maintained, all_crates};
 use blaze_dbsp::Work;
 use blaze_mem::Tag;
-use hir_expand::{MacroCallKind, name::Name};
+use hir_expand::{MacroCallKind, fixture, name::Name};
 use intern::Symbol;
 use span::FileId;
-use test_fixture::ChangeFixture;
-use test_utils::{FixtureWithProjectMeta, MiniCore};
 
 use crate::{
     ModuleId,
@@ -63,13 +61,10 @@ pub(super) struct Loaded {
 
 impl Loaded {
     pub(super) fn new(fixture: &str) -> Loaded {
-        let mut db = TestDB::for_tests();
-        let change =
-            ChangeFixture::parse_with_proc_macros(fixture, MiniCore::RAW_SOURCE, extra_proc_macros());
-        let paths = FixtureWithProjectMeta::parse(fixture).fixture.into_iter().map(|it| it.path);
-        let files = paths.zip(change.files.iter().map(|it| it.file_id())).collect();
-        change.change.apply(&mut db);
-        Loaded { db, files }
+        let fx = fixture::db_with_proc_macros(fixture, extra_proc_macros());
+        let files =
+            fx.paths().iter().cloned().zip(fx.files().iter().map(|it| it.file_id())).collect();
+        Loaded { db: fx.into_db(), files }
     }
 
     pub(super) fn file(&self, path: &str) -> FileId {

@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ide_db::{RootDatabase, base_db::salsa};
+use base_db::{Db, salsa};
 
 /// The directory `BLAZE_MEMORY` names, when it is set.
 pub fn report_dir() -> Option<PathBuf> {
@@ -250,7 +250,7 @@ pub fn checkpoint(step: &str) {
 }
 
 /// Writes what the daemon holds now that `step` is done to the directory `BLAZE_MEMORY` names.
-pub fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
+pub fn report(db: &mut Db, step: &str) -> anyhow::Result<()> {
     checkpoint(step);
     let Some(dir) = report_dir() else { return Ok(()) };
     std::fs::create_dir_all(&dir)?;
@@ -260,7 +260,7 @@ pub fn report(db: &mut RootDatabase, step: &str) -> anyhow::Result<()> {
 }
 
 /// [`report`] once the daemon has answered a request, as `request-N`, N counting from 1.
-pub fn served(db: &mut RootDatabase) -> anyhow::Result<()> {
+pub fn served(db: &mut Db) -> anyhow::Result<()> {
     static SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if report_dir().is_none() {
         return Ok(());
@@ -272,7 +272,7 @@ pub fn served(db: &mut RootDatabase) -> anyhow::Result<()> {
 /// A line for every struct and query of the database: how many there are and the bytes of
 /// their fields, of the database's own records about them and, where the ingredient can
 /// tell, of what the fields own on the heap.
-fn ingredients(db: &mut RootDatabase) -> String {
+fn ingredients(db: &mut Db) -> String {
     // dyn: salsa's `memory_usage` is on `dyn Database`; a report, off any build's path
     let db: &mut dyn salsa::Database = db;
     let usage = db.memory_usage();

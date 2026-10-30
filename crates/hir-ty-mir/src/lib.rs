@@ -16,4 +16,15 @@ use hir_def::CallableDefId;
 #[allow(unused_imports, reason = "hir-ty's root, which the passes name as `crate::`")]
 use hir_ty::*;
 
+pub mod const_macro;
 pub mod mir;
+pub mod mir_pretty;
+
+#[cfg(test)]
+mod test_db;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

@@ -32,7 +32,7 @@ use blaze_diagnostics::{Diag, Options, cache};
 use blaze_ids::ContentId;
 use hir_def::deps::{Held, ImageBuf, ImageStore, Mode, Served};
 use hir_ty::{body_store, next_solver::goal_store};
-use load_cargo::v2::Lowered;
+use blaze_lower::Lowered;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{Job, compile, graph};
@@ -202,6 +202,11 @@ pub(crate) fn item_errors(session: &Session) -> Result<(), ApiError> {
 }
 
 impl Session {
+    /// What this build's item store lookups found, step by step; None with no item store.
+    pub(crate) fn item_steps(&self) -> Option<[body_store::StepCounts; 3]> {
+        self.items.as_ref().map(body_store::Installed::steps)
+    }
+
     /// The dependencies' check outcomes the database was served, for a job's units to read.
     pub(crate) fn checks(&self) -> Arc<cache::Served> {
         Arc::clone(&self.checks)
@@ -298,11 +303,51 @@ pub(crate) struct Flushes {
     pub(crate) items: Option<body_store::Flushed>,
 }
 
-/// The `-v` note of what [`store`]'s flushes did: the goals' ([`flushed`]), then the bodies'
-/// steps the head's last build offered, and why any were kept out.
-pub(crate) fn noted(flushes: &Flushes) -> Diagnostic {
-    let mut note = flushed(&flushes.goals);
-    let Some(items) = &flushes.items else { return note };
+/// The `-v` note of a build: what [`store`]'s flushes did when it lowered (`flushes`: the goals'
+/// ([`flushed`]), then the bodies' steps the head's last build offered, and why any were kept
+/// out), then what this build's item store lookups found, step by step (`steps`, from
+/// [`Session::item_steps`]). None when there is neither.
+pub(crate) fn noted(flushes: Option<&Flushes>, steps: Option<&[body_store::StepCounts; 3]>) -> Option<Diagnostic> {
+    let note = flushes.map(|it| flushed(&it.goals));
+    let mut message = String::new();
+    if let Some(items) = flushes.and_then(|it| it.items.as_ref()) {
+        message.push_str("; ");
+        items_flushed(items, &mut message);
+    }
+    if let Some(steps) = steps {
+        message.push_str("; the item store, this build:");
+        for (at, (counts, step)) in steps.iter().zip(["inference", "MIR", "borrow check"]).enumerate() {
+            let body_store::StepCounts { hits, ran, refused } = counts;
+            let sep = if at == 0 { "" } else { ";" };
+            message.push_str(&format!("{sep} {step} {hits} hit, {ran} ran, {refused} refused")); // alloc: under `-v`, once per build
+        }
+    }
+    let mut note = match note {
+        Some(note) => note,
+        None if message.is_empty() => return None,
+        None => Diagnostic {
+            level: Level::Note,
+            code: None,
+            rendered: String::new(),
+            message: String::new(),
+            spans: Vec::new(),    // alloc: none
+            children: Vec::new(), // alloc: none
+            facts: Vec::new(),    // alloc: none
+            unit: None,
+            explanation: None,
+        },
+    };
+    let message = match note.message.is_empty() {
+        true => message.trim_start_matches("; "),
+        false => message.as_str(),
+    };
+    note.message.push_str(message);
+    note.rendered = format!("note: {}\n", note.message); // alloc: under `-v`, once per build
+    Some(note)
+}
+
+/// What the item store's flush did, written after `message`'s end.
+fn items_flushed(items: &body_store::Flushed, message: &mut String) {
     let body_store::Flushed {
         written,
         kept,
@@ -313,9 +358,10 @@ pub(crate) fn noted(flushes: &Flushes) -> Diagnostic {
         unshareable,
         unencodable,
         dropped,
+        steps: _,
     } = items;
     // alloc: under `-v`, once per build that stored a front end
-    let mut message = format!("; the item store: {written} written, {kept} kept, {slots_full} with every slot full");
+    message.push_str(&format!("the item store: {written} written, {kept} kept, {slots_full} with every slot full"));
     if !refused.is_empty() {
         let by: Vec<String> = refused.iter().map(|(read, count)| format!("`{read}` ({count})")).collect(); // alloc: as above
         message.push_str(&format!("; steps kept out by reads of {}", by.join(", "))); // alloc: as above
@@ -331,9 +377,6 @@ pub(crate) fn noted(flushes: &Flushes) -> Diagnostic {
             message.push_str(&format!("; {count} {why}")); // alloc: as above
         }
     }
-    note.message.push_str(&message);
-    note.rendered = format!("note: {}\n", note.message); // alloc: as above
-    note
 }
 
 /// The `-v` note of what [`store`]'s flush of the persistent goal cache did with the goals the
@@ -436,7 +479,7 @@ pub(crate) fn served(db: &Db, job: &Job, session: &Session) -> Result<Vec<Served
 fn build() -> Result<ContentId, ApiError> {
     static BUILD: OnceLock<Result<ContentId, String>> = OnceLock::new();
     let worked_out = BUILD.get_or_init(|| {
-        let host = crate::cargo::toolchain::host()
+        let host = crate::toolchain::host()
             .ok_or("blaze has no target triple for this machine's architecture and system")?;
         hir_ty_codegen::v2::toolchain(host, &[], hir_ty_codegen::v2::Runs::Elsewhere).map(|it| it.id)
     });
@@ -502,7 +545,7 @@ impl ImageStore for Images {
     }
 
     fn reads_now(&self, env: &Env, shape: &[u8]) -> Result<ContentId, String> {
-        blaze_expand::reads_now(env, shape)
+        proc_macro_api::kept::reads_now(env, shape)
     }
 
     // dyn: as `ImageStore::for_each`, one call per batch of crates

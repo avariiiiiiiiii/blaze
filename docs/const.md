@@ -33,9 +33,9 @@ Whether a call in a const body is const is decided as rustc decides it, by provi
 that has the bound, a `const impl` holds for its type when its own `[const]` bounds do, and a
 closure or fn item is `[const] Fn` when it is const. `non_const_calls` lists the calls that are
 not, for the const checker (#860) to refuse; ordinary type checking does not prove effects, so
-it costs nothing outside const bodies. Tests: `crates/hir-ide/src/tests/const_effects.rs`.
+it costs nothing outside const bodies. Tests: `crates/hir-ty-mir/src/tests/const_effects.rs`.
 
-Tests: `crates/hir-ide/src/tests/consteval/const_traits.rs` (values from rustc on the same
+Tests: `crates/hir-ty-mir/src/tests/consteval/const_traits.rs` (values from rustc on the same
 programs).
 
 ## Extensions (beyond the pinned nightly)

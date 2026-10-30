@@ -830,7 +830,7 @@ pub(crate) mod tests {
     use span::Edition;
     use stdx::format_to;
     use syntax::view::AstNode;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::test_db::{TestDB, TestDBExt};
 
@@ -849,7 +849,9 @@ pub(crate) mod tests {
         allow_unstable: bool,
         expect: Expect,
     ) {
-        let (db, pos) = TestDB::with_position(ra_fixture);
+        let fx = fixture::db(ra_fixture);
+        let pos = fx.position();
+        let db = fx.into_db();
         let module = db.module_at_position(pos);
         let parsed_path_file =
             syntax::SourceFile::parse(&format!("use {path};"), span::Edition::CURRENT);
@@ -3261,7 +3263,7 @@ pub mod future {
         for seed in 0..16u64 {
             let shape = shapes[seed as usize % shapes.len()];
             let fixture = gen_fixture(seed, shape);
-            let db = TestDB::with_files(&fixture);
+            let db = fixture::db(&fixture).into_db();
             let main = crate_named(&db, "main");
             let items = declared_items(&db);
             let mut scratch = FindPathScratch::default();
@@ -3399,7 +3401,7 @@ pub mod future {
         let shape = Shape { private_modules: false, private_imports: true };
         for seed in 100..132u64 {
             let fixture = gen_fixture(seed, shape);
-            let db = TestDB::with_files(&fixture);
+            let db = fixture::db(&fixture).into_db();
             let main = crate_named(&db, "main");
             let def_map = crate::nameres::crate_def_map(&db, main);
             let targets: Vec<ModuleDefId> = def_map
@@ -3450,7 +3452,7 @@ pub mod future {
     /// thread's scratch has grown and the path is interned: 0 allocations.
     #[test]
     fn a_warm_find_path_allocates_nothing() {
-        let (db, pos) = TestDB::with_position(
+        let fx = fixture::db(
             r#"
 //- /main.rs crate:main deps:dep
 mod a {
@@ -3470,6 +3472,8 @@ pub mod x {
 }
 "#,
         );
+        let pos = fx.position();
+        let db = fx.into_db();
         let module = db.module_at_position(pos);
         let (def_map, local_def_map) = module.local_def_map(&db);
         let item = |kind: PathKind, segments: &[&str]| {

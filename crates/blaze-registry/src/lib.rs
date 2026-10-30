@@ -72,7 +72,7 @@ pub struct Context {
     // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     pub http: Arc<dyn http::Http>,
     /// blaze's store, which keeps `.crate` files by their sha256.
-    pub store: Option<&'static blaze_store::Store>,
+    pub store: Option<&'static blaze_cas::Handle>,
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
     pub keep_crate_files: bool,

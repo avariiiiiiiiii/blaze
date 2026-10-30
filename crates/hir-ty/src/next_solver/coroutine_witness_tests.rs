@@ -14,7 +14,7 @@ use rustc_type_ir::{
     BoundVar, DebruijnIndex, INNERMOST, Mutability, TypingMode,
     inherent::{SliceLike as _, Ty as _},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::interner::bind_witness_regions;
 use crate::{
@@ -152,7 +152,7 @@ fn send(db: &Db) -> TraitId {
 
 #[test]
 fn a_coroutine_is_send_only_when_what_it_holds_across_an_await_is() {
-    let db = Db::with_files(HELD_ACROSS_AWAIT);
+    let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
     crate::next_solver::attach_db(&db, || {
         let send = send(&db);
         for (name, expected) in [
@@ -166,7 +166,7 @@ fn a_coroutine_is_send_only_when_what_it_holds_across_an_await_is() {
                 .find(|(_, it)| it.name.as_str() == "fut")
                 .unwrap_or_else(|| panic!("no binding `fut` in `{name}`"));
             let fut = InferenceResult::of(&db, InferBodyId::DefWithBodyId(def)).binding_ty(fut);
-            let interner = DbInterner::new_with(&db, db.test_crate());
+            let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
             let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
             let answer = infcx.type_implements_trait(send, [fut], ParamEnv::empty());
             assert_eq!(answer, expected, "{name}: is its future `Send`");

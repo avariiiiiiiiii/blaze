@@ -919,11 +919,10 @@ mod tests {
     use expect_test::expect;
     use hir_expand::InFile;
     use syntax::view::{self as ast, AstNode, AstToken, block_may_start_with_inner_attr};
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
     use thin_vec::ThinVec;
     use tt::{TextRange, TextSize};
 
-    use crate::test_db::TestDB;
 
     use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
 
@@ -958,7 +957,9 @@ mod tests {
 
     #[test]
     fn docs() {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let mut docs = Docs {
             docs: String::new(),
             docs_source_map: Vec::new(),
@@ -1135,7 +1136,9 @@ mod tests {
 
     #[test]
     fn sugared_desugared_mix() {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let mut docs = Docs {
             docs: String::new(),
             docs_source_map: Vec::new(),
@@ -1194,7 +1197,9 @@ mod tests {
 
     #[test]
     fn remove_indent_as_by_lines() {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let lines = [
             "", " ", "  a", "\tb", " \t ü", "ü", "   日本", "x", "  ", " 🦀 c", "\t\td", "    e",
         ];
@@ -1230,7 +1235,9 @@ mod tests {
     /// Extracts the docs of the first comment in `source`, running the same normalization as
     /// [`super::extract_docs`] does for inline docs.
     fn comment_docs(source: &str) -> Docs {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let parse = syntax::SourceFile::parse(source, span::Edition::CURRENT);
         let comment = parse
             .root()
@@ -1315,7 +1322,9 @@ mod tests {
 
     /// Extracts the docs of the first string in `source`, as if it were a `#[doc = "..."]` value.
     fn doc_attr_docs(source: &str) -> Docs {
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let parse = syntax::SourceFile::parse(source, span::Edition::CURRENT);
         let value = parse
             .root()
@@ -1456,7 +1465,9 @@ mod tests {
     fn trims_match_reference() {
         use super::{get_horizontal_trim, get_vertical_trim};
 
-        let (_db, file_id) = TestDB::with_single_file("");
+        let fx = fixture::db("");
+        let file_id = fx.only_file();
+        let _db = fx.into_db();
         let pieces = ["", "*", "**", " * a", "\t* b", "  c", "* ", "   ", "*/", "d *", " ** e"];
         let mut rng = SplitMix64::new(0x646f_6373);
         for case in 0..20_000 {

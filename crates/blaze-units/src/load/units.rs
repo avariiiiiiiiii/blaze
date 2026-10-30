@@ -301,14 +301,32 @@ pub(crate) fn units(
     }
 
     let checksums = resolved.resolve.checksums();
-    let mut packages: Vec<PackagePlan> = by_id
-        .iter()
-        .map(|(id, package)| {
-            let checksum = checksums.get(id).and_then(Option::as_deref);
-            let tests = test_sandbox.remove(id).unwrap_or_default();
-            package_plan(*id, package.manifest, resolved.manifests[id].0, package.is_member, checksum, tests)
-        })
-        .collect();
+    let const_macros_on = super::sandbox::const_macros_on(ws.custom_metadata());
+    let mut packages: Vec<PackagePlan> = Vec::with_capacity(by_id.len());
+    // The first by manifest, whatever order the packages are walked in.
+    let mut failed: Option<LoadError> = None;
+    for (id, package) in &by_id {
+        let checksum = checksums.get(id).and_then(Option::as_deref);
+        let tests = test_sandbox.remove(id).unwrap_or_default();
+        let manifest_path = resolved.manifests[id].0;
+        let metadata = package.manifest.custom_metadata.as_ref();
+        match super::sandbox::const_macros(metadata, manifest_path, ws.root_manifest(), const_macros_on) {
+            Ok(const_macros) => packages.push(package_plan(
+                *id,
+                package.manifest,
+                manifest_path,
+                package.is_member,
+                checksum,
+                tests,
+                const_macros,
+            )),
+            Err(error) if failed.as_ref().is_none_or(|it| error.at < it.at) => failed = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = failed {
+        return Ok(Staged::Failed(error));
+    }
     packages.extend(std_packages);
     packages.sort_by(|a, b| a.id.cmp(&b.id));
     packages.dedup_by(|a, b| a.id == b.id);
@@ -727,6 +745,7 @@ fn package_plan(
     is_member: bool,
     checksum: Option<&str>,
     tests: TestSandbox,
+    const_macros: Option<String>,
 ) -> PackagePlan {
     let named = format!("{} v{}", id.name(), id.version());
     let full = id.to_string();
@@ -741,5 +760,6 @@ fn package_plan(
         default_run: manifest.default_run.clone(),
         checksum: checksum.filter(|_| id.source_id().is_crates_io()).and_then(blaze_format::hex::decode::<32>),
         tests,
+        const_macros,
     }
 }

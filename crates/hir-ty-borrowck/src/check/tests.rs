@@ -14,11 +14,10 @@ use hir_def::{
 };
 use hir_ty::mir::MirSpan;
 use hir_ty_mir as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{Applicability, BorrowckDiagnostic, Mode, PartSpan, Sublevel, borrowck_in_mode};
 
-type TestDB = base_db::Db;
 
 thread_local! {
     /// What the parts of the checks run on this thread took from the global allocator.
@@ -142,7 +141,9 @@ fn error_of(
     want: &[(&str, &str)],
     rest: impl FnOnce(&TestDB, &BodySourceMap, &BorrowckDiagnostic),
 ) {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = function(&db, name);
         let (_, source_map) = Body::with_source_map(&db, def);
@@ -354,7 +355,9 @@ fn moves(shape: Shape) -> Shape {
 
 #[test]
 fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
-    let (db, _) = TestDB::with_single_file(CLEAN);
+    let fx = fixture::db(CLEAN);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut bodies = 0;
         for &krate in all_crates(&db).iter() {

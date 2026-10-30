@@ -1867,6 +1867,14 @@ impl ExpressionStore {
         }
     }
 
+    #[inline]
+    pub fn labels(&self) -> impl Iterator<Item = (LabelId, &Label)> {
+        match &self.expr_only {
+            Some(it) => it.labels.iter(),
+            None => const { &Arena::new() }.iter(),
+        }
+    }
+
     /// The coroutine associated with a coroutine closure.
     #[inline]
     pub fn coroutine_for_closure(coroutine_closure: ExprId) -> ExprId {

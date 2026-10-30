@@ -9,7 +9,7 @@ use hir_def::{
     src::{HasChildSourceView, HasSource as _},
 };
 use hir_expand::{EditionedFileId, HirFileId, InFile};
-use hir_ide::{db::InternedClosure, next_solver::AnyImplId};
+use hir_ty::{db::InternedClosure, next_solver::AnyImplId};
 use syntax::{
     SyntaxKind, SyntaxNodePtr, TextRange,
     view::{self as ast, AstNode, HasName as _, Node, Typed},

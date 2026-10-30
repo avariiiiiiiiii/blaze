@@ -12,7 +12,7 @@ use syntax::{
     ast as tag,
     view::{self as ast, AstNode as _},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId,
@@ -55,7 +55,9 @@ fn the_function(db: &TestDB) -> DefWithBodyId {
 
 #[test]
 fn reading_a_store_allocates_nothing() {
-    let (db, _) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let body = Body::of(&db, the_function(&db));
     assert!(body.expr_ids().len() > 10 && body.pat_ids().len() > 5, "too small to measure");
     assert_at_most(0, "reading every node of a store", || {
@@ -73,7 +75,9 @@ fn reading_a_store_allocates_nothing() {
 
 #[test]
 fn a_memo_hit_allocates_nothing() {
-    let (db, _) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let def = the_function(&db);
     Body::of(&db, def);
     ExprScopes::of(&db, def);
@@ -83,7 +87,9 @@ fn a_memo_hit_allocates_nothing() {
 
 #[test]
 fn a_scope_lookup_allocates_nothing() {
-    let (db, _) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let def = the_function(&db);
     let body = Body::of(&db, def);
     let scopes = ExprScopes::of(&db, def);
@@ -108,7 +114,9 @@ fn a_scope_lookup_allocates_nothing() {
 /// (`SourceTable`'s search).
 #[test]
 fn source_map_lookups_allocate_nothing() {
-    let (db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let def = the_function(&db);
     let (body, map) = Body::with_source_map(&db, def);
     let root = file.parse(&db).root();

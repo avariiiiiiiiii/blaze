@@ -16,7 +16,7 @@ use blaze_items::{CodeHash, ItemKey};
 use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::MirSpan;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{
     Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, Kind,
@@ -32,7 +32,7 @@ use db::TestDB;
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
-    held(TestDB::with_single_file(text).0)
+    held(fixture::db(text).into_db())
 }
 
 fn held(db: TestDB) -> (&'static TestDB, HirFrontend<'static>) {
@@ -74,7 +74,7 @@ fn inlines(spec: &Spec) -> bool {
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 fn spec() -> Spec {
@@ -239,7 +239,7 @@ fn instances_with_one_share_key_are_one() {
     let (db, frontend) = frontend(SHARED);
     let policy = policy(OptLevel::O0);
     let root = frontend.root(function(db, "roots"));
-    let origin = frontend.with(|hir, _| frontend.origin(hir, db.test_crate()));
+    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
     let key = |instance: &HirInstance| {
         let described = (frontend.describe(instance, &origin))
             .unwrap_or_else(|e| panic!("{instance:?}: {}", e.what));
@@ -272,7 +272,7 @@ fn a_generic_is_shared_under_every_options_its_units_build_with() {
         MirOptions,
     };
     let (db, frontend) = frontend(SHARED);
-    let origin = frontend.with(|hir, _| frontend.origin(hir, db.test_crate()));
+    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
     let options = |policy: &Policy| {
         let build_time = std::sync::Arc::new(BuildTime(Default::default()));
         let frontend =
@@ -429,7 +429,7 @@ pub fn roots(x: u32) -> u32 { dep::outer(x) }
 /// any depth.
 #[test]
 fn an_always_inline_callee_of_a_dependency_is_built_in() {
-    let (db, frontend) = held(TestDB::with_files(ALWAYS));
+    let (db, frontend) = held(fixture::db(ALWAYS).into_db());
     let root = frontend.root(function(&db, "roots"));
     let spec = spec();
     frontend.with(|db, homes| {
@@ -497,7 +497,7 @@ fn an_instances_arguments_are_evaluated() {
 fn a_units_mir_level_is_rustcs() {
     use hir_ty_mir::mir::MirOptLevel;
     let (db, _) = frontend(SIBLINGS);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let level = |spec: &Spec| Build::of(spec).options(db, krate, krate).level;
     let mut spec = spec();
     assert_eq!(level(&spec), MirOptLevel::Debug);
@@ -515,7 +515,7 @@ fn a_units_mir_level_is_rustcs() {
 #[test]
 fn an_allocator_entry_calls_what_its_walk_lists() {
     let (db, frontend) = frontend(REFERRING);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let entry = |to| Forward { symbol: "__rust_alloc", to, params: 2, returns: true, krate };
     let ours = HirInstance(Kind::Allocator(entry(Some("__blaze_global_alloc"))));
     let defaults = entry(Some("__rdl_alloc"));
@@ -651,7 +651,7 @@ fn built_as(db: &Db, spec: &Spec, instance: &HirInstance) -> super::Built {
 #[test]
 fn a_units_bodies_are_inlined_as_rustcs() {
     let (db, _) = frontend(SIBLINGS);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let core = base_db::all_crates(db)
         .iter()
         .copied()
@@ -699,7 +699,7 @@ fn which_units_inline_is_the_policys() {
     assert!(inlines(&policy(OptLevel::O2), &root));
     assert!(!inlines(&policy(OptLevel::O1), &root));
     let mut set_apart = policy(OptLevel::O3);
-    let name = frontend.with(|hir, _| match frontend.origin(hir, db.test_crate()) {
+    let name = frontend.with(|hir, _| match frontend.origin(hir, fixture::test_crate(&db)) {
         blaze_codegen::plan::Origin::Member(name) => name.as_str().to_owned(),
         other => panic!("the fixture's crate is {other:?}"),
     });
@@ -728,7 +728,7 @@ pub fn caller(x: u32) -> u32 { f(x) }
 /// there. It lists all the walk without inlining does, first.
 #[test]
 fn the_walk_lists_what_inlined_code_calls() {
-    let (db, frontend) = held_as(TestDB::with_single_file(INLINED).0, &policy(OptLevel::O3));
+    let (db, frontend) = held_as(fixture::db(INLINED).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
     let (f, g) = (function(db, "f"), function(db, "g"));
     frontend.with(|db, homes| {
@@ -768,7 +768,7 @@ pub fn caller(x: u32) -> u32 { leaf(x) ^ mid(x) }
 /// is among what the caller's key holds once.
 #[test]
 fn a_callee_inlined_twice_is_built_in_once() {
-    let (db, frontend) = held_as(TestDB::with_single_file(TWICE).0, &policy(OptLevel::O3));
+    let (db, frontend) = held_as(fixture::db(TWICE).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
     let (leaf, mid) = (function(db, "leaf"), function(db, "mid"));
     frontend.with(|db, homes| {
@@ -798,7 +798,7 @@ pub fn caller() -> &'static Location<'static> { here() }
 #[test]
 fn an_inlined_track_caller_callee_reports_the_call() {
     use crate::fragment::DataRequest;
-    let (db, frontend) = held_as(TestDB::with_single_file(TRACKED).0, &policy(OptLevel::O3));
+    let (db, frontend) = held_as(fixture::db(TRACKED).into_db(), &policy(OptLevel::O3));
     let root = frontend.root(function(db, "caller"));
     let here = function(db, "here");
     let caller: DefWithBodyId = function(db, "caller").into();

@@ -28,7 +28,7 @@ use blaze_units::{
 };
 use blaze_vfs::View;
 use hir_firewall::{Codegen, Harness, Report};
-use load_cargo::v2::{Lower, Lowered, Ran};
+use blaze_lower::{Lower, Lowered, Ran};
 use serde::Deserialize;
 
 const LIBRARY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../library");
@@ -276,7 +276,7 @@ fn lower(dir: &str, cargo_home: &str) -> Result<(Lowered, Units), String> {
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home)?;
     let lower = Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None };
-    let mut lowered = load_cargo::v2::lower_into(Db::logged(), lower).map_err(|error| format!("lowering {dir}: {error}"))?;
+    let mut lowered = blaze_lower::lower_into(Db::logged(), lower).map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {
             let run = ran(&units, unit)?;

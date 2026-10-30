@@ -6,8 +6,7 @@ use base_db::{Db, Crate};
 use blaze_format::{FormatError, Placed, Slice, Writer};
 use hir_def::{
     ConstId, EnumVariantId, ExpressionStoreOwnerId, ItemContainerId, StaticId,
-    attrs::AttrFlags,
-    expr_store::{Body, ExpressionStore, HygieneId, path::Path},
+    expr_store::{ExpressionStore, HygieneId, path::Path},
     hir::{Expr, ExprId, Literal},
     resolver::{Resolver, ValueNs},
     signatures::ImplSignature,
@@ -36,6 +35,7 @@ use crate::{
 };
 
 pub mod deps;
+pub mod discriminants;
 pub mod hir_eval;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
@@ -431,31 +431,14 @@ pub(crate) fn create_anon_const<'a, 'db>(
     }
 }
 
+/// One variant's discriminant, kept per variant so that what reads it is invalidated only when
+/// its own value changes. Every variant's at once is [`discriminants::enum_discriminants`].
 #[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
 pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db Db,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
-    let def = variant_id.into();
-    let body = Body::of(db, def);
-    let loc = variant_id.lookup(db);
-    if matches!(body.expr(body.root_expr()), Expr::Missing) {
-        let prev_idx = loc.index(db).checked_sub(1);
-        let value = match prev_idx {
-            Some(prev_idx) => {
-                1 + db.const_eval_discriminant(loc.parent.enum_variants(db).variants[prev_idx].0)?
-            }
-            _ => 0,
-        };
-        return Ok(value);
-    }
-
-    let repr = AttrFlags::repr(db, loc.parent.into());
-    let is_signed = repr.and_then(|repr| repr.int).is_none_or(|int| int.is_signed());
-
-    let c = hir_eval::value(db, def.into(), GenericArgs::empty(), None)?;
-    let c = if is_signed { allocation_as_isize(c) } else { allocation_as_usize(c) as i128 };
-    Ok(c)
+    discriminants::variant_discriminant(db, variant_id)
 }
 
 fn const_eval_discriminant_cycle_result<'db>(

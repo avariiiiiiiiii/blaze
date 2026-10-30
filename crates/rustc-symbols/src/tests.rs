@@ -6,7 +6,7 @@ use hegel::generators as gs;
 use hir::Crate;
 use hir_def::FunctionId;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{Paths, Places, StaticPath, count::Counts};
 
@@ -322,7 +322,9 @@ mod reference {
 /// Every function written in the file, by its name, with the shared path of each and the
 /// reference's.
 fn function_paths(text: &str) -> Vec<(String, Option<String>, Option<String>)> {
-    let (db, file) = Db::with_single_file(text);
+    let fx = fixture::db(text);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir::attach_db(&db, || {
         let shared = Named { db: &db, places: Places::default() };
         let reference = reference::Resolver { db: &db };
@@ -342,7 +344,9 @@ fn function_paths(text: &str) -> Vec<(String, Option<String>, Option<String>)> {
 /// The self type of every `impl` written in the file, as the shared paths and the reference
 /// write it.
 fn impl_types(text: &str) -> Vec<(Option<String>, Option<String>)> {
-    let (db, file) = Db::with_single_file(text);
+    let fx = fixture::db(text);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir::attach_db(&db, || {
         let shared = Named { db: &db, places: Places::default() };
         let reference = reference::Resolver { db: &db };
@@ -459,7 +463,9 @@ fn host() {
 }
 const C: () = { static A: u8 = 0; };
 "#;
-    let (db, file) = Db::with_single_file(text);
+    let fx = fixture::db(text);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir::attach_db(&db, || {
         let shared = Named { db: &db, places: Places::default() };
         let sema = hir::view::Semantics::new(&db);

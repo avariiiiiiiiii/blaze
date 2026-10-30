@@ -35,7 +35,8 @@ blaze-mem.workspace = true
 cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-hir-ide.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
 hir-ty-borrowck.workspace = true
 hir-ty-matchck.workspace = true
 hir-ty-unsafeck.workspace = true
@@ -56,7 +57,7 @@ tracing-tree.workspace = true
 
 # local deps
 test-utils.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 syntax-bridge.workspace = true
 
 [features]

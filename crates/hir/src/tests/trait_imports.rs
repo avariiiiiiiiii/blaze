@@ -2,14 +2,13 @@
 //! E0658 once for a glob of a trait and once per namespace of a single import of its item.
 
 use hir_def::nameres::diagnostics::TraitItemImport;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use super::db::TestDB;
 use crate::{AnyDiagnostic, Crate};
 
 /// The `why` of each `TraitItemImport` hir reports for the crate `main`, in order.
 fn reported(fixture: &str) -> Vec<TraitItemImport> {
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     crate::attach_db(&db, || {
         let main = Crate::all(&db)
             .into_iter()

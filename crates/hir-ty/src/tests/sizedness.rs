@@ -11,7 +11,7 @@ use hir_def::{
     signatures::{FunctionSignature, TraitSignature, TypeAliasSignature},
 };
 use rustc_type_ir::inherent::IntoKind as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     GenericPredicates,
@@ -35,7 +35,7 @@ trait Holder {
 "#;
 
 fn declarations(db: &Db) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .collect()
@@ -56,7 +56,7 @@ fn sizedness<'db>(
     db: &Db,
     clauses: impl IntoIterator<Item = Clause<'db>>,
 ) -> Vec<(u32, &'static str)> {
-    let lang = lang_items(db, db.test_crate());
+    let lang = lang_items(db, fixture::test_crate(db));
     let names =
         [(lang.Sized, "Sized"), (lang.MetaSized, "MetaSized"), (lang.PointeeSized, "PointeeSized")];
     clauses
@@ -74,7 +74,7 @@ fn sizedness<'db>(
 
 #[test]
 fn implicit_sizedness_bounds_are_rustcs() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         let f = declarations(&db)
             .into_iter()
@@ -112,7 +112,7 @@ fn implicit_sizedness_bounds_are_rustcs() {
                 .find(|&it| TypeAliasSignature::of(&db, it).name.as_str() == name)
                 .unwrap_or_else(|| panic!("`Holder` has `{name}`"));
             let bounds = type_alias_bounds(&db, alias).skip_binder();
-            let lang = lang_items(&db, db.test_crate());
+            let lang = lang_items(&db, fixture::test_crate(&db));
             bounds
                 .iter()
                 .filter_map(|clause| clause.as_trait_clause())
@@ -120,7 +120,7 @@ fn implicit_sizedness_bounds_are_rustcs() {
                 .filter(|&it| Some(it) == lang.Sized || Some(it) == lang.MetaSized)
                 .collect::<Vec<_>>()
         };
-        let lang = lang_items(&db, db.test_crate());
+        let lang = lang_items(&db, fixture::test_crate(&db));
         assert_eq!(alias("Unsized"), [lang.MetaSized.unwrap()]);
         assert_eq!(alias("Plain"), [lang.Sized.unwrap()]);
     });

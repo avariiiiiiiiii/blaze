@@ -12,21 +12,21 @@ use hir_def::{
     nameres::{DefMap, crate_def_map},
     signatures::FunctionSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::identity::{identity, set_build};
 
 mod properties;
 
-fn db(fixture: &str) -> Db {
-    let mut db = <Db as WithFixture>::with_files(fixture);
+pub(super) fn db(fixture: &str) -> Db {
+    let mut db = fixture::db(fixture).into_db();
     set_build(&mut db, ContentId([7; 32]));
     db
 }
 
 /// The body of the one function named `name` in any crate, in a module, an impl or a block.
 #[track_caller]
-fn body(db: &Db, name: &str) -> DefWithBodyId {
+pub(super) fn body(db: &Db, name: &str) -> DefWithBodyId {
     let mut found = Vec::new();
     for &krate in base_db::all_crates(db).iter() {
         functions(db, crate_def_map(db, krate), &mut found);
@@ -87,7 +87,7 @@ pub fn g() -> u8 { 0 }
 macro_rules! mac { () => { 1u8 } }
 "#;
 
-fn with_dep(main: &str) -> String {
+pub(super) fn with_dep(main: &str) -> String {
     format!("//- /main.rs crate:main deps:dep\n{main}\n{DEP}")
 }
 
@@ -244,6 +244,30 @@ fn moving_the_item_in_its_file_keeps_it() {
     same(
         &with_dep("pub fn f() -> u8 { dep::g() }\npub fn h() {}"),
         &with_dep("pub fn h() {}\npub fn f() -> u8 { dep::g() }"),
+    );
+}
+
+#[test]
+fn moving_a_location_macro_keeps_it() {
+    let located = |body: &str| {
+        with_dep(&format!(
+            "#[rustc_builtin_macro]\nmacro_rules! line {{ () => {{}} }}\n\
+             #[rustc_builtin_macro]\nmacro_rules! column {{ () => {{}} }}\n{body}"
+        ))
+    };
+    // What `line!()` and `column!()` expand to is a slot the MIR record fills.
+    same(
+        &located("pub fn f() -> u32 { line!() + column!() }"),
+        &located("\n\n\npub fn f() -> u32 {\n    line!() + column!()\n}"),
+    );
+    // Not where inference makes a type of its value.
+    differ(
+        &located("pub fn f() -> usize { [0u8; line!() as usize].len() }"),
+        &located("\npub fn f() -> usize { [0u8; line!() as usize].len() }"),
+    );
+    differ(
+        &located("pub fn f() -> u32 { const { line!() } }"),
+        &located("\npub fn f() -> u32 { const { line!() } }"),
     );
 }
 

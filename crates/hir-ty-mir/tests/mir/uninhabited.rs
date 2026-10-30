@@ -10,9 +10,9 @@ use hir_ty::{
     db::HirDatabase,
     mir::{MirSpan, TerminatorKind},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 const ITEMS: &str = "\
 enum Void {}
@@ -30,7 +30,9 @@ impl S {
 #[track_caller]
 fn entries(src: &str, name: &str) -> Vec<(String, String, &'static str)> {
     let text = format!("{ITEMS}{src}");
-    let (db, _) = TestDB::with_single_file(&format!("//- minicore: sized\n{text}"));
+    let fx = fixture::db(&format!("//- minicore: sized\n{text}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, name);
         let body =
@@ -77,7 +79,9 @@ fn a_call_after_a_statement_is_an_unreachable_expression() {
 #[test]
 fn the_kept_body_ends_at_the_call() {
     let src = "fn main() {\n    f();\n    g();\n}\n";
-    let (db, _) = TestDB::with_single_file(&format!("//- minicore: sized\n{ITEMS}{src}"));
+    let fx = fixture::db(&format!("//- minicore: sized\n{ITEMS}{src}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let body = db.mir_body(function(&db, "main").into()).expect("the MIR of `main`");
         let calls: Vec<_> = body

@@ -25,7 +25,7 @@ use hir_ty::{
     traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
 };
 use rustc_type_ir::inherent::GenericArgs as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::db::TestDB;
 
@@ -36,7 +36,9 @@ fn ran(executed: &[String], query: &str) -> bool {
 }
 
 fn single_file(text: &str) -> (TestDB, FileId) {
-    let (db, file) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{text}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{text}"));
+    let file = fx.only_file();
+    let db = fx.into_db();
     let file = file.file_id(&db);
     (db, file)
 }
@@ -163,8 +165,9 @@ const IMPL: &str = "pub struct A;\nimpl A {\n    pub fn m(&self) {}\n}\n";
 /// A caller of `A::m` in one file and `impl A` in another, so an edit of the impl moves
 /// nothing in the caller's file.
 fn method_db() -> (TestDB, FileId, FunctionId) {
-    let (db, files) =
-        TestDB::with_many_files(&format!("//- /main.rs crate:main\n{CALLER}//- /a.rs\n{IMPL}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{CALLER}//- /a.rs\n{IMPL}"));
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let impl_file = files[1].file_id(&db);
     let caller = function_named(&db, "caller");
     (db, impl_file, caller)
@@ -510,9 +513,11 @@ const MODULE_B: &str = "pub struct B;\nimpl B {}\nimpl crate::T for B {}\nimpl c
 
 /// A crate of two modules with impls, and the files of `a` and `b`.
 fn modules_db() -> (TestDB, FileId, FileId) {
-    let (db, files) = TestDB::with_many_files(&format!(
+    let fx = fixture::db(&format!(
         "//- /main.rs crate:main\n{MODULES}//- /a.rs\n{MODULE_A}//- /b.rs\n{MODULE_B}"
     ));
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let (a, b) = (files[1].file_id(&db), files[2].file_id(&db));
     (db, a, b)
 }
@@ -698,7 +703,9 @@ fn holders(db: &TestDB, krate: Crate) -> Vec<String> {
 /// inert attribute, leaves the body unlowered.
 #[test]
 fn a_dependency_body_with_a_proc_macro_call_or_a_derive_holds_impls() {
-    let (db, _) = TestDB::with_many_files(DEP_BODIES);
+    let fx = fixture::db(DEP_BODIES);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let held = holders(&db, crate_named(&db, "dep"));
     for holder in ["calls_proc_macro", "derives"] {
         assert!(held.iter().any(|it| it == holder), "{holder}: {held:?}");
@@ -731,7 +738,9 @@ fn const_argument() -> Wrap<{ 4 }> { struct F; impl Tr for F {} Wrap }
 /// `Wrap<{ 4 }>`) is not taken for the body. Every impl in a body is still found.
 #[test]
 fn a_local_body_is_lowered_for_impls_only_when_it_may_hold_one() {
-    let (db, _) = TestDB::with_many_files(LOCAL_BODIES);
+    let fx = fixture::db(LOCAL_BODIES);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let main = crate_named(&db, "main");
     let held = holders(&db, main);
     let holding =
@@ -798,7 +807,9 @@ fn traits_in(db: &TestDB, def_map: &DefMap, traits: &mut Vec<TraitId>) {
 /// one index asked of every trait in turn as a probe asks.
 #[test]
 fn the_trait_name_index_answers_as_each_trait_alone() {
-    let (db, _) = TestDB::with_many_files(TRAIT_ITEMS);
+    let fx = fixture::db(TRAIT_ITEMS);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut traits = Vec::new();
         for name in ["main", "dep", "other"] {
@@ -829,9 +840,11 @@ const TRAIT_DEF: &str =
     "pub struct A;\npub trait Tr {\n    fn m(&self);\n}\nimpl Tr for A {\n    fn m(&self) {}\n}\n";
 
 fn trait_method_db() -> (TestDB, FileId, FunctionId) {
-    let (db, files) = TestDB::with_many_files(&format!(
+    let fx = fixture::db(&format!(
         "//- /main.rs crate:main\n{TRAIT_CALLER}//- /a.rs\n{TRAIT_DEF}"
     ));
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let trait_file = files[1].file_id(&db);
     let caller = function_named(&db, "caller");
     (db, trait_file, caller)
@@ -881,7 +894,9 @@ pub fn blanket(x: <W<u8> as Tr>::A) -> u16 { x }
 /// the closest, not from the blanket impl of another crate it also specializes.
 #[test]
 fn a_specializing_impl_takes_the_item_of_its_closest_ancestor_of_its_self_type() {
-    let (db, _) = TestDB::with_many_files(SPECIALIZED_CHAIN);
+    let fx = fixture::db(SPECIALIZED_CHAIN);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let main = crate_named(&db, "main");
     let mismatches = |name: &str| {
         let function = crate_def_map(&db, main)

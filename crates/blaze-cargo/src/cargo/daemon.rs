@@ -930,10 +930,10 @@ fn exact_env(command: &mut Command, env: &BTreeMap<String, String>) {
 /// The variables a request of the build `config` says, under its checkout's: those a worker
 /// of it runs with. The worker loads the workspace again when the flags or a variable a
 /// build script reads are another than it loaded it with, and its `env!` reads them.
-fn requests_env(config: &WorkerConfig) -> ide_db::base_db::Env {
+fn requests_env(config: &WorkerConfig) -> base_db::Env {
     let builds = config.builds_env();
     let not_ours = super::cli::not_the_builds(&builds);
-    let mut env: ide_db::base_db::Env = Vec::from(crate::process::own())
+    let mut env: base_db::Env = Vec::from(crate::process::own())
         .into_iter()
         .filter(|(name, _)| !not_ours.contains(name))
         .collect();

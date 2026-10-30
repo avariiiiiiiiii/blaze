@@ -20,7 +20,7 @@ use blaze_ids::ContentId;
 use hir_def::DefWithBodyId;
 use rustc_hash::FxHashMap;
 
-use super::{Refusal, Step};
+use super::{Refusal, Step, StepCounts};
 
 const SHARDS: usize = 64;
 
@@ -48,7 +48,8 @@ struct Shard {
     refused: FxHashMap<&'static str, u64>,
 }
 
-/// Why offered steps were not kept, by every reason but a read.
+/// Why offered steps were not kept, by every reason but a read, and what each step's lookups
+/// found.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Counts {
     pub(super) unhashable: u64,
@@ -56,6 +57,23 @@ pub(super) struct Counts {
     pub(super) unshareable: u64,
     pub(super) unencodable: u64,
     pub(super) dropped: u64,
+    /// By [`Step`] as an index.
+    pub(super) steps: [StepCounts; 3],
+}
+
+impl Counts {
+    fn add(&mut self, other: &Counts) {
+        self.unhashable += other.unhashable;
+        self.no_identity += other.no_identity;
+        self.unshareable += other.unshareable;
+        self.unencodable += other.unencodable;
+        self.dropped += other.dropped;
+        for (into, from) in self.steps.iter_mut().zip(&other.steps) {
+            into.hits += from.hits;
+            into.ran += from.ran;
+            into.refused += from.refused;
+        }
+    }
 }
 
 /// Why offered steps were not kept since the last flush.
@@ -125,9 +143,23 @@ impl Pending {
         defs.push(def);
     }
 
-    pub(super) fn refused(&self, refusal: Refusal) {
+    /// A lookup of `step` that found its result stored (`hit`), or ran it.
+    pub(super) fn looked_up(&self, step: Step, hit: bool) {
+        let mut shard = self.shard();
+        let counts = &mut shard.tallies.steps[step as usize];
+        match hit {
+            true => counts.hits += 1,
+            false => counts.ran += 1,
+        }
+    }
+
+    /// A step kept out of the store, or for [`Refusal::NoIdentity`] a body not looked up.
+    pub(super) fn refused(&self, step: Step, refusal: Refusal) {
         let mut shard = self.shard();
         let Shard { tallies: counts, refused, .. } = &mut *shard;
+        if refusal != Refusal::NoIdentity {
+            counts.steps[step as usize].refused += 1;
+        }
         match refusal {
             Refusal::Read(name) => match refused.entry(name) {
                 Slot::Occupied(mut count) => *count.get_mut() += 1,
@@ -139,6 +171,17 @@ impl Pending {
             Refusal::Unshareable => counts.unshareable += 1,
             Refusal::Unencodable => counts.unencodable += 1,
         }
+    }
+
+    /// What each step's lookups found and its offers met since the last [`Pending::take`], left
+    /// in place.
+    pub(super) fn steps(&self) -> [StepCounts; 3] {
+        let mut counts = Counts::default();
+        for shard in &self.shards {
+            let shard = shard.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            counts.add(&Counts { steps: shard.tallies.steps, ..Counts::default() });
+        }
+        counts.steps
     }
 
     /// Every shard's entries and tallies, leaving them empty.
@@ -154,13 +197,7 @@ impl Pending {
             for (name, count) in shard.refused.drain() {
                 *refused.entry(name).or_default() += count;
             }
-            let Counts { unhashable, no_identity, unshareable, unencodable, dropped } = mem::take(&mut shard.tallies);
-            let counts = &mut tallies.counts;
-            counts.unhashable += unhashable;
-            counts.no_identity += no_identity;
-            counts.unshareable += unshareable;
-            counts.unencodable += unencodable;
-            counts.dropped += dropped;
+            tallies.counts.add(&mem::take(&mut shard.tallies));
         }
         // alloc: flush, once per build
         tallies.refused = refused.into_iter().collect();

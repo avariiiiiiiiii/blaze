@@ -21,49 +21,121 @@
 //! The traits in scope are hashed once per module a scope is in (the owner's, each block's
 //! with items): the impl's trait, the blocks', the prelude's and the module's, as a sorted set
 //! of (key, signature), which is what method calls and type-relative paths search.
+//!
+//! The body's own item (and a generic parameter of it) is hashed as "self", not by its key, so
+//! that a rename keeps the identity. Each path's segments that every resolution hashed here
+//! resolved are hashed by that alone: [`Names::blank`] tells the HIR's bytes to leave their
+//! text out, so a rename of a local and a `use .. as` alias keep the identity too. The rest of
+//! a path (type-relative segments, and all of one that resolves to nothing) stays text.
 
 use base_db::Db;
 use blaze_format::cursor::Put;
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use hir_def::{
-    AdtId, DefWithBodyId, GenericDefId, ModuleDefId, ModuleId,
+    AdtId, DefWithBodyId, EnumVariantId, GenericDefId, ModuleDefId, ModuleId,
     builtin_type::BuiltinType,
     expr_store::{
         Body, ExpressionStore, HygieneId, StoreVisitor, StoreVisitorExt as _, path::Path,
     },
     hir::{AsmOperand, Expr, ExprId, InlineAsm, Pat, PatId, type_ref::TypeRef, type_ref::TypeRefId},
+    item_hash::{mod_path_index, path_count},
     item_tree::VisibilityExplicitness,
     nameres::ResolvePathResultPrefixInfo,
     per_ns::PerNs,
     resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
     visibility::Visibility,
 };
-use hir_expand::name::AsName;
+use hir_expand::{mod_path::ModPath, name::AsName};
 use la_arena::RawIdx;
+use rustc_hash::FxHashMap;
 use salsa::plumbing::AsId;
 
-use super::item::{Part, item_part, variant_part};
+use super::item::{Part, SELF, item_part, own_item, self_part, variant_part};
 
 type R<T = ()> = Result<T, &'static str>;
 
-/// The names of `body` into `names` and its traits in scope into `traits`.
-pub(super) fn write(
+/// What `def`'s paths resolve to, computed once for its identity and for its records' keys
+/// ([`crate::keys`]).
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) struct Names {
+    /// What each path resolves to where it is written.
+    pub(crate) names: Box<[u8]>,
+    /// The traits in scope of each module a scope of the body is in.
+    pub(crate) traits: Box<[u8]>,
+    /// For each path of the body's store (`hir_def::item_hash::mod_path_index`), how many of
+    /// its leading segments `names` hashes by what they resolve to: the HIR's bytes leave
+    /// their text out.
+    pub(crate) blank: Box<[u16]>,
+    /// Each item or variant a path resolves to, in the order `names` first writes it: what
+    /// "the target of path `i`" of a record key is.
+    pub(crate) targets: Box<[Target]>,
+}
+
+/// What a path of a body resolves to that a record may name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Target {
+    Item(ItemId),
+    Variant(EnumVariantId),
+}
+
+/// [`Names`] of `def`'s body.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn names_of(db: &Db, def: DefWithBodyId) -> Result<Names, &'static str> {
+    let body = Body::of(db, def);
+    let mut names = scratch::lend_bytes();
+    let mut traits = scratch::lend_bytes();
+    // alloc: one count per path of the body and one entry per target, once per identity
+    let mut blank = vec![u16::MAX; path_count(body)];
+    // alloc: the targets, at most one per path, and the set that keeps each once
+    let mut targets = Vec::with_capacity(blank.len());
+    let mut seen = FxHashMap::default();
+    write(db, def, body, &mut names, &mut traits, &mut blank, &mut targets, &mut seen)?;
+    for it in &mut blank {
+        if *it == u16::MAX {
+            *it = 0;
+        }
+    }
+    Ok(Names {
+        // alloc: the query's value, once per identity
+        names: names.as_slice().into(),
+        traits: traits.as_slice().into(),
+        blank: blank.into_boxed_slice(),
+        targets: targets.into_boxed_slice(),
+    })
+}
+
+/// The names of `body` into `names`, its traits in scope into `traits`, the segments of each
+/// path hashed by resolution into `blank` (`u16::MAX` for a path not walked) and the items
+/// its paths name into `targets`.
+#[expect(clippy::too_many_arguments, reason = "the parts of `Names`, each its own buffer")]
+fn write(
     db: &Db,
     def: DefWithBodyId,
     body: &Body,
     names: &mut Vec<u8>,
     traits: &mut Vec<u8>,
+    blank: &mut [u16],
+    targets: &mut Vec<Target>,
+    seen: &mut FxHashMap<Target, ()>,
 ) -> R {
     let store: &ExpressionStore = body;
     let root = body.root_expr();
     let base = def.resolver(db);
     let mut resolver = def.resolver(db);
     let mut walk = Walk {
-        out: Out { db, bytes: names },
+        out: Out {
+            db,
+            bytes: names,
+            own: own_item(def),
+            targets,
+            seen,
+            resolved: usize::MAX,
+        },
         traits: Traits { db, out: traits, seen: scratch::lend_u64s() },
         pats: scratch::lend_u32s(),
         types: scratch::lend_u32s(),
+        blank,
     };
     walk.traits.scope(&base)?;
     for param in body.params.iter() {
@@ -87,6 +159,7 @@ struct Walk<'a, 'db> {
     /// The patterns and types of the expression being walked, still to walk.
     pats: scratch::Lent<Vec<u32>>,
     types: scratch::Lent<Vec<u32>>,
+    blank: &'a mut [u16],
 }
 
 impl Walk<'_, '_> {
@@ -101,15 +174,15 @@ impl Walk<'_, '_> {
         expr: Expr<'_>,
     ) -> R {
         match expr {
-            Expr::Path(path) => self.path(at, also, path, store.expr_path_hygiene(id))?,
+            Expr::Path(path) => self.path(store, at, also, path, store.expr_path_hygiene(id))?,
             Expr::RecordLit { path, .. } => {
-                self.path(at, also, path, store.expr_path_hygiene(id))?
+                self.path(store, at, also, path, store.expr_path_hygiene(id))?
             }
             Expr::InlineAsm(InlineAsm { operands, .. }) => {
                 for (_, operand) in operands.iter() {
                     if let AsmOperand::Sym(path) = *operand {
                         let path = store.path_at(path);
-                        self.path(at, also, path, store.expr_path_hygiene(id))?;
+                        self.path(store, at, also, path, store.expr_path_hygiene(id))?;
                         Collect { pats: &mut self.pats, types: &mut self.types }.on_path(path);
                     }
                 }
@@ -134,7 +207,7 @@ impl Walk<'_, '_> {
                     Pat::Path(path)
                     | Pat::TupleStruct { path, .. }
                     | Pat::Record { path, .. } => {
-                        self.path(at, also, path, store.pat_path_hygiene(pat))?
+                        self.path(store, at, also, path, store.pat_path_hygiene(pat))?
                     }
                     _ => {}
                 }
@@ -143,7 +216,7 @@ impl Walk<'_, '_> {
             } else if let Some(ty) = self.types.pop() {
                 let ty = TypeRefId::from_raw(RawIdx::from_u32(ty));
                 if let TypeRef::Path(path) = store.type_ref(ty) {
-                    self.path(at, also, path, store.type_path_hygiene(ty))?;
+                    self.path(store, at, also, path, store.type_path_hygiene(ty))?;
                 }
                 let collect = Collect { pats: &mut self.pats, types: &mut self.types };
                 store.visit_type_ref_children(ty, collect);
@@ -155,15 +228,25 @@ impl Walk<'_, '_> {
 
     fn path(
         &mut self,
+        store: &ExpressionStore,
         at: &Resolver<'_>,
         also: Option<&Resolver<'_>>,
         path: Path<'_>,
         hygiene: HygieneId,
     ) -> R {
+        self.out.resolved = usize::MAX;
         self.out.resolutions(at, path, hygiene, true)?;
         if let Some(base) = also {
             self.out.tag(0xff);
             self.out.resolutions(base, path, hygiene, false)?;
+        }
+        if let Some(index) = mod_path_of(path).and_then(|it| mod_path_index(store, it)) {
+            let resolved = match self.out.resolved {
+                usize::MAX => 0,
+                n => u16::try_from(n).unwrap_or(u16::MAX - 1),
+            };
+            let blank = &mut self.blank[index];
+            *blank = (*blank).min(resolved);
         }
         Ok(())
     }
@@ -232,10 +315,25 @@ impl Traits<'_, '_> {
     }
 }
 
+fn mod_path_of(path: Path<'_>) -> Option<&ModPath> {
+    match path {
+        Path::BarePath(it) => Some(it),
+        Path::Normal(it) => Some(it.mod_path),
+        Path::LangItem(..) => None,
+    }
+}
+
 /// The bytes resolutions are written as.
 struct Out<'a, 'db> {
     db: &'db Db,
     bytes: &'a mut Vec<u8>,
+    /// The body's own item, written as "self".
+    own: Option<ItemId>,
+    targets: &'a mut Vec<Target>,
+    seen: &'a mut FxHashMap<Target, ()>,
+    /// The fewest leading segments any resolution of the path being written resolved,
+    /// `usize::MAX` while none has.
+    resolved: usize,
 }
 
 impl Out<'_, '_> {
@@ -252,18 +350,34 @@ impl Out<'_, '_> {
     }
 
     fn item(&mut self, item: ItemId) -> R {
-        let part = item_part(self.db, item)?;
+        let part = match Some(item) == self.own {
+            true => self_part(self.db, item)?,
+            false => item_part(self.db, item)?,
+        };
         self.bytes.extend_from_slice(&part);
+        self.target(Target::Item(item));
         Ok(())
+    }
+
+    fn target(&mut self, target: Target) {
+        if self.seen.insert(target, ()).is_none() {
+            self.targets.push(target);
+        }
+    }
+
+    /// A resolution of the path being written that resolved its first `segments`.
+    fn resolved(&mut self, segments: usize) {
+        self.resolved = self.resolved.min(segments);
     }
 
     fn adt(&mut self, adt: AdtId) -> R {
         self.item(ItemId::Adt(adt))
     }
 
-    fn variant(&mut self, variant: hir_def::EnumVariantId) -> R {
+    fn variant(&mut self, variant: EnumVariantId) -> R {
         let part = variant_part(self.db, variant)?;
         self.bytes.extend_from_slice(&part);
+        self.target(Target::Variant(variant));
         Ok(())
     }
 
@@ -276,8 +390,8 @@ impl Out<'_, '_> {
         self.bytes(builtin.as_name().as_str().as_bytes());
     }
 
-    /// A generic parameter: its owner's key (the owner is the body's or its parent's, whose
-    /// signatures section 3.2 hashes) and its index there.
+    /// A generic parameter: its owner's key, "self" for the body's own item (the owner is the
+    /// body's or its parent's, whose signatures section 3.2 hashes) and its index there.
     fn param(&mut self, owner: GenericDefId, index: u32) {
         let owner = match owner {
             GenericDefId::AdtId(it) => ItemId::Adt(it),
@@ -288,8 +402,10 @@ impl Out<'_, '_> {
             GenericDefId::TraitId(it) => ItemId::Trait(it),
             GenericDefId::TypeAliasId(it) => ItemId::Alias(it),
         };
-        let owner = key::item_key(self.db, owner);
-        self.bytes.extend_from_slice(&owner.0.0);
+        match Some(owner) == self.own {
+            true => self.bytes.extend_from_slice(&SELF),
+            false => self.bytes.extend_from_slice(&key::item_key(self.db, owner).0.0),
+        }
         self.u64(u64::from(index));
     }
 
@@ -318,8 +434,10 @@ impl Out<'_, '_> {
         def_site: bool,
     ) -> R {
         let db = self.db;
+        let segments = mod_path_of(path).map_or(0, |it| it.segments().len());
         match at.resolve_path_in_type_ns_with_prefix_info(db, path) {
             Some((ty, remaining, _, prefix, visibility)) => {
+                self.resolved(remaining.unwrap_or(segments));
                 self.tag(1);
                 self.type_ns(ty)?;
                 self.u64(remaining.map_or(u64::MAX, |it| it as u64));
@@ -332,6 +450,7 @@ impl Out<'_, '_> {
             match Resolver::def_site(db, hygiene) {
                 Some(site) => match site.resolve_path_in_type_ns_with_prefix_info(db, path) {
                     Some((ty, remaining, _, prefix, visibility)) => {
+                        self.resolved(remaining.unwrap_or(segments));
                         self.tag(2);
                         self.type_ns(ty)?;
                         self.u64(remaining.map_or(u64::MAX, |it| it as u64));
@@ -349,10 +468,12 @@ impl Out<'_, '_> {
                 let local = matches!(value, ResolveValueResult::ValueNs(ValueNs::LocalBinding(_)));
                 match value {
                     ResolveValueResult::ValueNs(value) => {
+                        self.resolved(segments);
                         self.tag(0);
                         self.value_ns(value)?;
                     }
                     ResolveValueResult::Partial(ty, remaining) => {
+                        self.resolved(remaining);
                         self.tag(1);
                         self.type_ns(ty)?;
                         self.u64(remaining as u64);
@@ -361,12 +482,7 @@ impl Out<'_, '_> {
                 self.prefix(prefix);
                 self.visibility(visibility);
                 if local {
-                    let mod_path = match path {
-                        Path::BarePath(it) => Some(it),
-                        Path::Normal(it) => Some(it.mod_path),
-                        Path::LangItem(..) => None,
-                    };
-                    if let Some(mod_path) = mod_path {
+                    if let Some(mod_path) = mod_path_of(path) {
                         self.per_ns(at.resolve_module_path_in_items(db, mod_path))?;
                     }
                 }

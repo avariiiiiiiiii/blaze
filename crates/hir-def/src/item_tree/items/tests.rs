@@ -7,7 +7,7 @@ use std::{
 use base_db::EditionedFileId;
 use blaze_ids::rng::SplitMix64;
 use syntax::view::HasModuleItem;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     item_tree::{ItemTree, lower_whole, tests::assert_assembled_is_whole},
@@ -47,18 +47,22 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// A database of one file, the crate's root, holding `text`.
 fn db_of(text: &str) -> (TestDB, EditionedFileId) {
-    let (mut db, file) = TestDB::with_single_file("");
+    let fx = fixture::db("");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     db.set_file_text(file.file_id(&db), text);
     (db, file)
 }
 
 fn assembled(db: &TestDB, file: EditionedFileId) -> Arc<ItemTree> {
-    super::file_item_tree(db, file, db.test_crate())
+    super::file_item_tree(db, file, fixture::test_crate(db))
 }
 
 #[test]
 fn real_files_assemble_to_their_whole_trees() {
-    let (mut db, file) = TestDB::with_single_file("");
+    let fx = fixture::db("");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     for (path, text) in &corpus() {
         db.set_file_text(file.file_id(&db), text);
         assert_assembled_is_whole(&db, file, path);
@@ -103,7 +107,9 @@ fn random_edit(rng: &mut SplitMix64, text: &str) -> (Range<usize>, String) {
 #[test]
 fn random_edits_assemble_to_a_fresh_whole_tree() {
     let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
-    let (mut db, file) = TestDB::with_single_file("");
+    let fx = fixture::db("");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     for (path, text) in corpus().iter().step_by(2) {
         let mut text = text.clone();
         db.set_file_text(file.file_id(&db), &text);
@@ -114,7 +120,7 @@ fn random_edits_assemble_to_a_fresh_whole_tree() {
             db.set_file_text(file.file_id(&db), &text);
             let (fresh, fresh_file) = db_of(&text);
             let edited = assembled(&db, file);
-            let whole = lower_whole(&fresh, fresh_file.into(), fresh.test_crate());
+            let whole = lower_whole(&fresh, fresh_file.into(), fixture::test_crate(&fresh));
             assert_eq!(*edited, whole, "{path} after replacing {range:?} with {insert:?}");
             assert_eq!(
                 blaze_format::to_bytes(&*edited),
@@ -142,7 +148,7 @@ mod m { pub fn inner() {} }
 /// alone. Before it, an edit that changes no item (a newline at the end) has the file lowered
 /// whole and keyed, as a file's first edit is, so what is counted is an edit of a keyed file.
 fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(db);
     let file_id = file.file_id(&*db);
     crate::file_item_tree(&*db, file.into(), krate);
     let before = file.parse(&*db).root().text().to_string();
@@ -178,7 +184,7 @@ fn an_edit_inside_bodies_lowers_no_item() {
 #[test]
 fn an_edit_inside_a_body_gives_the_kept_tree() {
     let (mut db, file) = db_of(ITEMS);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     items_lowered_by(&mut db, file, &ITEMS.replace("{ s.0 }", "{ s.0 + 1 }"));
     let kept = super::file_item_tree(&db, file, krate);
     let again = super::file_item_tree(&db, file, krate);
@@ -216,7 +222,7 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
     let text = format!("macro_rules! big {{\n{rules}}}\nfn f() {{}}\nstruct S;\n");
     assert!(text.len() > 4096 + 32);
     let (mut db, file) = db_of(&text);
-    crate::file_item_tree(&db, file.into(), db.test_crate());
+    crate::file_item_tree(&db, file.into(), fixture::test_crate(&db));
     assert_eq!(items_lowered_by(&mut db, file, &text.replace("struct S;", "struct T;")), 1);
     let renamed = text.replace("struct S;", "struct T;").replace("(a7)", "(b7)");
     assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
@@ -226,7 +232,7 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
 /// many items' ast ids and anchors it reads from the maps, the file keyed at the text it holds
 /// before.
 fn items_keyed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> (usize, usize) {
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(db);
     let file_id = file.file_id(&*db);
     let before = file.parse(&*db).root().text().to_string();
     for warm in [format!("{before}\n"), before] {
@@ -326,7 +332,7 @@ fn common_ends_are_the_longest_that_do_not_overlap() {
 #[test]
 fn trees_asked_again_allocate_nothing() {
     let (db, file) = db_of(ITEMS);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     crate::file_item_tree(&db, file.into(), krate);
     blaze_alloc_count::assert_at_most(0, "a memo hit of `file_item_tree`", || {
         std::hint::black_box(crate::file_item_tree(&db, file.into(), krate));
@@ -349,7 +355,7 @@ fn assembly_allocates_once_a_tree() {
             .map(|i| format!("pub struct S{i}(pub u8);\nfn f{i}() {{}}\nuse a::b{i};\n"))
             .collect();
         let (db, file) = db_of(&text);
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(&db);
         let top = super::top_attrs(&db, file, krate);
         let alone: Vec<ItemTree> = (file.parse(&db).view().items())
             .map(|item| super::item_alone(&db, file, krate, item))

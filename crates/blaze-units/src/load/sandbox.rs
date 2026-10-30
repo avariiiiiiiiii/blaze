@@ -22,8 +22,12 @@ pub(crate) const EXPERIMENTAL: &str = "experimental";
 /// Every test of the workspace runs in a sandbox.
 pub(crate) const SANDBOXED_TESTS: &str = "sandboxed-tests";
 
+/// A package's `[package.metadata.blaze] const-macros` file is a crate of macros the front end
+/// runs (docs/future/const-macros.md); the key of that table too.
+pub(crate) const CONST_MACROS: &str = "const-macros";
+
 /// The experiments there are, as v1's `experimental::KNOWN`.
-const KNOWN: &[&str] = &[SANDBOXED_TESTS, "const-macros"];
+const KNOWN: &[&str] = &[SANDBOXED_TESTS, CONST_MACROS];
 
 /// What the workspace's root manifest says in [`WORKSPACE_TABLE`] and [`EXPERIMENTAL`] that the
 /// load hands on.
@@ -171,6 +175,50 @@ pub(crate) fn package(metadata: Option<&toml::Value>, manifest: &Path) -> Result
     Ok(out)
 }
 
+/// Whether [`EXPERIMENTAL`] in the root manifest's `[workspace.metadata.blaze]` (`metadata`)
+/// lists [`CONST_MACROS`]; the list itself is checked by [`workspace`].
+pub(crate) fn const_macros_on(metadata: Option<&toml::Value>) -> bool {
+    let listed = blaze_table(metadata).and_then(|it| it.get(EXPERIMENTAL)).and_then(|it| it.as_array());
+    listed.is_some_and(|names| names.iter().any(|it| it.as_str() == Some(CONST_MACROS)))
+}
+
+/// The file `[package.metadata.blaze] const-macros` (`metadata`) of the package whose manifest is
+/// `manifest` names, absolute and normal; none when it names none. Named while the workspace
+/// (`root_manifest`) has not turned the experiment on (`on`), or as anything but a path, it is
+/// an error worded as v1's. Whether the file is there is the front end's to say: it reads the
+/// build's files, and this the manifests.
+pub(crate) fn const_macros(
+    metadata: Option<&toml::Value>,
+    manifest: &Path,
+    root_manifest: &Path,
+    on: bool,
+) -> Result<Option<String>, LoadError> {
+    let Some(value) = blaze_table(metadata).and_then(|it| it.get(CONST_MACROS)) else { return Ok(None) };
+    let wrong = |what: String| LoadError { what, at: Some(manifest.display().to_string()) };
+    let Some(path) = value.as_str() else {
+        return Err(wrong(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {} is a path, as a string",
+            manifest.display()
+        )));
+    };
+    if !on {
+        return Err(wrong(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {} is an experiment: \
+             `experimental = [\"{CONST_MACROS}\"]` under [workspace.metadata.blaze] in {} turns it on",
+            manifest.display(),
+            root_manifest.display()
+        )));
+    }
+    let dir = manifest.parent().unwrap_or(Path::new("/"));
+    let file = super::files::normal(&dir.join(path)).ok_or_else(|| {
+        wrong(format!(
+            "`{CONST_MACROS}` under [package.metadata.blaze] in {} names `{path}`, which is not a UTF-8 path",
+            manifest.display()
+        ))
+    })?;
+    Ok(Some(file))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +302,25 @@ mod tests {
         assert!(not_list.what.contains("Cargo.toml: a list of experiments' names"), "{}", not_list.what);
         let not_strings = on("[blaze]\nexperimental = [true]\n").unwrap_err();
         assert!(not_strings.what.contains("as strings"), "{}", not_strings.what);
+    }
+
+    #[test]
+    fn a_package_names_its_const_macros_once_the_workspace_turns_them_on() {
+        let (root, member) = (Path::new("/w/Cargo.toml"), Path::new("/w/a/Cargo.toml"));
+        assert!(const_macros_on(Some(&metadata("[blaze]\nexperimental = [\"sandboxed-tests\", \"const-macros\"]\n"))));
+        assert!(!const_macros_on(Some(&metadata("[blaze]\nexperimental = [\"sandboxed-tests\"]\n"))));
+        assert!(!const_macros_on(None));
+        let named = metadata("[blaze]\nconst-macros = \"src/../macros/derive.rs\"\n");
+        assert_eq!(const_macros(Some(&named), member, root, true), Ok(Some("/w/a/macros/derive.rs".to_owned())));
+        assert_eq!(const_macros(None, member, root, true), Ok(None));
+        assert_eq!(const_macros(Some(&metadata("[blaze.sandbox]\ntests = true\n")), member, root, false), Ok(None));
+        let off = const_macros(Some(&named), member, root, false).unwrap_err();
+        assert_eq!(
+            off.what,
+            "`const-macros` under [package.metadata.blaze] in /w/a/Cargo.toml is an experiment: \
+             `experimental = [\"const-macros\"]` under [workspace.metadata.blaze] in /w/Cargo.toml turns it on"
+        );
+        let not_path = const_macros(Some(&metadata("[blaze]\nconst-macros = 1\n")), member, root, true).unwrap_err();
+        assert!(not_path.what.ends_with("is a path, as a string"), "{}", not_path.what);
     }
 }

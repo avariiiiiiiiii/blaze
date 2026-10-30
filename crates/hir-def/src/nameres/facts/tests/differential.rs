@@ -5,7 +5,7 @@
 //! The fixtures are read out of the test files themselves (`include_str!`), not copied: every
 //! raw string literal of a file outside an `expect![...]` is a fixture, named by the file, the
 //! item it is in and its place there. A literal that is not a fixture (a file's new text in an
-//! incremental test) is still a crate, compared like any other; one `ChangeFixture` can't parse
+//! incremental test) is still a crate, compared like any other; one `fixture::db` can't parse
 //! is listed by name.
 
 use std::panic::{self, AssertUnwindSafe};
@@ -100,7 +100,7 @@ fn check_files(files: &[(&str, &'static str)]) {
             if ORDER_DEPENDENT.iter().any(|it| it.name == name) {
                 continue;
             }
-            // `ChangeFixture` panics on text it can't read as a fixture; that literal is not one.
+            // `fixture::db` panics on text it can't read as a fixture; that literal is not one.
             let parses = panic::catch_unwind(|| drop(fixture_db(text))).is_ok();
             if !parses {
                 not_fixtures.push(name);

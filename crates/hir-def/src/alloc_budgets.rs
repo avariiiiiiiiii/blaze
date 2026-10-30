@@ -8,7 +8,7 @@ use base_db::{Crate, relevant_crates};
 use either::Either;
 use hir_expand::{Intern, Lookup};
 use intern::{Symbol, sym};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
@@ -162,7 +162,9 @@ impl Defs {
 }
 
 fn fixture() -> (TestDB, Crate) {
-    let (db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let krate = relevant_crates(&db, file.file_id(&db))[0];
     (db, krate)
 }

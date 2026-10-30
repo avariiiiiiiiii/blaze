@@ -7,7 +7,7 @@
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, HasModule, TraitId, signatures::ImplSignature};
 use rustc_type_ir::{IntTy, fast_reject::SimplifiedType as Simplified};
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{RelevantImplsKey, SelfTyKey, TraitImpls, relevant_impls};
 use crate::next_solver::{AnyImplId, SimplifiedType, SolverDefId};
@@ -149,8 +149,7 @@ fn traits_and_self_tys(db: &Db) -> Vec<(TraitId, Vec<SimplifiedType<'_>>)> {
 
 #[test]
 fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+    let db = fixture::db(FIXTURE).into_db();
     let (main, dep) = (crate_named(&db, "main"), crate_named(&db, "dep"));
     let (mut from_dep, mut in_block, mut negative, mut derived, mut blanket) =
         (false, false, false, false, false);
@@ -197,8 +196,7 @@ fn the_relevant_impls_are_those_the_table_walk_finds_in_its_order() {
 
 #[test]
 fn a_warm_read_of_the_relevant_impls_allocates_nothing() {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+    let db = fixture::db(FIXTURE).into_db();
     let main = crate_named(&db, "main");
     let (trait_, self_tys) = traits_and_self_tys(&db)
         .into_iter()

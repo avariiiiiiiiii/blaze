@@ -13,7 +13,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
 use salsa::plumbing::AsId;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{ids::Table, part, *};
 use crate::{
@@ -62,8 +62,7 @@ fn main() { let _ = dep::area(&dep::Shape::Dot(dep::Point { x: 1, y: 2 })); }
 "#;
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 

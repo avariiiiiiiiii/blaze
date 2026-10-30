@@ -71,7 +71,7 @@ struct ProcMacroLibrary {
 }
 
 /// One entry of the list blaze writes into a proc-macro crate it links as a shared library,
-/// as `crates/blaze-engine/src/macro_list.rs` declares it.
+/// as `crates/hir-ty-codegen/v2/roots/proc_macros.rs` declares it.
 #[repr(C)]
 struct Macro {
     kind: u32,

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use hir::{HirFileId, InFile};
-use ide_db::RootDatabase;
+use base_db::Db;
 use rustc_hash::FxHashMap;
 use syntax::{TextRange, TextSize, view as ast};
 
@@ -14,15 +14,15 @@ use crate::{
 
 pub(crate) struct Files {
     /// For each file: its crate's index, its index there and where its lines start.
-    by_file: FxHashMap<vfs::FileId, (usize, usize, Arc<[u32]>)>,
+    by_file: FxHashMap<base_db::FileId, (usize, usize, Arc<[u32]>)>,
     /// Each crate's files, in the order of their indices.
     pub(crate) per_crate: Vec<Vec<SourceFile>>,
     /// The absolute path of every file, for warnings.
-    paths: FxHashMap<vfs::FileId, String>,
+    paths: FxHashMap<base_db::FileId, String>,
 }
 
 impl Files {
-    pub(crate) fn new(db: &RootDatabase, places: &Places) -> Files {
+    pub(crate) fn new(db: &Db, places: &Places) -> Files {
         let mut by_file = FxHashMap::default();
         let mut per_crate = vec![];
         let mut paths = FxHashMap::default();
@@ -32,7 +32,7 @@ impl Files {
                 .and_then(|it| it.rsplit_once('/').map(|(dir, _)| dir.to_owned()))
                 .unwrap_or_default();
             let mut files = vec![];
-            let mut ids: Vec<vfs::FileId> = documented
+            let mut ids: Vec<base_db::FileId> = documented
                 .krate
                 .modules(db)
                 .into_iter()
@@ -61,7 +61,7 @@ impl Files {
     }
 
     /// The lines of a node, in the file it is written in (a macro's output maps to the call).
-    pub(crate) fn span(&self, db: &RootDatabase, node: InFile<ast::Node<'_>>) -> Option<Span> {
+    pub(crate) fn span(&self, db: &Db, node: InFile<ast::Node<'_>>) -> Option<Span> {
         let range = node.map(|it| it.text_range()).original_node_file_range_rooted(db);
         let file = range.file_id.file_id(db);
         let (krate, index, starts) = self.by_file.get(&file)?;
@@ -71,7 +71,7 @@ impl Files {
     }
 
     /// `path:line:column` of a range, for a warning; the path is as the file system has it.
-    pub(crate) fn location(&self, db: &RootDatabase, at: InFile<TextRange>) -> Option<String> {
+    pub(crate) fn location(&self, db: &Db, at: InFile<TextRange>) -> Option<String> {
         let range = at.original_node_file_range_rooted(db);
         let file = range.file_id.file_id(db);
         let path = self.paths.get(&file).cloned().or_else(|| path_of(db, file))?;
@@ -92,7 +92,7 @@ fn line_of(starts: &[u32], offset: TextSize) -> u32 {
     }
 }
 
-pub(crate) fn path_of(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
+pub(crate) fn path_of(db: &Db, file: base_db::FileId) -> Option<String> {
     let root = db.file_source_root(file).source_root_id(db);
     let root = db.source_root(root).source_root(db);
     root.path_for_file(&file).map(|it| it.to_string())

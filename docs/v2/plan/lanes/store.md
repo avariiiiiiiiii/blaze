@@ -17,6 +17,11 @@ Part of the [v2 plan](../../plan.md). Section numbers refer to the plan as first
 - **Index**: an mmapped open-addressed table on BLAKE3 keys; one or two cache misses a lookup.
 - **Verified**: a read checks the content hash; archive and path entries can't escape their
   directory.
+- **The user's alone**: the store refuses a directory of another user or one others may write
+  to, and reads no pack or file others may write to, as v1's did: a value is checked against its
+  own hash, never against what its key says made it, and the store keeps machine code that is
+  run (`Kind::Machine`). Not done yet: it needs `blaze_core` to say who owns a file and who may
+  write it (queue 00999).
 - **Remote** is a read-through tier for machines outside the pool (a laptop) only, never on the
   hot path of the VM. Supersedes the per-job, per-pin remote naming (#1481).
 
@@ -36,6 +41,7 @@ Part of the [v2 plan](../../plan.md). Section numbers refer to the plan as first
 ## Done when
 
 - one mapped file per crate version with the index flip; the mmapped BLAKE3 index
-- hot, warm and cold tiers with background moves; every read verified
+- hot, warm and cold tiers with background moves; every read verified; a store others can
+  write to refused
 - keys by schema and producing code; the remote as an off-path tier
 - nothing in the lane's paths matches `rg 'unimplemented!|todo!'`; tests for all of it are written; its report says `STATUS: DONE`

@@ -12,7 +12,7 @@ use blaze_ids::rng::SplitMix64;
 use blaze_mem::{Tag, frame};
 use hir_def::{DefWithBodyId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_ty_mir as _;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     BorrowckResult, PartSpan, borrowck, borrowck_in_mode,
@@ -135,7 +135,9 @@ fn large_fixture() -> String {
 /// own blocks and nothing else, so a clean body allocates nothing, whichever body the frame
 /// served before it.
 fn allocates_its_result_alone(fixture: &str, first: &[&str], errors: bool) {
-    let (db, _) = Db::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut defs = functions(&db);
         assert!(defs.len() >= 3, "{}", defs.len());
@@ -184,7 +186,9 @@ fn a_body_with_errors_allocates_its_diagnostics_alone() {
 #[test]
 fn asking_again_allocates_nothing() {
     for fixture in [TYPICAL, ERRORS] {
-        let (db, _) = Db::with_single_file(fixture);
+        let fx = fixture::db(fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
         hir_ty::attach_db(&db, || {
             for (name, def) in functions(&db) {
                 let first: *const BorrowckResult = borrowck(&db, def);
@@ -198,7 +202,7 @@ fn asking_again_allocates_nothing() {
 
 #[test]
 fn an_edit_to_another_file_allocates_nothing_to_answer_again() {
-    let (mut db, files) = Db::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /main.rs
 mod other;
@@ -210,6 +214,8 @@ fn fine(n: &mut u32) { *n += 1; }
 pub fn elsewhere() -> u32 { 1 }
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let other = files[1].file_id(&db);
     let defs = hir_ty::attach_db(&db, || {
         let defs: Vec<_> =
@@ -231,7 +237,9 @@ pub fn elsewhere() -> u32 { 1 }
 
 #[test]
 fn a_passing_gate_allocates_nothing() {
-    let (db, _) = Db::with_single_file(TYPICAL);
+    let fx = fixture::db(TYPICAL);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         for (name, def) in functions(&db) {
             assert!(crate::gate::checked(&db, def).is_ok(), "{name}: the typical fixture passes");

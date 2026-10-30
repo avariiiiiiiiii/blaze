@@ -3,7 +3,7 @@ use blaze_format::Persist;
 use expect_test::{Expect, expect};
 use hir_expand::HirFileId;
 use span::Edition;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     item_tree::{ItemTree, ModItemKind, RawVisibility},
@@ -11,8 +11,10 @@ use crate::{
 };
 
 fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let (db, file_id) = TestDB::with_single_file(ra_fixture);
-    let item_tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db(ra_fixture);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let item_tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let pretty = item_tree.pretty_print(&db, Edition::CURRENT);
     expect.assert_eq(&pretty);
     crate::item_tree::persist::assert_round_trip(&item_tree);
@@ -24,7 +26,7 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
 /// of a first lowering, a keyed one and one from the kept tree is checked, whichever the slot
 /// held.
 pub(super) fn assert_assembled_is_whole(db: &TestDB, file: EditionedFileId, what: &str) {
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(db);
     let whole = super::lower_whole(db, file.into(), krate);
     for _ in 0..3 {
         let made = super::items::file_item_tree(db, file, krate);
@@ -317,8 +319,10 @@ fn crate_attrs_with_disabled_cfg_in_source() {
 fn use_trees_expand_in_order_of_their_syntax() {
     use la_arena::{Idx, RawIdx};
 
-    let (db, file_id) = TestDB::with_single_file("use a::{b, c::{d, *}, self, e as f};");
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db("use a::{b, c::{d, *}, self, e as f};");
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let [item] = tree.top_level_items() else { panic!("one item") };
     let ModItemKind::Use(_, use_item) = tree.index(*item) else { panic!("a `use`") };
     let mut imports = Vec::new();
@@ -344,7 +348,7 @@ fn use_trees_expand_in_order_of_their_syntax() {
 fn struct_constructors_have_the_least_visibility_of_their_fields() {
     use crate::item_tree::{RawVisibility, StructValueNsCtor};
 
-    let (db, file_id) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 pub struct R { a: u8 }
 pub(crate) struct U;
@@ -352,7 +356,9 @@ pub struct T(pub u8, pub(crate) u16);
 pub struct M(pub(in crate::a) u8, pub(in crate::b) u8);
 "#,
     );
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let ctors: Vec<Option<Vec<RawVisibility>>> = (tree.top_level_items().iter())
         .map(|&item| {
             let ModItemKind::Struct(_, strukt) = tree.index(item) else { panic!("a struct") };
@@ -374,7 +380,7 @@ pub struct M(pub(in crate::a) u8, pub(in crate::b) u8);
 
 /// The tree of `file`, owned (decoded from its bytes) so it outlives an edit, and its bytes.
 fn owned_tree(db: &TestDB, file: HirFileId) -> (ItemTree, Vec<u8>) {
-    let tree = crate::file_item_tree(db, file, db.test_crate());
+    let tree = crate::file_item_tree(db, file, fixture::test_crate(db));
     let bytes = blaze_format::to_bytes(tree);
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let owned = ItemTree::read(&buffer).and_then(|read| read.decode()).expect("a tree written");
@@ -397,7 +403,9 @@ impl S { fn g(&self) {} }
 
 #[test]
 fn an_edit_inside_a_body_changes_no_byte_of_the_tree() {
-    let (mut db, file_id) = TestDB::with_single_file(EDITED);
+    let fx = fixture::db(EDITED);
+    let file_id = fx.only_file();
+    let mut db = fx.into_db();
     let file: HirFileId = file_id.into();
     let (before, bytes) = owned_tree(&db, file);
     for edited in [
@@ -414,7 +422,9 @@ fn an_edit_inside_a_body_changes_no_byte_of_the_tree() {
 
 #[test]
 fn an_edit_of_one_item_changes_only_its_rows() {
-    let (mut db, file_id) = TestDB::with_single_file(EDITED);
+    let fx = fixture::db(EDITED);
+    let file_id = fx.only_file();
+    let mut db = fx.into_db();
     let file: HirFileId = file_id.into();
     let (before, _) = owned_tree(&db, file);
     db.set_file_text(file_id.file_id(&db), &EDITED.replace("pub fn f(", "pub fn renamed("));
@@ -463,7 +473,9 @@ macro_rules! m { () => {} }
 m!();
 "#;
     let lower = |text: &str| {
-        let (db, file_id) = TestDB::with_single_file(text);
+        let fx = fixture::db(text);
+        let file_id = fx.only_file();
+        let db = fx.into_db();
         owned_tree(&db, file_id.into()).1
     };
     let first = lower(small);
@@ -476,10 +488,12 @@ m!();
 fn constructor_visibilities_keep_the_order_of_their_fields() {
     use crate::item_tree::{RawVisibility, StructValueNsCtor};
 
-    let (db, file_id) = TestDB::with_single_file(
+    let fx = fixture::db(
         "pub struct M(pub(in crate::b) u8, pub(in crate::a) u8, pub u8, pub(in crate::b) u16);",
     );
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let [item] = tree.top_level_items() else { panic!("one item") };
     let ModItemKind::Struct(_, strukt) = tree.index(*item) else { panic!("a struct") };
     let StructValueNsCtor::ValueNsCtorWithMinVis(all) = tree.value_ns_ctor(strukt) else {
@@ -517,8 +531,10 @@ fn attributes_are_found_as_a_search_of_their_owners_finds_them() {
             _ => format!("#[cfg(false)] mod m{i} {{ #[b] fn g() {{}} fn h() {{}} }}\n"),
         })
         .collect();
-    let (db, file_id) = TestDB::with_single_file(&format!("#![c]\n{items}"));
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db(&format!("#![c]\n{items}"));
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     assert!(tree.kinds().len() > 128, "more than two blocks of items");
     for index in 0..tree.kinds().len() as u32 {
         let id = ModItemId::new(index);
@@ -609,8 +625,10 @@ fn read_all(tree: &ItemTree, items: &[crate::item_tree::ModItemId]) -> usize {
 
 #[test]
 fn reading_a_tree_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db(EVERY_KIND);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     assert_eq!(read_all(tree, tree.top_level_items()), tree.kinds().len(), "every item read");
     blaze_alloc_count::assert_at_most(0, "reading every item of a tree", || {
         std::hint::black_box(read_all(tree, tree.top_level_items()));
@@ -620,8 +638,10 @@ fn reading_a_tree_allocates_nothing() {
 
 #[test]
 fn expanding_use_trees_whose_paths_are_interned_allocates_nothing() {
-    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db(EVERY_KIND);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let expand = || {
         let mut imports = 0;
         for &item in tree.top_level_items() {
@@ -640,8 +660,10 @@ fn expanding_use_trees_whose_paths_are_interned_allocates_nothing() {
 
 #[test]
 fn a_warm_builder_lowers_a_file_in_one_allocation() {
-    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
-    let (file, krate) = (HirFileId::from(file_id), db.test_crate());
+    let fx = fixture::db(EVERY_KIND);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let (file, krate) = (HirFileId::from(file_id), fixture::test_crate(&db));
     let cold = super::lower_whole(&db, file, krate);
     let warm = blaze_alloc_count::assert_at_most(1, "lowering on a warm builder", || {
         super::lower_whole(&db, file, krate)
@@ -651,8 +673,10 @@ fn a_warm_builder_lowers_a_file_in_one_allocation() {
 
 #[test]
 fn decoding_a_tree_allocates_its_block_and_its_paths() {
-    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
-    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let fx = fixture::db(EVERY_KIND);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let tree = crate::file_item_tree(&db, file_id.into(), fixture::test_crate(&db));
     let buffer = blaze_format::Aligned::copy_from(&blaze_format::to_bytes(tree));
     let read = ItemTree::read(&buffer).expect("a tree written");
     assert_eq!(read.decode().expect("a tree written"), *tree);
@@ -670,7 +694,9 @@ fn a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one() {
     let names: String = (0..600).map(|i| format!("fn f{i}() {{}}\n")).collect();
     let big = format!("mod many {{\n{names}}}\n");
     let lower = |text: &str| {
-        let (db, file_id) = TestDB::with_single_file(text);
+        let fx = fixture::db(text);
+        let file_id = fx.only_file();
+        let db = fx.into_db();
         owned_tree(&db, file_id.into()).1
     };
     let first = lower(small);

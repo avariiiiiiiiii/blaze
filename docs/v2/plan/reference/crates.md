@@ -67,7 +67,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | lane | paths |
 |---|---|
 | coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `v2/requests/` (applying them), `crates/hir-ide/`, `crates/ide-db/`, `crates/test-fixture/` until they are removed |
-| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
+| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-lower/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
 | diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
 | vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
@@ -97,10 +97,11 @@ coordinator's: a change there is a request.
 | `blaze-graph` | changed: the plane becomes the one scheduler, `Machine` its one-request case; the executor's cache-aware groups | core |
 | `blaze-store` | replaced by `blaze-cas`, deleted at integration | store |
 | `blaze-cargo` | changed: its daemon and client move onto `blaze-core`, `blaze-graph`'s plane and `blaze-api` at integration; its sandbox gains tracing (usercode); its remote store becomes the read-through tier (store) | coordinator, usercode, store |
-| `blaze-engine` | replaced: the crate-at-a-time codegen tail becomes per-function units | codegen |
+| `blaze-engine` | replaced: the crate-at-a-time codegen tail becomes per-function units; tail deleted at integration, 2026-10-30. Kept: the `blaze` program (`src/program.rs`: the sandbox launcher, the release hand-over, the build-script `rustc`/`rustdoc` stand-ins in `as_rustc`, the pinned release and `pin`/`version-fetch`/`version-resolve`, then `blaze_cargo::cli::main`), `pin.rs`, `versions.rs` | codegen |
 | `hir-ty-codegen` | changed: compiles one `Unit` to one `CompiledFunction` | codegen |
 | `hir-ty-mir` | changed: instances keyed by `Instance`, code dedupe, inlining edges | codegen |
-| `blaze-splice`, `blaze-in-place` | replaced by `blaze-link` | link |
+| `blaze-splice` | replaced by `blaze-link`; deleted at integration, 2026-10-30 | link |
+| `blaze-in-place` | replaced by `blaze-link` | link |
 | `blaze-live` | changed: patches through `blaze-link`'s slots and commit | link |
 | `blaze-expand` | replaced: expansions keyed by `RunKey` with traced inputs | usercode |
 | `blaze-build-script`, `blaze-macro-wasm`, `blaze-wasi`, `proc-macro-api`, `proc-macro-srv` | changed: run in tracing sandboxes, from a warm pool | usercode |
@@ -115,9 +116,10 @@ coordinator's: a change there is a request.
 | `hir-ty-borrowck`, `hir-ty-wfcheck` | changed only as `hir-ty` moves | db |
 | `blaze-protocol` | left: `blaze-api` uses its CBOR and frames; its `events` stay for the build view | ci |
 | `blaze-ui`, `blaze-web` | changed: clients of `blaze-api` | ci |
-| `hir-ide`, `ide-db`, `test-fixture` | removed at integration | coordinator |
+| `hir-ide` | deleted at integration, 2026-10-30: its display and diagnostics moved to `hir-ty`, its tests to `hir-ty-mir` | coordinator |
+| `ide-db`, `test-fixture` | removed at integration | coordinator |
 | `ide-diagnostics` | replaced by `blaze-diagnostics` ([building.md](../process/building.md) section 18), then removed | diagnostics |
-| `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18) | cargo |
+| `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18); the units' lowering into base-db's crate graph is the new crate `blaze-lower` | cargo |
 | `blaze-fmt`, `blaze-lints` | left; moved onto the flat tree at integration | coordinator |
 | every other crate | left | coordinator |
 

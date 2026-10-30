@@ -77,7 +77,8 @@ change still prints what cargo's build prints.
 ### Proc-macro expansions
 
 The store also keeps what proc macros expand to, so a daemon that loads a workspace again,
-here or on any machine sharing the remote, does not run them again (`crates/blaze-expand`).
+here or on any machine sharing the remote, does not run them again
+(`crates/proc-macro-api/src/kept.rs`).
 Every kind of macro is kept: derive, attribute and function-like. An expansion is a run of
 user code, keyed as a build script's run is (`blaze_usercode::RunKey`). Its code is the
 content ID of the macro's library. What it is given is:
@@ -91,8 +92,9 @@ content ID of the macro's library. What it is given is:
 
 So the next call with the same input, in another database or revision, has the same key.
 The output is kept with its spans written the same way. What else the macro read (files,
-listings, variables of the shell) is traced: by the sandbox of a native macro's server, and
-by the host for a macro run as WebAssembly, which records every read of its package. The
+listings, variables of the shell) is traced: by blaze's server for a macro run in process on
+blaze's own compiler (`crates/blaze-macro-eval`), and by the host for a macro run as
+WebAssembly, which records every read of its package. The
 result is found by exactly those inputs' values now, through `blaze_usercode::index`. A
 macro that reads a file or a variable by itself is therefore keyed by it, with nothing to
 name.
@@ -102,8 +104,7 @@ An expansion is not kept when:
 - it failed;
 - its output has an anchor or a context its input has not;
 - it read what can't be traced (the clock, randomness);
-- its server could not trace it (`BLAZE_SANDBOX=off`);
-- a native macro asked rust-analyzer about a span (its text, file or line).
+- a macro run in process asked the database about a span (its text, file or line).
 
 A module run as WebAssembly is kept with each question it asked and the answer, and is found
 while the database answers each the same. A module seen keeping state between expansions

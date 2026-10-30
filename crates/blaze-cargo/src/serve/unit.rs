@@ -59,7 +59,7 @@ use blaze_units::{
     query::{BuildConfig, Fetch, Units},
     schema::{Mode, Unit},
 };
-use load_cargo::v2::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
+use blaze_lower::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
 
 use crate::serve::{
     Paths,
@@ -149,7 +149,7 @@ impl Steps for Real {
 
     fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
         let at = || Some("the standard library's sources".to_owned());
-        let library = crate::cargo::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
+        let library = crate::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
         let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
         let named = blaze_units::stdlib::library_at(&library.commit);
         let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint");
@@ -200,12 +200,15 @@ impl Steps for Real {
                     }
                     false => {
                         drop((session, lowered, seeds));
-                        (load_cargo::v2::lower(lower()).map_err(failed)?, None, Vec::new())
+                        (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new())
                     }
                 },
-                None => (load_cargo::v2::lower(lower()).map_err(failed)?, None, Vec::new()),
+                None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
             };
             let fresh = session.is_none();
+            if fresh {
+                blaze_item_hash::impls::install(lowered.served_db());
+            }
             let mut session = match session {
                 Some(session) => session,
                 None => deps::session(&lowered, &input.store, &input.config.invocation.env)?,
@@ -256,7 +259,7 @@ fn seed(lowered: &Lowered, mut seeds: Vec<blaze_intent::Seed>) -> Vec<blaze_inte
     seeds
 }
 
-fn lower_error(error: load_cargo::v2::LowerError) -> ApiError {
+fn lower_error(error: blaze_lower::LowerError) -> ApiError {
     ApiError::new(error.what, error.at)
 }
 
@@ -396,7 +399,7 @@ impl Writer<Real> for UnitWriter {
     }
 
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic> {
-        self.flushed.as_ref().map(deps::noted)
+        deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
     }
 
     fn keep(mut self) -> Option<KeptLowered> {

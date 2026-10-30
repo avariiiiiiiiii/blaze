@@ -3,7 +3,7 @@
 
 use base_db::{Db, FileId};
 use hir_def::DefWithBodyId;
-use test_fixture::WithFixture as _;
+use hir_expand::fixture;
 
 use super::{LintSet, body_lints};
 use crate::{
@@ -29,7 +29,9 @@ fn b(x: bool) {
 ";
 
 fn db(text: &str) -> (Db, FileId) {
-    let (db, file) = Db::with_single_file(&format!("//- /main.rs crate:main\n{text}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{text}"));
+    let file = fx.only_file();
+    let db = fx.into_db();
     let file = file.file_id(&db);
     (db, file)
 }

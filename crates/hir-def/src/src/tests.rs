@@ -3,7 +3,7 @@
 
 use la_arena::{Idx, RawIdx};
 use syntax::{SyntaxKind, TextRange};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{
@@ -134,7 +134,7 @@ fn defs(db: &TestDB) -> Defs {
 
 #[test]
 fn source_view_is_source() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let defs = defs(&db);
     assert!(defs.sources.len() >= 14, "the fixture's items: {}", defs.sources.len());
     for (vk, vr, hk, hr) in defs.sources {
@@ -144,7 +144,7 @@ fn source_view_is_source() {
 
 #[test]
 fn child_source_view_is_child_source() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let defs = defs(&db);
     let mut seen = 0;
     for variant in defs.variants {
@@ -189,7 +189,7 @@ fn child_source_view_is_child_source() {
 
 #[test]
 fn use_tree_to_view_is_child_source() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let mut seen = 0;
     for use_ in defs(&db).uses {
         let id = use_.lookup(&db).id;

@@ -32,7 +32,7 @@ pub const SYMBOL: &str = "BLAZE_PROC_MACROS";
 
 /// One macro of the list, as [`list_text`] writes it.
 pub struct ListedMacro<'a> {
-    /// As blaze-expand numbers them: a derive 0, an attribute 1, a function-like 2.
+    /// As `proc_macro_api::kept` numbers them: a derive 0, an attribute 1, a function-like 2.
     pub kind: u32,
     /// What it is invoked by: a derive's trait, else its function's name.
     pub name: &'a str,
@@ -43,7 +43,7 @@ pub struct ListedMacro<'a> {
 
 /// One macro of the list.
 struct Macro {
-    /// As blaze-expand numbers them: a derive 0, an attribute 1, a function-like 2.
+    /// As `proc_macro_api::kept` numbers them: a derive 0, an attribute 1, a function-like 2.
     kind: u32,
     /// What it is invoked by: a derive's trait, else its function's name.
     name: String,

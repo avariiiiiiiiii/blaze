@@ -1,6 +1,7 @@
 //! The four hashes and the keys: what an edit changes and what it keeps.
 
 use hir_def::{AdtId, DefWithBodyId, expr_store::Body, hir::Expr};
+use hir_expand::fixture;
 use hir_ty::db::{InternedClosure, InternedClosureId};
 
 use super::{TestDB, edit, item, single};
@@ -312,7 +313,7 @@ fn f() -> impl Sized {
 }
 "#,
     );
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let mut cycles = 0;
     for graph in [Graph::Interface, Graph::Layout, Graph::Deep] {
         let table = hash::find_components(&db, graph, krate);
@@ -588,14 +589,15 @@ fn f() {
 
 #[test]
 fn keys_of_two_crates_differ() {
-    let db = <TestDB as test_fixture::WithFixture>::with_files(
+    let db = fixture::db(
         r#"
 //- /a.rs crate:a
 pub struct S;
 //- /b.rs crate:b
 pub struct S;
 "#,
-    );
+    )
+    .into_db();
     let krates: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
     let keys: Vec<_> = krates.iter().map(|&krate| key::crate_key(&db, krate)).collect();
     for (at, a) in keys.iter().enumerate() {
@@ -665,7 +667,7 @@ fn crate_items(db: &TestDB, krate: base_db::Crate) -> Vec<ItemId> {
 
 #[test]
 fn a_key_says_its_crate_and_whether_it_is_in_a_body() {
-    let db = <TestDB as test_fixture::WithFixture>::with_files(
+    let db = fixture::db(
         r#"
 //- /a.rs crate:a
 pub struct S;
@@ -677,7 +679,8 @@ pub fn f() -> u8 {
 //- /b.rs crate:b
 pub struct S;
 "#,
-    );
+    )
+    .into_db();
     let mut inner = 0;
     for &krate in base_db::all_crates(&db).iter() {
         let prefix = key::crate_key(&db, krate).0[..8].to_vec();
@@ -710,7 +713,7 @@ pub struct S;
 
 #[test]
 fn an_item_of_each_crate_resolves_in_its_own() {
-    let db = <TestDB as test_fixture::WithFixture>::with_files(
+    let db = fixture::db(
         r#"
 //- /a.rs crate:a
 pub struct S;
@@ -719,7 +722,8 @@ pub struct S;
 //- /c.rs crate:c deps:a,b
 pub struct S;
 "#,
-    );
+    )
+    .into_db();
     let mut seen = 0;
     for &krate in base_db::all_crates(&db).iter() {
         for id in crate_items(&db, krate) {

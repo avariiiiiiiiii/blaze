@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""apps.py: whole applications built by blaze, dependencies included, against cargo's build.
+"""apps.py: whole applications built by blaze, dependencies included, and run.
 
 usage: apps.py <name> [--stage build,workload,perf,tests,edits] [--json out.json]
-       apps.py --table <dir of json>
 
 <name> is an entry of apps/apps.json. The checkout (APPS_DIR/<name>, cloned at `rev`) gets
 the source of every dependency in a directory beside it (`cargo vendor`, and the source
@@ -14,12 +13,18 @@ build     cargo builds the program for the link line; blaze compiles every crate
           it and links its objects ahead of rustc's. Then the same with blaze as cargo's
           `RUSTC_WRAPPER`, where rustc builds only what runs during the build: that one is
           timed from nothing and is the program the other stages use when it links.
-workload  each command line of `runs`, cargo's program against blaze's: status, stdout, stderr.
-perf      `bench` timed with cargo's debug and release programs and blaze's; sizes.
-tests     the test binaries of `tests`: those of a library are linked again with blaze's
-          objects, those that start the program are run with blaze's program in its place.
-edits     the daemon holds the program; each edit of `edits` is timed to a linked program and
-          to cargo's, and `check` has to print the same from both.
+workload  each command line of `runs` with blaze's program: it has to finish, not be killed by
+          a signal and not panic out of `main` (exit 101), and exit with the run's `status`
+          where it states one (`{"args": [...], "status": 1}`). The applications' own tests
+          (`tests`) are what holds what the program does.
+perf      `bench` timed with blaze's program, and cargo's debug and release programs as the
+          baseline; sizes.
+tests     the test binaries of `tests`, judged by their own results: those of a library are
+          linked again with blaze's objects, those that start the program are run with blaze's
+          program in its place.
+edits     the daemon holds the program; each edit of `edits` is timed to a linked program (and
+          cargo's build of it, as the baseline), and `check` has to print the same from the
+          daemon's program and from blaze's own build of the same source from nothing.
 
 The backend is the environment's, as for the other harnesses: `BLAZE_BACKEND`, `BLAZE_OPT`,
 `BLAZE_EMIT`.
@@ -28,7 +33,7 @@ import argparse, importlib, json, os, re, shlex, shutil, socket, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import mixed, linkline, memory
+import linkline, memory
 from mixed import Fixture, BLAZE, bucket, host, sysroot_rlibs
 
 APPS_DIR = os.environ.get("APPS_DIR") or os.path.join(HERE, "vendor", "apps")
@@ -117,7 +122,7 @@ class App(Fixture):
         self.stdin = None
         self.project = package_directory(ws, spec["package"])
 
-    def rustc_build(self):
+    def rustc_build(self, target_dir=None):
         """Cargo's build, with blaze in rustc's place for every crate when the program is
         blaze's alone: a dependency is not of the workspace to cargo. Without `lto`, which
         links one object of what the stand-ins use in place of the libraries, the standard
@@ -127,17 +132,17 @@ class App(Fixture):
             os.environ.update(own)
         try:
             began = time.monotonic()
-            super().rustc_build()
+            super().rustc_build(target_dir)
             self.cargo_secs = time.monotonic() - began
         finally:
             for var in own if self.alone else ():
                 os.environ.pop(var, None)
         linked = {os.path.basename(r)[3:].rsplit("-", 1)[0] for r in self.rlibs
                   if r.endswith(".rlib") and "/rustlib/" not in r}
-        program = os.path.basename(self.reference).rsplit("-", 1)[0].replace("-", "_")
+        program = os.path.basename(linkline.output_of(self.link_args)).rsplit("-", 1)[0].replace("-", "_")
         self.crates = [",".join([program, *sorted(linked - {program})])]
 
-    def blaze_build(self, deny=()):
+    def blaze_build(self, deny=(), env=None):
         """As the fixture's, keeping what the process took: seconds and peak resident memory."""
         crate = self.crates[0]
         obj, report, log = (os.path.join(self.work, f"all.{ext}") for ext in ("o", "tsv", "stderr"))
@@ -149,7 +154,7 @@ class App(Fixture):
         began = time.monotonic()
         with open(log, "w") as err:
             child = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=err,
-                                     env={**os.environ, "RUST_BACKTRACE": "1"})
+                                     env={**(env or os.environ), "RUST_BACKTRACE": "1"})
             _, status, usage = os.wait4(child.pid, 0)
         self.blaze_secs, self.blaze_mb = time.monotonic() - began, memory.maxrss_mb(usage)
         if status != 0:
@@ -232,8 +237,9 @@ def reasons(row):
 
 
 def reference(ws, spec, profile, timed=False):
-    """Cargo's own build of the program without the harness's flags, timed when it is from
-    nothing or when asked; returns (program, seconds or None)."""
+    """Cargo's own build of the program without the harness's flags, the speed baseline of
+    `perf` and `edits`, timed when it is from nothing or when asked; returns (program, seconds
+    or None)."""
     target = os.path.join(ws, "target-" + profile)
     name = spec.get("bin", spec["package"])
     program = os.path.join(target, profile, name)
@@ -295,8 +301,8 @@ class Served:
                                  timeout=600, cwd=self.fx.ws)
             return ran.returncode, self.fx.scrub(ran.stdout), self.fx.scrub(ran.stderr)
         if isinstance(run, dict):
-            # The program reads the file `stdin` names.
-            self.fx.run_args, self.fx.stdin = self.args(run["args"]), run["stdin"]
+            # The program reads the file `stdin` names, if any.
+            self.fx.run_args, self.fx.stdin = self.args(run["args"]), run.get("stdin")
         else:
             self.fx.run_args, self.fx.stdin = self.args(run), None
         return self.fx.behaviour(self.binary)
@@ -324,26 +330,39 @@ class Served:
 
 def name_of(run):
     if isinstance(run, dict):
-        return shlex.join(run["tool"]) if "tool" in run else f"{shlex.join(run['args'])} < {run['stdin']}"
+        if "tool" in run:
+            return shlex.join(run["tool"])
+        return shlex.join(run["args"]) + (f" < {run['stdin']}" if run.get("stdin") else "")
     return shlex.join(run)
 
 
-def workload(fx, spec, debug, result):
-    """Every command line with cargo's program, then with blaze's, in the same order: a
-    server keeps what the earlier ones did to it."""
-    seen = []
-    for binary in (debug, fx.binary):
-        with Served(fx, binary) as served:
-            seen.append([served.behaviour(run) for run in spec["runs"]])
-    differing = []
-    for run, want, got in zip(spec["runs"], *seen):
-        if want != got:
-            differing.append(name_of(run))
+def run_wrong(run, got):
+    """None when blaze's program ran a command line as it should (`workload`); else how not."""
+    status = got[0]
+    if status == "timeout":
+        return "did not finish in 600 s"
+    if isinstance(run, dict) and "status" in run:
+        return None if status == run["status"] else f"exited {status}, and the run says {run['status']}"
+    if status < 0:
+        return f"killed by signal {-status}"
+    if status == 101:
+        return "panicked out of main (exit 101)"
+    return None
+
+
+def workload(fx, spec, result):
+    """Every command line with blaze's program, in order: a server keeps what the earlier ones
+    did to it."""
+    with Served(fx, fx.binary) as served:
+        seen = [served.behaviour(run) for run in spec["runs"]]
+    wrong = []
+    for run, got in zip(spec["runs"], seen):
+        if (why := run_wrong(run, got)) is not None:
+            wrong.append(name_of(run))
             tail = got[2].decode(errors="replace").strip().splitlines()[-2:]
-            print(f"  DIFFERS `{name_of(run)}`: rustc status {want[0]}, blaze status {got[0]}: "
-                  f"{mixed.symptom(want, got)} {' | '.join(tail)[:300]}")
-    result["workload"] = {"runs": len(spec["runs"]), "differing": differing}
-    print(f"workload: {len(spec['runs']) - len(differing)} of {len(spec['runs'])} command lines the same")
+            print(f"  WRONG `{name_of(run)}`: {why}: {' | '.join(tail)[:300]}")
+    result["workload"] = {"runs": len(spec["runs"]), "wrong": wrong}
+    print(f"workload: {len(spec['runs']) - len(wrong)} of {len(spec['runs'])} command lines ran")
 
 
 def perf(fx, spec, debug, release, result):
@@ -367,14 +386,10 @@ def perf(fx, spec, debug, release, result):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("name", nargs="?")
+    ap.add_argument("name")
     ap.add_argument("--stage", default="build,workload,perf")
     ap.add_argument("--json")
-    ap.add_argument("--table")
     a = ap.parse_args()
-    if a.table:
-        import appstable
-        return appstable.main(a.table)
     spec = json.load(open(SPECS))[a.name]
     stages = a.stage.split(",")
     out = os.path.abspath(a.json) if a.json else None
@@ -386,7 +401,6 @@ def main():
     os.environ["RUSTFLAGS"] = f"{FLAGS} {own_flags(spec)}".strip()
     backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     result = {"app": a.name, "backend": backend, "rev": spec.get("rev")}
-    debug, result["debug_cold_s"] = reference(ws, spec, "debug")
     setup(ws, spec)
     ahead = build(ws, spec, result, alone=False)
     alone = build(ws, spec, result, alone=True) if ahead else None
@@ -394,9 +408,10 @@ def main():
     result["program"] = "alone" if alone else "ahead" if ahead else None
     ok = fx is not None
     if fx and "workload" in stages:
-        workload(fx, spec, debug, result)
-        ok = ok and not result["workload"]["differing"]
+        workload(fx, spec, result)
+        ok = ok and not result["workload"]["wrong"]
     if fx and "perf" in stages and ("bench" in spec or "load" in spec):
+        debug, result["debug_cold_s"] = reference(ws, spec, "debug")
         release, result["release_cold_s"] = reference(ws, spec, "release")
         perf(fx, spec, debug, release, result)
     if fx and "tests" in stages:

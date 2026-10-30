@@ -421,6 +421,13 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         &self.store
     }
 
+    /// Makes its store the process's ([`blaze_cas::Handle::install`]), which blaze-macro-wasm and
+    /// blaze-wasi read and write through: the daemon of `blaze serve` alone, as a process has one
+    /// store, and a test's daemons are many to a process. Its root is the driver's, `/`.
+    pub fn install_store(&mut self) -> Result<&'static blaze_cas::Handle, String> {
+        blaze_cas::Handle::install(blaze_cas::Handle::new(&mut self.store, std::path::PathBuf::from("/")))
+    }
+
     pub fn mounts(&self) -> &Mounts {
         &self.mounts
     }

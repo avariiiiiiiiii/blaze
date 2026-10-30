@@ -17,7 +17,7 @@ use hir_ty_mir::mir::{
     monomorphized,
     type_name::rustc_type_name,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -68,7 +68,9 @@ const GOAL: u32 = triangle(100);
 
 #[test]
 fn a_built_mir_body_is_read_without_allocating() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, "work");
         let first = db.mir_body(func.into()).expect("the MIR of `work`");
@@ -81,7 +83,9 @@ fn a_built_mir_body_is_read_without_allocating() {
 
 #[test]
 fn an_optimized_mir_body_is_read_without_allocating() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let options = MirOptions::at(MirOptLevel::Debug);
     hir_ty::attach_db(&db, || {
         let func = function(&db, "work");
@@ -95,7 +99,9 @@ fn an_optimized_mir_body_is_read_without_allocating() {
 
 #[test]
 fn an_evaluated_constant_is_read_without_allocating() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let goal = constant(&db, "GOAL");
         let first = db.const_eval(goal, GenericArgs::empty(), None).expect("evaluating `GOAL`");
@@ -109,7 +115,9 @@ fn an_evaluated_constant_is_read_without_allocating() {
 
 #[test]
 fn storage_conflicts_allocate_their_result_only() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, "work");
         let options = MirOptions::at(MirOptLevel::Debug);
@@ -135,7 +143,9 @@ fn owned(body: &MirBody<'_>) -> u64 {
 
 #[test]
 fn warm_optimizations_allocate_nothing() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "work");
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
@@ -158,7 +168,9 @@ fn warm_optimizations_allocate_nothing() {
 #[test]
 fn warm_ub_checks_allocate_nothing_without_sites() {
     // `work` reads no raw pointer and transmutes into no enum: the checks scan and add nothing.
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "work");
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
@@ -178,7 +190,9 @@ fn warm_ub_checks_allocate_nothing_without_sites() {
 
 #[test]
 fn warm_runtime_analyses_allocate_nothing() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "work");
         let built = db.mir_body(def).expect("the built body").clone();
@@ -196,7 +210,9 @@ fn warm_runtime_analyses_allocate_nothing() {
 
 #[test]
 fn run_passes_allocates_the_kept_body_only() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "plain");
         let built = db.mir_body(def).expect("the built body").clone();
@@ -214,7 +230,9 @@ fn run_passes_allocates_the_kept_body_only() {
 
 #[test]
 fn optimize_allocates_the_kept_body_only() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "work");
         let options = MirOptions::at(MirOptLevel::Release);
@@ -248,7 +266,9 @@ const WARM: u32 = run(5);
 const TEN: u32 = run(10);
 const TWENTY: u32 = run(20);
 "#;
-    let (db, _) = TestDB::with_single_file(LOOPS);
+    let fx = fixture::db(LOOPS);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let eval = |name| {
             measure(|| {
@@ -296,7 +316,9 @@ pub fn many() -> u32 {
     1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12
 }
 "#;
-    let (db, _) = TestDB::with_single_file(CONSTANTS);
+    let fx = fixture::db(CONSTANTS);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let few = monomorphize_beyond_the_copy(&db, "few");
         let many = monomorphize_beyond_the_copy(&db, "many");
@@ -321,7 +343,9 @@ fn straight(n: usize) -> String {
 
 /// What lowering `straight(n)` allocates beyond the body it keeps, and what its setup does.
 fn lowering_extra(n: usize) -> (u64, u64) {
-    let (db, _) = TestDB::with_single_file(&straight(n));
+    let fx = fixture::db(&straight(n));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = body_of(&db, "straight");
         let warm = budget::lower(&db, def).expect("the body");
@@ -348,7 +372,9 @@ fn lowering_allocates_the_kept_body_and_its_setup_only() {
 
 #[test]
 fn type_names_allocate_the_name_only() {
-    let (db, _) = TestDB::with_single_file(WORK);
+    let fx = fixture::db(WORK);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, "make");
         let body = db.mir_body(func.into()).expect("the body");

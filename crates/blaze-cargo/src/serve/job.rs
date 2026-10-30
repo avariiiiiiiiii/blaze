@@ -1230,8 +1230,8 @@ impl<S: Steps> Jobs<S> {
 
     /// Keeps what a task's expansions put, from the store's one owner: a refused one fails the
     /// task's job, naming the expansion.
-    fn kept(&mut self, w: &mut World<'_, S>, node: NodeId, puts: Vec<blaze_expand::Put>) {
-        let published = blaze_expand::publish(w.store, puts);
+    fn kept(&mut self, w: &mut World<'_, S>, node: NodeId, puts: Vec<proc_macro_api::kept::Put>) {
+        let published = proc_macro_api::kept::publish(w.store, puts);
         if let Some(ticket) = published.tickets.last() {
             self.put = Some(*ticket);
         }
@@ -2132,7 +2132,7 @@ impl<S: Steps> Jobs<S> {
         job.finished = true;
         blaze_macro_eval::flush();
         // The snapshot waits on the last ticket; a verdict the store refuses fails the job.
-        let published = blaze_expand::publish(w.store, blaze_expand::take_puts());
+        let published = proc_macro_api::kept::publish(w.store, proc_macro_api::kept::take_puts());
         if let Some(ticket) = published.tickets.last() {
             self.put = Some(*ticket);
         }

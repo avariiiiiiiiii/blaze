@@ -21,16 +21,16 @@ struct Toolchain {
 impl Toolchain {
     /// `None` when the data of targets is not of the pinned toolchain's rustc.
     fn ours() -> Option<Toolchain> {
-        if target::rustc_version() != crate::cargo::toolchain::ours_says() {
+        if target::rustc_version() != crate::toolchain::ours_says() {
             return None;
         }
-        Some(Toolchain { host: crate::cargo::toolchain::host()? })
+        Some(Toolchain { host: crate::toolchain::host()? })
     }
 }
 
 /// Where blaze's release is, found with nothing run.
 fn sysroot() -> Option<PathBuf> {
-    crate::cargo::toolchain::sysroot()
+    crate::toolchain::sysroot()
 }
 
 /// What `cargo --version` says after `cargo ` for the toolchain at `sysroot`, from rustup's

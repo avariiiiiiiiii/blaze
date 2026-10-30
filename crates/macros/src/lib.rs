@@ -200,45 +200,6 @@ fn generic_type_visitable_derive(mut s: synstructure::Structure<'_>) -> proc_mac
     )
 }
 
-decl_derive!(
-    [UpmapFromRaFixture] => upmap_from_ra_fixture
-);
-
-fn upmap_from_ra_fixture(mut s: synstructure::Structure<'_>) -> proc_macro2::TokenStream {
-    if let syn::Data::Union(_) = s.ast().data {
-        panic!("cannot derive on union")
-    }
-
-    s.add_bounds(synstructure::AddBounds::Generics);
-    s.bind_with(|_| synstructure::BindStyle::Move);
-    let body = s.each_variant(|vi| {
-        let bindings = vi.bindings();
-        vi.construct(|_, index| {
-            let bind = &bindings[index];
-
-            quote! {
-                ::ide_db::ra_fixture::UpmapFromRaFixture::upmap_from_ra_fixture(
-                    #bind, __analysis, __virtual_file_id, __real_file_id,
-                )?
-            }
-        })
-    });
-
-    s.bound_impl(
-        quote!(::ide_db::ra_fixture::UpmapFromRaFixture),
-        quote! {
-            fn upmap_from_ra_fixture(
-                self,
-                __analysis: &::ide_db::ra_fixture::RaFixtureAnalysis,
-                __virtual_file_id: ::ide_db::ra_fixture::FileId,
-                __real_file_id: ::ide_db::ra_fixture::FileId,
-            ) -> Result<Self, ()> {
-                Ok(match self { #body })
-            }
-        },
-    )
-}
-
 /// Derive an extension trait for a given impl block. The trait name
 /// goes into the parenthesized args of the macro, for greppability.
 /// For example:

@@ -16,7 +16,7 @@ use hir_ty::{
     next_solver::{DbInterner, Region, RegionExt as _, Ty},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{Scan, irrefutable};
 use crate::regions::{Annotation, spells_generics};
@@ -441,7 +441,9 @@ fn empty_match(e: E) {
 
 #[test]
 fn the_one_pass_gives_what_each_scan_gave() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut seen = Seen::default();
         let mut bodies = 0;

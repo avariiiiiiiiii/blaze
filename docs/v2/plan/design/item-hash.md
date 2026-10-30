@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2's item identities: a body's type check, MIR and borrow check are filed in the store under an a-priori hash of everything they read (its own name-resolved HIR with no spans, the signature hashes of what it names, the crate's inputs) plus a constructive trace of the global facts they read (impl sets, method candidates, field names, constant values), so a result is a store read with no deep verify, shared across branches, machines and reverted edits.
+summary: blaze v2's item identities: a body's type check, MIR and borrow check are filed in the store under an a-priori hash of everything they read (its own name-resolved HIR with no spans, the signature hashes of what it names, the crate's inputs) plus a constructive trace of the global facts they read (impl sets, method candidates, field names, constant values), so a result is a store read with no deep verify, shared across branches, machines and reverted edits; the hash is anonymous (Unison-style), with names and positions in a presentation layer, locations as a per-crate data table, debug info off the edit path, and item IDs in blaze's own reports.
 date: 2026-10-30
 ---
 # Item identities: a front-end result is a lookup by hash
@@ -87,12 +87,14 @@ that every salsa id is written as its index in a table of first appearance (`Rel
   index in the body's arenas, de Bruijn style), never by name;
 - generic and lifetime parameters by index in the owner's generics;
 - a path by what it resolves to (section 3.5), never by its text, so a rename of a local, a
-  parameter, the item or a callee, and a `use .. as` alias, keep the hash;
+  parameter or the item itself, and a `use .. as` alias, keep the hash (a callee's rename does
+  not yet, section 3.7);
 - what is resolved *by name* after inference stays text: a field (`s.f`), a method (`x.m()`), the
   segments of a type-relative path after its qualifier (`Vec::new`'s `new`), and a path that
   resolves to nothing (its diagnostic names it);
-- `line!()`, `column!()`, `file!()`, `module_path!()` and every other position or name a macro
-  expands to are a slot, not their value (section 3.7).
+- a `line!()`, `column!()`, `file!()`, `module_path!()` or `concat!` literal in a plain value
+  position is a slot, not its value (section 3.7); in an array length, a type, a const argument,
+  a const block, a pattern or `asm!` it stays by value, since there it becomes part of a type.
 
 The source map is a separate buffer and is never read. Moving an item within its file,
 reformatting, comments and renames keep the hash; what the body is after macro expansion is hashed,
@@ -121,11 +123,14 @@ coroutines, opaque types and anonymous constants as "self", and each item one of
 "the target of path i", decoded through the current database's resolutions; everything else by item
 key (those reads are facts keyed by item key, section 5). So a rename hits.
 
-**What a target is in the hash** (section 3.5): its kind, its signature hash, whether it is a lang
-item and which, and whether it is an intrinsic: everything inference, MIR building and the borrow
-check read of an item they name. Its key is not in the hash.
+**What a target is in the hash** (section 3.5): its item key and signature hash. The key stays
+because the trace's facts about a target (its constant value, its impls) are keyed by item key: with
+the key out of the hash, `[u8; A]` edited to `[u8; B]` (two constants of one signature) would find
+A's record and check A's fact. Dropping it needs facts about a body's targets keyed relative to
+the body ("the value of target i"), as records are.
 
-**Left, with why:** a body's module chain (section 3.5) is by module key, so moving an item to
+**Left, with why:** renaming an item changes the identity of the bodies that name it (above). A
+body's module chain (section 3.5) is by module key, so moving an item to
 *another module* or renaming an enclosing module changes the identity: privacy and `super::` can
 change meaning there. Facts are keyed by item key, so renaming an item a body reaches only through
 a type or an impl changes that fact's key and the body misses once.
@@ -153,9 +158,8 @@ patterns, record literals, type refs and `asm!` operands, at the scope it is wri
 
 - the first segment, in the type, value and macro namespaces, through the body's resolver at that
   scope (`Resolver::resolve_path_in_type_ns`, `resolve_path_in_value_ns`, with the path's
-  hygiene): a local binding by its index in the body, a generic parameter by its index, an item as
-  section 3.7 says (kind, signature hash, lang item, intrinsic; not its key), "none" with the
-  path's text;
+  hygiene): a local binding by its index in the body, a generic parameter by its index, an item by
+  key and signature hash (section 3.7), "none" with the path's text;
 - each next segment, while the prefix is a module or an enum: its resolution in that module's
   scope (each namespace) or as that enum's variant;
 - once the prefix is a type, the rest is type-relative: inference resolves it through impls and
@@ -259,7 +263,10 @@ read's value does. Both are what the tests of section 9 aim at.
   cache, `ReadThrough`), as the goal store, the dependency images and the bodies part are. On a
   restart the store's packs are mapped (`blaze-core/src/fs/mapped.rs`); the daemon image (lane
   graph's frozen graph, lane tree-store's trees, `crates/blaze-image` sections) holds no copy of
-  these records: they are content-addressed and are read from the store's mapping.
+  these records: they are content-addressed and are read from the store's mapping. The frozen
+  graph (section `SALSA_GRAPH`, 0x0501) holds node keys, filter words and edges, no memo values;
+  if memo restore (queue 00822) links a frozen node to a record, the link is the record's store
+  key (`QueryKey { kind, input }.id()`), never a copy.
 - An inference answer is `hir_ty::check_cache`'s per-body record (the inference result in stable
   form, its ids through a portable table by item key). A MIR answer is the MIR body in the same
   stable form. A borrow-check answer is the verdict. Only passing verdicts are stored; a failing
@@ -299,7 +306,9 @@ body when the two results differ: the differential mode the harness runs.
   corpus projects, with `harness/apps/pick_edits.py`'s edits): build with the store, apply a random
   edit sequence (body edits, signature edits, impl added and removed, item moved, reverted), build
   after each with `BLAZE_ITEM_STORE=verify`: every hit equals a fresh run, and each program's
-  output equals rustc's (the apps harness's differential against the pinned nightly).
+  output equals what blaze builds of the same state from nothing (a fresh home, store and
+  target, `BLAZE_ITEM_STORE=off`); no harness compares with rustc or cargo (Andrew, 2026-10-30,
+  queue 00955).
 - **Allocation budget**: a hit allocates only the decoded result.
 
 ## 10. Speed of light
@@ -318,3 +327,95 @@ page cache) plus the decode, against an inference of 50-500 µs: a 50-200x savin
 | `crates/hir-ty/src/body_store.rs`, `crates/hir-ty/src/body_store/` (install, lookup, offer, flush, records) | item-hash (new files in db's crate) |
 | hooks: `infer_body_query` (`hir-ty/src/infer.rs`), MIR (`hir-ty-mir`), borrow check gate (`hir-ty-borrowck/src/gate.rs`), the driver's session (`blaze-cargo/src/serve/unit/deps.rs`) | their owners; one targeted edit each, told by tmux |
 | `harness/v2/frontend/item_store.py` | item-hash (in proof's `harness/v2/`, by request) |
+| sections 12-14: location table, lazy debug info, item IDs in reports | codegen and link (12, 13), the daemon and the agent API (14), by request; item-hash owns the IDs' definition |
+
+## 12. Locations as data
+
+Andrew, 2026-10-30. Code never holds a location's value: it loads its `&'static Location` (and
+each `line!()`, `column!()`, `file!()` value in a plain value position, section 3.3) from a
+per-crate **location table**, so moving or editing lines rewrites only that table, and a live patch
+of a move writes data, not code.
+
+- **Today**: a `Location` is a `DataRequest::Location(owner, span)` filled when stitching
+  (`hir-ty-codegen/fragment.rs`), and `Target::Position(SpanRef)` is a link-time entry of the span
+  side table. But a function's patch identity hashes the location it reports (`patch.rs`,
+  `Mark::new`'s `locations`, `patch_hash`'s `DataRequest::Location`), so a move re-patches the
+  function's code, and `line!()`'s value, refilled into MIR from the presentation layer (section
+  3.7), is compiled as an immediate.
+- **The table**: one per crate, writable only by the loader and the patcher, read-only to the
+  program. An entry is a `core::panic::Location` (`file: &'static str`, `line: u32`, `col: u32`, the
+  layout of the pinned nightly's `core`) or, for a lone `line!()`/`column!()`, a `u32`, and for
+  `file!()` a `&'static str`; the file strings are in a string pool the table points into. An entry
+  is named by `(item identity, slot)`: the body's semantic identity (section 3) and the slot's
+  index in its `location_literals` or its MIR spans, never by value. A function's code names its
+  entries by relocation; its code hash and patch identity leave the values out.
+- **Code**: a `Location` operand becomes the entry's address; a `line!()` value a load of the
+  entry; a `#[track_caller]` call passes the entry's address as the hidden argument, as rustc
+  passes its constant's. The optimizer must not fold a load from the table (it is external to the
+  function). Release builds, which are never live-patched, bake the values as rustc does; both
+  forms print the same.
+- **A move or a line edit**: the identity and the code hash are unchanged (section 3.7), the
+  presentation hash changes, the location table's entries of that crate are rewritten, and a live
+  patch is a data write into the table (plus the string pool when a file is renamed), no code. A
+  location inside a type (an array length, a const argument, section 3.3) is by value in the
+  identity, so a move there changes the code, as it must.
+- **Unchanged output**: `line!()`, `column!()`, `file!()`, `Location::caller()`, `#[track_caller]`
+  and the panic message read the same bytes as under rustc.
+- **Tests**: a harness program printing `line!()`, `column!()`, `file!()`, `Location::caller()`
+  through `#[track_caller]` chains, and panicking (caught and uncaught), is moved, edited above,
+  and its file renamed; after each, its stdout, stderr and exit status equal a fresh build's of
+  the same state from nothing, and the live patch the daemon sends has no code section (only table and
+  string-pool writes).
+
+## 13. Debug info off the edit path
+
+Andrew, 2026-10-30. Line tables and variable names are regenerated cheaply after an edit, or
+served lazily when a debugger asks; an edit never waits on them.
+
+- **Today**: split DWARF exists (`hir-ty-codegen/debuginfo/split.rs`: the object keeps lines and
+  addresses, the rest goes to `.dwo`), a function's variables and inlined frames are a side record
+  (`hir-ty-codegen/v2/side.rs`), and a function's patch identity includes its line rows when
+  `debug` is set (`patch.rs` `Mark::of_function`), so a move re-patches it.
+- **Keying**: a function's line rows and variable names are a debug record keyed by (its code
+  hash, its body's presentation hash, section 3.7): code keyed by the code hash alone never carries
+  them, and a rename or a move changes only the debug record.
+- **Off the edit path**: the link step writes only a debug map (each function's address range
+  and its debug record's key), as Apple's linker writes `N_OSO` stabs pointing at objects; the
+  debug records are built after the edit at low priority, or on demand.
+- **Served lazily**: the daemon answers a debugger's request for a debug record: on Linux, split
+  DWARF `.dwo` files materialized by the daemon on first open, with a debuginfod-style lookup by
+  build ID (the daemon's endpoint on a Unix socket, or loopback reachable only by the user, the
+  store's security rule); on macOS, the debug map's objects, written by the daemon when `lldb`
+  opens them (`dsymutil` packs them for a shipped build); on Windows, the PDB the same way.
+- **Equal to a fresh build**: a debug record built after an edit is byte-identical to a fresh
+  build's; `blaze build --release` and a `dsymutil`/`.dwp` package wait for all of them.
+- **Tests**: after a move and a rename, the edit's time does not include debug info (the daemon's
+  events show the build finishing before any debug record is made); `lldb`/`gdb` scripts break on a
+  line and print a renamed local after the edit; the debug records equal a fresh build's.
+
+## 14. Stable item IDs in blaze's reports
+
+Andrew, 2026-10-30. On by default, out of band only: the program's stdout, stderr and panic text
+never change. A later opt-in extension may print IDs in a program's own panic text; not now.
+
+- **The ID**: `(item identity, node)`: the item's semantic hash (section 3; for a signature, its
+  signature hash) and the node's place in its anonymous body (an `ExprId`, `PatId`, binding,
+  `TypeRefId` or location slot, by kind and arena index). A move or a rename keeps it (section
+  3.7); an edit of the item gives a new one.
+- **Where it appears**: next to `file:line:col`, in blaze's own records only: test results, the
+  `--events` records, diagnostics records (which already hold ids, not text: the store's records,
+  section 3.7), and the agent API. A panic's ID comes from its `Location`'s place in the location
+  table (section 12): the test runner's panic hook, which blaze owns, maps the `&Location` address
+  to its entry and so to `(identity, slot)`, and writes it to blaze's side channel, never to the
+  program's streams. A test failure is the test function's ID plus the panic's.
+- **Back to a location**: the agent API's `locate(id)` answers the item's current file, line and
+  column and its path now: the daemon keeps an index from identity to item (renames and moves
+  keep the identity, so they are a lookup) and a log of each item's past identities (an edit of an
+  item records old → new under its item key). An ID of an edited item maps to the item now and
+  says the node is of an older version (`edited: true`, no position for the node); an item that is
+  gone says so. One versioned schema in deterministic CBOR, as every agent API request
+  (no-mcp).
+- **Tests**: a failing test and a diagnostic in a harness project report IDs; after a move, a
+  rename and an edit of the item, `locate` gives the current place, the program's output is
+  byte-identical to a build with IDs off, and the `--events` records name the same ID after the
+  move and the rename.

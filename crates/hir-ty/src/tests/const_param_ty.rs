@@ -6,12 +6,12 @@ use hir_def::{
     AdtId, GenericDefId, ModuleDefId, hir::generics::GenericParams, nameres::crate_def_map,
     signatures::StructSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::const_param_ty::{ConstParamTyReason, const_param_ty_errors};
 
 fn struct_named(db: &Db, name: &str) -> GenericDefId {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .find_map(|def| match def {
@@ -39,7 +39,7 @@ fn refused(db: &Db, def: GenericDefId) -> Vec<(String, ConstParamTyReason)> {
 
 #[test]
 fn without_the_feature_only_integers_bool_and_char_are_allowed() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 struct S<
@@ -54,7 +54,8 @@ struct S<
 >;
 struct Unknown<const X: Missing>;
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),
@@ -75,7 +76,7 @@ struct Unknown<const X: Missing>;
 
 #[test]
 fn with_adt_const_params_the_type_must_implement_const_param_ty() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, const_param_ty
 #![feature(adt_const_params)]
@@ -85,7 +86,8 @@ impl core::marker::ConstParamTy_ for Good {}
 struct Bad;
 struct S<const A: Good, const B: Bad>;
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),
@@ -96,13 +98,14 @@ struct S<const A: Good, const B: Bad>;
 
 #[test]
 fn with_adt_const_params_and_no_lang_item_the_lang_item_is_missing() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 #![feature(adt_const_params)]
 struct S<const A: u8>;
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
         assert_eq!(
             refused(&db, struct_named(&db, "S")),

@@ -11,7 +11,7 @@ use hir_expand::{
     name::Name,
 };
 use intern::Symbol;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId, ModuleId,
@@ -59,7 +59,9 @@ pub fn f(x: u32) -> u32 {
 "#;
 
 fn fixture() -> (TestDB, Crate) {
-    let (db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let krate = relevant_crates(&db, file.file_id(&db))[0];
     (db, krate)
 }

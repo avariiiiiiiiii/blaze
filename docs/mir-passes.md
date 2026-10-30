@@ -253,7 +253,7 @@ Where a port differs from rustc:
   and terminators in range), which names the pass that broke it.
 
 The interpreter's tests run every program at all three levels and require the same output
-(`hir-ide/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`).
+(`hir-ty-mir/src/tests/mir/eval.rs`, `tests/mir/optimize.rs`).
 
 ## Not done yet
 

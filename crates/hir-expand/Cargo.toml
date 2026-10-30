@@ -38,14 +38,21 @@ syntax-bridge.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 blaze-mem.workspace = true
+# The test fixture (`fixture`): a view's files, and the fixture text parser.
+blaze-vfs = { workspace = true, optional = true }
+test-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 expect-test = "1.5.1"
 blaze-alloc-count.workspace = true
+blaze-vfs.workspace = true
 syntax-bridge = { workspace = true, features = ["reference"] }
+test-utils.workspace = true
 
 [features]
 in-rust-tree = ["syntax/in-rust-tree"]
+# `hir_expand::fixture`, for other crates' tests (as a dev-dependency).
+fixture = ["dep:blaze-vfs", "dep:test-utils"]
 
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
 //! [`BodySyntax::tree`] against the anchor it is of, and the thread's tree cache.
 
 use syntax::view;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AssocItemId, DefWithBodyId, ModuleDefId,
@@ -59,7 +59,7 @@ fn bodies(db: &TestDB) -> Vec<DefWithBodyId> {
 /// the item's pointer finds a node of the item's kind and range.
 #[test]
 fn tree_is_the_anchor() {
-    let db = TestDB::with_files(CODE);
+    let db = fixture::db(CODE).into_db();
     let bodies = bodies(&db);
     assert!(bodies.len() >= 6, "{bodies:?}");
     for def in bodies {
@@ -80,7 +80,7 @@ fn tree_is_kept_on_its_thread() {
     if super::check_relative() {
         return;
     }
-    let db = TestDB::with_files(CODE);
+    let db = fixture::db(CODE).into_db();
     for def in bodies(&db) {
         let syntax = body_syntax(&db, def).as_ref().expect("a body written in a file");
         let (first, second) = (syntax.tree(&db), syntax.tree(&db));

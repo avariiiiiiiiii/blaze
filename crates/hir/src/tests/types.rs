@@ -4,7 +4,7 @@
 //! trait for some arguments, and a callable's safety.
 
 use base_db::Db;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::db::TestDB;
 use crate::{
@@ -75,7 +75,7 @@ fn safe() {}
 
 #[test]
 fn a_type_s_bounds_are_its_own_elaborated_without_sized() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let [t, u] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
         let named = |ty: &Type<'_>| {
@@ -108,7 +108,7 @@ fn a_type_s_bounds_are_its_own_elaborated_without_sized() {
 
 #[test]
 fn a_reference_to_a_type_has_its_environment() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let [t, u] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
         let shared = t.ref_to(&db, Mutability::Shared);
@@ -130,7 +130,7 @@ fn a_reference_to_a_type_has_its_environment() {
 
 #[test]
 fn sized_is_the_solver_s_answer_in_the_environment() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let [t, s, m] = <[Type<'_>; 3]>::try_from(params(&db, "others")).unwrap();
         assert!(t.is_sized(&db), "`&T`");
@@ -144,7 +144,7 @@ fn sized_is_the_solver_s_answer_in_the_environment() {
 
 #[test]
 fn copy_is_allowed_of_an_adt_without_drop_unsafe_fields_or_a_field_not_copy() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let adts = params(&db, "adts");
         let allowed: Vec<bool> = adts.iter().map(|it| it.may_implement_copy(&db)).collect();
@@ -166,7 +166,7 @@ fn copy_is_allowed_of_an_adt_without_drop_unsafe_fields_or_a_field_not_copy() {
 
 #[test]
 fn a_trait_with_fresh_arguments_holds_for_some_impl() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let any = trait_(&db, "Any");
         let adts = params(&db, "adts");
@@ -182,7 +182,7 @@ fn a_trait_with_fresh_arguments_holds_for_some_impl() {
 
 #[test]
 fn a_callable_s_safety_is_its_signature_s() {
-    let db = TestDB::with_files(TYPES);
+    let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {
         let safety = |ty: &Type<'_>| ty.as_callable(&db).expect("a callable type").safety();
         let [f, g, h] = <[Type<'_>; 3]>::try_from(params(&db, "callees")).unwrap();

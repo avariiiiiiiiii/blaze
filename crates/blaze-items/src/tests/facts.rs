@@ -8,7 +8,7 @@ use hir_ty::{
     db::{InternedClosure, InternedClosureId},
     next_solver::SimplifiedType as HirSimplifiedType,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{TestDB, edit, item, single};
 use crate::{
@@ -44,7 +44,7 @@ fn implements_of(db: &TestDB, trait_path: &str, ty: &str) -> Fact {
 
 #[track_caller]
 fn module(db: &TestDB, name: &str) -> ModuleId {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .map(|(id, _)| id)
         .find(|id| id.name(db).is_some_and(|it| it.as_str() == name))

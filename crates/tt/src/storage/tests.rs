@@ -1055,7 +1055,7 @@ fn literal_codes_are_the_old_ones(tc: hegel::TestCase) {
     assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
 }
 
-/// The scan-then-map index blaze-expand's native `Parts::index` had, before it took
+/// The scan-then-map index the in-process bridge's `Parts::index` had, before it took
 /// [`IndexTable`].
 fn old_index(list: &mut Vec<u32>, map: &mut rustc_hash::FxHashMap<u32, u32>, value: u32) -> u32 {
     if list.len() <= SCAN {

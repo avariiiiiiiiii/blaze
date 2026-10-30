@@ -12,7 +12,7 @@ use hir_ty_mir::mir::{
     MirSpan,
     const_check::{ConstCheckKind, const_check},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -25,7 +25,9 @@ type Found = (&'static str, String, String, Option<(String, bool)>);
 /// closing brace.
 #[track_caller]
 fn check(minicore: &str, src: &str, pick: impl FnOnce(&TestDB) -> DefWithBodyId) -> Vec<Found> {
-    let (db, _) = TestDB::with_single_file(&format!("//- minicore: {minicore}\n{src}"));
+    let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = pick(&db);
         let (_, map) = Body::with_source_map(&db, def);
@@ -87,7 +89,7 @@ fn konst(name: &'static str) -> impl FnOnce(&TestDB) -> DefWithBodyId {
 }
 
 fn statik(name: &'static str) -> impl FnOnce(&TestDB) -> DefWithBodyId {
-    move |db| hir_def::test_items::static_item(db, db.test_crate(), name).into()
+    move |db| hir_def::test_items::static_item(db, fixture::test_crate(&db), name).into()
 }
 
 const NONE: [Reported<'static>; 0] = [];

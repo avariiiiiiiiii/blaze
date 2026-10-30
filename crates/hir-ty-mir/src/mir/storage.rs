@@ -4,7 +4,7 @@
 //!
 //! A local whose address is never taken holds a value from where it is assigned whole to where
 //! it is last read (liveness), whatever its markers say: they are too coarse to share by (in
-//! hir-ide's `hir_fmt` they had each of 724 locals live with 722 others at some point). A
+//! hir-ty's `hir_fmt` they had each of 724 locals live with 722 others at some point). A
 //! borrowed local has storage where `StorageLive` and `StorageDead` say it
 //! does (`MaybeStorageLive` of `rustc_mir_dataflow`), and all through the body when they do not
 //! mention it or it is mentioned where they say it has none. So does a local a debugger is told

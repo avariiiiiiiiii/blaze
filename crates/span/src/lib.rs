@@ -31,7 +31,25 @@ pub use self::{
 
 pub use syntax::Edition;
 pub use text_size::{TextRange, TextSize};
-pub use vfs::FileId;
+
+/// A source file: a dense number base-db hands out, at most [`EditionedFileId::MAX_FILE_ID`].
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct FileId(u32);
+
+impl FileId {
+    const MAX: u32 = 0x7fff_ffff;
+
+    #[inline]
+    pub const fn from_raw(raw: u32) -> FileId {
+        assert!(raw <= Self::MAX);
+        FileId(raw)
+    }
+
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 
 impl Span {
     pub fn cover(self, other: Span) -> Span {

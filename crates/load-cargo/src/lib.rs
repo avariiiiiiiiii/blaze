@@ -11,9 +11,6 @@ extern crate rustc_driver as _;
 mod described;
 mod listed;
 mod unsandboxed;
-/// blaze v2's lowering: a build's units (`blaze_units::query::Units`) into the front end's
-/// crate graph and files, for the daemon (docs/v2/plan/lanes/cargo/notes.md section 6).
-pub mod v2;
 mod wasm;
 mod wrap;
 pub use listed::{Compiled, Own, is_listed, own_libraries_with, serve_listed_with};
@@ -27,15 +24,13 @@ use crossbeam_channel::unbounded;
 use hir_expand::proc_macro::{
     ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
 };
-use ide_db::{
-    ChangeWithProcMacros, FxHashMap, FxHashSet, RootDatabase,
-    base_db::{
-        Crate, CrateGraphBuilder, Db, LibraryRoots, LocalRoots, ProcMacroLoadingError,
-        SourceRoot, SourceRootId,
-        salsa::{Database as _, Durability, Setter},
-    },
-    prime_caches,
+use base_db::{
+    Crate, CrateGraphBuilder, Db, LibraryRoots, LocalRoots, ProcMacroLoadingError, SourceRoot,
+    SourceRootId,
+    salsa::{Database as _, Durability, Setter},
 };
+use hir_expand::change::ChangeWithProcMacros;
+use rustc_hash::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 pub use proc_macro_api::bidirectional_protocol::msg::{SubRequest, SubResponse};
 use proc_macro_api::{MacroDylib, ProcMacroClient, bidirectional_protocol::msg::ParentSpan};
@@ -64,8 +59,6 @@ fn set_file(vfs: &mut vfs::Vfs, db: &mut Db, path: VfsPath, contents: Option<Vec
 pub struct LoadCargoConfig {
     pub load_out_dirs_from_check: bool,
     pub with_proc_macro_server: ProcMacroServerChoice,
-    pub prefill_caches: bool,
-    pub num_worker_threads: usize,
     pub proc_macro_processes: usize,
 }
 
@@ -80,7 +73,7 @@ pub fn load_workspace_at(
     root: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
+) -> anyhow::Result<(Db, vfs::Vfs, Option<ProcMacroClient>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(root));
     let root = ProjectManifest::discover_single(&root)?;
     let manifest_path = root.manifest_path().clone();
@@ -105,7 +98,7 @@ pub fn load_workspace(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
+) -> anyhow::Result<(Db, vfs::Vfs, Option<ProcMacroClient>)> {
     let mut db = Db::new();
 
     let (vfs, proc_macro_server) = load_workspace_into_db(ws, extra_env, load_config, &mut db)?;
@@ -113,14 +106,12 @@ pub fn load_workspace(
     Ok((db, vfs, proc_macro_server))
 }
 
-// This variant of `load_workspace` allows deferring the loading of rust-analyzer
-// into an existing database, which is useful in certain third-party scenarios,
-// now that `salsa` supports extending foreign databases (e.g. `RootDatabase`).
+/// `load_workspace` into a database the caller already has.
 pub fn load_workspace_into_db(
     ws: ProjectWorkspace,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-    db: &mut RootDatabase,
+    db: &mut Db,
 ) -> anyhow::Result<(vfs::Vfs, Option<ProcMacroClient>)> {
     load_workspaces_into_db(vec![ws], extra_env, load_config, db)
 }
@@ -133,17 +124,11 @@ pub fn load_workspaces_into_db(
     workspaces: Vec<ProjectWorkspace>,
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
-    db: &mut RootDatabase,
+    db: &mut Db,
 ) -> anyhow::Result<(vfs::Vfs, Option<ProcMacroClient>)> {
     let mut vfs = vfs::Vfs::default();
     let mut loaded = Loaded::default();
     loaded.add(workspaces, extra_env, load_config, &mut vfs, db)?;
-
-    if load_config.prefill_caches {
-        let all = ide_db::base_db::all_crates(db);
-        prime_caches::parallel_prime_caches(db, &all, load_config.num_worker_threads);
-    }
-
     Ok((vfs, loaded.proc_macro_server.and_then(Result::ok)))
 }
 
@@ -188,7 +173,7 @@ impl Loaded {
         extra_env: &FxHashMap<String, Option<String>>,
         load_config: &LoadCargoConfig,
         vfs: &mut vfs::Vfs,
-        db: &mut RootDatabase,
+        db: &mut Db,
     ) -> anyhow::Result<()> {
         let start = std::time::Instant::now();
         let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
@@ -206,7 +191,7 @@ impl Loaded {
         for ws in &self.workspaces {
             // blaze's copy of `const-ast`, which const macros depend on, is in no folder on disk.
             if let Some(dir) = ws.const_ast_dir() {
-                for (name, text) in ide_db::const_macro::CONST_AST {
+                for (name, text) in hir::const_macro::CONST_AST {
                     let path = vfs::VfsPath::from(dir.join(name));
                     set_file(vfs, db, path, Some(text.as_bytes().to_vec()));
                 }
@@ -376,7 +361,7 @@ impl Loaded {
                                     )
                                 })?;
                                 let edition = crate_graph[crate_id].basic.edition;
-                                return Ok(ide_db::const_macro::load(file, &text, edition));
+                                return Ok(hir::const_macro::load(file, &text, edition));
                             }
                             if is_wasm(&path) {
                                 let loaded = wasm::load(&path);
@@ -518,7 +503,7 @@ impl Loaded {
 /// Puts the files of `files` that are not among `known`, and so in no source root yet, in
 /// the root `root_id`.
 fn join_root(
-    db: &mut RootDatabase,
+    db: &mut Db,
     root_id: SourceRootId,
     files: vfs::file_set::FileSet,
     known: &FxHashSet<vfs::FileId>,
@@ -1130,7 +1115,7 @@ pub fn source_text(text: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ide_db::base_db::all_crates;
+    use base_db::all_crates;
     use vfs::file_set::FileSetConfigBuilder;
 
     use super::*;
@@ -1150,8 +1135,6 @@ mod tests {
         let load_cargo_config = LoadCargoConfig {
             load_out_dirs_from_check: false,
             with_proc_macro_server: ProcMacroServerChoice::None,
-            prefill_caches: false,
-            num_worker_threads: 1,
             proc_macro_processes: 1,
         };
         let workspace = ProjectWorkspace::load(manifest, &cargo_config).unwrap();
@@ -1319,7 +1302,7 @@ mod tests {
     /// after it: the reload's file is set in the database, not refused as an attribute's.
     #[test]
     fn a_reload_after_a_graph_with_crate_attrs_sets_its_new_file() {
-        use ide_db::base_db::{CrateOrigin, CrateWorkspaceData, Env, TargetKind};
+        use base_db::{CrateOrigin, CrateWorkspaceData, Env, TargetKind};
 
         let mut db = Db::for_tests();
         let mut vfs = vfs::Vfs::default();

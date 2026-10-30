@@ -126,7 +126,7 @@ fn blaze_item_store_is_verify_off_or_unset() {
 #[test]
 fn the_note_adds_the_item_store_counts_after_the_goals() {
     let goals = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
-    let alone = noted(&Flushes { goals, items: None });
+    let alone = noted(Some(&Flushes { goals, items: None }), None).unwrap();
     assert_eq!(alone.message, "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full");
     let items = body_store::Flushed {
         written: 2,
@@ -136,12 +136,30 @@ fn the_note_adds_the_item_store_counts_after_the_goals() {
         ..body_store::Flushed::default()
     };
     let goals = goal_store::Flushed { written: 3, kept: 5, ..goal_store::Flushed::default() };
-    let note = noted(&Flushes { goals, items: Some(items) });
+    let steps = [
+        body_store::StepCounts { hits: 6, ran: 1, refused: 0 },
+        body_store::StepCounts { hits: 5, ran: 2, refused: 1 },
+        body_store::StepCounts::default(),
+    ];
+    let note = noted(Some(&Flushes { goals, items: Some(items) }), Some(&steps)).unwrap();
     assert_eq!(
         note.message,
         "the persistent goal cache, of the last build: 3 written, 5 kept, 0 with every slot full; \
          the item store: 2 written, 9 kept, 0 with every slot full; steps kept out by reads of \
-         `crate_env` (3); 4 of bodies with no identity"
+         `crate_env` (3); 4 of bodies with no identity; the item store, this build: inference 6 hit, \
+         1 ran, 0 refused; MIR 5 hit, 2 ran, 1 refused; borrow check 0 hit, 0 ran, 0 refused"
     );
     assert_eq!(note.rendered, format!("note: {}\n", note.message));
+}
+
+#[test]
+fn a_first_build_notes_its_steps_alone() {
+    assert!(noted(None, None).is_none());
+    let steps = [body_store::StepCounts { hits: 0, ran: 3, refused: 0 }; 3];
+    let note = noted(None, Some(&steps)).unwrap();
+    assert_eq!(
+        note.message,
+        "the item store, this build: inference 0 hit, 3 ran, 0 refused; MIR 0 hit, 3 ran, 0 refused; \
+         borrow check 0 hit, 3 ran, 0 refused"
+    );
 }

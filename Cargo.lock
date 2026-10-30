@@ -812,7 +812,6 @@ dependencies = [
  "blaze-codegen",
  "blaze-core",
  "blaze-diagnostics",
- "blaze-expand",
  "blaze-fmt",
  "blaze-format",
  "blaze-global",
@@ -828,6 +827,7 @@ dependencies = [
  "blaze-link",
  "blaze-lints",
  "blaze-live",
+ "blaze-lower",
  "blaze-macro-eval",
  "blaze-macro-wasm",
  "blaze-manifest",
@@ -869,11 +869,9 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "ide-db",
  "intern",
  "libc",
  "libmimalloc-sys",
- "load-cargo",
  "lzma-rust2",
  "object 0.37.3",
  "paths",
@@ -904,7 +902,6 @@ dependencies = [
  "typed-arena",
  "uds_windows",
  "url",
- "vfs",
  "windows-sys 0.61.2",
  "zip",
  "zstd",
@@ -1050,7 +1047,6 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
- "test-fixture",
  "triomphe",
  "unicode-ident",
  "unicode-normalization",
@@ -1067,7 +1063,6 @@ dependencies = [
  "hir",
  "hir-def",
  "hir-expand",
- "ide-db",
  "intern",
  "parser",
  "pulldown-cmark",
@@ -1076,8 +1071,6 @@ dependencies = [
  "serde_json",
  "span",
  "syntax",
- "test-fixture",
- "vfs",
 ]
 
 [[package]]
@@ -1085,99 +1078,28 @@ name = "blaze-engine"
 version = "0.0.0"
 dependencies = [
  "anyhow",
- "ar_archive_writer",
  "base-db",
  "blaze-alloc-count",
  "blaze-cargo",
- "blaze-core",
  "blaze-diagnostics",
- "blaze-doc",
- "blaze-expand",
- "blaze-format",
  "blaze-graph",
- "blaze-ids",
- "blaze-lints",
- "blaze-live",
- "blaze-macro-wasm",
- "blaze-mem",
- "blaze-protocol",
- "blaze-sha256",
- "blaze-splice",
- "blaze-store",
- "blaze-wasi",
- "cargo_metadata",
+ "blaze-lower",
+ "blaze-query",
+ "blaze-registry",
+ "blaze-units",
+ "blaze-vfs",
  "cfg",
- "dunce",
- "find-msvc-tools",
  "flate2",
- "gimli 0.33.0",
  "hir",
- "hir-def",
- "hir-ty",
- "hir-ty-borrowck",
  "hir-ty-codegen",
- "hir-ty-mir",
- "ide-db",
  "intern",
- "libc",
- "load-cargo",
- "memchr",
  "mimalloc",
- "object 0.37.3",
- "paths",
- "proc-macro-api",
- "project-model",
- "pulldown-cmark",
- "rustc-demangle",
- "rustc-hash 2.1.2",
- "rustc-symbols",
- "salsa",
- "same-file",
- "serde",
- "serde_json",
  "sha2 0.10.9",
- "shlex",
- "syntax",
  "tar",
- "tempfile",
- "test-fixture",
  "tikv-jemallocator",
- "tokio",
  "toml",
  "toml_edit",
- "toolchain",
- "triomphe",
- "uds_windows",
  "url",
- "vfs",
- "wasm-encoder 0.244.0",
- "wasmparser 0.236.1",
- "windows-sys 0.61.2",
- "zstd",
-]
-
-[[package]]
-name = "blaze-expand"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-alloc-count",
- "blaze-cas",
- "blaze-core",
- "blaze-ids",
- "blaze-native-proc-macro",
- "blaze-usercode",
- "hir-expand",
- "intern",
- "load-cargo",
- "paths",
- "postcard",
- "proc-macro-api",
- "ra-ap-rustc_lexer",
- "rustc-hash 2.1.2",
- "serde",
- "span",
- "tt",
 ]
 
 [[package]]
@@ -1238,7 +1160,6 @@ dependencies = [
  "blaze-cas",
  "blaze-codegen",
  "blaze-core",
- "blaze-expand",
  "blaze-format",
  "blaze-fuzz",
  "blaze-ids",
@@ -1390,12 +1311,12 @@ dependencies = [
  "either",
  "hir",
  "hir-def",
+ "hir-expand",
  "memchr",
  "rustc-hash 2.1.2",
  "salsa",
  "span",
  "syntax",
- "test-fixture",
  "triomphe",
 ]
 
@@ -1421,7 +1342,6 @@ dependencies = [
  "salsa",
  "smallvec",
  "span",
- "test-fixture",
  "test-utils",
  "triomphe",
 ]
@@ -1451,7 +1371,6 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
- "test-fixture",
  "test-utils",
  "triomphe",
 ]
@@ -1531,7 +1450,6 @@ dependencies = [
  "serde_json",
  "span",
  "syntax",
- "test-fixture",
  "toml",
  "triomphe",
 ]
@@ -1546,6 +1464,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-lower"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-ids",
+ "blaze-query",
+ "blaze-units",
+ "blaze-vfs",
+ "cfg",
+ "hir-def",
+ "hir-expand",
+ "hir-ty-mir",
+ "intern",
+ "proc-macro-api",
+ "rustc-hash 2.1.2",
+ "salsa",
+ "span",
+ "toml",
+ "triomphe",
+ "vfs",
+]
+
+[[package]]
 name = "blaze-macro-eval"
 version = "0.0.0"
 dependencies = [
@@ -1553,8 +1494,8 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-core",
- "blaze-expand",
  "blaze-ids",
+ "blaze-lower",
  "blaze-macro-wasm",
  "blaze-native-proc-macro",
  "blaze-query",
@@ -1568,7 +1509,6 @@ dependencies = [
  "hir-ty-mir",
  "intern",
  "libc",
- "load-cargo",
  "paths",
  "proc-macro-api",
  "ra-ap-rustc_lexer",
@@ -1591,16 +1531,15 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-core",
- "blaze-expand",
  "blaze-format",
  "blaze-ids",
+ "blaze-lower",
  "blaze-mem",
  "blaze-native-proc-macro",
  "blaze-store",
  "blaze-usercode",
  "hir-expand",
  "intern",
- "load-cargo",
  "paths",
  "proc-macro-api",
  "rustc-hash 2.1.2",
@@ -1835,27 +1774,6 @@ dependencies = [
  "semver",
  "serde",
  "url",
-]
-
-[[package]]
-name = "blaze-splice"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "blaze-alloc-count",
- "blaze-core",
- "blaze-format",
- "blaze-ids",
- "blaze-in-place",
- "blaze-live",
- "blaze-mem",
- "blaze-sha256",
- "libc",
- "object 0.37.3",
- "pdb",
- "rustc-hash 2.1.2",
- "wasm-encoder 0.244.0",
- "wasmparser 0.236.1",
 ]
 
 [[package]]
@@ -2972,12 +2890,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fallible-iterator"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3353,9 +3265,10 @@ dependencies = [
  "hashbrown 0.17.1",
  "hir-def",
  "hir-expand",
- "hir-ide",
+ "hir-ty",
  "hir-ty-borrowck",
  "hir-ty-matchck",
+ "hir-ty-mir",
  "hir-ty-unsafeck",
  "hir-ty-wfcheck",
  "intern",
@@ -3370,7 +3283,6 @@ dependencies = [
  "stdx",
  "syntax",
  "syntax-bridge",
- "test-fixture",
  "test-utils",
  "tracing",
  "tracing-subscriber",
@@ -3416,7 +3328,6 @@ dependencies = [
  "stdx",
  "syntax",
  "syntax-bridge",
- "test-fixture",
  "test-utils",
  "thin-vec",
  "tracing",
@@ -3434,6 +3345,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+ "blaze-vfs",
  "cfg",
  "cov-mark",
  "either",
@@ -3450,49 +3362,11 @@ dependencies = [
  "stdx",
  "syntax",
  "syntax-bridge",
+ "test-utils",
  "thin-vec",
  "tracing",
  "triomphe",
  "tt",
-]
-
-[[package]]
-name = "hir-ide"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "blaze-alloc-count",
- "blaze-hashcons",
- "const-ast",
- "cov-mark",
- "either",
- "expect-test",
- "hir-def",
- "hir-expand",
- "hir-ty",
- "hir-ty-mir",
- "intern",
- "inventory",
- "itertools 0.15.0",
- "la-arena",
- "macros",
- "parser",
- "project-model",
- "ra-ap-rustc_ast_ir",
- "rustc-hash 2.1.2",
- "rustc_abi",
- "rustc_apfloat",
- "rustc_type_ir",
- "salsa",
- "smallvec",
- "span",
- "stdx",
- "syntax",
- "syntax-bridge",
- "test-fixture",
- "test-utils",
- "tracing",
- "triomphe",
 ]
 
 [[package]]
@@ -3514,7 +3388,6 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
- "test-fixture",
 ]
 
 [[package]]
@@ -3535,6 +3408,7 @@ dependencies = [
  "cfg",
  "cov-mark",
  "either",
+ "expect-test",
  "hashbrown 0.17.1",
  "hir-def",
  "hir-expand",
@@ -3559,7 +3433,6 @@ dependencies = [
  "stdx",
  "syntax",
  "target-features",
- "test-fixture",
  "thin-vec",
  "tracing",
  "tracing-subscriber",
@@ -3590,7 +3463,6 @@ dependencies = [
  "salsa",
  "smallvec",
  "syntax",
- "test-fixture",
 ]
 
 [[package]]
@@ -3644,7 +3516,6 @@ dependencies = [
  "stdx",
  "syntax",
  "target-lexicon",
- "test-fixture",
  "tracing",
  "triomphe",
  "wasm-encoder 0.244.0",
@@ -3667,7 +3538,6 @@ dependencies = [
  "salsa",
  "smallvec",
  "stdx",
- "test-fixture",
 ]
 
 [[package]]
@@ -3681,8 +3551,12 @@ dependencies = [
  "blaze-ids",
  "blaze-lint-defs",
  "blaze-mem",
+ "blaze-units",
  "cfg",
+ "const-ast",
+ "cov-mark",
  "either",
+ "expect-test",
  "hashbrown 0.17.1",
  "hir",
  "hir-def",
@@ -3695,6 +3569,7 @@ dependencies = [
  "la-arena",
  "macros",
  "oorandom",
+ "parser",
  "ra-ap-rustc_ast_ir",
  "rustc-hash 2.1.2",
  "rustc_abi",
@@ -3706,7 +3581,8 @@ dependencies = [
  "span",
  "stdx",
  "syntax",
- "test-fixture",
+ "syntax-bridge",
+ "test-utils",
  "tracing",
  "triomphe",
 ]
@@ -3722,6 +3598,7 @@ dependencies = [
  "either",
  "hegeltest",
  "hir-def",
+ "hir-expand",
  "hir-ty",
  "hir-ty-mir",
  "rustc-hash 2.1.2",
@@ -3729,7 +3606,6 @@ dependencies = [
  "rustc_type_ir",
  "salsa",
  "smallvec",
- "test-fixture",
  "triomphe",
 ]
 
@@ -3752,7 +3628,6 @@ dependencies = [
  "smallvec",
  "span",
  "syntax",
- "test-fixture",
  "triomphe",
 ]
 
@@ -3763,6 +3638,7 @@ dependencies = [
  "base-db",
  "either",
  "hir-def",
+ "hir-expand",
  "hir-lint-levels",
  "hir-ty",
  "hir-ty-mir",
@@ -3770,7 +3646,6 @@ dependencies = [
  "salsa",
  "span",
  "syntax",
- "test-fixture",
  "test-utils",
 ]
 
@@ -3784,6 +3659,7 @@ dependencies = [
  "blaze-mem",
  "hashbrown 0.17.1",
  "hir-def",
+ "hir-expand",
  "hir-ty",
  "hir-ty-mir",
  "intern",
@@ -3792,7 +3668,6 @@ dependencies = [
  "rustc_type_ir",
  "salsa",
  "smallvec",
- "test-fixture",
 ]
 
 [[package]]
@@ -4007,41 +3882,6 @@ name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
-
-[[package]]
-name = "ide-db"
-version = "0.0.0"
-dependencies = [
- "arrayvec",
- "base-db",
- "bitflags 2.12.1",
- "blaze-ids",
- "blaze-mem",
- "cov-mark",
- "crossbeam-channel",
- "either",
- "expect-test",
- "fst",
- "hir",
- "itertools 0.15.0",
- "line-index",
- "macros",
- "memchr",
- "nohash-hasher",
- "parser",
- "profile",
- "rustc-hash 2.1.2",
- "salsa",
- "smallvec",
- "span",
- "stdx",
- "syntax",
- "test-fixture",
- "test-utils",
- "tracing",
- "triomphe",
- "vfs",
-]
 
 [[package]]
 name = "idna"
@@ -4412,7 +4252,6 @@ dependencies = [
  "hir",
  "hir-def",
  "hir-expand",
- "ide-db",
  "intern",
  "itertools 0.15.0",
  "proc-macro-api",
@@ -4888,17 +4727,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pdb"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82040a392923abe6279c00ab4aff62d5250d1c8555dc780e4b02783a7aa74863"
-dependencies = [
- "fallible-iterator",
- "scroll",
- "uuid",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5016,16 +4844,21 @@ dependencies = [
 name = "proc-macro-api"
 version = "0.0.0"
 dependencies = [
+ "base-db",
  "blaze-alloc-count",
+ "blaze-cas",
  "blaze-core",
  "blaze-ids",
  "blaze-mem",
+ "blaze-native-proc-macro",
  "blaze-usercode",
+ "hir-expand",
  "indexmap",
  "intern",
  "paths",
  "postcard",
  "proc-macro-srv",
+ "ra-ap-rustc_lexer",
  "rustc-hash 2.1.2",
  "semver",
  "serde",
@@ -5504,9 +5337,9 @@ dependencies = [
  "hegeltest",
  "hir",
  "hir-def",
+ "hir-expand",
  "rustc-hash 2.1.2",
  "syntax",
- "test-fixture",
 ]
 
 [[package]]
@@ -5748,12 +5581,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "scroll"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04c565b551bafbef4157586fa379538366e4385d42082f255bfd96e4fe8519da"
 
 [[package]]
 name = "security-framework"
@@ -6069,7 +5896,6 @@ dependencies = [
  "syntax",
  "text-size",
  "unicode-width 0.2.2",
- "vfs",
 ]
 
 [[package]]
@@ -6299,22 +6125,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "test-fixture"
-version = "0.0.0"
-dependencies = [
- "base-db",
- "cfg",
- "hir-expand",
- "intern",
- "paths",
- "span",
- "stdx",
- "test-utils",
- "triomphe",
- "tt",
 ]
 
 [[package]]
@@ -6882,9 +6692,9 @@ dependencies = [
  "crossbeam-channel",
  "fst",
  "indexmap",
- "nohash-hasher",
  "paths",
  "rustc-hash 2.1.2",
+ "span",
  "stdx",
  "tracing",
 ]

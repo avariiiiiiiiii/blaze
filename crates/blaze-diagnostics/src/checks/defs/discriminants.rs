@@ -8,7 +8,9 @@
 
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
-use smallvec::SmallVec;
+use hir_ty::consteval::discriminants::{
+    DiscrInt, EnumDiscriminants, enum_discriminants, explicit_discriminant_indices,
+};
 use syntax::{
     NodeOrToken, SyntaxKind, TextRange,
     view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
@@ -19,58 +21,6 @@ use crate::{
     lower::{Found, Phase},
     model::{Diag, Span},
 };
-
-/// A discriminant as rustc's `Discr` holds it: its bits in the enum's `repr` type.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Discr {
-    bits: u128,
-    signed: bool,
-    width: u32,
-}
-
-impl Discr {
-    fn of(value: i128, signed: bool, width: u32) -> Discr {
-        let mask = if width >= 128 { u128::MAX } else { (1u128 << width) - 1 };
-        Discr { bits: (value as u128) & mask, signed, width }
-    }
-
-    /// The value as rustc writes it: negative in a signed type.
-    fn value(self) -> i128 {
-        if self.signed && self.width < 128 && self.bits >> (self.width - 1) & 1 == 1 {
-            (self.bits | !((1u128 << self.width) - 1)) as i128
-        } else {
-            self.bits as i128
-        }
-    }
-
-    fn max(self) -> u128 {
-        let bits = if self.signed { self.width - 1 } else { self.width };
-        if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 }
-    }
-
-    /// The next value, and whether it went past the type's last one (rustc's `checked_add`).
-    fn next(self) -> (Discr, bool) {
-        let next = Discr::of(self.value().wrapping_add(1), self.signed, self.width);
-        (next, self.bits == self.max())
-    }
-
-    fn text(self) -> String {
-        // alloc: the errors' text, and tests'
-        if self.signed { self.value().to_string() } else { self.bits.to_string() }
-    }
-}
-
-/// A variant with its discriminant, and its node for what rustc's labels point at.
-struct Variant<'db> {
-    variant: hir::EnumVariant,
-    node: InFile<ast::Variant<'db>>,
-    discr: Discr,
-    /// Whether an expression assigns it, with the literal it is when it is one.
-    explicit: Option<Option<u128>>,
-    /// The variant its value is counted up from and how many variants later it is, when it is
-    /// not assigned.
-    relative: usize,
-}
 
 /// The span of a variant's name, or of the variant without one.
 fn name_span(cx: &Cx<'_, '_>, node: InFile<ast::Variant<'_>>) -> Span {
@@ -107,7 +57,9 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         return found;
     }
     let needs_repr = needs_repr_int(cx, enum_, &variants, source);
-    let Some((signed, width)) = repr_int(cx, enum_) else {
+    let id = hir_def::EnumId::from(enum_);
+    let table = enum_discriminants(cx.db, id);
+    let Some(int) = table.int() else {
         found.extend(needs_repr.map(|mut diag| {
             // clone: the error's fact
             diag.fact(fact.clone(), what());
@@ -115,96 +67,43 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
         }));
         return found;
     };
-    let mut discrs: SmallVec<[Variant<'_>; 8]> = SmallVec::new();
-    let mut prev: Option<Discr> = None;
-    let mut last_explicit = 0;
-    for (index, variant) in variants.iter().enumerate() {
-        let Some(node) = cx.vsema.source(*variant) else { continue };
-        let expr = discr_expr(node.value);
-        let wrapped = match prev {
-            Some(prev) => prev.next().0,
-            None => Discr::of(0, signed, width),
-        };
-        let discr = match &expr {
-            Some(_) => variant.eval(cx.db).map(|it| Discr::of(it, signed, width)).unwrap_or(wrapped),
-            None => match prev {
-                Some(prev) if prev.next().1 => {
-                    let name_span = name_span(cx, node);
-                    let mut diag = Diag::error(
-                        Some("E0370"),
-                        "enum discriminant overflowed",
-                        // clone: the error's span
-                        name_span.clone(),
-                    );
-                    // alloc: the error's label
-                    diag.span_label(name_span, format!("overflowed on value after {}", prev.text()));
-                    let name = variant.name(cx.db);
-                    // alloc: the error's note
-                    diag.note(format!(
-                        "explicitly set `{} = {}` if that is desired outcome",
-                        name.as_str(),
-                        wrapped.text()
-                    ));
-                    // clone: the error's fact
-                    diag.fact(fact.clone(), what());
-                    found.push(Found::new(diag, Phase::Items));
-                    wrapped
-                }
-                _ => wrapped,
-            },
-        };
-        let explicit = expr.map(literal);
-        if explicit.is_some() {
-            last_explicit = index;
-        }
-        discrs.push(Variant {
-            variant: *variant,
-            node,
-            discr,
-            relative: if explicit.is_some() { 0 } else { index - last_explicit },
-            explicit,
-        });
-        prev = Some(discr);
+    for &index in table.overflowed() {
+        let index = index as usize;
+        let Some(node) = cx.vsema.source(variants[index]) else { continue };
+        let name_span = name_span(cx, node);
+        // clone: the error's span
+        let mut diag = Diag::error(Some("E0370"), "enum discriminant overflowed", name_span.clone());
+        let after = int.display(table.value(index - 1));
+        // alloc: the error's label
+        diag.span_label(name_span, format!("overflowed on value after {after}"));
+        let name = variants[index].name(cx.db);
+        // alloc: the error's note
+        diag.note(format!(
+            "explicitly set `{} = {}` if that is desired outcome",
+            name.as_str(),
+            int.display(table.value(index))
+        ));
+        // clone: the error's fact
+        diag.fact(fact.clone(), what());
+        found.push(Found::new(diag, Phase::Items));
     }
     if let Some(mut diag) = needs_repr {
         // clone: the error's fact
         diag.fact(fact.clone(), what());
         found.push(Found::new(diag, Phase::Items));
     }
-    // alloc: inline up to 16 variants
-    let mut order: SmallVec<[usize; 16]> = (0..discrs.len()).collect();
-    let mut i = 0;
-    while i < order.len() {
-        let first = order[i];
-        let mut diag: Option<Diag> = None;
-        let mut o = i + 1;
-        while o < order.len() {
-            let other = order[o];
-            if discrs[first].discr.bits != discrs[other].discr.bits {
-                o += 1;
-                continue;
-            }
-            let diag = diag.get_or_insert_with(|| {
-                // alloc: the error's message
-                let message = format!(
-                    "discriminant value `{}` assigned more than once",
-                    discrs[first].discr.text()
-                );
-                let mut diag = Diag::error(Some("E0081"), message, enum_span());
-                label(cx, &mut diag, &discrs, first);
-                diag
-            });
-            label(cx, diag, &discrs, other);
-            let last = *order.last().expect("not empty");
-            order[o] = last;
-            order.pop();
+    let explicit = explicit_discriminant_indices(cx.db, id);
+    for group in table.duplicates() {
+        let first = int.display(table.value(group[0] as usize));
+        // alloc: the error's message
+        let message = format!("discriminant value `{first}` assigned more than once");
+        let mut diag = Diag::error(Some("E0081"), message, enum_span());
+        for &index in &group {
+            label(cx, &mut diag, &variants, explicit, table, index as usize);
         }
-        if let Some(mut diag) = diag {
-            // clone: the error's fact
-            diag.fact(fact.clone(), what());
-            found.push(Found::new(diag, Phase::Items));
-        }
-        i += 1;
+        // clone: the error's fact
+        diag.fact(fact.clone(), what());
+        found.push(Found::new(diag, Phase::Items));
     }
     found
 }
@@ -260,42 +159,66 @@ fn needs_repr_int(
     Some(diag)
 }
 
-/// rustc's `report` in `detect_discriminant_duplicate`: where `discrs[index]` gets its value.
-fn label(cx: &Cx<'_, '_>, diag: &mut Diag, discrs: &[Variant<'_>], index: usize) {
-    let variant = &discrs[index];
-    let value = variant.discr.text();
-    let expr_span = || {
-        let expr = discr_expr(variant.node.value).expect("an explicit discriminant's expression");
-        cx.span(variant.node.with_value(expr.syntax().text_range()))
-    };
-    let (span, shown) = match variant.explicit {
-        // alloc: the error's label
-        Some(Some(literal)) if literal != variant.discr.bits => (expr_span(), format!("`{value}` (overflowed from `{literal}`)")),
-        // alloc: the error's label
-        Some(_) => (expr_span(), format!("`{value}`")),
-        // alloc: the error's label
-        None if variant.relative == 0 => (name_span(cx, variant.node), format!("`{value}`")),
-        None => {
-            let start = &discrs[index - variant.relative];
-            let distance = variant.relative;
-            let variants = if distance > 1 { "variants" } else { "variant" };
-            let (name, start_name) = (variant.variant.name(cx.db), start.variant.name(cx.db));
-            diag.span_label(
-                name_span(cx, start.node),
+/// rustc's `report` in `detect_discriminant_duplicate`: where variant `index` gets its value.
+/// `explicit` is the variants with an explicit discriminant, ascending.
+fn label(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    variants: &[hir::EnumVariant],
+    explicit: &[u32],
+    table: &EnumDiscriminants<'_>,
+    index: usize,
+) {
+    let Some(node) = cx.vsema.source(variants[index]) else { return };
+    let Some(int) = table.int() else { return };
+    let value = table.value(index);
+    let shown = int.display(value);
+    let (span, shown) = match discr_expr(node.value) {
+        Some(expr) => {
+            let span = cx.span(node.with_value(expr.syntax().text_range()));
+            match literal(expr) {
+                Some(literal) if literal != bits(int, value) => {
+                    // alloc: the error's label
+                    (span, format!("`{shown}` (overflowed from `{literal}`)"))
+                }
                 // alloc: the error's label
-                format!(
-                    "discriminant for `{}` incremented from this startpoint (`{}` + {distance} {variants} later => `{}` = {value})",
-                    name.as_str(),
-                    start_name.as_str(),
-                    name.as_str()
-                ),
-            );
+                _ => (span, format!("`{shown}`")),
+            }
+        }
+        None => {
+            let start = match explicit.partition_point(|&at| at as usize <= index) {
+                0 => 0,
+                after => explicit[after - 1] as usize,
+            };
+            let distance = index - start;
+            if distance > 0
+                && let Some(start_node) = cx.vsema.source(variants[start])
+            {
+                let plural = if distance > 1 { "variants" } else { "variant" };
+                let (name, start_name) = (variants[index].name(cx.db), variants[start].name(cx.db));
+                diag.span_label(
+                    name_span(cx, start_node),
+                    // alloc: the error's label
+                    format!(
+                        "discriminant for `{}` incremented from this startpoint (`{}` + {distance} {plural} later => `{}` = {shown})",
+                        name.as_str(),
+                        start_name.as_str(),
+                        name.as_str()
+                    ),
+                );
+            }
             // alloc: the error's label
-            (name_span(cx, variant.node), format!("`{value}`"))
+            (name_span(cx, node), format!("`{shown}`"))
         }
     };
     // alloc: the error's label
     diag.span_label(span, format!("{shown} assigned here"));
+}
+
+/// `value`'s bits in the type, as rustc's `Discr::val` holds them.
+fn bits(int: DiscrInt, value: i128) -> u128 {
+    let mask = if int.bits >= 128 { u128::MAX } else { (1u128 << int.bits) - 1 };
+    value as u128 & mask
 }
 
 /// The value of an integer literal, as rustc's check reads one.
@@ -305,16 +228,6 @@ fn literal(expr: ast::Expr<'_>) -> Option<u128> {
         ast::LiteralKind::IntNumber(it) => it.value().ok(),
         _ => None,
     }
-}
-
-/// Whether the enum's discriminants are signed, and their width in bits: its `repr`'s integer
-/// type, else `isize`.
-fn repr_int(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Option<(bool, u32)> {
-    let ty = enum_.variant_body_ty(cx.db);
-    let builtin = ty.as_builtin()?;
-    let signed = builtin.is_int();
-    let size = ty.layout(cx.db).ok()?.size();
-    Some((signed, (size * 8) as u32))
 }
 
 /// The span of the first hint of the first `#[repr(..)]` of `node`: `i32` of `#[repr(i32)]`.
@@ -340,22 +253,4 @@ fn first_repr_hint(node: ast::Enum<'_>) -> Option<TextRange> {
         end = Some(range.end());
     }
     Some(TextRange::new(start?, end?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn discriminants_wrap_in_their_type() {
-        let u8 = |it| Discr::of(it, false, 8);
-        assert_eq!(u8(257).text(), "1");
-        assert_eq!(u8(255).next().0.text(), "0");
-        assert!(u8(255).next().1);
-        let i8 = |it| Discr::of(it, true, 8);
-        assert_eq!(i8(-1).text(), "-1");
-        assert_eq!(i8(-2).next().0.text(), "-1");
-        assert!(i8(127).next().1);
-        assert!(!i8(-1).next().1);
-    }
 }

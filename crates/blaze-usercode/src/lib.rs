@@ -371,7 +371,7 @@ mod tests {
         assert_ne!(one.finish(), two.finish());
     }
 
-    /// A proc macro's key, as blaze-expand makes one for each expansion it looks up.
+    /// A proc macro's key, as `proc_macro_api::kept` makes one for each expansion it looks up.
     fn macro_given() -> Given {
         let vars = [("CARGO_PKG_NAME", "a"), ("A", "1"), ("CARGO_PKG_NAME", "b")];
         let mut given = Given::new(RunKind::ProcMacro);

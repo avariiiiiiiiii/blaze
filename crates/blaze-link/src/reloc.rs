@@ -510,6 +510,42 @@ mod tests {
         assert_eq!((u32::from_le_bytes(add) >> 10) & 0xfff, 0x675);
     }
 
+    /// What `as` and `ld` write for the same instructions at the same addresses (v1's splice
+    /// checked its jumps and stubs against these words).
+    #[test]
+    fn aarch64_fields_are_the_words_as_and_ld_write() {
+        let word = |insn: u32, apply_as: Apply, s: u64, p: u64| {
+            let mut field = insn.to_le_bytes();
+            apply(apply_as, &ctx(Arch::Aarch64, s, 0, p), &mut field).unwrap();
+            u32::from_le_bytes(field)
+        };
+        let lo12 = Apply::A64Lo12 { shift: u8::MAX };
+        // A far jump to 0x12355678 from 0x10000: adrp x16; add x16, x16, #lo12.
+        assert_eq!(word(0x9000_0010, Apply::A64Page21, 0x1235_5678, 0x10000), 0xb009_1a30);
+        assert_eq!(word(0x9100_0210, lo12, 0x1235_5678, 0x10004), 0x9119_e210);
+        // A stub through the slot at 0x7ff8 from 0x1000c: adrp x16; ldr x16, [x16, #lo12].
+        assert_eq!(word(0x9000_0010, Apply::A64Page21, 0x7ff8, 0x1000c), 0xf0ff_ffb0);
+        assert_eq!(word(0xf940_0210, lo12, 0x7ff8, 0x10010), 0xf947_fe10);
+        // bl 0x400 from 0x1001c, and ldrh w1, [x0, #lo12] of 0x7ff8.
+        assert_eq!(word(0x9400_0000, Apply::A64Call26, 0x400, 0x1001c), 0x97ff_c0f9);
+        assert_eq!(word(0x7940_0001, lo12, 0x7ff8, 0x10024), 0x795f_f001);
+        let mut odd = 0x7940_0001u32.to_le_bytes();
+        assert!(apply(lo12, &ctx(Arch::Aarch64, 0x7ffd, 0, 0), &mut odd).is_err());
+    }
+
+    /// A `b` or `bl` reaches 128 MiB less 4 forward and 128 MiB back, and no further.
+    #[test]
+    fn an_aarch64_branch_reaches_128_mib() {
+        let reaches = |to: u64, from: u64| {
+            let mut bl = 0x9400_0000u32.to_le_bytes();
+            apply(Apply::A64Call26, &ctx(Arch::Aarch64, to, 0, from), &mut bl).is_ok()
+        };
+        let (old, last) = (0x10000u64, 0x10000 + (128 << 20) - 4);
+        assert!(reaches(last, old) && !reaches(last + 4, old));
+        assert!(reaches(0, 128 << 20) && !reaches(0, (128 << 20) + 4));
+        assert!(!reaches(old + 2, old), "a branch to an address not 4-aligned");
+    }
+
     #[test]
     fn lo12_shifts_follow_the_access_size() {
         assert_eq!(a64_lo12_shift(0x3940_0000).unwrap(), 0); // ldrb

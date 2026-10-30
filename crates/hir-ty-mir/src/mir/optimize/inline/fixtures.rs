@@ -10,7 +10,7 @@ use hir_ty_mir::mir::{
     CallerLocation, InlinedBody, MirBody, MirOptLevel, MirOptions, MirSpan, TerminatorKind,
     caller_location,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{db::TestDB, function};
 
@@ -31,7 +31,9 @@ fn optimized<T>(
     level: MirOptLevel,
     check: impl FnOnce(&TestDB, &MirBody<'_>) -> T,
 ) -> T {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, name);
         let body = db

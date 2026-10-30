@@ -731,7 +731,7 @@ impl syntax_bridge::SpanMapper for AbsoluteSpans {
 #[cfg(test)]
 mod tests {
     use span::Edition;
-    use syntax::{SourceFile, ast::HasModuleItem};
+    use syntax::SourceFile;
 
     use super::*;
 
@@ -745,24 +745,21 @@ struct S;
     #[test]
     fn segments_as_before() {
         let file = SourceFile::parse(ITEM, Edition::CURRENT);
-        let item = file.tree().items().next().unwrap();
+        let item = file.root().descendants().find_map(view::Struct::cast).unwrap();
+        let item = view::AnyHasAttrs::new(item);
         let cfg = CfgOptions::default();
-        let old_text = |path: &ast::Path| -> Option<SmolStr> {
+        let old_text = |path: &view::Path<'_>| -> Option<SmolStr> {
             Some(path.as_single_name_ref()?.text().trim_start_matches("r#").into())
         };
 
         let mut kept = Vec::new();
-        let _ = collect_item_tree_attrs::<Infallible>(
-            ast::attrs_including_inner(&item),
-            || &cfg,
-            |meta, _| {
-                kept.push(meta.syntax().text().to_string());
-                ControlFlow::Continue(())
-            },
-        );
+        let _ = collect_item_tree_attrs_view::<Infallible>(item, || &cfg, |meta, _| {
+            kept.push(meta.syntax().text().to_string());
+            ControlFlow::Continue(())
+        });
         let mut expected = Vec::new();
-        let _ = expand_cfg_attr::<Infallible>(
-            ast::attrs_including_inner(&item),
+        let _ = expand_cfg_attr_view::<Infallible>(
+            view::attrs_including_inner(&item),
             || &cfg,
             |meta, _| {
                 let filtered = meta
@@ -778,7 +775,7 @@ struct S;
         assert_eq!(kept, expected);
         assert_eq!(kept, ["foo::doc", "derive(Y)", "serde", "no_mangle", "must_used", "r#mod_attr"]);
 
-        for attr in ast::attrs_including_inner(&item) {
+        for attr in view::attrs_including_inner(&item) {
             let Some(path) = attr.meta().and_then(|it| it.path()) else { continue };
             for word in ["doc", "inline", "must_use", "foo", "mod_attr", "r#inline", ""] {
                 assert_eq!(path.is1(word), old_text(&path).is_some_and(|it| it == word), "{word}");
@@ -825,13 +822,12 @@ struct S;
         assert!(ITEM_TREE_FILTERED_ATTRS.iter().all(|it| is_item_tree_filtered_attr(it)));
     }
 
-    /// `cfg_attrs_view` gives what `expand_cfg_attr` gives over the handles: the same metas, by
-    /// kind and range, with the same outermost attributes, in the same order.
+    /// `cfg_attrs_view` gives what `expand_cfg_attr_view` gives: the same metas, by kind and
+    /// range, with the same outermost attributes, in the same order.
     #[test]
-    fn cfg_attrs_view_matches_the_handle_expansion() {
+    fn cfg_attrs_view_matches_the_expansion() {
         use syntax::{
-            AstNode as _, SourceFile,
-            ast::{self, HasAttrs as _},
+            SourceFile,
             view::{self, AstNode as _, HasAttrs as _},
         };
 
@@ -847,13 +843,12 @@ fn f() {}
 "#;
         let parse = SourceFile::parse(text, span::Edition::CURRENT);
         let cfg = CfgOptions::default();
-        let handle = parse.tree().syntax().descendants().find_map(ast::Fn::cast).unwrap();
+        let viewed = parse.root().descendants().find_map(view::Fn::cast).unwrap();
         let mut expected = Vec::new();
-        expand_cfg_attr::<()>(handle.attrs(), || &cfg, |meta, attr| {
+        expand_cfg_attr_view::<()>(viewed.attrs(), || &cfg, |meta, attr| {
             expected.push((meta.syntax().text_range(), attr.syntax().text_range()));
             ControlFlow::Continue(())
         });
-        let viewed = parse.root().descendants().find_map(view::Fn::cast).unwrap();
         let got: Vec<_> = cfg_attrs_view(viewed.attrs(), &cfg)
             .map(|(meta, attr)| (meta.syntax().text_range(), attr.syntax().text_range()))
             .collect();

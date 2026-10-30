@@ -14,7 +14,7 @@ use hir_def::{
     type_ref::{TypeRef, TypeRefId},
 };
 use rustc_type_ir::{InferConst, InferTy, inherent::IntoKind as _};
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 use thin_vec::ThinVec;
 
 use crate::{
@@ -41,8 +41,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Fixture {
-        let mut db = Db::for_tests();
-        ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+        let db = fixture::db(FIXTURE).into_db();
         let mut function = None;
         for &krate in all_crates(&db).iter() {
             if !krate.data(&db).origin.is_local() {

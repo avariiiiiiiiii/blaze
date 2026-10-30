@@ -12,14 +12,13 @@ use hir_def::{
     hir::ExprOrPatId,
     nameres::crate_def_map,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     BindingOrigin, IrrefutableLet, LetAt, MatchError, MatchLint, PatternTypo, UnreachablePattern,
     match_check,
 };
 
-use self::db::TestDB;
 
 fn render_lint(lint: &MatchLint) -> (ExprOrPatId, String) {
     match lint {
@@ -107,7 +106,9 @@ fn render_error(error: &MatchError) -> (ExprOrPatId, String) {
 /// and the finding.
 #[track_caller]
 fn check(#[rust_analyzer::rust_fixture] fixture: &str, expected: &[(&str, &str)]) {
-    let (db, file) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let hir_db: &Db = &db;
         let text = db.file_text(file.file_id(&db)).text(&db);
@@ -543,11 +544,13 @@ fn main() {
 
 #[test]
 fn a_body_without_a_match_computes_nothing() {
-    let (db, _) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 fn plain(a: u8) -> u8 { let b = a; b }
 "#,
     );
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
@@ -571,7 +574,7 @@ fn plain(a: u8) -> u8 { let b = a; b }
 /// give, and a body the binding scan clears takes no allocation.
 #[test]
 fn shortcuts_match_the_walk() {
-    let (db, _) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 //- minicore: option, fn
 pub enum E { One, Two }
@@ -590,6 +593,8 @@ fn let_else() { let x = 1 else { return }; }
 fn refutable_param((1, _): (u8, u8)) {}
 "#,
     );
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {
@@ -620,7 +625,7 @@ fn refutable_param((1, _): (u8, u8)) {}
 
 #[test]
 fn erroneous_bodies_are_not_checked() {
-    let (db, _) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 fn mismatched() {
     let x: u8 = "not a u8";
@@ -628,6 +633,8 @@ fn mismatched() {
 }
 "#,
     );
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let hir_db: &Db = &db;
         for &krate in all_crates(&db).iter() {

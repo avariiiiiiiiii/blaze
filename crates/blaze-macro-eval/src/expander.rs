@@ -3,7 +3,7 @@
 //!
 //! A call is keyed by the macro's code (its crate's whole closure and this server's version,
 //! [`code`](crate::code)), what it is given (name, kind, input and attribute tokens, spans as
-//! shapes, the calling crate's variables and directory, the toolchain: `blaze_expand::given`),
+//! shapes, the calling crate's variables and directory, the toolchain: `proc_macro_api::kept::given`),
 //! and what it read (files and variables, traced by [`os`](crate::os) and looked up again on
 //! a hit). Not kept: one that asked the database about a span, read what can't be traced,
 //! emitted a diagnostic, failed, or ran with state from the calls before it.
@@ -30,8 +30,8 @@ use std::{
 };
 
 use base_db::{Crate, Db, Nonce, ProcMacroLoadingError};
-use blaze_expand::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
-use blaze_expand::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
+use proc_macro_api::kept::verdict::{self as verdicts, STATEFUL, STATELESS, Verdict};
+use proc_macro_api::kept::{Call, Keeping, Mode, Put, checked, given, keeping, put, read, written};
 use blaze_ids::ContentId;
 use blaze_usercode::{
     RunKey,
@@ -130,7 +130,7 @@ static LIBRARIES: Mutex<Vec<Weak<Library>>> = Mutex::new(Vec::new()); // alloc: 
 
 /// Tells the store of each crate whose macros ran in this build and left no state that it is
 /// stateless: called once a build has expanded everything, on the thread of the store's
-/// owner, which then publishes this thread's puts (`blaze_expand::take_puts`). Writes nothing
+/// owner, which then publishes this thread's puts (`proc_macro_api::kept::take_puts`). Writes nothing
 /// itself and blocks on nothing.
 pub fn flush() {
     if keeping().is_none() {
@@ -487,7 +487,7 @@ impl Evaluated {
                     "{}: {}=check: it expanded otherwise than the store kept it, under a key of \
                      every input it was traced to read",
                     self.what(),
-                    blaze_expand::CACHE
+                    proc_macro_api::kept::CACHE
                 )));
             }
             report_reads(reads);

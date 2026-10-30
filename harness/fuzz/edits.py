@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # pyright: basic
-"""edits.py: generated edits, what the daemon makes of each against a cold cargo build.
+"""edits.py: generated edits, what the daemon makes of each against a cold blaze build.
 
 usage: edits.py smoke '{"backends": ["cranelift"]}'             a short run on fixed seeds, for CI
        edits.py run '{"seed": "S", "rounds": N, "steps": K}'      N programs from seed S, K edits each
@@ -15,9 +15,11 @@ harness/fuzz/edits.py ...` from the root.
 
 A round is one generated program (`gen.py`) under a daemon that keeps its binary up to date,
 as `splices.py` runs one. Each step edits the source, asks the daemon for the binary (which it
-splices, patches or links in full, as it sees fit) and builds the same source with cargo from
-nothing. A finding is a step whose binary prints something else than cargo's, a step the
-daemon refused, a daemon that died, or one that panicked and went on. An edit rustc turns down is not shown to the daemon.
+splices, patches or links in full, as it sees fit) and builds the same source with blaze from
+nothing: no daemon and no store (`runs.Project`). A finding is a step whose binary prints
+something else than the one from nothing, a step the daemon refused, a daemon that died, or one
+that panicked and went on. An edit rustc turns down (cargo, asked for the program's link line,
+fails) is not shown to the daemon.
 
 The edits:
   regen.run         the body of a case's `run`, generated anew
@@ -57,10 +59,10 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen
 import linkline
-from mixed import BLAZE, TARGET_ARGS, Fixture, built, minimize, sysroot_rlibs
-from fuzz import BACKENDS, FOUND, MANIFEST, differences, edition_of, run
+from mixed import BLAZE, TARGET_ARGS, Fixture, minimize, sysroot_rlibs
+from runs import BACKENDS, MANIFEST, Project, differences, edition_of, run
 
-EDITS = os.path.join(FOUND, "edits")
+EDITS = os.path.join(HERE, "found", "edits")
 # The line between one source and the next in a file under found/edits/.
 THEN = "//// then"
 SCALARS = {
@@ -286,11 +288,13 @@ class Editor:
 
 
 class Daemon:
-    """A cargo project, a daemon that keeps its binary up to date, and cargo's own build beside it."""
+    """A cargo project, a daemon that keeps its binary up to date, and blaze's build from nothing beside it."""
 
     def __init__(self, directory, edition, backend, text):
         self.dir = directory
-        self.ws, self.work, self.cold = (os.path.join(directory, name) for name in ("ws", "work", "cold"))
+        self.edition, self.backend = edition, backend
+        self.ws, self.work = (os.path.join(directory, name) for name in ("ws", "work"))
+        self.scratch = Project(os.path.join(directory, "cold"))
         os.makedirs(os.path.join(self.ws, "src"))
         os.makedirs(self.work)
         Path(self.ws, "Cargo.toml").write_text(MANIFEST.format(edition=edition))
@@ -353,18 +357,12 @@ class Daemon:
         reason = re.search(r"not spliced: (.*)", links[-1])
         return said, "full: " + (reason.group(1) if reason else "not asked to splice")
 
-    def cargo(self, text):
-        """What cargo's build of the source from nothing prints, or None when rustc turns it down."""
-        Path(self.main).write_text(text)
-        build = subprocess.run(
-            ["cargo", "build", "-q", *TARGET_ARGS],
-            check=False,
-            cwd=self.ws,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "CARGO_TARGET_DIR": self.cold, "CARGO_INCREMENTAL": "0"},
-        )
-        return run(built(self.cold, "fz")) if build.returncode == 0 else None
+    def cold(self, text):
+        """What blaze's build of the source from nothing prints, or None when rustc turns it down."""
+        try:
+            return self.scratch.build(text, self.edition, self.backend)
+        except SystemExit as error:
+            raise SystemExit(f"the build from nothing failed: {str(error)[-1500:]}") from None
 
     def alive(self):
         return self.process.poll() is None
@@ -381,6 +379,8 @@ class Daemon:
         self.process.kill()
         self.process.wait()
         shutil.rmtree(self.fx.work, ignore_errors=True)
+        if self.scratch.fx is not None:
+            shutil.rmtree(self.scratch.fx.work, ignore_errors=True)
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
@@ -418,7 +418,7 @@ def replay(work, edition, backend, sources):
     daemon = Daemon(tempfile.mkdtemp(prefix="replay-", dir=work), edition, backend, texts[0])
     try:
         for at, text in enumerate(texts):
-            expected = daemon.cargo(text)
+            expected = daemon.cold(text)
             if expected is None:
                 return f"step {at}: not accepted by rustc"
             wrong = verdict(daemon, text, expected)[0]
@@ -484,7 +484,7 @@ def read_found(path):
 
 def check(paths, backends, work):
     """Each file given, or all of found/edits/: whether a daemon shown its sources in turn gets one wrong."""
-    paths = paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs"))
+    paths = paths or sorted(os.path.join(EDITS, name) for name in os.listdir(EDITS) if name.endswith(".rs")) if os.path.isdir(EDITS) else paths
     wrong = 0
     for path in paths:
         path = path if os.path.exists(path) else os.path.join(EDITS, path)
@@ -507,7 +507,7 @@ def round_of(seed, cases, steps, backend, work, out, budget):
     daemon = Daemon(tempfile.mkdtemp(prefix=f"{backend}-", dir=work), edition, backend, editor.text())
     rows = []
     try:
-        expected = daemon.cargo(editor.text())
+        expected = daemon.cold(editor.text())
         wrong, how, took = verdict(daemon, editor.text(), expected)
         rows.append({"kind": "start", "what": "", "how": how, "ms": took, "wrong": wrong})
         for step in range(steps):
@@ -518,7 +518,7 @@ def round_of(seed, cases, steps, backend, work, out, budget):
             if edit is None:
                 continue
             kind, what = edit
-            expected = daemon.cargo(editor.text())
+            expected = daemon.cold(editor.text())
             if expected is None or expected[0] == "timeout":
                 rows.append(
                     {"kind": kind, "what": what, "how": "not accepted by rustc", "ms": 0, "wrong": None}
@@ -615,7 +615,7 @@ type Backend = Literal["cranelift", "llvm", "llvm-O0", "llvm-full"]
 
 @dataclass(frozen=True)
 class Smoke:
-    """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then found/edits/ again."""
+    """The fixed seeds of CI: 2 programs of 4 cases, 8 edits each, then whatever is under found/edits/ again."""
 
     backends: tuple[Backend, ...] = ("cranelift", "llvm")
     jobs: int = 2

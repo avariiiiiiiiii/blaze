@@ -1,5 +1,5 @@
 use base_db::{Crate, all_crates};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     AdtId, AssocItemId, AttrDefId, DefWithBodyId, GenericDefId, ImplId, Lookup, ModuleDefId,
@@ -198,7 +198,7 @@ fn ask_signatures(db: &TestDB, krate: Crate) {
 
 #[test]
 fn signatures_lower_no_body() {
-    let db = TestDB::with_files(BLOCKS);
+    let db = fixture::db(BLOCKS).into_db();
     let krate = crate_named(&db, "lib");
     let executed = db.executed_in_read_order(|| {
         ask_signatures(&db, krate);
@@ -227,7 +227,7 @@ pub enum VariantCfgdOut { #[cfg(any())] A(u8), B }
 pub enum DiscriminantCfgdOut { #[cfg(any())] A() = 1, B }
 pub enum Twice { A() = 1, A }
 "#;
-    let db = TestDB::with_files(ENUMS);
+    let db = fixture::db(ENUMS).into_db();
     let krate = crate_named(&db, "lib");
     let def_map = crate_def_map(&db, krate);
     let enums: Vec<_> = def_map
@@ -293,7 +293,7 @@ const OWNERS: &[(&str, usize)] = &[
 #[test]
 fn frozen_blocks_round_trip_lowering_only_their_owner() {
     for &(name, read_lowers) in OWNERS {
-        let db = TestDB::with_files(BLOCKS);
+        let db = fixture::db(BLOCKS).into_db();
         let krate = crate_named(&db, "lib");
         let owner = owner_named(&db, krate, name);
         let impls = impls_in(&db, owner);
@@ -311,7 +311,7 @@ fn frozen_blocks_round_trip_lowering_only_their_owner() {
             assert_eq!(dec.impl_id(), Ok(imp), "{name}");
             assert_eq!(dec.finish(), Ok(()), "{name}");
 
-            let fresh = TestDB::with_files(BLOCKS);
+            let fresh = fixture::db(BLOCKS).into_db();
             let fresh_krate = crate_named(&fresh, "lib");
             _ = crate_def_map(&fresh, fresh_krate);
             let mut read = None;
@@ -328,7 +328,7 @@ fn frozen_blocks_round_trip_lowering_only_their_owner() {
 
 #[test]
 fn the_blocks_of_a_body_lower_only_it() {
-    let db = TestDB::with_files(BLOCKS);
+    let db = fixture::db(BLOCKS).into_db();
     let krate = crate_named(&db, "lib");
     _ = crate_def_map(&db, krate);
     let nested = owner_named(&db, krate, "nested");
@@ -349,7 +349,7 @@ fn the_blocks_of_a_body_lower_only_it() {
 
 #[test]
 fn every_body_reaches_the_bodies_in_bodies() {
-    let db = TestDB::with_files(BLOCKS);
+    let db = fixture::db(BLOCKS).into_db();
     let krate = crate_named(&db, "lib");
     let mut names: Vec<_> = every_body(&db, krate).into_iter().map(|it| owner_name(&db, it)).collect();
     names.sort();
@@ -378,7 +378,7 @@ pub fn local_macro() {
     fn inner() { keep!(); }
 }
 "#;
-    let db = TestDB::with_files(ROOTS);
+    let db = fixture::db(ROOTS).into_db();
     let krate = crate_named(&db, "lib");
     let by_name = |name: &str| {
         crate_body_owners(&db, krate).into_iter().find(|&it| owner_name(&db, it) == name).unwrap()

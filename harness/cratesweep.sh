@@ -18,7 +18,7 @@ one() {
     "$here/vendor.sh" "$1" > "$dir/$name.log" 2>&1 &&
         timeout -k 20 "${TIMEOUT:-1800}" python3 "$here/cratetest.py" "$here/vendor/$name" --json "$dir/$name.json" >> "$dir/$name.log" 2>&1
     code=$?
-    result=$(grep -aE '^(MATCH|MISMATCH|UNTESTED|UNSTABLE): ' "$dir/$name.log" | tail -1)
+    result=$(grep -aE '^(PASS|FAIL|UNTESTED): ' "$dir/$name.log" | tail -1)
     [ "$code" = 124 ] || [ "$code" = 137 ] && result="TIMEOUT after ${TIMEOUT:-1800}s"
     [ -z "$result" ] && result="FAILED $(tail -1 "$dir/$name.log" | cut -c1-150)"
     echo "$name ($BLAZE_BACKEND): $result"

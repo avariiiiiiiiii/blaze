@@ -4,7 +4,7 @@
 //! signature as they were, not lowered again.
 
 use base_db::Db;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 use triomphe::Arc;
 
 use crate::{
@@ -109,7 +109,9 @@ fn count(log: &[String], query: &str) -> usize {
 #[track_caller]
 fn check_store_unchanged_by(edited: &str) {
     assert_ne!(edited, CODE);
-    let (mut db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let def = function_named(&db, "first");
     let before = relative_body(&db, def);
     let bytes = blaze_format::to_bytes(&*before);
@@ -139,7 +141,9 @@ fn comments_in_a_body_keep_its_store() {
 /// doesn't run at all.
 #[test]
 fn an_edit_in_one_body_lowers_only_that_body() {
-    let (mut db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let (bodies, signatures) = defs(&db);
     assert_eq!((bodies.len(), signatures.len()), (6, 8), "{bodies:?}\n{signatures:?}");
     let edited = function_named(&db, "second");
@@ -190,7 +194,9 @@ fn an_edit_in_one_body_lowers_only_that_body() {
 /// is the store it was lowered as the first time.
 #[test]
 fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
-    let (mut db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let mut db = fx.into_db();
     let add = function_named(&db, "add");
     let first = function_named(&db, "first");
     let before = relative_body(&db, add);

@@ -15,7 +15,7 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{ConstSignature, FunctionSignature, StructSignature},
 };
-use hir_ide::{
+use hir_ty::{
     ColdBatch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits,
     GenericPredicates, InferBodyId, InferenceResult,
     consteval::{AllocationRec, read_allocation, write_allocation},
@@ -28,7 +28,7 @@ use hir_ide::{
     },
 };
 use hir_ty_borrowck::{Checked, NotChecked, Refused};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use self::db::TestDB;
 
@@ -52,19 +52,16 @@ fn count(executed: &[String], query: &str) -> usize {
     executed.iter().filter(|it| *it == query).count()
 }
 
-/// hir names nothing of hir-ty-mir: linking hir is what links hir-ty-mir's table and
-/// hir-ide's, and each panics unless exactly one is linked.
+/// Linking hir is what links hir-ty-mir's table, which panics unless exactly one is linked.
 #[test]
-fn the_mir_and_display_providers_are_linked() {
-    let mir = hir_ide::providers::mir();
-    let display = hir_ide::providers::display();
-    assert!(std::ptr::eq(mir, hir_ide::providers::mir()));
-    assert!(std::ptr::eq(display, hir_ide::providers::display()));
+fn the_mir_providers_are_linked() {
+    let mir = hir_ty::providers::mir();
+    assert!(std::ptr::eq(mir, hir_ty::providers::mir()));
 }
 
 #[test]
 fn check_infers_only_workspace_bodies() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /dep.rs crate:dep library
 pub struct S;
@@ -79,7 +76,8 @@ fn main() {
     let _ = dep::S.method();
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let workspace = crate::check::workspace_crates(&db);
         assert_eq!(workspace.len(), 1, "only `main` is a workspace member");
@@ -133,8 +131,8 @@ fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
                 .collect::<Vec<_>>()
         })
     };
-    let in_order = TestDB::with_files(MODULES);
-    let reversed = TestDB::with_files(MODULES);
+    let in_order = fixture::db(MODULES).into_db();
+    let reversed = fixture::db(MODULES).into_db();
     let before = set_run_order(RunOrder::InOrder);
     let found = check(&in_order);
     set_run_order(RunOrder::Reversed);
@@ -150,7 +148,7 @@ fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
 
 #[test]
 fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
-    let db = TestDB::with_files(MODULES);
+    let db = fixture::db(MODULES).into_db();
     let before = set_run_order(RunOrder::Reversed);
     crate::attach_db(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
@@ -169,7 +167,7 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
 
 #[test]
 fn a_check_of_some_bodies_leaves_the_others_out() {
-    let db = TestDB::with_files(MODULES);
+    let db = fixture::db(MODULES).into_db();
     crate::attach_db(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let main = crate::DefWithBody::from(function(&db, "main"));
@@ -203,7 +201,7 @@ fn mismatched() -> u32 {
 
 #[test]
 fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
-    let db = TestDB::with_files(MOVED_TWICE);
+    let db = fixture::db(MOVED_TWICE).into_db();
     crate::attach_db(&db, || {
         let bad = function(&db, "moved_twice");
         match hir_ty_borrowck::checked(&db, bad) {
@@ -222,7 +220,7 @@ fn a_build_gets_no_mir_of_a_body_whose_borrow_check_failed() {
 
 #[test]
 fn a_lint_of_the_borrow_checker_lets_the_body_build() {
-    let db = TestDB::with_files(MOVED_TWICE);
+    let db = fixture::db(MOVED_TWICE).into_db();
     crate::attach_db(&db, || {
         let def = function(&db, "mut_unused");
         assert!(
@@ -235,7 +233,7 @@ fn a_lint_of_the_borrow_checker_lets_the_body_build() {
 
 #[test]
 fn a_body_with_type_errors_is_refused_not_passed() {
-    let db = TestDB::with_files(MOVED_TWICE);
+    let db = fixture::db(MOVED_TWICE).into_db();
     crate::attach_db(&db, || {
         let def = function(&db, "mismatched");
         assert_eq!(
@@ -247,7 +245,7 @@ fn a_body_with_type_errors_is_refused_not_passed() {
 
 #[test]
 fn a_body_match_checking_refused_gets_no_borrow_check_error() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, copy
 struct S;
@@ -261,7 +259,8 @@ fn refused(b: bool) {
     }
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let def = function(&db, "refused");
         let result = hir_ty_borrowck::borrowck(&db, def);
@@ -272,7 +271,7 @@ fn refused(b: bool) {
 
 #[test]
 fn a_check_takes_no_mir_of_another_body() {
-    let db = TestDB::with_files(MOVED_TWICE);
+    let db = fixture::db(MOVED_TWICE).into_db();
     crate::attach_db(&db, || {
         let good = function(&db, "moved_once");
         let other = function(&db, "mut_unused");
@@ -292,7 +291,7 @@ fn a_check_takes_no_mir_of_another_body() {
 
 #[test]
 fn a_live_patch_has_code_before_the_check_that_refuses_it() {
-    let db = TestDB::with_files(MOVED_TWICE);
+    let db = fixture::db(MOVED_TWICE).into_db();
     crate::attach_db(&db, || {
         let bad = function(&db, "moved_twice");
         let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
@@ -314,7 +313,7 @@ fn a_live_patch_has_code_before_the_check_that_refuses_it() {
 
 #[test]
 fn dropped_results_keep_cutoff_and_come_back_equal() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- minicore: sized, copy
 //- /main.rs crate:main
@@ -329,6 +328,8 @@ fn evicted() -> u32 {
 pub fn g() {}
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let other = files
         .iter()
         .map(|it| it.file_id(&db))
@@ -433,7 +434,7 @@ fn binding_ty<'db>(db: &'db TestDB, def: DefWithBodyId, name: &str) -> Ty<'db> {
 
 #[test]
 fn a_future_is_send_only_when_what_it_holds_across_an_await_is() {
-    let db = TestDB::with_files(HELD_ACROSS_AWAIT);
+    let db = fixture::db(HELD_ACROSS_AWAIT).into_db();
     crate::attach_db(&db, || {
         let (_, ModuleDefId::TraitId(send)) = type_item(&db, "Send") else {
             panic!("`Send` is a trait")
@@ -476,14 +477,14 @@ fn moved_before() {
 /// check refutes it when a `NotSend` is held across the `.await` and proves it when it is not.
 #[test]
 fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
-    let db = TestDB::with_files(SEND_REQUIRED_IN_ITS_BODY);
+    let db = fixture::db(SEND_REQUIRED_IN_ITS_BODY).into_db();
     crate::attach_db(&db, || {
         for (name, errors) in [("held", 1), ("moved_before", 0)] {
             let body = InferBodyId::DefWithBodyId(function(&db, name));
             let infer = InferenceResult::of(&db, body);
             assert!(!infer.coroutine_stalled_predicates().is_empty(), "{name}: `{{async}}: Send`");
             assert!(infer.diagnostics().is_empty(), "{name}: {:?}", infer.diagnostics());
-            let found = hir_ide::coroutine_obligations::coroutine_obligation_errors(&db, body);
+            let found = hir_ty::coroutine_obligations::coroutine_obligation_errors(&db, body);
             assert_eq!(found.len(), errors, "{name}: {found:?}");
         }
     });
@@ -491,7 +492,7 @@ fn a_goal_stalled_on_the_body_s_own_future_is_checked_after_inference() {
 
 #[test]
 fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
-    let db = TestDB::with_files(SOLVER);
+    let db = fixture::db(SOLVER).into_db();
     crate::attach_db(&db, || {
         let (krate, ModuleDefId::TraitId(tr)) = type_item(&db, "Tr") else {
             panic!("`Tr` is a trait")
@@ -541,7 +542,7 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
 
 #[test]
 fn a_goal_reused_from_another_query_reruns_it_when_what_the_goal_read_changes() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- minicore: sized
 //- /main.rs crate:main
@@ -560,6 +561,8 @@ impl Tr for A {}
 impl<T> Tr for B<T> where T: Tr {}
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let imp = files
         .iter()
         .map(|it| it.file_id(&db))
@@ -664,7 +667,7 @@ const MUTABLE_WHILE_SHARED: (&str, &str) =
 /// The borrow check of `BORROWCK`'s `name` gives exactly `expected`, rustc's codes and primary
 /// messages in rustc's order, and the gate refuses it unless all of them are lints.
 fn borrowck_gives(name: &str, expected: &[(&str, &str)]) {
-    let db = TestDB::with_files(BORROWCK);
+    let db = fixture::db(BORROWCK).into_db();
     crate::attach_db(&db, || {
         let def = function(&db, name);
         let found: Vec<(&str, String)> = hir_ty_borrowck::borrowck(&db, def)
@@ -752,9 +755,10 @@ impl<T> Tr for Q<T> where T: Tr {}
 ";
 
 fn signatures_db() -> TestDB {
-    TestDB::with_files(&format!(
+    fixture::db(&format!(
         "//- /dep.rs crate:dep library\n{SIGNATURES}//- /main.rs crate:main\n{SIGNATURES}"
     ))
+    .into_db()
 }
 
 /// `dep` and `main` of [`signatures_db`].
@@ -938,7 +942,7 @@ fn constant(db: &TestDB, name: &str) -> ConstId {
 
 #[test]
 fn allocations_read_back_as_written() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, unsize, coerce_unsized
 trait T { fn f(&self) -> u8; }
@@ -947,7 +951,8 @@ const S: &str = "text";
 const D: &dyn T = &7u8;
 const P: (&[u16], u8) = (&[1, 2, 3], 4);
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         for name in ["S", "D", "P"] {
@@ -1002,7 +1007,7 @@ fn bodies(db: &TestDB) -> Vec<DefWithBodyId> {
 
 #[test]
 fn an_inference_record_round_trips_through_its_type_table() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: deref, coerce_unsized, fn, sized, index, slice
 struct S { a: u32, b: (u8, bool) }
@@ -1025,7 +1030,8 @@ fn f(s: &S, v: &mut Vec<u32>) -> u32 {
     opaque().m() + slice[0] + moved() as u32 + k
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let bodies = bodies(&db);

@@ -2,7 +2,7 @@
 //! platform's driver holds the API server, the session, the VFS, the database, the store and
 //! the plane, and builds what the CLI and agents ask through them.
 //!
-//! - Its socket is `<home>/v2.sock`, `home` as v1's daemon has it ([`crate::cargo::daemon::home`]);
+//! - Its socket is `<home>/v2.sock` ([`home`]);
 //!   `--socket PATH` names another, `--http ADDR` also listens on TCP with the bearer token in
 //!   `BLAZE_API_TOKEN`.
 //! - What it keeps lives in [`state`]: the VFS's journal, the database's image, the store and
@@ -48,7 +48,21 @@ pub struct Paths {
 
 /// Where the daemon's socket is: `<home>/v2.sock`.
 pub fn socket() -> anyhow::Result<PathBuf> {
-    Ok(crate::cargo::daemon::home()?.join("v2.sock"))
+    Ok(home()?.join("v2.sock"))
+}
+
+/// Where the daemon's socket lives: `BLAZE_HOME`, else `blaze` in `XDG_RUNTIME_DIR`, else
+/// `~/.cache/blaze`.
+pub fn home() -> anyhow::Result<PathBuf> {
+    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
+        return Ok(PathBuf::from(home));
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|it| !it.is_empty()) {
+        return Ok(PathBuf::from(runtime).join("blaze"));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    Ok(PathBuf::from(home.context("no BLAZE_HOME, XDG_RUNTIME_DIR or HOME says where the daemon's socket is")?)
+        .join(".cache/blaze"))
 }
 
 /// Where the daemon keeps what outlives it: `$BLAZE_HOME/v2`, else `blaze/v2` in the user's
@@ -187,7 +201,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
             .into_iter()
             .filter_map(|name| Some((name.to_owned(), std::env::var(name).ok()?)))
             .collect(),
-        host: crate::cargo::toolchain::host()
+        host: crate::toolchain::host()
             .context("blaze has no target triple for this machine's architecture and system")?
             .to_owned(),
         color: false,
@@ -221,11 +235,12 @@ fn run(
 ) -> anyhow::Result<()> {
     let host = options.host.clone();
     let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;
+    daemon.install_store().map_err(|why| anyhow::anyhow!("the daemon's store: {why}"))?;
     // Once a process: every expansion from here on reads the daemon's store with no lock.
     let toolchain = hir_ty_codegen::v2::toolchain(&host, &[], hir_ty_codegen::v2::Runs::Elsewhere)
         .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
         .id;
-    blaze_expand::install(blaze_expand::Expansions {
+    proc_macro_api::kept::install(proc_macro_api::kept::Expansions {
         store: daemon.store().reader(),
         toolchain,
         environment: proc_macro_api::warm::Environment::new(),

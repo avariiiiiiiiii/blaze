@@ -2,10 +2,7 @@
 //! and the build scripts set nothing, and a client of the daemon sends its own with a request:
 //! the daemon's are those of whoever started it.
 
-use ide_db::{
-    RootDatabase, RootDatabaseExt as _,
-    base_db::{Crate, Env, ProcessEnv, process_env_var, set_process_env},
-};
+use base_db::{Crate, Db, Env, ProcessEnv, process_env_var, set_process_env};
 
 /// Between two variables on the line of a request.
 const BETWEEN: char = '\u{1f}';
@@ -67,15 +64,15 @@ fn unescape(text: &str) -> String {
 }
 
 /// Whether builds are for a process with other variables than `env`.
-pub fn differs(db: &RootDatabase, env: &Env) -> bool {
+pub fn differs(db: &Db, env: &Env) -> bool {
     ProcessEnv::try_get(db).is_none_or(|it| it.vars(db) != env)
 }
 
 /// Has builds from here on be for a process with the variables `env`. The result is the crates
 /// that have asked for a variable which is another now.
-pub fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
+pub fn turn(db: &mut Db, env: Env) -> Vec<Crate> {
     let mut reading: Vec<Crate> = db
-        .env_read()
+        .files().env_read()
         .into_iter()
         .filter(|(krate, key)| {
             !krate.env(db).contains_key(key) && process_env_var(db, key) != env.get(key)

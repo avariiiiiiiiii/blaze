@@ -25,7 +25,8 @@ use std::{
 };
 
 use blaze_core::sim::{Faults, Sim};
-use blaze_expand::{Expansions, Put, native};
+use blaze_macro_wasm::native;
+use proc_macro_api::kept::{self, Expansions, Put};
 use hir_def::nameres::crate_def_map;
 use hir_expand::proc_macro::{ProcMacroCall, ProcMacroExpander};
 use proc_macro_api::warm::Environment;
@@ -135,7 +136,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let toolchain = load::toolchain().unwrap_or_else(|why| panic!("{why}"));
     let mut sim = Sim::new(5, Faults::default());
     let mut store = kept_in(&mut sim);
-    blaze_expand::install(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
+    kept::install(Expansions { store: store.reader(), toolchain, environment: Arc::new(Environment::default()) })
         .unwrap_or_else(|why| panic!("{why}"));
 
     // A first build runs every macro and keeps what each stateless one made.
@@ -143,7 +144,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let mut loaded = Loaded::new();
     let first = build(&config, &dir, &records, &mut loaded);
     let firstly = taken(&records);
-    let mut puts = blaze_expand::take_puts();
+    let mut puts = kept::take_puts();
     for name in [
         "Serialize",
         "Deserialize",
@@ -170,9 +171,9 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     // The verdicts of the crates that kept no state are left with the puts of the thread that
     // calls `flush`, as the daemon's loop does, and published with the build's.
     blaze_macro_eval::flush();
-    puts.extend(blaze_expand::take_puts());
+    puts.extend(kept::take_puts());
     assert_eq!(verdict(&puts, "corpus_macros"), [b"stateless".to_vec()], "{:?}", whats(&puts));
-    let published = blaze_expand::publish(&mut store, puts);
+    let published = kept::publish(&mut store, puts);
     assert!(published.refused.is_empty(), "{:?}", published.refused);
     drop(first);
     loaded.clear();
@@ -180,7 +181,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     // A second build finds each, runs none of them, and gives what the first did.
     let second = build(&config, &dir, &records, &mut loaded);
     let secondly = taken(&records);
-    let puts = blaze_expand::take_puts();
+    let puts = kept::take_puts();
     assert!(puts.is_empty(), "the second build ran what the first kept: {:?}", whats(&puts));
     assert_eq!(firstly.len(), secondly.len(), "both builds make the same calls");
     for (one, two) in firstly.iter().zip(&secondly) {
@@ -200,7 +201,7 @@ fn a_kept_expansion_is_found_and_one_whose_input_changed_is_not() {
     let replay = |name: &str, call: ProcMacroCall<'_>| {
         let output = expander(&loaded, name).expand_in(db, calls, call);
         let output = output.unwrap_or_else(|error| panic!("`{name}` again: {error:?}"));
-        (record::literals(&output), blaze_expand::take_puts())
+        (record::literals(&output), kept::take_puts())
     };
 
     // A call whose variable changed finds nothing of the first and runs again.

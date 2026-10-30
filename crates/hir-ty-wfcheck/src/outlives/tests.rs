@@ -7,7 +7,7 @@ pub(crate) mod db;
 use hir_ty::db::HirDatabase;
 use base_db::{Db, all_crates};
 use hir_def::{AdtId, ModuleDefId, nameres::crate_def_map};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{Site, wfcheck};
@@ -209,7 +209,9 @@ fn is_trivial(need: Needs<'_>) -> bool {
 
 #[test]
 fn the_pruned_walk_is_the_walk_of_types_with_the_flags() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let tys = field_tys(&db);
         assert!(tys.len() > 15, "{}", tys.len());
@@ -226,7 +228,9 @@ fn the_pruned_walk_is_the_walk_of_types_with_the_flags() {
 
 #[test]
 fn inferred_outlives_finds_what_every_type_s_requirements_find() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut found_any = false;
         for (_, ty) in field_tys(&db) {
@@ -251,7 +255,9 @@ fn inferred_outlives_finds_what_every_type_s_requirements_find() {
 
 #[test]
 fn well_formedness_leaves_out_only_what_holds_and_tells_nothing() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut inferred = Inferred::default();
         let mut left_out = 0;
@@ -307,7 +313,9 @@ struct Uses<'a, T: 'a + Tr> {
 /// nothing, in order, and fail where proving them in a context fails.
 #[test]
 fn global_predicates_leave_out_only_what_holds() {
-    let (db, _) = TestDB::with_single_file(TRAITS);
+    let fx = fixture::db(TRAITS);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let mut globals = 0;
         for (adt, ty) in field_tys(&db) {
@@ -342,7 +350,9 @@ fn global_predicates_leave_out_only_what_holds() {
 
 #[test]
 fn a_field_of_static_reference_to_a_parameter_needs_it_static() {
-    let (db, _) = TestDB::with_single_file(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let named = |name: &str| {
             adts(&db)

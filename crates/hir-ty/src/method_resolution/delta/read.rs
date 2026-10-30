@@ -66,7 +66,8 @@ pub(in crate::method_resolution) fn inherent_bodies<'db>(
 /// blocks, each sorted, and whether a body of the module may hold an impl at all (it has impl
 /// holders: an `impl`, a macro call or an attribute that may write one), which is what makes the
 /// maintainer read it again after a write to another module.
-#[derive(Clone, Debug, Default, PartialEq, Eq)] // clone: the maintainer keeps a changed part to diff the next write against, once per write per module whose part changed
+// clone: a changed part, kept to diff the next write against; once per module whose part changed
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in crate::method_resolution) struct BodyPart {
     pub(in crate::method_resolution) traits: Box<[TraitId]>,
     pub(in crate::method_resolution) heads: Box<[Head]>,

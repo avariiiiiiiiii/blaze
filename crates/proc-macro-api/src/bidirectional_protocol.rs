@@ -28,8 +28,8 @@ use crate::{
 pub mod msg;
 
 /// What answers a server's sub-requests during a request: the database's answer
-/// (`load_cargo::answer`), or a refusal while none can be asked.
-// load-cargo's answer from the database, which this crate can't name (load-cargo depends on it).
+/// (`blaze_lower::answer`), or a refusal while none can be asked.
+// blaze-lower's answer from the database, which this crate can't name (blaze-lower depends on it).
 // dyn: called once per sub-request, each a round trip to the server.
 pub type SubCallback<'a> = &'a dyn Fn(SubRequest) -> Result<SubResponse, ServerError>;
 

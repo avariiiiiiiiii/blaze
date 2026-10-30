@@ -8,9 +8,9 @@ use hir_ty::{
     mir::{MirOwner, MirStage},
 };
 use hir_ty_mir::mir::{Operand, Rvalue, StatementKind, purity::operands};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 const BODIES: &str = r#"
 //- minicore: sized, copy, add
@@ -47,7 +47,9 @@ fn same<'a>(a: impl Iterator<Item = &'a Operand>, b: impl Iterator<Item = &'a Op
 
 #[test]
 fn operands_is_the_code_generators_copy_plus_binary_op() {
-    let (db, _) = TestDB::with_single_file(BODIES);
+    let fx = fixture::db(BODIES);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let reads: InferBodyId<'_> = function(&db, "reads").into();
         let mut binary = 0;

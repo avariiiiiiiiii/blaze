@@ -9,7 +9,7 @@ use syntax::{
     AstNode, AstPtr, SyntaxKind, ast,
     view::{self, AstNode as _, Typed},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::BodyAnalysis;
 use crate::{
@@ -86,7 +86,7 @@ fn local<'db>(analysis: &BodyAnalysis<'db>, name: &str) -> Local<'db> {
 
 #[test]
 fn the_tree_is_the_body_s_own_and_types_are_read_off_it() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let target = target(&db, "takes");
@@ -111,7 +111,7 @@ fn the_tree_is_the_body_s_own_and_types_are_read_off_it() {
 
 #[test]
 fn a_method_call_resolves_to_the_impl_s_function() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
@@ -133,7 +133,7 @@ fn a_method_call_resolves_to_the_impl_s_function() {
 
 #[test]
 fn paths_and_names_resolve_in_the_scope_of_their_block() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
@@ -164,7 +164,7 @@ fn paths_and_names_resolve_in_the_scope_of_their_block() {
 
 #[test]
 fn types_resolve_in_the_body_the_signature_and_a_nested_item() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let target = target(&db, "takes");
@@ -187,7 +187,7 @@ fn types_resolve_in_the_body_the_signature_and_a_nested_item() {
 
 #[test]
 fn a_macro_call_resolves_and_its_expressions_are_where_the_call_is() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         let (root, file) = analysis.tree();
@@ -214,7 +214,7 @@ fn a_macro_call_resolves_and_its_expressions_are_where_the_call_is() {
 
 #[test]
 fn a_moved_local_is_consumed_and_a_read_one_is_not() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "takes")));
         assert!(analysis.consumes(local(&analysis, "v")));
@@ -232,7 +232,7 @@ fn a_moved_local_is_consumed_and_a_read_one_is_not() {
 
 #[test]
 fn a_body_a_macro_writes_is_read_off_its_expansion() {
-    let db = Db::with_files(BODY);
+    let db = fixture::db(BODY).into_db();
     crate::attach_db(&db, || {
         let analysis = BodyAnalysis::new(&db, DefWithBody::from(func(&db, "made")));
         let target = target(&db, "made");

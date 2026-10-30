@@ -136,10 +136,20 @@ against the keys and item names made from scratch before and after it.
 - `impl_set_hash(db, krate, trait_)` is the trait slice's `ContentId` (own rows) combined with
   `body_impl_set_hash`: the body tables of the modules the slice lists, in module order.
 - `candidate_set_hash(db, krate, name)` is the candidate slice's.
-- `impl_identity(db, impl)` hashes an impl by its crate's content, its module path, its AST ID
-  and the chain of macro calls its file comes from. It uses no salsa IDs, so the same impl hashes
-  equal in two databases. Lane item-hash replaces it with its stable item identity, in this one
-  place.
+- Identities come from lane item-hash. hir-ty can't depend on blaze-items, so `blaze-item-hash`
+  installs two functions once per database with `install_identities(db, impl_, def)`, into the
+  singleton input `ImplIdentities`:
+  - `impl_` names an impl by its stable identity: signature hash, crate, and ordinal among
+    impls of equal signature;
+  - `def` names the def of a head or of a trait.
+
+  `impl_identity` and every hash go through them. A hash asked of a database with none installed
+  stops with an error: a location is no identity, because a module rename would change it and a
+  where-clause edit would not. hir-ty's tests install location identities (`publish::location`),
+  which are equal for the same text in two databases.
+- Slices hold no hash. `trait_slice_hash`, `inherent_slice_hash` and `candidate_slice_hash` are
+  queries over the rows, so a write computes no hash and a database without item-hash never
+  hashes.
 - `impl_row_hash(db, krate, trait_, self type)` and `blanket_hash(db, krate, trait_)` hash
   the rows that method resolution on one self type can see.
 

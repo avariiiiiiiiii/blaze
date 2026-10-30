@@ -4,7 +4,7 @@
 use base_db::{Db, FileId};
 use blaze_diagnostics::emit::{self, Sources, Style};
 use rustc_hash::FxHashMap;
-use test_fixture::WithFixture as _;
+use hir_expand::fixture;
 
 use crate::{
     check::{Setup, check},
@@ -86,7 +86,7 @@ pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
 }
 
 fn lint_once(fixture: &str, flags: &str, conf: Conf) -> String {
-    let db = Db::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     hir::attach_db(&db, || {
         let krate = main_crate(&db);
         let mut names: FxHashMap<FileId, String> = FxHashMap::default();

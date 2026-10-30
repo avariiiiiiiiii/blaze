@@ -18,7 +18,7 @@ use hir_ty_ub::{
     memory::MemError,
     run_test,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::db::TestDB;
 
@@ -110,7 +110,9 @@ fn main_of(db: &TestDB, file: EditionedFileId) -> FunctionId {
 }
 
 fn run_with(fixture: &str, config: &Config) -> Outcome {
-    let (db, file) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || run_test(&db, main_of(&db, file), config))
 }
 
@@ -1110,7 +1112,9 @@ fn main() {
 }
 "#
     );
-    let (db, file) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let main = main_of(&db, file);
         let (plain, plain_out, _) = run_function(&db, main, Plain);
@@ -1301,7 +1305,9 @@ fn main() {
 
 #[test]
 fn sites_are_interned_densely() {
-    let (db, file) = TestDB::with_single_file(program!("sized", "fn main() {}\n"));
+    let fx = fixture::db(program!("sized", "fn main() {}\n"));
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let owner = InferBodyId::DefWithBodyId(main_of(&db, file).into());
         let a = Site { owner, span: MirSpan::Unknown };

@@ -2,7 +2,7 @@
 //! expansion, argument, span map and ast id map again allocates nothing.
 
 use hir_expand::{HirFileId, MacroCallId, MacroCallKind};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::builtin_errors::macro_calls;
 use crate::test_db::TestDB;
@@ -10,7 +10,7 @@ use crate::test_db::TestDB;
 #[test]
 fn expansion_memo_hits_allocate_nothing() {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: derive, clone
 macro_rules! make { ($($t:tt)*) => { fn made() { $($t)* } } }
@@ -18,7 +18,8 @@ make!(let _x = 1;);
 #[derive(Clone)]
 struct S { a: u8, b: u16 }
 "#,
-    );
+    )
+    .into_db();
     let calls = macro_calls(&db);
     assert!(
         calls.iter().any(|call| matches!(call.loc(&db).kind, MacroCallKind::FnLike { .. }))
@@ -41,17 +42,18 @@ struct S { a: u8, b: u16 }
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(true);
 }
 
-/// Mapping into and out of an expansion through `ExpansionInfo`, as `hir::Semantics` does on
+/// Mapping into and out of an expansion through `ExpansionInfo`, as `hir::view::Semantics` does on
 /// every IDE request: after one round (the downmap index built, the worker's `u32`s grown), a
 /// second allocates nothing.
 #[test]
 fn warm_span_mapping_allocates_nothing() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 macro_rules! make { ($($t:tt)*) => { fn made() { $($t)* } } }
 make!(let _x = 1 + 2;);
 "#,
-    );
+    )
+    .into_db();
     let [call] = macro_calls(&db)[..] else { panic!("the `make!` call") };
     let round = || {
         let info = hir_expand::ExpansionInfo::new(&db, call);
@@ -91,14 +93,15 @@ fn arg_columns(db: &TestDB, call: MacroCallId) -> u64 {
 /// expands to nothing, less what that one owns.
 #[test]
 fn an_expansion_miss_allocates_its_result_alone() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 macro_rules! make { ($($t:tt)*) => { fn made() { $($t)* } } }
 macro_rules! nothing { () => {} }
 make!(let _x = 1 + 2; let _y = [3, 4, 5]; let _z = (6, 7););
 nothing!();
 "#,
-    );
+    )
+    .into_db();
     let calls = macro_calls(&db);
     let [make, nothing] = calls[..] else { panic!("two calls: {calls:?}") };
     let span = make.macro_arg_considering_derives(&db, &make.loc(&db).kind).2;
@@ -137,7 +140,7 @@ nothing!();
 #[test]
 fn a_derive_argument_miss_allocates_its_tree_alone() {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: derive, clone
 #[derive(Clone)]
@@ -146,7 +149,8 @@ struct Wide { #[cfg(all())] a: u8, b: u16, #[cfg(any())] c: u32, d: (u8, u8) }
 #[derive(Clone)]
 struct Unit;
 "#,
-    );
+    )
+    .into_db();
     let mut derives: Vec<_> = macro_calls(&db)
         .into_iter()
         .filter_map(|call| match call.loc(&db).kind {

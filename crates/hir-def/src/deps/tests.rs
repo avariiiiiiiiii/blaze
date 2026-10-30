@@ -14,7 +14,7 @@ use hir_expand::proc_macro::{
     ProcMacroKind, report_reads,
 };
 use rustc_hash::FxHashMap;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{nameres::frozen, test_db::TestDB, tt::TopSubtree};
@@ -96,7 +96,7 @@ fn all(db: &TestDB) -> Vec<Crate> {
 
 /// A store with the images of a fresh database of `fixture`.
 fn stored(fixture: &str) -> (Memory, Stored) {
-    let mut db = TestDB::with_files(fixture);
+    let mut db = fixture::db(fixture).into_db();
     let memory = Memory::default();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
@@ -122,7 +122,7 @@ fn crate_name_reference(db: &Db, krate: Crate) -> String {
 
 #[test]
 fn a_crate_is_named_in_an_error_as_every_old_copy_named_it() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     for krate in all(&db) {
         assert_eq!(crate_name(&db, krate), crate_name_reference(&db, krate));
     }
@@ -130,7 +130,7 @@ fn a_crate_is_named_in_an_error_as_every_old_copy_named_it() {
 
 #[test]
 fn only_crates_outside_the_workspace_are_eligible() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     assert!(eligible(&db, crate_named(&db, "lib")));
     assert!(eligible(&db, crate_named(&db, "core")));
     assert!(!eligible(&db, crate_named(&db, "main")));
@@ -140,17 +140,18 @@ fn only_crates_outside_the_workspace_are_eligible() {
 
 #[test]
 fn a_library_on_a_member_is_not_eligible() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         "//- /lib.rs crate:lib deps:member new_source_root:library\n\
          pub use member::X;\n\
          //- /member.rs crate:member new_source_root:local\n\
          pub struct X;\n",
-    );
+    )
+    .into_db();
     assert!(!eligible(&db, crate_named(&db, "lib")));
 }
 
 fn key_of(fixture: &str, name: &str, build: ContentId) -> ContentId {
-    let db = TestDB::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let krate = crate_named(&db, name);
     keys(&db, &[krate], build)[&krate]
 }
@@ -230,7 +231,7 @@ fn every_dependency_is_stored_and_served() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, stored) = stored(FIXTURE);
     assert_eq!(stored.refused, Vec::new());
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     assert_eq!(names(&db, &stored.written), ["core", "lib"]);
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
@@ -254,7 +255,7 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     for fixture in [FIXTURE, READING] {
         let memory = Memory::default();
-        let open = || if fixture == READING { reading_db() } else { TestDB::with_files(fixture) };
+        let open = || if fixture == READING { reading_db() } else { fixture::db(fixture).into_db() };
         let mut db = open();
         let crates = all(&db);
         let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
@@ -283,9 +284,9 @@ fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
 fn a_served_dependency_resolves_as_a_fresh_one() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
-    let fresh = TestDB::with_files(FIXTURE);
+    let fresh = fixture::db(FIXTURE).into_db();
     for mode in [Mode::Serve, Mode::Verify, Mode::Check] {
-        let mut db = TestDB::with_files(FIXTURE);
+        let mut db = fixture::db(FIXTURE).into_db();
         let crates = all(&db);
         serve(&mut db, &crates, BUILD, &memory, mode).unwrap();
         for name in ["core", "lib", "main"] {
@@ -308,7 +309,7 @@ fn a_served_dependency_resolves_as_a_fresh_one() {
 fn an_unresolved_import_of_a_dependency_is_still_reported() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let lib = crate::nameres::crate_def_map(&db, crate_named(&db, "lib"));
@@ -320,7 +321,7 @@ fn an_edit_to_a_dependency_misses_its_image_and_its_dependents() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
     let edited = FIXTURE.replace("pub trait Sized {}", "pub trait Sized {}\npub struct More;");
-    let mut db = TestDB::with_files(&edited);
+    let mut db = fixture::db(&edited).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(served.hits, Vec::new());
@@ -332,7 +333,7 @@ fn an_edit_to_a_dependency_misses_its_image_and_its_dependents() {
 fn an_image_written_under_another_key_is_an_error() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
     let other = ContentId([3; 32]);
@@ -343,7 +344,7 @@ fn an_image_written_under_another_key_is_an_error() {
         .lock()
         .unwrap()
         .insert(key, Arc::new(Aligned::copy_from(&write_image(other, [b"", b"", b""]))));
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let error = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap_err();
     assert!(error.contains("the image of crate lib"), "{error}");
@@ -354,11 +355,12 @@ fn an_image_written_under_another_key_is_an_error() {
 /// refused, and a library of macros with no known code is not keyed at all.
 #[test]
 fn a_crate_with_an_expansion_of_unknown_reads_is_refused() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         "//- proc_macros: identity\n\
          //- /lib.rs crate:lib new_source_root:library\n\
          pub mod inner { #[proc_macros::identity] pub fn f() {} }\n",
-    );
+    )
+    .into_db();
     let lib = crate_named(&db, "lib");
     assert!(!eligible(&db, lib), "the fixture's macros have no library");
     let refused = Reads::of(&db, lib, &[]).unwrap_err();
@@ -423,7 +425,7 @@ fn reading_db() -> TestDB {
         expander: Arc::new(Reading),
         disabled: false,
     };
-    let mut db = TestDB::with_files_extra_proc_macros(READING, vec![(source.into(), reading)]);
+    let mut db = fixture::db_with_proc_macros(READING, vec![(source.into(), reading)]).into_db();
     let macros = crate_named(&db, "proc_macros");
     let mut data = macros.data(&db).clone();
     data.origin = CrateOrigin::Library { repo: None, name: intern::Symbol::intern("proc_macros") };
@@ -523,7 +525,7 @@ fn a_key_covers_the_library_of_its_macros() {
 /// The process variables a crate's `env!`s read are its reads, and their values file it.
 #[test]
 fn process_variables_read_file_the_image_by_their_values() {
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let reads = Reads::for_tests(&["BLAZE_DEPS_TEST"], &[]);
     let unset = reads.values_then(&db);
     base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_DEPS_TEST".into(), "1".into())]));
@@ -681,13 +683,13 @@ fn the_global_cache_is_read_through_the_local_store() {
     let local = Memory::default();
     *global.gets.lock().unwrap() = 0;
     let through = ReadThrough { local: &local, global: &global };
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
     assert_eq!(*global.gets.lock().unwrap(), 2);
     assert_eq!(contents(&local), contents(&global));
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let served = serve(&mut db, &crates, BUILD, &through, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
     assert_eq!(*global.gets.lock().unwrap(), 2, "the second session reads the local store alone");
@@ -695,7 +697,7 @@ fn the_global_cache_is_read_through_the_local_store() {
 
 #[test]
 fn a_crate_with_no_outside_input_is_not_refused() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     for name in ["core", "lib"] {
         assert_eq!(serve::refusal(&db, crate_named(&db, name)), None, "{name}");
     }
@@ -706,7 +708,7 @@ fn serving_asks_the_store_once_a_crate() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
     *memory.gets.lock().unwrap() = 0;
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(*memory.gets.lock().unwrap(), 2);
@@ -744,13 +746,13 @@ fn tasks_on_threads_store_and_serve_as_in_order() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
     let threads = Threads::default();
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
     let stored = store(&db, &served, &threads).unwrap();
     assert_eq!(names(&db, &stored.written), ["core", "lib"]);
     assert_eq!(contents(&threads.0), contents(&memory));
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
     assert_eq!(names(&db, &served.hits), ["core", "lib"]);
 }
@@ -760,7 +762,7 @@ fn tasks_on_threads_store_and_serve_as_in_order() {
 fn served_parts_are_the_store_s_bytes() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
     let lib = crate_named(&db, "lib");
@@ -787,12 +789,13 @@ fn found_in(db: &TestDB, lib: Crate, key: ContentId, memory: &Memory) -> Option<
 /// crate's bodies in a slot: found while the variable is as it was, not once it changed.
 #[test]
 fn a_body_s_process_variable_files_a_value_in_a_slot() {
-    let mut db = TestDB::with_files(
+    let mut db = fixture::db(
         "//- /lib.rs crate:lib new_source_root:library\n\
          #[rustc_builtin_macro]\n\
          macro_rules! env {() => {}}\n\
          pub fn f() -> &'static str { env!(\"BLAZE_DEPS_BODY\") }\n",
-    );
+    )
+    .into_db();
     let set = |db: &mut TestDB, value: &str| {
         let vars = Env::from_iter([("BLAZE_DEPS_BODY".into(), value.into())]);
         base_db::set_process_env(db, vars);
@@ -818,11 +821,12 @@ fn a_body_s_process_variable_files_a_value_in_a_slot() {
 /// its modules and signatures read nothing.
 #[test]
 fn a_body_s_expansion_of_unknown_reads_is_refused() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         "//- proc_macros: mirror\n\
          //- /lib.rs crate:lib new_source_root:library\n\
          pub fn f() -> u8 { proc_macros::mirror!(1) }\n",
-    );
+    )
+    .into_db();
     let lib = crate_named(&db, "lib");
     assert!(Reads::of(&db, lib, &[]).unwrap().is_empty());
     let refused = checked_reads(&db, lib).unwrap_err();
@@ -835,7 +839,7 @@ fn a_body_s_expansion_of_unknown_reads_is_refused() {
 /// A crate whose bodies read nothing is filed and found under the key alone, with no slot.
 #[test]
 fn a_crate_with_no_body_reads_is_found_under_its_key() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let lib = crate_named(&db, "lib");
     let reads = checked_reads(&db, lib).unwrap();
     assert!(reads.is_empty(), "{reads:?}");
@@ -872,7 +876,7 @@ fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
 #[test]
 fn serving_a_crate_at_a_time_adds_to_what_was_served() {
     let (memory, _) = stored(FIXTURE);
-    let mut db = TestDB::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let (lib, core) = (crate_named(&db, "lib"), crate_named(&db, "core"));
     let first = serve(&mut db, &[core], BUILD, &memory, Mode::Serve).unwrap();
     assert_eq!(first.hits, [core]);
@@ -901,14 +905,15 @@ fn serving_a_crate_at_a_time_adds_to_what_was_served() {
 /// once each, and their `OUT_DIR`s as their variables give them.
 #[test]
 fn key_inputs_are_what_the_key_was_made_from() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         "//- /lib.rs crate:lib deps:mid,core new_source_root:library env:OUT_DIR=/out/lib\n\
          pub use mid::M;\n\
          //- /mid.rs crate:mid deps:core new_source_root:library\n\
          pub use core::C as M;\n\
          //- /core.rs crate:core new_source_root:library env:OUT_DIR=/out/core\n\
          pub struct C;\n",
-    );
+    )
+    .into_db();
     let (lib, mid) = (crate_named(&db, "lib"), crate_named(&db, "mid"));
     let inputs = key_inputs(&db, &[lib], BUILD);
     let keys = keys(&db, &[lib], BUILD);

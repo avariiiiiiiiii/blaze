@@ -26,8 +26,8 @@ use crate::mir;
 /// is better left out of `compiled` when a check follows the build.
 pub fn drop_after_store(db: &mut Db, compiled: &[DefWithBodyId]) {
     drop_mir(db);
-    hir_ide::evict::drop_all_const_eval(db);
-    hir_ide::evict::drop_inference(db, compiled);
+    hir_ty::evict::drop_all_const_eval(db);
+    hir_ty::evict::drop_inference(db, compiled);
 }
 
 /// Drops every MIR the database holds.

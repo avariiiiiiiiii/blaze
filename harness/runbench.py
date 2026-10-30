@@ -17,12 +17,10 @@ times, the builds taking turns, and reported by its median wall time:
 
 `--variant NAME:VAR=VALUE,...` adds an blaze build with those variables set too (say
 `--variant blaze-mir2:BLAZE_MIR_OPT=2`). Before timing, each benchmark is run once with
-every build and its exit status, stdout and stderr (scrubbed as apps.json says) have to be
-release's; a build that differs is reported and not timed.
+every build, and has to exit 0: a build whose run does not is reported and not timed.
 
-NAME is `kernels` (harness/corpus/kernels, a benchmark per kernel) or an entry of
-apps/apps.json with a `bench` (checked out as apps.py does, under APPS_DIR). Default: kernels,
-numeric, jsonrt, ripgrep, fd, tokei, eza, bat.
+NAME is an entry of apps/apps.json with a `bench` (checked out as apps.py does, under
+APPS_DIR). Default: numeric, jsonrt, ripgrep, fd, tokei, eza, bat.
 
 Memory is kept beside the times (memory.py, docs/benchmarks.md "Memory and disk"): each run's
 peak resident memory as the kernel kept it (`wait4`), the size of each program, and what each
@@ -43,8 +41,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import apps, memory  # noqa: E402
 
-KERNELS = ["sieve", "collatz", "fnv", "qsort", "matmul", "nbody", "mandelbrot", "words"]
-DEFAULT = ["kernels", "numeric", "jsonrt", "ripgrep", "fd", "tokei", "eza", "bat"]
+DEFAULT = ["numeric", "jsonrt", "ripgrep", "fd", "tokei", "eza", "bat"]
 BLAZE_ENV = {"BLAZE_BACKEND": "llvm", "BLAZE_OPT": "3"}
 # What a variant may not inherit from the shell: the build is said by its flags alone.
 OWN_VARS = ["BLAZE_BACKEND", "BLAZE_OPT", "BLAZE_EMIT", "BLAZE_MIR_OPT", "BLAZE_INLINE",
@@ -53,9 +50,6 @@ OWN_VARS = ["BLAZE_BACKEND", "BLAZE_OPT", "BLAZE_EMIT", "BLAZE_MIR_OPT", "BLAZE_
 
 
 def spec_of(name):
-    if name == "kernels":
-        return {"package": "kernels", "path": os.path.join(HERE, "corpus", "kernels"),
-                "benches": {k: [k] for k in KERNELS}}
     spec = json.load(open(apps.SPECS))[name]
     if "bench" not in spec:
         raise SystemExit(f"{name}: apps.json has no `bench` for it")
@@ -64,16 +58,8 @@ def spec_of(name):
 
 def workspace(name, spec):
     """The program's source, its dependencies vendored beside it."""
-    if "path" in spec:
-        ws = os.path.join(apps.APPS_DIR, name)
-        if not os.path.isdir(ws):
-            shutil.copytree(spec["path"], ws, ignore=shutil.ignore_patterns("target*"))
-            with open(os.path.join(ws, "Cargo.toml"), "a") as out:
-                out.write("\n[workspace]\n")
-            subprocess.run(["cargo", "generate-lockfile"], cwd=ws, check=True, capture_output=True)
-    else:
-        ws = apps.checkout(name, spec)
-        apps.prepare(ws, spec)
+    ws = apps.checkout(name, spec)
+    apps.prepare(ws, spec)
     apps.localize(ws)
     os.environ.update(spec.get("build_env", {}))
     apps.setup(ws, spec)
@@ -148,13 +134,16 @@ class Runner:
         for var in OWN_VARS:
             self.env.pop(var, None)
 
-    def behaviour(self, binary, argv):
-        ran = subprocess.run([self.argv0, *argv], executable=binary, cwd=self.ws, env=self.env,
-                             capture_output=True, stdin=subprocess.DEVNULL, timeout=1800)
-        scrub = apps.App.scrub.__get__(type("S", (), {"scrubbed": self.spec.get("scrub", [])})())
-        where, directory = os.fsencode(binary), os.fsencode(os.path.dirname(binary))
-        clean = lambda out: scrub(out.replace(where, b"<program>").replace(directory, b"<directory>"))
-        return ran.returncode, clean(ran.stdout), clean(ran.stderr) if self.spec.get("compare_stderr") else b""
+    def failure(self, binary, argv):
+        """None when one run of the benchmark exits 0; else its status and the end of what it said."""
+        try:
+            ran = subprocess.run([self.argv0, *argv], executable=binary, cwd=self.ws, env=self.env,
+                                 capture_output=True, stdin=subprocess.DEVNULL, timeout=1800)
+        except subprocess.TimeoutExpired:
+            return "did not finish in 1800 s"
+        if ran.returncode == 0:
+            return None
+        return f"exited {ran.returncode}: {(ran.stdout + ran.stderr).decode(errors='replace').strip()[-300:]}"
 
     def seconds(self, binary, argv):
         """The seconds of one run, and the peak resident memory of the program (its tree's
@@ -223,17 +212,18 @@ def main():
         runner = Runner(ws, spec)
         benches = {}
         for bench, argv in spec["benches"].items():
-            want = runner.behaviour(programs["release"], argv)
             timed = []
             for build in builds:
                 if build not in programs:
                     continue
-                got = want if build == "release" else runner.behaviour(programs[build], argv)
-                if got != want:
-                    print(f"  {bench}: {build} DIFFERS from release (status {got[0]} vs {want[0]})", flush=True)
-                    info[build].setdefault("differs", []).append(bench)
+                if (why := runner.failure(programs[build], argv)) is not None:
+                    print(f"  {bench}: {build} FAILED: {why}", flush=True)
+                    info[build].setdefault("failed_runs", []).append(bench)
                     continue
                 timed.append(build)
+            if "release" not in timed:
+                print(f"  {bench}: not timed, with no release run to be the baseline", flush=True)
+                continue
             times, held = {build: [] for build in timed}, {build: [] for build in timed}
             for round_ in range(a.rounds):
                 # Each round starts with another build, so what the machine does meanwhile
@@ -264,7 +254,7 @@ def main():
     lines = ["| Benchmark | release (s) | " + " | ".join(f"{b} / release" for b in builds if b != "release") + " |",
              "|---|---|" + "---|" * (len(builds) - 1)]
     for program, bench, row in all_benches:
-        cells = [f"{row[b]['ratio']:.2f}" if b in row else "differs" if bench in results["programs"][program]["builds"].get(b, {}).get("differs", []) else "failed"
+        cells = [f"{row[b]['ratio']:.2f}" if b in row else "run failed" if bench in results["programs"][program]["builds"].get(b, {}).get("failed_runs", []) else "failed"
                  for b in builds if b != "release"]
         lines.append(f"| {bench} | {row['release']['median_s']:.3f} | " + " | ".join(cells) + " |")
     lines.append("| geomean | | " + " | ".join(

@@ -21,17 +21,18 @@ use hir_def::{
     nameres::{crate_def_map, module_impls},
     signatures::TraitSignature,
 };
-use hir_expand::name::Name;
+use hir_expand::{fixture, name::Name};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::FileId;
-use test_fixture::ChangeFixture;
 
 use super::{
     head::{Head, try_head},
     key::{ImplKey, assoc_names, derive_key, impl_key},
+    install_identities,
     publish::{
-        candidate_rows_hash, directory, inherent_rows_hash, module_rank, trait_rows_hash,
+        candidate_rows_hash, candidate_slice_hash, directory, inherent_rows_hash,
+        inherent_slice_hash, location, module_rank, trait_rows_hash, trait_slice_hash,
     },
     read::{inherent_bodies, trait_bodies},
     state::NAME,
@@ -48,10 +49,10 @@ pub(super) struct Loaded {
 
 impl Loaded {
     pub(super) fn new(fixture: &str) -> Loaded {
-        let mut db = Db::for_tests();
-        let parsed = ChangeFixture::parse(fixture);
-        let files = parsed.files.iter().map(|it| it.file_id()).collect();
-        parsed.change.apply(&mut db);
+        let fx = fixture::db(fixture);
+        let files = fx.files().iter().map(|it| it.file_id()).collect();
+        let mut db = fx.into_db();
+        install_identities(&mut db, location::impl_identity, location::def_identity);
         Loaded { db, files }
     }
 
@@ -210,7 +211,7 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
         if (impls, derives, rows.bodies.to_vec()) != expected {
             _ = writeln!(failures, "{what}: the slice of {trait_:?} differs from scratch");
         }
-        if slice.hash(db) != trait_rows_hash(db, trait_, rows) {
+        if trait_slice_hash(db, *slice) != trait_rows_hash(db, trait_, rows) {
             _ = writeln!(failures, "{what}: the hash of {trait_:?}'s slice is not its rows'");
         }
     }
@@ -231,7 +232,7 @@ fn check_slices(db: &Db, krate: Crate, what: &str, failures: &mut String) {
         if !ordered {
             _ = writeln!(failures, "{what}: the slice of {head:?} is out of position order");
         }
-        if slice.hash(db) != inherent_rows_hash(db, head, rows) {
+        if inherent_slice_hash(db, *slice) != inherent_rows_hash(db, head, rows) {
             _ = writeln!(failures, "{what}: the hash of {head:?}'s slice is not its rows'");
         }
     }
@@ -258,7 +259,7 @@ fn check_candidates(db: &Db, krate: Crate, what: &str, failures: &mut String) {
             let name = name.as_str();
             _ = writeln!(failures, "{what}: the candidates of `{name}` differ from scratch");
         }
-        if slice.hash(db) != candidate_rows_hash(db, name, rows) {
+        if candidate_slice_hash(db, *slice) != candidate_rows_hash(db, name, rows) {
             let name = name.as_str();
             _ = writeln!(failures, "{what}: the hash of `{name}`'s candidates is not its rows'");
         }

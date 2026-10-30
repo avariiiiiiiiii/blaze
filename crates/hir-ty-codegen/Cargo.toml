@@ -76,7 +76,7 @@ blaze-alloc-count.workspace = true
 blaze-cas.workspace = true
 blaze-fuzz.workspace = true
 hir.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [features]
 llvm = ["dep:inkwell"]

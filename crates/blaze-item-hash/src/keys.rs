@@ -8,6 +8,13 @@
 //! expression, but its id is interned with its type, which only the lowering of its owner
 //! gives: `hir_ty::body_store` writes one by its location and type (`IdKind::AnonConst`), never
 //! by key, so it and a closure written inside one (whose owner it is) give `None` here.
+//!
+//! A key is relative to the body whose record names it (docs/v2/plan/design/item-hash.md,
+//! section 3.7): the body's own item, its closures, coroutines and `impl Trait` return types
+//! are "self" (their place in the body), an item one of its paths names is "the target of
+//! path `i`" of the identity's resolutions ([`crate::identity::names`]), so that a record of
+//! a renamed body is read back. A relative key is [`RELATIVE`], a tag and an index, which no
+//! hash is.
 
 use base_db::Db;
 use blaze_ids::ContentId;
@@ -16,7 +23,7 @@ use blaze_items::{
     key::{self, Resolved},
 };
 use hir_def::{
-    ExpressionStoreOwnerId,
+    DefWithBodyId, ExpressionStoreOwnerId,
     expr_store::{Body, ExpressionStore},
     hir::{ClosureKind, Expr, ExprId},
 };
@@ -28,16 +35,124 @@ use hir_ty::{
     },
     next_solver::{ImplTraitIdx, SolverDefId},
 };
-use la_arena::RawIdx;
+use la_arena::{Idx, RawIdx};
+use rustc_hash::FxHashMap;
 
-/// The key of `def`: the same definition has the same key in every database.
-pub fn def_key<'db>(db: &'db Db, def: SolverDefId<'db>) -> ContentId {
-    key::def_key(db, def).0
+use crate::identity::names::{Target, names_of};
+
+/// What a relative key begins with.
+const RELATIVE: [u8; 20] = *b"blaze v2 relative: \0";
+
+/// What a relative key names, relative to the body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Rel {
+    /// The body's own item (a discriminant's variant).
+    Own = 0,
+    /// A closure written in the body, by its expression.
+    Closure = 1,
+    Coroutine = 2,
+    CoroutineClosure = 3,
+    /// An `impl Trait` of the body's own function's return type, by its index.
+    Opaque = 4,
+    /// The target of the identity's `i`th resolution.
+    Target = 5,
 }
 
-/// The definition of `db` whose [`def_key`] is `key`, `None` when it has none (or when it is
-/// an anonymous constant's, see the module doc).
-pub fn def_of<'db>(db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>> {
+impl Rel {
+    fn of(tag: u8) -> Option<Rel> {
+        Some(match tag {
+            0 => Rel::Own,
+            1 => Rel::Closure,
+            2 => Rel::Coroutine,
+            3 => Rel::CoroutineClosure,
+            4 => Rel::Opaque,
+            5 => Rel::Target,
+            _ => return None,
+        })
+    }
+}
+
+/// The key of `def` in a record of `body`: relative to `body` where it can be (see the module
+/// doc), else its item key, the same in every database.
+pub fn def_key<'db>(db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+    match relative(db, body, def) {
+        Some((rel, at)) => {
+            let mut bytes = [0; 32];
+            bytes[..20].copy_from_slice(&RELATIVE);
+            bytes[20] = rel as u8;
+            bytes[21..25].copy_from_slice(&at.to_le_bytes());
+            ContentId(bytes)
+        }
+        None => key::def_key(db, def).0,
+    }
+}
+
+fn relative<'db>(db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> Option<(Rel, u32)> {
+    let own = InferBodyId::DefWithBodyId(body);
+    let raw = |expr: ExprId| expr.into_raw().into_u32();
+    Some(match def {
+        SolverDefId::FunctionId(it) if body == DefWithBodyId::FunctionId(it) => (Rel::Own, 0),
+        SolverDefId::ConstId(it) if body == DefWithBodyId::ConstId(it) => (Rel::Own, 0),
+        SolverDefId::StaticId(it) if body == DefWithBodyId::StaticId(it) => (Rel::Own, 0),
+        SolverDefId::EnumVariantId(it) if body == DefWithBodyId::VariantId(it) => (Rel::Own, 0),
+        SolverDefId::InternedClosureId(it) if it.loc(db).owner == own => {
+            (Rel::Closure, raw(it.loc(db).expr))
+        }
+        SolverDefId::InternedCoroutineId(it) if it.loc(db).owner == own => {
+            (Rel::Coroutine, raw(it.loc(db).expr))
+        }
+        SolverDefId::InternedCoroutineClosureId(it) if it.loc(db).owner == own => {
+            (Rel::CoroutineClosure, raw(it.loc(db).expr))
+        }
+        SolverDefId::InternedOpaqueTyId(it) => match it.loc(db) {
+            ImplTraitId::ReturnTypeImplTrait(function, index)
+                if body == DefWithBodyId::FunctionId(function) =>
+            {
+                (Rel::Opaque, index.into_raw().into_u32())
+            }
+            ImplTraitId::ReturnTypeImplTrait(..) | ImplTraitId::TypeAliasImplTrait(..) => {
+                return None;
+            }
+        },
+        other => {
+            let target = match other {
+                SolverDefId::FunctionId(it) => Target::Item(ItemId::Function(it)),
+                SolverDefId::AdtId(it) => Target::Item(ItemId::Adt(it)),
+                SolverDefId::TraitId(it) => Target::Item(ItemId::Trait(it)),
+                SolverDefId::ImplId(it) => Target::Item(ItemId::Impl(it)),
+                SolverDefId::ConstId(it) => Target::Item(ItemId::Const(it)),
+                SolverDefId::StaticId(it) => Target::Item(ItemId::Static(it)),
+                SolverDefId::TypeAliasId(it) => Target::Item(ItemId::Alias(it)),
+                SolverDefId::EnumVariantId(it) => Target::Variant(it),
+                _ => return None,
+            };
+            (Rel::Target, *target_indices(db, body).get(&target)?)
+        }
+    })
+}
+
+/// The index of each target among `body`'s resolutions ([`Target`]), empty when its paths
+/// could not be hashed (it then has no identity, and no record).
+#[salsa::tracked(returns(ref))]
+fn target_indices(db: &Db, body: DefWithBodyId) -> FxHashMap<Target, u32> {
+    let Ok(names) = names_of(db, body) else { return FxHashMap::default() };
+    // alloc: the query's value, once per body a record is written or read for
+    let mut indices = FxHashMap::default();
+    for (at, &target) in names.targets.iter().enumerate() {
+        indices.insert(target, u32::try_from(at).expect("more than 2^32 targets of one body"));
+    }
+    indices
+}
+
+/// The definition of `db` whose [`def_key`] in a record of `body` is `key`, `None` when it has
+/// none (or when it is an anonymous constant's, see the module doc).
+pub fn def_of<'db>(db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    if key.0[..20] == RELATIVE {
+        let def = relative_def(db, body, key)?;
+        debug_assert_eq!(def_key(db, body, def), key, "a relative key names what has another");
+        return Some(def);
+    }
     let def = match key::resolve(db, ItemKey(key))? {
         Resolved::Item(item) => item_def(item)?,
         Resolved::Module(_) => return None,
@@ -75,8 +190,55 @@ pub fn def_of<'db>(db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>> {
             }
         }
     };
-    debug_assert_eq!(def_key(db, def), key, "a key resolves to what has another key");
+    debug_assert_eq!(key::def_key(db, def).0, key, "a key resolves to what has another key");
     Some(def)
+}
+
+/// [`def_of`] of a relative key.
+fn relative_def<'db>(db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+    let at = u32::from_le_bytes(key.0[21..25].try_into().expect("four bytes"));
+    let own = InferBodyId::DefWithBodyId(body);
+    let closure = |at: u32| {
+        let expr: ExprId = Idx::from_raw(RawIdx::from_u32(at));
+        let store = ExpressionStore::of(db, ExpressionStoreOwnerId::Body(body));
+        if at as usize >= store.expr_count() {
+            return None;
+        }
+        match store.expr(expr) {
+            Expr::Closure { closure_kind, .. } => {
+                Some(InternedClosure { owner: own, expr, kind: closure_kind })
+            }
+            _ => None,
+        }
+    };
+    Some(match Rel::of(key.0[20])? {
+        Rel::Own => match body {
+            DefWithBodyId::FunctionId(it) => SolverDefId::FunctionId(it),
+            DefWithBodyId::ConstId(it) => SolverDefId::ConstId(it),
+            DefWithBodyId::StaticId(it) => SolverDefId::StaticId(it),
+            DefWithBodyId::VariantId(it) => SolverDefId::EnumVariantId(it),
+        },
+        Rel::Closure => SolverDefId::InternedClosureId(InternedClosureId::new(db, closure(at)?)),
+        Rel::Coroutine => {
+            SolverDefId::InternedCoroutineId(InternedCoroutineId::new(db, closure(at)?))
+        }
+        Rel::CoroutineClosure => SolverDefId::InternedCoroutineClosureId(
+            InternedCoroutineClosureId::new(db, closure(at)?),
+        ),
+        Rel::Opaque => {
+            let DefWithBodyId::FunctionId(function) = body else { return None };
+            let index = ImplTraitIdx::from_raw(RawIdx::from_u32(at));
+            let loc = ImplTraitId::ReturnTypeImplTrait(function, index);
+            SolverDefId::InternedOpaqueTyId(InternedOpaqueTyId::new(db, loc))
+        }
+        Rel::Target => {
+            let names = names_of(db, body).as_ref().ok()?;
+            match *names.targets.get(at as usize)? {
+                Target::Item(item) => item_def(item)?,
+                Target::Variant(it) => SolverDefId::EnumVariantId(it),
+            }
+        }
+    })
 }
 
 fn item_def<'db>(item: ItemId) -> Option<SolverDefId<'db>> {

@@ -30,7 +30,7 @@ use std::{
 
 use anyhow::Context as _;
 use blaze_build_script as script;
-use ide_db::base_db::TargetKind;
+use base_db::TargetKind;
 use project_model::{CargoWorkspace, OwnBuildAsked, OwnBuildOutput, OwnBuildScripts, Package};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest as _, Sha256};
@@ -1094,7 +1094,7 @@ impl<'a> Driver<'a> {
         // Compiled for this host from here, beside the other units, rather than in the load,
         // which loads one module after another.
         if wasm && compiled.is_ok() {
-            compiled = blaze_macro_wasm::prepare_soon(&made.exe, own_script::store())
+            compiled = blaze_macro_wasm::prepare_soon(&made.exe, blaze_cas::Handle::installed())
                 .map_err(anyhow::Error::msg);
         }
         if let (true, Err(why)) = (wasm, &compiled) {

@@ -19,7 +19,12 @@ use blaze_format::{ALIGN, FormatError, Part, Placed, Record, SchemaHash, Slice, 
 use blaze_ids::ContentId;
 use hir_def::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,
-    hir::{ClosureKind, CoroutineKind, CoroutineSource, Movability},
+    expr_store::Body,
+    hir::{ClosureKind, CoroutineKind, CoroutineSource, Expr, ExprId, Movability},
+};
+use hir_expand::{
+    MacroDefKind,
+    builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
 
 use super::{BodyFacts, INSTALLED, Lookup, Step, infer::{Keyed, items_of}};
@@ -27,7 +32,10 @@ use crate::{
     InferBodyId,
     check_cache::ids::{self, Table},
     db::InternedClosure,
-    mir::{MirBody, MirLowerError, MirOwner, persist},
+    mir::{
+        MirBody, MirLowerError, MirOwner,
+        persist::{self, Locations},
+    },
     next_solver::{
         DbInterner,
         persist::{TABLE_SCHEMA, TyTableWriter},
@@ -37,6 +45,49 @@ use crate::{
 type R<T = ()> = Result<T, String>;
 
 type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
+
+/// The literals of `def`'s body that `line!`, `column!`, `file!`, `module_path!` or a `concat!`
+/// made, in order: a record keeps a slot for each, never its value, which moves with the code.
+/// A `concat!` of no location is kept as a slot too, which reads back as the same constant. The
+/// source map changes with every edit above the body, and only a body that calls one of these
+/// macros reads it.
+#[salsa::tracked(returns(deref), mem_tag = Mir)]
+pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
+    let body = Body::of(db, def);
+    let located = |kind: MacroDefKind| {
+        matches!(
+            kind,
+            MacroDefKind::BuiltIn(
+                _,
+                BuiltinFnLikeExpander::Line
+                    | BuiltinFnLikeExpander::Column
+                    | BuiltinFnLikeExpander::File
+                    | BuiltinFnLikeExpander::ModulePath
+            ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
+        )
+    };
+    if !body.macro_calls().iter().any(|call| located(call.loc(db).def.kind)) {
+        return Box::default();
+    }
+    let source_map = Body::unmoved_source_map(db, def);
+    body.exprs()
+        .filter(|(_, expr)| matches!(expr, Expr::Literal(_)))
+        .filter(|&(id, _)| {
+            source_map
+                .expr_syntax(id)
+                .ok()
+                .and_then(|source| source.file_id.macro_file())
+                .is_some_and(|call| located(call.loc(db).def.kind))
+        })
+        .map(|(id, _)| id)
+        // alloc: the query's value, of a body that called a location macro
+        .collect()
+}
+
+/// The location literals of `def`, for its records.
+fn locations(db: &Db, def: DefWithBodyId) -> Locations<'_> {
+    Locations { store: Body::of(db, def), exprs: location_literals(db, def) }
+}
 
 blaze_format::record! {
     /// A MIR answer: where its anonymous constants' type table is, the body's `mir::persist`
@@ -217,9 +268,11 @@ pub(super) fn encode<'db>(
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = Table::default();
     // alloc: the reason a body is not stored
-    let record = ids::relocating(&mut table, || persist::write(db, body)).map_err(str::to_owned)?;
+    let locations = locations(db, def);
+    let record = ids::relocating(&mut table, || persist::write(db, body, Some(locations)))
+        .map_err(str::to_owned)?;
     let mut locs = TyTableWriter::new(interner);
-    let mut items = Keyed::new(db, facts);
+    let mut items = Keyed::new(db, facts, def);
     let words = ids::write_with(db, &mut table, &mut locs, &mut items)?;
 
     let mut writer = Writer::with_buffer(SCHEMA, mem::take(out));
@@ -265,8 +318,9 @@ pub(super) fn decode<'db>(
     let record = root.body.follow(bytes).map_err(format_error)?;
     let keys = root.items.follow(bytes).map_err(format_error)?;
     let kinds = root.kinds.follow(bytes).map_err(format_error)?;
-    let items = items_of(db, facts, keys, kinds)?;
+    let items = items_of(db, facts, def, keys, kinds)?;
     let interner = DbInterner::new_with(db, def.krate(db));
     let mut table = ids::read(db, interner, &items, words, bytes, root.locs)?;
-    ids::relocating(&mut table, || persist::read(db, record)).map_err(format_error)
+    let locations = locations(db, def);
+    ids::relocating(&mut table, || persist::read(db, record, Some(locations))).map_err(format_error)
 }

@@ -6,9 +6,8 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::type_name::{rustc_symbol_type, rustc_type_name, scalar_name};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::db::TestDB;
 
 /// The arms `write_ty`, `spell_ty` and `Spelling::symbol_type` each had.
 fn reference(kind: TyKind<'_>) -> Option<&'static str> {
@@ -26,7 +25,9 @@ fn reference(kind: TyKind<'_>) -> Option<&'static str> {
 
 #[test]
 fn scalar_names_are_the_arms_they_replace() {
-    let (db, _) = TestDB::with_single_file("fn main() {}");
+    let fx = fixture::db("fn main() {}");
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let ints = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];

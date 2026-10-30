@@ -3,7 +3,7 @@
 
 use hir_expand::InFile;
 use syntax::{AstPtr, SyntaxNode, ast, view};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     DefWithBodyId, Lookup, ModuleDefId,
@@ -64,7 +64,7 @@ fn handle<N: syntax::AstNode + view::Typed>(node: N::Of<'_>, root: &SyntaxNode) 
 
 #[test]
 fn every_lookup_view_is_its_handle() {
-    let db = TestDB::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     let mut found = [0usize; 7];
     let bodies = bodies(&db);
     assert_eq!(bodies.len(), 3);

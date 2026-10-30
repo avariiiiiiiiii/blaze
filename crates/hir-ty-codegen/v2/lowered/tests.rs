@@ -16,7 +16,7 @@ use blaze_cas::Key;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemKey};
 use hir_def::FunctionId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::v2::{Backends, BuildTime, Databases, HashSource, Prepared, by_id::ById, refs};
@@ -122,7 +122,7 @@ fn policy() -> Policy {
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend() -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(PROGRAM).0));
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(PROGRAM).into_db()));
     let build_time = std::sync::Arc::new(BuildTime(Default::default()));
     let frontend = HirFrontend::new(Databases::new(db), HashSource::ById(ById), build_time);
     (db, frontend.with_policy(&policy()))
@@ -130,7 +130,7 @@ fn frontend() -> (&'static TestDB, HirFrontend<'static>) {
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 /// One target a reference, each another symbol.
@@ -230,7 +230,7 @@ fn assembly_and_the_allocator_shim_are_named() {
         to: None,
         params: 2,
         returns: true,
-        krate: db.test_crate(),
+        krate: fixture::test_crate(&db),
     };
     let shim = HirInstance(Kind::Allocator(forward));
     let Ok(Lowering::Allocator(symbol)) = lowered(&frontend, &unit(&tier), &tier, &shim, &[]) else {
@@ -254,7 +254,7 @@ fn the_reach_of_a_root_is_the_drivers() {
     let (db, frontend) = frontend();
     let policy = policy();
     let root = frontend.root(function(db, "caller"));
-    let origin = frontend.with(|hir, _| frontend.origin(hir, db.test_crate()));
+    let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
     let roots = [(root, origin)];
     let backends = Backends::default();
     let memo = Memo::new();

@@ -6,10 +6,9 @@
 
 use std::{fmt::Write as _, time::Instant};
 
-use base_db::Db;
 use hir_firewall::Harness;
 use salsa::{Database as _, Durability};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 const MODULES: usize = 10;
 const PER_MODULE: usize = 20;
@@ -38,8 +37,8 @@ fn fixture() -> String {
 }
 
 fn main() {
-    let mut db = Db::with_files(&fixture());
-    let krate = db.test_crate();
+    let mut db = fixture::db(&fixture()).into_db();
+    let krate = fixture::test_crate(&db);
 
     let started = Instant::now();
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");

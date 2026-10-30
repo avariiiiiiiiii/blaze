@@ -419,7 +419,9 @@ impl Own {
                 let payload = &payload[..];
                 self.claim(look, unit, record(Form::Chunked, 0, payload), payload, ticket)
             })
-        } else if !kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM {
+        } else if (kind == Kind::Machine && !bytes.is_empty())
+            || (!kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM)
+        {
             // Its bytes ride in the segment; the store writes them as the file at the commit.
             self.claim(look, unit, record(Form::External, 0, bytes), bytes, ticket)
         } else if let Some(columns) = look.columns_of(bytes).filter(|_| kind.cold()) {

@@ -59,6 +59,17 @@ pub fn parse_checksum(hex: &str) -> Option<[u8; 32]> {
     blaze_format::hex::decode(hex)
 }
 
+/// The schema of a `.crate` file as the store keeps it: the file's bytes, as downloaded.
+const CRATE_FILE: blaze_format::SchemaHash = blaze_format::schema("a registry's .crate file 1");
+
+/// What the store keeps the `.crate` file whose sha256 is `sha256` under: the file is named by
+/// that hash alone, so every registry and every fetch shares it; nothing made it but the
+/// download, which is checked against the hash before it is kept.
+pub fn crate_key(sha256: &[u8; 32]) -> blaze_cas::Key {
+    let producer = blaze_ids::ContentId::of("blaze v2 registry download of a .crate file 1", &[]);
+    blaze_cas::Key::of(CRATE_FILE, producer, &[blaze_ids::ContentId(*sha256)])
+}
+
 impl Registry {
     /// Where a package is unpacked: `$CARGO_HOME/registry/src/<registry>/<name>-<version>`.
     pub fn package_dir(&self, name: &str, version: &Version) -> PathBuf {
@@ -114,8 +125,27 @@ impl Registry {
             .with_context(|| format!("`{}` is not a sha256 checksum", package.checksum))?;
         let store = self.context().store;
         let matches = |bytes: &[u8]| <[u8; 32]>::from(Sha256::digest(bytes)) == key;
+        let keep = |bytes: &[u8]| -> anyhow::Result<()> {
+            let Some(store) = store else { return Ok(()) };
+            // clone: a download kept, once a package
+            let put = store.put(crate_key(&key), blaze_cas::Kind::Output, bytes.to_vec());
+            put.map(drop).map_err(|it| {
+                anyhow::anyhow!("the store keeps other bytes than `{package}`'s under its sha256 ({:x})", it.kept)
+            })
+        };
         let cache_file = self.crate_file(&package.name, &package.version);
-        if let Some(bytes) = store.and_then(|it| it.get(&key)).filter(|it| matches(it)) {
+        let kept = match store {
+            Some(store) => store
+                // alloc: the `.crate` the caller is given, once a package
+                .read(&crate_key(&key), |it| it.bytes.to_vec())
+                // alloc: error path
+                .map_err(|e| anyhow::anyhow!("the store's `.crate` of `{package}`: {e}"))?,
+            None => None,
+        };
+        if let Some(bytes) = kept {
+            if !matches(&bytes) {
+                bail!("the store's `.crate` of `{package}` is not of its sha256 `{}`", package.checksum);
+            }
             if !self.is_local() && self.context().keep_crate_files {
                 keep_crate_file(&cache_file, &bytes);
             }
@@ -123,9 +153,7 @@ impl Registry {
         }
         match std::fs::read(&cache_file) {
             Ok(bytes) if !bytes.is_empty() && matches(&bytes) => {
-                if let Some(store) = store {
-                    store.insert(&key, &bytes);
-                }
+                keep(&bytes)?;
                 return Ok((bytes, From::CargoCache));
             }
             Ok(bytes) if !bytes.is_empty() && self.is_local() => {
@@ -162,9 +190,7 @@ impl Registry {
         if !matches(&bytes) {
             bail!("failed to verify the checksum of `{package}`");
         }
-        if let Some(store) = store {
-            store.insert(&key, &bytes);
-        }
+        keep(&bytes)?;
         if self.context().keep_crate_files {
             keep_crate_file(&cache_file, &bytes);
         }

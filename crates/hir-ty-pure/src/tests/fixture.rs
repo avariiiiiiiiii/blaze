@@ -3,7 +3,7 @@
 //! end in `extern "C"` functions as the real ones do, and build scripts on them.
 
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin, all_crates};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 /// The minicore regions the stand-ins use, then `alloc` and `std`. A test appends its crates.
 pub(super) const TOOLCHAIN: &str = r#"
@@ -613,7 +613,7 @@ pub mod process {
 /// The database of the toolchain with `crates` appended (each starting `//- /path crate:..`).
 pub(super) fn db_with(crates: &str) -> Db {
     // alloc: a test's fixture text
-    Db::with_files(&format!("{TOOLCHAIN}{crates}"))
+    fixture::db(&format!("{TOOLCHAIN}{crates}")).into_db()
 }
 
 /// The crate named `name` in `db`.

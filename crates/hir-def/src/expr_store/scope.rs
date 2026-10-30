@@ -537,7 +537,7 @@ mod tests {
         TextSize,
         view::{self, AstNode as _},
     };
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
     use test_utils::{assert_eq_text, extract_offset};
 
     use super::*;
@@ -649,7 +649,7 @@ mod tests {
     }
 
     fn find_function(db: &TestDB, file_id: FileId) -> FunctionId {
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(db);
         let crate_def_map = crate_def_map(db, krate);
 
         let module = crate_def_map.modules_for_file(db, file_id).next().unwrap();
@@ -679,7 +679,9 @@ mod tests {
             buf
         };
 
-        let (db, position) = TestDB::with_position(&code);
+        let fx = fixture::db(&code);
+        let position = fx.position();
+        let db = fx.into_db();
         let editioned_file_id = position.file_id;
         let offset = position.offset;
 
@@ -723,7 +725,7 @@ mod tests {
 
     #[test]
     fn every_scope_kind_matches_the_model() {
-        let (db, position) = TestDB::with_position(
+        let fx = fixture::db(
             r#"
 fn f<const N: usize>(p: u32, s: [u8; { let k = 1; k }]) {
     macro_rules! m { () => { 1 } }
@@ -744,6 +746,8 @@ fn f<const N: usize>(p: u32, s: [u8; { let k = 1; k }]) {
 }
 "#,
         );
+        let position = fx.position();
+        let db = fx.into_db();
         let (file_id, _) = position.file_id.unpack(&db);
         check_model(&db, find_function(&db, file_id));
     }
@@ -939,7 +943,9 @@ fn foo() {
     }
 
     fn do_check_local_name(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected_offset: u32) {
-        let (db, position) = TestDB::with_position(ra_fixture);
+        let fx = fixture::db(ra_fixture);
+        let position = fx.position();
+        let db = fx.into_db();
         let editioned_file_id = position.file_id;
         let offset = position.offset;
 

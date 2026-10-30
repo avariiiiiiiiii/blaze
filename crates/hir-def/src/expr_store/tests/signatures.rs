@@ -3,15 +3,15 @@ use crate::{
     expr_store::pretty::{print_function, print_struct},
     nameres::crate_def_map,
     signatures::{FunctionSignature, StructSignature},
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
 };
 use expect_test::{Expect, expect};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::super::*;
 
 fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);

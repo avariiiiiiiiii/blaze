@@ -10,7 +10,7 @@ use hir_def::deps::{self as deps, ImageBuf, ImageStore};
 use hir_ty_borrowck::Mode;
 use rustc_hash::FxHashMap;
 use span::FileId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{
@@ -82,7 +82,9 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 /// The outcome key of `name` in `fixture`, for a crate whose image and bodies read nothing (each
 /// filed under its key) and whose dependencies' check keys are given alike.
 fn outcome_key(fixture: &str, name: &str) -> ContentId {
-    let (db, _) = Db::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let krate = crate_named(&db, name);
     let image = deps::keys(&db, &[krate], BUILD)[&krate];
     key(bodies_key(image, &[ContentId([3; 32])], Mode::Polonius), &inputs(&flags(&["--cap-lints", "allow"])))
@@ -246,7 +248,9 @@ fn checked_with(
     root: &str,
     vars: &[(&str, &str)],
 ) -> (Db, HashMap<FileId, String>, Vec<Diag>) {
-    let (mut db, files) = Db::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     if !vars.is_empty() {
         base_db::set_process_env(&mut db, Env::from_iter(vars.iter().map(|&(name, value)| (name.into(), value.into()))));
     }
@@ -332,7 +336,9 @@ fn imaged(db: &mut Db, store: &Memory) -> (ContentId, ContentId) {
 
 /// A second database of `fixture`, its images served from `store`.
 fn served_db(fixture: &str, vars: &[(&str, &str)], store: &Memory) -> Db {
-    let (mut db, _) = Db::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.files().to_vec();
+    let mut db = fx.into_db();
     if !vars.is_empty() {
         base_db::set_process_env(&mut db, Env::from_iter(vars.iter().map(|&(name, value)| (name.into(), value.into()))));
     }
@@ -448,7 +454,9 @@ fn a_bodys_process_variable_files_the_outcome_by_its_value() {
     let kept = super::store(&db, &checked, &Served::default(), root, &store).unwrap();
     assert!(kept.refused.is_empty(), "{:?}", kept.refused);
     let served_with = |value: &str| {
-        let (mut db, _) = Db::with_many_files(READING);
+        let fx = fixture::db(READING);
+        let _ = fx.files().to_vec();
+        let mut db = fx.into_db();
         base_db::set_process_env(&mut db, Env::from_iter([("BLAZE_CHECK_CACHE_TEST".into(), value.into())]));
         let all = base_db::all_crates(&db).to_vec();
         deps::serve(&mut db, &all, BUILD, &store, deps::Mode::Serve).unwrap();
@@ -464,7 +472,9 @@ fn a_bodies_part_under_its_key_that_does_not_open_is_an_error() {
     let store = Memory::default();
     let flags = flags(&[]);
     let inputs = inputs(&flags);
-    let (mut first, _) = Db::with_many_files(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let _ = fx.files().to_vec();
+    let mut first = fx.into_db();
     let (core_image, lib_image) = imaged(&mut first, &store);
     let core = [Checked { krate: crate_named(&first, "core"), image: core_image, inputs, diags: &[] }];
     let kept = super::store(&first, &core, &Served::default(), "/w", &store).unwrap();

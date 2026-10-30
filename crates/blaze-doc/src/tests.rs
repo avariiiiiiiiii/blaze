@@ -2,8 +2,8 @@
 //! (one unresolved), a dependency and a proc macro.
 
 use hir::Crate;
-use ide_db::RootDatabase;
-use test_fixture::WithFixture;
+use base_db::Db;
+use hir_expand::fixture;
 
 use crate::{
     Asked,
@@ -273,13 +273,13 @@ macro_rules! declare {
 }
 "#;
 
-fn load() -> (RootDatabase, Model) {
+fn load() -> (Db, Model) {
     load_with(false, false)
 }
 
 /// The fixture documented; `dep_for_tests` makes `dep` a dependency of its tests alone.
-fn load_with(no_deps: bool, dep_for_tests: bool) -> (RootDatabase, Model) {
-    let mut db = RootDatabase::with_files(FIXTURE);
+fn load_with(no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
+    let mut db = fixture::db(FIXTURE).into_db();
     let named = |name: &str| {
         Crate::all(&db).into_iter().find(|it| crate::crate_name(&db, *it) == name).expect(name)
     };

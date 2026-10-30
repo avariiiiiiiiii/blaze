@@ -13,7 +13,7 @@ use hir_def::{
     resolver::HasResolver,
 };
 use hir_expand::name::Name;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{
     Answer,
@@ -92,8 +92,7 @@ fn same_pick(a: &Pick<'_>, b: &Pick<'_>) -> bool {
 }
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 
@@ -270,8 +269,8 @@ fn fixtures(text: &'static str) -> Vec<&'static str> {
 fn method_resolution_fixtures_pick_as_the_probe_does() {
     let mut hits = 0;
     let tests = [
-        include_str!("../../../../hir-ide/src/tests/method_resolution.rs"),
-        include_str!("../../../../hir-ide/src/tests/traits.rs"),
+        include_str!("../../../../hir-ty-mir/src/tests/method_resolution.rs"),
+        include_str!("../../../../hir-ty-mir/src/tests/traits.rs"),
     ];
     for text in tests {
         let fixtures = fixtures(text);

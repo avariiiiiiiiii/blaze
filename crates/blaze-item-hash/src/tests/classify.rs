@@ -29,7 +29,7 @@ use hir_ty::{
 };
 use rustc_hash::FxHashMap;
 use rustc_type_ir::fast_reject::SimplifiedType;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use crate::{
     reads::{self, RULES, Rule},
@@ -37,8 +37,7 @@ use crate::{
 };
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 
@@ -503,12 +502,12 @@ impl BodyFacts for Probe {
         values::value(db, fact)
     }
 
-    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId {
-        crate::keys::def_key(db, def)
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
+        crate::keys::def_key(db, body, def)
     }
 
-    fn def_of<'db>(&self, db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>> {
-        crate::keys::def_of(db, key)
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
+        crate::keys::def_of(db, body, key)
     }
 }
 

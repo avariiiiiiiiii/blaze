@@ -25,7 +25,6 @@ wasmtime = { version = "49", default-features = false, features = ["cranelift", 
 base-db.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
-blaze-expand.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
@@ -33,17 +32,17 @@ blaze-usercode.workspace = true
 salsa.workspace = true
 hir-expand.workspace = true
 intern.workspace = true
-load-cargo.workspace = true
+blaze-lower.workspace = true
+# The `proc_macro` of the in-process bridge (`src/native.rs`, `native/proc_macro/`).
+native-proc-macro.workspace = true
 paths.workspace = true
 proc-macro-api.workspace = true
-blaze-store.workspace = true
 span.workspace = true
 stdx.workspace = true
 tt.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-native-proc-macro.workspace = true
 
 [lints]
 workspace = true

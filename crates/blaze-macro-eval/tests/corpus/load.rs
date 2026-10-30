@@ -1,6 +1,6 @@
 //! A fixture workspace in the front end as a build has it: planned by blaze-units' `Plan` over
 //! its files on disk, the registry's sources cargo fetched and this checkout's `library/`;
-//! lowered by `load_cargo::v2::lower`; each build script's run applied from what `blaze build`
+//! lowered by `blaze_lower::lower`; each build script's run applied from what `blaze build`
 //! of the workspace left beside its `OUT_DIR` (blaze's own runs, read as the daemon applies
 //! them); and each proc-macro crate's expanders those `blaze_macro_eval::load` gives, as the
 //! caller wraps them.
@@ -20,7 +20,7 @@ use blaze_units::{
 };
 use blaze_vfs::View;
 use hir_expand::proc_macro::ProcMacro;
-use load_cargo::v2::{Lower, Lowered, Ran};
+use blaze_lower::{Lower, Lowered, Ran};
 
 const LIBRARY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../library");
 
@@ -236,7 +236,7 @@ pub(crate) fn lower(
     let mut db = Database::new(Config { tree: Some(tree.clone()), dir: None, tags: 0 });
     query::register(&mut db);
     let (units, config) = plan(&db, dir, view, cargo_home)?;
-    let mut lowered = load_cargo::v2::lower(Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None })
+    let mut lowered = blaze_lower::lower(Lower { units: &units, config: &config, files: &**tree, root: view, host_cpu: None })
         .map_err(|error| format!("lowering {dir}: {error}"))?;
     for (unit, it) in units.graph.units.iter().enumerate() {
         if it.mode == Mode::RunCustomBuild {

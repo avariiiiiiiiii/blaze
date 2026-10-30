@@ -1,6 +1,6 @@
-//! The hashes a module's own records are made with: its digest, its machine code's key, whether
-//! it keeps state, the answer to a question of a span. Its expansions are kept through
-//! [`blaze_usercode::index`] ([`crate::expand`]).
+//! The hashes a module's own records are made with: its digest, what it was built of, the answer
+//! to a question of a span. Its machine code and verdicts are kept under `blaze_cas::Key`s
+//! ([`crate::code_key`]), its expansions through [`blaze_usercode::index`] ([`crate::expand`]).
 
 use sha2::{Digest as _, Sha256};
 

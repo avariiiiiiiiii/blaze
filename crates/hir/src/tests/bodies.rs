@@ -3,8 +3,8 @@
 //! checks them all again, counting what ran.
 
 use hir_expand::EditionedFileId;
-use hir_ide::{InferBodyId, InferenceResult};
-use test_fixture::WithFixture;
+use hir_ty::{InferBodyId, InferenceResult};
+use hir_expand::fixture;
 
 use super::{TestDB, count, function};
 
@@ -44,7 +44,9 @@ pub fn sibling() -> u32 {
 const BODIES: [&str; 4] = ["main", "reader", "edited", "sibling"];
 
 fn fixture() -> (TestDB, Vec<EditionedFileId>) {
-    let (db, files) = TestDB::with_many_files(FIXTURE);
+    let fx = fixture::db(FIXTURE);
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     check_all(&db);
     (db, files)
 }
@@ -211,7 +213,7 @@ fn a_removed_impl_reinfers_its_reader() {
 
 #[test]
 fn an_edit_of_another_crate_reinfers_no_body() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- minicore: sized
 //- /dep.rs crate:dep library
@@ -227,6 +229,8 @@ fn main() {
 }
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let main = crate::attach_db(&db, || {
         let main = function(&db, "main");
         InferenceResult::of(&db, InferBodyId::DefWithBodyId(main));

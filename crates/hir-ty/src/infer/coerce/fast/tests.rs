@@ -4,7 +4,7 @@ use base_db::{Db, all_crates};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{AssocItemId, DefWithBodyId, LoweringMode, ModuleDefId, nameres::crate_def_map};
 use rustc_type_ir::UintTy;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::super::{AllowTwoPhase, Coerce, HirCoercionDelegate};
 use crate::{
@@ -135,8 +135,7 @@ fn calls() -> u32 {
 ];
 
 fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 

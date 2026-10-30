@@ -9,12 +9,12 @@ use crate::{
 };
 use expect_test::{Expect, expect};
 use la_arena::RawIdx;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::super::*;
 
 fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBodyId) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
@@ -53,7 +53,7 @@ fn round_trip(db: &TestDB, def: DefWithBodyId) {
 }
 
 fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
 
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
@@ -73,14 +73,18 @@ fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect)
 }
 
 fn def_map_at(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
-    let (db, position) = TestDB::with_position(ra_fixture);
+    let fx = fixture::db(ra_fixture);
+    let position = fx.position();
+    let db = fx.into_db();
 
     let module = db.module_at_position(position);
     salsa::plumbing::attach(&db, || module.def_map(&db).dump(&db))
 }
 
 fn check_block_scopes_at(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
-    let (db, position) = TestDB::with_position(ra_fixture);
+    let fx = fixture::db(ra_fixture);
+    let position = fx.position();
+    let db = fx.into_db();
 
     let module = db.module_at_position(position);
     let actual = salsa::plumbing::attach(&db, || format!("{module:#?}"));
@@ -1272,7 +1276,7 @@ fn erased_ast_id_reference(
 
 #[test]
 fn a_bodys_ast_id_is_its_items_as_each_old_copy_gave() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 fn f() {}
 const C: u8 = 0;
@@ -1281,7 +1285,8 @@ enum E { A = 1, B }
 macro_rules! m { () => { fn g() {} }; }
 m!();
 "#,
-    );
+    )
+    .into_db();
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let mut defs: Vec<DefWithBodyId> = Vec::new();
     for (_, module) in def_map.modules(&db) {

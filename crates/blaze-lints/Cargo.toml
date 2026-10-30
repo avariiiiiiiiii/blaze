@@ -41,7 +41,7 @@ blaze-alloc-count.workspace = true
 expect-test.workspace = true
 hir-ty-mir.workspace = true
 hegeltest.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]
 workspace = true

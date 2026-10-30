@@ -9,7 +9,7 @@ use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
     signatures::FunctionSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 use test_utils::extract_annotations;
 
 use crate::{InsideUnsafeBlock, UnsafeLint, UnsafeOp, unsafe_operations, unsafety_check};
@@ -93,7 +93,9 @@ fn operations(db: &TestDB) -> Vec<(EditionedFileId, syntax::TextRange, String)> 
 
 #[track_caller]
 fn check(#[rust_analyzer::rust_fixture] fixture: &str) {
-    let (db, files) = TestDB::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let found = operations(&db);
         for file in files {
@@ -114,7 +116,9 @@ fn check(#[rust_analyzer::rust_fixture] fixture: &str) {
 /// The source of each operation of the one file, in the order the check gives them.
 #[track_caller]
 fn order(#[rust_analyzer::rust_fixture] fixture: &str) -> Vec<String> {
-    let (db, file) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db);
         operations(&db)
@@ -790,7 +794,7 @@ fn borrow(x: NonZero<UnsafeCell<u32>>, y: NonZero<u32>) {
 
 #[test]
 fn operations_for_an_editor() {
-    let (db, file) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 unsafe fn unsf() {}
 
@@ -800,6 +804,8 @@ fn f() {
 }
 "#,
     );
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let text = db.file_text(file.file_id(&db)).text(&db);
         let named_f = |def: &DefWithBodyId| match *def {

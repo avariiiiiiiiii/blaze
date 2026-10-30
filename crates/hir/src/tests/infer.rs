@@ -11,7 +11,7 @@ use hir_def::{
     resolver::ValueNs,
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
-use hir_ide::{
+use hir_ty::{
     CastError, EditionLint, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable,
     UnreachableAt,
     method_resolution::CandidateId,
@@ -22,7 +22,7 @@ use rustc_type_ir::{
     InferTy, TypeVisitableExt as _,
     inherent::{GenericArgs as _, IntoKind as _},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{db::TestDB, function};
 
@@ -55,7 +55,7 @@ fn place() {
 
 #[test]
 fn an_invalid_left_hand_side_names_its_assignment() {
-    let db = TestDB::with_files(ASSIGN);
+    let db = fixture::db(ASSIGN).into_db();
     crate::attach_db(&db, || {
         let (body, result) = infer(&db, "plain");
         let assign = find_expr(&body, |it| matches!(it, Expr::Assignment { .. }));
@@ -166,7 +166,7 @@ fn undecided(db: &TestDB, name: &str) -> Vec<(TypeAnnotationNeeded, Option<Strin
 
 #[test]
 fn an_ambiguous_bound_is_e0283_with_its_goal() {
-    let db = TestDB::with_files(AMBIGUOUS);
+    let db = fixture::db(AMBIGUOUS).into_db();
     crate::attach_db(&db, || {
         // rustc: E0283 "type annotations needed", "cannot satisfy `_: Tr`"; the `T: Sized` of
         // the same variable gives none after it, and writeback none for the variable.
@@ -184,7 +184,7 @@ fn an_ambiguous_bound_is_e0283_with_its_goal() {
 /// of `need()` is required by a bound of `need`.
 #[test]
 fn an_ambiguity_keeps_why_its_goal_was_required() {
-    let db = TestDB::with_files(AMBIGUOUS);
+    let db = fixture::db(AMBIGUOUS).into_db();
     crate::attach_db(&db, || {
         let (_, result) = infer(&db, "ambiguous");
         let DefWithBodyId::FunctionId(need) = function(&db, "need") else {
@@ -207,7 +207,7 @@ fn an_ambiguity_keeps_why_its_goal_was_required() {
 
 #[test]
 fn an_undecided_variable_names_the_parameter_it_was_made_for() {
-    let db = TestDB::with_files(AMBIGUOUS);
+    let db = fixture::db(AMBIGUOUS).into_db();
     crate::attach_db(&db, || {
         // rustc: "cannot infer type of the type parameter `T` declared on the function `need`",
         // and the same of `any`'s `U`, which only its `Sized` bound constrains.
@@ -218,7 +218,7 @@ fn an_undecided_variable_names_the_parameter_it_was_made_for() {
 
 #[test]
 fn a_mismatch_keeps_an_undecided_literal_type() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 fn literal() {
@@ -228,7 +228,8 @@ fn decided() {
     let _x: bool = 1u8;
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let at_error = |name| {
             let (_, result) = infer(&db, name);
@@ -256,7 +257,7 @@ fn decided() {
 
 #[test]
 fn a_mismatch_and_an_unmet_bound_say_why_they_were_required() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, copy
 fn else_branch(c: bool) -> u8 {
@@ -286,7 +287,8 @@ fn bound() {
     needs(S);
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let mismatches = |name| {
             let (_, result) = infer(&db, name);
@@ -360,13 +362,14 @@ fn a_bound_index_finds_its_written_bound() {
 
     use crate::diagnostics::{BoundSource, bound_source};
 
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, copy, clone
 trait Tr {}
 fn need<T: Copy + Tr>(_: T) where T: Clone {}
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let DefWithBodyId::FunctionId(need) = function(&db, "need") else { unreachable!() };
         let need = GenericDefId::FunctionId(need);
@@ -389,13 +392,14 @@ fn need<T: Copy + Tr>(_: T) where T: Clone {}
 /// parameters, in printing order ("consider giving `_x` an explicit type: `[T; N]`").
 #[test]
 fn an_undecided_term_names_each_variable_by_its_parameter() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 fn make<T, const N: usize>() -> [T; N] { loop {} }
 fn undecided() { let _x = make(); }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, result) = infer(&db, "undecided");
         let named = result
@@ -420,7 +424,7 @@ fn undecided() { let _x = make(); }
             })
             .collect();
         assert_eq!(names, ["T", "N"], "both variables of `[T; N]`, the element first");
-        let interner = hir_ide::next_solver::DbInterner::new_no_crate(&db);
+        let interner = hir_ty::next_solver::DbInterner::new_no_crate(&db);
         let named_all = named.named(interner, |_, _| true);
         assert!(!named_all.has_infer() && !named_all.references_error(), "{named_all:?}");
         assert!(named.named(interner, |_, _| false).references_error(), "unnamed is unknown");
@@ -432,13 +436,14 @@ fn undecided() { let _x = make(); }
 /// one has none.
 #[test]
 fn an_undecided_pattern_keeps_its_type_with_every_variable_named() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 fn make<T, U>() -> (T, U) { loop {} }
 fn undecided() { let x = make(); let y = 1u8; }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (body, result) = infer(&db, "undecided");
         let binding = |name: &str| {
@@ -455,7 +460,7 @@ fn undecided() { let x = make(); let y = 1u8; }
         };
         let named = result.named_pat_type(binding("x")).expect("`x` is undecided");
         assert_eq!(named.params.len(), 2, "`T` and `U`, not only the error's own: {named:?}");
-        let interner = hir_ide::next_solver::DbInterner::new_no_crate(&db);
+        let interner = hir_ty::next_solver::DbInterner::new_no_crate(&db);
         let named_all = named.named(interner, |_, _| true);
         assert!(!named_all.has_infer() && !named_all.references_error(), "{named_all:?}");
         assert!(result.named_pat_type(binding("y")).is_none(), "`y` is `u8`");
@@ -466,7 +471,7 @@ fn undecided() { let x = make(); let y = 1u8; }
 /// found `bool`").
 #[test]
 fn a_projection_mismatch_keeps_what_its_alias_normalized_to() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 trait Tr { type A; }
@@ -475,7 +480,8 @@ impl Tr for S { type A = bool; }
 fn need<T: Tr<A = u8>>(_: T) {}
 fn mismatch() { need(S); }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, result) = infer(&db, "mismatch");
         let normalized: Vec<_> = result
@@ -505,7 +511,7 @@ fn mismatch() { need(S); }
             })
             .collect();
         assert!(
-            matches!(impls[..], [Some(hir_ide::next_solver::AnyImplId::ImplId(_))]),
+            matches!(impls[..], [Some(hir_ty::next_solver::AnyImplId::ImplId(_))]),
             "the E0271 names `impl Tr for S`, selected for `S: Tr`, not {impls:?}"
         );
     });
@@ -516,7 +522,7 @@ fn mismatch() { need(S); }
 /// the failed wrap is checked against an error, so no mismatch follows.
 #[test]
 fn an_unsafe_binder_cast_of_a_type_that_is_no_binder_is_an_error() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 fn casts(x: &i32) {
@@ -524,7 +530,8 @@ fn casts(x: &i32) {
     let _ = unsafe { builtin # unwrap_binder(1u8) };
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let (_, result) = infer(&db, "casts");
         let casts: Vec<_> = result
@@ -562,7 +569,7 @@ fn casts(x: &i32) {
 /// `GatherLocalsVisitor`; `tests/ui/unsized-locals/issue-30276.rs`, `issue-50940.rs`).
 #[test]
 fn parameters_return_types_and_bindings_must_be_sized() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 fn sized_param(x: [u8]) {}
@@ -572,7 +579,8 @@ fn sized_ok(x: &[u8]) {}
 fn sized_closure_param() { let _ = |x: [u8]| {}; }
 fn sized_two(x: [u8], s: &str) { let t = *s; }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         use ObligationCauseCode as C;
         assert_eq!(unmet_causes(&db, "sized_param"), [C::SizedArgumentType]);
@@ -589,7 +597,7 @@ fn sized_two(x: [u8], s: &str) { let t = *s; }
 /// `tests/ui/unsized-locals/issue-67981.rs`) nor a local's.
 #[test]
 fn unsized_fn_params_lifts_only_a_fns_parameters() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 //- /main.rs crate:main
@@ -598,7 +606,8 @@ fn unsized_param(x: [u8]) {}
 fn unsized_closure_param() { let _ = |x: [u8]| {}; }
 fn unsized_binding(s: &str) { let t = *s; }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         use ObligationCauseCode as C;
         assert_eq!(unmet_causes(&db, "unsized_param"), []);
@@ -665,7 +674,7 @@ fn in_closure() {
 
 #[test]
 fn an_unlabeled_jump_in_a_labeled_block_is_e0695() {
-    let db = TestDB::with_files(JUMPS);
+    let db = fixture::db(JUMPS).into_db();
     crate::attach_db(&db, || {
         let jumps = |name: &str| -> Vec<bool> {
             let (_, result) = infer(&db, name);
@@ -716,7 +725,7 @@ fn in_closure_in_async() {
 
 #[test]
 fn a_yield_in_an_async_body_is_e0727() {
-    let db = TestDB::with_files(ASYNC_YIELD);
+    let db = fixture::db(ASYNC_YIELD).into_db();
     crate::attach_db(&db, || {
         let count = |name: &str| {
             let (body, result) = infer(&db, name);
@@ -791,7 +800,7 @@ fn question(x: Option<u8>) -> Option<u8> {
 
 #[test]
 fn type_checking_finds_where_a_body_stops_being_reachable() {
-    let db = TestDB::with_files(REACHABLE);
+    let db = fixture::db(REACHABLE).into_db();
     crate::attach_db(&db, || {
         let found = |name: &str| -> (&Body, Vec<Unreachable>) {
             let (body, result) = infer(&db, name);
@@ -888,7 +897,7 @@ fn neg() {
 
 #[test]
 fn an_operator_error_carries_its_unmet_goals() {
-    let db = TestDB::with_files(OPERATORS);
+    let db = fixture::db(OPERATORS).into_db();
     crate::attach_db(&db, || {
         // Each goal as `Trait` and the name of its self type.
         let names = |goals: &[StoredGoal]| -> Vec<(String, String)> {
@@ -969,7 +978,7 @@ fn not() {
 
 #[test]
 fn an_operator_error_keeps_an_undecided_literal_type() {
-    let db = TestDB::with_files(AT_ERROR);
+    let db = fixture::db(AT_ERROR).into_db();
     crate::attach_db(&db, || {
         let types = default_types();
         let fresh_int = TyKind::Infer(InferTy::FreshIntTy(0));
@@ -1029,7 +1038,7 @@ fn fits() {
 
 #[test]
 fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
-    let db = TestDB::with_files(ARGUMENTS);
+    let db = fixture::db(ARGUMENTS).into_db();
     crate::attach_db(&db, || {
         let types = default_types();
         let fresh_int = TyKind::Infer(InferTy::FreshIntTy(0));
@@ -1050,7 +1059,7 @@ fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
                 })
                 .collect::<Vec<_>>()
         };
-        let rows = |args: &hir_ide::CallArguments| {
+        let rows = |args: &hir_ty::CallArguments| {
             (0..args.provided.len()).map(|it| args.compatible_with(it).to_vec()).collect::<Vec<_>>()
         };
 
@@ -1109,7 +1118,7 @@ fn enum_plain() {
 
 #[test]
 fn a_cast_to_a_pointer_of_unknown_kind_is_e0641() {
-    let db = TestDB::with_files(CASTS);
+    let db = fixture::db(CASTS).into_db();
     crate::attach_db(&db, || {
         let errors = |name: &str| -> Vec<CastError> {
             let (_, result) = infer(&db, name);
@@ -1154,7 +1163,7 @@ fn count() {
 
 #[test]
 fn pattern_errors_carry_what_rustc_reports() {
-    let db = TestDB::with_files(PATTERNS);
+    let db = fixture::db(PATTERNS).into_db();
     crate::attach_db(&db, || {
         let ranges = |name: &str| -> Vec<(Option<(TyKind<'_>, bool)>, Option<bool>)> {
             let (_, result) = infer(&db, name);
@@ -1214,7 +1223,7 @@ fn values() {
 
 #[test]
 fn inference_records_the_value_each_path_resolved_to() {
-    let db = TestDB::with_files(VALUES);
+    let db = fixture::db(VALUES).into_db();
     crate::attach_db(&db, || {
         let (body, result) = infer(&db, "values");
         let values: Vec<_> = body
@@ -1255,7 +1264,7 @@ fn bar(arg: private::B) {
 
 #[test]
 fn a_sized_bound_on_a_trait_object_carries_the_pick() {
-    let db = TestDB::with_files(SIZED_BOUND);
+    let db = fixture::db(SIZED_BOUND).into_db();
     crate::attach_db(&db, || {
         let (_, result) = infer(&db, "bar");
         let found: Vec<_> = result
@@ -1311,7 +1320,7 @@ impl S {
 
 #[test]
 fn a_probe_records_the_unstable_items_it_passed_over() {
-    let db = TestDB::with_files(UNSTABLE);
+    let db = fixture::db(UNSTABLE).into_db();
     crate::attach_db(&db, || {
         for name in ["call", "path"] {
             let (body, result) = infer(&db, name);
@@ -1337,7 +1346,7 @@ fn a_probe_records_the_unstable_items_it_passed_over() {
 /// expression, which `unstable_candidate_nodes` lists alone.
 #[test]
 fn a_field_naming_a_method_keeps_its_probe_s_unstable_items() {
-    let db = TestDB::with_files(UNSTABLE);
+    let db = fixture::db(UNSTABLE).into_db();
     crate::attach_db(&db, || {
         let (body, result) = infer(&db, "field");
         let field = find_expr(&body, |it| matches!(it, Expr::Field { .. }));
@@ -1395,7 +1404,7 @@ fn new_call() {
 
 #[test]
 fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
-    let db = TestDB::with_files(EDITIONS);
+    let db = fixture::db(EDITIONS).into_db();
     crate::attach_db(&db, || {
         let lints = |name: &str| -> Vec<InferenceDiagnostic> {
             let (_, result) = infer(&db, name);
@@ -1465,7 +1474,7 @@ fn ident() { nope; }
 
 #[test]
 fn a_path_that_names_nothing_reports_its_first_failing_segment() {
-    let db = TestDB::with_files(UNRESOLVED_PATHS);
+    let db = fixture::db(UNRESOLVED_PATHS).into_db();
     crate::attach_db(&db, || {
         let segments = |name: &str| -> Vec<u32> {
             let (_, result) = infer(&db, name);

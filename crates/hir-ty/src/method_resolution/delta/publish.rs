@@ -1,7 +1,8 @@
 //! The published slices (design §7, §8): one salsa input per (crate, trait), per (crate, head)
-//! and per (crate, name), each with its content and its `ContentId`, set only when the content
-//! changed; the crate's [`SliceDirectory`] for keys a reader asks of before they have a slice;
-//! and the singleton [`ImplSlices`] that finds a crate's directory.
+//! and per (crate, name), each with its content, set only when the content changed, and its
+//! `ContentId` a query over it, asked only by lane item-hash (through the identities it
+//! installs, [`ImplIdentities`]); the crate's [`SliceDirectory`] for keys a reader asks of
+//! before they have a slice; and the singleton [`ImplSlices`] that finds a crate's directory.
 //!
 //! A slice, once made, is kept for the life of the database, emptied rather than dropped, so a
 //! directory gains a key once and never loses it: it changes only when a key is first seen.
@@ -17,7 +18,7 @@ use base_db::{Crate, Db};
 use blaze_dbsp::{Pos, SliceHasher};
 use blaze_ids::{ContentId, Hasher};
 use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def_map};
-use hir_expand::{HirFileId, name::Name};
+use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
 use salsa::Setter;
@@ -27,6 +28,7 @@ use super::head::{Head, HeadDef};
 /// The domain of an impl set's and of a candidate set's hash (design §7).
 pub const IMPL_SET_DOMAIN: &str = "blaze v2 impl set 1";
 pub const CANDIDATE_SET_DOMAIN: &str = "blaze v2 candidate set 1";
+#[cfg(test)]
 const IDENTITY_DOMAIN: &str = "blaze v2 impl identity 1";
 
 /// One crate's impls of one trait, by the module that holds each: what the module's own scope
@@ -65,8 +67,6 @@ pub struct TraitImplsSlice {
     pub trait_: TraitId,
     #[returns(ref)]
     pub rows: TraitRows,
-    #[returns(copy)]
-    pub hash: ContentId,
 }
 
 #[salsa::input(debug)]
@@ -77,8 +77,6 @@ pub struct InherentSlice {
     pub head: Head,
     #[returns(ref)]
     pub rows: InherentRows,
-    #[returns(copy)]
-    pub hash: ContentId,
 }
 
 #[salsa::input(debug)]
@@ -89,8 +87,6 @@ pub struct CandidateSlice {
     pub name: Name,
     #[returns(ref)]
     pub rows: CandidateRows,
-    #[returns(copy)]
-    pub hash: ContentId,
 }
 
 /// Every key of one crate that has a slice, and the modules whose bodies hold any inherent
@@ -157,7 +153,7 @@ fn empty_hash(domain: &'static str) -> ContentId {
 /// by [`super::read::body_impl_set_hash`], which this folds in.
 pub fn impl_set_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
     let own = match trait_slice(db, krate, trait_) {
-        Some(slice) => slice.hash(db),
+        Some(slice) => trait_slice_hash(db, slice),
         None => empty_hash(IMPL_SET_DOMAIN),
     };
     let bodies = super::read::body_impl_set_hash(db, krate, trait_);
@@ -171,55 +167,83 @@ pub fn impl_set_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
 /// `krate`'s modules with an associated item of that name.
 pub fn candidate_set_hash(db: &Db, krate: Crate, name: Name) -> ContentId {
     match candidate_slice(db, krate, name) {
-        Some(slice) => slice.hash(db),
+        Some(slice) => candidate_slice_hash(db, slice),
         None => empty_hash(CANDIDATE_SET_DOMAIN),
     }
 }
 
-/// An impl's identity inside the hashes: its `ImplLoc` content, which is its crate's content,
-/// the names of the modules from the crate root to its container, and its file AST ID with
-/// the chain of macro calls its file comes from. Lane item-hash takes this over with its stable
-/// item identity, here and nowhere else.
+/// How the hashes name an impl and the def of a head (design §7): lane item-hash's stable
+/// identities, which `blaze-item-hash` installs once per database ([`install_identities`]),
+/// since hir-ty cannot depend on it. Each must give an item the same identity in every
+/// database, under any renaming of the modules around it, and a different one when anything a
+/// trait solver reads of it changes (an impl's generics, where clauses and associated values).
+/// No hash is asked of a database without them: a location names no content, so it is no
+/// identity.
+#[salsa::input(singleton, debug)]
+pub struct ImplIdentities {
+    #[returns(copy)]
+    pub impl_: fn(&Db, ImplId) -> ContentId,
+    #[returns(copy)]
+    pub def: fn(&Db, HeadDef) -> ContentId,
+}
+
+/// Installs the identities the hashes name impls and head defs by, or replaces them.
+pub fn install_identities(
+    db: &mut Db,
+    impl_: fn(&Db, ImplId) -> ContentId,
+    def: fn(&Db, HeadDef) -> ContentId,
+) {
+    match ImplIdentities::try_get(&*db) {
+        Some(it) => {
+            it.set_impl_(db).to(impl_);
+            it.set_def(db).to(def);
+        }
+        None => _ = ImplIdentities::new(&*db, impl_, def),
+    }
+}
+
+fn identities(db: &Db) -> ImplIdentities {
+    ImplIdentities::try_get(db).unwrap_or_else(|| {
+        panic!(
+            "impls: an impl-set or candidate-set hash was asked of a database with no impl \
+             identities installed: `blaze-item-hash` installs them \
+             (`method_resolution::delta::install_identities`)"
+        )
+    })
+}
+
+/// An impl's identity inside the hashes: the installed one ([`ImplIdentities`]).
 pub fn impl_identity(db: &Db, imp: ImplId) -> ContentId {
-    let loc = imp.loc(db);
-    let mut hasher = Hasher::new(IDENTITY_DOMAIN);
-    hasher.part(b"impl");
-    item_identity(db, &mut hasher, loc.container, loc.id.file_id, loc.id.value.erase().into_raw());
-    hasher.finish()
+    (identities(db).impl_(db))(db, imp)
 }
 
-/// An item's `ItemLoc` content into `hasher`: crate, module path, file and AST ID.
-fn item_identity(db: &Db, hasher: &mut Hasher, container: ModuleId, file: HirFileId, ast: u32) {
-    hasher.id(&container.krate(db).content(db));
-    let mut module = Some(container);
-    while let Some(at) = module {
-        match at.name(db) {
-            Some(name) => hasher.part(name.as_str().as_bytes()),
-            None if at.block(db).is_some() => hasher.part(b"{block}"),
-            None => hasher.part(b"{root}"),
-        };
-        module = at.containing_module(db);
+/// A head def's identity inside the hashes: the installed one ([`ImplIdentities`]).
+fn def_identity(db: &Db, def: HeadDef) -> ContentId {
+    (identities(db).def(db))(db, def)
+}
+
+/// The identities the tests install: an item's `ItemLoc` content (its crate's content, the
+/// names of the modules from the crate root to its container, its file AST ID and the chain of
+/// macro calls its file comes from), which is the same for the same text in two databases.
+#[cfg(test)]
+pub(crate) mod location {
+    use base_db::Db;
+    use blaze_ids::{ContentId, Hasher};
+    use hir_def::{ImplId, ModuleId};
+    use hir_expand::HirFileId;
+
+    use super::{HeadDef, IDENTITY_DOMAIN};
+
+    pub(crate) fn impl_identity(db: &Db, imp: ImplId) -> ContentId {
+        let loc = imp.loc(db);
+        let mut hasher = Hasher::new(IDENTITY_DOMAIN);
+        hasher.part(b"impl");
+        let ast = loc.id.value.erase().into_raw();
+        item_identity(db, &mut hasher, loc.container, loc.id.file_id, ast);
+        hasher.finish()
     }
-    hasher.update(&ast.to_le_bytes());
-    let mut file = file;
-    while let Some(call) = file.macro_file() {
-        let kind = &call.loc(db).kind;
-        hasher.part(b"macro").update(&kind.erased_ast_id().into_raw().to_le_bytes());
-        file = kind.file_id();
-    }
-}
 
-/// A built-in derive impl's identity inside the hashes: its derive and its index among its
-/// ADT's derives (the ADT is its row's head).
-pub(super) fn derive_identity(db: &Db, hasher: &mut Hasher, imp: BuiltinDeriveImplId) {
-    let loc = imp.loc(db);
-    hasher.part(loc.trait_.name().as_str().as_bytes());
-    hasher.update(&loc.derive_index.to_le_bytes());
-}
-
-/// A head's identity inside the hashes: its variant, its numbers, and its def's `ItemLoc`.
-pub(super) fn head_identity(db: &Db, hasher: &mut Hasher, head: Head) {
-    let def = |hasher: &mut Hasher, def: HeadDef| {
+    pub(crate) fn def_identity(db: &Db, def: HeadDef) -> ContentId {
         let (tag, container, file, ast) = match def {
             HeadDef::Adt(it) => {
                 let (container, id) = match it {
@@ -250,8 +274,45 @@ pub(super) fn head_identity(db: &Db, hasher: &mut Hasher, head: Head) {
                 (b"alias".as_slice(), it.module(db), loc.id.file_id, ast)
             }
         };
+        let mut hasher = Hasher::new(IDENTITY_DOMAIN);
         hasher.part(tag);
-        item_identity(db, hasher, container, file, ast);
+        item_identity(db, &mut hasher, container, file, ast);
+        hasher.finish()
+    }
+
+    fn item_identity(db: &Db, hasher: &mut Hasher, container: ModuleId, file: HirFileId, ast: u32) {
+        hasher.id(&container.krate(db).content(db));
+        let mut module = Some(container);
+        while let Some(at) = module {
+            match at.name(db) {
+                Some(name) => hasher.part(name.as_str().as_bytes()),
+                None if at.block(db).is_some() => hasher.part(b"{block}"),
+                None => hasher.part(b"{root}"),
+            };
+            module = at.containing_module(db);
+        }
+        hasher.update(&ast.to_le_bytes());
+        let mut file = file;
+        while let Some(call) = file.macro_file() {
+            let kind = &call.loc(db).kind;
+            hasher.part(b"macro").update(&kind.erased_ast_id().into_raw().to_le_bytes());
+            file = kind.file_id();
+        }
+    }
+}
+
+/// A built-in derive impl's identity inside the hashes: its derive and its index among its
+/// ADT's derives (the ADT is its row's head).
+pub(super) fn derive_identity(db: &Db, hasher: &mut Hasher, imp: BuiltinDeriveImplId) {
+    let loc = imp.loc(db);
+    hasher.part(loc.trait_.name().as_str().as_bytes());
+    hasher.update(&loc.derive_index.to_le_bytes());
+}
+
+/// A head's identity inside the hashes: its variant, its numbers, and its def's identity.
+pub(super) fn head_identity(db: &Db, hasher: &mut Hasher, head: Head) {
+    let def = |hasher: &mut Hasher, def: HeadDef| {
+        hasher.id(&def_identity(db, def));
     };
     let tag: u8 = match head {
         S::Bool => 0,
@@ -349,6 +410,22 @@ pub(crate) fn inherent_rows_hash(db: &Db, head: Head, rows: &InherentRows) -> Co
     hasher.finish()
 }
 
+/// The hash of a trait slice's rows ([`trait_rows_hash`]), asked by lane item-hash alone.
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn trait_slice_hash(db: &Db, slice: TraitImplsSlice) -> ContentId {
+    trait_rows_hash(db, slice.trait_(db), slice.rows(db))
+}
+
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn inherent_slice_hash(db: &Db, slice: InherentSlice) -> ContentId {
+    inherent_rows_hash(db, slice.head(db), slice.rows(db))
+}
+
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn candidate_slice_hash(db: &Db, slice: CandidateSlice) -> ContentId {
+    candidate_rows_hash(db, slice.name(db), slice.rows(db))
+}
+
 pub(crate) fn candidate_rows_hash(db: &Db, name: Name, rows: &CandidateRows) -> ContentId {
     let mut hasher = Hasher::new(CANDIDATE_SET_DOMAIN);
     hasher.part(name.as_str().as_bytes());
@@ -389,13 +466,10 @@ impl Published {
                 if *slice.rows(&*db) == rows {
                     return false;
                 }
-                let hash = trait_rows_hash(&*db, trait_, &rows);
                 slice.set_rows(db).to(rows);
-                slice.set_hash(db).to(hash);
             }
             None => {
-                let hash = trait_rows_hash(&*db, trait_, &rows);
-                let slice = TraitImplsSlice::new(&*db, krate, trait_, rows, hash);
+                let slice = TraitImplsSlice::new(&*db, krate, trait_, rows);
                 self.traits.insert(trait_, slice);
                 self.new_traits = true;
             }
@@ -415,13 +489,10 @@ impl Published {
                 if *slice.rows(&*db) == rows {
                     return false;
                 }
-                let hash = inherent_rows_hash(&*db, head, &rows);
                 slice.set_rows(db).to(rows);
-                slice.set_hash(db).to(hash);
             }
             None => {
-                let hash = inherent_rows_hash(&*db, head, &rows);
-                let slice = InherentSlice::new(&*db, krate, head, rows, hash);
+                let slice = InherentSlice::new(&*db, krate, head, rows);
                 self.heads.insert(head, slice);
                 self.new_heads = true;
             }
@@ -441,13 +512,10 @@ impl Published {
                 if *slice.rows(&*db) == rows {
                     return false;
                 }
-                let hash = candidate_rows_hash(&*db, name, &rows);
                 slice.set_rows(db).to(rows);
-                slice.set_hash(db).to(hash);
             }
             None => {
-                let hash = candidate_rows_hash(&*db, name, &rows);
-                let slice = CandidateSlice::new(&*db, krate, name, rows, hash);
+                let slice = CandidateSlice::new(&*db, krate, name, rows);
                 self.names.insert(name, slice);
                 self.new_names = true;
             }

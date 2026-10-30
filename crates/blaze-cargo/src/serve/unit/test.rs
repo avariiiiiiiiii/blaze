@@ -38,7 +38,7 @@ use blaze_usercode::test::{
     Reported, ShouldPanic, Suite, Wanted, select,
 };
 use blaze_units::schema::{Mode, Unit};
-use load_cargo::v2::Db;
+use blaze_lower::Db;
 
 use super::{Job, Real, UnitReader, UnitWriter, compile::TestOf, graph::flag, package_of};
 use crate::serve::work::{Failed, Runs, Selection};

@@ -6,14 +6,16 @@ usage: store.py [--backends cranelift,llvm]
 Issue #418: smoke-1/c16 differed only with BLAZE_CACHE set. Two asm! wrappers can have
 identical Cranelift IR but different assembly, so LLVM must key its code by the assembly too
 (2a3a0a35). Compile one body, change only its assembly, then read each body back from the
-store. The smoke seeds also run twice, first filling a fresh store and then reading it.
+store. The smoke programs (`runs.smoke_programs`) are built three times: with no store, into a
+fresh store and from the store that filled. Every build with a store has to run as the one
+without does, and leave no function out.
 BLAZE_BIN names the compiler under test. A failure keeps its work and logs.
 """
-import argparse, os, shutil, subprocess, sys, tempfile
+import argparse, os, shutil, tempfile
 
-from fuzz import BACKENDS, Project
+from runs import BACKENDS, Project, differences, smoke_programs
+import gen
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 ASM = """    #[cfg(target_arch = "x86_64")]
     #[inline(never)]
     fn transform(mut x: u64, mut y: u64) -> u64 {
@@ -39,23 +41,51 @@ ASSEMBLY = {
 }
 
 
+def held(project, what, text, edition, backend, plain, store):
+    """Builds `text` with the store and holds its run to `plain`, the run of the build without one."""
+    got = project.build(text, edition, backend, store)
+    findings = differences(plain, got)
+    left = project.left()
+    if findings or left:
+        raise SystemExit(f"{what} ({backend}):\n" + "\n".join(f.detail for f in findings)
+                         + "".join(f"\nleft out: {it}" for it in left[:10]))
+
+
+def unstored(project, what, text, edition, backend):
+    """The run of the build of `text` without a store, which has to exit 0."""
+    plain = project.build(text, edition, backend)
+    if plain is None:
+        raise SystemExit(f"{what}: cargo turned the source down when asked for its link line")
+    if plain[0] != 0:
+        raise SystemExit(f"{what} ({backend}) without a store: status {plain[0]}\n{plain[2][-2000:]}")
+    return plain
+
+
 def asm_changes(work, backend):
     """One IR with two different asm! bodies, each compiled and restored in a new process."""
-    os.environ["BLAZE_CACHE"] = os.path.join(work, "asm-store")
+    store = os.path.join(work, "asm-store")
     project = Project(os.path.join(work, "asm"))
     for step, body in enumerate(("add", "negate", "add", "negate")):
         x86, arm = ASSEMBLY[body]
-        lines = ASM.replace("X86", x86).replace("ARM", arm).splitlines()
-        rejected = project.reference([("c16", lines)], "2021")
-        if rejected is not None:
-            raise SystemExit(rejected)
-        findings, _ = project.blaze(backend)
+        text = gen.render([("c16", ASM.replace("X86", x86).replace("ARM", arm).splitlines())])
+        what = f"asm {step} {body}"
+        plain = unstored(project, what, text, "2021", backend)
+        held(project, what, text, "2021", backend, plain, store)
         shutil.copyfile(os.path.join(project.fx.work, "fz.stderr"),
                         os.path.join(work, f"asm-{step}-{body}.stderr"))
-        if findings:
-            raise SystemExit(f"asm {step} {body} ({backend}):\n" +
-                             "\n".join(f.detail for f in findings))
         print(f"MATCH asm {step} {body} ({backend})", flush=True)
+    shutil.rmtree(project.fx.work)
+
+
+def smoke(work, backend):
+    """The smoke programs with no store, into an empty one, and from the one that filled."""
+    store = os.path.join(work, "smoke-store")
+    project = Project(os.path.join(work, "smoke"))
+    for seed, text, edition in smoke_programs():
+        plain = unstored(project, seed, text, edition, backend)
+        for phase in ("cold", "warm"):
+            held(project, f"{seed} {phase}", text, edition, backend, plain, store)
+            print(f"MATCH {seed} {phase} ({backend})", flush=True)
     shutil.rmtree(project.fx.work)
 
 
@@ -73,15 +103,7 @@ def main():
         own = os.path.join(work, backend)
         os.environ["BLAZE_HOME"] = os.path.join(own, "home")
         asm_changes(own, backend)
-        os.environ["BLAZE_CACHE"] = os.path.join(own, "smoke-store")
-        for phase in ("cold", "warm"):
-            print(f"smoke {phase} ({backend})", flush=True)
-            command = [sys.executable, os.path.join(HERE, "fuzz.py"), "smoke", "--backends", backend,
-                       "--reduce", "0", "--work", os.path.join(own, "smoke"),
-                       "--out", os.path.join(own, f"smoke-{phase}")]
-            status = subprocess.run(command).returncode
-            if status:
-                raise SystemExit(status)
+        smoke(own, backend)
     shutil.rmtree(work)
 
 

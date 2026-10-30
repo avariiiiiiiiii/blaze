@@ -12,7 +12,7 @@ use hir_def::{
     src::use_tree_sources_view,
 };
 use hir_expand::InFile;
-use hir_ide::{
+use hir_ty::{
     inhabitedness::is_ty_uninhabited_from,
     next_solver::{DbInterner, EarlyBinder, StoredTy, TypingMode, infer::DbInternerInferExt as _},
 };

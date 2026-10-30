@@ -9,7 +9,7 @@ use hir_ty_mir::mir::{
     MirSpan,
     const_check::{ClosureNote, ConstCheckDiagnostic, ConstCheckKind, Desugaring, const_check},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{constant, db::TestDB, function};
 
@@ -21,7 +21,9 @@ fn check(
     src: &str,
     pick: impl FnOnce(&TestDB) -> DefWithBodyId,
 ) -> Vec<(ConstCheckDiagnostic, String)> {
-    let (db, _) = TestDB::with_single_file(&format!("//- minicore: {minicore}\n{src}"));
+    let fx = fixture::db(&format!("//- minicore: {minicore}\n{src}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let def = pick(&db);
         let (_, map) = Body::with_source_map(&db, def);
@@ -54,7 +56,7 @@ fn func(name: &'static str) -> impl FnOnce(&TestDB) -> DefWithBodyId {
 /// The method `name` of the one `impl` of the fixture.
 fn impl_method(name: &'static str) -> impl FnOnce(&TestDB) -> DefWithBodyId {
     move |db| {
-        let impls = hir_def::test_items::impls(db, db.test_crate());
+        let impls = hir_def::test_items::impls(db, fixture::test_crate(&db));
         let [impl_] = impls[..] else { panic!("{} impls in the fixture", impls.len()) };
         let found = impl_.impl_items(db).items.iter().find_map(|(it, item)| match item {
             AssocItemId::FunctionId(func) if it.as_str() == name => Some(*func),
@@ -217,7 +219,7 @@ mod Y {
 static foo: &Y::X = &*Y::foo(Y::x as *const Y::X);
 ";
     let found =
-        check("sized", src, |db| hir_def::test_items::static_item(db, db.test_crate(), "foo").into());
+        check("sized", src, |db| hir_def::test_items::static_item(db, fixture::test_crate(&db), "foo").into());
     assert_eq!(
         reported(&found),
         [(

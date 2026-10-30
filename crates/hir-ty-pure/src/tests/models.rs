@@ -14,7 +14,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use hir_ty::{db::HirDatabase, next_solver::TyKind};
 use rustc_type_ir::inherent::IntoKind;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::fixture::{TOOLCHAIN, crate_named, db_with, lang_crate};
 use crate::{
@@ -212,7 +212,7 @@ fn strerror_r_is_fixed_error_text() {
 
 #[test]
 fn unwrap_and_expect_failures_are_panics() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- /core.rs crate:core
 pub mod result {
@@ -230,7 +230,8 @@ pub mod option {
     }
 }
 "#,
-    );
+    )
+    .into_db();
     hir_ty::attach_db(&db, || {
         let core = lang_crate(&db, LangCrateOrigin::Core);
         for path in [&["result", "unwrap_failed"][..], &["option", "unwrap_failed"], &["option", "expect_failed"]] {
@@ -248,7 +249,7 @@ fn only_the_toolchain_has_models() {
         assert_eq!(model_of(&db, free(&db, script, &["main"])), None);
     });
     // A crate named `std` that is not the toolchain's.
-    let db = Db::with_files(
+    let db = fixture::db(
         "
 //- minicore: sized
 //- /std.rs crate:r#std
@@ -259,7 +260,8 @@ pub mod io {
     pub fn _print() {}
 }
 ",
-    );
+    )
+    .into_db();
     hir_ty::attach_db(&db, || {
         let std = crate_named(&db, "std");
         assert!(matches!(std.data(&db).origin, CrateOrigin::Local { .. }));
@@ -311,7 +313,7 @@ fn a_platform_entry_must_resolve_on_its_platform() {
         "//- /std.rs crate:std deps:alloc",
         "//- /std.rs crate:std deps:alloc cfg:target_family=windows",
     );
-    let db = Db::with_files(&format!("{windows}{SCRIPT}"));
+    let db = fixture::db(&format!("{windows}{SCRIPT}")).into_db();
     hir_ty::attach_db(&db, || {
         let std = lang_crate(&db, LangCrateOrigin::Std);
         let missing = check_resolved(&db, std);

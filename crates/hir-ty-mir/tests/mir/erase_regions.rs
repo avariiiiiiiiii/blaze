@@ -7,9 +7,9 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::erase_and_anonymize_regions;
 use rustc_type_ir::{Interner, TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 const TYPES: &str = r#"
 //- minicore: sized, fn
@@ -69,7 +69,9 @@ fn type_id_reference<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 
 #[test]
 fn erasing_and_anonymizing_is_what_both_folders_did() {
-    let (db, _) = TestDB::with_single_file(TYPES);
+    let fx = fixture::db(TYPES);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let interner = DbInterner::new_no_crate(&db);
         let func = function(&db, "types");

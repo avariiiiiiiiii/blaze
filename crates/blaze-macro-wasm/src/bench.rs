@@ -131,15 +131,13 @@ pub fn command(args: impl Iterator<Item = String>) -> Result<(), String> {
         mixed_site: call_site,
     };
 
-    // Compiled machine code belongs to this build; expansion outputs are not cached.
-    blaze_store::compiles_against("blaze-engine proc-macro-wasm");
-    let code = args.store.as_deref().map(blaze_store::Store::open_at).transpose();
-    // alloc: the message of a store that can't be opened.
-    let code = code.map_err(|e| e.to_string())?;
+    // Machine code is kept in the store under `--store`; expansion outputs are not cached.
+    let mut driven = args.store.as_deref().map(blaze_cas::Driven::open).transpose()?;
+    let code = driven.as_mut().map(blaze_cas::Driven::handle);
     let wasm = Wasm::at(&args.module, code.as_ref())?;
     println!("wasm compile: {}", Ms(wasm.compiled_in));
-    if let Some(code) = &code {
-        code.flush();
+    if let Some(driven) = &mut driven {
+        driven.flush()?;
     }
     let macros = wasm.macros()?;
     let index = macros.iter().position(|it| it.name == name).ok_or_else(|| {

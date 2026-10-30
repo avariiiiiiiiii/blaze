@@ -48,11 +48,18 @@ hir-ty.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true
+const-ast = { workspace = true, features = ["source"] }
+parser.workspace = true
+syntax-bridge.workspace = true
 
 [dev-dependencies]
+cov-mark = "2.0.0"
+expect-test.workspace = true
 blaze-alloc-count.workspace = true
+blaze-units = { workspace = true, features = ["query"] }
 hir.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
+test-utils.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

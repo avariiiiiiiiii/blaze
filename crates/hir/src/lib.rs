@@ -26,7 +26,6 @@ extern crate rustc_type_ir;
 mod attrs;
 mod body_analysis;
 mod from_id;
-mod has_source;
 mod match_lints;
 mod semantics;
 mod source_analyzer;
@@ -35,8 +34,6 @@ pub mod check;
 pub mod db;
 pub mod diagnostics;
 pub mod evict;
-pub mod symbols;
-pub mod term_search;
 
 mod display;
 mod scratch;
@@ -90,7 +87,7 @@ use hir_def::{
     visibility::visibility_from_ast_view,
 };
 use hir_expand::{builtin::BuiltinDeriveExpander, proc_macro::ProcMacroKind};
-use hir_ide::{
+use hir_ty::{
     GenericPredicates, InferBodyId, InferenceResult, ParamEnvAndCrate, TyDefId, ValueTyDefId,
     all_super_traits, autoderef, check_orphan_rules,
     consteval::try_const_usize,
@@ -98,14 +95,12 @@ use hir_ide::{
         AnonConstId, InternedClosure, InternedClosureId, InternedCoroutineClosureId,
         InternedCoroutineId,
     },
-    direct_super_traits, known_const_to_ast,
+    direct_super_traits,
     layout::{
         InternedLayout, Layout as TyLayout, RustcEnumVariantIdx, RustcFieldIdx, TagEncoding,
         intern_layout,
     },
     method_resolution::{self, InherentImpls, MethodResolutionContext, TraitSet, TraitsInScope},
-    mir::interpret_mir,
-    mir_pretty::{MirBodyPretty as _, MirEvalErrorPretty as _},
     next_solver::{
         AliasTy, AnyImplId, ClauseKind, DbInterner, EarlyBinder, ErrorGuaranteed, FnSig,
         GenericArg, GenericArgs, ParamEnv, PolyFnSig, Region, RegionExt as _, SolverDefId, Ty,
@@ -113,6 +108,10 @@ use hir_ide::{
         infer::{DbInternerInferExt, InferCtxt},
     },
     traits::{self, structurally_normalize_ty},
+};
+use hir_ty_mir::{
+    mir::interpret_mir,
+    mir_pretty::{MirBodyPretty as _, MirEvalErrorPretty as _},
 };
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -123,7 +122,7 @@ use rustc_type_ir::{
 use span::{AstIdNode, Edition, FileId};
 use stdx::{format_to, impl_from, never};
 use syntax::{
-    AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange, ToSmolStr,
+    AstNode, AstPtr, SmolStr, SyntaxNode, TextRange, ToSmolStr,
     ast::{self, HasName as _},
     format_smolstr,
     view::{HasName as _, HasVisibility as _},
@@ -167,14 +166,13 @@ pub use crate::{
     attrs::{AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     body_analysis::BodyAnalysis,
     diagnostics::*,
-    has_source::HasSource,
     match_lints::{
         BindingOrigin, BindingWithVariantName, ConstPatternError, IrrefutableLet, LetSource,
         ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
         UnreachablePattern,
     },
     semantics::{
-        LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
+        LintAttr, PathResolution, PathResolutionPerNs, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,
         view::{self, FieldSourceView, LocalSourceView, ModuleSourceView},
     },
@@ -229,23 +227,23 @@ pub use {
         tt,
     },
     // FIXME: Properly encapsulate mir
-    hir_ide::mir,
-    hir_ide::{
+    hir_ty_mir::mir,
+    hir_ty_mir::{const_macro, mir_pretty::ConstEvalErrorPretty},
+    hir_ty::{
         CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db,
-        attach_db_allow_change, const_macro,
+        attach_db_allow_change,
         consteval::ConstEvalError,
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError},
         drop::DropGlue,
         dyn_compatibility::{DynCompatibilityViolation, MethodViolationCode},
         layout::LayoutError,
         mir::{MirEvalError, MirLowerError},
-        mir_pretty::ConstEvalErrorPretty,
         next_solver::abi::Safety,
         next_solver::clear_tls_solver_cache,
         setup_tracing,
     },
     // FIXME: These are needed for import assets, properly encapsulate them.
-    hir_ide::{method_resolution::TraitImpls, next_solver::SimplifiedType},
+    hir_ty::{method_resolution::TraitImpls, next_solver::SimplifiedType},
     hir_ty_wfcheck::SignatureMismatchAt,
     intern::{Symbol, sym},
 };
@@ -259,7 +257,7 @@ use {
         name::AsName,
         span_map::{ExpansionSpanMap, RealSpanMap, SpanMap},
     },
-    hir_ide::next_solver,
+    hir_ty::next_solver,
 };
 
 /// hir::Crate describes a single crate. It's the main interface with which
@@ -1387,7 +1385,7 @@ impl Adt {
     /// type has an error.
     pub fn unused_params(self, db: &Db) -> Vec<GenericParam> {
         // alloc: error path, non-empty only when E0392 is reported
-        hir_ide::adt_unused_params(db, self.into()).into_iter().map(GenericParam::from).collect()
+        hir_ty::adt_unused_params(db, self.into()).into_iter().map(GenericParam::from).collect()
     }
 }
 
@@ -2026,30 +2024,30 @@ impl Function {
         let (target_features, target_feature_is_safe_in_target) = caller
             .map(|caller| {
                 let target_features = match caller.id {
-                    AnyFunctionId::FunctionId(id) => hir_ide::TargetFeatures::from_fn(db, id),
+                    AnyFunctionId::FunctionId(id) => hir_ty::TargetFeatures::from_fn(db, id),
                     AnyFunctionId::BuiltinDeriveImplMethod { .. } => {
-                        hir_ide::TargetFeatures::default()
+                        hir_ty::TargetFeatures::default()
                     }
                 };
                 let target_feature_is_safe_in_target =
                     match &caller.krate(db).id.workspace_data(db).target {
-                        Ok(target) => hir_ide::target_feature_is_safe_in_target(target),
-                        Err(_) => hir_ide::TargetFeatureIsSafeInTarget::No,
+                        Ok(target) => hir_ty::target_feature_is_safe_in_target(target),
+                        Err(_) => hir_ty::TargetFeatureIsSafeInTarget::No,
                     };
                 (target_features, target_feature_is_safe_in_target)
             })
             .unwrap_or_else(|| {
-                (hir_ide::TargetFeatures::default(), hir_ide::TargetFeatureIsSafeInTarget::No)
+                (hir_ty::TargetFeatures::default(), hir_ty::TargetFeatureIsSafeInTarget::No)
             });
         matches!(
-            hir_ide::is_fn_unsafe_to_call(
+            hir_ty::is_fn_unsafe_to_call(
                 db,
                 id,
                 &target_features,
                 call_edition,
                 target_feature_is_safe_in_target
             ),
-            hir_ide::Unsafety::Unsafe
+            hir_ty::Unsafety::Unsafe
         )
     }
 
@@ -2119,7 +2117,7 @@ impl Function {
     }
 }
 
-// Note: logically, this belongs to `hir_ide`, but we are not using it there yet.
+// Note: logically, this belongs to `hir_ty`, but we are not using it there yet.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Shared,
@@ -2127,11 +2125,11 @@ pub enum Access {
     Owned,
 }
 
-impl From<hir_ide::next_solver::Mutability> for Access {
-    fn from(mutability: hir_ide::next_solver::Mutability) -> Access {
+impl From<hir_ty::next_solver::Mutability> for Access {
+    fn from(mutability: hir_ty::next_solver::Mutability) -> Access {
         match mutability {
-            hir_ide::next_solver::Mutability::Not => Access::Shared,
-            hir_ide::next_solver::Mutability::Mut => Access::Exclusive,
+            hir_ty::next_solver::Mutability::Not => Access::Shared,
+            hir_ty::next_solver::Mutability::Mut => Access::Exclusive,
         }
     }
 }
@@ -2372,7 +2370,7 @@ impl HasVisibility for Const {
 
 pub struct EvaluatedConst<'db> {
     def: InferBodyId<'db>,
-    allocation: hir_ide::next_solver::Allocation<'db>,
+    allocation: hir_ty::next_solver::Allocation<'db>,
     ty: Ty<'db>,
 }
 
@@ -2533,7 +2531,7 @@ impl Trait {
     }
 
     pub fn dyn_compatibility(&self, db: &Db) -> Option<DynCompatibilityViolation> {
-        hir_ide::dyn_compatibility::dyn_compatibility(db, self.id)
+        hir_ty::dyn_compatibility::dyn_compatibility(db, self.id)
     }
 
     pub fn dyn_compatibility_all_violations(
@@ -2541,7 +2539,7 @@ impl Trait {
         db: &Db,
     ) -> Option<Vec<DynCompatibilityViolation>> {
         let mut violations = vec![]; // alloc: error path, filled only with violations
-        _ = hir_ide::dyn_compatibility::dyn_compatibility_with_callback(
+        _ = hir_ty::dyn_compatibility::dyn_compatibility_with_callback(
             db,
             self.id,
             &mut |violation| {
@@ -2655,7 +2653,7 @@ impl BuiltinType {
 
     pub fn i32() -> BuiltinType {
         BuiltinType {
-            inner: hir_def::builtin_type::BuiltinType::Int(hir_ide::primitive::BuiltinInt::I32),
+            inner: hir_def::builtin_type::BuiltinType::Int(hir_ty::primitive::BuiltinInt::I32),
         }
     }
 
@@ -3469,62 +3467,7 @@ pub struct Local<'db> {
     pub(crate) binding_id: BindingId,
 }
 
-pub struct LocalSource<'db> {
-    pub local: Local<'db>,
-    pub source: InFile<Either<ast::IdentPat, ast::SelfParam>>,
-}
-
-impl<'db> LocalSource<'db> {
-    pub fn as_ident_pat(&self) -> Option<&ast::IdentPat> {
-        match &self.source.value {
-            Either::Left(it) => Some(it),
-            Either::Right(_) => None,
-        }
-    }
-
-    pub fn into_ident_pat(self) -> Option<ast::IdentPat> {
-        match self.source.value {
-            Either::Left(it) => Some(it),
-            Either::Right(_) => None,
-        }
-    }
-
-    pub fn original_file(&self, db: &Db) -> EditionedFileId {
-        self.source.file_id.original_file(db)
-    }
-
-    pub fn file(&self) -> HirFileId {
-        self.source.file_id
-    }
-
-    pub fn name(&self) -> Option<InFile<ast::Name>> {
-        self.source.as_ref().map(|it| it.name()).transpose()
-    }
-
-    pub fn syntax(&self) -> &SyntaxNode {
-        self.source.value.syntax()
-    }
-
-    pub fn syntax_ptr(self) -> InFile<SyntaxNodePtr> {
-        self.source.map(|it| SyntaxNodePtr::new(it.syntax()))
-    }
-}
-
 impl<'db> Local<'db> {
-    pub fn is_param(self, db: &Db) -> bool {
-        // FIXME: This parses!
-        let src = self.primary_source(db);
-        match src.source.value {
-            Either::Left(pat) => pat
-                .syntax()
-                .ancestors()
-                .map(|it| it.kind())
-                .take_while(|&kind| ast::Pat::can_cast(kind) || ast::Param::can_cast(kind))
-                .any(ast::Param::can_cast),
-            Either::Right(_) => true,
-        }
-    }
-
     pub fn as_self_param(self, db: &Db) -> Option<SelfParam> {
         match self.parent {
             ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(func)) if self.is_self(db) => {
@@ -3572,88 +3515,6 @@ impl<'db> Local<'db> {
         Type::new_body(db, def, ty)
     }
 
-    /// All definitions for this local. Example: `let (a$0, _) | (_, a$0) = it;`
-    pub fn sources(self, db: &Db) -> Vec<LocalSource<'db>> {
-        let b;
-        let (_, source_map) = match self.parent {
-            ExpressionStoreOwnerId::Signature(generic_def_id) => {
-                ExpressionStore::with_source_map(db, generic_def_id.into())
-            }
-            ExpressionStoreOwnerId::Body(def_with_body_id) => {
-                b = Body::with_source_map(db, def_with_body_id);
-                if b.0.is_any_self_param(self.binding_id)
-                    && let Some(source) = b.1.self_param_syntax()
-                {
-                    let root = source.file_syntax(db);
-                    // alloc: editor edge, the owned source list callers take
-                    return vec![LocalSource {
-                        local: self,
-                        source: source.map(|ast| Either::Right(ast.to_node(&root))),
-                    }];
-                }
-                (&b.0.store, &b.1.store)
-            }
-            ExpressionStoreOwnerId::VariantFields(def) => {
-                ExpressionStore::with_source_map(db, def.into())
-            }
-        };
-        source_map
-            .patterns_for_binding(self.binding_id)
-            .iter()
-            .map(|&definition| {
-                let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
-                let root = src.file_syntax(db);
-                LocalSource {
-                    local: self,
-                    source: src.map(|ast| match ast.to_node(&root) {
-                        Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
-                        _ => unreachable!("local with non ident-pattern"),
-                    }),
-                }
-            })
-            .collect() // alloc: editor edge, the owned source list callers take
-    }
-
-    /// The leftmost definition for this local. Example: `let (a$0, _) | (_, a) = it;`
-    pub fn primary_source(self, db: &Db) -> LocalSource<'db> {
-        let b;
-        let (_, source_map) = match self.parent {
-            ExpressionStoreOwnerId::Signature(generic_def_id) => {
-                ExpressionStore::with_source_map(db, generic_def_id.into())
-            }
-            ExpressionStoreOwnerId::Body(def_with_body_id) => {
-                b = Body::with_source_map(db, def_with_body_id);
-                if b.0.is_any_self_param(self.binding_id)
-                    && let Some(source) = b.1.self_param_syntax()
-                {
-                    let root = source.file_syntax(db);
-                    return LocalSource {
-                        local: self,
-                        source: source.map(|ast| Either::Right(ast.to_node(&root))),
-                    };
-                }
-                (&b.0.store, &b.1.store)
-            }
-            ExpressionStoreOwnerId::VariantFields(def) => {
-                ExpressionStore::with_source_map(db, def.into())
-            }
-        };
-        source_map
-            .patterns_for_binding(self.binding_id)
-            .first()
-            .map(|&definition| {
-                let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
-                let root = src.file_syntax(db);
-                LocalSource {
-                    local: self,
-                    source: src.map(|ast| match ast.to_node(&root) {
-                        Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
-                        _ => unreachable!("local with non ident-pattern"),
-                    }),
-                }
-            })
-            .unwrap()
-    }
 }
 
 impl PartialOrd for Local<'_> {
@@ -3794,9 +3655,9 @@ impl GenericParam {
             GenericParam::LifetimeParam(it) => it.id.parent,
         };
         let index = match self {
-            GenericParam::TypeParam(it) => hir_ide::type_or_const_param_idx(db, it.id.into()),
+            GenericParam::TypeParam(it) => hir_ty::type_or_const_param_idx(db, it.id.into()),
             GenericParam::ConstParam(_) => return None,
-            GenericParam::LifetimeParam(it) => hir_ide::lifetime_param_idx(db, it.id),
+            GenericParam::LifetimeParam(it) => hir_ty::lifetime_param_idx(db, it.id),
         };
         db.variances_of(parent).get(index as usize).map(Into::into)
     }
@@ -3869,7 +3730,7 @@ impl TypeParam {
 
     pub fn ty(self, db: &Db) -> Type<'_> {
         let interner = DbInterner::new_no_crate(db);
-        let index = hir_ide::type_or_const_param_idx(db, self.id.into());
+        let index = hir_ty::type_or_const_param_idx(db, self.id.into());
         let ty = Ty::new_param(interner, self.id, index);
         Type::new(db, self.id.parent(), ty)
     }
@@ -3979,19 +3840,10 @@ impl ConstParam {
         let arg = generic_arg_from_param(db, self.id.into())?;
         Some(arg.display(db, display_target).to_string()) // alloc: editor edge, for display
     }
-
-    pub fn default_source_code(
-        self,
-        db: &Db,
-        target_module: Module,
-    ) -> Option<ast::ConstArg> {
-        let arg = generic_arg_from_param(db, self.id.into())?;
-        known_const_to_ast(arg.konst()?, db, target_module.id)
-    }
 }
 
 fn generic_arg_from_param(db: &Db, id: TypeOrConstParamId) -> Option<GenericArg<'_>> {
-    let local_idx = hir_ide::type_or_const_param_idx(db, id);
+    let local_idx = hir_ty::type_or_const_param_idx(db, id);
     let defaults = db.generic_defaults(id.parent);
     let ty = defaults.get(local_idx as usize)?;
     // FIXME: This shouldn't be `instantiate_identity()`, we shouldn't leak `TyKind::Param`s.
@@ -4189,7 +4041,7 @@ impl Impl {
                 let loc = id.loc(db);
                 let krate = loc.module(db).krate(db);
                 let interner = DbInterner::new_with(db, krate);
-                let trait_ref = hir_ide::builtin_derive::impl_trait(interner, id)
+                let trait_ref = hir_ty::builtin_derive::impl_trait(interner, id)
                     .instantiate_identity()
                     .skip_norm_wip();
                 Some(TraitRef::new(interner, TypeOwnerId::BuiltinDeriveImplId(id), trait_ref))
@@ -4208,7 +4060,7 @@ impl Impl {
                 let krate = loc.module(db).krate(db);
                 let interner = DbInterner::new_with(db, krate);
                 let ty =
-                    hir_ide::builtin_derive::impl_trait(interner, id).map_bound(|it| it.self_ty());
+                    hir_ty::builtin_derive::impl_trait(interner, id).map_bound(|it| it.self_ty());
                 Type { owner: TypeOwnerId::BuiltinDeriveImplId(id), ty }
             }
         }
@@ -4268,14 +4120,14 @@ impl Impl {
 pub struct TraitRef<'db> {
     owner: TypeOwnerId,
     /// Holds no rigid aliases, so that its types can be bound without an interner.
-    trait_ref: hir_ide::next_solver::TraitRef<'db>,
+    trait_ref: hir_ty::next_solver::TraitRef<'db>,
 }
 
 impl<'db> TraitRef<'db> {
     fn new(
         interner: DbInterner<'db>,
         owner: TypeOwnerId,
-        trait_ref: hir_ide::next_solver::TraitRef<'db>,
+        trait_ref: hir_ty::next_solver::TraitRef<'db>,
     ) -> Self {
         let trait_ref = rustc_type_ir::set_aliases_to_non_rigid(interner, trait_ref);
         Self { owner, trait_ref: trait_ref.skip_normalization() }
@@ -4302,7 +4154,7 @@ impl<'db> TraitRef<'db> {
     }
 
     /// The trait ref as the front end has it, for rustc's printing outside `hir`.
-    pub fn to_next_solver(&self) -> hir_ide::next_solver::TraitRef<'db> {
+    pub fn to_next_solver(&self) -> hir_ty::next_solver::TraitRef<'db> {
         self.trait_ref
     }
 
@@ -4402,8 +4254,8 @@ impl<'db> Closure<'db> {
         let mut result = capture.local().name(db).as_str().to_owned();
         for (i, proj) in place.projections.iter().enumerate() {
             match proj.kind {
-                hir_ide::closure_analysis::ProjectionKind::Deref => result.insert(0, '*'),
-                hir_ide::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
+                hir_ty::closure_analysis::ProjectionKind::Deref => result.insert(0, '*'),
+                hir_ty::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
                     match place.ty_before_projection(i).kind() {
                         TyKind::Tuple(_) => format_to!(result, ".{field_idx}"),
                         TyKind::Adt(adt_def, _) => {
@@ -4477,14 +4329,14 @@ fn captured_items<'db>(
         .collect() // alloc: editor edge, the owned capture list callers take
 }
 
-pub use hir_ide::traits::FnTrait;
+pub use hir_ty::traits::FnTrait;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureCapture<'db> {
     owner: ExpressionStoreOwnerId,
     infer_owner: InferBodyId<'db>,
     closure: ExprId,
-    capture: &'db hir_ide::closure_analysis::CapturedPlace,
+    capture: &'db hir_ty::closure_analysis::CapturedPlace,
 }
 
 impl<'db> ClosureCapture<'db> {
@@ -4499,7 +4351,7 @@ impl<'db> ClosureCapture<'db> {
     /// Returns whether this place has any field (aka. non-deref) projections.
     pub fn has_field_projections(&self) -> bool {
         self.capture.place.projections.iter().any(|proj| {
-            matches!(proj.kind, hir_ide::closure_analysis::ProjectionKind::Field { .. })
+            matches!(proj.kind, hir_ty::closure_analysis::ProjectionKind::Field { .. })
         })
     }
 
@@ -4509,16 +4361,16 @@ impl<'db> ClosureCapture<'db> {
 
     pub fn kind(&self) -> CaptureKind {
         match self.capture.info.capture_kind {
-            hir_ide::closure_analysis::UpvarCapture::ByValue => CaptureKind::Move,
-            hir_ide::closure_analysis::UpvarCapture::ByUse => CaptureKind::SharedRef, // Good enough?
-            hir_ide::closure_analysis::UpvarCapture::ByRef(
-                hir_ide::closure_analysis::BorrowKind::Immutable,
+            hir_ty::closure_analysis::UpvarCapture::ByValue => CaptureKind::Move,
+            hir_ty::closure_analysis::UpvarCapture::ByUse => CaptureKind::SharedRef, // Good enough?
+            hir_ty::closure_analysis::UpvarCapture::ByRef(
+                hir_ty::closure_analysis::BorrowKind::Immutable,
             ) => CaptureKind::SharedRef,
-            hir_ide::closure_analysis::UpvarCapture::ByRef(
-                hir_ide::closure_analysis::BorrowKind::UniqueImmutable,
+            hir_ty::closure_analysis::UpvarCapture::ByRef(
+                hir_ty::closure_analysis::BorrowKind::UniqueImmutable,
             ) => CaptureKind::UniqueSharedRef,
-            hir_ide::closure_analysis::UpvarCapture::ByRef(
-                hir_ide::closure_analysis::BorrowKind::Mutable,
+            hir_ty::closure_analysis::UpvarCapture::ByRef(
+                hir_ty::closure_analysis::BorrowKind::Mutable,
             ) => CaptureKind::MutableRef,
         }
     }
@@ -4529,8 +4381,8 @@ impl<'db> ClosureCapture<'db> {
         let mut result = self.local().name(db).display(db, edition).to_string();
         for (i, proj) in self.capture.place.projections.iter().enumerate() {
             match proj.kind {
-                hir_ide::closure_analysis::ProjectionKind::Deref => {}
-                hir_ide::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
+                hir_ty::closure_analysis::ProjectionKind::Deref => {}
+                hir_ty::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
                     let ty = self.capture.place.ty_before_projection(i);
                     match ty.kind() {
                         TyKind::Tuple(_) => format_to!(result, "_{field_idx}"),
@@ -4562,8 +4414,8 @@ impl<'db> ClosureCapture<'db> {
         let mut last_derefs = 0;
         for (i, proj) in self.capture.place.projections.iter().enumerate() {
             match proj.kind {
-                hir_ide::closure_analysis::ProjectionKind::Deref => last_derefs += 1,
-                hir_ide::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
+                hir_ty::closure_analysis::ProjectionKind::Deref => last_derefs += 1,
+                hir_ty::closure_analysis::ProjectionKind::Field { field_idx, variant_idx } => {
                     last_derefs = 0;
 
                     let ty = self.capture.place.ty_before_projection(i);
@@ -4614,7 +4466,7 @@ pub enum CaptureKind {
 #[derive(Debug, Clone)]
 pub struct CaptureUsages<'db> {
     parent: ExpressionStoreOwnerId,
-    sources: &'db [hir_ide::closure_analysis::CaptureSourceStack],
+    sources: &'db [hir_ty::closure_analysis::CaptureSourceStack],
 }
 
 impl CaptureUsages<'_> {
@@ -4776,7 +4628,7 @@ impl<'db> PartialEq for Type<'db> {
         if self.ty != other.ty {
             return false;
         }
-        hir_ide::with_attached_db(|db| {
+        hir_ty::with_attached_db(|db| {
             self.owner.can_rebase_into(db, other.owner, self.ty)
                 || other.owner.can_rebase_into(db, self.owner, other.ty)
         })
@@ -4897,9 +4749,9 @@ impl<'db> Type<'db> {
         let args = GenericArgs::for_item(interner, def.into(), |index, id, _, _| match id {
             GenericParamId::TypeParamId(_) => match args.next() {
                 Some(arg) => arg.borrow().ty.skip_binder().into(),
-                None => hir_ide::next_solver::mk_param(interner, index, id),
+                None => hir_ty::next_solver::mk_param(interner, index, id),
             },
-            _ => hir_ide::next_solver::mk_param(interner, index, id),
+            _ => hir_ty::next_solver::mk_param(interner, index, id),
         });
         let ty = self.ty.instantiate(interner, args).skip_norm_wip();
         Type { owner: self.owner, ty: EarlyBinder::bind(interner, ty) }
@@ -4921,7 +4773,7 @@ impl<'db> Type<'db> {
             let args = GenericArgs::for_item(infcx.interner, owner, |_, param, _, _| {
                 *var_for_param
                     .entry(param)
-                    .or_insert_with(|| infcx.var_for_def(param, hir_ide::Span::Dummy))
+                    .or_insert_with(|| infcx.var_for_def(param, hir_ty::Span::Dummy))
             });
 
             ty.ty.instantiate(infcx.interner, args).skip_norm_wip()
@@ -5033,7 +4885,7 @@ impl<'db> Type<'db> {
     pub fn is_mutable_reference(&self) -> bool {
         matches!(
             self.ty.skip_binder().kind(),
-            TyKind::Ref(.., hir_ide::next_solver::Mutability::Mut)
+            TyKind::Ref(.., hir_ty::next_solver::Mutability::Mut)
         )
     }
 
@@ -5087,7 +4939,7 @@ impl<'db> Type<'db> {
 
     pub fn as_reference(&self) -> Option<(Type<'db>, Mutability)> {
         let TyKind::Ref(_lt, ty, m) = self.ty.skip_binder().kind() else { return None };
-        let m = Mutability::from_mutable(matches!(m, hir_ide::next_solver::Mutability::Mut));
+        let m = Mutability::from_mutable(matches!(m, hir_ty::next_solver::Mutability::Mut));
         Some((self.derived(ty), m))
     }
 
@@ -5097,7 +4949,7 @@ impl<'db> Type<'db> {
 
     pub fn add_reference(&self, db: &'db Db, mutability: Mutability) -> Self {
         let interner = DbInterner::new_no_crate(db);
-        let ty_mutability = hir_ide::lower_mutability(mutability);
+        let ty_mutability = hir_ty::lower_mutability(mutability);
         self.derived_with(
             interner,
             Ty::new_ref(interner, Region::error(interner), self.ty.skip_binder(), ty_mutability),
@@ -5108,7 +4960,7 @@ impl<'db> Type<'db> {
     /// `Ty::new_imm_ref(tcx, re_erased, ty)`; [`Type::add_reference`] gives an error region.
     pub fn ref_to(&self, db: &'db Db, mutability: Mutability) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
-        let ty_mutability = hir_ide::lower_mutability(mutability);
+        let ty_mutability = hir_ty::lower_mutability(mutability);
         let region = Region::new_erased(interner);
         self.derived_with(interner, Ty::new_ref(interner, region, self.ty.skip_binder(), ty_mutability))
     }
@@ -5178,7 +5030,7 @@ impl<'db> Type<'db> {
                 ParamEnvAndCrate { param_env: db.trait_environment(def), krate }
             }
             TypeOwnerId::BuiltinDeriveImplId(def) => ParamEnvAndCrate {
-                param_env: hir_ide::builtin_derive::param_env(DbInterner::new_with(db, krate), def),
+                param_env: hir_ty::builtin_derive::param_env(DbInterner::new_with(db, krate), def),
                 krate,
             },
             TypeOwnerId::NoParams(_) => ParamEnvAndCrate { param_env: ParamEnv::empty(), krate },
@@ -5326,7 +5178,7 @@ impl<'db> Type<'db> {
                 {
                     arg.into()
                 } else {
-                    infcx.var_for_def(param, hir_ide::Span::Dummy)
+                    infcx.var_for_def(param, hir_ty::Span::Dummy)
                 }
             })
         })
@@ -5424,13 +5276,13 @@ impl<'db> Type<'db> {
             | TyKind::Char
             | TyKind::RawPtr(..)
             | TyKind::Never
-            | TyKind::Ref(_, _, hir_ide::next_solver::Mutability::Not)
+            | TyKind::Ref(_, _, hir_ty::next_solver::Mutability::Not)
             | TyKind::Array(..) => return true,
             TyKind::Adt(adt_def, args) => (adt_def, args),
             _ => return false,
         };
         let adt = adt_def.def_id();
-        if hir_ide::drop::destructor(db, adt).is_some() {
+        if hir_ty::drop::destructor(db, adt).is_some() {
             return false;
         }
         let interner = DbInterner::new_no_crate(db);
@@ -5465,7 +5317,7 @@ impl<'db> Type<'db> {
             _ => {
                 let env = self.param_env(db);
                 let (fn_trait, sig) =
-                    hir_ide::callable_sig_from_fn_trait(self.ty.skip_binder(), env, db)?;
+                    hir_ty::callable_sig_from_fn_trait(self.ty.skip_binder(), env, db)?;
                 let erased = interner.instantiate_bound_regions_with_erased(sig);
                 return Some(Callable {
                     ty: *self,
@@ -5538,14 +5390,14 @@ impl<'db> Type<'db> {
         // Used outside of rust-analyzer (e.g. by `ra_ap_hir` consumers).
         matches!(
             self.ty.skip_binder().kind(),
-            TyKind::RawPtr(.., hir_ide::next_solver::Mutability::Mut)
+            TyKind::RawPtr(.., hir_ty::next_solver::Mutability::Mut)
         )
     }
 
     pub fn as_raw_ptr(&self) -> Option<(Type<'db>, Mutability)> {
         // Used outside of rust-analyzer (e.g. by `ra_ap_hir` consumers).
         let TyKind::RawPtr(ty, m) = self.ty.skip_binder().kind() else { return None };
-        let m = Mutability::from_mutable(matches!(m, hir_ide::next_solver::Mutability::Mut));
+        let m = Mutability::from_mutable(matches!(m, hir_ty::next_solver::Mutability::Mut));
         Some((self.derived(ty), m))
     }
 
@@ -5668,7 +5520,7 @@ impl<'db> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         let env = self.param_env(db);
         // There should be no inference vars in types passed here
-        let canonical = hir_ide::replace_errors_with_variables(interner, &self.ty.skip_binder());
+        let canonical = hir_ty::replace_errors_with_variables(interner, &self.ty.skip_binder());
         autoderef(db, env, canonical)
     }
 
@@ -5885,8 +5737,8 @@ impl<'db> Type<'db> {
                 )),
                 edition: resolver.krate().data(db).edition,
                 features,
-                call_span: hir_ide::Span::Dummy,
-                receiver_span: hir_ide::Span::Dummy,
+                call_span: hir_ty::Span::Dummy,
+                receiver_span: hir_ty::Span::Dummy,
                 frame,
             };
             f(&ctx)
@@ -5915,8 +5767,8 @@ impl<'db> Type<'db> {
         self.with_method_resolution(db, scope.resolver(), traits_in_scope, |ctx| {
             // There should be no inference vars in types passed here
             let canonical =
-                hir_ide::replace_errors_with_variables(ctx.infcx.interner, &self.ty.skip_binder());
-            let (self_ty, _) = ctx.infcx.instantiate_canonical(hir_ide::Span::Dummy, &canonical);
+                hir_ty::replace_errors_with_variables(ctx.infcx.interner, &self.ty.skip_binder());
+            let (self_ty, _) = ctx.infcx.instantiate_canonical(hir_ty::Span::Dummy, &canonical);
 
             match name {
                 Some(name) => {
@@ -6024,8 +5876,8 @@ impl<'db> Type<'db> {
         self.with_method_resolution(db, scope.resolver(), traits_in_scope, |ctx| {
             // There should be no inference vars in types passed here
             let canonical =
-                hir_ide::replace_errors_with_variables(ctx.infcx.interner, &self.ty.skip_binder());
-            let (self_ty, _) = ctx.infcx.instantiate_canonical(hir_ide::Span::Dummy, &canonical);
+                hir_ty::replace_errors_with_variables(ctx.infcx.interner, &self.ty.skip_binder());
+            let (self_ty, _) = ctx.infcx.instantiate_canonical(hir_ty::Span::Dummy, &canonical);
 
             match name {
                 Some(name) => {
@@ -6102,7 +5954,7 @@ impl<'db> Type<'db> {
         let _p = tracing::info_span!("applicable_inherent_traits").entered();
         self.autoderef_(db)
             .filter_map(|ty| ty.dyn_trait())
-            .flat_map(move |dyn_trait_id| hir_ide::all_super_traits(db, dyn_trait_id))
+            .flat_map(move |dyn_trait_id| hir_ty::all_super_traits(db, dyn_trait_id))
             .copied()
             .map(Trait::from)
     }
@@ -6120,7 +5972,7 @@ impl<'db> Type<'db> {
                         ClauseKind::Trait(tr) if tr.self_ty() == ty => Some(tr.def_id().0),
                         _ => None,
                     })
-                    .flat_map(|t| hir_ide::all_super_traits(db, t))
+                    .flat_map(|t| hir_ty::all_super_traits(db, t))
                     .copied()
             })
             .map(Trait::from)
@@ -6251,11 +6103,11 @@ impl<'db> Type<'db> {
         self.owner.must_unify(other.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
-        let tys = hir_ide::replace_errors_with_variables(
+        let tys = hir_ty::replace_errors_with_variables(
             interner,
             &(self.ty.skip_binder(), other.ty.skip_binder()),
         );
-        hir_ide::could_unify(db, env, &tys)
+        hir_ty::could_unify(db, env, &tys)
     }
 
     /// Check if type unifies with another type eagerly making sure there are no unresolved goals.
@@ -6266,22 +6118,22 @@ impl<'db> Type<'db> {
         self.owner.must_unify(other.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
-        let tys = hir_ide::replace_errors_with_variables(
+        let tys = hir_ty::replace_errors_with_variables(
             interner,
             &(self.ty.skip_binder(), other.ty.skip_binder()),
         );
-        hir_ide::could_unify_deeply(db, env, &tys)
+        hir_ty::could_unify_deeply(db, env, &tys)
     }
 
     pub fn could_coerce_to(&self, db: &'db Db, to: &Type<'db>) -> bool {
         self.owner.must_unify(to.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
-        let tys = hir_ide::replace_errors_with_variables(
+        let tys = hir_ty::replace_errors_with_variables(
             interner,
             &(self.ty.skip_binder(), to.ty.skip_binder()),
         );
-        hir_ide::could_coerce(db, env, &tys)
+        hir_ty::could_coerce(db, env, &tys)
     }
 
     pub fn as_type_param(&self, _db: &'db Db) -> Option<TypeParam> {
@@ -6293,7 +6145,7 @@ impl<'db> Type<'db> {
 
     /// Returns unique `GenericParam`s contained in this type.
     pub fn generic_params(&self, db: &'db Db) -> FxHashSet<GenericParam> {
-        hir_ide::collect_params(&self.ty.skip_binder())
+        hir_ty::collect_params(&self.ty.skip_binder())
             .into_iter()
             .map(|id| TypeOrConstParam { id }.split(db).either_into())
             .collect() // alloc: editor edge, the owned set callers take
@@ -6309,7 +6161,7 @@ impl<'db> Type<'db> {
         let env = self.param_env(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-        hir_ide::drop::has_drop_glue(&infcx, self.ty.skip_binder(), env.param_env)
+        hir_ty::drop::has_drop_glue(&infcx, self.ty.skip_binder(), env.param_env)
     }
 }
 
@@ -6668,21 +6520,21 @@ pub enum AutoBorrow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct OverloadedDeref(pub Mutability);
 
-impl From<hir_ide::Adjust> for Adjust {
-    fn from(adjust: hir_ide::Adjust) -> Adjust {
+impl From<hir_ty::Adjust> for Adjust {
+    fn from(adjust: hir_ty::Adjust) -> Adjust {
         match adjust {
-            hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
-            hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
-                Adjust::Deref(Some(OverloadedDeref(hir_ide::hir_mutability(m))))
+            hir_ty::Adjust::NeverToAny => Adjust::NeverToAny,
+            hir_ty::Adjust::Deref(Some(hir_ty::OverloadedDeref(m))) => {
+                Adjust::Deref(Some(OverloadedDeref(hir_ty::hir_mutability(m))))
             }
-            hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
-            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
-                Adjust::Borrow(AutoBorrow::RawPtr(hir_ide::hir_mutability(m)))
+            hir_ty::Adjust::Deref(None) => Adjust::Deref(None),
+            hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::RawPtr(m)) => {
+                Adjust::Borrow(AutoBorrow::RawPtr(hir_ty::hir_mutability(m)))
             }
-            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
-                Adjust::Borrow(AutoBorrow::Ref(hir_ide::hir_mutability(m.into())))
+            hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(m)) => {
+                Adjust::Borrow(AutoBorrow::Ref(hir_ty::hir_mutability(m.into())))
             }
-            hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
         }
     }
 }
@@ -6706,7 +6558,7 @@ pub enum ClausePolarity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitClause<'db> {
     /// Holds no rigid aliases, like [`TraitRef`]'s.
-    inner: hir_ide::next_solver::TraitClause<'db>,
+    inner: hir_ty::next_solver::TraitClause<'db>,
     owner: TypeOwnerId,
 }
 
@@ -6714,7 +6566,7 @@ impl<'db> TraitClause<'db> {
     fn new(
         interner: DbInterner<'db>,
         owner: TypeOwnerId,
-        inner: hir_ide::next_solver::TraitClause<'db>,
+        inner: hir_ty::next_solver::TraitClause<'db>,
     ) -> Self {
         let inner = rustc_type_ir::set_aliases_to_non_rigid(interner, inner).skip_normalization();
         Self { inner, owner }
@@ -6732,7 +6584,7 @@ impl<'db> TraitClause<'db> {
     }
 
     /// The clause as the front end has it, for rustc's printing outside `hir`.
-    pub fn to_next_solver(&self) -> hir_ide::next_solver::TraitClause<'db> {
+    pub fn to_next_solver(&self) -> hir_ty::next_solver::TraitClause<'db> {
         self.inner
     }
 }
@@ -6742,7 +6594,7 @@ impl<'db> TraitClause<'db> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WherePredicate<'db> {
     /// Holds no rigid aliases, like [`TraitRef`]'s.
-    clause: hir_ide::next_solver::Clause<'db>,
+    clause: hir_ty::next_solver::Clause<'db>,
     owner: TypeOwnerId,
 }
 
@@ -6777,7 +6629,7 @@ impl<'db> WherePredicate<'db> {
     }
 
     /// The predicate as the front end has it, for rustc's printing outside `hir`.
-    pub fn to_next_solver(&self) -> hir_ide::next_solver::Clause<'db> {
+    pub fn to_next_solver(&self) -> hir_ty::next_solver::Clause<'db> {
         self.clause
     }
 }
@@ -7132,7 +6984,7 @@ pub enum ItemContainer {
     Crate(Crate),
 }
 
-/// Subset of `ide_db::Definition` that doc links can resolve to.
+/// What a doc link can resolve to.
 pub enum DocLinkDef {
     ModuleDef(ModuleDef),
     Field(Field),
@@ -7264,7 +7116,7 @@ fn has_non_default_type_params(db: &Db, generic_def: GenericDefId) -> bool {
         .filter(|(_, param)| matches!(param, TypeOrConstParamData::TypeParamData(_)))
         .map(|(local_id, _)| TypeOrConstParamId { parent: generic_def, local_id })
         .any(|param| {
-            let param = hir_ide::type_or_const_param_idx(db, param);
+            let param = hir_ty::type_or_const_param_idx(db, param);
             defaults.get(param as usize).is_none()
         })
 }

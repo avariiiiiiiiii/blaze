@@ -4,9 +4,9 @@
 //! tail call returns to the evaluation. Each program runs on Linux x86-64 under [`Plain`] with minicore.
 
 use hir_ty_mir::mir::{Plain, run_function};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 macro_rules! program {
     ($body:literal) => {
@@ -51,7 +51,9 @@ impl Drop for Noisy {
 
 #[track_caller]
 fn prints(fixture: &str, expected: &str) {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let (result, stdout) = hir_ty::attach_db(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);

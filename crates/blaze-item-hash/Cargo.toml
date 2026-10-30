@@ -35,11 +35,12 @@ hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 intern.workspace = true
 span.workspace = true
+syntax.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 test-utils.workspace = true
 
 [lints]

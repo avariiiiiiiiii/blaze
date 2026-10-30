@@ -23,10 +23,10 @@ use hir_def::{
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
 use salsa::Setter;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::{
-    BodyFacts, Classified, Flushed, Lookup, Mode, Step, capture, infer, install, lookup_inference,
+    BodyFacts, Classified, Flushed, Lookup, Mode, Step, StepCounts, capture, infer, install, lookup_inference,
     lookup_passed, offer_passed,
     record::{self, AnswerKey, ShapeRef},
     step_value,
@@ -66,8 +66,7 @@ pub(super) const BUILD: ContentId = ContentId([7; 32]);
 const IMPLS: FactRef = FactRef { kind: QueryKind(0x1800), subject: ContentId([4; 32]), object: FactObject::None };
 
 pub(super) fn db_of(fixture: &str) -> Db {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(fixture).change.apply(&mut db);
+    let db = fixture::db(fixture).into_db();
     db
 }
 
@@ -229,7 +228,7 @@ impl BodyFacts for TestFacts {
         Some(Hasher::new("blaze v2 item store test impls").update(&(impls as u64).to_le_bytes()).finish())
     }
 
-    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId {
+    fn def_key<'db>(&self, db: &'db Db, _: DefWithBodyId, def: SolverDefId<'db>) -> ContentId {
         let (tag, ids) = portable(def);
         let bytes = ids.encode(db, self.main).expect("a test item has a portable form");
         let key = Hasher::new("blaze v2 item store test def").update(&[tag]).part(&bytes).finish();
@@ -237,7 +236,7 @@ impl BodyFacts for TestFacts {
         key
     }
 
-    fn def_of<'db>(&self, db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>> {
+    fn def_of<'db>(&self, db: &'db Db, _: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>> {
         let (tag, bytes) = self.defs.lock().unwrap().get(&key)?.clone();
         let ids = PortableIds::decode(db, self.main, &bytes).ok()?;
         match tag {
@@ -270,6 +269,18 @@ pub(super) fn session(db: Db, memory: &Arc<Memory>, defs: &Defs, refuse: Option<
     Session { installed, facts, db }
 }
 
+/// [`Flushed::steps`] with `counts` for `step` and none for the others.
+pub(super) fn only(step: Step, counts: StepCounts) -> [StepCounts; 3] {
+    let mut steps = [StepCounts::default(); 3];
+    steps[step as usize] = counts;
+    steps
+}
+
+/// `flushed` but for its step counts, for a test that holds those apart.
+pub(super) fn without_steps(flushed: Flushed) -> Flushed {
+    Flushed { steps: Default::default(), ..flushed }
+}
+
 fn ran() -> u32 {
     infer::RAN.with(|ran| ran.get())
 }
@@ -297,6 +308,8 @@ fn stored(mode: Mode) -> (Arc<Memory>, Defs, FxHashMap<&'static str, Vec<u8>>) {
     }
     let flushed = first.installed.flush().unwrap();
     assert_eq!(flushed.written, BODIES.len(), "each body's inference is written: {flushed:?}");
+    let ran = StepCounts { ran: BODIES.len() as u64, ..StepCounts::default() };
+    assert_eq!(flushed.steps, only(Step::Infer, ran), "each body missed and ran");
     assert_eq!(memory.len(), 2 * BODIES.len(), "a shape and an answer each");
     assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "a flush writes each offer once");
     (memory, defs, forms)
@@ -388,8 +401,11 @@ fn a_stored_inference_is_read_in_a_fresh_database_without_inferring() {
         assert_eq!(ran(), 0, "`{name}` is read, not inferred");
         assert_eq!(stable(&fresh.db, &fresh.facts, def), forms[name], "`{name}` reads back as it was stored");
     }
+    let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
+    assert_eq!(fresh.installed.steps(), hits, "this build's counts, before the flush");
     let flushed = fresh.installed.flush().unwrap();
-    assert_eq!(flushed, Flushed::default(), "a hit offers nothing");
+    assert_eq!(flushed, Flushed { steps: hits, ..Flushed::default() }, "a hit offers nothing");
+    assert_eq!(fresh.installed.steps(), [StepCounts::default(); 3], "a flush takes the counts");
 }
 
 #[test]
@@ -404,6 +420,7 @@ fn a_changed_body_misses_and_the_others_hit() {
     assert_eq!(ran(), 1, "the changed body is inferred");
     let flushed = fresh.installed.flush().unwrap();
     assert_eq!(flushed.written, 1, "the changed body is offered and written: {flushed:?}");
+    assert_eq!(flushed.steps, only(Step::Infer, StepCounts { hits: 1, ran: 1, refused: 0 }));
 }
 
 #[test]
@@ -432,6 +449,7 @@ fn an_added_impl_misses_only_where_the_shape_lists_the_impls() {
     assert_eq!(ran(), 1, "a body whose shape lists the impls misses");
     let flushed = fresh.installed.flush().unwrap();
     assert_eq!(flushed.written, 1, "the same shape, a second answer: {flushed:?}");
+    assert_eq!(flushed.steps, only(Step::Infer, StepCounts { hits: 1, ran: 1, refused: 0 }));
     assert_eq!(memory.len(), 2 * BODIES.len() + 1);
 }
 
@@ -447,7 +465,8 @@ fn a_refused_read_is_tallied_by_name_and_nothing_is_stored() {
     let refusing = session(db_of(FIXTURE), &memory, &defs, Some(read), Mode::Serve);
     let _ = InferenceResult::of(&refusing.db, function(&refusing.db, "seven"));
     let flushed = refusing.installed.flush().unwrap();
-    assert_eq!(flushed, Flushed { refused: vec![(read, 1)], ..Flushed::default() });
+    let steps = only(Step::Infer, StepCounts { hits: 0, ran: 1, refused: 1 });
+    assert_eq!(flushed, Flushed { refused: vec![(read, 1)], steps, ..Flushed::default() });
     assert_eq!(memory.len(), 0);
 }
 
@@ -483,7 +502,8 @@ fn verify_runs_every_hit_and_a_difference_is_an_error_naming_the_body() {
         let _ = InferenceResult::of(&same.db, function(&same.db, name));
     }
     assert_eq!(ran(), BODIES.len() as u32, "every hit is inferred as well");
-    assert_eq!(same.installed.flush().unwrap(), Flushed::default(), "each stored result is the one inferred");
+    let hits = only(Step::Infer, StepCounts { hits: BODIES.len() as u64, ..StepCounts::default() });
+    assert_eq!(same.installed.flush().unwrap(), Flushed { steps: hits, ..Flushed::default() }, "each stored result is the one inferred");
     drop(same);
 
     let probe = session(db_of(FIXTURE), &Arc::new(Memory::default()), &defs, None, Mode::Serve);
@@ -531,6 +551,7 @@ fn only_a_passing_borrow_check_is_stored() {
     assert!(!borrow_checked(&first.db, verdict));
     assert_eq!(first.installed.flush().unwrap(), Flushed::default(), "a failing verdict is never offered");
     assert!(!lookup_passed(&first.db, seven, CHECKER, || panic!("not verifying")));
+    assert_eq!(first.installed.steps(), only(Step::Borrowck, StepCounts { ran: 1, ..StepCounts::default() }));
 
     verdict.set_passes(&mut first.db).to(true);
     assert!(borrow_checked(&first.db, verdict));
@@ -547,7 +568,8 @@ fn only_a_passing_borrow_check_is_stored() {
     let verify = session(second(FIXTURE), &memory, &defs, None, Mode::Verify);
     let seven = function(&verify.db, "seven");
     assert!(!lookup_passed(&verify.db, seven, CHECKER, || true), "under verify the check runs");
-    assert_eq!(verify.installed.flush().unwrap(), Flushed::default());
+    let hit = only(Step::Borrowck, StepCounts { hits: 1, ..StepCounts::default() });
+    assert_eq!(verify.installed.flush().unwrap(), Flushed { steps: hit, ..Flushed::default() });
     assert!(!lookup_passed(&verify.db, seven, CHECKER, || false));
     let error = verify.installed.flush().expect_err("a stored pass whose check fails");
     assert!(error.contains(&format!("{seven:?}")) && error.contains("borrow check"), "{error}");

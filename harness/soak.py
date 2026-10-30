@@ -22,8 +22,8 @@ worktrees. Every step is drawn from the seed and the number of the step alone:
   collect    `blaze-engine cache gc` and `blaze-engine cache verify` under a burst
 After a step, the worktrees it touched are built by `blaze` (run, test or build, with
 or without the feature) or by `blaze sync` to the worker's own socket, and at the sampled
-rate by plain cargo into a target directory of its own: what the program prints and how it
-ends, or the result of every test, has to be the same. A difference is asked for again
+rate by blaze from nothing (`blaze_cli.Scratch`: a home, store and target directory of its
+own): what the program prints and how it ends, or the result of every test, has to be the same. A difference is asked for again
 before it counts, and one that goes away is counted as flaky.
 
 `metrics.jsonl` in the work directory has a line a step: the resident memory, the open files
@@ -352,7 +352,7 @@ class Soak:
     def __init__(self, args):
         self.args = args
         self.work = args.work
-        self.reference = threading.Lock()
+        self.from_nothing = threading.Lock()
         self.state_path = os.path.join(self.work, "state.json")
         self.home, self.store = os.path.join(self.work, "home"), os.path.join(self.work, "store")
         self.env = dict(base_env(self.home), BLAZE_CACHE=self.store, SOAK_REPORT="1", BLAZE_IDLE_SECS=str(args.idle))
@@ -378,7 +378,7 @@ class Soak:
         for name in self.args.projects:
             root = os.path.join(self.work, name, "main")
             source = os.path.join(HERE, "soak") if name == "macros" else fetch(name, PROJECTS[name])
-            shutil.copytree(source, root, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref"))
+            shutil.copytree(source, root, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-scratch"))
             tree = Tree(name, root)
             if not os.path.isdir(tree.path(".git")):
                 tree.git("init", "-q")
@@ -389,7 +389,7 @@ class Soak:
             info = os.path.join(root, tree.git("rev-parse", "--git-common-dir").stdout.strip(), "info")
             os.makedirs(info, exist_ok=True)
             with open(os.path.join(info, "exclude"), "a") as exclude:
-                exclude.write("target\ntarget-ref\n*.soak-tmp\n")
+                exclude.write("target\ntarget-scratch\n*.soak-tmp\n")
             tree.write(first_model(tree, rng))
             subprocess.run(["cargo", "generate-lockfile"] if not os.path.exists(tree.path("Cargo.lock")) else ["cargo", "fetch"], cwd=root, env=self.env, capture_output=True)
             tree.git("add", "-A"), tree.git("commit", "-qm", "soak: the start")
@@ -419,10 +419,6 @@ class Soak:
         os.replace(tmp, self.state_path)
 
     # Asking.
-    def reference_env(self, tree):
-        # Nothing is built from it twice, so what an incremental build keeps is only room.
-        return dict(self.env, CARGO_TARGET_DIR=tree.path("target-ref"), CARGO_INCREMENTAL="0")
-
     def command(self, tree, kind, feature):
         """The arguments after `cargo [blaze]` and the variables of a request of `kind`."""
         spec, real = tree.spec, PROJECTS.get(tree.project, tree.spec)
@@ -438,20 +434,21 @@ class Soak:
         return ["run", *build, "--", *real["run"]], {}
 
     def ask(self, tree, argv, env, ours=True, cancel=None):
-        """Runs one request to its end. `cancel` is how long to wait and the signal to send."""
-        base = self.env if ours else self.reference_env(tree)
+        """Runs one request to its end. `cancel` is how long to wait and the signal to send.
+        Not `ours`: blaze from nothing (`blaze_cli.Scratch`), a home, store and target
+        directory of its own, none of which stays on the disk."""
         if not ours:
-            # Cold: cargo starts from nothing, and what it built does not stay on the disk.
             # One at a time: each is as large as the project's whole build.
-            with self.reference:
-                return self.ask_cargo(tree, argv, env, base)
-        return self.ask_cargo(tree, argv, env, base, ours, cancel)
+            with self.from_nothing, blaze_cli.Scratch(tree.root, self.env).session() as fresh:
+                try:
+                    return self.ask_cargo(tree, argv, env, fresh)
+                finally:
+                    shutil.rmtree(tree.path("target-scratch"), ignore_errors=True)
+        return self.ask_cargo(tree, argv, env, self.env, ours, cancel)
 
     def ask_cargo(self, tree, argv, env, base, ours=False, cancel=None):
-        if not ours:
-            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         began = time.time()
-        child = subprocess.Popen([*(["blaze"] if ours else ["cargo"]), *argv], cwd=tree.root, env=dict(base, **env),
+        child = subprocess.Popen(["blaze", *argv], cwd=tree.root, env=dict(base, **env),
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, start_new_session=True)
         cancelled = None
         try:
@@ -465,7 +462,7 @@ class Soak:
         except subprocess.TimeoutExpired:
             os.killpg(child.pid, signal.SIGKILL)
             child.communicate()
-            raise Failure(f"`cargo {'blaze ' if ours else ''}{' '.join(argv)}` in {tree.root} did not end in {REQUEST_SECS}s")
+            raise Failure(f"`blaze {' '.join(argv)}`{'' if ours else ' from nothing'} in {tree.root} did not end in {REQUEST_SECS}s")
         finally:
             # What a killed client leaves running would hold the checkout's lock.
             try:
@@ -474,15 +471,13 @@ class Soak:
                 pass
         ran = subprocess.CompletedProcess(argv, child.returncode, out, err)
         if "No space left on device" in err:
-            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
+            shutil.rmtree(tree.path("target-scratch"), ignore_errors=True)
             raise RuntimeError(f"the disk of {self.work} is full")
         if ours:
             self.requests.append(dict(tree=os.path.relpath(tree.root, self.work), kind=argv[0], secs=round(time.time() - began, 3),
                                       built=how_built(err), cancelled=cancelled))
             if any(it in err for it in ODD):
                 self.requests[-1]["said"] = err[-6000:]
-        else:
-            shutil.rmtree(tree.path("target-ref"), ignore_errors=True)
         return ran
 
     def status(self, tree=None):
@@ -523,11 +518,11 @@ class Soak:
             first = first if attempt else (mine, other, wrong)
             mine = None
         raise Failure(f"`blaze {' '.join(argv)}` in {tree.root} ({how_built(first[0].stderr)}): {first[2]}",
-                      {"blaze.txt": first[0].stdout + first[0].stderr, "cargo.txt": first[1].stdout + first[1].stderr})
+                      {"blaze.txt": first[0].stdout + first[0].stderr, "scratch.txt": first[1].stdout + first[1].stderr})
 
     def direct(self, tree):
         """Asks the worker that holds `tree` for its program by `blaze sync`, runs it, and
-        compares with what cargo's prints. Nothing when no worker has it loaded."""
+        compares with what blaze's build from nothing prints. Nothing when no worker has it loaded."""
         root = os.path.realpath(tree.root)
         for path in glob.glob(os.path.join(self.home, "states", "*.json")):
             if path.endswith(".kept.json"):
@@ -577,7 +572,7 @@ class Soak:
         wrong = difference(program_output(mine), program_output(other))
         self.state["compared"] += 1
         if wrong:
-            raise Failure(f"`blaze sync` of {tree.root}: {wrong}", {"blaze.txt": mine.stdout + mine.stderr, "cargo.txt": other.stdout + other.stderr})
+            raise Failure(f"`blaze sync` of {tree.root}: {wrong}", {"blaze.txt": mine.stdout + mine.stderr, "scratch.txt": other.stdout + other.stderr})
         return said
 
     def verify(self, tree, rng):
@@ -598,8 +593,8 @@ class Soak:
             self.ask(tree, argv, env)
 
     def burst(self, rng, count, cancel=False):
-        """`count` clients at once over every checkout. Each is compared with cargo
-        afterwards, when it was not cancelled."""
+        """`count` clients at once over every checkout. Each is compared with blaze from
+        nothing afterwards, when it was not cancelled."""
         trees = self.trees()
         asked = []
         for _ in range(count):
@@ -875,9 +870,9 @@ class Soak:
         print(f"FAIL at step {step} of seed {seed}: {why}\n  kept in {where}\n  again: soak.py --seed {seed} --steps {step} --projects {','.join(self.args.projects)} --worktrees {self.args.worktrees} --sample {self.args.sample}  ({self.state['backend']})", flush=True)
 
     def make_room(self, least=4 << 30):
-        """Keeps the soak from filling its disk: the reference builds go first, which are
-        then cold again, and then what cargo and the daemon built, which is built again."""
-        for name in ("target-ref", "target"):
+        """Keeps the soak from filling its disk: what the builds from nothing left, then what
+        the daemon built, which is built again."""
+        for name in ("target-scratch", "target"):
             for tree in self.trees():
                 if shutil.disk_usage(self.work).free >= least:
                     return
@@ -917,7 +912,7 @@ class Soak:
                       f"workers {line['workers']}  store {line['store_bytes'] >> 20} MB  {said[:150]}", flush=True)
             if failed and self.args.stop:
                 break
-        print(f"seed {self.state['seed']}: {self.state['step']} steps, {self.state['compared']} comparisons with cargo, {len(self.state['failures'])} failures, {self.state['flaky']} flaky", flush=True)
+        print(f"seed {self.state['seed']}: {self.state['step']} steps, {self.state['compared']} comparisons with blaze from nothing, {len(self.state['failures'])} failures, {self.state['flaky']} flaky", flush=True)
         return 1 if self.state["failures"] else 0
 
 
@@ -960,7 +955,7 @@ def report(work):
     requests = [r for line in lines for r in line["requests"]]
     served = [r for r in requests if r["built"] == "daemon"]
     print(f"head {state.get('head')}, {state.get('backend')}, seed {state['seed']}: {len(lines)} steps in {hours:.2f} h, {len(requests)} requests, "
-          f"{len(served)} built by the daemon, {sum(1 for r in requests if r['cancelled'])} cancelled, {state['compared']} compared with cargo, "
+          f"{len(served)} built by the daemon, {sum(1 for r in requests if r['cancelled'])} cancelled, {state['compared']} compared with blaze from nothing, "
           f"{len(state['failures'])} failures, {state['flaky']} flaky")
     print("steps: " + ", ".join(f"{k} {n}" for k, n in sorted(collections.Counter(line["kind"] for line in lines).items())))
     print(f"daemon kills: {sum(1 for line in lines if line['killed'])}")
@@ -996,7 +991,7 @@ def main():
     parser.add_argument("--report")
     parser.add_argument("--projects", default="ripgrep,fd,bat,axum,macros")
     parser.add_argument("--worktrees", type=int, default=3)
-    parser.add_argument("--sample", type=float, default=0.5, help="the share of requests compared with cargo")
+    parser.add_argument("--sample", type=float, default=0.5, help="the share of requests compared with blaze from nothing")
     parser.add_argument("--warm", type=float, default=0.7, help="the share of builds that wait for the daemon to have loaded")
     parser.add_argument("--idle", type=int, default=1800, help="BLAZE_IDLE_SECS of the daemon")
     parser.add_argument("--debuginfo", action="store_true", help="build with the debug info of the profiles, which takes the disk for it")

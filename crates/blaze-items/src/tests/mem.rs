@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use blaze_alloc_count::assert_at_most;
 use blaze_ids::{ContentId, bits::Ranked, rng::SplitMix64};
 use hir_ty::next_solver::goal_store::GoalFacts;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::{items, single};
 use crate::{
@@ -178,7 +178,7 @@ pub fn f(s: &S) -> u32 { let c = |y: u32| y + s.x; fn inner() {} c(1) }
     for &key in &keys {
         assert!(key::resolve(&db, key).is_some(), "{key:?}");
     }
-    let columns = crate_hashes(&db, db.test_crate());
+    let columns = crate_hashes(&db, fixture::test_crate(&db));
     assert_at_most(0, "a warm resolve", || {
         for &key in &keys {
             std::hint::black_box(key::resolve(&db, key));
@@ -207,7 +207,7 @@ pub fn f(s: &S) -> u32 { let c = |y: u32| y + s.x; fn inner() {} c(1) }
 pub const C: u32 = 1;
 "#,
     );
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let ids = items(&db);
     let mut about = Vec::new();
     for &id in &ids {

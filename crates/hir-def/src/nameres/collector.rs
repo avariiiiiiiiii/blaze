@@ -4008,15 +4008,17 @@ impl<'db> ModCollector<'_, 'db> {
 
 #[cfg(test)]
 mod tests {
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::test_db::TestDB;
 
     use super::*;
 
     fn do_resolve(not_ra_fixture: &str) {
-        let (db, _) = TestDB::with_single_file(not_ra_fixture);
-        let krate = db.test_crate();
+        let fx = fixture::db(not_ra_fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let krate = fixture::test_crate(&db);
 
         crate_def_map(&db, krate);
     }
@@ -4064,8 +4066,10 @@ foo!(KABOOM);
         let fixture = r#"
 //- /lib.rs crate:foo crate-attr:recursion_limit="4" crate-attr:no_core crate-attr:no_std crate-attr:feature(register_tool)
         "#;
-        let (db, _) = TestDB::with_single_file(fixture);
-        let def_map = crate_def_map(&db, db.test_crate());
+        let fx = fixture::db(fixture);
+        let _ = fx.only_file();
+        let db = fx.into_db();
+        let def_map = crate_def_map(&db, fixture::test_crate(&db));
         assert_eq!(def_map.recursion_limit(), 4);
         assert!(def_map.is_no_core());
         assert!(def_map.is_no_std());

@@ -2318,7 +2318,7 @@ mod alone_tests;
 /// [`SignatureSyntax`], so an edit of a body, or of another item, lowers none of them.
 #[cfg(test)]
 mod relative_tests {
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::{
@@ -2450,7 +2450,9 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
 
     /// `edits` of `CODE`, with every signature asked for before and after: what they lower.
     fn lowered_by(edits: &[(&str, &str)]) -> (Vec<String>, Vec<usize>, Vec<usize>) {
-        let (mut db, file) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
         let before = lowered(&db);
         assert!(lowerings(&db.executed_in_read_order(|| _ = lowered(&db))).is_empty());
         db.set_file_text(file.file_id(&db), &edited(CODE, edits));
@@ -2523,7 +2525,9 @@ pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
             found.sort();
             found
         }
-        let (mut db, file) = TestDB::with_single_file(UNSAFE);
+        let fx = fixture::db(UNSAFE);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
         let want = |f| {
             [("E", true), ("F", f), ("S", true), ("T", false), ("U", true)]
                 .map(|(name, has)| (name.to_owned(), has))
@@ -2549,7 +2553,9 @@ pub enum F { A(u8), #[cfg(any())] B { unsafe b: u8 } }
 
     #[test]
     fn the_outline_leaves_out_each_body_of_its_own_anchor() {
-        let (db, file) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let db = fx.into_db();
         let outline = file_outline(&db, file);
         assert_eq!(outline.root().text(), edited(CODE, &LEFT_OUT));
         assert_eq!(outline.cuts.len(), BODY_EDITS.len(), "{outline:?}");
@@ -2583,14 +2589,18 @@ pub fn outer_first() { #[allow(unused)] let x = 1; }
 pub fn cut() 
 pub const K: u8 = ;
 "#;
-        let (db, file) = TestDB::with_single_file(INNER);
+        let fx = fixture::db(INNER);
+        let file = fx.only_file();
+        let db = fx.into_db();
         assert_eq!(file_outline(&db, file).root().to_string(), LEFT);
         assert_eq!(syntax::view::AstNode::syntax(&outline_root(&db, file)).to_string(), LEFT);
     }
 
     #[test]
     fn a_body_edit_runs_no_signature_syntax() {
-        let (mut db, file) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
         _ = lowered(&db);
         db.set_file_text(file.file_id(&db), &edited(CODE, &BODY_EDITS));
         let log = db.executed_in_read_order(|| _ = lowered(&db));
@@ -2609,7 +2619,9 @@ pub const K: u8 = ;
 pub fn outer() -> u32 { struct Inner<T>(T); 1 }
 pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
 "#;
-        let (db, file) = TestDB::with_single_file(NESTED);
+        let fx = fixture::db(NESTED);
+        let file = fx.only_file();
+        let db = fx.into_db();
         let file_id = HirFileId::from(file);
         let root = file_id.root(&db);
         let named = |name: &str| {
@@ -2644,7 +2656,9 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
     /// lazy bodies are parsed.
     #[test]
     fn walking_the_outline_allocates_nothing() {
-        let (db, file) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let db = fx.into_db();
         let root = HirFileId::from(file).root(&db);
         let walk = || {
             let mut bodies = 0;
@@ -2729,7 +2743,9 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
     /// memo hit and reads of what it holds, and allocates nothing.
     #[test]
     fn reading_signatures_allocates_nothing() {
-        let (db, _) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let _ = fx.only_file();
+        let db = fx.into_db();
         let (signatures, variants) = defs(&db);
         assert!(signatures.len() > 15 && variants.len() > 4, "too small to measure");
         for &def in &signatures {
@@ -2763,7 +2779,9 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }};
         }
-        let (mut db, file) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
         for text in [CODE.to_owned(), edited(CODE, &BODY_EDITS)] {
             db.set_file_text(file.file_id(&db), &text);
             let (signatures, variants) = defs(&db);

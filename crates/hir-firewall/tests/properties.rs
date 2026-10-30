@@ -1,11 +1,10 @@
 //! The harness over random programs: functions calling the ones before them, methods, struct
 //! literals and closures; an edit of each body reaches only it.
 
-use base_db::Db;
 use hegel::{Hegel, Settings, TestCase};
 use hegel::generators as gs;
 use hir_firewall::Harness;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 /// One operand of a function of `x` that may call the `functions` before it and use the
 /// `structs` there are.
@@ -49,8 +48,8 @@ fn program(tc: &TestCase) -> String {
 /// Each case edits every body of its program.
 fn reaches_only_the_edited_body(tc: TestCase) {
     let fixture = program(&tc);
-    let mut db = Db::with_files(&fixture);
-    let krate = db.test_crate();
+    let mut db = fixture::db(&fixture).into_db();
+    let krate = fixture::test_crate(&db);
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     let report = harness.run(&mut db, 1).expect("every edit is made");
     assert!(report.edits > 0, "no function was edited:\n{fixture}");

@@ -201,19 +201,19 @@ impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
 #[cfg(test)]
 mod tests {
     use syntax::{AstPtr, ast};
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::{DynMap, keys};
     use crate::{
         Lookup,
         src::HasSource,
-        test_db::{TestDB, TestDBExt},
+        test_db::TestDBExt,
         test_items,
     };
 
     #[test]
     fn each_key_has_its_own_map() {
-        let db = TestDB::with_files("//- /main.rs\nfn f() {}\nconst C: u8 = 0;\n");
+        let db = fixture::db("//- /main.rs\nfn f() {}\nconst C: u8 = 0;\n").into_db();
         let krate = db.fetch_test_crate();
         let f = test_items::function(&db, krate, "f");
         let c = test_items::constant(&db, krate, "C");

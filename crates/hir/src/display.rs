@@ -18,7 +18,7 @@ use hir_def::{
     visibility::Visibility,
 };
 use hir_expand::name::Name;
-use hir_ide::{
+use hir_ty::{
     GenericPredicates,
     db::HirDatabase,
     display::{
@@ -71,7 +71,7 @@ fn write_builtin_derive_impl_method<'db>(
         write!(f, "\n    // Bounds from impl:")?;
 
         let predicates =
-            hir_ide::builtin_derive::predicates(db, impl_).explicit_predicates().skip_binder();
+            hir_ty::builtin_derive::predicates(db, impl_).explicit_predicates().skip_binder();
         crate::scratch::with_clauses(|clauses| {
             clauses.extend(predicates);
             write_params_bounds(f, clauses)

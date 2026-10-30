@@ -21,7 +21,7 @@ mod guest;
 
 use std::{sync::OnceLock, time::Duration};
 
-use blaze_expand::bridge::wire::{self, Parts};
+use proc_macro_api::bridge::wire::{self, Parts};
 use blaze_fuzzer::Target;
 use guest::{CAP, Host, Kind, site};
 
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn a_part_the_expansion_lacks_is_refused() {
         let mut bytes = written("foo");
-        let at = blaze_expand::bridge::wire::sections(&bytes).expect("one tree").parts;
+        let at = proc_macro_api::bridge::wire::sections(&bytes).expect("one tree").parts;
         bytes[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
         let (_, output) = host().run(&bytes, 0);
         assert!(output.is_err(), "a part index past the expansion's parts is read");

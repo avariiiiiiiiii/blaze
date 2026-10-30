@@ -264,8 +264,6 @@ blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-codegen.workspace = true
 blaze-core.workspace = true
-# `bridge::wire`, the bytes a wasm module writes, which `macro_wasm_wire`'s seeds are.
-blaze-expand.workspace = true
 blaze-format.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
@@ -293,6 +291,8 @@ object = { workspace = true, features = ["write"] }
 parser = { workspace = true, features = ["fuzz"] }
 # `Utf8PathBuf`, the library path of the proc-macro targets' requests.
 paths.workspace = true
+# The requests of the proc-macro targets, and `bridge::wire`, the bytes a wasm module writes,
+# which `macro_wasm_wire`'s seeds are.
 proc-macro-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 span.workspace = true

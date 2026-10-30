@@ -400,8 +400,8 @@ pub trait HirDatabase: sealed::Sealed {
 
     fn variances_of<'db>(&'db self, def: GenericDefId) -> VariancesOf<'db>;
 
-    /// The path of `ty` as `std::any::type_name` prints it, for the MIR intrinsic: hir-ide's
-    /// display, through [`crate::providers::Display`]. `None` when it has no source path.
+    /// The path of `ty` as `std::any::type_name` prints it, for the MIR intrinsic
+    /// ([`crate::display`]). `None` when it has no source path.
     fn type_name<'db>(&'db self, ty: Ty<'db>, module: ModuleId) -> Option<String>;
 }
 
@@ -943,7 +943,7 @@ impl HirDatabase for Db {
 
     #[inline]
     fn type_name<'db>(&'db self, ty: Ty<'db>, module: ModuleId) -> Option<String> {
-        (providers::display().type_name)(self, ty, module)
+        crate::display::type_name(self, ty, module)
     }
 }
 
@@ -1278,6 +1278,9 @@ pub mod kinds {
         CONST_EVAL_STATIC = 0x2412, "const_eval_static_query";
         CONST_EVAL_DISCRIMINANT = 0x2413, "const_eval_discriminant_variant";
         ANON_CONST_VALTREE_ERROR = 0x2414, "anon_const_valtree_error";
+        EXPLICIT_DISCRIMINANT = 0x2415, "explicit_discriminant";
+        EXPLICIT_DISCRIMINANT_INDICES = 0x2416, "explicit_discriminant_indices";
+        ENUM_DISCRIMINANTS = 0x2417, "enum_discriminants";
 
         // Signatures.
         IMPL_TRAIT = 0x2420, "impl_trait_of_impl";
@@ -1421,6 +1424,9 @@ pub mod kinds {
         IMPL_ROW_HASH = 0x24db, "impl_row_hash";
         BLANKET_HASH = 0x24dc, "blanket_hash";
         BODY_PART = 0x24dd, "body_part";
+        TRAIT_SLICE_HASH = 0x24de, "trait_slice_hash";
+        INHERENT_SLICE_HASH = 0x24df, "inherent_slice_hash";
+        CANDIDATE_SLICE_HASH = 0x24e0, "candidate_slice_hash";
 
         // Imports.
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
@@ -1433,6 +1439,7 @@ pub mod kinds {
         CANDIDATE_SLICE_INPUT = 0x25e3, "CandidateSlice";
         SLICE_DIRECTORY = 0x25e4, "SliceDirectory";
         IMPL_SLICES = 0x25e5, "ImplSlices";
+        IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";

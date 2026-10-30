@@ -37,7 +37,7 @@ use hir_expand::{
     ExpandErrorKind, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind, RenderedExpandError,
     ValueResult, mod_path::ModPath, name::Name,
 };
-use hir_ide::{
+use hir_ty::{
     CastError, ElidedLifetimeSite, ExplicitDropMethodUseKind, InferBodyId, InferenceDiagnostic,
     InferenceResult, ParamEnvAndCrate, PathGenericsSource, PathLoweringDiagnostic,
     TyLoweringDiagnostic,
@@ -72,12 +72,12 @@ use crate::{
 
 pub use hir_def::{VariantId, expr_store::MissingBodyItemKind, hir::UnsafeBinderCastKind};
 pub use hir_expand::BuiltinChild;
-pub use hir_ide::{
+pub use hir_ty::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind, ReturnKind,
     const_param_ty::ConstParamTyReason,
     diagnostics::{CaseType, IdentType, IncorrectCase},
 };
-pub use hir_ide::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
+pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 
 #[derive(Debug, Clone)]
 pub enum SpanAst {
@@ -554,9 +554,9 @@ type BorrowckParts =
 fn borrowck_parts(
     db: &Db,
     diagnostic: &hir_ty_borrowck::BorrowckDiagnostic,
-    node_of: &impl Fn(hir_ide::mir::MirSpan) -> Option<InFile<SyntaxNodePtr>>,
+    node_of: &impl Fn(hir_ty_mir::mir::MirSpan) -> Option<InFile<SyntaxNodePtr>>,
 ) -> BorrowckParts {
-    use hir_ide::mir::MirSpan;
+    use hir_ty_mir::mir::MirSpan;
     use hir_ty_borrowck::PartSpan;
     let syntax = |node: InFile<SyntaxNodePtr>| {
         let root = node.file_id.root(db);
@@ -695,8 +695,8 @@ pub struct ConstCheckError {
     pub node: InFile<SyntaxNodePtr>,
     pub code: &'static str,
     pub message: String,
-    pub kind: hir_ide::mir::const_check::ConstCheckKind,
-    pub context: hir_ide::mir::const_check::ConstContext,
+    pub kind: hir_ty_mir::mir::const_check::ConstCheckKind,
+    pub context: hir_ty_mir::mir::const_check::ConstContext,
 }
 
 /// A `const fn` whose result at run time depends on more than its arguments: "const fn reads
@@ -860,7 +860,7 @@ impl CallArgs {
         &self.compatible[start..self.compatible_ends[provided] as usize]
     }
 
-    fn new(db: &Db, target: DisplayTarget, args: &hir_ide::CallArguments) -> Self {
+    fn new(db: &Db, target: DisplayTarget, args: &hir_ty::CallArguments) -> Self {
         // alloc: error path, the types of a reported call's arguments as rustc prints them
         let show = |ty: &StoredTy| ty.as_ref().display(db, target).to_string();
         // alloc: error path, as above
@@ -1003,9 +1003,9 @@ pub enum ObligationCauseCode {
     ReturnNoExpression,
 }
 
-impl From<hir_ide::next_solver::infer::traits::ObligationCauseCode> for ObligationCauseCode {
-    fn from(code: hir_ide::next_solver::infer::traits::ObligationCauseCode) -> Self {
-        use hir_ide::next_solver::infer::traits::ObligationCauseCode as C;
+impl From<hir_ty::next_solver::infer::traits::ObligationCauseCode> for ObligationCauseCode {
+    fn from(code: hir_ty::next_solver::infer::traits::ObligationCauseCode) -> Self {
+        use hir_ty::next_solver::infer::traits::ObligationCauseCode as C;
         match code {
             C::Misc => Self::Misc,
             C::WhereClauseInExpr { item, bound_index, arg_index } => {
@@ -1476,8 +1476,8 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         generics::{GenericParams, WherePredicate},
         type_ref::TypeBound,
     };
-    use hir_ide::PredicateSource;
-    Some(match *hir_ide::predicate_sources(db, def).get(bound_index as usize)? {
+    use hir_ty::PredicateSource;
+    Some(match *hir_ty::predicate_sources(db, def).get(bound_index as usize)? {
         PredicateSource::ImpliedTrait(id) => BoundSource::ImpliedTrait(Trait { id }),
         PredicateSource::ImplicitSized(id) => BoundSource::ImplicitSized(crate::TypeParam { id }),
         PredicateSource::ConstParamType(id) => BoundSource::ConstParamType(crate::ConstParam { id }),
@@ -1532,7 +1532,7 @@ impl Trait {
         self,
         db: &Db,
     ) -> Vec<(crate::DynCompatibilityViolation, Vec<DynCompatibilitySite>)> {
-        use hir_ide::dyn_compatibility::{ViolationSite, dyn_compatibility_violation_sites};
+        use hir_ty::dyn_compatibility::{ViolationSite, dyn_compatibility_violation_sites};
         let site = |site: &ViolationSite| -> Option<DynCompatibilitySite> {
             let syntax = match *site {
                 ViolationSite::Predicate { def, index } => match bound_source(db, def, index)? {
@@ -1957,7 +1957,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
 
     fn emit_case_diagnostics(&mut self, def: ModuleDefId) {
         self.acc
-            .extend(hir_ide::diagnostics::incorrect_case(self.db, def).into_iter().map(Into::into));
+            .extend(hir_ty::diagnostics::incorrect_case(self.db, def).into_iter().map(Into::into));
     }
 
     fn collect_macro_call(&mut self, macro_call_id: MacroCallId) {
@@ -2156,7 +2156,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                                 AssocItem::Const(it) => it.id.into(),
                                 AssocItem::TypeAlias(it) => it.id.into(),
                             };
-                            !hir_ide::dyn_compatibility::generics_require_sized_self(self.db, assoc_item)
+                            !hir_ty::dyn_compatibility::generics_require_sized_self(self.db, assoc_item)
                         });
                 }
             }
@@ -2282,7 +2282,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         source_map: &ExpressionStoreSourceMap,
         def: AnonConstId<'db>,
     ) {
-        use hir_ide::const_valtree::{ValTreeError as Error, anon_const_valtree_error};
+        use hir_ty::const_valtree::{ValTreeError as Error, anon_const_valtree_error};
         let Some(error) = anon_const_valtree_error(self.db, def) else { return };
         let loc = def.loc(self.db);
         let Ok(at) = source_map.expr_syntax(loc.expr) else {
@@ -2310,7 +2310,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         source_map: &ExpressionStoreSourceMap,
         def: AnonConstId<'db>,
     ) {
-        use hir_ide::mir::MirSpan;
+        use hir_ty_mir::mir::MirSpan;
         let result = hir_ty_borrowck::borrowck_anon_const(self.db, def);
         let node_of = |span: MirSpan| -> Option<InFile<SyntaxNodePtr>> {
             let source = match span {
@@ -2401,7 +2401,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_const_param_tys(&mut self, def: GenericDefId) {
-        let errors = hir_ide::const_param_ty::const_param_ty_errors(self.db, def);
+        let errors = hir_ty::const_param_ty::const_param_ty_errors(self.db, def);
         if errors.is_empty() {
             return;
         }
@@ -2478,7 +2478,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         body: &Body,
         source_map: &hir_def::expr_store::BodySourceMap,
     ) {
-        use hir_ide::mir::MirSpan;
+        use hir_ty_mir::mir::MirSpan;
         let result = hir_ty_borrowck::borrowck(self.db, def);
         // An `async fn`'s body is the future it makes, which rustc points at as its block.
         let block = || -> Option<InFile<SyntaxNodePtr>> {
@@ -2593,7 +2593,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 .into(),
             );
         }
-        let const_check = &hir_ide::mir::const_check::const_check(self.db, def).diagnostics;
+        let const_check = &hir_ty_mir::mir::const_check::const_check(self.db, def).diagnostics;
         for diagnostic in const_check {
             let Some(node) = node_of(diagnostic.span) else { continue };
             self.acc.push(
@@ -2611,11 +2611,11 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         }
         // `blaze::const_impure` is fn-cache's lint: no other crate's `const fn` is walked for it.
         if let DefWithBodyId::FunctionId(func) = def
-            && hir_ide::fn_cache::uses_fn_cache(self.db, hir_def::HasModule::krate(&def, self.db))
+            && hir_ty::fn_cache::uses_fn_cache(self.db, hir_def::HasModule::krate(&def, self.db))
             && const_check.is_empty()
-            && hir_ide::mir::const_check::const_context(self.db, def)
-                == Some(hir_ide::mir::const_check::ConstContext::ConstFn)
-            && let Some(impure) = hir_ide::mir::purity::const_purity(self.db, func)
+            && hir_ty_mir::mir::const_check::const_context(self.db, def)
+                == Some(hir_ty_mir::mir::const_check::ConstContext::ConstFn)
+            && let Some(impure) = hir_ty_mir::mir::purity::const_purity(self.db, func)
             && impure.told
             && let Some(node) = node_of(impure.span)
         {
@@ -2647,7 +2647,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     ) {
         let infer = InferenceResult::of(self.db, def);
         // rustc's `check_coroutine_obligations`, after the body's own errors.
-        let stalled = hir_ide::coroutine_obligations::coroutine_obligation_errors(self.db, def);
+        let stalled = hir_ty::coroutine_obligations::coroutine_obligation_errors(self.db, def);
 
         self.acc.extend(infer.diagnostics().iter().chain(stalled).filter_map(|diag| {
             AnyDiagnostic::inference_diagnostic(
@@ -3167,15 +3167,15 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr = expr_syntax(*expr)?;
                 let expr_ty = new_ty(expr_ty.as_ref());
                 let cast_ty = new_ty(cast_ty.as_ref());
-                let kind = |kind: Option<hir_ide::CastPointerKind>| {
+                let kind = |kind: Option<hir_ty::CastPointerKind>| {
                     kind.map(|kind| match kind {
-                        hir_ide::CastPointerKind::Thin => CastPointerKind::Thin,
-                        hir_ide::CastPointerKind::VTable(principal) => {
+                        hir_ty::CastPointerKind::Thin => CastPointerKind::Thin,
+                        hir_ty::CastPointerKind::VTable(principal) => {
                             CastPointerKind::VTable(principal.map(|id| crate::Trait { id }))
                         }
-                        hir_ide::CastPointerKind::Length => CastPointerKind::Length,
-                        hir_ide::CastPointerKind::OfAlias => CastPointerKind::OfAlias,
-                        hir_ide::CastPointerKind::OfParam(id) => {
+                        hir_ty::CastPointerKind::Length => CastPointerKind::Length,
+                        hir_ty::CastPointerKind::OfAlias => CastPointerKind::OfAlias,
+                        hir_ty::CastPointerKind::OfParam(id) => {
                             CastPointerKind::OfParam(crate::TypeParam { id })
                         }
                     })
@@ -3414,7 +3414,7 @@ impl<'db> AnyDiagnostic<'db> {
                         related: ambiguity.related.iter().map(note).collect(),
                     }
                 });
-                let term = |term: hir_ide::next_solver::GenericArg<'db>| match term.kind() {
+                let term = |term: hir_ty::next_solver::GenericArg<'db>| match term.kind() {
                     rustc_type_ir::GenericArgKind::Type(ty) => Either::Left(new_ty(ty)),
                     // FIXME: Printing the const to string is definitely not the correct thing to do here.
                     rustc_type_ir::GenericArgKind::Const(konst) => Either::Right(
@@ -3576,7 +3576,7 @@ impl<'db> AnyDiagnostic<'db> {
         target: DisplayTarget,
     ) -> Option<AnyDiagnostic<'db>> {
         let interner = DbInterner::new_no_crate(db);
-        let ty = |ty: &'db hir_ide::next_solver::StoredTy| Type {
+        let ty = |ty: &'db hir_ty::next_solver::StoredTy| Type {
             owner: type_owner,
             ty: EarlyBinder::bind(interner, ty.as_ref()),
         };
@@ -3690,9 +3690,9 @@ impl<'db> AnyDiagnostic<'db> {
     /// The syntax of the closure `ty` is the type of, in whichever body it is written.
     fn closure_syntax(
         db: &'db Db,
-        ty: hir_ide::next_solver::Ty<'db>,
+        ty: hir_ty::next_solver::Ty<'db>,
     ) -> Option<InFile<AstPtr<ast::ClosureExpr>>> {
-        let hir_ide::db::InternedClosure { owner, expr, .. } = match ty.kind() {
+        let hir_ty::db::InternedClosure { owner, expr, .. } = match ty.kind() {
             TyKind::Closure(id, _) => id.0.loc(db),
             TyKind::CoroutineClosure(id, _) => id.0.loc(db),
             _ => return None,
@@ -3717,7 +3717,7 @@ impl<'db> AnyDiagnostic<'db> {
                     AmbiguityCandidate::Impl(crate::Impl { id })
                 }
                 solver_errors::AmbiguityCandidate::ParamEnv { trait_, args } => {
-                    let trait_ref = hir_ide::next_solver::TraitRef::new_from_args(
+                    let trait_ref = hir_ty::next_solver::TraitRef::new_from_args(
                         interner,
                         (*trait_).into(),
                         args.as_ref(),
@@ -3739,28 +3739,28 @@ impl<'db> AnyDiagnostic<'db> {
         target: DisplayTarget,
     ) -> SolverGoal<'db> {
         let interner = DbInterner::new_no_crate(db);
-        let ty = |ty: &'db hir_ide::next_solver::StoredTy| Type {
+        let ty = |ty: &'db hir_ty::next_solver::StoredTy| Type {
             owner: type_owner,
             ty: EarlyBinder::bind(interner, ty.as_ref()),
         };
-        let text = |arg: &'db hir_ide::next_solver::StoredGenericArg| {
+        let text = |arg: &'db hir_ty::next_solver::StoredGenericArg| {
             // alloc: error path, a reported goal's argument as rustc prints it
             arg.as_ref().display(db, target).to_string()
         };
-        let term = |arg: &'db hir_ide::next_solver::StoredGenericArg| match arg.as_ref().kind() {
+        let term = |arg: &'db hir_ty::next_solver::StoredGenericArg| match arg.as_ref().kind() {
             rustc_type_ir::GenericArgKind::Type(it) => Either::Left(Type {
                 owner: type_owner,
                 ty: EarlyBinder::bind(interner, it),
             }),
             _ => Either::Right(text(arg)),
         };
-        let trait_ref = |trait_: hir_def::TraitId, args: &'db hir_ide::next_solver::StoredGenericArgs| {
-            hir_ide::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
+        let trait_ref = |trait_: hir_def::TraitId, args: &'db hir_ty::next_solver::StoredGenericArgs| {
+            hir_ty::next_solver::TraitRef::new_from_args(interner, trait_.into(), args.as_ref())
         };
         match goal {
             &StoredGoal::Trait { trait_, ref args, polarity } => {
                 let clause =
-                    hir_ide::next_solver::TraitClause { trait_ref: trait_ref(trait_, args), polarity };
+                    hir_ty::next_solver::TraitClause { trait_ref: trait_ref(trait_, args), polarity };
                 SolverGoal::Trait(crate::TraitClause::new(interner, type_owner, clause))
             }
             &StoredGoal::HostEffect { trait_, ref args, maybe_const } => SolverGoal::HostEffect {
@@ -3958,20 +3958,20 @@ impl<'db> AnyDiagnostic<'db> {
     }
 
     pub(crate) fn span_syntax(
-        span: hir_ide::Span,
+        span: hir_ty::Span,
         source_map: &ExpressionStoreSourceMap,
     ) -> Option<InFile<AstPtr<SpanAst>>> {
         Some(match span {
-            hir_ide::Span::ExprId(idx) => Self::expr_syntax(idx, source_map)?.map(|it| it.upcast()),
-            hir_ide::Span::PatId(idx) => Self::pat_syntax(idx, source_map)?.map(|it| it.upcast()),
-            hir_ide::Span::TypeRefId(idx) => {
+            hir_ty::Span::ExprId(idx) => Self::expr_syntax(idx, source_map)?.map(|it| it.upcast()),
+            hir_ty::Span::PatId(idx) => Self::pat_syntax(idx, source_map)?.map(|it| it.upcast()),
+            hir_ty::Span::TypeRefId(idx) => {
                 Self::type_syntax(idx, source_map)?.map(|it| it.upcast())
             }
-            hir_ide::Span::BindingId(idx) => {
+            hir_ty::Span::BindingId(idx) => {
                 let &pat = source_map.patterns_for_binding(idx).first()?;
                 Self::pat_syntax(pat, source_map)?.map(|it| it.upcast())
             }
-            hir_ide::Span::Dummy => {
+            hir_ty::Span::Dummy => {
                 never!("should never create a diagnostic for dummy spans");
                 return None;
             }

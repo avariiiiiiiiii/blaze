@@ -4,7 +4,7 @@
 use base_db::{Crate, Db, all_crates};
 use hir_def::{AdtId, EnumVariantId, ModuleDefId, ModuleId, TyDefId, nameres::crate_def_map};
 use hir_expand::name::Name;
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use crate::{
     db::HirDatabase,
@@ -70,8 +70,7 @@ fn ty<'db>(db: &'db Db, adt: AdtId) -> Ty<'db> {
 
 #[test]
 fn only_a_foreign_non_exhaustive_enum_is_taken_as_inhabited() {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+    let db = fixture::db(FIXTURE).into_db();
     let krate = crate_named(&db, "main");
     let root = crate_def_map(&db, krate).root_module_id();
     let interner = DbInterner::new_with(&db, krate);

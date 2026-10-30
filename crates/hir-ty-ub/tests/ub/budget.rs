@@ -9,9 +9,9 @@ use hir_ty_ub::{
     check::{Checker, Shadow, Sites},
     memory::Bytes,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, main_of};
+use crate::main_of;
 
 const ROUNDS: usize = 1_000;
 
@@ -55,7 +55,9 @@ fn copies_allocate_nothing() {
 
 #[test]
 fn steps_and_site_hits_allocate_nothing() {
-    let (db, file) = TestDB::with_single_file(program!("sized", "fn main() {}\n"));
+    let fx = fixture::db(program!("sized", "fn main() {}\n"));
+    let file = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let owner = InferBodyId::DefWithBodyId(main_of(&db, file).into());
         let a = Site { owner, span: MirSpan::Unknown };

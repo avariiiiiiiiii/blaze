@@ -13,7 +13,7 @@ use rustc_type_ir::{
     Mutability, TypingMode,
     inherent::{Clause as _, Ty as _},
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     Span,
@@ -54,8 +54,8 @@ pub(crate) fn fixture() -> (Db, Crate) {
 }
 
 fn fixture_of(fixture: &str) -> (Db, Crate) {
-    let db = Db::with_files(fixture);
-    let krate = db.test_crate();
+    let db = fixture::db(fixture).into_db();
+    let krate = fixture::test_crate(&db);
     (db, krate)
 }
 

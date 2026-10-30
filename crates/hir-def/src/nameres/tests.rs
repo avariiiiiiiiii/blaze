@@ -14,7 +14,7 @@ mod batch_order;
 mod views;
 
 use expect_test::{Expect, expect};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     nameres::{DefMap, crate_def_map},
@@ -25,13 +25,13 @@ fn compute_crate_def_map(
     #[rust_analyzer::rust_fixture] ra_fixture: &str,
     cb: impl FnOnce(&TestDB, &DefMap),
 ) {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     cb(&db, crate_def_map(&db, krate));
 }
 
 fn render_crate_def_map(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     crate_def_map(&db, krate).dump(&db)
 }
@@ -911,7 +911,7 @@ pub fn f() {}
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
     use base_db::salsa::Durability;
-    let mut db = TestDB::with_files(
+    let mut db = fixture::db(
         r#"
 //- /main.rs
 #![cfg(never)]
@@ -921,7 +921,8 @@ mod __blaze_test_harness {
     pub fn main() {}
 }
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     let root = krate.root_file_id(&db).file_id(&db);
     // The same module written only in source follows the crate's cfg.
@@ -1117,7 +1118,7 @@ fn impls_keep_their_order_and_their_reservation_bit() {
     };
     use syntax::view::AstNode;
 
-    let mut db = TestDB::with_files(
+    let mut db = fixture::db(
         r#"
 trait Tr {}
 struct A;
@@ -1133,7 +1134,8 @@ impl Tr for C {}
 #[cfg_attr(any(), rustc_reservation_impl = "not reserved")]
 impl Tr for D {}
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     {
         let def_map = crate_def_map(&db, krate);

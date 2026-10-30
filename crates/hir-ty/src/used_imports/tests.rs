@@ -5,7 +5,7 @@ use hir_def::{
     item_scope::{GlobId, ImportId, ImportOrExternCrate},
     src::use_tree_to_view,
 };
-use test_fixture::ChangeFixture;
+use hir_expand::fixture;
 
 use super::used_imports_with_traits;
 
@@ -49,8 +49,7 @@ fn main_crate(db: &Db) -> Crate {
 
 #[test]
 fn the_innermost_import_of_each_picked_trait_is_used() {
-    let mut db = Db::for_tests();
-    ChangeFixture::parse(FIXTURE).change.apply(&mut db);
+    let db = fixture::db(FIXTURE).into_db();
     let used = used_imports_with_traits(&db, main_crate(&db));
     let mut texts: Vec<String> = used
         .imports()

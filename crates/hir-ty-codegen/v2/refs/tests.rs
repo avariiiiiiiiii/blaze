@@ -16,7 +16,7 @@ use cranelift_codegen::ir;
 use hir_def::{FunctionId, StaticId, signatures::FunctionSignature};
 use hir_ty::db::HirDatabase;
 use rustc_hash::FxHashSet;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::walk;
 use crate::{
@@ -34,18 +34,18 @@ use db::TestDB;
 
 /// The fixture lives as long as the test process, as the frontend borrows it.
 fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
-    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
+    let db: &'static TestDB = Box::leak(Box::new(fixture::db(text).into_db()));
     (db, HirFrontend::new(Databases::new(db), HashSource::ById(ById), std::sync::Arc::new(BuildTime(Default::default()))))
 }
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 #[track_caller]
 fn static_named(db: &TestDB, name: &str) -> StaticId {
-    hir_def::test_items::static_item(db, db.test_crate(), name)
+    hir_def::test_items::static_item(db, fixture::test_crate(db), name)
 }
 
 fn spec() -> Spec {

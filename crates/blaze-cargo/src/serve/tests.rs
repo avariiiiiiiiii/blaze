@@ -251,6 +251,7 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         default_run: None,
         checksum: None,
         tests: TestSandbox::default(),
+        const_macros: None,
     };
     Units {
         plans: vec![plan; graph.units.len()],
@@ -379,13 +380,13 @@ impl Writer<Fake> for FakeWriter {
         (!self.waiting()).then(|| FakeReader(Arc::clone(&self.inputs)))
     }
 
-    fn ran(&mut self, run: usize, _: load_cargo::v2::Ran) -> Result<(), ApiError> {
+    fn ran(&mut self, run: usize, _: blaze_lower::Ran) -> Result<(), ApiError> {
         ASKED.with(|it| it.set(it.get() + 1));
         self.asked.push(run);
         Ok(())
     }
 
-    fn macros(&mut self, unit: usize, _: load_cargo::v2::ProcMacroLoadResult) -> Result<(), ApiError> {
+    fn macros(&mut self, unit: usize, _: blaze_lower::ProcMacroLoadResult) -> Result<(), ApiError> {
         Err(ApiError::new(format!("the fakes build no proc macro, and unit {unit} is not one"), None))
     }
 
@@ -481,7 +482,7 @@ struct Script(usize);
 impl Runs<Fake> for Script {
     fn start(&mut self, _: &Store, writer: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
         let writer = writer.expect("a build script's run is given its job's writer");
-        Some(writer.ran(self.0, load_cargo::v2::Ran::default()).is_ok())
+        Some(writer.ran(self.0, blaze_lower::Ran::default()).is_ok())
     }
 
     fn owns(&self, _: Tag) -> bool {

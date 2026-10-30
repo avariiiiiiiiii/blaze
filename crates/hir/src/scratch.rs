@@ -91,7 +91,7 @@ shelves! {
     /// `Semantics::lint_attrs`' attributes, before they are handed out.
     LintAttrs, LINT_ATTRS: (LintAttr, SmolStr);
     /// Clauses `display` writes, kept as `'static` and lent as `'db` through [`recycle`].
-    Clauses, CLAUSES: hir_ide::next_solver::Clause<'static>;
+    Clauses, CLAUSES: hir_ty::next_solver::Clause<'static>;
     /// `query_external_importables`' items, first found first.
     Importables, IMPORTABLES: (hir_def::item_scope::ItemInNs, hir_def::Complete);
 }
@@ -131,7 +131,7 @@ pub(crate) fn recycle<T, U>(mut buffer: Vec<T>) -> Vec<U> {
 
 /// Lends the thread's clause buffer, empty, as `Clause<'db>`s for `f`.
 pub(crate) fn with_clauses<'db, R>(
-    f: impl FnOnce(&mut Vec<hir_ide::next_solver::Clause<'db>>) -> R,
+    f: impl FnOnce(&mut Vec<hir_ty::next_solver::Clause<'db>>) -> R,
 ) -> R {
     Clauses::with(|kept| {
         let mut lent = recycle(std::mem::take(kept));

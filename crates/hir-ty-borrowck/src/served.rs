@@ -13,7 +13,7 @@ use hir_expand::name::Name;
 use hir_ty::{InferBodyId, check_cache, db::HirDatabase, infer_query_with_inspect};
 use hir_ty_mir::mir::lower_body_to_mir;
 use rustc_hash::FxHashMap;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::checked;
 
@@ -48,9 +48,9 @@ fn crate_named(db: &Db, name: &str) -> Crate {
 /// A database whose `dep` is served from a part written in another one, every body marked by
 /// `passed`.
 fn served(passed: fn(DefWithBodyId) -> bool) -> (Db, Crate) {
-    let first = Db::with_files(FIXTURE);
+    let first = fixture::db(FIXTURE).into_db();
     let bytes = check_cache::encode(&first, crate_named(&first, "dep"), &passed).unwrap();
-    let mut db = Db::with_files(FIXTURE);
+    let mut db = fixture::db(FIXTURE).into_db();
     let dep = crate_named(&db, "dep");
     // alloc: test setup
     let mut parts = FxHashMap::default();
@@ -97,7 +97,7 @@ fn a_served_verdict_skips_the_borrow_check() {
             })
             .unwrap()
     };
-    let own = Db::with_files(FIXTURE);
+    let own = fixture::db(FIXTURE).into_db();
     let own_dep = crate_named(&own, "dep");
     assert!(checked(&own, two_mut(&own, own_dep)).is_err(), "the body has a borrow error");
 

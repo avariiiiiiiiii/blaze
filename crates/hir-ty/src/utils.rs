@@ -15,7 +15,6 @@ use span::Edition;
 
 use crate::{
     BindingMode, ByRef, TargetFeatures,
-    db::HirDatabase,
     layout::{Layout, RustcEnumVariantIdx, TagEncoding},
     lower::SupertraitsInfo,
     mir::{IsSigned, pad16},
@@ -139,10 +138,11 @@ pub fn detect_variant_from_bytes<'a>(
                         }
                         false => tag,
                     };
-                    let (def, var_idx) = variants.indices().find_map(|var_idx| {
-                        let def = e.enum_variants(db).variants[var_idx.0].0;
-                        (db.const_eval_discriminant(def) == Ok(tag)).then_some((def, var_idx))
-                    })?;
+                    let index =
+                        crate::consteval::discriminants::enum_discriminants(db, e).variant_of(tag)?;
+                    let var_idx = RustcEnumVariantIdx(index);
+                    assert!(var_idx.0 < variants.len());
+                    let def = e.enum_variants(db).variants[index].0;
                     (def, Cow::Owned(Layout::for_variant(layout, var_idx)))
                 }
                 TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {

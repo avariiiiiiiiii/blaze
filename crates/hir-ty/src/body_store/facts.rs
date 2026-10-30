@@ -60,11 +60,14 @@ pub trait BodyFacts: Send + Sync + 'static {
     /// The value of `fact` now; `None` when it cannot be hashed now.
     fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId>;
 
-    /// The key of a definition a record names: the same item in every database has the same key.
-    fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId;
+    /// The key of a definition `body`'s record names, relative to `body`: `body` itself and what
+    /// it owns (closures, coroutines, opaque types, anonymous constants) as "self", an item one of
+    /// its paths names as "the target of that path", anything else by its item key. Two bodies of
+    /// one identity give the same item the same key in every database, under any renaming.
+    fn def_key<'db>(&self, db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> ContentId;
 
-    /// The definition [`BodyFacts::def_key`] gave `key` in `db`; `None` when there is none: the
-    /// record names an item this database does not have, which for a record found under a
-    /// matching identity is a bug in the identity.
-    fn def_of<'db>(&self, db: &'db Db, key: ContentId) -> Option<SolverDefId<'db>>;
+    /// The definition [`BodyFacts::def_key`] gave `key` for `body` in `db`; `None` when there is
+    /// none: the record names an item this database does not have, which for a record found
+    /// under a matching identity is a bug in the identity.
+    fn def_of<'db>(&self, db: &'db Db, body: DefWithBodyId, key: ContentId) -> Option<SolverDefId<'db>>;
 }

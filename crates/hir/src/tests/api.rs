@@ -4,8 +4,8 @@
 
 use base_db::Db;
 use hir_def::hir::Expr;
-use hir_ide::{InferBodyId, InferenceResult};
-use test_fixture::WithFixture;
+use hir_ty::{InferBodyId, InferenceResult};
+use hir_expand::fixture;
 
 use super::{db::TestDB, kinds};
 use crate::{
@@ -68,7 +68,7 @@ fn takes_opaque(o: Opaque) {}
 
 #[test]
 fn a_variant_s_fields_have_the_type_s_arguments() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "takes_e");
         let sig = f.signature(&db).expect("a function has a signature");
@@ -88,7 +88,7 @@ fn a_variant_s_fields_have_the_type_s_arguments() {
 
 #[test]
 fn a_direct_tag_enum_gives_its_tag_and_variant_sizes_in_order() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 //- /main.rs crate:main
@@ -97,7 +97,8 @@ enum Direct { A(u32), B, C([u8; 9]) }
 enum Niche { A(&'static u8), B }
 enum One { A(u32) }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let layout = |name: &str| {
             let ModuleDef::Adt(adt @ Adt::Enum(_)) = item(&db, name) else {
@@ -123,7 +124,7 @@ enum One { A(u32) }
 
 #[test]
 fn an_array_s_element_whatever_its_length() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "takes_s");
         let s = f.signature(&db).unwrap().params(&db).remove(0);
@@ -136,7 +137,7 @@ fn an_array_s_element_whatever_its_length() {
 
 #[test]
 fn a_parameter_no_field_or_projection_uses_is_unused() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     crate::attach_db(&db, || {
         let unused = |name: &str| -> Vec<String> {
             let ModuleDef::Adt(adt) = item(&db, name) else { panic!("`{name}` is an ADT") };
@@ -150,7 +151,7 @@ fn a_parameter_no_field_or_projection_uses_is_unused() {
 
 #[test]
 fn where_predicates_are_the_written_ones() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "bounded");
         let preds = crate::GenericDef::Function(f).where_predicates(&db);
@@ -166,7 +167,7 @@ fn where_predicates_are_the_written_ones() {
 
 #[test]
 fn a_foreign_type_is_its_alias() {
-    let db = TestDB::with_files(ITEMS);
+    let db = fixture::db(ITEMS).into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "takes_opaque");
         let ty = f.signature(&db).unwrap().params(&db).remove(0);
@@ -198,7 +199,7 @@ impl Foo for Bar {
 
 #[test]
 fn an_impl_method_s_signature_is_compared_with_the_trait_s() {
-    let db = TestDB::with_files(E0053);
+    let db = fixture::db(E0053).into_db();
     crate::attach_db(&db, || {
         let foo = impl_method(&db, "foo");
         let it = foo.impl_signature_mismatch(&db).expect("`i16` is not `u16`: E0053");
@@ -240,7 +241,7 @@ unsafe fn not_safe(x: TokenStream) -> TokenStream { x }
 
 #[test]
 fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
-    let db = TestDB::with_files(PROC_MACRO);
+    let db = fixture::db(PROC_MACRO).into_db();
     crate::attach_db(&db, || {
         let at = |name, attribute| {
             func(&db, name).proc_macro_signature_mismatch(&db, attribute).map(|it| it.at)
@@ -266,14 +267,15 @@ fn a_proc_macro_s_signature_is_fn_token_stream_to_token_stream() {
 
 #[test]
 fn a_closure_s_source_is_its_expression() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, fn
 fn f() {
     let c = |x: u8| x;
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
@@ -291,7 +293,7 @@ fn f() {
 
 #[test]
 fn a_closure_s_kind_origin_place_is_the_use_s_not_the_capture_s() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized, fn
 struct S { a: u8 }
@@ -300,7 +302,8 @@ fn f(r: &mut S, mut t: (u8, u8)) {
     let mut borrowed = || { t.1 = 2; };
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let f = func(&db, "f");
         let crate::AnyFunctionId::FunctionId(id) = f.id else { panic!() };
@@ -328,7 +331,7 @@ fn f(r: &mut S, mut t: (u8, u8)) {
 
 #[test]
 fn deprecation_is_its_own_or_its_module_s() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main
 #[deprecated(note = "old")]
@@ -339,7 +342,8 @@ mod old {
 pub fn own() {}
 pub fn current() {}
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let note = |def: ModuleDef| {
             let entry = def.deprecation(&db)?;
@@ -357,7 +361,7 @@ pub fn current() {}
 #[test]
 fn a_body_borrowck_skipped_is_always_reported() {
     // MIR lowering refuses `twice!(n += 1;)` inside another call's parentheses (#154).
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 //- /main.rs crate:main
 macro_rules! twice {
@@ -371,7 +375,8 @@ fn main() {
     twice!(twice!(n += 1;));
 }
 "#,
-    );
+    )
+    .into_db();
     crate::attach_db(&db, || {
         let found = crate::check::check_workspace(&db, false);
         let skipped: usize = found
@@ -387,7 +392,7 @@ fn main() {
 #[test]
 fn adjustments_convert_as_before() {
     use hir_def::type_ref::Mutability as Hir;
-    use hir_ide::{
+    use hir_ty::{
         PointerCast,
         infer::{AllowTwoPhase, AutoBorrowMutability},
         next_solver::Mutability as Ty,
@@ -395,41 +400,41 @@ fn adjustments_convert_as_before() {
 
     use crate::{Adjust, AutoBorrow, OverloadedDeref};
 
-    let old = |adjust: hir_ide::Adjust| -> Adjust {
+    let old = |adjust: hir_ty::Adjust| -> Adjust {
         let mutability = |m| match m {
             Ty::Not => Hir::Shared,
             Ty::Mut => Hir::Mut,
         };
         match adjust {
-            hir_ide::Adjust::NeverToAny => Adjust::NeverToAny,
-            hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))) => {
+            hir_ty::Adjust::NeverToAny => Adjust::NeverToAny,
+            hir_ty::Adjust::Deref(Some(hir_ty::OverloadedDeref(m))) => {
                 Adjust::Deref(Some(OverloadedDeref(mutability(m))))
             }
-            hir_ide::Adjust::Deref(None) => Adjust::Deref(None),
-            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)) => {
+            hir_ty::Adjust::Deref(None) => Adjust::Deref(None),
+            hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::RawPtr(m)) => {
                 Adjust::Borrow(AutoBorrow::RawPtr(mutability(m)))
             }
-            hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(m)) => {
+            hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(m)) => {
                 Adjust::Borrow(AutoBorrow::Ref(mutability(m.into())))
             }
-            hir_ide::Adjust::Pointer(pc) => Adjust::Pointer(pc),
+            hir_ty::Adjust::Pointer(pc) => Adjust::Pointer(pc),
         }
     };
     let mut cases = vec![
-        hir_ide::Adjust::NeverToAny,
-        hir_ide::Adjust::Deref(None),
-        hir_ide::Adjust::Pointer(PointerCast::ReifyFnPointer),
-        hir_ide::Adjust::Pointer(PointerCast::Unsize),
-        hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(AutoBorrowMutability::Not)),
+        hir_ty::Adjust::NeverToAny,
+        hir_ty::Adjust::Deref(None),
+        hir_ty::Adjust::Pointer(PointerCast::ReifyFnPointer),
+        hir_ty::Adjust::Pointer(PointerCast::Unsize),
+        hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(AutoBorrowMutability::Not)),
     ];
     for two_phase in [AllowTwoPhase::Yes, AllowTwoPhase::No] {
-        cases.push(hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::Ref(AutoBorrowMutability::Mut {
+        cases.push(hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::Ref(AutoBorrowMutability::Mut {
             allow_two_phase_borrow: two_phase,
         })));
     }
     for m in [Ty::Not, Ty::Mut] {
-        cases.push(hir_ide::Adjust::Deref(Some(hir_ide::OverloadedDeref(m))));
-        cases.push(hir_ide::Adjust::Borrow(hir_ide::AutoBorrow::RawPtr(m)));
+        cases.push(hir_ty::Adjust::Deref(Some(hir_ty::OverloadedDeref(m))));
+        cases.push(hir_ty::Adjust::Borrow(hir_ty::AutoBorrow::RawPtr(m)));
     }
     for case in cases {
         assert_eq!(Adjust::from(case), old(case), "{case:?}");

@@ -63,30 +63,7 @@ use rustc_hash::FxHasher;
 use stdx::hash_once;
 use tracing::{Level, span};
 
-/// Handle to a file in [`Vfs`]
-///
-/// Most functions in rust-analyzer use this when they need to refer to a file.
-#[derive(Copy, Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Hash)]
-pub struct FileId(u32);
-// pub struct FileId(NonMaxU32);
-
-impl FileId {
-    const MAX: u32 = 0x7fff_ffff;
-
-    #[inline]
-    pub const fn from_raw(raw: u32) -> FileId {
-        assert!(raw <= Self::MAX);
-        FileId(raw)
-    }
-
-    #[inline]
-    pub const fn index(self) -> u32 {
-        self.0
-    }
-}
-
-/// safe because `FileId` is a newtype of `u32`
-impl nohash_hasher::IsEnabled for FileId {}
+pub use span::FileId;
 
 /// Storage for all file changes and the file id to path mapping.
 ///
@@ -203,7 +180,7 @@ impl Vfs {
     /// This will skip deleted files.
     pub fn iter(&self) -> impl Iterator<Item = (FileId, &VfsPath)> + '_ {
         (0..self.data.len())
-            .map(|it| FileId(it as u32))
+            .map(|it| FileId::from_raw(it as u32))
             .filter(move |&file_id| matches!(self.get(file_id), FileState::Exists(_)))
             .map(move |file_id| {
                 let path = self.interner.lookup(file_id);
@@ -262,7 +239,7 @@ impl Vfs {
         };
 
         let mut set_data = |change_kind| {
-            self.data[file_id.0 as usize] = match change_kind {
+            self.data[file_id.index() as usize] = match change_kind {
                 &Change::Create(_, hash) | &Change::Modify(_, hash) => FileState::Exists(hash),
                 Change::Delete => FileState::Deleted,
             };
@@ -332,7 +309,7 @@ impl Vfs {
 
     /// Grows `data` to hold `file_id`, IDs no path has reading as deleted.
     fn hold(&mut self, file_id: FileId) {
-        let idx = file_id.0 as usize;
+        let idx = file_id.index() as usize;
         let len = self.data.len().max(idx + 1);
         self.data.resize(len, FileState::Deleted);
     }
@@ -343,14 +320,14 @@ impl Vfs {
     ///
     /// Panics if no file is associated to that id.
     fn get(&self, file_id: FileId) -> FileState {
-        self.data[file_id.0 as usize]
+        self.data[file_id.index() as usize]
     }
 
     /// We cannot ignore excluded files, because this will lead to errors when the client
     /// requests semantic information for them, so we instead mark them specially.
     pub fn insert_excluded_file(&mut self, path: VfsPath) {
         let file_id = self.alloc_file_id(path);
-        self.data[file_id.0 as usize] = FileState::Excluded;
+        self.data[file_id.index() as usize] = FileState::Excluded;
     }
 }
 

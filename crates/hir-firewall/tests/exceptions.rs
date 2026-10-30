@@ -4,22 +4,21 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use base_db::Db;
 use hir_firewall::{CodeLeak, Codegen, EDIT, Harness, Report};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 /// Every function of `fixture` edited in turn, without codegen.
 fn run(fixture: &str) -> Report {
-    let mut db = Db::with_files(fixture);
-    let krate = db.test_crate();
+    let mut db = fixture::db(fixture).into_db();
+    let krate = fixture::test_crate(&db);
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
 }
 
 /// [`run`] with codegen's walk, as a dev build of the fixture's crate walks it.
 fn run_compiled(fixture: &str) -> Report {
-    let mut db = Db::with_files(fixture);
-    let krate = db.test_crate();
+    let mut db = fixture::db(fixture).into_db();
+    let krate = fixture::test_crate(&db);
     let codegen = Codegen::dev("fixture", Arc::new(HashMap::new())).expect("a dev build's policy for this machine");
     let mut harness = Harness::new(&mut db, krate, Some(codegen)).expect("the harness sets up");
     harness.run(&mut db, 1).expect("every edit is made")
@@ -117,7 +116,7 @@ pub fn other() -> u32 { 3 }
 /// value, and the harness reports them; nothing else.
 #[test]
 fn an_edit_that_changes_a_const_fn_s_value_is_found_at_its_users() {
-    let mut db = Db::with_files(
+    let mut db = fixture::db(
         r#"
 //- minicore: sized, copy
 pub const fn one() -> u32 { 1 }
@@ -125,8 +124,9 @@ pub const ONE: u32 = one();
 pub fn uses_one() -> [u8; ONE as usize] { [0; ONE as usize] }
 pub fn other() -> u32 { 3 }
 "#,
-    );
-    let krate = db.test_crate();
+    )
+    .into_db();
+    let krate = fixture::test_crate(&db);
     let mut harness = Harness::new(&mut db, krate, None).expect("the harness sets up");
     let one = harness.function("one").expect("`one` has a body");
     let mut report = Report::default();

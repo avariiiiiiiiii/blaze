@@ -10,7 +10,7 @@ use std::{
 
 use blaze_registry::{
     Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
-    download::{From, checksum, crate_url, parse_checksum, unpack_package_in},
+    download::{From, checksum, crate_key, crate_url, parse_checksum, unpack_package_in},
     http::{Http, Response},
     index::Status,
 };
@@ -58,10 +58,11 @@ impl Http for Server {
     }
 }
 
-/// A store of its own in `dir`, kept for the rest of the test process as the process's store
-/// is.
-fn store(dir: &Path) -> &'static blaze_store::Store {
-    Box::leak(Box::new(blaze_store::Store::open_by_content(dir).unwrap()))
+/// A store of its own in `dir`, kept for the rest of the test process as the daemon's store
+/// is; what is put is read at once, before any commit.
+fn store(dir: &Path) -> &'static blaze_cas::Handle {
+    let driven = Box::leak(Box::new(blaze_cas::Driven::open(dir).unwrap()));
+    Box::leak(Box::new(driven.handle()))
 }
 
 fn temporary(name: &str) -> PathBuf {
@@ -96,7 +97,7 @@ fn line(name: &str, version: &str, cksum: &str, extra: &str) -> String {
 
 struct Fixture {
     server: Arc<Server>,
-    store: &'static blaze_store::Store,
+    store: &'static blaze_cas::Handle,
     home: PathBuf,
     source: SourceId,
 }
@@ -118,7 +119,7 @@ impl Fixture {
         self.registry_with(offline, self.store)
     }
 
-    fn registry_with(&self, offline: bool, store: &'static blaze_store::Store) -> Registry {
+    fn registry_with(&self, offline: bool, store: &'static blaze_cas::Handle) -> Registry {
         let mut context = Context::new(self.home.clone(), self.server.clone());
         context.store = Some(store);
         context.net.offline = offline;
@@ -238,8 +239,7 @@ fn fetches_into_cargos_directories_and_the_store() {
     let crate_file =
         fixture.home.join("registry/cache").join(registry.dir_name()).join("Demo-1.0.0.crate");
     assert_eq!(checksum(&std::fs::read(&crate_file).unwrap()), package.checksum);
-    let key = parse_checksum(&package.checksum).unwrap();
-    fixture.store.seal();
+    let key = crate_key(&parse_checksum(&package.checksum).unwrap());
     assert!(fixture.store.has(&key));
 
     // Unpacked already: nothing read.
@@ -256,7 +256,6 @@ fn fetches_into_cargos_directories_and_the_store() {
     let empty = store(&fixture.home.join("empty-store"));
     let registry = fixture.registry_with(false, empty);
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::CargoCache);
-    empty.seal();
     assert!(empty.has(&key));
     // An unpacking cut short (no `.cargo-ok`) is done again.
     std::fs::remove_file(src.join(".cargo-ok")).unwrap();

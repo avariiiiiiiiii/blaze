@@ -33,7 +33,10 @@ mod cold;
 mod copy;
 use blaze_ids::crc32c as crc;
 mod disk;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+mod driven;
 mod flags;
+mod handle;
 mod index;
 mod read;
 pub mod remote;
@@ -65,6 +68,9 @@ use crate::disk::{
     NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX,
 };
 pub use crate::disk::content_of;
+pub use crate::handle::Handle;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub use crate::driven::Driven;
 use crate::flags::{FLAGS, Flag, Row};
 use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
 pub use crate::read::Pinned;
@@ -159,11 +165,15 @@ pub enum Kind {
     Output,
     /// The daemon's image.
     Image,
+    /// A whole module of machine code its loader maps (a Wasmtime module's): always a file of
+    /// its own, never compressed, so [`Pinned::file`] names it and the loader maps it
+    /// copy-on-write, its pages read only as its code runs.
+    Machine,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] =
-        [Kind::Query, Kind::Code, Kind::Debug, Kind::Run, Kind::Output, Kind::Image];
+    pub const ALL: [Kind; 7] =
+        [Kind::Query, Kind::Code, Kind::Debug, Kind::Run, Kind::Output, Kind::Image, Kind::Machine];
 
     /// The kind's byte on disk and on the wire.
     pub const fn code(self) -> u8 {
@@ -174,6 +184,7 @@ impl Kind {
             Kind::Run => 3,
             Kind::Output => 4,
             Kind::Image => 5,
+            Kind::Machine => 6,
         }
     }
 
@@ -185,6 +196,7 @@ impl Kind {
             3 => Some(Kind::Run),
             4 => Some(Kind::Output),
             5 => Some(Kind::Image),
+            6 => Some(Kind::Machine),
             _ => None,
         }
     }
@@ -197,6 +209,7 @@ impl Kind {
             Kind::Run => "run",
             Kind::Output => "output",
             Kind::Image => "image",
+            Kind::Machine => "machine",
         }
     }
 

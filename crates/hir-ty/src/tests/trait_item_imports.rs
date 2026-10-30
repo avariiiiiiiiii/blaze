@@ -8,7 +8,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use rustc_type_ir::{UintTy, inherent::IntoKind as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{InferBodyId, InferenceResult, next_solver::TyKind};
 
@@ -55,7 +55,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 
 #[test]
 fn an_imported_trait_function_infers_its_self_from_the_call() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         for (name, expected) in [("foreign", UintTy::U8), ("local", UintTy::U16)] {
             let def = DefWithBodyId::FunctionId(function(&db, name));

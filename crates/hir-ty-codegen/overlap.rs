@@ -1,7 +1,7 @@
 //! The locals of a body whose storage never overlaps share memory in the frame, as LLVM's
 //! stack colouring has them share it from the lifetime markers rustc writes. Cranelift gives
 //! every slot room of its own, so a function that matches on many shapes, each arm with its
-//! temporaries, had a frame of all of them at once: hir-ide's `<Ty as HirDisplay>::hir_fmt`
+//! temporaries, had a frame of all of them at once: hir-ty's `<Ty as HirDisplay>::hir_fmt`
 //! had one of 20 KB, and its tests that print a type nested two hundred deep overflowed a
 //! test thread's stack of 2 MB.
 //!

@@ -67,31 +67,47 @@ fn engine() -> &'static Engine {
 pub fn compile(path: &Path) -> anyhow::Result<Module> {
     // alloc: setup, once a run: the module's bytes, which its key is the hash of.
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?; // alloc: error path
-    let store = blaze_store::toolchain().and_then(|_| blaze_store::Store::global());
-    compile_in(&bytes, store).with_context(|| format!("compiling {}", path.display())) // alloc: error path
+    compile_in(&bytes, blaze_cas::Handle::installed()).with_context(|| format!("compiling {}", path.display())) // alloc: error path
 }
 
-/// As [`compile`], of a module's `bytes`, with what `store` keeps.
-fn compile_in(bytes: &[u8], store: Option<&blaze_store::Store>) -> anyhow::Result<Module> {
+/// As [`compile`], of a module's `bytes`, with what `store` keeps. The code it compiles is
+/// durable once the daemon commits.
+fn compile_in(bytes: &[u8], store: Option<&blaze_cas::Handle>) -> anyhow::Result<Module> {
     let engine = engine();
     let key = code_key(bytes, engine);
-    if let Some(code) = store.and_then(|it| it.get_lasting(&key)) {
-        return kept::load(engine, &code).context(
-            "the store's machine code of it, under a key of this engine's configuration, is refused",
-        );
+    if let Some(store) = store {
+        // alloc: error path
+        let kept = store.pinned(&key).map_err(|e| anyhow::anyhow!("the store's machine code of it: {e}"))?;
+        if let Some(kept) = kept {
+            return kept::load(engine, store, &kept).context(
+                "the store's machine code of it, under a key of this engine's configuration, is refused",
+            );
+        }
     }
     let module = Module::new(engine, bytes)?;
     if let Some(store) = store {
-        store.insert_lasting(&key, &module.serialize()?);
-        store.flush();
+        store.put(key, blaze_cas::Kind::Machine, module.serialize()?).map_err(|it| {
+            // alloc: error path
+            anyhow::anyhow!(
+                "the store keeps other machine code under the key of this module and engine \
+                 ({:x}, not {:x}): the key misses an input of the code",
+                it.kept,
+                it.given
+            )
+        })?;
     }
     Ok(module)
 }
 
-/// What the store keeps a script module's machine code under: the hash of its bytes and what
-/// Wasmtime says code must match to load (its version, its configuration, the target and the
-/// CPU features `engine` compiles for), and nothing of where the module is.
-fn code_key(bytes: &[u8], engine: &Engine) -> [u8; 32] {
+/// The schema of a script module's machine code as the store keeps it: what Wasmtime's
+/// `serialize` writes, which only a Wasmtime of the producer's compatibility hash loads.
+const MACHINE_CODE: blaze_format::SchemaHash = blaze_format::schema("wasmtime serialized module of a build script 1");
+
+/// What the store keeps a script module's machine code under: the hash of its bytes (the one
+/// input), and as the producer what Wasmtime says code must match to load (its version, its
+/// configuration, the target and the CPU features `engine` compiles for); nothing of where the
+/// module is.
+fn code_key(bytes: &[u8], engine: &Engine) -> blaze_cas::Key {
     use std::hash::Hash as _;
     struct Parts<'a>(&'a mut blaze_ids::Hasher);
     impl std::hash::Hasher for Parts<'_> {
@@ -102,24 +118,54 @@ fn code_key(bytes: &[u8], engine: &Engine) -> [u8; 32] {
             self.0.part(bytes);
         }
     }
-    let mut key = blaze_ids::Hasher::new("blaze v2 wasmtime machine code of a build script 1");
-    key.part(bytes).part(std::env::consts::ARCH.as_bytes());
-    engine.precompile_compatibility_hash().hash(&mut Parts(&mut key));
-    key.finish().0
+    let mut producer = blaze_ids::Hasher::new("blaze v2 wasmtime engine of build scripts 1");
+    producer.part(std::env::consts::ARCH.as_bytes());
+    engine.precompile_compatibility_hash().hash(&mut Parts(&mut producer));
+    let module = blaze_ids::ContentId::of("blaze v2 build script module 1", bytes);
+    blaze_cas::Key::of(MACHINE_CODE, producer.finish(), &[module])
 }
 
 /// Machine code from the store, made a module.
 #[allow(unsafe_code)]
 mod kept {
+    use std::path::Path;
+
     use wasmtime::{Engine, Module};
 
-    pub(super) fn load(engine: &Engine, code: &[u8]) -> wasmtime::Result<Module> {
-        // SAFETY: `code` is what the store keeps under a `code_key` of the module's bytes and
-        // of `engine`'s compatibility hash, checked against its checksum as it was read
-        // (`Store::get_lasting`), and only `compile_in` puts under such a key, the `serialize`
-        // of a module an engine of that hash compiled; Wasmtime refuses code of another
-        // version, configuration or CPU. Other bytes would run as machine code.
-        unsafe { Module::deserialize(engine, code) }
+    /// Committed code is a file of its own (`blaze_cas::Kind::Machine`), mapped copy-on-write
+    /// with its pages read only as its code runs; code put since the daemon's last commit is
+    /// in the store's memory still, and loaded from its bytes.
+    pub(super) fn load(engine: &Engine, store: &blaze_cas::Handle, code: &blaze_cas::Pinned) -> anyhow::Result<Module> {
+        Ok(match code.file() {
+            Some(file) => {
+                let at = store.path_of(file);
+                let open = open_code(&at).map_err(|e| anyhow::anyhow!("opening {}: {e}", at.display()))?;
+                // SAFETY: the file is the store's of the value under a `code_key` of the
+                // module's bytes and of `engine`'s compatibility hash, whose bytes were checked
+                // against their content hash as they were pinned; the store names it by that
+                // hash and only ever renames a file of the same bytes over it. Only
+                // `compile_in` puts under such a key, the `serialize` of a module an engine of
+                // that hash compiled; Wasmtime refuses code of another version, configuration
+                // or CPU. Other bytes would run as machine code.
+                unsafe { Module::deserialize_open_file(engine, open) }?
+            }
+            // SAFETY: as above, of the value's checked bytes, which Wasmtime copies.
+            None => unsafe { Module::deserialize(engine, &**code) }?,
+        })
+    }
+
+    /// The store's file of machine code, opened as Wasmtime maps it: readable, and on Windows
+    /// executable too.
+    fn open_code(at: &Path) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_GENERIC_READ | FILE_GENERIC_EXECUTE, which Wasmtime's mapping of it needs.
+            options.access_mode(0x0012_0089 | 0x0012_00A0);
+        }
+        options.open(at)
     }
 }
 
@@ -265,17 +311,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("blaze-wasi-kept-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        blaze_store::compiles_against("blaze-wasi tests");
-        let store = blaze_store::Store::open_at(&dir.join("store")).unwrap();
+        let mut driven = blaze_cas::Driven::open(&dir).unwrap();
+        let store = driven.handle();
         let bytes = exits_7();
         let key = code_key(&bytes, engine());
-        assert!(!store.has_lasting(&key));
+        assert!(!store.has(&key));
         let compiled = compile_in(&bytes, Some(&store)).unwrap();
-        store.seal();
-        let code = store.get_lasting(&key).expect("the compile kept its machine code");
-        assert_eq!(code, compiled.serialize().unwrap());
+        let in_memory = compile_in(&bytes, Some(&store)).unwrap();
+        driven.flush().unwrap();
+        let code = store.pinned(&key).unwrap().expect("the compile kept its machine code");
+        assert_eq!(&*code, compiled.serialize().unwrap().as_slice());
+        assert!(code.file().is_some(), "committed machine code is a file of its own, which Wasmtime maps");
         let loaded = compile_in(&bytes, Some(&store)).unwrap();
-        for module in [&compiled, &loaded, &compile_in(&bytes, None).unwrap()] {
+        for module in [&compiled, &in_memory, &loaded, &compile_in(&bytes, None).unwrap()] {
             let exited = ran(module);
             assert_eq!((exited.status, exited.trap), (7, None));
         }

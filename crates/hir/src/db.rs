@@ -4,4 +4,4 @@
 //!
 //! But we need this for at least LRU caching at the query level.
 pub use hir_def::file_item_tree;
-pub use hir_ide::db::HirDatabase;
+pub use hir_ty::db::HirDatabase;

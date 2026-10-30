@@ -7,7 +7,8 @@
 //! and simplified self type, as `TraitImpls`/`InherentImpls` index) of each impl the write
 //! could have changed (its read set met the delta), moves the rows whose key changed in the
 //! arrangements, and sets the salsa inputs ([`publish`]) of each `(crate, trait)`,
-//! `(crate, head)` and `(crate, name)` slice whose rows changed, each with its `ContentId`.
+//! `(crate, head)` and `(crate, name)` slice whose rows changed. Their `ContentId`s are queries
+//! over the rows, through the impl and def identities lane item-hash installs.
 //!
 //! The impls of body blocks stay in per-module pulled tables; the maintainer reads again the
 //! body parts of the modules a write may have changed the bodies of, and each slice lists the
@@ -33,8 +34,9 @@ use hir_expand::name::Name;
 pub use self::{
     head::{Head, HeadDef},
     publish::{
-        CANDIDATE_SET_DOMAIN, CandidateSlice, IMPL_SET_DOMAIN, ImplSlices, InherentSlice,
-        SliceDirectory, TraitImplsSlice, candidate_set_hash, impl_identity, impl_set_hash,
+        CANDIDATE_SET_DOMAIN, CandidateSlice, IMPL_SET_DOMAIN, ImplIdentities, ImplSlices,
+        InherentSlice, SliceDirectory, TraitImplsSlice, candidate_set_hash, impl_identity,
+        impl_set_hash, install_identities,
     },
     read::{blanket_hash, impl_row_hash},
     state::State,

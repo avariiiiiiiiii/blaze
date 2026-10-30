@@ -370,7 +370,7 @@ fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
 #[cfg(test)]
 mod view_tests {
     use syntax::view::HasName as _;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::{
@@ -429,7 +429,9 @@ pub use m::*;
     /// only its own syntax.
     #[test]
     fn visibility_of_each_way_to_write_one() {
-        let (db, _) = TestDB::with_single_file(CODE);
+        let fx = fixture::db(CODE);
+        let _ = fx.only_file();
+        let db = fx.into_db();
         let mut seen = Vec::new();
         let mut items = Vec::new();
         let mut traits = 0;

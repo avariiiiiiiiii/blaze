@@ -8,7 +8,7 @@ use hir::{
     AssocItem, Crate, HasAttrs, HasCrate, HasVisibility, Impl, InFile, ModuleDef, Visibility,
     view::HasSourceView,
 };
-use ide_db::RootDatabase;
+use base_db::Db;
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     SyntaxKind, T, TextRange, TextSize,
@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Builds the model of every crate placed.
-pub(crate) fn build(db: &RootDatabase, places: &Places) -> Model {
+pub(crate) fn build(db: &Db, places: &Places) -> Model {
     use rayon::prelude::*;
     let files = Files::new(db, places);
     let std = StdItems::find(db, places);
@@ -76,7 +76,7 @@ enum Members {
 }
 
 /// Whether `imp` is a `#[rustc_reservation_impl]` (`impl<T> From<!> for T`), which no type has.
-fn reservation(db: &RootDatabase, imp: Impl) -> bool {
+fn reservation(db: &Db, imp: Impl) -> bool {
     hir_def::ImplId::try_from(imp).is_ok_and(|id| {
         hir_def::attrs::AttrFlags::query(db, id.into())
             .contains(hir_def::attrs::AttrFlags::RUSTC_RESERVATION_IMPL)
@@ -87,7 +87,7 @@ fn reservation(db: &RootDatabase, imp: Impl) -> bool {
 /// than the one they are for: of each documented type the impl names as an argument of the
 /// trait (`impl From<Local> for Foreign`), as the self type behind a reference, or inside a
 /// `#[fundamental]` type (`impl Clone for Box<Local>`).
-fn impls_by_trait_arg(db: &RootDatabase, places: &Places) -> FxHashMap<hir::Adt, Vec<Impl>> {
+fn impls_by_trait_arg(db: &Db, places: &Places) -> FxHashMap<hir::Adt, Vec<Impl>> {
     let mut out: FxHashMap<hir::Adt, Vec<Impl>> = FxHashMap::default();
     for documented in &places.crates {
         for imp in Impl::all_in_crate(db, documented.krate) {
@@ -126,7 +126,7 @@ fn impls_by_trait_arg(db: &RootDatabase, places: &Places) -> FxHashMap<hir::Adt,
     out
 }
 
-fn fundamental(db: &RootDatabase, adt: hir::Adt) -> bool {
+fn fundamental(db: &Db, adt: hir::Adt) -> bool {
     hir_def::attrs::AttrFlags::query(db, hir_def::AdtId::from(adt).into())
         .contains(hir_def::attrs::AttrFlags::FUNDAMENTAL)
 }
@@ -151,7 +151,7 @@ struct AutoTrait {
 }
 
 impl StdItems {
-    fn find(db: &RootDatabase, places: &Places) -> StdItems {
+    fn find(db: &Db, places: &Places) -> StdItems {
         let core =
             Crate::all(db).into_iter().find(|it| places::lang_crate_name(db, *it) == Some("core"));
         let mut auto = vec![];
@@ -194,7 +194,7 @@ impl StdItems {
             }
             // Not the crates the sysroot's own depend on (its tests' `rand`).
             let crates = Crate::all(db).into_iter().filter(|it| match it.origin(db) {
-                ide_db::base_db::CrateOrigin::Lang(_) => {
+                base_db::CrateOrigin::Lang(_) => {
                     matches!(places::lang_crate_name(db, *it), Some("core" | "alloc" | "std"))
                 }
                 _ => upstream.contains(it),
@@ -217,7 +217,7 @@ impl StdItems {
 }
 
 /// The item at `path` from the root of `krate`, through modules then a name in the last.
-fn lookup(db: &RootDatabase, krate: Crate, path: &[&str]) -> Option<ModuleDef> {
+fn lookup(db: &Db, krate: Crate, path: &[&str]) -> Option<ModuleDef> {
     let (last, modules) = path.split_last()?;
     let mut module = krate.root_module(db);
     for name in modules {
@@ -230,7 +230,7 @@ fn lookup(db: &RootDatabase, krate: Crate, path: &[&str]) -> Option<ModuleDef> {
 }
 
 struct Builder<'a> {
-    db: &'a RootDatabase,
+    db: &'a Db,
     places: Linking<'a>,
     files: &'a Files,
     std: &'a StdItems,
@@ -1476,7 +1476,7 @@ fn assoc_def(assoc: AssocItem) -> ModuleDef {
     }
 }
 
-fn assoc_hidden(db: &RootDatabase, assoc: AssocItem) -> bool {
+fn assoc_hidden(db: &Db, assoc: AssocItem) -> bool {
     match assoc {
         AssocItem::Function(it) => it.attrs(db).is_doc_hidden(),
         AssocItem::Const(it) => it.attrs(db).is_doc_hidden(),
@@ -1484,7 +1484,7 @@ fn assoc_hidden(db: &RootDatabase, assoc: AssocItem) -> bool {
     }
 }
 
-fn assoc_visibility(db: &RootDatabase, assoc: AssocItem) -> Visibility {
+fn assoc_visibility(db: &Db, assoc: AssocItem) -> Visibility {
     match assoc {
         AssocItem::Function(it) => it.visibility(db),
         AssocItem::Const(it) => it.visibility(db),
@@ -1492,7 +1492,7 @@ fn assoc_visibility(db: &RootDatabase, assoc: AssocItem) -> Visibility {
     }
 }
 
-fn must_use(db: &RootDatabase, def: ModuleDef) -> Option<String> {
+fn must_use(db: &Db, def: ModuleDef) -> Option<String> {
     let id: hir_def::AttrDefId = match def {
         ModuleDef::Function(it) => hir_def::FunctionId::try_from(it).ok()?.into(),
         ModuleDef::Adt(it) => hir_def::AdtId::from(it).into(),
@@ -1591,7 +1591,7 @@ fn small_url_encode(text: &str) -> String {
 /// Whether a blanket impl applies to `ty`, as rustdoc decides: with the impl's parameters and
 /// the type's as inference variables, each of the impl's where-clauses may hold, solved in
 /// `krate`, the crate documented, which may see impls a re-exported type's crate does not.
-fn blanket_applies(db: &RootDatabase, imp: Impl, ty: &hir::Type<'_>, krate: Crate) -> bool {
+fn blanket_applies(db: &Db, imp: Impl, ty: &hir::Type<'_>, krate: Crate) -> bool {
     imp.self_ty(db).as_type_param(db).is_some() && ty.may_have_impl(db, imp, krate)
 }
 

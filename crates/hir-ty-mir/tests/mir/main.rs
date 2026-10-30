@@ -29,7 +29,7 @@ mod unwind;
 use hir_def::{ConstId, FunctionId};
 use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::{MirOptions, print_mir_body};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use db::TestDB;
 
@@ -39,18 +39,20 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 #[track_caller]
 fn constant(db: &TestDB, name: &str) -> ConstId {
-    hir_def::test_items::constant(db, db.test_crate(), name)
+    hir_def::test_items::constant(db, fixture::test_crate(db), name)
 }
 
 /// The MIR of the function `name` in a one-file fixture, as asked with `options`, printed.
 #[track_caller]
 fn mir(fixture: &str, name: &str, options: MirOptions) -> String {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let func = function(&db, name);
         let body = db

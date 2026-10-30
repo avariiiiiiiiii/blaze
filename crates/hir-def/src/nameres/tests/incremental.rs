@@ -5,7 +5,7 @@ use base_db::{
 use expect_test::{Expect, expect};
 use intern::Symbol;
 use span::Edition;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 use triomphe::Arc;
 
 use crate::{
@@ -19,7 +19,9 @@ fn check_def_map_is_not_recomputed(
     expecta: Expect,
     expectb: Expect,
 ) {
-    let (mut db, pos) = TestDB::with_position(ra_fixture_initial);
+    let fx = fixture::db(ra_fixture_initial);
+    let pos = fx.position();
+    let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     execute_assert_events(
         &db,
@@ -43,7 +45,7 @@ fn check_def_map_is_not_recomputed(
 
 #[test]
 fn crate_metadata_changes_should_not_invalidate_unrelated_def_maps() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /a.rs crate:a
 pub fn foo() {}
@@ -55,6 +57,8 @@ pub struct Bar;
 pub const BAZ: u32 = 0;
     "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
 
     for &krate in all_crates(&db).iter() {
         crate_def_map(&db, krate);
@@ -497,7 +501,7 @@ pub struct S {}
 
 #[test]
 fn typing_inside_a_function_should_not_invalidate_item_expansions() {
-    let (mut db, pos) = TestDB::with_position(
+    let fx = fixture::db(
         r#"
 //- /lib.rs
 macro_rules! m {
@@ -517,7 +521,9 @@ m!(Y);
 m!(Z);
 "#,
     );
-    let krate = db.test_crate();
+    let pos = fx.position();
+    let mut db = fx.into_db();
+    let krate = fixture::test_crate(&db);
     execute_assert_events(
         &db,
         || {
@@ -598,7 +604,7 @@ m!(Z);
 
 #[test]
 fn item_tree_prevents_reparsing() {
-    let (mut db, pos) = TestDB::with_position(
+    let fx = fixture::db(
         r#"
 pub struct S;
 pub union U {}
@@ -613,11 +619,13 @@ pub static ST: u8 = 0;
 pub type Ty = ();
 "#,
     );
+    let pos = fx.position();
+    let mut db = fx.into_db();
 
     execute_assert_events(
         &db,
         || {
-            file_item_tree(&db, pos.file_id.into(), db.test_crate());
+            file_item_tree(&db, pos.file_id.into(), fixture::test_crate(&db));
         },
         &[("file_item_tree_query", 1), ("parse", 1)],
         expect![[r#"
@@ -637,7 +645,7 @@ pub type Ty = ();
     execute_assert_events(
         &db,
         || {
-            file_item_tree(&db, pos.file_id.into(), db.test_crate());
+            file_item_tree(&db, pos.file_id.into(), fixture::test_crate(&db));
         },
         &[("file_item_tree_query", 1), ("parse", 1)],
         expect![[r#"
@@ -673,7 +681,7 @@ fn item_after_impl_is_its_own_span_anchor() {
         view::{self as ast, AstNode, HasModuleItem},
     };
 
-    let (db, pos) = TestDB::with_position(
+    let fx = fixture::db(
         r#"
 struct S;
 impl S {
@@ -683,6 +691,8 @@ impl S {
 struct AfterImpl;
 "#,
     );
+    let pos = fx.position();
+    let db = fx.into_db();
     let file_id = HirFileId::from(pos.file_id);
     let after_impl = pos.file_id.parse(&db).view().items().last().unwrap();
     assert!(matches!(after_impl, ast::Item::Struct(_)));

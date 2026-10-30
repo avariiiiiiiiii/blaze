@@ -1,19 +1,19 @@
 //! Allocation budgets of the signature queries: a warm re-request is a memo hit and allocates
 //! nothing; a miss allocates only its value.
 
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::*;
 use crate::{
     AdtId, ModuleDefId,
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
     test_items::{declarations, impls},
 };
 
 /// A second request of each signature query is a memo hit: no allocation.
 #[test]
 fn warm_signature_requests_allocate_nothing() {
-    let (db, _) = TestDB::with_single_file(
+    let fx = fixture::db(
         r#"
 pub struct S<T: Clone>(T) where T: Copy;
 pub union U { a: u8 }
@@ -26,6 +26,8 @@ pub fn f<'a, T: ?Sized>(x: &'a T) -> &'a T { x }
 pub type A<T> = (T, T);
 "#,
     );
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let krate = db.fetch_test_crate();
     let defs = declarations(&db, krate);
     let impl_ = *impls(&db, krate).first().expect("the fixture has an impl");
@@ -68,7 +70,9 @@ pub type A<T> = (T, T);
 /// are predefined symbols, so naming them interns nothing.
 #[test]
 fn enum_variants_miss_is_its_map() {
-    let (db, _) = TestDB::with_single_file("pub enum E { Some, None }");
+    let fx = fixture::db("pub enum E { Some, None }");
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let e = declarations(&db, db.fetch_test_crate())
         .into_iter()
         .find_map(|it| match it {

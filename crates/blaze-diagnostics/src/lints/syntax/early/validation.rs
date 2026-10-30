@@ -5,7 +5,7 @@
 //!
 //! `non_camel_case_types` of the other names rustc's `NonCamelCaseTypes` checks (types,
 //! traits, trait aliases, associated types, variants) is hir's `IncorrectCase`
-//! (`hir_ide::diagnostics::decl_check`), lowered in `crate::lower::incorrect_case`: it checks
+//! (`hir_ty::diagnostics::decl_check`), lowered in `crate::lower::incorrect_case`: it checks
 //! no type parameter, so each name is linted once.
 //!
 //! AST validation runs on the crate once it is expanded and `cfg` has removed what it removes,

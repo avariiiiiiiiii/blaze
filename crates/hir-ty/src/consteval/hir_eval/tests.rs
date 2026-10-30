@@ -1,7 +1,7 @@
 //! The HIR evaluator's operations and programs against a reference written as the MIR
 //! evaluator computes: each value its native integer type read from its bytes, each check the
 //! assert of `hir-ty-mir`'s `transform/asserts.rs`. The differential against the MIR
-//! evaluator itself, over a database, is `hir-ide`'s `tests/consteval/hir_eval.rs`.
+//! evaluator itself, over a database, is `hir-ty-mir`'s `tests/consteval/hir_eval.rs`.
 
 use hir_def::hir::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, UnaryOp};
 

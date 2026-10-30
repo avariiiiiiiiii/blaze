@@ -13,37 +13,37 @@ blaze to test with yet), one run in the root workspace, with `args` after its ow
 the run is passed on as it comes, so a CI log shows a slow build while it is slow. A failing test that is not in OPEN fails the run, and so does a test in
 OPEN that passes or no longer exists: take it out; so does the cargo run failing before any of
 its tests failed. `ide-diagnostics` is the daemon's errors (its diagnostics are the verdict).
-`hir-ide` is rust-analyzer's type inference with its own tests; the ones in OPEN are what the
+`hir-ty-mir` has rust-analyzer's type inference tests; the ones in OPEN are what the
 fork does differently from upstream that its expectations have not caught up with.
 """
 import dataclasses, json, os, re, subprocess, sys, typing
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CRATES = [
-    "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-splice", "blaze-cargo", "blaze-engine",
-    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "hir-ide", "ide-diagnostics",
+    "hir-ty-codegen", "blaze-store", "blaze-registry", "blaze-resolve", "blaze-build-script", "blaze-manifest", "blaze-in-place", "blaze-cargo", "blaze-engine",
+    "hir-ty", "hir-ty-mir", "hir-ty-borrowck", "hir-ty-wfcheck", "hir-def", "parser", "syntax", "const-ast", "ide-diagnostics",
 ]
 CRATES += ["proc-macro-api"]
 
 # crate::test, as libtest names it under the crate's test binary.
 OPEN = {
-    "hir_ide::tests::display_source_code::render_dyn_ty_independent_of_order",
-    "hir_ide::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
-    "hir_ide::tests::incremental::add_struct_invalidates_trait_solve",
-    "hir_ide::tests::incremental::adding_enum_query_log",
-    "hir_ide::tests::incremental::adding_impl_query_log",
-    "hir_ide::tests::incremental::adding_struct_invalidates_infer",
-    "hir_ide::tests::incremental::adding_use_query_log",
-    "hir_ide::tests::mir::eval::caller_location_intrinsic",
-    "hir_ide::tests::regression::issue_6628",
-    "hir_ide::tests::regression::new_solver::trait_solving_with_error",
-    "hir_ide::tests::regression::regression_21605",
-    "hir_ide::tests::simple::box_into_vec",
-    "hir_ide::tests::traits::assoc_types_from_bounds",
-    "hir_ide::tests::traits::closure_signature_from_struct_where_clause",
-    "hir_ide::tests::traits::infer_box_fn_arg",
-    "hir_ide::tests::traits::infer_from_return_pos_impl_trait",
-    "hir_ide::tests::traits::nested_impl_traits",
+    "hir_ty_mir::tests::display_source_code::render_dyn_ty_independent_of_order",
+    "hir_ty_mir::tests::display_source_code::render_dyn_ty_under_enclosing_binder",
+    "hir_ty_mir::tests::incremental::add_struct_invalidates_trait_solve",
+    "hir_ty_mir::tests::incremental::adding_enum_query_log",
+    "hir_ty_mir::tests::incremental::adding_impl_query_log",
+    "hir_ty_mir::tests::incremental::adding_struct_invalidates_infer",
+    "hir_ty_mir::tests::incremental::adding_use_query_log",
+    "hir_ty_mir::tests::mir::eval::caller_location_intrinsic",
+    "hir_ty_mir::tests::regression::issue_6628",
+    "hir_ty_mir::tests::regression::new_solver::trait_solving_with_error",
+    "hir_ty_mir::tests::regression::regression_21605",
+    "hir_ty_mir::tests::simple::box_into_vec",
+    "hir_ty_mir::tests::traits::assoc_types_from_bounds",
+    "hir_ty_mir::tests::traits::closure_signature_from_struct_where_clause",
+    "hir_ty_mir::tests::traits::infer_box_fn_arg",
+    "hir_ty_mir::tests::traits::infer_from_return_pos_impl_trait",
+    "hir_ty_mir::tests::traits::nested_impl_traits",
 }
 # Known to fail when blaze builds and tests them, and not when rustc does: OPEN too on a blaze run.
 OPEN_BLAZE = {

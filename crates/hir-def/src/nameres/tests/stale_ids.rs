@@ -5,16 +5,16 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     nameres::crate_def_map,
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
 };
 
 #[test]
 fn a_module_id_kept_past_its_deletion_panics_or_reads_a_module() {
-    let (mut db, files) = TestDB::with_many_files(
+    let fx = fixture::db(
         r#"
 //- /main.rs
 mod foo;
@@ -25,6 +25,8 @@ pub struct S;
 pub struct T;
 "#,
     );
+    let files = fx.files().to_vec();
+    let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
     let main = files[0].file_id(&db);
     let foo = db.module_for_file(files[1].file_id(&db));

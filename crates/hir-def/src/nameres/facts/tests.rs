@@ -23,6 +23,7 @@ use either::Either;
 use hir_expand::{
     AstId, ErasedAstId, InFile, MacroCallId,
     attrs::AttrId,
+    fixture,
     name::Name,
     proc_macro::{
         CustomProcMacroExpander, ProcMacro, ProcMacroCall, ProcMacroExpander,
@@ -34,8 +35,6 @@ use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::Edition;
 use syntax::ast;
-use test_fixture::ChangeFixture;
-use test_utils::MiniCore;
 use triomphe::Arc;
 
 use crate::{
@@ -1175,10 +1174,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
 /// A database of `fixture`, which may mark a position (`$0`): the comparisons read none.
 pub(in crate::nameres) fn fixture_db(fixture: &str) -> TestDB {
-    let mut db = TestDB::for_tests();
-    let change = ChangeFixture::parse_with_proc_macros(fixture, MiniCore::RAW_SOURCE, extra_proc_macros());
-    change.change.apply(&mut db);
-    db
+    fixture::db_with_proc_macros(fixture, extra_proc_macros()).into_db()
 }
 
 /// Runs `f` with the builtin-derive fast path on or off (`ENABLE_BUILTIN_DERIVE_FAST_PATH`),

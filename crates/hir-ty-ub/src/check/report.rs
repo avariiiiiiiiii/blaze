@@ -138,7 +138,7 @@ impl<'db> Report<'_, 'db> {
     }
 }
 
-/// The file and range of `span` in the body of `def` (as hir-ide's `mir_pretty::errors`).
+/// The file and range of `span` in the body of `def` (as hir-ty-mir's `mir_pretty::errors`).
 fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {

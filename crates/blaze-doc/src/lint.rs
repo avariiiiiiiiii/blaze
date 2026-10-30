@@ -5,7 +5,7 @@
 //! in docs a macro of another crate wrote is not reported at all, as rustc reports no lint there.
 
 use hir::{CfgExpr, CfgOptions, HirFileId, InFile, view::Semantics};
-use ide_db::RootDatabase;
+use base_db::Db;
 use syntax::{
     NodeOrToken, TextRange,
     view::{self as ast, AstNode, HasAttrs},
@@ -13,7 +13,7 @@ use syntax::{
 
 /// Whether a broken link at `at`, in `krate`, is reported.
 pub(crate) fn broken_links_reported(
-    db: &RootDatabase,
+    db: &Db,
     krate: hir::Crate,
     at: InFile<TextRange>,
 ) -> bool {
@@ -26,7 +26,7 @@ pub(crate) fn broken_links_reported(
 /// 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0; `broken_intra_doc_links` does not ask to be
 /// reported there). A doc comment a macro passes on as it was given keeps the caller's `#`,
 /// and the text of an included file is the file's.
-fn in_external_macro(db: &RootDatabase, krate: hir::Crate, at: InFile<TextRange>) -> bool {
+fn in_external_macro(db: &Db, krate: hir::Crate, at: InFile<TextRange>) -> bool {
     let HirFileId::MacroFile(file) = at.file_id else { return false };
     let root = at.file_id.root(db);
     if !root.text_range().contains_range(at.value) {
@@ -48,13 +48,13 @@ fn in_external_macro(db: &RootDatabase, krate: hir::Crate, at: InFile<TextRange>
     let loc = hir_expand::MacroCallId::from(expn).loc(db);
     match loc.kind {
         hir_expand::MacroCallKind::FnLike { .. } => {
-            !loc.def.is_include() && loc.def.krate != ide_db::base_db::Crate::from(krate)
+            !loc.def.is_include() && loc.def.krate != base_db::Crate::from(krate)
         }
         hir_expand::MacroCallKind::Derive { .. } | hir_expand::MacroCallKind::Attr { .. } => true,
     }
 }
 
-fn level(db: &RootDatabase, krate: hir::Crate, at: InFile<TextRange>) -> Option<bool> {
+fn level(db: &Db, krate: hir::Crate, at: InFile<TextRange>) -> Option<bool> {
     let cfg = krate.cfg(db);
     let sema = Semantics::new(db);
     let root = at.file_id.root(db);

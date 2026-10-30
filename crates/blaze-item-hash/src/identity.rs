@@ -5,9 +5,10 @@
 //! It hashes, each as its own part:
 //!
 //! - its crate's inputs (3.1, [`crate_inputs`]) and its crate's lang items by signature;
-//! - its owner (3.2): which item it is the body of, by key and signature, and the impl or
-//!   trait that item is in;
-//! - its HIR (3.3) as [`hir_def::item_hash::portable_body`] writes it, with no span;
+//! - its owner (3.2): the item it is the body of as "self", by signature and attributes, and
+//!   the impl or trait that item is in by key and signature;
+//! - its HIR (3.3) as [`hir_def::item_hash::portable_body`] writes it, anonymous, with no
+//!   span, and what a location macro expanded to as a slot (`slots`);
 //! - what each id the HIR names is (3.4, `entries`);
 //! - what each path resolves to where it is written, and the traits in scope (3.5, `names`);
 //! - the chain of modules it is in, by key (3.6): privacy and `super` paths.
@@ -18,20 +19,21 @@
 mod entries;
 mod inputs;
 mod item;
-mod names;
+pub(crate) mod names;
+mod slots;
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use hir_def::{
-    DefWithBodyId, HasModule as _, ItemContainerId, Lookup as _, expr_store::Body,
+    AttrDefId, DefWithBodyId, HasModule as _, ItemContainerId, Lookup as _, expr_store::Body,
     item_hash::portable_body,
 };
 
 pub use inputs::{FrontEnd, crate_inputs, set_build};
 
-pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 1";
+pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 2";
 
 /// A body that has no identity, and why: its inference, MIR and borrow check are computed
 /// and not filed.
@@ -56,19 +58,15 @@ fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     h.id(&crate_inputs(db, home));
     h.id(&inputs::lang_item_signatures(db, home)?);
     owner(db, def, &mut h)?;
-    let body = Body::of(db, def);
-    let portable = portable_body(body);
+    let names = names::names_of(db, def).as_ref().map_err(|it| *it)?;
+    let portable = portable_body(Body::of(db, def), &names.blank, &slots::of(db, def));
     h.part(portable.bytes());
     scratch::with_bytes(|buffer| -> Result<(), &'static str> {
-        entries::write(db, home, &portable, buffer)?;
+        entries::write(db, home, item::own_item(def), &portable, buffer)?;
         h.part(buffer);
-        buffer.clear();
-        scratch::with_bytes(|traits| {
-            names::write(db, def, body, buffer, traits)?;
-            h.part(buffer).part(traits);
-            Ok(())
-        })
+        Ok(())
     })?;
+    h.part(&names.names).part(&names.traits);
     let mut module = Some(def.module(db));
     let mut depth = 0u32;
     while let Some(it) = module {
@@ -80,8 +78,9 @@ fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     Ok(h.finish())
 }
 
-/// Section 3.2: which item `def` is the body of, by key and signature, and the impl or trait
-/// that item is in (its generics and where clauses are the body's too).
+/// Section 3.2: the item `def` is the body of, as "self" by its signature and attributes (a
+/// variant's discriminant: its enum by key and signature), and the impl or trait that item is
+/// in by key and signature (its generics and where clauses are the body's too).
 fn owner(db: &Db, def: DefWithBodyId, h: &mut Hasher) -> Result<(), &'static str> {
     let container = match def {
         DefWithBodyId::FunctionId(it) => {
@@ -101,7 +100,15 @@ fn owner(db: &Db, def: DefWithBodyId, h: &mut Hasher) -> Result<(), &'static str
             None
         }
     };
-    h.update(&item::item_part(db, ItemId::of_body(db, def))?);
+    match item::own_item(def) {
+        Some(own) => {
+            h.update(&item::self_part(db, own)?);
+            h.id(&own_attrs(db, def).ok_or("its attributes have no hash")?);
+        }
+        None => {
+            h.update(&item::item_part(db, ItemId::of_body(db, def))?);
+        }
+    }
     match container {
         Some(ItemContainerId::ImplId(it)) => {
             h.update(&[1]).update(&item::item_part(db, ItemId::Impl(it))?);
@@ -114,6 +121,18 @@ fn owner(db: &Db, def: DefWithBodyId, h: &mut Hasher) -> Result<(), &'static str
         }
     }
     Ok(())
+}
+
+/// The value of the `Attrs` fact of the item `def` is the body of, which [`owner`] hashes, so
+/// that a read of it by the body's steps is covered; `None` for a variant's discriminant.
+pub(crate) fn own_attrs(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
+    let owner = match def {
+        DefWithBodyId::FunctionId(it) => AttrDefId::FunctionId(it),
+        DefWithBodyId::ConstId(it) => AttrDefId::ConstId(it),
+        DefWithBodyId::StaticId(it) => AttrDefId::StaticId(it),
+        DefWithBodyId::VariantId(_) => return None,
+    };
+    crate::values::value(db, crate::values::attrs(db, owner)?)
 }
 
 /// Which reads of a [`covered_queries`] query the identity covers, by its key.

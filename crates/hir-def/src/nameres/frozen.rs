@@ -3458,7 +3458,7 @@ impl Dec<'_> {
 
 #[cfg(test)]
 mod tests {
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::test_db::TestDB;
@@ -3527,7 +3527,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
 
     /// The bytes of each crate of a fresh database of [`FIXTURE`], dependencies first.
     fn frozen() -> Vec<(&'static str, Vec<u8>)> {
-        let db = TestDB::with_files(FIXTURE);
+        let db = fixture::db(FIXTURE).into_db();
         ["lib", "main"]
             .into_iter()
             .map(|name| (name, encode(&db, crate_named(&db, name)).unwrap()))
@@ -3535,7 +3535,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     }
 
     fn with(mode: Mode, bytes: &[(&'static str, Vec<u8>)]) -> TestDB {
-        let mut db = TestDB::with_files(FIXTURE);
+        let mut db = fixture::db(FIXTURE).into_db();
         let maps = bytes
             .iter()
             .map(|(name, bytes)| {
@@ -3587,7 +3587,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     /// for field.
     #[test]
     fn a_builtin_macro_error_reads_back_whole() {
-        let db = TestDB::with_files(FIXTURE);
+        let db = fixture::db(FIXTURE).into_db();
         let krate = crate_named(&db, "main");
         let def_map = super::super::crate_def_map(&db, krate);
         let root = def_map.root;
@@ -3647,7 +3647,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     #[test]
     fn the_name_records_read_back() {
         let bytes = frozen();
-        let live = TestDB::with_files(FIXTURE);
+        let live = fixture::db(FIXTURE).into_db();
         let served = with(Mode::Serve, &bytes);
         let main = |db: &TestDB| super::super::crate_def_map(db, crate_named(db, "main"));
         let records = main(&live).name_records(&live);
@@ -3670,7 +3670,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     #[test]
     fn each_scope_reads_back_as_it_was_written() {
         let bytes = frozen();
-        let live = TestDB::with_files(FIXTURE);
+        let live = fixture::db(FIXTURE).into_db();
         let served = with(Mode::Serve, &bytes);
         for name in ["lib", "main"] {
             assert_eq!(scope_bytes(&served, name), scope_bytes(&live, name), "{name}");
@@ -3680,7 +3680,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
     #[test]
     fn read_back_resolves_the_same() {
         let bytes = frozen();
-        let live = TestDB::with_files(FIXTURE);
+        let live = fixture::db(FIXTURE).into_db();
         let served = with(Mode::Serve, &bytes);
         for name in ["lib", "main"] {
             let dump =
@@ -3700,11 +3700,11 @@ pub mod made;
 //- /lib/made.rs
 pub fn made() {}
 "#;
-        let db = TestDB::with_files(OUTSIDE);
+        let db = fixture::db(OUTSIDE).into_db();
         let lib = crate_named(&db, "lib");
         let bytes = encode(&db, lib).unwrap();
         assert_eq!(unreadable(&db, lib, &bytes), None);
-        let changed = TestDB::with_files(&OUTSIDE.replace("{}\n", "{}\npub fn more() {}\n"));
+        let changed = fixture::db(&OUTSIDE.replace("{}\n", "{}\npub fn more() {}\n")).into_db();
         let why = unreadable(&changed, crate_named(&changed, "lib"), &bytes);
         assert!(
             why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
@@ -3725,11 +3725,11 @@ include!("../out/made.rs");
 #[macro_export]
 macro_rules! unroll { () => { pub fn made() {} } }
 "#;
-        let db = TestDB::with_files(INCLUDED);
+        let db = fixture::db(INCLUDED).into_db();
         let lib = crate_named(&db, "lib");
         let bytes = encode(&db, lib).unwrap();
         assert_eq!(unreadable(&db, lib, &bytes), None);
-        let mut served = TestDB::with_files(INCLUDED);
+        let mut served = fixture::db(INCLUDED).into_db();
         let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };
         let served_lib = crate_named(&served, "lib");
         set(&mut served, [(served_lib, frozen)].into_iter().collect());
@@ -3738,13 +3738,13 @@ macro_rules! unroll { () => { pub fn made() {} } }
                 |db: &TestDB| super::super::crate_def_map(db, crate_named(db, name)).dump(db);
             assert_eq!(dump(&served), dump(&db), "{name}");
         }
-        let changed = TestDB::with_files(&INCLUDED.replace("unroll {", "unroll_more {"));
+        let changed = fixture::db(&INCLUDED.replace("unroll {", "unroll_more {")).into_db();
         let why = unreadable(&changed, crate_named(&changed, "lib"), &bytes);
         assert!(
             why.as_ref().is_some_and(|it| it.ends_with("is not the file that was written")),
             "{why:?}"
         );
-        let missing = TestDB::with_files(INCLUDED.split("//- /lib/out").next().unwrap());
+        let missing = fixture::db(INCLUDED.split("//- /lib/out").next().unwrap()).into_db();
         let why = unreadable(&missing, crate_named(&missing, "lib"), &bytes);
         assert!(why.as_ref().is_some_and(|it| it.ends_with("is not loaded")), "{why:?}");
     }
@@ -3767,8 +3767,8 @@ include!("../../../first/target/out/made.rs");
 macro_rules! unroll { () => { pub fn made() {} } }
 pub mod inside { pub fn f() {} }
 "#;
-        let first = TestDB::with_files(WROTE);
-        let other = TestDB::with_files(&WROTE.replace("first", "other"));
+        let first = fixture::db(WROTE).into_db();
+        let other = fixture::db(&WROTE.replace("first", "other")).into_db();
         let bytes: Vec<_> = ["lib", "main"]
             .into_iter()
             .map(|name| (name, encode(&first, crate_named(&first, name)).unwrap()))
@@ -3778,7 +3778,7 @@ pub mod inside { pub fn f() {} }
             assert_eq!(encode(&other, krate).as_ref(), Ok(written), "{name}");
             assert_eq!(unreadable(&other, krate, written), None, "{name}");
         }
-        let mut served = TestDB::with_files(&WROTE.replace("first", "other"));
+        let mut served = fixture::db(&WROTE.replace("first", "other")).into_db();
         let maps = (bytes.iter())
             .map(|(name, bytes)| {
                 let frozen = Frozen { bytes: bytes.as_slice().into(), mode: Mode::Serve };

@@ -1,5 +1,5 @@
 //! `non_snake_case` and `non_upper_case_globals` of the names hir's `IncorrectCase` says
-//! nothing of (`crates/hir-ide/src/diagnostics/decl_check.rs`, lowered in
+//! nothing of (`crates/hir-ty/src/diagnostics/decl_check.rs`, lowered in
 //! `lower/incorrect_case.rs`), so that each name rustc lints is linted once:
 //!
 //! - `IncorrectCase`: modules, functions and methods (not of trait impls, not `#[no_mangle]`

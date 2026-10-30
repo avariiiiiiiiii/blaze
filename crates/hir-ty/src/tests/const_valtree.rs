@@ -5,7 +5,7 @@ use base_db::Db;
 use hir_def::{
     FunctionId, GenericDefId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     const_valtree::{ValTreeError, anon_const_valtree_error},
@@ -13,7 +13,7 @@ use crate::{
 };
 
 fn function_named(db: &Db, name: &str) -> FunctionId {
-    crate_def_map(db, db.test_crate())
+    crate_def_map(db, fixture::test_crate(db))
         .modules(db)
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .find_map(|def| match def {
@@ -37,7 +37,7 @@ fn errors_in_signature(db: &Db, name: &str) -> Vec<Option<ValTreeError>> {
 
 #[test]
 fn a_const_argument_of_more_nodes_than_a_value_tree_holds_is_an_overflow() {
-    let db = Db::with_files(
+    let db = fixture::db(
         r#"
 //- minicore: sized
 #![feature(adt_const_params)]
@@ -47,7 +47,8 @@ fn big(_: Big<{ [0u8; 100001] }>) {}
 fn small(_: Small<{ 1 + 2 }>) {}
 fn generic<T>(_: Small<{ 3 }>, _: T) {}
 "#,
-    );
+    )
+    .into_db();
     crate::next_solver::attach_db(&db, || {
         assert_eq!(errors_in_signature(&db, "big"), [Some(ValTreeError::NodesOverflow)]);
         assert_eq!(errors_in_signature(&db, "small"), [None]);

@@ -1,11 +1,11 @@
 //! Tests for `builtin_fn_macro.rs` from `hir_expand`.
 
 use expect_test::expect;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     ModuleDefId, expr_store::Body, macro_expansion_tests::check, nameres::crate_def_map,
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
 };
 
 #[test]
@@ -107,7 +107,7 @@ fn main() { 4u32 }
 /// call passed to a macro is where it is written, and a column counts code points.
 #[test]
 fn line_and_column_are_where_the_call_is_written() {
-    let db = TestDB::with_files(
+    let db = fixture::db(
         r#"
 #[rustc_builtin_macro]
 macro_rules! line {() => {}}
@@ -122,7 +122,8 @@ fn main() {
     let _ = line!(column);
 }
 "#,
-    );
+    )
+    .into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let main = def_map.module(&db, def_map.root).scope(&db).declarations().find_map(|it| match it {
@@ -160,7 +161,7 @@ fn line_and_column_after_a_byte_order_mark_and_crlf_lines() {
         #[rustc_builtin_macro] macro_rules! line {() => {}} fn a() -> u32 { ";
     let second = "fn b() -> (u32, u32) { (line!(), ";
     let text = format!("\u{feff}{first}column!() }}\r\n{second}column!()) }}\r\n");
-    let db = TestDB::with_files(&text);
+    let db = fixture::db(&text).into_db();
     let mut placed = super::builtin_errors::macro_calls(&db)
         .into_iter()
         .map(|call| {

@@ -1,5 +1,4 @@
-//! The queries hir-ty declares and a crate above it computes: MIR (hir-ty-mir) and printing a
-//! type as its path (hir-ide).
+//! The queries hir-ty declares and a crate above it computes: MIR (hir-ty-mir).
 //!
 //! hir-ty, hir-ty-borrowck and blaze-items read MIR, whose code is in hir-ty-mir, above them.
 //! The memos are declared here, so a hit is a static call from every crate; only a miss calls
@@ -15,7 +14,6 @@
 use std::sync::OnceLock;
 
 use base_db::Db;
-use hir_def::ModuleId;
 use rustc_type_ir::{
     Interner as _, RegionKind, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
     TypeVisitableExt as _, inherent::IntoKind as _,
@@ -72,26 +70,12 @@ pub struct Mir {
     ) -> Option<Ty<'db>>,
 }
 
-/// hir-ide's code for printing a type as source.
-pub struct Display {
-    /// The type's path as `std::any::type_name` gives it: `None` when the type has no source
-    /// path to print, which the caller makes an error.
-    pub type_name: for<'db> fn(&'db Db, Ty<'db>, ModuleId) -> Option<String>,
-}
-
 inventory::collect!(Mir);
-inventory::collect!(Display);
 
 /// The linked MIR table.
 pub fn mir() -> &'static Mir {
     static ONE: OnceLock<&'static Mir> = OnceLock::new();
     ONE.get_or_init(|| one::<Mir>("hir-ty-mir"))
-}
-
-/// The linked display table.
-pub fn display() -> &'static Display {
-    static ONE: OnceLock<&'static Display> = OnceLock::new();
-    ONE.get_or_init(|| one::<Display>("hir-ide"))
 }
 
 fn one<T: inventory::Collect>(by: &str) -> &'static T {

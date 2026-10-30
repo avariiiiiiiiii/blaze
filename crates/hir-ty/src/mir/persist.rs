@@ -16,6 +16,12 @@
 //! place in the record's id table, which the store writes as item keys, so two databases that
 //! built the same body write the same bytes. Outside a scope it is the id's salsa bits, read
 //! back only by the database that wrote them.
+//!
+//! A constant a location macro made (`line!()`, `column!()`, `file!()`, `module_path!()`, a
+//! `concat!` of one) is written as a slot, its literal's expression and its type, never its
+//! value: reading fills it from that literal as the body is now ([`Locations`]), so moving or
+//! renaming the code reads as the MIR building it again gives. `#[track_caller]` and panic
+//! locations are not constants of built MIR: they are read off the spans where used.
 
 #[cfg(test)]
 mod tests;
@@ -28,10 +34,15 @@ use blaze_format::{
 };
 use hir_def::{
     DefWithBodyId, FieldId, LocalFieldId, VariantId,
-    hir::{AsmOptions, AsmPiece, BindingId, InlineAsmRegOrRegClass},
+    expr_store::ExpressionStore,
+    hir::{
+        AsmOperand as HirAsmOperand, AsmOptions, AsmPiece, BindingId, Expr, ExprId,
+        InlineAsmRegOrRegClass, Literal, Pat,
+    },
 };
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_hash::FxHashMap;
+use rustc_type_ir::{IntTy, UintTy, inherent::IntoKind as _};
 use smallvec::SmallVec;
 
 use super::{
@@ -45,21 +56,95 @@ use super::{
 use crate::{
     InferBodyId,
     MemoryMap,
-    check_cache::{Relocate, id_bits, id_of, in_scope},
+    check_cache::{Relocate, id_bits, id_of},
     closure_analysis,
     consteval::{AllocationRec, read_allocation, write_allocation},
     infer::PointerCast,
     intrinsic::Intrinsic,
     next_solver::{
-        Allocation, ConstExt as _, DbInterner, StoredAllocation, StoredConst, StoredGenericArgs,
-        StoredTy,
+        Allocation, AllocationData, ConstExt as _, DbInterner, StoredAllocation, StoredConst,
+        StoredGenericArgs, StoredTy, Ty, TyKind,
         abi::Safety,
         persist::{TABLE_SCHEMA, TyTableReader, TyTableWriter},
     },
 };
 
 /// The version of the words [`write`] writes: changes with any change to what a word means.
-const WORDS_VERSION: u64 = 1;
+const WORDS_VERSION: u64 = 2;
+
+/// The literals of a body that a location macro expanded to, sorted, with the store they are
+/// expressions of: the constants a body's MIR makes of them are written as slots and filled
+/// from the store on reading.
+#[derive(Clone, Copy)]
+pub(crate) struct Locations<'a> {
+    pub(crate) store: &'a ExpressionStore,
+    pub(crate) exprs: &'a [ExprId],
+}
+
+impl Locations<'_> {
+    fn has(&self, expr: ExprId) -> bool {
+        self.exprs.binary_search(&expr).is_ok()
+    }
+
+    /// Why the body's MIR cannot hold its location literals as slots: one used where lowering
+    /// makes a value of it with no operand of its own (a pattern, an `asm!` constant).
+    fn unslotted(&self) -> Option<&'static str> {
+        if self.exprs.is_empty() {
+            return None;
+        }
+        let in_pattern = self.store.pats().any(|(_, pat)| match pat {
+            Pat::Lit(expr) => self.has(expr),
+            Pat::Range { start, end, .. } => start.is_some_and(|it| self.has(it)) || end.is_some_and(|it| self.has(it)),
+            _ => false,
+        });
+        if in_pattern {
+            return Some("a location macro in a pattern");
+        }
+        let in_asm = self.store.exprs().any(|(_, expr)| match expr {
+            Expr::InlineAsm(asm) => {
+                asm.operands.iter().any(|(_, operand)| matches!(operand, HirAsmOperand::Const(it) if self.has(*it)))
+            }
+            _ => false,
+        });
+        in_asm.then_some("a location macro as an `asm!` constant")
+    }
+
+    /// The constant of type `ty` that MIR building makes of the literal `expr` as the store
+    /// has it now, by its rule (`lower_literal_to_operand`) for the literals location macros
+    /// expand to; `None` for another.
+    fn constant<'db>(&self, expr: ExprId, ty: Ty<'db>) -> Option<StoredAllocation> {
+        let Expr::Literal(literal) = self.store.expr(expr) else { return None };
+        let word = super::target::word();
+        let (memory, memory_map): (Box<[u8]>, MemoryMap<'db>) = match *literal {
+            Literal::String(ref text) => {
+                let text = text.as_str();
+                // A reference to the text's bytes, whose address the memory map gives.
+                // alloc: the constant and its bytes, once per location literal written or read
+                let mut fat = Vec::with_capacity(2 * word);
+                fat.extend_from_slice(&0usize.to_le_bytes()[..word]);
+                fat.extend_from_slice(&text.len().to_le_bytes()[..word]);
+                (fat.into_boxed_slice(), MemoryMap::simple(Box::from(text.as_bytes())))
+            }
+            Literal::Uint(value, _) => (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty),
+            Literal::Int(value, _) => (Box::from(&value.to_le_bytes()[..int_size(ty, word)?]), MemoryMap::Empty),
+            _ => return None,
+        };
+        Some(Allocation::new(AllocationData { ty, memory, memory_map }).store())
+    }
+}
+
+/// The size of the integer type `ty` on a target of `word`-byte addresses.
+fn int_size(ty: Ty<'_>, word: usize) -> Option<usize> {
+    Some(match ty.kind() {
+        TyKind::Uint(UintTy::U8) | TyKind::Int(IntTy::I8) => 1,
+        TyKind::Uint(UintTy::U16) | TyKind::Int(IntTy::I16) => 2,
+        TyKind::Uint(UintTy::U32) | TyKind::Int(IntTy::I32) => 4,
+        TyKind::Uint(UintTy::U64) | TyKind::Int(IntTy::I64) => 8,
+        TyKind::Uint(UintTy::U128) | TyKind::Int(IntTy::I128) => 16,
+        TyKind::Uint(UintTy::Usize) | TyKind::Int(IntTy::Isize) => word,
+        _ => return None,
+    })
+}
 
 blaze_format::record! {
     /// A MIR body: where its type table is, its words, its text, and each allocation its
@@ -85,10 +170,17 @@ pub(crate) const SCHEMA: SchemaHash = schema_of(&[
     Part::Schema(<AllocationRec as Record>::SCHEMA),
 ]);
 
-/// `body` as a buffer of its own. Refused, with why, only for what has no word: a lint's
-/// description lowering did not make, and inside a relocating scope an allocation pointing
-/// into a static.
-pub(crate) fn write<'db>(db: &'db Db, body: &MirBody<'db>) -> Result<Vec<u8>, &'static str> {
+/// `body` as a buffer of its own, the constants of `locations` as slots. Refused, with why,
+/// only for what has no word: a lint's description lowering did not make, a location literal
+/// used with no operand of its own, and a location literal's constant that is not what its literal makes.
+pub(crate) fn write<'db>(
+    db: &'db Db,
+    body: &MirBody<'db>,
+    locations: Option<Locations<'_>>,
+) -> Result<Vec<u8>, &'static str> {
+    if let Some(why) = locations.and_then(|it| it.unslotted()) {
+        return Err(why);
+    }
     let mut out = Writer::new(SCHEMA);
     let mut encode = Encode {
         out: &mut out,
@@ -101,9 +193,10 @@ pub(crate) fn write<'db>(db: &'db Db, body: &MirBody<'db>) -> Result<Vec<u8>, &'
         allocs: Vec::new(),
         alloc_places: FxHashMap::default(),
         refused: None,
+        locations,
     };
     encode.body(body)?;
-    let Encode { out: _, tys, words, text, allocs, alloc_places: _, refused } = encode;
+    let Encode { out: _, tys, words, text, allocs, alloc_places: _, refused, locations: _ } = encode;
     if let Some(why) = refused {
         return Err(why);
     }
@@ -133,8 +226,13 @@ pub(crate) fn write<'db>(db: &'db Db, body: &MirBody<'db>) -> Result<Vec<u8>, &'
 
 /// The body [`write`] wrote into `buffer`, made in `db`: its header, schema and columns checked
 /// in place, then every word as it is read. A buffer that does not read is an error, never a
-/// panic and never another body.
-pub(crate) fn read<'db>(db: &'db Db, buffer: &[u8]) -> Result<MirBody<'db>, FormatError> {
+/// panic and never another body. Slots are filled from `locations`; a slot it does not list, or
+/// whose expression is no longer such a literal, is an error.
+pub(crate) fn read<'db>(
+    db: &'db Db,
+    buffer: &[u8],
+    locations: Option<Locations<'_>>,
+) -> Result<MirBody<'db>, FormatError> {
     let root = open_as::<MirRoot>(buffer, SCHEMA)?;
     let tys = TyTableReader::open(DbInterner::new_no_crate(db), buffer, root.tys)?;
     let allocs = root.allocs.follow(buffer)?;
@@ -149,6 +247,7 @@ pub(crate) fn read<'db>(db: &'db Db, buffer: &[u8]) -> Result<MirBody<'db>, Form
         buffer,
         locals: 0,
         blocks: 0,
+        locations,
     };
     let body = decode.body()?;
     match decode.at == decode.words.len() {
@@ -173,6 +272,7 @@ struct Encode<'w, 'db> {
     alloc_places: FxHashMap<Allocation<'db>, u32>,
     /// Why the body has no stored form, found where a word could not say so.
     refused: Option<&'static str>,
+    locations: Option<Locations<'w>>,
 }
 
 type W<T = ()> = Result<T, &'static str>;
@@ -228,14 +328,6 @@ impl<'db> Encode<'_, 'db> {
         let index = match self.alloc_places.get(&allocation) {
             Some(&index) => index,
             None => {
-                // `consteval`'s record holds a static as its salsa bits, which the relocating
-                // scope does not see: in another database they name another static.
-                if in_scope()
-                    && let MemoryMap::Complex(map) = &allocation.memory_map
-                    && !map.statics.is_empty()
-                {
-                    self.refused.get_or_insert("an allocation pointing into a static");
-                }
                 let at = write_allocation(self.out, &mut self.tys, allocation);
                 let index = u32::try_from(self.allocs.len()).expect("fewer than 2^32 allocations");
                 self.allocs.push(at);
@@ -626,10 +718,20 @@ impl<'db> Encode<'_, 'db> {
                 self.konst(konst);
                 self.ty(ty);
             }
-            OperandKind::Allocation { allocation } => {
-                self.word(3);
-                self.allocation(allocation);
-            }
+            OperandKind::Allocation { allocation } => match (*span, self.locations) {
+                (Some(MirSpan::ExprId(expr)), Some(locations)) if locations.has(expr) => {
+                    let ty = allocation.as_ref().ty;
+                    if locations.constant(expr, ty) != Some(*allocation) {
+                        self.refused.get_or_insert("a location literal's constant that is not what its literal makes");
+                    }
+                    self.word(5);
+                    self.ty(&ty.store());
+                }
+                _ => {
+                    self.word(3);
+                    self.allocation(allocation);
+                }
+            },
             OperandKind::Static(it) => {
                 self.word(4);
                 self.id(*it);
@@ -1024,6 +1126,7 @@ struct Decode<'a, 'db> {
     /// them, so the body read never indexes past its arenas.
     locals: u32,
     blocks: u32,
+    locations: Option<Locations<'a>>,
 }
 
 type R<T> = Result<T, FormatError>;
@@ -1410,9 +1513,24 @@ impl<'a, 'db> Decode<'a, 'db> {
             2 => OperandKind::Constant { konst: self.konst()?, ty: self.ty()? },
             3 => OperandKind::Allocation { allocation: self.allocation()? },
             4 => OperandKind::Static(self.id()?),
+            5 => OperandKind::Allocation { allocation: self.slot(span)? },
             _ => return Err(self.invalid("an operand of no kind")),
         };
         Ok(Operand { kind, span })
+    }
+
+    /// The constant of the location literal `span` is, of the type the next word names, as
+    /// its literal makes it now.
+    fn slot(&mut self, span: Option<MirSpan>) -> R<StoredAllocation> {
+        let ty = self.ty()?;
+        let Some(MirSpan::ExprId(expr)) = span else {
+            return Err(self.invalid("a location slot with no expression"));
+        };
+        let locations = self.locations.ok_or_else(|| self.invalid("a location slot in a body read with none"))?;
+        if !locations.has(expr) {
+            return Err(self.invalid("a location slot of an expression that is no location literal now"));
+        }
+        locations.constant(expr, ty.as_ref()).ok_or_else(|| self.invalid("a location slot whose literal makes no constant now"))
     }
 
     fn opt_operand(&mut self) -> R<Option<Operand>> {

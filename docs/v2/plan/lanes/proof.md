@@ -42,6 +42,11 @@ and `v2-proof` run everything together once the lanes' work is in:
   changing fingerprints, a worker keyed by `PATH`. Each becomes an oracle edit kind, and the
   environment becomes a traced input, not part of a worker's identity. (`v2-proof`, `v2-usercode`)
 
+Since 2026-10-30 nothing here compares with rustc or cargo (Andrew): the oracle holds the daemon
+to blaze's own build from nothing, the corpus judges each crate's tests by their own verdicts,
+`rejections.py` is deleted and its fixed cases for #1522 and #1440 are front-end cases
+(`harness/v2/frontend/cases/rejects/`) that state the errors they expect.
+
 ## Where it lives
 
 The scripts are in `harness/v2/`, one entry for all of them (`proof.py`), and what each

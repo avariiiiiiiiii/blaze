@@ -1,6 +1,6 @@
-"""edits.py: blaze's incremental path against rustc over edit sequences, the proof of lane dbsp's
-maintained name resolution, impl tables and trait candidate sets (docs/v2/plan/design/dbsp.md
-section 12, "the same as rustc"; notes in docs/v2/plan/lanes/dbsp/proof.md).
+"""edits.py: blaze's incremental path held to blaze's own build of the same state from nothing,
+over edit sequences, the proof of lane dbsp's maintained name resolution, impl tables and trait
+candidate sets (docs/v2/plan/design/dbsp.md section 12; notes in docs/v2/plan/lanes/dbsp/proof.md).
 
     uv run --frozen python harness/v2/dbsp/edits.py '{"engine": {"kind": "v2", "blaze": "target/release/blaze"}, "out": "/tmp/edits.json"}'
     uv run --frozen python harness/v2/dbsp/edits.py '{"engine": {...}, "out": "...", "projects": [{"kind": "harness", "name": "ripgrep"}]}'
@@ -10,12 +10,11 @@ section 12, "the same as rustc"; notes in docs/v2/plan/lanes/dbsp/proof.md).
 A project is built once as it is (the base), then once after each edit of a script. blaze builds
 every step in one workspace under one daemon, so each step after the base goes through its
 incremental path: a file written, the maintainers run over the delta, the queries that read a
-changed slice rerun. rustc builds every step fresh: a case through cases.py's `Runner` on a copy
-named by its content (so a state seen before is rustc's kept answer), a workspace by plain cargo
-with the pinned nightly into a target of its own (engine.reference_env: no incremental
-compilation, the edited crate rebuilt whole). Each step is compared as cases.py compares a case
-(`cases.judged`): the outcome, the error codes, each code's primary spans, and the program's exit
-status, output and panics when the project has a program to run.
+changed slice rerun. Each step is also built from nothing: a copy of the same files, a daemon
+with an empty home, and a store holding only the standard library (oracle.std_seed). The two are
+compared: accepted or rejected, the keys of the errors (cases.key_of: a code, or the start of a
+message), and the program's exit status, output and panics when the project has a program to run.
+No step is compared with rustc or cargo (2026-10-30).
 
 An edit script is text, one edit a line, `op(arg, ...);`, after the line `//@ dbsp-edits 1`;
 `//` lines and a `// keep` or `// break` after an edit are notes. Every edit is a total function
@@ -39,15 +38,15 @@ and every use of it, `rename_def` only its definition). Script `i` of seed `s` i
 `random.Random("blaze-dbsp-edits:<s>:<i>")` alone, so a seed gives the same scripts everywhere.
 Each edit keeps the program or breaks it on purpose (a `// break`: a duplicate impl or item, a
 dangling path, a derive missing what it needs, a method a probe still calls removed, a probe
-with its trait out of scope), about one edit in four, so both rustc's accept and reject paths
+with its trait out of scope), about one edit in four, so both the accept and the reject paths
 are hit. Every script holds at least one `add_impl` that keeps the program. The scripts of
 `scripts/` (beside this file) run on every project too: hand-written ones and every mismatch
 shrunk.
 
-A step that blaze treats otherwise than rustc ends its script, and is shrunk as fuzz.py shrinks
-a program (`fuzz.shrink`: edits deleted, then lines, each pass's candidates run at once, each a
-whole script on a fresh daemon) while its first mismatch keeps the same signature
-(`fuzz.signature`). The result is written to `into` as `<project>-s<seed>-<i>.edits`.
+A step whose incremental build differs from the one from nothing ends its script, and is shrunk
+(`shrink`: edits deleted, each pass's candidates run at once, each a whole script on a fresh
+daemon) while its first mismatch keeps the same signature (`signature`: what differs and the
+error keys it is about). The result is written to `into` as `<project>-s<seed>-<i>.edits`.
 
 The cost check (design section 10): after each `add_impl` step, the daemon's
 `{"reason": "blaze-maintained", "write", "maintainer", "crate", "work": {"ops", "woken",
@@ -65,11 +64,11 @@ impls the model says the edit changed (`touched`): after an impl edit no query o
 trait's slice reruns; after an item edit no resolver query of another module does; after any
 edit no round query does.
 
-    pass   the step builds as rustc does (outcome, codes, spans, run); the cost is the edit's;
-           the trace is the case's
-    fail   it does not; or no `blaze-maintained` line was printed
-    error  the harness could not say (a timeout, rustc crashed, a project that cannot be laid
-           out), or a saved script does not parse
+    pass   the incremental build of the step is the build from nothing's (outcome, error keys,
+           run); the cost is the edit's; the trace is the case's
+    fail   it is not; or no `blaze-maintained` line was printed
+    error  the harness could not say (a timeout, a build that said nothing, a project that cannot
+           be laid out), or a saved script does not parse
     unmeasured
            a trace case found a kind of query neither trace has
 
@@ -85,8 +84,8 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
                                                      file its `edits` name, run with its `run`
               {"kind": "workspace", "path": DIR}     a cargo workspace or package (needs `file`)
               {"kind": "cases", "path": DIR|FILE}    each case of a directory of
-                                                     harness/v2/frontend/cases/ or harness/v2/rejections/
-                                                     (or one case file), the scaffold in its root
+                                                     harness/v2/frontend/cases/ (or one case file),
+                                                     the scaffold in its root
             with, for the three workspace kinds, `file` (where the scaffold goes, under the
             workspace), `args` (after `blaze COMMAND`/`cargo COMMAND`, e.g. ["-p", "app"]),
             `command` ("build" or "check"), `run` (the program's arguments; null: not run)
@@ -102,22 +101,18 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
     trace     take the daemon's trace after every step and check it (false)
     jobs      how many scripts run at once (4), each with a daemon, a home and a workspace of its own
     keep      keep every workspace, not only those of scripts that did not pass
-    cache     where rustc's answers are kept across runs ("~/.cache/blaze-v2-proof"; "": none)
 """
 
 import concurrent.futures
 import copy
-import hashlib
 import importlib
 import itertools
 import json
-import platform
 import random
 import re
 import shutil
 import sys
 import tempfile
-from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -128,9 +123,9 @@ HERE = Path(__file__).resolve().parent
 V2 = HERE.parent
 sys.path[:0] = [str(HERE), str(V2), str(V2 / "frontend"), str(V2.parent)]
 from typed_input import fail, parse  # noqa: E402
-import engine, report, rejections  # noqa: E402
-import cases, fuzz  # noqa: E402
-import fixture  # noqa: E402
+import engine, report  # noqa: E402
+import cases  # noqa: E402
+import fixture, oracle  # noqa: E402
 
 SCRIPT = "edits.py"
 SCRIPTS = HERE / "scripts"
@@ -214,7 +209,6 @@ class Input:
     trace: bool = False
     jobs: int = 4
     keep: bool = False
-    cache: str = "~/.cache/blaze-v2-proof"
 
 
 # --- edits and the scaffold they change
@@ -826,7 +820,7 @@ def copy_tree(source: Path, to: Path) -> None:
     shutil.copytree(source, to, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", ".git"))
 
 
-def case_targets(project: Project, host: frozenset[str]) -> tuple[list[Target], list[tuple[str, str]]]:
+def case_targets(project: Project) -> tuple[list[Target], list[tuple[str, str]]]:
     """Each case of `project.path` (a directory's `.rs` files, or one file) whose name has
     `filter`, and each file that is not one, with why."""
     root = Path(project.path).resolve()
@@ -839,7 +833,7 @@ def case_targets(project: Project, host: frozenset[str]) -> tuple[list[Target], 
         name = f"{path.parent.name}/{path.name}"
         if project.filter not in name:
             continue
-        got = case_of(name, path, path.read_text(errors="replace"), host)
+        got = case_of(name, path, path.read_text(errors="replace"))
         if isinstance(got, str):
             wrong.append((name, got))
         else:
@@ -847,16 +841,11 @@ def case_targets(project: Project, host: frozenset[str]) -> tuple[list[Target], 
     return found, wrong
 
 
-def case_of(name: str, path: Path, text: str, host: frozenset[str]) -> cases.Case | str:
-    """The case at `path` as rustc is the truth of it: a case of cases.py (its header dropped,
-    since edits change what rustc does), or a fixed case of rejections.py (`//@ rejects:`)."""
-    if cases.EXPECT.fullmatch(text.split("\n", 1)[0].rstrip()):
-        got = cases.case_of(name, path, text, host)
-        return got if isinstance(got, str) else replace(got, expect=None, twice=False, refused=frozenset())
-    found = rejections.classify(name, str(path), text, host)
-    if len(found.units) != 1:
-        return f"not one unit as rejections.py reads it: {found.out[:1] or found.units}"
-    return cases.Case(found.units[0])
+def case_of(name: str, path: Path, text: str) -> cases.Case | str:
+    """The case at `path` as a project: what its header expects is not used (edits change what
+    the program does), and it is built once a step whatever its area."""
+    got = cases.case_of(name, path, text)
+    return got if isinstance(got, str) else replace(got, twice=False, refused=frozenset())
 
 
 def workspace_target(project: Project, work: Path) -> Target:
@@ -892,37 +881,97 @@ def workspace_target(project: Project, work: Path) -> Target:
     return Target(name, source=source, file=file, args=args, command=project.command, run=run, program=program)
 
 
-# --- running a script
+# --- one step, built both ways
+
+type Category = Literal["same", "accepted what the build from nothing rejects",
+                        "rejected what the build from nothing accepts", "other codes", "other run", "not blaze's",
+                        "error"]
+
+
+@dataclass(frozen=True)
+class Built:
+    """One build of a step: what blaze said (cases.Said: its error keys, or why nothing can be
+    read), and its program's run when it built one to run."""
+
+    said: cases.Said
+    run: cases.Run | None = None
+
 
 @dataclass(frozen=True)
 class Stepped:
-    """One step compared: as cases.py compares a case, and what blaze printed."""
+    """One step: the incremental build and the one from nothing, the verdict on the two, and
+    what the incremental build printed (for the cost check)."""
 
-    compared: cases.Compared
-    stdout: str
+    verdict: report.Verdict
+    category: Category
+    detail: str
+    incremental: Built | None = None
+    scratch: Built | None = None
+    stdout: str = ""
+    ws: str = ""
 
 
-class Subject(ABC):
-    """A project opened for one script's run: one blaze workspace under one daemon, every step
-    written into it and built incrementally, and rustc's side fresh each step. `base` is the
-    text of the file the scaffold goes in, as the project has it; `crate` cargo's name for the
-    target that file is in ("" until a build has named it)."""
+def shown(keys: frozenset[str]) -> str:
+    return ", ".join(cases.shown_key(k) for k in sorted(keys)) or "none"
 
-    case: cases.Case
-    base: str
-    crate: str
 
-    @abstractmethod
-    def step(self, label: str, text: str, files: dict[str, str]) -> Stepped:
-        """The scaffold's file as `text` and its module files `files`, built by both."""
+def run_shown(ran: cases.Run) -> str:
+    if ran.error is not None:
+        return f"did not finish: {ran.error}"
+    return f"exit {ran.status}, {len(ran.stdout.splitlines())} lines" + (f", panics {'; '.join(ran.panics[:2])}"
+                                                                          if ran.panics else "")
 
-    @abstractmethod
-    def trace(self, to: Path) -> None:
-        """The daemon's trace of the last build, written to `to`."""
 
-    @abstractmethod
-    def close(self, keep: bool) -> str | None:
-        """The daemon stopped, the workspace removed unless `keep`; why it would not stop."""
+def run_aspect(a: cases.Run, b: cases.Run) -> str:
+    """What two runs differ in, as far as shrinking keeps it."""
+    if (a.error is None) != (b.error is None):
+        return "finished"
+    if a.status != b.status:
+        return "status"
+    if a.panics != b.panics:
+        return "panics"
+    return "stdout"
+
+
+def compare(inc: Built, scratch: Built) -> tuple[report.Verdict, Category, str]:
+    """The incremental build of a step against the build of the same files from nothing."""
+    for side, built in (("incremental", inc), ("from nothing", scratch)):
+        if built.said.error is not None:
+            return "error", "error", f"the build {side}: {built.said.error}"
+        if built.said.who is not None:
+            return "fail", "not blaze's", f"the build {side} was not blaze's: {built.said.who}"
+    a, b = inc.said.keys, scratch.said.keys
+    if a and not b:
+        return "fail", "rejected what the build from nothing accepts", f"the incremental build gives {shown(a)}"
+    if b and not a:
+        return "fail", "accepted what the build from nothing rejects", f"the build from nothing gives {shown(b)}"
+    if a != b:
+        return "fail", "other codes", f"incremental {shown(a)}; from nothing {shown(b)}"
+    if a:
+        return "pass", "same", f"both reject with {shown(a)}"
+    if (inc.run is None) != (scratch.run is None):
+        return "error", "error", "one build made a program to run and the other did not"
+    if inc.run is not None and scratch.run is not None and inc.run != scratch.run:
+        return "fail", "other run", (f"{run_aspect(inc.run, scratch.run)}: incremental {run_shown(inc.run)}; "
+                                     f"from nothing {run_shown(scratch.run)}")
+    return "pass", "same", "both accept" + (f"; the program: {run_shown(inc.run)}" if inc.run is not None else "")
+
+
+def signature(s: Stepped) -> tuple[str, ...] | None:
+    """What a mismatch is, as far as shrinking keeps it: its category and the keys it is about
+    (output moves as edits are deleted; the keys and what differs do not)."""
+    if s.verdict != "fail" or s.incremental is None or s.scratch is None:
+        return None
+    a, b = sorted(s.incremental.said.keys), sorted(s.scratch.said.keys)
+    if s.category == "rejected what the build from nothing accepts":
+        return (s.category, *a)
+    if s.category == "accepted what the build from nothing rejects":
+        return (s.category, *b)
+    if s.category == "other codes":
+        return (s.category, ",".join(a), ",".join(b))
+    if s.category == "other run" and s.incremental.run is not None and s.scratch.run is not None:
+        return (s.category, run_aspect(s.incremental.run, s.scratch.run))
+    return (s.category,)
 
 
 def write_files(base: Path, files: dict[str, str], written: set[Path]) -> set[Path]:
@@ -938,105 +987,9 @@ def write_files(base: Path, files: dict[str, str], written: set[Path]) -> set[Pa
     return now
 
 
-def blaze_built(eng: engine.Engine, label: str, ws: Path, env: dict[str, str], args: list[str],
-                command: Command) -> engine.Ran | str:
-    try:
-        return eng.build(label, ws, env, args, command=command, timeout=rejections.CHECK_SECS)
-    except (engine.Failed, engine.Unmeasurable) as e:
-        return str(e)
-
-
-class CaseSubject(Subject):
-    def __init__(self, runner: "Runner", target: Target, index: int):
-        assert target.case is not None
-        self.runner, self.case = runner, target.case
-        unit = target.case.unit
-        self.dir, self.root_name = Path(unit.path).parent, Path(unit.path).name
-        self.base = Path(unit.path).read_text(errors="replace")
-        if BEGIN in self.base:
-            raise engine.Failed(f"{target.name}: its root already holds a scaffold ({BEGIN})")
-        work = runner.work
-        self.ws, self.home = work / "ws" / f"e{index}", work / "h" / f"e{index}"
-        shutil.rmtree(self.ws, ignore_errors=True)
-        members, out = rejections.write_workspace(self.ws, index, [unit])
-        if out:
-            raise engine.Failed(f"{target.name}: cannot be laid out as a package: {out[0][1]}")
-        if target.case.deps and (wrong := cases.vendor(self.ws, members, {unit.label: target.case})):
-            raise engine.Failed(f"{target.name}: its dependencies cannot be laid out: {wrong[0][1]}")
-        ((self.member, _),) = members.items()
-        self.crate = self.member
-        self.root = rejections.root_of(self.ws, self.member, unit)
-        self.command: Command = "build" if unit.kind == "bin" else "check"
-        self.env = runner.eng.env(self.home, runner.work / "store",
-                                  extra={"RUSTFLAGS": " ".join((*rejections.COMMON, *unit.flags))})
-        self.rename = cases.blaze_names(self.member, target.case) if target.case.deps else cases.same_file
-        self.written: set[Path] = set()
-
-    def truth(self, text: str, files: dict[str, str]) -> tuple[cases.Case, cases.Truth] | str:
-        """rustc on the step, in a copy of the case's directory named by what it holds."""
-        h = hashlib.sha256(str(self.dir).encode())
-        for name, body in sorted({self.root_name: text, **files}.items()):
-            h.update(f"\0{name}\0{len(body)}\0".encode() + body.encode())
-        src = self.runner.work / "rustc-src" / h.hexdigest()[:20]
-        if not src.is_dir():
-            part = src.with_name(f"{src.name}.{id(self)}.part")
-            shutil.rmtree(part, ignore_errors=True)
-            shutil.copytree(self.dir, part, symlinks=True)
-            (part / self.root_name).write_text(text)
-            for name, body in files.items():
-                (part / name).write_text(body)
-            try:
-                part.rename(src)
-            except OSError:
-                shutil.rmtree(part, ignore_errors=True)
-        path = src / self.root_name
-        case = case_of(self.case.name, path, text, self.runner.host)
-        if isinstance(case, str):
-            return f"the edited case: {case}"
-        return case, self.runner.cases.truths([case])[0]
-
-    def step(self, label: str, text: str, files: dict[str, str]) -> Stepped:
-        got = self.truth(text, files)
-        self.written = write_files(self.root.parent, {self.root.name: text, **files}, self.written)
-        ran = blaze_built(self.runner.eng, f"blaze {self.command} of {self.case.name} {label}", self.ws, self.env,
-                          rejections.check_args(self.case.unit, self.member), self.command)
-        if isinstance(got, str):
-            truth = cases.Truth(rejections.Reference(error=got))
-            return Stepped(cases.Compared(self.case, truth, "error", "error", got), "" if isinstance(ran, str) else ran.stdout)
-        case, truth = got
-        if isinstance(ran, str):
-            return Stepped(cases.Compared(case, truth, "error", "error", ran), "")
-        if (problem := cases.rustc_problem(case, truth)) is not None:
-            return Stepped(cases.Compared(case, truth, *problem), ran.stdout)
-        said = rejections.said_alone(ran.returncode, ran.stdout, ran.said(600), self.runner.eng.not_blazes(ran), self.ws,
-                                     self.root, self.command)
-        if case.deps:
-            said = replace(said, spans=cases.renamed(said.spans, self.rename))
-        run = None
-        if truth.run is not None and not said.keys and said.error is None and said.who is None:
-            run = cases.run_program(self.ws / "target" / "debug" / (self.member + engine.EXE), self.runner.work / "cwd",
-                                    self.runner.cases.env, self.ws, self.root, self.rename)
-        verdict, category, detail = cases.judged(truth, said, run)
-        return Stepped(cases.Compared(case, truth, verdict, category, detail, said, run, str(self.ws)), ran.stdout)
-
-    def trace(self, to: Path) -> None:
-        self.runner.eng.trace(self.ws, self.env, to)
-
-    def close(self, keep: bool) -> str | None:
-        try:
-            self.runner.eng.stop(self.ws, self.env)
-        except engine.Failed as e:
-            return str(e)
-        finally:
-            if not keep:
-                shutil.rmtree(self.ws, ignore_errors=True)
-                shutil.rmtree(self.home, ignore_errors=True)
-        return None
-
-
 def targeted(stdout: str) -> list[dict[str, Any]]:
-    """cargo's JSON lines that name a target: its artifacts and the messages of its builds."""
-    return [m for line in stdout.splitlines() if (m := rejections.json_line(line)) is not None
+    """The JSON lines of a build that name a target: its artifacts and the messages of its builds."""
+    return [m for line in stdout.splitlines() if (m := cases.json_line(line)) is not None
             and isinstance(m.get("target"), dict)]
 
 
@@ -1045,9 +998,9 @@ def artifacts(stdout: str) -> list[dict[str, Any]]:
 
 
 def crate_of(stdout: str, ws: Path, file: str) -> str | None:
-    """The target (by cargo's name for it) whose sources hold `file` under `ws`: the one whose
-    root's directory is the deepest above it, of cargo's lines that name a target (a target
-    that did not build has messages and no artifact)."""
+    """The target (by its name) whose sources hold `file` under `ws`: the one whose root's
+    directory is the deepest above it, of the lines that name a target (a target that did not
+    build has messages and no artifact)."""
     at = (ws / file).resolve()
     best: tuple[int, str] | None = None
     for m in targeted(stdout):
@@ -1063,7 +1016,7 @@ def crate_of(stdout: str, ws: Path, file: str) -> str | None:
 
 
 def executable_of(stdout: str, program: str) -> Path | None:
-    """The program cargo built: the bin target named `program`, else the one bin built."""
+    """The program a build made: the bin target named `program`, else the one bin built."""
     found = [(m["target"].get("name"), Path(m["executable"])) for m in artifacts(stdout)
              if isinstance(m.get("executable"), str)]
     if program:
@@ -1071,7 +1024,7 @@ def executable_of(stdout: str, program: str) -> Path | None:
     return found[0][1] if len(found) == 1 else None
 
 
-def run_with(program: Path, args: Sequence[str], cwd: Path, env: dict[str, str], root: Path) -> cases.Run:
+def run_with(program: Path, args: Sequence[str], cwd: Path, env: dict[str, str]) -> cases.Run:
     """`program ARGS` run in `cwd`, as cases.run_program runs a case's (which takes no arguments)."""
     if not program.is_file():
         return cases.Run(error=f"no program at {program}", started=False)
@@ -1079,96 +1032,117 @@ def run_with(program: Path, args: Sequence[str], cwd: Path, env: dict[str, str],
         ran = engine.run(f"running {program}", [str(program), *args], cwd, env, cases.RUN_SECS)
     except engine.Failed as e:
         return cases.Run(error=str(e).splitlines()[0])
-    return cases.Run(ran.returncode, ran.stdout, cases.panics_of(ran.stderr, cwd, root))
+    return cases.Run(ran.returncode, ran.stdout, cases.panics_of(ran.stderr))
 
 
-class WorkspaceSubject(Subject):
+class Subject:
+    """A project opened for one script's run: one blaze workspace under one daemon, every step
+    written into it and built incrementally; and each step copied, files and all, into a
+    workspace of its own built from nothing (an empty home, a copy of the standard library's
+    store), whose daemon is stopped after it. `base` is the text of the file the scaffold goes
+    in, as the project has it; `crate` the name of the target that file is in ("" until a build
+    has named it)."""
+
     def __init__(self, runner: "Runner", target: Target, index: int):
-        assert target.source is not None
-        self.runner, self.target = runner, target
-        base = runner.work / "w" / f"e{index}"
-        self.ref, self.ws, self.home = base / "ref", base / "blaze", runner.work / "h" / f"e{index}"
-        copy_tree(target.source, self.ref)
-        copy_tree(target.source, self.ws)
-        flags = {"RUSTFLAGS": " ".join(rejections.COMMON)}
-        self.ref_env = engine.reference_env(base / "target-ref", flags)
-        self.env = runner.eng.env(self.home, runner.work / "store", extra=flags)
-        self.base = (target.source / target.file).read_text(errors="replace")
-        self.dir = module_dir(target.file, is_root(target.file))
-        kind: rejections.Kind = "bin" if target.run is not None else "lib"
-        self.case = cases.Case(rejections.Unit(target.name, str(self.ref / target.file), None, kind, "2021"))
-        self.written_ref: set[Path] = set()
+        self.runner, self.target, self.index = runner, target, index
+        work = runner.work
+        self.ws, self.home = work / "ws" / f"e{index}", work / "h" / f"e{index}"
+        self.scratch_ws, self.scratch_home = work / "ws" / f"s{index}", work / "h" / f"s{index}"
+        self.scratch_store = work / "ss" / f"s{index}"
         self.written: set[Path] = set()
         self.crate = self.program = ""
+        flags = " ".join(cases.COMMON)
+        if target.case is not None:
+            case = target.case
+            shutil.rmtree(self.ws, ignore_errors=True)
+            members, out = cases.write_workspace(self.ws, index, [case])
+            if out:
+                raise engine.Failed(f"{target.name}: cannot be laid out as a package: {next(iter(out.values()))}")
+            ((self.member, _),) = members.items()
+            self.crate = self.member
+            root = cases.root_of(self.ws, self.member, case)
+            self.file = root.relative_to(self.ws).as_posix()
+            self.base = Path(case.path).read_text(errors="replace")
+            self.command: Command = "build" if case.kind == "bin" else "check"
+            self.args = cases.check_args(case.kind, self.member)
+            self.runs = case.kind == "bin"
+        else:
+            assert target.source is not None
+            copy_tree(target.source, self.ws)
+            self.member, self.file = "", target.file
+            self.base = (target.source / target.file).read_text(errors="replace")
+            self.command = target.command
+            self.args = ["--message-format=json", *target.args]
+            self.runs = target.run is not None and target.command == "build"
+        if BEGIN in self.base:
+            raise engine.Failed(f"{target.name}: {self.file} already holds a scaffold ({BEGIN})")
+        self.dir = module_dir(self.file, is_root(self.file))
+        self.extra = {"RUSTFLAGS": flags}
+        self.env = runner.eng.env(self.home, runner.work / "store", extra=self.extra)
 
     def files(self, text: str, files: dict[str, str]) -> dict[str, str]:
-        return {self.target.file: text, **{f"{self.dir}/{name}": body for name, body in files.items()}}
+        return {self.file: text, **{f"{self.dir}/{name}": body for name, body in files.items()}}
 
-    def truth(self, label: str, files: dict[str, str]) -> cases.Truth:
-        """Plain cargo with the pinned nightly on the reference copy: its errors, and its program's run."""
-        self.written_ref = write_files(self.ref, files, self.written_ref)
-        argv = ["cargo", self.target.command, "--message-format=json", *self.target.args]
+    def built(self, label: str, ws: Path, env: dict[str, str]) -> tuple[Built, str]:
+        """`blaze COMMAND` of `ws`: what it said, its program's run, and what it printed."""
         try:
-            ran = engine.run(f"cargo {self.target.command} of {self.target.name} {label}", argv, self.ref, self.ref_env,
-                             rejections.CHECK_SECS)
-        except engine.Failed as e:
-            return cases.Truth(rejections.Reference(error=str(e)))
+            ran = self.runner.eng.build(label, ws, env, self.args, command=self.command, timeout=cases.CHECK_SECS)
+        except (engine.Failed, engine.Unmeasurable) as e:
+            return Built(cases.Said(error=str(e))), ""
+        said = cases.said_alone(ran.returncode, ran.stdout, ran.said(600), self.runner.eng.not_blazes(ran), self.command)
         if not self.crate:
-            self.crate = crate_of(ran.stdout, self.ref, self.target.file) or ""
-        m = rejections.cargo_messages(ran.stdout, self.ref, {"": self.ref / self.target.file})
-        if m.every:
-            return cases.Truth(rejections.Reference(m.every, spans=m.every_span))
-        if ran.returncode != 0:
-            return cases.Truth(rejections.Reference(
-                error=f"`cargo {self.target.command}` exited {ran.returncode} with no error:\n{ran.said(600)}"))
-        ref = rejections.Reference(out=rejections.ACCEPTED)
-        if self.target.run is None or self.target.command != "build":
-            return cases.Truth(ref)
+            self.crate = crate_of(ran.stdout, ws, self.file) or ""
+        if said.keys or said.error is not None or said.who is not None or not self.runs:
+            return Built(said), ran.stdout
+        if self.target.case is not None:
+            exe = ws / "target" / "debug" / (self.member + engine.EXE)
+            return Built(said, cases.run_program(exe, self.runner.work / "cwd", self.runner.run_env)), ran.stdout
         exe = executable_of(ran.stdout, self.target.program)
         if exe is None:
-            return cases.Truth(rejections.Reference(
-                error=f"cargo built no one program {self.target.program or '(name it with `program`)'}"))
-        self.program = exe.name
-        return cases.Truth(ref, run_with(exe, self.target.run, self.ref, engine.scrubbed(), self.ref / self.target.file))
+            why = f"the build made no one program {self.target.program or '(name it with `program`)'}"
+            return Built(cases.Said(error=why)), ran.stdout
+        return Built(said, run_with(exe, cast(tuple[str, ...], self.target.run), ws, self.runner.run_env)), ran.stdout
+
+    def from_nothing(self, label: str) -> Built:
+        """The workspace as it is now, copied without its target, built by a daemon of its own
+        with an empty home and the standard library's store alone."""
+        copy_tree(self.ws, self.scratch_ws)
+        shutil.rmtree(self.scratch_home, ignore_errors=True)
+        shutil.rmtree(self.scratch_store, ignore_errors=True)
+        shutil.copytree(self.runner.std_store, self.scratch_store, symlinks=True)
+        env = self.runner.eng.env(self.scratch_home, self.scratch_store, extra=self.extra)
+        try:
+            built, _ = self.built(f"blaze {self.command} of {self.target.name} {label}, from nothing", self.scratch_ws, env)
+            return built
+        finally:
+            try:
+                self.runner.eng.stop(self.scratch_ws, env)
+            except engine.Failed:
+                pass
+            for path in (self.scratch_ws, self.scratch_home, self.scratch_store):
+                shutil.rmtree(path, ignore_errors=True)
 
     def step(self, label: str, text: str, files: dict[str, str]) -> Stepped:
-        every = self.files(text, files)
-        truth = self.truth(label, every)
-        self.written = write_files(self.ws, every, self.written)
-        ran = blaze_built(self.runner.eng, f"blaze {self.target.command} of {self.target.name} {label}", self.ws,
-                          self.env, ["--message-format=json", *self.target.args], self.target.command)
-        if isinstance(ran, str):
-            return Stepped(cases.Compared(self.case, truth, "error", "error", ran), "")
-        if (problem := cases.rustc_problem(self.case, truth)) is not None:
-            return Stepped(cases.Compared(self.case, truth, *problem), ran.stdout)
-        root = self.ws / self.target.file
-        m = rejections.cargo_messages(ran.stdout, self.ws, {"": root})
-        who = self.runner.eng.not_blazes(ran)
-        if m.every:
-            said = rejections.Said(m.every, who=who, spans=m.every_span)
-        elif ran.returncode == 0:
-            said = rejections.Said(who=who)
-        else:
-            said = rejections.Said(error=f"`blaze {self.target.command}` exited {ran.returncode} with no error:\n"
-                                         f"{ran.said(600)}")
-        run = None
-        if truth.run is not None and not said.keys and said.error is None and said.who is None:
-            run = run_with(self.ws / "target" / "debug" / self.program, cast(tuple[str, ...], self.target.run), self.ws,
-                           engine.scrubbed(), root)
-        verdict, category, detail = cases.judged(truth, said, run)
-        return Stepped(cases.Compared(self.case, truth, verdict, category, detail, said, run, str(self.ws)), ran.stdout)
+        """The scaffold's file as `text` and its module files `files`, built both ways."""
+        self.written = write_files(self.ws, self.files(text, files), self.written)
+        inc, stdout = self.built(f"blaze {self.command} of {self.target.name} {label}", self.ws, self.env)
+        scratch = self.from_nothing(label)
+        verdict, category, detail = compare(inc, scratch)
+        return Stepped(verdict, category, detail, inc, scratch, stdout, str(self.ws))
 
     def trace(self, to: Path) -> None:
+        """The daemon's trace of the last build, written to `to`."""
         self.runner.eng.trace(self.ws, self.env, to)
 
     def close(self, keep: bool) -> str | None:
+        """The daemon stopped, the workspace removed unless `keep`; why it would not stop."""
         try:
             self.runner.eng.stop(self.ws, self.env)
         except engine.Failed as e:
             return str(e)
         finally:
             if not keep:
-                shutil.rmtree(self.ws.parent, ignore_errors=True)
+                shutil.rmtree(self.ws, ignore_errors=True)
                 shutil.rmtree(self.home, ignore_errors=True)
         return None
 
@@ -1180,14 +1154,17 @@ def maintained(stdout: str) -> tuple[list[dict[str, Any]], list[str]]:
     lines: list[dict[str, Any]] = []
     wrong: list[str] = []
     for text in stdout.splitlines():
-        m = rejections.json_line(text)
+        m = cases.json_line(text)
         if m is None or m.get("reason") != MAINTAINED:
             continue
         work = m.get("work")
         good = (isinstance(m.get("crate"), str) and isinstance(m.get("maintainer"), str) and isinstance(work, dict)
                 and all(isinstance(w := cast(dict[str, Any], work).get(f), int) and not isinstance(w, bool) and w >= 0
                         for f in WORK_FIELDS))
-        (lines if good else wrong).append(m if good else text)
+        if good:
+            lines.append(m)
+        else:
+            wrong.append(text)
     return lines, wrong
 
 
@@ -1200,7 +1177,7 @@ def cost(stdout: str, crate: str) -> tuple[report.Verdict, str, dict[str, report
     if not lines:
         return "fail", f"no `{MAINTAINED}` line, so the maintainers' work is not known: {REQUESTED}", {}
     if not crate:
-        return "error", "the edited crate is not known: cargo's build named no target holding the file", {}
+        return "error", "the edited crate is not known: the build named no target holding the file", {}
     totals: dict[tuple[str, str], Counter[str]] = {}
     for line in lines:
         counts = totals.setdefault((line["crate"], line["maintainer"]), Counter())
@@ -1270,6 +1247,35 @@ def dbsp_case(proof: Path, kind: str, moved: tuple[int, int], before: Path, afte
     return "pass", f"the {kind} case holds"
 
 
+# --- shrinking
+
+def shrink(text: str, still: Callable[[list[str]], list[bool]], rounds: int) -> tuple[str, int]:
+    """`text`, a script, made as small as deleting its edit lines can while `still` holds of it
+    (asked of a pass's candidates at once: each line deleted alone), and how many batches it
+    took. The header and the notes are kept. After a pass, every deletion that held alone is
+    tried together once."""
+    used = 0
+    while used < rounds:
+        lines = text.splitlines(keepends=True)
+        at = [k for k, line in enumerate(lines) if STATEMENT.fullmatch(line.strip())]
+        variants = ["".join(line for j, line in enumerate(lines) if j != k) for k in at]
+        if not variants:
+            break
+        held = still(variants)
+        used += 1
+        good = [k for k, ok in zip(at, held) if ok]
+        if not good:
+            break
+        single = min((v for v, ok in zip(variants, held) if ok), key=lambda v: (len(v), v))
+        combined = "".join(line for j, line in enumerate(lines) if j not in set(good))
+        if len(good) > 1 and used < rounds:
+            used += 1
+            text = combined if still([combined])[0] else single
+        else:
+            text = single
+    return text, used
+
+
 @dataclass(frozen=True)
 class Plan:
     """One script on one project: its name, and its edits with their intents."""
@@ -1291,7 +1297,7 @@ class Outcome:
 
 @dataclass(frozen=True)
 class Ran:
-    """A script's run: every outcome, the steps compared, and the first that did not pass."""
+    """A script's run: every outcome, the steps, and the first that did not pass."""
 
     outcomes: tuple[Outcome, ...]
     steps: tuple[Stepped, ...]
@@ -1300,22 +1306,21 @@ class Ran:
 
 
 def first_bad(steps: Sequence[Stepped]) -> int | None:
-    return next((k for k, s in enumerate(steps) if s.compared.verdict != "pass"), None)
+    return next((k for k, s in enumerate(steps) if s.verdict != "pass"), None)
 
 
 class Runner:
-    """Scripts run on targets: rustc's cases through cases.py's Runner, blaze through `eng`."""
+    """Scripts run on targets through `eng`, each step built incrementally and from nothing."""
 
-    def __init__(self, eng: engine.Engine, work: Path, jobs: int, cache: str, trace: bool, keep: bool):
+    def __init__(self, eng: engine.Engine, work: Path, jobs: int, trace: bool, keep: bool):
         self.eng, self.work, self.jobs, self.trace, self.keep = eng, work, jobs, trace, keep
-        self.cases = cases.Runner(eng, work, jobs, 1, False, cache, keep)
-        self.host = rejections.host_names(sys.platform, platform.machine())
+        self.run_env = engine.scrubbed()
         self.indices = itertools.count()
         self.proof = engine.proof_beside(str(eng.blaze))
+        self.std_store = oracle.std_seed(eng, work)
 
     def open(self, target: Target) -> Subject:
-        index = next(self.indices)
-        return CaseSubject(self, target, index) if target.case is not None else WorkspaceSubject(self, target, index)
+        return Subject(self, target, next(self.indices))
 
     def run(self, target: Target, name: str, edits: Sequence[Edit], keep: bool | None = None) -> Ran:
         """`edits` on `target`, from its base, in one workspace under one daemon; stops at the
@@ -1339,15 +1344,13 @@ class Runner:
                 try:
                     stepped = subject.step(label, text, files)
                 except engine.Failed as e:
-                    truth = cases.Truth(rejections.Reference(error=str(e)))
-                    stepped = Stepped(cases.Compared(subject.case, truth, "error", "error", str(e)), "")
+                    stepped = Stepped("error", "error", str(e))
                 steps.append(stepped)
-                c = stepped.compared
-                outcomes.append(Outcome(f"{target.name}/{name}/{label}", c.verdict, c.detail))
-                if edit is not None and edit.op == "add_impl" and c.verdict != "error":
+                outcomes.append(Outcome(f"{target.name}/{name}/{label}", stepped.verdict, stepped.detail))
+                if edit is not None and edit.op == "add_impl" and stepped.verdict != "error":
                     verdict, detail, numbers = cost(stepped.stdout, subject.crate)
                     outcomes.append(Outcome(f"{target.name}/{name}/step {k} cost", verdict, detail, numbers))
-                if self.trace and c.verdict != "error":
+                if self.trace and stepped.verdict != "error":
                     traces.mkdir(parents=True, exist_ok=True)
                     now = traces / f"{k}.cbor"
                     try:
@@ -1359,7 +1362,7 @@ class Runner:
                             verdict, detail = dbsp_case(self.proof, edit.kind, touched(was, model),
                                                         traces / f"{k - 1}.cbor", now)
                             outcomes.append(Outcome(f"{target.name}/{name}/step {k} trace", verdict, detail))
-                if c.verdict != "pass":
+                if stepped.verdict != "pass":
                     break
         finally:
             bad = first_bad(steps)
@@ -1371,8 +1374,8 @@ class Runner:
         return Ran(tuple(outcomes), tuple(steps), first_bad(steps), stopped)
 
     def still(self, target: Target, wanted: tuple[str, ...]) -> Callable[[list[str]], list[bool]]:
-        """fuzz.shrink's test: each script text, run whole on a fresh daemon, first does not pass
-        at a step of the same signature."""
+        """shrink's test: each script text, run whole on a fresh daemon, first does not pass at a
+        step of the same signature."""
         def one(text: str) -> bool:
             edits = parse_script(text)
             if isinstance(edits, str) or not edits:
@@ -1380,7 +1383,7 @@ class Runner:
             ran = self.run(target, "shrink", edits, keep=False)
             if ran.bad is None or ran.bad == 0:
                 return False
-            return fuzz.signature(ran.steps[ran.bad].compared) == wanted
+            return signature(ran.steps[ran.bad]) == wanted
 
         def holds(texts: list[str]) -> list[bool]:
             with concurrent.futures.ThreadPoolExecutor(self.jobs) as pool:
@@ -1421,7 +1424,7 @@ def main(args: Input) -> None:
     print(f"work: {work}", flush=True)
     rep = report.Report(SCRIPT, args.engine, args.out)
     try:
-        runner = Runner(eng, work, args.jobs, args.cache, args.trace, args.keep)
+        runner = Runner(eng, work, args.jobs, args.trace, args.keep)
     except engine.Failed as e:
         fail(SCRIPT, str(e))
     saved, wrong = saved_scripts(SCRIPTS) if args.saved else ([], [])
@@ -1431,7 +1434,7 @@ def main(args: Input) -> None:
     for project in args.projects:
         try:
             if project.kind == "cases":
-                found, bad = case_targets(project, runner.host)
+                found, bad = case_targets(project)
                 targets += found
                 for name, why in bad:
                     rep.add(name, "error", f"case wrong: {why}")
@@ -1439,35 +1442,40 @@ def main(args: Input) -> None:
                 targets.append(workspace_target(project, work))
         except engine.Failed as e:
             rep.add(project.name or project.path or project.kind, "error", str(e))
-    plans = [Plan(t, name, tuple((e, "") for e in edits)) for t in targets for name, edits in saved]
+    unsaid: Intent = ""
+    plans: list[Plan] = [Plan(t, name, tuple((e, unsaid) for e in edits)) for t in targets for name, edits in saved]
     plans += [Plan(t, f"s{args.seed}-{i}", tuple(generate(args.seed, i, args.steps)), args.seed, i)
               for t in targets for i in range(args.scripts)]
     if not plans:
         fail(SCRIPT, "no script to run: no project could be made ready, or no script")
+    def ran_plan(plan: Plan) -> Ran:
+        return runner.run(plan.target, plan.name, [e for e, _ in plan.edits])
+
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        results = list(pool.map(lambda p: runner.run(p.target, p.name, [e for e, _ in p.edits]), plans))
+        results = list(pool.map(ran_plan, plans))
     tally: Counter[str] = Counter()
     for plan, ran in zip(plans, results):
         for o in ran.outcomes:
             rep.add(o.name, o.verdict, o.detail, **o.numbers)
         for s in ran.steps:
-            tally["rustc rejects" if s.compared.truth.ref.keys else "rustc accepts"] += 1
-            tally[s.compared.category] += 1
+            if s.scratch is not None:
+                tally["rejected" if s.scratch.said.keys else "accepted"] += 1
+            tally[s.category] += 1
         if ran.bad is None or ran.bad == 0 or not args.shrink:
             continue
-        bad = ran.steps[ran.bad].compared
-        wanted = fuzz.signature(bad)
+        bad = ran.steps[ran.bad]
+        wanted = signature(bad)
         if wanted is None:
             continue
         edits = plan.edits[:ran.bad]
         text = script_text(edits)
-        small, used = fuzz.shrink(text, runner.still(plan.target, wanted), args.rounds)
+        small, used = shrink(text, runner.still(plan.target, wanted), args.rounds)
         if not runner.still(plan.target, wanted)([small])[0]:
             small = text
         note = (f"edits.py: {plan.target.name}, script {plan.name}, step {ran.bad} ({edits[-1][0]}), shrunk in {used} "
                 f"batches; {bad.category}: {bad.detail.splitlines()[0][:160]}")
         got = parse_script(small)
-        shrunk = [(e, cast(Intent, "")) for e in got] if not isinstance(got, str) else list(edits)
+        shrunk: list[tuple[Edit, Intent]] = [(e, unsaid) for e in got] if not isinstance(got, str) else list(edits)
         into.mkdir(parents=True, exist_ok=True)
         written = into / f"{slug(plan.target.name)}-{slug(plan.name)}{SUFFIX}"
         written.write_text(script_text(shrunk, [note]))
@@ -1475,15 +1483,31 @@ def main(args: Input) -> None:
                 f"{note}\nwritten as {written} ({len(shrunk)} edits, from {len(edits)})", edits=len(shrunk),
                 from_edits=len(edits), batches=used)
     rep.extra.update(work=str(work), toolchain=engine.TOOLCHAIN, seed=args.seed, targets=len(targets),
-                     scripts=len(plans), rustc_runs=runner.cases.rustc_runs, rustc_kept=runner.cases.rustc_kept,
-                     steps=dict(tally))
+                     scripts=len(plans), steps=dict(tally))
     if not args.keep:
-        shutil.rmtree(work / "store", ignore_errors=True)
-        shutil.rmtree(work / "h", ignore_errors=True)
+        for name in ("store", "h", "ss", "std-store"):
+            shutil.rmtree(work / name, ignore_errors=True)
     rep.finish()
 
 
 # --- selftest
+
+def balanced(text: str) -> bool:
+    """Whether the brackets of rendered scaffold text balance (it has no strings; `//` lines are
+    skipped)."""
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("//"):
+            continue
+        for c in line:
+            if c in "([{":
+                stack.append(c)
+            elif c in pairs:
+                if not stack or stack.pop() != pairs[c]:
+                    return False
+    return not stack
+
 
 def test_deterministic() -> None:
     for i in range(20):
@@ -1522,11 +1546,12 @@ def test_render() -> None:
                 apply(model, e)
                 block, files = render(model)
                 assert block.startswith(BEGIN + "\n") and block.endswith(END + "\n"), block
-                fuzz.matching(fuzz.lex(block))
+                assert balanced(block), block
                 for body in files.values():
-                    fuzz.matching(fuzz.lex(body))
+                    assert balanced(body), body
                 assert set(files) == {f"{m}.rs" for m, k in model.modules if k == "file"}, (files, model.modules)
                 assert "@" not in block and "None" not in block, block
+    assert not balanced("fn f() {") and not balanced("fn f() )(") and balanced("// {\nfn f() {}")
     model = Model()
     for e in parse_script("\n".join([HEADER, "add_mod(dbsp_m1, inline);", "add_trait(top, DbspT1);",
                                      "add_method(DbspT1, dbsp_f1);", "add_struct(dbsp_m1, DbspS1);",
@@ -1617,7 +1642,7 @@ def planted(texts: list[str]) -> list[bool]:
 
 
 def test_shrink() -> None:
-    """fuzz.shrink reduces a script with a planted mismatch to the edits that make it."""
+    """shrink reduces a script with a planted mismatch to the edits that make it."""
     edits = [Edit(op, args) for op, args in (
         ("add_mod", ("dbsp_m1", "inline")), ("add_trait", ("top", "DbspT1")), ("add_struct", ("dbsp_m1", "DbspS3")),
         ("add_struct", ("top", "DbspS1")), ("add_method", ("DbspT1", "dbsp_f1")), ("add_impl", ("top", "DbspT1", "DbspS1")),
@@ -1626,42 +1651,38 @@ def test_shrink() -> None:
         ("add_impl", ("dbsp_m1", "DbspU1", "DbspA1")), ("add_trait", ("dbsp_m1", "DbspT2")))]
     text = script_text([(e, "keep") for e in edits])
     assert planted([text]) == [True]
-    small, used = fuzz.shrink(text, planted, 60)
+    small, used = shrink(text, planted, 60)
     got = parse_script(small)
     assert isinstance(got, list) and planted([small]) == [True], small
     assert len(got) <= 7 and {e.op for e in got} <= {"add_mod", "add_trait", "add_struct", "add_impl", "add_use",
                                                      "add_alias"}, got
     assert sum(e.op == "add_impl" for e in got) == 2 and small.startswith(HEADER + "\n"), small
     assert 0 < used <= 60
-    assert fuzz.shrink(text, lambda ts: [False] * len(ts), 10)[0] == text
+    assert shrink(text, lambda ts: [False] * len(ts), 10)[0] == text
 
 
 def test_compare() -> None:
-    """A step reads the fields cases.py emits: rustc's JSON and blaze's cargo messages go through
-    rejections.py and cases.judged as a case's do, and fuzz.signature reads the Compared."""
-    rd = rejections
-    root = Path("/c/nameres/t.rs")
-    stderr = rd.diagnostic("error", "conflicting implementations of trait `DbspT1`", "E0119",
-                           [rd.span_json(str(root), 9, 1, 9, 30)])
-    ref = rd.reference_of(1, stderr, root)
-    ws = Path("/w/ws/e3")
-    unit = rd.Unit("nameres/t.rs", str(root), None, "lib", "2021")
-    blaze_root = rd.root_of(ws, "u3_0", unit)
-    same = rd.message("compiler-message", "u3_0", rd.diagnostic("error", "conflicting implementations", "E0119",
-                                                                [rd.span_json("crates/u3_0/src/lib.rs", 9, 1, 9, 30)]))
-    said = rd.said_alone(101, same, "", None, ws, blaze_root)
-    truth = cases.Truth(ref)
-    assert cases.judged(truth, said, None)[:2] == ("pass", "same")
-    moved = rd.said_alone(101, same.replace('"line_start": 9', '"line_start": 8'), "", None, ws, blaze_root)
-    verdict, category, detail = cases.judged(truth, moved, None)
-    assert (verdict, category) == ("fail", "other spans"), (verdict, category, detail)
-    case = cases.Case(unit)
-    compared = cases.Compared(case, truth, verdict, category, detail, moved)
-    assert fuzz.signature(compared) == ("other spans", "E0119")
-    accepted = cases.judged(truth, rd.said_alone(0, "", "", None, ws, blaze_root), None)
-    assert accepted[1] == "accepted what rustc rejects"
-    scaffold = rd.place("crates/u3_0/src/dbsp_m1.rs", ws, blaze_root)
-    assert scaffold == rd.place("/c/nameres/dbsp_m1.rs", root.parent, root) == "dbsp_m1.rs", scaffold
+    """Two builds of a step compared, the mismatch's signature, and the targets a build's JSON names."""
+    said = cases.said_alone
+    e0119 = json.dumps({"reason": "compiler-message", "target": {"name": "u3_0"},
+                        "message": {"level": "error", "message": "conflicting implementations", "code": {"code": "E0119"}}})
+    rejected, accepted = Built(said(101, e0119, "", None)), Built(said(0, "", "", None))
+    assert compare(rejected, rejected)[:2] == ("pass", "same")
+    assert compare(accepted, accepted)[:2] == ("pass", "same")
+    verdict, category, _ = compare(accepted, rejected)
+    assert (verdict, category) == ("fail", "accepted what the build from nothing rejects")
+    stepped = Stepped(verdict, category, "", accepted, rejected)
+    assert signature(stepped) == ("accepted what the build from nothing rejects", "E0119"), signature(stepped)
+    assert compare(rejected, accepted)[1] == "rejected what the build from nothing accepts"
+    e0425 = e0119.replace("E0119", "E0425")
+    other = compare(rejected, Built(said(101, e0425, "", None)))
+    assert other[:2] == ("fail", "other codes"), other
+    ran, panicked = cases.Run(0, "1\n"), cases.Run(101, "", ("main at src/main.rs:3:5",))
+    runs = compare(Built(accepted.said, ran), Built(accepted.said, panicked))
+    assert runs[:2] == ("fail", "other run") and runs[2].startswith("status"), runs
+    assert compare(Built(accepted.said, ran), Built(accepted.said, ran))[:2] == ("pass", "same")
+    assert compare(Built(cases.Said(error="timed out")), accepted)[0] == "error"
+    assert compare(Built(cases.Said(who="cargo")), accepted)[1] == "not blaze's"
     stdout = "\n".join([json.dumps({"reason": "compiler-artifact", "target": {"name": "oracle_base",
                                                                               "src_path": "/r/base/src/lib.rs"}}),
                         json.dumps({"reason": "compiler-artifact", "target": {"name": "oracle_app",
@@ -1714,20 +1735,19 @@ def test_kinds() -> None:
 
 
 def test_cases() -> None:
-    """A case of cases.py and a fixed case of rejections.py are both read, their headers dropped."""
-    host = rejections.host_names("linux", "x86_64")
+    """Each case of a directory is read as a project; a file that is no case is named with why."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "a.rs").write_text("//@ expect: reject E0425\n//@ edition: 2021\nfn main() { x; }\n")
-        (root / "b.rs").write_text("//@ edition: 2018\n//@ rejects: E0063\nstruct S { a: u8 }\nfn main() { S {}; }\n")
+        (root / "b.rs").write_text("//@ expect: accept\n//@ edition: 2018\n#![crate_type = \"lib\"]\npub struct S;\n")
         (root / "c.rs").write_text("//@ expect: accept\n//@ revisions: x y\nfn main() {}\n")
-        found, wrong = case_targets(Project("cases", path=tmp), host)
+        found, wrong = case_targets(Project("cases", path=tmp))
         assert [t.name for t in found] == [f"{root.name}/a.rs", f"{root.name}/b.rs"], found
         assert [n for n, _ in wrong] == [f"{root.name}/c.rs"], wrong
         a, b = (cast(cases.Case, t.case) for t in found)
-        assert a.expect is None and a.unit.edition == "2021" and a.unit.kind == "bin", a
-        assert b.unit.edition == "2018", b
-        none, missing = case_targets(Project("cases", path=str(root / "nothing")), host)
+        assert a.edition == "2021" and a.kind == "bin", a
+        assert b.edition == "2018" and b.kind == "lib", b
+        none, missing = case_targets(Project("cases", path=str(root / "nothing")))
         assert not none and missing, missing
 
 

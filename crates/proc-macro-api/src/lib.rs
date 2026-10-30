@@ -18,6 +18,8 @@
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub mod bidirectional_protocol;
+pub mod bridge;
+pub mod kept;
 pub mod legacy_protocol;
 pub mod pool;
 pub mod process;

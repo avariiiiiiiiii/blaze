@@ -290,15 +290,15 @@ fn status(code: Option<i32>, signal: Option<i32>) -> std::process::ExitStatus {
 }
 
 /// What a sandboxed script may print, checked before cargo reads it
-/// ([`crate::cargo::directives`]); `None` when it may print it all.
+/// ([`crate::directives`]); `None` when it may print it all.
 pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> Option<String> {
-    let ran = crate::cargo::directives::Ran {
+    let ran = crate::directives::Ran {
         package_dir: &unit.package.manifest_dir,
         out_dir: &unit.out_dir,
         link_dirs,
     };
-    let refused = crate::cargo::directives::refused(stdout, &ran);
-    (!refused.is_empty()).then(|| crate::cargo::directives::refused_error(&unit.package.name, &refused))
+    let refused = crate::directives::refused(stdout, &ran);
+    (!refused.is_empty()).then(|| crate::directives::refused_error(&unit.package.name, &refused))
 }
 
 /// `value`, a run of `unit` started in `env`, as cargo makes of it: what it printed, once it
@@ -621,7 +621,7 @@ impl ScriptRun {
                 Err(what) => return self.error(what, out),
             },
         };
-        let ran = load_cargo::v2::Ran { cfgs: output.cfgs.clone(), env: output.env.clone(), out_dir: out_dir.clone(), files };
+        let ran = blaze_lower::Ran { cfgs: output.cfgs.clone(), env: output.env.clone(), out_dir: out_dir.clone(), files };
         let Some(writer) = writer else {
             let what = format!("the build script run of unit {} was given no writer to apply it with", self.unit);
             return self.error(what, out);

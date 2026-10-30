@@ -237,7 +237,7 @@ impl<'db> Famous<'db> {
 #[cfg(test)]
 mod tests {
     use base_db::Db;
-    use test_fixture::WithFixture as _;
+    use hir_expand::fixture;
 
     use super::{Famous, KNOWN, KNOWN_AT, LONGEST, known};
 
@@ -276,7 +276,7 @@ fn f() {{}}
 {}"#,
             crate::tests::STD
         );
-        let db = Db::with_files(&fixture);
+        let db = fixture::db(&fixture).into_db();
         hir::attach_db(&db, || {
             let krate = crate::tests::main_crate(&db);
             let famous = Famous::new(&db, krate);

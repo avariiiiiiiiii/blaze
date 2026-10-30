@@ -327,7 +327,7 @@ mod tests {
     use hir_def::{FunctionId, GenericParamId, ModuleDefId, nameres::crate_def_map};
     use hir_expand::name::Name;
     use rustc_type_ir::Variance;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::{opt_alias_variances, variances_of_opaque};
     use crate::{
@@ -340,8 +340,8 @@ mod tests {
     };
 
     fn fixture(text: &str) -> (Db, Crate) {
-        let db = Db::with_files(text);
-        let krate = db.test_crate();
+        let db = fixture::db(text).into_db();
+        let krate = fixture::test_crate(&db);
         (db, krate)
     }
 

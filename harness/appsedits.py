@@ -3,11 +3,12 @@
 The daemon holds every crate of the program. Each edit of the application's `edits` (a file,
 the text to replace and its replacement) is made on top of the ones before it; the daemon is
 asked for the program, which is timed, and `check` (a command line of the program, the edit's
-own or the application's `edit_check`) is run with the daemon's program and with the one
-`cargo build` makes of the same source, which is timed too. Both have to print the same. How
-each edit got linked, spliced or in full, is read from the daemon's log.
+own or the application's `edit_check`) is run with the daemon's program and with blaze's own
+build of the same source from nothing (`scratch`). Both have to print the same. `cargo build`
+of the same source is timed as the baseline. How each edit got linked, spliced or in full, is
+read from the daemon's log.
 """
-import os, re, shlex, statistics, subprocess, time
+import os, re, shlex, shutil, statistics, subprocess, time
 
 import linkline
 from mixed import BLAZE, sysroot_rlibs
@@ -19,6 +20,17 @@ def peak_mb(pid):
         if line.startswith("VmHWM:"):
             return int(line.split()[1]) // 1024
     return 0
+
+
+def scratch(ws, spec, alone):
+    """blaze's build of the program from nothing as the source is now, as apps.py's `build`
+    makes it: cargo's link line from a target directory of its own, and blaze with no store.
+    The fixture, whose program `binary` is; its `work` is the caller's to remove."""
+    import apps
+    fx = apps.App(ws, spec, alone)
+    fx.rustc_build(os.path.join(fx.work, "target"))
+    fx.blaze_build(env={k: v for k, v in os.environ.items() if k != "BLAZE_CACHE"})
+    return fx
 
 
 def run(fx, ws, spec, result):
@@ -68,9 +80,19 @@ def run(fx, ws, spec, result):
             links = re.findall(r"^link: \S+ \((.*)\)$", open(log_path).read()[seen:], re.M)
             how = "no link" if not links else "spliced" if links[-1].startswith("spliced") else \
                 "full: " + (re.search(r"not spliced: (.*)", links[-1]) or [None, "not asked to splice"])[1]
-            cargo, cargo_s = apps.reference(ws, spec, "debug", timed=True)
-            fx.run_args, fx.stdin = edit.get("check", spec.get("edit_check", [])), None
-            want, got = fx.behaviour(cargo), fx.behaviour(binary)
+            _, cargo_s = apps.reference(ws, spec, "debug", timed=True)
+            check = edit.get("check", spec.get("edit_check", []))
+            try:
+                fresh = scratch(ws, spec, fx.alone)
+            except SystemExit as failed:
+                raise SystemExit(f"edits: blaze's build from nothing after `{edit.get('what', edit['old'][:40])}`: "
+                                 f"{str(failed)[-1500:]}")
+            try:
+                fx.run_args, fx.stdin = check, None
+                fresh.run_args, fresh.stdin = check, None
+                want, got = fresh.behaviour(fresh.binary), fx.behaviour(binary)
+            finally:
+                shutil.rmtree(fresh.work, ignore_errors=True)
             same = reply.startswith("ok") and want == got
             wrong += not same
             row["steps"].append({"edit": f"{edit['file']}: {edit.get('what', edit['old'][:40])}",
@@ -87,7 +109,7 @@ def run(fx, ws, spec, result):
                wrong=wrong, sync_ms=round(statistics.median(s["sync_ms"] for s in steps)),
                cargo_s=round(statistics.median(s["cargo_s"] for s in steps), 1))
     result["edits"] = row
-    print(f"edits: {len(steps) - wrong} of {len(steps)} the same as cargo's; {row['spliced']} spliced, {row['full']} linked "
+    print(f"edits: {len(steps) - wrong} of {len(steps)} the same as blaze's from nothing; {row['spliced']} spliced, {row['full']} linked "
           f"in full; median {row['sync_ms']} ms to a program against cargo's {row['cargo_s']} s; the daemon's first "
           f"program {row['first_s']} s, peak {row['peak_mb']} MB")
     return wrong == 0

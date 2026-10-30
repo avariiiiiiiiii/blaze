@@ -53,6 +53,7 @@ pub(crate) use infer::inference;
 #[cfg(test)]
 use infer::lookup_inference;
 pub(crate) use mir::built as built_mir;
+pub use mir::location_literals;
 
 use crate::next_solver::goal_store::{FactRef, solver_version};
 use pending::{Counts, Offered, Pending, Tallies};
@@ -150,19 +151,25 @@ impl Store {
         decode: impl FnOnce(&dyn BodyFacts, &[u8]) -> Result<T, String>,
     ) -> Lookup<T> {
         let Some(identity) = self.facts.identity(db, def) else {
-            self.pending.refused(Refusal::NoIdentity);
+            self.pending.refused(step, Refusal::NoIdentity);
+            self.pending.looked_up(step, false);
             return Lookup::Off;
         };
         let base = record::base_key(&identity, step, &schema, &self.version);
-        let Some((found, answer_key)) = self.find(db, def, step, &base) else { return Lookup::Miss };
-        let decoded = record::open_answer(found.bytes(), &answer_key).and_then(|body| decode(&*self.facts, body));
-        match decoded {
-            Ok(value) => Lookup::Hit { value, verify: self.mode == Mode::Verify },
-            Err(why) => {
-                self.fail(format_args!("the stored {} of {def:?} (answer {answer_key:x}): {why}", what(step)));
-                Lookup::Miss
+        let found = match self.find(db, def, step, &base) {
+            None => Lookup::Miss,
+            Some((found, answer_key)) => {
+                match record::open_answer(found.bytes(), &answer_key).and_then(|body| decode(&*self.facts, body)) {
+                    Ok(value) => Lookup::Hit { value, verify: self.mode == Mode::Verify },
+                    Err(why) => {
+                        self.fail(format_args!("the stored {} of {def:?} (answer {answer_key:x}): {why}", what(step)));
+                        Lookup::Miss
+                    }
+                }
             }
-        }
+        };
+        self.pending.looked_up(step, matches!(found, Lookup::Hit { .. }));
+        found
     }
 
     /// The answer record of the first slot of `base` whose facts hash the same now, and its
@@ -223,7 +230,7 @@ impl Store {
         scratch.values.clear();
         scratch.answer.clear();
         if let Err(refusal) = self.offered(db, def, step, schema, reads, write, &mut scratch) {
-            self.pending.refused(refusal);
+            self.pending.refused(step, refusal);
         }
         SCRATCH.set(scratch);
     }
@@ -386,6 +393,20 @@ pub struct Flushed {
     pub unencodable: u64,
     /// Steps dropped as the buffer of their thread was full.
     pub dropped: u64,
+    /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
+    /// index.
+    pub steps: [StepCounts; 3],
+}
+
+/// What one step's lookups found and its offers met.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepCounts {
+    /// Results read from the store; under [`Mode::Verify`] each also ran.
+    pub hits: u64,
+    /// Steps that ran as nothing was stored, or as the body has no identity.
+    pub ran: u64,
+    /// Steps that ran and were kept out of the store (any reason but no identity).
+    pub refused: u64,
 }
 
 /// How many databases may have an item store at once.
@@ -585,6 +606,12 @@ impl Installed {
         unsafe { self.store.as_ref() }
     }
 
+    /// What each step's lookups found and its offers met since the last flush, by [`Step`] as an
+    /// index; the next flush's [`Flushed::steps`] has them too.
+    pub fn steps(&self) -> [StepCounts; 3] {
+        self.store().pending.steps()
+    }
+
     /// The first error a lookup met since the last flush or call (a store that could not be
     /// read, a record that does not open under its key, a stored result that differs from
     /// running the step), taken: the driver calls it once a build has ended, so the build it
@@ -615,9 +642,9 @@ impl Installed {
             _ = results[at].set(store.write(&entries[at]));
         });
         let Tallies { refused, counts } = tallies;
-        let Counts { unhashable, no_identity, unshareable, unencodable, dropped } = counts;
+        let Counts { unhashable, no_identity, unshareable, unencodable, dropped, steps } = counts;
         let mut flushed =
-            Flushed { refused, unhashable, no_identity, unshareable, unencodable, dropped, ..Flushed::default() };
+            Flushed { refused, unhashable, no_identity, unshareable, unencodable, dropped, steps, ..Flushed::default() };
         for result in results {
             let wrote = result.into_inner().unwrap_or_else(|| {
                 panic!("`ImageStore::for_each` did not run every task of an item store flush")

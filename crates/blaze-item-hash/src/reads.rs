@@ -415,6 +415,9 @@ fn apply(
         Some(fact) if fact.kind == items::SIGNATURE && is_owner(db, def, fact.subject) => {
             Classified::Covered
         }
+        Some(fact) if fact.kind == values::kinds::ATTRS && is_own_attrs(db, def, fact.subject) => {
+            Classified::Covered
+        }
         Some(fact) => Classified::Fact(fact),
     }
 }
@@ -526,6 +529,12 @@ fn whole_crate(db: &Db, krate: Crate) -> FactRef {
 fn is_owner(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
     let (owner, parent) = owner_keys(db, def);
     subject == owner || Some(subject) == parent
+}
+
+/// Whether `subject` is the key of the item `def` is the body of, whose attributes the
+/// identity hashes (`identity::own_attrs`): not a variant's discriminant's enum.
+fn is_own_attrs(db: &Db, def: DefWithBodyId, subject: ContentId) -> bool {
+    !matches!(def, DefWithBodyId::VariantId(_)) && subject == owner_keys(db, def).0
 }
 
 #[salsa::tracked(returns(copy))]

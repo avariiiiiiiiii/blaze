@@ -24,7 +24,7 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::AsName,
 };
-use hir_ide::{
+use hir_ty::{
     Adjustment, InferenceResult, LifetimeElisionKind, LifetimeLoweringMode, TyLoweringContext,
     method_resolution::CandidateId,
     next_solver::{
@@ -57,8 +57,7 @@ use crate::{
 };
 
 impl<'db> SourceAnalyzer<'db> {
-    /// [`SourceAnalyzer::new_for_body`] (`infer`) or `new_for_body_no_infer` at a view, with no
-    /// offset.
+    /// The analyzer of `def`'s body at a view, with its inference when `infer`, with no offset.
     pub(crate) fn new_for_body_view(
         db: &'db Db,
         def: DefWithBodyId,
@@ -80,7 +79,7 @@ impl<'db> SourceAnalyzer<'db> {
         }
     }
 
-    /// [`SourceAnalyzer::new_generic_def_`] at a view, with no offset.
+    /// The analyzer of `def`'s signature at a view, with no offset.
     pub(crate) fn new_generic_def_view(
         db: &'db Db,
         sema: &SemanticsImpl<'db>,
@@ -115,7 +114,7 @@ impl<'db> SourceAnalyzer<'db> {
         }
     }
 
-    /// [`SourceAnalyzer::new_variant_body`] at a view, with no offset.
+    /// The analyzer of `def`'s fields at a view, with no offset.
     pub(crate) fn new_variant_body_view(
         db: &'db Db,
         sema: &SemanticsImpl<'db>,
@@ -154,7 +153,7 @@ impl<'db> SourceAnalyzer<'db> {
         }
     }
 
-    /// [`SourceAnalyzer::new_for_resolver`] for a node of `file_id`.
+    /// The analyzer of `resolver`'s scope for a node of `file_id`.
     pub(crate) fn new_for_resolver_view(
         resolver: Resolver<'db>,
         file_id: HirFileId,
@@ -533,7 +532,7 @@ impl<'db> SourceAnalyzer<'db> {
         None
     }
 
-    /// [`SourceAnalyzer::resolve_path`] of a view.
+    /// What `path` resolves to, with the generic arguments it was given.
     pub(crate) fn resolve_path_view(
         &self,
         db: &'db Db,

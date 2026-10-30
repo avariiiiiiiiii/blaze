@@ -6,15 +6,15 @@
 //! Token streams are owned handles, dense from 1, freed as the client takes them; spans are
 //! interned handles, the same span always the same handle, as the bridge's `InternedStore`
 //! gives them. A question only the database can answer (a span's text, file, line or
-//! parent) is asked through `load_cargo::answer`, and the expansion is then not kept: its key
+//! parent) is asked through `blaze_lower::answer`, and the expansion is then not kept: its key
 //! does not say what it was told.
 
 use std::{fmt::Write as _, ops::Bound};
 
 use base_db::Db;
-use blaze_expand::bridge::spans::{self, spanned};
+use proc_macro_api::bridge::spans::{self, spanned};
 use intern::Symbol;
-use load_cargo::{SubRequest, SubResponse};
+use blaze_lower::{SubRequest, SubResponse};
 use rustc_hash::FxHashMap;
 use span::{Edition, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, TextRange, TextSize};
 
@@ -264,7 +264,7 @@ impl Server {
 
     fn ask(&mut self, db: &Db, req: SubRequest) -> SubResponse {
         self.asked = true;
-        load_cargo::answer(db, req)
+        blaze_lower::answer(db, req)
     }
 
     fn read_tree(&mut self, r: &mut Reader<'_>, out: &mut Vec<Tree>) -> Result<(), Stop> {

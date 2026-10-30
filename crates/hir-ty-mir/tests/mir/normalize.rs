@@ -14,9 +14,8 @@ use hir_ty::{
 };
 use hir_ty_mir::mir::normalize_or_keep;
 use rustc_type_ir::inherent::IntoKind;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::db::TestDB;
 
 const TYPES: &str = r#"
 //- minicore: sized, copy
@@ -49,9 +48,11 @@ fn alias_only<'db>(infcx: &InferCtxt<'db>, env: ParamEnv<'db>, ty: Ty<'db>) -> T
 
 #[test]
 fn normalize_or_keep_is_each_copy_it_replaced() {
-    let (db, _) = TestDB::with_single_file(TYPES);
+    let fx = fixture::db(TYPES);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
-        let krate = db.test_crate();
+        let krate = fixture::test_crate(&db);
         let interner = DbInterner::new_with(&db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
         let env = ParamEnv::empty();

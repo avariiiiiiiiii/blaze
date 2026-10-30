@@ -2,12 +2,12 @@
 //! crate.
 
 use base_db::{Crate, all_crates};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{nameres::crate_shadows_primitive_type, test_db::TestDB};
+use crate::nameres::crate_shadows_primitive_type;
 
 fn shadows(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> bool {
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let main: Crate = all_crates(&db)
         .iter()
         .copied()

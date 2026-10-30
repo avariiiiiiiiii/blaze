@@ -292,7 +292,7 @@ mod tests {
         for program in ["rustc", "/no/such/toolchain/bin/rustc", "/usr/bin/rustc"] {
             let said = answered_as(OsStr::new(program), &version, &[], vars).unwrap();
             let said = String::from_utf8(said.stdout).unwrap();
-            assert_eq!(said.trim(), format!("rustc {}", crate::cargo::toolchain::ours_says()));
+            assert_eq!(said.trim(), format!("rustc {}", crate::toolchain::ours_says()));
         }
         assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], vars), None);
     }
@@ -316,7 +316,7 @@ mod tests {
             ask(&mut asked).expect("a question")
         };
         // The specs are recorded by the host rustc ran on, and not of every host.
-        let Some(host) = crate::cargo::toolchain::host() else { return };
+        let Some(host) = crate::toolchain::host() else { return };
         if spec_of(host, None).is_err() {
             return;
         }

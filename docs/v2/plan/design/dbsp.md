@@ -414,7 +414,7 @@ woken, modules rebuilt, slices set, and that a 1000-module crate gives the same 
 | impl sets and candidates = fresh | `method_resolution/delta/tests.rs`: the same scripts; every slice equals a from-scratch arrangement, every hash equal |
 | adding one impl costs its facts | `adding_an_impl_costs_its_facts` (§10), counters at 10 and 1000 modules |
 | a reader sees only its slice | trace tests: `Db::log_executed` after an impl edit shows no `TraitImpls` query of another trait, and no resolver query but those of the edited module |
-| the same as rustc | `harness/v2/dbsp/`: edit sequences over the harness projects. Each step is built by blaze incrementally and by rustc fresh, and the outcome, error codes and primary spans are compared (`harness/v2/frontend/cases.py`'s comparison) |
+| the same as from nothing | `harness/v2/dbsp/`: edit sequences over the harness projects. Each step is built by blaze incrementally and by blaze from nothing, and the outcome, error keys and program run are compared (no rustc or cargo since 2026-10-30) |
 | no allocation on a read | `blaze-alloc-count` budgets: a slice read and a `scope_name` hit allocate nothing |
 
 ## 13. Who builds what

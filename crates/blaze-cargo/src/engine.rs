@@ -25,6 +25,7 @@ pub struct Engine {
 static ENGINE: OnceLock<Engine> = OnceLock::new();
 
 pub fn set(engine: Engine) {
+    crate::release::set(crate::release::Release { version: engine.version, line: engine.version_line });
     let _ = ENGINE.set(engine);
 }
 

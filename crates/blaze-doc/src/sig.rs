@@ -32,7 +32,7 @@ use hir_def::{
     },
     visibility::Visibility,
 };
-use ide_db::RootDatabase;
+use base_db::Db;
 use syntax::view::{self as ast, AstNode, HasName};
 
 use crate::{
@@ -44,7 +44,7 @@ use crate::{
 const WIDTH: usize = 100;
 
 pub(crate) struct Sig<'a> {
-    pub(crate) db: &'a RootDatabase,
+    pub(crate) db: &'a Db,
     pub(crate) places: Linking<'a>,
     store: &'a ExpressionStore,
     resolver: Resolver<'a>,
@@ -53,7 +53,7 @@ pub(crate) struct Sig<'a> {
 
 impl<'a> Sig<'a> {
     pub(crate) fn new(
-        db: &'a RootDatabase,
+        db: &'a Db,
         places: Linking<'a>,
         store: &'a ExpressionStore,
         resolver: Resolver<'a>,
@@ -710,7 +710,7 @@ pub(crate) fn lifetime_text(name: &str) -> String {
 
 /// `pub`, `pub(crate)`, `pub(super)`, `pub(in path)` or nothing, said from `module`, the module
 /// the item is in.
-pub(crate) fn visibility(db: &RootDatabase, out: &mut Code, vis: Visibility, module: hir::Module) {
+pub(crate) fn visibility(db: &Db, out: &mut Code, vis: Visibility, module: hir::Module) {
     match vis {
         Visibility::Public => {
             out.kw("pub").text(" ");
@@ -744,7 +744,7 @@ pub(crate) fn visibility(db: &RootDatabase, out: &mut Code, vis: Visibility, mod
 
 /// A signature renderer for the generic parameters of `def`.
 fn sig_of<'a>(
-    db: &'a RootDatabase,
+    db: &'a Db,
     places: Linking<'a>,
     store: &'a ExpressionStore,
     def: GenericDefId,
@@ -762,7 +762,7 @@ pub(crate) enum FnContext {
 }
 
 pub(crate) fn function(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     func: hir::Function,
     context: FnContext,
@@ -899,7 +899,7 @@ fn self_param(sig: &Sig<'_>, out: &mut Code, ty: TypeRefId, store: &ExpressionSt
 
 /// The parameter names as rustdoc shows them: a binding's name without `mut` or `ref`, another
 /// pattern as written.
-fn param_names(db: &RootDatabase, func: hir::Function) -> Vec<Option<String>> {
+fn param_names(db: &Db, func: hir::Function) -> Vec<Option<String>> {
     use hir::view::HasSourceView;
     let Some(source) = func.source_view(db) else { return vec![] };
     let Some(list) = source.value.param_list() else { return vec![] };
@@ -931,7 +931,7 @@ pub(crate) struct Fields {
 /// A struct, union or enum variant's fields as the declaration lists them: public ones (all
 /// when documenting private items), the rest as `/* private fields */`.
 fn fields_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     variant: VariantId,
     module: hir::Module,
@@ -1014,7 +1014,7 @@ fn fields_decl(
 }
 
 /// The type of one field, for its entry under "Fields".
-pub(crate) fn field_type(db: &RootDatabase, places: Linking<'_>, field: hir::Field) -> Code {
+pub(crate) fn field_type(db: &Db, places: Linking<'_>, field: hir::Field) -> Code {
     let variant: VariantId = field.parent_def(db).into();
     let fields = VariantFields::of(db, variant);
     let sig = Sig::new(
@@ -1031,7 +1031,7 @@ pub(crate) fn field_type(db: &RootDatabase, places: Linking<'_>, field: hir::Fie
 }
 
 /// A variant as its entry shows it: `Name(u8)`, `Name { .. }` with its fields, `Name = 3`.
-pub(crate) fn variant(db: &RootDatabase, places: Linking<'_>, variant: hir::EnumVariant) -> Code {
+pub(crate) fn variant(db: &Db, places: Linking<'_>, variant: hir::EnumVariant) -> Code {
     let mut out = Code::default();
     out.push(Piece::Name(variant.name(db).as_str().to_owned(), Kind::Variant));
     let id: hir_def::EnumVariantId = variant.into();
@@ -1045,7 +1045,7 @@ pub(crate) fn variant(db: &RootDatabase, places: Linking<'_>, variant: hir::Enum
 
 /// A struct's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn struct_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Struct,
     show_private: bool,
@@ -1098,7 +1098,7 @@ fn trim_leading_space(mut code: Code) -> Code {
 
 /// A union's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn union_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Union,
     show_private: bool,
@@ -1129,7 +1129,7 @@ pub(crate) fn union_decl(
 
 /// An enum's declaration, or with `alias` the one its alias's page shows.
 pub(crate) fn enum_decl(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Enum,
     alias: Option<&Aliased>,
@@ -1175,7 +1175,7 @@ pub(crate) fn enum_decl(
 }
 
 /// `#[repr(..)]` and `#[non_exhaustive]`, which rustdoc shows above a type.
-fn attributes(db: &RootDatabase, out: &mut Code, adt: AdtId) {
+fn attributes(db: &Db, out: &mut Code, adt: AdtId) {
     let flags = hir_def::attrs::AttrFlags::query(db, adt.into());
     if flags.contains(hir_def::attrs::AttrFlags::NON_EXHAUSTIVE) {
         out.push(Piece::Attribute("#[non_exhaustive]".to_owned())).text("\n");
@@ -1183,7 +1183,7 @@ fn attributes(db: &RootDatabase, out: &mut Code, adt: AdtId) {
 }
 
 pub(crate) fn trait_header(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Trait,
     out: &mut Code,
@@ -1230,7 +1230,7 @@ pub(crate) fn trait_header(
 }
 
 pub(crate) fn type_alias(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::TypeAlias,
     context: FnContext,
@@ -1273,7 +1273,7 @@ pub(crate) struct Aliased {
 }
 
 pub(crate) fn aliased(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::TypeAlias,
 ) -> Option<Aliased> {
@@ -1358,7 +1358,7 @@ fn head(
 
 /// The type an alias stands for: `[u8]` of `type Target = [u8];`.
 pub(crate) fn alias_type(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::TypeAlias,
 ) -> Option<Code> {
@@ -1370,7 +1370,7 @@ pub(crate) fn alias_type(
 }
 
 pub(crate) fn constant(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     it: hir::Const,
     context: FnContext,
@@ -1396,7 +1396,7 @@ pub(crate) fn constant(
 }
 
 /// A constant's value as written when it is short and simple, as rustdoc shows it.
-fn short_initializer(db: &RootDatabase, it: hir::Const) -> Option<String> {
+fn short_initializer(db: &Db, it: hir::Const) -> Option<String> {
     use hir::view::HasSourceView;
     let source = it.source_view(db)?;
     let body = source.value.body()?;
@@ -1406,7 +1406,7 @@ fn short_initializer(db: &RootDatabase, it: hir::Const) -> Option<String> {
     (simple && text.len() <= 60).then_some(text)
 }
 
-pub(crate) fn static_decl(db: &RootDatabase, places: Linking<'_>, it: hir::Static) -> Code {
+pub(crate) fn static_decl(db: &Db, places: Linking<'_>, it: hir::Static) -> Code {
     let id: hir_def::StaticId = it.into();
     let data = StaticSignature::of(db, id);
     let mut out = Code::default();
@@ -1425,7 +1425,7 @@ pub(crate) fn static_decl(db: &RootDatabase, places: Linking<'_>, it: hir::Stati
 }
 
 /// `impl<T: Clone> Trait<A> for Foo<T>` and its `where` clause.
-pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl) -> Code {
+pub(crate) fn impl_header(db: &Db, places: Linking<'_>, it: hir::Impl) -> Code {
     if let (Some(trait_), Some(adt)) = (it.trait_(db), it.self_ty(db).as_adt())
         && is_builtin_derive(db, it)
     {
@@ -1455,7 +1455,7 @@ pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl)
 
 /// Whether `it` is the impl of a built-in derive (`#[derive(Clone)]`), which rustdoc shows as
 /// rustc's derive writes it, whatever rust-analyzer's expansion of it says.
-pub(crate) fn is_builtin_derive(db: &RootDatabase, it: hir::Impl) -> bool {
+pub(crate) fn is_builtin_derive(db: &Db, it: hir::Impl) -> bool {
     use hir::view::HasSourceView;
     if ImplId::try_from(it).is_err() {
         return true;
@@ -1471,7 +1471,7 @@ pub(crate) fn is_builtin_derive(db: &RootDatabase, it: hir::Impl) -> bool {
 /// derived trait, as rustc's derive writes the impl; `bound` is that trait when it is not the
 /// one implemented, as `impl<T: PartialEq> StructuralPartialEq for Foo<T>`.
 pub(crate) fn derive_header(
-    db: &RootDatabase,
+    db: &Db,
     places: Linking<'_>,
     trait_: hir::Trait,
     bound: hir::Trait,
@@ -1534,7 +1534,7 @@ pub(crate) struct AdtParams {
     pub(crate) args: Vec<String>,
 }
 
-pub(crate) fn adt_params(db: &RootDatabase, places: Linking<'_>, adt: hir::Adt) -> AdtParams {
+pub(crate) fn adt_params(db: &Db, places: Linking<'_>, adt: hir::Adt) -> AdtParams {
     let def = GenericDefId::AdtId(adt.into());
     let (params, store) = GenericParams::with_store(db, def);
     let sig = sig_of(db, places, store, def);

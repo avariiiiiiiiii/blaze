@@ -197,6 +197,11 @@ of the inputs take one cheap shape. Those are the areas below.
 
 ## 9. Proof: differential against rustc, and fuzzing
 
+Dropped 2026-10-30 (Andrew: no harness compares blaze with rustc or cargo):
+`rejections.py` and `frontend/fuzz.py` are deleted, and `frontend/cases.py` holds each case to
+its own header ([the harnesses](../../../../harness.md#the-v2-proof)). The plan below is as of
+2026-10-29.
+
 - `harness/v2/rejections.py` (proof, done) compares rustc's error codes with blaze's. The bar
   also needs the **primary span** and, for accepted programs, the **same meaning**.
 - `frontend-fast-diff` adds:

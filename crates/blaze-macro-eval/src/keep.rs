@@ -1,4 +1,4 @@
-//! What an expansion is kept by in the store, besides its call ([`blaze_expand::given`]) and
+//! What an expansion is kept by in the store, besides its call ([`proc_macro_api::kept::given`]) and
 //! its macro's code ([`code`](crate::code)): what it read, as [`os`](crate::os) traced it,
 //! looked up again now. A macro reads the calling crate's environment, never blaze's, and the
 //! machine's files, so that is what is looked at.

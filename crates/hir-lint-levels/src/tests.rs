@@ -6,14 +6,14 @@ use hir_def::{
     nameres::crate_def_map,
 };
 use syntax::view::{self as ast, AstNode as _, HasName as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{LevelError, crate_lint_level, lint_level, lint_level_at, query::owner_node};
 
 const LINT: LintId = LintId::LONG_RUNNING_CONST_EVAL;
 
 fn db_of(fixture: &str) -> (Db, Crate) {
-    let db = Db::with_files(fixture);
+    let db = fixture::db(fixture).into_db();
     let krate = *base_db::all_crates(&db).iter().find(|it| it.data(&db).origin.is_local()).expect("a local crate");
     (db, krate)
 }

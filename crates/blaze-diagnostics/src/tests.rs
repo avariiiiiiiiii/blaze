@@ -11,7 +11,7 @@ pub(crate) mod lints;
 use std::collections::HashMap;
 
 use span::FileId;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use self::db::TestDB;
 use crate::{
@@ -77,7 +77,9 @@ fn paths(fixture: &str) -> Vec<String> {
 /// The workspace crates of `fixture` checked with `options`, each file named as the fixture
 /// names it, with `prefix` before it.
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
-    let (db, files) = TestDB::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))

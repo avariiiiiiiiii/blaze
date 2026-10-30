@@ -6,18 +6,20 @@ use std::collections::HashMap;
 
 use span::FileId;
 use syntax::view::{self as ast, AstNode as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     cx::{Cx, Files},
     print,
-    tests::{db::TestDB, paths},
+    tests::paths,
 };
 
 /// What `f` makes of the type of the initializer of each `let` of the fixture's first file,
 /// its files named `$DIR/<path>` as rustc's UI tests name them.
 fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) -> Vec<String> {
-    let (db, files) = TestDB::with_many_files(fixture);
+    let fx = fixture::db(fixture);
+    let files = fx.files().to_vec();
+    let db = fx.into_db();
     let names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))

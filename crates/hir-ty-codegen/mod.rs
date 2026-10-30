@@ -2739,8 +2739,8 @@ const LARGE: usize = 50_000;
 /// of nushell took 80 to 220 ms each. The single-pass allocator's code is larger and slower,
 /// and it gives every value live across blocks a stack slot of its own: hir-ty's
 /// `<Ty as HirDisplay>::hir_fmt`, of 22 503 instructions and recursive, had a frame of 10.7 KB
-/// with it and 2.5 KB without, and hir-ide's `recursive_vars_2` overflowed its 2 MB stack. The
-/// largest functions of blaze's own hir-ide tests, up to 128 217 instructions, took at most
+/// with it and 2.5 KB without, and hir-ty-mir's `recursive_vars_2` overflowed its 2 MB stack. The
+/// largest functions of blaze's own hir-ty-mir tests, up to 128 217 instructions, took at most
 /// 85 ms each with the usual one.
 const SINGLE_PASS: usize = 50_000;
 

@@ -8,13 +8,12 @@ use base_db::relevant_crates;
 use blaze_alloc_count::assert_at_most;
 use hir_expand::name::Name;
 use intern::Symbol;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{
     ModuleDefId,
     item_scope::{ItemInNs, LINEAR},
     nameres::crate_def_map,
-    test_db::TestDB,
 };
 
 const CODE: &str = r#"
@@ -48,7 +47,9 @@ fn name(text: &str) -> Name {
 /// [`LINEAR`] names and one of more, with no read before the measure: 0 allocations.
 #[test]
 fn reading_a_settled_scope_allocates_nothing() {
-    let (db, file) = TestDB::with_single_file(CODE);
+    let fx = fixture::db(CODE);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let krate = relevant_crates(&db, file.file_id(&db))[0];
     let map = crate_def_map(&db, krate);
     let root = map.module(&db, map.root).scope(&db);

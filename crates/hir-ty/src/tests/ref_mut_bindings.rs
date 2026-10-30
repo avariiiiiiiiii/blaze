@@ -11,7 +11,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use rustc_ast_ir::Mutability;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{BindingMode, ByRef, InferBodyId, InferenceResult, utils::pat_has_ref_mut_binding};
 
@@ -57,7 +57,7 @@ fn reference(store: &ExpressionStore, pat: PatId, mode: impl Fn(PatId) -> Option
 
 #[test]
 fn a_pattern_binds_by_ref_mut_as_both_old_copies_said() {
-    let db = Db::with_files(FIXTURE);
+    let db = fixture::db(FIXTURE).into_db();
     crate::next_solver::attach_db(&db, || {
         let def = DefWithBodyId::FunctionId(function(&db, "f"));
         let body = Body::of(&db, def);

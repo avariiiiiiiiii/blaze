@@ -1,64 +1,8 @@
-//! `BLAZE_VERSION` and `BLAZE_VERSION_LINE`, which blaze this is (see [`version`]), and
-//! `BLAZE_SOURCES`: what this build of blaze is built from, for the store to key what it
-//! keeps by (`blaze_store::built_from`). A hash of every file of the workspace's crates, the
-//! vendored ones included, of the manifest and lock file that pick the crates of crates.io, of
-//! the files outside them a crate compiles in, of the features, the target and whether debug
-//! assertions are on, which some of codegen checks under. The compiler that builds blaze is
-//! not: what blaze compiles does not depend on it, and the toolchain it compiles against is
-//! in the store's key apart. Two such builds of the same sources compile the same code into
-//! the store, wherever they are built. Outside the workspace, as a published crate builds, it
-//! is not set, and the store keys by the bytes of the executable.
-//!
-//! The SHA-256 is `blaze-sha256`'s, which has no dependencies, rather than `sha2`'s: a build
-//! dependency is built for the machine that builds, and `tools/nix/units` holds one graph per
-//! target computed on Linux, where `sha2`'s `cpufeatures` needs no `libc`, which it needs on
-//! Apple's aarch64.
-
-use std::path::{Path, PathBuf};
-
-use blaze_sha256::Sha256;
+//! `BLAZE_VERSION` and `BLAZE_VERSION_LINE`: which blaze this is (see [`version`]).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     version();
-    println!("cargo:rerun-if-env-changed=CARGO_WORKSPACE_DIR");
-    let Some(root) = std::env::var_os("CARGO_WORKSPACE_DIR").map(PathBuf::from) else { return };
-    let (lock, crates, vendor) =
-        (root.join("Cargo.lock"), root.join("crates"), root.join("vendor"));
-    if !lock.is_file() || !crates.is_dir() {
-        return;
-    }
-    let mut files = Vec::new();
-    for top in [&crates, &vendor] {
-        println!("cargo:rerun-if-changed={}", top.display());
-        listed(top, &mut files);
-    }
-    // `harness/toolchain` is compiled in (`cargo/state.rs`).
-    for file in ["Cargo.toml", "Cargo.lock", ".cargo/config.toml", "harness/toolchain"] {
-        let path = root.join(file);
-        println!("cargo:rerun-if-changed={}", path.display());
-        files.push(path);
-    }
-    files.sort();
-    let mut hash = Sha256::new();
-    let mut field = |bytes: &[u8]| {
-        hash.update(&(bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
-    };
-    for path in &files {
-        let Ok(bytes) = std::fs::read(path) else { continue };
-        let name = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
-        field(name.as_bytes());
-        field(&bytes);
-    }
-    let mut features: Vec<String> =
-        std::env::vars().map(|it| it.0).filter(|it| it.starts_with("CARGO_FEATURE_")).collect();
-    features.sort();
-    field(features.join(" ").as_bytes());
-    field(std::env::var("TARGET").unwrap_or_default().as_bytes());
-    field(&[u8::from(std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some())]);
-    let hex: String = hash.finish().iter().map(|byte| format!("{byte:02x}")).collect();
-    println!("cargo:rustc-env=BLAZE_SOURCES={hex}");
 }
 
 /// Which blaze this is, from the one place it is said: `BLAZE_RELEASE`, the tag a release is
@@ -149,21 +93,4 @@ fn version() {
     };
     println!("cargo:rustc-env=BLAZE_VERSION={version}");
     println!("cargo:rustc-env=BLAZE_VERSION_LINE={line}");
-}
-
-/// Every file below `dir`, but in hidden directories and in what cargo and npm build into.
-fn listed(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Ok(kind) = entry.file_type() else { continue };
-        if kind.is_dir() {
-            let built = name == "target" || name == "node_modules";
-            if !name.to_string_lossy().starts_with('.') && !built {
-                listed(&entry.path(), files);
-            }
-        } else {
-            files.push(entry.path());
-        }
-    }
 }

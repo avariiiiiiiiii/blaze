@@ -5,8 +5,7 @@
 //! A project pins blaze, and so the Rust blaze ships; Rust's own toolchain files are not read
 //! (docs/toolchain.md).
 //!
-//! Shared by the launcher (`bin/blaze.rs`), which must stay small and quick on every
-//! command: std and `toml` only.
+//! Asked before every command (`program.rs`), so it stays small and quick: std and `toml` only.
 
 use std::path::{Path, PathBuf};
 

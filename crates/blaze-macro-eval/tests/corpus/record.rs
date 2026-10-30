@@ -10,17 +10,14 @@ use std::{
 };
 
 use base_db::{ContentId, Crate, Db, Env};
-use blaze_expand::native;
+use blaze_macro_wasm::native;
 use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
 use span::Span;
 use tt::TopSubtree;
 
-/// What a call is held against.
+/// Another host of blaze's a call is held against.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Reference {
-    /// The toolchain's proc-macro server with rustc's library of the crate: the macro as rustc
-    /// runs it.
-    Toolchain,
     /// blaze's WebAssembly host with blaze's module of the crate.
     Wasm,
     /// The fixture's macro built into this test against blaze's in-process bridge.
@@ -101,8 +98,8 @@ impl Call {
 
     /// The anchors and contexts of the call's spans, as the store writes an output against
     /// them.
-    fn spans(&self) -> blaze_expand::Spans {
-        let call = blaze_expand::Call {
+    fn spans(&self) -> proc_macro_api::kept::Spans {
+        let call = proc_macro_api::kept::Call {
             name: &self.name,
             kind: self.kind,
             subtree: &self.subtree,
@@ -113,7 +110,7 @@ impl Call {
             mixed_site: self.mixed_site,
             current_dir: &self.current_dir,
         };
-        blaze_expand::given(&ContentId::default(), &call).1
+        proc_macro_api::kept::given(&ContentId::default(), &call).1
     }
 
     /// What the call is about: the name of the item a derive or an attribute is on, the first
@@ -172,14 +169,11 @@ impl Record {
     /// anchor and context), the spans as the store writes them against the call's, and a
     /// panic's message.
     pub(crate) fn differences(&self, out: &mut Vec<String>) {
-        if self.references.is_empty() {
-            out.push(format!("{}: no reference expanded it", self.what()));
-        }
         let spans = self.call.spans();
         for (which, theirs) in &self.references {
             let said = match (&self.eval, theirs) {
                 (Outcome::Expanded(ours), Outcome::Expanded(theirs)) => native::difference(ours, theirs).or_else(|| {
-                    (blaze_expand::written(ours, &spans) != blaze_expand::written(theirs, &spans))
+                    (proc_macro_api::kept::written(ours, &spans) != proc_macro_api::kept::written(theirs, &spans))
                         .then(|| "its spans are written otherwise against the call's".to_owned())
                 }),
                 (Outcome::Panicked(ours), Outcome::Panicked(theirs)) => {

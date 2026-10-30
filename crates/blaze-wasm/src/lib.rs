@@ -35,19 +35,17 @@ use hir_def::{
 use hir_ty_codegen::{
     CodegenError, CodegenUnit, Rejections, Roots, SymbolResolver, exported_symbol,
 };
-use ide_db::{
-    ChangeWithProcMacros, RootDatabase, RootDatabaseExt as _,
-    base_db::{
-        CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env,
-        LangCrateOrigin, SourceRoot, TargetKind,
-        target::{Arch, TargetData},
-    },
+use base_db::{
+    CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env,
+    LangCrateOrigin, SourceRoot, TargetKind,
+    target::{Arch, TargetData},
 };
+use hir_expand::change::ChangeWithProcMacros;
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::Edition;
 use triomphe::Arc;
-use vfs::{AbsPathBuf, FileId, VfsPath, file_set::FileSet};
+use base_db::{AbsPathBuf, FileId, FileSet, VfsPath};
 
 use crate::link::{Linker, Patch};
 
@@ -60,7 +58,7 @@ pub const CORE: &str = "/core/src/lib.rs";
 const DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-i128:128-n32:64-S128-ni:1:10:20";
 
 pub struct Compiler {
-    db: RootDatabase,
+    db: Db,
     files: FxHashMap<String, FileId>,
     /// Files added since the crate graph was last set.
     new_files: bool,
@@ -185,10 +183,10 @@ impl Compiler {
             change.set_roots(roots);
             change.set_crate_graph(graph);
         }
-        self.db.apply_change(change);
+        change.apply(&mut self.db);
         // The build after this looks at what the changed files can have changed.
         for file in changed {
-            let crates = ide_db::base_db::relevant_crates(&self.db, file);
+            let crates = base_db::relevant_crates(&self.db, file);
             self.known.touch(&self.db, (!crates.is_empty()).then_some(crates));
         }
     }
@@ -213,7 +211,7 @@ impl Compiler {
         change.set_roots(project.roots);
         change.set_crate_graph(project.graph);
         change.set_proc_macros(project.macros);
-        self.db.apply_change(change);
+        change.apply(&mut self.db);
         self.missed = project.missed;
         Ok(())
     }
@@ -231,7 +229,7 @@ impl Compiler {
     pub fn analyze(&self) -> (usize, Duration, Duration) {
         let db = &self.db;
         let start = stdx::time::Instant::now();
-        let crates = ide_db::base_db::all_crates(db);
+        let crates = base_db::all_crates(db);
         for &krate in crates.iter() {
             hir_def::nameres::crate_def_map(db, krate);
         }
@@ -250,7 +248,7 @@ impl Compiler {
     pub fn expanded(&self) -> String {
         let db = &self.db;
         let mut text = String::new();
-        for &krate in ide_db::base_db::all_crates(db).iter() {
+        for &krate in base_db::all_crates(db).iter() {
             if krate.data(db).origin.is_local() {
                 for function in functions_of(db, krate.into()) {
                     text.push_str(
@@ -314,7 +312,7 @@ impl Compiler {
             graph.add_crate_root(
                 root,
                 Edition::CURRENT,
-                Some(ide_db::base_db::CrateName::new(name).expect("a crate name").into()),
+                Some(base_db::CrateName::new(name).expect("a crate name").into()),
                 None,
                 cfg.clone(),
                 None,
@@ -335,7 +333,7 @@ impl Compiler {
             .get(MAIN)
             .map(|&root| add(root, "app", CrateOrigin::Local { repo: None, name: None }));
         if let (Some(app), Some(core)) = (app, core) {
-            let name = ide_db::base_db::CrateName::new("core").expect("a crate name");
+            let name = base_db::CrateName::new("core").expect("a crate name");
             let dep = DependencyBuilder::with_prelude(name, core, true, true);
             graph.add_dep(app, dep).expect("`core` depends on nothing");
         }
@@ -356,7 +354,7 @@ impl Compiler {
             }
             let names = Names { db, library: &library };
             let mut named = Vec::new();
-            for &krate in ide_db::base_db::all_crates(db).iter() {
+            for &krate in base_db::all_crates(db).iter() {
                 if !krate.data(db).origin.is_local() {
                     let functions = functions_of(db, krate.into());
                     named.extend(
@@ -369,7 +367,7 @@ impl Compiler {
             library.extend(named);
             library
         });
-        for &krate in ide_db::base_db::all_crates(db).iter() {
+        for &krate in base_db::all_crates(db).iter() {
             if krate.data(db).origin.is_local() {
                 entries.extend(functions_of(db, krate.into()));
             }
@@ -467,7 +465,7 @@ impl Compiler {
 
 /// The functions of a crate's modules and `impl`s that have a body.
 // FIXME: those declared inside a body are not listed, as `blaze` lists them.
-pub fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
+pub fn functions_of(db: &Db, krate: Crate) -> Vec<FunctionId> {
     let mut modules: Vec<Module> = vec![krate.root_module(db)];
     let mut functions = Vec::new();
     while let Some(module) = modules.pop() {
@@ -494,7 +492,7 @@ pub fn functions_of(db: &RootDatabase, krate: Crate) -> Vec<FunctionId> {
 
 /// Names for what rustc would have named, had it built anything: the path of the item.
 struct Names<'a> {
-    db: &'a RootDatabase,
+    db: &'a Db,
     library: &'a FxHashMap<String, FunctionId>,
 }
 
@@ -565,7 +563,7 @@ impl SymbolResolver for Names<'_> {
         Some(Symbol::intern(&root.path_for_file(&file)?.to_string())) // alloc: wasm, per name
     }
 
-    fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn stable_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
         // Nothing here is linked with what another compiler named.
         let name = Crate::from(krate).display_name(self.db)?;
         Some(name.crate_name().as_str().bytes().fold(0xcbf29ce484222325, |hash, byte| {

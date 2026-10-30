@@ -6,11 +6,11 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context as _, bail};
+use blaze_registry::http::{Http as _, HttpNotSuccessful, HyperHttp, Retry};
 use sha2::{Digest as _, Sha256};
 
 use crate::pin;
@@ -161,12 +161,17 @@ fn read_at(tag: &str, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
         };
     }
     let base = given.unwrap_or_else(|| RELEASES.to_owned());
-    let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?;
-    let traffic = Arc::new(crate::remote::Traffic::new(1));
-    let web = crate::remote::Https::open(&address, PATIENCE, traffic)?;
-    let runtime = crate::remote::runtime()?;
-    let read = runtime.block_on(web.read_small(name, MOST))?;
-    Ok(read.map(|(bytes, _)| bytes))
+    let address = url::Url::parse(&format!("{}/{tag}/", base.trim_end_matches('/')))?.join(name)?;
+    let http = HyperHttp::new(PATIENCE)?;
+    let answer = Retry::default().run(|| http.get(address.as_str(), &[]))?;
+    match answer.status {
+        404 => Ok(None),
+        200..300 if answer.body.len() as u64 > MOST => {
+            bail!("{address} is {} bytes, more than the {MOST} a release's asset may be", answer.body.len())
+        }
+        200..300 => Ok(Some(answer.body)),
+        _ => Err(HttpNotSuccessful::new(address.as_str(), &answer).into()),
+    }
 }
 
 /// The tag of the release whose assets are the channels' pointers (docs/release.md).

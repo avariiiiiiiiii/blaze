@@ -17,6 +17,8 @@ pub mod change;
 pub mod declarative;
 pub mod eager;
 pub mod files;
+#[cfg(any(test, feature = "fixture"))]
+pub mod fixture;
 pub mod hygiene;
 pub mod inert_attr_macro;
 pub mod mod_path;

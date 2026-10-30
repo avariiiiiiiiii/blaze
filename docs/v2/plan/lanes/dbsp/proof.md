@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lane dbsp's proof against rustc and on its own traces: edit sequences built incrementally by blaze and fresh by rustc, the cost of one impl, and what a build after each kind of edit may rerun.
+summary: Lane dbsp's proof on blaze's own builds and traces: edit sequences built incrementally and from nothing by blaze, the cost of one impl, and what a build after each kind of edit may rerun.
 date: 2026-10-30
 ---
 # dbsp: the proof
@@ -11,15 +11,15 @@ outside blaze, by one harness and one module of the oracle:
 
 | check | where | what it proves |
 |---|---|---|
-| the same as rustc | `harness/v2/dbsp/edits.py` | after every edit of a sequence, blaze's incremental build says what rustc's fresh build says |
+| the same as from nothing | `harness/v2/dbsp/edits.py` | after every edit of a sequence, blaze's incremental build says what blaze's build of the same files from nothing says |
 | one impl costs its facts | `edits.py`'s cost check | design section 10's counts hold on every project, whatever its size |
 | a reader sees only its slice | `crates/blaze-v2-proof/src/dbsp.rs` | after each kind of edit, the build reran only what that edit can reach |
 
-## Edit sequences against rustc
+## Edit sequences, incremental against from nothing
 
 `edits.py` takes a project and an edit script. A project is the oracle's fixture workspace
 (`harness/v2/fixture.py`), a project of `harness/blaze_cli.py`'s `PROJECTS`, any cargo
-workspace, or a directory of cases (`harness/v2/frontend/cases/`, `harness/v2/rejections/`). An
+workspace, or a directory of cases (`harness/v2/frontend/cases/`). An
 edit script is generated from a seed or saved in `harness/v2/dbsp/scripts/`. The script's
 edits change a scaffold appended to one file of the project, between two marker lines. The
 scaffold holds modules (inline, or files of their own), structs, traits with methods, aliases,
@@ -27,19 +27,21 @@ scaffold holds modules (inline, or files of their own), structs, traits with met
 project, so the same script runs on any of them.
 
 blaze builds every step in one workspace under one daemon, so each step after the base goes
-through the maintainers. rustc builds every step fresh: a case through `cases.py`'s `Runner`, a
-workspace with plain cargo on the pinned nightly. Each step is compared as `cases.py` compares
-a case (`cases.judged`): the outcome, the error codes, each code's primary spans, and the
-program's run where there is one. About one edit in four breaks the program on purpose (a
-duplicate impl, a dangling path, a derive missing what it needs, a method still called removed).
-That way rustc's reject paths are compared as well as its accept paths.
+through the maintainers. Each step is also copied into a workspace of its own and built from
+nothing: a daemon with an empty home and a store holding only the standard library
+(`oracle.std_seed`). The two are compared (`edits.compare`): accepted or rejected, the keys of
+the errors (`cases.key_of`), and the program's run where there is one. Since 2026-10-30 no step
+is built by rustc or cargo (Andrew: no harness compares blaze with them). About one edit in four
+breaks the program on purpose (a duplicate impl, a dangling path, a derive missing what it
+needs, a method still called removed), so the reject paths are compared as well as the accept
+paths.
 
-The first step that does not match ends its script. The script is then shrunk with `fuzz.py`'s
-shrinker to the fewest edits that still give a mismatch of the same signature, and written to
+The first step that does not match ends its script. The script is then shrunk (`edits.shrink`,
+edit lines deleted) to the fewest edits that still give a mismatch of the same signature, and written to
 `scripts/`, where every later run replays it on every project.
 
 What it proves: for the edits it makes, the incremental path has the same observable result as
-rustc, including the steps where the maintainers have to retract (removed impls, removed
+a build from nothing, including the steps where the maintainers have to retract (removed impls, removed
 modules, renames, repointed `use`s). What it does not prove: anything about edits outside the
 scaffold's vocabulary (attribute macros, proc macros, `cfg` changes). Those are design section
 12's first row, the in-crate random tests.
@@ -78,18 +80,17 @@ trait slices; for the rest, the modules' declarations) is unmeasured, never a pa
 
 ## How the coordinator runs it
 
-- Selftest (no blaze, no rustc): `uv run --frozen python harness/v2/dbsp/edits.py selftest`.
+- Selftest (no blaze): `uv run --frozen python harness/v2/dbsp/edits.py selftest`.
   It checks that the generator is deterministic per seed and covers every op and kind, that the
-  rendering and the model are right, that the shrinker reduces a planted mismatch, that the
-  comparison reads `cases.py`'s and `rejections.py`'s fields, the cost check, the saved
+  rendering and the model are right, that the shrinker reduces a planted mismatch, the
+  comparison of two builds and a mismatch's signature, the cost check, the saved
   scripts, and that the trace cases match.
 - The oracle's tests: `blaze test -p blaze-v2-proof` (the `dbsp` module's).
 - A run: `harness/v2/proof.py` runs it as the check `dbsp` with its defaults (the fixture, three
   generated scripts and the saved ones). For more, use `uv run --frozen python
   harness/v2/dbsp/edits.py '{"engine": {"kind": "v2", "blaze": "..."}, "out": "/tmp/edits.json",
   "projects": [{"kind": "fixture"}, {"kind": "harness", "name": "ripgrep"}, {"kind": "cases",
-  "path": "harness/v2/frontend/cases/nameres"}], "scripts": 20, "trace": true}'`. Give it a
-  fixed `work` to keep rustc's answers for the cases between runs.
+  "path": "harness/v2/frontend/cases/nameres"}], "scripts": 20, "trace": true}'`.
 
 Until the lane's maintainers and the `blaze-maintained` line exist, the cost check fails on
 every `add_impl` step, and the trace cases fail on the round queries. Both failures are

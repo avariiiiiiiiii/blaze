@@ -203,7 +203,7 @@ pub(crate) fn sanitize(rustflags: &[String], target: &str) -> Result<Sanitize, S
     }
     let sanitize = crate::unstable::sanitize(rustflags)?;
     if sanitize.sanitizers != Sanitizers::NONE {
-        let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+        let sysroot = crate::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
         crate::unstable::runtimes(sanitize.sanitizers, target, &sysroot)?;
     }
     match sanitize.is_empty() {
@@ -717,7 +717,7 @@ pub(crate) fn link(
     output.exec_log = test && blaze_codegen::exec::records(generated.policy.mode);
     output.sanitize = generated.policy.sanitize;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
-    let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+    let sysroot = crate::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let located =
         blaze_link::target::locate(&mut output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
     let side = generated.side()?;

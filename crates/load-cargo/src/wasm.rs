@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use hir_expand::proc_macro::ProcMacroLoadResult;
-use ide_db::base_db::ProcMacroLoadingError;
+use base_db::ProcMacroLoadingError;
 use vfs::AbsPath;
 
 /// Loads the macros of the module at a path.

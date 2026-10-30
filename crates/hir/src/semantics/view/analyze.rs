@@ -43,7 +43,7 @@ impl<'db> Semantics<'db> {
         self.analyze_impl(self.find_file(node), false)
     }
 
-    /// `SemanticsImpl::analyze_impl` at a view, with no offset.
+    /// The analyzer for `node`'s innermost owner, with no offset.
     pub(super) fn analyze_impl(
         &self,
         node: InFile<Node<'db>>,
@@ -107,7 +107,7 @@ impl<'db> Semantics<'db> {
     }
 
     /// The adjustments inference applied to `expr`, borrowed as inference stores them.
-    pub fn expr_adjustments(&self, expr: ast::Expr<'db>) -> Option<&'db [hir_ide::Adjustment]> {
+    pub fn expr_adjustments(&self, expr: ast::Expr<'db>) -> Option<&'db [hir_ty::Adjustment]> {
         self.analyze(expr.syntax())?.expr_adjustments_view(expr)
     }
 
@@ -280,8 +280,8 @@ impl<'db> Semantics<'db> {
         r
     }
 
-    /// `SemanticsImpl::descend_into_macros_impl` without descending into derives: `f` on each
-    /// token `token` maps to that maps no further, through attribute macros, fn-like macros
+    /// Descent into macros without descending into derives: `f` on each token `token` maps to
+    /// that maps no further, through attribute macros, fn-like macros
     /// (eager arguments included), derive attributes and derive helpers.
     fn descend_into_macros_all(
         &self,

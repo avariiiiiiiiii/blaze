@@ -7,9 +7,9 @@
 //! panic is the evaluator's own (a failed bounds check here).
 
 use hir_ty_mir::mir::{Plain, run_function};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 macro_rules! program {
     ($body:literal) => {
@@ -60,7 +60,9 @@ fn fail() {
 
 /// Runs the program's `main` and gives how it ended and what it printed.
 fn run(fixture: &str) -> (Result<(), String>, String) {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let main = function(&db, "main");
         let (result, output, Plain) = run_function(&db, main, Plain);

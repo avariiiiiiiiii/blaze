@@ -1,13 +1,12 @@
-//! [`Semantics`] over borrowed syntax views (frontend.md item 16): the handle `Semantics`'s
-//! methods, same names and meaning, taking `syntax::view` nodes by value and giving views
-//! borrowed from the database, `'db` from `db: &'db Db`. Callers write
-//! `use hir::view::Semantics;` and keep their bodies.
+//! [`Semantics`] over borrowed syntax views (frontend.md item 16): what the source means, taking
+//! `syntax::view` nodes by value and giving views borrowed from the database, `'db` from
+//! `db: &'db Db`. Callers write `use hir::view::Semantics;`.
 //!
 //! A view does not know its file. Every tree this hands out (`parse`, `parse_or_expand`,
 //! `expand`, `source`, ...) is recorded by its address with its [`HirFileId`], and a view is
 //! put in its file again by its tree's address ([`Semantics::hir_file_for`]). The dyn maps,
-//! file-to-module tables and anon-const caches are the handle `Semantics`'s own, which hold
-//! ids and kind tags only.
+//! file-to-module tables and anon-const caches are [`SemanticsImpl`]'s, which hold ids and
+//! kind tags only.
 
 mod analyze;
 mod has_source;
@@ -23,6 +22,7 @@ use hir_def::{
     nameres::{ModuleOrigin, crate_def_map},
 };
 use hir_expand::{AstId, EditionedFileId, ExpandResult, HirFileId, MacroCallId};
+use hir_ty::next_solver::AnyImplId;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::FileId;
 use syntax::{
@@ -59,9 +59,23 @@ fn tree_key(node: Node<'_>) -> usize {
     ptr::from_ref::<FlatTree>(node.file()).addr()
 }
 
+thread_local! {
+    /// The `roots` of the last `Semantics` dropped on this thread, emptied: the next one takes
+    /// its allocation, as the source-to-def tables are carried (`SourceToDefCache::take`).
+    static ROOTS: RefCell<FxHashMap<usize, HirFileId>> = RefCell::default();
+}
+
+impl Drop for Semantics<'_> {
+    fn drop(&mut self) {
+        let mut roots = std::mem::take(self.roots.get_mut());
+        roots.clear();
+        let _ = ROOTS.try_with(|it| it.replace(roots));
+    }
+}
+
 impl<'db> Semantics<'db> {
     pub fn new(db: &'db Db) -> Semantics<'db> {
-        Semantics { db, imp: SemanticsImpl::new(db), roots: RefCell::default() }
+        Semantics { db, imp: SemanticsImpl::new(db), roots: RefCell::new(ROOTS.take()) }
     }
 
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
@@ -69,7 +83,7 @@ impl<'db> Semantics<'db> {
     pub fn new_within(db: &'db Db, crates: Arc<FxHashSet<base_db::Crate>>) -> Semantics<'db> {
         let mut imp = SemanticsImpl::new(db);
         imp.s2d_cache.get_mut().within = Some(crates);
-        Semantics { db, imp, roots: RefCell::default() }
+        Semantics { db, imp, roots: RefCell::new(ROOTS.take()) }
     }
 
     /// Records `root`'s tree as the tree of `file_id`.
@@ -239,6 +253,22 @@ impl<'db> Semantics<'db> {
     }
 
     pub fn impl_generated_from_derive(&self, impl_: Impl) -> Option<Adt> {
-        self.imp.impl_generated_from_derive(impl_)
+        let id = match impl_.id {
+            AnyImplId::ImplId(id) => id,
+            AnyImplId::BuiltinDeriveImplId(id) => return Some(id.loc(self.db).adt.into()),
+        };
+        let source = hir_def::src::HasSource::ast_ptr(id.loc(self.db), self.db);
+        let mut file_id = source.file_id;
+        let adt_ast_id = loop {
+            let macro_call = file_id.macro_file()?;
+            match macro_call.loc(self.db).kind {
+                hir_expand::MacroCallKind::Derive { ast_id, .. } => break ast_id,
+                hir_expand::MacroCallKind::FnLike { ast_id, .. } => file_id = ast_id.file_id,
+                hir_expand::MacroCallKind::Attr { ast_id, .. } => file_id = ast_id.file_id,
+            }
+        };
+        let adt = adt_ast_id.to_view(self.db);
+        self.cache(adt.syntax().tree_top(), adt_ast_id.file_id);
+        self.to_def2(InFile::new(adt_ast_id.file_id, adt))
     }
 }

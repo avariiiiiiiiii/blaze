@@ -43,7 +43,7 @@ use syntax::{
     view::{self as ast, AstNode},
 };
 use syntax_bridge::token_tree_to_syntax_node;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 use tt::{TextRange, TextSize};
 
 use crate::{
@@ -51,7 +51,7 @@ use crate::{
     expr_store::Body,
     nameres::{DefMap, ModuleSourceView, crate_def_map},
     src::HasSource,
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDBExt,
     tt::TopSubtree,
 };
 
@@ -59,7 +59,7 @@ use crate::{
 fn check_errors(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(false);
 
-    let db = TestDB::with_files(ra_fixture);
+    let db = fixture::db(ra_fixture).into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let errors = def_map
@@ -111,7 +111,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         },
     )];
 
-    let db = TestDB::with_files_extra_proc_macros(ra_fixture, extra_proc_macros);
+    let db = fixture::db_with_proc_macros(ra_fixture, extra_proc_macros).into_db();
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let source = def_map.module(&db, def_map.root).definition_source_view(&db);
@@ -477,8 +477,10 @@ m!(f);
 m!(g);
     "#;
 
-    let (db, file_id) = TestDB::with_single_file(fixture);
-    let krate = db.test_crate();
+    let fx = fixture::db(fixture);
+    let file_id = fx.only_file();
+    let db = fx.into_db();
+    let krate = fixture::test_crate(&db);
     let def_map = crate_def_map(&db, krate);
     let source = def_map.module(&db, def_map.root).definition_source_view(&db);
     let source_file = match source.value {

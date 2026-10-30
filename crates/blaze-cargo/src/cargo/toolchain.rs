@@ -244,7 +244,7 @@ pub fn too_new(packages: &[&cargo_metadata::Package]) -> Option<String> {
          blaze to one with Rust {needs} or newer, and pin it in the workspace's `Cargo.toml` \
          under `[workspace.metadata.blaze] version`",
         package.name,
-        crate::engine::get().version,
+        crate::release::get().version,
         ours_release()
     ))
 }

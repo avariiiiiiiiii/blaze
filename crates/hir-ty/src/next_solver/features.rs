@@ -58,7 +58,7 @@ mod tests {
         Interner as _,
         inherent::{Clause as _, Features as _},
     };
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use crate::{
         lower::{GenericPredicates, trait_environment},
@@ -82,8 +82,8 @@ fn unsized_param<T: ?Sized + Tr>() {}
     fn fixture(features: &str) -> (Db, Crate) {
         let attr =
             if features.is_empty() { String::new() } else { format!("#![feature({features})]\n") };
-        let db = Db::with_files(&format!("//- minicore: sized\n{attr}{ITEMS}"));
-        let krate = db.test_crate();
+        let db = fixture::db(&format!("//- minicore: sized\n{attr}{ITEMS}")).into_db();
+        let krate = fixture::test_crate(&db);
         (db, krate)
     }
 

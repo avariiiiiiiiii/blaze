@@ -21,8 +21,8 @@ you send them, including fixes you find here and want to upstream.
 
 ## Layout of the tree
 
-    crates/blaze-engine/       the daemon, the cargo drop-in, the splice, the remote
-    crates/blaze-engine/src/bin/ blaze, blaze-rustc
+    crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
+    crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
     crates/blaze-store/      the disk store of compiled code, which knows nothing about Rust
     crates/blaze-fuzz/       made-up and damaged inputs for the tests of what reads the store

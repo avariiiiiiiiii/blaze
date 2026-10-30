@@ -12,7 +12,7 @@
 //! ([`body`]): each name read from what inference recorded, or resolved with one resolver kept
 //! at the scope being walked. A signature, and what is in it (an enum's discriminants, the
 //! constants in its types), is walked over its syntax, as rustc's `intravisit` walks its HIR,
-//! its macro calls expanded and names resolved through `hir::Semantics`. Either way a trait
+//! its macro calls expanded and names resolved through `hir::view::Semantics`. Either way a trait
 //! impl's item named through a trait is mapped back to the trait's item as typeck has it, each
 //! path is resolved once, and what is live and what was walked are bitsets over the
 //! definitions.

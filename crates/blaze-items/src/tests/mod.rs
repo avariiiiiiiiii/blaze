@@ -1,4 +1,4 @@
-//! Tests over fixtures: `test-fixture`'s `WithFixture` builds [`db::TestDB`] from text.
+//! Tests over fixtures: `hir_expand::fixture` builds [`db::TestDB`] from text.
 
 mod bound;
 mod coherence;
@@ -12,7 +12,7 @@ mod narrow;
 mod table;
 
 use hir_def::{ModuleDefId, nameres::crate_def_map};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use crate::{ItemId, key};
 
@@ -20,7 +20,7 @@ pub(crate) use db::TestDB;
 
 /// Every item of the fixture's own crate outside bodies: of its modules, impls and traits.
 pub(crate) fn items(db: &TestDB) -> Vec<ItemId> {
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(db);
     let mut items = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         let scope = module.scope(db);
@@ -68,7 +68,9 @@ pub(crate) fn item(db: &TestDB, path: &str) -> ItemId {
 
 /// The database of a one-file fixture, and a way to set that file's text.
 pub(crate) fn single(text: &str) -> (TestDB, base_db::FileId) {
-    let (db, file) = TestDB::with_single_file(text);
+    let fx = fixture::db(text);
+    let file = fx.only_file();
+    let db = fx.into_db();
     let file = file.file_id(&db);
     (db, file)
 }

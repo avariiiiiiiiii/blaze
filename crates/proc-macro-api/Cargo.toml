@@ -19,9 +19,16 @@ serde_json.workspace = true
 tracing.workspace = true
 rustc-hash.workspace = true
 indexmap.workspace = true
+ra-ap-rustc_lexer.workspace = true
+
+# The `proc_macro` of the in-process bridge, whose span words the bridge's wire shares.
+native-proc-macro.workspace = true
 
 # local deps
+base-db.workspace = true
+blaze-cas.workspace = true
 blaze-core.workspace = true
+hir-expand.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-usercode.workspace = true

@@ -19,9 +19,8 @@ it is under [macOS arm64](#macos-arm64). The design notes it was written from ar
 
 ## Install
 
-`blaze` runs the `blaze-engine` executable in the same directory, blaze's engine, so the two
-have to be installed side by side, with `blaze-rustc`. The [installer](../install.sh) and
-`cargo install` both do that:
+`blaze` is one program, also installed as `blaze-engine`. The [installer](../install.sh) and
+`cargo install` both install it:
 
     curl -fsSL https://ix.dev/blaze | sh
     cargo +nightly-2026-10-27 install --locked blaze-engine
@@ -640,7 +639,7 @@ built from the load's own description of the macro's crate and what it depends o
 (`load_cargo::described`), whoever compiled the macro's library. Either build is kept in the
 store like a build script's. The macro's `proc_macro` crate is a shim
 (`crates/blaze-macro-wasm/guest/proc_macro.rs`, followed by the API it shares with the
-in-process bridge, `crates/blaze-expand/src/native/proc_macro/api.rs`) whose handles go to the
+in-process bridge, `crates/blaze-macro-wasm/native/proc_macro/api.rs`) whose handles go to the
 host by imports, so
 `syn`, `quote` and `proc-macro2` build unchanged. A module is linked with the wasi-libc of
 the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
@@ -1210,7 +1209,6 @@ started it. To change one, run `blaze stop` first.
 | `BLAZE_MEMORY_MAX` | the most the workers hold together, a size such as `6G`, or `off` | half the machine's memory (on Linux, or of what its control group allows) |
 | `BLAZE_MEMORY_BUDGET` | the limit of the memory budget the daemon says at start (`memory budget:` in its log; [memory-budget.md](memory-budget.md)), a size such as `12G`, or `off`; the budget is that less what other processes hold and a reserve of 5% (at least 512 MB) | the machine's memory, or the fewest its control groups' `memory.max` and `memory.high` allow |
 | `BLAZE_SPARE` | `ready` keeps a spare worker with the library loaded at all times, for the next project; `0` starts none, and a workspace loads once cargo has built it | a spare for each build of a new workspace, as it begins |
-| `BLAZE_OWN_BASE_MEMORY` | the most a worker may hold while it builds its own base in the background, a size such as `40G`, past which it gives that base up and edits patch rustc's executable; `off` is no bound | a quarter of the machine's memory (on Linux, or of what its control group allows) |
 | `BLAZE_LRU` | how many values of the queries a build in full holds the most of a worker keeps once the build is over, `mir=N,runtime=N,compiled=N,inlinable=N` (lowered MIR, runtime and monomorphized MIR, each instance's code, bodies to inline); 0 keeps every value. One let go is computed again when an edit asks for it ([#261](https://github.com/indexable-inc/blaze/issues/261)) | `mir=2048,runtime=2048,compiled=16384,inlinable=8192` |
 | `BLAZE_CACHE` | directory of the disk store, or `off` for none | `blaze/store` in the user's cache directory ([cache.md](cache.md)) |
 | `BLAZE_REMOTE` and the other store variables | see [cache.md](cache.md) | not set |

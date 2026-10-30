@@ -1030,7 +1030,7 @@ mod tests {
     use base_db::Crate;
     use hir_def::{CallableDefId, ModuleDefId, nameres::crate_def_map};
     use rustc_type_ir::inherent::Ty as _;
-    use test_fixture::WithFixture;
+    use hir_expand::fixture;
 
     use super::*;
     use crate::{
@@ -1064,8 +1064,8 @@ union U { a: u8, b: u16 }
 
     impl Fixture {
         fn new() -> Fixture {
-            let db = Db::with_files(FIXTURE);
-            let krate = db.test_crate();
+            let db = fixture::db(FIXTURE).into_db();
+            let krate = fixture::test_crate(&db);
             Fixture { db, krate }
         }
 

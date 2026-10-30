@@ -189,10 +189,10 @@ impl Asker {
     /// The toolchain directory of the cargo run: blaze's release, whichever cargo was named
     /// (cargo/toolchain.rs). Not found is an error, and nothing is run to find it.
     fn sysroot(&self) -> anyhow::Result<PathBuf> {
-        crate::cargo::toolchain::sysroot().with_context(|| {
+        crate::toolchain::sysroot().with_context(|| {
             format!(
                 "blaze builds with Rust {}, which is not installed: `blaze toolchain` installs it",
-                crate::cargo::toolchain::OURS.trim()
+                crate::toolchain::OURS.trim()
             )
         })
     }

@@ -13,9 +13,9 @@ use hir_ty_mir::mir::{
     CastKind, MirBody, MirOptLevel, MirOptions, Operand, OperandKind, Rvalue, StatementKind,
     TerminatorKind,
 };
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
-use crate::{db::TestDB, function};
+use crate::function;
 
 /// What a body makes the code generator emit or link to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,7 +71,9 @@ fn at(level: MirOptLevel) -> MirOptions {
 /// do at `Debug`.
 #[track_caller]
 fn release_adds_nothing(fixture: &str, functions: &[&str]) {
-    let (db, _) = TestDB::with_single_file(fixture);
+    let fx = fixture::db(fixture);
+    let _ = fx.only_file();
+    let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         for name in functions {
             let func = function(&db, name);

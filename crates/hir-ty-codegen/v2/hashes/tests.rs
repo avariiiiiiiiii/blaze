@@ -9,7 +9,7 @@ use blaze_items::{CodeHash, ItemId};
 use hir_def::{FunctionId, TypeAliasId, expr_store::Body as BodyStore};
 use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::ItemHashes;
 use crate::v2::{Body, HashSource, Hashes, by_id::ById};
@@ -21,19 +21,21 @@ fn hashes() -> ItemHashes {
 
 /// The database of `//- minicore: {minicore}` and `text`, and the file `text` is, to edit.
 fn fixture(minicore: &str, text: &str) -> (TestDB, base_db::FileId) {
-    let (db, file) = TestDB::with_single_file(&format!("//- minicore: {minicore}\n{text}"));
+    let fx = fixture::db(&format!("//- minicore: {minicore}\n{text}"));
+    let file = fx.only_file();
+    let db = fx.into_db();
     let file = file.file_id(&db);
     (db, file)
 }
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    hir_def::test_items::function(db, db.test_crate(), name)
+    hir_def::test_items::function(db, fixture::test_crate(db), name)
 }
 
 #[track_caller]
 fn alias(db: &TestDB, name: &str) -> TypeAliasId {
-    hir_def::test_items::type_alias(db, db.test_crate(), name)
+    hir_def::test_items::type_alias(db, fixture::test_crate(db), name)
 }
 
 #[track_caller]
@@ -152,7 +154,7 @@ fn a_drop_impl_of_a_fields_type_is_in_the_type() {
 #[test]
 fn a_constant_is_its_value() {
     let (db, _) = fixture("sized", CALLS);
-    let krate = db.test_crate();
+    let krate = fixture::test_crate(&db);
     let h = hashes();
     let konst = |value: u128| {
         hir_ty::attach_db(&db, || {

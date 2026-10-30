@@ -19,7 +19,7 @@ use hir_ty::{
     tait_hidden_types,
 };
 use rustc_type_ir::{UintTy, inherent::IntoKind as _};
-use test_fixture::WithFixture;
+use hir_expand::fixture;
 
 use super::db::TestDB;
 
@@ -115,7 +115,9 @@ impl<'a, T> Tr for &'a [T] {}
 /// unconstrained parameters come in declaration order, const ones too, lifetimes never.
 #[test]
 fn unconstrained_params_are_as_before_in_declaration_order() {
-    let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{UNCONSTRAINED}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{UNCONSTRAINED}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let main = crate_named(&db, "main");
     let found: Vec<Vec<u32>> = hir_ty::attach_db(&db, || {
         impls(&db, main)
@@ -154,7 +156,9 @@ pub fn bad(x: <S as Tr>::A) -> u16 { x }
 /// reverse, where every impl that defines `A` (four queries) was asked before.
 #[test]
 fn a_specializing_impl_asks_only_the_impls_its_header_unifies_with() {
-    let (db, _) = TestDB::with_many_files(SPECIALIZATION);
+    let fx = fixture::db(SPECIALIZATION);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let main = crate_named(&db, "main");
     let good = function_named(&db, main, "good");
     let bad = function_named(&db, main, "bad");
@@ -181,7 +185,9 @@ pub fn opaque() -> Opaque { 0u32 }
 /// is no longer inferred to find that out.
 #[test]
 fn an_alias_without_impl_trait_infers_no_body() {
-    let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{TAITS}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{TAITS}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let plain = type_alias_named(&db, crate_named(&db, "main"), "Plain");
     let executed = db.log_executed(|| {
         hir_ty::attach_db(&db, || assert_eq!(tait_hidden_types(&db, plain).values().count(), 0))
@@ -191,7 +197,9 @@ fn an_alias_without_impl_trait_infers_no_body() {
 
 #[test]
 fn an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body() {
-    let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{TAITS}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{TAITS}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let opaque = type_alias_named(&db, crate_named(&db, "main"), "Opaque");
     let executed = db.log_executed(|| {
         hir_ty::attach_db(&db, || {
@@ -222,13 +230,17 @@ impl dep::Foreign<u8> for u16 {}
 /// environment made for it.
 #[test]
 fn orphan_rules_normalize_only_a_header_with_an_alias() {
-    let (db, _) = TestDB::with_many_files(ORPHAN);
+    let fx = fixture::db(ORPHAN);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let impls = impls(&db, crate_named(&db, "main"));
     let answers: Vec<bool> =
         hir_ty::attach_db(&db, || impls.iter().map(|&it| check_orphan_rules(&db, it)).collect());
     assert_eq!(answers, [true, true, true, false]);
 
-    let (db, _) = TestDB::with_many_files(ORPHAN);
+    let fx = fixture::db(ORPHAN);
+    let _ = fx.files().to_vec();
+    let db = fx.into_db();
     let impls = self::impls(&db, crate_named(&db, "main"));
     let plain = db.log_executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[2]))));
     assert_eq!(runs(&plain, "trait_environment_query"), 0, "{plain:#?}");
@@ -251,7 +263,9 @@ pub enum Never {}
 /// `Freeze` walks every variant's fields in place: an enum is `Freeze` when each variant is.
 #[test]
 fn is_freeze_walks_every_variant() {
-    let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{FREEZE}"));
+    let fx = fixture::db(&format!("//- /main.rs crate:main\n{FREEZE}"));
+    let _ = fx.only_file();
+    let db = fx.into_db();
     let main = crate_named(&db, "main");
     let names = ["UnsafeCell", "Cell", "Plain", "Shared", "Wrap", "U", "Empty", "Never"];
     let adts = names.map(|name| adt_named(&db, main, name));

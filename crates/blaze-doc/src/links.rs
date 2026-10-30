@@ -8,6 +8,7 @@
 
 use std::ops::Range;
 
+use base_db::Db;
 use hir::{DocLinkDef, ModuleDef, Namespace};
 use pulldown_cmark::{BrokenLink, CowStr, Event, LinkType, Options, Parser, Tag};
 
@@ -364,7 +365,7 @@ pub(crate) enum Resolved {
 /// Resolves `link` as the docs on `def` have it, where an inner doc comment (`//!`) resolves in
 /// the module itself rather than its parent.
 pub(crate) fn resolve(
-    db: &ide_db::RootDatabase,
+    db: &Db,
     def: impl hir::HasAttrs + Copy,
     link: &Preprocessed,
     is_inner: hir::IsInnerDoc,

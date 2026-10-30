@@ -19,7 +19,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_units::schema::Unit;
 use hir_ty_codegen::v2::BodyChecks;
-use load_cargo::v2::{ProcMacroLoadResult, ProcMacroLoadingError};
+use blaze_lower::{ProcMacroLoadResult, ProcMacroLoadingError};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -416,7 +416,7 @@ pub(crate) fn unit_lint_flags(job: &Job, unit: usize) -> Result<Vec<String>, Api
     Ok(lint_flags(u, job.plan(unit)?, local(package.source.as_deref())))
 }
 
-pub(crate) use load_cargo::v2::{lint_flags, local};
+pub(crate) use blaze_lower::{lint_flags, local};
 
 /// Whether a diagnostic is one of rustc's closing lines cargo does not show: "aborting due to
 /// ...", "N warnings emitted" (`cargo/src/cargo/core/compiler/mod.rs`, `on_stderr_line_inner`).

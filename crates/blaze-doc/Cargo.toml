@@ -20,7 +20,6 @@ either.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
-ide-db.workspace = true
 intern.workspace = true
 parser.workspace = true
 pulldown-cmark.workspace = true
@@ -30,10 +29,9 @@ serde_json.workspace = true
 span.workspace = true
 stdx.workspace = true
 syntax.workspace = true
-vfs.workspace = true
 
 [dev-dependencies]
-test-fixture.workspace = true
+hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]
 workspace = true

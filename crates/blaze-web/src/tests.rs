@@ -779,8 +779,9 @@ fn calls_waiting_in_chains_are_those_a_scan_found() {
                 continue;
             }
             let snapshot = read(&world.snapshot(&program));
+            let keys = &keys;
             let mut calls: Vec<(u64, u64)> = (snapshot.iter())
-                .flat_map(|(from, _, to)| to.iter().map(|to| (keys[from], keys[to])))
+                .flat_map(|(from, _, to)| to.iter().map(move |to| (keys[from], keys[to])))
                 .collect();
             calls.sort_unstable();
             assert_eq!(calls, old.calls(), "seed {seed}, record {at}");

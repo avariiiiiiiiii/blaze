@@ -7,6 +7,17 @@
 //! The code generator calls it as a function of its own (`asm::x86_function`), which loads
 //! each argument into the register [`Lowered::args`] names, runs the text, and writes each
 //! register [`Lowered::results`] names where the result goes.
+//!
+//! The ones SSE2 has and Cranelift says as vector instructions (`minps`, the packs,
+//! `pmaddwd`, `pavgb`) are [`FunctionCx::x86_vector`]'s instead, in the function's own code.
+
+use cranelift_codegen::ir::{
+    Endianness, InstBuilder, MemFlagsData, Type, Value, condcodes::FloatCC, types,
+};
+use cranelift_frontend::FunctionBuilder;
+use hir_ty::mir::Operand;
+
+use super::{Arch, FunctionCx, MEM, Result};
 
 /// An intrinsic as instructions on the registers `asm::x86_function` loads.
 pub(super) struct Lowered {
@@ -386,6 +397,114 @@ fn comparison(op: &str) -> Option<(&str, String)> {
     Some((condition, format!("{mnemonic}{}", &lanes[1..])))
 }
 
+/// What [`FunctionCx::x86_vector`] lowers, on each 16 bytes of its two operands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum Vector {
+    /// `minps`: the first where it is less than the second, else the second (a NaN or two
+    /// zeros give the second).
+    Min,
+    /// `maxps`: the first where it is greater than the second, else the second.
+    Max,
+    /// `packsswb`: each lane of the first then the second, halved with signed saturation.
+    PackSigned,
+    /// `packuswb`: the same with unsigned saturation of the signed lanes.
+    PackUnsigned,
+    /// `pmaddwd`: the wrapping sum of each two neighboring products of 16-bit lanes.
+    MultiplyAddPairs,
+    /// `pavgb`: `(a + b + 1) >> 1` without overflow.
+    RoundedMean,
+}
+
+const _: () = assert!(size_of::<Vector>() == 1);
+
+/// The [`Vector`] of `llvm.{name}`, the lanes of its operands and how many 16-byte halves
+/// they have, for the ones SSE2 has (and AVX2's of two halves, each the same).
+fn vector_op(name: &str) -> Option<(Vector, Type, i32)> {
+    use Vector::*;
+    use types::{F32X4, F64X2, I8X16, I16X8, I32X4};
+    Some(match name.strip_prefix("x86.")? {
+        "sse.min.ps" => (Min, F32X4, 1),
+        "sse.max.ps" => (Max, F32X4, 1),
+        "sse2.min.pd" => (Min, F64X2, 1),
+        "sse2.max.pd" => (Max, F64X2, 1),
+        "avx.min.ps.256" => (Min, F32X4, 2),
+        "avx.max.ps.256" => (Max, F32X4, 2),
+        "avx.min.pd.256" => (Min, F64X2, 2),
+        "avx.max.pd.256" => (Max, F64X2, 2),
+        "sse2.packsswb.128" => (PackSigned, I16X8, 1),
+        "sse2.packuswb.128" => (PackUnsigned, I16X8, 1),
+        "sse2.packssdw.128" => (PackSigned, I32X4, 1),
+        "sse41.packusdw" => (PackUnsigned, I32X4, 1),
+        "avx2.packsswb" => (PackSigned, I16X8, 2),
+        "avx2.packuswb" => (PackUnsigned, I16X8, 2),
+        "avx2.packssdw" => (PackSigned, I32X4, 2),
+        "avx2.packusdw" => (PackUnsigned, I32X4, 2),
+        "sse2.pmadd.wd" => (MultiplyAddPairs, I16X8, 1),
+        "avx2.pmadd.wd" => (MultiplyAddPairs, I16X8, 2),
+        "sse2.pavg.b" => (RoundedMean, I8X16, 1),
+        "sse2.pavg.w" => (RoundedMean, I16X8, 1),
+        "avx2.pavg.b" => (RoundedMean, I8X16, 2),
+        "avx2.pavg.w" => (RoundedMean, I16X8, 2),
+        _ => return None,
+    })
+}
+
+impl<'db> FunctionCx<'_, 'db> {
+    /// Lowers `llvm.{name}` to Cranelift's vector instructions if it is one of [`Vector`]'s on
+    /// x86-64, each the instruction LLVM selects (Cranelift's x64 rules give `minps`, `maxps`,
+    /// `packsswb`, `packuswb`, `packssdw`, `pmaddwd`, `pavgb` and `pavgw` with SSE2 alone),
+    /// storing the result at `dst`. False for any other, which the caller lowers.
+    pub(super) fn x86_vector(
+        &mut self,
+        name: &str,
+        args: &[Operand],
+        dst: Value,
+    ) -> Result<bool> {
+        if self.cg.target.arch != Arch::X86_64 {
+            return Ok(false);
+        }
+        let Some((op, lanes, halves)) = vector_op(name) else { return Ok(false) };
+        let [a, b] = args else { return Ok(false) };
+        let (a, _) = self.operand(a)?;
+        let (b, _) = self.operand(b)?;
+        for half in 0..halves {
+            let at = half * 16;
+            let x = self.builder.ins().load(lanes, MEM, a, at);
+            let y = self.builder.ins().load(lanes, MEM, b, at);
+            let value = vector(&mut self.builder, op, lanes, x, y);
+            self.builder.ins().store(MEM, value, dst, at);
+        }
+        Ok(true)
+    }
+}
+
+const LITTLE: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Little);
+
+/// `op` of 16 bytes `x` and `y` of `lanes`, in the form Cranelift's x64 rules select the one
+/// instruction for (`minps` is `bitselect(bitcast(fcmp lt x y), x, y)` with the operands in
+/// that order).
+fn vector(builder: &mut FunctionBuilder<'_>, op: Vector, lanes: Type, x: Value, y: Value) -> Value {
+    match op {
+        Vector::Min | Vector::Max => {
+            let (less, more) = if op == Vector::Min { (x, y) } else { (y, x) };
+            let mask = builder.ins().fcmp(FloatCC::LessThan, less, more);
+            let mask = builder.ins().bitcast(lanes, LITTLE, mask);
+            builder.ins().bitselect(mask, x, y)
+        }
+        Vector::PackSigned => builder.ins().snarrow(x, y),
+        Vector::PackUnsigned => builder.ins().unarrow(x, y),
+        Vector::MultiplyAddPairs => {
+            let (x_low, y_low) = (builder.ins().swiden_low(x), builder.ins().swiden_low(y));
+            let (x_high, y_high) = (builder.ins().swiden_high(x), builder.ins().swiden_high(y));
+            let low = builder.ins().imul(x_low, y_low);
+            let high = builder.ins().imul(x_high, y_high);
+            builder.ins().iadd_pairwise(low, high)
+        }
+        Vector::RoundedMean => builder.ins().avg_round(x, y),
+    }
+}
+
 /// `Lowered::text` for a list of names, for a test: each name and what it lowers to, or that
 /// it does not.
 #[cfg(test)]
@@ -480,5 +599,97 @@ x86.sse.comilt.sd: none
 x86.avx512.max.ps.512: none
 ";
         assert_eq!(described, expected);
+    }
+
+    /// Each name of [`vector_op`] with the one SSE2 instruction LLVM selects for it.
+    const VECTORS: [(&str, &str); 22] = [
+        ("x86.sse.min.ps", "minps"),
+        ("x86.sse.max.ps", "maxps"),
+        ("x86.sse2.min.pd", "minpd"),
+        ("x86.sse2.max.pd", "maxpd"),
+        ("x86.avx.min.ps.256", "minps"),
+        ("x86.avx.max.ps.256", "maxps"),
+        ("x86.avx.min.pd.256", "minpd"),
+        ("x86.avx.max.pd.256", "maxpd"),
+        ("x86.sse2.packsswb.128", "packsswb"),
+        ("x86.sse2.packuswb.128", "packuswb"),
+        ("x86.sse2.packssdw.128", "packssdw"),
+        ("x86.sse41.packusdw", ""),
+        ("x86.avx2.packsswb", "packsswb"),
+        ("x86.avx2.packuswb", "packuswb"),
+        ("x86.avx2.packssdw", "packssdw"),
+        ("x86.avx2.packusdw", ""),
+        ("x86.sse2.pmadd.wd", "pmaddwd"),
+        ("x86.avx2.pmadd.wd", "pmaddwd"),
+        ("x86.sse2.pavg.b", "pavgb"),
+        ("x86.sse2.pavg.w", "pavgw"),
+        ("x86.avx2.pavg.b", "pavgb"),
+        ("x86.avx2.pavg.w", "pavgw"),
+    ];
+
+    #[test]
+    fn vector_ops_by_name() {
+        for (name, _) in VECTORS {
+            let (_, lanes, halves) = vector_op(name).expect(name);
+            assert_eq!(lanes.bytes(), 16, "{name}");
+            assert_eq!(halves, if name.starts_with("x86.avx") { 2 } else { 1 }, "{name}");
+        }
+        for name in ["x86.sse.min.ss", "x86.sse2.pavg.d", "x86.avx512.pavg.b.512", "sse.min.ps"] {
+            assert_eq!(vector_op(name), None, "{name}");
+        }
+    }
+
+    /// What [`vector`] builds is the instruction LLVM selects once Cranelift lowers it for
+    /// x86-64 with SSE2 alone, as blaze's ISA is: one `minps`, not a compare and a blend.
+    /// `packusdw` is SSE4.1's, so without it Cranelift's own sequence of SSE2 stands in.
+    #[test]
+    fn each_vector_is_the_instruction_of_sse2() {
+        use cranelift_codegen::{
+            Context,
+            control::ControlPlane,
+            ir::{AbiParam, Function, Signature, UserFuncName},
+            isa::{self, CallConv},
+            settings::{self, Configurable},
+        };
+        use cranelift_frontend::FunctionBuilderContext;
+
+        let triple = target_lexicon::triple!("x86_64-unknown-linux-gnu");
+        let mut features = isa::lookup(triple).unwrap();
+        for feature in ["has_ssse3", "has_sse41", "has_sse42", "has_avx", "has_avx2"] {
+            features.set(feature, "false").unwrap();
+        }
+        let isa = features.finish(settings::Flags::new(settings::builder())).unwrap();
+        for (name, instruction) in VECTORS {
+            let (op, lanes, _) = vector_op(name).unwrap();
+            let mut signature = Signature::new(CallConv::SystemV);
+            signature.params.extend([AbiParam::new(types::I64); 3]);
+            let mut func = Function::with_name_signature(UserFuncName::default(), signature);
+            let mut context = FunctionBuilderContext::new();
+            let mut builder = FunctionBuilder::new(&mut func, &mut context);
+            let block = builder.create_block();
+            builder.append_block_params_for_function_params(block);
+            builder.switch_to_block(block);
+            let [a, b, dst] = *builder.block_params(block) else { unreachable!() };
+            let x = builder.ins().load(lanes, MEM, a, 0);
+            let y = builder.ins().load(lanes, MEM, b, 0);
+            let value = vector(&mut builder, op, lanes, x, y);
+            builder.ins().store(MEM, value, dst, 0);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            builder.finalize(isa.frontend_config());
+
+            let mut context = Context::for_function(func);
+            context.set_disasm(true);
+            let code = context.compile(&*isa, &mut ControlPlane::default()).expect(name);
+            let code = code.vcode.as_deref().expect("its instructions");
+            let ops = code.lines().filter_map(|line| line.split_whitespace().next());
+            let ops = ops.collect::<Vec<_>>();
+            assert!(!ops.iter().any(|op| op.starts_with("call")), "{name}: {code}");
+            if !instruction.is_empty() {
+                assert!(ops.contains(&instruction), "{name}: {code}");
+                let blend = |op: &&str| op.starts_with("cmp") || op.starts_with("pand");
+                assert!(!ops.iter().any(blend), "{name}: {code}");
+            }
+        }
     }
 }

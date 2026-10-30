@@ -216,3 +216,17 @@ fn an_error_of_the_daemon() {
     assert_eq!(out, "");
     assert_eq!(err, "error: no package `nope` in the workspace\n");
 }
+
+#[test]
+fn what_the_daemon_fetched() {
+    let responses = [
+        Response::Fetched { verb: FetchVerb::Updating, what: "crates.io index".to_owned() },
+        Response::Fetched { verb: FetchVerb::Downloaded, what: "serde v1.0.219".to_owned() },
+        Response::Done { ok: false },
+    ];
+    let (out, err) = printed(Shown::default(), &responses, false);
+    assert_eq!(out, "");
+    assert_eq!(err, "    Updating crates.io index\n  Downloaded serde v1.0.219\n");
+    let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, false);
+    assert_eq!(quiet, "");
+}

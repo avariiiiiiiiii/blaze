@@ -1,7 +1,7 @@
 //! A map that maps a span to every position in a file. Usually maps a span to some range of positions.
 //! Allows bidirectional lookup.
 
-use std::{fmt, hash::Hash};
+use std::{fmt, hash::Hash, sync::OnceLock};
 
 use blaze_format::Spans;
 use blaze_ids::ContentId;
@@ -16,13 +16,18 @@ use crate::{
 ///
 /// Two columns: where each piece of text ends, and its span. The span at an offset is a
 /// branch-free binary search of the ends alone (4 bytes each, 16 to a cache line), then one
-/// load of a 20-byte span.
-#[derive(PartialEq, Eq, Clone, Hash)]
+/// load of a 20-byte span; in-order lookups ([`SpanMap::span_at_from`]) are `O(1)` amortized.
+/// Mapping a span down to the text is a binary search of `by_anchor`.
+#[derive(Clone)]
 pub struct SpanMap {
     /// Where each piece of text ends, in order; it begins where the one before ends, or at 0.
     ends: Vec<TextSize>,
     /// The span of each piece of text.
     spans: Vec<Span>,
+    /// The pieces' numbers sorted by their spans' [`down_key`], then number: made when a span
+    /// is first mapped down (4 bytes a piece), dropped by whatever changes the pieces. Not part
+    /// of what the map is.
+    by_anchor: OnceLock<Box<[u32]>>,
     /// Index of the matched macro arm on successful expansion for declarative macros.
     // FIXME: Does it make sense to have this here?
     pub matched_arm: Option<u32>,
@@ -36,6 +41,64 @@ pub struct SpanMap {
 fn count_of(offsets: &[TextSize], offset: TextSize) -> usize {
     let first = offsets.partition_point(|&it| it < offset);
     offsets[first..].partition_point(|&it| it == offset)
+}
+
+/// The first of `keys` that `below` refuses, `below` accepting a prefix, searched from `hint`:
+/// forward in steps of 1, 2, 4, ... then a binary search of the last step, or a binary search
+/// of what is before `hint` when the answer is there. `O(log d)` for an answer `d` away from
+/// `hint`, and two compares when it is at `hint` or the one after.
+#[inline]
+fn search_from<T: Copy>(keys: &[T], hint: usize, below: impl Fn(T) -> bool) -> usize {
+    let hint = hint.min(keys.len());
+    if hint > 0 && !below(keys[hint - 1]) {
+        return keys[..hint].partition_point(|&it| below(it));
+    }
+    // Every key before `lo` is accepted.
+    let (mut lo, mut step) = (hint, 1);
+    loop {
+        let hi = lo + step;
+        if hi > keys.len() {
+            return lo + keys[lo..].partition_point(|&it| below(it));
+        }
+        if !below(keys[hi - 1]) {
+            return lo + keys[lo..hi - 1].partition_point(|&it| below(it));
+        }
+        lo = hi;
+        step *= 2;
+    }
+}
+
+/// What [`SpanMap::by_anchor`] sorts pieces by: their span's anchor, then range.
+#[inline]
+fn down_key(span: &Span) -> [u32; 4] {
+    [
+        span.anchor.file_id.as_u32(),
+        span.anchor.ast_id.into_raw(),
+        u32::from(span.range.start()),
+        u32::from(span.range.end()),
+    ]
+}
+
+impl PartialEq for SpanMap {
+    fn eq(&self, other: &SpanMap) -> bool {
+        self.ends == other.ends
+            && self.spans == other.spans
+            && self.matched_arm == other.matched_arm
+            && self.fragment_starts == other.fragment_starts
+            && self.fragment_ends == other.fragment_ends
+    }
+}
+
+impl Eq for SpanMap {}
+
+impl Hash for SpanMap {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ends.hash(state);
+        self.spans.hash(state);
+        self.matched_arm.hash(state);
+        self.fragment_starts.hash(state);
+        self.fragment_ends.hash(state);
+    }
 }
 
 impl fmt::Debug for SpanMap {
@@ -52,9 +115,15 @@ impl fmt::Debug for SpanMap {
 impl SpanMap {
     /// Creates a new empty [`SpanMap`].
     pub fn empty() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// An empty [`SpanMap`] with room for `pieces` [`SpanMap::push`]es without reallocating.
+    pub fn with_capacity(pieces: usize) -> Self {
         Self {
-            ends: Vec::new(),
-            spans: Vec::new(),
+            ends: Vec::with_capacity(pieces),
+            spans: Vec::with_capacity(pieces),
+            by_anchor: OnceLock::new(),
             matched_arm: None,
             fragment_starts: Vec::new(),
             fragment_ends: Vec::new(),
@@ -83,6 +152,24 @@ impl SpanMap {
         }
         self.ends.push(offset);
         self.spans.push(span);
+        self.by_anchor = OnceLock::new();
+    }
+
+    /// The pieces sorted by [`down_key`], then number, made on first use: `O(n log n)` once,
+    /// then an acquire load per call.
+    fn by_anchor(&self) -> &[u32] {
+        self.by_anchor.get_or_init(|| {
+            let mut pieces = (0..self.spans.len() as u32).collect::<Box<[u32]>>();
+            pieces.sort_unstable_by_key(|&it| (down_key(&self.spans[it as usize]), it));
+            pieces
+        })
+    }
+
+    /// The range of piece `idx` and its span's context.
+    #[inline]
+    fn range_of(&self, idx: u32) -> (TextRange, SyntaxContext) {
+        let idx = idx as usize;
+        (TextRange::new(self.start_of(idx), self.ends[idx]), self.spans[idx].ctx)
     }
 
     /// Where piece `idx` of the text begins: where the one before ends.
@@ -107,43 +194,62 @@ impl SpanMap {
         count_of(&self.fragment_ends, offset)
     }
 
-    /// Returns all [`TextRange`]s that correspond to the given span.
+    /// Returns all [`TextRange`]s that correspond to the given span, in text order.
     ///
-    /// Note this does a linear search through the entire backing vector.
+    /// A binary search of the pieces sorted by span, then the run of equal ones: `O(log n)`
+    /// plus one step a match.
     pub fn ranges_with_span_exact(
         &self,
         span: Span,
     ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
-        self.spans.iter().enumerate().filter_map(move |(idx, &s)| {
-            if !s.eq_ignoring_ctx(span) {
-                return None;
-            }
-            Some((TextRange::new(self.start_of(idx), self.ends[idx]), s.ctx))
-        })
+        let key = down_key(&span);
+        let by_anchor = self.by_anchor();
+        let first = by_anchor.partition_point(|&it| down_key(&self.spans[it as usize]) < key);
+        by_anchor[first..]
+            .iter()
+            .take_while(move |&&it| down_key(&self.spans[it as usize]) == key)
+            .map(move |&it| self.range_of(it))
     }
 
-    /// Returns all [`TextRange`]s whose spans contain the given span.
+    /// Returns all [`TextRange`]s whose spans contain the given span, in text order.
     ///
-    /// Note this does a linear search through the entire backing vector.
+    /// Two binary searches bound the pieces with the same anchor that start at or before the
+    /// span; those that end at or after it are put back in text order: `O(log n + c log c)` for
+    /// `c` such pieces, and one allocation.
     pub fn ranges_with_span(
         &self,
         span: Span,
     ) -> impl Iterator<Item = (TextRange, SyntaxContext)> + '_ {
-        self.spans.iter().enumerate().filter_map(move |(idx, &s)| {
-            if s.anchor != span.anchor {
-                return None;
-            }
-            if !s.range.contains_range(span.range) {
-                return None;
-            }
-            Some((TextRange::new(self.start_of(idx), self.ends[idx]), s.ctx))
-        })
+        let [file, ast_id, start, end] = down_key(&span);
+        let by_anchor = self.by_anchor();
+        let key = |it: &u32| down_key(&self.spans[*it as usize]);
+        let first = by_anchor.partition_point(|it| key(it) < [file, ast_id, 0, 0]);
+        let last = first
+            + by_anchor[first..].partition_point(|it| key(it) <= [file, ast_id, start, u32::MAX]);
+        let mut found = by_anchor[first..last]
+            .iter()
+            .copied()
+            .filter(|it| key(it)[3] >= end)
+            .collect::<Vec<u32>>();
+        found.sort_unstable();
+        found.into_iter().map(move |it| self.range_of(it))
     }
 
     /// Returns the span at the given position.
     #[inline]
     pub fn span_at(&self, offset: TextSize) -> Span {
         let entry = self.ends.partition_point(|&it| it <= offset);
+        self.spans[entry]
+    }
+
+    /// [`SpanMap::span_at`], searched from the piece `hint` names and storing the one found
+    /// there: for offsets in increasing order (a walk of the tokens) each lookup is two
+    /// compares when it lands in the same piece or the next, `O(log d)` for `d` pieces on.
+    /// Any `hint` gives the same span.
+    #[inline]
+    pub fn span_at_from(&self, offset: TextSize, hint: &mut u32) -> Span {
+        let entry = search_from(&self.ends, *hint as usize, |it| it <= offset);
+        *hint = entry as u32;
         self.spans[entry]
     }
 
@@ -196,6 +302,7 @@ impl SpanMap {
         }
         self.ends.splice(before..after, other.ends.iter().map(|&it| it + other_range.start()));
         self.spans.splice(before..after, other.spans.iter().copied());
+        self.by_anchor = OnceLock::new();
 
         // A fragment that starts where the replaced text ends comes after it, one that ends
         // where it starts comes before it.
@@ -226,39 +333,6 @@ impl SpanMap {
 
         // Matched arm info is no longer correct once we have multiple macros.
         self.matched_arm = None;
-    }
-}
-
-#[cfg(not(no_salsa_async_drops))]
-impl Drop for SpanMap {
-    fn drop(&mut self) {
-        let spans = (std::mem::take(&mut self.ends), std::mem::take(&mut self.spans));
-        type Dropped = (Vec<TextSize>, Vec<Span>);
-        static SPAN_MAP_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Dropped>> =
-            std::sync::OnceLock::new();
-
-        SPAN_MAP_DROP_THREAD
-            .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<Dropped>();
-                std::thread::Builder::new()
-                    .name("SpanMapDropper".to_owned())
-                    .spawn(move || {
-                        loop {
-                            // block on a receive
-                            _ = receiver.recv();
-                            // then drain the entire channel
-                            while receiver.try_recv().is_ok() {}
-                            // and sleep for a bit
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
-                        // otherwise this thread will constantly wake up and sleep again.
-                    })
-                    .unwrap();
-                sender
-            })
-            .send(spans)
-            .unwrap();
     }
 }
 
@@ -403,6 +477,31 @@ impl RealSpanMap {
         Span {
             range: range - offset,
             anchor: crate::SpanAnchor { file_id: self.file_id, ast_id },
+            ctx: SyntaxContext::root(self.file_id.edition()),
+        }
+    }
+
+    /// [`RealSpanMap::span_for_range`], searched from the anchor `hint` names and storing the
+    /// one found there: for ranges in increasing order (a walk of the tokens) each lookup is
+    /// two compares while it stays in an anchor or moves to the next, `O(log d)` for `d`
+    /// anchors on. Any `hint` gives the same span.
+    #[cfg(feature = "salsa")]
+    #[inline]
+    pub fn span_for_range_from(&self, range: TextRange, hint: &mut u32) -> Span {
+        let end = self.end();
+        assert!(range.end() <= end, "range {range:?} goes beyond the end of the file {end:?}");
+        let offset = u32::from(range.start());
+        let after = search_from(&self.starts, *hint as usize + 1, |it| it <= offset);
+        let idx = after
+            .checked_sub(1)
+            .unwrap_or_else(|| panic!("no anchor begins at or before {offset}"));
+        *hint = idx as u32;
+        Span {
+            range: range - TextSize::new(self.starts[idx]),
+            anchor: crate::SpanAnchor {
+                file_id: self.file_id,
+                ast_id: ErasedFileAstId::from_raw(self.anchors[idx][0]),
+            },
             ctx: SyntaxContext::root(self.file_id.edition()),
         }
     }
@@ -587,6 +686,51 @@ mod tests {
         }
     }
 
+    /// From any hint, the search finds what a binary search of the whole does.
+    #[test]
+    fn a_search_from_any_hint_is_a_binary_search() {
+        let mut state = 8;
+        for len in 0..40 {
+            let mut keys = (0..len).map(|_| (next(&mut state) % 16) as u32).collect::<Vec<_>>();
+            keys.sort_unstable();
+            for offset in 0..=16 {
+                let want = keys.partition_point(|&it| it <= offset);
+                for hint in 0..len + 3 {
+                    let found = search_from(&keys, hint, |it| it <= offset);
+                    assert_eq!(found, want, "{keys:?}, {offset} from {hint}");
+                }
+            }
+        }
+    }
+
+    /// The cursor gives the spans [`RealSpanMap::span_for_range`] does, walking in order, from
+    /// any hint and in no order.
+    #[cfg(feature = "salsa")]
+    #[test]
+    fn a_cursor_gives_the_spans_a_search_does() {
+        let mut state = 7;
+        for n in [1usize, 2, 3, 17, 100, 1000] {
+            let (pairs, end) = anchors(&mut state, n, 1 << 20);
+            let map = RealSpanMap::from_file(file(), pairs, at(end));
+            let mut hint = 0;
+            for offset in 0..end {
+                let range = range(offset, offset + 1);
+                let want = map.span_for_range(range);
+                assert_eq!(map.span_for_range_from(range, &mut hint), want, "{n}, at {offset}");
+                let from = (next(&mut state) % (n as u64 + 2)) as u32;
+                let found = map.span_for_range_from(range, &mut { from });
+                assert_eq!(found, want, "{n} anchors, from {from}, at {offset}");
+            }
+            let mut hint = u32::MAX;
+            for _ in 0..200 {
+                let offset = (next(&mut state) % u64::from(end)) as u32;
+                let range = range(offset, end);
+                let found = map.span_for_range_from(range, &mut hint);
+                assert_eq!(found, map.span_for_range(range), "{n} anchors, {range:?}");
+            }
+        }
+    }
+
     /// Two maps are equal exactly when their anchors' ids and lengths are, and equal maps hash
     /// the same.
     #[test]
@@ -691,8 +835,28 @@ mod tests {
     fn check_same(map: &SpanMap, pairs: &Pairs, state: &mut u64) {
         assert_eq!(map.iter().collect::<Vec<_>>(), pairs.0);
         let Some(&(last, _)) = pairs.0.last() else { return };
+        let mut hint = 0;
         for offset in 0..u32::from(last) {
-            assert_eq!(map.span_at(at(offset)), pairs.span_at(at(offset)), "at {offset}");
+            let want = pairs.span_at(at(offset));
+            assert_eq!(map.span_at(at(offset)), want, "at {offset}");
+            assert_eq!(map.span_at_from(at(offset), &mut hint), want, "in order, at {offset}");
+            let from = (next(state) % (pairs.0.len() as u64 + 2)) as u32;
+            assert_eq!(map.span_at_from(at(offset), &mut { from }), want, "from {from}, at {offset}");
+        }
+        let mut hint = u32::MAX;
+        for _ in 0..50 {
+            let offset = at((next(state) % u64::from(last)) as u32);
+            assert_eq!(map.span_at_from(offset, &mut hint), pairs.span_at(offset), "at {offset:?}");
+        }
+        let ctx = SyntaxContext::root(crate::Edition::CURRENT);
+        for _ in 0..20 {
+            let anchor = crate::SpanAnchor { file_id: file(), ast_id: id((next(state) % 4) as u32) };
+            let start = (next(state) % 9) as u32;
+            let span = Span { range: range(start, start + (next(state) % 5) as u32), anchor, ctx };
+            let exact = map.ranges_with_span_exact(span).collect::<Vec<_>>();
+            assert_eq!(exact, pairs.ranges_with(span, true), "{span:?}");
+            let containing = map.ranges_with_span(span).collect::<Vec<_>>();
+            assert_eq!(containing, pairs.ranges_with(span, false), "{span:?}");
         }
         for _ in 0..50 {
             let start = (next(state) % u64::from(last)) as u32;

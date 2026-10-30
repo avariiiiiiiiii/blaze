@@ -511,6 +511,17 @@ pub struct Warm {
     pub traced: Option<(PathBuf, PathBuf)>,
 }
 
+/// Where a client gets another warm server of its key when every one it has is in the middle
+/// of an expansion: the daemon's pool ([`blaze_usercode::pool::Pool::take`], or
+/// [`blaze_usercode::pool::Pool::start`] when none is idle), through its driver, connected as
+/// [`Bridge::new`] is. A server's protocol is one request at a time, and one connection per
+/// expansion in flight is what keeps it so with no lock: an expansion asked for while another
+/// answers a sub-request from the database gets its own server instead of waiting on itself.
+pub trait Servers: Send + Sync {
+    /// Another server of the client's key, connected and the client's from now on.
+    fn connect(&self) -> io::Result<Warm>;
+}
+
 /// A link that plays a server from answers given beforehand, for tests.
 #[cfg(test)]
 pub(crate) struct Script {

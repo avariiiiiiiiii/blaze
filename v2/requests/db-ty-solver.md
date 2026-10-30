@@ -411,3 +411,5 @@ Why: a body's inference asks the same goals (`T: Sized`, `Vec<u8>: Clone`, `Stri
 that every other body asked. With per-query caches each body solves them again; rustc solves
 them once per session. With 1 to 4, blaze solves them once per revision across every thread,
 with lock-free reads where rustc takes a lock. That beats the benchmark on both counts.
+
+> forwarded to db: a design inside lane db (db-salsa, db-ty-types, `rustc_type_ir`).

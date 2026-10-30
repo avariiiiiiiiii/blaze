@@ -3,6 +3,8 @@
 //! and step by step against [`reference`], the plane as it was before its state moved to
 //! columns.
 
+#![forbid(unsafe_code)]
+
 mod reference;
 
 use std::sync::{Arc, Mutex};
@@ -681,6 +683,9 @@ struct Model {
     cancelled: FxHashSet<u32>,
     /// How many `Run`s each request was said.
     ran: FxHashMap<u32, u64>,
+    /// `Run`s said critical and not, so the test knows it saw both.
+    critical_runs: u64,
+    other_runs: u64,
     outputs: Vec<PlaneOutput>,
 }
 
@@ -771,10 +776,28 @@ impl Model {
                     }
                     other => panic!("seed {seed}: the plane said {other:?}"),
                 },
-                PlaneOutput::Run { id, pool, .. } => {
+                PlaneOutput::Run { id, pool, critical, .. } => {
                     let spec = &self.specs[&id.0];
                     assert_eq!(*pool, spec.pool, "seed {seed}");
                     assert_eq!(self.states[&id.0], NodeState::Running, "seed {seed}: #{id}");
+                    // Critical exactly when nothing ready or running of its request has a
+                    // longer path to go, counted from the whole graph.
+                    let mut memo = FxHashMap::default();
+                    let mine = self.priority(id.0, &mut memo);
+                    let most = self.nodes_of[&self.request_of[&id.0]]
+                        .iter()
+                        .filter(|it| {
+                            matches!(self.states.get(it), Some(NodeState::Ready | NodeState::Running))
+                        })
+                        .map(|it| self.priority(*it, &mut memo))
+                        .max()
+                        .unwrap_or(0);
+                    assert_eq!(*critical, mine >= most, "seed {seed}: #{id} at {mine}, most {most}");
+                    if *critical {
+                        self.critical_runs += 1;
+                    } else {
+                        self.other_runs += 1;
+                    }
                     for dep in &spec.deps {
                         assert!(self.done_well(dep.0), "seed {seed}: #{id} runs before #{dep}");
                     }

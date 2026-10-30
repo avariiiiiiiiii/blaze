@@ -130,7 +130,7 @@ impl BuiltinDeriveImplMethod {
     ) -> Option<FunctionId> {
         let loc = impl_.loc(db);
         let lang_items = crate::lang_item::lang_items(db, loc.krate(db));
-        let trait_ = impl_.loc(db).trait_.get_id(lang_items)?;
+        let trait_ = loc.trait_.get_id(lang_items)?;
         trait_.trait_items(db).method_by_name(&Name::new_symbol_root(self.name()))
     }
 }

@@ -443,13 +443,18 @@ impl Drop for Capability {
             if list.is_null() {
                 continue;
             }
-            // SAFETY: the list and each SID in it were made with LocalAlloc.
-            unsafe {
-                for at in 0..count as usize {
-                    LocalFree(*list.add(at));
-                }
-                LocalFree(list.cast());
+            for at in 0..count as usize {
+                // SAFETY: DeriveCapabilitySidsFromName made the list with `count` entries, so
+                // `at` is inside it.
+                let entry = unsafe { list.add(at) };
+                // SAFETY: as above, the entry is in the list and holds a SID's pointer.
+                let sid = unsafe { *entry };
+                // SAFETY: each SID in the list was made with LocalAlloc and is freed only here.
+                unsafe { LocalFree(sid) };
             }
+            // SAFETY: the list was made with LocalAlloc, its SIDs are freed above, and this
+            // drop is the only one.
+            unsafe { LocalFree(list.cast()) };
         }
     }
 }
@@ -543,11 +548,11 @@ fn standard() -> Result<[Option<Handle>; 3], String> {
             continue;
         }
         let mut copy: HANDLE = null_mut();
-        // SAFETY: the handle is the process's own; the copy is closed when dropped.
-        let copied = unsafe {
-            let process = GetCurrentProcess();
-            DuplicateHandle(process, handle, process, &mut copy, 0, 1, DUPLICATE_SAME_ACCESS)
-        };
+        // SAFETY: no arguments; the pseudo-handle it gives needs no closing.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: `handle` was just checked open and is this process's own; `copy` is a live
+        // HANDLE, owned by the `Handle` below, which closes it once.
+        let copied = unsafe { DuplicateHandle(process, handle, process, &mut copy, 0, 1, DUPLICATE_SAME_ACCESS) };
         if copied == 0 {
             return Err(failed(format!("passing the program the launcher's standard {name}"), "DuplicateHandle"));
         }
@@ -677,16 +682,18 @@ impl Dacl {
             if unsafe { GetAce(self.dacl, at, &mut ace) } == 0 {
                 continue;
             }
-            // SAFETY: every entry starts with its header, and an allowing one is an
-            // ACCESS_ALLOWED_ACE whose SID starts at `SidStart`.
-            let (header, mask_of, entry_sid) = unsafe {
-                let header = *ace.cast::<ACE_HEADER>();
-                let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-                (header, (*allowed).Mask, (&raw mut (*allowed).SidStart).cast::<c_void>())
-            };
+            // SAFETY: GetAce gave a pointer to an entry of the DACL, which `self` keeps alive;
+            // every entry starts with its header, at the 4-byte alignment entries have in an ACL.
+            let header = unsafe { *ace.cast::<ACE_HEADER>() };
             if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
                 continue;
             }
+            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // SAFETY: the type, checked just above, says the entry is an ACCESS_ALLOWED_ACE.
+            let mask_of = unsafe { (*allowed).Mask };
+            // SAFETY: as above; this takes the address of its SID, which starts at `SidStart`,
+            // and reads nothing.
+            let entry_sid = unsafe { (&raw mut (*allowed).SidStart).cast::<c_void>() };
             // SAFETY: both are SIDs.
             if !sids.iter().any(|it| unsafe { EqualSid(*it, entry_sid) } != 0) {
                 continue;
@@ -795,20 +802,13 @@ fn set_dacl(name: &[u16], path: &Path, current: &Dacl, access: &EXPLICIT_ACCESS_
     if code != ERROR_SUCCESS {
         return Err(failed_with(format!("{what} on {}", path.display()), "SetEntriesInAclW", code as i32));
     }
-    // SAFETY: the name ends in NUL and `new` is a DACL, freed after.
+    // SAFETY: the name ends in NUL (`wide` made it), and `new` is the DACL SetEntriesInAclW
+    // just made, freed only below.
     let code = unsafe {
-        let code = SetNamedSecurityInfoW(
-            name.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            new,
-            null(),
-        );
-        LocalFree(new.cast());
-        code
+        SetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, null_mut(), null_mut(), new, null())
     };
+    // SAFETY: SetEntriesInAclW made `new` with LocalAlloc; nothing uses it after.
+    unsafe { LocalFree(new.cast()) };
     match code {
         ERROR_SUCCESS => Ok(()),
         _ => Err(failed_with(format!("{what} on {}", path.display()), "SetNamedSecurityInfoW", code as i32)),
@@ -887,6 +887,11 @@ impl Drop for Registered {
 /// Ctrl-C, Ctrl-Break and closing the console end the program's job rather than the launcher,
 /// which then takes its grants back and ends as the program did. On a close Windows ends the
 /// launcher once this returns, so it waits for that first.
+///
+/// # Safety
+///
+/// Called only by Windows, as the console's handler `on_interrupt` set; it reads nothing
+/// through its argument, so any `event` is sound.
 unsafe extern "system" fn interrupted(event: u32) -> BOOL {
     if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
         return 0;

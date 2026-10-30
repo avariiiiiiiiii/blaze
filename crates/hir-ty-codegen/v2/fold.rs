@@ -1145,6 +1145,643 @@ mod tests {
         assert!(masked_ir(&grow(8, 0, 1, false), &|_| None).is_none());
     }
 
+    /// The masked form as it was: Cranelift's printed text, its entities renumbered by first
+    /// use. The model [`masked_ir`] is held to, but for what the printer leaves out (an
+    /// atomic's memory flags) or shows by number (a global value load's flags).
+    mod text {
+        use std::collections::HashMap;
+
+        use super::super::*;
+
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        enum Kind {
+            Value,
+            Block,
+            Func,
+            Sig,
+            Global,
+            Slot,
+            Pool,
+        }
+
+        const PREFIXES: [(&str, Option<Kind>); 11] = [
+            ("block", Some(Kind::Block)),
+            ("const", Some(Kind::Pool)),
+            ("dss", None),
+            ("sig", Some(Kind::Sig)),
+            ("fn", Some(Kind::Func)),
+            ("gv", Some(Kind::Global)),
+            ("jt", None),
+            ("et", None),
+            ("dt", None),
+            ("ss", Some(Kind::Slot)),
+            ("v", Some(Kind::Value)),
+        ];
+
+        struct Canon<'a> {
+            func: &'a ir::Function,
+            names: &'a dyn Fn(ir::UserExternalName) -> Option<Name>,
+            text: String,
+            numbers: HashMap<(Kind, u32), u32>,
+            counts: HashMap<Kind, u32>,
+            constants: Vec<Constant>,
+            refused: bool,
+        }
+
+        pub(super) fn masked(
+            func: &ir::Function,
+            names: &dyn Fn(ir::UserExternalName) -> Option<Name>,
+        ) -> Option<(String, Vec<Constant>)> {
+            func.layout.entry_block()?;
+            if !func.dynamic_stack_slots.is_empty() {
+                return None;
+            }
+            let mut canon = Canon {
+                func,
+                names,
+                text: format!("{}\n", func.signature),
+                numbers: HashMap::new(),
+                counts: HashMap::new(),
+                constants: Vec::new(),
+                refused: false,
+            };
+            for block in func.layout.blocks() {
+                canon.entity(Kind::Block, block.as_u32());
+                canon.text.push('(');
+                for &param in func.dfg.block_params(block) {
+                    canon.entity(Kind::Value, param.as_u32());
+                    canon.text.push_str(&format!(": {}, ", func.dfg.value_type(param)));
+                }
+                canon.text.push_str(if func.layout.is_cold(block) { ") cold:\n" } else { "):\n" });
+                for inst in func.layout.block_insts(block) {
+                    canon.inst(inst);
+                    canon.text.push('\n');
+                }
+            }
+            if canon.refused {
+                return None;
+            }
+            Some((canon.text, canon.constants))
+        }
+
+        impl Canon<'_> {
+            fn inst(&mut self, inst: ir::Inst) {
+                let dfg = &self.func.dfg;
+                let constant = match dfg.insts[inst] {
+                    InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } => {
+                        let bits = dfg.ctrl_typevar(inst).bits() as u8;
+                        Some(Constant::Int { bits, value: u128::from(imm.bits() as u64) })
+                    }
+                    InstructionData::UnaryIeee32 { opcode: Opcode::F32const, imm } => {
+                        Some(Constant::F32(imm.bits()))
+                    }
+                    InstructionData::UnaryIeee64 { opcode: Opcode::F64const, imm } => {
+                        Some(Constant::F64(imm.bits()))
+                    }
+                    _ => None,
+                };
+                let Some(constant) = constant else {
+                    let shown = dfg.display_inst(inst).to_string();
+                    return self.tokens(shown.split("  ; ").next().unwrap_or_default());
+                };
+                self.entity(Kind::Value, dfg.first_result(inst).as_u32());
+                let opcode = dfg.insts[inst].opcode();
+                let ty = dfg.ctrl_typevar(inst);
+                self.text.push_str(&format!(" = {opcode}.{ty} #{}", self.constants.len()));
+                self.constants.push(constant);
+            }
+
+            fn tokens(&mut self, text: &str) {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                let mut rest = text;
+                while let Some(start) = rest.find(word) {
+                    self.text.push_str(&rest[..start]);
+                    let len = rest[start..].find(|c: char| !word(c)).unwrap_or(rest.len() - start);
+                    self.token(&rest[start..start + len]);
+                    rest = &rest[start + len..];
+                }
+                self.text.push_str(rest);
+            }
+
+            fn token(&mut self, word: &str) {
+                for (prefix, kind) in PREFIXES {
+                    let Some(digits) = word.strip_prefix(prefix) else { continue };
+                    if digits.is_empty() || !digits.bytes().all(|it| it.is_ascii_digit()) {
+                        continue;
+                    }
+                    match (kind, digits.parse::<u32>()) {
+                        (Some(kind), Ok(raw)) => self.entity(kind, raw),
+                        _ => self.refused = true,
+                    }
+                    return;
+                }
+                self.text.push_str(word);
+            }
+
+            fn entity(&mut self, kind: Kind, raw: u32) {
+                let raw = match kind {
+                    Kind::Value => self.func.dfg.resolve_aliases(ir::Value::from_u32(raw)).as_u32(),
+                    _ => raw,
+                };
+                let prefix = PREFIXES.iter().find(|it| it.1 == Some(kind)).map_or("?", |it| it.0);
+                if let Some(number) = self.numbers.get(&(kind, raw)) {
+                    return self.text.push_str(&format!("{prefix}{number}"));
+                }
+                let count = self.counts.entry(kind).or_default();
+                let number = *count;
+                *count += 1;
+                self.numbers.insert((kind, raw), number);
+                self.text.push_str(&format!("{prefix}{number}"));
+                let func = self.func;
+                match kind {
+                    Kind::Value | Kind::Block => {}
+                    Kind::Func => {
+                        let callee = ir::FuncRef::from_u32(raw);
+                        let data = &func.dfg.ext_funcs[callee];
+                        self.text.push('{');
+                        let place = self.name(&data.name);
+                        self.text.push(' ');
+                        self.entity(Kind::Sig, data.signature.as_u32());
+                        self.text.push_str(&format!(" {} {}}}", data.colocated, data.patchable));
+                        if place && data.patchable {
+                            self.refused = true;
+                        }
+                    }
+                    Kind::Global => {
+                        let global = ir::GlobalValue::from_u32(raw);
+                        self.text.push('{');
+                        match func.global_values[global] {
+                            ir::GlobalValueData::Symbol { ref name, offset, colocated, tls } => {
+                                self.name(name);
+                                let offset: i64 = offset.into();
+                                self.text.push_str(&format!(" {offset} {colocated} {tls}"));
+                            }
+                            ir::GlobalValueData::Load { base, offset, global_type, flags } => {
+                                self.refused |= self.is_named(base);
+                                self.text.push_str(&format!("load.{global_type} {flags} "));
+                                self.entity(Kind::Global, base.as_u32());
+                                self.text.push_str(&format!("{offset}"));
+                            }
+                            ir::GlobalValueData::IAddImm { base, offset, global_type } => {
+                                self.refused |= self.is_named(base);
+                                self.text.push_str(&format!("iadd_imm.{global_type} "));
+                                self.entity(Kind::Global, base.as_u32());
+                                self.text.push_str(&format!(", {offset}"));
+                            }
+                            ref other => {
+                                let shown = other.display(&func.dfg.mem_flags).to_string();
+                                self.text.push_str(&shown);
+                            }
+                        }
+                        self.text.push('}');
+                    }
+                    Kind::Sig => {
+                        let sig = &func.dfg.signatures[ir::SigRef::from_u32(raw)];
+                        self.text.push_str(&format!("{{{sig}}}"));
+                    }
+                    Kind::Slot => {
+                        let slot = &func.sized_stack_slots[ir::StackSlot::from_u32(raw)];
+                        self.text.push_str(&format!("{{{slot}}}"));
+                    }
+                    Kind::Pool => {
+                        let data = func.dfg.constants.get(ir::Constant::from_u32(raw));
+                        self.text.push_str(&format!("{{{data}}}"));
+                    }
+                }
+            }
+
+            fn name(&mut self, name: &ir::ExternalName) -> bool {
+                let ir::ExternalName::User(user) = name else {
+                    self.text.push_str(&name.display(None).to_string());
+                    return false;
+                };
+                let constant = match (self.names)(self.func.params.user_named_funcs()[*user].clone()) {
+                    Some(Name::Place(place)) => Constant::Place(place),
+                    Some(Name::Data(id)) => Constant::Data(id),
+                    None => {
+                        self.refused = true;
+                        return false;
+                    }
+                };
+                self.text.push_str(&format!("#{}", self.constants.len()));
+                self.constants.push(constant);
+                true
+            }
+
+            fn is_named(&self, global: ir::GlobalValue) -> bool {
+                matches!(
+                    self.func.global_values[global],
+                    ir::GlobalValueData::Symbol { name: ir::ExternalName::User(_), .. }
+                )
+            }
+        }
+    }
+
+    /// SplitMix64. With `mutate`, that draw is moved by one: the same function but for one
+    /// choice.
+    struct Draws {
+        state: u64,
+        count: u32,
+        mutate: Option<u32>,
+    }
+
+    impl Draws {
+        fn new(seed: u64, mutate: Option<u32>) -> Draws {
+            Draws { state: seed, count: 0, mutate }
+        }
+
+        fn below(&mut self, n: u32) -> u32 {
+            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            let value = ((z ^ (z >> 31)) % u64::from(n)) as u32;
+            let at = self.count;
+            self.count += 1;
+            if self.mutate == Some(at) { (value + 1) % n } else { value }
+        }
+    }
+
+    /// Unused entities and dead values between a function's own, from a stream of their own,
+    /// so the same function gets other entity numbers.
+    struct Noise(Option<Draws>);
+
+    impl Noise {
+        fn now(&mut self) -> bool {
+            self.0.as_mut().is_some_and(|it| it.below(3) == 0)
+        }
+
+        fn dummy(&mut self, func: &mut ir::Function) {
+            if !self.now() {
+                return;
+            }
+            let call_conv = func.signature.call_conv;
+            match self.0.as_mut().map_or(0, |it| it.below(7)) {
+                0 => {
+                    func.import_signature(ir::Signature::new(call_conv));
+                }
+                1 => {
+                    let name = func.declare_imported_user_function(ir::UserExternalName::new(0, 77));
+                    let signature = func.import_signature(ir::Signature::new(call_conv));
+                    let name = ir::ExternalName::user(name);
+                    let data = ir::ExtFuncData { name, signature, colocated: false, patchable: false };
+                    func.import_function(data);
+                }
+                2 => {
+                    func.create_global_value(ir::GlobalValueData::VMContext);
+                }
+                3 => {
+                    let data = ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, 4, 0);
+                    func.create_sized_stack_slot(data);
+                }
+                4 => {
+                    func.dfg.constants.insert(vec![0xee; 16].into());
+                }
+                5 => {
+                    let flags = ir::MemFlagsData::new().with_readonly().with_can_move();
+                    let _ = func.dfg.mem_flags.insert(flags);
+                }
+                _ => {
+                    func.dfg.make_block();
+                }
+            }
+        }
+
+        fn dead(&mut self, cursor: &mut FuncCursor<'_>) {
+            if self.now() {
+                let dead = cursor.ins().iconst(types::I64, 0);
+                let inst = cursor.func.dfg.value_def(dead).unwrap_inst();
+                cursor.func.layout.remove_inst(inst);
+            }
+        }
+    }
+
+    /// A function of seed `seed`: blocks of loads, stores, compares, calls (some with stack
+    /// maps), constants, vector constants, stack, function and symbol addresses, traps and
+    /// atomics, ending in jumps, branches, jump tables and `try_call`s. Its entities are
+    /// declared with `noise` between.
+    fn random(seed: u64, mutate: Option<u32>, noise: Option<u64>) -> ir::Function {
+        let mut d = Draws::new(seed, mutate);
+        let mut z = Noise(noise.map(|it| Draws::new(it, None)));
+        let call_conv = crate::target().unwrap().default_call_conv();
+        let sig_of = |params: u32| {
+            let mut sig = ir::Signature::new(call_conv);
+            sig.params.extend((0..params).map(|_| AbiParam::new(types::I64)));
+            sig.returns.push(AbiParam::new(types::I64));
+            sig
+        };
+        let mut func = ir::Function::with_name_signature(
+            ir::UserFuncName::default(),
+            sig_of(1 + d.below(3)),
+        );
+        let mut user = |func: &mut ir::Function, d: &mut Draws| {
+            let namespace = if d.below(48) == 0 { 2 } else { d.below(2) };
+            let name = ir::UserExternalName::new(namespace, d.below(4));
+            ir::ExternalName::user(func.declare_imported_user_function(name))
+        };
+        let mut sigs = Vec::new();
+        for _ in 0..2 {
+            z.dummy(&mut func);
+            let params = 1 + d.below(2);
+            sigs.push((func.import_signature(sig_of(params)), params));
+        }
+        let mut funcs = Vec::new();
+        for _ in 0..3 {
+            z.dummy(&mut func);
+            let name = match d.below(8) {
+                0 => ir::ExternalName::testcase([b'a' + d.below(2) as u8]),
+                _ => user(&mut func, &mut d),
+            };
+            let (signature, params) = sigs[d.below(2) as usize];
+            let colocated = d.below(2) == 1;
+            let data = ir::ExtFuncData { name, signature, colocated, patchable: false };
+            funcs.push((func.import_function(data), params));
+        }
+        let vmctx = func.create_global_value(ir::GlobalValueData::VMContext);
+        let mut globals = Vec::new();
+        for _ in 0..3 {
+            z.dummy(&mut func);
+            let data = match d.below(3) {
+                0 => ir::GlobalValueData::IAddImm {
+                    base: vmctx,
+                    offset: i64::from(d.below(3)).into(),
+                    global_type: types::I64,
+                },
+                _ => ir::GlobalValueData::Symbol {
+                    name: user(&mut func, &mut d),
+                    offset: i64::from(d.below(2)).into(),
+                    colocated: d.below(2) == 1,
+                    tls: false,
+                },
+            };
+            globals.push(func.create_global_value(data));
+        }
+        let mut slots = Vec::new();
+        for _ in 0..2 {
+            z.dummy(&mut func);
+            let size = 8 * (1 + d.below(3));
+            let data = ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, size, d.below(4) as u8);
+            slots.push(func.create_sized_stack_slot(data));
+        }
+        let mut blocks = Vec::new();
+        for _ in 0..1 + d.below(3) {
+            z.dummy(&mut func);
+            let block = func.dfg.make_block();
+            func.layout.append_block(block);
+            if d.below(4) == 0 {
+                func.layout.set_cold(block);
+            }
+            blocks.push(block);
+        }
+        let mut values = Vec::new();
+        for (at, &block) in blocks.iter().enumerate() {
+            let count = if at == 0 { func.signature.params.len() } else { d.below(2) as usize };
+            for _ in 0..count {
+                values.push(func.dfg.append_block_param(block, types::I64));
+            }
+        }
+        let pick = |d: &mut Draws, values: &[ir::Value]| values[d.below(values.len() as u32) as usize];
+        let flags = |d: &mut Draws| {
+            let trusted = ir::MemFlagsData::trusted();
+            [ir::MemFlagsData::new(), trusted, trusted.with_readonly()][d.below(3) as usize]
+        };
+        let args = |d: &mut Draws, values: &[ir::Value], n: usize| -> Vec<ir::BlockArg> {
+            (0..n).map(|_| ir::BlockArg::Value(pick(d, values))).collect()
+        };
+        for (at, &block) in blocks.iter().enumerate() {
+            let mut cursor = FuncCursor::new(&mut func).at_bottom(block);
+            for _ in 0..1 + d.below(6) {
+                z.dead(&mut cursor);
+                let made = match d.below(16) {
+                    0 => Some(cursor.ins().iconst(types::I64, i64::from(d.below(5)) - 2)),
+                    1 => Some(cursor.ins().iconst(types::I32, i64::from(d.below(3)))),
+                    2 => {
+                        let (a, b) = (pick(&mut d, &values), pick(&mut d, &values));
+                        Some(match d.below(3) {
+                            0 => cursor.ins().iadd(a, b),
+                            1 => cursor.ins().imul(a, b),
+                            _ => cursor.ins().band(a, b),
+                        })
+                    }
+                    3 => {
+                        use ir::condcodes::IntCC;
+                        let conds = [
+                            IntCC::Equal,
+                            IntCC::NotEqual,
+                            IntCC::SignedLessThan,
+                            IntCC::UnsignedLessThan,
+                        ];
+                        let cond = conds[d.below(4) as usize];
+                        let (a, b) = (pick(&mut d, &values), pick(&mut d, &values));
+                        let compared = cursor.ins().icmp(cond, a, b);
+                        Some(cursor.ins().uextend(types::I64, compared))
+                    }
+                    4 => {
+                        let (c, a) = (pick(&mut d, &values), pick(&mut d, &values));
+                        Some(cursor.ins().select(c, a, pick(&mut d, &values)))
+                    }
+                    5 => {
+                        let (flags, address) = (flags(&mut d), pick(&mut d, &values));
+                        let offset = 8 * d.below(3) as i32;
+                        Some(cursor.ins().load(types::I64, flags, address, offset))
+                    }
+                    6 => {
+                        let (flags, value) = (flags(&mut d), pick(&mut d, &values));
+                        let (address, offset) = (pick(&mut d, &values), 8 * d.below(3) as i32);
+                        cursor.ins().store(flags, value, address, offset);
+                        None
+                    }
+                    7 => {
+                        let slot = slots[d.below(2) as usize];
+                        Some(cursor.ins().stack_addr(types::I64, slot, 8 * d.below(2) as i32))
+                    }
+                    8 => {
+                        let (callee, params) = funcs[d.below(3) as usize];
+                        let args: Vec<ir::Value> = (0..params).map(|_| pick(&mut d, &values)).collect();
+                        let call = cursor.ins().call(callee, &args);
+                        if d.below(4) == 0 {
+                            let slot = slots[d.below(2) as usize];
+                            let entry =
+                                ir::UserStackMapEntry { ty: types::I64, slot, offset: 8 * d.below(2) };
+                            cursor.func.dfg.append_user_stack_map_entry(call, entry);
+                        }
+                        Some(cursor.func.dfg.first_result(call))
+                    }
+                    9 => Some(cursor.ins().func_addr(types::I64, funcs[d.below(3) as usize].0)),
+                    10 => Some(cursor.ins().symbol_value(types::I64, globals[d.below(3) as usize])),
+                    11 => {
+                        let bits = u64::from(d.below(3)) << 52;
+                        cursor.ins().f64const(ir::immediates::Ieee64::with_bits(bits));
+                        None
+                    }
+                    12 => {
+                        let bits = d.below(3) << 23;
+                        cursor.ins().f32const(ir::immediates::Ieee32::with_bits(bits));
+                        None
+                    }
+                    13 => {
+                        let data = vec![d.below(3) as u8; 16].into();
+                        let constant = cursor.func.dfg.constants.insert(data);
+                        cursor.ins().vconst(types::I8X16, constant);
+                        None
+                    }
+                    14 => {
+                        let code = [ir::TrapCode::INTEGER_OVERFLOW, ir::TrapCode::HEAP_OUT_OF_BOUNDS]
+                            [d.below(2) as usize];
+                        cursor.ins().trapnz(pick(&mut d, &values), code);
+                        None
+                    }
+                    _ => {
+                        let op = [ir::AtomicRmwOp::Add, ir::AtomicRmwOp::Xchg][d.below(2) as usize];
+                        let (address, value) = (pick(&mut d, &values), pick(&mut d, &values));
+                        let flags = ir::MemFlagsData::trusted();
+                        Some(cursor.ins().atomic_rmw(types::I64, flags, op, address, value))
+                    }
+                };
+                values.extend(made);
+            }
+            let Some(&next) = blocks.get(at + 1) else {
+                cursor.ins().return_(&[pick(&mut d, &values)]);
+                continue;
+            };
+            let wants = cursor.func.dfg.block_params(next).len();
+            match d.below(4) {
+                0 => {
+                    cursor.ins().jump(next, &args(&mut d, &values, wants));
+                }
+                1 => {
+                    let condition = pick(&mut d, &values);
+                    let (then, otherwise) = (args(&mut d, &values, wants), args(&mut d, &values, wants));
+                    cursor.ins().brif(condition, next, &then, next, &otherwise);
+                }
+                2 => {
+                    let calls: Vec<ir::BlockCall> = (0..1 + d.below(3))
+                        .map(|_| {
+                            let args = args(&mut d, &values, wants);
+                            cursor.func.dfg.block_call(next, &args)
+                        })
+                        .collect();
+                    let table = ir::JumpTableData::new(calls[0], &calls[1..]);
+                    let table = cursor.func.create_jump_table(table);
+                    cursor.ins().br_table(pick(&mut d, &values), table);
+                }
+                _ => {
+                    let (callee, params) = funcs[d.below(3) as usize];
+                    let args: Vec<ir::Value> = (0..params).map(|_| pick(&mut d, &values)).collect();
+                    let signature = cursor.func.dfg.ext_funcs[callee].signature;
+                    let normal = cursor.func.dfg.block_call(next, &[ir::BlockArg::TryCallRet(0)]);
+                    let caught = cursor.func.dfg.block_call(next, &[ir::BlockArg::TryCallExn(0)]);
+                    let other = cursor.func.dfg.block_call(next, &[]);
+                    let tag = ir::ExceptionTag::from_u32(d.below(2));
+                    let items = [
+                        ir::ExceptionTableItem::Tag(tag, caught),
+                        ir::ExceptionTableItem::Default(other),
+                    ];
+                    let table = ir::ExceptionTableData::new(signature, normal, items);
+                    let table = cursor.func.dfg.exception_tables.push(table);
+                    cursor.ins().try_call(callee, &args, table);
+                }
+            }
+        }
+        func
+    }
+
+    #[test]
+    fn the_walk_tells_apart_what_the_text_did() {
+        let (mut equal, mut other) = (0, 0);
+        for seed in 0..300u64 {
+            let base = random(seed, None, None);
+            let want = text::masked(&base, &names);
+            let got = masked_ir(&base, &names);
+            assert_eq!(want.is_some(), got.is_some(), "seed {seed}");
+            let renumbered = random(seed, None, Some(seed ^ 0x5eed));
+            if let (Some((text, _)), Some((renumbered, _))) = (&want, text::masked(&renumbered, &names))
+            {
+                assert_eq!(*text, renumbered, "seed {seed}: the noise changed the function");
+            }
+            let mut variants = vec![renumbered];
+            for at in [0, 2, 5, 9, 14, 20, 27, 35, 44, 54, 65, 80] {
+                variants.push(random(seed, Some(at), Some(seed.wrapping_mul(31) + u64::from(at))));
+            }
+            variants.push(random(seed + 10_000, None, None));
+            for variant in &variants {
+                let (theirs, ours) = (text::masked(variant, &names), masked_ir(variant, &names));
+                assert_eq!(theirs.is_some(), ours.is_some(), "seed {seed}");
+                let (Some((text_a, constants_a)), Some((text_b, constants_b))) = (&want, &theirs)
+                else {
+                    continue;
+                };
+                let (a, b) = (got.as_ref().unwrap(), ours.as_ref().unwrap());
+                assert_eq!(*constants_a, a.constants, "seed {seed}");
+                assert_eq!(*constants_b, b.constants, "seed {seed}");
+                assert_eq!(text_a == text_b, a.shape == b.shape, "seed {seed}:\n{text_a}\n{text_b}");
+                if text_a == text_b { equal += 1 } else { other += 1 }
+            }
+        }
+        assert!(equal > 300 && other > 300, "{equal} equal, {other} other pairs");
+    }
+
+    /// One `atomic_rmw` with `flags`.
+    fn atomic(flags: ir::MemFlagsData) -> ir::Function {
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature());
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        let arg = func.dfg.append_block_param(block, types::I64);
+        let mut cursor = FuncCursor::new(&mut func).at_bottom(block);
+        let old = cursor.ins().atomic_rmw(types::I64, flags, ir::AtomicRmwOp::Add, arg, arg);
+        cursor.ins().return_(&[old]);
+        func
+    }
+
+    #[test]
+    fn an_atomics_flags_are_in_the_shape() {
+        let trusted = ir::MemFlagsData::trusted();
+        let (a, b) = (atomic(trusted), atomic(trusted.with_endianness(ir::Endianness::Big)));
+        // The printer leaves them out.
+        assert_eq!(text::masked(&a, &names), text::masked(&b, &names));
+        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        assert_ne!(a.shape, b.shape);
+    }
+
+    /// A function reading a global value loaded with `flags` from the VM context.
+    fn global_load(flags: ir::MemFlagsData) -> ir::Function {
+        let mut func = ir::Function::with_name_signature(ir::UserFuncName::default(), signature());
+        let vmctx = func.create_global_value(ir::GlobalValueData::VMContext);
+        let flags = func.dfg.mem_flags.insert(flags).unwrap();
+        let loaded = func.create_global_value(ir::GlobalValueData::Load {
+            base: vmctx,
+            offset: 8.into(),
+            global_type: types::I64,
+            flags,
+        });
+        let block = func.dfg.make_block();
+        func.layout.append_block(block);
+        func.dfg.append_block_param(block, types::I64);
+        let mut cursor = FuncCursor::new(&mut func).at_bottom(block);
+        let value = cursor.ins().symbol_value(types::I64, loaded);
+        cursor.ins().return_(&[value]);
+        func
+    }
+
+    #[test]
+    fn a_global_loads_flags_are_in_the_shape() {
+        let trusted = ir::MemFlagsData::trusted();
+        let (a, b) = (global_load(trusted), global_load(trusted.with_readonly()));
+        // The text named the flags by their handle, the same number in both.
+        assert_eq!(text::masked(&a, &names), text::masked(&b, &names));
+        let (a, b) = (masked_ir(&a, &names).unwrap(), masked_ir(&b, &names).unwrap());
+        assert_ne!(a.shape, b.shape);
+        assert_eq!(masked_ir(&global_load(trusted), &names).unwrap().shape, a.shape);
+    }
+
+    #[test]
+    fn masking_reuses_the_threads_buffers() {
+        let (big, small) = (random(7, None, None), grow(8, 0, 1, false));
+        let first = masked_ir(&small, &names);
+        masked_ir(&big, &names);
+        assert_eq!(masked_ir(&small, &names), first);
+    }
+
     fn verified(func: &ir::Function) {
         let flags = settings::Flags::new(settings::builder());
         if let Err(errors) = cranelift_codegen::verify_function(func, &flags) {

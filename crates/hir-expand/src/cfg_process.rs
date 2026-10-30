@@ -13,7 +13,7 @@ use syntax::{
 use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
-    attrs::{AstPathExt, AttrId, expand_cfg_attr, is_item_tree_filtered_attr},
+    attrs::{AttrId, expand_cfg_attr, is_item_tree_filtered_attr, with_one_segment},
     fixup::{self, SyntaxFixupUndoInfo},
     span_map::SpanMap,
     tt::{self, DelimSpan, Span},
@@ -161,10 +161,9 @@ fn macro_input_callback(
                                     }
                                 }
                                 _ => {
-                                    if attr
-                                        .path()
-                                        .as_one_segment()
-                                        .is_none_or(|name| !is_item_tree_filtered_attr(&name))
+                                    if attr.path().and_then(|path| {
+                                        with_one_segment(&path, is_item_tree_filtered_attr)
+                                    }) != Some(true)
                                     {
                                         strip_current_attr = should_strip_attr();
                                     }

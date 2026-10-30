@@ -12,15 +12,19 @@ mod tests;
 
 use std::{
     borrow::Borrow,
+    cell::RefCell,
+    mem,
     ops::{Deref, Index},
+    sync::LazyLock,
 };
 
 use base_db::SourceDatabase;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name};
-use la_arena::{Arena, ArenaMap};
+use la_arena::{Arena, ArenaMap, Idx};
 use rustc_hash::{FxHashMap, FxHashSet};
+use salsa::plumbing::AsId;
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use syntax::{AstNode, AstPtr, SyntaxNodePtr, ast};
@@ -40,7 +44,7 @@ use crate::{
     signatures::VariantFields,
     type_ref::{
         ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, PathId, RefType, TypeBound,
-        TypeRef, TypeRefId, UseArgRef,
+        TypeColumns, TypeRef, TypeRefId, UseArgRef,
     },
 };
 
@@ -183,7 +187,8 @@ const NO_OWNER: u32 = u32::MAX;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpressionStore {
     expr_only: Option<Box<ExpressionOnlyStore>>,
-    pub types: Arena<TypeRef>,
+    /// The type refs ([`ExpressionStore::type_ref`]).
+    pub(crate) types: TypeColumns<Frozen>,
     pub lifetimes: Arena<LifetimeRef>,
     /// The hygiene of the plain type paths a `macro` wrote, by type in increasing order.
     type_hygiene: Option<Box<[(TypeRefId, HygieneId)]>>,
@@ -193,13 +198,13 @@ pub struct ExpressionStore {
 struct ExpressionOnlySourceMap {
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
     // to `PatId`, and `PatId` can also map to `ExprSource` (the other way around is unaffected).
-    expr_map: FxHashMap<ExprSource, ExprOrPatIdPacked>,
+    expr_map: SourceTable<ExprSource, ExprOrPatIdPacked>,
     expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
 
-    pat_map: FxHashMap<PatSource, ExprOrPatIdPacked>,
+    pat_map: SourceTable<PatSource, ExprOrPatIdPacked>,
     pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
 
-    label_map: FxHashMap<LabelSource, LabelId>,
+    label_map: SourceTable<LabelSource, LabelId>,
     label_map_back: ArenaMap<LabelId, LabelSource>,
 
     binding_definitions:
@@ -212,7 +217,7 @@ struct ExpressionOnlySourceMap {
 
     template_map: Option<Box<FormatTemplate>>,
 
-    expansions: FxHashMap<InFile<MacroCallPtr>, MacroCallId>,
+    expansions: SourceTable<InFile<MacroCallPtr>, MacroCallId>,
 
     /// Diagnostics accumulated during lowering. These contain `AstPtr`s and so are stored in
     /// the source map (since they're just as volatile).

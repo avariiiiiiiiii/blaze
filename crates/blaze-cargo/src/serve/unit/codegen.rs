@@ -5,7 +5,7 @@
 //! link of the same file relinks only what changed.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::PathBuf,
     sync::Mutex,
 };
@@ -17,22 +17,19 @@ use blaze_codegen::{
     settings::{DebugInfo, Panic, Toolchain},
 };
 use blaze_build_script::{
-    apply::{Compile, GraphUnit, Linked as LinkedTo, to_link},
+    apply::{Compile, Linked as LinkedTo},
     unit as bs,
 };
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, Output};
-use blaze_units::{
-    query::Units,
-    schema::{self, Mode, Unit},
-};
+use blaze_units::schema::{self, Mode, Unit};
 use hir_ty::db::HirDatabase;
 use hir_ty_codegen::v2::{
     Backends, BuildTime, Databases, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
 };
 
-use super::{Job, files::Mounted, script};
+use super::{Job, files::Mounted, graph::flag, script};
 
 /// What a unit makes, as the linker sees it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -129,52 +126,21 @@ fn panic(panic: &str) -> Result<Panic, String> {
     }
 }
 
-/// Every unit `unit` depends on, itself first, each once, dependencies before what depends on
-/// them after the first.
-pub(crate) fn closure(job: &Job, unit: usize) -> Vec<usize> {
-    let units = &job.units().graph.units;
-    let mut seen = BTreeSet::new();
-    let mut order = Vec::new();
-    let mut stack = vec![(unit, false)];
-    while let Some((at, expanded)) = stack.pop() {
-        if expanded {
-            order.push(at);
-            continue;
-        }
-        if !seen.insert(at) {
-            continue;
-        }
-        stack.push((at, true));
-        if let Some(it) = units.get(at) {
-            for dep in it.dependencies.iter().rev() {
-                if !seen.contains(&dep.index) {
-                    stack.push((dep.index, false));
-                }
-            }
-        }
-    }
-    order.reverse();
-    order
-}
-
-/// The crates compiled for build scripts and proc macros, not for the program: every unit a
-/// build script's or proc macro's compile depends on.
+/// The crates compiled for build scripts and proc macros, not for the program, as the code
+/// generator takes them. Worked out once per job from [`Graph`](super::graph::Graph)'s bitset.
 fn build_time(job: &Job) -> BuildTime {
-    let units = &job.units().graph.units;
-    let mut crates = rustc_hash::FxHashSet::default();
-    for (at, unit) in units.iter().enumerate() {
-        let tool = (unit.target.is_custom_build() && !matches!(unit.mode, Mode::RunCustomBuild))
-            || unit.target.is_proc_macro();
-        if !tool {
-            continue;
-        }
-        for dep in closure(job, at) {
-            if let Some(krate) = job.lowered.krate(dep) {
+    let crates = job.build_time.get_or_init(|| {
+        let mut crates = rustc_hash::FxHashSet::default();
+        for at in 0..job.graph.len() as u32 {
+            if job.graph.build_time(at)
+                && let Some(krate) = job.lowered.krate(at as usize)
+            {
                 crates.insert(krate);
             }
         }
-    }
-    BuildTime(crates)
+        BuildTime(crates)
+    });
+    crates.clone()
 }
 
 fn is_build_time(unit: &Unit) -> bool {
@@ -200,11 +166,11 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     let opt = opt_level(&base.opt_level)?;
     let info = debuginfo(&base.debuginfo)?;
     let mut packages = BTreeMap::new();
-    for dep in closure(job, unit).into_iter().skip(1) {
-        let dep = job.unit(dep).map_err(|it| it.what)?;
-        if dep.is_std {
+    for dep in job.graph.closure(unit as u32).into_iter().skip(1) {
+        if job.graph.has(dep, flag::STD) {
             continue;
         }
+        let dep = job.unit(dep as usize).map_err(|it| it.what)?;
         let name = job.package(dep).map_err(|it| it.what)?.name.clone();
         let profile = &dep.profile;
         let level = opt_level(&profile.opt_level)?;
@@ -288,90 +254,112 @@ pub(crate) fn generate(
 }
 
 /// An image kept linked at one path, and what is in it, so the next link of it is a change.
+/// Each column is sorted, so a link's diff against it is one merge pass: `O(n)` with no hashing
+/// and no allocation but the diff itself (keys are content hashes, 32 bytes each).
 pub(crate) struct Linked {
     image: Image,
     output: Output,
-    functions: BTreeSet<InstanceKey>,
-    statics: BTreeSet<(ItemKey, ContentId)>,
-    natives: BTreeSet<ContentId>,
-    names: BTreeSet<String>,
+    functions: Vec<InstanceKey>,
+    statics: Vec<(ItemKey, ContentId)>,
+    natives: Vec<ContentId>,
+    names: Vec<String>,
 }
 
-/// `unit` as cargo's `build_map` reads it: its dependencies sorted by package id, its package's
-/// script runs, whether it is built for the host, whether it links into what depends on it.
-fn graph_unit(units: &Units, unit: usize) -> GraphUnit<usize, usize> {
-    let all = &units.graph.units;
-    let Some(it) = all.get(unit) else {
-        return GraphUnit { deps: Vec::new(), own_runs: Vec::new(), for_host: false, linkable: false };
-    };
-    let mut deps: Vec<usize> = it.dependencies.iter().map(|dep| dep.index).collect();
-    deps.sort_by(|a, b| all[*a].pkg_id.cmp(&all[*b].pkg_id));
-    let own_runs = match it.target.is_custom_build() {
-        true => Vec::new(),
-        false => deps
-            .iter()
-            .copied()
-            .filter(|dep| all[*dep].mode == Mode::RunCustomBuild && all[*dep].pkg_id == it.pkg_id)
-            .collect(),
-    };
-    let linkable = it.target.is_lib()
-        && it.target.crate_types.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "proc-macro"));
-    GraphUnit { deps, own_runs, for_host: it.target.is_custom_build() || it.target.is_proc_macro(), linkable }
+/// What of sorted `old` is not in sorted `new`, and what of `new` is not in `old`, in one pass.
+fn diff<T: Ord + Copy>(old: &[T], new: &[T], removed: &mut Vec<T>, added: &mut Vec<T>) {
+    let (mut a, mut b) = (0, 0);
+    while a < old.len() && b < new.len() {
+        match old[a].cmp(&new[b]) {
+            std::cmp::Ordering::Less => {
+                removed.push(old[a]);
+                a += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                added.push(new[b]);
+                b += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                a += 1;
+                b += 1;
+            }
+        }
+    }
+    removed.extend_from_slice(&old[a..]);
+    added.extend_from_slice(&new[b..]);
+}
+
+/// The symbol names of a link, sorted, each kept `String` moved from the last link's rather
+/// than copied: only a name new to the image is allocated, and each name gone is moved out.
+fn renamed(old: Vec<String>, new: &mut Vec<&str>) -> (Vec<String>, Vec<String>) {
+    new.sort_unstable();
+    new.dedup();
+    let mut kept = Vec::with_capacity(new.len());
+    let mut gone = Vec::new();
+    let mut old = old.into_iter().peekable();
+    for name in new.iter() {
+        while old.peek().is_some_and(|it| it.as_str() < *name) {
+            gone.extend(old.next());
+        }
+        match old.peek().is_some_and(|it| it.as_str() == *name) {
+            true => kept.extend(old.next()),
+            false => kept.push((*name).to_owned()),
+        }
+    }
+    gone.extend(old);
+    (kept, gone)
 }
 
 /// What rustc is given for `unit` from the build scripts it is linked with
-/// ([`blaze_build_script::apply::Compile`]).
-fn given(job: &Job, unit: usize, scripts: &BTreeMap<usize, script::Applied>) -> Result<Compile, String> {
+/// ([`blaze_build_script::apply::Compile`]), in cargo's order ([`Graph::links`]).
+///
+/// [`Graph::links`]: super::graph::Graph::links
+fn given(job: &Job, unit: u32) -> Result<Compile, String> {
     let units = job.units();
-    let u = job.unit(unit).map_err(|it| it.what)?;
-    let mut memo = rustc_hash::FxHashMap::default();
-    let to_link = to_link(unit, &|at: &usize| graph_unit(units, *at), &mut memo).to_link;
-    let mut linked = Vec::new();
+    let u = job.unit(unit as usize).map_err(|it| it.what)?;
+    let runs = job.graph.links(unit);
+    let mut linked = Vec::with_capacity(runs.len());
     let mut own = Vec::new();
-    for run in to_link {
-        let applied = scripts.get(&run).ok_or_else(|| {
-            format!("the build script run of `{}` that `{}` is linked with has not run", units.graph.units[run].pkg_id, u.target.name)
+    for &run in runs {
+        let applied = job.scripts[run as usize].get().ok_or_else(|| {
+            format!(
+                "the build script run of `{}` that `{}` is linked with has not run",
+                units.graph.units[run as usize].pkg_id, u.target.name
+            )
         })?;
-        let mine = units.graph.units[run].pkg_id == u.pkg_id;
+        let mine = job.graph.package(run) == job.graph.package(unit);
         linked.push(LinkedTo { own: mine, output: &applied.output });
         if mine {
             own.push(&applied.output);
         }
     }
     let package = bs::Package { targets: script::targets(units, &u.pkg_id), ..bs::Package::default() };
-    Ok(Compile::of(&package, &script::target_of(u), matches!(u.mode, Mode::Test), &linked, &own))
+    Ok(Compile::of(&package, &script::target_of(u), job.graph.has(unit, flag::TEST), &linked, &own))
 }
 
-/// The native libraries `unit` links, in rustc's order: each linked crate of its closure, what
-/// depends first, the `-l`s its rustc is given (its build script's `rustc-link-lib`s) then its
-/// `#[link]`s, then the unit's own `rustc-link-arg`s; and where to look for them, the unit's
-/// `-L`s.
+/// The native libraries `unit` links, in rustc's order: each crate linked in, what depends
+/// first ([`Graph::linked_in`]), the `-l`s its rustc is given (its build script's
+/// `rustc-link-lib`s) then its `#[link]`s, then the unit's own `rustc-link-arg`s; and where to
+/// look for them, the unit's `-L`s.
+///
+/// [`Graph::linked_in`]: super::graph::Graph::linked_in
 fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<NativeLib>, Vec<PathBuf>), String> {
-    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
-    let units = job.units();
-    let mine = given(job, unit, &scripts)?;
-    // The crates linked in: the unit's, and each library reached through libraries, not through
-    // a build script or proc macro, which are built for the host.
-    let mut linked_in = BTreeSet::from([unit]);
-    let mut pending = vec![unit];
-    while let Some(at) = pending.pop() {
-        for dep in graph_unit(units, at).deps {
-            let node = graph_unit(units, dep);
-            if node.linkable && !node.for_host && linked_in.insert(dep) {
-                pending.push(dep);
-            }
-        }
-    }
+    let unit = unit as u32;
+    let mine = given(job, unit)?;
     let mut libs = Vec::new();
-    for at in closure(job, unit).into_iter().filter(|it| linked_in.contains(it)) {
+    for at in job.graph.linked_in(unit) {
+        let theirs;
         let compile = match at == unit {
-            true => mine.clone(),
-            false => given(job, at, &scripts)?,
+            true => &mine,
+            false => {
+                theirs = given(job, at)?;
+                &theirs
+            }
         };
+        libs.reserve(compile.libs.len());
         for lib in &compile.libs {
             libs.push(link_lib(lib)?);
         }
-        if let Some(krate) = job.lowered.krate(at) {
+        if let Some(krate) = job.lowered.krate(at as usize) {
             libs.extend(frontend.linked(krate).map_err(|it| it.what)?);
         }
     }
@@ -381,8 +369,8 @@ fn natives(job: &Job, unit: usize, frontend: &HirFrontend) -> Result<(Vec<Native
     Ok((libs, mine.search))
 }
 
-/// The bytes of a file, by its path.
-pub(crate) type Read = (String, Vec<u8>);
+/// A native input a link read off the machine: its path, and the BLAKE3 hash of its contents.
+pub(crate) type Read = (String, ContentId);
 
 /// `generated` linked into the image at `path` as `makes` says: the file's bytes, and every
 /// native input the link read off the machine.
@@ -409,13 +397,11 @@ pub(crate) fn link(
     };
     let output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
-    let owned = blaze_link::target::natives(&output, &libs, &search).map_err(|it| it.to_string())?;
+    let located = blaze_link::target::locate(&output, &libs, &search).map_err(|it| it.to_string())?;
     let side = generated.frontend.link_inputs(built).map_err(|it| it.what)?;
 
-    let mut images = job.shared.images.lock().unwrap_or_else(|it| it.into_inner());
-    let kept = images.remove(path).filter(|it| it.output == output);
-    drop(images);
-    let mut linked = match kept {
+    let kept = job.shared.images.lock().unwrap_or_else(|it| it.into_inner()).remove(path);
+    let mut linked = match kept.filter(|it| it.output == output) {
         Some(it) => it,
         None => {
             let to = blaze_core::FileName::new(path.trim_start_matches('/'))
@@ -423,68 +409,91 @@ pub(crate) fn link(
             Linked {
                 image: Image::new(to, output.clone()).map_err(|it| it.to_string())?,
                 output: output.clone(),
-                functions: BTreeSet::new(),
-                statics: BTreeSet::new(),
-                natives: BTreeSet::new(),
-                names: BTreeSet::new(),
+                functions: Vec::new(),
+                statics: Vec::new(),
+                natives: Vec::new(),
+                names: Vec::new(),
             }
         }
     };
 
-    let functions: BTreeSet<InstanceKey> = built.functions.iter().map(|it| it.key).collect();
-    let statics: BTreeSet<(ItemKey, ContentId)> = built.statics.iter().map(|it| (it.item, it.instance)).collect();
-    let native_ids: BTreeSet<ContentId> = owned.iter().map(|it| it.id).collect();
-    let patchable: BTreeSet<InstanceKey> = built.patchable.iter().copied().collect();
-    let mut names: Vec<(String, Target)> = built
-        .symbols
-        .iter()
-        .map(|(key, name)| {
-            let target = match patchable.contains(key) {
-                true => Target::Function(*key),
-                false => Target::Direct(*key),
-            };
-            (name.clone(), target)
-        })
-        .collect();
-    names.extend(
-        built
-            .static_symbols
-            .iter()
-            .map(|(item, instance, name)| (name.clone(), Target::Static { item: *item, instance: *instance })),
-    );
-    let name_set: BTreeSet<String> = names.iter().map(|it| it.0.clone()).collect();
+    // Each native input by the hash of its contents, through the process's table of files by
+    // their `stat`: one `stat` for a library the image already has, read only when it is new.
+    let mut files = blaze_usercode::inputs::Disk::new(Vec::new());
+    let mut read = Vec::with_capacity(located.len());
+    let mut native_ids = Vec::with_capacity(located.len());
+    for it in &located {
+        let hash = blaze_usercode::trace::Inputs::file(&mut files, &it.path)
+            .map_err(|error| format!("{}: {}", error.path.display(), error.error))?
+            .ok_or_else(|| format!("{}: the native library is gone", it.path.display()))?;
+        native_ids.push(ContentId(hash));
+        read.push((it.path.to_string_lossy().into_owned(), ContentId(hash)));
+    }
+    let mut new_natives: Vec<ContentId> = native_ids.clone();
+    new_natives.sort_unstable();
+    new_natives.dedup();
+    let mut removed_natives = Vec::new();
+    let mut added_natives = Vec::new();
+    diff(&linked.natives, &new_natives, &mut removed_natives, &mut added_natives);
+    let mut bytes_of = Vec::with_capacity(added_natives.len());
+    for (order, it) in located.iter().enumerate() {
+        if added_natives.binary_search(&native_ids[order]).is_ok() {
+            let bytes = std::fs::read(&it.path).map_err(|error| format!("{}: {error}", it.path.display()))?;
+            bytes_of.push((order, bytes));
+        }
+    }
+
+    let mut functions: Vec<InstanceKey> = built.functions.iter().map(|it| it.key).collect();
+    functions.sort_unstable();
+    let mut statics: Vec<(ItemKey, ContentId)> = built.statics.iter().map(|it| (it.item, it.instance)).collect();
+    statics.sort_unstable();
+    let mut removed = Vec::new();
+    let mut added_keys = Vec::new();
+    diff(&linked.functions, &functions, &mut removed, &mut added_keys);
+    let mut patchable: Vec<InstanceKey> = built.patchable.iter().copied().collect();
+    patchable.sort_unstable();
+    let mut names: Vec<(String, Target)> = Vec::with_capacity(built.symbols.len() + built.static_symbols.len());
+    for (key, name) in &built.symbols {
+        let target = match patchable.binary_search(key).is_ok() {
+            true => Target::Function(*key),
+            false => Target::Direct(*key),
+        };
+        names.push((name.clone(), target));
+    }
+    for (item, instance, name) in &built.static_symbols {
+        names.push((name.clone(), Target::Static { item: *item, instance: *instance }));
+    }
+    let mut now_named: Vec<&str> = names.iter().map(|it| it.0.as_str()).collect();
+    let (kept_names, unnamed) = renamed(std::mem::take(&mut linked.names), &mut now_named);
     let change = Change {
-        added: built.functions.iter().filter(|it| !linked.functions.contains(&it.key)).collect(),
-        removed: linked.functions.difference(&functions).copied().collect(),
+        added: built.functions.iter().filter(|it| added_keys.binary_search(&it.key).is_ok()).collect(),
+        removed,
         // A static's value is not in its key: every static is put again.
         statics: built.statics.iter().collect(),
-        removed_statics: linked.statics.iter().copied().collect(),
+        removed_statics: std::mem::take(&mut linked.statics),
         names,
-        unnamed: linked.names.difference(&name_set).cloned().collect(),
-        debug_names: side.debug_names.clone(),
-        natives: owned
+        unnamed,
+        debug_names: side.debug_names,
+        natives: bytes_of
             .iter()
-            .enumerate()
-            .filter(|(_, it)| !linked.natives.contains(&it.id))
-            .map(|(order, it)| Native {
-                id: it.id,
-                name: &it.name,
-                bytes: &it.bytes,
-                kind: it.kind,
-                order: order as u32,
+            .map(|(order, bytes)| Native {
+                id: native_ids[*order],
+                name: &located[*order].name,
+                bytes,
+                kind: located[*order].kind,
+                order: *order as u32,
             })
             .collect(),
-        removed_natives: linked.natives.difference(&native_ids).copied().collect(),
+        removed_natives,
         spans: side.spans.iter().map(|(anchor, bytes)| (*anchor, bytes.as_slice())).collect(),
     };
     let staged = linked.image.stage(change).map_err(|it| it.to_string())?;
     let bytes = linked.image.bytes(staged).map_err(|it| it.to_string())?;
     linked.functions = functions;
     linked.statics = statics;
-    linked.natives = native_ids;
-    linked.names = name_set;
+    linked.natives = new_natives;
+    linked.names = kept_names;
     job.shared.images.lock().unwrap_or_else(|it| it.into_inner()).insert(path.to_owned(), linked);
-    let read = owned.into_iter().map(|it| (it.name, it.bytes)).collect();
     Ok((bytes, read))
 }
 

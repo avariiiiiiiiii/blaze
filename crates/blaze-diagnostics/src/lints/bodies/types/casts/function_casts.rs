@@ -24,8 +24,7 @@ impl LatePass for FunctionCastsAsInteger {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        let Expr::Cast { expr: from, .. } = &b.store()[expr] else { return };
-        let from = *from;
+        let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };
         if matches!(b.infer.expr_ty(expr).kind(), TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::RawPtr(..)) {
             return;
         }

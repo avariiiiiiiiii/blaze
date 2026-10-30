@@ -10,9 +10,12 @@
 //! put together greedily, the largest first, into one slot per group of locals of which no two
 //! conflict ([`FrameStorage::frame_storage_conflicts`](hir_ty_mir::mir::FrameStorage::frame_storage_conflicts)).
 
-use cranelift_codegen::ir::{self, InstructionData};
+use cranelift_codegen::{
+    entity::{EntitySet, PackedOption, SecondaryMap},
+    ir::{self, InstructionData},
+};
 use rustc_hash::FxHashMap;
-use rustc_index::bit_set::BitMatrix;
+use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 
 use super::fragment::Named;
 
@@ -53,38 +56,44 @@ pub(super) fn share_escaping(
 
 /// The slots whose address goes anywhere but to the address of a load or a store, an
 /// offset from it, or a `memcpy`, `memmove` or `memset`.
-fn escaping(func: &ir::Function) -> rustc_hash::FxHashSet<ir::StackSlot> {
+fn escaping(func: &ir::Function) -> EntitySet<ir::StackSlot> {
     let dfg = &func.dfg;
-    // What each address of a slot, or an offset from one, is of.
-    let mut of: FxHashMap<ir::Value, ir::StackSlot> = FxHashMap::default();
+    // What each address of a slot, or an offset from one, is of, indexed by value.
+    let mut of: SecondaryMap<ir::Value, PackedOption<ir::StackSlot>> = SecondaryMap::new();
+    let address_of = |of: &SecondaryMap<ir::Value, PackedOption<ir::StackSlot>>, value| {
+        of[dfg.resolve_aliases(value)].expand()
+    };
+    let mut known = 0;
     loop {
-        let known = of.len();
+        let before = known;
         for block in func.layout.blocks() {
             for inst in func.layout.block_insts(block) {
                 let slot = match dfg.insts[inst] {
                     InstructionData::StackAddr { stack_slot, .. } => Some(stack_slot),
                     InstructionData::Binary { opcode: ir::Opcode::Iadd, args } => {
-                        args.iter().find_map(|it| of.get(&dfg.resolve_aliases(*it)).copied())
+                        args.iter().find_map(|&it| address_of(&of, it))
                     }
                     _ => None,
                 };
                 if let Some(slot) = slot {
-                    of.insert(dfg.first_result(inst), slot);
+                    let value = dfg.first_result(inst);
+                    known += usize::from(of[value].is_none());
+                    of[value] = slot.into();
                 }
             }
         }
-        if of.len() == known {
+        if known == before {
             break;
         }
     }
-    let mut escaping = rustc_hash::FxHashSet::default();
+    let mut escaping = EntitySet::with_capacity(func.sized_stack_slots.len());
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let data = &dfg.insts[inst];
             let followed = match *data {
                 InstructionData::Load { .. } | InstructionData::StackAddr { .. } => true,
                 InstructionData::Store { args: [value, _], .. } => {
-                    if let Some(&slot) = of.get(&dfg.resolve_aliases(value)) {
+                    if let Some(slot) = address_of(&of, value) {
                         escaping.insert(slot);
                     }
                     true
@@ -99,10 +108,9 @@ fn escaping(func: &ir::Function) -> rustc_hash::FxHashSet<ir::StackSlot> {
                 _ => false,
             };
             if !followed {
-                escaping.extend(
-                    dfg.inst_values(inst)
-                        .filter_map(|it| of.get(&dfg.resolve_aliases(it)).copied()),
-                );
+                for slot in dfg.inst_values(inst).filter_map(|it| address_of(&of, it)) {
+                    escaping.insert(slot);
+                }
             }
         }
     }
@@ -115,23 +123,25 @@ fn share_slots(
     func: &mut ir::Function,
     frame: &FrameLocals,
     named: &mut [ir::StackSlot],
-    only: Option<&rustc_hash::FxHashSet<ir::StackSlot>>,
+    only: Option<&EntitySet<ir::StackSlot>>,
 ) {
     if frame.slots.is_empty() {
         return;
     }
     // An address of a slot that nothing uses is what `promote` left of its loads and stores.
-    let mut used = rustc_hash::FxHashSet::default();
+    let mut used = EntitySet::with_capacity(func.dfg.num_values());
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
-            used.extend(func.dfg.inst_values(inst).map(|it| func.dfg.resolve_aliases(it)));
+            for value in func.dfg.inst_values(inst) {
+                used.insert(func.dfg.resolve_aliases(value));
+            }
         }
     }
     let mut addressed = vec![false; func.sized_stack_slots.len()];
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             let Some(slot) = slot_of(&func.dfg.insts[inst]) else { continue };
-            if used.contains(&func.dfg.first_result(inst)) {
+            if used.contains(func.dfg.first_result(inst)) {
                 addressed[slot.as_u32() as usize] = true;
             }
         }
@@ -144,52 +154,57 @@ fn share_slots(
         let Some(slot) = *slot else { continue };
         if !addressed[slot.as_u32() as usize] {
             func.sized_stack_slots[slot].size = 0;
-        } else if only.is_none_or(|only| only.contains(&slot)) {
+        } else if only.is_none_or(|only| only.contains(slot)) {
             order.push(at);
         }
     }
     let slot = |at: usize| frame.slots[at].expect("a local's slot");
     let size = |func: &ir::Function, at: usize| func.sized_stack_slots[slot(at)].size;
     order.sort_by_key(|&at| (std::cmp::Reverse(size(func, at)), at));
-    // Each group's members, the first of them the slot the group keeps.
-    let mut groups: Vec<Vec<usize>> = Vec::new();
+    // Each group: the slot it keeps, and every local any of its members conflicts with (the
+    // rows of its members, or'ed), so that whether one more fits is one bit.
+    let mut groups: Vec<(ir::StackSlot, DenseBitSet<usize>)> = Vec::new();
+    let mut moved: SecondaryMap<ir::StackSlot, PackedOption<ir::StackSlot>> = SecondaryMap::new();
+    let mut any = false;
     for at in order {
-        let fits = |group: &Vec<usize>| group.iter().all(|&it| !frame.conflicts.contains(it, at));
-        match groups.iter_mut().find(|group| fits(group)) {
-            Some(group) => group.push(at),
-            None => groups.push(vec![at]),
+        let found = groups.iter().position(|group| !group.1.contains(at));
+        let first = found.is_none();
+        let index = found.unwrap_or_else(|| {
+            groups.push((slot(at), DenseBitSet::new_empty(frame.slots.len())));
+            groups.len() - 1
+        });
+        let into = &mut groups[index];
+        for it in frame.conflicts.iter(at) {
+            into.1.insert(it);
         }
-    }
-    let mut moved: FxHashMap<ir::StackSlot, ir::StackSlot> = FxHashMap::default();
-    for group in groups.iter().filter(|it| it.len() > 1) {
-        let kept = slot(group[0]);
-        for &at in &group[1..] {
-            let slot = slot(at);
-            let (size, align_shift) =
-                (func.sized_stack_slots[slot].size, func.sized_stack_slots[slot].align_shift);
-            let into = &mut func.sized_stack_slots[kept];
-            into.size = into.size.max(size);
-            into.align_shift = into.align_shift.max(align_shift);
-            func.sized_stack_slots[slot].size = 0;
-            moved.insert(slot, kept);
+        if first {
+            continue;
         }
+        let (kept, slot) = (into.0, slot(at));
+        let (size, align_shift) =
+            (func.sized_stack_slots[slot].size, func.sized_stack_slots[slot].align_shift);
+        let into = &mut func.sized_stack_slots[kept];
+        into.size = into.size.max(size);
+        into.align_shift = into.align_shift.max(align_shift);
+        func.sized_stack_slots[slot].size = 0;
+        moved[slot] = kept.into();
+        any = true;
     }
-    if moved.is_empty() {
+    if !any {
         return;
     }
-    let blocks: Vec<ir::Block> = func.layout.blocks().collect();
-    for block in blocks {
-        let insts: Vec<ir::Inst> = func.layout.block_insts(block).collect();
-        for inst in insts {
-            if let Some(slot) = slot_mut(&mut func.dfg.insts[inst])
-                && let Some(&kept) = moved.get(slot)
+    let stencil = &mut func.stencil;
+    for block in stencil.layout.blocks() {
+        for inst in stencil.layout.block_insts(block) {
+            if let Some(slot) = slot_mut(&mut stencil.dfg.insts[inst])
+                && let Some(kept) = moved[*slot].expand()
             {
                 *slot = kept;
             }
         }
     }
     for slot in named.iter_mut() {
-        if let Some(&kept) = moved.get(slot) {
+        if let Some(kept) = moved[*slot].expand() {
             *slot = kept;
         }
     }

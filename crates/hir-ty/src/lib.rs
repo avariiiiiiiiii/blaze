@@ -109,6 +109,7 @@ pub use lower::{
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
 pub use opaques::{rpit_hidden_types, tait_hidden_types};
+pub use specialization::impl_unconstrained_params;
 pub use target_feature::TargetFeatures;
 pub use traits::{ParamEnvAndCrate, check_orphan_rules};
 pub use utils::{

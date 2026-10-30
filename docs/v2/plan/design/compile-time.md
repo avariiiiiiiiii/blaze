@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: the bigger changes for the fastest compile times: lazy per-function compilation, copy-and-patch codegen, no binary on disk for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT.
+summary: blaze v2: the bigger changes for the fastest compile times: tiered compilation and idle cores always working, lazy per-function compilation, copy-and-patch codegen, no binary on disk for dev runs, one global cache, semantic edits and declared intent, shared generic code, exact test selection, hash-consing, premapped dependencies, scheduling from history, PGO and BOLT.
 date: 2026-10-29
 ---
 # The fastest compile times
@@ -68,6 +68,33 @@ hooks.
 10. **Declared intent.** An agent can say what comes next: "I will run test T" or "here is the
     edit I am about to save". The daemon compiles only what T needs, starts speculatively on
     the announced edit at low priority, and drops that work if the edit doesn't come.
+
+## Tier up, and never sit idle
+
+13. **Tiered compilation for dev and test runs**:
+    - **Tier 0, copy-and-patch.** Every function starts here, on first call (changes 1 and 4),
+      with counters on calls and loop back-edges.
+    - **Tier 1, cranelift.** Warm functions are recompiled in the background and patched in
+      (change 6).
+    - **Tier 2, LLVM at full optimization**, using the profile the counters gathered (branch
+      weights, hot call sites), for hot functions.
+    - **On-stack replacement at loop headers**, so a long-running test moves to faster code
+      partway through.
+
+    No user picks a back end; the profile does, per function. Tiers change only optimization.
+    Overflow checks, debug assertions and `cfg` come from the chosen profile as under cargo, so
+    a correct program behaves the same at every tier.
+14. **Idle cores always work.** With no foreground request, the daemon spends idle cores, at
+    the lowest OS priority (`SCHED_IDLE`, background QoS on macOS) and under memory admission,
+    on:
+    - higher tiers for functions past runs showed hot, hottest first, stored by code hash and
+      profile, so the next run starts with them;
+    - the release build of what changed, so `blaze build --release` is usually already done;
+    - the dependency image (change 7) and global-cache fetches (change 8) for branches likely to
+      be built.
+
+    A foreground request preempts all of it at once. `blaze build` outputs stay whole,
+    ahead-of-time and byte-identical; tiering applies only to processes the daemon runs.
 
 ## Make blaze itself faster
 

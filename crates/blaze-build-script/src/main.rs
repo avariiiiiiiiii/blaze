@@ -9,6 +9,7 @@
 //! wrote the script and the script's path in `harness-real` beside it. It writes what cargo
 //! gave it to `harness-ran.json` beside `OUT_DIR` and becomes the script.
 
+#![forbid(unsafe_code)]
 #![allow(
     clippy::print_stdout,
     clippy::print_stderr,

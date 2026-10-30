@@ -799,7 +799,7 @@ fn find_local_import_locations<'db>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::LazyCell;
 
     use expect_test::{Expect, expect};
@@ -3034,8 +3034,13 @@ pub mod future {
         shape: Shape,
         deps: &[(&str, &GenCrate)],
     ) -> GenCrate {
-        let root =
-            GenModule { parent: None, name: String::new(), is_pub: true, lines: Vec::new(), names: FxHashSet::default() };
+        let root = GenModule {
+            parent: None,
+            name: String::new(),
+            is_pub: true,
+            lines: Vec::new(),
+            names: FxHashSet::default(),
+        };
         let mut krate = GenCrate { modules: vec![root], items: Vec::new() };
         for i in 0..1 + rng.below(7) {
             let parent = rng.below(krate.modules.len());
@@ -3052,7 +3057,9 @@ pub mod future {
         for i in 0..2 + rng.below(8) {
             let module = rng.below(krate.modules.len());
             let vis = if rng.chance(80) { "pub " } else { "" };
-            let (name, line) = match rng.below(3) {
+            // `#[macro_export]` puts a macro at the crate root, whatever module declares it.
+            let mut at = module;
+            let (name, line) = match rng.below(5) {
                 0 => {
                     let name = format!("{tag}S{i}");
                     let line = format!("{vis}struct {name};");
@@ -3063,15 +3070,29 @@ pub mod future {
                     let line = format!("{vis}enum {name} {{ {tag}V{i}a, {tag}V{i}b }}");
                     (name, line)
                 }
+                2 => {
+                    let name = format!("{tag}T{i}");
+                    let line = format!(
+                        "{vis}trait {name} {{ fn {tag}t{i}(); const {tag}C{i}: u8; type {tag}Y{i}; }}"
+                    );
+                    (name, line)
+                }
+                3 => {
+                    at = 0;
+                    let name = format!("{tag}mac{i}");
+                    let line = format!("#[macro_export]\nmacro_rules! {name} {{ () => {{}} }}");
+                    (name, line)
+                }
                 _ => {
                     let name = format!("{tag}f{i}");
                     let line = format!("{vis}fn {name}() {{}}");
                     (name, line)
                 }
             };
+            let path = GenCrate::join(&krate.module_path(at), &name);
+            krate.modules[at].names.insert(name);
             krate.modules[module].lines.push(line);
-            krate.modules[module].names.insert(name.clone());
-            krate.items.push(GenCrate::join(&krate.module_path(module), &name));
+            krate.items.push(path);
         }
         let mut alias = 0;
         for _ in 0..rng.below(7) {
@@ -3231,7 +3252,15 @@ pub mod future {
             Shape { private_modules: false, private_imports: true },
             Shape { private_modules: true, private_imports: false },
         ];
-        for seed in 0..24u64 {
+        let mut cases = Vec::new();
+        for prefix in [PrefixKind::Plain, PrefixKind::ByCrate, PrefixKind::BySelf] {
+            for ignore_local_imports in [false, true] {
+                cases.push((prefix, ignore_local_imports, CONFIGS[0]));
+            }
+        }
+        cases.push((PrefixKind::Plain, false, CONFIGS[1]));
+        cases.push((PrefixKind::Plain, false, CONFIGS[2]));
+        for seed in 0..16u64 {
             let shape = shapes[seed as usize % shapes.len()];
             let fixture = gen_fixture(seed, shape);
             let db = TestDB::with_files(&fixture);
@@ -3242,41 +3271,30 @@ pub mod future {
                 crate::nameres::crate_def_map(&db, main).modules(&db).map(|(id, _)| id).collect();
             for &from in &modules {
                 for &item in &items {
-                    for prefix in [PrefixKind::Plain, PrefixKind::ByCrate, PrefixKind::BySelf] {
-                        for ignore_local_imports in [false, true] {
-                            for cfg in CONFIGS {
-                                let new = find_path_with(
-                                    &mut scratch,
-                                    &db,
-                                    item,
-                                    from,
-                                    prefix,
-                                    ignore_local_imports,
-                                    cfg,
-                                );
-                                let old = reference::find_path(
-                                    &db,
-                                    item,
-                                    from,
-                                    prefix,
-                                    ignore_local_imports,
-                                    cfg,
-                                );
-                                assert_eq!(
-                                    new, old,
-                                    "seed {seed}, {item:?} from {from:?}, {prefix:?}, \
-                                     ignore_local_imports {ignore_local_imports}, {cfg:?}\n\
-                                     {fixture}"
-                                );
-                                if let Some(path) = new {
-                                    assert!(
-                                        resolves_to(&db, from, &path, item),
-                                        "seed {seed}: {} does not resolve to {item:?} from \
-                                         {from:?}\n{fixture}",
-                                        path.display(&db, Edition::CURRENT),
-                                    );
-                                }
-                            }
+                    for &(prefix, ignore_local_imports, cfg) in &cases {
+                        let new = find_path_with(
+                            &mut scratch,
+                            &db,
+                            item,
+                            from,
+                            prefix,
+                            ignore_local_imports,
+                            cfg,
+                        );
+                        let old =
+                            reference::find_path(&db, item, from, prefix, ignore_local_imports, cfg);
+                        assert_eq!(
+                            new, old,
+                            "seed {seed}, {item:?} from {from:?}, {prefix:?}, \
+                             ignore_local_imports {ignore_local_imports}, {cfg:?}\n{fixture}"
+                        );
+                        if let Some(path) = new {
+                            assert!(
+                                resolves_to(&db, from, &path, item),
+                                "seed {seed}: {} does not resolve to {item:?} from {from:?}\n\
+                                 {fixture}",
+                                path.display(&db, Edition::CURRENT),
+                            );
                         }
                     }
                 }

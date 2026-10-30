@@ -354,7 +354,7 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
             }
             let mut diag = Diag::lint(
                 "malformed_diagnostic_format_literals",
-                format!("there is no parameter `{param}` on trait `{name}`"),
+                format!("there is no parameter `{}` on trait `{name}`", printable(param, sink.cx.edition)),
                 sink.cx.span(at),
             );
             if !directive.is_rustc_attr {
@@ -424,8 +424,8 @@ fn unknown_params(sink: &mut Sink<'_, '_, '_>, directive: &Directive, params: &[
         if params.iter().any(|it| it == param) || allowed.contains(&param) {
             return;
         }
-        let mut diag =
-            Diag::lint("malformed_diagnostic_format_literals", format!("unknown parameter `{param}`"), sink.cx.span(at));
+        let message = format!("unknown parameter `{}`", printable(param, sink.cx.edition));
+        let mut diag = Diag::lint("malformed_diagnostic_format_literals", message, sink.cx.span(at));
         diag.help(help);
         sink.checked(diag);
     });

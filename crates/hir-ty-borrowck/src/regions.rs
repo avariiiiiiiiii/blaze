@@ -6235,8 +6235,11 @@ impl<'db> Builder<'_, '_, 'db> {
                     .collect();
                 let pairs = constraint_pairs(
                     interner,
-                    &inner.unwrap_region_constraints().region_constraint_data().constraints
-                        [constraints_before..],
+                    inner
+                        .unwrap_region_constraints()
+                        .region_constraint_data()
+                        .constraints
+                        .iter_from(constraints_before),
                 );
                 (pairs, obligations)
             }
@@ -6436,19 +6439,11 @@ impl Universes {
 /// `a <= b` for each of `constraints`: `b` outlives `a`.
 fn constraint_pairs<'db>(
     interner: hir_ty::next_solver::DbInterner<'db>,
-    constraints: &[hir_ty::next_solver::infer::region_constraints::Constraint<'db>],
+    constraints: impl IntoIterator<
+        Item = hir_ty::next_solver::infer::region_constraints::Constraint<'db>,
+    >,
 ) -> Vec<(Region<'db>, Region<'db>)> {
-    use hir_ty::next_solver::infer::region_constraints::Constraint;
-    let var = |vid: rustc_type_ir::RegionVid| Region::new_var(interner, vid);
-    constraints
-        .iter()
-        .map(|constraint| match *constraint {
-            Constraint::VarSubVar(a, b) => (var(a), var(b)),
-            Constraint::RegSubVar(a, b) => (a, var(b)),
-            Constraint::VarSubReg(a, b) => (var(a), b),
-            Constraint::RegSubReg(a, b) => (a, b),
-        })
-        .collect()
+    constraints.into_iter().map(|constraint| constraint.regions(interner)).collect()
 }
 
 /// Proves `trait_ref`, whose region variables are the first `vars`, in `env`, as rustc's
@@ -6494,7 +6489,7 @@ fn prove_query(
     let obligations: Vec<_> =
         inner.region_obligations().iter().map(|it| (it.sup_type, it.sub_region)).collect();
     let mut constraints = inner.unwrap_region_constraints();
-    let pairs = constraint_pairs(interner, &constraints.region_constraint_data().constraints);
+    let pairs = constraint_pairs(interner, constraints.region_constraint_data().constraints.iter());
     let mut universes = 0;
     let mut in_universe = FxHashMap::default();
     let mut resolved = false;
@@ -7171,8 +7166,9 @@ fn normalize_full<'db>(
                 .borrow_mut()
                 .unwrap_region_constraints()
                 .region_constraint_data()
-                .constraints[constraints_before..]
-                .to_vec();
+                .constraints
+                .iter_from(constraints_before)
+                .collect::<Vec<_>>();
             (normalized, constraints)
         }
     };
@@ -7356,7 +7352,7 @@ fn normalize_query(
     }
     let mut inner = infcx.inner.borrow_mut();
     let mut constraints = inner.unwrap_region_constraints();
-    let pairs = constraint_pairs(interner, &constraints.region_constraint_data().constraints);
+    let pairs = constraint_pairs(interner, constraints.region_constraint_data().constraints.iter());
     let mut own = |region: Region<'_>| match region.kind() {
         RegionKind::RePlaceholder(_) => false,
         RegionKind::ReVar(vid) => {

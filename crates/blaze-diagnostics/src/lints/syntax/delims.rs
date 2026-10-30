@@ -36,7 +36,7 @@ use crate::{
 const MACRO_DEPTH: usize = 128;
 
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut check = Check { cx, walk, here: None, call: CallMemo::default(), emitted: Vec::new() };
+    let mut check = Check { cx, walk, here: None, call: CallMemo::default(), last: None, emitted: Vec::new() };
     for tree in &walk.trees {
         check.here = Some(tree);
         for node in &tree.nodes {
@@ -120,18 +120,18 @@ impl Ctx {
 
 /// What rustc's `check_unused_delims_expr` is told of a value: where it is, whether a block
 /// follows it, where the keyword before it ends and the block after it starts (`left_pos`,
-/// `right_pos`, made spans only when a lint is emitted), and whether a keyword is before it
-/// (`is_kw`).
+/// `right_pos`: offsets in the file of the expression checked, made spans only when a lint is
+/// emitted), and whether a keyword is before it (`is_kw`).
 #[derive(Clone, Copy)]
 struct Site {
     ctx: Ctx,
     followed_by_block: bool,
-    left: Option<InFile<TextSize>>,
-    right: Option<InFile<TextSize>>,
+    left: Option<TextSize>,
+    right: Option<TextSize>,
     is_kw: bool,
 }
 
-const _: () = assert!(size_of::<Lint>() == 1 && size_of::<Ctx>() == 1 && size_of::<Site>() <= 32);
+const _: () = assert!(size_of::<Lint>() == 1 && size_of::<Ctx>() == 1 && size_of::<Site>() == 20);
 
 impl Site {
     fn of(ctx: Ctx) -> Site {
@@ -171,6 +171,9 @@ struct Check<'c, 'a, 'db, 'w> {
     /// The tree being walked, whose `cfg` facts answer [`Check::kept`] without a lookup.
     here: Option<&'c Tree>,
     call: CallMemo,
+    /// The last macro call in a value position and what it expands to: both lints check the
+    /// same values in turn, so the second finds the first's expansion here.
+    last: Option<(SyntaxNode, InFile<ast::Expr>)>,
     emitted: Vec<Emitted>,
 }
 
@@ -315,15 +318,14 @@ impl Check<'_, '_, '_, '_> {
 
     /// `UnusedDelimLint::check_expr`: the value of an expression that takes one.
     fn delim_expr(&mut self, lint: Lint, e: &ast::Expr, file: HirFileId, at: At) {
-        let pos = |offset: TextSize| InFile::new(file, offset);
         let (value, site) = match e {
             ast::Expr::IfExpr(it) => {
                 let Some(cond) = it.condition() else { return };
                 if matches!(cond, ast::Expr::LetExpr(_)) && !lint.in_pattern_matching() {
                     return;
                 }
-                let left = it.if_token().map(|it| pos(it.text_range().start() + TextSize::from(2)));
-                let right = it.then_branch().map(|it| pos(it.syntax().text_range().start()));
+                let left = it.if_token().map(|it| it.text_range().start() + TextSize::from(2));
+                let right = it.then_branch().map(|it| it.syntax().text_range().start());
                 (cond, Site { ctx: Ctx::IfCond, followed_by_block: true, left, right, is_kw: true })
             }
             ast::Expr::WhileExpr(it) => {
@@ -335,24 +337,24 @@ impl Check<'_, '_, '_, '_> {
                     .label()
                     .map(|it| it.syntax().text_range().start())
                     .or_else(|| it.while_token().map(|it| it.text_range().start()));
-                let left = start.map(|it| pos(it + TextSize::from(5)));
-                let right = it.loop_body().map(|it| pos(it.syntax().text_range().start()));
+                let left = start.map(|it| it + TextSize::from(5));
+                let right = it.loop_body().map(|it| it.syntax().text_range().start());
                 (cond, Site { ctx: Ctx::WhileCond, followed_by_block: true, left, right, is_kw: true })
             }
             ast::Expr::ForExpr(it) => {
                 let Some(iter) = it.iterable() else { return };
-                let right = it.loop_body().map(|it| pos(it.syntax().text_range().start()));
+                let right = it.loop_body().map(|it| it.syntax().text_range().start());
                 (iter, Site { ctx: Ctx::ForIterExpr, followed_by_block: true, left: None, right, is_kw: true })
             }
             ast::Expr::MatchExpr(it) if lint.in_pattern_matching() => {
                 let Some(head) = it.expr() else { return };
-                let left = it.match_token().map(|it| pos(it.text_range().start() + TextSize::from(5)));
+                let left = it.match_token().map(|it| it.text_range().start() + TextSize::from(5));
                 let site = Site { ctx: Ctx::MatchScrutineeExpr, followed_by_block: true, left, right: None, is_kw: true };
                 (head, site)
             }
             ast::Expr::ReturnExpr(it) => {
                 let Some(value) = it.expr() else { return };
-                let left = it.return_token().map(|it| pos(it.text_range().start() + TextSize::from(3)));
+                let left = it.return_token().map(|it| it.text_range().start() + TextSize::from(3));
                 (value, Site { left, is_kw: true, ..Site::of(Ctx::ReturnValue) })
             }
             ast::Expr::BreakExpr(it) => {
@@ -475,7 +477,8 @@ impl Check<'_, '_, '_, '_> {
         if !matches!(value, ast::Expr::ParenExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)) {
             return;
         }
-        let InFile { file_id: file, value } = expanded_in(self.cx, file, value.clone());
+        let site_file = file;
+        let InFile { file_id: file, value } = self.expand(file, value);
         match value {
             ast::Expr::ParenExpr(paren) => {
                 let Some(inner) = paren.expr() else { return };
@@ -492,7 +495,7 @@ impl Check<'_, '_, '_, '_> {
                 else {
                     return;
                 };
-                self.emit_value(Lint::Parens, delimited, site, at);
+                self.emit_value(Lint::Parens, delimited, site, site_file, at);
             }
             ast::Expr::LetExpr(it) => {
                 if let Some(scrutinee) = it.expr() {
@@ -510,7 +513,8 @@ impl Check<'_, '_, '_, '_> {
         if !matches!(value, ast::Expr::BlockExpr(_) | ast::Expr::LetExpr(_) | ast::Expr::MacroExpr(_)) {
             return;
         }
-        let InFile { file_id: file, value } = expanded_in(self.cx, file, value.clone());
+        let site_file = file;
+        let InFile { file_id: file, value } = self.expand(file, value);
         match value {
             ast::Expr::BlockExpr(block) if site.ctx != Ctx::ClosureBody && precedence::is_plain_block(&block) => {
                 let Some(list) = block.stmt_list() else { return };
@@ -536,7 +540,7 @@ impl Check<'_, '_, '_, '_> {
                 if self.cx.snippet(&delimited.value).is_none_or(|it| it.contains('\n')) {
                     return;
                 }
-                self.emit_value(Lint::Braces, delimited, site, at);
+                self.emit_value(Lint::Braces, delimited, site, site_file, at);
             }
             ast::Expr::LetExpr(it) => {
                 if let Some(scrutinee) = it.expr() {
@@ -546,6 +550,19 @@ impl Check<'_, '_, '_, '_> {
             }
             _ => {}
         }
+    }
+
+    /// [`expanded_in`] of a value of `file`, through [`Check::last`] for a macro call.
+    fn expand(&mut self, file: HirFileId, value: &ast::Expr) -> InFile<ast::Expr> {
+        let ast::Expr::MacroExpr(call) = value else { return InFile::new(file, value.clone()) };
+        if let Some((node, expansion)) = &self.last
+            && node == call.syntax()
+        {
+            return expansion.clone();
+        }
+        let expansion = expanded_in(self.cx, file, value.clone());
+        self.last = Some((call.syntax().clone(), expansion.clone()));
+        expansion
     }
 
     /// The one statement of a block of `file` when it is an expression with no `;` (rustc's
@@ -884,10 +901,10 @@ impl Check<'_, '_, '_, '_> {
     }
 
     /// `emit_unused_delims_expr`: whether to keep a space where the keyword before the value
-    /// or the block after it touches it.
-    fn emit_value(&mut self, lint: Lint, delimited: Delimited, site: &Site, at: At) {
+    /// or the block after it touches it; `site`'s offsets are of `site_file`.
+    fn emit_value(&mut self, lint: Lint, delimited: Delimited, site: &Site, site_file: HirFileId, at: At) {
         let value = &delimited.value;
-        let span = |pos: InFile<TextSize>| self.cx.span(pos.map(TextRange::empty));
+        let span = |pos: TextSize| self.cx.span(InFile::new(site_file, TextRange::empty(pos)));
         let keep_space = (
             site.left.map(span).is_some_and(|it| it.file == value.file && it.lo >= value.lo),
             site.right.map(span).is_some_and(|it| it.file == value.file && it.lo <= value.hi),

@@ -21,9 +21,11 @@
 //! queueing behind it. A peer that lets more than 64 MiB queue (it stopped reading) is hung up
 //! on.
 
-use std::{collections::BTreeMap, fmt, net::SocketAddr};
+use std::{fmt, net::SocketAddr};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, FileName, Tag};
+use blaze_protocol::cbor;
+use rustc_hash::FxHashMap;
 
 use crate::{
     ApiError, Arrived, Envelope, LONGEST_REQUEST, Reply, Request, RequestRef, Response,
@@ -41,6 +43,8 @@ const MOST_QUEUED: usize = 64 << 20;
 const MOST_HELD: usize = LONGEST_REQUEST as usize + (1 << 20);
 /// How many tags the server uses, from [`Config::tags`].
 const TAGS: u64 = 1 << 32;
+/// The most bytes [`Server::line`] keeps between chunks; a longer chunk's buffer is dropped.
+const KEPT_LINE: usize = 1 << 20;
 
 #[derive(Clone)]
 pub struct Http {
@@ -70,12 +74,16 @@ pub struct Server {
     token: Option<String>,
     most_connections: usize,
     listeners: Vec<Listener>,
-    pending: BTreeMap<Tag, Pending>,
-    conns: BTreeMap<Conn, Connection>,
+    pending: FxHashMap<Tag, Pending>,
+    conns: FxHashMap<Conn, Connection>,
     failed: Option<String>,
     stopped: bool,
     /// What arrived, handed over at the end of the next [`Server::complete`].
     told: Vec<Arrived>,
+    /// Every reply is encoded with it, onto its connection's queue.
+    writer: cbor::Writer,
+    /// An HTTP chunk's content, put together before its size is known.
+    line: Vec<u8>,
 }
 
 impl fmt::Debug for Server {
@@ -121,7 +129,8 @@ struct Connection {
     reader: Reader,
     receiving: Option<Tag>,
     sending: Option<Tag>,
-    /// Bytes waiting for the send in flight.
+    /// Bytes waiting for the send in flight; empty while none is in flight, so a reply is
+    /// encoded where it is sent from.
     queue: Vec<u8>,
     /// Hang up once everything queued is sent; nothing more is read.
     closing: bool,
@@ -150,11 +159,13 @@ impl Server {
             token: None,
             most_connections: config.most_connections,
             listeners: Vec::new(),
-            pending: BTreeMap::new(),
-            conns: BTreeMap::new(),
+            pending: FxHashMap::default(),
+            conns: FxHashMap::default(),
             failed: None,
             stopped: false,
             told: Vec::new(),
+            writer: cbor::Writer::new(),
+            line: Vec::new(),
         };
         if config.unix.is_none() && config.http.is_none() {
             server.fail("the API server was given no address to listen on".to_owned());
@@ -205,27 +216,26 @@ impl Server {
     pub fn reply(&mut self, reply: Reply, effects: &mut Vec<Effect>) {
         let RequestRef { conn, id } = reply.to;
         let Some(connection) = self.conns.get_mut(&conn) else { return };
-        if connection.closing {
+        let Connection { reader, queue, closing, .. } = connection;
+        if *closing {
             return;
         }
-        let bytes = match &mut connection.reader {
-            Reader::Unix(_) => frame(id, reply.response),
+        match reader {
+            Reader::Unix(_) => frame(&mut self.writer, queue, id, &reply.response),
             Reader::Http { answering, .. } => {
                 let Some(now) = *answering else { return };
                 if now.id != id {
                     return;
                 }
-                let done = matches!(reply.response, Response::Done { .. });
-                let mut bytes = rendered(id, reply.response, now.json);
-                if done {
-                    bytes.extend(http::last_chunk());
+                rendered(&mut self.writer, &mut self.line, queue, id, &reply.response, now.json);
+                if matches!(reply.response, Response::Done { .. }) {
+                    queue.extend_from_slice(http::LAST_CHUNK);
                     *answering = None;
-                    connection.closing = now.close;
+                    *closing = now.close;
                 }
-                bytes
             }
-        };
-        self.queue(conn, bytes, effects);
+        }
+        self.flush(conn, effects);
     }
 
     /// Unlistens and hangs up every connection.
@@ -237,7 +247,8 @@ impl Server {
                 effects.push(Effect::Unlisten { tag: listener.tag });
             }
         }
-        let conns: Vec<Conn> = self.conns.keys().copied().collect();
+        let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
+        conns.sort_unstable();
         for conn in conns {
             self.gone(conn, effects);
         }
@@ -340,11 +351,11 @@ impl Server {
         }
         match &mut connection.reader {
             Reader::Unix(frames) => {
-                frames.push(&bytes);
+                frames.push_vec(bytes);
                 self.unix_items(conn, effects);
             }
             Reader::Http { parser, .. } => {
-                parser.push(&bytes);
+                parser.push_vec(bytes);
                 self.http_requests(conn, effects);
             }
         }
@@ -402,9 +413,11 @@ impl Server {
     /// Answers an item that is no request of this schema, as its request would end.
     fn refuse(&mut self, conn: Conn, refused: Refused, effects: &mut Vec<Effect>) {
         let id = refused.id.unwrap_or(0);
-        let mut bytes = frame(id, Response::Error(refused.error));
-        bytes.extend(frame(id, Response::Done { ok: false }));
-        self.queue(conn, bytes, effects);
+        let Some(connection) = self.conns.get_mut(&conn) else { return };
+        for response in [Response::Error(refused.error), Response::Done { ok: false }] {
+            frame(&mut self.writer, &mut connection.queue, id, &response);
+        }
+        self.flush(conn, effects);
     }
 
     /// The whole requests an HTTP connection has sent, while none is being answered.
@@ -423,7 +436,7 @@ impl Server {
                 Ok(None) => return,
                 Err(error) => {
                     let bytes = plain(error.status, &[("Connection", "close")], &error.what);
-                    self.queue(conn, bytes, effects);
+                    self.queue(conn, &bytes, effects);
                     self.close(conn);
                     return;
                 }
@@ -450,7 +463,7 @@ impl Server {
             None
         };
         if let Some(bytes) = refusal {
-            self.queue(conn, bytes, effects);
+            self.queue(conn, &bytes, effects);
             if close {
                 self.close(conn);
             }
@@ -460,26 +473,28 @@ impl Server {
             .header("Accept")
             .is_some_and(|accept| media_is(Some(accept), &["application/json", "application/x-ndjson"]));
         let kind = if json { "application/x-ndjson" } else { "application/cbor" };
-        let mut bytes = http::chunked(200, &[("Content-Type", kind)]);
+        let Some(Connection { reader: Reader::Http { answering, .. }, queue, .. }) =
+            self.conns.get_mut(&conn)
+        else {
+            return;
+        };
+        http::chunked_into(queue, 200, &[("Content-Type", kind)]);
         match frames::decode::<Request>(&request.body) {
             Ok(envelope) => {
-                if let Some(Connection { reader: Reader::Http { answering, .. }, .. }) =
-                    self.conns.get_mut(&conn)
-                {
-                    *answering = Some(Answering { id: envelope.id, json, close });
-                }
+                *answering = Some(Answering { id: envelope.id, json, close });
                 self.told.push(Arrived::Request {
                     from: RequestRef { conn, id: envelope.id },
                     request: envelope.body,
                 });
-                self.queue(conn, bytes, effects);
+                self.flush(conn, effects);
             }
             Err(refused) => {
                 let id = refused.id.unwrap_or(0);
-                bytes.extend(rendered(id, Response::Error(refused.error), json));
-                bytes.extend(rendered(id, Response::Done { ok: false }, json));
-                bytes.extend(http::last_chunk());
-                self.queue(conn, bytes, effects);
+                for response in [Response::Error(refused.error), Response::Done { ok: false }] {
+                    rendered(&mut self.writer, &mut self.line, queue, id, &response, json);
+                }
+                queue.extend_from_slice(http::LAST_CHUNK);
+                self.flush(conn, effects);
                 if close {
                     self.close(conn);
                 }
@@ -487,16 +502,25 @@ impl Server {
         }
     }
 
-    /// Sends `bytes` now, or after the send in flight; a peer with too much queued is hung up
-    /// on.
-    fn queue(&mut self, conn: Conn, bytes: Vec<u8>, effects: &mut Vec<Effect>) {
+    /// Sends `bytes` now, or after the send in flight.
+    fn queue(&mut self, conn: Conn, bytes: &[u8], effects: &mut Vec<Effect>) {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
-        if connection.sending.is_none() {
-            return self.send(conn, bytes, effects);
-        }
-        connection.queue.extend(bytes);
-        if connection.queue.len() > MOST_QUEUED {
-            self.gone(conn, effects);
+        connection.queue.extend_from_slice(bytes);
+        self.flush(conn, effects);
+    }
+
+    /// Sends what is queued now when no send is in flight; else it waits for that send, and a
+    /// peer with too much waiting is hung up on.
+    fn flush(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
+        let Some(connection) = self.conns.get_mut(&conn) else { return };
+        let waiting = connection.queue.len();
+        match connection.sending {
+            None if waiting > 0 => {
+                let bytes = std::mem::take(&mut connection.queue);
+                self.send(conn, bytes, effects);
+            }
+            Some(_) if waiting > MOST_QUEUED => self.gone(conn, effects),
+            _ => {}
         }
     }
 

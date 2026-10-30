@@ -141,3 +141,66 @@ grows with every collection (nothing is unsound, it is just never freed until th
 every `Reader` are dropped). The contract is in `Vfs::reclaim`'s doc.
 
 > forwarded to cargo: the daemon's loop is `crates/blaze-cargo/src/serve/daemon.rs`, lane cargo's (after a `Vfs::collect` and at the task boundary the plane reports).
+
+## From speed-runtime-vfs: the node store, reclamation and the watcher's reads (2026-10-29)
+
+speed-runtime-vfs rebuilt `crates/blaze-vfs` for speed while this lane was done (notes:
+`docs/v2/plan/lanes/vfs/speed-runtime.md`). The hashes, the journal's bytes and the public
+`Vfs` API are unchanged; what changed for this lane:
+
+- **One store, no publish.** The tree and every `Reader` share one `store::Table` (append-only
+  chunked columns: IDs, 8-byte shapes, entry columns of `u32` name, `u32` node and a mode byte,
+  file bytes as `Arc<[u8]>`) with an open-addressed index on the ID's bits grown by a level.
+  The tree writes it and releases each node before anything names it, so `reader.rs`'s second
+  copy of every node (`Publisher`) is gone. A collection builds the next table and swaps it
+  in with one release store.
+- **Reclamation is the crate's own; item 9 is withdrawn.** The old table goes into a
+  `blaze_reclaim::Limbo` and is freed once every task that could be reading it has ended
+  (`blaze_reclaim::enter`, nested inside the task a plane worker already runs). `unsafe fn
+  Vfs::reclaim` and its caller contract are gone; commit, apply, flush and collect free what
+  has passed its grace. The daemon has nothing to call. Workspace dependency requested in
+  `v2/requests/speed.md`.
+- **Item 8 changes shape.** `Reader::file` returns `(ContentId, Mode, Arc<[u8]>)` owned (one
+  count, as the trait asks) and `Reader::list` an owned iterator; `Reader::pin()` gives a
+  `Pinned` whose `file` lends `File<'_>` (bytes in place, no count) and whose `list` lends
+  `&str`s, many reads under one task. When db holds a view's bytes as lent (item 8), it reads
+  through `Pinned`.
+- **Journal**: a failed append or sync is no longer retried from a kept copy of its bytes;
+  its tickets go back to the open batch and the next flush is a rewrite (atomic, holding
+  every commit), so an append moves its bytes and never clones them.
+- **Watcher**: a reported path's `Stat` and `ReadAll` are asked together (one round trip per
+  batch, not two); the read's bytes count only if the stat says a file, and a read the stat
+  made moot is dropped. A file read is compared with the head's bytes in place, not hashed.
+- **Fixed**: `apply` grouped changes by sorting paths as strings, so `a/x` and `a.b` split
+  `a`'s group and a delete of `a` with a write under it could lose the write. It now sorts by
+  component (test `a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling`).
+
+The exact edits for `docs/v2-vfs.md` (this lane's), so it stays true:
+
+1. Replace the bullet list under "**Readers on other threads**" (from "- The nodes are in an
+   append-only open-addressed table" through "- A node an open view, head or `keep` reaches
+   is never retired.") with:
+
+```
+  - The tree and every reader share one store: append-only columns in chunks that never move
+    (each node's ID and an 8-byte shape; each directory's entries as a `u32` name, a `u32`
+    node and a mode byte; each file's bytes as one `Arc<[u8]>`) and an open-addressed index
+    keyed by the content ID's bits, grown by adding a level.
+  - The `Vfs` is the only writer. It writes each node, children first, and releases it
+    before anything names it, so a node is readable before the call that gives its ID
+    returns. A read is in a task (`blaze_reclaim::enter`) and is acquire loads: an index
+    probe for the root and a binary search of a name column per component, no lock.
+    `file` returns the bytes' `Arc` with one count; `pin()` gives a `Pinned` that lends
+    them with none.
+  - A collection builds the next table and swaps it in with one release store; the old one
+    is freed once every task that could read it has ended (blaze-reclaim), or with the last
+    handle. A node an open view, head or `keep` reaches is kept.
+```
+
+2. In "## The journal", replace "A failed one is made again from the state then, which holds
+   every commit recorded since." with "A failed one, or a failed append or sync, is made
+   again as a rewrite from the state then, which holds every commit recorded since."
+
+3. In "## The disk as input", replace "Every path in it is stat-ed, and each file is then
+   read." with "Every path in it is stat-ed and read at once (one round trip); the read
+   counts only if the stat says a file."

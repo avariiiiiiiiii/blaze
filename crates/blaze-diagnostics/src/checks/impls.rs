@@ -20,7 +20,7 @@ mod compare;
 
 use blaze_items::{Fact, ItemId};
 use hir::HasSource as _;
-use hir_def::{BuiltinDeriveImplId, lang_item::lang_items};
+use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
 use syntax::{
     AstNode as _,
     ast::{HasAttrs as _, HasName as _},
@@ -90,24 +90,94 @@ pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
         }
     }
     let mut builtin = builtin::Builtin::new(cx);
+    let mut incoherent: Vec<hir::Trait> = Vec::new();
     for (trait_, of) in &traits {
+        let denied = denies_explicit_impls(cx, *trait_);
+        let mut coherent = true;
         for &index in of {
             let (impl_, origin) = &impls[index];
-            if let Origin::Written(at) = origin {
-                found.extend(explicit_impl(cx, at, *trait_));
-                if impl_.check_orphan_rules(db) {
-                    found.extend(trait_impl_orphan::report(cx, at));
-                }
-            }
-            found.extend(builtin.check(*impl_, origin, *trait_));
+            let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, *trait_, denied);
+            coherent &= !hir_error && !errors.iter().any(is_error);
+            found.extend(errors);
+        }
+        if !coherent {
+            incoherent.push(*trait_);
         }
     }
-    for (_, origin) in &impls {
+    for (impl_, origin) in &impls {
+        // rustc compares an impl's items with its trait's only when the trait is coherent
+        // (`check_item_type`).
+        if impl_.trait_(db).is_some_and(|it| incoherent.contains(&it)) {
+            continue;
+        }
         if let Origin::Written(at) = origin {
             found.extend(compare::check(cx, at));
         }
     }
     found
+}
+
+/// rustc's `coherent_trait` of `trait_`, as far as it is decided here (overlap is the front
+/// end's, `v2/requests/diagnostics.md`): whether no impl of it in the crate has an error of
+/// coherence, here or hir's (an orphan impl, an impl whose safety is not the trait's). When it
+/// has one, rustc checks no impl's items against the trait (E0046 and `compare_impl_item`).
+pub(crate) fn coherent(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
+    let denied = denies_explicit_impls(cx, trait_);
+    let mut builtin = builtin::Builtin::new(cx);
+    impls(cx).iter().filter(|(impl_, _)| impl_.trait_(cx.db) == Some(trait_)).all(|(impl_, origin)| {
+        let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, trait_, denied);
+        !hir_error && !errors.iter().any(is_error)
+    })
+}
+
+/// The coherence checks of one impl of `trait_` (`coherent_trait`'s loop): what is given here,
+/// and whether hir gives an error of it (an orphan impl, a safety that is not the trait's).
+fn coherence(
+    cx: &Cx<'_, '_>,
+    builtin: &mut builtin::Builtin<'_, '_, '_>,
+    impl_: hir::Impl,
+    origin: &Origin,
+    trait_: hir::Trait,
+    denied: bool,
+) -> (Vec<Found>, bool) {
+    let mut found = Vec::new();
+    let mut hir_error = false;
+    if let Origin::Written(at) = origin {
+        if denied {
+            found.extend(explicit_impl(cx, at, trait_));
+        }
+        hir_error |= incorrect_safety(cx, at, trait_);
+        if impl_.check_orphan_rules(cx.db) {
+            found.extend(trait_impl_orphan::report(cx, at));
+        } else {
+            hir_error = true;
+        }
+    }
+    found.extend(builtin.check(impl_, origin, trait_));
+    (found, hir_error)
+}
+
+/// Whether hir gives `TraitImplIncorrectSafety` of the impl (rustc's `unsafety::check_item`):
+/// the same rule as hir's (`crates/hir/src/diagnostics.rs`), so that both agree.
+fn incorrect_safety(cx: &Cx<'_, '_>, at: &ImplAt, trait_: hir::Trait) -> bool {
+    let db = cx.db;
+    let impl_unsafe = at.impl_.is_unsafe(db);
+    let negative = at.impl_.is_negative(db);
+    let trait_unsafe = trait_.is_unsafe(db);
+    let is_drop = lang_items(db, cx.krate.base()).Drop == Some(trait_.into());
+    let may_dangle = is_drop && {
+        let (lifetimes, types) = AttrFlags::query_generic_params(db, hir_def::GenericDefId::from(at.id));
+        lifetimes.values().chain(types.values()).any(|it| it.contains(AttrFlags::MAY_DANGLE))
+    };
+    match (impl_unsafe, trait_unsafe, negative, may_dangle) {
+        (true, _, true, _) | (true, false, _, false) => true,
+        (false, true, false, _) | (false, false, _, true) => true,
+        _ => false,
+    }
+}
+
+fn is_error(found: &Found) -> bool {
+    found.diag.is_error() && !found.diag.is_lint()
 }
 
 /// The impls of the crate, in rustc's order: each scope's (`defs::scopes`), as they are
@@ -135,17 +205,18 @@ fn impls(cx: &Cx<'_, '_>) -> Vec<(hir::Impl, Origin)> {
     all
 }
 
+/// Whether the trait is marked `#[rustc_deny_explicit_impl]`.
+fn denies_explicit_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
+    let Some(source) = trait_.source(cx.db) else { return false };
+    source.value.attrs().any(|attr| {
+        attr.path().and_then(|path| path.as_single_name_ref()).is_some_and(|name| name.text() == "rustc_deny_explicit_impl")
+    })
+}
+
 /// `enforce_trait_manually_implementable`: E0322 (E0328 for `Unsize`) for an impl of a trait
 /// marked `#[rustc_deny_explicit_impl]`.
 fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt, trait_: hir::Trait) -> Vec<Found> {
     let db = cx.db;
-    let Some(source) = trait_.source(db) else { return Vec::new() };
-    let denied = source.value.attrs().any(|attr| {
-        attr.path().and_then(|path| path.as_single_name_ref()).is_some_and(|name| name.text() == "rustc_deny_explicit_impl")
-    });
-    if !denied {
-        return Vec::new();
-    }
     let name = trait_.name(db);
     let name = name.as_str();
     let unsize = lang_items(db, cx.krate.base()).Unsize == Some(trait_.into());

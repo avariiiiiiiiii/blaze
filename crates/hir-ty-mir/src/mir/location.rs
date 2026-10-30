@@ -89,23 +89,64 @@ pub enum Placed {
 
 type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
 
-/// What the build calls each file, for a constant with `file!()` in its value. The evaluator
-/// has no build to ask.
-static SOURCE_PATHS: std::sync::RwLock<Option<std::sync::Arc<SourcePaths>>> =
-    std::sync::RwLock::new(None);
+/// How a build names files, told by [`name_sources`]. Two rules with the same `key` name every
+/// file the same: the key is all the rule depends on besides what it reads of the database.
+#[derive(Clone)]
+pub struct NamingRule {
+    key: Box<str>,
+    paths: std::sync::Arc<SourcePaths>,
+}
 
-/// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in blaze.
+impl std::fmt::Debug for NamingRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NamingRule").field(&self.key).finish()
+    }
+}
+
+/// What the build calls each file, for a constant with `file!()` in its value: the evaluator
+/// has no build to ask, and a constant's value depends on it, so it is an input.
+#[salsa::input(singleton, debug)]
+pub struct SourceNames {
+    #[returns(ref)]
+    pub rule: NamingRule,
+}
+
+/// Tells the evaluator of constants what the build calls each file: `Symbols::source_path` in
+/// blaze. `key` names everything `paths` depends on besides the database (the checkout and its
+/// base, say); telling the same key again changes nothing, so no constant is evaluated again.
 pub fn name_sources(
+    db: &mut dyn HirDatabase,
+    key: &str,
     paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
-    *SOURCE_PATHS.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(paths));
+    let rule = NamingRule { key: key.into(), paths: std::sync::Arc::new(paths) };
+    match SourceNames::try_get(db) {
+        Some(names) if names.rule(db).key == rule.key => {}
+        Some(names) => {
+            names.set_rule(db).with_durability(salsa::Durability::HIGH).to(rule);
+        }
+        None => {
+            _ = SourceNames::builder(rule).durability(salsa::Durability::HIGH).new(db);
+            // Reading a singleton that does not exist yet is not tracked: what read it before
+            // reported an untracked read (`file_source_path`), which a new revision makes stale.
+            db.synthetic_write(salsa::Durability::LOW);
+        }
+    }
 }
 
 /// What the build calls `file`, as `file!()` and `Location::file` say: none when the
 /// evaluator was not told ([`name_sources`]).
-pub fn source_path(db: &dyn HirDatabase, file: base_db::FileId) -> Option<String> {
-    let paths = SOURCE_PATHS.read().unwrap_or_else(|e| e.into_inner()).clone()?;
-    paths(db, file)
+pub fn source_path<'db>(db: &'db dyn HirDatabase, file: base_db::FileId) -> Option<&'db str> {
+    file_source_path(db, db.file_text(file))
+}
+
+#[salsa::tracked(returns(as_deref))]
+fn file_source_path<'db>(db: &'db dyn HirDatabase, file: base_db::FileText) -> Option<String> {
+    let Some(names) = SourceNames::try_get(db) else {
+        db.report_untracked_read();
+        return None;
+    };
+    (names.rule(db).paths)(db, file.file_id(db))
 }
 
 /// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
@@ -124,7 +165,7 @@ pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Optio
                     match expander {
                         BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
                         BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
-                        _ => text.push_str(&path(file)?),
+                        _ => text.push_str(path(file)?),
                     }
                 }
             }
@@ -139,7 +180,7 @@ pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Optio
     Some(match expander {
         BuiltinFnLikeExpander::Line => Placed::Number(line),
         BuiltinFnLikeExpander::Column => Placed::Number(col),
-        _ => Placed::Text(path(file)?),
+        _ => Placed::Text(path(file)?.to_owned()),
     })
 }
 

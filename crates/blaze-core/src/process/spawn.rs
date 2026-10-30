@@ -180,7 +180,9 @@ fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the call made both; each is owned once from here.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+    let read = unsafe { OwnedFd::from_raw_fd(ends[0]) };
+    // SAFETY: as above.
+    let write = unsafe { OwnedFd::from_raw_fd(ends[1]) };
     Ok((above_stdio(read)?, above_stdio(write)?))
 }
 
@@ -237,8 +239,10 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
     let top = stack.as_mut_ptr().wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child { plan, fds, procs, step: 0, failed: 0 };
     let mut pidfd: libc::c_int = -1;
-    // SAFETY: all zeros is a valid `sigset_t`; the calls fill them.
-    let (mut all, mut was): (libc::sigset_t, libc::sigset_t) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
+    // SAFETY: all zeros is a valid `sigset_t`; the calls below fill it.
+    let mut all: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let mut was: libc::sigset_t = unsafe { std::mem::zeroed() };
     // SAFETY: a `sigset_t` to fill.
     unsafe { libc::sigfillset(&mut all) };
     // Until the child has reset its handlers, a signal would run one of the daemon's on the
@@ -268,7 +272,9 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
     let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
     // SAFETY: written by the child, which has run its program or exited; volatile because the
     // compiler cannot see a write made through the pointer given to `clone`.
-    let (step, failed) = unsafe { (ptr::read_volatile(&raw const child.step), ptr::read_volatile(&raw const child.failed)) };
+    let step = unsafe { ptr::read_volatile(&raw const child.step) };
+    // SAFETY: as above.
+    let failed = unsafe { ptr::read_volatile(&raw const child.failed) };
     drop(stack);
     if step == 0 {
         return Ok((pid, pidfd));
@@ -292,14 +298,14 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
     // nothing else has it.
     let child = unsafe { &mut *arg.cast::<Child<'_>>() };
     let fail = |child: &mut Child<'_>, step: u8| -> ! {
-        // SAFETY: the calling thread's errno (shared with the waiting parent thread, whose
-        // TLS the child runs on), then the end of the child without running anything of the
-        // parent's.
-        unsafe {
-            child.failed = *libc::__errno_location();
-            child.step = step;
-            libc::_exit(127)
-        }
+        // SAFETY: the calling thread's errno, in the TLS the child shares with the waiting
+        // parent thread.
+        let errno = unsafe { libc::__errno_location() };
+        // SAFETY: as above; nothing else writes it until the parent runs again.
+        child.failed = unsafe { *errno };
+        child.step = step;
+        // SAFETY: the end of the child, running nothing of the parent's.
+        unsafe { libc::_exit(127) }
     };
     for signal in 1..65 {
         // SAFETY: all zeros is a valid `sigaction`; the call writes it.
@@ -319,12 +325,12 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
         // SAFETY: a `sigaction` to read.
         unsafe { libc::sigaction(signal, &default, ptr::null_mut()) };
     }
-    // SAFETY: a `sigset_t` emptied, then read.
-    unsafe {
-        let mut none: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut none);
-        libc::sigprocmask(libc::SIG_SETMASK, &none, ptr::null_mut());
-    }
+    // SAFETY: all zeros is a valid `sigset_t`.
+    let mut none: libc::sigset_t = unsafe { std::mem::zeroed() };
+    // SAFETY: a `sigset_t` to empty.
+    unsafe { libc::sigemptyset(&mut none) };
+    // SAFETY: a `sigset_t` to read.
+    unsafe { libc::sigprocmask(libc::SIG_SETMASK, &none, ptr::null_mut()) };
     for (target, fd) in (0..).zip(child.fds) {
         // SAFETY: an open descriptor past 2 onto one of 0, 1 and 2; the copy keeps no
         // close-on-exec.
@@ -379,17 +385,16 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
         }
         // SAFETY: made above; a NUL-terminated path kept until the spawn.
         check(unsafe { posix_spawn_file_actions_addchdir_np(&mut actions, plan.dir.as_ptr()) })?;
-        // SAFETY: `sigset_t`s emptied, then given SIGPIPE, which std ignores in the daemon and
-        // gives back to its children; the mask of the child is empty, as std's spawn makes it.
-        unsafe {
-            let mut defaults: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut defaults);
-            libc::sigaddset(&mut defaults, libc::SIGPIPE);
-            check(libc::posix_spawnattr_setsigdefault(&mut attr, &defaults))?;
-            let mut none: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut none);
-            check(libc::posix_spawnattr_setsigmask(&mut attr, &none))?;
-        }
+        // SIGPIPE, which std ignores in the daemon, back to its default in the child, and the
+        // child's mask empty, as std's spawn makes them. On macOS `sigset_t` is an integer.
+        let mut defaults: libc::sigset_t = 0;
+        // SAFETY: a `sigset_t` to fill.
+        unsafe { libc::sigaddset(&mut defaults, libc::SIGPIPE) };
+        // SAFETY: made above; a `sigset_t` to read.
+        check(unsafe { libc::posix_spawnattr_setsigdefault(&mut attr, &defaults) })?;
+        let none: libc::sigset_t = 0;
+        // SAFETY: as above.
+        check(unsafe { libc::posix_spawnattr_setsigmask(&mut attr, &none) })?;
         let flags = CLOEXEC_DEFAULT
             | libc::POSIX_SPAWN_SETSIGDEF as libc::c_short
             | libc::POSIX_SPAWN_SETSIGMASK as libc::c_short;
@@ -410,10 +415,9 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
         })?;
         Ok(pid)
     })();
-    // SAFETY: both made above, destroyed once.
-    unsafe {
-        libc::posix_spawnattr_destroy(&mut attr);
-        libc::posix_spawn_file_actions_destroy(&mut actions);
-    }
+    // SAFETY: made above, destroyed once.
+    unsafe { libc::posix_spawnattr_destroy(&mut attr) };
+    // SAFETY: as above.
+    unsafe { libc::posix_spawn_file_actions_destroy(&mut actions) };
     spawned
 }

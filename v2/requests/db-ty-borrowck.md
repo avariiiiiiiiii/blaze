@@ -110,6 +110,8 @@ fn in_order() {
 backticks of E0382's name, say), the fixture is right and the checker is wrong: say so here
 rather than change the expectation.
 
+> forwarded to db: `crates/hir/src/tests.rs` is lane db's.
+
 ## 2. db (lane notes): name the borrow checker's techniques in `docs/v2/plan/lanes/db/`
 
 What: a paragraph in the db lane notes (a new `borrowck.md` there, or the notes the lane keeps
@@ -135,3 +137,5 @@ for `hir-ty`), the state-of-the-art rule's "name it in your lane notes" for
 
 Why: the coordinator's state-of-the-art rule asks every lane to name the fastest known
 technique for its part in its lane notes.
+
+> forwarded to db: `docs/v2/plan/lanes/db/` is lane db's notes folder.

@@ -21,7 +21,7 @@ use hir_ty::db::HirDatabase;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Job, artifact, checks_only,
+    Job, artifact, checks_only, graph,
     codegen::{self, Makes},
     files::{Mounted, Names},
     say, script,
@@ -54,25 +54,107 @@ pub(crate) struct TestOf {
     pub(crate) reached: Vec<CodeHash>,
 }
 
-/// A unit's result as the store keeps it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+/// A unit's result as the store keeps it, after the [`header`]: what a replay gives back.
+#[derive(Deserialize)]
 struct Record {
     ok: bool,
     diagnostics: Vec<Diagnostic>,
     outputs: Vec<(String, Key, bool)>,
     artifact: Option<Artifact>,
     made: Made,
-    /// Every native input the link read off the machine, by path, with its content: a unit
-    /// whose system library changed is not fresh.
-    natives: Vec<(String, ContentId)>,
+}
+
+/// [`Record`] as it is written, borrowing what the compile made rather than copying it.
+#[derive(Serialize)]
+struct RecordRef<'a> {
+    ok: bool,
+    diagnostics: &'a [Diagnostic],
+    outputs: Vec<(&'a str, Key, bool)>,
+    artifact: Option<&'a Artifact>,
+    made: &'a Made,
 }
 
 const RECORD: &str = "blaze v2 cargo unit record 1";
 const OUTPUT: &str = "blaze v2 cargo output 1";
-const NATIVE: &str = "blaze v2 native input 1";
+
+/// The record's fixed header, which `fresh` reads where the store has it, allocating nothing:
+/// `MAGIC`, the count of outputs and of native inputs (`u32` LE each), each output's key
+/// (32 bytes), then each native input's BLAKE3 hash (32 bytes), its path's length (`u32` LE)
+/// and its path. The CBOR of [`Record`] follows.
+mod header {
+    pub(super) const MAGIC: &[u8; 4] = b"BZU1";
+
+    pub(super) fn write(out: &mut Vec<u8>, outputs: &[blaze_cas::Key], natives: &[(String, blaze_ids::ContentId)]) {
+        let paths: usize = natives.iter().map(|it| it.0.len()).sum();
+        out.reserve(12 + 32 * outputs.len() + 36 * natives.len() + paths);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(natives.len() as u32).to_le_bytes());
+        for key in outputs {
+            out.extend_from_slice(&key.0.0);
+        }
+        for (path, hash) in natives {
+            out.extend_from_slice(&hash.0);
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(path.as_bytes());
+        }
+    }
+
+    fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+        let (head, rest) = bytes.split_at_checked(len)?;
+        *bytes = rest;
+        Some(head)
+    }
+
+    fn count(bytes: &mut &[u8]) -> Option<usize> {
+        Some(u32::from_le_bytes(take(bytes, 4)?.try_into().ok()?) as usize)
+    }
+
+    /// Whether every output is in the store and every native input is as it was, and where the
+    /// CBOR body starts; `None` for a record that is not, or a header that is cut short.
+    pub(super) fn check(
+        mut bytes: &[u8],
+        has: impl Fn(&blaze_cas::Key) -> bool,
+        file: &mut impl FnMut(&std::path::Path) -> Option<[u8; 32]>,
+    ) -> Option<usize> {
+        let whole = bytes.len();
+        if take(&mut bytes, 4)? != MAGIC {
+            return None;
+        }
+        let outputs = count(&mut bytes)?;
+        let natives = count(&mut bytes)?;
+        for _ in 0..outputs {
+            let key = blaze_cas::Key(blaze_ids::ContentId(take(&mut bytes, 32)?.try_into().ok()?));
+            if !has(&key) {
+                return None;
+            }
+        }
+        for _ in 0..natives {
+            let hash: [u8; 32] = take(&mut bytes, 32)?.try_into().ok()?;
+            let len = count(&mut bytes)?;
+            let path = std::str::from_utf8(take(&mut bytes, len)?).ok()?;
+            if file(std::path::Path::new(path))? != hash {
+                return None;
+            }
+        }
+        Some(whole - bytes.len())
+    }
+}
 
 /// The key of `unit`'s record: none while the front end can't say what the unit's inputs are.
+/// Worked out once per job and unit.
 fn record_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
+    if let Some(key) = job.keys.get(unit).and_then(|it| it.get()) {
+        return Ok(*key);
+    }
+    let key = work_out_key(job, unit)?;
+    if let Some(slot) = job.keys.get(unit) {
+        let _ = slot.set(key);
+    }
+    Ok(key)
+}
+
+fn work_out_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
     let Some(identity) = job.lowered.identity(unit) else { return Ok(None) };
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
@@ -100,31 +182,39 @@ fn cbor<T: Serialize>(value: &T, what: &str, unit: usize) -> Result<Vec<u8>, Api
         .map_err(|why| ApiError::new(format!("encoding the {what} of unit {unit}: {why}"), None))
 }
 
+/// The machine's files as the process's table of them by `stat` hashes them: one `stat` for a
+/// file hashed before, read only when its `stat` changed.
+fn machine_file(disk: &mut blaze_usercode::inputs::Disk) -> impl FnMut(&std::path::Path) -> Option<[u8; 32]> + '_ {
+    move |path| blaze_usercode::trace::Inputs::file(disk, path).ok().flatten()
+}
+
+/// Whether nothing of `unit` will be made again: its record and all it wrote are in the store,
+/// and every native input it linked is as it was. Read in place: no decode, no allocation.
+pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
+    let Ok(Some(key)) = record_key(job, unit) else { return false };
+    let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
+    let Ok(Some(entry)) = store.get(&key) else { return false };
+    let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
+    header::check(entry.bytes, |key| store.has(key), &mut machine_file(&mut disk)).is_some()
+}
+
 /// The record of `unit` the store has, every output and native input of it as it was.
 fn kept(job: &Job, unit: usize) -> Option<Record> {
     let key = record_key(job, unit).ok()??;
     let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
     let entry = store.get(&key).ok()??;
-    let record: Record = blaze_protocol::cbor::from_slice(entry.bytes).ok()?;
-    if !record.outputs.iter().all(|(_, key, _)| store.has(key)) {
-        return None;
-    }
-    let same = |(path, id): &(String, ContentId)| {
-        std::fs::read(path).is_ok_and(|bytes| ContentId::of(NATIVE, &bytes) == *id)
-    };
-    record.natives.iter().all(same).then_some(record)
-}
-
-/// Whether nothing of `unit` will be made again: its record and all it wrote are in the store.
-pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
-    kept(job, unit).is_some()
+    let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
+    let body = header::check(entry.bytes, |key| store.has(key), &mut machine_file(&mut disk))?;
+    blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()
 }
 
 /// `unit` checked and, unless it is a check, compiled and linked.
 pub(crate) fn compile(job: &Job, unit: usize) -> Result<Compiled, Failed> {
     if let Some(record) = kept(job, unit) {
         let artifact = record.artifact.map(|it| Artifact { fresh: true, ..it });
-        job.made.lock().unwrap_or_else(|it| it.into_inner()).insert(unit, record.made);
+        if let Some(slot) = job.made.get(unit) {
+            let _ = slot.set(record.made);
+        }
         return Ok(Compiled {
             diagnostics: record.diagnostics,
             ok: record.ok,
@@ -139,20 +229,24 @@ pub(crate) fn compile(job: &Job, unit: usize) -> Result<Compiled, Failed> {
     }
     let made = make(job, unit)?;
     let key = record_key(job, unit)?;
-    let Made2 { compiled, made, natives } = made;
-    job.made.lock().unwrap_or_else(|it| it.into_inner()).insert(unit, made.clone());
-    let mut compiled = compiled;
+    let Made2 { mut compiled, made, natives } = made;
     if let Some(key) = key {
-        let record = Record {
+        let record = RecordRef {
             ok: compiled.ok,
-            diagnostics: compiled.diagnostics.clone(),
-            outputs: compiled.outputs.iter().map(|it| (it.path.clone(), it.key, it.executable)).collect(),
-            artifact: compiled.artifact.clone(),
-            made,
-            natives,
+            diagnostics: &compiled.diagnostics,
+            outputs: compiled.outputs.iter().map(|it| (it.path.as_str(), it.key, it.executable)).collect(),
+            artifact: compiled.artifact.as_ref(),
+            made: &made,
         };
-        let bytes = cbor(&record, "record", unit)?;
+        let keys: Vec<Key> = compiled.outputs.iter().map(|it| it.key).collect();
+        let mut bytes = Vec::new();
+        header::write(&mut bytes, &keys, &natives);
+        blaze_protocol::cbor::append(&mut bytes, &record)
+            .map_err(|why| ApiError::new(format!("encoding the record of unit {unit}: {why}"), None))?;
         compiled.puts.push(Put { key, kind: Kind::Query, bytes });
+    }
+    if let Some(slot) = job.made.get(unit) {
+        let _ = slot.set(made);
     }
     Ok(compiled)
 }
@@ -274,7 +368,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
                 return Ok(nothing(diagnostics, false, made));
             }
         };
-        let generated = match codegen::generate(job, unit, &makes, &mounted)
+        let mut generated = match codegen::generate(job, unit, &makes, &mounted)
             .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
         {
             Ok(it) => it,
@@ -287,7 +381,9 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
         if job.cancelled() {
             return Err(Failed::Again);
         }
-        puts.extend(generated.built.puts.iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes.clone() }));
+        let built_puts = std::mem::take(&mut generated.built.puts);
+        puts.reserve(built_puts.len() + plan.outputs.len());
+        puts.extend(built_puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
         made.context = Some(context(&generated.policy));
         for test in &generated.roots.tests {
             let root = generated.built.roots.get(test.root).ok_or_else(|| {
@@ -322,25 +418,40 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
             }
         }
     }
+    // Each file's bytes go into the store once, moved, under their key; a copy cargo makes of
+    // one (`target/debug/foo` of `deps/foo-0123`) is the same key.
     let sources = crate_files(job, krate);
-    for path in &plan.outputs {
-        let bytes = if let Some((_, bytes, executable)) = files.iter().find(|it| it.0 == *path) {
-            Some((bytes.clone(), *executable))
-        } else if let Some(made) = files.iter().find(|it| artifact::uplifted(&it.0, plan) == Some(path.as_str())) {
-            Some((made.1.clone(), made.2))
-        } else if path.ends_with(".d") {
-            let main = files.first().map(|it| it.0.as_str());
-            Some((dep_info(path, plan, main, &sources, &mounted), false))
-        } else {
-            // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
-            // their line tables, and write none beside them.
-            None
-        };
-        let Some((bytes, executable)) = bytes else { continue };
+    let mut keyed: Vec<(String, Key, bool)> = Vec::with_capacity(files.len());
+    let mut output_keys: Vec<Key> = Vec::with_capacity(plan.outputs.len());
+    let mut put_output = |puts: &mut Vec<Put>, bytes: Vec<u8>| {
         let key = Key(ContentId::of(OUTPUT, &bytes));
-        if !puts.iter().any(|it: &Put| it.key == key) {
+        if !output_keys.contains(&key) {
+            output_keys.push(key);
             puts.push(Put { key, kind: Kind::Output, bytes });
         }
+        key
+    };
+    let main_file = files.first().map(|it| it.0.clone());
+    for (path, bytes, executable) in files {
+        let key = put_output(&mut puts, bytes);
+        keyed.push((path, key, executable));
+    }
+    outputs.reserve(plan.outputs.len());
+    for path in &plan.outputs {
+        let found = keyed
+            .iter()
+            .find(|it| it.0 == *path)
+            .or_else(|| keyed.iter().find(|it| artifact::uplifted(&it.0, plan) == Some(path.as_str())));
+        let (key, executable) = match found {
+            Some((_, key, executable)) => (*key, *executable),
+            None if path.ends_with(".d") => {
+                let text = dep_info(path, plan, main_file.as_deref(), &sources, &mounted);
+                (put_output(&mut puts, text.into_bytes()), false)
+            }
+            // Debug info beside an image (`.dSYM`, `.pdb`, `.dwp`): blaze's images carry
+            // their line tables, and write none beside them.
+            None => continue,
+        };
         outputs.push(Output { path: path.clone(), key, executable });
     }
     let main = artifact::main(u, plan);
@@ -353,36 +464,45 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
         (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))),
         _ => None,
     };
-    let natives = natives.into_iter().map(|(path, bytes): (String, Vec<u8>)| (path, ContentId::of(NATIVE, &bytes))).collect();
     Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact }, made, natives })
 }
 
 /// How `unit`'s program is run: its plan's runner, and cargo's variables of it, from the build
 /// scripts' runs it depends on (its package's script's `rustc-env`, every run's library search
-/// directories).
+/// directories). Worked out once per job and unit: the record's key and the artifact read it.
 fn runs(job: &Job, unit: usize) -> artifact::Runs {
+    if let Some(slot) = job.runs.get(unit) {
+        return slot.get_or_init(|| work_out_runs(job, unit)).clone();
+    }
+    artifact::Runs::default()
+}
+
+fn work_out_runs(job: &Job, unit: usize) -> artifact::Runs {
     let units = job.units();
     let Some(plan) = units.plans.get(unit) else { return artifact::Runs::default() };
-    let pkg_id = units.graph.units.get(unit).map(|it| it.pkg_id.as_str());
-    let scripts = job.scripts.lock().unwrap_or_else(|it| it.into_inner());
-    let mut own = Vec::new();
-    let mut native = Vec::new();
-    for at in codegen::closure(job, unit) {
-        let Some(applied) = scripts.get(&at) else { continue };
-        if Some(applied.package_id.as_str()) == pkg_id {
-            own = applied.output.env.clone();
+    let package = job.graph.package(unit as u32);
+    let mut own: &[(String, String)] = &[];
+    let mut native: Vec<String> = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    for at in job.graph.closure(unit as u32) {
+        if !job.graph.has(at, graph::flag::RUN) {
+            continue;
+        }
+        let Some(applied) = job.scripts[at as usize].get() else { continue };
+        if job.graph.package(at) == package {
+            own = &applied.output.env;
         }
         for path in &applied.output.library_paths {
-            let path = blaze_build_script::output::search_path_of(path.path()).to_string_lossy().into_owned();
-            if !native.contains(&path) {
-                native.push(path);
+            let path = blaze_build_script::output::search_path_of(path.path());
+            if seen.insert(path) {
+                native.push(path.to_string_lossy().into_owned());
             }
         }
     }
     let cargo = job.shared.launcher.to_string_lossy();
     artifact::Runs {
         runner: plan.runner.clone(),
-        env: artifact::run_env(plan, &cargo, &own, &native, std::env::consts::OS),
+        env: artifact::run_env(plan, &cargo, own, &native, std::env::consts::OS),
     }
 }
 

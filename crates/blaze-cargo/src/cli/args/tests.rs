@@ -90,6 +90,36 @@ fn test_names_its_filter_and_the_harness_args() {
 }
 
 #[test]
+fn ub_is_blazes_and_its_values_imply_it() {
+    let ub = cargo(&["test", "--ub", "parse", "--release"]);
+    assert!(ub.flags.ub);
+    assert_eq!((ub.flags.ub_seed, ub.flags.ub_schedules), (None, None));
+    assert_eq!(ub.args, ["parse", "--release"], "cargo never sees `--ub`");
+    let seeded = cargo(&["test", "--ub-seed", "42", "--ub-schedules=8"]);
+    assert!(seeded.flags.ub);
+    assert_eq!((seeded.flags.ub_seed, seeded.flags.ub_schedules), (Some(42), Some(8)));
+    assert!(seeded.args.is_empty());
+    assert!(!cargo(&["test"]).flags.ub, "opt-in");
+    assert!(parse(os(&["bench", "--ub"])).is_err());
+    assert!(parse(os(&["build", "--ub-seed", "1"])).is_err());
+}
+
+#[test]
+fn ub_values_clap_refuses() {
+    assert_eq!(
+        refused(&["test", "--ub-seed", "x1"]),
+        "error: invalid value 'x1' for '--ub-seed <N>': invalid digit found in string\n\nFor more information, \
+         try '--help'.\n"
+    );
+    assert_eq!(
+        refused(&["test", "--ub-schedules", "0"]),
+        "error: invalid value '0' for '--ub-schedules <K>': 0 is not in 1..=4294967295\n\nFor more information, \
+         try '--help'.\n"
+    );
+    assert!(parse(os(&["test", "--ub-seed"])).is_err());
+}
+
+#[test]
 fn run_has_the_rest() {
     let asked = cargo(&["run", "--release", "a", "--verbose", "--", "b"]);
     assert_eq!(asked.args, ["--release"]);

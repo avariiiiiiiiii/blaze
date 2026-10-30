@@ -4,13 +4,13 @@ use blaze_core::{
     Completion, Done, Driver, Effect, FileName, IoError, Meta, Tag,
     sim::{Faults, Rng, Sim},
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, Hasher};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Change, ChangeKind, CommitError, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket, View, Vfs,
-    Watched, Watcher,
-    tree::{NodeId, Tree},
+    Change, ChangeKind, CommitError, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket,
+    Vfs, View, Watched, Watcher,
+    tree::{DIR_MODE, NodeId, Tree},
 };
 
 fn write(path: &str, bytes: &str) -> Op {
@@ -244,8 +244,7 @@ fn diffs_are_in_path_order_by_component() {
 fn a_stale_transaction_rebases_or_names_the_conflict() {
     let mut vfs = new_vfs();
     assert_eq!(vfs.head("w"), None);
-    let base =
-        vfs.commit("w", vfs.empty(), &[write("a", "0123456789"), write("b", "b")]).unwrap();
+    let base = vfs.commit("w", vfs.empty(), &[write("a", "0123456789"), write("b", "b")]).unwrap();
     assert!(!base.rebased);
     let base = base.root;
 
@@ -401,28 +400,39 @@ fn collecting_keeps_what_is_reached() {
     assert_eq!(text(&vfs, next, "d0/f0").as_deref(), Some("new"));
 }
 
-/// Random transactions against a map from path to bytes.
+type Model = BTreeMap<String, (Mode, Vec<u8>)>;
+
+/// The old layout as a model: random transactions against a map from path to mode and bytes,
+/// with each root's ID hashed from the map alone, entry by entry, as the node table before the
+/// column store did. Paths with `-` and `.` sort between a name and the same name with `/`, so
+/// a component's changes are not one run of the sorted paths. Every few transactions a
+/// collection renumbers the table; diffs, the reader and IDs are checked against the model
+/// after each.
 #[test]
 fn transactions_match_a_model() {
-    const PATHS: &[&str] = &["a", "b", "d/a", "d/b", "d/e/a", "f/g/h"];
+    const PATHS: &[&str] =
+        &["a", "a.b", "a-c", "b", "d", "d/a", "d/b", "d.x", "d/e/a", "d/e.f", "f/g/h", "f-g"];
+    const DIRS: &[&str] = &["d", "d/e", "f", "f/g"];
     for seed in 0..300 {
         let mut rng = Rng::new(seed);
-        let mut tree = Tree::new();
-        let mut root = tree.empty();
-        let mut model: BTreeMap<String, (Mode, Vec<u8>)> = BTreeMap::new();
-        for _ in 0..40 {
+        let mut vfs = new_vfs();
+        let reader = vfs.reader();
+        let mut root = vfs.empty();
+        let mut model = Model::new();
+        let mut kept: Vec<(ContentId, Model)> = Vec::new();
+        for step in 0..40 {
             let mut ops = Vec::new();
             let mut next = model.clone();
-            for _ in 0..=rng.below(3) {
+            for _ in 0..=rng.below(4) {
                 let path = PATHS[rng.below(PATHS.len() as u64) as usize];
                 let bytes = format!("{seed}-{}", rng.below(1000)).into_bytes();
-                let op = match rng.below(3) {
-                    0 => {
-                        let mode = [Mode::Regular, Mode::Executable, Mode::Symlink]
-                            [rng.below(3) as usize];
+                let op = match rng.below(5) {
+                    0 | 1 => {
+                        let mode =
+                            [Mode::Regular, Mode::Executable, Mode::Symlink][rng.below(3) as usize];
                         Op::Write { path: path.into(), bytes, mode }
                     }
-                    1 => match next.get(path) {
+                    2 => match next.get(path) {
                         Some((_, old)) => {
                             let at = rng.below(old.len() as u64 + 1);
                             let len = rng.below(old.len() as u64 - at + 1);
@@ -430,29 +440,50 @@ fn transactions_match_a_model() {
                         }
                         None => continue,
                     },
-                    _ if next.contains_key(path) => delete(path),
-                    _ => continue,
+                    3 if rng.one_in(2) => delete(DIRS[rng.below(DIRS.len() as u64) as usize]),
+                    3 => delete(path),
+                    _ => match next.keys().nth(rng.below(next.len() as u64 + 1) as usize) {
+                        Some(from) => rename(from, path),
+                        None => continue,
+                    },
                 };
-                // The paths never put a file where a directory is.
+                // Only ops the tree takes: none puts a file where a directory is.
                 if !model_apply(&mut next, &op) {
                     continue;
                 }
                 ops.push(op);
             }
-            root = tree
+            let after = vfs
                 .apply(root, &ops)
                 .unwrap_or_else(|error| panic!("seed {seed}: {error} for {ops:?}"));
-            model = next;
-            assert_eq!(moded(&tree, root), model, "seed {seed}");
+            assert_eq!(after, model_id(&next), "seed {seed}: the root's ID for {ops:?}");
+            let paths: Vec<String> = vfs.diff(root, after).into_iter().map(|it| it.path).collect();
+            assert_eq!(paths, model_diff(&model, &next), "seed {seed}: the diff of {ops:?}");
+            (root, model) = (after, next);
+            assert_eq!(moded(&vfs.tree, vfs.root(root).unwrap()), model, "seed {seed}");
+            for (path, (mode, bytes)) in &model {
+                let read = reader.file(root, path).map(|(_, mode, bytes)| (mode, bytes.to_vec()));
+                assert_eq!(read, Some((*mode, bytes.clone())), "seed {seed}: {path}");
+            }
+            if step % 2 == 0 {
+                kept.push((root, model.clone()));
+            }
+            if step % 7 == 6 {
+                kept.drain(..kept.len().saturating_sub(2));
+                let keep: Vec<ContentId> = kept.iter().map(|it| it.0).chain([root]).collect();
+                vfs.collect(&keep);
+                for (id, files) in &kept {
+                    assert_eq!(&moded(&vfs.tree, vfs.root(*id).unwrap()), files, "seed {seed}");
+                }
+            }
         }
     }
 }
 
-fn model_apply(model: &mut BTreeMap<String, (Mode, Vec<u8>)>, op: &Op) -> bool {
-    let clashes = |model: &BTreeMap<String, (Mode, Vec<u8>)>, path: &str| {
-        model
-            .keys()
-            .any(|it| it.starts_with(&format!("{path}/")) || path.starts_with(&format!("{it}/")))
+fn model_apply(model: &mut Model, op: &Op) -> bool {
+    let under = |path: &str| format!("{path}/");
+    let clashes = |model: &Model, path: &str| {
+        model.keys().any(|it| it.starts_with(&under(path)) || path.starts_with(&under(it)))
     };
     match op {
         Op::Write { path, bytes, mode } => {
@@ -466,11 +497,177 @@ fn model_apply(model: &mut BTreeMap<String, (Mode, Vec<u8>)>, op: &Op) -> bool {
             old.splice(*at as usize..(at + len) as usize, bytes.iter().copied());
         }
         Op::Delete { path } => {
-            model.remove(path);
+            let before = model.len();
+            model.retain(|it, _| it != path && !it.starts_with(&under(path)));
+            return model.len() < before;
         }
-        Op::Rename { .. } => unreachable!(),
+        Op::Rename { from, to } => {
+            if from == to || to.starts_with(&under(from)) || model.contains_key(to) {
+                return false;
+            }
+            let Some(file) = model.remove(from) else { return false };
+            if clashes(model, to) {
+                model.insert(from.clone(), file);
+                return false;
+            }
+            model.insert(to.clone(), file);
+        }
     }
     true
+}
+
+enum ModelNode<'a> {
+    File(Mode, &'a [u8]),
+    Dir(BTreeMap<&'a str, ModelNode<'a>>),
+}
+
+/// A root's ID from the model alone: each directory hashed entry by entry with an incremental
+/// hasher (git's code, length-prefixed name, child ID), as the old node table did.
+fn model_id(model: &Model) -> ContentId {
+    let mut root = BTreeMap::new();
+    for (path, (mode, bytes)) in model {
+        let mut names: Vec<&str> = path.split('/').collect();
+        let file = names.pop().unwrap();
+        let mut dir = &mut root;
+        for name in names {
+            let ModelNode::Dir(next) =
+                dir.entry(name).or_insert_with(|| ModelNode::Dir(BTreeMap::new()))
+            else {
+                panic!("{path} under a file")
+            };
+            dir = next;
+        }
+        dir.insert(file, ModelNode::File(*mode, bytes));
+    }
+    fn hash(node: &ModelNode<'_>) -> (u32, ContentId) {
+        match node {
+            ModelNode::File(mode, bytes) => (mode.git(), ContentId::of(FILE_DOMAIN, bytes)),
+            ModelNode::Dir(entries) => {
+                let mut hasher = Hasher::new(DIR_DOMAIN);
+                for (name, child) in entries {
+                    let (code, id) = hash(child);
+                    hasher.update(&code.to_le_bytes()).part(name.as_bytes()).id(&id);
+                }
+                (DIR_MODE, hasher.finish())
+            }
+        }
+    }
+    hash(&ModelNode::Dir(root)).1
+}
+
+/// The paths a diff names, in path order by component: each file added, removed, or changed
+/// in bytes or mode.
+fn model_diff(old: &Model, new: &Model) -> Vec<String> {
+    let mut paths: Vec<&String> =
+        old.keys().chain(new.keys()).filter(|it| old.get(*it) != new.get(*it)).collect();
+    paths.sort_unstable_by(|a, b| a.split('/').cmp(b.split('/')));
+    paths.dedup();
+    paths.into_iter().cloned().collect()
+}
+
+/// A directory's changes that sort apart as strings ("a", then "a.b", then "a/y") are one
+/// group by component: the delete of `a` and the write under it are applied together.
+#[test]
+fn a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling() {
+    let mut tree = Tree::new();
+    let base = tree
+        .apply(tree.empty(), &[write("a/x", "1"), write("a-c/z", "0"), write("b", "2")])
+        .unwrap();
+    let next = tree
+        .apply(base, &[delete("a"), write("a.b", "4"), write("a/y", "5"), write("a-c/w", "6")])
+        .unwrap();
+    let want = [("a-c/w", "6"), ("a-c/z", "0"), ("a.b", "4"), ("a/y", "5"), ("b", "2")];
+    assert_eq!(
+        files(&tree, next),
+        want.into_iter()
+            .map(|(path, bytes)| (path.to_owned(), bytes.as_bytes().to_vec()))
+            .collect()
+    );
+}
+
+/// Readers on several threads, each pinned to read a root whole, while the writer commits and
+/// collects: every root a reader finds reads complete and self-consistent, and one a
+/// collection dropped reads as none, never as part of a tree.
+#[test]
+fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let mut vfs = new_vfs();
+    let reader = vfs.reader();
+    let published = Mutex::new(Vec::<ContentId>::new());
+    let finished = AtomicUsize::new(0);
+    const READERS: usize = 4;
+    std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..READERS as u64)
+            .map(|seed| {
+                let (reader, published, finished) = (reader.clone(), &published, &finished);
+                scope.spawn(move || {
+                    let mut rng = Rng::new(seed);
+                    let (mut whole, mut gone) = (0, 0);
+                    while whole + gone < 3000 {
+                        let root = {
+                            let roots = published.lock().unwrap();
+                            let len = roots.len() as u64;
+                            // The latest half the time: the head keeps it, so most reads find
+                            // one.
+                            let at =
+                                if rng.one_in(2) { len.saturating_sub(1) } else { rng.below(len) };
+                            roots.get(at as usize).copied()
+                        };
+                        let Some(root) = root else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        let pinned = reader.pin();
+                        let a = pinned.file(root, "a").map(|it| it.bytes.to_vec());
+                        let b = pinned.file(root, "d/e/b").map(|it| it.bytes.to_vec());
+                        let listed = pinned.list(root, "d").map(Iterator::count);
+                        match (a, b, listed) {
+                            (Some(a), Some(b), Some(2)) => {
+                                assert_eq!(a, b, "one root's files are one commit's");
+                                whole += 1;
+                            }
+                            (None, None, None) => gone += 1,
+                            other => panic!("part of a root: {other:?}"),
+                        }
+                    }
+                    finished.fetch_add(1, Ordering::Release);
+                    whole
+                })
+            })
+            .collect();
+        let mut root = vfs.empty();
+        let mut at = 0u64;
+        while finished.load(Ordering::Acquire) < READERS || at < 300 {
+            let bytes = at.to_string();
+            let ops = [
+                write("a", &bytes),
+                write("d/e/b", &bytes),
+                write("d/c", "c"),
+                write(&format!("x/{}", at % 8), &bytes),
+            ];
+            root = vfs.commit("w", root, &ops).unwrap().root;
+            published.lock().unwrap().push(root);
+            if at % 25 == 24 {
+                let keep = {
+                    let roots = published.lock().unwrap();
+                    roots[roots.len().saturating_sub(3)..].to_vec()
+                };
+                vfs.collect(&keep);
+            }
+            at += 1;
+        }
+        for reading in readers {
+            assert!(reading.join().unwrap() > 0, "a reader found a whole root");
+        }
+    });
+    vfs.collect(&[]);
+    let head = vfs.head("w").unwrap();
+    let read = reader.pin().file(head, "d/c").map(|it| it.bytes.to_vec());
+    assert_eq!(read, Some(b"c".to_vec()));
 }
 
 fn listed(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
@@ -491,7 +688,11 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
     let mut vfs = new_vfs();
     let reader = vfs.reader();
     let empty = vfs.empty();
-    assert_eq!(listed(&reader, empty, ""), Some(Vec::new()), "the empty root is there from the start");
+    assert_eq!(
+        listed(&reader, empty, ""),
+        Some(Vec::new()),
+        "the empty root is there from the start"
+    );
     let ops = [
         write("src/lib.rs", "fn a() {}"),
         write_as("run.sh", "echo", Mode::Executable),
@@ -499,7 +700,8 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
     ];
     let root = vfs.commit("w", empty, &ops).unwrap().root;
     let view = vfs.open(View { root }).unwrap();
-    for path in ["src/lib.rs", "run.sh", "link", "src", "", "nope", "src/lib.rs/x", "a//b", "../x"] {
+    for path in ["src/lib.rs", "run.sh", "link", "src", "", "nope", "src/lib.rs/x", "a//b", "../x"]
+    {
         let file = vfs.read(view, path).map(|it| (it.id, it.mode, it.bytes.to_vec()));
         let read = reader.file(root, path).map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
         assert_eq!(read, file, "{path}");
@@ -526,7 +728,9 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
                 let reader = reader.clone();
                 scope.spawn(move || {
                     (0..2000).all(|_| {
-                        reader.file(what_if, "src/lib.rs").is_some_and(|it| *it.2 == *b"pub fn a() {}")
+                        reader
+                            .file(what_if, "src/lib.rs")
+                            .is_some_and(|it| *it.2 == *b"pub fn a() {}")
                     })
                 })
             })
@@ -1032,7 +1236,10 @@ fn scan_as_head(vfs: &mut Vfs, watcher: &mut Watcher, effects: &mut Vec<Effect>)
     let listed = files
         .iter()
         .map(|(path, bytes)| {
-            (name(&format!("ws/{path}")), Meta { len: bytes.len() as u64, dir: false, modified_ns: 0 })
+            (
+                name(&format!("ws/{path}")),
+                Meta { len: bytes.len() as u64, dir: false, modified_ns: 0 },
+            )
         })
         .collect();
     let mut out = watcher.complete(vfs, Completion { tag, done: Done::Listed(listed) }, effects);
@@ -1055,7 +1262,11 @@ fn scan_as_head(vfs: &mut Vfs, watcher: &mut Watcher, effects: &mut Vec<Effect>)
 fn a_watch_starts_by_making_the_head_what_the_directory_holds() {
     let mut sim = Sim::new(2, Faults::default());
     let mut vfs = new_vfs();
-    let stale = vfs.commit("disk", vfs.empty(), &[write("gone", "1"), write("same", "s"), write("old", "o")]);
+    let stale = vfs.commit(
+        "disk",
+        vfs.empty(),
+        &[write("gone", "1"), write("same", "s"), write("old", "o")],
+    );
     let stale = stale.unwrap().root;
     sim.change(&name("ws/same"), b"s");
     sim.change(&name("ws/old"), b"new");
@@ -1088,7 +1299,10 @@ fn a_watch_starts_by_making_the_head_what_the_directory_holds() {
     let mut lone = Watcher::new("other", name("nowhere"), 1 << 33);
     lone.start(&mut effects);
     let out = pump(&mut sim, &mut vfs, &mut lone, &mut effects);
-    assert!(matches!(&out[..], [Watched::Unreadable { path, .. }, ..] if path.is_empty()), "{out:?}");
+    assert!(
+        matches!(&out[..], [Watched::Unreadable { path, .. }, ..] if path.is_empty()),
+        "{out:?}"
+    );
     assert!(matches!(out.last(), Some(Watched::Ended(_))), "{out:?}");
     assert_eq!(vfs.head("other"), None);
 }
@@ -1183,7 +1397,8 @@ fn an_unreadable_path_or_lost_changes_are_named() {
     assert_eq!(vfs.head("disk"), None);
 
     // Dropped changes are a rescan; a second loss while it lists asks for one more after.
-    let lost = || Completion { tag: Tag(100), done: Done::Changed { files: Vec::new(), lost: true } };
+    let lost =
+        || Completion { tag: Tag(100), done: Done::Changed { files: Vec::new(), lost: true } };
     let list = Effect::List { dir: name("ws"), tag: Tag(101) };
     assert_eq!(watcher.complete(&mut vfs, lost(), &mut effects), vec![Watched::Lost]);
     assert_eq!(effects, vec![list.clone()]);
@@ -1194,7 +1409,8 @@ fn an_unreadable_path_or_lost_changes_are_named() {
     let b = (name("ws/b"), Meta { len: 1, dir: false, modified_ns: 0 });
     let listed = || Completion { tag: Tag(101), done: Done::Listed(vec![b.clone()]) };
     let read_b = |effects: &mut Vec<Effect>| {
-        let at = effects.iter().position(|it| matches!(it, Effect::ReadAll { .. })).expect("a read");
+        let at =
+            effects.iter().position(|it| matches!(it, Effect::ReadAll { .. })).expect("a read");
         let Effect::ReadAll { file, tag } = effects.remove(at) else { unreachable!() };
         assert_eq!(file, name("ws/b"));
         Completion { tag, done: Done::Read(b"b".to_vec()) }
@@ -1261,7 +1477,8 @@ fn the_head_follows_the_disk() {
         }
         out.extend(pump(&mut sim, &mut vfs, &mut watcher, &mut effects));
         assert!(
-            out.iter().all(|it| matches!(it, Watched::Committed(_) | Watched::Lost | Watched::Scanned)),
+            out.iter()
+                .all(|it| matches!(it, Watched::Committed(_) | Watched::Lost | Watched::Scanned)),
             "seed {seed}: {out:?}"
         );
         assert!(out.contains(&Watched::Scanned), "seed {seed}: the first scan");

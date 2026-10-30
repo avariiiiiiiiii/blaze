@@ -10,9 +10,9 @@ use std::{collections::VecDeque, fmt, hash::Hash};
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
-use stdx::{format_to, never};
+use stdx::never;
 use syntax::{
-    FlatTree, Parse, PreorderWithTokens, SmolStr, SyntaxElement,
+    FlatTree, Parse, PreorderWithTokens, SyntaxElement,
     SyntaxKind::{self, *},
     SyntaxNode, SyntaxToken, SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
 };
@@ -141,13 +141,15 @@ where
     SpanMap: SpanMapper,
 {
     if let Some((tree, at)) = node.flat() {
-        return convert_tokens(&mut FlatConverter::new(tree, at, map, span, mode));
+        let mut c = FlatConverter::new(tree, at, map, span, mode);
+        let len = c.tokens.len_hint();
+        return convert_tokens(&mut c, len);
     }
     let mut c =
         Converter::new(node, map, Default::default(), Default::default(), span, mode, |_, _| {
             (true, Vec::new())
         });
-    convert_tokens(&mut c)
+    convert_tokens(&mut c, 0)
 }
 
 /// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
@@ -167,7 +169,7 @@ where
     OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>),
 {
     let mut c = Converter::new(node, map, append, remove, call_site, mode, on_enter);
-    convert_tokens(&mut c)
+    convert_tokens(&mut c, 0)
 }
 
 // The following items are what `rustc` macro can be parsed into :
@@ -225,9 +227,10 @@ pub fn parse_to_token_tree(
     if lexed.errors().next().is_some() {
         return None;
     }
+    let len = lexed.len();
     let mut conv =
         RawConverter { lexed, anchor, pos: 0, ctx, mode: DocCommentDesugarMode::ProcMacro };
-    Some(convert_tokens(&mut conv))
+    Some(convert_tokens(&mut conv, len))
 }
 
 /// Convert a string to a `TokenTree`. The passed span will be used for all spans of the produced subtree.
@@ -240,18 +243,22 @@ pub fn parse_to_token_tree_static_span(
     if lexed.errors().next().is_some() {
         return None;
     }
+    let len = lexed.len();
     let mut conv =
         StaticRawConverter { lexed, pos: 0, span, mode: DocCommentDesugarMode::ProcMacro };
-    Some(convert_tokens(&mut conv))
+    Some(convert_tokens(&mut conv, len))
 }
 
-fn convert_tokens<C>(conv: &mut C) -> tt::TopSubtree
+/// Converts the tokens of `conv`, `len` being about how many token trees they make.
+fn convert_tokens<C>(conv: &mut C, len: usize) -> tt::TopSubtree
 where
     C: TokenConverter,
     C::Token: fmt::Debug,
 {
-    let mut builder =
-        tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(conv.call_site()));
+    let mut builder = tt::TopSubtreeBuilder::with_capacity(
+        tt::Delimiter::invisible_spanned(conv.call_site()),
+        len,
+    );
 
     // The fragments that the last token ended, with its span.
     let mut ended = (0, conv.call_site());
@@ -356,7 +363,7 @@ where
                         () => {
                             tt::Ident {
                                 span: conv.span_for(abs_range),
-                                sym: Symbol::intern(&token.to_text(conv)),
+                                sym: Symbol::intern(token.to_text(conv)),
                                 is_raw: tt::IdentIsRaw::No,
                             }
                             .into()
@@ -365,7 +372,7 @@ where
                     let leaf: tt::Leaf = match kind {
                         k if k.is_any_identifier() => {
                             let text = token.to_text(conv);
-                            tt::Ident::new(&text, conv.span_for(abs_range)).into()
+                            tt::Ident::new(text, conv.span_for(abs_range)).into()
                         }
                         UNDERSCORE => make_ident!(),
                         k if k.is_literal() => {
@@ -374,7 +381,7 @@ where
                             let span = conv.span_for(abs_range);
                             match text.contains('\r') {
                                 true => token_to_literal(&text.replace("\r\n", "\n"), span),
-                                false => token_to_literal(&text, span),
+                                false => token_to_literal(text, span),
                             }
                             .into()
                         }
@@ -426,6 +433,11 @@ fn close_fragments(builder: &mut tt::TopSubtreeBuilder, (count, span): (usize, S
         }
         builder.close(span);
     }
+}
+
+/// The char at byte `offset` of a punctuation token, whose text is ASCII.
+fn punct_char(text: &str, offset: usize) -> Option<char> {
+    text.get(offset..)?.chars().next()
 }
 
 fn is_single_token_op(kind: SyntaxKind) -> bool {
@@ -546,7 +558,7 @@ trait SrcToken<Ctx> {
 
     fn to_char(&self, ctx: &Ctx) -> Option<char>;
 
-    fn to_text(&self, ctx: &Ctx) -> SmolStr;
+    fn to_text<'a>(&'a self, ctx: &'a Ctx) -> &'a str;
 
     fn as_leaf(&self) -> Option<&tt::Leaf> {
         None
@@ -586,8 +598,8 @@ impl SrcToken<RawConverter<'_>> for usize {
         ctx.lexed.text(*self).chars().next()
     }
 
-    fn to_text(&self, ctx: &RawConverter<'_>) -> SmolStr {
-        ctx.lexed.text(*self).into()
+    fn to_text<'a>(&'a self, ctx: &'a RawConverter<'_>) -> &'a str {
+        ctx.lexed.text(*self)
     }
 }
 
@@ -600,8 +612,8 @@ impl SrcToken<StaticRawConverter<'_>> for usize {
         ctx.lexed.text(*self).chars().next()
     }
 
-    fn to_text(&self, ctx: &StaticRawConverter<'_>) -> SmolStr {
-        ctx.lexed.text(*self).into()
+    fn to_text<'a>(&'a self, ctx: &'a StaticRawConverter<'_>) -> &'a str {
+        ctx.lexed.text(*self)
     }
 }
 
@@ -793,7 +805,7 @@ impl<SpanMap, OnEvent> SrcToken<Converter<SpanMap, OnEvent>> for SynToken {
         match self {
             SynToken::Ordinary(token) => token.kind(),
             SynToken::Punct { token, offset: i } => {
-                SyntaxKind::from_char(token.text().chars().nth(*i).unwrap()).unwrap()
+                SyntaxKind::from_char(punct_char(token.text(), *i).unwrap()).unwrap()
             }
             SynToken::Leaf(_) => {
                 never!();
@@ -804,16 +816,16 @@ impl<SpanMap, OnEvent> SrcToken<Converter<SpanMap, OnEvent>> for SynToken {
     fn to_char(&self, _ctx: &Converter<SpanMap, OnEvent>) -> Option<char> {
         match self {
             SynToken::Ordinary(_) => None,
-            SynToken::Punct { token: it, offset: i } => it.text().chars().nth(*i),
+            SynToken::Punct { token: it, offset: i } => punct_char(it.text(), *i),
             SynToken::Leaf(_) => None,
         }
     }
-    fn to_text(&self, _ctx: &Converter<SpanMap, OnEvent>) -> SmolStr {
+    fn to_text<'a>(&'a self, _ctx: &'a Converter<SpanMap, OnEvent>) -> &'a str {
         match self {
-            SynToken::Ordinary(token) | SynToken::Punct { token, offset: _ } => token.text().into(),
+            SynToken::Ordinary(token) | SynToken::Punct { token, offset: _ } => token.text(),
             SynToken::Leaf(_) => {
                 never!();
-                "".into()
+                ""
             }
         }
     }
@@ -930,9 +942,15 @@ struct FlatTokens<'t> {
 
 impl<'t> FlatTokens<'t> {
     fn new(tree: &'t FlatTree, at: u32) -> FlatTokens<'t> {
-        let mut tokens = FlatTokens { stack: Vec::new() };
+        let mut tokens = FlatTokens { stack: Vec::with_capacity(4) };
         tokens.enter(tree, at);
         tokens
+    }
+
+    /// How many elements the walk has left in its outermost tree: its tokens, its nodes and its
+    /// lazy nodes, not what those hold.
+    fn len_hint(&self) -> usize {
+        self.stack.first().map_or(0, |&(_, next, end)| (end - next) as usize)
     }
 
     fn enter(&mut self, tree: &'t FlatTree, at: u32) {
@@ -1012,18 +1030,18 @@ impl<'t, SpanMap> SrcToken<FlatConverter<'t, SpanMap>> for FlatToken<'t> {
         match self {
             FlatToken::Ordinary(token) => token.kind,
             FlatToken::Punct { token, offset: i } => {
-                SyntaxKind::from_char(token.text.chars().nth(*i).unwrap()).unwrap()
+                SyntaxKind::from_char(punct_char(token.text, *i).unwrap()).unwrap()
             }
         }
     }
     fn to_char(&self, _ctx: &FlatConverter<'t, SpanMap>) -> Option<char> {
         match self {
             FlatToken::Ordinary(_) => None,
-            FlatToken::Punct { token, offset: i } => token.text.chars().nth(*i),
+            FlatToken::Punct { token, offset: i } => punct_char(token.text, *i),
         }
     }
-    fn to_text(&self, _ctx: &FlatConverter<'t, SpanMap>) -> SmolStr {
-        self.token().text.into()
+    fn to_text<'a>(&'a self, _ctx: &'a FlatConverter<'t, SpanMap>) -> &'a str {
+        self.token().text
     }
 }
 
@@ -1251,7 +1269,7 @@ impl TtTreeSink<'_> {
                         }
                         tt::Leaf::Literal(lit) => {
                             let buf_l = self.buf.len();
-                            format_to!(self.buf, "{lit}");
+                            lit.push_to(&mut self.buf);
                             debug_assert_ne!(self.buf.len() - buf_l, 0);
                             self.text_pos += TextSize::new((self.buf.len() - buf_l) as u32);
                             combined_span = match combined_span {

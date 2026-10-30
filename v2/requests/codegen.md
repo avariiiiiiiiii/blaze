@@ -201,6 +201,8 @@ As a sibling call it is a few moves and a jump, so calling a folded function cos
 cost unfolded. That keeps folding from costing dev run time (docs/v2/plan/lanes/codegen.md, "dev
 code at least as fast as cargo debug"). Then lane codegen makes the thunk end in `return_call`.
 
+> forwarded to coordinator: `vendor/` and its `[patch.crates-io]` entry come with the vendored crate; listed in the requests report for integration.
+
 ## 6. Status of what came back to codegen (agent 2, 2026-10-29)
 
 - Request 1 (`Hashes`): written in codegen, by child `codegen-hashes` in
@@ -213,6 +215,8 @@ code at least as fast as cargo debug"). Then lane codegen makes the thunk end in
   `codegen-mir`'s.
 - From speed-backend (`v2/requests/codegen-adapter.md`): `bumpalo` and `smallvec` added to
   `crates/hir-ty-codegen/Cargo.toml`.
+
+> applied: noted. Request 1 (`Hashes`) is codegen's `v2/hashes.rs`, which settles the forward of cargo-daemon-units' `ItemHashes::new`.
 
 ## speed-hir-store: hir-ty-mir onto the HIR column views (from speed-hir-store-mir)
 
@@ -231,6 +235,8 @@ Files that import the HIR types and need no change: `mir/lower/deref_pattern.rs`
 `mir/transform.rs`, `mir/monomorphization.rs` (an `ExprId` salsa argument, still `'static`),
 `mir/eval.rs`, `mir/pretty.rs` (`store[binding]`), `mir.rs` (`pub(crate) use hir_def::hir::Expr` stays:
 the view keeps the name).
+
+> forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's; `hir-def` has the views now.
 
 ### crates/hir-ty-mir/src/mir/lower.rs  (~150 sites)
 Store edits (old text exact; each line is every occurrence unless a line is given):
@@ -350,6 +356,8 @@ change: `fragment.rs`, `later.rs`, `asm.rs`, `asm/aarch64.rs`, `llvm/lower.rs` (
 `ExprId` only), `debuginfo/types.rs` and `v2/backend.rs` (`store[binding]`, `Index<BindingId>`
 stays), `v2/refs.rs`, `v2/frontend.rs`, `stable.rs` (no expression or pattern lookups).
 
+> forwarded to codegen: `crates/hir-ty-codegen/` is lane codegen's; `hir-def` has the views now.
+
 ### crates/hir-ty-codegen/fncache/dispatch.rs  (1 site)
 - ~L81  `matches!(expr, Expr::Closure { closure_kind, .. } if *closure_kind != ClosureKind::Closure)`  ->  `matches!(expr, Expr::Closure { closure_kind, .. } if closure_kind != ClosureKind::Closure)`
 
@@ -401,7 +409,11 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
    second ISA at `opt_level=speed` and std's and dependencies' units use it; I'll write that
    side as soon as the variant exists.
 
+> forwarded to codegen: lane codegen's paths, still running.
+
 ## From safety (lane safety, 2026-10-29; design `docs/v2/plan/lanes/safety/notes.md`)
+
+> forwarded to codegen: S1 (`hir-ty-mir`'s evaluator) and S2 (the LLVM back end) are lane codegen's.
 
 ### S1. codegen-mir: the evaluator's `Machine` hooks (`crates/hir-ty-mir/src/mir/eval*`)
 
@@ -450,3 +462,41 @@ ASan. Today `crates/blaze-cargo/src/unstable.rs:237` refuses `-Zsanitizer` and
 `v2/requests/cargo.md` and `v2/requests/safety.md`). The rustc differential: a test per
 sanitizer that a known out-of-bounds, a data race and an uninitialized read are each reported
 by the instrumented binary with the same report as rustc's build.
+
+## 7. cargo: `ItemHashes::new` takes a `Send + Sync` closure
+
+Where: `crates/blaze-cargo/src/serve/unit/codegen.rs:260-265` (`names`).
+
+What: `hir_ty_codegen::v2::ItemHashes::new` takes
+`Box<dyn Fn(base_db::FileId) -> Option<String> + Send + Sync>` (`Hashes: Sync`, read from every
+worker). The closure there captures `mounted` and `job.lowered.paths()`; both must be
+`Send + Sync` (an `Arc` of an immutable map, not an `Rc` or a `RefCell`).
+
+Why: otherwise the call doesn't type-check.
+
+## 8. link: who builds the span tables `Target::Position` names
+
+Where: lane link (`crates/blaze-link/src/position.rs` decodes a `SpanTable`; nothing in v2
+produces one yet).
+
+What: a `Target::Position(SpanRef { anchor, index })` from codegen names entry `index` of the
+table `anchor`. `hir_ty_codegen::v2::ItemHashes::span_tables(db, owner)` lists every table of a
+body by anchor, with the `MirSpan` at each index, and `ItemHashes::declaration_table(db, func)`
+the one-entry table of a function's declaration. The position of each entry is
+`hir_ty_mir::mir::location::source_location_in_file`; an entry it finds no syntax for (a
+binding, the self parameter, `MirSpan::Unknown`) is its owner's position. Whoever feeds the
+linker its span tables (the daemon's link step, lane cargo or link) should build them from
+these, keyed by anchor, so a reformat rebuilds tables and compiles nothing.
+
+Why: without them every panic location and `#[track_caller]` `Location` points at nothing.
+
+## 9. items (optional, speed): spans of a body form and a by-move code query
+
+Where: `crates/blaze-items/src/hash.rs`.
+
+What: `ItemHashes::code` rebuilds each body's span ids from `mir_body`, `mir_body_for_closure`
+and `mir_body_for_coroutine_by_move` and hashes them beside `code_hash`/`closure_code`/
+`coroutine_code`, and has no by-move code query. A code hash that already covers the span ids
+the MIR names, and a `coroutine_by_move_code` query, would hash each body once in one place.
+
+Why: hash once (principles.md); today the MIR's spans are walked twice per body.

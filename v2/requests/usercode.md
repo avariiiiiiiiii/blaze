@@ -224,3 +224,5 @@ becomes `{ common: Arc<[Line]>, own: Vec<Line> }` and `traced` chains the two, s
 nothing for the shared lines but their hashing (and `Disk` caches that by stat). I have already
 cut the clone to each shared line once (they were repeated per child); this takes it to zero.
 I will make the `Trace` change in `test/queue.rs` once this is in; nothing of mine needs it to compile.
+
+> forwarded to usercode: `crates/blaze-usercode/src/trace.rs` is lane usercode's.

@@ -331,6 +331,14 @@ Lookups in both interners take no lock, which is right. The findings are on the 
    indices from per-worker blocks (claim 64 at a time from `next`), and keep `published` per
    shard, summed by `len()`. There are no users outside the crate yet, so now is the cheap time
    to change it.
+   Status: done by format (lead). `shard_count()`: `(cores * 4).next_power_of_two().max(4)`,
+   chosen once; the shard is picked by the ID's first 4 bytes. `intern` computes `value()`
+   before locking and locks only to probe again and insert (a racing loser's value is dropped
+   after the lock is released), so a `value` may now intern into the same interner. Each shard
+   claims indices `BLOCK` (64) at a time from `next` under its own lock; `len` is per shard
+   (`#[repr(align(128))]` shards), summed by `len()`. New `Sharded::end()`: above every index
+   handed out, by at most `BLOCK` per shard (size `Idx`-indexed columns by it, not by `len()`;
+   no current user sizes by `len()`). `pub const SHARDS` is gone (no user outside the crate).
 
 Judged off the hot path: `syntax-tree/src/flat.rs:1167` (`PARTS`, tests only). The format files
 in `hir-def` (`expr_store*`, `hir*`, `item_tree*`) and `syntax`, `span`, `tt` and `mbe` hold no locks.
@@ -427,6 +435,22 @@ From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
 
 > forwarded to format: `crates/blaze-ids/src/lib.rs` is lane format's; lane format is still running. `blaze-items` (key.rs, index.rs, form.rs) does not build until `of_many` lands.
 
+Status: done by format (lead), in `crates/blaze-ids/src/lib.rs`:
+- `ContentId::of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId>`: the domain's
+  context key looked up once, then one `new_from_context_key` hasher per input. Not the
+  `hash_many` SIMD batch: `blake3::platform` is `#[doc(hidden)]`, "undocumented and unstable,
+  for benchmarks only", so any blake3 bump may break or silently change it; the context key
+  (stable `blake3::hazmat`) already removes the derive-key compression, the 25-50% named.
+- `Hasher::new(domain)` reads the key from a 1024-slot open-addressed table keyed by the name's
+  text (not its address: a `const &str` may sit at several addresses), each slot a `OnceLock`
+  (a read is acquire loads; more than 1024 names panics, naming the constant).
+- `pub struct Domain`, `const fn Domain::new(name)`, `Domain::name()`, `Hasher::of(&Domain)`,
+  `ContentId::of_domain(&Domain, bytes)`: the key in the `Domain` itself, one acquire load.
+  Items may move its hot domains to `pub static X: Domain`; nothing requires it.
+- Tests: `Hasher::new(d)` equals `blake3::Hasher::new_derive_key(d)` over several domains and
+  lengths, `of_many` equals `of` per input over 0, 1, 63, 64, 65, 1024, 1025 and 3000 bytes
+  mixed, 600 domains from 4 threads, the same name at two addresses.
+
 ## speed-syntax (speed pass of `crates/parser`, `crates/syntax`)
 
 From `speed-syntax`, for format-tree (`crates/syntax-tree/` is live as format-edit). Notes:
@@ -514,6 +538,8 @@ me (`tmux send-keys -t blaze-v2:speed-hir-expand`).
    permutation `by_anchor: Vec<u32>` (entry indices ordered by `(anchor, range.start)`) built in
    `finish()` makes each a binary search plus the matching run. Lower priority than 1-3.
 
+> forwarded to format (`span`, `syntax-bridge`) and to speed (speed-span-ast, speed-span-tt), both still running.
+
 ## format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)
 
 From format-hir-encode, for the lead (`crates/blaze-format/`) and format-span (`crates/span/`).
@@ -541,3 +567,14 @@ before any view is made of them. Two ways to close it; either is enough:
 Until one lands, the only `unsafe` left for this is the single function
 `hir::persist::syntax_context` (format-hir's file; edit given in
 /tmp/blaze-lanes/v2-format-hir-encode.md).
+
+Status: 1 done by format (lead), in `crates/blaze-format/src/lib.rs`: `BUFFER_DOMAIN`
+(`"blaze v2 buffer 1"`), `buffer_id(buffer) -> ContentId` (the whole buffer, header included),
+`open_verified::<R>(buffer, schema, key)`, `read_verified::<P>(buffer, key)` and
+`FormatError::Hash { found, wanted }`; `Persist::read`'s doc says bytes this process did not
+write go through `read_verified`. For lanes store and db (they read buffers back): key stored
+HIR buffers by `blaze_format::buffer_id` and open them with `read_verified`. The `SAFETY:`
+comment in `hir::persist::syntax_context` can now name `read_verified` as where the invariant
+is upheld (format-hir told).
+
+> forwarded to format: `crates/blaze-format/` and `crates/span/` are lane format's.

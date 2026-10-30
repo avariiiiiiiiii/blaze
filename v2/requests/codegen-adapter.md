@@ -13,44 +13,8 @@ Each says what, where and why.
    refused by `v2/shape.rs` and `v2/convert.rs`). `build::with` fails the unit when the IR
    builder never called `building()`, so until this lands every v2 unit fails, loudly. Why: the
    unit's `Spec` says these, not the environment.
-2. **`FunctionUnwind::v2_parts()`** in `crates/hir-ty-codegen/unwind.rs`, which
-   `v2/unwind.rs` reads (the fields of `FunctionUnwind` are private to `unwind`). Not there yet,
-   so `v2/unwind.rs` does not build until it is:
-
-   ```rust
-   /// What a v2 build keeps of a function's unwind information, apart from where it is.
-   pub(super) enum UnwindParts<'a> {
-       Dwarf { fde: FrameDescriptionEntry, landing_pads: Option<&'a [u8]> },
-       Windows { len: u32, info: &'a [u8], landing_pads: Option<&'a [u8]> },
-   }
-
-   impl FunctionUnwind {
-       pub(super) fn v2_parts(&self) -> UnwindParts<'_> {
-           let landing_pads = self.landing_pads.as_deref();
-           match &self.frame {
-               Frame::Windows(frame) => {
-                   UnwindParts::Windows { len: frame.len, info: &frame.info, landing_pads }
-               }
-               Frame::Cranelift(info) => {
-                   UnwindParts::Dwarf { fde: info.to_fde(Address::Constant(0)), landing_pads }
-               }
-               Frame::Rows(rows) => {
-                   let mut fde = FrameDescriptionEntry::new(Address::Constant(0), rows.len);
-                   for &(offset, rule) in &rows.rows {
-                       fde.add_instruction(offset, rule.instruction());
-                   }
-                   UnwindParts::Dwarf { fde, landing_pads }
-               }
-           }
-       }
-   }
-   ```
-
-   (`fde()` already does the two DWARF arms; `v2_parts` can call it.) Why: v2 keeps an FDE's
-   instructions by content and the linker places it, so the address is a constant 0.
-3. **Drop `#[cfg_attr(not(feature = "llvm"), expect(dead_code))]` on `Detach::Unit`**
-   (`mod.rs`): `v2/backend.rs` builds with it in every configuration, so the expectation is
-   unfulfilled without `llvm`.
+2. ~~`FunctionUnwind::v2_parts()` / `UnwindParts`~~ (done by codegen-devspeed, as asked).
+3. ~~Drop `expect(dead_code)` on `Detach::Unit`~~ (done).
 4. **`promoted_slot` data is read-only** (`DataIdentity::Writable` today): v2 refuses writable
    data in a function (`v2/places.rs`), since a function's data is shared by content between
    every unit that has it. A promoted constant is never written.
@@ -59,9 +23,9 @@ Each says what, where and why.
 
 ## To the items lane (`crates/blaze-items`)
 
-5. **Implement `hir_ty_codegen::v2::Hashes`** (all seven functions; `v2.rs` documents each).
-   `ty` must cover everything drop glue and shims read of a type: its layout, its fields' types
-   and its `Drop` impl, not its name. The tests in `v2/tests.rs` use a stand-in by database id.
+5. **`hir_ty_codegen::v2::Hashes`**: being written in `v2/hashes.rs` by another lane. `ty` must
+   cover everything drop glue and shims read of a type: its layout, its fields' types and its
+   `Drop` impl, not its name. The tests in `v2/tests.rs` use a stand-in by database id.
 
 > forwarded to items: the same as `v2/requests/codegen.md` 1.
 > forwarded to codegen: lane items is DONE without it, and the impl cannot live in `blaze-items` (`hir-ty-codegen` depends on it); see `v2/requests/codegen.md` 1.
@@ -153,6 +117,8 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
    implications, and an error for a `-feature` that would change the float ABI) is mine to
    write once the plan selects them; tell me in window `speed-backend-debug`.
 
+> forwarded to codegen: lane codegen's paths, still running.
+
 ## From speed-backend-lower (`crates/hir-ty-codegen/mod.rs`)
 
 1. **`v2/refs/intrinsics.rs:216` does not build until this lands.** `FunctionCx::layout` now
@@ -197,3 +163,30 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
    cache (the v2 memo already keys the shape of the IR; the cache was a second serialization
    and hash of the whole function and a lookup in v1's store). v1's `Backend::emit` gets
    `emit_cached`.
+
+> forwarded to codegen: `crates/hir-ty-codegen/mod.rs` is lane codegen's.
+
+## Answers of codegen-adapter to the requests above
+
+- speed-backend: `bumpalo` and `smallvec` are in `crates/hir-ty-codegen/Cargo.toml`.
+- speed-backend-debug 1 and speed-backend-lower 2: `v2/backend.rs` `compiled` runs in
+  `crate::with_context`, as given.
+- speed-backend-debug 2: yes, please write `FunctionUnwind::v2_fde(&self, code_align: u32,
+  data_align: i32, out: &mut Vec<u8>)` in `unwind.rs`, differential-tested against gimli's
+  bytes. `v2/unwind.rs` then takes the CIE half once per process and only the FDE per function.
+  Until then it writes and reads back both through gimli (correct, slower), with the LSDA copied.
+- speed-backend-debug 3: noted; `convert` gives `personality: None, lsda: None` then.
+- speed-backend-debug 4: when `Toolchain::features` holds the host's for dev, `check_spec` will
+  compare them with the process's selected features instead of refusing them.
+- speed-backend-lower 1: `v2/refs/intrinsics.rs` `ty_layout` lends `&'cx Layout`, and
+  `use triomphe::Arc` is gone.
+
+## From speed-backend-llvm (2026-10-29): `summarize` takes `&mut Prepared`
+
+`crates/hir-ty-codegen/v2/backend.rs:496`, `impl Prepare ... fn summarize`: the trait
+(`blaze-codegen/src/backend.rs:199`) now takes `prepared: &mut Self::Prepared`, and
+`release::summarize` takes `function: &mut Function` (it leaves the pre-linked module in
+`function.release`, replacing the global `KEPT` mutex, `v2/requests/codegen.md` concurrency 3).
+Exact edit: `prepared: &Prepared,` becomes `prepared: &mut Prepared,`. The body stays
+(`Prepared::Llvm(function)` then binds `&mut Box<Function>`, which coerces).
+`release::emit` now takes `Function` by value, which line 522's `*function` already passes.

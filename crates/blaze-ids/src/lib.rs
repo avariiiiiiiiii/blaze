@@ -536,10 +536,14 @@ mod tests {
     fn many_domains_keep_their_own_keys() {
         let names: Vec<&'static str> =
             (0..600).map(|n| &*Box::leak(format!("blaze v2 test domain {n}").into_boxed_str())).collect();
-        let first: Vec<ContentId> = names.iter().map(|name| ContentId::of(name, b"x")).collect();
+        let first: Vec<ContentId> = names.iter().map(|&name| ContentId::of(name, b"x")).collect();
         let threads: Vec<Vec<ContentId>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..4)
-                .map(|_| scope.spawn(|| names.iter().map(|name| ContentId::of(name, b"x")).collect()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        names.iter().map(|&name| ContentId::of(name, b"x")).collect::<Vec<_>>()
+                    })
+                })
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
         });

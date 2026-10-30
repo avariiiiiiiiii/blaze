@@ -182,14 +182,15 @@ impl<P: Policy> KeyMap<Key<P::K, P::V, P>> {
 impl<P: Policy> Index<Key<P::K, P::V, P>> for DynMap {
     type Output = KeyMap<Key<P::K, P::V, P>>;
     fn index(&self, _key: Key<P::K, P::V, P>) -> &Self::Output {
-        // Safe due to `#[repr(transparent)]`.
+        // SAFETY: `KeyMap` is `#[repr(transparent)]` over a `DynMap` (its other field is a
+        // zero-sized `PhantomData`), so the two references have one layout and validity.
         unsafe { std::mem::transmute::<&DynMap, &KeyMap<Key<P::K, P::V, P>>>(self) }
     }
 }
 
 impl<P: Policy> IndexMut<Key<P::K, P::V, P>> for DynMap {
     fn index_mut(&mut self, _key: Key<P::K, P::V, P>) -> &mut Self::Output {
-        // Safe due to `#[repr(transparent)]`.
+        // SAFETY: as in `index`: `KeyMap` is `#[repr(transparent)]` over a `DynMap`.
         unsafe { std::mem::transmute::<&mut DynMap, &mut KeyMap<Key<P::K, P::V, P>>>(self) }
     }
 }

@@ -591,6 +591,57 @@ warning: 2 warnings emitted
     assert_eq!(ui_fixture(fixture, &compiletest(true)), expected);
 }
 
+#[test]
+fn binders_of_nested_macro_definitions_are_not_misuse() {
+    let fixture = r#"//- minicore: eq, add
+//- /std.rs crate:std edition:2021 library
+pub macro assert_eq($left:expr, $right:expr $(,)?) {
+    let _: bool = $left == $right;
+}
+pub mod prelude {
+    pub mod rust_2015 {
+        pub use crate::assert_eq;
+    }
+}
+//- /meta-variable-misuse.rs crate:main edition:2015 deps:std
+//@ run-pass
+#![deny(meta_variable_misuse)]
+
+macro_rules! foo {
+    ($($m:ident $($f:ident $v:tt)+),*) => {
+        $($(macro_rules! $f { () => { $v } })+)*
+        $(macro_rules! $m { () => { $(fn $f() -> i32 { $v })+ } })*
+    }
+}
+
+foo!(m a 1 b 2, n c 3);
+m!();
+n!();
+
+macro_rules! no_shadow {
+    ($x:tt) => { macro_rules! bar { ($x:tt) => { 42 }; } };
+}
+no_shadow!(z);
+
+macro_rules! make_plus {
+    ($n: ident $x:expr) => { macro_rules! $n { ($y:expr) => { $x + $y }; } };
+}
+make_plus!(add3 3);
+
+fn main() {
+    assert_eq!(a!(), 1);
+    assert_eq!(b!(), 2);
+    assert_eq!(c!(), 3);
+    assert_eq!(a(), 1);
+    assert_eq!(b(), 2);
+    assert_eq!(c(), 3);
+    assert_eq!(bar!(z:tt), 42);
+    assert_eq!(add3!(9), 12);
+}
+"#;
+    assert_eq!(ui_fixture(fixture, &compiletest(true)), "");
+}
+
 /// What `std` and `test` are to `duplicated-attributes.rs`: the builtin attribute macros in the
 /// prelude, and `Bencher`.
 const TEST_CRATES: &str = r#"//- /std.rs crate:std edition:2015 library

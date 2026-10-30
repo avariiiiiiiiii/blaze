@@ -58,7 +58,7 @@ fn frame_len(len: usize) -> Result<u32, String> {
 }
 
 /// All of `head` and then all of `body`, in one write for a writer that takes them both.
-fn write_both(to: &mut impl Write, mut head: &[u8], mut body: &[u8]) -> io::Result<()> {
+pub fn write_both(to: &mut impl Write, mut head: &[u8], mut body: &[u8]) -> io::Result<()> {
     while !head.is_empty() {
         match to.write_vectored(&[IoSlice::new(head), IoSlice::new(body)]) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),

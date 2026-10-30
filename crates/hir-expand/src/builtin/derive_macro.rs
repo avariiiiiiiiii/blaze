@@ -1,19 +1,25 @@
 //! Builtin derives.
+//!
+//! Each derive writes its whole expansion into one [`tt::TopSubtreeBuilder`]. Where the output
+//! was once made of nested `quote!`s spliced into each other, it keeps the invisible group each
+//! splice added (see [`in_group`]), so the token trees, spans and encoding are the same.
+
+use std::ops::Range;
 
 use base_db::SourceDatabase;
 use either::Either;
-use intern::sym;
-use itertools::{Itertools, izip};
+use intern::{Symbol, sym};
+use itertools::Itertools;
 use parser::SyntaxKind;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use span::{Edition, Span};
-use stdx::never;
 use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
 
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
-    builtin::quote::dollar_crate,
+    builtin::quote::{ToTokenTree, dollar_crate, group},
     hygiene::span_with_def_site_ctxt,
     name::{self, AsName, Name},
     span_map::ExpansionSpanMap,
@@ -26,6 +32,13 @@ use syntax::{
     },
     syntax_editor::{GetOrCreateWhereClause, SyntaxEditor},
 };
+
+#[cfg(test)]
+mod reference;
+#[cfg(test)]
+mod tests;
+
+type Builder = tt::TopSubtreeBuilder;
 
 macro_rules! register_builtin {
     ( $($trait:ident => $expand:ident),* $(,)? ) => {
@@ -104,14 +117,32 @@ fn as_const_impls(expanded: tt::TopSubtree) -> tt::TopSubtree {
     builder.build()
 }
 
+/// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
+/// `skip`) start with `head` and then have `word`. A word never spans two tokens, so the tokens
+/// are split one by one and nothing is copied.
+fn attr_words_have(attr: &ast::Attr, head: &str, skip: &[&str], word: &str) -> bool {
+    let mut first = true;
+    for token in attr.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
+        for it in token.text().split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if it.is_empty() || skip.contains(&it) {
+                continue;
+            }
+            if first {
+                if it != head {
+                    return false;
+                }
+                first = false;
+            } else if it == word {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Whether one of the item's `#[derive]`s lists `Copy`.
 fn derives_copy(adt: &ast::Adt) -> bool {
-    adt.attrs().any(|attr| {
-        let text = attr.syntax().text().to_string();
-        let mut words =
-            text.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|word| !word.is_empty());
-        words.next() == Some("derive") && words.any(|word| word == "Copy")
-    })
+    adt.attrs().any(|attr| attr_words_have(&attr, "derive", &[], "Copy"))
 }
 
 register_builtin! {
@@ -135,165 +166,52 @@ pub fn find_builtin_derive(ident: &name::Name) -> Option<BuiltinDeriveExpander> 
     BuiltinDeriveExpander::find_by_name(ident)
 }
 
-#[derive(Clone)]
-enum VariantShape {
-    Struct(Vec<tt::Ident>),
-    /// The span of each field, which what is said about the field (as that moving it out of a
-    /// packed struct is E0507) points at, as rustc's do.
-    Tuple(Vec<Span>),
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldsKind {
+    Record,
+    Tuple,
     Unit,
 }
 
-fn tuple_field_iterator(spans: &[Span]) -> impl Iterator<Item = tt::Ident> + '_ {
-    spans.iter().enumerate().map(|(it, &span)| tt::Ident::new(&format!("f{it}"), span))
+/// A struct's fields or an enum's variant: `fields[start..end]` of its [`AdtShape`].
+#[derive(Debug)]
+struct Variant {
+    /// The variant's name; the type's for a struct.
+    name: tt::Ident,
+    kind: FieldsKind,
+    start: u32,
+    end: u32,
 }
 
-/// What a pattern over `self` binds a field to. The name of the field may be that of a tuple
-/// struct or a constant in scope, which a binding can't have.
-fn bound_of_self(field: &tt::Ident) -> tt::Ident {
-    tt::Ident::new(&format!("{}_self", field.sym), field.span)
-}
-
-impl VariantShape {
-    fn as_pattern(&self, path: tt::TopSubtree, span: Span) -> tt::TopSubtree {
-        self.as_pattern_map(path, span, |it| {
-            let bound = bound_of_self(it);
-            quote!(span => #bound)
-        })
+impl Variant {
+    fn fields(&self) -> Range<usize> {
+        self.start as usize..self.end as usize
     }
 
-    fn field_names(&self, span: Span) -> Vec<tt::Ident> {
-        match self {
-            VariantShape::Struct(s) => s.clone(),
-            VariantShape::Tuple(spans) => tuple_field_iterator(spans).collect(),
-            VariantShape::Unit => vec![],
-        }
-    }
-
-    fn as_pattern_map(
-        &self,
-        path: tt::TopSubtree,
-        span: Span,
-        field_map: impl Fn(&tt::Ident) -> tt::TopSubtree,
-    ) -> tt::TopSubtree {
-        match self {
-            VariantShape::Struct(fields) => {
-                let fields = fields.iter().map(|it| {
-                    let mapped = field_map(it);
-                    quote! {span => #it : #mapped , }
-                });
-                quote! {span =>
-                    #path { # #fields }
-                }
-            }
-            VariantShape::Tuple(spans) => {
-                let fields = tuple_field_iterator(spans).map(|it| {
-                    let mapped = field_map(&it);
-                    quote! {span =>
-                        #mapped ,
-                    }
-                });
-                quote! {span =>
-                    #path ( # #fields )
-                }
-            }
-            VariantShape::Unit => path,
-        }
-    }
-
-    fn from(
-        call_site: Span,
-        tm: &ExpansionSpanMap,
-        value: Option<FieldList>,
-    ) -> Result<Self, ExpandError> {
-        // Where a field is written, in the derive's hygiene: what the expansion says of the
-        // field, as copying it out of a packed struct, is reported there, as rustc's is.
-        let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
-        let r = match value {
-            None => VariantShape::Unit,
-            Some(FieldList::RecordFieldList(it)) => VariantShape::Struct(
-                it.fields()
-                    .map(|it| it.name())
-                    .map(|it| {
-                        name_to_token(call_site, tm, it)
-                            .map(|it| tt::Ident { span: at_field(it.span), ..it })
-                    })
-                    .collect::<Result<_, _>>()?,
-            ),
-            Some(FieldList::TupleFieldList(it)) => VariantShape::Tuple(
-                it.fields()
-                    .map(|field| {
-                        let at = field
-                            .ty()
-                            .map_or_else(|| field.syntax().clone(), |ty| ty.syntax().clone());
-                        at_field(tm.span_at(at.text_range().start()))
-                    })
-                    .collect(),
-            ),
-        };
-        Ok(r)
+    fn is_empty(&self) -> bool {
+        self.start == self.end
     }
 }
 
-#[derive(Clone)]
-enum AdtShape {
-    Struct(VariantShape),
-    Enum { variants: Vec<(tt::Ident, VariantShape)>, default_variant: Option<usize> },
+#[derive(Debug)]
+enum AdtKind {
+    Struct,
+    Enum { default_variant: Option<usize> },
     Union,
 }
 
-impl AdtShape {
-    fn as_pattern(&self, span: Span, name: &tt::Ident) -> Vec<tt::TopSubtree> {
-        self.as_pattern_map(
-            name,
-            |it| {
-                let bound = bound_of_self(it);
-                quote!(span =>#bound)
-            },
-            span,
-        )
-    }
-
-    fn field_names(&self, span: Span) -> Vec<Vec<tt::Ident>> {
-        match self {
-            AdtShape::Struct(s) => {
-                vec![s.field_names(span)]
-            }
-            AdtShape::Enum { variants, .. } => {
-                variants.iter().map(|(_, fields)| fields.field_names(span)).collect()
-            }
-            AdtShape::Union => {
-                never!("using fields of union in derive is always wrong");
-                vec![]
-            }
-        }
-    }
-
-    fn as_pattern_map(
-        &self,
-        name: &tt::Ident,
-        field_map: impl Fn(&tt::Ident) -> tt::TopSubtree,
-        span: Span,
-    ) -> Vec<tt::TopSubtree> {
-        match self {
-            AdtShape::Struct(s) => {
-                vec![s.as_pattern_map(quote! {span => #name }, span, field_map)]
-            }
-            AdtShape::Enum { variants, .. } => variants
-                .iter()
-                .map(|(v, fields)| {
-                    fields.as_pattern_map(quote! {span => #name :: #v }, span, &field_map)
-                })
-                .collect(),
-            AdtShape::Union => {
-                never!("pattern matching on union is always wrong");
-                vec![quote! {span => un }]
-            }
-        }
-    }
+/// The variants, and all their fields in one list: a record field by its name, a tuple field
+/// `i` as `f{i}`. The span of each field is where it is written, in the derive's hygiene: what
+/// the expansion says of the field (as that moving it out of a packed struct is E0507) points
+/// there, as rustc's does.
+#[derive(Debug)]
+struct AdtShape {
+    kind: AdtKind,
+    /// One for a struct, none for a union.
+    variants: Vec<Variant>,
+    fields: Vec<tt::Ident>,
 }
 
-#[derive(Clone)]
 struct BasicAdtInfo {
     name: tt::Ident,
     shape: AdtShape,
@@ -308,94 +226,269 @@ struct BasicAdtInfo {
     associated_types: Vec<tt::TopSubtree>,
     /// Whether the fields can be misaligned, and so have to be copied out to be used.
     packed: bool,
+    /// Whether the impl also bounds the type parameters and associated types by `Copy`, after
+    /// the item's own `where` clause: what the fields of a packed struct are made of, since
+    /// they are copied out (rustc's `needs_copy_as_bound_if_packed`).
+    copy_bounds: bool,
 }
 
-impl BasicAdtInfo {
-    /// A `match` of `self` against each arm's pattern. A packed struct's fields are copied out
-    /// of it instead, as rustc's derives do (`{ self.x }`): a field may be misaligned, so isn't
-    /// borrowed, and moving one that isn't `Copy` is E0507, where the field is.
-    fn match_self(
-        &self,
-        span: Span,
-        arms: Vec<(tt::TopSubtree, tt::TopSubtree)>,
-    ) -> tt::TopSubtree {
-        if let Some(lets) = self.packed_lets("self")
-            && arms.len() == 1
-        {
-            let (_, body) = arms.into_iter().next().unwrap();
-            return quote! {span => { # #lets #body } };
-        }
-        let arms = arms.into_iter().map(|(pat, body)| {
-            let fat_arrow = fat_arrow(span);
-            quote! {span => #pat #fat_arrow #body , }
-        });
-        quote! {span => match self { # #arms } }
-    }
-
-    /// For a packed struct, a `let` of each field of `base` (`self` or `other`) to a copy out
-    /// of it, to the name the patterns of the other derives bind it to.
-    fn packed_lets(&self, base: &str) -> Option<Vec<tt::TopSubtree>> {
-        let AdtShape::Struct(shape) = &self.shape else { return None };
-        if !self.packed {
-            return None;
-        }
-        let fields = match shape {
-            VariantShape::Struct(fields) => fields
-                .iter()
-                .map(|it| {
-                    let at = it.span;
-                    (it.clone(), quote! {at => #it })
-                })
-                .collect(),
-            VariantShape::Tuple(spans) => tuple_field_iterator(spans)
-                .enumerate()
-                .map(|(i, it)| {
-                    let at = it.span;
-                    let index = quote! {at => #i };
-                    (it, index)
-                })
-                .collect(),
-            VariantShape::Unit => vec![],
-        };
-        let lets = fields.into_iter().map(|(name, field)| {
-            let at = name.span;
-            let bound = tt::Ident::new(&format!("{}_{base}", name.sym), at);
-            let base = tt::Ident::new(base, at);
-            quote! {at => let #bound = { #base . #field }; }
-        });
-        Some(lets.collect())
-    }
-
-    /// A `match` of `self` and `other` against each arm's two patterns, and `fallback` if none
-    /// matches. A packed struct's fields are copied out of both, as by [`Self::match_self`].
-    fn match_both(
-        &self,
-        span: Span,
-        arms: Vec<(tt::TopSubtree, tt::TopSubtree, tt::TopSubtree)>,
-        fallback: tt::TopSubtree,
-    ) -> tt::TopSubtree {
-        if let (Some(lets), Some(other_lets)) =
-            (self.packed_lets("self"), self.packed_lets("other"))
-            && arms.len() == 1
-        {
-            let (_, _, body) = arms.into_iter().next().unwrap();
-            return quote! {span => { # #lets # #other_lets #body } };
-        }
-        let arms = arms.into_iter().map(|(pat1, pat2, body)| {
-            let fat_arrow = fat_arrow(span);
-            quote! {span => ( #pat1 , #pat2 ) #fat_arrow #body , }
-        });
-        let fat_arrow = fat_arrow(span);
-        quote! {span => match (self, other) { # #arms _unused #fat_arrow #fallback } }
-    }
-}
-
-#[derive(Clone)]
 struct AdtParam {
     name: tt::TopSubtree,
     /// `None` if this is a type parameter.
     const_ty: Option<tt::TopSubtree>,
     bounds: Option<tt::TopSubtree>,
+}
+
+/// `a` then `b`, interned, with no heap allocation for a name of up to 64 bytes.
+fn joined(a: &str, b: &str) -> Symbol {
+    let mut buf: SmallVec<[u8; 64]> = SmallVec::with_capacity(a.len() + b.len());
+    buf.extend_from_slice(a.as_bytes());
+    buf.extend_from_slice(b.as_bytes());
+    Symbol::intern(std::str::from_utf8(&buf).expect("two `str`s joined are one"))
+}
+
+/// `f{i}`, the name of tuple field `i`.
+fn tuple_field_symbol(i: usize) -> Symbol {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    let mut n = i;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    joined("f", std::str::from_utf8(&digits[at..]).expect("ASCII digits"))
+}
+
+/// Writes what `f` writes in an invisible group at `span`: what splicing a `quote!` at `span`
+/// of anything but one delimited group adds.
+#[inline]
+fn in_group(b: &mut Builder, span: Span, f: impl FnOnce(&mut Builder)) {
+    b.open(tt::DelimiterKind::Invisible, span);
+    f(b);
+    b.close(span);
+}
+
+/// What splicing an empty `quote!` adds.
+#[inline]
+fn empty_group(b: &mut Builder, span: Span) {
+    in_group(b, span, |_| {})
+}
+
+#[inline]
+fn delimited(b: &mut Builder, kind: tt::DelimiterKind, span: Span, f: impl FnOnce(&mut Builder)) {
+    b.open(kind, span);
+    f(b);
+    b.close(span);
+}
+
+fn punct(char: char, spacing: tt::Spacing, span: Span) -> tt::Punct {
+    tt::Punct { char, spacing, span }
+}
+
+/// Two punctuation characters joined, as `quote!` can't write them (`=>`, `&&`, `==`).
+fn joint(b: &mut Builder, span: Span, first: char, second: char) {
+    in_group(b, span, |b| {
+        b.push(punct(first, tt::Spacing::Joint, span).into());
+        b.push(punct(second, tt::Spacing::Alone, span).into());
+    })
+}
+
+fn fat_arrow(b: &mut Builder, span: Span) {
+    joint(b, span, '=', '>')
+}
+
+fn and_and(b: &mut Builder, span: Span) {
+    joint(b, span, '&', '&')
+}
+
+fn eq_eq(b: &mut Builder, span: Span) {
+    joint(b, span, '=', '=')
+}
+
+impl BasicAdtInfo {
+    fn is_empty_enum(&self) -> bool {
+        matches!(self.shape.kind, AdtKind::Enum { .. }) && self.shape.variants.is_empty()
+    }
+
+    fn is_enum(&self) -> bool {
+        matches!(self.shape.kind, AdtKind::Enum { .. })
+    }
+
+    fn packed_struct(&self) -> bool {
+        self.packed && matches!(self.shape.kind, AdtKind::Struct)
+    }
+
+    /// What a pattern over `self` (`suffix` `_self`) or `other` (`_other`) binds each field of
+    /// [`AdtShape::fields`] to: the name of the field may be that of a tuple struct or a constant
+    /// in scope, which a binding can't have. One interning per field per derive.
+    fn bindings(&self, suffix: &str) -> Vec<tt::Ident> {
+        let mut out = Vec::with_capacity(self.shape.fields.len());
+        out.extend(self.shape.fields.iter().map(|it| tt::Ident {
+            sym: joined(it.sym.as_str(), suffix),
+            span: it.span,
+            is_raw: tt::IdentIsRaw::No,
+        }));
+        out
+    }
+
+    /// `Name` or `Name::Variant`.
+    fn write_path(&self, b: &mut Builder, span: Span, v: &Variant) {
+        let name = &self.name;
+        if self.is_enum() {
+            let variant = &v.name;
+            in_group(b, span, |b| quote_into!(b, span => #name :: #variant))
+        } else {
+            in_group(b, span, |b| quote_into!(b, span => #name))
+        }
+    }
+
+    /// The variant's pattern or expression: its path, and what `field` writes in the place of
+    /// each field (by its index in [`AdtShape::fields`]).
+    fn write_variant(
+        &self,
+        b: &mut Builder,
+        span: Span,
+        v: &Variant,
+        field: impl Fn(&mut Builder, usize),
+    ) {
+        match v.kind {
+            FieldsKind::Unit => self.write_path(b, span, v),
+            FieldsKind::Record => in_group(b, span, |b| {
+                self.write_path(b, span, v);
+                delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                    for i in v.fields() {
+                        let it = &self.shape.fields[i];
+                        in_group(b, span, |b| {
+                            quote_into!(b, span => #it :);
+                            field(b, i);
+                            quote_into!(b, span => ,);
+                        });
+                    }
+                });
+            }),
+            FieldsKind::Tuple => in_group(b, span, |b| {
+                self.write_path(b, span, v);
+                delimited(b, tt::DelimiterKind::Parenthesis, span, |b| {
+                    for i in v.fields() {
+                        in_group(b, span, |b| {
+                            field(b, i);
+                            quote_into!(b, span => ,);
+                        });
+                    }
+                });
+            }),
+        }
+    }
+
+    /// The variant's pattern, which binds each field to its name in `bindings`.
+    fn write_pattern(&self, b: &mut Builder, span: Span, v: &Variant, bindings: &[tt::Ident]) {
+        self.write_variant(b, span, v, |b, i| {
+            let bound = &bindings[i];
+            in_group(b, span, |b| quote_into!(b, span => #bound))
+        })
+    }
+
+    /// For a packed struct, a `let` of each field of `self` (or `other`) to a copy out of it, to
+    /// the name in `bindings` the patterns of the other derives bind it to.
+    fn write_packed_lets(&self, b: &mut Builder, bindings: &[tt::Ident], other: bool) {
+        let Some(v) = self.shape.variants.first() else { return };
+        for i in v.fields() {
+            let field = &self.shape.fields[i];
+            let at = field.span;
+            let bound = &bindings[i];
+            let index = i - v.start as usize;
+            let place = group(at, |b| match v.kind {
+                FieldsKind::Tuple => quote_into!(b, at => #index),
+                _ => quote_into!(b, at => #field),
+            });
+            in_group(b, at, |b| {
+                if other {
+                    quote_into!(b, at => let #bound = { other . #place };)
+                } else {
+                    quote_into!(b, at => let #bound = { self . #place };)
+                }
+            });
+        }
+    }
+
+    /// A `match` of `self` against each variant's pattern, with the arm `body` writes for it. A
+    /// packed struct's fields are copied out of it instead, as rustc's derives do
+    /// (`{ self.x }`): a field may be misaligned, so isn't borrowed, and moving one that isn't
+    /// `Copy` is E0507, where the field is.
+    fn write_match_self(
+        &self,
+        b: &mut Builder,
+        span: Span,
+        selfs: &[tt::Ident],
+        body: impl Fn(&mut Builder, &Variant),
+    ) {
+        if self.packed_struct() {
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                self.write_packed_lets(b, selfs, false);
+                body(b, &self.shape.variants[0]);
+            });
+            return;
+        }
+        in_group(b, span, |b| {
+            quote_into!(b, span => match self);
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                for v in &self.shape.variants {
+                    in_group(b, span, |b| {
+                        self.write_pattern(b, span, v, selfs);
+                        fat_arrow(b, span);
+                        body(b, v);
+                        quote_into!(b, span => ,);
+                    });
+                }
+            });
+        });
+    }
+
+    /// A `match` of `self` and `other` against each of `arms`' two patterns, with the arm
+    /// `body` writes for it, and `fallback` if none matches. A packed struct's fields are copied
+    /// out of both, as by [`Self::write_match_self`].
+    fn write_match_both<'a>(
+        &'a self,
+        b: &mut Builder,
+        span: Span,
+        (selfs, others): (&[tt::Ident], &[tt::Ident]),
+        arms: impl Iterator<Item = &'a Variant>,
+        body: impl Fn(&mut Builder, &Variant),
+        fallback: impl FnOnce(&mut Builder),
+    ) {
+        if self.packed_struct() {
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                self.write_packed_lets(b, selfs, false);
+                self.write_packed_lets(b, others, true);
+                body(b, &self.shape.variants[0]);
+            });
+            return;
+        }
+        in_group(b, span, |b| {
+            quote_into!(b, span => match (self, other));
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                for v in arms {
+                    in_group(b, span, |b| {
+                        delimited(b, tt::DelimiterKind::Parenthesis, span, |b| {
+                            self.write_pattern(b, span, v, selfs);
+                            quote_into!(b, span => ,);
+                            self.write_pattern(b, span, v, others);
+                        });
+                        fat_arrow(b, span);
+                        body(b, v);
+                        quote_into!(b, span => ,);
+                    });
+                }
+                quote_into!(b, span => _unused);
+                fat_arrow(b, span);
+                fallback(b);
+            });
+        });
+    }
 }
 
 // FIXME: This whole thing needs a refactor. Each derive requires its special values, and the result is a mess.
@@ -408,46 +501,80 @@ fn parse_adt(
     parse_adt_from_syntax(&adt, &tm, call_site)
 }
 
+/// Pushes the fields of `list` to `fields`, and says how they are written.
+fn push_fields(
+    fields: &mut Vec<tt::Ident>,
+    call_site: Span,
+    tm: &ExpansionSpanMap,
+    list: Option<FieldList>,
+) -> Result<FieldsKind, ExpandError> {
+    let at_field = |span: Span| Span { ctx: call_site.ctx, ..span };
+    Ok(match list {
+        None => FieldsKind::Unit,
+        Some(FieldList::RecordFieldList(it)) => {
+            for field in it.fields() {
+                let name = name_to_token(call_site, tm, field.name())?;
+                fields.push(tt::Ident { span: at_field(name.span), ..name });
+            }
+            FieldsKind::Record
+        }
+        Some(FieldList::TupleFieldList(it)) => {
+            for (i, field) in it.fields().enumerate() {
+                let at = field
+                    .ty()
+                    .map_or_else(|| field.syntax().text_range(), |ty| ty.syntax().text_range());
+                fields.push(tt::Ident {
+                    sym: tuple_field_symbol(i),
+                    span: at_field(tm.span_at(at.start())),
+                    is_raw: tt::IdentIsRaw::No,
+                });
+            }
+            FieldsKind::Tuple
+        }
+    })
+}
+
+fn len_u32(len: usize) -> u32 {
+    u32::try_from(len).expect("fewer than 2^32 fields")
+}
+
 fn parse_adt_from_syntax(
     adt: &ast::Adt,
     tm: &span::SpanMap,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
-    let (name, generic_param_list, where_clause, shape) = match &adt {
-        ast::Adt::Struct(it) => (
-            it.name(),
-            it.generic_param_list(),
-            it.where_clause(),
-            AdtShape::Struct(VariantShape::from(call_site, tm, it.field_list())?),
-        ),
+    let mut fields = Vec::new();
+    let mut variants = Vec::new();
+    // A struct's one variant takes its name, which is read last, as the errors are.
+    let mut struct_fields = None;
+    let (name, generic_param_list, where_clause, kind) = match &adt {
+        ast::Adt::Struct(it) => {
+            struct_fields = Some(push_fields(&mut fields, call_site, tm, it.field_list())?);
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtKind::Struct)
+        }
         ast::Adt::Enum(it) => {
-            let default_variant = it
-                .variant_list()
-                .into_iter()
-                .flat_map(|it| it.variants())
-                .position(|it| it.attrs().any(|it| it.simple_name() == Some("default".into())));
+            let mut default_variant = None;
+            for (i, variant) in it.variant_list().into_iter().flat_map(|it| it.variants()).enumerate()
+            {
+                if default_variant.is_none()
+                    && variant.attrs().any(|it| it.simple_name() == Some("default".into()))
+                {
+                    default_variant = Some(i);
+                }
+                let name = name_to_token(call_site, tm, variant.name())?;
+                let start = len_u32(fields.len());
+                let kind = push_fields(&mut fields, call_site, tm, variant.field_list())?;
+                variants.push(Variant { name, kind, start, end: len_u32(fields.len()) });
+            }
             (
                 it.name(),
                 it.generic_param_list(),
                 it.where_clause(),
-                AdtShape::Enum {
-                    default_variant,
-                    variants: it
-                        .variant_list()
-                        .into_iter()
-                        .flat_map(|it| it.variants())
-                        .map(|it| {
-                            Ok((
-                                name_to_token(call_site, tm, it.name())?,
-                                VariantShape::from(call_site, tm, it.field_list())?,
-                            ))
-                        })
-                        .collect::<Result<_, ExpandError>>()?,
-                },
+                AdtKind::Enum { default_variant },
             )
         }
         ast::Adt::Union(it) => {
-            (it.name(), it.generic_param_list(), it.where_clause(), AdtShape::Union)
+            (it.name(), it.generic_param_list(), it.where_clause(), AdtKind::Union)
         }
     };
 
@@ -464,53 +591,29 @@ fn parse_adt_from_syntax(
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
         .collect();
-    let mut param_type_set: FxHashSet<Name> = FxHashSet::default();
+    let mut param_names: SmallVec<[Name; 4]> = SmallVec::new();
     let param_types = generic_param_list
         .into_iter()
         .flat_map(|param_list| param_list.type_or_const_params())
         .map(|param| {
-            let name = {
-                let this = param.name();
-                match this {
-                    Some(it) => {
-                        param_type_set.insert(it.as_name());
-                        syntax_bridge::syntax_node_to_token_tree(
-                            it.syntax(),
-                            tm,
-                            call_site,
-                            DocCommentDesugarMode::ProcMacro,
-                        )
+            let name = match param.name() {
+                Some(it) => {
+                    let name = it.as_name();
+                    if !param_names.contains(&name) {
+                        param_names.push(name);
                     }
-                    None => {
-                        tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
-                    }
+                    to_tt(it.syntax())
                 }
+                None => tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site }),
             };
             let bounds = match &param {
-                ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| {
-                    syntax_bridge::syntax_node_to_token_tree(
-                        it.syntax(),
-                        tm,
-                        call_site,
-                        DocCommentDesugarMode::ProcMacro,
-                    )
-                }),
+                ast::TypeOrConstParam::Type(it) => it.type_bound_list().map(|it| to_tt(it.syntax())),
                 ast::TypeOrConstParam::Const(_) => None,
             };
             let const_ty = if let ast::TypeOrConstParam::Const(param) = param {
-                let ty = param
-                    .ty()
-                    .map(|ty| {
-                        syntax_bridge::syntax_node_to_token_tree(
-                            ty.syntax(),
-                            tm,
-                            call_site,
-                            DocCommentDesugarMode::ProcMacro,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
-                    });
+                let ty = param.ty().map(|ty| to_tt(ty.syntax())).unwrap_or_else(|| {
+                    tt::TopSubtree::empty(::tt::DelimSpan { open: call_site, close: call_site })
+                });
                 Some(ty)
             } else {
                 None
@@ -519,19 +622,9 @@ fn parse_adt_from_syntax(
         })
         .collect();
 
-    let where_clause = if let Some(w) = where_clause {
-        w.predicates()
-            .map(|it| {
-                syntax_bridge::syntax_node_to_token_tree(
-                    it.syntax(),
-                    tm,
-                    call_site,
-                    DocCommentDesugarMode::ProcMacro,
-                )
-            })
-            .collect()
-    } else {
-        vec![]
+    let where_clause = match where_clause {
+        Some(w) => w.predicates().map(|it| to_tt(it.syntax())).collect(),
+        None => Vec::new(),
     };
 
     // For a generic parameter `T`, when shorthand associated type `T::Assoc` appears in field
@@ -544,45 +637,41 @@ fn parse_adt_from_syntax(
 
     // It's cumbersome to deal with the distinct structures of ADTs, so let's just get untyped
     // `SyntaxNode` that contains fields and look for descendant `ast::PathType`s. Of note is that
-    // we should not inspect `ast::PathType`s in parameter bounds and where clauses.
-    let field_list = match adt {
-        ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()),
-        ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()),
-        ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()),
+    // we should not inspect `ast::PathType`s in parameter bounds and where clauses. A type
+    // without type parameters has none, and its fields aren't walked.
+    let associated_types = if param_names.is_empty() {
+        Vec::new()
+    } else {
+        let field_list = match adt {
+            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()),
+            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()),
+            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()),
+        };
+        field_list
+            .into_iter()
+            .flat_map(|it| it.descendants())
+            .filter_map(ast::PathType::cast)
+            .filter_map(|p| {
+                let name = p.path()?.qualifier()?.as_single_name_ref()?.as_name();
+                param_names.contains(&name).then_some(p)
+            })
+            .map(|it| to_tt(it.syntax()))
+            .collect()
     };
-    let associated_types = field_list
-        .into_iter()
-        .flat_map(|it| it.descendants())
-        .filter_map(ast::PathType::cast)
-        .filter_map(|p| {
-            let name = p.path()?.qualifier()?.as_single_name_ref()?.as_name();
-            param_type_set.contains(&name).then_some(p)
-        })
-        .map(|it| {
-            syntax_bridge::syntax_node_to_token_tree(
-                it.syntax(),
-                tm,
-                call_site,
-                DocCommentDesugarMode::ProcMacro,
-            )
-        })
-        .collect();
     let name_token = name_to_token(call_site, tm, name)?;
-    let packed = adt.attrs().any(|attr| {
-        let text = attr.syntax().text().to_string();
-        let mut words = text
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|word| !word.is_empty() && *word != "r");
-        words.next() == Some("repr") && words.any(|word| word == "packed")
-    });
+    if let Some(kind) = struct_fields {
+        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) });
+    }
+    let packed = adt.attrs().any(|attr| attr_words_have(&attr, "repr", &["r"], "packed"));
     Ok(BasicAdtInfo {
         name: name_token,
-        shape,
+        shape: AdtShape { kind, variants, fields },
         param_types,
         lifetimes,
         where_clause,
         associated_types,
         packed,
+        copy_bounds: false,
     })
 }
 
@@ -616,6 +705,21 @@ fn name_to_token(
     Ok(name_token)
 }
 
+fn empty(span: Span) -> tt::TopSubtree {
+    tt::TopSubtree::empty(tt::DelimSpan::from_single(span))
+}
+
+/// The builder of a derive's expansion, whose top subtree is dropped if it holds one subtree.
+fn write_derive(span: Span, f: impl FnOnce(&mut Builder)) -> tt::TopSubtree {
+    let mut b = Builder::new(tt::Delimiter {
+        kind: tt::DelimiterKind::Invisible,
+        open: span,
+        close: span,
+    });
+    f(&mut b);
+    b.build_skip_top_subtree()
+}
+
 /// Given that we are deriving a trait `DerivedTrait` for a type like:
 ///
 /// ```ignore (only-for-syntax-highlight)
@@ -647,16 +751,15 @@ fn name_to_token(
 ///
 /// where B1, ..., BN are the bounds given by `bounds_paths`. Z is a phantom type, and
 /// therefore does not get bound by the derived trait.
-fn expand_simple_derive(
-    db: &dyn SourceDatabase,
+fn expand_simple_derive<P: ToTokenTree + Copy>(
     invoc_span: Span,
-    tt: &tt::TopSubtree,
-    trait_path: tt::TopSubtree,
+    info: Result<BasicAdtInfo, ExpandError>,
+    trait_path: P,
     allow_unions: bool,
     copy_if_packed: bool,
-    make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::TopSubtree,
+    make_trait_body: impl FnOnce(&mut Builder, &BasicAdtInfo),
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut info = match parse_adt(db, tt, invoc_span) {
+    let mut info = match info {
         Ok(info) => info,
         Err(e) => {
             return ExpandResult::new(
@@ -665,86 +768,78 @@ fn expand_simple_derive(
             );
         }
     };
-    if !allow_unions && matches!(info.shape, AdtShape::Union) {
+    if !allow_unions && matches!(info.shape.kind, AdtKind::Union) {
         return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
+            empty(invoc_span),
             ExpandError::builtin_derive(invoc_span, "this trait cannot be derived for unions"),
         );
     }
-    if info.packed && copy_if_packed {
-        // As rustc's (`needs_copy_as_bound_if_packed`): the fields are copied out, so what
-        // their types are made of is `Copy` too.
-        let krate = &dollar_crate(invoc_span);
-        let types = info.param_types.iter().filter(|it| it.const_ty.is_none()).map(|it| &it.name);
-        let copy: Vec<_> = types
-            .chain(&info.associated_types)
-            .map(|it| quote! {invoc_span => #it : #krate::marker::Copy })
-            .collect();
-        info.where_clause.extend(copy);
-    }
-    ExpandResult::ok(expand_simple_derive_with_parsed(
-        invoc_span,
-        info,
-        trait_path,
-        make_trait_body,
-        true,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(invoc_span)),
-    ))
+    info.copy_bounds = info.packed && copy_if_packed;
+    let no_extra_params = group(invoc_span, |_| {});
+    ExpandResult::ok(write_derive(invoc_span, |b| {
+        write_impl(b, invoc_span, &info, trait_path, true, &no_extra_params, |b| {
+            make_trait_body(b, &info)
+        })
+    }))
 }
 
-fn expand_simple_derive_with_parsed(
-    invoc_span: Span,
-    info: BasicAdtInfo,
-    trait_path: tt::TopSubtree,
-    make_trait_body: impl FnOnce(&BasicAdtInfo) -> tt::TopSubtree,
+/// `impl<..> Trait for Name<..> where .. { .. }`, the body written by `trait_body`.
+fn write_impl<P: ToTokenTree + Copy, X: ToTokenTree + Copy>(
+    b: &mut Builder,
+    s: Span,
+    info: &BasicAdtInfo,
+    trait_path: P,
     constrain_to_trait: bool,
-    extra_impl_params: tt::TopSubtree,
-) -> tt::TopSubtree {
-    let trait_body = make_trait_body(&info);
-    let mut where_block: Vec<_> =
-        info.where_clause.into_iter().map(|w| quote! {invoc_span => #w , }).collect();
-    let (params, args): (Vec<_>, Vec<_>) = info
-        .param_types
-        .into_iter()
-        .map(|param| {
-            let ident = param.name;
-            if let Some(b) = param.bounds {
-                let ident2 = ident.clone();
-                where_block.push(quote! {invoc_span => #ident2 : #b , });
-            }
-            if let Some(ty) = param.const_ty {
-                let ident2 = ident.clone();
-                (quote! {invoc_span => const #ident : #ty , }, quote! {invoc_span => #ident2 , })
-            } else {
-                let bound = trait_path.clone();
-                let ident2 = ident.clone();
-                let param = if constrain_to_trait {
-                    quote! {invoc_span => #ident : #bound , }
-                } else {
-                    quote! {invoc_span => #ident , }
-                };
-                (param, quote! {invoc_span => #ident2 , })
-            }
-        })
-        .unzip();
-
+    extra_impl_params: X,
+    trait_body: impl FnOnce(&mut Builder),
+) {
+    quote_into!(b, s => impl <);
+    for (param, _) in &info.lifetimes {
+        in_group(b, s, |b| quote_into!(b, s => #param ,));
+    }
+    for param in &info.param_types {
+        let name = &param.name;
+        in_group(b, s, |b| match &param.const_ty {
+            Some(ty) => quote_into!(b, s => const #name : #ty ,),
+            None if constrain_to_trait => quote_into!(b, s => #name : #trait_path ,),
+            None => quote_into!(b, s => #name ,),
+        });
+    }
+    let name = &info.name;
+    quote_into!(b, s => #extra_impl_params > #trait_path for #name <);
+    for (_, lifetime) in &info.lifetimes {
+        in_group(b, s, |b| quote_into!(b, s => #lifetime ,));
+    }
+    for param in &info.param_types {
+        let name = &param.name;
+        in_group(b, s, |b| quote_into!(b, s => #name ,));
+    }
+    quote_into!(b, s => > where);
+    for predicate in &info.where_clause {
+        in_group(b, s, |b| quote_into!(b, s => #predicate ,));
+    }
+    if info.copy_bounds {
+        let krate = &dollar_crate(s);
+        let types = info.param_types.iter().filter(|it| it.const_ty.is_none()).map(|it| &it.name);
+        for ty in types.chain(&info.associated_types) {
+            in_group(b, s, |b| {
+                in_group(b, s, |b| quote_into!(b, s => #ty : #krate::marker::Copy));
+                quote_into!(b, s => ,);
+            });
+        }
+    }
+    for param in &info.param_types {
+        if let Some(bounds) = &param.bounds {
+            let name = &param.name;
+            in_group(b, s, |b| quote_into!(b, s => #name : #bounds ,));
+        }
+    }
     if constrain_to_trait {
-        where_block.extend(info.associated_types.iter().map(|it| {
-            let it = it.clone();
-            let bound = trait_path.clone();
-            quote! {invoc_span => #it : #bound , }
-        }));
+        for ty in &info.associated_types {
+            in_group(b, s, |b| quote_into!(b, s => #ty : #trait_path ,));
+        }
     }
-
-    let (lifetime_params, lifetime_args): (Vec<_>, Vec<_>) = info
-        .lifetimes
-        .into_iter()
-        .map(|(param, name)| (quote! {invoc_span => #param , }, quote! {invoc_span => #name , }))
-        .unzip();
-    let name = info.name;
-    quote! {invoc_span =>
-        impl < # #lifetime_params # #params #extra_impl_params > #trait_path for #name < # #lifetime_args # #args > where # #where_block { #trait_body }
-    }
+    delimited(b, tt::DelimiterKind::Brace, s, trait_body);
 }
 
 fn copy_expand(
@@ -752,16 +847,16 @@ fn copy_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = dollar_crate(span);
-    expand_simple_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::marker::Copy },
-        true,
-        false,
-        |_| quote! {span =>},
-    )
+    copy_derive(span, parse_adt(db, tt, span))
+}
+
+fn copy_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::Copy));
+    expand_simple_derive(span, info, &trait_path, true, false, |b, _| empty_group(b, span))
 }
 
 /// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
@@ -771,16 +866,16 @@ fn const_param_ty_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = dollar_crate(span);
-    expand_simple_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::marker::ConstParamTy_ },
-        true,
-        false,
-        |_| quote! {span =>},
-    )
+    const_param_ty_derive(span, parse_adt(db, tt, span))
+}
+
+fn const_param_ty_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::ConstParamTy_));
+    expand_simple_derive(span, info, &trait_path, true, false, |b, _| empty_group(b, span))
 }
 
 /// `#[derive(From)]` (`derive_from`): `From` of the type of a struct's one field, as rustc's
@@ -791,45 +886,53 @@ fn from_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let empty = || tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
     let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
-        Err(err) => return ExpandResult::new(empty(), err),
+        Err(err) => return ExpandResult::new(empty(span), err),
     };
-    let strukt = match &adt {
+    from_derive(span, &adt, &span_map)
+}
+
+fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandResult<tt::TopSubtree> {
+    let strukt = match adt {
         ast::Adt::Struct(it) => it,
         ast::Adt::Enum(_) => {
             return ExpandResult::new(
-                empty(),
+                empty(span),
                 ExpandError::builtin_derive(span, "`#[derive(From)]` used on an enum"),
             );
         }
         ast::Adt::Union(_) => {
             return ExpandResult::new(
-                empty(),
+                empty(span),
                 ExpandError::builtin_derive(span, "`#[derive(From)]` used on a union"),
             );
         }
     };
-    let field_types: Vec<_> = match strukt.field_list() {
-        Some(FieldList::RecordFieldList(it)) => it.fields().map(|it| it.ty()).collect(),
-        Some(FieldList::TupleFieldList(it)) => it.fields().map(|it| it.ty()).collect(),
-        None => vec![],
-    };
+    let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
+    match strukt.field_list() {
+        Some(FieldList::RecordFieldList(it)) => {
+            field_types.extend(it.fields().map(|it| it.ty()).take(2))
+        }
+        Some(FieldList::TupleFieldList(it)) => {
+            field_types.extend(it.fields().map(|it| it.ty()).take(2))
+        }
+        None => {}
+    }
     let field_ty = match &field_types[..] {
         [Some(ty)] => syntax_bridge::syntax_node_to_token_tree(
             ty.syntax(),
-            &span_map,
+            span_map,
             span,
             DocCommentDesugarMode::ProcMacro,
         ),
         [None] => {
-            return ExpandResult::new(empty(), ExpandError::other(span, "missing field type"));
+            return ExpandResult::new(empty(span), ExpandError::other(span, "missing field type"));
         }
         fields => {
             let count = if fields.is_empty() { "no fields" } else { "multiple fields" };
             return ExpandResult::new(
-                empty(),
+                empty(span),
                 ExpandError::builtin_derive(
                     span,
                     format!("`#[derive(From)]` used on a struct with {count}"),
@@ -837,40 +940,32 @@ fn from_expand(
             );
         }
     };
-    let info = match parse_adt_from_syntax(&adt, &span_map, span) {
+    let info = match parse_adt_from_syntax(adt, span_map, span) {
         Ok(it) => it,
-        Err(err) => return ExpandResult::new(empty(), err),
+        Err(err) => return ExpandResult::new(empty(span), err),
     };
-    let krate = dollar_crate(span);
-    let value = || tt::Ident::new("value", span);
-    let body = match &info.shape {
-        AdtShape::Struct(VariantShape::Struct(fields)) => {
-            let (field, value) = (&fields[0], value());
-            quote! {span => Self { #field : #value } }
-        }
-        _ => {
-            let value = value();
-            quote! {span => Self ( #value ) }
-        }
+    let krate = &dollar_crate(span);
+    let field_ty = &field_ty;
+    let record_field = match info.shape.variants.first() {
+        Some(Variant { kind: FieldsKind::Record, .. }) => info.shape.fields.first(),
+        _ => None,
     };
-    let trait_path = {
-        let field_ty = field_ty.clone();
-        quote! {span => #krate::convert::From<#field_ty> }
-    };
-    ExpandResult::ok(expand_simple_derive_with_parsed(
-        span,
-        info,
-        trait_path,
-        |_| {
-            let value = value();
-            quote! {span =>
-                #[inline]
-                fn from(#value : #field_ty) -> Self { #body }
-            }
-        },
-        false,
-        empty(),
-    ))
+    let body = group(span, |b| match record_field {
+        Some(field) => quote_into!(b, span => Self { #field : value }),
+        None => quote_into!(b, span => Self ( value )),
+    });
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
+    let no_extra_params = group(span, |_| {});
+    ExpandResult::ok(write_derive(span, |b| {
+        write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| {
+            in_group(b, span, |b| {
+                quote_into!(b, span =>
+                    #[inline]
+                    fn from(value : #field_ty) -> Self { #body }
+                )
+            })
+        })
+    }))
 }
 
 fn reborrow_expand(
@@ -878,14 +973,16 @@ fn reborrow_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = dollar_crate(span);
-    expand_reborrow_marker_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::marker::Reborrow },
-        "Reborrow",
-    )
+    reborrow_derive(span, parse_adt(db, tt, span))
+}
+
+fn reborrow_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::Reborrow));
+    expand_reborrow_marker_derive(span, info, &trait_path, "Reborrow")
 }
 
 fn coerce_shared_expand(
@@ -896,18 +993,18 @@ fn coerce_shared_expand(
     let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
+            return ExpandResult::new(empty(span), err);
         }
     };
     let ast::Adt::Struct(strukt) = &adt else {
         return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+            empty(span),
             ExpandError::builtin_derive(span, "`CoerceShared` can only be derived on `struct`s"),
         );
     };
     let Some(target) = coerce_shared_target(db, span, strukt) else {
         return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+            empty(span),
             ExpandError::builtin_derive(
                 span,
                 "`derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute",
@@ -917,37 +1014,35 @@ fn coerce_shared_expand(
     let info = match parse_adt_from_syntax(&adt, &span_map, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
+            return ExpandResult::new(empty(span), err);
         }
     };
 
-    let krate = dollar_crate(span);
-    ExpandResult::ok(expand_simple_derive_with_parsed(
-        span,
-        info,
-        quote! {span => #krate::marker::CoerceShared<#target> },
-        |_| quote! {span => },
-        false,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-    ))
+    let krate = &dollar_crate(span);
+    let target = &target;
+    let trait_path =
+        group(span, |b| quote_into!(b, span => #krate::marker::CoerceShared<#target>));
+    let no_extra_params = group(span, |_| {});
+    ExpandResult::ok(write_derive(span, |b| {
+        write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| empty_group(b, span))
+    }))
 }
 
-fn expand_reborrow_marker_derive(
-    db: &dyn SourceDatabase,
+fn expand_reborrow_marker_derive<P: ToTokenTree + Copy>(
     span: Span,
-    tt: &tt::TopSubtree,
-    trait_path: tt::TopSubtree,
+    info: Result<BasicAdtInfo, ExpandError>,
+    trait_path: P,
     trait_name: &'static str,
 ) -> ExpandResult<tt::TopSubtree> {
-    let info = match parse_adt(db, tt, span) {
+    let info = match info {
         Ok(info) => info,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
+            return ExpandResult::new(empty(span), err);
         }
     };
-    if !matches!(info.shape, AdtShape::Struct(_)) {
+    if !matches!(info.shape.kind, AdtKind::Struct) {
         return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+            empty(span),
             ExpandError::builtin_derive(
                 span,
                 format!("`{trait_name}` can only be derived on `struct`s"),
@@ -955,14 +1050,10 @@ fn expand_reborrow_marker_derive(
         );
     }
 
-    ExpandResult::ok(expand_simple_derive_with_parsed(
-        span,
-        info,
-        trait_path,
-        |_| quote! {span => },
-        false,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-    ))
+    let no_extra_params = group(span, |_| {});
+    ExpandResult::ok(write_derive(span, |b| {
+        write_impl(b, span, &info, trait_path, false, &no_extra_params, |b| empty_group(b, span))
+    }))
 }
 
 fn coerce_shared_target(
@@ -1012,73 +1103,66 @@ fn clone_expand(
     clone_expand_with(db, span, tt, false)
 }
 
-/// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
-/// that has no type parameters.
 fn clone_expand_with(
     db: &dyn SourceDatabase,
     span: Span,
     tt: &tt::TopSubtree,
     copy: bool,
 ) -> ExpandResult<tt::TopSubtree> {
+    clone_derive(span, parse_adt(db, tt, span), copy)
+}
+
+/// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
+/// that has no type parameters.
+fn clone_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+    copy: bool,
+) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::clone::Clone }, true, true, |adt| {
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::clone::Clone));
+    expand_simple_derive(span, info, &trait_path, true, true, |b, adt| {
         let copy = copy && adt.param_types.iter().all(|param| param.const_ty.is_some());
-        if copy || matches!(adt.shape, AdtShape::Union) {
-            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
-            return quote! {span =>
-                fn clone(&self) -> Self {
-                    #star self
-                }
-            };
+        let star = punct('*', tt::Spacing::Alone, span);
+        if copy || matches!(adt.shape.kind, AdtKind::Union) {
+            return in_group(b, span, |b| {
+                quote_into!(b, span =>
+                    fn clone(&self) -> Self {
+                        #star self
+                    }
+                )
+            });
         }
-        if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
-            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
-            return quote! {span =>
-                fn clone(&self) -> Self {
-                    match #star self {}
-                }
-            };
+        if adt.is_empty_enum() {
+            return in_group(b, span, |b| {
+                quote_into!(b, span =>
+                    fn clone(&self) -> Self {
+                        match #star self {}
+                    }
+                )
+            });
         }
-        let name = &adt.name;
-        let patterns = adt.shape.as_pattern(span, name);
-        let exprs = adt.shape.as_pattern_map(
-            name,
-            |it| {
-                let bound = bound_of_self(it);
-                // A packed struct's field is a copy out of it, which is cloned by reference.
+        let selfs = adt.bindings("_self");
+        let clone_field = |b: &mut Builder, i: usize| {
+            let bound = &selfs[i];
+            // A packed struct's field is a copy out of it, which is cloned by reference.
+            in_group(b, span, |b| {
                 if adt.packed {
-                    quote! {span => #krate::clone::Clone::clone(&#bound) }
+                    quote_into!(b, span => #krate::clone::Clone::clone(&#bound))
                 } else {
-                    quote! {span => #krate::clone::Clone::clone(#bound) }
+                    quote_into!(b, span => #krate::clone::Clone::clone(#bound))
                 }
-            },
-            span,
-        );
-        let body = adt.match_self(span, patterns.into_iter().zip(exprs).collect());
-        quote! {span =>
-            fn clone(&self) -> Self {
-                #body
-            }
-        }
+            })
+        };
+        in_group(b, span, |b| {
+            quote_into!(b, span => fn clone(&self) -> Self);
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                adt.write_match_self(b, span, &selfs, |b, v| {
+                    adt.write_variant(b, span, v, clone_field)
+                })
+            });
+        });
     })
-}
-
-/// This function exists since `quote! {span => => }` doesn't work.
-fn fat_arrow(span: Span) -> tt::TopSubtree {
-    let eq = tt::Punct { char: '=', spacing: ::tt::Spacing::Joint, span };
-    quote! {span => #eq> }
-}
-
-/// This function exists since `quote! {span => && }` doesn't work.
-fn and_and(span: Span) -> tt::TopSubtree {
-    let and = tt::Punct { char: '&', spacing: ::tt::Spacing::Joint, span };
-    quote! {span => #and& }
-}
-
-/// As [`and_and`], for `==`.
-fn eq_eq(span: Span) -> tt::TopSubtree {
-    let eq = tt::Punct { char: '=', spacing: ::tt::Spacing::Joint, span };
-    quote! {span => #eq= }
 }
 
 fn default_expand(
@@ -1086,8 +1170,15 @@ fn default_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
+    default_derive(span, parse_adt(db, tt, span))
+}
+
+fn default_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    let adt = match parse_adt(db, tt, span) {
+    let adt = match info {
         Ok(info) => info,
         Err(e) => {
             return ExpandResult::new(
@@ -1096,54 +1187,38 @@ fn default_expand(
             );
         }
     };
-    let (body, constrain_to_trait) = match &adt.shape {
-        AdtShape::Struct(fields) => {
-            let name = &adt.name;
-            let body = fields.as_pattern_map(
-                quote!(span =>#name),
-                span,
-                |_| quote!(span =>#krate::default::Default::default()),
-            );
-            (body, true)
-        }
-        AdtShape::Enum { default_variant, variants } => {
-            if let Some(d) = default_variant {
-                let (name, fields) = &variants[*d];
-                let adt_name = &adt.name;
-                let body = fields.as_pattern_map(
-                    quote!(span =>#adt_name :: #name),
-                    span,
-                    |_| quote!(span =>#krate::default::Default::default()),
-                );
-                (body, false)
-            } else {
-                return ExpandResult::new(
-                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::new(span, ExpandErrorKind::DefaultNoVariant),
-                );
-            }
-        }
-        AdtShape::Union => {
+    let (variant, constrain_to_trait) = match &adt.shape.kind {
+        AdtKind::Struct => (&adt.shape.variants[0], true),
+        AdtKind::Enum { default_variant: Some(d) } => (&adt.shape.variants[*d], false),
+        AdtKind::Enum { default_variant: None } => {
             return ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                empty(span),
+                ExpandError::new(span, ExpandErrorKind::DefaultNoVariant),
+            );
+        }
+        AdtKind::Union => {
+            return ExpandResult::new(
+                empty(span),
                 ExpandError::builtin_derive(span, "this trait cannot be derived for unions"),
             );
         }
     };
-    ExpandResult::ok(expand_simple_derive_with_parsed(
-        span,
-        adt,
-        quote! {span => #krate::default::Default },
-        |_adt| {
-            quote! {span =>
-                fn default() -> Self {
-                    #body
-                }
-            }
-        },
-        constrain_to_trait,
-        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-    ))
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::default::Default));
+    let no_extra_params = group(span, |_| {});
+    ExpandResult::ok(write_derive(span, |b| {
+        write_impl(b, span, &adt, &trait_path, constrain_to_trait, &no_extra_params, |b| {
+            in_group(b, span, |b| {
+                quote_into!(b, span => fn default() -> Self);
+                delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                    adt.write_variant(b, span, variant, |b, _| {
+                        in_group(b, span, |b| {
+                            quote_into!(b, span => #krate::default::Default::default())
+                        })
+                    })
+                });
+            })
+        })
+    }))
 }
 
 fn debug_expand(
@@ -1151,88 +1226,88 @@ fn debug_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::fmt::Debug }, false, true, |adt| {
-        let for_variant = |name: String, v: &VariantShape| match v {
-            VariantShape::Struct(fields) => {
-                // Spelled out in full, as rustc does: a method of the same name on some other
-                // trait must not be picked up.
-                let for_fields = fields.iter().enumerate().map(|(i, it)| {
-                    let x_string = it.sym.as_str().to_owned();
-                    let bound = bound_of_self(it);
-                    let by = last_by_ref(adt, span, i + 1 == fields.len());
-                    quote! {span =>
-                        #krate::fmt::DebugStruct::field(&mut ra_expand_builder, #x_string, & #by #bound);
-                    }
-                });
-                quote! {span => {
-                    let mut ra_expand_builder = #krate::fmt::Formatter::debug_struct(f, #name);
-                    # #for_fields
-                    #krate::fmt::DebugStruct::finish(&mut ra_expand_builder)
-                } }
-            }
-            VariantShape::Tuple(spans) => {
-                let for_fields = tuple_field_iterator(spans).enumerate().map(|(i, it)| {
-                    let bound = bound_of_self(&it);
-                    let by = last_by_ref(adt, span, i + 1 == spans.len());
-                    quote! {span =>
-                        #krate::fmt::DebugTuple::field(&mut ra_expand_builder, & #by #bound);
-                    }
-                });
-                quote! {span => {
-                    let mut ra_expand_builder = #krate::fmt::Formatter::debug_tuple(f, #name);
-                    # #for_fields
-                    #krate::fmt::DebugTuple::finish(&mut ra_expand_builder)
-                } }
-            }
-            VariantShape::Unit => quote! {span =>
-                #krate::fmt::Formatter::write_str(f, #name)
-            },
-        };
-        if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
-            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
-            return quote! {span =>
-                fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result {
-                    match #star self {}
-                }
-            };
-        }
-        let arms = match &adt.shape {
-            AdtShape::Struct(fields) => {
-                let name = &adt.name;
-                let pat = fields.as_pattern(quote!(span =>#name), span);
-                let expr = for_variant(name.sym.as_str().to_owned(), fields);
-                vec![(pat, expr)]
-            }
-            AdtShape::Enum { variants, .. } => variants
-                .iter()
-                .map(|(name, v)| {
-                    let adt_name = &adt.name;
-                    let pat = v.as_pattern(quote!(span =>#adt_name :: #name), span);
-                    let expr = for_variant(name.sym.as_str().to_owned(), v);
-                    (pat, expr)
-                })
-                .collect(),
-            AdtShape::Union => unreachable!(),
-        };
-        let body = adt.match_self(span, arms);
-        quote! {span =>
-            fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result {
-                #body
-            }
-        }
-    })
+    debug_derive(span, parse_adt(db, tt, span))
 }
 
-/// The `&` that rustc's `Debug` puts before the last field of a packed struct, which may be
-/// unsized: a `&dyn Debug` is made of a reference to the copy out of it.
-fn last_by_ref(adt: &BasicAdtInfo, span: Span, last: bool) -> tt::TopSubtree {
-    if adt.packed && last {
-        let and = tt::Punct { char: '&', spacing: ::tt::Spacing::Alone, span };
-        quote! {span => #and }
-    } else {
-        quote! {span =>}
-    }
+fn debug_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::fmt::Debug));
+    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+        if adt.is_empty_enum() {
+            let star = punct('*', tt::Spacing::Alone, span);
+            return in_group(b, span, |b| {
+                quote_into!(b, span =>
+                    fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result {
+                        match #star self {}
+                    }
+                )
+            });
+        }
+        let selfs = adt.bindings("_self");
+        // The `&` that rustc's `Debug` puts before the last field of a packed struct, which may
+        // be unsized: a `&dyn Debug` is made of a reference to the copy out of it.
+        let by_ref = |b: &mut Builder, v: &Variant, i: usize| {
+            in_group(b, span, |b| {
+                if adt.packed && i + 1 == v.end as usize {
+                    b.push(punct('&', tt::Spacing::Alone, span).into());
+                }
+            })
+        };
+        // Spelled out in full, as rustc does: a method of the same name on some other trait must
+        // not be picked up.
+        let for_variant = |b: &mut Builder, v: &Variant| {
+            let name = v.name.sym.as_str();
+            match v.kind {
+                FieldsKind::Record => delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                    quote_into!(b, span =>
+                        let mut ra_expand_builder = #krate::fmt::Formatter::debug_struct(f, #name);
+                    );
+                    for i in v.fields() {
+                        let field_name = adt.shape.fields[i].sym.as_str();
+                        let bound = &selfs[i];
+                        let by = group(span, |b| by_ref(b, v, i));
+                        in_group(b, span, |b| {
+                            quote_into!(b, span =>
+                                #krate::fmt::DebugStruct::field(&mut ra_expand_builder, #field_name, & #by #bound);
+                            )
+                        });
+                    }
+                    quote_into!(b, span =>
+                        #krate::fmt::DebugStruct::finish(&mut ra_expand_builder)
+                    );
+                }),
+                FieldsKind::Tuple => delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                    quote_into!(b, span =>
+                        let mut ra_expand_builder = #krate::fmt::Formatter::debug_tuple(f, #name);
+                    );
+                    for i in v.fields() {
+                        let bound = &selfs[i];
+                        let by = group(span, |b| by_ref(b, v, i));
+                        in_group(b, span, |b| {
+                            quote_into!(b, span =>
+                                #krate::fmt::DebugTuple::field(&mut ra_expand_builder, & #by #bound);
+                            )
+                        });
+                    }
+                    quote_into!(b, span =>
+                        #krate::fmt::DebugTuple::finish(&mut ra_expand_builder)
+                    );
+                }),
+                FieldsKind::Unit => in_group(b, span, |b| {
+                    quote_into!(b, span => #krate::fmt::Formatter::write_str(f, #name))
+                }),
+            }
+        };
+        in_group(b, span, |b| {
+            quote_into!(b, span => fn fmt(&self, f: &mut #krate::fmt::Formatter) -> #krate::fmt::Result);
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                adt.write_match_self(b, span, &selfs, for_variant)
+            });
+        });
+    })
 }
 
 fn hash_expand(
@@ -1240,45 +1315,52 @@ fn hash_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
+    hash_derive(span, parse_adt(db, tt, span))
+}
+
+fn hash_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::hash::Hash }, false, true, |adt| {
-        if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.is_empty()) {
-            let star = tt::Punct { char: '*', spacing: ::tt::Spacing::Alone, span };
-            return quote! {span =>
-                fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
-                    match #star self {}
-                }
-            };
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::hash::Hash));
+    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+        if adt.is_empty_enum() {
+            let star = punct('*', tt::Spacing::Alone, span);
+            return in_group(b, span, |b| {
+                quote_into!(b, span =>
+                    fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
+                        match #star self {}
+                    }
+                )
+            });
         }
-        let arms =
-            adt.shape.as_pattern(span, &adt.name).into_iter().zip(adt.shape.field_names(span)).map(
-                |(pat, names)| {
-                    let expr = {
-                        let it = names.iter().map(|it| {
-                            let bound = bound_of_self(it);
-                            quote! {span => #krate::hash::Hash::hash(&#bound, ra_expand_state); }
-                        });
-                        quote! {span => {
-                            # #it
-                        } }
-                    };
-                    (pat, expr)
-                },
-            );
-        let body = adt.match_self(span, arms.collect());
-        // rustc leaves the discriminant out when there is only one variant.
-        let check_discriminant = if matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1)
-        {
-            quote! {span => #krate::hash::Hash::hash(&#krate::mem::discriminant(self), ra_expand_state); }
-        } else {
-            quote! {span =>}
-        };
-        quote! {span =>
-            fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H) {
-                #check_discriminant
-                #body
-            }
-        }
+        let selfs = adt.bindings("_self");
+        in_group(b, span, |b| {
+            quote_into!(b, span => fn hash<H: #krate::hash::Hasher>(&self, ra_expand_state: &mut H));
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                // rustc leaves the discriminant out when there is only one variant.
+                in_group(b, span, |b| {
+                    if adt.is_enum() && adt.shape.variants.len() > 1 {
+                        quote_into!(b, span =>
+                            #krate::hash::Hash::hash(&#krate::mem::discriminant(self), ra_expand_state);
+                        )
+                    }
+                });
+                adt.write_match_self(b, span, &selfs, |b, v| {
+                    delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                        for i in v.fields() {
+                            let bound = &selfs[i];
+                            in_group(b, span, |b| {
+                                quote_into!(b, span =>
+                                    #krate::hash::Hash::hash(&#bound, ra_expand_state);
+                                )
+                            });
+                        }
+                    })
+                });
+            });
+        });
     })
 }
 
@@ -1287,16 +1369,13 @@ fn eq_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = dollar_crate(span);
-    expand_simple_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::cmp::Eq },
-        true,
-        true,
-        |_| quote! {span =>},
-    )
+    eq_derive(span, parse_adt(db, tt, span))
+}
+
+fn eq_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::Eq));
+    expand_simple_derive(span, info, &trait_path, true, true, |b, _| empty_group(b, span))
 }
 
 fn partial_eq_expand(
@@ -1304,103 +1383,187 @@ fn partial_eq_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = &dollar_crate(span);
-    expand_simple_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::cmp::PartialEq },
-        false,
-        true,
-        |adt| {
-            let name = &adt.name;
+    partial_eq_derive(span, parse_adt(db, tt, span))
+}
 
-            // As rustc's: an enum of several variants compares the discriminants, and then the
-            // fields of the variants that have any. A match of each variant against itself is a
-            // comparison for each, which LLVM leaves as a chain.
-            let discriminants =
-                matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
-            let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
-            let arms = arms.filter(|(_, _, names)| !discriminants || !names.is_empty());
-            let arms: Vec<_> = arms.collect();
-            if discriminants {
-                let fielded = !arms.is_empty();
-                let arms = arms
-                    .into_iter()
-                    .map(|(pat1, pat2, names)| (pat1, pat2, fields_eq(krate, &names, span)))
-                    .collect();
-                let and_and = and_and(span);
-                let fields = match fielded {
-                    true => {
-                        let fields = adt.match_both(span, arms, quote! {span => true });
-                        quote! {span => #and_and #fields }
-                    }
-                    false => quote! {span =>},
-                };
-                let eq_eq = eq_eq(span);
-                return quote! {span =>
-                    fn eq(&self, other: &Self) -> bool {
+fn partial_eq_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::PartialEq));
+    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+        let selfs = adt.bindings("_self");
+        let others = adt.bindings("_other");
+        let bindings = (&selfs[..], &others[..]);
+        // As rustc's: an enum of several variants compares the discriminants, and then the
+        // fields of the variants that have any. A match of each variant against itself is a
+        // comparison for each, which LLVM leaves as a chain.
+        let discriminants = adt.is_enum() && adt.shape.variants.len() > 1;
+        let arms = || adt.shape.variants.iter().filter(move |v| !discriminants || !v.is_empty());
+        let fields_eq = |b: &mut Builder, v: &Variant| write_fields_eq(b, span, krate, v, bindings);
+        if discriminants {
+            let fielded = arms().next().is_some();
+            return in_group(b, span, |b| {
+                quote_into!(b, span => fn eq(&self, other: &Self) -> bool);
+                delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                    quote_into!(b, span =>
                         let __self_discr = #krate::intrinsics::discriminant_value(self);
                         let __arg1_discr = #krate::intrinsics::discriminant_value(other);
-                        __self_discr #eq_eq __arg1_discr #fields
-                    }
-                };
-            }
-            let arms = arms
-                .into_iter()
-                .map(|(pat1, pat2, names)| (pat1, pat2, fields_eq(krate, &names, span)))
-                .collect();
-            let body = adt.match_both(span, arms, quote! {span => false });
-            quote! {span =>
-                fn eq(&self, other: &Self) -> bool {
-                    #body
-                }
-            }
-        },
-    )
+                        __self_discr
+                    );
+                    eq_eq(b, span);
+                    quote_into!(b, span => __arg1_discr);
+                    in_group(b, span, |b| {
+                        if fielded {
+                            and_and(b, span);
+                            adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
+                                in_group(b, span, |b| quote_into!(b, span => true))
+                            });
+                        }
+                    });
+                });
+            });
+        }
+        in_group(b, span, |b| {
+            quote_into!(b, span => fn eq(&self, other: &Self) -> bool);
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
+                    in_group(b, span, |b| quote_into!(b, span => false))
+                })
+            });
+        });
+    })
 }
 
-/// Whether the fields `names` of `self`'s and `other`'s variant are equal, each with the next.
-fn fields_eq(krate: &tt::Ident, names: &[tt::Ident], span: Span) -> tt::TopSubtree {
-    let Some((first, rest)) = names.split_first() else { return quote!(span =>true) };
-    let eq = |it: &tt::Ident| {
-        let t1 = tt::Ident::new(&format!("{}_self", it.sym), it.span);
-        let t2 = tt::Ident::new(&format!("{}_other", it.sym), it.span);
-        // By path, as rustc does: a type's own `eq` would be found first.
-        quote!(span =>#krate::cmp::PartialEq::eq(&#t1, &#t2))
-    };
-    let first = eq(first);
-    let rest = rest.iter().map(|it| {
-        let and_and = and_and(span);
-        let eq = eq(it);
-        quote!(span =>#and_and #eq)
-    });
-    quote!(span =>#first # #rest)
-}
-
-fn self_and_other_patterns(
-    adt: &BasicAdtInfo,
-    name: &tt::Ident,
+/// Whether the fields of `self`'s and `other`'s variant `v` are equal, each with the next. A
+/// single comparison gets no second group: a `quote!` of one group is that group.
+fn write_fields_eq(
+    b: &mut Builder,
     span: Span,
-) -> (Vec<tt::TopSubtree>, Vec<tt::TopSubtree>) {
-    let self_patterns = adt.shape.as_pattern_map(
-        name,
-        |it| {
-            let t = bound_of_self(it);
-            quote!(span =>#t)
-        },
-        span,
-    );
-    let other_patterns = adt.shape.as_pattern_map(
-        name,
-        |it| {
-            let t = tt::Ident::new(&format!("{}_other", it.sym), it.span);
-            quote!(span =>#t)
-        },
-        span,
-    );
-    (self_patterns, other_patterns)
+    krate: &tt::Ident,
+    v: &Variant,
+    (selfs, others): (&[tt::Ident], &[tt::Ident]),
+) {
+    // By path, as rustc does: a type's own `eq` would be found first.
+    let eq = |b: &mut Builder, i: usize| {
+        let (t1, t2) = (&selfs[i], &others[i]);
+        in_group(b, span, |b| quote_into!(b, span => #krate::cmp::PartialEq::eq(&#t1, &#t2)))
+    };
+    let fields = v.fields();
+    match fields.len() {
+        0 => in_group(b, span, |b| quote_into!(b, span => true)),
+        1 => eq(b, fields.start),
+        _ => in_group(b, span, |b| {
+            eq(b, fields.start);
+            for i in fields.start + 1..fields.end {
+                in_group(b, span, |b| {
+                    and_and(b, span);
+                    eq(b, i);
+                });
+            }
+        }),
+    }
+}
+
+/// The start of `match Ord::cmp(&left, &right) { Equal => { .., up to where what follows when
+/// they are equal goes; [`write_compare_close`] ends it. `partial` is `PartialOrd`'s.
+fn write_compare_open(
+    b: &mut Builder,
+    span: Span,
+    krate: &tt::Ident,
+    partial: bool,
+    left: impl FnOnce(&mut Builder),
+    right: impl FnOnce(&mut Builder),
+) {
+    b.open(tt::DelimiterKind::Invisible, span);
+    if partial {
+        quote_into!(b, span => match #krate::cmp::PartialOrd::partial_cmp);
+    } else {
+        quote_into!(b, span => match #krate::cmp::Ord::cmp);
+    }
+    delimited(b, tt::DelimiterKind::Parenthesis, span, |b| {
+        quote_into!(b, span => &);
+        left(b);
+        quote_into!(b, span => , &);
+        right(b);
+    });
+    b.open(tt::DelimiterKind::Brace, span);
+    write_ordering_equal(b, span, krate, partial, false);
+    fat_arrow(b, span);
+    b.open(tt::DelimiterKind::Brace, span);
+}
+
+/// `} c => return c, }`, the end of [`write_compare_open`].
+fn write_compare_close(b: &mut Builder, span: Span) {
+    b.close(span);
+    quote_into!(b, span => c);
+    fat_arrow(b, span);
+    quote_into!(b, span => return c,);
+    b.close(span);
+    b.close(span);
+}
+
+/// `Ordering::Equal`, or `Option::Some(Ordering::Equal)` for `partial`, in a group of its own
+/// when `grouped`.
+fn write_ordering_equal(b: &mut Builder, span: Span, krate: &tt::Ident, partial: bool, grouped: bool) {
+    let write = |b: &mut Builder| {
+        if partial {
+            quote_into!(b, span => #krate::option::Option::Some(#krate::cmp::Ordering::Equal))
+        } else {
+            quote_into!(b, span => #krate::cmp::Ordering::Equal)
+        }
+    };
+    if grouped { in_group(b, span, write) } else { write(b) }
+}
+
+/// The comparison of `self` and `other` of `Ord` (`PartialOrd` for `partial`): the
+/// discriminants first (always for `PartialOrd`, for an enum for `Ord`), then the fields of
+/// the variants that have any, each in turn.
+fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdtInfo, partial: bool) {
+    let selfs = adt.bindings("_self");
+    let others = adt.bindings("_other");
+    let enumeration = adt.is_enum();
+    // The discriminants are compared first: a variant without fields is then equal.
+    let arms = adt.shape.variants.iter().filter(|v| !enumeration || !v.is_empty());
+    let arm = |b: &mut Builder, v: &Variant| {
+        for i in v.fields() {
+            let (t1, t2) = (&selfs[i], &others[i]);
+            write_compare_open(
+                b,
+                span,
+                krate,
+                partial,
+                |b| in_group(b, span, |b| quote_into!(b, span => #t1)),
+                |b| in_group(b, span, |b| quote_into!(b, span => #t2)),
+            );
+        }
+        write_ordering_equal(b, span, krate, partial, true);
+        for _ in v.fields() {
+            write_compare_close(b, span);
+        }
+    };
+    let discriminants = partial || enumeration;
+    let discriminant = |b: &mut Builder, of_self: bool| {
+        in_group(b, span, |b| {
+            if of_self {
+                quote_into!(b, span => #krate::intrinsics::discriminant_value(self))
+            } else {
+                quote_into!(b, span => #krate::intrinsics::discriminant_value(other))
+            }
+        })
+    };
+    if discriminants {
+        write_compare_open(b, span, krate, partial, |b| discriminant(b, true), |b| {
+            discriminant(b, false)
+        });
+    }
+    adt.write_match_both(b, span, (&selfs, &others), arms, arm, |b| {
+        write_ordering_equal(b, span, krate, partial, true)
+    });
+    if discriminants {
+        write_compare_close(b, span);
+    }
 }
 
 fn ord_expand(
@@ -1408,53 +1571,19 @@ fn ord_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
+    ord_derive(span, parse_adt(db, tt, span))
+}
+
+fn ord_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResult<tt::TopSubtree> {
     let krate = &dollar_crate(span);
-    expand_simple_derive(db, span, tt, quote! {span => #krate::cmp::Ord }, false, true, |adt| {
-        fn compare(
-            krate: &tt::Ident,
-            left: tt::TopSubtree,
-            right: tt::TopSubtree,
-            rest: tt::TopSubtree,
-            span: Span,
-        ) -> tt::TopSubtree {
-            let fat_arrow1 = fat_arrow(span);
-            let fat_arrow2 = fat_arrow(span);
-            quote! {span =>
-                match #krate::cmp::Ord::cmp(&#left, &#right) {
-                    #krate::cmp::Ordering::Equal #fat_arrow1 {
-                        #rest
-                    }
-                    c #fat_arrow2 return c,
-                }
-            }
-        }
-        let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-        // The discriminants are compared first: a variant without fields is then equal.
-        let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
-        let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
-            |(pat1, pat2, fields)| {
-                let mut body = quote!(span =>#krate::cmp::Ordering::Equal);
-                for f in fields.into_iter().rev() {
-                    let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
-                    let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                    body = compare(krate, quote!(span =>#t1), quote!(span =>#t2), body, span);
-                }
-                (pat1, pat2, body)
-            },
-        );
-        let mut body =
-            adt.match_both(span, arms.collect(), quote! {span => #krate::cmp::Ordering::Equal });
-        if matches!(&adt.shape, AdtShape::Enum { .. }) {
-            let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
-            let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
-            body = compare(krate, left, right, body, span);
-        }
-        quote! {span =>
-            fn cmp(&self, other: &Self) -> #krate::cmp::Ordering {
-                #body
-            }
-        }
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::Ord));
+    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+        in_group(b, span, |b| {
+            quote_into!(b, span => fn cmp(&self, other: &Self) -> #krate::cmp::Ordering);
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                write_ordering(b, span, krate, adt, false)
+            });
+        })
     })
 }
 
@@ -1463,63 +1592,52 @@ fn partial_ord_expand(
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let krate = &dollar_crate(span);
-    expand_simple_derive(
-        db,
-        span,
-        tt,
-        quote! {span => #krate::cmp::PartialOrd },
-        false,
-        true,
-        |adt| {
-            fn compare(
-                krate: &tt::Ident,
-                left: tt::TopSubtree,
-                right: tt::TopSubtree,
-                rest: tt::TopSubtree,
-                span: Span,
-            ) -> tt::TopSubtree {
-                let fat_arrow1 = fat_arrow(span);
-                let fat_arrow2 = fat_arrow(span);
-                quote! {span =>
-                    match #krate::cmp::PartialOrd::partial_cmp(&#left, &#right) {
-                        #krate::option::Option::Some(#krate::cmp::Ordering::Equal) #fat_arrow1 {
-                            #rest
-                        }
-                        c #fat_arrow2 return c,
-                    }
-                }
-            }
-            let left = quote!(span =>#krate::intrinsics::discriminant_value(self));
-            let right = quote!(span =>#krate::intrinsics::discriminant_value(other));
+    partial_ord_derive(span, parse_adt(db, tt, span))
+}
 
-            let (self_patterns, other_patterns) = self_and_other_patterns(adt, &adt.name, span);
-            // The discriminants are compared first: a variant without fields is then equal.
-            let enumeration = matches!(&adt.shape, AdtShape::Enum { .. });
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names(span));
-            let arms = arms.filter(|(_, _, fields)| !enumeration || !fields.is_empty()).map(
-                |(pat1, pat2, fields)| {
-                    let mut body =
-                        quote!(span =>#krate::option::Option::Some(#krate::cmp::Ordering::Equal));
-                    for f in fields.into_iter().rev() {
-                        let t1 = tt::Ident::new(&format!("{}_self", f.sym), f.span);
-                        let t2 = tt::Ident::new(&format!("{}_other", f.sym), f.span);
-                        body = compare(krate, quote!(span =>#t1), quote!(span =>#t2), body, span);
-                    }
-                    (pat1, pat2, body)
-                },
+fn partial_ord_derive(
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree> {
+    let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::PartialOrd));
+    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+        in_group(b, span, |b| {
+            quote_into!(b, span =>
+                fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering>
             );
-            let equal =
-                quote! {span => #krate::option::Option::Some(#krate::cmp::Ordering::Equal) };
-            let body =
-                compare(krate, left, right, adt.match_both(span, arms.collect(), equal), span);
-            quote! {span =>
-                fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering> {
-                    #body
-                }
-            }
-        },
-    )
+            delimited(b, tt::DelimiterKind::Brace, span, |b| {
+                write_ordering(b, span, krate, adt, true)
+            });
+        })
+    })
+}
+
+/// The `DispatchFromDyn` and `CoerceUnsized` impls of `CoercePointee`, each in a group of its
+/// own, from the struct with the `__S` bounds added.
+fn write_coerce_pointee_impls(
+    span: Span,
+    info: &BasicAdtInfo,
+    self_for_traits: &tt::TopSubtree,
+) -> tt::TopSubtree {
+    let krate = &dollar_crate(span);
+    let dispatch_from_dyn =
+        group(span, |b| quote_into!(b, span => #krate::ops::DispatchFromDyn<#self_for_traits>));
+    let coerce_unsized =
+        group(span, |b| quote_into!(b, span => #krate::ops::CoerceUnsized<#self_for_traits>));
+    let added_param = group(span, |b| quote_into!(b, span => __S));
+    write_derive(span, |b| {
+        in_group(b, span, |b| {
+            write_impl(b, span, info, &dispatch_from_dyn, false, &added_param, |b| {
+                empty_group(b, span)
+            })
+        });
+        in_group(b, span, |b| {
+            write_impl(b, span, info, &coerce_unsized, false, &added_param, |b| {
+                empty_group(b, span)
+            })
+        });
+    })
 }
 
 fn coerce_pointee_expand(
@@ -1870,26 +1988,7 @@ fn coerce_pointee_expand(
         }
     };
 
-    let self_for_traits2 = self_for_traits.clone();
-    let krate = dollar_crate(span);
-    let krate2 = krate.clone();
-    let dispatch_from_dyn = expand_simple_derive_with_parsed(
-        span,
-        info.clone(),
-        quote! {span => #krate2::ops::DispatchFromDyn<#self_for_traits2> },
-        |_adt| quote! {span => },
-        false,
-        quote! {span => __S },
-    );
-    let coerce_unsized = expand_simple_derive_with_parsed(
-        span,
-        info,
-        quote! {span => #krate::ops::CoerceUnsized<#self_for_traits> },
-        |_adt| quote! {span => },
-        false,
-        quote! {span => __S },
-    );
-    return ExpandResult::ok(quote! {span => #dispatch_from_dyn #coerce_unsized });
+    return ExpandResult::ok(write_coerce_pointee_impls(span, &info, &self_for_traits));
 
     fn is_maybe_sized_bound(bound: ast::TypeBound) -> bool {
         if bound.question_mark_token().is_none() {

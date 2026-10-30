@@ -152,9 +152,15 @@ print what cargo prints, on the stream cargo prints it, with cargo's exit codes:
 - `test`/`bench`: builds the test targets, then runs each test executable (and the doc tests)
   as cargo does (`Running unittests src/lib.rs (target/debug/deps/foo-0123)`, `Doc-tests foo`),
   stopping at the first failing one without `--no-fail-fast`; exit 101 on a failure.
+- blaze's own `test` flags, opt-in and never on cargo's command line: `--reached` (the tests
+  an edit reached) and `--ub [--ub-seed N] [--ub-schedules K]` (each selected test in the MIR
+  evaluator under `hir-ty-ub`, nothing compiled). Both are run by the daemon and sent with
+  libtest's selection arguments; the CLI prints their `TestResult`s in libtest's format.
 - exit codes: 0, 101 for a failed build or test (cargo's), 1 for cargo's usage errors.
 
-The CLI reads no manifest itself: the daemon's load is the one load.
+The CLI reads no manifest itself: the daemon's load is the one load. It has no `unsafe`, and
+`cli.rs` says `#![forbid(unsafe_code)]` for all of it (the crate can't: its sandboxes and sockets
+need `unsafe`).
 
 Fast: the CLI is a thin client, as buck2's and Bazel's clients are: what it does before the
 request is parse the words, stat up from the directory for `Cargo.toml` and `.git` (one stat per

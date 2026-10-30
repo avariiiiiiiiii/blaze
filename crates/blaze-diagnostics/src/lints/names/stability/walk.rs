@@ -101,9 +101,17 @@ pub(super) struct Walked {
     pub(super) owners: Vec<Owner>,
     pub(super) uses: Vec<Use>,
     pub(super) macros: Vec<MacroUse>,
-    /// Each `#[deprecated]`, with whether it is on an item of a trait impl.
-    pub(super) attrs: Vec<(Attribute, bool)>,
+    pub(super) attrs: Vec<Deprecated>,
     pub(super) escapes: Vec<Escape>,
+}
+
+/// A `#[deprecated]`.
+pub(super) struct Deprecated {
+    pub(super) attr: Attribute,
+    /// The item-like it is in, or is of.
+    pub(super) owner: Option<usize>,
+    /// On an item of a trait impl.
+    pub(super) of_trait_impl: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -131,7 +139,7 @@ pub(super) fn walk(cx: &Cx<'_, '_>) -> Walked {
     let file = cx.krate.root_module(db).definition_source(db).file_id;
     let root = InFile::new(file, cx.sema.parse_or_expand(file));
     let ctx = Ctx { owner: None, module: 0, container: Container::Free, body: false, derive: false };
-    walker.attributes(&root, Some(Target::Crate), false);
+    walker.attributes(&root, Some(Target::Crate), None, false);
     walker.children(&root, ctx);
     walker.walked
 }
@@ -176,11 +184,30 @@ impl Walker<'_, '_, '_> {
             return;
         }
         let target = other_target(&node.value);
-        self.attributes(&node, target, false);
-        self.uses_at(&node, ctx);
+        self.attributes(&node, target, ctx.owner, false);
         let kind = node.value.kind();
-        let ctx = Ctx { body: ctx.body || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind), ..ctx };
-        self.children(&node, ctx);
+        let inner = Ctx { body: ctx.body || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind), ..ctx };
+        // typeck checks a method or field after the expression it is of.
+        if ast::MethodCallExpr::can_cast(kind) || ast::FieldExpr::can_cast(kind) {
+            self.children(&node, inner);
+            self.uses_at(&node, ctx);
+            return;
+        }
+        self.uses_at(&node, ctx);
+        match ast::LetStmt::cast(node.value.clone()) {
+            // `check_decl_local`: the type, the initializer, the pattern, the `else`.
+            Some(stmt) => {
+                let ty = stmt.ty().map(|it| it.syntax().clone());
+                let init = stmt.initializer().map(|it| it.syntax().clone());
+                let pat = stmt.pat().map(|it| it.syntax().clone());
+                let other = node.value.children().filter(|it| Some(it) != ty.as_ref() && Some(it) != init.as_ref() && Some(it) != pat.as_ref());
+                let order: Vec<SyntaxNode> = ty.clone().into_iter().chain(init.clone()).chain(pat.clone()).chain(other).collect();
+                for child in order {
+                    self.visit(node.with_value(child), inner);
+                }
+            }
+            None => self.children(&node, inner),
+        }
     }
 
     fn owner(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx) -> usize {
@@ -192,7 +219,7 @@ impl Walker<'_, '_, '_> {
         let owner = self.owner(&node, ctx);
         let inner = Ctx { owner: Some(owner), container: Container::Free, body: false, ..ctx };
         let of_trait_impl = ctx.container == Container::Impl { of_trait: true };
-        self.attributes(&node, item_target(&item, ctx.container), of_trait_impl);
+        self.attributes(&node, item_target(&item, ctx.container), Some(owner), of_trait_impl);
         match &item {
             ast::Item::Module(module) => self.module(&node, module, inner),
             ast::Item::Impl(imp) => {
@@ -239,7 +266,7 @@ impl Walker<'_, '_, '_> {
                     let root = InFile::new(source.file_id, cx.sema.parse_or_expand(source.file_id));
                     if self.on(&root.value) {
                         attrs.extend(attr::attrs(&root.value, self.cfg));
-                        self.attributes(&root, Some(Target::Mod), false);
+                        self.attributes(&root, Some(Target::Mod), inner.owner, false);
                         self.children(&root, contents);
                     }
                 }
@@ -263,14 +290,14 @@ impl Walker<'_, '_, '_> {
         }
     }
 
-    /// The `#[deprecated]`s of `node`, on `target`.
-    fn attributes(&mut self, node: &InFile<SyntaxNode>, target: Option<Target>, of_trait_impl: bool) {
+    /// The `#[deprecated]`s of `node`, on `target`, in the item-like `owner`.
+    fn attributes(&mut self, node: &InFile<SyntaxNode>, target: Option<Target>, owner: Option<usize>, of_trait_impl: bool) {
         let Some(target) = target else { return };
         for (meta, written) in attr::attrs(&node.value, self.cfg) {
             if attr::is(&meta, "deprecated")
-                && let Some(found) = Attribute::new(target, node.as_ref(), &meta, &written)
+                && let Some(attr) = Attribute::new(target, node.as_ref(), &meta, &written)
             {
-                self.walked.attrs.push((found, of_trait_impl));
+                self.walked.attrs.push(Deprecated { attr, owner, of_trait_impl });
             }
         }
     }
@@ -417,7 +444,7 @@ impl Walker<'_, '_, '_> {
         let last = value.segment().and_then(|it| it.name_ref()).map_or(whole, |it| it.syntax().text_range());
         let at = parent.clone().unwrap_or_else(|| value.syntax().clone());
         let expr = parent.as_ref().is_some_and(|it| ast::PathExpr::can_cast(it.kind()) || ast::RecordExpr::can_cast(it.kind()));
-        if let Some(def) = def {
+        let main = def.map(|def| {
             let in_type = parent.as_ref().is_some_and(|it| ast::PathType::can_cast(it.kind()));
             let span = match relative && in_type {
                 true => whole,
@@ -428,7 +455,8 @@ impl Walker<'_, '_, '_> {
             found.expr = expr;
             found.phase = phase;
             found.stability_only = stability_only;
-        }
+            self.walked.uses.len() - 1
+        });
         let Some(qualifier) = value.qualifier() else { return };
         if relative {
             if !matches!(qualifier.segment().and_then(|it| it.kind()), Some(ast::PathSegmentKind::Type { .. })) {
@@ -436,16 +464,25 @@ impl Walker<'_, '_, '_> {
             }
             return;
         }
+        let Some(main) = main else { return };
         let mut segment = Some(qualifier);
         while let Some(qualifier) = segment {
-            if let Some(PathResolution::Def(def)) = cx.sema.resolve_path(&qualifier)
-                && !matches!(def, ModuleDef::BuiltinType(_))
-            {
-                let range = qualifier.segment().map_or(qualifier.syntax().text_range(), |it| it.syntax().text_range());
-                let found = self.push(ctx, Def::Item(def), &at, path.file_id, range, range);
-                found.stability_only = true;
-            }
+            self.segment(ctx, &qualifier, &at, path.file_id, main);
             segment = qualifier.qualifier();
+        }
+    }
+
+    /// The check of the parent segment `qualifier` of the path checked as `main`.
+    fn segment(&mut self, ctx: Ctx, qualifier: &ast::Path, at: &SyntaxNode, file: hir::HirFileId, main: usize) {
+        if let Some(PathResolution::Def(def)) = self.cx.sema.resolve_path(qualifier)
+            && !matches!(def, ModuleDef::BuiltinType(_))
+        {
+            let segment = qualifier.segment();
+            let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
+            let range = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(qualifier.syntax().text_range());
+            let found = self.push(ctx, Def::Item(def), at, file, range, range);
+            found.stability_only = true;
+            found.segment_of = Some(main);
         }
     }
 
@@ -499,7 +536,9 @@ impl Walker<'_, '_, '_> {
         let file = tree.file_id;
         let at = tree.value.syntax().clone();
         let whole = path.syntax().text_range();
-        let last = path.segment().map_or(whole, |it| it.syntax().text_range());
+        let segment = path.segment();
+        let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
+        let last = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(whole);
         let def = match def {
             Some(def) => Some(def),
             None => match cx.sema.resolve_path(path) {
@@ -509,6 +548,7 @@ impl Walker<'_, '_, '_> {
         };
         let Some(def) = def else { return };
         self.push(ctx, trait_item_def(cx, def), &at, file, last, whole);
+        let main = self.walked.uses.len() - 1;
         let mut parents = Vec::new();
         let mut segment = path.qualifier();
         while let Some(qualifier) = segment {
@@ -524,13 +564,7 @@ impl Walker<'_, '_, '_> {
             }
         }
         for parent in parents {
-            if let Some(PathResolution::Def(def)) = cx.sema.resolve_path(&parent)
-                && !matches!(def, ModuleDef::BuiltinType(_))
-            {
-                let range = parent.segment().map_or(parent.syntax().text_range(), |it| it.syntax().text_range());
-                let found = self.push(ctx, Def::Item(def), &at, file, range, range);
-                found.stability_only = true;
-            }
+            self.segment(ctx, &parent, &at, file, main);
         }
     }
 

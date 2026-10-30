@@ -794,6 +794,8 @@ cargo-load-source's `tree.rs` (request 10); `#![forbid(unsafe_code)]` in
 `crates/blaze-units/src/lib.rs` and `crates/blaze-tree/src/lib.rs` (cargo-std's request 10).
 `StdKey.{host, rustflags, profile_root}` are as cargo-std's request 6 has them.
 
+> forwarded to coordinator: `blaze-resolve` and `blaze-manifest` are "every other path" in `crates.md`, the coordinator's, and go with request 1's grant to lane cargo; not among the paths `requests` applies.
+
 ## From cargo-daemon-units (`crates/blaze-cargo/src/serve/unit.rs`, `serve/unit/`)
 
 `serve/unit*` calls each item below by this signature already; each waits on the lane named.
@@ -860,6 +862,8 @@ the sandbox, for `BLAZE_SANDBOX=off` and `unsandboxed-tests`; until then either 
 build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as blaze v2, not v1's
 `as_rustc`.
 
+> forwarded to cargo (its own children), codegen, link and usercode: every item names a lane that is still running (`ItemHashes::new` is now codegen-hashes', codegen.md 6). Nothing asked of the coordinator's paths.
+
 ## From speed-runtime-plane: `crates/blaze-cargo/src/serve/plane.rs`, one output buffer (2026-10-29)
 
 - What: `blaze_graph::Plane` gained `step_into(&mut self, PlaneInput, &mut Vec<PlaneOutput>) ->
@@ -870,6 +874,8 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
   taking `impl Iterator<Item = PlaneOutput>` (its body is unchanged).
 - Why: the daemon steps the plane once per task; this takes the one allocation per step the
   plane still made, with the same outputs.
+
+> forwarded to cargo: `crates/blaze-cargo/src/serve/plane.rs` is lane cargo's.
 
 ## From safety (lane safety, 2026-10-29): `blaze test --ub`, and `-Zsanitizer` once codegen has it
 
@@ -895,3 +901,41 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
    `sanitizer-memory-track-origins` and the coverage flags from `Refused(INSTRUMENTS)` to
    passed to codegen, and keep refusing what codegen still doesn't do (CFI, KCFI, dataflow) with
    that reason. Until then they stay refused.
+
+> forwarded to cargo: `blaze test --ub` and `unstable.rs` are lane cargo's. `hir-ty-ub` is now a workspace dependency (safety.md 2).
+
+## 15. From cargo-cli (to the coordinator and ci, `crates/blaze-api/src/lib.rs`; and to cargo-daemon): `blaze test --ub` (answers lane safety's item 1)
+
+The CLI side of `blaze test --ub [--ub-seed N] [--ub-schedules K]` is written
+(`cli/args.rs`, `cli.rs`), against this interface change, which it does not compile without:
+
+```rust
+pub enum Request {
+    /// Runs the tests the view's change reached (all, with `all`), filtered by name, with
+    /// libtest's selection `args`; in blaze's MIR evaluator, checked for undefined behavior,
+    /// with `ub`.
+    Test { all: bool, view: ViewRef, filter: Vec<String>, targets: Targets, args: Vec<String>, ub: Option<Ub> },
+    // ... the rest as they are
+}
+
+/// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
+/// `None` is `hir_ty_ub::Config::default()`'s.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ub {
+    pub seed: Option<u64>,
+    pub schedules: Option<u32>,
+}
+```
+
+`args` is what follows `--` (`--exact`, `--ignored`, `--include-ignored`, `--skip NAME`): the
+daemon needs it to select the tests as libtest would, for `--reached` too, and the CLI has it
+nowhere else. Non-UTF-8 arguments are refused by the CLI.
+
+What the CLI does: `--ub` (or either value, which implies it) is `test`'s alone and never on
+cargo's command line. It sends `Request::Test { all: !reached, ub: Some(..), .. }`, and
+`--ub` with `--no-run` is refused. The daemon's `Response::TestResult`s are printed in libtest's
+pretty format, and any failure exits 101. To cargo-daemon: an `Outcome::Ub { report, seed, .. }`
+is a `TestResult` with outcome `Failed` and `output` = the report, then `seed: N` (the CLI
+prints the output as libtest prints a failure's stdout). `Unsupported { what }` is `Failed` with
+`what` as its output, never a pass and never a compiled run (no-fallback). `binary` is the test
+target's would-be executable path, or its name, which the CLI shows after `Running`.

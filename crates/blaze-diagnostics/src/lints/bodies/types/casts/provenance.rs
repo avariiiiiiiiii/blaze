@@ -30,8 +30,7 @@ impl LatePass for ImplicitProvenanceCasts {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        let Expr::Cast { expr: from, .. } = &b.store()[expr] else { return };
-        let from = *from;
+        let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };
         let from_ty = b.infer.expr_ty(from);
         if from_ty.is_raw_ptr() {
             let to_ty = b.infer.expr_ty(expr);
@@ -110,7 +109,7 @@ fn int2ptr(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Found>)
 /// or a prefix operation, and no attribute is written on it. A range is a struct expression
 /// in rustc's HIR, and `?` and `.await` are matches, so they are unambiguous.
 fn unambiguous(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
-    match &b.store()[expr] {
+    match b.store().expr(expr) {
         Expr::Closure { ret_type: None, .. }
         | Expr::Break { .. }
         | Expr::Return { .. }

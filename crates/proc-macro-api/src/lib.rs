@@ -26,10 +26,12 @@ pub mod wrap;
 use paths::{AbsPath, AbsPathBuf};
 use semver::Version;
 use span::{ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span};
-use std::{fmt, io, sync::Arc, time::SystemTime};
+use std::{ffi::OsString, fmt, io, sync::Arc, time::SystemTime};
 
 use crate::{
-    bidirectional_protocol::SubCallback, pool::ProcMacroServerPool, process::ProcMacroServerProcess,
+    bidirectional_protocol::SubCallback,
+    pool::{Open, ProcMacroServerPool},
+    process::ProcMacroServerProcess,
 };
 
 /// The versions of the server protocol
@@ -88,11 +90,10 @@ pub enum ProcMacroKind {
 /// and runs actual macro expansion functions.
 #[derive(Debug, Clone)]
 pub struct ProcMacroClient {
-    /// Currently, the proc macro process expands all procedural macros sequentially.
-    ///
-    /// That means that concurrent salsa requests may block each other when expanding proc macros,
-    /// which is unfortunate, but simple and good enough for the time being.
-    pool: Arc<ProcMacroServerPool>,
+    /// One connection per expansion in flight ([`pool`]): concurrent salsa requests never wait
+    /// on each other's, and an expansion asked for while answering another's sub-request gets
+    /// a connection of its own.
+    pool: ProcMacroServerPool,
     /// The path to the proc-macro server binary.
     path: AbsPathBuf,
 }
@@ -160,15 +161,25 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker = ProcMacroServerProcess::spawn(process_path, env.clone(), version)?;
-            workers.push(worker);
-        }
+        let env: Vec<(OsString, Option<OsString>)> = env
+            .into_iter()
+            .map(|(name, value)| {
+                (name.as_ref().to_owned(), value.as_ref().map(|it| it.as_ref().to_owned()))
+            })
+            .collect();
+        let (path, version) = (process_path.to_owned(), version.cloned());
+        let open = move || {
+            let env = env.iter().map(|(name, value)| (name, value));
+            ProcMacroServerProcess::spawn(&path, env, version.as_ref())
+        };
+        ProcMacroClient::pooled(process_path, num_process, Box::new(open))
+    }
 
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+    /// A client of `size` connections opened by `open` to start with, which opens more by it.
+    fn pooled(path: &AbsPath, size: usize, open: Open) -> io::Result<ProcMacroClient> {
+        let first = (0..size.max(1)).map(|_| open()).collect::<io::Result<Vec<_>>>()?;
+        let pool = ProcMacroServerPool::new(first, open).map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(ProcMacroClient { pool, path: path.to_owned() })
     }
 
     /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
@@ -182,39 +193,41 @@ impl ProcMacroClient {
             Box<dyn process::ProcessExit>,
             Box<dyn io::Write + Send + Sync>,
             Box<dyn io::BufRead + Send + Sync>,
-        )> + Clone,
+        )> + Clone
+        + Send
+        + Sync
+        + 'static,
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
-        let pool_size = num_process;
-        let mut workers = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            let worker =
-                ProcMacroServerProcess::run(spawn.clone(), version, || "<unknown>".to_owned())?;
-            workers.push(worker);
-        }
-
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+        let version = version.cloned();
+        let open = move || {
+            ProcMacroServerProcess::run(&spawn, version.as_ref(), || "<unknown>".to_owned())
+        };
+        ProcMacroClient::pooled(process_path, num_process, Box::new(open))
     }
 
     /// A client of the warm servers `servers` ([`warm`]), each started by the daemon's pool as
     /// [`warm::Server::command`] says and connected: `program` is what [`Self::server_path`]
-    /// says. Each expansion is sent the variables `environment` passes through.
+    /// says. Each expansion is sent the variables `environment` passes through. When every
+    /// server it has is in the middle of an expansion, it asks `more` for another.
     pub fn warm(
         program: &AbsPath,
         servers: Vec<warm::Warm>,
+        more: Arc<dyn warm::Servers>,
         environment: Arc<warm::Environment>,
     ) -> io::Result<ProcMacroClient> {
         if servers.is_empty() {
             return Err(io::Error::other("a proc-macro client of no warm server"));
         }
-        let workers = servers
+        let first = servers
             .into_iter()
             .map(|server| ProcMacroServerProcess::warm(server, environment.clone()))
             .collect::<io::Result<Vec<_>>>()?;
-        let pool = ProcMacroServerPool::new(workers);
-        Ok(ProcMacroClient { pool: Arc::new(pool), path: program.to_owned() })
+        let open: Open =
+            Box::new(move || ProcMacroServerProcess::warm(more.connect()?, environment.clone()));
+        let pool = ProcMacroServerPool::new(first, open).map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(ProcMacroClient { pool, path: program.to_owned() })
     }
 
     /// Returns the absolute path to the proc-macro server.
@@ -289,7 +302,7 @@ impl ProcMacro {
             }
         }
 
-        self.pool.pick_process()?.expand(
+        self.pool.claim()?.expand(
             self,
             subtree,
             attr,

@@ -54,7 +54,7 @@ impl LatePass for InvalidAtomicOrdering {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        match &b.store()[expr] {
+        match b.store().expr(expr) {
             Expr::MethodCall { method_name, args, .. } => {
                 let method = method_name.as_str();
                 check_load_store(b, expr, method, args, out);

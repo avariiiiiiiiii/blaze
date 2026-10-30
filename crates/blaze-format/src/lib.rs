@@ -445,6 +445,43 @@ pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, Forma
     Ok(unsafe { &*bytes.as_ptr().cast::<R>() })
 }
 
+/// The domain of a buffer's content ID ([`buffer_id`]).
+pub const BUFFER_DOMAIN: &str = "blaze v2 buffer 1";
+
+/// The content ID of a whole buffer, its header included: what the store and the daemon's
+/// image key a buffer by, and [`open_verified`] checks it against.
+pub fn buffer_id(buffer: &[u8]) -> ContentId {
+    ContentId::of(BUFFER_DOMAIN, buffer)
+}
+
+/// [`open_as`] of bytes from outside this process (the store, a pack, the image, the
+/// network), after checking they are the buffer `key` names. A decoder that trusts what a
+/// record holds beyond its bounds (a salsa index, an interned handle) is only given bytes
+/// opened this way.
+pub fn open_verified<R: Record>(
+    buffer: &[u8],
+    schema: SchemaHash,
+    key: ContentId,
+) -> Result<&R, FormatError> {
+    verify(buffer, key)?;
+    open_as::<R>(buffer, schema)
+}
+
+/// [`Persist::read`] of bytes from outside this process, after checking they are the buffer
+/// `key` names.
+pub fn read_verified<P: Persist>(buffer: &[u8], key: ContentId) -> Result<P::Ref<'_>, FormatError> {
+    verify(buffer, key)?;
+    P::read(buffer)
+}
+
+fn verify(buffer: &[u8], key: ContentId) -> Result<(), FormatError> {
+    let found = buffer_id(buffer);
+    match found == key {
+        true => Ok(()),
+        false => Err(FormatError::Hash { found, wanted: key }),
+    }
+}
+
 /// Appends records to one buffer, aligned, and gives each a place for the [`Rel`]s of others.
 /// Padding between records is zeros, so equal values written in the same order are equal
 /// bytes.
@@ -520,6 +557,9 @@ pub trait Persist: Send + Sync + 'static {
     type Ref<'a>: Copy;
     /// Writes the value, returning where its root is.
     fn write(&self, out: &mut Writer) -> u64;
+    /// The value in `buffer`, checked as [`open_as`] checks. Bytes this process did not write
+    /// are read through [`read_verified`], so a `read` may rely on the buffer being one some
+    /// blaze wrote whole.
     fn read(buffer: &[u8]) -> Result<Self::Ref<'_>, FormatError>;
 }
 
@@ -699,6 +739,8 @@ pub enum FormatError {
     Invalid { at: u64, what: &'static str },
     /// A reference at `at` that leaves the buffer or is misaligned.
     OutOfBounds { at: u64 },
+    /// Bytes that are not the buffer their key names ([`open_verified`]).
+    Hash { found: ContentId, wanted: ContentId },
 }
 
 impl fmt::Display for FormatError {
@@ -711,6 +753,9 @@ impl fmt::Display for FormatError {
             FormatError::Invalid { at, what } => write!(f, "invalid record at byte {at}: {what}"),
             FormatError::OutOfBounds { at } => {
                 write!(f, "a reference at byte {at} leaves the buffer or is misaligned")
+            }
+            FormatError::Hash { found, wanted } => {
+                write!(f, "a buffer of content {found} where {wanted} was wanted")
             }
         }
     }

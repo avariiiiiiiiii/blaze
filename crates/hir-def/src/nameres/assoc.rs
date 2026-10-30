@@ -11,7 +11,6 @@ use hir_expand::{
     name::{AsName, Name},
     span_map::SpanMap,
 };
-use intern::Interned;
 use span::AstIdMap;
 use syntax::{
     AstNode,
@@ -229,7 +228,7 @@ impl<'db> AssocItemCollector<'db> {
                             self.diagnostics.push(DefDiagnostic::macro_error(
                                 self.module_id,
                                 ast_id,
-                                (*attr.path).clone(),
+                                *attr.path,
                                 err,
                             ));
                             continue 'attrs;
@@ -249,7 +248,7 @@ impl<'db> AssocItemCollector<'db> {
                             attr_args: None,
                             censored_attr_ids: AttrMacroAttrIds::from_one(attr_id),
                         },
-                        (*attr.path).clone(),
+                        *attr.path,
                     ));
                 }
             }
@@ -298,7 +297,6 @@ impl<'db> AssocItemCollector<'db> {
                 }) else {
                     return;
                 };
-                let path = Interned::new(path);
                 let ctxt = self.span_map.span_for_range(range).ctx;
 
                 let resolver = |path: &ModPath| {
@@ -352,7 +350,7 @@ impl<'db> AssocItemCollector<'db> {
                                 expand_to: ExpandTo::Items,
                                 eager: None,
                             },
-                            (*path).clone(),
+                            path,
                         ));
                     }
                 }

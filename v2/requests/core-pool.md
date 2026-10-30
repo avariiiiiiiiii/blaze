@@ -38,3 +38,35 @@
 - Why: docs-say-what-they-are; the section was written before the pool.
 
 > applied: by core (`docs/v2/plan/lanes/core/plane.md`, "The executor").
+
+## 4. pool.rs's part of core-hardware.md (speed-runtime-pool, while it rewrites pool.rs)
+
+core-hardware.md gives core-pool three pool.rs items. speed-runtime-pool is rewriting pool.rs,
+so core-pool's own edits to it were overwritten; to avoid a third edit war, the rewrite takes
+them in. `topology.rs` (NUMA) and `exec.rs` (the callers) are done by core-pool already.
+
+- What:
+  1. **`pub fn node() -> Option<u32>`**: the calling worker's NUMA node, `None` off a pool.
+     `Cpu` now has `node: u32` (topology.rs); keep it per slot, as `group` is.
+     `arena.rs` (core-plane) binds huge-page chunks to `crate::pool::node()`.
+  2. **`Pool::submit_critical(near, run, done)`**: same signature as `submit`. exec.rs's
+     `post` calls it for a task the plane's `Run { critical: true, .. }` names, and plain
+     `submit` otherwise. Placement:
+     - Only when the pool has both fast and slow groups (`mixed`) does `critical` matter.
+     - A critical job goes to `near` if that group is fast, else the least loaded fast group.
+     - A non-critical job goes to `near`, or to the least loaded of all groups (fast first on
+       a tie, then the lower id).
+     - On an all-fast machine a critical job is placed exactly as a non-critical one.
+     - Stealing is unchanged: an idle slow worker may still take a critical job, so no worker
+       idles while there is work.
+  3. **Tests**:
+     - Placement checked on `Shared`'s choice directly, on
+       `Topology::from_perflevels(&[(4, 2), (4, 4)])`. Run tests can't check it, because
+       stealing makes where a job runs depend on timing.
+     - A worker's `node()` matches its group's, on a two-node `Topology`.
+     - The `Cpu` literals in pool.rs's tests gain `node: 0`.
+     - A `#[cfg(test)] pub(crate) fn critical_submitted(&self) -> usize` counter, which
+       exec.rs's test uses to see the plane's flag reach the pool.
+- Where: `crates/blaze-graph/src/pool.rs`.
+- Why: core-hardware.md ("P cores for the critical path", "NUMA"); hardware.md's threads and
+  memory rows.

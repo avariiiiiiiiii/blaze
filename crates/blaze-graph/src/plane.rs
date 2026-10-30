@@ -42,6 +42,8 @@
 //! buffer kept on the plane, so in steady state a task costs the plane no allocation:
 //! [`Plane::step_into`] appends to the caller's buffer of outputs.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap, hash_map::Entry},
@@ -164,8 +166,10 @@ pub enum PlaneOutput {
     /// A record of a request: a node, a move, its critical path.
     Said { request: RequestId, record: Record },
     /// Run the work of node `id` on `pool`, near the thread group `near` if the executor has
-    /// one, then give the plane a [`PlaneInput::Done`] of it.
-    Run { id: NodeId, pool: Pool, near: Option<u32> },
+    /// one, then give the plane a [`PlaneInput::Done`] of it. `critical`: its path of expected
+    /// cost to the end of its request is the longest of the request's ready or running work,
+    /// so a machine with fast and slow cores gives it a fast one.
+    Run { id: NodeId, pool: Pool, near: Option<u32>, critical: bool },
     /// Every node of the request is settled. Nothing more comes of it.
     Finished { request: RequestId, ok: bool },
 }
@@ -345,6 +349,13 @@ struct Request {
     active_at: [u32; 2],
     /// Its virtual time in each pool, for fair share.
     vtime: [u128; 2],
+    /// Its running nodes as `(priority, seq, slot)`, the most first, for
+    /// [`PlaneOutput::Run`]'s `critical`. An entry goes stale when its node stops running or
+    /// rises (a raise pushes a new one); a stale one is dropped when it comes to the top, and
+    /// all of them once they outnumber the live ones ([`running_live`]).
+    running: BinaryHeap<(u64, u64, u32)>,
+    /// How many of its nodes are running.
+    running_now: u32,
     nodes: Vec<u32>,
     edges: Vec<Edge>,
     names: String,
@@ -368,6 +379,8 @@ impl Request {
             ready: [Vec::new(), Vec::new()],
             active_at: [NONE; 2],
             vtime: [0; 2],
+            running: BinaryHeap::new(),
+            running_now: 0,
             nodes: Vec::new(),
             edges: Vec::new(),
             names: String::new(),
@@ -392,6 +405,8 @@ impl Request {
         self.failed = NONE;
         self.active_at = [NONE; 2];
         self.vtime = vclock;
+        debug_assert_eq!(self.running_now, 0);
+        self.running.clear();
         self.stats = RequestStats::default();
     }
 
@@ -1154,6 +1169,9 @@ impl Plane {
         row.priority = priority;
         let (at, r, task) = (row.heap_at, row.request, row.task);
         if at == NONE {
+            if self.states[me as usize] == NodeState::Running {
+                self.track_running(me);
+            }
             return;
         }
         let p = pool_at(self.tasks[task as usize].pool);
@@ -1169,8 +1187,44 @@ impl Plane {
         if state.settled() {
             request.open -= 1;
         }
+        let was = self.states[me as usize] == NodeState::Running;
+        let now = state == NodeState::Running;
+        if was && !now {
+            request.running_now -= 1;
+        }
         out.push(said(request.id, at, Event::Moved { id: row.id.0, state: state.clone() }));
         self.states[me as usize] = state;
+        if now && !was {
+            self.requests[self.rows[me as usize].request as usize].running_now += 1;
+            self.track_running(me);
+        }
+    }
+
+    /// Puts running `me` at its priority among its request's running nodes.
+    fn track_running(&mut self, me: u32) {
+        let row = self.rows[me as usize];
+        let request = &mut self.requests[row.request as usize];
+        request.running.push((row.priority, row.seq, me));
+        if request.running.len() > 2 * request.running_now as usize + 16 {
+            let (rows, states) = (&self.rows, &self.states);
+            request.running.retain(|&it| running_live(rows, states, it));
+        }
+    }
+
+    /// Whether the task `me` starts is on its request's critical path: its priority is the
+    /// most of its request's ready and running nodes. Called once `me` runs.
+    fn on_critical_path(&mut self, me: u32) -> bool {
+        let row = self.rows[me as usize];
+        let request = &mut self.requests[row.request as usize];
+        let (rows, states) = (&self.rows, &self.states);
+        let running = loop {
+            match request.running.peek().copied() {
+                Some(top) if !running_live(rows, states, top) => _ = request.running.pop(),
+                top => break top.map_or(0, |it| it.0),
+            }
+        };
+        let ready = request.ready.iter().filter_map(|it| it.first()).map(|it| !it.rank).max();
+        row.priority >= running.max(ready.unwrap_or(0))
     }
 
     /// Puts `me`, of a task not running, among its request's ready nodes of pool `p`. A
@@ -1655,7 +1709,8 @@ impl Plane {
         let blocker = self.cold[m].blocker;
         let near = (blocker != NONE && self.cold[blocker as usize].flags & GROUP != 0)
             .then(|| self.cold[blocker as usize].group);
-        out.push(PlaneOutput::Run { id: self.rows[m].id, pool: t.pool, near });
+        let critical = self.on_critical_path(me);
+        out.push(PlaneOutput::Run { id: self.rows[m].id, pool: t.pool, near, critical });
     }
 
     /// From request `r`'s node that settled last, back through what each one waited for last:
@@ -1673,6 +1728,13 @@ impl Plane {
         path.reverse();
         path
     }
+}
+
+/// Whether an entry of a request's running nodes is still what it says: the same node (a slot
+/// reused has another `seq`), running, at that priority.
+fn running_live(rows: &[NodeRow], states: &[NodeState], (priority, seq, node): (u64, u64, u32)) -> bool {
+    let row = &rows[node as usize];
+    row.seq == seq && row.priority == priority && states[node as usize] == NodeState::Running
 }
 
 enum Pick {

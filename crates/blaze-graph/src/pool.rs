@@ -18,6 +18,12 @@
 //! Tokio's rules), so a burst of work wakes no stampede and none is left unseen. A parked worker
 //! sleeps on its own thread's futex (`thread::park`), not a shared condvar.
 //!
+//! On a machine of fast and slow groups, a job on its request's critical path
+//! ([`Pool::submit_critical`]) goes to its `near` group if that is fast, else to the least loaded
+//! fast group; stealing is unchanged, so a slow worker with nothing else still takes it. Where
+//! every group is fast a critical job is placed as any other. [`node`] names the NUMA node of
+//! the calling worker, for memory it should keep local.
+//!
 //! Bound to its CPU, a worker is pinned to it on Linux (`sched_setaffinity`); on macOS, which
 //! pins nothing, it takes the QoS class of its kind of core: user-interactive on fast cores,
 //! utility on the others.
@@ -163,8 +169,12 @@ struct Shared {
     slots: Box<[Slot]>,
     idle: Idle,
     stop: AtomicBool,
+    /// Of fast and slow groups both: only then does a job's being critical place it.
+    mixed: bool,
     /// The first panic of a job's `done`, raised when the pool is dropped.
     stray: Lock<Option<Box<dyn Any + Send>>>,
+    #[cfg(test)]
+    critical: AtomicUsize,
 }
 
 pub struct Pool {
@@ -178,6 +188,7 @@ struct Local {
     shared: Arc<Shared>,
     index: usize,
     group: usize,
+    node: u32,
     deque: Worker<Job>,
     /// How many jobs in a row came from the LIFO slot.
     lifo: Cell<u8>,
@@ -199,6 +210,12 @@ fn with_local<R>(f: impl FnOnce(&Local) -> R) -> Option<R> {
 /// The group of the worker this thread is, or `None` for a thread of no pool.
 pub fn group() -> Option<u32> {
     with_local(|local| u32::try_from(local.group).ok()).flatten()
+}
+
+/// The NUMA node of the worker this thread is (its CPU's [`Cpu::node`]), or `None` for a
+/// thread of no pool.
+pub fn node() -> Option<u32> {
+    with_local(|local| local.node)
 }
 
 impl Pool {
@@ -245,13 +262,17 @@ impl Pool {
                 workers: workers.into_boxed_slice(),
                 sleepers: AtomicU32::new(0),
             })
-            .collect();
+            .collect::<Box<[Group]>>();
+        let mixed = groups.iter().any(|it| it.fast) && groups.iter().any(|it| !it.fast);
         let shared = Arc::new(Shared {
             groups,
             slots,
             idle: Idle(AtomicU64::new(0)),
             stop: AtomicBool::new(false),
+            mixed,
             stray: Lock::new(None),
+            #[cfg(test)]
+            critical: AtomicUsize::new(0),
         });
         let (ready_tx, ready_rx) = crossbeam_channel::unbounded::<io::Result<()>>();
         let mut threads = Vec::with_capacity(deques.len());
@@ -273,6 +294,7 @@ impl Pool {
                             shared,
                             index,
                             group,
+                            node: cpu.node,
                             deque,
                             lifo: Cell::new(0),
                             seed: Cell::new(seed),
@@ -347,6 +369,28 @@ impl Pool {
         if let Some(job) = push_next(&self.shared, None, job) {
             self.shared.push(None, job);
         }
+    }
+
+    /// As [`Pool::submit`], for a job on its request's critical path: on a pool of fast and
+    /// slow groups it goes to `near` if that group is fast, else to the least loaded fast
+    /// group. Where every group is fast it is placed as [`Pool::submit`] places it.
+    pub fn submit_critical<R: 'static>(
+        &self,
+        near: Option<u32>,
+        run: impl FnOnce() -> R + Send + 'static,
+        done: impl FnOnce(thread::Result<R>) + Send + 'static,
+    ) {
+        #[cfg(test)]
+        self.shared.critical.fetch_add(1, Ordering::Relaxed);
+        let job = Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run))));
+        let group = self.shared.place(near, true);
+        self.shared.push_to(group, job);
+    }
+
+    /// How many jobs were given by [`Pool::submit_critical`].
+    #[cfg(test)]
+    pub(crate) fn critical_submitted(&self) -> usize {
+        self.shared.critical.load(Ordering::Relaxed)
     }
 
     /// `job` behind what is queued near `near`, as [`Pool::submit`] puts a job.
@@ -513,12 +557,21 @@ fn take(next: &AtomicPtr<Header>) -> Option<Job> {
 
 impl Shared {
     fn push(&self, near: Option<u32>, job: Job) {
-        let group = near
-            .map(|it| it as usize)
-            .filter(|&it| it < self.groups.len())
-            .unwrap_or_else(|| self.least_loaded());
+        self.push_to(self.place(near, false), job);
+    }
+
+    fn push_to(&self, group: usize, job: Job) {
         self.groups[group].injector.push(job);
         self.announce(group);
+    }
+
+    /// The group a job near `near` (a group this pool does not have is none) is queued on: a
+    /// critical one, on a pool of fast and slow groups, only on a fast group.
+    fn place(&self, near: Option<u32>, critical: bool) -> usize {
+        let only_fast = critical && self.mixed;
+        near.map(|it| it as usize)
+            .filter(|&it| it < self.groups.len() && (!only_fast || self.groups[it].fast))
+            .unwrap_or_else(|| self.least_loaded(only_fast))
     }
 
     /// After a job is queued: wakes a parked worker, of `group` first, when none searches. A
@@ -835,7 +888,10 @@ mod tests {
     use crossbeam_channel::{bounded, unbounded};
 
     use super::{Group, Job, Pending, Pool, Slot, group, searching, sleeping};
-    use crate::topology::{Cpu, Topology};
+    use crate::{
+        pump::PUMP_DEPTH,
+        topology::{Cpu, Topology},
+    };
 
     const LONG: Duration = Duration::from_secs(60);
 
@@ -1056,7 +1112,6 @@ mod tests {
         assert_eq!(&log[..3], ["b0", "b1", "b2"], "the job just given runs next: {log:?}");
         assert_eq!(log[3], "a", "after three from the slot, the deque's job: {log:?}");
         assert_eq!(log.iter().filter(|it| it.starts_with('b')).count(), 21);
-        tx.send(()).unwrap();
     }
 
     /// Off the pool, `submit_next` is `submit`; and each worker says its own index.
@@ -1064,14 +1119,11 @@ mod tests {
     fn workers_say_their_index_and_submit_next_works_off_the_pool() {
         let pool = Arc::new(Pool::new(&groups_of(2, 2), false).unwrap());
         assert_eq!(pool.worker(), None);
-        let other = Pool::new(&Topology::flat(1), false).unwrap();
+        let other = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
         let (tx, rx) = unbounded::<(Option<u32>, Option<u32>)>();
-        let inner = pool.clone();
-        let other = Arc::new(other);
-        let theirs = other.clone();
         for _ in 0..64 {
-            let (tx, inner, theirs) = (tx.clone(), inner.clone(), theirs.clone());
-            pool.submit_next(move || (inner.worker(), theirs.worker()), move |it| _ = tx.send(it.unwrap()));
+            let (tx, mine, theirs) = (tx.clone(), pool.clone(), other.clone());
+            pool.submit_next(move || (mine.worker(), theirs.worker()), move |it| _ = tx.send(it.unwrap()));
         }
         for _ in 0..64 {
             let (mine, theirs) = rx.recv_timeout(LONG).unwrap();
@@ -1147,7 +1199,7 @@ mod tests {
         if !scoped.is_empty() {
             pool.scope(|scope| {
                 for &child in &scoped {
-                    scope.submit(None, || run_node(pool, tree, child), |it| it.unwrap());
+                    scope.submit(None, move || run_node(pool, tree, child), |it| it.unwrap());
                 }
             });
         }
@@ -1156,22 +1208,33 @@ mod tests {
 
     /// Random trees of jobs that give their children by `submit` (near a random group or
     /// none), `submit_next` and a scope, on random topologies: every node of the model's tree
-    /// runs exactly once, and then every worker parks with no searcher left.
+    /// runs exactly once, and then every worker parks with no searcher left. Fewer than
+    /// [`PUMP_DEPTH`] nodes wait on a scope, so no stack reaches the bound with work only it
+    /// could run (a one-worker pool's scope at the bound waits for its own queue).
     #[test]
     fn a_seeded_stress_runs_every_job_of_the_model_once() {
         for seed in 0..10u64 {
             let mut rng = Rng(seed);
             let (count, each) = (1 + rng.below(3) as u32, 1 + rng.below(3) as u32);
             let mut children: Vec<Vec<(How, usize)>> = vec![Vec::new()];
+            let mut scoping = 0;
             let mut at = 0;
             while at < children.len() && children.len() < 600 {
+                let mut scopes = false;
                 for _ in 0..rng.below(4) {
-                    let how = match rng.below(4) {
+                    let mut how = match rng.below(4) {
                         0 => How::Submit(None),
                         1 => How::Submit(Some(rng.below(u64::from(count) + 1) as u32)),
                         2 => How::Next,
                         _ => How::Scope,
                     };
+                    if matches!(how, How::Scope) && !scopes {
+                        if scoping + 1 < PUMP_DEPTH {
+                            (scoping, scopes) = (scoping + 1, true);
+                        } else {
+                            how = How::Next;
+                        }
+                    }
                     let child = children.len();
                     children.push(Vec::new());
                     children[at].push((how, child));

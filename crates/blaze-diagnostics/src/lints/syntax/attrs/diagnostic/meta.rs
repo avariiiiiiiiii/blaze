@@ -53,6 +53,8 @@ impl Item {
 /// rustc's `MetaItemParser`.
 #[derive(Clone, Debug)]
 pub(super) struct MetaItem {
+    /// Whether the path starts with `::`.
+    rooted: bool,
     /// Each segment's name (a raw one's without the `r#`) and where it is written.
     pub(super) path: Vec<(String, TextRange)>,
     pub(super) path_range: TextRange,
@@ -63,7 +65,7 @@ impl MetaItem {
     /// The name of a path of one segment.
     pub(super) fn ident(&self) -> Option<&str> {
         match &self.path[..] {
-            [(name, _)] => Some(name),
+            [(name, _)] if !self.rooted => Some(name.as_str()),
             _ => None,
         }
     }
@@ -79,7 +81,7 @@ impl MetaItem {
     pub(super) fn path_text(&self) -> String {
         let mut text = String::new();
         for (i, (name, _)) in self.path.iter().enumerate() {
-            if i > 0 {
+            if i > 0 || self.rooted {
                 text.push_str("::");
             }
             text.push_str(name);
@@ -304,7 +306,7 @@ impl Parser<'_> {
                 None => Args::NoArgs,
             },
         };
-        Some(MetaItem { path, path_range, args })
+        Some(MetaItem { rooted: leading.is_some(), path, path_range, args })
     }
 
     /// A path segment: an identifier that is not a reserved keyword, or `self`, `Self`,

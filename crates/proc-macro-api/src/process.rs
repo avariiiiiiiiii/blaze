@@ -114,7 +114,11 @@ mod tests {
         bidirectional_protocol::msg::Response,
         legacy_protocol::msg::{Message as _, ServerConfig},
     };
-    use std::{io::Cursor, sync::atomic::AtomicUsize};
+    use crate::pool::ProcMacroServerPool;
+    use std::{
+        io::Cursor,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     struct Running;
     impl ProcessExit for Running {
@@ -185,6 +189,45 @@ mod tests {
         let refused = warm_server(version::HASHED_AST_ID).unwrap_err().to_string();
         assert!(refused.contains("scope"), "{refused}");
         assert!(warm_server(version::SCOPED_EXPANSIONS).unwrap().rust_analyzer_spans());
+    }
+
+    fn handshake() -> io::Result<ProcMacroServerProcess> {
+        connect(vec![
+            Response::ApiVersionCheck(version::CURRENT_API_VERSION),
+            Response::SetConfig(ServerConfig { span_mode: SpanMode::RustAnalyzer }),
+        ])
+    }
+
+    #[test]
+    fn a_claim_while_every_connection_is_claimed_opens_another_and_a_given_back_one_is_reused() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let open = {
+            let opened = opened.clone();
+            move || {
+                opened.fetch_add(1, Ordering::Relaxed);
+                handshake()
+            }
+        };
+        let pool = ProcMacroServerPool::new(vec![open().unwrap()], Box::new(open)).unwrap();
+        let first = pool.claim().unwrap();
+        assert!(first.rust_analyzer_spans());
+        // As an expansion asked for while this thread answers the first's sub-request would.
+        let second = pool.claim().unwrap();
+        assert_eq!(opened.load(Ordering::Relaxed), 2);
+        drop(second);
+        let again = pool.claim().unwrap();
+        assert_eq!(opened.load(Ordering::Relaxed), 2);
+        drop((first, again));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| drop(pool.claim().unwrap()));
+            }
+        });
+        // Every claim was given back: the next one opens nothing.
+        let before = opened.load(Ordering::Relaxed);
+        drop(pool.claim().unwrap());
+        assert_eq!(opened.load(Ordering::Relaxed), before);
+        assert!(pool.exited().is_none());
     }
 
     #[test]
@@ -559,15 +602,20 @@ impl Claimed<'_> {
         callback: SubCallback<'_>,
         seen: Option<Vec<(OsString, OsString)>>,
     ) -> Result<BidirectionalMessage, ServerError> {
-        let scope = self.state.borrow_mut().as_mut().and_then(|it| it.tracer.as_mut().map(Tracer::scope));
+        fn tracer(state: &mut Option<ProcessSrvState>) -> Option<&mut Tracer> {
+            state.as_mut()?.tracer.as_mut()
+        }
+        let scope = tracer(&mut self.state.borrow_mut()).map(Tracer::scope);
         let answered = self.with_io(Vec::new(), |writer, reader, buf| {
             bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
         });
         if answered.is_ok()
             && let Some(scope) = scope
-            && let Some(tracer) = self.state.borrow_mut().as_mut().and_then(|it| it.tracer.as_mut())
         {
-            warm::set_traced(Some(tracer.traced(&scope, seen.unwrap_or_default())));
+            let mut state = self.state.borrow_mut();
+            if let Some(tracer) = tracer(&mut state) {
+                warm::set_traced(Some(tracer.traced(&scope, seen.unwrap_or_default())));
+            }
         }
         answered
     }

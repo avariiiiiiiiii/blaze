@@ -10,7 +10,7 @@
 //! summaries, never by compiling functions together (v1's units, `RA_JIT_UNITS`).
 
 #[cfg(feature = "llvm")]
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 
 use blaze_codegen::{
     CodegenError, Unit,
@@ -41,20 +41,13 @@ use crate::{
     llvm::release::{self as llvm, Given, Prelinked},
 };
 
-/// What [`summarize`] leaves of an LLVM unit for its own [`emit`], by the unit's key: its
-/// pre-linked module, so that LLVM's pre-link pipeline runs once per function. A key is the
-/// unit's code, arguments and settings, which make the same module whichever unit of it
-/// summarized; `emit` takes it out.
-#[cfg(feature = "llvm")]
-static KEPT: LazyLock<Mutex<rustc_hash::FxHashMap<InstanceKey, Arc<Vec<u8>>>>> =
-    LazyLock::new(Mutex::default);
-
-/// What the function's `#[inline]` asks. The prepared function does not carry it
-/// (`v2/requests/codegen-release.md`), so LLVM and the importers are told nothing and LLVM's
-/// cost model alone decides, which changes how fast the code is, never what it does.
-#[cfg(feature = "llvm")]
-fn inline_hint(_: &Function) -> Hint {
-    Hint::None
+/// What [`summarize`] leaves in an LLVM unit's prepared function ([`Function::release`]) for
+/// its own [`emit`]: its pre-linked module, so that LLVM's pre-link pipeline runs once per
+/// function. It goes with the function, so no table is shared between units.
+#[derive(Default)]
+pub(crate) struct Kept {
+    #[cfg(feature = "llvm")]
+    own: Option<Arc<[u8]>>,
 }
 
 /// A release function as its importers link it, held for one build.
@@ -78,7 +71,7 @@ pub(crate) struct Export(std::convert::Infallible);
 pub(crate) fn summarize(
     unit: &Unit,
     spec: &Spec,
-    function: &Function,
+    function: &mut Function,
     refs: &Refs,
 ) -> Result<(Summary, Export), CodegenError> {
     let optimization = optimization(unit, spec)?;
@@ -107,7 +100,7 @@ pub(crate) fn summarize(
         }
     };
     let Prelinked { own, export, size, facts } = prelinked(unit, spec, function, refs, optimization)?;
-    KEPT.lock().unwrap_or_else(|e| e.into_inner()).insert(unit.instance.key(), Arc::new(own));
+    function.release.own = Some(own);
     let requests = &pending.wants.requests;
     let mut calls: Vec<Call> = Vec::with_capacity(facts.calls.len());
     for called in facts.calls {
@@ -137,7 +130,7 @@ pub(crate) fn summarize(
     });
     let addressed = keys(unit, places, refs, facts.addressed.iter().copied().chain(in_data))?;
     let importable = requests.ordered();
-    let hint = match inline_hint(function) {
+    let hint = match function.hint {
         _ if !importable => summary::Hint::Never,
         Hint::None => summary::Hint::None,
         Hint::Inline => summary::Hint::Inline,
@@ -164,7 +157,7 @@ pub(crate) fn summarize(
             requests: copied(requests),
             signature: pending.func.signature.clone(),
             size,
-            hint: inline_hint(function),
+            hint: function.hint,
         })
     });
     Ok((summary, Export { module, places: places.clone(), code: unit.instance.code }))
@@ -174,7 +167,7 @@ pub(crate) fn summarize(
 pub(crate) fn summarize(
     unit: &Unit,
     _: &Spec,
-    _: &Function,
+    _: &mut Function,
     _: &Refs,
 ) -> Result<(Summary, Export), CodegenError> {
     Err(failed(unit, "blaze was built without `--features llvm`"))
@@ -186,7 +179,7 @@ pub(crate) fn summarize(
 pub(crate) fn emit(
     unit: &Unit,
     spec: &Spec,
-    mut function: Box<Function>,
+    mut function: Function,
     refs: &Refs,
     imports: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
@@ -210,12 +203,12 @@ pub(crate) fn emit(
         }
         return emitted(unit, &function, code, requests, refs);
     }
-    let kept = KEPT.lock().unwrap_or_else(|e| e.into_inner()).remove(&unit.instance.key());
-    let own = match kept {
+    // Nothing summarized a unit compiled without imports, or one whose summary the store had.
+    let own = match function.release.own.take() {
         Some(own) => own,
-        None => Arc::new(prelinked(unit, spec, &function, refs, optimization)?.own),
+        None => prelinked(unit, spec, &function, refs, optimization)?.own,
     };
-    let Function { code: Built::Ir(pending), places, .. } = &mut *function else {
+    let Function { code: Built::Ir(pending), places, .. } = &mut function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
     let mut linked = Vec::with_capacity(imported.len());
@@ -288,7 +281,7 @@ fn emitted(
 pub(crate) fn emit(
     unit: &Unit,
     _: &Spec,
-    _: Box<Function>,
+    _: Function,
     _: &Refs,
     _: Option<(&Imports, &[Import<'_, Export>])>,
 ) -> Result<Emitted, CodegenError> {
@@ -333,7 +326,7 @@ fn prelinked(
         matches!(target, Some(Target::Function(_) | Target::Direct(_)))
     };
     let debug = spec.debuginfo != DebugInfo::None;
-    llvm::prelink(&pending.wants, &pending.func, &pending.named, inline_hint(function), debug, optimization, &instances)
+    llvm::prelink(&pending.wants, &pending.func, &pending.named, function.hint, debug, optimization, &instances)
         .map_err(|why| failed(unit, format!("LLVM has no code for it: {why}")))
 }
 

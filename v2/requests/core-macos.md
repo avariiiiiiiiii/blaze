@@ -92,3 +92,5 @@ the footprint watch is always on and holds the limit, the rlimit is extra.
   `F_NOCACHE` write coherent with cached and mapped pages. So the choice is dispatch, not a
   fallback. The trade-off is `O_DIRECT`'s, which the plan has settled: a pack mapped right
   after it is written faults its pages in from disk.
+
+> applied: lane core is DONE. `crates/blaze-core/src/fs.rs` `write_at` sets `F_NOCACHE` on macOS for a write of at least 1 MiB at a 4 KiB-aligned offset and length, as written, before `write_all_at`.

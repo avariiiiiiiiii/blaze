@@ -648,31 +648,42 @@ impl fmt::Display for Ident {
     }
 }
 
+impl Literal {
+    /// Appends the source text of the literal, what `Display` writes.
+    pub fn push_to(&self, out: &mut String) {
+        self.write(out).expect("writing to a String does not fail");
+    }
+
+    fn write(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        let (prefix, hashes, quote) = match self.kind {
+            LitKind::Byte => ("b", 0, "'"),
+            LitKind::Char => ("", 0, "'"),
+            LitKind::Integer | LitKind::Float | LitKind::Err(_) => ("", 0, ""),
+            LitKind::Str => ("", 0, "\""),
+            LitKind::ByteStr => ("b", 0, "\""),
+            LitKind::CStr => ("c", 0, "\""),
+            LitKind::StrRaw(hashes) => ("r", hashes, "\""),
+            LitKind::ByteStrRaw(hashes) => ("br", hashes, "\""),
+            LitKind::CStrRaw(hashes) => ("cr", hashes, "\""),
+        };
+        let (text, suffix) = self.text_and_suffix();
+        out.write_str(prefix)?;
+        for _ in 0..hashes {
+            out.write_char('#')?;
+        }
+        out.write_str(quote)?;
+        out.write_str(text)?;
+        out.write_str(quote)?;
+        for _ in 0..hashes {
+            out.write_char('#')?;
+        }
+        out.write_str(suffix)
+    }
+}
+
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (text, suffix) = self.text_and_suffix();
-        match self.kind {
-            LitKind::Byte => write!(f, "b'{}'", text),
-            LitKind::Char => write!(f, "'{}'", text),
-            LitKind::Integer | LitKind::Float | LitKind::Err(_) => write!(f, "{}", text),
-            LitKind::Str => write!(f, "\"{}\"", text),
-            LitKind::ByteStr => write!(f, "b\"{}\"", text),
-            LitKind::CStr => write!(f, "c\"{}\"", text),
-            LitKind::StrRaw(num_of_hashes) => {
-                let num_of_hashes = num_of_hashes as usize;
-                write!(f, r#"r{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
-            }
-            LitKind::ByteStrRaw(num_of_hashes) => {
-                let num_of_hashes = num_of_hashes as usize;
-                write!(f, r#"br{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
-            }
-            LitKind::CStrRaw(num_of_hashes) => {
-                let num_of_hashes = num_of_hashes as usize;
-                write!(f, r#"cr{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
-            }
-        }?;
-        write!(f, "{suffix}")?;
-        Ok(())
+        self.write(f)
     }
 }
 

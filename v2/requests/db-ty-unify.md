@@ -19,6 +19,8 @@ Why: `rg '\bena::' crates/hir-ty` finds nothing; only comments mention it.
 `vendor/rustc_type_ir` still depends on `ena` (`data_structures/mod.rs`), so `Cargo.lock` keeps
 it.
 
+> forwarded to db: `crates/hir-ty/Cargo.toml` is lane db's.
+
 ## 2. db-ty-hir (sibling), `crates/hir-ty-wfcheck/src/outlives.rs`, `Wfcx::needs_since`
 
 Replace
@@ -42,6 +44,8 @@ with
 
 `mark()`'s `.constraints.len()` compiles unchanged.
 
+> forwarded to db: `crates/hir-ty-wfcheck/` is lane db's.
+
 ## 3. db-ty-borrowck (sibling), `crates/hir-ty-borrowck/src/regions.rs`
 
 - `constraint_pairs` (line ~6437): take an iterator.
@@ -63,6 +67,8 @@ with
   `.constraints.iter_from(constraints_before).collect::<Vec<_>>()`.
 
 The `.constraints.len()` calls compile unchanged.
+
+> forwarded to db: `crates/hir-ty-borrowck/` is lane db's.
 
 ## 4. db-ty-solver (sibling), `crates/hir-ty/src/next_solver/solver.rs`
 
@@ -88,3 +94,5 @@ The `.constraints.len()` calls compile unchanged.
 Done (db-ty-solver's note in its own request 1): the stale comment about reinitializing the
 cache in `InferCtxtBuilder::build` now reads "Solving needs the crate's trait environment and
 solver cache."
+
+> forwarded to db: `next_solver/solver.rs` is lane db's.

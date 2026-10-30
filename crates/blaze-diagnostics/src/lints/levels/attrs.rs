@@ -100,7 +100,7 @@ pub(super) fn owner(node: &SyntaxNode, generics: bool) -> Option<ast::AnyHasAttr
 /// order.
 pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Vec<Read> {
     let mut found = Vec::new();
-    let mut each = |meta: ast::Meta, _| {
+    let mut each = |meta: ast::Meta, _: ast::Attr| {
         if let Some(read) = read_meta(&meta, edition) {
             found.push(read);
         }
@@ -171,7 +171,7 @@ fn item(elements: &[SyntaxElement], edition: Edition) -> Option<Item> {
         [NodeOrToken::Token(eq), NodeOrToken::Token(value)]
             if eq.kind() == SyntaxKind::EQ && is_literal(value.kind()) =>
         {
-            let string = ast::String::cast(value.clone()).and_then(|it| it.value().ok()).map(|it| it.into_owned());
+            let string = ast::String::cast(value.clone()).and_then(|it| it.value().ok().map(|it| it.into_owned()));
             ItemKind::NameValue { path, string, value: value.text_range() }
         }
         [NodeOrToken::Node(tt)] if tt.kind() == SyntaxKind::TOKEN_TREE => {

@@ -46,7 +46,7 @@ with.
 | whole-file write (temporary, sync, rename) | the ring + `renameat` | file threads | file threads, `MoveFileExW` written through | all or nothing over a crash |
 | rename, mode, stat, list, remove, link | where submitted, or a thread for a list | file threads | file threads | in memory |
 | clone | `FICLONE` | `clonefile` | ReFS block cloning | shares the bytes |
-| map | `mmap` | `mmap` | `MapViewOfFile` | the bytes |
+| map | `mmap`, `MADV_HUGEPAGE` from 2 MiB | `mmap` | `MapViewOfFile` | the bytes |
 | timer | the ring | `EVFILT_TIMER` | the port's wait, to the next due | the virtual clock |
 | watch | fanotify, inotify when fanotify is refused for privilege (`EPERM`) | FSEvents | `ReadDirectoryChangesW` | changes the test makes |
 | spawn, kill | `pidfd`, the ring polls it and the pipes | `EVFILT_PROC`, `EVFILT_READ`/`WRITE` | a job object each; its end from a thread-pool wait on the process, posted to the port | a program the test gives |
@@ -67,11 +67,24 @@ given no `Confine` fails every sandboxed spawn naming it.
 **The hard backstop for a process.** A `Command` with `memory: Some(bytes)` runs under a limit
 the kernel holds: on Linux a cgroup v2 of its own (`memory.max`, swap 0, the child joins it
 before `exec`; its `memory.peak` is the `Exit`'s peak; Linux 5.19 or newer, else an error
-before it runs); on macOS `RLIMIT_DATA` and `RLIMIT_AS` where macOS holds them, and always a
-watch of its physical footprint that kills it past the limit; on Windows its job object's
+before it runs); on macOS a watch of its physical footprint that kills it past the limit
+(macOS refuses `RLIMIT_AS` and `RLIMIT_DATA` below what every process reserves, so none is
+set); on Windows its job object's
 memory limit, which refuses any commit past it (so its peak is at most the limit; the job's
 port messages, which Windows does not promise, only say it went over). The watch stops before
 the process is reaped, so no kill reaches a reused pid.
+
+**No process starts by `fork`** (`process/spawn.rs`). Everything the child needs (paths,
+argument and environment arrays, pipes past descriptor 2, the cgroup's `cgroup.procs` open) is
+made in the parent first. On Linux `clone(CLONE_VM | CLONE_VFORK | CLONE_PIDFD)` runs the child
+on a stack of its own in the daemon's memory, with every signal blocked across it: the child
+resets its handlers, takes its pipes, writes itself into its cgroup, changes directory and
+`execve`s, using system calls alone; a step that fails comes back as the spawn's error naming
+it. The pidfd comes from the same call, so it names this process and no later one. On macOS
+`posix_spawn` with every descriptor not given closed (`POSIX_SPAWN_CLOEXEC_DEFAULT`). A spawn
+costs the same however large the warm daemon is. The program is looked up on the `PATH` of
+its own environment, the environment ordered by name with a later value replacing an earlier
+one, and SIGPIPE back to its default, as std's spawn does.
 
 **The simulation's files** keep a log of changes since their last covering sync (appends,
 writes at an offset, truncations): a crash keeps a random prefix of it, the last change maybe

@@ -2,6 +2,8 @@
 //! structs of `Vec`s, ready sets as `BTreeSet`s. Kept unchanged but for its imports and visibility, as the
 //! model [`crate::plane::Plane`] is compared with step by step (`plane_tests`).
 
+#![forbid(unsafe_code)]
+
 use std::{cmp::Reverse, collections::BTreeSet};
 
 use blaze_protocol::events::{Event, Level, NodeState, Record};
@@ -944,7 +946,17 @@ impl Plane {
             self.moved(at, member, NodeState::Running, out);
         }
         let near = self.nodes[me].blocker.and_then(|it| self.nodes[it].group);
-        out.push(PlaneOutput::Run { id: self.nodes[me].spec.id, pool: self.tasks[task].pool, near });
+        // On the critical path: no ready or running node of the request has more to go.
+        let most = self.requests[self.nodes[me].request]
+            .nodes
+            .iter()
+            .filter(|&&it| matches!(self.nodes[it].state, NodeState::Ready | NodeState::Running))
+            .map(|&it| self.nodes[it].priority)
+            .max()
+            .unwrap_or(0);
+        let critical = self.nodes[me].priority >= most;
+        let (id, pool) = (self.nodes[me].spec.id, self.tasks[task].pool);
+        out.push(PlaneOutput::Run { id, pool, near, critical });
     }
 
     /// From request `r`'s node that settled last, back through what each one waited for last.

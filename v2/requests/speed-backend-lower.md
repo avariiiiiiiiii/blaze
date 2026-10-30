@@ -30,6 +30,8 @@ aho-corasick's Teddy inner loop on AArch64. Bit-identical: integer ops, each the
 definition (tests in `neon.rs`). It asks for no symbol, libcall or assembly, so the refs walk's
 list stays a superset.
 
+> forwarded to speed: between speed's children.
+
 ## From speed-backend-intrinsics: FYI, `wasm_simd_intrinsic` now runs on every target
 
 No edit needed. `FunctionCx::wasm_simd_intrinsic` (called first in `intrinsic`) now lowers the
@@ -40,6 +42,8 @@ lane arms for these in `intrinsic` now see only what `admits` refuses (x86-64 op
 f16 lanes, non-16-byte shapes). The name is unchanged so no caller moves; if you rename it
 (`simd_vector_intrinsic`), tell me and I'll rename the definition.
 
+> forwarded to speed: between speed's children.
+
 ## From speed-backend-intrinsics: x86 `pshufb` stays scalar until the ISA has SSSE3
 
 `llvm.x86.ssse3.pshuf.b.128` / `avx2.pshuf.b` (Teddy's `_mm_shuffle_epi8` on x86-64) are a
@@ -47,3 +51,5 @@ f16 lanes, non-16-byte shapes). The name is unchanged so no caller moves; if you
 `Target::isa` never sets (one ISA per process). The fix is a per-function ISA from
 `#[target_feature]` (filed in `v2/requests/speed.md` under speed-backend-intrinsics); once it
 exists the arm becomes `x86_pshufb(table, band(indices, 0x8f))`. Nothing for you to do now.
+
+> forwarded to speed: between speed's children.

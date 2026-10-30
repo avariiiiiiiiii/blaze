@@ -11,6 +11,8 @@
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build.
 
+#![forbid(unsafe_code)]
+
 pub mod args;
 pub mod daemon;
 pub mod json;
@@ -27,7 +29,7 @@ use std::{
     time::Instant,
 };
 
-use blaze_api::{Cargo, Request, Response, TestResult, ViewRef};
+use blaze_api::{Cargo, Request, Response, TestResult, Ub, ViewRef};
 
 use self::{
     args::{Asked, Command, Invocation},
@@ -136,17 +138,36 @@ pub fn command(words: Vec<OsString>) -> i32 {
     }
 }
 
-/// The request of a cargo command line, once its place and `Cargo` are known.
-pub fn request(asked: &Invocation, cargo: Cargo) -> Request {
+/// The request of a cargo command line, once its place and `Cargo` are known. `test` runs in
+/// the daemon under blaze's `--reached` (the tests the edit reached) and `--ub` (every selected
+/// test, or the reached ones, in the MIR evaluator, nothing compiled); else the CLI runs what the
+/// build placed.
+pub fn request(asked: &Invocation, cargo: Cargo) -> Result<Request, String> {
     let view = ViewRef::Head(cargo.root.clone());
     let targets = place::targets(asked, cargo);
-    match asked.command() {
+    let flags = &asked.flags;
+    Ok(match asked.command() {
         Command::Check => Request::Check { view, targets },
-        Command::Test | Command::Bench if asked.flags.reached => {
-            Request::Test { view, targets, filter: asked.filter.iter().cloned().collect(), all: false }
+        Command::Test | Command::Bench if in_daemon(asked) => {
+            if flags.ub && flags.no_run {
+                return Err("`--ub` runs the tests in blaze's evaluator, which `--no-run` says not to do".to_owned());
+            }
+            let ub = flags.ub.then_some(Ub { seed: flags.ub_seed, schedules: flags.ub_schedules });
+            let args = asked.program.iter().map(|it| {
+                it.to_str().map(str::to_owned).ok_or_else(|| {
+                    format!("the test argument {} is not UTF-8, which a request to the daemon can't carry", it.to_string_lossy())
+                })
+            });
+            let args = args.collect::<Result<_, _>>()?;
+            Request::Test { view, targets, filter: asked.filter.iter().cloned().collect(), all: !flags.reached, args, ub }
         }
         Command::Build | Command::Run | Command::Test | Command::Bench => Request::Build { view, targets },
-    }
+    })
+}
+
+/// The tests run in the daemon, which sends their results: blaze's `--reached` and `--ub`.
+fn in_daemon(asked: &Invocation) -> bool {
+    asked.flags.reached || asked.flags.ub
 }
 
 /// Everything of the machine the request needs: where it runs and what it sends.
@@ -157,7 +178,7 @@ fn prepared(asked: &Invocation, color: bool) -> Result<(Place, Request), String>
     let home = crate::cargo::home::cargo_home();
     let files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
     let cargo = place::cargo(asked, &place, env, files, color)?;
-    let request = request(asked, cargo);
+    let request = request(asked, cargo)?;
     Ok((place, request))
 }
 
@@ -267,7 +288,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
                 }
             }
         }
-        Command::Test | Command::Bench if asked.flags.reached => {
+        Command::Test | Command::Bench if in_daemon(asked) => {
             let (out, err) = printer.streams();
             let passed = test::reached(&results, speaking, out, err)?;
             Ok(Then::Exit(if passed { 0 } else { FAILED }))

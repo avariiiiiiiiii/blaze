@@ -576,13 +576,13 @@ fn crt_tls_range_ends_before_its_end_marker() {
     f.entry = Some(text);
     f.tls = Some(Tls { addr: tdata, init: 17, size: 17 + 0x1_0000, align: 8 });
     f.symbols = vec![("_tls_used", rodata)];
-    let mut directory = Buf::default();
+    let mut used = Buf::default();
     for value in [tdata, tdata + 16, 0, 0] {
-        directory.u64(value);
+        used.u64(value);
     }
-    directory.u32(0);
-    directory.u32(0);
-    f.set(&Class::Rodata, directory.0);
+    used.u32(0);
+    used.u32(0);
+    f.set(&Class::Rodata, used.0);
     let image = f.image().unwrap();
     let aligned = Aligned::new(&image);
     let file = PeFile64::parse(aligned.bytes()).unwrap();

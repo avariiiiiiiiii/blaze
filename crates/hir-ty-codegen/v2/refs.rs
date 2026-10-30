@@ -327,7 +327,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         }
     }
 
-    pub(super) fn operands(&mut self, operands: &[Operand]) -> Result<Vec<Ty<'db>>, String> {
+    pub(super) fn operands(&mut self, operands: &[Operand]) -> Result<Tys<'db>, String> {
         operands.iter().map(|it| self.operand(it)).collect()
     }
 
@@ -541,7 +541,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             self.enter_coroutine(body)?;
         }
         for (id, block) in body.basic_blocks.iter() {
-            if !reachable.contains(&id) {
+            if !reachable.contains(id) {
                 continue;
             }
             for statement in &block.statements {
@@ -560,7 +560,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 return Err("block without terminator".to_owned());
             };
             self.fx.span = terminator.span;
-            if !decided.contains(&id) {
+            if !decided.contains(id) {
                 self.terminator(&terminator.kind)?;
             }
         }
@@ -571,18 +571,17 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// compiles with any setting: a check that is off only decides a switch, and `panic =
     /// "abort"` only leaves out cleanup blocks. With the blocks whose switch is decided, which
     /// only jump.
-    fn reachable(
-        &mut self,
-        body: &'db MirBody<'db>,
-    ) -> (FxHashSet<BasicBlockId>, FxHashSet<BasicBlockId>) {
+    fn reachable(&mut self, body: &'db MirBody<'db>) -> (Blocks, Blocks) {
         let off = self.fx.checks_off(body);
         let resumes_only = match body.coroutine {
             Some(_) => FxHashSet::default(),
             None => FunctionCx::resumes_only(body),
         };
-        let mut reachable = FxHashSet::default();
-        let mut decided = FxHashMap::default();
-        let mut worklist = vec![body.start_block];
+        let count = body.basic_blocks.len();
+        let mut reachable = Blocks::new(count);
+        let mut decided = Blocks::new(count);
+        let mut worklist = Vec::with_capacity(count);
+        worklist.push(body.start_block);
         while let Some(id) = worklist.pop() {
             if !reachable.insert(id) {
                 continue;
@@ -591,9 +590,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 Some(TerminatorKind::SwitchInt { discr, targets }) => {
                     match self.fx.switch_bits(&body.basic_blocks[id], discr, &off) {
                         Some(bits) => {
-                            let target = targets.target_for_value(bits);
-                            decided.insert(id, target);
-                            worklist.push(target)
+                            decided.insert(id);
+                            worklist.push(targets.target_for_value(bits))
                         }
                         None => worklist.extend_from_slice(targets.all_targets()),
                     }
@@ -617,7 +615,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let unwind = block.terminator.as_ref().and_then(|it| it.kind.unwind());
             worklist.extend(unwind.filter(|it| !resumes_only.contains(it)));
         }
-        (reachable, decided.into_keys().collect())
+        (reachable, decided)
     }
 
     /// `enter_coroutine`: an `async` body dropped before it ran drops what it captured.
@@ -916,7 +914,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let TyKind::Tuple(fields) = tuple_ty.kind() else {
                 return Err("const_eval_select with non-tuple arguments".to_owned());
             };
-            let fields: Vec<_> = fields.iter().collect();
+            let fields: Tys<'db> = fields.iter().collect();
             return self.call_direct(runtime, runtime_args, &fields, dst_ty);
         }
         if func.krate(db).data(db).origin.is_lang()
@@ -1027,7 +1025,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 }
                 let self_ty = body.params[0].as_ref();
                 let borrows = self_ty.as_reference().is_some();
-                let mut values = vec![if borrows { self_ty } else { ty }];
+                let mut values: Tys<'db> = smallvec![if borrows { self_ty } else { ty }];
                 values.extend(arg_tys);
                 self.emit_call(def, parent_args, &values, dst_ty)?;
                 // A closure passed by value to a body that borrows it is the caller's to drop.
@@ -1179,7 +1177,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let start_args = GenericArgs::new_from_slice(&[returned.into()]);
         let start_sig = sig_of(fn_ty(start, start_args));
         self.recorded(|fx| fx.fn_item(main_ty))?;
-        let inputs: Vec<_> =
+        let inputs: Tys<'db> =
             start_sig.inputs().as_slice().iter().map(|&ty| self.fx.normalize(ty)).collect();
         self.call_direct(start, start_args, &inputs, start_sig.output())
     }

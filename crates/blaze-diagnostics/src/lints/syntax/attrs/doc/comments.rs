@@ -82,7 +82,7 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>)
             continue;
         }
         let help = match &attr.kind {
-            AttrKind::Doc(doc) if matches!(doc.shape(), CommentShape::Block) => "use `/* */` for a plain comment",
+            AttrKind::Doc(doc) if matches!(doc.token().shape(), CommentShape::Block) => "use `/* */` for a plain comment",
             _ => "use `//` for a plain comment",
         };
         let mut diag = Diag::lint(LINT, "unused doc comment", cx.span(span));

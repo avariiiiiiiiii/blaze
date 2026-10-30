@@ -676,13 +676,21 @@ fn fix_up_and_push_path_tt(
 
 /// Handles `${count(t, depth)}`. `our_depth` is the recursion depth and `count_depth` is the depth
 /// defined by the metavar expression.
-fn count(binding: &Binding<'_>, depth_curr: usize, depth_max: usize) -> usize {
+fn count(
+    bindings: &Bindings<'_>,
+    binding: Binding,
+    depth_curr: usize,
+    depth_max: usize,
+) -> usize {
     match binding {
-        Binding::Nested(bs) => {
+        Binding::Nested { start, len } => {
             if depth_curr == depth_max {
-                bs.len()
+                len as usize
             } else {
-                bs.iter().map(|b| count(b, depth_curr + 1, depth_max)).sum()
+                (0..len as usize)
+                    .filter_map(|idx| bindings.iteration(start, len, idx))
+                    .map(|b| count(bindings, b, depth_curr + 1, depth_max))
+                    .sum()
             }
         }
         Binding::Empty => 0,

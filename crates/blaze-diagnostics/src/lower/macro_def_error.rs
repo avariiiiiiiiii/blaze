@@ -2,13 +2,20 @@
 //! (`rustc_expand/src/mbe/macro_rules.rs`), the matcher parsing of `rustc_expand/src/mbe/quoted.rs`
 //! and the binder check of `rustc_expand/src/mbe/macro_check.rs` (MIT or Apache-2.0).
 //!
+//! rustc builds an `mbe::TokenTree` (a `Vec` per delimited group), then walks it again for each
+//! check and keeps binders in a hash map. Here one pass reads the token trees in place in the
+//! syntax tree and does every check as it goes: a definition rustc accepts costs one walk of its
+//! tokens with no allocation and no hashing (binders sit in an inline `SmallVec`, compared by
+//! text, and a rule rarely has more than eight).
+//!
 //! The checks follow-set ambiguity (`check_matcher`), meta-variable expressions (`${...}`), the
 //! `macro_metavar_expr`, `macro_attr` and `macro_derive` feature gates and the
 //! `meta_variable_misuse` lint are not ported yet; a definition mbe refuses for one of those is
 //! still an error naming what mbe said.
 
 use hir::InFile;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxToken, TextRange, TextSize, ast};
+use smallvec::SmallVec;
+use syntax::{AstNode, NodeOrToken, SyntaxElement, SyntaxElementChildren, SyntaxKind, SyntaxToken, TextRange, TextSize, ast};
 
 use super::macro_error::token_descr;
 use crate::{
@@ -19,12 +26,6 @@ use crate::{
 
 /// rustc's `VALID_FRAGMENT_NAMES_MSG`.
 const VALID_FRAGMENT_NAMES: &str = "valid fragment specifiers are `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, `literal`, `path`, `meta`, `tt`, `item` and `vis`, along with `expr_2021` and `pat_param` for edition compatibility";
-
-/// rustc's `NonterminalKind::from_symbol`: the same names in every edition.
-const FRAGMENTS: &[&str] = &[
-    "item", "block", "stmt", "pat", "pat_param", "expr", "expr_2021", "ty", "ident", "lifetime",
-    "literal", "meta", "path", "vis", "tt",
-];
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroDefError) -> Vec<Found> {
     let node = cx.node(d.node);
@@ -38,18 +39,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroDefError) -> Vec<Found> {
     out
 }
 
-/// rustc's errors on the definition of `mac`, in the order rustc gives them. Empty when rustc
-/// defines it.
+/// rustc's errors on the definition of `mac`, in the order rustc gives them. Empty, and nothing
+/// allocated, when rustc defines it.
 pub(crate) fn check(cx: &Cx<'_, '_>, mac: InFile<&ast::Macro>) -> Vec<Found> {
     let ast::Macro::MacroRules(rules) = mac.value else { return Vec::new() };
     let Some(body) = rules.token_tree() else { return Vec::new() };
-    let mut checker = Checker { cx, file: mac.file_id, errors: Vec::new() };
+    let mut checker = Checker { cx, file: mac.file_id, errors: Vec::new(), binders: SmallVec::new() };
     checker.definition(&body, item_range(rules.syntax()));
     checker.errors.into_iter().map(|it| Found::new(it, Phase::Resolve)).collect()
 }
 
 /// A token tree of rustc's `tokenstream`: a token, or a delimited group.
-#[derive(Clone)]
 enum Tree {
     Token(SyntaxToken),
     Group(ast::TokenTree),
@@ -70,28 +70,61 @@ impl Tree {
         }
     }
 
-    fn is(&self, text: &str) -> bool {
-        self.token().is_some_and(|it| it.text() == text)
+    fn kind(&self) -> Option<SyntaxKind> {
+        self.token().map(SyntaxToken::kind)
+    }
+
+    /// A contextual keyword (`attr`, `derive`), which the lexer gives as an identifier.
+    fn is_ident(&self, text: &str) -> bool {
+        self.token().is_some_and(|it| it.kind() == SyntaxKind::IDENT && it.text() == text)
     }
 }
 
-/// The trees between `group`'s delimiters, without whitespace and comments other than doc
-/// comments, which are tokens to rustc.
-fn trees_in(group: &ast::TokenTree) -> Vec<Tree> {
-    let open = group.left_delimiter_token();
-    let close = group.right_delimiter_token();
-    group
-        .token_trees_and_tokens()
-        .filter_map(|it| match it {
-            NodeOrToken::Node(it) => Some(Tree::Group(it)),
-            NodeOrToken::Token(it) if Some(&it) == open.as_ref() || Some(&it) == close.as_ref() => None,
-            NodeOrToken::Token(it) if it.kind() == SyntaxKind::WHITESPACE => None,
-            NodeOrToken::Token(it) if it.kind() == SyntaxKind::COMMENT => {
-                ast::Comment::cast(it.clone()).and_then(|c| c.kind().doc).map(|_| Tree::Token(it))
-            }
-            NodeOrToken::Token(it) => Some(Tree::Token(it)),
-        })
-        .collect()
+fn tree(element: SyntaxElement) -> Option<Tree> {
+    match element {
+        NodeOrToken::Node(node) => ast::TokenTree::cast(node).map(Tree::Group),
+        NodeOrToken::Token(token) => match token.kind() {
+            SyntaxKind::WHITESPACE => None,
+            SyntaxKind::COMMENT => is_doc(&token).then_some(Tree::Token(token)),
+            kind if kind.is_delimiter() => None,
+            _ => Some(Tree::Token(token)),
+        },
+    }
+}
+
+fn is_doc(token: &SyntaxToken) -> bool {
+    ast::Comment::cast(token.clone()).is_some_and(|it| it.kind().doc.is_some())
+}
+
+/// The trees between a group's delimiters, read in place: whitespace and plain comments skipped,
+/// doc comments kept (they are tokens to rustc). A direct token child that is a delimiter is the
+/// group's own; nested ones are inside child groups.
+struct Trees {
+    children: std::iter::Peekable<std::iter::FilterMap<SyntaxElementChildren, fn(SyntaxElement) -> Option<Tree>>>,
+    /// Where the last tree taken ends: rustc's `prev_token.span.hi()`.
+    end: TextSize,
+}
+
+impl Trees {
+    fn of(group: &ast::TokenTree) -> Trees {
+        let end = group.left_delimiter_token().map_or(group.syntax().text_range().start(), |it| it.text_range().end());
+        let tree: fn(SyntaxElement) -> Option<Tree> = tree;
+        Trees { children: group.syntax().children_with_tokens().filter_map(tree).peekable(), end }
+    }
+
+    fn next(&mut self) -> Option<Tree> {
+        let tree = self.children.next()?;
+        self.end = tree.range().end();
+        Some(tree)
+    }
+
+    fn peek(&mut self) -> Option<&Tree> {
+        self.children.peek()
+    }
+
+    fn peek_kind(&mut self) -> Option<SyntaxKind> {
+        self.peek().and_then(Tree::kind)
+    }
 }
 
 fn delimiter(group: &ast::TokenTree) -> Option<SyntaxKind> {
@@ -103,13 +136,13 @@ fn is_ident(token: &SyntaxToken) -> bool {
     token.kind().is_any_identifier() || token.kind() == SyntaxKind::UNDERSCORE
 }
 
-/// rustc's `mbe::TokenTree`.
-enum Mt {
-    Token(TextRange),
-    Group(Vec<Mt>),
-    Sequence { range: TextRange, tts: Vec<Mt>, separator: bool, op: Kleene, op_range: TextRange },
-    Var { range: TextRange, name: String },
-    Decl { range: TextRange, name: String, kind: String },
+/// rustc's `NonterminalKind::from_symbol`: the same names in every edition.
+fn is_fragment(name: &str) -> bool {
+    matches!(
+        name,
+        "item" | "block" | "stmt" | "pat" | "pat_param" | "expr" | "expr_2021" | "ty" | "ident" | "lifetime"
+            | "literal" | "meta" | "path" | "vis" | "tt"
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,11 +153,11 @@ enum Kleene {
 }
 
 impl Kleene {
-    fn of(tree: &Tree) -> Option<Kleene> {
-        match tree.token()?.text() {
-            "*" => Some(Kleene::ZeroOrMore),
-            "+" => Some(Kleene::OneOrMore),
-            "?" => Some(Kleene::ZeroOrOne),
+    fn of(kind: Option<SyntaxKind>) -> Option<Kleene> {
+        match kind? {
+            SyntaxKind::STAR => Some(Kleene::ZeroOrMore),
+            SyntaxKind::PLUS => Some(Kleene::OneOrMore),
+            SyntaxKind::QUESTION => Some(Kleene::ZeroOrOne),
             _ => None,
         }
     }
@@ -136,10 +169,40 @@ enum Part {
     Body,
 }
 
+/// What rustc's `is_empty_token_tree` needs of one parsed tree of a repetition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Elem {
+    Token,
+    Doc,
+    Group,
+    Var,
+    Decl { vis: bool },
+    Sequence(Kleene),
+}
+
+impl Elem {
+    fn matches_empty(self) -> bool {
+        matches!(
+            self,
+            Elem::Doc | Elem::Decl { vis: true } | Elem::Sequence(Kleene::ZeroOrMore | Kleene::ZeroOrOne)
+        )
+    }
+}
+
+/// The first repetition of a matcher that can match nothing (rustc's `check_lhs_no_empty_seq`
+/// walks in pre-order, which is source order), and what its `vis` suggestion needs.
+#[derive(Clone, Copy)]
+struct EmptySequence {
+    range: TextRange,
+    vis_op: Option<TextRange>,
+}
+
 struct Checker<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
     file: hir::HirFileId,
     errors: Vec<Diag>,
+    /// The metavariables bound by the rule being read: the name and the declaration's range.
+    binders: SmallVec<[(SyntaxToken, TextRange); 8]>,
 }
 
 impl Checker<'_, '_, '_> {
@@ -155,54 +218,49 @@ impl Checker<'_, '_, '_> {
 
     /// rustc's `compile_declarative_macro` over a `macro_rules!` body.
     fn definition(&mut self, body: &ast::TokenTree, item: TextRange) {
-        let trees = trees_in(body);
-        let mut i = 0;
-        let mut rules = 0;
-        while i < trees.len() {
-            let unsafe_rule = trees[i].is("unsafe");
-            let unsafe_range = trees[i].range();
+        let mut trees = Trees::of(body);
+        let mut rules = 0u32;
+        while trees.peek().is_some() {
+            self.binders.clear();
+            let unsafe_rule = trees.peek_kind() == Some(SyntaxKind::UNSAFE_KW);
+            let mut unsafe_range = TextRange::default();
             if unsafe_rule {
-                i += 1;
-                if self.no_eof(&trees, i, "expected `attr`") {
+                unsafe_range = trees.next().expect("peeked").range();
+                if self.no_eof(&mut trees, "expected `attr`") {
                     return;
                 }
             }
-            let mut binders = Vec::new();
-            if trees[i].is("attr") {
-                i += 1;
-                if self.no_eof(&trees, i, "expected macro attr args") {
+            if trees.peek().is_some_and(|it| it.is_ident("attr")) {
+                trees.next();
+                if self.no_eof(&mut trees, "expected macro attr args") {
                     return;
                 }
-                let args = trees[i].clone();
-                i += 1;
+                let args = trees.next().expect("checked");
                 self.args_parens("attr", &args);
-                let args = self.parse_one(&args, Part::Pattern);
                 self.lhs(&args);
-                self.binders(&args, &mut binders);
-                if self.no_eof(&trees, i, "expected macro attr body") {
+                if self.no_eof(&mut trees, "expected macro attr body") {
                     return;
                 }
-            } else if trees[i].is("derive") {
-                let derive_range = trees[i].range();
-                i += 1;
+            } else if trees.peek().is_some_and(|it| it.is_ident("derive")) {
+                let derive_range = trees.next().expect("peeked").range();
                 if unsafe_rule {
                     self.error(unsafe_range, "`unsafe` is only supported on `attr` rules");
                 }
-                if self.no_eof(&trees, i, "expected `()` after `derive`") {
+                if self.no_eof(&mut trees, "expected `()` after `derive`") {
                     return;
                 }
-                let args = trees[i].clone();
-                i += 1;
+                let args = trees.next().expect("checked");
                 self.args_parens("derive", &args);
-                let args_empty = matches!(&args, Tree::Group(it) if trees_in(it).is_empty());
+                let args_empty = matches!(&args, Tree::Group(it) if Trees::of(it).peek().is_none());
                 if !args_empty {
                     let msg = "`derive` rules do not accept arguments; `derive` must be followed by `()`";
                     self.error(args.range(), msg);
                 }
-                if self.no_eof(&trees, i, "expected macro derive body") {
+                if self.no_eof(&mut trees, "expected macro derive body") {
                     return;
                 }
-                if let Some(arrow) = fat_arrow(&trees, i) {
+                if trees.peek_kind() == Some(SyntaxKind::FAT_ARROW) {
+                    let arrow = trees.peek().expect("peeked").range();
                     let derive = self.span(derive_range);
                     let diag = self.error(arrow, "expected macro derive body, got `=>`");
                     if !args_empty {
@@ -213,34 +271,31 @@ impl Checker<'_, '_, '_> {
             } else if unsafe_rule {
                 self.error(unsafe_range, "`unsafe` is only supported on `attr` rules");
             }
-            let lhs = self.parse_one(&trees[i], Part::Pattern);
-            let lhs_end = trees[i].range().end();
-            i += 1;
+            let lhs = trees.next().expect("checked");
             self.lhs(&lhs);
-            if fat_arrow(&trees, i).is_none() {
-                self.expected(&trees, i, lhs_end, "=>");
+            if trees.peek_kind() != Some(SyntaxKind::FAT_ARROW) {
+                self.expected(&mut trees, "=>");
                 return;
             }
-            i += if trees[i].is("=>") { 1 } else { 2 };
-            if self.no_eof(&trees, i, "expected right-hand side of macro rule") {
+            trees.next();
+            if self.no_eof(&mut trees, "expected right-hand side of macro rule") {
                 return;
             }
-            let rhs = self.parse_one(&trees[i], Part::Body);
-            let rhs_end = trees[i].range().end();
-            i += 1;
-            if !matches!(rhs, Mt::Group(_)) {
-                self.error(trees[i - 1].range(), "macro rhs must be delimited");
+            let rhs = trees.next().expect("checked");
+            self.parse_one(&rhs, Part::Body);
+            if let Tree::Token(token) = &rhs {
+                self.error(token.text_range(), "macro rhs must be delimited");
             }
-            self.binders(&lhs, &mut binders);
+            self.duplicate_binders();
             rules += 1;
-            if i == trees.len() {
+            if trees.peek().is_none() {
                 break;
             }
-            if !trees[i].is(";") {
-                self.expected(&trees, i, rhs_end, ";");
+            if trees.peek_kind() != Some(SyntaxKind::SEMICOLON) {
+                self.expected(&mut trees, ";");
                 return;
             }
-            i += 1;
+            trees.next();
         }
         if rules == 0 {
             self.error(item, "macros must contain at least one rule");
@@ -248,56 +303,43 @@ impl Checker<'_, '_, '_> {
     }
 
     /// rustc's `check_no_eof`.
-    fn no_eof(&mut self, trees: &[Tree], i: usize, label: &str) -> bool {
-        if i < trees.len() {
+    fn no_eof(&mut self, trees: &mut Trees, label: &str) -> bool {
+        if trees.peek().is_some() {
             return false;
         }
-        let end = trees.last().map_or_else(|| TextSize::new(0), |it| it.range().end());
-        let span = self.span(TextRange::empty(end));
-        self.error(TextRange::empty(end), "macro definition ended unexpectedly").span_label(span, label);
+        let at = TextRange::empty(trees.end);
+        let span = self.span(at);
+        self.error(at, "macro definition ended unexpectedly").span_label(span, label);
         true
     }
 
-    /// rustc's `Parser::expect` of `token` failing at `trees[i]`, `prev_end` being where the
-    /// previous token ends.
-    fn expected(&mut self, trees: &[Tree], i: usize, prev_end: TextSize, token: &str) {
+    /// rustc's `Parser::expect` of `token` failing at the next tree.
+    fn expected(&mut self, trees: &mut Trees, token: &str) {
+        let prev_end = trees.end;
         let label = format!("expected `{token}`");
-        let Some(found) = trees.get(i) else {
+        let Some(found) = trees.peek() else {
             let at = TextRange::empty(prev_end);
             let span = self.span(at);
             self.error(at, format!("expected `{token}`, found end of macro arguments")).span_label(span, label);
             return;
         };
-        let found_descr = match found {
-            Tree::Token(it) => token_descr(it, self.cx.edition),
+        let (at, found_descr) = match found {
+            Tree::Token(it) => (it.text_range(), token_descr(it, self.cx.edition)),
             Tree::Group(it) => match it.left_delimiter_token() {
-                Some(open) => format!("`{}`", open.text()),
-                None => format!("`{}`", it.syntax().text()),
+                Some(open) => (open.text_range(), format!("`{}`", open.text())),
+                None => (it.syntax().text_range(), format!("`{}`", it.syntax().text())),
             },
-        };
-        let at = match found {
-            Tree::Token(it) => it.text_range(),
-            Tree::Group(it) => it.left_delimiter_token().map_or_else(|| it.syntax().text_range(), |it| it.text_range()),
         };
         let message = format!("expected `{token}`, found {found_descr}");
         let span = self.span(at);
-        let between = self.between(prev_end, at.start());
-        if token == ";" && between.contains('\n') {
+        let root = self.cx.sema.parse_or_expand(self.file);
+        let on_next_line = prev_end < at.start() && root.text().slice(TextRange::new(prev_end, at.start())).contains_char('\n');
+        if token == ";" && on_next_line {
             let prev = self.span(TextRange::empty(prev_end));
             self.error(at, message).span_label(prev, label).span_label(span, "unexpected token");
         } else {
             self.error(at, message).span_label(span, label);
         }
-    }
-
-    /// The source text between two offsets of this file.
-    fn between(&self, from: TextSize, to: TextSize) -> String {
-        let root = self.cx.sema.parse_or_expand(self.file);
-        let text = root.text();
-        if from >= to || to > text.len() {
-            return String::new();
-        }
-        text.slice(TextRange::new(from, to)).to_string()
     }
 
     /// rustc's `check_args_parens`.
@@ -312,140 +354,112 @@ impl Checker<'_, '_, '_> {
             .multipart_suggestion("the delimiters should be `(` and `)`", parts, Applicability::MachineApplicable);
     }
 
-    /// rustc's `check_lhs`: delimited, and no repetition that matches nothing.
-    fn lhs(&mut self, lhs: &Mt) {
+    /// rustc's `parse_one_tt` of a matcher, then `check_lhs`: delimited, and no repetition that
+    /// matches nothing.
+    fn lhs(&mut self, lhs: &Tree) {
+        let mut empty = None;
         match lhs {
-            Mt::Group(_) => {}
-            Mt::Token(range) | Mt::Var { range, .. } | Mt::Decl { range, .. } | Mt::Sequence { range, .. } => {
-                self.error(*range, "invalid macro matcher; matchers must be contained in balanced delimiters");
+            Tree::Group(group) => {
+                self.parse(&mut Trees::of(group), Part::Pattern, &mut empty);
+            }
+            Tree::Token(token) => {
+                self.error(token.text_range(), "invalid macro matcher; matchers must be contained in balanced delimiters");
             }
         }
-        self.no_empty_sequence(std::slice::from_ref(lhs));
+        let Some(EmptySequence { range, vis_op }) = empty else { return };
+        let diag = self.error(range, "repetition matches empty token tree");
+        let Some(op) = vis_op else { return };
+        diag.note("a `vis` fragment can already be empty");
+        let open = TextRange::new(range.start() - TextSize::of('$'), range.start() + TextSize::of('('));
+        let close = TextRange::new(range.end() - TextSize::of(')'), op.end());
+        let parts = vec![(self.span(open), String::new()), (self.span(close), String::new())];
+        self.errors
+            .last_mut()
+            .expect("just pushed")
+            .multipart_suggestion("remove the `$(` and `)?`", parts, Applicability::MaybeIncorrect);
     }
 
-    /// rustc's `check_lhs_no_empty_seq`: the first repetition that can match nothing.
-    fn no_empty_sequence(&mut self, tts: &[Mt]) -> bool {
-        for tt in tts {
-            match tt {
-                Mt::Token(_) | Mt::Var { .. } | Mt::Decl { .. } => {}
-                Mt::Group(tts) => {
-                    if self.no_empty_sequence(tts) {
-                        return true;
-                    }
-                }
-                Mt::Sequence { range, tts, separator, op, op_range } => {
-                    if !separator && tts.iter().all(matches_empty) {
-                        let diag = self.error(*range, "repetition matches empty token tree");
-                        if *op == Kleene::ZeroOrOne && matches!(tts.first(), Some(Mt::Decl { kind, .. }) if kind == "vis") {
-                            diag.note("a `vis` fragment can already be empty");
-                            let open = TextRange::new(range.start() - TextSize::of('$'), range.start() + TextSize::of('('));
-                            let close = TextRange::new(range.end() - TextSize::of(')'), op_range.end());
-                            let parts = vec![(self.span(open), String::new()), (self.span(close), String::new())];
-                            self.errors
-                                .last_mut()
-                                .expect("just pushed")
-                                .multipart_suggestion("remove the `$(` and `)?`", parts, Applicability::MaybeIncorrect);
-                        }
-                        return true;
-                    }
-                    if self.no_empty_sequence(tts) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// The binders of `check_meta_variables`' `check_binders`: a name bound twice in the
-    /// matchers of one rule is an error.
-    fn binders(&mut self, tt: &Mt, seen: &mut Vec<(String, TextRange)>) {
-        match tt {
-            Mt::Decl { range, name, .. } => {
-                let name = name.strip_prefix("r#").unwrap_or(name);
-                if let Some((_, prev)) = seen.iter().find(|(it, _)| it == name) {
-                    let (span, prev) = (self.span(*range), self.span(*prev));
-                    self.error(*range, "duplicate matcher binding")
-                        .span_label(span, "duplicate binding")
-                        .span_label(prev, "previous binding");
-                } else {
-                    seen.push((name.to_owned(), *range));
-                }
-            }
-            Mt::Group(tts) | Mt::Sequence { tts, .. } => tts.iter().for_each(|it| self.binders(it, seen)),
-            Mt::Token(_) | Mt::Var { .. } => {}
+    /// `check_meta_variables`' `check_binders`: a name bound twice in the matchers of one rule.
+    /// Quadratic in the binders of one rule, which are few.
+    fn duplicate_binders(&mut self) {
+        for i in 1..self.binders.len() {
+            let name = unraw(self.binders[i].0.text());
+            let Some(prev) = self.binders[..i].iter().find(|(it, _)| unraw(it.text()) == name).map(|it| it.1) else {
+                continue;
+            };
+            let range = self.binders[i].1;
+            let (span, prev) = (self.span(range), self.span(prev));
+            self.error(range, "duplicate matcher binding")
+                .span_label(span, "duplicate binding")
+                .span_label(prev, "previous binding");
         }
     }
 
-    /// rustc's `parse_one_tt`.
-    fn parse_one(&mut self, tree: &Tree, part: Part) -> Mt {
-        let mut tts = self.parse(std::slice::from_ref(tree), part);
-        tts.pop().unwrap_or(Mt::Token(tree.range()))
+    /// rustc's `parse_one_tt` of a rule's body.
+    fn parse_one(&mut self, tree: &Tree, part: Part) {
+        if let Tree::Group(group) = tree {
+            self.parse(&mut Trees::of(group), part, &mut None);
+        }
     }
 
-    /// rustc's `quoted::parse`.
-    fn parse(&mut self, trees: &[Tree], part: Part) -> Vec<Mt> {
-        let mut result = Vec::new();
-        let mut i = 0;
-        while i < trees.len() {
-            let tree = self.parse_tree(trees, &mut i, part);
-            let Mt::Var { range: start, name } = tree else {
-                result.push(tree);
-                continue;
+    /// rustc's `quoted::parse`: whether every tree matches nothing, and whether the first is a
+    /// `vis` declaration.
+    fn parse(&mut self, trees: &mut Trees, part: Part, empty: &mut Option<EmptySequence>) -> (bool, bool) {
+        let (mut all_empty, mut first_vis, mut first) = (true, false, true);
+        while let Some(tree) = trees.next() {
+            let elem = match self.parse_tree(tree, trees, part, empty) {
+                (Elem::Var, Some((start, name))) if part == Part::Pattern => self.declaration(start, name, trees),
+                (elem, _) => elem,
             };
-            if part == Part::Body {
-                result.push(Mt::Var { range: start, name });
-                continue;
+            all_empty &= elem.matches_empty();
+            if first {
+                first_vis = elem == Elem::Decl { vis: true };
+                first = false;
             }
-            let decl = |range, kind: &str| Mt::Decl { range, name: name.clone(), kind: kind.to_owned() };
-            let Some(colon) = trees.get(i).filter(|it| it.is(":")) else {
-                result.push(decl(start, "tt"));
-                self.missing_fragment(start, TextRange::empty(start.end()));
-                continue;
-            };
-            let colon = colon.range();
-            i += 1;
-            let next = trees.get(i).cloned();
-            if next.is_some() {
-                i += 1;
+        }
+        (all_empty, first_vis)
+    }
+
+    /// The fragment specifier after a metavariable `$name` of a matcher, starting at `start`.
+    fn declaration(&mut self, start: TextRange, name: Option<SyntaxToken>, trees: &mut Trees) -> Elem {
+        let record = |this: &mut Self, range: TextRange| {
+            if let Some(name) = name.clone() {
+                this.binders.push((name, range));
             }
-            let Some(Tree::Token(token)) = next else {
-                result.push(decl(TextRange::new(start.start(), colon.end()), "tt"));
-                self.missing_fragment(TextRange::new(start.start(), colon.end()), TextRange::empty(colon.end()));
-                continue;
-            };
-            if !is_ident(&token) {
-                if token.kind() == SyntaxKind::DOLLAR
-                    && trees.get(i).and_then(Tree::token).is_some_and(is_ident)
-                {
-                    let span = self.span(token.text_range());
-                    self.error(token.text_range(), "missing fragment specifier")
-                        .note("fragment specifiers must be provided")
-                        .help(VALID_FRAGMENT_NAMES)
-                        .suggestion_verbose(
-                            span,
-                            "fragment specifiers should not be prefixed with `$`",
-                            "",
-                            Applicability::MaybeIncorrect,
-                        );
-                    result.push(decl(token.text_range(), "tt"));
-                } else {
-                    result.push(decl(token.text_range(), "tt"));
-                    self.missing_fragment(token.text_range(), TextRange::empty(token.text_range().end()));
-                }
-                continue;
-            }
-            let range = TextRange::new(start.start(), token.text_range().end());
-            let fragment = token.text();
-            let unraw = fragment.strip_prefix("r#").unwrap_or(fragment);
-            if FRAGMENTS.contains(&unraw) {
-                result.push(decl(range, unraw));
+        };
+        if trees.peek_kind() != Some(SyntaxKind::COLON) {
+            record(self, start);
+            self.missing_fragment(start, TextRange::empty(start.end()));
+            return Elem::Decl { vis: false };
+        }
+        let colon = trees.next().expect("peeked").range();
+        let with_colon = TextRange::new(start.start(), colon.end());
+        let Some(Tree::Token(token)) = trees.next() else {
+            record(self, with_colon);
+            self.missing_fragment(with_colon, TextRange::empty(colon.end()));
+            return Elem::Decl { vis: false };
+        };
+        if !is_ident(&token) {
+            record(self, token.text_range());
+            if token.kind() == SyntaxKind::DOLLAR && trees.peek().and_then(Tree::token).is_some_and(is_ident) {
+                let span = self.span(token.text_range());
+                self.error(token.text_range(), "missing fragment specifier")
+                    .note("fragment specifiers must be provided")
+                    .help(VALID_FRAGMENT_NAMES)
+                    .suggestion_verbose(span, "fragment specifiers should not be prefixed with `$`", "", Applicability::MaybeIncorrect);
             } else {
-                self.error(range, format!("invalid fragment specifier `{fragment}`")).help(VALID_FRAGMENT_NAMES);
-                result.push(decl(range, "tt"));
+                self.missing_fragment(token.text_range(), TextRange::empty(token.text_range().end()));
             }
+            return Elem::Decl { vis: false };
         }
-        result
+        let range = TextRange::new(start.start(), token.text_range().end());
+        record(self, range);
+        let fragment = unraw(token.text());
+        if is_fragment(fragment) {
+            return Elem::Decl { vis: fragment == "vis" };
+        }
+        self.error(range, format!("invalid fragment specifier `{}`", token.text())).help(VALID_FRAGMENT_NAMES);
+        Elem::Decl { vis: false }
     }
 
     /// rustc's `MissingFragmentSpecifier`.
@@ -457,52 +471,70 @@ impl Checker<'_, '_, '_> {
             .suggestion_verbose(add, "try adding a specifier here", ":spec", Applicability::MaybeIncorrect);
     }
 
-    /// rustc's `quoted::parse_tree`.
-    fn parse_tree(&mut self, trees: &[Tree], i: &mut usize, part: Part) -> Mt {
-        let tree = trees[*i].clone();
-        *i += 1;
-        let dollar = match &tree {
+    /// rustc's `quoted::parse_tree`. A metavariable comes back with its range and name (none when
+    /// rustc gives it a dummy name after an error).
+    fn parse_tree(
+        &mut self,
+        tree: Tree,
+        trees: &mut Trees,
+        part: Part,
+        empty: &mut Option<EmptySequence>,
+    ) -> (Elem, Option<(TextRange, Option<SyntaxToken>)>) {
+        let dollar = match tree {
             Tree::Token(it) if it.kind() == SyntaxKind::DOLLAR => it.text_range(),
-            Tree::Token(it) => return Mt::Token(it.text_range()),
-            Tree::Group(group) => return Mt::Group(self.parse(&trees_in(group), part)),
+            Tree::Token(it) if it.kind() == SyntaxKind::COMMENT => return (Elem::Doc, None),
+            Tree::Token(_) => return (Elem::Token, None),
+            Tree::Group(group) => {
+                self.parse(&mut Trees::of(&group), part, empty);
+                return (Elem::Group, None);
+            }
         };
-        let Some(next) = trees.get(*i).cloned() else { return Mt::Token(dollar) };
-        *i += 1;
+        let Some(next) = trees.next() else { return (Elem::Token, None) };
         match next {
             Tree::Group(group) => {
-                let delim = delimiter(&group);
                 let entire = group.syntax().text_range();
-                match part {
-                    Part::Pattern if delim != Some(SyntaxKind::L_PAREN) => {
-                        let open = group.left_delimiter_token().map_or_else(String::new, |it| it.text().to_owned());
-                        self.dollar_in_lhs(entire, &open);
+                match (part, delimiter(&group)) {
+                    (Part::Pattern, Some(SyntaxKind::L_PAREN)) | (Part::Body, _) => {}
+                    (Part::Pattern, open) => {
+                        let open = group.left_delimiter_token().map_or("", |_| match open {
+                            Some(SyntaxKind::L_CURLY) => "{",
+                            _ => "[",
+                        });
+                        self.dollar_in_lhs(entire, open);
                     }
-                    Part::Body if delim == Some(SyntaxKind::L_BRACK) => {
-                        self.error(entire, "expected `(` or `{`, found `[`");
-                    }
-                    _ => {}
                 }
-                let tts = self.parse(&trees_in(&group), part);
-                let (separator, op, op_range) = self.separator_and_kleene(trees, i, entire);
-                Mt::Sequence { range: entire, tts, separator, op, op_range }
+                if part == Part::Body && delimiter(&group) == Some(SyntaxKind::L_BRACK) {
+                    self.error(entire, "expected `(` or `{`, found `[`");
+                }
+                let (contents_empty, first_vis) = self.parse(&mut Trees::of(&group), part, empty);
+                let (separator, op, op_range) = self.separator_and_kleene(trees, entire);
+                if part == Part::Pattern
+                    && !separator
+                    && contents_empty
+                    && empty.is_none_or(|it| entire.start() < it.range.start())
+                {
+                    let vis_op = (op == Kleene::ZeroOrOne && first_vis).then_some(op_range);
+                    *empty = Some(EmptySequence { range: entire, vis_op });
+                }
+                (Elem::Sequence(op), None)
             }
             Tree::Token(token) if is_ident(&token) => {
                 let range = TextRange::new(dollar.start(), token.text_range().end());
-                if token.text() == "crate" {
-                    Mt::Token(range)
+                if token.kind() == SyntaxKind::CRATE_KW {
+                    (Elem::Token, None)
                 } else {
-                    Mt::Var { range, name: token.text().to_owned() }
+                    (Elem::Var, Some((range, Some(token))))
                 }
             }
             Tree::Token(token) if token.kind() == SyntaxKind::DOLLAR => {
                 if part == Part::Pattern {
                     self.dollar_in_lhs(token.text_range(), "$");
                 }
-                Mt::Token(token.text_range())
+                (Elem::Token, None)
             }
             Tree::Token(token) => {
                 self.error(token.text_range(), format!("expected identifier, found `{}`", token.text()));
-                Mt::Var { range: token.text_range(), name: String::new() }
+                (Elem::Var, Some((token.text_range(), None)))
             }
         }
     }
@@ -516,33 +548,19 @@ impl Checker<'_, '_, '_> {
         );
     }
 
-    /// rustc's `parse_sep_and_kleene_op`.
-    fn separator_and_kleene(&mut self, trees: &[Tree], i: &mut usize, span: TextRange) -> (bool, Kleene, TextRange) {
-        let first = trees.get(*i).cloned();
-        if first.is_some() {
-            *i += 1;
-        }
-        let at = match first {
-            Some(tree) if Kleene::of(&tree).is_some() => {
-                return (false, Kleene::of(&tree).expect("checked"), tree.range());
-            }
-            Some(Tree::Token(separator)) => {
-                let second = trees.get(*i).cloned();
-                if second.is_some() {
-                    *i += 1;
+    /// rustc's `parse_sep_and_kleene_op`: whether there is a separator, the operator and its range.
+    fn separator_and_kleene(&mut self, trees: &mut Trees, span: TextRange) -> (bool, Kleene, TextRange) {
+        let at = match trees.next() {
+            Some(tree) if let Some(op) = Kleene::of(tree.kind()) => return (false, op, tree.range()),
+            Some(Tree::Token(separator)) => match trees.next() {
+                Some(tree) if Kleene::of(tree.kind()) == Some(Kleene::ZeroOrOne) => {
+                    self.error(separator.text_range(), "the `?` macro repetition operator does not take a separator");
+                    return (false, Kleene::ZeroOrMore, tree.range());
                 }
-                match second {
-                    Some(tree) if Kleene::of(&tree) == Some(Kleene::ZeroOrOne) => {
-                        self.error(separator.text_range(), "the `?` macro repetition operator does not take a separator");
-                        return (false, Kleene::ZeroOrMore, tree.range());
-                    }
-                    Some(tree) if Kleene::of(&tree).is_some() => {
-                        return (true, Kleene::of(&tree).expect("checked"), tree.range());
-                    }
-                    Some(tree) => tree.range(),
-                    None => separator.text_range(),
-                }
-            }
+                Some(tree) if let Some(op) = Kleene::of(tree.kind()) => return (true, op, tree.range()),
+                Some(tree) => tree.range(),
+                None => separator.text_range(),
+            },
             Some(group) => group.range(),
             None => span,
         };
@@ -551,22 +569,6 @@ impl Checker<'_, '_, '_> {
     }
 }
 
-/// rustc's `is_empty_token_tree` for one tree of a repetition.
-fn matches_empty(tt: &Mt) -> bool {
-    match tt {
-        Mt::Decl { kind, .. } => kind == "vis",
-        Mt::Sequence { op, .. } => matches!(op, Kleene::ZeroOrMore | Kleene::ZeroOrOne),
-        Mt::Token(_) | Mt::Group(_) | Mt::Var { .. } => false,
-    }
-}
-
-/// The range of a `=>` at `trees[i]`, which the lexer may give as one token or as `=` and `>`.
-fn fat_arrow(trees: &[Tree], i: usize) -> Option<TextRange> {
-    let first = trees.get(i)?;
-    if first.is("=>") {
-        return Some(first.range());
-    }
-    let second = trees.get(i + 1)?;
-    (first.is("=") && second.is(">") && first.range().end() == second.range().start())
-        .then(|| TextRange::new(first.range().start(), second.range().end()))
+fn unraw(name: &str) -> &str {
+    name.strip_prefix("r#").unwrap_or(name)
 }

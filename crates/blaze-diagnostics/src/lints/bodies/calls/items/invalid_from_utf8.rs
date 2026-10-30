@@ -54,8 +54,8 @@ impl LatePass for InvalidFromUtf8 {
         let Some(item) = self.items.of(b.db(), def) else { return };
         let mut init = Init { linted: b, item: None, expr: *arg, read: Vec::new() };
         init.or_init();
-        while let Expr::Ref { expr: inner, .. } = &init.b().store()[init.expr] {
-            init.expr = *inner;
+        while let Expr::Ref { expr: inner, .. } = init.b().store().expr(init.expr) {
+            init.expr = inner;
             init.or_init();
         }
         let Some(error) = invalid_bytes(init.b(), init.expr) else { return };
@@ -96,12 +96,12 @@ impl LatePass for InvalidFromUtf8 {
 /// array of byte and integer literals (each integer cut to its low byte).
 fn invalid_bytes(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<std::str::Utf8Error> {
     let store = b.store();
-    match &store[expr] {
+    match store.expr(expr) {
         Expr::Literal(Literal::ByteString(bytes)) => std::str::from_utf8(bytes).err(),
         Expr::Array(Array::ElementList { elements }) => {
             let mut bytes = Vec::with_capacity(elements.len());
-            for element in elements.iter() {
-                bytes.push(match &store[*element] {
+            for &element in elements {
+                bytes.push(match store.expr(element) {
                     Expr::Literal(Literal::Uint(value, _)) => *value as u8,
                     Expr::Literal(Literal::Int(value, _)) => *value as u8,
                     _ => return None,
@@ -162,7 +162,7 @@ impl<'s, 'a, 'db> Init<'s, 'a, 'db> {
 
     fn step(&self, expr: ExprId) -> Option<Step<'a, 'db>> {
         let b = self.b();
-        let Expr::Path(_) = &b.store()[expr] else { return None };
+        let Expr::Path(_) = b.store().expr(expr) else { return None };
         let db = b.db();
         let local = |container: ItemContainerId, krate: base_db::Crate| {
             matches!(container, ItemContainerId::ModuleId(_)) && krate == b.cx.krate.base()
@@ -190,11 +190,11 @@ fn let_init(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<ExprId> {
         return None;
     }
     for &expr in b.exprs() {
-        let Expr::Block { statements, .. } = &store[expr] else { continue };
-        for statement in statements.iter() {
+        let Expr::Block { statements, .. } = store.expr(expr) else { continue };
+        for statement in statements {
             if let Statement::Let { pat, initializer, .. } = statement
-                && let Pat::Bind { id, .. } = &store[*pat]
-                && *id == binding
+                && let Pat::Bind { id, .. } = store.pat(*pat)
+                && id == binding
             {
                 return *initializer;
             }

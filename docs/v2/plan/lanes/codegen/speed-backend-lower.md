@@ -42,8 +42,8 @@ builder build the IR a fresh one does; at most `KEPT` are held) and `mod.rs`
 `a_kept_context_compiles_what_a_fresh_one_does` (same bytes, relocations and alignment out of
 Cranelift after a larger function grew the kept context).
 
-**Missing.** `Recorder` still owns an unused `FunctionBuilderContext` (`fragment.rs`, asked of
-speed-backend-code). Cranelift's `CompiledCode` buffer is still copied out (`bytes.to_vec()`)
+**Missing.** The shims built on `Recorder::builder_ctx` (`mod.rs`, v1's glue and thunks) keep
+one builder context per `Recorder` rather than drawing from the thread's. Cranelift's `CompiledCode` buffer is still copied out (`bytes.to_vec()`)
 because `Code` owns its bytes; that is the `Code` layout's change (speed-backend-code), as are
 relocations as 16-byte columns (offset, kind, target).
 

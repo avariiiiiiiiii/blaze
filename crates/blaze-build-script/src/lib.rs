@@ -17,6 +17,8 @@
 //! [#89]: https://github.com/indexable-inc/blaze/issues/89
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
 
+#![forbid(unsafe_code)]
+
 pub mod apply;
 pub mod elide;
 pub mod env;

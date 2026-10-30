@@ -370,6 +370,16 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn suggest_unsupported_python_numeric_grouping(&mut self) {
+        if let Some((range, _)) = self.consume_pos(',') {
+            self.errors.insert(0, ParseError {
+                description: "python's numeric grouping `,` is not supported in rust format strings".to_owned(),
+                label: "expected `}`".to_owned(),
+                span: range,
+            });
+        }
+    }
+
     fn suggest_format_missing_colon_for_sign(&mut self) {
         if let Some((range, _)) = self.consume_pos('+') {
             self.errors.insert(0, ParseError {

@@ -86,7 +86,8 @@ pub(super) fn stability(cx: &Cx<'_, '_>, def: Def) -> Option<Stability> {
     stability_at(cx, def.source(cx)?, krate)
 }
 
-fn stability_at(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>, krate: hir::Crate) -> Option<Stability> {
+/// `lookup_stability` of the definition of `krate` at `node`, `krate` staged.
+pub(super) fn stability_at(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>, krate: hir::Crate) -> Option<Stability> {
     if let Some(stability) = attr::stability(&own_attrs(cx, &node, krate)) {
         return Some(stability);
     }
@@ -99,15 +100,25 @@ fn stability_at(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>, krate: hir::Crate) ->
 }
 
 /// `Span::allows_unstable(feature)` of `range` in `file`: the macro whose expansion its
-/// first token comes from is defined with `#[allow_internal_unstable(feature)]`.
+/// first token comes from is defined with `#[allow_internal_unstable(feature)]`. A builtin
+/// macro's expansion is its own, not the one rustc checks with the features its definition
+/// allows, so it may use any.
 pub(super) fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: &str) -> bool {
+    use hir_expand::MacroDefKind;
     let db = cx.db;
     let ctxt = file.span_map(db).span_for_range(range).ctx;
     let Some(call) = ctxt.outer_expn(db) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
-    let node: SyntaxNode = match def.ast_id() {
-        either::Either::Left(id) => id.to_node(db).syntax().clone(),
-        either::Either::Right(id) => id.to_node(db).syntax().clone(),
+    let node: SyntaxNode = match def.kind {
+        MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => match def.ast_id() {
+            either::Either::Left(id) => id.to_node(db).syntax().clone(),
+            either::Either::Right(id) => id.to_node(db).syntax().clone(),
+        },
+        MacroDefKind::BuiltIn(..)
+        | MacroDefKind::BuiltInAttr(..)
+        | MacroDefKind::BuiltInDerive(..)
+        | MacroDefKind::BuiltInEager(..)
+        | MacroDefKind::UnimplementedBuiltIn(..) => return true,
     };
     let attrs = attr::attrs(&node, hir::Crate::from(def.krate).cfg(db));
     attr::allow_internal_unstable(&attrs).iter().any(|it| it == feature)

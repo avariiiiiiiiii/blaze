@@ -4962,7 +4962,7 @@ fn build<'db>(
     fill: impl for<'cx> FnOnce(&mut FunctionCx<'cx, 'db>) -> Result<()>,
 ) -> Result<cranelift_codegen::Context> {
     let interner = DbInterner::new_with(cg.db, env.krate);
-    let layouts = Layouts::default();
+    let kept = KeptLayouts::default();
     let mut ctx = spare::context();
     ctx.func.signature.call_conv = cg.isa.default_call_conv();
     // Source locations are kept as distances from the first one set, and the distance of
@@ -4985,7 +4985,7 @@ fn build<'db>(
         builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
         locals: ArenaMap::with_capacity(body.map_or(0, |it| it.locals.len())),
         blocks: ArenaMap::with_capacity(body.map_or(0, |it| it.basic_blocks.len())),
-        layouts: &layouts,
+        layouts: Layouts::new(&kept),
         core_panics: Vec::new(),
         glue: Default::default(),
         inner_pad: None,
@@ -8210,7 +8210,7 @@ struct FunctionCx<'cx, 'db> {
     locals: ArenaMap<LocalId, LocalSlot>,
     blocks: ArenaMap<BasicBlockId, ir::Block>,
     /// The layouts asked for so far: a body asks for that of the same few types many times.
-    layouts: &'cx Layouts<'db>,
+    layouts: Layouts<'cx, 'db>,
     /// The panic functions of core called so far, by name: resolving one walks core's modules
     /// by name, and every checked `+` of the body calls one.
     core_panics: Vec<(&'static str, Option<FunctionId>)>,
@@ -8276,32 +8276,36 @@ struct FunctionCx<'cx, 'db> {
 /// reference count salsa's memo shares with every other thread compiling a function that uses
 /// the type: a shared cache line written on a read. A lookup is now one `FxHash` probe of an
 /// interned `Ty` (a pointer) and no write outside the thread.
-#[derive(Default)]
-struct Layouts<'db> {
-    of: std::cell::RefCell<FxHashMap<Ty<'db>, Arc<Layout>>>,
+struct Layouts<'cx, 'db> {
+    kept: &'cx KeptLayouts,
+    of: std::cell::RefCell<FxHashMap<Ty<'db>, &'cx Layout>>,
     /// The layout whose fields are a variant's, and the tag a value of it has (where, as what
     /// and its value), by the variant and the arguments of its type: `None` for a variant the
     /// type has no room for. Building one copies the variant's field offsets, which each
     /// aggregate of the variant would otherwise do again.
-    variants: std::cell::RefCell<FxHashMap<(VariantId, GenericArgs<'db>), Option<VariantShape>>>,
+    variants:
+        std::cell::RefCell<FxHashMap<(VariantId, GenericArgs<'db>), Option<VariantShape<'cx>>>>,
+}
+
+/// What [`Layouts`] lends from, owned by `build` for the whole of it and freed after.
+struct KeptLayouts {
+    asked: typed_arena::Arena<Arc<Layout>>,
+    variants: typed_arena::Arena<Layout>,
+}
+
+impl KeptLayouts {
+    fn new() -> Self {
+        Self { asked: typed_arena::Arena::new(), variants: typed_arena::Arena::new() }
+    }
 }
 
 /// A variant's layout and its tag, as [`FunctionCx::variant_shape`] gives them.
 type Tag = Option<(usize, types::Type, u128)>;
+type VariantShape<'cx> = (&'cx Layout, Tag);
 
-struct VariantShape {
-    layout: Arc<Layout>,
-    tag: Tag,
-}
-
-impl<'db> Layouts<'db> {
-    /// `layout`, lent for as long as `self` lives.
-    fn lend<'a>(&'a self, layout: &Arc<Layout>) -> &'a Layout {
-        // SAFETY: `layout` is a value of `self.of` or `self.variants`. Neither map has an entry
-        // removed or replaced while `self` lives (both are only added to, through `entry`), so
-        // the `Arc` keeps the `Layout` it points to alive and where it is, however the map is
-        // rehashed, for all of `'a`.
-        unsafe { &*Arc::as_ptr(layout) }
+impl<'cx> Layouts<'cx, '_> {
+    fn new(kept: &'cx KeptLayouts) -> Self {
+        Self { kept, of: Default::default(), variants: Default::default() }
     }
 }
 
@@ -8578,9 +8582,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     fn layout(&self, ty: Ty<'db>) -> Result<&'cx Layout> {
-        let layouts: &'cx Layouts<'db> = self.layouts;
-        if let Some(layout) = layouts.of.borrow().get(&ty) {
-            return Ok(layouts.lend(layout));
+        if let Some(&layout) = self.layouts.of.borrow().get(&ty) {
+            return Ok(layout);
         }
         let layout = self
             .cg
@@ -8595,9 +8598,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         }
         // What is laid out at the least vector length is stored for the largest.
-        let layout = sve::storage(layout);
-        let mut of = layouts.of.borrow_mut();
-        Ok(layouts.lend(of.entry(ty).or_insert(layout)))
+        let kept: &'cx KeptLayouts = self.layouts.kept;
+        let layout: &'cx Layout = kept.asked.alloc(sve::storage(layout));
+        Ok(*self.layouts.of.borrow_mut().entry(ty).or_insert(layout))
     }
 
     /// The shape of a scalable vector type, `None` for any other.
@@ -12570,23 +12573,18 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         variant: VariantId,
         args: GenericArgs<'db>,
     ) -> Result<Option<(&'cx Layout, Tag)>> {
-        let layouts: &'cx Layouts<'db> = self.layouts;
-        let lent = |shape: &Option<VariantShape>| {
-            shape.as_ref().map(|it| (layouts.lend(&it.layout), it.tag))
-        };
-        if let Some(shape) = layouts.variants.borrow().get(&(variant, args)) {
-            return Ok(lent(shape));
+        if let Some(&shape) = self.layouts.variants.borrow().get(&(variant, args)) {
+            return Ok(shape);
         }
         let shape = self.variant_shape_of(variant, args)?;
-        let mut variants = layouts.variants.borrow_mut();
-        Ok(lent(variants.entry((variant, args)).or_insert(shape)))
+        Ok(*self.layouts.variants.borrow_mut().entry((variant, args)).or_insert(shape))
     }
 
     fn variant_shape_of(
         &mut self,
         variant: VariantId,
         args: GenericArgs<'db>,
-    ) -> Result<Option<VariantShape>> {
+    ) -> Result<Option<VariantShape<'cx>>> {
         let db = self.cg.db;
         let adt: AdtId = variant.adt_id(db);
         let ty = Ty::new_adt(self.interner, adt, args);
@@ -12600,8 +12598,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                     VariantId::EnumVariantId(variant) => variant.index(db) == index.0,
                     _ => true,
                 };
-                let whole = || self.layouts.of.borrow()[&ty].clone();
-                return Ok(inhabited.then(|| VariantShape { layout: whole(), tag: None }));
+                return Ok(inhabited.then_some((layout, None)));
             }
             Variants::Empty => return Ok(None),
         };
@@ -12623,8 +12620,10 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 Some(((index - niche_variants.start.0) as u128).wrapping_add(*niche_start))
             }
         };
-        let layout = Arc::new(Layout::for_variant(layout, RustcEnumVariantIdx(index)));
-        Ok(Some(VariantShape { layout, tag: tag_value.map(|it| (offset, tag_ty, it)) }))
+        let kept: &'cx KeptLayouts = self.layouts.kept;
+        let layout: &'cx Layout =
+            kept.variants.alloc(Layout::for_variant(layout, RustcEnumVariantIdx(index)));
+        Ok(Some((layout, tag_value.map(|it| (offset, tag_ty, it)))))
     }
 
     fn write_fields(&mut self, dst: Value, layout: &Layout, operands: &[Operand]) -> Result<()> {

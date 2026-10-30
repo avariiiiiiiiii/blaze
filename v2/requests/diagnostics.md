@@ -491,6 +491,8 @@ are given.
 Also: the request 5 above (`BorrowckSkipped` always given) is what `lower/borrowck_skipped.rs`
 needs; it writes ``blaze cannot borrow-check `<path>`: <reason>`` at the function's signature.
 
+> forwarded to db: lane db is still running (`crates/hir-ty-borrowck/`, `crates/hir/src/diagnostics.rs`).
+
 ## diagnostics-lints: what the const checker refuses, by kind (codegen, `crates/hir-ty-mir/src/mir/const_check.rs`)
 
 What, first: `ConstCheckDiagnostic` says what it is, not only its text:
@@ -531,6 +533,8 @@ rejects; `compiler/rustc_const_eval/src/check_consts/ops.rs`, `build_error_for_c
   inline `const { .. }` are not const checked (`hir` runs `const_check` on `DefWithBodyId`s only);
 - the path of a generic callee as rustc's `def_path_str_with_args` prints it (`Vec::<u8>::new`).
 
+> forwarded to codegen: `crates/hir-ty-mir/src/mir/const_check.rs` is lane codegen's.
+
 ## diagnostics-lints: `crate::tests::ui` passes compiletest's flags (the parent, `diagnostics`, `src/tests.rs`)
 
 What: `ui` and `ui_with` give the crate, before the options' own lint flags, what compiletest
@@ -539,6 +543,8 @@ gives a UI test that is not `run-pass` (`src/tools/compiletest/src/runtest.rs`,
 incomplete_features -A unused_parens -A unused_braces`. Why: every `.stderr` of rustc's was
 made with them, so a test whose source has an unused variable or an `unsafe` block with nothing
 unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-18294.rs`).
+
+> forwarded to diagnostics: its own parent's `src/tests.rs`.
 
 ## diagnostics-lints-syntax-early-macros: the `;` an expression's expansion ends in, and which calls are expressions (db, `crates/hir-expand`, `crates/mbe`)
 
@@ -567,6 +573,8 @@ unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-1829
    with the suggestion `:spec` after it; `hir::MacroDefError` needs the range of each (a
    `Vec<(TextRange, TextRange)>`: the span and where `:spec` goes) for
    `crates/blaze-diagnostics/src/lower/macro_def_error.rs` to give rustc's text.
+
+> forwarded to db: lane db is still running: 1 to 3 (`crates/hir-expand/`). > forwarded to format: 4 (`crates/mbe/src/parser.rs`).
 
 ## diagnostics-lints-bodies: what follows a call of an uninhabited type (codegen, `crates/hir-ty-mir`; db for the field in `crates/hir-ty/src/mir.rs`)
 
@@ -606,6 +614,8 @@ Why: the lint depends on the MIR lowering does not build.
 `crates/blaze-diagnostics/src/lints/bodies/reachable.rs` (`after_calls`) lowers it as written
 above, its type printed through `hir::Type::derived_from_next_solver` (requested by
 `diagnostics-bodies`).
+
+> forwarded to codegen (`crates/hir-ty-mir`) and db, both still running.
 
 ## diagnostics-bodies-types: why the types had to agree, and what a bound was needed for (db, `crates/hir-ty`, `crates/hir/src/diagnostics.rs`)
 
@@ -657,6 +667,8 @@ can only guess at from the syntax today:
    cause is in core's `assert_eq!` itself (the `?Sized` bound through `&*left_val`, or
    `#[track_caller]`), to be tried with std's macro in a VM.
 
+> forwarded to db: lane db is still running (`crates/hir-ty`, `crates/hir`).
+
 ## diagnostics-lints-mir-unsafe: what rustc's unsafety checking finds that `hir::MissingUnsafe` does not give (db, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir/src/diagnostics.rs`, `crates/hir-def/src/signatures.rs`)
 
 `crates/blaze-diagnostics/src/lower/missing_unsafe.rs` lowers every `MissingUnsafe` as rustc's
@@ -694,9 +706,14 @@ can only guess at from the syntax today:
    `DEPRECATED_SAFE_2024` instead of `UNSAFE`, so its own body is checked as a safe function's
    (std's `env::set_var` would get E0133 for what is `unsafe_op_in_unsafe_fn` in rustc). Keep
    `UNSAFE` too, and test `is_deprecated_safe_2024` first where calls are checked.
+   Status: `signatures.rs` part done by speed-hir-defs-sigs (both flags set, test
+   `flags_from_attrs_as_one_if_per_flag`); the call-site reorder in `hir-ty/src/utils.rs` is
+   requested in `v2/requests/db-ty-lower.md`.
 7. `crates/hir-ty/src/target_feature.rs` merges the implications of a feature across
    architectures; rustc's `is_target_feature_call_safe` uses the target's. A call rustc
    rejects can pass.
+
+> forwarded to db: 6 (`hir-def/src/signatures.rs`), 7 (`hir-ty/src/target_feature.rs`) and the `hir::MissingUnsafe` fields. > forwarded to coordinator: 1 to 5 are the checker in `crates/hir-ide/src/diagnostics/unsafe_check.rs`, which `crates.md` removes at integration; porting rustc's `check_unsafety` into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate it moves to first, then the port goes there.
 
 ## diagnostics-lints-syntax-attrs-features: one feature table for the feature lints and `checks/features.rs` (the parents, `lints.rs`, `lints/syntax.rs`, `lints/syntax/attrs.rs`; `diagnostics-items`)
 
@@ -716,6 +733,8 @@ writes `checks/features.rs` next and should use it rather than keep its own).
 Also: the table is from the July checkout, not `nightly-2026-10-27`; regenerate it with
 `table.py` from a checkout of the nightly's commit when there is one
 (`PYTHONPATH=python/typed-input/src python3 .../features/table.py '{"rust": "<checkout>", "out": ".../features/table/lang.rs"}'`).
+
+> forwarded to diagnostics: the module paths and `checks/features.rs` are its own (parents and diagnostics-items).
 
 ## diagnostics-lints-syntax-early-validation: camel case helpers, a fragment's span, and the errors next to my lints
 
@@ -747,6 +766,8 @@ Also: the table is from the July checkout, not `nightly-2026-10-27`; regenerate 
      to avoid confusion with a labeled break expression" (`parse_expr_break`). Our parser
      leaves `break 'a: loop {}` without a value; needed by
      `a_labeled_break_of_an_unlabeled_loop_is_linted_after_the_parse_errors`.
+
+> forwarded to diagnostics: 1, 2 and 4 are its own (`lower/incorrect_case.rs`, the parent's assignments). > forwarded to db: 3 (`crates/hir-expand/`). > forwarded to format: 4's `LabeledLoopInBreak` (`crates/parser`).
 
 ## diagnostics-lints-mir-matches: what match checking gives, as rustc gives it (db, `crates/hir-ide/src/diagnostics/expr.rs`, `match_check.rs`, `match_check/pat_analysis.rs`, `crates/hir/src/diagnostics.rs`)
 
@@ -799,6 +820,8 @@ missing_match_arms.rs` (E0004) and `non_exhaustive_let.rs` (E0005).
    `tests/ui/pattern/refutable-pattern-for-loop-15381.rs`,
    `tests/ui/pattern/usefulness/refutable-pattern-errors.rs`.
 
+> forwarded to db: the fields on `hir::MissingMatchArms`/`NonExhaustiveLet` and `hir::Type::is_inhabited_from` (`crates/hir/`). > forwarded to coordinator: 1 to 5's checking is `crates/hir-ide/src/diagnostics/{expr,match_check}.rs`, which `crates.md` removes at integration; porting rustc's pattern lowering into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate match checking moves to first, then the port goes there.
+
 ## speed-hir-store: blaze-diagnostics onto the HIR column views (from speed-hir-store-tools)
 
 From speed-hir-store-tools, 2026-10-29. 63 sites in 7 files of `crates/blaze-diagnostics/src/`
@@ -817,6 +840,8 @@ Files that import the HIR types or name `ExprId`/`PatId` and need no change: eve
 `lower/*.rs` (their `Expr`/`Pat` are `syntax::ast`'s; `mismatched_tuple_struct_pat_arg_count.rs`'s
 `Pat<'db>` is a local struct), `checks/defs/discriminants.rs`, `lints/names/items/naming.rs`,
 `lints/syntax/**` but `early/labels.rs`.
+
+> forwarded to diagnostics: `crates/blaze-diagnostics/` is its own; `hir-def` has the expression and pattern views now.
 
 ### crates/blaze-diagnostics/src/lints/bodies.rs  (23 sites)
 - ~L121  `if matches!(body[body.root_expr()], Expr::Missing) && body.params.is_empty() {`  ->  `if matches!(body.expr(body.root_expr()), Expr::Missing) && body.params.is_empty() {`
@@ -912,6 +937,8 @@ Why: `tests/lints/syntax/early/builtin.rs` (`range-inclusive-pattern-precedence.
 `...precedence2.rs`, rustc's UI tests verbatim) expect it before the
 `ellipsis_inclusive_range_patterns` warning.
 
+> forwarded to format: `crates/parser` is lane format's.
+
 ## diagnostics-bodies-calls: the types of an error as of when it was found
 
 What: `hir_ty::infer` keeps, in `MismatchedArgCount` (each argument's type and each formal
@@ -924,6 +951,8 @@ Why: rustc reports these while type checking, before fallback: `binop/binop-type
 ("cannot add `{integer}` to `bool`"), `error-codes/E0057.rs` ("unexpected argument #2 of type
 `{integer}`") and `argument-suggestions/basic.rs` ("found `{integer}`"), in
 `tests/bodies/calls.rs` and `tests/bodies/calls/args.rs`.
+
+> forwarded to db: lane db is still running (`crates/hir-ty/src/infer`, `crates/hir`).
 
 ## diagnostics-bodies-calls: `MismatchedArgCount` carries the call's callee and formal types
 
@@ -938,6 +967,8 @@ Why: `lower/mismatched_arg_count.rs` re-resolves the callee with `Semantics` and
 compatibility with `Type::could_coerce_to`, which is not rustc's check: a provided type that
 coerces only through an expectation, or a generic formal input, gives other errors than rustc.
 
+> forwarded to db: lane db is still running (`infer/expr.rs`, `hir/src/diagnostics.rs`).
+
 ## diagnostics-bodies-calls: `HasSource` for `hir::Closure`
 
 What: `impl HasSource for hir::Closure` (its `ast::ClosureExpr`).
@@ -946,6 +977,8 @@ Why: E0057's "closure defined here" note and the parameter labels of a closure c
 closure's span; `lower/mismatched_arg_count.rs` finds it only from its first parameter or from
 the callee's local binding (`let f = || ..; f(1)`), so a closure without parameters reached
 otherwise gets no note.
+
+> forwarded to db: lane db is still running (`crates/hir/`).
 
 ## diagnostics-bodies-calls: the unmet predicates of an operator
 
@@ -960,6 +993,8 @@ suggestion on the element type, "consider further restricting type parameter `T`
 (`suggestions/invalid-bin-op.rs`) and `Output = ` in a bound suggestion come from those
 predicates; `lower/binary_operator_cannot_be_applied.rs` knows only the operator's own trait.
 
+> forwarded to db: lane db is still running (`crates/hir-ty`, `crates/hir`).
+
 ## diagnostics-bodies-calls: casts with unknown pointer kinds are E0641, not accepted
 
 What: `hir_ty::infer::cast` gives `CastError::UnknownCastPtrKind` and `UnknownExprPtrKind`
@@ -973,6 +1008,8 @@ pointer of an unknown kind"); blaze accepting it is a program rustc refuses (sup
 allows accepting more only behind an opt-in). `lower/invalid_cast.rs` works the metadata out
 from the types itself, which misses projections and opaque types.
 
+> forwarded to db: lane db is still running (`infer/cast.rs`, `hir/src/diagnostics.rs`).
+
 ## diagnostics-bodies-calls: `InvalidLhsOfAssignment` says which assignment
 
 What: `hir::InvalidLhsOfAssignment` carries the assignment expression and its operator (plain
@@ -980,6 +1017,8 @@ What: `hir::InvalidLhsOfAssignment` carries the assignment expression and its op
 Where: `crates/hir/src/diagnostics.rs`, `crates/hir-ty/src/infer/expr.rs`.
 Why: E0070 and E0067 differ by it; `lower/invalid_lhs_of_assignment.rs` finds the enclosing
 `BinExpr` from the syntax, which breaks for a left-hand side inside a macro expansion.
+
+> forwarded to db: lane db is still running (`infer/expr.rs`, `hir/src/diagnostics.rs`).
 
 ## diagnostics-bodies-calls: `MethodCallIllegalSizedBound` carries the pick
 
@@ -989,6 +1028,8 @@ Where: `crates/hir-ty/src/method_resolution`, `crates/hir/src/diagnostics.rs`.
 Why: rustc's "you need `&mut dyn Trait` instead of `&dyn Trait`" suggestion and its "a method
 with a similar name exists" help need them; `lower/method_call_illegal_sized_bound.rs` gives
 the error and the bound's label only.
+
+> forwarded to db: the fields go on `InferenceDiagnostic::MethodCallIllegalSizedBound` (`infer.rs`) and `hir::MethodCallIllegalSizedBound`. The one line in items' `method_resolution.rs` (lane items is DONE; line 164, the `push_diagnostic`) db edits in the same change; `MethodError::IllegalSizedBound { candidates, needs_mut }` already has two of them.
 
 ## diagnostics-lints-syntax-delims: pinned reference and guard patterns in the syntax tree
 
@@ -1003,6 +1044,8 @@ and never lints those around a guard pattern
 `tests/ui/lint/unused/unused_parens/parens-around-guard-patterns-not-unused.rs`);
 `lints/syntax/delims.rs` cannot tell them from what the parser makes of them now.
 
+> forwarded to format: `crates/parser`, `crates/syntax` are lane format's.
+
 ## diagnostics-lints-syntax-early-macros-asm: `ra-ap-rustc_parse_format` for blaze-diagnostics
 
 What: `ra-ap-rustc_parse_format.workspace = true` under `[dependencies]` of
@@ -1013,6 +1056,8 @@ Why: `lints/syntax/early/macros/asm.rs` stops at the first template piece that
 does, so later pieces get neither `bad_asm_style` nor `named_asm_labels`; it doesn't build
 without it.
 
+> forwarded to diagnostics: its own `Cargo.toml`; the workspace has `ra-ap-rustc_parse_format` already.
+
 ## diagnostics-lints-syntax-early-macros-asm: `-Z deduplicate-diagnostics=no` in the UI harness
 
 What: an `Options` flag that keeps a diagnostic identical to one already emitted, with the note
@@ -1022,6 +1067,8 @@ Where: `crates/blaze-diagnostics/src/check.rs` (`Options`), `src/emit.rs`; owned
 Why: `tests/ui/asm/named-asm-labels.stderr` has 6 such duplicates (a label defined twice in a
 template); `tests/lints/syntax/early/macros/asm.rs` drops them from the expected output and
 fixes the error count by hand until the harness can give them.
+
+> forwarded to diagnostics: `check.rs`, `emit.rs` are its own.
 
 ## speed-hir-store: blaze-diagnostics code still being written: write it against the HIR views (from speed-hir-store-tools)
 
@@ -1080,6 +1127,8 @@ them before you report DONE):
 - `diagnostics-lints-syntax-early-macros-asm`: `lints/syntax/early/macros/asm.rs`.
 (all paths under `crates/blaze-diagnostics/src/lints/bodies/` but the last.)
 
+> forwarded to diagnostics: its own children's files.
+
 ## diagnostics-lints-syntax-early-validation: `#![forbid(unsafe_code)]` for blaze-diagnostics
 
 `crates/blaze-diagnostics/src/lib.rs` (parent): add `#![forbid(unsafe_code)]`, as
@@ -1087,12 +1136,16 @@ them before you report DONE):
 `rg 'unsafe\s*(\{|fn|impl)' crates/blaze-diagnostics/src`: every match is inside a string,
 comment or diagnostic message (rustc test sources, suggestion text), so it builds unchanged.
 
+> forwarded to diagnostics: its own `src/lib.rs`.
+
 ## diagnostics-lints-syntax-early-macros-asm: re "write it against the HIR views" (speed-hir-store-tools)
 
 Nothing to convert in `lints/syntax/early/macros/asm.rs`: it never reads an `ExpressionStore`
 (no `store[..]`, `ExprId`, `PatId` or `TypeRefId`). Its `Expr`/`Pat` matches are the syntax
 tree's `ast::Expr`/`ast::Pat` of the asm expansion; the only HIR it reads is
 `hir_ty::generics::generics` and `crate::lints::body_item`, neither of which changes.
+
+> forwarded to diagnostics: between its own children.
 
 ## diagnostics-lints-syntax-attrs: attribute parsing's delayed lints, and the path to the feature table (`lints/syntax.rs`, `lints.rs`; `diagnostics-lints-syntax`, `diagnostics`)
 
@@ -1130,6 +1183,8 @@ tree's `ast::Expr`/`ast::Pat` of the asm expansion; the only HIR it reads is
      `WarnButFutureError` duplicate is part of rustc's diagnostic, and `attrs/parse.rs` adds it.
    - `diagnostics-lints-syntax-early-macros`: `duplicate_macro_attributes` is yours, not mine.
 
+> forwarded to diagnostics: `lints/syntax.rs`, `lints.rs` are its own.
+
 ## diagnostics-lints-syntax-early-macros-matchers: two `macro_rules!` errors blaze never gives (`crates/mbe`, `lower/macro_def_error.rs`; front end, `diagnostics`)
 
 rustc refuses these definitions at `compile_declarative_macro`; blaze defines them and the
@@ -1154,6 +1209,53 @@ owns `lower/macro_def_error.rs` can take them (make the module `pub(crate)` from
 `matchers.rs`, the parent's `macros.rs` declares it) or port the check into `crates/mbe` so
 the definition is refused there.
 
+> forwarded to format: `crates/mbe` is lane format's (and db for any `hir-expand` part).
+
+## diagnostics-lints-mir-scopes: scope errors the front end doesn't report (`hir-def`, `hir-ty`; front end, `diagnostics`)
+
+Each is a program the pinned nightly refuses and blaze builds (**superset-of-rust**). The
+lowerings (`lower/break_outside_of_loop.rs`, `lower/yield_outside_coroutine.rs`) already render
+rustc's message once a diagnostic reaches them; what's missing is the diagnostic.
+
+1. **An unlabeled `break`/`continue` in a labeled block inside a loop** (E0695, rustc's
+   `require_label_in_labeled_block` in `compiler/rustc_hir_typeck/src/loops.rs`):
+   `loop { 'b: { break; } }` and `loop { 'b: { continue; } }`. hir-ty's `find_breakable`
+   takes the jump to be the loop's, so it gives no `BreakOutsideOfLoop`. Outside a loop it does,
+   and the lowering turns that into E0695. What's needed: a `BreakOutsideOfLoop` (or a new
+   diagnostic) whenever an unlabeled jump's innermost breakable is a labeled block. Tests waiting:
+   `tests/ui/label/label_break_value_continue.rs` (`continue_crossing`) and
+   `label_break_value_unlabeled_break.rs` (`unlabeled_break_crossing`).
+2. **An unlabeled `break`/`continue` in a `while` loop's condition** (E0590, rustc's
+   `LoopIdError::UnlabeledCfInWhileCondition` from `lower_loop_destination` in
+   `compiler/rustc_ast_lowering/src/expr.rs`): `while break {}`, `while let true = continue {}`.
+   hir-def lowers `while` to a `loop` whose condition is inside it, so the jump has a target. The
+   lowering gives E0590 only when the jump also has a value (`bad_value_break`). Test waiting:
+   `tests/ui/for-loop-while/break-continue-in-loop-while-condition.rs`.
+3. **`yield` in an `async` body** (E0727, `AsyncCoroutinesNotSupported` in
+   `compiler/rustc_ast_lowering/src/expr.rs` `lower_expr_yield`): hir-ty gives async coroutines
+   `resume_yield_tys`, so `async { yield }` reports nothing. Test:
+   `tests/ui/coroutine/async-coroutine-issue-67158.rs`.
+4. **`yield` in a closure without `#[coroutine]`** (`YieldInClosure`, "`yield` can only be used
+   in `#[coroutine]` closures, or `gen` blocks", with the suggestion to add `#[coroutine] `):
+   hir-def makes any closure with a `yield` a coroutine. It should do so only for
+   `#[coroutine]` closures and report the others, as rustc's `lower_expr_yield` does. The
+   lowering gives this error today only for the first `yield` of a body that isn't a closure
+   (rustc's `yield-in-function.rs`, `yield-in-const.rs`).
+5. **`.await` outside `async`**: rustc lowers it to an error expression (`lower_expr_await`),
+   so the awaitee isn't type-checked and the body is tainted. hir-ty's `infer_await_expr`
+   still registers `awaitee: IntoFuture`. With core's `IntoFuture`, that adds an E0277
+   rustc doesn't give: `async fn f() { [1; ().await]; }` (`tests/ui/async-await/issue-70594.rs`)
+   would say `()` is not a future. What's needed: infer an `await` that
+   `AwaitOutsideOfAsync` is reported for as the error type, with no obligation. The scope
+   test runs `issue-70594.rs` without minicore's `future`, where the bound isn't registered.
+6. **minicore's `Result` and `ControlFlow` lack core's `#[must_use]`**
+   (`crates/test-utils/src/minicore.rs`): core has
+   `#[must_use = "this `Result` may be an `Err` variant, which should be handled"]` on `Result`
+   and `#[must_use]` on `ControlFlow`. Without them, rustc's `must_use-result-unit-uninhabited.rs`
+   and `must_use-tuple.rs` can't be checked against minicore.
+
+> forwarded to db: `hir-def` and `hir-ty` are lane db's.
+
 ## diagnostics-lints-bodies: `become` in hir-ty's MIR (codegen, `crates/hir-ty-mir`; db for the variant in `crates/hir-ty/src/mir.rs`)
 
 `unconditional_recursion` (`lints/bodies/recursion.rs`, rustc's
@@ -1166,3 +1268,118 @@ f(!x) } else { f(!x) } }` lints, with only the `f(!x)` call as a "recursive call
 `TerminatorKind::TailCall { func, args, fn_span }`, no successors, for `become`. Nothing else
 is needed on my side: `recursion.rs` already treats a terminator with no successors that is
 neither a return nor a call of the function itself as rustc treats `TailCall`.
+
+> forwarded to codegen (`crates/hir-ty-mir`) and db (the variant), both still running.
+
+## diagnostics-items-impls: what the checks of impls need of the front end
+
+From `crates/blaze-diagnostics/src/checks/impls/{builtin,compare}.rs` and
+`checks/impls.rs`. Each is an error rustc gives that blaze does not until it exists
+(superset-of-rust); the rest of each check is written and in use.
+
+1. **db (`crates/hir/src/lib.rs`): the fields of an enum's variant typed in the impl's
+   environment.** `hir::Type::variant_fields(&self, db, variant: hir::EnumVariant) ->
+   Vec<(Field, Type<'db>)>`, as `Type::fields` is for a struct (`field.ty().instantiate(..)`
+   with `self.derived(ty)`). Why: E0204 (`all_fields_implement_trait`) asks `field_ty: Copy`
+   in the Copy impl's param env. Today `builtin.rs` decides an enum field whose type has no
+   parameter or is one parameter alone; `enum E<T> { A(Vec<T>) } impl<T> Copy for E<T> {}`
+   is accepted until this exists.
+2. **items (`hir-ty/src/traits.rs`): the fulfillment errors of `ty: Trait` in an impl's
+   environment**, each with its predicate and whether it is the root obligation (rustc's
+   `FulfillmentError::{obligation, root_obligation}`), printed as rustc does. Why: E0204's
+   notes "the `Copy` impl for `Wrapper<T>` requires that `T: Copy`" and the bound suggested
+   for a parameter found deeper than the field's own type
+   (`tests/ui/coherence/deep-bad-copy-reason.rs`,
+   `tests/ui/suggestions/missing-bound-in-derive-copy-impl*.rs`).
+3. **items (`hir-ty/src/specialization.rs` or `traits.rs`): overlap of two impls**, rustc's
+   `overlapping_impls` with its `OverlapResult` (the intercrate ambiguity causes and whether
+   it involves a placeholder). Why: E0119 "conflicting implementations of trait `T` for type
+   `X`" with "first implementation here" / "conflicting implementation for `X`" and the
+   upstream-crates note (`coherence/specialization_graph`'s `report_conflicting_impls`), and
+   E0592 across two inherent impls (`inherent_impls_overlap.rs`,
+   `check_for_common_items_in_impls`). `checks/impls.rs` iterates the impls per trait in
+   rustc's order and is where the report goes.
+4. **items: the parameters of an impl not constrained** (rustc's
+   `impl_wf_check::enforce_impl_params_are_constrained`, with `parameters_for` of the impl's
+   trait ref, self type and the projections its predicates constrain). Why: E0207.
+5. **db (`hir-ty`): compare_impl_item's type comparison**: the trait method's signature
+   instantiated with the impl's arguments against the impl's, normalized
+   (`compare_method_clause_entailment`), with the first argument or the return type that
+   differs. Why: E0053 "method `x` has an incompatible type for trait" with
+   `expected signature fn(..)` / `found signature fn(..)`, and E0276 / the
+   `refining_impl_trait` lints that the same comparison gives.
+6. **db (`hir-def` generics): which lifetime parameters of a function are early bound**
+   (rustc's `is_late_bound_map`) and `check_region_late_boundedness`. Why: E0195 "lifetime
+   parameters or bounds on method `x` do not match the trait declaration".
+7. **items: `Drop` impl predicates implied by the type's** (rustc's
+   `ensure_impl_predicates_are_implied_by_item_defn`). Why: E0367.
+8. **items: CoerceUnsized/DispatchFromDyn** (rustc's `coerce_unsized_info` and
+   `visit_implementation_of_dispatch_from_dyn`: the fields that differ between source and
+   target after normalization and whether each coerces). Why: E0374, E0375, E0377, E0378.
+9. **test-utils (`crates/test-utils/src/minicore.rs`): `#[rustc_deny_explicit_impl]` on
+   `Sized`, `MetaSized`, `PointeeSized` and `Unsize`**, as core has them. Why: E0322 and E0328
+   (`checks/impls.rs`, `explicit_impl`) read the attribute; the UI tests
+   `tests/ui/error-codes/E0328.rs` and `coherence/coherence-impls-sized.rs` cannot be run on
+   minicore without it.
+
+> applied: 4, as lane items is DONE: `hir_ty::impl_unconstrained_params(db, impl) -> Vec<TypeOrConstParamId>` in `specialization.rs`, the type and const parameters E0207 names in declaration order (empty when the header has an error type); `impl_has_unconstrained_params` is now `!is_empty()` of it, so it answers as before. rustc's lifetime half (`enforce_impl_lifetime_params_are_constrained`, lifetimes in associated types' values) is not in it. > forwarded to db: 1 and 5 (`hir`, `hir-ty`). > forwarded to coordinator: 2, 3, 6 to 8, and 4's lifetime half, are ports of whole rustc checks (fulfillment errors with root obligations, `overlapping_impls`, late-bound lifetimes, E0367, `coerce_unsized_info`) in items' paths with lane items DONE: new work for a lane the coordinator names, not edits. 9 (`crates/test-utils`) is the coordinator's "every other path".
+
+## diagnostics-lints-bodies-types-casts: compiletest's `-A unused` goes to every UI test but a `run-pass` one (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)
+
+`calls.rs`'s `compiletest` gives `-A unused -W unused_attributes` only to `Test::Passes`
+("`//@ check-pass`, `//@ run-pass`"). compiletest does the opposite for `run-pass`:
+`runtest.rs` (`allow_unused`, lines 930-948) gives it to every UI test whose declared pass mode
+is not `run-pass`, failing ones and `check-pass`/`build-pass` included. Asked: replace `Test`
+with `RunPass` / `Other` (or `test: Option<PassMode>`), `-A unused` for all but `RunPass`.
+Until then `types/casts`' tests pick the variant that gives compiletest's flags:
+`Test::Passes` for every test but `static-mut-refs.rs`'s e2021 revision (`//@ [e2021] run-pass`),
+which is `Test::Fails`. Flip them with the rename.
+
+## diagnostics-lints-bodies-types-casts: three things of core minicore lacks (`crates/test-utils/src/minicore.rs`; test-utils)
+
+`static-mut-refs.rs` and `static-mut-refs-interior-mutability{,-no-sugg}.rs` (tests in
+`tests/lints/bodies/types/casts/static_mut_refs.rs`) need, as core writes them:
+1. `Result::unwrap` (`impl<T, E> Result<T, E> { pub fn unwrap(self) -> T where E: fmt::Debug }`,
+   under `result` with `fmt`): `MUTEX.lock().unwrap()`.
+2. `fmt::rt::Argument::new_debug` (under `fmt`): `format!("{:?}", Z)` lowers to it.
+3. `impl<T: Debug, const N: usize> Debug for [T; N]` (under `fmt`): `Z` is `&[i32; 3]` (minicore has `Debug for &T`).
+Without them these tests get an unresolved-method / unmet-bound error besides the lint.
+
+## diagnostics-lints-bodies-types-casts: an expression's span across macro contexts (`Cx::span`; `diagnostics`)
+
+rustc's prefix-expression span is `lo.to(operand.span)` (`rustc_parse`, `parse_expr_prefix`),
+and `Span::to` of spans in different contexts keeps the operand's ancestor in the macro's
+context. So in `macro_rules! ref_cast { ($e:expr) => { &$e as *const i32 } }` called as
+`ref_cast!(*x)`, the cast's span starts at `$e`, not `&`:
+`lint-raw-borrows-via-references.stderr` points at 68:10 with 16 carets. blaze's span of the
+cast is its syntax node's, from `&` (68:9, 17 carets). Not mine to patch per lint: any lint on
+an expression whose operand is a `$e` fragment differs the same way. Test waiting:
+`tests/lints/bodies/types/casts/raw_borrows.rs`.
+
+## diagnostics-lints-bodies-types-casts: the value a path resolved to, from inference (`hir-ty` `InferenceResult`; db)
+
+`static_mut_refs` asks for every `&path`, `&path.field`, method receiver and `let ref x =
+path` whether the path is a `static mut`, and `raw_borrows_via_references` whether a borrowed
+path is a local or a static; both go through `types::util::path_value`, which runs the
+resolver again. Inference already resolved each value path: recording it (`ExprId ->
+ValueNs`, as `InferenceResult` records `variant_resolutions`) makes these a table lookup.
+
+## diagnostics-lints-syntax-delims: `#![forbid(unsafe_code)]` on blaze-diagnostics
+
+What: add `#![forbid(unsafe_code)]` to `crates/blaze-diagnostics/src/lib.rs`.
+Where: `crates/blaze-diagnostics/src/lib.rs` (the lane parent's).
+Why: `docs/v2/plan/design/unsafe.md` says a crate with no unsafe module forbids `unsafe_code`.
+`rg` finds no `unsafe` block, fn or impl in the crate's Rust; the only hits are rustc's
+error-code docs in `emit/codes/*.md` and the sources the UI tests lint.
+
+## diagnostics-lints-bodies-calls-items: `concat_bytes!`'s literal has the call's span, as rustc's (`crates/hir-expand/src/builtin/fn_macro.rs`; db)
+
+What: in `concat_bytes_expand` (line ~820), give the byte string literal it makes the macro
+call's span (`call_site`), not the cover of its argument literals' spans (`record_span`).
+Why: rustc's `concat_bytes!` (`rustc_builtin_macros/src/concat_bytes.rs`) makes its expression
+with `cx.expr_byte_str(sp, ..)`, `sp` the call's span, so a diagnostic on the expression points
+at the whole `concat_bytes!(b"cl", b"\x82ippy")`. `include_bytes_expand` already does this.
+With the cover span, `Cx::span` maps the literal back to `b"cl", b"\x82ippy"` (root context),
+so `invalid_from_utf8`'s label ("the literal was valid UTF-8 up to the 2 bytes") is 14 columns
+short of rustc's at four places in `invalid_from_utf8.stderr` (lines 61, 63, 123, 125 of the test).
+Test waiting: `tests/lints/bodies/calls/items.rs`, `invalid_from_utf8`.

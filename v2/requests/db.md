@@ -246,6 +246,8 @@ Files that import the HIR types and need no change: `display.rs` (only `TypeRef`
 `from_id.rs`, `has_source.rs`, `term_search.rs`, `term_search/` (their `Expr` is
 `crate::term_search::Expr`, not HIR's). Imports stay as they are in every file.
 
+> forwarded to db: `crates/hir/` is lane db's. Its two calls into `hir-ide` now take the views: `record_literal_missing_fields(db, infer, id, body.expr(id))`, `record_pattern_missing_fields(.., body.pat(id))` (speed.md, applied).
+
 ### crates/hir/src/lib.rs  (8 sites)
 - ~L2003  `&body[body.params[self.idx - body.self_param.is_some() as usize].user_written]`  ->  `body.pat(body.params[self.idx - body.self_param.is_some() as usize].user_written)`
 - ~L2008, ~L2026 (both in `Param::as_local`, the only two in the file)  `binding_id: *id,`  ->  `binding_id: id,`
@@ -302,6 +304,8 @@ and `opts: opts.clone(),` with `opts: self.krate.cfg_options(self.db).clone(),` 
 the `base_db::Crate` whose def map's diagnostics these are). The clone now happens only when an
 `InactiveCode` diagnostic is emitted, not once per disabled item at collection.
 
+> forwarded to db: `hir-def`'s nameres and `hir` are lane db's.
+
 ## speed-hir-store: hir onto the HIR column views, type refs (from speed-hir-store-tools)
 
 From speed-hir-store-tools, 2026-10-29. The type-ref half of the block "## speed-hir-store: hir
@@ -313,6 +317,8 @@ view too (`store.type_ref(t)`, API in the addendum of
 `&TypeBound::Path(path, _)` patterns and `store[path]` (a `PathId`) stay. `pub use
 hir_def::type_ref::TypeRef` in `lib.rs` now re-exports the view; only `blaze-diagnostics`
 imports it and reads it through `hir_def` already.
+
+> forwarded to db: `crates/hir/` is lane db's; `hir-def` does not have the type-ref view yet (`Index<TypeRefId>` is still there).
 
 ### crates/hir/src/lib.rs  (1 site)
 - ~L2053  `.map(|&param| match &func_data.store[param] {`  ->  `.map(|&param| match func_data.store.type_ref(param) {` (`TypeRef::Reference(ref_) => match ref_.mutability` is unchanged)
@@ -330,3 +336,25 @@ imports it and reads it through `hir_def` already.
 
 ### crates/hir/src/semantics.rs  (1 site)
 - ~L1729  `let path = match &analyze.store()?.types[ty] {`  ->  `let path = match analyze.store()?.type_ref(ty) {` (this read the store's `types` arena field directly, which the columns remove; `path` is `&'db Path`, as before)
+
+## From speed-runtime-vfs: `crates/blaze-query/src/tree.rs`, two copies the reader no longer needs (2026-10-29)
+
+`blaze_vfs::Reader::file` now returns its `Arc<[u8]>` owned and `Reader::list` an owned
+`std::vec::IntoIter<(String, bool)>`, so the impl's `.clone()` and `.to_owned()` copy again
+what is already owned (it compiles as it is; this is only the waste). The exact edit, in
+`impl Tree for blaze_vfs::Reader`:
+
+```rust
+    fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
+        blaze_vfs::Reader::file(self, root, path)
+    }
+
+    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+        blaze_vfs::Reader::list(self, root, path).map(Iterator::collect)
+    }
+```
+
+and in its doc, replace "The reader lends a file's bytes; this trait gives an `Arc`, so `file`
+takes one count" with "The trait gives an `Arc`, so `file` takes one count" (lent bytes are
+`Reader::pin()`'s `Pinned::file`, for when the database holds a view's bytes as lent:
+v2/requests/vfs.md item 8).

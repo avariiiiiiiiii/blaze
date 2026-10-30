@@ -139,7 +139,7 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
                 if let Some((first, _)) = slot {
                     ignored(sink, name, *first, at);
                 } else {
-                    let format = format(sink, lit, str, mode);
+                    let format = format_string(sink, lit, str, mode);
                     let slot = if name == "message" { &mut directive.message } else { &mut directive.label };
                     *slot = Some((at, format));
                 }
@@ -149,7 +149,7 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
                     malformed(sink, mode, span);
                     continue;
                 };
-                let format = format(sink, lit, str, mode);
+                let format = format_string(sink, lit, str, mode);
                 directive.notes.push(format);
             }
             (Mode::RustcOnUnimplemented, "parent_label") => {
@@ -160,7 +160,7 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
                 if let Some((first, _)) = &directive.parent_label {
                     ignored(sink, name, *first, at);
                 } else {
-                    let format = format(sink, lit, str, mode);
+                    let format = format_string(sink, lit, str, mode);
                     directive.parent_label = Some((sink.at(lit.range()), format));
                 }
             }
@@ -196,17 +196,17 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
 
 /// rustc's `merge_directives`: `later`, of a later attribute, into what the ones before gave.
 pub(super) fn merge(sink: &mut Sink<'_, '_, '_>, first: &mut Option<Directive>, later: Directive) {
-    let Some(first) = first else {
+    let Some(existing) = first.as_mut() else {
         *first = Some(later);
         return;
     };
     let Directive { is_rustc_attr, filters, message, label, notes, parent_label } = later;
-    first.is_rustc_attr |= is_rustc_attr;
-    first.filters.extend(filters);
-    merge_option(sink, &mut first.message, message, "message");
-    merge_option(sink, &mut first.label, label, "label");
-    first.notes.extend(notes);
-    merge_option(sink, &mut first.parent_label, parent_label, "parent_label");
+    existing.is_rustc_attr |= is_rustc_attr;
+    existing.filters.extend(filters);
+    merge_option(sink, &mut existing.message, message, "message");
+    merge_option(sink, &mut existing.label, label, "label");
+    existing.notes.extend(notes);
+    merge_option(sink, &mut existing.parent_label, parent_label, "parent_label");
 }
 
 fn merge_option(
@@ -215,15 +215,15 @@ fn merge_option(
     later: Option<(InFile<TextRange>, Format)>,
     option: &str,
 ) {
-    match (&*first, later) {
-        (_, None) => {}
-        (Some((first, _)), Some((later, _))) => ignored(sink, option, *first, later),
-        (None, Some(later)) => *first = Some(later),
+    let Some(later) = later else { return };
+    match first.as_ref() {
+        Some((at, _)) => ignored(sink, option, *at, later.0),
+        None => *first = Some(later),
     }
 }
 
 /// The format string `value` of the literal `lit`, its lints given.
-fn format(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode) -> Format {
+fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode) -> Format {
     match format::parse(value, lit.text(), lit.range(), mode) {
         Ok(parsed) => {
             for warning in parsed.warnings {

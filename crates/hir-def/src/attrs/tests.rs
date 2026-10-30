@@ -297,25 +297,21 @@ fn old_match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlF
 /// The flags that gate a value query: set exactly where that query, reading the source, finds
 /// its attribute (a key-value or a word attribute whose path `is1` the name).
 fn gating_flags(meta: &ast::Meta) -> AttrFlags {
-    let (path, names): (_, &[(&str, AttrFlags)]) = match meta {
-        ast::Meta::KeyValueMeta(meta) => (
-            meta.path(),
-            &[
-                ("export_name", AttrFlags::HAS_EXPORT_NAME),
-                ("link_name", AttrFlags::HAS_LINK_NAME),
-                ("link_section", AttrFlags::HAS_LINK_SECTION),
-                ("linkage", AttrFlags::HAS_LINKAGE),
-                ("rustc_diagnostic_item", AttrFlags::HAS_DIAGNOSTIC_ITEM),
-            ],
-        ),
-        ast::Meta::PathMeta(meta) => (
-            meta.path(),
-            &[
-                ("rustc_nounwind", AttrFlags::RUSTC_NOUNWIND),
-                ("rustc_comptime", AttrFlags::RUSTC_COMPTIME),
-                ("panic_handler", AttrFlags::PANIC_HANDLER),
-            ],
-        ),
+    const KEY_VALUE: &[(&str, AttrFlags)] = &[
+        ("export_name", AttrFlags::HAS_EXPORT_NAME),
+        ("link_name", AttrFlags::HAS_LINK_NAME),
+        ("link_section", AttrFlags::HAS_LINK_SECTION),
+        ("linkage", AttrFlags::HAS_LINKAGE),
+        ("rustc_diagnostic_item", AttrFlags::HAS_DIAGNOSTIC_ITEM),
+    ];
+    const WORD: &[(&str, AttrFlags)] = &[
+        ("rustc_nounwind", AttrFlags::RUSTC_NOUNWIND),
+        ("rustc_comptime", AttrFlags::RUSTC_COMPTIME),
+        ("panic_handler", AttrFlags::PANIC_HANDLER),
+    ];
+    let (path, names) = match meta {
+        ast::Meta::KeyValueMeta(meta) => (meta.path(), KEY_VALUE),
+        ast::Meta::PathMeta(meta) => (meta.path(), WORD),
         _ => return AttrFlags::empty(),
     };
     names

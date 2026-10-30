@@ -256,11 +256,18 @@ fn parameters_for<'db>(
 /// variable nothing constrains, and gives an error instead.
 #[salsa::tracked(returns(copy))]
 pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> bool {
+    !impl_unconstrained_params(db, impl_id).is_empty()
+}
+
+/// The type and const parameters of `impl_id` that are constrained neither by its header nor
+/// by the associated types its where clauses equate with what is, in declaration order: each
+/// is one E0207. None when the header has an error type.
+pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
     let interner = DbInterner::new_no_crate(db);
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());
     if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {
-        return false;
+        return Vec::new();
     }
     let mut constrained = FxHashSet::default();
     match trait_ref {
@@ -292,8 +299,9 @@ pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplI
             break;
         }
     }
-    GenericParams::of(db, impl_id.into()).iter_type_or_consts().any(|(local_id, _)| {
-        let param = TypeOrConstParamId { parent: impl_id.into(), local_id };
-        !constrained.contains(&Parameter::TypeOrConst(param))
-    })
+    GenericParams::of(db, impl_id.into())
+        .iter_type_or_consts()
+        .map(|(local_id, _)| TypeOrConstParamId { parent: impl_id.into(), local_id })
+        .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param)))
+        .collect()
 }

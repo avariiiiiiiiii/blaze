@@ -25,7 +25,7 @@ use hir_def::{
 use rustc_abi::ExternAbi;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_type_ir::{
-    AliasTy, BoundVar, CoroutineWitnessTypes, DebruijnIndex, EarlyBinder, FlagComputation, Flags,
+    AliasTy, BoundVar, CoroutineWitnessTypes, DebruijnIndex, EarlyBinder, Flags,
     FnSigKind, GenericArgKind, GenericTypeVisitable, ImplPolarity, InferTy, Interner, TraitRef,
     TypeFlags, TypeVisitableExt, Variance, VisitorResult,
     error::TypeError,

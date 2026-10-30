@@ -132,7 +132,10 @@ impl<T> Chunked<T> {
         let (chunk, place) = chunk_of(start as usize);
         // SAFETY: as the caller promises, the run is written and within one chunk.
         unsafe {
-            std::slice::from_raw_parts(self.chunks[chunk].load(Ordering::Acquire).add(place), len as usize)
+            std::slice::from_raw_parts(
+                self.chunks[chunk].load(Ordering::Acquire).add(place),
+                len as usize,
+            )
         }
     }
 }
@@ -150,7 +153,9 @@ impl<T: Copy> Chunked<T> {
         let (chunk, place) = chunk_of(start as usize);
         debug_assert!(place + values.len() <= FIRST << chunk, "a run across chunks");
         // SAFETY: the run is within one chunk and nothing published names it yet.
-        unsafe { ptr::copy_nonoverlapping(values.as_ptr(), self.chunk(chunk).add(place), values.len()) };
+        unsafe {
+            ptr::copy_nonoverlapping(values.as_ptr(), self.chunk(chunk).add(place), values.len())
+        };
     }
 }
 
@@ -166,7 +171,8 @@ impl<T> Drop for Chunked<T> {
         for (chunk, at) in self.chunks.iter_mut().enumerate() {
             let at = *at.get_mut();
             if !at.is_null() {
-                let all = ptr::slice_from_raw_parts_mut(at.cast::<MaybeUninit<T>>(), FIRST << chunk);
+                let all =
+                    ptr::slice_from_raw_parts_mut(at.cast::<MaybeUninit<T>>(), FIRST << chunk);
                 // SAFETY: allocated by `chunk` as a box of exactly this many values.
                 drop(unsafe { Box::from_raw(all) });
             }
@@ -307,7 +313,9 @@ impl Index {
 
     fn places(&self, level: usize) -> &[AtomicU32] {
         // SAFETY: a level is allocated before `level` names it, and freed only with the index.
-        unsafe { std::slice::from_raw_parts(self.levels[level].load(Ordering::Acquire), PLACES << level) }
+        unsafe {
+            std::slice::from_raw_parts(self.levels[level].load(Ordering::Acquire), PLACES << level)
+        }
     }
 }
 

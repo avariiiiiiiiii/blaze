@@ -14,6 +14,8 @@
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use rustc_hash::FxHashMap;

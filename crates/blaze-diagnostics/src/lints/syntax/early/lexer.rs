@@ -1,0 +1,336 @@
+//! What rustc's lexer lints and what it gathers for the identifier lints:
+//! `text_direction_codepoint_in_comment`, `text_direction_codepoint_in_literal`,
+//! `rust_2021_prefixes_incompatible_syntax` and `rust_2024_guarded_string_incompatible_syntax`,
+//! buffered at the crate root as each file is lexed; `keyword_idents_2018` and
+//! `keyword_idents_2024` of the pre-expansion pass (`keywords`); and the identifier lints of
+//! `check_crate` over the symbol gallery (`idents`).
+//!
+//! rustc lexes a file whole before `cfg` removes anything, so nothing here skips what `cfg`
+//! removes (`Tree::skipped`): a comment or identifier of a removed item is lexed, and linted,
+//! as any other. The files lexed are those of the
+//! crate's modules and those `include!` reads; what a macro expands to is not lexed again.
+//!
+//! Follows rustc's `compiler/rustc_parse/src/lexer/mod.rs` (`lint_unicode_text_flow`,
+//! `report_text_direction_codepoint`, `report_unknown_prefix`, `maybe_report_guarded_str`, the
+//! `RawLifetime` arm of `next_token_from_cursor`), `compiler/rustc_parse/src/diagnostics.rs`
+//! (`UnicodeTextFlow`, `UnicodeCharNoteSub`, `UnicodeTextFlowSuggestion`,
+//! `HiddenUnicodeCodepointsDiag`, `HiddenUnicodeCodepointsDiagLabels`,
+//! `HiddenUnicodeCodepointsDiagSub`, `ReservedPrefix`, `RawPrefix`, `ReservedStringLint`,
+//! `ReservedMultihashLint`), `compiler/rustc_session/src/parse.rs` (`SymbolGallery`) and
+//! `compiler/rustc_expand/src/proc_macro_server.rs` (the identifiers a proc macro makes, in the
+//! gallery) (MIT or Apache-2.0).
+
+mod idents;
+mod keywords;
+mod lex;
+
+use std::borrow::Cow;
+
+use hir::{HirFileId, InFile};
+use hir_expand::MacroDefKind;
+use rustc_hash::{FxHashMap, FxHashSet};
+use span::{Edition, FileId};
+use syntax::{SyntaxKind, SyntaxNodePtr, TextRange};
+
+use crate::{
+    cx::Cx,
+    lints::syntax::{Emitted, Pass, Walk, source_fact},
+    lower::Phase,
+    model::{Applicability, Diag, Span, SuggestionStyle},
+};
+
+use self::lex::Lexed;
+
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
+    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
+    let Some(root) = walk.tree(HirFileId::from(root)) else { return Vec::new() };
+    let krate = root.ptr(&root.root);
+    let mut emitted = Vec::new();
+    for tree in walk.files() {
+        keywords::lints(cx, tree, &mut emitted);
+    }
+    let sources = sources(cx, walk);
+    let mut gallery = Gallery::default();
+    for (index, source) in sources.iter().enumerate() {
+        let text = cx.file_text(source.file);
+        let lexed = lex::lex(text, source.edition);
+        for lexed in lexed.lexed {
+            emitted.push(lexer_lint(cx, source.file, text, lexed, krate));
+        }
+        for ident in lexed.idents {
+            let symbol = lex::nfc(&text[ident.symbol_range()]);
+            let order = (index as u32, u32::from(ident.range.start()), u32::from(ident.range.end()));
+            gallery.symbols.entry(symbol).or_insert(Entry { order, place: Place::File(source.file, ident.range) });
+        }
+    }
+    gallery.add_proc_macro_idents(cx, walk, &sources);
+    emitted.extend(idents::lints(cx, gallery.sorted(), krate));
+    emitted
+}
+
+/// A file rustc's lexer reads, and the edition it is lexed in.
+struct Source {
+    file: FileId,
+    edition: Edition,
+}
+
+/// The files rustc lexes, in the order it loads them: the crate's modules, then what
+/// `include!` reads.
+fn sources(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Source> {
+    let mut seen = FxHashSet::default();
+    let mut sources = Vec::new();
+    for tree in walk.files() {
+        let Some(file) = tree.file.file_id() else { continue };
+        let id = file.file_id(cx.db);
+        if seen.insert(id) {
+            sources.push(Source { file: id, edition: tree.file.edition(cx.db) });
+        }
+    }
+    for tree in &walk.trees {
+        let Some(call) = tree.call else { continue };
+        let Some(file) = call.loc(cx.db).include_file_id(cx.db, call) else { continue };
+        let id = file.file_id(cx.db);
+        // An included file's spans are of no expansion: it is lexed in the crate's edition.
+        if seen.insert(id) {
+            sources.push(Source { file: id, edition: cx.edition });
+        }
+    }
+    sources
+}
+
+/// Where a symbol of the gallery was first seen: a token of a file, or one a proc macro made.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Place {
+    File(FileId, TextRange),
+    Expansion(InFile<TextRange>),
+}
+
+impl Place {
+    pub(super) fn span(self, cx: &Cx<'_, '_>) -> Span {
+        match self {
+            Place::File(file, range) => cx.span_in_file(file, range),
+            Place::Expansion(range) => cx.span(range),
+        }
+    }
+}
+
+/// Where rustc's spans sort a place: by the file, in the order the source map loaded it, then
+/// where in it.
+pub(super) type Order = (u32, u32, u32);
+
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    order: Order,
+    place: Place,
+}
+
+/// rustc's `SymbolGallery`: each identifier's symbol and where it was first seen.
+#[derive(Default)]
+struct Gallery<'db> {
+    symbols: FxHashMap<Cow<'db, str>, Entry>,
+}
+
+/// A symbol of the gallery, as `check_crate` takes them: sorted by where they were seen.
+pub(super) struct Symbol<'db> {
+    pub(super) name: Cow<'db, str>,
+    pub(super) order: Order,
+    pub(super) place: Place,
+}
+
+impl<'db> Gallery<'db> {
+    /// The identifiers of what proc macros expand to (`proc_macro_server.rs`: each `Ident` a
+    /// proc macro gives back, its lifetimes' too, which `proc_macro` gives as a `'` and an
+    /// `Ident`), where the gallery has no such symbol yet. They are expanded after the files
+    /// they are called from are lexed.
+    fn add_proc_macro_idents(&mut self, cx: &Cx<'_, 'db>, walk: &Walk<'_>, sources: &[Source]) {
+        let mut index: Option<FxHashMap<FileId, u32>> = None;
+        for tree in &walk.trees {
+            let Some(call) = tree.call else { continue };
+            if !matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)) {
+                continue;
+            }
+            for token in tree.root.descendants_with_tokens().filter_map(|it| it.into_token()) {
+                let text = token.text();
+                let name = match token.kind() {
+                    SyntaxKind::LIFETIME_IDENT => text.strip_prefix('\''),
+                    kind if kind.is_any_identifier() => Some(text),
+                    _ => None,
+                };
+                let Some(name) = name else { continue };
+                let symbol = lex::nfc(name.strip_prefix("r#").unwrap_or(name));
+                if self.symbols.contains_key(symbol.as_ref()) {
+                    continue;
+                }
+                let range = InFile::new(tree.file, token.text_range());
+                let span = cx.span(range);
+                let index = index.get_or_insert_with(|| {
+                    sources.iter().enumerate().map(|(at, it)| (it.file, at as u32)).collect()
+                });
+                let file = cx.file_of(&span).and_then(|it| index.get(&it).copied()).unwrap_or(u32::MAX);
+                let order = (file, span.lo, span.hi);
+                self.symbols.insert(Cow::Owned(symbol.into_owned()), Entry { order, place: Place::Expansion(range) });
+            }
+        }
+    }
+
+    fn sorted(self) -> Vec<Symbol<'db>> {
+        let mut symbols: Vec<Symbol<'db>> = self
+            .symbols
+            .into_iter()
+            .map(|(name, Entry { order, place })| Symbol { name, order, place })
+            .collect();
+        // Symbols a proc macro made share its call's span; rustc leaves those in hash order.
+        symbols.sort_unstable_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
+        symbols
+    }
+}
+
+const TEXT_FLOW_NOTE: &str = "these kind of unicode codepoints change the way text flows on applications that support them, but can cause confusion because they change the order of characters on the screen";
+const REMOVE_THEM: &str = "if their presence wasn't intentional, you can remove them";
+
+/// `count` codepoints, as `this comment contains ..` and `this literal contains ..` say it.
+fn invisible(count: usize) -> &'static str {
+    match count {
+        1 => "an invisible unicode text flow control codepoint",
+        _ => "invisible unicode text flow control codepoints",
+    }
+}
+
+/// A character as rustc's `{c:?}` writes it, without the quotes.
+fn escaped(c: char) -> String {
+    let debug = format!("{c:?}");
+    debug[1..debug.len() - 1].to_owned()
+}
+
+/// The lint rustc's lexer buffers for `lexed`, of `file` (whose text is `text`), at the crate
+/// root `krate`.
+fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: InFile<SyntaxNodePtr>) -> Emitted {
+    let span = |range: TextRange| cx.span_in_file(file, range);
+    let mut diag = match lexed {
+        Lexed::Comment { range, chars } => {
+            let at = span(range);
+            let mut diag = Diag::lint(
+                "text_direction_codepoint_in_comment",
+                "unicode codepoint changing visible direction of text present in comment",
+                at.clone(),
+            );
+            diag.note(TEXT_FLOW_NOTE);
+            diag.span_label(at, format!("this comment contains {}", invisible(chars.len())));
+            for &(c, range) in &chars {
+                diag.span_label(span(range), format!("{c:?}"));
+            }
+            let parts = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
+            diag.suggestion_with_style(parts, REMOVE_THEM, Applicability::MachineApplicable, SuggestionStyle::HideCodeAlways);
+            diag
+        }
+        Lexed::Literal { range, label, chars, inner, doc } => {
+            let at = span(range);
+            let mut diag = Diag::lint(
+                "text_direction_codepoint_in_literal",
+                format!("unicode codepoint changing visible direction of text present in {label}"),
+                at.clone(),
+            );
+            diag.note(TEXT_FLOW_NOTE);
+            diag.span_label(at, format!("this {label} contains {}", invisible(chars.len())));
+            if inner {
+                for &(c, range) in &chars {
+                    diag.span_label(span(range), format!("{c:?}"));
+                }
+            }
+            if inner && !chars.is_empty() {
+                let removed = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
+                diag.suggestion_with_style(
+                    removed,
+                    REMOVE_THEM,
+                    Applicability::MachineApplicable,
+                    SuggestionStyle::HideCodeAlways,
+                );
+                let escapes = chars.iter().map(|&(c, range)| (span(range), escaped(c))).collect();
+                diag.multipart_suggestion(
+                    "if you want to keep them but make them visible in your source code, you can escape them",
+                    escapes,
+                    Applicability::MachineApplicable,
+                );
+            } else {
+                let escaped: Vec<String> = chars.iter().map(|(c, _)| format!("{c:?}")).collect();
+                let escaped = escaped.join(", ");
+                diag.note(REMOVE_THEM);
+                match doc {
+                    true => diag.note(format!(
+                        "if you need to keep them and make them explicit in source, rewrite this doc comment as a `#[doc = \"...\"]` attribute and use Unicode escapes such as {escaped}"
+                    )),
+                    false => diag.note(format!(
+                        "if you want to keep them but make them visible in your source code, you can escape them: {escaped}"
+                    )),
+                };
+            }
+            diag
+        }
+        Lexed::UnknownPrefix { range } => {
+            let at = span(range);
+            let mut diag = Diag::lint(
+                "rust_2021_prefixes_incompatible_syntax",
+                format!("prefix `{}` is unknown", &text[range]),
+                at.clone(),
+            );
+            diag.span_label(at, "unknown prefix");
+            diag.suggestion(
+                span(TextRange::empty(range.end())),
+                "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
+                " ",
+                Applicability::MachineApplicable,
+            );
+            diag
+        }
+        Lexed::RawPrefix { range } => {
+            let at = span(range);
+            let mut diag = Diag::lint("rust_2021_prefixes_incompatible_syntax", "prefix `'r` is reserved", at.clone());
+            diag.span_label(at, "reserved prefix");
+            diag.suggestion(
+                span(TextRange::empty(range.end())),
+                "insert whitespace here to avoid this being parsed as a prefix in Rust 2021",
+                " ",
+                Applicability::MachineApplicable,
+            );
+            diag
+        }
+        Lexed::Guarded { range, string, space } => {
+            let (message, help) = match string {
+                true => (
+                    "will be parsed as a guarded string in Rust 2024",
+                    "insert whitespace here to avoid this being parsed as a guarded string in Rust 2024",
+                ),
+                false => (
+                    "reserved token in Rust 2024",
+                    "insert whitespace here to avoid this being parsed as a forbidden token in Rust 2024",
+                ),
+            };
+            let mut diag = Diag::lint("rust_2024_guarded_string_incompatible_syntax", message, span(range));
+            diag.suggestion(span(TextRange::empty(space)), help, " ", Applicability::MachineApplicable);
+            diag
+        }
+    };
+    source_fact(cx, &mut diag, krate);
+    Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate)
+}
+
+#[cfg(test)]
+mod tests {
+    use syntax::TextSize;
+
+    use super::*;
+
+    #[test]
+    fn codepoints_are_escaped_as_rust_writes_them() {
+        assert_eq!(escaped('\u{202e}'), "\\u{202e}");
+        assert_eq!(format!("{:?}", '\u{2066}'), "'\\u{2066}'");
+        assert_eq!(invisible(1), "an invisible unicode text flow control codepoint");
+        assert_eq!(invisible(4), "invisible unicode text flow control codepoints");
+    }
+
+    #[test]
+    fn an_empty_range_is_where_whitespace_goes() {
+        let range = TextRange::new(TextSize::from(3), TextSize::from(5));
+        assert_eq!(TextRange::empty(range.end()), TextRange::new(TextSize::from(5), TextSize::from(5)));
+    }
+}

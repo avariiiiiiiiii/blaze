@@ -2,6 +2,10 @@
 //! the API (the CLI, a CI log) prints. Diagnostics as rustc writes them, with the facts they
 //! read; tests as libtest writes them. JSON for programs is [`blaze_api::json`]'s, but for the
 //! forms lane proof's harness reads: [`work_json`], [`codegen_inputs_json`] and [`trace_cbor`].
+//!
+//! Every line is written into the one `String` it ends in, with no `String` of its own.
+
+use std::fmt;
 
 use blaze_api::{
     Diagnostic, FetchVerb, Level, LinkKind, Ranked, Response, TestOutcome, TestResult, Traced,
@@ -12,7 +16,7 @@ use blaze_query::QueryKey;
 use blaze_v2_proof::TraceBuilder;
 use blaze_vfs::ChangeKind;
 
-use crate::{CYAN, DIM, GREEN, RED, YELLOW, paint};
+use crate::{CYAN, DIM, GREEN, Painted, RED, YELLOW};
 
 /// The most bytes of a test's or a run's output shown.
 const OUTPUT: usize = 64 << 10;
@@ -21,30 +25,27 @@ const OUTPUT: usize = 64 << 10;
 /// to a person (a request's successful end).
 pub fn lines(response: &Response, color: bool) -> String {
     let mut out = String::new();
-    write(&mut out, response, color);
+    lines_into(&mut out, response, color);
     out
 }
 
-fn write(out: &mut String, response: &Response, color: bool) {
+/// [`lines`], written at the end of `out`.
+pub fn lines_into(out: &mut String, response: &Response, color: bool) {
+    let paint = |code, text| Painted(code, text, color);
+    // A status word as cargo writes it: right-aligned in 12 columns.
+    let status = |word: &'static str| Painted(GREEN, Status(word), color);
     match response {
         Response::Committed { root, rebased } => {
             let rebased = if *rebased { " (rebased onto the head)" } else { "" };
-            line(out, format!("{} {root}{rebased}", paint(GREEN, "committed", color)));
+            put!(out, "{} {root}{rebased}\n", paint(GREEN, "committed"));
         }
         Response::Diagnostic(diagnostic) => diagnostic_lines(out, diagnostic, 0, color),
         Response::Built { artifacts, profile, .. } => {
-            for artifact in artifacts {
-                let word = paint(GREEN, &format!("{:>12}", "Built"), color);
-                line(
-                    out,
-                    format!(
-                        "{word} {} {} at {} ({})",
-                        artifact.package, artifact.kind, artifact.path, artifact.content
-                    ),
-                );
+            for it in artifacts {
+                let (package, kind, path, content) = (&it.package, &it.kind, &it.path, &it.content);
+                put!(out, "{} {package} {kind} at {path} ({content})\n", status("Built"));
             }
-            let word = paint(GREEN, &format!("{:>12}", "Finished"), color);
-            line(out, format!("{word} {profile}"));
+            put!(out, "{} {profile}\n", status("Finished"));
         }
         Response::Unit(unit) => {
             let verb = match unit.verb {
@@ -52,17 +53,18 @@ fn write(out: &mut String, response: &Response, color: bool) {
                 Verb::Checking => "Checking",
                 Verb::Fresh => "Fresh",
             };
-            let word = paint(GREEN, &format!("{verb:>12}"), color);
-            let source = unit.source.as_deref().map(|it| format!(" {it}")).unwrap_or_default();
-            line(out, format!("{word} {} v{}{source}", unit.name, unit.version));
+            put!(out, "{} {} v{}", status(verb), unit.name, unit.version);
+            if let Some(source) = &unit.source {
+                put!(out, " {source}");
+            }
+            out.push('\n');
         }
         Response::Fetched { verb, what } => {
             let verb = match verb {
                 FetchVerb::Updating => "Updating",
                 FetchVerb::Downloaded => "Downloaded",
             };
-            let word = paint(GREEN, &format!("{verb:>12}"), color);
-            line(out, format!("{word} {what}"));
+            put!(out, "{} {what}\n", status(verb));
         }
         Response::BuildScript(_) | Response::UnitEnded(_) => {}
         Response::Work(worked) => {
@@ -70,36 +72,34 @@ fn write(out: &mut String, response: &Response, color: bool) {
                 LinkKind::Patched => "patched in place",
                 LinkKind::Placed => "placed whole",
             };
-            line(
+            put!(
                 out,
-                format!(
-                    "{} {} queries ran, {} green; {} functions compiled, {} found; {link}; \
-                     critical path {} us",
-                    paint(DIM, "work:", color),
-                    worked.reran,
-                    worked.green,
-                    worked.compiled,
-                    worked.found,
-                    worked.critical_path_us
-                ),
+                "{} {} queries ran, {} green; {} functions compiled, {} found; {link}; \
+                 critical path {} us\n",
+                paint(DIM, "work:"),
+                worked.reran,
+                worked.green,
+                worked.compiled,
+                worked.found,
+                worked.critical_path_us
             );
         }
         Response::CodegenInputs(inputs) => {
             for (instance, code) in inputs {
-                line(out, format!("{instance:x} {code:x}"));
+                put!(out, "{instance:x} {code:x}\n");
             }
         }
         Response::Trace(traced) => {
             for result in traced {
                 let ran = if result.ran { "ran" } else { "kept" };
                 let (edges, fingerprint) = (result.edges.len(), result.fingerprint);
-                line(out, format!("{} {ran}, {edges} edges, {fingerprint:?}", key(&result.key)));
+                put!(out, "{} {ran}, {edges} edges, {fingerprint:?}\n", Key(&result.key));
             }
         }
         Response::Tables(tables) => {
             for table in tables {
                 let (name, elements, bytes) = (&table.name, table.elements, table.bytes);
-                line(out, format!("{name}: {elements} elements, {bytes} bytes"));
+                put!(out, "{name}: {elements} elements, {bytes} bytes\n");
             }
         }
         Response::TestResult(result) => test_lines(out, result, color),
@@ -108,89 +108,80 @@ fn write(out: &mut String, response: &Response, color: bool) {
             bytes(out, stderr);
             match code {
                 Some(0) => {}
-                Some(code) => {
-                    line(out, format!("{} exited with {code}", paint(RED, "error", color)));
-                }
-                None => line(out, format!("{} ended by a signal", paint(RED, "error", color))),
+                Some(code) => put!(out, "{} exited with {code}\n", paint(RED, "error")),
+                None => put!(out, "{} ended by a signal\n", paint(RED, "error")),
             }
         }
         Response::Diff { changes } => {
             for change in changes {
                 let mark = match change.kind {
-                    ChangeKind::Added => paint(GREEN, "A", color),
-                    ChangeKind::Removed => paint(RED, "D", color),
-                    ChangeKind::Modified => paint(YELLOW, "M", color),
+                    ChangeKind::Added => paint(GREEN, "A"),
+                    ChangeKind::Removed => paint(RED, "D"),
+                    ChangeKind::Modified => paint(YELLOW, "M"),
                 };
-                line(out, format!("{mark} {}", change.path));
+                put!(out, "{mark} {}\n", change.path);
             }
         }
         Response::Why(why) => {
-            line(out, format!("{} reran because:", key(&why.query)));
+            put!(out, "{} reran because:\n", Key(&why.query));
             for changed in &why.chain {
-                line(
-                    out,
-                    format!(
-                        "  {} changed ({:?} -> {:?})",
-                        key(&changed.key),
-                        changed.was,
-                        changed.now
-                    ),
-                );
+                let (was, now) = (&changed.was, &changed.now);
+                put!(out, "  {} changed ({was:?} -> {now:?})\n", Key(&changed.key));
             }
             if let Some(input) = &why.input {
-                line(out, format!("  from the input {input:?}"));
+                put!(out, "  from the input {input:?}\n");
             }
         }
         Response::Status(status) => {
             let requests = status.requests.len();
-            line(
+            put!(
                 out,
-                format!(
-                    "{requests} {} under way, {} {} open, {} of {} bytes of memory",
-                    if requests == 1 { "request" } else { "requests" },
-                    status.views,
-                    if status.views == 1 { "view" } else { "views" },
-                    status.memory_bytes,
-                    status.budget_bytes
-                ),
+                "{requests} {} under way, {} {} open, {} of {} bytes of memory\n",
+                if requests == 1 { "request" } else { "requests" },
+                status.views,
+                if status.views == 1 { "view" } else { "views" },
+                status.memory_bytes,
+                status.budget_bytes
             );
         }
         Response::Done { ok: true } => {}
-        Response::Done { ok: false } => line(out, paint(RED, "failed", color)),
+        Response::Done { ok: false } => put!(out, "{}\n", paint(RED, "failed")),
         Response::Error(error) => {
-            let at = error.at.as_deref().map(|at| format!(" (at {at})")).unwrap_or_default();
-            line(out, format!("{}: {}{at}", paint(RED, "error", color), error.what));
+            put!(out, "{}: {}", paint(RED, "error"), error.what);
+            if let Some(at) = &error.at {
+                put!(out, " (at {at})");
+            }
+            out.push('\n');
         }
-        Response::Opened { root } => line(out, format!("{} {root}", paint(GREEN, "opened", color))),
+        Response::Opened { root } => put!(out, "{} {root}\n", paint(GREEN, "opened")),
         Response::Reached(reach) => {
-            line(
+            put!(
                 out,
-                format!(
-                    "{} files changed; {} items, {} functions to compile, {} tests reached",
-                    reach.changes.len(),
-                    reach.items.len(),
-                    reach.compiled.len(),
-                    reach.tests.len()
-                ),
+                "{} files changed; {} items, {} functions to compile, {} tests reached\n",
+                reach.changes.len(),
+                reach.items.len(),
+                reach.compiled.len(),
+                reach.tests.len()
             );
             for item in &reach.items {
-                line(out, format!("  {}", item.path));
+                put!(out, "  {}\n", item.path);
                 for fact in &item.facts {
-                    line(out, format!("    {} {}", paint(DIM, "changed:", color), fact.what));
+                    put!(out, "    {} {}\n", paint(DIM, "changed:"), fact.what);
                 }
             }
             for function in &reach.compiled {
-                line(out, format!("  {} {function}", paint(CYAN, "compile", color)));
+                put!(out, "  {} {function}\n", paint(CYAN, "compile"));
             }
             for test in &reach.tests {
-                line(out, format!("  {} {test}", paint(CYAN, "test", color)));
+                put!(out, "  {} {test}\n", paint(CYAN, "test"));
             }
         }
         Response::Of { candidate, response } => {
-            let mut inner = String::new();
-            write(&mut inner, response, color);
+            let from = out.len();
+            lines_into(out, response, color);
+            let inner = out.split_off(from);
             for said in inner.lines() {
-                line(out, format!("[{candidate}] {said}"));
+                put!(out, "[{candidate}] {said}\n");
             }
         }
         Response::Ranked(ranked) => {
@@ -199,42 +190,35 @@ fn write(out: &mut String, response: &Response, color: bool) {
             }
         }
         Response::Verified { mismatches } if mismatches.is_empty() => {
-            let word = paint(GREEN, "verified", color);
-            line(out, format!("{word} every result matched a build from nothing"));
+            put!(out, "{} every result matched a build from nothing\n", paint(GREEN, "verified"));
         }
         Response::Verified { mismatches } => {
-            line(
-                out,
-                format!(
-                    "{}: {} results differ from a build from nothing",
-                    paint(RED, "error", color),
-                    mismatches.len()
-                ),
-            );
+            let (error, count) = (paint(RED, "error"), mismatches.len());
+            put!(out, "{error}: {count} results differ from a build from nothing\n");
             for mismatch in mismatches {
-                let fact = mismatch
-                    .fact
-                    .as_ref()
-                    .map(|fact| format!(", the fact that missed: {}", fact.what))
-                    .unwrap_or_default();
-                line(
-                    out,
-                    format!(
-                        "  {}: {:?} kept, {:?} from nothing{fact}",
-                        key(&mismatch.query),
-                        mismatch.incremental,
-                        mismatch.scratch
-                    ),
-                );
+                let (kept, scratch) = (&mismatch.incremental, &mismatch.scratch);
+                put!(out, "  {}: {kept:?} kept, {scratch:?} from nothing", Key(&mismatch.query));
+                if let Some(fact) = &mismatch.fact {
+                    put!(out, ", the fact that missed: {}", fact.what);
+                }
+                out.push('\n');
             }
         }
         Response::Snapshotted { heads } => {
-            let word = paint(GREEN, "snapshotted", color);
-            line(out, format!("{word} {} heads durable", heads.len()));
+            put!(out, "{} {} heads durable\n", paint(GREEN, "snapshotted"), heads.len());
             for (head, root) in heads {
-                line(out, format!("  {head} {root}"));
+                put!(out, "  {head} {root}\n");
             }
         }
+    }
+}
+
+/// A word right-aligned in 12 columns, as cargo's status lines start.
+struct Status(&'static str);
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:>12}", self.0)
     }
 }
 
@@ -254,21 +238,27 @@ fn diagnostic_lines(out: &mut String, diagnostic: &Diagnostic, depth: usize, col
         Level::Note => ("note", GREEN),
         Level::Help => ("help", CYAN),
         Level::FailureNote => {
-            line(out, diagnostic.message.clone());
+            out.push_str(&diagnostic.message);
+            out.push('\n');
             return;
         }
     };
-    let code = diagnostic.code.as_deref().map(|code| format!("[{code}]")).unwrap_or_default();
-    if depth == 0 {
-        let word = paint(color_of, &format!("{word}{code}"), color);
-        line(out, format!("{word}: {}", diagnostic.message));
-    } else {
-        line(out, format!("   = {}: {}", paint(color_of, word, color), diagnostic.message));
+    let message = &diagnostic.message;
+    match (depth, &diagnostic.code) {
+        (0, Some(code)) => {
+            let word = Painted(color_of, format_args!("{word}[{code}]"), color);
+            put!(out, "{word}: {message}\n");
+        }
+        (0, None) => put!(out, "{}: {message}\n", Painted(color_of, word, color)),
+        _ => put!(out, "   = {}: {message}\n", Painted(color_of, word, color)),
     }
     for span in &diagnostic.spans {
-        let label = span.label.as_deref().map(|label| format!(": {label}")).unwrap_or_default();
-        let arrow = paint(CYAN, "-->", color);
-        line(out, format!("  {arrow} {}:{}:{}{label}", span.file, span.line, span.column));
+        let arrow = Painted(CYAN, "-->", color);
+        put!(out, "  {arrow} {}:{}:{}", span.file, span.line, span.column);
+        if let Some(label) = &span.label {
+            put!(out, ": {label}");
+        }
+        out.push('\n');
     }
     for child in &diagnostic.children {
         diagnostic_lines(out, child, depth + 1, color);
@@ -278,42 +268,49 @@ fn diagnostic_lines(out: &mut String, diagnostic: &Diagnostic, depth: usize, col
 
 fn facts_lines(out: &mut String, diagnostic: &Diagnostic, color: bool) {
     for fact in &diagnostic.facts {
-        line(out, format!("   = {} {}", paint(DIM, "read:", color), fact.what));
+        put!(out, "   = {} {}\n", Painted(DIM, "read:", color), fact.what);
     }
 }
 
 fn test_lines(out: &mut String, result: &TestResult, color: bool) {
-    let verdict = match result.outcome {
-        TestOutcome::Passed => paint(GREEN, "ok", color),
-        TestOutcome::Failed => paint(RED, "FAILED", color),
-        TestOutcome::Ignored => paint(YELLOW, "ignored", color),
-        TestOutcome::Unreached => paint(DIM, "unreached", color),
+    let (code, verdict) = match result.outcome {
+        TestOutcome::Passed => (GREEN, "ok"),
+        TestOutcome::Failed => (RED, "FAILED"),
+        TestOutcome::Ignored => (YELLOW, "ignored"),
+        TestOutcome::Unreached => (DIM, "unreached"),
     };
-    line(out, format!("test {} ... {verdict} ({} ms)", result.name, result.millis));
+    let verdict = Painted(code, verdict, color);
+    put!(out, "test {} ... {verdict} ({} ms)\n", result.name, result.millis);
     if result.outcome == TestOutcome::Failed {
         bytes(out, &result.output);
     }
 }
 
 fn ranked_line(out: &mut String, place: usize, ranked: &Ranked, color: bool) {
-    let verdict = if ranked.ok { paint(GREEN, "ok", color) } else { paint(RED, "failed", color) };
-    line(
+    let verdict = match ranked.ok {
+        true => Painted(GREEN, "ok", color),
+        false => Painted(RED, "failed", color),
+    };
+    put!(
         out,
-        format!(
-            "{}. candidate {} ({}): {verdict}, {} errors, {} warnings, {} passed, {} failed",
-            place + 1,
-            ranked.candidate,
-            ranked.root,
-            ranked.errors,
-            ranked.warnings,
-            ranked.passed,
-            ranked.failed
-        ),
+        "{}. candidate {} ({}): {verdict}, {} errors, {} warnings, {} passed, {} failed\n",
+        place + 1,
+        ranked.candidate,
+        ranked.root,
+        ranked.errors,
+        ranked.warnings,
+        ranked.passed,
+        ranked.failed
     );
 }
 
-fn key(key: &QueryKey) -> String {
-    format!("query {:#06x}:{}", key.kind.0, key.input)
+/// A query as the lines name it: `query 0x1000:<input>`.
+struct Key<'a>(&'a QueryKey);
+
+impl fmt::Display for Key<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "query {:#06x}:{}", self.0.kind.0, self.0.input)
+    }
 }
 
 /// What a request did, as the CLI prints it under `--message-format=json`: one line, newline
@@ -333,9 +330,15 @@ pub fn work_json(worked: &Worked) -> String {
 /// `blaze codegen-inputs --format=json`: one object from each instance key's hex to its code
 /// hash's hex, in the response's order (sorted by key), newline ended.
 pub fn codegen_inputs_json(inputs: &[(ContentId, ContentId)]) -> String {
-    let pairs: Vec<String> =
-        inputs.iter().map(|(instance, code)| format!("\"{instance:x}\": \"{code:x}\"")).collect();
-    format!("{{{}}}\n", pairs.join(", "))
+    // `"<64 hex>": "<64 hex>", ` is 136 bytes a pair.
+    let mut out = String::with_capacity(3 + inputs.len() * 136);
+    out.push('{');
+    for (at, (instance, code)) in inputs.iter().enumerate() {
+        let comma = if at > 0 { ", " } else { "" };
+        put!(&mut out, "{comma}\"{instance:x}\": \"{code:x}\"");
+    }
+    out.push_str("}\n");
+    out
 }
 
 /// `blaze trace --out PATH`: the deterministic CBOR of the [`blaze_v2_proof::Trace`] the
@@ -353,16 +356,12 @@ fn bytes(out: &mut String, bytes: &[u8]) {
     let start = bytes.len().saturating_sub(OUTPUT);
     let text = String::from_utf8_lossy(&bytes[start..]);
     if start > 0 {
-        line(out, format!("({start} bytes cut)"));
+        put!(out, "({start} bytes cut)\n");
     }
     for said in text.lines() {
-        line(out, said.to_owned());
+        out.push_str(said);
+        out.push('\n');
     }
-}
-
-fn line(out: &mut String, text: String) {
-    out.push_str(&text);
-    out.push('\n');
 }
 
 #[cfg(test)]
@@ -378,9 +377,8 @@ mod tests {
         FactRead { key, what: what.to_owned() }
     }
 
-    #[test]
-    fn a_diagnostic_reads_as_rustc_writes_it_with_its_facts() {
-        let diagnostic = Diagnostic {
+    fn diagnostic() -> Diagnostic {
+        Diagnostic {
             level: Level::Error,
             code: Some("E0308".to_owned()),
             message: "mismatched types".to_owned(),
@@ -410,14 +408,36 @@ mod tests {
             facts: vec![fact("the signature of `main::parse`")],
             rendered: String::new(),
             unit: None,
-        };
+        }
+    }
+
+    #[test]
+    fn a_diagnostic_reads_as_rustc_writes_it_with_its_facts() {
         assert_eq!(
-            lines(&Response::Diagnostic(diagnostic), false),
+            lines(&Response::Diagnostic(diagnostic()), false),
             "error[E0308]: mismatched types\n\
              \x20 --> src/main.rs:3:17: expected `u32`, found `&str`\n\
              \x20  = note: expected due to this\n\
              \x20  = read: the signature of `main::parse`\n"
         );
+    }
+
+    /// In color, each word is painted as `paint` painted it: the code, the word, the reset.
+    #[test]
+    fn a_diagnostic_in_color_paints_its_words() {
+        let (red, green, cyan, dim) = (RED, GREEN, CYAN, DIM);
+        let reset = crate::RESET;
+        assert_eq!(
+            lines(&Response::Diagnostic(diagnostic()), true),
+            format!(
+                "{red}error[E0308]{reset}: mismatched types\n\
+                 \x20 {cyan}-->{reset} src/main.rs:3:17: expected `u32`, found `&str`\n\
+                 \x20  = {green}note{reset}: expected due to this\n\
+                 \x20  = {dim}read:{reset} the signature of `main::parse`\n"
+            )
+        );
+        let failed = Response::Done { ok: false };
+        assert_eq!(lines(&failed, true), format!("{red}failed{reset}\n"));
     }
 
     #[test]
@@ -449,6 +469,11 @@ mod tests {
         assert_eq!(value[format!("{:x}", ContentId([3; 32]))], format!("{:x}", ContentId([4; 32])));
         assert_eq!(value.as_object().unwrap().len(), 2);
         assert_eq!(codegen_inputs_json(&[]), "{}\n");
+        let pairs: Vec<String> = inputs
+            .iter()
+            .map(|(instance, code)| format!("\"{instance:x}\": \"{code:x}\""))
+            .collect();
+        assert_eq!(text, format!("{{{}}}\n", pairs.join(", ")));
     }
 
     #[test]
@@ -519,6 +544,10 @@ mod tests {
         let inner = Response::Error(ApiError::new("no such file", Some("src/a.rs".to_owned())));
         let of = Response::Of { candidate: 2, response: Box::new(inner) };
         assert_eq!(lines(&of, false), "[2] error: no such file (at src/a.rs)\n");
+        // After what `out` had, which stays as it was.
+        let mut out = "before\n".to_owned();
+        lines_into(&mut out, &of, false);
+        assert_eq!(out, "before\n[2] error: no such file (at src/a.rs)\n");
     }
 
     #[test]

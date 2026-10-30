@@ -123,6 +123,17 @@ Proposed, not applied (in `v2/requests/usercode-sandbox.md`, section 6):
 - Running the launcher inside the daemon, so a run costs one `CreateProcessW` instead of two.
   That needs the lead and the driver.
 
+## Unsafe
+
+These paths follow [unsafe.md](../../design/unsafe.md):
+
+- `blaze-build-script` forbids `unsafe_code`.
+- The fork server and the Windows sandbox use unsafe only to reach the kernel. Each is a module
+  with a safe API (`serve`; `run` and `probe`).
+- Every block in them is one operation with a `// SAFETY:` comment.
+- None of the speed changes above added `unsafe`. The SIMD is the `memchr` crate's, and each
+  use is checked against a scalar model in tests.
+
 ## Left as it is
 
 - `Env` stays a `BTreeMap` of about 100 variables per run: `blaze-usercode` relies on its

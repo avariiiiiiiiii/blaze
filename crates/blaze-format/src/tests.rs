@@ -4,8 +4,37 @@ use blaze_ids::ContentId;
 
 use crate::{
     Aligned, FormatError, HEADER_LEN, Persist, Record, Rel, Slice, SpanRef, Spans, Str, Writer,
-    header, open, open_as, record, schema, to_bytes,
+    buffer_id, header, open, open_as, open_verified, read_verified, record, schema, to_bytes,
 };
+
+#[test]
+fn a_verified_open_reads_only_the_buffer_its_key_names() {
+    let buffer = Aligned::copy_from(&written(1));
+    let key = buffer_id(&buffer);
+    assert_eq!(key, ContentId::of(crate::BUFFER_DOMAIN, &buffer));
+    let root = open_verified::<Root>(&buffer, Root::SCHEMA, key).unwrap();
+    assert_eq!(root.numbers.get(&buffer), &[1, 2, 3]);
+
+    let mut changed = written(1);
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    let changed = Aligned::copy_from(&changed);
+    assert_eq!(
+        open_verified::<Root>(&changed, Root::SCHEMA, key).err(),
+        Some(FormatError::Hash { found: buffer_id(&changed), wanted: key })
+    );
+    assert!(matches!(
+        open_verified::<Root>(&buffer, Leaf::SCHEMA, key),
+        Err(FormatError::Schema { .. })
+    ));
+
+    let mut spans = Spans::new(ContentId::of("blaze v2 test 1", b"fn main"));
+    spans.push(3, 4);
+    let bytes = Aligned::copy_from(&to_bytes(&spans));
+    let read = read_verified::<Spans>(&bytes, buffer_id(&bytes)).unwrap();
+    assert_eq!(read.to_spans(), spans);
+    assert!(matches!(read_verified::<Spans>(&bytes, key), Err(FormatError::Hash { .. })));
+}
 
 record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]

@@ -127,6 +127,8 @@ Why: docs/v2/plan/process/decisions.md (10-29: "The database is `Sync` and share
 no per-thread handles; all parallel work is plane tasks"); a write no longer waits for every
 handle to drop, and no handle per thread is made or kept.
 
+> forwarded to db: `vendor/salsa` and `base-db` are lane db's; hir-ide's `TestDB` (mine) follows whatever db lands.
+
 ## Set salsa's task depth to the plane's (lane db, base-db; cargo daemon)
 
 What: before the first query, call `salsa::set_task_depth(blaze_graph::pump::depth)` once per
@@ -142,6 +144,8 @@ query waiting below it, and its claims would look like the waiting query's own (
 With it, the pumped job has its own query stack, and asking a key the task below holds unwinds at
 once with `salsa::Cancelled::WouldWaitOnItself` instead of deadlocking.
 
+> forwarded to db: lane db's paths.
+
 ## Repost a task that unwinds with `Cancelled::WouldWaitOnItself` (lane db, base-db `run_all`; core-pool)
 
 What: a `run_all` task, or any pool job, that unwinds with
@@ -153,6 +157,8 @@ another worker. Today the first panic of a task is resumed by `run_all`, which w
 whole batch's caller.
 Why: the plane's rule for a wait that can't be served (crates/blaze-graph/src/pump.rs: "gives way
 at once ... and is posted again"); salsa now gives way the same way.
+
+> forwarded to db: lane db's paths (`base-db` `run_all`).
 
 # From speed-salsa (to db-salsa, the owner of `vendor/salsa*`)
 
@@ -251,6 +257,8 @@ differential test: over seeded read sequences across revisions, the number of va
 after each `new_revision` is `min(cap, values)`, and every kept value was verified no earlier
 than every evicted one.
 
+> forwarded to db: `vendor/salsa` is lane db's.
+
 ## S2. Interning: no lock on a hit (`interned.rs`)
 
 What is slow: `intern_id` locks a shard `Mutex` for every call, hit or miss (`interned.rs:437`),
@@ -317,12 +325,16 @@ reusable, checks that both give the same IDs and generations. A test that 8
 sweeps the same shard: either the reader's ID is current and its fields are the ones it
 interned, or the reader got a new ID; never a reused slot under an old ID.
 
+> forwarded to db: `vendor/salsa` is lane db's.
+
 ## S2a. Existing unsafe against `unsafe.md` (note for you and the safety lane)
 
 salsa has 270 `unsafe {` blocks, and three files opt out of `clippy::undocumented_unsafe_blocks`:
 `tracked_struct.rs:1` and `salsa_value.rs:1` (whole file), and `function/delete.rs:13`, `:15`
 (TODO #697). unsafe.md's Done-when requires a `// SAFETY:` on every block in v2's crates. When
 you next touch these files, write the comments and drop the `allow`s. S1 and S4 add no unsafe.
+
+> forwarded to db: `vendor/salsa` is lane db's.
 
 ## S3. Claims: shard count (`function/sync.rs:75`)
 
@@ -331,6 +343,8 @@ for at least 4 times the core count. Change to `(max_parallelism() * 4).next_pow
 `interned::new_shards` does. Every execute and every deep verify of a memo from an older
 revision takes a claim, so on a warm build after an edit, each verified memo locks a shard. If
 your `Sync` rewrite replaces `SyncTable`, apply this to its replacement.
+
+> forwarded to db: `vendor/salsa` is lane db's.
 
 ## S4. Recording a read: skip the hash for a repeated edge (`active_query.rs:144`)
 
@@ -351,6 +365,8 @@ calling one query on one key, and an accessor that reads one memo many times. Do
 `add_read_simple` (`:173`) and `add_output` (`:194`). Test: one unit test that a frame that
 reads `a, a, b, a` records edges `[a, b]` with the same positions and fingerprints as before.
 
+> forwarded to db: `vendor/salsa` is lane db's.
+
 ## S5. Not filed, for the salsa owner after `Sync` lands: memos and edges as columns
 
 The memo budget (data.md: 24 bytes plus 4 per edge) and #734's edges need the memo layer
@@ -361,3 +377,5 @@ second allocation, plus 8 per sibling function in the slot's memo table. What it
 in `docs/v2/plan/lanes/db/speed-salsa.md`, "What it would take to meet the memo budget". It
 rewrites `zalsa_local.rs`, `function/*`, `table/memo.rs` and every ingredient, so it waits for
 your current part.
+
+> forwarded to db: a plan for the salsa owner.

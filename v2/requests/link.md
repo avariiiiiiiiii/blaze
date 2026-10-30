@@ -220,6 +220,8 @@ section bytes copied once, into the output, instead of three times. Until this i
 readers keep the current types; the reader-side edits are mechanical and listed in
 `/tmp/blaze-lanes/v2-speed-link-edge-macho.md`.
 
+> forwarded to link: `crates/blaze-link/` is lane link's.
+
 ## 6. From speed-link-edge-macho: a writer may encode pointer slots (Mach-O chained fixups)
 
 Status: open, a proposal. For lead `link`.
@@ -240,6 +242,8 @@ deployment targets of macOS 12 and later (`Output::platform.minimum >= 0x000c_00
 Why: chains are built in one pass per page as slots are placed (no sort when the slots are
 already in address order), cost dyld nothing until a page is touched, and a relink rewrites only
 the slots whose target or neighbour changed instead of re-encoding every opcode.
+
+> forwarded to link: `crates/blaze-link/` is lane link's.
 
 ## 7. From speed-link-edge-elf: what the ELF writer's speed needs from the core
 
@@ -287,6 +291,8 @@ Status: open. For lead `link` (window `link-next1`). Notes:
    before `[]`) and `object`'s checked parsers, and holds no `unsafe`
    (`elf.rs` is `#![forbid(unsafe_code)]`).
 
+> forwarded to link: `crates/blaze-link/` is lane link's.
+
 ### 5a. Follow-up to item 5 (from speed-link-edge-macho-input, via speed-link-edge-macho)
 
 With the `names` arena of item 5, three more per-atom allocations go: `Section::name` becomes
@@ -317,6 +323,8 @@ Used by: `blaze-link/src/model.rs` (`Symbol::import`, `Import::wasm`), `state.rs
 (`wasm_imports`), `stage.rs` (`Code::decode` of each wasm function, `Static::imports`),
 `native.rs` (an undefined function with an import becomes one: rustc's `--allow-undefined`).
 
+> forwarded to codegen: `crates/blaze-codegen` is lane codegen's.
+
 ## 9. Coordinator and codegen: `Change::slots` for an edited function
 
 Status: open. For whoever builds a `blaze_link::Change` from codegen's output.
@@ -328,6 +336,8 @@ pairs. Without it the edit links (the new function gets a slot of its own) but c
 calling the old code, or the link fails naming a caller of the removed function. See
 `docs/v2/plan/lanes/link/notes.md`, "The jump table".
 
+> forwarded to codegen: whoever builds the `Change` from codegen's output is codegen's live path. > forwarded to coordinator: the integration side, listed in the requests report.
+
 ## Answers to items 5-7 (lead `link`, 2026-10-29)
 
 - 5 (zero-copy `Data::Input`, `Name` arenas): accepted, not applied. It changes the type every
@@ -338,3 +348,5 @@ calling the old code, or the link fails naming a caller of the removed function.
 - 7.1, 7.2: as 5. 7.3 applied: new natives are read in parallel (`native.rs` `inputs`); members
   are still pulled one round at a time. 7.4 applied: both facts are in `model.rs` (`Placed`,
   `Writer::file`). 7.5: not applied (a proposal). 7.6 applied: `blaze_link::fuzz_read`.
+
+> applied: noted; 5 to 7 are lane link's own.

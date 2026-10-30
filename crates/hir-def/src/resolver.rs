@@ -10,9 +10,9 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use itertools::Itertools as _;
 use rustc_hash::FxHashSet;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use span::SyntaxContext;
-use syntax::ast::HasName;
+use syntax::{SyntaxKind, ast::HasName};
 
 use crate::{
     AdtId, AstIdLoc, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId,
@@ -40,6 +40,10 @@ use crate::{
     visibility::{RawVisibility, Visibility},
 };
 
+/// A stack of [`Scope`]s over the scope of a module. A body walk keeps one: entering an
+/// expression pushes its scopes onto the same `Vec` and leaving truncates it
+/// ([`Resolver::update_to_inner_scope`], [`Resolver::reset_to_guard`]), so a walk allocates
+/// only when the stack grows past its deepest point so far.
 #[derive(Debug, Clone)]
 pub struct Resolver<'db> {
     /// The stack of scopes, where the inner-most scope is the last item.
@@ -47,10 +51,13 @@ pub struct Resolver<'db> {
     /// When using, you generally want to process the scopes in reverse order,
     /// there's `scopes` *method* for that.
     scopes: Vec<Scope<'db>>,
+    /// The expression scopes that [`Scope::ExprScope`] and [`Scope::MacroDefScope`] index: one
+    /// per expression store the stack has held, so one in practice, kept inline.
+    expr_stores: SmallVec<[ExprStore<'db>; 1]>,
     module_scope: ModuleItemMap<'db>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct ModuleItemMap<'db> {
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
@@ -63,33 +70,61 @@ impl fmt::Debug for ModuleItemMap<'_> {
     }
 }
 
-#[derive(Clone)]
-struct ExprScope<'db> {
+/// The expression scopes of one store owner.
+#[derive(Clone, Copy)]
+struct ExprStore<'db> {
     owner: ExpressionStoreOwnerId,
-    expr_scopes: &'db ExprScopes,
-    scope_id: ScopeId,
+    scopes: &'db ExprScopes,
 }
 
-impl fmt::Debug for ExprScope<'_> {
+impl fmt::Debug for ExprStore<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExprScope")
-            .field("owner", &self.owner)
-            .field("scope_id", &self.scope_id)
-            .finish()
+        f.debug_struct("ExprStore").field("owner", &self.owner).finish()
     }
 }
 
-#[derive(Debug, Clone)]
+/// One scope of a [`Resolver`]: `Copy`, 24 bytes at most (16 where rustc puts the tag in a
+/// niche of `GenericDefId`), against 32 when it held a `MacroDefId` and an owner per scope.
+/// Pushing one is a copy; nothing in it is dropped.
+#[derive(Clone, Copy)]
 enum Scope<'db> {
-    /// All the items and imported names of a module
-    BlockScope(ModuleItemMap<'db>),
+    /// All the items and imported names of a module of a block's def map. Its local def map is
+    /// the crate's, the resolver's `module_scope.local_def_map`: a block is in the crate of the
+    /// item whose body it is in.
+    BlockScope { def_map: &'db DefMap, module_id: ModuleId },
     /// Brings the generic parameters of an item into scope as well as the `Self` type alias /
     /// generic for ADTs and impls.
     GenericParams { def: GenericDefId, params: &'db GenericParams },
-    /// Local bindings
-    ExprScope(ExprScope<'db>),
-    /// Macro definition inside bodies that affects all paths after it in the same block.
-    MacroDefScope(MacroDefId),
+    /// Local bindings: scope `scope_id` of `expr_stores[store]`.
+    ExprScope { store: u32, scope_id: ScopeId },
+    /// Macro definition inside bodies that affects all paths after it in the same block: the
+    /// macro of scope `scope_id` of `expr_stores[store]`.
+    MacroDefScope { store: u32, scope_id: ScopeId },
+}
+
+const _: () = assert!(size_of::<Scope<'static>>() <= 24);
+
+impl fmt::Debug for Scope<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scope::BlockScope { module_id, .. } => {
+                f.debug_struct("BlockScope").field("module_id", module_id).finish()
+            }
+            Scope::GenericParams { def, .. } => {
+                f.debug_struct("GenericParams").field("def", def).finish()
+            }
+            Scope::ExprScope { store, scope_id } => f
+                .debug_struct("ExprScope")
+                .field("store", store)
+                .field("scope_id", scope_id)
+                .finish(),
+            Scope::MacroDefScope { store, scope_id } => f
+                .debug_struct("MacroDefScope")
+                .field("store", store)
+                .field("scope_id", scope_id)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -235,9 +270,9 @@ impl<'db> Resolver<'db> {
 
         for scope in self.scopes() {
             match scope {
-                Scope::ExprScope(_) | Scope::MacroDefScope(_) => continue,
+                Scope::ExprScope { .. } | Scope::MacroDefScope { .. } => continue,
                 Scope::GenericParams { params, def } => {
-                    if let &GenericDefId::ImplId(impl_) = def {
+                    if let GenericDefId::ImplId(impl_) = def {
                         if *first_name == sym::Self_ {
                             return Some((
                                 TypeNs::SelfType(impl_),
@@ -247,7 +282,7 @@ impl<'db> Resolver<'db> {
                                 Visibility::Public,
                             ));
                         }
-                    } else if let &GenericDefId::AdtId(adt) = def
+                    } else if let GenericDefId::AdtId(adt) = def
                         && *first_name == sym::Self_
                     {
                         return Some((
@@ -258,7 +293,7 @@ impl<'db> Resolver<'db> {
                             Visibility::Public,
                         ));
                     }
-                    if let Some(id) = params.find_type_by_name(first_name, *def) {
+                    if let Some(id) = params.find_type_by_name(first_name, def) {
                         return Some((
                             TypeNs::GenericParam(id),
                             remaining_idx(),
@@ -268,7 +303,8 @@ impl<'db> Resolver<'db> {
                         ));
                     }
                 }
-                Scope::BlockScope(m) => {
+                Scope::BlockScope { def_map, module_id } => {
+                    let m = self.block_items(def_map, module_id);
                     if let Some(res) = m.resolve_path_in_type_ns(db, path) {
                         let res = match res.0 {
                             TypeNs::ModuleId(_) if res.1.is_none() => {
@@ -344,13 +380,12 @@ impl<'db> Resolver<'db> {
         self.resolve_path_in_value_ns_with_prefix_info(db, path, hygiene_id).map(|(it, _, _)| it)
     }
 
-    fn skip_to_mod<'this, T>(
-        &'this self,
-        mut f: impl FnMut(&'this ModuleItemMap<'db>) -> Option<T>,
-    ) -> Option<T> {
+    fn skip_to_mod<T>(&self, mut f: impl FnMut(&ModuleItemMap<'db>) -> Option<T>) -> Option<T> {
         self.scopes()
             .find_map(|scope| match scope {
-                Scope::BlockScope(it) => f(it),
+                Scope::BlockScope { def_map, module_id } => {
+                    f(&self.block_items(def_map, module_id))
+                }
                 _ => None,
             })
             .or_else(|| f(&self.module_scope))
@@ -425,15 +460,15 @@ impl<'db> Resolver<'db> {
         }
 
         if n_segments <= 1 {
-            let mut hygiene_info = hygiene_info(db, hygiene_id);
+            // Read at the first macro scope the walk meets, before `hygiene_id` changes there.
+            let mut macro_hygiene = None;
             for scope in self.scopes() {
                 match scope {
-                    Scope::ExprScope(scope) => {
+                    Scope::ExprScope { store, scope_id } => {
                         // A name a pattern binds twice means its last binding.
-                        let entry =
-                            scope.expr_scopes.entries(scope.scope_id).iter().rev().find(|entry| {
-                                entry.name() == first_name && entry.hygiene() == hygiene_id
-                            });
+                        let entry = self.expr_scopes(store).entries(scope_id).iter().rev().find(
+                            |entry| entry.name() == first_name && entry.hygiene() == hygiene_id,
+                        );
 
                         if let Some(e) = entry {
                             return Some((
@@ -443,11 +478,17 @@ impl<'db> Resolver<'db> {
                             ));
                         }
                     }
-                    Scope::MacroDefScope(macro_id) => {
-                        handle_macro_def_scope(db, &mut hygiene_id, &mut hygiene_info, macro_id)
+                    Scope::MacroDefScope { store, scope_id } => {
+                        let info = macro_hygiene.get_or_insert_with(|| hygiene_info(db, hygiene_id));
+                        handle_macro_def_scope(
+                            db,
+                            &mut hygiene_id,
+                            info,
+                            self.macro_def(store, scope_id),
+                        )
                     }
                     Scope::GenericParams { params, def } => {
-                        if let &GenericDefId::ImplId(impl_) = def
+                        if let GenericDefId::ImplId(impl_) = def
                             && *first_name == sym::Self_
                         {
                             return Some((
@@ -456,7 +497,7 @@ impl<'db> Resolver<'db> {
                                 Visibility::Public,
                             ));
                         }
-                        if let Some(id) = params.find_const_by_name(first_name, *def) {
+                        if let Some(id) = params.find_const_by_name(first_name, def) {
                             let val = ValueNs::GenericParam(id);
                             return Some((
                                 ResolveValueResult::ValueNs(val),
@@ -465,7 +506,8 @@ impl<'db> Resolver<'db> {
                             ));
                         }
                     }
-                    Scope::BlockScope(m) => {
+                    Scope::BlockScope { def_map, module_id } => {
+                        let m = self.block_items(def_map, module_id);
                         if let Some(def) = m.resolve_path_in_value_ns(db, path) {
                             return Some(def);
                         }
@@ -475,9 +517,9 @@ impl<'db> Resolver<'db> {
         } else {
             for scope in self.scopes() {
                 match scope {
-                    Scope::ExprScope(_) | Scope::MacroDefScope(_) => continue,
+                    Scope::ExprScope { .. } | Scope::MacroDefScope { .. } => continue,
                     Scope::GenericParams { params, def } => {
-                        if let &GenericDefId::ImplId(impl_) = def {
+                        if let GenericDefId::ImplId(impl_) = def {
                             if *first_name == sym::Self_ {
                                 return Some((
                                     ResolveValueResult::Partial(TypeNs::SelfType(impl_), 1),
@@ -485,7 +527,7 @@ impl<'db> Resolver<'db> {
                                     Visibility::Public,
                                 ));
                             }
-                        } else if let &GenericDefId::AdtId(adt) = def
+                        } else if let GenericDefId::AdtId(adt) = def
                             && *first_name == sym::Self_
                         {
                             let ty = TypeNs::AdtSelfType(adt);
@@ -495,7 +537,7 @@ impl<'db> Resolver<'db> {
                                 Visibility::Public,
                             ));
                         }
-                        if let Some(id) = params.find_type_by_name(first_name, *def) {
+                        if let Some(id) = params.find_type_by_name(first_name, def) {
                             let ty = TypeNs::GenericParam(id);
                             return Some((
                                 ResolveValueResult::Partial(ty, 1),
@@ -504,7 +546,8 @@ impl<'db> Resolver<'db> {
                             ));
                         }
                     }
-                    Scope::BlockScope(m) => {
+                    Scope::BlockScope { def_map, module_id } => {
+                        let m = self.block_items(def_map, module_id);
                         if let Some(def) = m.resolve_path_in_value_ns(db, path) {
                             return Some(def);
                         }
@@ -586,7 +629,7 @@ impl<'db> Resolver<'db> {
             LifetimeRef::Static => Some(LifetimeNs::Static),
             LifetimeRef::Named(name) => self.scopes().find_map(|scope| match scope {
                 Scope::GenericParams { def, params } => {
-                    params.find_lifetime_by_name(name, *def).map(LifetimeNs::LifetimeParam)
+                    params.find_lifetime_by_name(name, def).map(LifetimeNs::LifetimeParam)
                 }
                 _ => None,
             }),
@@ -642,7 +685,7 @@ impl<'db> Resolver<'db> {
     ) -> FxIndexMap<Name, SmallVec<[ScopeDef; 1]>> {
         let mut res = ScopeNames::default();
         for scope in self.scopes() {
-            scope.process_names(&mut res, db);
+            self.process_names(scope, &mut res, db);
         }
         let ModuleItemMap { def_map, module_id, local_def_map } = self.module_scope;
         // FIXME: should we provide `self` here?
@@ -712,16 +755,24 @@ impl<'db> Resolver<'db> {
     }
 
     pub fn traits_in_scope(&self, db: &dyn SourceDatabase) -> FxHashSet<TraitId> {
+        let mut traits = FxHashSet::default();
+        self.traits_in_scope_into(db, &mut traits);
+        traits
+    }
+
+    /// Adds the traits in scope to `traits`, for a caller that refills one set as it walks
+    /// (clear it first for exactly [`Self::traits_in_scope`]). The resolver's
+    /// [`Self::module`] names which traits these are: two positions of one walk with the same
+    /// module have the same traits in scope.
+    pub fn traits_in_scope_into(&self, db: &dyn SourceDatabase, traits: &mut FxHashSet<TraitId>) {
         // FIXME(trait_alias): Trait alias brings aliased traits in scope! Note that supertraits of
         // aliased traits are NOT brought in scope (unless also aliased).
-        let mut traits = FxHashSet::default();
-
         for scope in self.scopes() {
             match scope {
-                Scope::BlockScope(m) => {
-                    traits.extend(m.def_map.module(db, m.module_id).traits_in_scope(db))
+                Scope::BlockScope { def_map, module_id } => {
+                    traits.extend(def_map.module(db, module_id).traits_in_scope(db))
                 }
-                &Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
+                Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                     let impl_data = ImplSignature::of(db, impl_);
                     if let Some(target_trait) = impl_data.target_trait
                         && let Some(TypeNs::TraitId(trait_)) = self
@@ -743,7 +794,6 @@ impl<'db> Resolver<'db> {
         traits.extend(
             self.module_scope.def_map.module(db, self.module_scope.module_id).traits_in_scope(db),
         );
-        traits
     }
 
     pub fn traits_in_scope_from_block_scopes<'a>(
@@ -751,8 +801,10 @@ impl<'db> Resolver<'db> {
         db: &'a dyn SourceDatabase,
     ) -> impl Iterator<Item = TraitId> + 'a {
         self.scopes()
-            .filter_map(|scope| match scope {
-                Scope::BlockScope(m) => Some(m.def_map.module(db, m.module_id).traits_in_scope(db)),
+            .filter_map(move |scope| match scope {
+                Scope::BlockScope { def_map, module_id } => {
+                    Some(def_map.module(db, module_id).traits_in_scope(db))
+                }
                 _ => None,
             })
             .flatten()
@@ -791,35 +843,35 @@ impl<'db> Resolver<'db> {
 
     pub fn generic_def(&self) -> Option<GenericDefId> {
         self.scopes().find_map(|scope| match scope {
-            Scope::GenericParams { def, .. } => Some(*def),
+            Scope::GenericParams { def, .. } => Some(def),
             _ => None,
         })
     }
 
     pub fn generic_params(&self) -> Option<&GenericParams> {
         self.scopes().find_map(|scope| match scope {
-            &Scope::GenericParams { params, .. } => Some(params),
+            Scope::GenericParams { params, .. } => Some(params),
             _ => None,
         })
     }
 
     pub fn all_generic_params(&self) -> impl Iterator<Item = (&GenericParams, GenericDefId)> {
         self.scopes().filter_map(|scope| match scope {
-            &Scope::GenericParams { params, def } => Some((params, def)),
+            Scope::GenericParams { params, def } => Some((params, def)),
             _ => None,
         })
     }
 
     pub fn expression_store_owner(&self) -> Option<ExpressionStoreOwnerId> {
         self.scopes().find_map(|scope| match scope {
-            Scope::ExprScope(it) => Some(it.owner),
+            Scope::ExprScope { store, .. } => Some(self.expr_stores[store as usize].owner),
             _ => None,
         })
     }
 
     pub fn impl_def(&self) -> Option<ImplId> {
         self.scopes().find_map(|scope| match scope {
-            &Scope::GenericParams { def: GenericDefId::ImplId(def), .. } => Some(def),
+            Scope::GenericParams { def: GenericDefId::ImplId(def), .. } => Some(def),
             _ => None,
         })
     }
@@ -839,8 +891,8 @@ impl<'db> Resolver<'db> {
         let mut will_be_resolved_to = None;
         for scope in self.scopes() {
             match scope {
-                Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
+                Scope::ExprScope { store, scope_id } => {
+                    for entry in self.expr_scopes(store).entries(scope_id).iter().rev() {
                         if entry.hygiene() == hygiene_id {
                             if entry.binding() == to_be_renamed {
                                 // This currently resolves to our renamed variable, now `will_be_resolved_to`
@@ -852,16 +904,20 @@ impl<'db> Resolver<'db> {
                         }
                     }
                 }
-                Scope::MacroDefScope(macro_id) => {
-                    handle_macro_def_scope(db, &mut hygiene_id, &mut hygiene_info, macro_id)
-                }
+                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(
+                    db,
+                    &mut hygiene_id,
+                    &mut hygiene_info,
+                    self.macro_def(store, scope_id),
+                ),
                 Scope::GenericParams { params, def } => {
-                    if params.find_const_by_name(current_name, *def).is_some() {
+                    if params.find_const_by_name(current_name, def).is_some() {
                         // It does not resolve to our renamed variable.
                         return None;
                     }
                 }
-                Scope::BlockScope(m) => {
+                Scope::BlockScope { def_map, module_id } => {
+                    let m = self.block_items(def_map, module_id);
                     if m.resolve_path_in_value_ns(db, current_name_as_path).is_some() {
                         // It does not resolve to our renamed variable.
                         return None;
@@ -887,8 +943,8 @@ impl<'db> Resolver<'db> {
         let mut will_resolve_to_renamed = false;
         for scope in self.scopes() {
             match scope {
-                Scope::ExprScope(scope) => {
-                    for entry in scope.expr_scopes.entries(scope.scope_id).iter().rev() {
+                Scope::ExprScope { store, scope_id } => {
+                    for entry in self.expr_scopes(store).entries(scope_id).iter().rev() {
                         if entry.binding() == to_be_renamed {
                             will_resolve_to_renamed = true;
                         } else if entry.hygiene() == hygiene_id && entry.name() == name {
@@ -902,18 +958,22 @@ impl<'db> Resolver<'db> {
                         }
                     }
                 }
-                Scope::MacroDefScope(macro_id) => {
-                    handle_macro_def_scope(db, &mut hygiene_id, &mut hygiene_info, macro_id)
-                }
+                Scope::MacroDefScope { store, scope_id } => handle_macro_def_scope(
+                    db,
+                    &mut hygiene_id,
+                    &mut hygiene_info,
+                    self.macro_def(store, scope_id),
+                ),
                 Scope::GenericParams { params, def } => {
-                    if params.find_const_by_name(name, *def).is_some() {
+                    if params.find_const_by_name(name, def).is_some() {
                         // Here and below, it might actually resolve to our renamed variable - in which case it'll
                         // hide the generic parameter or some other thing (not a variable). We don't check for that
                         // because due to naming conventions, it is rare that variable will shadow a non-variable.
                         return None;
                     }
                 }
-                Scope::BlockScope(m) => {
+                Scope::BlockScope { def_map, module_id } => {
+                    let m = self.block_items(def_map, module_id);
                     if m.resolve_path_in_value_ns(db, name_as_path).is_some() {
                         return None;
                     }
@@ -940,49 +1000,46 @@ impl<'db> Resolver<'db> {
         owner: ExpressionStoreOwnerId,
         expr_id: ExprId,
     ) -> UpdateGuard {
+        // Each scope is pushed as macro, locals, block and the range reversed at the end, so the
+        // stack holds outer scopes first and, for each, its block, locals, macro.
         #[inline(always)]
         fn append_expr_scope<'db>(
             db: &'db dyn SourceDatabase,
             resolver: &mut Resolver<'db>,
-            owner: ExpressionStoreOwnerId,
+            store: u32,
             expr_scopes: &'db ExprScopes,
             scope_id: ScopeId,
         ) {
-            if let Some(macro_id) = expr_scopes.macro_def(scope_id) {
-                resolver.scopes.push(Scope::MacroDefScope(**macro_id));
+            if expr_scopes.macro_def(scope_id).is_some() {
+                resolver.scopes.push(Scope::MacroDefScope { store, scope_id });
             }
-            resolver.scopes.push(Scope::ExprScope(ExprScope { owner, expr_scopes, scope_id }));
+            resolver.scopes.push(Scope::ExprScope { store, scope_id });
             if let Some(block) = expr_scopes.block(scope_id) {
                 let def_map = block_def_map(db, block);
-                let local_def_map = block.module(db).only_local_def_map(db);
-                resolver.scopes.push(Scope::BlockScope(ModuleItemMap {
-                    def_map,
-                    local_def_map,
-                    module_id: def_map.root,
-                }));
-                // FIXME: This adds as many module scopes as there are blocks, but resolving in each
-                // already traverses all parents, so this is O(n²). I think we could only store the
-                // innermost module scope instead?
+                resolver.scopes.push(Scope::BlockScope { def_map, module_id: def_map.root });
             }
         }
 
         let start = self.scopes.len();
-        let innermost_scope = self.scopes().find(|scope| !matches!(scope, Scope::MacroDefScope(_)));
+        let innermost_scope =
+            self.scopes().find(|scope| !matches!(scope, Scope::MacroDefScope { .. }));
         match innermost_scope {
-            Some(&Scope::ExprScope(ExprScope { scope_id, expr_scopes, owner })) => {
+            Some(Scope::ExprScope { store, scope_id }) => {
+                let expr_scopes = self.expr_scopes(store);
                 let scope_chain = expr_scopes
                     .scope_chain(expr_scopes.scope_for(expr_id))
                     .take_while(|&it| it != scope_id);
                 for scope_id in scope_chain {
-                    append_expr_scope(db, self, owner, expr_scopes, scope_id);
+                    append_expr_scope(db, self, store, expr_scopes, scope_id);
                 }
             }
             _ => {
                 let expr_scopes = ExprScopes::of(db, owner);
+                let store = self.expr_store_index(owner, expr_scopes);
                 let scope_chain = expr_scopes.scope_chain(expr_scopes.scope_for(expr_id));
 
                 for scope_id in scope_chain {
-                    append_expr_scope(db, self, owner, expr_scopes, scope_id);
+                    append_expr_scope(db, self, store, expr_scopes, scope_id);
                 }
             }
         }
@@ -1021,6 +1078,12 @@ fn handle_macro_def_scope(
 // FIXME: rustc looks there first; this is only reached when the name is unknown at the call site.
 pub(crate) fn macro_def_site(db: &dyn SourceDatabase, hygiene_id: HygieneId) -> Option<ModuleId> {
     let (_, def) = hygiene_info(db, hygiene_id)?;
+    // Only a `macro` is found below, and it is defined by a `MACRO_DEF` node: a `macro_rules!`
+    // or a proc macro is turned away by one look at its node, not a walk over the crate's
+    // macros.
+    if def.kind.erased_ast_id().to_ptr(db).kind() != SyntaxKind::MACRO_DEF {
+        return None;
+    }
     crate::crate_def_map(db, def.krate).modules(db).find_map(|(_, data)| {
         data.scope(db).macros().find_map(|(_, it)| match it.def {
             MacroId::Macro2Id(id) if it.def.definition(db) == def => Some(id.lookup(db).container),
@@ -1048,8 +1111,35 @@ fn hygiene_info(
 pub struct UpdateGuard(usize);
 
 impl<'db> Resolver<'db> {
-    fn scopes(&self) -> impl Iterator<Item = &Scope<'db>> {
-        self.scopes.iter().rev()
+    /// The scopes, innermost first, by value (each is a small `Copy`).
+    fn scopes(&self) -> impl Iterator<Item = Scope<'db>> + '_ {
+        self.scopes.iter().rev().copied()
+    }
+
+    fn expr_scopes(&self, store: u32) -> &'db ExprScopes {
+        self.expr_stores[store as usize].scopes
+    }
+
+    /// The macro of a [`Scope::MacroDefScope`], which is only pushed for a scope that has one.
+    fn macro_def(&self, store: u32, scope_id: ScopeId) -> &'db MacroDefId {
+        self.expr_scopes(store).macro_def(scope_id).expect("a macro def scope has a macro")
+    }
+
+    /// The index in `expr_stores` of `owner`'s scopes, added when the stack meets it first.
+    fn expr_store_index(&mut self, owner: ExpressionStoreOwnerId, scopes: &'db ExprScopes) -> u32 {
+        let at = match self.expr_stores.iter().position(|it| it.owner == owner) {
+            Some(at) => at,
+            None => {
+                self.expr_stores.push(ExprStore { owner, scopes });
+                self.expr_stores.len() - 1
+            }
+        };
+        at as u32
+    }
+
+    /// The items of a module of a block's def map, which share the crate's local def map.
+    fn block_items(&self, def_map: &'db DefMap, module_id: ModuleId) -> ModuleItemMap<'db> {
+        ModuleItemMap { def_map, local_def_map: self.module_scope.local_def_map, module_id }
     }
 
     fn resolve_module_path(
@@ -1072,7 +1162,9 @@ impl<'db> Resolver<'db> {
     fn item_scope_(&self) -> (&DefMap, &LocalDefMap, ModuleId) {
         self.scopes()
             .find_map(|scope| match scope {
-                Scope::BlockScope(m) => Some((m.def_map, m.local_def_map, m.module_id)),
+                Scope::BlockScope { def_map, module_id } => {
+                    Some((def_map, self.module_scope.local_def_map, module_id))
+                }
                 _ => None,
             })
             .unwrap_or((
@@ -1094,22 +1186,20 @@ pub enum ScopeDef {
     Label(LabelId),
 }
 
-impl<'db> Scope<'db> {
-    fn process_names(&self, acc: &mut ScopeNames, db: &'db dyn SourceDatabase) {
-        match self {
-            Scope::BlockScope(m) => {
-                m.def_map.module(db, m.module_id).scope(db).entries().for_each(|(name, def)| {
+impl<'db> Resolver<'db> {
+    fn process_names(&self, scope: Scope<'db>, acc: &mut ScopeNames, db: &dyn SourceDatabase) {
+        match scope {
+            Scope::BlockScope { def_map, module_id } => {
+                def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
                     acc.add_per_ns(name, def);
                 });
-                m.def_map.module(db, m.module_id).scope(db).legacy_macros().for_each(
-                    |(name, macs)| {
-                        macs.iter().for_each(|&mac| {
-                            acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
-                        })
-                    },
-                );
+                def_map.module(db, module_id).scope(db).legacy_macros().for_each(|(name, macs)| {
+                    macs.iter().for_each(|&mac| {
+                        acc.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
+                    })
+                });
             }
-            &Scope::GenericParams { params, def: parent } => {
+            Scope::GenericParams { params, def: parent } => {
                 if let GenericDefId::ImplId(impl_) = parent {
                     acc.add(&Name::new_symbol_root(sym::Self_), ScopeDef::ImplSelfType(impl_));
                 } else if let GenericDefId::AdtId(adt) = parent {
@@ -1138,18 +1228,16 @@ impl<'db> Scope<'db> {
                     acc.add(&param.name, ScopeDef::GenericParam(id.into()))
                 }
             }
-            Scope::ExprScope(scope) => {
-                if let Some(label) = scope.expr_scopes.label(scope.scope_id) {
-                    acc.add(
-                        &ExpressionStore::of(db, scope.owner)[label].name,
-                        ScopeDef::Label(label),
-                    )
+            Scope::ExprScope { store, scope_id } => {
+                let ExprStore { owner, scopes } = self.expr_stores[store as usize];
+                if let Some(label) = scopes.label(scope_id) {
+                    acc.add(&ExpressionStore::of(db, owner)[label].name, ScopeDef::Label(label))
                 }
-                scope.expr_scopes.entries(scope.scope_id).iter().for_each(|e| {
+                scopes.entries(scope_id).iter().for_each(|e| {
                     acc.add_local(e.name(), e.binding());
                 });
             }
-            Scope::MacroDefScope(_) => {}
+            Scope::MacroDefScope { .. } => {}
         }
     }
 }
@@ -1172,26 +1260,27 @@ fn resolver_for_scope_<'db>(
     mut r: Resolver<'db>,
     owner: ExpressionStoreOwnerId,
 ) -> Resolver<'db> {
-    let scope_chain = scopes.scope_chain(scope_id).collect::<Vec<_>>();
-    r.scopes.reserve(scope_chain.len());
-
-    for scope in scope_chain.into_iter().rev() {
-        if let Some(block) = scopes.block(scope) {
+    let store = r.expr_store_index(owner, scopes);
+    // A walk of parent links: no allocation, and the reservation makes the pushes below
+    // allocate at most once.
+    r.scopes.reserve(scopes.scope_chain(scope_id).count());
+    let start = r.scopes.len();
+    // The chain runs innermost first: each scope is pushed as locals, macro, block and the
+    // range reversed, so the stack holds outer scopes first and, for each, its block, macro,
+    // locals.
+    for scope_id in scopes.scope_chain(scope_id) {
+        r.scopes.push(Scope::ExprScope { store, scope_id });
+        if scopes.macro_def(scope_id).is_some() {
+            r.scopes.push(Scope::MacroDefScope { store, scope_id });
+        }
+        if let Some(block) = scopes.block(scope_id) {
             let def_map = block_def_map(db, block);
-            let local_def_map = block.module(db).only_local_def_map(db);
             // Using `DefMap::ROOT` is okay here since inside modules other than the root,
             // there can't directly be expressions.
-            r = r.push_block_scope(def_map, local_def_map, def_map.root);
-            // FIXME: This adds as many module scopes as there are blocks, but resolving in each
-            // already traverses all parents, so this is O(n²). I think we could only store the
-            // innermost module scope instead?
+            r.scopes.push(Scope::BlockScope { def_map, module_id: def_map.root });
         }
-        if let Some(macro_id) = scopes.macro_def(scope) {
-            r = r.push_scope(Scope::MacroDefScope(**macro_id));
-        }
-
-        r = r.push_expr_scope(owner, scopes, scope);
     }
+    r.scopes[start..].reverse();
     r
 }
 
@@ -1208,24 +1297,6 @@ impl<'db> Resolver<'db> {
     ) -> Resolver<'db> {
         let params = GenericParams::of(db, def);
         self.push_scope(Scope::GenericParams { def, params })
-    }
-
-    fn push_block_scope(
-        self,
-        def_map: &'db DefMap,
-        local_def_map: &'db LocalDefMap,
-        module_id: ModuleId,
-    ) -> Resolver<'db> {
-        self.push_scope(Scope::BlockScope(ModuleItemMap { def_map, local_def_map, module_id }))
-    }
-
-    fn push_expr_scope(
-        self,
-        owner: ExpressionStoreOwnerId,
-        expr_scopes: &'db ExprScopes,
-        scope_id: ScopeId,
-    ) -> Resolver<'db> {
-        self.push_scope(Scope::ExprScope(ExprScope { owner, expr_scopes, scope_id }))
     }
 }
 
@@ -1391,30 +1462,24 @@ impl HasResolver for ModuleId {
         let (mut def_map, local_def_map) = self.local_def_map(db);
         let mut module_id = self;
 
-        if self.block(db).is_none() {
-            return Resolver {
-                scopes: vec![],
-                module_scope: ModuleItemMap { def_map, local_def_map, module_id },
-            };
-        }
-
-        let mut modules: SmallVec<[_; 1]> = smallvec![];
-        while let Some(parent) = def_map.parent() {
-            let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
-            let block_module_id = mem::replace(&mut module_id, parent);
-            modules.push((block_def_map, block_module_id));
-            if parent.block(db).is_none() {
-                break;
+        let mut scopes = Vec::new();
+        if self.block(db).is_some() {
+            // Innermost block first, then reversed: the stack holds outer blocks first.
+            while let Some(parent) = def_map.parent() {
+                let block_def_map = mem::replace(&mut def_map, parent.def_map(db));
+                let block_module_id = mem::replace(&mut module_id, parent);
+                scopes.push(Scope::BlockScope { def_map: block_def_map, module_id: block_module_id });
+                if parent.block(db).is_none() {
+                    break;
+                }
             }
+            scopes.reverse();
         }
-        let mut resolver = Resolver {
-            scopes: Vec::with_capacity(modules.len()),
+        Resolver {
+            scopes,
+            expr_stores: SmallVec::new(),
             module_scope: ModuleItemMap { def_map, local_def_map, module_id },
-        };
-        for (def_map, module_id) in modules.into_iter().rev() {
-            resolver = resolver.push_block_scope(def_map, local_def_map, module_id);
         }
-        resolver
     }
 }
 

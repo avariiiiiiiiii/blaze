@@ -20,5 +20,10 @@ fn line<T: Serialize>(envelope: &Envelope<T>) -> String {
     serde_json::to_string(envelope).expect("an envelope of the API has a JSON rendering")
 }
 
+/// [`response`] onto the end of `out`, written where it goes.
+pub(crate) fn line_into<T: Serialize>(out: &mut Vec<u8>, envelope: &Envelope<T>) {
+    serde_json::to_writer(&mut *out, envelope).expect("an envelope of the API has a JSON rendering");
+}
+
 #[cfg(test)]
 mod tests;

@@ -1,23 +1,24 @@
 //! A map of all publicly exported items in a crate.
 
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use base_db::{Crate, SourceDatabase};
 use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir_expand::name::Name;
-use itertools::Itertools;
-use rustc_hash::FxHashSet;
-use smallvec::SmallVec;
+use indexmap::IndexSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use span::Edition;
 use stdx::format_to;
 
 use crate::{
-    AdtId, AssocItemId, AttrDefId, Complete, EnumId, FxIndexMap, ModuleDefId, ModuleId, TraitId,
+    AdtId, AssocItemId, AttrDefId, Complete, EnumId, ModuleDefId, ModuleId, TraitId,
     attrs::AttrFlags,
     item_scope::{ImportOrExternCrate, ItemInNs},
     nameres::{assoc::TraitItems, crate_def_map},
     visibility::Visibility,
 };
+
+type FxIndexSet<T> = IndexSet<T, FxBuildHasher>;
 
 /// Item import details stored in the `ImportMap`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

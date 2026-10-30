@@ -159,6 +159,8 @@ pub struct Machine {
     config: Config,
     plane: Plane,
     over: bool,
+    /// The plane's outputs of a step, drained each step and kept for the next.
+    said: Vec<PlaneOutput>,
 }
 
 impl Machine {
@@ -176,7 +178,7 @@ impl Machine {
             keep_going: config.keep_going,
         })?;
         debug_assert!(opened.is_empty(), "opening a request says nothing");
-        Ok(Machine { config, plane, over: false })
+        Ok(Machine { config, plane, over: false, said: Vec::new() })
     }
 
     pub fn config(&self) -> Config {
@@ -203,17 +205,21 @@ impl Machine {
                 PlaneInput::Done { at_ns, id, outcome, added, group: None, peak: 0 }
             }
         };
-        let outputs = self.plane.step(input)?;
-        Ok(outputs
-            .into_iter()
-            .map(|output| match output {
-                PlaneOutput::Said { record, .. } => Output::Said(record),
-                PlaneOutput::Run { id, pool, .. } => Output::Run { id, pool },
-                PlaneOutput::Finished { ok, .. } => {
-                    self.over = true;
-                    Output::Finished { ok }
-                }
-            })
-            .collect())
+        let mut said = std::mem::take(&mut self.said);
+        let taken = self.plane.step_into(input, &mut said);
+        let outputs = taken.map(|()| {
+            said.drain(..)
+                .map(|output| match output {
+                    PlaneOutput::Said { record, .. } => Output::Said(record),
+                    PlaneOutput::Run { id, pool, .. } => Output::Run { id, pool },
+                    PlaneOutput::Finished { ok, .. } => {
+                        self.over = true;
+                        Output::Finished { ok }
+                    }
+                })
+                .collect()
+        });
+        self.said = said;
+        outputs
     }
 }

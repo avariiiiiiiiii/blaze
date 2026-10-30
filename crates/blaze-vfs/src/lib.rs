@@ -116,10 +116,18 @@ pub enum OpError {
     IsADirectory(String),
     NotADirectory(String),
     Exists(String),
-    OutOfRange { path: String, at: u64, len: u64, size: u64 },
+    OutOfRange {
+        path: String,
+        at: u64,
+        len: u64,
+        size: u64,
+    },
     /// The symlink at `path` points outside the tree (an absolute target, or `..` past the
     /// root) or into a loop of symlinks.
-    BadLink { path: String, target: String },
+    BadLink {
+        path: String,
+        target: String,
+    },
     /// The base root the ops were given is not one this tree has.
     UnknownRoot(ContentId),
 }
@@ -172,7 +180,9 @@ pub enum CommitError {
     /// The base root is not one this tree has.
     UnknownBase(ContentId),
     /// The head moved and changed `path` in a way the ops can't be moved past.
-    Conflict { path: String },
+    Conflict {
+        path: String,
+    },
     Op(OpError),
 }
 
@@ -384,7 +394,8 @@ impl Vfs {
     /// reading them. The next flush also rewrites the journal as just what the heads reach.
     pub fn collect(&mut self, keep: &[ContentId]) {
         let names: Vec<Box<str>> = self.heads.keys().cloned().collect();
-        let views: Vec<usize> = (0..self.views.len()).filter(|&at| self.views[at].is_some()).collect();
+        let views: Vec<usize> =
+            (0..self.views.len()).filter(|&at| self.views[at].is_some()).collect();
         let mut live: Vec<NodeId> = names.iter().map(|name| self.heads[name]).collect();
         live.extend(views.iter().map(|&at| self.views[at].expect("an open view")));
         live.extend(keep.iter().filter_map(|root| self.tree.node(root)));

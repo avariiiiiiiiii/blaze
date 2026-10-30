@@ -19,6 +19,8 @@ whose span mbe puts on the open delimiter or the macro name gives "no rules of `
 call", not rustc's "no rules expected `x`"; and the note and comma help, which every rustc
 `no rules expected` has, can't be given at all.
 
+> forwarded to db: `hir` and `hir-expand` are lane db's.
+
 ## 2. Run `macro_def_error::check` on every local `macro_rules!` (diagnostics-items)
 
 Where: `crates/blaze-diagnostics/src/lower/mod.rs` or the items checks.
@@ -31,6 +33,8 @@ Why: mbe accepts definitions rustc refuses: no rules at all (`macro_rules! f {}`
 fragment specifier (`$x:id`), duplicate bindings, empty repetitions; hir only reports what mbe
 refuses, so those give no error today.
 
+> forwarded to diagnostics: its own.
+
 ## 3. Builtin macros' errors in rustc's words (db-expand)
 
 Where: `crates/hir-expand/src/builtin/fn_macro.rs`, `builtin/derive_macro.rs`.
@@ -41,6 +45,8 @@ defined at compile time" with its help).
 
 Why: `lower/macro_error.rs` gives them as "blaze can't expand macro `x`: {text}", an error naming
 what, but not rustc's.
+
+> forwarded to db: `hir-expand`'s builtin macros are lane db's.
 
 ## 4. A parse error of a token stream in rustc's words (diagnostics-items / parse)
 
@@ -55,6 +61,8 @@ expression, type or pattern and rust-analyzer's text for the rest; rustc's "macr
 ignores `x` and any tokens following" needs the fragment parse's leftovers, which rust-analyzer's
 parser wraps in an `ERROR` node with no message.
 
+> forwarded to diagnostics: its own (and format for `crates/parser`, if the parser's text changes).
+
 ## 5. Whether cargo invoked the compile (diagnostics / blaze-api)
 
 Where: `crates/blaze-diagnostics` `Options`.
@@ -64,3 +72,5 @@ What: a flag for rustc's `was_invoked_from_cargo()`.
 Why: E0432/E0433's "you might be missing a crate named `x`" help reads "if you wanted to use a
 crate named `x`, use `cargo add x` to add it to your `Cargo.toml`" under cargo;
 `lower/unresolved_import.rs` gives the non-cargo text.
+
+> forwarded to diagnostics: `Options` is in `crates/blaze-diagnostics/src/check.rs`, its own; `blaze-api` needs no change (the daemon that sets the flag is lane cargo's).

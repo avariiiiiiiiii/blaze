@@ -62,6 +62,16 @@ pub fn is_fn_unsafe_to_call(
     target_feature_is_safe: TargetFeatureIsSafeInTarget,
 ) -> Unsafety {
     let data = FunctionSignature::of(db, func);
+    // Before `is_unsafe`: a `#[rustc_deprecated_safe_2024]` function is also `unsafe`, yet a call
+    // of it before 2024 is only linted.
+    if data.is_deprecated_safe_2024() {
+        if call_edition.at_least_2024() {
+            return Unsafety::Unsafe;
+        } else {
+            return Unsafety::DeprecatedSafe2024;
+        }
+    }
+
     if data.is_unsafe() {
         return Unsafety::Unsafe;
     }
@@ -71,14 +81,6 @@ pub fn is_fn_unsafe_to_call(
         let callee_target_features = TargetFeatures::from_fn_no_implications(db, func);
         if !caller_target_features.enabled.is_superset(&callee_target_features.enabled) {
             return Unsafety::Unsafe;
-        }
-    }
-
-    if data.is_deprecated_safe_2024() {
-        if call_edition.at_least_2024() {
-            return Unsafety::Unsafe;
-        } else {
-            return Unsafety::DeprecatedSafe2024;
         }
     }
 

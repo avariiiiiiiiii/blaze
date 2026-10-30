@@ -1,6 +1,6 @@
 use std::{ffi::OsString, io, path::PathBuf, time::Instant};
 
-use blaze_api::{Request, Response, UnitStarted, Verb, client::ClientError};
+use blaze_api::{Request, Response, TestOutcome, TestResult, Ub, UnitStarted, Verb, client::ClientError};
 
 use super::*;
 use crate::cli::{
@@ -26,7 +26,7 @@ fn place() -> Place {
 
 fn request_of(asked: &Invocation) -> Request {
     let env = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
-    request(asked, place::cargo(asked, &place(), env, Vec::new(), false).unwrap())
+    request(asked, place::cargo(asked, &place(), env, Vec::new(), false).unwrap()).unwrap()
 }
 
 #[test]
@@ -62,6 +62,47 @@ fn each_command_its_request() {
     assert_eq!((filter, all), (vec!["parse".to_owned()], false));
     // `--reached` is blaze's: cargo's command line does not have it.
     assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+}
+
+#[test]
+fn ub_runs_every_selected_test_in_the_daemon() {
+    let ub = request_of(&invocation(words(os(&["blaze", "test", "--ub-seed", "7", "parse", "--", "--exact", "--ignored"]))));
+    let Request::Test { filter, all, args, ub, targets, .. } = ub else { panic!("{ub:?}") };
+    assert_eq!((filter, all), (vec!["parse".to_owned()], true));
+    assert_eq!(args, ["--exact", "--ignored"], "libtest's selection, which the daemon applies");
+    assert_eq!(ub, Some(Ub { seed: Some(7), schedules: None }));
+    assert_eq!(targets.cargo.unwrap().args, ["parse"]);
+
+    let both = request_of(&invocation(words(os(&["blaze", "test", "--ub", "--reached"]))));
+    let Request::Test { all, ub, .. } = both else { panic!("{both:?}") };
+    assert_eq!((all, ub), (false, Some(Ub { seed: None, schedules: None })));
+
+    let reached = request_of(&invocation(words(os(&["blaze", "test", "--reached"]))));
+    let Request::Test { ub, .. } = reached else { panic!("{reached:?}") };
+    assert_eq!(ub, None, "opt-in");
+
+    let asked = invocation(words(os(&["blaze", "test", "--ub", "--no-run"])));
+    let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false).unwrap();
+    assert!(request(&asked, cargo).unwrap_err().contains("--no-run"));
+}
+
+#[test]
+fn ub_results_print_as_libtest_prints_them() {
+    let failed = TestResult {
+        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        name: "tests::aliasing".to_owned(),
+        outcome: TestOutcome::Failed,
+        output: b"undefined behavior: a write through a reference that was retagged as shared\nseed: 7".to_vec(),
+        millis: 0,
+    };
+    let passed = TestResult { name: "tests::fine".to_owned(), outcome: TestOutcome::Passed, output: Vec::new(), ..failed.clone() };
+    let mut api = FakeApi::answering(vec![Response::TestResult(passed), Response::TestResult(failed), Response::Done { ok: true }]);
+    let (then, out, err) = driven(&mut api, &["blaze", "test", "--ub", "-q"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(FAILED));
+    assert!(out.contains("test tests::aliasing ... FAILED\n"), "{out}");
+    assert!(out.contains("---- tests::aliasing stdout ----\nundefined behavior:"), "{out}");
+    assert!(out.contains("seed: 7"), "{out}");
+    assert_eq!(err, "", "nothing compiled, nothing run on this machine");
 }
 
 #[test]

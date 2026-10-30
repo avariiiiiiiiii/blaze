@@ -354,8 +354,8 @@ pub struct Jobs {
     library: Option<String>,
     library_failed: Option<ApiError>,
     fetch_failed: BTreeMap<String, ApiError>,
-    /// The store's placements: the job, where, and whether it is executable.
-    placing: FxHashMap<Tag, (JobId, FileName, bool)>,
+    /// The store's placements: the job, and whether it is executable.
+    placing: FxHashMap<Tag, (JobId, bool)>,
     /// The job of each lock write and mode of the loop's own.
     own: FxHashMap<Tag, (JobId, String)>,
     next_own: u64,
@@ -425,11 +425,23 @@ impl Jobs {
 
     /// Takes what the session asked since the last call.
     pub fn step(&mut self, w: &mut World<'_>) {
-        for (id, view, work) in std::mem::take(&mut self.started) {
-            self.begin(w, id, view, work);
+        if !self.started.is_empty() {
+            let mut started = std::mem::take(&mut self.started);
+            for (id, view, work) in started.drain(..) {
+                self.begin(w, id, view, work);
+            }
+            if self.started.is_empty() {
+                self.started = started;
+            }
         }
-        for id in std::mem::take(&mut self.cancels) {
-            self.cancel_job(w, id);
+        if !self.cancels.is_empty() {
+            let mut cancels = std::mem::take(&mut self.cancels);
+            for id in cancels.drain(..) {
+                self.cancel_job(w, id);
+            }
+            if self.cancels.is_empty() {
+                self.cancels = cancels;
+            }
         }
         self.wind_up(w);
     }
@@ -620,12 +632,13 @@ impl Jobs {
                 }
             }
             Stage::Fetch(mut fetching) => {
-                let Some(fetch) = fetching.fetches.get(node.0.wrapping_sub(fetching.first.0) as usize) else {
+                let place = node.0.wrapping_sub(fetching.first.0) as usize;
+                if place >= fetching.fetches.len() {
                     job.stage = Stage::Fetch(fetching);
                     return;
-                };
+                }
                 if !ok {
-                    let at = &fetch.at;
+                    let at = &fetching.fetches[place].at;
                     let error = self
                         .fetch_failed
                         .get(at)
@@ -791,94 +804,100 @@ impl Jobs {
                 let from = job.ready[0].front.clone().expect("a reach lowers both views");
                 let to = ready.front.clone().expect("a reach lowers both views");
                 let changes = changes.clone();
-                Some(task(&cancelled, move || to.reach(from.as_ref(), &changes), |it| Value::Answer(it.map(Response::Reached))))
+                let reach = move |_| to.reach(from.as_ref(), &changes);
+                Some(task(&cancelled, reach, |_, it| Value::Answer(it.map(Response::Reached))))
             }
             Work::CodegenInputs(_) => {
                 let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move || front.codegen_inputs(), |it| Value::Answer(it.map(Response::CodegenInputs))))
+                Some(task(&cancelled, move |_| front.codegen_inputs(), |_, it| Value::Answer(it.map(Response::CodegenInputs))))
             }
             Work::Tables => {
                 let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move || front.tables(), |it| Value::Answer(it.map(Response::Tables))))
+                Some(task(&cancelled, move |_| front.tables(), |_, it| Value::Answer(it.map(Response::Tables))))
             }
             Work::Trace(_) => {
                 let (db, queries, root) = (ready.input.db.clone(), ready.input.queries, w.steps.plan_key());
-                Some(task(&cancelled, move || Ok(trace(&db, queries, root)), |it| Value::Answer(it.map(Response::Trace))))
+                Some(task(&cancelled, move |_| Ok(trace(&db, queries, root)), |_, it| Value::Answer(it.map(Response::Trace))))
             }
             Work::Verify(_) => {
                 let (steps, input) = (w.steps.clone(), ready.input.clone());
                 let view = job.views[0].view;
                 Some(task(
                     &cancelled,
-                    move || verify(steps.as_ref(), &input, view),
-                    |it| Value::Answer(it.map(|mismatches| Response::Verified { mismatches })),
+                    move |_| verify(steps.as_ref(), &input, view),
+                    |_, it| Value::Answer(it.map(|mismatches| Response::Verified { mismatches })),
                 ))
             }
             Work::Snapshot => unreachable!("a snapshot has no view"),
         };
         if let Some(work) = answer {
-            let node = w.plane.node_id();
+            let node = w.plane.reserve(1);
             let spec = spec(node, NodeKind::Bodies, "the job's answer".into(), Vec::new(), Pool::Work, None);
             job.stage = Stage::Answer(node);
-            self.add(w, id, vec![Node { spec, task: plane::Task::Thread { kind: kinds::WALK, work } }]);
+            self.add(w, id, node, vec![Node { spec, task: one(kinds::WALK) }], Some(work));
             self.close(w, id);
             return;
         }
         let ready = job.ready.pop().expect("a job has a view");
         let front = ready.front.expect("a build lowers its view");
         let input = ready.input;
-        let units = input.units.clone();
-        let ids: Vec<NodeId> = units.graph.units.iter().map(|_| w.plane.node_id()).collect();
-        let mut nodes = Vec::with_capacity(ids.len());
-        let mut by_unit = FxHashMap::default();
+        let units = &input.units;
+        let count = u32::try_from(units.graph.units.len()).expect("under 2^32 units");
+        let first = w.plane.reserve(count);
         let check = input.goal == Goal::Check;
-        for (at, unit) in units.graph.units.iter().enumerate() {
-            let deps = unit.dependencies.iter().map(|dep| ids[dep.index]).collect();
-            let name = format!("{} {}", unit.pkg_id, unit.target.name);
-            by_unit.insert(ids[at], at);
-            let node = match unit.mode {
-                UnitMode::RunCustomBuild => Node {
-                    spec: spec(ids[at], NodeKind::ScriptRun, name, deps, Pool::Work, None),
-                    task: Task::Loop,
-                },
-                _ => {
-                    let front = front.clone();
-                    let work: plane::Work<Value> = {
-                        let cancelled = cancelled.clone();
-                        Arc::new(move || match front.compile(at) {
-                            Ok(compiled) => {
-                                let outcome = match compiled.ok {
-                                    true => Outcome::Built,
-                                    false => Outcome::Failed { why: "it did not compile".to_owned() },
-                                };
-                                Some(Did { outcome, value: Value::Compiled(at, Ok(compiled)) })
-                            }
-                            Err(Failed::Error(error)) => Some(Did {
-                                outcome: Outcome::Failed { why: error.what.clone() },
-                                value: Value::Compiled(at, Err(error)),
-                            }),
-                            Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
-                                outcome: Outcome::Failed { why: "cancelled".to_owned() },
-                                value: Value::Compiled(at, Err(ApiError::new("cancelled", None))),
-                            }),
-                            Err(Failed::Again) => None,
-                        })
-                    };
-                    let kind = if check { NodeKind::Bodies } else { NodeKind::Codegen };
-                    Node { spec: spec(ids[at], kind, name, deps, Pool::Work, None), task: Task::Thread { kind: kinds::COMPILE, work } }
-                }
-            };
-            nodes.push(node);
+        let kind = if check { NodeKind::Bodies } else { NodeKind::Codegen };
+        let mut nodes = Vec::with_capacity(units.graph.units.len());
+        for (at, unit) in (0u32..).zip(&units.graph.units) {
+            let deps = unit.dependencies.iter().map(|dep| NodeId(first.0 + dep.index as u32)).collect();
+            let mut name = String::with_capacity(unit.pkg_id.len() + 1 + unit.target.name.len());
+            name.push_str(&unit.pkg_id);
+            name.push(' ');
+            name.push_str(&unit.target.name);
+            let id = NodeId(first.0 + at);
+            nodes.push(match unit.mode {
+                UnitMode::RunCustomBuild => Node { spec: spec(id, NodeKind::ScriptRun, name, deps, Pool::Work, None), task: Task::Loop },
+                _ => Node { spec: spec(id, kind, name, deps, Pool::Work, None), task: Task::Thread { kind: kinds::COMPILE, arg: at } },
+            });
         }
+        let work: plane::Work<Value> = {
+            let front = front.clone();
+            Arc::new(move |arg| {
+                let at = arg as usize;
+                match front.compile(at) {
+                    Ok(compiled) => {
+                        let outcome = match compiled.ok {
+                            true => Outcome::Built,
+                            false => Outcome::Failed { why: "it did not compile".to_owned() },
+                        };
+                        Some(Did { outcome, value: Value::Compiled(at, Ok(compiled)) })
+                    }
+                    Err(Failed::Error(error)) => {
+                        Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: Value::Compiled(at, Err(error)) })
+                    }
+                    Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
+                        outcome: Outcome::Failed { why: "cancelled".to_owned() },
+                        value: Value::Compiled(at, Err(ApiError::new("cancelled", None))),
+                    }),
+                    Err(Failed::Again) => None,
+                }
+            })
+        };
+        let package_of = {
+            let packages: FxHashMap<&str, u32> =
+                (0u32..).zip(&units.packages).map(|(at, package)| (package.id.as_str(), at)).collect();
+            units.graph.units.iter().map(|unit| packages.get(unit.pkg_id.as_str()).copied().unwrap_or(u32::MAX)).collect()
+        };
+        let reported = vec![0; units.packages.len().div_ceil(64)];
         job.stage = Stage::Units(Box::new(Build {
             input,
             front,
-            units: by_unit,
+            first,
+            package_of,
+            reported,
             scripts: FxHashMap::default(),
-            reported: BTreeSet::new(),
             artifacts: Vec::new(),
         }));
-        self.add(w, id, nodes);
+        self.add(w, id, first, nodes, Some(work));
         self.close(w, id);
     }
 
@@ -892,20 +911,22 @@ impl Jobs {
 
     /// A unit begins: reported once for its package, as cargo says `Compiling` once.
     fn started_unit(&mut self, w: &mut World<'_>, node: NodeId) {
-        let Some(&id) = self.by_node.get(&node) else { return };
+        let Some(id) = self.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(&id) else { return };
         let Stage::Units(build) = &mut job.stage else { return };
-        let Some(&at) = build.units.get(&node) else { return };
+        let Some(at) = build.unit(node) else { return };
         let fresh = build.front.fresh(at);
         match fresh {
             true => job.fresh += 1,
             false => job.compiled += 1,
         }
         let unit = &build.input.units.graph.units[at];
-        if !build.reported.insert(unit.pkg_id.clone()) {
+        let Some(package) = build.input.units.packages.get(build.package_of[at] as usize) else { return };
+        let (word, bit) = (build.package_of[at] as usize / 64, 1 << (build.package_of[at] % 64));
+        if build.reported[word] & bit != 0 {
             return;
         }
-        let Some(package) = build.input.units.packages.iter().find(|it| it.id == unit.pkg_id) else { return };
+        build.reported[word] |= bit;
         let verb = match (fresh, build.input.goal, unit.mode) {
             (true, ..) => Verb::Fresh,
             (false, Goal::Check, _) | (false, _, UnitMode::Check) => Verb::Checking,
@@ -921,20 +942,43 @@ impl Jobs {
         w.said.push(Said::Report(id, Response::Unit(started)));
     }
 
+    /// The first tag of a new run of the job's.
     fn run_tags(&mut self, id: JobId, node: Option<NodeId>) -> u64 {
-        assert!(self.next_runs < self.setup.runs_end, "the daemon has run 2^32 runs of user code and has no tags for another");
-        let tags = self.next_runs;
-        self.next_runs += RUN_TAGS;
-        self.runs.insert(tags, (id, node));
+        let tags = self.setup.runs + (self.runs_from + self.runs.len() as u64) * RUN_TAGS;
+        assert!(tags < self.setup.runs_end, "the daemon has run every run of user code its tags allow");
+        self.runs.push_back(Some((id, node)));
+        if let Some(job) = self.jobs.get_mut(&id) {
+            job.runs += 1;
+        }
         tags
+    }
+
+    /// The run a tag is of: its first tag, its job, and the script's node.
+    fn run_of(&self, tag: u64) -> Option<(u64, JobId, Option<NodeId>)> {
+        let number = tag.checked_sub(self.setup.runs)? / RUN_TAGS;
+        let (id, node) = (*self.runs.get(usize::try_from(number.checked_sub(self.runs_from)?).ok()?)?)?;
+        Some((self.setup.runs + number * RUN_TAGS, id, node))
+    }
+
+    fn run_over(&mut self, tags: u64) {
+        let Some(at) = ((tags - self.setup.runs) / RUN_TAGS).checked_sub(self.runs_from) else { return };
+        if let Some((id, _)) = self.runs.get_mut(at as usize).and_then(Option::take)
+            && let Some(job) = self.jobs.get_mut(&id)
+        {
+            job.runs -= 1;
+        }
+        while self.runs.front().is_some_and(Option::is_none) {
+            self.runs.pop_front();
+            self.runs_from += 1;
+        }
     }
 
     /// A build script's run begins, on the loop.
     fn run_script(&mut self, w: &mut World<'_>, node: NodeId) {
-        let Some(&id) = self.by_node.get(&node) else { return };
+        let Some(id) = self.job_of(node) else { return };
         self.started_unit(w, node);
         let Some(Stage::Units(build)) = self.jobs.get(&id).map(|it| &it.stage) else { return };
-        let Some(&at) = build.units.get(&node) else { return };
+        let Some(at) = build.unit(node) else { return };
         let tags = self.run_tags(id, Some(node));
         let job = self.jobs.get_mut(&id).expect("a job running a script");
         let Stage::Units(build) = &mut job.stage else { unreachable!("checked above") };
@@ -943,6 +987,7 @@ impl Jobs {
             Err(error) => {
                 w.plane.ended(w.now, node, Outcome::Failed { why: error.what.clone() });
                 job.over.get_or_insert((false, Some(error)));
+                self.run_over(tags);
                 return;
             }
         };
@@ -953,15 +998,15 @@ impl Jobs {
         }
         match ended {
             Some(ok) => {
-                self.runs.remove(&tags);
+                self.run_over(tags);
                 script_ended(w, node, ok);
             }
-            None => _ = build.scripts.insert(node, runs),
+            None => _ = build.scripts.insert(node, (tags, runs)),
         }
     }
 
     fn compiled(&mut self, w: &mut World<'_>, node: NodeId, _unit: usize, result: Result<Compiled, ApiError>) {
-        let Some(&id) = self.by_node.get(&node) else { return };
+        let Some(id) = self.job_of(node) else { return };
         let Some(job) = self.jobs.get_mut(&id) else { return };
         let compiled = match result {
             Ok(compiled) => compiled,
@@ -977,11 +1022,11 @@ impl Jobs {
         }
         let mut store = w.store.write().expect("the store's lock");
         for put in compiled.puts {
-            let key = format!("{:?}", put.key);
+            let key = put.key;
             match store.put(put.key, put.kind, put.bytes) {
-                Ok(ticket) => self.unsaved.push(ticket),
+                Ok(ticket) => self.put = Some(ticket),
                 Err(mismatch) => {
-                    let error = ApiError::new(format!("the store holds other bytes under {key}: {mismatch:?}"), None);
+                    let error = ApiError::new(format!("the store holds other bytes under {key:?}: {mismatch:?}"), None);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
@@ -992,9 +1037,9 @@ impl Jobs {
                 job.over.get_or_insert((false, Some(error)));
                 continue;
             };
-            match store.place(&output.key, file.clone(), w.effects) {
+            match store.place(&output.key, file, w.effects) {
                 Some(tag) => {
-                    self.placing.insert(tag, (id, file, output.executable));
+                    self.placing.insert(tag, (id, output.executable));
                     job.placing += 1;
                 }
                 None => {
@@ -1014,14 +1059,14 @@ impl Jobs {
     /// What the store placed.
     pub fn placed(&mut self, w: &mut World<'_>, placed: Vec<Placed>) {
         for Placed { tag, to, result } in placed {
-            let Some((id, file, executable)) = self.placing.remove(&tag) else { continue };
+            let Some((id, executable)) = self.placing.remove(&tag) else { continue };
             let Some(job) = self.jobs.get_mut(&id) else { continue };
             match result {
                 Ok(()) if executable => {
                     let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
                     self.next_own += 1;
-                    self.own.insert(tag, (id, format!("/{file}")));
-                    w.effects.push(Effect::Mode { file, mode: 0o755, tag });
+                    self.own.insert(tag, (id, format!("/{to}")));
+                    w.effects.push(Effect::Mode { file: to, mode: 0o755, tag });
                 }
                 Ok(()) => job.placing -= 1,
                 Err(why) => {
@@ -1047,22 +1092,19 @@ impl Jobs {
             self.wind_up(w);
             return;
         }
-        let Some((&tags, &(id, node))) = self.runs.range(..=completion.tag.0).next_back() else { return };
-        if completion.tag.0 - tags >= RUN_TAGS {
-            return;
-        }
+        let Some((tags, id, node)) = self.run_of(completion.tag.0) else { return };
         let Some(job) = self.jobs.get_mut(&id) else {
-            self.runs.remove(&tags);
+            self.run_over(tags);
             return;
         };
         let mut out = Vec::new();
         let mut store = w.store.write().expect("the store's lock");
         let ended = match (node, &mut job.stage) {
             (Some(node), Stage::Units(build)) => match build.scripts.get_mut(&node) {
-                Some(runs) => runs.complete(completion, &mut store, w.effects, &mut out),
+                Some((_, runs)) => runs.complete(completion, &mut store, w.effects, &mut out),
                 None => None,
             },
-            (None, Stage::Runs(runs)) => runs.complete(completion, &mut store, w.effects, &mut out),
+            (None, Stage::Runs(_, runs)) => runs.complete(completion, &mut store, w.effects, &mut out),
             _ => None,
         };
         drop(store);
@@ -1070,7 +1112,7 @@ impl Jobs {
             w.said.push(Said::Report(id, response));
         }
         if let Some(ok) = ended {
-            self.runs.remove(&tags);
+            self.run_over(tags);
             self.run_ended(w, id, node, ok);
         }
         self.wind_up(w);
@@ -1108,30 +1150,27 @@ impl Jobs {
             return;
         }
         let ok = ok && job.over.is_none();
-        let runs = match (&job.work, ok) {
-            (Work::Test { filter, all, .. }, true) => Some((filter.clone(), *all, None, Vec::new())),
-            (Work::Run { bin, args, .. }, true) => Some((Vec::new(), false, Some(bin.clone()), args.clone())),
-            _ => None,
-        };
-        self.report_built(w, id);
-        let Some((filter, all, bin, args)) = runs else {
+        let runs = ok && matches!(job.work, Work::Test { .. } | Work::Run { .. });
+        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
+        let Build { input, front, artifacts, .. } = *build;
+        let profile = input.units.finished.clone();
+        if !runs {
+            w.said.push(Said::Report(id, Response::Built { artifacts, profile }));
             self.worked(w, id);
             self.end(w, id, ok, None);
             return;
-        };
-        let Some(Stage::Units(build)) = self.jobs.get(&id).map(|it| &it.stage) else {
-            unreachable!("checked above")
-        };
-        let (front, artifacts) = (build.front.clone(), build.artifacts.clone());
+        }
         let tags = self.run_tags(id, None);
-        let started = match &bin {
-            None => front.tests(&artifacts, &filter, all, tags),
-            Some(bin) => front.run(&artifacts, bin.as_deref(), &args, tags),
+        let started = match &self.jobs[&id].work {
+            Work::Test { filter, all, .. } => front.tests(&artifacts, filter, *all, tags),
+            Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
+            _ => unreachable!("checked above"),
         };
+        w.said.push(Said::Report(id, Response::Built { artifacts, profile }));
         let mut runs = match started {
             Ok(runs) => runs,
             Err(error) => {
-                self.runs.remove(&tags);
+                self.run_over(tags);
                 self.worked(w, id);
                 self.end(w, id, false, Some(error));
                 return;
@@ -1142,18 +1181,11 @@ impl Jobs {
         for response in out {
             w.said.push(Said::Report(id, response));
         }
-        self.jobs.get_mut(&id).expect("a job whose plane finished").stage = Stage::Runs(runs);
+        self.jobs.get_mut(&id).expect("a job whose plane finished").stage = Stage::Runs(tags, runs);
         if let Some(ok) = ended {
-            self.runs.remove(&tags);
+            self.run_over(tags);
             self.run_ended(w, id, None, ok);
         }
-    }
-
-    fn report_built(&mut self, w: &mut World<'_>, id: JobId) {
-        let job = &self.jobs[&id];
-        let Stage::Units(build) = &job.stage else { return };
-        let profile = build.input.units.finished.clone();
-        w.said.push(Said::Report(id, Response::Built { artifacts: build.artifacts.clone(), profile }));
     }
 
     /// `Work` of a build, test or run: what the plane and the units did.
@@ -1184,15 +1216,15 @@ impl Jobs {
         let mut ended = Vec::new();
         match &mut job.stage {
             Stage::Units(build) => {
-                for (node, runs) in &mut build.scripts {
+                for (node, (tags, runs)) in &mut build.scripts {
                     if let Some(ok) = runs.cancel(w.effects) {
-                        ended.push((Some(*node), ok));
+                        ended.push((*tags, Some(*node), ok));
                     }
                 }
             }
-            Stage::Runs(runs) => {
+            Stage::Runs(tags, runs) => {
                 if let Some(ok) = runs.cancel(w.effects) {
-                    ended.push((None, ok));
+                    ended.push((*tags, None, ok));
                 }
             }
             _ => {}
@@ -1204,8 +1236,8 @@ impl Jobs {
                 w.plane.close(w.now, request);
             }
         }
-        for (node, ok) in ended {
-            self.runs.retain(|_, it| *it != (id, node));
+        for (tags, node, ok) in ended {
+            self.run_over(tags);
             match node {
                 Some(node) => {
                     if let Some(Stage::Units(build)) = self.jobs.get_mut(&id).map(|it| &mut it.stage) {
@@ -1230,7 +1262,7 @@ impl Jobs {
             Some((was, _)) => *was = *was && ok,
             None => job.over = Some((ok, error)),
         }
-        if !matches!(job.stage, Stage::Runs(_)) {
+        if !matches!(job.stage, Stage::Runs(..)) {
             job.stage = Stage::Over;
         }
         if let (Some(request), false) = (job.request, job.finished) {
@@ -1247,25 +1279,20 @@ impl Jobs {
     /// Finishes every job that is over and has nothing left: its tasks, its placements and its
     /// runs; and a snapshot once all it waits for is durable.
     fn wind_up(&mut self, w: &mut World<'_>) {
-        {
-            let store = w.store.read().expect("the store's lock");
-            self.unsaved.retain(|ticket| !store.durable(*ticket));
-        }
         let mut over = Vec::new();
         for (id, job) in &mut self.jobs {
-            if let Stage::Snapshot { ticket: None, heads, store } = &job.stage
+            if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
                 && w.db.settled()
-                && store.iter().all(|it| self.unsaved.iter().all(|unsaved| unsaved != it))
+                && store.is_none_or(|it| w.store.read().expect("the store's lock").durable(it))
             {
-                let heads = heads.clone();
+                let heads = std::mem::take(heads);
                 w.said.push(Said::Report(*id, Response::Snapshotted { heads }));
                 job.stage = Stage::Over;
                 job.over = Some((true, None));
             }
-            let Some((ok, error)) = &job.over else { continue };
-            if job.finished && job.placing == 0 && !matches!(job.stage, Stage::Runs(_)) && self.runs.values().all(|it| it.0 != *id)
-            {
-                over.push((*id, *ok, error.clone()));
+            let Some((ok, error)) = &mut job.over else { continue };
+            if job.finished && job.placing == 0 && job.runs == 0 && !matches!(job.stage, Stage::Runs(..)) {
+                over.push((*id, *ok, error.take()));
             }
         }
         for (id, ok, error) in over {
@@ -1273,7 +1300,9 @@ impl Jobs {
             for queries in job.queries {
                 w.db.close(queries);
             }
-            self.by_node.retain(|_, it| *it != id);
+            for first in job.batches {
+                self.nodes.remove(&first.0);
+            }
             self.ended = true;
             w.said.push(Said::Finish(id, ok, error));
         }
@@ -1299,7 +1328,7 @@ impl Jobs {
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());
         w.vfs.flush(w.effects);
-        Stage::Snapshot { ticket, heads, store: self.unsaved.clone() }
+        Stage::Snapshot { ticket, heads, store: self.put }
     }
 }
 
@@ -1327,11 +1356,11 @@ fn warned(warning: &str) -> Diagnostic {
 
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.
 fn walk(db: &Database, from: QueryKey) -> Vec<blaze_query::Memo> {
-    let mut seen = BTreeSet::new();
+    let mut seen = FxHashSet::default();
     let mut queue = vec![from];
     let mut memos = Vec::new();
     while let Some(key) = queue.pop() {
-        if !seen.insert((key.kind.0, key.input)) {
+        if !seen.insert(key) {
             continue;
         }
         let Some(memo) = db.memo(&key) else { continue };

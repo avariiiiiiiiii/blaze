@@ -44,7 +44,7 @@ pub trait AstPathExt {
 }
 
 /// `f` of the text of the path's one segment, without `r#`, read in place.
-fn with_one_segment<R>(path: &ast::Path, f: impl FnOnce(&str) -> R) -> Option<R> {
+pub(crate) fn with_one_segment<R>(path: &ast::Path, f: impl FnOnce(&str) -> R) -> Option<R> {
     let name_ref = path.as_single_name_ref()?;
     Some(f(name_ref.text().trim_start_matches("r#")))
 }
@@ -456,5 +456,65 @@ impl AttrId {
         let start = first_span.range.start();
         let end = last_span.range.end();
         TextRange::new(start, end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use span::Edition;
+    use syntax::{SourceFile, ast::HasModuleItem};
+
+    use super::*;
+
+    const ITEM: &str = r#"
+#[doc = "x"] #[r#inline] #[foo::doc] #[repr(C)] #[cfg_attr(all(), allow(x), derive(Y))]
+#[serde] #[r#must_use] #[unsafe(no_mangle)] #[must_used] #[r#mod_attr]
+struct S;
+"#;
+
+    /// The segment is read in place and filtered as when it was copied out first.
+    #[test]
+    fn segments_as_before() {
+        let file = SourceFile::parse(ITEM, Edition::CURRENT);
+        let item = file.tree().items().next().unwrap();
+        let cfg = CfgOptions::default();
+        let old_text = |path: &ast::Path| -> Option<SmolStr> {
+            Some(path.as_single_name_ref()?.text().trim_start_matches("r#").into())
+        };
+
+        let mut kept = Vec::new();
+        let _ = collect_item_tree_attrs::<Infallible>(
+            &item,
+            || &cfg,
+            |meta, _| {
+                kept.push(meta.syntax().text().to_string());
+                ControlFlow::Continue(())
+            },
+        );
+        let mut expected = Vec::new();
+        let _ = expand_cfg_attr::<Infallible>(
+            ast::attrs_including_inner(&item),
+            || &cfg,
+            |meta, _| {
+                let filtered = meta
+                    .path()
+                    .and_then(|it| old_text(&it))
+                    .is_some_and(|it| is_item_tree_filtered_attr(&it));
+                if !filtered {
+                    expected.push(meta.syntax().text().to_string());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(kept, expected);
+        assert_eq!(kept, ["foo::doc", "derive(Y)", "serde", "no_mangle", "must_used", "r#mod_attr"]);
+
+        for attr in ast::attrs_including_inner(&item) {
+            let Some(path) = attr.meta().and_then(|it| it.path()) else { continue };
+            for word in ["doc", "inline", "must_use", "foo", "mod_attr", "r#inline", ""] {
+                assert_eq!(path.is1(word), old_text(&path).is_some_and(|it| it == word), "{word}");
+            }
+            assert_eq!(path.as_one_segment(), old_text(&path));
+        }
     }
 }

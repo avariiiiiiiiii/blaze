@@ -87,7 +87,11 @@ impl Pinned<'_> {
 
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
     /// is a directory; `None` for none, a file, or a root the tree does not have.
-    pub fn list(&self, root: ContentId, path: &str) -> Option<impl Iterator<Item = (&str, bool)> + '_> {
+    pub fn list(
+        &self,
+        root: ContentId,
+        path: &str,
+    ) -> Option<impl Iterator<Item = (&str, bool)> + '_> {
         let (node, _) = self.walk(root, path)?;
         // SAFETY: reached through this table while pinned.
         let shape = unsafe { self.table.shape(node) };

@@ -12,8 +12,11 @@
 //! ids and closure positions are positions in that body's own store.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::{Debug, Write as _},
+    hash::BuildHasher,
+    mem,
+    sync::LazyLock,
 };
 
 use base_db::Crate;
@@ -51,22 +54,25 @@ use hir_ty::{
     },
     next_solver::{
         Allocation, Binder, BoundRegion, Clause, Const, ConstKind, DbInterner, FnSig, GenericArgs,
-        ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, Term, TermId, TraitRef, Ty, TyKind,
-        ValTree,
+        ImplTraitIdx, OpaqueTyIdWrapper, Pattern, Region, StoredTy, Term, TermId, TraitRef, Ty,
+        TyKind, ValTree,
     },
     rpit_hidden_types,
     traits::{ParamEnvAndCrate, implements_traits_unique},
 };
 use intern::Symbol;
 use rustc_abi::ReprOptions;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasTermKind, AliasTyKind, BoundRegionKind, BoundTyKind, BoundVarIndexKind, ClauseKind,
     ExistentialPredicate, GenericArgKind, InferConst, InferTy, Interner as _, OutlivesPredicate,
     PatternKind, RegionKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
-use syntax::{AstNode, ast::HasVisibility};
+use syntax::{
+    AstNode,
+    ast::{self, HasVisibility},
+};
 
 use crate::{
     ItemId, ItemKey,
@@ -127,43 +133,79 @@ pub(crate) struct Code {
 
 const _: () = assert!(size_of::<Code>() == 88);
 
-/// A finished sub-form inside one [`Cx`]: its refs are a range of [`Cx::refs`].
-#[derive(Clone, Copy)]
-struct Part {
-    digest: ContentId,
-    spans: ContentId,
-    refs_at: u32,
-    refs_len: u32,
-    missed: Option<Missed>,
-}
-
-const _: () = assert!(size_of::<Part>() == 76);
+/// The spans hash of a form with no positions, which most are.
+static NO_SPANS: LazyLock<ContentId> = LazyLock::new(|| ContentId::of(SPANS_DOMAIN, &[]));
 
 /// The preimages of a form's digest and spans, hashed when it is finished: whole, or many
-/// small ones in one batched call ([`Cx::parts`]).
+/// small ones in one batched call ([`Cx::set`]). Its buffers come from the worker's [`SPARE`]
+/// and go back there when it is dropped, so a form allocates only when it outgrows them.
 struct Form {
+    digest: Vec<u8>,
+    spans: Vec<u8>,
+    /// Distinct, in slot order.
+    refs: Vec<ItemId>,
+    /// The slot of each of `refs`, filled once there are more than [`SCAN`].
+    slots: FxHashMap<ItemId, u32>,
+    missed: Option<Missed>,
+    /// The first walk of a body, which only finds the locals it uses: nothing is written, and
+    /// what names no local (types, constants, allocations, variants) is not spelled.
+    quiet: bool,
+}
+
+/// Up to this many refs a slot is found by scanning them, which beats hashing.
+const SCAN: usize = 8;
+
+#[derive(Default)]
+struct FormBuffers {
     digest: Vec<u8>,
     spans: Vec<u8>,
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
-    missed: Option<Missed>,
+}
+
+/// What one worker keeps of finished forms and walks to write the next ones into: at most
+/// [`SPARE_COUNT`] of each, none of more than [`SPARE_BYTES`]. Per thread, so taking and
+/// giving back is a borrow flag, never a lock or a shared write.
+struct Spare {
+    forms: Vec<FormBuffers>,
+    canons: Vec<CanonBuffers>,
+}
+
+const SPARE_COUNT: usize = 64;
+const SPARE_BYTES: usize = 1 << 20;
+
+thread_local! {
+    static SPARE: RefCell<Spare> =
+        const { RefCell::new(Spare { forms: Vec::new(), canons: Vec::new() }) };
 }
 
 impl Form {
     fn new(tag: &str) -> Form {
-        let mut form = Form {
+        let FormBuffers { digest, spans, refs, slots } = SPARE
+            .try_with(|spare| spare.try_borrow_mut().ok().and_then(|mut it| it.forms.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let mut form = Form { digest, spans, refs, slots, missed: None, quiet: false };
+        form.str(tag);
+        form
+    }
+
+    fn quiet() -> Form {
+        Form {
             digest: Vec::new(),
             spans: Vec::new(),
             refs: Vec::new(),
             slots: FxHashMap::default(),
             missed: None,
-        };
-        form.str(tag);
-        form
+            quiet: true,
+        }
     }
 
     fn update(&mut self, bytes: &[u8]) {
-        self.digest.extend_from_slice(bytes);
+        if !self.quiet {
+            self.digest.extend_from_slice(bytes);
+        }
     }
 
     fn u8(&mut self, value: u8) {
@@ -184,6 +226,20 @@ impl Form {
 
     fn len(&mut self, len: usize) {
         self.u64(len as u64);
+    }
+
+    /// A length to be written by [`Form::set_len`] once what it counts is: the bytes
+    /// [`Form::len`] before them writes, without collecting them first.
+    fn len_at(&mut self) -> usize {
+        let at = self.digest.len();
+        self.u64(0);
+        at
+    }
+
+    fn set_len(&mut self, at: usize, len: usize) {
+        if !self.quiet {
+            self.digest[at..at + 8].copy_from_slice(&(len as u64).to_le_bytes());
+        }
     }
 
     fn bool(&mut self, value: bool) {

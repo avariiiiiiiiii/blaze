@@ -63,7 +63,7 @@ impl LatePass for DropForgetUseless {
     }
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, _out: &mut Vec<Found>) {
-        self.semi_stmt = match &b.store()[block] {
+        self.semi_stmt = match b.store().expr(block) {
             Expr::Block { statements, .. } => match statements.get(index) {
                 Some(Statement::Expr { expr, has_semi: true }) => Some(*expr),
                 _ => None,
@@ -73,7 +73,7 @@ impl LatePass for DropForgetUseless {
     }
 
     fn check_arm(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, index: usize, _out: &mut Vec<Found>) {
-        if let Expr::Match { arms, .. } = &b.store()[expr]
+        if let Expr::Match { arms, .. } = b.store().expr(expr)
             && let Some(arm) = arms.get(index)
         {
             self.arm_values.insert(arm.expr);
@@ -89,7 +89,7 @@ impl LatePass for DropForgetUseless {
         let solver = util::Solver::of(b);
         let is_copy = solver.is_copy(arg_ty);
         let is_ref = matches!(arg_ty.kind(), TyKind::Ref(..));
-        let single_call_in_arm = can_have_side_effects(b, arg) && self.arm_values.contains(&expr);
+        let single_call_in_arm = self.arm_values.contains(&expr) && can_have_side_effects(b, arg);
         let (lint, message) = match name {
             MEM_DROP if is_ref && !single_call_in_arm => (
                 "dropping_references",
@@ -178,23 +178,23 @@ fn ancestor_inside_same_ctxt(span: &Span, outer: &Span) -> Option<Span> {
 /// them alone as having none (calls of tuple structs' and variants' constructors included).
 fn can_have_side_effects(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
     let any = |exprs: &[ExprId]| exprs.iter().any(|it| can_have_side_effects(b, *it));
-    stdx::ensure_sufficient_stack(|| match &b.store()[expr] {
+    stdx::ensure_sufficient_stack(|| match b.store().expr(expr) {
         Expr::Path(_) | Expr::Literal(_) | Expr::OffsetOf(_) | Expr::IncludeBytes => false,
         Expr::UnaryOp { expr, .. } | Expr::Field { expr, .. } | Expr::Ref { expr, .. } | Expr::Cast { expr, .. } => {
-            can_have_side_effects(b, *expr)
+            can_have_side_effects(b, expr)
         }
-        Expr::Index { base, .. } => can_have_side_effects(b, *base),
+        Expr::Index { base, .. } => can_have_side_effects(b, base),
         Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::ArithOp(_) | BinaryOp::LogicOp(_) | BinaryOp::CmpOp(_)) } => {
-            can_have_side_effects(b, *lhs) || can_have_side_effects(b, *rhs)
+            can_have_side_effects(b, lhs) || can_have_side_effects(b, rhs)
         }
         Expr::RecordLit { fields, spread, .. } => {
             fields.iter().any(|it| can_have_side_effects(b, it.expr))
-                || matches!(spread, RecordSpread::Expr(it) if can_have_side_effects(b, *it))
+                || matches!(spread, RecordSpread::Expr(it) if can_have_side_effects(b, it))
         }
         Expr::Array(Array::ElementList { elements }) => any(elements),
-        Expr::Array(Array::Repeat { initializer, .. }) => can_have_side_effects(b, *initializer),
+        Expr::Array(Array::Repeat { initializer, .. }) => can_have_side_effects(b, initializer),
         Expr::Tuple { exprs } => any(exprs),
-        Expr::Call { callee, args } if is_fn_ctor(b, *callee) => any(args),
+        Expr::Call { callee, args } if is_fn_ctor(b, callee) => any(args),
         _ => true,
     })
 }
@@ -202,7 +202,7 @@ fn can_have_side_effects(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
 /// The callee is a path written without a type before it (rustc's `QPath::Resolved(None, ..)`)
 /// that names the constructor of a tuple struct or a tuple variant.
 fn is_fn_ctor(b: &BodyCx<'_, '_>, callee: ExprId) -> bool {
-    let Expr::Path(path) = &b.store()[callee] else { return false };
+    let Expr::Path(path) = b.store().expr(callee) else { return false };
     let type_relative =
         path.type_anchor().is_some() || path.segments().first().is_some_and(|it| it.name.as_str() == "Self");
     !type_relative && matches!(util::path_value(b, callee), Some(ValueNs::StructId(_) | ValueNs::EnumVariantId(_)))

@@ -139,6 +139,26 @@ number. Children are stepped over by their subtree ends, tokens read straight fr
 and nothing is copied per element. Nothing to change. The host that writes the arrays
 (`hir-ide/src/const_macro.rs`) pushes each element once per call, into the evaluator's memory.
 
+## Unsafe ([unsafe.md](../../design/unsafe.md))
+
+- None of the layouts above needed `unsafe`. Columns are `[u32; N]` arrays viewed with
+  `as_flattened` and `as_chunks`, and searched with the safe `partition_point`.
+- `const-ast`: no unsafe; `#![forbid(unsafe_code)]`.
+- `span`: `#![deny(unsafe_code)]`, allowed only in `hygiene.rs`, the one place a
+  `SyntaxContext` becomes a salsa id, through `salsa::Id::from_index`, which has no safe
+  version.
+  - Before, `SyntaxContext::id` passed any non-root value to `from_index`. Values come from
+    persisted bytes (`hir-def/src/hir/persist.rs`) and proc-macro wire formats, so a bad value
+    broke `from_index`'s `index < MAX_U32`, and `u32::MAX` made a `NonZeroU32` of 0. Now `id`
+    checks that bound before the call, with one compare, so bad bytes panic. What remains of
+    `from_u32`'s `# Safety` is a correctness contract, not a memory-safety one (salsa's table
+    checks page, slot and type), and it says so. `from_u32` stays `unsafe fn` because ten
+    callers in other crates wrap it in `unsafe`, which marks where they trust decoded bytes.
+  - `EditionedFileId::edition` read the edition with `transmute`; it is now a `const` match
+    that panics on a value no constructor makes. A `const` assert catches a new edition.
+  - Every remaining block has a `// SAFETY:` comment with one unsafe op. Tests check that a
+    context past the roots and `u32::MAX` panic.
+
 ## Tests (beside the code; none run, nothing is compiled yet)
 
 - `ast_id`:

@@ -433,7 +433,6 @@ fn callable_descr(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<&'static str> {
 pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMatch<'_>, item_kind: &str) {
     let ty = cx.ty(&no_match.receiver);
     diag.span_label(no_match.name_span.clone(), format!("{item_kind} not found in `{ty}`"));
-    let peeled = no_match.receiver.strip_reference();
     let string_or_str = match no_match.receiver.as_reference() {
         Some((inner, _)) => inner.is_str() || is_string(cx, &inner),
         None => is_string(cx, &no_match.receiver),
@@ -446,7 +445,6 @@ pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
             Applicability::MachineApplicable,
         );
     }
-    let _ = peeled;
     if no_match.receiver.as_adt().is_none() {
         return;
     }

@@ -458,16 +458,17 @@ fn compiled(
     named: &[ir::StackSlot],
 ) -> Result<fragment::Code, CodegenError> {
     let isa = isa(unit)?;
-    let mut context = cranelift_codegen::Context::for_function(func);
-    let pairs = crate::float_pair::lower(&mut context.func);
-    let mut code = crate::emit(&mut context).map_err(|e| failed(unit, e))?;
-    if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
-        code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
-    }
-    if let Some(pairs) = pairs {
-        pairs.hold(&context, &mut code).map_err(|e| failed(unit, e))?;
-    }
-    Ok(code)
+    crate::with_context(func, |context| {
+        let pairs = crate::float_pair::lower(&mut context.func);
+        let mut code = crate::emit(context).map_err(|e| failed(unit, e))?;
+        if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
+            code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
+        }
+        if let Some(pairs) = pairs {
+            pairs.hold(context, &mut code).map_err(|e| failed(unit, e))?;
+        }
+        Ok(code)
+    })
 }
 
 impl Prepare for Backends {

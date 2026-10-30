@@ -322,6 +322,76 @@ mod tests {
         expectation.assert_eq(&closures);
     }
 
+    /// As [`check`], without the closures' ranges: each closure with upvars, in source order.
+    #[track_caller]
+    fn check_names(#[rust_analyzer::rust_fixture] ra_fixture: &str, expectation: Expect) {
+        let db = TestDB::with_files(ra_fixture);
+        let def_map = crate_def_map(&db, db.test_crate());
+        let func = def_map
+            .modules(&db)
+            .flat_map(|(_, module)| module.scope(&db).declarations())
+            .filter_map(|decl| match decl {
+                ModuleDefId::FunctionId(func) => Some(func),
+                _ => None,
+            })
+            .filter(|&func| upvars_mentioned(&db, DefWithBodyId::from(func).into()).is_some())
+            .exactly_one()
+            .unwrap_or_else(|_| panic!("expected one function with closures that capture"));
+        let (body, source_map) = Body::with_source_map(&db, func.into());
+        let upvars = upvars_mentioned(&db, DefWithBodyId::from(func).into()).unwrap();
+        let mut closures: Vec<_> = upvars
+            .iter()
+            .map(|(&closure, upvars)| {
+                let start = source_map.expr_syntax(closure).unwrap().value.text_range().start();
+                let names = upvars
+                    .iter()
+                    .map(|local| body[local].name.display(&db, Edition::CURRENT))
+                    .join(", ");
+                (start, names)
+            })
+            .collect();
+        closures.sort_unstable_by_key(|&(start, _)| start);
+        expectation.assert_eq(&closures.into_iter().map(|(_, names)| names).join("\n"));
+    }
+
+    #[test]
+    fn nested_three_deep_with_items() {
+        check_names(
+            r#"
+fn bar() {}
+struct Unit;
+fn foo() {
+    let a = 1;
+    let bar2 = 2;
+    || {
+        let b = a;
+        || {
+            || { a; b; bar(); bar2; Unit };
+        };
+    };
+}
+        "#,
+            expect![[r#"
+                a, bar2
+                a, bar2, b
+                a, bar2, b"#]],
+        );
+    }
+
+    #[test]
+    fn shadowed_by_a_closure_local() {
+        check_names(
+            r#"
+fn foo() {
+    let x = 1;
+    || { let x = 2; x };
+    || x;
+}
+        "#,
+            expect!["x"],
+        );
+    }
+
     #[test]
     fn simple() {
         check(

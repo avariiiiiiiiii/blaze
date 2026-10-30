@@ -1,11 +1,11 @@
 //! Things related to opaques in the next-trait-solver.
 
-use intern::{Interned, InternedRef, impl_internable};
-use macros::GenericTypeVisitable;
+use std::{marker::PhantomData, num::NonZeroU32};
+
 use rustc_ast_ir::try_visit;
 use rustc_type_ir::inherent::SliceLike;
 
-use crate::next_solver::{impl_foldable_for_interned_slice, interned_slice};
+use crate::next_solver::{impl_foldable_for_interned_slice, interned_slice, interner::table};
 
 use super::{DbInterner, SolverDefId, Ty};
 
@@ -35,35 +35,38 @@ interned_slice!(
 );
 impl_foldable_for_interned_slice!(SolverDefIds);
 
+/// Every interned [`ExternalConstraints`], kept whole: it derefs to its data.
+static EXTERNAL_CONSTRAINTS: table::Values<ExternalConstraintsData<'static>> =
+    table::Values::new("external constraints");
+
+/// Solver constraints: their row in [`EXTERNAL_CONSTRAINTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct ExternalConstraints<'db> {
-    interned: InternedRef<'db, ExternalConstraintsInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub(super) struct ExternalConstraintsInterned(ExternalConstraintsData<'static>);
-
-impl_internable!(gc; ExternalConstraintsInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<ExternalConstraints<'static>>();
-};
+const _: () = assert!(size_of::<Option<ExternalConstraints<'static>>>() == 4);
 
 impl<'db> ExternalConstraints<'db> {
     #[inline]
     pub fn new(_interner: DbInterner<'db>, data: ExternalConstraintsData<'db>) -> Self {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
         let data = unsafe {
             std::mem::transmute::<ExternalConstraintsData<'db>, ExternalConstraintsData<'static>>(
                 data,
             )
         };
-        Self { interned: Interned::new_gc(ExternalConstraintsInterned(data)) }
+        ExternalConstraints { index: EXTERNAL_CONSTRAINTS.intern(data), _db: PhantomData }
     }
 
     #[inline]
     pub fn inner(&self) -> &ExternalConstraintsData<'db> {
-        let inner = &self.interned.0;
+        // SAFETY: an `ExternalConstraints` is a row of `EXTERNAL_CONSTRAINTS`.
+        let inner = unsafe { EXTERNAL_CONSTRAINTS.get(self.index) };
+        // SAFETY: as in `new`.
         unsafe {
             std::mem::transmute::<&ExternalConstraintsData<'static>, &ExternalConstraintsData<'db>>(
                 inner,

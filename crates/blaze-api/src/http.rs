@@ -106,6 +106,15 @@ impl RequestParser {
         }
     }
 
+    /// [`RequestParser::push`] of a buffer that is the caller's no more: kept as it is,
+    /// uncopied, when nothing is held before it.
+    pub(crate) fn push_vec(&mut self, bytes: Vec<u8>) {
+        match self.bytes.is_empty() && self.broken.is_none() {
+            true => self.bytes = bytes,
+            false => self.push(&bytes),
+        }
+    }
+
     /// The next whole request (Content-Length or chunked body), `Ok(None)` until one is here.
     /// After an error every call gives it again: the connection is not in step any more.
     pub fn next(&mut self) -> Result<Option<HttpRequest>, HttpError> {
@@ -145,7 +154,8 @@ impl RequestParser {
                     if self.bytes.len() < len {
                         return Ok(None);
                     }
-                    let body = self.bytes.drain(..len).collect();
+                    let rest = self.bytes.split_off(len);
+                    let body = std::mem::replace(&mut self.bytes, rest);
                     return Ok(Some(self.finish(body)));
                 }
                 RequestState::Body { body: BodyRead::Chunked { chunks, body }, .. } => {
@@ -273,7 +283,10 @@ impl ResponseParser {
         match &mut self.body {
             ResponseBody::Length(left) => {
                 let here = self.bytes.len().min(*left);
-                self.out.extend(self.bytes.drain(..here));
+                match here == self.bytes.len() && self.out.is_empty() {
+                    true => std::mem::swap(&mut self.out, &mut self.bytes),
+                    false => self.out.extend(self.bytes.drain(..here)),
+                }
                 *left -= here;
                 if *left == 0 {
                     self.body = ResponseBody::Done;
@@ -303,7 +316,10 @@ impl ResponseParser {
                     let said = format!("a body of more than {} bytes", self.most_body);
                     return Err(HttpError::new(413, said));
                 }
-                self.out.append(&mut self.bytes);
+                match self.out.is_empty() {
+                    true => std::mem::swap(&mut self.out, &mut self.bytes),
+                    false => self.out.append(&mut self.bytes),
+                }
                 if self.ended {
                     self.body = ResponseBody::Done;
                 }
@@ -329,15 +345,21 @@ struct HeadScan {
 impl HeadScan {
     /// Where the head ends in `bytes` (past its blank line), once it is whole.
     fn scan(&mut self, bytes: &[u8]) -> Result<Option<usize>, HttpError> {
-        while let Some(&byte) = bytes.get(self.at) {
-            self.at += 1;
-            if byte != b'\n' {
+        let too_long = || HttpError::new(431, "a head line longer than 8 KiB");
+        loop {
+            let Some(found) = memchr::memchr(b'\n', &bytes[self.at..]) else {
+                self.at = bytes.len();
                 if self.at - self.line_start > LONGEST_LINE + 1 {
-                    return Err(HttpError::new(431, "a head line longer than 8 KiB"));
+                    return Err(too_long());
                 }
-                continue;
+                return Ok(None);
+            };
+            let end = self.at + found;
+            if end - self.line_start > LONGEST_LINE + 1 {
+                return Err(too_long());
             }
-            let line = &bytes[self.line_start..self.at - 1];
+            self.at = end + 1;
+            let line = &bytes[self.line_start..end];
             let Some(line) = line.strip_suffix(b"\r") else {
                 return Err(HttpError::new(400, "a head line ended by LF without CR"));
             };
@@ -354,7 +376,6 @@ impl HeadScan {
                 }
             }
         }
-        Ok(None)
     }
 }
 
@@ -616,47 +637,100 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-fn head_bytes(start: &str, headers: &[(&str, &str)], last: (&str, &str)) -> Vec<u8> {
-    let mut out = String::from(start);
-    out.push_str("\r\n");
-    for (name, value) in headers.iter().chain([&last]) {
-        out.push_str(name);
-        out.push_str(": ");
-        out.push_str(value);
-        out.push_str("\r\n");
+/// A head onto the end of `out`: its start line, `first`, `headers`, `last`, the blank line.
+fn head_into(
+    out: &mut Vec<u8>,
+    start: &[&str],
+    first: Option<(&str, &str)>,
+    headers: &[(&str, &str)],
+    last: (&str, &str),
+) {
+    for part in start {
+        out.extend_from_slice(part.as_bytes());
     }
-    out.push_str("\r\n");
-    out.into_bytes()
+    out.extend_from_slice(b"\r\n");
+    for (name, value) in first.iter().chain(headers).chain([&last]) {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+}
+
+/// `n` in decimal, as the digits it ends `digits` with.
+fn decimal(n: usize, digits: &mut [u8; 20]) -> &str {
+    let mut at = digits.len();
+    let mut n = n;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&digits[at..]).expect("decimal digits are UTF-8")
+}
+
+/// A response's start line, `HTTP/1.1 200 OK`, as the parts [`head_into`] writes.
+fn status_line(status: u16, digits: &mut [u8; 20]) -> [&str; 4] {
+    ["HTTP/1.1 ", decimal(usize::from(status), digits), " ", reason(status)]
 }
 
 /// A whole response, with its Content-Length.
 pub fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
-    let start = format!("HTTP/1.1 {status} {}", reason(status));
-    let len = body.len().to_string();
-    let mut out = head_bytes(&start, headers, ("Content-Length", len.as_str()));
+    let mut out = Vec::new();
+    let (mut digits, mut len) = ([0; 20], [0; 20]);
+    let start = status_line(status, &mut digits);
+    let length = ("Content-Length", decimal(body.len(), &mut len));
+    head_into(&mut out, &start, None, headers, length);
     out.extend_from_slice(body);
     out
 }
 
 /// The head of a response whose body comes in [`chunk`]s, ended by [`last_chunk`].
 pub fn chunked(status: u16, headers: &[(&str, &str)]) -> Vec<u8> {
-    let start = format!("HTTP/1.1 {status} {}", reason(status));
-    head_bytes(&start, headers, ("Transfer-Encoding", "chunked"))
+    let mut out = Vec::new();
+    chunked_into(&mut out, status, headers);
+    out
+}
+
+/// [`chunked`] onto the end of `out`.
+pub fn chunked_into(out: &mut Vec<u8>, status: u16, headers: &[(&str, &str)]) {
+    let mut digits = [0; 20];
+    let start = status_line(status, &mut digits);
+    head_into(out, &start, None, headers, ("Transfer-Encoding", "chunked"));
 }
 
 /// `bytes` as one chunk; no bytes give no output, never the last chunk.
 pub fn chunk(bytes: &[u8]) -> Vec<u8> {
-    if bytes.is_empty() {
-        return Vec::new();
-    }
-    let mut out = format!("{:x}\r\n", bytes.len()).into_bytes();
-    out.extend_from_slice(bytes);
-    out.extend_from_slice(b"\r\n");
+    let mut out = Vec::new();
+    chunk_into(&mut out, bytes);
     out
 }
 
+/// [`chunk`] onto the end of `out`.
+pub fn chunk_into(out: &mut Vec<u8>, bytes: &[u8]) {
+    let len = bytes.len();
+    if len == 0 {
+        return;
+    }
+    let digits = (usize::BITS - len.leading_zeros()).div_ceil(4);
+    out.reserve(digits as usize + len + 4);
+    for digit in (0..digits).rev() {
+        out.push(b"0123456789abcdef"[(len >> (digit * 4)) & 0xf]);
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// The chunk that ends a chunked body, with no trailers.
+pub const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
 pub fn last_chunk() -> Vec<u8> {
-    b"0\r\n\r\n".to_vec()
+    LAST_CHUNK.to_vec()
 }
 
 /// A whole request to `host`, with its Content-Length.
@@ -667,13 +741,26 @@ pub fn request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Vec<u8> {
-    let start = format!("{method} {path} HTTP/1.1");
-    let headers: Vec<(&str, &str)> =
-        [("Host", host)].into_iter().chain(headers.iter().copied()).collect();
-    let len = body.len().to_string();
-    let mut out = head_bytes(&start, &headers, ("Content-Length", len.as_str()));
+    let mut out = Vec::new();
+    request_head_into(&mut out, method, host, path, headers, body.len());
     out.extend_from_slice(body);
     out
+}
+
+/// The head of [`request`] of a body of `len` bytes onto the end of `out`, for the body to be
+/// written after it from where it lies.
+pub(crate) fn request_head_into(
+    out: &mut Vec<u8>,
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    len: usize,
+) {
+    let mut digits = [0; 20];
+    let start = [method, " ", path, " HTTP/1.1"];
+    let length = ("Content-Length", decimal(len, &mut digits));
+    head_into(out, &start, Some(("Host", host)), headers, length);
 }
 
 /// Blocking: one whole response from `from`. What `from` gives past the response's end is

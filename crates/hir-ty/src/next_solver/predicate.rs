@@ -1,15 +1,12 @@
 //! Things related to predicates.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, marker::PhantomData, num::NonZeroU32};
 
-use intern::{
-    Interned, InternedRef, InternedSlice, InternedSliceRef, impl_internable, impl_slice_internable,
-};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     self as ty, CollectAndApply, EarlyBinder, FlagComputation, Flags, GenericTypeVisitable,
     PredicatePolarity, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, Upcast,
-    UpcastFrom, WithCachedTypeInfo,
+    UpcastFrom,
     elaborate::Elaboratable,
     error::{ExpectedFound, TypeError},
     inherent::{IntoKind, SliceLike},
@@ -17,7 +14,7 @@ use rustc_type_ir::{
 
 use crate::next_solver::{
     GenericArg, TraitIdWrapper, default_types, impl_foldable_for_interned_slice,
-    impl_stored_interned_slice, interned_slice,
+    impl_stored_interned_slice, interned_slice, interner::table, persist,
 };
 
 use super::{Binder, BoundVarKinds, DbInterner, Region, Ty};
@@ -183,46 +180,40 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for BoundExistentialPre
     }
 }
 
+/// Every interned [`Predicate`].
+static PREDICATES: table::Rows = table::Rows::new("predicates", table::LAST_ROW);
+
+/// A predicate: its row in [`PREDICATES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Predicate<'db> {
-    interned: InternedRef<'db, PredicateInterned>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
 
-#[derive(PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub(super) struct PredicateInterned(WithCachedTypeInfo<Binder<'static, PredicateKind<'static>>>);
-
-impl_internable!(gc; PredicateInterned);
-
-const _: () = {
-    const fn is_copy<T: Copy>() {}
-    is_copy::<Predicate<'static>>();
-};
+const _: () = assert!(size_of::<Option<Predicate<'static>>>() == 4);
 
 impl<'db> Predicate<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: Binder<'db, PredicateKind<'db>>) -> Self {
-        let kind = unsafe {
-            std::mem::transmute::<
-                Binder<'db, PredicateKind<'db>>,
-                Binder<'static, PredicateKind<'static>>,
-            >(kind)
-        };
-        let flags = FlagComputation::for_predicate(kind);
-        let cached = WithCachedTypeInfo {
-            internee: kind,
-            flags: flags.flags,
-            outer_exclusive_binder: flags.outer_exclusive_binder,
-        };
-        Self { interned: Interned::new_gc(PredicateInterned(cached)) }
+        Self::intern(kind)
     }
 
-    pub fn inner(&self) -> &WithCachedTypeInfo<Binder<'db, PredicateKind<'db>>> {
-        let inner = &self.interned.0;
-        unsafe {
-            std::mem::transmute::<
-                &WithCachedTypeInfo<Binder<'static, PredicateKind<'static>>>,
-                &WithCachedTypeInfo<Binder<'db, PredicateKind<'db>>>,
-            >(inner)
-        }
+    pub(super) fn intern(kind: Binder<'db, PredicateKind<'db>>) -> Self {
+        let words = persist::encode(&kind);
+        Self::at(PREDICATES.intern(&words, || {
+            let computed = FlagComputation::for_predicate(kind);
+            (computed.flags, computed.outer_exclusive_binder)
+        }))
+    }
+
+    #[inline]
+    pub(super) fn at(index: NonZeroU32) -> Self {
+        Predicate { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(super) fn row(self) -> NonZeroU32 {
+        self.index
     }
 
     /// Flips the polarity of a Predicate.
@@ -254,16 +245,27 @@ impl<'db> std::fmt::Debug for Predicate<'db> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, GenericTypeVisitable)]
-pub struct ClausesCachedTypeInfo(WithCachedTypeInfo<()>);
+/// Where every interned [`Clauses`] is: a list table with flags, for `Clauses` is `Flags`.
+pub struct ClausesStorage;
 
-impl_slice_internable!(gc; ClausesStorage, ClausesCachedTypeInfo, Clause<'static>);
-impl_stored_interned_slice!(ClausesStorage, Clauses, StoredClauses);
+impl ClausesStorage {
+    #[inline]
+    fn table() -> &'static table::Lists<Clause<'static>> {
+        static TABLE: table::Lists<Clause<'static>> = table::Lists::new("Clauses");
+        &TABLE
+    }
+}
+
+impl_stored_interned_slice!(Clauses, StoredClauses);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Clauses<'db> {
-    interned: InternedSliceRef<'db, ClausesStorage>,
+    index: NonZeroU32,
+    _db: PhantomData<&'db ()>,
 }
+
+const _: () = assert!(size_of::<Option<Clauses<'static>>>() == 4);
 
 impl<'db> std::fmt::Debug for Clauses<'db> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -291,14 +293,38 @@ impl<'db> Clauses<'db> {
     /// needs to intern the global slice as well.
     #[inline]
     pub(crate) fn new_from_slice_no_empty_check(slice: &[Clause<'db>]) -> Self {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
         let slice = unsafe { ::std::mem::transmute::<&[Clause<'db>], &[Clause<'static>]>(slice) };
-        let flags = FlagComputation::<DbInterner<'db>>::for_clauses(slice);
-        let flags = ClausesCachedTypeInfo(WithCachedTypeInfo {
-            internee: (),
-            flags: flags.flags,
-            outer_exclusive_binder: flags.outer_exclusive_binder,
-        });
-        Self { interned: InternedSlice::from_header_and_slice(flags, slice) }
+        Self::at(ClausesStorage::table().intern_with(slice, || {
+            let computed = FlagComputation::<DbInterner<'db>>::for_clauses(slice);
+            (computed.flags, computed.outer_exclusive_binder)
+        }))
+    }
+
+    /// The list's place in its table: dense from 1, the same for equal lists, for the life of
+    /// the process.
+    #[inline]
+    pub fn index(self) -> u32 {
+        self.index.get()
+    }
+
+    /// The list at `index`, which [`Self::index`] gave. Panics on any other number.
+    pub fn from_index(_interner: DbInterner<'db>, index: u32) -> Self {
+        match NonZeroU32::new(index) {
+            Some(index) if ClausesStorage::table().published(index) => Self::at(index),
+            _ => panic!("{index} is not the index of an interned Clauses"),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn at(index: NonZeroU32) -> Self {
+        Clauses { index, _db: PhantomData }
+    }
+
+    #[inline]
+    pub(crate) fn row(self) -> NonZeroU32 {
+        self.index
     }
 
     #[inline]
@@ -312,8 +338,10 @@ impl<'db> Clauses<'db> {
 
     #[inline]
     pub fn as_slice(self) -> &'db [Clause<'db>] {
-        let slice = &self.interned.get().slice;
-        unsafe { ::std::mem::transmute::<&[Clause<'static>], &[Clause<'db>]>(slice) }
+        // SAFETY: `index` was given by the table's `intern_with`.
+        let slice = unsafe { ClausesStorage::table().get(self.index) };
+        // SAFETY: as in `new_from_slice_no_empty_check`.
+        unsafe { ::std::mem::transmute::<&[Clause<'static>], &'db [Clause<'db>]>(slice) }
     }
 
     #[inline]
@@ -416,7 +444,7 @@ impl<'db> rustc_type_ir::TypeVisitable<DbInterner<'db>> for Clauses<'db> {
 
 impl<'db, V: super::WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Clauses<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned_slice(self.interned).is_continue() {
+        if visitor.on_interned(ClausesStorage::table().name(), self.index.get()).is_continue() {
             self.as_slice().iter().for_each(|it| it.generic_visit_with(visitor));
         }
     }
@@ -425,12 +453,14 @@ impl<'db, V: super::WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Cla
 impl<'db> rustc_type_ir::Flags for Clauses<'db> {
     #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        self.interned.header.header.0.flags
+        // SAFETY: a `Clauses` is a row the table's `intern_with` gave.
+        unsafe { ClausesStorage::table().flags(self.index) }
     }
 
     #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        self.interned.header.header.0.outer_exclusive_binder
+        // SAFETY: as in `flags`.
+        unsafe { ClausesStorage::table().binder(self.index) }
     }
 }
 
@@ -498,7 +528,7 @@ impl<'db> TypeVisitable<DbInterner<'db>> for Predicate<'db> {
 
 impl<'db, V: super::WorldExposer> GenericTypeVisitable<V> for Predicate<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
-        if visitor.on_interned(self.interned).is_continue() {
+        if visitor.on_interned(PREDICATES.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
         }
     }
@@ -566,20 +596,26 @@ impl<'db> Elaboratable<DbInterner<'db>> for Predicate<'db> {
 }
 
 impl<'db> Flags for Predicate<'db> {
+    #[inline]
     fn flags(&self) -> rustc_type_ir::TypeFlags {
-        self.inner().flags
+        // SAFETY: a `Predicate` is a row of `PREDICATES`.
+        unsafe { PREDICATES.flags(self.index) }
     }
 
+    #[inline]
     fn outer_exclusive_binder(&self) -> rustc_type_ir::DebruijnIndex {
-        self.inner().outer_exclusive_binder
+        // SAFETY: as in `flags`.
+        unsafe { PREDICATES.binder(self.index) }
     }
 }
 
 impl<'db> IntoKind for Predicate<'db> {
     type Kind = Binder<'db, PredicateKind<'db>>;
 
+    #[inline]
     fn kind(self) -> Self::Kind {
-        self.inner().internee
+        // SAFETY: a `Predicate` is a row of `PREDICATES`.
+        persist::decode(unsafe { PREDICATES.fields(self.index) })
     }
 }
 

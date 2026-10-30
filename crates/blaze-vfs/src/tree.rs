@@ -194,7 +194,8 @@ impl Tree {
         let Tree { shared, name_index, names, name_bytes, .. } = self;
         let store = &shared.names;
         // SAFETY: every interned name was written by this tree.
-        let same = |&(at, id): &(u64, u32)| at == hash && unsafe { store.get(id) } == name.as_bytes();
+        let same =
+            |&(at, id): &(u64, u32)| at == hash && unsafe { store.get(id) } == name.as_bytes();
         match name_index.entry(hash, same, |&(at, _)| at) {
             hash_table::Entry::Occupied(it) => NameId(it.get().1),
             hash_table::Entry::Vacant(it) => {
@@ -411,7 +412,12 @@ impl Tree {
 
     /// Every file under `node`, with its path below `prefix` and its mode, in path order. `node`
     /// itself, when a file, is taken as `mode`.
-    pub(crate) fn files(&self, node: NodeId, mode: Mode, prefix: &str) -> Vec<(String, NodeId, Mode)> {
+    pub(crate) fn files(
+        &self,
+        node: NodeId,
+        mode: Mode,
+        prefix: &str,
+    ) -> Vec<(String, NodeId, Mode)> {
         let mut out = Vec::new();
         self.each_file(node, mode, &mut prefix.to_owned(), &mut |path, node, mode| {
             out.push((path.to_owned(), node, mode));
@@ -421,7 +427,13 @@ impl Tree {
 
     /// Calls `f` with every file under `node`, its path below `path` and its mode, in path
     /// order, building each path in the one buffer.
-    fn each_file(&self, node: NodeId, mode: Mode, path: &mut String, f: &mut impl FnMut(&str, NodeId, Mode)) {
+    fn each_file(
+        &self,
+        node: NodeId,
+        mode: Mode,
+        path: &mut String,
+        f: &mut impl FnMut(&str, NodeId, Mode),
+    ) {
         let Some(entries) = self.entries(node) else {
             f(path, node, mode);
             return;
@@ -616,7 +628,8 @@ impl Tree {
         changes: &[(Vec<&str>, Option<Blob>)],
         depth: usize,
     ) -> Option<NodeId> {
-        let old: Vec<Entry> = dir.and_then(|it| self.entries(it)).map(|it| it.iter().collect()).unwrap_or_default();
+        let old: Vec<Entry> =
+            dir.and_then(|it| self.entries(it)).map(|it| it.iter().collect()).unwrap_or_default();
         let mut out: Vec<Entry> = Vec::with_capacity(old.len() + changes.len());
         let mut kept = 0;
         let mut start = 0;
@@ -629,10 +642,11 @@ impl Tree {
                 out.push(old[kept]);
                 kept += 1;
             }
-            let existing = (kept < old.len() && self.name_bytes(old[kept].0) == name.as_bytes()).then(|| {
-                kept += 1;
-                old[kept - 1]
-            });
+            let existing = (kept < old.len() && self.name_bytes(old[kept].0) == name.as_bytes())
+                .then(|| {
+                    kept += 1;
+                    old[kept - 1]
+                });
             // The change at this name itself sorts first in its group: its path is the shortest.
             let (here, deeper) = match group[0].0.len() == depth + 1 {
                 true => (Some(&group[0].1), &group[1..]),
@@ -644,7 +658,8 @@ impl Tree {
                 }
                 // A directory, made of what was there if that was one and nothing replaced it.
                 _ => {
-                    let was = existing.map(|it| it.1).filter(|it| here.is_none() && self.is_dir(*it));
+                    let was =
+                        existing.map(|it| it.1).filter(|it| here.is_none() && self.is_dir(*it));
                     self.rebuild(was, deeper, depth + 1).map(|dir| (dir, Mode::Regular))
                 }
             };
@@ -682,7 +697,10 @@ impl Tree {
         if from == to {
             return;
         }
-        let all = |(node, mode): (NodeId, Mode), kind: ChangeKind, path: &mut String, out: &mut Vec<Change>| {
+        let all = |(node, mode): (NodeId, Mode),
+                   kind: ChangeKind,
+                   path: &mut String,
+                   out: &mut Vec<Change>| {
             self.each_file(node, mode, path, &mut |path, _, _| {
                 out.push(Change { path: path.to_owned(), kind });
             });
@@ -695,7 +713,9 @@ impl Tree {
                     while i < x.len() || j < y.len() {
                         let order = match (i < x.len(), j < y.len()) {
                             (true, true) if x.0.names[i] == y.0.names[j] => Ordering::Equal,
-                            (true, true) => self.name_bytes(NameId(x.0.names[i])).cmp(self.name_bytes(NameId(y.0.names[j]))),
+                            (true, true) => self
+                                .name_bytes(NameId(x.0.names[i]))
+                                .cmp(self.name_bytes(NameId(y.0.names[j]))),
                             (true, false) => Ordering::Less,
                             _ => Ordering::Greater,
                         };

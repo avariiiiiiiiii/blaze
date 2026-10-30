@@ -17,15 +17,16 @@ use inkwell::{
     llvm_sys::{core, prelude::LLVMValueRef},
     memory_buffer::MemoryBuffer,
     module::{Linkage, Module},
-    passes::PassBuilderOptions,
-    targets::{FileType, TargetMachine},
+    targets::FileType,
     types::BasicTypeEnum,
     values::{AsValueRef as _, BasicValueEnum, FunctionValue, InstructionOpcode},
 };
+use std::sync::Arc;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
-    INNER, Machine, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
+    INNER, Machine, Machinery, OWN, REBASED, Symbol, Unhandled, agree_calls, attribute_kind, emitted, link,
     lower::{Debug, Defined, Lowering},
     mark_hint, rebase, retold_bytes, told_constants, wrap,
 };
@@ -40,9 +41,10 @@ use crate::{
 pub(crate) struct Prelinked {
     /// Its module, the function under [`OWN`], with its line table if one was asked for:
     /// what its own compile starts from.
-    pub(crate) own: Vec<u8>,
-    /// The same without a line table: what importers link in.
-    pub(crate) export: Vec<u8>,
+    pub(crate) own: Arc<[u8]>,
+    /// The same without a line table: what importers link in. The same buffer as `own`
+    /// where there is no line table.
+    pub(crate) export: Arc<[u8]>,
     /// Its instructions, as LLVM counts them.
     pub(crate) size: usize,
     pub(crate) facts: Facts,
@@ -113,16 +115,10 @@ fn llvm(e: inkwell::support::LLVMString) -> Unhandled {
     Unhandled::Llvm(e.to_string_lossy().into_owned())
 }
 
-fn run(
-    module: &Module<'_>,
-    passes: &str,
-    machine: &TargetMachine,
-    vectorize: bool,
-) -> Result<(), Unhandled> {
-    let options = PassBuilderOptions::create();
-    // rustc vectorizes straight-line code at `-O2` and `-O3`.
-    options.set_loop_slp_vectorization(vectorize);
-    Tally::global().time(Phase::Optimize, || module.run_passes(passes, machine, options)).map_err(llvm)
+/// Runs `passes` over `module` through the passes kept for `machine`; `vectorize` as rustc
+/// vectorizes straight-line code at `-O2` and `-O3`.
+fn run(module: &Module<'_>, passes: &str, machine: &Machinery, vectorize: bool) -> Result<(), Unhandled> {
+    Tally::global().time(Phase::Optimize, || machine.run(module, passes, vectorize))
 }
 
 /// Lowers `func` alone into a module, runs the pre-link pipeline of `optimization` on it,
@@ -178,23 +174,25 @@ pub(crate) fn prelink(
             Ok::<_, Unhandled>(function)
         })?;
         told_functions(context, &module, wants, pointer)?;
-        if let Some(lines) = &lines {
-            lines.finish();
-        }
+        // The builder of the line table goes before the module is changed or let go of.
+        let lined = lines.inspect(Debug::finish).is_some();
         tally.time(Phase::Verify, || module.verify()).map_err(llvm)?;
         if let Some(passes) = prelink_passes(optimization) {
             run(&module, passes, machine, true)?;
         }
         let size = function.get_basic_blocks().iter().map(|it| it.get_instructions().count()).sum();
-        let facts = facts(context, &module, function, instances, machine)?;
-        let own = module.write_bitcode_to_memory().as_slice().to_vec();
-        let export = if lines.is_some() {
-            let stripped = module.clone();
-            stripped.strip_debug_info();
-            stripped.write_bitcode_to_memory().as_slice().to_vec()
-        } else {
-            own.clone()
+        let mut facts = facts(&module, function, instances);
+        let own: Arc<[u8]> = module.write_bitcode_to_memory().as_slice().into();
+        // The module is written: what follows changes it in place rather than a copy.
+        let export = match lined {
+            true => {
+                module.strip_debug_info();
+                module.write_bitcode_to_memory().as_slice().into()
+            }
+            false => Arc::clone(&own),
         };
+        let body = optimistic(context, module, function, instances, machine)?;
+        facts.body = Attrs { noreturn: facts.attrs.noreturn, ..body };
         Ok(Prelinked { own, export, size, facts })
     })
 }
@@ -403,21 +401,16 @@ fn arg_of(value: LLVMValueRef) -> Arg {
         let bits = core::LLVMGetIntTypeWidth(core::LLVMTypeOf(value));
         match u8::try_from(bits) {
             Ok(bits) if bits <= 64 => {
-                Arg::Int { bits, value: u128::from(core::LLVMConstIntGetZExtValue(value)) }
+                Arg::Int { bits, value: core::LLVMConstIntGetZExtValue(value) }
             }
             _ => Arg::Unknown,
         }
     }
 }
 
-/// What `function`, alone in `module` after the pre-link pipeline, says of itself.
-fn facts<'ctx>(
-    context: &'ctx Context,
-    module: &Module<'ctx>,
-    function: FunctionValue<'ctx>,
-    instances: &dyn Fn(u32) -> bool,
-    machine: &TargetMachine,
-) -> Result<Facts, Unhandled> {
+/// What `function`, alone in `module` after the pre-link pipeline, says of itself. Its
+/// `body` is its `attrs` until [`optimistic`] says more.
+fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &dyn Fn(u32) -> bool) -> Facts {
     let params = function.count_params();
     let unused = function
         .get_param_iter()
@@ -486,41 +479,32 @@ fn facts<'ctx>(
     addressed.sort_unstable();
     addressed.dedup();
     let attrs = attrs_of(function);
-    let body = optimistic(context, module, instances, machine)?;
-    Ok(Facts {
-        params,
-        unused,
-        calls,
-        addressed,
-        attrs,
-        body: Attrs { noreturn: attrs.noreturn, ..body },
-    })
+    Facts { params, unused, calls, addressed, attrs, body: attrs }
 }
 
-/// What LLVM's attribute inference says of the function of `module` when every function of
-/// `instances` it calls is nounwind, readnone, willreturn and norecurse: run on a copy, as
-/// what it assumes need not be true.
+/// What LLVM's attribute inference says of `function`, of `module`, when every function of
+/// `instances` it calls is nounwind, readnone, willreturn and norecurse. It takes the module,
+/// as what it assumes need not be true: nothing may be written or compiled from it after.
 fn optimistic<'ctx>(
     context: &'ctx Context,
-    module: &Module<'ctx>,
+    module: Module<'ctx>,
+    function: FunctionValue<'ctx>,
     instances: &dyn Fn(u32) -> bool,
-    machine: &TargetMachine,
+    machine: &Machinery,
 ) -> Result<Attrs, Unhandled> {
-    let copy = module.clone();
     let memory = attribute_kind("memory");
-    for function in copy.get_functions() {
-        if request_of(function).is_none_or(|it| !instances(it)) {
+    for callee in module.get_functions() {
+        if request_of(callee).is_none_or(|it| !instances(it)) {
             continue;
         }
-        function.remove_enum_attribute(AttributeLoc::Function, memory);
-        function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(memory, 0));
+        callee.remove_enum_attribute(AttributeLoc::Function, memory);
+        callee.add_attribute(AttributeLoc::Function, context.create_enum_attribute(memory, 0));
         for name in ["nounwind", "willreturn", "norecurse"] {
             let kind = attribute_kind(name);
-            function.add_attribute(AttributeLoc::Function, context.create_enum_attribute(kind, 0));
+            callee.add_attribute(AttributeLoc::Function, context.create_enum_attribute(kind, 0));
         }
     }
-    run(&copy, "cgscc(function-attrs)", machine, false)?;
-    let function = copy.get_function(OWN).ok_or(Unhandled::Shape("a copy without the function"))?;
+    run(&module, "cgscc(function-attrs)", machine, false)?;
     Ok(attrs_of(function))
 }
 
@@ -604,7 +588,6 @@ fn apply<'ctx>(
         let Arg::Int { bits, value } = arg else {
             return Err(Unhandled::Shape("a constant parameter that is not a constant"));
         };
-        let value = u64::try_from(value).map_err(|_| Unhandled::Shape("a constant of more than 64 bits"))?;
         let constant: BasicValueEnum<'ctx> = match param.get_type() {
             BasicTypeEnum::IntType(ty) if ty.get_bit_width() == u32::from(bits) => {
                 ty.const_int(value, false).into()
@@ -688,12 +671,13 @@ mod tests {
         context.create_module_from_ir(source).unwrap()
     }
 
-    fn machine() -> TargetMachine {
+    /// A target machine and its passes, for the one context of a test.
+    fn machine() -> Machinery {
         let optimization = Optimization {
             passes: Passes::Aggressive,
             selection: crate::backend::Selection::Optimized,
         };
-        Machine::create(optimization).unwrap()
+        Machinery::new(Machine::create(optimization).unwrap())
     }
 
     /// Calls its request 1 twice with one constant and its request 2 with two, takes the
@@ -765,7 +749,7 @@ define i32 @"blaze.own"() {
         let module = parsed(&context, CALLER);
         let function = module.get_function(OWN).unwrap();
         let instances = |it: u32| it != 4;
-        let facts = facts(&context, &module, function, &instances, &machine()).unwrap();
+        let facts = facts(&module, function, &instances);
         assert_eq!(facts.params, 3);
         // The `byval` one is read by the call.
         assert_eq!(facts.unused, vec![1]);
@@ -793,19 +777,27 @@ declare i32 @"blaze.f.1"(i32)
     #[test]
     fn the_body_assumes_the_best_of_the_builds_callees_and_the_function_nothing() {
         let context = Context::create();
-        let module = parsed(&context, PURE);
         let machine = machine();
-        let alone = facts(&context, &module, module.get_function(OWN).unwrap(), &|_| true, &machine).unwrap();
+        let module = parsed(&context, PURE);
+        let function = module.get_function(OWN).unwrap();
+        let alone = facts(&module, function, &|_| true);
         assert!(!alone.attrs.nounwind && !alone.attrs.readnone, "{:?}", alone.attrs);
-        assert!(alone.body.nounwind && alone.body.readnone && alone.body.readonly, "{:?}", alone.body);
-        assert!(alone.body.willreturn && alone.body.norecurse, "{:?}", alone.body);
-        // The module is as it was: the callee is assumed nothing of.
-        let callee = module.get_function("blaze.f.1").unwrap();
-        assert!(callee.get_enum_attribute(AttributeLoc::Function, attribute_kind("nounwind")).is_none());
+        assert_eq!(alone.body, alone.attrs);
+        // Run on the module itself, it says what it said run on a copy.
+        let copy = module.clone();
+        let copied = copy.get_function(OWN).unwrap();
+        let of_copy = optimistic(&context, copy, copied, &|_| true, &machine).unwrap();
+        let body = optimistic(&context, module, function, &|_| true, &machine).unwrap();
+        assert!(body.nounwind && body.readnone && body.readonly, "{body:?}");
+        assert!(body.willreturn && body.norecurse, "{body:?}");
+        assert_eq!(of_copy, body);
         // An outside symbol is assumed nothing of.
-        let outside = facts(&context, &module, module.get_function(OWN).unwrap(), &|_| false, &machine).unwrap();
-        assert!(!outside.body.nounwind && !outside.body.readnone, "{:?}", outside.body);
+        let module = parsed(&context, PURE);
+        let function = module.get_function(OWN).unwrap();
+        let outside = facts(&module, function, &|_| false);
         assert!(outside.calls.is_empty());
+        let body = optimistic(&context, module, function, &|_| false, &machine).unwrap();
+        assert!(!body.nounwind && !body.readnone, "{body:?}");
     }
 
     #[test]
@@ -876,7 +868,7 @@ define i32 @"blaze.own"(i32 %n) {
 "#,
         );
         let export = crate::imports::Export {
-            bitcode: callee.write_bitcode_to_memory().as_slice().to_vec(),
+            bitcode: callee.write_bitcode_to_memory().as_slice().into(),
             requests: Default::default(),
             signature: ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV),
             size: 2,

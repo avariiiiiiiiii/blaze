@@ -143,6 +143,8 @@ struct Rule {
     style: MacroCallStyle,
     lhs: MetaTemplate,
     rhs: MetaTemplate,
+    /// `lhs` flattened for the matcher, once per definition.
+    matcher: expander::Matcher,
 }
 
 impl DeclarativeMacro {
@@ -210,7 +212,7 @@ impl DeclarativeMacro {
                 // In the "simple" syntax, there is apparently no way to specify
                 // that the single rule is an attribute or derive rule, so it
                 // must be a function-like rule.
-                Ok(crate::Rule { style: MacroCallStyle::FnLike, lhs, rhs })
+                Ok(crate::Rule::new(MacroCallStyle::FnLike, lhs, rhs))
             })();
 
             match rule {
@@ -303,7 +305,13 @@ impl Rule {
         let lhs = MetaTemplate::parse_pattern(edition, lhs)?;
         let rhs = MetaTemplate::parse_template(edition, rhs)?;
 
-        Ok(crate::Rule { style, lhs, rhs })
+        Ok(crate::Rule::new(style, lhs, rhs))
+    }
+
+    fn new(style: MacroCallStyle, mut lhs: MetaTemplate, mut rhs: MetaTemplate) -> Rule {
+        let binders = parser::resolve_binders(&mut lhs, &mut rhs);
+        let matcher = expander::Matcher::new(&lhs, binders);
+        Rule { style, lhs, rhs, matcher }
     }
 }
 
@@ -404,8 +412,29 @@ pub fn expect_fragment<'t>(
 ) -> ExpandResult<tt::TokenTreesView<'t>> {
     use ::parser;
     let buffer = tt_iter.remaining();
-    let parser_input = to_matcher_input(buffer, &mut |ctx| ctx.edition(db));
-    let tree_traversal = entry_point.parse(&parser_input);
+    let mut edition = |ctx: SyntaxContext| ctx.edition(db);
+    // The parser reads only the first top-level trees of the level, doubled until it provably
+    // read nothing past them: its position only moves forward, and it reads at most
+    // `PARSER_LOOKAHEAD - 1` tokens past it (`Parser::nth` asserts `n <= 3`, and glued
+    // punctuation looks two further). A fragment costs its own length, not the rest of the
+    // level's, so `$($e:expr),*` is linear, not quadratic.
+    let mut window_trees = FIRST_WINDOW_TREES;
+    let tree_traversal = loop {
+        let mut fork = tt_iter.clone();
+        let savepoint = fork.savepoint();
+        let mut taken = 0;
+        while taken < window_trees && fork.next().is_some() {
+            taken += 1;
+        }
+        let whole = fork.is_empty();
+        let parser_input = to_matcher_input(fork.from_savepoint(savepoint), &mut edition);
+        let output = entry_point.parse(&parser_input);
+        if whole || consumed_input_tokens(&output) + PARSER_LOOKAHEAD <= parser_input.len() {
+            break output;
+        }
+        window_trees *= 2;
+    };
+    // Over the whole level, so that `flat_advance_to` keeps its end.
     let mut cursor = buffer.cursor();
     let mut error = false;
     for step in tree_traversal.iter() {
@@ -448,4 +477,22 @@ pub fn expect_fragment<'t>(
     tt_iter.flat_advance_to(&cursor);
 
     ExpandResult { value: res, err }
+}
+
+/// How many tokens past its position the `parser` crate's parser may read, plus one.
+const PARSER_LOOKAHEAD: usize = 6;
+
+/// The top-level token trees [`expect_fragment`]'s first window holds.
+const FIRST_WINDOW_TREES: usize = 8;
+
+/// The parser input tokens a parse consumed: the position it ended at.
+fn consumed_input_tokens(output: &::parser::Output) -> usize {
+    output
+        .iter()
+        .map(|step| match step {
+            ::parser::Step::Token { n_input_tokens, .. } => n_input_tokens as usize,
+            ::parser::Step::FloatSplit { .. } => 1,
+            ::parser::Step::Enter { .. } | ::parser::Step::Exit | ::parser::Step::Error { .. } => 0,
+        })
+        .sum()
 }

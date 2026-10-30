@@ -27,6 +27,16 @@ hundreds of MB in place (principles.md "Zero-copy"), instead of reading each int
 
 > applied: `memmap2 = "0.9"` in the root `[workspace.dependencies]` (0.9.11 in `Cargo.lock`). Moving blaze-cargo, blaze-engine, blaze-store and blaze-splice to `workspace = true` is their lanes' (their own manifests).
 
+### `pyproject.toml` / `uv.lock`: the `blake3` Python package (optional, not blocking)
+
+What: add `blake3` (the PyPI bindings of the Rust crate, with SIMD dispatch and a
+`max_threads` option) to the Python dependencies that `uv run --frozen` uses for `harness/v2`.
+
+Why: `harness/v2/engine.py` `digest` hashes every build output and every source file of a
+corpus checkout (`tree_digest`) with hashlib's SHA-256: hardware SHA-2 is ~1.5-2.5 GB/s a core
+and BLAKE3 ~3-6 GB/s. Once it is there I'd switch `digest` and `Kept.key` to BLAKE3 and bump
+their domain to `"blaze v2 proof <kind> 2"`. Until then SHA-256 is correct, only slower.
+
 ## speed-hir-nameres
 
 - `crates/hir-ide/src/tests/consteval/const_traits.rs:9-19` (coordinator's; removed at
@@ -96,6 +106,8 @@ no other blaze-doc file reads a type ref, expression or pattern. `LifetimeRef` (
 `&'a ExpressionStore`, so the views borrow it and the `self.ty(..)` calls in the arms still
 compile.
 
+> forwarded to coordinator: `crates/blaze-doc/` is "every other path" in `crates.md`, not among the paths `requests` applies, and `hir-def` has no type-ref view yet. `hir-ide`'s 18 `TypeRef` lines (`display.rs`) are mine; they move once the view lands.
+
 #### crates/blaze-doc/src/sig.rs  (18 sites)
 - ~L70 (in `fn ty`)  `match &self.store[ty] {`  ->  `match self.store.type_ref(ty) {`
 - ~L96 (`RawPtr` arm) and ~L118 (`Slice` arm), the only two in the file:  `self.ty(out, *inner);`  ->  `self.ty(out, inner);` (`match mutability` in the `RawPtr` arm is unchanged: it now matches a `Mutability` value)
@@ -129,7 +141,11 @@ epoch scheme of its own. `crates/blaze-vfs/Cargo.toml` writes `blaze-reclaim.wor
 until this line is in, the manifest lint names it and blaze-vfs does not build. The concurrency
 lane's report lists the same entry as still to write.
 
+> applied: `blaze-reclaim = { path = "crates/blaze-reclaim" }` under `# v2`, after `blaze-query`.
+
 ## speed-backend-intrinsics
+
+> forwarded to codegen and speed: 1 is in `crates/hir-ty-codegen/`. > forwarded to coordinator: 2 vendors `cranelift-codegen` under `vendor/` with a `[patch.crates-io]` entry, as codegen.md 5 asks too; the patch line goes in with the vendored tree.
 
 ### 1. Cranelift ISA per `#[target_feature]` set (x86-64 SSSE3/SSE4/AVX2 vector code)
 

@@ -162,7 +162,7 @@ impl Body {
             DefWithBodyId::StaticId(_) => ast::Static::cast(node.clone())?.body(),
             DefWithBodyId::VariantId(_) => ast::Variant::cast(node.clone())?.const_arg()?.expr(),
         };
-        let maps = Some((&syntax.span_map, &syntax.ast_id_map));
+        let maps = Some((&*syntax.span_map, &*syntax.ast_id_map));
         let (body, source_map) = lower_body(
             db,
             def,
@@ -284,8 +284,18 @@ pub struct BodySyntax {
     outline: bool,
     /// The item in [`BodySyntax::root`].
     pub item: SyntaxNodePtr,
-    pub ast_id_map: AstIdMap,
-    pub span_map: RealSpanMap,
+    /// The maps of the anchor, the same for every body written in it, and so shared by them.
+    pub ast_id_map: Arc<AstIdMap>,
+    pub span_map: Arc<RealSpanMap>,
+}
+
+/// What every body written in one anchor has the same of: made for the first of them and shared
+/// by the rest, so that an edit of a file walks an `impl` of many methods once, not once a method.
+#[derive(Clone)]
+struct AnchorMaps {
+    ast_id_map: Arc<AstIdMap>,
+    span_map: Arc<RealSpanMap>,
+    outline: bool,
 }
 
 impl PartialEq for BodySyntax {
@@ -429,9 +439,14 @@ mod trees {
         sync::{Arc, Weak},
     };
 
+    use hir_expand::HirFileId;
     use syntax::{FlatTree, SyntaxNode};
 
+    use super::AnchorMaps;
+
     const KEPT: usize = 32;
+    /// The bodies of an anchor are made one after another, so a few anchors' maps are enough.
+    const KEPT_MAPS: usize = 8;
 
     /// A tree, its root, and the anchor in a file's flat tree it was made of: that tree, which
     /// is not let go of while this holds it, and the anchor's number in it.

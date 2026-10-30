@@ -118,9 +118,7 @@ impl Writer {
             None => {
                 self.by_path.insert(path.clone(), file);
                 for (base, index) in &mut self.views {
-                    if path.starts_with(base) {
-                        index.note(file);
-                    }
+                    index.note(base, path, file);
                 }
             }
         }

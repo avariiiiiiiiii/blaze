@@ -506,8 +506,9 @@ impl<'db> Code<'db> for ConstParamId {
 }
 
 /// A struct of `rustc_type_ir` whose one private field is a `()` that has it be built by a
-/// function taking an interner, built from its public fields: the check that function would
-/// make (`Interner::debug_assert_args_compatible`) is empty for `DbInterner`.
+/// function taking an interner, built from its public fields: the checks that function would
+/// make (`Interner::debug_assert_args_compatible` and
+/// `Interner::debug_assert_existential_args_compatible`) are empty for `DbInterner`.
 macro_rules! assemble {
     ($ty:ty { $($field:ident: $value:expr),* $(,)? }) => {{
         let mut value = MaybeUninit::<$ty>::uninit();
@@ -1827,6 +1828,10 @@ mod tests {
         T::from_id(salsa::Id::from_bits(u64::from(index)))
     }
 
+    fn local<T>(index: u32) -> Idx<T> {
+        Idx::from_raw(RawIdx::from_u32(index))
+    }
+
     fn adt(id: AdtId) -> AdtDef {
         AdtDef::from_parts(id, 0).expect("no flags are valid flags")
     }
@@ -1846,7 +1851,6 @@ mod tests {
         let statik = Region::intern(RegionKind::ReStatic);
         let function: FunctionId = id(3);
         let generic = GenericDefId::FunctionId(function);
-        let local = |n| Idx::from_raw(RawIdx::from_u32(n));
         let param = TypeParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(0) });
         let const_param =
             ConstParamId::from_unchecked(TypeOrConstParamId { parent: generic, local_id: local(1) });

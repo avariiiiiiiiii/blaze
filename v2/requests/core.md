@@ -201,6 +201,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
   these modules. Until then a Windows build of `blaze-core` fails; Linux and macOS are not
   touched.
 
+> applied: `windows-sys` 0.61.2 with those features was in the root `[workspace.dependencies]`; lane core is DONE, so `crates/blaze-core/Cargo.toml` now has `[target.'cfg(windows)'.dependencies]` `windows-sys.workspace = true`.
+
 ## 7. docs/v2/plan/lanes/core.md "Windows": how a process's end is heard
 
 - What: say "a thread-pool wait on the process (`RegisterWaitForSingleObject`) posts its end to
@@ -210,6 +212,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
 - Where: `docs/v2/plan/lanes/core.md` (coordinator's).
 - Why: a lost `EXIT_PROCESS` would leave a spawn in flight forever; the wait always fires.
 
+> forwarded to coordinator: `docs/v2/` is the coordinator's, not among the paths `requests` applies.
+
 ## 8. For the daemon (cargo or ci): start every process through a driver
 
 - What: no `std::process::Command` in the daemon once the drivers run its processes.
@@ -217,6 +221,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
   `CreateProcessW`; std's spawn inherits every inheritable handle, so a std spawn in that window
   holds another spawn's pipe open until it exits. On Unix the same holds for any descriptor
   without close-on-exec; the drivers set it on all of theirs.
+
+> forwarded to cargo: the daemon's processes are lane cargo's (`crates/blaze-cargo/src/serve/`).
 
 ## From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, "Memory admission" (2026-10-29)
 
@@ -229,6 +235,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
 - Where: `docs/v2/plan/lanes/core/plane.md` (core's).
 - Why: `crates/blaze-graph/src/arena.rs` changed so (see `docs/v2/plan/lanes/core/speed-runtime.md`),
   and the doc is `current`-kept by core.
+
+> forwarded to coordinator: lane core is DONE and its doc falls back to the coordinator's `docs/v2/`, not among the paths `requests` applies.
 
 ## From speed-runtime-plane: one output buffer per caller of the plane (2026-10-29)
 
@@ -259,3 +267,24 @@ step.
    eight bytes. In steady state a task costs the plane no allocation; `Plane::step_into` appends
    to the caller's buffer." Why: the doc is `current`-kept by core and now says nothing of how
    the plane holds its state (see `docs/v2/plan/lanes/core/speed-runtime-plane.md`).
+
+> applied: lane core is DONE. 1: `crates/blaze-graph/src/machine.rs` `Machine` keeps `said: Vec<PlaneOutput>` and `step` drains `Plane::step_into` into it, mapped as before. > forwarded to speed: 2 (`exec.rs`) is speed-runtime-pool's, told by the requester. > forwarded to coordinator: 3, `docs/v2/plan/lanes/core/plane.md`, falls to the coordinator's `docs/v2/` with core DONE.
+
+## From speed-runtime-vfs: one effect to look at many paths, and the kind of a change (2026-10-29)
+
+The watcher (`crates/blaze-vfs/src/watch.rs`) now asks a reported path's `Effect::Stat` and
+`Effect::ReadAll` together, so a batch is one round trip, but still two effects per path.
+
+1. What: `Effect::Look { files: Vec<FileName>, tag }`, done as `Done::Looked(Vec<Looked>)` in
+   the same order, `enum Looked { Gone, Dir, File { meta: Meta, bytes: Vec<u8> }, Failed(IoError) }`.
+   Linux: one io_uring submission of linked `statx` + `openat` + `read` per path; macOS and
+   Windows: one pool job walking the list. Why: a change batch of N paths becomes one effect
+   and one completion instead of 2N, with no read of a path the stat says is gone or a
+   directory (Watchman's and git's fsmonitor's batching).
+2. What: in `Done::Changed`, each file with what the system said of it, `(FileName, Kind)`
+   with `enum Kind { Removed, Dir, Changed }` (fanotify's `FAN_DELETE`/`FAN_ONDIR`, FSEvents'
+   `ItemRemoved`/`ItemIsDir`). Why: a removal or directory event needs no stat at all; only
+   `Changed` paths are looked at, as the brief asks ("no per-file stat where the change already
+   says what it is").
+
+The watcher moves to both once they exist; until then it stays correct with Stat + ReadAll.

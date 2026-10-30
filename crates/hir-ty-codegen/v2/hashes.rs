@@ -50,6 +50,7 @@ pub const ADT_DOMAIN: &str = "blaze v2 codegen adt 1";
 pub const CODE_DOMAIN: &str = "blaze v2 codegen code 1";
 pub const DISCRIMINANT_DOMAIN: &str = "blaze v2 codegen discriminant 1";
 pub const SPAN_DOMAIN: &str = "blaze v2 codegen span table 1";
+pub const NAMES_DOMAIN: &str = "blaze v2 codegen binding names 1";
 
 /// The tables of a body's spans, by the kind of span: [`MirSpan`]'s variants.
 const EXPRS: usize = 0;
@@ -196,14 +197,21 @@ fn unhashable(db: &dyn HirDatabase) -> impl Fn(Unhashable) -> String + '_ {
     move |it| it.describe(db)
 }
 
-/// The code hash beside the positions `body` names, by table and index, in the order of its
-/// blocks: what a template built from `body` holds of it.
-fn with_spans(kind: u8, parts: &[ContentId], body: &MirBody<'_>) -> ContentId {
-    let mut out = Vec::with_capacity(1 + 32 * parts.len() + 5 * 8 * body.basic_blocks.len());
+/// The code hash beside what a template built from `body` holds of it that the code hash
+/// leaves out: the names of its bindings, which its debug info tells, and the positions it
+/// names, by table and index, in the order of its blocks.
+fn with_spans(
+    db: &dyn HirDatabase,
+    kind: u8,
+    parts: &[ContentId],
+    body: &MirBody<'_>,
+) -> ContentId {
+    let mut out = Vec::with_capacity(1 + 32 * (parts.len() + 1) + 5 * 8 * body.basic_blocks.len());
     out.push(kind);
     for part in parts {
         out.extend_from_slice(&part.0);
     }
+    out.extend_from_slice(&names(db, body).0);
     let mut push = |span: Option<MirSpan>| match span {
         Some(span) => {
             let (table, index) = table_of(span);
@@ -223,6 +231,20 @@ fn with_spans(kind: u8, parts: &[ContentId], body: &MirBody<'_>) -> ContentId {
         }
     }
     ContentId::of(CODE_DOMAIN, &out)
+}
+
+/// The name of each of `body`'s bindings, in the order of their locals, each framed by its
+/// local and its length.
+fn names(db: &dyn HirDatabase, body: &MirBody<'_>) -> ContentId {
+    let store = ExpressionStore::of(db, body.owner.expression_store_owner(db));
+    let mut out = Vec::new();
+    for (local, binding) in body.local_to_binding_map().iter() {
+        let name = store[*binding].name.as_str();
+        out.extend_from_slice(&local.into_raw().into_u32().to_le_bytes());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+    }
+    ContentId::of(NAMES_DOMAIN, &out)
 }
 
 fn no_mir(what: impl std::fmt::Debug, error: impl std::fmt::Debug) -> String {
@@ -255,7 +277,7 @@ fn item_code(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<ContentId, Stri
         }
     };
     let body = db.mir_body(InferBodyId::DefWithBodyId(def)).map_err(|it| no_mir(def, it))?;
-    Ok(with_spans(ITEM, &[code], body))
+    Ok(with_spans(db, ITEM, &[code], body))
 }
 
 #[salsa::tracked(returns(ref))]
@@ -265,7 +287,7 @@ fn closure_code_in<'db>(
 ) -> Result<ContentId, String> {
     let code = closure_code(db, closure).map_err(unhashable(db))?;
     let body = db.mir_body_for_closure(closure).map_err(|it| no_mir(closure, it))?;
-    Ok(with_spans(CLOSURE, &[code.0], body))
+    Ok(with_spans(db, CLOSURE, &[code.0], body))
 }
 
 #[salsa::tracked(returns(ref))]
@@ -275,7 +297,7 @@ fn coroutine_code_in<'db>(
 ) -> Result<ContentId, String> {
     let code = coroutine_code(db, coroutine).map_err(unhashable(db))?;
     let body = db.mir_body_for_coroutine(coroutine).map_err(|it| no_mir(coroutine, it))?;
-    Ok(with_spans(COROUTINE, &[code.0], body))
+    Ok(with_spans(db, COROUTINE, &[code.0], body))
 }
 
 /// The future an `async` closure gives when called by value: the coroutine's body lowered
@@ -301,7 +323,7 @@ fn by_move_code_in<'db>(
         blaze_items::value(db, &blaze_items::captures(db, closure)).map_err(unhashable(db))?;
     let body =
         db.mir_body_for_coroutine_by_move(coroutine).map_err(|it| no_mir(coroutine, it))?;
-    Ok(with_spans(BY_MOVE, &[code.0, captures], body))
+    Ok(with_spans(db, BY_MOVE, &[code.0, captures], body))
 }
 
 /// An ADT as a type's content says it: its key, its interface (fields, variants, `repr`), its

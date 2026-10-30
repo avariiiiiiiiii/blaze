@@ -342,6 +342,20 @@ impl Target {
             // swaps 128 bits, as `core::arch::x86_64::cmpxchg16b` does.
             isa.enable("has_cmpxchg16b").map_err(|e| e.to_string())?;
         }
+        for setting in self.baseline_settings() {
+            isa.enable(setting).map_err(|e| e.to_string())?;
+        }
         isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
+    }
+
+    /// The settings of Cranelift's ISA that the [`cpu`](Self::cpu) rustc compiles for has:
+    /// what every machine the target runs on has, so code may use it unasked. A unit's key
+    /// has the CPU. `apple-m1` has LSE: an atomic is one `ldaddal` or `casal` instead of a
+    /// loop of exclusive loads and stores, as LLVM's code of it is.
+    fn baseline_settings(&self) -> &'static [&'static str] {
+        match self.cpu() {
+            "apple-m1" => &["has_lse"],
+            _ => &[],
+        }
     }
 }

@@ -119,16 +119,26 @@ branch's ops are not sent a second time.
 
 ## `blaze-ui` and `blaze-web`
 
-See the children's notes: [speed-link-edge-ci-ui.md](speed-link-edge-ci-ui.md) (a line diff
-into one reused buffer; `Build::apply` lookups no longer linear) and
-[speed-link-edge-ci-web.md](speed-link-edge-ci-web.md) (one encode per record, batched
-websocket frames, a decoder without an object per record).
+The details are in the children's notes. These are their summaries.
 
-| per rendered row / per frame | before | after |
+**`blaze-web`** ([speed-link-edge-ci-web.md](speed-link-edge-ci-web.md)): `Graphs::record` takes
+no lock, and records are encoded once and kept compressed in one stream per build. Pages get
+frames of up to 4 096 records written in one syscall, and the page uploads to the GPU once per
+animation frame. The page still decodes each record into an object: columns would need a WASM
+SIMD decoder, which is left as future work.
+
+| per record | before | after |
 |---|---|---|
-| allocations per rendered row | 1 or more (`format!`) | 0 |
-| rows redrawn per change | the whole region | the rows that changed |
-| time from an event to its pixel | one full redraw | one diffed row write |
+| locks on the daemon's side | 1 | 0 |
+| encodings | 2 | 1 |
+| websocket messages per page | 1 | 1 per batch of up to 4 096 |
+| `write` syscalls per page | 2 per message | 1 per batch |
+| GPU uploads on the page | 1 per `Functions` record | 1 per animation frame |
+
+**`blaze-ui`** ([speed-link-edge-ci-ui.md](speed-link-edge-ci-ui.md)): indexes in `Build` in
+place of linear scans per record. The live region is rendered into one reused buffer and only
+the lines that differ from the last drawn region are written. Plain output goes through one
+buffer, with no `String` per line.
 
 ## What measures them
 

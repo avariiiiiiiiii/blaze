@@ -31,6 +31,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplMissingAssocItems) -> Vec
     let Some(at) = ImplAt::of_ptr(cx, d.file_id, d.impl_) else {
         return unresolved(cx, d.file_id, d.impl_, "a missing trait items error");
     };
+    // rustc checks an impl's items against its trait only when the trait is coherent
+    // (`check_item_type`).
+    if at.impl_.trait_(cx.db).is_some_and(|it| !crate::checks::impls::coherent(cx, it)) {
+        return Vec::new();
+    }
     let names: Vec<&str> = d.missing.iter().map(|(name, _)| name.as_str()).collect();
     let message = names.join("`, `");
     let span = at.span(cx);

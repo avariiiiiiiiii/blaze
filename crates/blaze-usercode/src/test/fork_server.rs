@@ -422,22 +422,30 @@ mod unix {
             return Err(format!("fork: {}", ::std::io::Error::last_os_error()));
         }
         if pid == 0 {
-            // SAFETY: plain calls on descriptors this process holds; none is used after.
-            unsafe {
-                setpgid(0, 0);
-                close(stream.as_raw_fd());
-                close(ours.as_raw_fd());
-                for child in children {
-                    close(child.output.as_raw_fd());
-                    if let Some(exit) = &child.exit {
-                        close(exit.as_raw_fd());
-                    }
+            // The child closes the server's descriptors under the owners that hold them: it
+            // never uses those owners again, since it leaves by `_exit` below, which runs no
+            // destructor, so no descriptor is closed twice or used after its close.
+            // SAFETY: integers only; the child leads a group of its own.
+            unsafe { setpgid(0, 0) };
+            // SAFETY: as above, the socket's owner is not used in the child.
+            unsafe { close(stream.as_raw_fd()) };
+            // SAFETY: as above.
+            unsafe { close(ours.as_raw_fd()) };
+            for child in children {
+                // SAFETY: as above, the other children's owners are not used in this one.
+                unsafe { close(child.output.as_raw_fd()) };
+                if let Some(exit) = &child.exit {
+                    // SAFETY: as above.
+                    unsafe { close(exit.as_raw_fd()) };
                 }
-                dup2(theirs.as_raw_fd(), 1);
-                dup2(theirs.as_raw_fd(), 2);
-                if theirs.as_raw_fd() > 2 {
-                    close(theirs.as_raw_fd());
-                }
+            }
+            // SAFETY: `theirs` is open until the close below; 1 and 2 become copies of it.
+            unsafe { dup2(theirs.as_raw_fd(), 1) };
+            // SAFETY: as above.
+            unsafe { dup2(theirs.as_raw_fd(), 2) };
+            if theirs.as_raw_fd() > 2 {
+                // SAFETY: as above, `theirs` is not used in the child after this; 1 and 2 stay.
+                unsafe { close(theirs.as_raw_fd()) };
             }
             let code = run(test);
             let _ = ::std::io::stdout().flush();
@@ -494,11 +502,11 @@ mod unix {
     }
 
     fn kill_group(pid: Int) {
-        // SAFETY: plain calls; the group is the child's own.
-        unsafe {
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-        }
+        // SAFETY: integers only. `pid` is a child not yet reaped (callers pass only those with
+        // no status), so neither it nor its group can be another process's.
+        unsafe { kill(-pid, SIGKILL) };
+        // SAFETY: as above.
+        unsafe { kill(pid, SIGKILL) };
     }
 
     fn kill_all(children: &mut Vec<Child>) {

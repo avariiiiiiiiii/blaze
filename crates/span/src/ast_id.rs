@@ -768,7 +768,6 @@ fn home(word: u32, bits: u32) -> usize {
 
 /// A map's fn bodies, as columns in the order of their text. A body's ids are made by a walk of
 /// it alone, when something in it is first asked about. 60 bytes per body until then.
-#[derive(Default)]
 struct Bodies {
     /// Where each begins: what the body holding a node is searched by.
     starts: Box<[u32]>,
@@ -1387,43 +1386,6 @@ impl AstIdMap {
                 self.bodies,
             )
         })
-    }
-}
-
-#[cfg(not(no_salsa_async_drops))]
-type Dropped = (Box<[Entry]>, Index, Index, Bodies);
-
-#[cfg(not(no_salsa_async_drops))]
-impl Drop for AstIdMap {
-    fn drop(&mut self) {
-        let entries = std::mem::take(&mut self.entries);
-        let by_start = std::mem::take(&mut self.by_start);
-        let by_id = std::mem::take(&mut self.by_id);
-        let bodies = std::mem::take(&mut self.bodies);
-        static AST_ID_MAP_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Dropped>> =
-            std::sync::OnceLock::new();
-        AST_ID_MAP_DROP_THREAD
-            .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<Dropped>();
-                std::thread::Builder::new()
-                    .name("AstIdMapDropper".to_owned())
-                    .spawn(move || {
-                        loop {
-                            // block on a receive
-                            _ = receiver.recv();
-                            // then drain the entire channel
-                            while receiver.try_recv().is_ok() {}
-                            // and sleep for a bit
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                        // why do this over just a `receiver.iter().for_each(drop)`? To reduce contention on the channel lock.
-                        // otherwise this thread will constantly wake up and sleep again.
-                    })
-                    .unwrap();
-                sender
-            })
-            .send((entries, by_start, by_id, bodies))
-            .unwrap();
     }
 }
 

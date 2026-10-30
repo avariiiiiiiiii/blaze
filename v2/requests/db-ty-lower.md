@@ -132,3 +132,36 @@ changes between runs. If
 the hash should also not change when bounds are reordered, sort the per-supertrait hashes there.
 
 > applied: lane items is DONE; nothing to change. A trait's supertrait order is in its interface: rustc lays out a trait object's vtable by it (`prepare_vtable_segments`), so reordering bounds must change the hash, and the slice order (now deterministic) is the right fold.
+
+## From speed-hir-defs-sigs (2026-10-29): test deprecated-safe before unsafe in `is_fn_unsafe_to_call` (`crates/hir-ty/src/utils.rs`)
+
+What: `crates/hir-def/src/signatures.rs` now gives an `unsafe fn` with
+`#[rustc_deprecated_safe_2024]` both `FnFlags::UNSAFE` and `FnFlags::DEPRECATED_SAFE_2024`
+(it used to give only the second). This is diagnostics-lints-mir-unsafe's request 6 in
+`v2/requests/diagnostics.md`. In `is_fn_unsafe_to_call` (`utils.rs` ~L64-84), move the block
+
+```rust
+    if data.is_deprecated_safe_2024() {
+        if call_edition.at_least_2024() {
+            return Unsafety::Unsafe;
+        } else {
+            return Unsafety::DeprecatedSafe2024;
+        }
+    }
+```
+
+to the top, before `if data.is_unsafe() { return Unsafety::Unsafe; }`.
+Why: rustc's `fn_sig` of such a function (std's `env::set_var`, `env::remove_var`) is `unsafe`,
+so its body is an unsafe function's body and it doesn't coerce to a safe `fn` pointer. Before 2024,
+only a call of it is let through with the `deprecated_safe_2024` lint (`check_unsafety`). With
+the flag change alone, `is_unsafe()` answers first and a pre-2024 `set_var(..)` outside `unsafe`
+becomes a hard E0133 where rustc only lints. With the reorder, calls behave as before. `lower.rs`
+~L3737 (`if data.is_unsafe() { Safety::Unsafe }`) then gives the unsafe `fn_sig` rustc gives, as
+it should. Nothing else changes: blaze-diagnostics' `missing_unsafe.rs:397` already ORs both,
+and `hir-ide`'s `unsafe_check.rs:41` now checks the body as an unsafe function's, as rustc does.
+Status: open
+
+> applied by db-ty-lower: the deprecated-safe check now comes first in `is_fn_unsafe_to_call`
+> (`utils.rs`), before `is_unsafe()` and the target-feature check. `lower.rs`'s `fn_sig` is left
+> as it is: it already answers from `is_unsafe()`, so it gives the unsafe signature once
+> hir-def sets the flag.

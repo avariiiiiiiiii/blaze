@@ -83,20 +83,20 @@ impl HasChildSource<LocalTypeOrConstParamId> for GenericDefId {
         let generic_params = GenericParams::of(db, *self);
         let mut idx_iter = generic_params.iter_type_or_consts().map(|(idx, _)| idx);
 
-        let (file_id, generic_params_list) = self.file_id_and_params_of(db);
-
-        let mut params = ArenaMap::default();
+        let mut params = ArenaMap::with_capacity(generic_params.len_type_or_consts());
 
         // For traits and trait aliases the first type index is `Self`, we need to add it before
         // the other params.
-        match *self {
+        let (file_id, generic_params_list) = match *self {
             GenericDefId::TraitId(id) => {
-                let trait_ref = id.lookup(db).source(db).value;
+                let source = id.lookup(db).source(db);
+                let list = ast::HasGenericParams::generic_param_list(&source.value);
                 let idx = idx_iter.next().unwrap();
-                params.insert(idx, Either::Right(trait_ref));
+                params.insert(idx, Either::Right(source.value));
+                (source.file_id, list)
             }
-            _ => {}
-        }
+            _ => self.file_id_and_params_of(db),
+        };
 
         if let Some(generic_params_list) = generic_params_list {
             for (idx, ast_param) in idx_iter.zip(generic_params_list.type_or_const_params()) {
@@ -119,7 +119,7 @@ impl HasChildSource<LocalLifetimeParamId> for GenericDefId {
 
         let (file_id, generic_params_list) = self.file_id_and_params_of(db);
 
-        let mut params = ArenaMap::default();
+        let mut params = ArenaMap::with_capacity(generic_params.len_lifetimes());
 
         if let Some(generic_params_list) = generic_params_list {
             for (idx, ast_param) in idx_iter.zip(generic_params_list.lifetime_params()) {

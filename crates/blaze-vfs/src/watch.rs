@@ -240,7 +240,8 @@ impl Watcher {
             self.reading.remove(&stat);
         }
         // A read after its batch committed, or after the stat settled the path, is not needed.
-        let Some(batch) = number.checked_sub(self.first).and_then(|it| self.batches.get_mut(it as usize))
+        let Some(batch) =
+            number.checked_sub(self.first).and_then(|it| self.batches.get_mut(it as usize))
         else {
             return out;
         };
@@ -393,7 +394,10 @@ impl Watcher {
                     }
                     let mode = entry.filter(|_| is_file).map_or(Mode::Regular, |it| it.1);
                     // Compared in place, not hashed: the commit hashes what it writes, once.
-                    let same = node.filter(|_| is_file).and_then(|it| tree.bytes(it)).is_some_and(|it| **it == *bytes);
+                    let same = node
+                        .filter(|_| is_file)
+                        .and_then(|it| tree.bytes(it))
+                        .is_some_and(|it| **it == *bytes);
                     if !same {
                         writes.push((slot.path.clone(), bytes, mode));
                     }

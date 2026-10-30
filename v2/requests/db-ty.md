@@ -169,6 +169,8 @@ of the first one; it is the private `OFFSET`, 1000).
 
 `VTableMap::id` now hashes a type once (entry API), not twice.
 
+> forwarded to db: `crates/hir-ty/src/lib.rs` and `consteval.rs` are lane db's.
+
 ## From safety (lane safety, 2026-10-29): `MirEvalError::MachineStop` (`crates/hir-ty/src/mir.rs`)
 
 What: a variant `MachineStop` of `MirEvalError` (no fields; `Debug`, `Hash`, `PartialEq` as the
@@ -182,3 +184,5 @@ returns `Stop`, which the evaluator turns into this, inside its `InFunction` sta
 keeps the structured report, so the variant carries nothing (and `MirEvalError` keeps its
 `Hash` for the MIR queries' fingerprints). Const eval never produces it: its `Plain` machine
 never stops.
+
+> forwarded to db: `crates/hir-ty/src/mir.rs` is lane db's.

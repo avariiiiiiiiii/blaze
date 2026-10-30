@@ -451,7 +451,7 @@ impl Resolver<'_, '_, '_> {
             Scope::ExternPrelude => format!("no `{}` in the root", source.name),
         };
         let names = self.names_in(scope, &source.name);
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let names: Vec<&str> = names.iter().map(Name::as_str).collect();
         let suggestion = find_best_match_for_name(&names, &source.name, None).map(|it| Suggestion {
             parts: vec![(self.span(source.range), it.to_owned())],
             message: "a similar name exists in the module".to_owned(),
@@ -475,25 +475,22 @@ impl Resolver<'_, '_, '_> {
     }
 
     /// The names of `scope` rustc may suggest for `name`: not `name` itself, nor `_`.
-    fn names_in(&self, scope: Scope, name: &str) -> Vec<String> {
+    /// Interned names, so the sort and dedup compare symbols, not copied strings.
+    fn names_in(&self, scope: Scope, name: &str) -> Vec<Name> {
         let db = self.cx.db;
-        let mut names: Vec<String> = match scope {
+        let mut names: Vec<Name> = match scope {
             Scope::Def(ModuleDef::Module(m)) => m
                 .scope(db, None)
                 .into_iter()
                 .filter(|(_, def)| !matches!(def, hir::ScopeDef::Unknown))
-                .map(|(name, _)| name.as_str().to_owned())
+                .map(|(name, _)| name)
                 .collect(),
-            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => {
-                e.variants(db).into_iter().map(|it| it.name(db).as_str().to_owned()).collect()
-            }
-            Scope::Def(ModuleDef::Trait(t)) => {
-                t.items(db).into_iter().filter_map(|it| it.name(db)).map(|it| it.as_str().to_owned()).collect()
-            }
+            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => e.variants(db).into_iter().map(|it| it.name(db)).collect(),
+            Scope::Def(ModuleDef::Trait(t)) => t.items(db).into_iter().filter_map(|it| it.name(db)).collect(),
             _ => Vec::new(),
         };
-        names.retain(|it| it != name && it != "_");
-        names.sort();
+        names.retain(|it| it.as_str() != name && it.as_str() != "_");
+        names.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         names.dedup();
         names
     }
@@ -527,13 +524,13 @@ impl Resolver<'_, '_, '_> {
             return None;
         }
         let mut crates = self.extern_prelude();
-        crates.sort_by(|a, b| b.cmp(a));
-        crates.into_iter().map(|it| with(&it)).find(|it| self.module(it).is_some()).map(|it| (it, None))
+        crates.sort_unstable_by(|a, b| b.as_str().cmp(a.as_str()));
+        crates.into_iter().map(|it| with(it.as_str())).find(|it| self.module(it).is_some()).map(|it| (it, None))
     }
 
     /// The names of the crate's extern prelude: its dependencies.
-    fn extern_prelude(&self) -> Vec<String> {
-        self.cx.krate.dependencies(self.cx.db).into_iter().map(|it| it.name.as_str().to_owned()).collect()
+    fn extern_prelude(&self) -> Vec<Name> {
+        self.cx.krate.dependencies(self.cx.db).into_iter().map(|it| it.name).collect()
     }
 
     /// rustc's `report_path_resolution_error` of the segment `at` of `path`, `module` what the
@@ -691,15 +688,15 @@ impl Resolver<'_, '_, '_> {
         let current = self.current()?;
         let mut candidates = self.extern_prelude();
         for module in self.cx.krate.modules(db) {
-            let below = module != current && module.path_to_root(db).contains(&current);
+            let below = std::iter::successors(module.parent(db), |it| it.parent(db)).any(|it| it == current);
             if below && let Some(it) = module.name(db) {
-                candidates.push(it.as_str().to_owned());
+                candidates.push(it);
             }
         }
-        candidates.retain(|it| !it.is_empty());
-        candidates.sort();
+        candidates.retain(|it| !it.as_str().is_empty());
+        candidates.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         candidates.dedup();
-        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
         find_best_match_for_name(&candidates, name, None).filter(|it| *it != name).map(str::to_owned)
     }
 
@@ -707,33 +704,28 @@ impl Resolver<'_, '_, '_> {
     /// root's inner attributes.
     fn crate_insert_span(&self) -> Span {
         let cx = self.cx;
-        let file = cx.krate.root_file(cx.db);
-        let parse = syntax::SourceFile::parse(cx.file_text(file), cx.edition);
-        let root = parse.tree();
-        let at = root
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|it| it.into_token())
-            .find(|token| {
-                let kind = token.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::SHEBANG {
-                    return false;
+        let file = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
+        let source = cx.sema.parse_or_expand(file);
+        let is_token = |token: &syntax::SyntaxToken| match token.kind() {
+            SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG => false,
+            SyntaxKind::COMMENT => ast::Comment::cast(token.clone())
+                .and_then(|it| it.kind().doc)
+                .is_some_and(|doc| doc == ast::AttrKind::Outer),
+            _ => true,
+        };
+        let at = source
+            .children_with_tokens()
+            .find_map(|it| match it {
+                syntax::NodeOrToken::Node(node) => {
+                    if ast::Attr::cast(node.clone()).is_some_and(|it| it.excl_token().is_some()) {
+                        return None;
+                    }
+                    node.descendants_with_tokens().filter_map(syntax::NodeOrToken::into_token).find(is_token)
                 }
-                if kind == SyntaxKind::COMMENT {
-                    let text = token.text();
-                    let inner_doc = text.starts_with("//!") || text.starts_with("/*!");
-                    let outer_doc = (text.starts_with("///") && !text.starts_with("////"))
-                        || (text.starts_with("/**") && !text.starts_with("/***") && text != "/**/");
-                    return outer_doc && !inner_doc;
-                }
-                let in_inner_attr = token
-                    .parent_ancestors()
-                    .filter_map(ast::Attr::cast)
-                    .any(|it| it.excl_token().is_some());
-                !in_inner_attr
+                syntax::NodeOrToken::Token(token) => is_token(&token).then_some(token),
             })
-            .map_or(TextSize::of(cx.file_text(file)), |it| it.text_range().start());
-        cx.span_in_file(file, TextRange::empty(at))
+            .map_or(source.text_range().end(), |it| it.text_range().start());
+        cx.span(InFile::new(file, TextRange::empty(at)))
     }
 }
 

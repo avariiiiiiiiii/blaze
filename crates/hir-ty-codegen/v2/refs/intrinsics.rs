@@ -25,7 +25,7 @@ use hir_ty_mir::mir::{AggregateKind, BinOp, CastKind, MirBody, Operand, OperandK
 use rustc_abi::Size;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
-use triomphe::Arc;
+use smallvec::SmallVec;
 
 use super::{Walk, told};
 use crate::{
@@ -211,7 +211,7 @@ fn fma_texts(bytes: u32, suffix: &str) -> Vec<String> {
 }
 
 impl<'cx, 'db> Walk<'_, 'cx, 'db> {
-    fn ty_layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>, String> {
+    fn ty_layout(&self, ty: Ty<'db>) -> Result<&'cx Layout, String> {
         self.fx.layout(ty).map_err(told)
     }
 
@@ -998,7 +998,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             _ if arch == Arch::Aarch64
                 && let Some(lowered) = neon::lower(name) =>
             {
-                self.neon_assembly(&format!("llvm.{name}"), &lowered, args, dst_ty)?
+                self.neon_assembly(name, &lowered, args, dst_ty)?
             }
             _ if arch == Arch::X86_64
                 && [
@@ -1015,7 +1015,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             _ if arch == Arch::X86_64
                 && let Some(lowered) = x86::lower(name) =>
             {
-                self.x86_assembly(&format!("llvm.{name}"), &lowered, args, arg_tys, dst_ty)?
+                self.x86_assembly(name, &lowered, args, arg_tys, dst_ty)?
             }
             _ => return Err(unsupported(format!("LLVM intrinsic `{name}`"))),
         }
@@ -1186,7 +1186,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         args: &[Operand],
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
-        let mut args: Vec<&Operand> = args.iter().collect();
+        let mut args: SmallVec<[&Operand; 8]> = args.iter().collect();
         let mut with_immediate = None;
         if let Some(immediate) = &lowered.immediate {
             if immediate.arg >= args.len() {
@@ -1210,7 +1210,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let text = lowered.text.replace("{imm}", &value.to_string());
             with_immediate = Some(neon::Lowered { text, ..lowered.clone() });
         }
-        let arg_tys: Vec<Ty<'db>> = args.iter().map(|arg| self.operand_ty(arg)).collect();
+        let arg_tys: SmallVec<[Ty<'db>; 8]> = args.iter().map(|arg| self.operand_ty(arg)).collect();
         let text =
             self.neon_text(name, with_immediate.as_ref().unwrap_or(lowered), &arg_tys, dst_ty)?;
         self.assembly(text)

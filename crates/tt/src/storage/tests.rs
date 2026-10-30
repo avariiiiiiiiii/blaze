@@ -676,9 +676,6 @@ fn literals_are_what_they_were() {
     .map(|it| it.to_string())
     .collect();
     for (_, text) in corpus() {
-        for token in rustc_lexer::tokenize(&text, rustc_lexer::FrontmatterAllowed::No) {
-            let _ = token;
-        }
         let mut offset = 0;
         for token in rustc_lexer::tokenize(&text, rustc_lexer::FrontmatterAllowed::No) {
             if matches!(token.kind, rustc_lexer::TokenKind::Literal { .. }) {
@@ -689,5 +686,46 @@ fn literals_are_what_they_were() {
     }
     for text in &texts {
         assert_eq!(token_to_literal(text, span), old_token_to_literal(text, span), "{text:?}");
+    }
+}
+
+/// What `Literal`'s `Display` wrote before `Literal::push_to`.
+fn old_literal_display(lit: &Literal) -> String {
+    let (text, suffix) = lit.text_and_suffix();
+    let mut out = match lit.kind {
+        LitKind::Byte => format!("b'{}'", text),
+        LitKind::Char => format!("'{}'", text),
+        LitKind::Integer | LitKind::Float | LitKind::Err(_) => format!("{}", text),
+        LitKind::Str => format!("\"{}\"", text),
+        LitKind::ByteStr => format!("b\"{}\"", text),
+        LitKind::CStr => format!("c\"{}\"", text),
+        LitKind::StrRaw(num_of_hashes) => {
+            let num_of_hashes = num_of_hashes as usize;
+            format!(r#"r{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
+        }
+        LitKind::ByteStrRaw(num_of_hashes) => {
+            let num_of_hashes = num_of_hashes as usize;
+            format!(r#"br{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
+        }
+        LitKind::CStrRaw(num_of_hashes) => {
+            let num_of_hashes = num_of_hashes as usize;
+            format!(r#"cr{0:#<num_of_hashes$}"{text}"{0:#<num_of_hashes$}"#, "", text = text)
+        }
+    };
+    out.push_str(suffix);
+    out
+}
+
+#[test]
+fn literals_display_as_they_did() {
+    let mut generator = Gen::new(17, 3);
+    let mut seen = 0;
+    while seen < 5000 {
+        let Leaf::Literal(lit) = generator.leaf() else { continue };
+        seen += 1;
+        let mut pushed = "before".to_owned();
+        lit.push_to(&mut pushed);
+        assert_eq!(pushed, format!("before{}", old_literal_display(&lit)), "{lit:?}");
+        assert_eq!(lit.to_string(), old_literal_display(&lit), "{lit:?}");
     }
 }

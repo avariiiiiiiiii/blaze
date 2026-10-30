@@ -8,7 +8,7 @@ mod ast_validation;
 mod attrs;
 mod defs;
 mod features;
-mod impls;
+pub(crate) mod impls;
 mod krate;
 mod names;
 

@@ -114,6 +114,7 @@ Why: the fast-code rule asks each part to name the fastest known technique it ma
 > open-addressing table (compare-and-swap, wyhash-style mixing, 16 bytes a multiply). Its
 > working directory is cached per thread, keyed by a global count of `chdir`s, so a read takes
 > no lock and writes nothing shared. Each new line is one `write`.
+> forwarded to usercode: `docs/v2/plan/lanes/usercode/notes.md` is the parent's.
 
 ## 6. Speed of `sandbox/windows.rs` per run (from `speed-link-edge-usercode`, 2026-10-29)
 
@@ -211,3 +212,4 @@ propagating writes go (per run: none); with 5, process creations go from 2 to 1.
 >   (`on_interrupt`) and `JOBS`/`RUNS`, which already serve several runs at once.
 > - **6**: SHA-256 of a spec's JSON is about a microsecond with SHA-NI, beside a
 >   `CreateProcessW` of milliseconds. `blake3` is not a `blaze-cargo` dependency. Leave it.
+> forwarded to usercode: 3 to 5 are its own design (lane usercode still running).

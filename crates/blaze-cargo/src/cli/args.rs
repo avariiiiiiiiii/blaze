@@ -220,8 +220,20 @@ const MANIFEST: &[Flag] = &[
     Flag::new("manifest-path", None, Takes::Value, "PATH"),
     Flag::new("lockfile-path", None, Takes::Value, "PATH"),
 ];
-/// `--reached` is blaze's (an extension, opt-in): only the tests an edit reached run.
-const TEST_ONLY: &[Flag] = &[Flag::switch("doc"), Flag::switch("reached")];
+/// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
+/// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
+const TEST_ONLY: &[Flag] = &[
+    Flag::switch("doc"),
+    Flag::switch("reached"),
+    Flag::switch("ub"),
+    Flag::new("ub-seed", None, Takes::Value, "N"),
+    Flag::new("ub-schedules", None, Takes::Value, "K"),
+];
+
+/// blaze's own flags: read here, never on cargo's command line.
+fn blaze_only(flag: &Flag) -> bool {
+    matches!(flag.long, Some("reached" | "ub" | "ub-seed" | "ub-schedules"))
+}
 const RUNNING: &[Flag] = &[Flag::switch("no-run"), Flag::switch("no-fail-fast")];
 
 /// What blaze was asked.
@@ -243,7 +255,7 @@ pub enum Asked {
 pub struct Invocation {
     pub command: Option<Command>,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
-    /// None of `run`'s program arguments, nor blaze's own `--reached`.
+    /// None of `run`'s program arguments, nor blaze's own `--reached` and `--ub*`.
     pub args: Vec<String>,
     /// `test`'s and `bench`'s `TESTNAME`.
     pub filter: Option<String>,
@@ -306,6 +318,10 @@ pub struct Flags {
     pub no_run: bool,
     pub no_fail_fast: bool,
     pub reached: bool,
+    /// `--ub`, or either of its values, which imply it.
+    pub ub: bool,
+    pub ub_seed: Option<u64>,
+    pub ub_schedules: Option<u32>,
 }
 
 impl Flags {
@@ -336,6 +352,16 @@ impl Flags {
             "no-run" => self.no_run = true,
             "no-fail-fast" => self.no_fail_fast = true,
             "reached" => self.reached = true,
+            "ub" => self.ub = true,
+            // `check_value` parsed them first.
+            "ub-seed" => {
+                self.ub = true;
+                self.ub_seed = value.and_then(|it| it.parse().ok());
+            }
+            "ub-schedules" => {
+                self.ub = true;
+                self.ub_schedules = value.and_then(|it| it.parse().ok());
+            }
             _ => {}
         }
     }
@@ -354,6 +380,8 @@ pub enum Said {
     NoValue { flag: &'static Flag },
     BadValue { value: String, flag: &'static Flag },
     ExtraValue { value: String, flag: &'static Flag },
+    /// A number clap's `value_parser` refuses, with why (`invalid digit found in string`).
+    NotNumber { value: String, flag: &'static Flag, why: String },
     NotUtf8,
 }
 
@@ -479,7 +507,7 @@ pub fn command_line(command: Command, words: Vec<OsString>) -> Result<Invocation
             }
             check_value(flag, value.as_deref()).map_err(refused)?;
             asked.flags.read(flag, value.as_deref());
-            if flag.long != Some("reached") {
+            if !blaze_only(flag) {
                 asked.args.extend(typed);
             }
             continue;
@@ -562,6 +590,19 @@ fn run_program(asked: &mut Invocation, words: &mut impl Iterator<Item = OsString
 
 fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
     let Some(value) = value else { return Ok(()) };
+    let not_number = |why: String| Said::NotNumber { value: value.to_owned(), flag, why };
+    match flag.long {
+        Some("ub-seed") => return value.parse::<u64>().map(drop).map_err(|it| not_number(it.to_string())),
+        // `value_parser!(u32).range(1..)`.
+        Some("ub-schedules") => {
+            return match value.parse::<u32>() {
+                Ok(0) => Err(not_number(format!("0 is not in 1..={}", u32::MAX))),
+                Ok(_) => Ok(()),
+                Err(error) => Err(not_number(error.to_string())),
+            };
+        }
+        _ => {}
+    }
     if flag.possible.is_empty() {
         return Ok(());
     }
@@ -704,6 +745,11 @@ pub fn refusal(usage: &Usage, color: bool) -> String {
             paint(say::WARN, value),
             paint(say::VALID, &flag.shown()),
             usage_line()
+        ),
+        Said::NotNumber { value, flag, why } => format!(
+            "{error} invalid value '{}' for '{}': {why}\n\n{more}",
+            paint(say::WARN, value),
+            paint(say::VALID, &flag.shown())
         ),
         Said::NotUtf8 => format!(
             "{error} invalid UTF-8 was detected in one or more arguments\n\n{}\n\n{more}",

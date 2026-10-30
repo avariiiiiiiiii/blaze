@@ -3,6 +3,7 @@
 //! by blaze's own code generator and linker, its build scripts, tests and program run as the
 //! driver's sandboxed spawns.
 //!
+//! - [`graph`]: the job's unit graph as flat columns, built once.
 //! - [`files`]: where a unit's files are (the mounts), and the names rustc gives them.
 //! - [`compile`]: [`Front::compile`] and [`Front::fresh`]: diagnostics, codegen, the link,
 //!   the files cargo would write, a unit's record in the store.
@@ -21,6 +22,7 @@ mod artifact;
 mod codegen;
 mod compile;
 mod files;
+mod graph;
 mod reach;
 mod run;
 mod say;
@@ -32,9 +34,8 @@ mod tests;
 
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
     time::Instant,
 };
 
@@ -65,12 +66,10 @@ pub(crate) struct Shared {
     /// The directory of blaze's stand-ins for the tools cargo names to a build script:
     /// `rustc` and `rustdoc`, each blaze's own executable under that name.
     pub(crate) tools: PathBuf,
-    /// The machine's files and environment as build scripts and tests read them, hashed once
-    /// per change ([`blaze_usercode::inputs::Disk`]).
-    pub(crate) disk: Mutex<blaze_usercode::inputs::Disk>,
     /// Every executable and shared library linked, by the path cargo writes it at, kept so the
-    /// next link of it relinks only what changed.
-    pub(crate) images: Mutex<HashMap<String, codegen::Linked>>,
+    /// next link of it relinks only what changed. Taken out for a link and put back after, so
+    /// the lock is held for the move only.
+    pub(crate) images: Mutex<rustc_hash::FxHashMap<String, codegen::Linked>>,
     pub(crate) memo: Arc<blaze_codegen::memo::Memo>,
     /// What `-C target-cpu=native` is on this machine; none without LLVM.
     pub(crate) host_cpu: Option<blaze_units::stdlib::target::HostCpu>,
@@ -85,8 +84,7 @@ impl Real {
             state: paths.state.clone(),
             launcher: paths.launcher.clone(),
             tools,
-            disk: Mutex::new(blaze_usercode::inputs::Disk::new(Vec::new())),
-            images: Mutex::new(HashMap::new()),
+            images: Mutex::new(rustc_hash::FxHashMap::default()),
             memo: blaze_codegen::driver::shared_memo(),
             host_cpu: hir_ty_codegen::host_cpu().map(|(name, features)| blaze_units::stdlib::target::HostCpu {
                 arch: std::env::consts::ARCH.to_owned(),
@@ -182,22 +180,39 @@ pub(crate) struct Job {
     pub(crate) input: JobInput,
     pub(crate) lowered: Lowered,
     pub(crate) shared: Arc<Shared>,
-    /// What each build script's run told cargo, by its run unit.
-    pub(crate) scripts: Mutex<BTreeMap<usize, script::Applied>>,
-    /// What each compiled unit made that later work reads: its main file, its tests.
-    pub(crate) made: Mutex<BTreeMap<usize, compile::Made>>,
+    /// The unit graph as columns.
+    pub(crate) graph: graph::Graph,
+    /// What each build script's run told cargo, by its run unit. Each slot is written once,
+    /// when the run ends, and read with no lock by every unit after it.
+    pub(crate) scripts: Box<[OnceLock<script::Applied>]>,
+    /// What each compiled unit made that later work reads: its main file, its tests. Written
+    /// once per unit.
+    pub(crate) made: Box<[OnceLock<compile::Made>]>,
+    /// Each unit's record key, worked out once: `fresh` on the loop and `compile` on a worker
+    /// both read it.
+    pub(crate) keys: Box<[OnceLock<Option<blaze_cas::Key>>]>,
+    /// How each unit's program is run, worked out once (the key and the artifact read it).
+    pub(crate) runs: Box<[OnceLock<artifact::Runs>]>,
+    /// The crates built for build scripts and proc macros, as the code generator takes them.
+    pub(crate) build_time: OnceLock<hir_ty_codegen::v2::BuildTime>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
 }
 
 impl Job {
     fn new(input: JobInput, lowered: Lowered, shared: Arc<Shared>) -> Job {
+        let graph = graph::Graph::new(&input.units);
+        let slots = graph.len();
         Job {
             input,
             lowered,
             shared,
-            scripts: Mutex::new(BTreeMap::new()),
-            made: Mutex::new(BTreeMap::new()),
+            graph,
+            scripts: (0..slots).map(|_| OnceLock::new()).collect(),
+            made: (0..slots).map(|_| OnceLock::new()).collect(),
+            keys: (0..slots).map(|_| OnceLock::new()).collect(),
+            runs: (0..slots).map(|_| OnceLock::new()).collect(),
+            build_time: OnceLock::new(),
             began: Instant::now(),
         }
     }
@@ -256,8 +271,9 @@ pub(crate) fn package_of<'a>(
 ) -> Result<&'a blaze_units::query::PackagePlan, ApiError> {
     units
         .packages
-        .iter()
-        .find(|it| it.id == unit.pkg_id)
+        .binary_search_by(|it| it.id.as_str().cmp(&unit.pkg_id))
+        .ok()
+        .map(|at| &units.packages[at])
         .ok_or_else(|| ApiError::new(format!("the build has no package `{}`", unit.pkg_id), None))
 }
 

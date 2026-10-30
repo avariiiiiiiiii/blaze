@@ -51,14 +51,14 @@ macro_rules! flags_from_attrs {
         let attrs = attrs.bits();
         $Flags::from_bits_retain(0 $(| {
             const FROM: u32 = single_bit(AttrFlags::$attr.bits());
-            const TO: u32 = single_bit($Flags::$flag.bits() as u64);
+            const TO: u32 = single_bit($Flags::$flag.bits() as u128);
             (((attrs >> FROM) & 1) as Bits) << TO
         })+)
     }};
 }
 
 /// The position of the one bit of `bits`.
-const fn single_bit(bits: u64) -> u32 {
+const fn single_bit(bits: u128) -> u32 {
     assert!(bits.count_ones() == 1, "a flag read off an attribute is one bit");
     bits.trailing_zeros()
 }
@@ -1302,10 +1302,12 @@ mod tests {
     /// Every single bit, none, all, and seeded random words.
     fn attr_inputs() -> Vec<AttrFlags> {
         let mut state = 0x5167_5f66_6c61_6773;
-        (0..64)
-            .map(|bit| 1u64 << bit)
-            .chain([0, u64::MAX])
-            .chain((0..4096).map(|_| splitmix(&mut state)))
+        (0..128)
+            .map(|bit| 1u128 << bit)
+            .chain([0, u128::MAX])
+            .chain((0..4096).map(|_| {
+                (u128::from(splitmix(&mut state)) << 64) | u128::from(splitmix(&mut state))
+            }))
             .map(AttrFlags::from_bits_retain)
             .collect()
     }

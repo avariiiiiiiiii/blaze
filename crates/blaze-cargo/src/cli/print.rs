@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use blaze_api::{Artifact, Diagnostic, Level, Response, UnitOf, Verb};
+use blaze_api::{Artifact, Diagnostic, FetchVerb, Level, Response, UnitOf, Verb};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::{json, say};
@@ -181,6 +181,18 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                     self.line.push(' ');
                     self.line.push_str(source);
                 }
+                self.line.push('\n');
+                self.err.write_all(self.line.as_bytes())?;
+            }
+            // cargo's `Updating crates.io index`, `Downloaded serde v1.0.219`.
+            Response::Fetched { verb, what } if !self.shown.quiet => {
+                let word = match verb {
+                    FetchVerb::Updating => "Updating",
+                    FetchVerb::Downloaded => "Downloaded",
+                };
+                self.line.clear();
+                say::status_word(&mut self.line, word, self.shown.color);
+                self.line.push_str(&what);
                 self.line.push('\n');
                 self.err.write_all(self.line.as_bytes())?;
             }

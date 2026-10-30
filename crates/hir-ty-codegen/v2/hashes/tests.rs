@@ -130,6 +130,21 @@ fn a_callee_body_edit_keeps_its_callers_code_and_an_interface_edit_does_not() {
     assert_ne!(code(&db, "caller"), caller, "a callee's interface is in its callers' code");
 }
 
+const LOCALS: &str = r#"
+pub fn callee() -> u32 { let one = 1; one }
+pub fn caller() -> u32 { callee() }
+"#;
+
+#[test]
+fn renaming_a_local_changes_its_functions_code_and_not_its_callers() {
+    let (mut db, file) = fixture("sized", LOCALS);
+    let (callee, caller) = (code(&db, "callee"), code(&db, "caller"));
+
+    db.set_file_text(file, &LOCALS.replace("one", "uno"));
+    assert_ne!(code(&db, "callee"), callee, "debug info names the local");
+    assert_eq!(code(&db, "caller"), caller, "a caller takes its callee by its interface");
+}
+
 #[test]
 fn a_type_is_its_arguments_and_not_its_alias() {
     let (db, _) = fixture("sized", CALLS);

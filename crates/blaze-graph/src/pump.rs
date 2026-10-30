@@ -807,7 +807,7 @@ mod tests {
     fn random_waits_end_and_run_each_key_once_at_a_time() {
         const KEYS: usize = 24;
         let topology = Topology {
-            cpus: (0..4).map(|id| Cpu { id, group: id / 2, socket: 0, fast: true }).collect(),
+            cpus: (0..4).map(|id| Cpu { id, group: id / 2, socket: 0, node: 0, fast: true }).collect(),
         };
         for seed in 0..12u64 {
             let mut rng = Rng(seed);

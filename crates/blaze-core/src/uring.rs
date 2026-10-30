@@ -15,6 +15,7 @@
 //! waits run the kernel's completion work (`IORING_SETUP_DEFER_TASKRUN`). Kernel 6.1 or later.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, VecDeque},
     ffi::CString,
     io,
@@ -24,9 +25,10 @@ use std::{
     },
     path::{Path, PathBuf},
     ptr,
+    rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU16, AtomicU32, Ordering, fence},
         mpsc,
     },
     time::{Duration, Instant},
@@ -211,9 +213,308 @@ struct GeteventsArg {
     ts: u64,
 }
 
+#[repr(C)]
+struct RsrcRegister {
+    nr: u32,
+    flags: u32,
+    resv2: u64,
+    data: u64,
+    tags: u64,
+}
+
+#[repr(C)]
+struct RsrcUpdate2 {
+    offset: u32,
+    resv: u32,
+    data: u64,
+    tags: u64,
+    nr: u32,
+    resv2: u32,
+}
+
+#[repr(C)]
+struct BufReg {
+    ring_addr: u64,
+    ring_entries: u32,
+    bgid: u16,
+    flags: u16,
+    resv: [u64; 3],
+}
+
+#[repr(C)]
+struct FileIndexRange {
+    off: u32,
+    len: u32,
+    resv: u64,
+}
+
+/// An entry of a provided buffer ring; the ring's tail is the `resv` of its first entry.
+#[repr(C)]
+struct ProvidedBuf {
+    addr: u64,
+    len: u32,
+    bid: u16,
+    resv: u16,
+}
+
 const _: () = assert!(size_of::<Params>() == 120);
 const _: () = assert!(size_of::<Sqe>() == 64);
 const _: () = assert!(size_of::<Cqe>() == 16);
+const _: () = assert!(size_of::<RsrcRegister>() == 32);
+const _: () = assert!(size_of::<RsrcUpdate2>() == 32);
+const _: () = assert!(size_of::<BufReg>() == 40);
+const _: () = assert!(size_of::<FileIndexRange>() == 16);
+const _: () = assert!(size_of::<ProvidedBuf>() == 16);
+
+/// `io_uring_register(2)` of `opcode` with `arg`, or an error naming what was asked and the
+/// kernel that has it, where this one refuses it as unknown.
+fn register<T>(ring: RawFd, opcode: libc::c_uint, arg: *const T, nr: libc::c_uint, what: &str, since: &str) -> io::Result<i64> {
+    // SAFETY: `arg` points at what `opcode` reads (and the memory it names), alive for the call.
+    let got = unsafe { libc::syscall(libc::SYS_io_uring_register, ring, opcode, arg, nr) };
+    if got >= 0 {
+        return Ok(got);
+    }
+    let error = io::Error::last_os_error();
+    Err(match error.raw_os_error() {
+        Some(libc::EINVAL | libc::EOPNOTSUPP) => io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("io_uring {what}: {error}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
+        ),
+        _ => io::Error::new(error.kind(), format!("io_uring {what}: {error}")),
+    })
+}
+
+/// An anonymous mapping of `len` bytes, page-aligned, unmapped when dropped.
+fn anonymous(len: usize) -> io::Result<Map> {
+    // SAFETY: a new private mapping of no file.
+    let at = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE,
+            -1,
+            0,
+        )
+    };
+    if at == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Map { at: at.cast(), len })
+}
+
+/// The table of registered files: requests name a slot of it (`IOSQE_FIXED_FILE`), so the
+/// kernel takes no reference to a file per request. The first half is the driver's, for the
+/// files it keeps open and the sockets it connects; the second is the kernel's, which accepts
+/// put connections into directly.
+struct Table {
+    ring: Rc<OwnedFd>,
+    /// Slots of the driver's half that are free.
+    free: RefCell<Vec<u32>>,
+    ours: u32,
+}
+
+impl Table {
+    fn new(ring: &Rc<OwnedFd>) -> io::Result<Rc<Table>> {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        // SAFETY: a limit to write.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let size = u32::try_from(limit.rlim_cur).unwrap_or(u32::MAX).min(TABLE) & !1;
+        if size < 2 {
+            return Err(io::Error::other(format!("RLIMIT_NOFILE is {}: no table of files fits", limit.rlim_cur)));
+        }
+        let fd = ring.as_raw_fd();
+        let sparse = RsrcRegister { nr: size, flags: RSRC_REGISTER_SPARSE, resv2: 0, data: 0, tags: 0 };
+        let nr = size_of::<RsrcRegister>() as libc::c_uint;
+        register(fd, REGISTER_FILES2, &raw const sparse, nr, "a sparse table of registered files", "5.19")?;
+        let ours = size / 2;
+        let range = FileIndexRange { off: ours, len: size - ours, resv: 0 };
+        register(fd, REGISTER_FILE_ALLOC_RANGE, &raw const range, 0, "a range of the file table for direct accepts", "6.0")?;
+        Ok(Rc::new(Table { ring: ring.clone(), free: RefCell::new((0..ours).rev().collect()), ours }))
+    }
+
+    /// Slot `slot` made `fd`'s file, or emptied with -1.
+    fn set(&self, slot: u32, fd: RawFd) -> io::Result<()> {
+        let fds = [fd];
+        let update = RsrcUpdate2 { offset: slot, resv: 0, data: fds.as_ptr() as u64, tags: 0, nr: 1, resv2: 0 };
+        let nr = size_of::<RsrcUpdate2>() as libc::c_uint;
+        register(self.ring.as_raw_fd(), REGISTER_FILES_UPDATE2, &raw const update, nr, "updating the file table", "5.13")
+            .map(|_| ())
+    }
+
+    /// `fd` put in a slot of the driver's half, if one is free.
+    fn install(self: &Rc<Table>, fd: OwnedFd) -> io::Result<Rc<Fixed>> {
+        let slot = self.free.borrow_mut().pop();
+        if let Some(slot) = slot
+            && let Err(error) = self.set(slot, fd.as_raw_fd())
+        {
+            self.free.borrow_mut().push(slot);
+            return Err(error);
+        }
+        Ok(Rc::new(Fixed { fd: Some(fd), slot, table: self.clone() }))
+    }
+
+    /// The connection an accept put in slot `slot` of the kernel's half.
+    fn accepted(self: &Rc<Table>, slot: u32) -> Rc<Fixed> {
+        Rc::new(Fixed { fd: None, slot: Some(slot), table: self.clone() })
+    }
+}
+
+/// A file the ring's requests name: its slot of the [`Table`] where it has one, else its
+/// descriptor. Shared by each request in flight on it, so its slot is emptied, and may be
+/// reused, only once no request can name it any more.
+struct Fixed {
+    /// None for a connection an accept put straight into the table.
+    fd: Option<OwnedFd>,
+    /// None only where the driver's half of the table was full: the same file, through its
+    /// descriptor, so the same bytes.
+    slot: Option<u32>,
+    table: Rc<Table>,
+}
+
+impl Fixed {
+    /// The `fd` and flags of a request on it.
+    fn target(&self) -> (RawFd, u8) {
+        match (self.slot, &self.fd) {
+            (Some(slot), _) => (slot as RawFd, SQE_FIXED_FILE),
+            (None, Some(fd)) => (fd.as_raw_fd(), 0),
+            (None, None) => unreachable!("a file of no slot has its descriptor"),
+        }
+    }
+
+    fn fd(&self) -> RawFd {
+        self.fd.as_ref().map_or(-1, |it| it.as_raw_fd())
+    }
+}
+
+impl Drop for Fixed {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot else { return };
+        // Emptying the slot drops the table's reference: a socket accepted into it closes.
+        if self.table.set(slot, -1).is_ok() && slot < self.table.ours {
+            self.table.free.borrow_mut().push(slot);
+        }
+    }
+}
+
+/// Registered buffers (`IORING_REGISTER_BUFFERS2`), page-aligned, for the pieces of writes
+/// that bypass the page cache (`WRITE_FIXED`), which need memory aligned to the device's
+/// blocks. Pinned once, so no request pins pages of its own.
+struct Registered {
+    map: Map,
+    free: Vec<u16>,
+}
+
+impl Registered {
+    fn new(ring: RawFd) -> io::Result<Registered> {
+        let map = anonymous(DIRECT_BUFFERS as usize * DIRECT_PIECE)?;
+        let iovecs: Vec<libc::iovec> = (0..DIRECT_BUFFERS as usize)
+            .map(|n| libc::iovec {
+                // SAFETY: within the mapping.
+                iov_base: unsafe { map.at.add(n * DIRECT_PIECE) }.cast(),
+                iov_len: DIRECT_PIECE,
+            })
+            .collect();
+        let buffers = RsrcRegister { nr: DIRECT_BUFFERS.into(), flags: 0, resv2: 0, data: iovecs.as_ptr() as u64, tags: 0 };
+        let nr = size_of::<RsrcRegister>() as libc::c_uint;
+        register(ring, REGISTER_BUFFERS2, &raw const buffers, nr, "registered buffers", "5.13").map_err(|error| {
+            match error.raw_os_error() {
+                Some(libc::ENOMEM) => io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}: pinning {} MiB of buffers needs RLIMIT_MEMLOCK of that much (ulimit -l) or CAP_IPC_LOCK",
+                        DIRECT_BUFFERS as usize * DIRECT_PIECE >> 20
+                    ),
+                ),
+                _ => error,
+            }
+        })?;
+        Ok(Registered { map, free: (0..DIRECT_BUFFERS).rev().collect() })
+    }
+
+    fn at(&self, index: u16) -> *mut u8 {
+        // SAFETY: within the mapping: `index` is one of its buffers.
+        unsafe { self.map.at.add(index as usize * DIRECT_PIECE) }
+    }
+}
+
+/// The buffers a connection's multishot receive takes from (`IORING_REGISTER_PBUF_RING`): the
+/// kernel picks one per completion, and each is given back once its bytes are copied out.
+struct Provided {
+    ring: Map,
+    buffers: Map,
+    tail: u16,
+}
+
+impl Provided {
+    fn new(fd: RawFd) -> io::Result<Provided> {
+        let ring = anonymous(RECV_BUFFERS as usize * size_of::<ProvidedBuf>())?;
+        let buffers = anonymous(RECV_BUFFERS as usize * RECV_BUFFER)?;
+        let reg = BufReg {
+            ring_addr: ring.at as u64,
+            ring_entries: RECV_BUFFERS.into(),
+            bgid: RECV_GROUP,
+            flags: 0,
+            resv: [0; 3],
+        };
+        register(fd, REGISTER_PBUF_RING, &raw const reg, 1, "a ring of provided buffers", "5.19")?;
+        let mut provided = Provided { ring, buffers, tail: 0 };
+        for bid in 0..RECV_BUFFERS {
+            provided.give(bid);
+        }
+        Ok(provided)
+    }
+
+    /// The bytes the kernel put in buffer `bid`.
+    fn bytes(&self, bid: u16, len: usize) -> &[u8] {
+        // SAFETY: the buffer the completion names, written by the kernel and not given back.
+        unsafe { std::slice::from_raw_parts(self.buffers.at.add(bid as usize * RECV_BUFFER), len.min(RECV_BUFFER)) }
+    }
+
+    /// Buffer `bid` the kernel's again.
+    fn give(&mut self, bid: u16) {
+        let mask = RECV_BUFFERS - 1;
+        let entry: *mut ProvidedBuf = self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
+        // SAFETY: an entry of the ring past the tail, which the kernel does not read until the
+        // tail moves past it; the buffer is the driver's until then.
+        unsafe {
+            (*entry).addr = self.buffers.at.add(bid as usize * RECV_BUFFER) as u64;
+            (*entry).len = RECV_BUFFER as u32;
+            (*entry).bid = bid;
+        }
+        self.tail = self.tail.wrapping_add(1);
+        // SAFETY: the tail is the `resv` of the first entry, the kernel's to read.
+        unsafe { (*self.ring.at::<AtomicU16>(14)).store(self.tail, Ordering::Release) };
+    }
+}
+
+const _: () = assert!(RECV_BUFFERS.is_power_of_two());
+
+/// What `statx` says of a descriptor's file: its device, and the alignment of offset and
+/// length a write bypassing the page cache needs (0 where its file system has none).
+fn direct_alignment(fd: RawFd) -> io::Result<(u64, u32)> {
+    #[repr(C, align(8))]
+    struct Statx([u8; 256]);
+    let mut statx = Statx([0; 256]);
+    // SAFETY: an open descriptor, an empty path with `AT_EMPTY_PATH`, and a buffer of the
+    // size of `struct statx` to write.
+    let got = unsafe {
+        libc::syscall(libc::SYS_statx, fd, c"".as_ptr(), libc::AT_EMPTY_PATH, STATX_DIOALIGN, statx.0.as_mut_ptr())
+    };
+    if got != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let word = |at: usize| u32::from_ne_bytes(statx.0[at..at + 4].try_into().expect("four bytes"));
+    let device = (u64::from(word(136)) << 32) | u64::from(word(140));
+    // `stx_dio_offset_align`, where the mask says it is filled in.
+    let align = match word(0) & STATX_DIOALIGN {
+        0 => 0,
+        _ => word(156),
+    };
+    Ok((device, align))
+}
 
 /// A mapping of the ring's memory, unmapped when dropped.
 struct Map {
@@ -259,6 +560,7 @@ impl Drop for Map {
 struct Ring {
     sq_head: *const AtomicU32,
     sq_tail: *const AtomicU32,
+    sq_flags: *const AtomicU32,
     sq_mask: u32,
     sq_entries: u32,
     sqes: *mut Sqe,
@@ -266,20 +568,26 @@ struct Ring {
     cq_tail: *const AtomicU32,
     cq_mask: u32,
     cqes: *const Cqe,
-    /// Requests written to the ring and not yet handed to the kernel.
+    /// Requests written to the ring since the kernel's thread was last told of them.
     unsubmitted: u32,
     // Dropped after the pointers into them are no longer used.
     _maps: Vec<Map>,
-    fd: OwnedFd,
+    /// Shared with the [`Table`], whose slots are emptied through it until the last goes.
+    fd: Rc<OwnedFd>,
 }
 
 impl Ring {
-    /// Set up for the one thread that makes it (a [`Uring`] is not `Send`): the kernel does a
-    /// completion's work when that thread waits, in a batch, rather than interrupting it for
-    /// each.
+    /// Submitted by a kernel thread of its own (`IORING_SETUP_SQPOLL`), which takes requests
+    /// from the ring as they are written, with no system call, and sleeps after
+    /// [`SQ_THREAD_IDLE_MS`] of nothing to do. For one issuing thread (a [`Uring`] is not
+    /// `Send`; `IORING_SETUP_SINGLE_ISSUER`). With a thread of its own the kernel runs every
+    /// completion's work there, so `IORING_SETUP_DEFER_TASKRUN`, `COOP_TASKRUN` and
+    /// `TASKRUN_FLAG`, which say when the issuing thread runs it, mean nothing with SQPOLL, and
+    /// the kernel refuses them with it.
     fn new(entries: u32, completions: u32) -> io::Result<Ring> {
         let mut params = Params {
-            flags: SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER | SETUP_DEFER_TASKRUN,
+            flags: SETUP_SQPOLL | SETUP_CQSIZE | SETUP_SUBMIT_ALL | SETUP_SINGLE_ISSUER,
+            sq_thread_idle: SQ_THREAD_IDLE_MS,
             cq_entries: completions,
             ..Params::default()
         };
@@ -293,8 +601,8 @@ impl Ring {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     format!(
-                        "io_uring_setup with IORING_SETUP_DEFER_TASKRUN: {error}: Linux 6.1 or \
-                         later has it, and this is Linux {}",
+                        "io_uring_setup with IORING_SETUP_SQPOLL and IORING_SETUP_SINGLE_ISSUER: \
+                         {error}: Linux 6.0 or later has them, and this is Linux {}",
                         crate::cgroup::kernel()
                     ),
                 ));
@@ -302,11 +610,17 @@ impl Ring {
             return Err(error);
         }
         // SAFETY: the call returned a file descriptor of its own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-        if params.features & FEAT_EXT_ARG == 0 || params.features & FEAT_SINGLE_MMAP == 0 {
+        let fd = Rc::new(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        let wanted = [
+            (FEAT_SINGLE_MMAP, "IORING_FEAT_SINGLE_MMAP", "5.4"),
+            (FEAT_NODROP, "IORING_FEAT_NODROP", "5.5"),
+            (FEAT_SQPOLL_NONFIXED, "IORING_FEAT_SQPOLL_NONFIXED", "5.11"),
+            (FEAT_EXT_ARG, "IORING_FEAT_EXT_ARG", "5.11"),
+        ];
+        if let Some((_, name, since)) = wanted.iter().find(|(bit, ..)| params.features & bit == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "io_uring of before Linux 5.11 (no IORING_FEAT_EXT_ARG)",
+                format!("io_uring without {name}: Linux {since} or later has it, and this is Linux {}", crate::cgroup::kernel()),
             ));
         }
         let sq_len = params.sq_off.array as usize + params.sq_entries as usize * size_of::<u32>();
@@ -326,6 +640,7 @@ impl Ring {
         Ok(Ring {
             sq_head: rings.at(sq.head),
             sq_tail: rings.at(sq.tail),
+            sq_flags: rings.at(sq.flags),
             sq_mask,
             sq_entries: params.sq_entries,
             sqes: sqes.at(0),
@@ -339,27 +654,46 @@ impl Ring {
         })
     }
 
-    /// Writes `sqe` to the ring, unless it is full.
-    fn push(&mut self, sqe: Sqe) -> bool {
+    /// Writes `sqes` to the ring one after another, all or, where there is no room for all,
+    /// none (a linked chain is links of requests next to each other).
+    fn push(&mut self, sqes: &[Sqe]) -> bool {
         // SAFETY: the counters are the kernel's and this thread's; the kernel moves the head.
         let (head, tail) = unsafe {
             ((*self.sq_head).load(Ordering::Acquire), (*self.sq_tail).load(Ordering::Relaxed))
         };
-        if tail.wrapping_sub(head) >= self.sq_entries {
+        if tail.wrapping_sub(head) as usize + sqes.len() > self.sq_entries as usize {
             return false;
         }
-        // SAFETY: the slot at `tail` is not the kernel's until the tail moves past it.
-        unsafe {
-            self.sqes.add((tail & self.sq_mask) as usize).write(sqe);
-            (*self.sq_tail).store(tail.wrapping_add(1), Ordering::Release);
+        for (n, sqe) in sqes.iter().enumerate() {
+            let at = tail.wrapping_add(n as u32) & self.sq_mask;
+            // SAFETY: the slots from `tail` are not the kernel's until the tail moves past them.
+            unsafe { self.sqes.add(at as usize).write(*sqe) };
         }
-        self.unsubmitted += 1;
+        // SAFETY: as above; the release publishes the entries with the tail.
+        unsafe { (*self.sq_tail).store(tail.wrapping_add(sqes.len() as u32), Ordering::Release) };
+        self.unsubmitted += sqes.len() as u32;
         true
     }
 
-    /// Hands the requests written to the kernel and, with `wait`, waits up to it for one
-    /// completion.
+    /// The submission ring's flags, read after every write of it is visible to the kernel's
+    /// thread (the full fence pairs with the one the thread makes before it sleeps).
+    fn flags(&self) -> u32 {
+        fence(Ordering::SeqCst);
+        // SAFETY: the kernel's counter at the offset it named.
+        unsafe { (*self.sq_flags).load(Ordering::Relaxed) }
+    }
+
+    /// Wakes the kernel's thread where it sleeps with requests written since, and, with
+    /// `wait`, waits up to it for one completion. Completions the kernel held for want of room
+    /// are flushed to the ring by any enter that gets events.
     fn enter(&mut self, wait: Option<Duration>) -> io::Result<()> {
+        let flags = self.flags();
+        let wake = self.unsubmitted > 0 && flags & SQ_NEED_WAKEUP != 0;
+        self.unsubmitted = 0;
+        let wait = wait.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Duration::ZERO));
+        if wait.is_none() && !wake {
+            return Ok(());
+        }
         let ts =
             wait.map(|it| Timespec { sec: it.as_secs() as i64, nsec: it.subsec_nanos() as i64 });
         let arg = GeteventsArg {
@@ -368,17 +702,21 @@ impl Ring {
             pad: 0,
             ts: ts.as_ref().map_or(0, |it| it as *const Timespec as u64),
         };
-        let (min_complete, flags) = match wait {
+        let (min_complete, mut flags) = match wait {
             Some(_) => (1, ENTER_GETEVENTS | ENTER_EXT_ARG),
             None => (0, ENTER_EXT_ARG),
         };
+        if wake {
+            flags |= ENTER_SQ_WAKEUP;
+        }
         loop {
-            // SAFETY: `arg` and the timespec it points at outlive the call.
+            // SAFETY: `arg` and the timespec it points at outlive the call. With SQPOLL the
+            // kernel's thread submits; the call only wakes it and waits.
             let entered = unsafe {
                 libc::syscall(
                     libc::SYS_io_uring_enter,
                     self.fd.as_raw_fd(),
-                    self.unsubmitted,
+                    0,
                     min_complete,
                     flags,
                     &raw const arg,
@@ -386,7 +724,6 @@ impl Ring {
                 )
             };
             if entered >= 0 {
-                self.unsubmitted -= (entered as u32).min(self.unsubmitted);
                 return Ok(());
             }
             let error = io::Error::last_os_error();
@@ -401,9 +738,9 @@ impl Ring {
         }
     }
 
-    /// Every completion the kernel has posted: its `user_data`, its result and whether its
-    /// request goes on ([`CQE_F_MORE`]).
-    fn reap(&mut self, mut each: impl FnMut(u64, i32, bool)) {
+    /// Every completion the kernel has posted: its `user_data`, its result and its flags
+    /// ([`CQE_F_MORE`], [`CQE_F_BUFFER`] and the buffer's id).
+    fn reap(&mut self, mut each: impl FnMut(u64, i32, u32)) {
         // SAFETY: the counters are the kernel's and this thread's; the kernel moves the tail.
         let (mut head, tail) = unsafe {
             ((*self.cq_head).load(Ordering::Relaxed), (*self.cq_tail).load(Ordering::Acquire))
@@ -411,11 +748,11 @@ impl Ring {
         while head != tail {
             // SAFETY: the entries between the head and the tail are posted and not reaped.
             let cqe = unsafe { &*self.cqes.add((head & self.cq_mask) as usize) };
-            let (user_data, res, more) = (cqe.user_data, cqe.res, cqe.flags & CQE_F_MORE != 0);
+            let (user_data, res, flags) = (cqe.user_data, cqe.res, cqe.flags);
             head = head.wrapping_add(1);
             // SAFETY: as above; the entry is the kernel's again once the head is past it.
             unsafe { (*self.cq_head).store(head, Ordering::Release) };
-            each(user_data, res, more);
+            each(user_data, res, flags);
         }
     }
 }
@@ -1241,21 +1578,8 @@ impl Uring {
     }
 
     fn spawn(&mut self, tag: Tag, command: Box<Command>) -> io::Result<()> {
-        let crate::process::Started { pid, stdin, stdout, stderr, finish } =
+        let crate::process::Started { pid, pidfd, stdin, stdout, stderr, finish } =
             crate::process::start(&self.root, command, self.confine.as_ref())?;
-        let pidfd = match crate::process::pidfd(pid) {
-            Ok(it) => it,
-            Err(error) => {
-                let program = finish.command.program.display().to_string();
-                crate::process::kill(pid);
-                // Only to reap it and remove what was made for it.
-                _ = finish.exited(pid, Vec::new(), Vec::new());
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("{program}: no pidfd of it, to learn of its exit: {error}"),
-                ));
-            }
-        };
         let input = finish.command.stdin.clone();
         let exit = pidfd.as_raw_fd();
         let parts = 3 + usize::from(stdin.is_some());

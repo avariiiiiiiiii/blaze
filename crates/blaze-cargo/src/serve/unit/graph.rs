@@ -75,8 +75,6 @@ pub(crate) struct Graph {
     by_target: FxHashMap<u64, Vec<u32>>,
 }
 
-const _: () = assert!(size_of::<u32>() * 3 + size_of::<u8>() <= 16);
-
 /// What a unit builds, hashed: its package, target name and kinds, and mode.
 pub(crate) fn target_hash(pkg_id: &str, name: &str, kinds: &[String], mode: Mode) -> u64 {
     let mut hasher = FxHasher::default();

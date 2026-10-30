@@ -701,6 +701,7 @@ fn run_io(job: Arc<Job>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
         collections::BTreeSet,
@@ -720,10 +721,10 @@ mod tests {
     use crate::{
         Cancelled, Key,
         admission::{Estimates, TaskKind},
+        arena,
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
-        pump::lock,
         topology::Topology,
     };
 
@@ -751,15 +752,59 @@ mod tests {
     type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
 
     fn scheduler(workers: usize) -> (Scheduler, Db) {
-        let pool: &'static Workers =
-            Box::leak(Box::new(Workers::new(&Topology::flat(workers), false).unwrap()));
+        scheduler_on(&Topology::flat(workers)).0
+    }
+
+    /// A scheduler on a pool of `topology`'s shape, and the pool.
+    fn scheduler_on(topology: &Topology) -> ((Scheduler, Db), &'static Workers) {
+        let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
+        let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
         let db = Db::default();
         let memo = {
             let db = db.clone();
             move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
         };
-        (Scheduler::with_pool(config, Estimates::default(), Box::new(memo), pool).unwrap(), db)
+        ((Scheduler::with_pool(config, Estimates::default(), Box::new(memo), pool).unwrap(), db), pool)
+    }
+
+    /// A chain of five tasks on a machine of P and E cores: each, the only work of its request
+    /// when it runs, is on its critical path, and the scheduler submits it as critical.
+    #[test]
+    fn a_task_on_the_critical_path_is_submitted_as_critical() {
+        let ((scheduler, _), pool) = scheduler_on(&Topology::from_perflevels(&[(1, 1), (2, 2)]));
+        let built: Work = Arc::new(|| Ok(Did::built()));
+        let opened = scheduler.open(1, false);
+        let chain = (0..5u32)
+            .map(|id| {
+                let deps: Vec<u32> = (id > 0).then_some(59 + id).into_iter().collect();
+                task(60 + id, &deps, None, built.clone())
+            })
+            .collect();
+        scheduler.add(opened.request, chain);
+        scheduler.close(opened.request);
+        assert!(finish(&opened).0);
+        assert_eq!(pool.critical_submitted(), 5);
+    }
+
+    /// Every task's work runs in its thread's task arena, under `drive` and the scheduler both.
+    #[test]
+    fn work_runs_in_a_task_arena() {
+        let in_arena = || arena::with(|bump| *bump.alloc(7u64).unwrap()) == 7;
+
+        let mut machine = Machine::new(Config { io: 1, work: 2, keep_going: false }).unwrap();
+        let nodes = vec![spec(0, &[], Pool::Io, None), spec(1, &[0], Pool::Work, None)];
+        let work = |_: NodeId| if in_arena() { Did::built() } else { Did::failed("no arena") };
+        assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
+
+        let (scheduler, _) = scheduler(2);
+        let work: Work =
+            Arc::new(move || Ok(if in_arena() { Did::built() } else { Did::failed("no arena") }));
+        let opened = scheduler.open(1, false);
+        let io = Task { spec: spec(71, &[], Pool::Io, None), kind: TaskKind(1), work: work.clone() };
+        scheduler.add(opened.request, vec![io, task(72, &[71], None, work)]);
+        scheduler.close(opened.request);
+        assert!(finish(&opened).0);
     }
 
     /// Everything the request said, up to its end, and whether it was ok.

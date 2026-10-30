@@ -87,7 +87,8 @@ impl Levels {
             emitted: Vec::new(),
             expectations: Vec::new(),
         };
-        for (name, level) in &sh.cmd.opts {
+        let cmd = sh.cmd;
+        for (name, level) in &cmd.opts {
             levels.command_line(sh, name, *level);
         }
         levels
@@ -229,7 +230,9 @@ impl Levels {
             false => Vec::new(),
         };
         let pre = node.file_id == sh.root;
-        let span = |range: TextRange| sh.cx.span(InFile::new(node.file_id, range));
+        let cx = sh.cx;
+        let file = node.file_id;
+        let span = |range: TextRange| cx.span(InFile::new(file, range));
         for read in reads {
             let (level, mut items) = match read {
                 Read::Allows(name) => {
@@ -239,24 +242,33 @@ impl Levels {
                 }
                 Read::Level(level, items) => (level, items),
             };
-            let Some(tail) = items.last() else { continue };
+            let tail = match items.last() {
+                None => continue,
+                Some(it) => match &it.kind {
+                    ItemKind::Word(_) | ItemKind::Lit => Tail::Lint,
+                    ItemKind::NameValue { string, value, .. } if it.kind.is_reason() => {
+                        Tail::Reason(string.clone(), *value)
+                    }
+                    ItemKind::NameValue { .. } | ItemKind::List(_) => Tail::Bad(it.range),
+                },
+            };
             let mut reason = None;
-            match &tail.kind {
-                ItemKind::Word(_) | ItemKind::Lit => {}
-                ItemKind::NameValue { string, value, .. } if tail.kind.is_reason() => {
+            match tail {
+                Tail::Lint => {}
+                Tail::Reason(string, value) => {
                     match string {
-                        Some(string) => reason = Some(string.clone()),
+                        Some(string) => reason = Some(string),
                         None if says => {
-                            let diag = malformed(span(*value), "reason must be a string literal");
+                            let diag = malformed(span(value), "reason must be a string literal");
                             self.push(pre, place.clone(), diag);
                         }
                         None => {}
                     }
                     items.pop();
                 }
-                ItemKind::NameValue { .. } | ItemKind::List(_) => {
+                Tail::Bad(range) => {
                     if says {
-                        self.push(pre, place.clone(), malformed(span(tail.range), "bad attribute argument"));
+                        self.push(pre, place.clone(), malformed(span(range), "bad attribute argument"));
                     }
                 }
             }
@@ -523,6 +535,15 @@ impl Levels {
             None => specs.push((lint, spec)),
         }
     }
+}
+
+/// The last element of a lint attribute's list, which may be its `reason`.
+enum Tail {
+    Lint,
+    /// `reason = ..`: the string, if it is one, and where the value is.
+    Reason(Option<String>, TextRange),
+    /// A `name = value` or `name(..)` that is not a reason.
+    Bad(TextRange),
 }
 
 /// E0452 "malformed lint attribute input" with its label.

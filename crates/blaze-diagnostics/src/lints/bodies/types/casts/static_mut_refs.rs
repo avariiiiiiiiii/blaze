@@ -49,9 +49,9 @@ impl LatePass for StaticMutRefs {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        match &b.store()[expr] {
+        match b.store().expr(expr) {
             Expr::Ref { expr: inner, rawness: Rawness::Ref, mutability } => {
-                let (inner, mutable) = (*inner, *mutability == Mutability::Mut);
+                let mutable = mutability == Mutability::Mut;
                 let Some(def) = static_mut(b, inner) else { return };
                 // A borrow made by lowering (`format_args!`'s of its arguments) is in rustc a
                 // borrow in the macro's expansion, linted where what it borrows is.
@@ -68,7 +68,6 @@ impl LatePass for StaticMutRefs {
                 emit(b, at, span, sugg, mutable, def, out);
             }
             Expr::MethodCall { receiver, .. } => {
-                let receiver = *receiver;
                 let Some(def) = static_mut(b, receiver) else { return };
                 let Some(method) = method_fn(b, expr) else { return };
                 let sig = b.db().callable_item_signature(method.into());
@@ -91,11 +90,11 @@ impl LatePass for StaticMutRefs {
     }
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
-        let Expr::Block { statements, .. } = &b.store()[block] else { return };
+        let Expr::Block { statements, .. } = b.store().expr(block) else { return };
         let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index) else { return };
         let (pat, init) = (*pat, *init);
-        let Pat::Bind { id, .. } = &b.store()[pat] else { return };
-        let mutable = match b.store()[*id].mode {
+        let Pat::Bind { id, .. } = b.store().pat(pat) else { return };
+        let mutable = match b.store()[id].mode {
             BindingAnnotation::Ref => false,
             BindingAnnotation::RefMut => true,
             BindingAnnotation::Unannotated | BindingAnnotation::Mutable => return,
@@ -108,10 +107,10 @@ impl LatePass for StaticMutRefs {
 
 /// rustc's `path_is_static_mut`: the `static mut` that `expr`, through its fields, names.
 fn static_mut(b: &BodyCx<'_, '_>, mut expr: ExprId) -> Option<StaticId> {
-    while let Expr::Field { expr: base, .. } = &b.store()[expr] {
-        expr = *base;
+    while let Expr::Field { expr: base, .. } = b.store().expr(expr) {
+        expr = base;
     }
-    let Expr::Path(_) = &b.store()[expr] else { return None };
+    let Expr::Path(_) = b.store().expr(expr) else { return None };
     match path_value(b, expr)? {
         ValueNs::StaticId(it) if StaticSignature::of(b.db(), it).flags.contains(StaticFlags::MUTABLE) => Some(it),
         _ => None,

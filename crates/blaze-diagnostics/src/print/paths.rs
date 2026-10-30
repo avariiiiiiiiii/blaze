@@ -211,7 +211,7 @@ pub(crate) fn parent(cx: &Cx<'_, '_>, def: Def) -> Option<Parent> {
         if module.is_block_module(db) { block_owner(cx, module) } else { Some(Parent::Def(Def::Module(module))) }
     };
     match def {
-        Def::Module(it) => module_parent(it.containing_module(db)?),
+        Def::Module(it) => module_parent(it.containing_module(db)?.to_static()),
         Def::Variant(it) => Some(Parent::Def(Def::Adt(it.lookup(db).parent.into()))),
         Def::Function(_) | Def::Const(_) | Def::Static(_) | Def::TypeAlias(_) => {
             match def.container(cx)? {

@@ -132,9 +132,6 @@ name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
 
 [[package]]
 name = "arc-swap"
@@ -637,6 +634,7 @@ dependencies = [
  "blaze-format",
  "blaze-graph",
  "blaze-ids",
+ "blaze-lint-defs",
  "blaze-mem",
  "blaze-vfs",
  "cfg",
@@ -745,6 +743,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "sonic-rs",
 ]
 
 [[package]]
@@ -822,6 +821,7 @@ dependencies = [
  "blaze-image",
  "blaze-inproc",
  "blaze-intent",
+ "blaze-item-hash",
  "blaze-items",
  "blaze-lazy",
  "blaze-link",
@@ -834,6 +834,7 @@ dependencies = [
  "blaze-mem",
  "blaze-metadata",
  "blaze-new",
+ "blaze-profile",
  "blaze-protocol",
  "blaze-query",
  "blaze-registry",
@@ -864,6 +865,7 @@ dependencies = [
  "hir-def",
  "hir-ty",
  "hir-ty-codegen",
+ "hir-ty-pure",
  "hir-ty-ub",
  "http-body-util",
  "hyper",
@@ -886,6 +888,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shlex",
+ "stdx",
  "syntax",
  "tar",
  "tempfile",
@@ -911,6 +914,7 @@ name = "blaze-cas"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-check",
  "blaze-core",
  "blaze-format",
@@ -929,6 +933,8 @@ dependencies = [
 name = "blaze-check"
 version = "0.0.0"
 dependencies = [
+ "blaze-alloc-count",
+ "blaze-rng",
  "libc",
  "rustc-hash 2.1.2",
  "windows-sys 0.61.2",
@@ -987,6 +993,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-radix",
+ "blaze-rng",
  "crossbeam-channel",
  "hegeltest",
  "libc",
@@ -1069,6 +1076,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde_json",
  "span",
+ "stdx",
  "syntax",
 ]
 
@@ -1191,11 +1199,14 @@ dependencies = [
  "blaze-cas",
  "blaze-codegen",
  "blaze-core",
+ "blaze-diagnostics",
  "blaze-format",
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
  "blaze-usercode",
+ "hir-ty",
+ "hir-ty-borrowck",
  "memchr",
  "ring",
  "rustls",
@@ -1223,6 +1234,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "serde",
  "serde_json",
+ "stdx",
 ]
 
 [[package]]
@@ -1240,9 +1252,11 @@ name = "blaze-history"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-format",
  "blaze-graph",
  "blaze-ids",
+ "blaze-image",
  "blaze-protocol",
  "rustc-hash 2.1.2",
 ]
@@ -1257,6 +1271,7 @@ dependencies = [
  "blaze-check",
  "blaze-mem",
  "blaze-radix",
+ "blaze-rng",
  "hegeltest",
  "postcard",
  "serde",
@@ -1280,9 +1295,11 @@ dependencies = [
 name = "blaze-inproc"
 version = "0.0.0"
 dependencies = [
+ "blaze-bytes",
  "blaze-core",
  "blaze-ids",
  "blaze-mem",
+ "blaze-radix",
  "libc",
  "windows-sys 0.61.2",
 ]
@@ -1297,6 +1314,7 @@ dependencies = [
  "blaze-core",
  "blaze-ids",
  "blaze-items",
+ "blaze-mem",
  "blaze-vfs",
  "either",
  "hir",
@@ -1326,12 +1344,15 @@ dependencies = [
  "hir-def",
  "hir-expand",
  "hir-ty",
+ "hir-ty-borrowck",
  "intern",
+ "la-arena",
  "rustc-hash 2.1.2",
  "rustc_type_ir",
  "salsa",
  "smallvec",
  "span",
+ "syntax",
  "test-utils",
  "triomphe",
 ]
@@ -1370,10 +1391,13 @@ name = "blaze-lazy"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
+ "blaze-cas",
  "blaze-codegen",
  "blaze-ids",
  "blaze-inproc",
  "blaze-items",
+ "blaze-mem",
  "blaze-stencil",
  "libc",
  "rustc-hash 2.1.2",
@@ -1384,6 +1408,7 @@ name = "blaze-link"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-codegen",
  "blaze-core",
  "blaze-format",
@@ -1483,11 +1508,15 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-core",
+ "blaze-format",
  "blaze-ids",
+ "blaze-inproc",
  "blaze-lower",
  "blaze-macro-wasm",
+ "blaze-mem",
  "blaze-native-proc-macro",
  "blaze-query",
+ "blaze-stencil",
  "blaze-units",
  "blaze-usercode",
  "blaze-vfs",
@@ -1498,18 +1527,18 @@ dependencies = [
  "hir-ty-mir",
  "intern",
  "libc",
+ "parser",
  "paths",
  "proc-macro-api",
  "ra-ap-rustc_lexer",
  "rustc-hash 2.1.2",
- "rustc-literal-escaper",
  "salsa",
  "serde",
  "serde_json",
  "span",
+ "stdx",
  "tt",
  "unicode-normalization",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1535,7 +1564,9 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "span",
+ "stdx",
  "target-lexicon",
+ "tracing",
  "tt",
  "wasmtime",
 ]
@@ -1547,6 +1578,7 @@ dependencies = [
  "annotate-snippets",
  "anyhow",
  "blaze-ids",
+ "blaze-resolve",
  "blaze-source",
  "cargo-platform",
  "cargo-util-schemas",
@@ -1628,6 +1660,7 @@ name = "blaze-premap"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-cas",
  "blaze-codegen",
  "blaze-core",
@@ -1639,6 +1672,18 @@ dependencies = [
  "blaze-mem",
  "rayon",
  "rustc-hash 2.1.2",
+]
+
+[[package]]
+name = "blaze-profile"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rustc-hash 2.1.2",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1659,6 +1704,7 @@ name = "blaze-query"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-check",
  "blaze-core",
  "blaze-format",
@@ -1680,6 +1726,7 @@ name = "blaze-radix"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-rng",
  "hegeltest",
 ]
 
@@ -1695,11 +1742,13 @@ name = "blaze-registry"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blaze-cas",
  "blaze-format",
+ "blaze-ids",
  "blaze-manifest",
  "blaze-resolve",
  "blaze-source",
- "cargo-platform",
+ "blaze-units",
  "filetime",
  "flate2",
  "http-body-util",
@@ -1741,6 +1790,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-rng"
+version = "0.0.0"
+dependencies = [
+ "blaze-alloc-count",
+ "hegeltest",
+]
+
+[[package]]
 name = "blaze-sha256"
 version = "0.0.0"
 dependencies = [
@@ -1769,6 +1826,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "blaze-alloc-count",
+ "blaze-bytes",
  "blaze-codegen",
  "blaze-ids",
  "blaze-inproc",
@@ -1920,6 +1978,9 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-alloc-count",
+ "blaze-cas",
+ "blaze-format",
+ "blaze-ids",
  "wasmtime",
  "wasmtime-wasi",
 ]
@@ -1980,22 +2041,8 @@ version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
 dependencies = [
- "borsh-derive",
  "bytes",
  "cfg_aliases",
-]
-
-[[package]]
-name = "borsh-derive"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
-dependencies = [
- "once_cell",
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2704,17 +2751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3237,6 +3273,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-format",
  "blaze-hashcons",
+ "blaze-ids",
  "blaze-mem",
  "cfg",
  "either",
@@ -3295,6 +3332,7 @@ dependencies = [
  "hir-expand",
  "indexmap",
  "intern",
+ "inventory",
  "itertools 0.15.0",
  "la-arena",
  "ra-ap-rustc_parse_format",
@@ -3349,6 +3387,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-firewall"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-codegen",
+ "blaze-ids",
+ "blaze-lower",
+ "blaze-macro-eval",
+ "blaze-query",
+ "blaze-units",
+ "blaze-vfs",
+ "hegeltest",
+ "hir",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-codegen",
+ "hir-ty-share",
+ "rustc-hash 2.1.2",
+ "salsa",
+ "serde",
+ "serde_json",
+ "syntax",
+]
+
+[[package]]
 name = "hir-lint-levels"
 version = "0.0.0"
 dependencies = [
@@ -3377,6 +3441,8 @@ dependencies = [
  "base-db",
  "bitflags 2.12.1",
  "blaze-alloc-count",
+ "blaze-check",
+ "blaze-dbsp",
  "blaze-format",
  "blaze-hashcons",
  "blaze-ids",
@@ -3452,11 +3518,13 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-cas",
  "blaze-codegen",
+ "blaze-core",
  "blaze-format",
  "blaze-fuzz",
  "blaze-ids",
  "blaze-items",
  "blaze-mem",
+ "blaze-profile",
  "blaze-stencil",
  "bumpalo",
  "cfg",
@@ -3566,6 +3634,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-ty-pure"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "blaze-alloc-count",
+ "blaze-ids",
+ "blaze-item-hash",
+ "blaze-items",
+ "blaze-mem",
+ "either",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "hir-ty-mir",
+ "hir-ty-share",
+ "intern",
+ "rustc-hash 2.1.2",
+ "rustc_type_ir",
+ "salsa",
+ "smallvec",
+ "span",
+]
+
+[[package]]
 name = "hir-ty-share"
 version = "0.0.0"
 dependencies = [
@@ -3635,14 +3727,12 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-format",
  "blaze-mem",
- "hashbrown 0.17.1",
  "hir-def",
  "hir-expand",
  "hir-ty",
  "hir-ty-mir",
  "intern",
  "la-arena",
- "rustc-hash 2.1.2",
  "rustc_type_ir",
  "salsa",
  "smallvec",
@@ -3942,6 +4032,7 @@ dependencies = [
  "blaze-ids",
  "blaze-image",
  "blaze-mem",
+ "blaze-phf",
  "rustc-hash 2.1.2",
 ]
 
@@ -4338,7 +4429,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
- "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -4747,15 +4837,6 @@ dependencies = [
  "stdx",
  "tracing",
  "tt",
-]
-
-[[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit",
 ]
 
 [[package]]
@@ -6662,7 +6743,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9b1e81f3eb254cf7404a82cee6926a4a3ccc5aad80cc3d43608a070c67aa1d7"
 dependencies = [
  "bitflags 2.12.1",
- "indexmap",
 ]
 
 [[package]]

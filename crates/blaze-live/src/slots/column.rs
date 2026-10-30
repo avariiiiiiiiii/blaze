@@ -98,7 +98,7 @@ impl<T: Plain> Column<T> {
             return;
         }
         let per_page = (FAULT / size_of::<T>()).max(1);
-        let pages = image::rows_mut(&mut self.memory, rows);
+        let pages = image::rows_mut::<T>(&mut self.memory, rows);
         let mut at = self.len;
         while at < rows {
             // Past the last row: a row's bytes stored back, which the compiler can't drop.

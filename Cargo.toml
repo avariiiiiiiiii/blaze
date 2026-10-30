@@ -111,6 +111,7 @@ blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
 blaze-lower = { path = "crates/blaze-lower" }
+blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-new = { path = "crates/blaze-new" }
 blaze-tree = { path = "crates/blaze-tree" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }

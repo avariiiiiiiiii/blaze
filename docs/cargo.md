@@ -98,7 +98,7 @@ hash, every result with its edges as CBOR, the size of each long-lived table); `
 the package for `wasm32-unknown-unknown` with debug assertions off (as `--release`), its build
 scripts run and proc macros loaded in the sandbox as any check's, and writes the program's crate
 and every crate it is made of, with each macro expansion its names and bodies needed, to `PATH`
-as one JSON file for the in-browser compiler (`crates/blaze-wasm/pack`, the agent API's
+as one JSON file for the in-browser compiler (`crates/blaze-wasm-pack`, the agent API's
 `Request::Pack`); `pin` is [below](#pinning-a-release-of-blaze). Any other command (v1's `fmt`, `clippy`, `doc`, `tree`,
 `metadata`, `toolchain`, ...) fails with `error: no such command` and status 101; none is
 passed to cargo, and no cargo plugin is run ([Every subcommand](#every-subcommand)).

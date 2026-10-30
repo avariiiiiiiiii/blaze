@@ -35,9 +35,9 @@ hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
 hir-ty-pure = { path = "../hir-ty-pure" }
-# `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It sits in blaze-wasm's own
-# workspace, but names no code generator, so no `wasm` feature reaches this build.
-blaze-wasm-pack = { path = "../blaze-wasm/pack" }
+# `blaze pack`'s pack, made in the daemon (`serve::unit::pack`). It names no code generator, so
+# blaze-wasm's `wasm` feature never reaches this build.
+blaze-wasm-pack.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true

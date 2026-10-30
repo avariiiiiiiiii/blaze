@@ -602,7 +602,7 @@ mod tests {
         let early: Vec<u32> = (0..100).map(intern).collect();
         std::thread::scope(|scope| {
             for worker in 0..8u64 {
-                let (intern, early) = (&intern, &early);
+                let (intern, early, column, index) = (&intern, &early, &column, &index);
                 scope.spawn(move || {
                     for n in 0..KEYS as u64 / 2 {
                         let key = (n * 7 + worker * 131) % (KEYS as u64 / 2);

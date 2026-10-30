@@ -19,7 +19,7 @@ blaze-codegen = { path = "../blaze-codegen" }
 blaze-format = { path = "../blaze-format" }
 blaze-ids = { path = "../blaze-ids" }
 blaze-items = { path = "../blaze-items" }
-blaze-wasm-pack = { path = "pack", version = "0.0.0" }
+blaze-wasm-pack = { path = "../blaze-wasm-pack", version = "0.0.0" }
 rustc-hash = "2.1.1"
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }

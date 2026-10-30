@@ -121,6 +121,7 @@ coordinator's: a change there is a request.
 | `test-fixture` | deleted at integration, 2026-10-30: its users run on the v2 fixture, `hir_expand::fixture` (feature `fixture`), which builds a `base_db::Db` through a `blaze-vfs` view | coordinator |
 | `ide-diagnostics` | replaced by `blaze-diagnostics` ([building.md](../process/building.md) section 18), then removed | diagnostics |
 | `load-cargo`, `project-model` | replaced by the workspace load as queries ([building.md](../process/building.md) section 18), the units lowered into base-db's crate graph by the new crate `blaze-lower`; deleted at integration, 2026-10-30 | cargo |
+| `blaze-wasm-pack` | new at integration, 2026-10-30: a front end `blaze serve` lowered (blaze-lower) recorded as one file for `blaze-wasm`, the in-browser compiler; made by the agent API's `pack` request. A root member, so its tests run with the workspace's; no code generator, so blaze-wasm's `wasm` feature never reaches the native build | coordinator |
 | `blaze-fmt`, `blaze-lints` | left; moved onto the flat tree at integration | coordinator |
 | every other crate | left | coordinator |
 

@@ -160,8 +160,8 @@ directory forgets everything.
 
 v2 does not yet follow a cached function through a live edit. The function that asks for the
 code holds the hash as a constant, so it has to be compiled again when any code its body reaches
-changes. v1 did that in `crates/hir-ty-codegen/patch.rs` (`cached_roots`), which v2's build does
-not use. v2's code identity of a body (`hir_ty_share::code`, read by
+changes. v1 did that with `cached_roots` in its code generator's patch module, deleted with v1's
+whole-object build on 2026-10-30. v2's code identity of a body (`hir_ty_share::code`, read by
 `crates/hir-ty-codegen/v2/hashes.rs`) takes each callee by its interface hash and does not hold
 that constant.
 

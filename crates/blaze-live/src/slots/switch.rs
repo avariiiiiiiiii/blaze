@@ -580,6 +580,7 @@ impl<M: Memory> Switch<M> {
         // SAFETY: `at` is 8-aligned (`Layout::new` checked) and the platform's `in_image`
         // refuses what is not the image, whose header and loader's table are the linker's
         // `Class::Table`, writable data for the life of the program.
+        #[allow(unsafe_code, reason = "the execution log's header, in place in the image")]
         let header = unsafe { Header::checked(at, layout.slots, in_image) }?;
         let table = header.loader();
         let current = memory.cell(at + exec::CURRENT);

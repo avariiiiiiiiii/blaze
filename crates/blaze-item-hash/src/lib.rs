@@ -26,8 +26,6 @@ pub mod presentation;
 pub mod reads;
 pub mod values;
 
-pub use presentation::presentation;
-
 #[cfg(test)]
 mod tests;
 

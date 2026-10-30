@@ -73,7 +73,7 @@ pub(crate) struct Kept {
 
 /// A release function as its importers link it, held for one build.
 #[cfg(feature = "llvm")]
-pub(crate) struct Export {
+pub struct Export {
     /// Its pre-linked module without a line table, with its requests and signature; `None`
     /// for one nothing can import (assembly, data that points at data after it), whose
     /// summary says [`summary::Hint::Never`].
@@ -85,7 +85,7 @@ pub(crate) struct Export {
 }
 
 #[cfg(not(feature = "llvm"))]
-pub(crate) struct Export(std::convert::Infallible);
+pub struct Export(std::convert::Infallible);
 
 /// The summary and export of an LLVM unit, from its prepared IR.
 #[cfg(feature = "llvm")]

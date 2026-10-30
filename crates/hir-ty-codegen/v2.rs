@@ -201,7 +201,7 @@ pub(crate) enum Kind {
 pub struct HirStatic(pub StaticId);
 
 /// A function whose IR is built, waiting for its backend.
-pub(crate) enum Prepared {
+pub enum Prepared {
     Cranelift(Box<Function>),
     Llvm(Box<Function>),
     /// For copy-and-patch (`blaze_stencil`): prepared as for Cranelift, over the same IR.

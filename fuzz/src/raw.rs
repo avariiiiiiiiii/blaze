@@ -112,9 +112,9 @@ fn value(at: u64) {
     let word = VALUES.as_ptr().wrapping_add(bit.wrapping_shr(6) as usize).cast::<u64>().cast_mut();
     // SAFETY: `bit` is masked below `VALUE_BITS`, so `word` is one of `VALUES`' words, which
     // are `AtomicU64`s, loaded and stored atomically.
-    let old = unsafe { intrinsics::atomic_load::<u64, { Relaxed }>(word) };
+    let old = unsafe { intrinsics::atomic_load::<u64, { Relaxed }, false>(word) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(word, old | 1u64.wrapping_shl(bit as u32)) };
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(word, old | 1u64.wrapping_shl(bit as u32)) };
 }
 
 /// libFuzzer's `HandleCmp`: the Hamming distance and the distance's leading zeros of the
@@ -130,17 +130,17 @@ fn distance(pc: u64, a: u64, b: u64) {
 fn recent(a: u64, b: u64, width: u64) {
     // SAFETY: `RECENT_NEXT` is an `AtomicU64`, loaded and stored atomically; two threads that
     // take the same slot at once overwrite one comparison, as in libFuzzer's table.
-    let n = unsafe { intrinsics::atomic_load::<u64, { Relaxed }>(RECENT_NEXT.as_ptr()) };
+    let n = unsafe { intrinsics::atomic_load::<u64, { Relaxed }, false>(RECENT_NEXT.as_ptr()) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(RECENT_NEXT.as_ptr(), n.wrapping_add(1)) };
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(RECENT_NEXT.as_ptr(), n.wrapping_add(1)) };
     let slot = RECENT.as_ptr().wrapping_add((n & TORC_MASK).wrapping_mul(3) as usize).cast::<u64>().cast_mut();
     // SAFETY: the slot index is masked below `TORC`, so `slot` and the two words after it are
     // `RECENT`'s `AtomicU64`s, stored to atomically.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(slot, a) };
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(slot, a) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(slot.wrapping_add(1), b) };
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(slot.wrapping_add(1), b) };
     // SAFETY: as above.
-    unsafe { intrinsics::atomic_store::<u64, { Relaxed }>(slot.wrapping_add(2), width) };
+    unsafe { intrinsics::atomic_store::<u64, { Relaxed }, false>(slot.wrapping_add(2), width) };
 }
 
 #[inline(always)]

@@ -9,6 +9,7 @@
 //! `compiler/rustc_ast_lowering/src/expr.rs` (the span of `(e)`) and
 //! `compiler/rustc_hir_typeck` (`qpath_res`) (MIT or Apache-2.0).
 
+use base_db::Db;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, FunctionId, HasModule,
@@ -38,12 +39,12 @@ use crate::{lints::bodies::BodyCx, model::Span};
 /// The name `#[rustc_diagnostic_item = "name"]` gives `def`: rustc's `get_diagnostic_name`.
 /// hir-def's `AttrFlags` answers it: a bit test of the item's memoized attribute flags, then
 /// the memoized symbol; comparing it with another `Symbol` is a pointer compare.
-pub(crate) fn diagnostic_item(db: &dyn HirDatabase, def: AttrDefId) -> Option<Symbol> {
+pub(crate) fn diagnostic_item(db: &Db, def: AttrDefId) -> Option<Symbol> {
     AttrFlags::diagnostic_item(db, def)
 }
 
 /// [`diagnostic_item`] of a function.
-pub(crate) fn fn_item(db: &dyn HirDatabase, def: FunctionId) -> Option<Symbol> {
+pub(crate) fn fn_item(db: &Db, def: FunctionId) -> Option<Symbol> {
     diagnostic_item(db, AttrDefId::FunctionId(def))
 }
 

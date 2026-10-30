@@ -3,7 +3,7 @@
 //! leaves its store as it was, and an edit of one body leaves every other body and every
 //! signature as they were, not lowered again.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use test_fixture::WithFixture;
 use triomphe::Arc;
 
@@ -13,7 +13,7 @@ use crate::{
     hir::generics::GenericParams,
     nameres::{assoc::ImplItems, crate_def_map},
     signatures::FunctionSignature,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 const CODE: &str = r#"
@@ -45,7 +45,7 @@ pub static L: u32 = K + 1;
 
 /// What reads a signature's store: whether it ran again is whether the store changed.
 #[salsa::tracked]
-fn signature_store_bytes(db: &dyn SourceDatabase, def: GenericDefId) -> Vec<u8> {
+fn signature_store_bytes(db: &Db, def: GenericDefId) -> Vec<u8> {
     let (_, store) = GenericParams::with_store(db, def);
     blaze_format::to_bytes(store)
 }
@@ -158,7 +158,7 @@ fn an_edit_in_one_body_lowers_only_that_body() {
         signatures.iter().map(|&def| signature_store_bytes(&db, def)).collect();
 
     db.set_file_text(file.file_id(&db), &CODE.replace("n => n - 1,", "n => n - 2,"));
-    let log = db.log_executed(|| {
+    let log = db.executed_in_read_order(|| {
         for &def in &bodies {
             ExprScopes::body_expr_scopes(&db, def);
         }
@@ -204,7 +204,7 @@ fn a_body_lowered_again_on_a_reused_scratch_is_the_same() {
     relative_body(&db, first);
 
     db.set_file_text(file.file_id(&db), CODE);
-    let log = db.log_executed(|| {
+    let log = db.executed_in_read_order(|| {
         relative_body(&db, add);
     });
     assert_eq!(count(&log, "Body::relative_"), 1, "`add` was not lowered again: {log:#?}");

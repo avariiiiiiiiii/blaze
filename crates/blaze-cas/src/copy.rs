@@ -235,7 +235,7 @@ mod tests {
     use super::*;
 
     fn noise(len: usize, seed: u64) -> Vec<u8> {
-        let mut rng = blaze_core::sim::Rng::new(seed);
+        let mut rng = blaze_ids::rng::SplitMix64::new(seed);
         (0..len).map(|_| rng.next_u64() as u8).collect()
     }
 

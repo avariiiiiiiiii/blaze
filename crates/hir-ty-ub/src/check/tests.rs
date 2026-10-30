@@ -1,5 +1,11 @@
-use super::valid;
-use crate::ids::Span;
+use super::{
+    OffsetFromError::{self, *},
+    offset, valid,
+};
+use crate::{
+    ids::{BorTag, Prov, Span},
+    memory::{Kind, Memory},
+};
 
 // rustc_const_eval validity.rs, `fmt_range`: every arm.
 #[test]
@@ -40,3 +46,49 @@ fn value_error_display() {
     );
 }
 
+/// Two live 16-byte allocations, at `0x1000` and `0x2000`, and a pointer into each.
+fn two_allocations() -> (Memory, Option<Prov>, Option<Prov>) {
+    let mut mem = Memory::with_pointer_size(8);
+    let x = mem.alloc(0x1000, 16, 8, Kind::Rust, false).expect("x");
+    let y = mem.alloc(0x2000, 16, 8, Kind::Rust, false).expect("y");
+    let tag = BorTag::new(1);
+    (mem, Some(Prov::Concrete { alloc: x, tag }), Some(Prov::Concrete { alloc: y, tag }))
+}
+
+// rustc interpret/intrinsics.rs, `ptr_offset_from`: each way it fails, and the cases it allows.
+#[test]
+fn offset_from_follows_rustc() {
+    let (mem, x, y) = two_allocations();
+    let from = |a: (u64, Option<Prov>), b, unsigned| offset::check(&mem, a, b, unsigned);
+    assert_eq!(from((0x1010, x), (0x1000, x), false), Ok(()));
+    assert_eq!(from((0x1000, x), (0x1010, x), false), Ok(()));
+    assert_eq!(from((0x1010, x), (0x1000, x), true), Ok(()));
+    assert_eq!(from((0x1008, x), (0x1008, x), true), Ok(()));
+    assert_eq!(from((0x1000, x), (0x1010, x), true), Err(Negative { a: 0x1000, b: 0x1010 }));
+    assert_eq!(from((0x1020, x), (0x1000, x), false), Err(OutOfBounds { unsigned: false }));
+    assert_eq!(from((0x2000, y), (0x1000, x), false), Err(DifferentAllocations { unsigned: false }));
+    assert_eq!(from((0x2000, y), (0x1010, x), true), Err(DifferentAllocations { unsigned: true }));
+    assert_eq!(from((u64::MAX, None), (0, None), false), Err(TooFarAhead { unsigned: false }));
+    assert_eq!(from((0, None), (u64::MAX, None), false), Err(TooFarBefore));
+    // Zero bytes apart: no allocation needed.
+    assert_eq!(from((0x10, None), (0x10, None), false), Ok(()));
+}
+
+#[test]
+fn offset_from_words() {
+    let words = |e: OffsetFromError| e.to_string();
+    assert_eq!(
+        words(DifferentAllocations { unsigned: false }),
+        "`ptr_offset_from` called on two different pointers that are not both derived from the same allocation"
+    );
+    assert_eq!(
+        words(OutOfBounds { unsigned: true }),
+        "`ptr_offset_from_unsigned` called on two different pointers where the memory range between them is not in-bounds of an allocation"
+    );
+    assert_eq!(words(TooFarAhead { unsigned: false }), "`ptr_offset_from` called when first pointer is too far ahead of second");
+    assert_eq!(words(TooFarBefore), "`ptr_offset_from` called when first pointer is too far before second");
+    assert_eq!(
+        words(Negative { a: 4096, b: 4112 }),
+        "`ptr_offset_from_unsigned` called when first pointer has smaller address than second: 4096 < 4112"
+    );
+}

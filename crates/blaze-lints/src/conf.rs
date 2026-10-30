@@ -23,8 +23,9 @@ impl Version {
     }
 }
 
-/// A package's clippy configuration.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// A package's clippy configuration. A key of the lint queries ([`crate::query::LintSet`]), so
+/// compared and hashed by what it is.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Conf {
     /// The file it was read from.
     pub path: Option<PathBuf>,
@@ -33,6 +34,46 @@ pub struct Conf {
     pub table: toml::Table,
     /// `msrv`, else the package's `rust-version`.
     pub msrv: Option<Version>,
+}
+
+/// A `clippy.toml` holds no NaN that two equal configurations could differ by in practice; a
+/// NaN only makes two loads of one file two keys, never two files one.
+impl Eq for Conf {}
+
+impl std::hash::Hash for Conf {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.path.hash(state);
+        self.msrv.hash(state);
+        state.write_u64(table_hash(&self.table));
+    }
+}
+
+/// A hash of `table` that its order does not change, as its equality doesn't.
+fn table_hash(table: &toml::Table) -> u64 {
+    table.iter().fold(table.len() as u64, |sum, (key, value)| {
+        let mut entry = rustc_hash::FxHasher::default();
+        std::hash::Hash::hash(key, &mut entry);
+        std::hash::Hasher::write_u64(&mut entry, value_hash(value));
+        sum.wrapping_add(std::hash::Hasher::finish(&entry))
+    })
+}
+
+fn value_hash(value: &toml::Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut state = rustc_hash::FxHasher::default();
+    match value {
+        toml::Value::String(it) => (0u8, it).hash(&mut state),
+        toml::Value::Integer(it) => (1u8, it).hash(&mut state),
+        toml::Value::Float(it) => (2u8, it.to_bits()).hash(&mut state),
+        toml::Value::Boolean(it) => (3u8, it).hash(&mut state),
+        toml::Value::Datetime(it) => (4u8, it.to_string()).hash(&mut state),
+        toml::Value::Array(items) => {
+            5u8.hash(&mut state);
+            items.iter().for_each(|it| state.write_u64(value_hash(it)));
+        }
+        toml::Value::Table(it) => (6u8, table_hash(it)).hash(&mut state),
+    }
+    state.finish()
 }
 
 /// The names clippy looks for, in the order it takes them.
@@ -121,5 +162,16 @@ mod tests {
         let conf = Conf::load(None, Some("1.80")).unwrap();
         assert!(conf.meets(Version(1, 70, 0)));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn equal_confs_hash_alike_in_any_order() {
+        use std::hash::BuildHasher as _;
+        let of = |text: &str| Conf { table: text.parse().unwrap(), ..Conf::default() };
+        let (a, b) = (of("a = 1\nb = [true, 2.5]\n"), of("b = [true, 2.5]\na = 1\n"));
+        assert_eq!(a, b);
+        let hash = |it: &Conf| rustc_hash::FxBuildHasher.hash_one(it);
+        assert_eq!(hash(&a), hash(&b));
+        assert_ne!(hash(&a), hash(&of("a = 2\nb = [true, 2.5]\n")));
     }
 }

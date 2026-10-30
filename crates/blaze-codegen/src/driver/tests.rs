@@ -13,7 +13,7 @@ use super::*;
 use crate::{
     Arch, Backend, Init, RelocKind,
     plan::{Mode, OptLevel, Override, Profile},
-    settings::{DebugInfo, Panic, Relocation, Toolchain},
+    settings::{DebugInfo, Panic, Relocation, Sanitize, Toolchain},
     summary::{Attrs, Call, Hint},
 };
 
@@ -24,6 +24,8 @@ struct Function {
     statics: Vec<u32>,
     origin: Origin,
     symbol: Option<String>,
+    /// The places among its references it builds in.
+    built_in: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -41,6 +43,7 @@ impl Program {
             statics: Vec::new(),
             origin: Origin::Member("app".to_owned()),
             symbol: None,
+            built_in: Vec::new(),
         };
         self.functions.insert(id, function);
         self.functions.get_mut(&id).unwrap()
@@ -86,7 +89,7 @@ impl Frontend for Program {
             },
             symbol: function.symbol.clone(),
             refs,
-            built_in: Vec::new(),
+            built_in: function.built_in.clone(),
         })
     }
 
@@ -219,6 +222,7 @@ impl Prepare for Machine {
             side: None,
             unwind: None,
             lines: Vec::new(),
+            coverage: None,
         };
         Ok(Emitted { function, side: None, extra })
     }
@@ -298,6 +302,7 @@ fn policy(level: OptLevel, mode: Mode) -> Policy {
         },
         mode,
         fold: false,
+        sanitize: Sanitize::default(),
     }
 }
 
@@ -472,6 +477,30 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
     assert_eq!(up.replaced.len(), 1);
     assert_eq!(up.replaced[0].0, tiered);
     assert_ne!(up.replaced[0].1.key, tiered);
+}
+
+#[test]
+fn a_tiered_callee_may_be_built_in_but_a_patchable_one_may_not() {
+    let mut policy = policy(OptLevel::O0, Mode::Live);
+    policy.profile.packages.insert(
+        "*".to_owned(),
+        Override { opt_level: Some(OptLevel::O3), ..Override::default() },
+    );
+    let mut program = program();
+    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency("memchr".to_owned());
+    program.functions.get_mut(&2).unwrap().built_in = vec![0];
+    let built = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap();
+    assert_eq!(built.tiered.len(), 1);
+
+    program.functions.get_mut(&1).unwrap().built_in = vec![0];
+    let errors = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].item, item(1));
+    assert!(errors[0].what.contains("which is patchable"), "{}", errors[0].what);
 }
 
 #[test]

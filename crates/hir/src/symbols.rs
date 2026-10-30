@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 
-use base_db::{FxIndexSet, salsa::SalsaValue};
+use base_db::{Db, FxIndexSet, salsa::SalsaValue};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AstIdLoc, Complete, DefWithBodyId, ExternCrateId, HasModule, ImplId,
@@ -79,7 +79,7 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
-    pub fn syntax<DB: HirDatabase>(&self, sema: &Semantics<'_, DB>) -> SyntaxNode {
+    pub fn syntax(&self, sema: &Semantics<'_>) -> SyntaxNode {
         let root = sema.parse_or_expand(self.hir_file_id);
         self.ptr.to_node(&root)
     }
@@ -93,7 +93,7 @@ struct SymbolCollectorWork {
 }
 
 pub struct SymbolCollector<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     symbols: FxIndexSet<FileSymbol<'db>>,
     work: Vec<SymbolCollectorWork>,
     current_container_name: Option<Symbol>,
@@ -103,7 +103,7 @@ pub struct SymbolCollector<'db> {
 /// Given a [`ModuleId`] and a [`HirDatabase`], use the DefMap for the module's crate to collect
 /// all symbols that should be indexed for the given module.
 impl<'a> SymbolCollector<'a> {
-    pub fn new(db: &'a dyn HirDatabase, collect_pub_only: bool) -> Self {
+    pub fn new(db: &'a Db, collect_pub_only: bool) -> Self {
         SymbolCollector {
             db,
             symbols: Default::default(),
@@ -114,7 +114,7 @@ impl<'a> SymbolCollector<'a> {
     }
 
     pub fn new_module(
-        db: &'a dyn HirDatabase,
+        db: &'a Db,
         module: Module,
         collect_pub_only: bool,
     ) -> Box<[FileSymbol<'a>]> {

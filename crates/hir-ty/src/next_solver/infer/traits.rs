@@ -7,7 +7,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use hir_def::TraitId;
+use hir_def::{GenericDefId, TraitId};
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::elaborate::Elaboratable;
 use rustc_type_ir::{
@@ -31,12 +31,43 @@ use super::InferCtxt;
 pub struct ObligationCause {
     #[type_visitable(ignore)]
     span: Span,
+    #[type_visitable(ignore)]
+    #[type_foldable(identity)]
+    code: ObligationCauseCode,
+}
+
+/// rustc's `ObligationCauseCode`, the codes diagnostics read. Ids only, so a cause stays `Copy`
+/// (rustc boxes it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObligationCauseCode {
+    /// Not well classified or should be obvious from the span.
+    Misc,
+    /// Like rustc's `WhereClauseInExpr`: the `bound_index`th predicate of `item`, required by
+    /// a use of it in an expression; `arg_index` is the argument the bound is about, if any.
+    WhereClauseInExpr { item: GenericDefId, bound_index: u32, arg_index: Option<u32> },
+    /// The type of a function argument must be `Sized`.
+    SizedArgumentType,
+    /// The tail expression of a block.
+    BlockTailExpression,
+    /// The value of a `return`, or a body's tail.
+    ReturnValue,
+    /// The arms of an `if` must agree.
+    IfExpression,
+    /// A `match` arm must agree with the `prior_arms` before it.
+    MatchExpressionArm { prior_arms: u32 },
+    /// The type of a `let` must be `Sized`.
+    LetType,
 }
 
 impl ObligationCause {
     #[inline]
     pub fn new<S: Into<Span>>(span: S) -> ObligationCause {
-        ObligationCause { span: span.into() }
+        ObligationCause::with_code(span, ObligationCauseCode::Misc)
+    }
+
+    #[inline]
+    pub fn with_code<S: Into<Span>>(span: S, code: ObligationCauseCode) -> ObligationCause {
+        ObligationCause { span: span.into(), code }
     }
 
     #[inline]
@@ -47,6 +78,11 @@ impl ObligationCause {
     #[inline]
     pub(crate) fn span(&self) -> Span {
         self.span
+    }
+
+    #[inline]
+    pub fn code(&self) -> ObligationCauseCode {
+        self.code
     }
 }
 
@@ -82,8 +118,9 @@ pub struct Obligation<'db, T> {
     pub recursion_depth: u32,
 }
 
-// `PredicateObligation` is moved per nested goal. Make sure it doesn't unintentionally get bigger.
-const _: () = assert!(size_of::<PredicateObligation<'static>>() == 20);
+// `PredicateObligation` is moved per nested goal. Make sure it doesn't unintentionally get bigger:
+// 8 bytes of span, at most 24 of cause code (a `GenericDefId` and two `u32`s), 12 of the rest.
+const _: () = assert!(size_of::<PredicateObligation<'static>>() <= 44);
 
 /// A callback that can be provided to `inspect_typeck`. Invoked on evaluation
 /// of root obligations.

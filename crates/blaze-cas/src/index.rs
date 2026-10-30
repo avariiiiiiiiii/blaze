@@ -345,7 +345,7 @@ pub(crate) fn paths() -> Vec<(&'static str, Matcher)> {
 mod tests {
     use std::collections::HashSet;
 
-    use blaze_core::sim::Rng;
+    use blaze_ids::rng::SplitMix64 as Rng;
     use blaze_ids::ContentId;
 
     use super::*;

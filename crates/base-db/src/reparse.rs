@@ -76,6 +76,7 @@ impl fmt::Debug for Reparse {
 
 impl Slot {
     fn new(text: &Arc<str>, id: ContentId) -> Arc<Slot> {
+        // alloc: one slot per text set, in the setter; `text.clone()` is a refcount.
         Arc::new(Slot { text: text.clone(), id, kept: [const { OnceLock::new() }; KEPT] })
     }
 
@@ -98,6 +99,7 @@ impl Reparse {
             true => Some(&self.slot),
             false => self.from.as_ref().map(|(slot, _)| slot),
         };
+        // clone: a refcount of the base slot, in the setter.
         let from = base.map(|base| (base.clone(), TextEdit::between(&base.text, text, base.id)));
         Reparse { slot: Slot::new(text, id), from }
     }
@@ -116,13 +118,14 @@ impl Reparse {
             Some((previous, delete)) => {
                 #[cfg(test)]
                 REPARSED.with(|it| it.set(it.get() + 1));
+                // clone: a refcount; the new tree shares the file's text.
                 let parse = previous.reparse_onto(delete, text.clone(), edition);
                 if cfg!(debug_assertions) {
                     assert_whole(&parse, text, edition, outline);
                 }
                 parse
             }
-            None => whole(text.clone(), edition, outline),
+            None => whole(text.clone(), edition, outline), // clone: a refcount, as above.
         };
         self.keep(&parse, edition, outline);
         parse
@@ -186,14 +189,16 @@ pub(crate) fn whole(text: Arc<str>, edition: Edition, outline: bool) -> Parse<So
 
 /// Panics unless `made` is the parse a whole parse of `text` makes: the same tree and errors.
 pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Arc<str>, edition: Edition, outline: bool) {
+    // clone: the check of debug builds and tests, not of a release parse.
     let whole = whole(text.clone(), edition, outline);
     let tree = |parse: &Parse<SourceFile>| parse.syntax_node().flat_tree().cloned();
     assert!(tree(made) == tree(&whole), "a reparse whose tree is not the whole parse's");
     let errors = |parse: &Parse<SourceFile>| {
+        // alloc: as above, only to compare the two parses' errors.
         let mut errors: Vec<_> = parse
             .errors_with_bodies()
             .into_iter()
-            .map(|it| (it.range().start(), it.range().end(), it.to_string()))
+            .map(|it| (it.range().start(), it.range().end(), it.to_string())) // alloc: as above.
             .collect();
         errors.sort_unstable();
         errors

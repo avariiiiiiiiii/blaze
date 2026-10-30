@@ -22,6 +22,7 @@ pub trait Jar: Any {
     fn create_ingredients(
         zalsa: &mut Zalsa,
         first_index: IngredientIndex,
+    // alloc: setup, once per ingredient when its jar registers
     ) -> Vec<Box<dyn Ingredient>>;
 
     /// This returns the [`TypeId`] of the ID struct, that is, the struct that wraps `salsa::Id`
@@ -228,6 +229,7 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     unsafe fn serialize<'db>(
         &'db self,
         _zalsa: &'db Zalsa,
+        // alloc: the edge: persistence, once per serialized database
         _f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
         unreachable!("called `serialize` on ingredient where `should_serialize` returns `false`")
@@ -246,6 +248,7 @@ pub trait Ingredient: Any + fmt::Debug + Send + Sync {
     }
 }
 
+// dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
 impl dyn Ingredient {
     /// Equivalent to the `downcast` method on `Any`.
     ///

@@ -466,9 +466,39 @@ fn model_a_check_sees_a_directory_whole_and_vouches_only_after_it_is_confirmed()
             })
         };
         dirs.want(path("/tc"));
-        dirs.dir(0).since.store(dirs.bump(), crate::sync::atomic::Ordering::Release);
+        dirs.dir(0).entry.since.store(dirs.bump(), crate::sync::atomic::Ordering::Release);
         dirs.settle(true);
         reader.join().unwrap();
+    });
+}
+
+/// A check on another thread while the writer appends a second directory to the columns: it
+/// finds it whole, its path's bytes and all, or not at all, and finds the first throughout.
+#[cfg(blaze_check)]
+#[test]
+fn model_a_directory_appended_is_found_whole_or_not_at_all() {
+    use std::sync::Arc;
+
+    blaze_check::model(|| {
+        let dirs = Arc::new(Dirs::new());
+        dirs.want(path("/tc"));
+        let reader = {
+            let dirs = dirs.clone();
+            crate::sync::thread::spawn(move || {
+                let len = dirs.len();
+                assert!(dirs.find(b"/tc", super::tag(b"/tc")).is_some());
+                if let Some(dir) = dirs.find(b"/sdk", super::tag(b"/sdk")) {
+                    assert_eq!(dir.path(), Path::new("/sdk"));
+                    assert_eq!(dir.since(), UNCONFIRMED);
+                }
+                if len == 2 {
+                    assert_eq!(dirs.dir(1).path(), Path::new("/sdk"));
+                }
+            })
+        };
+        dirs.want(path("/sdk"));
+        reader.join().unwrap();
+        assert_eq!(dirs.len(), 2);
     });
 }
 
@@ -517,6 +547,80 @@ fn checks_wants_and_rounds_allocate_nothing() {
         }
     }
     assert!(!cover.unchanged_since(generation));
+}
+
+/// Wants past every column's high-water mark (its first commit step and the index's tables
+/// growing level by level) commit pages of the table's own regions and never call the global
+/// allocator; what was found before the growth is found after it, at the same address.
+#[cfg(not(blaze_check))] // the model's atomics keep state of their own
+#[test]
+fn wants_past_the_high_water_mark_allocate_nothing() {
+    use std::path::PathBuf;
+
+    use blaze_alloc_count::assert_at_most;
+
+    let dirs = Dirs::new();
+    dirs.want(path("/tc"));
+    let first: *const super::Entry = dirs.dir(0).entry;
+    // More entries than a 64 KB commit step holds (2048), and past index level 7.
+    let wanted: Vec<PathBuf> = (0..5000).map(|at| PathBuf::from(format!("/grown/{at:04}"))).collect();
+    assert_at_most(0, "wants past the high-water mark", || {
+        for dir in &wanted {
+            dirs.want(dir);
+        }
+    });
+    assert_eq!(dirs.len(), 5001);
+    assert!(dirs.level.load(crate::sync::atomic::Ordering::Relaxed) >= 7);
+    assert!(std::ptr::eq(first, dirs.dir(0).entry), "an entry never moves");
+    for (at, dir) in wanted.iter().enumerate() {
+        assert_eq!(dirs.dir(at as u32 + 1).path(), dir.as_path());
+        let key = dir.as_os_str().as_encoded_bytes();
+        let found = assert_at_most(0, "a find past growth", || dirs.find(key, super::tag(key)));
+        assert_eq!(found.map(|it| it.path()), Some(dir.as_path()));
+    }
+    assert!(blaze_mem::tag::snapshot().get(blaze_mem::Tag::Vfs).live > 0, "counted under vfs");
+}
+
+/// The columns against a reference built the plain way: the same directories in the same
+/// order, each found by its bytes and none of the paths only under them.
+#[cfg(not(blaze_check))]
+#[test]
+fn the_columns_answer_as_a_plain_table_does() {
+    use std::collections::HashMap;
+
+    let dirs = Dirs::new();
+    let mut reference: Vec<String> = Vec::new();
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    for _ in 0..3000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let depth = 1 + seed % 3;
+        let mut wanted = String::new();
+        for part in 0..depth {
+            wanted.push_str(&format!("/d{}", (seed >> (8 * part)) % 40));
+        }
+        let covered = reference.iter().any(|it| {
+            wanted == *it || (wanted.starts_with(it.as_str()) && wanted.as_bytes()[it.len()] == b'/')
+        });
+        dirs.want(path(&wanted));
+        if !covered {
+            reference.push(wanted);
+        }
+    }
+    assert_eq!(dirs.len() as usize, reference.len());
+    let numbered: HashMap<&str, u32> =
+        reference.iter().enumerate().map(|(at, it)| (it.as_str(), at as u32)).collect();
+    for (at, wanted) in reference.iter().enumerate() {
+        assert_eq!(dirs.dir(at as u32).path(), Path::new(wanted));
+        let key = wanted.as_bytes();
+        assert!(dirs.find(key, super::tag(key)).is_some(), "{wanted}");
+        let above = reference.iter().filter(|it| {
+            it.len() < wanted.len() && wanted.starts_with(it.as_str()) && wanted.as_bytes()[it.len()] == b'/'
+        });
+        let expected = above.map(|it| numbered[it.as_str()]).filter(|&by| by > at as u32).min();
+        assert_eq!(dirs.dir(at as u32).subsumed_by(), expected, "{wanted}");
+    }
 }
 
 #[test]

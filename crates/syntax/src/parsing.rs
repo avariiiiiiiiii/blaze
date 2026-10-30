@@ -7,7 +7,7 @@ mod reparsing;
 use std::sync::Arc;
 
 use parser::{Edition, OutlineStrStep, StrStep};
-use syntax_tree::{FlatTree, TextRange, TextSize};
+use syntax_tree::{FlatTree, Text, TextRange, TextSize};
 
 use crate::{SyntaxError, SyntaxKind, SyntaxTreeBuilder, Tree, syntax_node::RustLanguage};
 
@@ -17,7 +17,7 @@ pub(crate) use crate::parsing::reparsing::{
 
 /// A source file's tree: in full, or as an outline whose `fn` bodies are lazy nodes.
 pub(crate) fn parse_text(
-    text: Arc<str>,
+    text: Text,
     edition: Edition,
     outline: bool,
 ) -> (Tree, Vec<SyntaxError>) {
@@ -33,7 +33,7 @@ pub(crate) fn parse_text(
 }
 
 pub(crate) fn parse_text_at(
-    text: Arc<str>,
+    text: Text,
     entry: parser::TopEntryPoint,
     edition: Edition,
 ) -> (Tree, Vec<SyntaxError>) {
@@ -48,33 +48,37 @@ pub(crate) fn parse_text_at(
 /// The tree of `lexed`, the lexing of `source`, from the parser's output (full or outline),
 /// its parser errors then its lexer errors, and whether every token was taken.
 pub(crate) fn build_tree(
-    source: Arc<str>,
+    source: Text,
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
-    let (tree, mut errors, is_eof) = build_parsed(source, lexed, parser_output, edition);
+    let range = TextRange::up_to(TextSize::of(&*source));
+    let (tree, mut errors, is_eof) = build_parsed(source, range, lexed, parser_output, edition);
     errors.extend(lexer_errors(lexed, TextSize::new(0)));
     (tree, errors, is_eof)
 }
 
-/// [`build_tree`] with the parser's errors only.
+/// [`build_tree`] with the parser's errors only, of `lexed`, the lexing of `range` of
+/// `source`: the tree is over that range of `source`, and its errors' ranges are in `source`.
 fn build_parsed(
-    source: Arc<str>,
+    source: Text,
+    range: TextRange,
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
 ) -> (FlatTree, Vec<SyntaxError>, bool) {
     let _p = tracing::info_span!("build_tree").entered();
-    debug_assert_eq!(lexed.as_str(), &*source);
-    let mut builder = SyntaxTreeBuilder::sourced(source);
+    debug_assert_eq!(lexed.as_str(), &source[range]);
+    let start = range.start();
+    let mut builder = SyntaxTreeBuilder::sourced_range(source, range);
 
     let is_eof = lexed.intersperse_trivia_outline(parser_output, &mut |step| match step {
         OutlineStrStep::Step(StrStep::Token { kind, text }) => builder.token(kind, text),
         OutlineStrStep::Step(StrStep::Enter { kind }) => builder.start_node(kind),
         OutlineStrStep::Step(StrStep::Exit) => builder.finish_node(),
         OutlineStrStep::Step(StrStep::Error { msg, pos }) => {
-            builder.error(msg.to_owned(), pos.try_into().unwrap())
+            builder.error(msg.to_owned(), TextSize::try_from(pos).unwrap() + start)
         }
         OutlineStrStep::Lazy { kind, text } => builder.lazy(kind, TextSize::of(text)),
     });
@@ -86,7 +90,7 @@ fn build_parsed(
 /// [`build_tree`] for a node of `kind` parsed again alone: `None` unless the parse took every
 /// token into one node of `kind`, its root.
 pub(crate) fn build_node(
-    source: Arc<str>,
+    source: Text,
     lexed: &parser::LexedStr<'_>,
     parser_output: &parser::Output,
     edition: Edition,
@@ -135,17 +139,19 @@ pub(crate) fn lexer_errors<'a>(
 /// the text ([`body_errors`] reads them). Its lexer errors are the outline's, which lexed it.
 pub(crate) fn expand_lazy(
     kind: syntax_tree::SyntaxKind,
-    text: &str,
+    source: &Text,
+    range: TextRange,
     data: u32,
 ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
     let kind = <RustLanguage as syntax_tree::Language>::kind_from_raw(kind);
     let edition = Edition::from_u32(data);
     let reparser = parser::Reparser::for_node(kind, None, None)
         .unwrap_or_else(|| panic!("a lazy {kind:?}: only blocks are left unparsed"));
-    let lexed = parser::LexedStr::new(edition, text);
+    let lexed = parser::LexedStr::new(edition, &source[range]);
     let output = reparser.parse(&lexed.to_input(edition));
-    let (tree, errors, is_eof) = build_parsed(Arc::from(text), &lexed, &output, edition);
-    assert!(is_eof, "a lazy {kind:?} of {} bytes parsed short of its end", text.len());
+    // clone: one count of the file's text, which the part shares
+    let (tree, errors, is_eof) = build_parsed(source.clone(), range, &lexed, &output, edition);
+    assert!(is_eof, "a lazy {kind:?} of {} bytes parsed short of its end", u32::from(range.len()));
     let errors = errors
         .into_iter()
         .map(|it| {

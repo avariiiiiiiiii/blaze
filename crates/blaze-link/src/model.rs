@@ -18,6 +18,127 @@ use blaze_codegen::Arch;
 
 use crate::{Format, LinkError, Output};
 
+/// A [`Class::Named`] section's name: a format's own (`"__LD,__compact_unwind"`) borrowed,
+/// one read from an input made once and shared, so a class clones without allocating. It
+/// compares, hashes, orders and prints as its text, whichever it is.
+#[derive(Clone)]
+pub(crate) enum SectionName {
+    Static(&'static str),
+    Shared(Arc<str>),
+}
+
+impl SectionName {
+    /// A name read from an input.
+    pub fn new(name: &str) -> SectionName {
+        // alloc: once per named section read, shared by every clone after
+        SectionName::Shared(Arc::from(name))
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        match self {
+            SectionName::Static(it) => it,
+            SectionName::Shared(it) => it,
+        }
+    }
+}
+
+impl From<&'static str> for SectionName {
+    fn from(name: &'static str) -> SectionName {
+        SectionName::Static(name)
+    }
+}
+
+impl From<String> for SectionName {
+    fn from(name: String) -> SectionName {
+        // alloc: the edge: a name already made, moved into its one shared buffer
+        SectionName::Shared(Arc::from(name))
+    }
+}
+
+impl std::ops::Deref for SectionName {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq for SectionName {
+    fn eq(&self, other: &SectionName) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SectionName {}
+
+impl PartialEq<str> for SectionName {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SectionName {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SectionName {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<SectionName> for str {
+    fn eq(&self, other: &SectionName) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<SectionName> for &str {
+    fn eq(&self, other: &SectionName) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<SectionName> for String {
+    fn eq(&self, other: &SectionName) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl std::hash::Hash for SectionName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialOrd for SectionName {
+    fn partial_cmp(&self, other: &SectionName) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SectionName {
+    fn cmp(&self, other: &SectionName) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::fmt::Debug for SectionName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl std::fmt::Display for SectionName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a region holds. A region is one range of the address space with one protection;
 /// the format writer orders them ([`Writer::order`]) and names them in the file.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -53,7 +174,7 @@ pub(crate) enum Class {
     PatchData,
     /// A section a static or a native object names (`#[link_section]`), kept whole and in
     /// input order so the program can walk it between its start and stop symbols.
-    Named { name: String, write: bool, exec: bool },
+    Named { name: SectionName, write: bool, exec: bool },
     /// Mach-O thread-local variable descriptors (`__thread_vars`): three words each, the
     /// `_tlv_bootstrap` thunk (bound), a key (0) and the variable's offset in the template.
     /// The core makes one for each thread-local static when [`Plan::tls_descriptors`].
@@ -112,7 +233,7 @@ pub(crate) enum Special {
     Stop(Class),
     /// The start or the end of the [`Class::Named`] regions of this name, whatever their
     /// flags; an error naming the section when there is none (ELF `__start_X`, #1496).
-    Section { name: String, end: bool },
+    Section { name: SectionName, end: bool },
     /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
     /// `__bss_start`, `_DYNAMIC`).
     Placed(fn(&[Region]) -> u64),
@@ -122,8 +243,20 @@ pub(crate) enum Special {
     LiveDescriptor,
     /// The address of the GOT cell of the symbol named so, resolved as any reference to it
     /// is: an import's import address table entry, or a cell holding a local symbol's
-    /// address (PE's `__imp_X`; link.exe's LNK4217 case).
-    Got(String),
+    /// address (PE's `__imp_X`; link.exe's LNK4217 case). The symbol's name is the special's
+    /// own from byte `from` (6 for `__imp_X`), so the writer makes no string for it.
+    Got { from: u32 },
+}
+
+impl Special {
+    /// Of a [`Special::Got`] that `name` named, the name of the symbol it is the cell of.
+    #[inline]
+    pub fn got_target<'n>(&self, name: &'n str) -> Option<&'n str> {
+        match self {
+            Special::Got { from } => name.get(*from as usize..),
+            _ => None,
+        }
+    }
 }
 
 /// How a relocation is written. Every format's relocation types are read into these, and
@@ -245,13 +378,20 @@ pub(crate) struct Name {
 
 const _: () = assert!(std::mem::size_of::<Name>() == 8);
 
-/// Every name of one native file, one after another in one allocation.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+/// Every name of one native file, one after another in one allocation. Not `Clone`: the
+/// big model types are borrowed or moved, never copied.
+#[derive(Default, PartialEq, Eq, Debug)]
 pub(crate) struct Names(String);
 
 impl Names {
     pub fn with_capacity(bytes: usize) -> Names {
         Names(String::with_capacity(bytes))
+    }
+
+    /// Room for `bytes` more of names, for a reader that learns their size only after its
+    /// first pushes.
+    pub fn reserve(&mut self, bytes: usize) {
+        self.0.reserve(bytes);
     }
 
     /// Adds `name`; an error past 4 GiB of names in one file.
@@ -263,6 +403,7 @@ impl Names {
                 self.0.push_str(name);
                 Ok(Name { at, len })
             }
+            // alloc: error path
             _ => Err("more than 4 GiB of names in one file".to_owned()),
         }
     }
@@ -292,7 +433,7 @@ impl Names {
 }
 
 /// A relocatable object (`.o`, `.obj`, a member of an archive).
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
@@ -302,11 +443,21 @@ pub(crate) struct Object {
     pub groups: Vec<Group>,
     /// Every group's sections, each group's a run of them ([`Group::sections`]).
     pub grouped: Vec<u32>,
+    /// Sections kept exactly when another of the object's is, and never for themselves
+    /// (`SHF_LINK_ORDER`, an associative COMDAT): at most one each.
+    pub ties: Vec<Tie>,
+    /// Sections kept only when a section they refer to is kept (`S_ATTR_LIVE_SUPPORT`), and
+    /// never for themselves.
+    pub live_support: Vec<u32>,
     /// The names of the symbols, sections and groups.
     pub names: Names,
     /// wasm: what an undefined function is imported as when nothing defines it, by symbol
     /// index. Other formats leave it empty.
-    pub imports: Vec<(u32, blaze_codegen::wasm::Import)>,
+    pub imports: Vec<(u32, WasmImport)>,
+    /// Every byte the reader made rather than found in the input (a header it prepends, a
+    /// section it rewrote), in one buffer per object: [`Data::Made`] ranges of it. Empty for a
+    /// reader that makes none.
+    pub made: Vec<u8>,
     /// Libraries the object asks for (`/DEFAULTLIB` of a COFF object, `LC_LINKER_OPTION`).
     pub libraries: Vec<String>,
     /// What a COFF object's `.drectve` asks of the link beyond its libraries.
@@ -327,10 +478,19 @@ impl Object {
     pub fn group_sections(&self, group: &Group) -> &[u32] {
         &self.grouped[group.sections.start as usize..group.sections.end as usize]
     }
+
+    /// `data`'s bytes, `data` being one of this object's and `input` the slice it was read
+    /// from: [`Data::bytes`], with [`Data::Made`] read from [`Object::made`].
+    pub fn section_bytes<'b>(&'b self, data: &'b Data, input: &'b [u8]) -> Result<Option<&'b [u8]>, String> {
+        match data {
+            Data::Made(range) => slice(&self.made, range, "reader's made bytes"),
+            _ => data.bytes(input),
+        }
+    }
 }
 
 /// What a COFF object's `.drectve` asks of the link beyond [`Object::libraries`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) enum Directive {
     /// `/INCLUDE:sym`: the link defines `sym` (pulling archive members for it) and keeps it.
     Include(String),
@@ -344,7 +504,7 @@ pub(crate) enum Directive {
     NoDefaultLib(Option<String>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Section {
     pub name: Name,
     pub what: SectionKind,
@@ -369,7 +529,7 @@ pub(crate) enum SectionKind {
     Dropped,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) enum Data {
     /// `bytes[range]` of the slice handed to [`Writer::read`] (for an archive member, the
     /// member's own slice): the section as the file has it, never copied.
@@ -377,31 +537,63 @@ pub(crate) enum Data {
     /// Bytes the reader made: ones the file does not hold as they are (a header it
     /// prepends, a section it rewrote).
     Bytes(Vec<u8>),
+    /// `made[range]` of the object's [`Object::made`]: bytes the reader made, all of an
+    /// object's in one buffer.
+    Made(Range<u64>),
     Zero(u64),
 }
 
 impl Data {
     pub fn len(&self) -> u64 {
         match self {
-            Data::Input(range) => range.end.saturating_sub(range.start),
+            Data::Input(range) | Data::Made(range) => range.end.saturating_sub(range.start),
             Data::Bytes(bytes) => bytes.len() as u64,
             Data::Zero(size) => *size,
         }
     }
 
     /// Its bytes, `input` being the slice the file was read from: none for zeroed data, an
-    /// error for a range past the input's end.
+    /// error for a range past the input's end. [`Data::Made`] is read with its object
+    /// ([`Object::section_bytes`]); here it is an error.
     pub fn bytes<'b>(&'b self, input: &'b [u8]) -> Result<Option<&'b [u8]>, String> {
         match self {
-            Data::Input(range) => usize::try_from(range.start)
-                .ok()
-                .zip(usize::try_from(range.end).ok())
-                .and_then(|(start, end)| input.get(start..end))
-                .map(Some)
-                .ok_or_else(|| format!("bytes {range:?} past the input's {} bytes", input.len())),
+            Data::Input(range) => slice(input, range, "input"),
+            Data::Made(range) => {
+                // alloc: error path
+                Err(format!("bytes {range:?} the reader made, read without their object (`Object::section_bytes`)"))
+            }
             Data::Bytes(bytes) => Ok(Some(bytes)),
             Data::Zero(_) => Ok(None),
         }
+    }
+}
+
+/// `from[range]`, or an error naming `what` when it is past the end.
+fn slice<'b>(from: &'b [u8], range: &Range<u64>, what: &str) -> Result<Option<&'b [u8]>, String> {
+    usize::try_from(range.start)
+        .ok()
+        .zip(usize::try_from(range.end).ok())
+        .and_then(|(start, end)| from.get(start..end))
+        .map(Some)
+        // alloc: error path
+        .ok_or_else(|| format!("bytes {range:?} past the {what}'s {} bytes", from.len()))
+}
+
+/// wasm: what an undefined function is imported as, read in place: its module and field
+/// names in the object's [`Names`], its type the encoded function type (`0x60` …) as
+/// `bytes[ty]` of the input, as [`Data::Input`] ranges are. The reader checks the encoding;
+/// the core decodes it into a [`blaze_codegen::wasm::Import`] once per import per graph built.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct WasmImport {
+    pub module: Name,
+    pub field: Name,
+    pub ty: Range<u64>,
+}
+
+impl WasmImport {
+    /// Its encoded function type, `input` being the slice its object was read from.
+    pub fn type_bytes<'b>(&self, input: &'b [u8]) -> Result<&'b [u8], String> {
+        slice(input, &self.ty, "input").map(Option::unwrap_or_default)
     }
 }
 
@@ -472,9 +664,20 @@ pub(crate) struct Group {
     pub largest: bool,
 }
 
+/// Section `section` tied to section `to` of the same object ([`Object::ties`]): ELF
+/// `SHF_LINK_ORDER` to its `sh_link`, a COFF associative COMDAT to its root.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Tie {
+    pub section: u32,
+    pub to: u32,
+    /// Placed among the sections of its class in the order of the sections they are tied to,
+    /// not their own (`SHF_LINK_ORDER`).
+    pub ordered: bool,
+}
+
 /// An archive: its members are read only when one defines a symbol the link needs, as a
 /// linker takes them, unless the archive is taken whole.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Archive {
     pub members: Vec<Member>,
     /// Each symbol the archive's index names and the member defining it, in the index's
@@ -490,14 +693,14 @@ impl Archive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Member {
     pub name: Name,
     pub bytes: Range<usize>,
 }
 
 /// A shared library: what the image may import from it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Shared {
     /// What the loader finds it by: the ELF `DT_SONAME`, the Mach-O install name, the DLL.
     pub name: String,
@@ -667,6 +870,7 @@ pub(crate) struct Placed<'a> {
     pub debug: &'a [(&'static str, Vec<u8>)],
     /// The address of a global name the image defines, an object's or a special (PE's data
     /// directories point at the CRT's `_tls_used` and `_load_config_used`).
+    // dyn: a handful of calls per image (PE's data directories), never per element
     pub symbol: &'a dyn Fn(&str) -> Option<u64>,
 }
 
@@ -682,7 +886,7 @@ impl Placed<'_> {
 }
 
 /// A shared library the image needs.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub(crate) struct Library {
     pub name: String,
     /// Loaded only for a symbol it gives (`--as-needed`): one none of whose symbols are
@@ -756,6 +960,7 @@ pub(crate) trait Writer: Send + Sync {
     /// The class and rank of a piece the core places with no section name of its own
     /// (codegen's code and statics), given the class the core would use.
     fn own(&self, class: &Class) -> (Class, u32) {
+        // clone: once per class per stage (the stage caches what it gives)
         (class.clone(), u32::MAX)
     }
 
@@ -788,18 +993,112 @@ pub(crate) trait Writer: Send + Sync {
     /// writes only the slots whose value changed. None by default.
     fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
         let _ = placed;
+        // alloc: none: an empty `Vec` holds no buffer
         Ok(Vec::new())
     }
 }
 
-/// The writer of an output's format.
-pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
-    match output.format {
-        Format::Elf => crate::elf::writer(output),
-        Format::MachO => crate::macho::writer(output),
-        Format::Pe => crate::pe::writer(output),
-        Format::Wasm => crate::wasm::writer(output),
+/// The writer of each format, dispatched by its tag: a `match` per call, inlined into each
+/// format's method, never a virtual call.
+pub(crate) enum Formats {
+    Elf(crate::elf::Elf),
+    MachO(crate::macho::MachO),
+    Pe(crate::pe::Pe),
+    Wasm(crate::wasm::Wasm),
+}
+
+macro_rules! each {
+    ($self:ident, $it:ident => $call:expr) => {
+        match $self {
+            Formats::Elf($it) => $call,
+            Formats::MachO($it) => $call,
+            Formats::Pe($it) => $call,
+            Formats::Wasm($it) => $call,
+        }
+    };
+}
+
+impl Writer for Formats {
+    #[inline]
+    fn format(&self) -> Format {
+        each!(self, it => it.format())
     }
+
+    #[inline]
+    fn arch(&self) -> Arch {
+        each!(self, it => it.arch())
+    }
+
+    fn plan(&self) -> Plan {
+        each!(self, it => it.plan())
+    }
+
+    fn order(&self, classes: &mut Vec<Class>) {
+        each!(self, it => it.order(classes))
+    }
+
+    #[inline]
+    fn prot(&self, class: &Class) -> Prot {
+        each!(self, it => it.prot(class))
+    }
+
+    #[inline]
+    fn section(&self, name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
+        each!(self, it => it.section(name, write, exec, tls))
+    }
+
+    #[inline]
+    fn special(&self, name: &str) -> Option<Special> {
+        each!(self, it => it.special(name))
+    }
+
+    fn shared_entry(&self) -> Option<&'static str> {
+        each!(self, it => it.shared_entry())
+    }
+
+    #[inline]
+    fn own(&self, class: &Class) -> (Class, u32) {
+        each!(self, it => it.own(class))
+    }
+
+    fn read(&self, name: &str, bytes: &[u8], kind: &crate::NativeKind) -> Result<NativeFile, String> {
+        each!(self, it => it.read(name, bytes, kind))
+    }
+
+    fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
+        each!(self, it => it.synthetic(counts))
+    }
+
+    #[inline]
+    fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64) -> Result<(), String> {
+        each!(self, it => it.apply(r_type, bytes, p, s, addend))
+    }
+
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+        each!(self, it => it.synthesize(placed))
+    }
+
+    fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64> {
+        each!(self, it => it.offset(placed, region))
+    }
+
+    fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
+        each!(self, it => it.file(placed))
+    }
+
+    fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        each!(self, it => it.encode(placed))
+    }
+}
+
+/// The writer of an output's format.
+pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
+    Ok(match output.format {
+        Format::Elf => Formats::Elf(crate::elf::writer(output)?),
+        Format::MachO => Formats::MachO(crate::macho::writer(output)?),
+        Format::Pe => Formats::Pe(crate::pe::writer(output)?),
+        Format::Wasm => Formats::Wasm(crate::wasm::writer(output)?),
+    })
 }
 
 #[cfg(test)]
@@ -817,5 +1116,20 @@ mod tests {
         assert_eq!(names.suffix(name, 9), None);
         assert_eq!(names.suffix(name, 6), None);
         assert_eq!(names.bytes(), 1 + "_main€".len());
+    }
+
+    /// A name looked up, whole or as a suffix, allocates nothing, and neither does a push into
+    /// room reserved for it.
+    #[test]
+    fn a_names_lookup_allocates_nothing() {
+        let mut names = Names::with_capacity(16 * 1000);
+        let list: Vec<Name> = (0..1000).map(|n| names.push(&format!("symbol{n}")).unwrap()).collect();
+        blaze_alloc_count::assert_at_most(0, "a name's bytes and a suffix of it", || {
+            assert_eq!(names.at(list[500]), "symbol500");
+            assert_eq!(names.get(list[999]), Some("symbol999"));
+            assert_eq!(names.at(names.suffix(list[7], 6).unwrap()), "7");
+        });
+        let pushed = blaze_alloc_count::assert_at_most(0, "a push into reserved room", || names.push("one more"));
+        assert_eq!(names.at(pushed.unwrap()), "one more");
     }
 }

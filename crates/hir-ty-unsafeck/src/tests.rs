@@ -4,7 +4,7 @@
 
 mod db;
 
-use base_db::{EditionedFileId, SourceDatabase, all_crates};
+use base_db::{EditionedFileId, all_crates};
 use hir_def::{
     AssocItemId, DefWithBodyId, ModuleDefId, expr_store::Body, nameres::crate_def_map,
     signatures::FunctionSignature,

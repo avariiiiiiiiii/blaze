@@ -750,6 +750,29 @@ impl<'a> Sealing<'a> {
     }
 }
 
+/// `file` mapped whole and read-only (`blaze_core::fs::Mapped`); `whole` tells the system it is
+/// read front to back.
+///
+/// # Safety
+///
+/// While the mapping lives, nothing writes, appends to or truncates the file in place.
+#[cfg(not(target_family = "wasm"))]
+unsafe fn map(file: &File, whole: bool) -> io::Result<blaze_core::fs::Mapped> {
+    let advice = if whole { blaze_core::fs::Advice::Sequential } else { blaze_core::fs::Advice::Normal };
+    // SAFETY: the caller's contract.
+    unsafe { blaze_core::fs::MapOptions::new().advise(advice).map(file) }
+}
+
+/// A wasm build maps nothing: reading a pack in place says so.
+///
+/// # Safety
+///
+/// None: nothing is mapped.
+#[cfg(target_family = "wasm")]
+unsafe fn map(_: &File, _: bool) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "a wasm build of the store maps no pack"))
+}
+
 /// Seals the whole records at the start of the open pack `file`, which is at `path` and
 /// held: writes them as a sealed pack, then removes the open one. One with no whole record
 /// is only removed. The pack is mapped and not read: one that the files of a program were
@@ -759,7 +782,7 @@ fn seal_records(dir: &Path, path: &Path, file: &File) -> io::Result<()> {
         // SAFETY: an open pack is written only by whoever holds its lock, which is the
         // caller, and the caller writes nothing more to it. The map is gone before the
         // pack is removed, which Windows refuses a mapped file.
-        let bytes = unsafe { memmap2::Mmap::map(file) }?;
+        let bytes = unsafe { map(file, true) }?;
         let (records, _) = records(&bytes);
         if !records.is_empty() {
             let mut sealing = Sealing::new();
@@ -1057,7 +1080,7 @@ impl StoreDir {
             let Ok(file) = File::open(self.dir.join(name)) else { continue };
             // SAFETY: a sealed pack is never written again; one that is removed stays
             // mapped.
-            let Ok(pack) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+            let Ok(pack) = (unsafe { map(&file, false) }) else { continue };
             if let Some(index) = Index::read(&pack) {
                 keys.extend(index.entries.iter().map(|it| it.key));
             }
@@ -1438,33 +1461,17 @@ impl Sealed {
 /// so their first byte spreads them evenly: the slots are put by it into as many buckets,
 /// which are sorted on several threads.
 fn sorted(pieces: Vec<Vec<Slot>>) -> Vec<Slot> {
-    let bucket = |slot: &Slot| (slot.start >> 56) as usize;
-    let mut ends = [0usize; 256];
-    for slot in pieces.iter().flatten() {
-        ends[bucket(slot)] += 1;
-    }
-    let mut total = 0;
-    let mut next = [0usize; 256];
-    for (end, next) in ends.iter_mut().zip(&mut next) {
-        *next = total;
-        total += *end;
-        *end = total;
-    }
-    let mut run = vec![Slot::default(); total];
-    for piece in pieces {
-        for slot in piece {
-            let at = &mut next[bucket(&slot)];
-            run[*at] = slot;
-            *at += 1;
-        }
-    }
+    let bucket = |slot: &Slot| (slot.start >> 56) as u32;
+    let (starts, mut run) =
+        radix::Csr::build(256, pieces.iter().flatten().map(|slot| (bucket(slot), *slot))).into_parts();
+    drop(pieces);
+    let total = run.len();
     let mut buckets = Vec::with_capacity(256);
     let mut rest = &mut run[..];
-    let mut taken = 0;
-    for end in ends {
-        let (bucket, after) = std::mem::take(&mut rest).split_at_mut(end - taken);
+    for at in 0..256 {
+        let (bucket, after) = std::mem::take(&mut rest).split_at_mut((starts[at + 1] - starts[at]) as usize);
         buckets.push(bucket);
-        (rest, taken) = (after, end);
+        rest = after;
     }
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     let threads = threads.min(total / (64 << 10) + 1);
@@ -2533,6 +2540,8 @@ mod private {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     /// Seals at every flush, and keeps everything.
@@ -2909,15 +2918,9 @@ mod tests {
 
     /// Bytes that do not compress, the same for the same seed.
     fn noise(seed: u8, len: usize) -> Vec<u8> {
-        let mut state = 0x9e37_79b9_7f4a_7c15 ^ u64::from(seed);
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state as u8
-            })
-            .collect()
+        let mut bytes = vec![0; len];
+        SplitMix64::new(0x9e37_79b9_7f4a_7c15 ^ u64::from(seed)).fill(&mut bytes);
+        bytes
     }
 
     fn pack_of(dir: &Path, key: u8, len: usize, age: u64) -> PathBuf {

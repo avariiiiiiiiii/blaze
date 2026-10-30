@@ -5,6 +5,7 @@
 //! `compiler/rustc_middle/src/ty/print/pretty.rs`, `compiler/rustc_middle/src/ty/error.rs`
 //! and `compiler/rustc_trait_selection/src/error_reporting/infer/mod.rs` (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use hir_def::{
     AdtId, GenericDefId, TypeAliasId,
     hir::{ClosureKind as HirClosureKind, CoroutineKind, CoroutineSource, Movability},

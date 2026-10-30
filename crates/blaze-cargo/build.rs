@@ -1,4 +1,5 @@
-//! On macOS, the sandbox's library (`BLAZE_SANDBOX_LIBRARY`). The SHA-256 is written here rather
+//! On macOS, the sandbox's library (`BLAZE_SANDBOX_LIBRARY`); on Linux, its interposer
+//! (`BLAZE_SANDBOX_INTERPOSE`). The SHA-256 is written here rather
 //! than taken from `sha2`, as in crates/blaze-engine/build.rs: a build dependency is built for
 //! the machine that builds. Which blaze this is (its version and commit) is crates/blaze-engine's
 //! build.rs's, the one crate that changes with every commit anyway, and reaches this crate
@@ -9,6 +10,38 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     sandbox_library();
+    linux_interpose();
+}
+
+/// On Linux, the library every process of a traced sandbox loads through `LD_PRELOAD`
+/// (`src/sandbox/linux_interpose.c`): it interposes `getenv`, `secure_getenv`, the realtime
+/// clocks and the `exec`/`posix_spawn` family, and says it loaded, so the supervisor sees
+/// variable and clock reads a seccomp filter cannot, and which programs ran without it. Built
+/// with the C compiler of the system (`CC` when set), carried in the executable by
+/// `src/sandbox/linux.rs`.
+fn linux_interpose() {
+    let source = "src/sandbox/linux_interpose.c";
+    println!("cargo:rerun-if-changed={source}");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        return;
+    }
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("libblaze_sandbox_interpose.so");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let status = std::process::Command::new(&cc)
+        .args(["-shared", "-fPIC", "-O2", "-Wall"])
+        .arg("-o")
+        .arg(&out)
+        .arg(source)
+        // After the source: under `--as-needed` a library named before the object it serves is
+        // dropped.
+        .arg("-ldl")
+        .status()
+        .unwrap_or_else(|error| panic!("{cc} did not run to build {source}: {error}"));
+    assert!(status.success(), "{cc} could not build {source}");
+    let mut hash = Sha256::new();
+    hash.update(&std::fs::read(&out).unwrap());
+    let hex: String = hash.finish().iter().take(12).map(|byte| format!("{byte:02x}")).collect();
+    println!("cargo:rustc-env=BLAZE_SANDBOX_INTERPOSE={hex}");
 }
 
 /// On macOS, the library every process of a sandbox loads (`src/sandbox/macos_interpose.c`),

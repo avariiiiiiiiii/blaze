@@ -956,7 +956,7 @@ fn validate_same_iteration(
         return on_stack;
     }
 
-    let cycle_heads_iter = TryClaimCycleHeadsIter::new(zalsa, cycle_heads);
+    let cycle_heads_iter = TryClaimCycleHeadsIter::new(zalsa, zalsa_local.task(), cycle_heads);
 
     for cycle_head in cycle_heads_iter {
         match cycle_head {

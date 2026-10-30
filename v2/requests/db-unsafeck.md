@@ -1,5 +1,7 @@
 # Requests of db-unsafeck
 
+Status (19:55): 1 is in the root `Cargo.toml`. db-ty-next1 applied 2. 3 to 6 are open.
+
 ## 1. Coordinator: the root dependency `hir-ty-unsafeck` (db's request 9)
 
 What: in the root `Cargo.toml` `[workspace.dependencies]`, beside `hir-ty-borrowck`:

@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, cast
 
+import blake3
+
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE.parent
 ROOT = HARNESS.parent
@@ -209,27 +211,59 @@ def cargo(step: str, args: list[str], ws: Path, env: dict[str, str], timeout: fl
     return run(step, ["cargo", *args], ws, env, timeout)
 
 
-def digest(path: Path) -> str:
-    """The sha256 of the file at `path`, hashed mapped: one call over its bytes, no copy, and
-    hashlib holds no GIL while it hashes, so `digests` uses every core. The file is a finished
-    build's output, which nothing writes while it is hashed."""
-    with open(path, "rb") as f:
-        if os.fstat(f.fileno()).st_size == 0:
-            return hashlib.sha256().hexdigest()
+# A file this long or longer is hashed on every core (BLAKE3's tree, split by the `blake3`
+# package's threads); below it one core takes under 2 ms.
+ACROSS_CORES = 8 << 20
+# Below this a file is read whole (one `read`) rather than mapped (`mmap`, a fault a page and
+# `munmap`), which costs more than copying a small file.
+MAPPED_FROM = 1 << 20
+# How many bytes of small files, at most, one task of `digests` hashes: one task a file costs
+# more in the pool than hashing a small file does.
+BATCH_BYTES = 4 << 20
+BATCH_FILES = 256
+
+
+def digest(path: Path, size: int | None = None) -> str:
+    """The BLAKE3 hash (hex) of the file at `path`, in one call over its bytes: read whole when
+    small, mapped otherwise (no copy) and from `ACROSS_CORES` on hashed by every core. The
+    package releases the GIL while it hashes, so `digests` uses every core for many files too.
+    The file is a finished build's output, which nothing writes while it is hashed."""
+    with open(path, "rb", buffering=0) as f:
+        if size is None:
+            size = os.fstat(f.fileno()).st_size
+        if size < MAPPED_FROM:
+            return blake3.blake3(f.read()).hexdigest()
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
-            return hashlib.sha256(mapped).hexdigest()
+            threads = blake3.blake3.AUTO if size >= ACROSS_CORES else 1
+            return blake3.blake3(mapped, max_threads=threads).hexdigest()
 
 
 def digests(files: Sequence[tuple[Path, int]]) -> list[str]:
-    """`digest` of each (path, size) in `files`, in their order, on every core at once; the
-    largest are started first, so one big file does not run alone at the end."""
+    """`digest` of each (path, size) in `files`, in their order, on every core at once. The
+    largest go first, each a task of its own, so one big file does not run alone at the end;
+    small ones go in tasks of up to `BATCH_FILES` files and `BATCH_BYTES` bytes, so the pool
+    costs one task per batch, not one per file."""
     if len(files) < 2:
-        return [digest(path) for path, _ in files]
+        return [digest(path, size) for path, size in files]
     order = sorted(range(len(files)), key=lambda i: -files[i][1])
+    batches: list[list[int]] = []
+    held = 0
+    for i in order:
+        size = files[i][1]
+        if not batches or held + size > BATCH_BYTES or len(batches[-1]) >= BATCH_FILES:
+            batches.append([])
+            held = 0
+        batches[-1].append(i)
+        held += size
     out = [""] * len(files)
-    with concurrent.futures.ThreadPoolExecutor(min(len(files), os.cpu_count() or 1)) as pool:
-        for i, got in zip(order, pool.map(lambda i: digest(files[i][0]), order)):
-            out[i] = got
+
+    def batch(chosen: list[int]) -> None:
+        for i in chosen:
+            out[i] = digest(*files[i])
+
+    with concurrent.futures.ThreadPoolExecutor(min(len(batches), os.cpu_count() or 1)) as pool:
+        for _ in pool.map(batch, batches):
+            pass
     return out
 
 
@@ -238,7 +272,7 @@ OUTPUT_SUFFIXES = (".rlib", ".rmeta", ".so", ".dylib", ".dll", ".a", ".lib", ".e
 
 def outputs(target: Path, profile: str = "debug") -> dict[str, str]:
     """The files a build of `target/<profile>` delivers, each by its path under it and its
-    sha256: every executable and library at its top, in `examples/` and in `deps/` (test
+    BLAKE3 digest: every executable and library at its top, in `examples/` and in `deps/` (test
     programs). What cargo keeps for itself (`.fingerprint`, `build`, `incremental`, dep-info,
     `.cargo-lock`) and blaze's own `target/blaze` are not outputs. A directory is listed once
     (its entries' types come with it); only the files chosen are `stat`ed."""
@@ -308,9 +342,9 @@ def first_difference(a: Path, b: Path) -> str:
 
 
 def tree_digest(root: Path, skip: Sequence[str] = ()) -> str:
-    """The sha256 of a source tree: every file's path under `root`, whether it is executable
-    and its sha256, and every symbolic link's target, in path order; the directories named in
-    `skip` at the top are left out (build outputs)."""
+    """The BLAKE3 hash of a source tree: every file's path under `root`, whether it is
+    executable and its digest, and every symbolic link's target, in path order; the directories
+    named in `skip` at the top are left out (build outputs)."""
     files: list[tuple[str, Path, int, bool]] = []
     links: list[tuple[str, str]] = []
     for here, dirs, names in os.walk(root):
@@ -327,7 +361,7 @@ def tree_digest(root: Path, skip: Sequence[str] = ()) -> str:
                 files.append((rel, path, info.st_size, bool(info.st_mode & 0o111)))
     files.sort()
     links.sort()
-    h = hashlib.sha256(b"blaze v2 proof tree 1\0")
+    h = blake3.blake3(b"blaze v2 proof tree 2\0")
     for (rel, _, _, executable), sha in zip(files, digests([(path, size) for _, path, size, _ in files])):
         h.update(f"f\0{rel}\0{int(executable)}\0{sha}\n".encode())
     for rel, to in links:

@@ -174,11 +174,30 @@ each input into the key as it reads it (`index::search`, requested as `pub(crate
 `usercode-fast-tests 1`). And a pass is keyed by the code hashes a test can reach, not the ones
 it executed; `fastcompile-ident-select 7` moves selection onto the execution record.
 
+## Memory ([memory.md](../../design/memory.md))
+
+Each structure by how long it lives, and its allocator. **Now** is what the code does today;
+**Then** is where it goes on `blaze-mem` (tag `usercode`).
+
+| what | lives | now | then |
+|---|---|---|---|
+| the queue's columns (unit to binary and job, order, ranks, tries) | a test run (request) | `Vec`s sized once in `Queue::new`, never grown | the run's request arena |
+| attempts, tags, the wheel's timers | come and go per test | slabs with free lists, generational ids (attempt id = generation << 32, slot), grown to what runs at once | `blaze_mem::Slab`, whose `Handle::to_bits` is the same id |
+| a server's interned names, its lines of every scope | a server (request) | `Names` (one text buffer, one index) and an `Arc<Run>` shared by its results | `RegionVec`s, which never move |
+| a result's output, name, execution record, own lines | a test run (request), read by cargo | heap `Vec`s and `String`s owned by `Finished` | the run's request arena, `Finished<'r>` borrowing it |
+| a test's identity and reached set: sort keys | a call | the worker's scratch (`blaze_mem::scratch::with_u64s`), hashed from a 16 KiB stack block | (done) |
+| the radix sort's counts and scratch | a call | three heap buffers per sort, inside `blaze-radix` | a caller's scratch |
+| the fork server (in the test binary) | the test binary's process | std only: it runs in the user's binary, which links no blaze crate | (stays) |
+
+The warm loop's allocations today are the result's (8 per test, `the_steady_state_reuses_its_slabs`) and the radix sort's (3 per identity of a large set,
+`an_identity_allocates_only_what_the_radix_sort_does`). Both go to zero with the request
+arena and the radix scratch (`usercode-fast-tests` 11 and 13).
+
 ## What is not done
 
 - A benchmark: a suite of many short tests in one binary (fork server against nextest's exec
   per test), a suite with a few long tests (the order against test order), and a rerun with
   one function changed (selection against all). Each in an ix VM, cold and warm.
-- Region reuse across children; a duration prior for new tests; warm servers across requests.
+- A duration prior for new tests; warm servers across requests.
 - `index::search` in selection (`usercode-fast-tests 1`), and a borrowed `trace::assemble` for
   the lines a fork server's test read (`usercode-fast-tests 2`).

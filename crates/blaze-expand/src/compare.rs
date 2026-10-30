@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use base_db::{Env, SourceDatabase};
+use base_db::{Db, Env};
 use hir_expand::proc_macro::{ProcMacro, ProcMacroKind};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::ProcMacroClient;
@@ -81,21 +81,27 @@ impl Compare {
     /// it, which tells two versions of a crate apart, or else the one of its crate.
     fn macro_of(&self, dylib: &AbsPath, name: &str) -> Result<ProcMacro, String> {
         let mut loaded = self.loaded.lock().unwrap_or_else(|it| it.into_inner());
-        let macros = loaded.entry(dylib.to_path_buf()).or_insert_with(|| -> Result<_, String> {
-            let krate = crate_of(dylib).ok_or_else(|| format!("{dylib} names no crate"))?;
-            let file = format!("lib{krate}{}", std::env::consts::DLL_SUFFIX);
-            let same = dylib.file_name().map(|it| self.libs.join(it)).filter(|it| it.exists());
-            let path = same.unwrap_or_else(|| self.libs.join(file));
-            let path = std::path::absolute(path).map_err(|e| e.to_string())?;
-            if !path.exists() {
-                return Err(format!("blaze linked no {}", path.display()));
-            }
-            let path = AbsPathBuf::assert_utf8(path);
-            load_cargo::load_proc_macro(&self.server, &path, &[]).map_err(|e| e.to_string())
-        });
-        let macros = macros.as_ref().map_err(Clone::clone)?;
+        if !loaded.contains_key(dylib) {
+            let macros = self.load(dylib);
+            loaded.insert(dylib.to_path_buf(), macros); // alloc: setup: once per library
+        }
+        let macros = loaded[dylib].as_ref().map_err(Clone::clone)?;
         let found = macros.iter().find(|it| it.name.as_str() == name);
-        found.cloned().ok_or_else(|| format!("blaze's library of {dylib} lists no `{name}`"))
+        found.cloned().ok_or_else(|| format!("blaze's library of {dylib} lists no `{name}`")) // alloc: error path
+    }
+
+    /// The macros of blaze's library of rustc's at `dylib`, loaded: once per library.
+    fn load(&self, dylib: &AbsPath) -> Result<Vec<ProcMacro>, String> {
+        let krate = crate_of(dylib).ok_or_else(|| format!("{dylib} names no crate"))?; // alloc: error path
+        let file = format!("lib{krate}{}", std::env::consts::DLL_SUFFIX); // alloc: setup: once per library
+        let same = dylib.file_name().map(|it| self.libs.join(it)).filter(|it| it.exists());
+        let path = same.unwrap_or_else(|| self.libs.join(file));
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?; // alloc: error path
+        if !path.exists() {
+            return Err(format!("blaze linked no {}", path.display())); // alloc: error path
+        }
+        let path = AbsPathBuf::assert_utf8(path);
+        load_cargo::load_proc_macro(&self.server, &path, &[]).map_err(|e| e.to_string()) // alloc: error path
     }
 }
 
@@ -106,7 +112,7 @@ pub(crate) fn again(
     dylib: &AbsPath,
     name: &str,
     kind: ProcMacroKind,
-    db: &dyn SourceDatabase,
+    db: &Db,
     subtree: &tt::TopSubtree,
     attrs: Option<&tt::TopSubtree>,
     env: &Env,
@@ -117,12 +123,11 @@ pub(crate) fn again(
     toolchain: &Result<tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError>,
 ) {
     let Some(compare) = compare() else { return };
-    let label = format!("{}::{name}", crate_of(dylib).unwrap_or("?"));
     let mac = match compare.macro_of(dylib, name) {
         Ok(it) => it,
         Err(why) => {
             COUNTS.unloaded.fetch_add(1, Ordering::Relaxed);
-            noted(&label, NOT_COMPARED, &format!("not compared: {why}"));
+            noted(dylib, name, NOT_COMPARED, &format!("not compared: {why}")); // alloc: error path
             return;
         }
     };
@@ -135,7 +140,7 @@ pub(crate) fn again(
         def_site,
         call_site,
         mixed_site,
-        current_dir.to_owned(),
+        current_dir.to_owned(), // alloc: the edge: the expander's interface takes its directory owned
     );
     COMPARING.with(|it| it.set(false));
     COUNTS.compared[crate::kind_byte(kind) as usize].fetch_add(1, Ordering::Relaxed);
@@ -143,19 +148,21 @@ pub(crate) fn again(
         (Ok(theirs), Ok(ours)) => theirs == ours,
         (Err(theirs), Err(ours)) => {
             COUNTS.failed.fetch_add(1, Ordering::Relaxed);
-            format!("{theirs:?}") == format!("{ours:?}")
+            format!("{theirs:?}") == format!("{ours:?}") // alloc: error path: both servers failed
         }
         _ => false,
     };
     if !same {
         COUNTS.differed.fetch_add(1, Ordering::Relaxed);
         let said = |it: &Result<tt::TopSubtree, _>| match it {
-            Ok(tree) => format!("{tree:?}"),
-            Err(e) => format!("error: {e:?}"),
+            Ok(tree) => format!("{tree:?}"), // alloc: error path: the servers differ
+            Err(e) => format!("error: {e:?}"), // alloc: error path: the servers differ
         };
         noted(
-            &label,
+            dylib,
+            name,
             OTHERWISE,
+            // alloc: error path: the servers differ
             &format!(
                 "blaze's server and library expanded otherwise than the toolchain's:\n\
                  toolchain's: {}\nblaze's:     {}",
@@ -172,13 +179,15 @@ const NOT_COMPARED: usize = 1;
 /// The calls of each macro, `crate::name`, expanded otherwise and not compared.
 static NAMED: Mutex<BTreeMap<String, [u64; 2]>> = Mutex::new(BTreeMap::new());
 
-/// Counts a call of the macro `label` as `which`, and says `what` of the first.
-fn noted(label: &str, which: usize, what: &str) {
+/// Counts a call of the macro `name` of the library `dylib` as `which`, and says `what` of
+/// the first.
+fn noted(dylib: &AbsPath, name: &str, which: usize, what: &str) {
+    let krate = crate_of(dylib).unwrap_or("?");
     let mut named = NAMED.lock().unwrap_or_else(|it| it.into_inner());
-    let calls = named.entry(label.to_owned()).or_default();
+    let calls = named.entry(format!("{krate}::{name}")).or_default(); // alloc: error path: a call that differed or was not compared
     calls[which] += 1;
     if calls[which] == 1 {
-        eprintln!("proc macros: `{label}`: {what}");
+        eprintln!("proc macros: `{krate}::{name}`: {what}");
     }
 }
 
@@ -199,30 +208,33 @@ static COUNTS: Counts = Counts {
 
 /// What the comparison found so far, for the report: `None` when there is none.
 pub(crate) fn report() -> Option<String> {
+    use std::fmt::Write as _;
+
     compare()?;
-    let compared: Vec<u64> = COUNTS.compared.iter().map(|it| it.load(Ordering::Relaxed)).collect();
-    let kinds = ["derives", "attributes", "function-like"];
-    let kinds: Vec<_> =
-        kinds.iter().zip(&compared).map(|(what, calls)| format!("{calls} {what}")).collect();
-    let named = NAMED.lock().unwrap_or_else(|it| it.into_inner());
-    let of = |which: usize| -> Vec<String> {
-        let calls = named.iter().filter(|(_, calls)| calls[which] != 0);
-        calls.map(|(label, calls)| format!("{label} {}", calls[which])).collect()
-    };
-    let mut said = format!(
-        "compared with blaze's server: {} calls ({}), {} expanded otherwise, {} failed by both, \
-         {} not compared",
-        compared.iter().sum::<u64>(),
-        kinds.join(", "),
+    let compared = COUNTS.compared.each_ref().map(|it| it.load(Ordering::Relaxed));
+    let mut said = String::new(); // alloc: the edge: the daemon's log
+    _ = write!(said, "compared with blaze's server: {} calls (", compared.iter().sum::<u64>());
+    for (at, (what, calls)) in ["derives", "attributes", "function-like"].into_iter().zip(compared).enumerate() {
+        _ = write!(said, "{}{calls} {what}", if at == 0 { "" } else { ", " });
+    }
+    _ = write!(
+        said,
+        "), {} expanded otherwise, {} failed by both, {} not compared",
         COUNTS.differed.load(Ordering::Relaxed),
         COUNTS.failed.load(Ordering::Relaxed),
         COUNTS.unloaded.load(Ordering::Relaxed),
     );
+    let named = NAMED.lock().unwrap_or_else(|it| it.into_inner());
     for (which, what) in [(OTHERWISE, "expanded otherwise"), (NOT_COMPARED, "not compared")] {
-        let calls = of(which);
-        if !calls.is_empty() {
-            said += &format!(" ({what}: {})", calls.join(", "));
+        let mut macros = named.iter().filter(|(_, calls)| calls[which] != 0).peekable();
+        if macros.peek().is_none() {
+            continue;
         }
+        _ = write!(said, " ({what}: ");
+        for (at, (label, calls)) in macros.enumerate() {
+            _ = write!(said, "{}{label} {}", if at == 0 { "" } else { ", " }, calls[which]);
+        }
+        said.push(')');
     }
     Some(said)
 }

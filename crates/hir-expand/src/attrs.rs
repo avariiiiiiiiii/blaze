@@ -17,7 +17,7 @@
 use std::{borrow::Cow, cell::OnceCell, convert::Infallible, fmt, ops::ControlFlow};
 
 use ::tt::TextRange;
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use itertools::Itertools;
@@ -148,7 +148,7 @@ pub fn expand_cfg_attr_with_doc_comments<'a, DocComment, BreakValue>(
             let cfg_predicate = CfgExpr::parse_from_ast(cfg_predicate);
             if cfg_options().check(&cfg_predicate) != Some(false) {
                 let prev_stack_len = stack.len();
-                stack.extend(meta.metas().map(|meta| (meta, top_attr.clone())));
+                stack.extend(meta.metas().map(|meta| (meta, top_attr.clone()))); // clone: a node handle, a non-atomic count
                 stack[prev_stack_len..].reverse();
             }
         } else {
@@ -301,7 +301,7 @@ impl Attr {
     /// Parses this attribute as a token tree consisting of comma separated paths.
     pub fn parse_path_comma_token_tree<'a>(
         &'a self,
-        db: &'a dyn SourceDatabase,
+        db: &'a Db,
     ) -> Option<impl Iterator<Item = (ModPath, Span, tt::TokenTreesView<'a>)> + 'a> {
         let args = self.token_tree_value()?;
 
@@ -313,7 +313,7 @@ impl Attr {
 }
 
 fn parse_path_comma_token_tree<'a>(
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     args: &'a tt::TopSubtree,
 ) -> impl Iterator<Item = (ModPath, Span, tt::TokenTreesView<'a>)> {
     args.token_trees()
@@ -325,7 +325,7 @@ fn parse_path_comma_token_tree<'a>(
 }
 
 fn unescape(s: &str) -> Option<Cow<'_, str>> {
-    let mut buf = String::new();
+    let mut buf = String::new(); // alloc: none until the first escape (`reserve_exact` then)
     let mut prev_end = 0;
     let mut has_error = false;
     unescape::unescape_str(s, |char_range, unescaped_char| {
@@ -374,7 +374,7 @@ impl AttrId {
     /// to `cfg_attr`) and its [`ast::Meta`].
     pub fn find_attr_range<N: ast::HasAttrs>(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         owner: AstId<N>,
     ) -> (ast::Attr, ast::Meta) {
@@ -388,7 +388,7 @@ impl AttrId {
     /// original file (not speculatively expanded macro output).
     pub fn find_attr_range_with_source(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         owner: &dyn ast::HasAttrs,
     ) -> (ast::Attr, ast::Meta) {
@@ -401,7 +401,7 @@ impl AttrId {
     /// to `cfg_attr`) and its [`ast::Meta`].
     pub(crate) fn find_attr_range_with_source_opt(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         owner: &dyn ast::HasAttrs,
     ) -> Option<(ast::Attr, ast::Meta)> {
@@ -426,7 +426,7 @@ impl AttrId {
 
     pub fn find_derive_range(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         owner: AstId<ast::Adt>,
         derive_index: u32,

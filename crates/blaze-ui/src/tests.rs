@@ -3,6 +3,7 @@ use std::hash::BuildHasher;
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, Slow, Step, Summary,
 };
+use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxBuildHasher;
 
 use crate::{Build, Count, Dur, Live, Plain, Progress, summary_line, took};
@@ -14,6 +15,11 @@ const MS: u64 = 1_000_000;
 
 fn at(at_ns: u64, event: Event) -> Record {
     Record { at_ns, event }
+}
+
+/// A view that draws for every record and tick, so a test sees the screen after each.
+fn every_record(width: usize, color: bool) -> Live {
+    Live::new(width, color).frames(0)
 }
 
 fn anim(state: CrateState, done: u64, kept: u64) -> Event {
@@ -260,7 +266,7 @@ fn an_edit_says_what_it_rebuilt_and_why() {
          0.21s\n"
     );
     // `blaze status` of it: the steps it did and its last line, as the live view ends.
-    let mut live = Live::new(100, false);
+    let mut live = every_record(100, false);
     for record in edit() {
         live.record(&record, record.at_ns);
     }
@@ -283,7 +289,7 @@ fn a_fresh_build_says_nothing_of_its_own() {
     ];
     let mut plain = Plain::new(false);
     assert_eq!(records.iter().map(|it| plain.record(it)).collect::<String>(), "");
-    let mut live = Live::new(80, false);
+    let mut live = every_record(80, false);
     let drawn: String = records.iter().map(|it| live.record(it, MS)).collect();
     assert!(!drawn.contains("Fresh"), "{drawn:?}");
 }
@@ -304,7 +310,7 @@ fn a_failure_is_said_once_to_the_command_that_asked() {
     assert_eq!(said, "error: error[E0308]: expected u32, found &'static str (after 0.04s)\n");
     let mut asked = Plain::new(false).errors_said();
     assert_eq!(records.iter().map(|it| asked.record(it)).collect::<String>(), "");
-    let mut live = Live::new(80, false).errors_said();
+    let mut live = every_record(80, false).errors_said();
     let drawn: String = records.iter().map(|it| live.record(it, 40 * MS)).collect();
     assert!(!drawn.contains("error"), "{drawn:?}");
 }
@@ -314,7 +320,7 @@ fn a_failure_is_said_once_to_the_command_that_asked() {
 #[test]
 fn the_live_region_is_redrawn_in_place_and_cleared() {
     let width = 60;
-    let mut live = Live::new(width, false);
+    let mut live = every_record(width, false);
     let mut screen = Screen::default();
     let mut middle = Vec::new();
     let mut time = 0;
@@ -357,7 +363,7 @@ fn the_live_region_is_redrawn_in_place_and_cleared() {
 /// changed with the cursor moved to it and back. One whose width changed is drawn whole.
 #[test]
 fn a_draw_writes_only_the_lines_that_changed() {
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let records = [
         at(0, Event::Began { build: 1, command: "build".into(), root: "/w/rg".into() }),
         at(0, Event::Started { step: Step::Std, of: None }),
@@ -440,7 +446,7 @@ fn region_at(
 /// the last line, with the longest chain so far.
 #[test]
 fn the_region_is_a_tree_of_the_crates_under_way() {
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let region = region_at(&mut live, graphed(), 3 * S);
     assert_eq!(
         region,
@@ -460,7 +466,7 @@ fn the_region_is_a_tree_of_the_crates_under_way() {
 /// their [`Event::Moved`]s: a build script compiling waits for nothing, its run for it.
 #[test]
 fn a_build_script_is_a_node_of_its_own() {
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let records = [
         at(0, Event::Began { build: 1, command: "build".into(), root: "/w/rg".into() }),
         at(0, Event::Started { step: Step::BuildScripts, of: None }),
@@ -546,9 +552,9 @@ fn a_record_of_nodes_is_its_nodes() {
     let each = graphed();
     assert_eq!(shape(&in_order), shape(&each));
     assert_eq!(shape(&backwards), shape(&each));
-    let region = region_at(&mut Live::new(120, false), each, 3 * S);
-    assert_eq!(region_at(&mut Live::new(120, false), in_order, 3 * S), region);
-    assert_eq!(region_at(&mut Live::new(120, false), backwards, 3 * S), region);
+    let region = region_at(&mut every_record(120, false), each, 3 * S);
+    assert_eq!(region_at(&mut every_record(120, false), in_order, 3 * S), region);
+    assert_eq!(region_at(&mut every_record(120, false), backwards, 3 * S), region);
 
     let mut plain = Plain::new(false);
     let cycle = nodes(0, &[(Names, "a", &[1]), (Names, "b", &[0])]);
@@ -621,7 +627,7 @@ fn a_long_build_says_why_it_took_as_long_as_it_did() {
 /// no step named, which is a step that is missing.
 #[test]
 fn a_long_build_says_what_held_it_up_and_time_no_step_named() {
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let records = graphed().into_iter().chain([
         at(2 * S, crate_is("winit", CrateState::Resolved, 0)),
         at(2 * S, crate_is("wgpu", CrateState::Resolved, 0)),
@@ -664,7 +670,7 @@ fn the_cores_kept_busy_show_as_it_goes_and_at_the_end() {
         at(500 * MS, Event::Cores { busy: 100, of: 8 }),
         at(3 * S, Event::Cores { busy: 790, of: 8 }),
     ];
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let region = region_at(&mut live, records, 4 * S);
     let spark = format!(
         "cores {:12}\u{2582}\u{2582}\u{2582}\u{2582}\u{2582}\u{2588}\u{2588}\u{2588} 7.9/8 busy",
@@ -688,7 +694,7 @@ fn the_functions_slow_to_compile_show_under_their_crate_and_at_the_end() {
     let compiling = Event::Compiling {
         functions: vec![slow("wgpu::Device::new", 300 * MS), slow("wgpu::Queue::submit", 100 * MS)],
     };
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let records = graphed().into_iter().chain([at(2 * S, compiling)]);
     let region = region_at(&mut live, records, 3 * S);
     assert_eq!(
@@ -720,7 +726,7 @@ fn the_functions_slow_to_compile_show_under_their_crate_and_at_the_end() {
 /// would read more done than there are.
 #[test]
 fn functions_with_a_total_unknown_are_a_count() {
-    let mut live = Live::new(120, false);
+    let mut live = every_record(120, false);
     let records = [
         at(0, Event::Started { step: Step::Codegen, of: None }),
         at(0, anim(CrateState::Running, 1200, 0)),
@@ -795,28 +801,24 @@ const OFS: [Option<&str>; 4] =
 const FUNCTIONS: [&str; 4] =
     ["wgpu::Device::new", "wgpu::Queue::submit", "<regex_syntax::Folder>::new", "main"];
 
-/// splitmix64: the same records for the same seed, on every machine.
-struct Rng(u64);
+/// The same records for the same seed, on every machine.
+struct Rng(SplitMix64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
+    fn new(seed: u64) -> Rng {
+        Rng(SplitMix64::new(seed))
     }
 
     fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+        self.0.below(n)
     }
 
     fn chance(&mut self, one_in: u64) -> bool {
-        self.below(one_in) == 0
+        self.0.one_in(one_in)
     }
 
     fn pick<T: Copy>(&mut self, of: &[T]) -> T {
-        of[self.below(of.len() as u64) as usize]
+        of[self.0.index(of.len())]
     }
 }
 
@@ -1053,11 +1055,11 @@ fn indexes_agree(build: &Build, now_ns: u64) {
 fn the_diffed_region_shows_what_redrawing_it_whole_did() {
     let (mut fast_bytes, mut whole_bytes) = (0, 0);
     for seed in 0..300 {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let records = records(&mut rng, 120);
         let width = 20 + rng.below(130) as usize;
         let color = rng.chance(2);
-        let (mut new, mut was) = (Live::new(width, color), old::Live::new(width, color));
+        let (mut new, mut was) = (every_record(width, color), old::Live::new(width, color));
         if rng.chance(4) {
             (new, was) = (new.errors_said(), was.errors_said());
         }
@@ -1098,10 +1100,10 @@ fn the_diffed_region_shows_what_redrawing_it_whole_did() {
 #[test]
 fn records_come_together_show_what_each_alone_did() {
     for seed in 0..200 {
-        let mut rng = Rng(1000 + seed);
+        let mut rng = Rng::new(1000 + seed);
         let records = records(&mut rng, 120);
         let (width, color) = (20 + rng.below(130) as usize, rng.chance(2));
-        let (mut each, mut together) = (Live::new(width, color), Live::new(width, color));
+        let (mut each, mut together) = (every_record(width, color), every_record(width, color));
         let (mut alone, mut batched) = (Screen::default(), Screen::default());
         let mut rest = records.as_slice();
         while !rest.is_empty() {
@@ -1121,11 +1123,54 @@ fn records_come_together_show_what_each_alone_did() {
     }
 }
 
+/// Records far more often than a screen shows frames are written at most once a frame, and
+/// once a frame has passed the screen shows what drawing after every record showed.
+#[test]
+fn records_faster_than_frames_are_drawn_once_a_frame() {
+    for seed in 0..200 {
+        let mut rng = Rng::new(9000 + seed);
+        let records = records(&mut rng, 120);
+        let (width, color) = (20 + rng.below(130) as usize, rng.chance(2));
+        let (mut capped, mut each) = (Live::new(width, color), every_record(width, color));
+        let (mut held, mut alone) = (Screen::default(), Screen::default());
+        let (mut now, mut writes, mut last_write) = (0, 0u64, None::<u64>);
+        for (at, record) in records.iter().enumerate() {
+            now = now.max(record.at_ns) + rng.below(4) * MS;
+            let mut out = String::new();
+            capped.record_into(record, now, &mut out);
+            alone.feed(&each.record(record, now));
+            if !out.is_empty() {
+                let finished = capped.build().finished.is_some();
+                if let Some(last) = last_write {
+                    assert!(finished || now - last >= crate::FRAME_NS, "seed {seed}, record {at}: drawn {}ns after the last", now - last);
+                }
+                writes += 1;
+                last_write = Some(now);
+                held.feed(&out);
+            }
+            if capped.due_ns().is_none() {
+                assert_eq!(held.lines(), alone.lines(), "seed {seed}, record {at}: drawn, the screens agree");
+            }
+        }
+        if let Some(due) = capped.due_ns() {
+            now = now.max(due);
+            held.feed(&capped.tick(now));
+            alone.feed(&each.tick(now));
+        }
+        assert_eq!(capped.due_ns(), None, "seed {seed}");
+        assert_eq!(held.lines(), alone.lines(), "seed {seed}: once due");
+        held.feed(&capped.finish());
+        alone.feed(&each.finish());
+        assert_eq!(held.lines(), alone.lines(), "seed {seed}: finished");
+        assert!(writes <= 1 + now / crate::FRAME_NS + 1, "seed {seed}: {writes} writes in {now}ns");
+    }
+}
+
 /// The lines off a terminal are the old ones, byte for byte.
 #[test]
 fn plain_lines_are_the_old_ones() {
     for seed in 0..300 {
-        let mut rng = Rng(5000 + seed);
+        let mut rng = Rng::new(5000 + seed);
         let records = records(&mut rng, 120);
         let color = rng.chance(2);
         let (mut new, mut was) = (Plain::new(color), old::Plain::new(color));

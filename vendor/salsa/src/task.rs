@@ -9,36 +9,13 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::sync::Mutex;
 use crate::sync::thread::{self, ThreadId};
 use crate::table::{PageIndex, Table};
 use crate::zalsa::IngredientIndex;
 use crate::zalsa_local::ZalsaLocal;
-
-static TASK_DEPTH: OnceLock<fn() -> usize> = OnceLock::new();
-
-/// Sets how salsa learns which task the current thread runs: `depth()` is how many tasks the
-/// thread runs above the one at the bottom of its stack (blaze's daemon passes
-/// `blaze_graph::pump::depth`). Unset, every thread runs one task, at depth 0.
-///
-/// # Panics
-///
-/// If it was set before.
-pub fn set_task_depth(depth: fn() -> usize) {
-    assert!(
-        TASK_DEPTH.set(depth).is_ok(),
-        "`salsa::set_task_depth` may be called once per process"
-    );
-}
-
-#[inline]
-pub(crate) fn current_depth() -> u32 {
-    TASK_DEPTH.get().map_or(0, |depth| {
-        u32::try_from(depth()).expect("a thread runs more than `u32::MAX` tasks")
-    })
-}
 
 /// A task: the thread that runs it and how many tasks that thread runs below it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -48,12 +25,14 @@ pub struct TaskId {
 }
 
 impl TaskId {
-    /// The task the current thread runs now.
+    /// The task the current thread runs at `depth` ([`Database::task_depth`]).
+    ///
+    /// [`Database::task_depth`]: crate::Database::task_depth
     #[inline]
-    pub(crate) fn current() -> Self {
+    pub(crate) fn current(depth: u32) -> Self {
         Self {
             thread: thread::current().id(),
-            depth: current_depth(),
+            depth,
         }
     }
 
@@ -115,6 +94,7 @@ impl Drop for Entry {
 
 crate::sync::thread_local! {
     /// The task-local state this thread holds, for every database and task depth it ran.
+    // alloc: `Vec::new` allocates nothing; one entry per database and task depth a thread runs
     static ENTRIES: RefCell<Vec<Entry>> = RefCell::new(Vec::new());
 }
 
@@ -134,10 +114,10 @@ impl TaskLocals {
         }
     }
 
-    /// The state of the task the current thread runs now, made empty the first time.
+    /// The state of the task the current thread runs now, made empty the first time. `depth` is
+    /// the database's [`Database::task_depth`](crate::Database::task_depth).
     #[inline]
-    pub(crate) fn current(&self) -> &ZalsaLocal {
-        let depth = current_depth();
+    pub(crate) fn current(&self, depth: u32) -> &ZalsaLocal {
         let local: *const ZalsaLocal = ENTRIES.with(|entries| {
             let mut entries = entries.borrow_mut();
             if let Some(entry) = entries
@@ -164,8 +144,10 @@ impl TaskLocals {
         entries.push(Entry {
             database: self.database,
             depth,
+            // alloc: once per database and task depth a thread first runs
             shared: self.shared.clone(),
-            local: Box::new(ZalsaLocal::new()),
+            // alloc: once per database and task depth a thread first runs
+            local: Box::new(ZalsaLocal::new(TaskId::current(depth))),
         });
         let entry = entries.last().expect("an entry was just pushed");
         &*entry.local as *const ZalsaLocal

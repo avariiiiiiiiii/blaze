@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Arch, Backend, Settings};
 
-pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 1";
+pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 2";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Panic {
@@ -53,6 +53,85 @@ pub struct Toolchain {
     pub relocation: Relocation,
 }
 
+/// rustc's `-Zsanitizer` (address, thread, memory), `-Zsanitizer-recover`,
+/// `-Zsanitizer-memory-track-origins`, and SanitizerCoverage as rustc gets it
+/// (`-Cpasses=sancov-module` with `-Cllvm-args=-sanitizer-coverage-*`): one for the whole
+/// build, as cargo passes `RUSTFLAGS` to every crate. `Sanitize::default()` is none.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Sanitize {
+    pub sanitizers: Sanitizers,
+    /// Of `sanitizers`, those that report and go on (`-Zsanitizer-recover`).
+    pub recover: Sanitizers,
+    /// `-Zsanitizer-memory-track-origins`: 0, 1 or 2; 0 without `Sanitizers::MEMORY`.
+    pub track_origins: u8,
+    pub coverage: Coverage,
+}
+
+impl Sanitize {
+    pub const fn is_empty(&self) -> bool {
+        self.sanitizers.is_empty() && !self.coverage.is_on()
+    }
+}
+
+/// A set of sanitizers, as bits.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Sanitizers(pub u8);
+
+impl Sanitizers {
+    pub const NONE: Sanitizers = Sanitizers(0);
+    pub const ADDRESS: Sanitizers = Sanitizers(1 << 0);
+    pub const THREAD: Sanitizers = Sanitizers(1 << 1);
+    pub const MEMORY: Sanitizers = Sanitizers(1 << 2);
+    /// In a function's set of what is off for it only (`Function::unsanitized`): LLVM's
+    /// SanitizerCoverage skips it, as it skips a function named `__sanitizer_*`. Never in
+    /// `Sanitize::sanitizers` or `recover`.
+    pub const COVERAGE: Sanitizers = Sanitizers(1 << 3);
+
+    pub const fn contains(self, other: Sanitizers) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    pub const fn union(self, other: Sanitizers) -> Sanitizers {
+        Sanitizers(self.0 | other.0)
+    }
+    pub const fn without(self, other: Sanitizers) -> Sanitizers {
+        Sanitizers(self.0 & !other.0)
+    }
+}
+
+/// SanitizerCoverage: `-sanitizer-coverage-level` (1 the entry block, 2 every block, 3 and
+/// critical edges, 4 and indirect calls) and the `-sanitizer-coverage-*` switches as bits.
+/// Canonical: `Coverage::default()` (level 0, no flags) unless `-Cpasses` names
+/// `sancov-module` and the level is 1 to 4, so two builds without coverage have one key.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
+pub struct Coverage {
+    pub level: u8,
+    pub flags: u16,
+}
+
+impl Coverage {
+    pub const TRACE_PC: u16 = 1 << 0;
+    pub const TRACE_PC_GUARD: u16 = 1 << 1;
+    pub const INLINE_8BIT_COUNTERS: u16 = 1 << 2;
+    pub const INLINE_BOOL_FLAG: u16 = 1 << 3;
+    pub const PC_TABLE: u16 = 1 << 4;
+    pub const TRACE_CMP: u16 = 1 << 5;
+    pub const TRACE_DIV: u16 = 1 << 6;
+    pub const TRACE_GEP: u16 = 1 << 7;
+    pub const TRACE_LOADS: u16 = 1 << 8;
+    pub const TRACE_STORES: u16 = 1 << 9;
+    pub const NO_PRUNE: u16 = 1 << 10;
+    pub const STACK_DEPTH: u16 = 1 << 11;
+    pub const TRACE_PC_ENTRY_EXIT: u16 = 1 << 12;
+    pub const CONTROL_FLOW: u16 = 1 << 13;
+
+    pub const fn is_on(self) -> bool {
+        matches!(self.level, 1..=4)
+    }
+}
+
 /// What changes one function's machine code besides its MIR and its type arguments' facts.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Spec {
@@ -69,6 +148,15 @@ pub struct Spec {
     /// Folding functions that differ only in constants (#1292): changes which body a
     /// function's code is.
     pub fold: bool,
+    /// Whether rustc's MIR inliner runs on the bodies of the crates compiled at these
+    /// settings (`Inline::is_enabled`): `-Copt-level` 2 or 3, not `s`/`z`, which share
+    /// `Llvm { opt: 2 }`, and not in a build that patches, as rustc runs it only outside
+    /// incremental builds ([`crate::plan::Policy::choose`]). The library's MIR is inlined
+    /// whatever this says, as rustc ships it.
+    pub mir_inline: bool,
+    /// The sanitizers and coverage the LLVM back end instruments with: a sanitized build's
+    /// code is never a plain one's.
+    pub sanitize: Sanitize,
     /// The content ID of the policy that gives every function of the build its settings
     /// ([`crate::plan::Policy::id`]): a function's relocations name its callees by keys made
     /// with their settings, so a change to how a callee is compiled is a change to the
@@ -86,6 +174,8 @@ impl Spec {
             panic,
             debuginfo,
             fold,
+            mir_inline,
+            sanitize,
             policy,
         } = self;
         let Toolchain {
@@ -122,7 +212,11 @@ impl Spec {
             *panic as u8,
             *debuginfo as u8,
             *fold as u8,
+            *mir_inline as u8,
         ]);
+        let Sanitize { sanitizers, recover, track_origins, coverage } = sanitize;
+        hasher.update(&[sanitizers.0, recover.0, *track_origins, coverage.level]);
+        hasher.update(&coverage.flags.to_le_bytes());
         hasher.id(policy);
         Settings(hasher.finish())
     }
@@ -157,6 +251,8 @@ mod tests {
             panic: Panic::Unwind,
             debuginfo: DebugInfo::Full,
             fold: false,
+            mir_inline: false,
+            sanitize: Sanitize::default(),
             policy: ContentId([2; 32]),
         }
     }
@@ -181,6 +277,12 @@ mod tests {
             |it| it.panic = Panic::Abort,
             |it| it.debuginfo = DebugInfo::LineTablesOnly,
             |it| it.fold = true,
+            |it| it.mir_inline = true,
+            |it| it.sanitize.sanitizers = Sanitizers::ADDRESS,
+            |it| it.sanitize.recover = Sanitizers::ADDRESS,
+            |it| it.sanitize.track_origins = 2,
+            |it| it.sanitize.coverage.level = 3,
+            |it| it.sanitize.coverage.flags = Coverage::PC_TABLE,
             |it| it.policy = ContentId([4; 32]),
         ];
         let mut seen = std::collections::BTreeSet::from([base.settings()]);

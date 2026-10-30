@@ -355,10 +355,7 @@ pub fn summary(diags: &[Diag]) -> Vec<Diag> {
     }
     let mut explained: Vec<&str> = diags
         .iter()
-        .filter_map(|it| match &it.code {
-            Some(Code::Error(code)) => Some(code.as_str()),
-            _ => None,
-        })
+        .filter_map(|it| it.code.as_ref().and_then(Code::error))
         .filter(|code| codes::explanation(code).is_some())
         .collect();
     explained.sort_unstable();
@@ -417,8 +414,8 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
     .short_message(style.short);
 
     let mut title = level_of(diag.level).primary_title(diag.message.as_str());
-    if let Some(Code::Error(code)) = &diag.code {
-        title = title.id(code.as_str());
+    if let Some(code) = diag.code.as_ref().and_then(Code::error) {
+        title = title.id(code);
     }
     let mut report: Vec<Group<'a>> = Vec::with_capacity(2 + diag.children.len() + suggestions.len());
     let mut group = Group::with_title(title);

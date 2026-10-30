@@ -1,6 +1,8 @@
 //! Elision of real build scripts (a census of crates.io's and this tree's, each named by where
 //! it is from, its source as published), of the forms it reads, and of each form it refuses.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::{
     output::{self, Context, Output},
@@ -678,23 +680,17 @@ fn on_demand_elision_says_what_the_whole_list_said() {
         "\n    // A comment.\n    println!(\"cargo:c\");",
     ];
     let tails = ["\n}\n", "}", "\n}\nfn other() {}\n", "\n} // End.\n", "\n}}\n", "\n"];
-    let mut state = 0x3c6e_f372_fe94_f82bu64;
-    let mut next = |bound: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % bound as u64) as usize
-    };
+    let mut rng = SplitMix64::new(0x3c6e_f372_fe94_f82b);
     let root = Path::new("/p/foo/build.rs");
     let (mut read, mut refused) = (0, 0);
     for _ in 0..60_000 {
-        let mut source = String::from(heads[next(heads.len())]);
-        source.push_str(mains[next(mains.len())]);
-        for _ in 0..next(5) {
-            source.push_str(statements[next(statements.len())]);
+        let mut source = String::from(heads[rng.index(heads.len())]);
+        source.push_str(mains[rng.index(mains.len())]);
+        for _ in 0..rng.index(5) {
+            source.push_str(statements[rng.index(statements.len())]);
         }
-        source.push_str(tails[next(tails.len())]);
-        if next(8) == 0 {
+        source.push_str(tails[rng.index(tails.len())]);
+        if rng.one_in(8) {
             source = source.replace('\n', "\r\n");
         }
         let files = BTreeMap::from([(root.to_owned(), source.clone().into_bytes())]);
@@ -741,9 +737,9 @@ fn refused_at_the_first_byte() {
     }
 }
 
-/// A script refused at its first byte costs nothing, and one read costs what it prints and
-/// the arguments it is read with, presized: the printed text, the arguments of a call, and
-/// which arguments a placeholder used.
+/// A refused script allocates nothing; a read one, nothing once the caller's buffer, the
+/// thread's frame and its lent strings have grown: what it prints goes into the caller's
+/// buffer, everything else is bumped in the frame and freed with the task.
 #[test]
 fn what_elision_allocates() {
     let root = Path::new("/p/foo/build.rs");
@@ -751,22 +747,30 @@ fn what_elision_allocates() {
         root.to_owned(),
         b"use std::env;\nfn main() { println!(\"cargo:rustc-cfg=x\"); }\n".to_vec(),
     )]);
-    let none = blaze_alloc_count::assert_at_most(0, "a script refused at its first byte", || {
-        elide(root, &refused)
+    let mut out = Vec::new();
+    let kept = blaze_alloc_count::assert_at_most(0, "a script refused at its first byte", || {
+        elide_into(root, &refused, &mut out)
     });
-    assert_eq!(none, None);
+    assert!(!kept && out.is_empty());
     let read = BTreeMap::from([(
         root.to_owned(),
-        b"// Generated.\nfn main() {\n    println!(\"cargo:rustc-cfg=has_foo\");\n    \
-          println!(\"cargo:rustc-check-cfg=cfg(has_foo)\");\n    \
-          println!(\"cargo:rustc-env=LEVEL={}\", 3);\n}\n"
+        b"// Generated.\r\nfn main() {\r\n    println!(\"cargo:rustc-cfg=has_foo\");\r\n    \
+          println!(\"cargo:rustc-check-cfg=cfg(has_foo)\");\r\n    \
+          println!(\"cargo:rustc-env=LEVEL={}\\t\", 3);\r\n}\r\n"
             .to_vec(),
     )]);
-    let printed = blaze_alloc_count::assert_at_most(3, "a script read", || elide(root, &read));
-    assert_eq!(
-        String::from_utf8(printed.unwrap()).unwrap(),
-        "cargo:rustc-cfg=has_foo\ncargo:rustc-check-cfg=cfg(has_foo)\ncargo:rustc-env=LEVEL=3\n"
-    );
+    let printed =
+        "cargo:rustc-cfg=has_foo\ncargo:rustc-check-cfg=cfg(has_foo)\ncargo:rustc-env=LEVEL=3\t\n";
+    let cold = "a script read cold: the caller's buffer and the lent string";
+    let kept = blaze_alloc_count::assert_at_most(2, cold, || elide_into(root, &read, &mut out));
+    assert!(kept);
+    assert_eq!(std::str::from_utf8(&out).unwrap(), printed);
+    let warm = "a script read warm";
+    let kept = blaze_alloc_count::assert_at_most(0, warm, || elide_into(root, &read, &mut out));
+    assert!(kept);
+    assert_eq!(std::str::from_utf8(&out).unwrap(), printed);
+    assert!(!elide_into(root, &refused, &mut out) && out.is_empty(), "a refusal empties it");
+    assert_eq!(elide(root, &read).as_deref(), Some(printed.as_bytes()), "elide is elide_into's");
 }
 
 mod reference;

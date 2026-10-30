@@ -371,6 +371,36 @@ impl SyntaxNode {
         }
     }
 
+    /// [`SyntaxNode::clone_subtree`] with the nodes `elided` under this one, in order and
+    /// disjoint, each replaced by an empty node of its kind (`FlatTree::subtree_without`):
+    /// what is left of the copy's text and elements, made without copying the elided ones.
+    /// They must be in this node's flat tree (its part's, for a lazy node).
+    pub fn clone_subtree_without<'a>(
+        &self,
+        elided: impl ExactSizeIterator<Item = &'a SyntaxNode>,
+    ) -> SyntaxNode {
+        if elided.len() == 0 {
+            return self.clone_subtree();
+        }
+        let (root, at) = inner(self.0.root, self.0.at);
+        let tree = &flat(&root).tree;
+        let numbers = elided.map(|node| {
+            let (of, it) = (&flat(&node.0.root).tree, node.0.at);
+            assert!(
+                Arc::ptr_eq(of, tree),
+                "the elided {:?} at {:?} is not in the flat tree of the {:?} it is cut from",
+                node.kind(),
+                node.text_range(),
+                self.kind(),
+            );
+            it
+        });
+        // alloc: the elided nodes' numbers, once per copy
+        let numbers: Vec<u32> = numbers.collect();
+        // alloc: the copy's tree, shared by its cursors as every tree is
+        SyntaxNode::new_flat_root(Arc::new(tree.subtree_without(at, &numbers)))
+    }
+
     /// The root of a new tree, the one this node is in but with this node's children (and
     /// tokens) at `range` replaced by copies of `with`. Only the text and structure carry
     /// over: the new tree's text is its own, its lazy nodes parsed into it, so its ranges

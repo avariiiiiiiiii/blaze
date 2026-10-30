@@ -181,6 +181,7 @@ impl Args<'_> {
         match self.args.get(i) {
             Some(it) => Ok(it),
             None => Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("llvm.{} has no argument {i}", self.name).into(),
             )),
         }
@@ -190,6 +191,7 @@ impl Args<'_> {
         match self.arg(i)?.try_into() {
             Ok(it) => Ok(it),
             Err(_) => Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("llvm.{} takes 16 bytes", self.name).into(),
             )),
         }

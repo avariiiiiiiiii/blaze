@@ -240,6 +240,34 @@ fn spans() -> Vec<linkedit::Span> {
     ]
 }
 
+/// What an encoder appends to a buffer already holding 3 bytes (so off 8-byte alignment): the
+/// table alone, checked to be the length it says, padded to 8 bytes from where it starts, and
+/// to leave the bytes before it alone.
+fn appended(encode: impl FnOnce(&mut Vec<u8>) -> Result<usize, String>) -> Result<Vec<u8>, String> {
+    let mut out = vec![0xaa; 3];
+    let len = encode(&mut out)?;
+    assert_eq!(out.len(), 3 + len, "the length it says");
+    assert_eq!(len % 8, 0, "padded to 8 bytes");
+    assert_eq!(out[..3], [0xaa; 3], "what was before it");
+    Ok(out.split_off(3))
+}
+
+fn encode_rebases(addrs: &[u64], spans: &[linkedit::Span]) -> Result<Vec<u8>, String> {
+    appended(|out| linkedit::rebases(addrs, spans, out))
+}
+
+fn encode_binds(binds: &mut [linkedit::Bind<'_>], spans: &[linkedit::Span]) -> Result<Vec<u8>, String> {
+    appended(|out| linkedit::binds(binds, spans, out))
+}
+
+fn encode_trie<N: AsRef<[u8]> + Ord>(exports: &mut [(N, u64, u64)]) -> Result<Vec<u8>, String> {
+    appended(|out| linkedit::trie(exports, out))
+}
+
+fn encode_starts(text: u64, addrs: &[u64]) -> Vec<u8> {
+    appended(|out| Ok(linkedit::function_starts(text, addrs, out))).unwrap()
+}
+
 #[test]
 fn names_cross_the_edge_both_ways() {
     assert_eq!(core_name(b"_main").unwrap(), "main");
@@ -291,7 +319,7 @@ fn trie_finds_every_export() {
         want.sort();
         want
     };
-    let trie = linkedit::trie(&mut exports).unwrap();
+    let trie = encode_trie(&mut exports).unwrap();
     assert_eq!(trie.len() % 8, 0);
     assert_eq!(decode_trie(&trie), want);
     for (name, _, addr) in &want {
@@ -300,8 +328,8 @@ fn trie_finds_every_export() {
     assert_eq!(trie_lookup(&trie, b"_ac"), None);
     assert_eq!(trie_lookup(&trie, b"_"), None);
     let mut twice = vec![(b"_a".to_vec(), 0, 1), (b"_a".to_vec(), 0, 2)];
-    assert!(linkedit::trie(&mut twice).is_err());
-    assert!(linkedit::trie(&mut Vec::<(Vec<u8>, u64, u64)>::new()).unwrap().is_empty());
+    assert!(encode_trie(&mut twice).is_err());
+    assert!(encode_trie(&mut Vec::<(Vec<u8>, u64, u64)>::new()).unwrap().is_empty());
 }
 
 #[test]
@@ -316,15 +344,15 @@ fn rebases_in_runs() {
     ];
     let mut many: Vec<u64> = (0..40).map(|it| 0x1_0000_c000 + it * 8).collect();
     many.extend(addrs);
-    let stream = linkedit::rebases(&many, &spans()).unwrap();
+    let stream = encode_rebases(&many, &spans()).unwrap();
     let starts: Vec<u64> = spans().iter().map(|it| it.start).collect();
     let mut want = many.clone();
     want.sort();
     assert_eq!(decode_rebases(&stream, &starts), want);
-    let text = linkedit::rebases(&[0x1_0000_4000], &spans()).unwrap_err();
+    let text = encode_rebases(&[0x1_0000_4000], &spans()).unwrap_err();
     assert!(text.contains("__TEXT"), "{text}");
-    assert!(linkedit::rebases(&[0x1_0000_8000, 0x1_0000_8000], &spans()).is_err());
-    assert!(linkedit::rebases(&[0x2_0000_0000], &spans()).is_err());
+    assert!(encode_rebases(&[0x1_0000_8000, 0x1_0000_8000], &spans()).is_err());
+    assert!(encode_rebases(&[0x2_0000_0000], &spans()).is_err());
 }
 
 #[test]
@@ -353,25 +381,25 @@ fn binds_decode_to_the_imports() {
         })
         .collect();
     want.sort();
-    let stream = linkedit::binds(&mut binds, &spans()).unwrap();
+    let stream = encode_binds(&mut binds, &spans()).unwrap();
     let starts: Vec<u64> = spans().iter().map(|it| it.start).collect();
     assert_eq!(decode_binds(&stream, &starts), want);
     let mut text = vec![bind(0x1_0000_4000, 1, "_x", false, 0)];
-    assert!(linkedit::binds(&mut text, &spans()).is_err());
+    assert!(encode_binds(&mut text, &spans()).is_err());
     let mut twice =
         vec![bind(0x1_0000_8000, 1, "_x", false, 0), bind(0x1_0000_8000, 2, "_y", false, 0)];
-    assert!(linkedit::binds(&mut twice, &spans()).is_err());
+    assert!(encode_binds(&mut twice, &spans()).is_err());
 }
 
 #[test]
 fn function_starts_are_distances() {
-    let starts = linkedit::function_starts(0x1_0000_0000, &[0x1_0000_4010, 0x1_0000_4000, 0x1_0000_4400]);
+    let starts = encode_starts(0x1_0000_0000, &[0x1_0000_4010, 0x1_0000_4000, 0x1_0000_4400]);
     let mut at = 0;
     assert_eq!(uleb(&starts, &mut at), 0x4000);
     assert_eq!(uleb(&starts, &mut at), 0x10);
     assert_eq!(uleb(&starts, &mut at), 0x3f0);
     assert_eq!(uleb(&starts, &mut at), 0);
-    assert!(linkedit::function_starts(0x1_0000_0000, &[]).is_empty());
+    assert!(encode_starts(0x1_0000_0000, &[]).is_empty());
 }
 
 #[test]
@@ -430,7 +458,7 @@ fn plans() {
 #[test]
 fn classes_in_ld64_order() {
     let writer = super::writer(&executable(Arch::Aarch64)).unwrap();
-    let linkme = Class::Named { name: "__DATA,__linkme_X".to_owned(), write: true, exec: false };
+    let linkme = Class::Named { name: "__DATA,__linkme_X".into(), write: true, exec: false };
     let mut classes = vec![
         Class::Bss,
         Class::Got,
@@ -482,12 +510,12 @@ fn classes_in_ld64_order() {
 #[test]
 fn link_sections_and_specials() {
     let writer = super::writer(&executable(Arch::Aarch64)).unwrap();
-    let linkme = Class::Named { name: "__DATA,__linkme_X".to_owned(), write: true, exec: false };
+    let linkme = Class::Named { name: "__DATA,__linkme_X".into(), write: true, exec: false };
     assert_eq!(
         writer.section("__DATA,__linkme_X,regular,no_dead_strip", false, false, false).unwrap(),
         (linkme.clone(), u32::MAX)
     );
-    let section = |end| Some(Special::Section { name: "__DATA,__linkme_X".to_owned(), end });
+    let section = |end| Some(Special::Section { name: "__DATA,__linkme_X".into(), end });
     assert_eq!(writer.special("\x01section$start$__DATA$__linkme_X"), section(false));
     assert_eq!(writer.special("\x01section$end$__DATA$__linkme_X"), section(true));
     assert_eq!(writer.section("__DATA,__mod_init_func,mod_init_funcs", false, false, false).unwrap().0, Class::InitArray);
@@ -1136,6 +1164,7 @@ fn objects_are_read_in_place_wherever_they_start() {
             }
             Data::Zero(_) => {}
             Data::Bytes(_) => panic!("{}: copied, not a range of the input", thin.name(section.name)),
+            Data::Made(_) => panic!("{}: made, not a range of the input", thin.name(section.name)),
         }
     }
     assert_eq!(held, 32 + 16 + 12, "every byte of the code, the data and the strings");
@@ -1293,10 +1322,10 @@ fn trie_is_the_insertion_trie() {
         // Out of order, as the builder must sort them itself.
         exports.reverse();
         let want = trie_by_insertion(&mut exports.clone());
-        assert_eq!(linkedit::trie(&mut exports).unwrap(), want, "round {round}");
+        assert_eq!(encode_trie(&mut exports).unwrap(), want, "round {round}");
         let mut borrowed: Vec<(&[u8], u64, u64)> =
             exports.iter().map(|it| (&it.0[..], it.1, it.2)).collect();
-        assert_eq!(linkedit::trie(&mut borrowed).unwrap(), want, "round {round}, borrowed");
+        assert_eq!(encode_trie(&mut borrowed).unwrap(), want, "round {round}, borrowed");
     }
 }
 
@@ -1317,14 +1346,14 @@ fn rebases_and_starts_sorted_or_not_are_the_same() {
     let mut shuffled = sorted.clone();
     shuffled.reverse();
     shuffled.swap(3, 30);
-    assert_eq!(linkedit::rebases(&sorted, &spans()).unwrap(), linkedit::rebases(&shuffled, &spans()).unwrap());
+    assert_eq!(encode_rebases(&sorted, &spans()).unwrap(), encode_rebases(&shuffled, &spans()).unwrap());
     assert_eq!(
-        linkedit::function_starts(0x1_0000_0000, &sorted),
-        linkedit::function_starts(0x1_0000_0000, &shuffled)
+        encode_starts(0x1_0000_0000, &sorted),
+        encode_starts(0x1_0000_0000, &shuffled)
     );
     let mut twice = sorted.clone();
     twice.push(sorted[10]);
-    assert_eq!(linkedit::function_starts(0x1_0000_0000, &twice), linkedit::function_starts(0x1_0000_0000, &sorted));
+    assert_eq!(encode_starts(0x1_0000_0000, &twice), encode_starts(0x1_0000_0000, &sorted));
 }
 
 /// A writer that keeps the last signature's pages writes the same file as one that doesn't,
@@ -1350,5 +1379,173 @@ fn the_signing_cache_writes_the_same_file() {
         let read = read(&file);
         let (at, len) = read.signature.unwrap();
         check_signature(range(&file, (at, len)), &file[..at as usize], "hello");
+    }
+}
+
+#[test]
+fn an_object_read_allocates_a_constant_number_of_buffers() {
+    // Each sized once: the nlist names, the name arena, the sections as read, the symbols'
+    // places, the atom bounds, the atom starts, the atoms, their section symbols, the nlist
+    // map, the symbols, the fixups, `__eh_frame`'s sections by address, the fixup column. A
+    // radix sort of more than 64 keys out of order would add three; these are in order.
+    let used = [100, 2000].map(|n| {
+        let bytes = super::input::tests::sized(n);
+        let (object, used) =
+            blaze_alloc_count::measure(|| super::input::read("sized.o", &bytes, Arch::X86_64));
+        let object = object.unwrap();
+        assert_eq!(object.sections.len(), n + 2);
+        assert_eq!(object.fixups.len(), 2 * n);
+        used.allocations
+    });
+    assert_eq!(used, [13, 13]);
+}
+
+#[test]
+fn an_archive_index_read_is_bounded_by_its_index() {
+    let symbols = ["_alpha", "_beta", "_gamma", "_delta"];
+    let (mut strings, mut offsets) = (Vec::new(), Vec::new());
+    for symbol in symbols {
+        offsets.push(strings.len() as u32);
+        strings.extend_from_slice(symbol.as_bytes());
+        strings.push(0);
+    }
+    let names = "a.o".len() + symbols.iter().map(|it| core_name(it.as_bytes()).unwrap().len()).sum::<usize>();
+    // The members, their header offsets, their ranges, the index, its entries by string
+    // offset and the names, and the radix sort's three: the entries are out of offset order.
+    let used = [128, 8192].map(|entries| {
+        let entries: Vec<(u32, usize)> = (0..entries).map(|it| (offsets[3 - it % 4], 0)).collect();
+        let bytes = super::archive::tests::bsd_raw(&[("a.o", &b"aaaa"[..])], strings.clone(), &entries);
+        let (archive, used) = blaze_alloc_count::measure(|| super::archive::read("libsym.a", &bytes));
+        let archive = archive.unwrap();
+        assert_eq!(archive.index.len(), entries.len());
+        assert_eq!(archive.names.bytes(), names, "one name a string, however many entries name it");
+        used.allocations
+    });
+    assert_eq!(used, [9, 9]);
+}
+
+#[test]
+fn signing_allocates_nothing_per_page() {
+    // One worker, measured on it: the pages are hashed on the thread that signs.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    for pages in [3, 300] {
+        let file: Vec<u8> = (0..pages * sign::PAGE + 100).map(|it| (it * 31 % 251) as u8).collect();
+        // Two parts, so the page across them is gathered.
+        let (a, b) = file.split_at(pages * sign::PAGE / 2 + 7);
+        let view = sign::View::new(file.len() as u64, vec![(0, a), (a.len() as u64, b)]).unwrap();
+        let mut cache = sign::Cache::default();
+        let len = sign::len("x", file.len() as u64);
+        pool.install(|| {
+            sign::signature(&view, "x", 0, 0x4000, true, Some(&mut cache), &mut Vec::new());
+            let mut out = Vec::new();
+            let ((), plain) =
+                blaze_alloc_count::measure(|| sign::signature(&view, "x", 0, 0x4000, true, None, &mut out));
+            assert_eq!((plain.allocations, plain.bytes), (1, len), "{pages} pages: the output alone");
+            check_signature(&out, &file, "x");
+            let want = std::mem::take(&mut out);
+            out.reserve(want.len());
+            let ((), cached) = blaze_alloc_count::measure(|| {
+                sign::signature(&view, "x", 0, 0x4000, true, Some(&mut cache), &mut out);
+            });
+            assert_eq!(cached.allocations, 0, "{pages} pages, cached, into a buffer of room");
+            assert_eq!(out, want);
+        });
+    }
+}
+
+#[test]
+fn linkedit_encodes_into_one_buffer() {
+    const IMPORTS: [&[u8]; 4] = [b"_malloc", b"_free", b"_open", b"_close"];
+    let spans = spans();
+    for n in [100u64, 2000] {
+        // In order, as `Placed` lists them.
+        let rebases: Vec<u64> = (0..n).map(|it| 0x1_0000_8000 + 8 * it).collect();
+        let functions: Vec<u64> = (0..n).map(|it| 0x1_0000_4000 + 16 * it).collect();
+        let mut binds: Vec<linkedit::Bind<'_>> = (0..n)
+            .map(|it| linkedit::Bind {
+                addr: 0x1_0000_8000 + 8 * it,
+                ordinal: 1 + (it % 3) as i64,
+                name: IMPORTS[(it % 4) as usize],
+                weak: false,
+                addend: 0,
+            })
+            .collect();
+        let names: Vec<Vec<u8>> = (0..n).map(|it| format!("_export{it}").into_bytes()).collect();
+        let mut exports: Vec<(&[u8], u64, u64)> =
+            names.iter().zip(0..).map(|(name, it)| (&name[..], 0, 0x4000 + 16 * it)).collect();
+        exports.sort_unstable();
+        let mut out =
+            Vec::with_capacity(linkedit::capacity(rebases.len(), &binds, &exports, functions.len()));
+        let (at, room) = (out.as_ptr(), out.capacity());
+        let (len, used) = blaze_alloc_count::measure(|| {
+            linkedit::rebases(&rebases, &spans, &mut out).unwrap()
+                + linkedit::binds(&mut binds, &spans, &mut out).unwrap()
+                + linkedit::trie(&mut exports, &mut out).unwrap()
+                + linkedit::function_starts(0x1_0000_0000, &functions, &mut out)
+        });
+        assert_eq!(used.allocations, 4, "{n}: the trie's four scratch columns");
+        assert_eq!((out.as_ptr(), out.capacity()), (at, room), "{n}: the buffer never grew");
+        assert_eq!(out.len(), len);
+    }
+}
+
+/// The locals as `MachO::symbols` wrote them one at a time before they were filled in parallel.
+fn locals_one_by_one(
+    locals: &[(u64, &str)],
+    section_at: &dyn Fn(u64, &str) -> Result<u8, crate::LinkError>,
+    strings: &mut Vec<u8>,
+    nlist: &mut Vec<u8>,
+) -> Result<(), crate::LinkError> {
+    for &(addr, name) in locals {
+        let sect = section_at(addr, name)?;
+        nlist.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        let (prefix, rest) = super::spelled(name);
+        strings.extend_from_slice(prefix.as_bytes());
+        strings.extend_from_slice(rest.as_bytes());
+        strings.push(0);
+        nlist.push(macho::N_SECT);
+        nlist.push(sect);
+        nlist.extend_from_slice(&0u16.to_le_bytes());
+        nlist.extend_from_slice(&addr.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[test]
+fn the_locals_in_parallel_are_the_locals_one_by_one() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let names: Vec<String> = (0..10_000)
+        .map(|nth| {
+            let len = (next() % 120) as usize;
+            let body: String = (0..len).map(|_| char::from(b'a' + (next() % 26) as u8)).collect();
+            if nth % 5 == 0 { format!("\x01{body}") } else { body }
+        })
+        .collect();
+    let sect = |addr: u64, _: &str| -> Result<u8, crate::LinkError> { Ok((addr % 7) as u8 + 1) };
+    let failing = |addr: u64, name: &str| -> Result<u8, crate::LinkError> {
+        if addr % 4099 == 4098 {
+            return Err(crate::LinkError { function: None, what: format!("{name} at {addr:#x}") });
+        }
+        Ok(1)
+    };
+    for count in [0, 1, 4095, 4096, 4097, 10_000] {
+        let locals: Vec<(u64, &str)> =
+            (names[..count].iter().enumerate()).map(|(nth, it)| (0x1000 + nth as u64, it.as_str())).collect();
+        let (mut strings, mut nlist) = (b" \0".to_vec(), vec![0xaa; 32]);
+        let (mut want_strings, mut want_nlist) = (strings.clone(), nlist.clone());
+        super::locals_into(&locals, &sect, &mut strings, &mut nlist).unwrap();
+        locals_one_by_one(&locals, &sect, &mut want_strings, &mut want_nlist).unwrap();
+        assert_eq!(strings, want_strings, "{count} locals: the names");
+        assert_eq!(nlist, want_nlist, "{count} locals: the entries");
+
+        let ours = super::locals_into(&locals, &failing, &mut Vec::new(), &mut Vec::new());
+        let theirs = locals_one_by_one(&locals, &failing, &mut Vec::new(), &mut Vec::new());
+        assert_eq!(ours.map_err(|it| it.what), theirs.map_err(|it| it.what), "{count} locals: the first error");
     }
 }

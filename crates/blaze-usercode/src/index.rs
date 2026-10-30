@@ -12,11 +12,15 @@
 //! The store never replaces a value, so the chain only grows, a slot at a time; two daemons
 //! that keep different shapes in one slot see the [`Mismatch`] and move to the next.
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{Tag, frame};
 
 use crate::{
     RunKey,
@@ -35,24 +39,28 @@ pub struct Shape {
 }
 
 impl Shape {
+    /// The shape of `traced`, in the order [`trace::normalize`] leaves it, which is sorted by
+    /// reference and never copied: the shape owns only its names.
     pub fn of(traced: &Traced) -> Shape {
-        let mut traced = traced.clone();
-        trace::normalize(&mut traced);
-        let all = traced.env.iter().any(|it| it.0 == ALL_ENV_NAME);
-        // The variables a run that read them all saw are any the environment has then; what
-        // it asked for by name and was not there is named still.
-        let env: Vec<OsString> = traced
-            .env
-            .into_iter()
-            .filter(|(name, value)| !all || name == ALL_ENV_NAME || value.is_none())
-            .map(|it| it.0)
-            .collect();
-        Shape {
-            files: traced.files.into_iter().map(|it| it.0).collect(),
-            dirs: traced.dirs.into_iter().map(|it| it.0).collect(),
-            env,
-            untraceable: traced.untraceable,
-        }
+        frame::task(Tag::Usercode, |frame| {
+            let env = trace::sorted_in(&traced.env, frame);
+            let all = env.iter().any(|it| it.0 == ALL_ENV_NAME);
+            // The variables a run that read them all saw are any the environment has then;
+            // what it asked for by name and was not there is named still.
+            let env = env
+                .iter()
+                .filter(|(name, value)| !all || name == ALL_ENV_NAME || value.is_none())
+                .map(|it| it.0.clone()) // clone: the names the shape keeps
+                .collect(); // alloc: the shape the caller keeps
+            Shape {
+                // clone: the paths the shape keeps
+                files: trace::sorted_in(&traced.files, frame).iter().map(|it| it.0.clone()).collect(),
+                // clone: the paths the shape keeps
+                dirs: trace::sorted_in(&traced.dirs, frame).iter().map(|it| it.0.clone()).collect(),
+                env,
+                untraceable: trace::sorted_in(&traced.untraceable, frame).into_iter().copied().collect(), // alloc: kept
+            }
+        })
     }
 
     /// The inputs of this shape as `inputs` has them: what a run that read them would have
@@ -85,7 +93,7 @@ impl Shape {
                 traced.env.push((ALL_ENV_NAME.into(), Some(trace::names_hash(all).into())));
                 traced.env.extend(all.iter().map(|(name, value)| (name.clone(), Some(value.clone()))));
             } else {
-                traced.env.push((name.clone(), inputs.env(name)));
+                traced.env.push((name.clone(), inputs.env(name).map(OsStr::to_owned)));
             }
         }
         traced.untraceable = self.untraceable.clone();
@@ -102,12 +110,12 @@ impl Shape {
         for list in [&self.files, &self.dirs] {
             out.extend_from_slice(&(list.len() as u64).to_le_bytes());
             for path in list {
-                part(&mut out, trace::os_bytes(path.as_os_str()));
+                part(&mut out, &trace::os_bytes(path.as_os_str()));
             }
         }
         out.extend_from_slice(&(self.env.len() as u64).to_le_bytes());
         for name in &self.env {
-            part(&mut out, trace::os_bytes(name));
+            part(&mut out, &trace::os_bytes(name));
         }
         out.extend_from_slice(&(self.untraceable.len() as u64).to_le_bytes());
         for it in &self.untraceable {
@@ -144,7 +152,9 @@ impl Shape {
     }
 }
 
-const SHAPE_MAGIC: &[u8; 16] = b"blaze v2 shape 1";
+/// Another on Windows, whose names are [`trace::os_bytes`]' UTF-16 units: a shape of an
+/// older blaze's bytes there is not one.
+const SHAPE_MAGIC: &[u8; 16] = if cfg!(windows) { b"blaze v2 shape 2" } else { b"blaze v2 shape 1" };
 
 /// The key of slot `n` of `run`'s chain of shapes.
 pub fn slot(run: &RunKey, n: u32) -> Key {
@@ -235,9 +245,11 @@ enum Keyed<E> {
 ///
 /// What it hashes is what [`RunKey::traced`] of [`Shape::values`] hashes: the shape is the
 /// normalized order, and the whole environment, sorted as [`Inputs::env_all`] lends it, is
-/// merged into the names the run asked for by the same order.
+/// merged into the names the run asked for by the same order, the names' own (on Windows
+/// not their bytes').
 fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option<ContentId>, Keyed<I::Error>> {
     let bad = Keyed::NotAShape;
+    let all_name = trace::os_bytes(OsStr::new(ALL_ENV_NAME));
     let rest = bytes.strip_prefix(SHAPE_MAGIC.as_slice()).ok_or_else(|| bad("not a shape".to_owned()))?;
     let mut at = At(rest);
     let mut keyer = trace::Keyer::new(run);
@@ -271,34 +283,36 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
     let mut asked = At(at.0);
     let mut whole = false;
     for _ in 0..names {
-        whole |= asked.part().map_err(bad)? == ALL_ENV_NAME.as_bytes();
+        whole |= asked.part().map_err(bad)? == &*all_name;
     }
     if whole {
         let all = inputs.env_all();
         let hex = trace::names_hex(all);
+        let hex = trace::os_bytes(OsStr::new(std::str::from_utf8(&hex).expect("a hash in hex is ASCII")));
         let mut all = all.iter().peekable();
         for _ in 0..names {
             let name = at.part().map_err(bad)?;
-            while let Some((set, value)) = all.next_if(|it| trace::os_bytes(&it.0) < name) {
-                keyer.env(trace::os_bytes(set), Some(trace::os_bytes(value)));
+            let named = trace::os_in(name).map_err(bad)?;
+            while let Some((set, value)) = all.next_if(|it| it.0.as_os_str() < &*named) {
+                keyer.env(&trace::os_bytes(set), Some(&*trace::os_bytes(value)));
             }
-            if name == ALL_ENV_NAME.as_bytes() {
-                keyer.env(name, Some(hex.as_slice()));
-            } else if let Some((_, value)) = all.next_if(|it| trace::os_bytes(&it.0) == name) {
-                keyer.env(name, Some(trace::os_bytes(value)));
+            if name == &*all_name {
+                keyer.env(name, Some(&*hex));
+            } else if let Some((_, value)) = all.next_if(|it| it.0.as_os_str() == &*named) {
+                keyer.env(name, Some(&*trace::os_bytes(value)));
             } else {
                 // What the whole environment has not is not set.
                 keyer.env(name, None);
             }
         }
         for (set, value) in all {
-            keyer.env(trace::os_bytes(set), Some(trace::os_bytes(value)));
+            keyer.env(&trace::os_bytes(set), Some(&*trace::os_bytes(value)));
         }
     } else {
         for _ in 0..names {
             let name = at.part().map_err(bad)?;
-            let value = inputs.env(&trace::os_in(name).map_err(bad)?);
-            keyer.env(name, value.as_deref().map(trace::os_bytes));
+            let value = inputs.env(&trace::os_in(name).map_err(bad)?).map(trace::os_bytes);
+            keyer.env(name, value.as_deref());
         }
     }
     for _ in 0..at.len().map_err(bad)? {
@@ -361,7 +375,7 @@ pub fn untraceable(traced: &Traced) -> bool {
 }
 /// The content ID of a shape, for an explanation of a rerun.
 pub fn shape_id(shape: &Shape) -> ContentId {
-    ContentId::of("blaze v2 shape id 1", &shape.encode())
+    ContentId::of(trace::os_domain!("blaze v2 shape id 1"), &shape.encode())
 }
 
 #[cfg(test)]
@@ -417,15 +431,15 @@ mod tests {
             fn dir(&mut self, _: &Path) -> Result<Option<[u8; 32]>, ()> {
                 Ok(None)
             }
-            fn env(&mut self, name: &OsStr) -> Option<OsString> {
-                self.0.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+            fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+                self.0.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
             }
             fn env_all(&mut self) -> &[(OsString, OsString)] {
                 self.0.sort();
                 &self.0
             }
-            fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, ()> {
-                Ok(None)
+            fn names(&mut self, _: &Path, _: &mut trace::Names<'_>) -> Result<bool, ()> {
+                Ok(false)
             }
         }
         let lines = [Line::new(Seen::Env, "", "*"), Line::new(Seen::Env, "", "UNSET"), Line::new(Seen::Env, "", "A")];
@@ -459,15 +473,15 @@ mod tests {
             fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
                 Ok(self.dirs.get(path).copied())
             }
-            fn env(&mut self, name: &OsStr) -> Option<OsString> {
-                self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+            fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+                self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
             }
             fn env_all(&mut self) -> &[(OsString, OsString)] {
                 self.env.sort();
                 &self.env
             }
-            fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, ()> {
-                Ok(None)
+            fn names(&mut self, _: &Path, _: &mut trace::Names<'_>) -> Result<bool, ()> {
+                Ok(false)
             }
         }
         let run = RunKey { code: ContentId::of("blaze v2 test 1", b"run"), given: ContentId::default() };
@@ -508,6 +522,55 @@ mod tests {
             gone.dirs.clear();
             assert_eq!(keyed(&shape, &run, &mut gone).ok().unwrap(), None);
         }
+    }
+
+    /// A check of a kept run's shape, whose files, directories and variables are as they were,
+    /// allocates nothing: the shape is read in place, each value lent and hashed into the key.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_check_of_a_shape_allocates_nothing() {
+        use std::{collections::BTreeMap, ffi::OsStr};
+
+        struct World {
+            files: BTreeMap<PathBuf, [u8; 32]>,
+            dirs: BTreeMap<PathBuf, [u8; 32]>,
+            env: Vec<(OsString, OsString)>,
+        }
+        impl Inputs for World {
+            type Error = ();
+            fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(self.files.get(path).copied())
+            }
+            fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(self.dirs.get(path).copied())
+            }
+            fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+                self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
+            }
+            fn env_all(&mut self) -> &[(OsString, OsString)] {
+                &self.env
+            }
+            fn names(&mut self, _: &Path, _: &mut trace::Names<'_>) -> Result<bool, ()> {
+                Ok(false)
+            }
+        }
+        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"run"), given: ContentId::default() };
+        let traced = Traced {
+            files: vec![("/a".into(), Some([1; 32])), ("/gone".into(), None)],
+            dirs: vec![("/d".into(), [3; 32])],
+            env: vec![("A".into(), Some("1".into())), ("UNSET".into(), None)],
+            untraceable: vec![],
+        };
+        let shape = Shape::of(&traced).encode();
+        let mut world = World {
+            files: [("/a".into(), [1; 32])].into(),
+            dirs: [("/d".into(), [3; 32])].into(),
+            env: vec![("A".into(), "1".into())],
+        };
+        let key = blaze_alloc_count::assert_at_most(0, "a kept run's shape checked", || {
+            keyed(&shape, &run, &mut world).ok().unwrap()
+        });
+        assert_eq!(key, Some(run.traced(&traced)));
     }
 
     #[test]

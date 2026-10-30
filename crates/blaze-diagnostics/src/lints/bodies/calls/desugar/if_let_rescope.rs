@@ -76,7 +76,7 @@ impl LatePass for IfLetRescope {
                 Expr::Block { statements, tail, .. } => {
                     for statement in statements {
                         if let Statement::Expr { expr, .. } = statement {
-                            place(*expr, Parent::Stmt);
+                            place(expr, Parent::Stmt);
                         }
                     }
                     if let Some(tail) = tail {

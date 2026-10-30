@@ -3,39 +3,34 @@
 //! comparisons the last runs made, and a splice of two corpus inputs. Up to five stacked on a
 //! copy of a corpus input, as libFuzzer's `MutateDepth`.
 
+use blaze_ids::rng::SplitMix64;
+
 use crate::raw;
 
-/// xorshift64*, seeded: a run with the same seed and corpus makes the same inputs.
-pub(crate) struct Random(u64);
+/// Seeded: a run with the same seed and corpus makes the same inputs.
+pub(crate) struct Random(SplitMix64);
 
 impl Random {
     pub(crate) fn new(seed: u64) -> Self {
-        // splitmix64 of the seed, never 0.
-        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        Random((z ^ (z >> 31)) | 1)
+        Random(SplitMix64::new(seed))
     }
 
     pub(crate) fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        self.0.next_u64()
     }
 
     /// A number below `bound` (0 when `bound` is 0).
     pub(crate) fn below(&mut self, bound: usize) -> usize {
-        self.below_u64(bound as u64) as usize
+        self.0.index(bound)
     }
 
-    /// A number below `bound` (0 when `bound` is 0), by Lemire's multiply and shift.
+    /// A number below `bound` (0 when `bound` is 0).
     pub(crate) fn below_u64(&mut self, bound: u64) -> u64 {
-        ((self.next() as u128 * bound as u128) >> 64) as u64
+        self.0.below(bound)
     }
 
     fn chance(&mut self, one_in: usize) -> bool {
-        self.below(one_in) == 0
+        self.0.one_in(one_in as u64)
     }
 
     fn byte(&mut self) -> u8 {

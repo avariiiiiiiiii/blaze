@@ -4,7 +4,7 @@
 //! The `TokenTree` is semantically a tree, but for performance reasons it is stored as a flat structure.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -35,7 +35,8 @@ pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{
-    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, WireError, WirePart,
+    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, TreeWords, ViewWords, WireError,
+    WirePart,
 };
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;

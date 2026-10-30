@@ -37,7 +37,7 @@ pub mod timings;
 
 use std::sync::LazyLock;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::radix;
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -87,7 +87,7 @@ pub fn mode() -> Mode {
 
 /// `BLAZE_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
 /// `BLAZE_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
-pub(crate) fn debugging(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> bool {
+pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
     let Ok(wanted) = std::env::var("BLAZE_BORROWCK_DEBUG") else { return false };
     match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) if wanted != "1" => {
@@ -106,9 +106,125 @@ pub struct BorrowckDiagnostic {
     /// Reported at the function's signature rather than at `span`, as rustc reports an
     /// `impl Trait`'s hidden type.
     pub at_signature: bool,
+    /// rustc's `span_label`s, in the order rustc adds them; one at `span` is the primary
+    /// span's own.
+    pub labels: Vec<(PartSpan, String)>,
+    /// rustc's notes and helps, in the order rustc adds them.
+    pub children: Vec<Child>,
+    /// rustc's suggestions, in the order rustc adds them.
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// Where a part of a [`BorrowckDiagnostic`] points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PartSpan {
+    At(MirSpan),
+    /// The empty span where `span`'s source starts, where a suggestion inserts before it.
+    Before(MirSpan),
+    /// The empty span where `span`'s source ends.
+    After(MirSpan),
+    /// From where the first expression's source starts to where the second's, an expression
+    /// inside it, starts: the `&` or `*` a suggestion removes.
+    Head(ExprId, ExprId),
+    /// From where the second expression's source ends to where the first's ends.
+    Tail(ExprId, ExprId),
+    /// The name a method call calls, rustc's span of the callee of a method call.
+    MethodName(ExprId),
+    /// A closure's or coroutine's head, rustc's `fn_decl_span`: from its start through its
+    /// parameters and return type, or `async`/`gen` and `move` of a block.
+    ClosureHead(ExprId),
+    /// rustc's `def_span` of the type: its head, up to its name and generics.
+    Def(hir_def::AdtId),
+}
+
+/// rustc's `Level` of a note or help.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Sublevel {
+    Note,
+    Help,
+}
+
+/// rustc's `Applicability` of a suggestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Applicability {
+    MachineApplicable,
+    MaybeIncorrect,
+    HasPlaceholders,
+    Unspecified,
+}
+
+/// A note or help: rustc's `span_note` and `note`, with no span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub level: Sublevel,
+    pub message: String,
+    pub spans: Vec<PartSpan>,
+    /// Labels of spans of the child's `MultiSpan`, which need not be among `spans`.
+    pub labels: Vec<(PartSpan, String)>,
+}
+
+/// A suggested edit: each part replaces the source of its span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suggestion {
+    pub message: String,
+    pub parts: Vec<(PartSpan, String)>,
+    pub applicability: Applicability,
+    /// rustc's `span_suggestion_verbose` (`SuggestionStyle::ShowAlways`): shown as a diff of
+    /// its own, never inline in the message.
+    pub verbose: bool,
 }
 
 impl BorrowckDiagnostic {
+    /// A diagnostic with no labels, notes or suggestions.
+    pub fn new(code: &'static str, span: MirSpan, message: String) -> Self {
+        BorrowckDiagnostic {
+            code,
+            span,
+            message,
+            at_signature: false,
+            labels: Vec::new(),
+            children: Vec::new(),
+            suggestions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn label(&mut self, span: PartSpan, text: impl Into<String>) {
+        self.labels.push((span, text.into()));
+    }
+
+    pub(crate) fn note(&mut self, message: impl Into<String>) {
+        self.children.push(Child {
+            level: Sublevel::Note,
+            message: message.into(),
+            spans: Vec::new(),
+            labels: Vec::new(),
+        });
+    }
+
+    pub(crate) fn help(&mut self, message: impl Into<String>) {
+        self.children.push(Child {
+            level: Sublevel::Help,
+            message: message.into(),
+            spans: Vec::new(),
+            labels: Vec::new(),
+        });
+    }
+
+    pub(crate) fn suggest(
+        &mut self,
+        message: impl Into<String>,
+        parts: Vec<(PartSpan, String)>,
+        applicability: Applicability,
+        verbose: bool,
+    ) {
+        self.suggestions.push(Suggestion {
+            message: message.into(),
+            parts,
+            applicability,
+            verbose,
+        });
+    }
+
     /// An error, which keeps the body out of any build (cargo's rule), not a lint: rustc gives
     /// some errors no code ("lifetime may not live long enough"), and a lint a lowercase name.
     pub fn is_error(&self) -> bool {
@@ -155,12 +271,12 @@ impl NotChecked {
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
 #[salsa::tracked(returns(ref))]
-pub fn borrowck<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> BorrowckResult {
+pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     borrowck_in_mode(db, def, mode())
 }
 
 /// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.
-pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
+pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         result.not_checked = Some(NotChecked::Off);
@@ -206,7 +322,7 @@ pub fn borrowck_in_mode(db: &dyn HirDatabase, def: DefWithBodyId, mode: Mode) ->
 /// or a const generic argument or default, which rustc checks as a body of its own.
 #[salsa::tracked(returns(ref))]
 pub fn borrowck_anon_const<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     konst: hir_ty::db::AnonConstId<'db>,
 ) -> BorrowckResult {
     if konst.is_inline_const(db) {
@@ -226,7 +342,7 @@ pub fn borrowck_anon_const<'db>(
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
 /// `def` is the item when it is one, not a constant of a signature.
 fn check_owner<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
     mode: Mode,
@@ -434,7 +550,7 @@ enum Nested<'db> {
 /// The closures, `async` blocks and `const { .. }` blocks written directly in the body written
 /// as `at` (the owner's for `None`), not in another of them, reached or not.
 fn nested_bodies_written<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,
@@ -483,7 +599,7 @@ fn nested_bodies_written<'db>(
 
 /// The `const { .. }` blocks `body` evaluates, in the order it does.
 fn inline_consts<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
 ) -> Vec<hir_ty::db::AnonConstId<'db>> {
     use hir_ty::next_solver::{AnonConstIdWrapper, ConstKind};
@@ -508,7 +624,7 @@ fn inline_consts<'db>(
 
 /// What the checks ask of the types and the source of a body.
 pub(crate) struct Ctx<'a, 'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) owner: InferBodyId<'db>,
     pub(crate) infcx: InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
@@ -552,7 +668,7 @@ pub(crate) struct Upvar {
 
 impl<'a, 'db> Ctx<'a, 'db> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         owner: InferBodyId<'db>,
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
@@ -717,6 +833,19 @@ impl<'a, 'db> Ctx<'a, 'db> {
         known
     }
 
+    /// rustc's `implements_clone`: `ty` is `Clone` modulo regions. Asked only as an error is
+    /// reported.
+    pub(crate) fn implements_clone(&self, ty: Ty<'db>) -> bool {
+        use hir_ty::next_solver::infer::select::EvaluationResult;
+        let interner = self.infcx.interner;
+        let Some(clone) = interner.lang_items().Clone else { return false };
+        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        matches!(
+            self.infcx.type_implements_trait(clone, [ty], self.env),
+            EvaluationResult::EvaluatedToOk | EvaluationResult::EvaluatedToOkModuloRegions
+        )
+    }
+
     /// The place `operand` moves out of. Lowering says a value a closure captures by value is
     /// moved even when its type is `Copy`.
     pub(crate) fn moved_place<'o>(
@@ -750,7 +879,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
 /// the environment, and after an edit.
 #[salsa::tracked]
 fn is_copy_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
     ty: hir_ty::next_solver::StoredTy,
 ) -> bool {
@@ -764,7 +893,7 @@ fn is_copy_query(
 /// its variants: a query as [`is_copy_query`] is.
 #[salsa::tracked]
 fn drop_glue_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
     ty: hir_ty::next_solver::StoredTy,
 ) -> u8 {

@@ -18,6 +18,7 @@ use crate::{
             ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData,
             TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
         },
+        columns::{Checked, below, raw},
         persist::{Code, Read, Words},
     },
     signatures::{
@@ -25,7 +26,7 @@ use crate::{
         ImplSignature, InactiveEnumVariantCode, StaticSignature, StructSignature,
         TraitSignature, TypeAliasSignature, UnionSignature, VariantFields,
     },
-    type_ref::TraitRef,
+    type_ref::{ConstRef, LifetimeRefId, PathId, TraitRef, TypeBound, TypeRef, TypeRefId},
 };
 
 /// One signature query, as a record holds its value.
@@ -82,6 +83,82 @@ fn get_arena<T: Code>(r: &mut Read<'_>) -> Result<Arena<T>, FormatError> {
         arena.alloc(r.get()?);
     }
     Ok(arena)
+}
+
+/// What `params` (defaults, const params' types, where predicates) and `bounds` name in
+/// `store`. A record and its store are read from buffers of their own, and the store's read
+/// checks only its own columns, so a record's ids are checked here before the signature is used:
+/// ids below their arenas, `for<..>` and `use<..>` runs inside the store's paths.
+fn in_store(store: &ExpressionStore, params: &GenericParams, bounds: &[TypeBound]) -> Checked {
+    let (types, lifetimes) = (&store.types, store.lifetimes.len());
+    let ids = Ids(store);
+    for (_, param) in params.type_or_consts.iter() {
+        match param {
+            TypeOrConstParamData::TypeParamData(it) => ids.types(it.default)?,
+            TypeOrConstParamData::ConstParamData(it) => {
+                ids.ty(it.ty)?;
+                it.default.map_or(Ok(()), |it| ids.konst(it))?;
+            }
+        }
+    }
+    let lifetime = |id: LifetimeRefId| {
+        below(raw(id), lifetimes, "a where predicate's lifetime past its arena")
+    };
+    for predicate in params.where_predicates.iter() {
+        match *predicate {
+            WherePredicate::TypeBound { lifetimes: binder, target, bound } => {
+                below(raw(target), types.len(), "a where predicate's type past its arena")?;
+                binder.map_or(Ok(()), |names| types.paths.check_names(names))?;
+                types.check_outside_bound(&bound, lifetimes)?;
+            }
+            WherePredicate::Lifetime { target, bound } => {
+                lifetime(target)?;
+                lifetime(bound)?;
+            }
+        }
+    }
+    bounds.iter().try_for_each(|bound| types.check_outside_bound(bound, lifetimes))
+}
+
+fn check_in_store(
+    store: &ExpressionStore,
+    params: &GenericParams,
+    bounds: &[TypeBound],
+    r: &Read<'_>,
+) -> Result<(), FormatError> {
+    check(in_store(store, params, bounds), r)
+}
+
+fn check(checked: Checked, r: &Read<'_>) -> Result<(), FormatError> {
+    checked.map_err(|what| r.invalid(what))
+}
+
+/// A record's own ids in its store, beside its generics: each below its arena, and an impl's
+/// trait a path.
+struct Ids<'a>(&'a ExpressionStore);
+
+impl Ids<'_> {
+    fn ty(&self, id: TypeRefId) -> Checked {
+        below(raw(id), self.0.types.len(), "a record's type past its store")
+    }
+
+    fn types(&self, ids: impl IntoIterator<Item = TypeRefId>) -> Checked {
+        ids.into_iter().try_for_each(|id| self.ty(id))
+    }
+
+    /// The store's own read checked what each type holds, so the type of an id below the
+    /// arena decodes.
+    fn path(&self, id: PathId) -> Checked {
+        self.ty(id.type_ref())?;
+        match self.0.types.get(id.type_ref()) {
+            TypeRef::Path(_) => Ok(()),
+            _ => Err("a record's trait that is not a path"),
+        }
+    }
+
+    fn konst(&self, it: ConstRef) -> Checked {
+        below(raw(it.expr), self.0.expr_count(), "a record's constant past its store")
+    }
 }
 
 impl Code for TypeParamProvenance {
@@ -288,13 +365,16 @@ impl Sig for Struct {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(StructSignature {
+        let signature = StructSignature {
             name: r.get()?,
             generic_params: r.get()?,
             flags: get_flags(r)?,
             shape: r.get()?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -321,12 +401,15 @@ impl Sig for Union {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(UnionSignature {
+        let signature = UnionSignature {
             name: r.get()?,
             generic_params: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -353,12 +436,15 @@ impl Sig for Enum {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(EnumSignature {
+        let signature = EnumSignature {
             name: r.get()?,
             generic_params: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -385,12 +471,15 @@ impl Sig for Const {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(ConstSignature {
+        let signature = ConstSignature {
             name: r.get()?,
             type_ref: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check(Ids(&signature.store).ty(signature.type_ref), r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -417,12 +506,15 @@ impl Sig for Static {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(StaticSignature {
+        let signature = StaticSignature {
             name: r.get()?,
             type_ref: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check(Ids(&signature.store).ty(signature.type_ref), r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -450,13 +542,19 @@ impl Sig for Impl {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(ImplSignature {
+        let signature = ImplSignature {
             generic_params: r.get()?,
             self_ty: r.get()?,
             target_trait: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        let ids = Ids(&signature.store);
+        check(ids.ty(signature.self_ty), r)?;
+        check(signature.target_trait.map_or(Ok(()), |it| ids.path(it.path)), r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -483,12 +581,15 @@ impl Sig for Trait {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(TraitSignature {
+        let signature = TraitSignature {
             name: r.get()?,
             generic_params: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -518,7 +619,7 @@ impl Sig for Function {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(FunctionSignature {
+        let signature = FunctionSignature {
             name: r.get()?,
             generic_params: r.get()?,
             params: r.get()?,
@@ -526,7 +627,12 @@ impl Sig for Function {
             abi: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &[], r)?;
+        let types = signature.params.iter().copied().chain(signature.ret_type);
+        check(Ids(&signature.store).types(types), r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -555,14 +661,18 @@ impl Sig for TypeAlias {
         store: Option<ExpressionStore>,
         _: &CfgOptions,
     ) -> Result<Self::Value, FormatError> {
-        Ok(Arc::new(TypeAliasSignature {
+        let signature = TypeAliasSignature {
             name: r.get()?,
             generic_params: r.get()?,
             bounds: r.get()?,
             ty: r.get()?,
             flags: get_flags(r)?,
             store: needs(store, r)?,
-        }))
+        };
+        check_in_store(&signature.store, &signature.generic_params, &signature.bounds, r)?;
+        check(Ids(&signature.store).types(signature.ty), r)?;
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(signature))
     }
 }
 
@@ -590,7 +700,14 @@ impl Sig for Fields {
     ) -> Result<Self::Value, FormatError> {
         let fields = get_arena(r)?;
         let shape = r.get()?;
-        Ok(Arc::new(VariantFields::from_parts(fields, needs(store, r)?, shape)))
+        let value = VariantFields::from_parts(fields, needs(store, r)?, shape);
+        let ids = Ids(&value.store);
+        for field in value.fields().values() {
+            check(ids.ty(field.type_ref), r)?;
+            check(field.default_value.map_or(Ok(()), |it| ids.konst(it)), r)?;
+        }
+        // alloc: the `Arc` the signature query returns, once per item asked.
+        Ok(Arc::new(value))
     }
 }
 
@@ -644,9 +761,123 @@ impl Sig for Variants {
         let len = r.len()?;
         let mut inactive = ThinVec::with_capacity(len);
         for _ in 0..len {
-            let cfg_expr = r.get()?;
-            inactive.push(InactiveEnumVariantCode { cfg: cfg_expr, opts: cfg.clone(), ast_id: r.get()? });
+            let (cfg_expr, ast_id) = (r.get()?, r.get()?);
+            // clone: each inactive variant holds the crate's options, as lowering gives it.
+            inactive.push(InactiveEnumVariantCode { cfg: cfg_expr, opts: cfg.clone(), ast_id });
         }
         Ok((EnumVariants::from_parts(variants, &explicit), inactive))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_fixture::WithFixture;
+
+    use super::*;
+    use crate::{
+        ModuleDefId,
+        expr_store::path::{Names, UseArgs},
+        hir::columns::idx,
+        nameres::crate_def_map,
+        test_db::{TestDB, TestDBExt},
+    };
+
+    #[test]
+    fn a_where_predicate_or_bound_past_its_store_is_refused() {
+        let db = TestDB::with_files(
+            "trait Tr<'a> {}\nfn f<'x, T>() where for<'a> T: Tr<'a>, T: 'x, 'x: 'x {}",
+        );
+        let krate = db.fetch_test_crate();
+        let def_map = crate_def_map(&db, krate);
+        let mut function = None;
+        for (_, module) in def_map.modules(&db) {
+            for decl in module.scope(&db).declarations() {
+                if let ModuleDefId::FunctionId(it) = decl {
+                    function = Some(it);
+                }
+            }
+        }
+        let (signature, _) = FunctionSignature::with_source_map(&db, function.expect("`f`"));
+        let (store, params) = (&signature.store, &signature.generic_params);
+        assert_eq!(in_store(store, params, &[]), Ok(()));
+
+        let (binder, target, bound) = (params.where_predicates.iter())
+            .find_map(|it| match *it {
+                WherePredicate::TypeBound { lifetimes: Some(names), target, bound } => {
+                    Some((names, target, bound))
+                }
+                _ => None,
+            })
+            .expect("the `for<'a>` predicate");
+        let one = |predicate: WherePredicate| GenericParams {
+            where_predicates: Box::new([predicate]),
+            ..GenericParams::default()
+        };
+        let none = GenericParams::default();
+        let ok = WherePredicate::TypeBound { lifetimes: Some(binder), target, bound };
+        assert_eq!(in_store(store, &one(ok), &[]), Ok(()));
+
+        let names = store.types.paths.names.len() as u32;
+        let past = Names { start: names, len: 1 };
+        let past = WherePredicate::TypeBound { lifetimes: Some(past), target, bound };
+        assert!(in_store(store, &one(past), &[]).is_err(), "a `for<..>` run past the names");
+
+        let types = store.types.len() as u32;
+        let past = WherePredicate::TypeBound { lifetimes: None, target: idx(types), bound };
+        assert!(in_store(store, &one(past), &[]).is_err(), "a target past the types");
+
+        let lifetimes = store.lifetimes.len() as u32;
+        let past = WherePredicate::Lifetime { target: idx(lifetimes), bound: idx(0) };
+        assert!(in_store(store, &one(past), &[]).is_err(), "a lifetime past its arena");
+
+        let past = TypeBound::Lifetime(idx(lifetimes));
+        assert!(in_store(store, &none, &[past]).is_err(), "a bound's lifetime past its arena");
+
+        let uses = store.types.paths.use_args.len() as u32;
+        let past = TypeBound::Use(UseArgs { start: 0, len: uses + 1 });
+        assert!(in_store(store, &none, &[past]).is_err(), "a `use<..>` run past its table");
+    }
+
+    #[test]
+    fn a_record_id_past_its_store_is_refused() {
+        let db = TestDB::with_files("fn f<const C: usize = 1>(_: (), _: u8) {}");
+        let krate = db.fetch_test_crate();
+        let mut function = None;
+        for (_, module) in crate_def_map(&db, krate).modules(&db) {
+            for decl in module.scope(&db).declarations() {
+                if let ModuleDefId::FunctionId(it) = decl {
+                    function = Some(it);
+                }
+            }
+        }
+        let (signature, _) = FunctionSignature::with_source_map(&db, function.expect("`f`"));
+        let store = &signature.store;
+        assert_eq!(in_store(store, &signature.generic_params, &[]), Ok(()));
+        let ids = Ids(store);
+        assert_eq!(ids.types(signature.params.iter().copied()), Ok(()));
+
+        let types = store.types.len() as u32;
+        assert!(ids.ty(idx(types)).is_err(), "a type past its arena");
+        let path = PathId::from_type_ref_unchecked;
+        let (mut paths, mut others) = (0, 0);
+        for (id, ty) in store.types.iter() {
+            match ty {
+                TypeRef::Path(_) => {
+                    assert_eq!(ids.path(path(id)), Ok(()));
+                    paths += 1;
+                }
+                _ => {
+                    assert!(ids.path(path(id)).is_err(), "{ty:?} as a trait");
+                    others += 1;
+                }
+            }
+        }
+        assert!(paths > 0 && others > 0, "the fixture has a path type and a tuple type");
+        assert!(ids.path(path(idx(types))).is_err(), "a trait past the types");
+
+        let exprs = store.expr_count() as u32;
+        assert!(exprs > 0, "the const param's default is an expression");
+        assert_eq!(ids.konst(ConstRef { expr: idx(0) }), Ok(()));
+        assert!(ids.konst(ConstRef { expr: idx(exprs) }).is_err(), "a constant past its store");
     }
 }

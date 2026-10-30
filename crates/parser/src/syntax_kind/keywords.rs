@@ -147,20 +147,30 @@ const CONTEXTUAL_LENGTHS: (usize, usize) = lengths(&CONTEXTUAL_NAMES);
 
 blaze_phf::phf_table!(static CONTEXTUAL_TABLE = &CONTEXTUAL_NAMES;);
 
-/// An identifier of 2 to 8 bytes as one word: the 2-byte pairs at 0, `min(2, len - 2)`,
-/// `len - 4` (or 0) and `len - 2`. They cover every byte at offsets fixed by the length, so for
-/// one length the window is the bytes.
+/// An identifier of 2 to 8 bytes as one word, its bytes little-endian and zero above them, read
+/// without going past its end: the 2-byte pairs at 0, `min(2, len - 2)`, `len - 4` (or 0) and
+/// `len - 2` cover every byte, and each is or-ed in at its own offset.
 #[inline(always)]
 const fn window(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let second = if len - 2 < 2 { len - 2 } else { 2 };
     let third = len.saturating_sub(4);
-    pair(bytes, 0) | pair(bytes, second) << 16 | pair(bytes, third) << 32 | pair(bytes, len - 2) << 48
+    pair(bytes, 0) | pair(bytes, second) | pair(bytes, third) | pair(bytes, len - 2)
 }
 
 #[inline(always)]
 const fn pair(bytes: &[u8], at: usize) -> u64 {
-    bytes[at] as u64 | (bytes[at + 1] as u64) << 8
+    (bytes[at] as u64 | (bytes[at + 1] as u64) << 8) << (8 * at)
+}
+
+/// [`window`] of `text[start..start + len]` (`len` 2 to 8) with one 8-byte load, when `text`
+/// has 8 bytes at `start`.
+#[inline(always)]
+fn window_in(text: &[u8], start: usize, len: usize) -> u64 {
+    match text.get(start..).and_then(<[u8]>::first_chunk::<8>) {
+        Some(eight) => u64::from_le_bytes(*eight) & (u64::MAX >> (64 - 8 * len)),
+        None => window(&text[start..start + len]),
+    }
 }
 
 #[inline(always)]
@@ -180,7 +190,7 @@ struct StrictEntry {
 /// its own among 256. The sequence is a constant, so the table is the same in every build.
 const STRICT_MULTIPLIER: u64 = {
     assert!(STRICT_LENGTHS.0 >= 2 && STRICT_LENGTHS.1 <= 8, "a window holds 2 to 8 bytes");
-    assert!(STRICT.len() < 255, "slot 255 is free");
+    assert!(STRICT.len() < 256, "an entry's index, the empty slots' included, is a u8");
     let mut multiplier: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut tries = 0;
     loop {
@@ -199,7 +209,10 @@ const STRICT_MULTIPLIER: u64 = {
         if i == STRICT.len() {
             break multiplier;
         }
-        multiplier = multiplier.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407) | 1;
+        multiplier = multiplier
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407)
+            | 1;
         tries += 1;
     }
 };
@@ -218,12 +231,13 @@ static STRICT_SLOTS: [u8; 256] = {
 };
 
 static STRICT_ENTRIES: [StrictEntry; STRICT.len() + 1] = {
-    let mut entries =
-        [StrictEntry { window: 0, len: 0, kind: EOF, since: Edition::Edition2015 }; STRICT.len() + 1];
+    let empty = StrictEntry { window: 0, len: 0, kind: EOF, since: Edition::Edition2015 };
+    let mut entries = [empty; STRICT.len() + 1];
     let mut i = 0;
     while i < STRICT.len() {
         let (name, kind, since) = STRICT[i];
-        entries[i] = StrictEntry { window: window(name.as_bytes()), len: name.len() as u8, kind, since };
+        let (window, len) = (window(name.as_bytes()), name.len() as u8);
+        entries[i] = StrictEntry { window, len, kind, since };
         i += 1;
     }
     entries
@@ -237,12 +251,33 @@ pub(super) fn texts() -> impl Iterator<Item = &'static str> {
 /// [`SyntaxKind::from_keyword`].
 #[inline]
 pub(super) fn strict(ident: &str, edition: Edition) -> Option<SyntaxKind> {
-    let len = ident.len();
+    let bytes = ident.as_bytes();
+    let len = bytes.len();
     if len < STRICT_LENGTHS.0 || len > STRICT_LENGTHS.1 {
         return None;
     }
-    let (_, kind, since) = STRICT[STRICT_TABLE.get(ident)?];
-    (since <= edition).then_some(kind)
+    strict_window(window(bytes), len, edition)
+}
+
+/// [`SyntaxKind::from_keyword_in`].
+#[inline]
+pub(super) fn strict_in(
+    text: &[u8],
+    start: usize,
+    len: usize,
+    edition: Edition,
+) -> Option<SyntaxKind> {
+    if len < STRICT_LENGTHS.0 || len > STRICT_LENGTHS.1 {
+        return None;
+    }
+    strict_window(window_in(text, start, len), len, edition)
+}
+
+#[inline(always)]
+fn strict_window(window: u64, len: usize, edition: Edition) -> Option<SyntaxKind> {
+    let entry = STRICT_ENTRIES[STRICT_SLOTS[strict_slot(window, len, STRICT_MULTIPLIER)] as usize];
+    let found = entry.window == window && entry.len as usize == len && entry.since <= edition;
+    found.then_some(entry.kind)
 }
 
 /// [`SyntaxKind::from_contextual_keyword`].
@@ -379,6 +414,13 @@ mod tests {
             idents.push(name.to_uppercase());
             idents.push(name[1..].to_owned());
             idents.push(name[..name.len() - 1].to_owned());
+            idents.push(name.repeat(2));
+            for i in 0..name.len() {
+                let mut changed = name.as_bytes().to_vec();
+                changed[i] ^= 1;
+                idents.extend(String::from_utf8(changed));
+                idents.push(format!("{}{}", &name[..=i], &name[i..]));
+            }
         }
         idents.extend(["", "_", "a", "x", "self_", "Self_", "macro_rules!", "union_", "unions"].map(String::from));
         idents.push("a".repeat(100));
@@ -391,12 +433,48 @@ mod tests {
                     "{ident:?} {edition:?}"
                 );
                 assert_eq!(SyntaxKind::from_keyword(ident, edition), strict_by_match(ident, edition));
+                for text in [format!(" {ident} = x;\n"), format!(" {ident}")] {
+                    assert_eq!(
+                        strict_in(text.as_bytes(), 1, ident.len(), edition),
+                        strict_by_match(ident, edition),
+                        "{text:?} {edition:?}"
+                    );
+                }
                 assert_eq!(
                     SyntaxKind::from_contextual_keyword(ident, edition),
                     contextual_by_match(ident, edition)
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_lookup_allocates_nothing() {
+        let text = "fn main() { let r#type = Self::new(); macro_rules! union {} }".repeat(4);
+        let words: Vec<(usize, usize)> = text
+            .match_indices(|c: char| !c.is_alphanumeric() && c != '_')
+            .scan(0, |start, (at, sep)| {
+                let word = (*start, at - *start);
+                *start = at + sep.len();
+                Some(word)
+            })
+            .filter(|&(_, len)| len > 0)
+            .collect();
+        blaze_alloc_count::assert_at_most(0, "keyword lookups", || {
+            for &(start, len) in &words {
+                for edition in EDITIONS {
+                    let ident = &text[start..start + len];
+                    std::hint::black_box(SyntaxKind::from_keyword(ident, edition));
+                    std::hint::black_box(SyntaxKind::from_keyword_in(
+                        text.as_bytes(),
+                        start,
+                        len,
+                        edition,
+                    ));
+                    std::hint::black_box(SyntaxKind::from_contextual_keyword(ident, edition));
+                }
+            }
+        });
     }
 
     #[test]

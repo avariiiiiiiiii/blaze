@@ -1,19 +1,25 @@
 //! Linux on x86-64 and AArch64: a memory object is a `memfd`, sealed against shrinking and
-//! growing, mapped shared and writable in the daemon. The loader is given a read-only reopen
-//! of it over `SCM_RIGHTS` (`/proc/self/fd/N` opened `O_RDONLY`), so it can map it to read,
-//! execute or copy but never to write it shared; the control object goes as it is.
+//! growing, mapped shared and writable in the daemon. A run process is given a read-only
+//! reopen of a code object over `SCM_RIGHTS` (`/proc/self/fd/N` opened `O_RDONLY`), so it can
+//! map it to read, execute or copy but never to write it shared; the control words and cells
+//! go as they are.
+//!
+//! The start hook lays an overlay over its executable with one `mmap` of `MAP_FIXED`, which
+//! the kernel does under the process's `mmap_lock`: a thread running in the range fetches its
+//! next instruction from the old page or the new one, and the bytes are equal.
 
-use std::ffi::{CString, c_void};
+use std::ffi::{CString, c_int, c_void};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::Mutex;
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-pub(crate) use super::unix::{Listener, Stream, backtrace, connect, protect, random, serialize};
+pub(crate) use super::unix::{Listener, Stream, backtrace, connect, random, serialize};
 use super::Rights;
 use super::unix::protection;
 use crate::channel::Channel;
 use crate::frame::{self, kinds};
+use crate::handshake::Overlay;
 use crate::{Access, Error};
 
 fn os(what: &str) -> Error {
@@ -130,7 +136,7 @@ impl Object {
     }
 
     pub(crate) fn map_here(&self, access: Access) -> Result<View, Error> {
-        View::map(self.fd.as_raw_fd(), 0, self.len, None, access)
+        View::map(self.fd.as_raw_fd(), self.len, access)
     }
 
     /// A descriptor of the object opened read-only: what maps it can't write it shared.
@@ -151,8 +157,6 @@ pub(crate) struct View {
     at: *mut u8,
     len: usize,
     writable: bool,
-    /// Whether dropping it unmaps it: a view of a range inside a reservation goes with it.
-    owned: bool,
 }
 
 // SAFETY: a `View` is an address range this process mapped; nothing of it is tied to a thread,
@@ -163,7 +167,7 @@ unsafe impl Sync for View {}
 
 impl Drop for View {
     fn drop(&mut self) {
-        if self.owned && self.len != 0 {
+        if self.len != 0 {
             // SAFETY: `at..at + len` is this view's own mapping, which nothing borrows once it
             // drops (every borrow is of `self`).
             unsafe { libc::munmap(self.at.cast(), self.len) };
@@ -172,35 +176,11 @@ impl Drop for View {
 }
 
 impl View {
-    fn map(fd: RawFd, offset: u64, len: u64, at: Option<u64>, access: Access) -> Result<View, Error> {
-        let page = page();
-        if !offset.is_multiple_of(page) || len == 0 || at.is_some_and(|it| !it.is_multiple_of(page)) {
-            return Err(Error::new(format!("a map of {len:#x} bytes at offset {offset:#x}: not whole pages of {page:#x}")));
-        }
-        let len_usize = usize::try_from(len).map_err(|_| Error::new(format!("a map of {len:#x} bytes")))?;
-        let offset_t = libc::off_t::try_from(offset).map_err(|_| Error::new(format!("a map at offset {offset:#x}")))?;
-        let shared = if access == Access::Copy { libc::MAP_PRIVATE } else { libc::MAP_SHARED };
-        let (hint, fixed) = match at {
-            Some(at) if within_reservation(at, len) => (at, libc::MAP_FIXED),
-            Some(at) => (at, libc::MAP_FIXED_NOREPLACE),
-            None => (0, 0),
-        };
-        // SAFETY: `fd` is an open memory object; a fixed address is either inside a
-        // reservation of this process's own (`reserve`), which holds nothing yet, or mapped
-        // with MAP_FIXED_NOREPLACE, which fails rather than replace anything.
-        let mapped = unsafe { libc::mmap(hint as *mut c_void, len_usize, protection(access), shared | fixed, fd, offset_t) };
-        if mapped == libc::MAP_FAILED {
-            return Err(os(&format!("mmap of {len:#x} bytes at offset {offset:#x}{}", at.map(|it| format!(" to {it:#x}")).unwrap_or_default())));
-        }
-        if let Some(at) = at
-            && mapped as u64 != at
-        {
-            // SAFETY: `mapped` is the mapping just made, of `len` bytes, which nothing uses.
-            unsafe { libc::munmap(mapped, len_usize) };
-            return Err(Error::new(format!("{at:#x} is taken: the kernel mapped {len:#x} bytes at {:#x} instead", mapped as u64)));
-        }
+    /// The first `len` bytes of `fd`, wherever the kernel puts them.
+    fn map(fd: RawFd, len: u64, access: Access) -> Result<View, Error> {
+        let at = map_anywhere(fd, len, access)?;
         let writable = matches!(access, Access::Copy | Access::Shared);
-        Ok(View { at: mapped.cast(), len: len_usize, writable, owned: at.is_none() })
+        Ok(View { at: at as *mut u8, len: len as usize, writable })
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -288,51 +268,33 @@ impl View {
     }
 }
 
-/// Address space reserved by `reserve`: a fixed map inside it replaces what is there (nothing
-/// yet), one outside must find the space free. Written by the loader alone, before the
-/// program runs; the lock is never held across a call.
-static RESERVED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-
-fn within_reservation(at: u64, len: u64) -> bool {
-    let end = at.saturating_add(len);
-    RESERVED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .any(|&(start, until)| at >= start && end <= until)
+fn mapping(access: Access) -> c_int {
+    if access == Access::Copy { libc::MAP_PRIVATE } else { libc::MAP_SHARED }
 }
 
-pub(crate) fn reserve(_: &mut Channel, len: u64, at: Option<u64>) -> Result<u64, Error> {
-    let len = len.next_multiple_of(page());
-    let len_usize = usize::try_from(len).map_err(|_| Error::new(format!("a reservation of {len:#x} bytes")))?;
-    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-    let (hint, fixed) = match at {
-        Some(at) => (at, libc::MAP_FIXED_NOREPLACE),
-        None => (0, 0),
-    };
-    // SAFETY: an anonymous mapping with no access, at a free place (MAP_FIXED_NOREPLACE fails
-    // rather than replace anything).
-    let mapped = unsafe { libc::mmap(hint as *mut c_void, len_usize, libc::PROT_NONE, flags | fixed, -1, 0) };
+/// The first `len` bytes of `fd` mapped wherever the kernel finds room, for the rest of the
+/// mapping's owner.
+fn map_anywhere(fd: RawFd, len: u64, access: Access) -> Result<u64, Error> {
+    let len_usize = usize::try_from(len).ok().filter(|it| *it != 0).ok_or_else(|| Error::new(format!("a map of {len:#x} bytes")))?;
+    // SAFETY: `fd` is an open memory object; with no address the kernel picks free space, so
+    // nothing of this process is replaced.
+    let mapped = unsafe { libc::mmap(std::ptr::null_mut(), len_usize, protection(access), mapping(access), fd, 0) };
     if mapped == libc::MAP_FAILED {
-        return Err(os(&format!("reserving {len:#x} bytes of address space")));
+        return Err(os(&format!("mmap of {len:#x} bytes")));
     }
-    if let Some(at) = at
-        && mapped as u64 != at
-    {
-        // SAFETY: the mapping just made, which nothing uses.
-        unsafe { libc::munmap(mapped, len_usize) };
-        return Err(Error::new(format!("{at:#x} is taken: {len:#x} bytes can't be reserved there")));
-    }
-    RESERVED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((mapped as u64, mapped as u64 + len));
     Ok(mapped as u64)
 }
 
-/// The daemon's side of a run process: nothing, since the loader maps what it is given.
+/// The daemon's side of a run process: nothing, since the start hook maps what it is given.
 pub(crate) struct Remote;
 
 impl Remote {
-    pub(crate) fn map(&self, object: u32, _: u64, _: u64, _: u64, _: Access) -> Result<u64, Error> {
-        Err(Error::new(format!("a loader asked the daemon to map object {object}: on Linux the loader maps it")))
+    pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
+        Err(Error::new(format!("a start hook asked the daemon to map object {object}: on Linux the hook maps it")))
+    }
+
+    pub(crate) fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
+        Err(Error::new("a start hook asked the daemon to lay its overlays: on Linux the hook lays them"))
     }
 }
 
@@ -341,7 +303,7 @@ pub(crate) fn send_objects(channel: &mut Channel, _pid: u32, grant: &[u8], objec
     for (object, rights) in objects {
         fds.push(match rights {
             Rights::Code => object.read_only()?,
-            Rights::Control => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating the control object: {it}")))?,
+            Rights::Words => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
         });
     }
     let mut bytes = Vec::with_capacity(frame::HEADER + grant.len());
@@ -389,18 +351,113 @@ impl Granted {
         self.len
     }
 
-    pub(crate) fn map(&self, _: &mut Channel, offset: u64, len: u64, at: u64, access: Access) -> Result<u64, Error> {
-        if offset.checked_add(len).is_none_or(|end| end > self.len) {
-            return Err(Error::new(format!("a map of {len:#x} bytes at offset {offset:#x} of an object of {:#x}", self.len)));
-        }
-        let view = View::map(self.fd.as_raw_fd(), offset, len, Some(at), access)?;
-        let address = view.address();
-        std::mem::forget(view);
-        Ok(address)
+    pub(crate) fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
+        map_anywhere(self.fd.as_raw_fd(), self.len, access)
     }
+}
 
-    pub(crate) fn view(&self, _: &mut Channel) -> Result<View, Error> {
-        View::map(self.fd.as_raw_fd(), 0, self.len, None, Access::Read)
+/// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it.
+#[cfg(test)]
+pub(crate) fn granted(object: &Object, rights: Rights) -> Result<Granted, Error> {
+    let fd = match rights {
+        Rights::Code => object.read_only()?,
+        Rights::Words => object.fd.try_clone().map_err(|it| Error::new(format!("duplicating a words object: {it}")))?,
+    };
+    Ok(Granted { fd, len: object.len })
+}
+
+pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+    for overlay in overlays {
+        let object = objects
+            .get(overlay.object as usize)
+            .ok_or_else(|| Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len())))?;
+        if overlay.offset.checked_add(overlay.len).is_none_or(|end| end > object.len) {
+            return Err(Error::new(format!(
+                "an overlay of {:#x} bytes at offset {:#x} of an object of {:#x}",
+                overlay.len, overlay.offset, object.len
+            )));
+        }
+        let at = overlay.at.wrapping_add(slide);
+        let len = usize::try_from(overlay.len).map_err(|_| Error::new(format!("an overlay of {:#x} bytes", overlay.len)))?;
+        let offset = libc::off_t::try_from(overlay.offset)
+            .map_err(|_| Error::new(format!("an overlay at offset {:#x}", overlay.offset)))?;
+        // SAFETY: `at..at + len` is, by `Grant::check` against the headers the system loader
+        // mapped, either one of this executable's code segments, whose bytes the object holds
+        // equal at `offset` (the file was written from it, and the daemon changes code a
+        // thread can reach only by words a thread may see change), or inside a reservation,
+        // which holds nothing. MAP_FIXED replaces those pages in one step, so a thread running
+        // there, this one included, fetches the same instructions before and after.
+        let mapped = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                len,
+                protection(overlay.access),
+                mapping(overlay.access) | libc::MAP_FIXED,
+                object.fd.as_raw_fd(),
+                offset,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(os(&format!("mmap of {len:#x} bytes of object {} over {at:#x}", overlay.object)));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+    /// The executable's first `PT_LOAD`'s address and its bytes from the file.
+    unsafe extern "C" fn first(info: *mut libc::dl_phdr_info, _: usize, data: *mut c_void) -> c_int {
+        // SAFETY: the dynamic linker passes its own record of an object, live for the call,
+        // and `data` is the `Option` `own_image` passed, borrowed by nothing else meanwhile.
+        let (info, found) = unsafe { (&*info, &mut *data.cast::<Option<(u64, u64)>>()) };
+        for index in 0..usize::from(info.dlpi_phnum) {
+            // SAFETY: `dlpi_phdr` points at `dlpi_phnum` program headers of the object, mapped.
+            let header = unsafe { &*info.dlpi_phdr.add(index) };
+            if header.p_type == libc::PT_LOAD && header.p_offset == 0 {
+                *found = Some((info.dlpi_addr.wrapping_add(header.p_vaddr), header.p_filesz.min(header.p_memsz)));
+                break;
+            }
+        }
+        // The first object is the executable: stop.
+        1
+    }
+    let mut found: Option<(u64, u64)> = None;
+    // SAFETY: `first` is a callback of the signature asked, given `found`, live for the call.
+    unsafe { libc::dl_iterate_phdr(Some(first), (&raw mut found).cast()) };
+    let (header, mapped) =
+        found.ok_or_else(|| Error::new("the executable has no PT_LOAD of file offset 0: its headers are not mapped"))?;
+    let read = |len: u64| -> Result<&'static [u8], Error> {
+        if len > mapped {
+            return Err(Error::new(format!(
+                "the executable's headers are {len:#x} bytes, past its first segment of {mapped:#x} bytes"
+            )));
+        }
+        // SAFETY: `header..header + len` is inside the executable's first segment, mapped
+        // readable from its file for the life of the process (checked above), and nothing
+        // writes it.
+        Ok(unsafe { std::slice::from_raw_parts(header as *const u8, len as usize) })
+    };
+    let prefix = read(64)?;
+    let len = crate::image::headers_len(crate::Format::Elf, prefix)
+        .ok_or_else(|| Error::new("the executable's ELF header is not one"))?;
+    Ok((header, read(len)?))
+}
+
+pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
+    let fail = |path: &Path, it: std::io::Error| Error::new(format!("{}: {it}", path.display()));
+    let source = std::fs::File::open(from).map_err(|it| fail(from, it))?;
+    let target = std::fs::OpenOptions::new().write(true).create_new(true).open(to).map_err(|it| fail(to, it))?;
+    // SAFETY: both descriptors are open, the target writable and empty; FICLONE only shares
+    // the source's blocks into it.
+    if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    drop(target);
+    std::fs::remove_file(to).map_err(|it| fail(to, it))?;
+    match error.raw_os_error() {
+        Some(libc::EXDEV | libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL | libc::ENOSYS) => Ok(false),
+        _ => Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display()))),
     }
 }
 

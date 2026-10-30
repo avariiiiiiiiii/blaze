@@ -44,6 +44,7 @@ impl<T: AsId + FromId + Copy> Column<T> {
 
     pub(crate) fn new() -> Column<T> {
         let pages = (Self::MAX as usize >> PAGE_BITS) + 1;
+        // alloc: the page directory, once per column (32 KiB).
         Column { pages: (0..pages).map(|_| OnceLock::new()).collect(), of: PhantomData }
     }
 
@@ -87,6 +88,7 @@ impl<T: AsId + FromId + Copy> Column<T> {
 }
 
 fn new_page() -> Box<[AtomicU64; PAGE]> {
+    // alloc: a page, once per 4096 IDs the first time one of them is set.
     let page: Box<[AtomicU64]> = (0..PAGE).map(|_| AtomicU64::new(0)).collect();
     page.try_into().unwrap_or_else(|_| unreachable!("a page of {PAGE} words"))
 }
@@ -119,7 +121,7 @@ impl<T> Log<T> {
         assert!(raw != u32::MAX, "a log of 2^32 values");
         let (chunk, at) = chunk_of(raw);
         let slots =
-            self.chunks[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
+            self.chunks[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect()); // alloc: chunk k once, when the log first reaches it.
         if slots[at].set(value).is_err() {
             unreachable!("index {raw} handed out twice");
         }
@@ -178,6 +180,7 @@ impl<T> Table<T> {
         let shards = shard_count();
         Table {
             values: Log::new(),
+            // alloc: once per table: 16 bytes a shard.
             shards: (0..shards).map(|_| OnceLock::new()).collect(),
             shift: u64::BITS - shards.trailing_zeros(),
         }
@@ -193,6 +196,7 @@ impl<T> Table<T> {
     }
 
     fn table(shard: &Shard, level: usize) -> &[AtomicU32] {
+        // alloc: a shard's table at each size it grows to, once.
         shard.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU32::new(0)).collect())
     }
 
@@ -244,6 +248,7 @@ impl<T> Table<T> {
             return (found, false);
         }
         let shard = self.shard(hash).get_or_init(|| {
+            // alloc: a shard, on its first insert.
             Box::new(Shard {
                 lock: Mutex::new(0),
                 level: AtomicUsize::new(0),

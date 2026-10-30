@@ -6,6 +6,7 @@ use std::{
     mem,
 };
 
+use base_db::Db;
 use hir_expand::{Lookup, mod_path::PathKind};
 use itertools::Itertools;
 use rustc_abi::ExternAbi;
@@ -54,7 +55,7 @@ pub enum LineFormat {
     Indentation,
 }
 
-fn item_name<Id, Loc>(db: &dyn SourceDatabase, id: Id, default: &str) -> String
+fn item_name<Id, Loc>(db: &Db, id: Id, default: &str) -> String
 where
     Id: Lookup<Data = Loc>,
     Loc: HasSource,
@@ -62,19 +63,24 @@ where
 {
     let loc = id.lookup(db);
     let source = loc.source(db);
+    // alloc: printing, the edge (tests and the IDE).
     source.value.name().map_or_else(|| default.to_owned(), |name| name.to_string())
 }
 
 pub fn print_body_hir(
-    db: &dyn SourceDatabase,
+    db: &Db,
     body: &Body,
     owner: DefWithBodyId,
     edition: Edition,
 ) -> String {
     let header = match owner {
+        // alloc: printing, the edge (tests and the IDE).
         DefWithBodyId::FunctionId(it) => format!("fn {}", item_name(db, it, "<missing>")),
+        // alloc: printing, the edge (tests and the IDE).
         DefWithBodyId::StaticId(it) => format!("static {} = ", item_name(db, it, "<missing>")),
+        // alloc: printing, the edge (tests and the IDE).
         DefWithBodyId::ConstId(it) => format!("const {} = ", item_name(db, it, "_")),
+        // alloc: printing, the edge (tests and the IDE).
         DefWithBodyId::VariantId(it) => format!(
             "enum {}::{}",
             item_name(db, it.lookup(db).parent, "<missing>"),
@@ -115,17 +121,20 @@ pub fn print_body_hir(
 }
 
 pub fn print_variant_body_hir(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: VariantId,
     edition: Edition,
 ) -> String {
     let header = match owner {
+        // alloc: printing, the edge (tests and the IDE).
         VariantId::StructId(it) => format!("struct {}", item_name(db, it, "<missing>")),
+        // alloc: printing, the edge (tests and the IDE).
         VariantId::EnumVariantId(it) => format!(
             "enum {}::{}",
             item_name(db, it.lookup(db).parent, "<missing>"),
             item_name(db, it, "<missing>")
         ),
+        // alloc: printing, the edge (tests and the IDE).
         VariantId::UnionId(it) => format!("union {}", item_name(db, it, "<missing>")),
     };
 
@@ -170,7 +179,7 @@ pub fn print_variant_body_hir(
     p.buf
 }
 
-pub fn print_signature(db: &dyn SourceDatabase, owner: GenericDefId, edition: Edition) -> String {
+pub fn print_signature(db: &Db, owner: GenericDefId, edition: Edition) -> String {
     match owner {
         GenericDefId::AdtId(id) => match id {
             AdtId::StructId(id) => {
@@ -178,33 +187,41 @@ pub fn print_signature(db: &dyn SourceDatabase, owner: GenericDefId, edition: Ed
                 print_struct(db, id, signature, edition)
             }
             AdtId::UnionId(id) => {
+                // alloc: printing, the edge (tests and the IDE).
                 format!("unimplemented {id:?}")
             }
             AdtId::EnumId(id) => {
+                // alloc: printing, the edge (tests and the IDE).
                 format!("unimplemented {id:?}")
             }
         },
+        // alloc: printing, the edge (tests and the IDE).
         GenericDefId::ConstId(id) => format!("unimplemented {id:?}"),
         GenericDefId::FunctionId(id) => {
             let signature = FunctionSignature::of(db, id);
             print_function(db, id, signature, edition)
         }
+        // alloc: printing, the edge (tests and the IDE).
         GenericDefId::ImplId(id) => format!("unimplemented {id:?}"),
+        // alloc: printing, the edge (tests and the IDE).
         GenericDefId::StaticId(id) => format!("unimplemented {id:?}"),
+        // alloc: printing, the edge (tests and the IDE).
         GenericDefId::TraitId(id) => format!("unimplemented {id:?}"),
+        // alloc: printing, the edge (tests and the IDE).
         GenericDefId::TypeAliasId(id) => format!("unimplemented {id:?}"),
     }
 }
 
 pub fn print_path(
-    db: &dyn SourceDatabase,
+    db: &Db,
     store: &ExpressionStore,
-    path: &Path,
+    path: Path<'_>,
     edition: Edition,
 ) -> String {
     let mut p = Printer {
         db,
         store,
+        // alloc: the printed text, the edge (tests and the IDE).
         buf: String::new(),
         indent_level: 0,
         line_format: LineFormat::Newline,
@@ -215,7 +232,7 @@ pub fn print_path(
 }
 
 pub fn print_struct(
-    db: &dyn SourceDatabase,
+    db: &Db,
     id: StructId,
     StructSignature { name, generic_params, store, flags, shape }: &StructSignature,
     edition: Edition,
@@ -223,6 +240,7 @@ pub fn print_struct(
     let mut p = Printer {
         db,
         store,
+        // alloc: the printed text, the edge (tests and the IDE).
         buf: String::new(),
         indent_level: 0,
         line_format: LineFormat::Newline,
@@ -263,7 +281,7 @@ pub fn print_struct(
 }
 
 pub fn print_function(
-    db: &dyn SourceDatabase,
+    db: &Db,
     id: FunctionId,
     signature @ FunctionSignature {
         name,
@@ -280,6 +298,7 @@ pub fn print_function(
     let mut p = Printer {
         db,
         store,
+        // alloc: the printed text, the edge (tests and the IDE).
         buf: String::new(),
         indent_level: 0,
         line_format: LineFormat::Newline,
@@ -326,7 +345,7 @@ pub fn print_function(
 }
 
 fn print_where_clauses(
-    db: &dyn SourceDatabase,
+    db: &Db,
     generic_params: &GenericParams,
     p: &mut Printer<'_>,
 ) {
@@ -339,9 +358,10 @@ fn print_where_clauses(
                 }
                 match pred {
                     WherePredicate::TypeBound { lifetimes, target, bound } => {
-                        if let Some(lifetimes) = lifetimes {
+                        if let Some(lifetimes) = *lifetimes {
                             w!(p, "for<");
-                            for (i, lifetime) in lifetimes.iter().enumerate() {
+                            let store = p.store;
+                            for (i, lifetime) in store.names(lifetimes).iter().enumerate() {
                                 if i != 0 {
                                     w!(p, ", ");
                                 }
@@ -366,7 +386,7 @@ fn print_where_clauses(
 }
 
 fn print_generic_params(
-    db: &dyn SourceDatabase,
+    db: &Db,
     generic_params: &GenericParams,
     p: &mut Printer<'_>,
 ) {
@@ -409,7 +429,7 @@ fn print_generic_params(
 }
 
 pub fn print_expr_hir(
-    db: &dyn SourceDatabase,
+    db: &Db,
     store: &ExpressionStore,
     _owner: ExpressionStoreOwnerId,
     expr: ExprId,
@@ -418,6 +438,7 @@ pub fn print_expr_hir(
     let mut p = Printer {
         db,
         store,
+        // alloc: the printed text, the edge (tests and the IDE).
         buf: String::new(),
         indent_level: 0,
         line_format: LineFormat::Newline,
@@ -428,7 +449,7 @@ pub fn print_expr_hir(
 }
 
 pub fn print_pat_hir(
-    db: &dyn SourceDatabase,
+    db: &Db,
     store: &ExpressionStore,
     _owner: ExpressionStoreOwnerId,
     pat: PatId,
@@ -438,6 +459,7 @@ pub fn print_pat_hir(
     let mut p = Printer {
         db,
         store,
+        // alloc: the printed text, the edge (tests and the IDE).
         buf: String::new(),
         indent_level: 0,
         line_format: if oneline { LineFormat::Oneline } else { LineFormat::Newline },
@@ -448,7 +470,7 @@ pub fn print_pat_hir(
 }
 
 struct Printer<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     store: &'a ExpressionStore,
     buf: String,
     indent_level: usize,
@@ -464,7 +486,9 @@ impl Write for Printer<'_> {
                     Some('\n') | None => {}
                     _ => self.buf.push('\n'),
                 }
-                self.buf.push_str(&"    ".repeat(self.indent_level));
+                for _ in 0..self.indent_level {
+                    self.buf.push_str("    ");
+                }
             }
 
             self.buf.push_str(line);
@@ -488,7 +512,8 @@ impl Printer<'_> {
         wln!(self);
         f(self);
         self.indent_level -= 1;
-        self.buf = self.buf.trim_end_matches('\n').to_owned();
+        let len = self.buf.trim_end_matches('\n').len();
+        self.buf.truncate(len);
     }
 
     fn whitespace(&mut self) {
@@ -844,6 +869,7 @@ impl Printer<'_> {
             Expr::Literal(lit) => self.print_literal(lit),
             Expr::Block { id: _, statements, tail, label, unsafe_ } => {
                 let label = label.map(|lbl| {
+                    // alloc: printing, the edge (tests and the IDE).
                     format!("{}: ", self.store[lbl].name.display(self.db, self.edition))
                 });
                 self.print_block(label.as_deref(), unsafe_, statements, tail);
@@ -932,6 +958,7 @@ impl Printer<'_> {
                 let oneline = matches!(self.line_format, LineFormat::Oneline);
                 self.indented(|p| {
                     for (idx, arg) in args.iter().enumerate() {
+                        // alloc: printing, the edge (tests and the IDE).
                         let field_name = arg.name.display(self.db, edition).to_string();
 
                         let mut same_name = false;
@@ -1107,7 +1134,7 @@ impl Printer<'_> {
         w!(self, "{}{}", mode, name.display(self.db, self.edition));
     }
 
-    fn print_path(&mut self, path: &Path) {
+    fn print_path(&mut self, path: Path<'_>) {
         if let Path::LangItem(it, s) = path {
             w!(self, "builtin#lang(");
             macro_rules! write_name {
@@ -1115,7 +1142,7 @@ impl Printer<'_> {
                     w!(self, "{}", item_name(self.db, $it, "<missing>"));
                 }};
             }
-            match *it {
+            match it {
                 LangItemTarget::ImplId(it) => w!(self, "{it:?}"),
                 LangItemTarget::EnumId(it) => write_name!(it),
                 LangItemTarget::FunctionId(it) => write_name!(it),
@@ -1184,7 +1211,7 @@ impl Printer<'_> {
         }
     }
 
-    pub(crate) fn print_generic_args(&mut self, generics: &GenericArgs) {
+    pub(crate) fn print_generic_args(&mut self, generics: GenericArgs<'_>) {
         let mut first = true;
         let args = if generics.has_self_type {
             let (self_ty, args) = generics.args.split_first().unwrap();
@@ -1193,7 +1220,7 @@ impl Printer<'_> {
             first = false;
             args
         } else {
-            &generics.args
+            generics.args
         };
         for arg in args {
             if !first {
@@ -1210,7 +1237,7 @@ impl Printer<'_> {
             w!(self, "{}", binding.name.display(self.db, self.edition));
             if !binding.bounds.is_empty() {
                 w!(self, ": ");
-                self.print_type_bounds(&binding.bounds);
+                self.print_type_bounds(binding.bounds);
             }
             if let Some(ty) = binding.type_ref {
                 w!(self, " = ");
@@ -1316,6 +1343,7 @@ impl Printer<'_> {
                             .iter()
                             .map(|it| it.display(self.db, self.edition))
                             .format(", ")
+                            // alloc: printing, the edge; `w!` borrows `self` mutably.
                             .to_string()
                     );
                 }
@@ -1374,25 +1402,28 @@ impl Printer<'_> {
                         TraitBoundModifier::Const => w!(self, "const "),
                         TraitBoundModifier::MaybeConst => w!(self, "[const] "),
                     }
-                    self.print_path(&self.store[*path]);
+                    self.print_path(self.store.path(*path));
                 }
                 TypeBound::ForLifetime(lifetimes, path) => {
                     w!(
                         self,
                         "for<{}> ",
-                        lifetimes
+                        self.store
+                            .names(*lifetimes)
                             .iter()
                             .map(|it| it.display(self.db, self.edition))
                             .format(", ")
+                            // alloc: printing, the edge; `w!` borrows `self` mutably.
                             .to_string()
                     );
-                    self.print_path(&self.store[*path]);
+                    self.print_path(self.store.path(*path));
                 }
                 TypeBound::Lifetime(lt) => self.print_lifetime_ref(*lt),
                 TypeBound::Use(args) => {
                     w!(self, "use<");
                     let mut first = true;
-                    for arg in args {
+                    let store = self.store;
+                    for arg in store.use_args(*args) {
                         if !mem::take(&mut first) {
                             w!(self, ", ");
                         }

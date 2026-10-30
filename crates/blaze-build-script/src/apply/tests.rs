@@ -202,28 +202,27 @@ fn when_a_script_runs_again() {
         Rerun::Watched { files: vec!["foo".into(), "watched".into()], env: vec!["FOO".into()] }
     );
     let foo = |_: &str| Some("foo");
-    let mut path = PathBuf::new();
     let ran = SystemTime::now() + std::time::Duration::from_secs(60);
-    assert_eq!(rerun.stale(&dir, ran, &foo, &foo, &mut path), Some(None));
+    assert_eq!(rerun.stale(&dir, ran, &foo, &foo), Some(None));
     let bar = |_: &str| Some("bar");
-    assert!(matches!(rerun.stale(&dir, ran, &foo, &bar, &mut path), Some(Some(Stale::Env { .. }))));
+    assert!(matches!(rerun.stale(&dir, ran, &foo, &bar), Some(Some(Stale::Env { .. }))));
     let before = SystemTime::UNIX_EPOCH;
     let newer = Some(Some(Stale::Newer(dir.join("foo"))));
-    assert_eq!(rerun.stale(&dir, before, &foo, &foo, &mut path), newer);
+    assert_eq!(rerun.stale(&dir, before, &foo, &foo), newer);
     // A file deep in a watched directory counts.
     let file = std::fs::File::options().write(true).open(dir.join("foo")).unwrap();
     file.set_modified(before).unwrap();
     let watched = dir.join("watched");
-    assert_eq!(rerun.stale(&dir, before, &foo, &foo, &mut path), Some(Some(Stale::Newer(watched))));
+    assert_eq!(rerun.stale(&dir, before, &foo, &foo), Some(Some(Stale::Newer(watched))));
     std::fs::remove_file(dir.join("foo")).unwrap();
     let missing = Some(Some(Stale::Missing(dir.join("foo"))));
-    assert_eq!(rerun.stale(&dir, ran, &foo, &foo, &mut path), missing);
-    assert_eq!(Rerun::Package.stale(&dir, ran, &foo, &foo, &mut path), None);
+    assert_eq!(rerun.stale(&dir, ran, &foo, &foo), missing);
+    assert_eq!(Rerun::Package.stale(&dir, ran, &foo, &foo), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A check of a kept run's files and variables that finds nothing changed allocates nothing
-/// once the caller's buffer has grown: each file is one `stat`, each variable compared
+/// once the thread's path buffer has grown: each file is one `stat`, each variable compared
 /// borrowed.
 #[test]
 fn a_fresh_run_is_checked_without_allocating() {
@@ -243,10 +242,9 @@ fn a_fresh_run_is_checked_without_allocating() {
         _ => None,
     };
     let ran = SystemTime::now() + std::time::Duration::from_secs(60);
-    let mut path = PathBuf::new();
-    assert_eq!(rerun.stale(&dir, ran, &vars, &vars, &mut path), Some(None));
+    assert_eq!(rerun.stale(&dir, ran, &vars, &vars), Some(None));
     let fresh = blaze_alloc_count::assert_at_most(0, "checking a kept run", || {
-        rerun.stale(&dir, ran, &vars, &vars, &mut path)
+        rerun.stale(&dir, ran, &vars, &vars)
     });
     assert_eq!(fresh, Some(None));
     let _ = std::fs::remove_dir_all(&dir);

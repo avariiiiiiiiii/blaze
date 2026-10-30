@@ -8,7 +8,7 @@
 //! configuration, in a `macro_rules!` body or in tokens no macro expanded) is an error naming
 //! where it is: the rename would otherwise miss a reference without saying so.
 
-use base_db::FileId;
+use base_db::{Db, FileId};
 use blaze_api::{ApiError, How, Target};
 use blaze_ids::radix;
 use blaze_vfs::Op;
@@ -156,7 +156,7 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
 }
 
 /// The front end's item for the node a path named.
-fn def_of(sema: &Semantics<'_, dyn HirDatabase>, node: &SyntaxNode) -> Option<Def> {
+fn def_of(sema: &Semantics<'_>, node: &SyntaxNode) -> Option<Def> {
     let node = node.clone();
     let item: ModuleDef = match node.kind() {
         SyntaxKind::FN => sema.to_fn_def(&ast::Fn::cast(node)?)?.into(),
@@ -179,7 +179,7 @@ fn def_of(sema: &Semantics<'_, dyn HirDatabase>, node: &SyntaxNode) -> Option<De
     Some(Def::Item(item))
 }
 
-fn assoc(db: &dyn HirDatabase, item: ModuleDef) -> Option<AssocItem> {
+fn assoc(db: &Db, item: ModuleDef) -> Option<AssocItem> {
     match item {
         ModuleDef::Function(it) => it.as_assoc_item(db),
         ModuleDef::Const(it) => it.as_assoc_item(db),
@@ -189,23 +189,23 @@ fn assoc(db: &dyn HirDatabase, item: ModuleDef) -> Option<AssocItem> {
 }
 
 /// The trait `item` is an item of, when it is one.
-fn trait_of(db: &dyn HirDatabase, item: ModuleDef) -> Option<Trait> {
+fn trait_of(db: &Db, item: ModuleDef) -> Option<Trait> {
     assoc(db, item)?.container_trait(db)
 }
 
 /// Whether `found` is an impl's item implementing the trait item `item`.
-fn implements(db: &dyn HirDatabase, found: ModuleDef, item: ModuleDef) -> bool {
+fn implements(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
     trait_of(db, item).is_some_and(|of| assoc(db, found).and_then(|it| it.implemented_trait(db)) == Some(of))
 }
 
 /// Whether `found`, a reference resolved, is `item` or implements it.
-fn is(db: &dyn HirDatabase, found: ModuleDef, item: ModuleDef) -> bool {
+fn is(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
     found == item || implements(db, found, item)
 }
 
 /// The files of the crates that can name `def`: its own, and those depending on it when it is
 /// public.
-fn files_of(db: &dyn HirDatabase, def: Def) -> Vec<FileId> {
+fn files_of(db: &Db, def: Def) -> Vec<FileId> {
     let (krate, public) = match def {
         Def::Item(item) => {
             let module = match item {

@@ -22,7 +22,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_TYPE_PIPE, FILE_WRITE_DATA, GetFileType, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
+    FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -44,10 +44,10 @@ const PIPES: &str = r"\\.\pipe\";
 const PREFIX: &str = "blaze-inproc-";
 /// Each direction's buffer in the pipe: a frame of a stub miss fits many times.
 const BUFFER: u32 = 64 << 10;
-/// How long a loader keeps trying while every instance is busy.
+/// How long a start hook keeps trying while every instance is busy.
 const CONNECTING: Duration = Duration::from_secs(30);
 /// What an AppContainer process of this user may do with the pipe: connect, read and write,
-/// never make an instance of it (`FILE_APPEND_DATA`, which would let it answer loaders).
+/// never make an instance of it (`FILE_APPEND_DATA`, which would let it answer start hooks).
 const CONNECT: u32 = FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 
 fn check(ok: BOOL, what: &str) -> Result<(), Error> {
@@ -171,27 +171,9 @@ impl Stream {
         };
         Ok(())
     }
-
-    pub(crate) fn raw(&self) -> i64 {
-        self.pipe.as_raw_handle() as i64
-    }
-
-    pub(crate) fn from_raw(raw: i64) -> Result<Stream, Error> {
-        let handle = raw as usize as HANDLE;
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return Err(Error::new(format!("a channel handle {raw:#x}")));
-        }
-        // SAFETY: a query of a handle value; a handle that is not open answers unknown.
-        if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
-            return Err(Error::new(format!("the channel handle {raw:#x} is not a pipe")));
-        }
-        // SAFETY: the caller hands the handle over (`Channel::from_raw`): the loader's end of the
-        // pipe, which the loader never closes, named in its boot record.
-        Stream::new(unsafe { OwnedHandle::from_raw_handle(handle) })
-    }
 }
 
-/// The daemon's end: instances of one pipe name, one always waiting for the next loader.
+/// The daemon's end: instances of one pipe name, one always waiting for the next start hook.
 pub(crate) struct Listener {
     name: Vec<u16>,
     security: Security,
@@ -223,7 +205,7 @@ impl Listener {
             None => instance(&self.name, &self.security, false)?,
         };
         wait_for_client(&pipe, &self.event)?;
-        // The next instance waits before this one is handed out, so a loader never finds none.
+        // The next instance waits before this one is handed out, so a start hook never finds none.
         // Where it can't be made, the next `accept` makes it and says why.
         if let Ok(next) = instance(&self.name, &self.security, false) {
             *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(next);
@@ -289,7 +271,7 @@ fn wait_for_client(pipe: &OwnedHandle, event: &OwnedHandle) -> Result<(), Error>
     check(unsafe { GetOverlappedResult(pipe.as_raw_handle(), &overlapped, &mut done, 1) }, "ConnectNamedPipe")
 }
 
-/// The loader's end, of the pipe `address` ([`Listener::bind`]).
+/// The start hook's end, of the pipe `address` ([`Listener::bind`]).
 pub(crate) fn connect(address: &str) -> Result<Stream, Error> {
     if !address.strip_prefix(PIPES).is_some_and(|it| it.starts_with(PREFIX)) {
         return Err(Error::new(format!("{address} is not a pipe of blaze-inproc's")));

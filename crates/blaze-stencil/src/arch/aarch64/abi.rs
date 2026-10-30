@@ -13,7 +13,7 @@ use crate::Error;
 
 /// A register an argument or return value is passed in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Reg {
+pub(super) enum Reg {
     /// `x0` to `x8`.
     X(u8),
     /// `v0` to `v7`.
@@ -22,7 +22,7 @@ pub enum Reg {
 
 /// Where one argument or return value is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Place {
+pub(super) enum Place {
     /// In one register, `ty` its type.
     Reg(Reg, ir::Type),
     /// An `i128` in two X registers, the low half in the first.
@@ -33,14 +33,22 @@ pub enum Place {
 }
 
 /// Whether `conv` is one the glue passes values in, as an error naming it otherwise.
-pub fn check(conv: CallConv) -> Result<(), Error> {
+/// Windows' (`windows_fastcall`, AArch64 Windows triples' default) is AAPCS64 to Cranelift.
+pub(super) fn check(conv: CallConv) -> Result<(), Error> {
     match conv {
-        CallConv::SystemV | CallConv::AppleAarch64 => Ok(()),
+        CallConv::SystemV | CallConv::AppleAarch64 | CallConv::WindowsFastcall => Ok(()),
+        // alloc: the error's message, once, as the function fails to compile.
         other => Err(Error::new(format!(
-            "the {other} calling convention on AArch64: the IR builder makes code in `system_v` \
-             and `apple_aarch64` only"
+            "the {other} calling convention on AArch64: the glue passes values in `system_v`, \
+             `apple_aarch64` and `windows_fastcall` only"
         ))),
     }
+}
+
+/// Whether a `try_call` in `conv` has exception payload registers (`x0`, `x1`): Cranelift's
+/// `exception_payload_regs` gives Windows' none, and panics on its exception clobbers.
+pub(super) fn catches(conv: CallConv) -> bool {
+    matches!(conv, CallConv::SystemV | CallConv::AppleAarch64)
 }
 
 /// Whether a value of `ty` goes in X registers (and how many) or in one V register.
@@ -50,6 +58,7 @@ fn classes(ty: ir::Type) -> Result<(bool, u8), Error> {
         types::I128 => Ok((true, 2)),
         types::F16 | types::F32 | types::F64 | types::F128 => Ok((false, 1)),
         ty if ty.is_vector() && ty.bits() <= 128 => Ok((false, 1)),
+        // alloc: the error's message, once, as the function fails to compile.
         ty => Err(Error::new(format!("a {ty} argument or return value on AArch64"))),
     }
 }
@@ -133,7 +142,7 @@ impl Assign {
 
 /// Calls `f` with each argument of `sig` and its place, in order; gives the bytes of the
 /// stack argument area, 16-aligned.
-pub fn args(
+pub(super) fn args(
     sig: &ir::Signature,
     mut f: impl FnMut(usize, &ir::AbiParam, Place) -> Result<(), Error>,
 ) -> Result<u32, Error> {
@@ -151,14 +160,14 @@ pub fn args(
 }
 
 /// The bytes of `sig`'s stack argument area.
-pub fn stack_args(sig: &ir::Signature) -> Result<u32, Error> {
+pub(super) fn stack_args(sig: &ir::Signature) -> Result<u32, Error> {
     args(sig, |_, _, _| Ok(()))
 }
 
 /// Calls `f` with each return value of `sig` and its register, in order. A signature with a
 /// `StructReturn` argument returns nothing but that pointer, in `x8`; `f` is not given it
 /// (`k` counts `sig.returns`), and a caller ignores it, as Cranelift's does.
-pub fn rets(
+pub(super) fn rets(
     sig: &ir::Signature,
     mut f: impl FnMut(usize, &ir::AbiParam, Place) -> Result<(), Error>,
 ) -> Result<(), Error> {
@@ -180,7 +189,7 @@ pub fn rets(
 /// The extension a caller applies to an argument (or a callee to a return value) at
 /// `place`: Apple's convention extends what is in a register to 64 bits as the signature
 /// says, AAPCS64 leaves the high bits unspecified, and neither extends what is on the stack.
-pub fn extension(conv: CallConv, param: &ir::AbiParam, place: Place) -> Option<bool> {
+pub(super) fn extension(conv: CallConv, param: &ir::AbiParam, place: Place) -> Option<bool> {
     let in_reg = matches!(place, Place::Reg(Reg::X(_), _));
     if conv != CallConv::AppleAarch64 || !in_reg || param.value_type.bits() >= 64 {
         return None;

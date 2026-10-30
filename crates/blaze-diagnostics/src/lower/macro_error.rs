@@ -64,7 +64,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroError) -> Vec<Found> {
         };
         Diag::error(None, message, at(call.as_ref().map_or(d.range.value, |it| it.range)))
     };
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }
 
 /// The call a macro error is about.

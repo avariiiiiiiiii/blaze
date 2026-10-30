@@ -1,24 +1,73 @@
-//! Dev runs and tests with no binary on disk (docs/v2/plan/design/compile-time.md change 6,
-//! docs/v2/plan/lanes/fastcompile/inproc.md).
+//! Dev runs and tests that patch running code with one store (docs/v2/plan/design/compile-time.md
+//! change 6, docs/v2/plan/lanes/fastcompile/inproc.md).
 //!
-//! The daemon loads code straight into the process it runs. A [`CodeMemory`] is one OS memory
-//! object (Linux `memfd_create`, macOS a Mach memory entry, Windows a pagefile-backed section)
-//! mapped twice: writable in the daemon, executable in every run process. Changing code is a
-//! write into the daemon's view, [`CodeMemory::publish`] (the instruction-cache maintenance
-//! the architecture asks for), and one aligned atomic store of the word that makes it
-//! reachable ([`CodeMemory::store_word`]): no `mprotect`, no link, no file.
+//! A [`CodeMemory`] is one OS memory object (Linux `memfd_create`, macOS a Mach memory entry,
+//! Windows a pagefile-backed section) mapped writable in the daemon and executable in every
+//! run process. Its first part holds the program's executable as the linker lays out its file
+//! (a file offset is an offset here); an arena after it is handed out for code placed while
+//! the program runs. Changing code is a write into the daemon's view, [`CodeMemory::publish`]
+//! (the instruction-cache maintenance the architecture asks for), and one aligned atomic
+//! store of the word that makes it reachable ([`CodeMemory::store_word`]): no `mprotect`, no
+//! link, no rewrite of the file.
 //!
 //! Replaced code stays valid while a thread may be in it. [`CodeMemory::retire`] puts a range
 //! behind a fence ([`fence`]): it is reused only once every thread of every run process has
 //! passed a quiescent point after the store that unlinked it with no frame of its stack in
 //! the range, and every live thread is known to the fence.
 //!
-//! A run process starts from blaze's own loader (the `blaze-inproc-run` binary, [`load`]),
-//! which the daemon spawns through `blaze-core`'s `Effect::Spawn` (the `host` feature,
-//! `host`). It is handed the memory over its [`channel::Channel`], maps the program's segments
-//! from it, links the program to the system's libraries, sets up thread-local storage and
-//! jumps in. The program's runtime ([`runtime`]) reports quiescent points and speaks to the
-//! daemon over the same channel in fixed-layout little-endian frames ([`frame`]).
+//! # The start of a run
+//!
+//! A run is exact by construction: the program is its own executable at the path cargo gives
+//! it, started by the kernel, so `current_exe`, `/proc/self/exe`, dyld's image 0, the PEB,
+//! `dl_iterate_phdr` and backtraces all see the program there, as in a whole build.
+//!
+//! 1. The daemon writes the executable's bytes, as the memory object holds them, to cargo's
+//!    path once per content key ([`host::Host::write_executable`]): not again while the key
+//!    is the same, never for a patch.
+//! 2. It spawns that file through `blaze-core`'s `Effect::Spawn` in the run's sandbox, with
+//!    `BLAZE_INPROC` naming its host and a token ([`host::Program::command`]).
+//! 3. Before `main` and before any other code of the program, the program's runtime
+//!    ([`runtime`], linked into the executable) runs its start hook: an ELF `.preinit_array`
+//!    entry, the first pointer of the Mach-O `__mod_init_func`, a PE TLS callback in
+//!    `.CRT$XLAB` (the first; the CRT's start runs after TLS callbacks). Only the dynamic
+//!    linker's own work comes before it: mapping and relocating, including the IFUNC
+//!    resolvers of the executable, which therefore must not be lazy.
+//! 4. The hook takes `BLAZE_INPROC` out of the environment (the program never sees it, nor
+//!    do its children), connects, and says where its image's header is. The daemon answers
+//!    with the objects and the overlays: the image's code ranges, the arena, cells and fixed
+//!    maps. The hook checks each overlay against its own image's headers ([`image`]): a code
+//!    range must be one of the image's executable segments at the same file offset, every
+//!    other overlay must be inside a reservation the executable carries. Then it maps the
+//!    fence's control words, and replaces each range with the shared mapping of the memory
+//!    object (Linux `mmap` `MAP_FIXED|MAP_SHARED`, macOS `mach_vm_map` with
+//!    `VM_FLAGS_OVERWRITE` of the entry it got through the rendezvous; on Windows the daemon
+//!    rebuilds the image's region in the process from the section and the bytes it held).
+//!    The bytes are equal at the moment of the swap: the file was written from the object,
+//!    and the daemon writes only code no thread can reach yet. The hook says STARTED and
+//!    returns; the program starts as it would anywhere.
+//! 5. A program started otherwise (no `BLAZE_INPROC`: run by hand) runs its file as it is;
+//!    [`runtime::attach`] says so, and [`runtime::quiesce`] does nothing.
+//!
+//! A hook that can't attach stops the process with exit code 127 and the reason on stderr
+//! (and to the daemon when the channel is up): never a run of the file's code in place of
+//! the object's.
+//!
+//! # Addresses
+//!
+//! Every address this crate deals in is *linked*: as the linker placed it. Each run process
+//! has its own slide (ASLR), the same for the whole image: where its header is minus the
+//! linked header ([`image::Layout::header`]), as `blaze-live`'s descriptor finds its own.
+//! The arena, cells and fixed maps are mapped into reservations the executable carries in its
+//! own address range ([`image::Layout::reserved`], first the arena, then the cells, then
+//! fixed maps), so they slide with it. Hence:
+//!
+//! - bytes shared by every process (code, the arena, stub words, cells) must not depend on the
+//!   slide: code is position-independent, and a word that names code names it relative to
+//!   itself, never by absolute address;
+//! - [`CodeMemory::linked`] gives an offset's linked address; a process's address is that
+//!   plus its slide ([`host::Session::slide`], [`runtime::Attached::slide`]);
+//! - the fence's ranges are linked addresses, and each thread subtracts its slide from its
+//!   return addresses before comparing.
 //!
 //! The crate knows nothing of stubs, functions or dependency graphs: `blaze-lazy` and
 //! `blaze-premap` build those on it.
@@ -31,18 +80,21 @@ pub mod fence;
 pub mod frame;
 #[cfg(feature = "host")]
 pub mod host;
-pub mod load;
+pub mod image;
 pub mod runtime;
 
 mod alloc;
+mod handshake;
 mod sys;
 
 #[cfg(test)]
 mod tests;
 
 use std::fmt;
+use std::sync::Arc;
 
 use fence::{Fences, Grace};
+pub use image::{Layout, Segment};
 
 /// Why something of this crate could not be done, and on which platform.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -70,7 +122,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The object format of a program image a run process loads.
+/// The object format of a program's executable.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Format {
     Elf,
@@ -117,12 +169,12 @@ pub enum Access {
     Execute,
     /// Readable, shared: read-only data the daemon may still change.
     Read,
-    /// Readable and writable, a private copy: a program's data. Nothing relies on whether the
-    /// daemon's later writes show through: on Linux and Windows they do in pages the process
-    /// has not written (copy on write), on macOS never (a snapshot taken when it is mapped,
-    /// since a mapping of a Mach memory entry can't gain more rights than the entry has).
+    /// Readable and writable, a private copy: data. Nothing relies on whether the daemon's
+    /// later writes show through: on Linux and Windows they do in pages the process has not
+    /// written (copy on write), on macOS never (a snapshot taken when it is mapped, since a
+    /// mapping of a Mach memory entry can't gain more rights than the entry has).
     Copy,
-    /// Readable and writable, shared both ways: the fence's control words.
+    /// Readable and writable, shared both ways: the fence's control words, and cells.
     Shared,
 }
 
@@ -164,48 +216,21 @@ impl CodeRange {
     }
 }
 
-/// A range of a memory object a run process maps at a fixed address before the program's
-/// own image: `blaze-premap`'s dependency image, mapped the same in every run.
+/// A range of another memory object a run process maps into its executable's address space
+/// before the program starts: `blaze-premap`'s dependency image, at the same linked address
+/// in every run (each process adds its slide).
 #[derive(Clone, Copy)]
 pub struct FixedMap<'a> {
     pub memory: &'a CodeMemory,
     pub range: CodeRange,
-    /// Where in the run process; a multiple of [`CodeMemory::page`]. Taken already is an error
-    /// naming the address, never another address.
+    /// The linked address it goes at: a multiple of [`CodeMemory::page`], inside a reservation
+    /// of the executable that the arena and cells don't use. Anywhere else is an error naming
+    /// it, never another address.
     pub at: u64,
     pub access: Access,
 }
 
-/// What the loader keeps aside in every thread's static thread-local block for a program's
-/// thread-locals (ELF and PE; Mach-O's are reached through descriptors the loader fills).
-/// The linker places the program's thread-locals at `bias + offset`: from the thread
-/// pointer on ELF, from the start of the module's block on PE.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-pub struct TlsReserve {
-    pub bias: i64,
-    pub size: u64,
-    pub align: u64,
-}
-
-impl TlsReserve {
-    /// As `blaze-inproc-run --reserve` prints it: `bias size align` in decimal.
-    pub fn decode(text: &[u8]) -> Option<TlsReserve> {
-        let text = std::str::from_utf8(text).ok()?;
-        let mut words = text.split_ascii_whitespace();
-        let reserve = TlsReserve {
-            bias: words.next()?.parse().ok()?,
-            size: words.next()?.parse().ok()?,
-            align: words.next()?.parse().ok()?,
-        };
-        (words.next().is_none() && reserve.align.is_power_of_two()).then_some(reserve)
-    }
-
-    pub fn encode(&self) -> String {
-        format!("{} {} {}\n", self.bias, self.size, self.align)
-    }
-}
-
-/// The run processes a code memory is mapped in, and where.
+/// The run processes a code memory is mapped in.
 struct Process {
     pid: u32,
     /// Its threads, as the OS listed them at the last [`CodeMemory::collect`]; reused.
@@ -214,23 +239,41 @@ struct Process {
     forks: bool,
 }
 
+/// Where the parts after the image go in the executable's address space, once laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Placed {
+    /// The linked address of the arena's first byte (offset `image`).
+    arena: u64,
+    /// The linked address of the cells' first byte (offset `image + arena`).
+    cells: u64,
+}
+
 /// One memory object of code, writable here and executable in each run process it is mapped
-/// in, at the same address in each ([`CodeMemory::base`]).
+/// in.
 ///
-/// Its first `image` bytes are the program image as the linker lays out its file (a file
-/// offset is an offset here); the `arena` after them is handed out by
-/// [`CodeMemory::reserve`] for code placed while the program runs.
+/// Its first `image` bytes are the program's executable as the linker lays out its file; the
+/// `arena` after them is handed out by [`CodeMemory::reserve`] for code placed while the
+/// program runs; the `cells` after that are words shared both ways with every run process
+/// ([`CodeMemory::cell_view`]). The cells are offsets of the same memory to every caller, but
+/// an OS object of their own: a run maps the image and arena's object never writable.
 pub struct CodeMemory {
     object: sys::Object,
     view: sys::View,
+    cells: Option<(sys::Object, Arc<sys::View>)>,
     control: sys::Object,
     fences: Fences<sys::View>,
     image: u64,
+    arena_len: u64,
+    cells_len: u64,
     arena: alloc::Arena,
     /// Ranges retired behind a fence: with their grace once their entry is in the control
     /// table, waiting for room in it before.
     limbo: Vec<(Option<(Grace, u32)>, CodeRange)>,
-    base: Option<u64>,
+    layout: Option<Layout>,
+    placed: Option<Placed>,
+    /// Nothing changed the image part since [`CodeMemory::lay_out`]: it is still the file the
+    /// linker wrote, so it may be written out as the executable.
+    pristine: bool,
     processes: Vec<Process>,
     page: u64,
 }
@@ -239,42 +282,70 @@ impl CodeMemory {
     /// A new memory object of `image + arena` bytes (each rounded up to [`CodeMemory::page`]),
     /// zero, mapped writable here. Pages take memory only once written.
     pub fn new(name: &str, image: u64, arena: u64) -> Result<CodeMemory, Error> {
+        CodeMemory::with_cells(name, image, arena, 0)
+    }
+
+    /// As [`CodeMemory::new`], with a third part of `cells` bytes (rounded up to the page)
+    /// after the arena, zero, which every run process maps shared both ways.
+    pub fn with_cells(name: &str, image: u64, arena: u64, cells: u64) -> Result<CodeMemory, Error> {
         let page = sys::page();
-        let image = image.checked_next_multiple_of(page).ok_or_else(|| Error::new("image size overflows"))?;
-        let arena = arena.checked_next_multiple_of(page).ok_or_else(|| Error::new("arena size overflows"))?;
-        let len = image.checked_add(arena).ok_or_else(|| Error::new("code memory size overflows"))?;
+        let round = |len: u64, what: &str| {
+            len.checked_next_multiple_of(page).ok_or_else(|| Error::new(format!("{what} size overflows")))
+        };
+        let image = round(image, "image")?;
+        let arena = round(arena, "arena")?;
+        let cells = round(cells, "cells")?;
+        let len = image
+            .checked_add(arena)
+            .and_then(|it| it.checked_add(cells))
+            .ok_or_else(|| Error::new("code memory size overflows"))?;
         if len == 0 {
             return Err(Error::new("a code memory of no bytes"));
         }
         sys::check_icache()?;
-        let object = sys::Object::create(name, len)?;
+        if image + arena == 0 {
+            return Err(Error::new("a code memory of cells only: no image and no arena"));
+        }
+        let object = sys::Object::create(name, image + arena)?;
         let view = object.map_here(Access::Shared)?;
         let control_len = fence::CONTROL_BYTES.next_multiple_of(page);
         let control = sys::Object::create(&format!("{name}.fence"), control_len)?;
         let control_view = control.map_here(Access::Shared)?;
         let fences = Fences::new(control_view);
-        let base = choose_base(len)?;
+        let cells_object = match cells {
+            0 => None,
+            _ => {
+                let object = sys::Object::create(&format!("{name}.cells"), cells)?;
+                let view = Arc::new(object.map_here(Access::Shared)?);
+                Some((object, view))
+            }
+        };
         Ok(CodeMemory {
             object,
             view,
+            cells: cells_object,
             control,
             fences,
             image,
+            arena_len: arena,
+            cells_len: cells,
             arena: alloc::Arena::new(image, arena),
             limbo: Vec::new(),
-            base: Some(base),
+            layout: None,
+            placed: None,
+            pristine: false,
             processes: Vec::new(),
             page,
         })
     }
 
-    /// The whole object's length.
+    /// The length of all three parts: offsets run `0..len()`.
     pub fn len(&self) -> u64 {
-        self.view.len() as u64
+        self.image + self.arena_len + self.cells_len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.view.len() == 0
+        self.len() == 0
     }
 
     /// The image part's length: the linker writes `0..image_len()`.
@@ -287,10 +358,64 @@ impl CodeMemory {
         self.page
     }
 
-    /// Writes `bytes` at `offset`: code no thread can reach yet (the image before its run,
-    /// a reserved range before its slot is stored). Call [`CodeMemory::publish`] after.
+    /// Reads the executable's headers from the image part (written whole before) and places
+    /// the arena and the cells in its reservations: the arena in the first, the cells in the
+    /// next. An image whose headers can't be read, or whose reservations are missing or too
+    /// small, is an error naming what the link must give it.
+    pub fn lay_out(&mut self, format: Format) -> Result<&Layout, Error> {
+        let bytes = self.view.bytes(0..self.image as usize)?;
+        let layout = image::layout(format, bytes, self.page)?;
+        for segment in &layout.code {
+            if segment.offset.checked_add(segment.len).is_none_or(|end| end > self.image) {
+                return Err(Error::new(format!(
+                    "the code segment at file offset {:#x} of {:#x} bytes runs past the image part of {:#x}",
+                    segment.offset, segment.len, self.image
+                )));
+            }
+        }
+        let mut reserved = layout.reserved.iter();
+        let mut take = |len: u64, what: &str| -> Result<u64, Error> {
+            if len == 0 {
+                return Ok(0);
+            }
+            let Some(range) = reserved.next() else {
+                return Err(Error::new(format!(
+                    "the executable reserves no address space for the {what} ({len:#x} bytes): the link must give \
+                     it a reservation segment"
+                )));
+            };
+            if range.end - range.start < len {
+                return Err(Error::new(format!(
+                    "the executable reserves {:#x} bytes at {:#x} for the {what}, which needs {len:#x}",
+                    range.end - range.start,
+                    range.start
+                )));
+            }
+            Ok(range.start)
+        };
+        let arena = take(self.arena_len, "arena")?;
+        let cells = take(self.cells_len, "cells")?;
+        self.placed = Some(Placed { arena, cells });
+        self.pristine = true;
+        Ok(self.layout.insert(layout))
+    }
+
+    /// Nothing wrote the image part since [`CodeMemory::lay_out`] read it.
+    pub fn is_pristine(&self) -> bool {
+        self.pristine
+    }
+
+    /// The executable's layout, once [`CodeMemory::lay_out`] read it.
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_ref()
+    }
+
+    /// Writes `bytes` at `offset` of the image or the arena: code no thread can reach yet (the
+    /// image before its run, a reserved range before its slot is stored). Call
+    /// [`CodeMemory::publish`] after. Cells change only by [`CodeMemory::store_word`].
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         let range = self.checked(offset, bytes.len() as u64)?;
+        self.touch(offset);
         self.view.bytes_mut(range)?.copy_from_slice(bytes);
         Ok(())
     }
@@ -298,11 +423,12 @@ impl CodeMemory {
     /// Sets `len` bytes at `offset` to `byte` (a trap, to fill what a retired range held).
     pub fn fill(&mut self, offset: u64, len: u64, byte: u8) -> Result<(), Error> {
         let range = self.checked(offset, len)?;
+        self.touch(offset);
         self.view.bytes_mut(range)?.fill(byte);
         Ok(())
     }
 
-    /// The bytes at `range`, as the daemon's view has them.
+    /// The bytes at `range` of the image or the arena, as the daemon's view has them.
     pub fn bytes(&self, range: CodeRange) -> Result<&[u8], Error> {
         let range = self.checked(range.offset, range.len)?;
         self.view.bytes(range)
@@ -320,23 +446,37 @@ impl CodeMemory {
 
     /// Stores `value` in the aligned 8-byte word at `offset` with one release store: a slot,
     /// or the target word a stub loads. A thread that loads it sees the old value or the new,
-    /// whole.
+    /// whole. Every process sees the same value, so it must not depend on a slide.
     pub fn store_word(&mut self, offset: u64, value: u64) -> Result<(), Error> {
-        self.checked(offset, 8)?;
-        if !offset.is_multiple_of(8) {
-            return Err(Error::new(format!("a word store at {offset:#x}, which is not 8-byte aligned")));
-        }
-        self.view.word(offset as usize).store(value, std::sync::atomic::Ordering::Release);
+        self.word(offset, "store")?.store(value, std::sync::atomic::Ordering::Release);
+        self.touch(offset);
         Ok(())
     }
 
     /// The aligned 8-byte word at `offset`.
     pub fn load_word(&self, offset: u64) -> Result<u64, Error> {
-        self.checked(offset, 8)?;
+        Ok(self.word(offset, "load")?.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn word(&self, offset: u64, what: &str) -> Result<&std::sync::atomic::AtomicU64, Error> {
         if !offset.is_multiple_of(8) {
-            return Err(Error::new(format!("a word load at {offset:#x}, which is not 8-byte aligned")));
+            return Err(Error::new(format!("a word {what} at {offset:#x}, which is not 8-byte aligned")));
         }
-        Ok(self.view.word(offset as usize).load(std::sync::atomic::Ordering::Acquire))
+        let cells = self.image + self.arena_len;
+        match &self.cells {
+            Some((_, view)) if offset >= cells && offset - cells < self.cells_len => Ok(view.word((offset - cells) as usize)),
+            _ => {
+                self.checked(offset, 8)?;
+                Ok(self.view.word(offset as usize))
+            }
+        }
+    }
+
+    /// The image part is no longer the linker's file once anything writes into it.
+    fn touch(&mut self, offset: u64) {
+        if offset < self.image {
+            self.pristine = false;
+        }
     }
 
     /// Stores the AArch64 instruction `instruction` at the aligned `offset` with one 4-byte
@@ -359,6 +499,7 @@ impl CodeMemory {
         if !offset.is_multiple_of(4) {
             return Err(Error::new(format!("an instruction at {offset:#x}, which is not 4-byte aligned")));
         }
+        self.touch(offset);
         self.view.word32(offset as usize).store(instruction, std::sync::atomic::Ordering::Release);
         self.view.publish(range);
         Ok(())
@@ -400,7 +541,7 @@ impl CodeMemory {
     /// thread that could be in it has left it ([`CodeMemory::collect`]).
     pub fn retire(&mut self, range: CodeRange) -> Result<(), Error> {
         self.arena_range(range)?;
-        if self.base.is_none() || self.processes.is_empty() {
+        if self.placed.is_none() || self.processes.is_empty() {
             self.arena.give(range);
             return Ok(());
         }
@@ -458,51 +599,65 @@ impl CodeMemory {
         self.limbo.iter().map(|(_, range)| range.len).sum()
     }
 
-    /// Where offset 0 is in every run process: chosen when the memory is made, at random in
-    /// [`BASES`], so every process a launch starts maps it at the same place, and code can be
-    /// placed for run-process addresses before any process exists.
-    pub fn base(&self) -> Option<u64> {
-        self.base
-    }
-
-    /// The run-process address of `offset`.
-    pub fn address(&self, offset: u64) -> Option<u64> {
-        (offset < self.len()).then(|| self.base.map(|base| base + offset)).flatten()
-    }
-
-    /// The offset of the run-process address `address`.
-    pub fn offset_of(&self, address: u64) -> Option<u64> {
-        let offset = address.checked_sub(self.base?)?;
-        (offset < self.len()).then_some(offset)
-    }
-
-    /// Records that the run process `pid` mapped the memory at `base`. Every process maps it at
-    /// [`CodeMemory::base`]: elsewhere is an error.
-    pub fn attach(&mut self, pid: u32, base: u64) -> Result<(), Error> {
-        match self.base {
-            Some(at) if at != base => {
-                return Err(Error::new(format!(
-                    "process {pid} mapped the code memory at {base:#x}, where the others have it at {at:#x}"
-                )));
-            }
-            _ => self.base = Some(base),
+    /// The linked address of `offset`: in one of the image's code segments, the arena or the
+    /// cells, once [`CodeMemory::lay_out`] placed them. A run process has it at this plus its
+    /// slide.
+    pub fn linked(&self, offset: u64) -> Option<u64> {
+        let placed = self.placed?;
+        let arena = self.image..self.image + self.arena_len;
+        let cells = arena.end..arena.end + self.cells_len;
+        if arena.contains(&offset) {
+            return Some(placed.arena + (offset - arena.start));
         }
+        if cells.contains(&offset) {
+            return Some(placed.cells + (offset - cells.start));
+        }
+        let layout = self.layout.as_ref()?;
+        let segment = layout.code.iter().find(|it| offset >= it.offset && offset - it.offset < it.len)?;
+        Some(segment.linked + (offset - segment.offset))
+    }
+
+    /// The offset of the linked address `linked`, as [`CodeMemory::linked`] maps them.
+    pub fn offset_of(&self, linked: u64) -> Option<u64> {
+        let placed = self.placed?;
+        if linked >= placed.arena && linked - placed.arena < self.arena_len {
+            return Some(self.image + (linked - placed.arena));
+        }
+        if linked >= placed.cells && linked - placed.cells < self.cells_len {
+            return Some(self.image + self.arena_len + (linked - placed.cells));
+        }
+        let layout = self.layout.as_ref()?;
+        let segment = layout.code.iter().find(|it| linked >= it.linked && linked - it.linked < it.len)?;
+        Some(segment.offset + (linked - segment.linked))
+    }
+
+    /// Where the cells part is ([`CodeMemory::with_cells`]); empty when there is none.
+    pub fn cells(&self) -> CodeRange {
+        CodeRange { offset: self.image + self.arena_len, len: self.cells_len }
+    }
+
+    /// The cells part, to read with no lock while compiles and placements hold this memory.
+    pub fn cell_view(&self) -> Option<CellView> {
+        let (_, view) = self.cells.as_ref()?;
+        Some(CellView { view: view.clone(), start: self.image + self.arena_len, len: self.cells_len })
+    }
+
+    /// Records that the run process `pid` mapped the memory.
+    pub fn attach(&mut self, pid: u32) {
         if !self.processes.iter().any(|it| it.pid == pid) {
             self.processes.push(Process { pid, threads: Vec::new(), forks: false });
         }
-        Ok(())
     }
 
     /// As [`CodeMemory::attach`], for a process that forks children which run the program's
     /// code (a test binary's fork server): the fence can't see a child before it is told of
     /// it, so nothing retired is freed until this process and its children have exited
     /// ([`CodeMemory::exited`], called once the last of them ended).
-    pub fn attach_forking(&mut self, pid: u32, base: u64) -> Result<(), Error> {
-        self.attach(pid, base)?;
+    pub fn attach_forking(&mut self, pid: u32) {
+        self.attach(pid);
         if let Some(process) = self.processes.iter_mut().find(|it| it.pid == pid) {
             process.forks = true;
         }
-        Ok(())
     }
 
     /// Records that the run process `pid` exited: its threads hold no fence any more.
@@ -519,8 +674,25 @@ impl CodeMemory {
         }
     }
 
+    /// The arena's offset, length and linked address, once laid out.
+    pub(crate) fn arena_part(&self) -> Option<(CodeRange, u64)> {
+        let placed = self.placed?;
+        Some((CodeRange { offset: self.image, len: self.arena_len }, placed.arena))
+    }
+
+    /// The cells' offset, length and linked address, once laid out.
+    pub(crate) fn cells_part(&self) -> Option<(CodeRange, u64)> {
+        let placed = self.placed?;
+        Some((self.cells(), placed.cells))
+    }
+
+    /// The image and arena's object.
     pub(crate) fn object(&self) -> &sys::Object {
         &self.object
+    }
+
+    pub(crate) fn cells_object(&self) -> Option<&sys::Object> {
+        self.cells.as_ref().map(|(object, _)| object)
     }
 
     pub(crate) fn control(&self) -> &sys::Object {
@@ -529,13 +701,14 @@ impl CodeMemory {
 
     /// Posts what waits in limbo to the control table, under one grace.
     fn post(&mut self) {
-        let Some(base) = self.base else { return };
+        let Some(placed) = self.placed else { return };
         let mut posted = false;
         for (entry, range) in &mut self.limbo {
             if entry.is_some() {
                 continue;
             }
-            let Some(slot) = self.fences.post(base + range.offset, base + range.end()) else { break };
+            let start = placed.arena + (range.offset - self.image);
+            let Some(slot) = self.fences.post(start, start + range.len) else { break };
             *entry = Some((Grace::NONE, slot));
             posted = true;
         }
@@ -560,49 +733,54 @@ impl CodeMemory {
         format!("processes {}", pids.join(", "))
     }
 
+    /// The range of the image and arena's object at `offset`.
     fn checked(&self, offset: u64, len: u64) -> Result<std::ops::Range<usize>, Error> {
+        let code = self.image + self.arena_len;
         match offset.checked_add(len) {
-            Some(end) if end <= self.len() => Ok(offset as usize..end as usize),
+            Some(end) if end <= code => Ok(offset as usize..end as usize),
             _ => Err(Error::new(format!(
-                "{len} bytes at {offset:#x} of a code memory of {:#x} bytes",
-                self.len()
+                "{len} bytes at {offset:#x}: not in the image and arena 0..{code:#x} of a code memory (the cells \
+                 after them change only by word)"
             ))),
         }
     }
 
     fn arena_range(&self, range: CodeRange) -> Result<(), Error> {
-        if range.offset < self.image || range.end() > self.len() || range.len == 0 {
+        let end = self.image + self.arena_len;
+        if range.offset < self.image || range.end() > end || range.len == 0 {
             return Err(Error::new(format!(
-                "{:#x}..{:#x} is not in the arena {:#x}..{:#x}",
+                "{:#x}..{:#x} is not in the arena {:#x}..{end:#x}",
                 range.offset,
                 range.end(),
                 self.image,
-                self.len()
             )));
         }
         Ok(())
     }
 }
 
-/// The addresses run processes map a code memory at: above a 4 GiB zero page, the dyld shared
-/// cache and non-PIE images, below the top of a 39-bit address space (the smallest AArch64
-/// Linux configures), and away from where Linux, macOS and Windows put mmaps, heaps and PIE
-/// images in a process as small as the loader. A base taken in a process is an error naming it.
-pub const BASES: std::ops::Range<u64> = 0x10_0000_0000..0x40_0000_0000;
-const BASE_ALIGN: u64 = 2 << 20;
+/// The cells part of a [`CodeMemory`], read with no lock: a second mapping of the object
+/// here, kept while any clone lives.
+#[derive(Clone)]
+pub struct CellView {
+    view: Arc<sys::View>,
+    start: u64,
+    len: u64,
+}
 
-fn choose_base(len: u64) -> Result<u64, Error> {
-    let room = (BASES.end - BASES.start).checked_sub(len.next_multiple_of(BASE_ALIGN)).ok_or_else(|| {
-        Error::new(format!(
-            "a code memory of {len:#x} bytes does not fit {:#x}..{:#x}, where run processes map code memory",
-            BASES.start, BASES.end
-        ))
-    })?;
-    let mut random = [0u8; 16];
-    sys::random(&mut random)?;
-    let [a, b, c, d, e, f, g, h, ..] = random;
-    let pick = u64::from_le_bytes([a, b, c, d, e, f, g, h]);
-    Ok(BASES.start + (pick % (room / BASE_ALIGN + 1)) * BASE_ALIGN)
+impl CellView {
+    /// One relaxed load of the aligned word at `offset` of the object, which must be in the
+    /// cells part.
+    pub fn load(&self, offset: u64) -> Result<u64, Error> {
+        if !offset.is_multiple_of(8) || offset < self.start || offset.saturating_add(8) > self.start + self.len {
+            return Err(Error::new(format!(
+                "a cell load at {offset:#x}: not an aligned word of the cells {:#x}..{:#x}",
+                self.start,
+                self.start + self.len
+            )));
+        }
+        Ok(self.view.word((offset - self.start) as usize).load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// Whether AArch64 lets one thread change `instruction` while another may run it (Arm ARM

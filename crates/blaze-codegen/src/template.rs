@@ -24,8 +24,8 @@ use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Arch, CompiledFunction, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target, Unwind,
-    content,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target,
+    Unwind, content,
 };
 
 /// What an instance refers to, in the order its front end lists them: every function, static
@@ -42,6 +42,8 @@ pub enum Ref {
     Position(SpanRef),
     /// The `n`th of the template's own [`Template::externs`].
     Extern(u32),
+    /// The function's own SanitizerCoverage array ([`Target::Coverage`]).
+    Coverage(u32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -78,6 +80,8 @@ pub struct Template {
     /// ([`crate::backend::Emitted::extra`]): a function of its code and settings, so kept with
     /// it and never a place.
     pub externs: Vec<String>,
+    /// Its SanitizerCoverage arrays and PC table, which are its own whatever fills its places.
+    pub coverage: Option<Covered>,
 }
 
 /// A function's [`Unwind`], its personality routine or handler by place and its
@@ -135,6 +139,9 @@ pub enum TemplateError {
     Extern(u32),
     /// A symbol a backend says it named of its own accord is not an outside symbol's name.
     NotAnExtern(String),
+    /// A relocation names a SanitizerCoverage array that is not one of a function's
+    /// ([`Covered::ARRAYS`]), or a static names one.
+    Coverage(u32),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -160,14 +167,17 @@ impl std::fmt::Display for TemplateError {
             TemplateError::NotAnExtern(name) => {
                 write!(f, "the backend named {name:?} of its own accord, which is empty or listed twice")
             }
+            TemplateError::Coverage(array) => {
+                write!(f, "a relocation names coverage array {array}, which is no function's own")
+            }
         }
     }
 }
 
-pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 1";
+pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 2";
 
 fn check_refs(refs: &Refs) -> Result<(), TemplateError> {
-    match refs.iter().find(|it| matches!(it, Target::Data(_) | Target::Position(_))) {
+    match refs.iter().find(|it| matches!(it, Target::Data(_) | Target::Position(_) | Target::Coverage(_))) {
         Some(it) => Err(TemplateError::NotAReference(it.clone())),
         None => Ok(()),
     }
@@ -230,6 +240,8 @@ fn template_relocs(
                     Ref::Data(at)
                 }
                 Target::Position(span) => Ref::Position(*span),
+                Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
+                Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
                 other => reference(refs, externs, other)?,
             };
             Ok(TemplateReloc { at: reloc.at, kind: reloc.kind, target, addend: reloc.addend })
@@ -284,6 +296,8 @@ fn instantiate_relocs(
                     Target::Data(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
                 }
                 Ref::Position(span) => Target::Position(span),
+                Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
+                Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
             };
             Ok(Reloc { at: reloc.at, kind: reloc.kind, target, addend: reloc.addend })
         })
@@ -365,6 +379,7 @@ impl Template {
             lines: function.lines.clone(),
             refs: refs_len(refs),
             externs,
+            coverage: function.coverage.clone(),
         })
     }
 
@@ -390,6 +405,7 @@ impl Template {
             inlined: self.inlined.clone(),
             side: self.side,
             lines: self.lines.clone(),
+            coverage: self.coverage.clone(),
         })
     }
 
@@ -439,6 +455,7 @@ impl Template {
         for name in &self.externs {
             hasher.part(name.as_bytes());
         }
+        content::covered_into(&mut hasher, self.coverage.as_ref());
         hasher.finish()
     }
 }
@@ -452,10 +469,12 @@ impl StaticTemplate {
             }
             Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
         };
+        let data = template_data(&value.data, refs, &[])?;
+        names_no_coverage(&init, &data)?;
         Ok(StaticTemplate {
             align: value.align,
             init,
-            data: template_data(&value.data, refs, &[])?,
+            data,
             mutable: value.mutable,
             thread_local: value.thread_local,
             section: value.section.clone(),
@@ -465,6 +484,7 @@ impl StaticTemplate {
 
     pub fn instantiate(&self, item: ItemKey, instance: ContentId, refs: &Refs) -> Result<Static, TemplateError> {
         check_refs(refs)?;
+        names_no_coverage(&self.init, &self.data)?;
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
@@ -488,6 +508,22 @@ impl StaticTemplate {
     }
 }
 
+/// A static's value and data name no SanitizerCoverage array: those are a function's own.
+fn names_no_coverage(init: &TemplateInit, data: &[TemplateData]) -> Result<(), TemplateError> {
+    let relocs = match init {
+        TemplateInit::Bytes { relocs, .. } => relocs.as_slice(),
+        TemplateInit::Zeroed { .. } => &[],
+    };
+    let named = relocs.iter().chain(data.iter().flat_map(|it| &it.relocs)).find_map(|it| match it.target {
+        Ref::Coverage(array) => Some(array),
+        _ => None,
+    });
+    match named {
+        Some(array) => Err(TemplateError::Coverage(array)),
+        None => Ok(()),
+    }
+}
+
 fn template_relocs_into(hasher: &mut Hasher, relocs: &[TemplateReloc]) {
     hasher.update(&(relocs.len() as u64).to_le_bytes());
     for reloc in relocs {
@@ -501,6 +537,7 @@ fn template_relocs_into(hasher: &mut Hasher, relocs: &[TemplateReloc]) {
                 hasher.update(&[2]).id(&anchor).update(&index.to_le_bytes())
             }
             Ref::Extern(at) => hasher.update(&[3]).update(&at.to_le_bytes()),
+            Ref::Coverage(array) => hasher.update(&[4]).update(&array.to_le_bytes()),
         };
     }
 }
@@ -558,6 +595,7 @@ mod tests {
             side: None,
             unwind: None,
             lines: vec![Line { at: 0, span: SpanRef { anchor: ContentId([5; 32]), index: 2 } }],
+            coverage: None,
         };
         (function, refs)
     }
@@ -593,6 +631,41 @@ mod tests {
             lsda: None,
         });
         assert!(matches!(Template::of(&unlisted, &refs, &[]), Err(TemplateError::NotReferenced(_))));
+    }
+
+    #[test]
+    fn coverage_is_the_functions_own() {
+        let (mut function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        function.relocs.push(Reloc { at: 1, kind: RelocKind::PcRel32, target: Target::Coverage(0), addend: 1 });
+        function.coverage = Some(Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1), (5, 0)] });
+        let template = Template::of(&function, &refs, &[]).unwrap();
+        assert_eq!(template.relocs.last().unwrap().target, Ref::Coverage(0));
+        assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+        assert_ne!(template.id(), Template { coverage: None, ..template.clone() }.id());
+
+        let mut past = function.clone();
+        past.relocs.last_mut().unwrap().target = Target::Coverage(Covered::ARRAYS);
+        assert_eq!(Template::of(&past, &refs, &[]).unwrap_err(), TemplateError::Coverage(Covered::ARRAYS));
+        let mut listed = refs.clone();
+        listed.push(Target::Coverage(0));
+        assert_eq!(
+            Template::of(&function, &listed, &[]).unwrap_err(),
+            TemplateError::NotAReference(Target::Coverage(0))
+        );
+        let value = Static {
+            item: ItemKey(ContentId([3; 32])),
+            instance: ContentId([4; 32]),
+            align: 8,
+            init: Init::Bytes {
+                bytes: vec![0; 8],
+                relocs: vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Coverage(1), addend: 0 }],
+            },
+            data: Vec::new(),
+            mutable: false,
+            thread_local: false,
+            section: None,
+        };
+        assert_eq!(StaticTemplate::of(&value, &refs).unwrap_err(), TemplateError::Coverage(1));
     }
 
     #[test]

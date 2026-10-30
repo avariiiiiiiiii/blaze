@@ -20,6 +20,7 @@
 
 use std::{
     ffi::OsString,
+    fmt::Write as _,
     hash::BuildHasher as _,
     io::Write as _,
     path::{Path, PathBuf},
@@ -28,6 +29,9 @@ use std::{
 use blaze_usercode::trace::{self, Seen};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod alone;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -271,7 +275,7 @@ impl Reached {
 /// or empty when that is not known (another thread, a child process, the program before or
 /// after its tests): what has an empty test is taken to be every test's of the run. A record
 /// has each line once, in order.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Line {
     pub reached: Reached,
     pub test: String,
@@ -285,9 +289,11 @@ pub fn read_record(file: &Path) -> Option<Vec<Line>> {
         .map(|line| {
             let mut parts = line.splitn(3, '\t');
             let reached = Reached::of(parts.next()?)?;
+            // alloc: the record is read back once, after the run, into the lines the caller keeps.
             let (test, what) = (parts.next()?.to_owned(), parts.next()?.to_owned());
             Some(Line { reached, test, what })
         })
+        // alloc: one `Vec` of the lines, once per record read back.
         .collect()
 }
 
@@ -351,10 +357,27 @@ struct Noted {
 
 const _: () = assert!(std::mem::size_of::<Noted>() == 12);
 
+/// A scope of a [`Recorder`], by the id of its name: what a thread runs in, handed from one
+/// thread to another without its text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Scope(u32);
+
+impl Scope {
+    /// No scope: every scope's.
+    pub const NONE: Scope = Scope(NO_SCOPE);
+}
+
 /// Whether a scope or what a line names can't be written as it is: a tab or a line break.
 fn unwritable(text: &str) -> bool {
     text.as_bytes().contains(&b'\t') || text.as_bytes().contains(&b'\n')
 }
+
+/// The lines a [`Recorder`] has room for before it grows: a test's run reads a few hundred
+/// paths.
+const LINES: usize = 1024;
+
+/// The room of a line or a name being written: a path is at most 4096 bytes, most far less.
+const LINE: usize = 512;
 
 /// What a sandbox notes as its program runs: each [`trace::Line`] once, appended to the live
 /// record as it is first seen when there is one ([`Recorder::live`]), and written as the record
@@ -372,6 +395,9 @@ pub struct Recorder {
     live_failed: Option<String>,
     /// The line being appended to the live record.
     appending: Vec<u8>,
+    /// A name read as text (a marker's, or why a program was not traced), kept from one to
+    /// the next.
+    text: String,
     /// The scope each thread runs in, by the thread's id, as [`MARK`] said or as the thread
     /// that forked its process had it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -384,10 +410,10 @@ pub struct Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interposed: bool,
     /// The processes that ran a program and have not said the interposer loaded since, by
-    /// process id: the program and the scope it ran in. Walked in process id order once, as
-    /// the run ends ([`Recorder::ended`]).
+    /// process id: the ids of the program's name and of the scope it ran in. Walked in process
+    /// id order once, as the run ends ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pending: FxHashMap<u64, (String, String)>,
+    pending: FxHashMap<u64, (u32, u32)>,
     reads: bool,
     /// What is no input of the run's own process: the program it is, read again by a test
     /// that runs it, is an input of that test ([`Recorder::input`]).
@@ -411,10 +437,13 @@ pub struct Recorder {
 impl Recorder {
     /// For `spec`, in a sandbox whose own directories are `own`.
     pub fn new(spec: &Spec, own: &[&str]) -> Recorder {
+        // alloc: the directories the lines are told by, made whole once per sandbox.
         let tidied = |it: &Vec<PathBuf>| it.iter().map(|it| tidy(it)).collect::<Vec<_>>();
         let overlays = tidied(&spec.overlays);
+        // clone: once per sandbox, the overlays being where writes are the program's too.
         let mut written = overlays.clone();
         written.extend(tidied(&spec.writable));
+        // alloc: once per sandbox, its own directories by name.
         written.extend(own.iter().map(|it| (*it).to_owned()));
         let mut readable = tidied(&spec.readable);
         // A view's binds are where it writes and what it reads, as the writable and readable
@@ -433,20 +462,23 @@ impl Recorder {
         Recorder {
             names,
             noted: FxHashSet::default(),
-            lines: Vec::new(),
+            lines: Vec::with_capacity(LINES),
             live: None,
             live_failed: None,
-            appending: Vec::new(),
+            appending: Vec::with_capacity(LINE),
+            text: String::with_capacity(LINE),
             threads: FxHashMap::default(),
             known: FxHashSet::default(),
             interposed: false,
             pending: FxHashMap::default(),
             reads: spec.record_reads,
+            // alloc: once per sandbox, the paths that are no input by name.
             not_inputs: spec.not_inputs.iter().map(|it| tidy(it)).collect(),
-            ours: Vec::new(),
+            ours: Vec::with_capacity(1),
             written,
             readable,
             overlays,
+            // alloc: once per sandbox, as `written`'s.
             own: own.iter().map(|it| (*it).to_owned()).collect(),
         }
     }
@@ -454,6 +486,7 @@ impl Recorder {
     /// Appends each line to `file` as it is first seen, from now on.
     pub fn live(&mut self, file: &Path) -> Result<(), String> {
         let opened = std::fs::OpenOptions::new().append(true).open(file);
+        // alloc: the error, once, and the sandbox is not made.
         self.live = Some(opened.map_err(|e| format!("opening the live record {}: {e}", file.display()))?);
         Ok(())
     }
@@ -524,6 +557,7 @@ impl Recorder {
             line.extend_from_slice(self.names.get(written.what).as_bytes());
             line.push(b'\n');
             if let Err(e) = file.write_all(line) {
+                // alloc: the first failure alone, after which no line is appended.
                 self.live_failed = Some(e.to_string());
             }
         }
@@ -531,6 +565,7 @@ impl Recorder {
     }
 
     /// Every line seen, each once, in the order first seen.
+    #[cfg(test)]
     pub fn lines(&self) -> impl Iterator<Item = trace::Line> + '_ {
         self.lines.iter().map(|it| trace::Line {
             seen: it.seen,
@@ -550,12 +585,17 @@ impl Recorder {
     /// from one that did.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn ended(&mut self) {
-        let mut pending: Vec<(u64, (String, String))> = std::mem::take(&mut self.pending).into_iter().collect();
+        // alloc: once, as the run ends: the processes never traced, sorted by process id.
+        let mut pending: Vec<(u64, (u32, u32))> = std::mem::take(&mut self.pending).into_iter().collect();
         blaze_ids::radix::sort_by_key(&mut pending, |it| it.0);
+        let mut why = std::mem::take(&mut self.text);
         for (_, (program, scope)) in pending {
-            let why = format!("{program} ran without the interposer, so what it read is not known");
-            self.reached(Seen::Incomplete, &scope, &why);
+            why.clear();
+            let program = self.names.get(program);
+            _ = write!(why, "{program} ran without the interposer, so what it read is not known");
+            self.note(Seen::Incomplete, scope, &why);
         }
+        self.text = why;
     }
 
     /// Whether `path`, made whole, is an input of the line in `scope`: not the sandbox's own
@@ -577,6 +617,7 @@ impl Recorder {
                 let reached = Reached::of_seen(it.seen)?;
                 Some((reached, self.names.get(it.scope), self.names.get(it.what)))
             })
+            // alloc: once, as the run ends: the record's lines by reference, to sort.
             .collect();
         lines.sort_unstable();
         lines.dedup();
@@ -615,7 +656,8 @@ impl Recorder {
             match name.is_empty() {
                 true => _ = self.threads.remove(&thread),
                 false => {
-                    let scope = self.names.intern(&String::from_utf8_lossy(name));
+                    lossy_into(name, &mut self.text);
+                    let scope = self.names.intern(&self.text);
                     self.threads.insert(thread, scope);
                 }
             }
@@ -627,7 +669,10 @@ impl Recorder {
         if let Some(name) = path.strip_prefix(ENV_MARK.as_bytes()) {
             // A name that is not UTF-8 is read as one that is: the variable is an input
             // either way, and `Traced::env` names variables as text.
-            self.note(Seen::Env, self.scope_of(thread), &String::from_utf8_lossy(name));
+            let mut text = std::mem::take(&mut self.text);
+            lossy_into(name, &mut text);
+            self.note(Seen::Env, self.scope_id(thread), &text);
+            self.text = text;
             return true;
         }
         if path == CLOCK_MARK.as_bytes() {
@@ -641,13 +686,24 @@ impl Recorder {
         false
     }
 
-    /// The scope `thread` runs in, empty when none.
-    pub fn scope(&self, thread: u64) -> String {
-        self.names.get(self.scope_of(thread)).to_owned()
+    /// The name of the scope `thread` runs in, empty when none.
+    pub fn scope(&self, thread: u64) -> &str {
+        self.names.get(self.scope_id(thread))
+    }
+
+    /// The scope `thread` runs in, [`Scope::NONE`] when none.
+    pub fn scope_of(&self, thread: u64) -> Scope {
+        Scope(self.scope_id(thread))
+    }
+
+    /// The scope named `name`, kept from now on.
+    #[cfg(test)]
+    fn scope_named(&mut self, name: &str) -> Scope {
+        Scope(self.names.intern(name))
     }
 
     /// The id of the scope `thread` runs in.
-    fn scope_of(&self, thread: u64) -> u32 {
+    fn scope_id(&self, thread: u64) -> u32 {
         self.threads.get(&thread).copied().unwrap_or(NO_SCOPE)
     }
 
@@ -656,38 +712,37 @@ impl Recorder {
         self.known.contains(&thread)
     }
 
-    /// `thread`, not seen before, starts in `scope` (empty for none): a new process starts in
-    /// the scope the thread that forked it had then.
-    pub fn starts(&mut self, thread: u64, scope: String) {
-        if self.known.insert(thread) && !scope.is_empty() {
-            let scope = self.names.intern(&scope);
-            self.threads.insert(thread, scope);
+    /// `thread`, not seen before, starts in `scope` ([`Scope::NONE`] for none): a new process
+    /// starts in the scope the thread that forked it had then.
+    pub fn starts(&mut self, thread: u64, scope: Scope) {
+        if self.known.insert(thread) && scope != Scope::NONE {
+            self.threads.insert(thread, scope.0);
         }
     }
 
     /// `thread` read `path`, made whole: recorded when reads are and it is an input.
     pub fn read(&mut self, thread: u64, path: &str) {
-        self.note(Seen::Read, self.scope_of(thread), path);
+        self.note(Seen::Read, self.scope_id(thread), path);
     }
 
     /// `thread` looked at `path`, made whole, without opening it: recorded as [`Self::read`]
     /// records a read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn looked(&mut self, thread: u64, path: &str) {
-        self.note(Seen::Looked, self.scope_of(thread), path);
+        self.note(Seen::Looked, self.scope_id(thread), path);
     }
 
     /// `thread` listed the directory `path`, made whole: recorded as [`Self::read`] records a
     /// read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn listed(&mut self, thread: u64, path: &str) {
-        self.note(Seen::Listed, self.scope_of(thread), path);
+        self.note(Seen::Listed, self.scope_id(thread), path);
     }
 
     /// `thread` got what can't be traced.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn untraceable(&mut self, thread: u64, it: blaze_core::Untraceable) {
-        self.note(Seen::Untraceable, self.scope_of(thread), trace::untraceable_name(it));
+        self.note(Seen::Untraceable, self.scope_id(thread), trace::untraceable_name(it));
     }
 
     /// Randomness was read. What a process read of it stays in it (`std` keeps the keys of its
@@ -701,9 +756,10 @@ impl Recorder {
     /// `process` runs the program `path`, in `scope`: when the processes load the interposer,
     /// it is to say so before the run ends.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn runs(&mut self, process: u64, path: &str, scope: String) {
+    pub fn runs(&mut self, process: u64, path: &str, scope: Scope) {
         if self.interposed && self.reads {
-            self.pending.insert(process, (path.to_owned(), scope));
+            let program = self.names.intern(path);
+            self.pending.insert(process, (program, scope.0));
         }
     }
 
@@ -731,17 +787,17 @@ impl Recorder {
 
     /// The sandbox refused `thread` a write to `path`.
     pub fn refused_write(&mut self, thread: u64, path: &str) {
-        self.note(Seen::RefusedWrite, self.scope_of(thread), path);
+        self.note(Seen::RefusedWrite, self.scope_id(thread), path);
     }
 
     /// The sandbox refused `thread` the network at `address`.
     pub fn refused_net(&mut self, thread: u64, address: &str) {
-        self.note(Seen::RefusedNet, self.scope_of(thread), address);
+        self.note(Seen::RefusedNet, self.scope_id(thread), address);
     }
 
     /// The record is not whole for what `thread` did, and why.
     pub fn incomplete(&mut self, thread: u64, why: &str) {
-        self.note(Seen::Incomplete, self.scope_of(thread), why);
+        self.note(Seen::Incomplete, self.scope_id(thread), why);
     }
 }
 
@@ -822,6 +878,7 @@ pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
         let text = std::fs::read_to_string(&it).map_err(|_| "a spec it can read")?;
         serde_json::from_str::<Spec>(&text).map_err(|_| "a spec it can parse")
     });
+    // alloc: the program's command line, once, at the edge.
     let program: Vec<OsString> = args.skip_while(|it| it != "--").skip(1).collect();
     let spec = match (spec, program.is_empty()) {
         (Ok(spec), false) => spec,
@@ -855,6 +912,7 @@ fn backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         _ = (spec, program, also);
+        // alloc: the error, once: there is no sandbox to make.
         Err(format!("there is no sandbox on {} yet", std::env::consts::OS))
     }
 }
@@ -864,26 +922,30 @@ fn backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
 #[cfg(windows)]
 fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
     if !spec.overlays.is_empty() {
+        // alloc: the error, once: no sandbox is made.
         return Err("there are no overlays on Windows: a test's sandbox can't be made".to_owned());
     }
     if spec.view.is_some() {
+        // alloc: the error, once: no sandbox is made.
         return Err("there are no views of the machine on Windows".to_owned());
     }
     let Some((name, args)) = program.and_then(|it| it.split_first()) else {
         return windows::probe().map(|()| 0);
     };
+    // The launcher's spec, made once per run at the edge: what it owns is what it hands the
+    // AppContainer.
     let confined = blaze_usercode::confine::Spec {
         program: PathBuf::from(name),
-        args: args.to_vec(),
-        env: spec.env.iter().map(|(k, v)| (k.into(), v.into())).collect(),
-        dir: spec.cwd.clone(),
-        read: spec.readable.clone(),
-        write: spec.writable.clone(),
+        args: args.to_vec(), // alloc: once per run, the launcher's spec.
+        env: spec.env.iter().map(|(k, v)| (k.into(), v.into())).collect(), // alloc: as `args`.
+        dir: spec.cwd.clone(),        // clone: as `args`.
+        read: spec.readable.clone(),  // clone: as `args`.
+        write: spec.writable.clone(), // clone: as `args`.
         network: also.network,
         trace: false,
         live: PathBuf::new(),
         report: PathBuf::new(),
-        not_inputs: Vec::new(),
+        not_inputs: Vec::with_capacity(0),
     };
     let code = windows::run(&confined)?;
     if let Some(file) = &spec.record {
@@ -906,6 +968,7 @@ pub fn available(overlays: bool) -> Result<(), String> {
 
 /// What a probe makes a sandbox for.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 enum Probe {
     /// A writable directory, as a build script's sandbox has.
     Writable,
@@ -923,8 +986,10 @@ fn probed(kind: Probe) -> Result<(), String> {
     AVAILABLE[kind as usize]
         .get_or_init(|| {
             if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+                // alloc: the error, once per process.
                 return Err(format!("there is no sandbox on {} yet", std::env::consts::OS));
             }
+            // alloc: the error, once per process.
             let exe = std::env::current_exe().map_err(|it| format!("blaze is not found ({it})"))?;
             let flag = match kind {
                 Probe::Writable => None,
@@ -936,26 +1001,35 @@ fn probed(kind: Probe) -> Result<(), String> {
                 .args(flag)
                 .stdin(std::process::Stdio::null())
                 .output()
+                // alloc: the error, once per process.
                 .map_err(|it| format!("the probe did not run ({it})"))?;
             match out.status.success() {
                 true => Ok(()),
+                // alloc: the error, once per process.
                 false => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
             }
         })
+        // `Ok(())` copies nothing.
+        // clone: the error alone: why no sandbox can be made, for the caller to report.
         .clone()
 }
 
 /// Makes a sandbox around nothing, as `kind` says: `Ok` when it could be made, why not
 /// otherwise, with what would let it be where that is known.
 fn probe(kind: Probe) -> Result<(), String> {
+    // alloc: the probe's directory, once per process.
     let dir = std::env::temp_dir().join(format!("blaze-sandbox-probe-{}", std::process::id()));
+    // alloc: the error, once.
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    // The probe's spec, once per process: the directory is each of its parts.
     let spec = match kind {
+        // clone: the probe's spec, once per process.
         Probe::Overlays => Spec { cwd: dir.clone(), overlays: vec![dir.clone()], ..Spec::default() },
+        // clone: the probe's spec, once per process.
         Probe::Writable => Spec { cwd: dir.clone(), writable: vec![dir.clone()], ..Spec::default() },
         Probe::V2 => Spec {
-            cwd: dir.clone(),
-            writable: vec![dir.clone()],
+            cwd: dir.clone(),           // clone: the probe's spec, once per process.
+            writable: vec![dir.clone()], // clone: the probe's spec, once per process.
             record_reads: true,
             ..Spec::default()
         },
@@ -963,6 +1037,7 @@ fn probe(kind: Probe) -> Result<(), String> {
     let live = Live { path: dir.join("live"), start: 0, failed: Default::default() };
     let also = match kind {
         Probe::V2 => {
+            // alloc: the error, once.
             std::fs::write(&live.path, "").map_err(|it| format!("{}: {it}", live.path.display()))?;
             Also { network: false, live: Some(&live), env: None }
         }
@@ -982,7 +1057,9 @@ fn probe(kind: Probe) -> Result<(), String> {
     };
     match ended {
         Ok(0) => Ok(()),
+        // alloc: the error, once per process.
         Ok(_) => Err(format!("the sandbox could not be made (it said why above){hint}")),
+        // alloc: the error, once per process.
         Err(error) => Err(format!("{error}{hint}")),
     }
 }
@@ -995,16 +1072,19 @@ fn probe(kind: Probe) -> Result<(), String> {
 pub fn container(root: &Path, container: Option<&str>) -> Option<String> {
     for file in [".dockerenv", "run/.containerenv"] {
         if root.join(file).exists() {
+            // alloc: part of an error, once: the sandbox could not be made.
             return Some(format!("/{file}"));
         }
     }
     if let Some(name) = container.filter(|it| !it.is_empty()) {
+        // alloc: part of an error, once.
         return Some(format!("`container={name}`"));
     }
     let cgroup = std::fs::read_to_string(root.join("proc/1/cgroup")).unwrap_or_default();
     ["docker", "kubepods", "containerd", "libpod", "lxc"]
         .into_iter()
         .find(|it| cgroup.contains(it))
+        // alloc: part of an error, once.
         .map(|it| format!("/proc/1/cgroup naming {it}"))
 }
 
@@ -1013,6 +1093,7 @@ pub fn container(root: &Path, container: Option<&str>) -> Option<String> {
 /// the ways on: a profile that allows it, or no sandbox at all.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn container_hint(known: &str) -> String {
+    // alloc: part of an error, once: the sandbox could not be made.
     format!(
         "; this runs in a container ({known}), and its seccomp profile (Docker's default) refuses \
          `unshare(CLONE_NEWUSER)`: run the container with `--security-opt seccomp=unconfined` \
@@ -1046,9 +1127,25 @@ fn tidy_into(path: &[u8], out: &mut String) {
         if !out.is_empty() && !out.ends_with('/') {
             out.push('/');
         }
-        match std::str::from_utf8(part) {
-            Ok(part) => out.push_str(part),
-            Err(_) => out.push_str(&String::from_utf8_lossy(part)),
+        push_lossy(part, out);
+    }
+}
+
+/// `bytes` as text into `out`, in the room `out` keeps from one to the next: as
+/// `String::from_utf8_lossy` makes it, each piece that is not UTF-8 one U+FFFD.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn lossy_into(bytes: &[u8], out: &mut String) {
+    out.clear();
+    push_lossy(bytes, out);
+}
+
+/// [`lossy_into`], after what `out` has.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn push_lossy(bytes: &[u8], out: &mut String) {
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            out.push(char::REPLACEMENT_CHARACTER);
         }
     }
 }
@@ -1056,6 +1153,65 @@ fn tidy_into(path: &[u8], out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts each test thread's allocations, for the allocation-budget tests
+    /// (docs/v2/plan/goals/principles.md): this crate's test binary has its one global allocator
+    /// here.
+    #[global_allocator]
+    static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+    /// The recorder's hot path, a line it has seen (a path read again, a write refused again, a
+    /// thread marking the test it is in again, a variable read again), allocates nothing; with
+    /// the live record too, which a line seen before is not appended to again.
+    #[test]
+    fn a_line_seen_before_allocates_nothing() {
+        let dir = std::env::temp_dir().join(format!("blaze-record-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("live");
+        std::fs::write(&live, "").unwrap();
+        let spec = Spec { overlays: vec!["/ws".into()], record_reads: true, ..Spec::default() };
+        let mut recorder = Recorder::new(&spec, &["/tmp"]);
+        recorder.live(&live).unwrap();
+        recorder.interposed();
+        let seen = |recorder: &mut Recorder| {
+            assert!(recorder.marked(7, 7, b"/.blaze-test/tests::a"));
+            recorder.read(7, "/ws/a");
+            recorder.read(8, "/ws/a");
+            recorder.looked(7, "/ws/b");
+            recorder.listed(7, "/ws");
+            recorder.refused_write(7, "/etc/x");
+            recorder.refused_net(7, "1.2.3.4:443");
+            recorder.untraceable(7, blaze_core::Untraceable::Clock);
+            recorder.random();
+            assert!(recorder.marked(7, 7, b"/.blaze-env/HOME"));
+            assert!(recorder.marked(7, 7, b"/.blaze-test/\xfftests"));
+            recorder.read(7, "/ws/a");
+            assert!(recorder.marked(7, 7, b"/.blaze-test/"));
+            _ = recorder.scope_of(7);
+        };
+        seen(&mut recorder);
+        let written = std::fs::read_to_string(&live).unwrap();
+        blaze_alloc_count::assert_at_most(0, "a line the recorder has seen", || {
+            for _ in 0..100 {
+                seen(&mut recorder);
+            }
+        });
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), written, "no line twice");
+        assert_eq!(recorder.live_failed(), None);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A name that is not UTF-8 is read as `String::from_utf8_lossy` reads it, into the room
+    /// kept.
+    #[test]
+    fn a_name_is_read_as_lossy_text_into_its_room() {
+        let names: [&[u8]; 6] = [b"", b"tests::a", b"\xff", b"a\xffb\xfe", b"\xe2\x82", "é".as_bytes()];
+        let mut out = String::with_capacity(64);
+        for name in names {
+            blaze_alloc_count::assert_at_most(0, "a name read as text", || lossy_into(name, &mut out));
+            assert_eq!(out, String::from_utf8_lossy(name), "{name:?}");
+        }
+    }
 
     #[test]
     fn blaze_sandbox_off_or_0_turns_sandboxes_off() {
@@ -1202,8 +1358,8 @@ mod tests {
         let mut recorder = Recorder::new(&spec, &[]);
         recorder.interposed();
         assert!(recorder.marked(10, 10, b"/.blaze-test/tests::b"));
-        recorder.runs(10, "/bin/loads", recorder.scope(10));
-        recorder.runs(11, "/bin/static", recorder.scope(11));
+        recorder.runs(10, "/bin/loads", recorder.scope_of(10));
+        recorder.runs(11, "/bin/static", recorder.scope_of(11));
         assert!(recorder.marked(10, 10, b"/.blaze-loaded"));
         recorder.ended();
         let lines: Vec<_> = recorder.lines().collect();
@@ -1224,7 +1380,7 @@ mod tests {
         recorder.interposed();
         let processes = [900u64, 3, 70, 1 << 40, 12, 5000];
         for process in processes {
-            recorder.runs(process, &format!("/bin/p{process}"), String::new());
+            recorder.runs(process, &format!("/bin/p{process}"), Scope::NONE);
         }
         recorder.ended();
         let mut sorted = processes;
@@ -1243,10 +1399,11 @@ mod tests {
     fn a_new_process_starts_in_the_scope_it_is_given_and_a_thread_once() {
         let mut recorder = Recorder::new(&Spec { record_reads: true, ..Spec::default() }, &[]);
         assert!(!recorder.knows(20));
-        recorder.starts(20, "tests::c".to_owned());
+        let (c, d) = (recorder.scope_named("tests::c"), recorder.scope_named("tests::d"));
+        recorder.starts(20, c);
         assert!(recorder.knows(20));
         assert_eq!(recorder.scope(20), "tests::c");
-        recorder.starts(20, "tests::d".to_owned());
+        recorder.starts(20, d);
         assert_eq!(recorder.scope(20), "tests::c", "a thread seen before keeps its scope");
         assert!(recorder.marked(20, 20, b"/.blaze-test/"));
         assert_eq!(recorder.scope(20), "");

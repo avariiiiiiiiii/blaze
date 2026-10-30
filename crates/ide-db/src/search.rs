@@ -7,7 +7,7 @@
 use std::mem;
 use std::{cell::LazyCell, cmp::Reverse, sync::Arc};
 
-use base_db::{SourceDatabase, all_crates};
+use base_db::{all_crates};
 use either::Either;
 use hir::{
     Adt, AsAssocItem, DefWithBody, EditionedFileId, ExpressionStoreOwner, FileRange,

@@ -241,6 +241,109 @@ mod unix {
         pub fn clear(_queue: &Option<OwnedFd>) {}
     }
 
+    // What a test's child closes: every descriptor of the server's (its socket to blaze, its
+    // children's outputs and pidfds, the child's own ends), which is every one at 3 or above
+    // that was not open when the server started, since no code of the program runs in the
+    // server after. On Linux that is one `close_range` per gap in what the program had open,
+    // usually one, where a `close` per descriptor costs two per test in flight.
+    #[cfg(target_os = "linux")]
+    mod fds {
+        use super::super::closed_ranges;
+        use super::{Int, dup2};
+
+        unsafe extern "C" {
+            fn syscall(number: ::core::ffi::c_long, ...) -> ::core::ffi::c_long;
+            fn fcntl(fd: Int, command: Int, ...) -> Int;
+        }
+
+        /// `close_range`, the same number on every Linux architecture.
+        const CLOSE_RANGE: ::core::ffi::c_long = 436;
+        const F_GETFD: Int = 1;
+
+        /// The ranges a test's child closes.
+        pub struct Kept(Vec<(u32, u32)>);
+
+        impl Kept {
+            /// What is open now, which every test's child keeps; an error on a kernel without
+            /// `close_range` (before 5.9).
+            pub fn now() -> Result<Kept, String> {
+                // SAFETY: `close_range` takes integers and touches no memory of ours; the range
+                // of the one descriptor `u32::MAX`, never open, closes nothing and only asks
+                // whether the kernel has the call.
+                let asked = unsafe {
+                    syscall(CLOSE_RANGE, u32::MAX as ::core::ffi::c_long, u32::MAX as ::core::ffi::c_long, 0 as ::core::ffi::c_long)
+                };
+                if asked != 0 {
+                    return Err(format!("close_range: {} (blaze's fork server needs Linux 5.9 or later)", ::std::io::Error::last_os_error())); // alloc: error path
+                }
+                let mut open: Vec<u32> = Vec::new(); // alloc: setup, once per server
+                let listing = ::std::fs::read_dir("/proc/self/fd").map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
+                for entry in listing {
+                    let entry = entry.map_err(|error| format!("listing /proc/self/fd: {}", error))?; // alloc: error path
+                    if let Some(fd) = entry.file_name().to_str().and_then(|it| it.parse::<u32>().ok()) {
+                        open.push(fd);
+                    }
+                }
+                // The listing's own descriptor was in it, and is closed by now.
+                // SAFETY: F_GETFD takes integers and touches no memory of ours; it only asks
+                // whether `fd` is open.
+                open.retain(|&fd| unsafe { fcntl(fd as Int, F_GETFD) } >= 0);
+                let mut gaps = Vec::new(); // alloc: setup, once per server
+                closed_ranges(&mut open, &mut gaps);
+                Ok(Kept(gaps))
+            }
+
+            /// In the test's child: its output on 1 and 2, and every descriptor of the server's
+            /// closed. `_servers` is what the other platforms close one by one.
+            pub fn into_child(&self, theirs: Int, _servers: impl Iterator<Item = Int>) {
+                // SAFETY: `theirs` is open until the closes below; 1 and 2 become copies of it,
+                // and stay, being below 3.
+                unsafe { dup2(theirs, 1) };
+                // SAFETY: as above.
+                unsafe { dup2(theirs, 2) };
+                for &(first, last) in &self.0 {
+                    // SAFETY: in the test's child, which leaves by `_exit` and never uses the
+                    // server's owners again (`start`), so no descriptor is closed twice or used
+                    // after its close; `theirs` is in a gap, closed here after its copies.
+                    unsafe { syscall(CLOSE_RANGE, first as ::core::ffi::c_long, last as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    mod fds {
+        use super::{Int, close, dup2};
+
+        /// Nothing: the other platforms close the server's descriptors one by one.
+        pub struct Kept;
+
+        impl Kept {
+            pub fn now() -> Result<Kept, String> {
+                Ok(Kept)
+            }
+
+            /// In the test's child: every descriptor of `servers` closed, and its output on 1
+            /// and 2.
+            pub fn into_child(&self, theirs: Int, servers: impl Iterator<Item = Int>) {
+                for fd in servers {
+                    // SAFETY: in the test's child, which leaves by `_exit` and never uses the
+                    // server's owners again (`start`), so no descriptor is closed twice or used
+                    // after its close.
+                    unsafe { close(fd) };
+                }
+                // SAFETY: `theirs` is open until the close below; 1 and 2 become copies of it.
+                unsafe { dup2(theirs, 1) };
+                // SAFETY: as above.
+                unsafe { dup2(theirs, 2) };
+                if theirs > 2 {
+                    // SAFETY: as above, `theirs` is not used in the child after this; 1 and 2 stay.
+                    unsafe { close(theirs) };
+                }
+            }
+        }
+    }
+
     pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: &::std::ffi::OsStr) -> Result<(), String> {
         // Taken out before any test runs, so a test that runs its own binary gets libtest.
         // SAFETY: the harness's `main` calls this before it starts any thread, and the server
@@ -249,6 +352,7 @@ mod unix {
         unsafe {
             ::std::env::remove_var(SOCKET);
         }
+        let kept = fds::Kept::now()?;
         let queue = exits::queue()?;
         let mut exec = Exec::open();
         // A child ended before its end could be watched: the next poll doesn't wait.
@@ -323,7 +427,7 @@ mod unix {
                         }
                     };
                     match frame {
-                        View::Run { id, index } => match start(tests, &mut exec, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
+                        View::Run { id, index } => match start(tests, &mut exec, &kept, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
                             Ok(mut child) => {
                                 match exits::watch(&queue, child.pid) {
                                     Ok((exit, ended)) => {
@@ -436,6 +540,7 @@ mod unix {
     fn start(
         tests: &'static [&'static test::TestDescAndFn],
         exec: &mut Exec,
+        kept: &fds::Kept,
         id: u64,
         index: u32,
         stream: &UnixStream,
@@ -465,26 +570,12 @@ mod unix {
             // SAFETY: `setpgid` takes integers and touches no memory of ours; (0, 0) makes
             // the child lead a group of its own, which `kill_group` relies on.
             unsafe { setpgid(0, 0) };
-            // SAFETY: as above, the socket's owner is not used in the child.
-            unsafe { close(stream.as_raw_fd()) };
-            // SAFETY: as above.
-            unsafe { close(ours.as_raw_fd()) };
-            for child in children {
-                // SAFETY: as above, the other children's owners are not used in this one.
-                unsafe { close(child.output.as_raw_fd()) };
-                if let Some(exit) = &child.exit {
-                    // SAFETY: as above.
-                    unsafe { close(exit.as_raw_fd()) };
-                }
-            }
-            // SAFETY: `theirs` is open until the close below; 1 and 2 become copies of it.
-            unsafe { dup2(theirs.as_raw_fd(), 1) };
-            // SAFETY: as above.
-            unsafe { dup2(theirs.as_raw_fd(), 2) };
-            if theirs.as_raw_fd() > 2 {
-                // SAFETY: as above, `theirs` is not used in the child after this; 1 and 2 stay.
-                unsafe { close(theirs.as_raw_fd()) };
-            }
+            let servers = [stream.as_raw_fd(), ours.as_raw_fd()].into_iter().chain(
+                children
+                    .iter()
+                    .flat_map(|child| ::core::iter::once(child.output.as_raw_fd()).chain(child.exit.as_ref().map(|it| it.as_raw_fd()))),
+            );
+            kept.into_child(theirs.as_raw_fd(), servers);
             let armed = region.arm();
             if armed != 0 {
                 eprintln!("blaze's fork server: the runtime did not arm the execution record ({}); what this test executed is not known", armed);
@@ -586,7 +677,7 @@ mod unix {
         unsafe { access(path.as_ptr() as *const ::core::ffi::c_char, 0) };
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Copy)]
     enum Panics {
         No,
         Yes,
@@ -675,7 +766,7 @@ mod unix {
         };
         if cfg!(panic = "abort") {
             // No unwinding to catch: the first panic is judged where it happens.
-            let judged = panics.clone(); // clone: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
+            let judged = panics;
             let default = ::std::panic::take_hook();
             ::std::panic::set_hook(Box::new(move |info| { // alloc: in the test's child, after its fork: libtest's own hook and thread, nothing of the server's
                 default(info);

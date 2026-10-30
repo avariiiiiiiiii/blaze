@@ -2,41 +2,68 @@
 //! the end of work done elsewhere; timers are a [`Wheel`] whose next deadline ends the wait,
 //! with no registration in the kernel. File calls block, so they run on threads of the
 //! driver's own; watches and journals are FSEvents streams on dispatch queues of their own.
-//! Both hand their completions back through a channel and wake the kqueue with an
+//! Both hand their completions back through a bounded channel and wake the kqueue with an
 //! `EVFILT_USER` trigger.
 //!
-//! Every registration carries an id of the driver's in `udata`, so an event of a descriptor
-//! closed and reused within one batch is told apart from the new one's and dropped. Changes are
-//! made with the next wait, all in one call, their failures coming back as events.
+//! Every registration carries a handle of the driver's in `udata`: the bits of a
+//! [`blaze_mem::Handle`] into a slab of what each names, so an event of a registration that
+//! has ended (its descriptor closed and reused within one batch, its process reaped, its slot
+//! holding another since) is a stale handle, dropped. Changes are made with the next wait, all
+//! in one call, their failures coming back as events.
+//!
+//! Memory (docs/v2/plan/design/memory.md): processes, listens, connects, connections and
+//! watches sit in [`Slab`]s tagged [`MemTag::Io`], named by their handles (a [`Conn`] is one's
+//! bits), with maps from the caller's [`Tag`] to the handle reserved at setup. A file effect
+//! goes to the threads through a bounded channel and comes back through another, each holding
+//! [`FILES`], the most at the threads at once (more wait in a backlog the driver keeps), so
+//! neither ever waits and a round trip allocates nothing. Watches tell through a channel of
+//! their own, and a stopped watch is kept with its buffers for the next. A warm submit and
+//! poll allocate only what a completion carries.
 
 use std::{
     collections::VecDeque,
     io,
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        mpsc::{self, Receiver, Sender},
-    },
+    sync::Arc,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
+use blaze_mem::{MemError, Slab, Tag as MemTag};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Address, Command, Completion, Confine, Conn, Done, Driver, Effect, IoError, Tag, fs, fsevents,
+    Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
+    Tag,
+    fsevents::{self, Tell},
     net, process,
     wheel::{self, Wheel},
 };
 
-/// The id of the trigger that says the channel has completions.
+/// The `udata` of the trigger that says a channel has completions: no handle's bits, since a
+/// slab issues odd generations only.
 const TRIGGER: u64 = 0;
 /// Events taken off the kqueue at once, besides the failures of the changes made with them.
 const EVENTS: usize = 64;
+/// File effects at the threads at once: queued, running, or done and not yet taken. Each
+/// channel between the driver and the threads holds this many, so neither a submit nor a file
+/// thread ever waits on one; more wait in the driver's backlog.
+const FILES: usize = 1024;
+/// Completions of watches not yet taken: a watch that hears more waits for room (its queue
+/// holds fseventsd back, which drops what it cannot hold and says so).
+const WATCHED: usize = 4096;
+/// The most registrations, processes, listens, connects, connections and watches the driver
+/// holds at once: each slab's reservation, committed only as used.
+const MOST: u32 = 1 << 20;
+/// Watches kept stopped for the next, their cookies, queue and buffers made already.
+const SPARE_WATCHES: usize = 64;
+/// Tags watched, spawned or listening at once that the maps hold before they grow.
+const TAGS: usize = 256;
 
-/// `struct kevent` as the system lays it out, with `udata` the driver's id, so the lists of
-/// changes and events are plain data of the driver's own.
+/// `struct kevent` as the system lays it out, with `udata` the driver's handle, so the lists
+/// of changes and events are plain data of the driver's own.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Kevent {
@@ -53,10 +80,14 @@ const _: () = assert!(
         && align_of::<Kevent>() == align_of::<libc::kevent>()
 );
 
-/// The kqueue and the channel, shared with the file threads and the watches' queues.
+/// The kqueue and the channels, shared with the file threads and the watches' queues.
 struct Notify {
     kq: OwnedFd,
-    done: Sender<Completion>,
+    files: Sender<Completion>,
+    watched: Sender<Completion>,
+    /// What the file threads allocated doing their effects and handing them back.
+    #[cfg(test)]
+    file_allocations: std::sync::atomic::AtomicU64,
 }
 
 impl Notify {
@@ -92,29 +123,91 @@ impl Notify {
         }
     }
 
-    /// Hands `completion` to the polling thread and wakes it; false once the driver is gone.
-    fn send(&self, completion: Completion) -> bool {
-        if self.done.send(completion).is_err() {
-            return false;
-        }
+    /// Wakes the polling thread: a channel has completions.
+    fn wake(&self) {
         _ = self.change(TRIGGER as usize, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, TRIGGER);
-        true
     }
 }
 
-/// What an event is about, by the id in its `udata`.
-#[derive(Clone, Copy)]
+/// Where a watch tells what it hears: the watches' channel, and a wake.
+struct Watched(Arc<Notify>);
+
+impl Tell for Watched {
+    fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>> {
+        match self.0.watched.send_timeout(completion, wait) {
+            Ok(()) => {
+                self.0.wake();
+                Ok(())
+            }
+            Err(SendTimeoutError::Timeout(completion)) => Err(Some(completion)),
+            Err(SendTimeoutError::Disconnected(_)) => Err(None),
+        }
+    }
+}
+
+type Id = blaze_mem::Handle<Owner>;
+type SpawnId = blaze_mem::Handle<Spawned>;
+type ListenId = blaze_mem::Handle<Listening>;
+type ConnectId = blaze_mem::Handle<Connecting>;
+type ConnId = blaze_mem::Handle<Connection>;
+type WatchId = blaze_mem::Handle<fsevents::Watch<Watched>>;
+
+/// What an event is about, by the handle in its `udata`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Owner {
-    Exit(Tag),
-    Output { tag: Tag, err: bool },
-    Input(Tag),
-    Listen(Tag),
-    Connecting(Tag),
-    Read(Conn),
-    Write(Conn),
+    Exit(SpawnId),
+    Output { spawn: SpawnId, err: bool },
+    Input(SpawnId),
+    Listen(ListenId),
+    Connecting(ConnectId),
+    Read(ConnId),
+    Write(ConnId),
+}
+
+/// What each registration's `udata` names. Ids are handles' bits: one of a registration that
+/// has ended names nothing, even once its slot holds another's.
+struct Owners {
+    slab: Slab<Owner>,
+}
+
+impl Owners {
+    fn new() -> Result<Owners, MemError> {
+        Ok(Owners { slab: Slab::new(MOST, MemTag::Io)? })
+    }
+
+    fn own(&mut self, owner: Owner) -> u64 {
+        self.slab.insert(owner).to_bits()
+    }
+
+    fn get(&self, id: u64) -> Option<Owner> {
+        self.slab.get(Id::from_bits(id)).copied()
+    }
+
+    fn disown(&mut self, id: u64) -> Option<Owner> {
+        self.slab.remove(Id::from_bits(id))
+    }
+}
+
+/// A process's registrations: its output, its error, its input and its end.
+#[derive(Default)]
+struct Ids {
+    ids: [u64; 4],
+    len: usize,
+}
+
+impl Ids {
+    fn push(&mut self, id: u64) {
+        self.ids[self.len] = id;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        &self.ids[..self.len]
+    }
 }
 
 struct Spawned {
+    tag: Tag,
     pid: libc::pid_t,
     /// Open until its input is all written.
     stdin: Option<OwnedFd>,
@@ -128,15 +221,17 @@ struct Spawned {
     /// Why its output or input could not all be moved.
     failed: Option<io::Error>,
     finish: process::Finish,
-    ids: Vec<u64>,
+    ids: Ids,
 }
 
 struct Listening {
+    tag: Tag,
     listener: net::Listener,
     id: u64,
 }
 
 struct Connecting {
+    tag: Tag,
     fd: OwnedFd,
     at: Address,
     unix: bool,
@@ -151,13 +246,27 @@ struct Connection {
     write: u64,
 }
 
+fn conn_id(conn: Conn) -> ConnId {
+    ConnId::from_bits(conn.0)
+}
+
+fn no_slab(error: MemError) -> io::Error {
+    io::Error::other(error)
+}
+
 pub struct Kqueue {
     start: Instant,
     root: Arc<Path>,
     notify: Arc<Notify>,
-    done: Receiver<Completion>,
-    work: Option<crossbeam_channel::Sender<Effect>>,
+    files: Receiver<Completion>,
+    watched: Receiver<Completion>,
+    work: Option<Sender<Effect>>,
+    /// File effects asked for beyond the [`FILES`] at the threads, in the order asked.
+    backlog: VecDeque<Effect>,
+    /// File effects at the threads whose completions are not taken yet.
+    at_threads: usize,
     workers: Vec<JoinHandle<()>>,
+    // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
     /// Where a process's output and a connection's bytes are read into.
     buffer: Vec<u8>,
@@ -166,17 +275,25 @@ pub struct Kqueue {
     events: Vec<Kevent>,
     /// Completions made on the polling thread, in the order they happened.
     ready: Vec<Completion>,
-    next_id: u64,
-    owners: FxHashMap<u64, Owner>,
+    owners: Owners,
     /// By ticks since `start`; the wait ends at the next one due.
     timers: Wheel<Tag>,
-    watches: FxHashMap<Tag, fsevents::Stream>,
-    spawns: FxHashMap<Tag, Spawned>,
-    listens: FxHashMap<Tag, Listening>,
-    connecting: FxHashMap<Tag, Connecting>,
-    conns: FxHashMap<Conn, Connection>,
-    next_conn: u64,
+    watches: Slab<fsevents::Watch<Watched>>,
+    watch_tags: FxHashMap<Tag, WatchId>,
+    /// Stopped, for the next watch.
+    spare: Vec<fsevents::Watch<Watched>>,
+    /// The flushes a stopping watch had not told.
+    untold: Vec<Tag>,
+    spawns: Slab<Spawned>,
+    spawn_tags: FxHashMap<Tag, SpawnId>,
+    listens: Slab<Listening>,
+    listen_tags: FxHashMap<Tag, ListenId>,
+    connecting: Slab<Connecting>,
+    conns: Slab<Connection>,
     in_flight: usize,
+    /// What the watches' callbacks allocated beyond their payloads, as each watch stopped.
+    #[cfg(test)]
+    watch_overhead: u64,
 }
 
 impl Kqueue {
@@ -191,8 +308,17 @@ impl Kqueue {
         // SAFETY: the call returned a descriptor of its own.
         let kq = unsafe { OwnedFd::from_raw_fd(kq) };
         net::set_cloexec(kq.as_raw_fd())?;
-        let (finished, done) = mpsc::channel();
-        let notify = Arc::new(Notify { kq, done: finished });
+        // alloc: setup, once per driver: each channel's slots.
+        let (files_done, files) = crossbeam_channel::bounded(FILES);
+        let (watched_done, watched) = crossbeam_channel::bounded(WATCHED); // alloc: as above.
+        let (work, queue) = crossbeam_channel::bounded::<Effect>(FILES); // alloc: as above.
+        let notify = Arc::new(Notify {
+            kq,
+            files: files_done,
+            watched: watched_done,
+            #[cfg(test)]
+            file_allocations: std::sync::atomic::AtomicU64::new(0),
+        });
         notify.change(
             TRIGGER as usize,
             libc::EVFILT_USER,
@@ -201,37 +327,48 @@ impl Kqueue {
             0,
             TRIGGER,
         )?;
-        let (work, queue) = crossbeam_channel::unbounded::<Effect>();
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (root, queue, notify) = (root.clone(), queue.clone(), notify.clone());
                 std::thread::Builder::new()
+                    // alloc: setup, once per thread.
                     .name(format!("blaze-kqueue-{n}"))
                     .spawn(move || work_on(&root, &queue, &notify))
             })
+            // alloc: setup, once per driver.
             .collect::<io::Result<Vec<_>>>()?;
+        let tags = || FxHashMap::with_capacity_and_hasher(TAGS, Default::default());
         Ok(Kqueue {
             start: Instant::now(),
             root,
             notify,
-            done,
+            files,
+            watched,
             work: Some(work),
+            backlog: VecDeque::with_capacity(FILES), // alloc: setup, once per driver.
+            at_threads: 0,
             workers,
             confine: None,
-            buffer: vec![0; 64 << 10],
-            changes: Vec::new(),
-            events: Vec::new(),
-            ready: Vec::new(),
-            next_id: TRIGGER + 1,
-            owners: FxHashMap::default(),
-            timers: Wheel::new(),
-            watches: FxHashMap::default(),
-            spawns: FxHashMap::default(),
-            listens: FxHashMap::default(),
-            connecting: FxHashMap::default(),
-            conns: FxHashMap::default(),
-            next_conn: 0,
+            buffer: vec![0; 64 << 10], // alloc: setup, once per driver.
+            // alloc: setup, once per driver: the lists of a wait at their usual most.
+            changes: Vec::with_capacity(EVENTS),
+            events: Vec::with_capacity(2 * EVENTS), // alloc: as above.
+            ready: Vec::with_capacity(EVENTS),      // alloc: as above.
+            owners: Owners::new().map_err(no_slab)?,
+            timers: Wheel::try_new(wheel::MAX_TIMERS).map_err(no_slab)?,
+            watches: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            watch_tags: tags(),
+            spare: Vec::with_capacity(SPARE_WATCHES), // alloc: setup, once per driver.
+            untold: Vec::with_capacity(16),           // alloc: setup, once per driver.
+            spawns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            spawn_tags: tags(),
+            listens: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            listen_tags: tags(),
+            connecting: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            conns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
             in_flight: 0,
+            #[cfg(test)]
+            watch_overhead: 0,
         })
     }
 
@@ -239,13 +376,6 @@ impl Kqueue {
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Kqueue {
         self.confine = Some(confine);
         self
-    }
-
-    fn own(&mut self, owner: Owner) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.owners.insert(id, owner);
-        id
     }
 
     /// A change made with the next wait; a failure of it comes back as an event of `id`'s with
@@ -256,7 +386,7 @@ impl Kqueue {
 
     /// `ident` of `filter` registered as `owner`'s, with the next wait.
     fn register(&mut self, owner: Owner, ident: usize, filter: i16, flags: u16, fflags: u32) -> u64 {
-        let id = self.own(owner);
+        let id = self.owners.own(owner);
         self.change(ident, filter, flags, fflags, 0, id);
         id
     }
@@ -264,7 +394,7 @@ impl Kqueue {
     /// `id` ends: no event of it is acted on, and a change of it not yet made is dropped, so it
     /// cannot land on a descriptor closed and reused since.
     fn disown(&mut self, id: u64) {
-        self.owners.remove(&id);
+        self.owners.disown(id);
         self.changes.retain(|it| it.udata != id as usize);
     }
 
@@ -287,8 +417,10 @@ impl Kqueue {
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::Map { .. }) => {
-                let work = self.work.as_ref().expect("the driver is running");
-                work.send(effect).expect("the IO threads are running");
+                match self.at_threads < FILES && self.backlog.is_empty() {
+                    true => self.to_threads(effect),
+                    false => self.backlog.push_back(effect),
+                }
                 Ok(())
             }
             Effect::Timer { after, tag } => {
@@ -296,44 +428,30 @@ impl Kqueue {
                 self.timers.insert(due, tag);
                 Ok(())
             }
-            Effect::Watch { dir, tag } => {
-                let notify = self.notify.clone();
-                let send = Box::new(move |completion| _ = notify.send(completion));
-                let stream = fsevents::Stream::start(&self.root, &dir, tag, send)?;
-                if let Some(old) = self.watches.insert(tag, stream) {
-                    old.stop();
-                }
-                Ok(())
-            }
-            Effect::Journal { dir, since, tag } => {
-                let notify = self.notify.clone();
-                let send = Box::new(move |completion| _ = notify.send(completion));
-                let stream = fsevents::Stream::journal(&self.root, &dir, since, tag, send)?;
-                if let Some(old) = self.watches.insert(tag, stream) {
-                    old.stop();
-                }
-                Ok(())
-            }
-            // Told through the channel by the stream, after the changes it heard first.
-            Effect::Flush { watch, tag } => match self.watches.get(&watch) {
-                Some(stream) => stream.flush(tag).map_err(|error| {
+            Effect::Watch { dir, tag } => self.watch(dir, None, tag),
+            Effect::Journal { dir, since, tag } => self.watch(dir, Some(since), tag),
+            // Told through the watches' channel by the stream, after the changes it heard first.
+            Effect::Flush { watch, tag } => {
+                match self.watch_tags.get(&watch).and_then(|&id| self.watches.get(id)) {
+                    Some(stream) => stream.flush(tag).map_err(|error| {
+                        // alloc: an error path.
+                        io::Error::new(error.kind(), format!("flushing the watch: {error}"))
+                    }),
                     // alloc: an error path.
-                    io::Error::new(error.kind(), format!("flushing the watch: {error}"))
-                }),
-                // alloc: an error path.
-                None => Err(io::Error::other(format!("nothing is watched as {watch:?}"))),
-            },
+                    None => Err(io::Error::other(format!("nothing is watched as {watch:?}"))),
+                }
+            }
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(&at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
             Effect::Recv { conn, most, tag } => {
                 self.connection(conn)?.recvs.push_back((tag, most));
-                self.serve_recvs(conn);
+                self.serve_recvs(conn_id(conn));
                 Ok(())
             }
             Effect::Send { conn, bytes, tag } => {
                 self.connection(conn)?.sends.push_back((tag, bytes, 0));
-                self.serve_sends(conn);
+                self.serve_sends(conn_id(conn));
                 Ok(())
             }
             Effect::Hangup { conn, tag } => self.hangup(conn, tag),
@@ -343,66 +461,151 @@ impl Kqueue {
         }
     }
 
+    /// A file effect onto the threads' queue, which has room: at most [`FILES`] are there.
+    fn to_threads(&mut self, effect: Effect) {
+        let work = self.work.as_ref().expect("the driver is running");
+        work.try_send(effect).expect("room for a file effect at the threads, which are running");
+        self.at_threads += 1;
+    }
+
     fn connection(&mut self, conn: Conn) -> io::Result<&mut Connection> {
-        self.conns.get_mut(&conn).ok_or_else(|| no_connection(conn))
+        self.conns.get_mut(conn_id(conn)).ok_or_else(|| no_connection(conn))
+    }
+
+    /// Watches `dir` as `tag`, a journal of it from `since`: on a stopped watch kept from an
+    /// earlier one where there is one. A watch of `tag` already ends first, telling nothing
+    /// more.
+    fn watch(&mut self, dir: FileName, since: Option<Cursor>, tag: Tag) -> io::Result<()> {
+        if let Some(old) = self.watch_tags.remove(&tag) {
+            self.retire(old);
+        }
+        let watch = match self.spare.pop() {
+            Some(watch) => watch,
+            None => fsevents::Watch::new(Watched(self.notify.clone()))?,
+        };
+        let id = self.watches.insert(watch);
+        let watch = self.watches.get_mut(id).expect("inserted above");
+        // SAFETY: the watch is in a slab entry, which never moves while it holds it, and it is
+        // stopped (`retire`, or dropped in place with the slab) before it is taken out.
+        let mut first = None;
+        let started = unsafe {
+            match since {
+                None => watch.start(&self.root, dir, tag),
+                Some(since) => watch.journal(&self.root, dir, since, tag, |it| first = Some(it)),
+            }
+        };
+        match started {
+            Ok(()) => {
+                if let Some(first) = first {
+                    // alloc: the batch's payload.
+                    let done = Done::Journaled(Box::new(first));
+                    self.ready.push(Completion { tag, done });
+                }
+                self.watch_tags.insert(tag, id);
+                Ok(())
+            }
+            Err(error) => {
+                let watch = self.watches.remove(id).expect("inserted above");
+                self.keep(watch);
+                Err(error)
+            }
+        }
+    }
+
+    /// Stops the watch `id` and takes it out: what it told is moved to `ready` first, then
+    /// each flush it had not told, failed.
+    fn retire(&mut self, id: WatchId) {
+        let Some(watch) = self.watches.get_mut(id) else { return };
+        let untold = &mut self.untold;
+        watch.stop(|tag| untold.push(tag));
+        #[cfg(test)]
+        {
+            self.watch_overhead += watch.take_overhead();
+        }
+        while let Ok(completion) = self.watched.try_recv() {
+            self.ready.push(completion);
+        }
+        for tag in self.untold.drain(..) {
+            // alloc: an error path, a flush its watch ended before.
+            let why = IoError("the watch ended before the flush".into());
+            self.ready.push(Completion { tag, done: Done::Failed(why) });
+        }
+        let watch = self.watches.remove(id).expect("looked up above");
+        self.keep(watch);
+    }
+
+    /// A stopped watch kept for the next, up to [`SPARE_WATCHES`].
+    fn keep(&mut self, watch: fsevents::Watch<Watched>) {
+        debug_assert!(!watch.is_running());
+        if self.spare.len() < SPARE_WATCHES {
+            self.spare.push(watch);
+        }
     }
 
     fn spawn(&mut self, command: Box<Command>, tag: Tag) -> io::Result<()> {
         let process::Started { pid, stdin, stdout, stderr, finish } =
             process::start(&self.root, command, self.confine.as_ref())?;
-        let mut spawned = Spawned {
+        let spawn = self.spawns.insert(Spawned {
+            tag,
             pid,
             stdin,
             written: 0,
             stdout: Some(stdout),
             stderr: Some(stderr),
-            out: Vec::new(),
-            err: Vec::new(),
+            out: Vec::new(), // alloc: none until it writes, the exit's payload.
+            err: Vec::new(), // alloc: as above.
             exited: false,
             failed: None,
             finish,
-            ids: Vec::new(),
-        };
-        match self.follow(tag, &mut spawned) {
+            ids: Ids::default(),
+        });
+        match self.follow(spawn) {
             Ok(()) => {
-                self.spawns.insert(tag, spawned);
+                // A spawn of `tag` already runs on, followed by its own handle.
+                self.spawn_tags.insert(tag, spawn);
                 Ok(())
             }
             Err(error) => {
-                for &id in &spawned.ids {
+                let spawned = self.spawns.remove(spawn).expect("inserted above");
+                for &id in spawned.ids.as_slice() {
                     self.disown(id);
                 }
+                // alloc: an error path.
                 let program = spawned.finish.command.program.display().to_string();
                 abandon(spawned);
+                // alloc: an error path.
                 Err(io::Error::new(error.kind(), format!("following {program}: {error}")))
             }
         }
     }
 
     /// The process's pipes and its end registered on the kqueue.
-    fn follow(&mut self, tag: Tag, spawned: &mut Spawned) -> io::Result<()> {
-        for (fd, err) in [(&spawned.stdout, false), (&spawned.stderr, true)] {
-            let fd = fd.as_ref().expect("a pipe just made").as_raw_fd();
+    fn follow(&mut self, spawn: SpawnId) -> io::Result<()> {
+        let spawned = self.spawns.get(spawn).expect("followed as it is made");
+        let pipe = |it: &Option<OwnedFd>| it.as_ref().expect("a pipe just made").as_raw_fd();
+        let outputs = [(pipe(&spawned.stdout), false), (pipe(&spawned.stderr), true)];
+        let stdin = spawned.stdin.as_ref().map(|it| it.as_raw_fd());
+        let pid = spawned.pid;
+        for (fd, err) in outputs {
             set_nonblocking(fd)?;
-            let owner = Owner::Output { tag, err };
+            let owner = Owner::Output { spawn, err };
             let id = self.register(owner, fd as usize, libc::EVFILT_READ, libc::EV_ADD, 0);
-            spawned.ids.push(id);
+            self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
-        if let Some(fd) = &spawned.stdin {
-            let fd = fd.as_raw_fd();
+        if let Some(fd) = stdin {
             set_nonblocking(fd)?;
             let id =
-                self.register(Owner::Input(tag), fd as usize, libc::EVFILT_WRITE, libc::EV_ADD, 0);
-            spawned.ids.push(id);
+                self.register(Owner::Input(spawn), fd as usize, libc::EVFILT_WRITE, libc::EV_ADD, 0);
+            self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         }
-        let (pid, flags) = (spawned.pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
-        let id = self.register(Owner::Exit(tag), pid, libc::EVFILT_PROC, flags, libc::NOTE_EXIT);
-        spawned.ids.push(id);
+        let (pid, flags) = (pid as usize, libc::EV_ADD | libc::EV_ONESHOT);
+        let id = self.register(Owner::Exit(spawn), pid, libc::EVFILT_PROC, flags, libc::NOTE_EXIT);
+        self.spawns.get_mut(spawn).expect("followed as it is made").ids.push(id);
         Ok(())
     }
 
-    fn read_output(&mut self, tag: Tag, err: bool) {
-        let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+    fn read_output(&mut self, spawn: SpawnId, err: bool) {
+        let Some(spawned) = self.spawns.get_mut(spawn) else { return };
         let (pipe, into) = match err {
             true => (&mut spawned.stderr, &mut spawned.err),
             false => (&mut spawned.stdout, &mut spawned.out),
@@ -431,11 +634,11 @@ impl Kqueue {
                 }
             }
         }
-        self.finish_spawn(tag);
+        self.finish_spawn(spawn);
     }
 
-    fn write_input(&mut self, tag: Tag) {
-        let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+    fn write_input(&mut self, spawn: SpawnId) {
+        let Some(spawned) = self.spawns.get_mut(spawn) else { return };
         let Some(fd) = spawned.stdin.as_ref().map(|it| it.as_raw_fd()) else { return };
         let input = &spawned.finish.command.stdin;
         while spawned.written < input.len() {
@@ -468,21 +671,27 @@ impl Kqueue {
         spawned.stdin = None;
     }
 
-    /// Ends the spawn `tag` once it has exited and its output has ended.
-    fn finish_spawn(&mut self, tag: Tag) {
-        match self.spawns.get(&tag) {
+    /// Ends the spawn once it has exited and its output has ended.
+    fn finish_spawn(&mut self, spawn: SpawnId) {
+        match self.spawns.get(spawn) {
             Some(it) if it.exited && it.stdout.is_none() && it.stderr.is_none() => {}
             _ => return,
         }
-        let spawned = self.spawns.remove(&tag).expect("looked up above");
-        for &id in &spawned.ids {
+        let spawned = self.spawns.remove(spawn).expect("looked up above");
+        if self.spawn_tags.get(&spawned.tag) == Some(&spawn) {
+            self.spawn_tags.remove(&spawned.tag);
+        }
+        for &id in spawned.ids.as_slice() {
             self.disown(id);
         }
-        let Spawned { pid, out, err, failed, finish, .. } = spawned;
+        let Spawned { tag, pid, out, err, failed, finish, .. } = spawned;
+        // alloc: once per spawn, to name it in a failure; its exit allocates far more.
         let program = finish.command.program.display().to_string();
         let ended = finish.exited(pid, out, err);
         let done = match (ended, failed) {
+            // alloc: the exit's payload.
             (Ok(exit), None) => Done::Exited(Box::new(exit)),
+            // alloc: an error path.
             (Ok(_), Some(error)) | (Err(error), _) => Done::Failed(IoError(format!("{program}: {error}"))),
         };
         self.ready.push(Completion { tag, done });
@@ -490,18 +699,27 @@ impl Kqueue {
 
     fn listen(&mut self, at: &Address, tag: Tag) -> io::Result<()> {
         let context =
+            // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("listening at {at:?}: {error}"));
         let listener = net::listen(&self.root, at).map_err(context)?;
         listener.set_nonblocking(true).map_err(context)?;
         let fd = listener.fd() as usize;
-        let id = self.register(Owner::Listen(tag), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
-        self.listens.insert(tag, Listening { listener, id });
+        let listen = self.listens.insert(Listening { tag, listener, id: TRIGGER });
+        let id = self.register(Owner::Listen(listen), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
+        self.listens.get_mut(listen).expect("inserted above").id = id;
+        // A listen of `tag` already ends, as the one it is replaced by begins.
+        if let Some(old) = self.listen_tags.insert(tag, listen)
+            && let Some(old) = self.listens.remove(old)
+        {
+            self.disown(old.id);
+        }
         Ok(())
     }
 
-    fn accept(&mut self, tag: Tag) {
+    fn accept(&mut self, listen: ListenId) {
         loop {
-            let Some(listening) = self.listens.get(&tag) else { return };
+            let Some(listening) = self.listens.get(listen) else { return };
+            let tag = listening.tag;
             let accepted = listening.listener.accept().and_then(|socket| {
                 socket.set_nonblocking(true)?;
                 no_sigpipe(socket.fd())?;
@@ -520,8 +738,8 @@ impl Kqueue {
                     ) => {}
                 Err(error) => {
                     // A failure ends the listen.
-                    let listening = self.listens.remove(&tag).expect("looked up above");
-                    self.disown(listening.id);
+                    self.end_listen(listen);
+                    // alloc: an error path.
                     let done = Done::Failed(IoError(format!("accepting a connection: {error}")));
                     self.ready.push(Completion { tag, done });
                     return;
@@ -530,19 +748,35 @@ impl Kqueue {
         }
     }
 
+    /// The listen `listen` taken out, its registration and its tag's name of it with it.
+    fn end_listen(&mut self, listen: ListenId) -> Option<Listening> {
+        let listening = self.listens.remove(listen)?;
+        self.disown(listening.id);
+        if self.listen_tags.get(&listening.tag) == Some(&listen) {
+            self.listen_tags.remove(&listening.tag);
+        }
+        Some(listening)
+    }
+
     fn adopt(&mut self, socket: net::Socket) -> Conn {
-        let conn = Conn(self.next_conn);
-        self.next_conn += 1;
-        let read = self.own(Owner::Read(conn));
-        let write = self.own(Owner::Write(conn));
-        let connection =
-            Connection { socket, recvs: VecDeque::new(), sends: VecDeque::new(), read, write };
-        self.conns.insert(conn, connection);
-        conn
+        let conn = self.conns.insert(Connection {
+            socket,
+            recvs: VecDeque::new(),
+            sends: VecDeque::new(),
+            read: TRIGGER,
+            write: TRIGGER,
+        });
+        let read = self.owners.own(Owner::Read(conn));
+        let write = self.owners.own(Owner::Write(conn));
+        let connection = self.conns.get_mut(conn).expect("inserted above");
+        connection.read = read;
+        connection.write = write;
+        Conn(conn.to_bits())
     }
 
     fn connect(&mut self, at: Address, tag: Tag) -> io::Result<()> {
         let context =
+            // alloc: an error path.
             |error: io::Error| io::Error::new(error.kind(), format!("connecting to {at:?}: {error}"));
         let address = net::sockaddr(&self.root, &at).map_err(context)?;
         let fd = net::stream_socket(address.domain).map_err(context)?;
@@ -562,16 +796,19 @@ impl Kqueue {
         }
         let ident = fd.as_raw_fd() as usize;
         let flags = libc::EV_ADD | libc::EV_ONESHOT;
-        self.register(Owner::Connecting(tag), ident, libc::EVFILT_WRITE, flags, 0);
-        self.connecting.insert(tag, Connecting { fd, at, unix });
+        let connecting = self.connecting.insert(Connecting { tag, fd, at, unix });
+        self.register(Owner::Connecting(connecting), ident, libc::EVFILT_WRITE, flags, 0);
         Ok(())
     }
 
     /// A connect in flight has ended, made or not.
-    fn ended_connecting(&mut self, tag: Tag) {
-        let Some(Connecting { fd, at, unix }) = self.connecting.remove(&tag) else { return };
+    fn ended_connecting(&mut self, connecting: ConnectId) {
+        let Some(Connecting { tag, fd, at, unix }) = self.connecting.remove(connecting) else {
+            return;
+        };
         let made = socket_error(fd.as_raw_fd()).and_then(|()| self.connected(tag, fd, unix));
         if let Err(error) = made {
+            // alloc: an error path.
             let done = Done::Failed(IoError(format!("connecting to {at:?}: {error}")));
             self.ready.push(Completion { tag, done });
         }
@@ -587,13 +824,14 @@ impl Kqueue {
         Ok(())
     }
 
-    fn serve_recvs(&mut self, conn: Conn) {
-        let Some(connection) = self.conns.get_mut(&conn) else { return };
+    fn serve_recvs(&mut self, conn: ConnId) {
+        let Some(connection) = self.conns.get_mut(conn) else { return };
         while let Some(&(tag, most)) = connection.recvs.front() {
             // At most a buffer's worth, which a receive may be: nothing is allocated for a
             // receive that would wait.
             let most = most.min(self.buffer.len());
             let done = match connection.socket.read(&mut self.buffer[..most]) {
+                // alloc: the receive's payload.
                 Ok(n) => Done::Read(self.buffer[..n].to_vec()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.changes.push(Kevent {
@@ -606,6 +844,7 @@ impl Kqueue {
                     });
                     return;
                 }
+                // alloc: an error path.
                 Err(error) => Done::Failed(IoError(error.to_string())),
             };
             connection.recvs.pop_front();
@@ -613,13 +852,14 @@ impl Kqueue {
         }
     }
 
-    fn serve_sends(&mut self, conn: Conn) {
-        let Some(connection) = self.conns.get_mut(&conn) else { return };
+    fn serve_sends(&mut self, conn: ConnId) {
+        let Some(connection) = self.conns.get_mut(conn) else { return };
         while let Some((tag, bytes, put)) = connection.sends.front_mut() {
             let tag = *tag;
             let done = match *put == bytes.len() {
                 true => Done::Sent,
                 false => match connection.socket.write(&bytes[*put..]) {
+                    // alloc: an error path.
                     Ok(0) => Done::Failed(IoError("the connection took no more bytes".into())),
                     Ok(n) => {
                         *put += n;
@@ -637,6 +877,7 @@ impl Kqueue {
                         });
                         return;
                     }
+                    // alloc: an error path.
                     Err(error) => Done::Failed(IoError(error.to_string())),
                 },
             };
@@ -646,14 +887,16 @@ impl Kqueue {
     }
 
     fn hangup(&mut self, conn: Conn, tag: Tag) -> io::Result<()> {
-        let connection = self.conns.remove(&conn).ok_or_else(|| no_connection(conn))?;
+        let connection = self.conns.remove(conn_id(conn)).ok_or_else(|| no_connection(conn))?;
         self.disown(connection.read);
         self.disown(connection.write);
         let shut = connection.socket.shutdown();
         for (recv, _) in connection.recvs {
+            // alloc: none, an empty vector.
             self.ready.push(Completion { tag: recv, done: Done::Read(Vec::new()) });
         }
         for (send, ..) in connection.sends {
+            // alloc: an error path.
             let done = Done::Failed(IoError(format!("{conn:?} hung up before all of it was sent")));
             self.ready.push(Completion { tag: send, done });
         }
@@ -714,49 +957,55 @@ impl Kqueue {
         }
         // SAFETY: the call wrote `got` events.
         unsafe { events.set_len(got as usize) };
-        for event in &events {
-            let id = event.udata as u64;
-            if id == TRIGGER {
-                continue;
-            }
-            // Of a registration that has ended.
-            let Some(&owner) = self.owners.get(&id) else { continue };
-            if event.flags & libc::EV_ERROR != 0 {
-                if event.data != 0 {
-                    self.refused(id, owner, io::Error::from_raw_os_error(event.data as i32));
-                }
-                continue;
-            }
-            match owner {
-                Owner::Exit(tag) => {
-                    self.disown(id);
-                    if let Some(spawned) = self.spawns.get_mut(&tag) {
-                        spawned.exited = true;
-                        spawned.stdin = None;
-                    }
-                    self.finish_spawn(tag);
-                }
-                Owner::Output { tag, err } => self.read_output(tag, err),
-                Owner::Input(tag) => self.write_input(tag),
-                Owner::Listen(tag) => self.accept(tag),
-                Owner::Connecting(tag) => {
-                    self.disown(id);
-                    self.ended_connecting(tag);
-                }
-                Owner::Read(conn) => self.serve_recvs(conn),
-                Owner::Write(conn) => self.serve_sends(conn),
-            }
+        for &event in &events {
+            self.dispatch(event);
         }
         self.events = events;
     }
 
+    /// Acts on one event, by what its `udata` names now: nothing for the trigger, or for a
+    /// registration that has ended (a stale handle, its slot free or another's).
+    fn dispatch(&mut self, event: Kevent) {
+        let id = event.udata as u64;
+        if id == TRIGGER {
+            return;
+        }
+        let Some(owner) = self.owners.get(id) else { return };
+        if event.flags & libc::EV_ERROR != 0 {
+            if event.data != 0 {
+                self.refused(id, owner, io::Error::from_raw_os_error(event.data as i32));
+            }
+            return;
+        }
+        match owner {
+            Owner::Exit(spawn) => {
+                self.disown(id);
+                if let Some(spawned) = self.spawns.get_mut(spawn) {
+                    spawned.exited = true;
+                    spawned.stdin = None;
+                }
+                self.finish_spawn(spawn);
+            }
+            Owner::Output { spawn, err } => self.read_output(spawn, err),
+            Owner::Input(spawn) => self.write_input(spawn),
+            Owner::Listen(listen) => self.accept(listen),
+            Owner::Connecting(connecting) => {
+                self.disown(id);
+                self.ended_connecting(connecting);
+            }
+            Owner::Read(conn) => self.serve_recvs(conn),
+            Owner::Write(conn) => self.serve_sends(conn),
+        }
+    }
+
     /// The kqueue refused a change of `id`'s.
     fn refused(&mut self, id: u64, owner: Owner, error: io::Error) {
+        // alloc: an error path.
         let failed = |error: &io::Error| Done::Failed(IoError(error.to_string()));
         match owner {
-            Owner::Exit(tag) => {
+            Owner::Exit(spawn) => {
                 self.disown(id);
-                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+                let Some(spawned) = self.spawns.get_mut(spawn) else { return };
                 // `ESRCH`: exited already, a child not reaped, which the kernel no longer
                 // follows. Anything else: its end cannot be heard, so it does not run on.
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -768,46 +1017,47 @@ impl Kqueue {
                 }
                 spawned.exited = true;
                 spawned.stdin = None;
-                self.finish_spawn(tag);
+                self.finish_spawn(spawn);
             }
             // Its output or input cannot be moved: it does not run on.
-            Owner::Output { tag, err } => {
-                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+            Owner::Output { spawn, err } => {
+                let Some(spawned) = self.spawns.get_mut(spawn) else { return };
                 process::kill(spawned.pid);
                 spawned.failed.get_or_insert(error);
                 match err {
                     true => spawned.stderr = None,
                     false => spawned.stdout = None,
                 }
-                self.finish_spawn(tag);
+                self.finish_spawn(spawn);
             }
-            Owner::Input(tag) => {
-                let Some(spawned) = self.spawns.get_mut(&tag) else { return };
+            Owner::Input(spawn) => {
+                let Some(spawned) = self.spawns.get_mut(spawn) else { return };
                 process::kill(spawned.pid);
                 spawned.failed.get_or_insert(error);
                 spawned.stdin = None;
             }
-            Owner::Listen(tag) => {
-                let Some(listening) = self.listens.remove(&tag) else { return };
-                self.disown(listening.id);
+            Owner::Listen(listen) => {
+                let Some(listening) = self.end_listen(listen) else { return };
+                // alloc: an error path.
                 let done = Done::Failed(IoError(format!("listening: {error}")));
-                self.ready.push(Completion { tag, done });
+                self.ready.push(Completion { tag: listening.tag, done });
             }
-            Owner::Connecting(tag) => {
+            Owner::Connecting(connecting) => {
                 self.disown(id);
-                let Some(connecting) = self.connecting.remove(&tag) else { return };
+                let Some(connecting) = self.connecting.remove(connecting) else { return };
+                // alloc: an error path.
                 let done = Done::Failed(IoError(format!("connecting to {:?}: {error}", connecting.at)));
-                self.ready.push(Completion { tag, done });
+                self.ready.push(Completion { tag: connecting.tag, done });
             }
             Owner::Read(conn) => {
-                let Some(connection) = self.conns.get_mut(&conn) else { return };
+                let Some(connection) = self.conns.get_mut(conn) else { return };
                 if let Some((tag, _)) = connection.recvs.pop_front() {
                     self.ready.push(Completion { tag, done: failed(&error) });
                 }
                 self.serve_recvs(conn);
             }
             Owner::Write(conn) => {
-                let Some(connection) = self.conns.get_mut(&conn) else { return };
+                let Some(connection) = self.conns.get_mut(conn) else { return };
                 if let Some((tag, ..)) = connection.sends.pop_front() {
                     self.ready.push(Completion { tag, done: failed(&error) });
                 }
@@ -816,9 +1066,19 @@ impl Kqueue {
         }
     }
 
+    /// Moves every completion ready into `out`: the polling thread's, then the file threads'
+    /// (each making room at the threads for one from the backlog), then the watches'.
     fn take(&mut self, out: &mut Vec<Completion>) {
         out.append(&mut self.ready);
-        while let Ok(completion) = self.done.try_recv() {
+        while let Ok(completion) = self.files.try_recv() {
+            self.at_threads -= 1;
+            out.push(completion);
+        }
+        while self.at_threads < FILES {
+            let Some(effect) = self.backlog.pop_front() else { break };
+            self.to_threads(effect);
+        }
+        while let Ok(completion) = self.watched.try_recv() {
             out.push(completion);
         }
     }
@@ -826,10 +1086,19 @@ impl Kqueue {
 
 impl Drop for Kqueue {
     fn drop(&mut self) {
-        for (_, stream) in self.watches.drain() {
-            stream.stop();
+        for (_, watch) in self.watches.iter_mut() {
+            watch.stop(|_| {});
         }
-        for (_, spawned) in self.spawns.drain() {
+        for (_, spawn) in self.spawn_tags.drain() {
+            if let Some(spawned) = self.spawns.remove(spawn) {
+                abandon(spawned);
+            }
+        }
+        // Spawns whose tag a later spawn took.
+        loop {
+            let next = self.spawns.iter().next().map(|(spawn, _)| spawn);
+            let Some(spawn) = next else { break };
+            let spawned = self.spawns.remove(spawn).expect("listed above");
             abandon(spawned);
         }
         self.work = None;
@@ -845,30 +1114,33 @@ impl Driver for Kqueue {
             let tag = effect.tag();
             match effect {
                 Effect::Kill { tag } => {
-                    if let Some(spawned) = self.spawns.get(&tag) {
+                    let spawn = self.spawn_tags.get(&tag).and_then(|&it| self.spawns.get(it));
+                    if let Some(spawned) = spawn {
                         process::kill(spawned.pid);
                     }
                 }
-                Effect::Unwatch { tag } => match self.watches.remove(&tag) {
-                    Some(stream) => {
-                        stream.stop();
-                        // Through the channel, after every change the stream sent.
-                        _ = self.notify.done.send(Completion { tag, done: Done::Unwatched });
+                // Its end after every change it told, which `retire` moves to `ready` first.
+                Effect::Unwatch { tag } => match self.watch_tags.remove(&tag) {
+                    Some(id) => {
+                        self.retire(id);
+                        self.ready.push(Completion { tag, done: Done::Unwatched });
                     }
                     None => {
                         self.in_flight += 1;
+                        // alloc: an error path.
                         let done = Done::Failed(IoError(format!("nothing is watched as {tag:?}")));
                         self.ready.push(Completion { tag, done });
                     }
                 },
                 // The end of the listen, which is in flight since it was asked for.
-                Effect::Unlisten { tag } => match self.listens.remove(&tag) {
-                    Some(listening) => {
-                        self.disown(listening.id);
+                Effect::Unlisten { tag } => match self.listen_tags.get(&tag).copied() {
+                    Some(listen) => {
+                        self.end_listen(listen);
                         self.ready.push(Completion { tag, done: Done::Unlistened });
                     }
                     None => {
                         self.in_flight += 1;
+                        // alloc: an error path.
                         let done = Done::Failed(IoError(format!("nothing listens as {tag:?}")));
                         self.ready.push(Completion { tag, done });
                     }
@@ -876,6 +1148,7 @@ impl Driver for Kqueue {
                 effect => {
                     self.in_flight += 1;
                     if let Err(error) = self.begin(effect) {
+                        // alloc: an error path.
                         let done = Done::Failed(IoError(error.to_string()));
                         self.ready.push(Completion { tag, done });
                     }
@@ -924,22 +1197,40 @@ impl Driver for Kqueue {
 }
 
 /// Runs the file effects this thread takes off `queue`, which every file thread takes from
-/// with no lock, until the driver drops its end.
-fn work_on(root: &Path, queue: &crossbeam_channel::Receiver<Effect>, notify: &Notify) {
+/// with no lock, until the driver drops its end. The completions channel has room for each:
+/// the driver keeps at most [`FILES`] at the threads.
+fn work_on(root: &Path, queue: &Receiver<Effect>, notify: &Notify) {
     while let Ok(effect) = queue.recv() {
-        let tag = effect.tag();
-        let done = match effect {
-            Effect::Map { file, .. } => fs::map(&root.join(file.as_str())).map(Done::Mapped),
-            Effect::Stamp { files, .. } => fs::stamps(root, &files).map(Done::Stamped),
-            Effect::Entries { dir, .. } => {
-                fs::entries(&root.join(dir.as_str()), &dir).map(Done::Entries)
+        let sent = counted(notify, || {
+            let tag = effect.tag();
+            let done = crate::threads::run(root, effect)
+                // alloc: an error path.
+                .unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
+            let sent = notify.files.send(Completion { tag, done }).is_ok();
+            if sent {
+                notify.wake();
             }
-            effect => crate::threads::run(root, effect),
-        };
-        let done = done.unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
-        if !notify.send(Completion { tag, done }) {
+            sent
+        });
+        if !sent {
             return;
         }
+    }
+}
+
+/// Runs `f`, a file thread's effect and its hand-back: counted in the allocation-budget tests.
+#[inline]
+fn counted<R>(notify: &Notify, f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    {
+        let (result, used) = blaze_alloc_count::measure(f);
+        notify.file_allocations.fetch_add(used.allocations, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
+    #[cfg(not(test))]
+    {
+        _ = notify;
+        f()
     }
 }
 
@@ -948,10 +1239,12 @@ fn abandon(spawned: Spawned) {
     let Spawned { pid, finish, stdin, stdout, stderr, .. } = spawned;
     drop((stdin, stdout, stderr));
     process::kill(pid);
+    // alloc: none, empty vectors.
     _ = finish.exited(pid, Vec::new(), Vec::new());
 }
 
 fn no_connection(conn: Conn) -> io::Error {
+    // alloc: an error path.
     io::Error::new(io::ErrorKind::NotConnected, format!("no connection {conn:?}"))
 }
 
@@ -1003,10 +1296,10 @@ fn socket_error(fd: RawFd) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, ffi::OsString};
+    use std::{collections::BTreeMap, ffi::OsString, sync::atomic::Ordering};
 
     use super::*;
-    use crate::{Confined, Exit, FileName, Sandbox, Traced, run_until_idle, threads::Threads};
+    use crate::{Confined, Exit, Sandbox, Traced, run_until_idle, sim::Rng, threads::Threads};
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
@@ -1038,6 +1331,15 @@ mod tests {
         run_until_idle(driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, done.done));
         assert_eq!(driver.in_flight(), 0);
         seen
+    }
+
+    /// Polls until `out` holds `n` completions, or the deadline.
+    fn poll_for(driver: &mut Kqueue, out: &mut Vec<Completion>, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while out.len() < n {
+            assert!(Instant::now() < deadline, "never came: {out:?}");
+            driver.poll(out, Duration::from_millis(100));
+        }
     }
 
     fn exit(done: &Done) -> &Exit {
@@ -1082,6 +1384,8 @@ mod tests {
         assert_eq!(six.code, Some(0));
         assert!(six.stdout == big, "{} bytes back of {}", six.stdout.len(), big.len());
         assert!(!seen.contains_key(&99));
+        assert!(driver.spawns.is_empty() && driver.spawn_tags.is_empty());
+        assert!(driver.owners.slab.is_empty(), "every registration of a spawn ends with it");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1180,6 +1484,8 @@ mod tests {
         assert_eq!(ends, [1, 4, 5, 7, 9]);
         assert_ne!(server, client);
         assert_eq!(driver.in_flight(), 0);
+        assert!(driver.conns.is_empty() && driver.listens.is_empty() && driver.connecting.is_empty());
+        assert!(driver.owners.slab.is_empty(), "every registration ends with what it was of");
     }
 
     #[test]
@@ -1338,6 +1644,28 @@ mod tests {
         }
     }
 
+    /// More file effects at once than the threads' channels hold: the rest wait in the backlog
+    /// and every one ends, in the order asked on one thread.
+    #[test]
+    fn file_effects_past_the_threads_room_wait_and_all_end() {
+        let root = dir("backlog");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let file = name("log");
+        let n = 3 * FILES as u64 + 7;
+        let effects = (0..n)
+            .map(|at| Effect::Append { file: file.clone(), bytes: at.to_le_bytes().to_vec(), tag: Tag(at) })
+            .collect();
+        let seen = run(&mut driver, effects);
+        assert_eq!(seen.len() as u64, n);
+        assert!(seen.values().all(|it| *it == Done::Appended));
+        assert!(driver.backlog.is_empty() && driver.at_threads == 0);
+        let bytes = std::fs::read(root.join("log")).unwrap();
+        let wanted: Vec<u8> = (0..n).flat_map(u64::to_le_bytes).collect();
+        assert!(bytes == wanted, "appended out of order");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_watch_hears_a_file_written_under_it_then_ends() {
         let root = dir("watch");
@@ -1380,6 +1708,8 @@ mod tests {
         assert!(ended, "the watch never ended; heard {heard:?}");
         assert!(!heard.contains(&name("outside")), "{heard:?}");
         run(&mut driver, Vec::new());
+        assert!(driver.watches.is_empty() && driver.watch_tags.is_empty());
+        assert_eq!(driver.spare.len(), 1, "the stopped watch is kept for the next");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1421,6 +1751,31 @@ mod tests {
         });
         assert!(refused);
         assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A flush asked and the watch ended before it is told: the flush fails, after the changes
+    /// the watch told and before its end.
+    #[test]
+    fn a_flush_its_watch_ends_before_fails_before_the_end() {
+        let root = dir("flush-end");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        let mut effects = vec![
+            Effect::Watch { dir: name("src"), tag: Tag(7) },
+            Effect::Flush { watch: Tag(7), tag: Tag(8) },
+            Effect::Unwatch { tag: Tag(7) },
+        ];
+        let mut order = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |it, _| match (it.tag.0, it.done) {
+            (8, Done::Flushed) => order.push("flushed"),
+            (8, Done::Failed(_)) => order.push("failed"),
+            (7, Done::Changed { .. }) => {}
+            (7, Done::Unwatched) => order.push("unwatched"),
+            other => panic!("{other:?}"),
+        });
+        assert!(matches!(order.as_slice(), ["flushed" | "failed", "unwatched"]), "{order:?}");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1508,20 +1863,368 @@ mod tests {
             assert!(names.push_str(it));
         }
         let seen = run(&mut driver, vec![
-            Effect::Stamp { files: names.clone(), tag: Tag(3) },
+            Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(3) },
             Effect::Entries { dir: name("src"), tag: Tag(4) },
             Effect::Entries { dir: name("missing"), tag: Tag(5) },
         ]);
-        let stamps = fs::stamps(&root, &names).unwrap();
+        let stamps = crate::fs::stamps(&root, &names).unwrap();
         assert_eq!(seen[&3], Done::Stamped(stamps.clone()));
         assert!(stamps[0].is_file() && stamps[0].size == 9, "{stamps:?}");
         assert!(stamps[1].is_dir() && stamps[2].is_link(), "{stamps:?}");
         assert!(stamps[3].is_gone() && stamps[4].is_gone(), "{stamps:?}");
-        let entries = fs::entries(&root.join("src"), &name("src")).unwrap();
+        let entries = crate::fs::entries(&root.join("src"), &name("src")).unwrap();
         assert_eq!(seen[&4], Done::Entries(entries.clone()));
         let named: Vec<_> = entries.iter().map(|(it, _)| it.as_str()).collect();
         assert_eq!(named, ["src/deep", "src/lib.rs", "src/link"]);
         assert!(matches!(seen[&5], Done::Failed(_)));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The map of registrations the driver kept before its slab: ids counted up from the
+    /// trigger's, never reused.
+    struct OldOwners {
+        next: u64,
+        owners: FxHashMap<u64, Owner>,
+    }
+
+    impl OldOwners {
+        fn own(&mut self, owner: Owner) -> u64 {
+            let id = self.next;
+            self.next += 1;
+            self.owners.insert(id, owner);
+            id
+        }
+
+        fn get(&self, id: u64) -> Option<Owner> {
+            self.owners.get(&id).copied()
+        }
+
+        fn disown(&mut self, id: u64) -> Option<Owner> {
+            self.owners.remove(&id)
+        }
+    }
+
+    fn any_owner(rng: &mut Rng) -> Owner {
+        let bits = rng.next_u64();
+        match rng.below(7) {
+            0 => Owner::Exit(SpawnId::from_bits(bits)),
+            1 => Owner::Output { spawn: SpawnId::from_bits(bits), err: rng.one_in(2) },
+            2 => Owner::Input(SpawnId::from_bits(bits)),
+            3 => Owner::Listen(ListenId::from_bits(bits)),
+            4 => Owner::Connecting(ConnectId::from_bits(bits)),
+            5 => Owner::Read(ConnId::from_bits(bits)),
+            _ => Owner::Write(ConnId::from_bits(bits)),
+        }
+    }
+
+    /// Against the map it replaced, on every seed: registrations made, ended (twice, too),
+    /// looked up live and ended, and ids no registration had. Both answer the same each time;
+    /// an ended one's id names nothing even once its slot is another's, and no id is issued
+    /// twice.
+    #[test]
+    fn owners_answer_as_the_map_they_replaced() {
+        for seed in 0..300 {
+            let mut rng = Rng::new(seed);
+            let mut owners = Owners::new().unwrap();
+            let mut old = OldOwners { next: TRIGGER + 1, owners: FxHashMap::default() };
+            // Each registration made: its id in each, and whether it is live.
+            let mut made: Vec<(u64, u64, bool)> = Vec::new();
+            for _ in 0..500 {
+                match rng.below(8) {
+                    0..=2 => {
+                        let owner = any_owner(&mut rng);
+                        let (id, old_id) = (owners.own(owner), old.own(owner));
+                        assert_ne!(id, TRIGGER, "seed {seed}");
+                        assert!(made.iter().all(|it| it.0 != id), "seed {seed}: {id:#x} issued twice");
+                        made.push((id, old_id, true));
+                    }
+                    3 | 4 if !made.is_empty() => {
+                        let at = rng.below(made.len() as u64) as usize;
+                        let (id, old_id, live) = made[at];
+                        let ended = owners.disown(id);
+                        assert_eq!(ended, old.disown(old_id), "seed {seed}");
+                        assert_eq!(ended.is_some(), live, "seed {seed}");
+                        assert_eq!(owners.disown(id), None, "seed {seed}: ended twice");
+                        made[at].2 = false;
+                    }
+                    5 if !made.is_empty() => {
+                        let (id, old_id, live) = made[rng.below(made.len() as u64) as usize];
+                        assert_eq!(owners.get(id), old.get(old_id), "seed {seed}");
+                        assert_eq!(owners.get(id).is_some(), live, "seed {seed}");
+                    }
+                    6 => {
+                        let bits = rng.next_u64();
+                        let live = made.iter().any(|it| it.0 == bits && it.2);
+                        assert_eq!(owners.get(bits).is_some(), live, "seed {seed}: {bits:#x}");
+                        assert_eq!(owners.get(TRIGGER), None, "seed {seed}");
+                    }
+                    _ => {
+                        for &(id, old_id, _) in &made {
+                            assert_eq!(owners.get(id), old.get(old_id), "seed {seed}");
+                        }
+                    }
+                }
+                assert_eq!(owners.slab.len(), old.owners.len(), "seed {seed}");
+            }
+        }
+    }
+
+    /// A kernel event carrying the handle of a registration that ended, its slot then another
+    /// registration's, is dropped; the same event carrying the live one's is acted on.
+    #[test]
+    fn an_event_of_a_registration_ended_and_its_slot_reused_is_dropped() {
+        let root = dir("stale");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let connecting = |driver: &mut Kqueue, tag| {
+            let fd = net::stream_socket(libc::AF_UNIX).unwrap();
+            driver.connecting.insert(Connecting { tag, fd, at: Address::Unix(name("x")), unix: true })
+        };
+        let first = connecting(&mut driver, Tag(1));
+        let ended = driver.owners.own(Owner::Connecting(first));
+        driver.disown(ended);
+        drop(driver.connecting.remove(first));
+        let second = connecting(&mut driver, Tag(2));
+        let live = driver.owners.own(Owner::Connecting(second));
+        assert_eq!(Id::from_bits(ended).index(), Id::from_bits(live).index(), "the slot is reused");
+        assert_eq!(first.index(), second.index(), "the connect's slot is reused");
+        assert_ne!(ended, live);
+        // An `EVFILT_USER` of its own, its `udata` the ended registration's, then triggered.
+        let user = |driver: &Kqueue, id: u64| {
+            let flags = libc::EV_ADD | libc::EV_CLEAR;
+            driver.notify.change(1, libc::EVFILT_USER, flags, 0, 0, id).unwrap();
+            driver.notify.change(1, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER, 0, id).unwrap();
+        };
+        user(&driver, ended);
+        driver.wait(Some(Duration::from_millis(50)));
+        let mut out = Vec::new();
+        driver.take(&mut out);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(driver.connecting.contains(second), "the live connect is left as it is");
+        assert!(driver.connecting.get(first).is_none());
+        user(&driver, live);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while out.is_empty() && Instant::now() < deadline {
+            driver.wait(Some(Duration::from_millis(50)));
+            driver.take(&mut out);
+        }
+        assert!(
+            matches!(out.as_slice(), [Completion { tag: Tag(2), done: Done::Connected { .. } }]),
+            "{out:?}"
+        );
+        assert!(!driver.connecting.contains(second));
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A Sync, a Stat and a Read through the file threads, once the driver's buffers and the
+    /// threads' have grown: nothing allocated on the driver's thread, and on the file thread
+    /// only the Read's bytes.
+    #[test]
+    fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
+        const WARM: u64 = 8;
+        const ROUNDS: u64 = 200;
+        let root = dir("budget-files");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let file = name("f");
+        run(&mut driver, vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }]);
+        let (mut effects, mut out) = (Vec::with_capacity(3), Vec::with_capacity(16));
+        for round in 0..WARM + ROUNDS {
+            if round == WARM {
+                driver.notify.file_allocations.store(0, Ordering::Relaxed);
+            }
+            // The caller's: made before the cycle.
+            effects.extend([
+                Effect::Sync { file: file.clone(), tag: Tag(10) },
+                Effect::Stat { file: file.clone(), tag: Tag(11) },
+                Effect::Read { file: file.clone(), at: 1, len: 3, tag: Tag(12) },
+            ]);
+            let ((), used) = blaze_alloc_count::measure(|| {
+                driver.submit(&mut effects);
+                poll_for(&mut driver, &mut out, 3);
+            });
+            if round >= WARM {
+                assert_eq!(used.allocations, 0, "round {round}: a warm Sync, Stat and Read, on the driver's thread");
+            }
+            out.sort_by_key(|it| it.tag);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [
+                        Completion { done: Done::Synced, .. },
+                        Completion { done: Done::Stat(Some(_)), .. },
+                        Completion { done: Done::Read(bytes), .. },
+                    ] if bytes == b"yte"
+                ),
+                "{out:?}"
+            );
+            out.clear();
+        }
+        let threads = driver.notify.file_allocations.load(Ordering::Relaxed);
+        assert!(
+            threads <= ROUNDS,
+            "the file thread: {threads} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only"
+        );
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_warm_timer_arm_and_fire_allocates_nothing() {
+        let mut driver = Kqueue::new(dir("budget-timers"), 1).unwrap();
+        let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+        for round in 0..1000u64 {
+            let ((), used) = blaze_alloc_count::measure(|| {
+                effects.push(Effect::Timer { after: Duration::ZERO, tag: Tag(round) });
+                driver.submit(&mut effects);
+                poll_for(&mut driver, &mut out, 1);
+            });
+            if round >= 8 {
+                assert_eq!(used.allocations, 0, "round {round}: a warm timer arm and fire");
+            }
+            assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Fired }]);
+            out.clear();
+        }
+    }
+
+    /// A watch added, a change heard and the watch removed, once a stopped watch is kept for
+    /// the next: nothing allocated on the driver's thread, nor by the watch's callbacks beyond
+    /// the names `Done::Changed` carries.
+    #[test]
+    fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
+        const WARM: u32 = 2;
+        let root = dir("budget-watch");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        run(&mut driver, vec![Effect::Write { file: name("src/keep"), bytes: Vec::new(), tag: Tag(1) }]);
+        let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(64));
+        let (src, edited, path) = (name("src"), name("src/edit"), root.join("src/edit"));
+        let mut on_driver = 0;
+        for round in 0..WARM + 4 {
+            if round == WARM {
+                driver.watch_overhead = 0;
+                on_driver = 0;
+            }
+            // The caller's: made before the cycle.
+            effects.push(Effect::Watch { dir: src.clone(), tag: Tag(7) });
+            let ((), used) = blaze_alloc_count::measure(|| driver.submit(&mut effects));
+            on_driver += used.allocations;
+            let (mut heard, deadline) = (false, Instant::now() + Duration::from_secs(10));
+            while !heard {
+                assert!(Instant::now() < deadline, "round {round}: the change was never heard");
+                std::fs::write(&path, b"edited").unwrap();
+                let (_, used) =
+                    blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+                on_driver += used.allocations;
+                for it in out.drain(..) {
+                    match it.done {
+                        Done::Changed { files, .. } => heard |= files.contains(&edited),
+                        other => panic!("round {round}: {other:?}"),
+                    }
+                }
+            }
+            effects.push(Effect::Unwatch { tag: Tag(7) });
+            let ((), used) = blaze_alloc_count::measure(|| {
+                driver.submit(&mut effects);
+                poll_for(&mut driver, &mut out, 1);
+                while !matches!(out.last(), Some(Completion { done: Done::Unwatched, .. })) {
+                    driver.poll(&mut out, Duration::from_millis(50));
+                }
+            });
+            on_driver += used.allocations;
+            for it in out.drain(..) {
+                assert!(matches!(it.done, Done::Changed { .. } | Done::Unwatched), "{it:?}");
+            }
+            assert_eq!(driver.in_flight(), 0);
+        }
+        assert_eq!(on_driver, 0, "four warm watch cycles, on the driver's thread");
+        assert_eq!(driver.watch_overhead, 0, "the watches' callbacks, beyond what Done::Changed carries");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A send on one end and a receive on the other, on a warm connection: only the received
+    /// bytes allocated. Then both ends hung up and their slots another connection's: the old
+    /// `Conn`s name nothing.
+    #[test]
+    fn a_warm_send_and_receive_allocates_only_the_bytes_received() {
+        let root = dir("budget-conn");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let at = Address::Unix(name("s"));
+        let mut effects = vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at: at.clone(), tag: Tag(2) },
+        ];
+        driver.submit(&mut effects);
+        let mut out = Vec::with_capacity(16);
+        let accept = |driver: &mut Kqueue, out: &mut Vec<Completion>, connected: Tag| {
+            let (mut server, mut client) = (None, None);
+            poll_for(driver, out, 2);
+            for it in out.drain(..) {
+                match it.done {
+                    Done::Accepted { conn } if it.tag == Tag(1) => server = Some(conn),
+                    Done::Connected { conn } if it.tag == connected => client = Some(conn),
+                    other => panic!("{other:?}"),
+                }
+            }
+            (server.unwrap(), client.unwrap())
+        };
+        let (server, client) = accept(&mut driver, &mut out, Tag(2));
+        for round in 0..200u64 {
+            // The caller's: made before the cycle.
+            effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(10) });
+            effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(11) });
+            let ((), used) = blaze_alloc_count::measure(|| {
+                driver.submit(&mut effects);
+                poll_for(&mut driver, &mut out, 2);
+            });
+            if round >= 8 {
+                assert!(
+                    used.allocations <= 1,
+                    "round {round}: a warm send and receive made {} allocations; the received bytes' Vec<u8> only",
+                    used.allocations
+                );
+            }
+            out.sort_by_key(|it| it.tag);
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [Completion { done: Done::Sent, .. }, Completion { done: Done::Read(bytes), .. }]
+                        if bytes == b"ping"
+                ),
+                "{out:?}"
+            );
+            out.clear();
+        }
+        effects.extend([Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }]);
+        driver.submit(&mut effects);
+        poll_for(&mut driver, &mut out, 2);
+        assert!(out.iter().all(|it| it.done == Done::HungUp), "{out:?}");
+        out.clear();
+        effects.push(Effect::Connect { at, tag: Tag(3) });
+        driver.submit(&mut effects);
+        let (again, other) = accept(&mut driver, &mut out, Tag(3));
+        let index = |conn: Conn| conn_id(conn).index();
+        let mut old = [index(server), index(client)];
+        let mut new = [index(again), index(other)];
+        old.sort();
+        new.sort();
+        assert_eq!(old, new, "the hung-up connections' slots are the new ones'");
+        effects.extend([
+            Effect::Recv { conn: client, most: 8, tag: Tag(30) },
+            Effect::Send { conn: server, bytes: b"x".to_vec(), tag: Tag(31) },
+        ]);
+        driver.submit(&mut effects);
+        poll_for(&mut driver, &mut out, 2);
+        assert!(out.iter().all(|it| matches!(it.done, Done::Failed(_))), "stale: {out:?}");
+        out.clear();
+        effects.extend([
+            Effect::Hangup { conn: again, tag: Tag(40) },
+            Effect::Hangup { conn: other, tag: Tag(41) },
+            Effect::Unlisten { tag: Tag(1) },
+        ]);
+        driver.submit(&mut effects);
+        poll_for(&mut driver, &mut out, 3);
+        assert_eq!(driver.in_flight(), 0);
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }

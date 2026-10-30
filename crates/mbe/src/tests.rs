@@ -487,3 +487,37 @@ fn minus_belongs_to_literal() {
             missing"#]],
     );
 }
+
+/// Taking a fragment allocates the same however much of its level follows it: the parser reads a
+/// window of the level, not the rest of it, into the input kept from the last fragment.
+#[test]
+fn a_fragment_allocates_the_same_however_much_follows_it() {
+    let db = salsa::DatabaseImpl::default();
+    let anchor = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let used = |rest: usize| {
+        let text = format!("a + b * 2, {}", "x, ".repeat(rest));
+        let tt = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
+        let fragment = || {
+            let mut iter = tt.iter();
+            let delim_span = tt.top_subtree().delimiter.delim_span();
+            let parsed =
+                crate::expect_fragment(&db, &mut iter, parser::PrefixEntryPoint::Expr, delim_span);
+            assert!(parsed.err.is_none());
+            parsed.value.len()
+        };
+        // The first makes the tree's words and the thread's buffers; a warm one reuses them.
+        fragment();
+        let (len, used) = blaze_alloc_count::measure(fragment);
+        assert_eq!(len, 5, "`a + b * 2` is five token trees");
+        used
+    };
+    // Both past the first window, so that both read the same one.
+    let (short, long) = (used(100), used(10_000));
+    assert_eq!(short, long);
+    assert_eq!(short.allocations, 0, "a warm fragment allocates nothing");
+}
+

@@ -5,30 +5,22 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
-extern crate ra_ap_rustc_pattern_analysis as rustc_pattern_analysis;
 extern crate rustc_abi;
 extern crate rustc_type_ir;
 
 pub mod const_macro;
 pub mod diagnostics;
 pub mod display;
-mod impl_db_macro;
 pub mod mir_pretty;
-
-#[doc(hidden)]
-pub mod __private {
-    pub use hir_def;
-    pub use hir_ty_mir;
-    pub use salsa;
-}
 
 #[cfg(test)]
 mod test_db;
 #[cfg(test)]
 mod tests;
 
+use base_db::Db;
 use hir_def::ModuleId;
-use hir_ty::{db::HirDatabase, next_solver::Const};
+use hir_ty::next_solver::Const;
 use syntax::ast::{ConstArg, make};
 
 pub use hir_ty::*;
@@ -39,7 +31,7 @@ use crate::display::HirDisplay;
 
 pub fn known_const_to_ast<'db>(
     konst: Const<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     target_module: ModuleId,
 ) -> Option<ConstArg> {
     Some(make::expr_const_value(

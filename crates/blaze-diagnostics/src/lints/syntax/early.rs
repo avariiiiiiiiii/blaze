@@ -24,7 +24,7 @@ mod builtin;
 mod labels;
 mod lexer;
 mod macros;
-mod validation;
+pub(crate) mod validation;
 
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;

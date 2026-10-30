@@ -10,7 +10,7 @@ use std::{
     ops::{self, ControlFlow},
 };
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -37,24 +37,26 @@ pub(crate) enum AttrsOrCfg {
 impl Default for AttrsOrCfg {
     #[inline]
     fn default() -> Self {
-        AttrsOrCfg::Enabled { attrs: AttrsOwned(Box::new([])) }
+        AttrsOrCfg::Enabled { attrs: AttrsOwned(Box::new([])) } // alloc: none, an empty slice
     }
 }
 
 impl AttrsOrCfg {
     pub(crate) fn lower<'a, S>(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: &dyn ast::HasAttrs,
-        cfg_options: &dyn Fn() -> &'a CfgOptions,
+        cfg_options: &impl Fn() -> &'a CfgOptions,
         span_map: S,
     ) -> AttrsOrCfg
     where
         S: syntax_bridge::SpanMapper + Copy,
     {
+        // alloc: the owner's attributes, the value; none for an owner without any
         let mut attrs = Vec::new();
         let cfg = lower_attrs_into(db, owner, cfg_options, span_map, &mut attrs);
         let attrs = AttrsOwned(attrs.into_boxed_slice());
         match cfg {
+            // alloc: once an owner `cfg`d out, which is lowered no further
             Some(cfg) => AttrsOrCfg::CfgDisabled(Box::new((cfg, attrs))),
             None => AttrsOrCfg::Enabled { attrs },
         }
@@ -65,9 +67,9 @@ impl AttrsOrCfg {
 /// does: the attributes appended are then those before that `cfg` (what crate-level attributes
 /// need), so lowering a second owner after a disabled one is never needed.
 pub(super) fn lower_attrs_into<'a, S>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: &dyn ast::HasAttrs,
-    cfg_options: &dyn Fn() -> &'a CfgOptions,
+    cfg_options: &impl Fn() -> &'a CfgOptions,
     span_map: S,
     attrs: &mut Vec<Attr>,
 ) -> Option<CfgExpr>
@@ -102,11 +104,9 @@ where
             }
             ast::Meta::TokenTreeMeta(meta) => {
                 let span = span_map.span_for(path_range);
+                let token_tree = meta.token_tree();
                 let tt = syntax_bridge::syntax_node_to_token_tree(
-                    &meta
-                        .token_tree()
-                        .map(|it| it.syntax().clone())
-                        .unwrap_or_else(|| meta.syntax().clone()),
+                    token_tree.as_ref().map_or(meta.syntax(), |it| it.syntax()),
                     span_map,
                     span,
                     DocCommentDesugarMode::ProcMacro,

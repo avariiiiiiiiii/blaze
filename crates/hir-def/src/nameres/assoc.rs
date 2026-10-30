@@ -2,7 +2,7 @@
 
 use std::mem;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use cfg::CfgOptions;
 use hir_expand::{
     AstId, AttrMacroAttrIds, ExpandTo, HirFileId, InFile, Intern, Lookup, MacroCallKind,
@@ -40,13 +40,13 @@ pub struct TraitItems {
 #[salsa::tracked]
 impl TraitItems {
     #[inline]
-    pub(crate) fn query(db: &dyn SourceDatabase, tr: TraitId) -> &TraitItems {
+    pub(crate) fn query(db: &Db, tr: TraitId) -> &TraitItems {
         &Self::query_with_diagnostics(db, tr).0
     }
 
     #[salsa::tracked(returns(ref))]
     pub fn query_with_diagnostics(
-        db: &dyn SourceDatabase,
+        db: &Db,
         tr: TraitId,
     ) -> (TraitItems, DefDiagnostics) {
         let ItemLoc { container: module_id, id: ast_id } = *tr.lookup(db);
@@ -112,7 +112,7 @@ pub struct ImplItems {
 #[salsa::tracked]
 impl ImplItems {
     #[salsa::tracked(returns(ref))]
-    pub fn of(db: &dyn SourceDatabase, id: ImplId) -> (ImplItems, DefDiagnostics) {
+    pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);
 
@@ -132,7 +132,7 @@ impl ImplItems {
 }
 
 struct AssocItemCollector<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     module_id: ModuleId,
     def_map: &'db DefMap,
     local_def_map: &'db LocalDefMap,
@@ -150,7 +150,7 @@ struct AssocItemCollector<'db> {
 
 impl<'db> AssocItemCollector<'db> {
     fn new(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         module_id: ModuleId,
         container: ItemContainerId,
         file_id: HirFileId,

@@ -139,8 +139,8 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for BoundExistentialPre
         // `trait Trait<A, B>: Sup<A, Assoc = A> + Sup<B, Assoc = B>` keeps both projections,
         // which are one twice once `A` and `B` are inferred to be the same, and one is still
         // related to each of the other's.
-        let mut a_v: Vec<_> = a.into_iter().collect();
-        let mut b_v: Vec<_> = b.into_iter().collect();
+        let mut a_v: SmallVec<[_; 8]> = SmallVec::from_iter(a);
+        let mut b_v: SmallVec<[_; 8]> = SmallVec::from_iter(b);
         // `skip_binder` here is okay because `stable_cmp` doesn't look at binders
         a_v.sort_by(|a, b| {
             stable_cmp_existential_predicate(a.as_ref().skip_binder(), b.as_ref().skip_binder())

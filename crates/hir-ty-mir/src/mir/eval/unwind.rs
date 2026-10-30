@@ -17,9 +17,9 @@ use hir_expand::name::Name;
 use intern::Symbol;
 use la_arena::ArenaMap;
 use rustc_ast_ir::Mutability;
-use rustc_type_ir::inherent::{Region as _, Ty as _};
+use rustc_type_ir::inherent::{IntoKind, Region as _, Ty as _};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 
 use super::{
     Address, BasicBlockId, Evaluator, Interval, IntervalAndTy, Locals, MirBody, MirEvalError,
@@ -62,6 +62,7 @@ pub(super) struct Catch {
 
 /// The program aborts, as rustc's `UnwindTerminate` does: nothing catches it.
 pub(super) fn abort<'db>(reason: &str) -> MirEvalError<'db> {
+    // alloc: error path
     MirEvalError::NotSupported(format!("the program aborted: {reason}"))
 }
 
@@ -76,6 +77,7 @@ fn is_panic(error: &MirEvalError<'_>) -> bool {
 
 fn message(error: &MirEvalError<'_>) -> String {
     match error {
+        // clone: error path
         MirEvalError::Panic(message) => message.clone(),
         MirEvalError::InFunction(inner, _) => message(inner),
         _ => String::new(),
@@ -85,7 +87,7 @@ fn message(error: &MirEvalError<'_>) -> String {
 /// The `#[panic_handler]` of the crate graph `krate` is the root of: the function core's
 /// `panic_impl` goes to. rustc allows one in a graph.
 #[salsa::tracked]
-pub(crate) fn panic_handler(db: &dyn HirDatabase, krate: Crate) -> Option<FunctionId> {
+pub(crate) fn panic_handler(db: &Db, krate: Crate) -> Option<FunctionId> {
     let def_map = crate_def_map(db, krate);
     for (_, module) in def_map.modules(db) {
         for def in module.scope(db).declarations() {
@@ -202,8 +204,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let Some(unwinding) = &mut self.unwinding else {
                 not_supported!("unwinding with no panic");
             };
+            // alloc: error path
             let error = unwinding.error.take().unwrap_or(MirEvalError::Panic(String::new()));
             self.escaped = true;
+            // alloc: error path
             return Err(MirEvalError::InFunction(Box::new(error), std::mem::take(&mut unwinding.trace)));
         }
         if self.limits_frames {
@@ -268,6 +272,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let args = [catch.data, exception];
         match self.call_fn_pointer_word(catch.catch_fn, &args, unit, body, span, then)? {
             Some(frame) => {
+                self.count_frame()?;
                 *block = frame.locals.body.start_block;
                 self.code_stack.push(frame);
             }
@@ -275,6 +280,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Then::Block(target) => *block = target,
                 _ => {
                     return Err(MirEvalError::UndefinedBehavior(
+                        // alloc: error path
                         "Diverging function returned".to_owned(),
                     ));
                 }
@@ -396,9 +402,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let data = self.read_pointer(boxed)?;
                 let vtable = from_bytes!(usize, self.read_scalar(Interval::new(boxed.offset(size), size))?);
                 let message = self.payload_message(data, vtable)?;
-                let trace = self.trace();
-                self.unwinding =
-                    Some(Unwinding { payload: Payload::Boxed { data, vtable }, error: None, trace });
+                let payload = Payload::Boxed { data, vtable };
+                self.unwinding = Some(Unwinding { payload, error: None, trace: Vec::new() });
                 Err(MirEvalError::Panic(message))
             }
             // `fn __rust_panic_cleanup(exception: *mut u8) -> *mut (dyn Any + Send)`.

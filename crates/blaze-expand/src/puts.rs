@@ -47,15 +47,15 @@ impl Drop for Buffer {
 }
 
 thread_local! {
-    static PUTS: Buffer = const { Buffer(RefCell::new(Vec::new())) };
+    static PUTS: Buffer = const { Buffer(RefCell::new(Vec::new())) }; // alloc: none, an empty buffer
 }
 
 /// The puts of threads that ended before they were taken, for the next [`take_puts`]. Locked
 /// only as a thread ends with puts left and by a take that sees [`ORPHANED`].
-static ORPHANS: Mutex<Vec<Put>> = Mutex::new(Vec::new());
+static ORPHANS: Mutex<Vec<Put>> = Mutex::new(Vec::new()); // alloc: none, an empty buffer
 static ORPHANED: AtomicBool = AtomicBool::new(false);
 
-fn orphan(puts: Vec<Put>) {
+fn orphan(puts: impl IntoIterator<Item = Put>) {
     ORPHANS.lock().unwrap_or_else(|it| it.into_inner()).extend(puts);
     ORPHANED.store(true, Ordering::Release);
 }
@@ -66,7 +66,7 @@ pub fn put(put: Put) {
     _ = PUTS.try_with(|it| it.0.borrow_mut().extend(put.take()));
     // This thread is ending: its buffer is gone.
     if let Some(put) = put {
-        orphan(vec![put]);
+        orphan([put]);
     }
 }
 
@@ -98,7 +98,7 @@ pub fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
             Ok(tickets) => published.tickets.extend(tickets),
             Err(error) => {
                 let said = refused(&what, &error);
-                crate::system(said.clone());
+                crate::system(said.clone()); // clone: error path, a refused put, said and kept
                 published.refused.push(said);
             }
         }
@@ -108,7 +108,8 @@ pub fn publish(store: &mut Store, puts: Vec<Put>) -> Published {
 
 fn refused(what: &str, error: &KeepError) -> String {
     match error {
-        KeepError::Corrupt(corrupt) => format!("{what}: {corrupt}"),
+        KeepError::Corrupt(corrupt) => format!("{what}: {corrupt}"), // alloc: error path
+        // alloc: error path
         KeepError::Mismatch(mismatch) => format!(
             "{what}: the store has another expansion under the same key of every input it read, \
              so the key misses an input or the macro is not deterministic: {mismatch:?}"
@@ -177,10 +178,10 @@ mod tests {
             fn dir(&mut self, _: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
                 Ok(None)
             }
-            fn names(&mut self, _: &std::path::Path) -> Result<Option<Vec<(std::ffi::OsString, bool)>>, String> {
-                Ok(None)
+            fn names(&mut self, _: &std::path::Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {
+                Ok(false)
             }
-            fn env(&mut self, _: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+            fn env(&mut self, _: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
                 None
             }
             fn env_all(&mut self) -> &[(std::ffi::OsString, std::ffi::OsString)] {

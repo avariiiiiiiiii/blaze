@@ -1,11 +1,11 @@
 use test_fixture::WithFixture;
 
-use crate::{db::HirDatabase, setup_tracing, test_db::TestDB};
+use crate::{db::HirDatabase, setup_tracing, test_db::{TestDB, TestDBExt as _}};
 
 fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let _tracing = setup_tracing();
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    crate::attach_db(db.as_dyn(), || {
+    crate::attach_db(db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
@@ -24,7 +24,7 @@ fn lower_mir(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
 fn lower_mir_all(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
     let _tracing = setup_tracing();
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
-    crate::attach_db(db.as_dyn(), || {
+    crate::attach_db(db, || {
         let file_id = *file_ids.last().unwrap();
         let module_id = db.module_for_file(file_id.file_id(&db));
         let def_map = module_id.def_map(&db);
@@ -116,7 +116,7 @@ fn main() {
 }
 "#,
     );
-    crate::attach_db(db.as_dyn(), || {
+    crate::attach_db(db, || {
         let module_id = db.module_for_file(file_id.file_id(&db));
         let scope = &module_id.def_map(&db).module(&db, module_id).scope(&db);
         for decl in scope.declarations() {

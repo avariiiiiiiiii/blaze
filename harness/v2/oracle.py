@@ -24,8 +24,10 @@ the source is refused and with which errors, what the program prints and its exi
 outcome of every test, with `bytes` every output file byte for byte, and where the engine says
 them (v2) the codegen input of every function and the query database's trace of both builds,
 which `blaze-v2-proof` compares to name the query that went stale and the read it missed. That
-is under-invalidation, and the whole point. It is unmeasured where either build was not blaze's (v1 hands some to cargo). Apart
-from that:
+is under-invalidation, and the whole point. It is unmeasured where either build was not blaze's (v1 hands some to cargo).
+For a slot with a case in `blaze-v2-proof`'s `nameres` (the `nameres` regression edits each),
+the traces are also held to what the facts say that edit changes: more is `over`, less is stale.
+Apart from that:
 
 - `rustc/...` fails where the build from scratch differs from cargo's: not an invalidation bug
   but a wrong compiler, found here first;
@@ -260,6 +262,7 @@ class Round:
         self.work_gap: tuple[report.Verdict, str] | None = None
         self.codegen_gap: tuple[report.Verdict, str] | None = None
         self.trace_gap: tuple[report.Verdict, str] | None = None
+        self.nameres_gap: tuple[report.Verdict, str] | None = None
         self.traces = 0
         self.last_trace: Path | None = None
 
@@ -341,20 +344,30 @@ class Round:
             self.trace_gap = self.gap("the query database's trace", e)
             return None
 
-    def compare_traces(self, inc: Path, scratch: Path) -> tuple[list[str], int | None]:
+    def compare_traces(self, inc: Path, scratch: Path, slot: str) -> tuple[list[str], int | None]:
         """What `blaze-v2-proof` finds stale in the incremental trace, and how many results it
-        reran for nothing against the trace of the build before."""
+        reran for nothing against the trace of the build before; and where the edit's slot has a
+        case in blaze-v2-proof's `nameres`, what that case finds."""
         proof = Path(self.it.proof)
         if not proof.is_file():
             raise engine.Failed(f"proof: no `blaze-v2-proof` at {proof}, to compare the traces")
         given: dict[str, str] = {"incremental": str(inc), "scratch": str(scratch)}
         if self.last_trace is not None:
             given["before"] = str(self.last_trace)
+            if slot:
+                given["slot"] = slot
         ran = engine.run("comparing the traces", [str(proof), json.dumps(given)], self.work, engine.scrubbed(), RUN_SECS)
         if ran.returncode not in (0, 1):
             raise engine.Failed(f"comparing the traces: `blaze-v2-proof` exited {ran.returncode}:\n{ran.said()}")
         found = json.loads(ran.stdout)
         stale = [f"the trace: {s['what']} {s['query']}: {s['detail']}" for s in found["stale"]]
+        case = found.get("nameres")
+        for f in case["findings"] if case else []:
+            line = f"the {case['slot']} case ({case['claim']}): {f['side'].lower()}: {f['detail']}"
+            if f["side"] != "Unmeasured":
+                stale.append(line)
+            elif self.nameres_gap is None:
+                self.nameres_gap = ("unmeasured", f"the nameres cases: {line}")
         work = found["work"]
         return stale[:12], None if work is None else work["needless"]
 
@@ -429,7 +442,7 @@ class Round:
             cargo = self.reference(state) if self.it.reference else None
             stale: list[str] = []
             if inc.trace is not None and scratch.trace is not None:
-                stale, out.needless = self.compare_traces(inc.trace, scratch.trace)
+                stale, out.needless = self.compare_traces(inc.trace, scratch.trace, edit.slot if edit else "")
         except engine.Failed as e:
             out.verdict, out.detail = "error", str(e)
             return out
@@ -507,7 +520,7 @@ def run_sequence(eng: engine.Engine, it: Settings, seq: Sequence, work: Path, st
                 break
     finally:
         round_.close()
-    gaps = [g for g in (round_.work_gap, round_.codegen_gap, round_.trace_gap) if g is not None]
+    gaps = [g for g in (round_.work_gap, round_.codegen_gap, round_.trace_gap, round_.nameres_gap) if g is not None]
     return Ran(steps, gaps)
 
 

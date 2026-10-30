@@ -20,6 +20,7 @@ use crate::fingerprint::Fingerprint;
 use crate::graph::{self, EdgeSpan, Graph, Relocation, TaskGraph};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
+use crate::task::TaskId;
 use crate::sync::atomic::{AtomicU32, AtomicU64};
 use crate::table::{PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
@@ -47,6 +48,9 @@ pub struct ZalsaLocal {
     graph: TaskGraph,
 
     cancelled: CancellationToken,
+
+    /// The task this state belongs to: the thread that made it and the depth it was made for.
+    task: TaskId,
 }
 
 /// A cancellation token that can be used to cancel a query computation for a specific local `Database`.
@@ -87,13 +91,21 @@ impl CancellationToken {
 }
 
 impl ZalsaLocal {
-    pub(crate) fn new() -> Self {
+    /// The state of `task`, which the current thread runs.
+    pub(crate) fn new(task: TaskId) -> Self {
         ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
             graph: TaskGraph::default(),
             cancelled: CancellationToken::default(),
+            task,
         }
+    }
+
+    /// The task this state belongs to, which is the task that owns its claims and blocks.
+    #[inline]
+    pub(crate) fn task(&self) -> TaskId {
+        self.task
     }
 
     /// Writes a finished query's edges into the database's edge array.
@@ -165,6 +177,7 @@ impl ZalsaLocal {
             zalsa
                 .lookup_ingredient(ingredient)
                 .memo_table_types()
+                // clone: one `Arc` count per new table page, when a page fills
                 .clone()
         };
 
@@ -288,6 +301,7 @@ impl ZalsaLocal {
                     (
                         active_query.database_key_index,
                         active_query.stamp(),
+                        // clone: the empty `ThinVec` outside cycles, which allocates nothing
                         active_query.cycle_heads().clone(),
                     )
                 })
@@ -488,6 +502,7 @@ impl ZalsaLocal {
 
     #[inline]
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        // clone: the edge: a cancellation token handed to the caller, one `Arc` count
         self.cancelled.clone()
     }
 
@@ -890,6 +905,7 @@ impl QueryRevisionsExtraInner {
             #[cfg(feature = "accumulator")]
             accumulated: AccumulatedMap::default(),
             tracked_struct_ids: ThinVec::default(),
+            // clone: the empty `ThinVec` outside cycles, which allocates nothing
             cycle_heads: empty_cycle_heads().clone(),
             iteration: IterationStamp::default().into(),
             cycle_converged: false,
@@ -1209,6 +1225,7 @@ impl OriginAndExtra {
     }
 
     fn boxed<T>(kind: QueryOriginKind, with_extra: WithExtra<T>) -> Self {
+        // alloc: the memo's cold box, only for memos with cycle, tracked-struct, accumulator or fingerprint data, or assigned
         let address = Box::into_raw(Box::new(with_extra)).expose_provenance() as u64;
         debug_assert_eq!(address & Self::TAG_MASK, 0);
         Self {
@@ -2004,6 +2021,7 @@ pub(crate) mod persistence {
             I: IntoIterator<Item = QueryEdge>,
             I::IntoIter: ExactSizeIterator,
         {
+            // alloc: the edge: persistence, once per serialized database
             Self::Derived(input_outputs.into_iter().collect())
         }
 
@@ -2012,6 +2030,7 @@ pub(crate) mod persistence {
             I: IntoIterator<Item = QueryEdge>,
             I::IntoIter: ExactSizeIterator,
         {
+            // alloc: the edge: persistence, once per serialized database
             Self::DerivedUntracked(input_outputs.into_iter().collect())
         }
 

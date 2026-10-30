@@ -12,6 +12,7 @@ use serde::ser::{self, Serialize};
 
 use super::{
     ARRAY, BYTES, Error, FALSE, MAP, NEGATIVE, NULL, TEXT, TRUE, UNSIGNED, float, head, head_bytes,
+    key_order,
 };
 
 /// The deterministic encoding of `value`.
@@ -473,7 +474,7 @@ impl<'a> Map<'a> {
             None if self.count == 1 => self.last = (start, end),
             None => {
                 let last = &self.out[self.last.0..self.last.1];
-                match last.cmp(&self.out[start..end]) {
+                match key_order(last, &self.out[start..end]) {
                     Ordering::Less => self.last = (start, end),
                     Ordering::Equal => self.twice = true,
                     Ordering::Greater => self.out_of_order(start, end),

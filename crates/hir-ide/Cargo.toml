@@ -21,12 +21,11 @@ tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
-typed-arena = "2.0.2"
 rustc_apfloat.workspace = true
 salsa.workspace = true
+inventory.workspace = true
 
 rustc_abi.workspace = true
-ra-ap-rustc_pattern_analysis.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true
 

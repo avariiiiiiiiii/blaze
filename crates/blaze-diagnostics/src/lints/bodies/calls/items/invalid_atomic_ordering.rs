@@ -10,6 +10,7 @@
 //! `AtomicOrderingStore`, `AtomicOrderingFence`, `InvalidAtomicOrderingDiag`) (MIT or
 //! Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir_def::{
     AdtId, AttrDefId, FunctionId, ItemContainerId, Lookup as _, ModuleDefId,

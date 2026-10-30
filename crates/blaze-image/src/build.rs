@@ -10,11 +10,10 @@ use std::{
 };
 
 use blaze_format::{Record, SchemaHash};
+use blaze_ids::crc32c::crc32c;
 
 use crate::{
-    Section, SectionId,
-    crc::crc32c,
-    raw,
+    Section, SectionId, raw,
     spine::{self, DEFAULT_GROUP_SHIFT, MAX_GROUP_SHIFT, MIN_GROUP_SHIFT, Spine},
 };
 
@@ -61,6 +60,7 @@ impl Builder {
             (MIN_GROUP_SHIFT..=MAX_GROUP_SHIFT).contains(&shift),
             "an image's groups are 2^{MIN_GROUP_SHIFT} to 2^{MAX_GROUP_SHIFT} bytes, not 2^{shift}"
         );
+        // alloc: one output buffer an image written, at the daemon's stop
         Builder { shift, out: vec![0; 1 << shift], sections: Vec::new() }
     }
 
@@ -114,6 +114,7 @@ impl Builder {
         }
         self.out.resize(crc_at + tops as usize * group, 0);
         let tops: Box<[u32]> =
+            // alloc: the CRC table's own few CRCs, once an image written
             self.out[crc_at..].chunks_exact(group).map(crc32c).collect();
         let spine = Spine {
             hash: Default::default(),
@@ -136,6 +137,7 @@ const GROUPS_A_JOB: usize = 16;
 /// The CRC32C of each `group`-byte group of `bytes`, the groups spread over `jobs`.
 fn crcs_on(jobs: crate::Jobs<'_>, bytes: &[u8], group: usize) -> Vec<u32> {
     let count = bytes.len() / group;
+    // alloc: one CRC slot a group, once an image written
     let crcs: Vec<AtomicU32> = (0..count).map(|_| AtomicU32::new(0)).collect();
     jobs(count.div_ceil(GROUPS_A_JOB), &|job| {
         for at in job * GROUPS_A_JOB..((job + 1) * GROUPS_A_JOB).min(count) {
@@ -143,6 +145,7 @@ fn crcs_on(jobs: crate::Jobs<'_>, bytes: &[u8], group: usize) -> Vec<u32> {
         }
     });
     // `jobs` returns after every job finished, which orders their stores before these loads.
+    // alloc: in place over the atomics' buffer (same layout), once an image written
     crcs.into_iter().map(AtomicU32::into_inner).collect()
 }
 

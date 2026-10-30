@@ -310,6 +310,7 @@ impl<'db> InferenceContext<'db> {
                 liberated_sig: StoredFnSig::new(liberated_sig),
                 fake_reads: Box::default(),
                 min_captures: IndexMap::default(),
+                kind_origin: None,
             },
         );
 
@@ -324,6 +325,13 @@ impl<'db> InferenceContext<'db> {
         let prev_ret_coercion =
             self.return_coercion.replace(CoerceMany::new(liberated_sig.output()));
         let prev_resume_yield_tys = mem::replace(&mut self.resume_yield_tys, resume_yield_tys);
+        let desugaring = match closure_kind {
+            ClosureKind::Coroutine { kind, .. } => Some(kind),
+            ClosureKind::Closure | ClosureKind::OldCoroutine(_) | ClosureKind::CoroutineClosure(_) => {
+                None
+            }
+        };
+        let prev_desugaring = mem::replace(&mut self.coroutine_desugaring, desugaring);
 
         self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
             this.infer_return(body);
@@ -333,6 +341,7 @@ impl<'db> InferenceContext<'db> {
         self.return_ty = prev_ret_ty;
         self.return_coercion = prev_ret_coercion;
         self.resume_yield_tys = prev_resume_yield_tys;
+        self.coroutine_desugaring = prev_desugaring;
 
         closure_ty
     }

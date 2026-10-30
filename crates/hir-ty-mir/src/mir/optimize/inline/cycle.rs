@@ -6,6 +6,7 @@
 
 use std::hash::Hash;
 
+use base_db::Db;
 use hir_def::{FunctionId, HasModule, nameres::crate_def_map, signatures::FunctionSignature};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::GenericArgs as _;
@@ -49,7 +50,7 @@ fn callees_of(body: &MirBody<'_>) -> Vec<(FunctionId, StoredGenericArgs)> {
 
 #[salsa::tracked(returns(ref))]
 pub(super) fn inliner_callees_of_fn(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body(func.into()) {
@@ -60,7 +61,7 @@ pub(super) fn inliner_callees_of_fn(
 
 #[salsa::tracked(returns(ref))]
 pub(super) fn inliner_callees_of_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Vec<(FunctionId, StoredGenericArgs)> {
     match db.runtime_mir_body_for_closure(closure) {
@@ -70,7 +71,7 @@ pub(super) fn inliner_callees_of_closure<'db>(
 }
 
 fn inliner_callees<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: InlinedBody<'db>,
 ) -> &'db [(FunctionId, StoredGenericArgs)] {
     match body {
@@ -127,7 +128,7 @@ impl<'db> Callgraph<'db> {
 
 #[salsa::tracked(returns(ref))]
 pub(super) fn callgraph_cyclic_fn<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     root: FunctionId,
 ) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Fn(root))
@@ -135,7 +136,7 @@ pub(super) fn callgraph_cyclic_fn<'db>(
 
 #[salsa::tracked(returns(ref))]
 pub(super) fn callgraph_cyclic_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     root: InternedClosureId<'db>,
 ) -> Option<Callgraph<'db>> {
     cyclic(db, InlinedBody::Closure(root))
@@ -145,7 +146,7 @@ pub(super) fn callgraph_cyclic_closure<'db>(
 /// where it gave up at the recursion limit, as rustc's does, and nothing of the crate may then
 /// be inlined into `root`.
 pub(super) fn callgraph_cyclic<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     root: InlinedBody<'db>,
 ) -> Option<&'db Callgraph<'db>> {
     match root {
@@ -158,7 +159,7 @@ pub(super) fn callgraph_cyclic<'db>(
 /// which follows an instance whose MIR is available. Of a crate other than `krate`, that is
 /// what rustc keeps of it: the MIR of a generic or `#[inline]` function, or a closure's.
 fn has_mir<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: base_db::Crate,
     body: InlinedBody<'db>,
     args: GenericArgs<'db>,
@@ -173,7 +174,7 @@ fn has_mir<'db>(
     }
 }
 
-fn cyclic<'db>(db: &'db dyn HirDatabase, root: InlinedBody<'db>) -> Option<Callgraph<'db>> {
+fn cyclic<'db>(db: &'db Db, root: InlinedBody<'db>) -> Option<Callgraph<'db>> {
     let owner = owner_of(db, root);
     let krate = owner.krate(db);
     let ctx = Ctx::new(db, owner);

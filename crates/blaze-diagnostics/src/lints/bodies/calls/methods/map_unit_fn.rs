@@ -5,6 +5,7 @@
 //! (`MappingToUnit`) and `compiler/rustc_middle/src/ty/mod.rs` (`span_of_impl`: a local
 //! item's `def_span`, else nothing) (MIT or Apache-2.0).
 
+use base_db::Db;
 use hir::InFile;
 use hir_def::{
     CallableDefId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
@@ -54,7 +55,7 @@ impl LatePass for MapUnitFn {
 
 fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found> {
     let Expr::Block { statements, .. } = b.store().expr(block) else { return None };
-    let Statement::Expr { expr, has_semi: true } = *statements.get(index)? else { return None };
+    let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };
     let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else { return None };
     if method_name.as_str() != "map" {
         return None;
@@ -154,7 +155,7 @@ fn closure_span(b: &BodyCx<'_, '_>, closure: InternedClosure<'_>) -> Option<Span
 }
 
 /// The node an expression of another body is written as.
-fn expr_node(db: &dyn HirDatabase, owner: InferBodyId<'_>, expr: ExprId) -> Option<InFile<SyntaxNodePtr>> {
+fn expr_node(db: &Db, owner: InferBodyId<'_>, expr: ExprId) -> Option<InFile<SyntaxNodePtr>> {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner.expression_store_owner(db));
     let source = source_map.expr_syntax(expr).ok()?;
     Some(source.map(|it| it.syntax_node_ptr()))

@@ -177,7 +177,9 @@ pub(super) fn binds(binds: &mut [Bind<'_>], spans: &[Span], out: &mut Vec<u8>) -
     if binds.is_empty() {
         return Ok(0);
     }
-    radix::sort_by_key(binds, |it| it.addr);
+    // In place: a radix sort by key of more than 64 binds would allocate its pairs. Equal
+    // addresses are an error, so the order among them doesn't matter.
+    binds.sort_unstable_by_key(|it| it.addr);
     if let Some(twice) = binds.windows(2).find(|it| it[0].addr == it[1].addr) {
         // alloc: error path
         return Err(format!("the address {:#x} is to be bound twice", twice[0].addr));

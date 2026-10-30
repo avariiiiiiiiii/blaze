@@ -44,12 +44,12 @@ fn files(tree: &Tree, root: NodeId) -> BTreeMap<String, Vec<u8>> {
 fn moded(tree: &Tree, root: NodeId) -> BTreeMap<String, (Mode, Vec<u8>)> {
     tree.files(root, Mode::Regular, "")
         .into_iter()
-        .map(|(path, node, mode)| (path, (mode, tree.bytes(node).expect("a file").to_vec())))
+        .map(|(path, node, mode)| (path, (mode, tree.bytes(node).unwrap().expect("a file").to_vec())))
         .collect()
 }
 
 fn text_at(tree: &Tree, root: NodeId, path: &str) -> Option<String> {
-    tree.read(root, path).map(|it| String::from_utf8(it.to_vec()).expect("utf-8"))
+    tree.read(root, path).unwrap().map(|it| String::from_utf8(it.to_vec()).expect("utf-8"))
 }
 
 fn new_vfs() -> Vfs {
@@ -88,7 +88,7 @@ fn writes_make_directories_and_read_back() {
         .unwrap();
     assert_eq!(text_at(&tree, root, "src/lib.rs").as_deref(), Some("fn a() {}"));
     assert!(tree.is_dir(tree.lookup(root, "src").unwrap()));
-    assert_eq!(tree.read(root, "src"), None);
+    assert_eq!(tree.read(root, "src"), Ok(None));
     assert_eq!(tree.lookup(root, "src/main.rs"), None);
     assert_eq!(tree.lookup(root, ""), Some(root));
 }
@@ -323,11 +323,11 @@ fn views_read_share_and_outlive_collection_until_closed() {
         .root;
     let main = vfs.open(View { root }).unwrap();
     assert_eq!(vfs.view(main), View { root });
-    let file = vfs.read(main, "src/lib.rs").unwrap();
+    let file = vfs.read(main, "src/lib.rs").unwrap().unwrap();
     assert_eq!(file.bytes, b"x");
     assert_eq!(file.id, ContentId::of(FILE_DOMAIN, b"x"));
-    assert_eq!(vfs.read(main, "src"), None);
-    assert_eq!(vfs.read(main, "nope"), None);
+    assert_eq!(vfs.read(main, "src").unwrap(), None);
+    assert_eq!(vfs.read(main, "nope").unwrap(), None);
     assert_eq!(vfs.lookup(main, ""), Some(root));
     assert_eq!(vfs.lookup(main, "src/lib.rs"), Some(file.id));
     assert_eq!(vfs.list(main, ""), Some(vec![("README".into(), false), ("src".into(), true)]));
@@ -339,7 +339,7 @@ fn views_read_share_and_outlive_collection_until_closed() {
     assert_eq!(vfs.head("main"), Some(root));
     let view = vfs.open(View { root: pr }).unwrap();
     assert_ne!(view, main);
-    assert_eq!(vfs.read(view, "src/lib.rs").unwrap().bytes, b"z");
+    assert_eq!(vfs.read(view, "src/lib.rs").unwrap().unwrap().bytes, b"z");
     assert_eq!(vfs.lookup(view, "src/a"), vfs.lookup(main, "src/a"), "a subtree is shared");
     assert_eq!(
         vfs.diff(root, pr),
@@ -355,12 +355,12 @@ fn views_read_share_and_outlive_collection_until_closed() {
     vfs.collect(&[kept]);
     assert!(!vfs.has(ci));
     assert!(vfs.has(pr) && vfs.has(kept) && vfs.has(root));
-    assert_eq!(vfs.read(view, "src/lib.rs").unwrap().bytes, b"z");
+    assert_eq!(vfs.read(view, "src/lib.rs").unwrap().unwrap().bytes, b"z");
     assert_eq!(vfs.view(view), View { root: pr });
     vfs.close(view);
     vfs.collect(&[]);
     assert!(!vfs.has(pr) && !vfs.has(kept));
-    assert_eq!(vfs.read(main, "src/a/b.rs").unwrap().bytes, b"y");
+    assert_eq!(vfs.read(main, "src/a/b.rs").unwrap().unwrap().bytes, b"y");
 
     // A closed view's number is not given again, and a root that is gone does not open.
     let again = vfs.open(View { root }).unwrap();
@@ -375,7 +375,7 @@ fn a_closed_view_is_not_read() {
     let mut vfs = new_vfs();
     let view = vfs.open(View { root: vfs.empty() }).unwrap();
     vfs.close(view);
-    let _ = vfs.read(view, "a");
+    let _ = vfs.read(view, "a").unwrap();
 }
 
 #[test]
@@ -486,7 +486,7 @@ fn transactions_match_a_model() {
             (root, model) = (after, next);
             assert_eq!(moded(&vfs.tree, vfs.root(root).unwrap()), model, "seed {seed}");
             for (path, (mode, bytes)) in &model {
-                let read = reader.file(root, path).map(|(_, mode, bytes)| (mode, bytes.to_vec()));
+                let read = reader.file(root, path).unwrap().map(|(_, mode, bytes)| (mode, bytes.to_vec()));
                 assert_eq!(read, Some((*mode, bytes.clone())), "seed {seed}: {path}");
             }
             if step % 2 == 0 {
@@ -647,8 +647,8 @@ fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
                             continue;
                         };
                         let pinned = reader.pin();
-                        let a = pinned.file(root, "a").map(|it| it.bytes.to_vec());
-                        let b = pinned.file(root, "d/e/b").map(|it| it.bytes.to_vec());
+                        let a = pinned.file(root, "a").unwrap().map(|it| it.bytes.to_vec());
+                        let b = pinned.file(root, "d/e/b").unwrap().map(|it| it.bytes.to_vec());
                         let listed = pinned.list(root, "d").map(Iterator::count);
                         match (a, b, listed) {
                             (Some(a), Some(b), Some(2)) => {
@@ -691,7 +691,7 @@ fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
     });
     vfs.collect(&[]);
     let head = vfs.head("w").unwrap();
-    let read = reader.pin().file(head, "d/c").map(|it| it.bytes.to_vec());
+    let read = reader.pin().file(head, "d/c").unwrap().map(|it| it.bytes.to_vec());
     assert_eq!(read, Some(b"c".to_vec()));
 }
 
@@ -701,7 +701,7 @@ fn listed(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, b
 
 /// What a pinned read lends, owned, to compare with [`Reader::file`].
 fn pinned_file(reader: &Reader, root: ContentId, path: &str) -> Option<(ContentId, Mode, Vec<u8>)> {
-    reader.pin().file(root, path).map(|it| (it.id, it.mode, it.bytes.to_vec()))
+    reader.pin().file(root, path).unwrap().map(|it| (it.id, it.mode, it.bytes.to_vec()))
 }
 
 fn pinned_list(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
@@ -728,8 +728,8 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
     let view = vfs.open(View { root }).unwrap();
     for path in ["src/lib.rs", "run.sh", "link", "src", "", "nope", "src/lib.rs/x", "a//b", "../x"]
     {
-        let file = vfs.read(view, path).map(|it| (it.id, it.mode, it.bytes.to_vec()));
-        let read = reader.file(root, path).map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
+        let file = vfs.read(view, path).unwrap().map(|it| (it.id, it.mode, it.bytes.to_vec()));
+        let read = reader.file(root, path).unwrap().map(|(id, mode, bytes)| (id, mode, bytes.to_vec()));
         assert_eq!(read, file, "{path}");
         assert_eq!(pinned_file(&reader, root, path), file, "{path}");
     }
@@ -738,11 +738,11 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
         assert_eq!(pinned_list(&reader, root, path), vfs.list(view, path), "{path}");
     }
     // A read lends the tree's own bytes: no copy, whichever handle reads them.
-    let lent = reader.file(root, "run.sh").unwrap().2;
-    assert!(std::ptr::eq(lent.as_ptr(), vfs.read(view, "run.sh").unwrap().bytes.as_ptr()));
+    let lent = reader.file(root, "run.sh").unwrap().unwrap().2;
+    assert!(std::ptr::eq(lent.as_ptr(), vfs.read(view, "run.sh").unwrap().unwrap().bytes.as_ptr()));
     let file_id = vfs.lookup(view, "run.sh").unwrap();
     assert_eq!(listed(&reader, file_id, ""), None, "a file is no root");
-    assert_eq!(reader.file(file_id, ""), None);
+    assert_eq!(reader.file(file_id, "").unwrap(), None);
 
     // A what-if is readable as soon as `apply` gives its ID. Readers on other threads go on
     // while the table grows and collections swap levels under them; what a collection keeps
@@ -755,7 +755,7 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
                 scope.spawn(move || {
                     (0..2000).all(|_| {
                         reader
-                            .file(what_if, "src/lib.rs")
+                            .file(what_if, "src/lib.rs").unwrap()
                             .is_some_and(|it| *it.2 == *b"pub fn a() {}")
                     })
                 })
@@ -778,18 +778,18 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
     vfs.remove_head("w");
     vfs.collect(&[what_if]);
     assert!(vfs.has(what_if) && !vfs.has(root));
-    assert_eq!(reader.file(root, "run.sh"), None);
+    assert_eq!(reader.file(root, "run.sh").unwrap(), None);
     assert_eq!(listed(&reader, root, ""), None);
-    assert_eq!(reader.file(what_if, "run.sh").map(|it| it.1), Some(Mode::Executable));
+    assert_eq!(reader.file(what_if, "run.sh").unwrap().map(|it| it.1), Some(Mode::Executable));
     let next = vfs.commit("w", empty, &[write("after", "1")]).unwrap().root;
-    assert_eq!(reader.file(next, "after").map(|it| it.2.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(reader.file(next, "after").unwrap().map(|it| it.2.to_vec()), Some(b"1".to_vec()));
 
     // A reader outlives its `Vfs`: what was retired and not reclaimed goes with the last
     // handle, and what the table holds still reads.
     vfs.collect(&[]);
     drop(vfs);
-    assert_eq!(reader.file(what_if, "run.sh"), None);
-    assert_eq!(reader.file(next, "after").map(|it| it.2.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(reader.file(what_if, "run.sh").unwrap(), None);
+    assert_eq!(reader.file(next, "after").unwrap().map(|it| it.2.to_vec()), Some(b"1".to_vec()));
     assert_eq!(listed(&reader, empty, ""), Some(Vec::new()));
 }
 
@@ -819,7 +819,7 @@ fn a_mode_is_in_the_tree_not_in_the_file() {
         vec![Change { path: "run.sh".into(), kind: ChangeKind::Modified }]
     );
     let (a, b) = (vfs.open(View { root: plain }).unwrap(), vfs.open(View { root: exec }).unwrap());
-    let (a, b) = (vfs.read(a, "run.sh").unwrap(), vfs.read(b, "run.sh").unwrap());
+    let (a, b) = (vfs.read(a, "run.sh").unwrap().unwrap(), vfs.read(b, "run.sh").unwrap().unwrap());
     assert_eq!((a.mode, b.mode), (Mode::Regular, Mode::Executable));
     assert_eq!(a.id, b.id, "the same bytes are the same file");
 
@@ -866,10 +866,10 @@ fn a_symlink_reads_as_its_target_and_follows_to_its_file() {
         .unwrap()
         .root;
     let view = vfs.open(View { root }).unwrap();
-    let link = vfs.read(view, "lib.rs").unwrap();
+    let link = vfs.read(view, "lib.rs").unwrap().unwrap();
     assert_eq!((link.mode, link.bytes), (Mode::Symlink, &b"src/lib.rs"[..]));
 
-    let target = vfs.read(view, "src/lib.rs").unwrap();
+    let target = vfs.read(view, "src/lib.rs").unwrap().unwrap();
     for path in ["lib.rs", "src/up", "dir/lib.rs", "src/lib.rs"] {
         assert_eq!(vfs.follow(view, path), Ok(Some(target)), "{path}");
     }
@@ -946,7 +946,7 @@ fn journal_run(seed: u64) {
                         rng.below(6)
                     );
                     let bytes = format!("{seed}:{step}:{}", rng.below(1 << 20));
-                    ops.push(match (rng.below(4), vfs.tree.read(base_node, &path)) {
+                    ops.push(match (rng.below(4), vfs.tree.read(base_node, &path).unwrap()) {
                         (0, Some(_)) => delete(&path),
                         (1, Some(old)) => edit(
                             &path,

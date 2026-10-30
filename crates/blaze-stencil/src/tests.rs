@@ -1,30 +1,21 @@
-//! The backend's tests (stencil.md, "Tests"): each stencil against `cranelift-interpreter`,
-//! whole functions against Cranelift's code of them, the CLIF corpus, the library's
-//! invariants, the encodings, unwinding through stencil code, and compile speed.
+//! The backend's tests (stencil.md, "Tests"): that the stencil backend means what Cranelift
+//! means. Each stencil against `cranelift-interpreter` and Cranelift's code of the same
+//! one-instruction function ([`stencil`]), whole functions of both backends calling each
+//! other ([`func`]), the CLIF corpus ([`clif`]), and seeded random IR ([`fuzz`]).
 //!
-//! What runs code (each stencil alone in a harness frame, whole functions, unwinding) runs on
-//! the machine's own architecture under Unix ([`exec`]). Everything else, compiling for every
-//! target the IR builder makes code for included, runs everywhere.
+//! What runs code ([`exec`], the crate's one unsafe module) runs only on the host's own
+//! variant: x86-64 Linux, AArch64 Linux, or AArch64 macOS (`apple-m1`), each the variant its
+//! CI host covers. Compiling for every target the IR builder makes code for, and the
+//! interpreter's side, run everywhere.
 
-mod rng;
 mod host;
-mod semantics;
 mod interp;
-
-mod coverage;
-mod enc;
-mod library;
-mod tier;
+mod rng;
 
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod exec;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod stencils;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod funcs;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod corpus;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod unwind;
-#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
-mod speed;
+
+mod clif;
+mod func;
+mod fuzz;
+mod stencil;

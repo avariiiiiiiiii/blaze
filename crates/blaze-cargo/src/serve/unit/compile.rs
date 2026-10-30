@@ -17,7 +17,6 @@ use blaze_diagnostics::{Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_units::schema::Unit;
-use hir_ty::db::HirDatabase;
 use load_cargo::v2::{ProcMacroLoadResult, ProcMacroLoadingError};
 use serde::{Deserialize, Serialize};
 
@@ -431,7 +430,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     let options = Options { lints, ..Options::default() };
-    let db: &dyn HirDatabase = reader.db();
+    let db = reader.db();
     let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), &names, &options);
     let mut sources = mounted.sources();
     let style = blaze_diagnostics::emit::Style { ansi: color, ..Default::default() };
@@ -653,7 +652,7 @@ fn ar(members: &[(&str, &[u8])]) -> Vec<u8> {
 
 /// The files of `krate`'s modules, by absolute path, sorted.
 fn crate_files(reader: &UnitReader, krate: base_db::Crate) -> Vec<String> {
-    let db: &dyn HirDatabase = reader.db();
+    let db = reader.db();
     let paths = reader.paths();
     let def_map = hir_def::nameres::crate_def_map(db, krate);
     let mut out = Vec::new();

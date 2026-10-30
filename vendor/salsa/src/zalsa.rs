@@ -159,6 +159,7 @@ pub struct Zalsa {
     ingredient_to_id_struct_type_id_map: FxHashMap<IngredientIndex, TypeId>,
 
     /// Vector of ingredients.
+    // alloc: setup: the ingredient list, filled when jars register
     ingredients_vec: Vec<Box<dyn Ingredient>>,
 
     /// Indices of ingredients that require reset when a new revision starts.
@@ -170,6 +171,7 @@ pub struct Zalsa {
     /// Every memo's edges: dense nodes for the keys they name and one array of edge words.
     graph: Graph,
 
+    // dyn: setup: the event callback, installed once per database
     event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync>>,
 }
 
@@ -182,6 +184,7 @@ impl RefUnwindSafe for Zalsa {}
 
 impl Zalsa {
     pub(crate) fn new<Db: Database>(
+        // dyn: setup: the event callback, installed once per database
         event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync + 'static>>,
         jars: Vec<ErasedJar>,
     ) -> Self {
@@ -189,7 +192,9 @@ impl Zalsa {
             views_of: Views::new::<Db>(),
             jar_map: HashMap::default(),
             ingredient_to_id_struct_type_id_map: Default::default(),
+            // alloc: setup: the ingredient list, filled when jars register
             ingredients_vec: Vec::new(),
+            // alloc: setup: the ingredient list, filled when jars register
             ingredients_requiring_reset: Vec::new(),
             runtime: Runtime::default(),
             graph: Graph::default(),
@@ -204,6 +209,7 @@ impl Zalsa {
         let mut jars = inventory::iter::<ErasedJar>()
             .copied()
             .chain(jars)
+            // alloc: setup: the ingredient list, filled when jars register
             .collect::<Vec<_>>();
 
         #[cfg(not(feature = "inventory"))]
@@ -262,6 +268,7 @@ impl Zalsa {
 
     /// Returns the ingredient at the given index, or panics if it is out-of-bounds.
     #[inline]
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     pub fn lookup_ingredient(&self, index: IngredientIndex) -> &dyn Ingredient {
         self.ingredients_vec[index.as_u32() as usize].as_ref()
     }
@@ -272,6 +279,7 @@ impl Zalsa {
     ///
     /// The index must be in-bounds.
     #[inline]
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     pub unsafe fn lookup_ingredient_unchecked(&self, index: IngredientIndex) -> &dyn Ingredient {
         // SAFETY: Guaranteed by caller.
         unsafe {
@@ -291,6 +299,7 @@ impl Zalsa {
     }
 
     #[allow(unused)]
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     pub(crate) fn ingredients(&self) -> impl Iterator<Item = &dyn Ingredient> {
         self.ingredients_vec
             .iter()
@@ -418,6 +427,7 @@ impl Zalsa {
     pub fn lookup_ingredient_mut(
         &mut self,
         index: IngredientIndex,
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     ) -> (&mut dyn Ingredient, &mut Runtime) {
         let index = index.as_u32() as usize;
         let ingredient = self
@@ -429,12 +439,14 @@ impl Zalsa {
 
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     pub fn take_ingredient(&mut self, index: IngredientIndex) -> Box<dyn Ingredient> {
         self.ingredients_vec.remove(index.as_u32() as usize)
     }
 
     /// **NOT SEMVER STABLE**
     #[doc(hidden)]
+    // dyn: ingredients are reached by index through their vtable, once per query call and once per edge in deep verify; the color column takes it off the per-edge path (docs/v2/plan/lanes/db/speed-of-light.md)
     pub fn replace_ingredient(&mut self, index: IngredientIndex, ingredient: Box<dyn Ingredient>) {
         self.ingredients_vec
             .insert(index.as_u32() as usize, ingredient);
@@ -521,6 +533,7 @@ impl Zalsa {
     }
 
     #[inline(always)]
+    // dyn: the closure runs only when an event callback is installed (tests, tracing); otherwise a hit pays one branch
     pub fn event(&self, event: &dyn Fn() -> crate::Event) {
         if self.event_callback.is_some() {
             self.event_cold(event);
@@ -530,6 +543,7 @@ impl Zalsa {
     // Avoid inlining, as events are typically only enabled for debugging purposes.
     #[cold]
     #[inline(never)]
+    // dyn: the closure runs only when an event callback is installed (tests, tracing); otherwise a hit pays one branch
     pub fn event_cold(&self, event: &dyn Fn() -> crate::Event) {
         let event_callback = self.event_callback.as_ref().unwrap();
         event_callback(event());
@@ -543,6 +557,7 @@ pub struct ErasedJar {
     type_id: fn() -> TypeId,
     type_name: fn() -> &'static str,
     id_struct_type_id: fn() -> TypeId,
+    // alloc: setup: the ingredient list, filled when jars register
     create_ingredients: fn(&mut Zalsa, IngredientIndex) -> Vec<Box<dyn Ingredient>>,
 }
 

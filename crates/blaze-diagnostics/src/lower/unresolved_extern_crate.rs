@@ -31,5 +31,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedExternCrate) -> Vec<Foun
         );
     }
     diag.span_label(span, "can't find crate");
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }

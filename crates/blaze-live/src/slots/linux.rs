@@ -26,7 +26,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::{__register_frame, image_base, in_image, load_cell, loaders},
+    unix::{__register_frame, Segments, load_cell, loaders},
 };
 use crate::patch::MESSAGE_PREFIX;
 
@@ -88,8 +88,8 @@ pub(super) struct Os {
     code: Range<u64>,
     alias: u64,
     maps: Maps,
-    /// Where the image is loaded, which every data write is checked to be in.
-    base: u64,
+    /// Where the image is mapped, which every data write is checked to be in.
+    segments: Segments,
 }
 
 impl Os {
@@ -123,9 +123,8 @@ impl Os {
             cell = protection;
             Ok(())
         })?;
-        let base =
-            image_base(at).ok_or_else(|| format!("no image has the table cell at {at:#x}"))?;
-        Ok(Os { page, cell, code, alias, maps, base })
+        let segments = Segments::of(at)?;
+        Ok(Os { page, cell, code, alias, maps, segments })
     }
 
     fn pages(&self, range: &Range<u64>) -> Range<u64> {
@@ -232,7 +231,7 @@ impl Memory for Os {
     }
 
     fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
-        in_image(range, self.base)?;
+        self.segments.check(range)?;
         self.maps.each(range, |piece, protection| {
             if protection & PROT_READ == 0 {
                 return Err(format!("{:#x}, in pages with no access", piece.start));
@@ -243,7 +242,7 @@ impl Memory for Os {
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
         self.in_image(range)?;
-        super::unix::bytes(range, self.base)
+        super::unix::bytes(range, self.segments.base())
     }
 
     fn loaders(&self, at: u64, slots: u64) -> &[u64] {
@@ -268,7 +267,7 @@ impl Memory for Os {
     fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         let mut run: Option<(Range<u64>, i32)> = None;
         for span in writes.spans {
-            in_image(&span.range(), self.base)?;
+            self.segments.check(&span.range())?;
             self.maps.each(&span.range(), |piece, protection| {
                 if protection & PROT_READ == 0 {
                     return Err(format!("data at {:#x}, in pages with no access", piece.start));
@@ -479,28 +478,45 @@ fn names(bytes: &[u8]) -> (bool, bool) {
 
 /// Makes what was written at each of `ranges`, through the addresses `delta` from them, what
 /// runs there: every data cache line cleaned, one barrier, every instruction cache line
-/// invalidated, one barrier.
+/// invalidated, one barrier. Where `CTR_EL0` says the hardware keeps either side coherent
+/// itself (IDC: no clean to the point of unification; DIC: no instruction cache
+/// invalidation), that side is one barrier and no line, as Linux's own
+/// `caches_clean_inval_pou` does. The register is read as the kernel shows it, which hides
+/// DIC on cores whose errata need the invalidation (Neoverse N1's 1542419).
 #[cfg(target_arch = "aarch64")]
 fn flush(ranges: impl Iterator<Item = Range<u64>> + Clone, delta: u64) {
     use std::arch::asm;
     let ctr: u64;
     // SAFETY: CTR_EL0 is readable at EL0 on Linux, which traps and emulates it where not.
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
+    let (idc, dic) = ((ctr >> 28) & 1 != 0, (ctr >> 29) & 1 != 0);
     let data_line = 4u64 << ((ctr >> 16) & 0xf);
     let code_line = 4u64 << (ctr & 0xf);
-    // Cleaning and invalidating caches by address of memory that is mapped changes no
-    // memory, as __clear_cache does; each address below is of a range just written.
-    for range in ranges.clone() {
-        let (start, end) = (range.start.wrapping_add(delta), range.end.wrapping_add(delta));
-        let mut at = start & !(data_line - 1);
-        while at < end {
-            // SAFETY: as above: `at` is in a mapped range.
-            unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack)) };
-            at += data_line;
+    if idc {
+        // SAFETY: a barrier, which touches no memory: the stores reach the point of
+        // unification, which instruction fetch is coherent with.
+        unsafe { asm!("dsb ishst", options(nostack)) };
+    } else {
+        // Cleaning and invalidating caches by address of memory that is mapped changes no
+        // memory, as __clear_cache does; each address below is of a range just written.
+        for range in ranges.clone() {
+            let (start, end) = (range.start.wrapping_add(delta), range.end.wrapping_add(delta));
+            let mut at = start & !(data_line - 1);
+            while at < end {
+                // SAFETY: as above: `at` is in a mapped range.
+                unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack)) };
+                at += data_line;
+            }
         }
+        // SAFETY: a barrier, which touches no memory.
+        unsafe { asm!("dsb ish", options(nostack)) };
     }
-    // SAFETY: a barrier, which touches no memory.
-    unsafe { asm!("dsb ish", options(nostack)) };
+    if dic {
+        // SAFETY: a barrier, which touches no memory: the instruction cache needs no
+        // invalidation, so this thread only refetches.
+        unsafe { asm!("isb", options(nostack)) };
+        return;
+    }
     for range in ranges {
         let mut at = range.start & !(code_line - 1);
         while at < range.end {

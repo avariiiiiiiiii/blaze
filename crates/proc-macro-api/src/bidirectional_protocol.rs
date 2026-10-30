@@ -1,6 +1,7 @@
 //! Bidirectional protocol methods
 
 use std::{
+    cell::RefCell,
     io::{self, BufRead, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
@@ -16,14 +17,13 @@ use crate::{
         ListMacros, Request, Response, SubRequest, SubResponse,
     },
     legacy_protocol::{
-        SpanMode,
-        msg::{
-            FlatTree, ServerConfig, SpanDataIndexMap, deserialize_span_data_index_map,
-            serialize_span_data_index_map,
-        },
+        SpanMode, answer_error,
+        msg::{FlatTree, ServerConfig, SpanDataIndexMap, serialize_span_data_index_map},
     },
     process::Claimed,
     transport::postcard,
+    version,
+    wire::{ExpandMacroWire, Sent, flat_answer, read_tree},
 };
 
 pub mod msg;
@@ -161,6 +161,32 @@ pub(crate) fn expand(
     seen: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
     let version = process.version();
+    if let Some(err) = process.exited() {
+        return Err(err.clone());
+    }
+    if version >= version::WIRE_TREES {
+        let mut sent = Sent::new();
+        let task = ExpandMacroWire::of(
+            proc_macro,
+            subtree,
+            attr,
+            env,
+            [def_site, call_site, mixed_site],
+            current_dir,
+            &mut sent,
+        );
+        let sent = RefCell::new(sent);
+        let task = BidirectionalMessage::Request(Request::ExpandMacroWire(Box::new(task)));
+        let answer = process.run_expansion(task, &noting(&sent, callback), seen)?;
+        return match answer {
+            BidirectionalMessage::Response(Response::ExpandMacroWire(Ok(resp))) => {
+                let tree = read_tree(&resp.tree, &sent.borrow(), &mut Vec::new());
+                Ok(Ok(tree.map_err(answer_error)?))
+            }
+            BidirectionalMessage::Response(Response::ExpandMacroWire(Err(msg))) => Ok(Err(msg.0)),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+        };
+    }
     let mut span_data_table = SpanDataIndexMap::default();
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
@@ -183,22 +209,34 @@ pub(crate) fn expand(
         current_dir: Some(current_dir),
     })));
 
-    if let Some(err) = process.exited() {
-        return Err(err.clone());
-    }
-    let response_payload = process.run_expansion(task, callback, seen)?;
+    let sent = RefCell::new(Sent::of_table(&span_data_table));
+    let response_payload = process.run_expansion(task, &noting(&sent, callback), seen)?;
 
     match response_payload {
-        BidirectionalMessage::Response(Response::ExpandMacro(it)) => Ok(it
-            .map(|resp| {
-                FlatTree::to_subtree_resolved(
-                    resp.tree,
-                    version,
-                    &deserialize_span_data_index_map(&resp.span_data_table),
-                )
-            })
-            .map_err(|msg| msg.0)),
+        BidirectionalMessage::Response(Response::ExpandMacro(Ok(resp))) => {
+            let answered = Some(&resp.span_data_table[..]);
+            let tree = flat_answer(resp.tree, version, &span_data_table, answered, &sent.borrow());
+            Ok(Ok(tree.map_err(answer_error)?))
+        }
+        BidirectionalMessage::Response(Response::ExpandMacro(Err(msg))) => Ok(Err(msg.0)),
         _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+    }
+}
+
+/// `callback`, noting in `sent` each span it answers a sub-request with: the server may put it
+/// in its output.
+fn noting<'a>(
+    sent: &'a RefCell<Sent>,
+    callback: SubCallback<'a>,
+) -> impl Fn(SubRequest) -> Result<SubResponse, ServerError> + 'a {
+    move |request| {
+        let joined_in = match &request {
+            SubRequest::SpanJoin { file_id, .. } => Some(*file_id),
+            _ => None,
+        };
+        let response = callback(request)?;
+        sent.borrow_mut().sub_response(joined_in, &response);
+        Ok(response)
     }
 }
 

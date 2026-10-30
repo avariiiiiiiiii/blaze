@@ -9,6 +9,7 @@
 //! `IdentInScopeButItIsDesc`, `ExplicitUnsafeTraits`, `MaybeMissingMacroRulesName`,
 //! `AddedMacroUse`, `ConsiderAddingADerive`) (MIT or Apache-2.0).
 
+use base_db::Db;
 use either::Either;
 use hir::{HasSource as _, InFile, ModuleDef, ScopeDef};
 use hir_expand::inert_attr_macro::INERT_ATTRIBUTES;
@@ -35,7 +36,7 @@ pub(super) enum Kind {
 }
 
 impl Kind {
-    pub(super) fn of(macro_: hir::Macro, db: &dyn hir::db::HirDatabase) -> Kind {
+    pub(super) fn of(macro_: hir::Macro, db: &Db) -> Kind {
         match macro_.kind(db) {
             hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => Kind::Attr,
             hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => Kind::Derive,
@@ -95,12 +96,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMacroCall) -> Vec<Found>
     let Some(ident) = segments.last().cloned() else {
         let name = d.path.segments().last().map_or_else(String::new, |it| it.as_str().to_owned());
         let message = format!("cannot find {} `{name}` in this scope", kind.expected());
-        return vec![Found::new(Diag::error(None, message, cx.span(d.range)), Phase::Resolve)];
+        return vec![Found::new(Diag::error(None, message, cx.span(d.range)), Phase::Expand)];
     };
     if segments.len() > 1 {
         let range = TextRange::new(segments[0].range.start(), ident.range.end());
         let diag = macro_path_error(cx, file, node, &segments, range, (kind.article(), kind.descr()), d.is_bang);
-        return vec![Found::new(diag, Phase::Resolve)];
+        return vec![Found::new(diag, Phase::Expand)];
     }
     let span = cx.span(InFile::new(file, ident.range));
     let name = ident.name.as_str();
@@ -110,7 +111,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMacroCall) -> Vec<Found>
         diag.fact(cx.resolves_fact(module, name), format!("what `{name}` names in this scope"));
     }
     suggestions(cx, &mut diag, kind, &ident, span, &names, &node, attr.as_ref());
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }
 
 /// rustc's `unresolved_macro_suggestions`, as far as its steps can be told from hir.

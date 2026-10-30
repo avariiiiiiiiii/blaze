@@ -1,11 +1,11 @@
 //! A static's value as v2 keeps it ([`Static`]): its bytes with what they point at by place,
 //! its own read-only data by content.
 
+use base_db::Db;
 use blaze_codegen::{Arch, Init, Reloc, RelocKind, Static, backend::FrontRef, template::Refs};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey};
 use hir_def::{HasModule, StaticId, attrs::AttrFlags};
-use hir_ty::db::HirDatabase;
 
 use super::{
     Hashes, Places,
@@ -35,7 +35,7 @@ pub(crate) struct Value {
 
 /// What the static `id` holds, evaluated.
 pub(crate) fn value(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     hashes: &dyn Hashes,
     id: StaticId,
@@ -86,7 +86,7 @@ pub(crate) fn value(
 
 /// The static `id` with its references at `refs`.
 pub(crate) fn compile(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     hashes: &dyn Hashes,
     arch: Arch,

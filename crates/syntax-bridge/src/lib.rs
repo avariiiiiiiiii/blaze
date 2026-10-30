@@ -24,7 +24,8 @@ pub mod prettify_macro_expansion;
 pub mod reference;
 mod to_parser_input;
 pub use to_parser_input::{
-    to_matcher_input, to_matcher_input_into, to_parser_input, to_parser_input_into,
+    to_matcher_input, to_matcher_input_into, to_parser_input, to_parser_input_into, tree_words,
+    view_tokens,
 };
 // FIXME: we probably should re-think  `token_tree_to_syntax_node` interfaces
 pub use ::parser::TopEntryPoint;
@@ -205,34 +206,37 @@ const KEEP_INPUT: usize = 1 << 16;
 /// Converts a [`tt::Subtree`] back to a [`SyntaxNode`].
 /// The produced `SpanMap` contains a mapping from the syntax nodes offsets to the subtree's spans.
 ///
-/// The parser reads the tokens' kinds from one pass over the tree's columns
-/// ([`to_parser_input_into`]) into an input kept per thread, and the tree is built straight
-/// from its events and the tokens: nothing is parsed twice and no text is lexed.
+/// The parser reads the words the tree keeps ([`view_tokens`]; made once, the first time it is
+/// parsed), where they are, and the tree is built straight from its events and the tokens:
+/// nothing is converted or parsed twice and no text is lexed. The input kept per thread is
+/// only filled when the words must be made afresh for other editions.
 pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     tt: &tt::TopSubtree,
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut F,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
-    let mut parser_input =
-        INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(buffer.len()));
-    to_parser_input_into(buffer, span_to_edition, &mut parser_input);
-    let parsed = parse_tokens(buffer, entry_point, &parser_input);
-    if parser_input.len() <= KEEP_INPUT {
-        INPUT.set(Some(parser_input));
+    let mut copy = INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(0));
+    let parsed = parse_tokens(
+        buffer,
+        entry_point,
+        view_tokens(buffer, false, span_to_edition, &mut copy),
+    );
+    if copy.len() <= KEEP_INPUT {
+        INPUT.set(Some(copy));
     }
     parsed
 }
 
-/// The tree of the tokens of `buffer`, `parser_input` being their input.
+/// The tree of the tokens of `buffer`, `tokens` being their input.
 pub(crate) fn parse_tokens(
     buffer: tt::TokenTreesView<'_>,
     entry_point: parser::TopEntryPoint,
-    parser_input: &parser::Input,
+    tokens: parser::Tokens<'_>,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     // It matters what edition we parse with even when we escape all identifiers correctly.
-    let parser_output = entry_point.parse(parser_input);
-    let mut tree_sink = TtTreeSink::new(buffer.cursor(), parser_input.len());
+    let parser_output = entry_point.parse(tokens);
+    let mut tree_sink = TtTreeSink::new(buffer.cursor(), tokens.len());
     for event in parser_output.iter() {
         match event {
             parser::Step::Token { kind, n_input_tokens: n_raw_tokens } => {

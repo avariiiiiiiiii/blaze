@@ -158,6 +158,18 @@ made two allocations per test: about 5 to 10 µs, 8 to 16% of `T_fork`.
 a new one arrives (`Lines::common`, `Lines::common_is`). A result costs an `Arc` clone and its
 own lines. This is at the bound.
 
+**Allocation budget** (`the_steady_state_reuses_its_slabs`): once the columns have grown, a
+test costs the queue at most 8 allocations, every one owned by something past the queue:
+- the result's output, execution record and name;
+- its own line, kept and then its result's two buffers;
+- the record file name of the driver's read;
+- the bytes of the driver's send of the next run.
+
+None is per line every test read, per timer or per attempt. The wire, the region read, an
+interner hit and the wheel in steady state allocate nothing, and a test's identity, sorted in the
+worker's scratch (the radix sort's buffer included, through `sort_copy_by_key_in`), allocates
+nothing warm below `blaze_radix::PARALLEL` hashes. Each has a test with `blaze-alloc-count`.
+
 **What stands in the way, outside these paths:** cargo's `Trace::traced` turns each result into
 a `Traced` and rehashes every common line for every test, about 20 µs for 2,000 lines. With
 `common_is` it can build the common part once per server and merge each test's own lines into

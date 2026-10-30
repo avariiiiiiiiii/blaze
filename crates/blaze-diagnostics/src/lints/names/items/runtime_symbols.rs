@@ -8,6 +8,7 @@
 //! canonical_symbols.rs`, `compiler/rustc_symbol_mangling/src/lib.rs` (`symbol_name_from_attrs`)
 //! and `compiler/rustc_lint/src/lints.rs` (`RedefiningRuntimeSymbolsDiag`) (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir::{HasSource as _, ModuleDef};
 use hir_def::{

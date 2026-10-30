@@ -1,9 +1,10 @@
 //! The columns an expression store keeps its expressions, patterns and statements in
 //! (`docs/v2/plan/design/data.md`): a `u8` kind and a `u32` data word per node, the words of the
 //! variants that need more than one in the shared `extra` column, lists as `(start, len)` ranges
-//! into one array per element type, and cold values (names, paths, literals, generic arguments,
-//! `offset_of!`, `asm!`, macro definitions) in side tables by index. [`Expr`], [`Pat`] and
-//! [`Statement`] are views decoded from them on the fly; a block's statements are a run of
+//! into one array per element type, and cold values (names, literals, `offset_of!`, `asm!`,
+//! macro definitions) in side tables by index. Paths and generic arguments are the store's
+//! [`PathColumns`], which a node names by [`PathIdx`] and by [`slot`] word. [`Expr`], [`Pat`]
+//! and [`Statement`] are views decoded from them on the fly; a block's statements are a run of
 //! statement rows, read through [`Statements`].
 //!
 //! In the tables, `e` is a data word holding the index in `extra` of the node's words, written
@@ -14,20 +15,20 @@
 //! | expression | data | `extra` |
 //! |---|---|---|
 //! | `Missing`, `Underscore`, `IncludeBytes` | 0 | |
-//! | `Path(path)` | `paths` t | |
+//! | `Path(path)` | path (`PathIdx`) | |
 //! | `If` | e | `[condition, then_branch, else_branch+1]` |
 //! | `Let` | e | `[pat, expr]` |
 //! | `Block` | e | `[id low, id high, statements start, statements len, tail+1, label+1 <<1 \| unsafe_]` (an id of low word 0 is `None`; the statements a run of statement rows) |
 //! | `Const(expr)` | expr | |
 //! | `Loop` | e | `[body, label+1 <<2 \| source]` |
 //! | `Call` | e | `[callee, args start, args len]` (`expr_lists`) |
-//! | `MethodCall` | e | `[receiver, method_name (names t), args start, args len, generic_args+1 (generic_args t)]` |
+//! | `MethodCall` | e | `[receiver, method_name (names t), args start, args len, generic_args+1 (paths' generic_args rows, [`slot`])]` |
 //! | `Match` | e | `[expr, arms start, arms len]` |
 //! | `Continue` | label+1 | |
 //! | `Break` | e | `[expr+1, label+1]` |
 //! | `Return`, `Yield`, `Yeet` | expr+1 | |
 //! | `Become`, `Await` | expr | |
-//! | `RecordLit` | e | `[path (paths t), fields start, fields len, spread]`, spread 0 `None`, 1 `FieldDefaults`, expr+2 `Expr` |
+//! | `RecordLit` | e | `[path (PathIdx), fields start, fields len, spread]`, spread 0 `None`, 1 `FieldDefaults`, expr+2 `Expr` |
 //! | `Field` | e | `[expr, name (names t)]` |
 //! | `Cast` | e | `[expr, type_ref]` |
 //! | `Ref` | e | `[expr, mutability <<1 \| rawness]` |
@@ -47,13 +48,13 @@
 //! | `Missing`, `Rest`, `Wild`, `NotNull` | 0 | |
 //! | `Tuple` | e | `[args start, args len, ellipsis+1]` |
 //! | `Or` | e | `[start, len]` |
-//! | `Record` | e | `[path (paths t), args start, args len (field_pats), ellipsis]` |
+//! | `Record` | e | `[path (PathIdx), args start, args len (field_pats), ellipsis]` |
 //! | `Range` | e | `[start+1, end+1, range_type]` |
 //! | `Slice` | e | `[prefix start, prefix len, slice+1, suffix start, suffix len]` |
-//! | `Path(path)` | `paths` t | |
+//! | `Path(path)` | path (`PathIdx`) | |
 //! | `Lit(expr)`, `Expr(expr)` | expr | |
 //! | `Bind` | e | `[id, subpat+1]` |
-//! | `TupleStruct` | e | `[path (paths t), args start, args len, ellipsis+1]` |
+//! | `TupleStruct` | e | `[path (PathIdx), args start, args len, ellipsis+1]` |
 //! | `Ref` | e | `[pat, mutability]` |
 //! | `Box`, `Deref` | inner | |
 //!
@@ -69,7 +70,8 @@
 //! [`EXPR_WORDS`] and [`PAT_WORDS`] give the number of `extra` words of each kind; a `let`
 //! takes 1 to [`LET_WORDS`], `let x = e;` two. A node replaced by one of its own kind
 //! ([`HirColumns::set_expr`]) keeps its words, list ranges and statement runs that are long
-//! enough and side-table entries, so columns only grow when a node grows.
+//! enough and side-table entries, so columns only grow when a node grows; its path and generic
+//! arguments are pushed anew, as paths only grow.
 
 #![forbid(unsafe_code)]
 
@@ -80,18 +82,19 @@ use salsa::plumbing::{AsId, FromId};
 
 use crate::{
     BlockId,
-    expr_store::path::{GenericArgs, Path},
+    expr_store::path::{GenericArgsIdx, PathColumns, PathIdx, slot},
     hir::{
         Array, AsmOperand, BindingId, CaptureBy, ClosureKind, CoroutineKind, CoroutineSource, Expr,
         ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf,
         Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Statements, Unsafe,
+        col::{Col, SlabLayout, SlabWriter},
     },
     type_ref::{Mutability, Rawness, TypeRefId},
 };
 use hir_expand::{MacroDefId, name::Name};
 use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
 
-/// What a column of [`HirColumns`] is: a `Vec` while a store is built, a boxed slice after.
+/// What a column of [`HirColumns`] is: a `Vec` while a store is built, a [`Col`] after.
 pub(crate) trait ColumnVec: Sized {
     type Of<T>: Deref<Target = [T]>;
 
@@ -117,7 +120,7 @@ impl ColumnVec for Growing {
 }
 
 impl ColumnVec for Frozen {
-    type Of<T> = Box<[T]>;
+    type Of<T> = Col<T>;
 
     #[inline]
     fn rows(columns: &HirColumns<Frozen>) -> Rows<'_> {
@@ -168,9 +171,7 @@ pub(crate) struct HirColumns<V: ColumnVec = Frozen> {
     pub(crate) type_lists: V::Of<Option<TypeRefId>>,
     // Cold side tables, by `u32` index.
     pub(crate) names: V::Of<Name>,
-    pub(crate) paths: V::Of<Path>,
     pub(crate) literals: V::Of<Literal>,
-    pub(crate) generic_args: V::Of<GenericArgs>,
     pub(crate) offset_ofs: V::Of<OffsetOf>,
     pub(crate) asms: V::Of<InlineAsm>,
     pub(crate) macro_defs: V::Of<MacroDefId>,
@@ -448,9 +449,7 @@ const RECORD_FIELDS: &str = "a record field list past its array";
 const FIELD_PATS: &str = "a field pattern list past its array";
 const TYPE_LIST: &str = "a type list past its array";
 const NAME: &str = "a name index past its table";
-const PATH: &str = "a path index past its table";
 const LITERAL: &str = "a literal index past its table";
-const GENERIC_ARGS: &str = "a generic arguments index past its table";
 const OFFSET_OF: &str = "an offset_of index past its table";
 const ASM: &str = "an asm index past its table";
 
@@ -642,10 +641,6 @@ pub(crate) fn entry<'s, T>(table: &'s [T], at: u32, what: &'static str) -> Check
     table.get(at as usize).ok_or(what)
 }
 
-fn entry_opt<'s, T>(table: &'s [T], word: u32, what: &'static str) -> Checked<Option<&'s T>> {
-    word.checked_sub(1).map(|at| entry(table, at, what)).transpose()
-}
-
 impl<V: ColumnVec> HirColumns<V> {
     #[inline]
     pub(crate) fn expr_count(&self) -> usize {
@@ -732,11 +727,12 @@ impl<V: ColumnVec> HirColumns<V> {
         })
     }
 
-    /// The expression `id`. A store is checked when it is made or read ([`HirColumns::check`]),
-    /// so a node that doesn't decode is a bug in the store and panics.
+    /// The expression `id`, its path or generic arguments read from `paths` (the store's). A
+    /// store is checked when it is made or read ([`HirColumns::check`]), so a node that doesn't
+    /// decode is a bug in the store and panics.
     #[inline]
-    pub(crate) fn expr(&self, id: ExprId) -> Expr<'_> {
-        match self.decode_expr(id) {
+    pub(crate) fn expr<'a>(&'a self, paths: &'a PathColumns, id: ExprId) -> Expr<'a> {
+        match self.decode_expr(paths, id) {
             Ok(expr) => expr,
             Err(what) => bad_store(what, raw(id)),
         }
@@ -744,19 +740,25 @@ impl<V: ColumnVec> HirColumns<V> {
 
     /// The pattern `id`, as [`HirColumns::expr`] decodes an expression.
     #[inline]
-    pub(crate) fn pat(&self, id: PatId) -> Pat<'_> {
-        match self.decode_pat(id) {
+    pub(crate) fn pat<'a>(&'a self, paths: &'a PathColumns, id: PatId) -> Pat<'a> {
+        match self.decode_pat(paths, id) {
             Ok(pat) => pat,
             Err(what) => bad_store(what, raw(id)),
         }
     }
 
-    pub(crate) fn exprs(&self) -> impl ExactSizeIterator<Item = (ExprId, Expr<'_>)> + '_ {
-        (0..len(self.expr_count())).map(move |at| (idx(at), self.expr(idx(at))))
+    pub(crate) fn exprs<'a>(
+        &'a self,
+        paths: &'a PathColumns,
+    ) -> impl ExactSizeIterator<Item = (ExprId, Expr<'a>)> + 'a {
+        (0..len(self.expr_count())).map(move |at| (idx(at), self.expr(paths, idx(at))))
     }
 
-    pub(crate) fn pats(&self) -> impl ExactSizeIterator<Item = (PatId, Pat<'_>)> + '_ {
-        (0..len(self.pat_count())).map(move |at| (idx(at), self.pat(idx(at))))
+    pub(crate) fn pats<'a>(
+        &'a self,
+        paths: &'a PathColumns,
+    ) -> impl ExactSizeIterator<Item = (PatId, Pat<'a>)> + 'a {
+        (0..len(self.pat_count())).map(move |at| (idx(at), self.pat(paths, idx(at))))
     }
 
     #[inline]
@@ -770,7 +772,7 @@ impl<V: ColumnVec> HirColumns<V> {
     }
 
     #[inline]
-    fn decode_expr(&self, id: ExprId) -> Checked<Expr<'_>> {
+    fn decode_expr<'a>(&'a self, paths: &'a PathColumns, id: ExprId) -> Checked<Expr<'a>> {
         let at = raw(id) as usize;
         let (Some(&kind), Some(&d)) = (self.expr_kind.get(at), self.expr_data.get(at)) else {
             return Err(EXPR_ID);
@@ -779,7 +781,7 @@ impl<V: ColumnVec> HirColumns<V> {
         let exprs: &[ExprId] = &self.expr_lists;
         Ok(match kind {
             ExprKind::Missing => Expr::Missing,
-            ExprKind::Path => Expr::Path(entry(&self.paths, d, PATH)?),
+            ExprKind::Path => Expr::Path(paths.decode(idx(d))?),
             ExprKind::If => {
                 let [condition, then_branch, else_branch] = self.node::<3>(d)?;
                 Expr::If {
@@ -821,7 +823,7 @@ impl<V: ColumnVec> HirColumns<V> {
                     receiver: idx(receiver),
                     method_name: entry(&self.names, name, NAME)?,
                     args: list(exprs, start, count, EXPR_LIST)?,
-                    generic_args: entry_opt(&self.generic_args, generic_args, GENERIC_ARGS)?,
+                    generic_args: paths.decode_slot(generic_args)?,
                 }
             }
             ExprKind::Match => {
@@ -840,7 +842,7 @@ impl<V: ColumnVec> HirColumns<V> {
             ExprKind::RecordLit => {
                 let [path, start, count, spread_] = self.node::<4>(d)?;
                 Expr::RecordLit {
-                    path: entry(&self.paths, path, PATH)?,
+                    path: paths.decode(idx(path))?,
                     fields: list(&self.record_fields, start, count, RECORD_FIELDS)?,
                     spread: spread(spread_),
                 }
@@ -921,7 +923,7 @@ impl<V: ColumnVec> HirColumns<V> {
     }
 
     #[inline]
-    fn decode_pat(&self, id: PatId) -> Checked<Pat<'_>> {
+    fn decode_pat<'a>(&'a self, paths: &'a PathColumns, id: PatId) -> Checked<Pat<'a>> {
         let at = raw(id) as usize;
         let (Some(&kind), Some(&d)) = (self.pat_kind.get(at), self.pat_data.get(at)) else {
             return Err(PAT_ID);
@@ -946,7 +948,7 @@ impl<V: ColumnVec> HirColumns<V> {
             PatKind::Record => {
                 let [path, start, count, ellipsis] = self.node::<4>(d)?;
                 Pat::Record {
-                    path: entry(&self.paths, path, PATH)?,
+                    path: paths.decode(idx(path))?,
                     args: list(&self.field_pats, start, count, FIELD_PATS)?,
                     ellipsis: match ellipsis {
                         0 => false,
@@ -971,7 +973,7 @@ impl<V: ColumnVec> HirColumns<V> {
                     suffix: list(pats, suffix, suffix_len, PAT_LIST)?,
                 }
             }
-            PatKind::Path => Pat::Path(entry(&self.paths, d, PATH)?),
+            PatKind::Path => Pat::Path(paths.decode(idx(d))?),
             PatKind::Lit => Pat::Lit(idx(d)),
             PatKind::Bind => {
                 let [id, subpat] = self.node::<2>(d)?;
@@ -980,7 +982,7 @@ impl<V: ColumnVec> HirColumns<V> {
             PatKind::TupleStruct => {
                 let [path, start, count, ellipsis] = self.node::<4>(d)?;
                 Pat::TupleStruct {
-                    path: entry(&self.paths, path, PATH)?,
+                    path: paths.decode(idx(path))?,
                     args: list(pats, start, count, PAT_LIST)?,
                     ellipsis: ellipsis.checked_sub(1),
                 }
@@ -1032,6 +1034,7 @@ fn put_one<T: Clone>(table: &mut Vec<T>, value: &T, old: Option<u32>) -> u32 {
         }
         None => {
             let at = len(table.len());
+            // clone: a cold side-table value pushed from a view, which borrows it elsewhere
             table.push(value.clone());
             at
         }
@@ -1045,44 +1048,42 @@ fn push_one<T>(table: &mut Vec<T>, value: T) -> u32 {
     at
 }
 
-/// [`put_one`] of an optional value, as its index plus one; `old` is the replaced node's word.
-fn put_opt<T: Clone>(table: &mut Vec<T>, value: Option<&T>, old: Option<u32>) -> u32 {
-    value.map_or(0, |value| put_one(table, value, old.and_then(|word| word.checked_sub(1))) + 1)
-}
-
 impl HirColumns<Growing> {
-    pub(crate) fn push_expr(&mut self, expr: Expr<'_>) -> ExprId {
+    /// Appends `expr`, a view whose path or generic arguments (of other columns: borrowck
+    /// forbids `paths`' own) are copied into `paths`, the store's.
+    pub(crate) fn push_expr(&mut self, paths: &mut PathColumns, expr: Expr<'_>) -> ExprId {
         let id = idx(len(self.expr_kind.len()));
-        let data = self.encode_expr(expr, None);
+        let data = self.encode_expr(paths, expr, None);
         self.expr_kind.push(ExprKind::of(&expr) as u8);
         self.expr_data.push(data);
         id
     }
 
-    pub(crate) fn push_pat(&mut self, pat: Pat<'_>) -> PatId {
+    pub(crate) fn push_pat(&mut self, paths: &mut PathColumns, pat: Pat<'_>) -> PatId {
         let id = idx(len(self.pat_kind.len()));
-        let data = self.encode_pat(pat, None);
+        let data = self.encode_pat(paths, pat, None);
         self.pat_kind.push(PatKind::of(&pat) as u8);
         self.pat_data.push(data);
         id
     }
 
     /// Replaces a node. Overwrites its words in place when the new one fits them, otherwise
-    /// appends new words (the old ones stay, unreferenced; a store is built once).
-    pub(crate) fn set_expr(&mut self, id: ExprId, expr: Expr<'_>) {
+    /// appends new words (the old ones stay, unreferenced; a store is built once). Its path or
+    /// generic arguments are pushed into `paths` anew, as [`HirColumns::push_expr`] pushes them.
+    pub(crate) fn set_expr(&mut self, paths: &mut PathColumns, id: ExprId, expr: Expr<'_>) {
         let at = raw(id) as usize;
         let kind = ExprKind::of(&expr) as u8;
         let old = (self.expr_kind[at] == kind).then_some(self.expr_data[at]);
-        self.expr_data[at] = self.encode_expr(expr, old);
+        self.expr_data[at] = self.encode_expr(paths, expr, old);
         self.expr_kind[at] = kind;
     }
 
     /// Replaces a node as [`HirColumns::set_expr`] does.
-    pub(crate) fn set_pat(&mut self, id: PatId, pat: Pat<'_>) {
+    pub(crate) fn set_pat(&mut self, paths: &mut PathColumns, id: PatId, pat: Pat<'_>) {
         let at = raw(id) as usize;
         let kind = PatKind::of(&pat) as u8;
         let old = (self.pat_kind[at] == kind).then_some(self.pat_data[at]);
-        self.pat_data[at] = self.encode_pat(pat, old);
+        self.pat_data[at] = self.encode_pat(paths, pat, old);
         self.pat_kind[at] = kind;
     }
 
@@ -1201,11 +1202,12 @@ impl HirColumns<Growing> {
     }
 
     // The by-value pushes below write the same words as `push_expr`/`push_pat` of the matching
-    // view, with the cold values moved into their side tables where the view's are cloned.
+    // view, with the cold values moved into their side tables where the view's are cloned, and
+    // a path or generic arguments named by the row lowering pushed them at where a view's are
+    // copied into the paths.
 
-    pub(crate) fn push_path_expr(&mut self, path: Path) -> ExprId {
-        let data = push_one(&mut self.paths, path);
-        self.node_expr(ExprKind::Path, data)
+    pub(crate) fn push_path_expr(&mut self, path: PathIdx) -> ExprId {
+        self.node_expr(ExprKind::Path, raw(path))
     }
 
     pub(crate) fn push_literal_expr(&mut self, literal: Literal) -> ExprId {
@@ -1228,58 +1230,53 @@ impl HirColumns<Growing> {
         receiver: ExprId,
         method_name: Name,
         args: &[ExprId],
-        generic_args: Option<GenericArgs>,
+        generic_args: Option<GenericArgsIdx>,
     ) -> ExprId {
         let name = push_one(&mut self.names, method_name);
         let (start, count) = put_list(&mut self.expr_lists, args, None);
-        let generic_args = generic_args.map_or(0, |it| plus(push_one(&mut self.generic_args, it), 1));
-        let data = self.words(None, [raw(receiver), name, start, count, generic_args]);
+        let data = self.words(None, [raw(receiver), name, start, count, slot(generic_args)]);
         self.node_expr(ExprKind::MethodCall, data)
     }
 
     /// A `RecordLit`, its fields moved in from `fields`.
     pub(crate) fn push_record_lit(
         &mut self,
-        path: Path,
+        path: PathIdx,
         fields: impl ExactSizeIterator<Item = RecordLitField>,
         spread: RecordSpread,
     ) -> ExprId {
-        let path = push_one(&mut self.paths, path);
         let (start, count) = (len(self.record_fields.len()), len(fields.len()));
         self.record_fields.extend(fields);
-        let data = self.words(None, [path, start, count, spread_word(spread)]);
+        let data = self.words(None, [raw(path), start, count, spread_word(spread)]);
         self.node_expr(ExprKind::RecordLit, data)
     }
 
     /// A `Pat::Record`, its fields moved in from `args`.
     pub(crate) fn push_record_pat(
         &mut self,
-        path: Path,
+        path: PathIdx,
         args: impl ExactSizeIterator<Item = RecordFieldPat>,
         ellipsis: bool,
     ) -> PatId {
-        let path = push_one(&mut self.paths, path);
         let (start, count) = (len(self.field_pats.len()), len(args.len()));
         self.field_pats.extend(args);
-        let data = self.words(None, [path, start, count, ellipsis as u32]);
+        let data = self.words(None, [raw(path), start, count, ellipsis as u32]);
         self.node_pat(PatKind::Record, data)
     }
 
-    pub(crate) fn push_path_pat(&mut self, path: Path) -> PatId {
-        let data = push_one(&mut self.paths, path);
-        self.node_pat(PatKind::Path, data)
+    pub(crate) fn push_path_pat(&mut self, path: PathIdx) -> PatId {
+        self.node_pat(PatKind::Path, raw(path))
     }
 
     pub(crate) fn push_tuple_struct_pat(
         &mut self,
-        path: Path,
+        path: PathIdx,
         args: &[PatId],
         ellipsis: Option<u32>,
     ) -> PatId {
-        let path = push_one(&mut self.paths, path);
         let (start, count) = put_list(&mut self.pat_lists, args, None);
         let ellipsis = ellipsis.map_or(0, |at| plus(at, 1));
-        let data = self.words(None, [path, start, count, ellipsis]);
+        let data = self.words(None, [raw(path), start, count, ellipsis]);
         self.node_pat(PatKind::TupleStruct, data)
     }
 
@@ -1297,31 +1294,54 @@ impl HirColumns<Growing> {
         self.freeze_into()
     }
 
-    /// The columns of a finished store, each copied into a boxed slice of its length
-    /// ([`take_exact`]); `self` is left empty with its capacity, for the next store built on
-    /// this thread.
+    /// The columns of a finished store, each copied out at its exact length: the `Copy` ones
+    /// into one slab together ([`SlabWriter`]), widest first so no padding is between them, the
+    /// others each into a box of its own ([`take_exact`]). `self` is left empty with its
+    /// capacity, for the next store built on this thread.
     pub(crate) fn freeze_into(&mut self) -> HirColumns<Frozen> {
+        let mut layout = SlabLayout::default();
+        layout.add::<MacroDefId>(self.macro_defs.len());
+        layout.add::<Option<TypeRefId>>(self.type_lists.len());
+        layout.add::<u32>(self.expr_data.len());
+        layout.add::<u32>(self.pat_data.len());
+        layout.add::<u32>(self.extra.len());
+        layout.add::<u32>(self.stmt_data.len());
+        layout.add::<ExprId>(self.expr_lists.len());
+        layout.add::<PatId>(self.pat_lists.len());
+        layout.add::<u8>(self.expr_kind.len());
+        layout.add::<u8>(self.pat_kind.len());
+        layout.add::<u8>(self.stmt_kind.len());
+        let mut slab = SlabWriter::new(layout);
+        let macro_defs = slab.take(&mut self.macro_defs);
+        let type_lists = slab.take(&mut self.type_lists);
+        let expr_data = slab.take(&mut self.expr_data);
+        let pat_data = slab.take(&mut self.pat_data);
+        let extra = slab.take(&mut self.extra);
+        let stmt_data = slab.take(&mut self.stmt_data);
+        let expr_lists = slab.take(&mut self.expr_lists);
+        let pat_lists = slab.take(&mut self.pat_lists);
+        let expr_kind = slab.take(&mut self.expr_kind);
+        let pat_kind = slab.take(&mut self.pat_kind);
+        let stmt_kind = slab.take(&mut self.stmt_kind);
         HirColumns {
-            expr_kind: take_exact(&mut self.expr_kind),
-            expr_data: take_exact(&mut self.expr_data),
-            pat_kind: take_exact(&mut self.pat_kind),
-            pat_data: take_exact(&mut self.pat_data),
-            extra: take_exact(&mut self.extra),
-            expr_lists: take_exact(&mut self.expr_lists),
-            pat_lists: take_exact(&mut self.pat_lists),
-            stmt_kind: take_exact(&mut self.stmt_kind),
-            stmt_data: take_exact(&mut self.stmt_data),
-            arms: take_exact(&mut self.arms),
-            record_fields: take_exact(&mut self.record_fields),
-            field_pats: take_exact(&mut self.field_pats),
-            type_lists: take_exact(&mut self.type_lists),
-            names: take_exact(&mut self.names),
-            paths: take_exact(&mut self.paths),
-            literals: take_exact(&mut self.literals),
-            generic_args: take_exact(&mut self.generic_args),
-            offset_ofs: take_exact(&mut self.offset_ofs),
-            asms: take_exact(&mut self.asms),
-            macro_defs: take_exact(&mut self.macro_defs),
+            expr_kind,
+            expr_data,
+            pat_kind,
+            pat_data,
+            extra,
+            expr_lists,
+            pat_lists,
+            stmt_kind,
+            stmt_data,
+            arms: take_exact(&mut self.arms).into(),
+            record_fields: take_exact(&mut self.record_fields).into(),
+            field_pats: take_exact(&mut self.field_pats).into(),
+            type_lists,
+            names: take_exact(&mut self.names).into(),
+            literals: take_exact(&mut self.literals).into(),
+            offset_ofs: take_exact(&mut self.offset_ofs).into(),
+            asms: take_exact(&mut self.asms).into(),
+            macro_defs,
         }
     }
 
@@ -1342,9 +1362,7 @@ impl HirColumns<Growing> {
             field_pats,
             type_lists,
             names,
-            paths,
             literals,
-            generic_args,
             offset_ofs,
             asms,
             macro_defs,
@@ -1363,9 +1381,7 @@ impl HirColumns<Growing> {
         field_pats.clear();
         type_lists.clear();
         names.clear();
-        paths.clear();
         literals.clear();
-        generic_args.clear();
         offset_ofs.clear();
         asms.clear();
         macro_defs.clear();
@@ -1408,11 +1424,12 @@ impl HirColumns<Growing> {
     }
 
     /// The data word of `expr`, its words and lists written over those of the node of the same
-    /// kind whose data word is `old`, or appended.
-    fn encode_expr(&mut self, expr: Expr<'_>, old: Option<u32>) -> u32 {
+    /// kind whose data word is `old`, or appended, its path or generic arguments copied into
+    /// `paths`.
+    fn encode_expr(&mut self, paths: &mut PathColumns, expr: Expr<'_>, old: Option<u32>) -> u32 {
         match expr {
             Expr::Missing | Expr::Underscore | Expr::IncludeBytes => 0,
-            Expr::Path(path) => put_one(&mut self.paths, path, old),
+            Expr::Path(path) => raw(paths.push_view(path)),
             Expr::If { condition, then_branch, else_branch } => {
                 self.words(old, [raw(condition), raw(then_branch), opt(else_branch)])
             }
@@ -1434,11 +1451,10 @@ impl HirColumns<Growing> {
                 self.words(old, [raw(callee), start, count])
             }
             Expr::MethodCall { receiver, method_name, args, generic_args } => {
-                let (old_name, old_args, old_generic_args) =
-                    (self.old_word(old, 1), self.old_list(old, 2), self.old_word(old, 4));
+                let (old_name, old_args) = (self.old_word(old, 1), self.old_list(old, 2));
                 let name = put_one(&mut self.names, method_name, old_name);
                 let (start, count) = put_list(&mut self.expr_lists, args, old_args);
-                let generic_args = put_opt(&mut self.generic_args, generic_args, old_generic_args);
+                let generic_args = slot(generic_args.map(|args| paths.push_args_view(args)));
                 self.words(old, [raw(receiver), name, start, count, generic_args])
             }
             Expr::Match { expr, arms } => {
@@ -1450,8 +1466,8 @@ impl HirColumns<Growing> {
             Expr::Break { expr, label } => self.words(old, [opt(expr), opt(label)]),
             Expr::Return { expr } | Expr::Yield { expr } | Expr::Yeet { expr } => opt(expr),
             Expr::RecordLit { path, fields, spread } => {
-                let (old_path, old_fields) = (self.old_word(old, 0), self.old_list(old, 1));
-                let path = put_one(&mut self.paths, path, old_path);
+                let old_fields = self.old_list(old, 1);
+                let path = raw(paths.push_view(path));
                 let (start, count) = put_list(&mut self.record_fields, fields, old_fields);
                 self.words(old, [path, start, count, spread_word(spread)])
             }
@@ -1500,7 +1516,7 @@ impl HirColumns<Growing> {
     }
 
     /// The data word of `pat`, as [`HirColumns::encode_expr`] makes an expression's.
-    fn encode_pat(&mut self, pat: Pat<'_>, old: Option<u32>) -> u32 {
+    fn encode_pat(&mut self, paths: &mut PathColumns, pat: Pat<'_>, old: Option<u32>) -> u32 {
         let ellipsis_word = |ellipsis: Option<u32>| ellipsis.map_or(0, |at| plus(at, 1));
         match pat {
             Pat::Missing | Pat::Rest | Pat::Wild | Pat::NotNull => 0,
@@ -1515,8 +1531,8 @@ impl HirColumns<Growing> {
                 self.words(old, [start, count])
             }
             Pat::Record { path, args, ellipsis } => {
-                let (old_path, old_args) = (self.old_word(old, 0), self.old_list(old, 1));
-                let path = put_one(&mut self.paths, path, old_path);
+                let old_args = self.old_list(old, 1);
+                let path = raw(paths.push_view(path));
                 let (start, count) = put_list(&mut self.field_pats, args, old_args);
                 self.words(old, [path, start, count, ellipsis as u32])
             }
@@ -1529,12 +1545,12 @@ impl HirColumns<Growing> {
                 let (suffix, suffix_len) = put_list(&mut self.pat_lists, suffix, old_suffix);
                 self.words(old, [prefix, prefix_len, opt(slice), suffix, suffix_len])
             }
-            Pat::Path(path) => put_one(&mut self.paths, path, old),
+            Pat::Path(path) => raw(paths.push_view(path)),
             Pat::Lit(expr) | Pat::Expr(expr) => raw(expr),
             Pat::Bind { id, subpat } => self.words(old, [raw(id), opt(subpat)]),
             Pat::TupleStruct { path, args, ellipsis } => {
-                let (old_path, old_args) = (self.old_word(old, 0), self.old_list(old, 1));
-                let path = put_one(&mut self.paths, path, old_path);
+                let old_args = self.old_list(old, 1);
+                let path = raw(paths.push_view(path));
                 let (start, count) = put_list(&mut self.pat_lists, args, old_args);
                 self.words(old, [path, start, count, ellipsis_word(ellipsis)])
             }
@@ -1758,7 +1774,9 @@ impl Bounds {
 }
 
 impl HirColumns<Frozen> {
-    /// Every kind in range, every id, list range and side-table index in bounds. The encoding
+    /// Every kind in range, every id, list range and side-table index in bounds, and every
+    /// path and slot word (an `asm!` `sym` operand's too) naming a row of `paths`, the store's,
+    /// whose own rows [`crate::hir::type_ref::TypeColumns::check`] checks first. The encoding
     /// calls it after reading a buffer and maps `Err(what)` to `FormatError::Invalid`.
     /// `BlockId`s are salsa ids the encoding layer already refuses at 0; they are not checked here.
     pub(crate) fn check(
@@ -1766,6 +1784,7 @@ impl HirColumns<Frozen> {
         bindings: usize,
         labels: usize,
         type_refs: usize,
+        paths: &PathColumns,
     ) -> Result<(), &'static str> {
         if self.expr_kind.len() != self.expr_data.len() {
             return Err("expression kind and data columns of different lengths");
@@ -1793,13 +1812,48 @@ impl HirColumns<Frozen> {
         for at in 0..self.statement_count() as u32 {
             bounds.in_statement(self.decode_statement(at)?)?;
         }
+        for asm in self.asms.iter() {
+            for (_, operand) in asm.operands.iter() {
+                if let AsmOperand::Sym(path) = *operand {
+                    paths.check_path_word(raw(path))?;
+                }
+            }
+        }
         for at in 0..self.expr_count() as u32 {
-            bounds.in_expr(self.decode_expr(idx(at))?)?;
+            self.check_expr_paths(paths, at)?;
+            bounds.in_expr(self.decode_expr(paths, idx(at))?)?;
         }
         for at in 0..self.pat_count() as u32 {
-            bounds.in_pat(self.decode_pat(idx(at))?)?;
+            self.check_pat_paths(paths, at)?;
+            bounds.in_pat(self.decode_pat(paths, idx(at))?)?;
         }
         Ok(())
+    }
+
+    /// The path or slot word of expression `at` in range of `paths`, before the node is
+    /// decoded (which refuses them too, with its own errors). `at` is below the expression
+    /// count; a kind out of range is the decoder's to refuse.
+    fn check_expr_paths(&self, paths: &PathColumns, at: u32) -> Checked {
+        let d = self.expr_data[at as usize];
+        match ExprKind::ALL.get(self.expr_kind[at as usize] as usize).copied() {
+            Some(ExprKind::Path) => paths.check_path_word(d),
+            Some(ExprKind::RecordLit) => paths.check_path_word(self.node::<4>(d)?[0]),
+            Some(ExprKind::MethodCall) => paths.check_slot_word(self.node::<5>(d)?[4]),
+            _ => Ok(()),
+        }
+    }
+
+    /// The path word of pattern `at` in range of `paths`, as [`Self::check_expr_paths`] checks
+    /// an expression's.
+    fn check_pat_paths(&self, paths: &PathColumns, at: u32) -> Checked {
+        let d = self.pat_data[at as usize];
+        match PatKind::ALL.get(self.pat_kind[at as usize] as usize).copied() {
+            Some(PatKind::Path) => paths.check_path_word(d),
+            Some(PatKind::Record | PatKind::TupleStruct) => {
+                paths.check_path_word(self.node::<4>(d)?[0])
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1810,7 +1864,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        expr_store::path::{GenericArg, GenericArgsParentheses},
+        expr_store::path::{GenericArg, GenericArgs, GenericArgsParentheses, Path},
         hir::{
             AsmOptions, FloatTypeWrapper, InlineAsmKind, InlineAsmRegOrRegClass, Item,
         },
@@ -1835,8 +1889,8 @@ mod tests {
         Name::new_symbol_root(Symbol::intern(text))
     }
 
-    fn path(text: &str) -> Path {
-        Path::BarePath(ModPath::from_segments(PathKind::Plain, [name(text)]))
+    fn mod_path(text: &str) -> ModPath {
+        ModPath::from_segments(PathKind::Plain, [name(text)])
     }
 
     fn macro_def(bits: u64) -> MacroDefId {
@@ -1865,10 +1919,13 @@ mod tests {
     }
 
     struct Values {
-        paths: [Path; 2],
+        /// Another store's paths, which the views' paths and generic arguments are read from.
+        paths: PathColumns,
+        /// A bare path, and a `Normal` one whose segment has `generic_args`.
+        path_ids: [PathIdx; 2],
+        generic_args: GenericArgsIdx,
         names: [Name; 2],
         literals: [Literal; 3],
-        generic_args: GenericArgs,
         macro_defs: [MacroDefId; 2],
         /// A block's statements, one of each kind.
         statements: HirColumns<Growing>,
@@ -1877,6 +1934,16 @@ mod tests {
         field_pats: Vec<RecordFieldPat>,
         offset_of: OffsetOf,
         asm: InlineAsm,
+    }
+
+    impl Values {
+        fn path(&self, at: usize) -> Path<'_> {
+            self.paths.get(self.path_ids[at])
+        }
+
+        fn generic_args(&self) -> GenericArgs<'_> {
+            self.paths.generic_args_at(self.generic_args)
+        }
     }
 
     fn values() -> Values {
@@ -1893,25 +1960,29 @@ mod tests {
             Statement::Item(Item::MacroDef(&macro_defs[0])),
             Statement::Item(Item::Other),
         ]);
+        let mut paths = PathColumns::default();
+        let generic_args = paths.push_generic_args(
+            [GenericArg::Type(idx(0)), GenericArg::Const(ConstRef { expr: E0 })],
+            false,
+            [],
+            GenericArgsParentheses::No,
+        );
+        let path_ids = [
+            paths.push_bare(mod_path("a")),
+            paths.push_normal(mod_path("b"), None, [slot(Some(generic_args))]),
+        ];
         Values {
             macro_defs,
             statements,
-            paths: [path("a"), path("b")],
+            paths,
+            path_ids,
+            generic_args,
             names: [name("x"), name("y")],
             literals: [
                 Literal::Int(-3, None),
                 Literal::String(Symbol::intern("s")),
                 Literal::Float(FloatTypeWrapper::new(Symbol::intern("1.5")), None),
             ],
-            generic_args: GenericArgs {
-                args: Box::new([
-                    GenericArg::Type(idx(0)),
-                    GenericArg::Const(ConstRef { expr: E0 }),
-                ]),
-                has_self_type: false,
-                bindings: Box::default(),
-                parenthesized: GenericArgsParentheses::No,
-            },
             arms: vec![
                 MatchArm { pat: P0, guard: Some(E0), expr: E0 },
                 MatchArm { pat: P0, guard: None, expr: E0 },
@@ -1976,7 +2047,8 @@ mod tests {
         let some_label = Some(idx::<crate::hir::Label>(0));
         let mut exprs = vec![
             Expr::Missing,
-            Expr::Path(&v.paths[0]),
+            Expr::Path(v.path(0)),
+            Expr::Path(v.path(1)),
             Expr::If { condition: E0, then_branch: E0, else_branch: Some(E0) },
             Expr::If { condition: E0, then_branch: E0, else_branch: None },
             Expr::Let { pat: P0, expr: E0 },
@@ -2003,7 +2075,7 @@ mod tests {
                 receiver: E0,
                 method_name: &v.names[0],
                 args: &[E0],
-                generic_args: Some(&v.generic_args),
+                generic_args: Some(v.generic_args()),
             },
             Expr::MethodCall { receiver: E0, method_name: &v.names[1], args: &[], generic_args: None },
             Expr::Match { expr: E0, arms: &v.arms },
@@ -2016,9 +2088,9 @@ mod tests {
             Expr::Become { expr: E0 },
             Expr::Yield { expr: Some(E0) },
             Expr::Yeet { expr: None },
-            Expr::RecordLit { path: &v.paths[1], fields: &v.fields, spread: RecordSpread::None },
-            Expr::RecordLit { path: &v.paths[0], fields: &[], spread: RecordSpread::FieldDefaults },
-            Expr::RecordLit { path: &v.paths[0], fields: &v.fields, spread: RecordSpread::Expr(E0) },
+            Expr::RecordLit { path: v.path(1), fields: &v.fields, spread: RecordSpread::None },
+            Expr::RecordLit { path: v.path(0), fields: &[], spread: RecordSpread::FieldDefaults },
+            Expr::RecordLit { path: v.path(0), fields: &v.fields, spread: RecordSpread::Expr(E0) },
             Expr::Field { expr: E0, name: &v.names[1] },
             Expr::Await { expr: E0 },
             Expr::Cast { expr: E0, type_ref: idx(0) },
@@ -2069,18 +2141,18 @@ mod tests {
             Pat::Tuple { args: &[], ellipsis: None },
             Pat::Tuple { args: &[P0], ellipsis: Some(0) },
             Pat::Or(&[P0, P0]),
-            Pat::Record { path: &v.paths[0], args: &v.field_pats, ellipsis: true },
-            Pat::Record { path: &v.paths[1], args: &[], ellipsis: false },
+            Pat::Record { path: v.path(0), args: &v.field_pats, ellipsis: true },
+            Pat::Record { path: v.path(1), args: &[], ellipsis: false },
             Pat::Range { start: Some(E0), end: None, range_type: RangeOp::Inclusive },
             Pat::Range { start: None, end: Some(E0), range_type: RangeOp::Exclusive },
             Pat::Slice { prefix: &[P0], slice: Some(P0), suffix: &[P0, P0] },
             Pat::Slice { prefix: &[], slice: None, suffix: &[] },
-            Pat::Path(&v.paths[1]),
+            Pat::Path(v.path(1)),
             Pat::Lit(E0),
             Pat::Bind { id: idx(0), subpat: Some(P0) },
             Pat::Bind { id: idx(0), subpat: None },
-            Pat::TupleStruct { path: &v.paths[0], args: &[P0], ellipsis: Some(1) },
-            Pat::TupleStruct { path: &v.paths[0], args: &[], ellipsis: None },
+            Pat::TupleStruct { path: v.path(0), args: &[P0], ellipsis: Some(1) },
+            Pat::TupleStruct { path: v.path(1), args: &[], ellipsis: None },
             Pat::Ref { pat: P0, mutability: Mutability::Mut },
             Pat::Ref { pat: P0, mutability: Mutability::Shared },
             Pat::Box { inner: P0 },
@@ -2101,11 +2173,16 @@ mod tests {
         statements.iter().map(words).sum()
     }
 
-    fn columns_of<'v>(exprs: &[Expr<'v>], pats: &[Pat<'v>]) -> HirColumns<Growing> {
+    /// The columns of `exprs` and `pats`, their paths and generic arguments copied into `paths`.
+    fn columns_of(
+        paths: &mut PathColumns,
+        exprs: &[Expr<'_>],
+        pats: &[Pat<'_>],
+    ) -> HirColumns<Growing> {
         let mut columns = HirColumns::<Growing>::default();
         for (at, &expr) in exprs.iter().enumerate() {
             let words = columns.extra.len();
-            assert_eq!(columns.push_expr(expr), e(at as u32));
+            assert_eq!(columns.push_expr(paths, expr), e(at as u32));
             let kind = ExprKind::of(&expr) as usize;
             let statement_words = match expr {
                 Expr::Block { statements, .. } => let_words_of(statements),
@@ -2116,7 +2193,7 @@ mod tests {
         }
         for (at, &pat) in pats.iter().enumerate() {
             let words = columns.extra.len();
-            assert_eq!(columns.push_pat(pat), p(at as u32));
+            assert_eq!(columns.push_pat(paths, pat), p(at as u32));
             let kind = PatKind::of(&pat) as usize;
             assert_eq!(columns.extra.len() - words, PAT_WORDS[kind] as usize, "{pat:?}");
         }
@@ -2132,49 +2209,57 @@ mod tests {
         let kinds: std::collections::HashSet<_> = pats.iter().map(PatKind::of).collect();
         assert_eq!(kinds.len(), PatKind::ALL.len(), "every pattern kind is tested");
 
-        let columns = columns_of(&exprs, &pats);
+        let mut paths = PathColumns::default();
+        let columns = columns_of(&mut paths, &exprs, &pats);
         for (at, &expr) in exprs.iter().enumerate() {
-            assert_eq!(columns.expr(e(at as u32)), expr);
+            assert_eq!(columns.expr(&paths, e(at as u32)), expr);
         }
         for (at, &pat) in pats.iter().enumerate() {
-            assert_eq!(columns.pat(p(at as u32)), pat);
+            assert_eq!(columns.pat(&paths, p(at as u32)), pat);
         }
-        assert_eq!(columns.exprs().map(|(_, expr)| expr).collect::<Vec<_>>(), exprs);
-        assert_eq!(columns.pats().map(|(_, pat)| pat).collect::<Vec<_>>(), pats);
+        assert_eq!(columns.exprs(&paths).map(|(_, expr)| expr).collect::<Vec<_>>(), exprs);
+        assert_eq!(columns.pats(&paths).map(|(_, pat)| pat).collect::<Vec<_>>(), pats);
+        assert_eq!(paths.check(1, 1, 1, |_| Ok(())), Ok(()), "the copied paths are whole");
 
-        let again = columns_of(&exprs, &pats).freeze();
+        let mut again_paths = PathColumns::default();
+        let again = columns_of(&mut again_paths, &exprs, &pats).freeze();
         let frozen = columns.freeze();
         assert_eq!(frozen, again, "the same nodes make the same columns");
-        assert_eq!(frozen.check(1, 1, 1), Ok(()));
+        assert_eq!(paths, again_paths, "and the same paths");
+        assert_eq!(frozen.check(1, 1, 1, &paths), Ok(()));
         for (at, &expr) in exprs.iter().enumerate() {
-            assert_eq!(frozen.expr(e(at as u32)), expr);
+            assert_eq!(frozen.expr(&paths, e(at as u32)), expr);
         }
         for (at, &pat) in pats.iter().enumerate() {
-            assert_eq!(frozen.pat(p(at as u32)), pat);
+            assert_eq!(frozen.pat(&paths, p(at as u32)), pat);
         }
     }
 
     #[test]
     fn a_node_set_to_one_that_fits_keeps_its_words() {
         let v = values();
-        let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]);
-        let call = columns.push_expr(Expr::Call { callee: E0, args: &[E0, E0] });
-        let block = columns.push_expr(Expr::Block {
-            id: None,
-            statements: v.statements.statements_since(0),
-            tail: None,
-            label: None,
-            unsafe_: Unsafe::No,
-        });
-        let path = columns.push_pat(Pat::Path(&v.paths[0]));
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing], &[Pat::Wild]);
+        let call = columns.push_expr(&mut paths, Expr::Call { callee: E0, args: &[E0, E0] });
+        let block = columns.push_expr(
+            &mut paths,
+            Expr::Block {
+                id: None,
+                statements: v.statements.statements_since(0),
+                tail: None,
+                label: None,
+                unsafe_: Unsafe::No,
+            },
+        );
+        let path = columns.push_pat(&mut paths, Pat::Path(v.path(0)));
         let sizes = |c: &HirColumns<Growing>| {
-            (c.extra.len(), c.expr_lists.len(), c.stmt_kind.len(), c.macro_defs.len(), c.paths.len())
+            (c.extra.len(), c.expr_lists.len(), c.stmt_kind.len(), c.macro_defs.len())
         };
-        let before = sizes(&columns);
+        let (before, paths_before) = (sizes(&columns), paths.len());
 
-        columns.set_expr(call, Expr::Call { callee: E1, args: &[E0] });
-        assert_eq!(columns.expr(call), Expr::Call { callee: E1, args: &[E0] });
-        let Expr::Block { statements, .. } = columns.expr(block) else { panic!("a block") };
+        columns.set_expr(&mut paths, call, Expr::Call { callee: E1, args: &[E0] });
+        assert_eq!(columns.expr(&paths, call), Expr::Call { callee: E1, args: &[E0] });
+        let Expr::Block { statements, .. } = columns.expr(&paths, block) else { panic!("a block") };
         let statements = rows_of(&statements.iter().collect::<Vec<_>>());
         let with_tail = Expr::Block {
             id: None,
@@ -2183,62 +2268,65 @@ mod tests {
             label: None,
             unsafe_: Unsafe::Yes,
         };
-        columns.set_expr(block, with_tail);
-        assert_eq!(columns.expr(block), with_tail);
-        columns.set_pat(path, Pat::Path(&v.paths[1]));
-        assert_eq!(columns.pat(path), Pat::Path(&v.paths[1]));
+        columns.set_expr(&mut paths, block, with_tail);
+        assert_eq!(columns.expr(&paths, block), with_tail);
+        columns.set_pat(&mut paths, path, Pat::Path(v.path(1)));
+        assert_eq!(columns.pat(&paths, path), Pat::Path(v.path(1)));
         assert_eq!(sizes(&columns), before, "nothing grew");
-        assert_eq!(columns.freeze().check(0, 0, 1), Ok(()));
+        assert_eq!(paths.len(), paths_before + 1, "a set node's path is pushed anew");
+        assert_eq!(columns.freeze().check(0, 0, 1, &paths), Ok(()));
     }
 
     #[test]
     fn a_node_set_to_one_that_does_not_fit_appends() {
-        let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]);
-        let call = columns.push_expr(Expr::Call { callee: E0, args: &[E0] });
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing], &[Pat::Wild]);
+        let call = columns.push_expr(&mut paths, Expr::Call { callee: E0, args: &[E0] });
         let (extra, lists) = (columns.extra.len(), columns.expr_lists.len());
 
         let longer = Expr::Call { callee: E0, args: &[E0, E1, E0] };
-        columns.set_expr(call, longer);
-        assert_eq!(columns.expr(call), longer);
+        columns.set_expr(&mut paths, call, longer);
+        assert_eq!(columns.expr(&paths, call), longer);
         assert_eq!(columns.extra.len(), extra, "the same kind keeps its words");
         assert_eq!(columns.expr_lists.len(), lists + 3, "a longer list is appended");
 
         let tuple = Expr::Tuple { exprs: &[E1] };
-        columns.set_expr(call, tuple);
-        assert_eq!(columns.expr(call), tuple);
+        columns.set_expr(&mut paths, call, tuple);
+        assert_eq!(columns.expr(&paths, call), tuple);
         assert_eq!(columns.extra.len(), extra + EXPR_WORDS[ExprKind::Tuple as usize] as usize);
 
-        columns.set_expr(call, Expr::Await { expr: E0 });
-        assert_eq!(columns.expr(call), Expr::Await { expr: E0 });
+        columns.set_expr(&mut paths, call, Expr::Await { expr: E0 });
+        assert_eq!(columns.expr(&paths, call), Expr::Await { expr: E0 });
 
         let array = Expr::Array(Array::Repeat { initializer: E0, repeat: E0 });
-        let arr = columns.push_expr(array);
+        let arr = columns.push_expr(&mut paths, array);
         let elements = Expr::Array(Array::ElementList { elements: &[E0, E1] });
-        columns.set_expr(arr, elements);
-        assert_eq!(columns.expr(arr), elements, "a repeat's words are not a list to reuse");
+        columns.set_expr(&mut paths, arr, elements);
+        assert_eq!(columns.expr(&paths, arr), elements, "a repeat's words are not a list to reuse");
 
-        let pat = columns.push_pat(Pat::Or(&[P0]));
-        columns.set_pat(pat, Pat::Or(&[P0, P0]));
-        assert_eq!(columns.pat(pat), Pat::Or(&[P0, P0]));
-        columns.set_pat(pat, Pat::Bind { id: idx(0), subpat: None });
-        assert_eq!(columns.pat(pat), Pat::Bind { id: idx(0), subpat: None });
-        assert_eq!(columns.freeze().check(1, 0, 0), Ok(()));
+        let pat = columns.push_pat(&mut paths, Pat::Or(&[P0]));
+        columns.set_pat(&mut paths, pat, Pat::Or(&[P0, P0]));
+        assert_eq!(columns.pat(&paths, pat), Pat::Or(&[P0, P0]));
+        columns.set_pat(&mut paths, pat, Pat::Bind { id: idx(0), subpat: None });
+        assert_eq!(columns.pat(&paths, pat), Pat::Bind { id: idx(0), subpat: None });
+        assert_eq!(columns.freeze().check(1, 0, 0, &paths), Ok(()));
     }
 
     #[test]
     fn check_refuses_a_kind_out_of_range() {
-        let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]).freeze();
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing], &[Pat::Wild]).freeze();
         columns.expr_kind[0] = ExprKind::ALL.len() as u8;
-        assert_eq!(columns.check(0, 0, 0), Err("an expression kind out of range"));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("an expression kind out of range"));
 
-        let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]).freeze();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing], &[Pat::Wild]).freeze();
         columns.pat_kind[0] = u8::MAX;
-        assert_eq!(columns.check(0, 0, 0), Err("a pattern kind out of range"));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a pattern kind out of range"));
 
         let mut columns =
-            columns_of(&[Expr::UnaryOp { expr: E0, op: UnaryOp::Not }], &[]).freeze();
+            columns_of(&mut paths, &[Expr::UnaryOp { expr: E0, op: UnaryOp::Not }], &[]).freeze();
         columns.extra[1] = UNARY_OPS.len() as u32;
-        assert_eq!(columns.check(0, 0, 0), Err("a unary operator out of range"));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a unary operator out of range"));
 
         let closure = Expr::Closure {
             args: &[],
@@ -2248,162 +2336,280 @@ mod tests {
             closure_kind: ClosureKind::Closure,
             capture_by: CaptureBy::Ref,
         };
-        let mut columns = columns_of(&[closure], &[]).freeze();
+        let mut columns = columns_of(&mut paths, &[closure], &[]).freeze();
         columns.extra[6] |= 1 << 7;
-        assert_eq!(columns.check(0, 0, 0), Err("a closure kind out of range"));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a closure kind out of range"));
     }
 
     #[test]
     fn check_refuses_an_id_past_its_arena() {
-        let columns = columns_of(&[Expr::Await { expr: E1 }], &[]).freeze();
-        assert_eq!(columns.check(0, 0, 0), Err(EXPR_ID));
+        let mut paths = PathColumns::default();
+        let columns = columns_of(&mut paths, &[Expr::Await { expr: E1 }], &[]).freeze();
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(EXPR_ID));
 
-        let columns = columns_of(&[Expr::Let { pat: P1, expr: E0 }], &[Pat::Wild]).freeze();
-        assert_eq!(columns.check(0, 0, 0), Err(PAT_ID));
+        let columns =
+            columns_of(&mut paths, &[Expr::Let { pat: P1, expr: E0 }], &[Pat::Wild]).freeze();
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(PAT_ID));
 
-        let columns = columns_of(&[Expr::Missing], &[Pat::Bind { id: idx(0), subpat: None }]);
-        assert_eq!(columns.freeze().check(0, 0, 0), Err("a binding id past its arena"));
+        let columns =
+            columns_of(&mut paths, &[Expr::Missing], &[Pat::Bind { id: idx(0), subpat: None }]);
+        assert_eq!(columns.freeze().check(0, 0, 0, &paths), Err("a binding id past its arena"));
 
-        let columns = columns_of(&[Expr::Continue { label: Some(idx(2)) }], &[]).freeze();
-        assert_eq!(columns.check(0, 2, 0), Err("a label id past its arena"));
-        assert_eq!(columns.check(0, 3, 0), Ok(()));
+        let columns =
+            columns_of(&mut paths, &[Expr::Continue { label: Some(idx(2)) }], &[]).freeze();
+        assert_eq!(columns.check(0, 2, 0, &paths), Err("a label id past its arena"));
+        assert_eq!(columns.check(0, 3, 0, &paths), Ok(()));
 
-        let columns = columns_of(&[Expr::Cast { expr: E0, type_ref: idx(0) }], &[]).freeze();
-        assert_eq!(columns.check(0, 0, 0), Err("a type id past its arena"));
+        let columns =
+            columns_of(&mut paths, &[Expr::Cast { expr: E0, type_ref: idx(0) }], &[]).freeze();
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a type id past its arena"));
 
         let v = values();
-        let columns = columns_of(&[Expr::Missing, Expr::Match { expr: E0, arms: &v.arms }], &[]);
-        assert_eq!(columns.freeze().check(0, 0, 0), Err(PAT_ID));
+        let columns =
+            columns_of(&mut paths, &[Expr::Missing, Expr::Match { expr: E0, arms: &v.arms }], &[]);
+        assert_eq!(columns.freeze().check(0, 0, 0, &paths), Err(PAT_ID));
     }
 
     #[test]
     fn check_refuses_a_list_past_its_array() {
+        let mut paths = PathColumns::default();
         let mut columns =
-            columns_of(&[Expr::Missing, Expr::Call { callee: E0, args: &[E0] }], &[]).freeze();
+            columns_of(&mut paths, &[Expr::Missing, Expr::Call { callee: E0, args: &[E0] }], &[])
+                .freeze();
         columns.extra[2] = 2;
-        assert_eq!(columns.check(0, 0, 0), Err(EXPR_LIST));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(EXPR_LIST));
         columns.extra[1] = u32::MAX;
         columns.extra[2] = 1;
-        assert_eq!(columns.check(0, 0, 0), Err(EXPR_LIST));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(EXPR_LIST));
 
         let v = values();
-        let mut columns = columns_of(&[Expr::Path(&v.paths[0])], &[]).freeze();
-        columns.expr_data[0] = 1;
-        assert_eq!(columns.check(0, 0, 0), Err(PATH));
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Path(v.path(0))], &[]).freeze();
+        let past = len(paths.len());
+        columns.expr_data[0] = past;
+        let refused = paths.check_path_word(past);
+        assert!(refused.is_err());
+        assert_eq!(columns.check(0, 0, 0, &paths), refused);
 
-        let mut columns = columns_of(&[Expr::Missing], &[Pat::Or(&[P0])]).freeze();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing], &[Pat::Or(&[P0])]).freeze();
         columns.pat_data[0] = columns.extra.len() as u32 - 1;
-        assert_eq!(columns.check(0, 0, 0), Err(EXTRA));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(EXTRA));
+    }
+
+    #[test]
+    fn check_refuses_a_path_or_slot_word_past_the_paths() {
+        let v = values();
+        let method_call = Expr::MethodCall {
+            receiver: E0,
+            method_name: &v.names[0],
+            args: &[],
+            generic_args: Some(v.generic_args()),
+        };
+        let exprs = [
+            Expr::Path(v.path(0)),
+            method_call,
+            Expr::RecordLit { path: v.path(1), fields: &[], spread: RecordSpread::None },
+        ];
+        let pats = [
+            Pat::Path(v.path(1)),
+            Pat::Record { path: v.path(0), args: &[], ellipsis: false },
+            Pat::TupleStruct { path: v.path(1), args: &[], ellipsis: None },
+        ];
+        let mut paths = PathColumns::default();
+        let columns = columns_of(&mut paths, &exprs, &pats).freeze();
+        assert_eq!(columns.check(0, 0, 0, &paths), Ok(()));
+
+        let past = len(paths.len());
+        let refused = paths.check_path_word(past);
+        assert!(refused.is_err());
+        let mut bad = columns.clone();
+        bad.expr_data[0] = past;
+        assert_eq!(bad.check(0, 0, 0, &paths), refused, "an expression's path");
+        let mut bad = columns.clone();
+        bad.extra[columns.expr_data[2] as usize] = past;
+        assert_eq!(bad.check(0, 0, 0, &paths), refused, "a record literal's path");
+        let mut bad = columns.clone();
+        bad.pat_data[0] = past;
+        assert_eq!(bad.check(0, 0, 0, &paths), refused, "a pattern's path");
+        for at in [1, 2] {
+            let mut bad = columns.clone();
+            bad.extra[columns.pat_data[at] as usize] = past;
+            assert_eq!(bad.check(0, 0, 0, &paths), refused, "{:?}'s path", pats[at]);
+        }
+
+        let past_args = len(paths.generic_args.len()) + 1;
+        let refused_slot = paths.check_slot_word(past_args);
+        assert!(refused_slot.is_err());
+        let mut bad = columns.clone();
+        bad.extra[columns.expr_data[1] as usize + 4] = past_args;
+        assert_eq!(bad.check(0, 0, 0, &paths), refused_slot, "a method call's generic arguments");
+
+        let sym = |path: PathIdx| InlineAsm {
+            operands: Box::new([(None, AsmOperand::Sym(path))]),
+            ..v.asm.clone()
+        };
+        let asm_columns = |asm: &InlineAsm| {
+            columns_of(&mut PathColumns::default(), &[Expr::InlineAsm(asm)], &[]).freeze()
+        };
+        let (named, past_sym) = (sym(idx(past - 1)), sym(idx(past)));
+        assert_eq!(asm_columns(&named).check(0, 0, 0, &paths), Ok(()));
+        assert_eq!(asm_columns(&past_sym).check(0, 0, 0, &paths), refused, "an asm `sym` operand");
     }
 
     #[test]
     fn reused_scratch_freezes_to_the_same_columns() {
         let v = values();
         let (exprs, pats) = (every_expr(&v), every_pat(&v));
-        let fresh = columns_of(&exprs, &pats).freeze();
+        let mut fresh_paths = PathColumns::default();
+        let fresh = columns_of(&mut fresh_paths, &exprs, &pats).freeze();
 
-        let mut scratch = columns_of(&[Expr::Tuple { exprs: &[E0] }], &[Pat::Or(&[P0])]);
+        let mut paths = PathColumns::default();
+        let used = [Expr::Tuple { exprs: &[E0] }, Expr::Path(v.path(1))];
+        let mut scratch = columns_of(&mut paths, &used, &[Pat::Or(&[P0])]);
         scratch.clear();
+        paths.clear();
         assert!(scratch.is_empty() && scratch.extra.is_empty() && scratch.expr_lists.is_empty());
         for &expr in &exprs {
-            scratch.push_expr(expr);
+            scratch.push_expr(&mut paths, expr);
         }
         for &pat in &pats {
-            scratch.push_pat(pat);
+            scratch.push_pat(&mut paths, pat);
         }
         assert_eq!(scratch.freeze_into(), fresh);
+        assert_eq!(paths, fresh_paths, "the paths pushed again are the same");
         assert!(scratch.is_empty() && scratch.extra.is_empty() && scratch.names.is_empty());
         assert!(scratch.capacity() > 0, "the scratch keeps its room");
         assert_eq!(scratch.freeze_into(), HirColumns::<Frozen>::default());
     }
 
+    /// The typed pushes name a path or generic arguments lowering pushed once (here each of
+    /// `v`'s, copied in before the nodes); a view push copies its view in anew. The words naming
+    /// them differ, so the nodes are compared as they decode.
     #[test]
     fn by_value_pushes_match_the_views() {
         let v = values();
-        let mut viewed = columns_of(&[Expr::Missing], &[Pat::Wild]);
-        let mut owned = columns_of(&[Expr::Missing], &[Pat::Wild]);
+        let (mut viewed_paths, mut owned_paths) = (PathColumns::default(), PathColumns::default());
+        let mut viewed = columns_of(&mut viewed_paths, &[Expr::Missing], &[Pat::Wild]);
+        let mut owned = columns_of(&mut owned_paths, &[Expr::Missing], &[Pat::Wild]);
+        let path = [owned_paths.push_view(v.path(0)), owned_paths.push_view(v.path(1))];
+        let generic_args = owned_paths.push_args_view(v.generic_args());
         let pairs: [(ExprId, ExprId); 8] = [
-            (viewed.push_expr(Expr::Path(&v.paths[0])), owned.push_path_expr(v.paths[0].clone())),
             (
-                viewed.push_expr(Expr::Literal(&v.literals[2])),
+                viewed.push_expr(&mut viewed_paths, Expr::Path(v.path(0))),
+                owned.push_path_expr(path[0]),
+            ),
+            (
+                viewed.push_expr(&mut viewed_paths, Expr::Literal(&v.literals[2])),
                 owned.push_literal_expr(v.literals[2].clone()),
             ),
             (
-                viewed.push_expr(Expr::OffsetOf(&v.offset_of)),
+                viewed.push_expr(&mut viewed_paths, Expr::OffsetOf(&v.offset_of)),
                 owned.push_offset_of_expr(v.offset_of.clone()),
             ),
-            (viewed.push_expr(Expr::InlineAsm(&v.asm)), owned.push_asm_expr(v.asm.clone())),
             (
-                viewed.push_expr(Expr::MethodCall {
-                    receiver: E0,
-                    method_name: &v.names[0],
-                    args: &[E0, E0],
-                    generic_args: Some(&v.generic_args),
-                }),
-                owned.push_method_call(
-                    E0,
-                    v.names[0].clone(),
-                    &[E0, E0],
-                    Some(v.generic_args.clone()),
-                ),
+                viewed.push_expr(&mut viewed_paths, Expr::InlineAsm(&v.asm)),
+                owned.push_asm_expr(v.asm.clone()),
             ),
             (
-                viewed.push_expr(Expr::MethodCall {
-                    receiver: E0,
-                    method_name: &v.names[1],
-                    args: &[],
-                    generic_args: None,
-                }),
+                viewed.push_expr(
+                    &mut viewed_paths,
+                    Expr::MethodCall {
+                        receiver: E0,
+                        method_name: &v.names[0],
+                        args: &[E0, E0],
+                        generic_args: Some(v.generic_args()),
+                    },
+                ),
+                owned.push_method_call(E0, v.names[0].clone(), &[E0, E0], Some(generic_args)),
+            ),
+            (
+                viewed.push_expr(
+                    &mut viewed_paths,
+                    Expr::MethodCall {
+                        receiver: E0,
+                        method_name: &v.names[1],
+                        args: &[],
+                        generic_args: None,
+                    },
+                ),
                 owned.push_method_call(E0, v.names[1].clone(), &[], None),
             ),
             (
-                viewed.push_expr(Expr::RecordLit {
-                    path: &v.paths[1],
-                    fields: &v.fields,
-                    spread: RecordSpread::Expr(E0),
-                }),
+                viewed.push_expr(
+                    &mut viewed_paths,
+                    Expr::RecordLit {
+                        path: v.path(1),
+                        fields: &v.fields,
+                        spread: RecordSpread::Expr(E0),
+                    },
+                ),
                 owned.push_record_lit(
-                    v.paths[1].clone(),
+                    path[1],
                     v.fields.clone().into_iter(),
                     RecordSpread::Expr(E0),
                 ),
             ),
             (
-                viewed.push_expr(Expr::RecordLit {
-                    path: &v.paths[0],
-                    fields: &[],
-                    spread: RecordSpread::FieldDefaults,
-                }),
-                owned.push_record_lit(
-                    v.paths[0].clone(),
-                    std::iter::empty(),
-                    RecordSpread::FieldDefaults,
+                viewed.push_expr(
+                    &mut viewed_paths,
+                    Expr::RecordLit {
+                        path: v.path(0),
+                        fields: &[],
+                        spread: RecordSpread::FieldDefaults,
+                    },
                 ),
+                owned.push_record_lit(path[0], std::iter::empty(), RecordSpread::FieldDefaults),
             ),
         ];
         for (viewed_id, owned_id) in pairs {
             assert_eq!(viewed_id, owned_id);
+            assert_eq!(owned.expr(&owned_paths, owned_id), viewed.expr(&viewed_paths, viewed_id));
         }
         let pats: [(PatId, PatId); 4] = [
-            (viewed.push_pat(Pat::Path(&v.paths[1])), owned.push_path_pat(v.paths[1].clone())),
             (
-                viewed.push_pat(Pat::Record { path: &v.paths[0], args: &v.field_pats, ellipsis: true }),
-                owned.push_record_pat(v.paths[0].clone(), v.field_pats.clone().into_iter(), true),
+                viewed.push_pat(&mut viewed_paths, Pat::Path(v.path(1))),
+                owned.push_path_pat(path[1]),
             ),
             (
-                viewed.push_pat(Pat::TupleStruct { path: &v.paths[0], args: &[P0], ellipsis: Some(1) }),
-                owned.push_tuple_struct_pat(v.paths[0].clone(), &[P0], Some(1)),
+                viewed.push_pat(
+                    &mut viewed_paths,
+                    Pat::Record { path: v.path(0), args: &v.field_pats, ellipsis: true },
+                ),
+                owned.push_record_pat(path[0], v.field_pats.clone().into_iter(), true),
             ),
             (
-                viewed.push_pat(Pat::TupleStruct { path: &v.paths[1], args: &[], ellipsis: None }),
-                owned.push_tuple_struct_pat(v.paths[1].clone(), &[], None),
+                viewed.push_pat(
+                    &mut viewed_paths,
+                    Pat::TupleStruct { path: v.path(0), args: &[P0], ellipsis: Some(1) },
+                ),
+                owned.push_tuple_struct_pat(path[0], &[P0], Some(1)),
+            ),
+            (
+                viewed.push_pat(
+                    &mut viewed_paths,
+                    Pat::TupleStruct { path: v.path(1), args: &[], ellipsis: None },
+                ),
+                owned.push_tuple_struct_pat(path[1], &[], None),
             ),
         ];
         for (viewed_id, owned_id) in pats {
             assert_eq!(viewed_id, owned_id);
+            assert_eq!(owned.pat(&owned_paths, owned_id), viewed.pat(&viewed_paths, viewed_id));
         }
-        assert_eq!(owned, viewed);
-        assert_eq!(owned.freeze().check(1, 1, 1), Ok(()));
+        assert_eq!((&owned.expr_kind, &owned.pat_kind), (&viewed.expr_kind, &viewed.pat_kind));
+        assert_eq!(owned.extra.len(), viewed.extra.len());
+        assert_eq!((&owned.expr_lists, &owned.pat_lists), (&viewed.expr_lists, &viewed.pat_lists));
+        assert_eq!(
+            (&owned.record_fields, &owned.field_pats),
+            (&viewed.record_fields, &viewed.field_pats)
+        );
+        assert_eq!(
+            (&owned.names, &owned.literals, &owned.offset_ofs, &owned.asms),
+            (&viewed.names, &viewed.literals, &viewed.offset_ofs, &viewed.asms)
+        );
+        assert!(owned_paths.len() < viewed_paths.len(), "each view push appends a path");
+        assert_eq!(owned.freeze().check(1, 1, 1, &owned_paths), Ok(()));
+        assert_eq!(viewed.freeze().check(1, 1, 1, &viewed_paths), Ok(()));
     }
 
     #[test]
@@ -2416,19 +2622,20 @@ mod tests {
             label: Some(idx(0)),
             unsafe_: Unsafe::Yes,
         };
-        let mut columns = columns_of(&[Expr::Missing, block(None)], &[]);
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing, block(None)], &[]);
         let before = columns.clone();
         columns.set_block_tail(E1, E0);
-        assert_eq!(columns.expr(E1), block(Some(E0)));
+        assert_eq!(columns.expr(&paths, E1), block(Some(E0)));
         let mut viewed = before;
-        viewed.set_expr(E1, block(Some(E0)));
+        viewed.set_expr(&mut paths, E1, block(Some(E0)));
         assert_eq!(columns, viewed);
     }
 
     #[test]
     #[should_panic = "a tail given to a non-block"]
     fn a_block_tail_on_a_non_block_panics() {
-        columns_of(&[Expr::Missing], &[]).set_block_tail(E0, E0);
+        columns_of(&mut PathColumns::default(), &[Expr::Missing], &[]).set_block_tail(E0, E0);
     }
 
     /// Every variant of [`Statement`], a `let` with each of its optional ids there and not.
@@ -2461,7 +2668,9 @@ mod tests {
         let kinds: std::collections::HashSet<_> = statements.iter().map(StatementKind::of).collect();
         assert_eq!(kinds.len(), StatementKind::ALL.len(), "every statement kind is tested");
 
-        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
+        let mut paths = PathColumns::default();
+        let mut columns =
+            columns_of(&mut paths, &[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
         for (at, &statement) in statements.iter().enumerate() {
             let (words, defs) = (columns.extra.len(), columns.macro_defs.len());
             assert_eq!(columns.push_statement(statement), at as u32);
@@ -2502,17 +2711,19 @@ mod tests {
         assert!(Statements::EMPTY.is_empty() && Statements::EMPTY.iter().next().is_none());
 
         let frozen = columns.freeze();
-        assert_eq!(frozen.check(0, 0, 1), Ok(()));
+        assert_eq!(frozen.check(0, 0, 1, &paths), Ok(()));
         for (at, &statement) in statements.iter().enumerate() {
             assert_eq!(frozen.statement(at as u32), statement);
         }
-        assert_eq!(frozen.check(0, 0, 0), Err("a type id past its arena"));
+        assert_eq!(frozen.check(0, 0, 0, &paths), Err("a type id past its arena"));
     }
 
     #[test]
     fn a_statement_set_to_one_that_fits_keeps_its_words() {
         let v = values();
-        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
+        let mut paths = PathColumns::default();
+        let mut columns =
+            columns_of(&mut paths, &[Expr::Missing, Expr::Missing], &[Pat::Wild, Pat::Wild]);
         let full = Statement::Let {
             pat: P0,
             type_ref: Some(T0),
@@ -2545,13 +2756,14 @@ mod tests {
             assert_eq!(columns.statement(at), statement);
         }
         assert_eq!(sizes(&columns), before, "nothing grew");
-        assert_eq!(columns.freeze().check(0, 0, 1), Ok(()));
+        assert_eq!(columns.freeze().check(0, 0, 1, &paths), Ok(()));
     }
 
     #[test]
     fn a_statement_set_to_one_that_does_not_fit_appends() {
         let v = values();
-        let mut columns = columns_of(&[Expr::Missing, Expr::Missing], &[Pat::Wild]);
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing, Expr::Missing], &[Pat::Wild]);
         let bare = Statement::Let {
             pat: P0,
             type_ref: None,
@@ -2585,13 +2797,16 @@ mod tests {
         assert_eq!(columns.extra.len(), words + LET_WORDS + 1, "a `let` from an expression appends");
         assert_eq!(columns.stmt_kind.len(), 1, "rows are set in place");
 
-        let block = columns.push_expr(Expr::Block {
-            id: None,
-            statements: Statements::EMPTY,
-            tail: None,
-            label: None,
-            unsafe_: Unsafe::No,
-        });
+        let block = columns.push_expr(
+            &mut paths,
+            Expr::Block {
+                id: None,
+                statements: Statements::EMPTY,
+                tail: None,
+                label: None,
+                unsafe_: Unsafe::No,
+            },
+        );
         let rows = rows_of(&[bare, def]);
         let grown = Expr::Block {
             id: None,
@@ -2600,35 +2815,40 @@ mod tests {
             label: None,
             unsafe_: Unsafe::No,
         };
-        columns.set_expr(block, grown);
-        assert_eq!(columns.expr(block), grown);
+        columns.set_expr(&mut paths, block, grown);
+        assert_eq!(columns.expr(&paths, block), grown);
         assert_eq!(columns.stmt_kind.len(), 3, "a block with more statements gets a new run");
-        assert_eq!(columns.freeze().check(0, 0, 1), Ok(()));
+        assert_eq!(columns.freeze().check(0, 0, 1, &paths), Ok(()));
     }
 
     #[test]
     fn check_refuses_a_bad_statement() {
         let v = values();
+        let paths = PathColumns::default();
         let columns_with = |statement| {
-            let mut columns = columns_of(&[Expr::Missing], &[Pat::Wild]);
+            let mut columns =
+                columns_of(&mut PathColumns::default(), &[Expr::Missing], &[Pat::Wild]);
             columns.push_statement(statement);
             columns.freeze()
         };
         let mut columns = columns_with(Statement::Expr { expr: E0, has_semi: true });
         columns.stmt_kind[0] = StatementKind::ALL.len() as u8;
-        assert_eq!(columns.check(0, 0, 0), Err("a statement kind out of range"));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err("a statement kind out of range"));
 
         let mut columns = columns_with(Statement::Item(Item::Other));
         columns.stmt_data[0] = 1;
-        assert_eq!(columns.check(0, 0, 0), Err("an item statement's data word that is not 0"));
+        assert_eq!(
+            columns.check(0, 0, 0, &paths),
+            Err("an item statement's data word that is not 0")
+        );
 
         let mut columns = columns_with(Statement::Item(Item::MacroDef(&v.macro_defs[0])));
-        assert_eq!(columns.check(0, 0, 0), Ok(()));
+        assert_eq!(columns.check(0, 0, 0, &paths), Ok(()));
         columns.stmt_data[0] = 1;
-        assert_eq!(columns.check(0, 0, 0), Err(MACRO_DEF));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(MACRO_DEF));
 
         let columns = columns_with(Statement::Expr { expr: E1, has_semi: false });
-        assert_eq!(columns.check(0, 0, 0), Err(EXPR_ID));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(EXPR_ID));
 
         let full = Statement::Let {
             pat: P0,
@@ -2638,15 +2858,22 @@ mod tests {
             is_super: false,
         };
         let mut columns = columns_with(full);
-        assert_eq!(columns.check(0, 0, 0), Ok(()));
+        assert_eq!(columns.check(0, 0, 0, &paths), Ok(()));
         columns.extra[0] = (1 << LET_BITS) | LET_INIT | LET_ELSE;
-        assert_eq!(columns.check(0, 0, 0), Err(PAT_ID));
+        assert_eq!(columns.check(0, 0, 0, &paths), Err(PAT_ID));
         columns.extra[0] = LET_TYPE | LET_INIT | LET_ELSE;
-        assert_eq!(columns.check(0, 0, 0), Err(EXTRA), "a third optional id past the column");
+        assert_eq!(
+            columns.check(0, 0, 0, &paths),
+            Err(EXTRA),
+            "a third optional id past the column"
+        );
 
         let mut columns = columns_with(Statement::Expr { expr: E0, has_semi: true });
         columns.stmt_data = Box::default();
-        assert_eq!(columns.check(0, 0, 0), Err("statement kind and data columns of different lengths"));
+        assert_eq!(
+            columns.check(0, 0, 0, &paths),
+            Err("statement kind and data columns of different lengths")
+        );
     }
 
     #[test]
@@ -2659,17 +2886,18 @@ mod tests {
             label: None,
             unsafe_: Unsafe::No,
         };
-        let mut columns = columns_of(&[Expr::Missing, block], &[Pat::Wild]).freeze();
-        assert_eq!(columns.check(0, 0, 1), Ok(()));
+        let mut paths = PathColumns::default();
+        let mut columns = columns_of(&mut paths, &[Expr::Missing, block], &[Pat::Wild]).freeze();
+        assert_eq!(columns.check(0, 0, 1, &paths), Ok(()));
         let words = columns.expr_data[1] as usize;
         let rows = columns.stmt_kind.len() as u32;
         columns.extra[words + 3] = rows + 1;
-        assert_eq!(columns.check(0, 0, 1), Err(STATEMENTS));
+        assert_eq!(columns.check(0, 0, 1, &paths), Err(STATEMENTS));
         columns.extra[words + 2] = u32::MAX;
         columns.extra[words + 3] = 2;
-        assert_eq!(columns.check(0, 0, 1), Err(STATEMENTS), "a start that overflows");
+        assert_eq!(columns.check(0, 0, 1, &paths), Err(STATEMENTS), "a start that overflows");
         columns.extra[words + 2] = 1;
         columns.extra[words + 3] = rows - 1;
-        assert_eq!(columns.check(0, 0, 1), Ok(()), "a run inside the rows");
+        assert_eq!(columns.check(0, 0, 1, &paths), Ok(()), "a run inside the rows");
     }
 }

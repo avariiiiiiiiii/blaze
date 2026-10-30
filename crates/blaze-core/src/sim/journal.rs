@@ -399,7 +399,7 @@ mod tests {
         for it in ["src/b.rs", "src/a", "src"] {
             assert!(names.push_str(it));
         }
-        let mut effects = vec![Effect::Stamp { files: names, tag: Tag(1) }];
+        let mut effects = vec![Effect::Stamp { files: std::sync::Arc::new(names), tag: Tag(1) }];
         effects.push(Effect::Entries { dir: name("src"), tag: Tag(2) });
         let mut done = Vec::new();
         sim.submit(&mut effects);

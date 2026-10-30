@@ -12,7 +12,7 @@ use std::{
     ops::{ControlFlow, Range},
 };
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::CfgOptions;
 use either::Either;
 use hir_expand::{
@@ -564,7 +564,7 @@ fn get_horizontal_trim(lines: &[&str], kind: ast::CommentShape) -> Option<String
 }
 
 struct DocMacroExpander<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     macro_depth: u32,
     recursion_limit: u32,
@@ -655,7 +655,7 @@ fn expand_doc_macro_call<'db>(
 /// The string a `#[key = value]` attribute's value is once the macros in it are expanded, as
 /// `#[link_name = concat!(prefix!(), "name")]`.
 pub(crate) fn expand_attr_value<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     resolver: Resolver<'db>,
     value: InFile<ast::Expr>,
@@ -677,7 +677,7 @@ pub(crate) fn expand_attr_value<'db>(
 
 fn extend_with_attrs<'a, 'db>(
     result: &mut Docs,
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     node: &SyntaxNode,
     file_id: HirFileId,
@@ -822,7 +822,7 @@ fn block_comment_len(text: &str) -> Option<usize> {
 }
 
 pub(crate) fn extract_docs<'a, 'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     resolver: &dyn Fn() -> Resolver<'db>,
     get_cfg_options: &dyn Fn() -> &'a CfgOptions,
@@ -900,6 +900,7 @@ pub(crate) fn extract_docs<'a, 'db>(
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use expect_test::expect;
     use hir_expand::InFile;
     use syntax::{AstNode, AstToken, ast};
@@ -1187,7 +1188,7 @@ mod tests {
             DocCommentKind::Sugared(ast::CommentShape::Block),
             DocCommentKind::Desugared,
         ];
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for case in 0..2000 {
             let mut docs = Docs {
                 docs: String::new(),
@@ -1201,11 +1202,8 @@ mod tests {
             };
             let mut indent = Indent::default();
             for _ in 0..1 + case % 6 {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let line = lines[seed as usize % lines.len()];
-                let kind = kinds[(seed >> 32) as usize % kinds.len()];
+                let line = lines[rng.index(lines.len())];
+                let kind = kinds[rng.index(kinds.len())];
                 docs.push_doc_lines(line, None, kind, &mut indent);
             }
             let want = remove_indent_by_lines(&docs, &indent);

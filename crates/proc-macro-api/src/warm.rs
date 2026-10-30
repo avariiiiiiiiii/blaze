@@ -96,15 +96,16 @@ impl Write for LinkWriter {
     }
 }
 
-/// The reading half of a [`Link`] as [`BufRead`].
-pub(crate) struct LinkReader {
+/// The reading half of a [`Link`] as [`BufRead`]: what a client reads a warm server's frames
+/// from.
+pub struct LinkReader {
     link: Arc<dyn Link>,
     buffer: Vec<u8>,
     at: usize,
 }
 
 impl LinkReader {
-    pub(crate) fn new(link: Arc<dyn Link>) -> LinkReader {
+    pub fn new(link: Arc<dyn Link>) -> LinkReader {
         LinkReader { link, buffer: Vec::new(), at: 0 }
     }
 }

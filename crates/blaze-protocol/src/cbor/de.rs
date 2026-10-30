@@ -4,11 +4,13 @@
 //! not decode are read again, by [`check`], so the error is the one the two passes gave: the
 //! first offence against the encoding wherever it is, else what the type found.
 
+use std::cmp::Ordering;
+
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer as _, Visitor};
 
 use super::{
     ARRAY, BYTES, Error, MAP, NAN, NEGATIVE, NULL, SIMPLE, TEXT, UNSIGNED, check, from_half,
-    half_of,
+    half_of, key_order,
 };
 use super::check::{DEEPEST, item};
 
@@ -245,12 +247,10 @@ impl Items<'_, '_> {
         let bytes = self.de.bytes;
         let key = &bytes[start..self.de.at];
         if let Some((from, to)) = self.last {
-            let last = &bytes[from..to];
-            if last == key {
-                return Err(self.de.offence("a key twice"));
-            }
-            if last > key {
-                return Err(self.de.offence("map keys out of order"));
+            match key_order(&bytes[from..to], key) {
+                Ordering::Less => {}
+                Ordering::Equal => return Err(self.de.offence("a key twice")),
+                Ordering::Greater => return Err(self.de.offence("map keys out of order")),
             }
         }
         self.last = Some((start, self.de.at));

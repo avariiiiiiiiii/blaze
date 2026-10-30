@@ -284,7 +284,25 @@ How the code reaches each term:
 - The merge indexes a bitset directly, at `index << 3 | bucket`, so a counter's eight buckets
   share one byte.
 - The fuzz loop reads the clock once per run.
-- The run buffer is reused, and only a kept input allocates.
+- The run buffer is reused, even after a keep; tests hold a run that keeps nothing and a
+  keep to zero general-purpose allocations.
+
+### Memory by lifetime ([memory.md](../../design/memory.md))
+
+- **The process.** The kept corpus is three columns over reserved regions
+  (`blaze_mem::RegionVec`): the inputs' bytes end to end, their ends, and the running sums
+  of their weights. Each column grows by committing pages and never moves, so a keep is one
+  copy and two pushes, and a pick is a binary search and a slice. Reaching the reservation
+  (16 GiB of bytes, 2^26 inputs) stops the job with an error naming it. The seen bitset, the
+  feature list and the run buffer are sized once at setup.
+- **One run.** Nothing from the general-purpose allocator. A kept input's file is written
+  from scratch buffers (text and two paths) that grow once to the longest input. The set of
+  kept files is keyed by content hash and reserved for 2^14 entries, so it grows only past
+  that, by doubling.
+- **The edge.** Reading another worker's file (once per file), the directory listing (once a
+  second), a finding's report and error messages allocate, each marked `// alloc:`.
+- Until blaze-mem has a fuzzer tag, the corpus counts under `Tag::Other`
+  (`v2/requests/mem.md`, "From safety-fuzz").
 
 The previous version of the engine was far from these bounds:
 - Its drain made a variable-length copy per 8-byte word, about 15 cycles, or 2N cycles in

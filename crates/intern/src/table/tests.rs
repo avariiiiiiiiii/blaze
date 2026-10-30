@@ -1,7 +1,7 @@
 use std::{collections::HashMap, panic::AssertUnwindSafe};
 
 use blaze_format::SchemaHash;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64};
 use blaze_image::{Builder, Image, SectionId};
 
 use super::*;
@@ -23,27 +23,10 @@ fn shape() -> Shape {
     }
 }
 
-/// A splitmix64 stream: seeded, so a failure reproduces.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    /// A short name from few letters, so many share an order key and a hash tag.
-    fn name(&mut self) -> String {
-        let len = self.below(12) as usize;
-        (0..len).map(|_| ['a', 'b', 'é', '_', '0'][self.below(5) as usize]).collect()
-    }
+/// A short name from few letters, so many share an order key and a hash tag.
+fn name(rng: &mut SplitMix64) -> String {
+    let len = rng.index(12);
+    (0..len).map(|_| ['a', 'b', 'é', '_', '0'][rng.index(5)]).collect()
 }
 
 fn section_bytes(table: &Table, live: &Live) -> Vec<u8> {
@@ -107,11 +90,11 @@ fn compiled_in_values_are_their_ids() {
 
 #[test]
 fn ids_are_equal_after_write_and_reopen() {
-    let mut rng = Rng(0x1d5);
+    let mut rng = SplitMix64::new(0x1d5);
     let table = Table::new(shape());
     let mut model = HashMap::new();
     for _ in 0..3000 {
-        let text = rng.name() + &rng.below(400).to_string();
+        let text = name(&mut rng) + &rng.below(400).to_string();
         let id = table.intern(text.as_bytes());
         if id >= table.first {
             let previous = model.insert(id, text.clone());
@@ -133,12 +116,12 @@ fn ids_are_equal_after_write_and_reopen() {
 
 #[test]
 fn gc_never_renumbers_a_live_value() {
-    let mut rng = Rng(0x6c);
+    let mut rng = SplitMix64::new(0x6c);
     let mut current = Table::new(shape());
     let mut model: HashMap<u32, String> = HashMap::new();
     for generation in 0..8 {
         for _ in 0..rng.below(600) {
-            let text = format!("{}{generation}", rng.name());
+            let text = format!("{}{generation}", name(&mut rng));
             let id = current.intern(text.as_bytes());
             if id >= current.first {
                 model.insert(id, text);
@@ -261,9 +244,9 @@ fn another_shape_is_refused() {
 /// trip on. (That each value is reachable in the index is the CRC's to guard, not these.)
 #[test]
 fn a_restore_never_accepts_a_table_it_cannot_read() {
-    let mut rng = Rng(0xbad);
+    let mut rng = SplitMix64::new(0xbad);
     let table = Table::new(shape());
-    (0..40).for_each(|_| _ = table.intern(rng.name().as_bytes()));
+    (0..40).for_each(|_| _ = table.intern(name(&mut rng).as_bytes()));
     let mut live = Live::new();
     (table.first..table.end()).filter(|id| id % 3 != 0).for_each(|id| live.mark_id(id));
     let section = section_bytes(&table, &live);
@@ -327,7 +310,7 @@ fn value_hash_is_deterministic_and_spreads() {
     let mut tags = [0u32; 128];
     let mut starts = vec![0u32; 1024];
     for &hash in &hashes {
-        tags[(tag(hash) & 0x7f) as usize] += 1;
+        tags[(swiss::tag(hash) & 0x7f) as usize] += 1;
         starts[hash as usize & 1023] += 1;
     }
     assert!(tags.iter().all(|&n| n > 0));
@@ -377,4 +360,38 @@ fn a_parallel_restore_is_the_serial_one() {
         assert_eq!(error, serial_error);
     }
     assert!(matches!(serial_error, RestoreError::Corrupt(Corrupt { group: 3, .. })), "{serial_error}");
+}
+
+/// Interning a value the table holds, finding it and reading it allocate nothing: from the
+/// compiled-in values, the mapped base of a restored table, and the overlay over it.
+#[test]
+fn hits_allocate_nothing() {
+    let table = Table::new(shape());
+    let mut model = HashMap::new();
+    let mut rng = SplitMix64::new(41);
+    for _ in 0..500 {
+        let text = name(&mut rng);
+        model.insert(table.intern(text.as_bytes()), text);
+    }
+    let restored = reopen(&table, &everything(&table)).unwrap();
+    let mut overlay = HashMap::new();
+    for _ in 0..500 {
+        let text = format!("new {}", rng.next_u64());
+        overlay.insert(restored.intern(text.as_bytes()), text);
+    }
+    for (what, values) in [("the mapped base", &model), ("the overlay", &overlay)] {
+        for (&id, text) in values {
+            let text = text.as_bytes();
+            blaze_alloc_count::assert_at_most(0, what, || {
+                assert_eq!(restored.intern(text), id);
+                assert_eq!(restored.find(text), Some(id));
+                assert_eq!(restored.get(id), Some(text));
+            });
+        }
+    }
+    blaze_alloc_count::assert_at_most(0, "a compiled-in value", || {
+        assert_eq!(restored.intern(b"a"), 1);
+        assert_eq!(restored.find(b"b"), Some(2));
+        assert_eq!(restored.get(3), Some(&b"a"[..]));
+    });
 }

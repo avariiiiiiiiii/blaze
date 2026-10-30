@@ -49,6 +49,16 @@ impl MacroKind {
 }
 
 impl Expansion {
+    fn place(
+        &mut self,
+        offset: u32,
+        name: &str,
+        name_of: &dyn Fn(span::FileId) -> Option<String>,
+    ) -> bool {
+        let def_site = self.def_site.as_mut().is_none_or(|it| it.place(offset, name, name_of));
+        self.call_site.place(offset, name, name_of) && def_site
+    }
+
     /// As rustc's JSON names it: `name!`, `#[name]`, `#[derive(Name)]`.
     pub fn decl_name(&self) -> String {
         match self.kind {
@@ -59,6 +69,11 @@ impl Expansion {
     }
 }
 
+/// What a span made in a lint query has for its file, before the driver names it: the empty
+/// name for the tree the query walks (its range moved into the file by the driver), or this
+/// byte and the file's number for a span of another file.
+const FILE_ID: char = '\0';
+
 impl Span {
     pub fn new(file: &str, range: TextRange) -> Span {
         Span {
@@ -66,6 +81,43 @@ impl Span {
             lo: range.start().into(),
             hi: range.end().into(),
             expansion: None,
+        }
+    }
+
+    /// A span of the tree a lint query walks, which the driver moves into the file and names.
+    pub(crate) fn in_query(range: TextRange) -> Span {
+        Span { file: String::new(), lo: range.start().into(), hi: range.end().into(), expansion: None }
+    }
+
+    /// A span of `file` as a lint query makes it, which the driver names.
+    pub(crate) fn of_file(file: span::FileId, range: TextRange) -> Span {
+        let mut name = String::with_capacity(11);
+        name.push(FILE_ID);
+        name.push_str(&file.index().to_string());
+        Span { file: name, lo: range.start().into(), hi: range.end().into(), expansion: None }
+    }
+
+    /// Gives a span a lint query made its file's name, moving it by `offset` when it is of the
+    /// tree the query walked, named `name`. `false` when a file is not named.
+    pub(crate) fn place(
+        &mut self,
+        offset: u32,
+        name: &str,
+        name_of: &dyn Fn(span::FileId) -> Option<String>,
+    ) -> bool {
+        if self.file.is_empty() {
+            self.lo += offset;
+            self.hi += offset;
+            name.clone_into(&mut self.file);
+        } else if let Some(id) = self.file.strip_prefix(FILE_ID) {
+            let Some(file) = id.parse().ok().map(span::FileId::from_raw).and_then(name_of) else {
+                return false;
+            };
+            self.file = file;
+        }
+        match &mut self.expansion {
+            Some(expansion) => expansion.place(offset, name, name_of),
+            None => true,
         }
     }
 
@@ -95,7 +147,7 @@ impl Span {
 }
 
 /// rustc's `MultiSpan`: the places a diagnostic is of, and the labels on places.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MultiSpan {
     pub primary: Vec<Span>,
     pub labels: Vec<(Span, String)>,
@@ -116,6 +168,19 @@ impl From<Span> for MultiSpan {
 }
 
 impl MultiSpan {
+    fn place(
+        &mut self,
+        offset: u32,
+        name: &str,
+        name_of: &dyn Fn(span::FileId) -> Option<String>,
+    ) -> bool {
+        let mut named = true;
+        for span in self.primary.iter_mut().chain(self.labels.iter_mut().map(|it| &mut it.0)) {
+            named &= span.place(offset, name, name_of);
+        }
+        named
+    }
+
     pub fn of(span: Span) -> MultiSpan {
         MultiSpan { primary: vec![span], labels: Vec::new() }
     }
@@ -168,7 +233,7 @@ impl Sublevel {
 }
 
 /// A note, a help or a warning under a diagnostic: rustc's `Subdiag`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Child {
     pub level: Sublevel,
     pub message: String,
@@ -221,7 +286,7 @@ impl SuggestionStyle {
 
 /// A suggested change: one or more ways to substitute parts of the source: rustc's
 /// `CodeSuggestion`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Suggestion {
     pub message: String,
     /// Each way to substitute, each a set of disjoint parts.
@@ -231,7 +296,7 @@ pub struct Suggestion {
 }
 
 /// A lint's diagnostic, at the level it was found at.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     /// As rustc's JSON names it: `clippy::needless_bool`, `unfulfilled_lint_expectations`.
     pub lint: String,
@@ -250,6 +315,26 @@ impl Diagnostic {
     /// Whether it is written as an error.
     pub fn is_error(&self) -> bool {
         self.level >= Level::Deny
+    }
+
+    /// Names the files of every span of it a lint query made ([`Span::place`]). `false` when
+    /// one of them is of a file that is not named.
+    pub(crate) fn place(
+        &mut self,
+        offset: u32,
+        name: &str,
+        name_of: &dyn Fn(span::FileId) -> Option<String>,
+    ) -> bool {
+        let mut named = self.span.place(offset, name, name_of);
+        for child in &mut self.children {
+            named &= child.span.place(offset, name, name_of);
+        }
+        for suggestion in &mut self.suggestions {
+            for (span, _) in suggestion.substitutions.iter_mut().flatten() {
+                named &= span.place(offset, name, name_of);
+            }
+        }
+        named
     }
 
     /// Whether cargo counts it as one `cargo clippy --fix` applies: it has a suggestion rustfix

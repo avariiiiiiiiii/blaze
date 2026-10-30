@@ -23,7 +23,7 @@ pub(super) use cleanup::remove_noop_landing_pads;
 
 use std::cell::RefCell;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::HasModule;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
@@ -46,7 +46,7 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 /// What the passes ask of the types of a body.
 pub(super) struct Ctx<'db> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) infcx: InferCtxt<'db>,
     pub(super) env: ParamEnv<'db>,
     krate: Crate,
@@ -54,7 +54,7 @@ pub(super) struct Ctx<'db> {
 }
 
 impl<'db> Ctx<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Self {
+    pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>) -> Self {
         let krate = owner.krate(db);
         let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, krate);
@@ -129,7 +129,7 @@ impl<'db> Ctx<'db> {
 }
 
 /// `built` after the passes.
-fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
     // rustc's `CleanupPostBorrowck` before these: a false edge, which only borrow checking
@@ -158,23 +158,8 @@ fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db
     Ok(body)
 }
 
-/// How many of the runtime bodies (and their monomorphized copies) salsa keeps the value of once
-/// a revision is over; 0 keeps every one. A body let go is lowered again when it is next asked
-/// for, and what depends on it cannot be backdated then.
-pub fn set_runtime_mir_capacity(db: &mut dyn HirDatabase, capacity: usize) {
-    runtime_mir_body_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    monomorphized_runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_cycle_result, lru = 0)]
-pub fn runtime_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_runtime_mir_body<'db>(
+    db: &'db Db,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     run_passes(db, db.mir_body(def)?)
@@ -184,7 +169,7 @@ pub fn runtime_mir_body_query<'db>(
 /// evaluates for it with the interpreter.
 #[salsa::tracked(returns(as_ref))]
 pub fn runtime_promoted_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: InferBodyId<'db>,
     expr: hir_def::hir::ExprId,
 ) -> Result<'db, MirBody<'db>> {
@@ -192,33 +177,29 @@ pub fn runtime_promoted_mir_body_query<'db>(
     run_passes(db, built)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_closure_cycle_result, lru = 0)]
-pub fn runtime_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_runtime_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     run_passes(db, db.mir_body_for_closure(closure)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result, lru = 0)]
-pub fn runtime_mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_runtime_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     run_passes(db, db.mir_body_for_coroutine(coroutine)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = runtime_mir_body_for_coroutine_cycle_result, lru = 0)]
-pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_runtime_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_runtime_mir_body_cycle_result, lru = 0)]
-pub fn monomorphized_runtime_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_runtime_mir_body<'db>(
+    db: &'db Db,
     def: InferBodyId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -226,13 +207,8 @@ pub fn monomorphized_runtime_mir_body_query<'db>(
     monomorphized(db, db.runtime_mir_body(def)?, &subst, &trait_env)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_closure_cycle_result,
-    lru = 0
-)]
-pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_runtime_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -240,13 +216,8 @@ pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     monomorphized(db, db.runtime_mir_body_for_closure(closure)?, &subst, &trait_env)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result,
-    lru = 0
-)]
-pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_runtime_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -254,70 +225,11 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     monomorphized(db, db.runtime_mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_runtime_mir_body_for_coroutine_cycle_result,
-    lru = 0
-)]
-pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_runtime_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<'db, MirBody<'db>> {
     monomorphized(db, db.runtime_mir_body_for_coroutine_by_move(coroutine)?, &subst, &trait_env)
-}
-
-fn runtime_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn runtime_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn runtime_mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedCoroutineId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_runtime_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_runtime_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_runtime_mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedCoroutineId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
 }

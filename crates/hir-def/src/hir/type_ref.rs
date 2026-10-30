@@ -37,6 +37,7 @@ use crate::{
     },
     hir::{
         ExprId, PatId,
+        col::{SlabLayout, SlabWriter},
         columns::{Checked, ColumnVec, Frozen, Growing, below, entry, idx, len, list, raw, take_exact},
     },
 };
@@ -138,13 +139,13 @@ impl FnType {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ArrayType {
     pub ty: TypeRefId,
     pub len: ConstRef,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct RefType {
     pub ty: TypeRefId,
     pub lifetime: Option<LifetimeRefId>,
@@ -338,6 +339,7 @@ const _: () = {
 };
 
 const TYPE_ID: &str = "a type id past its arena";
+const LIFETIME_ID: &str = "a lifetime id past its arena";
 const NOT_A_PATH: &str = "a path id that is not a path";
 const EXTRA: &str = "a type ref's words past the extra column";
 const LIST: &str = "a tuple's types past their array";
@@ -486,9 +488,10 @@ impl TypeColumns<Growing> {
                 assert!(raw(inner) >> (u32::BITS - 1) == 0, "a type id too large to share its word");
                 raw(inner) << 1 | mutability as u32
             }
-            TypeRef::Reference(ref_type) => push_one(&mut self.refs, ref_type.clone()),
-            TypeRef::Array(array) => push_one(&mut self.arrays, array.clone()),
+            TypeRef::Reference(ref_type) => push_one(&mut self.refs, *ref_type),
+            TypeRef::Array(array) => push_one(&mut self.arrays, *array),
             TypeRef::Slice(inner) => raw(inner),
+            // clone: a view's fn type copied into this table; lowering pushes each one once
             TypeRef::Fn(fn_type) => push_one(&mut self.fns, fn_type.clone()),
             TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
                 let words = append(&mut self.bounds, bounds);
@@ -550,30 +553,56 @@ impl TypeColumns<Growing> {
             + self.paths.capacity()
     }
 
-    /// The columns of a finished store, each copied into a boxed slice of its length (one
-    /// allocation per non-empty column); `self` is left empty with its capacity, for the next
-    /// store built on this thread.
+    /// The store's paths, for lowering to push paths, generic arguments and bound runs into.
+    #[inline]
+    pub(crate) fn paths_mut(&mut self) -> &mut PathColumns {
+        &mut self.paths
+    }
+
+    /// The columns of a finished store, each copied out at its exact length: the `Copy` ones
+    /// into one slab together ([`SlabWriter`]), widest first so no padding is between them, the
+    /// fn types into a box of their own ([`take_exact`]) and the paths as
+    /// [`PathColumns::freeze_into`] makes them. `self` is left empty with its capacity, for the
+    /// next store built on this thread.
     pub(crate) fn freeze_into(&mut self) -> TypeColumns<Frozen> {
+        let mut layout = SlabLayout::default();
+        layout.add::<TypeBound>(self.bounds.len());
+        layout.add::<RefType>(self.refs.len());
+        layout.add::<ArrayType>(self.arrays.len());
+        layout.add::<TypeParamId>(self.type_params.len());
+        layout.add::<u32>(self.data.len());
+        layout.add::<u32>(self.extra.len());
+        layout.add::<TypeRefId>(self.lists.len());
+        layout.add::<u8>(self.kind.len());
+        let mut slab = SlabWriter::new(layout);
+        let bounds = slab.take(&mut self.bounds);
+        let refs = slab.take(&mut self.refs);
+        let arrays = slab.take(&mut self.arrays);
+        let type_params = slab.take(&mut self.type_params);
+        let data = slab.take(&mut self.data);
+        let extra = slab.take(&mut self.extra);
+        let lists = slab.take(&mut self.lists);
+        let kind = slab.take(&mut self.kind);
         TypeColumns {
-            kind: take_exact(&mut self.kind),
-            data: take_exact(&mut self.data),
-            extra: take_exact(&mut self.extra),
-            lists: take_exact(&mut self.lists),
-            bounds: take_exact(&mut self.bounds),
-            paths: take_exact(&mut self.paths),
-            refs: take_exact(&mut self.refs),
-            arrays: take_exact(&mut self.arrays),
-            fns: take_exact(&mut self.fns),
-            type_params: take_exact(&mut self.type_params),
+            kind,
+            data,
+            extra,
+            lists,
+            bounds,
+            paths: self.paths.freeze_into(),
+            refs,
+            arrays,
+            fns: take_exact(&mut self.fns).into(),
+            type_params,
         }
     }
 }
 
 impl TypeColumns<Frozen> {
-    /// Every kind in range, every id, list range and side-table index in bounds, and every
-    /// [`PathId`] of a bound naming a `Path`. The encoding calls it after reading a buffer and
-    /// maps `Err(what)` to `FormatError::Invalid`. The ids inside paths (type anchors, generic
-    /// arguments) are the encoding's to check, as for [`super::columns::HirColumns::check`].
+    /// Every kind in range, every id, list range and side-table index in bounds, every
+    /// [`PathId`] of a bound naming a `Path`, and the paths' columns ([`PathColumns::check`]:
+    /// their rows, runs and the ids inside them). The encoding calls it after reading a buffer
+    /// and maps `Err(what)` to `FormatError::Invalid`.
     pub(crate) fn check(&self, exprs: usize, pats: usize, lifetimes: usize) -> Checked {
         if self.kind.len() != self.data.len() {
             return Err("type ref kind and data columns of different lengths");
@@ -583,8 +612,8 @@ impl TypeColumns<Frozen> {
         }
         let count = self.len();
         let ty = |id: TypeRefId| below(raw(id), count, TYPE_ID);
-        let lifetime = |id: LifetimeRefId| below(raw(id), lifetimes, "a lifetime id past its arena");
         let path = |id: PathId| self.path_of(id).map(drop);
+        self.paths.check(count, lifetimes, exprs, path)?;
         for at in 0..len(count) {
             match self.decode(idx(at))? {
                 TypeRef::Never
@@ -596,7 +625,7 @@ impl TypeColumns<Frozen> {
                 TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => ty(inner)?,
                 TypeRef::Reference(RefType { ty: inner, lifetime: region, mutability: _ }) => {
                     ty(*inner)?;
-                    region.map_or(Ok(()), lifetime)?;
+                    region.map_or(Ok(()), |id| below(raw(id), lifetimes, LIFETIME_ID))?;
                 }
                 TypeRef::Array(ArrayType { ty: inner, len: ConstRef { expr } }) => {
                     ty(*inner)?;
@@ -610,15 +639,7 @@ impl TypeColumns<Frozen> {
                 }
                 TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
                     for bound in bounds {
-                        match bound {
-                            TypeBound::Path(id, _) | TypeBound::ForLifetime(_, id) => path(*id)?,
-                            TypeBound::Lifetime(id) => lifetime(*id)?,
-                            TypeBound::Use(args) => args.iter().try_for_each(|arg| match arg {
-                                UseArgRef::Lifetime(id) => lifetime(*id),
-                                UseArgRef::Name(_) => Ok(()),
-                            })?,
-                            TypeBound::Error => {}
-                        }
+                        self.paths.check_bound(bound, lifetimes, &path)?;
                     }
                 }
                 TypeRef::PatternType(inner, pat) => {
@@ -628,6 +649,12 @@ impl TypeColumns<Frozen> {
             }
         }
         Ok(())
+    }
+
+    /// A bound held outside the columns (a where predicate's, a type alias's), checked as
+    /// [`TypeColumns::check`] checks the columns' own.
+    pub(crate) fn check_outside_bound(&self, bound: &TypeBound, lifetimes: usize) -> Checked {
+        self.paths.check_bound(bound, lifetimes, &|id: PathId| self.path_of(id).map(drop))
     }
 }
 
@@ -652,8 +679,8 @@ mod tests {
         Name::new_symbol_root(Symbol::intern(text))
     }
 
-    fn path(text: &str) -> Path {
-        Path::BarePath(ModPath::from_segments(PathKind::Plain, [name(text)]))
+    fn mod_path(text: &str) -> ModPath {
+        ModPath::from_segments(PathKind::Plain, [name(text)])
     }
 
     fn type_param(local: u32) -> TypeParamId {
@@ -666,7 +693,7 @@ mod tests {
     }
 
     struct Values {
-        paths: [Path; 2],
+        mod_paths: [ModPath; 2],
         refs: [RefType; 2],
         array: ArrayType,
         fn_type: FnType,
@@ -675,7 +702,7 @@ mod tests {
 
     fn values() -> Values {
         Values {
-            paths: [path("a"), path("b")],
+            mod_paths: [mod_path("a"), mod_path("b")],
             refs: [
                 RefType { ty: t(0), lifetime: Some(idx(0)), mutability: Mutability::Mut },
                 RefType { ty: t(1), lifetime: None, mutability: Mutability::Shared },
@@ -690,12 +717,9 @@ mod tests {
             },
             bounds: vec![
                 TypeBound::Path(PathId::from_type_ref_unchecked(t(0)), TraitBoundModifier::Maybe),
-                TypeBound::ForLifetime(ThinVec::from_iter([name("'b")]), PathId(t(0))),
+                TypeBound::ForLifetime(Names { start: 0, len: 1 }, PathId(t(0))),
                 TypeBound::Lifetime(idx(0)),
-                TypeBound::Use(ThinVec::from_iter([
-                    UseArgRef::Name(name("T")),
-                    UseArgRef::Lifetime(idx(0)),
-                ])),
+                TypeBound::Use(UseArgs { start: 0, len: 2 }),
                 TypeBound::Error,
             ],
         }
@@ -705,12 +729,12 @@ mod tests {
     /// path, so every [`PathId`] in the bounds names one.
     fn every_type_ref(v: &Values) -> Vec<TypeRef<'_>> {
         vec![
-            TypeRef::Path(&v.paths[0]),
+            TypeRef::Path(Path::BarePath(&v.mod_paths[0])),
             TypeRef::Never,
             TypeRef::Placeholder,
             TypeRef::Tuple(&[T0, T1, T0]),
             TypeRef::UNIT,
-            TypeRef::Path(&v.paths[1]),
+            TypeRef::Path(Path::BarePath(&v.mod_paths[1])),
             TypeRef::RawPtr(t(1), Mutability::Mut),
             TypeRef::RawPtr(t(0), Mutability::Shared),
             TypeRef::Reference(&v.refs[0]),
@@ -728,11 +752,19 @@ mod tests {
         ]
     }
 
-    fn columns_of(type_refs: &[TypeRef<'_>]) -> TypeColumns<Growing> {
-        let mut columns = TypeColumns::<Growing>::default();
+    /// `type_refs` pushed into `columns`, after the runs the bounds of [`values`] point into.
+    fn fill(columns: &mut TypeColumns<Growing>, type_refs: &[TypeRef<'_>]) {
+        assert_eq!(columns.paths.push_names([name("'b")]), Names { start: 0, len: 1 });
+        let use_args = [UseArgRef::Name(name("T")), UseArgRef::Name(name("U"))];
+        assert_eq!(columns.paths.push_use_args(use_args), UseArgs { start: 0, len: 2 });
         for (at, &type_ref) in type_refs.iter().enumerate() {
             assert_eq!(columns.push(type_ref), t(at as u32));
         }
+    }
+
+    fn columns_of(type_refs: &[TypeRef<'_>]) -> TypeColumns<Growing> {
+        let mut columns = TypeColumns::<Growing>::default();
+        fill(&mut columns, type_refs);
         columns
     }
 
@@ -748,7 +780,7 @@ mod tests {
             assert_eq!(columns.get(t(at as u32)), type_ref);
         }
         assert_eq!(columns.iter().map(|(_, it)| it).collect::<Vec<_>>(), type_refs);
-        assert_eq!(columns.path(PathId(t(5))), &v.paths[1]);
+        assert_eq!(columns.path(PathId(t(5))), Path::BarePath(&v.mod_paths[1]));
 
         let frozen = columns.freeze_into();
         assert!(columns.is_empty() && columns.paths.is_empty(), "freezing empties the scratch");
@@ -757,9 +789,7 @@ mod tests {
             assert_eq!(frozen.get(t(at as u32)), type_ref);
         }
 
-        for &type_ref in &type_refs {
-            columns.push(type_ref);
-        }
+        fill(&mut columns, &type_refs);
         assert_eq!(columns.freeze_into(), frozen, "reused scratch makes the same columns");
     }
 
@@ -767,10 +797,11 @@ mod tests {
     fn by_value_pushes_match_borrowed_ones() {
         let v = values();
         let mut borrowed = TypeColumns::<Growing>::default();
-        borrowed.push(TypeRef::Path(&v.paths[0]));
+        borrowed.push(TypeRef::Path(Path::BarePath(&v.mod_paths[0])));
         borrowed.push(TypeRef::Fn(&v.fn_type));
         let mut owned = TypeColumns::<Growing>::default();
-        owned.push_path(v.paths[0].clone());
+        let path = owned.paths.push_bare(v.mod_paths[0]);
+        owned.push_path(path);
         owned.push_fn(v.fn_type.clone());
         assert_eq!(owned, borrowed);
     }
@@ -814,11 +845,18 @@ mod tests {
 
         let v = values();
         let mut columns =
-            columns_of(&[TypeRef::Path(&v.paths[0]), TypeRef::ImplTrait(&v.bounds)]).freeze_into();
+            columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0])), TypeRef::ImplTrait(&v.bounds)])
+                .freeze_into();
         columns.extra[1] = v.bounds.len() as u32 + 1;
         assert_eq!(columns.check(0, 0, 1), Err(BOUNDS));
 
-        let mut columns = columns_of(&[TypeRef::Path(&v.paths[0])]).freeze_into();
+        let binder = [TypeBound::ForLifetime(Names { start: 0, len: 2 }, PathId(t(0)))];
+        let columns =
+            columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0])), TypeRef::ImplTrait(&binder)])
+                .freeze_into();
+        assert_eq!(columns.check(0, 0, 0), Err("a name run past its table"));
+
+        let mut columns = columns_of(&[TypeRef::Path(Path::BarePath(&v.mod_paths[0]))]).freeze_into();
         columns.data[0] = 1;
         assert_eq!(columns.check(0, 0, 0), Err(PATH));
 

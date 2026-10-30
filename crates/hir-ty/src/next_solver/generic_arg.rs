@@ -19,6 +19,7 @@ use rustc_type_ir::{
     walk::TypeWalker,
 };
 
+use crate::db::HirDatabase;
 use crate::next_solver::{
     impl_foldable_for_interned_slice, impl_foldable_for_stored_type, interned_slice,
     interner::table,

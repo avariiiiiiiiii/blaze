@@ -28,7 +28,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use ide_db::{RootDatabase, base_db::SourceDatabase};
+use ide_db::RootDatabase;
 use syntax::Edition;
 
 use crate::plan::Selection;
@@ -1108,7 +1108,6 @@ fn add_crates(
 /// with `--extern`, whose files [`Asked::key`] stamps; blaze's own run names none, and
 /// compiles them from these.
 fn built_from(db: &RootDatabase, library: ide_db::base_db::Crate) -> String {
-    use ide_db::base_db::SourceDatabase as _;
     use sha2::{Digest as _, Sha256};
     let mut crates: Vec<String> = library
         .transitive_deps(db)
@@ -1295,7 +1294,7 @@ fn run(
     });
     let ended: Mutex<Vec<(usize, anyhow::Result<Ended>)>> = Mutex::new(Vec::new());
     let counted = Counted::default();
-    // The examples are compiled a few at a time on snapshots of the database (a small
+    // The examples are compiled a few at a time on the one shared database (a small
     // program's build leaves most cores idle), and each is linked, run and removed as soon as
     // it is compiled.
     let (ready, next) = std::sync::mpsc::channel::<(usize, Result<Ours, String>)>();
@@ -1345,7 +1344,7 @@ fn run(
         }
         let compilers: Vec<_> = (0..compilers)
             .map(|_| {
-                let (db, ready, ours) = (db.clone(), ready.clone(), &ours);
+                let (ready, ours) = (ready.clone(), &ours);
                 let unit = unit.as_deref();
                 let (tests, counted, built_from) = (&tests, &counted, &built_from);
                 scope.spawn(move || {
@@ -1354,7 +1353,7 @@ fn run(
                         let job = ours.lock().unwrap_or_else(|it| it.into_inner()).next();
                         let Some((at, name)) = job else { break };
                         let test = &tests[at];
-                        let compiled = compile(&db, building, asked, test, name, unit, built_from);
+                        let compiled = compile(db, building, asked, test, name, unit, built_from);
                         if let Ok(Ours::Linked(_)) = &compiled {
                             counted.remembered.fetch_add(1, Ordering::Relaxed);
                         }

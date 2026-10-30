@@ -28,6 +28,7 @@ mod dylib;
 mod scope;
 mod server_impl;
 mod token_stream;
+mod wire;
 
 use std::{
     collections::hash_map::Entry,

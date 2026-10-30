@@ -58,6 +58,7 @@ macro_rules! define_symbols {
                 #[cold]
                 #[inline(never)]
                 fn create(idx: usize) -> Symbol {
+                    // alloc: cold: an index past the list's compiled-in names
                     Symbol::intern(&format!("{}{idx}", $list_prefix))
                 }
 

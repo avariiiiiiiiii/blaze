@@ -4,6 +4,7 @@
 //! scope names the call it was inlined at, a span of the body it was inlined into. That is
 //! what rustc's inlined `SourceScope`s say, with `inlined` and `inlined_parent_scope`.
 
+use base_db::Db;
 use crate::{
     InferBodyId,
     db::HirDatabase,
@@ -11,7 +12,7 @@ use crate::{
 };
 
 /// The body whose expression store the spans of an inlined callee are of.
-pub fn owner_of<'db>(db: &'db dyn HirDatabase, callee: InlinedBody<'db>) -> InferBodyId<'db> {
+pub fn owner_of<'db>(db: &'db Db, callee: InlinedBody<'db>) -> InferBodyId<'db> {
     match callee {
         InlinedBody::Fn(func) => func.into(),
         InlinedBody::Closure(closure) => closure.loc(db).owner,
@@ -21,7 +22,7 @@ pub fn owner_of<'db>(db: &'db dyn HirDatabase, callee: InlinedBody<'db>) -> Infe
 /// The body `span` of `body` is written in, and the span there, which is never
 /// [`MirSpan::Inlined`].
 pub fn source_span<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
     span: MirSpan,
 ) -> (InferBodyId<'db>, MirSpan) {
@@ -39,7 +40,7 @@ pub fn source_span<'db>(
 /// and the `overflow_checks` intrinsic) at `span` are written checked, as
 /// [`overflow::body_written_checked`] says of a body: of an inlined one, the body it was
 /// written in decides, as before it was inlined.
-pub fn written_checked_at(db: &dyn HirDatabase, body: &MirBody<'_>, span: MirSpan) -> bool {
+pub fn written_checked_at(db: &Db, body: &MirBody<'_>, span: MirSpan) -> bool {
     match span {
         MirSpan::Inlined(at) => {
             let scope = body.inlined.scopes[body.inlined.spans[at as usize].scope as usize];
@@ -63,7 +64,7 @@ pub enum CallerLocation<'db> {
 /// callee it was inlined from, to the call, and out of the innermost callee that is not.
 /// `tracked` says the body's own function is `#[track_caller]`.
 pub fn caller_location<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
     span: MirSpan,
     tracked: bool,

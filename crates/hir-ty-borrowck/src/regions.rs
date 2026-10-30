@@ -8,6 +8,8 @@
 //! where a loan of that region is in scope. A universal region made to outlive another the
 //! signature does not say it outlives is rustc's "lifetime may not live long enough".
 
+use hir_ty::db::HirDatabase;
+use base_db::Db;
 use blaze_ids::radix;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, GenericDefId, ItemContainerId, Lookup as _,
@@ -289,7 +291,7 @@ fn projections<'db>(ty: Ty<'db>) -> Vec<(hir_ty::next_solver::SolverDefId<'db>, 
 /// `impl Trait` there (a GAT of the trait) invariantly in all of them, whatever `use<..>` says.
 /// `None` where this does not work it out, which counts every argument captured.
 pub(super) fn opaque_captures<'db>(
-    db: &'db dyn hir_ty::db::HirDatabase,
+    db: &'db Db,
     opaque: OpaqueTyIdWrapper<'db>,
     len: usize,
 ) -> Option<Vec<bool>> {
@@ -584,9 +586,9 @@ fn names_closure(ty: Ty<'_>) -> bool {
 
 /// Whether `ty` names a lifetime other than in the arguments an `impl Trait` in it does not
 /// capture: `impl Sized` in edition 2021 names none of its function's.
-fn names_captured_lifetime<'db>(db: &dyn hir_ty::db::HirDatabase, ty: Ty<'db>) -> bool {
+fn names_captured_lifetime<'db>(db: &Db, ty: Ty<'db>) -> bool {
     struct Find<'d> {
-        db: &'d dyn hir_ty::db::HirDatabase,
+        db: &'d Db,
         found: bool,
     }
     impl<'db> rustc_type_ir::TypeVisitor<hir_ty::next_solver::DbInterner<'db>> for Find<'_> {
@@ -620,7 +622,7 @@ fn names_captured_lifetime<'db>(db: &dyn hir_ty::db::HirDatabase, ty: Ty<'db>) -
 /// `impl Cap<'a> + Cap<'b>`: no `+ 'a`, and no associated type that names one. Nested in a
 /// returned one's `Item = ..`, it adds nothing the returned one's member constraints need.
 fn unbounded_opaque<'db>(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     interner: hir_ty::next_solver::DbInterner<'db>,
     ty: Ty<'db>,
 ) -> bool {
@@ -642,13 +644,13 @@ fn unbounded_opaque<'db>(
 /// constraints: not those of a closure's parent arguments, nor an `impl Trait`'s arguments
 /// it does not capture.
 fn member_regions<'db>(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     ty: Ty<'db>,
     aliases: bool,
     out: &mut Vec<Rv>,
 ) {
     struct Collect<'o, 'd> {
-        db: &'d dyn hir_ty::db::HirDatabase,
+        db: &'d Db,
         aliases: bool,
         out: &'o mut Vec<Rv>,
     }
@@ -2229,17 +2231,7 @@ impl<'db> Builder<'_, '_, 'db> {
     }
 
     fn path_binding(&self, expr: hir_def::hir::ExprId) -> Option<hir_def::hir::BindingId> {
-        use hir_def::resolver::{HasResolver, ValueNs};
-        let hir_def::hir::Expr::Path(path) = self.ctx.store.expr(expr) else { return None };
-        let db = self.ctx.db;
-        let owner = self.body.owner;
-        let mut resolver = owner.resolver(db);
-        let _guard = resolver.update_to_inner_scope(db, owner.expression_store_owner(db), expr);
-        let hygiene = self.ctx.store.expr_path_hygiene(expr);
-        match resolver.resolve_path_in_value_ns_fully(db, path, hygiene)? {
-            ValueNs::LocalBinding(binding) => Some(binding),
-            _ => None,
-        }
+        path_binding(self.ctx, self.body, expr)
     }
 
     /// The constraints the type `ty` holds being well-formed: in `&'a T` that `T: 'a`, and
@@ -4518,7 +4510,7 @@ impl<'db> Builder<'_, '_, 'db> {
             let _ = ocx.try_evaluate_obligations();
             in_projection
                 .iter()
-                .map(|&hole| (hole, infcx.resolve_vars_if_possible(hole)))
+                .map(|&hole| (hole, infcx.deeply_resolve_ignoring_regions(hole)))
                 .filter(|(_, it)| !it.has_non_region_infer() && !it.references_error())
                 .collect()
         });
@@ -6422,7 +6414,7 @@ fn constraint_pairs<'db>(
 /// same environment, and an edit proves again only the goals of what it changes.
 #[salsa::tracked(returns(ref))]
 fn prove_query(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
     trait_ref: hir_ty::next_solver::StoredTraitRef,
     vars: u32,
@@ -6468,7 +6460,7 @@ fn prove_query(
         RegionKind::RePlaceholder(placeholder) => {
             universes = universes.max(placeholder.universe.as_u32());
         }
-        RegionKind::ReVar(vid) if vid.as_u32() >= vars => match constraints.probe_value(vid) {
+        RegionKind::ReVar(vid) if vid.as_u32() >= vars => match constraints.try_resolve_region_var(vid) {
             Err(universe) if universe != rustc_type_ir::UniverseIndex::ROOT => {
                 universes = universes.max(universe.as_u32());
                 in_universe.insert(vid.as_u32(), universe.as_u32());
@@ -6510,7 +6502,7 @@ fn prove_query(
 /// the body writes `dyn Trait + 'static` somewhere, where it may be that, or the trait's
 /// bounds say `'static`, as rustc's `compute_object_lifetime_bound`.
 struct ObjectDefaults<'db> {
-    db: &'db dyn hir_ty::db::HirDatabase,
+    db: &'db Db,
     interner: hir_ty::next_solver::DbInterner<'db>,
     keep_static: bool,
     /// In a body, where the lifetime is inferred rather than `'static`.
@@ -6599,7 +6591,7 @@ impl<'db> rustc_type_ir::TypeFolder<hir_ty::next_solver::DbInterner<'db>> for Re
 
 /// Whether `trait_` or one of its supertraits is bounded by `'static`, so that its object
 /// type's lifetime defaults to that and each type implementing it outlives it.
-fn static_trait(db: &dyn hir_ty::db::HirDatabase, trait_: hir_def::TraitId) -> bool {
+fn static_trait(db: &Db, trait_: hir_def::TraitId) -> bool {
     hir_ty::utils::all_super_traits(db, trait_).iter().any(|&it| {
         GenericPredicates::query_all(db, it.into()).skip_binder().any(|clause| {
             matches!(clause.kind().skip_binder(),
@@ -6697,7 +6689,7 @@ fn writes_elided(
 /// none of its lifetimes, one for `S2` of `type S2<'a> = S<'a, 'a>` though its type has it
 /// twice. `None` where that is not known (`dyn Trait`, `impl Trait`, `Self`, associated types).
 fn elided_lifetimes(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     resolver: &hir_def::resolver::Resolver<'_>,
     store: &hir_def::expr_store::ExpressionStore,
     ty: hir_def::hir::type_ref::TypeRefId,
@@ -6778,7 +6770,7 @@ fn writes_static_object(store: &hir_def::expr_store::ExpressionStore) -> bool {
 /// `T::f`, not through its trait alone, `Default::default`: rustc gives it a user type
 /// annotation whose generic arguments, and an inherent impl's self type, must be well-formed.
 fn names_through_type(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     path: &hir_def::expr_store::path::Path,
     container: ItemContainerId,
 ) -> bool {
@@ -6839,13 +6831,32 @@ fn returned_opaque<'db>(
     find(output, ty)
 }
 
+/// The variable the path `expr` names, if it names one.
+pub(super) fn path_binding(
+    ctx: &Ctx<'_, '_>,
+    body: &MirBody<'_>,
+    expr: hir_def::hir::ExprId,
+) -> Option<hir_def::hir::BindingId> {
+    use hir_def::resolver::{HasResolver, ValueNs};
+    let hir_def::hir::Expr::Path(path) = ctx.store.expr(expr) else { return None };
+    let db = ctx.db;
+    let owner = body.owner;
+    let mut resolver = owner.resolver(db);
+    let _guard = resolver.update_to_inner_scope(db, owner.expression_store_owner(db), expr);
+    let hygiene = ctx.store.expr_path_hygiene(expr);
+    match resolver.resolve_path_in_value_ns_fully(db, path, hygiene)? {
+        ValueNs::LocalBinding(binding) => Some(binding),
+        _ => None,
+    }
+}
+
 pub(super) fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {
     path.type_anchor().is_some()
         || path.generic_args().is_some_and(|args| args.iter().any(Option::is_some))
 }
 
 pub(super) fn adt_variants(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     adt: AdtId,
 ) -> Vec<hir_def::VariantId> {
     match adt {
@@ -7184,12 +7195,12 @@ fn canonical_regions<'db, T: rustc_type_ir::TypeFoldable<hir_ty::next_solver::Db
         let RegionKind::ReVar(vid) = region.kind() else { return region };
         let mut inner = ctx.infcx.inner.borrow_mut();
         let mut constraints = inner.unwrap_region_constraints();
-        let resolved = constraints.opportunistic_resolve_var(interner, vid);
+        let resolved = constraints.shallow_resolve_region_var(interner, vid);
         let RegionKind::ReVar(root) = resolved.kind() else {
             here |= resolved.is_placeholder();
             return resolved;
         };
-        here |= constraints.probe_value(root) != Err(rustc_type_ir::UniverseIndex::ROOT);
+        here |= constraints.try_resolve_region_var(root) != Err(rustc_type_ir::UniverseIndex::ROOT);
         let at = vars.iter().position(|&it| it == resolved).unwrap_or_else(|| {
             vars.push(resolved);
             vars.len() - 1
@@ -7295,7 +7306,7 @@ enum Normalized {
 /// edit.
 #[salsa::tracked(returns(ref))]
 fn normalize_query(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
     ty: StoredTy,
     vars: u32,
@@ -7318,7 +7329,7 @@ fn normalize_query(
     else {
         return Normalized::Fails;
     };
-    let normalized = infcx.resolve_vars_if_possible(normalized);
+    let normalized = infcx.deeply_resolve_ignoring_regions(normalized);
     if normalized.has_non_region_infer() || normalized.has_placeholders() {
         return Normalized::Here;
     }
@@ -7329,7 +7340,7 @@ fn normalize_query(
         RegionKind::RePlaceholder(_) => false,
         RegionKind::ReVar(vid) => {
             vid.as_u32() < vars
-                || constraints.probe_value(vid) == Err(rustc_type_ir::UniverseIndex::ROOT)
+                || constraints.try_resolve_region_var(vid) == Err(rustc_type_ir::UniverseIndex::ROOT)
         }
         _ => true,
     };

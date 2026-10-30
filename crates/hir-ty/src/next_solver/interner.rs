@@ -8,7 +8,7 @@ use rustc_ast_ir::{FloatTy, IntTy, UintTy};
 pub use tls_cache::clear_tls_solver_cache;
 pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AdtId, CallableDefId, EnumId, GenericDefId, GenericParamId, HasModule, ItemContainerId,
     StructId, TraitId, TypeAliasId, UnionId, VariantId,
@@ -391,7 +391,7 @@ pub trait WorldExposer {
 
 #[derive(Debug, Copy, Clone)]
 pub struct DbInterner<'db> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     krate: Option<Crate>,
     lang_items: Option<&'db LangItems>,
     /// The crate's `#![recursion_limit]`, or rustc's default. The solver asks for it with every
@@ -415,7 +415,7 @@ impl<'db> DbInterner<'db> {
     /// As a rule of thumb, when you create an `InferCtxt`, you need to provide the crate (and the block).
     ///
     /// Elaboration is a special kind: it needs lang items (for `Sized`), therefore it needs `new_with()`.
-    pub fn new_no_crate(db: &'db dyn HirDatabase) -> Self {
+    pub fn new_no_crate(db: &'db Db) -> Self {
         DbInterner {
             db,
             krate: None,
@@ -426,7 +426,7 @@ impl<'db> DbInterner<'db> {
         }
     }
 
-    pub fn new_with(db: &'db dyn HirDatabase, krate: Crate) -> DbInterner<'db> {
+    pub fn new_with(db: &'db Db, krate: Crate) -> DbInterner<'db> {
         DbInterner {
             db,
             krate: Some(krate),
@@ -451,7 +451,7 @@ impl<'db> DbInterner<'db> {
     }
 
     #[inline]
-    pub fn db(&self) -> &'db dyn HirDatabase {
+    pub fn db(&self) -> &'db Db {
         self.db
     }
 
@@ -744,7 +744,7 @@ impl AdtDef {
     }
 
     #[inline]
-    pub fn repr(self, db: &dyn HirDatabase) -> ReprOptions {
+    pub fn repr(self, db: &Db) -> ReprOptions {
         if self.flags().contains(AdtFlags::HAS_REPR) {
             AttrFlags::repr_assume_has(db, self.def_id()).unwrap_or_default()
         } else {
@@ -1652,10 +1652,9 @@ impl<'db> Interner for DbInterner<'db> {
     > {
         let db = self.db();
         let of = |def: GenericDefId| {
-            crate::effects::effect_trait_refs(
+            either::Either::Left(crate::effects::effect_trait_refs(
                 crate::lower::const_conditions(db, def).skip_binder().iter().copied(),
-            )
-            .collect()
+            ))
         };
         EarlyBinder::bind(self, match def_id {
             SolverDefId::FunctionId(it) => of(it.into()),
@@ -1667,10 +1666,10 @@ impl<'db> Interner for DbInterner<'db> {
             {
                 of(closure.loc(db).owner.generic_def(db))
             }
-            SolverDefId::BuiltinDeriveImplId(it) => {
-                crate::effects::builtin_derive_const_conditions(db, it)
-            }
-            _ => Vec::new(),
+            SolverDefId::BuiltinDeriveImplId(it) => either::Either::Right(
+                crate::effects::builtin_derive_const_conditions(db, it).into_iter(),
+            ),
+            _ => either::Either::Right(Default::default()),
         })
     }
 
@@ -2297,7 +2296,7 @@ impl<'db> Interner for DbInterner<'db> {
         return SolverDefIds::new_from_slice(&result);
 
         struct CoroutinesVisitor<'a, 'db> {
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             owner: InferBodyId<'db>,
             store: &'db ExpressionStore,
             coroutines: &'a mut Vec<SolverDefId<'db>>,
@@ -2342,17 +2341,18 @@ impl<'db> Interner for DbInterner<'db> {
         impl IntoIterator<Item = rustc_type_ir::Binder<Self, rustc_type_ir::TraitRef<Self>>>,
     > {
         // A trait's `[const]` supertraits. FIXME: an associated type's `[const]` item bounds.
-        let SolverDefId::TraitId(trait_) = def_id else {
-            return EarlyBinder::bind(self, Vec::new());
+        let trait_ = match def_id {
+            SolverDefId::TraitId(trait_) => Some(trait_),
+            _ => None,
         };
-        let conditions = crate::lower::const_conditions(self.db(), trait_.into()).skip_binder();
+        let conditions = trait_.map_or(&[][..], |trait_| {
+            crate::lower::const_conditions(self.db(), trait_.into()).skip_binder()
+        });
         EarlyBinder::bind(
             self,
-            crate::effects::effect_trait_refs(conditions.iter().copied())
-                .filter(|it| {
-                    it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())
-                })
-                .collect(),
+            crate::effects::effect_trait_refs(conditions.iter().copied()).filter(move |it| {
+                Some(it.skip_binder().def_id.0) != trait_ && is_ty_self(it.skip_binder().self_ty())
+            }),
         )
     }
 
@@ -2738,7 +2738,7 @@ impl<'db> DbInterner<'db> {
 }
 
 fn generic_predicates_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def_id: SolverDefId<'db>,
 ) -> &'db GenericPredicates {
     match def_id {
@@ -2835,19 +2835,19 @@ mod tls_db {
     use crate::db::HirDatabase;
 
     struct Attached {
-        database: Cell<Option<NonNull<dyn HirDatabase>>>,
+        database: Cell<Option<NonNull<Db>>>,
     }
 
     impl Attached {
         #[inline]
-        fn attach<R>(&self, db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
+        fn attach<R>(&self, db: &Db, op: impl FnOnce() -> R) -> R {
             struct DbGuard<'s> {
                 state: Option<&'s Attached>,
             }
 
             impl<'s> DbGuard<'s> {
                 #[inline]
-                fn new(attached: &'s Attached, db: &dyn HirDatabase) -> Self {
+                fn new(attached: &'s Attached, db: &Db) -> Self {
                     match attached.database.get() {
                         Some(current_db) => {
                             let new_db = NonNull::from(db);
@@ -2883,15 +2883,15 @@ mod tls_db {
         }
 
         #[inline]
-        fn attach_allow_change<R>(&self, db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
+        fn attach_allow_change<R>(&self, db: &Db, op: impl FnOnce() -> R) -> R {
             struct DbGuard<'s> {
                 state: &'s Attached,
-                prev: Option<NonNull<dyn HirDatabase>>,
+                prev: Option<NonNull<Db>>,
             }
 
             impl<'s> DbGuard<'s> {
                 #[inline]
-                fn new(attached: &'s Attached, db: &dyn HirDatabase) -> Self {
+                fn new(attached: &'s Attached, db: &Db) -> Self {
                     let prev = attached.database.replace(Some(NonNull::from(db)));
                     Self { state: attached, prev }
                 }
@@ -2909,7 +2909,7 @@ mod tls_db {
         }
 
         #[inline]
-        fn with<R>(&self, op: impl FnOnce(&dyn HirDatabase) -> R) -> R {
+        fn with<R>(&self, op: impl FnOnce(&Db) -> R) -> R {
             let db = self.database.get().expect("Tried to use attached db, but no db is attached");
 
             // SAFETY: `database` holds a pointer only while the `DbGuard` that set it is alive,
@@ -2925,17 +2925,17 @@ mod tls_db {
     }
 
     #[inline]
-    pub fn attach_db<R>(db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
+    pub fn attach_db<R>(db: &Db, op: impl FnOnce() -> R) -> R {
         GLOBAL_DB.with(|global_db| global_db.attach(db, op))
     }
 
     #[inline]
-    pub fn attach_db_allow_change<R>(db: &dyn HirDatabase, op: impl FnOnce() -> R) -> R {
+    pub fn attach_db_allow_change<R>(db: &Db, op: impl FnOnce() -> R) -> R {
         GLOBAL_DB.with(|global_db| global_db.attach_allow_change(db, op))
     }
 
     #[inline]
-    pub fn with_attached_db<R>(op: impl FnOnce(&dyn HirDatabase) -> R) -> R {
+    pub fn with_attached_db<R>(op: impl FnOnce(&Db) -> R) -> R {
         GLOBAL_DB.with(
             #[inline]
             |a| a.with(op),
@@ -3319,49 +3319,99 @@ pub(crate) mod table {
     /// an empty slot, as rows start at 1). A hit is loads alone; an insert takes the shard's
     /// lock, looks again and publishes the row with a release store. A table that grows is
     /// copied and the old one leaked, as a reader may still be probing it.
+    ///
+    /// A hit is three dependent loads: the shard's word, the slot, and the row's kind for the
+    /// equality check. The shard's word holds the table's address and the log2 of its length
+    /// together, so there is no header between the shard and the slot.
     struct Index {
         shards: [Shard; SHARDS],
     }
 
     struct Shard {
-        /// Null until the first insert; replaced only by the holder of `len`.
-        slots: AtomicPtr<Slots>,
+        /// Null until the first insert, then [`Slots::packed`]; replaced only by the holder of
+        /// `len`.
+        slots: AtomicPtr<AtomicU64>,
         /// How many rows the shard holds.
         len: Mutex<usize>,
     }
 
+    /// A shard's table is aligned to this, so the low bits of its address hold the log2 of its
+    /// length (at most 34, as a table holds at most twice 2^32 rows).
+    const SLOTS_ALIGN: usize = 64;
+    const LOG_LEN_MASK: usize = SLOTS_ALIGN - 1;
+
+    /// A shard's table, as its word names it: `len` zeroed `AtomicU64`s in one allocation that
+    /// is never freed.
+    #[derive(Clone, Copy)]
     struct Slots {
-        words: Box<[AtomicU64]>,
+        words: *mut AtomicU64,
+        mask: usize,
     }
 
     impl Slots {
-        fn new(len: usize) -> Slots {
-            Slots { words: (0..len).map(|_| AtomicU64::new(0)).collect() }
+        /// A zeroed table of `len` slots, a power of two of at least [`FIRST_SLOTS`].
+        fn allocate(len: usize) -> Slots {
+            assert!(len.is_power_of_two() && len >= FIRST_SLOTS);
+            let layout = Layout::array::<AtomicU64>(len)
+                .and_then(|layout| layout.align_to(SLOTS_ALIGN))
+                .expect("a shard's slots fit in memory");
+            // SAFETY: `layout` is not zero-sized: `len` is at least `FIRST_SLOTS`.
+            let words = unsafe { alloc::alloc_zeroed(layout) }.cast::<AtomicU64>();
+            if words.is_null() {
+                alloc::handle_alloc_error(layout);
+            }
+            Slots { words, mask: len - 1 }
+        }
+
+        /// The shard's pointer to this table: its address, whose low bits are 0 by
+        /// [`SLOTS_ALIGN`], with the log2 of its length in them (`map_addr` keeps the
+        /// allocation's provenance).
+        fn packed(self) -> *mut AtomicU64 {
+            let log_len = self.len().trailing_zeros() as usize;
+            self.words.map_addr(|addr| addr | log_len)
+        }
+
+        /// The table a shard's pointer names, `None` for null.
+        #[inline]
+        fn unpack(packed: *mut AtomicU64) -> Option<Slots> {
+            (!packed.is_null()).then(|| Slots {
+                words: packed.map_addr(|addr| addr & !LOG_LEN_MASK),
+                mask: (1 << (packed.addr() & LOG_LEN_MASK)) - 1,
+            })
+        }
+
+        fn len(self) -> usize {
+            self.mask + 1
         }
 
         #[inline]
-        fn find(&self, hash: u32, mut same: impl FnMut(NonZeroU32) -> bool) -> Option<NonZeroU32> {
-            let mask = self.words.len() - 1;
-            let mut at = hash as usize & mask;
+        fn word(self, at: usize) -> &'static AtomicU64 {
+            // SAFETY: `at & mask` is below the table's length, its allocation is never freed,
+            // and it was zeroed, which is a valid `AtomicU64`.
+            unsafe { &*self.words.add(at & self.mask) }
+        }
+
+        #[inline]
+        fn find(self, hash: u32, mut same: impl FnMut(NonZeroU32) -> bool) -> Option<NonZeroU32> {
+            let mut at = hash as usize;
             loop {
-                let word = self.words[at].load(Ordering::Acquire);
+                let word = self.word(at).load(Ordering::Acquire);
                 let row = NonZeroU32::new(word as u32)?;
                 if (word >> 32) as u32 == hash && same(row) {
                     return Some(row);
                 }
-                at = (at + 1) & mask;
+                at += 1;
             }
         }
 
         /// Puts `word` in the first empty slot from its hash's. Only the holder of the shard's
         /// lock calls it, on a table with an empty slot.
-        fn put(&self, word: u64) {
-            let mask = self.words.len() - 1;
-            let mut at = (word >> 32) as usize & mask;
-            while self.words[at].load(Ordering::Relaxed) != 0 {
-                at = (at + 1) & mask;
+        fn put(self, word: u64) {
+            let mut at = (word >> 32) as usize;
+            while self.word(at).load(Ordering::Relaxed) != 0 {
+                at += 1;
             }
-            self.words[at].store(word, Ordering::Release);
+            self.word(at).store(word, Ordering::Release);
         }
     }
 
@@ -3398,9 +3448,9 @@ pub(crate) mod table {
             hash: u64,
             same: impl FnMut(NonZeroU32) -> bool,
         ) -> Option<NonZeroU32> {
-            let slots = self.shard(hash).slots.load(Ordering::Acquire);
-            // SAFETY: a published table is never freed.
-            unsafe { slots.as_ref() }?.find(hash as u32, same)
+            // The acquire load pairs with `Vacant::insert`'s release store of a grown table, so
+            // its copied slots read as written.
+            Slots::unpack(self.shard(hash).slots.load(Ordering::Acquire))?.find(hash as u32, same)
         }
 
         /// The row of hash `hash` that `same` accepts, looked for again under its shard's lock,
@@ -3419,25 +3469,23 @@ pub(crate) mod table {
         /// Publishes `row`, written in full, for the hash, and releases the shard's lock.
         fn insert(mut self, row: NonZeroU32) {
             let len = *self.len + 1;
-            let mut slots = self.shard.slots.load(Ordering::Relaxed);
-            // SAFETY: a published table is never freed.
-            let capacity = unsafe { slots.as_ref() }.map_or(0, |slots| slots.words.len());
+            let mut slots = Slots::unpack(self.shard.slots.load(Ordering::Relaxed));
+            let capacity = slots.map_or(0, Slots::len);
             if len * 2 > capacity {
-                let grown = Slots::new((capacity * 2).max(FIRST_SLOTS));
-                // SAFETY: as above.
-                if let Some(old) = unsafe { slots.as_ref() } {
-                    for word in &old.words {
-                        let word = word.load(Ordering::Relaxed);
+                let grown = Slots::allocate((capacity * 2).max(FIRST_SLOTS));
+                if let Some(old) = slots {
+                    for at in 0..old.len() {
+                        let word = old.word(at).load(Ordering::Relaxed);
                         if word != 0 {
                             grown.put(word);
                         }
                     }
                 }
-                slots = Box::into_raw(Box::new(grown));
-                self.shard.slots.store(slots, Ordering::Release);
+                self.shard.slots.store(grown.packed(), Ordering::Release);
+                slots = Some(grown);
             }
-            // SAFETY: `slots` is the shard's table, never freed.
-            unsafe { &*slots }.put((u64::from(self.hash) << 32) | u64::from(row.get()));
+            let slots = slots.expect("a shard has a table once it grew");
+            slots.put((u64::from(self.hash) << 32) | u64::from(row.get()));
             *self.len = len;
         }
     }
@@ -3863,11 +3911,13 @@ pub(crate) mod table {
             sync::Barrier,
         };
 
+        use std::sync::atomic::Ordering;
+
         use rustc_type_ir::{DebruijnIndex, INNERMOST, TypeFlags};
 
         use super::{
-            Erase, FIRST_BITS, Lists, RowInfo, Rows, SEGMENTS, Values, fit, locate, segment_len,
-            segment_start,
+            Erase, FIRST_BITS, FIRST_SLOTS, Lists, RowInfo, Rows, SEGMENTS, Slots, Values, fit,
+            locate, segment_len, segment_start,
         };
 
         macro_rules! erase_static {
@@ -3910,18 +3960,6 @@ pub(crate) mod table {
             }
         }
 
-        /// A sequence of pseudo-random numbers below `below` (xorshift), with repeats.
-        fn numbers(seed: u64, count: usize, below: u64) -> impl Iterator<Item = u64> {
-            let mut state = seed;
-            std::iter::repeat_with(move || {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state % below
-            })
-            .take(count)
-        }
-
         #[test]
         fn each_table_gives_the_rows_and_values_of_its_safe_reference() {
             static ROWS: Rows<(u32, u64)> = Rows::new("reference rows", 1 << 20);
@@ -3930,7 +3968,9 @@ pub(crate) mod table {
             let mut rows = Reference::new();
             let mut lists = Reference::new();
             let mut values = Reference::new();
-            for n in numbers(0x9e37_79b9_7f4a_7c15, 20_000, 3000) {
+            let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+            for _ in 0..20_000 {
+                let n = rng.below(3000);
                 let kind = ((n % 7) as u32, n * 0x1_0000_0001);
                 let row = ROWS.intern(kind, tagged(kind.0));
                 assert_eq!(row, rows.intern(kind));
@@ -4060,6 +4100,28 @@ pub(crate) mod table {
             static ROWS: Rows<u32> = Rows::new("tiny", 2);
             for value in 0u32..3 {
                 ROWS.intern(value, tagged(0));
+            }
+        }
+
+        #[test]
+        fn a_shard_pointer_gives_back_its_table_and_length() {
+            for len in [FIRST_SLOTS, FIRST_SLOTS * 2, 1 << 20] {
+                let table = Slots::allocate(len);
+                let back = Slots::unpack(table.packed()).expect("a table's pointer is not null");
+                assert_eq!(back.words, table.words);
+                assert_eq!(back.len(), len);
+                assert!((0..len).all(|at| back.word(at).load(Ordering::Relaxed) == 0));
+            }
+            assert!(Slots::unpack(std::ptr::null_mut()).is_none());
+        }
+
+        #[test]
+        fn a_shard_that_grows_keeps_every_row() {
+            static ROWS: Rows<u32> = Rows::new("growing", 1 << 16);
+            let rows: Vec<_> = (0u32..5000).map(|value| ROWS.intern(value, tagged(0))).collect();
+            for (value, &row) in (0u32..5000).zip(&rows) {
+                assert_eq!(ROWS.intern(value, tagged(0)), row);
+                assert_eq!(ROWS.kind::<u32>(row), value);
             }
         }
 

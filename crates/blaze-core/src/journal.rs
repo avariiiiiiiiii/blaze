@@ -43,6 +43,28 @@ impl Names {
         self.push_unchecked(name);
     }
 
+    /// Of `bytes` laid out as a [`Names`] keeps them (each name's text and a NUL, one after
+    /// another) and where each name starts in them, for names checked as [`FileName`]s already
+    /// (a column of an image, checked as it was opened): one copy, nothing checked again.
+    pub fn from_checked(bytes: &[u8], starts: Vec<u32>) -> Names {
+        debug_assert!(
+            starts.is_empty() == bytes.is_empty()
+                && starts.first().is_none_or(|it| *it == 0)
+                && starts.iter().enumerate().all(|(at, &start)| {
+                    let end = starts.get(at + 1).map_or(bytes.len(), |&it| it as usize);
+                    let name = bytes.get(start as usize..end).unwrap_or_default();
+                    name.split_last().is_some_and(|(nul, name)| {
+                        *nul == 0
+                            && std::str::from_utf8(name)
+                                .is_ok_and(|it| FileName::new(it).is_some() && !it.contains('\0'))
+                    })
+                }),
+            "not names laid out as Names keeps them"
+        );
+        // alloc: one copy per sweep of a whole column.
+        Names { bytes: bytes.to_vec(), starts }
+    }
+
     /// `dir`, a `/`, then `rest`, if that is a name.
     pub fn push_joined(&mut self, dir: &str, rest: &str) -> bool {
         let start = self.bytes.len();
@@ -321,10 +343,14 @@ pub struct Journaled {
 #[cfg(target_os = "linux")]
 pub(crate) fn first_on_linux(dir: &FileName, since: &Cursor) -> crate::Done {
     let lost = match since {
+        // alloc: none: the first batch, with nothing in it.
         Cursor::None => Vec::new(),
+        // clone: once per watch, when a cursor was saved.
         _ => vec![(dir.clone(), Lost::NoJournal)],
     };
+    // alloc: once per batch the system told, handed to the asker.
     crate::Done::Journaled(Box::new(Journaled {
+        // alloc: none: no files in the first batch.
         files: Vec::new(),
         lost,
         cursor: Cursor::None,
@@ -337,8 +363,10 @@ pub(crate) fn first_on_linux(dir: &FileName, since: &Cursor) -> crate::Done {
 #[cfg(target_os = "linux")]
 pub(crate) fn live(dir: &FileName, done: crate::Done) -> crate::Done {
     match done {
+        // alloc: once per batch the system told, handed to the asker.
         crate::Done::Changed { files, lost } => crate::Done::Journaled(Box::new(Journaled {
             files,
+            // clone: only when the system dropped changes.
             lost: if lost { vec![(dir.clone(), Lost::Dropped)] } else { Vec::new() },
             cursor: Cursor::None,
             caught_up: true,
@@ -363,6 +391,9 @@ mod tests {
         assert_eq!(names.iter().collect::<Vec<_>>(), ["src/lib.rs", "src/main.rs", "Cargo.toml"]);
         assert_eq!(names.c_str(1).to_bytes(), b"src/main.rs");
         assert_eq!(names.with_nul(2), b"Cargo.toml\0");
+        let copied = Names::from_checked(&names.bytes, names.starts.clone());
+        assert_eq!(copied, names);
+        assert_eq!(Names::from_checked(&[], Vec::new()), Names::default());
     }
 
     #[test]

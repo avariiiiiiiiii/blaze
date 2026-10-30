@@ -1,6 +1,6 @@
 use std::{convert::Infallible, ops::ControlFlow};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::{
     Lookup,
     attrs::{AstKeyValueMetaExt, AstPathExt},
@@ -22,7 +22,7 @@ use super::{
 };
 use crate::{
     AdtId, AttrDefId, FieldId, FunctionId, ModuleDefId, VariantId, nameres::crate_def_map,
-    src::HasSource, test_db::TestDB,
+    src::HasSource, test_db::{TestDB, TestDBExt},
 };
 
 #[test]
@@ -536,7 +536,7 @@ fn gated_queries_read_what_the_source_says() {
 
     for (name, func) in &functions {
         let owner = AttrDefId::from(*func);
-        type Read = fn(&dyn SourceDatabase, AttrDefId) -> Option<Symbol>;
+        type Read = fn(&Db, AttrDefId) -> Option<Symbol>;
         for (query, read) in [
             ("export_name", AttrFlags::export_name as Read),
             ("link_name", AttrFlags::link_name as Read),
@@ -1023,7 +1023,7 @@ mod stability {
         },
         expr_store::Body,
         nameres::crate_def_map,
-        test_db::TestDB,
+        test_db::{TestDB, TestDBExt},
     };
 
     fn attr_def(def: ModuleDefId) -> AttrDefId {

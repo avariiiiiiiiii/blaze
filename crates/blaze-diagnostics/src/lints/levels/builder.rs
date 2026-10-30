@@ -742,6 +742,8 @@ pub(super) fn root_file(cx: &crate::cx::Cx<'_, '_>) -> Option<HirFileId> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     const ALL_LEVELS: [Level; LEVELS] =
@@ -763,15 +765,7 @@ mod tests {
 
     #[test]
     fn bitsets_find_what_the_scan_finds() {
-        // A splitmix64 stream: seeded, so a failure reproduces.
-        let mut state = 0x6c65_7665_6c73u64;
-        let mut next = move || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
+        let mut rng = SplitMix64::new(0x6c65_7665_6c73);
         let ids: Vec<LintId> = registry::lints()
             .iter()
             .chain(registry::blaze_lints())
@@ -780,7 +774,7 @@ mod tests {
             .map(|it| it.id())
             .collect();
         // Few lints named, so that sets name the same ones and many are named nowhere.
-        let pool: Vec<LintId> = (0..24).map(|_| ids[(next() % ids.len() as u64) as usize]).collect();
+        let pool: Vec<LintId> = (0..24).map(|_| ids[rng.index(ids.len())]).collect();
         let mut source = 0u32;
         let mut spec = |level: Level| {
             source += 1;
@@ -788,8 +782,8 @@ mod tests {
         };
         let mut levels = Levels::empty(true, false, 0);
         for _ in 0..40 {
-            let id = pool[(next() % pool.len() as u64) as usize];
-            let level = ALL_LEVELS[(next() % LEVELS as u64) as usize];
+            let id = pool[rng.index(pool.len())];
+            let level = ALL_LEVELS[rng.index(LEVELS)];
             levels.insert(COMMAND_LINE, id, spec(level));
         }
         for &id in &ids {
@@ -800,11 +794,11 @@ mod tests {
         }
         let mut sets = vec![COMMAND_LINE];
         for _ in 0..300 {
-            let parent = sets[(next() % sets.len() as u64) as usize];
+            let parent = sets[rng.index(sets.len())];
             let set = levels.open(parent);
-            for _ in 0..next() % 5 {
-                let id = pool[(next() % pool.len() as u64) as usize];
-                let level = ALL_LEVELS[(next() % LEVELS as u64) as usize];
+            for _ in 0..rng.below(5) {
+                let id = pool[rng.index(pool.len())];
+                let level = ALL_LEVELS[rng.index(LEVELS)];
                 levels.insert(set, id, spec(level));
             }
             let set = levels.close(set);

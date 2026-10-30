@@ -264,8 +264,8 @@
 //! a running query. There are no second handles to a database.
 //!
 //! Each *task* has its own query stack: a thread runs one task, or more when a work pool runs
-//! another job on a thread whose task waits (the job is a task above it). [`set_task_depth`]
-//! tells salsa which one runs. A task's reads are dependencies of its own queries only. A task
+//! another job on a thread whose task waits (the job is a task above it).
+//! [`Database::task_depth`] tells salsa which one runs. A task's reads are dependencies of its own queries only. A task
 //! that asks for a query a task below it on its thread runs unwinds with
 //! [`Cancelled::WouldWaitOnItself`]; a task that asks for one another thread runs waits for it.
 //!
@@ -365,7 +365,7 @@ pub use self::revision::Revision;
 pub use self::runtime::Runtime;
 pub use self::salsa_value::SalsaValue;
 pub use self::storage::Storage;
-pub use self::task::{TaskId, set_task_depth};
+pub use self::task::TaskId;
 pub use self::zalsa::IngredientIndex;
 pub use self::zalsa_local::CancellationToken;
 pub use crate::attach::{attach, attach_allow_change, with_attached_database};
@@ -423,7 +423,7 @@ pub mod plumbing {
     pub use crate::storage::{HasStorage, Storage};
     pub use crate::table::memo::MemoTableWithTypes;
     pub use crate::tracked_struct::{TrackedStructInDb, update_field};
-    pub use crate::views::DatabaseDownCaster;
+    pub use crate::views::{ConcreteView, DatabaseDownCaster};
     pub use crate::zalsa::{
         ErasedJar, HasJar, IngredientIndex, JarKind, Zalsa, ZalsaDatabase, register_jar,
         transmute_data_ptr, views,

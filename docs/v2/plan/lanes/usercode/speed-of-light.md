@@ -145,7 +145,7 @@ This is I/O bound, and the bound is the number of system calls.
   would cut the per-call cost. That is the daemon's effects (lane core), not this crate's
   std calls; request 2 moves runs' files to effects, and `stale` can follow it.
 - **Allocations.** A check that finds nothing stale allocates nothing for files and
-  variables: the path is built in a buffer the caller keeps across checks, and the lookups
+  variables: the path is built in the thread's path buffer, and the lookups
   return borrowed values (`a_fresh_run_is_checked_without_allocating` holds it to zero). A
   watched directory still allocates what std's `read_dir` does, its handle and a copy of its
   path, per directory; reading directories without allocating needs `getdents64` into a
@@ -189,15 +189,16 @@ What this crate allocates, by how long it lives, and the allocator each belongs 
 | what | lives | allocator |
 |---|---|---|
 | `Output`, `Env`, `Compile`, `Watched`: owned results | a kept run, a unit's build | the revision arena (request 7: one buffer with `u32` spans) |
-| elision's printed text and argument list | one read of a root file | the frame allocator, once callers hand one in |
-| `Rerun::stale`'s path | across checks | the caller's per-worker scratch |
+| elision's printed text | the caller's buffer, kept as the run's output | the caller's (`elide_into`), or the result's own (`elide`) |
+| elision's argument list, placeholder flags, normalized copy | one read of a root file | the task's frame (`frame::task(Tag::Usercode, ..)`), strings lent from the thread's shelf |
+| `Rerun::stale`'s path | one check | the thread's path buffer (`scratch::with_path`) |
 | messages, errors | when one is shown | the general-purpose allocator: the edge |
 
-No crate uses `blaze-mem` yet, and this crate's results are owned types its callers keep, so
-moving them onto an arena is a change of their shape with the callers (request 7). The paths
+Elision and the rerun check use `blaze-mem`; the owned results wait on request 7, since
+moving them onto an arena changes their shape for the callers. The paths
 that run in the warm loop already make no general-purpose allocation. Those are reading what
 was printed, lexing, a refused root file, the check that a kept run is fresh, a memo hit,
-environment lookups and the check of a run for errors, and the allocation-budget tests hold
+environment lookups, the check of a run for errors and a warm elision, and the allocation-budget tests hold
 each to zero.
 
 ### What `proof` measures
@@ -207,3 +208,358 @@ Each figure above, with its bound times 1.1 as the budget:
 - nanoseconds per unit of `env`, with the inherited environment sorted and not;
 - nanoseconds per refused root file, and cycles per byte of a root file read to the end;
 - system calls (strace's count) of `begin`, `Ran::finish` and `newest` over a fixed tree.
+
+## Tests: the queue and fork server, `crates/blaze-usercode/src/test.rs`, `test/`
+
+Written by speed-link-edge-sol-usercode. The fork server, the execution record, the wire, the
+queue and a suite's critical path, each with its arithmetic, are in
+[speed-of-light-tests.md](speed-of-light-tests.md) (usercode-fast-tests). This section takes the
+two components the bar names, counts system calls per test against cargo-nextest, and says what
+is left. Tests run in ix VMs, so the costs are speed-of-light-tests.md's: a cheap system call
+about 0.3 µs, `fork` of a 10 to 30 MB server about 50 µs (`T_fork`), the child's exit and reap
+about 10 µs (`T_exit`).
+
+**Workload.** One test binary of 600 unit tests, its server about 20 MB resident, on 16 cores,
+so up to `k = 15` other children of the same server in flight while one starts. Each test does
+nothing (the worst case for overhead) or runs about 100 µs to 1 ms (the common case).
+
+### A test from the queue to its result
+
+- **The bound, with a fork server:** one `fork` (its page tables, about 20 MB / 4 KiB × 8 bytes
+  = 40 KB copied, and later a 4 KiB copy for each page the test writes), the test's own time, the
+  exit, and one frame each way (shared by every test that ends in the same turn). The system
+  calls that can't be merged are 17 a test:
+  - the server: `socketpair`, `fork`, `setpgid` (both sides set it, so a kill sent at once finds
+    the group), `close` of the child's end, `ioctl` to make its end non-blocking, `pidfd_open`,
+    the read that sees end of file, `waitpid`, and two `close`s;
+  - the child: `setpgid`, two `dup2`, closing the server's descriptors, the scope mark's
+    `access`, the exit;
+  - the turn's `poll`, the `waitpid` that finds no more and one `write`, shared.
+
+  That is \(T_{fork} + T_{exit} + 17 \times 0.3\) µs = 50 + 10 + 5 = **65 µs + T**. The test's
+  thread (libtest runs every test on a thread named after it, so nextest pays it too) is part of
+  `T`.
+- **Without a fork server** (a package that opts out, and Windows, where there is no fork):
+  the binary runs whole as libtest's threads, one process per binary. The bound is one
+  `posix_spawn` or `CreateProcessW` per binary. It costs two today, since the sandbox's launcher
+  starts the binary; per binary that is about 1 ms on Linux, spread over its tests. On Windows
+  the second process is in the next section.
+- **Where the code was:** `19 + 2k` system calls a test. The child closes the server's socket,
+  its own read end, each of the `k` other children's output and pidfd one by one, then its own
+  write end. At `k = 15` that is 49 calls, 15 µs, so an empty test cost 75 µs: **16% over** the
+  bound (3% at `k = 1`). It is the one per-test cost here that grows with the machine. Copies:
+  the page tables and the pages written, as the bound; a test's output crosses five copies,
+  which is noise under 64 KiB (speed-of-light-tests.md, "The wire").
+- **What changes:** the child closes the server's descriptors with one `close_range` per gap in
+  the descriptors the program had when its server started (no program code runs in the server
+  after, so everything else is the server's). That is usually one gap, so 4 calls in the child
+  whatever `k` is. The exact edits, with a test of the ranges against a model, are in
+  `v2/requests/usercode-fast-tests.md` ("speed-link-edge-sol-usercode 1"), since the code is
+  usercode-fast-tests' while it runs. Tests still see exactly the descriptors they saw before.
+  macOS has no `close_range` and keeps the loop.
+- **Where it is with that:** 17 calls, 5 µs: an empty test at 65 µs, **at the bound**. Not
+  taken: `clone3` with `CLONE_PIDFD` would fold `pidfd_open` into the fork (one call, 0.5%), but
+  a raw `clone3` skips the C library's fork handlers. Rebuilding `poll`'s list each turn costs
+  about 20 ns a child, under 1%.
+
+Against **cargo-nextest**, which runs one process per test (`posix_spawn` of the binary with
+`--exact NAME`), counted for a dynamically linked Rust test binary on Linux. These counts are
+estimated from the code, not measured:
+
+| per test | blaze's fork server | cargo-nextest |
+|---|---|---|
+| system calls, parent | 10, plus the shared turn | about 15: two `pipe2`, the spawn, closes, `epoll_ctl`s, reads to end of file, the wait |
+| system calls, child | 6 | about 70: `execve`, the dynamic loader opening and mapping libc and libgcc_s, std's start (signal handlers, the alternate stack), libtest's arguments, the exit |
+| exec and linking | none: the binary started once | every test: the image mapped, its relocations applied |
+| pages copied | page tables (40 KB), then 4 KiB for each page the test writes | each relocated page of `.data.rel.ro` and the GOT, and every page the start touches, made fresh |
+| time before the test's code | about 65 µs | about 0.5 to 2 ms |
+
+So nextest pays about 5 times the system calls and 8 to 30 times the time per test. The fork
+server is the zygote pattern (Android's zygote, AFL++'s fork server): one start per binary,
+then a fork per test.
+
+### The queue
+
+- **The bound:** choosing a test and scheduling it should cost far less than a fork. That means
+  O(1) or O(log n) with no lock: the next test in the longest-first order whose server can take
+  it, an O(1) deadline insert, a slab slot for the attempt, and a 30-byte frame. That is about 300
+  instructions, about 0.1 µs at 3.5 GHz and an IPC of 3, plus what it must hand on (the
+  result's output, record and name).
+- **Where the code is:** at the bound. `schedule` pops `ready.first()`, a bitset over the
+  longest-first order with a cursor that only moves forward until a lower bit is set again, so a
+  pick is amortized O(1): one word load per 64 tests and one `tzcnt`. Deadlines are a timing
+  wheel, O(1) to insert and cancel. Attempts and tags are slabs with generational ids. The queue
+  is sans-IO, driven from one thread, with no lock and nothing shared. About 0.5 µs a test with
+  its 8 allocations, **under 1% of the fork**.
+- **What is left:** the 8 allocations, each owned by the result past the queue, go to 0 with a
+  run's results in its request arena (`v2/requests/usercode-fast-tests.md`, 13). One server forks
+  serially, so a binary starts at most about `1 / 55 µs` = 18,000 tests a second, which caps
+  short tests on many cores. `K` replicas of the server are asked for in the same file (7). Both
+  need cargo.
+
+**State of the art:** Android's zygote and AFL++'s fork server for the per-test start; nextest
+for process-per-test isolation, which this keeps at about a tenth of its cost; timing wheels
+(Varghese and Lauck) for deadlines.
+
+**What `proof` measures** (budget = bound × 1.1):
+- system calls per test (`strace -f -c` over a binary of 600 empty tests) at 1 and at 15
+  children in flight: at most 19;
+- wall time per empty test from `Run` sent to `Ended` read: at most \(1.1 \times (T_{fork} +
+  T_{exit} + 5\ \mu s)\), with `T_fork` and `T_exit` measured on the same VM;
+- the queue's nanoseconds per test with a fake driver: at most 0.55 µs.
+
+## Finding a kept result: `index::find`, `trace::Keyer`
+
+Workload: a build script's hit with 50 outside paths of about 60 bytes (headers), 10 view files,
+15 variables and a shape chain of one step. The key stream is about 50 × (1 + 8 + 60 + 1 + 32) +
+25 × 50 ≈ 6 KB. The shape is about 4 KB, read in place.
+
+The work, and its bound:
+- **Reading the shape:** 4 KB at 32 bytes a cycle is 125 cycles, plus two dependent store
+  lookups (the shape slot, then the result) of about 100 ns each when they miss the cache.
+  That is about 0.25 µs.
+- **Hashing the key:** BLAKE3 over 6 KB. Given 8 KiB at a time it hashes its 1 KiB chunks side
+  by side: about 0.5 cycles a byte with AVX2 and 0.3 with AVX-512, so 3,000 cycles, 0.9 µs.
+  Fed one tiny update per tag, length and name (about 300 a key), it compresses one 64-byte
+  block at a time at about 2 cycles a byte, plus about 25 cycles a call. That is 12,000 +
+  7,500 cycles, 5.6 µs, 6× the bound.
+- **Checking 50 outside paths:** each is a path id, one probe and three loads (see the next
+  section), about 15 ns warm and 50 ns cold. That is 0.75 to 2.5 µs.
+- **Checking 10 view files:** query edges the database already holds, about 50 ns each, so
+  0.5 µs.
+
+Speed of light: about 2.4 µs warm and 4 µs cold.
+
+The design:
+- **`Keyer` gathers entries in an 8 KiB stack buffer** and gives BLAKE3 the whole buffer
+  (applied 2026-10-29, with a test against one update per piece), so the hash is at its SIMD
+  rate.
+- **Nothing is allocated, and the shape is not copied:** see notes.md, Speed.
+- **In the way: a `stat` per outside path** until the daemon drives `blaze_vfs::Outside`
+  (v2/requests/requests-outside.md, 2, cargo's). That is 50 × 0.4 µs = 20 µs, 5 to 8× the
+  bound. When the daemon drives it, a check is three loads.
+
+## Checking an outside path: `inputs::Files::file`
+
+Bound per check, with nothing changed: find the path's record and confirm its directory heard
+nothing. That is one hash of about 60 bytes, one probe of a lock-free table (one cache line,
+two when cold) and three atomic loads (`Cover::unchanged_since`).
+- **The hash:** FxHash twice over 60 bytes is 2 × 8 multiplies, about 30 cycles, plus 60 bytes
+  compared against the stored path, about 5 cycles.
+- **The rest:** about 15 cycles warm, or 100 ns for a probe that misses the cache.
+
+Speed of light: about 15 ns warm.
+
+The design:
+- **The path id is two seeded FxHash passes**, mixed by splitmix64's finalizer, with the path
+  stored and compared on each find. A collision is looked at on the disk.
+  - This was BLAKE3, which costs about 250 cycles for 60 bytes, and that alone was 3 to 4× the
+    bound (changed 2026-10-29).
+  - It is a speed hash, not a content one, because the table never leaves the process.
+- **The answer is under a sequence lock:** two loads of the sequence and five words between
+  them.
+- **A file that changed** is hashed once per process, with BLAKE3 over 64 KiB reads, so the
+  bound is the device: a 100 KB header at 3 GB/s is 33 µs, and BLAKE3 at about 6 GB/s (AVX2)
+  hides under it.
+
+## Assembling what a run read: `trace::assemble_seen`
+
+Bound: each distinct name owned once, plus one check per input; the checks are bounded above.
+A line is one insert into an `FxHashSet<&str>`, about 30 cycles. A test of a fork server shares
+the server's lines (the queue keeps them once, `Server::common`). A proc macro's lines are
+hashed where they lie in the record's buffer, with no copy (`warm::Tracer`). The design is at
+the bound.
+
+## The sandbox: tracing, `crates/blaze-cargo/src/sandbox/`
+
+The bound for a run's tracing is that the traced run takes at most 10% more time than the
+untraced run. Every read must be seen, or the key would miss an input, so the irreducible
+part is one record of each distinct read.
+- **macOS:** an interposed call costs its own syscall, plus about 50 ns of the library's
+  (a lock-free dedup table, a working directory cached per thread). A new line costs one `write`
+  of about 0.2 µs.
+  - A C build script opening 500 headers and `stat`ing 3,000 paths then pays about
+    3,500 × 50 ns + 600 × 0.2 µs ≈ 0.3 ms, against a run of about 300 ms: 0.1%.
+- **Linux:** a traced call is a seccomp user notification. That is two context switches, with
+  `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP` putting the supervisor on the waiting thread's CPU, plus
+  `recv`, `process_vm_readv` and `send`: about 2.5 µs.
+  - The same script pays 3,500 × 2.5 µs ≈ 9 ms: 3%, within the bar.
+  - A configure-style script that `stat`s 100,000 paths in a 1 s run pays 0.25 s: 25%, past it.
+  - **In the way:** the notification round trip.
+  - **What would remove it:** the macOS design on Linux. An interposed library records
+    in-process, and the BPF filter lets calls through without a notification when
+    `seccomp_data.instruction_pointer` is inside the library's syscall stub. That brings a call
+    to about 50 ns.
+  - **Not done:** a program can jump into that stub with its own arguments, and read a file
+    untraced. The filesystem view and Landlock still confine it, so it can't escape, but its
+    result could be keyed without that read. The stub check has to be proven unforgeable first,
+    or the cost accepted for programs that do this.
+- **Starting a run:** `blaze sandbox --v2` is exec'd, and it starts the program, so a run costs
+  two execs. The launcher's is of blaze's own binary, about 1 ms of page faults. The bound is one
+  exec, the program's. The daemon can't fork the program itself, since it is multi-threaded and
+  the child would allocate.
+  - **What would remove it:** a warm, single-threaded launcher per daemon that forks per run
+    (buck2's forkserver, Android's zygote). That is one fork of a small process plus the
+    program's exec.
+  - It needs a spawn effect of the driver's (cargo's) that reaches the launcher. It is the
+    next step for this lane and cargo.
+
+## The Windows sandbox: `crates/blaze-cargo/src/sandbox/windows.rs`
+
+Written by speed-link-edge-sol-usercode. Nothing here was built or run (no Windows build runs in
+this pass), and the Windows figures are estimates, not measurements:
+- a process creation of a small program is about 1 to 3 ms, and more in an AppContainer
+  (its lowbox token) or with the antivirus scanning the image;
+- an NT call on an open handle is about 0.5 to 1 µs;
+- an open that resolves a path on NTFS is about 5 to 10 µs;
+- `SetNamedSecurityInfoW` on an empty directory is about 30 to 100 µs, plus a rewrite of every
+  file below it when the entry it changes is inheritable.
+
+**Workload.** A build script's run: `spec.read` of 20 paths, plus the program's directory and the
+working directory, so R = 22 paths checked, all granted by an earlier run (read grants are kept).
+One writable directory, `OUT_DIR`, already there, which the script fills with about 5 files.
+The run's temporary directory. No network.
+
+**The bound.** One `CreateProcessW` of the program, in its AppContainer and its job from the
+start, plus:
+- the job (`CreateJobObjectW` and two `SetInformationJobObject`);
+- the wait, the exit code and the closes;
+- `OUT_DIR`'s write grant and its revoke. Each is a DACL read and write, since a run's write
+  capability is a SID of its own (item 3 below), with the revoke rewriting the run's files below
+  it.
+
+What the bound does not need:
+- the temporary directory's grant can be part of the `CreateDirectoryW` that makes it, and it
+  needs no revoke, since the directory is removed;
+- the R read checks need no system call at all where a long-lived process remembers them, until
+  a watch says a DACL changed;
+- handles, SIDs and the profile can be made once.
+
+So the bound is one process creation and about 15 system calls around it, set by the program's
+process creation.
+
+**Where the code was** (after speed-link-edge-usercode's pass, which took the read checks out of
+the lock):
+- About 283 system calls a run:
+  - 22 × 8 for the reads, each a stat by path and then a DACL read by path, so two path opens
+    each;
+  - 2 × 10 to grant `OUT_DIR` and the temporary directory, and 2 × (10 + its files) to revoke
+    them;
+  - the session lock opened and closed twice (8);
+  - a suspended start, `AssignProcessToJobObject` and `ResumeThread`;
+  - `exists` and `create_dir_all`'s stats on directories it had just made or found;
+  - `TerminateJobObject` on a job already empty.
+- ACL calls: 26 DACL reads and 4 DACL writes, against the bound's 2 and 2 plus the reads.
+- Two process creations: the daemon starts `blaze sandbox --v2`, which starts the program.
+
+**What changed** (`windows.rs`, 2026-10-29):
+- **The job at creation:** `PROC_THREAD_ATTRIBUTE_JOB_LIST` puts the process in the job as it
+  is made (Windows 10 and later). Gone: `CREATE_SUSPENDED`, `AssignProcessToJobObject`,
+  `ResumeThread`, and the moment the process existed outside the job.
+- **One handle per read path:** `covered` opens the path once (`READ_CONTROL |
+  FILE_READ_ATTRIBUTES`, following links as `metadata` did), reads whether it is a directory
+  (`GetFileInformationByHandleEx`) and its DACL (`GetSecurityInfo`) on that handle, then
+  closes it. That is about 5 calls and one path resolution, in place of about 8 and two. A path
+  that is not there is skipped as before. An open that fails for another reason (access denied)
+  is now an error naming the path, where `metadata` used to skip it and the DACL read then
+  failed on it anyway.
+- **Directories made with their grant:** the run's temporary directory, and a writable
+  directory that is missing, are made by `CreateDirectoryW` with a descriptor whose DACL gives the
+  run's SID write, inheritably. It is not protected, so the system merges in what the directory
+  inherits ("DACL for a New Object" in Windows' documentation). That takes no DACL read or write,
+  no lock and nothing to propagate. The temporary directory is not revoked, since it is removed
+  whole. A writable directory that was already there is checked with one `GetFileAttributesW`
+  (a link still goes through `is_dir`) and granted under the lock as before.
+- **The lock only when needed:** taken for the grants only when a read is missing or a writable
+  directory was already there, and at the end only when there are write grants to take back.
+  Its handle is opened once per process and kept.
+- **Fewer stats:** `Container::open`'s folder check is one `GetFileAttributesW`. The temporary
+  directory is made first and cleared only if it was there. `end` asks the job before ending
+  it, so the usual run (nothing left running) costs one call.
+- Tests: the handle check against the old stat-and-DACL-by-name check, over a directory, a file,
+  a missing path, `System32` and `win.ini`, with three SID and mask sets; a directory made with
+  its grant is covered for the run's SID inheritably, a file written in it inherits the grant,
+  the user who made it can still list it and remove it, and `make_dir_all` finds, makes nested
+  directories and refuses a file; `directory` against `Path::is_dir`; an empty job ends at once.
+  The existing run test (writes only where granted, the exit code, no temporary directory left)
+  covers the job list.
+
+**Where it is now:**
+- About 176 system calls a run: 22 × 5 for the reads, 10 to grant `OUT_DIR`, 25 to revoke it, 6
+  around the process, the job's 3 and the rest.
+- ACL calls: 24 DACL reads and 2 writes. That is the minimum for a design that starts a launcher
+  per run, which can remember nothing between runs.
+- What separates it from the bound is the second process. The launcher is blaze's own large
+  binary, about as costly to start as the program, so a run's fixed cost is about **2 to 3 times
+  the bound**.
+
+**The three known obstacles** (`v2/requests/usercode-sandbox.md` section 6):
+- **Item 3, write grants rewritten every run:** partly removed.
+  - The temporary directory's grant and revoke are gone, and so is the grant of a writable
+    directory the launcher makes.
+  - What is left is `OUT_DIR`'s grant, and its revoke rewriting the run's files. A capability
+    derived from the directory would keep the grant between runs. The sandbox's owner declined
+    that, since anyone can compute such a SID, so a sandboxed program that can name a capability
+    could write into every directory whose grant stays. I agree, and it stays declined.
+  - A revoke that does not propagate (`SetFileSecurityW`, which leaves the files' inherited
+    copies naming a SID nothing holds again) would make the revoke O(1). It is not applied: it
+    changes how the DACL's inheritance flags are stored, and nothing can be tested on Windows
+    in this pass.
+- **Item 4, `CreateAppContainerProfile` every run:** removed. The lead applied it: the SID is
+  derived when the profile's folder is there. The folder check is now one `GetFileAttributesW`.
+- **Item 5, two process creations a run:** blocked. The lead declined running the launcher
+  inside the daemon, because a launcher fault would end the daemon, the job objects and console
+  handler would be the daemon's, and `confine` would stop being one `Command`.
+  - The removal is a warm launcher: one long-lived `blaze sandbox` process per daemon, outside
+    it, that holds the jobs and the console handler, makes the SIDs and handles once, remembers
+    read grants until a `ReadDirectoryChangesW` watch with `FILE_NOTIFY_CHANGE_SECURITY` says a
+    DACL changed, and starts each program with one `CreateProcessW`. It is the same warm
+    launcher the section above asks for on Linux and macOS.
+  - It needs `Confine` to hand a spec to a running process rather than return a `Command`, which
+    is the driver's API and the lead's. That is asked in `v2/requests/usercode.md`
+    ("speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows").
+  - With it, a run is within 10% of the bound.
+
+**State of the art:** Chromium's sandbox, where a long-lived broker makes each target once, in
+its job and AppContainer, with its policy and SIDs made once. BuildXL's engine also starts each
+tool once, in a job. Both are the warm launcher's design. Per run, the code is now at the floor
+of a launcher-per-run design; the broker design is what reaches the bound.
+
+**What `proof` measures** (budget = bound × 1.1):
+- system calls per run (an ETW kernel trace) of the workload above: at most 194 now, and at most
+  about 20 around the `CreateProcessW` with the warm launcher;
+- wall time from the spawn to the program's exit for an empty program, against a bare
+  `CreateProcessW` of the same program in the same AppContainer and job: the ratio, now about 2
+  to 3, and at most 1.1 with the warm launcher.
+
+## A proc-macro expansion: `blaze-expand`, `proc-macro-api/src/warm.rs`
+
+Work for a hit, for a call with 2 KB of input tokens:
+- the input encoded (2 KB written) and hashed;
+- the key's parts hashed;
+- one shape step;
+- the expansion decoded in place into a token tree.
+
+Bound: BLAKE3 at its SIMD rate over 2 KB plus the parts, about 1,500 cycles, plus two store
+lookups (0.2 µs), plus the output tree built (about 4 KB of columns written, about 150 cycles).
+About 0.7 µs.
+
+The design:
+- **The variables are hashed as they are lent** (`Given::env_keyed`), so a hit allocates one
+  `Vec` of borrowed pairs.
+- **In the way: the input is encoded and then hashed.** frontend-tokens hands the columns to
+  the wire (`usercode-wire`, in progress), and hashing those columns in place removes the
+  encoding pass.
+- **A miss to a warm server:** a socket round trip (2 × 5 µs), the macro's own work, and the
+  trace record read with one `pread` (applied 2026-10-29).
+- **Change 20** moves this to fastcompile's evaluator. The keys, the store and the trace are the
+  same (v2/requests/usercode-bridge.md).
+
+## What `proof` measures, for the sections above
+
+- Cycles of `index::find` on a hit, with the workload above: warm and cold, and with `Files`
+  vouched and not.
+- Cycles of `Files::file` on a vouched path.
+- The traced-to-untraced time of the three script kinds above, on Linux and macOS.
+- The time to start a sandboxed run, from the `Effect::Spawn` to the program's first
+  instruction.

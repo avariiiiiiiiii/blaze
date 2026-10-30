@@ -14,7 +14,7 @@
 //! of `OUT_DIR`) is not in the key: the frozen def map names it with its text's hash, which
 //! [`crate::nameres::frozen::unreadable`] checks before the image is used.
 
-use base_db::{Crate, ProcessEnv, SourceDatabase};
+use base_db::{Db, Crate, ProcessEnv};
 use blaze_ids::{ContentId, Hasher};
 use rustc_hash::FxHashMap;
 
@@ -37,43 +37,57 @@ pub static PRODUCER: std::sync::LazyLock<ContentId> = std::sync::LazyLock::new(|
 /// Whether `krate` is read from an image: a crate no workspace member, none of whose
 /// dependencies is one either (a member's def map changes with every edit, so nothing that
 /// names it is kept).
-pub fn eligible(db: &dyn SourceDatabase, krate: Crate) -> bool {
-    !krate.data(db).origin.is_local()
-        && krate.transitive_deps(db).iter().all(|dep| !dep.data(db).origin.is_local())
+pub fn eligible(db: &Db, krate: Crate) -> bool {
+    let mut memo = FxHashMap::default();
+    walk(db, krate, &mut |_, _| ContentId::default(), &mut memo).is_some()
 }
 
 /// The key of each of `crates` that is [`eligible`], by `build`, the blaze that reads and
 /// writes the images. A crate's key covers its dependencies' keys, so they are made too.
-pub fn keys(
-    db: &dyn SourceDatabase,
-    crates: &[Crate],
-    build: ContentId,
-) -> FxHashMap<Crate, ContentId> {
+///
+/// One walk of the crate graph: each crate is visited once, whether eligible and its key
+/// decided together, so the work is the crates and their dependency edges, each edge a 32-byte
+/// hash input.
+pub fn keys(db: &Db, crates: &[Crate], build: ContentId) -> FxHashMap<Crate, ContentId> {
     let env = ProcessEnv::try_get(db).map(|it| it.content(db));
-    let mut done = FxHashMap::default();
+    let mut memo = FxHashMap::default();
+    let mut hash = |krate, memo: &Memo| key(db, krate, build, env, memo);
     for &krate in crates {
-        if eligible(db, krate) {
-            key(db, krate, build, env, &mut done);
-        }
+        walk(db, krate, &mut hash, &mut memo);
     }
-    done
+    // alloc: setup: the keys of a session, once
+    memo.into_iter().filter_map(|(krate, key)| Some((krate, key?))).collect()
 }
 
-/// The key of `krate`, an [`eligible`] crate, its dependencies' first. The crate graph has no
-/// cycles, which [`Crate::transitive_deps`] relies on too, so the walk ends.
-fn key(
-    db: &dyn SourceDatabase,
+/// Each crate walked: its key, or `None` when it is not [`eligible`].
+type Memo = FxHashMap<Crate, Option<ContentId>>;
+
+/// `krate`'s key by `hash` of it and the memo holding its dependencies' keys, if it and every
+/// crate it depends on is eligible, its dependencies' first. The crate graph has no cycles,
+/// which [`Crate::transitive_deps`] relies on too, so the walk ends.
+fn walk(
+    db: &Db,
     krate: Crate,
-    build: ContentId,
-    env: Option<ContentId>,
-    done: &mut FxHashMap<Crate, ContentId>,
-) -> ContentId {
-    if let Some(&key) = done.get(&krate) {
+    hash: &mut impl FnMut(Crate, &Memo) -> ContentId,
+    memo: &mut Memo,
+) -> Option<ContentId> {
+    if let Some(&key) = memo.get(&krate) {
         return key;
     }
     let data = krate.data(db);
-    let deps: Vec<ContentId> =
-        data.dependencies.iter().map(|dep| key(db, dep.crate_id, build, env, done)).collect();
+    let mut eligible = !data.origin.is_local();
+    for dep in &data.dependencies {
+        eligible &= walk(db, dep.crate_id, hash, memo).is_some();
+    }
+    let key = eligible.then(|| hash(krate, memo));
+    memo.insert(krate, key);
+    key
+}
+
+/// The key of `krate` from its inputs and its dependencies' keys in `memo`, in the order the
+/// crate lists them: each is there, since [`walk`] found every dependency eligible.
+fn key(db: &Db, krate: Crate, build: ContentId, env: Option<ContentId>, memo: &Memo) -> ContentId {
+    let data = krate.data(db);
     let root = db.file_source_root(data.root_file_id).source_root_id(db);
     let mut hasher = Hasher::new(KEY_DOMAIN);
     hasher.id(&PRODUCER).id(&build).id(&krate.content(db)).id(&db.source_root(root).content(db));
@@ -81,11 +95,9 @@ fn key(
         Some(env) => hasher.update(&[1]).id(&env),
         None => hasher.update(&[0]),
     };
-    hasher.update(&(deps.len() as u64).to_le_bytes());
-    for dep in &deps {
-        hasher.id(dep);
+    hasher.update(&(data.dependencies.len() as u64).to_le_bytes());
+    for dep in &data.dependencies {
+        hasher.id(&memo[&dep.crate_id].expect("`walk` keys every dependency first"));
     }
-    let key = hasher.finish();
-    done.insert(krate, key);
-    key
+    hasher.finish()
 }

@@ -17,7 +17,6 @@ doctest = false
 [dependencies]
 blaze-codegen.workspace = true
 cranelift-codegen.workspace = true
-rustc-hash.workspace = true
 smallvec.workspace = true
 
 [build-dependencies]
@@ -33,6 +32,7 @@ cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
 cranelift-frontend.workspace = true
 # The tests' global allocator, declared once in `src/tier/tests.rs`: proves hot paths allocate nothing.
 blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

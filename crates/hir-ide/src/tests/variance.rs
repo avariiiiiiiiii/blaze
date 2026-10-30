@@ -10,7 +10,7 @@ use test_fixture::WithFixture;
 
 use hir_def::Lookup;
 
-use crate::{db::HirDatabase, generics::generics, test_db::TestDB};
+use crate::{db::HirDatabase, generics::generics, test_db::{TestDB, TestDBExt as _}};
 
 #[test]
 fn phantom_data() {
@@ -476,6 +476,24 @@ struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
 "#,
         expect![[r#"
                 FixedPoint[T: covariant, U: covariant, V: covariant]
+            "#]],
+    );
+}
+
+#[test]
+fn parameter_free_fields_constrain_nothing() {
+    check(
+        r#"
+//- minicore: option
+struct Mixed<'a, T, U> {
+    a: Option<u8>,
+    b: &'a T,
+    c: (u8, [u16; 4], &'static str),
+    d: fn(U),
+}
+"#,
+        expect![[r#"
+                Mixed['a: covariant, T: covariant, U: contravariant]
             "#]],
     );
 }

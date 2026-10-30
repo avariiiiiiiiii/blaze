@@ -6,7 +6,8 @@
 //! - a worker per job ([`worker`]): the checkout (fetch, diff, the what-if, the head), then the
 //!   job's requests on a connection of its own, so cancelling one is a
 //!   [`blaze_api::Request::Cancel`] on it;
-//! - one GitHub thread posting check runs, retrying with backoff;
+//! - [`POST_LANES`] GitHub threads posting check runs, each on its connection and each run on
+//!   one of them, retrying with backoff;
 //! - the service's thread, the one [`serve`] runs on.
 //!
 //! The daemon is reached on its Unix socket only; nothing here writes the store or passes it a
@@ -80,12 +81,22 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
 
     let (to_service, inputs) = mpsc::channel();
     let (to_pins, pin_commands) = mpsc::channel();
-    let (to_github, posts) = mpsc::channel();
-    let github = Arc::new(Mutex::new(github));
+    let mut lanes = Vec::with_capacity(POST_LANES);
+    for lane in 0..POST_LANES {
+        let (to_lane, posts) = mpsc::channel();
+        // alloc: clone: a lane's client and sender, once at start
+        let (client, service) = (Arc::new(Mutex::new(github.lane())), to_service.clone());
+        thread::Builder::new()
+            .name(format!("blaze-ci github {lane}")) // alloc: once per lane, at start
+            .spawn(move || post(client, posts, service, Duration::from_secs(1)))
+            .map_err(|error| format!("GitHub thread {lane} did not start: {error}"))?; // alloc: a failed start
+        lanes.push(to_lane);
+    }
+    let to_github = Posts { lanes };
     let shared = Arc::new(Shared {
         socket: config.daemon.socket.clone(),
         git: Mutex::new(Git { dir: config.git.dir.clone(), remote: config.git.remote.clone() }),
-        github: github.clone(),
+        github: Arc::new(Mutex::new(github)), // alloc: once, at start
         pins: to_pins,
         service: to_service.clone(),
     });
@@ -97,13 +108,6 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
             .name("blaze-ci pins".to_owned())
             .spawn(move || pins::run(socket, pin_commands, service))
             .map_err(|error| format!("the pin thread did not start: {error}"))?;
-    }
-    {
-        let service = to_service.clone();
-        thread::Builder::new()
-            .name("blaze-ci github".to_owned())
-            .spawn(move || post(github, posts, service, Duration::from_secs(1)))
-            .map_err(|error| format!("the GitHub thread did not start: {error}"))?;
     }
     {
         let service = to_service.clone();
@@ -150,11 +154,37 @@ pub(crate) enum Post {
     Update { run: RunId, id: u64, check: CheckRun },
 }
 
+impl Post {
+    fn run(&self) -> RunId {
+        match self {
+            Post::Create { run, .. } | Post::Update { run, .. } => *run,
+        }
+    }
+}
+
+/// How many connections check runs post on at once. GitHub has no call that creates or updates
+/// several check runs, so the runs of a job that change together are that many requests in
+/// flight, not that many one after another; well under GitHub's 100 concurrent requests.
+pub(crate) const POST_LANES: usize = 8;
+
+/// The GitHub lanes, each a thread running [`post`] on a connection of its own. A run's posts
+/// all go to one lane, so they are sent in order and a superseded update is still dropped.
+pub(crate) struct Posts {
+    pub(crate) lanes: Vec<mpsc::Sender<Post>>,
+}
+
+impl Posts {
+    pub(crate) fn send(&self, post: Post) {
+        let lane = (post.run().0 % self.lanes.len() as u64) as usize;
+        let _ = self.lanes[lane].send(post);
+    }
+}
+
 /// Does `output`; [`Output::Save`] only sets `changed`, so the state is written once for many.
 fn dispatch(
     config: &Config,
     shared: &Arc<Shared>,
-    to_github: &mpsc::Sender<Post>,
+    to_github: &Posts,
     workers: &mut FxHashMap<JobId, mpsc::Sender<worker::Command>>,
     changed: &mut bool,
     output: Output,
@@ -192,12 +222,8 @@ fn dispatch(
                 let _ = commands.send(worker::Command::End);
             }
         }
-        Output::Create { run, check, .. } => {
-            let _ = to_github.send(Post::Create { run, check });
-        }
-        Output::Update { run, id, check } => {
-            let _ = to_github.send(Post::Update { run, id, check });
-        }
+        Output::Create { run, check, .. } => to_github.send(Post::Create { run, check }),
+        Output::Update { run, id, check } => to_github.send(Post::Update { run, id, check }),
         Output::Save => *changed = true,
         Output::Snapshot { name } => {
             let socket = config.daemon.socket.clone();

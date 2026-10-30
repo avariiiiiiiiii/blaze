@@ -32,6 +32,9 @@ pub struct FulfillmentError<'db> {
     pub obligation: PredicateObligation<'db>,
     pub code: FulfillmentErrorCode<'db>,
     pub parent_trait_obligations: Vec<Predicate<'db>>,
+    /// For each of `parent_trait_obligations`, the impl whose where clause the next obligation
+    /// came from (rustc's `ImplDerived`), or `None` where it didn't come from an impl.
+    pub parent_impls: Vec<Option<AnyImplId>>,
 }
 
 impl FulfillmentError<'_> {
@@ -119,7 +122,7 @@ fn fulfillment_error_for_no_solution<'db>(
     root_obligation: PredicateObligation<'db>,
 ) -> FulfillmentError<'db> {
     let interner = infcx.interner;
-    let (obligation, parent_trait_obligations) =
+    let (obligation, parent_trait_obligations, parent_impls) =
         find_best_leaf_obligation(infcx, &root_obligation, false);
 
     let code = match obligation.predicate.kind().skip_binder() {
@@ -171,7 +174,7 @@ fn fulfillment_error_for_no_solution<'db>(
         }
     };
 
-    FulfillmentError { obligation, code, parent_trait_obligations }
+    FulfillmentError { obligation, code, parent_trait_obligations, parent_impls }
 }
 
 fn fulfillment_error_for_stalled<'db>(
@@ -221,23 +224,24 @@ fn fulfillment_error_for_stalled<'db>(
         }
     });
 
-    let (obligation, parent_trait_obligations) = if refine_obligation {
+    let (obligation, parent_trait_obligations, parent_impls) = if refine_obligation {
         find_best_leaf_obligation(infcx, &root_obligation, true)
     } else {
-        // alloc: error path; an empty `Vec` does not allocate.
-        (root_obligation, Vec::new())
+        // alloc: error path; empty `Vec`s do not allocate.
+        (root_obligation, Vec::new(), Vec::new())
     };
 
-    FulfillmentError { obligation, code, parent_trait_obligations }
+    FulfillmentError { obligation, code, parent_trait_obligations, parent_impls }
 }
 
 fn fulfillment_error_for_overflow<'db>(
     infcx: &InferCtxt<'db>,
     root_obligation: PredicateObligation<'db>,
 ) -> FulfillmentError<'db> {
-    let (obligation, parent_trait_obligations) =
+    let (obligation, parent_trait_obligations, parent_impls) =
         find_best_leaf_obligation(infcx, &root_obligation, true);
     FulfillmentError {
+        parent_impls,
         obligation,
         code: FulfillmentErrorCode::Ambiguity { overflow: Some(true) },
         parent_trait_obligations,
@@ -249,20 +253,22 @@ fn find_best_leaf_obligation<'db>(
     infcx: &InferCtxt<'db>,
     obligation: &PredicateObligation<'db>,
     consider_ambiguities: bool,
-) -> (PredicateObligation<'db>, Vec<Predicate<'db>>) {
+) -> (PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<AnyImplId>>) {
     let obligation = infcx.deeply_resolve_ignoring_regions(*obligation);
     // FIXME: we use a probe here as the `BestObligation` visitor does not
     // check whether it uses candidates which get shadowed by where-bounds.
     //
     // We should probably fix the visitor to not do so instead, as this also
     // means the leaf obligation may be incorrect.
-    let (obligation, parent_trait_obligations) = infcx
+    let (obligation, parent_trait_obligations, parent_impls) = infcx
         .fudge_inference_if_ok(|| {
             let mut visitor = BestObligation {
                 obligation,
                 consider_ambiguities,
                 // alloc: error path; at most `max_depth` pushes, one per derived level.
                 parent_trait_obligations: Vec::new(),
+                // alloc: error path; one per entry of `parent_trait_obligations`.
+                parent_impls: Vec::new(),
             };
             infcx
                 .visit_proof_tree(obligation.as_goal(), &mut visitor)
@@ -270,31 +276,34 @@ fn find_best_leaf_obligation<'db>(
                 .ok_or(())
                 // walk around the fact that the cause in `Obligation` is ignored by folders so that
                 // we can properly fudge the infer vars in cause code.
-                .map(|(obligation, parent_trait_obligations)| {
-                    (obligation.cause, obligation, parent_trait_obligations)
+                .map(|(obligation, parent_trait_obligations, parent_impls)| {
+                    (obligation.cause, obligation, parent_trait_obligations, parent_impls)
                 })
         })
-        .map(|(cause, obligation, parent_trait_obligations)| {
-            (PredicateObligation { cause, ..obligation }, parent_trait_obligations)
+        .map(|(cause, obligation, parent_trait_obligations, parent_impls)| {
+            (PredicateObligation { cause, ..obligation }, parent_trait_obligations, parent_impls)
         })
-        // alloc: error path; an empty `Vec` does not allocate.
-        .unwrap_or((obligation, Vec::new()));
+        // alloc: error path; empty `Vec`s do not allocate.
+        .unwrap_or((obligation, Vec::new(), Vec::new()));
     let parent_trait_obligations =
         deeply_normalize_for_diagnostics(infcx, obligation.param_env, parent_trait_obligations);
     let obligation = deeply_normalize_for_diagnostics(infcx, obligation.param_env, obligation);
-    (obligation, parent_trait_obligations)
+    (obligation, parent_trait_obligations, parent_impls)
 }
 
 struct BestObligation<'db> {
     obligation: PredicateObligation<'db>,
     consider_ambiguities: bool,
     parent_trait_obligations: Vec<Predicate<'db>>,
+    parent_impls: Vec<Option<AnyImplId>>,
 }
 
 impl<'db> BestObligation<'db> {
+    /// `parent_impl`: the impl whose where clause `derived_obligation` is, if it is one.
     fn with_derived_obligation(
         &mut self,
         derived_obligation: PredicateObligation<'db>,
+        parent_impl: Option<AnyImplId>,
         and_then: impl FnOnce(&mut Self) -> <Self as ProofTreeVisitor<'db>>::Result,
     ) -> <Self as ProofTreeVisitor<'db>>::Result {
         let parent_predicate = self.obligation.predicate;
@@ -302,12 +311,14 @@ impl<'db> BestObligation<'db> {
             && self.parent_trait_obligations.last() != Some(&parent_predicate);
         if should_push {
             self.parent_trait_obligations.push(parent_predicate);
+            self.parent_impls.push(parent_impl);
         }
         let old_obligation = std::mem::replace(&mut self.obligation, derived_obligation);
         let result = and_then(self);
         self.obligation = old_obligation;
         if should_push {
             self.parent_trait_obligations.pop();
+            self.parent_impls.pop();
         }
         result
     }
@@ -316,6 +327,7 @@ impl<'db> BestObligation<'db> {
         ControlFlow::Break((
             self.obligation,
             std::mem::take(&mut self.parent_trait_obligations),
+            std::mem::take(&mut self.parent_impls),
         ))
     }
 
@@ -390,7 +402,7 @@ impl<'db> BestObligation<'db> {
         //         _ => continue,
         //     }
 
-        //     self.with_derived_obligation(obligation, |this| nested_goal.visit_with(this))?;
+        //     self.with_derived_obligation(obligation, None, |this| nested_goal.visit_with(this))?;
         // }
 
         self.break_with_current_obligation()
@@ -411,7 +423,7 @@ impl<'db> BestObligation<'db> {
             let pred = ProjectionClause { projection_term: alias.into(), term: infer_term.into() };
             let obligation =
                 Obligation::new(interner, self.obligation.cause, goal.goal().param_env, pred);
-            self.with_derived_obligation(obligation, |this| {
+            self.with_derived_obligation(obligation, None, |this| {
                 goal.infcx().visit_proof_tree_at_depth(
                     goal.goal().with(interner, pred),
                     goal.depth() + 1,
@@ -445,7 +457,7 @@ impl<'db> BestObligation<'db> {
                 goal.goal().param_env,
                 deeply_normalize_for_diagnostics(goal.infcx(), goal.goal().param_env, pred),
             );
-            self.with_derived_obligation(obligation, |this| {
+            self.with_derived_obligation(obligation, None, |this| {
                 goal.infcx().visit_proof_tree_at_depth(
                     goal.goal().with(interner, pred),
                     goal.depth() + 1,
@@ -474,7 +486,7 @@ impl<'db> BestObligation<'db> {
         let obligation =
             Obligation::new(interner, self.obligation.cause, goal.goal().param_env, trait_ref);
 
-        self.with_derived_obligation(obligation, |this| {
+        self.with_derived_obligation(obligation, None, |this| {
             goal.infcx().visit_proof_tree_at_depth(
                 goal.goal().with(interner, trait_ref),
                 goal.depth() + 1,
@@ -491,7 +503,7 @@ impl<'db> BestObligation<'db> {
             let obligation =
                 Obligation::new(interner, self.obligation.cause, goal.goal().param_env, clause);
 
-            self.with_derived_obligation(obligation, |this| {
+            self.with_derived_obligation(obligation, None, |this| {
                 goal.infcx().visit_proof_tree_at_depth(
                     goal.goal().with(interner, clause),
                     goal.depth() + 1,
@@ -529,7 +541,8 @@ impl<'db> BestObligation<'db> {
 }
 
 impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
-    type Result = ControlFlow<(PredicateObligation<'db>, Vec<Predicate<'db>>)>;
+    type Result =
+        ControlFlow<(PredicateObligation<'db>, Vec<Predicate<'db>>, Vec<Option<AnyImplId>>)>;
 
     fn span(&self) -> Span {
         self.obligation.cause.span()
@@ -608,6 +621,12 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
             }
         }
 
+        let candidate_impl = match candidate.kind() {
+            inspect::ProbeKind::TraitCandidate { source: CandidateSource::Impl(impl_id), .. } => {
+                Some(impl_id)
+            }
+            _ => None,
+        };
         let mut impl_where_bound_count = 0;
         for nested_goal in nested_goals {
             trace!(nested_goal = ?(nested_goal.goal(), nested_goal.source(), nested_goal.result()));
@@ -622,6 +641,7 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
             };
 
             let obligation;
+            let mut parent_impl = None;
             match (child_mode, nested_goal.source()) {
                 (
                     ChildMode::Trait(_) | ChildMode::Host(_),
@@ -637,6 +657,7 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
                         impl_where_bound_count,
                         parent_trait_pred,
                     ));
+                    parent_impl = candidate_impl;
                     impl_where_bound_count += 1;
                 }
                 (
@@ -650,6 +671,7 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
                         impl_where_bound_count,
                         parent_host_clause,
                     ));
+                    parent_impl = candidate_impl;
                     impl_where_bound_count += 1;
                 }
                 (ChildMode::PassThrough, _)
@@ -658,7 +680,9 @@ impl<'db> ProofTreeVisitor<'db> for BestObligation<'db> {
                 }
             }
 
-            self.with_derived_obligation(obligation, |this| nested_goal.visit_with(this))?;
+            self.with_derived_obligation(obligation, parent_impl, |this| {
+                nested_goal.visit_with(this)
+            })?;
         }
 
         self.detect_trait_error_in_higher_ranked_projection(goal)?;

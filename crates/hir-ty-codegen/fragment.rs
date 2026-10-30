@@ -12,7 +12,7 @@ use std::{
     sync::LazyLock,
 };
 
-use base_db::FileId;
+use base_db::{Db, FileId};
 use cranelift_codegen::{
     FinalizedMachReloc, FinalizedRelocTarget, binemit,
     ir::{self, Signature},
@@ -581,7 +581,7 @@ impl Source {
     /// recorded them (`MirSpan::Inlined` for inlined code). A statement of inlined code whose
     /// body or call has no place in the source is an error naming it.
     pub(super) fn of(
-        db: &dyn HirDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         body: &hir_ty::mir::MirBody<'_>,
         spans: Vec<MirSpan>,
@@ -639,7 +639,8 @@ impl Source {
         for (at, span) in spans.iter_mut().enumerate() {
             let MirSpan::Inlined(n) = *span else { continue };
             let inlined = table_spans[n as usize];
-            source.inlined.push(InlinedRow { at: at as u32, scope: inlined.scope, span: inlined.span });
+            let row = InlinedRow { at: at as u32, scope: inlined.scope, span: inlined.span };
+            source.inlined.push(row);
             let mut scope = inlined.scope;
             // Each scope's parent was made before it, so the chain ends within as many steps.
             for _ in 0..=source.scopes.len() {
@@ -865,7 +866,7 @@ pub(super) const INLINED: u32 = u32::MAX;
 
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
     pub(super) target: &'static Target,
@@ -1407,7 +1408,7 @@ impl<'db> Recorder<'db> {
     }
 
     pub(super) fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         isa: &'static dyn TargetIsa,
         target: &'static Target,
         checked: bool,
@@ -1799,23 +1800,10 @@ impl From<cranelift_module::ModuleError> for CodegenError {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{AbiParam, types};
 
     use super::*;
-
-    /// A small deterministic generator, so that every run sees the same inputs.
-    struct Seeded(u64);
-
-    impl Seeded {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-    }
 
     const KINDS: [binemit::Reloc; 6] = [
         binemit::Reloc::Abs8,
@@ -1827,7 +1815,7 @@ mod tests {
     ];
 
     fn module_relocs(seed: u64, count: usize) -> (Vec<ModuleReloc>, Vec<(u32, u32)>) {
-        let mut random = Seeded(seed);
+        let mut random = SplitMix64::new(seed);
         let mut relocs = Vec::new();
         let mut elf_types = Vec::new();
         for at in 0..count {
@@ -1970,7 +1958,7 @@ mod tests {
     #[test]
     fn requests_are_numbered_as_a_search_of_those_before_numbers_them() {
         let isa = &**crate::target().unwrap();
-        let mut random = Seeded(11);
+        let mut random = SplitMix64::new(11);
         let mut wants = Wants::new(isa);
         let mut model: Vec<(FuncTarget, Signature)> = Vec::new();
         for _ in 0..2000 {
@@ -1992,7 +1980,7 @@ mod tests {
         }
         assert_eq!(wants.requests.funcs.len(), model.len());
 
-        let blob = |random: &mut Seeded| ConstBlob {
+        let blob = |random: &mut SplitMix64| ConstBlob {
             bytes: vec![random.below(4) as u8; 1 + random.below(3) as usize],
             relocs: (0..random.below(2)).map(|_| (0, DataId::from_u32(0), 8)).collect(),
             align: 1 << random.below(2),
@@ -2022,7 +2010,7 @@ mod tests {
     /// A blob renamed in place hashes and compares as the blob it is made into.
     #[test]
     fn a_renamed_blob_is_the_blob_it_is_made_into() {
-        let mut random = Seeded(3);
+        let mut random = SplitMix64::new(3);
         for _ in 0..200 {
             let blob = ConstBlob {
                 bytes: (0..random.below(16)).map(|_| random.below(256) as u8).collect(),

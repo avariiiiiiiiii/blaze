@@ -1,344 +1,339 @@
 //! The host's side of the encoding a stream crosses into and out of the module in
-//! (`guest/proc_macro.rs`, `wire`), from and to rust-analyzer's token trees, with each span
-//! a number of the [`Spans`] of the expansion.
+//! (`guest/proc_macro.rs`, `wire`): a token tree's columns as `tt::TopSubtree::write_wire`
+//! lays them out, each span part named by its index in the [`Parts`] of the expansion, and
+//! each span the module holds a word of those parts.
 
-use intern::Symbol;
 use rustc_hash::FxHashMap;
-use span::Span;
+use span::{
+    EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
+};
 use tt::{
-    DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree,
-    iter::{TtElement, TtIter},
+    DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder,
+    WirePart,
 };
 
-/// The spans of an expansion, numbered from 1 in the order the host first gave them out: 0
-/// is none.
+/// The word of no span: a wide index never given out.
+pub(crate) const NONE: u64 = u64::MAX;
+/// A packed span's `len_part` that makes its `start` an index of the wide spans.
+const WIDE: u32 = u32::MAX;
+/// What a packed span's length and part each stay under.
+const NARROW: u32 = 0xFFFF;
+/// How many parts are found by a scan before a map is built.
+const SCAN: usize = 8;
+/// The words of a tree's header.
+const HEADER: usize = 6;
+
+/// A span's anchor and context: what the spans of an expansion share.
+pub(crate) type Part = (SpanAnchor, SyntaxContext);
+
+/// The span parts of an expansion, in the order first given out (the def, call and mixed
+/// sites, the input's, the attribute's, then what span operations make), and its spans too
+/// wide to pack. A span is a word: `start | len_part << 32`, `len_part` being `len | part << 16`
+/// when both are under [`NARROW`], else [`WIDE`] with `start` an index of the wide spans, as
+/// tt packs a span. Both tables hold each entry once and a span packs whenever it can, so
+/// equal spans have equal words.
 #[derive(Default)]
-pub(crate) struct Spans {
-    all: Vec<Span>,
-    numbers: FxHashMap<Span, u32>,
+pub(crate) struct Parts {
+    list: Vec<Part>,
+    /// Each part's index, once there are more than [`SCAN`].
+    map: FxHashMap<Part, u32>,
+    /// The part asked for last and its index: tokens near each other share one.
+    last: Option<(Part, u32)>,
+    wide: Vec<[u32; 3]>,
+    wides: FxHashMap<[u32; 3], u32>,
 }
 
-impl Spans {
-    pub(crate) fn number(&mut self, span: Span) -> u32 {
-        *self.numbers.entry(span).or_insert_with(|| {
-            self.all.push(span);
-            self.all.len() as u32
+impl Parts {
+    /// Forgets every part and wide span, keeping the room, for the next expansion.
+    pub(crate) fn clear(&mut self) {
+        self.list.clear();
+        self.map.clear();
+        self.last = None;
+        self.wide.clear();
+        self.wides.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    pub(crate) fn all(&self) -> &[Part] {
+        &self.list
+    }
+
+    /// The index of the part `(anchor, ctx)`, the next one when it is new.
+    #[inline]
+    pub(crate) fn part(&mut self, anchor: SpanAnchor, ctx: SyntaxContext) -> u32 {
+        let part = (anchor, ctx);
+        if let Some((last, index)) = self.last
+            && last == part
+        {
+            return index;
+        }
+        let index = self.index(part);
+        self.last = Some((part, index));
+        index
+    }
+
+    fn index(&mut self, part: Part) -> u32 {
+        if self.list.len() <= SCAN {
+            if let Some(at) = self.list.iter().position(|it| *it == part) {
+                return at as u32;
+            }
+            let at = self.list.len() as u32;
+            self.list.push(part);
+            if self.list.len() > SCAN {
+                self.map.reserve(4 * SCAN);
+                self.map.extend(self.list.iter().enumerate().map(|(at, &it)| (it, at as u32)));
+            }
+            return at;
+        }
+        let next = self.list.len() as u32;
+        let list = &mut self.list;
+        *self.map.entry(part).or_insert_with(|| {
+            list.push(part);
+            next
         })
     }
 
-    /// Numbers `span` next, as a kept output's table has it, the same as an earlier or not.
-    pub(crate) fn push(&mut self, span: Span) {
-        self.all.push(span);
-        self.numbers.entry(span).or_insert(self.all.len() as u32);
+    /// The word of `span`.
+    #[inline]
+    pub(crate) fn pack(&mut self, span: Span) -> u64 {
+        let part = self.part(span.anchor, span.ctx);
+        self.word(span.range.start().into(), span.range.len().into(), part)
     }
 
-    pub(crate) fn get(&self, number: u32) -> Option<Span> {
-        self.all.get((number as usize).checked_sub(1)?).copied()
+    /// The word of the span `start..start + len` of the part at `part`, which is one.
+    #[inline]
+    pub(crate) fn word(&mut self, start: u32, len: u32, part: u32) -> u64 {
+        if len < NARROW && part < NARROW {
+            return u64::from(start) | u64::from(len | part << 16) << 32;
+        }
+        self.wide_word([start, len, part])
     }
 
-    pub(crate) fn all(&self) -> &[Span] {
-        &self.all
-    }
-}
-
-pub(crate) fn lit_kind_number(kind: LitKind) -> (u8, u8) {
-    match kind {
-        LitKind::Byte => (0, 0),
-        LitKind::Char => (1, 0),
-        LitKind::Integer => (2, 0),
-        LitKind::Float => (3, 0),
-        LitKind::Str => (4, 0),
-        LitKind::StrRaw(n) => (5, n),
-        LitKind::ByteStr => (6, 0),
-        LitKind::ByteStrRaw(n) => (7, n),
-        LitKind::CStr => (8, 0),
-        LitKind::CStrRaw(n) => (9, n),
-        LitKind::Err(()) => (10, 0),
-    }
-}
-
-fn lit_kind(kind: u8, hashes: u8) -> LitKind {
-    match kind {
-        0 => LitKind::Byte,
-        1 => LitKind::Char,
-        2 => LitKind::Integer,
-        3 => LitKind::Float,
-        4 => LitKind::Str,
-        5 => LitKind::StrRaw(hashes),
-        6 => LitKind::ByteStr,
-        7 => LitKind::ByteStrRaw(hashes),
-        8 => LitKind::CStr,
-        9 => LitKind::CStrRaw(hashes),
-        _ => LitKind::Err(()),
-    }
-}
-
-/// Writes streams as the module reads them.
-pub(crate) struct Writer<'a> {
-    pub(crate) out: Vec<u8>,
-    pub(crate) spans: &'a mut Spans,
-}
-
-impl Writer<'_> {
-    fn u32(&mut self, it: u32) {
-        self.out.extend_from_slice(&it.to_le_bytes());
+    #[cold]
+    fn wide_word(&mut self, span: [u32; 3]) -> u64 {
+        let next = self.wide.len() as u32;
+        let wide = &mut self.wide;
+        let at = *self.wides.entry(span).or_insert_with(|| {
+            wide.push(span);
+            next
+        });
+        u64::from(at) | u64::from(WIDE) << 32
     }
 
-    fn span(&mut self, span: Span) {
-        let number = self.spans.number(span);
-        self.u32(number);
+    /// The word the module asks for of `start`, `len` and `part` (`span_pack`): [`NONE`] for a
+    /// part it was never given or a span ending past 4 GiB.
+    pub(crate) fn pack_fields(&mut self, start: u32, len: u32, part: u32) -> u64 {
+        if part as usize >= self.list.len() || start.checked_add(len).is_none() {
+            return NONE;
+        }
+        self.word(start, len, part)
     }
 
-    fn text(&mut self, text: &str) {
-        self.u32(text.len() as u32);
-        self.out.extend_from_slice(text.as_bytes());
+    /// The span of `word`: `None` for a word no span of this expansion has, which a packed
+    /// span as long as only a wide one is, or of a part only a wide one has, is not either.
+    #[inline]
+    pub(crate) fn get(&self, word: u64) -> Option<Span> {
+        let [start, len, part] = self.fields_of(word)?;
+        let (anchor, ctx) = *self.list.get(part as usize)?;
+        let end = start.checked_add(len)?;
+        Some(Span { range: TextRange::new(TextSize::new(start), TextSize::new(end)), anchor, ctx })
     }
 
-    /// What a macro is given of `top`: what is in it when it is a group without delimiters,
-    /// else it, as rust-analyzer's protocol hands a server the tree
-    /// (`proc-macro-api/src/legacy_protocol/msg/flat.rs`).
-    pub(crate) fn top(&mut self, top: &TopSubtree) {
-        let view = top.view();
-        let subtree = view.top_subtree();
-        if subtree.delimiter.kind == DelimiterKind::Invisible {
-            let contents = fragment_contents(&subtree, view.iter()).unwrap_or(view.iter());
-            self.stream(contents);
-        } else {
-            self.u32(1);
-            self.group(&subtree, view.iter());
+    fn fields_of(&self, word: u64) -> Option<[u32; 3]> {
+        let (start, len_part) = (word as u32, (word >> 32) as u32);
+        if len_part == WIDE {
+            return self.wide.get(start as usize).copied();
+        }
+        let (len, part) = (len_part & NARROW, len_part >> 16);
+        (len != NARROW && part != NARROW).then_some([start, len, part])
+    }
+
+    /// `[start, len, part]` of `word` (`span_unpack`), `[0, 0, u32::MAX]` for a word no span of
+    /// this expansion has: its part is then refused wherever the module names it.
+    pub(crate) fn fields(&self, word: u64) -> [u32; 3] {
+        match self.get(word) {
+            Some(_) => self.fields_of(word).expect("a span's word has its fields"),
+            None => [0, 0, u32::MAX],
         }
     }
 
-    fn stream(&mut self, contents: TtIter<'_>) {
-        self.u32(contents.clone().count() as u32);
-        for element in contents {
-            match element {
-                TtElement::Leaf(leaf) => self.leaf(&leaf),
-                TtElement::Subtree(subtree, contents) => self.group(&subtree, contents),
+    /// The part a tree the module wrote names: `{ file_id: index, ast_id: 0, ctx: 0 }` with an
+    /// index of this expansion's parts, and nothing else.
+    pub(crate) fn named(&self, part: WirePart) -> Result<Part, String> {
+        match part {
+            WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.list.len() => {
+                Ok(self.list[file_id as usize])
             }
+            _ => Err(format!(
+                "the expansion has {} span parts, each named by its index alone",
+                self.list.len()
+            )),
         }
     }
 
-    fn group(&mut self, subtree: &Subtree, contents: TtIter<'_>) {
-        self.out.push(0);
-        self.out.push(subtree.delimiter.kind as u8);
-        let (open, close) = (subtree.delimiter.open, subtree.delimiter.close);
-        self.span(open);
-        self.span(close);
-        self.span(entire(open, close));
-        let contents = fragment_contents(subtree, contents.clone()).unwrap_or(contents);
-        self.stream(contents);
-    }
-
-    /// Writes trees the host made, as [`Reader`] reads them.
-    pub(crate) fn trees(&mut self, trees: &[Tree]) {
-        self.u32(trees.len() as u32);
-        for tree in trees {
-            match tree {
-                Tree::Leaf(leaf) => self.leaf(leaf),
-                Tree::Group { kind, open, close, entire, trees } => {
-                    self.out.push(0);
-                    self.out.push(*kind as u8);
-                    self.span(*open);
-                    self.span(*close);
-                    self.span(*entire);
-                    self.trees(trees);
-                }
-            }
-        }
-    }
-
-    pub(crate) fn leaf(&mut self, leaf: &Leaf) {
-        match leaf {
-            Leaf::Ident(ident) => {
-                self.out.push(1);
-                self.span(ident.span);
-                self.out.push(ident.is_raw as u8);
-                self.text(ident.sym.as_str());
-            }
-            Leaf::Punct(punct) => {
-                self.out.push(2);
-                self.span(punct.span);
-                self.u32(punct.char as u32);
-                self.out.push(u8::from(punct.spacing == Spacing::Joint));
-            }
-            Leaf::Literal(literal) => {
-                self.out.push(3);
-                self.span(literal.span);
-                let (kind, hashes) = lit_kind_number(literal.kind);
-                self.out.extend_from_slice(&[kind, hashes]);
-                let (text, suffix) = literal.text_and_suffix();
-                self.text(text);
-                match suffix {
-                    "" => self.u32(u32::MAX),
-                    suffix => self.text(suffix),
-                }
-            }
-        }
+    /// The index of the part of the raw ids `write_wire` wrote of it.
+    fn part_written(&mut self, file_id: u32, ast_id: u32, ctx: u32) -> u32 {
+        let anchor = SpanAnchor {
+            file_id: EditionedFileId::from_raw(file_id),
+            ast_id: ErasedFileAstId::from_raw(ast_id),
+        };
+        // SAFETY: `from_u32` asks for a value `into_u32` gave of this process's contexts:
+        // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment before
+        // (`relative`). Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
+        // in salsa's checked lookup, or names another context's hygiene.
+        let ctx = unsafe { SyntaxContext::from_u32(ctx) };
+        self.part(anchor, ctx)
     }
 }
 
-/// What rustc calls the span of a whole group: rust-analyzer's protocol does not say, and
-/// its server joins the delimiters' (`flat.rs`, `span_join`).
-fn entire(open: Span, close: Span) -> Span {
-    if open.anchor == close.anchor && open.ctx == close.ctx {
-        Span { range: open.range.cover(close.range), ..close }
+/// Where a tree's bytes hold its spans and what names its span parts: byte offsets, and counts.
+pub(crate) struct Sections {
+    /// How many nodes there are, the top subtree's included.
+    pub(crate) nodes: usize,
+    pub(crate) spans: usize,
+    pub(crate) wide: usize,
+    pub(crate) wides: usize,
+    pub(crate) parts: usize,
+    pub(crate) count: usize,
+    /// The top subtree's two spans, five words each.
+    pub(crate) top: usize,
+}
+
+fn get(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("four bytes"))
+}
+
+fn put(bytes: &mut [u8], at: usize, words: [u32; 3]) {
+    for (i, word) in words.into_iter().enumerate() {
+        bytes[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+/// The sections of `bytes`, exactly one tree `write_wire` wrote. The header doesn't count the
+/// subtrees, whose closing spans the span column has after the nodes': the length gives them.
+pub(crate) fn sections(bytes: &[u8]) -> Option<Sections> {
+    let word = |at: usize| Some(u32::from_le_bytes(bytes.get(4 * at..4 * at + 4)?.try_into().ok()?) as usize);
+    let (nodes, wides, count, symbols, text) = (word(1)?, word(2)?, word(3)?, word(4)?, word(5)?);
+    let fixed = HEADER + 4 * nodes + 3 * wides + 3 * count + symbols + 10;
+    let closes = (bytes.len() / 4).checked_sub(text.div_ceil(4))?.checked_sub(fixed)? / 2;
+    let spans = 4 * (HEADER + 2 * nodes);
+    let wide = spans + 8 * (nodes + closes);
+    let parts = wide + 12 * wides;
+    Some(Sections { nodes, spans, wide, wides, parts, count, top: parts + 12 * count + 4 * symbols })
+}
+
+/// Appends `tree`'s columns to `out` with each span part named by its index in `parts`
+/// (`{ file_id: index, ast_id: 0, ctx: 0 }`), putting its parts and the spans of it that don't
+/// pack in `parts` in the order the tree uses them, then its top subtree's: bytes free of file
+/// ids and contexts, which the module reads and an expansion's key hashes.
+pub(crate) fn relative(tree: &TopSubtree, parts: &mut Parts, out: &mut Vec<u8>) {
+    let base = out.len();
+    tree.write_wire(out);
+    let bytes = &mut out[base..];
+    let at = sections(bytes).expect("`write_wire` wrote one whole tree");
+    for row in 0..at.count {
+        let it = at.parts + 12 * row;
+        let index = parts.part_written(get(bytes, it), get(bytes, it + 4), get(bytes, it + 8));
+        put(bytes, it, [index, 0, 0]);
+    }
+    let read: &[u8] = bytes;
+    let part = |local: u32| get(read, at.parts + 12 * local as usize);
+    if parts.len() < NARROW as usize {
+        // No span the tree packs fails to pack among the expansion's parts.
+        for row in 0..at.wides {
+            let it = at.wide + 12 * row;
+            parts.word(get(read, it), get(read, it + 4), part(get(read, it + 8)));
+        }
     } else {
-        open
+        // Each span in the order the tree uses it: a node's, then a subtree's closing one.
+        let mut register = |span: usize| {
+            let (start, len_part) = (get(read, span), get(read, span + 4));
+            let [start, len, local] = match len_part {
+                WIDE => {
+                    let it = at.wide + 12 * start as usize;
+                    [get(read, it), get(read, it + 4), get(read, it + 8)]
+                }
+                _ => [start, len_part & NARROW, len_part >> 16],
+            };
+            parts.word(start, len, part(local));
+        };
+        let mut ordinal = 0;
+        for node in 1..at.nodes {
+            register(at.spans + 8 * node);
+            if get(read, 4 * HEADER + 8 * node) & 0b11 == 0 {
+                ordinal += 1;
+                register(at.spans + 8 * (at.nodes + ordinal - 1));
+            }
+        }
+    }
+    for row in 0..2 {
+        let it = at.top + 20 * row;
+        let index =
+            parts.part_written(get(bytes, it + 8), get(bytes, it + 12), get(bytes, it + 16));
+        parts.word(get(bytes, it), get(bytes, it + 4), index);
+        put(bytes, it + 8, [index, 0, 0]);
     }
 }
 
-/// What is in the parentheses of an expression a macro was passed and passed on, as
-/// `flat.rs` has it: a proc macro is not to see them.
-fn fragment_contents<'a>(subtree: &Subtree, mut contents: TtIter<'a>) -> Option<TtIter<'a>> {
-    if subtree.delimiter.kind != DelimiterKind::Invisible {
-        return None;
+/// `bytes` at a 4-byte boundary, as `read_wire` takes them: themselves when they are, else a
+/// copy in `room`.
+fn aligned<'a>(bytes: &'a [u8], room: &'a mut Vec<u8>) -> &'a [u8] {
+    if bytes.as_ptr().addr().is_multiple_of(4) {
+        return bytes;
     }
-    let Some(TtElement::Subtree(inner, inner_contents)) = contents.next() else {
-        return None;
-    };
-    let wrapper = inner.delimiter.kind == DelimiterKind::Parenthesis
-        && inner.delimiter.open == subtree.delimiter.open
-        && inner.delimiter.close == subtree.delimiter.open;
-    (wrapper && contents.next().is_none()).then_some(inner_contents)
+    room.clear();
+    room.resize(bytes.len() + 3, 0);
+    let skip = room.as_ptr().addr().wrapping_neg() % 4;
+    room[skip..skip + bytes.len()].copy_from_slice(bytes);
+    let room: &'a [u8] = room;
+    &room[skip..skip + bytes.len()]
 }
 
-/// Reads what the module wrote.
-pub(crate) struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-    spans: &'a Spans,
-    /// How many groups the tree being read is in.
-    depth: u32,
+/// The tree of `bytes`, all of them, each span part it names one of `parts`: an error saying
+/// what is wrong with them otherwise.
+pub(crate) fn read(bytes: &[u8], parts: &Parts) -> Result<TopSubtree, String> {
+    let mut room = Vec::new();
+    let bytes = aligned(bytes, &mut room);
+    let (tree, used) =
+        TopSubtree::read_wire(bytes, &mut |part| parts.named(part)).map_err(|e| e.to_string())?;
+    match bytes.len() - used {
+        0 => Ok(tree),
+        left => Err(format!("{left} bytes after the token tree")),
+    }
 }
 
-/// The most groups a tree the module wrote may be nested in: its reading, its turning into
-/// rust-analyzer's tree and its drop each recurse once a level, on the expanding thread's
-/// stack, so a deeper one is refused rather than overflowing it.
-pub(crate) const DEPTH_MOST: u32 = 4096;
+/// `trees` in a top subtree without delimiters at `at`, as they are: what text the module asks
+/// to be tokens of is given back as.
+pub(crate) fn invisible(trees: &[Tree], at: Span) -> TopSubtree {
+    let mut builder = TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(at));
+    push(&mut builder, trees);
+    builder.build()
+}
 
-/// The fewest bytes one tree takes in a stream (a punct: kind, span, char, spacing), which
-/// bounds how many the bytes left can hold.
-const TREE_FEWEST: usize = 10;
+fn push(builder: &mut TopSubtreeBuilder, trees: &[Tree]) {
+    for tree in trees {
+        match tree {
+            Tree::Leaf(leaf) => builder.push(leaf.clone()),
+            Tree::Group { kind, open, close, entire: _, trees } => {
+                builder.open(*kind, *open);
+                push(builder, trees);
+                builder.close(*close);
+            }
+        }
+    }
+}
 
-/// A stream the module wrote, as trees: what [`Reader`] makes, and what is turned into
-/// rust-analyzer's.
+/// A stream the host made: what the lexer makes of text (`lex.rs`).
 pub(crate) enum Tree {
     Group { kind: DelimiterKind, open: Span, close: Span, entire: Span, trees: Vec<Tree> },
     Leaf(Leaf),
 }
 
-impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8], spans: &'a Spans) -> Reader<'a> {
-        Reader { bytes, at: 0, spans, depth: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
-        let end = self.at.checked_add(len).filter(|it| *it <= self.bytes.len());
-        let end = end.ok_or("the module wrote a stream that ends early")?;
-        let it = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(it)
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-
-    fn span(&mut self) -> Result<Span, String> {
-        let number = self.u32()?;
-        self.spans.get(number).ok_or_else(|| format!("the module named span {number}, unknown"))
-    }
-
-    fn text(&mut self) -> Result<&'a str, String> {
-        let len = self.u32()? as usize;
-        std::str::from_utf8(self.take(len)?).map_err(|it| it.to_string())
-    }
-
-    pub(crate) fn stream(&mut self) -> Result<Vec<Tree>, String> {
-        let count = self.u32()? as usize;
-        let mut trees = Vec::with_capacity(count.min((self.bytes.len() - self.at) / TREE_FEWEST));
-        for _ in 0..count {
-            trees.push(self.tree()?);
-        }
-        Ok(trees)
-    }
-
-    fn tree(&mut self) -> Result<Tree, String> {
-        Ok(match self.u8()? {
-            0 => {
-                let kind = match self.u8()? {
-                    0 => DelimiterKind::Parenthesis,
-                    1 => DelimiterKind::Brace,
-                    2 => DelimiterKind::Bracket,
-                    _ => DelimiterKind::Invisible,
-                };
-                let (open, close, entire) = (self.span()?, self.span()?, self.span()?);
-                if self.depth == DEPTH_MOST {
-                    return Err(format!("the module wrote groups nested over {DEPTH_MOST} deep"));
-                }
-                self.depth += 1;
-                let trees = self.stream();
-                self.depth -= 1;
-                Tree::Group { kind, open, close, entire, trees: trees? }
-            }
-            1 => {
-                let span = self.span()?;
-                let is_raw = if self.u8()? == 1 { IdentIsRaw::Yes } else { IdentIsRaw::No };
-                Tree::Leaf(Leaf::Ident(tt::Ident {
-                    sym: Symbol::intern(self.text()?),
-                    span,
-                    is_raw,
-                }))
-            }
-            2 => {
-                let span = self.span()?;
-                let char = char::from_u32(self.u32()?).ok_or("the module wrote no character")?;
-                let spacing = if self.u8()? != 0 { Spacing::Joint } else { Spacing::Alone };
-                Tree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span }))
-            }
-            3 => {
-                let span = self.span()?;
-                let (kind, hashes) = (self.u8()?, self.u8()?);
-                let text = self.text()?;
-                let suffix = match u32::from_le_bytes(
-                    self.bytes
-                        .get(self.at..self.at + 4)
-                        .ok_or("a literal ends early")?
-                        .try_into()
-                        .unwrap(),
-                ) {
-                    u32::MAX => {
-                        self.at += 4;
-                        ""
-                    }
-                    _ => self.text()?,
-                };
-                if suffix.len() > crate::lex::SUFFIX_MOST {
-                    return Err(format!(
-                        "the module wrote a literal's suffix of {} bytes, over the {} kept",
-                        suffix.len(),
-                        crate::lex::SUFFIX_MOST,
-                    ));
-                }
-                Tree::Leaf(Leaf::Literal(tt::Literal::new(
-                    text,
-                    span,
-                    lit_kind(kind, hashes),
-                    suffix,
-                )))
-            }
-            other => return Err(format!("the module wrote a tree of kind {other}")),
-        })
-    }
-}
-
-/// rust-analyzer's tree of a macro's output: its one group, or the stream in a group without
-/// delimiters at `call_site`, as its server writes it.
+/// rust-analyzer's tree of a stream: its one group, or the stream in a group without
+/// delimiters at `call_site`, as its server writes a macro's output.
 pub(crate) fn top_subtree(trees: Vec<Tree>, call_site: Span) -> TopSubtree {
     let mut flat = Vec::new();
     match <[Tree; 1]>::try_from(trees) {

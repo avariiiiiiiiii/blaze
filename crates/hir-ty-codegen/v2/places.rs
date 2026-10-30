@@ -17,7 +17,7 @@ use hir_def::{
     attrs::AttrFlags,
     signatures::{FunctionSignature, StaticSignature},
 };
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_ty::{
     db::HirDatabase,
     next_solver::{
@@ -47,7 +47,7 @@ pub(crate) const PERSONALITY: &str = crate::unwind::PERSONALITY;
 
 /// The reference a function request of the IR builder is.
 pub(crate) fn func_ref(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     target: &FuncTarget,
 ) -> Result<Ref, String> {
@@ -64,7 +64,7 @@ pub(crate) fn func_ref(
 /// The reference a call of `def` with `args` in `env` is: the instance, compiled in the crate
 /// every asker agrees on, or the symbol of a function that has no body of Rust.
 pub(crate) fn call_ref<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     homes: &mut Homes,
     def: InstanceDef,
     args: GenericArgs<'db>,
@@ -77,7 +77,7 @@ pub(crate) fn call_ref<'db>(
 
 /// As [`call_ref`], of an instance as the IR builder holds it.
 pub(crate) fn instance_ref(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
@@ -97,7 +97,7 @@ pub(crate) fn instance_ref(
 }
 
 /// The symbol a function without a body of Rust is: an item of an `extern` block.
-fn bodyless(db: &dyn HirDatabase, func: FunctionId) -> Result<String, String> {
+fn bodyless(db: &Db, func: FunctionId) -> Result<String, String> {
     let name = FunctionSignature::of(db, func).name.as_str().to_owned();
     match func.lookup(db).container {
         ItemContainerId::ExternBlockId(_) => {
@@ -122,7 +122,7 @@ fn bodyless(db: &dyn HirDatabase, func: FunctionId) -> Result<String, String> {
 /// The reference a static is: an item of an `extern` block by its symbol, any other by
 /// which static it is. An `extern_weak` one is a static of blaze's that holds the address of
 /// its symbol, 0 when nothing defines it ([`weak_symbol`]).
-pub(crate) fn static_ref(db: &dyn HirDatabase, id: StaticId) -> Result<Ref, String> {
+pub(crate) fn static_ref(db: &Db, id: StaticId) -> Result<Ref, String> {
     if weak_symbol(db, id)?.is_some() {
         return Ok(FrontRef::Static(HirStatic(id)));
     }
@@ -133,7 +133,7 @@ pub(crate) fn static_ref(db: &dyn HirDatabase, id: StaticId) -> Result<Ref, Stri
 }
 
 /// The symbol of an `extern_weak` static of an `extern` block.
-pub(crate) fn weak_symbol(db: &dyn HirDatabase, id: StaticId) -> Result<Option<String>, String> {
+pub(crate) fn weak_symbol(db: &Db, id: StaticId) -> Result<Option<String>, String> {
     if !AttrFlags::linkage(db, id.into()).is_some_and(|it| it.as_str() == "extern_weak") {
         return Ok(None);
     }
@@ -243,7 +243,7 @@ impl<'a> Placer<'a> {
 /// The place of each of `requests`, whose `TypeId`s it fills in. `krate` is the crate whose
 /// code makes them, `None` for assembly.
 pub(crate) fn place_requests(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     hashes: &dyn Hashes,
     krate: Option<Crate>,
@@ -298,7 +298,7 @@ pub(crate) fn place_requests(
 /// body's types but leaves their constants unevaluated: `[u8; N]` of a `const N`. One with
 /// neither, as nearly every one, is given back with nothing made.
 pub(crate) fn evaluated<'db, T>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Option<Crate>,
     value: T,
 ) -> Result<T, String>
@@ -325,7 +325,7 @@ where
 /// bytes of its type's content ID, one value for a type in every crate of the build. `krate`
 /// is the crate whose code holds the constant.
 pub(crate) fn fill_type_ids(
-    db: &dyn HirDatabase,
+    db: &Db,
     hashes: &dyn Hashes,
     krate: Option<Crate>,
     blob: &mut ConstBlob,

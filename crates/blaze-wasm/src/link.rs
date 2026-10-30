@@ -11,6 +11,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use blaze_format::leb;
 use blaze_ids::radix;
 use hir_ty_codegen::wasm::{INDEX_LEN, WasmFunction, WasmSignature, WasmType};
 use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
@@ -488,12 +489,14 @@ impl Linker {
                 }
                 let value = (self.place(symbols, reloc.target) as i64).wrapping_add(reloc.addend);
                 let place = function.body.get_mut(at..at + INDEX_LEN);
-                write_sleb(place.ok_or("relocation outside")?, value);
+                leb::put_padded_i64(place.ok_or("relocation outside")?, value)
+                    .map_err(|_| format!("a relocated value {value} past its {INDEX_LEN} bytes"))?;
             }
             for &(at, ty) in &function.type_fixups {
                 let ty = out.ty(&function.types[ty as usize]);
                 let place = &mut function.body[at as usize..at as usize + INDEX_LEN];
-                write_uleb(place, ty);
+                leb::put_padded_u64(place, ty.into())
+                    .map_err(|_| format!("a type index {ty} past its {INDEX_LEN} bytes"))?;
             }
             let ty = out.ty(&function.signature);
             let slot = self.slots[&symbols.keys[at]].index;
@@ -641,23 +644,5 @@ impl Output {
         section.functions(&names);
         module.section(&section);
         module.finish()
-    }
-}
-
-/// Writes a signed LEB128 padded to the length of `place`.
-fn write_sleb(place: &mut [u8], value: i64) {
-    let last = place.len() - 1;
-    for (at, byte) in place.iter_mut().enumerate() {
-        let bits = (value >> (7 * at).min(63)) as u8 & 0x7f;
-        *byte = if at == last { bits } else { bits | 0x80 };
-    }
-}
-
-/// Writes an unsigned LEB128 padded to the length of `place`.
-fn write_uleb(place: &mut [u8], value: u32) {
-    let last = place.len() - 1;
-    for (at, byte) in place.iter_mut().enumerate() {
-        let bits = (value >> (7 * at)) as u8 & 0x7f;
-        *byte = if at == last { bits } else { bits | 0x80 };
     }
 }

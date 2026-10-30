@@ -23,6 +23,7 @@ use syntax::ast::{BinaryOp, UnaryOp};
 use tracing::{debug, instrument, trace};
 
 use crate::{
+    db::HirDatabase,
     Adjust, Adjustment, AutoBorrow, Span,
     infer::{
         ByRef, CaptureSourceStack, DerefPatBorrowMode, InferenceContext, PatAdjust, PatAdjustment,
@@ -1158,7 +1159,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     fn expect_and_resolve_type(&mut self, ty: Option<Ty<'db>>) -> Result<Ty<'db>> {
         match ty {
             Some(ty) => {
-                let ty = self.cx.infcx().resolve_vars_if_possible(ty);
+                let ty = self.cx.infcx().deeply_resolve_ignoring_regions(ty);
                 self.error_reported_in_ty(ty)?;
                 Ok(ty)
             }
@@ -1274,7 +1275,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
     where
         F: FnOnce(&mut Self) -> Result<PlaceWithOrigin>,
     {
-        let target = self.cx.infcx().resolve_vars_if_possible(adjustment.target.as_ref());
+        let target = self.cx.infcx().deeply_resolve_ignoring_regions(adjustment.target.as_ref());
         match adjustment.kind {
             Adjust::Deref(overloaded) => {
                 // Equivalent to *expr or something similar.

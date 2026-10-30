@@ -29,12 +29,13 @@
 //! - Modes: a file the head has keeps its mode, a new one is [`Mode::Regular`] (the stamp's
 //!   mode bits are saved for when the driver reports modes, v2/requests/vfs.md item 6).
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use blaze_core::{
     Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
 };
 use blaze_ids::ContentId;
+use blaze_mem::Slab;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
@@ -53,6 +54,9 @@ fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
 /// How many tags a watcher uses: its journal, then one per stamp, listing or read in flight.
 const TAGS: u64 = 1 << 32;
 const FIRST: u64 = 1;
+/// The most looks one watch has in flight at once (a rescan's reads): address space only,
+/// 4 Mi slots, committed as they are used.
+const MOST_IN_FLIGHT: u32 = 1 << 22;
 
 /// What a watcher's completion did.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -102,11 +106,13 @@ struct Slot {
 }
 
 struct Batch {
-    /// A rescan's sweep: the column's names under its subtree, sorted, with what it saved of
-    /// each. They are stamped first, compared in one pass, and only a name whose stamp moved
-    /// (or that `forced` names) becomes a slot: an unchanged one costs no allocation and no
-    /// look in the tree.
-    names: Names,
+    /// A rescan's sweep: its first `swept` names are the column's names under its subtree,
+    /// sorted, with what it saved of each in `saved`; the rest are its slots' names. They are
+    /// stamped in one effect sharing this buffer, compared in one pass, and only a swept name
+    /// whose stamp moved (or that `forced` names) becomes a slot: an unchanged one costs no
+    /// allocation and no look in the tree. `None` outside a rescan.
+    names: Option<Arc<Names>>,
+    swept: usize,
     saved: Vec<Stamp>,
     /// Swept names the head changed since the column held all of it, ascending.
     forced: Vec<u32>,
@@ -131,8 +137,11 @@ struct Batch {
 impl Batch {
     fn new(slots: Vec<Slot>, rescan: Option<String>, relist: Option<FileName>) -> Batch {
         Batch {
-            names: Names::default(),
+            names: None,
+            swept: 0,
+            // alloc: none unless a path changed.
             saved: Vec::new(),
+            // alloc: none unless a path changed.
             forced: Vec::new(),
             slots,
             index: FxHashMap::default(),
@@ -147,10 +156,11 @@ impl Batch {
 
     /// Where `name` is among the swept names, or where it would go.
     fn swept(&self, name: &str) -> Result<usize, usize> {
-        let (mut low, mut high) = (0, self.names.len());
+        let Some(names) = &self.names else { return Err(0) };
+        let (mut low, mut high) = (0, self.swept);
         while low < high {
             let mid = (low + high) / 2;
-            match self.names.get(mid).cmp(name) {
+            match names.get(mid).cmp(name) {
                 std::cmp::Ordering::Less => low = mid + 1,
                 std::cmp::Ordering::Greater => high = mid,
                 std::cmp::Ordering::Equal => return Ok(mid),
@@ -167,6 +177,7 @@ impl Batch {
     fn indexed(&mut self) {
         if self.index.is_empty() {
             self.index =
+                // alloc: once per batch that lists, by its changed paths.
                 self.slots.iter().enumerate().map(|(at, it)| (it.file.as_str().into(), at)).collect();
         }
     }
@@ -181,6 +192,7 @@ impl Batch {
         {
             self.indexed();
             let dirs: Vec<FileName> =
+                // clone: per gone directory.
                 self.slots.iter().filter(|it| gone_dir(it)).map(|it| it.file.clone()).collect();
             for dir in dirs {
                 disk.under(dir.as_str(), |name, saved| {
@@ -188,6 +200,7 @@ impl Batch {
                         return;
                     }
                     let file = FileName::new(name).expect("a column's name is a name");
+                    // alloc: per changed path, beside its read and hash.
                     let path = name[below..].to_owned();
                     let was = seen(tree, head, &path);
                     self.index.insert(name.into(), self.slots.len());
@@ -241,8 +254,8 @@ pub struct Watcher {
     /// Batches in the order their changes were told; the first is number `first`.
     batches: VecDeque<Batch>,
     first: u64,
-    pending: FxHashMap<Tag, Pending>,
-    next_tag: u64,
+    /// Looks in flight, by their tag past `tags + FIRST`: a slot is reused once its look is in.
+    pending: Slab<Pending>,
     /// What this watcher's commits left at each path, while batches told before them wait.
     ours: FxHashMap<String, Seen>,
 }
@@ -253,16 +266,18 @@ impl Watcher {
     pub fn new(head: &str, dir: FileName, tags: u64) -> Watcher {
         Watcher {
             head: head.into(),
+            // alloc: once per watch.
             below: format!("{dir}/"),
             dir,
             tags,
             watching: false,
             caught_up: false,
+            // alloc: none unless a path changed.
             held: (Vec::new(), Vec::new()),
             batches: VecDeque::new(),
             first: 0,
-            pending: FxHashMap::default(),
-            next_tag: 0,
+            pending: Slab::new(MOST_IN_FLIGHT, blaze_mem::Tag::Vfs)
+                .unwrap_or_else(|error| panic!("the looks in flight of a watch: {error}")),
             ours: FxHashMap::default(),
         }
     }
@@ -276,8 +291,10 @@ impl Watcher {
             .get(&self.head)
             .filter(|disk| disk.dir == self.dir)
             .map_or(Cursor::None, |disk| disk.cursor);
+        // clone: once per watch.
         effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
         if since == Cursor::None {
+            // clone: once per watch.
             self.rescan(vfs, self.dir.clone(), effects);
         }
     }
@@ -316,10 +333,17 @@ impl Watcher {
     }
 
     fn tag(&mut self, pending: Pending) -> Tag {
-        let tag = Tag(self.tags + FIRST + self.next_tag);
-        self.next_tag = (self.next_tag + 1) % (TAGS - FIRST);
-        assert!(self.pending.insert(tag, pending).is_none(), "2^32 looks in flight at once");
-        tag
+        Tag(self.tags + FIRST + u64::from(self.pending.insert(pending).index()))
+    }
+
+    /// The look `tag` was asked for, out of its slot: each tag completes once.
+    fn take(&mut self, tag: Tag) -> Pending {
+        let index = tag.0 - self.tags - FIRST;
+        let Some(handle) = u32::try_from(index).ok().and_then(|it| self.pending.handle_at(it)) else {
+            unreachable!("a completion {tag:?} of nothing asked")
+        };
+        let Some(pending) = self.pending.remove(handle) else { unreachable!("an occupied slot") };
+        pending
     }
 
     fn batch(&mut self, number: u64) -> Option<&mut Batch> {
@@ -340,6 +364,7 @@ impl Watcher {
         completion: Completion,
         effects: &mut Vec<Effect>,
     ) -> Vec<Watched> {
+        // alloc: none unless a path changed.
         let mut out = Vec::new();
         if completion.tag == Tag(self.tags) {
             match completion.done {
@@ -357,9 +382,7 @@ impl Watcher {
             self.drain(vfs, &mut out, effects);
             return out;
         }
-        let Some(pending) = self.pending.remove(&completion.tag) else {
-            unreachable!("a completion {:?} of nothing asked", completion.tag)
-        };
+        let pending = self.take(completion.tag);
         match (pending, completion.done) {
             (Pending::Stamp(number), Done::Stamped(stamps)) => {
                 self.stamped(vfs, number, stamps, effects, &mut out);
@@ -372,6 +395,7 @@ impl Watcher {
                     slot.look = Some(match done {
                         Done::Read(bytes) => Look::File(bytes),
                         Done::Failed(error) => {
+                            // alloc: an error path.
                             out.push(Watched::Unreadable { path: slot.path.clone(), error });
                             Look::Unreadable
                         }
@@ -382,6 +406,7 @@ impl Watcher {
             (Pending::Stamp(number), Done::Failed(error)) => {
                 let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
                 batch.open -= 1;
+                // alloc: an error path.
                 let path = batch.rescan.clone().unwrap_or_default();
                 for slot in batch.slots.iter_mut().filter(|it| it.look.is_none()) {
                     slot.look = Some(Look::Unreadable);
@@ -399,6 +424,7 @@ impl Watcher {
                         slot.look = Some(Look::Unreadable);
                     }
                 }
+                // alloc: an error path.
                 let path = self.rel(&dir).unwrap_or_default().to_owned();
                 if path.is_empty() {
                     self.stop(effects);
@@ -484,15 +510,21 @@ impl Watcher {
         let Some(root) = self.rel(&under).map(str::to_owned) else { return };
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
+        // clone: once per rescan.
         let mut batch = Batch::new(Vec::new(), Some(root.clone()), None);
+        let mut names = Names::default();
         if let Some(disk) = disk {
-            disk.sweep(under.as_str(), &mut batch.names, &mut batch.saved);
+            disk.sweep(under.as_str(), &mut names, &mut batch.saved);
         }
+        batch.swept = names.len();
+        // alloc: one per rescan, shared with the driver's sweep of it.
+        batch.names = Some(Arc::new(names));
         let inside = |path: &str| {
             root.is_empty()
                 || path.strip_prefix(root.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         };
         let mut add = |path: &str, batch: &mut Batch| {
+            // alloc: per changed path, beside its read and hash.
             let name = if path.is_empty() { self.dir.to_string() } else { format!("{}{path}", self.below) };
             match batch.swept(&name) {
                 Ok(at) => batch.forced.push(at as u32),
@@ -501,6 +533,7 @@ impl Watcher {
                     let file = FileName::new(&name).expect("a head's path is a name");
                     let was = seen(&vfs.tree, head, path);
                     batch.index.insert(name.into(), batch.slots.len());
+                    // alloc: per changed path, beside its read and hash.
                     batch.slots.push(Slot { path: path.to_owned(), file, was, saved: None, stamp: None, look: None });
                 }
             }
@@ -526,13 +559,15 @@ impl Watcher {
         }
         batch.forced.sort_unstable();
         batch.forced.dedup();
-        let mut names = batch.names.clone();
+        let names = batch.names.as_mut().expect("set above");
+        let unshared = Arc::get_mut(names).expect("not given to the driver yet");
         for slot in &batch.slots {
-            names.push(&slot.file);
+            unshared.push(&slot.file);
         }
+        let files = Arc::clone(names);
         let number = self.push(batch);
         let tag = self.tag(Pending::Stamp(number));
-        effects.push(Effect::Stamp { files: names, tag });
+        effects.push(Effect::Stamp { files, tag });
     }
 
     /// Lists the directory `dir` alone again, for [`Lost::Unnamed`]: a name directly in it that
@@ -542,11 +577,13 @@ impl Watcher {
         let Some(root) = self.rel(&dir).map(str::to_owned) else { return };
         let head = self.head_root(vfs);
         let below = self.below.len();
+        // alloc: none unless a path changed.
         let mut slots: Vec<Slot> = Vec::new();
         let mut index: FxHashMap<Box<str>, usize> = FxHashMap::default();
         if let Some(disk) = self.disk(vfs) {
             disk.children(dir.as_str(), |name, saved| {
                 let file = FileName::new(name).expect("a column's name is a name");
+                // alloc: per changed path, beside its read and hash.
                 let path = name[below..].to_owned();
                 let was = seen(&vfs.tree, head, &path);
                 index.insert(name.into(), slots.len());
@@ -558,7 +595,9 @@ impl Watcher {
         {
             for (name, child, mode) in entries.iter() {
                 let name = vfs.tree.name_str(name);
+                // alloc: per changed path, beside its read and hash.
                 let path = if root.is_empty() { name.to_owned() } else { format!("{root}/{name}") };
+                // alloc: per changed path, beside its read and hash.
                 let full = format!("{}{path}", self.below);
                 if index.contains_key(full.as_str()) {
                     continue;
@@ -569,9 +608,11 @@ impl Watcher {
                 slots.push(Slot { path, file, was, saved: None, stamp: None, look: None });
             }
         }
+        // clone: once per relisting.
         let mut batch = Batch::new(slots, None, Some(dir.clone()));
         batch.index = index;
         let number = self.push(batch);
+        // clone: once per relisting.
         let tag = self.tag(Pending::Entries(number, dir.clone()));
         effects.push(Effect::Entries { dir, tag });
     }
@@ -584,7 +625,8 @@ impl Watcher {
         }
         let number = self.push(Batch::new(slots, rescan, None));
         let tag = self.tag(Pending::Stamp(number));
-        effects.push(Effect::Stamp { files: names, tag });
+        // alloc: one per batch the journal told, handed to the driver.
+        effects.push(Effect::Stamp { files: Arc::new(names), tag });
         number
     }
 
@@ -602,12 +644,14 @@ impl Watcher {
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
         let below = self.below.len();
+        // alloc: none unless a path changed.
         let mut reads = Vec::new();
+        // alloc: none unless a path changed.
         let mut lists = Vec::new();
         let mut stop = false;
         {
             let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
-            let swept = batch.names.len();
+            let swept = batch.swept;
             assert_eq!(stamps.len(), swept + batch.slots.len(), "a stamp per name");
             let rescan = batch.rescan.is_some();
             batch.open -= 1;
@@ -621,20 +665,24 @@ impl Watcher {
                 if saved == now && !force {
                     continue;
                 }
-                let name = batch.names.get(at);
+                let name = batch.names.as_deref().expect("a sweep's names").get(at);
                 let file = FileName::new(name).expect("a column's name is a name");
+                // alloc: per changed path, beside its read and hash.
                 let path = name.get(below..).unwrap_or_default().to_owned();
                 let was = seen(&vfs.tree, head, &path);
                 let slot = Slot { path, file, was, saved: Some(*saved), stamp: Some(*now), look: None };
                 batch.slots.push(slot);
             }
+            // alloc: none unless a path changed.
             let mut changed = Vec::new();
             for (at, slot) in batch.slots.iter_mut().enumerate() {
                 let stamp = slot.stamp.expect("stamped above");
                 if stamp.is_gone() {
                     if slot.path.is_empty() {
                         out.push(Watched::Unreadable {
+                            // alloc: an error path.
                             path: String::new(),
+                            // alloc: an error path.
                             error: IoError(format!("{}: no such directory", slot.file)),
                         });
                         slot.look = Some(Look::Unreadable);
@@ -650,6 +698,7 @@ impl Watcher {
                         Some(saved) => saved.ino != stamp.ino,
                     };
                     if list {
+                        // clone: per directory whose stamp moved.
                         lists.push(slot.file.clone());
                     }
                 } else if slot.saved == Some(stamp) && slot.was.is_some() {
@@ -672,6 +721,7 @@ impl Watcher {
                 };
                 match from {
                     Some(from) => batch.slots[at].look = Some(Look::Moved(from)),
+                    // alloc: per changed path, beside its read and hash.
                     None => reads.push((at, slot.file.clone())),
                 }
             }
@@ -682,6 +732,7 @@ impl Watcher {
             effects.push(Effect::ReadAll { file, tag });
         }
         for dir in lists {
+            // clone: per directory whose stamp moved.
             let tag = self.tag(Pending::Entries(number, dir.clone()));
             effects.push(Effect::Entries { dir, tag });
         }
@@ -704,13 +755,16 @@ impl Watcher {
         let head = self.head_root(vfs);
         let disk = self.disk(vfs);
         let below = self.below.len();
+        // alloc: none unless a path changed.
         let mut asks = Vec::new();
+        // alloc: none unless a path changed.
         let mut rescans = Vec::new();
         {
             let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
             batch.open -= 1;
             if batch.relist.as_ref() == Some(dir) {
                 let there: FxHashMap<&str, Stamp> =
+                    // alloc: once per batch.
                     entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
                 for (at, slot) in batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none()) {
                     let Some(&now) = there.get(slot.file.as_str()) else {
@@ -721,6 +775,7 @@ impl Watcher {
                     if now.is_dir() {
                         let kept = slot.saved.is_some_and(|it| it.is_dir() && it.ino == now.ino);
                         if !kept {
+                            // clone: per directory replaced.
                             rescans.push(slot.file.clone());
                         }
                         slot.look = Some(Look::Same);
@@ -728,6 +783,7 @@ impl Watcher {
                         slot.look = Some(Look::Same);
                     } else {
                         slot.stamp = Some(now);
+                        // alloc: per changed path, beside its read and hash.
                         asks.push((Some(at), slot.file.clone()));
                     }
                 }
@@ -737,6 +793,7 @@ impl Watcher {
                 if batch.known(file.as_str()) || file.as_str().len() <= below {
                     continue;
                 }
+                // alloc: per changed path, beside its read and hash.
                 let path = file.as_str()[below..].to_owned();
                 let at = batch.slots.len();
                 batch.index.insert(file.as_str().into(), at);
@@ -744,12 +801,14 @@ impl Watcher {
                 let look = if stamp.is_gone() {
                     Some(Look::Gone)
                 } else if stamp.is_dir() {
+                    // alloc: per changed path, beside its read and hash.
                     asks.push((None, file.clone()));
                     batch.open += 1;
                     Some(Look::Dir)
                 } else if let Some(from) = batch.moved(&stamp) {
                     Some(Look::Moved(from))
                 } else {
+                    // alloc: per changed path, beside its read and hash.
                     asks.push((Some(at), file.clone()));
                     None
                 };
@@ -763,6 +822,7 @@ impl Watcher {
                     effects.push(Effect::ReadAll { file, tag });
                 }
                 None => {
+                    // clone: per new directory.
                     let tag = self.tag(Pending::Entries(number, file.clone()));
                     effects.push(Effect::Entries { dir: file, tag });
                 }
@@ -789,6 +849,7 @@ impl Watcher {
             }
             for file in again {
                 vfs.disks.of(&self.head, &self.dir).set(file.as_str(), Stamp::GONE);
+                // alloc: per changed path, beside its read and hash.
                 let path = self.rel(&file).expect("a slot's name is under the directory").to_owned();
                 out.push(Watched::Lost { path, why: Lost::Rescan });
                 self.rescan(vfs, file, effects);
@@ -807,11 +868,16 @@ impl Watcher {
         save(disk, &batch);
         let base = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
         let tree = &vfs.tree;
+        // alloc: none unless a path changed.
         let mut deletes: Vec<String> = Vec::new();
+        // alloc: none unless a path changed.
         let mut writes: Vec<(String, Vec<u8>, Mode)> = Vec::new();
+        // alloc: none unless a path changed.
         let mut moves: Vec<(usize, usize)> = Vec::new();
+        // alloc: none unless a path changed.
         let mut taken = Vec::new();
         // The gone slots this commit deletes: a file moved from one of them is renamed.
+        // alloc: once per batch.
         let mut deleting = vec![false; batch.slots.len()];
         for (at, slot) in batch.slots.iter_mut().enumerate() {
             if slot.path.is_empty() || matches!(slot.look, Some(Look::Same | Look::Unreadable)) {
@@ -821,6 +887,7 @@ impl Watcher {
             let node = entry.map(|it| it.0);
             let now = entry.map(|(node, mode)| (tree.id(node), mode));
             if now != slot.was && !self.made(&slot.path, now) {
+                // alloc: per changed path, beside its read and hash.
                 out.push(Watched::Conflict { path: slot.path.clone() });
                 continue;
             }
@@ -828,10 +895,12 @@ impl Watcher {
             match slot.look.take().expect("a looked-at path") {
                 Look::Same | Look::Unreadable => unreachable!("skipped above"),
                 Look::Gone if node.is_some() => {
+                    // alloc: per changed path, beside its read and hash.
                     deletes.push(slot.path.clone());
                     deleting[at] = true;
                 }
                 Look::Gone => {}
+                // alloc: per changed path, beside its read and hash.
                 Look::Dir if is_file => deletes.push(slot.path.clone()),
                 Look::Dir => {}
                 Look::Moved(from) => {
@@ -845,17 +914,20 @@ impl Watcher {
                     // blob of the image that fails its check compares unequal, so it is replaced.
                     let same = node
                         .filter(|_| is_file)
-                        .and_then(|it| tree.bytes(it).ok().flatten())
-                        .is_some_and(|it| *it == *bytes);
+                        .is_some_and(|it| matches!(tree.bytes(it), Ok(Some(have)) if *have == *bytes));
                     if !same {
+                        // alloc: per changed path, beside its read and hash.
                         writes.push((slot.path.clone(), bytes, mode));
                     }
                 }
             }
+            // alloc: per changed path, beside its read and hash.
             taken.push(slot.path.clone());
         }
 
+        // alloc: none unless a path changed.
         let mut again = Vec::new();
+        // alloc: none unless a path changed.
         let mut renames: Vec<(String, String)> = Vec::new();
         let mut renamed = FxHashSet::default();
         for (at, from) in moves {
@@ -863,25 +935,30 @@ impl Watcher {
             let Some((id, mode)) = source.was else { unreachable!("a move is from a file the head had") };
             let entry = tree.entry(base, &target.path);
             if entry.is_some_and(|(node, _)| tree.id(node) == id) {
+                // alloc: per changed path, beside its read and hash.
                 taken.push(target.path.clone());
                 continue;
             }
             let clear = entry.is_none()
                 && !ancestors(&target.path).any(|up| tree.lookup(base, up).is_some_and(|it| !tree.is_dir(it)));
             if deleting[from] && clear && renamed.insert(from) {
+                // alloc: per changed path, beside its read and hash.
                 renames.push((source.path.clone(), target.path.clone()));
             } else {
                 match tree.node(&id).map(|node| tree.bytes(node)) {
                     Some(Ok(Some(bytes))) => {
                         room(tree, base, &target.path, &mut deletes);
+                        // alloc: per file moved from a node no op keeps, its bytes copied once.
                         writes.push((target.path.clone(), bytes.to_vec(), mode));
                     }
                     _ => {
+                        // alloc: per changed path, beside its read and hash.
                         again.push(target.file.clone());
                         continue;
                     }
                 }
             }
+            // alloc: per changed path, beside its read and hash.
             taken.push(target.path.clone());
         }
 
@@ -890,19 +967,23 @@ impl Watcher {
         // A path under one deleted goes with it.
         let deleted = |path: &str| deletes.binary_search_by(|it| it.as_str().cmp(path)).is_ok();
         let deletes: Vec<String> =
+            // alloc: once per batch.
             deletes.iter().filter(|path| !ancestors(path).any(deleted)).cloned().collect();
         // A rename moves its source out first: a delete at or above one waits for the renames,
         // and is left out when nothing else is under it.
+        // alloc: once per batch.
         let mut sources: Vec<&str> = renames.iter().map(|(from, _)| from.as_str()).collect();
         sources.sort_unstable();
         let source = |path: &str| sources.binary_search(&path).is_ok();
         let covers = |path: &str| {
+            // alloc: per changed path, beside its read and hash.
             let under = format!("{path}/");
             source(path)
                 || sources
                     .get(sources.partition_point(|it| *it < under.as_str()))
                     .is_some_and(|it| it.starts_with(&under))
         };
+        // alloc: none unless a path changed.
         let (mut early, mut late) = (Vec::new(), Vec::new());
         for path in deletes {
             if !covers(&path) {
@@ -921,6 +1002,7 @@ impl Watcher {
             .chain(renames.into_iter().map(|(from, to)| Op::Rename { to, from }))
             .chain(late.into_iter().map(|path| Op::Delete { path }))
             .chain(writes.into_iter().map(|(path, bytes, mode)| Op::Write { path, bytes, mode }))
+            // alloc: once per batch.
             .collect();
         if ops.is_empty() {
             return again;
@@ -931,6 +1013,7 @@ impl Watcher {
         });
         let root = vfs.root(commit.root).expect("the root just made");
         for path in taken.iter().map(String::as_str).chain(ops.iter().flat_map(op_paths)) {
+            // alloc: per changed path, beside its read and hash.
             self.ours.insert(path.to_owned(), seen(&vfs.tree, root, path));
         }
         out.push(Watched::Committed(commit));
@@ -949,10 +1032,12 @@ impl Watcher {
 fn room(tree: &Tree, base: NodeId, path: &str, deletes: &mut Vec<String>) {
     for up in ancestors(path) {
         if tree.lookup(base, up).is_some_and(|it| !tree.is_dir(it)) {
+            // alloc: per changed path, beside its read and hash.
             deletes.push(up.to_owned());
         }
     }
     if tree.lookup(base, path).is_some_and(|it| tree.is_dir(it)) {
+        // alloc: per changed path, beside its read and hash.
         deletes.push(path.to_owned());
     }
 }

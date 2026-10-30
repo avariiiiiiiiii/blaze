@@ -92,8 +92,8 @@ impl<'c, 'a, 'db> Crate<'c, 'a, 'db> {
             levels,
             reach,
             executable: executable(cx),
-            level: (0..defs.len()).map(|_| Cell::new(None)).collect(),
-            allow: (0..defs.len()).map(|_| Cell::new(NOT_ASKED)).collect(),
+            level: (0..defs.len()).map(|_| Cell::new(None)).collect(), // alloc: setup, a column sized once
+            allow: (0..defs.len()).map(|_| Cell::new(NOT_ASKED)).collect(), // alloc: setup, a column sized once
         }
     }
 }
@@ -123,8 +123,8 @@ impl Crate<'_, '_, '_> {
             return it;
         }
         let level = match self.level_node(def) {
-            Some(node) => self.levels.at(self.cx, &node),
-            None => self.levels.at(self.cx, &self.crate_root()),
+            Some(node) => self.levels.at(self.cx, node.as_ref()),
+            None => self.levels.at(self.cx, self.crate_root().as_ref()),
         };
         slot.set(Some(level));
         level
@@ -295,7 +295,13 @@ pub(super) fn executable(cx: &Cx<'_, '_>) -> Option<bool> {
 /// rustc's `create_and_seed_worklist`.
 pub(super) fn seeds(k: &Crate<'_, '_, '_>) -> Seeds {
     let defs = k.defs;
-    let mut seeds = Seeds { worklist: Vec::new(), deferred: Vec::new(), unsolved: Vec::new() };
+    // alloc: setup, the three worklists, once per crate, sized from the numbering so they
+    // rarely grow (each owner is unsolved at most once).
+    let mut seeds = Seeds {
+        worklist: Vec::with_capacity(defs.len()),
+        deferred: Vec::with_capacity(defs.len() + defs.owners.len()),
+        unsolved: Vec::with_capacity(defs.owners.len()),
+    };
     let root_main = k.root_main();
     if let Some(main) = k.entry(root_main) {
         seeds.worklist.push(WorkItem::new(main, false));
@@ -368,8 +374,8 @@ fn maybe_record_as_seed(k: &Crate<'_, '_, '_>, owner: DefIdx, seeds: &mut Seeds)
 
 /// What is between the first and the last `"` of `node`: an attribute's string value.
 fn string_value(node: &SyntaxNode) -> Option<String> {
-    let text = node.text().to_string();
+    let text = node.text().to_string(); // alloc: setup, a `#![crate_type]`, once per crate
     let start = text.find('"')?;
     let end = text.rfind('"')?;
-    (end > start).then(|| text[start + 1..end].to_owned())
+    (end > start).then(|| text[start + 1..end].to_owned()) // alloc: setup, as above
 }

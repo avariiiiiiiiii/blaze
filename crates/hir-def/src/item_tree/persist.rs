@@ -127,12 +127,13 @@ impl<'a> ItemTreeRef<'a> {
     pub fn decode(self) -> Result<ItemTree, FormatError> {
         let (root, buffer) = (self.root, self.buffer);
         let invalid = |what| FormatError::Invalid { at: self.position(root), what };
+        // alloc: the tree's column, once a store read, the edge
         let kinds = (self.kinds.iter())
             .map(|&kind| ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range")))
             .collect::<Result<Box<[ItemKind]>, FormatError>>()?;
         let ast_ids = (self.ast_ids.iter())
             .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw)))
-            .collect();
+            .collect(); // alloc: the tree's column, once a store read, the edge
         let macro_calls = (root.macro_calls.follow(buffer)?.iter())
             .map(|call| {
                 let expand_to = expand_to_of(call.expand_to)
@@ -327,7 +328,9 @@ impl Persist for ItemTree {
         let cfgs_at = w.at();
         w.seq(self.cfgs.iter());
 
+        // alloc: once a store write, the edge
         let kinds: Vec<u8> = self.kinds.iter().map(|&kind| kind as u8).collect();
+        // alloc: once a store write, the edge
         let ast_ids: Vec<u32> = self.ast_ids.iter().map(|id| id.erase().into_raw()).collect();
         let macro_calls: Vec<MacroCallRec> = (self.macro_calls.iter())
             .map(|call| MacroCallRec {
@@ -335,7 +338,7 @@ impl Persist for ItemTree {
                 ctxt: call.ctxt.into_u32(),
                 expand_to: expand_to_word(call.expand_to),
             })
-            .collect();
+            .collect(); // alloc: once a store write, the edge
 
         let placed = w.place(out);
         let top_level = Column::push(out, &self.top_level);
@@ -735,6 +738,7 @@ impl Code for tt::TokenTree {
 /// or kept it (`build`): the two fill the tree's tables in different orders.
 impl Code for tt::TopSubtree {
     fn put(&self, w: &mut Words) {
+        // alloc: once a store write, the edge
         let tokens: Vec<tt::TokenTree> = self.as_token_trees().iter_flat_tokens().collect();
         // A builder's own top is invisible, so a visible top was the first subtree in it.
         let visible = matches!(
@@ -769,7 +773,7 @@ fn check_tokens(tokens: &[tt::TokenTree]) -> Result<(), &'static str> {
     if top.usize_len() != tokens.len() - 1 {
         return Err("a top subtree that does not hold every token after it");
     }
-    let mut ends = vec![tokens.len()];
+    let mut ends = vec![tokens.len()]; // alloc: once a token tree read from the store, the edge
     for (at, token) in tokens.iter().enumerate().skip(1) {
         while ends.last() == Some(&at) {
             ends.pop();
@@ -799,6 +803,7 @@ fn rebuild(tokens: &[tt::TokenTree], skip: bool) -> tt::TopSubtree {
         }
         false => tt::TopSubtreeBuilder::new(top.delimiter),
     };
+    // alloc: once a token tree read from the store, the edge
     let mut open: Vec<(usize, Span)> = Vec::new();
     for (at, token) in tokens.iter().enumerate().skip(1) {
         while let Some(&(end, close)) = open.last()
@@ -812,6 +817,7 @@ fn rebuild(tokens: &[tt::TokenTree], skip: bool) -> tt::TopSubtree {
                 builder.open(subtree.delimiter.kind, subtree.delimiter.open);
                 open.push((at + 1 + subtree.usize_len(), subtree.delimiter.close));
             }
+            // clone: allocates nothing, a leaf's text is an interned symbol
             tt::TokenTree::Leaf(leaf) => builder.push(leaf.clone()),
         }
     }

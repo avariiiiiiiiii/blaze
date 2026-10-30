@@ -493,7 +493,7 @@ asked: rustc's witnesses are of the coroutine's own body.
 /// errors: that body is reported (`BorrowckSkipped`) and nothing is built from it.
 #[salsa::tracked(returns(deref))]
 pub fn coroutine_witnesses_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Box<[StoredTy]> {
     let Ok(body) = db.runtime_mir_body_for_coroutine(coroutine) else {
@@ -527,11 +527,19 @@ pub fn coroutine_witnesses_query<'db>(
 }
 ```
 
-with `use hir_def::attrs::AttrFlags;`, `use smallvec::SmallVec;` and, from `super`,
+over the concrete database (common.md, "The database is concrete"; `db.runtime_mir_body_for_coroutine`
+resolves statically to `impl HirDatabase for Db`), with `use base_db::Db;`,
+`use hir_def::attrs::AttrFlags;`, `use smallvec::SmallVec;` and, from `super`,
 `BorrowKind, LocalId, Operand, OperandKind, Rvalue, StatementKind` (all `hir_ty::mir::*`), and
 `StoredTy` from `crate::next_solver` (or `hir_ty::next_solver`). No `lru`: the result is a few
 types per coroutine, read by every auto-trait goal of its future, and not dropped by
 `hir/src/evict.rs`. hir-ty's kind test does not see it (hir-ty-mir's query).
+
+When frontend-db's providers land (`docs/v2/plan/lanes/frontend/db.md`, "Providers, for the
+queries hir-ty reads but can't compute"), this query moves with its MIR siblings: declared in
+hir-ty as a tracked function over `&Db` whose body calls `hir_ty::providers()`, its code the
+`fn` above registered by `hir_ty_mir::provide()`, and b's method goes. Until then it is a
+trait method like the other MIR queries.
 
 **b. Coordinator, `crates/hir-ide/src/impl_db_macro.rs`**: `StoredTy` joins the
 `next_solver::{..}` import at the top of the macro (`next_solver::{Allocation, GenericArgs,
@@ -559,3 +567,316 @@ Test (written, `crates/hir/src/tests.rs`,
 `NotSend(*const u8)` across `.await` is not `Send`; one that moves it out before is.
 
 > waiting for db's go (asked by tmux, window `db-next2`).
+
+## db-ty-port-infer
+
+`InferCtxt` (`crates/hir-ty/src/next_solver/infer/`) now has rustc 16d1ffac's names; the old ones
+are gone, with no aliases. Each caller below is in its owner's file; rename it there.
+
+| old | new |
+|---|---|
+| `InferCtxt::resolve_vars_if_possible(v)` | `deeply_resolve_ignoring_regions(v)` |
+| `InferCtxt::probe_ty_var(vid)` / `probe_const_var(vid)` | `try_resolve_ty_var(vid)` / `try_resolve_const_var(vid)` |
+| `InferCtxt::opportunistic_resolve_{int,float}_var(vid)` | `shallow_resolve_{int,float}_var(vid)` |
+| `InferCtxt::unresolved_variables() -> Vec<Ty>` | `unresolved_root_variables() -> (Vec<TyVid>, Vec<IntVid>, Vec<FloatVid>)` |
+| `InferCtxt::next_term_var_of_kind(term, span)` | `next_term_var_of_alias_kind(alias_term, span)` |
+| `RegionConstraintCollector::opportunistic_resolve_var(cx, vid)` | `shallow_resolve_region_var(cx, vid)` |
+| `RegionConstraintCollector::probe_value(vid)` | `try_resolve_region_var(vid)` |
+| `RegionConstraintCollector::data()` | `legacy_data()` (`InferCtxt::region_constraint_data()` stays) |
+| `resolve::OpportunisticVarResolver` | `resolve::DeepResolverIgnoringRegions` |
+
+Sites (2026-10-29):
+
+- hir-ty: `method_resolution.rs` 530, 656; `method_resolution/probe.rs` 398, 1951;
+  `solver_errors.rs` 195, 201; `infer/coerce.rs` 1612; `autoderef.rs` 52, 202, 283, 368;
+  `lib.rs` 805; `infer/pat.rs` 640; `infer/unify.rs` 233, 340, 351, 358 (`InferenceTable`'s own
+  `resolve_vars_if_possible` wrapper may keep its name; its body calls the new one);
+  `infer/closure/analysis.rs` 256, 933; `infer/closure/analysis/expr_use_visitor.rs` 1161, 1277;
+  `opaques.rs` 221.
+- hir-ty `infer/fallback.rs` 64: `unresolved_root_variables()` gives root vids, as rustc's
+  `fallback.rs`; build the types with `Ty::new_var` / `new_int_var` / `new_float_var`.
+- hir-ty `next_solver/util.rs` 650 (solver-sync): `shallow_resolve_region_var`.
+- hir-ty-mir `mir/monomorphization.rs` 482.
+- hir-ty-borrowck: `liveness.rs` 911; `regions.rs` 4521, 7321 (`deeply_resolve_ignoring_regions`),
+  7187 (`shallow_resolve_region_var`), 6471, 7192, 7332 (`try_resolve_region_var`).
+- hir-ty-wfcheck: `outlives.rs` 536 (`shallow_resolve_region_var`); `compare.rs` 193, 201.
+
+> forwarded to db (db-ty; window `db-next2`, told by tmux).
+> applied by db-ty (db-ty-next2, 20:20): every site in db-ty's paths. That is `solver_errors.rs`,
+> `infer/coerce.rs`, `autoderef.rs`, `lib.rs`, `infer/pat.rs`, `infer/unify.rs`,
+> `infer/closure/analysis.rs`, `expr_use_visitor.rs`, `next_solver/solver.rs`, `infer/fallback.rs`
+> (root vids made into `Ty::new_var`/`new_int_var`/`new_float_var`, in that order), borrowck's
+> `liveness.rs` and `regions.rs`, and wfcheck's `outlives.rs`. `compare.rs` already used the new
+> names. Still open, in other owners' files: items' `method_resolution.rs` 530 and 656,
+> `method_resolution/probe.rs` 398 and 1951, and `opaques.rs` 221; solver-sync's
+> `next_solver/util.rs` 650; codegen's `hir-ty-mir/src/mir/monomorphization.rs`.
+
+## frontend-nameres-impls: kinds for the per-module impl tables (2026-10-29)
+
+What: `crates/hir-ty/src/db.rs`, `kinds!`, a new group after the opaque types. Old:
+
+```rust
+        DEFINE_OPAQUE_AT = 0x2486, "define_opaque_at";
+
+        // Inputs.
+```
+
+New:
+
+```rust
+        DEFINE_OPAQUE_AT = 0x2486, "define_opaque_at";
+
+        // Per-module impl tables (frontend.md items 2 and 3).
+        INHERENT_IMPLS_FOR_MODULE = 0x2490, "InherentImpls::for_module";
+        INHERENT_IMPLS_MODULES_BY_SELF_TY = 0x2491, "InherentImpls::modules_by_self_ty";
+        INHERENT_IMPLS_MODULES_OF_SELF_TY = 0x2492, "InherentImpls::modules_of_self_ty";
+        INHERENT_IMPLS_IN_MODULE_FOR_SELF_TY = 0x2493, "InherentImpls::in_module_for_self_ty";
+        TRAIT_IMPLS_FOR_MODULE = 0x2494, "TraitImpls::for_module";
+        TRAIT_IMPLS_MODULES_BY_TRAIT = 0x2495, "TraitImpls::modules_by_trait";
+        TRAIT_IMPLS_MODULES_OF_TRAIT = 0x2496, "TraitImpls::modules_of_trait";
+        TRAIT_IMPLS_IN_MODULE_FOR_TRAIT = 0x2497, "TraitImpls::in_module_for_trait";
+        TRAIT_IMPLS_FOR_CRATE_AND_TRAIT = 0x2498, "TraitImpls::for_crate_and_trait";
+
+        // Inputs.
+```
+
+Why: `v2/requests/items.md`, `## frontend-nameres-impls: per-module impl collection` adds these
+nine tracked methods to `method_resolution.rs` (items' file; items is DONE, so `requests`
+applies it). `every_query_has_a_kind` fails without these lines, and they fail
+`"... is no query of hir-ty"` without that edit: land both together. `0x2490..0x2498` is
+unused and claims none of the numbers kept for speed-types-probe's children (`0x2457..0x245f`,
+`0x247b..0x247d`, `0x2487..0x248a`). No query is removed.
+Status: open
+
+> forwarded to db (db-ty; told by tmux). requests applies the items half once this and db's re-export land.
+
+## db-ty-d-infer2
+
+> forwarded to diagnostics (blaze-diagnostics and ide-diagnostics; told by tmux).
+
+### 1. Diagnostics (blaze-diagnostics) and ide-diagnostics: ambiguity errors and the other trait solver errors (task 22 part 3)
+
+hir now gives (`crates/hir/src/diagnostics.rs`):
+
+- `TypeMustBeKnown { at_point, top_term, kind: TypeAnnotationNeeded, ambiguity: Option<TypeAmbiguity> }`.
+  `kind` is rustc's `TypeAnnotationNeeded` (`E0282`, `E0283`, `E0284`); `ambiguity` is `Some` for
+  a goal still pending when inference is done (rustc's `report_ambiguity_errors` ->
+  `maybe_report_ambiguity`), with `primary: AmbiguousGoal { goal: SolverGoal, candidates }` and
+  `related: Vec<AmbiguousGoal>` (the goals rustc merges in as notes: same inference variable,
+  same place). `candidates` are `AmbiguityCandidate::{Impl(hir::Impl), WhereClause(hir::TraitRef)}`,
+  non-empty only where rustc lists them (`applicable_impls_to_mention`). `SolverGoal` is the
+  goal: `Trait(TraitClause)`, `HostEffect { trait_ref, maybe_const }`, `Projection { alias, term }`,
+  `NormalizesTo { alias }`, `WellFormed`, `Subtype`, `Coerce`, `ConstEvaluatable`,
+  `ConstArgHasType`, `ConstEquate`, `DynCompatible(Trait)`, `UnstableFeature(Symbol)`,
+  `Outlives`, `Ambiguous`.
+- A new `AnyDiagnostic::TraitSolverError(TraitSolverError { span, kind: TraitSolverErrorKind })`
+  for rustc's `report_fulfillment_error` codes hir had no diagnostic for, which hir-ty now
+  reports instead of dropping (a body with one used to build): `GoalUnmet(SolverGoal)` (a
+  `[const] Trait` bound: `report_host_effect_error`; E0038 of `DynCompatible`; "the type `{ty}`
+  is not well-formed" of `WellFormed`), `Overflow { goal, suggest_increasing_limit }` (E0275,
+  `report_overflow_no_abort`), `ProjectionMismatch(goal)` (E0271 "type mismatch resolving
+  `{goal}`", `report_projection_error`), `TypesDiffer { expected, found }` (E0308 of a subtype
+  or coerce goal), `ConstArgHasWrongType { ct, ct_ty, expected_ty }` ("the constant `{ct}` is
+  not of type `{expected_ty}`"), `HigherRankedOutlives` ("higher-ranked lifetime bound could not
+  be satisfied"), `Unreported(UnreportedSolverError)` (codes only the old solver gives; none
+  occurs today).
+
+Wanted, so the workspace builds again:
+
+- `crates/blaze-diagnostics/src/lower/mod.rs`, beside `AnyDiagnostic::TypeMustBeKnown(d) => ...`:
+  `AnyDiagnostic::TraitSolverError(d) => trait_solver_error::lower(cx, &d),` and a module
+  `lower/trait_solver_error.rs` giving each kind's rustc message and code above
+  (`compiler/rustc_trait_selection/src/error_reporting/traits/fulfillment_errors.rs` at
+  16d1ffac).
+- `crates/blaze-diagnostics/src/lower/type_must_be_known.rs`: use `d.kind` for the code
+  instead of `"E0282"` always, and with `d.ambiguity` give rustc's `maybe_report_ambiguity`
+  forms (`compiler/rustc_trait_selection/src/error_reporting/traits/ambiguity.rs`): E0283
+  "type annotations needed" with "cannot satisfy `{goal}`" and the "multiple `impl`s satisfying
+  `{goal}` found" note listing `candidates`; E0284 "cannot satisfy `{goal}`" / "cannot
+  normalize `{alias}`"; one "the type must also implement `{trait}`"-style note per
+  `related`. The module doc's "the ambiguous goals rustc reports as E0283 and E0284, which the
+  solver's errors drop" is then untrue.
+- `crates/ide-diagnostics/src/lib.rs`, beside `AnyDiagnostic::TypeMustBeKnown(d) => ...`: an
+  arm for `AnyDiagnostic::TraitSolverError(d)` (a handler module like
+  `handlers/unimplemented_trait.rs`).
+
+### 2. hir-ide and Diagnostics: the types of a type mismatch before literal fallback (task 22 part 2)
+
+`InferenceDiagnostic::TypeMismatch` gains `at_error: Option<Box<(StoredTy, StoredTy)>>`: the
+expected and found types as inference had them at the error, an undecided integer or float
+literal's type as `InferTy::FreshIntTy(0)` / `FreshFloatTy(0)`. hir's `TypeMismatch` gains
+`at_error: Option<(String, String)>`, the two printed.
+
+- `crates/hir-ide/src/display.rs` (`HirDisplay for Ty`, the `TyKind::Infer(..) => write!(f, "_")?`
+  arm): print rustc's `{integer}` and `{float}` outside source code, before that arm:
+  ```rust
+  TyKind::Infer(InferTy::IntVar(_) | InferTy::FreshIntTy(_)) if !f.display_kind.is_source_code() => {
+      write!(f, "{{integer}}")?
+  }
+  TyKind::Infer(InferTy::FloatVar(_) | InferTy::FreshFloatTy(_)) if !f.display_kind.is_source_code() => {
+      write!(f, "{{float}}")?
+  }
+  ```
+  Without it hir's `at_error` prints `_` for them.
+- `crates/hir-ide/src/tests.rs` lines 281 and 416: the patterns
+  `InferenceDiagnostic::TypeMismatch { node, expected, found }` need `, ..`.
+- `crates/blaze-diagnostics/src/lower/type_mismatch.rs`: print `d.at_error` where it is `Some`
+  (rustc's "expected integer, found `&str`", "expected `u8`, found floating-point number": a
+  type that is wholly `{integer}` / `{float}` is "integer" / "floating-point number",
+  `TypeError::Sorts` in `rustc_middle::ty::error`); then `tests/bodies/types.rs`
+  `match_arms_of_incompatible_types_skip_the_diverging_one` can be un-ignored.
+  `InvalidRangePatType` gets its types with task 37.
+
+### 3. Diagnostics (blaze-diagnostics): E0525 from the closure and its kind origin (task 22 parts 5 and 6)
+
+hir now gives `ClosureKindMismatch.closure: Option<InFile<AstPtr<ast::ClosureExpr>>>` (the
+closure rustc points at, from the solver goal's self type) and
+`hir::Closure::kind_origin(db) -> Option<(InFile<AstPtr<Either<ast::Expr, ast::Pat>>>, ClosureCapture)>`:
+rustc's `closure_kind_origins` entry (`compiler/rustc_hir_typeck/src/upvar.rs`,
+`process_collected_capture_information`): the use that made the closure `FnOnce` or `FnMut`, with
+the capture it belongs to, for `move` closures too.
+
+- `crates/blaze-diagnostics/src/lower/closure_kind_mismatch.rs`: take the closure from
+  `d.closure` (`cx.sema` to root it) instead of `closure_of` from the argument, and the label
+  of `origin` from `kind_origin` (span = the node, place =
+  `capture.display_place_source_code(cx.db, cx.edition)`) instead of the first moving or
+  mutating capture of a non-`move` closure; drop `closure_of`, `origin` and the module doc's
+  "The front end gives neither ..." paragraph.
+
+> forwarded to diagnostics (blaze-diagnostics and ide-diagnostics; told by tmux).
+
+## db-ty-d-hir
+
+> forwarded to diagnostics (blaze-diagnostics is its, running; told by tmux).
+
+### 1. Diagnostics (blaze-diagnostics): `hir::TraitPredicate` is `hir::TraitClause`
+
+`hir::TraitPredicate` and `hir::PredicatePolarity` are `hir::TraitClause` and
+`hir::ClausePolarity` (`crates/hir/src/lib.rs`, after the solver's rename), so blaze-diagnostics
+does not build. Wanted, a rename and nothing else: `hir::TraitPredicate` -> `hir::TraitClause`
+and `hir::PredicatePolarity` -> `hir::ClausePolarity` in `lower/unimplemented_trait.rs` (lines
+121, 149, 151, 251, 432, 557, 729, 730, 769), `print.rs` (112, 115, 123), `print/printer.rs`
+(19, 680) and `print/types.rs` (24, 422, 426, 437, 486, 501, 564). `TraitClause::to_next_solver`
+is what `TraitPredicate::to_next_solver` was asked to be.
+
+### 2. Diagnostics: the hir APIs db-ty-next1 asked for are there
+
+For the checks waiting on them (each noted `> applied by db-ty-d-hir` in
+`v2/requests/diagnostics.md`): `Type::{to_next_solver, derived_from_next_solver,
+variant_fields, as_array_element, as_foreign}`, `TraitRef::{to_next_solver,
+derived_from_next_solver}`, `GenericDef::where_predicates`, `Adt::unused_params`,
+`Crate::{crate_types, diagnostic_item_adt}`, `Function::{signature, trait_signature_in_impl,
+impl_signature_mismatch, proc_macro_signature_mismatch}` (`FnSignature`,
+`ImplSignatureMismatch`, `ProcMacroSignatureMismatch`, `SignatureMismatchAt`),
+`HasAttrs::{deprecation, stability}`, `impl HasSource for Closure`, and `BorrowckSkipped` given
+for every unchecked body.
+
+## dedup: the leak check's SCC graph onto `radix::Csr::graph`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr<T>`
+(`crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into compressed sparse rows:
+`Csr::build(rows, pairs)` walks a cloneable iterator of `(row: u32, item)` twice (count, then
+place at each row's cursor), `Csr::graph(nodes, edges)` gives each source's targets ascending
+(two passes, by target then by source), `dedup_rows()` drops repeats within a row, and
+`into_parts()` gives `(starts, items)` (`starts` has `rows + 1` entries). Its tests have the old
+copies as the proptest reference.
+
+`crates/hir-ty/src/next_solver/infer/region_constraints/leak_check.rs`, `Sccs::new`: delete the
+inner `fn counting_pass` and replace from `let (by_target, _) = counting_pass(...)` through
+`drop(sorted);` with
+
+```rust
+        // alloc: per leak check past a binder, sized to its region graph.
+        let (starts, targets) = radix::Csr::graph(num_nodes, edges.iter().copied()).into_parts();
+        drop(edges);
+```
+
+(`radix` is already imported from `blaze_ids`; `starts` has `num_nodes + 1` entries and
+`targets` the targets in `(source, target)` order, as before). The doc comment stays true. Why:
+one counting sort in the tree; this one cloned its starts and kept a pair per edge in between.
+
+## db-ty-d-lower
+
+From `db-ty-d-lower` (tasks 19, 33, 34, 35, 40, 42 of `db-dispatch/db-ty-next1.md`; report
+`/tmp/blaze-lanes/v2-db-ty-d-lower.md`). Items 1, 2 and 4 are needed for the tree to build:
+hir and hir-ty use what they add.
+
+1. **hir-def** (`crates/hir-def/src/expr_store/source_map.rs`, after `type_syntax`, about line
+   836): hir's `MissingLifetimes` points at a `'_` it reads back.
+
+   ```rust
+       pub fn lifetime_syntax(&self, id: LifetimeRefId) -> Result<LifetimeSource, SyntheticSyntax> {
+           self.lifetime_map_back.get(id).ok_or(SyntheticSyntax)
+       }
+   ```
+
+2. **items** (`crates/hir-ty/src/method_resolution/confirm.rs`, in `impl GenericArgsLowerer for
+   LowererCtx`, after `report_arg_mismatch`, about line 388): the trait gained
+   `report_late_bound_lifetime_args`, rustc's `prohibit_explicit_late_bound_lifetimes`. A method
+   call is always the `late_bound_lifetime_arguments` lint, so `hard_error` is not read.
+
+   ```rust
+               fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, _hard_error: bool) {
+                   self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallLateBoundLifetimeArgs {
+                       expr: self.expr,
+                       def,
+                   });
+               }
+   ```
+
+3. **diagnostics** (`crates/blaze-diagnostics/src/print/printer.rs`, the `match br.kind` about
+   line 240): a `for<'a>` now binds `BoundRegionKind::NamedForPrinting(name)` with the name
+   written, as rustc's `Named` leads to it, so `for<'x> fn(&'x u8)` prints `'x`, not a fresh
+   letter (rustc's `name_all_regions` takes `get_name` for any binder). Add before `_ => None`:
+
+   ```rust
+                   BoundRegionKind::NamedForPrinting(name)
+                       if !self.mode.erase && name.0.as_str() != "'_" =>
+                   {
+                       Some(name.0.clone())
+                   }
+   ```
+
+   hir-ide's `display.rs` (about line 2332) prints a bound region as `'?d.v`; it can print the
+   name the same way.
+
+4. **diagnostics and ide-diagnostics** (`crates/blaze-diagnostics/src/lower/mod.rs` `lower`,
+   `crates/ide-diagnostics/src/lib.rs`): `AnyDiagnostic` has three new variants, which both
+   match without a wildcard:
+   - `AmbiguousAssociatedItem<'db> { path, variant, item, self_ty, bound }`: the deny-by-default
+     `ambiguous_associated_items` lint of `Self::V` in `impl Tr for E` where `E` has a variant
+     `V` and `Tr` an associated type `V` (rustc's `hir_ty_lowering/mod.rs`,
+     `lower_type_relative_ty_path`; UI test
+     `tests/ui/enum/enum-variant-priority-lint-ambiguous_associated_items.rs`).
+   - `LateBoundLifetimeArgs { generics_or_segment, def, hard_error }`: E0794 "cannot specify
+     lifetime arguments explicitly if late bound lifetime parameters are present" when
+     `hard_error`, else the `late_bound_lifetime_arguments` lint (rustc's
+     `hir_ty_lowering/generics.rs`, `prohibit_explicit_late_bound_lifetimes`).
+   - `MissingLifetimes { sites, kind }`: a lifetime left out of `&T` or written `'_`
+     (`MissingLifetimeSite::{Reference, Placeholder, Path}`). `kind` `Missing` is E0106 per
+     site (a field, a free type alias), `ElisionFailure` one E0106 for every site of a return
+     type, `NotAllowed` E0637 (a bound, a where clause, a const parameter's type, a default, an
+     associated type). Paths without their lifetimes still come as `MissingLifetime`, which
+     gained `kind` (`Missing` or `ElisionFailure`).
+
+5. **diagnostics and ide-diagnostics**, readers of fields that changed shape:
+   - `hir::UnresolvedAssocItem` is `UnresolvedAssocItem<'db>` with `ty: Type<'db>` (the type
+     the item was looked up on, as inference has it: `Vec::nope()` is `Vec<_>`) and `name`.
+     `&hir::UnresolvedAssocItem` in `blaze-diagnostics/src/lower/unresolved_assoc_item.rs:30`
+     and `:122` and `ide-diagnostics/src/handlers/unresolved_assoc_item.rs:8` becomes
+     `&hir::UnresolvedAssocItem<'_>` (`elided_lifetimes_in_paths` warns). `lower` can print
+     `d.ty` in place of re-resolving the qualifier.
+   - `hir::MissingFields` has `variant: Variant`, and `missed_fields` can be empty (`..` with no
+     base where every field is given or has a default). `ide-diagnostics`' `missing_fields`
+     handler returns no fix for an empty `missed_fields`.
+   - `hir::IncorrectGenericsOrder` has `param: GenericParam`, the parameter the argument met.
+   - `hir::InferVarsNotAllowed` has `nodes`, every placeholder of the error in source order
+     (`node` is the first): a return type's, a const's or a static's with a body are one
+     diagnostic now. `blaze-diagnostics/src/lower/infer_vars_not_allowed.rs` can take `nodes`
+     in place of `placeholders(&ty)`; its check that `at` is the first still holds.
+   - `hir::GenericArgsProhibited` has `all_args`, the arguments of every segment one rustc
+     `prohibit_generic_args` checks (`args` is the first): the leading segments, with the last
+     for a type parameter, `Self`, a primitive or a module that ends a type path. A static's or
+     a const parameter's own arguments, a variant's and a type-relative path's resolved segment
+     stay their own. `generic_args_prohibited.rs`' `with_args.first() != Some(&h)` check still
+     holds; it can read the segments from `all_args`.

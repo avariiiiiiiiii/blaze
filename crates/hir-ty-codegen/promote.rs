@@ -245,6 +245,7 @@ fn only_fully_promoted_slots_release_their_storage() {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         AbiParam, InstBuilder, StackSlotData, StackSlotKind,
         types::{F64, I32, I64},
@@ -365,19 +366,10 @@ mod tests {
         }
     }
 
-    struct Seeded(u64);
-
-    impl Seeded {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) % n
-        }
-    }
-
     /// A function of four blocks, an entry branching to two that join, whose blocks store to,
     /// load from and pass on the addresses of a few slots, as `seed` picks.
     fn function(seed: u64) -> (ir::Function, Vec<StackSlot>) {
-        let mut random = Seeded(seed);
+        let mut random = SplitMix64::new(seed);
         let mut func = ir::Function::new();
         func.signature.params.push(AbiParam::new(I32));
         let mut context = FunctionBuilderContext::new();
@@ -398,7 +390,7 @@ mod tests {
                 builder.ins().stack_addr(I64, slot, offset)
             })
             .collect();
-        let ops = |builder: &mut FunctionBuilder, random: &mut Seeded| {
+        let ops = |builder: &mut FunctionBuilder, random: &mut SplitMix64| {
             for _ in 0..random.below(10) {
                 let addr = addrs[random.below(addrs.len() as u64) as usize];
                 let at = [0, 4, 8, 16][random.below(4) as usize];

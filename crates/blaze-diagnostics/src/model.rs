@@ -40,12 +40,24 @@ pub enum Code {
     Error(String),
     /// As rustc's JSON names it: `unused_variables`, `clippy::needless_bool`.
     Lint(String),
+    /// A lint whose diagnostic has an error code too (`unsafe_op_in_unsafe_fn`'s `E0133`): a
+    /// lint for its level, its code in its title, its JSON and the closing lines.
+    LintWithCode { lint: String, code: String },
 }
 
 impl Code {
+    /// The code rustc shows: the error code, else the lint's name.
     pub fn as_str(&self) -> &str {
         match self {
-            Code::Error(it) | Code::Lint(it) => it,
+            Code::Error(it) | Code::Lint(it) | Code::LintWithCode { code: it, .. } => it,
+        }
+    }
+
+    /// The error code, if it has one.
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Code::Error(it) | Code::LintWithCode { code: it, .. } => Some(it),
+            Code::Lint(_) => None,
         }
     }
 }
@@ -295,6 +307,10 @@ pub struct Diag {
     /// away, and why it came back after an edit (`blaze_api::Diagnostic::facts`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<Read>,
+    /// rustc's `emit_fatal` (`FatalError`, `ShouldEmit::EarlyFatal`): nothing after it, in
+    /// rustc's order, is written.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fatal: bool,
 }
 
 /// A fact a diagnostic read, and what it stands for in words, written where the names are
@@ -316,7 +332,15 @@ impl Diag {
             suggestions: Vec::new(),
             suggestions_disabled: false,
             facts: Vec::new(),
+            fatal: false,
         }
+    }
+
+    /// Marks this error fatal: rustc stops at it.
+    pub fn stop(&mut self) -> &mut Diag {
+        assert!(self.is_error() && !self.is_lint(), "only an error rustc gives is fatal: {:?}", self.message);
+        self.fatal = true;
+        self
     }
 
     /// An error with rustc's code `code` (`"E0308"`), or none.
@@ -337,14 +361,23 @@ impl Diag {
         self.level == Level::Error
     }
 
+    /// A lint of rustc's whose diagnostic has error code `code` (rustc's `.with_code` on a
+    /// lint's diagnostic).
+    pub fn lint_with_code(lint: &str, code: &str, message: impl Into<String>, span: Span) -> Diag {
+        let code = Code::LintWithCode { lint: lint.to_owned(), code: code.to_owned() };
+        let mut diag = Diag::new(Level::Warning, Some(code), message);
+        diag.span = MultiSpan::of(span);
+        diag
+    }
+
     pub fn is_lint(&self) -> bool {
-        matches!(self.code, Some(Code::Lint(_)))
+        self.lint_name().is_some()
     }
 
     /// The lint it is of, if it is a lint's.
     pub fn lint_name(&self) -> Option<&str> {
         match &self.code {
-            Some(Code::Lint(it)) => Some(it),
+            Some(Code::Lint(it) | Code::LintWithCode { lint: it, .. }) => Some(it),
             _ => None,
         }
     }
@@ -555,6 +588,17 @@ mod tests {
             Applicability::MachineApplicable,
         );
         assert_eq!(diag.suggestions[0].substitutions[0].len(), 1);
+    }
+
+    #[test]
+    fn a_lint_with_an_error_code_is_a_lint_that_shows_the_code() {
+        let lint = Diag::lint_with_code("unsafe_op_in_unsafe_fn", "E0133", "call to unsafe function", span(0, 1));
+        assert!(lint.is_lint());
+        assert_eq!(lint.lint_name(), Some("unsafe_op_in_unsafe_fn"));
+        assert_eq!(lint.code.as_ref().map(Code::as_str), Some("E0133"));
+        assert_eq!(lint.code.as_ref().and_then(Code::error), Some("E0133"));
+        let plain = Diag::lint("unused_variables", "unused variable: `x`", span(0, 1));
+        assert_eq!(plain.code.as_ref().and_then(Code::error), None);
     }
 
     #[test]

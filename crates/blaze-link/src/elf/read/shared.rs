@@ -9,7 +9,7 @@ use crate::model::{Names, Shared, SharedSymbol};
 
 /// Reads the shared object `data`, whose header [`super::read`] checked.
 pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
-    let error = |error: object::read::Error| format!("{name}: {error}");
+    let error = |error: object::read::Error| format!("{name}: {error}"); // alloc: error path
     let header = Header::parse(data).map_err(error)?;
     let sections = header.sections(ENDIAN, data).map_err(error)?;
     let dynsym = sections.symbols(ENDIAN, data, elf::SHT_DYNSYM).map_err(error)?;
@@ -25,8 +25,8 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
             let bytes = u32::try_from(entry.d_val(ENDIAN))
                 .ok()
                 .and_then(|offset| strings.get(offset).ok())
-                .ok_or_else(|| format!("{name}: DT_SONAME is past the dynamic string table"))?;
-            soname = Some(super::utf8(name, "DT_SONAME", bytes)?.to_owned());
+                .ok_or_else(|| format!("{name}: DT_SONAME is past the dynamic string table"))?; // alloc: error path
+            soname = Some(super::utf8(name, "DT_SONAME", bytes)?.to_owned()); // alloc: once per file, `Shared::name`
         }
     }
 
@@ -37,10 +37,13 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
     };
     let mut names = Names::with_capacity(dynstr.size());
     let mut symbols = Vec::with_capacity(dynsym.len());
+    // alloc: once per version the library defines, `Shared::versions`; empty allocates nothing
     let mut versions: Vec<String> = Vec::new();
     // By ELF version index (at most 0x7fff): its slot in `versions` once seen, `None` inside
-    // for the local and global indexes, which name no version.
-    let mut slots: Vec<Option<Option<u16>>> = Vec::new();
+    // for the local and global indexes, which name no version. Reserved whole, so it never
+    // grows: untouched pages past the highest index seen are never written.
+    let mut slots: Vec<Option<Option<u16>>> =
+        Vec::with_capacity(if table.is_some() { usize::from(elf::VERSYM_VERSION) + 1 } else { 0 });
     for (index, symbol) in dynsym.enumerate() {
         if index.0 == 0 || symbol.st_shndx(ENDIAN) == elf::SHN_UNDEF {
             continue;
@@ -53,8 +56,8 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         // Read for an error only: the name is pushed once the symbol is known to be kept.
         let symbol_name = || {
             dynsym.symbol_name(ENDIAN, symbol).map_or_else(
-                |_| format!("at string offset {}", symbol.st_name(ENDIAN)),
-                |it| String::from_utf8_lossy(it).into_owned(),
+                |_| format!("at string offset {}", symbol.st_name(ENDIAN)), // alloc: error path
+                |it| String::from_utf8_lossy(it).into_owned(), // alloc: error path
             )
         };
         let version = match &table {
@@ -72,6 +75,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                     Some(slot) => slot,
                     None => {
                         let found = table.version(version).map_err(|error| {
+                            // alloc: error path
                             format!("{name}: symbol {}: {error}", symbol_name())
                         })?;
                         let slot = match found {
@@ -83,9 +87,10 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
                                     Some(slot) => slot as u16,
                                     None => {
                                         let slot = u16::try_from(versions.len()).map_err(|_| {
+                                            // alloc: error path
                                             format!("{name}: more than 65,536 versions")
                                         })?;
-                                        versions.push(found.to_owned());
+                                        versions.push(found.to_owned()); // alloc: once per version, `Shared::versions`
                                         slot
                                     }
                                 })
@@ -110,7 +115,7 @@ pub(super) fn read(name: &str, data: &[u8]) -> Result<Shared, String> {
         symbols,
         names,
         versions,
-        more: Vec::new(),
-        inputs: Vec::new(),
+        more: Vec::new(),   // alloc: empty, allocates nothing
+        inputs: Vec::new(), // alloc: empty, allocates nothing
     })
 }

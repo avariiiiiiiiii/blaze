@@ -15,7 +15,7 @@ mod trace;
 
 use std::{fmt, fmt::Write as _, sync};
 
-use base_db::{Crate, SourceDatabase, all_crates};
+use base_db::{Db, Crate, all_crates};
 use either::Either;
 use hir_expand::{
     AstId, ErasedAstId, InFile, MacroCallId,
@@ -62,7 +62,7 @@ use crate::{
 /// resolver (`nameres.rs`, without `frozen`, which serves and checks images and is the same for
 /// both). A query of its own, so the tracked structs it makes live in one.
 #[salsa::tracked(returns(ref))]
-pub(super) fn old_crate_local_def_map(db: &dyn SourceDatabase, krate: Crate) -> DefMapPair<'_> {
+pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     let root_file_id = krate.root_file_id(db);
     let module_data = ModuleData::new(
         ModuleOrigin::CrateRoot { definition: root_file_id },
@@ -84,13 +84,13 @@ pub(super) fn old_crate_local_def_map(db: &dyn SourceDatabase, krate: Crate) -> 
 
 /// The crate's def map as the per-module resolver makes it, without `frozen`.
 #[salsa::tracked(returns(ref))]
-pub(super) fn new_crate_local_def_map(db: &dyn SourceDatabase, krate: Crate) -> DefMapPair<'_> {
+pub(super) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     let (def_map, local_def_map) = super::collect_crate(db, krate);
     DefMapPair::new(db, def_map, local_def_map)
 }
 
 /// The empty def map of `block` that `block_def_map` starts from, and the tree it collects.
-fn empty_block_def_map(db: &dyn SourceDatabase, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
+fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
     // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. Both
     // callers are queries keyed by `block_id`, and the `'static` copies go only into the `DefMap`
     // that query returns and the modules it makes, which salsa invalidates with the key.
@@ -115,7 +115,7 @@ fn empty_block_def_map(db: &dyn SourceDatabase, block_id: BlockIdLt<'_>) -> (Def
 /// `block`'s def map as the old collector made it (`block_def_map` before the resolver).
 #[salsa::tracked(returns(ref))]
 pub(super) fn old_block_def_map<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     block_id: BlockIdLt<'db>,
 ) -> DefMap {
     let (def_map, tree_id) = empty_block_def_map(db, block_id);
@@ -129,7 +129,7 @@ pub(super) fn old_block_def_map<'db>(
 /// `block`'s def map as the per-module resolver makes it.
 #[salsa::tracked(returns(ref))]
 pub(super) fn new_block_def_map<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     block_id: BlockIdLt<'db>,
 ) -> DefMap {
     let (def_map, tree_id) = empty_block_def_map(db, block_id);
@@ -361,12 +361,12 @@ fn sorted<T: fmt::Debug>(mut items: Vec<T>) -> Vec<T> {
 }
 
 struct Projector<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     local: FxHashMap<ModuleId, ModKey>,
 }
 
 impl<'a> Projector<'a> {
-    fn new(db: &'a dyn SourceDatabase, def_map: &DefMap) -> Self {
+    fn new(db: &'a Db, def_map: &DefMap) -> Self {
         let table = def_map.table(db);
         let mut local = FxHashMap::default();
         for (id, _) in table.iter() {
@@ -809,7 +809,7 @@ impl<'a> Projector<'a> {
 
 /// `def_map` (with `local` for a crate's map) in canonical form, leaving out what `exempt` names.
 pub(super) fn project<'a>(
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     def_map: &'a DefMap,
     local: Option<&'a LocalDefMap>,
     exempt: &Exempt,
@@ -1041,7 +1041,7 @@ pub(super) fn compare(old: &CDefMap<'_>, new: &CDefMap<'_>) -> String {
 
 /// Panics naming `what` unless every scope of `def_map` and its modules were handed to the
 /// database, as `crate_local_def_map` and `block_def_map` return them.
-pub(super) fn assert_handed_over(db: &dyn SourceDatabase, def_map: &DefMap, what: &str) {
+pub(super) fn assert_handed_over(db: &Db, def_map: &DefMap, what: &str) {
     assert!(
         matches!(def_map.modules, ModulesSlot::Collected(_)),
         "{what}: the modules of the def map were not handed over"
@@ -1057,15 +1057,16 @@ pub(super) fn assert_handed_over(db: &dyn SourceDatabase, def_map: &DefMap, what
 // ---------------------------------------------------------------------------------------------
 // Running a fixture.
 
-/// The `identity_when_valid` attribute macro `macro_expansion_tests` adds to every fixture: the
-/// item back when it parses as items, an error otherwise.
+/// The `identity_when_valid` attribute macro `macro_expansion_tests` gives every fixture's
+/// proc-macro crate: the item back when it parses as items, an error otherwise (the original
+/// panics; an error keeps one bad fixture from hiding the others' differences).
 #[derive(Debug)]
 struct IdentityWhenValid;
 
 impl ProcMacroExpander for IdentityWhenValid {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &base_db::Env,
@@ -1114,7 +1115,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
 /// A database of `fixture`, which may mark a position (`$0`): the comparisons read none.
 pub(super) fn fixture_db(fixture: &str) -> TestDB {
-    let mut db = TestDB::default();
+    let mut db = TestDB::for_tests();
     let change = ChangeFixture::parse_with_proc_macros(fixture, MiniCore::RAW_SOURCE, extra_proc_macros());
     change.change.apply(&mut db);
     db
@@ -1135,7 +1136,7 @@ pub(super) fn with_fast_path<R>(on: bool, f: impl FnOnce() -> R) -> R {
 
 /// Every body of the items of `def_map`'s modules: functions, consts, statics and enum
 /// variants, and the items of its impls and traits.
-fn bodies(db: &dyn SourceDatabase, def_map: &DefMap) -> Vec<DefWithBodyId> {
+fn bodies(db: &Db, def_map: &DefMap) -> Vec<DefWithBodyId> {
     let mut out = Vec::new();
     let assoc = |out: &mut Vec<DefWithBodyId>, items: &[(Name, crate::AssocItemId)]| {
         for &(_, item) in items {
@@ -1220,25 +1221,5 @@ pub(super) fn compare_fixture(name: &str, fixture: &str, exempt: &Exempt, out: &
             let db = fixture_db(fixture);
             compare_db(&db, &format!("{name} (fast path {on})"), exempt, out);
         });
-    }
-}
-
-/// A xorshift generator: the property tests' only source of randomness, so a seed is a case.
-pub(super) struct Rng(pub(super) u64);
-
-impl Rng {
-    pub(super) fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    pub(super) fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    pub(super) fn chance(&mut self, one_in: u64) -> bool {
-        self.below(one_in) == 0
     }
 }

@@ -9,12 +9,11 @@
 
 use std::cell::Cell;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_codegen::{
     Backend,
     settings::{Panic, Spec},
 };
-use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::{MirOptLevel, MirOptions};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -27,7 +26,7 @@ pub(crate) struct Build {
     /// 2, as rustc's above `-Copt-level=0`; else at 1.
     pub(crate) optimized: bool,
     /// The unit's bodies of crates other than the library's are MIR-inlined
-    /// ([`Build::inlines`]).
+    /// (`Spec::mir_inline`).
     pub(crate) inlines: bool,
 }
 
@@ -50,21 +49,12 @@ impl Build {
             debug_assertions: spec.debug_assertions,
             aborts: spec.panic == Panic::Abort,
             optimized: matches!(spec.backend, Backend::Llvm { opt } if opt > 0),
-            inlines: Self::inlines(spec.backend),
+            // rustc's `Inline::is_enabled`, as the plan decides it (`Spec::mir_inline`: opt 2
+            // and 3, not `s`/`z`, not a build that patches). A unit's key holds the code of what
+            // it inlined (`super::refs::built_in`), so an edit of an inlined callee compiles its
+            // callers again.
+            inlines: spec.mir_inline,
         }
-    }
-
-    /// rustc's `Inline::is_enabled` at `-Zmir-opt-level=2`: on at `-Copt-level=2` and 3,
-    /// which are LLVM's here (`OptLevel::backend`); off at 0 and 1, which Cranelift compiles.
-    ///
-    /// rustc also turns it off for an incremental build. blaze's builds are not rustc's
-    /// incremental ones: a unit's key holds the code of what it inlined
-    /// ([`super::refs::built_in`]), so an edit of an inlined callee compiles its callers
-    /// again, and inlining changes code, never behaviour. `s` and `z` are compiled at LLVM's
-    /// level 2 (`OptLevel::backend`), which a [`Spec`] does not tell from `2`: they inline
-    /// where rustc's do not, which only the machine code shows.
-    fn inlines(backend: Backend) -> bool {
-        matches!(backend, Backend::Llvm { opt } if opt >= 2)
     }
 
     /// What a body of `written` is optimized with in a function compiled as `compiling`, by
@@ -75,7 +65,7 @@ impl Build {
     ///
     /// `hir-ty-mir`'s inliner gives a callee of another crate the options this gives it
     /// (`inline.rs` `callee_options`): the two change together.
-    pub(crate) fn options(self, db: &dyn HirDatabase, written: Crate, compiling: Crate) -> MirOptions {
+    pub(crate) fn options(self, db: &Db, written: Crate, compiling: Crate) -> MirOptions {
         let lang = written.data(db).origin.is_lang();
         let level = match self.optimized || lang {
             true => MirOptLevel::Release,
@@ -119,15 +109,6 @@ pub(crate) fn with<T>(build: Build, work: impl FnOnce() -> T) -> Result<T, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn llvm_at_two_and_above_inlines() {
-        assert!(!Build::inlines(Backend::Cranelift));
-        assert!(!Build::inlines(Backend::Llvm { opt: 0 }));
-        assert!(!Build::inlines(Backend::Llvm { opt: 1 }));
-        assert!(Build::inlines(Backend::Llvm { opt: 2 }));
-        assert!(Build::inlines(Backend::Llvm { opt: 3 }));
-    }
 
     #[test]
     fn the_walks_differ_only_in_the_level_and_the_inliner() {

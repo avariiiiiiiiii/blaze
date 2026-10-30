@@ -18,11 +18,17 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
+blaze-image.workspace = true
+blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
 blaze-vfs.workspace = true
+intern.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
 
 [lints]
 workspace = true

@@ -6,9 +6,11 @@ use object::Object as _;
 use object::pe::{self, ImageNtHeaders64};
 use object::read::pe::{ExportTarget, Import as PeImport, ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 
-use super::coff::{Aligned, ImportName, words};
-use super::image::{self, Buf, Image, Tables, alignment, pdb_name};
-use super::{DEBUG, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, TLS_DIR, TLS_INDEX, rank, writer};
+use blaze_alloc_count::{assert_at_most, measure};
+
+use super::coff::{ImportName, words};
+use super::image::{self, Buf, Image, Tables, alignment, pdb_stem};
+use super::{DEBUG, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, TLS_DIR, TLS_INDEX, place, rank, writer};
 use crate::model::{
     Apply, Bind, Binding, Class, Counts, Data, Directive, Export, Function, GotEntry, Holds, Import, Library,
     NativeFile, NativeFixup, Placed, Plan, Region, SectionKind, Special, SymbolDef, SymbolKind, Tls, WindowsUnwind,
@@ -291,8 +293,7 @@ fn executable() -> Fixture {
 fn executable_headers_and_sections() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
     assert_eq!(header.machine.get(LE), pe::IMAGE_FILE_MACHINE_AMD64);
     let characteristics = header.characteristics.get(LE);
@@ -334,8 +335,7 @@ fn executable_headers_and_sections() {
 fn import_directory_names_each_dll_and_function() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let table = file.import_table().unwrap().unwrap();
     let mut descriptors = table.descriptors().unwrap();
     let mut seen = Vec::new();
@@ -367,9 +367,8 @@ fn import_directory_names_each_dll_and_function() {
 fn base_relocations_cover_every_rebase_and_the_tls_directory() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
-    let mut blocks = file.data_directories().relocation_blocks(aligned.bytes(), &file.section_table()).unwrap().unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
+    let mut blocks = file.data_directories().relocation_blocks(&image[..], &file.section_table()).unwrap().unwrap();
     let mut seen = Vec::new();
     while let Some(block) = blocks.next().unwrap() {
         assert_eq!(block.virtual_address() % 0x1000, 0);
@@ -390,8 +389,7 @@ fn base_relocations_cover_every_rebase_and_the_tls_directory() {
 fn pdata_merges_functions_and_native_entries_sorted() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let (at, size) = directory(&file, pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION);
     assert_eq!(at, f.rva(f.at(&Class::Synthetic(PDATA))));
     let bytes = &image[at as usize..][..size as usize];
@@ -411,8 +409,7 @@ fn pdata_merges_functions_and_native_entries_sorted() {
 fn debug_directory_has_rsds() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let codeview = file.pdb_info().unwrap().unwrap();
     assert_eq!(&codeview.guid(), b"blaze image id!!");
     assert_eq!(codeview.age(), 1);
@@ -424,8 +421,7 @@ fn debug_directory_has_rsds() {
 fn own_tls_directory_when_the_crt_has_none() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let dir = f.at(&Class::Synthetic(TLS_DIR));
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(dir), 40));
     let bytes = &image[f.rva(dir) as usize..][..48];
@@ -443,8 +439,7 @@ fn own_tls_directory_when_the_crt_has_none() {
 fn executable_exports_the_live_descriptor() {
     let mut f = executable();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let exports = file.export_table().unwrap().unwrap().exports().unwrap();
     assert_eq!(exports.len(), 1);
     assert_eq!(exports[0].name, Some(&b"__blaze_live"[..]));
@@ -463,8 +458,7 @@ fn dll_exports_sorted_by_name() {
         .map(|(at, name)| Export { name: (*name).into(), addr: text + 0x10 * at as u64, size: 0x10, kind: SymbolKind::Function })
         .collect();
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     let header = file.nt_headers().file_header();
     assert_ne!(header.characteristics.get(LE) & pe::IMAGE_FILE_DLL, 0);
     let optional = file.nt_headers().optional_header();
@@ -516,8 +510,7 @@ fn reloc_after_pdata_without_a_page_joins_it() {
     f.entry = Some(text);
     assert_ne!(f.at(&Class::Synthetic(RELOC)) % 0x1000, 0);
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     assert_eq!(section_names(&file), [".text", ".rdata", ".data", ".pdata"]);
     let pdata = file.section_table().iter().nth(3).unwrap();
     let (at, size) = directory(&file, pe::IMAGE_DIRECTORY_ENTRY_BASERELOC);
@@ -550,8 +543,7 @@ fn crt_tls_directory_is_used_when_defined() {
     f.symbols = vec![("_tls_used", rodata)];
     f.set(&Class::Rodata, crt(tdata, tdata + 16));
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(rodata), 40));
     let ours = f.rva(f.at(&Class::Synthetic(TLS_DIR))) as usize;
     assert!(image[ours..ours + 48].iter().all(|it| *it == 0));
@@ -584,8 +576,7 @@ fn crt_tls_range_ends_before_its_end_marker() {
     used.u32(0);
     f.set(&Class::Rodata, used.0);
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (f.rva(rodata), 40));
 }
 
@@ -600,8 +591,7 @@ fn load_config_directory_is_sized_by_its_first_word() {
     config[..4].copy_from_slice(&0x140u32.to_le_bytes());
     f.set(&Class::Rodata, config);
     let image = f.image().unwrap();
-    let aligned = Aligned::new(&image);
-    let file = PeFile64::parse(aligned.bytes()).unwrap();
+    let file = PeFile64::parse(&image[..]).unwrap();
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG), (f.rva(rodata), 0x140));
 }
 
@@ -751,7 +741,9 @@ fn specials() {
     assert_eq!(pe.special("__blaze_live"), Some(Special::LiveDescriptor));
     assert_eq!(pe.special("__guard_flags"), Some(Special::Absolute(0)));
     assert_eq!(pe.special("__guard_fids_table"), Some(Special::Absolute(0)));
-    assert_eq!(pe.special("__imp_ExitProcess"), Some(Special::Got("ExitProcess".into())));
+    let got = pe.special("__imp_ExitProcess");
+    assert_eq!(got, Some(Special::Got { from: 6 }));
+    assert_eq!(got.as_ref().and_then(|it| it.got_target("__imp_ExitProcess")), Some("ExitProcess"));
     assert_eq!(pe.special("__imp_"), None);
     assert_eq!(pe.special("main"), None);
     assert_eq!(pe.shared_entry(), None);
@@ -766,13 +758,32 @@ fn encoders() {
     assert!(alignment(3).is_err());
     assert!(alignment(16384).is_err());
 
-    assert_eq!(pdb_name("app.exe"), "app.pdb");
-    assert_eq!(pdb_name("lib.v2.dll"), "lib.v2.pdb");
-    assert_eq!(pdb_name("tool"), "tool.pdb");
-    assert_eq!(pdb_name(".hidden"), ".hidden.pdb");
+    assert_eq!(pdb_stem("app.exe"), "app");
+    assert_eq!(pdb_stem("lib.v2.dll"), "lib.v2");
+    assert_eq!(pdb_stem("tool"), "tool");
+    assert_eq!(pdb_stem(".hidden"), ".hidden");
 
-    assert_eq!(words(r#" /A "/B:x y"  /C:"q r"  "#), ["/A", "/B:x y", "/C:q r"]);
-    assert_eq!(words("\0/X\0"), ["/X"]);
+    let all_words = |text: &str| {
+        let (mut seen, mut buf) = (Vec::new(), String::new());
+        words(text, &mut buf, |word| {
+            seen.push(word.to_owned());
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        seen
+    };
+    assert_eq!(all_words(r#" /A "/B:x y"  /C:"q r"  "#), ["/A", "/B:x y", "/C:q r"]);
+    assert_eq!(all_words("\0/X\0"), ["/X"]);
+    assert_eq!(all_words(r#"/"a" b"#), ["/a", "b"]);
+
+    assert_eq!(ImportName::Name { hint: 356, name: "ExitProcess" }.version(), "356 ExitProcess");
+    assert_eq!(ImportName::Name { hint: 0, name: "f" }.version(), "0 f");
+    assert_eq!(ImportName::Ordinal(65535).version(), "#65535");
+    for import in [ImportName::Name { hint: 7, name: "g" }, ImportName::Ordinal(115)] {
+        let version = import.version();
+        assert_eq!(version.capacity(), version.len(), "one allocation of the exact size");
+        assert_eq!(ImportName::parse("g", Some(&version)), Ok(import));
+    }
 
     assert_eq!(ImportName::parse("f", Some("12 f")), Ok(ImportName::Name { hint: 12, name: "f".into() }));
     assert_eq!(ImportName::parse("f", Some("3 g")), Ok(ImportName::Name { hint: 3, name: "g".into() }));
@@ -1096,6 +1107,32 @@ fn coff_object_sections_and_groups() {
             Directive::Mismatch { key: "_MSC_VER".into(), value: "1900".into() },
         ]
     );
+    let tie = |section, to| crate::model::Tie { section, to, ordered: false };
+    assert_eq!(object.ties, [tie(4, 3), tie(5, 3)], "`.pdata` and `.xdata` are kept with `.text$mn`");
+}
+
+/// SanitizerCoverage's tables of a COMDAT function: counters associative to the function,
+/// its PC table associative to the counters, and counters of a function outside any COMDAT.
+#[test]
+fn coff_associative_sections_are_tied_to_their_parent() {
+    let mut coff = Coff::default();
+    let text = coff.section(".text", TEXT, vec![0xc3; 4]);
+    let inline = coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0xc3; 4]);
+    let counters = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 2]);
+    let pcs = coff.section(".SCOVP$M", RDATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 16]);
+    let plain = coff.section(".SCOV$CM", DATA | pe::IMAGE_SCN_LNK_COMDAT, vec![0; 1]);
+    coff.section_symbol(text, 0, 0);
+    coff.section_symbol(inline, 0, pe::IMAGE_COMDAT_SELECT_ANY);
+    coff.symbol("inline_fn", 0, inline, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]);
+    coff.section_symbol(counters, inline as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
+    coff.section_symbol(pcs, counters as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
+    coff.section_symbol(plain, text as u16, pe::IMAGE_COMDAT_SELECT_ASSOCIATIVE);
+    let object = read_object(&coff.bytes());
+    let tie = |section, to| crate::model::Tie { section, to, ordered: false };
+    assert_eq!(object.ties, [tie(2, 1), tie(3, 2), tie(4, 0)], "each to its own parent");
+    assert_eq!(object.group_sections(&object.groups[0]), [1, 2, 3], "and in its root's group");
+    let retain: Vec<bool> = object.sections.iter().map(|it| it.retain).collect();
+    assert_eq!(retain, [true, false, false, false, true], "a non-COMDAT parent is always kept, so is its child");
 }
 
 #[test]
@@ -1356,4 +1393,158 @@ fn import_library_is_a_shared_per_dll() {
 
     let error = pe.read("x.dll", b"MZ\x90\0", &NativeKind::Shared { as_needed: true }).err().unwrap();
     assert!(error.contains("import library"), "{error}");
+}
+
+// Allocation budgets.
+
+/// What reading `bytes` as `kind` allocates on this thread.
+fn allocations(pe: &Pe, name: &str, bytes: &[u8], kind: NativeKind) -> u64 {
+    let (file, used) = measure(|| pe.read(name, bytes, &kind));
+    assert!(file.is_ok(), "{:?}", file.err());
+    used.allocations
+}
+
+/// An object of `functions` COMDAT functions (`.text$mn`, selection any), each calling the
+/// next, and a `.data` holding the address of each: two relocations per function.
+fn functions_object(functions: usize) -> Vec<u8> {
+    let mut coff = Coff::default();
+    let data = coff.section(".data", DATA, vec![0; 8 * functions]);
+    let texts: Vec<i16> = (0..functions)
+        .map(|_| coff.section(".text$mn", TEXT | pe::IMAGE_SCN_LNK_COMDAT, vec![0xe8, 0, 0, 0, 0, 0xc3]))
+        .collect();
+    // `.data`'s symbol and its aux record, then per function its section's symbol, the aux
+    // record and the function.
+    let function = |at: usize| 4 + 3 * at as u32;
+    for (at, &text) in texts.iter().enumerate() {
+        coff.relocate(text, 1, function((at + 1) % functions), pe::IMAGE_REL_AMD64_REL32);
+        coff.relocate(data, 8 * at as u32, function(at), pe::IMAGE_REL_AMD64_ADDR64);
+    }
+    assert_eq!(coff.section_symbol(data, 0, 0), 0);
+    for (at, &text) in texts.iter().enumerate() {
+        assert_eq!(coff.section_symbol(text, 0, pe::IMAGE_COMDAT_SELECT_ANY), function(at) - 2);
+        let name = format!("f{at}");
+        assert_eq!(coff.symbol(&name, 0, text, FUNCTION, pe::IMAGE_SYM_CLASS_EXTERNAL, &[]), function(at));
+    }
+    coff.bytes()
+}
+
+/// An import library of `members` short import members (`F<n>` and `__imp_F<n>` in its index)
+/// spread over `dlls` DLLs.
+fn import_archive(members: usize, dlls: usize) -> Vec<u8> {
+    let names: Vec<String> = (0..members).map(|at| format!("m{at}.dll")).collect();
+    let symbols: Vec<[String; 2]> = (0..members).map(|at| [format!("F{at}"), format!("__imp_F{at}")]).collect();
+    let indexed: Vec<[&str; 2]> = symbols.iter().map(|[a, b]| [a.as_str(), b.as_str()]).collect();
+    let list: Vec<(&str, Vec<u8>, &[&str])> = (0..members)
+        .map(|at| {
+            let dll = format!("D{}.dll", at % dlls);
+            let bytes = short_import(&symbols[at][0], &dll, 1, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME);
+            (names[at].as_str(), bytes, &indexed[at][..])
+        })
+        .collect();
+    archive(&list)
+}
+
+/// Reading a COFF object allocates each of its columns once, whatever its number of
+/// sections, symbols and relocations, and wherever its bytes are (an archive member is only
+/// 2-aligned): nothing per symbol, per relocation or per COMDAT.
+#[test]
+fn coff_object_read_allocates_a_constant_number_of_buffers() {
+    // The object's sections, relocations, names; the reader's section names, its symbols
+    // (which become the object's), per-section marks and defined symbols; and for COMDATs the
+    // groups' members, the object's groups and grouped sections. The symbol map and each
+    // section's group are the worker's scratch buffers, warm once a larger object was read
+    // on this thread. The radix sorts find their keys in order and allocate nothing.
+    const BUDGET: u64 = 10;
+    let pe = pe(exe());
+    let objects = [functions_object(8), functions_object(200)];
+    let warm = allocations(&pe, "t.obj", &objects[1], NativeKind::Object);
+    assert!(warm <= BUDGET + 2, "a cold read grows the two scratch buffers: {warm} allocations");
+    for (bytes, functions) in objects.iter().zip([8, 200]) {
+        let object = read_object(bytes);
+        assert_eq!(object.groups.len(), functions);
+        assert_eq!(object.fixups.len(), 2 * functions);
+        assert_eq!(object.name(object.groups[functions - 1].name), format!("f{}", functions - 1));
+        let mut shifted = vec![0u8];
+        shifted.extend_from_slice(bytes);
+        for input in [&bytes[..], &shifted[1..]] {
+            let used = allocations(&pe, "t.obj", input, NativeKind::Object);
+            assert_eq!(used, BUDGET, "{functions} functions");
+        }
+    }
+}
+
+/// Reading an archive allocates its three columns (members, index, names), each sized by a
+/// first pass over the member headers and the index, whatever its number of members.
+#[test]
+fn archive_read_allocates_its_three_columns() {
+    const BUDGET: u64 = 3;
+    let pe = pe(exe());
+    for members in [8, 200] {
+        let bytes = import_archive(members, 3);
+        let used = allocations(&pe, "x.lib", &bytes, NativeKind::Archive { whole: false });
+        assert_eq!(used, BUDGET, "{members} members");
+    }
+}
+
+/// Reading an import library allocates per member: each import's `Shared::versions` entry,
+/// and the amortized growth of its DLL's columns. The rest is per DLL or per library: the
+/// archive's three columns, the DLLs and their index, and each DLL's name.
+#[test]
+fn import_library_read_allocates_per_member() {
+    let pe = pe(exe());
+    let read = |members: usize| {
+        let bytes = import_archive(members, 3);
+        let used = allocations(&pe, "x.lib", &bytes, NativeKind::Shared { as_needed: true });
+        assert!(used <= 2 * members as u64 + 16, "{members} members: {used} allocations");
+        used
+    };
+    let (small, large) = (read(64), read(256));
+    assert!(large - small <= 2 * (256 - 64), "{small} and {large} allocations: at most two more per member");
+}
+
+/// The writer's lookups by name allocate nothing: what a name is to the link, a section's
+/// class and rank, an import's export name.
+#[test]
+fn name_lookups_allocate_nothing() {
+    let pe = pe(exe());
+    assert_at_most(0, "PE's name lookups", || {
+        let specials = [
+            "__ImageBase",
+            "_tls_used",
+            "_tls_index",
+            "__blaze_live",
+            "__guard_flags",
+            "__enclave_config",
+            "__imp_",
+            "__imp_ExitProcess",
+            "main",
+        ];
+        for name in specials {
+            std::hint::black_box(pe.special(name));
+        }
+        let sections = [".text$mn", ".rdata$r", ".xdata", ".data", ".bss", ".tls$", ".tls$ZZZ", ".CRT$XCU", ".pdata", ".rsrc$01"];
+        for name in sections {
+            std::hint::black_box(pe.section(name, false, false, false).is_ok());
+        }
+        std::hint::black_box(ImportName::parse("f", Some("356 ExitProcess")));
+        std::hint::black_box(ImportName::parse("f", Some("#115")));
+        std::hint::black_box((rank(Some("XCU")), place(&Class::Got), pe.prot(&Class::Text), pe.own(&Class::Tbss)));
+    });
+}
+
+/// `.reloc` of one piece (fewer rebased addresses than a thread's share) is one buffer, its
+/// bytes, whatever the number of addresses.
+#[test]
+fn base_relocations_of_one_piece_are_one_buffer() {
+    for count in [16u64, 4096] {
+        let pieces =
+            vec![(Class::Text, Data::Bytes(vec![0xc3; 0x10])), (Class::Data, Data::Bytes(vec![0; count as usize * 8]))];
+        let mut f = Fixture::new(exe(), pieces, &Counts::default());
+        let data = f.at(&Class::Data);
+        f.rebase = (0..count).map(|it| data + it * 8).collect();
+        let (relocations, used) =
+            f.placed(|placed| measure(|| image::relocations(Image::of(placed), &[data], usize::MAX)));
+        assert!(relocations.is_ok());
+        assert_eq!(used.allocations, 1, "{count} addresses: the bytes of `.reloc` alone");
+    }
 }

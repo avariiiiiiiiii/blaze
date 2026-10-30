@@ -6,16 +6,36 @@
 //! Inserting is a shift and a link, cancelling an unlink through its [`Handle`], and advancing
 //! walks the occupied slots in deadline order through one bitmap per level, moving a higher
 //! slot's timers down once time reaches it (each timer moves at most ten times). Timers of one
-//! deadline fire in the order they were inserted. Cost: 24 bytes of links per timer beside its
-//! value, 5.5 KiB of slot heads, and O(1) insert, cancel and step of an advance.
+//! deadline fire in the order they were inserted.
+//!
+//! The timers sit in a [`blaze_mem::Slab`] tagged [`MemTag::Io`] (docs/v2/plan/design/memory.md,
+//! "Generational handles"): a slot's list links are the generational handles of its timers, and
+//! a [`Handle`] is one of them, so a handle to a timer that fired or was cancelled is detected
+//! as stale even once its slot holds another timer. The slab reserves room for
+//! [`MAX_TIMERS`] up front and commits pages as the working set grows: a warm arm, cancel and
+//! fire make no call to the global allocator.
+//!
+//! Cost: 32 bytes of links per timer beside its value (and the slab's 8), 11 KiB of slot heads,
+//! and O(1) insert, cancel and step of an advance.
 
 use std::time::Duration;
+
+use blaze_mem::{MemError, Slab, Tag as MemTag};
+
+#[cfg(test)]
+mod reference;
 
 const BITS: u32 = 6;
 const SLOTS: usize = 1 << BITS;
 /// 11 groups of 6 bits cover 64.
 const LEVELS: usize = 11;
-const NIL: u32 = u32::MAX;
+/// A timer's `slot` before it is placed.
+const UNPLACED: u32 = u32::MAX;
+/// The bits of no timer: index `u32::MAX`, which no slab issues.
+const NONE: u64 = u64::MAX;
+
+/// The most timers one wheel holds at once: its slab's reservation, committed only as used.
+pub const MAX_TIMERS: u32 = 1 << 22;
 
 /// A tick count for `duration`: nanoseconds, the last tick for one past what `u64` holds
 /// (some 584 years).
@@ -23,33 +43,31 @@ pub fn ticks(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Names a timer in the wheel until it fires or is cancelled; a stale one names nothing.
+/// Names a timer in the wheel until it fires or is cancelled; a stale one names nothing, even
+/// after its slot is reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Handle {
-    index: u32,
-    generation: u32,
-}
+pub struct Handle(u64);
 
-/// A timer's place: its deadline and the links of its slot's list, in insertion order.
-#[derive(Clone, Copy)]
-struct Link {
+/// A timer in the wheel: its deadline, its place and the links of its slot's list, in
+/// insertion order.
+pub struct Timer<T> {
     deadline: u64,
-    prev: u32,
-    next: u32,
-    generation: u32,
-    /// `level * SLOTS + slot`, or [`NIL`] while free (then `next` is the next free entry).
+    prev: u64,
+    next: u64,
+    /// `level * SLOTS + slot`.
     slot: u32,
+    value: T,
 }
 
-const _: () = assert!(size_of::<Link>() == 24);
+type Id<T> = blaze_mem::Handle<Timer<T>>;
 
 #[derive(Clone, Copy)]
 struct List {
-    head: u32,
-    tail: u32,
+    head: u64,
+    tail: u64,
 }
 
-const EMPTY: List = List { head: NIL, tail: NIL };
+const EMPTY: List = List { head: NONE, tail: NONE };
 
 pub struct Wheel<T> {
     /// Every timer due at or before this has fired.
@@ -57,10 +75,7 @@ pub struct Wheel<T> {
     /// Bit `slot` of level `level`: that slot's list is not empty.
     occupied: [u64; LEVELS],
     slots: Box<[List; LEVELS * SLOTS]>,
-    links: Vec<Link>,
-    values: Vec<Option<T>>,
-    free: u32,
-    len: usize,
+    timers: Slab<Timer<T>>,
     /// The soonest deadline, while known; recomputed after the timer that had it leaves.
     soonest: Option<u64>,
 }
@@ -72,25 +87,33 @@ impl<T> Default for Wheel<T> {
 }
 
 impl<T> Wheel<T> {
+    /// A wheel of at most [`MAX_TIMERS`] timers; stops when the address space for them cannot
+    /// be reserved.
+    #[track_caller]
     pub fn new() -> Wheel<T> {
-        Wheel {
-            now: 0,
-            occupied: [0; LEVELS],
-            slots: Box::new([EMPTY; LEVELS * SLOTS]),
-            links: Vec::new(),
-            values: Vec::new(),
-            free: NIL,
-            len: 0,
-            soonest: None,
+        match Wheel::try_new(MAX_TIMERS) {
+            Ok(wheel) => wheel,
+            Err(error) => panic!("{error}"),
         }
     }
 
+    /// A wheel of at most `max` timers, reserving their room and committing none.
+    pub fn try_new(max: u32) -> Result<Wheel<T>, MemError> {
+        Ok(Wheel {
+            now: 0,
+            occupied: [0; LEVELS],
+            slots: Box::new([EMPTY; LEVELS * SLOTS]), // alloc: once per wheel, at setup
+            timers: Slab::new(max, MemTag::Io)?,
+            soonest: None,
+        })
+    }
+
     pub fn len(&self) -> usize {
-        self.len
+        self.timers.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.timers.is_empty()
     }
 
     /// The wheel's time: what the last [`Wheel::advance`] went to.
@@ -98,63 +121,58 @@ impl<T> Wheel<T> {
         self.now
     }
 
-    /// `value` due at `deadline`; one already passed is due at the next advance.
+    /// `value` due at `deadline`; one already passed is due at the next advance. Stops when
+    /// the wheel holds [`MAX_TIMERS`] (its `max`) already.
+    #[track_caller]
     pub fn insert(&mut self, deadline: u64, value: T) -> Handle {
+        match self.try_insert(deadline, value) {
+            Ok(handle) => handle,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// As [`Wheel::insert`], or the error naming the subsystem when the wheel is full.
+    pub fn try_insert(&mut self, deadline: u64, value: T) -> Result<Handle, MemError> {
         let deadline = deadline.max(self.now);
-        let index = match self.free {
-            NIL => {
-                let index = u32::try_from(self.links.len()).ok().filter(|&it| it != NIL);
-                let index = index.expect("fewer than 2^32 - 1 timers at once");
-                self.links.push(Link { deadline, prev: NIL, next: NIL, generation: 0, slot: NIL });
-                self.values.push(Some(value));
-                index
-            }
-            index => {
-                self.free = self.links[index as usize].next;
-                self.links[index as usize].deadline = deadline;
-                self.values[index as usize] = Some(value);
-                index
-            }
-        };
-        self.place(index);
-        self.len += 1;
-        self.soonest = match (self.len, self.soonest) {
+        let id = self.timers.try_insert(Timer {
+            deadline,
+            prev: NONE,
+            next: NONE,
+            slot: UNPLACED,
+            value,
+        })?;
+        self.place(id);
+        self.soonest = match (self.timers.len(), self.soonest) {
             (1, _) => Some(deadline),
             (_, Some(soonest)) => Some(soonest.min(deadline)),
             (_, None) => None,
         };
-        Handle { index, generation: self.links[index as usize].generation }
+        Ok(Handle(id.to_bits()))
     }
 
     /// The timer's deadline, while it is in the wheel.
     pub fn deadline(&self, handle: Handle) -> Option<u64> {
-        self.live(handle).then(|| self.links[handle.index as usize].deadline)
+        self.timers.get(Id::from_bits(handle.0)).map(|timer| timer.deadline)
     }
 
     pub fn get_mut(&mut self, handle: Handle) -> Option<&mut T> {
-        match self.live(handle) {
-            true => self.values[handle.index as usize].as_mut(),
-            false => None,
-        }
+        self.timers.get_mut(Id::from_bits(handle.0)).map(|timer| &mut timer.value)
     }
 
     /// The timer taken out before it fires; `None` once it has fired or been cancelled.
     pub fn cancel(&mut self, handle: Handle) -> Option<T> {
-        if !self.live(handle) {
-            return None;
-        }
-        let index = handle.index;
-        let deadline = self.links[index as usize].deadline;
-        self.unlink(index);
+        let id = Id::from_bits(handle.0);
+        let deadline = self.timers.get(id)?.deadline;
+        self.unlink(id);
         if self.soonest == Some(deadline) {
             self.soonest = None;
         }
-        Some(self.release(index))
+        self.timers.remove(id).map(|timer| timer.value)
     }
 
     /// The soonest deadline of a timer in the wheel.
     pub fn next_deadline(&mut self) -> Option<u64> {
-        if self.len == 0 {
+        if self.timers.is_empty() {
             return None;
         }
         if let Some(soonest) = self.soonest {
@@ -167,10 +185,10 @@ impl<T> Wheel<T> {
             _ => {
                 let mut soonest = u64::MAX;
                 let mut at = self.slots[level * SLOTS + slot].head;
-                while at != NIL {
-                    let link = &self.links[at as usize];
-                    soonest = soonest.min(link.deadline);
-                    at = link.next;
+                while at != NONE {
+                    let timer = self.linked(at);
+                    soonest = soonest.min(timer.deadline);
+                    at = timer.next;
                 }
                 soonest
             }
@@ -192,20 +210,22 @@ impl<T> Wheel<T> {
             let list = std::mem::replace(&mut self.slots[level * SLOTS + slot], EMPTY);
             self.occupied[level] &= !(1 << slot);
             let mut at = list.head;
-            while at != NIL {
-                let next = self.links[at as usize].next;
+            while at != NONE {
+                let next = self.linked(at).next;
                 match level {
                     0 => {
-                        let deadline = self.links[at as usize].deadline;
-                        if self.soonest.is_some_and(|it| it <= deadline) {
+                        let timer = self
+                            .timers
+                            .remove(Id::from_bits(at))
+                            .expect("a linked timer is in the wheel");
+                        if self.soonest.is_some_and(|it| it <= timer.deadline) {
                             self.soonest = None;
                         }
-                        let value = self.release(at);
-                        fire(deadline, value);
+                        fire(timer.deadline, timer.value);
                     }
                     // Every level below is empty, so each goes to the tail of an empty list in
                     // the order it was inserted.
-                    _ => self.place(at),
+                    _ => self.place(Id::from_bits(at)),
                 }
                 at = next;
             }
@@ -220,10 +240,13 @@ impl<T> Wheel<T> {
         self.now = now;
     }
 
-    fn live(&self, handle: Handle) -> bool {
-        self.links
-            .get(handle.index as usize)
-            .is_some_and(|it| it.generation == handle.generation && it.slot != NIL)
+    /// The timer a list link names: every link is to a timer in the wheel.
+    fn linked(&self, bits: u64) -> &Timer<T> {
+        self.timers.get(Id::from_bits(bits)).expect("a linked timer is in the wheel")
+    }
+
+    fn linked_mut(&mut self, bits: u64) -> &mut Timer<T> {
+        self.timers.get_mut(Id::from_bits(bits)).expect("a linked timer is in the wheel")
     }
 
     /// The occupied slot of the lowest level: every timer of a lower level is due before any
@@ -240,51 +263,41 @@ impl<T> Wheel<T> {
         (self.now & above) | ((slot as u64) << (BITS * level as u32))
     }
 
-    /// Links `index` at the tail of the slot its deadline names from the wheel's time.
-    fn place(&mut self, index: u32) {
-        let deadline = self.links[index as usize].deadline;
+    /// Links `id` at the tail of the slot its deadline names from the wheel's time.
+    fn place(&mut self, id: Id<T>) {
+        let bits = id.to_bits();
+        let deadline = self.linked(bits).deadline;
         let differ = (self.now ^ deadline) | (SLOTS as u64 - 1);
         let level = ((63 - differ.leading_zeros()) / BITS) as usize;
         let slot = ((deadline >> (BITS * level as u32)) as usize) & (SLOTS - 1);
         let at = level * SLOTS + slot;
         let tail = self.slots[at].tail;
-        let link = &mut self.links[index as usize];
-        link.prev = tail;
-        link.next = NIL;
-        link.slot = at as u32;
+        let timer = self.linked_mut(bits);
+        timer.prev = tail;
+        timer.next = NONE;
+        timer.slot = at as u32;
         match tail {
-            NIL => self.slots[at].head = index,
-            tail => self.links[tail as usize].next = index,
+            NONE => self.slots[at].head = bits,
+            tail => self.linked_mut(tail).next = bits,
         }
-        self.slots[at].tail = index;
+        self.slots[at].tail = bits;
         self.occupied[level] |= 1 << slot;
     }
 
-    fn unlink(&mut self, index: u32) {
-        let Link { prev, next, slot, .. } = self.links[index as usize];
-        let list = &mut self.slots[slot as usize];
+    fn unlink(&mut self, id: Id<T>) {
+        let timer = self.linked(id.to_bits());
+        let (prev, next, slot) = (timer.prev, timer.next, timer.slot as usize);
         match prev {
-            NIL => list.head = next,
-            prev => self.links[prev as usize].next = next,
+            NONE => self.slots[slot].head = next,
+            prev => self.linked_mut(prev).next = next,
         }
         match next {
-            NIL => list.tail = prev,
-            next => self.links[next as usize].prev = prev,
+            NONE => self.slots[slot].tail = prev,
+            next => self.linked_mut(next).prev = prev,
         }
-        if list.head == NIL {
-            self.occupied[slot as usize / SLOTS] &= !(1 << (slot as usize % SLOTS));
+        if self.slots[slot].head == NONE {
+            self.occupied[slot / SLOTS] &= !(1 << (slot % SLOTS));
         }
-    }
-
-    /// Frees an entry already out of its list, for the next insert.
-    fn release(&mut self, index: u32) -> T {
-        let link = &mut self.links[index as usize];
-        link.slot = NIL;
-        link.generation = link.generation.wrapping_add(1);
-        link.next = self.free;
-        self.free = index;
-        self.len -= 1;
-        self.values[index as usize].take().expect("a timer in the wheel has its value")
     }
 }
 
@@ -323,16 +336,18 @@ mod tests {
         }
     }
 
-    /// Against the model on every seed: inserts (passed, now, near, far, at the end of time,
-    /// on level boundaries, many on one deadline), cancels of live and stale handles, the
-    /// soonest deadline, and advances small, large and backwards.
+    /// Against the model and the `Vec`-backed wheel it replaced, on every seed: inserts
+    /// (passed, now, near, far, at the end of time, on level boundaries, many on one deadline),
+    /// cancels of live and stale handles, the soonest deadline, and advances small, large and
+    /// backwards. All three fire the same timers in the same order.
     #[test]
     fn fires_as_sorting_by_deadline_then_insertion_does() {
         for seed in 0..400 {
             let mut rng = Rng::new(seed);
             let mut wheel = Wheel::new();
+            let mut old = reference::Wheel::new();
             let mut model = Model::default();
-            let mut handles: Vec<(Handle, u32)> = Vec::new();
+            let mut handles: Vec<(Handle, reference::Handle, u32)> = Vec::new();
             let mut inserted = 0u64;
             for _ in 0..600 {
                 match rng.below(10) {
@@ -340,24 +355,29 @@ mod tests {
                         let at = deadline(&mut rng, model.now);
                         let value = inserted as u32;
                         let handle = wheel.insert(at, value);
+                        let old_handle = old.insert(at, value);
                         assert_eq!(wheel.deadline(handle), Some(at.max(model.now)), "seed {seed}");
+                        assert_eq!(wheel.deadline(handle), old.deadline(old_handle), "seed {seed}");
                         model.timers.push((at.max(model.now), inserted, value));
-                        handles.push((handle, value));
+                        handles.push((handle, old_handle, value));
                         inserted += 1;
                     }
                     5 | 6 if !handles.is_empty() => {
-                        let (handle, value) =
+                        let (handle, old_handle, value) =
                             handles.swap_remove(rng.below(handles.len() as u64) as usize);
                         let live = model.timers.iter().position(|it| it.2 == value);
                         assert_eq!(wheel.cancel(handle), live.map(|_| value), "seed {seed}");
+                        assert_eq!(old.cancel(old_handle), live.map(|_| value), "seed {seed}");
                         if let Some(at) = live {
                             model.timers.remove(at);
                         }
                         assert_eq!(wheel.cancel(handle), None, "seed {seed}: cancelled twice");
+                        assert_eq!(wheel.deadline(handle), None, "seed {seed}: stale");
                     }
                     7 => {
                         let soonest = model.timers.iter().map(|it| it.0).min();
                         assert_eq!(wheel.next_deadline(), soonest, "seed {seed}");
+                        assert_eq!(old.next_deadline(), soonest, "seed {seed}");
                     }
                     _ => {
                         let to = match rng.below(5) {
@@ -368,11 +388,16 @@ mod tests {
                         };
                         let mut fired = Vec::new();
                         wheel.advance(to, |at, value| fired.push((at, value)));
+                        let mut old_fired = Vec::new();
+                        old.advance(to, |at, value| old_fired.push((at, value)));
                         assert_eq!(fired, model.advance(to), "seed {seed}");
+                        assert_eq!(fired, old_fired, "seed {seed}");
                         assert_eq!(wheel.now(), model.now, "seed {seed}");
+                        assert_eq!(old.now(), model.now, "seed {seed}");
                     }
                 }
                 assert_eq!(wheel.len(), model.timers.len(), "seed {seed}");
+                assert_eq!(old.len(), model.timers.len(), "seed {seed}");
             }
             let mut rest = Vec::new();
             wheel.drain(|at, value| rest.push((at, value)));
@@ -402,8 +427,46 @@ mod tests {
         let first = wheel.insert(10, "a");
         wheel.advance(10, |_, _| {});
         let second = wheel.insert(20, "b");
+        assert_ne!(first, second, "the reused slot has a new generation");
         assert_eq!((wheel.cancel(first), wheel.deadline(first)), (None, None));
+        assert_eq!(wheel.get_mut(first), None);
         assert_eq!(wheel.get_mut(second).copied(), Some("b"));
         assert_eq!(wheel.cancel(second), Some("b"));
+    }
+
+    #[test]
+    fn a_full_wheel_is_an_error_naming_io() {
+        let mut wheel = Wheel::try_new(2).unwrap();
+        wheel.try_insert(1, ()).unwrap();
+        wheel.try_insert(2, ()).unwrap();
+        let error = wheel.try_insert(3, ()).unwrap_err();
+        assert_eq!(error.tag(), MemTag::Io, "{error}");
+        assert_eq!(wheel.len(), 2);
+    }
+
+    /// Once the slab has grown to the working set, arming, cancelling and firing timers make
+    /// no call to the global allocator.
+    #[test]
+    fn a_warm_arm_and_fire_allocates_nothing() {
+        let mut wheel = Wheel::new();
+        for at in 0..64u64 {
+            wheel.insert(at, at);
+        }
+        wheel.advance(64, |_, _| {});
+        let mut fired = 0u64;
+        blaze_alloc_count::assert_at_most(0, "a warm timer arm, cancel and fire", || {
+            for round in 0..10_000u64 {
+                let now = wheel.now();
+                let far = wheel.insert(now + 3 + (round << 20), round);
+                let near = wheel.insert(now + 2, round);
+                assert_eq!(wheel.cancel(far), Some(round));
+                wheel.advance(now + 2, |_, value| {
+                    assert_eq!(value, round);
+                    fired += 1;
+                });
+                assert_eq!(wheel.deadline(near), None);
+            }
+        });
+        assert_eq!(fired, 10_000);
     }
 }

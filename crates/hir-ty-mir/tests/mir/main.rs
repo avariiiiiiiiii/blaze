@@ -9,6 +9,7 @@ mod source_names;
 mod storage;
 mod threads;
 mod ub_checks;
+mod unwind;
 
 use hir_def::{
     ConstId, FunctionId, ModuleDefId,

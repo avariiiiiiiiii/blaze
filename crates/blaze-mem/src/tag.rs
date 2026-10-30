@@ -40,11 +40,13 @@ pub enum Tag {
     /// Chunks cached for arenas and not held by any.
     Chunks,
     Api,
+    /// The fuzzer's corpus and its jobs.
+    Fuzz,
     Other,
 }
 
 impl Tag {
-    pub const COUNT: usize = 18;
+    pub const COUNT: usize = 19;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -64,6 +66,7 @@ impl Tag {
         Tag::Frames,
         Tag::Chunks,
         Tag::Api,
+        Tag::Fuzz,
         Tag::Other,
     ];
 
@@ -90,6 +93,7 @@ impl Tag {
             Tag::Frames => "frames",
             Tag::Chunks => "chunks",
             Tag::Api => "api",
+            Tag::Fuzz => "fuzz",
             Tag::Other => "other",
         }
     }

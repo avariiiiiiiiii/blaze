@@ -3,6 +3,7 @@
 use std::cmp;
 use std::ops::Range;
 
+use hir_def::TypeParamId;
 use rustc_type_ir::TyVid;
 use rustc_type_ir::UniverseIndex;
 use rustc_type_ir::inherent::Ty as _;
@@ -38,6 +39,10 @@ pub(crate) struct TypeVariableStorage<'db> {
     /// type of `x` is only a supertype of the argument of `returns_arg`. We
     /// still want to suggest specifying the type of the argument.
     sub_unification_table: UnionFind<TyVid, TypeVariableSubValue>,
+    /// The type parameter each variable made for one stands for (rustc's
+    /// `TypeVariableOrigin::param_def_id`), in variable order. Per variable, not per set, as in
+    /// rustc; sparse, as most variables stand for no parameter.
+    params: Vec<(TyVid, TypeParamId)>,
 }
 
 /// Where both tables of type variables stood when a snapshot started.
@@ -94,6 +99,12 @@ impl<'db> TypeVariableStorage<'db> {
         self.sub_unification_table.try_probe_value(vid).is_some()
     }
 
+    /// The count of changes to both tables; see `UnionFind::changes`.
+    #[inline]
+    pub(crate) fn changes(&self) -> u64 {
+        self.eq_relations.changes() + self.sub_unification_table.changes()
+    }
+
     pub(crate) fn start_snapshot(&mut self) -> TypeVariableMark {
         TypeVariableMark {
             eq: self.eq_relations.start_snapshot(),
@@ -104,6 +115,16 @@ impl<'db> TypeVariableStorage<'db> {
     pub(crate) fn rollback_to(&mut self, mark: TypeVariableMark) {
         self.eq_relations.rollback_to(mark.eq);
         self.sub_unification_table.rollback_to(mark.sub);
+        let len = self.eq_relations.len();
+        while self.params.last().is_some_and(|&(vid, _)| vid.as_usize() >= len) {
+            self.params.pop();
+        }
+    }
+
+    /// The type parameter `vid` was made for, if any.
+    pub(crate) fn param(&self, vid: TyVid) -> Option<TypeParamId> {
+        let at = self.params.binary_search_by_key(&vid, |&(vid, _)| vid).ok()?;
+        Some(self.params[at].1)
     }
 
     pub(crate) fn commit(&mut self, mark: TypeVariableMark) {
@@ -165,6 +186,20 @@ impl<'db> TypeVariableTable<'_, 'db> {
         eq_key
     }
 
+    /// Like `new_var`, remembering the type parameter the variable stands for.
+    pub(crate) fn new_var_for_param(
+        &mut self,
+        universe: UniverseIndex,
+        span: Span,
+        param: Option<TypeParamId>,
+    ) -> TyVid {
+        let vid = self.new_var(universe, span);
+        if let Some(param) = param {
+            self.storage.params.push((vid, param));
+        }
+        vid
+    }
+
     /// Returns the number of type variables created thus far.
     pub(crate) fn num_vars(&self) -> usize {
         self.storage.eq_relations.len()
@@ -217,10 +252,18 @@ impl<'db> TypeVariableTable<'_, 'db> {
     }
 
     /// Returns a range of the type variables created during the snapshot.
-    pub(crate) fn vars_since_snapshot(&mut self, value_count: usize) -> (Range<TyVid>, Vec<Span>) {
+    pub(crate) fn vars_since_snapshot(
+        &mut self,
+        value_count: usize,
+    ) -> (Range<TyVid>, Vec<(Span, Option<TypeParamId>)>) {
         let range = TyVid::from_usize(value_count)..TyVid::from_usize(self.num_vars());
-        // alloc: only when fudging, one span per variable made in the snapshot.
-        (range.start..range.end, iter_idx_range(range).map(|index| self.var_span(index)).collect())
+        (
+            range.start..range.end,
+            iter_idx_range(range)
+                .map(|vid| (self.var_span(vid), self.storage.param(vid)))
+                // alloc: only when fudging, one origin per variable made in the snapshot.
+                .collect(),
+        )
     }
 
     /// Returns indices of all root variables that are not yet instantiated.

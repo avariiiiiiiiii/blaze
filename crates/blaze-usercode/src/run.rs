@@ -420,15 +420,19 @@ mod tests {
         fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             Ok((path == Path::new("/ws")).then(|| listing([OsStr::new("data")])))
         }
-        fn env(&mut self, name: &OsStr) -> Option<OsString> {
-            self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+        fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+            self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
         }
         fn env_all(&mut self) -> &[(OsString, OsString)] {
             self.env.sort();
             &self.env
         }
-        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-            Ok((path == Path::new("/ws")).then(|| vec![(OsString::from("data"), false)]))
+        fn names(&mut self, path: &Path, out: &mut crate::trace::Names<'_>) -> Result<bool, String> {
+            if path != Path::new("/ws") {
+                return Ok(false);
+            }
+            out.push(OsStr::new("data"), false);
+            Ok(true)
         }
     }
 

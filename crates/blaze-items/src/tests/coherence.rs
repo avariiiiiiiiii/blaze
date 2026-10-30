@@ -167,7 +167,7 @@ fn a_specializing_impl_asks_only_the_impls_its_header_unifies_with() {
     let main = crate_named(&db, "main");
     let good = function_named(&db, main, "good");
     let bad = function_named(&db, main, "bad");
-    let executed = db.executed(|| {
+    let executed = db.log_executed(|| {
         assert!(!has_type_mismatches(&db, good), "`<S as Tr>::A` is `u8`");
         assert!(has_type_mismatches(&db, bad), "`<S as Tr>::A` is no `u16`");
     });
@@ -192,7 +192,7 @@ pub fn opaque() -> Opaque { 0u32 }
 fn an_alias_without_impl_trait_infers_no_body() {
     let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{TAITS}"));
     let plain = type_alias_named(&db, crate_named(&db, "main"), "Plain");
-    let executed = db.executed(|| {
+    let executed = db.log_executed(|| {
         hir_ty::attach_db(&db, || assert_eq!(tait_hidden_types(&db, plain).values().count(), 0))
     });
     assert_eq!(runs(&executed, "infer_body_query"), 0, "{executed:#?}");
@@ -202,7 +202,7 @@ fn an_alias_without_impl_trait_infers_no_body() {
 fn an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body() {
     let (db, _) = TestDB::with_single_file(&format!("//- /main.rs crate:main\n{TAITS}"));
     let opaque = type_alias_named(&db, crate_named(&db, "main"), "Opaque");
-    let executed = db.executed(|| {
+    let executed = db.log_executed(|| {
         hir_ty::attach_db(&db, || {
             let hidden: Vec<_> = tait_hidden_types(&db, opaque)
                 .values()
@@ -239,9 +239,9 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
 
     let (db, _) = TestDB::with_many_files(ORPHAN);
     let impls = self::impls(&db, crate_named(&db, "main"));
-    let plain = db.executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[2]))));
+    let plain = db.log_executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[2]))));
     assert_eq!(runs(&plain, "trait_environment_query"), 0, "{plain:#?}");
-    let alias = db.executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[1]))));
+    let alias = db.log_executed(|| hir_ty::attach_db(&db, || assert!(check_orphan_rules(&db, impls[1]))));
     assert!(runs(&alias, "trait_environment_query") >= 1, "{alias:#?}");
 }
 

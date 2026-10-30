@@ -9,19 +9,30 @@
 //! Sockets are in memory: a connect to an address listened on in the simulation makes both
 //! ends, and [`Sim::dial`] is a peer from outside (an agent's client, a webhook) that the test
 //! plays with [`Sim::peer_send`], [`Sim::peer_received`] and [`Sim::peer_hangup`].
+//!
+//! What is in flight sits where a real driver keeps it (docs/v2/plan/design/memory.md,
+//! "Generational handles"): effects in a [`Wheel`], spawns, watches and listens in [`Tagged`]
+//! slabs named by the asker's tag, and the ends of connections in a [`Slab`] whose handle bits
+//! are the [`Conn`], all tagged [`MemTag::Io`]. A warm cycle allocates nothing but what the
+//! completions carry. A completion told for an op that has ended by the time it is due (a
+//! change of a watch whose end came first, a receive on an end hung up meanwhile) names a stale
+//! handle: it is detected when due, the change dropped and the receive told empty, and counted
+//! ([`Sim::stale`]). The scheduler makes both races happen on some seeds: a watch that is
+//! ending is still told some of the changes made meanwhile, as a system that queued them before
+//! it saw the unwatch.
 
 mod journal;
 
-use std::{path::PathBuf, time::Duration};
+use std::{mem, path::PathBuf, time::Duration};
 
-use blaze_radix as radix;
-
-pub use self::journal::Journal;
+use blaze_mem::{Slab, Tag as MemTag};
 use rustc_hash::FxHashMap;
 
+pub use self::journal::Journal;
 use crate::{
     Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, Tag,
-    wheel::{self, Handle, Wheel},
+    threads::tagged::{Id, Tagged},
+    wheel::{self, Wheel},
 };
 
 /// What a simulated program does when spawned: how it ends, and how long it runs.
@@ -33,21 +44,39 @@ pub struct Ran {
 
 /// A simulated program: given the command it was spawned with and the simulation's random
 /// numbers, what its run is.
+// dyn: a test's program, given once per path and called once per spawn of it.
 pub type Program = Box<dyn FnMut(&Command, &mut Rng) -> Ran>;
 
 /// The signal a kill or a passed memory limit ends a process with.
 pub const KILLED: i32 = 9;
 
+/// The most ends of connections at once: their slab's reservation, committed as used.
+const MAX_ENDS: u32 = 1 << 20;
+
+/// The room reserved at the start for what is in flight at once, so a warm run does not grow.
+const RESERVE: usize = 256;
+
+/// A change made under a watch that is ending is still told once in this many, as a system
+/// that queued it before it saw the unwatch: when it is due after the end, it is stale.
+const RACE_ONE_IN: u32 = 3;
+
+type EndId = blaze_mem::Handle<End>;
+
+fn end_of(conn: Conn) -> EndId {
+    EndId::from_bits(conn.0)
+}
+
 /// One end of a connection.
 #[derive(Debug, Default)]
 struct End {
     /// The other end, or `None` for a peer outside the simulation the test plays.
-    peer: Option<Conn>,
+    peer: Option<EndId>,
     /// Sent to this end, not yet received.
     inbox: Vec<u8>,
     /// Sent by this end to a peer outside, not yet taken by the test.
     outbox: Vec<u8>,
-    /// This end hung up.
+    /// This end hung up: kept only while a peer outside may still take what it was sent, and
+    /// named by no effect.
     closed: bool,
     /// The other end hung up.
     peer_closed: bool,
@@ -127,6 +156,7 @@ struct SimFile {
 
 impl Default for SimFile {
     fn default() -> SimFile {
+        // alloc: none, two empty vectors.
         SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644 }
     }
 }
@@ -136,7 +166,9 @@ impl SimFile {
         SimFile { durable: bytes, ..SimFile::default() }
     }
 
+    /// The whole file, for the test's look at it or a copy of it.
     fn contents(&self) -> Vec<u8> {
+        // clone: a copy of the file's bytes, which is what is asked for.
         let mut bytes = self.durable.clone();
         for op in &self.ops {
             op.apply(&mut bytes);
@@ -144,11 +176,20 @@ impl SimFile {
         bytes
     }
 
+    /// Its length with every change applied, without making its bytes.
+    fn len(&self) -> u64 {
+        self.ops.iter().fold(self.durable.len() as u64, |len, op| match op {
+            Op::Append(more) => len + more.len() as u64,
+            Op::At(at, more) => len.max(at + more.len() as u64),
+            Op::Cut(to) => *to,
+        })
+    }
+
     /// The first `covers` of its changes made durable.
     fn sync(&mut self, covers: usize) {
-        let covered: Vec<Op> = self.ops.drain(..covers.min(self.ops.len())).collect();
-        for op in &covered {
-            op.apply(&mut self.durable);
+        let SimFile { durable, ops, .. } = self;
+        for op in ops.drain(..covers.min(ops.len())) {
+            op.apply(durable);
         }
     }
 }
@@ -178,6 +219,7 @@ impl Op {
 
     /// The change cut short, as a power cut leaves a write it was in the middle of.
     fn torn(&self, rng: &mut Rng) -> Option<Op> {
+        // alloc: a crash, not an op: the part of the change that landed.
         let part = |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
         match self {
             Op::Append(more) => Some(Op::Append(part(more, rng))),
@@ -192,6 +234,48 @@ struct Pending {
     effect: Effect,
     /// For a sync: how many changes the file had not synced when it was submitted.
     covers: usize,
+    /// For a spawn: its run.
+    spawn: Option<Id<Spawning>>,
+}
+
+/// A spawn in flight: its run, decided when it was spawned, and where its end waits.
+struct Spawning {
+    exit: Exit,
+    pending: Option<wheel::Handle>,
+}
+
+struct Watching {
+    dir: FileName,
+    /// Told as [`Done::Journaled`] from the disk's journal of changes.
+    journal: bool,
+    /// Unwatched: its end is told, and it is no longer in flight as a watch.
+    ending: bool,
+}
+
+/// What a told completion names that can end before it is due.
+#[derive(Clone, Copy)]
+enum Of {
+    /// Nothing that ends first.
+    Op,
+    /// A change or journal batch of the watch: dropped if the watch has ended by then.
+    Change(Id<Watching>),
+    /// The watch's end: it ends as this is delivered.
+    End(Id<Watching>),
+    /// What a receive on the end got: told empty if the end has hung up by then.
+    Recv(EndId),
+}
+
+struct Told {
+    at: Duration,
+    completion: Completion,
+    of: Of,
+}
+
+#[derive(Clone, Copy)]
+struct Receiving {
+    tag: Tag,
+    end: EndId,
+    most: usize,
 }
 
 pub struct Sim {
@@ -202,24 +286,51 @@ pub struct Sim {
     /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
     /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
     pending: Wheel<Pending>,
-    /// The pending effect of each spawn in flight, for a kill to bring forward.
-    spawning: FxHashMap<Tag, Handle>,
+    /// Each spawn in flight, for a kill to bring its end forward.
+    spawns: Tagged<Spawning>,
     /// What was ready at the last poll, kept for the next's.
     ready: Vec<Pending>,
-    watches: FxHashMap<Tag, FileName>,
+    watches: Tagged<Watching>,
+    /// Of `watches`, those ending.
+    ending: usize,
     /// Inodes, change times and the journal of changes, which a crash keeps.
     disk: journal::Disk,
     /// Changes and ends of watches, accepts and ends of listens, and what sockets did, each
-    /// ready at its time.
-    told: Vec<(Duration, Completion)>,
+    /// ready at its time, in the order they were told.
+    told: Vec<Told>,
+    /// What a poll left in `told`, swapped with it: both keep their room.
+    later: Vec<Told>,
     programs: FxHashMap<PathBuf, Program>,
-    /// The run of each spawn in flight, decided when it was spawned.
-    runs: FxHashMap<Tag, Exit>,
-    listens: FxHashMap<Tag, Address>,
-    ends: FxHashMap<Conn, End>,
-    next_conn: u64,
-    /// Receives waiting for bytes or a hang-up: tag, connection, at most.
-    receiving: Vec<(Tag, Conn, usize)>,
+    listens: Tagged<Address>,
+    ends: Slab<End>,
+    /// Receives waiting for bytes or a hang-up.
+    receiving: Vec<Receiving>,
+    /// A file's bytes with its unsynced changes applied, made for a read and kept for the next.
+    scratch: Vec<u8>,
+    /// Completions told for an op that had ended when they were due.
+    stale: u64,
+}
+
+/// A delay drawn up to the simulation's latency.
+fn latency(rng: &mut Rng, faults: &Faults) -> Duration {
+    Duration::from_nanos(rng.below(faults.max_latency.as_nanos() as u64 + 1))
+}
+
+/// `at`, or later: after everything told of `a` or `b`.
+fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
+    told.iter()
+        .filter(|it| it.completion.tag == a || it.completion.tag == b)
+        .map(|it| it.at)
+        .fold(at, Duration::max)
+}
+
+/// The file `name` of the simulated disk, made empty if it is not there.
+fn file_mut<'a>(files: &'a mut FxHashMap<FileName, SimFile>, name: &FileName) -> &'a mut SimFile {
+    if !files.contains_key(name) {
+        // clone: once per file new to the simulated disk, its key.
+        files.insert(name.clone(), SimFile::default());
+    }
+    files.get_mut(name).expect("there now")
 }
 
 impl Sim {
@@ -230,29 +341,30 @@ impl Sim {
             now: Duration::ZERO,
             files: FxHashMap::default(),
             pending: Wheel::new(),
-            spawning: FxHashMap::default(),
-            ready: Vec::new(),
-            watches: FxHashMap::default(),
+            spawns: Tagged::new(RESERVE),
+            ready: Vec::with_capacity(RESERVE),
+            watches: Tagged::new(RESERVE),
+            ending: 0,
             disk: journal::Disk::default(),
-            told: Vec::new(),
+            told: Vec::with_capacity(RESERVE),
+            later: Vec::with_capacity(RESERVE),
             programs: FxHashMap::default(),
-            runs: FxHashMap::default(),
-            listens: FxHashMap::default(),
-            ends: FxHashMap::default(),
-            next_conn: 0,
-            receiving: Vec::new(),
+            listens: Tagged::new(RESERVE),
+            ends: match Slab::new(MAX_ENDS, MemTag::Io) {
+                Ok(ends) => ends,
+                Err(error) => panic!("{error}"),
+            },
+            receiving: Vec::with_capacity(RESERVE),
+            // alloc: none until the first read of a file with unsynced changes.
+            scratch: Vec::new(),
+            stale: 0,
         }
     }
 
     /// `effect` ready `after` from now.
     fn pend(&mut self, after: Duration, effect: Effect, covers: usize) {
         let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
-        let tag = effect.tag();
-        let spawn = matches!(effect, Effect::Spawn { .. });
-        let handle = self.pending.insert(ready, Pending { effect, covers });
-        if spawn {
-            self.spawning.insert(tag, handle);
-        }
+        self.pending.insert(ready, Pending { effect, covers, spawn: None });
     }
 
     /// What a spawn of `path` does. A spawn of a program not given fails, as one not on disk.
@@ -261,6 +373,7 @@ impl Sim {
         path: impl Into<PathBuf>,
         program: impl FnMut(&Command, &mut Rng) -> Ran + 'static,
     ) {
+        // alloc: once per program the test gives.
         self.programs.insert(path.into(), Box::new(program));
     }
 
@@ -268,16 +381,17 @@ impl Sim {
     /// returns, which the test plays the other side of.
     pub fn dial(&mut self, at: &Address) -> Result<Conn, IoError> {
         let Some(listen) = self.listening_at(at) else {
+            // alloc: an error's message.
             return Err(IoError(format!("{at:?}: nothing listens there: connection refused")));
         };
         let conn = self.new_end(None);
-        self.tell(listen, Done::Accepted { conn });
+        self.tell(listen, Done::Accepted { conn }, Of::Op);
         Ok(conn)
     }
 
     /// The peer outside sends `bytes` to the end `conn` of the simulation's.
     pub fn peer_send(&mut self, conn: Conn, bytes: &[u8]) {
-        if let Some(end) = self.ends.get_mut(&conn)
+        if let Some(end) = self.ends.get_mut(end_of(conn))
             && end.peer.is_none()
             && !end.peer_closed
         {
@@ -288,22 +402,34 @@ impl Sim {
 
     /// What the end `conn` sent to the peer outside since the last time the test asked.
     pub fn peer_received(&mut self, conn: Conn) -> Vec<u8> {
-        self.ends.get_mut(&conn).map(|end| std::mem::take(&mut end.outbox)).unwrap_or_default()
+        self.ends.get_mut(end_of(conn)).map(|end| mem::take(&mut end.outbox)).unwrap_or_default()
     }
 
     /// Whether the end `conn` has hung up on the peer outside.
     pub fn peer_hung_up_on(&self, conn: Conn) -> bool {
-        self.ends.get(&conn).is_none_or(|end| end.closed)
+        self.ends.get(end_of(conn)).is_none_or(|end| end.closed)
     }
 
     /// The peer outside hangs up: a receive of `conn` then gets nothing.
     pub fn peer_hangup(&mut self, conn: Conn) {
-        if let Some(end) = self.ends.get_mut(&conn)
-            && end.peer.is_none()
+        let end = end_of(conn);
+        if let Some(it) = self.ends.get_mut(end)
+            && it.peer.is_none()
         {
-            end.peer_closed = true;
+            it.peer_closed = true;
+            // Both sides hung up: nothing names it any more.
+            if it.closed {
+                self.ends.remove(end);
+            }
             self.wake();
         }
+    }
+
+    /// Completions told for an op that had ended by the time they were due, and so detected
+    /// as stale: changes of a watch whose end came first (dropped), and bytes a receive got
+    /// on an end that hung up before they were told (told empty).
+    pub fn stale(&self) -> u64 {
+        self.stale
     }
 
     /// The machine loses power: every effect in flight is gone without a completion, every
@@ -313,15 +439,15 @@ impl Sim {
     /// one in flight is not there.
     pub fn crash(&mut self) {
         self.pending.drain(|_, _| {});
-        self.spawning.clear();
+        self.spawns.clear();
         self.watches.clear();
-        self.disk.journals.clear();
+        self.ending = 0;
         self.told.clear();
-        self.runs.clear();
         self.listens.clear();
         self.ends.clear();
         self.receiving.clear();
         // By name, so the seed's numbers go to the same files whatever the table's order.
+        // alloc: a crash, not an op.
         let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (_, file) in files {
@@ -353,7 +479,8 @@ impl Sim {
     /// The file made to hold `bytes`, durably, by something outside the state machine (a
     /// person's editor): watches of it hear of it.
     pub fn change(&mut self, file: &FileName, bytes: &[u8]) {
-        self.files.insert(file.clone(), SimFile::whole(bytes.to_vec()));
+        // alloc: the world changed by the test, not an op.
+        *file_mut(&mut self.files, file) = SimFile::whole(bytes.to_vec());
         self.changed(file);
     }
 
@@ -362,34 +489,57 @@ impl Sim {
     fn copy(&mut self, from: &FileName, to: &FileName) {
         let mode = self.files[from].mode;
         let bytes = self.contents(from);
-        self.files.insert(to.clone(), SimFile { mode, ..SimFile::whole(bytes) });
+        *file_mut(&mut self.files, to) = SimFile { mode, ..SimFile::whole(bytes) };
         self.changed(to);
     }
 
+    /// The bytes `at..at + len` of the file, or fewer at its end: none of a file not there.
+    fn read(&mut self, file: &FileName, at: u64, len: usize) -> Vec<u8> {
+        let Some(sim) = self.files.get(file) else {
+            // alloc: none, an empty read.
+            return Vec::new();
+        };
+        let bytes: &[u8] = match sim.ops.is_empty() {
+            true => &sim.durable,
+            false => {
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&sim.durable);
+                for op in &sim.ops {
+                    op.apply(&mut self.scratch);
+                }
+                &self.scratch
+            }
+        };
+        let at = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len());
+        // alloc: the read's payload, which the completion carries.
+        bytes[at..at.saturating_add(len).min(bytes.len())].to_vec()
+    }
+
     /// The files under `dir` and the directories they imply, as a disk would list them. As for
-    /// a stat, a directory is there while some file is under it.
+    /// a stat, a directory is there while some file is under it; a name that is a file and has
+    /// files under it is listed as the file.
     fn list(&self, dir: &FileName) -> Done {
         if self.files.contains_key(dir) {
+            // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
-        let mut found = FxHashMap::default();
+        let start = dir.as_str().len() + 1;
+        // alloc: the listing, which the completion carries.
+        let mut listed: Vec<(FileName, Meta)> = Vec::new();
         for (file, sim) in self.files.iter().filter(|(it, _)| it.is_under(dir)) {
-            let rest = &file.as_str()[dir.as_str().len() + 1..];
-            for (at, _) in rest.match_indices('/') {
-                let inner =
-                    FileName::new(&format!("{dir}/{}", &rest[..at])).expect("a part of a name");
-                found.entry(inner).or_insert(Meta { len: 0, dir: true, modified_ns: 0 });
+            for (at, _) in file.as_str()[start..].match_indices('/') {
+                let inner = FileName::new(&file.as_str()[..start + at]).expect("a part of a name");
+                listed.push((inner, Meta { len: 0, dir: true, modified_ns: 0 }));
             }
-            found.insert(
-                file.clone(),
-                Meta { len: sim.contents().len() as u64, dir: false, modified_ns: 0 },
-            );
+            // clone: a name of the listing.
+            listed.push((file.clone(), Meta { len: sim.len(), dir: false, modified_ns: 0 }));
         }
-        if found.is_empty() {
+        if listed.is_empty() {
+            // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
-        let mut listed: Vec<(FileName, Meta)> = found.into_iter().collect();
-        listed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        listed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.dir.cmp(&b.1.dir)));
+        listed.dedup_by(|later, first| later.0 == first.0);
         Done::Listed(listed)
     }
 
@@ -404,41 +554,46 @@ impl Sim {
     }
 
     fn delay(&mut self) -> Duration {
-        Duration::from_nanos(self.rng.below(self.faults.max_latency.as_nanos() as u64 + 1))
+        latency(&mut self.rng, &self.faults)
     }
 
-    /// Tells the watches of `file` it changed.
+    /// Tells the watches of `file` it changed, in their slab's order, which is the seed's as
+    /// everything else is.
     fn changed(&mut self, file: &FileName) {
         self.disk.touched(file, &self.files);
         self.tell_journals();
-        let mut watching: Vec<Tag> = self
-            .watches
-            .iter()
-            .filter(|(tag, dir)| file.is_under(dir) && !self.disk.journals.contains_key(tag))
-            .map(|(&tag, _)| tag)
-            .collect();
-        // By tag, so the seed's numbers go to the same watches whatever the table's order.
-        radix::sort_copy_by_key(&mut watching, |it| it.0);
-        for tag in watching {
+        for (id, tag, watch) in self.watches.iter() {
+            if watch.journal || !file.is_under(&watch.dir) {
+                continue;
+            }
+            if watch.ending && !self.rng.one_in(RACE_ONE_IN) {
+                continue;
+            }
             let done = match self.rng.one_in(self.faults.lose_change_one_in) {
+                // alloc: none, an empty list.
                 true => Done::Changed { files: Vec::new(), lost: true },
+                // alloc: the change's payload, the one name it tells.
                 false => Done::Changed { files: vec![file.clone()], lost: false },
             };
-            let at = self.now + self.delay();
-            self.told.push((at, Completion { tag, done }));
+            let at = self.now + latency(&mut self.rng, &self.faults);
+            self.told.push(Told { at, completion: Completion { tag, done }, of: Of::Change(id) });
         }
     }
 
     /// Tells each journal watch the change its journal just recorded, if under its directory;
     /// one in `lose_change_one_in` is told as dropped.
     fn tell_journals(&mut self) {
-        let mut journals: Vec<(Tag, FileName)> =
-            self.disk.journals.iter().map(|(tag, dir)| (*tag, dir.clone())).collect();
-        journals.sort_unstable_by_key(|it| it.0);
-        for (tag, dir) in journals {
+        for (id, tag, watch) in self.watches.iter() {
+            if !watch.journal || watch.ending {
+                continue;
+            }
             let dropped = self.rng.one_in(self.faults.lose_change_one_in);
-            if let Some(batch) = self.disk.live(&dir, dropped) {
-                self.tell(tag, Done::Journaled(Box::new(batch)));
+            if let Some(batch) = self.disk.live(&watch.dir, dropped) {
+                let at = self.now + latency(&mut self.rng, &self.faults);
+                let at = after_told(&self.told, at, tag, tag);
+                // alloc: the batch's payload.
+                let done = Done::Journaled(Box::new(batch));
+                self.told.push(Told { at, completion: Completion { tag, done }, of: Of::Change(id) });
             }
         }
     }
@@ -485,6 +640,7 @@ impl Sim {
     /// `from` renamed over `to` by something outside the state machine.
     pub fn rename(&mut self, from: &FileName, to: &FileName) {
         if let Some(sim) = self.files.remove(from) {
+            // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
             self.disk.renamed(from, to);
             self.changed(from);
@@ -493,45 +649,31 @@ impl Sim {
     }
 
     fn fail(&mut self, tag: Tag) -> Completion {
+        // alloc: an injected failure's message.
         Completion { tag, done: Done::Failed(IoError("injected by the simulation".into())) }
     }
 
     /// `done` of `tag`, ready after a delay, and after everything told of the same tag before.
-    fn tell(&mut self, tag: Tag, done: Done) {
+    fn tell(&mut self, tag: Tag, done: Done, of: Of) {
         let at = self.now + self.delay();
-        let at = self
-            .told
-            .iter()
-            .filter(|(_, it)| it.tag == tag)
-            .map(|(at, _)| *at)
-            .max()
-            .map_or(at, |last| last.max(at));
-        self.told.push((at, Completion { tag, done }));
+        let at = after_told(&self.told, at, tag, tag);
+        self.told.push(Told { at, completion: Completion { tag, done }, of });
     }
 
     /// `done` of `tag`, ready after a delay, and after everything told of `tag` or of `after`
     /// before: a watch's end or flush after the watch's changes.
-    fn tell_after(&mut self, after: Tag, tag: Tag, done: Done) {
+    fn tell_after(&mut self, after: Tag, tag: Tag, done: Done, of: Of) {
         let at = self.now + self.delay();
-        let at = self
-            .told
-            .iter()
-            .filter(|(_, it)| it.tag == after || it.tag == tag)
-            .map(|(at, _)| *at)
-            .max()
-            .map_or(at, |last| last.max(at));
-        self.told.push((at, Completion { tag, done }));
+        let at = after_told(&self.told, at, after, tag);
+        self.told.push(Told { at, completion: Completion { tag, done }, of });
     }
 
     fn listening_at(&self, at: &Address) -> Option<Tag> {
-        self.listens.iter().find(|(_, it)| *it == at).map(|(&tag, _)| tag)
+        self.listens.iter().find(|(_, _, it)| *it == at).map(|(_, tag, _)| tag)
     }
 
-    fn new_end(&mut self, peer: Option<Conn>) -> Conn {
-        let conn = Conn(self.next_conn);
-        self.next_conn += 1;
-        self.ends.insert(conn, End { peer, ..End::default() });
-        conn
+    fn new_end(&mut self, peer: Option<EndId>) -> Conn {
+        Conn(self.ends.insert(End { peer, ..End::default() }).to_bits())
     }
 
     /// Every waiting receive that can be answered now is: with what came, or with nothing once
@@ -539,21 +681,23 @@ impl Sim {
     fn wake(&mut self) {
         let mut at = 0;
         while at < self.receiving.len() {
-            let (tag, conn, most) = self.receiving[at];
-            let end = self.ends.get_mut(&conn);
-            let done = match end {
+            let Receiving { tag, end, most } = self.receiving[at];
+            let done = match self.ends.get_mut(end) {
+                // alloc: none, an empty read.
                 None => Some(Done::Read(Vec::new())),
-                Some(end) if !end.inbox.is_empty() => {
-                    let n = most.min(end.inbox.len());
-                    Some(Done::Read(end.inbox.drain(..n).collect()))
+                Some(it) if !it.inbox.is_empty() => {
+                    let n = most.min(it.inbox.len());
+                    // alloc: the receive's payload, which the completion carries.
+                    Some(Done::Read(it.inbox.drain(..n).collect()))
                 }
-                Some(end) if end.closed || end.peer_closed => Some(Done::Read(Vec::new())),
+                // alloc: none, an empty read.
+                Some(it) if it.closed || it.peer_closed => Some(Done::Read(Vec::new())),
                 Some(_) => None,
             };
             match done {
                 Some(done) => {
                     self.receiving.remove(at);
-                    self.tell(tag, done);
+                    self.tell(tag, done, Of::Recv(end));
                 }
                 None => at += 1,
             }
@@ -563,6 +707,7 @@ impl Sim {
     /// What a spawn of `command` ends with, decided now from its program.
     fn run(&mut self, command: &Command) -> Result<Ran, IoError> {
         let Some(program) = self.programs.get_mut(command.program.as_path()) else {
+            // alloc: an error's message.
             return Err(IoError(format!(
                 "starting {}: no such program in the simulation",
                 command.program.display()
@@ -577,7 +722,9 @@ impl Sim {
             ran.exit = Exit {
                 code: None,
                 signal: Some(KILLED),
+                // alloc: none, empty output.
                 stdout: Vec::new(),
+                // alloc: none, empty output.
                 stderr: Vec::new(),
                 traced: None,
                 peak_memory: limit,
@@ -587,49 +734,41 @@ impl Sim {
     }
 
     fn complete(&mut self, pending: Pending) -> Completion {
-        let tag = pending.effect.tag();
-        if !matches!(pending.effect, Effect::Timer { .. })
-            && self.rng.one_in(self.faults.fail_one_in)
-        {
-            if let Effect::Spawn { .. } = &pending.effect {
-                self.runs.remove(&tag);
+        let Pending { effect, covers, spawn } = pending;
+        let tag = effect.tag();
+        if !matches!(effect, Effect::Timer { .. }) && self.rng.one_in(self.faults.fail_one_in) {
+            if let Some(spawn) = spawn {
+                self.spawns.remove_id(spawn);
             }
-            if let Effect::Append { file, bytes, .. } = &pending.effect {
+            if let Effect::Append { file, mut bytes, .. } = effect {
                 let torn = self.rng.below(bytes.len() as u64) as usize;
-                self.files
-                    .entry(file.clone())
-                    .or_default()
-                    .ops
-                    .push(Op::Append(bytes[..torn].to_vec()));
+                bytes.truncate(torn);
+                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
                 if torn > 0 {
-                    self.changed(&file.clone());
+                    self.changed(&file);
                 }
             }
             return self.fail(tag);
         }
-        let done = match pending.effect {
-            Effect::ReadAll { file, .. } => Done::Read(self.contents(&file)),
-            Effect::Read { file, at, len, .. } => {
-                let all = self.contents(&file);
-                let at = (at as usize).min(all.len());
-                Done::Read(all[at..(at + len).min(all.len())].to_vec())
-            }
+        let done = match effect {
+            Effect::ReadAll { file, .. } => Done::Read(self.read(&file, 0, usize::MAX)),
+            Effect::Read { file, at, len, .. } => Done::Read(self.read(&file, at, len)),
             Effect::Append { file, bytes, .. } => {
-                self.files.entry(file.clone()).or_default().ops.push(Op::Append(bytes));
+                file_mut(&mut self.files, &file).ops.push(Op::Append(bytes));
                 self.changed(&file);
                 Done::Appended
             }
             Effect::Sync { file, .. } => {
-                self.files.entry(file).or_default().sync(pending.covers);
+                self.files.entry(file).or_default().sync(covers);
                 Done::Synced
             }
             Effect::Truncate { file, len, .. } => {
-                self.files.entry(file.clone()).or_default().ops.push(Op::Cut(len));
+                file_mut(&mut self.files, &file).ops.push(Op::Cut(len));
                 self.changed(&file);
                 Done::Truncated
             }
             Effect::Write { file, bytes, .. } => {
-                self.files.insert(file.clone(), SimFile::whole(bytes));
+                *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
                 self.changed(&file);
                 Done::Written
             }
@@ -639,16 +778,18 @@ impl Sim {
                     self.changed(&file);
                     Done::Written
                 }
+                // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
             Effect::Rename { from, to, .. } => match self.files.remove(&from) {
                 Some(sim) => {
-                    self.files.insert(to.clone(), sim);
+                    *file_mut(&mut self.files, &to) = sim;
                     self.disk.renamed(&from, &to);
                     self.changed(&from);
                     self.changed(&to);
                     Done::Renamed
                 }
+                // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{from}: no such file"))),
             },
             Effect::Mode { file, mode, .. } => match self.files.get_mut(&file) {
@@ -658,19 +799,23 @@ impl Sim {
                     self.tell_journals();
                     Done::Moded
                 }
+                // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }
                 if !self.files.contains_key(&from) =>
             {
                 let _ = to;
+                // alloc: an error's message.
                 Done::Failed(IoError(format!("{from}: no such file")))
             }
             Effect::Clone { .. } if self.faults.no_clone => Done::Failed(IoError(
+                // alloc: an error's message.
                 "the simulated file system cannot share blocks; blaze does not copy instead"
                     .into(),
             )),
             Effect::Clone { to, .. } | Effect::Link { to, .. } if self.files.contains_key(&to) => {
+                // alloc: an error's message.
                 Done::Failed(IoError(format!("{to}: already there")))
             }
             Effect::Clone { from, to, .. } => {
@@ -682,11 +827,7 @@ impl Sim {
                 Done::Linked
             }
             Effect::Stat { file, .. } => Done::Stat(match self.files.get(&file) {
-                Some(it) => Some(Meta {
-                    len: it.contents().len() as u64,
-                    dir: false,
-                    modified_ns: 0,
-                }),
+                Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns: 0 }),
                 None if self.files.keys().any(|it| it != &file && it.is_under(&file)) => {
                     Some(Meta { len: 0, dir: true, modified_ns: 0 })
                 }
@@ -697,13 +838,16 @@ impl Sim {
                 files
                     .iter()
                     .map(|name| {
+                        // alloc: a name of the batch as the simulated disk keys it.
                         let name = FileName::new(name).expect("a Names entry is a name");
                         self.disk.stamp(&name, &self.files)
                     })
+                    // alloc: the stamps, which the completion carries.
                     .collect(),
             ),
             Effect::Entries { dir, .. } => match self.disk.entries(&dir, &self.files) {
                 Some(entries) => Done::Entries(entries),
+                // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
             Effect::Remove { file, .. } => {
@@ -714,10 +858,12 @@ impl Sim {
             }
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, .. } => {
+                // alloc: the mapping, which the completion carries.
                 Done::Mapped(crate::Mapping(std::sync::Arc::new(self.contents(&file))))
             }
-            Effect::Spawn { .. } => match self.runs.remove(&tag) {
-                Some(exit) => Done::Exited(Box::new(exit)),
+            Effect::Spawn { .. } => match spawn.and_then(|id| self.spawns.remove_id(id)) {
+                // alloc: the exit, which the completion carries.
+                Some((_, spawning)) => Done::Exited(Box::new(spawning.exit)),
                 None => unreachable!("a spawn in flight has its run"),
             },
             Effect::Watch { .. }
@@ -736,6 +882,43 @@ impl Sim {
         };
         Completion { tag, done }
     }
+
+    fn watch(&mut self, tag: Tag, dir: FileName, journal: bool) -> Id<Watching> {
+        let (id, old) = self.watches.insert(tag, Watching { dir, journal, ending: false });
+        if old.is_some_and(|it| it.ending) {
+            self.ending -= 1;
+        }
+        id
+    }
+
+    /// The told completion as it is delivered: `None` for a change of a watch that ended
+    /// first, a receive's bytes emptied when its end hung up first.
+    fn deliver(&mut self, told: Told) -> Option<Completion> {
+        let Told { completion, of, .. } = told;
+        match of {
+            Of::Op => Some(completion),
+            Of::Change(watch) if self.watches.by_id(watch).is_some() => Some(completion),
+            Of::Change(_) => {
+                self.stale += 1;
+                None
+            }
+            Of::End(watch) => {
+                if self.watches.remove_id(watch).is_some() {
+                    self.ending -= 1;
+                }
+                Some(completion)
+            }
+            Of::Recv(end) if self.ends.get(end).is_some_and(|it| !it.closed) => Some(completion),
+            Of::Recv(_) => match completion.done {
+                Done::Read(bytes) if !bytes.is_empty() => {
+                    self.stale += 1;
+                    // alloc: none, an empty read.
+                    Some(Completion { tag: completion.tag, done: Done::Read(Vec::new()) })
+                }
+                _ => Some(completion),
+            },
+        }
+    }
 }
 
 impl Driver for Sim {
@@ -743,53 +926,62 @@ impl Driver for Sim {
         for effect in effects.drain(..) {
             match effect {
                 Effect::Watch { dir, tag } => {
-                    self.watches.insert(tag, dir);
+                    self.watch(tag, dir, false);
                     continue;
                 }
                 Effect::Journal { dir, since, tag } => {
                     let parts = 1 + self.rng.below(3);
-                    for batch in self.disk.history(&dir, &since, parts) {
-                        self.tell(tag, Done::Journaled(Box::new(batch)));
+                    let batches = self.disk.history(&dir, &since, parts);
+                    let id = self.watch(tag, dir, true);
+                    for batch in batches {
+                        // alloc: the batch's payload.
+                        self.tell(tag, Done::Journaled(Box::new(batch)), Of::Change(id));
                     }
-                    self.disk.journals.insert(tag, dir.clone());
-                    self.watches.insert(tag, dir);
                     continue;
                 }
                 Effect::Unwatch { tag } => {
-                    self.disk.journals.remove(&tag);
-                    let done = match self.watches.remove(&tag) {
-                        Some(_) => Done::Unwatched,
-                        None => Done::Failed(IoError(format!("nothing is watched as {tag:?}"))),
+                    let ended = match self.watches.get_mut(tag) {
+                        Some(watch) if !watch.ending => {
+                            watch.ending = true;
+                            true
+                        }
+                        _ => false,
+                    };
+                    let (done, of) = match self.watches.id(tag) {
+                        Some(id) if ended => {
+                            self.ending += 1;
+                            (Done::Unwatched, Of::End(id))
+                        }
+                        // alloc: an error's message.
+                        _ => (Done::Failed(IoError(format!("nothing is watched as {tag:?}"))), Of::Op),
                     };
                     // A change told before the end is heard before it.
-                    self.tell_after(tag, tag, done);
+                    self.tell_after(tag, tag, done, of);
                     continue;
                 }
                 Effect::Flush { watch, tag } => {
-                    let done = match self.watches.contains_key(&watch) {
+                    let done = match self.watches.get(watch).is_some_and(|it| !it.ending) {
                         // alloc: an error path.
                         false => Done::Failed(IoError(format!("nothing is watched as {watch:?}"))),
                         true if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
                         true => Done::Flushed,
                     };
                     // Every change of the watch told by now is heard first.
-                    self.tell_after(watch, tag, done);
+                    self.tell_after(watch, tag, done, Of::Op);
                     continue;
                 }
                 Effect::Kill { tag } => {
-                    if let Some(&handle) = self.spawning.get(&tag)
+                    if let Some(spawning) = self.spawns.get_mut(tag)
+                        && let Some(handle) = spawning.pending
                         && let Some(ready) = self.pending.deadline(handle)
-                        && let Some(exit) = self.runs.get_mut(&tag)
                     {
-                        let delay = Duration::from_nanos(
-                            self.rng.below(self.faults.max_latency.as_nanos() as u64 + 1),
-                        );
-                        exit.code = None;
-                        exit.signal = Some(KILLED);
+                        let delay = latency(&mut self.rng, &self.faults);
+                        spawning.exit.code = None;
+                        spawning.exit.signal = Some(KILLED);
                         let sooner = wheel::ticks(self.now).saturating_add(wheel::ticks(delay));
                         if sooner < ready {
                             let pending = self.pending.cancel(handle).expect("in the wheel");
-                            self.spawning.insert(tag, self.pending.insert(sooner, pending));
+                            spawning.pending = Some(self.pending.insert(sooner, pending));
                         }
                     }
                     continue;
@@ -802,103 +994,129 @@ impl Driver for Sim {
                     match self.listening_at(&at) {
                         Some(_) => self.tell(
                             tag,
+                            // alloc: an error's message.
                             Done::Failed(IoError(format!("{at:?}: another listen has it"))),
+                            Of::Op,
                         ),
                         None if self.rng.one_in(self.faults.fail_one_in) => {
                             let done = self.fail(tag).done;
-                            self.tell(tag, done);
+                            self.tell(tag, done, Of::Op);
                         }
                         None => _ = self.listens.insert(tag, at),
                     }
                     continue;
                 }
                 Effect::Unlisten { tag } => {
-                    let done = match self.listens.remove(&tag) {
+                    let done = match self.listens.remove(tag) {
                         Some(_) => Done::Unlistened,
+                        // alloc: an error's message.
                         None => Done::Failed(IoError(format!("nothing is listened on as {tag:?}"))),
                     };
-                    self.tell(tag, done);
+                    self.tell(tag, done, Of::Op);
                     continue;
                 }
                 Effect::Connect { at, tag } => {
                     let done = match self.listening_at(&at) {
                         _ if self.rng.one_in(self.faults.fail_one_in) => self.fail(tag).done,
+                        // alloc: an error's message.
                         None => Done::Failed(IoError(format!(
                             "{at:?}: nothing listens there: connection refused"
                         ))),
                         Some(listen) => {
                             let mine = self.new_end(None);
-                            let theirs = self.new_end(Some(mine));
-                            self.ends.get_mut(&mine).expect("just made").peer = Some(theirs);
-                            self.tell(listen, Done::Accepted { conn: theirs });
+                            let theirs = self.new_end(Some(end_of(mine)));
+                            self.ends.get_mut(end_of(mine)).expect("just made").peer = Some(end_of(theirs));
+                            self.tell(listen, Done::Accepted { conn: theirs }, Of::Op);
                             Done::Connected { conn: mine }
                         }
                     };
-                    self.tell(tag, done);
+                    self.tell(tag, done, Of::Op);
                     continue;
                 }
                 Effect::Recv { conn, most, tag } => {
-                    match self.ends.get(&conn) {
-                        Some(_) => {
-                            self.receiving.push((tag, conn, most));
+                    let end = end_of(conn);
+                    match self.ends.get(end).is_some_and(|it| !it.closed) {
+                        true => {
+                            self.receiving.push(Receiving { tag, end, most });
                             self.wake();
                         }
-                        None => self.tell(
+                        false => self.tell(
                             tag,
+                            // alloc: an error's message.
                             Done::Failed(IoError(format!("no connection {conn:?}"))),
+                            Of::Op,
                         ),
                     }
                     continue;
                 }
                 Effect::Send { conn, bytes, tag } => {
-                    let done = match self.ends.get(&conn).map(|end| (end.closed, end.peer_closed, end.peer)) {
-                        None => Done::Failed(IoError(format!("no connection {conn:?}"))),
-                        Some((true, _, _) | (_, true, _)) => Done::Failed(IoError(format!(
+                    let end = end_of(conn);
+                    let done = match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
+                        // alloc: an error's message.
+                        None | Some((true, _, _)) => Done::Failed(IoError(format!("no connection {conn:?}"))),
+                        // alloc: an error's message.
+                        Some((_, true, _)) => Done::Failed(IoError(format!(
                             "{conn:?}: the connection is hung up: broken pipe"
                         ))),
                         Some((_, _, None)) => {
-                            let end = self.ends.get_mut(&conn).expect("looked up");
-                            end.outbox.extend_from_slice(&bytes);
+                            let it = self.ends.get_mut(end).expect("looked up");
+                            it.outbox.extend_from_slice(&bytes);
                             Done::Sent
                         }
                         Some((_, _, Some(peer))) => {
-                            if let Some(peer) = self.ends.get_mut(&peer) {
+                            if let Some(peer) = self.ends.get_mut(peer) {
                                 peer.inbox.extend_from_slice(&bytes);
                             }
                             Done::Sent
                         }
                     };
-                    self.tell(tag, done);
+                    self.tell(tag, done, Of::Op);
                     self.wake();
                     continue;
                 }
                 Effect::Hangup { conn, tag } => {
-                    let peer = self.ends.get_mut(&conn).map(|end| {
-                        end.closed = true;
-                        end.peer
-                    });
-                    let done = match peer {
-                        Some(peer) => {
-                            if let Some(peer) = peer.and_then(|it| self.ends.get_mut(&it)) {
-                                peer.peer_closed = true;
+                    let end = end_of(conn);
+                    let hung = match self.ends.get_mut(end) {
+                        Some(it) if !it.closed => {
+                            it.closed = true;
+                            Some((it.peer, it.peer_closed))
+                        }
+                        _ => None,
+                    };
+                    let done = match hung {
+                        Some((peer, peer_closed)) => {
+                            if let Some(it) = peer.and_then(|peer| self.ends.get_mut(peer)) {
+                                it.peer_closed = true;
+                            }
+                            // An end of the simulation's own, or one the peer outside hung up
+                            // too, is named by nothing now; one the peer outside may still
+                            // read from is kept for it.
+                            if peer.is_some() || peer_closed {
+                                self.ends.remove(end);
                             }
                             Done::HungUp
                         }
+                        // alloc: an error's message.
                         None => Done::Failed(IoError(format!("no connection {conn:?}"))),
                     };
                     self.wake();
-                    self.tell(tag, done);
+                    self.tell(tag, done, Of::Op);
                     continue;
                 }
                 Effect::Spawn { ref command, tag } => match self.run(command) {
                     Ok(ran) => {
-                        self.runs.insert(tag, ran.exit);
                         let after = ran.takes.saturating_add(self.delay());
-                        self.pend(after, effect, 0);
+                        let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
+                        let (id, _) = self.spawns.insert(tag, Spawning { exit: ran.exit, pending: None });
+                        let pending =
+                            self.pending.insert(ready, Pending { effect, covers: 0, spawn: Some(id) });
+                        if let Some((_, spawning)) = self.spawns.by_id_mut(id) {
+                            spawning.pending = Some(pending);
+                        }
                         continue;
                     }
                     Err(why) => {
-                        self.tell(tag, Done::Failed(why));
+                        self.tell(tag, Done::Failed(why), Of::Op);
                         continue;
                     }
                 },
@@ -919,17 +1137,12 @@ impl Driver for Sim {
     /// Never waits: time jumps to the first completion when none is ready.
     fn poll(&mut self, out: &mut Vec<Completion>, _wait: Duration) -> usize {
         let first = self.pending.next_deadline().map(Duration::from_nanos);
-        let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.0)).min() else {
+        let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.at)).min() else {
             return 0;
         };
         self.now = self.now.max(first);
-        let mut ready = std::mem::take(&mut self.ready);
+        let mut ready = mem::take(&mut self.ready);
         self.pending.advance(wheel::ticks(self.now), |_, pending| ready.push(pending));
-        for pending in &ready {
-            if let Effect::Spawn { tag, .. } = pending.effect {
-                self.spawning.remove(&tag);
-            }
-        }
         // In the order they were due; shuffled so it is the seed's.
         self.rng.shuffle(&mut ready);
         let before = out.len();
@@ -939,23 +1152,29 @@ impl Driver for Sim {
         }
         self.ready = ready;
         // What watches were told, in the order they were told: a watch's end comes last.
-        let mut index = 0;
-        while index < self.told.len() {
-            if self.told[index].0 <= self.now {
-                out.push(self.told.remove(index).1);
-            } else {
-                index += 1;
+        let mut told = mem::take(&mut self.told);
+        let mut later = mem::take(&mut self.later);
+        for it in told.drain(..) {
+            if it.at > self.now {
+                later.push(it);
+            } else if let Some(completion) = self.deliver(it) {
+                out.push(completion);
             }
         }
+        self.told = later;
+        self.later = told;
         out.len() - before
     }
 
     fn in_flight(&self) -> usize {
-        let ending = self.told.iter().filter(|(_, it)| {
-            !matches!(it.done, Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. })
+        let ending = self.told.iter().filter(|it| {
+            !matches!(
+                it.completion.done,
+                Done::Changed { .. } | Done::Journaled(_) | Done::Accepted { .. }
+            )
         });
         self.pending.len()
-            + self.watches.len()
+            + (self.watches.len() - self.ending)
             + self.listens.len()
             + self.receiving.len()
             + ending.count()
@@ -1031,6 +1250,30 @@ mod tests {
         sim.poll(&mut out, Duration::ZERO);
         let file = &sim.files[&file];
         assert_eq!((file.durable.as_slice(), file.contents().as_slice()), (&b"a"[..], &b"ab"[..]));
+    }
+
+    /// The length of a file with unsynced changes, worked out without its bytes, is the length
+    /// of its bytes, and a read of a range of it is that range, on every seed.
+    #[test]
+    fn a_file_s_length_and_reads_are_its_bytes_on_every_seed() {
+        for seed in 0..300 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let file = name("f");
+            sim.change(&file, b"0123456789");
+            for _ in 0..8 {
+                let op = match sim.rng.below(3) {
+                    0 => Op::Append(vec![b'a'; sim.rng.below(5) as usize]),
+                    1 => Op::At(sim.rng.below(20), vec![b'b'; sim.rng.below(5) as usize]),
+                    _ => Op::Cut(sim.rng.below(20)),
+                };
+                sim.files.get_mut(&file).unwrap().ops.push(op);
+                let whole = sim.contents(&file);
+                assert_eq!(sim.files[&file].len(), whole.len() as u64, "seed {seed}");
+                let (at, len) = (sim.rng.below(25), sim.rng.below(25) as usize);
+                let from = (at as usize).min(whole.len());
+                assert_eq!(sim.read(&file, at, len), whole[from..(from + len).min(whole.len())], "seed {seed}");
+            }
+        }
     }
 
     /// A write at an offset over synced bytes is lost or kept, maybe torn, by a crash, never
@@ -1115,6 +1358,30 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_names_files_and_the_directories_they_imply() {
+        let mut sim = Sim::new(1, Faults::default());
+        sim.change(&name("src/a/b/c.rs"), b"12");
+        sim.change(&name("src/a/d.rs"), b"1");
+        sim.change(&name("src/e"), b"");
+        sim.change(&name("other"), b"x");
+        let Done::Listed(listed) = sim.list(&name("src")) else { panic!() };
+        let shown: Vec<(&str, bool, u64)> =
+            listed.iter().map(|(file, meta)| (file.as_str(), meta.dir, meta.len)).collect();
+        assert_eq!(
+            shown,
+            [
+                ("src/a", true, 0),
+                ("src/a/b", true, 0),
+                ("src/a/b/c.rs", false, 2),
+                ("src/a/d.rs", false, 1),
+                ("src/e", false, 0)
+            ]
+        );
+        assert!(matches!(sim.list(&name("other")), Done::Failed(_)));
+        assert!(matches!(sim.list(&name("none")), Done::Failed(_)));
+    }
+
+    #[test]
     fn watches_hear_changes_under_their_directory_then_their_end() {
         for seed in 0..500 {
             let mut sim = Sim::new(seed, Faults { lose_change_one_in: 7, ..Faults::default() });
@@ -1142,6 +1409,49 @@ mod tests {
                 assert!(heard.contains(&name("src/lib.rs")), "seed {seed}: {heard:?}");
             }
         }
+    }
+
+    /// Changes made while a watch is ending are told on some seeds, as a system that queued
+    /// them before it saw the unwatch does: one due after the end names a watch gone, and is
+    /// dropped, never delivered after the end. The race happens on some seeds and not others.
+    #[test]
+    fn a_change_racing_an_unwatch_is_stale_and_dropped() {
+        let (mut raced, mut clean) = (0, 0);
+        for seed in 0..500 {
+            let mut sim = Sim::new(seed, Faults::default());
+            sim.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(9) }]);
+            sim.change(&name("src/before"), b"1");
+            sim.submit(&mut vec![Effect::Unwatch { tag: Tag(9) }]);
+            for n in 0..8 {
+                sim.change(&name(&format!("src/during-{n}")), b"2");
+            }
+            let mut ended = false;
+            let mut effects = Vec::new();
+            run_until_idle(&mut sim, &mut effects, |done, _| match done.done {
+                Done::Changed { .. } => assert!(!ended, "seed {seed}: a change after the end"),
+                Done::Unwatched => ended = true,
+                other => panic!("seed {seed}: {other:?}"),
+            });
+            assert!(ended && sim.in_flight() == 0, "seed {seed}");
+            // Changes told for after the end are not in flight: each is due, and dropped.
+            let mut out = Vec::new();
+            while !sim.told.is_empty() {
+                sim.poll(&mut out, Duration::ZERO);
+                assert!(out.is_empty(), "seed {seed}: {out:?} after the end");
+            }
+            match sim.stale() {
+                0 => clean += 1,
+                _ => raced += 1,
+            }
+            // A watch of the same tag again is a new one: the old end's handle names nothing.
+            sim.submit(&mut vec![Effect::Watch { dir: name("src"), tag: Tag(9) }]);
+            sim.change(&name("src/again"), b"3");
+            let mut heard = Vec::new();
+            sim.submit(&mut vec![Effect::Unwatch { tag: Tag(9) }]);
+            run_until_idle(&mut sim, &mut effects, |done, _| heard.push(done.done));
+            assert_eq!(heard.last(), Some(&Done::Unwatched), "seed {seed}");
+        }
+        assert!(raced > 0 && clean > 0, "raced on {raced} seeds, clean on {clean}");
     }
 
     #[test]
@@ -1249,6 +1559,9 @@ mod tests {
             let Done::Exited(killed) = &seen[&Tag(4)] else { panic!("seed {seed}: {seen:?}") };
             assert_eq!(killed.signal, Some(KILLED));
             assert!(!seen.contains_key(&Tag(99)));
+            // A kill once the spawn has ended names nothing: nothing more is told.
+            sim.submit(&mut vec![Effect::Kill { tag: Tag(1) }]);
+            assert_eq!(sim.in_flight(), 0);
         }
     }
 
@@ -1378,6 +1691,142 @@ mod tests {
             assert_eq!(heard[inside].0, b"hello", "seed {seed}");
             assert_eq!(sim.peer_received(outside), b"reply", "seed {seed}");
             assert_eq!(sim.in_flight(), 0, "seed {seed}");
+        }
+    }
+
+    /// The bytes a receive got, told after a delay, on an end the state machine hung up before
+    /// they were due name an end gone: the receive is told empty, as a receive in flight at a
+    /// hang-up is. A receive after the hang-up names nothing and fails. On some seeds the
+    /// bytes are due first and arrive whole.
+    #[test]
+    fn a_hang_up_racing_a_receive_tells_it_empty() {
+        let at = Address::Unix(name("s.sock"));
+        let (mut raced, mut clean) = (0, 0);
+        for seed in 0..300 {
+            let mut sim = Sim::new(seed, Faults::default());
+            sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+            let conn = sim.dial(&at).unwrap();
+            let mut seen = BTreeMap::new();
+            let mut out = Vec::new();
+            while !seen.contains_key(&Tag(1)) {
+                sim.poll(&mut out, Duration::ZERO);
+                seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
+            }
+            sim.peer_send(conn, b"bytes");
+            sim.submit(&mut vec![Effect::Recv { conn, most: 16, tag: Tag(2) }]);
+            if sim.rng().one_in(2) {
+                while !seen.contains_key(&Tag(2)) {
+                    sim.poll(&mut out, Duration::ZERO);
+                    seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
+                }
+            }
+            let mut effects = vec![
+                Effect::Hangup { conn, tag: Tag(3) },
+                Effect::Recv { conn, most: 16, tag: Tag(4) },
+                Effect::Unlisten { tag: Tag(1) },
+            ];
+            run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag, it.done));
+            assert_eq!(seen[&Tag(3)], Done::HungUp, "seed {seed}");
+            assert!(matches!(&seen[&Tag(4)], Done::Failed(why) if why.0.contains("no connection")));
+            match &seen[&Tag(2)] {
+                Done::Read(bytes) if bytes == b"bytes" => clean += 1,
+                Done::Read(bytes) if bytes.is_empty() => raced += 1,
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            assert_eq!(sim.stale(), u64::from(seen[&Tag(2)] == Done::Read(Vec::new())), "seed {seed}");
+            assert!(sim.peer_hung_up_on(conn));
+            sim.peer_hangup(conn);
+            assert_eq!(sim.in_flight(), 0, "seed {seed}");
+        }
+        assert!(raced > 0 && clean > 0, "raced on {raced} seeds, clean on {clean}");
+    }
+
+    /// The ends of connections in their slab, named by handle bits, against the map of
+    /// connections they replace (an `FxHashMap<Conn, End>` keyed by a counter, an end gone once
+    /// hung up and the peer outside hung up too): the same answers to the same random sends,
+    /// hang-ups, peer hang-ups and takes on every seed, stale conns included.
+    #[test]
+    fn ends_on_a_slab_answer_as_the_map_of_conns_did() {
+        #[derive(Default)]
+        struct Old {
+            closed: bool,
+            peer_closed: bool,
+            outbox: Vec<u8>,
+        }
+        /// What `effect` completed with, polling past what else is told.
+        fn until(sim: &mut Sim, effect: Effect) -> Done {
+            let tag = effect.tag();
+            sim.submit(&mut vec![effect]);
+            let mut out = Vec::new();
+            loop {
+                sim.poll(&mut out, Duration::ZERO);
+                if let Some(at) = out.iter().position(|it| it.tag == tag) {
+                    return out.swap_remove(at).done;
+                }
+            }
+        }
+        let at = Address::Unix(name("s.sock"));
+        for seed in 0..100 {
+            let mut sim = Sim::new(seed, Faults::default());
+            sim.submit(&mut vec![Effect::Listen { at: at.clone(), tag: Tag(1) }]);
+            let mut model: FxHashMap<u64, Old> = FxHashMap::default();
+            let mut conns: Vec<Conn> = Vec::new();
+            let mut rng = Rng::new(seed ^ 0x5eed);
+            let mut out = Vec::new();
+            for step in 0..400u64 {
+                let pick = (!conns.is_empty()).then(|| rng.below(conns.len() as u64) as usize);
+                match (rng.below(5), pick) {
+                    (0, _) | (_, None) => {
+                        conns.push(sim.dial(&at).unwrap());
+                        model.insert(conns.len() as u64 - 1, Old::default());
+                    }
+                    (1, Some(at)) => {
+                        let tag = Tag(1000 + step);
+                        let done = until(&mut sim, Effect::Send { conn: conns[at], bytes: vec![step as u8], tag });
+                        let want = match model.get_mut(&(at as u64)) {
+                            Some(old) if !old.closed && !old.peer_closed => {
+                                old.outbox.push(step as u8);
+                                true
+                            }
+                            _ => false,
+                        };
+                        assert_eq!(done == Done::Sent, want, "seed {seed} step {step}");
+                    }
+                    (2, Some(at)) => {
+                        let done = until(&mut sim, Effect::Hangup { conn: conns[at], tag: Tag(1000 + step) });
+                        let want = match model.get_mut(&(at as u64)) {
+                            Some(old) if !old.closed => {
+                                old.closed = true;
+                                if old.peer_closed {
+                                    model.remove(&(at as u64));
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        assert_eq!(done == Done::HungUp, want, "seed {seed} step {step}");
+                    }
+                    (3, Some(at)) => {
+                        sim.peer_hangup(conns[at]);
+                        if let Some(old) = model.get_mut(&(at as u64)) {
+                            old.peer_closed = true;
+                            if old.closed {
+                                model.remove(&(at as u64));
+                            }
+                        }
+                    }
+                    (_, Some(at)) => {
+                        let want = model.get_mut(&(at as u64)).map(|old| mem::take(&mut old.outbox));
+                        assert_eq!(sim.peer_received(conns[at]), want.unwrap_or_default(), "seed {seed} step {step}");
+                        let gone = model.get(&(at as u64)).is_none_or(|old| old.closed);
+                        assert_eq!(sim.peer_hung_up_on(conns[at]), gone, "seed {seed} step {step}");
+                    }
+                }
+                sim.poll(&mut out, Duration::ZERO);
+                out.clear();
+            }
+            let live = model.len();
+            assert_eq!(sim.ends.len(), live, "seed {seed}");
         }
     }
 

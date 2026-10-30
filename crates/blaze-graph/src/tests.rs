@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
 use expect_test::{expect, expect_file};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -296,23 +297,13 @@ fn inputs_it_cannot_take_are_refused_and_change_nothing() {
     assert_eq!(machine.step(done(4, 2, Outcome::Built)).err(), Some(Error::Over));
 }
 
-/// A small generator, so the simulation needs no dependency and every seed is the same run.
-struct Lcg(u64);
-
-impl Lcg {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (self.0 >> 33) % n.max(1)
-    }
-}
-
 /// Random graphs finished in a random order: no node runs before what it waits for is done,
 /// no pool runs more than its threads, every node settles, and the critical path is a chain
 /// of nodes that each waited for the one before.
 #[test]
 fn random_builds_keep_the_rules() {
     for seed in 0..300u64 {
-        let mut random = Lcg(seed);
+        let mut random = SplitMix64::new(seed);
         let nodes = 1 + random.below(40) as u32;
         let config = Config {
             io: 1 + random.below(3) as usize,

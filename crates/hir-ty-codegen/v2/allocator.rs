@@ -3,12 +3,12 @@
 //! `#[global_allocator]`'s (the functions its expansion exports) or else to std's defaults.
 //! Each entry is an instance of its own ([`Kind::Allocator`]), defined under its symbol.
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_codegen::backend::FrontRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use cranelift_codegen::ir::{AbiParam, InstBuilder as _, Signature};
-use hir_ty::{ParamEnvAndCrate, db::HirDatabase, next_solver::{DbInterner, ParamEnv}};
+use hir_ty::{ParamEnvAndCrate, next_solver::{DbInterner, ParamEnv}};
 
 use super::{HirInstance, Kind, places::Ref};
 use crate::{
@@ -34,7 +34,7 @@ const CODE_DOMAIN: &str = "blaze v2 allocator 1";
 /// The shim of the program of `krate`, and the `#[global_allocator]`'s functions it calls,
 /// which nothing else names: none for a program that does not link `alloc`.
 pub(super) fn shim(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     root: impl Fn(hir_def::FunctionId) -> HirInstance,
 ) -> Result<Vec<HirInstance>, String> {
@@ -114,7 +114,7 @@ pub(super) fn walk(forward: &Forward) -> Vec<Ref> {
     forward.to.iter().map(|to| FrontRef::Extern((*to).to_owned())).collect()
 }
 
-pub(super) fn built(db: &dyn HirDatabase, forward: &Forward, checked: bool) -> crate::Result<Produced> {
+pub(super) fn built(db: &Db, forward: &Forward, checked: bool) -> crate::Result<Produced> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: forward.krate };
     compile_as(db, env, None, false, checked, true, |fx| {
         let mut sig = Signature::new(fx.cg.isa.default_call_conv());

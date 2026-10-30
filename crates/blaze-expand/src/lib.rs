@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use base_db::{Env, SourceDatabase};
+use base_db::{Db, Env};
 use blaze_cas::Reader;
 use blaze_core::Traced;
 use blaze_ids::ContentId;
@@ -82,7 +82,7 @@ impl Mode {
         match value {
             None => Ok(Mode::Keep),
             Some("check") => Ok(Mode::Check),
-            Some(other) => Err(format!(
+            Some(other) => Err(format!( // alloc: error path
                 "{CACHE}={other:?} is not a mode: every expansion that can be kept is, and \
                  `check` expands what was kept again and compares"
             )),
@@ -110,8 +110,9 @@ struct Installed {
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 /// The inputs of a server's expansion as they are now: the machine's files, and the
-/// environment it is sent ([`Environment::seen`]), worked out the first time a shape names a
-/// variable, so a hit of a run that read none allocates none.
+/// environment it is sent ([`Environment::seen`]). A variable a shape names is looked up where
+/// it is, so a hit allocates nothing; the whole environment is worked out only for a run that
+/// read all of it.
 struct Seen<'a> {
     passed: &'a [(String, String)],
     call: &'a Env,
@@ -120,11 +121,18 @@ struct Seen<'a> {
     none: inputs::Env,
 }
 
-impl Seen<'_> {
-    fn now(&mut self) -> Now<'_> {
-        let (passed, call) = (self.passed, self.call);
-        let env = self.made.get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter())));
-        Now { files: Files::shared(), env }
+impl<'a> Seen<'a> {
+    /// The value [`Environment::seen`] gives `name`: the call's, over what is passed, over
+    /// what blaze sets for a server ([`warm::SET`]). A name that is not UTF-8 is none of them.
+    fn value(&self, name: &std::ffi::OsStr) -> Option<&'a str> {
+        let name = name.to_str()?;
+        if let Some((_, value)) = self.call.iter().find(|it| it.0 == name) {
+            return Some(value);
+        }
+        if let Some((_, value)) = self.passed.iter().rev().find(|it| it.0 == name) {
+            return Some(value.as_str());
+        }
+        warm::SET.iter().find(|it| it.0 == name).map(|it| it.1)
     }
 }
 
@@ -139,20 +147,22 @@ impl Inputs for Seen<'_> {
         Now { files: Files::shared(), env: &self.none }.dir(path)
     }
 
-    fn env(&mut self, name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
-        self.now().env(name)
+    fn env(&mut self, name: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
+        self.value(name).map(std::ffi::OsStr::new)
     }
 
     fn env_all(&mut self) -> &[(std::ffi::OsString, std::ffi::OsString)] {
         let (passed, call) = (self.passed, self.call);
+        // alloc: a run that read the whole environment: it is sorted once per call, as its key needs.
         self.made.get_or_insert_with(|| inputs::Env::new(Environment::seen(passed, call.iter()))).vars()
     }
 
     fn names(
         &mut self,
         path: &std::path::Path,
-    ) -> Result<Option<Vec<(std::ffi::OsString, bool)>>, Self::Error> {
-        Now { files: Files::shared(), env: &self.none }.names(path)
+        out: &mut blaze_usercode::trace::Names<'_>,
+    ) -> Result<bool, Self::Error> {
+        Now { files: Files::shared(), env: &self.none }.names(path, out)
     }
 }
 
@@ -176,10 +186,11 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
     let var = |name: &str| match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")), // alloc: error path
     };
     let mode = Mode::of(var(CACHE)?.as_deref())?;
     let installed = Installed { expansions, mode };
+    // alloc: error path
     INSTALLED.set(installed).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
     load_cargo::wrap_expanders(wrap);
     Ok(())
@@ -202,12 +213,12 @@ pub fn keeping() -> Option<Keeping> {
 }
 
 fn wrap(
-    inner: Arc<dyn ProcMacroExpander>,
+    inner: Arc<dyn ProcMacroExpander>, // dyn: the database's expander, the edge, wrapped once per macro
     dylib: &AbsPath,
     name: &str,
     kind: ProcMacroKind,
-) -> Arc<dyn ProcMacroExpander> {
-    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind })
+) -> Arc<dyn ProcMacroExpander> { // dyn: as above
+    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind }) // alloc: setup, once per macro loaded
 }
 
 /// A library of proc macros, hashed the first time one of its macros expands.
@@ -228,22 +239,25 @@ impl Dylib {
         let dylibs = dylibs.get_or_insert_default();
         dylibs
             .entry((path.to_path_buf(), stamp))
+            // alloc: setup, once per library and macro as a workspace loads
             .or_insert_with(|| Arc::new(Dylib { path: path.to_path_buf(), code: OnceLock::new() }))
-            .clone()
+            .clone() // clone: setup, the macro's handle on its library
     }
 
-    fn code(&self) -> Result<ContentId, String> {
+    /// The library's content ID, hashed once; why it can't be read, lent, when it can't.
+    fn code(&self) -> Result<ContentId, &str> {
         let code = || match std::fs::read(&self.path) {
             Ok(bytes) => Ok(ContentId::of(LIBRARY, &bytes)),
+            // alloc: error path
             Err(error) => Err(format!("the proc-macro library {} can't be read: {error}", self.path)),
         };
-        self.code.get_or_init(code).clone()
+        self.code.get_or_init(code).as_ref().copied().map_err(String::as_str)
     }
 }
 
 #[derive(Debug)]
 struct Kept {
-    inner: Arc<dyn ProcMacroExpander>,
+    inner: Arc<dyn ProcMacroExpander>, // dyn: the database's expander, the edge (`wrap`)
     dylib: Arc<Dylib>,
     name: Box<str>,
     kind: ProcMacroKind,
@@ -421,7 +435,7 @@ impl Kept {
     #[allow(clippy::too_many_arguments)]
     fn kept(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -558,7 +572,7 @@ impl ProcMacroExpander for Kept {
 
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -612,7 +626,7 @@ impl ProcMacroExpander for Kept {
 
     fn expand_in(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         calling_crate: base_db::Crate,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,

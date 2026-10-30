@@ -52,7 +52,8 @@ const CHECKED: &str = "checked by Header::parse";
 /// A header from borrowed parts, for the functions the object reader takes out of C objects:
 /// the bytes [`blaze_codegen::wasm::Code::encode`] writes for a `Code` of these parts with no
 /// `__stack_pointer` places and no imports (an object names those through relocations and
-/// symbols). Nothing is decoded into a `Signature` and the code is one exact allocation.
+/// symbols). Nothing is decoded into a `Signature`, and the code is appended to a buffer the
+/// caller sized ([`Parts::len`]).
 pub(super) struct Parts<'a> {
     pub ty: Sig<'a>,
     pub types: &'a [Sig<'a>],
@@ -79,33 +80,48 @@ impl Parts<'_> {
             + export
     }
 
+    /// The length of the code [`Parts::encode_into`] writes for a body of `body` bytes.
+    pub(super) fn len(&self, body: usize) -> usize {
+        let header = self.header_len();
+        uleb_len(header as u64) + header + body
+    }
+
     /// The function's code, the header and then `body`, and where `body` starts in it.
+    #[cfg(test)]
     pub(super) fn encode(&self, body: &[u8]) -> (Vec<u8>, u32) {
+        let mut code = Vec::with_capacity(self.len(body.len()));
+        let start = self.encode_into(&mut code, body);
+        (code, start)
+    }
+
+    /// Appends the function's code, the header and then `body`, to `out` (which has room for
+    /// [`Parts::len`] more bytes), and says where `body` starts in it.
+    pub(super) fn encode_into(&self, out: &mut Vec<u8>, body: &[u8]) -> u32 {
+        let from = out.len();
         let header = self.header_len();
         let start = uleb_len(header as u64) + header;
-        let mut code = Vec::with_capacity(start + body.len());
-        uleb(&mut code, header as u64);
-        code.extend_from_slice(self.ty);
-        uleb(&mut code, self.types.len() as u64);
+        uleb(out, header as u64);
+        out.extend_from_slice(self.ty);
+        uleb(out, self.types.len() as u64);
         for ty in self.types {
-            code.extend_from_slice(ty);
+            out.extend_from_slice(ty);
         }
-        uleb(&mut code, self.type_fixups.len() as u64);
+        uleb(out, self.type_fixups.len() as u64);
         for &(at, which) in self.type_fixups {
-            uleb(&mut code, at.into());
-            uleb(&mut code, which.into());
+            uleb(out, at.into());
+            uleb(out, which.into());
         }
-        code.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&[0, 0]);
         match self.export {
-            None => code.push(0),
+            None => out.push(0),
             Some(name) => {
-                code.push(1);
-                leb::name(&mut code, name);
+                out.push(1);
+                leb::name(out, name);
             }
         }
-        debug_assert_eq!(code.len(), start);
-        code.extend_from_slice(body);
-        (code, start as u32)
+        debug_assert_eq!(out.len() - from, start);
+        out.extend_from_slice(body);
+        start as u32
     }
 }
 

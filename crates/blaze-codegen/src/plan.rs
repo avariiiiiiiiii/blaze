@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Backend,
-    settings::{DebugInfo, Panic, Spec, Toolchain},
+    settings::{DebugInfo, Panic, Sanitize, Spec, Toolchain},
 };
 
 pub const POLICY_DOMAIN: &str = "blaze v2 codegen policy 1";
@@ -107,6 +107,9 @@ pub struct Policy {
     /// #1292: fold functions that differ only in constants. Only where code speed holds:
     /// off for profiles at LLVM's levels unless asked for.
     pub fold: bool,
+    /// The build's sanitizers and SanitizerCoverage (`RUSTFLAGS`' `-Zsanitizer` and the
+    /// rest), the same for every function.
+    pub sanitize: Sanitize,
 }
 
 /// How one function is compiled.
@@ -198,6 +201,7 @@ impl Policy {
         let llvm = self.toolchain.llvm.is_some();
         let backend =
             level.backend(llvm).ok_or_else(|| PlanError::NoLlvm { origin: origin.clone(), level })?;
+        let live = self.mode == Mode::Live;
         let spec = Spec {
             toolchain: self.toolchain.clone(),
             backend,
@@ -206,9 +210,11 @@ impl Policy {
             panic: profile.panic,
             debuginfo,
             fold: self.fold && backend == Backend::Cranelift,
+            // A member's code built into another function's would outlive a patch of it.
+            mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
+            sanitize: self.sanitize,
             policy: self.id(),
         };
-        let live = self.mode == Mode::Live;
         let patchable = live && matches!(origin, Origin::Member(_));
         let tiered = live && backend != Backend::Cranelift;
         Ok(if tiered {
@@ -252,6 +258,7 @@ mod tests {
             },
             mode,
             fold: false,
+            sanitize: Sanitize::default(),
         }
     }
 
@@ -325,6 +332,22 @@ mod tests {
         let once = output.choose(&dependency, None).unwrap();
         assert_eq!(once.first.backend, Backend::Llvm { opt: 3 });
         assert!(once.then.is_none());
+    }
+
+    #[test]
+    fn mir_is_inlined_at_two_and_three_outside_live_builds() {
+        let inlines = |level, mode| {
+            let choice = policy(level, mode).choose(&member(), None).unwrap();
+            let last = choice.then.unwrap_or(choice.first);
+            last.mir_inline
+        };
+        for level in [OptLevel::O0, OptLevel::O1, OptLevel::S, OptLevel::Z] {
+            assert!(!inlines(level, Mode::Output), "{level:?}");
+        }
+        for level in [OptLevel::O2, OptLevel::O3] {
+            assert!(inlines(level, Mode::Output), "{level:?}");
+            assert!(!inlines(level, Mode::Live), "{level:?}");
+        }
     }
 
     #[test]

@@ -788,11 +788,11 @@ struct Struct9<T>(T);
 struct Struct9<#[pointee] T, U>(T) where T: ?Sized;
 "#,
         expect![[r#"
-            35..72: `CoercePointee` can only be derived on `struct`s
+            35..72: `CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`
             74..114: `CoercePointee` can only be derived on `struct`s with at least one field
             116..158: `CoercePointee` can only be derived on `struct`s with at least one field
             160..202: `CoercePointee` can only be derived on `struct`s with at least one field
-            204..258: `CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`
+            204..258: `derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout
             260..326: `CoercePointee` can only be derived on `struct`s that are generic over at least one type
             328..439: only one type parameter can be marked as `#[pointee]` when deriving `CoercePointee` traits
             441..530: exactly one generic type parameter must be marked as `#[pointee]` to derive `CoercePointee` traits

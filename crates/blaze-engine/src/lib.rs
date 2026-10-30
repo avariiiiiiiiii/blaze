@@ -5,6 +5,7 @@
 
 // The cargo drop-in and what it stands on are blaze-cargo's; here they are the engine's modules
 // as they were, `crate::cargo::...`.
+use base_db::Db;
 use blaze_cargo::{
     RUN_TOOL_TARGET, Told, answers, cargo, dep_info, deps, end_with_reader, errors, lock, memory,
     plan, process, refused_error, remote, renamed, replace, sandbox, socket, stub, trace, tree,
@@ -50,7 +51,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use ide_db::base_db::{CrateOrigin, LangCrateOrigin, SourceDatabase as _, TargetKind};
+use ide_db::base_db::{CrateOrigin, LangCrateOrigin, TargetKind};
 use std::{
     collections::BTreeSet,
     io::{BufRead as _, BufReader, Write as _},
@@ -64,7 +65,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef, db::HirDatabase};
+use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
 use hir_def::{
     AssocItemId, DefWithBodyId, FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId,
     expr_store::Body, item_scope::ItemScope,
@@ -778,7 +779,7 @@ fn name_sources(db: &mut RootDatabase, roots: &[(PathBuf, PathBuf)]) {
 
 /// What rustc is told a file is called: its place in the checkout when it is a file of it.
 fn source_path(
-    db: &dyn HirDatabase,
+    db: &Db,
     root: &Path,
     base: Option<&Path>,
     file: vfs::FileId,
@@ -866,7 +867,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// What reads the syntax, with each file a module of the crates of the programs.
-    fn sema(&self) -> hir::Semantics<'a, RootDatabase> {
+    fn sema(&self) -> hir::Semantics<'a> {
         match &self.programs {
             Some(crates) => hir::Semantics::new_within(self.db, crates.clone()),
             None => hir::Semantics::new(self.db),
@@ -1182,7 +1183,7 @@ impl Resolver<'_> {
     /// which for a package with tests and examples analyses all its dev-dependencies.
     fn function_at(
         &self,
-        sema: &hir::Semantics<'_, RootDatabase>,
+        sema: &hir::Semantics<'_>,
         scope: Module,
         func: &ast::Fn,
     ) -> Option<hir::Function> {
@@ -1362,7 +1363,7 @@ fn library_identity(files: &[PathBuf]) -> Vec<String> {
         let Ok(file) = std::fs::File::open(rlib) else { continue };
         // SAFETY: a library of the toolchain is not written once it is installed, nor one cargo
         // built while a build links it.
-        let Ok(bytes) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+        let Ok(bytes) = (unsafe { blaze_core::fs::Mapped::map(&file) }) else { continue };
         if let Some(hash) = metadata_hash(&bytes) {
             identity.push(format!("{name}={hash}"));
         }
@@ -1873,7 +1874,7 @@ fn is_definition(node: &SyntaxNode) -> bool {
 /// how rustc tells apart the closures of a function, and the statics of one name that a
 /// macro used twice in it declares.
 fn place_in_definition(
-    sema: &hir::Semantics<'_, RootDatabase>,
+    sema: &hir::Semantics<'_>,
     target: &SyntaxNode,
     counts: &dyn Fn(&SyntaxNode) -> bool,
 ) -> Option<u32> {
@@ -1902,7 +1903,7 @@ fn owner_of(along: &[SyntaxNode]) -> Option<SyntaxNode> {
 /// once instead of once a node, which made a build in full of a large program wait on one
 /// thread (#259). A node whose place the count does not find is counted alone as before.
 fn place_counted(
-    sema: &hir::Semantics<'_, RootDatabase>,
+    sema: &hir::Semantics<'_>,
     places: &Places,
     counted: Counted,
     target: &SyntaxNode,
@@ -1933,7 +1934,7 @@ fn place_counted(
 /// The places of all the nodes of the definition `owner` that `counts` holds of, by where
 /// each is ([`Spot`]), or none when the order rustc numbers them in is not known.
 fn all_places(
-    sema: &hir::Semantics<'_, RootDatabase>,
+    sema: &hir::Semantics<'_>,
     owner: &SyntaxNode,
     counts: &dyn Fn(&SyntaxNode) -> bool,
 ) -> Option<FxHashMap<Spot, u32>> {
@@ -2010,7 +2011,7 @@ struct LateImports {
 }
 
 impl LateImports {
-    fn around(sema: &hir::Semantics<'_, RootDatabase>, owner: &SyntaxNode) -> LateImports {
+    fn around(sema: &hir::Semantics<'_>, owner: &SyntaxNode) -> LateImports {
         let mut late = LateImports::default();
         let module_expanded = module_is_expanded(sema, owner);
         let expanded = |node: &SyntaxNode| {
@@ -2066,7 +2067,7 @@ impl LateImports {
 
 /// Whether an attribute of the item is a macro, which rustc expands the item with: `#[test]`
 /// is one, though it leaves the item as it is written.
-fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item) -> bool {
+fn has_attribute_macro(sema: &hir::Semantics<'_>, item: &ast::Item) -> bool {
     sema.resolve_attr_macro_call(item).is_some()
         || ast::HasAttrs::attrs(item).filter_map(|it| it.path()).any(|path| {
             matches!(
@@ -2077,7 +2078,7 @@ fn has_attribute_macro(sema: &hir::Semantics<'_, RootDatabase>, item: &ast::Item
 }
 
 /// Whether a macro expanded to the module the node is in, or to one around it.
-fn module_is_expanded(sema: &hir::Semantics<'_, RootDatabase>, node: &SyntaxNode) -> bool {
+fn module_is_expanded(sema: &hir::Semantics<'_>, node: &SyntaxNode) -> bool {
     let mut module = sema.scope(node).map(|it| it.module());
     while let Some(it) = module {
         if it.declaration_source(sema.db).is_some_and(|it| it.file_id.is_macro()) {
@@ -2097,7 +2098,7 @@ enum Turn {
 }
 
 struct Count<'a, 'db> {
-    sema: &'a hir::Semantics<'db, RootDatabase>,
+    sema: &'a hir::Semantics<'db>,
     target: Option<&'a SyntaxNode>,
     /// The target and what it is in, the macros it is expanded from with their expansions.
     along: Vec<SyntaxNode>,
@@ -2116,7 +2117,7 @@ struct Count<'a, 'db> {
 
 impl<'a, 'db> Count<'a, 'db> {
     fn new(
-        sema: &'a hir::Semantics<'db, RootDatabase>,
+        sema: &'a hir::Semantics<'db>,
         target: Option<&'a SyntaxNode>,
         along: Vec<SyntaxNode>,
         counts: &'a dyn Fn(&SyntaxNode) -> bool,
@@ -2363,7 +2364,7 @@ impl<'a, 'db> Count<'a, 'db> {
 /// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
 /// definition it is written in, a closure's own closures being counted apart.
 fn closure_number(
-    sema: &hir::Semantics<'_, RootDatabase>,
+    sema: &hir::Semantics<'_>,
     places: &Places,
     closure: &SyntaxNode,
 ) -> Option<u32> {
@@ -2547,7 +2548,7 @@ struct Named {
 /// Every crate of the graph, in its order, as naming one finds it: a build names its crates
 /// many times, and the graph is asked once until it changes.
 #[salsa::tracked(returns(ref))]
-fn named_crates(db: &dyn HirDatabase) -> Vec<Named> {
+fn named_crates(db: &Db) -> Vec<Named> {
     let root = |krate: Crate| {
         let file = krate.root_file(db);
         let source_root = db.file_source_root(file).source_root_id(db);
@@ -2564,7 +2565,7 @@ fn named_crates(db: &dyn HirDatabase) -> Vec<Named> {
 /// The crates `krate` depends on, itself and all, from the graph.
 #[salsa::tracked(returns(ref))]
 fn deps_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: ide_db::base_db::Crate,
 ) -> FxHashSet<ide_db::base_db::Crate> {
     krate.transitive_deps(db).into_iter().collect()
@@ -5242,7 +5243,7 @@ fn build(
     let counting = hir_ty_codegen::counted::Counting::start();
     let contents = &content::Contents::default();
     let resolver = Resolver::of(db, table, args, contents, listed)?;
-    let hir_db: &dyn HirDatabase = db;
+    let hir_db: &Db = db;
     let mut functions = Vec::new();
     let mut kept = Vec::new();
     let mut every_static: Vec<StaticId> = Vec::new();
@@ -8199,7 +8200,7 @@ pub fn main() -> anyhow::Result<()> {
 /// crate, every module and its name, so one of the same name elsewhere, in an impl or in a
 /// block is not. What to note for it, a request or a run of its query.
 fn followed_const(
-    db: &dyn hir_ty::db::HirDatabase,
+    db: &Db,
     def: hir_def::ConstId,
     executing: bool,
 ) -> Option<fn(Instant)> {
@@ -11739,7 +11740,7 @@ fn main() {}
         );
         let [main, shared, other] = [0, 1, 2].map(|it| files[it].file_id(&db));
         hir::attach_db(&db, || {
-            let crates_of = |sema: &hir::Semantics<'_, RootDatabase>, file| {
+            let crates_of = |sema: &hir::Semantics<'_>, file| {
                 let modules = sema.file_to_module_defs(file);
                 modules.map(|it| ide_db::base_db::Crate::from(it.krate(&db))).collect::<Vec<_>>()
             };

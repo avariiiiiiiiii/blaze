@@ -19,7 +19,8 @@
 //!
 //! Each fact ends with whether the type needs drop and whether it is `Freeze`.
 
-use blaze_ids::ContentId;
+use base_db::Db;
+use blaze_ids::{ContentId, Hasher};
 use hir_def::VariantId;
 use hir_ty::{
     ParamEnvAndCrate,
@@ -61,7 +62,7 @@ const PLAIN_DATA_DEPTH: u32 = 8;
 /// What the queries of one environment share: the database, an inference context in it and
 /// the environment, borrowed and stored.
 pub(crate) struct Cx<'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) interner: DbInterner<'db>,
     pub(crate) infcx: InferCtxt<'db>,
     pub(crate) env: ParamEnvAndCrate<'db>,
@@ -69,11 +70,14 @@ pub(crate) struct Cx<'db> {
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(db: &'db dyn HirDatabase, stored: &StoredParamEnvAndCrate) -> Cx<'db> {
+    pub(crate) fn new(
+        db: &'db Db,
+        stored: StoredParamEnvAndCrate,
+    ) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
-        Cx { db, interner, infcx, env, stored: stored.clone() }
+        Cx { db, interner, infcx, env, stored }
     }
 
     /// `ty` with a top-level alias normalized, as the code generator's `normalize` does.
@@ -83,8 +87,8 @@ impl<'db> Cx<'db> {
 
     pub(crate) fn layout(&self, ty: Ty<'db>) -> Result<Arc<Layout>, Unshared> {
         self.db
-            .layout_of_ty(ty.store(), self.stored.clone())
-            .map_err(|error| Unshared::NoLayout(format!("`{ty:?}`: {error:?}")))
+            .layout_of_ty(ty.store(), self.stored.clone()) // clone: the query's key, a reference count
+            .map_err(|error| Unshared::NoLayout(format!("`{ty:?}`: {error:?}"))) // alloc: error path
     }
 
     pub(crate) fn needs_drop(&self, ty: Ty<'db>) -> bool {
@@ -94,7 +98,10 @@ impl<'db> Cx<'db> {
     /// The fact of `ty`: one query per (type, environment), so a hit is one lookup.
     pub(crate) fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
         let ty = self.normalize(ty);
-        fact(self.db, ty.store(), self.stored.clone()).clone()
+        match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
+            Ok(id) => Ok(*id),
+            Err(why) => Err(why.clone()), // clone: error path
+        }
     }
 
     /// The code generator's `is_plain_data`: made of scalars, pointers and references only,
@@ -123,7 +130,7 @@ impl<'db> Cx<'db> {
                 if let hir_def::AdtId::UnionId(_) = adt {
                     return false;
                 }
-                identity::variants(self.db, adt).into_iter().all(|variant| {
+                identity::variants(self.db, adt).all(|variant| {
                     self.db.field_types(variant).iter().all(|(_, field)| {
                         let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
                         self.is_plain_data(ty, depth + 1)
@@ -142,39 +149,39 @@ impl<'db> Cx<'db> {
     }
 
     /// What a pointer to `pointee` says of its memory.
-    fn pointee(&self, pointee: Ty<'db>, out: &mut Vec<u8>) -> Result<(), Unshared> {
+    fn pointee(&self, pointee: Ty<'db>, out: &mut Hasher) -> Result<(), Unshared> {
         let pointee = self.normalize(pointee);
         let (size, align) = match pointee.kind() {
             TyKind::Str => {
-                out.push(tag::POINTEE_STR);
+                out.update(&[tag::POINTEE_STR]);
                 (0, 1)
             }
             TyKind::Slice(element) => {
-                out.push(tag::POINTEE_SLICE);
+                out.update(&[tag::POINTEE_SLICE]);
                 let layout = self.layout(self.normalize(element))?;
-                out.extend_from_slice(&layout.size.bytes().to_le_bytes());
+                out.update(&layout.size.bytes().to_le_bytes());
                 (0, layout.align.abi.bytes())
             }
             TyKind::Dynamic(..) | TyKind::Foreign(_) => {
-                out.push(tag::POINTEE_OPAQUE);
-                out.extend_from_slice(&identity::ty(self.db, pointee)?.0);
+                out.update(&[tag::POINTEE_OPAQUE]);
+                out.update(&identity::ty(self.db, pointee)?.0);
                 (0, 1)
             }
             _ => {
                 let layout = self.layout(pointee)?;
                 if layout.is_unsized() {
                     // A struct with an unsized tail: its metadata is the tail's.
-                    out.push(tag::POINTEE_OPAQUE);
-                    out.extend_from_slice(&identity::ty(self.db, pointee)?.0);
+                    out.update(&[tag::POINTEE_OPAQUE]);
+                    out.update(&identity::ty(self.db, pointee)?.0);
                 } else {
-                    out.push(tag::POINTEE_SIZED);
-                    out.push(u8::from(layout.uninhabited));
+                    out.update(&[tag::POINTEE_SIZED]);
+                    out.update(&[u8::from(layout.uninhabited)]);
                 }
                 (layout.size.bytes(), layout.align.abi.bytes())
             }
         };
-        out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&align.to_le_bytes());
+        out.update(&size.to_le_bytes());
+        out.update(&align.to_le_bytes());
         let element = match pointee.kind() {
             TyKind::Str => None,
             TyKind::Slice(element) => Some(element),
@@ -183,11 +190,11 @@ impl<'db> Cx<'db> {
         let plain = element.is_none_or(|it| self.is_plain_data(it, 0));
         let freeze = is_freeze(&self.infcx, pointee, self.env.param_env);
         let unpin = self.is_unpin(pointee);
-        out.push(u8::from(plain) | u8::from(freeze) << 1 | u8::from(unpin) << 2);
+        out.update(&[u8::from(plain) | u8::from(freeze) << 1 | u8::from(unpin) << 2]);
         Ok(())
     }
 
-    fn write(&self, ty: Ty<'db>, out: &mut Vec<u8>) -> Result<(), Unshared> {
+    fn write(&self, ty: Ty<'db>, out: &mut Hasher) -> Result<(), Unshared> {
         let db = self.db;
         match ty.kind() {
             TyKind::Bool
@@ -197,89 +204,91 @@ impl<'db> Cx<'db> {
             | TyKind::Float(_)
             | TyKind::Str
             | TyKind::Never => {
-                out.push(tag::LEAF);
-                out.extend_from_slice(&identity::ty(db, ty)?.0);
+                out.update(&[tag::LEAF]);
+                out.update(&identity::ty(db, ty)?.0);
             }
             TyKind::Adt(def, args) => {
                 let adt = def.def_id();
-                out.push(tag::ADT);
-                out.extend_from_slice(&identity::adt(db, adt).clone()?.0);
+                out.update(&[tag::ADT]);
+                out.id(identity::adt(db, adt).as_ref().map_err(Clone::clone)?);
                 layout::write(&self.layout(ty)?, out);
                 for variant in identity::variants(db, adt) {
                     if let VariantId::EnumVariantId(variant) = variant {
                         let discriminant = db.const_eval_discriminant(variant).map_err(|error| {
-                            Unshared::ConstEval(format!("a discriminant of `{ty:?}`: {error:?}"))
+                            Unshared::ConstEval(format!("a discriminant of `{ty:?}`: {error:?}")) // alloc: error path
                         })?;
-                        out.extend_from_slice(&discriminant.to_le_bytes());
+                        out.update(&discriminant.to_le_bytes());
                     }
                     for (_, field) in db.field_types(variant).iter() {
                         let field = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                        out.extend_from_slice(&self.fact(field)?.0);
+                        out.update(&self.fact(field)?.0);
                     }
                 }
             }
             TyKind::Tuple(fields) => {
-                out.push(tag::TUPLE);
+                out.update(&[tag::TUPLE]);
                 layout::write(&self.layout(ty)?, out);
                 for field in fields.iter() {
-                    out.extend_from_slice(&self.fact(field)?.0);
+                    out.update(&self.fact(field)?.0);
                 }
             }
             TyKind::Array(element, len) => {
-                out.push(tag::ARRAY);
+                out.update(&[tag::ARRAY]);
                 layout::write(&self.layout(ty)?, out);
-                out.extend_from_slice(&self.fact(element)?.0);
-                out.extend_from_slice(&identity::konst(db, len)?.0);
+                out.update(&self.fact(element)?.0);
+                out.update(&identity::konst(db, len)?.0);
             }
             TyKind::Slice(element) => {
-                out.push(tag::SLICE);
-                out.extend_from_slice(&self.fact(element)?.0);
+                out.update(&[tag::SLICE]);
+                out.update(&self.fact(element)?.0);
             }
             TyKind::Ref(_, pointee, mutability) => {
-                out.push(tag::REF);
-                out.push(u8::from(mutability.is_mut()));
+                out.update(&[tag::REF]);
+                out.update(&[u8::from(mutability.is_mut())]);
                 self.pointee(pointee, out)?;
             }
             TyKind::RawPtr(pointee, mutability) => {
-                out.push(tag::RAW);
-                out.push(u8::from(mutability.is_mut()));
+                out.update(&[tag::RAW]);
+                out.update(&[u8::from(mutability.is_mut())]);
                 self.pointee(pointee, out)?;
             }
             TyKind::Closure(_, args) => {
-                out.push(tag::CLOSURE);
+                out.update(&[tag::CLOSURE]);
                 layout::write(&self.layout(ty)?, out);
-                out.extend_from_slice(&self.fact(args.as_closure().tupled_upvars_ty())?.0);
+                out.update(&self.fact(args.as_closure().tupled_upvars_ty())?.0);
             }
             // A function item is a value of no size; a call of it, a cast of it to a pointer
             // and a vtable of it key it where they are.
-            TyKind::FnDef(..) => out.push(tag::FN_ITEM),
+            TyKind::FnDef(..) => {
+                out.update(&[tag::FN_ITEM]);
+            }
             // A parameter, an alias that did not normalize or an error has no identity, which
             // says so.
             _ => {
-                out.push(tag::IDENTITY);
-                out.extend_from_slice(&identity::ty(db, ty)?.0);
+                out.update(&[tag::IDENTITY]);
+                out.update(&identity::ty(db, ty)?.0);
             }
         }
         let freeze = is_freeze(&self.infcx, ty, self.env.param_env);
-        out.push(u8::from(self.needs_drop(ty)) | u8::from(freeze) << 1);
+        out.update(&[u8::from(self.needs_drop(ty)) | u8::from(freeze) << 1]);
         Ok(())
     }
 }
 
 #[salsa::tracked(returns(ref), cycle_result = fact_cycle)]
 fn fact(
-    db: &dyn HirDatabase,
+    db: &Db,
     ty: StoredTy,
     env: StoredParamEnvAndCrate,
 ) -> Result<ContentId, Unshared> {
-    let cx = Cx::new(db, &env);
-    let mut out = Vec::with_capacity(256);
+    let cx = Cx::new(db, env);
+    let mut out = Hasher::new(FACT_DOMAIN);
     cx.write(ty.as_ref(), &mut out)?;
-    Ok(ContentId::of(FACT_DOMAIN, &out))
+    Ok(out.finish())
 }
 
 fn fact_cycle(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,

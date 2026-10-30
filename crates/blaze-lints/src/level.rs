@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    blaze,
     diag::{Diagnostic, MultiSpan, Span, Sublevel},
     registry::{self, Group, Info, LintIndex, Named},
 };
@@ -88,6 +89,18 @@ pub enum Target {
     Warnings,
     /// A lint of rustc's, by name.
     Rustc(String),
+    /// Lints of blaze's own (`blaze::`): bit `i` for [`blaze::Lint::ALL`]`[i]`, one for a
+    /// lint, several for the group `blaze::hot`.
+    Blaze(u8),
+}
+
+/// The lints of the group `blaze::hot`, as a [`Target::Blaze`] has them.
+const BLAZE_HOT: u8 = blaze_bit(blaze::Lint::HotClone)
+    | blaze_bit(blaze::Lint::HotAlloc)
+    | blaze_bit(blaze::Lint::HotDyn);
+
+pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u8 {
+    1 << lint as u8
 }
 
 impl Target {
@@ -97,6 +110,9 @@ impl Target {
         let name = name.replace('-', "_");
         if name == "warnings" {
             return Some(Target::Warnings);
+        }
+        if let Some(rest) = name.strip_prefix("blaze::") {
+            return Target::blaze(rest).map(Target::Blaze);
         }
         let Some(rest) = name.strip_prefix("clippy::") else {
             return (!name.contains("::")).then_some(Target::Rustc(name));
@@ -110,6 +126,14 @@ impl Target {
         })
     }
 
+    /// The lints of blaze's own `blaze::<name>` stands for, as a [`Target::Blaze`] has them.
+    pub(crate) fn blaze(name: &str) -> Option<u8> {
+        if name == "hot" {
+            return Some(BLAZE_HOT);
+        }
+        blaze::Lint::ALL.iter().find(|it| it.name() == name).map(|it| blaze_bit(*it))
+    }
+
     /// Whether it sets the level of `lint`, whose index is `index` when it is clippy's.
     fn covers(&self, lint: Lint<'_>, index: Option<LintIndex>) -> bool {
         match (self, lint) {
@@ -118,6 +142,7 @@ impl Target {
             (Target::All, Lint::Clippy(info)) => info.group.in_all(),
             (Target::Warnings, Lint::Warnings) => true,
             (Target::Rustc(name), Lint::Rustc(lint)) => name == lint,
+            (Target::Blaze(lints), Lint::Blaze(lint)) => lints & blaze_bit(lint) != 0,
             _ => false,
         }
     }
@@ -127,17 +152,24 @@ impl Target {
 #[derive(Clone, Copy, Debug)]
 pub enum Lint<'a> {
     Clippy(&'a Info),
+    /// A lint of blaze's own, `allow` unless a crate turns it on.
+    Blaze(blaze::Lint),
     /// The `warnings` group, which rustc asks for as a lint.
     Warnings,
     /// A lint of rustc's, as `unfulfilled_lint_expectations`.
     Rustc(&'a str),
 }
 
+/// Where a diagnostic of a lint of blaze's own points for more.
+pub(crate) const BLAZE_DOCS: &str =
+    "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/lints/blaze.md";
+
 impl Lint<'_> {
     /// As rustc names it in its notes.
     pub fn name(&self) -> String {
         match self {
             Lint::Clippy(info) => format!("clippy::{}", info.name),
+            Lint::Blaze(lint) => format!("blaze::{}", lint.name()),
             Lint::Warnings => "warnings".to_owned(),
             Lint::Rustc(name) => (*name).to_owned(),
         }
@@ -146,6 +178,7 @@ impl Lint<'_> {
     fn default_level(&self) -> Level {
         match self {
             Lint::Clippy(info) => info.default_level(),
+            Lint::Blaze(_) => Level::Allow,
             Lint::Warnings | Lint::Rustc(_) => Level::Warn,
         }
     }
@@ -318,7 +351,7 @@ impl Levels {
     fn probe(&self, lint: Lint<'_>, sets: &[Set]) -> Option<Spec> {
         let index = match lint {
             Lint::Clippy(info) => Some(info.index()),
-            Lint::Warnings | Lint::Rustc(_) => None,
+            Lint::Blaze(_) | Lint::Warnings | Lint::Rustc(_) => None,
         };
         let mut found: Option<&Spec> = None;
         let attrs = sets.iter().map(|it| (&it.target, &it.spec));
@@ -453,6 +486,30 @@ mod tests {
     }
 
     #[test]
+    fn blazes_lints_are_allowed_until_turned_on() {
+        let hot_alloc = Lint::Blaze(blaze::Lint::HotAlloc);
+        let none = Levels::new(&CommandLine::default());
+        assert_eq!(none.of(hot_alloc, &[]).level, Level::Allow);
+        assert_eq!(none.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
+        let hot = Levels::new(&CommandLine::parse(&args("--deny=blaze::hot")).unwrap());
+        assert_eq!(hot.of(hot_alloc, &[]).level, Level::Deny);
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
+        assert_eq!(hot.of(Lint::Clippy(info("needless_bool")), &[]).level, Level::Warn);
+        let span = Span { file: "src/lib.rs".to_owned(), lo: 0, hi: 1, expansion: None };
+        let cold = Set {
+            target: Target::of("blaze::hot_alloc").unwrap(),
+            spec: Spec {
+                level: Level::Allow,
+                source: Source::Node { name: "blaze::hot_alloc".to_owned(), span, reason: None },
+            },
+        };
+        assert_eq!(hot.of(hot_alloc, &[cold.clone()]).level, Level::Allow);
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::HotClone), &[cold]).level, Level::Deny);
+        assert_eq!(Target::of("blaze::no_such_lint"), None);
+        assert_eq!(hot_alloc.name(), "blaze::hot_alloc");
+    }
+
+    #[test]
     fn manifest_flags_in_cargos_order() {
         let lints = vec![
             ("clippy".to_owned(), "all".to_owned(), Level::Warn, -1),
@@ -460,11 +517,18 @@ mod tests {
             ("clippy".to_owned(), "empty_enums".to_owned(), Level::Warn, 0),
             ("rust".to_owned(), "unsafe_code".to_owned(), Level::Deny, 0),
             ("cargo".to_owned(), "x".to_owned(), Level::Warn, 0),
+            ("blaze".to_owned(), "hot_alloc".to_owned(), Level::Deny, 0),
         ];
         let names: Vec<_> = of_manifest(&lints).opts.into_iter().map(|it| it.0).collect();
         assert_eq!(
             names,
-            ["clippy::all", "unsafe_code", "clippy::needless_bool", "clippy::empty_enums"]
+            [
+                "clippy::all",
+                "unsafe_code",
+                "clippy::needless_bool",
+                "blaze::hot_alloc",
+                "clippy::empty_enums"
+            ]
         );
     }
 

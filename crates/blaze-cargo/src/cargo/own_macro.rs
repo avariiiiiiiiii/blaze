@@ -20,6 +20,7 @@ use std::{
 };
 
 use anyhow::Context as _;
+use blaze_macro_wasm::rule;
 
 use super::{
     own_script::{self, Made},
@@ -36,8 +37,9 @@ pub const SERVER: &str = "BLAZE_PROC_MACRO_SERVER";
 pub const SHIPPED: &str = "blaze-proc-macro-srv";
 
 /// The variable that has proc macros expanded natively, `0` or `off`, rather than built as
-/// WebAssembly modules and run by blaze, which is what is done when it is unset.
-pub const WASM: &str = "BLAZE_PROC_MACRO_WASM";
+/// WebAssembly modules and run by blaze, which is what is done when it is unset or `1`/`on`;
+/// any other value is refused ([`blaze_macro_wasm::rule::runs`]).
+pub const WASM: &str = blaze_macro_wasm::rule::WASM;
 
 /// The target a proc macro's module is built for.
 pub const WASM_TARGET: &str = "wasm32-wasip1";
@@ -137,16 +139,36 @@ pub fn wasm_target(sysroot: &Path) -> Result<(), String> {
     said
 }
 
-/// Whether proc macros are built as WebAssembly modules ([`WASM`]): not when [`turned_off`].
+/// Whether proc macros are built as WebAssembly modules ([`WASM`]): not when it turns them
+/// off, nor when [`turned_off`]. A value of [`WASM`] the rule refuses is not off here; it is
+/// refused where each macro's way is decided ([`runs`]).
 pub fn wasm() -> bool {
-    let off =
-        matches!(std::env::var_os(WASM).as_deref().and_then(OsStr::to_str), Some("0" | "off"));
+    let off = matches!(
+        rule::runs("", &[], wasm_var().as_deref()),
+        Ok(rule::Runs::Native(rule::Why::TurnedOff))
+    );
     !off && !turned_off()
+}
+
+/// [`WASM`] as text: one that is not UTF-8 is read lossily, so the rule refuses it.
+fn wasm_var() -> Option<String> {
+    std::env::var_os(WASM).map(|it| it.to_string_lossy().into_owned())
+}
+
+/// Whether the proc macro of crate `name` runs as WebAssembly where the workspace runs the
+/// packages `native` natively ([`NATIVE_KEY`]), as [`blaze_macro_wasm::rule::runs`] decides
+/// with [`WASM`]: an error for a value of [`WASM`] it refuses.
+pub fn runs(name: &str, native: &[String]) -> Result<bool, String> {
+    runs_with(name, native, wasm_var().as_deref())
+}
+
+fn runs_with(name: &str, native: &[String], var: Option<&str>) -> Result<bool, String> {
+    Ok(rule::runs(name, native, var)? == rule::Runs::Wasm)
 }
 
 /// The key, in `[workspace.metadata.blaze]` of a workspace's root manifest, that lists the
 /// packages whose proc macros are expanded natively, not as WebAssembly.
-pub const NATIVE_KEY: &str = "native-proc-macros";
+pub const NATIVE_KEY: &str = rule::NATIVE_KEY;
 
 /// The packages, by crate name (`-` as `_`), the root manifest of the workspace at `root`
 /// names in [`NATIVE_KEY`]: none when it has no manifest or does not say.
@@ -172,7 +194,7 @@ pub fn runs_as_wasm(name: &str) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
     let root = sandboxed::workspace_root(&cwd)?.unwrap_or(cwd);
     let native = native_proc_macros(&root).map_err(anyhow::Error::msg)?;
-    Ok(!native.iter().any(|it| it == &name.replace('-', "_")))
+    runs(name, &native).map_err(anyhow::Error::msg)
 }
 
 /// The variable blaze sets for the cargo of a load into its own target directory.
@@ -284,13 +306,23 @@ pub fn libraries_of(
         false => Vec::new(),
     };
     let refused = |name: &str, why: &str| refusal(name, why, workspace);
+    // Each macro's way, decided once: a value of `WASM` the rule refuses fails each.
+    let ways: Vec<Result<bool, String>> = libraries
+        .iter()
+        .map(|Compiled { name, .. }| match wasm {
+            true => runs(name, &native),
+            false => Ok(false),
+        })
+        .collect();
     let Some(sysroot) = sysroot else {
         let why = "the workspace has no sysroot to build it over";
         return libraries
             .iter()
-            .map(|Compiled { name, .. }| match wasm && !native.contains(name) {
-                true => Err(refused(name, why)),
-                false => Ok(None),
+            .zip(&ways)
+            .map(|(Compiled { name, .. }, way)| match way {
+                Ok(true) => Err(refused(name, why)),
+                Ok(false) => Ok(None),
+                Err(why) => Err(why.clone()),
             })
             .collect();
     };
@@ -307,7 +339,13 @@ pub fn libraries_of(
                     let Some(Compiled { name, library, description }) = libraries.get(at) else {
                         break;
                     };
-                    let as_wasm = wasm && !native.contains(name);
+                    let as_wasm = match &ways[at] {
+                        Ok(it) => *it,
+                        Err(why) => {
+                            made.lock().unwrap()[at] = Err(why.clone());
+                            continue;
+                        }
+                    };
                     if !as_wasm && server().is_none() {
                         continue;
                     }
@@ -370,14 +408,14 @@ pub struct Compiled {
 }
 
 /// Why the load fails when the proc macro of crate `name` in the workspace at `workspace`
-/// cannot be built or run as a WebAssembly module, and the ways out.
+/// cannot be built or run as a WebAssembly module, and the ways out
+/// ([`blaze_macro_wasm::rule::refused`], with the manifest that lists natively run packages).
 pub fn refusal(name: &str, why: &str, workspace: &Path) -> String {
     let root = sandboxed::workspace_root(workspace).ok().flatten();
     let root = root.as_deref().unwrap_or(workspace);
     format!(
-        "the proc macro `{name}` cannot run as WebAssembly: {why}\n  name its package in \
-         `{NATIVE_KEY}` under [workspace.metadata.blaze] in {} to expand it natively, or set \
-         BLAZE_PROC_MACRO_WASM=0 for every proc macro",
+        "{} (in {}), or set {WASM}=0 for every proc macro",
+        rule::refused(name, why),
         root.join("Cargo.toml").display(),
     )
 }
@@ -503,6 +541,28 @@ pub fn made(record: &Record, wasm: bool) -> Option<Made<'_>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_way_a_macro_runs_is_blaze_macro_wasms_rule() {
+        let native = vec!["serde_derive".to_owned()];
+        assert_eq!(runs_with("thiserror_impl", &native, None), Ok(true));
+        assert_eq!(runs_with("thiserror-impl", &native, Some("on")), Ok(true));
+        assert_eq!(runs_with("serde-derive", &native, None), Ok(false));
+        assert_eq!(runs_with("thiserror_impl", &native, Some("0")), Ok(false));
+        let refused = runs_with("thiserror_impl", &native, Some("yes")).unwrap_err();
+        assert!(refused.contains(WASM), "{refused}");
+    }
+
+    #[test]
+    fn a_refused_module_names_its_macro_the_key_and_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        let said = refusal("serde_derive", "no wasm32-wasip1 target", dir.path());
+        assert!(said.contains("`serde_derive`"), "{said}");
+        assert!(said.contains(NATIVE_KEY), "{said}");
+        assert!(said.contains("no wasm32-wasip1 target"), "{said}");
+        assert!(said.contains(&dir.path().join("Cargo.toml").display().to_string()), "{said}");
+    }
 
     #[test]
     fn only_crates_that_link_proc_macro_are_told_the_host() {

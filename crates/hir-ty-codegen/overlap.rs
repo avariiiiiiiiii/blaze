@@ -232,6 +232,7 @@ fn slot_mut(inst: &mut InstructionData) -> Option<&mut ir::StackSlot> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use cranelift_codegen::ir::{
         InstBuilder, StackSlotData, StackSlotKind,
         types::{I32, I64},
@@ -372,20 +373,11 @@ mod tests {
         }
     }
 
-    struct Seeded(u64);
-
-    impl Seeded {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) % n
-        }
-    }
-
     /// A function with slots of sizes and alignments `seed` picks, whose addresses are loaded
     /// through, offset, stored, returned or left unused; the frame over them, some of its
     /// locals in registers, with conflicts `seed` picks; and the slots of named locals.
     fn frame(seed: u64) -> (ir::Function, FrameLocals, Vec<ir::StackSlot>) {
-        let mut random = Seeded(seed);
+        let mut random = SplitMix64::new(seed);
         let mut func = ir::Function::new();
         func.signature.returns.push(ir::AbiParam::new(I64));
         let mut context = FunctionBuilderContext::new();

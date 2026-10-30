@@ -10,11 +10,10 @@ use smallvec::SmallVec;
 
 use crate::{
     intrinsic::Intrinsic,
-    mir::{Inlined, InlinedScope, InlinedSpan, MirSpan},
+    mir::{Inlined, InlinedScope, InlinedSpan, MirSpan, optimize::abi_can_unwind},
 };
 
 use super::{
-    abi_can_unwind,
     cost::{Call, classify},
     cycle::{Walked, walk},
     spans::{Site, caller_site},

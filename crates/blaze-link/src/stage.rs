@@ -17,13 +17,13 @@ use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
 use blaze_ids::{Hasher, radix};
-use bumpalo::Bump;
-use bumpalo::collections::Vec as BumpVec;
+use blaze_mem::Frame;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::arena::{FrameVec, collect_in};
 use crate::cow::{IdSet, SymSet};
-use crate::model::{Apply, Class, Fixup, Plan, Special, Sym, Writer};
+use crate::model::{Apply, Class, Fixup, Formats, Plan, Special, Sym, Writer};
 use crate::position::{self, Spans};
 use crate::reloc::{self, GotKind};
 use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
@@ -67,13 +67,13 @@ impl<'a> Content<'a> {
 /// rewrote (a few: positions, the descriptor, pieces a relayout moved).
 pub(crate) struct Contents<'a> {
     first: PieceId,
-    fresh: Vec<Option<Content<'a>>>,
+    fresh: FrameVec<'a, Option<Content<'a>>>,
     other: FxHashMap<PieceId, Content<'a>>,
 }
 
 impl<'a> Contents<'a> {
-    pub fn new(first: PieceId) -> Contents<'a> {
-        Contents { first, fresh: Vec::new(), other: FxHashMap::default() }
+    pub fn new(first: PieceId, arena: &'a Frame) -> Contents<'a> {
+        Contents { first, fresh: Vec::new_in(arena), other: FxHashMap::default() }
     }
 
     #[inline]
@@ -119,7 +119,7 @@ impl<'a> Contents<'a> {
 
 pub(crate) struct Stage<'a> {
     pub output: &'a Output,
-    pub writer: &'a dyn Writer,
+    pub writer: &'a Formats,
     pub plan: &'a Plan,
     pub symbols: &'a mut Symbols,
     pub objects: &'a mut FxHashMap<Obj, crate::native::Read>,
@@ -130,35 +130,35 @@ pub(crate) struct Stage<'a> {
     /// The image's file name.
     pub name: &'a str,
     /// The stage's scratch: freed, all at once, when the stage ends.
-    pub arena: &'a Bump,
+    pub arena: &'a Frame,
     /// The contents of pieces this stage made or rewrote.
     pub contents: Contents<'a>,
     /// Pieces this stage made, still live.
-    pub fresh: IdSet,
+    pub fresh: IdSet<&'a Frame>,
     /// Pieces to relocate (with [`Stage::contents`] or their bytes where they were).
-    pub write: IdSet,
+    pub write: IdSet<&'a Frame>,
     /// Symbols whose definition changed: what refers to them is relocated again.
-    pub changed: SymSet,
+    pub changed: SymSet<&'a Frame>,
     /// Slots whose cell is written: put in this stage, or running a body that moved.
-    pub dirty_cells: IdSet,
+    pub dirty_cells: IdSet<&'a Frame>,
     /// Pieces removed this stage: [`State::any`] still reads them.
-    pub removed: Vec<PieceId>,
+    pub removed: FrameVec<'a, PieceId>,
     /// Slots whose function was removed: [`Stage::dangling`] fails if one is still empty
     /// and its slot still called.
-    pub emptied: Vec<u32>,
+    pub emptied: FrameVec<'a, u32>,
     /// Shared pieces that lost a user outside [`Stage::removed`], and symbols that gained
     /// one outside [`Stage::fresh`]: [`Stage::sweep`] counts them.
-    pub touched: Vec<PieceId>,
-    pub counted: Vec<Sym>,
+    pub touched: FrameVec<'a, PieceId>,
+    pub counted: FrameVec<'a, Sym>,
     /// Whether everything is placed anew.
     pub full: bool,
     pub table: bool,
     pub functions: u64,
     pub statics: u64,
     /// The classes [`Writer::own`] gave, asked once per stage.
-    pub owned: Vec<(Class, ClassId, u32)>,
-    /// Bytes reused for keys written out to be hashed.
-    pub scratch: Vec<u8>,
+    pub owned: FrameVec<'a, (Class, ClassId, u32)>,
+    /// Bytes reused for keys and frame records written out, kept by the image across stages.
+    pub scratch: &'a mut Vec<u8>,
     /// Whether [`Stage::spans`] replaced any span table.
     pub spans_changed: bool,
 }
@@ -226,11 +226,13 @@ impl<'a> Stage<'a> {
         self.symbols.intern(key)
     }
 
-    /// The symbols of relocations' targets, interned in one batch.
-    fn reloc_syms(&mut self, relocs: &[Reloc]) -> Vec<Sym> {
-        let table = self.table;
-        let keys: Vec<Wide<'_>> = relocs.iter().map(|it| wide(&it.target, table).0).collect();
-        self.symbols.intern_wide(&keys)
+    /// The symbols of relocations' targets, in the stage's arena.
+    fn reloc_syms(&mut self, relocs: &[Reloc]) -> &'a [Sym] {
+        let mut out = Vec::with_capacity_in(relocs.len(), self.arena);
+        for reloc in relocs {
+            out.push(self.target_sym(&reloc.target));
+        }
+        out.leak()
     }
 
     /// Defines `sym`, noting a change.
@@ -313,7 +315,7 @@ impl<'a> Stage<'a> {
     }
 
     fn fixup_slice(&self, fixups: impl IntoIterator<Item = Fixup>) -> &'a [Fixup] {
-        BumpVec::from_iter_in(fixups, self.arena).into_bump_slice()
+        collect_in(fixups, self.arena).leak()
     }
 
     /// Applies everything `change` says to the copy of the state.
@@ -350,7 +352,7 @@ impl<'a> Stage<'a> {
         for it in &change.statics {
             self.add_static(it)?;
         }
-        let mut named = Vec::with_capacity(change.names.len());
+        let mut named = Vec::with_capacity_in(change.names.len(), self.arena);
         for (name, target) in &change.names {
             let name = self.symbols.name(name);
             let sym = self.target_sym(target);
@@ -367,12 +369,12 @@ impl<'a> Stage<'a> {
                     names.remove(&name);
                 }
             }
-            for (name, sym) in &named {
+            for (name, sym) in named.iter() {
                 names.insert(*name, *sym);
             }
         }
         self.positions()?;
-        let mut seen: Vec<Sym> = Vec::new();
+        let mut seen: FrameVec<'a, Sym> = Vec::new_in(self.arena);
         for id in self.fresh.iter() {
             let piece = self.new.piece(id).expect("a fresh piece");
             seen.extend(
@@ -421,12 +423,8 @@ impl<'a> Stage<'a> {
         self.make(&piece, Content::Zero);
         let arch = self.arch();
         let size = table::stub_size(arch) as usize;
-        let code: &'a mut [u8] = self.arena.alloc_slice_fill_copy(size * capacity as usize, 0);
-        if size > 0 {
-            code.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
-                table::write_stub(arch, slot as u32, out);
-            });
-        }
+        let code: &'a mut [u8] = self.arena.alloc_slice_fill_with(size * capacity as usize, |_| 0);
+        table::stubs(arch, code);
         let stub = table::stub_fixups(arch);
         let fixups = self.fixup_slice((0..u64::from(capacity)).flat_map(|slot| {
             stub.iter().map(move |it| Fixup {
@@ -479,7 +477,7 @@ impl<'a> Stage<'a> {
     /// Empties every cell holding `body`, which is gone: the cell keeps its bytes (a running
     /// program may still be in the old code) until a function is put in its slot.
     fn unslot(&mut self, body: Sym) {
-        let slots: Vec<u32> = self.new.slots_of(body).collect();
+        let slots = collect_in(self.new.slots_of(body), self.arena);
         for slot in slots {
             self.new.set_cell(slot, None);
             self.dirty_cells.remove(slot);
@@ -505,6 +503,7 @@ impl<'a> Stage<'a> {
                 .find_body(function)
                 .filter(|it| self.new.home(*it).is_some())
                 .ok_or_else(|| {
+                    // alloc: error path
                     error(Some(*function), format!("put in the slot of {name:?}, and neither added nor linked"))
                 })?;
             let id = self.symbols.id(&name.0);
@@ -520,13 +519,18 @@ impl<'a> Stage<'a> {
     /// The functions added, made into pieces: their keys built in parallel and interned in
     /// one batch.
     fn functions(&mut self, added: &[&'a CompiledFunction]) -> Result<(), LinkError> {
+        if added.is_empty() {
+            return Ok(());
+        }
+        let arena = self.arena;
         let mut seen: FxHashSet<&InstanceKey> = FxHashSet::default();
         seen.reserve(added.len());
-        let mut todo: Vec<&'a CompiledFunction> = Vec::with_capacity(added.len());
+        let mut todo: FrameVec<'a, &'a CompiledFunction> = Vec::with_capacity_in(added.len(), arena);
         for function in added {
             if function.arch != self.arch() {
                 return Err(error(
                     Some(function.key),
+                    // alloc: error path
                     format!("compiled for {:?}, linked into an image for {:?}", function.arch, self.arch()),
                 ));
             }
@@ -539,21 +543,22 @@ impl<'a> Stage<'a> {
             }
             todo.push(function);
         }
-        let counts: Vec<usize> = todo.iter().map(|it| key_count(it)).collect();
-        let mut keys: Vec<Wide<'a>> = vec![Wide::Key(SymKey::Generation); counts.iter().sum()];
-        let mut parts: Vec<&mut [Wide<'a>]> = Vec::with_capacity(todo.len());
+        let counts = collect_in(todo.iter().map(|it| key_count(it)), arena);
+        let keys: &mut [Wide<'a>] = arena.alloc_slice_fill_with(counts.iter().sum(), |_| Wide::Key(SymKey::Generation));
+        let mut parts: FrameVec<'_, &mut [Wide<'a>]> = Vec::with_capacity_in(todo.len(), arena);
         let mut rest = &mut keys[..];
-        for count in &counts {
-            let (part, after) = rest.split_at_mut(*count);
+        for count in counts.iter() {
+            let (part, after) = std::mem::take(&mut rest).split_at_mut(*count);
             parts.push(part);
             rest = after;
         }
         let table = self.table;
-        parts.into_par_iter().zip(todo.par_iter()).for_each(|(out, function)| function_keys(*function, table, out));
-        let syms = self.symbols.intern_wide(&keys);
+        parts.par_iter_mut().zip(todo.par_iter()).for_each(|(out, function)| function_keys(*function, table, &mut **out));
+        drop(parts);
+        let syms = self.symbols.intern_wide(keys);
         let mut at = 0;
         for (function, count) in todo.iter().zip(counts) {
-            self.add_function(function, &syms[at..at + count])?;
+            self.add_function(*function, &syms[at..at + count])?;
             at += count;
         }
         self.functions += todo.len() as u64;
@@ -567,8 +572,8 @@ impl<'a> Stage<'a> {
         function: Option<InstanceKey>,
         in_code: bool,
     ) -> Result<(&'a [Fixup], &'a [Sym]), LinkError> {
-        let mut fixups = BumpVec::with_capacity_in(relocs.len(), self.arena);
-        let mut weak = BumpVec::new_in(self.arena);
+        let mut fixups = Vec::with_capacity_in(relocs.len(), self.arena);
+        let mut weak = Vec::new_in(self.arena);
         for (reloc, sym) in relocs.iter().zip(syms) {
             let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code).map_err(|it| error(function, it))?;
             if matches!(reloc.target, Target::Weak(_)) {
@@ -578,7 +583,7 @@ impl<'a> Stage<'a> {
         }
         weak.sort_unstable();
         weak.dedup();
-        Ok((fixups.into_bump_slice(), weak.into_bump_slice()))
+        Ok((fixups.leak(), weak.leak()))
     }
 
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {
@@ -587,6 +592,7 @@ impl<'a> Stage<'a> {
         let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.len()], key, true)?;
         if self.arch() == Arch::Wasm32 && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
             let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
+                // alloc: error path
                 .map_err(|it| error(key, format!("its wasm header: {it}")))?;
             self.wasm_imports(&code.imports);
         }
@@ -610,22 +616,29 @@ impl<'a> Stage<'a> {
                     .part(cie);
                 if let Some(personality) = personality {
                     self.scratch.clear();
-                    self.symbols.write_key(personality, &mut self.scratch);
-                    hasher.part(&self.scratch);
+                    self.symbols.write_key(personality, &mut *self.scratch);
+                    hasher.part(self.scratch.as_slice());
                 }
                 let cie_id = self.symbols.id(&hasher.finish());
                 let cie_sym = self.sym(SymKey::Cie(cie_id));
                 if self.new.home(cie_sym).is_none() {
-                    let record = unwind::cie(*code_align, *data_align, *return_address, cie, personality.is_some())
-                        .map_err(|it| error(key, it))?;
-                    let fixups = self.fixup_slice(record.fixups.iter().map(|(at, _)| Fixup {
+                    let fields = unwind::cie_into(
+                        *code_align,
+                        *data_align,
+                        *return_address,
+                        cie,
+                        personality.is_some(),
+                        &mut *self.scratch,
+                    )
+                    .map_err(|it| error(key, it))?;
+                    let fixups = self.fixup_slice(fields.iter().map(|(at, _)| Fixup {
                         at: *at,
                         apply: Apply::GotRel32,
                         target: personality.expect("a personality field"),
                         addend: 0,
                         minus: None,
                     }));
-                    let bytes: &'a [u8] = self.arena.alloc_slice_copy(&record.bytes);
+                    let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice());
                     let piece = self.piece(cie_sym, &Class::EhFrame, 4, bytes.len() as u64, fixups, What::Shared);
                     self.make(&piece, Content::Bytes(bytes));
                 }
@@ -639,11 +652,17 @@ impl<'a> Stage<'a> {
                     }
                     None => None,
                 };
-                let record = unwind::fde(function.code.len() as u64, fde, personality.is_some(), lsda.is_some())
-                    .map_err(|it| error(key, it))?;
+                let fields = unwind::fde_into(
+                    function.code.len() as u64,
+                    fde,
+                    personality.is_some(),
+                    lsda.is_some(),
+                    &mut *self.scratch,
+                )
+                .map_err(|it| error(key, it))?;
                 let fde_key = self.symbols.id(&function.key.0);
                 let sym = self.sym(SymKey::Fde(fde_key));
-                let fixups = self.fixup_slice(record.fixups.iter().map(|(at, field)| match field {
+                let fixups = self.fixup_slice(fields.iter().map(|(at, field)| match field {
                     Field::CiePointer => {
                         Fixup { at: *at, apply: Apply::Delta32, target: sym, addend: *at as i64, minus: Some(cie_sym) }
                     }
@@ -657,7 +676,7 @@ impl<'a> Stage<'a> {
                     },
                     Field::Personality => unreachable!("a CIE's field"),
                 }));
-                let bytes: &'a [u8] = self.arena.alloc_slice_copy(&record.bytes);
+                let bytes: &'a [u8] = self.arena.alloc_slice_copy(self.scratch.as_slice());
                 let mut piece = self.piece(sym, &Class::EhFrame, 4, bytes.len() as u64, fixups, What::Fde);
                 piece.rank = 1;
                 self.make(&piece, Content::Bytes(bytes));
@@ -671,8 +690,8 @@ impl<'a> Stage<'a> {
                 });
                 let padded = bytes.len().next_multiple_of(4);
                 let targets = handler.into_iter().chain(lsda);
-                let size = padded + 4 * targets.clone().count();
-                let out: &'a mut [u8] = self.arena.alloc_slice_fill_copy(size, 0);
+                let size = padded + 4 * (usize::from(handler.is_some()) + usize::from(lsda.is_some()));
+                let out: &'a mut [u8] = self.arena.alloc_slice_fill_with(size, |_| 0);
                 out[..bytes.len()].copy_from_slice(bytes);
                 let fixups = self.fixup_slice(targets.enumerate().map(|(n, target)| Fixup {
                     at: (padded + 4 * n) as u64,
@@ -717,6 +736,7 @@ impl<'a> Stage<'a> {
         if self.new.slots >= self.new.capacity {
             return Err(error(
                 Some(function),
+                // alloc: error path
                 format!("the jump table is full ({} slots): link the image from scratch", self.new.capacity),
             ));
         }
@@ -760,17 +780,18 @@ impl<'a> Stage<'a> {
             let id = self.symbols.id(&data.id);
             let data_sym = self.sym(SymKey::Data(id));
             let relocs = self.reloc_syms(&data.relocs);
-            self.add_data(data, data_sym, &relocs, None)?;
+            self.add_data(data, data_sym, relocs, None)?;
         }
         let (bytes, relocs, size, zero): (&'a [u8], &'a [Reloc], u64, bool) = match &it.init {
             Init::Bytes { bytes, relocs } => (&bytes[..], &relocs[..], bytes.len() as u64, false),
             Init::Zeroed { size } => (&[][..], &[][..], *size, true),
         };
         let syms = self.reloc_syms(relocs);
-        let (fixups, weak) = self.fixups(relocs, &syms, None, false)?;
+        let (fixups, weak) = self.fixups(relocs, syms, None, false)?;
         if self.arch() == Arch::Wasm32 {
             self.wasm_imports(&it.imports);
         }
+        // alloc: error path
         let static_error = |what: String| error(None, format!("the static {:?}: {what}", it.item));
         let (class, rank) = match &it.section {
             Some(name) => {
@@ -792,7 +813,8 @@ impl<'a> Stage<'a> {
         let zeroed = crate::state::zeroed(self.new.class(class));
         let content = match (zero, zeroed) {
             (false, true) => {
-                let class = self.new.class(class).clone();
+                let class = self.new.class(class);
+                // alloc: error path
                 return Err(static_error(format!("initialized bytes in the zeroed section {class:?}")));
             }
             (false, false) => Content::Bytes(bytes),
@@ -827,7 +849,7 @@ impl<'a> Stage<'a> {
         if change.spans.is_empty() {
             return Ok(());
         }
-        let mut changed: Vec<(IdNo, u32)> = Vec::new();
+        let mut changed: FrameVec<'a, (IdNo, u32)> = Vec::new_in(self.arena);
         for (anchor, bytes) in &change.spans {
             let id = self.symbols.id(anchor);
             let before = match self.new.span_table(id) {
@@ -835,6 +857,7 @@ impl<'a> Stage<'a> {
                 Some(it) => it.len(),
                 None => 0,
             };
+            // alloc: error path
             let spans = Spans::new(bytes).map_err(|it| error(None, format!("the span table of {anchor:?}: {it}")))?;
             let len = before.max(spans.len());
             self.new.set_span_table(id, spans);
@@ -880,11 +903,13 @@ impl<'a> Stage<'a> {
         let arena = self.arena;
         let Some(table) = self.new.span_table(anchor) else {
             let anchor = self.symbols.content(anchor);
+            // alloc: error path
             return Err(error(None, format!("a position in {anchor:?}, whose span table the link was not given")));
         };
         let Some(at) = table.span(index) else {
             let len = table.len();
             let anchor = self.symbols.content(anchor);
+            // alloc: error path
             return Err(error(None, format!("span {index} of {anchor:?}, whose table has {len}")));
         };
         let name = table.file(at.file);
@@ -892,7 +917,7 @@ impl<'a> Stage<'a> {
         let file_name = self.symbols.name(name);
         let file = self.symbols.intern(SymKey::FileName(file_name));
         let bytes: Option<&'a [u8]> = self.new.home(file).is_none().then(|| {
-            let out = arena.alloc_slice_fill_copy(name.len() + 1, 0);
+            let out = arena.alloc_slice_fill_with(name.len() + 1, |_| 0);
             out[..name.len()].copy_from_slice(name.as_bytes());
             &*out
         });
@@ -905,7 +930,7 @@ impl<'a> Stage<'a> {
 
     /// The `Location` records the fresh pieces refer to and that don't exist yet.
     fn positions(&mut self) -> Result<(), LinkError> {
-        let mut wanted: Vec<(Sym, IdNo, u32)> = Vec::new();
+        let mut wanted: FrameVec<'a, (Sym, IdNo, u32)> = Vec::new_in(self.arena);
         for id in self.fresh.iter() {
             let piece = self.new.piece(id).expect("a fresh piece");
             for fixup in piece.fixups() {
@@ -939,10 +964,12 @@ impl<'a> Stage<'a> {
     /// Counts the fixups to shared pieces that this stage added and removed, and removes the
     /// shared pieces nothing refers to any more.
     pub fn sweep(&mut self) {
-        let mut touched = std::mem::take(&mut self.touched);
-        let fresh = self.fresh.sorted();
-        let mut targets: Vec<Sym> = std::mem::take(&mut self.counted);
-        for id in &fresh {
+        let arena = self.arena;
+        let mut touched = std::mem::replace(&mut self.touched, Vec::new_in(arena));
+        let mut fresh = collect_in(self.fresh.iter(), arena);
+        fresh.sort_unstable();
+        let mut targets = std::mem::replace(&mut self.counted, Vec::new_in(arena));
+        for id in fresh.iter() {
             let piece = self.new.piece(*id).expect("a fresh piece");
             targets.extend(State::targets(piece));
             if matches!(piece.what(), What::Shared) {
@@ -975,7 +1002,7 @@ impl<'a> Stage<'a> {
             }
             touched.sort_unstable();
             touched.dedup();
-            for id in std::mem::take(&mut touched) {
+            for id in std::mem::replace(&mut touched, Vec::new_in(arena)) {
                 let live = self.new.piece(id).is_some_and(|it| matches!(it.what(), What::Shared));
                 if live && self.new.users(id) == 0 {
                     self.unmake(id);
@@ -1012,9 +1039,10 @@ impl<'a> Stage<'a> {
 
     /// The GOT cells and PLT stubs the pieces to write need, made when missing.
     pub fn needs(&mut self) -> Result<(), LinkError> {
-        let mut cells: Vec<(GotKind, Sym)> = Vec::new();
-        let mut plt: Vec<Sym> = Vec::new();
-        let mut got_names: Vec<String> = Vec::new();
+        let arena = self.arena;
+        let mut cells: FrameVec<'a, (GotKind, Sym)> = Vec::new_in(arena);
+        let mut plt: FrameVec<'a, Sym> = Vec::new_in(arena);
+        let mut got_specials: FrameVec<'a, (Sym, u32)> = Vec::new_in(arena);
         for id in self.write.iter() {
             let Some(piece) = self.new.piece(id) else { continue };
             for fixup in piece.fixups() {
@@ -1022,13 +1050,21 @@ impl<'a> Stage<'a> {
                     cells.push((kind, self.got_target(fixup)));
                 } else if self.through_plt(fixup) {
                     plt.push(fixup.target);
-                } else if let Some(Special::Got(name)) = self.special_of(fixup.target) {
-                    got_names.push(name.clone());
+                } else if let Some((sym, at)) = special_at(&self.new, fixup.target) {
+                    if matches!(self.new.specials.get(at as usize), Some(Special::Got { .. })) {
+                        got_specials.push((sym, at));
+                    }
                 }
             }
         }
-        for name in got_names {
-            let target = self.sym_name(&name);
+        radix::sort_copy_by_key(&mut got_specials, |it| it.0.0);
+        got_specials.dedup();
+        for (sym, at) in got_specials {
+            let Some(special) = self.new.specials.get(at as usize) else { continue };
+            let Some(name) = self.symbols.name_of(sym).and_then(|it| special.got_target(it)) else { continue };
+            // Copied out of the table it is interned into.
+            let name: &str = arena.alloc_str(name);
+            let target = self.symbols.sym_name(name);
             cells.push((GotKind::Address, target));
         }
         radix::sort_copy_by_key(&mut plt, |it| it.0);
@@ -1081,8 +1117,9 @@ impl<'a> Stage<'a> {
     /// layout puts after them ([`Stage::iat_end`]); those of DLLs no longer needed removed.
     /// The cells there are are the last resolution's libraries' ([`Stage::old`]).
     fn iat_ends(&mut self) {
-        let mut names: Vec<crate::symbols::NameId> =
-            self.new.resolved.libraries.iter().map(|it| self.symbols.name(&it.name)).collect();
+        let arena = self.arena;
+        let mut names: FrameVec<'a, crate::symbols::NameId> =
+            collect_in(self.new.resolved.libraries.iter().map(|it| self.symbols.name(&it.name)), arena);
         for library in self.old.resolved.libraries.iter() {
             let Some(name) = self.symbols.find_name(&library.name) else { continue };
             if names.contains(&name) {
@@ -1136,15 +1173,8 @@ impl<'a> Stage<'a> {
     }
 
     /// The linker's symbol a symbol is, through its aliases.
-    pub fn special_of(&self, mut sym: Sym) -> Option<&Special> {
-        for _ in 0..64 {
-            match self.new.def(sym) {
-                Def::Special(at) => return self.new.specials.get(at as usize),
-                Def::Alias(to) => sym = to,
-                _ => return None,
-            }
-        }
-        None
+    pub fn special_of(&self, sym: Sym) -> Option<&Special> {
+        self.new.specials.get(special_at(&self.new, sym)?.1 as usize)
     }
 
     /// Whether a fixup reaches its target at the target's PLT stub: a branch to an import,
@@ -1166,6 +1196,7 @@ impl<'a> Stage<'a> {
         for (name, import) in imports {
             let name = self.symbols.name(name);
             if self.new.wasm_imports.get(&name) != Some(import) {
+                // clone: the state's map owns its imports; only a new or changed one is copied
                 Arc::make_mut(&mut self.new.wasm_imports).insert(name, import.clone());
             }
         }
@@ -1206,7 +1237,7 @@ impl<'a> Stage<'a> {
     /// Fails when a removed function or static is still referred to, directly or through
     /// its slot.
     pub fn dangling(&self) -> Result<(), LinkError> {
-        for slot in &self.emptied {
+        for slot in self.emptied.iter() {
             if self.new.cell(*slot).is_some() {
                 continue;
             }
@@ -1214,6 +1245,7 @@ impl<'a> Stage<'a> {
             if let Some(caller) = self.new.refs(slot_sym).find_map(|it| self.new.piece(it)) {
                 return Err(error(
                     function_of(caller),
+                    // alloc: error path
                     format!(
                         "{} is removed with nothing put in its slot, and {} still calls it",
                         self.symbols.describe(slot_sym),
@@ -1222,7 +1254,7 @@ impl<'a> Stage<'a> {
                 ));
             }
         }
-        for id in &self.removed {
+        for id in self.removed.iter() {
             let piece = self.new.any(*id).expect("a removed piece");
             for sym in std::iter::once(piece.sym).chain(piece.defines().iter().copied()) {
                 if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {
@@ -1231,6 +1263,7 @@ impl<'a> Stage<'a> {
                 if let Some(user) = self.new.refs(sym).find_map(|it| self.new.piece(it)) {
                     return Err(error(
                         function_of(user),
+                        // alloc: error path
                         format!(
                             "{} is removed, and {} still refers to it",
                             self.symbols.describe(sym),
@@ -1248,6 +1281,18 @@ pub(crate) fn function_of(piece: PieceRef<'_>) -> Option<InstanceKey> {
     piece.function().map(|it| it.key)
 }
 
+/// The linker's symbol a symbol is, through its aliases, and its index in [`State::specials`].
+fn special_at(state: &State, mut sym: Sym) -> Option<(Sym, u32)> {
+    for _ in 0..64 {
+        match state.def(sym) {
+            Def::Special(at) => return Some((sym, at)),
+            Def::Alias(to) => sym = to,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Reads a LEB128 at `*at`, moving past it.
 fn uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
     let mut value = 0u64;
@@ -1259,12 +1304,14 @@ fn uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
             return Ok(value);
         }
     }
+    // alloc: error path
     Err("wasm: a LEB128 past 64 bits in a code header".to_owned())
 }
 
 /// Moves `*at` past a function type (`0x60`, the parameters, the results).
 fn skip_signature(bytes: &[u8], at: &mut usize) -> Result<(), String> {
     if bytes.get(*at) != Some(&0x60) {
+        // alloc: error path
         return Err("wasm: a type that is not a function type".to_owned());
     }
     *at += 1;
@@ -1331,7 +1378,8 @@ mod tests {
 
     #[test]
     fn contents_are_dense_for_fresh_pieces_and_mapped_for_others() {
-        let mut contents = Contents::new(10);
+        let arena = crate::arena::stage_frame().unwrap();
+        let mut contents = Contents::new(10, &arena);
         contents.insert(12, Content::Zero);
         contents.insert(3, Content::Bytes(b"abc"));
         assert!(matches!(contents.get(12), Some(Content::Zero)));

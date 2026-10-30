@@ -151,7 +151,7 @@ impl Visitor<'_, '_, '_> {
             Expr::Block { statements, .. } => {
                 for statement in statements {
                     if let Statement::Let { pat, .. } = statement {
-                        pats.push(*pat);
+                        pats.push(pat);
                     }
                 }
             }

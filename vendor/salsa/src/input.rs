@@ -99,13 +99,17 @@ impl<C: Configuration> Jar for JarImpl<C> {
     fn create_ingredients(
         _zalsa: &mut Zalsa,
         struct_index: crate::zalsa::IngredientIndex,
+    // alloc: setup, once per ingredient when its jar registers
     ) -> Vec<Box<dyn Ingredient>> {
         let struct_ingredient: IngredientImpl<C> = IngredientImpl::new(struct_index);
 
+        // alloc: setup, once per ingredient when its jar registers
         std::iter::once(Box::new(struct_ingredient) as _)
             .chain((0..C::FIELD_DEBUG_NAMES.len()).map(|field_index| {
+                // alloc: setup, once per ingredient when its jar registers
                 Box::new(<FieldIngredientImpl<C>>::new(struct_index, field_index)) as _
             }))
+            // alloc: setup, once per ingredient when its jar registers
             .collect()
     }
 
@@ -126,6 +130,7 @@ impl<C: Configuration> IngredientImpl<C> {
         Self {
             ingredient_index: index,
             singleton: Default::default(),
+            // alloc: setup, once per ingredient when its jar registers
             memo_table_types: Arc::new(MemoTableTypes::default()),
             _phantom: std::marker::PhantomData,
         }
@@ -370,6 +375,7 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
             // SAFETY: The memo table belongs to a value that we allocated, so it
             // has the correct type. The caller guarantees exclusive database access.
             .map(|entry| unsafe { entry.value.memory_usage(&self.memo_table_types) })
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect();
 
         Some(memory_usage)
@@ -387,6 +393,7 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
     unsafe fn serialize<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        // alloc: the edge: persistence, once per serialized database
         f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
         f(&persistence::SerializeIngredient {

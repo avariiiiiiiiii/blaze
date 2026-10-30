@@ -10,9 +10,10 @@ use std::{any::TypeId, mem, str::FromStr, sync};
 
 use base_db::target::TargetData;
 use base_db::{
+    Db,
     ConstEvalBudget, Crate, CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin,
     CrateWorkspaceData, DependencyBuilder, Env, FileChange, FileSet, FxIndexMap, LangCrateOrigin,
-    SourceDatabase, SourceRoot, TargetKind, Version, VfsPath, all_crates,
+    SourceRoot, TargetKind, Version, VfsPath, all_crates,
 };
 use cfg::CfgOptions;
 use hir_expand::{
@@ -139,13 +140,53 @@ pub const WORKSPACE: base_db::SourceRootId = base_db::SourceRootId(0);
 ///
 /// Available proc macros: `identity` (attr), `DeriveIdentity` (derive), `input_replace` (attr),
 /// `mirror` (bang), `shorten` (bang)
-pub trait WithFixture: Default + SourceDatabase + 'static {
+pub trait WithFixture: Sized {
     /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_single_file(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    ) -> (Self, EditionedFileId);
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_many_files(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    ) -> (Self, Vec<EditionedFileId>);
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_files(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self;
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_files_extra_proc_macros(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+        proc_macros: Vec<(String, ProcMacro)>,
+    ) -> Self;
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_position(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FilePosition);
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_range(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FileRange);
+
+    /// See the trait documentation for more information on fixtures.
+    #[track_caller]
+    fn with_range_or_offset(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    ) -> (Self, EditionedFileId, RangeOrOffset);
+
+    fn test_crate(&self) -> Crate;
+}
+
+impl WithFixture for Db {
+    #[track_caller]
+    fn with_single_file(
+        #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (Self, EditionedFileId) {
-        let mut db = Self::default();
+        let mut db = Db::for_tests();
         let fixture = ChangeFixture::parse(ra_fixture);
         fixture.change.apply(&mut db);
         assert_eq!(fixture.files.len(), 1, "Multiple file found in the fixture");
@@ -153,12 +194,11 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         (db, file_id)
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_many_files(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (Self, Vec<EditionedFileId>) {
-        let mut db = Self::default();
+        let mut db = Db::for_tests();
         let fixture = ChangeFixture::parse(ra_fixture);
         fixture.change.apply(&mut db);
         assert!(fixture.file_position.is_none());
@@ -170,23 +210,21 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         (db, files)
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_files(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> Self {
-        let mut db = Self::default();
+        let mut db = Db::for_tests();
         let fixture = ChangeFixture::parse(ra_fixture);
         fixture.change.apply(&mut db);
         assert!(fixture.file_position.is_none());
         db
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_files_extra_proc_macros(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
         proc_macros: Vec<(String, ProcMacro)>,
     ) -> Self {
-        let mut db = Self::default();
+        let mut db = Db::for_tests();
         let fixture =
             ChangeFixture::parse_with_proc_macros(ra_fixture, MiniCore::RAW_SOURCE, proc_macros);
         fixture.change.apply(&mut db);
@@ -194,7 +232,6 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         db
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_position(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FilePosition) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
@@ -202,7 +239,6 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         (db, FilePosition { file_id, offset })
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_range(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (Self, FileRange) {
         let (db, file_id, range_or_offset) = Self::with_range_or_offset(ra_fixture);
@@ -210,12 +246,11 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         (db, FileRange { file_id, range })
     }
 
-    /// See the trait documentation for more information on fixtures.
     #[track_caller]
     fn with_range_or_offset(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (Self, EditionedFileId, RangeOrOffset) {
-        let mut db = Self::default();
+        let mut db = Db::for_tests();
         let fixture = ChangeFixture::parse(ra_fixture);
         fixture.change.apply(&mut db);
 
@@ -230,8 +265,6 @@ pub trait WithFixture: Default + SourceDatabase + 'static {
         all_crates(self).iter().copied().find(|&krate| !krate.data(self).origin.is_lang()).unwrap()
     }
 }
-
-impl<DB: SourceDatabase + Default + 'static> WithFixture for DB {}
 
 pub struct ChangeFixture {
     pub file_position: Option<(span::EditionedFileId, RangeOrOffset)>,
@@ -263,7 +296,12 @@ impl ChangeFixture {
         } = FixtureWithProjectMeta::parse(ra_fixture);
         let target_data_layout = target_data_layout.into();
         let target_arch = parse_target_arch(&target_arch);
-        let target = Ok(TargetData { arch: target_arch, data_layout: target_data_layout });
+        let target = Ok(TargetData {
+            tuple: Symbol::intern("x86_64-unknown-linux-gnu"),
+            arch: target_arch,
+            data_layout: target_data_layout,
+            has_thumb_interworking: false,
+        });
         let toolchain = Some({
             let channel = toolchain.as_deref().unwrap_or("stable");
             Version::parse(&format!("1.76.0-{channel}")).unwrap()
@@ -878,7 +916,7 @@ struct IdentityProcMacroExpander;
 impl ProcMacroExpander for IdentityProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -901,7 +939,7 @@ struct Issue18089ProcMacroExpander;
 impl ProcMacroExpander for Issue18089ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -937,7 +975,7 @@ struct AttributeInputReplaceProcMacroExpander;
 impl ProcMacroExpander for AttributeInputReplaceProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         _: &TopSubtree,
         attrs: Option<&TopSubtree>,
         _: &Env,
@@ -961,7 +999,7 @@ struct Issue18840ProcMacroExpander;
 impl ProcMacroExpander for Issue18840ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         fn_: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -998,7 +1036,7 @@ struct MirrorProcMacroExpander;
 impl ProcMacroExpander for MirrorProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         input: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1037,7 +1075,7 @@ struct ShortenProcMacroExpander;
 impl ProcMacroExpander for ShortenProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         input: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1082,7 +1120,7 @@ struct Issue17479ProcMacroExpander;
 impl ProcMacroExpander for Issue17479ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1113,7 +1151,7 @@ struct Issue18898ProcMacroExpander;
 impl ProcMacroExpander for Issue18898ProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1167,7 +1205,7 @@ struct DisallowCfgProcMacroExpander;
 impl ProcMacroExpander for DisallowCfgProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,
@@ -1199,7 +1237,7 @@ struct GenerateSuffixedTypeProcMacroExpander;
 impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _attrs: Option<&TopSubtree>,
         _env: &Env,

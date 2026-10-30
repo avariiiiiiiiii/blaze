@@ -183,12 +183,35 @@ impl std::fmt::Display for Budget {
     }
 }
 
-/// Bytes of memory in use on the machine: all but what the kernel could hand out without
-/// swapping (`MemAvailable`).
+/// Bytes of memory in use where blaze's limit applies: in blaze's own control group (v2's
+/// `memory.current` of the group `/proc/self/cgroup` names, v1's `memory.usage_in_bytes` where
+/// the memory controller is v1's), as `blaze_graph::arena::machine_budget` counts it. Never the
+/// machine's `MemTotal` less `MemAvailable`, which counts processes outside the group against
+/// a limit they don't share. The root group keeps no count, so nothing is taken off there.
 #[cfg(not(target_os = "macos"))]
 fn in_use() -> Option<u64> {
-    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-    Some(kilobytes(&info, "MemTotal:")?.saturating_sub(kilobytes(&info, "MemAvailable:")?))
+    let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    used_by(&groups, |file| std::fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok())
+}
+
+/// [`in_use`] of the control groups `groups` names, `read` reading a file under
+/// `/sys/fs/cgroup`.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn used_by(groups: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+    groups.lines().find_map(|line| {
+        let (_, line) = line.split_once(':')?;
+        let (controllers, path) = line.split_once(':')?;
+        let (under, file) = match controllers {
+            "" => ("", "memory.current"),
+            _ if controllers.split(',').any(|it| it == "memory") => ("memory/", "memory.usage_in_bytes"),
+            _ => return None,
+        };
+        let at = path.trim_matches('/');
+        if at.is_empty() {
+            return None;
+        }
+        read(&format!("{under}{at}/{file}"))?.trim().parse::<u64>().ok()
+    })
 }
 
 /// Not read on macOS yet: what other processes hold counts as nothing there.
@@ -284,6 +307,7 @@ pub fn served(db: &mut RootDatabase) -> anyhow::Result<()> {
 /// their fields, of the database's own records about them and, where the ingredient can
 /// tell, of what the fields own on the heap.
 fn ingredients(db: &mut RootDatabase) -> String {
+    // dyn: salsa's `memory_usage` is on `dyn Database`; a report, off any build's path
     let db: &mut dyn salsa::Database = db;
     let usage = db.memory_usage();
     let structs = usage.structs.iter().map(|it| ("struct", it.debug_name(), it));
@@ -384,6 +408,20 @@ mod tests {
             allowed_by("0::/ci.slice\n", files),
             Some((6 << 30, "ci.slice/memory.high".to_owned()))
         );
+    }
+
+    #[test]
+    fn others_are_what_blazes_own_group_uses_not_the_machine() {
+        let files = |files: &'static [(&'static str, &'static str)]| {
+            move |file: &str| files.iter().find(|it| it.0 == file).map(|it| it.1.to_owned())
+        };
+        let v2 = files(&[("ci.slice/job.scope/memory.current", "1073741824\n"), ("ci.slice/memory.current", "9\n")]);
+        assert_eq!(used_by("0::/ci.slice/job.scope\n", v2), Some(1 << 30));
+        let v1 = files(&[("memory/docker/c1/memory.usage_in_bytes", "536870912\n")]);
+        assert_eq!(used_by("5:cpu,cpuacct:/docker/c1\n4:memory:/docker/c1\n", v1), Some(512 << 20));
+        // The root group keeps no count: nothing is taken off.
+        assert_eq!(used_by("0::/\n", files(&[("memory.current", "1\n")])), None);
+        assert_eq!(used_by("", files(&[])), None);
     }
 
     #[test]

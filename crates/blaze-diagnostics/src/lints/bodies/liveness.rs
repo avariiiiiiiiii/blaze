@@ -30,6 +30,7 @@
 mod flow;
 mod source;
 
+use hir_ty::db::HirDatabase;
 use blaze_ids::radix;
 use hir::InFile;
 use hir_def::hir::{BindingId, Expr, ExprId, Pat, PatId};

@@ -554,7 +554,7 @@ fn hashes_are_the_elf_ones() {
 
 #[test]
 fn sections_are_placed_as_lld_places_them() {
-    let named = |name: &str, write: bool, exec: bool| Class::Named { name: name.into(), write, exec };
+    let named = |name: &str, write: bool, exec: bool| Class::Named { name: crate::model::SectionName::new(name), write, exec };
     let cases = [
         (".text", false, true, false, Class::Text, 0),
         (".text.unlikely._ZN3foo3barE", false, true, false, Class::Text, 0),
@@ -968,4 +968,172 @@ fn eh_frame_hdr_indexes_fdes_of_every_cie() {
     assert_eq!(word(8), 40);
     let pcs: Vec<i64> = (0..40).map(|at| word(12 + 8 * at) + hdr as i64).collect();
     assert_eq!(pcs, (0..40).map(|at| text as i64 + 16 * at).collect::<Vec<_>>());
+}
+
+/// A relocatable x86-64 object of `n` functions, each in a `.text.N` of its own, and `n`
+/// undefined symbols, every one named in `.data` by an absolute relocation.
+fn object_of(n: usize) -> Vec<u8> {
+    use object::write::{Object as Builder, Relocation, Symbol as Def, SymbolSection};
+    use object::{Architecture, BinaryFormat, RelocationFlags, SectionKind, SymbolFlags, SymbolKind as Type, SymbolScope};
+    let mut builder = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+    let data = builder.add_section(Vec::new(), b".data".to_vec(), SectionKind::Data);
+    builder.append_section_data(data, &vec![0; 16 * n], 8);
+    let symbol = |name: String, section: SymbolSection| Def {
+        name: name.into_bytes(),
+        value: 0,
+        size: 0,
+        kind: if section == SymbolSection::Undefined { Type::Unknown } else { Type::Text },
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section,
+        flags: SymbolFlags::None,
+    };
+    for at in 0..n {
+        let text = builder.add_section(Vec::new(), format!(".text.f{at}").into_bytes(), SectionKind::Text);
+        builder.append_section_data(text, &[0xc3], 16);
+        let function = builder.add_symbol(symbol(format!("f{at}"), SymbolSection::Section(text)));
+        let external = builder.add_symbol(symbol(format!("ext{at}"), SymbolSection::Undefined));
+        for (slot, target) in [(2 * at, function), (2 * at + 1, external)] {
+            let flags = RelocationFlags::Elf { r_type: elf::R_X86_64_64 };
+            builder.add_relocation(data, Relocation { offset: 8 * slot as u64, symbol: target, addend: 0, flags }).unwrap();
+        }
+    }
+    builder.write().unwrap()
+}
+
+/// A relocatable object is read into a constant number of buffers whatever its size: the
+/// object's sections, symbols, fixups and name arena (4); four per string table (`.shstrtab`,
+/// `.strtab`): its NUL bitset, the NULs before each word, a slot per string and the strings
+/// pushed (8); and the relocation sections' order (1). 13 here; the two group columns make 15
+/// for an object with COMDAT groups. Every buffer is sized once from the section headers.
+#[test]
+fn an_object_read_allocates_a_constant_number_of_buffers() {
+    let read = |n: usize| {
+        let bytes = object_of(n);
+        let (read, used) = blaze_alloc_count::measure(|| {
+            super::read::read(blaze_codegen::Arch::X86_64, "f.o", &bytes, &crate::NativeKind::Object)
+        });
+        let Ok(crate::model::NativeFile::Object(object)) = read else { panic!("not read as an object") };
+        assert_eq!(object.symbols.len(), 1 + 2 * n, "the null symbol and the object's own");
+        assert_eq!(object.fixups.len(), 2 * n);
+        used
+    };
+    let (small, large) = (read(8), read(1000));
+    assert_eq!(small.allocations, large.allocations, "an object read allocates per symbol, section or relocation");
+    assert!(large.allocations <= 13, "an object read: {} allocations, budget 13", large.allocations);
+}
+
+/// A shared library this writer made, exporting `n` functions: what its reader reads back.
+fn shared_library(n: usize) -> Vec<u8> {
+    let names: Vec<String> = (0..n).map(|it| format!("blaze_export_{it}")).collect();
+    let counts = Counts {
+        exports: n as u64,
+        export_names: names.iter().map(|it| it.len() as u64).sum(),
+        ..Counts::default()
+    };
+    let kind = OutputKind::Shared { name: "libblaze.so".into(), exports: names.clone() };
+    let output = output(blaze_codegen::Arch::X86_64, kind, None);
+    let mut image = Fixture::new(output, &[(Class::Text, 4 * n as u64, 4)], &counts);
+    let text = image.at(&Class::Text);
+    image.exports = names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| Export { name: name.clone(), addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .collect();
+    image.link()
+}
+
+/// A shared library's symbols are read into its one `Names` arena with a constant number of
+/// allocations: `object`'s version table, four for `.dynstr` (as for any string table), the
+/// arena, the symbols, the version slots and the `DT_SONAME`. 9, whatever the number of
+/// symbols; a version the library defines adds its name to `Shared::versions`.
+#[test]
+fn a_shared_library_read_allocates_a_constant_number_of_buffers() {
+    let read = |n: usize| {
+        let bytes = shared_library(n);
+        let (read, used) = blaze_alloc_count::measure(|| {
+            super::read::read(
+                blaze_codegen::Arch::X86_64,
+                "libblaze.so",
+                &bytes,
+                &crate::NativeKind::Shared { as_needed: false },
+            )
+        });
+        let Ok(crate::model::NativeFile::Shared(shared)) = read else { panic!("not read as a shared library") };
+        assert_eq!(shared.name, "libblaze.so");
+        assert_eq!(shared.symbols.len(), n);
+        for (at, symbol) in shared.symbols.iter().enumerate() {
+            assert!(shared.symbol_name(symbol).starts_with("blaze_export_"), "symbol {at}");
+        }
+        let names = n * "blaze_export_".len() + (0..n).map(|it| it.to_string().len()).sum::<usize>();
+        assert_eq!(shared.names.bytes(), names, "each name pushed once");
+        used
+    };
+    let (small, large) = (read(16), read(2000));
+    assert_eq!(small.allocations, large.allocations, "a shared library read allocates per symbol");
+    assert!(large.allocations <= 9, "a shared library read: {} allocations, budget 9", large.allocations);
+}
+
+/// An executable importing `n` versioned functions from one library, exporting `n` and with
+/// `n` slid addresses: every per-symbol table scales with `n`.
+fn many_symbols(n: usize) -> Fixture {
+    let imports: Vec<Import> = (0..n).map(|at| import(&format!("import_{at}"), Some(0), Some("GLIBC_2.2.5"), false)).collect();
+    let exports: Vec<String> = (0..n).map(|at| format!("export_{at}")).collect();
+    let counts = Counts {
+        imports: n as u64,
+        import_names: imports.iter().map(|it| (it.name.len() + "GLIBC_2.2.5".len()) as u64).sum(),
+        libraries: 1,
+        library_names: "libc.so.6".len() as u64,
+        absolute: n as u64,
+        exports: n as u64,
+        export_names: exports.iter().map(|it| it.len() as u64).sum(),
+        ..Counts::default()
+    };
+    let pieces = [(Class::Text, 4 * n as u64, 4), (Class::Data, 8 * n as u64, 8)];
+    let mut image = Fixture::new(executable(), &pieces, &counts);
+    let (text, data) = (image.at(&Class::Text), image.at(&Class::Data));
+    for at in 0..n {
+        image.put(&Class::Data, 8 * at, &(text + 4 * at as u64).to_le_bytes());
+    }
+    image.entry = Some(text);
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
+    image.imports = imports;
+    image.exports = exports
+        .into_iter()
+        .enumerate()
+        .map(|(at, name)| Export { name, addr: text + 4 * at as u64, size: 4, kind: SymbolKind::Function })
+        .collect();
+    image.rebase = (0..n as u64).map(|at| data + 8 * at).collect();
+    image
+}
+
+/// `.dynsym`, `.dynstr`, `.gnu.hash`, the versions, `.rela.dyn` and `.dynamic` allocate
+/// nothing per symbol beyond their output buffers. Measured in a one-thread pool, whose
+/// worker does all the work, so the per-thread count sees every allocation. 22 in all, each
+/// once: the library slots, `.dynstr`'s bytes and lookup, the needed names, the version list
+/// and lookup, the hashes, bucket ends and order, the other nine regions' bytes (`.interp`, the
+/// build ID, `.dynsym`, `.gnu.version`, `.gnu.version_r`, `.gnu.hash`, `.rela.dyn`, `.dynamic`,
+/// `.eh_frame_hdr`), the relocations and their per-chunk results,
+/// the `.preinit_array` class looked up, and the list `synthesize` returns.
+#[test]
+fn dynamic_tables_allocate_nothing_per_symbol() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let used = |n: usize| {
+        let image = many_symbols(n);
+        pool.install(|| {
+            image.with(|placed| {
+                image.writer.synthesize(placed).unwrap();
+                let (tables, used) = blaze_alloc_count::measure(|| image.writer.synthesize(placed));
+                let tables = tables.unwrap();
+                let region = |name: &'static str| &tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1;
+                assert_eq!(region(super::DYNSYM).len(), 24 * (1 + 2 * n));
+                assert_eq!(region(super::RELA_DYN).len(), 24 * n);
+                assert_eq!(region(super::VERSYM).len(), 2 * (1 + 2 * n));
+                used
+            })
+        })
+    };
+    let (small, large) = (used(64), used(2000));
+    assert_eq!(small.allocations, large.allocations, "the dynamic tables allocate per symbol");
+    assert!(large.allocations <= 22, "the dynamic tables: {} allocations, budget 22", large.allocations);
 }

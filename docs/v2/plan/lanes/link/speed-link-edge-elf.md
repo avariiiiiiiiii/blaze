@@ -38,13 +38,47 @@ one reported (`dynamic::first_error`). One output change: `.strtab` no longer sh
 between a function and an export of the same name (mold doesn't either); every other byte is as
 before.
 
+## After the zero-copy contract (speed-link-edge-elf-input)
+
+The model took requests 5 and 7 (`Data::Input`, `Name` in one `Names` arena per file, fixups
+and group members as runs of one column per object, versions by index), and the readers moved
+onto it. Counted off the code, per input:
+
+| input | before (after speed-link-edge-elf) | after |
+|---|---|---|
+| relocatable object | per loaded section one `Vec<u8>` copy of its bytes and one `String` name; per symbol one `String`; per relocated section one fixup `Vec`; per group one `Vec` of members and one `String` | **15 allocations, whatever its size**: the sections, symbols, fixups, groups and group-members columns, the names arena, the relocation-section order, and four buffers per string table (`.shstrtab`, `.strtab`: the NUL bitset, its rank counts, the string slots, the pushed strings). Each is sized once from the section headers. One or two more when relocations add symbols (`TLSLD`, `GOTPC*`, `SIZE*`), and the `SIZE*` map's own |
+| archive with an index | per member one `String`, per index entry one `String` | **7 allocations**: the arena, the members, the index, and the index's string table (4), sized in a first pass over the member headers and the index |
+| archive without one (lld's path) | per member one `String` name for errors, its defined names as `String`s | per member the offsets of its defined names and its `.strtab`'s 4 table buffers; the member is named only in an error. The arena grows by doubling here (log *n* reallocations), as `Names` has no `reserve` |
+| shared object | per symbol one `String` name and one `Option<String>` version | per symbol nothing: the symbols, arena, versions (one `String` per distinct version, a few dozen in glibc) and slot columns, and `.dynstr`'s 4 table buffers |
+
+- **Bytes per element.** A name is 8 bytes (`Name`) instead of a 24-byte `String` plus its heap
+  block. A section's fixups are a `Range<u32>` (8 bytes) instead of a 24-byte `Vec`. Its data is
+  a 16-byte range of the input instead of a heap copy as long as the section.
+- **The arena** holds each string of a string table once, whole, the first time any offset in it
+  is named. Every name is a suffix of it, so tail-merged tables (`.text` inside `.rela.text`)
+  cost nothing extra, and a hostile table naming every offset of one long string still costs at
+  most its own bytes. The arena is at most the string tables' bytes plus
+  `_GLOBAL_OFFSET_TABLE_`. A string is found by the rank of the NUL that ends it (a bitset with
+  a count per 64 bytes): direct indexing, no hash, so no input can make a lookup slow.
+- **No alignment copy is left.** `object` is built with `unaligned` (asserted at compile time in
+  `read.rs`), so an archive member is read in place at its 2-byte alignment.
+- **Against mold and wild.** Sections and relocations are now read in place, as wild reads them.
+  Names are copied once into the arena: one `memcpy` of each distinct string, at most the table's
+  bytes, where mold keeps a `string_view` into the mapping. The extra work is one pass over each
+  string table to build the NUL bitset, and the UTF-8 check of each string pushed, because
+  `Names` is a `String`.
+
 ## Where it still falls short, and what it would take
 
-- **Zero-copy reads.** Sections and names still become owned `Vec<u8>`/`String`, because
-  `model::Data` and `Symbol::name` are owned. Request 5 (`Data::Input`, `Name`) and request 7
-  (versions by index) in `v2/requests/link.md` remove that; the ELF reader's side is then
-  mechanical (a section's bytes are `sh_offset..sh_offset + sh_size` of the input, names are
-  ranges of `.strtab`).
+- **The string-table pass is scalar**: one compare per byte. A 64-byte compare-and-movemask
+  (`pcmpeqb`/`pmovmskb`, NEON `cmeq` and a narrowing shift, as simdjson finds structural
+  characters) would build each bitset word in a few instructions instead of 64. That is about
+  10× faster on the pass, which runs once per table byte. It would also have to be checked
+  against the scalar loop as `blaze-cas`'s `chunk.rs` paths are. Mapping names straight from
+  the input, with no arena at all, would need `Name` to be able to point into the file's bytes,
+  which is a model change.
+- **`Names::reserve`** would let the no-index archive path size its arena once, as the other
+  paths do.
 - **Parallel parsing.** The core calls `Writer::read` once per input in a loop and pulls archive
   members one at a time (request 7, item 3). The readers are pure functions of their bytes, so
   this is the core's change alone.
@@ -74,3 +108,26 @@ before.
 - `eh_frame_hdr_indexes_fdes_of_every_cie`: 40 FDEs of two CIEs, out of order; the table holds
   all of them, sorted.
 - `an_executable_reads_back` now also checks `.gnu.version_r`'s `sh_info`.
+
+## Tests added by speed-link-edge-elf-input (`elf/read/tests.rs`)
+
+- `agrees`, a reference that reads the same input straight through `object`'s ELF reader, as
+  the reader did before it stopped copying, and checks:
+  - each loaded section is a `Data::Input` holding exactly the slice the old copy held;
+  - each section and symbol name is the string it used to allocate;
+  - each group is its members;
+  - each section has as many fixups as its relocation sections hold;
+  - the fixup and group runs tile their columns;
+  - the arena equals one built the slow way, by linear scans.
+
+  It runs on an archive member read at its offset, and on:
+  - `every_range_holds_what_the_copy_held_at_any_alignment`: two objects at every shift 0 to 7;
+  - `relocation_sections_of_one_section_extend_its_run`: two relocation sections pointed at
+    one section, in and out of the sections' order;
+  - `many_groups_and_fixups_tile_their_columns`: 300 functions, each with its own section and
+    group.
+- `a_string_table_pushes_each_string_once`, `a_string_table_past_a_word_finds_its_strings`:
+  tail-merged names, names inside a string that is not wholly UTF-8, a missing NUL, and
+  strings across the bitset's words, named in reverse.
+- `reading_allocates_nothing_per_symbol_section_or_fixup`: an object of 4 functions and one of
+  400 make the same number of allocations, and so do archive indexes of 3 and 600 symbols.

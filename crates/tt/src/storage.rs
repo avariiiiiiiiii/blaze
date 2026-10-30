@@ -35,6 +35,10 @@ mod tests;
 mod wire;
 
 pub use wire::{WireError, WirePart};
+mod columns;
+use columns::{Node, PackedSpan, WideSpan};
+mod words;
+pub use words::{TreeWords, ViewWords};
 #[cfg(test)]
 mod varint;
 
@@ -57,19 +61,6 @@ impl CompressedSpanPart {
     fn recombine(&self, range: TextRange) -> Span {
         Span { range, anchor: self.anchor, ctx: self.ctx }
     }
-}
-
-/// One token tree, 8 bytes. `head` holds the tag in its low two bits and above it:
-/// - a subtree: its delimiter kind (2 bits), then its ordinal (the number of subtrees before it,
-///   the top one being 0); `data` is its length, the number of token trees in it;
-/// - a punct: its spacing (2 bits); `data` is its character;
-/// - an ident: whether it is raw (1 bit); `data` is its symbol's index;
-/// - a literal: its kind (4 bits), the hashes of a raw one (8 bits) and its suffix's length
-///   (the 18 bits left, below [`MAX_SUFFIX`]); `data` is its symbol's index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct Node {
-    head: u32,
-    data: u32,
 }
 
 const _: () = assert!(size_of::<Node>() == 8);
@@ -193,15 +184,6 @@ impl Node {
     }
 }
 
-/// A span, 8 bytes: where it starts, and its length in the low 16 bits of `len_part` with its
-/// part's index in the high 16. A length or index of `0xFFFF` or more makes it wide: then
-/// `len_part` is [`WIDE`] and `start` the index of a [`WideSpan`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PackedSpan {
-    start: u32,
-    len_part: u32,
-}
-
 const _: () = assert!(size_of::<PackedSpan>() == 8);
 
 const WIDE: u32 = u32::MAX;
@@ -209,14 +191,6 @@ const NARROW_LIMIT: u32 = 0xFFFF;
 
 impl PackedSpan {
     const UNUSED: PackedSpan = PackedSpan { start: 0, len_part: 0 };
-}
-
-/// A span too large to pack, 12 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct WideSpan {
-    start: u32,
-    len: u32,
-    part: u32,
 }
 
 /// Distinct entries in the order they are first asked for, each found by a scan while there are
@@ -335,6 +309,7 @@ pub struct TopSubtree {
     symbols: Box<[Symbol]>,
     top_open: Span,
     top_close: Span,
+    words: words::WordsCache,
 }
 
 /// The tree [`TokenTreesView::empty`] views none of.
@@ -406,11 +381,14 @@ impl TopSubtree {
 
     pub fn set_top_subtree_delimiter_kind(&mut self, kind: DelimiterKind) {
         self.nodes[0] = Node::subtree(kind, 0, self.nodes[0].data);
+        self.words = Default::default();
     }
 
+    /// The top delimiters' contexts are their words' editions, so the words kept are dropped.
     pub fn set_top_subtree_delimiter_span(&mut self, span: DelimSpan) {
         self.top_open = span.open;
         self.top_close = span.close;
+        self.words = Default::default();
     }
 
     /// Puts `leaf` in place of the leaf at `idx` (the top subtree being 0). Rebuilds the tree,
@@ -595,11 +573,43 @@ impl TopSubtree {
     /// opening delimiter, its token trees and its closing delimiter, with the context of each.
     /// Reads the columns: no span's range and no leaf is unpacked, and nothing is allocated
     /// but the stack of open subtrees, kept per thread.
+    #[inline]
     pub(crate) fn for_each_token(
         &self,
         start: u32,
         end: u32,
         mut f: impl FnMut(crate::FlatToken, SyntaxContext),
+    ) {
+        self.walk_tokens(start, end, |_, token, ctx| f(token, ctx))
+    }
+
+    /// The number of token slots: one a node, one a subtree's closing delimiter.
+    #[inline]
+    pub fn token_slots(&self) -> usize {
+        self.spans.len() + 1
+    }
+
+    /// The slot of the closing delimiter of the subtree at `at`.
+    #[inline]
+    fn close_slot(&self, at: u32) -> u32 {
+        match at {
+            0 => self.spans.len() as u32,
+            _ => (self.nodes.len() + self.nodes[at as usize].ordinal() as usize - 1) as u32,
+        }
+    }
+
+    /// [`TopSubtree::for_each_token`] over the whole tree, with each token's slot: a leaf's or an
+    /// opening delimiter's node, or its subtree's [`TopSubtree::token_slots`] entry for a
+    /// closing one. What [`TreeWords`] are made from.
+    pub fn for_each_slotted_token(&self, f: impl FnMut(u32, crate::FlatToken, SyntaxContext)) {
+        self.walk_tokens(0, self.nodes.len() as u32, f)
+    }
+
+    fn walk_tokens(
+        &self,
+        start: u32,
+        end: u32,
+        mut f: impl FnMut(u32, crate::FlatToken, SyntaxContext),
     ) {
         use crate::FlatToken;
         let mut open = OPEN.take();
@@ -608,7 +618,7 @@ impl TopSubtree {
         if start == 0 && end > 0 {
             let top = self.nodes[0];
             open.push((1 + top.data, 0));
-            f(FlatToken::Open(top.delimiter_kind()), self.top_open.ctx);
+            f(0, FlatToken::Open(top.delimiter_kind()), self.top_open.ctx);
             from = 1;
         }
         let end = end as usize;
@@ -619,7 +629,7 @@ impl TopSubtree {
             {
                 open.pop();
                 let (close, ctx) = self.close_token(subtree);
-                f(close, ctx);
+                f(self.close_slot(subtree), close, ctx);
             }
             let token = match node.tag() {
                 SUBTREE => {
@@ -639,11 +649,11 @@ impl TopSubtree {
                     suffix_len: node.suffix_len(),
                 },
             };
-            f(token, self.ctx_of(span));
+            f(at, token, self.ctx_of(span));
         }
         while let Some((_, subtree)) = open.pop() {
             let (close, ctx) = self.close_token(subtree);
-            f(close, ctx);
+            f(self.close_slot(subtree), close, ctx);
         }
         OPEN.set(open);
     }
@@ -891,6 +901,7 @@ impl TopSubtreeBuilder {
             symbols: encoder.symbols.list.into_boxed_slice(),
             top_open: top.open,
             top_close: top.close,
+            words: Default::default(),
         };
         Scratch { nodes, spans, closes, symbols, unclosed: unclosed_subtree_indices }.give_back();
         tree

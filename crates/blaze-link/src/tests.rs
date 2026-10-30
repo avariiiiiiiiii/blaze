@@ -701,6 +701,104 @@ fn line_tables_are_written_from_the_span_tables() {
     assert!(!lines.data().unwrap().is_empty());
 }
 
+/// What an incremental stage of a change to one function may allocate, whatever the image
+/// holds: the state's copied chunk tables and pages, arena chunks, the column and lists it
+/// rebuilds, and the writes it hands the commit.
+const STAGE_BUDGET: u64 = 400;
+
+/// What growing the image or the changed function may add to a stage's allocations: a few
+/// buffers growing once more, never one per function or per fixup.
+const GROWTH: u64 = 64;
+
+/// A key `key` never makes, for images of many functions.
+fn wide_key(n: u32) -> InstanceKey {
+    let mut bytes = [0xa5; 32];
+    bytes[..4].copy_from_slice(&n.to_le_bytes());
+    InstanceKey(ContentId(bytes))
+}
+
+/// Function `n`: `fixups` calls to `_start` (1), then `ret`.
+fn calls(n: u8, fixups: u32) -> CompiledFunction {
+    let mut code = Vec::with_capacity(fixups as usize * 5 + 1);
+    let mut relocs = Vec::with_capacity(fixups as usize);
+    for at in 0..fixups {
+        relocs.push(rel32(at * 5 + 1, Target::Direct(key(1))));
+        code.extend_from_slice(&CALLER[..5]);
+    }
+    code.push(0xc3);
+    function(n, &code, relocs)
+}
+
+/// What staging a replacement of `g` allocates, in an incremental image of `_start`, `g` and
+/// `fillers` functions nothing calls, `g` already replaced once so the structures a
+/// replacement grows have grown. The replacement makes `fixups` calls. One worker thread, so
+/// the per-thread count sees all the stage's work.
+fn staged(fillers: u32, fixups: u32) -> blaze_alloc_count::Used {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    pool.install(|| {
+        let (start, g) = program(Target::Function);
+        let others: Vec<CompiledFunction> =
+            (0..fillers).map(|n| CompiledFunction { key: wide_key(n), ..function(0, &returns(9), Vec::new()) }).collect();
+        let mut change = first(&start, &g);
+        change.added.extend(&others);
+        let mut image = Image::new(name(TO), output(true)).unwrap();
+        let mut disk = Disk::default();
+        disk.link(&mut image, change).unwrap();
+        let g2 = calls(3, fixups);
+        disk.link(&mut image, edit(&g2)).unwrap();
+        let g3 = calls(4, fixups);
+        let next = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(4))], ..Change::default() };
+        let (staged, used) = blaze_alloc_count::measure(|| image.stage(next));
+        let mut effects = Vec::new();
+        image.commit(staged.unwrap(), &mut effects).unwrap();
+        disk.run(&mut image, effects).unwrap();
+        assert_eq!(image.generation(), 3);
+        used
+    })
+}
+
+#[test]
+fn an_incremental_stage_allocates_a_constant_whatever_the_image_holds() {
+    let small = staged(4, 1);
+    let large = staged(4096, 1);
+    eprintln!("a one-function stage: {small:?} among 6 functions, {large:?} among 4098");
+    for (used, what) in [(small, "6 functions"), (large, "4098 functions")] {
+        assert!(used.allocations <= STAGE_BUDGET, "a one-function stage among {what}: {used:?}, budget {STAGE_BUDGET}");
+    }
+    assert!(
+        large.allocations <= small.allocations + GROWTH,
+        "a one-function stage allocates per function of the image: {small:?} among 6, {large:?} among 4098"
+    );
+}
+
+#[test]
+fn relocation_allocates_nothing_per_fixup() {
+    // Below `Symbols`' parallel interning threshold, so both intern on this thread alike.
+    let few = staged(4, 64);
+    let many = staged(4, 2048);
+    eprintln!("a one-function stage: {few:?} with 64 fixups, {many:?} with 2048");
+    assert!(many.allocations <= STAGE_BUDGET, "a stage of 2048 fixups: {many:?}, budget {STAGE_BUDGET}");
+    assert!(
+        many.allocations <= few.allocations + GROWTH,
+        "relocation allocates per fixup: {few:?} with 64 fixups, {many:?} with 2048"
+    );
+}
+
+#[test]
+fn slot_and_generation_allocate_nothing() {
+    let (start, g) = program(Target::Function);
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    Disk::default().link(&mut image, first(&start, &g)).unwrap();
+    let slot = blaze_alloc_count::assert_at_most(0, "Image::slot", || image.slot(&key(2)));
+    assert!(slot.is_some());
+    let none = blaze_alloc_count::assert_at_most(0, "Image::slot of a function not linked", || image.slot(&key(9)));
+    assert_eq!(none, None);
+    let generation = blaze_alloc_count::assert_at_most(0, "Image::generation", || image.generation());
+    assert_eq!(generation, 1);
+}
+
+mod ties;
+
 /// The state's columns, read and written as a stage does.
 mod columns {
     use blaze_codegen::Line;

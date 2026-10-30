@@ -34,6 +34,11 @@ same as before, so nothing stored or compared changes.
 
 > forwarded to speed-hir-store (window `speed-hir-store-next1`, told by tmux).
 
+> applied by speed-hir-store (2026-10-29 20:35): `subtree_hash` is `tree.subtree_hash(at)`, the
+> `Blake3` adapter is gone (nothing else used it), `tree_hash`'s doc says the hash is carried.
+> Now untrue in `flat.rs` (syntax-tree's): the `SUBTREE` doc says hir-def hashes the same writes
+> itself and compares; it now reads this one.
+
 ## for speed-hir-defs-sigs (`crates/hir-def/src/signatures.rs`): the same for signatures
 
 What: `fn tree_hash(tree: &FlatTree) -> u128` becomes `tree.subtree_hash(0)` (or keeps calling
@@ -42,6 +47,11 @@ for a signature's tree hash" asks; after the change above that is the same call)
 Why: one pass, and a signature's tree that is rebuilt keeps its root's hash once made.
 
 > forwarded to speed-hir (for speed-hir-defs-sigs, which has no window; the lead told by tmux).
+
+> speed-hir-defs-sigs (2026-10-29): nothing to change. `tree_hash` was already gone:
+> `SignatureSyntax`, and now `FileOutline`, compare the tree by content (`FlatTree: PartialEq`),
+> and nothing in `signatures.rs` hashes a tree. See `v2/requests/speed-hir.md`, "one BLAKE3
+> pass for a signature's tree hash", status line.
 
 ## for the coordinator (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit")
 

@@ -10,7 +10,7 @@ extern crate rustc_type_ir;
 
 use std::{borrow::Cow, fmt, sync::LazyLock};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use std::cell::Cell;
 
 use cranelift_codegen::{
@@ -88,11 +88,11 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CallerLocation, CastKind, FrameStorage,
-    InlinedBody, LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan,
+    LocalId, MirBody, MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan,
     Operand, OperandKind, PlaceTy, ProjectionElem, Rvalue, StatementKind, StoredPlace,
     TerminatorKind, UnOp, caller_location, interpret_mir,
     location::{
-        ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
+        ConcatPart, concat_parts, line_and_column, located_concats, location_macros,
         location_of, reported_range, source_location_in_file, source_range, track_caller,
         written_call, written_range,
     },
@@ -102,6 +102,7 @@ use hir_ty_mir::mir::{
 };
 
 mod asm;
+pub use asm::Assembled;
 mod avx512;
 mod backend;
 use backend::Step;
@@ -495,7 +496,7 @@ pub trait SymbolResolver {
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;
 
-pub type ParallelWork<'a> = dyn Fn(&dyn HirDatabase, &dyn SymbolResolver, usize) + Sync + 'a;
+pub type ParallelWork<'a> = dyn Fn(&Db, &dyn SymbolResolver, usize) + Sync + 'a;
 
 /// An x86 operation on two vectors that `FunctionCx::lanewise` does lane by lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -787,7 +788,7 @@ impl CodegenUnit {
     /// A callee that can't be compiled poisons its callers, so codegen restarts with that callee
     /// rejected up front until a round finishes without a new rejection.
     pub fn compile(
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         denied: &FxHashSet<FunctionId>,
@@ -821,7 +822,7 @@ impl CodegenUnit {
     /// that work for it ([`counted::Counting`]): the stats say it compiled what it counted, and
     /// had the rest of its bodies from before.
     pub fn compile_or_hold(
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         denied: &FxHashSet<FunctionId>,
@@ -1353,7 +1354,7 @@ impl OwnStatics {
     }
 
     fn new(
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         crates: FxHashSet<Crate>,
         theirs: FxHashSet<StaticId>,
@@ -1394,7 +1395,7 @@ impl OwnStatics {
         OwnStatics { crates, shared, theirs, unknown, unbuilt }
     }
 
-    fn owns(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+    fn owns(&self, db: &Db, id: StaticId) -> bool {
         let krate = id.module(db).krate(db);
         if self.unbuilt.contains(&krate) {
             return true;
@@ -1406,7 +1407,7 @@ impl OwnStatics {
     /// static was when rustc last built the crate, which an edit to its value leaves behind.
     // FIXME: `#[used]` and `#[link_section]` statics are found by the linker or a runtime
     // through rustc's copy and should stay rustc's too.
-    fn replaces(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+    fn replaces(&self, db: &Db, id: StaticId) -> bool {
         self.owns(db, id)
             && !self.shared.contains(&id.krate(db))
             && !AttrFlags::query(db, id.into()).contains(AttrFlags::NO_MANGLE)
@@ -1525,7 +1526,7 @@ impl Rejections {
     /// `symbols` names what the last build had from the store.
     pub fn stale(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
@@ -1598,7 +1599,7 @@ impl Rejections {
     /// call others that do: what rustc copied those into.
     pub fn home(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         file: base_db::FileId,
         functions: &[FunctionId],
@@ -1615,7 +1616,7 @@ impl Rejections {
     /// Notes the first value of each static with state of `crates` and those that depend on
     /// them, which an edit is about to reach: as rustc built them, while no edit has.
     /// Asked before the edit.
-    pub fn take_first_values(&mut self, db: &dyn HirDatabase, crates: &[Crate]) {
+    pub fn take_first_values(&mut self, db: &Db, crates: &[Crate]) {
         let reached = crates.iter().flat_map(|it| it.transitive_rev_deps(db)).collect();
         self.frozen.take_values(db, reached);
     }
@@ -1682,7 +1683,7 @@ impl Rejections {
 
     /// Notes that rustc compiled `crates` from other source than they are first built from
     /// here, so that what it compiled of them and of those that see them is not to be linked.
-    pub fn distrust(&mut self, db: &dyn HirDatabase, crates: &[Crate]) {
+    pub fn distrust(&mut self, db: &Db, crates: &[Crate]) {
         if !crates.is_empty() {
             self.forget_rustc();
         }
@@ -1691,7 +1692,7 @@ impl Rejections {
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place. Every
     /// change since the last build has to be noted before [`Rejections::stale`] looks.
-    pub fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+    pub fn touch(&mut self, db: &Db, crates: Option<&[Crate]>) {
         match crates {
             Some(crates) => {
                 self.frozen.edit(crates.iter().flat_map(|it| it.transitive_rev_deps(db)))
@@ -1708,7 +1709,7 @@ impl Rejections {
     /// `include_str!` or `include_bytes!` read: what was compiled of any crate can be of
     /// them, but a first value of a static only of `includers`, the crates that read them,
     /// and of what depends on them.
-    pub fn touch_included(&mut self, db: &dyn HirDatabase, includers: &[Crate]) {
+    pub fn touch_included(&mut self, db: &Db, includers: &[Crate]) {
         let values = includers.iter().flat_map(|it| it.transitive_rev_deps(db));
         self.frozen.edit_apart(base_db::all_crates(db).iter().copied(), values);
         for base in [&mut self.base, &mut self.rustc].into_iter().flatten() {
@@ -1719,7 +1720,7 @@ impl Rejections {
 
     /// Notes that files rustc read, as it read them, were taken in for the first time: a build
     /// of the daemon's own compiled without them, and what rustc linked is of them.
-    pub fn touch_own(&mut self, db: &dyn HirDatabase) {
+    pub fn touch_own(&mut self, db: &Db) {
         self.frozen.edit(base_db::all_crates(db).iter().copied());
         if let Some(base) = &mut self.base {
             base.touch(db, None);
@@ -1744,7 +1745,7 @@ impl Rejections {
     /// code again.
     pub fn touch_added(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         crates: &[Crate],
         files: &[base_db::FileId],
     ) {
@@ -1761,7 +1762,7 @@ impl Rejections {
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into: not `const` or `async`, not returning `impl Trait`, declaring no
     /// items, and not handed to a macro.
-    pub fn touch_bodies(&mut self, db: &dyn HirDatabase, file: base_db::FileId) {
+    pub fn touch_bodies(&mut self, db: &Db, file: base_db::FileId) {
         self.frozen.edit_bodies(file);
         for base in [&mut self.base, &mut self.rustc].into_iter().flatten() {
             base.touch_bodies(db, file);
@@ -1773,13 +1774,13 @@ impl Rejections {
     /// is not what rustc compiled, and why it was left. rustc's copies are those of the build
     /// the daemon started from: the first call, to be made after that build, notes what they
     /// are copies of.
-    pub fn out_of_date(&mut self, db: &dyn HirDatabase) -> Option<OutOfDate> {
+    pub fn out_of_date(&mut self, db: &Db) -> Option<OutOfDate> {
         self.frozen.out_of_date(db, self.base.as_ref()?)
     }
 
     /// Hands the next build what [`Rejections::stale`] found, every part of it and with no
     /// edit in between.
-    pub fn set_stale(&mut self, db: &dyn HirDatabase, mut stale: Vec<Stale>) {
+    pub fn set_stale(&mut self, db: &Db, mut stale: Vec<Stale>) {
         let patched = self.patched().is_some();
         if let Some(base) = &mut self.base {
             base.settle(db, &mut stale);
@@ -1905,7 +1906,7 @@ enum Callee<'db> {
 
 /// How rustc's demangled symbols spell the types and instances of the program.
 struct Spelling<'a, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     symbols: &'a dyn SymbolResolver,
 }
 
@@ -2231,7 +2232,7 @@ fn split_top_on<'t>(text: &'t str, separator: &str) -> Vec<&'t str> {
 /// Stitches compiled functions into one object: gives every function and data object they
 /// ask for an id in the module, and defines the ones that are ours.
 struct ObjectCodegen<'a, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     unwind: UnwindContext,
@@ -2627,13 +2628,13 @@ fn print_of(code: &impl std::hash::Hash) -> u128 {
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
 #[salsa::tracked(returns(copy))]
-fn root_serial(db: &dyn HirDatabase, func: FunctionId) -> u128 {
+fn root_serial(db: &Db, func: FunctionId) -> u128 {
     compiled_root(db, func).as_ref().map_or(0, print_of)
 }
 
 /// A hash of the text of `func` and of where it starts, which says what rustc compiled of it
 /// and of each block in it, and where its panics are. `None` for one a macro writes.
-fn written_print(db: &dyn HirDatabase, func: FunctionId) -> Option<u64> {
+fn written_print(db: &Db, func: FunctionId) -> Option<u64> {
     use std::hash::{Hash, Hasher};
     let source = func.lookup(db).source(db);
     if source.file_id.macro_file().is_some() {
@@ -2651,7 +2652,7 @@ fn written_print(db: &dyn HirDatabase, func: FunctionId) -> Option<u64> {
 /// for a generic function, whose closures are instances of its arguments.
 #[allow(clippy::type_complexity)]
 fn closures_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
 ) -> Option<Vec<(hir_def::hir::ExprId, Option<(Instance, u64)>)>> {
     use std::hash::{Hash, Hasher};
@@ -2682,12 +2683,12 @@ fn closures_of(
 // Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(returns(copy), revisions = usize::MAX)]
-fn instance_serial(db: &dyn HirDatabase, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
+fn instance_serial(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
 
 #[salsa::tracked(returns(copy))]
-fn static_serial(db: &dyn HirDatabase, id: StaticId) -> u128 {
+fn static_serial(db: &Db, id: StaticId) -> u128 {
     compiled_static(db, id).as_ref().map_or(0, print_of)
 }
 
@@ -2735,14 +2736,14 @@ impl Unnamed {
 
 /// Whether rustc copies `func` into each crate that calls it, for a type or constant it is
 /// given.
-pub fn copied_by_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn copied_by_rustc(db: &Db, func: FunctionId) -> bool {
     patch::copied_by_rustc(db, func)
 }
 
 /// Compiles a function written in a file [`Rejections::home`] notes next, which compiles them
 /// one after another, so that threads share that work. One rustc copies into its callers,
 /// which `home` passes over, is not compiled.
-pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
+pub fn compile_written(db: &Db, func: FunctionId) {
     if !patch::copied_by_rustc(db, func) {
         let compile = || compiled_root(db, func).is_ok();
         // One that panics does again as `home` compiles it, which says so.
@@ -2755,7 +2756,7 @@ pub fn compile_written(db: &dyn HirDatabase, func: FunctionId) {
 /// code of a function is the same whichever they are, and a build that knows them finds it
 /// compiled. A call of a function without generic arguments is not followed, since rustc
 /// may have built the one called.
-pub fn compile_unnamed(db: &dyn HirDatabase, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
+pub fn compile_unnamed(db: &Db, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
     let mut homes = home::Homes::default();
     loop {
         let job = {
@@ -2817,21 +2818,21 @@ type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
 #[salsa::tracked(returns(ref))]
-fn root_rows(db: &dyn HirDatabase, func: FunctionId) -> Vec<Row> {
+fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
     compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
 #[salsa::tracked(returns(ref))]
 fn instance_rows(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Vec<Row> {
     compiled_instance(db, instance, env).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
-fn rows_of(db: &dyn HirDatabase, compiled: &CompiledFunction) -> Vec<Row> {
+fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
     let Some(source) = &compiled.source else { return Vec::new() };
     let rows = compiled.code.lines.iter().filter_map(|row| {
         let at = source.written(row.span, compiled.closure)?;
@@ -2858,7 +2859,7 @@ pub struct Recompiled {
 /// The functions of the source compiled since the last call, the first 64 of them, and how
 /// many there were in all. Salsa also runs [`compiled_root`] of a function an edit took away,
 /// to verify what read it before the edit: that one is not of the source, and has no name in it.
-pub fn take_recompiled(db: &dyn HirDatabase) -> (Vec<Recompiled>, usize) {
+pub fn take_recompiled(db: &Db) -> (Vec<Recompiled>, usize) {
     let (funcs, all) = std::mem::take(&mut *RECOMPILED.lock().unwrap_or_else(|e| e.into_inner()));
     let kept = funcs.len();
     let named: Vec<_> = funcs
@@ -2880,7 +2881,7 @@ pub fn take_recompiled(db: &dyn HirDatabase) -> (Vec<Recompiled>, usize) {
 /// Whether the item `id` is in the source as it is now, and so is every macro call it was
 /// expanded from and the macro's definition. The map of an expansion is made by expanding
 /// it, which looks for its call: a call the source no longer has is checked before.
-fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
+fn in_source(db: &Db, id: InFile<span::ErasedFileAstId>) -> bool {
     if let Some(call) = id.file_id.macro_file() {
         let loc = call.loc(db);
         let called = InFile::new(loc.kind.file_id(), loc.kind.erased_ast_id());
@@ -2893,7 +2894,7 @@ fn in_source(db: &dyn HirDatabase, id: InFile<span::ErasedFileAstId>) -> bool {
 
 /// The code of a non-generic function.
 #[salsa::tracked(returns(ref))]
-fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<CompiledFunction> {
+fn compiled_root<'db>(db: &'db Db, func: FunctionId) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::Root(func));
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     counted::compiles(func.krate(db));
@@ -2909,7 +2910,7 @@ fn compiled_root<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Result<Comp
 }
 
 /// The instance a non-generic function is compiled as under its own symbol.
-fn root_instance(db: &dyn HirDatabase, func: FunctionId) -> Instance {
+fn root_instance(db: &Db, func: FunctionId) -> Instance {
     Instance {
         def: InstanceDef::Fn(func),
         args: GenericArgs::new_from_slice(&[]).store(),
@@ -2921,7 +2922,7 @@ fn root_instance(db: &dyn HirDatabase, func: FunctionId) -> Instance {
 /// in, as the copy under the symbol of the function is. A crate that uses an `#[inline]`
 /// function of another compiles a copy with its own.
 fn as_its_crate_compiles(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     instance: &Instance,
 ) -> bool {
@@ -2945,7 +2946,7 @@ fn as_its_crate_compiles(
 /// put in the object under the symbol. Only where nothing of rustc's is linked are all the
 /// callers blaze's.
 fn rustcs_callers_pass_scalable(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> bool {
@@ -2960,7 +2961,7 @@ fn rustcs_callers_pass_scalable(
 }
 
 /// The last name of what an instance is of.
-fn callee_name(db: &dyn HirDatabase, def: InstanceDef) -> &str {
+fn callee_name(db: &Db, def: InstanceDef) -> &str {
     match def {
         InstanceDef::Fn(func) => FunctionSignature::of(db, func).name.as_str(),
         InstanceDef::Closure(_) => "{closure}",
@@ -2975,7 +2976,7 @@ fn callee_name(db: &dyn HirDatabase, def: InstanceDef) -> &str {
 
 /// Writes into `blob` the `TypeId`s it has the places of.
 fn hash_type_ids(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     crates: &FxHashSet<Crate>,
     blob: &mut ConstBlob,
@@ -2995,7 +2996,7 @@ fn hash_type_ids(
 
 /// What a debugger of a rustc build calls the code of a closure of `instance`.
 fn debug_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &Instance,
     owner: InferBodyId<'db>,
     expr: ExprId,
@@ -3009,7 +3010,7 @@ fn debug_closure<'db>(
 
 /// What a backtrace of a rustc build calls the instance, as far as that is reproduced:
 /// the last name of it otherwise.
-fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
+fn backtrace_name(db: &Db, instance: &Instance) -> String {
     let args = instance.args.as_ref();
     let ty = || args.as_slice().first().and_then(|arg| arg.ty());
     let of_closure = |owner: InferBodyId<'_>, expr| match owner {
@@ -3043,7 +3044,7 @@ fn backtrace_name(db: &dyn HirDatabase, instance: &Instance) -> String {
 
 /// The code of a non-generic function: Cranelift's, or, for a compile at a level above 1
 /// (`tier`), its IR for LLVM.
-fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produced> {
+fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     let (body, env) = root_body(db, func)?;
     if dump_mir_of().is_some_and(|want| FunctionSignature::of(db, func).name.as_str() == want) {
         dump_mir(body);
@@ -3064,7 +3065,7 @@ fn root_code(db: &dyn HirDatabase, func: FunctionId, tier: bool) -> Result<Produ
 /// The crates of a program of `crates`: what they depend on, but not through a proc macro,
 /// which is a library of the compiler's.
 fn linked_crates(
-    db: &dyn HirDatabase,
+    db: &Db,
     crates: impl IntoIterator<Item = Crate>,
 ) -> FxHashSet<Crate> {
     let mut linked = FxHashSet::default();
@@ -3080,7 +3081,7 @@ fn linked_crates(
 
 /// The `main` the C runtime calls, for a program whose `main` is `main`.
 #[salsa::tracked(returns(ref))]
-fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<CompiledFunction> {
+fn compiled_start<'db>(db: &'db Db, main: FunctionId) -> Result<CompiledFunction> {
     let krate = main.krate(db);
     let env = ParamEnvAndCrate { param_env: hir_ty::next_solver::ParamEnv::empty(), krate };
     let checked = crate_checks_overflow(db, krate).unwrap_or(false);
@@ -3092,7 +3093,7 @@ fn compiled_start<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Com
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(returns(ref), revisions = usize::MAX, lru = 0)]
 fn compiled_instance<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
@@ -3100,7 +3101,7 @@ fn compiled_instance<'db>(
     let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
     counted::compiles(env.krate);
     let _flight = flight::Flight::instance(db, &instance, &env);
-    tier::for_build(|| instance_code(db, instance, env, Detach::No)).map(Produced::code)
+    tier::for_build(|| instance_code(db, instance, env, Detach::No, None)).map(Produced::code)
 }
 
 /// Whether a compile leaves LLVM's part to later ([`Produced::Pending`]): not at all, for a
@@ -3114,11 +3115,14 @@ enum Detach {
 }
 
 /// The code of an instance: Cranelift's, or, detached, its IR for LLVM.
+///
+/// `unit` is the v2 unit's settings its body is read under; `None` in v1.
 fn instance_code(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
     detach: Detach,
+    unit: Option<v2::build::Build>,
 ) -> Result<Produced> {
     let stored_env = env.clone();
     let env = env.as_ref(db);
@@ -3170,7 +3174,7 @@ fn instance_code(
         InstanceDef::Fn(_)
         | InstanceDef::Closure(_)
         | InstanceDef::Coroutine(_)
-        | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env, v2::build::building())?,
+        | InstanceDef::CoroutineByMove(_) => instance_body(db, &instance, stored_env, unit)?,
     };
     let body = &*body;
     let dump = dump_mir_of();
@@ -3464,7 +3468,7 @@ pub(crate) fn checks_cache() -> bool {
 
 /// The MIR optimization level of the bodies of `krate`: [`mir_opt_level`] where it is asked
 /// for, else rustc's ([`rustc_mir_opt_level`]).
-fn mir_opt_level_of(db: &dyn HirDatabase, krate: Crate) -> MirOptLevel {
+fn mir_opt_level_of(db: &Db, krate: Crate) -> MirOptLevel {
     mir_opt_level().unwrap_or_else(|| {
         rustc_mir_opt_level(krate.data(db).origin.is_lang(), backend::above_o0())
     })
@@ -3487,7 +3491,7 @@ pub fn rustc_links_dead_code(links: bool) {
 /// where its `-C debug-assertions` is on (`sess.ub_checks()` of the crate whose MIR it is,
 /// not [`ub_checks_of`], the calling crate's `ub_checks()`), lifetime markers kept, and
 /// inlined as rustc's `Inline::is_enabled` says at level 2 ([`rustc_inlines`]).
-fn mir_options_of(db: &dyn HirDatabase, krate: Crate) -> MirOptions {
+fn mir_options_of(db: &Db, krate: Crate) -> MirOptions {
     let level = mir_opt_level_of(db, krate);
     MirOptions {
         level,
@@ -3515,7 +3519,7 @@ fn is_runtime(options: MirOptions) -> bool {
 /// unit's settings say ([`v2::build::Build::options`]) when `build` is a unit's, else what
 /// v1 reads of the crate and the environment ([`mir_options_of`]).
 fn body_options(
-    db: &dyn HirDatabase,
+    db: &Db,
     build: Option<v2::build::Build>,
     written: Crate,
     compiling: Crate,
@@ -3529,7 +3533,7 @@ fn body_options(
 /// The body the code generator compiles of `def`: the runtime body, optimized and checked as
 /// `options` ask ([`body_options`]).
 fn compiled_mir_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: InferBodyId<'db>,
     options: MirOptions,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
@@ -3540,7 +3544,7 @@ fn compiled_mir_body<'db>(
 }
 
 fn compiled_mir_body_for_closure<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     options: MirOptions,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
@@ -3553,7 +3557,7 @@ fn compiled_mir_body_for_closure<'db>(
 /// The body of a coroutine (`by_move`: its by-move twin): the runtime body, with rustc's UB
 /// checks where `options` ask for them. Coroutines are not optimized further.
 fn compiled_mir_body_for_coroutine<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     by_move: bool,
     options: MirOptions,
@@ -3573,7 +3577,7 @@ fn compiled_mir_body_for_coroutine<'db>(
 /// `build` is the v2 unit's settings the body is read under ([`v2::build::building`] in the
 /// IR builder, [`v2::build::Build::WALK`] for the walk), `None` in v1.
 fn instance_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &Instance,
     env: StoredParamEnvAndCrate,
     build: Option<v2::build::Build>,
@@ -3669,11 +3673,13 @@ struct BodyTypes {
 
 #[salsa::tracked(returns(ref))]
 fn body_types<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Result<BodyTypes> {
-    let body = &*instance_body(db, &instance, env, v2::build::building())?;
+    // What a body takes and returns is the same under every unit's settings, and a query
+    // must not read the thread's unit.
+    let body = &*instance_body(db, &instance, env, None)?;
     Ok(BodyTypes {
         params: body.param_locals.iter().map(|&local| body.locals[local].ty.clone()).collect(),
         returned: body.locals[returned_local(body)].ty.clone(),
@@ -3687,7 +3693,7 @@ fn body_types<'db>(
 /// rustc's, which `--layouts` otherwise skips: a future both compilers make and poll has to be
 /// laid out alike to the byte.
 fn coroutine_layout_line<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: Ty<'db>,
     layout: &Layout,
 ) -> Option<String> {
@@ -3742,7 +3748,7 @@ fn futures_kept_apart() -> bool {
 /// another type. rustc lays such a future out differently, so the function that makes one has
 /// to come from the compiler that compiles what holds and polls it.
 #[salsa::tracked]
-fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool {
+fn returns_async_block<'db>(db: &'db Db, func: FunctionId) -> bool {
     struct Finder<'db> {
         opaque: bool,
         coroutine: bool,
@@ -3779,7 +3785,7 @@ fn returns_async_block<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> bool 
 /// Whether a caller of the function gets a value of a type that only its body says: the
 /// future of an `async fn`, or what an `impl Trait` it returns stands for. The caller has the
 /// code for that type, compiled from the body as it was then.
-fn hands_out_opaque(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn hands_out_opaque(db: &Db, func: FunctionId) -> bool {
     struct Finder(bool);
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Finder {
         type Result = ();
@@ -3820,7 +3826,7 @@ fn fn_trait_methods(lang_items: &LangItems) -> [[Option<FunctionId>; 3]; 2] {
 /// The `Fn`-trait method (`call`, `call_mut` or `call_once`) that `func` is the impl of,
 /// when it is one written for a type.
 fn implemented_fn_method(
-    db: &dyn HirDatabase,
+    db: &Db,
     lang_items: &LangItems,
     func: FunctionId,
 ) -> Option<FunctionId> {
@@ -3833,7 +3839,7 @@ fn implemented_fn_method(
 }
 
 /// The trait's declaration of `func`, a method of a trait impl; `func` itself otherwise.
-fn declared_method(db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
+fn declared_method(db: &Db, func: FunctionId) -> FunctionId {
     let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return func };
     let Some(trait_ref) = db.impl_trait(impl_) else { return func };
     let name = &FunctionSignature::of(db, func).name;
@@ -3842,7 +3848,7 @@ fn declared_method(db: &dyn HirDatabase, func: FunctionId) -> FunctionId {
 
 /// The instance that is the `poll` of the future `ty`, when that is one of an `async` block.
 fn coroutine_instance<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: Ty<'db>,
 ) -> Option<(InstanceDef, GenericArgs<'db>)> {
     let TyKind::Coroutine(id, args) = ty.kind() else { return None };
@@ -3858,7 +3864,7 @@ fn coroutine_instance<'db>(
 /// can't be read. rustc lays a future out differently, so every function that touches one
 /// has to come from the same compiler.
 #[salsa::tracked(returns(ref))]
-fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
+fn async_blocks<'db>(db: &'db Db, func: FunctionId) -> Option<FxHashSet<salsa::Id>> {
     let Ok((body, env)) = root_body(db, func) else {
         return (!infers_a_future(db, func)).then(FxHashSet::default);
     };
@@ -3868,7 +3874,7 @@ fn async_blocks<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<FxHas
 /// The `async` blocks whose futures `body` holds, itself or in the closures and blocks it
 /// holds, or `None` when one of those can't be read.
 fn held_blocks<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
     env: ParamEnvAndCrate<'db>,
 ) -> Option<FxHashSet<salsa::Id>> {
@@ -3930,7 +3936,7 @@ fn held_blocks<'db>(
 
 /// Whether a type inferred in `func`'s body is or holds a future, an `impl Trait` included:
 /// for a body without MIR, which then holds no future when this is `false`.
-fn infers_a_future(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn infers_a_future(db: &Db, func: FunctionId) -> bool {
     struct Finder<'db> {
         interner: DbInterner<'db>,
         seen: FxHashSet<Ty<'db>>,
@@ -3983,12 +3989,12 @@ fn infers_a_future(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// The `async` blocks whose futures rustc's copy of `instance` holds: those of its body, with
 /// its types filled in, or else those its body names before they are.
 fn made_futures(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> FxHashSet<salsa::Id> {
     let InstanceDef::Fn(func) = instance.def else { return FxHashSet::default() };
-    instance_body(db, instance, env.clone(), v2::build::building())
+    instance_body(db, instance, env.clone(), None)
         .ok()
         .and_then(|body| held_blocks(db, &body, env.as_ref(db)))
         .unwrap_or_else(|| named_futures(db, func))
@@ -3996,7 +4002,7 @@ fn made_futures(
 
 /// The `async` blocks of `func`'s body and of the closures and blocks in it, read before its
 /// generic parameters are filled in.
-fn named_futures(db: &dyn HirDatabase, func: FunctionId) -> FxHashSet<salsa::Id> {
+fn named_futures(db: &Db, func: FunctionId) -> FxHashSet<salsa::Id> {
     struct Collector<'db>(Vec<Ty<'db>>);
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for Collector<'db> {
         type Result = ();
@@ -4039,7 +4045,7 @@ fn named_futures(db: &dyn HirDatabase, func: FunctionId) -> FxHashSet<salsa::Id>
 /// The functions skipped that rustc has a copy of. One of a crate rustc built nothing of has
 /// none: it is missing from the program, and no code of rustc's uses a static in its place.
 fn left_to_rustc<'a>(
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     symbols: &'a dyn SymbolResolver,
     skipped: &'a [(FunctionId, CodegenError)],
 ) -> impl Iterator<Item = FunctionId> + 'a {
@@ -4080,12 +4086,12 @@ type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 
 impl TheirStatics {
     /// The functions of a crate are walked together: they mostly reach the same instances.
-    fn of(db: &dyn HirDatabase, funcs: impl IntoIterator<Item = FunctionId>) -> TheirStatics {
+    fn of(db: &Db, funcs: impl IntoIterator<Item = FunctionId>) -> TheirStatics {
         TheirStatics::walk(db, funcs).0
     }
 
     fn walk(
-        db: &dyn HirDatabase,
+        db: &Db,
         funcs: impl IntoIterator<Item = FunctionId>,
     ) -> (TheirStatics, Walked) {
         let mut by_crate = FxHashMap::<Crate, Vec<FunctionId>>::default();
@@ -4141,7 +4147,7 @@ impl TheirStatics {
 
 /// The value of a static that rustc exports no symbol for.
 #[salsa::tracked(returns(ref))]
-fn compiled_static<'db>(db: &'db dyn HirDatabase, id: StaticId) -> Result<CompiledStatic> {
+fn compiled_static<'db>(db: &'db Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
     let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
     let env =
@@ -4287,7 +4293,7 @@ struct TypesTold {
 impl ToldTypes {
     fn told(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         env: &StoredParamEnvAndCrate,
         ty: &StoredTy,
     ) -> Option<debuginfo::TypeSet> {
@@ -4300,7 +4306,7 @@ impl ToldTypes {
     }
 
     /// Tells of the types of the variables of `compiled`, for [`describe_variables`] to find.
-    fn ahead(&self, db: &dyn HirDatabase, compiled: &CompiledFunction) {
+    fn ahead(&self, db: &Db, compiled: &CompiledFunction) {
         if let (Some(_), Some((env, variables))) = (&compiled.source, &compiled.variables) {
             variables.iter().for_each(|it| _ = self.told(db, env, &it.ty));
         }
@@ -4311,7 +4317,7 @@ impl ToldTypes {
 /// `debug` has the places of, each in the scope `scopes` has for its binding. A variable of
 /// a type that is not told of is left out.
 fn describe_variables<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
     (told, env): (&ToldTypes, &StoredParamEnvAndCrate),
     variables: &[Variable],
@@ -4362,7 +4368,7 @@ fn describe_variables<'db>(
 /// A binding of the outermost scope, which a parameter is, is known in all of the function
 /// and is not among what is returned.
 fn describe_scopes(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     variables: &[Variable],
     rows: &[(u32, MirSpan)],
@@ -4445,7 +4451,7 @@ fn describe_scopes(
 /// `[workspace.metadata.blaze]`), with what it ran out of, where, and the setting that raises
 /// it; or its value points to memory allocated while evaluating it. `None` for any other error.
 fn refused_const_eval(
-    db: &dyn HirDatabase,
+    db: &Db,
     of: GeneralConstId<'_>,
     e: &ConstEvalError<'_>,
 ) -> Option<CodegenError> {
@@ -4494,7 +4500,7 @@ fn refused_const_eval(
 /// the body when there is none, where that is itself what the macro writes.
 #[salsa::tracked]
 fn row_location_in_file<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
@@ -4519,7 +4525,7 @@ fn row_location_in_file<'db>(
 /// has it while the macro is the crate's own, and where the first macro that is not is
 /// called from, up to the expansion `within` or to the source.
 fn written_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     file_id: HirFileId,
     range: TextRange,
     within: Option<span::SyntaxContext>,
@@ -4544,7 +4550,7 @@ fn written_place(
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
 #[salsa::tracked]
 fn declaration_location<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
@@ -4560,7 +4566,7 @@ fn declaration_location<'db>(
 /// into it put the breakpoint past the calls, where a panic in them never got.
 #[salsa::tracked]
 fn debug_declaration_location<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let source = func.lookup(db).source(db);
@@ -4573,7 +4579,7 @@ fn debug_declaration_location<'db>(
 /// File, line and column of where the struct or the variant `def` constructs is written,
 /// which is where rustc has the code of a constructor from. `None` for a function.
 fn constructor_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: CallableDefId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let (file, node) = match def {
@@ -4590,7 +4596,7 @@ fn constructor_location(
     location_of(db, file, written_range(&node))
 }
 
-fn is_thread_local(db: &dyn HirDatabase, id: StaticId) -> bool {
+fn is_thread_local(db: &Db, id: StaticId) -> bool {
     AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL)
 }
 
@@ -4602,7 +4608,7 @@ fn is_integer(ty: Ty<'_>) -> bool {
 /// The symbol a function is exported under when an attribute names it: the runtime or the
 /// program loading the library looks it up by that name, so it is compiled whether or not
 /// anything calls it.
-pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn exported_symbol(db: &Db, func: FunctionId) -> Option<String> {
     if let Some(name) = AttrFlags::export_name(db, func.into()) {
         return Some(name.as_str().to_owned());
     }
@@ -4613,7 +4619,7 @@ pub fn exported_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String>
 
 /// Whether a function is `#[rustc_comptime]`: one the const evaluator alone runs, such as
 /// `TypeId::size` over the reflection intrinsics, of which rustc compiles no code.
-pub fn compile_time_only(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn compile_time_only(db: &Db, func: FunctionId) -> bool {
     AttrFlags::has_word(db, func.into(), "rustc_comptime")
 }
 
@@ -4626,7 +4632,7 @@ fn is_ub_check(name: &intern::Symbol) -> bool {
 /// The symbol a static of the program, not of an `extern` block, is exported under when an
 /// attribute names it: code of another language finds it by that name, whatever its
 /// visibility and whether or not Rust code uses it.
-pub fn exported_static(db: &dyn HirDatabase, id: StaticId) -> Option<intern::Symbol> {
+pub fn exported_static(db: &Db, id: StaticId) -> Option<intern::Symbol> {
     let signature = StaticSignature::of(db, id);
     if signature.flags.contains(StaticFlags::EXTERN) {
         return None;
@@ -4638,7 +4644,7 @@ pub fn exported_static(db: &dyn HirDatabase, id: StaticId) -> Option<intern::Sym
 }
 
 /// The symbol an item of an `extern` block links to.
-pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn link_name(db: &Db, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(_) = func.lookup(db).container else {
         return None;
     };
@@ -4649,7 +4655,7 @@ pub fn link_name(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
 
 /// The module of a wasm module's imports an item of an `extern` block is one of, on a target
 /// whose objects are wasm's.
-fn wasm_import_module(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+fn wasm_import_module(db: &Db, func: FunctionId) -> Option<String> {
     let ItemContainerId::ExternBlockId(block) = func.lookup(db).container else { return None };
     if !Target::current().writes_wasm_objects() {
         return None;
@@ -4685,7 +4691,7 @@ fn as_declared(name: &str, prefix: Option<char>) -> String {
 /// declarations in other crates of the standard library that name it as written: rustc gives
 /// it a name of its own. core declares the `#[panic_handler]` as `panic_impl`, and the
 /// personality is the one the unwinding tables name.
-pub fn linked_symbol(db: &dyn HirDatabase, func: FunctionId) -> Option<String> {
+pub fn linked_symbol(db: &Db, func: FunctionId) -> Option<String> {
     if let ItemContainerId::ExternBlockId(_) = func.lookup(db).container {
         return None;
     }
@@ -4784,7 +4790,7 @@ fn place_stand_ins(
 /// static once expanded). The expansion names the function as it exports it, so each module
 /// is asked for the name rather than for the attributes of all its functions.
 #[salsa::tracked(returns(copy))]
-fn declares_global_allocator(db: &dyn HirDatabase, krate: Crate) -> bool {
+fn declares_global_allocator(db: &Db, krate: Crate) -> bool {
     global_allocator_export(db, krate, "__blaze_global_alloc").is_some()
 }
 
@@ -4800,7 +4806,7 @@ const ALLOCATOR_ENTRIES: [(&str, &str, usize, bool); 4] = [
 
 /// The function of `krate` the `#[global_allocator]`'s expansion exports as `exported`.
 fn global_allocator_export(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     exported: &str,
 ) -> Option<FunctionId> {
@@ -4818,7 +4824,7 @@ fn global_allocator_export(
 }
 
 /// The symbol a static of an `extern` block links to.
-fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+fn static_link_name(db: &Db, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
     if !signature.flags.contains(StaticFlags::EXTERN) {
         return None;
@@ -4830,7 +4836,7 @@ fn static_link_name(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
 
 /// Builds the IR of one function and runs Cranelift on it.
 fn compile<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
@@ -4843,7 +4849,7 @@ fn compile<'db>(
 /// Builds the IR of one function and compiles it with Cranelift, or, for a compile at a level
 /// above 1 (`tier`), leaves it to LLVM to compile once the database is let go of.
 fn compile_as<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
@@ -5023,21 +5029,21 @@ fn described<'db>(
 /// Whether the crate has `panic = "abort"`. The standard library's crates are compiled
 /// before, for whichever the program has, and whatever of theirs is compiled again is in the
 /// program's crates.
-fn panics_abort(db: &dyn HirDatabase, krate: Crate) -> bool {
+fn panics_abort(db: &Db, krate: Crate) -> bool {
     let abort =
         cfg::CfgAtom::KeyValue { key: intern::sym::panic, value: intern::sym::abort };
     !krate.data(db).origin.is_lang() && krate.cfg_options(db).check_atom(&abort)
 }
 
 /// `-C debug-assertions` of `krate`: the library's crates are as rustc ships them, without.
-fn debug_assertions(db: &dyn HirDatabase, krate: Crate) -> bool {
+fn debug_assertions(db: &Db, krate: Crate) -> bool {
     !krate.data(db).origin.is_lang()
         && krate.cfg_options(db).check_atom(&cfg::CfgAtom::Flag(intern::sym::debug_assertions))
 }
 
 /// What `intrinsics::ub_checks()` is in a body of the crate `written`, compiled by a crate
 /// whose `-C debug-assertions` is `compiling`: see [`ub_checks_in`].
-fn ub_checks_of(db: &dyn HirDatabase, compiling: bool, written: Crate) -> bool {
+fn ub_checks_of(db: &Db, compiling: bool, written: Crate) -> bool {
     use base_db::{CrateOrigin, LangCrateOrigin};
     let preserves = matches!(
         written.data(db).origin,
@@ -5132,7 +5138,7 @@ fn build<'db>(
 
 /// How many compiled instances and inlinable bodies salsa keeps the value of once a revision
 /// is over; 0 keeps every one.
-pub fn set_code_capacity(db: &mut dyn HirDatabase, compiled: usize, inlinable_bodies: usize) {
+pub fn set_code_capacity(db: &mut Db, compiled: usize, inlinable_bodies: usize) {
     compiled_instance::set_lru_capacity(db, compiled);
     inlinable::set_lru_capacity(db, inlinable_bodies);
     always_inlinable::set_lru_capacity(db, inlinable_bodies);
@@ -5141,7 +5147,7 @@ pub fn set_code_capacity(db: &mut dyn HirDatabase, compiled: usize, inlinable_bo
 /// The body of a small function, built to be put where the function is called.
 #[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
 fn inlinable(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
@@ -5157,36 +5163,43 @@ fn inlinable(
         if generic.basic_blocks.len() > BLOCKS || statements > STATEMENTS {
             return None;
         }
-        built_in_body(db, &instance, env, INSTRUCTIONS)
+        // v1's alone: a v2 unit builds in `always_inlinable` bodies only.
+        built_in_body(db, &instance, env, INSTRUCTIONS, None)
     })
 }
 
 /// The body of an `#[inline(always)]` function of any size, built to be put where the function
-/// is called, as LLVM's always-inliner puts it at every level rustc compiles at.
+/// is called, as LLVM's always-inliner puts it at every level rustc compiles at. `unit` is the
+/// v2 unit's settings it is built under (debug assertions, panic strategy, MIR options), part
+/// of the key; `None` in v1.
 #[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
 fn always_inlinable(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
+    unit: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
-    tier::plain(|| built_in_body(db, &instance, env, usize::MAX))
+    tier::plain(|| built_in_body(db, &instance, env, usize::MAX, unit))
 }
 
 /// The body of the function `instance`, with what it calls built into it, where it is at
 /// most `instructions` long: none of a closure or coroutine, or of a body that defines one.
+/// It is built under `unit`'s settings, never the thread's: the callers are queries.
 fn built_in_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: StoredParamEnvAndCrate,
     instructions: usize,
+    unit: Option<v2::build::Build>,
 ) -> Option<fragment::Inlinable> {
     let InstanceDef::Fn(func) = instance.def else { return None };
     let generic = db.mir_body(func.into()).ok()?;
     if !generic.closures.is_empty() || generic.coroutine.is_some() {
         return None;
     }
-    let body = instance_body(db, instance, env.clone(), v2::build::building()).ok()?;
+    let body = instance_body(db, instance, env.clone(), unit).ok()?;
     let mut cg = Recorder::new(db, &**target().ok()?, selected_target().ok()?, instance.checked);
+    cg.unit = unit;
     cg.unlocated = true;
     let args = instance.args.clone();
     let mut ctx = build(&mut cg, env.as_ref(db), Some(&*body), false, |fx| {
@@ -5210,7 +5223,7 @@ fn built_in_body(
 }
 
 fn inlinable_cycle(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
@@ -5425,15 +5438,16 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
 /// The body of a non-generic function, with the types it only knows as `impl Trait`
 /// resolved.
 fn root_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
 ) -> Result<(&'db MirBody<'db>, ParamEnvAndCrate<'db>)> {
     let owner: InferBodyId<'db> = func.into();
     let tally = backend::Tally::global();
     tally.step(Step::Infer, || _ = InferenceResult::of(db, DefWithBodyId::from(func)));
     let krate = owner.module(db).krate(db);
-    // A function without generics is compiled in its own crate.
-    let options = body_options(db, v2::build::building(), krate, krate);
+    // v1's alone (its callers are v1's, several of them queries): a v2 unit reads bodies
+    // through `instance_body` with its own settings.
+    let options = mir_options_of(db, krate);
     let body = tally.step(Step::Mir, || compiled_mir_body(db, owner, options));
     let body = body.map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
     // Not the function's own bounds: with nothing generic they are bounds on concrete
@@ -5464,7 +5478,7 @@ fn root_body<'db>(
 
 impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, Rejected>,
         own_statics: OwnStatics,
@@ -6272,7 +6286,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // crate is listed to find again: listed here, beside the compiling, and not by every
         // thread at once after it.
         let (listings, keeps) = (self.names.listings(), self.defers() && entries.is_some());
-        let run = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver| {
+        let run = |db: &Db, symbols: &dyn SymbolResolver| {
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
                 .listing(listings.clone());
             let usable = |name: &str| {
@@ -6418,7 +6432,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 progress.notify_all();
             }
         };
-        let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
+        let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {
             ahead.lock().unwrap_or_else(|e| e.into_inner()).alive += 1;
             /// Counts the thread out however it stops.
             struct Leaving<'a>(&'a std::sync::Mutex<Ahead>, &'a std::sync::Condvar);
@@ -6601,7 +6615,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
             let listings = self.names.listings();
-            let work = |db: &dyn HirDatabase, symbols: &dyn SymbolResolver, _: usize| {
+            let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {
                 let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
                     .listing(listings.clone());
                 let (mut stable_names, mut source_paths) = Default::default();
@@ -8502,7 +8516,7 @@ impl Promoted<'_> {
 /// The promoted constants of `body`: its own (`MirBody::promoted_locals`) and those of the
 /// bodies inlined into it (`Inlined::promoted`).
 pub(crate) fn promoted_constants<'a, 'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &'a MirBody<'db>,
 ) -> impl Iterator<Item = Promoted<'db>> + 'a {
     let own = body.promoted_locals.iter().map(|&(local, expr)| Promoted {
@@ -8655,9 +8669,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 let sized_align = self.builder.ins().iconst(ptr(), align);
                 let full_align = self.builder.ins().umax(tail_align, sized_align);
                 let offset = self.builder.ins().iconst(ptr(), offset);
-                let offset = self.align_up(offset, tail_align);
+                let offset = self.emit_align_up(offset, tail_align);
                 let size = self.builder.ins().iadd(offset, tail_size);
-                Ok((self.align_up(size, full_align), full_align))
+                Ok((self.emit_align_up(size, full_align), full_align))
             }
         }
     }
@@ -8681,7 +8695,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(slot)
     }
 
-    fn align_up(&mut self, value: Value, align: Value) -> Value {
+    fn emit_align_up(&mut self, value: Value, align: Value) -> Value {
         let mask = self.builder.ins().iadd_imm(align, -1);
         let value = self.builder.ins().iadd(value, mask);
         self.builder.ins().band_not(value, mask)
@@ -8711,7 +8725,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             align = self.builder.ins().umin(align, pack);
         }
         let offset = self.builder.ins().iconst(ptr(), offset.bytes() as i64);
-        let offset = self.align_up(offset, align);
+        let offset = self.emit_align_up(offset, align);
         Ok(self.builder.ins().iadd(addr, offset))
     }
 
@@ -15131,8 +15145,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         static ENABLED: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("BLAZE_INLINE").is_none_or(|it| it != "0"));
         let db = self.cg.db;
-        if !*ENABLED || self.cg.unit.is_some() {
+        if !*ENABLED {
             return None;
+        }
+        // A v2 unit builds in only the `#[inline(always)]` callees of crates no edit reaches,
+        // whose places its walk lists (`v2/refs.rs` `Walk::instance_call`).
+        if self.cg.unit.is_some() {
+            return self.always_inlined(def, args, sig);
         }
         if Target::current().writes_wasm_objects() {
             return self.always_inlined(def, args, sig);
@@ -15207,6 +15226,20 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         args: GenericArgs<'db>,
         sig: &Signature,
     ) -> Option<ir::FuncRef> {
+        let (instance, body) = self.always_inlinable_callee(def, args)?;
+        (body.func.signature == *sig)
+            .then(|| self.cg.declare_inlined(&instance, body, self.builder.func))
+    }
+
+    /// The callee [`Self::always_inlined`] builds in and its body, without the signature
+    /// check or declaring it: the v2 walk (`v2/refs.rs` `Walk::instance_call`) asks this, so
+    /// the walk and the IR decide what is built in by one function. The body is built under
+    /// the unit's settings (`cg.unit`), which key it.
+    fn always_inlinable_callee(
+        &self,
+        def: InstanceDef,
+        args: GenericArgs<'db>,
+    ) -> Option<(Instance, &'db fragment::Inlinable)> {
         let db = self.cg.db;
         let InstanceDef::Fn(func) = def else { return None };
         let signature = FunctionSignature::of(db, func);
@@ -15221,9 +15254,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         let args = erase_regions(DbInterner::new_with(db, self.env.krate), args);
         let instance = Instance { def, args: args.store(), checked: self.cg.checked };
-        let body = always_inlinable(db, instance.clone(), self.env.store()).as_ref()?;
-        (body.func.signature == *sig)
-            .then(|| self.cg.declare_inlined(&instance, body, self.builder.func))
+        let body = always_inlinable(db, instance.clone(), self.env.store(), self.cg.unit).as_ref()?;
+        Some((instance, body))
     }
 
     /// Shows LLVM the body of the callee `id` a compile at a level above 1 calls, where

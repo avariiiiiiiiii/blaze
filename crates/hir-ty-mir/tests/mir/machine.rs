@@ -437,19 +437,42 @@ struct Made {
     to: u64,
 }
 
-/// The first assignment of a pointer of type `ty` retagged by `mode`.
-#[track_caller]
-fn made(events: &[Event], ty: TyClass, mode: RetagMode) -> Made {
+/// Every assignment of a pointer of type `ty` retagged by `mode`, in order.
+fn all_made(events: &[Event], ty: TyClass, mode: RetagMode) -> Vec<Made> {
     events
         .iter()
         .enumerate()
-        .find_map(|(at, event)| match *event {
+        .filter_map(|(at, event)| match *event {
             Event::Typed { addr, mode: m, ty: t, value, .. } if t == ty && m == mode => {
                 Some(Made { at, place: addr, to: value })
             }
             _ => None,
         })
+        .collect()
+}
+
+/// The first assignment of a pointer of type `ty` retagged by `mode`.
+#[track_caller]
+fn made(events: &[Event], ty: TyClass, mode: RetagMode) -> Made {
+    all_made(events, ty, mode)
+        .into_iter()
+        .next()
         .unwrap_or_else(|| panic!("no `Typed` of a {ty:?} by {mode:?}: {events:#?}"))
+}
+
+/// The first assignment of a non-pointer `value` (as `Typed` records it): its index and place.
+#[track_caller]
+fn assigned(events: &[Event], value: u64) -> Made {
+    events
+        .iter()
+        .enumerate()
+        .find_map(|(at, event)| match *event {
+            Event::Typed { addr, ty: TyClass::Other, value: v, .. } if v == value => {
+                Some(Made { at, place: addr, to: value })
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no assignment of {value}: {events:#?}"))
 }
 
 /// The latest stack allocation before event `before` that `addr` is in: its index, start and
@@ -696,4 +719,141 @@ fn main() {
         "main",
     );
     assert!(!run.ok, "dividing by zero passed: {:#?}", run.events);
+}
+
+// --- The SIMD shim ---
+
+const SIMD: &str = r#"
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct P2([*const u8; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct U2([usize; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct I2([i64; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct B2([u8; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct M2([i8; 2]);
+
+#[rustc_intrinsic]
+unsafe fn simd_shuffle<T, U, V>(a: T, b: T, idx: U) -> V;
+#[rustc_intrinsic]
+unsafe fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+#[rustc_intrinsic]
+unsafe fn simd_expose_provenance<T, U>(ptr: T) -> U;
+#[rustc_intrinsic]
+unsafe fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+#[rustc_intrinsic]
+unsafe fn simd_add<T>(a: T, b: T) -> T;
+#[rustc_intrinsic]
+unsafe fn arith_offset<T>(ptr: *const T, count: isize) -> *const T;
+"#;
+
+fn simd(body: &str) -> String {
+    format!("{SIMD}\nfn main() {{\n{body}\n}}\n")
+}
+
+#[test]
+fn shuffled_pointers_keep_their_provenance() {
+    let events = record(&simd(
+        r#"
+    let a = 1u8;
+    let b = 2u8;
+    let v = P2([&a, &b]);
+    let s: P2 = unsafe { simd_shuffle(v, v, [1u32, 0]) };
+    let _x = unsafe { *s.0[0] };
+"#,
+    ));
+    let init = assigned(&events, 2);
+    let (_, _, b) = stack_root(&events, init.at, init.place);
+    assert!(
+        reads(&events, init.at, init.place, b, 1),
+        "lane 0 of the shuffle doesn't read `b` with its root: {events:#?}"
+    );
+}
+
+#[test]
+fn a_gather_reads_through_its_lane_s_provenance() {
+    let run = run(
+        &simd(
+            r#"
+    let v = [0u8; 4];
+    let p = unsafe { arith_offset(&v as *const [u8; 4] as *const u8, 5) };
+    let _g: B2 = unsafe { simd_gather(B2([0, 0]), P2([p, p]), M2([-1, 0])) };
+"#,
+        ),
+        "main",
+    );
+    let events = &run.events;
+    let borrow = made(events, TyClass::Ref, RetagMode::Default);
+    let (_, start, v) = stack_root(events, borrow.at, borrow.to);
+    let lane = start + 5;
+    let gathered: Vec<_> = events[borrow.at..]
+        .iter()
+        .filter_map(Event::read)
+        .filter(|&(addr, _, size)| addr == lane && size == 1)
+        .collect();
+    assert_eq!(gathered, [(lane, Some(v), 1)], "only the enabled lane is read: {events:#?}");
+}
+
+#[test]
+fn an_address_never_exposed_has_no_provenance() {
+    let run = run(
+        &simd(
+            r#"
+    let p: P2 = unsafe { simd_with_exposed_provenance(U2([64, 64])) };
+    let _x = unsafe { *p.0[0] };
+"#,
+        ),
+        "main",
+    );
+    assert!(!run.ok, "a read of address 64 passed: {:#?}", run.events);
+    let lanes = run.events.iter().filter(|it| **it == Event::FromExposed { addr: 64, prov: None });
+    assert_eq!(lanes.count(), 2, "{:#?}", run.events);
+}
+
+#[test]
+fn exposed_lanes_get_their_provenance_back() {
+    let events = record(&simd(
+        r#"
+    let a = 1u8;
+    let u: U2 = unsafe { simd_expose_provenance(P2([&a, &a])) };
+    let p: P2 = unsafe { simd_with_exposed_provenance(u) };
+    let _x = unsafe { *p.0[0] };
+"#,
+    ));
+    let init = assigned(&events, 1);
+    let (_, _, a) = stack_root(&events, init.at, init.place);
+    let exposed = Event::Expose { addr: init.place, prov: Some(a) };
+    assert_eq!(events.iter().filter(|it| **it == exposed).count(), 2, "{events:#?}");
+    let back = Event::FromExposed { addr: init.place, prov: Some(a) };
+    let from = events
+        .iter()
+        .position(|it| *it == back)
+        .unwrap_or_else(|| panic!("no `FromExposed` of `a`'s address: {events:#?}"));
+    assert!(reads(&events, from, init.place, a, 1), "`*p.0[0]` doesn't read `a`: {events:#?}");
+}
+
+#[test]
+fn adding_an_uninitialized_lane_requires_it_initialized() {
+    let events = record(&simd(
+        r#"
+    union U {
+        v: I2,
+        b: (),
+    }
+    let u = U { b: () };
+    let x = unsafe { u.v };
+    let _s = unsafe { simd_add(x, I2([1, 1])) };
+"#,
+    ));
+    assert!(
+        events.iter().any(|it| matches!(it, Event::RequireInit { init: false, .. })),
+        "the lanes of `u.v` are used as numbers without `require_init` failing: {events:#?}"
+    );
 }

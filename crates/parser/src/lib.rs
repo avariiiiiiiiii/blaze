@@ -51,7 +51,7 @@ pub(crate) use token_set::TokenSet;
 pub use edition::Edition;
 
 pub use crate::{
-    input::Input,
+    input::{FRAGMENT, Input, JOINT, Tokens, word},
     lexed_str::LexedStr,
     outline::lazy_block_len,
     output::{OutlineStep, Output, Step},
@@ -101,17 +101,17 @@ pub enum TopEntryPoint {
 }
 
 impl TopEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
-        self.parse_with(input, false)
+    pub fn parse<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(input.into(), false)
     }
 
     /// As [`TopEntryPoint::parse`], as an outline: each `fn` item's body a lazy node
     /// ([`OutlineStep::Lazy`], [`lazy_block_len`]) when it can be one, else parsed in full.
-    pub fn parse_outline(&self, input: &Input) -> Output {
-        self.parse_with(input, true)
+    pub fn parse_outline<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
+        self.parse_with(input.into(), true)
     }
 
-    fn parse_with(&self, input: &Input, outline: bool) -> Output {
+    fn parse_with(&self, input: Tokens<'_>, outline: bool) -> Output {
         let _p = tracing::info_span!("TopEntryPoint::parse", ?self, outline).entered();
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             TopEntryPoint::SourceFile => grammar::entry::top::source_file,
@@ -178,7 +178,7 @@ pub enum PrefixEntryPoint {
 }
 
 impl PrefixEntryPoint {
-    pub fn parse(&self, input: &Input) -> Output {
+    pub fn parse<'t>(&self, input: impl Into<Tokens<'t>>) -> Output {
         let entry_point: fn(&'_ mut parser::Parser<'_>) = match self {
             PrefixEntryPoint::Vis => grammar::entry::prefix::vis,
             PrefixEntryPoint::Block => grammar::entry::prefix::block,
@@ -223,12 +223,12 @@ impl Reparser {
     ///
     /// For a block, tokens must start with `{`, end with `}` and form a valid brace
     /// sequence.
-    pub fn parse(self, tokens: &Input) -> Output {
+    pub fn parse<'t>(self, tokens: impl Into<Tokens<'t>>) -> Output {
         self.parse_with(parser::Parser::new(tokens))
     }
 
     /// As [`Reparser::parse`], as an outline ([`TopEntryPoint::parse_outline`]).
-    pub fn parse_outline(self, tokens: &Input) -> Output {
+    pub fn parse_outline<'t>(self, tokens: impl Into<Tokens<'t>>) -> Output {
         self.parse_with(parser::Parser::new_outline(tokens))
     }
 

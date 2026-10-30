@@ -467,6 +467,7 @@ fn delimited(
         }
         if !p.eat(delim) {
             if p.at_ts(first_set) {
+                // alloc: error path only, the message names the delimiter
                 p.error(format!("expected {delim:?}"));
             } else {
                 break;

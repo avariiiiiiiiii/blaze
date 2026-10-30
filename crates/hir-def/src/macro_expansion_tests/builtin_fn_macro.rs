@@ -5,7 +5,7 @@ use test_fixture::WithFixture;
 
 use crate::{
     ModuleDefId, expr_store::Body, macro_expansion_tests::check, nameres::crate_def_map,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 #[test]
@@ -227,8 +227,8 @@ macro_rules! env {() => {}}
 fn main() {
     /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
     /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
-    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
-    /* error: environment variable `TEST_ENV_VAR` not defined at compile time */"UNRESOLVED_ENV_VAR";
+    /* error: error */"UNRESOLVED_ENV_VAR";
+    /* error: error */"UNRESOLVED_ENV_VAR";
 }
 "##]],
     );
@@ -254,7 +254,7 @@ macro_rules! option_env {() => {}}
 fn main() {
     $crate::option::Option::None:: < &str>;
     $crate::option::Option::None:: < &str>;
-    /* error: unexpected input */;
+    /* error: option_env! takes 1 argument */$crate::option::Option::None:: < &str>;
 }
 "#]],
     );

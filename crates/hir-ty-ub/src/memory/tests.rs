@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use blaze_ids::rng::SplitMix64;
+
 use super::{
     AlignMsg, Bytes, InAlloc, Kind, Leak, Leaks, MemError, Memory, Uninit, init_mask::InitMask,
 };
@@ -19,22 +21,6 @@ fn ptr(size: usize, p: Prov) -> Bytes {
 
 fn err(r: Result<impl std::fmt::Debug, MemError>) -> String {
     r.unwrap_err().to_string()
-}
-
-/// A deterministic xorshift for the differential tests.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
 }
 
 // Miri: rustc_middle/src/mir/interpret/allocation/init_mask/tests.rs, every test.
@@ -163,7 +149,7 @@ fn grow_same_state_outside_capacity() {
 /// uninitialized run, chunks, and the bits `Bytes` reads.
 #[test]
 fn init_mask_matches_bool_model() {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for round in 0..200 {
         let len = 1 + rng.below(300);
         let start = round % 2 == 0;
@@ -189,7 +175,7 @@ fn init_mask_matches_bool_model() {
                 }
                 _ => {
                     let n = b - a;
-                    let bits: Vec<u64> = (0..n.div_ceil(64)).map(|_| rng.next()).collect();
+                    let bits: Vec<u64> = (0..n.div_ceil(64)).map(|_| rng.next_u64()).collect();
                     mask.set_bits(a, &bits, n);
                     for k in 0..n {
                         model[(a + k) as usize] = bits[(k / 64) as usize] & (1 << (k % 64)) != 0;
@@ -315,7 +301,7 @@ fn model_read_ptr(cells: &[Cell], at: usize) -> Option<Prov> {
 #[test]
 fn memory_matches_byte_model() {
     const N: usize = 72;
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for _ in 0..300 {
         let mut mem = Memory::new();
         let a = mem.alloc(0x1000, N as u64, 8, Kind::Rust, false).unwrap();
@@ -404,7 +390,7 @@ fn memory_matches_byte_model() {
 /// `Bytes` against the per-byte model under `put`, `slice`, `clear_prov` and `set_uninit`.
 #[test]
 fn bytes_match_byte_model() {
-    let mut rng = Rng(0xdead_beef_cafe_f00d);
+    let mut rng = SplitMix64::new(0xdead_beef_cafe_f00d);
     let a = id(1);
     let provs = [prov(a, 1), prov(a, 2), Prov::Wildcard];
     for _ in 0..500 {
@@ -900,6 +886,28 @@ fn free_errors() {
     assert_eq!(mem.free((0x2000, Some(prov(r, 2))), Some(1), Some(1), Kind::Rust), Ok(r));
     assert_eq!(mem.free((0x1000, Some(prov(s, 1))), None, None, Kind::Stack), Ok(s));
     assert_eq!(mem.live_at(0x2000), None);
+}
+
+#[test]
+fn munmap_frees_only_mmap_memory_and_neither_leaks() {
+    let mut mem = Memory::new();
+    let errno = mem.alloc(0x1000, 4, 4, Kind::Machine, true).unwrap();
+    let mapped = mem.alloc(0x4000, 0x1000, 0x1000, Kind::Mmap, true).unwrap();
+    let kept = mem.alloc(0x8000, 0x1000, 0x1000, Kind::Mmap, true).unwrap();
+    assert_eq!(
+        err(mem.free((0x1000, Some(prov(errno, 1))), None, None, Kind::Mmap)),
+        "deallocating alloc1, which is machine-managed memory memory, using mmap deallocation \
+         operation"
+    );
+    assert_eq!(
+        err(mem.free((0x4000, Some(prov(mapped, 2))), None, None, Kind::Machine)),
+        "deallocating alloc2, which is mmap memory, using machine-managed memory deallocation \
+         operation"
+    );
+    assert_eq!(mem.free((0x4000, Some(prov(mapped, 2))), None, None, Kind::Mmap), Ok(mapped));
+    assert_eq!(mem.free((0x1000, Some(prov(errno, 1))), None, None, Kind::Machine), Ok(errno));
+    assert_eq!(mem.live_at(0x8000), Some(kept));
+    assert_eq!(mem.leaks(), Ok(()));
 }
 
 #[test]

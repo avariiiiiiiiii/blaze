@@ -50,6 +50,7 @@ use std::{
     sync::{Condvar, LazyLock, Mutex, atomic::Ordering},
 };
 
+use base_db::Db;
 use cranelift_codegen::ir;
 use hir_def::FunctionId;
 use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
@@ -130,7 +131,7 @@ struct Finder<'x> {
 impl Finder<'_> {
     fn find<'r>(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -185,7 +186,7 @@ fn shares(pending: &Pending) -> std::result::Result<(), &'static str> {
 /// the same of what it imports, and every function it takes the address of. What it imports
 /// and LLVM leaves a call of is kept by the unit ([`llvm::emit_unit`]); a root, which is
 /// called by its symbol, is called.
-fn calls_after_imports(db: &dyn HirDatabase, pending: &Pending) -> Vec<FuncRequest> {
+fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
     let (Ok(isa), Ok(target)) = (super::target(), super::selected_target()) else {
         return pending.wants.requests.funcs.clone();
     };
@@ -547,7 +548,7 @@ impl Context<'_> {
         &self,
         round: &Mutex<Round>,
         idle: &Condvar,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
     ) {
         let names = stable::StableNames::new(db, symbols, self.owned.clone(), self.hydrate);
@@ -590,7 +591,7 @@ impl Context<'_> {
     /// that one is compiled alone here, to find what it calls.
     fn built(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -620,7 +621,7 @@ impl Context<'_> {
                 (!in_store).then(|| tier::for_build(|| super::root_code(db, *root, true)))
             }
             Kind::Instance(instance, env) => Some(tier::for_build(|| {
-                super::instance_code(db, instance.clone(), env.clone(), Detach::Unit)
+                super::instance_code(db, instance.clone(), env.clone(), Detach::Unit, None)
             })),
         };
         let mut found = Found::default();
@@ -649,7 +650,7 @@ impl Context<'_> {
     /// Compiles a unit, or a function alone, and what the code of each function calls.
     fn compiled(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -709,7 +710,7 @@ impl Job {
 
 /// Compiles the functions of a unit in one module: the code of each, or [`Outcome::Alone`]
 /// for one the unit has none for, which is then compiled alone.
-fn unit(db: &dyn HirDatabase, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
+fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
     let tally = Tally::global();
     let alone = |members: Vec<Built>, why: &str| {
         tally.alone(why, members.len());

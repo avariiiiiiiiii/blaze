@@ -125,7 +125,9 @@ impl Groups {
     fn new(groups: usize) -> Groups {
         debug_assert!(groups.is_power_of_two());
         Groups {
+            // alloc: growth: one table per doubling of a shard, the old one kept until the database drops (readers hold no lock)
             groups: (0..groups).map(|_| Group::new()).collect(),
+            // alloc: growth: one table per doubling of a shard, the old one kept until the database drops (readers hold no lock)
             hashes: (0..groups * GROUP).map(|_| AtomicU64::new(0)).collect(),
         }
     }
@@ -268,16 +270,19 @@ impl<S> ShardedTable<S> {
         Self {
             published: (0..shards)
                 .map(|_| AtomicPtr::new(ptr::null_mut()))
+                // alloc: setup, once per interned ingredient
                 .collect(),
             writers: (0..shards)
                 .map(|_| {
                     CachePadded::new(Mutex::new(Writer {
+                        // alloc: setup, once per interned ingredient
                         owned: Vec::new(),
                         live: 0,
                         dead: 0,
                         state: state(),
                     }))
                 })
+                // alloc: setup, once per interned ingredient
                 .collect(),
         }
     }
@@ -441,6 +446,7 @@ impl<S> Locked<'_, S> {
                 }
             }
         }
+        // alloc: growth: the grown table, once per doubling of a shard
         let grown = NonNull::from(Box::leak(Box::new(grown)));
         writer.owned.push(grown);
         writer.dead = 0;
@@ -458,18 +464,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
-    use super::*;
+    use blaze_ids::rng::SplitMix64;
 
-    /// A splitmix64 stream: seeded, so a failure reproduces.
-    fn stream(mut seed: u64) -> impl FnMut() -> u64 {
-        move || {
-            seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = seed;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-    }
+    use super::*;
 
     /// Values are leaked `u64`s, like interned values that live as long as the database.
     fn leak(value: u64) -> NonNull<()> {
@@ -539,14 +536,14 @@ mod tests {
             let table = ShardedTable::new(SHARDS, || ());
             let reference = Reference(StdMutex::new(hashbrown::HashTable::new()));
             let mut keys: HashMap<u64, NonNull<()>> = HashMap::new();
-            let mut next = stream(seed);
+            let mut rng = SplitMix64::new(seed);
             for step in 0..40_000 {
-                let key = next() % 6_000;
+                let key = rng.below(6_000);
                 let hash = hash_of(key);
                 let shard = shard_of(hash);
                 let found = table.find(shard, hash, |it| read(it.value()) == key);
                 assert_eq!(found, reference.find(hash, key), "seed {seed} step {step}");
-                match next() % 8 {
+                match rng.below(8) {
                     // Remove, as a reused slot leaves its old key.
                     0 => {
                         if let Some(value) = found {
@@ -591,9 +588,9 @@ mod tests {
         for &value in &values {
             table.lock(0).insert(7, value);
         }
-        let mut next = stream(9);
+        let mut rng = SplitMix64::new(9);
         for round in 0..20_000 {
-            let at = (next() % values.len() as u64) as usize;
+            let at = rng.index(values.len());
             let mut locked = table.lock(0);
             assert!(locked.remove(7, values[at]), "round {round}");
             locked.insert(7, values[at]);
@@ -653,10 +650,10 @@ mod tests {
                 .map(|seed| {
                     let table = &table;
                     scope.spawn(move || {
-                        let mut next = stream(seed);
+                        let mut rng = SplitMix64::new(seed);
                         (0..20_000)
                             .map(|_| {
-                                let key = next() % 3_000;
+                                let key = rng.below(3_000);
                                 let hash = hash_of(key);
                                 let shard = shard_of(hash);
                                 let value = match table.find(shard, hash, is(key)) {

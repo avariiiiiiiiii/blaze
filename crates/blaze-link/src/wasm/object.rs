@@ -11,7 +11,6 @@
 use std::collections::hash_map::Entry;
 use std::ops::Range;
 
-use blaze_codegen::wasm::{Import, Signature};
 use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
@@ -20,7 +19,7 @@ use super::reader::{self, Reader};
 use super::reloc::{self, Kind};
 use crate::model::{
     Apply, Archive, Binding, Class, Data, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
-    Section, SectionKind, Symbol, SymbolDef, SymbolKind,
+    Section, SectionKind, Symbol, SymbolDef, SymbolKind, WasmImport,
 };
 use crate::output::NativeKind;
 
@@ -75,11 +74,14 @@ const COMDAT_SECTION: u8 = 5;
 pub(super) fn read(name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
     match kind {
         NativeKind::Object => {
+            // alloc: error path
             object(bytes).map(NativeFile::Object).map_err(|e| format!("{name}: {e}"))
         }
         NativeKind::Archive { whole } => {
+            // alloc: error path
             archive(bytes, *whole).map(NativeFile::Archive).map_err(|e| format!("{name}: {e}"))
         }
+        // alloc: error path
         NativeKind::Shared { .. } => Err(format!(
             "{name}: a shared library, and a wasm32 module links none (wasm-ld takes them only \
              with -pie or -shared, which rustc's wasm targets don't use)"
@@ -90,17 +92,36 @@ pub(super) fn read(name: &str, bytes: &[u8], kind: &NativeKind) -> Result<Native
 fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
     use ::object::read::archive::ArchiveFile;
 
+    // alloc: error path
     let file = ArchiveFile::parse(bytes).map_err(|e| format!("an archive: {e}"))?;
     if file.is_thin() {
+        // alloc: error path
         return Err("a thin archive, whose members are other files".to_owned());
     }
-    let mut members = Vec::new();
-    let mut names = Names::default();
+    // A first walk of the headers counts the members and the index and their names, so every
+    // column is one exact allocation. The index's names can't be more bytes than the archive
+    // (a BSD index names each string once however many entries name it).
+    let (mut count, mut name_bytes) = (0, 0);
+    for member in file.members().flatten() {
+        count += 1;
+        name_bytes += member.name().len();
+    }
+    let (mut entries, mut entry_bytes) = (0, 0);
+    if let Ok(Some(index)) = file.symbols() {
+        for symbol in index.flatten() {
+            entries += 1;
+            entry_bytes += symbol.name().len();
+        }
+    }
+    let mut members = Vec::with_capacity(count);
+    let mut names = Names::with_capacity(name_bytes + entry_bytes.min(bytes.len()));
     // Where each member's bytes start, in file order and so sorted: found by binary search.
-    let mut by_offset: Vec<u64> = Vec::new();
+    let mut by_offset: Vec<u64> = Vec::with_capacity(count);
     for member in file.members() {
+        // alloc: error path
         let member = member.map_err(|e| format!("an archive member: {e}"))?;
         let (offset, size) = member.file_range();
+        // alloc: borrowed, unless the name is not UTF-8
         let member_name = String::from_utf8_lossy(member.name());
         // `object` takes a member's size from its header without bounding it by the archive.
         let range = offset
@@ -108,6 +129,7 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
             .and_then(|end| Some(usize::try_from(offset).ok()?..usize::try_from(end).ok()?))
             .filter(|it| it.end <= bytes.len())
             .ok_or_else(|| {
+                // alloc: error path
                 format!(
                     "the member `{member_name}` of {size} bytes at {offset} reaches past the \
                      archive's {} bytes",
@@ -118,22 +140,27 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
         let name = names.push(&member_name)?;
         members.push(Member { name, bytes: range });
     }
-    let mut index = Vec::new();
+    let mut index = Vec::with_capacity(entries);
+    // alloc: error path
     match file.symbols().map_err(|e| format!("the archive's index: {e}"))? {
         Some(symbols) => {
             // A BSD `__.SYMDEF` names its strings by offset, so many entries may name one: each
             // string is pushed once, keyed by where it is in the input (O(1) per entry, and the
             // arena no bigger than the index's strings).
-            let mut pushed: FxHashMap<(usize, usize), Name> = FxHashMap::default();
+            let mut pushed: FxHashMap<(usize, usize), Name> =
+                FxHashMap::with_capacity_and_hasher(entries, Default::default());
             for symbol in symbols {
+                // alloc: error path
                 let symbol = symbol.map_err(|e| format!("the archive's index: {e}"))?;
                 let name = std::str::from_utf8(symbol.name())
                     .map_err(|_| "a name in the archive's index that is not UTF-8")?;
                 let member = file.member(symbol.offset()).map_err(|e| {
+                    // alloc: error path
                     format!("the archive's index names `{name}` in no member: {e}")
                 })?;
                 let member = by_offset
                     .binary_search(&member.file_range().0)
+                    // alloc: error path
                     .map_err(|_| format!("the archive's index names `{name}` in no member"))?;
                 let name = match pushed.entry((name.as_ptr() as usize, name.len())) {
                     Entry::Occupied(it) => *it.get(),
@@ -144,8 +171,9 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
         }
         None if members.is_empty() || whole => {}
         None => {
-            return Err("an archive without an index of its symbols (run `llvm-ranlib` on it)"
-                .to_owned());
+            let missing = "an archive without an index of its symbols (run `llvm-ranlib` on it)";
+            // alloc: error path
+            return Err(missing.to_owned());
         }
     }
     Ok(Archive { members, index, names })
@@ -165,7 +193,9 @@ struct Custom<'a> {
     payload: Range<usize>,
 }
 
-/// The sections of an object, read.
+/// The sections of an object, read. Each column is reserved once, exactly, by its section's
+/// count (the imports' three by the import count): a constant number of buffers per object.
+#[derive(Default)]
 struct Parsed<'a> {
     sections: Vec<reader::Section<'a>>,
     /// Each type as the type section encodes it, checked: borrowed, never decoded.
@@ -190,25 +220,14 @@ struct Parsed<'a> {
 
 fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
     let sections = reader::sections(bytes)?;
-    let mut parsed = Parsed {
-        sections: Vec::new(),
-        types: Vec::new(),
-        imported: Vec::new(),
-        imported_globals: Vec::new(),
-        imported_tables: Vec::new(),
-        functions: Vec::new(),
-        exports: Vec::new(),
-        code: None,
-        bodies: Vec::new(),
-        data: None,
-        segments: Vec::new(),
-        customs: Vec::new(),
-        linking: None,
-        relocs: Vec::new(),
-    };
+    let mut parsed = Parsed::default();
+    let customs = sections.iter().filter(|it| it.id == id::CUSTOM).count();
+    parsed.customs.reserve_exact(customs);
+    parsed.relocs.reserve_exact(customs);
     for (index, section) in sections.iter().enumerate() {
         let mut r = Reader::new(section.contents);
         let at = section.at;
+        // alloc: error path
         let what = |e: String| format!("section {index} (id {}): {e}", section.id);
         let mut one = || -> Result<(), String> {
             match section.id {
@@ -233,7 +252,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 }
                 id::IMPORT => {
                     let count = r.count()?;
-                    parsed.imported.reserve(count);
+                    parsed.imported.reserve_exact(count);
+                    parsed.imported_tables.reserve_exact(count);
+                    parsed.imported_globals.reserve_exact(count);
                     for _ in 0..count {
                         let module = r.name()?;
                         let field = r.name()?;
@@ -251,11 +272,13 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                                 parsed.imported_globals.push(field);
                             }
                             4 => {
+                                // alloc: error path
                                 return Err(format!(
                                     "the tag import {module}.{field}: wasm exception handling \
                                      is not linked"
                                 ));
                             }
+                            // alloc: error path
                             kind => return Err(format!("the import {module}.{field} of kind {kind}")),
                         }
                     }
@@ -277,6 +300,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                                 parsed.exports.push((function, name));
                             }
                             (kind, _) => {
+                                // alloc: error path
                                 return Err(format!(
                                     "the export `{name}` of kind {kind}: an object exports only \
                                      functions"
@@ -304,14 +328,17 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                         match r.u32()? {
                             0 => {}
                             1 => {
+                                // alloc: error path
                                 return Err("a passive data segment (shared memory)".to_owned());
                             }
                             2 => match r.u32()? {
                                 0 => {}
                                 memory => {
+                                    // alloc: error path
                                     return Err(format!("a data segment of memory {memory}"));
                                 }
                             },
+                            // alloc: error path
                             flags => return Err(format!("a data segment of flags {flags}")),
                         }
                         r.i32_const()?;
@@ -325,6 +352,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     r.u32()?;
                 }
                 id::TABLE | id::MEMORY | id::GLOBAL | id::START | id::ELEMENT | id::TAG => {
+                    // alloc: error path
                     return Err(format!(
                         "a {} section, which LLVM's objects don't have: linked module or \
                          position-independent code?",
@@ -338,9 +366,11 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                         }
                     ));
                 }
+                // alloc: error path
                 other => return Err(format!("a section of the unknown id {other}")),
             }
             if !r.done() {
+                // alloc: error path
                 return Err("bytes after its contents".to_owned());
             }
             Ok(())
@@ -348,6 +378,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
         one().map_err(what)?;
     }
     if parsed.bodies.len() != parsed.functions.len() {
+        // alloc: error path
         return Err(format!(
             "{} function types and {} bodies",
             parsed.functions.len(),
@@ -362,7 +393,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
 fn signature<'a>(r: &mut Reader<'a>, contents: &'a [u8]) -> Result<Sig<'a>, String> {
     match contents.get(r.at()) {
         Some(0x60) => code::signature(r, contents),
+        // alloc: error path
         Some(form) => Err(format!("a type of form {form:#04x} (GC types are not linked)")),
+        // alloc: error path
         None => Err("a truncated type".to_owned()),
     }
 }
@@ -370,6 +403,7 @@ fn signature<'a>(r: &mut Reader<'a>, contents: &'a [u8]) -> Result<Sig<'a>, Stri
 fn limits(r: &mut Reader<'_>) -> Result<(), String> {
     let flags = r.u8()?;
     if flags > 7 {
+        // alloc: error path
         return Err(format!("limits of flags {flags:#x}"));
     }
     r.u64()?;
@@ -395,18 +429,24 @@ struct SegmentInfo<'a> {
     flags: u32,
 }
 
+/// Each column reserved once by its subsection's count (the COMDATs' entries by a bound from
+/// the subsection's size): a constant number of buffers per object.
 #[derive(Default)]
 struct Linking<'a> {
     symbols: Vec<WasmSymbol<'a>>,
     segments: Vec<SegmentInfo<'a>>,
     inits: Vec<(u32, u32)>,
-    comdats: Vec<(&'a str, Vec<(u8, u32)>)>,
+    /// Each COMDAT's name and its run of [`Linking::comdat_entries`].
+    comdats: Vec<(&'a str, Range<u32>)>,
+    /// Every COMDAT's entries, the kind and the index.
+    comdat_entries: Vec<(u8, u32)>,
 }
 
 fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
     let mut r = Reader::new(contents);
     match r.u32()? {
         LINKING_VERSION => {}
+        // alloc: error path
         version => return Err(format!("a linking section of version {version}")),
     }
     let mut linking = Linking::default();
@@ -416,7 +456,9 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
         let mut s = Reader::new(r.bytes(len)?);
         match id {
             SEGMENT_INFO => {
-                for _ in 0..s.count()? {
+                let count = s.count()?;
+                linking.segments.reserve_exact(count);
+                for _ in 0..count {
                     let name = s.name()?;
                     let align = s.u32()?;
                     let flags = s.u32()?;
@@ -424,34 +466,45 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
                 }
             }
             INIT_FUNCS => {
-                for _ in 0..s.count()? {
+                let count = s.count()?;
+                linking.inits.reserve_exact(count);
+                for _ in 0..count {
                     let priority = s.u32()?;
                     linking.inits.push((priority, s.u32()?));
                 }
             }
             COMDAT_INFO => {
-                for _ in 0..s.count()? {
+                let count = s.count()?;
+                linking.comdats.reserve_exact(count);
+                // An entry is at least two bytes (its kind and a LEB128 index).
+                linking.comdat_entries.reserve(len / 2);
+                for _ in 0..count {
                     let name = s.name()?;
                     match s.u32()? {
                         0 => {}
+                        // alloc: error path
                         flags => return Err(format!("the COMDAT `{name}` of flags {flags}")),
                     }
-                    let mut entries = Vec::new();
+                    let start = linking.comdat_entries.len() as u32;
                     for _ in 0..s.count()? {
                         let kind = s.u8()?;
-                        entries.push((kind, s.u32()?));
+                        linking.comdat_entries.push((kind, s.u32()?));
                     }
-                    linking.comdats.push((name, entries));
+                    linking.comdats.push((name, start..linking.comdat_entries.len() as u32));
                 }
             }
             SYMBOL_TABLE => {
-                for _ in 0..s.count()? {
+                let count = s.count()?;
+                linking.symbols.reserve_exact(count);
+                for _ in 0..count {
                     linking.symbols.push(symbol(&mut s)?);
                 }
             }
+            // alloc: error path
             other => return Err(format!("the linking subsection {other}")),
         }
         if !s.done() {
+            // alloc: error path
             return Err(format!("bytes after the linking subsection {id}"));
         }
     }
@@ -478,6 +531,7 @@ fn symbol<'a>(r: &mut Reader<'a>) -> Result<WasmSymbol<'a>, String> {
             }
         }
         SYM_SECTION => symbol.index = r.u32()?,
+        // alloc: error path
         other => return Err(format!("a symbol of the unknown kind {other}")),
     }
     Ok(symbol)
@@ -494,22 +548,37 @@ struct Reloc {
 
 const _: () = assert!(size_of::<Reloc>() <= 24);
 
-fn relocs(contents: &[u8]) -> Result<(usize, Vec<Reloc>), String> {
+/// A function's names: the first a symbol gives it, the first an exported symbol gives it,
+/// and the last the export section gives it.
+#[derive(Clone, Copy, Default)]
+struct FunctionNames<'a> {
+    first: Option<&'a str>,
+    exported: Option<&'a str>,
+    export: Option<&'a str>,
+}
+
+/// A relocation section's header: the section it is of and how many relocations it holds.
+fn relocs_header(r: &mut Reader<'_>) -> Result<(usize, usize), String> {
+    Ok((r.u32()? as usize, r.count()?))
+}
+
+/// Appends a relocation section's relocations to `out` (which has room for them) and says
+/// which section they are of.
+fn relocs(contents: &[u8], out: &mut Vec<Reloc>) -> Result<usize, String> {
     let mut r = Reader::new(contents);
-    let section = r.u32()? as usize;
-    let count = r.count()?;
-    let mut relocs = Vec::with_capacity(count);
+    let (section, count) = relocs_header(&mut r)?;
     for _ in 0..count {
         let r_type = r.u32()?;
         let offset = r.u32()? as usize;
         let index = r.u32()?;
         let addend = if reloc::has_addend(r_type) { r.i64()? } else { 0 };
-        relocs.push(Reloc { r_type, offset, index, addend });
+        out.push(Reloc { r_type, offset, index, addend });
     }
     if !r.done() {
+        // alloc: error path
         return Err("bytes after the relocations".to_owned());
     }
-    Ok((section, relocs))
+    Ok(section)
 }
 
 /// What a data segment's name places it in, as wasm-ld names output segments.
@@ -518,6 +587,7 @@ fn segment_class(name: &str, flags: u32) -> Result<Class, String> {
         name.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
     };
     if flags & SEGMENT_TLS != 0 || is(".tdata") || is(".tbss") {
+        // alloc: error path
         return Err(format!(
             "the thread-local data segment `{name}`: wasm32 without shared memory has no TLS \
              (LLVM makes thread-locals plain data there)"
@@ -561,6 +631,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         "no linking section: not a relocatable object (a linked module can't be linked again)",
     )?)?;
     if linking.segments.len() != parsed.segments.len() {
+        // alloc: error path
         return Err(format!(
             "{} data segments and {} of them in the linking section",
             parsed.segments.len(),
@@ -569,40 +640,69 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     }
     let imported = parsed.imported.len() as u32;
 
-    // The relocations of each section, by the section's index in the module.
-    let mut by_section: Vec<Vec<Reloc>> = Vec::new();
-    by_section.resize_with(parsed.sections.len(), Vec::new);
+    // Every relocation in one column, each section's a run of it, by the section's index in
+    // the module: the headers are read first so the column is one exact allocation.
+    let mut total = 0;
     for &(name, contents) in &parsed.relocs {
-        let (section, relocs) = relocs(contents).map_err(|e| format!("{name}: {e}"))?;
-        let Some(list) = by_section.get_mut(section) else {
+        // alloc: error path
+        let (_, count) = relocs_header(&mut Reader::new(contents)).map_err(|e| format!("{name}: {e}"))?;
+        total += count;
+    }
+    let mut all_relocs: Vec<Reloc> = Vec::with_capacity(total);
+    // alloc: once per object, a run per section
+    let mut runs: Vec<Range<u32>> = vec![0..0; parsed.sections.len()];
+    for &(name, contents) in &parsed.relocs {
+        let start = all_relocs.len() as u32;
+        // alloc: error path
+        let section = relocs(contents, &mut all_relocs).map_err(|e| format!("{name}: {e}"))?;
+        let Some(run) = runs.get_mut(section) else {
+            // alloc: error path
             return Err(format!("{name} is of section {section}, which there is not"));
         };
-        list.extend(relocs);
+        if !run.is_empty() {
+            // alloc: error path
+            return Err(format!("{name}: a second relocation section of section {section}"));
+        }
+        *run = start..all_relocs.len() as u32;
     }
+    let relocs_of = |section: usize| &all_relocs[runs[section].start as usize..runs[section].end as usize];
     let start_of = |section: usize| parsed.sections[section].at;
     let named = |r: &Reloc| reloc::name(r.r_type).unwrap_or("an unknown relocation");
 
     let bodies = parsed.bodies.len();
     let mut sections =
         Vec::with_capacity(bodies + parsed.segments.len() + parsed.customs.len() + linking.inits.len());
-    let mut retain: Vec<usize> = Vec::new();
     // Every section's relocations, each section's a run: the core's one column.
-    let mut fixups: Vec<NativeFixup> =
-        Vec::with_capacity(by_section.iter().map(Vec::len).sum::<usize>() + linking.inits.len());
+    let mut fixups: Vec<NativeFixup> = Vec::with_capacity(all_relocs.len() + linking.inits.len());
     // Every name once, borrowed from the input and pushed: the functions' and init arrays'
-    // section names are built in `scratch`, one buffer for all of them.
+    // section names are built in `scratch`, one buffer for all of them, room for the longest
+    // (`.text.` and a name or an index, `.init_array.` and a priority).
     let symbol_names: usize = linking.symbols.iter().filter_map(|it| it.name).map(str::len).sum();
+    let longest = linking.symbols.iter().filter_map(|it| it.name).map(str::len).max().unwrap_or(0);
     let segment_names: usize = linking.segments.iter().map(|it| it.name.len()).sum();
     let custom_names: usize = parsed.customs.iter().map(|it| it.name.len()).sum();
+    let comdat_names: usize = linking.comdats.iter().map(|it| it.0.len()).sum();
+    // An imported function's module and field once for its `WasmImport`, the field again as
+    // its symbol's name when the symbol has none.
+    let fields: usize = parsed.imported.iter().map(|it| it.module.len() + 2 * it.field.len()).sum::<usize>()
+        + parsed.imported_globals.iter().chain(&parsed.imported_tables).map(|it| it.len()).sum::<usize>();
+    // A symbol's name once for it and once more in its function's section name, `.text.` and
+    // an index (at most 16 bytes) or `.init_array.` and a priority (at most 17).
     let mut names = Names::with_capacity(
-        symbol_names * 2 + segment_names + custom_names + 16 * (bodies + linking.inits.len()),
+        symbol_names * 2
+            + fields
+            + segment_names
+            + custom_names
+            + comdat_names
+            + 24 * (bodies + linking.inits.len()),
     );
-    let mut scratch = String::new();
-    let mut imports = Vec::new();
+    let mut scratch = String::with_capacity(longest + 24);
+    let undefined_functions =
+        linking.symbols.iter().filter(|it| it.kind == SYM_FUNCTION && it.flags & UNDEFINED != 0).count();
+    let mut imports = Vec::with_capacity(undefined_functions);
 
-    // Functions: the first name and the first exported name of each, by body.
-    let mut function_names: Vec<Option<&str>> = vec![None; bodies];
-    let mut exported: Vec<Option<&str>> = vec![None; bodies];
+    // alloc: once per object, an entry per function
+    let mut function_names = vec![FunctionNames::default(); bodies];
     for symbol in &linking.symbols {
         if symbol.kind != SYM_FUNCTION || symbol.flags & UNDEFINED != 0 {
             continue;
@@ -611,21 +711,22 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             continue;
         };
         if let Some(slot) = function_names.get_mut(body as usize) {
-            slot.get_or_insert(name);
+            slot.first.get_or_insert(name);
             if symbol.flags & EXPORTED != 0 {
-                exported[body as usize].get_or_insert(name);
+                slot.exported.get_or_insert(name);
             }
         }
     }
     // The code's relocations as one list sorted by body (CSR, 16 bytes each): the body, the
     // offset in it, the relocation. LLVM lists them in offset order, which the adaptive sort
     // takes in one pass.
-    let mut code_relocs: Vec<(u32, u32, &Reloc)> = Vec::new();
+    let code_relocs_of = parsed.code.map_or(&[][..], relocs_of);
+    let mut code_relocs: Vec<(u32, u32, &Reloc)> = Vec::with_capacity(code_relocs_of.len());
     if let Some(code) = parsed.code {
-        code_relocs.reserve_exact(by_section[code].len());
-        for r in &by_section[code] {
+        for r in code_relocs_of {
             let at = start_of(code) + r.offset;
             let (body, offset) = within(&parsed.bodies, at, width(r.r_type)).ok_or_else(|| {
+                // alloc: error path
                 format!("{} at {:#x} of the code section, in no function body", named(r), r.offset)
             })?;
             code_relocs.push((body as u32, offset as u32, r));
@@ -633,20 +734,34 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         radix::sort_by_key(&mut code_relocs, |it| radix::pack_32(it.0, it.1));
     }
     // The last export of each body wins, as the export section's order says.
-    let mut export_names: Vec<Option<&str>> = vec![None; bodies];
     for &(function, name) in &parsed.exports {
-        if let Some(slot) = function.checked_sub(imported).and_then(|it| export_names.get_mut(it as usize)) {
-            *slot = Some(name);
+        if let Some(slot) = function.checked_sub(imported).and_then(|it| function_names.get_mut(it as usize)) {
+            slot.export = Some(name);
         }
     }
     let mut function_sections = Vec::with_capacity(bodies);
-    // Reused by every function: the types its `call_indirect`s name and where.
-    let mut types: Vec<Sig<'_>> = Vec::new();
-    let mut type_fixups: Vec<(u32, u32)> = Vec::new();
+    // Reused by every function, room for the most any can need: the types its
+    // `call_indirect`s name and where.
+    let mut types: Vec<Sig<'_>> = Vec::with_capacity(parsed.types.len());
+    let mut type_fixups: Vec<(u32, u32)> = Vec::with_capacity(code_relocs.len());
+    // Every function's code, header then body, one after the other in one buffer. A header is
+    // at most 23 bytes and its type, then 10 bytes and a type per `call_indirect`, and its
+    // export's name (a symbol's or an export's).
+    let longest_type = parsed.types.iter().map(|it| it.len()).max().unwrap_or(0);
+    let body_bytes: usize = parsed.bodies.iter().map(|it| it.len()).sum();
+    let export_names: usize = parsed.exports.iter().map(|it| it.1.len()).sum();
+    let mut made = Vec::with_capacity(
+        body_bytes
+            + bodies * (23 + longest_type)
+            + code_relocs.len() * (10 + longest_type)
+            + symbol_names
+            + export_names,
+    );
     let mut next = 0;
     for (body, range) in parsed.bodies.iter().enumerate() {
         let index = imported + body as u32;
         let ty = parsed.functions[body];
+        // alloc: error path
         let ty = *parsed.types.get(ty as usize).ok_or_else(|| format!("no type {ty}"))?;
         let end = next + code_relocs[next..].partition_point(|it| it.0 as usize == body);
         let relocs = &code_relocs[next..end];
@@ -667,6 +782,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     let ty = *parsed
                         .types
                         .get(r.index as usize)
+                        // alloc: error path
                         .ok_or_else(|| format!("{}: no type {}", named(r), r.index))?;
                     // A function names a few types: a scan beats a map.
                     let which = match types.iter().position(|&it| it == ty) {
@@ -679,22 +795,22 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     type_fixups.push((at, which as u32));
                 }
                 Kind::Debug => {
+                    // alloc: error path
                     return Err(format!("{} in the code of function {index}", named(r)));
                 }
             }
         }
-        let export = export_names[body].or(exported[body]);
+        let FunctionNames { first, exported, export } = function_names[body];
+        let export = export.or(exported);
         let parts = Parts { ty, types: &types, type_fixups: &type_fixups, export };
-        let (data, start) = parts.encode(&bytes[range.clone()]);
+        let from = made.len() as u64;
+        let start = parts.encode_into(&mut made, &bytes[range.start..range.end]);
         for fixup in &mut fixups[run..] {
             fixup.at += u64::from(start);
         }
-        if export.is_some() {
-            retain.push(sections.len());
-        }
         scratch.clear();
         scratch.push_str(".text.");
-        match function_names[body] {
+        match first {
             Some(it) => scratch.push_str(it),
             None => {
                 use std::fmt::Write;
@@ -707,20 +823,21 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             what: SectionKind::Alloc(Class::Text, 0),
             align: 1,
             // The header the reader puts before the body: not the input's bytes as they are.
-            data: Data::Bytes(data),
+            data: Data::Made(from..made.len() as u64),
             fixups: run as u32..fixups.len() as u32,
-            retain: false,
+            retain: export.is_some(),
         });
     }
 
     // Data segments. Their relocations, by segment: LLVM lists them in offset order, so by
     // segment already, and the adaptive sort takes them in one pass.
-    let mut segment_fixups: Vec<(u32, NativeFixup)> = Vec::new();
+    let data_relocs = parsed.data.map_or(&[][..], relocs_of);
+    let mut segment_fixups: Vec<(u32, NativeFixup)> = Vec::with_capacity(data_relocs.len());
     if let Some(data) = parsed.data {
-        segment_fixups.reserve_exact(by_section[data].len());
-        for r in &by_section[data] {
+        for r in data_relocs {
             let at = start_of(data) + r.offset;
             let (segment, offset) = within(&parsed.segments, at, width(r.r_type)).ok_or_else(|| {
+                // alloc: error path
                 format!("{} at {:#x} of the data section, in no segment", named(r), r.offset)
             })?;
             match reloc::kind(r.r_type)? {
@@ -735,6 +852,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     },
                 )),
                 Kind::Type | Kind::Debug => {
+                    // alloc: error path
                     return Err(format!("{} in the data segment {segment}", named(r)));
                 }
             }
@@ -745,19 +863,18 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     let mut segment_sections = Vec::with_capacity(parsed.segments.len());
     for (segment, (range, info)) in parsed.segments.iter().zip(&linking.segments).enumerate() {
         let class = segment_class(info.name, info.flags)?;
-        let contents = &bytes[range.clone()];
+        let contents = &bytes[range.start..range.end];
         let data = match class {
             Class::Bss if contents.iter().all(|&it| it == 0) => Data::Zero(contents.len() as u64),
             Class::Bss => {
+                // alloc: error path
                 return Err(format!("the zeroed segment `{}` holds bytes other than 0", info.name));
             }
             _ => Data::Input(range.start as u64..range.end as u64),
         };
         if info.align >= 32 {
+            // alloc: error path
             return Err(format!("the segment `{}` aligned to 2^{}", info.name, info.align));
-        }
-        if info.flags & SEGMENT_RETAIN != 0 {
-            retain.push(sections.len());
         }
         let end = next + segment_fixups[next..].partition_point(|it| it.0 as usize == segment);
         let run = fixups.len() as u32;
@@ -770,17 +887,19 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             align: 1 << info.align,
             data,
             fixups: run..fixups.len() as u32,
-            retain: false,
+            retain: info.flags & SEGMENT_RETAIN != 0,
         });
     }
 
     // Custom sections.
     // The contract section of each custom section, by the custom section's index.
+    // alloc: once per object, an entry per section
     let mut custom_sections: Vec<Option<u32>> = vec![None; parsed.sections.len()];
     for custom in &parsed.customs {
         let dropped = custom.name.starts_with(".debug")
             || matches!(custom.name, "name" | "external_debug_info" | "sourceMappingURL");
         if custom.name.starts_with("dylink") {
+            // alloc: error path
             return Err(format!(
                 "the `{}` section of a position-independent object, which a wasm32 module \
                  doesn't link",
@@ -788,11 +907,12 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             ));
         }
         let run = fixups.len() as u32;
-        for r in &by_section[custom.index] {
+        for r in relocs_of(custom.index) {
             let at = start_of(custom.index) + r.offset;
             let offset = at
                 .checked_sub(custom.payload.start)
                 .filter(|&it| it + width(r.r_type) <= custom.payload.len())
+                // alloc: error path
                 .ok_or_else(|| format!("{} outside the section `{}`", named(r), custom.name))?;
             match (reloc::kind(r.r_type)?, dropped) {
                 (Kind::Applied, _) | (Kind::Debug, true) => fixups.push(NativeFixup {
@@ -803,14 +923,12 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     minus: None,
                 }),
                 (Kind::Type | Kind::Debug, _) => {
+                    // alloc: error path
                     return Err(format!("{} in the section `{}`", named(r), custom.name));
                 }
             }
         }
         custom_sections[custom.index] = Some(sections.len() as u32);
-        if !dropped {
-            retain.push(sections.len());
-        }
         sections.push(Section {
             name: names.push(custom.name)?,
             what: match dropped {
@@ -820,13 +938,14 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             align: 1,
             data: Data::Input(custom.payload.start as u64..custom.payload.end as u64),
             fixups: run..fixups.len() as u32,
-            retain: false,
+            retain: !dropped,
         });
     }
     let function_section = |index: u32| {
         index
             .checked_sub(imported)
             .and_then(|body| function_sections.get(body as usize).copied())
+            // alloc: error path
             .ok_or_else(|| format!("function {index}, which the object doesn't define"))
     };
 
@@ -842,23 +961,28 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         };
         let hidden = s.flags & VISIBILITY_HIDDEN != 0;
         let undefined = s.flags & UNDEFINED != 0;
+        // alloc: error path
         let unnamed = || format!("symbol {at} has no name");
         let symbol = match s.kind {
             SYM_FUNCTION if undefined => {
                 let import = parsed
                     .imported
                     .get(s.index as usize)
+                    // alloc: error path
                     .ok_or_else(|| format!("symbol {at}: no imported function {}", s.index))?;
                 let ty = parsed
                     .types
                     .get(import.ty as usize)
+                    // alloc: error path
                     .ok_or_else(|| format!("symbol {at}: no type {}", import.ty))?;
+                // The type section's types are slices of the input, checked when it was read.
+                let ty_at = (ty.as_ptr() as usize - bytes.as_ptr() as usize) as u64;
                 imports.push((
                     at as u32,
-                    Import {
-                        module: import.module.to_owned(),
-                        field: import.field.to_owned(),
-                        ty: Signature::decode(ty, &mut 0).map_err(|e| format!("symbol {at}: {e}"))?,
+                    WasmImport {
+                        module: names.push(import.module)?,
+                        field: names.push(import.field)?,
+                        ty: ty_at..ty_at + ty.len() as u64,
                     },
                 ));
                 Symbol {
@@ -870,9 +994,10 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 }
             }
             SYM_FUNCTION => {
+                // alloc: error path
                 let section = function_section(s.index).map_err(|e| format!("symbol {at}: {e}"))?;
                 if s.flags & (EXPORTED | NO_STRIP) != 0 {
-                    retain.push(section as usize);
+                    sections[section as usize].retain = true;
                 }
                 Symbol {
                     name: names.push(s.name.ok_or_else(unnamed)?)?,
@@ -889,11 +1014,13 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             SYM_DATA => {
                 let name = s.name.ok_or_else(unnamed)?;
                 if s.flags & TLS != 0 {
+                    // alloc: error path
                     return Err(format!(
                         "the thread-local `{name}`: wasm32 without shared memory has no TLS"
                     ));
                 }
                 if s.flags & EXPORTED != 0 {
+                    // alloc: error path
                     return Err(format!("`{name}` is data and exported: only functions are"));
                 }
                 let def = match s.data {
@@ -902,13 +1029,15 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     Some((segment, value, size)) => {
                         let section = *segment_sections
                             .get(segment as usize)
+                            // alloc: error path
                             .ok_or_else(|| format!("`{name}` is in no segment {segment}"))?;
                         let len = sections[section as usize].data.len();
                         if value.checked_add(size).is_none_or(|end| end > len) {
+                            // alloc: error path
                             return Err(format!("`{name}` reaches past its segment"));
                         }
                         if s.flags & NO_STRIP != 0 {
-                            retain.push(section as usize);
+                            sections[section as usize].retain = true;
                         }
                         SymbolDef::Section { section, value, size }
                     }
@@ -931,6 +1060,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 }
             }
             SYM_GLOBAL | SYM_TABLE => {
+                // alloc: error path
                 return Err(format!(
                     "symbol {at} defines a {}: the module's globals and table are the linker's",
                     if s.kind == SYM_GLOBAL { "global" } else { "table" }
@@ -941,6 +1071,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                     .get(s.index as usize)
                     .copied()
                     .flatten()
+                    // alloc: error path
                     .ok_or_else(|| format!("symbol {at} of section {}, no custom one", s.index))?;
                 Symbol {
                     name: sections[section as usize].name,
@@ -951,10 +1082,12 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                 }
             }
             SYM_TAG => {
+                // alloc: error path
                 return Err(format!(
                     "symbol {at} is an exception tag: wasm exception handling is not linked"
                 ));
             }
+            // alloc: error path
             other => return Err(format!("symbol {at} of the unknown kind {other}")),
         };
         symbols.push(symbol);
@@ -964,6 +1097,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     for &(priority, symbol) in &linking.inits {
         match linking.symbols.get(symbol as usize) {
             Some(it) if it.kind == SYM_FUNCTION => {}
+            // alloc: error path
             _ => return Err(format!("the init function {symbol} is no function's symbol")),
         }
         scratch.clear();
@@ -983,41 +1117,44 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             name: names.push(&scratch)?,
             what: SectionKind::Alloc(Class::InitArray, priority),
             align: 4,
-            // The slot the core fills: no bytes of the input.
-            data: Data::Bytes(vec![0; 4]),
+            // The slot the core fills (it writes a zeroed piece's fixups too): no bytes of the
+            // input, and none made.
+            data: Data::Zero(4),
             fixups: run..fixups.len() as u32,
             retain: false,
         });
     }
 
     let mut groups = Vec::with_capacity(linking.comdats.len());
-    let mut grouped = Vec::with_capacity(linking.comdats.iter().map(|it| it.1.len()).sum());
+    let mut grouped = Vec::with_capacity(linking.comdat_entries.len());
     for (name, entries) in &linking.comdats {
         let start = grouped.len() as u32;
-        for &(kind, index) in entries {
+        for &(kind, index) in &linking.comdat_entries[entries.start as usize..entries.end as usize] {
             grouped.push(match kind {
                 COMDAT_DATA => *segment_sections
                     .get(index as usize)
+                    // alloc: error path
                     .ok_or_else(|| format!("the COMDAT `{name}` has no segment {index}"))?,
                 COMDAT_FUNCTION => {
+                    // alloc: error path
                     function_section(index).map_err(|e| format!("the COMDAT `{name}`: {e}"))?
                 }
                 COMDAT_SECTION => custom_sections
                     .get(index as usize)
                     .copied()
                     .flatten()
+                    // alloc: error path
                     .ok_or_else(|| format!("the COMDAT `{name}` has no custom section {index}"))?,
+                // alloc: error path
                 other => return Err(format!("the COMDAT `{name}` holds a thing of kind {other}")),
             });
         }
         groups.push(Group { name: names.push(name)?, sections: start..grouped.len() as u32, largest: false });
     }
 
-    for section in retain {
-        sections[section].retain = true;
-    }
     for fixup in &fixups {
         if fixup.symbol as usize >= symbols.len() {
+            // alloc: error path
             return Err(format!("a relocation against symbol {}, which there is not", fixup.symbol));
         }
     }
@@ -1027,16 +1164,24 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         fixups,
         groups,
         grouped,
+        // A wasm object has no ties, live support, libraries or directives.
+        // alloc: empty, allocates nothing
+        ties: Vec::new(),
+        // alloc: empty, allocates nothing
+        live_support: Vec::new(),
         names,
         imports,
+        made,
+        // alloc: empty, allocates nothing
         libraries: Vec::new(),
+        // alloc: empty, allocates nothing
         directives: Vec::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use blaze_codegen::wasm::{Code, ValType};
+    use blaze_codegen::wasm::{Code, Signature, ValType};
 
     use super::*;
     use crate::wasm::leb::{custom, name, section, sleb, uleb};
@@ -1235,18 +1380,24 @@ mod tests {
         assert_eq!(kinds[6], &SectionKind::Alloc(crate::wasm::custom("producers"), 0));
         assert_eq!(kinds[7], &SectionKind::Dropped);
         assert_eq!(kinds[8], &SectionKind::Alloc(Class::InitArray, 101));
+        assert_eq!(object.sections[8].data, Data::Zero(4));
         assert_eq!(object.sections[3].data, Data::Zero(8));
         assert_eq!(object.sections[3].align, 8);
         // Segments and custom sections are ranges of the input, not copies.
         assert!(matches!(object.sections[2].data, Data::Input(_)));
-        assert_eq!(object.sections[2].data.bytes(&input).unwrap(), Some(&b"hi!\0"[..]));
+        assert_eq!(object.section_bytes(&object.sections[2].data, &input).unwrap(), Some(&b"hi!\0"[..]));
         assert!(matches!(object.sections[6].data, Data::Input(_)));
-        assert_eq!(object.sections[3].data.bytes(&input).unwrap(), None);
+        assert_eq!(object.section_bytes(&object.sections[3].data, &input).unwrap(), None);
         let retained: Vec<bool> = object.sections.iter().map(|it| it.retain).collect();
         assert_eq!(retained, [true, false, false, false, false, true, true, false, false]);
 
         // `_start` is in the form codegen gives functions: header, then body.
-        let Data::Bytes(start) = &object.sections[0].data else { panic!("no bytes") };
+        // Both functions' code is the reader's one buffer of made bytes, `_start`'s first.
+        let Data::Made(made) = &object.sections[0].data else { panic!("not made") };
+        let Data::Made(init) = &object.sections[1].data else { panic!("not made") };
+        assert_eq!((made.start, made.end), (0, init.start));
+        assert_eq!(init.end as usize, object.made.len());
+        let start = object.section_bytes(&object.sections[0].data, &input).unwrap().unwrap();
         let (code, body) = Code::decode(start).unwrap();
         assert_eq!(&start[body..], &START_BODY);
         assert_eq!(code.ty, Signature::default());
@@ -1303,9 +1454,13 @@ mod tests {
         assert_eq!(object.imports.len(), 1);
         let (at, import) = &object.imports[0];
         assert_eq!(object.symbols[*at as usize], *fd_write);
-        assert_eq!((import.module.as_str(), import.field.as_str()), ("wasi_snapshot_preview1", "fd_write"));
-        assert_eq!(import.ty.params.len(), 4);
-        assert_eq!(import.ty.results, [ValType::I32]);
+        assert_eq!((object.name(import.module), object.name(import.field)), ("wasi_snapshot_preview1", "fd_write"));
+        // The type is borrowed from the type section, in place.
+        let ty = import.type_bytes(&input).unwrap();
+        assert_eq!(ty, [0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f]);
+        let ty = Signature::decode(ty, &mut 0).unwrap();
+        assert_eq!(ty.params.len(), 4);
+        assert_eq!(ty.results, [ValType::I32]);
         assert_eq!(object.name(object.symbols[SP as usize].name), "__stack_pointer");
         assert_eq!(object.symbols[SP as usize].kind, SymbolKind::Other);
         assert_eq!(object.name(object.symbols[8].name), "__indirect_function_table");
@@ -1318,6 +1473,67 @@ mod tests {
         assert_eq!(object.name(object.groups[0].name), "grp");
         assert!(!object.groups[0].largest);
         assert_eq!(object.group_sections(&object.groups[0]), [1, 4]);
+    }
+
+    /// An object of `functions` functions `f0`, `f1`, ... of type `() -> ()`, each calling the
+    /// imported `fd_write`: a relocation and a symbol each.
+    fn object_of(functions: usize) -> Vec<u8> {
+        let mut out = reader::MAGIC.to_vec();
+        section(&mut out, 1, &vec_of(1, &[0x60, 0, 0]));
+        let mut imports = Vec::new();
+        name(&mut imports, "wasi_snapshot_preview1");
+        name(&mut imports, "fd_write");
+        imports.extend([0, 0]);
+        section(&mut out, 2, &vec_of(1, &imports));
+        section(&mut out, 3, &vec_of(functions, &vec![0; functions]));
+        // Each body: no locals, `call` and a padded index, `end`.
+        let body = [0x00, 0x10, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b];
+        let mut code = Vec::new();
+        uleb(&mut code, functions as u64);
+        let first = code.len();
+        let mut relocs = Vec::with_capacity(functions);
+        for at in 0..functions {
+            relocs.push((0, (first + at * (1 + body.len()) + 3) as u32, 0, 0));
+            code.push(body.len() as u8);
+            code.extend(body);
+        }
+        section(&mut out, 10, &code);
+
+        let mut linking = Vec::new();
+        uleb(&mut linking, LINKING_VERSION.into());
+        let mut symbols = vec![SYM_FUNCTION, (UNDEFINED | EXPLICIT_NAME) as u8, 0];
+        name(&mut symbols, "fd_write");
+        for at in 0..functions {
+            symbols.extend([SYM_FUNCTION, 0]);
+            uleb(&mut symbols, at as u64 + 1);
+            name(&mut symbols, &format!("f{at}"));
+        }
+        subsection(&mut linking, SYMBOL_TABLE, &vec_of(functions + 1, &symbols));
+        custom(&mut out, "linking", &linking);
+        // The sections: type 0, import 1, function 2, code 3.
+        reloc_section(&mut out, "reloc.CODE", 3, &relocs);
+        out
+    }
+
+    #[test]
+    fn an_object_is_read_in_a_constant_number_of_buffers() {
+        let used = |functions| {
+            let input = object_of(functions);
+            let (object, used) = blaze_alloc_count::measure(|| read_object(&input).unwrap());
+            assert_eq!(object.sections.len(), functions);
+            assert_eq!(object.fixups.len(), functions);
+            assert_eq!(object.symbols.len(), functions + 1);
+            assert_eq!(object.imports.len(), 1);
+            used
+        };
+        let (small, large) = (used(100), used(2000));
+        // About 30: the reader's columns (sections, types, imports, function types, bodies,
+        // customs, relocation sections, symbols), the object's (sections, fixups, symbols,
+        // names, imports, the bytes the reader made), the relocations and their runs, the
+        // functions' names, the code's relocations by body and the sort's scratch, the reused
+        // buffers, and the one import's names and type. None per function, relocation or symbol.
+        assert!(small.allocations <= 40, "{small:?}");
+        assert_eq!(large.allocations, small.allocations, "20 times the functions");
     }
 
     #[test]

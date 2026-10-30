@@ -27,7 +27,7 @@ use crate::{
         AliasTermKind, BoundRegionKind, DbInterner, EarlyParamRegion, GenericArg, GenericArgs,
         InherentAssocTyId, SolverDefId, Symbol, TraitAssocTyId, Ty, TyKind,
     },
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 /// The item of the module scope declared as `name`.

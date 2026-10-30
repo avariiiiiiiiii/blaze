@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use base_db::Db;
 use hir_def::expr_store::body::{BodySyntax, body_syntax};
 use hir_expand::{MacroCallId, MacroCallKind, map_node_range_up_rooted_span};
 use span::Span;
@@ -29,7 +30,7 @@ pub(crate) enum Place {
 
 /// File, line and column of a place in a body, as rustc reports them.
 pub(crate) fn source_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -42,7 +43,7 @@ pub(crate) fn source_location(
 
 /// File, line and column of a place in a body for a debugger: [`row_location_in_file`].
 pub(crate) fn row_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
@@ -75,7 +76,7 @@ fn compare<T: PartialEq + fmt::Debug>(
 }
 
 fn resolve(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     place: Place,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -91,7 +92,7 @@ fn resolve(
 /// File, line and column of where the anchor of the body begins.
 #[salsa::tracked]
 fn anchor_location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = body_syntax(db, owner).as_ref()?.file_id.file_id()?;
@@ -99,28 +100,23 @@ fn anchor_location(
     line_and_column(db, FileRange { file_id, range: TextRange::empty(start) })
 }
 
-/// Where each row of the anchor of the body begins.
+/// Where the rows of the anchor of the body are.
 #[salsa::tracked(returns(ref))]
-fn anchor_rows(db: &dyn HirDatabase, owner: DefWithBodyId) -> Option<Box<[u32]>> {
-    let text = body_syntax(db, owner).as_ref()?.text();
-    let ends = text.bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
-    Some(std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect())
+fn anchor_rows(db: &Db, owner: DefWithBodyId) -> Option<span::LineIndex> {
+    Some(span::LineIndex::new(body_syntax(db, owner).as_ref()?.text()))
 }
 
 /// The place of `offset` in the anchor of the body.
-fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
-    let starts = anchor_rows(db, owner).as_ref()?;
+fn anchored(db: &Db, owner: DefWithBodyId, offset: TextSize) -> Option<Place> {
+    let (row, start) = anchor_rows(db, owner).as_ref()?.row(offset)?;
     let text = body_syntax(db, owner).as_ref()?.text();
-    let at = u32::from(offset);
-    let row = starts.partition_point(|&start| start <= at).checked_sub(1)?;
-    let written = text.get(starts[row] as usize..at as usize)?;
-    let column = written.chars().map(column_width).sum::<usize>() as u32;
-    Some(Place::Anchored { row: row as u32, column })
+    let written = text.get(usize::from(start)..usize::from(offset))?;
+    Some(Place::Anchored { row, column: span::display_width(written) })
 }
 
 /// The place of a span: in the anchor of the body when it is relative to that anchor.
 fn place_of_span(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     span: Span,
@@ -138,7 +134,7 @@ enum CallNode {
     Other(InFile<SyntaxNode>),
 }
 
-fn call_node(db: &dyn HirDatabase, syntax: &BodySyntax, call: MacroCallId) -> CallNode {
+fn call_node(db: &Db, syntax: &BodySyntax, call: MacroCallId) -> CallNode {
     let loc = call.loc(db);
     if let MacroCallKind::FnLike { ast_id, .. } = loc.kind
         && ast_id.file_id == syntax.file_id
@@ -152,7 +148,7 @@ fn call_node(db: &dyn HirDatabase, syntax: &BodySyntax, call: MacroCallId) -> Ca
 /// The file a place in a body is written in, and where in it rustc has the place begin: in
 /// the tree of [`BodySyntax::root`] when that file is the body's own.
 fn source_range(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     span: MirSpan,
@@ -202,7 +198,7 @@ fn source_range(
 // Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(revisions = usize::MAX)]
-fn source_place(db: &dyn HirDatabase, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
+fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
         let (file, line, column) = (*source_location_in_file(db, owner, span))?;
         return Some(Place::At(file, line, column));
@@ -216,7 +212,7 @@ fn source_place(db: &dyn HirDatabase, owner: DefWithBodyId, span: MirSpan) -> Op
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(revisions = usize::MAX)]
 fn row_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     closure: Option<ExprId>,
     span: MirSpan,
@@ -246,7 +242,7 @@ fn row_place(
 
 /// [`super::written_place`], of a macro file, in the anchor of the body where it can be.
 fn written_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,
@@ -277,7 +273,7 @@ fn written_place(
 }
 
 /// [`super::written_call`], in the anchor of the body where it is written there.
-fn written_call(db: &dyn HirDatabase, syntax: &BodySyntax, file_id: HirFileId) -> Option<CallNode> {
+fn written_call(db: &Db, syntax: &BodySyntax, file_id: HirFileId) -> Option<CallNode> {
     let mut call = call_node(db, syntax, file_id.macro_file()?);
     while let CallNode::Other(node) = &call
         && let Some(outer) = node.file_id.macro_file()
@@ -294,7 +290,7 @@ fn written_call(db: &dyn HirDatabase, syntax: &BodySyntax, file_id: HirFileId) -
 /// [`super::location_of`], in the anchor of the body where it can be: `range` is in the tree
 /// of [`BodySyntax::root`] when `file_id` is the body's file.
 fn place_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,
@@ -320,7 +316,7 @@ fn place_of(
 
 /// The place of a range of a macro file, or of a file that is not the body's.
 fn place_up(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     syntax: &BodySyntax,
     file_id: HirFileId,

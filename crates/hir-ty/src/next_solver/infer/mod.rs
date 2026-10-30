@@ -6,7 +6,7 @@ use std::range::RangeInclusive;
 use std::sync::Arc;
 
 pub use BoundRegionConversionTime::*;
-use hir_def::{GenericParamId, TraitId};
+use hir_def::{ConstParamId, GenericParamId, TraitId, TypeParamId};
 use opaque_types::{OpaqueHiddenType, OpaqueTypeStorage};
 use region_constraints::{
     RegionConstraintCollector, RegionConstraintStorage, SolverRegionConstraint,
@@ -100,6 +100,10 @@ pub struct InferCtxtInner<'db> {
     /// Map from const parameter variable to the kind of const it represents.
     pub(crate) const_unification_storage: UnionFind<ConstVid, ConstVariableValue<'db>>,
 
+    /// The const parameter each variable made for one stands for (rustc's
+    /// `ConstVariableOrigin::param_def_id`), in variable order; sparse, as for type variables.
+    pub(crate) const_var_params: Vec<(ConstVid, ConstParamId)>,
+
     /// Map from integral variable to the kind of integer it represents.
     pub(crate) int_unification_storage: UnionFind<IntVid, IntVarValue>,
 
@@ -166,6 +170,8 @@ impl<'db> InferCtxtInner<'db> {
 
             type_variable_storage: Default::default(),
             const_unification_storage: Default::default(),
+            // alloc: an empty `Vec` does not allocate.
+            const_var_params: Vec::new(),
             int_unification_storage: Default::default(),
             float_unification_storage: Default::default(),
             region_constraint_storage: Some(Default::default()),
@@ -174,6 +180,21 @@ impl<'db> InferCtxtInner<'db> {
             region_assumptions: Default::default(),
             opaque_type_storage: Default::default(),
         }
+    }
+
+    /// Grows whenever a type, const, int or float variable is instantiated or unified, an
+    /// opaque type is registered, or a rollback undoes any of these, and never shrinks. Equal
+    /// counts mean equal variable and opaque-type state, so a goal stalled at the first gives
+    /// the same answer at the second. Region variables are not counted, as in rustc's
+    /// `ty_or_const_infer_var_changed`: the solver's input canonicalization makes every region
+    /// a fresh placeholder.
+    #[inline]
+    pub(crate) fn state_changes(&self) -> u64 {
+        self.type_variable_storage.changes()
+            + self.const_unification_storage.changes()
+            + self.int_unification_storage.changes()
+            + self.float_unification_storage.changes()
+            + self.opaque_type_storage.changes()
     }
 
     #[inline]
@@ -756,6 +777,29 @@ impl<'db> InferCtxt<'db> {
         Ty::new_var(self.interner, vid)
     }
 
+    pub(crate) fn next_ty_var_for_param(
+        &self,
+        span: Span,
+        param: Option<TypeParamId>,
+    ) -> Ty<'db> {
+        let universe = self.universe();
+        let vid =
+            self.inner.borrow_mut().type_variables().new_var_for_param(universe, span, param);
+        Ty::new_var(self.interner, vid)
+    }
+
+    pub(crate) fn next_const_var_for_param(
+        &self,
+        span: Span,
+        param: Option<ConstParamId>,
+    ) -> Const<'db> {
+        let vid = self.next_const_vid(span);
+        if let Some(param) = param {
+            self.inner.borrow_mut().const_var_params.push((vid, param));
+        }
+        Const::new_var(self.interner, vid)
+    }
+
     pub fn next_const_var(&self, span: Span) -> Const<'db> {
         let vid = self.next_const_vid(span);
         Const::new_var(self.interner, vid)
@@ -849,7 +893,7 @@ impl<'db> InferCtxt<'db> {
                 // region parameter definition.
                 self.next_region_var(span).into()
             }
-            GenericParamId::TypeParamId(_) => {
+            GenericParamId::TypeParamId(param) => {
                 // Create a type inference variable for the given
                 // type parameter definition. The generic parameters are
                 // for actual parameters that may be referred to by
@@ -858,9 +902,11 @@ impl<'db> InferCtxt<'db> {
                 // used in a path such as `Foo::<T, U>::new()` will
                 // use an inference variable for `C` with `[T, U]`
                 // as the generic parameters for the default, `(T, U)`.
-                self.next_ty_var(span).into()
+                self.next_ty_var_for_param(span, Some(param)).into()
             }
-            GenericParamId::ConstParamId(_) => self.next_const_var(span).into(),
+            GenericParamId::ConstParamId(param) => {
+                self.next_const_var_for_param(span, Some(param)).into()
+            }
         }
     }
 
@@ -1193,6 +1239,24 @@ impl<'db> InferCtxt<'db> {
         self.inner.borrow_mut().type_variables().var_span(vid)
     }
 
+    /// The span of `vid` and the type parameter it was made for, if any (rustc's
+    /// `type_var_origin`).
+    pub fn type_var_origin(&self, vid: TyVid) -> (Span, Option<GenericParamId>) {
+        let mut inner = self.inner.borrow_mut();
+        let param = inner.type_variable_storage.param(vid);
+        (inner.type_variables().var_span(vid), param.map(GenericParamId::TypeParamId))
+    }
+
+    /// The span of `vid` while it is unknown and the const parameter it was made for, if any
+    /// (rustc's `const_var_origin`).
+    pub fn const_var_origin(&self, vid: ConstVid) -> Option<(Span, Option<GenericParamId>)> {
+        let span = self.const_var_span(vid)?;
+        let inner = self.inner.borrow();
+        let params = &inner.const_var_params;
+        let param = params.binary_search_by_key(&vid, |&(vid, _)| vid).ok().map(|at| params[at].1);
+        Some((span, param.map(GenericParamId::ConstParamId)))
+    }
+
     /// Returns the span of the const variable identified by `vid`
     pub fn const_var_span(&self, vid: ConstVid) -> Option<Span> {
         match self.inner.borrow_mut().const_unification_table().probe_value(vid) {
@@ -1267,6 +1331,12 @@ impl<'db> InferCtxt<'db> {
 
     pub fn universe(&self) -> UniverseIndex {
         self.universe.get()
+    }
+
+    /// See `InferCtxtInner::state_changes`.
+    #[inline]
+    pub fn state_changes(&self) -> u64 {
+        self.inner.borrow().state_changes()
     }
 
     /// Creates and return a fresh universe that extends all previous

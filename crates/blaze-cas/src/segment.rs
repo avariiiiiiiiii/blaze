@@ -18,6 +18,7 @@ use std::{
 };
 
 use blaze_ids::ContentId;
+use blaze_mem::{MemError, Region, Tag, scratch};
 use blaze_reclaim::Guard;
 
 use crate::{
@@ -26,6 +27,7 @@ use crate::{
     flags::Flag,
     read::{Look, Place, Seg, Shared, Spot},
     table::Held,
+    words::stop,
 };
 use crate::sync::{
     OnceLock,
@@ -51,7 +53,14 @@ pub(crate) const COPY: u8 = 1;
 /// A chunk's published word: bytes below `1 << BYTES_BITS`, puts ended in it above.
 const BYTES_BITS: u32 = 40;
 
+/// Where a chunk's bytes start in its region: its header comes first, a cache line to itself.
+const HEAD: usize = std::mem::size_of::<Chunk>().next_multiple_of(64);
+
+/// A chunk lives at the base of a region of its own, tagged [`Tag::Store`] and committed
+/// whole when it is made (the kernel's zeroed pages), its bytes after it: making one calls no
+/// allocator and freeing it hands the pages back.
 pub(crate) struct Chunk {
+    region: Region,
     bytes: NonNull<u8>,
     cap: usize,
     published: AtomicU64,
@@ -63,7 +72,7 @@ pub(crate) struct Chunk {
 // SAFETY: a chunk's bytes are written only by its segment's one writer, at or past what it has
 // kept; others read only bytes a published place names or that were published (both with
 // release after the bytes were written), and those are never written again. The bytes are
-// freed only with the chunk.
+// freed only with the chunk's region.
 unsafe impl Send for Chunk {}
 // SAFETY: as for `Send`: through `&Chunk` other threads read only bytes a published place names
 // or that were published, never written again, and the atomics; the writer writes only through
@@ -72,11 +81,26 @@ unsafe impl Sync for Chunk {}
 
 impl Chunk {
     fn new(cap: usize, start: u64) -> ChunkRef {
-        let bytes: Box<[u8]> = vec![0; cap].into_boxed_slice();
-        let bytes = NonNull::new(Box::into_raw(bytes).cast::<u8>()).expect("a box is not null");
+        let whole = cap.checked_add(HEAD).unwrap_or_else(|| {
+            stop(MemError::TooLarge { tag: Tag::Store, what: "a segment chunk", wanted: cap })
+        });
+        let region = match Region::reserve(whole, Tag::Store) {
+            Ok(region) => region,
+            Err(error) => stop(error),
+        };
+        if let Err(error) = region.ensure(whole) {
+            stop(error)
+        }
+        let at = region.base().cast::<Chunk>();
+        let bytes = region.at(HEAD);
         track::write(bytes.as_ptr(), cap);
-        let chunk = Chunk { bytes, cap, published: AtomicU64::new(0), next: AtomicPtr::new(ptr::null_mut()), start };
-        ChunkRef(NonNull::from(Box::leak(Box::new(chunk))))
+        let chunk =
+            Chunk { region, bytes, cap, published: AtomicU64::new(0), next: AtomicPtr::new(ptr::null_mut()), start };
+        // SAFETY: the region's base is page-aligned and its first `HEAD` bytes, at least a
+        // `Chunk`, are committed (ensured above) and hold nothing yet. The chunk now owns the
+        // region it sits in, freed only by `ChunkRef::free`.
+        unsafe { at.write(chunk) };
+        ChunkRef(at)
     }
 
     pub(crate) fn cap(&self) -> u64 {
@@ -94,13 +118,13 @@ impl Chunk {
         if end > self.cap as u64 {
             return None;
         }
-        // SAFETY: `at + len <= cap` (checked above), so `at` is inside the allocation of `cap`
-        // bytes.
+        // SAFETY: `at + len <= cap` (checked above), so `at` is inside the `cap` committed bytes
+        // after the header.
         let start = unsafe { self.bytes.as_ptr().add(at as usize) };
         track::read(start, len as usize);
-        // SAFETY: the `len` bytes from `start` are inside the allocation, which lives as long as
-        // the chunk; bytes a place names or that were published are not written again (the
-        // caller's contract).
+        // SAFETY: the `len` bytes from `start` are committed bytes of the region, which lives as
+        // long as the chunk; bytes a place names or that were published are not written again
+        // (the caller's contract).
         Some(unsafe { std::slice::from_raw_parts(start, len as usize) })
     }
 
@@ -113,10 +137,10 @@ impl Chunk {
     unsafe fn write(&self, at: usize, data: &[u8]) {
         assert!(at + data.len() <= self.cap, "a write past its chunk");
         let from = data.as_ptr();
-        // SAFETY: `at + data.len() <= cap` (asserted above), so `at` is inside the allocation.
+        // SAFETY: `at + data.len() <= cap` (asserted above), so `at` is inside the bytes.
         let to = unsafe { self.bytes.as_ptr().add(at) };
         track::write(to, data.len());
-        // SAFETY: `to` has `data.len()` writable bytes in the allocation, which `data` (the
+        // SAFETY: `to` has `data.len()` writable committed bytes, which `data` (the
         // caller's own buffer) does not overlap, and no one else reads or writes them (the
         // caller's contract).
         unsafe { ptr::copy_nonoverlapping(from, to, data.len()) }
@@ -129,10 +153,10 @@ impl Chunk {
     /// As `write`.
     unsafe fn zero(&self, at: usize, len: usize) {
         assert!(at + len <= self.cap, "a write past its chunk");
-        // SAFETY: `at + len <= cap` (asserted above), so `at` is inside the allocation.
+        // SAFETY: `at + len <= cap` (asserted above), so `at` is inside the bytes.
         let to = unsafe { self.bytes.as_ptr().add(at) };
         track::write(to, len);
-        // SAFETY: `to` has `len` writable bytes in the allocation, and no one else reads or
+        // SAFETY: `to` has `len` writable committed bytes, and no one else reads or
         // writes them (the caller's contract, as in `write`).
         unsafe { ptr::write_bytes(to, 0, len) }
     }
@@ -159,9 +183,8 @@ impl Chunk {
 
 impl Drop for Chunk {
     fn drop(&mut self) {
+        // The region, unmapped once this returns, takes the bytes with it.
         track::free(self.bytes.as_ptr(), self.cap);
-        // SAFETY: made from a boxed slice of `cap` bytes in `Chunk::new`, freed only here.
-        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(self.bytes.as_ptr(), self.cap)) });
     }
 }
 
@@ -187,6 +210,30 @@ impl ChunkRef {
     pub(crate) unsafe fn get<'a>(self) -> &'a Chunk {
         // SAFETY: alive, by the caller's contract.
         unsafe { self.0.as_ref() }
+    }
+
+    /// Frees the chunk and the region it sits in.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns the chunk (unlinked, or its segment being dropped), and nothing reads it
+    /// any more nor frees it again.
+    unsafe fn free(self) {
+        // SAFETY: the chunk was written at its region's base by `Chunk::new` and is read out
+        // once, by its one owner: the copy owns the region, so dropping it unmaps the original.
+        drop(unsafe { self.0.read() });
+    }
+}
+
+/// A chunk unlinked from its segment, freed when this drops: what the store holds in its limbo
+/// until no reader can be in the chunk.
+pub(crate) struct Unlinked(ChunkRef);
+
+impl Drop for Unlinked {
+    fn drop(&mut self) {
+        // SAFETY: `Segment::unlink_first` made it the chunk's one owner, and the store drops it
+        // only once a grace begun after the unlink has passed.
+        unsafe { self.0.free() }
     }
 }
 
@@ -220,25 +267,25 @@ impl Segment {
 
     /// Unlinks its oldest chunk, `chunk`, which its writer has moved on from and no place names
     /// any more, for the caller to hold in its limbo. Only the store calls it.
-    pub(crate) fn unlink_first(&self, chunk: ChunkRef) -> Box<Chunk> {
+    pub(crate) fn unlink_first(&self, chunk: ChunkRef) -> Unlinked {
         assert_eq!(self.first(), chunk, "a segment's chunks are freed oldest first");
         // SAFETY: the first chunk, which only this call frees.
         let next = unsafe { chunk.get() }.next().expect("the chunk a writer writes is not freed");
         self.first.store(next.0.as_ptr(), Ordering::Release);
-        // SAFETY: a leaked box from `Chunk::new`, unlinked just now and owned by no one else
-        // (the segment's drop starts at `first`).
-        unsafe { Box::from_raw(chunk.0.as_ptr()) }
+        // Unlinked just now, so owned by no one else: the segment's drop starts at `first`.
+        Unlinked(chunk)
     }
 }
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        let mut at = *self.first.get_mut();
-        while !at.is_null() {
-            // SAFETY: the chunks from `first` on are this segment's leaked boxes, and nothing
-            // reads a segment being dropped: its writer and the store let go of it.
-            let chunk = unsafe { Box::from_raw(at) };
-            at = chunk.next.load(Ordering::Acquire);
+        let mut at = NonNull::new(*self.first.get_mut()).map(ChunkRef);
+        while let Some(chunk) = at {
+            // SAFETY: the chunks from `first` on are this segment's, and nothing reads a segment
+            // being dropped: its writer and the store let go of it.
+            at = unsafe { chunk.get() }.next();
+            // SAFETY: as above; its next was read just before.
+            unsafe { chunk.free() };
         }
     }
 }
@@ -293,6 +340,7 @@ pub(crate) struct Own {
 impl Own {
     pub(crate) fn new(number: u32) -> Own {
         let tail = Chunk::new(CHUNK, 0);
+        // alloc: one a writer, shared with the store for the writer's life
         let segment = Arc::new(Segment {
             number,
             first: AtomicPtr::new(tail.0.as_ptr()),
@@ -334,38 +382,43 @@ impl Own {
             content,
         };
         let won = if kind == Kind::Output && bytes.len() >= CHUNK_FROM {
-            let mut refs = Vec::new();
-            for range in chunk::chunks(bytes) {
-                let piece = &bytes[range];
-                let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
-                let kept = look.kept(&chunk);
-                let copy = kept.is_some_and(|(_, there)| {
-                    there.segment() != self.segment.number && !look.shared.durable(there)
-                });
-                if kept.is_none() || copy {
-                    let (form, stored) = match cold::lz4(piece) {
-                        Some(stored) => (Form::Lz4, stored),
-                        None => (Form::Raw, piece.to_vec()),
-                    };
-                    let header = RecordHeader {
-                        kind: Kind::Output,
-                        form,
-                        dictionary: 0,
-                        stored: stored.len() as u64,
-                        raw: piece.len() as u64,
-                        key: chunk,
-                        content: content_of(piece),
-                    };
-                    match copy {
-                        true => self.write_copy(Unit::SHARED, &header, &stored),
-                        // A chunk another put kept meanwhile is the same bytes: either is it.
-                        false => _ = self.claim(look, Unit::SHARED, header, &stored, ticket),
+            // The list of chunks and each chunk's LZ4 are made in the thread's reused buffers.
+            scratch::with_bytes(|payload| {
+                scratch::with_bytes(|packed| {
+                    for range in chunk::cuts(bytes) {
+                        let piece = &bytes[range];
+                        let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
+                        let kept = look.kept(&chunk);
+                        let copy = kept.is_some_and(|(_, there)| {
+                            there.segment() != self.segment.number && !look.shared.durable(there)
+                        });
+                        if kept.is_none() || copy {
+                            let (form, stored) = match cold::lz4_into(piece, packed) {
+                                true => (Form::Lz4, &packed[..]),
+                                false => (Form::Raw, piece),
+                            };
+                            let header = RecordHeader {
+                                kind: Kind::Output,
+                                form,
+                                dictionary: 0,
+                                stored: stored.len() as u64,
+                                raw: piece.len() as u64,
+                                key: chunk,
+                                content: content_of(piece),
+                            };
+                            match copy {
+                                true => self.write_copy(Unit::SHARED, &header, stored),
+                                // A chunk another put kept meanwhile is the same bytes: either
+                                // is it.
+                                false => _ = self.claim(look, Unit::SHARED, header, stored, ticket),
+                            }
+                        }
+                        disk::encode_chunk(payload, chunk, piece.len() as u64);
                     }
-                }
-                refs.push((chunk, piece.len() as u64));
-            }
-            let payload = disk::encode_chunks(&refs);
-            self.claim(look, unit, record(Form::Chunked, 0, &payload), &payload, ticket)
+                });
+                let payload = &payload[..];
+                self.claim(look, unit, record(Form::Chunked, 0, payload), payload, ticket)
+            })
         } else if !kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM {
             // Its bytes ride in the segment; the store writes them as the file at the commit.
             self.claim(look, unit, record(Form::External, 0, bytes), bytes, ticket)
@@ -420,7 +473,7 @@ impl Own {
         ticket: Ticket,
     ) -> Result<(), (ContentId, Ticket)> {
         let (seg, span) = self.write(unit, &header, payload, 0);
-        let spot = Box::new(Spot::new(header.key, header.content, Place::Segment(seg), ticket));
+        let spot = Spot::new(header.key, header.content, Place::Segment(seg), ticket);
         let delta = &look.view().tiers[0].delta;
         match delta.insert(look.held, spot) {
             Ok((row, _)) => {
@@ -516,7 +569,38 @@ mod tests {
         assert_eq!(it.published(), (0, 0));
         it.publish(4000, 3);
         assert_eq!(it.published(), (4000, 3));
-        // SAFETY: a leaked box no one else holds.
-        drop(unsafe { Box::from_raw(chunk.0.as_ptr()) });
+        // SAFETY: made here, no one else holds it.
+        unsafe { chunk.free() };
+    }
+
+    /// A chunk's bytes start zero, hold what is written past any commit step of its region, and
+    /// a chunk bigger than the usual takes the size asked for.
+    #[test]
+    #[cfg(not(blaze_check))]
+    fn a_chunk_reads_back_what_was_written_across_its_pages() {
+        let cap = 3 * CHUNK + 5;
+        let chunk = Chunk::new(cap, 7);
+        // SAFETY: made just now and freed below.
+        let it = unsafe { chunk.get() };
+        assert_eq!((it.cap(), it.start), (cap as u64, 7));
+        // SAFETY: nothing was published or placed: this test is its one writer and reader.
+        assert!(unsafe { it.bytes(0, cap as u64) }.unwrap().iter().all(|it| *it == 0));
+        let mut model = vec![0u8; cap];
+        for (n, at) in (0..cap).step_by(4093).enumerate() {
+            let data = [n as u8 | 1; 9];
+            let len = data.len().min(cap - at);
+            // SAFETY: as above.
+            unsafe { it.write(at, &data[..len]) };
+            model[at..at + len].copy_from_slice(&data[..len]);
+        }
+        // SAFETY: as above.
+        unsafe { it.zero(cap - 3, 3) };
+        model[cap - 3..].fill(0);
+        // SAFETY: as above.
+        assert_eq!(unsafe { it.bytes(0, cap as u64) }.unwrap(), &model[..]);
+        // SAFETY: as above.
+        assert!(unsafe { it.bytes(cap as u64 - 1, 2) }.is_none(), "past the chunk is none");
+        // SAFETY: made here, no one else holds it.
+        unsafe { chunk.free() };
     }
 }

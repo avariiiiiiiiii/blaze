@@ -39,21 +39,52 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
 - **Bytes per expression**: `expr_kind` (1) + `expr_data` (4) = **5 bytes**, `const` asserted
   \(\le 12\) in `hir/columns.rs`; the words each variant takes in `extra` are tabled in that
   module's doc. Patterns the same, 5 bytes. Type refs 5 bytes (`TypeColumns` in
-  `hir/type_ref.rs`) with `RefType`/`ArrayType`/`FnType`/`Path`/`TypeBound` in side tables. That
-  beats ZIR's 9 and Carbon's 12 in the hot columns, and rustc's 64 by 12x. The cost is decoding:
-  a `store.expr(e)` view is two loads, a `match` on the tag and, for multi-word variants, a read
-  of `extra`. ZIR pays the same for its payloads.
-- **Lists**: CSR ranges into one array per element type (`expr_lists`, `pat_lists`,
-  `statements`, `arms`, `record_fields`, `field_pats`, `type_lists`, and for types `lists` and
-  `bounds`), as ZIR's `extra` and Carbon's blocks.
+  `hir/type_ref.rs`) with `RefType`/`ArrayType`/`FnType` in side tables, and paths in columns of
+  their own (below). That beats ZIR's 9 and Carbon's 12 in the hot columns, and rustc's 64 by
+  12x. The cost is decoding: a `store.expr(e)` view is two loads, a `match` on the tag and, for
+  multi-word variants, a read of `extra`. ZIR pays the same for its payloads.
+- **Statements** are rows too: `stmt_kind` (1) + `stmt_data` (4) = **5 bytes**, asserted, with
+  a `let`'s 1 to 4 words in `extra` (Zig's trailing optionals). `foo();` takes 5 bytes,
+  `let x = e;` 13, `let x: T = e else { .. };` at most 21. A typical body goes from a 32-byte
+  `Statement` enum to about 9 bytes a statement, 3.5x fewer cache lines on every block walk. A
+  block's statements are a run of rows (`Statements<'a>`, a `Copy` handle in `Expr::Block`). A
+  local macro definition is a row and a `MacroDefId` in the `macro_defs` side table, where
+  before it was boxed twice. On disk the rows are copied as they are (schema 4), not a 20-byte
+  record per statement.
+- **Lists**: CSR ranges into one array per element type (`expr_lists`, `pat_lists`, `arms`,
+  `record_fields`, `field_pats`, `type_lists`, and for types `lists` and `bounds`), as ZIR's
+  `extra` and Carbon's blocks.
 - **Allocations per body**: lowering builds in per-thread pooled scratch columns, with children
   collected on a list stack (Zig AstGen's scratch pattern), so after a thread's first large body
-  it allocates **nothing per node**. `finish` copies each non-empty column into an exact
-  `Box<[T]>`: **one allocation per non-empty column** (about 8 to 20 per body), with no shrink
-  reallocation. That matches rustc's bump arena on count, and unlike it a body's store is freed
-  on its own when salsa evicts it. What still allocates per node: a `Path` with generic arguments
-  (`Box<NormalPath>` and its `GenericArgs`), fn-pointer types (`FnType`'s two boxes), byte-string
-  literals, `asm!` and `offset_of!`: all rare, cold side-table values.
+  it allocates **nothing per node**. `finish` copies the `Copy` columns (kinds, data words,
+  `extra`, id lists, statement rows, macro definitions) into **one slab together**
+  (`hir/col.rs`, `Col<T>`). Each cold side table that isn't empty (names, literals, arms, record
+  fields, and each of the path columns) gets one exact box, with no shrink reallocation. That is
+  8 to 20 allocations a body down to 1 plus the non-empty side tables (typically 3 or 4). Decode
+  uses the same slab. rustc's bump arena makes no allocation per body, but a body's store, unlike
+  rustc's arena, is freed on its own when salsa evicts it. What still allocates per node:
+  fn-pointer types (`FnType`'s two boxes), byte-string literals, `asm!` and `offset_of!`: all
+  rare, cold side-table values.
+- **Paths** (`expr_store/path.rs`, `PathColumns`): a path is a kind byte and a data word, 5
+  bytes; a `Normal` path adds 4 `extra` words and a 4-byte slot per segment, and a segment with
+  arguments a 20-byte row, 8 bytes an argument and 20 a binding. `Path<'a>` is a 16-byte `Copy`
+  view, so copying a path copies no heap. Lowering appends to the scratch store's columns and
+  allocates nothing per path, where before it allocated per `Normal` path, per segment-argument
+  list, per binding list and per `for<..>`/`use<..>` list, and every `.clone()` deep-copied them:
+
+  | path | before: bytes, allocations | after: bytes, allocations |
+  |---|---|---|
+  | `foo::bar` | 24, 0 | 21, 0 |
+  | `Vec<u8>` | 112, 3 | 69, 0 |
+  | `Iterator<Item = u32>` | 176, 3 | 89, 0 |
+  | `<T as Trait<U>>::Assoc` | 6 allocations (two deep `Path`s, the trait's args cloned) | one 20-byte row and 2 args, 0 |
+
+  Reading a `Normal` path's arguments is 4 dependent loads into dense columns that a body's paths
+  share (data word, `extra`, slot, row), against a pointer chase to a separate heap object per
+  level before. rustc's `hir::Path` arena-allocates its segments and a full `PathSegment` record
+  per segment; these columns take 4 bytes a segment beyond the interned `ModPath`, plus rows only
+  for segments with arguments. `TypeBound` is a 16-byte `Copy` record, its `for<..>` names and
+  `use<..>` arguments runs into shared columns.
 - **Hashes**: lowering hashes nothing per node. The forward source maps are pushed to and sorted
   once per body by `(file, start, end, kind)`, which is nearly sorted already because lowering is
   preorder. `store[e]` is still 0 hashes. An IDE lookup is a binary search
@@ -89,8 +120,8 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
 - **Scans**: `expr_ids()` / `pat_ids()` give a store's ids without decoding, for the id-only
   whole-store scans in `hir-ty-borrowck` (request in `v2/requests/db.md`).
 - **Paths no longer intern their `ModPath` a second time.** `ModPath` is a 16-byte `Copy` value
-  with interned segments (speed-hir-expand), and `Path::BarePath(ModPath)` holds it directly: one
-  intern probe per lowered path instead of two, and one pointer fewer on every read.
+  with interned segments (speed-hir-expand), held directly in the path columns: one intern probe
+  per lowered path instead of two, and one pointer fewer on every read.
 
 ## Still short, and what it takes
 
@@ -98,12 +129,20 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   the other signatures lower from the file's AST with absolute pointers, so any edit re-runs them
   and they backdate. Making signatures relative to an anchor, as bodies are, removes that
   (`signatures.rs`, speed-hir-defs).
-- **`Option<Idx>` is 8 bytes.** `la_arena::Idx` has no niche, so `Statement` stays 32 bytes,
-  `MatchArm` 16 and `RefType` 16. A raw index that can't be `u32::MAX` (a `NonMaxU32`-style
-  niche) makes them 20/12/12 with no API change. That needs `la-arena` vendored (root
+- **`Option<Idx>` is 8 bytes.** `la_arena::Idx` has no niche, so `MatchArm` stays 16 bytes
+  and `RefType` 16 (statements are rows since 2026-10-29: 5 bytes plus a `let`'s words). A raw
+  index that can't be `u32::MAX` (a `NonMaxU32`-style niche) makes them 12/12 with no API
+  change. That needs `la-arena` vendored (root
   `Cargo.toml`, coordinator).
-- **Paths.** A `Path` is a 24-byte owned value in a side table, and its generic arguments are
-  boxed. Making it columns means `Path`'s methods take the store, which changes
-  `segments()`/`generic_args()` at every resolver and `hir-ty` caller. That is the next round,
-  not this one.
+- **Path columns are not in the slab.** `PathColumns` freezes to one exact box per non-empty
+  column (3 for a store of bare paths only, up to 12), because lowering reads paths back through
+  the same `&PathColumns` views that read a frozen store, and a slab needs the growing and frozen
+  columns to be different types. If it shows in a profile, lowering reads the builder's paths
+  through non-view accessors (4 call sites) and `PathColumns` becomes generic over `ColumnVec`,
+  as `HirColumns` is (`expr_store/path.rs`).
+- **Fn-pointer types** still box `FnType`'s `binder` and `params` per type (`hir/type_ref.rs`).
+  Moving them to runs in the type columns changes every `&FnType` reader.
+- **Decode borrows nothing from the pack.** A store read from the signature image copies its
+  `Copy` columns into a fresh slab. To borrow them in place, `deps/signatures.rs` must name the
+  image owner type and pass an `Arc` of it to `read` (`v2/requests/speed-hir-store.md`).
 - **Bindings and labels** keep their arenas (16 and 8 bytes, flat records, no per-node heap).

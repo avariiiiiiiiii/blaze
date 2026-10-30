@@ -61,28 +61,17 @@ fn sort_by_key_then<T>(items: &mut [T], key: impl Fn(&T) -> u64, cmp: impl Fn(&T
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A splitmix64 stream: seeded, so a failure reproduces.
-    fn stream(seed: u64) -> impl FnMut() -> u64 {
-        let mut state = seed;
-        move || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-    }
+    use crate::rng::SplitMix64;
 
     /// `n` names over few bytes and lengths around 8, so that many share an order key and
     /// many are equal, each with its place in the input to check stability.
     fn names(seed: u64, n: usize) -> Vec<(Vec<u8>, usize)> {
-        let mut next = stream(seed);
+        let mut rng = SplitMix64::new(seed);
         let alphabet = [0u8, b'a', b'b', 0x7f, 0xff];
         (0..n)
             .map(|at| {
-                let len = (next() % 13) as usize;
-                ((0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect(), at)
+                let len = rng.index(13);
+                ((0..len).map(|_| alphabet[rng.index(alphabet.len())]).collect(), at)
             })
             .collect()
     }

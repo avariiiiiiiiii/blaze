@@ -109,6 +109,7 @@ pub(super) fn cfg_predicate(p: &mut Parser<'_>) {
             T!['('],
             T![')'],
             T![,],
+            // alloc: error path only; the parser's error table holds `String`s
             || "expected a cfg predicate".to_owned(),
             CFG_PREDICATE_FIRST_SET,
             |p| {

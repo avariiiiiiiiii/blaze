@@ -99,6 +99,37 @@ fn drain_agrees_with_a_byte_at_a_time() {
     }
 }
 
+/// The engine's work per run, for an input that reaches nothing new (nearly every run): pick
+/// two corpus inputs, mutate into the reused buffer, clear, run, drain and merge. It allocates
+/// nothing. `blaze_fuzz`'s counting allocator is this binary's global one (it can't also have
+/// `blaze-alloc-count`'s), and its largest allocation is 0 exactly when nothing was allocated.
+#[test]
+fn a_run_that_keeps_nothing_allocates_nothing() {
+    let mut counters = vec![0u8; 300];
+    let coverage = Coverage::of(&mut counters, &[]);
+    let mut seen = Seen::new((coverage.total() << 3) + raw::VALUE_BITS);
+    let mut corpus = Corpus::new().unwrap();
+    corpus.add(b"header 1234 MAGIC tail", 1).unwrap();
+    corpus.add(b"another input to splice", 3).unwrap();
+    let dictionary: &[&[u8]] = &[b"WORD", b"\xff\xff\xff\xff"];
+    let mut mutator = Mutator::new(2, dictionary, OneRecent);
+    let mut features = Vec::with_capacity(coverage.total() + raw::VALUE_BITS);
+    let mut data = Vec::with_capacity(64);
+    for run in 0..10_000 {
+        let (largest, ()) = blaze_fuzz::largest_allocation(|| {
+            data.clear();
+            data.extend_from_slice(corpus.pick(&mut mutator.random));
+            let other = corpus.pick(&mut mutator.random);
+            mutator.mutate(&mut data, other, 64);
+            features.clear();
+            assert!(coverage.run(|_| {}, &data, 0));
+            coverage.drain(&mut features, true);
+            seen.merge(&features);
+        });
+        assert_eq!(largest, 0, "run {run} allocated (largest {largest} bytes)");
+    }
+}
+
 #[test]
 fn run_clears_whole_lines_and_the_tail() {
     for len in [0usize, 5, 64, 70, 130] {
@@ -230,10 +261,10 @@ fn hex_round_trips_and_refuses_what_is_not() {
 
 #[test]
 fn the_corpus_picks_every_input_and_favors_the_new() {
-    let mut corpus = Corpus::default();
-    corpus.add(b"a".to_vec(), 1);
-    corpus.add(b"b".to_vec(), 1);
-    corpus.add(b"c".to_vec(), 10);
+    let mut corpus = Corpus::new().unwrap();
+    corpus.add(b"a", 1).unwrap();
+    corpus.add(b"b", 1).unwrap();
+    corpus.add(b"c", 10).unwrap();
     let mut random = Random::new(9);
     let mut counts = [0usize; 3];
     for _ in 0..10_000 {
@@ -273,9 +304,36 @@ fn kept_files_appear_whole_and_listings_skip_the_partial() {
     let path = corpus::write(&dir, "", b"input").unwrap();
     std::fs::write(dir.join(".1234-being-written.hex"), "00").unwrap();
     let names = corpus::names(&dir).unwrap();
-    assert_eq!(names, vec![corpus::file_name("", b"input")]);
+    assert_eq!(names, vec![std::ffi::OsString::from(format!("{:016x}.hex", corpus::hash(b"input")))]);
     assert_eq!(path, dir.join(&names[0]));
+    assert_eq!(corpus::key(&names[0]), corpus::hash(b"input"));
+    assert_eq!(corpus::key("other.hex".as_ref()), corpus::hash(b"other.hex"));
     assert_eq!(corpus::read_dir(&dir).unwrap(), vec![b"input".to_vec()]);
     assert_eq!(corpus::names(&dir.join("missing")).unwrap(), Vec::<std::ffi::OsString>::new());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Keeping an input (the rare run that reaches something new) copies it into the corpus's
+/// reserved regions and writes its file from reused scratch: no general-purpose allocation
+/// once the scratch has grown to the longest input.
+#[test]
+fn keeping_an_input_allocates_nothing() {
+    let dir = std::env::temp_dir().join(format!("blaze-fuzzer-keep-{}", std::process::id()));
+    _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut corpus = Corpus::new().unwrap();
+    let mut scratch = corpus::Scratch::default();
+    let mut input = vec![0u8; 200];
+    scratch.write(&dir, "", &input).unwrap();
+    for keep in 0..100u8 {
+        input[0] = keep;
+        let (largest, ()) = blaze_fuzz::largest_allocation(|| {
+            corpus.add(&input, 1).unwrap();
+            scratch.write(&dir, "", &input).unwrap();
+        });
+        assert_eq!(largest, 0, "keep {keep} allocated (largest {largest} bytes)");
+    }
+    assert_eq!((corpus.len(), corpus.bytes(), corpus.last()), (100, 20_000, &input[..]));
+    assert_eq!(corpus::read(&dir.join(format!("{:016x}.hex", corpus::hash(&input)))).unwrap(), input);
     std::fs::remove_dir_all(&dir).unwrap();
 }

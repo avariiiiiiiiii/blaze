@@ -30,7 +30,6 @@ pub(crate) struct Checked {
 impl Checked {
     /// The sources of the fixture's files, by the names diagnostics give them.
     pub(crate) fn sources(&self) -> Sources {
-        use base_db::SourceDatabase as _;
         let files = self.names.iter().map(|(file, name)| {
             (name.clone(), self.db.file_text(*file).text(&self.db).to_owned())
         });
@@ -80,7 +79,7 @@ pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Ch
         .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
         .collect();
     let diags = hir::attach_db(&db, || {
-        let sema = Semantics::new_dyn(&db);
+        let sema = Semantics::new(&db);
         hir::check::workspace_crates(&db)
             .into_iter()
             .flat_map(|krate| crate::check::check_crate_with(&sema, krate, &names, options))
@@ -137,10 +136,10 @@ pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
     args.extend(["-A", "internal_features", "-A", "incomplete_features"]);
     args.extend(["-A", "unused_parens", "-A", "unused_braces"]);
     let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    let mut lints = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's");
-    lints.opts.extend(options.lints.opts.iter().cloned());
-    lints.cap = options.lints.cap;
-    lints.check_cfg = options.lints.check_cfg.clone();
+    let mut opts = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's").opts;
+    let mut lints = options.lints.clone();
+    opts.append(&mut lints.opts);
+    lints.opts = opts;
     Options { lints, keep_duplicates: true }
 }
 

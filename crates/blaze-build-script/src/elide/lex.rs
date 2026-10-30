@@ -21,6 +21,8 @@
 
 use std::borrow::Cow;
 
+use blaze_mem::Frame;
+
 /// What a token is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind<'a> {
@@ -122,12 +124,22 @@ pub struct Unlexed {
 }
 
 /// The source as rustc lexes it: without a leading byte order mark, `\r\n` as `\n`.
-pub fn normalize(source: &str) -> Cow<'_, str> {
+/// Borrowed when it has no `\r\n`; else copied once into `frame`.
+pub fn normalize<'a>(source: &'a str, frame: &'a Frame) -> &'a str {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-    match memchr::memmem::find(source.as_bytes(), b"\r\n") {
-        Some(_) => Cow::Owned(source.replace("\r\n", "\n")),
-        None => Cow::Borrowed(source),
+    let bytes = source.as_bytes();
+    let mut crlf = memchr::memmem::find_iter(bytes, b"\r\n").peekable();
+    if crlf.peek().is_none() {
+        return source;
     }
+    let mut out = Vec::with_capacity_in(bytes.len(), frame);
+    let mut copied = 0;
+    for at in crlf {
+        out.extend_from_slice(&bytes[copied..at]);
+        copied = at + 1;
+    }
+    out.extend_from_slice(&bytes[copied..]);
+    std::str::from_utf8(out.leak()).expect("dropping a \\r before each \\n leaves UTF-8 as UTF-8")
 }
 
 /// A byte's classes, as bits of [`CLASS`].

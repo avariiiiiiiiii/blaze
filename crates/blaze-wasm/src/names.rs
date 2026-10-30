@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
 use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
 use hir_ty_codegen::{SymbolResolver, exported_symbol, link_name};
-use ide_db::{RootDatabase, base_db::SourceDatabase as _};
+use ide_db::RootDatabase;
 use syntax::{AstNode, SyntaxNode, ast, ast::HasName, match_ast};
 use vfs::FileId;
 
@@ -98,7 +98,7 @@ impl Resolver<'_> {
     /// which for a package with tests and examples analyses all its dev-dependencies.
     fn function_at(
         &self,
-        sema: &hir::Semantics<'_, RootDatabase>,
+        sema: &hir::Semantics<'_>,
         scope: Module,
         func: &ast::Fn,
     ) -> Option<hir::Function> {
@@ -461,7 +461,7 @@ fn is_definition(node: &SyntaxNode) -> bool {
 /// of, in the order rustc comes across them. This is how rustc tells apart the closures
 /// of a function, and the statics of one name that a macro used twice in it declares.
 fn place_in_definition(
-    sema: &hir::Semantics<'_, RootDatabase>,
+    sema: &hir::Semantics<'_>,
     target: &SyntaxNode,
     counts: &dyn Fn(&SyntaxNode) -> bool,
 ) -> Option<u32> {
@@ -478,7 +478,7 @@ fn place_in_definition(
 }
 
 struct Place<'a, 'db> {
-    sema: &'a hir::Semantics<'db, RootDatabase>,
+    sema: &'a hir::Semantics<'db>,
     target: &'a SyntaxNode,
     counts: &'a dyn Fn(&SyntaxNode) -> bool,
     earlier: &'a mut u32,
@@ -525,7 +525,7 @@ impl Place<'_, '_> {
 
 /// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
 /// definition it is written in, a closure's own closures being counted apart.
-fn closure_number(sema: &hir::Semantics<'_, RootDatabase>, closure: &SyntaxNode) -> Option<u32> {
+fn closure_number(sema: &hir::Semantics<'_>, closure: &SyntaxNode) -> Option<u32> {
     place_in_definition(sema, closure, &is_closure)
 }
 

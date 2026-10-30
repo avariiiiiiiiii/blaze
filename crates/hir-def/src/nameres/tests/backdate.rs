@@ -1,10 +1,10 @@
 //! An edit that changes no name, visibility or import of a crate leaves its `DefMap` equal (the
 //! same frozen bytes), so the def maps of the crates that depend on it are not run again.
 
-use base_db::{Crate, SourceDatabase, all_crates};
+use base_db::{Crate, all_crates};
 use test_fixture::WithFixture;
 
-use crate::nameres::{crate_def_map, frozen, tests::TestDB};
+use crate::nameres::{crate_def_map, frozen, tests::{TestDB, TestDBExt}};
 
 const LIB: &str = r#"
 pub struct Fields { pub a: u8 }
@@ -38,7 +38,7 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 
 /// How many times `crate_local_def_map` ran while `f` did.
 fn def_maps_run(db: &TestDB, f: impl FnOnce()) -> usize {
-    db.log_executed(f).iter().filter(|it| it.contains("crate_local_def_map")).count()
+    db.executed_in_read_order(f).iter().filter(|it| it.contains("crate_local_def_map")).count()
 }
 
 struct Edited {

@@ -17,7 +17,7 @@ use crate::{
     mir_pretty::{MirEvalErrorPretty as _, MirLowerErrorPretty as _},
     next_solver::{Allocation, GenericArgs},
     setup_tracing,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 use crate::{
@@ -3167,7 +3167,7 @@ fn const_trait_assoc() {
         };
     }
     //- /main.rs crate:main deps:a
-    use a::{S};
+    use a::S;
     trait Tr {
         type Ty;
     }

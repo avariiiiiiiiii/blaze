@@ -16,7 +16,14 @@ doctest = false
 [dependencies]
 blake3.workspace = true
 blaze-radix.workspace = true
+blaze-mem.workspace = true
 serde = { workspace = true, features = ["derive"] }
+smallvec.workspace = true
+thin-vec.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+proptest.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

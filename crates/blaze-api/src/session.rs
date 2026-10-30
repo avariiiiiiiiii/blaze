@@ -21,16 +21,20 @@ mod intent;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use blaze_core::Conn;
 use rustc_hash::FxHashMap;
 use blaze_ids::{ContentId, radix};
+use blaze_mem::{
+    Tag,
+    tag::{Rate, Snapshot},
+};
 use blaze_query::QueryKey;
 use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
 
 use crate::{
-    ApiError, Arrived, Reply, Request, RequestRef, Response, Status, ViewRef,
+    ApiError, Arrived, Memory, Reply, Request, RequestRef, Response, Status, TagMemory, ViewRef,
     build::{Builder, JobId, Opened, Work},
     session::{best_of::BestOf, intent::Intents},
 };
@@ -44,6 +48,9 @@ pub struct Daemon<'a> {
     pub pid: u32,
     pub memory_bytes: u64,
     pub budget_bytes: u64,
+    /// blaze-mem's counters as they are now, for [`Response::Memory`]:
+    /// `blaze_mem::tag::snapshot` in the daemon, read only when asked.
+    pub memory: fn() -> Snapshot,
 }
 
 /// The requests under way, the views each connection holds, and the jobs of the build.
@@ -56,10 +63,10 @@ pub struct Session {
     /// Every request not yet over, by the session's own number for it; a gone connection's
     /// stay until their jobs finish.
     pending: FxHashMap<u64, Pending>,
-    /// The number of each request of a live connection not yet over, ordered so a gone
-    /// connection's are one range.
-    // BTreeMap: range queries by connection.
-    live: BTreeMap<RequestRef, u64>,
+    /// The number of each request of a live connection not yet over. A gone connection's are
+    /// found by a walk and put in order of id; a request's begin and end touch one slot and
+    /// allocate nothing.
+    live: FxHashMap<RequestRef, u64>,
     /// Each job's request, and its candidate for a best-of-N.
     jobs: FxHashMap<JobId, (u64, Option<u32>)>,
     /// Commits waiting to be durable.
@@ -71,6 +78,10 @@ pub struct Session {
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
     intents: Intents,
+    /// The clock as [`Session::tick`] last gave it.
+    now_ns: u64,
+    /// Each subsystem's allocation rate since the last [`Request::Memory`].
+    rate: Rate,
 }
 
 /// How many roots' last builds [`Session`] keeps for [`Request::Why`].
@@ -157,19 +168,47 @@ impl Session {
             next_job: 0,
             next_serial: 0,
             pending: FxHashMap::default(),
-            live: BTreeMap::new(),
+            live: FxHashMap::default(),
             jobs: FxHashMap::default(),
             tickets: FxHashMap::default(),
             held: FxHashMap::default(),
             kept: VecDeque::new(),
             intents: Intents::default(),
+            now_ns: 0,
+            rate: Rate::new(),
         }
     }
 
     /// The daemon's monotonic clock is `now_ns`: the intents whose wait it passed are
     /// cancelled.
     pub fn tick(&mut self, cx: &mut Daemon<'_>, now_ns: u64) {
+        self.now_ns = now_ns;
         self.intents.tick(cx.builder, now_ns);
+    }
+
+    /// `snapshot` as [`Response::Memory`] gives it, each tag's rate since the last.
+    fn memory(&mut self, snapshot: Snapshot) -> Memory {
+        let rates = self.rate.sample(self.now_ns, &snapshot);
+        let tags = Tag::ALL
+            .into_iter()
+            .map(|tag| {
+                let it = snapshot.get(tag);
+                TagMemory {
+                    tag: tag.name().to_owned(),
+                    live: it.live,
+                    rate: rates[tag.index()],
+                    budget: it.budget,
+                    allocated: it.allocated,
+                    task_peak: it.task_peak,
+                    high_water: it.high_water,
+                }
+            })
+            .collect();
+        Memory {
+            tags,
+            committed: snapshot.committed,
+            committed_high_water: snapshot.committed_high_water,
+        }
     }
 
     /// When [`Session::tick`] next has something to do, on the clock it is given.
@@ -608,6 +647,10 @@ impl Session {
                 };
                 answer(out, req, Response::Status(status));
             }
+            Request::Memory => {
+                let memory = self.memory((cx.memory)());
+                answer(out, req, Response::Memory(memory));
+            }
             Request::Open { view } => {
                 let root = resolve(cx.vfs, &view)?;
                 let files = cx.vfs.open(View { root }).map_err(|error| open_error(root, &error))?;
@@ -735,11 +778,14 @@ impl Session {
     }
 
     fn gone(&mut self, cx: &mut Daemon<'_>, conn: Conn) {
-        let requests: Vec<(RequestRef, u64)> = self
+        // alloc: once per connection's end, not per request.
+        let mut requests: Vec<(RequestRef, u64)> = self
             .live
-            .range(RequestRef { conn, id: 0 }..=RequestRef { conn, id: u64::MAX })
+            .iter()
+            .filter(|(req, _)| req.conn == conn)
             .map(|(req, serial)| (*req, *serial))
             .collect();
+        radix::sort_copy_by_key(&mut requests, |it| it.0.id);
         for (req, serial) in requests {
             self.live.remove(&req);
             let pending = self.pending.get_mut(&serial).expect("a live request is pending");

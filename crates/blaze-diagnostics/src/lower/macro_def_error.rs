@@ -37,7 +37,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroDefError) -> Vec<Found> {
     let range = d.name.unwrap_or_else(|| item_range(node.value.syntax()));
     let span = cx.span(InFile::new(d.node.file_id, range));
     let message = format!("blaze can't define this macro: {}", d.message);
-    vec![Found::new(Diag::error(None, message, span), Phase::Resolve)]
+    vec![Found::new(Diag::error(None, message, span), Phase::Expand)]
 }
 
 /// rustc's errors on the definition of `mac`, in the order rustc gives them. Empty, and nothing
@@ -47,7 +47,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, mac: InFile<&ast::Macro>) -> Vec<Found> {
     let Some(body) = rules.token_tree() else { return Vec::new() };
     let mut checker = Checker { cx, file: mac.file_id, errors: Vec::new(), binders: SmallVec::new() };
     checker.definition(&body, item_range(rules.syntax()));
-    checker.errors.into_iter().map(|it| Found::new(it, Phase::Resolve)).collect()
+    checker.errors.into_iter().map(|it| Found::new(it, Phase::Expand)).collect()
 }
 
 /// A token tree of rustc's `tokenstream`: a token, or a delimited group.

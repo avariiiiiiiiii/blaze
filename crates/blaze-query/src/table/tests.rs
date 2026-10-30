@@ -112,7 +112,7 @@ fn a_retired_row_is_reused_only_after_its_grace() {
 }
 
 #[test]
-fn rows_are_chunked_by_index_and_never_move() {
+fn rows_are_one_region_by_index_and_never_move() {
     let rows: Rows<u64> = Rows::new();
     let ids = Ids::new();
     let mut free = Free::default();
@@ -126,10 +126,25 @@ fn rows_are_chunked_by_index_and_never_move() {
     let first = unsafe { rows.get(0) } as *const u64;
     for &row in &claimed {
         // SAFETY: as above.
-        assert_eq!(unsafe { *rows.get(row) }, u64::from(row) * 3);
+        let at = unsafe { rows.get(row) };
+        assert_eq!(*at, u64::from(row) * 3);
+        assert_eq!(at as *const u64, first.wrapping_add(row as usize), "row {row} is base + index");
     }
     // SAFETY: as above.
     assert_eq!(unsafe { rows.get(0) } as *const u64, first, "growing never moved row 0");
+}
+
+/// A table read at numbers nobody claimed (the kinds) finds what was written and nothing else.
+#[test]
+fn a_row_never_written_reads_as_none() {
+    let rows: Rows<u64> = Rows::sized(1 << 16);
+    // SAFETY: no reader yet; the row holds no value.
+    unsafe { rows.put(0x2f0c, 7) };
+    // SAFETY: written above by this thread and never dropped.
+    let read = |row| unsafe { rows.written(row) }.copied();
+    assert_eq!(read(0x2f0c), Some(7));
+    assert_eq!(read(0x2f0b), None, "below the row written");
+    assert_eq!(read(0xfff0), None, "past the row written");
 }
 
 #[test]
@@ -233,4 +248,20 @@ fn a_column_publishes_takes_and_restores_by_index() {
     column.restore(next, values, |value| value.rsplit(':').next().and_then(|it| it.parse().ok()).expect("an index"));
     assert_eq!(column.values_mut().count(), 399);
     assert_eq!(column.push(|index| index.to_string()), 400);
+}
+
+/// A lookup, hit or miss, allocates nothing.
+#[test]
+fn a_map_lookup_allocates_nothing() {
+    let map: Map<u64> = Map::new();
+    let task = blaze_reclaim::enter();
+    for n in 0..256 {
+        map.insert(&task, key(n), n);
+    }
+    let found = blaze_alloc_count::assert_at_most(0, "a map lookup", || {
+        (0..512).filter(|&n| map.get(&task, &key(n)) == Some(&n)).count()
+    });
+    assert_eq!(found, 256);
+    drop(task);
+    freed(&map);
 }

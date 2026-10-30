@@ -31,8 +31,6 @@ use wasm_encoder::Encode;
 use super::Spliced;
 
 const PAGE: u32 = 1 << 16;
-/// What the linker leaves room for where an index or an address goes.
-const PADDED: usize = 5;
 const FUNCREF: u8 = 0x70;
 
 /// The ids of the sections that are read or written again.
@@ -645,11 +643,11 @@ impl<'a> Placed<'a> {
             }
             TableIndexSleb | MemoryAddrSleb => {
                 let place = place.first_chunk_mut().context("a relocation at the end")?;
-                *place = padded(value as i32 as i64, true);
+                *place = blaze_format::leb::padded_i32(value as i32);
             }
             _ => {
                 let place = place.first_chunk_mut().context("a relocation at the end")?;
-                *place = padded(value, false);
+                *place = blaze_format::leb::padded_u32(value as u32);
             }
         }
         Ok(())
@@ -787,15 +785,4 @@ fn value_type(ty: ValType) -> u8 {
         ValType::Ref(ty) if ty.is_extern_ref() => 0x6f,
         ValType::Ref(_) => 0x70,
     }
-}
-
-/// A number in the five bytes the linker leaves for it.
-fn padded(mut value: i64, signed: bool) -> [u8; PADDED] {
-    let mut bytes = [0x80; PADDED];
-    for byte in &mut bytes {
-        *byte |= (value & 0x7f) as u8;
-        value >>= 7;
-    }
-    bytes[PADDED - 1] &= if signed { 0x7f } else { 0x0f };
-    bytes
 }

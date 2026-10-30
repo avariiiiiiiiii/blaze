@@ -325,6 +325,15 @@ impl<L: Language> SyntaxNode<L> {
     pub fn clone_subtree(&self) -> SyntaxNode<L> {
         SyntaxNode::from(self.raw.clone_subtree())
     }
+
+    /// [`SyntaxNode::clone_subtree`] with the nodes `elided` (under this one, in order and
+    /// disjoint) each replaced by an empty node of its kind: the copy's text and elements as
+    /// `replace_subtree` of each in turn with an empty node, over the text without theirs,
+    /// would make them, without copying the elided nodes first. They must be in this node's
+    /// flat tree (its part's, for a lazy node).
+    pub fn clone_subtree_without(&self, elided: &[SyntaxNode<L>]) -> SyntaxNode<L> {
+        SyntaxNode::from(self.raw.clone_subtree_without(elided.iter().map(|it| &it.raw)))
+    }
 }
 
 impl<L: Language> SyntaxToken<L> {

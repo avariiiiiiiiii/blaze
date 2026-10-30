@@ -31,6 +31,7 @@ mod scalar;
 
 use std::fmt;
 
+use base_db::Db;
 use either::Either;
 use hir::InFile;
 use hir_def::{
@@ -336,7 +337,7 @@ struct Scratch<'db> {
 /// rustc's `ConstPropagator` over one body.
 struct Propagator<'a, 'b, 'db> {
     b: &'a BodyCx<'b, 'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: &'a Owner<'db>,
     body: &'db MirBody<'db>,
     s: &'a mut Scratch<'db>,
@@ -1040,7 +1041,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
 }
 
 /// The name of `param` when it is marked `#[rustc_panics_when_zero]`.
-fn panics_when_zero(db: &dyn HirDatabase, param: ConstParamId) -> Option<String> {
+fn panics_when_zero(db: &Db, param: ConstParamId) -> Option<String> {
     let sources = param.parent().child_source(db);
     let Either::Left(ast::TypeOrConstParam::Const(node)) = sources.value.get(param.local_id())? else { return None };
     let marked = node.attrs().any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "rustc_panics_when_zero"));

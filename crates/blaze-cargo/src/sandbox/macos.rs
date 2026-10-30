@@ -45,13 +45,14 @@
 //! ends is an `X` line too.
 
 use std::{
-    collections::HashSet,
     ffi::{CString, OsString},
+    fmt::Write as _,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
 use blaze_usercode::trace::Seen;
+use rustc_hash::FxHashSet;
 
 use super::{Also, Recorder, Spec, tidy};
 
@@ -63,6 +64,9 @@ const OURS: [&str; 4] =
 /// The library every process of a run loads, built from `macos_interpose.c` by `build.rs`.
 const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blaze_sandbox.dylib"));
 
+// SAFETY: libsystem_sandbox's `int sandbox_init_with_parameters(const char *profile, uint64_t
+// flags, const char *const parameters[], char **errorbuf)`, as `sandbox-exec` calls it; a
+// declaration that differs would have every call pass its arguments wrongly.
 unsafe extern "C" {
     // libsystem_sandbox, part of libSystem: what `sandbox-exec` does, without a process of
     // its own to run.
@@ -114,10 +118,15 @@ const RESOLVER_SERVICE: &str = "(global-name \"com.apple.dnssd.service\")";
 /// no quoting. No terminal is written by name: what the program prints goes to the
 /// descriptors it was given, which no rule checks again.
 fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String {
-    let dirs: String = (0..writes).map(|at| format!(" (subpath (param \"WRITE{at}\"))")).collect();
-    let files: String = (0..lives).map(|at| format!(" (literal (param \"LIVE{at}\"))")).collect();
-    let mut text = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
-    text.push_str(&format!("(allow file-write*{dirs}{files}\n"));
+    let mut text = String::with_capacity(4096 + 256 * (writes + lives + sockets));
+    text.push_str("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
+    for at in 0..writes {
+        _ = write!(text, " (subpath (param \"WRITE{at}\"))");
+    }
+    for at in 0..lives {
+        _ = write!(text, " (literal (param \"LIVE{at}\"))");
+    }
+    text.push('\n');
     text.push_str(
         "  (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\")
   (literal \"/dev/urandom\") (literal \"/dev/dtracehelper\") (literal \"/dev/stdout\")
@@ -142,12 +151,12 @@ fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String
     });
     // A socket's form takes one path: a rule each (two `subpath`s in one keep the first).
     for at in 0..writes {
-        let dir = format!("(subpath (param \"WRITE{at}\"))");
-        text.push_str(&format!("(allow network-bind network-inbound (local unix-socket {dir}))\n"));
-        text.push_str(&format!("(allow network-outbound (remote unix-socket {dir}))\n"));
+        let dir = Writable(at);
+        _ = writeln!(text, "(allow network-bind network-inbound (local unix-socket {dir}))");
+        _ = writeln!(text, "(allow network-outbound (remote unix-socket {dir}))");
     }
     for at in 0..sockets {
-        text.push_str(&format!("(allow network-outbound (remote unix-socket (path-literal (param \"SOCKET{at}\"))))\n"));
+        _ = writeln!(text, "(allow network-outbound (remote unix-socket (path-literal (param \"SOCKET{at}\"))))");
     }
     text.push_str("(deny mach-lookup)\n(allow mach-lookup");
     for service in MACH_SERVICES.iter().chain(network.then_some(&RESOLVER_SERVICE)) {
@@ -158,6 +167,15 @@ fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String
     text
 }
 
+/// The writable directory of the profile's parameter `WRITE<n>`, as a rule's path.
+struct Writable(usize);
+
+impl std::fmt::Display for Writable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "(subpath (param \"WRITE{}\"))", self.0)
+    }
+}
+
 /// The program's environment from `given` as it is, without `TMPDIR` (the run's own is given)
 /// and the library's variables ([`OURS`]). A name or a value with a nul in it can't be in one.
 fn program_env(given: &[(OsString, OsString)]) -> Result<Vec<CString>, String> {
@@ -166,10 +184,13 @@ fn program_env(given: &[(OsString, OsString)]) -> Result<Vec<CString>, String> {
         if name == "TMPDIR" || OURS.iter().any(|it| name == it) {
             continue;
         }
-        let mut entry = name.as_bytes().to_vec();
+        // Once per run, the program's environment for the kernel.
+        let mut entry = Vec::with_capacity(name.len() + 1 + value.len() + 1);
+        entry.extend_from_slice(name.as_bytes());
         entry.push(b'=');
         entry.extend_from_slice(value.as_bytes());
         env.push(CString::new(entry).map_err(|_| {
+            // alloc: the error, once, and no sandbox is made.
             format!("the variable {:?} has a nul in it", name.to_string_lossy())
         })?);
     }
@@ -177,6 +198,7 @@ fn program_env(given: &[(OsString, OsString)]) -> Result<Vec<CString>, String> {
 }
 
 fn os(what: &str) -> String {
+    // alloc: the error, once, and the sandbox or the run stops.
     format!("{what}: {}", std::io::Error::last_os_error())
 }
 
@@ -187,13 +209,17 @@ fn c(bytes: &[u8]) -> CString {
 /// The ways a directory is spelled: as given, and as the file system resolves it (`/tmp` is
 /// `/private/tmp`), which is what a program that resolved it names.
 fn spellings(dir: &Path) -> Vec<String> {
-    let mut out = vec![tidy(dir)];
+    // Once per directory of the run, as it is set up.
+    let mut out = Vec::with_capacity(4);
+    out.push(tidy(dir));
     if let Ok(real) = std::fs::canonicalize(dir) {
         out.push(tidy(&real));
     }
-    for it in out.clone() {
-        if let Some(rest) = it.strip_prefix("/private").filter(|rest| rest.starts_with('/')) {
-            out.push(rest.to_owned());
+    for at in 0..out.len() {
+        if let Some(rest) = out[at].strip_prefix("/private").filter(|rest| rest.starts_with('/')) {
+            // alloc: as above.
+            let rest = rest.to_owned();
+            out.push(rest);
         }
     }
     out.sort();
@@ -206,8 +232,11 @@ fn spellings(dir: &Path) -> Vec<String> {
 /// is what `getattrlist` says of it, from which `realpath` builds the path, so one named
 /// otherwise (`up/0`) turned `/w/flags/target` into `/w/0/target`, which is not there.
 fn stand_in(parent: &Path, dir: &Path) -> Result<PathBuf, String> {
+    // alloc: once per directory stood in for, as the run is set up.
     let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_owned());
+    // alloc: as above.
     let made = real.file_name().map_or_else(|| parent.to_owned(), |name| parent.join(name));
+    // alloc: the error, once, and no sandbox is made.
     std::fs::create_dir_all(&made).map_err(|error| format!("{}: {error}", made.display()))?;
     Ok(made)
 }
@@ -242,10 +271,13 @@ fn library() -> Result<PathBuf, String> {
     if std::fs::read(&file).is_ok_and(|it| it == LIBRARY) {
         return Ok(file);
     }
+    // alloc: the error, once per run, and no sandbox is made.
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    // alloc: once per run, the first time the library is written.
     let writing = dir.join(format!("writing-{}", std::process::id()));
     std::fs::write(&writing, LIBRARY)
         .and_then(|()| std::fs::rename(&writing, &file))
+        // alloc: the error, once per run, and no sandbox is made.
         .map_err(|it| format!("{}: {it}", file.display()))?;
     Ok(file)
 }
@@ -263,17 +295,23 @@ impl Scratch {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |it| it.subsec_nanos());
+        // alloc: once per run, its directory's name.
         let dir = base.join(format!("blaze-sandbox-{}-{nanos:x}", std::process::id()));
         let scratch = Scratch { dir };
-        let mut made = vec!["list".to_owned(), "tmp/tmp".to_owned()];
-        made.extend(["tmp/var".to_owned(), "tmp/user".to_owned()]);
-        made.extend((0..overlays).map(|at| format!("up/{at}")));
-        for it in made {
-            let it = scratch.dir.join(it);
-            std::fs::create_dir_all(&it).map_err(|error| format!("{}: {error}", it.display()))?;
+        let made = |it: PathBuf| {
+            // alloc: the error, once, and no sandbox is made.
+            std::fs::create_dir_all(&it).map_err(|error| format!("{}: {error}", it.display()))
+        };
+        for it in ["list", "tmp/tmp", "tmp/var", "tmp/user"] {
+            made(scratch.dir.join(it))?;
+        }
+        for at in 0..overlays {
+            // alloc: once per overlay, its upper directory's name.
+            made(scratch.dir.join(format!("up/{at}")))?;
         }
         let state = scratch.dir.join("state");
         std::fs::write(&state, [0u8; 4096])
+            // alloc: the error, once, and no sandbox is made.
             .map_err(|error| format!("{}: {error}", state.display()))?;
         Ok(scratch)
     }
@@ -478,10 +516,11 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
 
     // Before the fork, so that no signal ends this process before it passes them on.
     super::pass_signals_to(0);
-    // SAFETY: the process is one thread: `super::command` runs before anything else in it,
-    // and nothing here starts a thread. The child makes system calls, applies the profile and
-    // runs the program or exits; with another thread, a lock it held (the allocator's, as the
-    // profile is applied) would stay held in the child.
+    // SAFETY: the process is one thread: `super::command` runs before anything else in it (or
+    // a test's `super::alone` before `main`), and nothing here starts a thread. The child
+    // applies the profile, may allocate and print why it failed, and runs the program or
+    // exits; with another thread, a lock it held (the allocator's, stdio's) would stay held in
+    // the child.
     let child = unsafe { libc::fork() };
     if child < 0 {
         return Err(os("fork"));
@@ -653,8 +692,9 @@ fn still_runs(pid: libc::pid_t) -> bool {
 /// runs, and for a line that is not one. Why a line could not be added to the live record,
 /// when the library said one could not.
 fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
-    let mut ran = Vec::new();
-    let mut loaded = HashSet::new();
+    // Once per run, as it ends: the programs it ran, by reference.
+    let mut ran = Vec::with_capacity(64);
+    let mut loaded = FxHashSet::default();
     let mut lost = None;
     for piece in raw.split_inclusive('\n') {
         let Some(line) = piece.strip_suffix('\n') else {
@@ -847,7 +887,7 @@ mod tests {
     /// them. Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
     #[test]
     fn a_traced_run_sees_variables_listings_and_the_clock() {
-        if let Err(why) = crate::sandbox::probe(crate::sandbox::Probe::V2) {
+        if let Err(why) = crate::sandbox::alone::probe(crate::sandbox::Probe::V2) {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
@@ -878,7 +918,7 @@ mod tests {
             report: dir.join("report"),
             not_inputs: vec![exe],
         };
-        assert_eq!(crate::sandbox::v2::launch(&spec), 0);
+        assert_eq!(crate::sandbox::alone::launch(&spec), 0);
         assert_eq!(std::fs::read_to_string(out.join("seen")).unwrap(), "v 1");
         let text = std::fs::read_to_string(&spec.live).unwrap();
         let (lines, used) = trace::parse(&text).unwrap();

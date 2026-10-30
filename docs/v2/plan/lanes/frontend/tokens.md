@@ -133,3 +133,75 @@ and other crates' tests through the `reference` feature that mbe's dev-dependenc
 | `syntax-bridge` `lexing_then_parsing_gives_the_files_tree` | lexing a file to token trees gives what converting its syntax tree gives (so the running-offset lexer path changes no token), and parsing those token trees gives the file's tree but its trivia |
 | `mbe` `tests.rs` `check_` (every mbe fixture) | each expansion parses to the same tree and span map through the new and the reference input |
 | `mbe` `differential.rs` `assert_same` (corpus, benchmark macros, 40 seeded random `macro_rules!` with 5 inputs each, 400 with slow tests) | every input and every expansion in every call style has the reference's parser and matcher input and parses to the same tree, errors and span maps as five kinds of expansion; `expect_fragment` with the reused input takes the same fragments as the model |
+| `tt` `walking_and_the_wire_allocate_the_same_for_any_size_of_tree` | on a small tree and one of 40,000 token trees with a wide span: walking the tokens and the token trees allocates nothing, writing into a buffer with room allocates nothing, and reading allocates at most 7 times (the columns and the checks' buffers) |
+| `syntax-bridge` `a_reused_input_converts_without_allocating` | converting a tree into a parser's or matcher's input that was used before allocates nothing |
+| `mbe` `a_fragment_allocates_the_same_however_much_follows_it` | `expect_fragment` allocates the same with 100 or 10,000 token trees after the fragment |
+
+## Memory (docs/v2/plan/design/memory.md)
+
+Where the token-tree paths allocate, by lifetime:
+
+| What | Lifetime | Now | Plan |
+| --- | --- | --- | --- |
+| Builder buffers, the walk's open-subtree stack, mbe's matcher input | per call | kept per thread at their high-water mark (mbe's is freed above 64K tokens) | as is; the budget tests hold warm calls to 0 |
+| A built `TopSubtree` (expansions, macro arguments, proc-macro answers) | a revision (salsa memo) | up to five boxed columns from the global allocator | one allocation a tree, from mem's revision allocator (`v2/requests/mem.md`) |
+| A tree read from the proc-macro wire | a request | one allocation a non-empty column, plus the checks' buffers (at most 7) | the same single allocation as a built tree |
+| Errors | rare | global allocator | as is |
+
+## Item 4: the last two conversions (from 2026-10-29 19:54)
+
+Two conversions are still on the build's path. The first is a macro call's input:
+`syntax_node_to_token_tree` reads the call's flat tokens, but builds every token's node, span
+and kind. The second turns a token tree into `parser::Input` for every parse of an expansion
+and every fragment a matcher tries. The design removes both by giving tokens their parser
+word once, when they are made, and keeping it in the tree.
+
+- **The parser reads words where they are.** `parser::Tokens<'t>` is a borrowed slice of the
+  parser's `u32` words (kind, contextual kind, edition, joint, fragment start), plus whether
+  fragment starts count. `Parser` reads it, and an `Input` is one way to get it
+  (`From<&Input>`). The entry points and the outline's `lazy_block_len` take
+  `impl Into<Tokens<'t>>`, so their callers do not change, and the grammar does not change at
+  all.
+- **A token tree keeps its words.** `TopSubtree` gets a `words` column in parser order:
+  - an open and a close for each visible delimiter, a word for each leaf, and one
+    `LIFETIME_IDENT` for a `'` and the ident after it;
+  - nothing for an invisible delimiter, whose group's first token carries the fragment start.
+
+  A `word_at` column (one per node, and one per subtree close) gives where each token tree's
+  words begin. Any view of whole token trees is then a slice of `words`, so the parser's input
+  of an expansion is `Tokens::new(&words[..], false)` and a matcher's is the remaining view's
+  slice with fragments. Neither is converted.
+- **Where words come from.**
+  - A call's input is written from the file's lexed tokens. The lexer's kinds are the words,
+    the edition is the file's, and spans are the anchor plus each token's offset.
+  - Transcription copies the words of the input fragments it copies.
+  - A template's words are computed once, when the macro is defined, with the expander's
+    edition. Every transcribed template token is re-marked with that edition (`apply_mark` with
+    `DeclarativeMacroExpander::edition`).
+  - Trees built by hand (built-in macros, fixups) and trees read from the proc-macro wire get
+    theirs when they are built, from an edition function: that is their one conversion, at
+    the edge.
+- **Faithful to today, held by the differential tests against `syntax_bridge::reference`.**
+  The words of every view equal the reference's `to_parser_input` / `to_matcher_input`,
+  including fragment starts: a fragment start after an empty invisible group counts only when
+  the group is in the view.
+- **Padding.** Since 2026-10-29 20:05 (requests-parser, format-grammar's speed request) a
+  `Tokens`'s words end in 4 `EOF` words, so the parser's lookahead reads need no bounds check.
+  A tree keeps its words padded, as `Input::into_words` gives them. `TokenTreesView::words`
+  gives the words from the view's first word to the end of the tree, plus the view's length.
+  A view whose words are followed only by the pad (an expansion, or the last fragment a
+  matcher tries in a group) is read in place. One that ends earlier is copied into a reused
+  `Input` by `Input::extend_from_words`, which checks each word's kinds. That copies 4 bytes a
+  token and recomputes no kind or edition.
+- **The kept words record their editions.** A word holds its token's edition, and callers
+  give the edition function (`ctx.edition(db)` on the build's path, a constant in tests and
+  the IDE). So `TreeWords` keeps each context's answer. `syntax_bridge::view_tokens` asks the
+  caller's function again for those few contexts. If any answer differs, it makes that view's
+  words afresh, by the same conversion, and the kept ones stay. The top-delimiter setters,
+  which change a tree in place, drop its words.
+
+Order of work: `parser::Tokens` (additive), then the `Parser` reading it (with frontend-deps'
+`outline.rs` signature), then the `tt` columns with their builder and wire, then the call
+input from flat tokens, then mbe's template words, copies and `expect_fragment`, and last
+`token_tree_to_syntax_node`. Each step is checked against the reference before the next.
+

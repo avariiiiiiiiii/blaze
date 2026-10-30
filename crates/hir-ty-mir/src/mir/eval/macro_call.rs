@@ -3,6 +3,7 @@
 //! flat syntax tree read through `const-ast`'s views (stage 2), and its output is read back as
 //! text.
 
+use base_db::Db;
 use hir_def::FunctionId;
 
 use super::{
@@ -37,7 +38,7 @@ pub struct FlatInput {
 /// Calls the function `func`, whose parameters are `args`, and gives the `String` it
 /// returned. `func` is not generic.
 pub fn call_const_macro<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     args: &[MacroArg<'_>],
 ) -> Result<'db, String> {
@@ -124,6 +125,7 @@ fn write_item<'db>(evaluator: &mut Evaluator<'db>, input: &FlatInput) -> Result<
 fn read_string<'db>(evaluator: &Evaluator<'db>, value: Interval) -> Result<'db, String> {
     let ptr_size = evaluator.ptr_size();
     if value.size != 3 * ptr_size {
+        // alloc: error path
         return Err(MirEvalError::NotSupported(format!(
             "a const macro returns `String`; its function returned {} bytes",
             value.size

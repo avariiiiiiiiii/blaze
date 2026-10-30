@@ -19,8 +19,11 @@ reads under are in [../../design/concurrency.md](../../design/concurrency.md).
   directory two atomics, `since` (the generation since which it has been watched without a
   break, `u64::MAX` while it is not) and `changed` (the generation of the last change heard
   under it). Directories are keyed by an `FxHash` of their bytes in an open-addressed index of
-  `u64` places that grows by copying, the old tables kept for readers still probing them, as
-  `blaze_ids::Sharded` does. Directories are append-only, in chunks that double.
+  `u64` places that grows by rehashing into a table twice the size, the old tables kept for
+  readers still probing them. Directories, their paths' bytes and the index's tables (laid end
+  to end) are append-only `blaze_mem::AppendVec` columns over reserved regions tagged
+  `Tag::Vfs`: one writer appends under the adding lock, readers read with no lock, and nothing
+  moves or is copied as they grow.
 - **Reads** (`generation()`, `unchanged_since(path, g)`) are acquire loads only: no lock, no
   shared write, no allocation. `unchanged_since` walks the path's ancestors byte by byte and
   is true when some ancestor has `since <= g` and `changed <= g`, and the last flush round is

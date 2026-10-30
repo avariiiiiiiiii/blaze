@@ -42,9 +42,11 @@ type Block = [u64; 4];
 
 /// The byte classes of a text, a [`Block`] per 64 bytes. Bits past the text's end are clear in
 /// [`IDENT`] and set in the rest, so every run and search stops at the end. 32 bytes per 64 of
-/// text; a lookup is one load.
-pub(super) struct Classes {
-    blocks: Vec<Block>,
+/// text, in a buffer the caller lends (the worker's scratch, so the warm loop allocates
+/// nothing for them); a lookup is one load.
+#[derive(Clone, Copy)]
+pub(super) struct Classes<'b> {
+    blocks: &'b [Block],
 }
 
 const _: () = assert!(size_of::<Block>() == 32, "32 bytes of classes per 64 of text");
@@ -321,7 +323,7 @@ unsafe fn blocks_neon(bytes: &[u8], out: &mut Vec<u64>) {
         let (a, b, c, d) =
             (load_neon(chunk, 0), load_neon(chunk, 16), load_neon(chunk, 32), load_neon(chunk, 48));
         let (a, b, c, d) = (quarter_neon(a), quarter_neon(b), quarter_neon(c), quarter_neon(d));
-        out.push([
+        out.extend_from_slice(&[
             movemask_neon([a[0], b[0], c[0], d[0]], weights),
             movemask_neon([a[1], b[1], c[1], d[1]], weights),
             movemask_neon([a[2], b[2], c[2], d[2]], weights),
@@ -330,15 +332,17 @@ unsafe fn blocks_neon(bytes: &[u8], out: &mut Vec<u64>) {
     }
 }
 
-impl Classes {
-    pub(super) fn new(bytes: &[u8]) -> Classes {
-        Classes::with(bytes, blocks())
+impl<'b> Classes<'b> {
+    /// The classes of `bytes`, written over `words` (emptied first).
+    pub(super) fn new(bytes: &[u8], words: &'b mut Vec<u64>) -> Classes<'b> {
+        Classes::with(bytes, blocks(), words)
     }
 
-    fn with(bytes: &[u8], blocks: Blocks) -> Classes {
+    fn with(bytes: &[u8], blocks: Blocks, words: &'b mut Vec<u64>) -> Classes<'b> {
         let whole = bytes.len() / 64 * 64;
-        let mut out = Vec::with_capacity(bytes.len() / 64 + 1);
-        blocks(&bytes[..whole], &mut out);
+        words.clear();
+        words.reserve(4 * (bytes.len() / 64 + 1));
+        blocks(&bytes[..whole], words);
         let rest = &bytes[whole..];
         let mut tail = block_scalar(rest);
         // `rest` is shorter than 64 bytes, so the shift is in range.
@@ -347,17 +351,17 @@ impl Classes {
         tail[SPACE] &= !past;
         tail[NEWLINE] |= past;
         tail[QUOTE] |= past;
-        out.push(tail);
+        words.extend_from_slice(&tail);
         // A run's first byte and every byte of neither run starts a token; so do the bits past
         // the end, as both runs are clear there. `START` takes `SPACE`'s place.
         let (mut carry_ident, mut carry_space) = (0u64, 0u64);
-        for block in &mut out {
+        for block in words.as_chunks_mut::<4>().0 {
             let (ident, space) = (block[IDENT], block[SPACE]);
             let runs = (ident & !(ident << 1 | carry_ident)) | (space & !(space << 1 | carry_space));
             block[START] = runs | !(ident | space);
             (carry_ident, carry_space) = (ident >> 63, space >> 63);
         }
-        Classes { blocks: out }
+        Classes { blocks: words.as_chunks::<4>().0 }
     }
 
     /// The first offset after `at` where a token may start (the text's length at the latest):
@@ -513,15 +517,15 @@ const STOPS: [u8; 256] = {
 /// one `trailing_zeros`, and moving to it clears the lowest bit. So the chain from one token to
 /// the next is one dependent ALU op, not a load at the last token's end (simdjson's stage 2).
 pub(super) struct Cursor<'c> {
-    classes: &'c Classes,
+    classes: Classes<'c>,
     block: usize,
     /// The block's [`START`] bits after the position; zero when the next is in a later block.
     bits: u64,
 }
 
 impl<'c> Cursor<'c> {
-    pub(super) fn new(classes: &'c Classes, at: usize) -> Cursor<'c> {
-        let mut cursor = Cursor { classes, block: 0, bits: 0 };
+    pub(super) fn new(classes: &Classes<'c>, at: usize) -> Cursor<'c> {
+        let mut cursor = Cursor { classes: *classes, block: 0, bits: 0 };
         cursor.seek(at);
         cursor
     }
@@ -566,7 +570,7 @@ pub(super) fn token(text: &str, at: usize, cursor: &mut Cursor<'_>) -> Option<(S
     let first = bytes[at] as usize;
     let flags = FLAGS[first];
     if flags & SPECIAL != 0 {
-        let (kind, len) = special(text, at, cursor.classes)?;
+        let (kind, len) = special(text, at, &cursor.classes)?;
         cursor.seek(at + len);
         return Some((kind, len));
     }
@@ -580,7 +584,7 @@ pub(super) fn token(text: &str, at: usize, cursor: &mut Cursor<'_>) -> Option<(S
 }
 
 /// [`token`] at a digit, `/`, `#`, `"`, `'` or a byte only `rustc_lexer` lexes.
-fn special(text: &str, at: usize, classes: &Classes) -> Option<(SyntaxKind, usize)> {
+fn special(text: &str, at: usize, classes: &Classes<'_>) -> Option<(SyntaxKind, usize)> {
     let bytes = text.as_bytes();
     let next = |at: usize| bytes.get(at).copied();
     match bytes[at] {
@@ -668,22 +672,15 @@ fn special(text: &str, at: usize, classes: &Classes) -> Option<(SyntaxKind, usiz
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::super::{Converter, ident_kind};
     use super::{Classes, Cursor, paths, token};
     use crate::{LexedStr, SyntaxKind};
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, below: usize) -> usize {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((self.0 >> 33) % below as u64) as usize
-        }
-    }
-
     /// Texts weighted to the bytes where the fast path and `rustc_lexer` could part: prefixes,
     /// quotes, `#`, `.` after digits, exponents, comments, Unicode whitespace and identifiers.
-    fn random_text(rng: &mut Rng) -> String {
+    fn random_text(rng: &mut SplitMix64) -> String {
         const PIECES: &[&str] = &[
             "r", "b", "c", "br", "cr", "r#", "#", "##", "\"", "'", "'a", "_", "__", "0", "1", "9",
             "0x", "0b", "1e", "E", "1.", "..", ".", "1_000", "u8", "/", "//", "///", "////",
@@ -694,8 +691,8 @@ mod tests {
             "\\x80", "\\\n", "\\q", "\"\\", "\"\"",
         ];
         let mut text = String::new();
-        for _ in 0..rng.below(200) {
-            text.push_str(PIECES[rng.below(PIECES.len())]);
+        for _ in 0..rng.index(200) {
+            text.push_str(PIECES[rng.index(PIECES.len())]);
         }
         text
     }
@@ -721,16 +718,18 @@ mod tests {
     /// Every vector path gives the scalar path's classes, for every length and alignment.
     #[test]
     fn every_path_classifies_as_the_scalar_one() {
-        let mut rng = Rng(7);
+        let mut rng = SplitMix64::new(7);
         let mut texts: Vec<Vec<u8>> =
-            (0..300).map(|len| (0..len).map(|_| rng.below(256) as u8).collect()).collect();
+            (0..300).map(|len| (0..len).map(|_| rng.index(256) as u8).collect()).collect();
         texts.extend(rust_files().into_iter().take(50).map(String::into_bytes));
         for text in &texts {
             for skip in [0, 1, 31, 63] {
                 let text = &text[skip.min(text.len())..];
-                let scalar = Classes::with(text, paths()[0].1).blocks;
+                let mut words = Vec::new();
+                let scalar = Classes::with(text, paths()[0].1, &mut words).blocks.to_vec();
                 for (name, blocks) in paths() {
-                    let got = Classes::with(text, blocks).blocks;
+                    let mut words = vec![!0; 9];
+                    let got = Classes::with(text, blocks, &mut words).blocks.to_vec();
                     assert_eq!(got, scalar, "{name} on {} bytes", text.len());
                 }
             }
@@ -741,14 +740,15 @@ mod tests {
     /// or the next byte, and the next quote bit the next `"` or `\`, on every path's classes.
     #[test]
     fn the_next_start_is_where_the_run_ends() {
-        let mut rng = Rng(17);
+        let mut rng = SplitMix64::new(17);
         let mut texts: Vec<Vec<u8>> =
-            (0..300).map(|len| (0..len).map(|_| rng.below(256) as u8).collect()).collect();
+            (0..300).map(|len| (0..len).map(|_| rng.index(256) as u8).collect()).collect();
         texts.extend((0..300).map(|_| random_text(&mut rng).into_bytes()));
         texts.extend(rust_files().into_iter().take(50).map(String::into_bytes));
         for text in &texts {
             for (name, blocks) in paths() {
-                let classes = Classes::with(text, blocks);
+                let mut words = Vec::new();
+                let classes = Classes::with(text, blocks, &mut words);
                 let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
                 let space = |b: u8| matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ');
                 for at in 0..text.len() {
@@ -791,13 +791,14 @@ mod tests {
     /// files and random texts.
     #[test]
     fn the_fast_path_lexes_as_rustc_lexer() {
-        let mut rng = Rng(11);
+        let mut rng = SplitMix64::new(11);
         let mut texts = rust_files();
         texts.extend((0..3000).map(|_| random_text(&mut rng)));
         let mut decided = 0usize;
         let edition = crate::Edition::CURRENT;
         for text in &texts {
-            let classes = Classes::new(text.as_bytes());
+            let mut words = Vec::new();
+            let classes = Classes::new(text.as_bytes(), &mut words);
             for at in (0..text.len()).filter(|&at| text.is_char_boundary(at)) {
                 let mut cursor = Cursor::new(&classes, at);
                 let Some((kind, len)) = token(text, at, &mut cursor) else { continue };
@@ -813,7 +814,7 @@ mod tests {
                 let mut conv = Converter::new(edition, rest);
                 conv.extend_token(&reference.kind, &rest[..reference.len as usize]);
                 let kind = match kind {
-                    SyntaxKind::IDENT => ident_kind(&rest[..len], edition),
+                    SyntaxKind::IDENT => ident_kind(rest, 0, len, edition),
                     kind => kind,
                 };
                 assert!(
@@ -833,7 +834,7 @@ mod tests {
     /// edition: kinds, lengths, checkpoints, long tokens and errors.
     #[test]
     fn fast_and_rustc_lexer_lex_alike() {
-        let mut rng = Rng(13);
+        let mut rng = SplitMix64::new(13);
         let mut texts = rust_files();
         texts.extend((0..2000).map(|_| random_text(&mut rng)));
         texts.push("#!/usr/bin/env cargo\n---\n[package]\n---\nfn main() {}\n".to_owned());

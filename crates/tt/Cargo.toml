@@ -22,6 +22,7 @@ span = { path = "../span", version = "0.0", default-features = false }
 stdx.workspace = true
 intern.workspace = true
 ra-ap-rustc_lexer.workspace = true
+zerocopy.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

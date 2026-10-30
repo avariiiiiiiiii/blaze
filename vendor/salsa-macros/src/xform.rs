@@ -1,3 +1,4 @@
+// alloc: proc macro, at expansion time once per annotated item; no query runs this
 use std::collections::HashSet;
 
 use quote::ToTokens;
@@ -22,6 +23,7 @@ impl ChangeLt {
     pub fn elided_to(db_lt: &syn::Lifetime) -> Self {
         ChangeLt {
             from: syn::Ident::new("_", db_lt.span()),
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             to: db_lt.clone(),
             skip_higher_ranked: true,
         }
@@ -29,13 +31,16 @@ impl ChangeLt {
 
     pub fn named_to(from: &syn::Lifetime, to: &syn::Lifetime) -> Self {
         ChangeLt {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             from: from.ident.clone(),
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             to: to.clone(),
             skip_higher_ranked: false,
         }
     }
 
     pub fn in_type(mut self, ty: &syn::Type) -> syn::Type {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         let mut ty = ty.clone();
         self.visit_type_mut(&mut ty);
         ty
@@ -45,6 +50,7 @@ impl ChangeLt {
 impl syn::visit_mut::VisitMut for ChangeLt {
     fn visit_lifetime_mut(&mut self, i: &mut syn::Lifetime) {
         if i.ident == self.from {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             *i = self.to.clone();
         }
     }
@@ -74,6 +80,7 @@ pub(crate) fn uses_elided_lifetime(ty: &syn::Type) -> bool {
 /// Returns `true` if `ty` mentions `lifetime` outside a higher-ranked
 /// `for<..>` binder.
 pub(crate) fn uses_lifetime(ty: &syn::Type, lifetime: &syn::Lifetime) -> bool {
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     finds_lifetime(ty, &lifetime.ident.to_string())
 }
 
@@ -148,6 +155,7 @@ impl syn::visit_mut::VisitMut for ChangeSelfPath<'_> {
             && let Some(second) = i.path.segments.iter().nth(1)
         {
             let span = first.span();
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             let ty = Box::new(respan::<syn::Type>(self.self_ty, span));
             let lt_token = syn::Token![<](span);
             let gt_token = syn::Token![>](span);
@@ -207,6 +215,7 @@ fn respan_tokenstream(
     stream
         .into_iter()
         .map(|token| respan_token(token, span))
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect()
 }
 

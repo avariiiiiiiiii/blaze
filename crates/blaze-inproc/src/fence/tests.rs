@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 
 const PID: u32 = 7;
@@ -248,34 +250,27 @@ fn quiesce(world: &World, local: &mut Local, tid: u64, frames: &[u64]) {
     local.reported = if seen == epoch { epoch } else { 0 };
 }
 
-fn rng(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 /// One thread of the program: calls through the slot, reads the code it called into while
 /// it is there (with quiescent points inside), and ends releasing its slot or, when `abrupt`,
 /// dying with it held.
 fn worker(world: &World, tid: u64, seed: u64, abrupt: bool) {
-    let mut state = seed;
+    let mut rng = SplitMix64::new(seed);
     let mut local = Local { slot: None, reported: 0 };
     let mut frames: Vec<u64> = Vec::with_capacity(4);
     frames.push(0x10);
-    let mut left = 200 + rng(&mut state) % 400;
+    let mut left = 200 + rng.below(400);
     while left > 0 && !world.stop.load(Ordering::Relaxed) {
         left -= 1;
         let target = world.slot.load(Ordering::Acquire) as usize;
         let (start, _) = range_of(target);
         frames.push(start + 0x10);
-        for _ in 0..1 + rng(&mut state) % 3 {
+        for _ in 0..1 + rng.below(3) {
             let value = world.code[target].load(Ordering::Acquire);
             assert_ne!(value, POISON, "thread {tid} ran range {target} after the fence freed it");
-            if rng(&mut state) % 2 == 0 {
+            if rng.coin() {
                 quiesce(world, &mut local, tid, &frames);
             }
-            if rng(&mut state) % 8 == 0 {
+            if rng.one_in(8) {
                 std::thread::yield_now();
             }
         }
@@ -320,7 +315,7 @@ fn threads_never_run_freed_code() {
                     world.listed.lock().unwrap().push(tid);
                     let inner = world.clone();
                     let abrupt = generation % 3 == 2;
-                    let seed = (lane * 31 + generation + 1) * 0x9e37_79b9_7f4a_7c15;
+                    let seed = lane * 31 + generation + 1;
                     std::thread::spawn(move || worker(&inner, tid, seed, abrupt)).join().unwrap();
                     world.listed.lock().unwrap().retain(|it| *it != tid);
                 }

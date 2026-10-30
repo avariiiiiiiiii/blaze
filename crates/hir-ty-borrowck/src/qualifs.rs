@@ -4,6 +4,7 @@
 //! promoted though `OPEN_PAREN`'s type has a `Cell` in another variant, and `&Signals::EMPTY`
 //! is though `Signals` holds an `Arc` it would drop.
 
+use base_db::Db;
 use hir_def::{
     AdtId, ConstId, DefWithBodyId, ItemContainerId, Lookup,
     expr_store::{Body, ExpressionStore},
@@ -52,7 +53,7 @@ impl Qualifs {
 
 /// A body whose values are asked their qualifs: the one borrow checked, or a `const` item's.
 pub(crate) struct ValueCx<'a, 'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) infcx: &'a InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
     pub(crate) owner: InferBodyId<'db>,

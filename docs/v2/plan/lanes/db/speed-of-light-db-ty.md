@@ -21,3 +21,9 @@ One bullet per component; add yours, don't rewrite another's.
   [speed-of-light-infer-relate.md](speed-of-light-infer-relate.md).
 - Trait selection and the trait-error leaf search (`next_solver/infer/{select,traits,errors}.rs`):
   the db-ty-port-infer-errors section of [speed-of-light.md](speed-of-light.md).
+- Borrow checking one body (`crates/hir-ty-borrowck/`: dataflow, liveness, region inference,
+  loans, Polonius): [speed-of-light-borrowck.md](speed-of-light-borrowck.md).
+- Type lowering and item well-formedness (`lower.rs`, `lower/`, `generics.rs`, `variance.rs`,
+  `crates/hir-ty-wfcheck/`): [speed-of-light-lower.md](speed-of-light-lower.md).
+- Type inference of one body (`infer.rs`, `infer/`, `InferenceResult`'s columns,
+  `infer/persist.rs`): [speed-of-light-infer.md](speed-of-light-infer.md).

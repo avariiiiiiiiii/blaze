@@ -5,6 +5,7 @@
 #[path = "../tests/db.rs"]
 mod db;
 
+use base_db::Db;
 use blaze_codegen::{
     Backend,
     backend::FrontRef,
@@ -49,36 +50,36 @@ fn by_id(domain: &'static str, what: impl std::fmt::Debug) -> ContentId {
 }
 
 impl Hashes for ById {
-    fn item(&self, _: &dyn HirDatabase, item: ItemId) -> Result<ItemKey, String> {
+    fn item(&self, _: &Db, item: ItemId) -> Result<ItemKey, String> {
         Ok(ItemKey(by_id("test item", item)))
     }
 
-    fn code(&self, _: &dyn HirDatabase, body: Body) -> Result<CodeHash, String> {
+    fn code(&self, _: &Db, body: Body) -> Result<CodeHash, String> {
         Ok(CodeHash(by_id("test code", body)))
     }
 
-    fn ty<'db>(&self, _: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, String> {
+    fn ty<'db>(&self, _: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
         Ok(by_id("test type", ty))
     }
 
-    fn konst<'db>(&self, _: &'db dyn HirDatabase, konst: Const<'db>) -> Result<ContentId, String> {
+    fn konst<'db>(&self, _: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
         Ok(by_id("test const", konst))
     }
 
     fn span(
         &self,
-        _: &dyn HirDatabase,
+        _: &Db,
         owner: DefWithBodyId,
         span: MirSpan,
     ) -> Result<SpanRef, String> {
         Ok(SpanRef { anchor: by_id("test span", (owner, span)), index: 0 })
     }
 
-    fn declaration(&self, _: &dyn HirDatabase, func: FunctionId) -> Result<SpanRef, String> {
+    fn declaration(&self, _: &Db, func: FunctionId) -> Result<SpanRef, String> {
         Ok(SpanRef { anchor: by_id("test declaration", func), index: 0 })
     }
 
-    fn file_name(&self, _: &dyn HirDatabase, file: base_db::FileId) -> Result<String, String> {
+    fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
         Ok(format!("{file:?}"))
     }
 }
@@ -156,6 +157,7 @@ fn spec() -> Spec {
         panic: Panic::Unwind,
         debuginfo: DebugInfo::None,
         fold: false,
+        mir_inline: false,
         policy: ContentId::default(),
         sanitize: Sanitize::default(),
     }
@@ -182,15 +184,15 @@ type Reached = Vec<(HirInstance, Vec<Ref>)>;
 /// databases, and each reference once.
 fn walked(
     frontend: &HirFrontend,
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     instance: &HirInstance,
 ) -> Vec<Ref> {
-    let first = walk(db, instance, homes).unwrap_or_else(|e| panic!("{e}"));
-    let again = walk(db, instance, homes).unwrap_or_else(|e| panic!("again: {e}"));
+    let first = walk(db, instance, false, homes).unwrap_or_else(|e| panic!("{e}"));
+    let again = walk(db, instance, false, homes).unwrap_or_else(|e| panic!("again: {e}"));
     assert_eq!(first, again, "{instance:?} walks two ways");
     let elsewhere = frontend
-        .with(|db, homes| walk(db, instance, homes))
+        .with(|db, homes| walk(db, instance, false, homes))
         .unwrap_or_else(|e| panic!("in another database: {e}"));
     assert_eq!(first, elsewhere, "{instance:?} walks otherwise in another database");
     let distinct: FxHashSet<&Ref> = first.iter().collect();
@@ -201,7 +203,7 @@ fn walked(
 /// The IR of `instance` built with `spec` and overflow checks `checked` asks for nothing its
 /// walk has not listed.
 fn placed(
-    db: &dyn HirDatabase,
+    db: &Db,
     homes: &mut Homes,
     spec: &Spec,
     instance: &HirInstance,
@@ -248,7 +250,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                             queue.push(next.clone());
                         }
                     }
-                    Kind::Asm(_) => assert_eq!(walk(db, next, homes), Ok(Vec::new())),
+                    Kind::Asm(_) => assert_eq!(walk(db, next, false, homes), Ok(Vec::new())),
                     Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
@@ -616,7 +618,7 @@ fn extern_and_variadic_calls_list_their_symbols() {
     }
     let [assembly] = assembly[..] else { panic!("{walked:?}") };
     frontend.with(|db, homes| {
-        assert_eq!(walk(db, assembly, homes), Ok(Vec::new()));
+        assert_eq!(walk(db, assembly, false, homes), Ok(Vec::new()));
         let mut code = built(db, assembly, false).expect("the assembly");
         let Built::Assembled(_, requests) = &mut code else { panic!("IR of assembly") };
         place_requests(db, homes, &ById, None, &mut Placer::listed(Vec::new()), requests)
@@ -722,7 +724,7 @@ fn a_constant_lists_the_functions_it_points_at() {
 fn assembly_walks_empty() {
     let (_, frontend) = frontend(PLAIN);
     let assembly = HirInstance(Kind::Asm("nop".to_owned()));
-    frontend.with(|db, homes| assert_eq!(walk(db, &assembly, homes), Ok(Vec::new())));
+    frontend.with(|db, homes| assert_eq!(walk(db, &assembly, false, homes), Ok(Vec::new())));
 }
 
 const BROKEN: &str = r#"
@@ -735,7 +737,7 @@ pub fn broken() -> u32 { "not a number" }
 fn a_body_that_does_not_lower_is_an_error_naming_the_instance() {
     let (db, frontend) = frontend(BROKEN);
     let root = frontend.root(function(&db, "broken"));
-    let walked = frontend.with(|db, homes| walk(db, &root, homes));
+    let walked = frontend.with(|db, homes| walk(db, &root, false, homes));
     let error = walked.expect_err("the walk of a body with a type error");
     assert!(error.contains(&format!("{root:?}")), "{error}");
 }

@@ -333,20 +333,20 @@ impl Coverage<'static> {
     /// the functions at `engine` dropped, or why this build can't be fuzzed.
     pub(crate) fn new(engine: &[usize]) -> Result<Self, String> {
         if TOO_MANY.load(Ordering::Relaxed) {
-            return Err(format!("more than {MODULES} instrumented modules registered counters"));
+            return Err(format!("more than {MODULES} instrumented modules registered counters"));  // alloc: error message
         }
         let counted = COUNTER_MODULES.load(Ordering::Acquire);
         if counted == 0 {
-            return Err(format!("this binary was built without SanitizerCoverage's counters: {}", crate::FLAGS));
+            return Err(format!("this binary was built without SanitizerCoverage's counters: {}", crate::FLAGS));  // alloc: error message
         }
         let tabled = PC_MODULES.load(Ordering::Acquire);
         if tabled != counted {
-            return Err(format!(
+            return Err(format!(  // alloc: error message
                 "{counted} modules registered counters and {tabled} a PC table: build with `pc-table` ({})",
                 crate::FLAGS
             ));
         }
-        let ours: Vec<usize> = engine_functions().into_iter().chain(engine.iter().copied()).collect();
+        let ours = engine_functions();
         let mut modules = Vec::with_capacity(counted);
         let mut total = 0;
         for module in 0..counted {
@@ -357,15 +357,15 @@ impl Coverage<'static> {
             let len = (stop as usize).saturating_sub(start as usize);
             let entries = (pcs_stop as usize).saturating_sub(pcs as usize) / (2 * size_of::<usize>());
             if entries != len {
-                return Err(format!(
+                return Err(format!(  // alloc: error message
                     "module {module} has {len} counters and {entries} PC table entries; they must be one per block"
                 ));
             }
             // SAFETY: SanitizerCoverage registered `[pcs, pcs_stop)`, a constant array of
             // (pc, flags) pairs, one per counter (checked just above), for the program's life.
             let table = unsafe { std::slice::from_raw_parts(pcs, 2 * len) };
-            let mut ignored = vec![0u64; len.div_ceil(8)];
-            for &function in &ours {
+            let mut ignored = vec![0u64; len.div_ceil(8)];  // alloc: the engine's mask, once per module at start
+            for &function in ours.iter().chain(engine) {
                 // Its entry block (flag 1) at its address, then its other blocks up to the next
                 // entry. An engine function that is not instrumented has none.
                 let Some(entry) = (0..len).find(|&k| table[2 * k] == function && table[2 * k + 1] & 1 == 1)
@@ -381,7 +381,7 @@ impl Coverage<'static> {
             total += len;
         }
         if total > (u32::MAX as usize >> 3) - VALUE_BITS {
-            return Err(format!("{total} counters are more than features can number"));
+            return Err(format!("{total} counters are more than features can number"));  // alloc: error message
         }
         Ok(Coverage { modules, total, _counters: PhantomData })
     }
@@ -583,7 +583,7 @@ pub(crate) fn current() -> Option<Vec<u8>> {
     // the target returned; a caller is either inside that call (the slice is borrowed and
     // unchanged for its whole length) or the watchdog holding `DUMPING`, which keeps `run`
     // from returning.
-    Some(unsafe { std::slice::from_raw_parts(at, len) }.to_vec())
+    Some(unsafe { std::slice::from_raw_parts(at, len) }.to_vec())  // alloc: a crash report's copy of the input, once per process
 }
 
 /// For the watchdog: when the running input started more than `limit` milliseconds before

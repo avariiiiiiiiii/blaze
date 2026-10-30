@@ -84,34 +84,15 @@ impl<'a> LexedStr<'a> {
             conv.push(SHEBANG, shebang_len);
         }
 
-        let bytes = text.as_bytes();
-        let classes = FAST.then(|| scan::Classes::new(bytes));
-        let mut cursor = classes.as_ref().map(|it| scan::Cursor::new(it, conv.offset));
-        // Lex from scratch at every token `rustc_lexer` lexes, because some of its tokens are
-        // split as rustc splits them in older editions: `GuardedStrPrefix` before 2024, a C
-        // string and a raw lifetime before 2021.
-        while conv.offset < text.len() {
-            let at = conv.offset;
-            if let Some(cursor) = &mut cursor
-                && let Some((kind, len)) = scan::token(text, at, cursor)
-            {
-                let kind = match kind {
-                    IDENT => ident_kind(&text[at..at + len], edition),
-                    kind => kind,
-                };
-                conv.push(kind, len);
-                continue;
-            }
-            let rest = &text[at..];
-            let token = rustc_lexer::tokenize(rest, rustc_lexer::FrontmatterAllowed::No)
-                .next()
-                .expect("a token where text is left");
-            conv.extend_token(&token.kind, &rest[..token.len as usize]);
-            if let Some(cursor) = &mut cursor {
-                cursor.seek(conv.offset);
-            }
+        if FAST {
+            // The classes go in the worker's scratch, so a warm lex allocates nothing for them.
+            blaze_mem::scratch::with_u64s(|words| {
+                let classes = scan::Classes::new(text.as_bytes(), words);
+                conv.lex_rest(Some(scan::Cursor::new(&classes, conv.offset)));
+            });
+        } else {
+            conv.lex_rest(None);
         }
-
         conv.finalize_with_eof()
     }
 
@@ -253,6 +234,35 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Lexes the rest of the text: with a cursor, each token [`scan::token`] decides there and
+    /// the rest by `rustc_lexer`; without, all by `rustc_lexer`. Lexes from scratch at every
+    /// token `rustc_lexer` lexes, because some of its tokens are split as rustc splits them in
+    /// older editions: `GuardedStrPrefix` before 2024, a C string and a raw lifetime before 2021.
+    fn lex_rest(&mut self, mut cursor: Option<scan::Cursor<'_>>) {
+        let text = self.res.text;
+        while self.offset < text.len() {
+            let at = self.offset;
+            if let Some(cursor) = &mut cursor
+                && let Some((kind, len)) = scan::token(text, at, cursor)
+            {
+                let kind = match kind {
+                    IDENT => ident_kind(text, at, len, self.edition),
+                    kind => kind,
+                };
+                self.push(kind, len);
+                continue;
+            }
+            let rest = &text[at..];
+            let token = rustc_lexer::tokenize(rest, rustc_lexer::FrontmatterAllowed::No)
+                .next()
+                .expect("a token where text is left");
+            self.extend_token(&token.kind, &rest[..token.len as usize]);
+            if let Some(cursor) = &mut cursor {
+                cursor.seek(self.offset);
+            }
+        }
+    }
+
     fn finalize_with_eof(mut self) -> LexedStr<'a> {
         self.res.push(EOF, self.offset, 0);
         self.res
@@ -279,7 +289,10 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// `token_text` is the converter's text from its offset on, so a token's start is
+    /// `self.offset` in `self.res.text`.
     fn extend_token(&mut self, kind: &rustc_lexer::TokenKind, mut token_text: &str) {
+        debug_assert_eq!(token_text.as_ptr(), self.res.text[self.offset..].as_ptr());
         // A note on an intended tradeoff:
         // We drop some useful information here (see patterns with double dots `..`)
         // Storing that info in `SyntaxKind` is not possible due to its layout requirements of
@@ -308,7 +321,9 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::Whitespace => WHITESPACE,
 
-                rustc_lexer::TokenKind::Ident => ident_kind(token_text, self.edition),
+                rustc_lexer::TokenKind::Ident => {
+                    ident_kind(self.res.text, self.offset, token_text.len(), self.edition)
+                }
                 rustc_lexer::TokenKind::InvalidIdent => {
                     self.error("Ident contains invalid characters");
                     IDENT
@@ -423,7 +438,7 @@ impl<'a> Converter<'a> {
                         // alloc: the error path.
                         self.error(format!("prefix `{token_text}` is unknown"));
                     }
-                    ident_kind(token_text, self.edition)
+                    ident_kind(self.res.text, self.offset, token_text.len(), self.edition)
                 }
                 rustc_lexer::TokenKind::Eof => EOF,
             }
@@ -543,10 +558,16 @@ impl<'a> Converter<'a> {
     }
 }
 
-/// The kind of an identifier's text: `_`, a keyword of `edition`, or `IDENT`.
+/// The kind of the identifier `text[start..start + len]`: `_`, a keyword of `edition`, or
+/// `IDENT`. It reads the file's text in place, so the keyword probe can load 8 bytes at once.
 #[inline]
-fn ident_kind(text: &str, edition: Edition) -> SyntaxKind {
-    if text == "_" { UNDERSCORE } else { SyntaxKind::from_keyword(text, edition).unwrap_or(IDENT) }
+fn ident_kind(text: &str, start: usize, len: usize, edition: Edition) -> SyntaxKind {
+    let bytes = text.as_bytes();
+    if len == 1 && bytes[start] == b'_' {
+        UNDERSCORE
+    } else {
+        SyntaxKind::from_keyword_in(bytes, start, len, edition).unwrap_or(IDENT)
+    }
 }
 
 /// rustc's `Symbol::can_be_raw`: not `_` and not a path segment keyword.

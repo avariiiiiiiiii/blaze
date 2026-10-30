@@ -3,10 +3,13 @@
 //! instantiated with a trait impl's arguments and normalized in the impl method's
 //! environment, must be a supertype of the impl method's (E0053). Also the trait method's
 //! signature as an impl's method would have it, for rustc's suggestion for `_` in an impl
-//! method (`suggest_trait_fn_ty_for_impl_fn_infer`, E0121).
+//! method (`suggest_trait_fn_ty_for_impl_fn_infer`, E0121), and a proc macro function's
+//! signature compared with `fn(TokenStream) -> TokenStream` (`check_proc_macro`).
 
+use base_db::Db;
 use hir_def::{
     CallableDefId, FunctionId, HasModule as _, ImplId, ItemContainerId, Lookup as _, TraitId,
+    hir::generics::{GenericParams, TypeOrConstParamData, TypeParamProvenance},
     signatures::FunctionSignature,
 };
 use rustc_type_ir::{
@@ -17,8 +20,8 @@ use rustc_type_ir::{
 use smallvec::SmallVec;
 
 use hir_ty::{
-    GenericPredicates,
-    db::HirDatabase,
+    GenericPredicates, Span,
+    db::HirDatabase as _,
     next_solver::{
         Clause, Clauses, DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
         RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode,
@@ -40,9 +43,28 @@ pub enum SignatureMismatchAt {
     Return,
     /// The mutability of the return type.
     ReturnMutability,
+    /// Another number of parameters (`ArgCount`). Only [`compare_proc_macro_signature`] gives
+    /// it: an impl method with another number is E0050, checked before.
+    ParamCount,
     /// Another difference, of `unsafe`, the ABI or `...`: rustc reports it at the impl
     /// method's span.
     Signature,
+}
+
+impl SignatureMismatchAt {
+    /// Where `error`, of relating two signatures with `inputs` parameters, is.
+    fn of<'db>(error: &TypeError<'db>, inputs: usize) -> SignatureMismatchAt {
+        match *error {
+            TypeError::ArgumentSorts(_, i) if i == inputs => SignatureMismatchAt::Return,
+            TypeError::ArgumentSorts(_, i) => SignatureMismatchAt::Param(i as u32),
+            TypeError::ArgumentMutability(i) if i == inputs => {
+                SignatureMismatchAt::ReturnMutability
+            }
+            TypeError::ArgumentMutability(i) => SignatureMismatchAt::ParamMutability(i as u32),
+            TypeError::ArgCount => SignatureMismatchAt::ParamCount,
+            _ => SignatureMismatchAt::Signature,
+        }
+    }
 }
 
 /// The first difference between a trait impl's method's signature and its trait's, as
@@ -64,7 +86,7 @@ pub struct SignatureMismatch<'db> {
 /// The method of the trait `impl_method` implements, with the trait and the impl, when
 /// `impl_method` is a method of a trait impl that the trait has a method of its name for.
 fn trait_method_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_method: FunctionId,
 ) -> Option<(ImplId, TraitId, FunctionId)> {
     let ItemContainerId::ImplId(impl_) = impl_method.lookup(db).container else { return None };
@@ -81,7 +103,7 @@ fn trait_method_of(
 /// it suggests for a `_` in an impl's method. `None` when `impl_method` implements no trait
 /// method.
 pub fn trait_signature_in_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_method: FunctionId,
 ) -> Option<(FunctionId, FnSig<'db>)> {
     let (impl_, trait_, trait_method) = trait_method_of(db, impl_method)?;
@@ -103,7 +125,7 @@ pub fn trait_signature_in_impl<'db>(
 /// (`check_method_is_structurally_compatible`: `self`, the number and kinds of generic
 /// parameters, the number of parameters) fail, as each is an error of its own.
 pub fn compare_impl_method_signature<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_method: FunctionId,
 ) -> Option<SignatureMismatch<'db>> {
     let (impl_, _, trait_method) = trait_method_of(db, impl_method)?;
@@ -132,6 +154,27 @@ pub fn compare_impl_method_signature<'db>(
     {
         return None;
     }
+    // `compare_self_type` (E0185, E0186) and `compare_synthetic_generics` (E0643).
+    if FunctionSignature::of(db, impl_method).has_self_param()
+        != FunctionSignature::of(db, trait_method).has_self_param()
+    {
+        return None;
+    }
+    let synthetic = |def: FunctionId| {
+        GenericParams::of(db, def.into())
+            .iter_type_or_consts()
+            .map(|(_, data)| {
+                matches!(
+                    data,
+                    TypeOrConstParamData::TypeParamData(it)
+                        if it.provenance == TypeParamProvenance::ArgumentImplTrait
+                )
+            })
+            .collect::<SmallVec<[bool; 4]>>()
+    };
+    if synthetic(impl_method) != synthetic(trait_method) {
+        return None;
+    }
     let trait_to_impl_args =
         GenericArgs::identity_for_item(interner, SolverDefId::FunctionId(impl_method))
             .rebase_onto(interner, SolverDefId::ImplId(impl_), trait_ref.args);
@@ -153,16 +196,15 @@ pub fn compare_impl_method_signature<'db>(
     }
 
     // The impl's where clauses, and the trait method's own instantiated for the impl's.
-    let hybrid: SmallVec<[Clause<'db>; 8]> =
-        GenericPredicates::query_all(db, impl_.into())
-            .iter_identity()
-            .map(|it| it.skip_norm_wip())
-            .chain(
-                GenericPredicates::query_own_explicit(db, trait_method.into())
-                    .iter_instantiated(interner, trait_to_impl_args.as_slice())
-                    .map(|it| it.skip_norm_wip()),
-            )
-            .collect();
+    let hybrid: SmallVec<[Clause<'db>; 8]> = GenericPredicates::query_all(db, impl_.into())
+        .iter_identity()
+        .map(|it| it.skip_norm_wip())
+        .chain(
+            GenericPredicates::query_own_explicit(db, trait_method.into())
+                .iter_instantiated(interner, trait_to_impl_args.as_slice())
+                .map(|it| it.skip_norm_wip()),
+        )
+        .collect();
     let param_env = ParamEnv::new(Clauses::new_from_iter(rustc_type_ir::elaborate::elaborate(
         interner,
         hybrid.into_iter(),
@@ -172,7 +214,7 @@ pub fn compare_impl_method_signature<'db>(
     let mut ocx = ObligationCtxt::new(&infcx);
     let cause = ObligationCause::dummy();
     let impl_sig = infcx.instantiate_binder_with_fresh_vars(
-        cause.span(),
+        Span::Dummy,
         BoundRegionConversionTime::HigherRankedType,
         impl_poly_sig,
     );
@@ -182,31 +224,89 @@ pub fn compare_impl_method_signature<'db>(
     let trait_sig = ocx.deeply_normalize(&cause, param_env, trait_sig).unwrap_or(trait_sig);
 
     let error = ocx.sup(&cause, param_env, trait_sig, impl_sig).err()?;
-    let output = trait_sig.inputs().len();
-    let (at, types) = match error {
-        TypeError::ArgumentSorts(types, i) if i == output => (SignatureMismatchAt::Return, Some(types)),
-        TypeError::ArgumentSorts(types, i) => (SignatureMismatchAt::Param(i as u32), Some(types)),
-        TypeError::ArgumentMutability(i) if i == output => (SignatureMismatchAt::ReturnMutability, None),
-        TypeError::ArgumentMutability(i) => (SignatureMismatchAt::ParamMutability(i as u32), None),
-        _ => (SignatureMismatchAt::Signature, None),
+    let at = SignatureMismatchAt::of(&error, trait_sig.inputs().len());
+    let types = match error {
+        TypeError::ArgumentSorts(types, _) => Some(types),
+        _ => None,
     };
-    let found = rustc_type_ir::fold_regions(interner, infcx.resolve_vars_if_possible(impl_sig), |region, _| {
-        match region.kind() {
-            RegionKind::ReVar(_) => Region::new_erased(interner),
-            _ => region,
-        }
-    });
+    // The impl's signature has no type variables, only the region variables of its `for<'a>`
+    // lifetimes, which mean nothing outside this inference context.
+    let erase = |region: Region<'db>, _: rustc_type_ir::DebruijnIndex| match region.kind() {
+        RegionKind::ReVar(_) => Region::new_erased(interner),
+        _ => region,
+    };
+    let found = rustc_type_ir::fold_regions(interner, impl_sig, erase);
     let types = types.map(|ExpectedFound { expected, found }| ExpectedFound {
         expected,
-        found: rustc_type_ir::fold_regions(interner, infcx.resolve_vars_if_possible(found), |region, _| {
-            match region.kind() {
-                RegionKind::ReVar(_) => Region::new_erased(interner),
-                _ => region,
-            }
-        }),
+        found: rustc_type_ir::fold_regions(interner, found, erase),
     });
     Some(SignatureMismatch { trait_method, at, types, expected: trait_sig, found })
 }
 
-#[cfg(test)]
-mod tests;
+/// The first difference between a proc macro function's signature and the one rustc requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcMacroSignatureMismatch<'db> {
+    pub at: SignatureMismatchAt,
+    /// Safe Rust `fn(TokenStream) -> TokenStream`, with two `TokenStream`s for an attribute
+    /// macro: rustc's "expected signature".
+    pub expected: FnSig<'db>,
+    /// The function's signature with its own generic parameters, normalized: rustc's "found
+    /// signature".
+    pub found: FnSig<'db>,
+}
+
+/// rustc's `check_proc_macro` (`rustc_passes/src/check_attr.rs`, `ProcMacroBadSig`): the
+/// signature of `function`, a `#[proc_macro]` or `#[proc_macro_derive]` function (`inputs` 1)
+/// or a `#[proc_macro_attribute]` one (`inputs` 2), its generic parameters fresh inference
+/// variables and normalized, equated with safe Rust `fn(TokenStream, ..) -> TokenStream`.
+/// `None` when they agree, when `function`'s crate sees no diagnostic item `TokenStream` or
+/// it has generic parameters, and when proving the signature well-formed fails, as rustc's.
+pub fn compare_proc_macro_signature<'db>(
+    db: &'db Db,
+    function: FunctionId,
+    inputs: usize,
+) -> Option<ProcMacroSignatureMismatch<'db>> {
+    let krate = function.module(db).krate(db);
+    let token_stream = match hir_def::diagnostic_item::diagnostic_items(db, krate)
+        .get(&intern::Symbol::intern("TokenStream"))?
+    {
+        hir_def::AttrDefId::AdtId(adt) => adt,
+        _ => return None,
+    };
+    if !GenericParams::of(db, token_stream.into()).is_empty() {
+        return None;
+    }
+    let token_stream = db.ty(token_stream.into()).instantiate_identity().skip_norm_wip();
+
+    let interner = DbInterner::new_with(db, krate);
+    let param_env = ParamEnv::empty();
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    let mut ocx = ObligationCtxt::new(&infcx);
+    let cause = ObligationCause::dummy();
+    let poly_sig = db.callable_item_signature(CallableDefId::FunctionId(function));
+    let fresh_args = infcx.fresh_args_for_item(Span::Dummy, SolverDefId::FunctionId(function));
+    let sig = interner.liberate_late_bound_regions(
+        function.into(),
+        poly_sig.instantiate(interner, fresh_args).skip_norm_wip(),
+    );
+    if sig.references_error() {
+        return None;
+    }
+    let sig = ocx.deeply_normalize(&cause, param_env, sig).ok()?;
+    if !ocx.try_evaluate_obligations().is_empty() {
+        return None;
+    }
+
+    let expected = interner.mk_fn_sig_safe_rust_abi(
+        std::iter::repeat_n(token_stream, inputs),
+        token_stream,
+    );
+    let error = ocx.eq(&cause, param_env, expected, sig).err()?;
+    let at = SignatureMismatchAt::of(&error, sig.inputs().len());
+    let identity = interner.liberate_late_bound_regions(
+        function.into(),
+        poly_sig.instantiate_identity().skip_norm_wip(),
+    );
+    let found = ocx.deeply_normalize(&cause, param_env, identity).unwrap_or(identity);
+    Some(ProcMacroSignatureMismatch { at, expected, found })
+}

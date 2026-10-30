@@ -33,3 +33,5 @@ refuses where cargo's peak fits. tightmemory.py reports that as a `fail` at 1.0x
 be what is in use in the same cgroup.
 
 > forwarded to cargo: `crates/blaze-cargo/src/memory.rs` is lane cargo's ("others" as the same cgroup's use).
+
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/memory.rs `in_use`/`used_by`: off macOS, "others" is what blaze's own cgroup uses (`memory.current`, v1 `memory.usage_in_bytes`), not the machine's; test `others_are_what_blazes_own_group_uses_not_the_machine`.

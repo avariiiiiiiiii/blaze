@@ -6,8 +6,8 @@
 //!
 //! A soft gate's warning is stashed: an error of the visitor at the same span cancels it, and
 //! what is left rustc writes at the very end, and only when nothing was an error. None are
-//! given once a gate here errors; the rest at [`Phase::Late`], which the driver drops once an
-//! error elsewhere stops it.
+//! given once a gate here errors; the rest at [`Phase::Stashed`], which the driver writes last
+//! and drops when anything else was an error.
 //!
 //! Follows rustc's `compiler/rustc_ast_passes/src/feature_gate.rs` (`check_crate`: `gate!`,
 //! `gate_all!`, `soft_gate_all_legacy_dont_use!`), `compiler/rustc_session/src/diagnostics.rs`
@@ -46,14 +46,16 @@ pub(super) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>, features: &Features, _flag
         if let Some(primary) = posted.diag.span.primary_span() {
             stash.steal(primary);
         }
-        found.push(Found::new(posted.diag, Phase::Resolve));
+        let mut diag = posted.diag;
         if posted.fatal {
-            // rustc stops here (`emit_fatal`): nothing after it is given, nor what it stashed.
+            diag.stop();
+            found.push(Found::new(diag, Phase::Resolve));
             return found;
         }
+        found.push(Found::new(diag, Phase::Resolve));
     }
     if found.is_empty() {
-        found.extend(stash.warnings.into_iter().map(|(_, diag)| Found::new(diag, Phase::Late)));
+        found.extend(stash.warnings.into_iter().map(|(_, diag)| Found::new(diag, Phase::Stashed)));
     }
     found
 }

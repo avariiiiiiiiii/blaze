@@ -11,6 +11,7 @@
 
 use std::{fmt, ops::Range};
 
+use base_db::Db;
 use blaze_ids::radix;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, Lookup, VariantId,
@@ -917,8 +918,7 @@ impl<'db> Plans<'db> {
         Ok((layout.size.bytes(), layout.align.abi.bytes()))
     }
 
-    // dyn: setup, once per crate.
-    fn infcx(&mut self, env: ParamEnvAndCrate<'db>, db: &'db dyn HirDatabase) -> &InferCtxt<'db> {
+    fn infcx(&mut self, env: ParamEnvAndCrate<'db>, db: &'db Db) -> &InferCtxt<'db> {
         if self.infcx.as_ref().is_none_or(|(krate, _)| *krate != env.krate) {
             let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::PostAnalysis);
             self.infcx = Some((env.krate, infcx));
@@ -931,8 +931,7 @@ impl<'db> Plans<'db> {
         (self.paths.len() - 1) as u32
     }
 
-    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-    fn write_path(&self, db: &dyn HirDatabase, out: &mut String, mut path: u32) {
+    fn write_path(&self, db: &Db, out: &mut String, mut path: u32) {
         let mut elems: SmallVec<[Elem; 8]> = SmallVec::new();
         while path != 0 {
             let node = self.paths[path as usize];
@@ -1609,8 +1608,7 @@ fn op_data(op: &Op<'_>, ptr: u64, out: &mut Vec<(u64, u64)>) {
 
 /// Whether a `Box<T, A>` is of the global allocator (Miri `is_box_global`): `A` is `alloc`'s
 /// `Global`, or there is no `A`.
-// dyn: plan building, once per type.
-fn box_is_global<'db>(db: &'db dyn HirDatabase, args: hir_ty::next_solver::GenericArgs<'db>) -> bool {
+fn box_is_global<'db>(db: &'db Db, args: hir_ty::next_solver::GenericArgs<'db>) -> bool {
     let Some(alloc) = args.as_slice().get(1).and_then(|it| it.ty()) else { return true };
     let TyKind::Adt(def, _) = alloc.kind() else { return false };
     let AdtId::StructId(id) = def.def_id() else { return false };
@@ -1670,14 +1668,12 @@ pub(crate) fn fmt_range(lo: u128, hi: u128, max_hi: u128) -> String {
     }
 }
 
-// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-pub(crate) fn type_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> String {
+pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>) -> String {
     // alloc: error path: the message of a failure.
     hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_else(|| format!("{ty:?}"))
 }
 
-// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-fn variant_name(db: &dyn HirDatabase, v: EnumVariantId) -> String {
+fn variant_name(db: &Db, v: EnumVariantId) -> String {
     let parent = v.lookup(db).parent;
     parent
         .enum_variants(db)

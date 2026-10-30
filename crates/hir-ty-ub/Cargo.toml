@@ -32,11 +32,7 @@ syntax.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-# The tests' database, as `crates/hir-ide/src/tests/mir/eval.rs` builds one from source.
-hir-ide.workspace = true
-salsa.workspace = true
 test-fixture.workspace = true
-test-utils.workspace = true
 
 [lints]
 workspace = true

@@ -21,7 +21,7 @@
 
 use hir::GenericDef;
 use hir_def::{AdtId, ModuleDefId, ModuleId, item_scope::ItemScope, visibility::Visibility};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::defs::{Bits, DefIdx, Defs, Id, ImplOf, Kind, Parent};
 use crate::cx::Cx;
@@ -37,8 +37,8 @@ impl Reach {
             defs,
             nominal: nominal_pub(defs),
             public: Bits::new(defs.len()),
-            queue: Vec::new(),
-            named: Vec::new(),
+            queue: Vec::with_capacity(defs.len()), // alloc: setup, a definition is queued once
+            named: Vec::new(), // alloc: setup, one buffer reused for every type
         };
         walk.paths();
         walk.interfaces();
@@ -89,17 +89,12 @@ impl Walk<'_, '_, '_> {
     fn paths(&mut self) {
         let db = self.cx.db;
         let defs = self.defs;
-        let index: FxHashMap<hir::Module, u32> =
-            defs.module_ids.iter().enumerate().map(|(at, &module)| (module, at as u32)).collect();
-        let mut public_modules = vec![false; defs.module_ids.len()];
         let root: ModuleId = self.cx.krate.root_module(db).into();
+        // The modules reached through public paths: exactly the public ones.
         let mut seen: FxHashSet<ModuleId> = FxHashSet::default();
-        let mut stack = vec![root];
+        let mut stack = vec![root]; // alloc: setup, once per crate
         seen.insert(root);
         while let Some(module) = stack.pop() {
-            if let Some(&at) = index.get(&hir::Module::from(module)) {
-                public_modules[at as usize] = true;
-            }
             let scope: &ItemScope = module.def_map(db).module(db, module).scope(db);
             for (_, per_ns) in scope.entries() {
                 let types = per_ns.types.filter(|it| it.vis == Visibility::Public).map(|it| it.def);
@@ -130,7 +125,7 @@ impl Walk<'_, '_, '_> {
         for def in defs.all() {
             if defs[def].kind == Kind::Use
                 && defs[def].parent == Parent::Module
-                && public_modules[defs.module_of[def as usize] as usize]
+                && seen.contains(&ModuleId::from(defs.module_ids[defs.module_of[def as usize] as usize]))
             {
                 self.update(def);
             }
@@ -140,7 +135,7 @@ impl Walk<'_, '_, '_> {
     /// `EmbargoVisitor`'s fixed point: the interface of each public definition, and the impls
     /// whose self type and trait are public, until nothing changes.
     fn interfaces(&mut self) {
-        let mut pending: Vec<ImplOf> = self.defs.impls().to_vec();
+        let mut pending: Vec<ImplOf> = self.defs.impls().to_vec(); // alloc: setup, once per crate
         loop {
             while let Some(def) = self.queue.pop() {
                 self.check(def);

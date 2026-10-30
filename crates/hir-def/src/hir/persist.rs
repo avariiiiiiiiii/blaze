@@ -326,6 +326,7 @@ impl Words {
             Some(&index) => index,
             None => {
                 let index = self.name(symbol.as_str());
+                // clone: a `Symbol` is an interned pointer; the map of a write keeps one per name.
                 self.by_symbol.insert(symbol.clone(), index);
                 index
             }
@@ -375,6 +376,7 @@ impl Words {
                 let field_at = names_at + (index * size_of::<Str>()) as u64;
                 Str::between(field_at, text_at + u64::from(start), len as usize)
             })
+            // alloc: write path, the name column of one buffer.
             .collect();
         let pushed = out.push_slice(&names);
         debug_assert_eq!(pushed, names_at, "`Writer::next` is not where `push_slice` writes");
@@ -427,7 +429,7 @@ impl Placed {
 }
 
 /// Reads the words of a checked buffer, from a word on.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct Read<'a> {
     words: &'a [u32],
     names: &'a [Str],
@@ -443,7 +445,7 @@ impl<'a> Read<'a> {
 
     /// The same words, from word `at`.
     pub(crate) fn from(&self, at: u32) -> Read<'a> {
-        Read { next: at as usize, ..self.clone() }
+        Read { next: at as usize, ..*self }
     }
 
     /// Where the next word is in the buffer, for an error.
@@ -517,6 +519,7 @@ impl<'a> Read<'a> {
     /// A count, then that many values.
     pub(crate) fn seq<T: Code, C: FromIterator<T>>(&mut self) -> Result<C, FormatError> {
         let len = self.len()?;
+        // alloc: the collection the caller asks for, of the values read.
         (0..len).map(|_| T::get(self)).collect()
     }
 
@@ -547,7 +550,9 @@ impl<'a> Read<'a> {
         let index = self.u32()?;
         match unrelocated(kind, index) {
             Some(Some(bits)) => Ok(bits),
-            Some(None) => Err(self.invalid("an id the relocation table has not, or of another kind")),
+            Some(None) => {
+                Err(self.invalid("an id the relocation table has not, or of another kind"))
+            }
             None => Err(self.invalid("a relocated id read outside a relocation")),
         }
     }
@@ -739,6 +744,7 @@ impl Code for String {
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        // alloc: a `String` field owns its text.
         r.str().map(String::from)
     }
 }
@@ -1076,6 +1082,7 @@ pub(crate) fn nodes<'a, T: 'a>(
             debug_assert!(w.at() > at, "a value written as no words");
             Node { kind: kind(value), at }
         })
+        // alloc: write path, one node per value written.
         .collect()
 }
 

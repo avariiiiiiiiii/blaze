@@ -1,17 +1,10 @@
-//! Database used for testing `hir_def`.
+//! Database used for testing `hir_def`: the build's [`Db`], made by `Db::for_tests()`, with the
+//! tests' helpers in [`TestDBExt`].
 
-use std::{fmt, panic, sync::Mutex};
-
-use base_db::{
-    Crate, CrateGraphBuilder, CratesMap, FileSourceRootInput, FileText, Nonce, SourceDatabase,
-    SourceRoot, SourceRootId, SourceRootInput, all_crates, relevant_crates,
-    set_all_crates_with_durability,
-};
+use base_db::{Crate, Db, RunOrder, all_crates, relevant_crates, set_run_order};
 use hir_expand::{InFile, files::FilePosition};
-use salsa::Durability;
 use span::FileId;
 use syntax::{AstNode, algo, ast};
-use triomphe::Arc;
 
 use crate::{
     Lookup, ModuleDefId, ModuleId,
@@ -20,173 +13,26 @@ use crate::{
     src::HasSource,
 };
 
-/// The order the test database runs a batch of [`SourceDatabase::run_all`] in. It has no plane:
-/// the tasks run on the calling thread, and the tests vary their order to show no result
-/// depends on it, as none may on the plane's scheduling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RunOrder {
-    InOrder,
-    Reversed,
-    /// Every `n`th task from the first, then every `n`th from the second, and so on.
-    Strided(usize),
-    /// None of them: each result is computed by the query that reads it, as it reads it.
-    LeftToReaders,
+pub(crate) type TestDB = Db;
+
+pub(crate) trait TestDBExt {
+    fn fetch_test_crate(&self) -> Crate;
+
+    fn module_for_file(&self, file_id: FileId) -> ModuleId;
+
+    fn module_at_position(&self, position: FilePosition) -> ModuleId;
+
+    /// The events of `f`, in the order they happened: a batch's tasks are left to the queries
+    /// that read their results ([`RunOrder::LeftToReaders`]), so the order is the one a test
+    /// expects of the collection alone.
+    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<salsa::Event>;
+
+    /// The names of the queries `f` executed, in [`TestDBExt::log_in_read_order`]'s order.
+    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String>;
 }
 
-thread_local! {
-    pub(crate) static RUN_ORDER: std::cell::Cell<RunOrder> =
-        const { std::cell::Cell::new(RunOrder::InOrder) };
-}
-
-#[salsa::db]
-pub(crate) struct TestDB {
-    storage: salsa::Storage<Self>,
-    files: Arc<base_db::Files>,
-    crates_map: Arc<CratesMap>,
-    events: Arc<Mutex<Option<Vec<salsa::Event>>>>,
-    nonce: Nonce,
-}
-
-impl Default for TestDB {
-    fn default() -> Self {
-        let events = <Arc<Mutex<Option<Vec<salsa::Event>>>>>::default();
-        let mut this = Self {
-            storage: salsa::Storage::new(Some(Box::new({
-                let events = events.clone();
-                move |event| {
-                    let mut events = events.lock().unwrap();
-                    if let Some(events) = &mut *events {
-                        events.push(event);
-                    }
-                }
-            }))),
-            events,
-            files: Default::default(),
-            crates_map: Default::default(),
-            nonce: Nonce::new(),
-        };
-        crate::set_expand_proc_attr_macros(&mut this, true);
-        // This needs to be here otherwise `CrateGraphBuilder` panics.
-        set_all_crates_with_durability(&mut this, std::iter::empty(), Durability::HIGH);
-        _ = base_db::LibraryRoots::builder(Default::default())
-            .durability(Durability::MEDIUM)
-            .new(&this);
-        _ = base_db::LocalRoots::builder(Default::default())
-            .durability(Durability::MEDIUM)
-            .new(&this);
-        CrateGraphBuilder::default().set_in_db(&mut this);
-        this
-    }
-}
-
-#[salsa::db]
-impl salsa::Database for TestDB {}
-
-impl fmt::Debug for TestDB {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TestDB").finish()
-    }
-}
-
-impl panic::RefUnwindSafe for TestDB {}
-
-#[salsa::db]
-impl SourceDatabase for TestDB {
-    fn file_text(&self, file_id: base_db::FileId) -> FileText {
-        self.files.file_text(file_id)
-    }
-
-    fn set_file_text(&mut self, file_id: base_db::FileId, text: &str) {
-        let files = Arc::clone(&self.files);
-        files.set_file_text(self, file_id, text);
-    }
-
-    fn set_file_text_with_durability(
-        &mut self,
-        file_id: base_db::FileId,
-        text: &str,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_file_text_with_durability(self, file_id, text, durability);
-    }
-
-    /// Source root of the file.
-    fn source_root(&self, source_root_id: SourceRootId) -> SourceRootInput {
-        self.files.source_root(source_root_id)
-    }
-
-    fn set_source_root_with_durability(
-        &mut self,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_source_root_with_durability(self, source_root_id, source_root, durability);
-    }
-
-    fn file_source_root(&self, id: base_db::FileId) -> FileSourceRootInput {
-        self.files.file_source_root(self, id)
-    }
-
-    fn set_file_source_root_with_durability(
-        &mut self,
-        id: base_db::FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_file_source_root_with_durability(self, id, source_root_id, durability);
-    }
-
-    fn crates_map(&self) -> Arc<CratesMap> {
-        self.crates_map.clone()
-    }
-
-    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
-        match RUN_ORDER.get() {
-            RunOrder::InOrder => (0..count).for_each(|at| task(self, at)),
-            RunOrder::Reversed => (0..count).rev().for_each(|at| task(self, at)),
-            RunOrder::Strided(stride) => {
-                let stride = stride.max(1);
-                (0..stride)
-                    .flat_map(|first| (first..count).step_by(stride))
-                    .for_each(|at| task(self, at));
-            }
-            RunOrder::LeftToReaders => {}
-        }
-    }
-
-    fn set_appended_root_module(
-        &mut self,
-        file_id: base_db::FileId,
-        module: Option<&'static str>,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_appended_root_module(self, file_id, module, durability);
-    }
-
-    fn set_view_root(
-        &mut self,
-        view: base_db::ViewRoot<'_>,
-    ) -> Result<base_db::ViewChange, base_db::ViewError> {
-        let files = Arc::clone(&self.files);
-        files.set_view_root(self, view)
-    }
-
-    fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
-        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
-    }
-
-    fn line_column(&self, _file: FileId, _offset: syntax::TextSize) -> Result<(u32, u32), ()> {
-        Err(())
-    }
-}
-
-impl TestDB {
-    pub(crate) fn fetch_test_crate(&self) -> Crate {
+impl TestDBExt for Db {
+    fn fetch_test_crate(&self) -> Crate {
         let all_crates = all_crates(self);
         all_crates
             .iter()
@@ -198,7 +44,7 @@ impl TestDB {
             .unwrap_or(*all_crates.last().unwrap())
     }
 
-    pub(crate) fn module_for_file(&self, file_id: FileId) -> ModuleId {
+    fn module_for_file(&self, file_id: FileId) -> ModuleId {
         for &krate in relevant_crates(self, file_id).iter() {
             let crate_def_map = crate_def_map(self, krate);
             for (local_id, data) in crate_def_map.modules(self) {
@@ -210,17 +56,17 @@ impl TestDB {
         panic!("Can't find module for file")
     }
 
-    pub(crate) fn module_at_position(&self, position: FilePosition) -> ModuleId {
+    fn module_at_position(&self, position: FilePosition) -> ModuleId {
         let file_module = self.module_for_file(position.file_id.file_id(self));
         let mut def_map = file_module.def_map(self);
-        let module = self.mod_at_position(def_map, position);
+        let module = mod_at_position(self, def_map, position);
 
-        def_map = match self.block_at_position(def_map, position) {
+        def_map = match block_at_position(self, def_map, position) {
             Some(it) => it,
             None => return module,
         };
         loop {
-            let new_map = self.block_at_position(def_map, position);
+            let new_map = block_at_position(self, def_map, position);
             match new_map {
                 Some(new_block) if !std::ptr::eq(&new_block, &def_map) => {
                     def_map = new_block;
@@ -233,150 +79,141 @@ impl TestDB {
         }
     }
 
-    /// Finds the smallest/innermost module in `def_map` containing `position`.
-    fn mod_at_position(&self, def_map: &DefMap, position: FilePosition) -> ModuleId {
-        let mut size = None;
-        let mut res = def_map.root;
-        for (module, data) in def_map.modules(self) {
-            let src = data.definition_source(self);
-            // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
-            // `position.file_id` is created before the def map, causing it to have to wrong crate
-            // attached often, which means it won't compare equal. This should not be a problem in real
-            // r-a session, only in tests, because in real r-a we only guess the crate on syntactic-only
-            // (e.g. on-enter) handlers. The rest pick the `EditionedFileId` from the def map.
-            let Some(file_id) = src.file_id.file_id() else {
-                continue;
-            };
-            if file_id.file_id(self) != position.file_id.file_id(self) {
-                continue;
-            }
-
-            let range = match src.value {
-                ModuleSource::SourceFile(it) => it.syntax().text_range(),
-                ModuleSource::Module(it) => it.syntax().text_range(),
-                ModuleSource::BlockExpr(it) => it.syntax().text_range(),
-            };
-
-            if !range.contains(position.offset) {
-                continue;
-            }
-
-            let new_size = match size {
-                None => range.len(),
-                Some(size) => {
-                    if range.len() < size {
-                        range.len()
-                    } else {
-                        size
-                    }
-                }
-            };
-
-            if size != Some(new_size) {
-                size = Some(new_size);
-                res = module;
-            }
-        }
-
-        res
-    }
-
-    fn block_at_position(&self, def_map: &DefMap, position: FilePosition) -> Option<&DefMap> {
-        // Find the smallest (innermost) function in `def_map` containing the cursor.
-        let mut size = None;
-        let mut fn_def = None;
-        for (_, module) in def_map.modules(self) {
-            let file_id = module.definition_source(self).file_id;
-            // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
-            // `position.file_id` is created before the def map, causing it to have to wrong crate
-            // attached often, which means it won't compare equal. This should not be a problem in real
-            // r-a session, only in tests, because in real r-a we only guess the crate on syntactic-only
-            // (e.g. on-enter) handlers. The rest pick the `EditionedFileId` from the def map.
-            let Some(file_id) = file_id.file_id() else {
-                continue;
-            };
-            if file_id.file_id(self) != position.file_id.file_id(self) {
-                continue;
-            }
-            for decl in module.scope(self).declarations() {
-                if let ModuleDefId::FunctionId(it) = decl {
-                    let range = it.lookup(self).source(self).value.syntax().text_range();
-
-                    if !range.contains(position.offset) {
-                        continue;
-                    }
-
-                    let new_size = match size {
-                        None => range.len(),
-                        Some(size) => {
-                            if range.len() < size {
-                                range.len()
-                            } else {
-                                size
-                            }
-                        }
-                    };
-                    if size != Some(new_size) {
-                        size = Some(new_size);
-                        fn_def = Some((it, file_id));
-                    }
-                }
-            }
-        }
-
-        // Find the innermost block expression that has a `DefMap`.
-        let (def_with_body, file_id) = fn_def?;
-        let def_with_body = def_with_body.into();
-        let source_map = &Body::with_source_map(self, def_with_body).1;
-        let scopes = ExprScopes::body_expr_scopes(self, def_with_body);
-
-        let root_syntax_node = file_id.parse(self).syntax_node();
-        let scope_iter =
-            algo::ancestors_at_offset(&root_syntax_node, position.offset).filter_map(|node| {
-                let block = ast::BlockExpr::cast(node)?;
-                let expr = ast::Expr::from(block);
-                let expr_id =
-                    source_map.node_expr(InFile::new(file_id.into(), &expr))?.as_expr().unwrap();
-                let scope = scopes.scope_for(expr_id).unwrap();
-                Some(scope)
-            });
-
-        for scope in scope_iter {
-            let mut containing_blocks =
-                scopes.scope_chain(Some(scope)).filter_map(|scope| scopes.block(scope));
-
-            if let Some(block) = containing_blocks.next().map(|block| block_def_map(self, block)) {
-                return Some(block);
-            }
-        }
-
-        None
-    }
-
-    /// The events of `f`, in the order they happened: a batch's tasks are left to the queries
-    /// that read their results, so the order is the one a test expects of the collection alone.
-    pub(crate) fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
-        *self.events.lock().unwrap() = Some(Vec::new());
-        let order = RUN_ORDER.replace(RunOrder::LeftToReaders);
-        f();
-        RUN_ORDER.set(order);
-        self.events.lock().unwrap().take().unwrap()
-    }
-
-    pub(crate) fn log_executed(&self, f: impl FnOnce()) -> Vec<String> {
+    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+        let order = set_run_order(RunOrder::LeftToReaders);
         let events = self.log(f);
+        set_run_order(order);
         events
-            .into_iter()
-            .filter_map(|e| match e.kind {
-                // This is pretty horrible, but `Debug` is the only way to inspect
-                // QueryDescriptor at the moment.
-                salsa::EventKind::WillExecute { database_key } => {
-                    let ingredient = (self as &dyn salsa::Database)
-                        .ingredient_debug_name(database_key.ingredient_index());
-                    Some(ingredient.to_string())
-                }
-                _ => None,
-            })
-            .collect()
     }
+
+    fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String> {
+        let order = set_run_order(RunOrder::LeftToReaders);
+        let executed = self.log_executed(f);
+        set_run_order(order);
+        executed
+    }
+}
+
+/// Finds the smallest/innermost module in `def_map` containing `position`.
+fn mod_at_position(db: &Db, def_map: &DefMap, position: FilePosition) -> ModuleId {
+    let mut size = None;
+    let mut res = def_map.root;
+    for (module, data) in def_map.modules(db) {
+        let src = data.definition_source(db);
+        // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
+        // `position.file_id` is created before the def map, causing it to have to wrong crate
+        // attached often, which means it won't compare equal. This should not be a problem in real
+        // r-a session, only in tests, because in real r-a we only guess the crate on syntactic-only
+        // (e.g. on-enter) handlers. The rest pick the `EditionedFileId` from the def map.
+        let Some(file_id) = src.file_id.file_id() else {
+            continue;
+        };
+        if file_id.file_id(db) != position.file_id.file_id(db) {
+            continue;
+        }
+
+        let range = match src.value {
+            ModuleSource::SourceFile(it) => it.syntax().text_range(),
+            ModuleSource::Module(it) => it.syntax().text_range(),
+            ModuleSource::BlockExpr(it) => it.syntax().text_range(),
+        };
+
+        if !range.contains(position.offset) {
+            continue;
+        }
+
+        let new_size = match size {
+            None => range.len(),
+            Some(size) => {
+                if range.len() < size {
+                    range.len()
+                } else {
+                    size
+                }
+            }
+        };
+
+        if size != Some(new_size) {
+            size = Some(new_size);
+            res = module;
+        }
+    }
+
+    res
+}
+
+fn block_at_position<'db>(
+    db: &'db Db,
+    def_map: &DefMap,
+    position: FilePosition,
+) -> Option<&'db DefMap> {
+    // Find the smallest (innermost) function in `def_map` containing the cursor.
+    let mut size = None;
+    let mut fn_def = None;
+    for (_, module) in def_map.modules(db) {
+        let file_id = module.definition_source(db).file_id;
+        // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
+        // `position.file_id` is created before the def map, causing it to have to wrong crate
+        // attached often, which means it won't compare equal. This should not be a problem in real
+        // r-a session, only in tests, because in real r-a we only guess the crate on syntactic-only
+        // (e.g. on-enter) handlers. The rest pick the `EditionedFileId` from the def map.
+        let Some(file_id) = file_id.file_id() else {
+            continue;
+        };
+        if file_id.file_id(db) != position.file_id.file_id(db) {
+            continue;
+        }
+        for decl in module.scope(db).declarations() {
+            if let ModuleDefId::FunctionId(it) = decl {
+                let range = it.lookup(db).source(db).value.syntax().text_range();
+
+                if !range.contains(position.offset) {
+                    continue;
+                }
+
+                let new_size = match size {
+                    None => range.len(),
+                    Some(size) => {
+                        if range.len() < size {
+                            range.len()
+                        } else {
+                            size
+                        }
+                    }
+                };
+                if size != Some(new_size) {
+                    size = Some(new_size);
+                    fn_def = Some((it, file_id));
+                }
+            }
+        }
+    }
+
+    // Find the innermost block expression that has a `DefMap`.
+    let (def_with_body, file_id) = fn_def?;
+    let def_with_body = def_with_body.into();
+    let source_map = &Body::with_source_map(db, def_with_body).1;
+    let scopes = ExprScopes::body_expr_scopes(db, def_with_body);
+
+    let root_syntax_node = file_id.parse(db).syntax_node();
+    let scope_iter =
+        algo::ancestors_at_offset(&root_syntax_node, position.offset).filter_map(|node| {
+            let block = ast::BlockExpr::cast(node)?;
+            let expr = ast::Expr::from(block);
+            let expr_id =
+                source_map.node_expr(InFile::new(file_id.into(), &expr))?.as_expr().unwrap();
+            let scope = scopes.scope_for(expr_id).unwrap();
+            Some(scope)
+        });
+
+    for scope in scope_iter {
+        let mut containing_blocks =
+            scopes.scope_chain(Some(scope)).filter_map(|scope| scopes.block(scope));
+
+        if let Some(block) = containing_blocks.next().map(|block| block_def_map(db, block)) {
+            return Some(block);
+        }
+    }
+
+    None
 }

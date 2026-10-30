@@ -2,35 +2,29 @@
 //! operation is tried at first (0, ±1, MIN, MAX, NaNs with payloads, ±0, infinities,
 //! subnormals). A failure names its seed, so a rerun gives the same inputs.
 
+use blaze_ids::rng::{GAMMA, SplitMix64};
+
 use crate::shape::Ty;
 
-/// SplitMix64 (Steele, Lea and Flood): one add and three mixes a number.
+/// [`SplitMix64`] with the operand draws.
 #[derive(Clone, Debug)]
-pub struct Rng(u64);
+pub struct Rng(SplitMix64);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        Rng(seed ^ 0x9e37_79b9_7f4a_7c15)
+        Rng(SplitMix64::new(seed ^ GAMMA))
     }
 
     pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
+        self.0.next_u64()
     }
 
-    /// Below `n`, which is not 0.
     pub fn below(&mut self, n: u64) -> u64 {
-        ((u128::from(self.next()) * u128::from(n)) >> 64) as u64
+        self.0.below(n)
     }
 
     pub fn fill(&mut self, out: &mut [u8]) {
-        for chunk in out.chunks_mut(8) {
-            let bytes = self.next().to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
+        self.0.fill(out);
     }
 
     /// 16 bytes, with the low `ty.bytes()` a random value of `ty` biased to its edges a third

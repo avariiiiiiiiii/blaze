@@ -21,7 +21,7 @@ use salsa::{SalsaValue, plumbing::AsId};
 use span::Edition;
 use tracing::{debug, instrument};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AssocItemId, BlockIdLt, BuiltinDeriveImplId, ConstId, DefWithBodyId, FunctionId,
     GenericParamId, HasModule, ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, TraitId,
@@ -90,7 +90,7 @@ pub enum CandidateId {
 impl_from!(FunctionId, ConstId for CandidateId);
 
 impl CandidateId {
-    fn container(self, db: &dyn HirDatabase) -> ItemContainerId {
+    fn container(self, db: &Db) -> ItemContainerId {
         match self {
             CandidateId::FunctionId(id) => id.loc(db).container,
             CandidateId::ConstId(id) => id.loc(db).container,
@@ -427,7 +427,7 @@ pub(crate) type StoredImplMethod =
 /// selection in a fresh inference context.
 #[salsa::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone))]
 pub(crate) fn lookup_impl_method_stored(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: crate::traits::StoredParamEnvAndCrate,
     func: FunctionId,
     fn_subst: StoredGenericArgs,
@@ -437,7 +437,7 @@ pub(crate) fn lookup_impl_method_stored(
 }
 
 fn lookup_impl_method_cycle_result(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _env: crate::traits::StoredParamEnvAndCrate,
     func: FunctionId,
@@ -450,7 +450,7 @@ fn lookup_impl_method_cycle_result(
 ///
 /// Returns `func` if it's not a method defined in a trait or the lookup failed.
 pub(crate) fn lookup_impl_method_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     func: FunctionId,
     fn_subst: GenericArgs<'db>,
@@ -539,14 +539,14 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
 /// lookup of `name` reads of the impl, so an item of another name added to it leaves the
 /// lookup as it was.
 #[salsa::tracked]
-pub fn impl_value_item(db: &dyn HirDatabase, impl_: ImplId, name: Name) -> Option<CandidateId> {
+pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     value_item_named(&impl_.impl_items(db).items, &name)
 }
 
 /// As [`impl_value_item`], of a trait.
 #[salsa::tracked]
 pub fn trait_value_item(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     name: Name,
 ) -> Option<CandidateId> {
@@ -557,7 +557,7 @@ pub fn trait_value_item(
 /// answers for each name its items have, sorted by name and then trait. Built once per crate,
 /// so a probe asks one query per crate of its traits in scope instead of one per trait.
 #[salsa::tracked(returns(deref))]
-fn trait_value_items(db: &dyn HirDatabase, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
+fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
     let mut items: Vec<(Name, TraitId, CandidateId)> = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
@@ -582,7 +582,7 @@ fn trait_value_items(db: &dyn HirDatabase, krate: Crate) -> Box<[(Name, TraitId,
 /// added to a trait of `krate` leaves it as it was.
 #[salsa::tracked(returns(deref))]
 fn in_crate_trait_value_items(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     name: Name,
 ) -> Box<[(TraitId, CandidateId)]> {
@@ -602,7 +602,7 @@ pub struct TraitValueItems<'db> {
 impl<'db> TraitValueItems<'db> {
     pub fn get(
         &mut self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         trait_: TraitId,
         name: Name,
     ) -> Option<CandidateId> {
@@ -681,7 +681,7 @@ pub(crate) fn find_matching_impl<'db>(
 /// expand to among its items, which is more than rustc resolves (a local of the same name
 /// does) and less where such a macro in a body alone names the dependency.
 #[salsa::tracked(returns(deref))]
-pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
     let data = krate.data(db);
     let mut unnamed: Vec<_> = data
@@ -772,7 +772,7 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 /// `EnumAccess` for `&mut Deserializer`, and a `#[derive]` on a struct in a body or a
 /// procedural macro called there writes one with no `impl` in the text. A module's constants
 /// are all looked into: lexing finds no initializer after `const _`.
-fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
+fn impl_holders(db: &Db, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
     let declared = scope.declarations().filter_map(|def| match def {
         ModuleDefId::FunctionId(it) if may_hold(db, krate, it.loc(db).id, true) => {
@@ -844,7 +844,7 @@ enum BodyMark {
 /// ([`macro_is_inert`]) or an attribute that is not inert. An item a macro writes has no text
 /// of its own and may. The file is parsed for the item's range only when lexing it found one.
 pub(crate) fn may_hold<N: syntax::AstNode>(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     id: hir_expand::AstId<N>,
     impls: bool,
@@ -869,7 +869,7 @@ pub(crate) fn may_hold<N: syntax::AstNode>(
 /// `krate` or its dependencies has the name, none of that name may write one, and no
 /// procedural macro of a dependency has it ([`macros_writing_impls`]). `macro_rules!` itself
 /// defines and writes nothing; `include!` writes what its file has.
-fn macro_is_inert(db: &dyn HirDatabase, krate: Crate, name: &Symbol) -> bool {
+fn macro_is_inert(db: &Db, krate: Crate, name: &Symbol) -> bool {
     if *name == sym::macro_rules {
         return true;
     }
@@ -886,7 +886,7 @@ fn macro_is_inert(db: &dyn HirDatabase, krate: Crate, name: &Symbol) -> bool {
 /// nothing else.
 #[salsa::tracked(returns(deref))]
 fn impls_in_bodies(
-    db: &dyn HirDatabase,
+    db: &Db,
     file: base_db::EditionedFileId,
 ) -> Box<[(TextSize, BodyMark)]> {
     let text = db.file_text(file.file_id(db)).text(db);
@@ -990,7 +990,7 @@ fn impls_in_bodies(
 /// writes `impl DiyFp` there). Known by name, so a name that may costs a lowering and nothing
 /// else.
 #[salsa::tracked(returns(deref))]
-fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[(Symbol, bool)]> {
+fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
     fn add(known: &mut FxHashMap<Symbol, bool>, name: &Symbol, writes: bool) {
         *known.entry(name.clone()).or_default() |= writes;
     }
@@ -1056,7 +1056,7 @@ fn macros_writing_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[(Symbol, boo
 /// as `$name!`, and the names of the other macros they call.
 #[salsa::tracked(returns(deref))]
 fn macro_definitions(
-    db: &dyn HirDatabase,
+    db: &Db,
     file: base_db::EditionedFileId,
 ) -> Box<[(Symbol, bool, Box<[Symbol]>)]> {
     let text = db.file_text(file.file_id(db)).text(db);
@@ -1133,7 +1133,7 @@ fn macro_definitions(
 
 /// What finding the impls of `krate` asks of each impl and of each body that may hold one.
 /// Each is its own query, so [`ImplWork::run`] on many threads leaves the finding little to do.
-pub fn impl_work(db: &dyn HirDatabase, krate: Crate) -> Vec<ImplWork> {
+pub fn impl_work(db: &Db, krate: Crate) -> Vec<ImplWork> {
     let def_map = crate_def_map(db, krate);
     let mut work = Vec::new();
     for (_, module) in def_map.modules(db) {
@@ -1151,7 +1151,7 @@ pub enum ImplWork {
 }
 
 impl ImplWork {
-    pub fn run(self, db: &dyn HirDatabase) {
+    pub fn run(self, db: &Db) {
         match self {
             ImplWork::Impl(id) => {
                 _ = db.impl_self_ty(id);
@@ -1163,7 +1163,7 @@ impl ImplWork {
 }
 
 #[salsa::tracked(returns(ref))]
-fn crates_containing_incoherent_inherent_impls(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
     // We assume that only sysroot crates contain `#[rustc_has_incoherent_inherent_impls]`
     // impls, since this is an internal feature and only std uses it.
@@ -1171,7 +1171,7 @@ fn crates_containing_incoherent_inherent_impls(db: &dyn HirDatabase, krate: Crat
 }
 
 pub fn with_incoherent_inherent_impls<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     self_ty: &SimplifiedType<'db>,
     mut callback: impl FnMut(&[ImplId]),
@@ -1194,7 +1194,7 @@ pub fn with_incoherent_inherent_impls<'db>(
     }
 }
 
-pub fn simplified_type_module(db: &dyn HirDatabase, ty: &SimplifiedType<'_>) -> Option<ModuleId> {
+pub fn simplified_type_module(db: &Db, ty: &SimplifiedType<'_>) -> Option<ModuleId> {
     match ty.def()? {
         SolverDefId::AdtId(id) => Some(id.module(db)),
         SolverDefId::TypeAliasId(id) => Some(id.module(db)),
@@ -1330,7 +1330,7 @@ pub struct InherentImpls<'db> {
 #[salsa::tracked]
 impl<'db> InherentImpls<'db> {
     #[salsa::tracked(returns(ref))]
-    pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> InherentImpls<'db> {
+    pub fn for_crate(db: &'db Db, krate: Crate) -> InherentImpls<'db> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
         if let Some(frozen) = frozen::inherent_impls(db, krate) {
             return frozen;
@@ -1345,7 +1345,7 @@ impl<'db> InherentImpls<'db> {
     /// `for_crate()`, and leaves this as it was.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_for_self_ty(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
@@ -1354,7 +1354,7 @@ impl<'db> InherentImpls<'db> {
 
     #[salsa::tracked(returns(ref))]
     pub fn for_block(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         block: BlockIdLt<'db>,
     ) -> Option<Box<InherentImpls<'db>>> {
         let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
@@ -1367,7 +1367,7 @@ impl<'db> InherentImpls<'db> {
     /// The inherent impls of `block` for one type, as [`Self::in_crate_for_self_ty`].
     #[salsa::tracked(returns(deref))]
     pub fn in_block_for_self_ty(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         block: BlockIdLt<'db>,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
@@ -1379,13 +1379,13 @@ impl<'db> InherentImpls<'db> {
 }
 
 impl<'db> InherentImpls<'db> {
-    fn collect_def_map(db: &'db dyn HirDatabase, def_map: &'db DefMap) -> Self {
+    fn collect_def_map(db: &'db Db, def_map: &'db DefMap) -> Self {
         let mut map = SelfTyGroups::default();
         collect(db, def_map, &mut map);
         return Self::from_groups(map);
 
         fn collect<'db>(
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             def_map: &DefMap,
             map: &mut SelfTyGroups<'db, Vec<ImplId>>,
         ) {
@@ -1430,7 +1430,7 @@ impl<'db> InherentImpls<'db> {
     }
 
     pub fn for_each_crate_and_block(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&InherentImpls<'db>),
@@ -1529,7 +1529,7 @@ impl<'db> TraitImpls<'db> {
 #[salsa::tracked]
 impl<'db> TraitImpls<'db> {
     #[salsa::tracked(returns(ref))]
-    pub fn for_crate(db: &'db dyn HirDatabase, krate: Crate) -> Arc<TraitImpls<'db>> {
+    pub fn for_crate(db: &'db Db, krate: Crate) -> Arc<TraitImpls<'db>> {
         let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
         if let Some(frozen) = frozen::trait_impls(db, krate) {
             return Arc::new(frozen);
@@ -1542,7 +1542,7 @@ impl<'db> TraitImpls<'db> {
 
     #[salsa::tracked(returns(as_deref))]
     pub fn for_block(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         block: BlockIdLt<'db>,
     ) -> Option<Box<TraitImpls<'db>>> {
         let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
@@ -1553,7 +1553,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     #[salsa::tracked(returns(deref))]
-    pub fn for_crate_and_deps(db: &'db dyn HirDatabase, krate: Crate) -> Box<[Arc<Self>]> {
+    pub fn for_crate_and_deps(db: &'db Db, krate: Crate) -> Box<[Arc<Self>]> {
         loaded_crates(db, krate).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
     }
 
@@ -1561,7 +1561,7 @@ impl<'db> TraitImpls<'db> {
     /// another trait or type changes `for_crate()`, and leaves this as it was.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_and_deps_for_trait_and_self_ty(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
@@ -1578,7 +1578,7 @@ impl<'db> TraitImpls<'db> {
     /// The blanket impls of one trait in `krate` and its dependencies.
     #[salsa::tracked(returns(deref))]
     pub fn blanket_in_crate_and_deps(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
@@ -1592,7 +1592,7 @@ impl<'db> TraitImpls<'db> {
     /// The impls of one trait for one type in `krate` alone, without the built-in derives.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_for_trait_and_self_ty(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
@@ -1603,7 +1603,7 @@ impl<'db> TraitImpls<'db> {
     /// The impls of one trait for one type in `block` alone, without the built-in derives.
     #[salsa::tracked(returns(deref))]
     pub fn in_block_for_trait_and_self_ty(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         block: BlockIdLt<'db>,
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
@@ -1618,7 +1618,7 @@ impl<'db> TraitImpls<'db> {
     /// [`Self::for_trait`] gives them: the blanket impls first.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_for_trait(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
@@ -1636,7 +1636,7 @@ impl<'db> TraitImpls<'db> {
     /// `in_crate_for_trait()` reruns equal, so this does not rerun.
     #[salsa::tracked(returns(deref))]
     pub fn in_crate_and_deps_for_trait(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
@@ -1649,14 +1649,14 @@ impl<'db> TraitImpls<'db> {
 }
 
 impl<'db> TraitImpls<'db> {
-    fn collect_def_map(db: &'db dyn HirDatabase, def_map: &DefMap) -> Self {
+    fn collect_def_map(db: &'db Db, def_map: &DefMap) -> Self {
         let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
         let mut map = FxHashMap::default();
         collect(db, def_map, lang_items, &mut map);
         return Self::from_traits(map);
 
         fn collect<'db>(
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             def_map: &DefMap,
             lang_items: &LangItems,
             map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
@@ -1767,7 +1767,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     pub fn for_each_crate_and_block<R: VisitorResult>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
@@ -1781,7 +1781,7 @@ impl<'db> TraitImpls<'db> {
 
     /// The impls of `block` and of the blocks around it.
     pub fn for_each_block<R: VisitorResult>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
@@ -1794,7 +1794,7 @@ impl<'db> TraitImpls<'db> {
 
     /// Like [`Self::for_each_crate_and_block()`], but takes in account two blocks, one for a trait and one for a self type.
     pub fn for_each_crate_and_block_trait_and_type<R: VisitorResult>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         krate: Crate,
         type_block: Option<BlockIdLt<'db>>,
         trait_block: Option<BlockIdLt<'db>>,
@@ -1810,7 +1810,7 @@ impl<'db> TraitImpls<'db> {
     /// The impls of two blocks and of the blocks around them, one for a trait and one for a
     /// self type.
     pub fn for_each_block_trait_and_type<R: VisitorResult>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         type_block: Option<BlockIdLt<'db>>,
         trait_block: Option<BlockIdLt<'db>>,
         for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,

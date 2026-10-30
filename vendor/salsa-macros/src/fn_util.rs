@@ -24,11 +24,14 @@ pub fn input_ids(hygiene: &Hygiene, sig: &syn::Signature, skip: usize) -> Vec<sy
             if let syn::FnArg::Typed(typed) = input
                 && let syn::Pat::Ident(ident) = &*typed.pat
             {
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 return ident.ident.clone();
             }
 
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             hygiene.ident(format!("input{index}"))
         })
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect()
 }
 
@@ -43,6 +46,7 @@ pub fn input_tys(sig: &syn::Signature, skip: usize) -> syn::Result<Vec<&syn::Typ
                 Err(syn::Error::new_spanned(input, "unexpected receiver"))
             }
         })
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect()
 }
 
@@ -82,6 +86,7 @@ fn retain_body_meta(meta: &mut syn::Meta) -> bool {
         return true;
     };
 
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     let mut attrs: Vec<_> = attrs.into_iter().collect();
     attrs.retain_mut(retain_body_meta);
     if attrs.is_empty() {

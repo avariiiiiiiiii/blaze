@@ -5,9 +5,11 @@
 //! and `quote` compile against it unchanged.
 //!
 //! Token trees live in the module's memory: a stream is a vector of them, an identifier or a
-//! literal holds its text. A span is a number the host gave out, and what can only be known of
-//! it there (joining two, its source text, its file) is asked of the host by an import. The
-//! input of a macro arrives, and its output leaves, encoded as [`wire`] says. Displaying a
+//! literal holds its text. A span is a word of the host's (its range and the index of its
+//! anchor and context among the expansion's, packed as a token tree packs one), and what can
+//! only be known of it there (joining two, its source text, its file) is asked of the host by
+//! an import. The input of a macro arrives, and its output leaves, as a token tree's columns
+//! ([`wire`]). Displaying a
 //! stream follows the proc-macro server blaze expands native macros with
 //! (`vendor/proc-macro-srv/crates/proc-macro-srv/src/token_stream.rs`), so a macro that
 //! compares `to_string()`s sees the same text either way.
@@ -29,34 +31,39 @@ use std::{
 mod sys {
     #[link(wasm_import_module = "blaze_proc_macro")]
     unsafe extern "C" {
-        pub fn def_site() -> u32;
-        pub fn call_site() -> u32;
-        pub fn mixed_site() -> u32;
-        pub fn span_join(a: u32, b: u32) -> u32;
-        pub fn span_resolved_at(a: u32, b: u32) -> u32;
-        pub fn span_located_at(a: u32, b: u32) -> u32;
-        pub fn span_parent(a: u32) -> u32;
-        pub fn span_source(a: u32) -> u32;
-        pub fn span_start(a: u32) -> u32;
-        pub fn span_end(a: u32) -> u32;
-        pub fn span_subspan(a: u32, start: u64, end: u64) -> u32;
-        pub fn span_byte_range(a: u32, out: *mut u32);
-        pub fn span_line(a: u32) -> u32;
-        pub fn span_column(a: u32) -> u32;
+        pub fn def_site() -> u64;
+        pub fn call_site() -> u64;
+        pub fn mixed_site() -> u64;
+        pub fn span_join(a: u64, b: u64) -> u64;
+        pub fn span_resolved_at(a: u64, b: u64) -> u64;
+        pub fn span_located_at(a: u64, b: u64) -> u64;
+        pub fn span_parent(a: u64) -> u64;
+        pub fn span_source(a: u64) -> u64;
+        pub fn span_start(a: u64) -> u64;
+        pub fn span_end(a: u64) -> u64;
+        pub fn span_subspan(a: u64, start: u64, end: u64) -> u64;
+        pub fn span_byte_range(a: u64, out: *mut u32);
+        pub fn span_line(a: u64) -> u32;
+        pub fn span_column(a: u64) -> u32;
+        /// The word of the span `start..start + len` of the expansion's part `part`, for one
+        /// that doesn't pack.
+        pub fn span_pack(start: u32, len: u32, part: u32) -> u64;
+        /// Writes `[start, len, part]` of a span that doesn't pack to `out`.
+        pub fn span_unpack(a: u64, out: *mut u32);
         /// The length of the text the host put in its buffer for [`take`], or -1 for none.
-        pub fn span_debug(a: u32) -> i32;
-        pub fn span_file(a: u32) -> i32;
-        pub fn span_local_file(a: u32) -> i32;
-        pub fn span_source_text(a: u32) -> i32;
-        /// A stream lexed from the text: its encoding's length in the buffer, or `-1 - len`
-        /// with the error's text of `len` bytes there.
+        pub fn span_debug(a: u64) -> i32;
+        pub fn span_file(a: u64) -> i32;
+        pub fn span_local_file(a: u64) -> i32;
+        pub fn span_source_text(a: u64) -> i32;
+        /// A stream lexed from the text, as a tree's columns: their length in the buffer, or
+        /// `-1 - len` with the error's text of `len` bytes there.
         pub fn ts_from_str(ptr: *const u8, len: usize) -> i32;
         pub fn literal_from_str(ptr: *const u8, len: usize) -> i32;
         /// Copies the host's buffer to `to`.
         pub fn take(to: *mut u8);
         pub fn track_path(ptr: *const u8, len: usize);
         pub fn track_env_var(ptr: *const u8, len: usize);
-        pub fn diagnostic(level: u32, ptr: *const u8, len: usize, span: u32);
+        pub fn diagnostic(level: u32, ptr: *const u8, len: usize, span: u64);
         /// The macro's output, encoded.
         pub fn output(ptr: *const u8, len: usize);
         /// What a panic said, before the module traps.
@@ -186,7 +193,7 @@ impl FromStr for TokenStream {
         // live and unchanged; the host only reads them, during the call, and copies what it keeps.
         let len = unsafe { sys::ts_from_str(src.as_ptr(), src.len()) };
         match taken(len) {
-            Some(bytes) => Ok(wire::Reader::new(&bytes).stream()),
+            Some(bytes) => Ok(wire::Reader::new(&bytes).contents()),
             None => Err(LexError(taken_string(-1 - len).unwrap_or_default())),
         }
     }
@@ -340,8 +347,11 @@ pub mod token_stream {
     }
 }
 
+/// A word of the host's: `start | len_part << 32`, `len_part` being `len | part << 16` with
+/// `part` an index of the expansion's span parts, or `u32::MAX` with `start` an index of the
+/// host's spans too wide to pack. Equal spans have equal words.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Span(u32);
+pub struct Span(u64);
 
 impl Span {
     pub fn def_site() -> Span {
@@ -362,8 +372,11 @@ impl Span {
         Span(unsafe { sys::mixed_site() })
     }
 
-    fn some(handle: u32) -> Option<Span> {
-        (handle != 0).then_some(Span(handle))
+    /// The word of no span.
+    const NONE: u64 = u64::MAX;
+
+    fn some(word: u64) -> Option<Span> {
+        (word != Span::NONE).then_some(Span(word))
     }
 
     pub fn parent(&self) -> Option<Span> {
@@ -978,7 +991,7 @@ impl FromStr for Literal {
         let Some(bytes) = taken(len) else {
             return Err(LexError("cannot parse string into literal".to_owned()));
         };
-        match wire::Reader::new(&bytes).stream().0.first() {
+        match wire::Reader::new(&bytes).contents().0.first() {
             Some(TokenTree::Literal(literal)) => Ok(literal.clone()),
             _ => Err(LexError("cannot parse string into literal".to_owned())),
         }
@@ -1156,7 +1169,7 @@ impl Diagnostic {
             Level::Note => 2,
             Level::Help => 3,
         };
-        let span = self.spans.first().map_or(0, |it| it.0);
+        let span = self.spans.first().map_or(Span::NONE, |it| it.0);
         // SAFETY: `self.message` is borrowed for the call, so its `self.message.len()` bytes at
         // `self.message.as_ptr()` stay live and unchanged; the host only reads them, during the
         // call, and copies what it keeps.
@@ -1191,187 +1204,464 @@ pub mod tracked {
     }
 }
 
-/// The encoding of a stream between the module and the host, little-endian:
+/// The encoding of a stream between the module and the host: the columns blaze keeps a token
+/// tree in, as it lays them out on a wire (`crates/tt/src/storage.rs`, `storage/wire.rs`), in
+/// little-endian `u32` words:
 ///
 /// ```text
-/// stream  := count:u32 tree*
-/// tree    := 0 delimiter:u8 open:u32 close:u32 entire:u32 stream
-///          | 1 span:u32 kind:u8 text            (kind: 0 plain, 1 r#, 2 k#)
-///          | 2 span:u32 ch:u32 joint:u8
-///          | 3 span:u32 kind:u8 hashes:u8 text suffix
-/// text    := len:u32 bytes
-/// suffix  := len:u32 bytes, len u32::MAX for none
+/// tree    := header node* span* wide* part* end* top top text padding
+/// header  := MAGIC nodes wide parts symbols text_len
+/// node    := head data      (the top subtree first, then each token tree in preorder)
+/// span    := start len_part (each node's, the top's unused, then each subtree's closing one)
+/// wide    := start len part
+/// part    := index 0 0      (an index of the expansion's span parts)
+/// end     := where a symbol's text ends in `text`
+/// top     := start len index 0 0
 /// ```
 ///
-/// Delimiters are 0 `()`, 1 `{}`, 2 `[]`, 3 none; literal kinds are numbered as [`LitKind`]
-/// lists them.
+/// A head's low two bits are its node's kind: 0 a subtree (its delimiter, then its ordinal
+/// from bit 4; `data` how many nodes it holds), 1 a punct (its spacing; `data` the char), 2 an
+/// ident (whether raw; `data` its symbol), 3 a literal (its kind, a raw one's hashes from bit 6
+/// and its suffix's length from bit 14; `data` its symbol, the text then the suffix). A span's
+/// `len_part` is `len | part << 16` with `part` an index of the tree's parts, or `u32::MAX`
+/// with `start` an index of its wide spans. A [`Span`] packs the same way with an index of the
+/// expansion's parts, so one crosses with arithmetic alone unless it is too wide to pack. What
+/// a module writes is what blaze's builder makes of the stream, which the host checks.
 pub mod wire {
     use std::rc::Rc;
 
     use super::*;
 
+    const MAGIC: u32 = u32::from_le_bytes(*b"tt\x01\x00");
+    const HEADER: usize = 6;
+    /// The `len_part` of a span whose `start` is an index of the wide spans.
+    const WIDE: u32 = u32::MAX;
+    /// What a packed span's length and part each stay under.
+    const NARROW: u32 = 0xFFFF;
+    /// How many of the latest symbols a new one is looked for among.
+    const SYMBOL_WINDOW: usize = 16;
+    const SUFFIX_SHIFT: u32 = 14;
+    /// Below this, a writer finds an expansion part's index among its own by indexing, not by
+    /// a scan.
+    const DIRECT: u32 = 1 << 20;
+
+    /// The span `start..start + len` in the expansion's part `part`.
+    fn span(start: u32, len: u32, part: u32) -> Span {
+        if len < NARROW && part < NARROW {
+            return Span(u64::from(start) | u64::from(len | part << 16) << 32);
+        }
+        // SAFETY: the `sys` call takes and gives integers only, so it reads and writes no
+        // memory of this crate's and nothing the caller holds can break.
+        Span(unsafe { sys::span_pack(start, len, part) })
+    }
+
+    /// `[start, len, part]` of `span`, `part` an index of the expansion's parts.
+    fn fields(span: Span) -> [u32; 3] {
+        let (start, len_part) = (span.0 as u32, (span.0 >> 32) as u32);
+        if len_part != WIDE {
+            return [start, len_part & NARROW, len_part >> 16];
+        }
+        let mut out = [0u32; 3];
+        // SAFETY: `out` is three writable `u32`s of this frame, the room `sys::span_unpack`
+        // writes, live and not borrowed elsewhere for the call.
+        unsafe { sys::span_unpack(span.0, out.as_mut_ptr()) };
+        out
+    }
+
+    /// What rustc calls a whole group's span, which a token tree doesn't keep: the cover of its
+    /// delimiters' when they have one anchor and context, else the opening one's, as
+    /// rust-analyzer's server joins them.
+    pub(crate) fn entire(open: Span, close: Span) -> Span {
+        let [open_start, open_len, part] = fields(open);
+        let [close_start, close_len, close_part] = fields(close);
+        if part != close_part {
+            return open;
+        }
+        let start = open_start.min(close_start);
+        let end = open_start.saturating_add(open_len).max(close_start.saturating_add(close_len));
+        span(start, end - start, part)
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn delimiter_of(code: u32) -> Delimiter {
+        match code & 0b11 {
+            0 => Delimiter::Parenthesis,
+            1 => Delimiter::Brace,
+            2 => Delimiter::Bracket,
+            _ => Delimiter::None,
+        }
+    }
+
+    fn delimiter_code(delimiter: Delimiter) -> u32 {
+        match delimiter {
+            Delimiter::Parenthesis => 0,
+            Delimiter::Brace => 1,
+            Delimiter::Bracket => 2,
+            Delimiter::None => 3,
+        }
+    }
+
+    fn lit_kind(code: u32, hashes: u8) -> LitKind {
+        match code {
+            0 => LitKind::Byte,
+            1 => LitKind::Char,
+            2 => LitKind::Integer,
+            3 => LitKind::Float,
+            4 => LitKind::Str,
+            5 => LitKind::StrRaw(hashes),
+            6 => LitKind::ByteStr,
+            7 => LitKind::ByteStrRaw(hashes),
+            8 => LitKind::CStr,
+            9 => LitKind::CStrRaw(hashes),
+            _ => LitKind::ErrWithGuar,
+        }
+    }
+
+    fn lit_code(kind: LitKind) -> (u32, u32) {
+        match kind {
+            LitKind::Byte => (0, 0),
+            LitKind::Char => (1, 0),
+            LitKind::Integer => (2, 0),
+            LitKind::Float => (3, 0),
+            LitKind::Str => (4, 0),
+            LitKind::StrRaw(n) => (5, u32::from(n)),
+            LitKind::ByteStr => (6, 0),
+            LitKind::ByteStrRaw(n) => (7, u32::from(n)),
+            LitKind::CStr => (8, 0),
+            LitKind::CStrRaw(n) => (9, u32::from(n)),
+            LitKind::ErrWithGuar => (10, 0),
+        }
+    }
+
+    /// A tree the host wrote, read where its bytes lie; no bytes are a tree of nothing.
     pub struct Reader<'a> {
         bytes: &'a [u8],
-        at: usize,
+        /// How many nodes there are, the top subtree's included.
+        len: usize,
+        spans: usize,
+        wide: usize,
+        parts: usize,
+        ends: usize,
+        top: usize,
+        text: usize,
     }
 
     impl<'a> Reader<'a> {
         pub fn new(bytes: &'a [u8]) -> Reader<'a> {
-            Reader { bytes, at: 0 }
+            if bytes.is_empty() {
+                return Reader { bytes, len: 0, spans: 0, wide: 0, parts: 0, ends: 0, top: 0, text: 0 };
+            }
+            let word = |at: usize| u32_at(bytes, 4 * at) as usize;
+            let (len, wide, parts, symbols) = (word(1), word(2), word(3), word(4));
+            let subtrees = (1..len).filter(|&node| word(HEADER + 2 * node) & 0b11 == 0).count();
+            let spans = 4 * (HEADER + 2 * len);
+            let wide_at = spans + 8 * (len + subtrees);
+            let parts_at = wide_at + 12 * wide;
+            let ends = parts_at + 12 * parts;
+            let top = ends + 4 * symbols;
+            Reader { bytes, len, spans, wide: wide_at, parts: parts_at, ends, top, text: top + 40 }
         }
 
-        fn u8(&mut self) -> u8 {
-            let it = self.bytes[self.at];
-            self.at += 1;
-            it
+        fn node(&self, at: usize) -> (u32, u32) {
+            let it = 4 * (HEADER + 2 * at);
+            (u32_at(self.bytes, it), u32_at(self.bytes, it + 4))
         }
 
-        fn u32(&mut self) -> u32 {
-            let it = u32::from_le_bytes(self.bytes[self.at..self.at + 4].try_into().unwrap());
-            self.at += 4;
-            it
+        /// The span at `at` of the span column.
+        fn span(&self, at: usize) -> Span {
+            let it = self.spans + 8 * at;
+            let (start, len_part) = (u32_at(self.bytes, it), u32_at(self.bytes, it + 4));
+            let [start, len, local] = match len_part {
+                WIDE => {
+                    let it = self.wide + 12 * start as usize;
+                    [u32_at(self.bytes, it), u32_at(self.bytes, it + 4), u32_at(self.bytes, it + 8)]
+                }
+                _ => [start, len_part & NARROW, len_part >> 16],
+            };
+            span(start, len, u32_at(self.bytes, self.parts + 12 * local as usize))
         }
 
-        fn text(&mut self) -> Rc<str> {
-            let len = self.u32() as usize;
-            let text = std::str::from_utf8(&self.bytes[self.at..self.at + len]).unwrap();
-            self.at += len;
-            text.into()
+        /// The closing span of the subtree whose head is `head`.
+        fn close(&self, head: u32) -> Span {
+            self.span(self.len + (head >> 4) as usize - 1)
         }
 
-        pub fn stream(&mut self) -> TokenStream {
-            let count = self.u32() as usize;
-            let mut trees = Vec::with_capacity(count);
-            for _ in 0..count {
-                trees.push(self.tree());
+        /// The top subtree's opening span for 0, its closing one for 1.
+        fn top_span(&self, which: usize) -> Span {
+            let it = self.top + 20 * which;
+            span(u32_at(self.bytes, it), u32_at(self.bytes, it + 4), u32_at(self.bytes, it + 8))
+        }
+
+        fn symbol(&self, index: u32) -> &'a str {
+            let bytes = self.bytes;
+            let index = index as usize;
+            let start = match index {
+                0 => 0,
+                _ => u32_at(bytes, self.ends + 4 * (index - 1)) as usize,
+            };
+            let end = u32_at(bytes, self.ends + 4 * index) as usize;
+            std::str::from_utf8(&bytes[self.text + start..self.text + end]).unwrap()
+        }
+
+        /// What a macro is given of the tree: what its top subtree holds when that has no
+        /// delimiters, else the top subtree, without the parentheses rust-analyzer's protocol
+        /// wraps a passed-on fragment in (see [`Reader::inside`]).
+        pub fn input(&self) -> TokenStream {
+            if self.len == 0 {
+                return TokenStream::new();
+            }
+            let delimiter = delimiter_of(self.node(0).0 >> 2);
+            let (open, close) = (self.top_span(0), self.top_span(1));
+            if delimiter == Delimiter::None {
+                return self.inside(0, open, delimiter, true);
+            }
+            let entire = entire(open, close);
+            let stream = self.inside(0, open, delimiter, true);
+            TokenStream(Rc::new(vec![TokenTree::Group(Group { delimiter, stream, open, close, entire })]))
+        }
+
+        /// What the top subtree holds, as it is: the tokens of text a macro asked for.
+        pub fn contents(&self) -> TokenStream {
+            if self.len == 0 {
+                return TokenStream::new();
+            }
+            self.trees(1, self.len, false)
+        }
+
+        /// What the subtree at `at` holds; with `fragments`, the contents of the parentheses
+        /// when it is a group without delimiters around exactly a pair of them whose spans are
+        /// both its opening one: how rust-analyzer's protocol wraps an expression a macro was
+        /// passed and passes on, which a proc macro is not to see.
+        fn inside(&self, at: usize, open: Span, delimiter: Delimiter, fragments: bool) -> TokenStream {
+            let end = at + 1 + self.node(at).1 as usize;
+            if fragments && delimiter == Delimiter::None && at + 1 < end {
+                let (head, len) = self.node(at + 1);
+                let wrapper = head & 0b11 == 0
+                    && delimiter_of(head >> 2) == Delimiter::Parenthesis
+                    && at + 2 + len as usize == end
+                    && self.span(at + 1) == open
+                    && self.close(head) == open;
+                if wrapper {
+                    return self.trees(at + 2, end, fragments);
+                }
+            }
+            self.trees(at + 1, end, fragments)
+        }
+
+        fn trees(&self, mut at: usize, end: usize, fragments: bool) -> TokenStream {
+            let mut trees = Vec::new();
+            while at < end {
+                let (head, data) = self.node(at);
+                let tree = match head & 0b11 {
+                    0 => {
+                        let delimiter = delimiter_of(head >> 2);
+                        let (open, close) = (self.span(at), self.close(head));
+                        let entire = entire(open, close);
+                        let stream = self.inside(at, open, delimiter, fragments);
+                        at += data as usize;
+                        TokenTree::Group(Group { delimiter, stream, open, close, entire })
+                    }
+                    1 => TokenTree::Punct(Punct {
+                        ch: char::from_u32(data).unwrap_or('?'),
+                        joint: (head >> 2) & 0b11 == 1,
+                        span: self.span(at),
+                    }),
+                    2 => TokenTree::Ident(Ident {
+                        sym: self.symbol(data).into(),
+                        kind: if (head >> 2) & 1 == 1 { IdentKind::Raw } else { IdentKind::Normal },
+                        span: self.span(at),
+                    }),
+                    _ => {
+                        let text = self.symbol(data);
+                        let (symbol, suffix) =
+                            text.split_at(text.len() - (head >> SUFFIX_SHIFT) as usize);
+                        TokenTree::Literal(Literal {
+                            kind: lit_kind((head >> 2) & 0xF, (head >> 6) as u8),
+                            symbol: symbol.into(),
+                            suffix: (!suffix.is_empty()).then(|| suffix.into()),
+                            span: self.span(at),
+                        })
+                    }
+                };
+                trees.push(tree);
+                at += 1;
             }
             TokenStream(Rc::new(trees))
         }
-
-        fn tree(&mut self) -> TokenTree {
-            match self.u8() {
-                0 => {
-                    let delimiter = match self.u8() {
-                        0 => Delimiter::Parenthesis,
-                        1 => Delimiter::Brace,
-                        2 => Delimiter::Bracket,
-                        _ => Delimiter::None,
-                    };
-                    let (open, close, entire) =
-                        (Span(self.u32()), Span(self.u32()), Span(self.u32()));
-                    let stream = self.stream();
-                    TokenTree::Group(Group { delimiter, stream, open, close, entire })
-                }
-                1 => {
-                    let span = Span(self.u32());
-                    let kind = match self.u8() {
-                        1 => IdentKind::Raw,
-                        2 => IdentKind::ForcedKeyword,
-                        _ => IdentKind::Normal,
-                    };
-                    TokenTree::Ident(Ident { sym: self.text(), kind, span })
-                }
-                2 => {
-                    let span = Span(self.u32());
-                    let ch = char::from_u32(self.u32()).unwrap_or('?');
-                    TokenTree::Punct(Punct { ch, joint: self.u8() != 0, span })
-                }
-                _ => {
-                    let span = Span(self.u32());
-                    let (kind, hashes) = (self.u8(), self.u8());
-                    let kind = match kind {
-                        0 => LitKind::Byte,
-                        1 => LitKind::Char,
-                        2 => LitKind::Integer,
-                        3 => LitKind::Float,
-                        4 => LitKind::Str,
-                        5 => LitKind::StrRaw(hashes),
-                        6 => LitKind::ByteStr,
-                        7 => LitKind::ByteStrRaw(hashes),
-                        8 => LitKind::CStr,
-                        9 => LitKind::CStrRaw(hashes),
-                        _ => LitKind::ErrWithGuar,
-                    };
-                    let symbol = self.text();
-                    let suffix = match u32::from_le_bytes(
-                        self.bytes[self.at..self.at + 4].try_into().unwrap(),
-                    ) {
-                        u32::MAX => {
-                            self.at += 4;
-                            None
-                        }
-                        _ => Some(self.text()),
-                    };
-                    TokenTree::Literal(Literal { kind, symbol, suffix, span })
-                }
-            }
-        }
     }
 
+    /// Writes `stream` as the columns blaze's builder makes of it: its one group as the top
+    /// subtree, else a top without delimiters at the call site; a negative number as a minus
+    /// sign and the number, as blaze's lexer has one; each node's span then a subtree's closing
+    /// one, the tree's parts and wide spans in the order first used; a symbol found again
+    /// among the latest [`SYMBOL_WINDOW`].
     pub fn write(stream: &TokenStream, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(stream.0.len() as u32).to_le_bytes());
-        for tree in stream.0.iter() {
-            write_tree(tree, out);
+        let (delimiter, open, close, stream) = match &stream.0[..] {
+            [TokenTree::Group(group)] => (group.delimiter, group.open, group.close, &group.stream),
+            _ => {
+                let at = Span::call_site();
+                (Delimiter::None, at, at, stream)
+            }
+        };
+        let mut writer = Writer::default();
+        writer.nodes.extend([delimiter_code(delimiter) << 2, 0]);
+        writer.spans.extend([0, 0]);
+        writer.stream(stream);
+        let len = writer.nodes.len() / 2;
+        writer.nodes[1] = (len - 1) as u32;
+        let put = |out: &mut Vec<u8>, words: &[u32]| {
+            for word in words {
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        };
+        let base = out.len();
+        put(out, &[
+            MAGIC,
+            len as u32,
+            (writer.wide.len() / 3) as u32,
+            writer.parts.len() as u32,
+            writer.ends.len() as u32,
+            writer.text.len() as u32,
+        ]);
+        put(out, &writer.nodes);
+        put(out, &writer.spans);
+        put(out, &writer.closes);
+        put(out, &writer.wide);
+        for &part in &writer.parts {
+            put(out, &[part, 0, 0]);
         }
+        put(out, &writer.ends);
+        for span in [open, close] {
+            let [start, len, part] = fields(span);
+            put(out, &[start, len, part, 0, 0]);
+        }
+        out.extend_from_slice(&writer.text);
+        out.resize(base + (out.len() - base).next_multiple_of(4), 0);
     }
 
-    fn text(text: &str, out: &mut Vec<u8>) {
-        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-        out.extend_from_slice(text.as_bytes());
+    #[derive(Default)]
+    struct Writer {
+        nodes: Vec<u32>,
+        spans: Vec<u32>,
+        closes: Vec<u32>,
+        wide: Vec<u32>,
+        /// The expansion's index of each of the tree's parts, in the order first used.
+        parts: Vec<u32>,
+        /// One more than the tree's index of each expansion part below [`DIRECT`], 0 for one
+        /// not used yet.
+        local: Vec<u32>,
+        last: Option<(u32, u32)>,
+        ends: Vec<u32>,
+        text: Vec<u8>,
     }
 
-    fn write_tree(tree: &TokenTree, out: &mut Vec<u8>) {
-        match tree {
-            TokenTree::Group(group) => {
-                out.push(0);
-                out.push(match group.delimiter {
-                    Delimiter::Parenthesis => 0,
-                    Delimiter::Brace => 1,
-                    Delimiter::Bracket => 2,
-                    Delimiter::None => 3,
-                });
-                for span in [group.open, group.close, group.entire] {
-                    out.extend_from_slice(&span.0.to_le_bytes());
+    impl Writer {
+        /// The tree's index of the expansion's part `part`, given one the first time.
+        fn local(&mut self, part: u32) -> u32 {
+            match self.last {
+                Some((last, local)) if last == part => return local,
+                _ => {}
+            }
+            let local = if part < DIRECT {
+                let at = part as usize;
+                if self.local.len() <= at {
+                    self.local.resize(at + 1, 0);
                 }
-                write(&group.stream, out);
+                if self.local[at] == 0 {
+                    self.parts.push(part);
+                    self.local[at] = self.parts.len() as u32;
+                }
+                self.local[at] - 1
+            } else {
+                match self.parts.iter().position(|&it| it == part) {
+                    Some(at) => at as u32,
+                    None => {
+                        self.parts.push(part);
+                        (self.parts.len() - 1) as u32
+                    }
+                }
+            };
+            self.last = Some((part, local));
+            local
+        }
+
+        fn span(&mut self, span: Span) -> [u32; 2] {
+            let [start, len, part] = fields(span);
+            let local = self.local(part);
+            if len < NARROW && local < NARROW {
+                return [start, len | local << 16];
             }
-            TokenTree::Ident(ident) => {
-                out.push(1);
-                out.extend_from_slice(&ident.span.0.to_le_bytes());
-                out.push(match ident.kind {
-                    IdentKind::Normal => 0,
-                    IdentKind::Raw => 1,
-                    IdentKind::ForcedKeyword => 2,
-                });
-                text(&ident.sym, out);
-            }
-            TokenTree::Punct(punct) => {
-                out.push(2);
-                out.extend_from_slice(&punct.span.0.to_le_bytes());
-                out.extend_from_slice(&(punct.ch as u32).to_le_bytes());
-                out.push(punct.joint as u8);
-            }
-            TokenTree::Literal(literal) => {
-                out.push(3);
-                out.extend_from_slice(&literal.span.0.to_le_bytes());
-                let (kind, hashes) = match literal.kind {
-                    LitKind::Byte => (0, 0),
-                    LitKind::Char => (1, 0),
-                    LitKind::Integer => (2, 0),
-                    LitKind::Float => (3, 0),
-                    LitKind::Str => (4, 0),
-                    LitKind::StrRaw(n) => (5, n),
-                    LitKind::ByteStr => (6, 0),
-                    LitKind::ByteStrRaw(n) => (7, n),
-                    LitKind::CStr => (8, 0),
-                    LitKind::CStrRaw(n) => (9, n),
-                    LitKind::ErrWithGuar => (10, 0),
+            self.wide.extend([start, len, local]);
+            [(self.wide.len() / 3 - 1) as u32, WIDE]
+        }
+
+        /// The index of the symbol `text` then `suffix`, among the latest [`SYMBOL_WINDOW`] when
+        /// there.
+        fn symbol(&mut self, text: &str, suffix: &str) -> u32 {
+            let count = self.ends.len();
+            for index in (count.saturating_sub(SYMBOL_WINDOW)..count).rev() {
+                let start = match index {
+                    0 => 0,
+                    _ => self.ends[index - 1] as usize,
                 };
-                out.extend_from_slice(&[kind, hashes]);
-                text(&literal.symbol, out);
-                match &literal.suffix {
-                    Some(suffix) => text(suffix, out),
-                    None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
+                let it = &self.text[start..self.ends[index] as usize];
+                if it.len() == text.len() + suffix.len()
+                    && it.starts_with(text.as_bytes())
+                    && it.ends_with(suffix.as_bytes())
+                {
+                    return index as u32;
+                }
+            }
+            self.text.extend_from_slice(text.as_bytes());
+            self.text.extend_from_slice(suffix.as_bytes());
+            self.ends.push(self.text.len() as u32);
+            count as u32
+        }
+
+        fn leaf(&mut self, span: Span, head: u32, data: u32) {
+            let span = self.span(span);
+            self.spans.extend(span);
+            self.nodes.extend([head, data]);
+        }
+
+        fn stream(&mut self, stream: &TokenStream) {
+            for tree in stream.0.iter() {
+                match tree {
+                    TokenTree::Group(group) => {
+                        let at = self.nodes.len();
+                        let open = self.span(group.open);
+                        let close = self.span(group.close);
+                        self.spans.extend(open);
+                        self.closes.extend(close);
+                        let ordinal = (self.closes.len() / 2) as u32;
+                        self.nodes.extend([delimiter_code(group.delimiter) << 2 | ordinal << 4, 0]);
+                        self.stream(&group.stream);
+                        self.nodes[at + 1] = ((self.nodes.len() - at) / 2 - 1) as u32;
+                    }
+                    TokenTree::Punct(punct) => {
+                        self.leaf(punct.span, 1 | u32::from(punct.joint) << 2, punct.ch as u32)
+                    }
+                    TokenTree::Ident(ident) => {
+                        let symbol = self.symbol(&ident.sym, "");
+                        let raw = u32::from(ident.kind == IdentKind::Raw);
+                        self.leaf(ident.span, 2 | raw << 2, symbol);
+                    }
+                    TokenTree::Literal(literal) => {
+                        let mut text = &*literal.symbol;
+                        let number = matches!(literal.kind, LitKind::Integer | LitKind::Float);
+                        if number && text.starts_with('-') {
+                            self.leaf(literal.span, 1, '-' as u32);
+                            text = &text[1..];
+                        }
+                        let suffix = literal.suffix.as_deref().unwrap_or("");
+                        let symbol = self.symbol(text, suffix);
+                        let (code, hashes) = lit_code(literal.kind);
+                        let head = 3 | code << 2 | hashes << 6 | (suffix.len() as u32) << SUFFIX_SHIFT;
+                        self.leaf(literal.span, head, symbol);
+                    }
                 }
             }
         }
@@ -1402,7 +1692,7 @@ pub mod __blaze {
     /// host passes a null pointer with it when there is no attribute.
     fn input(ptr: *const u8, len: usize) -> TokenStream {
         if len == 0 {
-            return wire::Reader::new(&[]).stream();
+            return TokenStream::new();
         }
         ROOM.with(|room| {
             let room = room.borrow();
@@ -1412,7 +1702,7 @@ pub mod __blaze {
             let Some(bytes) = bytes.get(..len) else {
                 panic!("the host gave an input of {len} bytes in room of {}", bytes.len());
             };
-            wire::Reader::new(bytes).stream()
+            wire::Reader::new(bytes).input()
         })
     }
 

@@ -3,11 +3,10 @@
 
 use std::sync::Arc;
 
-use blaze_core::sim::Rng;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use rustc_hash::FxHashMap;
 
-use super::{Building, Column, FIRST, Writer, chunk_of, chunk_start, run};
+use super::{Base, Building, Column, DIR, FILE, FIRST, Writer, chunk_of, chunk_start, run};
 
 /// Seeded pushes and runs: every value reads back where the `Vec` has it, and every run reads
 /// as one slice.
@@ -202,6 +201,89 @@ fn a_snapshot_keeps_its_table_through_a_replace() {
     assert_eq!(shared.read().table().find(&old), None);
 }
 
+/// A base's columns, owned, to break one at a time.
+struct Parts {
+    ids: Vec<ContentId>,
+    shapes: Vec<[u32; 2]>,
+    entry_names: Vec<u32>,
+    entry_nodes: Vec<u32>,
+    entry_modes: Vec<u8>,
+    files: Vec<[u64; 2]>,
+    index: Vec<u32>,
+    spans: Vec<[u32; 2]>,
+    name_bytes: Vec<u8>,
+    name_index: Vec<u32>,
+}
+
+impl Parts {
+    /// Two files and the directory naming them `a` and `b`.
+    fn new() -> Parts {
+        let mut index = vec![0; 64];
+        index[..3].copy_from_slice(&[1, 2, 3]);
+        let mut name_index = vec![0; 64];
+        name_index[..2].copy_from_slice(&[1, 2]);
+        Parts {
+            ids: (0..3u8).map(|at| ContentId::of("store test base", &[at])).collect(),
+            shapes: vec![[0, FILE], [1, FILE], [0, 2]],
+            entry_names: vec![0, 1],
+            entry_nodes: vec![0, 1],
+            entry_modes: vec![0, 1],
+            files: vec![[0, 1], [1, 2]],
+            index,
+            spans: vec![[0, 1], [1, 1]],
+            name_bytes: b"ab".to_vec(),
+            name_index,
+        }
+    }
+
+    fn check(&self, blobs: u64) -> Result<(), &'static str> {
+        Base {
+            ids: &self.ids,
+            shapes: &self.shapes,
+            entry_names: &self.entry_names,
+            entry_nodes: &self.entry_nodes,
+            entry_modes: &self.entry_modes,
+            files: &self.files,
+            index: &self.index,
+            spans: &self.spans,
+            name_bytes: &self.name_bytes,
+            name_index: &self.name_index,
+        }
+        .check(blobs)
+    }
+}
+
+#[test]
+fn a_well_formed_base_passes_its_check() {
+    assert_eq!(Parts::new().check(3), Ok(()));
+}
+
+/// Each way a base can send a read out of bounds or a walk round forever is refused.
+#[test]
+fn a_malformed_base_is_refused() {
+    let broken: [(&str, fn(&mut Parts)); 9] = [
+        ("a file past the blobs section", |parts| parts.files[1] = [2, 2]),
+        ("an entry naming a node not before its directory", |parts| parts.entry_nodes[1] = 2),
+        ("an entry whose mode is not its node's kind", |parts| parts.entry_modes[0] = DIR),
+        ("a directory's entries not sorted by name, or a name twice", |parts| {
+            parts.entry_names = vec![1, 0];
+        }),
+        ("a name that is not one path component", |parts| parts.name_bytes[1] = b'/'),
+        ("a name that is not UTF-8", |parts| parts.name_bytes[1] = 0xff),
+        ("an index that is not a power of two at most half full", |parts| parts.index.truncate(4)),
+        ("an index place naming a node the base does not have", |parts| parts.index[9] = 4),
+        ("an index fuller than its nodes or names", |parts| parts.name_index[9] = 1),
+    ];
+    for (want, breaks) in broken {
+        let mut parts = Parts::new();
+        breaks(&mut parts);
+        assert_eq!(parts.check(3), Err(want));
+    }
+    let mut parts = Parts::new();
+    parts.entry_modes.pop();
+    assert_eq!(parts.check(3), Err("node or entry columns of different lengths"));
+}
+
 /// A reader on another thread looks for a directory while the writer adds it and its child:
 /// under every interleaving and every value a load may read, it finds it whole or not at all.
 #[cfg(blaze_check)]
@@ -220,7 +302,7 @@ fn model_a_node_reads_whole_or_not_at_all() {
                     let entries = table.entries(table.shape(node));
                     assert_eq!(entries.len(), 1);
                     assert_eq!(table.id(entries.nodes[0]), &file);
-                    assert_eq!(&table.blob(table.shape(entries.nodes[0]))[..], b"f");
+                    assert_eq!(table.blob(table.shape(entries.nodes[0])).unwrap(), b"f");
                 }
             })
         };

@@ -10,22 +10,35 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::{fmt, hash, marker::PhantomData};
 
 use blake3::hazmat::{self, ContextKey, HasherExt};
+use blaze_mem::swiss::Index;
 use serde::{Deserialize, Serialize};
 
 use crate::sync::{
     Mutex, OnceLock, PoisonError,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+pub mod bits;
+#[allow(unsafe_code)]
+pub mod crc32c;
 mod many;
 pub mod names;
 pub use blaze_radix as radix;
+pub mod rng;
+mod std_hash;
 mod sync;
+
+pub use crate::std_hash::StdHash;
+
+/// Counts allocations so the read paths' tests hold them to a budget.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -279,13 +292,17 @@ pub trait Interner<T>: Sync {
 }
 
 /// The [`Interner`] of blaze v2: values in an append-only arena of chunks that never move,
-/// found by content ID in one of [`shard_count`] open-addressed tables.
+/// found by content ID in one of [`shard_count`] [`blaze_mem::swiss::Index`]es.
 ///
 /// [`Interner::get`], [`Interner::content`] and [`Interner::find`] take no lock. Interning a
 /// new value computes it first, then locks the one shard its content ID falls in only to look
-/// again and insert (a racing loser's value is dropped). A shard's table grows by copying into
+/// again and insert (a racing loser's value is dropped). A shard's index grows by copying into
 /// one twice its size, published once full; the tables it outgrew are kept until the interner
 /// is dropped, as a reader may be probing one, so the tables cost at most twice the last one.
+///
+/// Not `intern`'s interners: those key a value by its own bytes and live for the process;
+/// this one is keyed by a content ID its caller computed (so it hashes nothing), owns values
+/// of any type and drops them with itself, and gives dense indices of one run.
 ///
 /// A shard hands out indices from a block of [`BLOCK`] it claims at a time, so writers to
 /// different shards share no counter. Indices are dense but for the unused rest of each
@@ -318,9 +335,6 @@ pub fn shard_count() -> usize {
 /// 27 chunks hold every `u32`.
 const FIRST: usize = 64;
 const CHUNKS: usize = 27;
-/// Table `k` of a shard has `TABLE << k` places: 28 hold more than a `u32` of entries.
-const TABLE: usize = 16;
-const TABLES: usize = 28;
 
 type Chunks<T> = [OnceLock<Box<[OnceLock<(ContentId, T)>]>>; CHUNKS];
 
@@ -337,23 +351,17 @@ struct Shard {
     lock: Mutex<Claimed>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
-    /// Which of `tables` is the one in use.
-    level: AtomicUsize,
-    /// A place holds [`entry`]: an index plus one in its low half (0 is empty) and the ID's
-    /// [`tag`] in its high half, so a probe compares the tag in the table and reads a value
-    /// only on a match, and growing never reads a value. 8 bytes a place, at most half full;
-    /// a find is one acquire load per place probed, about 1.5 at that load.
-    tables: [OnceLock<Box<[AtomicU64]>>; TABLES],
+    /// The shard's values by [`probe_hash`]: a find is one control word and one slot, then
+    /// the slot's ID compared only on a tag match.
+    index: Index,
 }
 
-/// Bits 64..96 of the ID: where its probe starts (masked to the table) and the tag a place
-/// keeps of it. The shard was picked by bits 0..32, so these are independent of it.
-fn tag(id: &ContentId) -> u32 {
-    u32::from_le_bytes([id.0[8], id.0[9], id.0[10], id.0[11]])
-}
-
-fn entry(tag: u32, raw: u32) -> u64 {
-    (tag as u64) << 32 | (raw as u64 + 1)
+/// Bits 64..128 of the ID: its probe's start (the low bits) and tag (the top seven). The shard
+/// was picked by bits 0..32, so these are independent of it, and an ID is already a hash.
+fn probe_hash(id: &ContentId) -> u64 {
+    let mut word = [0; 8];
+    word.copy_from_slice(&id.0[8..16]);
+    u64::from_le_bytes(word)
 }
 
 fn chunk_of(raw: u32) -> (usize, usize) {
@@ -372,8 +380,7 @@ impl<T: Send + Sync> Sharded<T> {
                 .map(|_| Shard {
                     lock: Mutex::new(Claimed { next: 0, end: 0 }),
                     len: AtomicU32::new(0),
-                    level: AtomicUsize::new(0),
-                    tables: std::array::from_fn(|_| OnceLock::new()),
+                    index: Index::new(),
                 })
                 .collect(),
             mask: count - 1,
@@ -397,51 +404,10 @@ impl<T: Send + Sync> Sharded<T> {
         &self.shards[u32::from_le_bytes(word) as usize & self.mask]
     }
 
-    /// The table in use, made if the shard has none yet: for writers only.
-    fn table(shard: &Shard, level: usize) -> &[AtomicU64] {
-        shard.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU64::new(0)).collect())
-    }
-
-    fn probe(&self, table: &[AtomicU64], id: &ContentId) -> Result<Idx<T>, usize> {
-        let mask = table.len() - 1;
-        let tag = tag(id);
-        let mut at = tag as usize & mask;
-        loop {
-            match table[at].load(Ordering::Acquire) {
-                0 => return Err(at),
-                entry if (entry >> 32) as u32 == tag => {
-                    let raw = entry as u32 - 1;
-                    let (content, _) = self.slot(raw).expect("a table entry before its value");
-                    if content == id {
-                        return Ok(Idx::from_raw(raw));
-                    }
-                }
-                _ => {}
-            }
-            at = (at + 1) & mask;
-        }
-    }
-
-    /// Moves a full shard's entries into a table twice its size and makes it the one in use,
-    /// from the tags alone. Called with the shard locked.
-    fn grow(&self, shard: &Shard, level: usize) -> usize {
-        assert!(level + 1 < TABLES, "a shard of more than 2^30 values");
-        let old = Self::table(shard, level);
-        let new = Self::table(shard, level + 1);
-        let mask = new.len() - 1;
-        for entry in old {
-            let entry = entry.load(Ordering::Relaxed);
-            if entry == 0 {
-                continue;
-            }
-            let mut at = (entry >> 32) as usize & mask;
-            while new[at].load(Ordering::Relaxed) != 0 {
-                at = (at + 1) & mask;
-            }
-            new[at].store(entry, Ordering::Relaxed);
-        }
-        shard.level.store(level + 1, Ordering::Release);
-        level + 1
+    /// The index of `id` in `shard`, taking no lock.
+    fn probe(&self, shard: &Shard, id: &ContentId) -> Option<Idx<T>> {
+        let is = |raw: u32| self.slot(raw).expect("an index entry before its value").0 == *id;
+        shard.index.find(probe_hash(id), is).map(Idx::from_raw)
     }
 }
 
@@ -459,14 +425,10 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         let value = value();
         let shard = self.shard(&id);
         let mut claimed = shard.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut level = shard.level.load(Ordering::Acquire);
-        if let Ok(found) = self.probe(Self::table(shard, level), &id) {
+        if let Some(found) = self.probe(shard, &id) {
             return found;
         }
         let len = shard.len.load(Ordering::Relaxed);
-        if (len as usize + 1) * 2 > TABLE << level {
-            level = self.grow(shard, level);
-        }
         if claimed.next == claimed.end {
             let start = self.next.fetch_add(BLOCK as u64, Ordering::AcqRel);
             assert!(start + BLOCK as u64 <= u32::MAX as u64, "an interner of 2^32 values");
@@ -480,9 +442,8 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         if slots[at].set((id, value)).is_err() {
             unreachable!("index {raw} handed out twice");
         }
-        let table = Self::table(shard, level);
-        let Err(empty) = self.probe(table, &id) else { unreachable!("interned under the lock") };
-        table[empty].store(entry(tag(&id), raw), Ordering::Release);
+        let hash_of = |raw: u32| probe_hash(&self.slot(raw).expect("an index entry before its value").0);
+        shard.index.insert(len as usize, probe_hash(&id), raw, hash_of);
         shard.len.store(len + 1, Ordering::Relaxed);
         Idx::from_raw(raw)
     }
@@ -497,9 +458,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
 
     /// No lock, no write and no allocation: a shard with no table yet holds nothing.
     fn find(&self, id: &ContentId) -> Option<Idx<T>> {
-        let shard = self.shard(id);
-        let level = shard.level.load(Ordering::Acquire);
-        self.probe(shard.tables[level].get()?, id).ok()
+        self.probe(self.shard(id), id)
     }
 
     fn len(&self) -> usize {
@@ -589,7 +548,7 @@ mod tests {
     fn a_find_in_an_empty_shard_makes_no_table() {
         let interner = Sharded::<u8>::new();
         assert_eq!(interner.find(&id(3)), None);
-        assert!(interner.shards.iter().all(|shard| shard.tables.iter().all(|it| it.get().is_none())));
+        assert!(interner.shards.iter().all(|shard| shard.index.capacity() == 0));
     }
 
     #[cfg(not(blaze_check))]
@@ -758,8 +717,8 @@ mod model {
 
     use super::*;
 
-    /// An ID in shard `shard` (bits 0..32) whose tag, and so probe start, is `tag` (bits
-    /// 64..96), told apart from the others by `key`.
+    /// An ID in shard `shard` (bits 0..32) whose probe starts from `tag` (bits 64..96; bits
+    /// 96..128 are 0, so every key has one SwissTable tag), told apart by `key`.
     fn id(shard: u32, tag: u32, key: u8) -> ContentId {
         let mut bytes = [0; 32];
         bytes[..4].copy_from_slice(&shard.to_le_bytes());
@@ -924,31 +883,32 @@ mod model {
         });
     }
 
-    /// Eight keys fill a shard's first table to half, so whichever of 8 and 9 goes in first
-    /// grows it, while the other thread finds a key from before the growth and races the insert.
+    /// Six keys fill a shard's first index table (eight slots) to three quarters, so whichever
+    /// of 6 and 7 goes in first grows it, while the other thread finds a key from before the
+    /// growth and races the insert.
     #[test]
     fn model_growth_keeps_every_index() {
         blaze_check::model(|| {
-            let model = Model::new((0..10).map(|tag| (0, tag)));
-            let before: Vec<Option<Idx<Counted>>> = (0..8).map(|key| model.run(Op::Intern(key))).collect();
+            let model = Model::new((0..8).map(|tag| (0, tag)));
+            let before: Vec<Option<Idx<Counted>>> = (0..6).map(|key| model.run(Op::Intern(key))).collect();
             let other = {
                 let model = model.clone();
-                thread::spawn(move || [Op::Intern(8), Op::Intern(9)].map(|op| model.run(op)))
+                thread::spawn(move || [Op::Intern(6), Op::Intern(7)].map(|op| model.run(op)))
             };
             let zero = model.run(Op::Find(0));
-            let nine = model.run(Op::Intern(9));
-            let eight = model.run(Op::Find(8));
-            let [eight_at, nine_at] = other.join().unwrap();
+            let seven = model.run(Op::Intern(7));
+            let six = model.run(Op::Find(6));
+            let [six_at, seven_at] = other.join().unwrap();
             assert_eq!(zero, before[0], "a key from before the growth is found at its index");
-            assert_eq!(nine, nine_at, "one index for key 9");
-            if eight.is_some() {
-                assert_eq!(eight, eight_at, "key 8 found at its index");
+            assert_eq!(seven, seven_at, "one index for key 7");
+            if six.is_some() {
+                assert_eq!(six, six_at, "key 6 found at its index");
             }
-            let all: Vec<Option<Idx<Counted>>> = before.iter().copied().chain([eight_at, nine_at]).collect();
+            let all: Vec<Option<Idx<Counted>>> = before.iter().copied().chain([six_at, seven_at]).collect();
             for (key, &idx) in all.iter().enumerate() {
                 assert_eq!(model.interner.find(&model.ids[key]), idx, "key {key} kept across the growth");
             }
-            assert_eq!(model.interner.len(), 10);
+            assert_eq!(model.interner.len(), 8);
             Model::finish(model);
         });
     }

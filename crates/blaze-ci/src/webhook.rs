@@ -3,7 +3,7 @@
 
 use std::{borrow::Cow, fmt};
 
-use blaze_api::http::HttpRequest;
+use blaze_api::http::{HttpRequest, HttpRequestRef};
 use ring::hmac;
 use serde::Deserialize;
 
@@ -139,14 +139,28 @@ pub fn parse(kind: &str, id: &str, body: &[u8]) -> Result<Delivery, WebhookError
 
 /// [`verify`] then [`parse`], from the request's headers. Only `POST`.
 pub fn receive(secret: &[u8], request: &HttpRequest) -> Result<Delivery, WebhookError> {
-    if request.method != "POST" {
-        return Err(WebhookError::new(
-            405,
-            format!("a webhook delivery is a POST, this was a {}", request.method),
-        ));
+    receive_parts(secret, &request.method, |name| request.header(name), &request.body)
+}
+
+/// [`receive`] of a request read in place ([`RequestParser::next_ref`]): its head and body
+/// are neither copied nor allocated.
+///
+/// [`RequestParser::next_ref`]: blaze_api::http::RequestParser::next_ref
+pub fn receive_ref(secret: &[u8], request: &HttpRequestRef<'_>) -> Result<Delivery, WebhookError> {
+    receive_parts(secret, request.method, |name| request.header(name), request.body)
+}
+
+fn receive_parts<'a>(
+    secret: &[u8],
+    method: &str,
+    header: impl Fn(&str) -> Option<&'a str>,
+    body: &[u8],
+) -> Result<Delivery, WebhookError> {
+    if method != "POST" {
+        return Err(WebhookError::new(405, format!("a webhook delivery is a POST, this was a {method}")));
     }
-    verify(secret, &request.body, request.header("X-Hub-Signature-256"))?;
-    if let Some(kind) = request.header("Content-Type") {
+    verify(secret, body, header("X-Hub-Signature-256"))?;
+    if let Some(kind) = header("Content-Type") {
         let essence = kind.split(';').next().unwrap_or_default().trim();
         if !essence.eq_ignore_ascii_case("application/json") {
             return Err(WebhookError::new(
@@ -155,13 +169,11 @@ pub fn receive(secret: &[u8], request: &HttpRequest) -> Result<Delivery, Webhook
             ));
         }
     }
-    let kind = request
-        .header("X-GitHub-Event")
+    let kind = header("X-GitHub-Event")
         .ok_or_else(|| WebhookError::new(400, "the delivery has no X-GitHub-Event"))?;
-    let id = request
-        .header("X-GitHub-Delivery")
+    let id = header("X-GitHub-Delivery")
         .ok_or_else(|| WebhookError::new(400, "the delivery has no X-GitHub-Delivery"))?;
-    parse(kind, id, &request.body)
+    parse(kind, id, body)
 }
 
 fn payload<'a, T: Deserialize<'a>>(kind: &str, body: &'a [u8]) -> Result<T, WebhookError> {

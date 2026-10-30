@@ -9,7 +9,8 @@
 //! [`Live::guard`].
 //!
 //! The descriptor ([`crate::patch::Descriptor`]) says where everything is. A program at
-//! generation `g` takes the message in the file [`message_file`]`(g)` of the directory it
+//! generation `g` takes the message in the file
+//! [`message_file`](crate::patch::message_file)`(g)` of the directory it
 //! names, read into a buffer kept from message to message, and answers each there
 //! ([`crate::patch::Answer`]). A thread blocks on the platform's notification of changes to
 //! the directory (inotify, kqueue, change notifications) and counts them, so [`Live::poll`]
@@ -25,14 +26,15 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    thread::Thread,
     time::SystemTime,
 };
 
 use crate::patch::{
-    ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file,
+    ANSWER, Answer, DESCRIPTOR, DESCRIPTOR_MAGIC, Descriptor, Message, message_file_into,
 };
 use os::backtrace;
 use switch::{KEPT, Layout, Switch};
@@ -186,11 +188,16 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 pub(crate) struct Events {
     count: AtomicU64,
     stop: AtomicBool,
+    /// The thread of [`Live::apply_as_they_come`], woken at each event.
+    waiter: OnceLock<Thread>,
 }
 
 impl Events {
     pub(crate) fn tell(&self) {
         self.count.fetch_add(1, Ordering::Release);
+        if let Some(waiter) = self.waiter.get() {
+            waiter.unpark();
+        }
     }
 
     pub(crate) fn stopped(&self) -> bool {
@@ -259,6 +266,9 @@ pub struct Live {
     taken: VecDeque<(u64, Identity)>,
     /// The bytes of the last message, its buffer kept for the next.
     message: Vec<u8>,
+    /// The path of the last message file looked for, and its name, kept for the next.
+    path: PathBuf,
+    name: String,
 }
 
 impl Live {
@@ -286,16 +296,31 @@ impl Live {
         let layout = Layout::new(&descriptor, at)?;
         let memory = os::Os::new(&layout)?;
         let dir = directory(&layout, &memory)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let sampled = {
+            let (slide, image) = (layout.slide, memory.image());
+            crate::sample::Code {
+                slide,
+                image: image.start.wrapping_sub(slide)..image.end.wrapping_sub(slide),
+                patches: layout.code.clone(),
+            }
+        };
         let switch = Switch::new(memory, layout)?;
         let mut create = std::fs::DirBuilder::new();
         create.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut create, 0o700);
         create.create(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+        _ = crate::DIR.set(dir.clone());
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        crate::sample::start(dir.clone(), sampled);
         hook::install();
         let events = Arc::new(Events::default());
         os::watch(&dir, events.clone())?;
         let answers = Answers::new(&dir);
+        let mut name = String::new();
+        message_file_into(switch.current(), &mut name);
+        let path = dir.join(&name);
         Ok(Live {
             switch,
             dir,
@@ -304,6 +329,8 @@ impl Live {
             looked: None,
             taken: VecDeque::new(),
             message: Vec::new(),
+            path,
+            name,
         })
     }
 
@@ -333,17 +360,47 @@ impl Live {
         }
     }
 
+    /// Takes each message as soon as it comes, on a thread of its own woken by the watcher,
+    /// instead of at [`Live::poll`], and tells `told` what became of it. For a program whose
+    /// functions can change between any two calls: one of many functions that work together
+    /// can be in the middle of a frame when some of them do, and data a patch changes in place
+    /// is stored while other threads may use it, as [`Live::poll`] says.
+    pub fn apply_as_they_come(mut self, mut told: impl FnMut(Outcome) + Send + 'static) {
+        let applying = move || {
+            _ = self.events.waiter.set(std::thread::current());
+            loop {
+                if let Some(outcome) = self.poll() {
+                    told(outcome);
+                }
+                std::thread::park();
+            }
+        };
+        std::thread::Builder::new()
+            .name("blaze-live-apply".to_owned())
+            .spawn(applying)
+            .expect("spawning the thread that applies patches");
+    }
+
     /// Takes the message for `generation`, if one came that wasn't taken.
     fn next(&mut self, generation: u64) -> Option<Outcome> {
-        let path = self.dir.join(message_file(generation));
-        let file = match File::open(&path) {
+        message_file_into(generation, &mut self.name);
+        self.path.set_file_name(&self.name);
+        let path = std::mem::take(&mut self.path);
+        let outcome = self.read_message(generation, &path);
+        self.path = path;
+        outcome
+    }
+
+    /// Takes the message file at `path`, for `generation`, unless it was taken already.
+    fn read_message(&mut self, generation: u64, path: &Path) -> Option<Outcome> {
+        let file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => return Some(self.unread(generation, &path, &error.to_string())),
+            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
         };
         let meta = match file.metadata() {
             Ok(meta) => meta,
-            Err(error) => return Some(self.unread(generation, &path, &error.to_string())),
+            Err(error) => return Some(self.unread(generation, path, &error.to_string())),
         };
         let identity = Identity::of(&meta);
         if self.taken.contains(&(generation, identity)) {
@@ -355,10 +412,12 @@ impl Live {
         self.taken.push_back((generation, identity));
         // Read, not mapped: the bytes checked are the bytes written, whatever happens to the
         // file meanwhile.
+        // One `read` of the length the file has: `take` ends the read there, with no second
+        // `read` to find the end.
         self.message.clear();
         self.message.reserve(usize::try_from(meta.len()).unwrap_or(0));
-        if let Err(error) = (&file).read_to_end(&mut self.message) {
-            return Some(self.unread(generation, &path, &error.to_string()));
+        if let Err(error) = (&file).take(meta.len()).read_to_end(&mut self.message) {
+            return Some(self.unread(generation, path, &error.to_string()));
         }
         drop(file);
         let (outcome, said) = match Message::view(&self.message) {

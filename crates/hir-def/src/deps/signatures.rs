@@ -25,16 +25,17 @@ mod tests;
 
 use std::mem::offset_of;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Crate, Db};
 use blaze_format::{
-    ALIGN, FormatError, Part as SchemaPart, Persist, Record, SchemaHash, Slice, Writer, open_as,
+    ALIGN, Aligned, FormatError, Part as SchemaPart, Persist, Record, SchemaHash, Slice, Writer,
+    open_as,
 };
 use blaze_ids::ContentId;
 use hir_expand::name::Name;
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
-use self::{codes::Sig, key::Item};
+use self::{codes::Sig, key::Item, table::StoreBytes};
 use crate::{
     AdtId, AssocItemId, ConstId, EnumId, FunctionId, ImplId, ModuleDefId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId, VariantId,
@@ -114,28 +115,34 @@ const RECORD_SCHEMA: SchemaHash = blaze_format::schema_of(&[
 
 /// The signatures part of the image of `krate`: a record of every signature query of every item
 /// of its modules. An item that cannot be written portably fails the whole part, with why.
-pub(crate) fn encode(db: &dyn SourceDatabase, krate: Crate) -> R<Vec<u8>> {
-    let mut keyed = Vec::new();
-    for item in items(db, krate) {
+pub(crate) fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
+    let items = items(db, krate);
+    let mut keyed = Vec::with_capacity(items.len());
+    for item in items {
+        // alloc: the error that fails the part.
         let (_, key) = key::of(db, item).ok_or_else(|| format!("{item:?} is in a block"))?;
         keyed.push((key, item));
     }
     keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     keyed.dedup();
     if let Some(pair) = keyed.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        // alloc: the error that fails the part.
         return Err(format!("{:?} and {:?} have one key", pair[0].1, pair[1].1));
     }
     let mut out = Writer::new(SCHEMA);
     let mut places = Vec::with_capacity(keyed.len());
+    // alloc: the error that fails the part.
     let place = |it: usize| u32::try_from(it).map_err(|_| "a part of 4 GiB or more".to_owned());
     for &(_, item) in &keyed {
         let record = record_of(db, krate, item)
+            // alloc: the error that fails the part.
             .map_err(|why| format!("the signature of {item:?}: {why}"))?;
         let at = out.bytes.len().next_multiple_of(ALIGN);
         out.bytes.resize(at, 0);
         out.bytes.extend_from_slice(&record);
         places.push(Place { at: place(at)?, len: place(record.len())? });
     }
+    // alloc: the key column, written once per crate.
     let keys: Vec<ContentId> = keyed.iter().map(|&(key, _)| key).collect();
     let keys = Column::push(&mut out, &keys);
     let places = Column::push(&mut out, &places);
@@ -152,7 +159,8 @@ pub(crate) fn encode(db: &dyn SourceDatabase, krate: Crate) -> R<Vec<u8>> {
 /// Each signature query of the items of `krate`'s modules: what the front end asks of a
 /// dependency's items. Items in blocks are left out: their blocks are lowered with the body
 /// they are in.
-fn items(db: &dyn SourceDatabase, krate: Crate) -> Vec<Item> {
+fn items(db: &Db, krate: Crate) -> Vec<Item> {
+    // alloc: the items of one crate, listed once at store time.
     let mut items = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         let scope = module.scope(db);
@@ -202,7 +210,7 @@ fn assoc(items: &mut Vec<Item>, assoc: &[(Name, AssocItemId)]) {
 }
 
 /// The record of `item` of `krate`, from its signature as this database has it.
-fn record_of(db: &dyn SourceDatabase, krate: Crate, item: Item) -> R<Vec<u8>> {
+fn record_of(db: &Db, krate: Crate, item: Item) -> R<Vec<u8>> {
     let what = item.what();
     match item {
         Item::Struct(id) => record::<codes::Struct>(db, krate, what, StructSignature::of(db, id)),
@@ -226,7 +234,7 @@ fn record_of(db: &dyn SourceDatabase, krate: Crate, item: Item) -> R<Vec<u8>> {
 /// The record of `of`, the value of query `what` of an item of `krate`. The same value is the
 /// same bytes in every process: the table lists the ids in the order they are first written,
 /// the store first.
-fn record<S: Sig>(db: &dyn SourceDatabase, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
+fn record<S: Sig>(db: &Db, krate: Crate, what: u8, of: &S::Of) -> R<Vec<u8>> {
     let mut table = Relocation::new();
     let mut store =
         S::store(of).map(|store| relocating(&mut table, || blaze_format::to_bytes(store)));
@@ -258,33 +266,47 @@ fn record<S: Sig>(db: &dyn SourceDatabase, krate: Crate, what: u8, of: &S::Of) -
     Ok(out.finish(at))
 }
 
+/// Why bytes do not read, for the panic of a corrupt image.
 fn format_error(error: FormatError) -> String {
+    // alloc: the reason of a panic.
     error.to_string()
 }
 
-/// The record of `item` in `part`, the signatures part of its crate's image.
-fn find<'a>(db: &dyn SourceDatabase, part: &'a [u8], item: Item) -> R<&'a [u8]> {
+/// The record of `item` in `part`, the signatures part of its crate's image: two plain columns
+/// checked in place, a key hashed and a binary search, nothing allocated.
+fn find<'a>(db: &Db, part: &'a [u8], item: Item) -> R<&'a [u8]> {
     let root = open_as::<PartRoot>(part, SCHEMA).map_err(format_error)?;
     let keys = root.keys.follow(part).map_err(format_error)?;
     let places = root.places.follow(part).map_err(format_error)?;
     if keys.len() != places.len() {
+        // alloc: the reason of a panic.
         return Err("its keys and records are not one each".to_owned());
     }
     let (_, key) = key::of(db, item).expect("an item outside a block has a key");
     let Ok(at) = keys.binary_search(&key) else {
+        // alloc: the reason of a panic.
         return Err("its signatures part has no record of the item".to_owned());
     };
     let Place { at, len } = places[at];
     let end = (at as usize).checked_add(len as usize);
     end.and_then(|end| part.get(at as usize..end))
+        // alloc: the reason of a panic.
         .ok_or_else(|| "a record past the end of its signatures part".to_owned())
 }
 
 /// The value of `bytes`, the record of query `what` of an item of `krate`, with each id it
-/// names made in this database.
-fn read<S: Sig>(db: &dyn SourceDatabase, krate: Crate, what: u8, bytes: &[u8]) -> R<S::Value> {
+/// names made in this database. `bytes` are inside `image`, which a store read in place
+/// borrows its columns from.
+fn read<S: Sig>(
+    db: &Db,
+    krate: Crate,
+    what: u8,
+    image: &std::sync::Arc<Aligned>,
+    bytes: &[u8],
+) -> R<S::Value> {
     let rec = open_as::<RecordRoot>(bytes, RECORD_SCHEMA).map_err(format_error)?;
     if rec.what != u32::from(what) {
+        // alloc: the reason of a panic.
         return Err(format!("a record of query {} where {what} was asked", rec.what));
     }
     let mut table = table::decode(db, krate, rec.table.follow(bytes).map_err(format_error)?)?;
@@ -298,7 +320,10 @@ fn read<S: Sig>(db: &dyn SourceDatabase, krate: Crate, what: u8, bytes: &[u8]) -
     let cfg = krate.cfg_options(db);
     relocating(&mut table, || {
         let store = match &store {
-            Some(store) => Some(ExpressionStore::read(store)?.decode()?),
+            Some(StoreBytes::InPlace(store)) => {
+                Some(ExpressionStore::read(store)?.decode_in(image)?)
+            }
+            Some(StoreBytes::Moved(store)) => Some(ExpressionStore::read(store)?.decode()?),
             None => None,
         };
         S::get(&mut Read::new(&rec.words, bytes), store, cfg)
@@ -308,7 +333,7 @@ fn read<S: Sig>(db: &dyn SourceDatabase, krate: Crate, what: u8, bytes: &[u8]) -
 
 #[cold]
 #[inline(never)]
-fn corrupt(db: &dyn SourceDatabase, krate: Crate, item: Item, why: &str) -> ! {
+fn corrupt(db: &Db, krate: Crate, item: Item, why: &str) -> ! {
     panic!(
         "the image of crate {} is corrupt: the signature of {item:?}: {why}; its bytes were \
          checked against their key, so an encoding wrote what it does not read",
@@ -324,7 +349,7 @@ fn corrupt(db: &dyn SourceDatabase, krate: Crate, item: Item, why: &str) -> ! {
 /// naming the crate, the item and why. Serving only gives a database images whose bytes the
 /// store checked against their key, so lowering the item instead would hide a bug.
 fn served<S: Sig>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item: Item,
     live: impl FnOnce(Crate) -> R<Vec<u8>>,
 ) -> Option<S::Value> {
@@ -338,7 +363,8 @@ fn served<S: Sig>(
     let part = image.view().part(Part::Signatures);
     let record = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
     let value =
-        read::<S>(db, krate, what, record).unwrap_or_else(|why| corrupt(db, krate, item, &why));
+        read::<S>(db, krate, what, image.bytes(), record)
+            .unwrap_or_else(|why| corrupt(db, krate, item, &why));
     match image.mode() {
         Mode::Serve => {}
         Mode::Check => {
@@ -356,7 +382,7 @@ fn served<S: Sig>(
 /// Records a difference between `written`, the record of `what` of `item`, and `record`, the
 /// image's.
 fn compare(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
     item: Item,
     what: &str,
@@ -366,10 +392,12 @@ fn compare(
     match written {
         Ok(written) if written == record => {}
         Ok(written) => {
+            // alloc: a difference, which is a bug.
             let what = format!("{what}, of {item:?}");
             frozen::record_difference(db, krate, "signatures", &what, &written, record);
         }
         Err(why) => {
+            // alloc: a difference, which is a bug.
             let what = format!("{what}, of {item:?}, which does not write ({why})");
             frozen::record_difference(db, krate, "signatures", &what, &[], &[]);
         }
@@ -379,7 +407,7 @@ fn compare(
 macro_rules! served {
     ($($(#[$doc:meta])* $name:ident($id:ty) -> $sig:ident as $code:ident;)*) => {$(
         $(#[$doc])*
-        pub(crate) fn $name(db: &dyn SourceDatabase, id: $id) -> Option<Arc<$sig>> {
+        pub(crate) fn $name(db: &Db, id: $id) -> Option<Arc<$sig>> {
             let item = Item::$code(id);
             served::<codes::$code>(db, item, |krate| {
                 record::<codes::$code>(db, krate, item.what(), &$sig::with_source_map(db, id).0)
@@ -413,7 +441,7 @@ served! {
 
 /// [`EnumVariants::of`] from the image of its crate, if it has one.
 pub(crate) fn served_enum_variants(
-    db: &dyn SourceDatabase,
+    db: &Db,
     id: EnumId,
 ) -> Option<(EnumVariants, ThinVec<InactiveEnumVariantCode>)> {
     let item = Item::Variants(id);

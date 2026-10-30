@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{GenericParamId, TraitId};
 use rustc_type_ir::{
     TyVid, TypeFoldable, TypeVisitableExt,
@@ -24,7 +24,7 @@ use crate::{
         infer::{
             DbInternerInferExt, InferCtxt, InferOk,
             at::At,
-            errors::FulfillmentError,
+            errors::{FulfillmentError, FulfillmentErrorCode},
             snapshot::CombinedSnapshot,
             traits::{Obligation, ObligationCause, PredicateObligation},
         },
@@ -107,7 +107,7 @@ impl<'a, 'db> ProofTreeVisitor<'db> for NestedObligationsForSelfTy<'a, 'db> {
 /// type for the types to unify. For example `Option<T>` and `Option<U>` unify although there is
 /// unresolved goal `T = U`.
 pub fn could_unify<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     tys: &Canonical<'db, (Ty<'db>, Ty<'db>)>,
 ) -> bool {
@@ -119,7 +119,7 @@ pub fn could_unify<'db>(
 /// This means that placeholder types are not considered to unify if there are any bounds set on
 /// them. For example `Option<T>` and `Option<U>` do not unify as we cannot show that `T = U`
 pub fn could_unify_deeply<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     tys: &Canonical<'db, (Ty<'db>, Ty<'db>)>,
 ) -> bool {
@@ -127,7 +127,7 @@ pub fn could_unify_deeply<'db>(
 }
 
 fn could_unify_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     tys: &Canonical<'db, (Ty<'db>, Ty<'db>)>,
     select: for<'a> fn(&mut ObligationCtxt<'a, 'db>) -> Vec<NextSolverError<'db>>,
@@ -146,7 +146,7 @@ fn could_unify_impl<'db>(
 }
 
 pub(crate) struct InferenceTable<'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) param_env: ParamEnv<'db>,
     pub(crate) infer_ctxt: InferCtxt<'db>,
     pub(super) fulfillment_cx: FulfillmentCtxt<'db>,
@@ -159,7 +159,7 @@ impl<'db> InferenceTable<'db> {
     /// Inside hir-ty you should use this for inference only, and always pass `owner`.
     /// Outside it, always pass `owner = None`.
     pub(crate) fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         trait_env: ParamEnv<'db>,
         krate: Crate,
         owner: InferBodyId<'db>,
@@ -230,7 +230,7 @@ impl<'db> InferenceTable<'db> {
         }
 
         obligations_for_self_ty.retain_mut(|obligation| {
-            obligation.predicate = self.infer_ctxt.resolve_vars_if_possible(obligation.predicate);
+            obligation.predicate = self.infer_ctxt.deeply_resolve_ignoring_regions(obligation.predicate);
             !obligation.predicate.has_placeholders()
         });
         obligations_for_self_ty
@@ -337,7 +337,7 @@ impl<'db> InferenceTable<'db> {
     }
 
     pub(crate) fn resolve_vars_if_possible<T: TypeFoldable<DbInterner<'db>>>(&self, t: T) -> T {
-        self.infer_ctxt.resolve_vars_if_possible(t)
+        self.infer_ctxt.deeply_resolve_ignoring_regions(t)
     }
 
     pub(crate) fn resolve_vars_with_obligations<T>(&mut self, t: T) -> T
@@ -348,14 +348,14 @@ impl<'db> InferenceTable<'db> {
             return t;
         }
 
-        let t = self.infer_ctxt.resolve_vars_if_possible(t);
+        let t = self.infer_ctxt.deeply_resolve_ignoring_regions(t);
 
         if !t.has_non_region_infer() {
             return t;
         }
 
         self.select_obligations_where_possible();
-        self.infer_ctxt.resolve_vars_if_possible(t)
+        self.infer_ctxt.deeply_resolve_ignoring_regions(t)
     }
 
     /// Create a `GenericArgs` full of infer vars for `def`.
@@ -457,6 +457,31 @@ impl<'db> InferenceTable<'db> {
     pub(crate) fn select_obligations_where_possible(&mut self) {
         let errors = self.fulfillment_cx.try_evaluate_obligations(&self.infer_ctxt);
         self.record_trait_errors(errors);
+    }
+
+    /// The ambiguities to report once inference is done: those found so far (normalizing a
+    /// type structurally, which rustc reports where it happens), then the goals still pending
+    /// (rustc's `report_ambiguity_errors`), after the goals stalled on a coroutine of the body
+    /// are set aside (`drain_stalled_coroutine_obligations`; rustc checks them after borrowck).
+    pub(super) fn take_ambiguity_errors(
+        &mut self,
+    ) -> (Vec<FulfillmentError<'db>>, Vec<FulfillmentError<'db>>) {
+        self.select_obligations_where_possible();
+        let infcx = &self.infer_ctxt;
+        _ = self.fulfillment_cx.drain_stalled_obligations_for_coroutines(infcx);
+        let found: Vec<_> = self
+            .trait_errors
+            .extract_if(.., |error| {
+                matches!(error.code, FulfillmentErrorCode::Ambiguity { overflow: None })
+            })
+            .collect(); // alloc: error path, none of a body without an ambiguity
+        let pending = self
+            .fulfillment_cx
+            .collect_remaining_errors(infcx)
+            .into_iter()
+            .map(|error| error.into_fulfillment_error(infcx))
+            .collect(); // alloc: error path, none of a body without an ambiguity
+        (found, pending)
     }
 
     pub(super) fn record_trait_errors(
@@ -721,6 +746,8 @@ pub(super) mod resolve_completely {
             self.ctx.unresolved_vars.push(InferenceDiagnostic::TypeMustBeKnown {
                 at_point: span,
                 top_term: Some(GenericArg::from(top_term).store()),
+                kind: crate::solver_errors::TypeAnnotationNeeded::E0282,
+                ambiguity: None,
             });
         }
     }
@@ -841,10 +868,17 @@ pub(super) mod resolve_completely {
             T: Into<Term<'db>> + TypeSuperFoldable<DbInterner<'db>> + Copy,
         {
             // Without any of `NORMALIZE_FLAGS`, deep normalization registers no goal and gives
-            // `value` back, so its fulfillment context and rounds are skipped.
+            // `value` back, so its fulfillment context and rounds are skipped; without a region
+            // variable either, `DiagnoseInferVars` gives it back too.
+            let renormalize = self.should_normalize
+                && rustc_type_ir::Interner::renormalize_rigid_aliases(self.cx());
+            if !renormalize
+                && !value.has_type_flags(Self::NORMALIZE_FLAGS.union(TypeFlags::HAS_RE_INFER))
+            {
+                return value;
+            }
             let value = if self.should_normalize
-                && (rustc_type_ir::Interner::renormalize_rigid_aliases(self.cx())
-                    || value.has_type_flags(Self::NORMALIZE_FLAGS))
+                && (renormalize || value.has_type_flags(Self::NORMALIZE_FLAGS))
             {
                 // FIXME: This should not use a dummy span.
                 let cause = ObligationCause::new(Span::Dummy);

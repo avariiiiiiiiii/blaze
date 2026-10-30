@@ -4,6 +4,8 @@
 
 use std::ops::Range;
 
+use blaze_ids::rng;
+
 /// The shortest chunk but a value's last.
 pub const MIN: usize = 16 << 10;
 pub(crate) const AVERAGE: usize = 64 << 10;
@@ -24,11 +26,8 @@ const fn gear() -> [u64; 256] {
     let mut state: u64 = 0x626c_617a_6520_7632;
     let mut at = 0;
     while at < 256 {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        out[at] = z ^ (z >> 31);
+        state = state.wrapping_add(rng::GAMMA);
+        out[at] = rng::mix(state);
         at += 1;
     }
     out
@@ -251,13 +250,20 @@ fn cut_scalar(bytes: &[u8]) -> usize {
 /// at least [`MIN`]. These are the pieces the store keeps an output as.
 pub fn chunks(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut out = Vec::with_capacity(bytes.len() / AVERAGE + 1);
-    let mut start = 0;
-    while start < bytes.len() {
-        let len = cut(&bytes[start..]);
-        out.push(start..start + len);
-        start += len;
-    }
+    out.extend(cuts(bytes));
     out
+}
+
+/// [`chunks`], cut as they are walked: no list is made.
+pub fn cuts(bytes: &[u8]) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        (start < bytes.len()).then(|| {
+            let len = cut(&bytes[start..]);
+            start += len;
+            start - len..start
+        })
+    })
 }
 
 #[cfg(test)]
@@ -267,8 +273,15 @@ mod tests {
     use super::*;
 
     fn noise(len: usize, seed: u64) -> Vec<u8> {
-        let mut rng = blaze_core::sim::Rng::new(seed);
+        let mut rng = rng::SplitMix64::new(seed);
         (0..len).map(|_| rng.next_u64() as u8).collect()
+    }
+
+    #[test]
+    fn the_gear_table_is_the_format() {
+        assert_eq!(GEAR[..3], [0x2db9_8404_6906_f47e, 0x9400_e56a_1a4e_6d5d, 0x7873_de3b_2d33_0196]);
+        let mut stream = rng::SplitMix64::new(0x626c_617a_6520_7632);
+        assert!(GEAR.iter().all(|&word| word == stream.next_u64()));
     }
 
     #[test]
@@ -353,7 +366,7 @@ mod tests {
     #[test]
     fn every_path_agrees_over_many_seeds() {
         for seed in 100..164 {
-            let mut rng = blaze_core::sim::Rng::new(seed);
+            let mut rng = rng::SplitMix64::new(seed);
             let len = MIN + rng.below((3 * MAX) as u64) as usize;
             every_path_agrees(&noise(len, seed), "noise");
         }
@@ -383,7 +396,7 @@ mod tests {
         for _ in 0..64 {
             saturated = (saturated << 1).wrapping_add(GEAR[0]);
         }
-        let mut rng = blaze_core::sim::Rng::new(seed);
+        let mut rng = rng::SplitMix64::new(seed);
         for _ in 0..1u64 << 26 {
             let chosen = rng.next_u64().to_le_bytes();
             let mut hash = saturated;

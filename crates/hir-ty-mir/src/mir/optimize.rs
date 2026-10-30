@@ -33,6 +33,7 @@ mod dse;
 mod inst_simplify;
 mod locals;
 
+use base_db::Db;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -87,7 +88,7 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
 /// run: what a future keeps across a yield is computed from the runtime body, and the checks'
 /// temporaries live within one block.
 pub(super) fn optimize<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
     options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
@@ -157,27 +158,24 @@ pub(super) fn optimize<'db>(
     Ok(body)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_cycle_result)]
-pub fn optimized_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_optimized_mir_body<'db>(
+    db: &'db Db,
     def: InferBodyId<'db>,
     options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     optimize(db, db.runtime_mir_body(def)?, options)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_closure_cycle_result)]
-pub fn optimized_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_optimized_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     optimize(db, db.runtime_mir_body_for_closure(closure)?, options)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_optimized_mir_body_cycle_result)]
-pub fn monomorphized_optimized_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_optimized_mir_body<'db>(
+    db: &'db Db,
     def: InferBodyId<'db>,
     options: MirOptions,
     subst: StoredGenericArgs,
@@ -186,12 +184,8 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
     monomorphized(db, db.optimized_mir_body(def, options)?, &subst, &trait_env)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_optimized_mir_body_for_closure_cycle_result
-)]
-pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_optimized_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     options: MirOptions,
     subst: StoredGenericArgs,
@@ -202,30 +196,24 @@ pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
 
 /// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
 /// on a coroutine body.
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_coroutine_cycle_result)]
-pub fn optimized_mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_optimized_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     optimize(db, db.runtime_mir_body_for_coroutine(coroutine)?, options)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_coroutine_cycle_result)]
-pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_optimized_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     optimize(db, db.runtime_mir_body_for_coroutine_by_move(coroutine)?, options)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_optimized_mir_body_for_coroutine_cycle_result
-)]
-pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_optimized_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
     subst: StoredGenericArgs,
@@ -235,12 +223,8 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     monomorphized(db, body, &subst, &trait_env)
 }
 
-#[salsa::tracked(
-    returns(as_ref),
-    cycle_result = monomorphized_optimized_mir_body_for_coroutine_cycle_result
-)]
-pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
     subst: StoredGenericArgs,
@@ -248,48 +232,6 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
 ) -> Result<'db, MirBody<'db>> {
     let body = db.optimized_mir_body_for_coroutine_by_move(coroutine, options)?;
     monomorphized(db, body, &subst, &trait_env)
-}
-
-fn optimized_mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedCoroutineId<'db>,
-    _: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_optimized_mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedCoroutineId<'db>,
-    _: MirOptions,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_optimized_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: MirOptions,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn monomorphized_optimized_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: MirOptions,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
 }
 
 thread_local! {
@@ -310,7 +252,7 @@ fn interpreter_level() -> MirOptLevel {
 /// The body the interpreter runs of a function: the runtime body, or that body optimized at
 /// the level [`set_interpreter_mir_opt_level`] set.
 pub(super) fn interpreted_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: InferBodyId<'db>,
     subst: StoredGenericArgs,
     env: StoredParamEnvAndCrate,
@@ -322,7 +264,7 @@ pub(super) fn interpreted_body<'db>(
 }
 
 pub(super) fn interpreted_closure_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     subst: StoredGenericArgs,
     env: StoredParamEnvAndCrate,
@@ -334,24 +276,6 @@ pub(super) fn interpreted_closure_body<'db>(
             db.monomorphized_optimized_mir_body_for_closure(closure, options, subst, env)
         }
     }
-}
-
-fn optimized_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn optimized_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
 }
 
 /// What every pass leaves: each local and block a body names is one it has, and each block
@@ -376,12 +300,14 @@ fn validate(body: &MirBody<'_>) -> std::result::Result<(), String> {
     let named = body.param_locals.iter().chain(body.binding_locals.values());
     let named = named.chain(body.promoted_locals.iter().map(|it| &it.0));
     if let Some(local) = named.into_iter().find(|it| local_index(**it) >= locals) {
+        // alloc: error path
         return Err(format!(
             "parameter, binding or promoted local _{} of {locals}",
             local_index(*local)
         ));
     }
     if block_index(body.start_block) >= blocks {
+        // alloc: error path
         return Err("start block".to_owned());
     }
     let reachable: rustc_hash::FxHashSet<BasicBlockId> =
@@ -389,6 +315,7 @@ fn validate(body: &MirBody<'_>) -> std::result::Result<(), String> {
     for (id, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else {
             if reachable.contains(&id) {
+                // alloc: error path
                 return Err(format!("bb{} has no terminator", block_index(id)));
             }
             continue;
@@ -396,6 +323,7 @@ fn validate(body: &MirBody<'_>) -> std::result::Result<(), String> {
         if let Some(target) =
             successors(&terminator.kind).into_iter().find(|it| block_index(*it) >= blocks)
         {
+            // alloc: error path
             return Err(format!(
                 "bb{} goes to bb{} of {blocks}",
                 block_index(id),
@@ -480,7 +408,7 @@ fn successors(kind: &TerminatorKind) -> SmallVec<[BasicBlockId; 4]> {
 
 /// rustc's `fn_can_unwind` where panics unwind: whether a panic may unwind out of `func`
 /// rather than abort.
-pub(crate) fn fn_can_unwind(db: &dyn HirDatabase, func: hir_def::FunctionId) -> bool {
+pub(crate) fn fn_can_unwind(db: &Db, func: hir_def::FunctionId) -> bool {
     !hir_def::attrs::AttrFlags::query(db, func.into())
         .contains(hir_def::attrs::AttrFlags::RUSTC_NOUNWIND)
         && abi_can_unwind(hir_def::signatures::FunctionSignature::of(db, func).abi)

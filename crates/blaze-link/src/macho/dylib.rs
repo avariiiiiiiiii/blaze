@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_codegen::Arch;
+use blaze_format::leb::LebError;
 use blaze_ids::radix;
 use object::Endianness;
 use object::macho;
@@ -197,22 +198,10 @@ fn set_trie(
 
 fn uleb(data: &[u8], at: &mut usize) -> Result<u64, String> {
     let start = *at;
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    loop {
-        // alloc: error path
-        let byte = *data.get(*at).ok_or_else(|| format!("a ULEB128 at {start:#x} runs past the end"))?;
-        *at += 1;
-        if shift > 63 || (shift == 63 && byte & 0x7e != 0) {
-            // alloc: error path
-            return Err(format!("a ULEB128 at {start:#x} is too long"));
-        }
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-    }
+    blaze_format::leb::read_u64(data, at).map_err(|error| match error {
+        LebError::Truncated => format!("a ULEB128 at {start:#x} runs past the end"), // alloc: error path
+        LebError::Overflow => format!("a ULEB128 at {start:#x} is too long"), // alloc: error path
+    })
 }
 
 fn cstring<'a>(data: &'a [u8], at: &mut usize) -> Result<&'a [u8], String> {
@@ -659,24 +648,6 @@ mod tests {
         )
     }
 
-    fn encode_uleb(out: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
-        }
-    }
-
-    fn uleb_len(value: u64) -> usize {
-        let mut out = Vec::new();
-        encode_uleb(&mut out, value);
-        out.len()
-    }
-
     struct Node {
         terminal: Vec<u8>,
         children: Vec<(&'static str, Node)>,
@@ -707,9 +678,9 @@ mod tests {
             for (node, children) in &nodes {
                 next.push(at);
                 let len = node.terminal.len() as u64;
-                at += uleb_len(len) as u64 + len + 1;
+                at += blaze_format::leb::len_u64(len) as u64 + len + 1;
                 for (label, child) in children {
-                    at += label.len() as u64 + 1 + uleb_len(offsets[*child]) as u64;
+                    at += label.len() as u64 + 1 + blaze_format::leb::len_u64(offsets[*child]) as u64;
                 }
             }
             if next == offsets {
@@ -720,13 +691,13 @@ mod tests {
         let mut out = Vec::new();
         for (index, (node, children)) in nodes.iter().enumerate() {
             assert_eq!(out.len() as u64, offsets[index]);
-            encode_uleb(&mut out, node.terminal.len() as u64);
+            blaze_format::leb::write_u64(&mut out, node.terminal.len() as u64);
             out.extend_from_slice(&node.terminal);
             out.push(children.len() as u8);
             for (label, child) in children {
                 out.extend_from_slice(label.as_bytes());
                 out.push(0);
-                encode_uleb(&mut out, offsets[*child]);
+                blaze_format::leb::write_u64(&mut out, offsets[*child]);
             }
         }
         out
@@ -734,9 +705,9 @@ mod tests {
 
     fn info(flags: u32, values: &[u64]) -> Vec<u8> {
         let mut out = Vec::new();
-        encode_uleb(&mut out, u64::from(flags));
+        blaze_format::leb::write_u64(&mut out, u64::from(flags));
         for &value in values {
-            encode_uleb(&mut out, value);
+            blaze_format::leb::write_u64(&mut out, value);
         }
         out
     }
@@ -953,19 +924,15 @@ mod tests {
         }
     }
 
-    struct Rng(u64);
+    struct Rng(blaze_ids::rng::SplitMix64);
 
     impl Rng {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
+            self.0.next_u64()
         }
 
         fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
+            self.0.index(n)
         }
     }
 
@@ -996,7 +963,7 @@ mod tests {
     /// with a byte changed or cut off for the error paths.
     #[test]
     fn trie_walk_matches_reference() {
-        let mut rng = Rng(0xd1_1b);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0xd1_1b));
         let sections = test_sections();
         for round in 0..400 {
             let mut trie = build_trie(&random_node(&mut rng, 0));
@@ -1018,7 +985,7 @@ mod tests {
     /// the first match in load-command order.
     #[test]
     fn sections_find_matches_linear() {
-        let mut rng = Rng(5);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(5));
         for _ in 0..200 {
             let all: Vec<Section> = (0..rng.below(6))
                 .map(|_| Section {
@@ -1043,7 +1010,7 @@ mod tests {
     #[test]
     fn uleb_limits() {
         let mut max = Vec::new();
-        encode_uleb(&mut max, u64::MAX);
+        blaze_format::leb::write_u64(&mut max, u64::MAX);
         let mut at = 0;
         assert_eq!(uleb(&max, &mut at).unwrap(), u64::MAX);
         assert_eq!(at, max.len());
@@ -1069,7 +1036,7 @@ mod tests {
     #[test]
     fn trie_walk_allocation_budget() {
         let sections = test_sections();
-        let mut rng = Rng(0xa11c);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0xa11c));
         let wide = Node {
             terminal: Vec::new(),
             children: (0..40).map(|_| (LABELS[rng.below(LABELS.len())], random_node(&mut rng, 3))).collect(),

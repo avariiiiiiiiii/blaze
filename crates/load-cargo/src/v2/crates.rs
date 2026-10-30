@@ -331,6 +331,7 @@ pub(crate) fn proc_macro_cwd(root: &Root, package: &PackagePlan) -> String {
 }
 
 /// The workspace's root, as cargo finds it from a member, and what its manifest sets.
+#[derive(PartialEq)]
 pub(crate) struct Root {
     /// The directory of the root manifest; none for a build of no member.
     pub(crate) dir: Option<String>,

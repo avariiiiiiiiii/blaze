@@ -30,13 +30,15 @@
 use std::{
     hash::Hasher as _,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_mem::{AppendVec, MemError, RegionVec};
 use rustc_hash::FxHasher;
 
 use crate::sync::{
-    Mutex, OnceLock, PoisonError,
+    Mutex, PoisonError,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
@@ -44,49 +46,74 @@ use crate::sync::{
 /// vouches for none.
 pub const UNCONFIRMED: u64 = u64::MAX;
 
-/// Chunk `k` of the directories holds `FIRST << k`, so an index's place is arithmetic.
-const FIRST: usize = 64;
-const CHUNKS: usize = 20;
-/// Table `k` of the index has `TABLE << k` places, at most half full.
+/// Table `k` of the index has `TABLE << k` places, at most half full; the tables lie end to end
+/// in one column, table `k` from place `TABLE * (2^k - 1)`.
 const TABLE: usize = 64;
-const TABLES: usize = 21;
-/// The most directories: what the chunks hold, and what a tag range of 2^32 numbers in fours.
-const MOST: u32 = (FIRST * ((1 << CHUNKS) - 1)) as u32;
+const TABLES: usize = 16;
+const PLACES: usize = TABLE * ((1 << TABLES) - 1);
+/// The most directories: what the last table holds half full. A build wants a few hundred
+/// (most are covered by the toolchain's, the SDK's and `/usr/include`), so this is address space
+/// only: 32 MB of entries, 32 MB of index and 64 MB of paths, committed as they fill.
+const MOST: u32 = (TABLE << (TABLES - 1)) as u32 / 2;
+/// The most bytes of the directories' paths together: 64 on average at [`MOST`].
+const PATH_BYTES: usize = 64 * MOST as usize;
 
 /// A directory watched: its two generations, the directory wanted later that covers it, and
-/// its path, as it was wanted. `since` and `changed` lead a 16-byte-aligned struct, so a check's
-/// two loads are always on one cache line.
+/// where its path is, as it was wanted. `since` and `changed` lead a 16-byte-aligned struct, so a
+/// check's two loads are always on one cache line.
 #[repr(C, align(16))]
-pub struct Dir {
+struct Entry {
     since: AtomicU64,
     changed: AtomicU64,
     /// The number plus one of a directory above it wanted after it, which covers it; 0 for none.
     subsumed_by: AtomicU32,
-    path: Box<Path>,
+    /// Its path's bytes: `paths[start..start + len]`.
+    start: u32,
+    len: u32,
 }
 
-#[cfg(all(not(blaze_check), target_pointer_width = "64"))]
-const _: () = assert!(size_of::<Dir>() == 48);
+#[cfg(not(blaze_check))]
+const _: () = assert!(size_of::<Entry>() == 32);
 
-impl Dir {
-    pub fn path(&self) -> &Path {
-        &self.path
+/// A directory of a [`Dirs`]: its generations and its path.
+#[derive(Clone, Copy)]
+pub struct Dir<'d> {
+    entry: &'d Entry,
+    bytes: &'d [u8],
+}
+
+impl<'d> Dir<'d> {
+    pub fn path(self) -> &'d Path {
+        as_path(self.bytes)
     }
 
     /// The number of a directory above it wanted after it, whose watch covers it.
-    pub fn subsumed_by(&self) -> Option<u32> {
-        self.subsumed_by.load(Ordering::Acquire).checked_sub(1)
+    pub fn subsumed_by(self) -> Option<u32> {
+        self.entry.subsumed_by.load(Ordering::Acquire).checked_sub(1)
     }
 
     /// The generation it has been watched without a break since, or [`UNCONFIRMED`].
-    pub fn since(&self) -> u64 {
-        self.since.load(Ordering::Acquire)
+    pub fn since(self) -> u64 {
+        self.entry.since.load(Ordering::Acquire)
     }
 
     /// The generation of the last change heard under it.
-    pub fn changed(&self) -> u64 {
-        self.changed.load(Ordering::Acquire)
+    pub fn changed(self) -> u64 {
+        self.entry.changed.load(Ordering::Acquire)
     }
+}
+
+/// A path's bytes as [`Dirs::want`] kept them.
+#[cfg(unix)]
+fn as_path(bytes: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes))
+}
+
+/// A path's bytes as [`Dirs::want`] kept them: UTF-8 off Unix.
+#[cfg(not(unix))]
+fn as_path(bytes: &[u8]) -> &Path {
+    Path::new(std::str::from_utf8(bytes).expect("a directory is wanted only as UTF-8"))
 }
 
 /// The counters every check reads, on a line pair of their own: the driver writes them once
@@ -98,29 +125,32 @@ struct Hot {
     settled: AtomicBool,
 }
 
-/// The directories watched outside every view, append-only: found by an `FxHash` of their
-/// bytes in an open-addressed index of `u64` places (the hash's high half and the index plus
-/// one, 0 empty), grown by copying into a table twice the size, the old ones kept for readers
-/// still probing them (as [`blaze_ids::Sharded`] does). A lookup compares the bytes, so two
-/// paths of one hash are two directories.
+/// The directories watched outside every view, append-only, in columns over reserved regions
+/// tagged [`blaze_mem::Tag::Vfs`] that one writer (under `adding`) appends to and readers read
+/// with no lock: never moved, so nothing is copied as they grow and a `&` into them lives as long
+/// as the table. A directory is found by an `FxHash` of its bytes in an open-addressed index of
+/// `u64` places (the hash's high half and the number plus one, 0 empty), grown by rehashing into
+/// a table twice the size laid after it in `places`, the old ones kept for readers still probing
+/// them. A lookup compares the bytes, so two paths of one hash are two directories.
 pub struct Dirs {
     hot: Hot,
     /// One [`Outside`] drives the table at a time.
     driven: AtomicBool,
-    /// How many directories are published; each below it is in `slots`.
+    /// How many directories are published: each below it is in `entries` and in the index.
     len: AtomicU32,
-    /// Which of `tables` is in use.
+    /// Which table of `places` is in use.
     level: AtomicU32,
-    slots: [OnceLock<Box<[OnceLock<Dir>]>>; CHUNKS],
-    tables: [OnceLock<Box<[AtomicU64]>>; TABLES],
+    entries: AppendVec<Entry>,
+    /// The directories' paths, one after another.
+    paths: AppendVec<u8>,
+    places: AppendVec<AtomicU64>,
     /// Held to add a directory: cold, once per directory per process.
     adding: Mutex<()>,
 }
 
-fn chunk_of(raw: u32) -> (usize, usize) {
-    let biased = raw as usize / FIRST + 1;
-    let chunk = (usize::BITS - 1 - biased.leading_zeros()) as usize;
-    (chunk, raw as usize - FIRST * ((1 << chunk) - 1))
+/// The places of table `level` in `places`.
+fn span(level: usize) -> std::ops::Range<usize> {
+    TABLE * ((1 << level) - 1)..TABLE * ((1 << (level + 1)) - 1)
 }
 
 /// Marks the end of a part in a key's hash: the parts are hashed in turn, so one pass over a
@@ -171,19 +201,19 @@ fn trimmed(path: &Path) -> &[u8] {
 #[derive(Clone, Copy)]
 pub struct Cover<'d> {
     dirs: &'d Dirs,
-    dir: &'d Dir,
+    entry: &'d Entry,
 }
 
 impl<'d> Cover<'d> {
     /// [`Dirs::unchanged_since`] of every path under this directory.
     pub fn unchanged_since(self, generation: u64) -> bool {
         self.dirs.hot.settled.load(Ordering::Acquire)
-            && self.dir.since.load(Ordering::Acquire) <= generation
-            && self.dir.changed.load(Ordering::Acquire) <= generation
+            && self.entry.since.load(Ordering::Acquire) <= generation
+            && self.entry.changed.load(Ordering::Acquire) <= generation
     }
 
-    pub fn dir(self) -> &'d Dir {
-        self.dir
+    pub fn dir(self) -> Dir<'d> {
+        self.dirs.view(self.entry)
     }
 }
 
@@ -196,16 +226,24 @@ fn is_separator(byte: u8) -> bool {
 }
 
 impl Dirs {
-    pub const fn new() -> Dirs {
-        Dirs {
+    /// An empty table, its columns reserved and nothing committed; stops when the address space
+    /// cannot be had.
+    pub fn new() -> Dirs {
+        Dirs::try_new().unwrap_or_else(|error| panic!("the table of directories outside views: {error}"))
+    }
+
+    pub fn try_new() -> Result<Dirs, MemError> {
+        let tag = blaze_mem::Tag::Vfs;
+        Ok(Dirs {
             hot: Hot { generation: AtomicU64::new(0), settled: AtomicBool::new(false) },
             driven: AtomicBool::new(false),
             len: AtomicU32::new(0),
             level: AtomicU32::new(0),
-            slots: [const { OnceLock::new() }; CHUNKS],
-            tables: [const { OnceLock::new() }; TABLES],
+            entries: AppendVec::new(MOST as usize, tag)?,
+            paths: AppendVec::new(PATH_BYTES, tag)?,
+            places: AppendVec::new(PLACES, tag)?,
             adding: Mutex::new(()),
-        }
+        })
     }
 
     /// The generation now: one load. A caller stores it with what it looked at after, and asks
@@ -228,10 +266,9 @@ impl Dirs {
         let bytes = trimmed(path);
         let mut vouched = false;
         prefixes(bytes, |end, tag| {
-            vouched = self.find(&bytes[..end], tag).is_some_and(|dir| {
-                dir.since.load(Ordering::Acquire) <= generation
-                    && dir.changed.load(Ordering::Acquire) <= generation
-            });
+            vouched = self
+                .find(&bytes[..end], tag)
+                .is_some_and(|dir| dir.since() <= generation && dir.changed() <= generation);
             !vouched
         });
         vouched
@@ -255,7 +292,7 @@ impl Dirs {
             }
             confirmed.is_none()
         });
-        confirmed.or(wanted).map(|dir| Cover { dirs: self, dir })
+        confirmed.or(wanted).map(|dir: Dir<'_>| Cover { dirs: self, entry: dir.entry })
     }
 
     /// Whether `key` or a directory above it is wanted.
@@ -282,6 +319,12 @@ impl Dirs {
         if dir.parent().is_none() {
             return;
         }
+        // Off Unix a path is kept as UTF-8; one that is not is never named by a driver either
+        // (`Outside::name`), so each check of it looks at the disk.
+        #[cfg(not(unix))]
+        if dir.to_str().is_none() {
+            return;
+        }
         let key = dir.as_os_str().as_encoded_bytes();
         if self.covered(key) {
             return;
@@ -293,19 +336,23 @@ impl Dirs {
         let tag = tag(key);
         let raw = self.len.load(Ordering::Relaxed);
         assert!(raw < MOST, "more than {MOST} directories watched outside every view");
-        let (chunk, at) = chunk_of(raw);
-        let slots = self.slots[chunk]
-            // alloc: a chunk of slots, once per doubling of the directories, under the adding lock.
-            .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
-        let dir = Dir {
+        let start = self.paths.len();
+        assert!(
+            start as usize + key.len() <= PATH_BYTES,
+            "more than {PATH_BYTES} bytes of directories watched outside every view"
+        );
+        for &byte in key {
+            self.paths.append(byte);
+        }
+        // Published before the index names it, and the index before `len` counts it.
+        let at = self.entries.append(Entry {
             since: AtomicU64::new(UNCONFIRMED),
             changed: AtomicU64::new(0),
             subsumed_by: AtomicU32::new(0),
-            path: dir.to_path_buf().into_boxed_path(),
-        };
-        if slots[at].set(dir).is_err() {
-            unreachable!("directory {raw} added twice");
-        }
+            start,
+            len: key.len() as u32,
+        });
+        debug_assert_eq!(at, raw);
         let mut level = self.level.load(Ordering::Relaxed) as usize;
         if (raw as usize + 1) * 2 > TABLE << level {
             level = self.grow(level);
@@ -318,9 +365,9 @@ impl Dirs {
         }
         table[place].store(entry(tag, raw), Ordering::Release);
         self.len.store(raw + 1, Ordering::Release);
-        for below in 0..raw {
-            let other = self.dir(below);
-            let bytes = other.path.as_os_str().as_encoded_bytes();
+        let paths = self.paths.as_slice();
+        for other in &self.entries.as_slice()[..raw as usize] {
+            let bytes = &paths[other.start as usize..][..other.len as usize];
             if bytes.len() > key.len() && bytes.starts_with(key) && is_separator(bytes[key.len()])
             {
                 _ = other.subsumed_by.compare_exchange(0, raw + 1, Ordering::AcqRel, Ordering::Acquire);
@@ -338,33 +385,38 @@ impl Dirs {
     }
 
     /// The directory numbered `at`, below [`Dirs::len`].
-    pub fn dir(&self, at: u32) -> &Dir {
-        self.slot(at).expect("a directory below the table's length")
+    pub fn dir(&self, at: u32) -> Dir<'_> {
+        self.view(self.entries.get(at).expect("a directory below the table's length"))
     }
 
-    fn slot(&self, raw: u32) -> Option<&Dir> {
-        let (chunk, at) = chunk_of(raw);
-        self.slots[chunk].get()?.get(at)?.get()
+    fn view<'d>(&'d self, entry: &'d Entry) -> Dir<'d> {
+        let bytes = &self.paths.as_slice()[entry.start as usize..][..entry.len as usize];
+        Dir { entry, bytes }
     }
 
-    /// The table in use, made if there is none yet: for the writer only.
+    /// Table `level`, its places appended (zero) if they are not yet: for the writer only.
     fn table(&self, level: usize) -> &[AtomicU64] {
-        // alloc: an index table, once per doubling, by the writer only.
-        self.tables[level].get_or_init(|| (0..TABLE << level).map(|_| AtomicU64::new(0)).collect())
+        let span = span(level);
+        while (self.places.len() as usize) < span.end {
+            self.places.append(AtomicU64::new(0));
+        }
+        &self.places.as_slice()[span]
     }
 
-    /// No lock, no write and no allocation: an index with no table yet holds nothing.
-    fn find(&self, key: &[u8], tag: u32) -> Option<&Dir> {
+    /// No lock, no write and no allocation: an index whose table is not appended whole yet
+    /// holds nothing.
+    fn find(&self, key: &[u8], tag: u32) -> Option<Dir<'_>> {
         let level = self.level.load(Ordering::Acquire) as usize;
-        let table = self.tables[level].get()?;
+        let table = self.places.as_slice().get(span(level))?;
         let mask = table.len() - 1;
         let mut place = tag as usize & mask;
         loop {
             match table[place].load(Ordering::Acquire) {
                 0 => return None,
                 entry if (entry >> 32) as u32 == tag => {
-                    let dir = self.slot(entry as u32 - 1).expect("an index entry before its directory");
-                    if dir.path.as_os_str().as_encoded_bytes() == key {
+                    let entry = self.entries.get(entry as u32 - 1).expect("an index entry before its directory");
+                    let dir = self.view(entry);
+                    if dir.bytes == key {
                         return Some(dir);
                     }
                 }
@@ -411,11 +463,11 @@ impl Default for Dirs {
     }
 }
 
-static DIRS: Dirs = Dirs::new();
+static DIRS: LazyLock<Dirs> = LazyLock::new(Dirs::new);
 
 /// The one table of the process.
 pub fn dirs() -> &'static Dirs {
-    &DIRS
+    &*DIRS
 }
 
 /// [`Dirs::generation`] of the process's table.
@@ -486,7 +538,8 @@ pub struct Outside<'d> {
     /// The driver's root: what the directories are named under.
     root: PathBuf,
     tags: u64,
-    watches: Vec<Watch>,
+    /// One per directory of the table, by its number; never removed (a retired one stays).
+    watches: RegionVec<Watch>,
     round: u64,
     /// The flushes the round under way waits for.
     left: u32,
@@ -494,11 +547,13 @@ pub struct Outside<'d> {
 
 impl<'d> Outside<'d> {
     /// The driver of `dirs`' watches, through a driver whose files are under `root` (`/`, so
-    /// that every directory is nameable). One drives a table at a time.
+    /// that every directory is nameable). One drives a table at a time. Stops when the address
+    /// space for its watches cannot be had.
     pub fn new(dirs: &'d Dirs, root: impl Into<PathBuf>, tags: u64) -> Outside<'d> {
+        let watches = RegionVec::new(MOST as usize, blaze_mem::Tag::Vfs)
+            .unwrap_or_else(|error| panic!("the watches of directories outside views: {error}"));
         assert!(!dirs.driven.swap(true, Ordering::AcqRel), "another Outside drives this table");
-        // alloc: setup, once per daemon; empty until a directory is wanted.
-        Outside { dirs, root: root.into(), tags, watches: Vec::new(), round: 0, left: 0 }
+        Outside { dirs, root: root.into(), tags, watches, round: 0, left: 0 }
     }
 
     /// Whether a completion is of an effect this asked for.
@@ -606,7 +661,7 @@ impl<'d> Outside<'d> {
         let watch = &mut self.watches[at];
         match (kind, completion.done) {
             (WATCH, Done::Changed { files, lost }) => {
-                dir.changed.fetch_max(dirs.bump(), Ordering::AcqRel);
+                dir.entry.changed.fetch_max(dirs.bump(), Ordering::AcqRel);
                 let replaced = lost || watch.file.as_ref().is_some_and(|it| files.contains(it));
                 if watch.retired {
                     // Its end is asked already; the directory above it hears the rest.
@@ -642,7 +697,7 @@ impl<'d> Outside<'d> {
                             && !watch.restart
                             && !watch.retired =>
                     {
-                        dir.since.store(dirs.bump(), Ordering::Release);
+                        dir.entry.since.store(dirs.bump(), Ordering::Release);
                         watch.confirmed = true;
                         watch.backoff = 1;
                     }
@@ -747,14 +802,14 @@ impl Drop for Outside<'_> {
     fn drop(&mut self) {
         self.dirs.settle(false);
         for at in 0..self.watches.len() {
-            self.dirs.dir(at as u32).since.store(UNCONFIRMED, Ordering::Release);
+            self.dirs.dir(at as u32).entry.since.store(UNCONFIRMED, Ordering::Release);
         }
         self.dirs.driven.store(false, Ordering::Release);
     }
 }
 
-fn unconfirm(dir: &Dir, watch: &mut Watch) {
-    dir.since.store(UNCONFIRMED, Ordering::Release);
+fn unconfirm(dir: Dir<'_>, watch: &mut Watch) {
+    dir.entry.since.store(UNCONFIRMED, Ordering::Release);
     watch.confirmed = false;
 }
 

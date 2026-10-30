@@ -1,15 +1,7 @@
+use blaze_ids::rng::SplitMix64 as Rng;
 use text_size::TextSize;
 
 use super::{Kernel, LineIndex, char_width, display_width, simd};
-
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, below: usize) -> usize {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 33) % below as u64) as usize
-    }
-}
 
 /// Texts weighted to where lines and columns could go wrong: newlines of each kind, a byte
 /// order mark (at the start or not), tabs, controls, wide and multibyte chars, and lines long
@@ -20,21 +12,21 @@ fn random_text(rng: &mut Rng) -> String {
         "\u{feff}", "\u{202a}", "\u{2066}", "\0", "\x7f", "\u{85}", "\u{300}", "\u{200d}",
     ];
     let mut text = String::new();
-    if rng.below(4) == 0 {
+    if rng.index(4) == 0 {
         text.push('\u{feff}');
     }
-    let pieces = rng.below(300);
+    let pieces = rng.index(300);
     for _ in 0..pieces {
-        match rng.below(60) {
-            0 => text.push_str(&"x".repeat(rng.below(1200))),
-            _ => text.push_str(PIECES[rng.below(PIECES.len())]),
+        match rng.index(60) {
+            0 => text.push_str(&"x".repeat(rng.index(1200))),
+            _ => text.push_str(PIECES[rng.index(PIECES.len())]),
         }
     }
     text
 }
 
 fn texts() -> Vec<String> {
-    let mut rng = Rng(5);
+    let mut rng = Rng::new(5);
     let mut texts: Vec<String> = (0..250).map(|_| random_text(&mut rng)).collect();
     texts.extend(
         [
@@ -58,13 +50,13 @@ fn texts() -> Vec<String> {
 /// Every kernel this CPU runs gives the scalar kernel's words, for every length and alignment.
 #[test]
 fn every_kernel_gives_the_scalar_bits() {
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     let mut inputs: Vec<Vec<u8>> = (0..300)
         .map(|len| {
             (0..len)
-                .map(|_| match rng.below(4) {
+                .map(|_| match rng.index(4) {
                     0 => b'\n',
-                    _ => rng.below(256) as u8,
+                    _ => rng.index(256) as u8,
                 })
                 .collect()
         })
@@ -310,10 +302,10 @@ fn columns_need_a_char_boundary() {
 
 #[test]
 fn ascii_display_width_is_char_widths() {
-    let mut rng = Rng(9);
+    let mut rng = Rng::new(9);
     for _ in 0..2000 {
-        let text: String = (0..rng.below(100))
-            .map(|_| char::from(rng.below(128) as u8))
+        let text: String = (0..rng.index(100))
+            .map(|_| char::from(rng.index(128) as u8))
             .filter(|&ch| ch != '\n')
             .collect();
         let slow: usize = text.chars().map(char_width).sum();

@@ -4,6 +4,8 @@
 //! and the parser algorithm independently.
 use std::{mem, num::NonZeroU32};
 
+use blaze_mem::scratch;
+
 use crate::{
     SyntaxKind::{self, *},
     output::Output,
@@ -88,13 +90,103 @@ impl Event {
     }
 }
 
+/// A buffer a parse needs only while it runs, kept per thread at the most it ever held
+/// (`blaze_mem::scratch`, docs/v2/plan/design/memory.md): `scratch::lend` or `scratch::with`
+/// hands out the thread's one, empty, and takes it back when done. A parse inside a parse on
+/// the same thread gets a new one, and of two coming back the larger is kept.
+macro_rules! per_thread_buffer {
+    ($(#[$doc:meta])* $name:ident, $shelf:ident: $item:ty) => {
+        $(#[$doc])*
+        #[derive(Default)]
+        pub(crate) struct $name(Vec<$item>);
+
+        ::std::thread_local! {
+            static $shelf: ::std::cell::Cell<Vec<$item>> =
+                const { ::std::cell::Cell::new(Vec::new()) }; // alloc: none, empty
+        }
+
+        impl ::std::ops::Deref for $name {
+            type Target = Vec<$item>;
+
+            #[inline]
+            fn deref(&self) -> &Vec<$item> {
+                &self.0
+            }
+        }
+
+        impl ::std::ops::DerefMut for $name {
+            #[inline]
+            fn deref_mut(&mut self) -> &mut Vec<$item> {
+                &mut self.0
+            }
+        }
+
+        impl ::blaze_mem::scratch::Shelved for $name {
+            #[inline]
+            fn empty(&mut self) {
+                self.0.clear();
+            }
+
+            #[inline]
+            fn held(&self) -> usize {
+                self.0.capacity()
+            }
+
+            #[inline]
+            fn unshelve() -> Option<Self> {
+                let buffer = $shelf.try_with(::std::cell::Cell::take).ok()?;
+                (buffer.capacity() != 0).then_some($name(buffer))
+            }
+
+            #[inline]
+            fn shelve(self) {
+                // A thread that is ending: the buffer is freed.
+                let _ = $shelf.try_with(|shelf| {
+                    let kept = shelf.take();
+                    shelf.set(if kept.capacity() >= self.0.capacity() { kept } else { self.0 });
+                });
+            }
+        }
+    };
+}
+
+pub(crate) use per_thread_buffer;
+
+per_thread_buffer! {
+    /// The parser's event list: it lives from `Parser::new` to the end of [`process`].
+    Events, EVENTS: Event
+}
+
+per_thread_buffer! {
+    /// [`process`]'s chain of forward parents, as long as the longest `precede` chain.
+    ForwardParents, FORWARD_PARENTS: SyntaxKind
+}
+
+/// The thread's event list, empty, with room for `tokens` tokens' events: one `Token` each,
+/// and a `Start` and a `Finish` for each of the 1.05 nodes a token, about 3.1 events, so a
+/// cold list sized at 3.25 seldom doubles. Warm, this allocates nothing.
+pub(crate) fn lend_events(tokens: usize) -> scratch::Lent<Events> {
+    let mut events = scratch::lend::<Events>();
+    events.reserve((tokens * 13).div_ceil(4));
+    events
+}
+
 /// Generate the syntax tree with the control of events. `errors` is the
 /// side table of error messages built up alongside the `events` stream.
-pub(super) fn process(mut events: Vec<Event>, mut errors: Vec<String>) -> Output {
+pub(super) fn process(mut events: scratch::Lent<Events>, errors: Vec<String>) -> Output {
+    scratch::with::<ForwardParents, _>(|forward_parents| {
+        process_with(&mut events, errors, forward_parents)
+    })
+}
+
+fn process_with(
+    events: &mut [Event],
+    mut errors: Vec<String>,
+    forward_parents: &mut Vec<SyntaxKind>,
+) -> Output {
     // Each event becomes roughly one u32 in Output, so preallocate to avoid
     // the amortized grow-one churn we used to see in Output::enter_node.
     let mut res = Output::with_event_capacity(events.len());
-    let mut forward_parents = Vec::new();
 
     for i in 0..events.len() {
         match events[i] {

@@ -204,7 +204,7 @@ pub(super) fn restricted_to(cx: &Cx<'_, '_>, item: &Item) -> Option<hir::Module>
     let mut module = item.module;
     while let Some(parent) = module.parent(db) {
         if let Some(it) = to_module(module.visibility(db)) {
-            at = Some(deeper(db, at, it));
+            at = Some(deeper(cx, at, it));
         }
         module = parent;
     }
@@ -213,14 +213,14 @@ pub(super) fn restricted_to(cx: &Cx<'_, '_>, item: &Item) -> Option<hir::Module>
 
 /// Of a restriction so far and another, the one that lets in less: the deeper module, both
 /// being ancestors of the item.
-fn deeper(db: &dyn hir::db::HirDatabase, at: Option<hir::Module>, other: hir::Module) -> hir::Module {
+fn deeper(cx: &Cx<'_, '_>, at: Option<hir::Module>, other: hir::Module) -> hir::Module {
     let Some(at) = at else { return other };
     let mut module = Some(at);
     while let Some(it) = module {
         if it == other {
             return at;
         }
-        module = it.parent(db);
+        module = it.parent(cx.db);
     }
     other
 }
@@ -238,15 +238,15 @@ fn members(cx: &Cx<'_, '_>, def: Def) -> Vec<Def> {
                     .chain(variant.fields(db).into_iter().map(Def::Field))
             })
             .collect(),
-        Def::Item(ModuleDef::Adt(Adt::Struct(it))) => public_fields(db, it.fields(db)),
-        Def::Item(ModuleDef::Adt(Adt::Union(it))) => public_fields(db, it.fields(db)),
+        Def::Item(ModuleDef::Adt(Adt::Struct(it))) => public_fields(cx, it.fields(db)),
+        Def::Item(ModuleDef::Adt(Adt::Union(it))) => public_fields(cx, it.fields(db)),
         Def::Item(ModuleDef::Trait(it)) => it.items(db).into_iter().map(|it| Def::Item(it.into())).collect(),
         _ => Vec::new(),
     }
 }
 
-fn public_fields(db: &dyn hir::db::HirDatabase, fields: Vec<Field>) -> Vec<Def> {
-    fields.into_iter().filter(|it| it.visibility(db) == Visibility::Public).map(Def::Field).collect()
+fn public_fields(cx: &Cx<'_, '_>, fields: Vec<Field>) -> Vec<Def> {
+    fields.into_iter().filter(|it| it.visibility(cx.db) == Visibility::Public).map(Def::Field).collect()
 }
 
 /// The items of an impl that are as visible as it: an inherent impl's public ones, all of a

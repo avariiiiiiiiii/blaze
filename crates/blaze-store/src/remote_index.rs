@@ -543,6 +543,8 @@ pub fn plan_merge(runs: &[u64]) -> Vec<usize> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     fn key(seed: u64) -> [u8; KEY] {
@@ -655,22 +657,16 @@ mod tests {
     /// `seed` and `runs` changes of it, the same in every run: bytes flipped, cut, put in
     /// and taken out.
     fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % bound.max(1) as u64) as usize
-        };
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let seed = seed.to_vec();
         std::iter::once(seed.clone()).chain((0..runs).map(move |_| {
             let mut bytes = seed.clone();
-            for _ in 0..=next(4) {
-                let at = next(bytes.len());
-                match next(4) {
+            for _ in 0..=rng.index(4) {
+                let at = rng.index(bytes.len());
+                match rng.index(4) {
                     0 => bytes.truncate(at),
-                    1 if !bytes.is_empty() => bytes[at] ^= 1 << next(8),
-                    2 => bytes.insert(at, [0, 1, 0x7f, 0x80, 0xff][next(5)]),
+                    1 if !bytes.is_empty() => bytes[at] ^= 1 << rng.index(8),
+                    2 => bytes.insert(at, [0, 1, 0x7f, 0x80, 0xff][rng.index(5)]),
                     _ if !bytes.is_empty() => _ = bytes.remove(at),
                     _ => {}
                 }

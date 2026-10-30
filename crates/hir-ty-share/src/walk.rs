@@ -21,6 +21,7 @@
 //! A call of a generic instance of the body itself is recorded as such: direct recursion
 //! shares. Any other cycle of instances gives [`Unshared::Recursive`] to all in it.
 
+use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, closure_code, code_hash, coroutine_code, interface_hash, item_key};
 use either::Either;
@@ -101,12 +102,12 @@ mod tag {
 
 #[salsa::tracked(returns(ref), cycle_result = share_cycle)]
 pub(crate) fn share(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: ShareInstance,
     env: StoredParamEnvAndCrate,
     options: BodyOptions,
 ) -> Result<ShareKey, Unshared> {
-    let cx = Cx::new(db, &env);
+    let cx = Cx::new(db, env.clone()); // clone: the environment's key, a reference count
     let mut key = Hasher::new(SHARE_DOMAIN);
     let bodies = bodies(db, instance.def, options, &mut key)?;
     // The code generator reads an instance's const arguments itself (a SIMD lane).
@@ -143,7 +144,7 @@ pub(crate) fn share(
 }
 
 fn share_cycle(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _: ShareInstance,
     _: StoredParamEnvAndCrate,
@@ -163,7 +164,7 @@ fn is_runtime(options: MirOptions) -> bool {
 /// The generic bodies the code generator may compile `def` from, one per options, as its
 /// `compiled_mir_body` picks them, with what names the body hashed into `key`.
 fn bodies<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ShareDef,
     options: BodyOptions,
     key: &mut Hasher,
@@ -288,7 +289,7 @@ struct Walk<'a, 'db> {
 }
 
 impl<'a, 'db> Walk<'a, 'db> {
-    fn db(&self) -> &'db dyn HirDatabase {
+    fn db(&self) -> &'db Db {
         self.cx.db
     }
 

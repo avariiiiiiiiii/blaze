@@ -3,12 +3,11 @@
 
 use std::hash::Hash;
 
-use salsa::Database;
 use span::Edition;
 use syntax::{SyntaxError, ast};
 use vfs::FileId;
 
-use crate::SourceDatabase;
+use crate::Db;
 
 #[salsa::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime), revisions = usize::MAX)]
 #[derive(PartialOrd, Ord)]
@@ -25,7 +24,7 @@ impl EditionedFileId {
     /// After an edit it is made from the file's last parse, when one is kept (see
     /// [`Reparse`](crate::Reparse)): the same tree, in the time of the edited item's parse.
     #[salsa::tracked(lru = 128, returns(ref))]
-    pub fn parse(self, db: &dyn SourceDatabase) -> syntax::Parse<ast::SourceFile> {
+    pub fn parse(self, db: &Db) -> syntax::Parse<ast::SourceFile> {
         let _p = tracing::info_span!("parse", ?self).entered();
         let (file_id, edition) = self.unpack(db);
         let input = db.file_text(file_id);
@@ -35,14 +34,14 @@ impl EditionedFileId {
     /// Whether the file is in a library source root: a firewall, so an edit to the root's set
     /// of files that keeps the answer re-parses none of them.
     #[salsa::tracked]
-    pub fn is_library(self, db: &dyn SourceDatabase) -> bool {
+    pub fn is_library(self, db: &Db) -> bool {
         let root = db.file_source_root(self.file_id(db)).source_root_id(db);
         db.source_root(root).source_root_ref(db).is_library
     }
 
     // firewall query
     #[salsa::tracked(returns(as_deref))]
-    pub fn parse_errors(self, db: &dyn SourceDatabase) -> Option<Box<[SyntaxError]>> {
+    pub fn parse_errors(self, db: &Db) -> Option<Box<[SyntaxError]>> {
         let errors = self.parse(db).errors();
         match &*errors {
             [] => None,
@@ -53,32 +52,32 @@ impl EditionedFileId {
 
 impl EditionedFileId {
     #[inline]
-    pub fn new(db: &dyn Database, file_id: FileId, edition: Edition) -> Self {
+    pub fn new(db: &Db, file_id: FileId, edition: Edition) -> Self {
         Self::from_span_file_id(db, span::EditionedFileId::new(file_id, edition))
     }
 
     #[inline]
-    pub fn current_edition(db: &dyn Database, file_id: FileId) -> Self {
+    pub fn current_edition(db: &Db, file_id: FileId) -> Self {
         Self::from_span_file_id(db, span::EditionedFileId::current_edition(file_id))
     }
 
     #[inline]
-    pub fn file_id(self, db: &dyn Database) -> vfs::FileId {
+    pub fn file_id(self, db: &Db) -> vfs::FileId {
         self.field(db).file_id()
     }
 
     #[inline]
-    pub fn span_file_id(self, db: &dyn Database) -> span::EditionedFileId {
+    pub fn span_file_id(self, db: &Db) -> span::EditionedFileId {
         self.field(db)
     }
 
     #[inline]
-    pub fn unpack(self, db: &dyn Database) -> (vfs::FileId, span::Edition) {
+    pub fn unpack(self, db: &Db) -> (vfs::FileId, span::Edition) {
         self.field(db).unpack()
     }
 
     #[inline]
-    pub fn edition(self, db: &dyn Database) -> Edition {
+    pub fn edition(self, db: &Db) -> Edition {
         self.field(db).edition()
     }
 }

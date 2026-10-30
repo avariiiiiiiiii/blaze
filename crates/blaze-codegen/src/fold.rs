@@ -469,6 +469,8 @@ pub fn groups(
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64 as Rng;
+
     use super::*;
 
     fn key(n: u8) -> InstanceKey {
@@ -785,19 +787,6 @@ mod tests {
         }
     }
 
-    /// SplitMix64.
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            (z ^ (z >> 31)) % n
-        }
-    }
-
     /// Candidates over three shapes, few values and few targets, so buckets are large, many
     /// constants vary alike, keys repeat (with other constants) and settings differ.
     fn random(rng: &mut Rng) -> Vec<(InstanceKey, Settings, Masked, Vec<Target>)> {
@@ -831,7 +820,7 @@ mod tests {
             Limits { max_params: 2, min_members: 3, thunk_size: 0 },
             Limits { max_params: 3, min_members: 2, thunk_size: 6 },
         ];
-        let mut rng = Rng(1292);
+        let mut rng = Rng::new(1292);
         let mut found = 0;
         for _ in 0..400 {
             let items = random(&mut rng);
@@ -854,7 +843,7 @@ mod tests {
 
     #[test]
     fn targets_compare_as_their_ids_did() {
-        let mut rng = Rng(7);
+        let mut rng = Rng::new(7);
         let target = |rng: &mut Rng| {
             let n = rng.below(3) as u8;
             let name = ["a", "ab", "b"][n as usize].to_owned();

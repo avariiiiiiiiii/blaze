@@ -13,11 +13,18 @@
 //! (rounded up) to the most of the window's peaks, and a new window begins. So the prediction is a high
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
+//!
+//! A task's peak is everything it held: what it allocated through the global allocator
+//! (`arena::measure`) and what its frames held (`blaze_mem::frame`). Each kind belongs to a
+//! subsystem ([`tag_of`]), and each subsystem has a budget, a share of the machine's
+//! ([`set_budgets`]): the scheduler holds back a task of a subsystem over its budget
+//! (`blaze_mem::tag::over_budget`) before the machine's budget is reached.
 
 #![forbid(unsafe_code)]
 
 use std::fmt;
 
+use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -30,6 +37,80 @@ pub const WINDOW: u32 = 64;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct TaskKind(pub u32);
+
+/// The daemon's own task kinds, past every query kind (a `u16`) but the load's.
+pub mod kinds {
+    use super::TaskKind;
+
+    /// The load's `Plan`: its query kind (`blaze-units`).
+    pub const PLAN: TaskKind = TaskKind(0x6000);
+    /// What a build fetches into the store.
+    pub const FETCH: TaskKind = TaskKind(0x1_0001);
+    /// The standard library built.
+    pub const LIBRARY: TaskKind = TaskKind(0x1_0002);
+    /// A crate's bodies lowered to MIR.
+    pub const LOWER: TaskKind = TaskKind(0x1_0003);
+    pub const COMPILE: TaskKind = TaskKind(0x1_0004);
+    /// What a binary reaches, for its compiles.
+    pub const REACH: TaskKind = TaskKind(0x1_0005);
+    /// A view's queries walked for `Trace`, `Verify` or `CodegenInputs`.
+    pub const WALK: TaskKind = TaskKind(0x1_0006);
+    /// `blaze test --ub`: the tests selected, and one test evaluated.
+    pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
+    pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
+}
+
+/// The subsystem whose memory a task of `kind` holds: whose budget holds it back.
+///
+/// Query kinds go by `blaze_query::kinds`' ranges (inputs, facts `0x1000`, the front end
+/// `0x2000`, codegen and link `0x4000`, user code `0x5000`, the units' loads `0x6000`), the
+/// front end's and the back end's ranges split by subsystem as written here and in
+/// docs/v2/plan/lanes/mem/core.md ("Kinds and tags"); the daemon's own by [`kinds`]. A kind
+/// none of them names is [`Tag::Other`]'s.
+pub const fn tag_of(kind: TaskKind) -> Tag {
+    match kind {
+        kinds::FETCH => Tag::Store,
+        kinds::LIBRARY | kinds::COMPILE | kinds::REACH => Tag::Codegen,
+        kinds::LOWER | kinds::UB_TESTS | kinds::EVALUATE => Tag::Mir,
+        kinds::WALK => Tag::Query,
+        TaskKind(1..=3) => Tag::Vfs,
+        TaskKind(0x1000..0x2000) => Tag::Nameres,
+        TaskKind(0x2000..0x2200) => Tag::Parse,
+        TaskKind(0x2200..0x2400) => Tag::Nameres,
+        TaskKind(0x2400..0x2c00) => Tag::Infer,
+        TaskKind(0x2c00..0x3000) => Tag::Expand,
+        TaskKind(0x3000..0x4000) => Tag::Mir,
+        TaskKind(0x4000..0x4800) => Tag::Codegen,
+        TaskKind(0x4800..0x5000) => Tag::Link,
+        TaskKind(0x5000..0x6000) => Tag::Usercode,
+        TaskKind(0x6000..0x7000) => Tag::Vfs,
+        _ => Tag::Other,
+    }
+}
+
+/// Each subsystem's budget as a share of the machine's, in 64ths. The shares sum past 64 on
+/// purpose: a build's phases peak at different times (names before bodies, bodies before
+/// code, code before the link), so each subsystem may take a large part of the machine while
+/// the others are small, and the machine's own budget still holds them all. No subsystem but
+/// the frames of every worker together may take more than half, so one that runs away is held
+/// back while the others still fit.
+pub const fn share(tag: Tag) -> u64 {
+    match tag {
+        Tag::Infer | Tag::Codegen | Tag::Link | Tag::Frames => 32,
+        Tag::Mir | Tag::Query => 24,
+        Tag::Nameres | Tag::Intern => 16,
+        Tag::Parse | Tag::Expand | Tag::Store | Tag::Vfs | Tag::Chunks | Tag::Fuzz => 8,
+        Tag::Usercode | Tag::Other => 4,
+        Tag::Plane | Tag::Io | Tag::Api => 2,
+    }
+}
+
+/// Sets each subsystem's budget ([`tag::set_budget`]) to its [`share`] of `machine` bytes.
+pub fn set_budgets(machine: u64) {
+    for tag in Tag::ALL {
+        tag::set_budget(tag, machine / 64 * share(tag));
+    }
+}
 
 /// What tasks of one kind held: 40 bytes.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -309,26 +390,12 @@ pub trait Arena {
 mod tests {
     use std::collections::BTreeMap;
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
-    struct SplitMix(u64);
-
-    impl SplitMix {
-        fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n.max(1)
-        }
-    }
-
     /// A peak of one of a few sizes, now and then far bigger.
-    fn peak(random: &mut SplitMix) -> u64 {
+    fn peak(random: &mut SplitMix64) -> u64 {
         match random.below(20) {
             0 => random.below(1 << 34),
             1..=3 => 0,
@@ -415,7 +482,7 @@ mod tests {
     #[test]
     fn random_peaks_keep_the_rule() {
         for seed in 0..200u64 {
-            let mut random = SplitMix(seed);
+            let mut random = SplitMix64::new(seed);
             let mut estimates = Estimates::new(random.below(1 << 30));
             let mut smaller_in_a_row = Windows::new();
             for _ in 0..2000 {
@@ -458,7 +525,7 @@ mod tests {
     fn the_same_observations_give_the_same_estimates_and_bytes() {
         for seed in 0..50u64 {
             let run = || {
-                let mut random = SplitMix(seed);
+                let mut random = SplitMix64::new(seed);
                 let mut estimates = Estimates::new(1 << 20);
                 for _ in 0..1000 {
                     let kind = TaskKind(random.below(6) as u32);
@@ -494,16 +561,16 @@ mod tests {
     fn the_hashed_table_says_what_the_ordered_map_said() {
         let kinds = [0, 1, 7, 300, 0x6000, 0x1_0001, 0x1_0004, u32::MAX];
         for seed in 0..100u64 {
-            let mut random = SplitMix(seed);
+            let mut random = SplitMix64::new(seed);
             let unseen = random.below(1 << 24);
             let mut estimates = Estimates::new(unseen);
             let mut model: BTreeMap<TaskKind, Estimate> = BTreeMap::new();
             for _ in 0..1500 {
-                let kind = TaskKind(kinds[random.below(kinds.len() as u64) as usize]);
+                let kind = TaskKind(kinds[random.index(kinds.len())]);
                 let peak = peak(&mut random);
                 estimates.observe(kind, peak);
                 model.entry(kind).or_default().observe(peak);
-                let asked = TaskKind(kinds[random.below(kinds.len() as u64) as usize]);
+                let asked = TaskKind(kinds[random.index(kinds.len())]);
                 let want = model.get(&asked).filter(|it| it.seen > 0).map_or(unseen, |it| it.predicted);
                 assert_eq!(estimates.predict(asked), want, "seed {seed}");
             }
@@ -517,7 +584,7 @@ mod tests {
     #[test]
     fn the_order_kinds_came_in_changes_no_byte() {
         for seed in 0..50u64 {
-            let mut random = SplitMix(seed);
+            let mut random = SplitMix64::new(seed);
             let runs: Vec<(TaskKind, Vec<u64>)> = (0..1 + random.below(40))
                 .map(|kind| {
                     let kind = TaskKind((kind as u32).wrapping_mul(0x9e37_79b9));
@@ -547,7 +614,7 @@ mod tests {
 
     #[test]
     fn estimates_come_back_from_their_bytes_and_bad_bytes_are_refused() {
-        let mut random = SplitMix(9);
+        let mut random = SplitMix64::new(9);
         let mut estimates = Estimates::new(123);
         for _ in 0..500 {
             estimates.observe(TaskKind(random.below(5) as u32), peak(&mut random));
@@ -574,5 +641,59 @@ mod tests {
         let kind = order[first..first + 4].to_vec();
         order[first + KIND_BYTES..first + KIND_BYTES + 4].copy_from_slice(&kind);
         assert!(matches!(Estimates::decode(&order), Err(DecodeError::Order { .. })));
+    }
+
+    /// Each range of `blaze_query::kinds` and each kind in use goes to its subsystem: the
+    /// inputs, the facts, name resolution's kinds (`hir-def`'s `0x2200..`), codegen's
+    /// (`blaze-codegen`'s `0x4000..`), the units' loads and the daemon's own.
+    #[test]
+    fn each_kind_belongs_to_its_subsystem() {
+        let cases = [
+            (1, Tag::Vfs),
+            (3, Tag::Vfs),
+            (0x1000, Tag::Nameres),
+            (0x1fff, Tag::Nameres),
+            (0x2000, Tag::Parse),
+            (0x2200, Tag::Nameres),
+            (0x2217, Tag::Nameres),
+            (0x2400, Tag::Infer),
+            (0x2c00, Tag::Expand),
+            (0x3000, Tag::Mir),
+            (0x3fff, Tag::Mir),
+            (0x4000, Tag::Codegen),
+            (0x4006, Tag::Codegen),
+            (0x4800, Tag::Link),
+            (0x5000, Tag::Usercode),
+            (0x6000, Tag::Vfs),
+            (0x601d, Tag::Vfs),
+            (0x1_0001, Tag::Store),
+            (0x1_0004, Tag::Codegen),
+            (0x1_0008, Tag::Mir),
+            (0, Tag::Other),
+            (0x7000, Tag::Other),
+            (u32::MAX, Tag::Other),
+        ];
+        for (kind, tag) in cases {
+            assert_eq!(tag_of(TaskKind(kind)), tag, "kind {kind:#x}");
+        }
+        assert_eq!(tag_of(kinds::PLAN), Tag::Vfs);
+        assert_eq!(tag_of(kinds::WALK), Tag::Query);
+    }
+
+    /// Every subsystem has a share; none but the workers' frames together takes more than
+    /// half the machine, and every budget is its share of the machine's.
+    #[test]
+    fn each_subsystem_gets_its_share_of_the_machine() {
+        for tag in Tag::ALL {
+            assert!((1..=32).contains(&share(tag)), "{tag}");
+        }
+        let machine = 64 << 30;
+        set_budgets(machine);
+        for tag in Tag::ALL {
+            assert_eq!(tag::budget(tag), machine / 64 * share(tag), "{tag}");
+            assert!(tag::budget(tag) <= machine / 2, "{tag}");
+        }
+        assert_eq!(tag::budget(Tag::Infer), 32 << 30);
+        assert_eq!(tag::budget(Tag::Plane), 2 << 30);
     }
 }

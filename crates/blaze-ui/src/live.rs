@@ -26,6 +26,12 @@ const FUNCTIONS: usize = 3;
 /// How many half seconds the line of how busy the cores were shows ([`Pen::cores`]).
 const SPARK: usize = 20;
 
+/// The least time between two draws: a screen shows at most 60 frames a second, so a draw
+/// sooner than this after the last one is held, and written by the first call once it is due
+/// ([`Live::due_ns`]). A cold build's thousands of records a second are then at most 60
+/// writes a second, each what changed since the last.
+pub const FRAME_NS: u64 = 1_000_000_000 / 60;
+
 /// Draws the region again as records come and time passes, writing what changed of it.
 /// What it returns is written to the terminal as it is.
 pub struct Live {
@@ -39,9 +45,15 @@ pub struct Live {
     /// Whether the screen may not show `shown`: a terminal rewraps what it shows when its
     /// width changes. The next draw clears the region and writes it whole.
     stale: bool,
-    /// The lines a record adds that stay, before they are written.
+    /// The lines records added that stay, until the next draw writes them.
     said: String,
     scratch: Scratch,
+    /// The least time between draws ([`FRAME_NS`]; 0 draws for every call).
+    least_ns: u64,
+    /// When the last draw was written.
+    drawn_ns: Option<u64>,
+    /// Whether records came since the last draw, so one is owed.
+    owed: bool,
 }
 
 /// Lines of text in one buffer, each ending in a newline, and where each ends: 4 bytes a
@@ -140,7 +152,22 @@ impl Live {
             stale: false,
             said: String::new(),
             scratch: Scratch::default(),
+            least_ns: FRAME_NS,
+            drawn_ns: None,
+            owed: false,
         }
+    }
+
+    /// Draws at most once every `least_ns` ([`FRAME_NS`] by default); 0 draws for each
+    /// record and tick, as a test that checks the screen after each one wants.
+    pub fn frames(self, least_ns: u64) -> Live {
+        Live { least_ns, ..self }
+    }
+
+    /// When the draw held back for records that came may be written: the caller ticks then.
+    /// `None` when nothing is owed.
+    pub fn due_ns(&self) -> Option<u64> {
+        self.owed.then(|| self.drawn_ns.map_or(0, |drawn| drawn.saturating_add(self.least_ns)))
     }
 
     /// For the command that asked for the build, which says its errors in full after it: a
@@ -176,10 +203,11 @@ impl Live {
 
     /// What to write for `records`, come together, at `now_ns`: the lines each adds that
     /// stay, in order, and the region drawn once below them. What the screen shows after it
-    /// is what it shows after [`Live::record`] of each.
+    /// is what it shows after [`Live::record`] of each. Within a frame of the last draw,
+    /// nothing is written but a build's end; the lines and the region wait for the draw that
+    /// is due next.
     pub fn records_into(&mut self, records: &[Record], now_ns: u64, out: &mut String) {
         let mut said = std::mem::take(&mut self.said);
-        said.clear();
         for record in records {
             let change = self.build.apply(record);
             staying(&self.build, &change, self.color, true, self.errors_said, &mut said);
@@ -188,8 +216,22 @@ impl Live {
                 said.clear();
             }
         }
+        self.said = said;
+        self.owed = true;
+        self.frame(now_ns, out);
+    }
+
+    /// The draw at `now_ns`, when a frame has passed since the last one.
+    fn frame(&mut self, now_ns: u64, out: &mut String) {
+        if self.drawn_ns.is_some_and(|drawn| now_ns.saturating_sub(drawn) < self.least_ns) {
+            return;
+        }
+        let said = std::mem::take(&mut self.said);
         self.draw(&said, now_ns, out);
         self.said = said;
+        self.said.clear();
+        self.drawn_ns = Some(now_ns);
+        self.owed = false;
     }
 
     /// What changed of the region for the time that passed.
@@ -199,14 +241,21 @@ impl Live {
         out
     }
 
+    /// [`Live::tick`], written at the end of `out`: the draw held back, or the region again
+    /// for the time that passed, once a frame has passed since the last draw.
     pub fn tick_into(&mut self, now_ns: u64, out: &mut String) {
-        self.draw("", now_ns, out);
+        self.frame(now_ns, out);
     }
 
-    /// The region cleared, and the summary in its place when the build finished.
+    /// The region cleared, and the summary in its place when the build finished; lines
+    /// held for a draw are written first.
     pub fn finish(&mut self) -> String {
         let mut out = String::new();
-        self.finish_with("", &mut out);
+        let said = std::mem::take(&mut self.said);
+        self.finish_with(&said, &mut out);
+        self.said = said;
+        self.said.clear();
+        self.owed = false;
         out
     }
 

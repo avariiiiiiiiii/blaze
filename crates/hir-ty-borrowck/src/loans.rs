@@ -111,10 +111,16 @@ fn ignored<'db>(
     if statics.contains(&local) {
         return true;
     }
-    for (index, elem) in projection.iter().enumerate() {
+    let Some(last) = projection.iter().rposition(|it| *it == ProjectionElem::Deref) else {
+        return false;
+    };
+    let mut base = ctx.place_ty(body, local, &[]);
+    for (index, elem) in projection[..=last].iter().enumerate() {
+        if index > 0 {
+            base = ctx.project(base, &projection[index - 1]);
+        }
         if *elem == ProjectionElem::Deref {
-            let ty = ctx.place_ty(body, local, &projection[..index]).ty;
-            match ty.kind() {
+            match base.ty.kind() {
                 TyKind::Ref(_, _, rustc_ast_ir::Mutability::Not) | TyKind::RawPtr(..) => {
                     return true;
                 }

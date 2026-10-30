@@ -23,5 +23,8 @@ anyhow = { workspace = true, optional = true }
 wasmtime = { version = "49", optional = true, default-features = false, features = ["anyhow", "cranelift", "runtime", "std", "parallel-compilation", "demangle"] }
 wasmtime-wasi = { version = "49", optional = true, default-features = false, features = ["p1"] }
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [lints]
 workspace = true

@@ -4,13 +4,17 @@
 //! A column is read alone: finding a key reads the key column only, and a fact range scan
 //! reads the kind and subject columns only. Hashes that only some items have (a layout, a
 //! code hash) sit densely in their own column, found through a presence bitset by rank.
+//!
+//! Each column is allocated once at its final length. What they are built from (a crate's
+//! rows, a fact set's split facts and dictionary) is the building task's, in its frame
+//! (`blaze_mem::frame`), so building grows nothing by doubling.
 
 use std::cmp::Ordering;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::ContentId;
+use blaze_mem::{Frame, Tag, frame};
 use blaze_query::QueryKind;
-use hir_ty::db::HirDatabase;
 
 use crate::{
     CodeHash, DeepHash, Fact, InterfaceHash, ItemHashes, ItemKey, ItemKind, LayoutHash, NameHash,
@@ -37,8 +41,13 @@ pub struct Bits {
 }
 
 impl Bits {
-    pub fn new(bits: impl IntoIterator<Item = bool>) -> Bits {
-        let mut words: Vec<u64> = Vec::new();
+    pub fn new<I>(bits: I) -> Bits
+    where
+        I: IntoIterator<Item = bool>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let bits = bits.into_iter();
+        let mut words: Vec<u64> = Vec::with_capacity(bits.len().div_ceil(64));
         let mut len = 0usize;
         for bit in bits {
             if len % 64 == 0 {
@@ -107,27 +116,29 @@ pub struct HashColumns {
 }
 
 impl HashColumns {
-    /// The columns of `rows`, which may come in any order; a key given twice is a bug in the
-    /// caller.
+    /// The columns of `rows`, which may come in any order and which it sorts; a key given
+    /// twice is a bug in the caller.
     pub fn new(
-        mut rows: Vec<(ItemKey, ItemHashes)>,
-        mut unhashable: Vec<(ItemKey, Unhashable)>,
+        rows: &mut [(ItemKey, ItemHashes)],
+        unhashable: &mut [(ItemKey, Unhashable)],
     ) -> HashColumns {
         rows.sort_unstable_by_key(|&(key, _)| key);
         unhashable.sort_unstable_by_key(|&(key, _)| key);
         for pair in rows.windows(2) {
             assert_ne!(pair[0].0, pair[1].0, "blaze-items: two rows of one key");
         }
+        let has_layout = Bits::new(rows.iter().map(|(_, it)| it.layout.is_some()));
+        let has_code = Bits::new(rows.iter().map(|(_, it)| it.code.is_some()));
         HashColumns {
-            keys: rows.iter().map(|&(key, _)| key).collect(),
-            kinds: rows.iter().map(|(_, it)| it.kind).collect(),
-            interface: rows.iter().map(|(_, it)| it.interface).collect(),
-            deep: rows.iter().map(|(_, it)| it.deep).collect(),
-            has_layout: Bits::new(rows.iter().map(|(_, it)| it.layout.is_some())),
-            layout: rows.iter().filter_map(|(_, it)| it.layout).collect(),
-            has_code: Bits::new(rows.iter().map(|(_, it)| it.code.is_some())),
-            code: rows.iter().filter_map(|(_, it)| it.code).collect(),
-            unhashable: unhashable.into(),
+            keys: column(rows.iter().map(|&(key, _)| key)),
+            kinds: column(rows.iter().map(|(_, it)| it.kind)),
+            interface: column(rows.iter().map(|(_, it)| it.interface)),
+            deep: column(rows.iter().map(|(_, it)| it.deep)),
+            layout: dense(has_layout.count(), rows.iter().filter_map(|(_, it)| it.layout)),
+            has_layout,
+            code: dense(has_code.count(), rows.iter().filter_map(|(_, it)| it.code)),
+            has_code,
+            unhashable: Box::from(&*unhashable),
         }
     }
 
@@ -172,6 +183,7 @@ impl HashColumns {
     /// one merge over both key columns.
     pub fn changed_since(&self, old: &HashColumns) -> Vec<ItemKey> {
         let (mut a, mut b) = (0, 0);
+        // alloc: the caller's list of what changed, once per build.
         let mut changed = Vec::new();
         while a < old.len() || b < self.len() {
             let order = match (old.keys.get(a), self.keys.get(b)) {
@@ -201,20 +213,37 @@ impl HashColumns {
     }
 }
 
+/// A memo's column of `values`, allocated once at its final length.
+pub(crate) fn column<T>(values: impl ExactSizeIterator<Item = T>) -> Box<[T]> {
+    dense(values.len(), values)
+}
+
+/// `count` values, the column of the rows that have one.
+fn dense<T>(count: usize, values: impl Iterator<Item = T>) -> Box<[T]> {
+    // alloc: a memo's column, kept as long as the memo, at the length its rows give.
+    let mut column = Vec::with_capacity(count);
+    column.extend(values);
+    debug_assert_eq!(column.len(), count);
+    column.into_boxed_slice()
+}
+
 /// The hashes of every item of `krate` with an [`crate::ItemId`], bodies' items included, in
-/// one pass: what the store keeps of a crate and diffs against the last build.
+/// one pass: what the store keeps of a crate and diffs against the last build. Its rows are
+/// gathered in the task's frame (the hash queries it runs take frames of their own).
 #[salsa::tracked(returns(ref))]
-pub fn crate_hashes(db: &dyn HirDatabase, krate: Crate) -> HashColumns {
-    let mut rows = Vec::new();
-    let mut unhashable = Vec::new();
-    for id in key::crate_item_ids(db, krate) {
-        let key = key::item_key(db, id);
-        match hash::hashes(db, id) {
-            Ok(it) => rows.push((key, it)),
-            Err(it) => unhashable.push((key, it)),
+pub fn crate_hashes(db: &Db, krate: Crate) -> HashColumns {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<(ItemKey, ItemHashes), &Frame> = Vec::new_in(frame);
+        let mut unhashable: Vec<(ItemKey, Unhashable), &Frame> = Vec::new_in(frame);
+        for id in key::crate_item_ids(db, krate) {
+            let key = key::item_key(db, id);
+            match hash::hashes(db, id) {
+                Ok(it) => rows.push((key, it)),
+                Err(it) => unhashable.push((key, it)),
+            }
         }
-    }
-    HashColumns::new(rows, unhashable)
+        HashColumns::new(&mut rows, &mut unhashable)
+    })
 }
 
 const NO_OBJECT: u32 = u32::MAX;
@@ -302,33 +331,37 @@ fn join(tag: u8, subject: ContentId, object: Object) -> Fact {
 
 impl FromIterator<Fact> for FactSet {
     fn from_iter<I: IntoIterator<Item = Fact>>(facts: I) -> FactSet {
-        let mut split: Vec<(u8, ContentId, Object)> = facts.into_iter().map(|it| split(&it)).collect();
-        let mut ids: Vec<ContentId> = Vec::with_capacity(split.len() * 2);
-        for &(_, subject, object) in &split {
-            ids.push(subject);
-            if let Object::Id(it) = object {
-                ids.push(it);
+        frame::task(Tag::Other, |frame| {
+            let mut rows: Vec<(u8, ContentId, Object), &Frame> = Vec::new_in(frame);
+            rows.extend(facts.into_iter().map(|it| split(&it)));
+            let mut ids: Vec<ContentId, &Frame> = Vec::with_capacity_in(rows.len() * 2, frame);
+            for &(_, subject, object) in rows.iter() {
+                ids.push(subject);
+                if let Object::Id(it) = object {
+                    ids.push(it);
+                }
             }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        assert!(ids.len() < NO_OBJECT as usize, "blaze-items: more than u32::MAX ids in a fact set");
-        let at = |id: ContentId| ids.binary_search(&id).expect("every id is in the dictionary") as u32;
-        // Positions in a sorted dictionary order as the ids do, so sorting the encoded rows
-        // sorts the facts by content.
-        split.sort_unstable();
-        split.dedup();
-        let kinds = split.iter().map(|&(tag, _, _)| tag).collect();
-        let subjects = split.iter().map(|&(_, subject, _)| at(subject)).collect();
-        let objects = split
-            .iter()
-            .map(|&(_, _, object)| match object {
+            ids.sort_unstable();
+            ids.dedup();
+            assert!(
+                ids.len() < NO_OBJECT as usize,
+                "blaze-items: more than u32::MAX ids in a fact set"
+            );
+            let at =
+                |id: ContentId| ids.binary_search(&id).expect("every id is in the dictionary") as u32;
+            // Positions in a sorted dictionary order as the ids do, so sorting the encoded rows
+            // sorts the facts by content.
+            rows.sort_unstable();
+            rows.dedup();
+            let kinds = column(rows.iter().map(|&(tag, _, _)| tag));
+            let subjects = column(rows.iter().map(|&(_, subject, _)| at(subject)));
+            let objects = column(rows.iter().map(|&(_, _, object)| match object {
                 Object::None => NO_OBJECT,
                 Object::Field(field) => field,
                 Object::Id(it) => at(it),
-            })
-            .collect();
-        FactSet { ids: ids.into(), kinds, subjects, objects }
+            }));
+            FactSet { ids: Box::from(&ids[..]), kinds, subjects, objects }
+        })
     }
 }
 

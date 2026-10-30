@@ -7,7 +7,7 @@
 
 use std::{cell::Cell, cmp::Ordering, iter};
 
-use base_db::{Crate, CrateOrigin, LangCrateOrigin, SourceDatabase};
+use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
 use hir_expand::{
     Lookup,
     mod_path::{ModPath, PathKind},
@@ -43,7 +43,7 @@ pub struct FindPathConfig {
 /// Find a path that can be used to refer to a certain item. This can depend on
 /// *from where* you're referring to the item, hence the `from` parameter.
 pub fn find_path(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item: ItemInNs,
     from: ModuleIdLt<'_>,
     prefix_kind: PrefixKind,
@@ -65,7 +65,7 @@ pub fn find_path(
 /// many paths) allocates only while the scratch grows.
 pub fn find_path_with<'db>(
     scratch: &mut FindPathScratch<'db>,
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     item: ItemInNs,
     from: ModuleIdLt<'db>,
     mut prefix_kind: PrefixKind,
@@ -189,7 +189,7 @@ impl PrefixKind {
 }
 
 struct FindPathCtx<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     prefix: PrefixKind,
     cfg: FindPathConfig,
     ignore_local_imports: bool,
@@ -347,7 +347,7 @@ fn find_path_for_module<'db>(
 }
 
 fn find_in_scope<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     def_map: &DefMap,
     from: ModuleIdLt<'db>,
     item: ItemInNs,
@@ -364,7 +364,7 @@ fn find_in_scope<'db>(
 /// Returns single-segment path (i.e. without any prefix) if `item` is found in prelude and its
 /// name doesn't clash in current scope.
 fn find_in_prelude(
-    db: &dyn SourceDatabase,
+    db: &Db,
     st: &mut FindPathScratch<'_>,
     local_def_map: &DefMap,
     item: ItemInNs,
@@ -398,7 +398,7 @@ fn find_in_prelude(
 }
 
 fn is_kw_kind_relative_to_from(
-    db: &dyn SourceDatabase,
+    db: &Db,
     def_map: &DefMap,
     item: ModuleIdLt<'_>,
     from: ModuleIdLt<'_>,
@@ -811,6 +811,7 @@ fn find_local_import_locations<'db>(
 pub(crate) mod tests {
     use std::cell::LazyCell;
 
+    use blaze_ids::rng::SplitMix64;
     use expect_test::{Expect, expect};
     use itertools::Itertools;
     use span::Edition;
@@ -818,7 +819,7 @@ pub(crate) mod tests {
     use syntax::ast::AstNode;
     use test_fixture::WithFixture;
 
-    use crate::test_db::TestDB;
+    use crate::test_db::{TestDB, TestDBExt};
 
     use super::*;
 
@@ -2438,7 +2439,7 @@ pub mod future {
     mod reference {
         use std::{cell::Cell, cmp::Ordering, iter};
 
-        use base_db::{Crate, CrateOrigin, LangCrateOrigin, SourceDatabase};
+        use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
         use hir_expand::{
             Lookup,
             mod_path::{ModPath, PathKind},
@@ -2461,7 +2462,7 @@ pub mod future {
         };
 
         pub(super) fn find_path(
-            db: &dyn SourceDatabase,
+            db: &Db,
             item: ItemInNs,
             from: ModuleIdLt<'_>,
             mut prefix_kind: PrefixKind,
@@ -2502,7 +2503,7 @@ pub mod future {
         }
 
         struct FindPathCtx<'db> {
-            db: &'db dyn SourceDatabase,
+            db: &'db Db,
             prefix: PrefixKind,
             cfg: FindPathConfig,
             ignore_local_imports: bool,
@@ -2663,7 +2664,7 @@ pub mod future {
         }
 
         fn find_in_prelude(
-            db: &dyn SourceDatabase,
+            db: &Db,
             local_def_map: &DefMap,
             item: ItemInNs,
             from: ModuleIdLt<'_>,
@@ -2954,31 +2955,6 @@ pub mod future {
         }
     }
 
-    /// splitmix64: the seeded stream the generated fixtures are drawn from.
-    pub(crate) struct Rng(u64);
-
-    impl Rng {
-        pub(crate) fn new(seed: u64) -> Rng {
-            Rng(seed)
-        }
-
-        pub(crate) fn next_u64(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        pub(crate) fn below(&mut self, n: usize) -> usize {
-            (self.next_u64() % n as u64) as usize
-        }
-
-        pub(crate) fn chance(&mut self, percent: u64) -> bool {
-            self.next_u64() % 100 < percent
-        }
-    }
-
     /// What the generator may put in a crate.
     #[derive(Clone, Copy)]
     pub(crate) struct Shape {
@@ -3048,7 +3024,7 @@ pub mod future {
     /// tree of modules, structs, enums and functions, then `use`s of its own items and modules,
     /// globs among them, and of the items of `deps` (by crate name).
     pub(crate) fn gen_crate(
-        rng: &mut Rng,
+        rng: &mut SplitMix64,
         tag: char,
         shape: Shape,
         deps: &[(&str, &GenCrate)],
@@ -3061,24 +3037,24 @@ pub mod future {
             names: FxHashSet::default(),
         };
         let mut krate = GenCrate { modules: vec![root], items: Vec::new() };
-        for i in 0..1 + rng.below(7) {
-            let parent = rng.below(krate.modules.len());
+        for i in 0..1 + rng.index(7) {
+            let parent = rng.index(krate.modules.len());
             let name = format!("{tag}m{i}");
             krate.modules[parent].names.insert(name.clone());
             krate.modules.push(GenModule {
                 parent: Some(parent),
                 name,
-                is_pub: !shape.private_modules || rng.chance(70),
+                is_pub: !shape.private_modules || rng.below(100) < 70,
                 lines: Vec::new(),
                 names: FxHashSet::default(),
             });
         }
-        for i in 0..2 + rng.below(8) {
-            let module = rng.below(krate.modules.len());
-            let vis = if rng.chance(80) { "pub " } else { "" };
+        for i in 0..2 + rng.index(8) {
+            let module = rng.index(krate.modules.len());
+            let vis = if rng.below(100) < 80 { "pub " } else { "" };
             // `#[macro_export]` puts a macro at the crate root, whatever module declares it.
             let mut at = module;
-            let (name, line) = match rng.below(5) {
+            let (name, line) = match rng.index(5) {
                 0 => {
                     let name = format!("{tag}S{i}");
                     let line = format!("{vis}struct {name};");
@@ -3114,28 +3090,28 @@ pub mod future {
             krate.items.push(path);
         }
         let mut alias = 0;
-        for _ in 0..rng.below(7) {
-            let into = rng.below(krate.modules.len());
-            let vis = match rng.below(10) {
+        for _ in 0..rng.index(7) {
+            let into = rng.index(krate.modules.len());
+            let vis = match rng.index(10) {
                 0..=4 => "pub ",
                 5 | 6 => "pub(crate) ",
                 7 => "pub(self) ",
                 _ if shape.private_imports => "",
                 _ => "pub ",
             };
-            let from_dep = !deps.is_empty() && rng.chance(30);
+            let from_dep = !deps.is_empty() && rng.below(100) < 30;
             let (prefix, source): (&str, &GenCrate) = if from_dep {
-                let (name, dep) = deps[rng.below(deps.len())];
+                let (name, dep) = deps[rng.index(deps.len())];
                 (name, dep)
             } else {
                 ("crate", &krate)
             };
-            let line = match rng.below(3) {
+            let line = match rng.index(3) {
                 0 if !source.items.is_empty() => {
-                    let item = &source.items[rng.below(source.items.len())];
+                    let item = &source.items[rng.index(source.items.len())];
                     let last = item.rsplit("::").next().unwrap().to_owned();
                     let path = GenCrate::join(prefix, item);
-                    if rng.chance(30) || krate.modules[into].names.contains(&last) {
+                    if rng.below(100) < 30 || krate.modules[into].names.contains(&last) {
                         alias += 1;
                         let renamed = format!("{tag}A{alias}");
                         krate.modules[into].names.insert(renamed.clone());
@@ -3146,7 +3122,7 @@ pub mod future {
                     }
                 }
                 1 if source.modules.len() > 1 => {
-                    let module = 1 + rng.below(source.modules.len() - 1);
+                    let module = 1 + rng.index(source.modules.len() - 1);
                     let path = GenCrate::join(prefix, &source.module_path(module));
                     alias += 1;
                     let renamed = format!("{tag}A{alias}");
@@ -3154,7 +3130,7 @@ pub mod future {
                     format!("{vis}use {path} as {renamed};")
                 }
                 _ => {
-                    let module = rng.below(source.modules.len());
+                    let module = rng.index(source.modules.len());
                     let path = GenCrate::join(prefix, &source.module_path(module));
                     format!("{vis}use {path}::*;")
                 }
@@ -3167,10 +3143,10 @@ pub mod future {
     /// A fixture of three crates: `std` (with a 2018 prelude re-exporting some of its items),
     /// `dep` using `std`, and `main` using both.
     pub(crate) fn gen_fixture(seed: u64, shape: Shape) -> String {
-        let mut rng = Rng::new(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut std_crate = gen_crate(&mut rng, 's', shape, &[]);
         let mut prelude = String::from("pub mod prelude {\npub mod rust_2018 {\npub struct sP0;\n");
-        for item in std_crate.items.iter().filter(|_| rng.chance(40)) {
+        for item in std_crate.items.iter().filter(|_| rng.below(100) < 40) {
             format_to!(prelude, "pub use crate::{item};\n");
         }
         prelude.push_str("}\n}\n");

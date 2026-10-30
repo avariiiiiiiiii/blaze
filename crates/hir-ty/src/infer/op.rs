@@ -10,6 +10,7 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, InferenceDiagnostic,
     infer::{AllowTwoPhase, AutoBorrowMutability, Expectation, InferenceContext, expr::ExprIsRead},
     method_resolution::{MethodCallee, TreatNotYetDefinedOpaques},
+    solver_errors::StoredGoal,
     next_solver::{
         GenericArgs, TraitRef, Ty, TyKind,
         fulfill::NextSolverError,
@@ -26,9 +27,15 @@ impl<'db> InferenceContext<'db> {
         op: ArithOp,
         lhs: ExprId,
         rhs: ExprId,
+        expected: &Expectation<'db>,
     ) -> Ty<'db> {
-        let (lhs_ty, rhs_ty, return_ty) =
-            self.infer_overloaded_binop(expr, lhs, rhs, BinaryOp::Assignment { op: Some(op) });
+        let (lhs_ty, rhs_ty, return_ty) = self.infer_overloaded_binop(
+            expr,
+            lhs,
+            rhs,
+            BinaryOp::Assignment { op: Some(op) },
+            expected,
+        );
 
         let category = BinOpCategory::from(op);
         let ty = if !lhs_ty.is_ty_var()
@@ -41,7 +48,7 @@ impl<'db> InferenceContext<'db> {
             return_ty
         };
 
-        self.check_lhs_assignable(lhs);
+        self.check_lhs_assignable(lhs, expr, Some(op));
 
         ty
     }
@@ -53,6 +60,7 @@ impl<'db> InferenceContext<'db> {
         op: BinaryOp,
         lhs_expr: ExprId,
         rhs_expr: ExprId,
+        expected: &Expectation<'db>,
     ) -> Ty<'db> {
         debug!(
             "check_binop(expr.hir_id={:?}, expr={:?}, op={:?}, lhs_expr={:?}, rhs_expr={:?})",
@@ -84,7 +92,7 @@ impl<'db> InferenceContext<'db> {
                 // overloaded. This is the way to be most flexible w/r/t
                 // types that get inferred.
                 let (lhs_ty, rhs_ty, return_ty) =
-                    self.infer_overloaded_binop(expr, lhs_expr, rhs_expr, op);
+                    self.infer_overloaded_binop(expr, lhs_expr, rhs_expr, op, expected);
 
                 // Supply type inference hints if relevant. Probably these
                 // hints should be enforced during select as part of the
@@ -159,6 +167,7 @@ impl<'db> InferenceContext<'db> {
         lhs_expr: ExprId,
         rhs_expr: ExprId,
         op: BinaryOp,
+        expected: &Expectation<'db>,
     ) -> (Ty<'db>, Ty<'db>, Ty<'db>) {
         debug!("infer_overloaded_binop(expr.hir_id={:?}, op={:?})", expr, op);
 
@@ -190,6 +199,8 @@ impl<'db> InferenceContext<'db> {
         // us do better coercions than we would be able to do otherwise,
         // particularly for things like `String + &String`.
         let rhs_ty_var = self.table.next_ty_var(rhs_expr.into());
+        // rustc's `ObligationCauseCode::BinOp { output_ty }` of the lookup.
+        let output = expected.only_has_type(&mut self.table);
         let result = self.lookup_op_method(
             expr,
             lhs_ty,
@@ -238,7 +249,7 @@ impl<'db> InferenceContext<'db> {
 
                 method.sig.output()
             }
-            Err(_errors) => {
+            Err(errors) => {
                 // Core implements the operator's trait for every builtin operation on scalars.
                 let is_builtin = !lhs_ty.is_ty_var()
                     && !rhs_ty.is_ty_var()
@@ -258,6 +269,9 @@ impl<'db> InferenceContext<'db> {
                         op,
                         lhs: lhs_ty.store(),
                         rhs: rhs_ty.store(),
+                        at_error: self.types_at_error(lhs_ty, rhs_ty),
+                        unmet: self.unmet_goals(errors),
+                        output: output.map(|it| it.store()),
                     });
                 }
                 self.types.types.error
@@ -278,11 +292,15 @@ impl<'db> InferenceContext<'db> {
                 self.write_method_resolution(ex, method.def_id, method.args);
                 method.sig.output()
             }
-            Err(_errors) => {
+            Err(errors) => {
+                let unmet = self.unmet_goals(errors);
+                let at_error = self.ty_at_error(operand_ty);
                 self.push_diagnostic(InferenceDiagnostic::UnaryOperatorCannotBeApplied {
                     expr: ex,
                     op,
                     found: operand_ty.store(),
+                    at_error,
+                    unmet,
                 });
                 self.types.types.error
             }
@@ -369,6 +387,19 @@ impl<'db> InferenceContext<'db> {
                 Err(ocx.evaluate_obligations_error_on_ambiguity())
             }
         }
+    }
+
+    /// The goals of `errors` as rustc's `report_binop_fulfillment_errors` and `check_user_unop`
+    /// read them: each fulfillment error's leaf obligation, resolved.
+    fn unmet_goals(&self, errors: Vec<NextSolverError<'db>>) -> Vec<StoredGoal> {
+        let infcx = self.infcx();
+        errors
+            .into_iter()
+            .map(|error| {
+                let predicate = error.into_fulfillment_error(infcx).obligation.predicate;
+                StoredGoal::new(self.interner(), infcx.deeply_resolve_ignoring_regions(predicate))
+            })
+            .collect()
     }
 
     fn lang_item_for_bin_op(&self, op: BinaryOp) -> (Option<FunctionId>, Option<TraitId>) {

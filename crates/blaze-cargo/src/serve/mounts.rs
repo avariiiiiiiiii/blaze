@@ -19,6 +19,11 @@ fn head_of(mount: &Mount) -> String {
     format!("{PREFIX}{}\0{}", mount.at, mount.under)
 }
 
+/// What the standard library's read is kept as besides its mount: `library:<fingerprint>`, a
+/// NUL, then where it is mounted, its root the mount's. While the mount there still has that
+/// root, a library of that fingerprint is not read again.
+const LIBRARY: &str = "library:";
+
 fn parse(head: &str) -> Option<(String, String)> {
     let (at, under) = head.strip_prefix(PREFIX)?.split_once('\0')?;
     Some((at.to_owned(), under.to_owned()))
@@ -91,6 +96,37 @@ impl Mounts {
         }
         Ok((mount, ticket))
     }
+
+    /// The standard library of `fingerprint` read into `source`, mounted at `at` as
+    /// [`Mounts::mount`] does and kept as that fingerprint's.
+    pub fn mount_library(
+        &mut self,
+        vfs: &mut Vfs,
+        at: &str,
+        fingerprint: &str,
+        source: &Source,
+    ) -> Result<(Mount, Ticket), String> {
+        let (mount, _) = self.mount(vfs, at, source)?;
+        let Origin::Root(root) = mount.origin else { unreachable!("a source is mounted as a root of its own") };
+        let head = format!("{LIBRARY}{fingerprint}\0{at}");
+        let ticket = vfs.set_head(&head, root).map_err(|error| commit_error(at, &error))?;
+        Ok((mount, ticket))
+    }
+
+    /// Each standard library read before and mounted as it was read: its fingerprint, and
+    /// where it is mounted.
+    pub fn libraries(&self, vfs: &Vfs) -> Vec<(String, String)> {
+        let mut kept = Vec::new();
+        for (head, root) in vfs.heads() {
+            let Some((fingerprint, at)) = head.strip_prefix(LIBRARY).and_then(|it| it.split_once('\0')) else {
+                continue;
+            };
+            if self.get(at).is_some_and(|it| it.origin == Origin::Root(root)) {
+                kept.push((fingerprint.to_owned(), at.to_owned()));
+            }
+        }
+        kept
+    }
 }
 
 fn op_error(error: &OpError) -> String {
@@ -133,6 +169,18 @@ mod tests {
         assert_eq!(again.get(at), Some(&mount));
         assert_eq!(again.get(index).unwrap().under, "serde");
         assert_eq!(again.roots().len(), 2);
+    }
+
+    #[test]
+    fn a_library_read_is_kept_while_its_mount_is_as_it_was_read() {
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
+        let mut mounts = Mounts::default();
+        let at = "/rustc/0123abcd/library";
+        mounts.mount_library(&mut vfs, at, "f1", &source(&[("core/src/lib.rs", b"#![no_core]\n")], "")).unwrap();
+        assert_eq!(mounts.libraries(&vfs), vec![("f1".to_owned(), at.to_owned())]);
+        assert_eq!(Mounts::recover(&vfs).libraries(&vfs), mounts.libraries(&vfs), "kept across a restart");
+        mounts.mount(&mut vfs, at, &source(&[("core/src/lib.rs", b"#![no_core] // edited\n")], "")).unwrap();
+        assert!(mounts.libraries(&vfs).is_empty(), "the mount is no longer what that library read");
     }
 
     #[test]

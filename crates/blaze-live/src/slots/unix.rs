@@ -67,7 +67,184 @@ pub(super) fn in_image(range: &Range<u64>, base: u64) -> Result<(), String> {
     if image_base(range.start) == Some(base) && image_base(last) == Some(base) {
         Ok(())
     } else {
-        Err(format!("data at {:#x}..{:#x}, outside the image at {base:#x}", range.start, range.end))
+        Err(outside(range, base))
+    }
+}
+
+fn outside(range: &Range<u64>, base: u64) -> String {
+    format!("data at {:#x}..{:#x}, outside the image at {base:#x}", range.start, range.end)
+}
+
+/// The address ranges the image the loader put at `base` is mapped in, sorted: those the
+/// loader's `dladdr` finds an address of the image in (ELF `PT_LOAD` segments, Mach-O
+/// segments but `__PAGEZERO`), read once at start. [`Segments::check`] is [`in_image`] by
+/// binary search, where `dladdr` walks the loader's list of images and their symbols for
+/// each address.
+pub(super) struct Segments {
+    base: u64,
+    ranges: Vec<Range<u64>>,
+}
+
+impl Segments {
+    fn new(base: u64, mut ranges: Vec<Range<u64>>) -> Result<Segments, String> {
+        ranges.retain(|it| !it.is_empty());
+        ranges.sort_unstable_by_key(|it| it.start);
+        if ranges.is_empty() {
+            return Err(format!("the image at {base:#x} has no segments"));
+        }
+        Ok(Segments { base, ranges })
+    }
+
+    /// Whether `at` is in a segment.
+    fn has(&self, at: u64) -> bool {
+        let next = self.ranges.partition_point(|it| it.end <= at);
+        self.ranges.get(next).is_some_and(|it| it.start <= at)
+    }
+
+    /// Checks that the first and the last byte of `range` are in the image, as [`in_image`].
+    pub(super) fn check(&self, range: &Range<u64>) -> Result<(), String> {
+        let last = range.end.saturating_sub(1).max(range.start);
+        if self.has(range.start) && self.has(last) {
+            Ok(())
+        } else {
+            Err(outside(range, self.base))
+        }
+    }
+
+    /// Where the image is loaded.
+    pub(super) fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// From the start of the first segment to the end of the last, in memory.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) fn hull(&self) -> Range<u64> {
+        let first = self.ranges.first().map_or(0, |it| it.start);
+        first..self.ranges.last().map_or(first, |it| it.end)
+    }
+
+    /// The segments of the image that has `address`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn of(address: u64) -> Result<Segments, String> {
+        /// The first fields of `dl_phdr_info`, which the loader passes by pointer.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct Info {
+            addr: u64,
+            name: *const c_char,
+            phdr: *const Phdr,
+            phnum: u16,
+        }
+        /// `Elf64_Phdr`.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct Phdr {
+            kind: u32,
+            flags: u32,
+            offset: u64,
+            vaddr: u64,
+            paddr: u64,
+            filesz: u64,
+            memsz: u64,
+            align: u64,
+        }
+        const PT_LOAD: u32 = 1;
+        unsafe extern "C" {
+            fn dl_iterate_phdr(
+                each: extern "C" fn(*mut Info, usize, *mut c_void) -> c_int,
+                data: *mut c_void,
+            ) -> c_int;
+        }
+        struct Found {
+            address: u64,
+            ranges: Vec<Range<u64>>,
+        }
+        extern "C" fn each(info: *mut Info, _: usize, data: *mut c_void) -> c_int {
+            // SAFETY: `data` is the `Found` `of` passed, borrowed for the walk.
+            let found = unsafe { &mut *(data as *mut Found) };
+            // SAFETY: the loader's `dl_phdr_info` of one object, valid during this call; its
+            // first four fields are `Info`'s.
+            let info = unsafe { &*info };
+            if info.phdr.is_null() {
+                return 0;
+            }
+            // SAFETY: `phdr` is the object's array of `phnum` program headers, mapped as long
+            // as the object is loaded, which it is during this call.
+            let headers = unsafe { std::slice::from_raw_parts(info.phdr, usize::from(info.phnum)) };
+            let loads = headers.iter().filter(|it| it.kind == PT_LOAD).map(|it| {
+                let start = info.addr.wrapping_add(it.vaddr);
+                start..start.saturating_add(it.memsz)
+            });
+            if !loads.clone().any(|it| it.contains(&found.address)) {
+                return 0;
+            }
+            found.ranges.extend(loads);
+            1
+        }
+        let base = image_base(address)
+            .ok_or_else(|| format!("no image has the address {address:#x}"))?;
+        let mut found = Found { address, ranges: Vec::with_capacity(16) };
+        // SAFETY: `each` only reads the loader's headers and pushes to the `Found` it is given.
+        unsafe { dl_iterate_phdr(each, &mut found as *mut Found as *mut c_void) };
+        Segments::new(base, found.ranges)
+    }
+
+    /// The segments of the image that has `address`, from its Mach-O header.
+    #[cfg(target_os = "macos")]
+    pub(super) fn of(address: u64) -> Result<Segments, String> {
+        const MH_MAGIC_64: u32 = 0xfeed_facf;
+        const LC_SEGMENT_64: u32 = 0x19;
+        const HEADER: usize = 32;
+        const SEGMENT: usize = 72;
+        let base = image_base(address)
+            .ok_or_else(|| format!("no image has the address {address:#x}"))?;
+        let u32_at = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+        };
+        let u64_at = |bytes: &[u8], at: usize| {
+            u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+        };
+        // SAFETY: `base` is where dyld mapped the image's Mach-O header (dladdr's `dli_fbase`),
+        // the start of its `__TEXT`, read-only for as long as the image is loaded.
+        let header = unsafe { image::view(base, HEADER) };
+        if u32_at(header, 0) != MH_MAGIC_64 {
+            return Err(format!("the image at {base:#x} is not a 64-bit Mach-O image"));
+        }
+        let (count, len) = (u32_at(header, 16), u32_at(header, 20) as usize);
+        // SAFETY: the load commands follow the header in the same mapped `__TEXT`, `len`
+        // bytes by the header, which dyld checked when it loaded the image.
+        let commands = unsafe { image::view(base + HEADER as u64, len) };
+        let (mut at, mut segments, mut slide) = (0usize, Vec::new(), None);
+        for _ in 0..count {
+            if at + 8 > commands.len() {
+                break;
+            }
+            let (kind, size) = (u32_at(commands, at), u32_at(commands, at + 4) as usize);
+            if size < 8 || at + size > commands.len() {
+                return Err(format!("the image at {base:#x} has a load command past its end"));
+            }
+            if kind == LC_SEGMENT_64 && size >= SEGMENT {
+                let (vmaddr, vmsize) = (u64_at(commands, at + 24), u64_at(commands, at + 32));
+                let (fileoff, filesize) = (u64_at(commands, at + 40), u64_at(commands, at + 48));
+                let initprot = u32_at(commands, at + 60);
+                if fileoff == 0 && filesize != 0 {
+                    slide = Some(base.wrapping_sub(vmaddr));
+                }
+                if initprot != 0 {
+                    segments.push((vmaddr, vmsize));
+                }
+            }
+            at += size;
+        }
+        let slide = slide.ok_or_else(|| format!("the image at {base:#x} maps no header"))?;
+        let ranges = segments
+            .into_iter()
+            .map(|(vmaddr, vmsize)| {
+                let start = vmaddr.wrapping_add(slide);
+                start..start.saturating_add(vmsize)
+            })
+            .collect();
+        Segments::new(base, ranges)
     }
 }
 

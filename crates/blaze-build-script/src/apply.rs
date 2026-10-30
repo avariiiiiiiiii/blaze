@@ -283,33 +283,38 @@ impl Rerun {
     /// Whether a run that began at `ran` must run again. A variable's value is `[env]`'s when
     /// that has it, else cargo's environment's: `then` is what it was at the run, `now` what
     /// it is. A file newer than `ran` is a change; one as old is not. `None` for
-    /// [`Rerun::Package`], whose files the package's source says. `path` is the caller's
-    /// buffer, kept across checks (docs/v2/plan/design/memory.md, scratch per worker): a check
-    /// that finds nothing stale allocates nothing once it has grown, a directory's walk aside.
+    /// [`Rerun::Package`], whose files the package's source says. Each file's path is joined
+    /// in the thread's path buffer ([`blaze_mem::scratch::with_path`]): a check that finds
+    /// nothing stale allocates nothing once that buffer has grown, a directory's walk aside.
     pub fn stale<'v, T, N>(
         &self,
         package_dir: &Path,
         ran: SystemTime,
         then: &T,
         now: &N,
-        path: &mut PathBuf,
     ) -> Option<Option<Stale>>
     where
         T: Fn(&str) -> Option<&'v str> + ?Sized,
         N: Fn(&str) -> Option<&'v str> + ?Sized,
     {
         let Rerun::Watched { files, env } = self else { return None };
-        for file in files {
-            path.as_mut_os_string().clear();
-            path.push(package_dir);
-            path.push(file);
-            match newest(path) {
-                // clone: the reason the run is stale, made once, when it is.
-                None => return Some(Some(Stale::Missing(path.clone()))),
-                // clone: as above.
-                Some(it) if it > ran => return Some(Some(Stale::Newer(path.clone()))),
-                Some(_) => {}
+        let changed = blaze_mem::scratch::with_path(|path| {
+            for file in files {
+                path.push(package_dir);
+                path.push(file);
+                match newest(path) {
+                    // clone: the reason the run is stale, made once, when it is.
+                    None => return Some(Stale::Missing(path.clone())),
+                    // clone: as above.
+                    Some(it) if it > ran => return Some(Stale::Newer(path.clone())),
+                    Some(_) => {}
+                }
+                path.as_mut_os_string().clear();
             }
+            None
+        });
+        if changed.is_some() {
+            return Some(changed);
         }
         for name in env {
             let (then, now) = (then(name), now(name));

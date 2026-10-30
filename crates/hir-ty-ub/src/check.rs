@@ -16,6 +16,7 @@
 //!   destination's race and Tree Borrows write, then the overlap check (`mem_copy_repeatedly`);
 //! - free: memory, race, Tree Borrows.
 
+mod offset;
 mod report;
 #[cfg(test)]
 mod tests;
@@ -23,6 +24,7 @@ mod valid;
 
 use std::ops::Range;
 
+use base_db::Db;
 use hir_def::{FunctionId, HasModule};
 use hir_ty::{
     InferBodyId,
@@ -36,7 +38,7 @@ use hir_ty_mir::mir::{
 };
 use rustc_hash::FxHashMap;
 
-pub use self::valid::ValueError;
+pub use self::{offset::OffsetFromError, valid::ValueError};
 use self::valid::{Fail, Plans};
 use crate::{
     borrows::{self, Borrows, NewPermission, PtrKind},
@@ -556,6 +558,11 @@ impl<'db> Machine<'db> for Checker<'db> {
         self.mem.offset_inbounds(ptr.addr, ptr.prov, by).map_err(|e| self.fail(e.into()))
     }
 
+    fn offset_from(&mut self, a: Ptr<Prov>, b: Ptr<Prov>, unsigned: bool) -> MResult<()> {
+        offset::check(&self.mem, (a.addr, a.prov), (b.addr, b.prov), unsigned)
+            .map_err(|e| self.fail(Ub::OffsetFrom(e)))
+    }
+
     // Miri: alloc_addresses/mod.rs, `expose_provenance`; borrow_tracker `expose_tag`.
     fn expose(&mut self, ptr: Ptr<Prov>) -> MResult<()> {
         if let Some(Prov::Concrete { alloc, tag }) = ptr.prov {
@@ -664,8 +671,7 @@ impl<'db> Machine<'db> for Checker<'db> {
 
 /// Runs the test `test` (a `fn()`) under the checker, once per schedule of `config`, and says
 /// what the first schedule that did not pass found.
-// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-pub fn run_test<'db>(db: &'db dyn HirDatabase, test: FunctionId, config: &Config) -> Outcome {
+pub fn run_test<'db>(db: &'db Db, test: FunctionId, config: &Config) -> Outcome {
     let krate = test.krate(db);
     let ptr_size = match db.target_data_layout(krate) {
         Ok(target) => target.pointer_size().bytes(),
@@ -688,8 +694,7 @@ pub fn run_test<'db>(db: &'db dyn HirDatabase, test: FunctionId, config: &Config
 
 /// The outcome of one schedule; `None` when it passed.
 fn outcome<'db>(
-    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     checker: &Checker<'db>,
     result: Result<(), MirEvalError<'db>>,
     seed: u64,

@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+use base_db::Db;
 use blaze_cargo::events::{COUNTED, node_ids, say};
 pub(crate) use blaze_cargo::events::{Counting, at, heard, idle, said_beside, within};
 pub(crate) use blaze_protocol::events::{Cache, CrateState, Step};
@@ -18,8 +19,8 @@ use hir_ty_codegen::counted::Counted;
 use ide_db::base_db::Crate;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// The name each crate of the build has in its [`Event::Node`], which its [`Event::Crate`]s
-/// use too: the standard library's crates are one node, `std`.
+/// The name each crate of the build has in the graph's [`Event::Nodes`], which its
+/// [`Event::Crate`]s use too: the standard library's crates are one node, `std`.
 static NAMES: Mutex<Option<FxHashMap<Crate, String>>> = Mutex::new(None);
 
 const STD: &str = "std";
@@ -70,45 +71,62 @@ pub(crate) fn graph(db: &ide_db::RootDatabase, crates: &[Crate]) {
             }
         }
     }
-    // Each node after what it waits for, in the order the crates came where that allows.
-    let first = node_ids(order.len());
+    if let Some(event) = nodes(node_ids(order.len()), &order, &deps) {
+        say(event);
+    }
+    *crate::lock(&NAMES) = Some(names);
+}
+
+/// The nodes named `order`, numbered from `first` as one [`Event::Nodes`]: each after the
+/// nodes of what it waits for in `deps`, in the order of `order` where that allows. `None`
+/// for no nodes.
+fn nodes(first: u32, order: &[String], deps: &FxHashMap<&str, FxHashSet<&str>>) -> Option<Event> {
+    if order.is_empty() {
+        return None;
+    }
     let mut index: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut nodes: Vec<Event> = Vec::with_capacity(order.len());
-    let node = |name: &str, id: u32, deps: Vec<u32>| {
-        let kind = if name == STD { NodeKind::Std } else { NodeKind::Names };
-        Event::Node { id, kind, name: name.to_owned(), deps }
+    let mut kinds: Vec<NodeKind> = Vec::with_capacity(order.len());
+    let mut said = String::with_capacity(order.iter().map(String::len).sum());
+    let mut name_at: Vec<u32> = Vec::with_capacity(order.len() + 1);
+    let mut waits_on: Vec<u32> = Vec::new();
+    let mut deps_at: Vec<u32> = Vec::with_capacity(order.len() + 1);
+    name_at.push(0);
+    deps_at.push(0);
+    let mut node = |name: &str, on: &[u32]| {
+        kinds.push(if name == STD { NodeKind::Std } else { NodeKind::Names });
+        said.push_str(name);
+        name_at.push(said.len() as u32);
+        waits_on.extend_from_slice(on);
+        deps_at.push(waits_on.len() as u32);
     };
+    let mut on: Vec<u32> = Vec::new();
     while index.len() < order.len() {
         let before = index.len();
-        for name in &order {
+        for name in order {
             if index.contains_key(name.as_str()) {
                 continue;
             }
             let waits = deps.get(name.as_str());
             let ready = waits.is_none_or(|it| it.iter().all(|dep| index.contains_key(dep)));
             if ready {
-                let mut on: Vec<u32> = waits.into_iter().flatten().map(|dep| index[dep]).collect();
+                on.clear();
+                on.extend(waits.into_iter().flatten().map(|dep| index[dep]));
                 blaze_ids::radix::sort(&mut on);
-                let id = first + index.len() as u32;
-                index.insert(name, id);
-                nodes.push(node(name, id, on));
+                index.insert(name, first + index.len() as u32);
+                node(name, &on);
             }
         }
         // A cycle, which crates do not have: the rest are said waiting for nothing.
         if index.len() == before {
-            for name in &order {
+            for name in order {
                 if !index.contains_key(name.as_str()) {
-                    let id = first + index.len() as u32;
-                    index.insert(name, id);
-                    nodes.push(node(name, id, Vec::new()));
+                    index.insert(name, first + index.len() as u32);
+                    node(name, &[]);
                 }
             }
         }
     }
-    for event in nodes {
-        say(event);
-    }
-    *crate::lock(&NAMES) = Some(names);
+    Some(Event::Nodes { first, kinds, names: said, name_at, deps: waits_on, deps_at })
 }
 
 /// The name of `krate` in the graph said, if one was.
@@ -298,7 +316,7 @@ impl Drop for Compiling {
 /// edit, of the files `edited`, which functions it compiled again and why. `counted` is what
 /// its [`Compiling`] counted, none when nothing was compiled.
 pub(crate) fn built(
-    db: &dyn hir::db::HirDatabase,
+    db: &Db,
     krate: &str,
     stats: &hir_ty_codegen::BuildStats,
     edited: Option<&FxHashMap<vfs::FileId, PathBuf>>,
@@ -357,5 +375,73 @@ pub(crate) fn built(
             let fns = Fns { total: kept, done: kept, kept };
             say(Event::Crate { name: name.clone(), state: CrateState::UpToDate, fns });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_protocol::events::{NodeKind, Order};
+    use rustc_hash::{FxHashMap, FxHashSet};
+
+    use super::{STD, nodes};
+
+    fn waits<'a>(edges: &[(&'a str, &[&'a str])]) -> FxHashMap<&'a str, FxHashSet<&'a str>> {
+        edges.iter().map(|(of, on)| (*of, on.iter().copied().collect())).collect()
+    }
+
+    /// Each node as `(id, kind, name, deps)`, read back through the protocol's own check.
+    fn read(
+        first: u32,
+        order: &[&str],
+        edges: &[(&str, &[&str])],
+    ) -> Vec<(u32, NodeKind, String, Vec<u32>)> {
+        let order: Vec<String> = order.iter().map(|it| (*it).to_owned()).collect();
+        let event = nodes(first, &order, &waits(edges)).expect("some nodes");
+        let mut places = Order::default();
+        let batch = event.nodes(&mut places).expect("an `Event::Nodes`").expect("well formed");
+        batch.iter().map(|it| (it.id, it.kind, it.name.to_owned(), it.deps.to_vec())).collect()
+    }
+
+    #[test]
+    fn a_node_comes_after_what_it_waits_for() {
+        let got = read(7, &[STD, "app", "lib"], &[("app", &[STD, "lib"]), ("lib", &[STD])]);
+        assert_eq!(
+            got,
+            [
+                (7, NodeKind::Std, STD.to_owned(), vec![]),
+                (8, NodeKind::Names, "lib".to_owned(), vec![7]),
+                (9, NodeKind::Names, "app".to_owned(), vec![7, 8]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_said_waiting_for_nothing() {
+        let got = read(0, &["a", "b", "c"], &[("a", &["b"]), ("b", &["a"])]);
+        assert_eq!(
+            got,
+            [
+                (0, NodeKind::Names, "c".to_owned(), vec![]),
+                (1, NodeKind::Names, "a".to_owned(), vec![]),
+                (2, NodeKind::Names, "b".to_owned(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn names_of_more_than_one_byte_a_char_are_cut_whole() {
+        let got = read(3, &["héllo", "wörld"], &[("wörld", &["héllo"])]);
+        assert_eq!(
+            got,
+            [
+                (3, NodeKind::Names, "héllo".to_owned(), vec![]),
+                (4, NodeKind::Names, "wörld".to_owned(), vec![3]),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_crates_say_nothing() {
+        assert!(nodes(0, &[], &FxHashMap::default()).is_none());
     }
 }

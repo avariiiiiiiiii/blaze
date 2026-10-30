@@ -24,6 +24,9 @@
 //!   each key at its pack with one swap.
 //!
 //! The layout on disk and why it survives a crash at any point: docs/v2-store.md.
+//!
+//! Its in-memory tables and segments sit on `blaze_mem` regions tagged `Tag::Store`
+//! (docs/v2/plan/lanes/mem/backend-cas.md): a lookup that hits and a warm put allocate nothing.
 
 pub mod chunk;
 mod cold;
@@ -37,10 +40,15 @@ pub mod remote;
 mod segment;
 mod sync;
 mod table;
+mod words;
 #[cfg(all(test, blaze_check))]
 mod model;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
+
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{collections::VecDeque, fmt, sync::Arc};
 
@@ -1200,14 +1208,11 @@ impl Store {
     fn rehome(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) {
         let (seg, span) = self.own.write(unit, &header, payload, 0);
         self.own.keep(span);
-        let spot = Box::new(Spot::new(header.key, header.content, Place::Segment(seg), Ticket::DURABLE));
+        let spot = Spot::new(header.key, header.content, Place::Segment(seg), Ticket::DURABLE);
         let held = Held::writer(&*self.shared);
         let delta = &self.tiers[0].delta;
-        let row = match delta.replace(spot) {
-            Ok(old) => {
-                self.limbo.retire(old);
-                delta.get(held, &header.key).expect("a key replaced just now").0
-            }
+        let row = match delta.replace(held, spot) {
+            Ok(_) => delta.get(held, &header.key).expect("a key replaced just now").0,
             // Only in the index table, or (a slot not whole) put meanwhile by a writer.
             Err(spot) => match delta.insert(held, spot) {
                 Ok((row, _)) | Err((_, (row, _))) => row,
@@ -1649,18 +1654,20 @@ impl Store {
     fn finish_batches(&mut self) {
         if self.pending.front().is_some_and(|it| it.maps == 0) {
             self.publish();
-            let (mut old, mut chunks) = (Vec::new(), Vec::new());
+            // alloc: one list a commit of the chunks drained, held in the limbo past their grace
+            let mut chunks = Vec::new();
             while self.pending.front().is_some_and(|it| it.maps == 0) {
                 let batch = self.pending.pop_front().expect("a batch at the front");
                 let held = Held::writer(&*self.shared);
                 let own = &self.tiers[0];
                 for it in &batch.moves {
                     for table in std::iter::once(&own.delta).chain(&own.prev) {
+                        // The spot swapped out stays readable in its table until a collect
+                        // after its grace, which begins after this swap and before the chunks'.
                         if let Some((_, spot)) = table.get(held, &it.key)
                             && spot.place == Place::Segment(it.from)
-                            && let Ok(was) = table.replace(spot.at(Place::Pack(it.to)))
                         {
-                            old.push(was);
+                            _ = table.replace(held, spot.at(Place::Pack(it.to)));
                         }
                     }
                 }
@@ -1668,9 +1675,7 @@ impl Store {
                     chunks.push(self.drains[number].segment.unlink_first(chunk));
                 }
             }
-            let grace = Grace::start();
-            self.limbo.hold(grace, old);
-            self.limbo.hold(grace, chunks);
+            self.limbo.hold(Grace::start(), chunks);
         }
         self.try_flip();
     }
@@ -1756,6 +1761,10 @@ impl Store {
     /// whole once they hold too much.
     fn tidy(&mut self) {
         self.limbo.collect();
+        let own = &self.tiers[0];
+        for table in std::iter::once(&own.delta).chain(&own.prev) {
+            table.collect();
+        }
         self.end_migration();
         if self.shared.owned(Held::writer(&*self.shared)).bytes() > OWNED_MOST {
             let old = self.shared.fresh_owned();
@@ -2399,7 +2408,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     // A settle writes a key's new record after its old one, so the last of a key is its live
     // one: inserted first, it keeps the key.
     for spot in found.into_iter().rev() {
-        _ = delta.insert(held, Box::new(spot));
+        _ = delta.insert(held, spot);
     }
     tier.delta = Arc::new(delta);
     let packs = &tier.packs;

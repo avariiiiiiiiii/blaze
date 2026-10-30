@@ -21,6 +21,7 @@ pub mod pool;
 pub mod process;
 pub mod transport;
 pub mod warm;
+pub mod wire;
 pub mod wrap;
 
 use paths::{AbsPath, AbsPathBuf};
@@ -48,9 +49,12 @@ pub mod version {
     /// from 0, with the scope `expand-<n>` for its sandbox (`crate::warm`). The messages are
     /// as they were.
     pub const SCOPED_EXPANSIONS: u32 = 7;
+    /// Whether an expansion is asked and answered with token trees as their columns
+    /// (`ExpandMacroWire`, [`crate::wire`]) where older versions send a `FlatTree`.
+    pub const WIRE_TREES: u32 = 8;
 
     /// Current API version of the proc-macro protocol.
-    pub const CURRENT_API_VERSION: u32 = SCOPED_EXPANSIONS;
+    pub const CURRENT_API_VERSION: u32 = WIRE_TREES;
 }
 
 /// Protocol format for communication between client and server.

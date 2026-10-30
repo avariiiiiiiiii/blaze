@@ -19,6 +19,7 @@ rustc-hash = { workspace = true, optional = true }
 span = { path = "../span", version = "0.0.0", default-features = false, optional = true }
 intern = { workspace = true, optional = true }
 stdx = { workspace = true, optional = true }
+tt = { workspace = true, optional = true }
 
 [dev-dependencies]
 expect-test.workspace = true
@@ -29,7 +30,7 @@ proc-macro-test.path = "./proc-macro-test"
 
 [features]
 default = []
-in-rust-tree = ["dep:intern", "dep:paths", "dep:rustc-hash", "dep:span", "dep:stdx"]
+in-rust-tree = ["dep:intern", "dep:paths", "dep:rustc-hash", "dep:span", "dep:stdx", "dep:tt"]
 
 [lints]
 workspace = true

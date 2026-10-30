@@ -9,6 +9,7 @@
 //! vtable. Whatever else there is is told by name and size alone, which a debugger shows as
 //! a value without fields.
 
+use base_db::Db;
 use hir_def::{
     AdtId, EnumId, GenericDefId, VariantId, expr_store::ExpressionStore,
     hir::generics::GenericParamDataRef, item_tree::FieldsShape as Written,
@@ -58,7 +59,7 @@ pub(crate) type Key = (StoredTy, u32);
 /// made of it, and depends on nothing of theirs.
 #[salsa::tracked(returns(clone))]
 pub(crate) fn told_type(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: StoredParamEnvAndCrate,
     ty: StoredTy,
     pointers: u32,
@@ -110,7 +111,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> ByEnv<K, V> {
 /// from [`told_type`] of each. `None` is a type that has no layout or no name rustc would
 /// spell.
 pub(crate) fn described(
-    db: &dyn HirDatabase,
+    db: &Db,
     env: &StoredParamEnvAndCrate,
     ty: &StoredTy,
     sets: &Sets,
@@ -120,7 +121,7 @@ pub(crate) fn described(
 }
 
 struct InDatabase<'a> {
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     env: &'a StoredParamEnvAndCrate,
     sets: &'a Sets,
 }
@@ -158,7 +159,7 @@ const POINTERS: u32 = 2;
 /// nothing but the type, so it is found once for every function with a variable of it: the
 /// layouts and the names are most of what telling of variables costs.
 struct Types<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     interner: DbInterner<'db>,
     infcx: InferCtxt<'db>,
@@ -170,7 +171,7 @@ struct Types<'db> {
 }
 
 impl<'db> Types<'db> {
-    fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>) -> Self {
+    fn new(db: &'db Db, env: ParamEnvAndCrate<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         Types {

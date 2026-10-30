@@ -23,12 +23,13 @@ mod visit;
 #[cfg(test)]
 mod tests;
 
+use base_db::Db;
 use hir_def::{
     ConstId, DefWithBodyId, EnumId, EnumVariantId,
-    hir::{ExprId, PatId},
+    hir::{ExprId, ExprOrPatId, PatId},
     item_scope::ImportId,
 };
-use hir_ty::{InferenceResult, db::HirDatabase, next_solver::StoredTy};
+use hir_ty::{InferenceResult, next_solver::StoredTy};
 
 /// What match checking finds in a body and the closures and inline constants in it.
 #[derive(Debug, Default, PartialEq, Eq, Hash)]
@@ -51,6 +52,31 @@ pub enum MatchLint {
     UnreachablePattern(UnreachablePattern),
     IrrefutableLet(IrrefutableLet),
     BindingWithVariantName(BindingWithVariantName),
+    OverlappingRangeEndpoints(OverlappingRangeEndpoints),
+    NonContiguousRangeEndpoints(NonContiguousRangeEndpoints),
+}
+
+/// `overlapping_range_endpoints` (`lint_overlapping_range_endpoints`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OverlappingRangeEndpoints {
+    pub pat: PatId,
+    /// The values the ranges share, printed as `print_pat_range` prints them.
+    pub overlap: Box<str>,
+    pub overlaps_with: Box<[PatId]>,
+}
+
+/// `non_contiguous_range_endpoints` (`lint_non_contiguous_range_endpoints`): `pat` is an
+/// exclusive range `lo..hi` that leaves out `hi`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NonContiguousRangeEndpoints {
+    pub pat: PatId,
+    /// `hi`, printed as `print_pat_range` prints it.
+    pub gap: Box<str>,
+    /// `lo..=hi`, as rustc's `PatRange` prints it.
+    pub suggestion: Box<str>,
+    /// The ranges that start at `hi + 1`; empty when `hi` is the type's maximum
+    /// (`ExclusiveRangeMissingMax`).
+    pub gapped_with: Box<[PatId]>,
 }
 
 /// `unreachable_patterns` (`report_unreachable_pattern`).
@@ -139,9 +165,11 @@ pub enum SpecialTy {
 pub struct Uncovered {
     /// Every witness, printed as `print_witness_pat` prints it.
     pub witnesses: Box<[Box<str>]>,
-    /// `maybe_point_at_variant` of the first five witnesses, for the peeled matched ADT.
+    /// `maybe_point_at_variant` of the first five witnesses, for the peeled matched ADT
+    /// (`report_adt_defined_here`: for E0005 only when that ADT is of this crate).
     pub variants: Box<[EnumVariantId]>,
-    /// `collect_special_tys` of the first witness, in its order.
+    /// `collect_special_tys` of the first witness, in its order; E0004 of a match with arms
+    /// only.
     pub special_tys: Box<[(StoredTy, SpecialTy)]>,
 }
 
@@ -156,7 +184,8 @@ pub enum BindingOrigin {
     ClosureParam,
     /// "`for` loop binding"
     ForLoop,
-    /// "assignment": a destructuring assignment.
+    /// A destructuring assignment. rustc lowers it to a `let` and checks that, so its origin
+    /// text is "local binding".
     Assignment,
 }
 
@@ -173,6 +202,12 @@ pub enum MatchError {
         uncovered: Uncovered,
         /// The match would be exhaustive if its guards were taken away.
         would_be_exhaustive_without_guards: bool,
+        /// The scrutinee is a reference to a type uninhabited from here: "references are
+        /// always considered inhabited".
+        ref_to_uninhabited: bool,
+        /// The arms whose pattern is a constant that looks like a binding
+        /// (`is_const_pat_that_looks_like_binding`), in arm order.
+        consts_like_bindings: Box<[(PatId, ConstId)]>,
     },
     /// E0005.
     NonExhaustiveLet {
@@ -190,14 +225,17 @@ pub enum MatchError {
     },
     /// E0030 (`..=`, `lo > hi`) or E0579 (`..`, `lo >= hi`).
     EmptyRange { pat: PatId, inclusive: bool },
-    /// "reached pattern complexity limit".
-    ComplexityLimit { at: ExprId },
+    /// "reached pattern complexity limit", at the scrutinee of a `match` or the pattern of a
+    /// binding.
+    ComplexityLimit { at: ExprOrPatId },
+    /// "mix of deref patterns and normal constructors".
+    MixedDerefPatterns { deref_pat: PatId, normal_pat: PatId },
 }
 
 /// Match checking of `def`, once per body: the closures and inline constants written in it are
 /// checked with it, as they are lowered with it.
 #[salsa::tracked(returns(ref))]
-pub fn match_check(db: &dyn HirDatabase, def: DefWithBodyId) -> MatchCheck {
+pub fn match_check(db: &Db, def: DefWithBodyId) -> MatchCheck {
     let infer = InferenceResult::of(db, def);
     // rustc's `thir_body` is `Err` for a body type checking found an error in.
     if infer.has_errors || infer.has_type_mismatches() || infer.is_erroneous() {

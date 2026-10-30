@@ -4,30 +4,12 @@
 
 use std::{fmt::Write as _, hash::BuildHasher, path::Path};
 
+use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxBuildHasher;
 use span::ErasedFileAstId;
 
 use super::{varint::VarintTree, *};
 use crate::{FlatToken, TtElement, buffer::Cursor, token_to_literal};
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        self.below(n) == 0
-    }
-}
 
 fn anchor(file: u32, ast_id: u32) -> SpanAnchor {
     SpanAnchor {
@@ -42,14 +24,14 @@ const EDITIONS: [Edition; 4] =
 /// Random token trees: spans from a few parts, with now and then a range too long or too far
 /// to pack; symbols from a small pool or new; every kind of leaf and delimiter.
 struct Gen {
-    rng: Rng,
+    rng: SplitMix64,
     parts: Vec<(SpanAnchor, SyntaxContext)>,
     pool: Vec<Symbol>,
 }
 
 impl Gen {
     fn new(seed: u64, parts: usize) -> Gen {
-        let mut rng = Rng(seed | 1);
+        let mut rng = SplitMix64::new(seed);
         let parts = (0..parts)
             .map(|_| {
                 let edition = EDITIONS[rng.below(4) as usize];
@@ -313,7 +295,7 @@ fn walk_tokens(view: TokenTreesView<'_>) -> Vec<(FlatToken, SyntaxContext)> {
 /// A tree of `tokens` built with `open`, `push` and `close` like a converter does: through an
 /// invisible top that is skipped, or not; with tokens pushed and then dropped by `restore`, and
 /// leaves in invisible subtrees taken away again, now and then.
-fn rebuild(tokens: &[TokenTree], skip: bool, rng: &mut Rng) -> TopSubtree {
+fn rebuild(tokens: &[TokenTree], skip: bool, rng: &mut SplitMix64) -> TopSubtree {
     let TokenTree::Subtree(top) = &tokens[0] else { unreachable!("a tree starts with a subtree") };
     let junk = Span {
         range: TextRange::at(TextSize::new(7), TextSize::new(1 << 20)),
@@ -371,7 +353,7 @@ fn rebuild(tokens: &[TokenTree], skip: bool, rng: &mut Rng) -> TopSubtree {
 }
 
 /// Checks the tree of `tokens` against the old encoding and against `tokens`, and returns it.
-fn check(tokens: &[TokenTree], rng: &mut Rng) -> TopSubtree {
+fn check(tokens: &[TokenTree], rng: &mut SplitMix64) -> TopSubtree {
     let tree = TopSubtree::from_serialized(tokens.to_vec());
     let model = VarintTree::from_serialized(tokens.to_vec());
     assert_eq!(model.flat(), tokens, "the old encoding");
@@ -517,7 +499,7 @@ fn spans_too_wide_to_pack_and_more_parts_than_fit() {
         delimiter: Delimiter { open: top_span, close: top_span, kind: DelimiterKind::Brace },
         len: 70_000,
     });
-    let tree = check(&tokens, &mut Rng(5));
+    let tree = check(&tokens, &mut SplitMix64::new(5));
     assert!(tree.parts.len() > NARROW_LIMIT as usize);
     assert!(!tree.wide.is_empty());
 }
@@ -537,7 +519,7 @@ fn a_literal_keeps_a_suffix_of_any_length_a_node_holds() {
         assert_eq!(Literal::new("ab", span, LitKind::Str, &suffix).suffix(), suffix);
         tokens.push(TokenTree::Leaf(Leaf::Literal(literal)));
     }
-    check(&tokens, &mut Rng(9));
+    check(&tokens, &mut SplitMix64::new(9));
 }
 
 #[test]
@@ -704,7 +686,7 @@ fn corpus() -> Vec<(std::path::PathBuf, String)> {
 
 #[test]
 fn lexed_files_match_the_old_encoding() {
-    let mut rng = Rng(99);
+    let mut rng = SplitMix64::new(99);
     for (file, (path, text)) in corpus().iter().enumerate() {
         let tree = lex(file as u32, text);
         let tokens = flat(&tree);

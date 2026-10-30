@@ -238,7 +238,7 @@ impl Store {
     pub(crate) fn new() -> Store {
         Store {
             ids: Ids::new(),
-            hot: Rows::new(),
+            hot: Rows::hot(),
             cold: Rows::new(),
             value_ids: Ids::new(),
             values: Rows::new(),
@@ -289,6 +289,7 @@ impl Store {
     /// Every code's schema and producer, indexed by code: for a pass over many memos, which
     /// would otherwise take the codes' lock once a memo.
     pub(crate) fn codes(&self) -> Vec<(SchemaHash, ContentId)> {
+        // clone: once per image write, a list of every schema and producer.
         self.codes.lock().all.clone()
     }
 
@@ -624,6 +625,7 @@ impl Store {
         let ready: Vec<MemoId> = {
             let mut dying = self.dying.lock();
             let done = passed(&dying.checked);
+            // alloc: once a sweep that frees memos, so they are freed outside the lock.
             dying.checked.drain(..done).map(|(_, memo)| memo).collect()
         };
         if !ready.is_empty() {
@@ -676,6 +678,7 @@ impl Store {
     /// with `&mut`, no task reads the store.
     pub(crate) fn reclaim(&mut self, held: impl Fn(MemoId) -> bool) {
         let dying = std::mem::take(self.dying.get_mut());
+        // alloc: once a `&mut` reclaim (settle, or a driver's full free).
         let pinned: Vec<MemoId> = self.pins.get_mut().keys().copied().collect();
         let mut keep = Dying::default();
         let all = dying

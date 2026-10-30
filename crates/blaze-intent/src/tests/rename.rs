@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use base_db::{FileId, FileText, SourceDatabase};
+use base_db::{FileId, FileText};
 use blaze_api::{Edit, EditedItem, How, Target};
 use blaze_items::{ItemKey, key::Resolved};
 use syntax::Edition;

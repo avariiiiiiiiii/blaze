@@ -21,6 +21,7 @@
 
 use std::fmt;
 
+use base_db::Db;
 use hir_def::{FunctionId, signatures::FunctionSignature};
 use intern::{KnownNames, Symbol, sym, sym::Declared};
 use rustc_type_ir::inherent::{IntoKind, SliceLike};
@@ -165,7 +166,7 @@ impl AtomicOrdering {
 /// and a compare-exchange's failure ordering. `None` where a const argument is not a known
 /// `AtomicOrdering` (a generic body's parameter).
 pub fn atomic_orderings<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     op: AtomicOp,
     orders: AtomicOrders,
     generic_args: GenericArgs<'db>,
@@ -185,7 +186,7 @@ pub fn atomic_orderings<'db>(
 /// The `AtomicOrdering` a const generic argument is: a value's variant index (core declares the
 /// variants in discriminant order), or what an unevaluated constant evaluates to.
 pub fn atomic_ordering_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ordering: Const<'db>,
 ) -> Option<AtomicOrdering> {
     let discriminant = match ordering.kind() {
@@ -255,7 +256,7 @@ impl fmt::Display for UnknownIntrinsic {
 /// The intrinsic `func` is: `None` for a function that is not `#[rustc_intrinsic]`, an error
 /// for one whose name is none of rustc's.
 pub fn intrinsic_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
 ) -> Result<Option<Intrinsic>, UnknownIntrinsic> {
     if !FunctionSignature::is_intrinsic(db, func) {

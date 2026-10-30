@@ -11,7 +11,7 @@ use crate::{
         MethodViolationCode::{self, *},
         dyn_compatibility_with_callback,
     },
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 use DynCompatibilityViolationKind::*;

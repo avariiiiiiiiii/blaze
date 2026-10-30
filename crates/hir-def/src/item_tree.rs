@@ -57,10 +57,9 @@ use std::{
     fmt,
     mem::size_of,
     ops::{Index, Range},
-    sync::OnceLock,
 };
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::CfgExpr;
 use hir_expand::{
     ExpandTo, HirFileId,
@@ -206,35 +205,28 @@ impl AttrOwner {
 }
 
 /// Computes an [`ItemTree`] for the given file or macro expansion.
-pub fn file_item_tree(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate) -> &ItemTree {
-    match file_item_tree_query(db, file_id, krate) {
-        Some(item_tree) => item_tree,
-        None => {
-            static EMPTY: OnceLock<ItemTree> = OnceLock::new();
-            EMPTY.get_or_init(ItemTree::default)
-        }
-    }
+pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
+    file_item_tree_query(db, file_id, krate)
 }
 
 /// A source file's tree is assembled from its items' ([`items`]), so an edit lowers only the
 /// items it touches; a macro file's is lowered whole, as each expansion is made anew.
 #[salsa::tracked(returns(ref))]
 fn file_item_tree_query(
-    db: &dyn SourceDatabase,
+    db: &Db,
     file_id: HirFileId,
     krate: Crate,
-) -> Option<Box<ItemTree>> {
+) -> ItemTree {
     let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
-    let item_tree = match file_id {
+    match file_id {
         HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
         HirFileId::MacroFile(_) => lower_whole(db, file_id, krate),
-    };
-    if item_tree.is_empty() { None } else { Some(Box::new(item_tree)) }
+    }
 }
 
 /// The tree of `file_id` lowered in one pass. A source file's assembled from its items is this
 /// tree, to the byte.
-pub(crate) fn lower_whole(db: &dyn SourceDatabase, file_id: HirFileId, krate: Crate) -> ItemTree {
+pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree {
     let mut ctx = lower::Ctx::new(db, file_id, krate);
     let syntax = file_id.parse_or_expand(db);
     match_ast! {
@@ -268,7 +260,7 @@ pub(crate) fn lower_whole(db: &dyn SourceDatabase, file_id: HirFileId, krate: Cr
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn block_item_tree_query(
-    db: &dyn SourceDatabase,
+    db: &Db,
     block: BlockId,
     krate: Crate,
 ) -> ItemTree {
@@ -413,6 +405,7 @@ impl ItemTree {
         match alias {
             AliasId::NONE => None,
             AliasId::UNDERSCORE => Some(ImportAlias::Underscore),
+            // clone: allocates nothing, a `Name` is an interned symbol
             AliasId { raw } => Some(ImportAlias::Alias(self[NameId { raw }].clone())),
         }
     }
@@ -435,10 +428,11 @@ impl ItemTree {
         }
     }
 
-    pub fn pretty_print(&self, db: &dyn SourceDatabase, edition: Edition) -> String {
+    pub fn pretty_print(&self, db: &Db, edition: Edition) -> String {
         pretty::print_item_tree(db, self, edition)
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         // We don't need to check the rest since if those are empty, everything is empty.
         // `attr_owners` might hold the top-level attrs so we need to check it separately.
@@ -493,7 +487,7 @@ impl TreeId {
 
     pub(crate) fn item_tree<'db>(
         &self,
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         krate: Crate,
     ) -> &'db ItemTree {
         match self.block {
@@ -970,6 +964,7 @@ impl UseTree {
             path: &ModPath,
         ) -> Option<(ModPath, ImportKind)> {
             match (prefix, path.kind) {
+                // clone: allocates nothing, a `ModPath` is an interned slice
                 (None, _) => Some((path.clone(), ImportKind::Plain)),
                 (Some(mut prefix), PathKind::Plain) => {
                     prefix.extend(path.segments().iter().cloned());
@@ -1031,6 +1026,7 @@ impl UseTree {
                 };
                 for &child in list {
                     *counting_index += 1;
+                    // clone: allocates nothing, a `ModPath` is an interned slice
                     tree.use_tree(child).expand_impl(tree, prefix.clone(), counting_index, cb);
                 }
             }

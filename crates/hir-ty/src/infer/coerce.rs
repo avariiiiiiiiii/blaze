@@ -37,6 +37,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir_def::{
     CallableDefId, TraitId, attrs::AttrFlags, hir::ExprId, signatures::FunctionSignature,
     upvars::upvars_mentioned,
@@ -139,7 +140,7 @@ where
     }
 
     #[inline]
-    fn db(&self) -> &'db dyn HirDatabase {
+    fn db(&self) -> &'db Db {
         self.interner().db
     }
 
@@ -924,6 +925,29 @@ impl<'db> InferenceContext<'db> {
         Ok(target)
     }
 
+    /// rustc's `may_coerce`: whether `expr_ty` coerces to `target_ty` with the coercion's
+    /// obligations holding, inference left as it was. A heuristic of error reporting.
+    pub(crate) fn may_coerce(&mut self, expr_ty: Ty<'db>, target_ty: Ty<'db>) -> bool {
+        let mut coerce = Coerce {
+            delegate: InferenceCoercionDelegate(self),
+            cause: ObligationCause::dummy(),
+            allow_two_phase: AllowTwoPhase::No,
+            coerce_never: true,
+            use_lub: false,
+        };
+        let snapshot = coerce.infcx().start_snapshot();
+        let may = match coerce.coerce(expr_ty, target_ty) {
+            Ok(ok) => {
+                let mut ocx = ObligationCtxt::new(coerce.infcx());
+                ocx.register_obligations(ok.obligations);
+                ocx.try_evaluate_obligations().is_empty()
+            }
+            Err(_) => false,
+        };
+        coerce.infcx().rollback_to(snapshot);
+        may
+    }
+
     /// Given some expressions, their known unified type and another expression,
     /// tries to unify the types, potentially inserting coercions on any of the
     /// provided expressions and returns their LUB (aka "common supertype").
@@ -1442,7 +1466,7 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
 }
 
 pub fn could_coerce<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     tys: &Canonical<'db, (Ty<'db>, Ty<'db>)>,
 ) -> bool {
@@ -1474,7 +1498,7 @@ impl<'db> CoerceDelegate<'db> for HirCoercionDelegate<'_, 'db> {
 }
 
 fn coerce<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     tys: &Canonical<'db, (Ty<'db>, Ty<'db>)>,
 ) -> Result<(Vec<Adjustment>, Ty<'db>), TypeError<DbInterner<'db>>> {
@@ -1609,13 +1633,13 @@ fn coerce<'db>(
     // FIXME: We don't fallback correctly since this is done on `InferenceContext` and we only have `InferCtxt`.
     let mut resolver =
         Resolver { interner, debruijn: DebruijnIndex::ZERO, var_values: vars.var_values };
-    let ty = infcx.resolve_vars_if_possible(ty).fold_with(&mut resolver);
+    let ty = infcx.deeply_resolve_ignoring_regions(ty).fold_with(&mut resolver);
     let adjustments = adjustments
         .into_iter()
         .map(|adjustment| Adjustment {
             kind: adjustment.kind,
             target: infcx
-                .resolve_vars_if_possible(adjustment.target.as_ref())
+                .deeply_resolve_ignoring_regions(adjustment.target.as_ref())
                 .fold_with(&mut resolver)
                 .store(),
         })
@@ -1623,7 +1647,7 @@ fn coerce<'db>(
     Ok((adjustments, ty))
 }
 
-fn is_capturing_closure(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> bool {
+fn is_capturing_closure(db: &Db, closure: InternedClosureId<'_>) -> bool {
     let InternedClosure { owner, expr, .. } = closure.loc(db);
     upvars_mentioned(db, owner.expression_store_owner(db))
         .is_some_and(|upvars| upvars.get(&expr).is_some_and(|upvars| !upvars.is_empty()))

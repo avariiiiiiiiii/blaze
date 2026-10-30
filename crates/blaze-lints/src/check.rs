@@ -145,7 +145,7 @@ struct Expectation {
 }
 
 pub(crate) struct State<'a, 'db> {
-    pub(crate) sema: &'a Semantics<'db, RootDatabase>,
+    pub(crate) sema: &'a Semantics<'db>,
     pub(crate) db: &'db RootDatabase,
     pub(crate) krate: hir::Crate,
     pub(crate) conf: &'a Conf,
@@ -182,7 +182,7 @@ pub(crate) struct Cx<'s, 'a, 'db> {
 }
 
 impl<'a, 'db> Cx<'_, 'a, 'db> {
-    pub(crate) fn sema(&self) -> &'a Semantics<'db, RootDatabase> {
+    pub(crate) fn sema(&self) -> &'a Semantics<'db> {
         self.state.sema
     }
 

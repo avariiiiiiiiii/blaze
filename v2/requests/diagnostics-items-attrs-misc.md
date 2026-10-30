@@ -23,3 +23,4 @@ For `diagnostics-items-attrs` (the parent, owner of `checks/attrs/args.rs`, `par
 > `suffix_of`, with its test), used by `args.rs` and `misc.rs`. 2. `table::builtins()` exists now.
 > 3. kept as is: `args::parse` stays silent for a macro call value, `misc::validate` says it.
 > 4. open, for the parent: the driver cannot stop after rustc's fatal early errors.
+> 4. applied by diagnostics: the errors of the crate root's `#![crate_type]` and `#![recursion_limit]` (their parsers through `early_fatal`, `Accept::fatal`, and the "attribute value must be a literal" of each), and a module's first `#[path]` that is not a string, are marked `Diag::stop()`. `checks::attrs::push` places them at `Phase::CrateAttrs` (crate root) or `Phase::Expand`. Test: `tests/check.rs` `an_early_fatal_error_stops_every_later_pass`.

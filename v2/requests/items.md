@@ -194,6 +194,11 @@ a `u32` encoding of `rustc_type_ir::fast_reject::SimplifiedType` from db, or `Or
 
 > forwarded to db: the type tables and `vendor/rustc_type_ir` are lane db's.
 
+> applied by solver-sync (20:15): `SimplifiedType` derives `PartialOrd + Ord`
+> (`vendor/rustc_type_ir/patches/0005-simplified-type-ord.patch`), and `SolverDefId` already did,
+> so `SimplifiedType<SolverDefId>` sorts. Its order follows `SolverDefId`'s, so use it only as a
+> table key, never for anything output.
+
 ## speed-types: read vtables with `VTableMap::tys` (`form.rs` 2092-2099, `facts.rs` 497-510)
 
 `crates/hir-ty/src/mir.rs` now has `VTableMap::tys()` (the types in id order, an
@@ -727,3 +732,1368 @@ Why: `v2/requests/fastcompile.md`, fastcompile-ident-hashcons 5.
 > applied (`requests'` part 4): `crates/hir-ide/src/tests/layout.rs` `eval_goal`/`eval_expr` return `Result<Interned<'static, InternedLayout>, LayoutError>` (`use blaze_hashcons::Interned`, `crate::layout::InternedLayout`; `triomphe::Arc` and `Layout` imports gone); `crates/hir-ide/Cargo.toml` dev-dependency `blaze-hashcons.workspace = true`. Parts 1-3 are db's, codegen's and safety's (items wrote them to each).
 > applied (requests' part, item 4): `crates/hir-ide/src/tests/layout.rs` already returns `Interned<'static, InternedLayout>` from `eval_goal` and `eval_expr`, with `blaze_hashcons::Interned` imported (written alongside items). > forwarded to db (1), codegen (2), safety (3).
 > applied by db-ty-next1 (part 1): `hir-ty/Cargo.toml` and `hir/Cargo.toml` gain `blaze-hashcons.workspace = true` (hir names `Interned` too; `hir-ty`'s `layout.rs` already used it); `hir-ty/src/db.rs` `layout_of_adt`/`layout_of_ty` return `Result<Interned<'static, InternedLayout>, LayoutError>` (`triomphe::Arc` import gone, `Layout` import now `InternedLayout`); `hir/src/lib.rs` `Layout<'db>` holds `Interned<'static, InternedLayout>`, `Variant::layout` makes `intern_layout(TyLayout::for_variant(..))`, `triomphe::Arc` import gone (no other use).
+
+## frontend-nameres-impls: per-module impl collection (2026-10-29)
+
+> held by requests (items is DONE, so its paths and hir-ide are requests'): parts 1 to 4 go in together once `mod facts;` and db's `pub use self::facts::impls::{ModuleImpls, module_impls};` are in `hir-def/src/nameres.rs` and db-ty's nine kinds are in `hir-ty/src/db.rs`; neither is in the tree yet (checked pass 12).
+
+> concrete database: frontend-db ran `tools/v2/concrete_db.py` on `method_resolution.rs` and
+> `method_resolution/`; the old text below is refreshed to it and checked verbatim against
+> every file (2026-10-29 20:13), and the tests use `Db::log_executed`. Both files already
+> import `base_db::Db`, so the request adds no import for it.
+
+What: hir-ty's impl tables and blaze-items' indexes built per module from
+`hir_def::nameres::module_impls` (frontend.md items 2 and 3), so a bucket reruns only when a
+module's impls in it change, and `in_crate_and_deps_for_trait_and_self_ty` reads each crate's
+own `(crate, trait)` bucket instead of every crate's whole table through `for_crate_and_deps`.
+Lane items is DONE (no window), so this is for `requests` to apply (paths of a DONE lane).
+Parts 1 and 2 land together with:
+- db's `## frontend-nameres-impls: re-export module_impls` in `v2/requests/db.md` (and core's
+  `mod facts;`): the `hir_def::nameres::module_impls` path;
+- db-ty's `## frontend-nameres-impls: kinds for the per-module impl tables` in
+  `v2/requests/db-ty.md`: `db.rs`'s `every_query_has_a_kind` fails on the nine new tracked
+  methods without it.
+Line numbers are from 2026-10-29 20:30; every old text below was read there.
+
+Why now: today `TraitImpls::for_crate` and `InherentImpls::for_crate` walk
+`crate_def_map(krate).modules(db)` and every module's whole scope, so any item added anywhere
+reruns them, and every narrow memo above (`in_crate_for_self_ty`,
+`in_crate_for_trait_and_self_ty`, `in_crate_and_deps_for_trait_and_self_ty` through
+`for_crate_and_deps`, `blanket_in_crate_and_deps`, blaze-items' `trait_impls_in`,
+`inherent_impls_in`) reruns for every impl added anywhere in the crate or a dependency.
+
+The layers after this change, each a memo that backdates when equal:
+
+| memo | key | reruns when |
+|---|---|---|
+| `module_impls` (hir-def) | module | the module's scope changes; equal unless an impl comes or goes |
+| `TraitImpls::for_module`, `InherentImpls::for_module` | module | its `module_impls` or the impls in its bodies' blocks change |
+| `TraitImpls::modules_by_trait`, `InherentImpls::modules_by_self_ty` | crate | a module's table changes; equal unless a module gains its first or loses its last impl of a trait / for a type |
+| `TraitImpls::modules_of_trait`, `InherentImpls::modules_of_self_ty` | crate, trait / type | only that trait's / type's module list changes |
+| `TraitImpls::in_module_for_trait`, `InherentImpls::in_module_for_self_ty` | module, trait / type | that module's impls of the trait / for the type |
+| `TraitImpls::for_crate_and_trait` | crate, trait | the trait's modules or one of their impls of it |
+| narrow memos (`in_crate_*`, `blanket_in_crate_and_deps`) | as today | the bucket they read |
+| `for_crate` (both) | crate | some module's table changes (no longer any item) |
+
+A frozen crate (`frozen::served`) keeps its one frozen table: its buckets read `for_crate`,
+which never changes. `for_crate` merges the module tables in module order, so every run holds
+its impls in the order the old walk found them (same order of modules, same order inside each
+module, blocks of bodies inside their module), and `frozen::encode`/`check` see the same table.
+
+### 1. `crates/hir-ty/src/method_resolution.rs`
+
+1a. Import (L35). Old:
+
+```rust
+    nameres::{DefMap, block_def_map, crate_def_map},
+```
+
+New:
+
+```rust
+    nameres::{DefMap, block_def_map, crate_def_map, module_impls},
+```
+
+1b. `InherentImpls::for_crate` and `in_crate_for_self_ty` (L1339-1353). Old:
+
+```rust
+        let crate_def_map = crate_def_map(db, krate);
+
+        Self::collect_def_map(db, crate_def_map)
+    }
+
+    /// The inherent impls of `krate` for one type. An impl added for another type changes
+    /// `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_crate(db, krate).for_self_ty(&self_ty.0).into()
+    }
+```
+
+New:
+
+```rust
+        let mut groups = SelfTyGroups::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            Self::for_module(db, module).merge_into(&mut groups);
+        }
+        Self::from_groups(groups)
+    }
+
+    /// The inherent impls one module of a crate or block def map gives its table: its own
+    /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
+    /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
+    /// unless one of those impls is added, removed or changes its self type.
+    #[salsa::tracked(returns(ref))]
+    pub fn for_module(db: &'db Db, module: ModuleId) -> InherentImpls<'db> {
+        let mut groups = SelfTyGroups::default();
+        Self::collect_module(db, module, &mut groups);
+        Self::from_groups(groups)
+    }
+
+    /// The modules of `krate` with an inherent impl for each simplified self type, in module
+    /// order. Equal unless a module gains its first impl for a type or loses its last.
+    #[salsa::tracked(returns(ref))]
+    fn modules_by_self_ty(db: &'db Db, krate: Crate) -> SelfTyModules<'db> {
+        let mut groups: SelfTyGroups<'db, Vec<ModuleId>> = SelfTyGroups::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            for (self_ty, _) in Self::for_module(db, module).iter() {
+                groups.entry(*self_ty).push(module);
+            }
+        }
+        SelfTyModules::new(groups)
+    }
+
+    /// The modules of `krate` with an inherent impl for one type: equal unless that list
+    /// changes, whatever other types gain.
+    #[salsa::tracked(returns(deref))]
+    fn modules_of_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ModuleId]> {
+        Self::modules_by_self_ty(db, krate).of(&self_ty.0).into()
+    }
+
+    /// The inherent impls of `module` for one type: equal unless one for that type is added
+    /// there or removed.
+    #[salsa::tracked(returns(deref))]
+    fn in_module_for_self_ty(
+        db: &'db Db,
+        module: ModuleId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_module(db, module).for_self_ty(&self_ty.0).into()
+    }
+
+    /// The inherent impls of `krate` for one type, in the order [`Self::for_crate`] holds
+    /// them. Reads only the modules with impls for the type, so an impl added for another type,
+    /// or anything else added anywhere, leaves this as it was. A frozen crate's are read from
+    /// its frozen table.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        if frozen::served(db, krate) {
+            return Self::for_crate(db, krate).for_self_ty(&self_ty.0).into();
+        }
+        let mut found = Vec::new();
+        for &module in Self::modules_of_self_ty(db, krate, self_ty) {
+            found.extend_from_slice(Self::in_module_for_self_ty(db, module, self_ty));
+        }
+        found.into()
+    }
+```
+
+1c. `InherentImpls::collect_def_map` (L1381-1411). Old:
+
+```rust
+impl<'db> InherentImpls<'db> {
+    fn collect_def_map(db: &'db Db, def_map: &'db DefMap) -> Self {
+        let mut map = SelfTyGroups::default();
+        collect(db, def_map, &mut map);
+        return Self::from_groups(map);
+
+        fn collect<'db>(
+            db: &'db Db,
+            def_map: &DefMap,
+            map: &mut SelfTyGroups<'db, Vec<ImplId>>,
+        ) {
+            for (_module_id, module_data) in def_map.modules(db) {
+                for impl_id in module_data.scope(db).inherent_impls() {
+                    let interner = DbInterner::new_no_crate(db);
+                    let self_ty = db.impl_self_ty(impl_id);
+                    let self_ty = self_ty.instantiate_identity().skip_norm_wip();
+                    if let Some(self_ty) =
+                        simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
+                    {
+                        map.entry(self_ty).push(impl_id);
+                    }
+                }
+
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                        collect(db, block_def_map, map);
+                    }
+                }
+            }
+        }
+    }
+```
+
+New:
+
+```rust
+impl<'db> InherentImpls<'db> {
+    fn collect_def_map(db: &'db Db, def_map: &'db DefMap) -> Self {
+        let mut map = SelfTyGroups::default();
+        for (module, _) in def_map.modules(db) {
+            Self::collect_module(db, module, &mut map);
+        }
+        Self::from_groups(map)
+    }
+
+    /// Adds the inherent impls of `module` and of the blocks in the bodies it holds to `map`.
+    fn collect_module(
+        db: &'db Db,
+        module: ModuleId,
+        map: &mut SelfTyGroups<'db, Vec<ImplId>>,
+    ) {
+        let interner = DbInterner::new_no_crate(db);
+        for &impl_id in module_impls(db, module).inherent_impls.iter() {
+            let self_ty = db.impl_self_ty(impl_id);
+            let self_ty = self_ty.instantiate_identity().skip_norm_wip();
+            if let Some(self_ty) =
+                simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
+            {
+                map.entry(self_ty).push(impl_id);
+            }
+        }
+
+        let scope = module.def_map(db).module(db, module).scope(db);
+        for owner in impl_holders(db, module.krate(db), scope) {
+            for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                for (block_module, _) in block_def_map.modules(db) {
+                    Self::collect_module(db, block_module, map);
+                }
+            }
+        }
+    }
+
+    /// Adds every impl of this table to `groups`, each type's after those already there.
+    fn merge_into(&self, groups: &mut SelfTyGroups<'db, Vec<ImplId>>) {
+        for (self_ty, impls) in self.iter() {
+            groups.entry(*self_ty).extend_from_slice(impls);
+        }
+    }
+```
+
+(`from_groups`, `for_self_ty`, `iter`, `for_each_crate_and_block` after it stay.)
+
+1d. Two index types, before `OneTraitImplsBuilder` (L1444). Old:
+
+```rust
+#[derive(Default)]
+struct OneTraitImplsBuilder<'db> {
+```
+
+New:
+
+```rust
+/// Modules by simplified self type, as columns: the self types sorted by hash, each with its
+/// run of modules in module order.
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+struct SelfTyModules<'db> {
+    // SAFETY: as for `InherentImpls::self_tys`: salsa may keep this column past `'db` only if
+    // nothing in it borrows from the database. `SelfTys<'db>` holds `u64`s and
+    // `SimplifiedType<'db>`s, which are `fast_reject::SimplifiedType<SolverDefId<'db>>`
+    // (`next_solver/ty.rs`), whose variants (`vendor/rustc_type_ir/src/fast_reject.rs`) hold
+    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.
+    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
+    self_tys: SelfTys<'db>,
+    modules: Runs<ModuleId>,
+}
+
+impl<'db> SelfTyModules<'db> {
+    fn new(groups: SelfTyGroups<'db, Vec<ModuleId>>) -> Self {
+        let groups = groups.into_sorted();
+        let modules = Runs::new(groups.iter().map(|(_, modules)| &**modules));
+        let self_tys = SelfTys::new(groups.into_iter().map(|(self_ty, _)| self_ty).collect());
+        SelfTyModules { self_tys, modules }
+    }
+
+    fn of(&self, self_ty: &SimplifiedType<'db>) -> &[ModuleId] {
+        match self.self_tys.find(0..self.self_tys.len(), self_ty) {
+            Some(i) => self.modules.run(i),
+            None => &[],
+        }
+    }
+}
+
+/// Modules by trait, as columns: the traits sorted as [`TraitImpls`] sorts them, each with its
+/// run of modules in module order.
+#[derive(Debug, PartialEq, Eq)]
+struct TraitModules {
+    traits: Box<[TraitId]>,
+    modules: Runs<ModuleId>,
+}
+
+impl TraitModules {
+    fn new(by_trait: FxHashMap<TraitId, Vec<ModuleId>>) -> Self {
+        let mut rows = by_trait.into_iter().collect::<Vec<_>>();
+        radix::sort_by_key(&mut rows, |&(trait_, _)| {
+            let id = trait_.as_id();
+            radix::pack_32(id.index(), id.generation())
+        });
+        let modules = Runs::new(rows.iter().map(|(_, modules)| &**modules));
+        let traits = rows.into_iter().map(|(trait_, _)| trait_).collect();
+        TraitModules { traits, modules }
+    }
+
+    fn of(&self, trait_: TraitId) -> &[ModuleId] {
+        match self.traits.binary_search(&trait_) {
+            Ok(t) => self.modules.run(t),
+            Err(_) => &[],
+        }
+    }
+}
+
+#[derive(Default)]
+struct OneTraitImplsBuilder<'db> {
+```
+
+1e. `TraitImpls::for_crate`'s body (L1538-1541). Old:
+
+```rust
+        let crate_def_map = crate_def_map(db, krate);
+        let result = Self::collect_def_map(db, crate_def_map);
+        Arc::new(result)
+    }
+```
+
+New:
+
+```rust
+        let mut map = FxHashMap::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            Self::for_module(db, module).merge_into(&mut map);
+        }
+        Arc::new(Self::from_traits(map))
+    }
+
+    /// The trait impls one module of a crate or block def map gives its tables: its own
+    /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
+    /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
+    /// unless one of those impls is added, removed or changes its trait or self type.
+    #[salsa::tracked(returns(ref))]
+    pub fn for_module(db: &'db Db, module: ModuleId) -> TraitImpls<'db> {
+        let lang_items = hir_def::lang_item::lang_items(db, module.krate(db));
+        let mut map = FxHashMap::default();
+        Self::collect_module(db, module, lang_items, &mut map);
+        Self::from_traits(map)
+    }
+
+    /// The modules of `krate` with an impl of each trait, in module order. Equal unless a
+    /// module gains its first impl of a trait or loses its last.
+    #[salsa::tracked(returns(ref))]
+    fn modules_by_trait(db: &'db Db, krate: Crate) -> TraitModules {
+        let mut by_trait: FxHashMap<TraitId, Vec<ModuleId>> = FxHashMap::default();
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            for &trait_ in Self::for_module(db, module).traits.iter() {
+                by_trait.entry(trait_).or_default().push(module);
+            }
+        }
+        TraitModules::new(by_trait)
+    }
+
+    /// The modules of `krate` with an impl of `trait_`: equal unless that list changes,
+    /// whatever other traits gain.
+    #[salsa::tracked(returns(deref))]
+    fn modules_of_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> Box<[ModuleId]> {
+        Self::modules_by_trait(db, krate).of(trait_).into()
+    }
+
+    /// The impls of `trait_` in `module`, as a table of that trait alone: equal unless one of
+    /// them is added, removed or changes its self type.
+    #[salsa::tracked(returns(ref))]
+    fn in_module_for_trait(
+        db: &'db Db,
+        module: ModuleId,
+        trait_: TraitId,
+    ) -> TraitImpls<'db> {
+        let mut map = FxHashMap::default();
+        Self::for_module(db, module).merge_trait_into(trait_, &mut map);
+        Self::from_traits(map)
+    }
+
+    /// The impls of `trait_` in `krate`, as a table of that trait alone, in the order
+    /// [`Self::for_crate`] holds them: the bucket every narrow memo of one crate reads. Reads
+    /// only the modules with impls of `trait_`, so an impl of another trait, or anything else
+    /// added anywhere, leaves this as it was. A frozen crate's is read from its frozen table.
+    #[salsa::tracked(returns(ref))]
+    pub fn for_crate_and_trait(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> TraitImpls<'db> {
+        let mut map = FxHashMap::default();
+        if frozen::served(db, krate) {
+            Self::for_crate(db, krate).merge_trait_into(trait_, &mut map);
+        } else {
+            for &module in Self::modules_of_trait(db, krate, trait_) {
+                Self::in_module_for_trait(db, module, trait_).merge_trait_into(trait_, &mut map);
+            }
+        }
+        Self::from_traits(map)
+    }
+```
+
+1f. `in_crate_and_deps_for_trait_and_self_ty` (L1560-1576): one memo per (crate, trait, self
+type) reading each loaded crate's own bucket. Old:
+
+```rust
+    /// The impls of one trait for one type in `krate` and its dependencies. An impl added for
+    /// another trait or type changes `for_crate()`, and leaves this as it was.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_and_deps_for_trait_and_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        let mut found = Vec::new();
+        for impls in Self::for_crate_and_deps(db, krate) {
+            let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
+```
+
+New:
+
+```rust
+    /// The impls of one trait for one type in `krate` and its dependencies, in the order of
+    /// [`loaded_crates`]. Reads each crate's [`Self::for_crate_and_trait`], so an impl of
+    /// another trait anywhere leaves this unvalidated-equal, and one of `trait_` for another
+    /// type reruns it equal.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_and_deps_for_trait_and_self_ty(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[AnyImplId]> {
+        let mut found = Vec::new();
+        for &dep in loaded_crates(db, krate) {
+            let impls = Self::for_crate_and_trait(db, dep, trait_);
+            let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
+```
+
+(the three lines after it stay.)
+
+1g. `blanket_in_crate_and_deps` (L1585-1589). Old:
+
+```rust
+        Self::for_crate_and_deps(db, krate)
+            .iter()
+            .flat_map(|impls| impls.blanket_impls(trait_))
+            .copied()
+            .collect()
+```
+
+New:
+
+```rust
+        loaded_crates(db, krate)
+            .iter()
+            .flat_map(|&dep| Self::for_crate_and_trait(db, dep, trait_).blanket_impls(trait_))
+            .copied()
+            .collect()
+```
+
+1h. `in_crate_for_trait_and_self_ty` (L1600). Old:
+
+```rust
+        Self::for_crate(db, krate).for_trait_and_self_ty(trait_, &self_ty.0).0.into()
+```
+
+New:
+
+```rust
+        Self::for_crate_and_trait(db, krate, trait_).for_trait_and_self_ty(trait_, &self_ty.0).0.into()
+```
+
+1i. `in_crate_for_trait` (L1626) and the doc of `in_crate_and_deps_for_trait` (L1634-1636).
+Old:
+
+```rust
+        Self::for_crate(db, krate).for_trait(trait_, |impls| {
+```
+
+New:
+
+```rust
+        Self::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| {
+```
+
+Old:
+
+```rust
+    /// The impls of one trait in `krate` and its dependencies, each crate's as
+    /// [`Self::in_crate_for_trait`]. An impl of another trait changes `for_crate()` and
+    /// `in_crate_for_trait()` reruns equal, so this does not rerun.
+```
+
+New:
+
+```rust
+    /// The impls of one trait in `krate` and its dependencies, each crate's as
+    /// [`Self::in_crate_for_trait`]. An impl of another trait leaves every crate's
+    /// [`Self::for_crate_and_trait`] for this one as it was, so this does not rerun.
+```
+
+1j. `TraitImpls::collect_def_map` (L1651-1711). Old: from
+
+```rust
+impl<'db> TraitImpls<'db> {
+    fn collect_def_map(db: &'db Db, def_map: &DefMap) -> Self {
+        let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
+        let mut map = FxHashMap::default();
+        collect(db, def_map, lang_items, &mut map);
+        return Self::from_traits(map);
+```
+
+through the end of the nested `fn collect` and of `collect_def_map`:
+
+```rust
+                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
+                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                        collect(db, block_def_map, lang_items, map);
+                    }
+                }
+            }
+        }
+    }
+```
+
+New (the impl bodies are the old ones, unchanged):
+
+```rust
+impl<'db> TraitImpls<'db> {
+    fn collect_def_map(db: &'db Db, def_map: &DefMap) -> Self {
+        let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
+        let mut map = FxHashMap::default();
+        for (module, _) in def_map.modules(db) {
+            Self::collect_module(db, module, lang_items, &mut map);
+        }
+        Self::from_traits(map)
+    }
+
+    /// Adds the trait impls of `module` and of the blocks in the bodies it holds to `map`.
+    fn collect_module(
+        db: &'db Db,
+        module: ModuleId,
+        lang_items: &LangItems,
+        map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
+    ) {
+        let impls = module_impls(db, module);
+        for &impl_id in impls.trait_impls.iter() {
+            let trait_ref = match db.impl_trait(impl_id) {
+                Some(tr) => tr.instantiate_identity().skip_norm_wip(),
+                None => continue,
+            };
+            // Reservation impls should be ignored during trait resolution, so we never need
+            // them during type analysis. See rust-lang/rust#64631 for details.
+            //
+            // FIXME: Reservation impls should be considered during coherence checks. If we are
+            // (ever) to implement coherence checks, this filtering should be done by the trait
+            // solver.
+            if AttrFlags::query(db, impl_id.into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL) {
+                continue;
+            }
+
+            let self_ty = trait_ref.self_ty();
+            if self_ty_has_error_constructor(self_ty) {
+                // If we see `impl Foo for NoSuchType`, just ignore it.
+                continue;
+            }
+
+            let interner = DbInterner::new_no_crate(db);
+            let entry = map.entry(trait_ref.def_id.0).or_default();
+            match simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer) {
+                Some(self_ty) => entry.non_blanket_impls.entry(self_ty).0.push(impl_id),
+                None => entry.blanket_impls.push(impl_id),
+            }
+        }
+
+        for &impl_id in impls.builtin_derive_impls.iter() {
+            let loc = impl_id.loc(db);
+            let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
+            let entry = map.entry(trait_id).or_default();
+            let entry = entry.non_blanket_impls.entry(SimplifiedType::Adt(loc.adt.into()));
+            entry.1.push(impl_id);
+        }
+
+        let scope = module.def_map(db).module(db, module).scope(db);
+        for owner in impl_holders(db, module.krate(db), scope) {
+            for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                for (block_module, _) in block_def_map.modules(db) {
+                    Self::collect_module(db, block_module, lang_items, map);
+                }
+            }
+        }
+    }
+
+    /// Adds every impl of this table to `map`, each run after the runs already there.
+    fn merge_into(&self, map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>) {
+        for (trait_, t) in self.trait_indices() {
+            self.merge_at(t, map.entry(trait_).or_default());
+        }
+    }
+
+    /// Adds this table's impls of `trait_` to `map`, as [`Self::merge_into`] does.
+    fn merge_trait_into(
+        &self,
+        trait_: TraitId,
+        map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
+    ) {
+        if let Some(t) = self.trait_index(trait_) {
+            self.merge_at(t, map.entry(trait_).or_default());
+        }
+    }
+
+    fn merge_at(&self, t: usize, into: &mut OneTraitImplsBuilder<'db>) {
+        into.blanket_impls.extend_from_slice(self.blanket.run(t));
+        for (self_ty, (impls, derives)) in self.rows_at(t) {
+            let row = into.non_blanket_impls.entry(*self_ty);
+            row.0.extend_from_slice(impls);
+            row.1.extend_from_slice(derives);
+        }
+    }
+```
+
+`for_crate_and_deps` stays for `for_each_crate_and_block*` (the solver's whole-table walks); it
+reads each crate's `for_crate`, which now reruns only when some module's impls change.
+
+### 2. `crates/blaze-items/src/index.rs`
+
+2a. The module doc (L7-15). Old:
+
+```rust
+//! - impls: one crate's impls of one trait ([`trait_impls_in`], which reruns when the crate's
+//!   impls change and backdates for every other trait), then every crate's impls of the trait
+//!   ([`trait_impls`]), then the impls for one simplified self type ([`impls_of`]) and the
+//!   blanket ones ([`blanket_impls_of`]);
+//! - inherent impls: one crate's, by simplified self type ([`inherent_impls_in`]), then every
+//!   crate's for one self type ([`inherent_impls_of`]);
+//! - traits with an item of a name, for method candidates: one crate's ([`traits_in`]), then
+//!   every crate's for one name ([`traits_with`]);
+```
+
+New:
+
+```rust
+//! - impls: one crate's impls of one trait ([`trait_impls_in`], from hir-ty's per-module
+//!   bucket `TraitImpls::for_crate_and_trait`, which reruns only when a module's impls of that
+//!   trait change), then every crate's impls of the trait ([`trait_impls`]), then the impls for
+//!   one simplified self type ([`impls_of`]) and the blanket ones ([`blanket_impls_of`]);
+//! - inherent impls: one module's by simplified self type ([`inherent_impls_in_module`]), the
+//!   modules of a crate with impls for each type ([`inherent_impl_modules`],
+//!   [`inherent_modules_of`]) and one module's for one type ([`module_inherent_impls_of`]),
+//!   then every crate's for one self type ([`inherent_impls_of`]); a frozen crate's come from
+//!   its one frozen table ([`inherent_impls_in`]);
+//! - traits with an item of a name, for method candidates: one module's
+//!   ([`traits_in_module`]), one crate's ([`traits_in`]), then every crate's for one name
+//!   ([`traits_with`]);
+```
+
+2b. Import (L43). Old:
+
+```rust
+    method_resolution::{InherentImpls, TraitImpls},
+```
+
+New:
+
+```rust
+    method_resolution::{InherentImpls, TraitImpls, frozen},
+```
+
+2c. `trait_impls_in` (L474). Old:
+
+```rust
+    TraitImpls::for_crate(db, krate).for_trait(trait_, |impls| match impls {
+```
+
+New:
+
+```rust
+    TraitImpls::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| match impls {
+```
+
+2d. `inherent_impls_in` and `inherent_impls_of` (L525-554). Old:
+
+```rust
+/// The inherent impls of `krate`, by the hash of their simplified self type, then key.
+#[salsa::tracked(returns(ref))]
+fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
+    Runs::new(
+        InherentImpls::for_crate(db, krate)
+            .iter()
+            .flat_map(|(self_ty, impls)| {
+                let self_ty = key::simplified(db, self_ty);
+                impls
+                    .iter()
+                    .map(move |&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it))
+            })
+            .collect(),
+    )
+}
+
+/// The inherent impls of every crate for `self_ty`, sorted by key.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn inherent_impls_of(
+    db: &Db,
+    self_ty: SimplifiedType,
+    _: (),
+) -> Keyed<ImplId> {
+    Keyed::sorted(
+        base_db::all_crates(db)
+            .iter()
+            .flat_map(|&krate| inherent_impls_in(db, krate).run(Some(self_ty)).iter())
+            .collect(),
+    )
+}
+```
+
+New:
+
+```rust
+/// The inherent impls of a frozen `krate`, from its one frozen table, by the hash of their
+/// simplified self type, then key.
+#[salsa::tracked(returns(ref))]
+fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
+    inherent_rows(db, InherentImpls::for_crate(db, krate))
+}
+
+/// The inherent impls of `module` and of the blocks in the bodies it holds, by the hash of
+/// their simplified self type, then key: equal unless one of them is added, removed or
+/// changes its self type.
+#[salsa::tracked(returns(ref))]
+fn inherent_impls_in_module(
+    db: &Db,
+    module: ModuleId,
+) -> Runs<SimplifiedType, ImplId> {
+    inherent_rows(db, InherentImpls::for_module(db, module))
+}
+
+fn inherent_rows(db: &Db, impls: &InherentImpls<'_>) -> Runs<SimplifiedType, ImplId> {
+    Runs::new(
+        impls
+            .iter()
+            .flat_map(|(self_ty, impls)| {
+                let self_ty = key::simplified(db, self_ty);
+                impls
+                    .iter()
+                    .map(move |&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it))
+            })
+            .collect(),
+    )
+}
+
+/// The modules of `krate` with an inherent impl for each simplified self type, by its hash,
+/// then the module's key: equal unless a module gains its first impl for a type or loses its
+/// last.
+#[salsa::tracked(returns(ref))]
+fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId> {
+    let mut rows = Vec::new();
+    for (module, _) in crate_def_map(db, krate).modules(db) {
+        let in_module = inherent_impls_in_module(db, module);
+        if in_module.searched.is_empty() {
+            continue;
+        }
+        let key = key::module_key(db, module);
+        rows.extend(in_module.searched.iter().map(|&self_ty| (Some(self_ty), key, module)));
+    }
+    Runs::new(rows)
+}
+
+/// The modules of `krate` with an inherent impl for `self_ty`: equal unless that list changes,
+/// whatever other types gain.
+#[salsa::tracked(returns(deref))]
+fn inherent_modules_of(
+    db: &Db,
+    krate: Crate,
+    self_ty: SimplifiedType,
+) -> Box<[ModuleId]> {
+    inherent_impl_modules(db, krate).run(Some(self_ty)).iter().map(|(_, it)| it).collect()
+}
+
+/// The inherent impls of `module` for `self_ty`, sorted by key: equal unless one for that
+/// type is added there or removed.
+#[salsa::tracked(returns(ref))]
+fn module_inherent_impls_of(
+    db: &Db,
+    module: ModuleId,
+    self_ty: SimplifiedType,
+) -> Keyed<ImplId> {
+    Keyed::of(inherent_impls_in_module(db, module).run(Some(self_ty)).iter())
+}
+
+/// The inherent impls of every crate for `self_ty`, sorted by key. Reads, in each crate, only
+/// the modules with impls for that type.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn inherent_impls_of(
+    db: &Db,
+    self_ty: SimplifiedType,
+    _: (),
+) -> Keyed<ImplId> {
+    let mut rows = Vec::new();
+    for &krate in base_db::all_crates(db).iter() {
+        if frozen::served(db, krate) {
+            rows.extend(inherent_impls_in(db, krate).run(Some(self_ty)).iter());
+            continue;
+        }
+        for &module in inherent_modules_of(db, krate, self_ty) {
+            rows.extend(module_inherent_impls_of(db, module, self_ty).iter());
+        }
+    }
+    Keyed::sorted(rows)
+}
+```
+
+2e. `traits_in` (L556-580), per module. Old:
+
+```rust
+/// The traits declared in `krate`'s modules, by the hash of each name one of their items
+/// has, then key.
+#[salsa::tracked(returns(ref))]
+fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+    let mut names = Vec::new();
+    let mut traits = Vec::new();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        for def in module.scope(db).declarations() {
+            let ModuleDefId::TraitId(trait_) = def else { continue };
+            let key = key::item_key(db, ItemId::Trait(trait_));
+            for (name, _) in trait_.trait_items(db).items.iter() {
+                names.push(name.as_str());
+                traits.push((key, trait_));
+            }
+        }
+    }
+    let mut found: Vec<_> = name_hashes(names)
+        .into_iter()
+        .zip(traits)
+        .map(|(name, (key, trait_))| (Some(name), key, trait_))
+        .collect();
+    found.sort_unstable_by_key(|&(name, key, _)| (name, key));
+    found.dedup_by_key(|&mut (name, key, _)| (name, key));
+    Runs::new(found)
+}
+```
+
+New:
+
+```rust
+/// The traits declared in `module`, by the hash of each name one of their items has, then
+/// key, each pair once: equal unless such a trait or the names of its items change.
+#[salsa::tracked(returns(deref))]
+fn traits_in_module(
+    db: &Db,
+    module: ModuleId,
+) -> Box<[(NameHash, ItemKey, TraitId)]> {
+    let mut names = Vec::new();
+    let mut traits = Vec::new();
+    for def in module.def_map(db).module(db, module).scope(db).declarations() {
+        let ModuleDefId::TraitId(trait_) = def else { continue };
+        let key = key::item_key(db, ItemId::Trait(trait_));
+        for (name, _) in trait_.trait_items(db).items.iter() {
+            names.push(name.as_str());
+            traits.push((key, trait_));
+        }
+    }
+    let mut found: Vec<_> = name_hashes(names)
+        .into_iter()
+        .zip(traits)
+        .map(|(name, (key, trait_))| (name, key, trait_))
+        .collect();
+    found.sort_unstable_by_key(|&(name, key, _)| (name, key));
+    found.dedup_by_key(|&mut (name, key, _)| (name, key));
+    found.into()
+}
+
+/// The traits declared in `krate`'s modules, by the hash of each name one of their items
+/// has, then key: reruns only when some module's [`traits_in_module`] changes. A trait is
+/// declared in one module, so the modules' rows never repeat one another.
+#[salsa::tracked(returns(ref))]
+fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+    let mut found = Vec::new();
+    for (module, _) in crate_def_map(db, krate).modules(db) {
+        let rows = traits_in_module(db, module);
+        found.extend(rows.iter().map(|&(name, key, trait_)| (Some(name), key, trait_)));
+    }
+    Runs::new(found)
+}
+```
+
+### 3. `crates/blaze-items/src/tests/narrow.rs`
+
+3a. Import (L20-22). Old:
+
+```rust
+    method_resolution::{
+        ImplWork, InherentImpls, TraitImpls, TraitValueItems, impl_work, trait_value_item,
+    },
+```
+
+New:
+
+```rust
+    method_resolution::{
+        ImplWork, InherentImpls, SelfTyKey, TraitImpls, TraitValueItems, impl_work,
+        trait_value_item,
+    },
+```
+
+3b. `an_impl_of_another_trait_leaves_the_impls_of_a_trait` (L227-230): the cut now comes one
+memo earlier, at the bucket. Old:
+
+```rust
+    let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
+    assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
+```
+
+New:
+
+```rust
+    let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
+    assert!(ran(&warm, "::in_module_for_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::for_crate_and_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
+```
+
+3c. New tests, after `impl_tables_keep_the_order_impls_are_found_in`:
+
+```rust
+const MODULES: &str = "mod a;\nmod b;\npub trait T {}\npub trait U {}\n";
+const MODULE_A: &str = "pub struct A;\nimpl A {}\nimpl crate::T for A {}\n";
+const MODULE_B: &str = "pub struct B;\nimpl B {}\nimpl crate::T for B {}\nimpl crate::U for B {}\n";
+
+/// A crate of two modules with impls, and the files of `a` and `b`.
+fn modules_db() -> (TestDB, FileId, FileId) {
+    let (db, files) = TestDB::with_many_files(&format!(
+        "//- /main.rs crate:main\n{MODULES}//- /a.rs\n{MODULE_A}//- /b.rs\n{MODULE_B}"
+    ));
+    let (a, b) = (files[1].file_id(&db), files[2].file_id(&db));
+    (db, a, b)
+}
+
+/// The buckets built module by module hold what the crate's tables hold, in the same order.
+#[test]
+fn per_module_buckets_are_the_crate_tables() {
+    let (db, _, _) = modules_db();
+    let k = krate(&db);
+    let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
+    let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
+    let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
+    hir_ty::attach_db(&db, || {
+        let whole = &**TraitImpls::for_crate(&db, k);
+        let inherent = InherentImpls::for_crate(&db, k);
+        for trait_ in [t, u] {
+            let bucket = TraitImpls::for_crate_and_trait(&db, k, trait_);
+            for self_ty in [a, b, SimplifiedType::Str] {
+                let expected = whole.for_trait_and_self_ty(trait_, &self_ty);
+                assert_eq!(bucket.for_trait_and_self_ty(trait_, &self_ty), expected);
+                let narrow =
+                    TraitImpls::in_crate_for_trait_and_self_ty(&db, k, trait_, SelfTyKey(self_ty));
+                assert_eq!(narrow, expected.0);
+            }
+            assert_eq!(bucket.blanket_impls(trait_), whole.blanket_impls(trait_));
+        }
+        for self_ty in [a, b, SimplifiedType::Str] {
+            let narrow = InherentImpls::in_crate_for_self_ty(&db, k, SelfTyKey(self_ty));
+            assert_eq!(narrow, inherent.for_self_ty(&self_ty));
+        }
+        assert_eq!(whole.for_trait_and_self_ty(t, &a).0.len(), 1);
+        assert_eq!(whole.for_trait_and_self_ty(u, &b).0.len(), 1);
+        assert_eq!(inherent.for_self_ty(&b).len(), 1);
+    });
+}
+
+/// An impl of `U` added to `a` reruns `U`'s bucket and what reads it; `T`'s bucket and the
+/// inherent ones are left unexecuted, though `a`'s own tables rerun.
+#[test]
+fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
+    let (mut db, a_file, _) = modules_db();
+    let k = krate(&db);
+    let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
+    let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
+    let read = |db: &TestDB| {
+        hir_ty::attach_db(db, || {
+            (
+                TraitImpls::for_crate_and_trait(db, k, t).blanket_impls(t).len(),
+                TraitImpls::in_crate_for_trait(db, k, u).len(),
+                InherentImpls::in_crate_for_self_ty(db, k, SelfTyKey(b)).len(),
+            )
+        })
+    };
+    assert_eq!(read(&db), (0, 1, 1));
+
+    db.set_file_text(a_file, &format!("{MODULE_A}impl crate::U for A {{}}\n"));
+    let warm = db.log_executed(|| assert_eq!(read(&db), (0, 2, 1)));
+    assert!(ran(&warm, "::for_module"), "{warm:#?}");
+    assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
+    let buckets = warm.iter().filter(|it| it.contains("::for_crate_and_trait")).count();
+    assert_eq!(buckets, 1, "only `U`'s bucket reruns: {warm:#?}");
+    assert!(!ran(&warm, "::in_crate_for_self_ty"), "{warm:#?}");
+}
+
+/// Adding a function to `a` leaves every bucket and both crate tables unexecuted.
+#[test]
+fn an_item_that_is_no_impl_reruns_no_bucket() {
+    let (mut db, a_file, _) = modules_db();
+    let k = krate(&db);
+    let t = trait_named(&db, "T");
+    let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
+    let read = |db: &TestDB| {
+        hir_ty::attach_db(db, || {
+            _ = TraitImpls::for_crate(db, k);
+            _ = InherentImpls::for_crate(db, k);
+            (
+                TraitImpls::in_crate_for_trait_and_self_ty(db, k, t, SelfTyKey(a)).len(),
+                InherentImpls::in_crate_for_self_ty(db, k, SelfTyKey(a)).len(),
+            )
+        })
+    };
+    assert_eq!(read(&db), (1, 1));
+
+    db.set_file_text(a_file, &format!("{MODULE_A}pub fn added() {{}}\n"));
+    let warm = db.log_executed(|| assert_eq!(read(&db), (1, 1)));
+    assert!(ran(&warm, "::for_module"), "{warm:#?}");
+    for query in [
+        "::for_crate",
+        "::for_crate_and_trait",
+        "::modules_by_trait",
+        "::modules_by_self_ty",
+        "::in_crate_for_trait_and_self_ty",
+        "::in_crate_for_self_ty",
+    ] {
+        assert!(!ran(&warm, query), "{query} reran: {warm:#?}");
+    }
+}
+```
+
+### 4. `crates/hir-ide/src/tests/incremental.rs` (coordinator's, for `requests`)
+
+`TraitImpls::for_crate` now reruns only when some module's trait impls change, and the new
+per-module table runs under it. In `adding_struct_invalidates_infer`,
+`adding_enum_query_log`, `adding_use_query_log` and `adding_impl_query_log` (whose new item is
+the inherent `impl SomeStruct`), the second `execute_assert_events` (L298, L373, L445, L530)
+becomes, old:
+
+```rust
+        &[("TraitImpls < 'db >::for_crate_", 1)],
+```
+
+new:
+
+```rust
+        &[("TraitImpls < 'db >::for_crate_", 0), ("TraitImpls < 'db >::for_module_", 1)],
+```
+
+(the first `execute_assert_events` of each keeps `1`). Every `expect!` there that lists
+`TraitImpls`/`InherentImpls` queries (those four and the long list near L633-649) gains the
+per-module names: regenerate with `UPDATE_EXPECT=1` when the tests run.
+
+Status: open
+
+
+## dedup: hir_def::test_items
+
+From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). `declarations` and
+`impls` (every `ModuleDefId`/`ImplId` of a crate's modules) are written again in six test modules;
+the one copy is `hir_def::test_items` (`v2/requests/db.md`, `## dedup: hir_def::test_items`).
+Apply once db lands it (lane items is DONE; `mem-backend-items` is editing this crate, so it or
+the coordinator applies this):
+
+- `crates/blaze-items/src/tests/narrow.rs`: the bodies of `fn declarations` (47-53) and `fn impls`
+  (55-61) become `hir_def::test_items::declarations(db, krate(db))` and
+  `hir_def::test_items::impls(db, krate(db))`.
+- `crates/blaze-items/src/tests/coherence.rs`: the bodies of `fn declarations` (42-49) and
+  `fn impls` (51-57) become `hir_def::test_items::declarations(db, krate)` and
+  `hir_def::test_items::impls(db, krate)`.
+- Drop `crate_def_map` from both files' imports if nothing else uses it. The `*_named` lookups
+  stay: they take the first match (`find_map`), where `test_items` asks for exactly one.
+
+Status: open
+
+> forwarded to mem-backend-items (editing blaze-items, running; told), to apply once db lands `hir_def::test_items`.
+
+
+## speed-hir-store-paths: paths as columns (2026-10-29)
+
+From `speed-hir-store-paths-consumers` (child of `speed-hir-store-paths`). hir-def's paths and
+generic arguments are columns now (`crates/hir-def/src/expr_store/path.rs`; the API is in
+`/tmp/blaze-lanes/v2-speed-hir-store-paths.md`, "The API"): `Path<'a>`, `GenericArgs<'a>`,
+`AssociatedTypeBinding<'a>`, `PathGenericArgs<'a>` and `Bindings<'a>` are `Copy` views decoded
+from the store; `TypeBound` and `WherePredicate` are `Copy` records whose `for<..>` binders and
+`use<..>` arguments are runs (`Names`, `UseArgs`) read with `store.names(..)` and
+`store.use_args(..)`. Apply these with the paths lane's own edits to `hir.rs`/`expr_store*`
+(one compile). Nothing here is built (common.md).
+
+The consumer rule:
+
+1. `&Path` parameters and fields become `Path<'_>` (by value; `Copy`). Where a function keeps
+   `&Path<'_>`, callers pass `&path`. `&store[p]` / `&map[p]` for a `PathId` -> `store.path(p)`.
+2. `Path::Normal(it) => &it.mod_path` -> `it.mod_path` (already a reference).
+   `it.generic_args` / `it.type_anchor` field reads are unchanged.
+3. `generic_args()` yields slots by value: `.into_iter().flatten().flatten()` still gives
+   `GenericArgs<'_>`; `.iter().any(Option::is_some)` -> `.iter().any(|it| it.is_some())`;
+   `generic_args()?.last()?.as_ref()?` -> `generic_args()?.last()??`; `&generic_args[i]` ->
+   `generic_args.get(i)`.
+4. `&GenericArgs` parameters -> `GenericArgs<'_>`; `Option<&GenericArgs>` -> `Option<GenericArgs<'_>>`
+   (drop `.as_ref()`/`.as_deref()`; `*args` -> `args`). `args.bindings.iter()`, `for b in
+   &args.bindings`, `.first()`, `.is_empty()`, `.len()` keep working; `bindings[i]` ->
+   `bindings.get(i).unwrap()` (or restructure), `&*bindings`/`bindings.as_ref()` -> iterate.
+5. `binding.args.as_ref()` -> `binding.args`; `&binding.bounds` / `binding.bounds.iter()`
+   unchanged (`&'a [TypeBound]`).
+6. `TypeBound::ForLifetime(lifetimes, path)`: `lifetimes` is `Names`; read with
+   `store.names(lifetimes)`. `TypeBound::Use(args)`: `store.use_args(args)`. `bound.clone()` ->
+   `*bound`; `&TypeBound::Path(p, m)` patterns keep working.
+7. `WherePredicate::TypeBound { lifetimes: Some(l), .. }`: `l` is `Names`; `store.names(l)`.
+8. `Path::from_known_path_with_no_generic(m)` -> `Path::from_known_path_with_no_generic(&m)`
+   (bind the `ModPath` to a local if it is a temporary used past the statement).
+9. `path.qualifier()` gives `Qualifier<'_>`: use `.path()` for a `Path<'_>` (bind the
+   qualifier to a local first: `let q = path.qualifier()?; let q = q.path();`).
+
+Applied the same way everywhere, so that callers in one crate agree with signatures in another:
+every `&Path`, `Option<&GenericArgs>`, `&GenericArgs`, `&[Option<GenericArgs>]` parameter,
+field and return becomes the by-value view, hir-def's `Resolver::resolve_path_in_*` and
+`record_path_uses` and hir-ty's path lowering included. Bodies are by-value views
+(`store.expr(id) -> Expr<'_>`), so `Expr::Path(p)` binds `p: Path<'_>` and most call sites
+keep their text. Also `args.args` is `&[GenericArg]` now, so `for arg in &args.args` becomes
+`for arg in args.args` (`&&[T]` is not `IntoIterator`).
+
+The edits assume, from the paths lane: `Expr::Path`/`Pat::Path`/`RecordLit`/`Pat::Record`/
+`Pat::TupleStruct` hold `Path<'a>`; `Expr::MethodCall { generic_args: Option<GenericArgs<'a>> }`;
+`AsmOperand::Sym(PathIdx)` read with `store.path_at(idx)` (both `pub`); `Index<PathId> for
+ExpressionStore` removed; `StoreVisitor::on_path`/`on_generic_args`/`on_type_bound` taking the
+views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
+
+Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
+old text (where the same text is on several lines, the function named beside it picks).
+
+
+### crates/hir-ty/src/method_resolution.rs
+
+- line 148 (`lookup_method_including_private`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+
+### crates/hir-ty/src/method_resolution/confirm.rs
+
+- line 59 (`confirm_method`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+- line 101 (`ConfirmContext::confirm`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+- line 349 (`instantiate_method_args`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+
+Stay as written: `TypeLikeConst::Path(path) => self.ctx.make_path_as_const(path)` (420, `match
+arg` by value), `substs_from_args_and_bindings(.., generic_args, ..)` (463), `provided_kind(..,
+arg: &HirGenericArg)` (`GenericArg` is unchanged), the `debug!`/`#[instrument]` of
+`generic_args` (`GenericArgs<'_>` is `Debug`).
+
+### No edits
+
+- `traits.rs:400` `predicate: &WherePredicate` passed to `lower_where_predicate`: not in the
+  rule's list, and `WherePredicate` is now `Copy`, so it still compiles.
+- `method_resolution/probe.rs`, `drop.rs`, `layout.rs`, `layout/adt.rs`, `specialization.rs`,
+  `opaques.rs`: only `next_solver` types and `Mode::MethodCall`/`Mode::Path` (false hits).
+- `crates/blaze-items/src/form.rs:2575` `AsmOperand::Sym(operand)` is MIR's operand;
+  `facts.rs`, `tests/coherence.rs`, `tests/narrow.rs` use `next_solver::GenericArgs`. Nothing
+  in blaze-items reads hir-def paths.
+
+Status: open
+
+## dedup: bits: blaze-items `table::Bits` onto `blaze_ids::bits::Ranked`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`) is the one bit-set family. Its `Ranked` is
+this `Bits`: words, a `u32` count of members before each word, a length; `contains`/`rank` panic
+at or past the length as `get`/`rank` did, `count` is the same sum, and `place(at)` is
+`contains(at).then(|| rank(at))` in one call. The test `a_bitset_ranks_each_row` is in
+`crates/blaze-ids/src/bits/tests.rs` already (with a proptest of `rank` against a popcount).
+No hash, serialized byte or equality changes: `HashColumns` is not serialized, and `Ranked`'s
+`PartialEq` compares the same words, counts and length.
+
+1. `crates/blaze-items/src/table.rs`: delete the whole `Bits` struct and its `impl Bits`
+   (from `/// One bit per row, with the count of set bits before each word, ...` through the
+   `}` closing `impl Bits`).
+
+   Imports, before:
+
+   ```rust
+   use blaze_ids::ContentId;
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::{ContentId, bits::Ranked};
+   ```
+
+   In `HashColumns`, before:
+
+   ```rust
+       has_layout: Bits,
+       layout: Box<[LayoutHash]>,
+       has_code: Bits,
+   ```
+
+   after:
+
+   ```rust
+       has_layout: Ranked,
+       layout: Box<[LayoutHash]>,
+       has_code: Ranked,
+   ```
+
+   In `HashColumns::new`, before:
+
+   ```rust
+           let has_layout = Bits::new(rows.iter().map(|(_, it)| it.layout.is_some()));
+           let has_code = Bits::new(rows.iter().map(|(_, it)| it.code.is_some()));
+   ```
+
+   after:
+
+   ```rust
+           let has_layout = Ranked::from_bools(rows.iter().map(|(_, it)| it.layout.is_some()));
+           let has_code = Ranked::from_bools(rows.iter().map(|(_, it)| it.code.is_some()));
+   ```
+
+   In `HashColumns::row`, before:
+
+   ```rust
+               layout: self.has_layout.get(row).then(|| self.layout[self.has_layout.rank(row)]),
+               code: self.has_code.get(row).then(|| self.code[self.has_code.rank(row)]),
+   ```
+
+   after (`row` is in bounds: `self.kinds[row]` above panics first, as before):
+
+   ```rust
+               layout: self.has_layout.place(row).map(|at| self.layout[at]),
+               code: self.has_code.place(row).map(|at| self.code[at]),
+   ```
+
+2. `crates/blaze-items/src/tests/table.rs`: delete the test `a_bitset_ranks_each_row` (moved
+   to blaze-ids) and `table::Bits,` from the `use crate::{...}` list.
+
+## dedup: bits: blaze-items `form.rs` impl items used, and the canonical walk's `uses`
+
+From `dedup-bits-store`, as above.
+
+1. `crates/blaze-items/src/form.rs`, the impl's items matched against the trait's (~line 960):
+   a `u64` of the first 64 and an `FxHashSet` past them is a growable bit set kept inline for
+   one word. Before:
+
+   ```rust
+                   // The impl items used, as a bit each; past 64 of them, a set.
+                   let (mut used, mut used_past) = (0u64, FxHashSet::default());
+   ```
+
+   after:
+
+   ```rust
+                   // The impl items used, a bit each, inline up to 64 of them.
+                   let mut used: Bits<SmallVec<[u64; 1]>> = Bits::new(items.len());
+   ```
+
+   before:
+
+   ```rust
+                       Some(at) => {
+                           if at < 64 {
+                               used |= 1 << at;
+                           } else {
+                               used_past.insert(at);
+                           }
+                           f.u8(1);
+   ```
+
+   after:
+
+   ```rust
+                       Some(at) => {
+                           used.insert(at);
+                           f.u8(1);
+   ```
+
+   before:
+
+   ```rust
+                   if used.count_ones() as usize + used_past.len() != items.len() {
+   ```
+
+   after:
+
+   ```rust
+                   if used.count() != items.len() {
+   ```
+
+   Imports: `use blaze_ids::{ContentId, radix};` becomes
+   `use blaze_ids::{ContentId, bits::{self, Bits}, radix};` and add `use smallvec::SmallVec;`
+   beside the other crate imports (`FxHashSet` stays imported: `seen` uses it).
+   `crates/blaze-items/Cargo.toml` `[dependencies]`: add `smallvec.workspace = true` (a root
+   workspace dependency already).
+
+2. `CanonBuffers::uses` (~line 2855) stays `Vec<Cell<u64>>`: the walk marks locals through
+   `&self` (`Canon` is shared by the closures of the walk, as `next` and `numbers` are), and a
+   `Bits` writes through `&mut`; a `RefCell<BitSet>` would add a borrow check to every local
+   the walk meets. Its index arithmetic moves onto `blaze_ids::bits`. Before:
+
+   ```rust
+       /// A bit for each local the first walk found used.
+       uses: Vec<Cell<u64>>,
+   ```
+
+   after:
+
+   ```rust
+       /// A bit for each local the first walk found used, in cells rather than a
+       /// `blaze_ids::bits::BitSet`: the walk marks them through `&self`.
+       uses: Vec<Cell<u64>>,
+   ```
+
+   before:
+
+   ```rust
+           c.uses.resize_with(body.locals.len().div_ceil(64), || Cell::new(0));
+   ```
+
+   after:
+
+   ```rust
+           c.uses.resize_with(bits::words_for(body.locals.len()), || Cell::new(0));
+   ```
+
+   before:
+
+   ```rust
+       fn used(&self, local: LocalId) -> bool {
+           let at = local_index(local);
+           (self.c.uses[at / 64].get() >> (at % 64)) & 1 == 1
+       }
+
+       fn mark_used(&self, local: LocalId) {
+           let at = local_index(local);
+           let word = &self.c.uses[at / 64];
+           word.set(word.get() | 1 << (at % 64));
+       }
+   ```
+
+   after:
+
+   ```rust
+       fn used(&self, local: LocalId) -> bool {
+           let (word, mask) = bits::locate(local_index(local));
+           self.c.uses[word].get() & mask != 0
+       }
+
+       fn mark_used(&self, local: LocalId) {
+           let (word, mask) = bits::locate(local_index(local));
+           let word = &self.c.uses[word];
+           word.set(word.get() | mask);
+       }
+   ```
+
+Status: open
+
+## dedup: push_successors is TerminatorKind::all_successors reversed (from dedup-scan)
+
+`crates/blaze-items/src/form.rs` `fn push_successors(kind, stack)` pushes exactly
+`kind.all_successors()` (db.md) in reverse, so the walk pops them in order. After db adds it,
+delete `push_successors` and at its call write `stack.extend(kind.all_successors().into_iter().rev());`.
+Same order, so no CodeHash changes. `tests/form.rs`'s copy stays: it is the reference
+`hashed_walk` is checked against.

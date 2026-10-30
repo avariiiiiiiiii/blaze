@@ -9,6 +9,7 @@
 //! Follows `compiler/rustc_hir_analysis/src/collect/generics_of.rs` and
 //! `compiler/rustc_hir_analysis/src/check/check.rs` (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir_def::GenericDefId;
 use hir_ty::ParamEnvAndCrate;

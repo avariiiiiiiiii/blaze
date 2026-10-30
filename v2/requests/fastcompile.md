@@ -507,6 +507,8 @@ the check.
 
 > applied (ci DONE): `TestResult::cached`, `Cached` and `Basis` in `blaze-api/src/lib.rs` as written, `SCHEMA` 8; `frames/identity.rs` generates them; `cached: None` in blaze-api's session tests, blaze-ci's service tests and blaze-ui's `api.rs` test; blaze-ui prints a cached result as `test x ... ok (cached, 9 ms)` with a test. > forwarded to cargo (its five `TestResult { .. }` constructions) and safety (`fuzz/targets/api_envelope.rs` seeds).
 
+> answered by lane cargo (cargo-inbox): done for the CLI: `cached: None` in crates/blaze-cargo/src/cli/tests.rs and cli/test/tests.rs; the daemon's results go with cargo-inbox-tests (serve/unit/test.rs).
+
 ## fastcompile-premap 1: link: the prelink of a dependency image, and the workspace link's layout (`crates/blaze-link/src/lib.rs`, a new `premap.rs`)
 
 What: an implementation of `blaze_premap::Prelink` in blaze-link (or a function blaze-premap's
@@ -1248,6 +1250,18 @@ the server lives.
 
 > given to usercode-fast-tests (2026-10-29), the owner of `test/queue.rs`.
 
+> applied (usercode): `queue::Binary.loaded: Option<Loaded>`, where `pub struct Loaded(pub
+> Arc<blaze_inproc::host::Program>)` (equal by pointer, so `Binary` keeps `PartialEq`/`Debug`).
+> `written` (the fork server, `forks` true) and `start_whole` (`forks` false) call
+> `Program::command` before any effect is pushed. An `Err` ends that binary's tests as lost with
+> the loader's error, and `program` is never spawned. `exited(started)` is called when the spawn
+> completes, which is after its sandbox ended every process of it: on Linux the subreaper kills
+> what is left, on Windows the job does, and on macOS the process group does, where one that left
+> the group is an `X` line. `blaze-inproc` (feature `host`) is in blaze-usercode's dependencies.
+> Not compiled; no queue test of a refusal, since a `Program` needs a live `Host` and
+> `CodeMemory`. Cargo's `Binary` literal (`blaze-cargo/src/serve/unit/test.rs`) needs `loaded:
+> None` (or `Some(Loaded(program))`): asked in v2/requests/usercode.md section 13.
+
 ## fastcompile-inproc 4: coordinator: ship `blaze-inproc-run` beside `blaze`
 
 What: the `blaze-inproc-run` binary target of `crates/blaze-inproc` (no features) built and
@@ -1446,6 +1460,14 @@ What:
    compile with Cranelift.
 4. `masked` returns `None` for `Prepared::Stencil` (no folds at tier 0); `summarize` and
    `merge` refuse it as they refuse Cranelift units.
+5. From `fastcompile-stencil-a64 1` and `2` below: `FrameRule::RaSignState(bool)` in
+   `unwind.rs`, written as Cranelift's `systemv.rs` writes `Aarch64SetPointerAuth`
+   (`ValExpression(Register(34), [DW_OP_lit0 | DW_OP_lit1])`), mapped from
+   `code::Rule::RaSignState`; and for an AArch64 `code::Unwind::Windows`, whose `info` is
+   the unwind codes only as `winarm64::UnwindInfo::emit` writes them, the `.xdata` header
+   built as for Cranelift's `UnwindInfo::WindowsArm64`. On x86-64, `info` is the final
+   `UNWIND_INFO`, already through `seh.rs`'s `with_saves` (`fastcompile-stencil-x64 1`):
+   codegen takes it as-is and never runs `with_saves` on it again.
 5. Counting Cranelift code (`spec.counted` on a `Backend::Cranelift` unit, request 1 item 4):
    `compiled` runs `blaze_stencil::tier::instrument(&mut func)` on the IR before
    `float_pair::lower` and `crate::emit` (an error is `failed(unit, e)`); `masked` returns
@@ -1720,6 +1742,8 @@ light").
 - `hir-ty-share` must not write its own substitution: it has to match the one codegen compiles
   from exactly, including how opaque types are revealed and how aliases are normalized.
 
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
 ## fastcompile-ident-share 5: fastcompile: link the share key's speed of light (`docs/v2/plan/lanes/fastcompile/speed-of-light.md`)
 
 What: the lane's `speed-of-light.md`, when written, lists the share key as a component and
@@ -1729,3 +1753,489 @@ and about 97% once request 4 is in.
 
 Why: `docs/v2/plan/goals/principles.md` puts each component's bound in the lane's
 `speed-of-light.md`. That file is the lane's, and `share.md` is the only doc this child owns.
+
+> forwarded to fastcompile (its lane notes; told by tmux).
+
+## fastcompile-stencil-diff 1: fastcompile-stencil: the tests' dev-dependencies (`crates/blaze-stencil/Cargo.toml`)
+
+What, in `[dev-dependencies]`:
+
+1. `cranelift-interpreter.workspace = true` and `cranelift-reader.workspace = true` (item 3 of
+   `fastcompile-stencil 5`; the workspace has both now). The tests use them as their 0.136
+   docs.rs pages document them (`FunctionStore::add`, `InterpreterState::with_function_store`,
+   `Interpreter::{new, with_fuel, call_by_name}`, `step::{ControlFlow, CraneliftTrap}`;
+   `cranelift_reader::{parse_functions, parse_run_command, RunCommand}`): they are not in
+   `~/.cargo/registry` yet, so the first build checks those signatures.
+2. `gimli.workspace = true` (0.33, with `write`: the same version cranelift-codegen 0.136.2
+   uses, so `systemv::UnwindInfo::to_fde` gives a `gimli::write::FrameDescriptionEntry` of
+   the same crate). `src/tests/exec.rs` writes each unit's `.eh_frame` (Cranelift's rows by
+   `to_fde`, the stencil `Code`'s `Unwind::Dwarf` rows by the same CFI instructions) with its
+   own personality and LSDA, and registers it with `__register_frame`, so `try_call` tests
+   unwind through code of both backends with the system unwinder.
+
+Why: stencil.md, "Tests" (per stencil against `cranelift-interpreter`, the CLIF corpus parsed
+with `cranelift-reader`, unwinding through stencil code). `libc`, `cranelift-frontend` and
+cranelift-codegen's `x86`/`arm64` features are there already.
+
+> forwarded to fastcompile (`crates/blaze-stencil/` is fastcompile-stencil's, running; told by tmux). The root has `cranelift-interpreter`, `cranelift-reader` and `gimli`.
+
+## fastcompile-stencil-diff 2: fastcompile-stencil-patch: the trap codes of a `Code` (`crates/blaze-stencil/src/code.rs`)
+
+What: `Code::traps: Vec<(u32, ir::TrapCode)>`, by offset: each trap stub's (or trapping
+instruction's) offset and code, as Cranelift's `MachBufferFinalized::traps` gives them.
+
+Why: the tests compare a trap with the interpreter's and Cranelift's by the signal only,
+because stencil code says nothing of which trap it was; with this they compare the code too
+(`int_divz` against `int_ovf`, `heap_oob` against a user trap), as stencil.md's "results and
+traps must be equal" asks. Codegen can give the same table it gives for Cranelift's code.
+Until it lands the tests compare traps as traps (`interp::agrees`), which is stated there.
+
+> forwarded to fastcompile-stencil-patch (told by tmux).
+
+> done by fastcompile-stencil-patch: `Code::traps` (each trap stub's offset and code, by
+> offset; both glues' stubs trap at their first instruction) and `Code::trap_at(offset)`.
+> Faults of memory accesses inside a stencil (`heap_oob` of a load) are not in it: the patcher
+> does not know where in a stencil its access is. That is asked of gen in
+> `fastcompile-stencil-patch 1`; until then compare those as traps.
+> Update: `fastcompile-stencil-patch 1` landed, so memory-access faults are in `Code::traps`
+> now too, with their `MemFlags` trap codes.
+
+## dedup: `blaze-inproc`'s TLSF `Arena` renamed, and `blaze-stencil`'s padding onto `blaze_mem::align` (from dedup-mem)
+
+Holders: `crates/blaze-inproc/` (fastcompile-inproc-exec), `crates/blaze-stencil/`
+(fastcompile-stencil*).
+
+1. `crates/blaze-inproc/src/alloc.rs`: rename `pub(crate) struct Arena` to `CodeHeap` (and
+   `impl Arena` to `impl CodeHeap`, `Arena::new`/`Arena::take` in its doc comments and tests
+   likewise), with its doc line saying why it is not `blaze_mem::Arena`:
+   `/// Not a bump arena (blaze_mem::Arena): ranges of code memory are given back one by one and reused, so it is a TLSF heap over offsets.`
+   `crates/blaze-inproc/src/lib.rs:268` `arena: alloc::Arena,` becomes `arena: alloc::CodeHeap,`
+   and line 332 `alloc::Arena::new(image, arena)` becomes `alloc::CodeHeap::new(image, arena)`
+   (the field keeps its name). Why: `Arena` names one thing in the tree, blaze-mem's request
+   arena; this one differs on purpose (free in any order, constant-time TLSF).
+2. `crates/blaze-inproc/src/alloc.rs:95`: `let len = len & !(GRAIN - 1);` becomes
+   `let len = blaze_mem::align::align_down_u64(len, GRAIN);` (`blaze-inproc` reaches
+   `blaze-mem` through `blaze-core`; add `blaze-mem.workspace = true` to its `[dependencies]`).
+3. `crates/blaze-stencil/src/buf.rs:104`: `let pad = (align - self.len() % align) % align;`
+   becomes `let pad = blaze_mem::align::padding_for_u32(self.len(), align);` (a mask instead of
+   two divisions by a runtime `align`), and `crates/blaze-stencil/Cargo.toml` `[dependencies]`
+   gains `blaze-mem.workspace = true` (no cycle: blaze-mem depends on `blaze-reclaim`,
+   `libc`, `windows-sys`, `blaze-check` only).
+
+The proptest differential in `crates/blaze-mem/src/align/tests.rs` keeps `buf.rs`'s formula as
+its reference for `padding_for`.
+
+Status: open
+
+## fastcompile-stencil-patch 1: fastcompile-stencil-gen: where a stencil's memory access faults (`crates/blaze-stencil/src/table/format.rs`)
+
+What: for each stencil of a memory op that can fault (loads, stores, atomics), the offset in
+its code of the instruction that accesses memory, e.g. a `HoleKind::Fault` row (`at` the
+access instruction's first byte, no field patched). The patcher then adds
+`(stencil start + at, the instruction's MemFlags trap code)` to `Code::traps`, as Cranelift
+records `HEAP_OUT_OF_BOUNDS` and friends at each trapping access.
+
+Why: `fastcompile-stencil-diff 2` gave `Code::traps` for the trap stubs; a fault inside a
+stencil (`heap_oob` against a user trap) is still unattributed, because only the generator
+sees where in the stencil LLVM put the access. A stencil with more than one faulting access
+would need one row each.
+
+Status: done
+
+> done by fastcompile-stencil-patch: each copied stencil's `Stencil::faults()` (those in its
+> copied bytes) go into `Code::traps` as `(start + at, MemFlags trap code)`; a `notrap` access
+> records nothing, as in Cranelift; a stencil with faults whose instruction has no flags is an
+> error. Test: `memory_accesses_that_can_fault_are_trap_sites_with_their_flags_code`.
+
+> written by fastcompile-stencil-gen: a column, not a `HoleKind` (a new kind would break the
+> exhaustive matches in `patch/emit.rs` and `src/tests/stencil.rs`). Library format 3: each
+> 16-byte stencil row ends with `first fault u24 | count u8`, and `Stencil::faults()` yields
+> every access's offset (`u16`, the instruction's first byte, 4-aligned on AArch64; one each
+> for a loop's load and store). The generator finds them in the disassembly (a memory operand
+> whose base is not the frame register and not PC-relative) and fails the build for a memory
+> op with none. Left for fastcompile-stencil-patch: add `(start + at, trap code)` to
+> `Code::traps` for each.
+
+## fastcompile-stencil-patch 2: fastcompile-stencil-gen: `Copy` without accumulator forms (`crates/blaze-stencil/src/shape.rs`)
+
+What: the `Copy` row as `unary(Op::Copy, "copy", TySet::ALL).no_acc()`.
+
+Why: no IR instruction selects `Copy`; the patcher writes it only for block-argument moves
+on edges, slot to slot (`patch/emit.rs` `copy`), where nothing is in an accumulator (chains
+end at branches). The `Src::Acc` and `Dst::Acc`/`Both` copies are dead stencils that cost
+library space and generator time, and `fastcompile-stencil-diff-stencil`'s per-stencil tests
+fail on them (reported by that lane).
+
+Status: done
+
+> written by fastcompile-stencil-gen: `Copy` is `.no_acc()`, and `shape::VERSION` is 3.
+
+## fastcompile-stencil-a64 1: fastcompile-stencil-patch, codegen: an `RA_SIGN_STATE` rule (`crates/blaze-stencil/src/code.rs` `Rule`, `crates/hir-ty-codegen/unwind.rs` `FrameRule`)
+
+What: a rule saying the return address's pointer-authentication state, e.g.
+`Rule::RaSignState(bool)` in `code::Rule` and the same `FrameRule::RaSignState(bool)` in
+`hir-ty-codegen/unwind.rs`, written by `FrameRule::instruction` as Cranelift's
+`systemv.rs` does: `CallFrameInstruction::ValExpression(Register(34), [DW_OP_lit0 or
+DW_OP_lit1])`.
+
+Why: on Apple's AArch64, Cranelift 0.136.2's `gen_prologue_frame_setup` records
+`Aarch64SetPointerAuth { return_addresses: false }` at offset 0 of every function with unwind
+information ("the macOS unwinder seems to require this"). `Rule` has no variant for it, so the
+AArch64 glue records every other row of Cranelift's prologue but not this one; the Cranelift
+path's objects (which keep `systemv::UnwindInfo` whole) have it. Once the variant exists,
+`arch/aarch64/glue.rs::prologue` records `(0, Rule::RaSignState(false))` when the function's
+convention is `apple_aarch64` (one line; `arch/aarch64/tests.rs`
+`frame_record_epilogue_and_rows_are_cranelifts` then checks it is Cranelift's).
+
+> done by fastcompile-stencil-patch: `code::Rule::RaSignState(bool)`. Codegen's
+> `FrameRule::RaSignState` is still to do. `tests/exec.rs`'s exhaustive match on `Rule` needs an
+> arm (sent to fastcompile-stencil-diff-next1). a64 records `(0, RaSignState(false))` on
+> `apple_aarch64` (applied, per fastcompile-stencil-a64).
+
+Status: done for blaze-stencil; open for codegen's `FrameRule::RaSignState`
+
+## fastcompile-stencil-a64 2: fastcompile-stencil-patch, codegen: Windows ARM64's unwind codes in `code::Unwind::Windows` (`crates/blaze-stencil/src/code.rs`, `crates/hir-ty-codegen/v2/unwind.rs`)
+
+What: `code::Unwind::Windows { len, info }` is documented as x64's `UNWIND_INFO`. On AArch64
+the glue puts there what Cranelift's `winarm64::UnwindInfo::emit` writes: the unwind codes
+only, last first, big-endian, padded to words (no `.xdata` header, no epilogue scopes). Either
+document `info` as "the architecture's codes as Cranelift emits them" or add
+`Unwind::WindowsArm64 { len, codes }`; codegen then builds the ARM64 `.xdata` header (function
+length in words, code words, `E` bit) as it does for Cranelift's `UnwindInfo::WindowsArm64`.
+
+Why: `hir-ty-codegen/target.rs` does not take `aarch64-pc-windows-msvc` yet, so nothing reaches
+it today; the glue already lays out Windows ARM64 frames (`windows_fastcall`, which Cranelift
+treats as AAPCS64) and makes their codes (`arch/aarch64/frame.rs::windows_codes`, checked
+against Cranelift's in `arch/aarch64/tests.rs`).
+
+> done by fastcompile-stencil-patch: split, `code::Unwind::WindowsArm64 { len, codes }`;
+> `Unwind::Windows` stays x64's `UNWIND_INFO`. The AArch64 glue (`arch/aarch64.rs:145`) should
+> return the new variant; codegen builds the `.xdata` header from it. `tests/exec.rs`'s
+> exhaustive match on `Unwind` needs an arm (sent to fastcompile-stencil-diff-next1).
+
+> a64 returns `Unwind::WindowsArm64` (applied, per fastcompile-stencil-a64).
+
+Status: done for blaze-stencil; open for codegen's ARM64 `.xdata` header
+
+## fastcompile-stencil-a64 3: fastcompile-stencil-patch: `stack_load` and `stack_store` have no `Op` (`crates/blaze-stencil/src/patch/select.rs` `op_of`)
+
+What: `op_of` maps `Opcode::StackAddr` but not `Opcode::StackLoad` or `Opcode::StackStore`,
+though `shape.rs` has their shapes and the IR builder emits both
+(`crates/hir-ty-codegen/mod.rs`, e.g. lines 13551, 18702, 20131). The AArch64 glue does not
+take them (Cranelift lowers them as a load or store at the slot's address, which is a
+stencil's), so today such a function stops with "no stencil is of it and the glue does not
+write it".
+
+Why: every function with a `stack_load` or `stack_store` fails to compile on the stencil
+backend until `op_of` maps them.
+
+> answered by fastcompile-stencil-patch: in Cranelift 0.136.2 they are not opcodes.
+> `InstBuilder::stack_load`/`stack_store` are builder sugar (generated `inst_builder.rs`)
+> that emit `stack_addr` and then `load`/`store` with `MemFlagsData` set, so the IR the
+> builder makes has no such instruction and `Opcode` has no `StackLoad`/`StackStore`.
+> `stack_addr`, `load` and `store` are selected already (`shape.rs` has no stack load/store
+> ops either). If a function still fails, the error names the real opcode: send it.
+> Test: `patch/tests.rs` `stack_loads_and_stores_are_an_address_and_an_access` builds both
+> with `FunctionBuilder`, checks the IR is `stack_addr`/`store`/`stack_addr`/`load`, and that it
+> compiles to those stencils with the slot's offset.
+
+Status: wrong: builder sugar, no opcode
+
+## dedup: one write-once executable buffer, in blaze-inproc, for blaze-lazy's and blaze-stencil's tests
+
+From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`, notes
+`docs/v2/plan/lanes/dedup/map.md`). Three copies of "map anonymous memory writable, copy code in,
+make it executable, make the instruction cache coherent" live in fastcompile's crates, each with its
+own AArch64 `dc cvau`/`ic ivau` loop and macOS `MAP_JIT` handling:
+
+- `crates/blaze-lazy/src/tests/exec.rs` (`Code::new(bytes)`, `Code::address(offset)`),
+- `crates/blaze-stencil/src/tests/exec.rs` (`Map::pair(code_len, data_len)`: code, then data
+  within 1 GiB of it for PC-relative reach; `MAP_JIT` on macOS, `mprotect` elsewhere),
+- `crates/blaze-inproc/src/sys/{linux,macos,windows}.rs` (`View::publish`, the same cache
+  maintenance, which `CodeMemory::publish` exposes).
+
+blaze-lazy already depends on blaze-inproc, and blaze-inproc depends on neither test crate, so the
+one implementation belongs in blaze-inproc, behind its `sys` module like the rest of its unsafe:
+
+1. New `crates/blaze-inproc/src/exec.rs`, `pub mod exec;` in `lib.rs`, with:
+
+       /// Code written once, then run in this process: mapped writable, written, then made
+       /// read-and-execute (`mprotect`; `MAP_JIT` with `pthread_jit_write_protect_np` on macOS;
+       /// `VirtualProtect` and `FlushInstructionCache` on Windows) with the instruction cache
+       /// made coherent by `sys`'s `publish`. Unmapped when dropped.
+       pub struct Executable { .. }
+       impl Executable {
+           /// `code`, executable, and `data_len` zeroed writable bytes right after it (one
+           /// reservation, so the data is in PC-relative reach of the code).
+           pub fn new(code: &[u8], data_len: usize) -> Result<Executable, Error>;
+           pub fn code_address(&self) -> u64;
+           pub fn data_address(&self) -> u64;
+           pub fn data(&mut self) -> &mut [u8];
+       }
+
+   built on `sys::reserve` and a `sys` call that sets a range's protection, with the cache
+   maintenance shared with `View::publish` (one function, not a second loop).
+2. `crates/blaze-lazy/src/tests/exec.rs`: `Code` becomes a wrapper of
+   `blaze_inproc::exec::Executable::new(bytes, 0)` (or the tests call it directly); its `map`,
+   `seal` and `icache` are deleted, and `libc` leaves its `[target.'cfg(unix)'.dev-dependencies]`
+   if nothing else in the tests uses it.
+3. `crates/blaze-stencil/src/tests/exec.rs`: `Map::pair` and its `Drop` go; the test takes
+   `blaze-inproc.workspace = true` under `[dev-dependencies]`. Its fork-shared result page
+   (`MAP_SHARED | MAP_ANON`, line ~839) is a different thing (memory shared with a child, not
+   code) and stays.
+4. Tests: the copies' own tests move with them, plus a differential: run the same tiny function
+   (`mov w0/eax, 42; ret`) from `Executable` and from the old test-only mapping kept in the test
+   module as the reference.
+
+Status: open
+
+## dedup: blaze-hashcons' shard table onto `blaze_mem::swiss::Index`
+
+From `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/blaze-hashcons/src/table.rs`'s
+per-shard leveled open-addressed table (`TABLE`, `TABLES`, `empty_table`, `Shard::{level,
+tables, table, probe, grow}`, `Key::{tag, home, entry}`) is a copy of `blaze_ids::Sharded`'s
+old table. Both now use one table, `blaze_mem::swiss::Index` (`crates/blaze-mem/src/swiss.rs`): a
+leveled SwissTable of `u32`s naming the caller's column, lock-free `find(hash, is)`, and
+`insert(len, hash, value, hash_of)` for the one writer (the caller's lock), growing at three
+quarters with the hash asked of the caller, so nothing per entry is stored but the `u32`.
+40-byte groups of 8: 6.7 to 13.3 bytes a value against 16 to 32 now, one control word a find.
+
+1. `crates/blaze-hashcons/Cargo.toml` `[dependencies]`: add `blaze-mem.workspace = true`.
+2. `table.rs` imports: `atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}` becomes
+   `atomic::{AtomicU32, Ordering}`; add `use blaze_mem::swiss::Index;`.
+3. Delete `const TABLE`, `const TABLES` (and their doc line), and `fn empty_table`.
+4. `struct Shard<T>`: delete `level` and `tables` (and docs); add
+```rust
+    /// The shard's nodes by their fingerprint's bits 64..128: a find is one control word and
+    /// one slot, then the node's fingerprint compared only on a tag match.
+    index: Index,
+```
+5. `struct Key`: `tag: u32, home: usize` become `hash: u64`; in `Key::of`, `tag: ...,` and
+   `home: ...,` become `hash: (bits >> 64) as u64,`; delete `fn entry`.
+6. `Shard::new`: `level: AtomicUsize::new(0), tables: std::array::from_fn(|_| OnceLock::new()),`
+   becomes `index: Index::new(),`, and the `if shard.tables[0].set(...)` block is deleted.
+7. Delete `Shard::table`, `Shard::probe` and `Shard::grow`; `Shard::find` becomes:
+```rust
+    /// The node whose fingerprint is `key`'s, taking no lock.
+    fn find(&self, key: &Key) -> Option<&Node<T>> {
+        let is = |local: u32| {
+            self.node(local).expect("an index entry before its node").content.fingerprint() == key.fingerprint
+        };
+        self.node(self.index.find(key.hash, is)?)
+    }
+```
+8. `HashCons::intern_content`, after `let held = shard.lock.lock();`:
+```rust
+        if let Some(node) = shard.find(&key) {
+            drop(held);
+            return matched(node, &content, value);
+        }
+        let node = self.append(shard, &key, content, value);
+        drop(held);
+        Interned { node }
+```
+9. `HashCons::append`: drop the `level: usize` parameter (doc: "Called with the shard locked
+   and `key` absent from its index."); after `let node = nodes[at].get().expect("a node just set");`
+   the `let level = match ...`, `let table = ...`, `let Err(empty) = ...` and `table[empty].store(...)`
+   lines become:
+```rust
+        let hash_of = |local: u32| {
+            (shard.node(local).expect("an index entry before its node").content.fingerprint().0 >> 64) as u64
+        };
+        shard.index.insert(local as usize, key.hash, local, hash_of);
+```
+   (`shard.len.store(local + 1, Ordering::Release);` and `node` stay).
+10. Module doc bullets 2 and 3 become: "The fingerprint picks the shard (its bits 0..32) and
+   is the node's hash in the shard's `blaze_mem::swiss::Index` (bits 64..128: the probe's start
+   and tag)." and "A full index is copied into one twice its size under the lock and published
+   with one release store. The tables it outgrew stay until the interner is dropped (a reader
+   may still be probing one), so they cost at most what the last one does."
+
+The tests (`tables_grow_and_keep_every_value` and the rest) touch no internals and stay.
+
+---
+## fastcompile-stencil-x64 1: fastcompile-stencil-patch, codegen: x64's `Unwind::Windows` info is final, not Cranelift's raw `UNWIND_INFO` (`crates/blaze-stencil/src/code.rs` `Unwind::Windows`, the v2 consumer in `crates/hir-ty-codegen`)
+
+What: document `code::Unwind::Windows { info }` as "the `UNWIND_INFO` as the dev path's
+`unwind/seh.rs` `with_saves` leaves it: ready for `.xdata`", and when codegen turns a stencil
+`Code` into a `blaze_codegen::Unwind::Windows`, take `info` as-is (don't run `with_saves` on it
+again: a second pass re-indexes the saves and adds a second allocation code).
+
+Why: the x64 glue (`arch/x64.rs` `unwind`, `arch/x64/frame.rs` `win_raw` then `with_saves`)
+first writes Cranelift's exact `UNWIND_INFO` bytes (checked against
+`winx64::UnwindInfo::emit` in `arch/x64/tests.rs`), then corrects them the way the dev path
+corrects Cranelift's, so a stencil function and a Cranelift one end up with the same `.xdata`.
+Nothing reads the variant outside blaze-stencil yet (`rg 'Unwind::Windows'`), so this is a
+doc line now and a rule for whoever writes the consumer.
+
+> done by fastcompile-stencil-patch: `code::Unwind::Windows` is documented as final (after
+> `with_saves`, ready for `.xdata`, take as-is). The consumer rule is codegen's.
+
+Status: done for blaze-stencil; open for codegen's consumer
+
+## dedup: bits: blaze-stencil `check_index`'s `seen` and `size`'s `codes` onto `blaze_ids::bits`
+
+From `dedup-bits-codegen` (report `/tmp/blaze-lanes/v2-dedup-bits-codegen.md`; parent
+`dedup-bits`). Two hand-written bit sets become the one family in
+`crates/blaze-ids/src/bits.rs`. Same members and results, nothing persisted or hashed.
+
+1. `crates/blaze-stencil/Cargo.toml`: `blaze-ids` moves from `[dev-dependencies]` to
+   `[dependencies]`, and joins `[build-dependencies]`, since `build.rs` compiles
+   `src/table/format.rs` with `#[path]` (`blaze-ids` depends on `blake3`, already a build
+   dependency here, `blaze-radix`, `serde`, `smallvec`, `thin-vec`; nothing of blaze-stencil's).
+
+   Before:
+
+       [dependencies]
+       blaze-codegen.workspace = true
+       cranelift-codegen.workspace = true
+       smallvec.workspace = true
+
+       [build-dependencies]
+       ...
+       # The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
+       blake3.workspace = true
+
+       [dev-dependencies]
+       ...
+       blaze-alloc-count.workspace = true
+       blaze-ids.workspace = true
+
+   after:
+
+       [dependencies]
+       blaze-codegen.workspace = true
+       blaze-ids.workspace = true
+       cranelift-codegen.workspace = true
+       smallvec.workspace = true
+
+       [build-dependencies]
+       ...
+       # The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
+       blake3.workspace = true
+       # `src/table/format.rs`'s sets, as the patcher reads them.
+       blaze-ids.workspace = true
+
+       [dev-dependencies]
+       ...
+       blaze-alloc-count.workspace = true
+
+2. `crates/blaze-stencil/src/table/format.rs`.
+
+   Module doc, before:
+
+       //! generator ([`Writer`]) and read in place by the patcher ([`Reader`]). Shared with the
+       //! generator (`build.rs` includes this file with `#[path]`); it uses nothing but `std`,
+       //! [`crate::shape`] and [`crate::enc`].
+
+   after:
+
+       //! generator ([`Writer`]) and read in place by the patcher ([`Reader`]). Shared with the
+       //! generator (`build.rs` includes this file with `#[path]`); it uses nothing but `std`,
+       //! `blaze_ids::bits`, [`crate::shape`] and [`crate::enc`].
+
+   Imports, before:
+
+       use std::fmt;
+
+       use crate::{enc::Form, shape::Shape};
+
+   after:
+
+       use std::fmt;
+
+       use blaze_ids::bits::BitSet;
+
+       use crate::{enc::Form, shape::Shape};
+
+   `Reader::check_index`, before:
+
+           let mut seen = vec![0u64; (self.counts.stencils as usize).div_ceil(64)];
+           ...
+               let word = &mut seen[stencil as usize / 64];
+               let bit = 1u64 << (stencil % 64);
+               if *word & bit != 0 {
+                   return Err(FormatError::Bounds("a stencil indexed twice"));
+               }
+               *word |= bit;
+               found += 1;
+
+   after (`stencil < self.counts.stencils` is checked just above, so `insert` is in range):
+
+           let mut seen: BitSet<u32> = BitSet::new(self.counts.stencils as usize);
+           ...
+               if !seen.insert(stencil) {
+                   return Err(FormatError::Bounds("a stencil indexed twice"));
+               }
+               found += 1;
+
+3. `crates/blaze-stencil/build.rs` doc, before:
+
+       //! The shape set, the hole forms and the library format are the crate's own files, included
+       //! here so the generator and the patcher read one definition. They use nothing but `std` and
+       //! each other.
+
+   after:
+
+       //! The shape set, the hole forms and the library format are the crate's own files, included
+       //! here so the generator and the patcher read one definition. They use nothing but `std`,
+       //! `blaze_ids::bits` and each other.
+
+4. `crates/blaze-stencil/src/patch/emit.rs` `size`: the trap codes met, a `u8` each
+   (`TrapCode::as_raw` is a `NonZeroU8`), stay 4 words inline.
+
+   Imports, before:
+
+       use cranelift_codegen::ir::{self, BlockArg};
+
+   after:
+
+       use blaze_ids::bits::BitArray;
+       use cranelift_codegen::ir::{self, BlockArg};
+
+   Before:
+
+           let mut codes = [0u64; 4];
+           let mut mark = |code: ir::TrapCode| {
+               let at = code.as_raw().get();
+               codes[usize::from(at / 64)] |= 1 << (at % 64);
+           };
+           ...
+           let stubs = codes.iter().map(|it| it.count_ones() as usize).sum::<usize>() + glue_stubs + 1;
+
+   after:
+
+           let mut codes = BitArray::<4, u8>::EMPTY;
+           let mut mark = |code: ir::TrapCode| {
+               codes.insert(code.as_raw().get());
+           };
+           ...
+           let stubs = codes.count() + glue_stubs + 1;
+
+## dedup: SelectError is blaze-usercode's (from dedup-scan)
+
+`crates/blaze-testsel/src/select.rs`'s `pub enum SelectError<E>` with its `From<Corrupt>` and
+`Display` impls is token-for-token `blaze-usercode/src/test/select.rs`'s, and testsel depends on
+usercode. Delete the enum and both impls (from `#[derive(Debug)] pub enum SelectError<E>` to the
+end of `impl<E: fmt::Display> fmt::Display for SelectError<E>`), and in the `use blaze_usercode::{…}`
+change `test::{Attrs, Input, Passes, select::keepable},` to
+`test::{Attrs, Input, Passes, select::{SelectError, keepable}},`. `pub use` it instead if
+testsel's callers name `blaze_testsel::select::SelectError` (`rg 'testsel::.*SelectError'`).
+`RecordError` stays (it has `Table`, usercode's has not).
+
+## dedup: blaze_codegen::content::kind_tag (from dedup-scan)
+
+`crates/blaze-premap/src/key.rs`'s `fn reloc_tag(kind: RelocKind) -> u8` is
+`blaze-codegen/src/content.rs`'s `kind_tag` arm for arm (0..=25). After codegen makes `kind_tag`
+`pub` (request in codegen.md), delete `reloc_tag` and at its use in the key hash change
+`.update(&[reloc_tag(*kind)])` to `.update(&[blaze_codegen::content::kind_tag(*kind)])`. The
+bytes hashed are the same, so no key changes; one table means a new `RelocKind` can't get two
+different tags.
+
+## dedup: blaze_codegen::unwind::FrameRule (from dedup-scan)
+
+`crates/blaze-stencil/src/code.rs`'s `pub enum Rule` is hir-ty-codegen's `FrameRule` (its doc
+says so) plus `RaSignState(bool)`. After codegen moves `FrameRule` with `RaSignState` into
+`blaze-codegen/src/unwind.rs` (codegen.md), replace the enum and its doc with
+`pub use blaze_codegen::unwind::FrameRule as Rule;`. Nothing else changes.
+

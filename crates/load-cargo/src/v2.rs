@@ -18,6 +18,8 @@
 //!   source root, so what it writes there is read by that package's crates and no other's.
 //! - **Build script runs** are applied by [`Lowered::ran`]; a proc macro's built expanders by
 //!   [`Lowered::macros`].
+//! - **Another view** of the same units is applied by [`Lowered::refresh`]: what it read from
+//!   the view read again and applied as a change, the database and its memos kept.
 //!
 //! The database is shared by reference, never cloned (docs/v2/plan/process/decisions.md): a
 //! task reads it through [`Lowered::db`] while it holds a shared reference to the
@@ -26,16 +28,15 @@
 #![forbid(unsafe_code)]
 
 mod crates;
-mod db;
 mod files;
 #[cfg(test)]
 mod tests;
 
-use std::{collections::HashMap, fmt};
+use std::{cell::Cell, collections::HashMap, fmt};
 
 use base_db::{
     AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
-    LocalRoots, SourceDatabase, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
+    LocalRoots, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
 use blaze_ids::{Hasher, radix};
 use blaze_units::{
@@ -50,8 +51,7 @@ use salsa::{Durability, Setter};
 use triomphe::Arc;
 use vfs::file_set::FileSetConfig;
 
-pub use base_db::ProcMacroLoadingError;
-pub use db::Db;
+pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 /// What [`lower`] lowers.
@@ -123,6 +123,23 @@ pub struct Lowered {
     paths: std::sync::Arc<HashMap<FileId, String>>,
     /// Each crate's identity worked out since the last write ([`Lowered::identity`]).
     identities: FxHashMap<Crate, ContentId>,
+    /// Each directory read into the front end, as [`Lowered::refresh`] reads it again.
+    loads: Vec<Load>,
+    /// The root of the view its files were read from.
+    view: ContentId,
+    /// The workspace's root as that view has it, which every crate is made with.
+    workspace_root: crates::Root,
+}
+
+/// A directory read into a package's source root.
+struct Load {
+    dir: String,
+    set: usize,
+    /// The paths under it that are another load's or the build's, not read.
+    skipped: Vec<String>,
+    built: Vec<AbsPathBuf>,
+    /// Whether what it read came from the view, not only from mounts of fixed roots.
+    view: bool,
 }
 
 /// What every task of a build reads and nothing writes once [`lower`] made it: each unit's
@@ -170,6 +187,13 @@ struct Applied {
     cfgs: Vec<CfgAtom>,
     env: Vec<(String, String)>,
     out_dir: String,
+}
+
+/// A build's database ([`Db::new`]) with the proc-macro input.
+fn build_db() -> Db {
+    let db = Db::new();
+    ProcMacros::init_default(&db, Durability::HIGH);
+    db
 }
 
 /// The crate graph, source roots and files of `lower.units` in a new database.
@@ -251,8 +275,8 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     let mut excluded: Vec<String> = excluded.into_iter().collect();
     excluded.sort_unstable();
 
-    let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files };
-    let mut db = Db::new();
+    let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
+    let mut db = build_db();
     for (index, &is_library) in library.iter().enumerate() {
         let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
@@ -273,20 +297,24 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);
 
     let mut loaded = Vec::new();
+    let mut read = Vec::with_capacity(loads.len());
     for (load, set) in &loads {
         let set = *set;
         // What is under another load, or written by the build, is not this one's.
-        let skipped: Vec<&String> = loads
+        let skipped: Vec<String> = loads
             .iter()
             .map(|(it, _)| it)
             .chain(excluded.iter())
             .filter(|it| *it != load && files::rest(it, load).is_some())
+            .cloned()
             .collect();
-        let skip = |path: &str| skipped.iter().any(|it| it.as_str() == path);
+        let skip = |path: &str| skipped.iter().any(|it| it == path);
         loaded.clear();
+        tree.read_view.set(false);
         tree.walk(load, &skip, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
         set_files(&mut db, load, &built, set, library.len(), &loaded)?;
+        read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get() });
     }
 
     let workspace_root = crates::root(units, &tree)?;
@@ -410,6 +438,9 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
         crates: std::sync::Arc::new(Crates { units: lowerings, sets: library.len() }),
         paths: std::sync::Arc::new(paths),
         identities: FxHashMap::default(),
+        loads: read,
+        view: root,
+        workspace_root,
     })
 }
 
@@ -424,8 +455,8 @@ impl Lowered {
         &self.crates
     }
 
-    /// The database, for a read through the shared reference a task holds: `&Db` is a
-    /// `hir::db::HirDatabase`, and every query a task asks runs with its own query stack.
+    /// The database, for a read through the shared reference a task holds: every front-end
+    /// query takes `&Db`, and each a task asks runs with its own query stack.
     pub fn db(&self) -> &Db {
         &self.db
     }
@@ -468,25 +499,14 @@ impl Lowered {
         let mut loaded = Vec::with_capacity(ran.files.len());
         for (path, bytes) in &ran.files {
             let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-            loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes: bytes.as_slice().into() });
+            let bytes = blaze_vfs::Bytes::from(std::sync::Arc::<[u8]>::from(bytes.as_slice()));
+            loaded.push(files::Loaded { path: format!("{out_dir}/{path}"), id, bytes });
         }
 
         self.identities.clear();
         let db = &mut self.db;
         let change = set_files(db, out_dir, &[], lowering.set, crates.sets, &loaded)?;
-        if !change.added.is_empty() || !change.removed.is_empty() {
-            // No task holds the map now, so this edits it in place.
-            let map = std::sync::Arc::make_mut(&mut self.paths);
-            for id in &change.removed {
-                map.remove(id);
-            }
-            let root = db.source_root(SourceRootId(lowering.set as u32)).source_root(&*db);
-            for id in &change.added {
-                if let Some(path) = root.path_for_file(id).and_then(VfsPath::as_path) {
-                    map.insert(*id, path.as_str().to_owned());
-                }
-            }
-        }
+        note(&mut self.paths, db, lowering.set, &change);
         for &dependent in &lowering.dependents {
             let Some(krate) = crates.units[dependent].krate else { continue };
             let runs = &mut self.applied[dependent];
@@ -510,6 +530,57 @@ impl Lowered {
             }
         }
         Ok(())
+    }
+
+    /// The front end moved to the view `lower` names, `lower`'s units and config being the
+    /// ones it was lowered from (the caller compares them): each directory whose files were
+    /// read from the view read again and applied as the change it is (O(its files), the
+    /// mounts' fixed roots not read again), so the database's memos stay and only what the
+    /// change reaches runs again. The runs and proc macros applied stay until applied again.
+    /// `Ok(false)`, nothing changed, when the view moves the workspace's root or what its
+    /// manifest sets, which every crate is made with: it is to be [`lower`]ed anew.
+    ///
+    /// A write, as [`Lowered::ran`] is.
+    pub fn refresh(&mut self, lower: Lower<'_>) -> Result<bool, LowerError> {
+        let Lower { units, config, files, root, .. } = lower;
+        if root == self.view {
+            return Ok(true);
+        }
+        let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files, read_view: Cell::new(false) };
+        if crates::root(units, &tree)? != self.workspace_root {
+            return Ok(false);
+        }
+        self.identities.clear();
+        let sets = self.crates.sets;
+        let mut loaded = Vec::new();
+        let mut removed = false;
+        for load in &mut self.loads {
+            if !load.view {
+                continue;
+            }
+            let skip = |path: &str| load.skipped.iter().any(|it| it == path);
+            loaded.clear();
+            tree.read_view.set(false);
+            tree.walk(&load.dir, &skip, &mut loaded)?;
+            load.view = tree.read_view.get();
+            let change = set_files(&mut self.db, &load.dir, &load.built, load.set, sets, &loaded)?;
+            removed |= !change.removed.is_empty();
+            note(&mut self.paths, &self.db, load.set, &change);
+        }
+        self.view = root;
+        if removed {
+            for lowering in &self.crates.units {
+                let Some(krate) = lowering.krate else { continue };
+                let file = krate.data(&self.db).root_file_id;
+                if !self.paths.contains_key(&file) {
+                    return Err(LowerError::at(
+                        "the root file of the crate is gone from its package's files",
+                        lowering.what.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// The front end's tables by owner and name: how many each holds and their bytes, as
@@ -610,6 +681,7 @@ fn identity_of(db: &Db, krate: Crate, known: &mut FxHashMap<Crate, ContentId>) -
 /// with how many it holds and their bytes (fields, salsa's metadata and what the fields hold
 /// on the heap), as salsa counts them. salsa measures only with the database exclusive.
 fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
+    // dyn: salsa's `memory_usage` is on `dyn Database`; a report, off any build's path
     let db: &mut dyn salsa::Database = db;
     let info = db.memory_usage();
     let row = |it: &salsa::IngredientInfo| {
@@ -619,6 +691,24 @@ fn tables(db: &mut Db) -> Vec<(&'static str, u64, u64)> {
     let mut rows: Vec<_> = info.structs.iter().map(row).collect();
     rows.extend(info.queries.values().map(row));
     rows
+}
+
+/// `change` of source root `set` made in `paths` too.
+fn note(paths: &mut std::sync::Arc<HashMap<FileId, String>>, db: &Db, set: usize, change: &ViewChange) {
+    if change.added.is_empty() && change.removed.is_empty() {
+        return;
+    }
+    // No task holds the map now, so this edits it in place.
+    let map = std::sync::Arc::make_mut(paths);
+    for id in &change.removed {
+        map.remove(id);
+    }
+    let root = db.source_root(SourceRootId(set as u32)).source_root(db);
+    for id in &change.added {
+        if let Some(path) = root.path_for_file(id).and_then(VfsPath::as_path) {
+            map.insert(*id, path.as_str().to_owned());
+        }
+    }
 }
 
 /// Every file of the source roots `0..=sets` by its absolute path.

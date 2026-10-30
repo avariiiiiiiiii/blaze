@@ -27,6 +27,7 @@ mod delims;
 mod early;
 
 pub use check_cfg::CheckCfg;
+pub(crate) use self::early::validation::pretty;
 
 use std::{collections::hash_map::Entry, ops::ControlFlow};
 
@@ -492,9 +493,10 @@ mod tests {
         let checked = crate::tests::checked(fixture);
         let db = &checked.db;
         hir::attach_db(db, || {
-            let sema = Semantics::new_dyn(db);
+            let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
-            let cx = Cx::new(&sema, krate, &checked.names);
+            let frame = crate::tests::frame();
+            let cx = Cx::new(&sema, krate, &checked.names, &frame);
             check(&cx, &Walk::of(&cx));
         });
     }

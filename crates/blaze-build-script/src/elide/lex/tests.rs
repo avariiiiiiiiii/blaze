@@ -1,6 +1,8 @@
 //! The lexical forms as rustc reads them (`rustc_lexer`'s tests and the Reference's chapter on
 //! tokens), and what this lexer refuses.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 
 fn kinds(source: &str) -> Vec<Kind> {
@@ -188,11 +190,9 @@ fn a_string_borrows_its_value_until_an_escape() {
 /// without `_`s, over seeded runs of digits and `_`s, short and past what a `u128` holds.
 #[test]
 fn an_integer_s_value_is_what_parse_gives() {
-    let mut state = 0xd1b5_4a32_d192_ed03u64;
+    let mut rng = SplitMix64::new(0xd1b5_4a32_d192_ed03);
     for _ in 0..20_000 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
+        let state = rng.next_u64();
         let len = 1 + (state % 45) as usize;
         let mut text = String::from(char::from(b'0' + (state >> 6) as u8 % 10));
         for at in 1..len {
@@ -210,11 +210,16 @@ fn an_integer_s_value_is_what_parse_gives() {
 
 #[test]
 fn normalization() {
-    assert_eq!(normalize("\u{feff}fn"), "fn");
-    assert_eq!(normalize("a\r\nb\r\n"), "a\nb\n");
-    assert_eq!(normalize("a\rb"), "a\rb", "a lone carriage return stays, and lex refuses it");
-    assert_eq!(normalize("x\u{feff}"), "x\u{feff}", "only a leading mark goes");
-    assert!(matches!(normalize("plain"), Cow::Borrowed(_)));
+    blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
+        assert_eq!(normalize("\u{feff}fn", frame), "fn");
+        assert_eq!(normalize("a\r\nb\r\n", frame), "a\nb\n");
+        assert_eq!(normalize("\r\r\n\r\n", frame), "\r\n\n", "as `str::replace` has it");
+        let lone = normalize("a\rb", frame);
+        assert_eq!(lone, "a\rb", "a lone carriage return stays, and lex refuses it");
+        assert_eq!(normalize("x\u{feff}", frame), "x\u{feff}", "only a leading mark goes");
+        let plain = "plain";
+        assert!(std::ptr::eq(normalize(plain, frame), plain), "borrowed when nothing changes");
+    });
 }
 
 /// A token as the reference lexer gives it, its string's value read from the source.
@@ -254,17 +259,11 @@ fn the_one_pass_lexer_lexes_as_the_old_one() {
         "\u{e9}", "\u{a0}", "b\"x\"", "\r", "\u{202e}", "\u{2020}", "x\"y", "\"\u{e9}\"",
         "'\t'", "`", "@",
     ];
-    let mut state = 0xbb67_ae85_84ca_a73bu64;
-    let mut next = |bound: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % bound as u64) as usize
-    };
+    let mut rng = SplitMix64::new(0xbb67_ae85_84ca_a73b);
     let (mut lexed, mut refused) = (0, 0);
     let mut pushed = String::new();
     for _ in 0..60_000 {
-        let source: String = (0..1 + next(8)).map(|_| pieces[next(pieces.len())]).collect();
+        let source: String = (0..1 + rng.index(8)).map(|_| pieces[rng.index(pieces.len())]).collect();
         let new = lex(&source);
         let old = reference::lex(&source);
         let new_as_old = new

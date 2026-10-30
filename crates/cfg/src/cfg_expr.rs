@@ -156,6 +156,55 @@ impl CfgExpr {
         }
     }
 
+    /// [`Self::parse_from_ast`] over a view of the predicate.
+    #[cfg(feature = "syntax")]
+    pub fn parse_from_view(ast: syntax::view::CfgPredicate<'_>) -> CfgExpr {
+        use intern::sym;
+        use syntax::view::{self as ast, AstToken};
+
+        match ast {
+            ast::CfgPredicate::CfgAtom(atom) => {
+                let atom = match atom.key() {
+                    Some(ast::CfgAtomKey::True) => CfgAtom::Flag(sym::true_),
+                    Some(ast::CfgAtomKey::False) => CfgAtom::Flag(sym::false_),
+                    Some(ast::CfgAtomKey::Ident(key)) => {
+                        let key = Symbol::intern(key.text());
+                        match atom.string_token().and_then(ast::String::cast) {
+                            Some(value) => match value.value() {
+                                Ok(value) => CfgAtom::KeyValue { key, value: Symbol::intern(&value) },
+                                Err(_) => return CfgExpr::Invalid,
+                            },
+                            None => CfgAtom::Flag(key),
+                        }
+                    }
+                    None => return CfgExpr::Invalid,
+                };
+                CfgExpr::Atom(atom)
+            }
+            ast::CfgPredicate::CfgComposite(composite) => {
+                let Some(keyword) = composite.keyword() else {
+                    return CfgExpr::Invalid;
+                };
+                match keyword.text() {
+                    "all" => CfgExpr::All(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_view).collect(),
+                    ),
+                    "any" => CfgExpr::Any(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_view).collect(),
+                    ),
+                    "not" => {
+                        let mut inner = composite.cfg_predicates();
+                        let (Some(inner), None) = (inner.next(), inner.next()) else {
+                            return CfgExpr::Invalid;
+                        };
+                        CfgExpr::Not(Box::new(CfgExpr::parse_from_view(inner)))
+                    }
+                    _ => CfgExpr::Invalid,
+                }
+            }
+        }
+    }
+
     /// Fold the cfg by querying all basic `Atom` and `KeyValue` predicates.
     pub fn fold(&self, query: &dyn Fn(&CfgAtom) -> bool) -> Option<bool> {
         match self {

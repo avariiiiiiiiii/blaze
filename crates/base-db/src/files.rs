@@ -27,13 +27,16 @@ use triomphe::Arc;
 use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
 
 use crate::{
-    Crate, FileSourceRootInput, FileText, IncludedFile, InputId, SourceDatabase, SourceRoot,
-    SourceRootId, SourceRootInput, content,
+    Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, SourceRoot, SourceRootId,
+    SourceRootInput, content,
     named::Named,
     reparse::Reparse,
     table::{Column, Log, Table, hash_of},
     view::ViewIndex,
 };
+
+/// The source roots a setter changed: one, or a few for a file several roots have.
+pub(crate) type Roots = SmallVec<[SourceRootId; 4]>;
 
 /// The inputs of a database's files and source roots. Shared by every handle of the database
 /// (`Arc<Files>`), so a reader on one handle may run while a setter runs on another.
@@ -91,15 +94,15 @@ pub(crate) struct Writer {
     /// The content IDs of each source root's files, from which its own is kept.
     pub(crate) root_contents: FxHashMap<SourceRootId, RootContent>,
     /// The source roots whose [`RootContent`] has each file.
-    pub(crate) in_roots: FxHashMap<FileId, SmallVec<[SourceRootId; 1]>>,
+    pub(crate) in_roots: ByFile<SmallVec<[SourceRootId; 1]>>,
     /// Every path a source root has named, with its file: a path keeps its file for good.
     pub(crate) by_path: FxHashMap<VfsPath, FileId>,
     /// The blaze-vfs content ID each file was last set from by [`Files::set_view_root`].
-    pub(crate) view_ids: FxHashMap<FileId, ContentId>,
+    pub(crate) view_ids: ByFile<ContentId>,
     /// Where [`Files::set_view_root`] starts looking for an unused file ID.
     pub(crate) next_file: u32,
     /// The index of each view base's paths that [`Files::set_view_root`] keeps.
-    pub(crate) views: FxHashMap<VfsPath, ViewIndex>,
+    pub(crate) views: FxHashMap<AbsPathBuf, ViewIndex>,
     /// `by_path` as queries read it, across source roots ([`crate::named`]).
     pub(crate) named: Named,
 }
@@ -107,7 +110,7 @@ pub(crate) struct Writer {
 impl Writer {
     /// The source roots that have `file`.
     pub(crate) fn roots_of(&self, file: FileId) -> &[SourceRootId] {
-        self.in_roots.get(&file).map_or(&[], |it| it.as_slice())
+        self.in_roots.get(file).map_or(&[], |it| it.as_slice())
     }
 
     /// Notes that a source root names `file` at `path`.
@@ -116,11 +119,13 @@ impl Writer {
             Some(&known) if known == file => {}
             Some(_) => {
                 // A path given another file: every view's index of paths is made again.
+                // clone: the one copy of a path, made when a source root first names it or moves it.
                 self.by_path.insert(path.clone(), file);
                 self.views.clear();
                 self.named.note(path, file);
             }
             None => {
+                // clone: the one copy of a path, made when a source root first names it or moves it.
                 self.by_path.insert(path.clone(), file);
                 for (base, index) in &mut self.views {
                     index.note(base, path, file);
@@ -128,6 +133,51 @@ impl Writer {
                 self.named.note(path, file);
             }
         }
+    }
+}
+
+/// A setter's value per file, by [`FileId::index`]: a direct index where a hash map took a hash
+/// and a probe. File IDs are dense, so it costs `size_of::<Option<T>>()` bytes per ID up to the
+/// largest one set (33 for a [`ContentId`]).
+pub(crate) struct ByFile<T>(Vec<Option<T>>);
+
+impl<T> Default for ByFile<T> {
+    fn default() -> ByFile<T> {
+        ByFile(Vec::new()) // alloc: none, an empty `Vec`.
+    }
+}
+
+impl<T> ByFile<T> {
+    #[inline]
+    pub(crate) fn get(&self, file: FileId) -> Option<&T> {
+        self.0.get(file.index() as usize)?.as_ref()
+    }
+
+    #[inline]
+    pub(crate) fn get_mut(&mut self, file: FileId) -> Option<&mut T> {
+        self.0.get_mut(file.index() as usize)?.as_mut()
+    }
+
+    pub(crate) fn contains_key(&self, file: FileId) -> bool {
+        self.get(file).is_some()
+    }
+
+    /// `file`'s place, the column grown to it.
+    pub(crate) fn slot(&mut self, file: FileId) -> &mut Option<T> {
+        let at = file.index() as usize;
+        if at >= self.0.len() {
+            // alloc: once per new largest file ID, amortized by `Vec`'s doubling.
+            self.0.resize_with(at + 1, || None);
+        }
+        &mut self.0[at]
+    }
+
+    pub(crate) fn insert(&mut self, file: FileId, value: T) {
+        *self.slot(file) = Some(value);
+    }
+
+    pub(crate) fn remove(&mut self, file: FileId) -> Option<T> {
+        self.0.get_mut(file.index() as usize)?.take()
     }
 }
 
@@ -176,13 +226,13 @@ impl Files {
         self.text.get(file_id.index()).is_some()
     }
 
-    pub fn set_file_text(&self, db: &mut dyn SourceDatabase, file_id: FileId, text: &str) {
+    pub fn set_file_text(&self, db: &mut Db, file_id: FileId, text: &str) {
         self.set_text(db, file_id, text, None);
     }
 
     pub fn set_file_text_with_durability(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         file_id: FileId,
         text: &str,
         durability: Durability,
@@ -194,7 +244,7 @@ impl Files {
     /// [`FileText::appended_root_module`]. Writes nothing if it is that already.
     pub fn set_appended_root_module(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         file_id: FileId,
         module: Option<&'static str>,
         durability: Durability,
@@ -207,7 +257,7 @@ impl Files {
         let content = FileText::content_of(input.text(&*db), module);
         input.set_appended_root_module_field(db).with_durability(durability).to(module);
         input.set_content_field(db).with_durability(durability).to(InputId(content));
-        let mut changed = Vec::new();
+        let mut changed = Roots::new();
         index_file(&mut writer, file_id, content, &mut changed);
         self.write_root_contents(&mut writer, db, &changed);
     }
@@ -215,18 +265,18 @@ impl Files {
     /// Sets a file's text from outside a view: what it was set from by a view is forgotten.
     fn set_text(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         file_id: FileId,
         text: &str,
         durability: Option<Durability>,
     ) {
         let mut writer = self.lock();
-        writer.view_ids.remove(&file_id);
+        writer.view_ids.remove(file_id);
         let appended = self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
         let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
         let content = FileText::content_of_file(file, appended);
         self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
-        let mut changed = Vec::new();
+        let mut changed = Roots::new();
         index_file(&mut writer, file_id, content, &mut changed);
         self.write_root_contents(&mut writer, db, &changed);
     }
@@ -249,7 +299,7 @@ impl Files {
     pub(crate) fn write_text(
         &self,
         writer: &mut Writer,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         file_id: FileId,
         text: Option<(&str, ContentId, ContentId)>,
         durability: Option<Durability>,
@@ -297,7 +347,7 @@ impl Files {
     }
 
     /// The content ID `file` has in a source root.
-    pub(crate) fn entry_content(&self, db: &dyn SourceDatabase, file: FileId) -> ContentId {
+    pub(crate) fn entry_content(&self, db: &Db, file: FileId) -> ContentId {
         match self.text.get(file.index()) {
             Some(input) => input.content(db),
             None => FileText::no_text(),
@@ -308,7 +358,7 @@ impl Files {
     pub(crate) fn write_root_contents(
         &self,
         writer: &mut Writer,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         roots: &[SourceRootId],
     ) {
         RootContent::refresh(&mut writer.root_contents, roots);
@@ -330,14 +380,14 @@ impl Files {
     fn index_root(
         &self,
         writer: &mut Writer,
-        db: &dyn SourceDatabase,
+        db: &Db,
         id: SourceRootId,
         root: &SourceRoot,
     ) -> RootContent {
         let old = writer.root_contents.remove(&id);
         if let Some(old) = &old {
             for file in old.keys.keys() {
-                if let Some(roots) = writer.in_roots.get_mut(file) {
+                if let Some(roots) = writer.in_roots.get_mut(*file) {
                     roots.retain(|it| *it != id);
                 }
             }
@@ -350,7 +400,7 @@ impl Files {
                 continue;
             }
             writer.note_path(path, file);
-            let roots = writer.in_roots.entry(file).or_default();
+            let roots = writer.in_roots.slot(file).get_or_insert_default();
             if !roots.contains(&id) {
                 roots.push(id);
             }
@@ -366,8 +416,9 @@ impl Files {
         // Held so that two of these don't each drop the other's change.
         let _writer = self.lock();
         let mut views: Vec<View> =
-            self.views_in_use().iter().filter(|it| it.base != base).cloned().collect();
+            self.views_in_use().iter().filter(|it| it.base != base).cloned().collect(); // alloc: setup: a new list of a few views, published once.
         if base != over {
+            // alloc: as above.
             views.push(View { base: base.to_owned(), over: over.to_owned(), built });
         }
         let raw = self.views.push(views.into_boxed_slice());
@@ -388,6 +439,7 @@ impl Files {
             .iter()
             .filter(|it| !it.built.iter().any(|built| path.starts_with(built)))
             .find_map(|it| Some(it.over.join(path.strip_prefix(&it.base).ok()?)));
+        // alloc: the edge: the path is handed to `std::fs::read` on a miss.
         over.unwrap_or_else(|| path.to_owned())
     }
 
@@ -397,7 +449,7 @@ impl Files {
     /// with no lock held; the first to finish is kept.
     pub fn included_file(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         path: &AbsPath,
         durability: Durability,
@@ -425,7 +477,7 @@ impl Files {
     /// `None` for one that could not be read. Sorted by path.
     pub fn included_by(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
     ) -> Vec<(AbsPathBuf, Option<std::sync::Arc<[u8]>>)> {
         let mut read: Vec<_> = self
@@ -434,9 +486,10 @@ impl Files {
             .filter(|(by, _)| *by == krate)
             .map(|&(_, at)| {
                 let included = self.included.get(at);
+                // clone: the edge: the list leaves base-db, read once per build (a path and a refcount each).
                 (included.path.clone(), included.file.bytes(db).clone())
             })
-            .collect();
+            .collect(); // alloc: the edge, as above.
         read.sort_by(|a, b| a.0.cmp(&b.0));
         read
     }
@@ -470,14 +523,16 @@ impl Files {
         let mut named: Vec<_> = self
             .sources_included_by
             .iter()
+            // clone: the edge: a sorted list for whoever loads included sources.
             .map(|&(krate, at)| (krate, self.included_sources.get(at).0.clone()))
-            .collect();
+            .collect(); // alloc: as above.
         named.sort();
         named
     }
 
     /// Sorted by path.
     pub fn included_sources(&self) -> Vec<(AbsPathBuf, SourceRootId)> {
+        // alloc: the edge, as above.
         let mut sources: Vec<_> = self.included_sources.iter().cloned().collect();
         sources.sort();
         sources
@@ -503,19 +558,20 @@ impl Files {
 
     /// Sorted.
     pub fn included_files(&self) -> Vec<AbsPathBuf> {
+        // alloc: the edge, as above.
         let mut paths: Vec<_> = self.included.iter().map(|it| it.path.clone()).collect();
         paths.sort();
         paths
     }
 
     /// Whether the file on disk is what was read of it.
-    pub fn included_is_read(&self, db: &dyn SourceDatabase, path: &AbsPath) -> bool {
+    pub fn included_is_read(&self, db: &Db, path: &AbsPath) -> bool {
         let Some(file) = self.find_included(path) else { return false };
         *file.bytes(db) == self.read_included(path)
     }
 
     /// Reads the file again, and says whether it changed.
-    pub fn reload_included_file(&self, db: &mut dyn SourceDatabase, path: &AbsPath) -> bool {
+    pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath) -> bool {
         let Some(file) = self.find_included(path) else { return false };
         let bytes = self.read_included(path);
         let changed = *file.bytes(&*db) != bytes;
@@ -543,7 +599,7 @@ impl Files {
 
     pub fn set_source_root_with_durability(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         source_root_id: SourceRootId,
         source_root: Arc<SourceRoot>,
         durability: Durability,
@@ -573,18 +629,19 @@ impl Files {
         writer.named.publish(db);
     }
 
-    pub fn file_source_root(&self, db: &dyn SourceDatabase, id: FileId) -> FileSourceRootInput {
+    pub fn file_source_root(&self, db: &Db, id: FileId) -> FileSourceRootInput {
         match self.file_source_roots.get(id.index()) {
             Some(file_source_root) => file_source_root,
             None => panic!(
                 "Unable to get `FileSourceRootInput` with `vfs::FileId` ({id:?}, path: {}); this is a bug",
                 self.path_for_file(db, id)
+                    // alloc: the panic's message.
                     .map_or_else(|| "<unknown>".to_owned(), |path| path.to_string()),
             ),
         }
     }
 
-    fn path_for_file(&self, db: &dyn SourceDatabase, id: FileId) -> Option<VfsPath> {
+    fn path_for_file(&self, db: &Db, id: FileId) -> Option<VfsPath> {
         self.source_roots
             .iter()
             .find_map(|(_, source_root)| source_root.source_root_ref(db).path_for_file(&id).cloned())
@@ -592,7 +649,7 @@ impl Files {
 
     pub fn set_file_source_root_with_durability(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         id: FileId,
         source_root_id: SourceRootId,
         durability: Durability,
@@ -605,7 +662,7 @@ impl Files {
     pub(crate) fn set_file_source_root_in(
         &self,
         _: &mut Writer,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         id: FileId,
         source_root_id: SourceRootId,
         durability: Durability,
@@ -627,8 +684,8 @@ impl Files {
         self.text.get(id.index()).is_some()
             || writer.parked.contains_key(&id)
             || self.file_source_roots.get(id.index()).is_some()
-            || writer.in_roots.contains_key(&id)
-            || writer.view_ids.contains_key(&id)
+            || writer.in_roots.contains_key(id)
+            || writer.view_ids.contains_key(id)
     }
 }
 
@@ -639,6 +696,7 @@ fn note_env(table: &Table<(Crate, Box<str>)>, krate: Crate, key: &str) {
 }
 
 fn env_list(table: &Table<(Crate, Box<str>)>) -> Vec<(Crate, String)> {
+    // alloc: the edge, as above.
     let mut list: Vec<_> = table.iter().map(|(krate, key)| (*krate, key.to_string())).collect();
     list.sort();
     list
@@ -650,9 +708,9 @@ pub(crate) fn index_file(
     writer: &mut Writer,
     file: FileId,
     content: ContentId,
-    changed: &mut Vec<SourceRootId>,
+    changed: &mut Roots,
 ) {
-    let Some(roots) = writer.in_roots.get(&file) else { return };
+    let Some(roots) = writer.in_roots.get(file) else { return };
     for &root in roots {
         let Some(index) = writer.root_contents.get_mut(&root) else { continue };
         if index.set(file, content) && !changed.contains(&root) {
@@ -684,7 +742,9 @@ impl RootContent {
         RootContent {
             is_library,
             keys: FxHashMap::default(),
+            // alloc: once per source root set (setup).
             buckets: vec![BTreeMap::new(); SourceRoot::BUCKETS],
+            // alloc: as above.
             hashes: vec![ContentId::default(); SourceRoot::BUCKETS],
             dirty: u64::MAX,
             content: ContentId::default(),
@@ -700,6 +760,7 @@ impl RootContent {
         old: Option<&RootContent>,
     ) -> RootContent {
         let mut buckets = Vec::with_capacity(files.len());
+        // alloc: per source root set (setup): the keys not in the old content.
         let mut hash = Vec::new();
         for (at, (file, key, _)) in files.iter().enumerate() {
             match old.and_then(|old| old.keys.get(file)) {
@@ -711,6 +772,7 @@ impl RootContent {
             }
         }
         if !hash.is_empty() {
+            // alloc: as above, one list for the batch.
             let keys: Vec<&[u8]> = hash.iter().map(|&at| files[at].1.as_slice()).collect();
             let hashes = ContentId::of_many(SourceRoot::PATH_DOMAIN, &keys);
             for (&at, path) in hash.iter().zip(&hashes) {
@@ -721,6 +783,7 @@ impl RootContent {
         content.keys.reserve(files.len());
         for ((file, key, id), bucket) in files.into_iter().zip(buckets) {
             let key = key.into_boxed_slice();
+            // clone: the bucket's copy of a key, per file of a root set (setup).
             content.buckets[bucket as usize].insert(key.clone(), id);
             content.keys.insert(file, (bucket, key));
         }
@@ -754,6 +817,7 @@ impl RootContent {
         if map.contains_key(&key) {
             self.keys.retain(|_, (at, known)| !(*at == bucket && **known == *key));
         }
+        // clone: the bucket's copy of a key, per file a root gains.
         map.insert(key.clone(), content);
         self.keys.insert(file, (bucket, key));
         self.dirty |= 1 << bucket;
@@ -794,8 +858,11 @@ impl RootContent {
     /// Brings each of `roots`' content IDs up to date: every bucket out of date in any of them
     /// hashed in one batch, then the roots in another.
     pub(crate) fn refresh(contents: &mut FxHashMap<SourceRootId, RootContent>, roots: &[SourceRootId]) {
+        // alloc: one batch per setter call, a constant per call: the dirty buckets, then the roots.
         let mut bytes = Vec::new();
+        // alloc: as above.
         let mut ranges: Vec<Range<usize>> = Vec::new();
+        // alloc: as above.
         let mut places = Vec::new();
         for root in roots {
             let Some(index) = contents.get(root) else { continue };
@@ -824,6 +891,7 @@ impl RootContent {
 
         bytes.clear();
         ranges.clear();
+        // alloc: as above.
         let mut refreshed = Vec::new();
         for root in roots {
             let Some(index) = contents.get_mut(root) else { continue };

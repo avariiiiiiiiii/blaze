@@ -197,10 +197,10 @@ fn let_init(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<ExprId> {
         let Expr::Block { statements, .. } = store.expr(expr) else { continue };
         for statement in statements {
             if let Statement::Let { pat, initializer, .. } = statement
-                && let Pat::Bind { id, .. } = store.pat(*pat)
+                && let Pat::Bind { id, .. } = store.pat(pat)
                 && id == binding
             {
-                return *initializer;
+                return initializer;
             }
         }
     }

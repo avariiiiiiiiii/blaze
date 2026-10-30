@@ -23,6 +23,37 @@ pub(crate) fn where_predicate(out: &mut String, pred: &ast::WherePred, edition: 
     Printer { out, edition }.where_predicate(pred);
 }
 
+/// rustc's `ty_to_string` of `ty`, appended to `out`.
+pub(crate) fn ty(out: &mut String, ty: &ast::Type, edition: Edition) {
+    Printer { out, edition }.ty(ty);
+}
+
+/// rustc's `bounds_to_string` of `list`: the bounds joined with ` + `, appended to `out`.
+pub(crate) fn bounds(out: &mut String, list: &ast::TypeBoundList, edition: Edition) {
+    Printer { out, edition }.type_bounds("", Some(list.clone()));
+}
+
+/// rustc's `print_generic_arg` of `arg` (`print_assoc_item_constraint` of a constraint),
+/// appended to `out`.
+pub(crate) fn generic_arg(out: &mut String, arg: &ast::GenericArg, edition: Edition) {
+    let mut printer = Printer { out, edition };
+    match arg {
+        ast::GenericArg::TypeArg(it) => printer.opt_ty(it.ty()),
+        ast::GenericArg::LifetimeArg(it) => {
+            if let Some(lifetime) = it.lifetime() {
+                printer.lifetime(&lifetime);
+            }
+        }
+        ast::GenericArg::ConstArg(it) => printer.const_arg(it),
+        ast::GenericArg::AssocTypeArg(it) => printer.assoc_item_constraint(it),
+    }
+}
+
+/// rustc's `expr_to_string` of the expressions a type holds, appended to `out`.
+pub(crate) fn expr(out: &mut String, expr: &ast::Expr, edition: Edition) {
+    Printer { out, edition }.expr(expr);
+}
+
 /// rustc's printing of an identifier written `text` (`Ident`'s `Display`): with `r#` when it is
 /// a keyword of `edition`, else without, however it is written.
 pub(crate) fn ident(text: &str, edition: Edition) -> String {

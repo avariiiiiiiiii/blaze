@@ -6,7 +6,7 @@
 
 use std::ops::Range;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use either::Either;
 use intern::{Symbol, sym};
 use itertools::Itertools;
@@ -18,7 +18,7 @@ use syntax_bridge::DocCommentDesugarMode;
 use tracing::debug;
 
 use crate::{
-    ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
+    BuiltinError, ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
     builtin::quote::{ToTokenTree, dollar_crate, group},
     hygiene::span_with_def_site_ctxt,
     name::{self, AsName, Name},
@@ -26,6 +26,7 @@ use crate::{
     tt,
 };
 use syntax::{
+    TextRange, TextSize,
     ast::{
         self, AstNode, FieldList, HasAttrs, HasGenericArgs, HasGenericParams, HasModuleItem,
         HasName, HasTypeBounds,
@@ -51,7 +52,7 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$trait),*];
 
-            pub fn expander(&self) -> fn(&dyn SourceDatabase, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> fn(&Db, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( BuiltinDeriveExpander::$trait => $expand, )*
                 }
@@ -83,7 +84,7 @@ macro_rules! register_builtin {
 impl BuiltinDeriveExpander {
     pub fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
@@ -102,7 +103,7 @@ impl BuiltinDeriveExpander {
 }
 
 /// Whether the derive is listed in a `#[derive_const(..)]`, whose impls are `const impl`s.
-fn from_derive_const(db: &dyn SourceDatabase, id: MacroCallId) -> bool {
+fn from_derive_const(db: &Db, id: MacroCallId) -> bool {
     let MacroCallKind::Derive { derive_macro_id, .. } = id.loc(db).kind else { return false };
     matches!(
         derive_macro_id.loc(db).def.kind,
@@ -506,7 +507,7 @@ impl BasicAdtInfo {
 
 // FIXME: This whole thing needs a refactor. Each derive requires its special values, and the result is a mess.
 fn parse_adt(
-    db: &dyn SourceDatabase,
+    db: &Db,
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
@@ -525,6 +526,7 @@ fn push_fields(
     Ok(match list {
         None => FieldsKind::Unit,
         Some(FieldList::RecordFieldList(it)) => {
+            fields.reserve(it.fields().count());
             for field in it.fields() {
                 let name = name_to_token(call_site, tm, field.name())?;
                 fields.push(tt::Ident { span: at_field(name.span), ..name });
@@ -532,6 +534,7 @@ fn push_fields(
             FieldsKind::Record
         }
         Some(FieldList::TupleFieldList(it)) => {
+            fields.reserve(it.fields().count());
             for (i, field) in it.fields().enumerate() {
                 let at = field
                     .ty()
@@ -556,8 +559,8 @@ fn parse_adt_from_syntax(
     tm: &span::SpanMap,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
-    let mut fields = Vec::new();
-    let mut variants = Vec::new();
+    let mut fields = Vec::new(); // alloc: the shape's field list, one per derive (each list reserved in `push_fields`)
+    let mut variants = Vec::new(); // alloc: the shape's variant list, one per derive
     // A struct's one variant takes its name, which is read last, as the errors are.
     let mut struct_fields = None;
     let (name, generic_param_list, where_clause, kind) = match &adt {
@@ -603,7 +606,7 @@ fn parse_adt_from_syntax(
         .iter()
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
-        .collect();
+        .collect(); // alloc: one tree per lifetime parameter; none without generics
     let mut param_names: SmallVec<[Name; 4]> = SmallVec::new();
     let param_types = generic_param_list
         .into_iter()
@@ -633,11 +636,11 @@ fn parse_adt_from_syntax(
             };
             AdtParam { name, const_ty, bounds }
         })
-        .collect();
+        .collect(); // alloc: one entry per type or const parameter; none without generics
 
     let where_clause = match where_clause {
-        Some(w) => w.predicates().map(|it| to_tt(it.syntax())).collect(),
-        None => Vec::new(),
+        Some(w) => w.predicates().map(|it| to_tt(it.syntax())).collect(), // alloc: one tree per where predicate
+        None => Vec::new(), // alloc: none, an empty `Vec`
     };
 
     // For a generic parameter `T`, when shorthand associated type `T::Assoc` appears in field
@@ -653,12 +656,12 @@ fn parse_adt_from_syntax(
     // we should not inspect `ast::PathType`s in parameter bounds and where clauses. A type
     // without type parameters has none, and its fields aren't walked.
     let associated_types = if param_names.is_empty() {
-        Vec::new()
+        Vec::new() // alloc: none, an empty `Vec`
     } else {
         let field_list = match adt {
-            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()),
-            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()),
-            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()),
+            ast::Adt::Enum(it) => it.variant_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Struct(it) => it.field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
+            ast::Adt::Union(it) => it.record_field_list().map(|list| list.syntax().clone()), // clone: a node handle, a non-atomic count
         };
         field_list
             .into_iter()
@@ -669,11 +672,11 @@ fn parse_adt_from_syntax(
                 param_names.contains(&name).then_some(p)
             })
             .map(|it| to_tt(it.syntax()))
-            .collect()
+            .collect() // alloc: one tree per `T::Assoc` path, only with type parameters
     };
     let name_token = name_to_token(call_site, tm, name)?;
     if let Some(kind) = struct_fields {
-        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) });
+        variants.push(Variant { name: name_token.clone(), kind, start: 0, end: len_u32(fields.len()) }); // clone: a copy (symbol and span)
     }
     let packed = adt.attrs().any(|attr| attr_words_have(&attr, "repr", &["r"], "packed"));
     Ok(BasicAdtInfo {
@@ -689,16 +692,16 @@ fn parse_adt_from_syntax(
 }
 
 fn to_adt_syntax(
-    db: &dyn SourceDatabase,
+    db: &Db,
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
-    let (parsed, tm) = crate::token_tree_to_syntax_node(db, tt, crate::ExpandTo::Items);
+    let (parsed, tm, _) = crate::token_tree_to_syntax_node(db, tt, crate::ExpandTo::Items);
     let macro_items = ast::MacroItems::cast(parsed.syntax_node())
         .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
     let item =
         macro_items.items().next().ok_or_else(|| ExpandError::other(call_site, "no item found"))?;
-    let adt = ast::Adt::cast(item.syntax().clone())
+    let adt = ast::Adt::cast(item.syntax().clone()) // clone: a node handle, a non-atomic count
         .ok_or_else(|| ExpandError::other(call_site, "expected struct, enum or union"))?;
     Ok((adt, tm))
 }
@@ -856,7 +859,7 @@ fn write_impl<P: ToTokenTree + Copy, X: ToTokenTree + Copy>(
 }
 
 fn copy_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -875,7 +878,7 @@ fn copy_derive(
 /// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
 /// macro in `core::marker`.
 fn const_param_ty_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -895,7 +898,7 @@ fn const_param_ty_derive(
 /// (`deriving/from.rs`): the impl keeps the struct's generics and bounds, and adds no bound of
 /// its own.
 fn from_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -907,20 +910,19 @@ fn from_expand(
 }
 
 fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandResult<tt::TopSubtree> {
+    // rustc's `DeriveFromWrongTarget` and `DeriveFromWrongFieldCount`, at the derive and the
+    // item's name.
+    let refuse = |message: &str| {
+        let name = adt.name().map(|it| span_map.span_at(it.syntax().text_range().start()));
+        let error = BuiltinError::derive(message)
+            .note("`#[derive(From)]` can only be used on structs with exactly one field")
+            .also_at(name.into_iter().collect::<Box<[_]>>());
+        ExpandResult::new(empty(span), error.at(span))
+    };
     let strukt = match adt {
         ast::Adt::Struct(it) => it,
-        ast::Adt::Enum(_) => {
-            return ExpandResult::new(
-                empty(span),
-                ExpandError::builtin_derive(span, "`#[derive(From)]` used on an enum"),
-            );
-        }
-        ast::Adt::Union(_) => {
-            return ExpandResult::new(
-                empty(span),
-                ExpandError::builtin_derive(span, "`#[derive(From)]` used on a union"),
-            );
-        }
+        ast::Adt::Enum(_) => return refuse("`#[derive(From)]` used on an enum"),
+        ast::Adt::Union(_) => return refuse("`#[derive(From)]` used on a union"),
     };
     let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
     match strukt.field_list() {
@@ -942,16 +944,8 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
         [None] => {
             return ExpandResult::new(empty(span), ExpandError::other(span, "missing field type"));
         }
-        fields => {
-            let count = if fields.is_empty() { "no fields" } else { "multiple fields" };
-            return ExpandResult::new(
-                empty(span),
-                ExpandError::builtin_derive(
-                    span,
-                    format!("`#[derive(From)]` used on a struct with {count}"),
-                ),
-            );
-        }
+        [] => return refuse("`#[derive(From)]` used on a struct with no fields"),
+        _ => return refuse("`#[derive(From)]` used on a struct with multiple fields"),
     };
     let info = match parse_adt_from_syntax(adt, span_map, span) {
         Ok(it) => it,
@@ -982,7 +976,7 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
 }
 
 fn reborrow_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -999,7 +993,7 @@ fn reborrow_derive(
 }
 
 fn coerce_shared_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1058,7 +1052,7 @@ fn expand_reborrow_marker_derive<P: ToTokenTree + Copy>(
             empty(span),
             ExpandError::builtin_derive(
                 span,
-                format!("`{trait_name}` can only be derived on `struct`s"),
+                format!("`{trait_name}` can only be derived on `struct`s"), // alloc: an error's message, on the error path
             ),
         );
     }
@@ -1070,7 +1064,7 @@ fn expand_reborrow_marker_derive<P: ToTokenTree + Copy>(
 }
 
 fn coerce_shared_target(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     strukt: &ast::Struct,
 ) -> Option<tt::TopSubtree> {
@@ -1097,10 +1091,10 @@ fn coerce_shared_target(
         remove,
         span,
         DocCommentDesugarMode::ProcMacro,
-        |_, _| (true, Vec::new()),
+        |_, _| (true, Vec::new()), // alloc: none, an empty `Vec`
     );
 
-    let (parse, _) = crate::token_tree_to_syntax_node(db, &target, crate::ExpandTo::Type);
+    let (parse, _, _) = crate::token_tree_to_syntax_node(db, &target, crate::ExpandTo::Type);
     if !parse.errors().is_empty() {
         return None;
     }
@@ -1109,7 +1103,7 @@ fn coerce_shared_target(
 }
 
 fn clone_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1117,7 +1111,7 @@ fn clone_expand(
 }
 
 fn clone_expand_with(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
     copy: bool,
@@ -1179,7 +1173,7 @@ fn clone_derive(
 }
 
 fn default_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1235,7 +1229,7 @@ fn default_derive(
 }
 
 fn debug_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1324,7 +1318,7 @@ fn debug_derive(
 }
 
 fn hash_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1378,7 +1372,7 @@ fn hash_derive(
 }
 
 fn eq_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1392,7 +1386,7 @@ fn eq_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResul
 }
 
 fn partial_eq_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1580,7 +1574,7 @@ fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdt
 }
 
 fn ord_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1601,7 +1595,7 @@ fn ord_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResu
 }
 
 fn partial_ord_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1653,23 +1647,51 @@ fn write_coerce_pointee_impls(
     })
 }
 
+/// rustc's `GenericParam::span` of a type parameter: its name, to the end of its default if it
+/// has one.
+fn type_param_span(param: &ast::TypeParam) -> Option<TextRange> {
+    let name = param.name()?.syntax().text_range();
+    Some(match param.default_type() {
+        Some(ty) => name.cover(ty.syntax().text_range()),
+        None => name,
+    })
+}
+
 fn coerce_pointee_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
-    let (adt, _span_map) = match to_adt_syntax(db, tt, span) {
+    let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
         Err(err) => {
             return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
         }
     };
+    // The editor's copy of the item starts at 0, the item in `span_map` where it was parsed.
+    let base = adt.syntax().text_range().start();
+    let span_of = |range: TextRange| {
+        let first = span_map.span_at(range.start() + base);
+        match range.end().checked_sub(TextSize::new(1)).filter(|_| !range.is_empty()) {
+            Some(last) => first.cover(span_map.span_at(last + base)),
+            None => first,
+        }
+    };
     let (editor, adt) = SyntaxEditor::with_ast_node(&adt);
     let make = editor.make();
+    let refuse = |error: BuiltinError, at: Span| {
+        ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), error.at(at))
+    };
+    // rustc's `CoercePointee` errors are E0802.
+    fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
+        BuiltinError::derive(message).code(802)
+    }
     let ast::Adt::Struct(strukt) = &adt else {
-        return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::builtin_derive(span, "`CoercePointee` can only be derived on `struct`s"),
+        return refuse(
+            pointee_error(
+                "`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`",
+            ),
+            span,
         );
     };
     let has_at_least_one_field = strukt
@@ -1680,31 +1702,11 @@ fn coerce_pointee_expand(
         })
         .unwrap_or(false);
     if !has_at_least_one_field {
-        return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::builtin_derive(
-                span,
+        return refuse(
+            pointee_error(
                 "`CoercePointee` can only be derived on `struct`s with at least one field",
             ),
-        );
-    }
-    let is_repr_transparent = strukt.attrs().any(|attr| {
-        attr.as_simple_call().is_some_and(|(name, tt)| {
-            name == "repr"
-                && tt.syntax().children_with_tokens().any(|it| {
-                    it.into_token().is_some_and(|it| {
-                        it.kind() == SyntaxKind::IDENT && it.text() == "transparent"
-                    })
-                })
-        })
-    });
-    if !is_repr_transparent {
-        return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::builtin_derive(
-                span,
-                "`CoercePointee` can only be derived on `struct`s with `#[repr(transparent)]`",
-            ),
+            span,
         );
     }
     let type_params = strukt
@@ -1718,17 +1720,16 @@ fn coerce_pointee_expand(
         })
         .collect_vec();
     if type_params.is_empty() {
-        return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-            ExpandError::builtin_derive(
-                span,
+        return refuse(
+            pointee_error(
                 "`CoercePointee` can only be derived on `struct`s that are generic over at least one type",
             ),
+            span,
         );
     }
     let (pointee_param, pointee_param_idx) = if type_params.len() == 1 {
         // Regardless of the only type param being designed as `#[pointee]` or not, we can just use it as such.
-        (type_params[0].clone(), 0)
+        (type_params[0].clone(), 0) // clone: `CoercePointee` only, rare: node handles and its edit's lists
     } else {
         let mut pointees = type_params.iter().cloned().enumerate().filter(|(_, param)| {
             param.attrs().any(|attr| {
@@ -1744,23 +1745,21 @@ fn coerce_pointee_expand(
         match (pointees.next(), pointees.next()) {
             (Some((pointee_idx, pointee)), None) => (pointee, pointee_idx),
             (None, _) => {
-                return ExpandResult::new(
-                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::builtin_derive(
-                        span,
+                return refuse(
+                    pointee_error(
                         "exactly one generic type parameter must be marked \
                                 as `#[pointee]` to derive `CoercePointee` traits",
                     ),
+                    span,
                 );
             }
-            (Some(_), Some(_)) => {
-                return ExpandResult::new(
-                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                    ExpandError::builtin_derive(
-                        span,
+            (Some((_, one)), Some(_)) => {
+                return refuse(
+                    pointee_error(
                         "only one type parameter can be marked as `#[pointee]` \
                                 when deriving `CoercePointee` traits",
                     ),
+                    type_param_span(&one).map_or(span, span_of),
                 );
             }
         }
@@ -1795,21 +1794,39 @@ fn coerce_pointee_expand(
             })
         }
         if !pointee_has_maybe_sized_bound {
-            return ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
-                ExpandError::builtin_derive(
-                    span,
-                    format!(
-                        "`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"
-                    ),
-                ),
+            return refuse(
+                // alloc: an error's message, on the error path
+                pointee_error(format!(
+                    "`derive(CoercePointee)` requires `{pointee_param_name}` to be marked `?Sized`"
+                )),
+                span_of(pointee_param_name.syntax().text_range()),
             );
         }
+    }
+    // rustc checks this of the impl the derive writes, in coherence
+    // (`visit_implementation_of_coerce_pointee_validity`): only once every check above passed.
+    let is_repr_transparent = strukt.attrs().any(|attr| {
+        attr.as_simple_call().is_some_and(|(name, tt)| {
+            name == "repr"
+                && tt.syntax().children_with_tokens().any(|it| {
+                    it.into_token().is_some_and(|it| {
+                        it.kind() == SyntaxKind::IDENT && it.text() == "transparent"
+                    })
+                })
+        })
+    });
+    if !is_repr_transparent {
+        return refuse(
+            pointee_error(
+                "`derive(CoercePointee)` is only applicable to `struct` with `repr(transparent)` layout",
+            ),
+            span,
+        );
     }
 
     const ADDED_PARAM: &str = "__S";
 
-    let mut new_predicates: Vec<ast::WherePred> = Vec::new();
+    let mut new_predicates: Vec<ast::WherePred> = Vec::new(); // clone: `CoercePointee` only, rare: node handles and its edit's lists
 
     {
         // # Rewrite generic parameter bounds
@@ -1841,7 +1858,7 @@ fn coerce_pointee_expand(
                 let is_pointee = param_name.text() == pointee_param_name.text();
                 let new_bounds = bounds.bounds().filter_map(|bound| {
                     let new_bound = substitute_type_bound(
-                        bound.clone(),
+                        bound.clone(), // clone: `CoercePointee` only, rare: node handles and its edit's lists
                         pointee_param_name.text(),
                         ADDED_PARAM,
                     );
@@ -1981,8 +1998,8 @@ fn coerce_pointee_expand(
 
     strukt.get_or_create_where_clause(&editor, new_predicates.into_iter());
     let edit = editor.finish();
-    let strukt = ast::Struct::cast(edit.new_root().clone()).unwrap();
-    let adt = ast::Adt::Struct(strukt.clone());
+    let strukt = ast::Struct::cast(edit.new_root().clone()).unwrap(); // clone: `CoercePointee` only, rare: node handles and its edit's lists
+    let adt = ast::Adt::Struct(strukt.clone()); // clone: `CoercePointee` only, rare: node handles and its edit's lists
 
     let mut span_map = span::SpanMap::empty();
     // One span for them all.
@@ -2041,7 +2058,7 @@ fn coerce_pointee_expand(
         }
 
         let edit = editor.finish();
-        Some(ast::TypeBound::cast(edit.new_root().clone()).unwrap())
+        Some(ast::TypeBound::cast(edit.new_root().clone()).unwrap()) // clone: `CoercePointee` only, rare: node handles and its edit's lists
     }
 
     fn substitute_where_pred(
@@ -2065,7 +2082,7 @@ fn coerce_pointee_expand(
         }
 
         let edit = editor.finish();
-        Some(ast::WherePred::cast(edit.new_root().clone()).unwrap())
+        Some(ast::WherePred::cast(edit.new_root().clone()).unwrap()) // clone: `CoercePointee` only, rare: node handles and its edit's lists
     }
 
     fn substitute_type_in_bound(

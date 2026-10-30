@@ -13,7 +13,7 @@
 
 use std::ops::ControlFlow;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use hir_expand::{ErasedAstId, InFile, name::Name};
 use intern::Symbol;
 use rustc_hash::FxHashSet;
@@ -37,14 +37,14 @@ use crate::{
 /// consts (named or not) and statics, the variants of its enums written with a discriminant,
 /// and the functions and consts of its traits and impls. A function or static of an `extern`
 /// block has none.
-pub fn scope_body_owners(db: &dyn SourceDatabase, scope: &ItemScope) -> Vec<DefWithBodyId> {
+pub fn scope_body_owners(db: &Db, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut owners = Vec::new();
     push_scope_body_owners(db, scope, &mut owners);
     owners
 }
 
 fn push_scope_body_owners(
-    db: &dyn SourceDatabase,
+    db: &Db,
     scope: &ItemScope,
     owners: &mut Vec<DefWithBodyId>,
 ) {
@@ -57,7 +57,7 @@ fn push_scope_body_owners(
 /// Calls `each` with the items of `scope` that have a body, in [`scope_body_owners`]' order,
 /// until it breaks.
 fn visit_scope_body_owners(
-    db: &dyn SourceDatabase,
+    db: &Db,
     scope: &ItemScope,
     mut each: impl FnMut(DefWithBodyId) -> ControlFlow<DefWithBodyId>,
 ) -> ControlFlow<DefWithBodyId> {
@@ -108,12 +108,12 @@ fn visit_assoc(
 }
 
 /// The items with a body declared in `module`, outside any body. Lowers no body.
-pub fn module_body_owners(db: &dyn SourceDatabase, module: ModuleId) -> Vec<DefWithBodyId> {
+pub fn module_body_owners(db: &Db, module: ModuleId) -> Vec<DefWithBodyId> {
     scope_body_owners(db, module.def_map(db).module(db, module).scope(db))
 }
 
 /// The items with a body declared in the modules of `krate`, outside any body. Lowers no body.
-pub fn crate_body_owners(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
+pub fn crate_body_owners(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
     let mut owners = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         push_scope_body_owners(db, module.scope(db), &mut owners);
@@ -132,7 +132,7 @@ pub struct BodyBlocks<'db> {
 }
 
 /// The blocks of the body of `owner` and what they declare, by lowering that body and no other.
-pub fn body_blocks(db: &dyn SourceDatabase, owner: DefWithBodyId) -> BodyBlocks<'_> {
+pub fn body_blocks(db: &Db, owner: DefWithBodyId) -> BodyBlocks<'_> {
     let blocks: Vec<_> = Body::of(db, owner).blocks(db).collect();
     let mut owners = Vec::new();
     for &(_, def_map) in &blocks {
@@ -146,7 +146,7 @@ pub fn body_blocks(db: &dyn SourceDatabase, owner: DefWithBodyId) -> BodyBlocks<
 /// Visits the bodies of `roots` that `lower` accepts and, in turn, those of the items their
 /// blocks declare, with their blocks; lowers no body `lower` refuses. A body is visited once.
 pub fn walk_bodies<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     roots: Vec<DefWithBodyId>,
     mut lower: impl FnMut(DefWithBodyId) -> bool,
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
@@ -166,7 +166,7 @@ pub fn walk_bodies<'db>(
 
 /// Every body of `krate`, those declared in bodies included, each lowered: for a crate that is
 /// checked fully. The order is the def map's, each body before those declared in it.
-pub fn every_body(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
+pub fn every_body(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
     let mut bodies = Vec::new();
     walk_bodies(db, crate_body_owners(db, krate), |_| true, |owner, _| bodies.push(owner));
     bodies
@@ -175,7 +175,7 @@ pub fn every_body(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
 /// The bodies of `krate` lowered to find the items in them that a build keeps whether or not
 /// anything reaches them ([`may_declare_roots`]), and those declared in them that may too: the
 /// only bodies of a dependency a build lowers before codegen reaches them. Lowers no other body.
-pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
+pub fn bodies_declaring_roots(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
     let mut bodies = Vec::new();
     walk_bodies_saying(db, krate, Look::Roots, |owner, _| bodies.push(owner));
     bodies
@@ -184,7 +184,7 @@ pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefW
 /// Visits the bodies of `krate` whose text may say what `look` looks for ([`Look::may_say`]),
 /// each with its blocks, and in turn those declared in them that may too. Lowers no other body.
 pub(crate) fn walk_bodies_saying<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     krate: Crate,
     look: Look,
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
@@ -215,7 +215,7 @@ pub(crate) fn walk_bodies_saying<'db>(
 /// the module the block is in; the one body lowered is that one's, to check that the block is
 /// in it. A block in an expression of a signature (an array length, a const argument, a
 /// field's default) is in no body.
-pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBodyId, String> {
+pub fn block_owner(db: &Db, block: BlockId) -> Result<DefWithBodyId, String> {
     let item = owning_item(db, block.ast_id(db))?;
     // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
     // `module` and `outer` are locals of this walk, only asked for their def maps, scopes and
@@ -247,7 +247,7 @@ pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBod
 }
 
 /// The item with a body that `owner` is, as its id.
-fn owner_ast_id(db: &dyn SourceDatabase, owner: DefWithBodyId) -> ErasedAstId {
+fn owner_ast_id(db: &Db, owner: DefWithBodyId) -> ErasedAstId {
     match owner {
         DefWithBodyId::FunctionId(it) => it.lookup(db).id.erase(),
         DefWithBodyId::ConstId(it) => it.lookup(db).id.erase(),
@@ -257,7 +257,7 @@ fn owner_ast_id(db: &dyn SourceDatabase, owner: DefWithBodyId) -> ErasedAstId {
 }
 
 fn owner_in_module(
-    db: &dyn SourceDatabase,
+    db: &Db,
     module: ModuleId,
     item: ErasedAstId,
 ) -> Option<DefWithBodyId> {
@@ -276,7 +276,7 @@ fn owner_in_module(
 /// an enum variant's discriminant. Inside a macro's expansion with no such item, the call is
 /// where the expansion is, and the search goes on from there in the file of the call.
 fn owning_item(
-    db: &dyn SourceDatabase,
+    db: &Db,
     block: AstId<ast::BlockExpr>,
 ) -> Result<ErasedAstId, String> {
     fn range<N: AstNode>(it: N) -> TextRange {
@@ -360,7 +360,7 @@ impl Look {
     }
 
     /// The names of the macros of `krate` and its dependencies that may write such an item.
-    fn macros(self, db: &dyn SourceDatabase, krate: Crate) -> &[Symbol] {
+    fn macros(self, db: &Db, krate: Crate) -> &[Symbol] {
         match self {
             Look::Roots => macros_declaring_roots(db, krate),
             Look::DiagnosticItems => macros_writing_diagnostic_items(db, krate),
@@ -372,7 +372,7 @@ impl Look {
     /// blocks around it (`local`) that may write one. Reads the body's syntax and lowers no body.
     fn may_say(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         local: &FxHashSet<SmolStr>,
     ) -> bool {
@@ -394,7 +394,7 @@ impl Look {
     /// given that those named in `declaring` may.
     fn macros_of_scope(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         scope: &ItemScope,
         declaring: &FxHashSet<SmolStr>,
     ) -> Vec<Symbol> {
@@ -408,7 +408,7 @@ impl Look {
 
     fn classify(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         name: Symbol,
         id: MacroId,
         found: &mut Vec<Symbol>,
@@ -426,7 +426,7 @@ impl Look {
 
     /// [`macros_declaring_roots`] and [`macros_writing_diagnostic_items`]: the macros of
     /// `krate` that may write such an item, with those of its dependencies.
-    fn crate_macros(self, db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
+    fn crate_macros(self, db: &Db, krate: Crate) -> Box<[Symbol]> {
         let mut known: FxHashSet<Symbol> = FxHashSet::default();
         for dep in &krate.data(db).dependencies {
             known.extend(self.macros(db, dep.crate_id).iter().cloned());
@@ -481,7 +481,7 @@ fn words(node: &SyntaxNode) -> Vec<Symbol> {
 }
 
 /// The expression of the body of `owner`, as it is written.
-fn body_syntax(db: &dyn SourceDatabase, owner: DefWithBodyId) -> Option<SyntaxNode> {
+fn body_syntax(db: &Db, owner: DefWithBodyId) -> Option<SyntaxNode> {
     match owner {
         DefWithBodyId::FunctionId(it) => {
             it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
@@ -503,7 +503,7 @@ fn body_syntax(db: &dyn SourceDatabase, owner: DefWithBodyId) -> Option<SyntaxNo
 /// crate it depends on that may write one ([`macros_declaring_roots`]). Reads the body's
 /// syntax, and lowers no body. A body of which this is false declares no such item, though it
 /// may declare others; those are reached through it.
-pub fn may_declare_roots(db: &dyn SourceDatabase, owner: DefWithBodyId) -> bool {
+pub fn may_declare_roots(db: &Db, owner: DefWithBodyId) -> bool {
     Look::Roots.may_say(db, owner, &FxHashSet::default())
 }
 
@@ -517,7 +517,7 @@ enum MacroText {
     Nothing,
 }
 
-fn macro_text(db: &dyn SourceDatabase, id: MacroId) -> MacroText {
+fn macro_text(db: &Db, id: MacroId) -> MacroText {
     let (expander, node) = match id {
         MacroId::ProcMacroId(_) => return MacroText::Anything,
         // The body only: the macro's own attributes are not in what it writes.
@@ -586,14 +586,14 @@ fn settle(
 /// name a module has one, so a macro of the same name costs a lowering and nothing else.
 /// Sorted. Reads def maps and macro definitions, no body.
 #[salsa::tracked(returns(deref))]
-pub fn macros_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
+pub fn macros_declaring_roots(db: &Db, krate: Crate) -> Box<[Symbol]> {
     Look::Roots.crate_macros(db, krate)
 }
 
 /// As [`macros_declaring_roots`], for the macros that may write an item with a diagnostic item
 /// (`#[rustc_diagnostic_item = ".."]`): what [`crate::diagnostic_item`] reads bodies for.
 #[salsa::tracked(returns(deref))]
-pub fn macros_writing_diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
+pub fn macros_writing_diagnostic_items(db: &Db, krate: Crate) -> Box<[Symbol]> {
     Look::DiagnosticItems.crate_macros(db, krate)
 }
 

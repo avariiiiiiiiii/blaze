@@ -1,3 +1,4 @@
+// alloc: proc macro, at expansion time once per annotated item; no query runs this
 use std::collections::HashSet;
 
 use quote::ToTokens;
@@ -9,6 +10,7 @@ pub struct Hygiene {
 impl Hygiene {
     pub fn from1(tokens: &proc_macro::TokenStream) -> Self {
         let mut user_tokens = HashSet::new();
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         push_idents1(tokens.clone(), &mut user_tokens);
         Self { user_tokens }
     }
@@ -26,6 +28,7 @@ fn push_idents1(input: proc_macro::TokenStream, user_tokens: &mut HashSet<String
             push_idents1(g.stream(), user_tokens);
         }
         proc_macro::TokenTree::Ident(ident) => {
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             user_tokens.insert(ident.to_string());
         }
         proc_macro::TokenTree::Punct(_) => (),
@@ -39,6 +42,7 @@ fn push_idents2(input: proc_macro2::TokenStream, user_tokens: &mut HashSet<Strin
             push_idents2(g.stream(), user_tokens);
         }
         proc_macro2::TokenTree::Ident(ident) => {
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             user_tokens.insert(ident.to_string());
         }
         proc_macro2::TokenTree::Punct(_) => (),
@@ -53,6 +57,7 @@ impl Hygiene {
     pub(crate) fn ident(&self, text: impl AsRef<str>) -> syn::Ident {
         // Make the default be `foo_` rather than `foo` -- this helps detect
         // cases where people wrote `foo` instead of `#foo` or `$foo` in the generated code.
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let mut buffer = format!("{}_", text.as_ref());
 
         while self.user_tokens.contains(&buffer) {
@@ -67,6 +72,7 @@ impl Hygiene {
     ///
     /// The identifier must be unique relative to the `scope` identifier.
     pub(crate) fn scoped_ident(&self, scope: &syn::Ident, text: &str) -> syn::Ident {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.ident(format!("{scope}_{text}"))
     }
 }

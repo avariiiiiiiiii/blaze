@@ -23,9 +23,16 @@
 //! crate's items: one of the items of its modules, impls and traits, one per body of the items
 //! of its blocks, its closures and its opaque types. A key it does not find names nothing that
 //! is still there.
+//!
+//! A crate's two indexes are its largest tables that live for the session, so each is a
+//! [`KeyIndex`] over a reserved region ([`RegionVec`], [`Tag::Other`]: an item's identity is no
+//! one subsystem's) that grows in place while the crate's items are walked, then is sorted once.
 
-use base_db::{Crate, CrateOrigin, LangCrateOrigin, TargetKind};
+use std::{fmt, mem};
+
+use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin, TargetKind};
 use blaze_ids::{ContentId, Hasher, radix};
+use blaze_mem::{Frame, MemError, RegionVec, Tag, frame, scratch};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId,
     GenericDefId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
@@ -73,7 +80,7 @@ pub enum Resolved {
 
 /// The key of a crate: its content, never its id (see the module doc).
 #[salsa::tracked]
-pub fn crate_key(db: &dyn HirDatabase, krate: Crate) -> ContentId {
+pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let extra = krate.extra_data(db);
     let mut h = Hasher::new(CRATE_DOMAIN);
@@ -108,29 +115,34 @@ pub fn crate_key(db: &dyn HirDatabase, krate: Crate) -> ContentId {
         TargetKind::BuildScript => h.update(&[5]),
         TargetKind::Other => h.update(&[6]),
     };
-    // Every atom's bytes in one buffer, sorted as byte strings.
-    let mut bytes = Vec::new();
-    let mut atoms: Vec<(usize, usize)> = Vec::new();
-    for atom in krate.cfg_options(db) {
-        let start = bytes.len();
-        match atom {
-            cfg::CfgAtom::Flag(name) => {
-                bytes.push(0);
-                frame(&mut bytes, name.as_str());
+    // Every atom's bytes in one buffer, sorted as byte strings; an atom is its start and end
+    // in the buffer, packed into a `u64`.
+    let range = |atom: u64| (atom >> 32) as usize..(atom as u32) as usize;
+    scratch::with_bytes(|bytes| {
+        scratch::with_u64s(|atoms| {
+            for atom in krate.cfg_options(db) {
+                let start = bytes.len();
+                match atom {
+                    cfg::CfgAtom::Flag(name) => {
+                        bytes.push(0);
+                        cfg_part(bytes, name.as_str());
+                    }
+                    cfg::CfgAtom::KeyValue { key, value } => {
+                        bytes.push(1);
+                        cfg_part(bytes, key.as_str());
+                        cfg_part(bytes, value.as_str());
+                    }
+                }
+                let end = u32::try_from(bytes.len()).expect("blaze-items: a crate's cfg under 4 GiB");
+                atoms.push(u64::from(start as u32) << 32 | u64::from(end));
             }
-            cfg::CfgAtom::KeyValue { key, value } => {
-                bytes.push(1);
-                frame(&mut bytes, key.as_str());
-                frame(&mut bytes, value.as_str());
+            atoms.sort_unstable_by(|&a, &b| bytes[range(a)].cmp(&bytes[range(b)]));
+            h.update(&(atoms.len() as u64).to_le_bytes());
+            for &atom in atoms.iter() {
+                h.part(&bytes[range(atom)]);
             }
-        }
-        atoms.push((start, bytes.len()));
-    }
-    atoms.sort_unstable_by(|a, b| bytes[a.0..a.1].cmp(&bytes[b.0..b.1]));
-    h.update(&(atoms.len() as u64).to_le_bytes());
-    for &(start, end) in &atoms {
-        h.part(&bytes[start..end]);
-    }
+        })
+    });
     h.finish()
 }
 
@@ -146,7 +158,7 @@ fn lang_tag(lang: LangCrateOrigin) -> u8 {
     }
 }
 
-fn frame(bytes: &mut Vec<u8>, part: &str) {
+fn cfg_part(bytes: &mut Vec<u8>, part: &str) {
     bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
     bytes.extend_from_slice(part.as_bytes());
 }
@@ -185,6 +197,18 @@ impl Bytes {
     }
 }
 
+/// One key's preimage written by `write` into the worker's byte buffer, and its hash: what
+/// `write` gives, and `ContentId::of(KEY_DOMAIN, preimage)`.
+fn hashed<R>(write: impl FnOnce(&mut Bytes) -> R) -> (R, ContentId) {
+    scratch::with_bytes(|buffer| {
+        let mut b = Bytes(mem::take(buffer));
+        let written = write(&mut b);
+        let hash = ContentId::of(KEY_DOMAIN, &b.0);
+        *buffer = b.0;
+        (written, hash)
+    })
+}
+
 /// The top bit of a key's byte 8: the key is of something inside a body (an item of a block,
 /// a block's module, a closure, an anonymous constant, an opaque type).
 const INNER: u8 = 0x80;
@@ -220,20 +244,24 @@ fn crate_prefix(krate: &ContentId) -> [u8; 8] {
 
 /// The preimages of many keys in one buffer, `ends[i]` where the `i`th ends, hashed in one
 /// batch: BLAKE3 over 16 inputs at a time with AVX-512, 4 with NEON, each exactly
-/// `ContentId::of(KEY_DOMAIN, it)`. One allocation per batch, not one per key.
+/// `ContentId::of(KEY_DOMAIN, it)`. The preimages and their ends are written into the worker's
+/// scratch buffers, so a warm batch allocates only its rows, which the query keeps.
 struct Batch<T> {
     rows: Vec<(T, ItemKey)>,
     bytes: Bytes,
     ends: Vec<u32>,
+    /// The scratch buffers `bytes` and `ends` were taken from, given back by [`Batch::finish`].
+    lent: (scratch::Lent<Vec<u8>>, scratch::Lent<Vec<u32>>),
 }
 
 impl<T: Copy + Ord> Batch<T> {
     fn with_capacity(count: usize) -> Batch<T> {
-        Batch {
-            rows: Vec::with_capacity(count),
-            bytes: Bytes(Vec::with_capacity(count * 96)),
-            ends: Vec::with_capacity(count),
-        }
+        let mut lent = (scratch::lend_bytes(), scratch::lend_u32s());
+        let mut bytes = mem::take(&mut *lent.0);
+        bytes.reserve(count * 96);
+        let mut ends = mem::take(&mut *lent.1);
+        ends.reserve(count);
+        Batch { rows: Vec::with_capacity(count), bytes: Bytes(bytes), ends, lent }
     }
 
     /// Adds `id`, whose preimage `write` appends and whose parent it returns.
@@ -245,16 +273,21 @@ impl<T: Copy + Ord> Batch<T> {
 
     /// The keys, sorted by id for [`find`].
     fn finish(self) -> Vec<(T, ItemKey)> {
-        let Batch { mut rows, bytes, ends } = self;
-        let mut inputs: Vec<&[u8]> = Vec::with_capacity(ends.len());
-        let mut start = 0;
-        for &end in &ends {
-            inputs.push(&bytes.0[start..end as usize]);
-            start = end as usize;
-        }
-        for ((_, parent), hash) in rows.iter_mut().zip(ContentId::of_many(KEY_DOMAIN, &inputs)) {
+        let Batch { mut rows, bytes, ends, mut lent } = self;
+        let hashes = frame::task(Tag::Other, |frame| {
+            let mut inputs: Vec<&[u8], &Frame> = Vec::with_capacity_in(ends.len(), frame);
+            let mut start = 0;
+            for &end in &ends {
+                inputs.push(&bytes.0[start..end as usize]);
+                start = end as usize;
+            }
+            ContentId::of_many(KEY_DOMAIN, &inputs)
+        });
+        for ((_, parent), hash) in rows.iter_mut().zip(hashes) {
             *parent = under(parent, false, hash);
         }
+        *lent.0 = bytes.0;
+        *lent.1 = ends;
         rows.sort_unstable_by_key(|&(id, _)| id);
         rows
     }
@@ -267,32 +300,39 @@ fn find<T: Copy + Ord>(keys: &[(T, ItemKey)], id: T) -> Option<ItemKey> {
 
 /// The key of a module: of its crate for a crate's root, of its block for a block's, else of
 /// its parent and its name.
-pub fn module_key(db: &dyn HirDatabase, module: ModuleId) -> ItemKey {
+pub fn module_key(db: &Db, module: ModuleId) -> ItemKey {
     module_key_in(db, module)
 }
 
 #[salsa::tracked]
-fn module_key_in<'db>(db: &'db dyn HirDatabase, module: ModuleIdLt<'db>) -> ItemKey {
-    let mut b = Bytes::default();
+fn module_key_in<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> ItemKey {
+    // Each parent's key is had before the preimage is written, so the recursion up to the
+    // crate's root holds no scratch buffer.
     match module.containing_module_inside_def_map(db) {
         Some(parent) => {
             let name = module.name(db);
             let parent = module_key_in(db, parent);
-            b.id(&parent.0).update(b"mod").opt(name.as_ref().map(|it| it.as_str()));
-            under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
+            let ((), hash) = hashed(|b| {
+                b.id(&parent.0).update(b"mod").opt(name.as_ref().map(|it| it.as_str()));
+            });
+            under(&parent, false, hash)
         }
         None => match module.block(db) {
             Some(block) => {
                 let ast = block.ast_id(db);
                 let parent = module_key_in(db, block.module(db));
-                b.id(&parent.0).update(b"block");
-                written(db, &mut b, ast.file_id, ast.value.erase());
-                under(&parent, true, ContentId::of(KEY_DOMAIN, &b.0))
+                let ((), hash) = hashed(|b| {
+                    b.id(&parent.0).update(b"block");
+                    written(db, b, ast.file_id, ast.value.erase());
+                });
+                under(&parent, true, hash)
             }
             None => {
                 let krate = crate_key(db, module.krate(db));
-                b.update(b"crate").id(&krate);
-                shaped(crate_prefix(&krate), false, ContentId::of(KEY_DOMAIN, &b.0))
+                let ((), hash) = hashed(|b| {
+                    b.update(b"crate").id(&krate);
+                });
+                shaped(crate_prefix(&krate), false, hash)
             }
         },
     }
@@ -300,12 +340,12 @@ fn module_key_in<'db>(db: &'db dyn HirDatabase, module: ModuleIdLt<'db>) -> Item
 
 /// Where a declaration is written: the file (an expansion named by its call) and the raw AST
 /// id in it.
-fn written(db: &dyn HirDatabase, b: &mut Bytes, file: HirFileId, ast: ErasedFileAstId) {
+fn written(db: &Db, b: &mut Bytes, file: HirFileId, ast: ErasedFileAstId) {
     file_key(db, b, file);
     b.update(&ast.into_raw().to_le_bytes());
 }
 
-fn file_key(db: &dyn HirDatabase, b: &mut Bytes, file: HirFileId) {
+fn file_key(db: &Db, b: &mut Bytes, file: HirFileId) {
     match file {
         HirFileId::FileId(_) => {
             b.update(&[0]);
@@ -328,7 +368,7 @@ fn file_key(db: &dyn HirDatabase, b: &mut Bytes, file: HirFileId) {
     }
 }
 
-fn container_key(db: &dyn HirDatabase, container: ItemContainerId) -> (ItemKey, &'static [u8]) {
+fn container_key(db: &Db, container: ItemContainerId) -> (ItemKey, &'static [u8]) {
     match container {
         ItemContainerId::ModuleId(it) => (module_key(db, it), b""),
         ItemContainerId::ImplId(it) => (item_key(db, ItemId::Impl(it)), b""),
@@ -346,7 +386,7 @@ enum Siblings {
     Trait(TraitId),
 }
 
-fn siblings_of_container(db: &dyn HirDatabase, container: ItemContainerId) -> Siblings {
+fn siblings_of_container(db: &Db, container: ItemContainerId) -> Siblings {
     match container {
         ItemContainerId::ModuleId(it) => Siblings::Module(it),
         ItemContainerId::ImplId(it) => Siblings::Impl(it),
@@ -355,7 +395,7 @@ fn siblings_of_container(db: &dyn HirDatabase, container: ItemContainerId) -> Si
     }
 }
 
-fn siblings(db: &dyn HirDatabase, id: ItemId) -> Siblings {
+fn siblings(db: &Db, id: ItemId) -> Siblings {
     match id {
         ItemId::Function(it) => siblings_of_container(db, it.lookup(db).container),
         ItemId::Const(it) => siblings_of_container(db, it.lookup(db).container),
@@ -367,7 +407,7 @@ fn siblings(db: &dyn HirDatabase, id: ItemId) -> Siblings {
 
 /// The key of an item (see the module doc), hashed in one batch with its siblings'.
 #[salsa::tracked]
-pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
+pub fn item_key(db: &Db, id: ItemId) -> ItemKey {
     let batch = match siblings(db, id) {
         Siblings::Module(it) => module_item_keys(db, it),
         Siblings::Impl(it) => impl_item_keys(db, it),
@@ -382,20 +422,20 @@ pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
 }
 
 /// An item's key hashed by itself, which the batch gives bit for bit.
-pub(crate) fn item_key_alone(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
-    let mut b = Bytes::default();
-    let parent = item_preimage(db, id, &mut b);
-    under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
+pub(crate) fn item_key_alone(db: &Db, id: ItemId) -> ItemKey {
+    let (parent, hash) = hashed(|b| item_preimage(db, id, b));
+    under(&parent, false, hash)
 }
 
 /// The keys of the items a module's scope declares, sorted by id: 40 bytes per item, found by
 /// binary search.
 #[salsa::tracked(returns(ref))]
 fn module_item_keys<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     module: ModuleIdLt<'db>,
 ) -> Vec<(ItemId, ItemKey)> {
     let scope = module.def_map(db).module(db, module).scope(db);
+    // alloc: the memo's own list, its length known only once the scope is walked.
     let mut ids = Vec::new();
     for def in scope.declarations() {
         match def {
@@ -428,7 +468,7 @@ fn module_item_keys<'db>(
 }
 
 #[salsa::tracked(returns(ref))]
-fn impl_item_keys(db: &dyn HirDatabase, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
+fn impl_item_keys(db: &Db, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
     let items = &impl_.impl_items(db).items;
     let mut batch = Batch::with_capacity(items.len());
     for &(_, it) in items.iter() {
@@ -438,7 +478,7 @@ fn impl_item_keys(db: &dyn HirDatabase, impl_: ImplId) -> Vec<(ItemId, ItemKey)>
 }
 
 #[salsa::tracked(returns(ref))]
-fn trait_item_keys(db: &dyn HirDatabase, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
+fn trait_item_keys(db: &Db, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
     let items = &trait_.trait_items(db).items;
     let mut batch = Batch::with_capacity(items.len());
     for &(_, it) in items.iter() {
@@ -449,7 +489,7 @@ fn trait_item_keys(db: &dyn HirDatabase, trait_: TraitId) -> Vec<(ItemId, ItemKe
 
 /// Appends the bytes an item's key is the hash of to `b`: its parent's key, its kind, its name
 /// (the interned symbol's bytes, read in place) and where it is written. Gives the parent.
-fn item_preimage(db: &dyn HirDatabase, id: ItemId, b: &mut Bytes) -> ItemKey {
+fn item_preimage(db: &Db, id: ItemId, b: &mut Bytes) -> ItemKey {
     fn head(b: &mut Bytes, parent: ItemKey, prefix: &[u8], tag: &[u8], name: Option<&str>) {
         b.id(&parent.0).part(prefix).part(tag).opt(name);
     }
@@ -537,26 +577,25 @@ fn item_preimage(db: &dyn HirDatabase, id: ItemId, b: &mut Bytes) -> ItemKey {
 }
 
 /// The key of an enum variant: its enum's and its name.
-pub fn variant_key(db: &dyn HirDatabase, variant: EnumVariantId) -> ItemKey {
+pub fn variant_key(db: &Db, variant: EnumVariantId) -> ItemKey {
     let loc = variant.lookup(db);
     match find(enum_variant_keys(db, loc.parent), variant) {
         Some(key) => key,
         None => {
-            let mut b = Bytes::default();
-            let parent = variant_preimage(db, loc.parent, &loc.name, &mut b);
-            under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
+            let (parent, hash) = hashed(|b| variant_preimage(db, loc.parent, &loc.name, b));
+            under(&parent, false, hash)
         }
     }
 }
 
-fn variant_preimage(db: &dyn HirDatabase, parent: EnumId, name: &Name, b: &mut Bytes) -> ItemKey {
+fn variant_preimage(db: &Db, parent: EnumId, name: &Name, b: &mut Bytes) -> ItemKey {
     let parent = item_key(db, ItemId::Adt(parent.into()));
     b.id(&parent.0).part(b"variant").part(name.as_str().as_bytes());
     parent
 }
 
 #[salsa::tracked(returns(ref))]
-fn enum_variant_keys(db: &dyn HirDatabase, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
+fn enum_variant_keys(db: &Db, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
     let variants = &enum_.enum_variants(db).variants;
     let mut batch = Batch::with_capacity(variants.len());
     for (name, &(variant, _)) in variants.iter() {
@@ -565,7 +604,7 @@ fn enum_variant_keys(db: &dyn HirDatabase, enum_: EnumId) -> Vec<(EnumVariantId,
     batch.finish()
 }
 
-fn variant_id_key(db: &dyn HirDatabase, variant: VariantId) -> ItemKey {
+fn variant_id_key(db: &Db, variant: VariantId) -> ItemKey {
     match variant {
         VariantId::EnumVariantId(it) => variant_key(db, it),
         VariantId::StructId(it) => item_key(db, ItemId::Adt(it.into())),
@@ -586,7 +625,7 @@ pub(crate) fn generic_def_item(def: GenericDefId) -> ItemId {
 }
 
 /// The key of an expression store: of a signature, a body or the fields of a variant.
-pub fn store_key(db: &dyn HirDatabase, store: ExpressionStoreOwnerId) -> ItemKey {
+pub fn store_key(db: &Db, store: ExpressionStoreOwnerId) -> ItemKey {
     let (parent, tag): (_, &[u8]) = match store {
         ExpressionStoreOwnerId::Signature(def) => (item_key(db, generic_def_item(def)), b"signature"),
         ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(it)) => {
@@ -602,7 +641,7 @@ pub fn store_key(db: &dyn HirDatabase, store: ExpressionStoreOwnerId) -> ItemKey
 
 /// The key of an anonymous constant (an array length, a const argument): its store's and its
 /// root expression's index there.
-pub fn anon_const_key<'db>(db: &'db dyn HirDatabase, anon: AnonConstId<'db>) -> ItemKey {
+pub fn anon_const_key<'db>(db: &'db Db, anon: AnonConstId<'db>) -> ItemKey {
     let loc = anon.loc(db);
     let parent = store_key(db, loc.owner);
     let mut h = Hasher::new(KEY_DOMAIN);
@@ -611,7 +650,7 @@ pub fn anon_const_key<'db>(db: &'db dyn HirDatabase, anon: AnonConstId<'db>) -> 
 }
 
 fn closure_key_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     store: ExpressionStoreOwnerId,
     tag: &'static [u8],
     nth: u32,
@@ -622,24 +661,24 @@ fn closure_key_of(
     under(&parent, true, h.finish())
 }
 
-fn store_of<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> ExpressionStoreOwnerId {
+fn store_of<'db>(db: &'db Db, owner: InferBodyId<'db>) -> ExpressionStoreOwnerId {
     owner.expression_store_owner(db)
 }
 
 /// The key of a closure: its store's and its place among the store's closures (an edit before
 /// it in the body keeps it, as [`ClosureKey`] does).
-pub fn closure_key<'db>(db: &'db dyn HirDatabase, closure: InternedClosureId<'db>) -> ItemKey {
+pub fn closure_key<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> ItemKey {
     let loc = closure.loc(db);
     closure_key_of(db, store_of(db, loc.owner), b"closure", ClosureKey::nth(db, loc))
 }
 
-pub fn coroutine_key<'db>(db: &'db dyn HirDatabase, coroutine: InternedCoroutineId<'db>) -> ItemKey {
+pub fn coroutine_key<'db>(db: &'db Db, coroutine: InternedCoroutineId<'db>) -> ItemKey {
     let loc = coroutine.loc(db);
     closure_key_of(db, store_of(db, loc.owner), b"coroutine", ClosureKey::nth(db, loc))
 }
 
 pub fn coroutine_closure_key<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedCoroutineClosureId<'db>,
 ) -> ItemKey {
     let loc = closure.loc(db);
@@ -648,14 +687,14 @@ pub fn coroutine_closure_key<'db>(
 
 /// The key of the `index`th opaque type of `owner`: a function's return type or a type
 /// alias's type.
-pub fn opaque_key(db: &dyn HirDatabase, owner: ItemId, index: u32) -> ItemKey {
+pub fn opaque_key(db: &Db, owner: ItemId, index: u32) -> ItemKey {
     let parent = item_key(db, owner);
     let mut h = Hasher::new(KEY_DOMAIN);
     h.id(&parent.0).part(b"opaque").update(&index.to_le_bytes());
     under(&parent, true, h.finish())
 }
 
-fn opaque_of<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
+fn opaque_of<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
     match opaque.loc(db) {
         ImplTraitId::ReturnTypeImplTrait(f, index) => {
             (ItemId::Function(f), index.into_raw().into_u32())
@@ -666,13 +705,13 @@ fn opaque_of<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> 
     }
 }
 
-pub fn opaque_ty_key<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> ItemKey {
+pub fn opaque_ty_key<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> ItemKey {
     let (owner, index) = opaque_of(db, opaque);
     opaque_key(db, owner, index)
 }
 
 /// The key of an impl a built-in derive writes: its type's, the trait and which derive.
-pub fn builtin_derive_key(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> ItemKey {
+pub fn builtin_derive_key(db: &Db, id: BuiltinDeriveImplId) -> ItemKey {
     let loc = id.loc(db);
     let parent = item_key(db, ItemId::Adt(loc.adt));
     let mut h = Hasher::new(KEY_DOMAIN);
@@ -685,7 +724,7 @@ pub fn builtin_derive_key(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> Item
 }
 
 /// The key of anything the solver names by a `SolverDefId`.
-pub fn def_key<'db>(db: &'db dyn HirDatabase, def: SolverDefId<'db>) -> ItemKey {
+pub fn def_key<'db>(db: &'db Db, def: SolverDefId<'db>) -> ItemKey {
     match def {
         SolverDefId::AdtId(it) => item_key(db, ItemId::Adt(it)),
         SolverDefId::ConstId(it) => item_key(db, ItemId::Const(it)),
@@ -719,7 +758,7 @@ pub fn name_hash(name: &str) -> NameHash {
 
 /// A simplified self type ([`crate::ImplIndexKey`]), with its def named by key.
 pub fn simplified<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: &hir_ty::next_solver::SimplifiedType<'db>,
 ) -> SimplifiedType {
     use rustc_type_ir::fast_reject::SimplifiedType as S;
@@ -755,7 +794,8 @@ pub fn simplified<'db>(
 /// The path of an item as the program sees it (`type_name`, `module_path!`, a symbol's
 /// demangled name): its crate's name, its modules, a `{block}` for each block it is in, and
 /// its name; an impl's item under `<impl>`.
-pub fn path(db: &dyn HirDatabase, id: ItemId) -> String {
+pub fn path(db: &Db, id: ItemId) -> String {
+    // alloc: the caller keeps the path (a message, a symbol's name): the edge.
     let mut out = String::new();
     path_segments(db, id, &mut |it| out.push_str(it));
     out
@@ -763,7 +803,7 @@ pub fn path(db: &dyn HirDatabase, id: ItemId) -> String {
 
 /// What `h.part(path(db, id).as_bytes())` gives a hasher, with no string built: `write` gets
 /// the length as 8 little-endian bytes, then the path's bytes a segment at a time.
-pub(crate) fn path_part(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&[u8])) {
+pub(crate) fn path_part(db: &Db, id: ItemId, write: &mut impl FnMut(&[u8])) {
     let mut len = 0u64;
     path_segments(db, id, &mut |it| len += it.len() as u64);
     write(&len.to_le_bytes());
@@ -771,7 +811,7 @@ pub(crate) fn path_part(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut
 }
 
 /// [`path`] a segment at a time, each an interned symbol's bytes read in place.
-fn path_segments(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str)) {
+fn path_segments(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
     let (module, container) = match id {
         ItemId::Function(it) => assoc_container(db, it.lookup(db).container),
         ItemId::Const(it) => assoc_container(db, it.lookup(db).container),
@@ -797,7 +837,7 @@ fn path_segments(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str))
 
 /// The module an associated item's path goes through, and its trait or impl if it has one.
 fn assoc_container(
-    db: &dyn HirDatabase,
+    db: &Db,
     container: ItemContainerId,
 ) -> (ModuleId, Option<ItemContainerId>) {
     match container {
@@ -809,7 +849,7 @@ fn assoc_container(
 }
 
 fn module_path<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     module: ModuleIdLt<'db>,
     write: &mut impl FnMut(&str),
 ) {
@@ -830,7 +870,7 @@ fn module_path<'db>(
 }
 
 /// Writes an item's name, `_` for one without.
-fn item_name(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str)) {
+fn item_name(db: &Db, id: ItemId, write: &mut impl FnMut(&str)) {
     fn macro_name(name: Option<syntax::ast::Name>, write: &mut impl FnMut(&str)) {
         write(name.as_ref().map_or("_", |it| it.text()))
     }
@@ -858,7 +898,7 @@ fn item_name(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str)) {
 }
 
 impl ItemId {
-    pub fn module(self, db: &dyn HirDatabase) -> ModuleId {
+    pub fn module(self, db: &Db) -> ModuleId {
         match self {
             ItemId::Function(it) => it.module(db),
             ItemId::Adt(it) => it.module(db),
@@ -873,16 +913,129 @@ impl ItemId {
 }
 
 /// The item of the current database a key names, if one still has it (see the module doc).
-pub fn resolve(db: &dyn HirDatabase, key: ItemKey) -> Option<Resolved> {
+pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
     let krates = crates_by_prefix(db);
     let prefix = u64::from_le_bytes(key.crate_prefix());
     let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
     let krate = krates[at].1;
-    let items = if key.is_inner() { crate_inner_items(db, krate) } else { crate_items(db, krate) };
-    items.index.get(&key).copied()
+    let index =
+        if key.is_inner() { crate_inner_items(db, krate) } else { &crate_items(db, krate).index };
+    index.get(&key)
 }
 
-type Index = std::collections::HashMap<ItemKey, Resolved, KeyHashing>;
+/// The most keys one crate's index holds: address space only, committed as the index grows.
+/// A crate past it stops with [`MemError::Exhausted`] naming the index.
+pub(crate) const MAX_KEYS: usize = 1 << 24;
+
+/// A key and what it names in one index.
+pub(crate) type Row<V> = (ItemKey, V);
+
+/// Keys and what each names, sorted by [`order`] then key, and a directory of `2^bits + 1`
+/// row starts by the top `bits` of the order: the rows of order `o` are in
+/// `starts[o >> (64 - bits)]..starts[(o >> (64 - bits)) + 1]`. Past its crate's 9 bits a key is
+/// BLAKE3's output, so with a bucket per row a run holds one row on average and a lookup reads
+/// one directory word and one row: two cache misses, no hashing, no probing.
+///
+/// The rows grow in place in a reserved region while the crate is walked; the directory is
+/// sized once from the row count, one allocation per index.
+pub(crate) struct KeyIndex<V: Copy> {
+    rows: RegionVec<Row<V>>,
+    starts: Box<[u32]>,
+    bits: u32,
+}
+
+/// The 64 bits of a key a directory is over: bytes 8..16 without the inner bit, big-endian so
+/// they order as the key's bytes do.
+fn order(key: &ItemKey) -> u64 {
+    let word: [u8; 8] = *key.0.0[8..16].first_chunk().expect("a key is 32 bytes");
+    u64::from_be_bytes(word) << 1
+}
+
+fn bucket(order: u64, bits: u32) -> usize {
+    if bits == 0 { 0 } else { (order >> (64 - bits)) as usize }
+}
+
+/// Stops with `error`: an index that cannot have its memory stops the build, naming it.
+#[cold]
+#[track_caller]
+fn stop(what: &str, error: MemError) -> ! {
+    panic!("blaze-items: {what}: {error}")
+}
+
+/// An empty column of an index's rows, `MAX_KEYS` of them reserved.
+#[track_caller]
+pub(crate) fn key_rows<T>(what: &str) -> RegionVec<T> {
+    RegionVec::new(MAX_KEYS, Tag::Other).unwrap_or_else(|error| stop(what, error))
+}
+
+/// Sorts `rows` by order then key and drops repeats in place, returning how many are left.
+/// A key twice must name one thing.
+#[track_caller]
+pub(crate) fn sort_distinct<V: Copy + PartialEq + fmt::Debug>(rows: &mut [Row<V>]) -> usize {
+    rows.sort_unstable_by_key(|&(key, _)| (order(&key), key));
+    let mut kept = 0;
+    for at in 0..rows.len() {
+        let (key, resolved) = rows[at];
+        if kept > 0 && rows[kept - 1].0 == key {
+            let old = rows[kept - 1].1;
+            assert_eq!(
+                old, resolved,
+                "blaze-items: two items with one key {key:?}: {old:?} and {resolved:?}"
+            );
+            continue;
+        }
+        rows[kept] = (key, resolved);
+        kept += 1;
+    }
+    kept
+}
+
+impl<V: Copy + PartialEq + fmt::Debug> KeyIndex<V> {
+    /// The index of `rows`, in any order and with repeats.
+    #[track_caller]
+    pub(crate) fn new(mut rows: RegionVec<Row<V>>) -> KeyIndex<V> {
+        let kept = sort_distinct(&mut rows);
+        rows.truncate(kept);
+        rows.shrink_to(kept);
+        let len = u32::try_from(kept).expect("blaze-items: an index of fewer than 2^32 keys");
+        let bits = kept.next_power_of_two().trailing_zeros();
+        let buckets = 1usize << bits;
+        let mut starts = Vec::with_capacity(buckets + 1);
+        let mut row = 0;
+        for at in 0..buckets {
+            while row < kept && bucket(order(&rows[row].0), bits) < at {
+                row += 1;
+            }
+            starts.push(row as u32);
+        }
+        starts.push(len);
+        KeyIndex { rows, starts: starts.into_boxed_slice(), bits }
+    }
+
+    pub(crate) fn get(&self, key: &ItemKey) -> Option<V> {
+        let at = bucket(order(key), self.bits);
+        let run = self.starts[at] as usize..self.starts[at + 1] as usize;
+        self.rows[run].iter().find(|(it, _)| it == key).map(|&(_, value)| value)
+    }
+
+    pub(crate) fn rows(&self) -> &[Row<V>] {
+        &self.rows
+    }
+}
+
+impl<V: Copy + PartialEq> PartialEq for KeyIndex<V> {
+    fn eq(&self, other: &KeyIndex<V>) -> bool {
+        self.rows[..] == other.rows[..]
+    }
+}
+
+impl<V: Copy + Eq> Eq for KeyIndex<V> {}
+
+impl<V: Copy + fmt::Debug> fmt::Debug for KeyIndex<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.rows.iter().map(|(key, value)| (key, value))).finish()
+    }
+}
 
 /// Hashing for maps keyed by a key, which is a BLAKE3 hash already: its words are folded into
 /// the map's hash, which was computed once with the key and is carried, not hashed again.
@@ -926,10 +1079,11 @@ impl std::hash::Hasher for KeyHasher {
 /// Every crate of the build by the first 8 bytes of its key, sorted. Stops if two crates have
 /// one: an item of one would be taken for the other's.
 #[salsa::tracked(returns(ref))]
-fn crates_by_prefix(db: &dyn HirDatabase) -> Vec<(u64, Crate)> {
+fn crates_by_prefix(db: &Db) -> Vec<(u64, Crate)> {
     let mut krates: Vec<(u64, Crate)> = base_db::all_crates(db)
         .iter()
         .map(|&krate| (u64::from_le_bytes(crate_prefix(&crate_key(db, krate))), krate))
+        // alloc: the memo's list, one per build, at its final length.
         .collect();
     radix::sort_copy_by_key(&mut krates, |&(prefix, _)| prefix);
     for pair in krates.windows(2) {
@@ -947,26 +1101,27 @@ fn crates_by_prefix(db: &dyn HirDatabase) -> Vec<(u64, Crate)> {
 }
 
 /// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.
-pub(crate) fn crate_item_ids(db: &dyn HirDatabase, krate: Crate) -> Vec<ItemId> {
-    [crate_items(db, krate), crate_inner_items(db, krate)]
-        .into_iter()
-        .flat_map(|items| items.index.values())
-        .filter_map(|it| match *it {
-            Resolved::Item(id) => Some(id),
-            _ => None,
-        })
-        .collect()
+pub(crate) fn crate_item_ids(db: &Db, krate: Crate) -> impl Iterator<Item = ItemId> + '_ {
+    let outer = crate_items(db, krate).index.rows();
+    let inner = crate_inner_items(db, krate).rows();
+    outer.iter().chain(inner).filter_map(|&(_, it)| match it {
+        Resolved::Item(id) => Some(id),
+        _ => None,
+    })
 }
 
 /// What has a key inside a crate's stores and items' types, in one index: a key that is no
 /// module, impl or trait item is one lookup, not one per store of every crate.
 #[salsa::tracked(returns(ref))]
-fn crate_inner_items(db: &dyn HirDatabase, krate: Crate) -> Items {
-    let mut items = Items::default();
-    for &inner in &crate_items(db, krate).inner {
-        items.merge(inner_items(db, inner, ()));
+fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
+    const WHAT: &str = "a crate's index of keys inside bodies";
+    let mut rows = key_rows(WHAT);
+    for &inner in crate_items(db, krate).inner.iter() {
+        if let Err(error) = rows.try_extend_from_slice(inner_items(db, inner, ())) {
+            stop(WHAT, error)
+        }
     }
-    items
+    KeyIndex::new(rows)
 }
 
 /// Where else an item has things with keys: a store, with its closures and the items of its
@@ -977,43 +1132,94 @@ enum Inner {
     Opaques(ItemId),
 }
 
-#[derive(PartialEq, Eq, Debug, Default)]
+/// A crate's index of its modules', impls' and traits' items, and every store and item type
+/// in it to look inside.
+#[derive(Debug)]
 struct Items {
-    index: Index,
-    inner: Vec<Inner>,
+    index: KeyIndex<Resolved>,
+    inner: RegionVec<Inner>,
 }
 
-impl Items {
+impl PartialEq for Items {
+    fn eq(&self, other: &Items) -> bool {
+        self.index == other.index && self.inner[..] == other.inner[..]
+    }
+}
+
+impl Eq for Items {}
+
+/// Where [`def_map_items`] puts what it finds: keys with what they name, and where else to look.
+trait Sink {
+    fn add(&mut self, key: ItemKey, resolved: Resolved);
+    fn inner(&mut self, inner: Inner);
+}
+
+/// A crate's rows while its modules are walked, growing in place in reserved regions.
+struct CrateRows {
+    rows: RegionVec<Row<Resolved>>,
+    inner: RegionVec<Inner>,
+}
+
+const CRATE_KEYS: &str = "a crate's index of keys";
+const CRATE_STORES: &str = "a crate's list of stores";
+
+impl Sink for CrateRows {
     fn add(&mut self, key: ItemKey, resolved: Resolved) {
-        if let Some(old) = self.index.insert(key, resolved) {
-            assert_eq!(
-                old, resolved,
-                "blaze-items: two items with one key {key:?}: {old:?} and {resolved:?}"
-            );
+        if let Err(error) = self.rows.try_push((key, resolved)) {
+            stop(CRATE_KEYS, error)
         }
     }
 
-    fn merge(&mut self, other: &Items) {
-        for (&key, &resolved) in &other.index {
-            self.add(key, resolved);
+    fn inner(&mut self, inner: Inner) {
+        if let Err(error) = self.inner.try_push(inner) {
+            stop(CRATE_STORES, error)
         }
+    }
+}
+
+/// One store's rows, in its task's frame.
+struct FrameRows<'f> {
+    rows: Vec<Row<Resolved>, &'f Frame>,
+    inner: Vec<Inner, &'f Frame>,
+}
+
+impl<'f> FrameRows<'f> {
+    fn new(frame: &'f Frame) -> FrameRows<'f> {
+        FrameRows { rows: Vec::new_in(frame), inner: Vec::new_in(frame) }
+    }
+}
+
+impl Sink for FrameRows<'_> {
+    fn add(&mut self, key: ItemKey, resolved: Resolved) {
+        self.rows.push((key, resolved));
+    }
+
+    fn inner(&mut self, inner: Inner) {
+        self.inner.push(inner);
     }
 }
 
 /// The items of a crate's modules, impls and traits, and where to look for the rest.
 #[salsa::tracked(returns(ref))]
-fn crate_items(db: &dyn HirDatabase, krate: Crate) -> Items {
-    let mut items = Items::default();
-    def_map_items(db, hir_def::nameres::crate_def_map(db, krate), &mut items);
-    items
+fn crate_items(db: &Db, krate: Crate) -> Items {
+    let mut rows = CrateRows { rows: key_rows(CRATE_KEYS), inner: key_rows(CRATE_STORES) };
+    def_map_items(db, hir_def::nameres::crate_def_map(db, krate), &mut rows);
+    let CrateRows { rows, mut inner } = rows;
+    let stores = inner.len();
+    inner.shrink_to(stores);
+    Items { index: KeyIndex::new(rows), inner }
 }
 
-/// What has a key inside one store or one item's type, transitively: the items of a block
-/// have stores of their own.
+/// What has a key inside one store or one item's type, transitively (the items of a block
+/// have stores of their own), sorted by [`order`] and distinct.
 // The unit makes the arguments something salsa interns: `Inner` is no salsa struct.
 #[salsa::tracked(returns(ref))]
-fn inner_items(db: &dyn HirDatabase, inner: Inner, _: ()) -> Items {
-    let mut items = Items::default();
+fn inner_items(db: &Db, inner: Inner, _: ()) -> Box<[Row<Resolved>]> {
+    frame::task(Tag::Other, |frame| inner_rows(db, inner, frame))
+}
+
+fn inner_rows(db: &Db, inner: Inner, frame: &Frame) -> Box<[Row<Resolved>]> {
+    let mut items = FrameRows::new(frame);
     match inner {
         Inner::Opaques(owner) => {
             let count = match owner {
@@ -1046,21 +1252,22 @@ fn inner_items(db: &dyn HirDatabase, inner: Inner, _: ()) -> Items {
                 }
                 nth += 1;
             }
-            let mut blocks = Items::default();
+            let mut blocks = FrameRows::new(frame);
             for (_, block) in exprs.blocks(db) {
                 def_map_items(db, block, &mut blocks);
             }
-            for &inner in &blocks.inner {
-                items.merge(inner_items(db, inner, ()));
+            for &inner in blocks.inner.iter() {
+                items.rows.extend_from_slice(inner_items(db, inner, ()));
             }
-            items.merge(&blocks);
+            items.rows.extend_from_slice(&blocks.rows);
         }
     }
-    items
+    let kept = sort_distinct(&mut items.rows);
+    Box::from(&items.rows[..kept])
 }
 
 /// The items of a def map's modules, and where to look inside them.
-fn def_map_items(db: &dyn HirDatabase, def_map: &DefMap, items: &mut Items) {
+fn def_map_items(db: &Db, def_map: &DefMap, items: &mut impl Sink) {
     for (module, data) in def_map.modules(db) {
         items.add(module_key(db, module), Resolved::Module(module));
         let scope = data.scope(db);
@@ -1106,28 +1313,28 @@ fn def_map_items(db: &dyn HirDatabase, def_map: &DefMap, items: &mut Items) {
 }
 
 /// An item, its enum's variants, and where to look inside it.
-fn item(db: &dyn HirDatabase, id: ItemId, items: &mut Items) {
+fn item(db: &Db, id: ItemId, items: &mut impl Sink) {
     items.add(item_key(db, id), Resolved::Item(id));
     if let Some(def) = id.generic_def() {
-        items.inner.push(Inner::Store(ExpressionStoreOwnerId::Signature(def)));
+        items.inner(Inner::Store(ExpressionStoreOwnerId::Signature(def)));
     }
     if let Some(body) = id.body() {
-        items.inner.push(Inner::Store(ExpressionStoreOwnerId::Body(body)));
+        items.inner(Inner::Store(ExpressionStoreOwnerId::Body(body)));
     }
     match id {
-        ItemId::Function(_) | ItemId::Alias(_) => items.inner.push(Inner::Opaques(id)),
+        ItemId::Function(_) | ItemId::Alias(_) => items.inner(Inner::Opaques(id)),
         ItemId::Adt(AdtId::EnumId(it)) => {
             for (_, &(variant, _)) in &it.enum_variants(db).variants {
                 items.add(variant_key(db, variant), Resolved::Variant(variant));
-                items.inner.push(Inner::Store(ExpressionStoreOwnerId::Body(variant.into())));
-                items.inner.push(Inner::Store(ExpressionStoreOwnerId::VariantFields(variant.into())));
+                items.inner(Inner::Store(ExpressionStoreOwnerId::Body(variant.into())));
+                items.inner(Inner::Store(ExpressionStoreOwnerId::VariantFields(variant.into())));
             }
         }
         ItemId::Adt(AdtId::StructId(it)) => {
-            items.inner.push(Inner::Store(ExpressionStoreOwnerId::VariantFields(it.into())))
+            items.inner(Inner::Store(ExpressionStoreOwnerId::VariantFields(it.into())))
         }
         ItemId::Adt(AdtId::UnionId(it)) => {
-            items.inner.push(Inner::Store(ExpressionStoreOwnerId::VariantFields(it.into())))
+            items.inner(Inner::Store(ExpressionStoreOwnerId::VariantFields(it.into())))
         }
         _ => {}
     }

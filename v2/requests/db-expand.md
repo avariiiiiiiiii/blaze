@@ -464,3 +464,903 @@ impl<T: Code> Code for triomphe::Arc<T> {
   makes a `Box` today and an `Arc` after this.
 
 A clone is then one reference count. The bytes `persist` writes do not change.
+
+> forwarded to db (db-expand; window `db-next2`, told by tmux).
+
+## db-expand-inputs2: `Parse::reparse_onto` and `WeakParse` for base-db's reparse on an edit (format, crates/syntax/src/lib.rs)
+
+What: two additions to `crates/syntax/src/lib.rs`, used by `crates/base-db/src/reparse.rs`
+(db's decision D8: base-db finds the edit once in `Files::set_text` and keeps each text's parse
+weakly in a per-file slot). base-db does not compile without them.
+
+1. Beside `reparse_to` (`:266`), on `impl Parse<SourceFile>`:
+
+```rust
+/// The parse of `text`, which is this parse's text with `delete` replaced by the bytes of
+/// `text` at `delete.start()`: the edit parsed again as [`Parse::reparse`] parses one, and the
+/// tree shares `text`. The same parse a whole parse of `text` makes.
+pub fn reparse_onto(&self, delete: TextRange, text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+    let tree = self.tree.as_ref().unwrap().flat();
+    let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
+    match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, self.outline) {
+        Some((tree, errors, _reparsed)) => {
+            Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, self.outline)
+        }
+        None => match self.outline {
+            Some(_) => SourceFile::parse_outline(text, edition),
+            None => SourceFile::parse_shared(text, edition),
+        },
+    }
+}
+```
+
+   `reparse_to` can then be its unchanged-text check, `parsing::edit_between`, and a call to
+   `reparse_onto`.
+
+2. A weak handle on a parse, exported from the crate root:
+
+```rust
+/// A [`Parse`] that does not keep its tree alive.
+pub struct WeakParse<T> {
+    tree: std::sync::Weak<FlatTree>,
+    errors: Option<Arc<[SyntaxError]>>,
+    outline: Option<Edition>,
+    _ty: PhantomData<fn() -> T>,
+}
+
+impl<T> Parse<T> {
+    pub fn downgrade(&self) -> WeakParse<T> {
+        WeakParse {
+            tree: std::sync::Arc::downgrade(self.tree.as_ref().unwrap().flat()),
+            errors: self.errors.clone(),
+            outline: self.outline,
+            _ty: PhantomData,
+        }
+    }
+}
+
+impl<T> WeakParse<T> {
+    /// The parse, while something else keeps its tree.
+    pub fn upgrade(&self) -> Option<Parse<T>> {
+        let tree = self.tree.upgrade()?;
+        Some(Parse { tree: Some(Tree::new(tree)), errors: self.errors.clone(), outline: self.outline, _ty: PhantomData })
+    }
+}
+```
+
+Why: base-db's slot must hold no tree salsa's LRU let go of, and reading it must take no
+lock (docs/v2/plan/design/concurrency.md): a `Weak` upgrade is an atomic, and the edit comes
+from the setter, so `reparse_onto` does no second prefix/suffix scan. `SourceFile::parse_file`
+and `parsing::kept` (a `Mutex` per lookup, strong parses) have no caller outside `syntax`;
+base-db's `EditionedFileId::parse` does not use them, so format may remove them.
+
+> applied by requests (format is DONE): `Parse::reparse_onto(&self, delete, text: impl Into<Text>, edition)` beside `reparse_to` (which is now its unchanged-text check, `edit_between` and a call to it; `Text` for `Arc<str>`, as the crate takes texts now), `Parse::downgrade` and `pub struct WeakParse<T>` with `upgrade` at the crate root, as given. Tests in `syntax/src/tests.rs`: `a_reparse_onto_a_known_edit_is_the_whole_parse` (full and outline) and `a_weak_parse_upgrades_to_the_same_parse_while_the_tree_is_held`. `parse_file` and `parsing::kept` left in place (format may remove them; nothing asks it now).
+
+## db-expand-inputs2: a dependency's `priv` flag, and the target tuple and `has_thumb_interworking` (cargo, crates/load-cargo/src/v2/crates.rs, crates/blaze-units/src/stdlib/target.rs, crates/project-model/src/toolchain_info/target_data.rs)
+
+What: cargo fills the new base-db fields of db-expand tasks 19 and 23. Both are in the crate's
+content id already.
+
+1. `crates/load-cargo/src/v2/crates.rs:278`, `dependency`: cargo passes `--extern priv:name`
+   for a dependency whose unit-graph `public` is `Some(false)` (`-Zpublic-dependency`):
+
+```rust
+let private = dep.public == Some(false);
+Ok(BuiltDependency::with_prelude(name, krate, prelude, on.is_std && !unit.is_std).with_private(private))
+```
+
+   (`Dependency::with_private(self, bool) -> Self` and `is_private(&self) -> bool`,
+   `crates/base-db/src/input.rs`.) Test: a unit whose dep has `public: Some(false)` gives a
+   dependency with `is_private()`; `None` and `Some(true)` do not.
+
+2. `crates/blaze-units/src/stdlib/target.rs`, beside the `data_layout` of request 12 in
+   `v2/requests/cargo.md`: `pub fn has_thumb_interworking(triple: &str) -> Result<bool, String>`,
+   the recorded spec's `"has-thumb-interworking"` (`#[serde(rename = "has-thumb-interworking",
+   default)] has_thumb_interworking: bool` on `Spec`; rustc's spec JSON leaves out a field that
+   is false, so a missing key is `false`), with the same error as `data_layout` for a triple
+   with no recorded spec. None of the three recorded specs (`rustc.json` `target_spec_json`)
+   has the key today; recording an ARM spec makes it true there.
+
+3. `crates/load-cargo/src/v2/crates.rs:94`, `workspace_data`:
+
+```rust
+target: Ok(TargetData {
+    tuple: Symbol::intern(triple),
+    data_layout: data_layout.into_boxed_str(),
+    arch,
+    has_thumb_interworking: target::has_thumb_interworking(triple)
+        .map_err(|what| LowerError::at(what, triple))?,
+}),
+```
+
+4. `crates/project-model/src/toolchain_info/target_data.rs:49` (compiles against the struct
+   until project-model is removed): add `#[serde(rename = "has-thumb-interworking", default)]
+   has_thumb_interworking: bool` to its `TargetSpec`, and to the literal
+   `has_thumb_interworking: target_spec.has_thumb_interworking` and `tuple`: `target` when
+   given, else the `host:` line of the same tool's `-vV` (the spec JSON has no tuple; its
+   `llvm-target` differs from it on Apple targets, so it is not the tuple), as
+   `intern::Symbol::intern(..)`.
+
+Why: `TargetData` (`crates/base-db/src/target.rs`) now has `tuple: Symbol` and
+`has_thumb_interworking: bool` (`DOMAIN` "blaze v2 target data 2"): rustc's
+`UnsupportedInstructionSet` names the tuple and is given only without thumb interworking
+(diagnostics' request "diagnostics-items-attrs"). Every `TargetData { .. }` literal without
+them stops compiling.
+
+> forwarded to cargo (told by tmux).
+
+## db-expand-inputs2: `TargetData`'s two new fields at its other constructors (coordinator, crates/blaze-wasm/src/pack.rs, crates/blaze-wasm/src/lib.rs, crates/test-fixture/src/lib.rs)
+
+What: each literal gains `tuple` and `has_thumb_interworking` (the wasm target has no thumb):
+- `crates/blaze-wasm/src/pack.rs:204` and `crates/blaze-wasm/src/lib.rs:303`:
+  `TargetData { tuple: Symbol::intern("wasm32-unknown-unknown"), data_layout: .., arch: Arch::Wasm32, has_thumb_interworking: false }`
+  (`intern::Symbol`; use the tuple the crate already names for its target if it has one).
+- `crates/test-fixture/src/lib.rs:266`:
+  `TargetData { tuple: Symbol::intern("x86_64-unknown-linux-gnu"), arch: target_arch, data_layout: target_data_layout, has_thumb_interworking: false }`.
+Why: as the section above; these do not compile without the fields.
+
+> applied by requests for `crates/test-fixture/src/lib.rs` (the literal as given). `crates/blaze-wasm/src/pack.rs` and `lib.rs` forwarded to the coordinator (blaze-wasm is its; on requests' coordinator list).
+
+## db-expand-inputs2: `Db::resolve_path` across source roots, and one global allocator in base-db's tests (frontend-db, crates/base-db/src/db.rs, crates/base-db/src/db/tests.rs)
+
+What:
+1. `crates/base-db/src/db.rs:203` `Db::resolve_path` copies the old own-root-only lookup. Make it
+   `SourceDatabase::resolve_path`'s (`crates/base-db/src/lib.rs`), which also finds a file
+   another source root names (db-expand task 22, a `#[path]` module outside its package),
+   tracked through `crate::named`:
+
+```rust
+pub fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
+    let root = self.file_source_root(path.anchor).source_root_id(self);
+    let root = self.source_root(root).source_root_ref(self);
+    if let Some(file) = root.resolve_path(path) {
+        return Some(file);
+    }
+    let mut target = root.path_for_file(&path.anchor)?.clone();
+    target.pop();
+    crate::named::resolve(self, &target.join(path.path)?)
+}
+```
+
+   `named::resolve` takes `<Db: ?Sized + SourceDatabase>` and calls only
+   `NamedPaths::try_get`, `file_source_root` and `source_root`; when `SourceDatabase` becomes
+   `Db`'s inherent methods, change its bound to `db: &crate::Db`. `Files`' setters already
+   publish the index (`writer.named.publish(db)`), so `Db`'s setters need nothing more.
+2. `crates/base-db/src/db/tests.rs:8` declares a `#[global_allocator]`, and so does
+   `crates/base-db/src/tests.rs:32`: both are in base-db's one test binary once `mod db;` is
+   in `lib.rs`, which does not compile. Drop the one in `db/tests.rs`
+   (`blaze_alloc_count::measure` works with the crate's).
+Why: without 1, a crate lowered through `Db` misses a `#[path]` module outside its package
+quietly (no-fallback).
+
+> applied by frontend-db (both). Then db-expand-inputs2 replaced `named::resolve`, whose
+> `SourceDatabase` bound `Db` does not meet, with `named::lookup<Db: ?Sized + salsa::Database>`.
+> Each caller (`Db::resolve_path` in `db.rs` and `SourceDatabase::resolve_path` in `lib.rs`)
+> now reads the found file's source root itself, with three lines in each.
+> `Named::publish` is generic over `salsa::Database` too, so nothing in `named.rs` or
+> `reparse.rs` names a `dyn` database.
+
+> applied by frontend-db: 1 in `crates/base-db/src/db.rs` (`Db::resolve_path`, the body above);
+> `named::resolve`'s bound becoming `db: &crate::Db` is in frontend-db's base-db request to db
+> (`v2/requests/db.md`, "frontend-db: the concrete database"). 2: `db/tests.rs` declares no
+> allocator now and measures with the crate's.
+
+## db-expand-inputs2: `hot_lint.py`'s `crates` is a `list[str]`, which typed_input cannot read (coordinator, tools/v2/hot_lint.py)
+
+What: `tools/v2/hot_lint.py:39` `crates: list[str] = field(default_factory=lambda: list(HOT))`
+makes `{"root": ".", "crates": ["base-db"]}` (common.md's command) raise `TypeError:
+typed_input: crates has a type it does not read: list[str]`; typed_input reads
+`tuple[str, ...]`. Make it `crates: tuple[str, ...] = HOT`.
+Why: no agent can run the lint as common.md says; base-db was linted by calling `lint_file`
+directly.
+
+> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.
+
+## frontend-tokens: token trees carry the parser's words (item 4)
+
+Why: item 4, design in docs/v2/plan/lanes/frontend/tokens.md, "Item 4". A token tree will keep
+the parser's word for each token, so that no expansion or fragment is converted to parser input.
+Three call sites in hir-expand change when the matching tt, syntax-bridge and mbe parts land.
+I will add the new entries next to the old ones first, so nothing breaks before then:
+
+1. A macro call's input (`macro_arg` and its kin, now `syntax_node_to_token_tree` on the call's
+   token tree): `syntax_bridge::call_input`, which writes the tree from the file's flat tokens.
+2. A declarative macro's template: `mbe::DeclarativeMacro::parse_macro_rules` / `parse_macro2`
+   take the expander's edition (`DeclarativeMacroExpander::edition`, which `apply_mark` gives
+   every transcribed template token), so the template's words are made once. In
+   `declarative.rs` that means computing `edition` before `mac`.
+3. Trees built by hand (built-ins, fixups, attributes) and proc-macro answers: built with an
+   edition function (`|ctx| ctx.edition(db)`), their one conversion.
+
+I will tell you each signature here before it lands. Answer with `>` lines if any of these
+can't take an edition function or a `FlatTree` there.
+
+> forwarded to db-expand (hir-expand is db's; told by tmux).
+
+## db-expand-macros: persist `ExpandErrorKind::Builtin` (db-expand-names, `crates/hir-def/src/nameres/frozen.rs`)
+
+What: encode `ExpandErrorKind::Builtin(Box<BuiltinError>)` (message, code, notes, helps,
+`also_at` spans, `derive`) as a variant of its own, as the other seven.
+Why: it falls into `_ => Err("a macro error")` today, so a frozen def map loses every builtin
+macro's rustc-worded error (`Mbe` has the same gap).
+
+## db-expand-macros: `hir::MacroError` carries a builtin error whole (db-ty-next1, `crates/hir/src/diagnostics.rs`)
+
+What: give `MacroError` the rendered kind, the error code, the notes and helps, and the extra
+primary spans (`BuiltinError::also_at`) from `RenderedExpandError`/`BuiltinError`.
+Why: `from_derive`'s two-span errors and `CoercePointee`'s `E0802` can't be shown otherwise.
+
+## db-expand-macros: builtin errors without blaze's prefix (diagnostics, `crates/blaze-diagnostics/src/lower/macro_error.rs`)
+
+What: for kinds `builtin-macro-error` and `builtin-derive-error` (`RenderedExpandError::BUILTIN`,
+`BUILTIN_DERIVE`), give the message as is (no "blaze can't expand macro `x`:"), with the code,
+the notes/helps and the extra spans of the previous section.
+Why: these texts are `rustc_builtin_macros`' now, quoted exactly; rustc's
+`tests/ui/macros/macros-nonfatal-errors.stderr` is the reference.
+
+## db-expand-macros: the macro-error tests' expectations (diagnostics, `crates/ide-diagnostics/src/handlers/macro_error.rs`)
+
+What: update the tests expecting "expected string literal", "failed to load file" and
+"`OUT_DIR` not set, build scripts may have failed to run" and their spans: `env!`/`include!`
+errors are rustc's now (e.g. "environment variable `X` not defined at compile time" with
+rustc's help), spanned from the macro path to the closing delimiter.
+
+## db-expand-macros: whether `builtin-macro-error` fails a build (engine, `crates/blaze-engine`)
+
+What: decide whether `builtin-macro-error` joins the SURE list beside `builtin-derive-error`.
+Why: every builtin-macro error is now one rustc gives as a hard error; derive errors keep the
+derive kind for this reason.
+
+## db-expand-macros: an include's read error and resolved path (db-expand-inputs2, `crates/base-db/`)
+
+What: let `include!`/`include_str!`/`include_bytes!` get the I/O error and the resolved path of
+a file they can't read.
+Why: rustc says "couldn't read `{path}`: {error}"; blaze can only say "failed to load file".
+
+## db-expand-macros: what macro expansion waits on (format, `crates/mbe/`, `crates/span/`, `crates/hir-def/src/{item_tree,expr_store}/`)
+
+1. Task 13: `mbe::ExpandErrorKind` (`crates/mbe/src/lib.rs:75`) carries the best failure's
+   account (the failing token, the remaining matcher, whether a comma makes a rule match), so
+   `ExpandErrorKind::Mbe` and then `hir::MacroError` carry it.
+2. Task 15.1: a `dropped_semicolon: Option<Span>` field in `span::SpanMap` (the expansion map),
+   filled from `token_tree_to_syntax_node`'s third value, so
+   `semicolon_in_expressions_from_macros` reads it without expanding twice.
+3. Task 15.3: `item_tree/lower.rs` (~786) and `expr_store/expander.rs` (~116) call
+   `ExpandTo::of_call_site` and report its `Err(kind)` (no-fallback); `collect_macro_as_stmt`
+   (`expr_store/lower.rs`) takes an `Expr` expansion for a block's non-braced tail call. Then
+   `of_call_site` makes that tail `Expr` (rustc's `parse_stmt_mac`) and `from_call_site`, which
+   takes an unknown parent as items, goes.
+4. Task 16: the transcriber wraps `stmt`/`block` fragments in an invisible group spanned by the
+   metavariable (`crates/mbe/src/expander/transcriber.rs:431-433`) and the span map records each
+   group's range; then `map_node_range_up*` give such a node the group's span.
+5. Task 17: the transcriber (`transcriber.rs:297-385`) returns the spans of the identifiers
+   `${concat(..)}` makes; then they are kept with the expansion.
+
+## db-expand-macros: cfg_select's and the parser's errors in rustc's words (diagnostics-items, `crates/blaze-diagnostics/src/lower/parse.rs`)
+
+What: `diagnostics-items-resolve.md` section 4: `cfg_select!`'s parse errors use the parser
+translation, so they wait on it being usable on a token stream.
+
+## speed-hir-sol-defs: hot_lint and budgets
+
+From `speed-hir-sol-defs` (round 2 of `speed-hir`; report `/tmp/blaze-lanes/v2-speed-hir-sol-defs.md`).
+Every edit below is mechanical: old text, new text, why. Line numbers are as of 10-29 20:30 and
+move; the old text is what to find. `&dyn SourceDatabase` findings (204 of the 331 in these files)
+are left to frontend-db-def's `&Db` rewrite and are not here. `Symbol`, `Name` and `ModPath` are
+`Copy` now, so every `.clone()` of one is a copy written `*x`. A syntax cursor's clone
+(`syntax-tree/src/cursor.rs`) is a non-atomic count bump that allocates nothing, which is the
+reason given where one is justified.
+
+### 1. The crate's allocation-budget harness (first: other tests already depend on it)
+
+`signatures.rs`, `hir/columns.rs`, `item_tree/items/tests.rs`, `nameres/facts/tests/*.rs`,
+`deps/signatures/tests.rs` and `expr_store/tests/alloc.rs` call `blaze_alloc_count` today, so
+hir-def's test binary does not compile without (a), and with (b) but not (c) it has two global
+allocators. Until (b), `blaze_alloc_count::measure` counts nothing in this binary, so every
+`assert_at_most(0, ..)` passes vacuously. This is speed-hir-store's request in
+`v2/requests/db.md` ("one counting allocator for hir-def's tests"), forwarded to db and not yet
+applied; it is in your files, so here it is again with my test module.
+
+a. `crates/hir-def/Cargo.toml`, `[dev-dependencies]`, after `expect-test.workspace = true`:
+   ```toml
+   blaze-alloc-count.workspace = true
+   ```
+   (`blaze-alloc-count` is in the root `[workspace.dependencies]` already.)
+b. `crates/hir-def/src/lib.rs`, after
+   ```rust
+   #[cfg(test)]
+   mod test_db;
+   ```
+   add
+   ```rust
+   #[cfg(test)]
+   mod alloc_budgets;
+
+   #[cfg(test)]
+   #[global_allocator]
+   static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+   ```
+   `alloc_budgets.rs` is new and written (by me): budgets of 0 for an attribute-flag read, a gated
+   value read with and without its attribute, a loc intern hit, a lang-item lookup and an upvars
+   read.
+c. `crates/hir-def/src/nameres/tests/paths.rs` (db-expand-names' file): delete
+   ```rust
+   #[global_allocator]
+   static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+   ```
+   and the whole `mod alloc_count { .. }` after it, and at its one use
+   `let (res, allocations) = alloc_count::count(resolve);` becomes
+   `let (res, used) = blaze_alloc_count::measure(resolve);` and `assert_eq!(allocations, 0);`
+   becomes `assert_eq!(used.allocations, 0);`.
+
+### 2. `crates/hir-def/src/attrs.rs`
+
+Fixes:
+- `parse_repr_tt`, `packed` (~L2055) and `align` (~L2076): the token tree is cloned to call
+  `tts.next()` after a peek. `next_if` takes it by value, so no clone. Same tokens consumed.
+  ```rust
+                let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
+                    let tt = tt.clone();
+                    tts.next();
+                    let mut tt_iter = TokenTreeChildren::new(&tt);
+  ```
+  becomes
+  ```rust
+                let pack = if let Some(NodeOrToken::Node(tt)) =
+                    tts.next_if(|it| matches!(it, NodeOrToken::Node(_)))
+                {
+                    let mut tt_iter = TokenTreeChildren::new(&tt);
+  ```
+  and
+  ```rust
+                if let Some(NodeOrToken::Node(tt)) = tts.peek() {
+                    let tt = tt.clone();
+                    tts.next();
+                    let mut tt_iter = TokenTreeChildren::new(&tt);
+  ```
+  becomes
+  ```rust
+                if let Some(NodeOrToken::Node(tt)) =
+                    tts.next_if(|it| matches!(it, NodeOrToken::Node(_)))
+                {
+                    let mut tt_iter = TokenTreeChildren::new(&tt);
+  ```
+- `derive_info` (~L1872): `Box::new([])` becomes `Box::default()` (an empty `Box<[Symbol]>`,
+  no allocation either way; the lint reads `Box::new(`).
+
+Justify, a comment on the line above each:
+- ~L901 `let mut literal = value.clone();`:
+  `// clone: a cursor, no allocation; only for an item whose flag says it has the attribute`
+- ~L949 `.with_value(ast::VariantDef::cast(variant_syntax.value.syntax().clone()).unwrap());`:
+  `// clone: a cursor, no allocation`
+- ~L1124 `let text = format!("#[cfg{}] fn f() {{}}", group.syntax().text());`:
+  `// alloc: only a `#[link(.., cfg(..))]`, once per extern block, inside its memo`
+- ~L1253 `owner: &dyn HasAttrs,`:
+  `// dyn: `ast::attrs_including_inner` takes `&dyn HasAttrs`; one call per field or variant`
+- ~L1317 `let mut libs = Vec::new();` (`native_libs`):
+  `// alloc: the memo's value; nothing for an extern block without `#[link]``
+- ~L1595 `return Vec::new();` (`target_feature_list`):
+  `// alloc: an empty `Vec`, no allocation`
+- ~L1597 `let mut result = Vec::new();` (`target_feature_list`):
+  `// alloc: only a function with `#[target_feature]`; the caller owns the list`
+- ~L1694 and ~L1705 `let mut result = Vec::new();` (`doc_aliases`, `fields_doc_aliases`):
+  `// alloc: the memo's value, only for an item whose flag says `#[doc(alias)]``
+- ~L1735 and ~L1751 `let mut result = Vec::new();` (`cfgs`, `fields_cfgs`):
+  `// alloc: the memo's value, only for an item whose flag says `#[cfg]``
+- ~L1949 `let mut result = Vec::new();` and ~L1962 `let mut segments = Vec::new();`
+  (`define_opaque`): `// alloc: the memo's value, only for a function with `#[define_opaque]``
+- ~L2124 `.collect()` (`parse_rustc_legacy_const_generics`):
+  `// alloc: the memo's value, only for a function with `#[rustc_legacy_const_generics]``
+- ~L2181 `.collect();` (`next_doc_expr`, `DocAtom::Alias`):
+  `// alloc: `#[doc(alias(..))]`, read only inside the gated doc-alias memo and docs`
+
+### 3. `crates/hir-def/src/attrs/docs.rs`
+
+Docs are read by `blaze-doc` and `hir` only, never by a build (`rg 'AttrFlags::(docs|field_docs)'`).
+A comment on the line above each:
+- ~L289 `let mut lines: Vec<(&str, TextSize)> = doc` (flagged at its `.collect();`, ~L295), ~L297
+  and ~L303 `let raw_lines: Vec<&str> = ..collect();`, ~L563 `Some(lines.first()?[..i].to_string())`,
+  ~L834 `docs: String::new(),`, ~L835 `docs_source_map: Vec::new(),`, ~L898
+  `if result.is_empty() { None } else { Some(Box::new(result)) }`:
+  `// alloc: docs, read by blaze-doc and hir, never by a build` (for ~L295 put it on the line
+  above `.collect();`, inside the chain)
+- ~L468 `self.docs = String::from_utf8(bytes)`:
+  `// alloc: none: `from_utf8` keeps `bytes`' buffer`
+- ~L632 `let expr = parse.clone().cast::<ast::Expr>().map(|parse| parse.tree())?;`:
+  `// clone: docs (or a `#[key = macro!()]` value): one count bump per expanded call`
+- ~L686, ~L688 (`extend_with_attrs`) and ~L827, ~L828 (`extract_docs`), the `&dyn Fn() -> ..`
+  parameters: `// dyn: docs, one call per item's docs`
+- ~L754 `let body = ast::Fn::cast(owner.syntax().clone())?.body()?;` and ~L762
+  `Some(body.stmt_list()?.syntax().clone())`: `// clone: a cursor, no allocation`
+
+### 4. `crates/hir-def/src/attrs/stability.rs`
+
+- ~L358 `let mut fields = Vec::new();` (`own_of_fields`):
+  `// alloc: the memo's value, once per variant whose fields' stability is asked`
+- ~L563 `tt.syntax().children_with_tokens()..collect();` (into the `SmallVec<[_; 16]>`):
+  `// alloc: a 16-element stack buffer; spills only for a longer attribute list`
+- ~L584 `ast::String::cast(value.clone())..`, ~L588 `items.push((key.clone(), value));`, ~L677
+  `InFile::new(ast_id.file_id, ast_id.to_node(db).syntax().clone())`, ~L739 and ~L747
+  `..ast_id(&ast::Variant::cast(node.value.clone())?)..` / `ast::Item::cast(..)`:
+  `// clone: a cursor, no allocation`
+
+### 5. `crates/hir-def/src/lang_item.rs`
+
+Fixes (`Symbol` is `Copy`):
+- ~L163 and ~L189: `current.scope(db).type_(&Name::new_symbol_root(module.clone()))` becomes
+  `current.scope(db).type_(&Name::new_symbol_root(*module))`.
+- ~L217: `trait_items.associated_type_by_name(&Name::new_symbol_root(name.clone()));` becomes
+  `trait_items.associated_type_by_name(&Name::new_symbol_root(*name));`
+- ~L223: `trait_items.method_by_name(&Name::new_symbol_root(name.clone()));` becomes
+  `trait_items.method_by_name(&Name::new_symbol_root(*name));`
+- ~L339: `if traits.is_empty() { None } else { Some(traits.into_iter().collect()) }` becomes
+  `if traits.is_empty() { None } else { Some(traits.into_boxed_slice()) }` (same value, no second
+  collect).
+
+Justify:
+- ~L113 `if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }`:
+  `// alloc: the memo's value, once per crate`
+- ~L325 `let mut traits = Vec::new();`: `// alloc: the memo's value, once per crate`
+
+### 6. `crates/hir-def/src/lib.rs`
+
+Fixes (`ModPath` is `Copy`):
+- ~L1672: `let def = resolver(path).ok_or_else(|| UnresolvedMacro { path: path.clone() })?;`
+  becomes `let def = resolver(path).ok_or(UnresolvedMacro { path: *path })?;`
+- ~L1697: `_ => return Err(UnresolvedMacro { path: path.clone() }),` becomes
+  `_ => return Err(UnresolvedMacro { path: *path }),`
+
+Justify:
+- ~L1667 `eager_callback: &mut dyn FnMut(`:
+  `// dyn: hir-expand's `EagerCallBackFn`; one call per eager macro call`
+- ~L1784 `.collect()` (`include_macro_invoc`): `// alloc: the memo's value, once per crate`
+
+### 7. `crates/hir-def/src/src.rs`
+
+Fixes: `fd` is the loop's own value, borrowed only by `is_cfg_enabled_for` before:
+- ~L164 `Either::Left(fd.clone()),` becomes `Either::Left(fd),`
+- ~L179 `Either::Right(fd.clone()),` becomes `Either::Right(fd),`
+
+Justify (both map a `use`'s trees back to syntax, for diagnostics and the IDE crates):
+- ~L46 `use_tree_source_map(db, use_ast_id)[index].clone()`:
+  `// clone: a cursor, no allocation`
+- ~L73 `InFile::new(loc.id.file_id, use_tree_source_map(db, loc.id).into_iter().collect())`:
+  `// alloc: a use's trees back to syntax, for diagnostics`
+
+### 8. `crates/hir-def/src/diagnostic_item.rs`
+
+Fixes (`Symbol` is `Copy`):
+- ~L49 `self.duplicates.push((it.key().clone(), *it.get(), owner));` becomes
+  `self.duplicates.push((*it.key(), *it.get(), owner));`
+- ~L104 `result.insert(name.clone(), owner);` becomes `result.insert(*name, owner);`
+
+Justify:
+- ~L86 `let mut result = own.clone();`:
+  `// clone: the memo's value starts as the crate's own map, once per crate`
+- ~L91 `let mut queue = vec![krate];`: `// alloc: the crates' queue, once per crate`
+
+### 9. `crates/hir-def/src/upvars.rs`
+
+Justify (once per body with a closure; the frame allocator takes them once `blaze-mem` has one):
+- ~L120 `binding_names: store.bindings().map(..).collect(),`:
+  `// alloc: once per body with a closure, sized by its bindings`
+- ~L123 `mentioned: Vec::new(),`: `// alloc: once per body with a closure that captures`
+- ~L131 `Some(Box::new(result))`: `// alloc: the memo's value, once per body with a capture`
+
+### 10. `crates/hir-def/src/unstable_features.rs`
+
+- ~L52 `crate::crate_def_map(db, krate).features().clone()`:
+  `// clone: once per def-map change of the crate; the copy lets its readers backdate`
+
+### 11. `macro_expansion_tests/` and `test_db.rs`
+
+Both are `#[cfg(test)] mod ..;` in `lib.rs`, so all of it is test code, but hot_lint can't see
+that from inside the files, and most of the 43 findings in `macro_expansion_tests/` are inside
+fixture strings, where a comment would change the test's input and the spans its expectations
+print. Nothing to do here: I asked speed (`v2/requests/speed.md`, "speed-hir-sol-defs") for hot_lint
+to skip the files of a module declared `#[cfg(test)]`. `test_db.rs` becomes
+`pub(crate) type TestDB = base_db::Db;` in frontend-db-def's rewrite anyway.
+
+### Check after applying
+
+`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": "."}' | rg 'crates/hir-def/src/(attrs|lang_item|lib|src|diagnostic_item|upvars|unstable_features)'`
+shows only `dyn SourceDatabase` lines until frontend-db-def's rewrite lands, then nothing.
+
+### 12. Attributes are read off the live parse, so every body edit re-runs them (design)
+
+Counted in `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def: attributes, interned
+locs, lang items (speed-hir-sol-defs)".
+- What happens: `attrs_source` reads the item through `loc.source(db)`, which reads `parse` and
+  `ast_id_map`, and both change on every edit of the file. The signature queries read
+  `AttrFlags::query`, `repr` and `repr_assume_has` (`signatures.rs` 612, 714, 822, 929,
+  1024). So verifying them after a body edit re-runs the flag query of every item in the file,
+  along with `fields_attrs` and `query_generic_params`.
+- Cost: ≈ 150 × 300 ns ≈ 45 µs per edited file, all backdated, against ≈ 0.8 µs if the queries
+  depended only on `file_outline`.
+
+The change, in order of payoff:
+1. `attrs_source` reads an item that is in its file's `file_outline` from the outline (the
+   lookup `item_syntax` does: `outline.ast_id_map.try_get_erased`, then `to_node` on the
+   outline root), and reads every other item (inside a body, or written by a macro) as it does
+   now. For this, `bodies_under` in `signatures.rs` must not cut a body whose text, after
+   trivia, starts with `#!`, since an inner attribute is part of its item's attributes. Test:
+   in `alloc_budgets.rs`'s style, edit a fn body in a two-item file and assert, with
+   `executed_in_read_order`, that no `AttrFlags::query` runs.
+2. Walk `syntax::view` nodes, borrowed from the memo, rather than `SyntaxNode`s: this drops the
+   per-item root `Box` and the write to the file tree's `Arc` count, a line every worker on the
+   file shares. It needs a view form of `hir_expand::attrs::expand_cfg_attr`.
+3. (format's, in `span`) `AstIdMap` keeps each entry's element index, so `to_node` is one load
+   instead of a binary search over the file's elements.
+4. `file_attr_flags(db, file) -> &[AttrFlags]`, built in one walk of the outline, with
+   `AttrFlags::query` as a tracked read of one entry. `crate_lang_items` then scans the
+   columns' `LANG_ITEM` bits instead of running every item's query on one thread (≈ 7.5 ms
+   for `core` when it is the first reader).
+
+Status: open
+
+## speed-hir-sol-nameres: hot_lint and budgets
+
+From `speed-hir-sol-nameres` (round 2 of `speed-hir`; report
+`/tmp/blaze-lanes/v2-speed-hir-sol-nameres.md`). The bounds behind the two design edits (1, 2)
+are in `docs/v2/plan/lanes/db/speed-of-light.md`, "hir-def: name resolution
+(speed-hir-sol-nameres)". Files: db-expand-names' (`nameres.rs`, `nameres/` but `facts/`,
+`item_scope.rs`, `resolver.rs`) and db-expand's (`find_path.rs`, `import_map.rs`, `lib.rs`).
+`nameres/facts/` is in `v2/requests/frontend-nameres.md` under the same heading. Line numbers are
+as of 10-29 21:10 and move (`frozen.rs` moved 110 lines while I read it); the old text is what
+to find. Left out:
+- the `&dyn SourceDatabase` findings, which frontend-db-def's `&Db` rewrite covers;
+- `collector.rs`'s 66 findings, which go away once frontend-nameres-core's `#[cfg(test)] mod
+  collector;` (`v2/requests/db.md`) lands.
+
+`Name` and `Symbol` are `Copy`, so their `.clone()` becomes `*x`. A syntax node's clone is a
+reference-count bump that allocates nothing.
+
+### 0. Budget tests: `crates/hir-def/src/nameres_budgets.rs` (new, written by me)
+
+It needs the counting allocator wired into hir-def's test binary first: items a–c of
+speed-hir-sol-defs' section above. Without them it doesn't link, and with only some of them it
+counts nothing. Then, in `crates/hir-def/src/lib.rs`, next to that section's
+`#[cfg(test)] mod alloc_budgets;`, add:
+```rust
+#[cfg(test)]
+mod nameres_budgets;
+```
+The budgets, each measured once the reads are warm:
+- 0 for a memo hit of `crate_def_map`, of `ModuleId::def_map` and of every block's
+  `block_def_map`;
+- 0 for `ItemScope::get` in a scope of at most 8 names and in one of more, and for the same
+  lookups through `ModuleData::name_in_scope`'s per-name memo;
+- 0 for `resolve_module_path_in_items` of paths of two and three segments, one of them through a
+  renaming import (`nameres/tests/paths.rs`' `resolved_path_allocates_nothing` already covers
+  `resolve_path_fp_with_macro`);
+- 0 for `Resolver::update_to_inner_scope` into a block that has a block def map, looking up a
+  local, a block item and `a::b::g` in the value namespace, then `reset_to_guard`;
+- at most 1 for building `FunctionId`'s resolver. Lower it to 0 in
+  `a_function_resolver_allocates_at_most_one` when edit 2 lands.
+
+### 1. `crates/hir-def/src/nameres.rs`
+
+**Design: one memo per path segment.** A segment read today costs two memo hits:
+`Modules::module` (≈ 11 ns), then `ModuleScope::name` (≈ 11 ns). This edit makes it one, about
+115 → 70 ns for a 3-segment path in this crate. The dependencies stay per module and per name.
+- In `#[salsa::tracked] impl<'db> Modules<'db>`, after `fn module(..)`, add:
+  ```rust
+      /// What `name` means in `module`: one memo for a path segment, where reading the module
+      /// and then its scope is two. Depends on the modules there are and on that module's scope;
+      /// backdated while the name means what it did.
+      #[salsa::tracked]
+      fn name(self, db: &'db Db, module: ModuleId, name: Name) -> PerNs {
+          let Some(data) = self.table(db).get(&module) else {
+              panic!("ModuleId not found in ModulesMap: {module:#?}")
+          };
+          data.scope(db).get(&name)
+      }
+  ```
+- In `impl DefMap`, after `pub fn module<'a>(..)`, add:
+  ```rust
+      /// What `name` means in module `id` of this `DefMap`; depends on that name only.
+      pub(crate) fn name_in_module(&self, db: &Db, id: ModuleIdLt<'_>, name: &Name) -> PerNs {
+          match &self.modules {
+              ModulesSlot::Building(_) => self.module(db, id).name_in_scope(db, name),
+              ModulesSlot::Collected(modules) => {
+                  // SAFETY: as in `Self::module`: the `'static` copy is only the key of the
+                  // `Modules::name` query, hashed and compared, never read through.
+                  let id = unsafe { id.to_static() };
+                  *<Modules<'_> as salsa::plumbing::FromId>::from_id(*modules).name(db, id, *name)
+              }
+          }
+      }
+  ```
+  frontend-nameres-core asks for a `ModulesSlot::Unit { own, rows }` in `v2/requests/db.md`
+  (its §4, "a resolver view"). Once that lands, the first arm becomes
+  `ModulesSlot::Building(_) | ModulesSlot::Unit { .. } => ..`. A view's segment reads stay on
+  `DefMap::module`, which reads a row as a fact. Its `ScopeSlot::Fact` (§5 there) needs nothing
+  here: `Modules::name` reads through `ModuleData::scope`, which handles every slot. Then use
+  `name_in_module` in `path_resolution.rs` (§3).
+
+**Fixes:**
+- `with_ancestor_maps`: `f: &mut dyn FnMut(&DefMap, ModuleIdLt<'db>) -> Option<T>,` becomes
+  `mut f: impl FnMut(&DefMap, ModuleIdLt<'db>) -> Option<T>,`. It is called once per path from
+  `find_path`. The callers pass `&mut |..| ..`, which is `impl FnMut` too, so they compile
+  unchanged.
+- `name_in_scope`: `.name(db, name.clone())` becomes `.name(db, *name)`.
+- `legacy_macro_in_scope`: `.legacy_macro(db, name.clone())` becomes `.legacy_macro(db, *name)`.
+- `ModuleSource::node`:
+  ```rust
+          match self {
+              ModuleSource::SourceFile(it) => it.syntax().clone(),
+              ModuleSource::Module(it) => it.syntax().clone(),
+              ModuleSource::BlockExpr(it) => it.syntax().clone(),
+          }
+  ```
+  becomes
+  ```rust
+          let node = match self {
+              ModuleSource::SourceFile(it) => it.syntax(),
+              ModuleSource::Module(it) => it.syntax(),
+              ModuleSource::BlockExpr(it) => it.syntax(),
+          };
+          // clone: an owned handle for the caller, a count bump
+          node.clone()
+  ```
+- **Decoding a frozen map builds the collected scope directly.** Today `ModuleData::with_scope`
+  boxes a `BuildingScope` per module, and `hand_over_scopes` then takes it apart again. Add,
+  after `with_scope`:
+  ```rust
+      /// A module of a `DefMap` whose scope is final (a frozen `DefMap` read back): the scope
+      /// goes to the database at once, with no `BuildingScope` in between.
+      pub(crate) fn collected(
+          db: &Db,
+          id: ModuleId,
+          origin: ModuleOrigin,
+          visibility: Visibility,
+          parent: Option<ModuleId>,
+          scope: ItemScope,
+          children: FxIndexMap<Name, ModuleId>,
+      ) -> Self {
+          let scope = ModuleScope::new(db, id, scope, children);
+          ModuleData {
+              origin,
+              visibility,
+              parent,
+              scope: ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope)),
+          }
+      }
+  ```
+  `hand_over_scopes` already skips a `Collected` slot. `with_scope` stays for
+  `facts/macros.rs` (`ModuleData::with_scope(` ~L919) and `facts/collect.rs` (~L826). Its
+  `Box::new(BuildingScope { .. })` gets, on the line above:
+  `// alloc: one box per module of a def map being built, moved to the database when it is done`.
+  The `frozen.rs` side is in §4.
+
+**Justify** (the comment goes on the line above):
+- `DiagnosticsByModule::of`, before `let mut order: Vec<u32> = (0..len).collect();` and before
+  `let mut modules: Vec<(ModuleId, u32)> = Vec::new();`:
+  `// alloc: once per def map, when collection is done; the memo's own columns`.
+- `DefMapCrateData::new`, `registered_tools: PREDEFINED_TOOLS.iter()..collect(),`:
+  `// alloc: once per crate`.
+- `ModuleScope::traits`, `self.scope(db).traits().collect()`: `// alloc: the memo's value, once
+  per module scope`.
+- `crate_local_def_map`'s `Arc::new(DefMapCrateData::new(krate.edition)),`:
+  `// alloc: once per crate`.
+- `block_def_map`'s `local_def_map.def_map(db).data.clone(),`: `// clone: an Arc count bump,
+  once per block def map`.
+- `DefMap::empty`'s `diagnostics: Vec::new(),`: `// alloc: empty; allocates nothing until a
+  diagnostic`.
+- `dump`'s `let mut buf = String::new();` and `let path = format!(..)`: `// alloc: a debug dump
+  (the edge)`.
+
+### 2. `crates/hir-def/src/resolver.rs`
+
+**Design: the scope stack inline.** `Resolver` is built per body walk and per IDE query. Its
+first `push` allocates a `Vec`, and a body's walk usually grows it once more. The bound is
+25 ns and 0 allocations, against 85 ns and 1–2 allocations today.
+- `scopes: Vec<Scope<'db>>,` becomes `scopes: SmallVec<[Scope<'db>; 8]>,`. `Scope` is `Copy`
+  and at most 24 B, so a `Resolver` grows by about 200 B. `smallvec::SmallVec` is imported
+  already.
+- In the doc comment, "pushes its scopes onto the same `Vec`" becomes "pushes its scopes onto
+  the same stack".
+- `impl HasResolver for ModuleId`: `let mut scopes = Vec::new();` becomes
+  `let mut scopes = SmallVec::new();`.
+- Every other use works on `SmallVec` unchanged: `push`, `reserve`, `len`, `truncate`,
+  `[start..].reverse()`, `iter().rev().copied()`, `scopes.reverse()` and the struct literal. If
+  any `resolver_for_*` builds the field from a `Vec`, `SmallVec::from_vec` takes it without a
+  copy.
+
+**Fixes:**
+- `.map(|(name, module_id)| (name.clone(), module_id.0))` (`names_in_scope`, extern prelude)
+  becomes `.map(|(name, module_id)| (*name, module_id.0))`.
+- `ScopeNames::add` and `add_local`: `self.map.entry(name.clone()).or_default();` becomes
+  `self.map.entry(*name).or_default();`, in both.
+
+### 3. `crates/hir-def/src/nameres/path_resolution.rs` (with §1's design edit)
+
+- `resolve_remaining_segments`:
+  ```rust
+                      let module_data = if module.block(db) == self.block_id() {
+                          self.module(db, module)
+                      } else {
+                          module.def_map(db).module(db, module)
+                      };
+
+                      // Since it is a qualified path here, it should not contains legacy macros
+                      reads(PathRead::Slot(module, *segment));
+                      module_data.name_in_scope(db, segment)
+  ```
+  becomes
+  ```rust
+                      let def_map = if module.block(db) == self.block_id() {
+                          self
+                      } else {
+                          module.def_map(db)
+                      };
+
+                      // Since it is a qualified path here, it should not contains legacy macros
+                      reads(PathRead::Slot(module, *segment));
+                      def_map.name_in_module(db, module, segment)
+  ```
+- `resolve_name_in_module`: `let from_scope = self.module(db, module).name_in_scope(db, name);`
+  becomes `let from_scope = self.name_in_module(db, module, name);`.
+- `resolve_name_in_crate_root_or_extern_prelude`:
+  `def_map.module(db, def_map.root).name_in_scope(db, name)` becomes
+  `def_map.name_in_module(db, def_map.root, name)`, and
+  `self.module(db, self.root).name_in_scope(db, name)` becomes
+  `self.name_in_module(db, self.root, name)`.
+- `resolve_in_prelude_reading`: `def_map.module(db, prelude).name_in_scope(db, name)` becomes
+  `def_map.name_in_module(db, prelude, name)`.
+
+Results are the same: `Modules::name` reads the scope `name_in_scope` reads. The `PathRead`s
+are unchanged.
+
+### 4. `crates/hir-def/src/nameres/frozen.rs`
+
+**Fixes:**
+- `served`: `let frozen = FrozenDefMaps::try_get(db)?.maps(db).get(&krate)?.clone();` becomes
+  `let frozen = FrozenDefMaps::try_get(db)?.maps(db).get(&krate)?;`. `Mode` is `Copy`,
+  `&frozen.bytes` is a `&Arc<[u8]>` that derefs to `&[u8]`, and the rest of the function reads
+  fields only. This drops a count bump per served crate.
+- `Enc::unplaced`: `Ok(if unplaced == written { text.clone() } else { Symbol::intern(&unplaced) })`
+  becomes `Ok(if unplaced == written { *text } else { Symbol::intern(&unplaced) })`, because
+  `text: &Symbol`.
+- In the decoder's module loop (~L3102):
+  ```rust
+              let parent = parent.map(|it| self.own[it as usize]);
+              let module = ModuleData::with_scope(origin, visibility, parent, scope, children);
+  ```
+  becomes
+  ```rust
+              let parent = parent.map(|it| self.own[it as usize]);
+              let module = ModuleData::collected(
+                  self.db,
+                  self.own[index],
+                  origin,
+                  visibility,
+                  parent,
+                  scope,
+                  children,
+              );
+  ```
+  This makes the same `ModuleScope`s, with the same keys, in the same order as
+  `hand_over_scopes` (§1). It drops one `Box` per decoded module and the `mem::take` of its
+  scope.
+
+**Justify** (the comment goes on the line above each). Line numbers are from one hot_lint run
+with the file unchanged during it:
+- Error paths, `// alloc: error path`. These are the `Err(format!(..))`,
+  `.ok_or_else(|| format!(..))`, `"..".to_owned()` inside `Err` and `.map_err(..)` lines: 196,
+  266, 272, 350, 358, 540, 546, 556, 661, 758, 780, 1615, 1639, 1764, 1788, 1791, 1807, 1832,
+  1839, 2068, 2080, 2104, 2121, 2134, 2139, 2144, 2174, 2190, 2208, 2226, 2235, 2241, 2264,
+  2297, 2324, 2338, 2362, 2364, 2388, 2412, 2429, 2440, 2445, 2461, 2466, 2473, 2489, 2494,
+  2504, 2507, 2517, 2530, 2554, 2568, 2605, 2612, 2618, 2650, 2657, 2687, 2697, 2706, 2722,
+  2832, 2836, 2916, 2946, 2957, 2975, 3034, 3038, 3079, 3128, 3142, 3145, 3166, 3183, 3210.
+- `Mode::Check` and `Mode::Verify` bookkeeping, `// alloc: Check/Verify only, which record
+  differences; never when serving`: 109 (`Arc::new(maps)` in `set`), 147 (`DIFFERENCES`), 151,
+  173, 174, 216, 310.
+- Setting the frozen inputs, once per load, `// alloc: once per load of the frozen bytes`:
+  238 (`Arc::new(maps)` in `set_lang_items`) and 275 (`Ok(Box::new(items))`, the memo value).
+- Encoding, `// alloc: encoding, once per crate per image write (not on a build's path)`: the
+  `Enc` lines 326, 327, 356, 379, 385, 394, 395, 397, 404, 414, 490, 494, 502, 519, 520, 526,
+  558, 561, 634, 640, 645, 665, 668, 745, 940, 1310, 1481, 1564, 1720, 1822, 1836, 1868.
+- Decoding, `// alloc: the decoded map's own storage, once per crate served`: the `Dec` lines
+  2029–2032 (`Dec::new`'s columns), 2050, 2156, 2179, 2184, 2272, 2287, 2471, 2974, 2984,
+  3020, 3118, 3135, 3150–3152, 3220.
+
+### 5. `crates/hir-def/src/nameres/demand.rs`
+
+**Fixes:**
+- `.iter().cloned()` at ~L432 and in `let mut writing: FxHashSet<Symbol> =
+  found.iter().cloned().collect();` (~L566) becomes `.iter().copied()`.
+- `if seen.insert((name.clone(), id)) {` becomes `if seen.insert((*name, id)) {`. If `name` is
+  a `Name` by value there, it is `(name, id)`.
+- In `let named = scope.macros().map(|(name, it)| (name.symbol().clone(), it.def));` and
+  `.flat_map(|(name, ids)| ids.iter().map(move |&id| (name.symbol().clone(), id)));`,
+  `name.symbol().clone()` becomes `*name.symbol()`.
+- `found.push(name.clone());` and `writing.insert(name.clone());` become `found.push(*name);`
+  and `writing.insert(*name);`.
+
+**Justify:**
+- The `Err(format!(..))` lines (~L234, 244, 303, 309, 320): `// alloc: error path`.
+- `let mut node: SyntaxNode = block.to_node(db).syntax().clone();`, the
+  `ast::Variant::cast(ancestor.clone())`, and the four `.map(|it| it.syntax().clone())` in the
+  body-of-an-owner match (~L487–496): `// clone: a node handle, a count bump`.
+- The owned results, `// alloc: the query's result, once per execution (per crate or per
+  body)`: `let mut owners = Vec::new();` (×3), `let blocks: Vec<_> = Body::of(..).collect();`,
+  `let mut seen: FxHashSet<DefWithBodyId> = ..collect();`, `let mut bodies = Vec::new();` (×2),
+  `let mut found = Vec::new();` and `let mut calling = Vec::new();` (×2 each),
+  `let mut names: Vec<Symbol> = known.into_iter().collect();`, `let mut words = Vec::new();`
+  and the `writing` set.
+
+### 6. `crates/hir-def/src/item_scope.rs`
+
+**Justify:**
+- `Index { slots: std::iter::repeat_n(EMPTY, slots).collect() }`: `// alloc: the index's
+  slots, once per scope of more than 8 names, when it is sealed`.
+- `Column { entries: self.entries.clone(), of: PhantomData }`: `// clone: only with its
+  ItemScope, which the facts engine copies once per macro step (frontend-nameres's
+  copy-on-write rows remove it)`.
+- `BUILTIN_SCOPE`'s `let names: Box<[Name]> = ..collect();` and
+  `BuiltinScope { names, defs: defs.collect(), index }`: `// alloc: once per process
+  (LazyLock)`.
+- `self.all_names().map(|(ns, _, name)| (ns, name)).collect();` (a `SmallVec` of at most 8):
+  `// alloc: inline, at most 8 names; no heap`.
+- `self.all_names().map(|(ns, pos, _)| ns << 30 | pos as u32).collect();` and the `by_def`
+  `.collect();` (~L1393): `// alloc: once per scope, on the first sorted or by-def read
+  (OnceLock)`.
+- `dump`'s `let mut entries: Vec<_> = self.resolutions().collect();` and
+  `let mut legacy_macros = self.legacy_macros().collect::<Vec<_>>();`: `// alloc: a debug dump
+  (the edge)`.
+
+### 7. `crates/hir-def/src/find_path.rs`
+
+**Fixes:**
+- `return Some(Choice::new(st, kind, name.clone(), Stable));` becomes
+  `return Some(Choice::new(st, kind, *name, Stable));`.
+- `(declared || !ignore_local_imports).then(|| name.clone())` becomes
+  `(declared || !ignore_local_imports).then(|| *name)`.
+- `Some(Choice::new(st, PathKind::Plain, name.clone(), Stable))` becomes
+  `Some(Choice::new(st, PathKind::Plain, *name, Stable))`.
+
+The rest of the file (the `name.clone()`s from ~L2564 on) is test code. dedup-codec-rng has an
+edit in those tests, so the three fixes above don't touch it.
+
+### 8. `crates/hir-def/src/import_map.rs`
+
+**Justify**, as `// alloc: once per ImportMap::of execution (per crate, on the IDE's import
+search)`: `let mut out = String::new();` (~L87), `vec![0u32; rows + 1]`, `vec![0u32;
+found.infos.len()]`, the `order.iter().map(|&at| found.infos[at as usize].1.clone()).collect()`
+(with `// clone:` saying the same), `vec![0u64; rows.div_ceil(64)]`,
+`let mut importables: Vec<u32> = ..collect();`, `let mut key = Vec::new();` and
+`let mut worklist = vec![root];`.
+The crate-list `..map(|dep| ImportMap::of(db, dep.crate_id)).collect()` (~L572) gets
+`// alloc: once per search request (the edge)`.
+`dump`'s three `format!("- {it:?} ..")` and its `.collect();` get `// alloc: a debug dump
+(the edge)`.
+
+### 9. Smaller files under `nameres/`
+
+- `proc_macro.rs`: `name: func_name.clone()` (×3) becomes `name: *func_name`.
+  `Some((trait_name.as_name(), Box::new([])))` becomes
+  `Some((trait_name.as_name(), Box::default()))`, the same empty box with no allocation.
+- `mod_resolution.rs`, `let candidate_files: Box<[String]> = match attr_path {`: put
+  `// alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them`
+  on the line above each of `let mut path = String::new();`, `Box::new([path])` and
+  `Box::new([format!("{dir}{name}.rs"), format!("{dir}{name}/mod.rs")])`.
+- `assoc.rs`:
+  - `DefDiagnostics::new(vec![]),` gets `// alloc: empty; allocates nothing`;
+  - `items: Vec::new(),` and `diagnostics: Vec::new(),` in the collector's constructor get
+    `// alloc: the query's result, once per trait or impl`.
+- `attr_resolution.rs`, `let mut tt = tt.clone();`: `// clone: the attribute macro call's own
+  argument (its delimiter is changed), once per call`.
+- `uses.rs` (being written): `uses: Vec::new(),`, `unresolved: Vec::new(),`,
+  `let mut ambiguous = Vec::new();` and `let mut todo = Vec::new();` get `// alloc: once per
+  execution, the result's storage`. The `globs: ..collect(),` gets `// alloc: the result`. If
+  `todo` is a worklist that runs per module, `SmallVec<[_; 8]>` keeps it inline instead.
+
+### Check after applying
+
+`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": "."}' | rg 'crates/hir-def/src/(nameres|item_scope|resolver|find_path|import_map)'`
+shows only `collector.rs` (until it is `#[cfg(test)]`), `facts/` (frontend-nameres's) and the
+`dyn SourceDatabase` lines until frontend-db-def's rewrite. `blaze test -p hir-def
+nameres_budgets` passes.
+
+Status: open

@@ -4,7 +4,6 @@
 #[path = "../tests/db.rs"]
 mod db;
 
-use base_db::SourceDatabase;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId};
 use hir_def::{

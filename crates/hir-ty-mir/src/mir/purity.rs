@@ -9,6 +9,7 @@
 //! as pure, as fn-cache takes core and alloc. What an argument with interior mutability holds
 //! is not looked at here: what keeps a result by its arguments refuses those itself.
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -65,7 +66,7 @@ impl Impure {
 
 /// Whether `func` is a `const fn`, not one of a trait, that is const-pure: what fn-cache needs
 /// not look past.
-pub fn is_const_pure(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn is_const_pure(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).is_const()
         && !of_a_trait(db, func)
         && const_purity(db, func).is_none()
@@ -74,7 +75,7 @@ pub fn is_const_pure(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// Why `func`, a function const code may call (a `const fn`, or a method of a trait or of an
 /// `impl` of one), is not const-pure, if it is not.
 #[salsa::tracked(returns(ref), cycle_result = const_purity_cycle_result)]
-pub fn const_purity<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<Impure> {
+pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
     let unknown =
         |what: String, span: MirSpan| Impure { what, through: Vec::new(), span, told: false };
     let signature = FunctionSignature::of(db, func);
@@ -85,9 +86,11 @@ pub fn const_purity<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<I
         return None;
     }
     if !signature.is_const() && !of_a_trait(db, func) {
+        // alloc: error path
         return Some(unknown("is not a `const fn`".to_owned(), MirSpan::Unknown));
     }
     let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(func.into())) else {
+        // alloc: error path
         return Some(unknown("has MIR blaze can't read".to_owned(), MirSpan::Unknown));
     };
     let own = krate.data(db).origin.is_local();
@@ -137,6 +140,7 @@ pub fn const_purity<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<I
                 };
                 if glue {
                     first_unknown.get_or_insert_with(|| {
+                        // alloc: error path
                         unknown("drops a value with drop glue".to_owned(), terminator.span)
                     });
                 }
@@ -169,7 +173,7 @@ pub fn const_purity<'db>(db: &'db dyn HirDatabase, func: FunctionId) -> Option<I
 /// Every function of a cycle of calls gets what this gives, so it can't say pure for one that
 /// is not.
 fn const_purity_cycle_result(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     _: salsa::Id,
     _func: FunctionId,
 ) -> Option<Impure> {
@@ -184,7 +188,7 @@ fn const_purity_cycle_result(
 /// What an assignment does that is not pure, and whether that is told: a static's state read,
 /// or in code of the workspace a raw pointer gone through or an address taken as a number.
 fn assigned(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: base_db::Crate,
     body: &MirBody<'_>,
     own: bool,
@@ -206,15 +210,17 @@ fn assigned(
 }
 
 /// What a function called by `callee` does that is not pure, said with the way to it.
-fn called(db: &dyn HirDatabase, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
+fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
     let unknown =
         |what: String| Impure { what, through: Vec::new(), span: MirSpan::Unknown, told: false };
     let ty: Ty<'_> = match &callee.kind {
         OperandKind::Constant { ty, .. } => ty.as_ref(),
         OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+        // alloc: error path
         _ => return Some(unknown("calls a function pointer or a closure".to_owned())),
     };
     let TyKind::FnDef(def, args) = ty.kind() else {
+        // alloc: error path
         return Some(unknown("calls a function pointer or a closure".to_owned()));
     };
     let CallableDefId::FunctionId(func) = def.0 else { return None };
@@ -227,6 +233,7 @@ fn called(db: &dyn HirDatabase, krate: base_db::Crate, callee: &Operand) -> Opti
             Some(it) => it,
             None => {
                 let name = FunctionSignature::of(db, func).name.as_str().to_owned();
+                // alloc: error path
                 return Some(unknown(format!("calls `{name}` of a trait, for a type not known")));
             }
         },
@@ -240,7 +247,7 @@ fn called(db: &dyn HirDatabase, krate: base_db::Crate, callee: &Operand) -> Opti
 
 /// The body a call of a trait's method `func` runs, when its arguments tell it.
 fn resolved<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: base_db::Crate,
     func: FunctionId,
     args: GenericArgs<'db>,
@@ -255,19 +262,19 @@ fn resolved<'db>(
     }
 }
 
-fn diverges(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn diverges(db: &Db, func: FunctionId) -> bool {
     let output = db.callable_item_signature(func.into()).skip_binder().skip_binder().output();
     matches!(output.kind(), TyKind::Never)
 }
 
 /// What reading `operand` reads of a static that changes: "reads or writes mutable state:
 /// `X` is a `static mut`".
-fn state_read(db: &dyn HirDatabase, krate: base_db::Crate, operand: &Operand) -> Option<String> {
+fn state_read(db: &Db, krate: base_db::Crate, operand: &Operand) -> Option<String> {
     let OperandKind::Static(id) = &operand.kind else { return None };
     static_state(db, krate, *id)
 }
 
-fn static_state(db: &dyn HirDatabase, krate: base_db::Crate, id: StaticId) -> Option<String> {
+fn static_state(db: &Db, krate: base_db::Crate, id: StaticId) -> Option<String> {
     let signature = StaticSignature::of(db, id);
     if signature.flags.contains(StaticFlags::EXTERN) {
         let name =

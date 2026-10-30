@@ -18,7 +18,7 @@
 //!
 //!
 //! See the full discussion : <https://rust-lang.zulipchat.com/#narrow/stream/131828-t-compiler/topic/Eager.20expansion.20of.20built-in.20macros>
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use span::SyntaxContext;
 use syntax::{
     AstPtr, SyntaxElement, SyntaxNode, TextSize, WalkEvent, syntax_editor::SyntaxEditor,
@@ -33,13 +33,13 @@ use crate::{
     span_map::{InOrder, SpanMap},
 };
 
-pub type EagerCallBackFn<'a> = &'a mut dyn FnMut(
+pub type EagerCallBackFn<'a> = &'a mut dyn FnMut( // dyn: one call per macro call the eager input holds, not per token
     InFile<(syntax::AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>,
     MacroCallId,
 );
 
 pub fn expand_eager_macro_input(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
     macro_call: &ast::MacroCall,
     ast_id: AstId<ast::MacroCall>,
@@ -47,10 +47,10 @@ pub fn expand_eager_macro_input(
     call_site: SyntaxContext,
     macro_depth: u32,
     recursion_limit: u32,
-    resolver: &dyn Fn(&ModPath) -> Option<MacroDefId>,
+    resolver: &dyn Fn(&ModPath) -> Option<MacroDefId>, // dyn: one call per nested macro call
     eager_callback: EagerCallBackFn<'_>,
 ) -> ExpandResult<Option<MacroCallId>> {
-    let expand_to = ExpandTo::from_call_site(macro_call);
+    let expand_to = ExpandTo::of_call_site(macro_call);
 
     // Note:
     // When `lazy_expand` is called, its *parent* file must already exist.
@@ -66,6 +66,14 @@ pub fn expand_eager_macro_input(
     let arg_id = MacroCallId::new(db, loc);
     #[expect(deprecated, reason = "builtin eager macros are never derives")]
     let (_, _, span) = arg_id.macro_arg(db);
+    let expand_to = match expand_to {
+        Ok(it) => it,
+        Err(parent) => {
+            // alloc: an error's message, on the error path
+            let message = format!("blaze can't tell what a macro call in a `{parent:?}` expands to");
+            return ExpandResult::new(None, ExpandError::other(*span, message));
+        }
+    };
     let ExpandResult { value: (arg_exp, arg_exp_map), err: parse_err } =
         arg_id.parse_macro_expansion(db);
 
@@ -86,7 +94,7 @@ pub fn expand_eager_macro_input(
             eager_callback,
         )
     };
-    let err = parse_err.clone().or(err);
+    let err = parse_err.clone().or(err); // clone: an `Option<ExpandError>`: an `Arc` count, only on error
     if cfg!(debug_assertions) {
         arg_map.finish();
     }
@@ -110,10 +118,10 @@ pub fn expand_eager_macro_input(
         kind: MacroCallKind::FnLike {
             ast_id,
             expand_to,
-            eager: Some(Box::new(EagerCallInfo {
+            eager: Some(Box::new(EagerCallInfo { // alloc: the eager call's interned key, once per eager call
                 arg: subtree,
                 arg_id,
-                error: err.clone(),
+                error: err.clone(), // clone: an `Option<ExpandError>`: an `Arc` count, only on error
                 span: *span,
             })),
         },
@@ -125,7 +133,7 @@ pub fn expand_eager_macro_input(
 }
 
 fn lazy_expand<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     def: &MacroDefId,
     macro_call: &ast::MacroCall,
     ast_id: AstId<ast::MacroCall>,
@@ -150,7 +158,7 @@ fn lazy_expand<'db>(
 }
 
 fn eager_macro_recur(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span_map: &ExpansionSpanMap,
     expanded_map: &mut ExpansionSpanMap,
     mut offset: TextSize,
@@ -159,12 +167,12 @@ fn eager_macro_recur(
     call_site: SyntaxContext,
     macro_depth: u32,
     recursion_limit: u32,
-    macro_resolver: &dyn Fn(&ModPath) -> Option<MacroDefId>,
+    macro_resolver: &dyn Fn(&ModPath) -> Option<MacroDefId>, // dyn: one call per nested macro call
     eager_callback: EagerCallBackFn<'_>,
 ) -> ExpandResult<Option<(SyntaxNode, TextSize)>> {
-    let original = curr.value.clone();
+    let original = curr.value.clone(); // clone: a node handle, a non-atomic count
 
-    let mut replacements = Vec::new();
+    let mut replacements = Vec::new(); // alloc: none unless a nested call is replaced
 
     // FIXME: We only report a single error inside of eager expansions
     let mut error = None;
@@ -201,7 +209,7 @@ fn eager_macro_recur(
                     let edition = krate.data(db).edition;
                     error = Some(ExpandError::other(
                         span_map.span_at(call.syntax().text_range().start()),
-                        format!("unresolved macro {}", path.display(db, edition)),
+                        format!("unresolved macro {}", path.display(db, edition)), // alloc: an error's message, on the error path
                     ));
                     offset += call.syntax().text_range().len();
                     continue;
@@ -253,10 +261,10 @@ fn eager_macro_recur(
                         let syntax_node = parse.syntax_node();
                         ExpandResult {
                             value: Some((
-                                syntax_node.clone(),
+                                syntax_node.clone(), // clone: a node handle, a non-atomic count
                                 offset + syntax_node.text_range().len(),
                             )),
-                            err: err.clone().or_else(|| err2.clone()),
+                            err: err.clone().or_else(|| err2.clone()), // clone: an `Option<ExpandError>`: an `Arc` count, only on error
                         }
                     }
                     None => ExpandResult { value: None, err },
@@ -321,6 +329,6 @@ fn eager_macro_recur(
     }
     let (editor, _) = SyntaxEditor::new(original);
     replacements.into_iter().rev().for_each(|(old, new)| editor.replace(old.syntax(), new));
-    let expanded = editor.finish().new_root().clone();
+    let expanded = editor.finish().new_root().clone(); // clone: a node handle, a non-atomic count
     ExpandResult { value: Some((expanded, offset)), err: error }
 }

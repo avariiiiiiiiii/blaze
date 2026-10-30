@@ -1,8 +1,12 @@
 //! Lowering of `format_args!()`.
 
+use std::fmt::Write as _;
+
+use arrayvec::ArrayString;
 use base_db::FxIndexSet;
 use hir_expand::name::{AsName, Name};
 use intern::{Symbol, sym};
+use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::{
     AstPtr, AstToken as _,
@@ -11,7 +15,7 @@ use syntax::{
 
 use crate::{
     builtin_type::{BuiltinInt, BuiltinUint},
-    expr_store::{HygieneId, lower::ExprCollector, path::Path},
+    expr_store::{HygieneId, lower::ExprCollector},
     hir::{
         Array, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, Statements, Unsafe,
         format_args::{
@@ -31,9 +35,10 @@ impl<'db> ExprCollector<'db> {
         syntax_ptr: AstPtr<ast::Expr>,
     ) -> ExprId {
         let mut args = FormatArgumentsCollector::default();
-        let mut written = Vec::new();
+        let mut written = SmallVec::<[bool; 16]>::new();
         f.args().for_each(|arg| {
             let expr = arg.expr();
+            // clone: a syntax node's count bump, once per argument.
             written.push(expr.clone().is_some_and(is_written_literal));
             args.add(FormatArgument {
                 kind: match arg.name() {
@@ -47,14 +52,17 @@ impl<'db> ExprCollector<'db> {
         let template = f.template();
         let fmt_snippet = template.as_ref().and_then(|it| match it {
             ast::Expr::Literal(literal) => match literal.kind() {
+                // alloc: `format_args::parse` takes an owned snippet, once per call.
                 ast::LiteralKind::String(s) => Some(s.text().to_owned()),
                 _ => None,
             },
             _ => None,
         });
         let record = self.store.record;
+        // alloc: the source-map side table it stores, once per call.
         let mut mappings = vec![];
         let (mut fmt, hygiene) = match template.and_then(|template| {
+            // clone: a syntax node's count bump, once per call.
             self.expand_macros_to_string(template.clone()).map(|it| (it, template))
         }) {
             Some(((s, is_direct_literal), template)) => {
@@ -68,7 +76,7 @@ impl<'db> ExprCollector<'db> {
                     args,
                     is_direct_literal,
                     |name, range| {
-                        let expr_id = self.store.alloc_path_expr(Path::from(name));
+                        let expr_id = self.store.alloc_name_path_expr(name);
                         if record && let Some(range) = range {
                             self.store
                                 .template_map
@@ -129,10 +137,12 @@ impl<'db> ExprCollector<'db> {
         // into the arguments array.
         let mut argmap = FxIndexSet::default();
 
+        // alloc: empty unless adjacent literals coalesce, once per call.
         let mut incomplete_lit = String::new();
 
         let mut implicit_arg_index = 0;
 
+        // alloc: the template bytes it stores as the literal, once per call.
         let mut bytecode = Vec::new();
 
         let template = if fmt.template.is_empty() {
@@ -172,7 +182,7 @@ impl<'db> ExprCollector<'db> {
                             sym::from_str,
                         );
                         let sym =
-                            if incomplete_lit.is_empty() { sym.clone() } else { Symbol::intern(s) };
+                            if incomplete_lit.is_empty() { *sym } else { Symbol::intern(s) };
                         let s = self.store.alloc_literal_expr(Literal::String(sym));
                         let from_str = self
                             .alloc_expr(Expr::Call { callee: from_str, args: &[s] }, syntax_ptr);
@@ -303,9 +313,9 @@ impl<'db> ExprCollector<'db> {
             // Generate:
             //     super let args = (&arg0, &arg1, &…);
             let args_name = self.generate_new_name();
-            let args_path = Path::from(args_name.clone());
+            let args_path = self.store.push_name_path(args_name);
             let args_binding = self.alloc_binding(
-                args_name.clone(),
+                args_name,
                 BindingAnnotation::Unannotated,
                 HygieneId::ROOT,
             );
@@ -341,7 +351,7 @@ impl<'db> ExprCollector<'db> {
             //     ];
             let args_mark = self.store.list_mark();
             for &(arg_index, ty) in &argmap {
-                let args_ident_expr = self.store.alloc_path_expr(args_path.clone());
+                let args_ident_expr = self.store.alloc_path_expr(args_path);
                 let arg = self.alloc_expr_desugared(Expr::Field {
                     expr: args_ident_expr,
                     name: &Name::new_tuple_field(arg_index),
@@ -438,7 +448,7 @@ impl<'db> ExprCollector<'db> {
     /// expand to placeholders the code generator puts the place in the source for, and a byte
     /// `b'x'`, which rustc leaves alone, lowers to what `120u8` does.
     fn inline_literals(&mut self, fmt: &mut FormatArgs, written: &[bool]) {
-        let mut remove = vec![false; fmt.arguments.arguments.len()];
+        let mut remove = SmallVec::<[bool; 16]>::from_elem(false, fmt.arguments.arguments.len());
         for piece in fmt.template.iter_mut() {
             let FormatArgsPiece::Placeholder(placeholder) = piece else { continue };
             let Ok(index) = placeholder.argument.index else { continue };
@@ -467,14 +477,14 @@ impl<'db> ExprCollector<'db> {
             }
         }
         fmt.arguments.arguments = kept.into_boxed_slice();
-        let moved: Vec<usize> = remove
+        let moved = remove
             .iter()
             .scan(0, |next, &remove| {
                 let index = *next;
                 *next += usize::from(!remove);
                 Some(index)
             })
-            .collect();
+            .collect::<SmallVec<[usize; 16]>>();
         for_all_argument_indexes(&mut fmt.template, |index| *index = moved[*index]);
     }
 
@@ -485,9 +495,15 @@ impl<'db> ExprCollector<'db> {
         while let Expr::Ref { expr: inner, rawness: Rawness::Ref, .. } = self.store.expr(expr) {
             expr = inner;
         }
-        let fits = |n: u128, max: u128| (n <= max).then(|| Symbol::intern(&n.to_string()));
+        let fits = |n: u128, max: u128| {
+            (n <= max).then(|| {
+                let mut digits = ArrayString::<40>::new();
+                write!(digits, "{n}").expect("a u128 has at most 39 digits");
+                Symbol::intern(&digits)
+            })
+        };
         match self.store.expr(expr) {
-            Expr::Literal(Literal::String(text)) => Some(text.clone()),
+            Expr::Literal(Literal::String(text)) => Some(*text),
             Expr::Literal(Literal::Int(n, ty)) => {
                 let max = match ty {
                     None | Some(BuiltinInt::I32) => i32::MAX as u128,

@@ -26,7 +26,15 @@
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
 //! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]). Each is computed by `#[salsa::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
+//!
+//! Memory (docs/v2/plan/design/memory.md): a crate's tables (its key index, its hash columns)
+//! sit in reserved regions of `blaze-mem`, which grow in place and never move. A query's
+//! temporaries come from its task's frame, but only in a query whose own nesting is bounded (a
+//! crate's tables, an index, a leaf that calls no query): a hash fills each ref by the hash of
+//! the item it names, so hashing nests as deep as the graph of refs, past the frames a worker
+//! keeps warm. Preimages are written into the worker's scratch buffers.
 
+#![feature(allocator_api)]
 #![forbid(unsafe_code)]
 
 mod bound;
@@ -39,6 +47,11 @@ pub mod table;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::{QueryKey, QueryKind};
 use hir_def::{
@@ -88,7 +101,7 @@ impl ItemId {
         }
     }
 
-    pub fn krate(self, db: &dyn hir_ty::db::HirDatabase) -> base_db::Crate {
+    pub fn krate(self, db: &Db) -> base_db::Crate {
         use hir_def::HasModule;
         match self {
             ItemId::Function(it) => it.krate(db),
@@ -138,7 +151,7 @@ impl From<AssocItemId> for ItemId {
 
 impl ItemId {
     /// The item a body is of: an enum variant's discriminant is its enum's.
-    pub fn of_body(db: &dyn hir_ty::db::HirDatabase, body: DefWithBodyId) -> ItemId {
+    pub fn of_body(db: &Db, body: DefWithBodyId) -> ItemId {
         use hir_def::Lookup;
         match body {
             DefWithBodyId::FunctionId(it) => ItemId::Function(it),

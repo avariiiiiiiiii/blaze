@@ -34,7 +34,8 @@ use super::{
     job::Value,
     plane::Inline,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Reader, Runs, Selection, Source, SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, KeptFront, Library, Output, Put, Reader, Runs,
+        Selection, Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -66,7 +67,19 @@ thread_local! {
     /// as one of a task that is still running.
     static KEEP: Cell<bool> = const { Cell::new(false) };
     static HOLD: RefCell<Vec<FakeReader>> = const { RefCell::new(Vec::new()) };
+    /// How many times a job asked the plan ([`Steps::plan`]), from the database or not.
+    static ASKS: Cell<usize> = const { Cell::new(0) };
+    /// How many lowerings were given the head's last front end, and how many lowered anew.
+    static INTO_KEPT: Cell<usize> = const { Cell::new(0) };
+    static ANEW: Cell<usize> = const { Cell::new(0) };
+    /// How many times the standard library's files were read.
+    static LIBRARY_READS: Cell<usize> = const { Cell::new(0) };
+    /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`].
+    static OUTPUT: Cell<bool> = const { Cell::new(false) };
 }
+
+const APP: &[u8] = b"\x7fELF the program\n";
+const APP_AT: &str = "/w/target/debug/app";
 
 fn needed() -> Vec<Fetch> {
     vec![
@@ -265,13 +278,28 @@ impl Steps for Fake {
         Ok(source)
     }
 
-    fn library(&self) -> Result<(String, Source), ApiError> {
+    fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
+        let fingerprint = "fake library".to_owned();
+        if kept.iter().any(|(it, at)| *it == fingerprint && at == LIBRARY) {
+            return Ok(Library { at: LIBRARY.into(), fingerprint, source: None });
+        }
+        LIBRARY_READS.set(LIBRARY_READS.get() + 1);
         let file = SourceFile { path: "core/src/lib.rs".into(), bytes: b"#![no_core]\n".to_vec(), mode: blaze_vfs::Mode::Regular };
-        Ok((LIBRARY.into(), Source { files: vec![file], under: String::new() }))
+        Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
     }
 
-    fn lower(&self, job: &JobInput) -> Result<FrontEnd, Failed> {
-        let writer = FakeWriter { inputs: Arc::new(FakeInputs::default()), asked: Vec::new() };
+    fn lower(&self, job: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed> {
+        let inputs = match kept.and_then(KeptFront::take::<FakeInputs>) {
+            Some(inputs) => {
+                INTO_KEPT.set(INTO_KEPT.get() + 1);
+                inputs
+            }
+            None => {
+                ANEW.set(ANEW.get() + 1);
+                FakeInputs::default()
+            }
+        };
+        let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new() };
         Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer: Box::new(writer) })
     }
 
@@ -280,6 +308,7 @@ impl Steps for Fake {
     }
 
     fn plan(&self, db: &Database, view: ViewId) -> Result<Planned, Failed> {
+        ASKS.set(ASKS.get() + 1);
         match db.pin().get::<FakePlan>(view, &()) {
             Ok(planned) => Ok(planned.get()),
             Err(DbError::Cancelled) => Err(Failed::Again),
@@ -339,6 +368,20 @@ impl Writer for FakeWriter {
         inputs.runs.append(&mut self.asked);
         APPLIES.with(|it| it.set(it.get() + 1));
         Ok(true)
+    }
+
+    fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
+        match Arc::get_mut(&mut self.inputs) {
+            Some(inputs) => Ok(vec![("run", inputs.runs.len() as u64, 0)]),
+            None => Err(ApiError::new("a task still reads the front end", None).into()),
+        }
+    }
+
+    fn keep(mut self: Box<Self>) -> Option<KeptFront> {
+        if !matches!(self.apply(), Ok(true)) {
+            return None;
+        }
+        Arc::into_inner(self.inputs).map(KeptFront::new)
     }
 }
 
@@ -416,7 +459,13 @@ impl Front for FakeFront {
         if unit == 0 && KEEP.get() {
             HOLD.with(|it| it.borrow_mut().push(reader));
         }
-        Ok(Compiled { diagnostics: Vec::new(), ok: true, puts: Vec::new(), outputs: Vec::new(), artifact: None, macros: None })
+        let (mut puts, mut outputs) = (Vec::new(), Vec::new());
+        if unit == 3 && OUTPUT.get() {
+            let key = blaze_cas::Key(ContentId::of("blaze serve tests output", APP));
+            puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
+            outputs.push(Output { path: APP_AT.into(), key, executable: true });
+        }
+        Ok(Compiled { diagnostics: Vec::new(), ok: true, puts, outputs, artifact: None, macros: None })
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<Box<dyn Runs>, ApiError> {
@@ -457,8 +506,9 @@ impl Front for FakeFront {
         Ok(Vec::new())
     }
 
-    fn tables(&self, _: Reader, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
-        Ok(Vec::new())
+    fn tables(&self, mut writer: Box<dyn Writer>, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+        let counted = writer.tables()?;
+        Ok(counted.into_iter().map(|(name, elements, bytes)| Table { name: name.to_owned(), elements, bytes }).collect())
     }
 }
 
@@ -649,6 +699,7 @@ fn the_mount_table_survives_a_restart() {
     let before = sorted(&daemon);
     assert_eq!(before.len(), 3);
     let roots = daemon.mounts().roots();
+    assert_eq!(LIBRARY_READS.get(), 1);
 
     let mut daemon = restart(daemon, &steps, 4);
     assert_eq!(sorted(&daemon), before);
@@ -660,6 +711,7 @@ fn the_mount_table_survives_a_restart() {
     assert!(!got.iter().any(|it| matches!(it, Response::Fetched { .. })), "nothing fetched again: {got:#?}");
     let fetched = steps.fetched.lock().unwrap().clone();
     assert!(fetched.values().all(|&it| it == 1), "each source fetched once: {fetched:?}");
+    assert_eq!(LIBRARY_READS.get(), 1, "the library's files are read once, not again by the next daemon");
 }
 
 #[test]
@@ -850,6 +902,57 @@ fn no_reader_posted_after_a_write_sees_the_inputs_before_it_over_many_seeds() {
         assert_eq!(seen(), vec![(0, Vec::new()), (SCRIPTS + 1, all)], "seed {seed}");
         assert!((1..=SCRIPTS).contains(&APPLIES.get()), "seed {seed}: {} writes", APPLIES.get());
     }
+}
+
+#[test]
+fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_end() {
+    let mut sim = Sim::new(11, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 11);
+    let mut client = dial(&mut daemon);
+    let build = |client: &mut Client, daemon: &mut Daemon<Sim>| {
+        let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    };
+    // The first build writes the lock file into the checkout, so the second's view is another.
+    build(&mut client, &mut daemon);
+    build(&mut client, &mut daemon);
+    let (asks, anew, into_kept) = (ASKS.get(), ANEW.get(), INTO_KEPT.get());
+    assert!(into_kept >= 1, "the second build lowers into the first's front end");
+    build(&mut client, &mut daemon);
+    assert_eq!(ASKS.get(), asks, "the view and its config are the last build's: its plan is not asked");
+    assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 1));
+
+    daemon.driver().change(&name("w/src/main.rs"), b"fn main() { }\n");
+    build(&mut client, &mut daemon);
+    assert_eq!(ASKS.get(), asks + 1, "a changed view's plan is asked");
+    assert_eq!((ANEW.get(), INTO_KEPT.get()), (anew, into_kept + 2));
+}
+
+#[test]
+fn an_output_is_placed_again_once_its_file_is_not_as_placed() {
+    let mut sim = Sim::new(12, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 12);
+    OUTPUT.set(true);
+    let mut client = dial(&mut daemon);
+    let app = name(&APP_AT[1..]);
+    let mut build = |daemon: &mut Daemon<Sim>| {
+        let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+        let got = client.wait(daemon, id);
+        assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+        assert_eq!(daemon.driver().contents(&app), APP);
+        assert_eq!(daemon.driver().mode(&app).map(|it| it & 0o777), Some(0o755));
+    };
+    build(&mut daemon);
+    build(&mut daemon);
+    daemon.driver().delete(&app);
+    build(&mut daemon);
+    daemon.driver().change(&app, b"a file longer than the one the build placed\n");
+    build(&mut daemon);
 }
 
 /// What one client asked and how it ended.

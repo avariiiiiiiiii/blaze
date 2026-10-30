@@ -57,10 +57,12 @@ impl SpanTable {
 
     pub fn decode(bytes: &[u8]) -> Result<SpanTable, String> {
         let spans = Spans::new(bytes)?;
-        Ok(SpanTable {
-            files: (0..spans.files()).map(|it| spans.file(it).to_owned()).collect(),
-            spans: (0..spans.len()).map(|it| spans.span(it).expect("in range")).collect(),
-        })
+        let mut files = Vec::with_capacity(spans.files() as usize);
+        // alloc: the edge: the public `SpanTable` owns its file names
+        files.extend((0..spans.files()).map(|it| spans.file(it).to_owned()));
+        let mut list = Vec::with_capacity(spans.len() as usize);
+        list.extend((0..spans.len()).map(|it| spans.span(it).expect("in range")));
+        Ok(SpanTable { files, spans: list })
     }
 
     /// The content ID of the table, which the image keeps to tell a changed one.
@@ -86,33 +88,39 @@ impl Spans {
     pub fn new(bytes: &[u8]) -> Result<Spans, String> {
         let mut read = Reader { bytes, at: 0 };
         if read.take(8)? != MAGIC {
+            // alloc: error path
             return Err("not a span table: its magic is wrong".to_owned());
         }
         let files = read.word()?;
         let index = (files as usize).checked_mul(4).filter(|it| *it <= bytes.len()).ok_or("a span table cut short")?;
-        let mut buf = Vec::with_capacity(index + bytes.len());
-        for _ in 0..files {
+        // An exact-size iterator collects into the `Arc` itself.
+        // alloc: the table's one buffer, once per table
+        let mut buf: Arc<[u8]> = std::iter::repeat_n(0, index + bytes.len()).collect();
+        let out = Arc::get_mut(&mut buf).expect("just made");
+        for file in 0..files as usize {
             let len = read.word()? as usize;
             let start = read.at;
             std::str::from_utf8(read.take(len)?).map_err(|_| "a file name not UTF-8")?;
-            buf.extend_from_slice(&((index + start) as u32).to_le_bytes());
+            out[file * 4..file * 4 + 4].copy_from_slice(&((index + start) as u32).to_le_bytes());
         }
         let spans = read.word()?;
         let spans_at = read.at;
         let body = (spans as usize).checked_mul(SPAN).ok_or("a span table cut short")?;
         let rest = read.take(body)?;
         if read.at != bytes.len() {
+            // alloc: error path
             return Err("bytes after a span table".to_owned());
         }
         for span in rest.chunks_exact(SPAN) {
             let file = u32::from_le_bytes(span[..4].try_into().expect("four bytes"));
             if file >= files {
+                // alloc: error path
                 return Err(format!("a span in file {file} of {files}"));
             }
         }
-        buf.extend_from_slice(bytes);
+        out[index..].copy_from_slice(bytes);
         let spans_at = u32::try_from(index + spans_at).map_err(|_| "a span table past 4 GiB")?;
-        Ok(Spans { buf: buf.into(), files, spans_at, spans })
+        Ok(Spans { buf, files, spans_at, spans })
     }
 
     /// The table's encoding, as the change carried it.
@@ -265,6 +273,25 @@ mod tests {
         let empty = SpanTable::default().encode();
         let none = Spans::new(&empty).unwrap();
         assert_eq!((none.files(), none.len(), none.span(0)), (0, 0, None));
+    }
+
+    /// Checking a table is one allocation whatever its size; reading a span or a file name,
+    /// and telling an unchanged table, none.
+    #[test]
+    fn a_table_is_one_allocation_and_reads_none() {
+        for n in [2u32, 5000] {
+            let owned = SpanTable {
+                files: (0..n).map(|it| format!("src/f{it}.rs")).collect(),
+                spans: (0..n).map(|it| Position { file: it, line: it + 1, column: 1 }).collect(),
+            };
+            let bytes = owned.encode();
+            let spans = blaze_alloc_count::assert_at_most(1, "a table checked and kept", || Spans::new(&bytes).unwrap());
+            blaze_alloc_count::assert_at_most(0, "a span, a file name, a comparison", || {
+                assert_eq!(spans.span(n - 1), Some(Position { file: n - 1, line: n, column: 1 }));
+                assert_eq!(spans.file(n - 1), owned.files[n as usize - 1]);
+                assert!(spans.is(&bytes));
+            });
+        }
     }
 
     #[test]

@@ -163,6 +163,7 @@ impl Buf {
         for fixup in &self.fixups {
             let target = match self.labels.get(fixup.label.0 as usize) {
                 Some(&UNBOUND) | None => {
+                    // alloc: the error's message, once per failed compile.
                     return Err(Error::new(format!(
                         "the {:?} field at {:#x} names {:?}, which is never placed",
                         fixup.form, fixup.at, fixup.label
@@ -175,6 +176,7 @@ impl Buf {
                 value -= i64::from(fixup.at);
             }
             enc::write(fixup.form, &mut self.bytes, fixup.at as usize, value).map_err(|e| {
+                // alloc: the error's message, once per failed compile.
                 Error::new(format!("the field at {:#x} to {:?}: {e}", fixup.at, fixup.label))
             })?;
         }

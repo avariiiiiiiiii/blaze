@@ -12,7 +12,7 @@ use crate::{
     mir::{
         CastKind, FieldIndex, LocalId, MutBorrowKind, Operand, OperandKind, Place,
         lower::{
-            AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr, Idx,
+            AssignTarget, Assigned, BasicBlockId, BinOp, BindingId, BorrowKind, Expr,
             MemoryMap, MirLowerCtx, MirLowerError, MirSpan, Pat, PatId, PlaceElem, ProjectionElem,
             ResolveValueResult, Result, Rvalue, SwitchTargets, TerminatorKind, Ty, TyKind, ValueNs,
             VariantId,
@@ -26,6 +26,7 @@ use crate::{
 
 macro_rules! not_supported {
     ($x: expr) => {
+        // alloc: error path
         return Err(MirLowerError::NotSupported(format!($x)))
     };
 }
@@ -142,9 +143,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
         // alternative binds by value is declared once the guard holds, after the rest.
         let mut bindings = Vec::new();
         let mut alternatives = false;
-        self.store.walk_pats(pattern, &mut |pat| match &self.store[pat] {
+        self.store.walk_pats(pattern, &mut |pat| match self.store.pat(pat) {
             Pat::Or(_) => alternatives = true,
-            &Pat::Bind { id, .. } if !bindings.contains(&id) => bindings.push(id),
+            Pat::Bind { id, .. } if !bindings.contains(&id) => bindings.push(id),
             _ => (),
         });
         if alternatives {
@@ -171,13 +172,13 @@ impl<'db> MirLowerCtx<'_, 'db> {
     /// The bindings `pattern` binds by value in the first alternative of each of its
     /// or-patterns, which rustc's binding modes for a guarded arm follow.
     fn first_alternative_by_value(&self, pattern: PatId, found: &mut Vec<BindingId>) {
-        match &self.store[pattern] {
+        match self.store.pat(pattern) {
             Pat::Or(alternatives) => {
                 if let Some(&first) = alternatives.first() {
                     self.first_alternative_by_value(first, found);
                 }
             }
-            &Pat::Bind { id, .. } => {
+            Pat::Bind { id, .. } => {
                 if let BindingMode(ByRef::No, _) = self.infer.binding_modes[pattern] {
                     found.push(id);
                 }
@@ -202,7 +203,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
     /// Every way of choosing one alternative from each or-pattern in `pattern`, in the order
     /// rustc tries them. A choice maps an or-pattern to the index of its alternative.
     pub(super) fn or_expansions(&self, pattern: PatId) -> Vec<Vec<(PatId, usize)>> {
-        if let Pat::Or(alternatives) = &self.store[pattern] {
+        if let Pat::Or(alternatives) = self.store.pat(pattern) {
             return alternatives
                 .iter()
                 .enumerate()
@@ -215,7 +216,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 .collect();
         }
         let mut expansions = vec![Vec::new()];
-        self.store[pattern].walk_child_pats(|child| {
+        self.store.pat(pattern).walk_child_pats(|child| {
             let children = self.or_expansions(child);
             if children.len() == 1 && children[0].is_empty() {
                 return;
@@ -325,7 +326,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 }
             };
         }
-        Ok(match &self.store[pattern] {
+        Ok(match self.store.pat(pattern) {
             Pat::Missing | Pat::Rest | Pat::NotNull => {
                 return Err(MirLowerError::IncompletePattern);
             }
@@ -344,7 +345,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     current,
                     current_else,
                     args,
-                    *ellipsis,
+                    ellipsis,
                     (0..subst.len()).map(|i| PlaceElem::Field(FieldIndex(i as u32))),
                     &cond_place,
                     mode,
@@ -453,14 +454,14 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 };
                 if mode == MatchingMode::Check {
                     if let Some(start) = start {
-                        add_check(start, BinOp::Le)?;
+                        add_check(&start, BinOp::Le)?;
                     }
                     if let Some(end) = end {
                         let op = match range_type {
                             syntax::ast::RangeOp::Exclusive => BinOp::Gt,
                             syntax::ast::RangeOp::Inclusive => BinOp::Ge,
                         };
-                        add_check(end, op)?;
+                        add_check(&end, op)?;
                     }
                 }
                 (current, current_else)
@@ -552,9 +553,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     (current, current_else) =
                         self.pattern_match_inner(current, current_else, next_place, pat, mode)?;
                 }
-                if let &Some(slice) = slice
+                if let Some(slice) = slice
                     && mode != MatchingMode::Check
-                    && let Pat::Bind { id, subpat: _ } = self.store[slice]
+                    && let Pat::Bind { id, subpat: _ } = self.store.pat(slice)
                 {
                     let next_place = cond_place.project(ProjectionElem::Subslice {
                         from: prefix.len() as u64,
@@ -595,6 +596,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 None => {
                     let unresolved_name = || MirLowerError::UnresolvedName {
                         owner: self.owner.expression_store_owner(self.db),
+                        // clone: error path
                         path: p.clone(),
                     };
                     // A path that starts at a type, `<T>::C`, is one only inference resolves.
@@ -675,7 +677,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     (next, Some(else_target))
                 }
             },
-            Pat::Lit(l) => match &self.store[*l] {
+            Pat::Lit(l) => match self.store.expr(l) {
                 Expr::Literal(l) => {
                     if mode == MatchingMode::Check {
                         let mut ty = self.infer.pat_ty(pattern);
@@ -714,12 +716,12 @@ impl<'db> MirLowerCtx<'_, 'db> {
             Pat::Bind { id, subpat } => {
                 if let Some(subpat) = subpat {
                     (current, current_else) =
-                        self.pattern_match_inner(current, current_else, cond_place, *subpat, mode)?
+                        self.pattern_match_inner(current, current_else, cond_place, subpat, mode)?
                 }
                 if mode != MatchingMode::Check {
                     let mode = self.infer.binding_modes[pattern];
                     self.pattern_match_binding(
-                        *id,
+                        id,
                         mode,
                         cond_place,
                         pattern.into(),
@@ -740,7 +742,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     current,
                     pattern.into(),
                     current_else,
-                    AdtPatternShape::Tuple { args, ellipsis: *ellipsis },
+                    AdtPatternShape::Tuple { args, ellipsis },
                     mode,
                 )?
             }
@@ -752,9 +754,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     ));
                 }
                 let cond_place = cond_place.project(ProjectionElem::Deref);
-                self.pattern_match_inner(current, current_else, cond_place, *pat, mode)?
+                self.pattern_match_inner(current, current_else, cond_place, pat, mode)?
             }
-            &Pat::Expr(expr) => {
+            Pat::Expr(expr) => {
                 stdx::always!(
                     mode == MatchingMode::Assign,
                     "Pat::Expr can only come in destructuring assignments"
@@ -764,11 +766,11 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 self.read_assigned(current, AssignTarget::Place(expr), ty, value, expr.into())?;
                 (current, current_else)
             }
-            &Pat::Box { inner } => {
+            Pat::Box { inner } => {
                 let cond_place = cond_place.project(ProjectionElem::Deref);
                 self.pattern_match_inner(current, current_else, cond_place, inner, mode)?
             }
-            &Pat::Deref { inner } => {
+            Pat::Deref { inner } => {
                 let pointer = self.place_ty(&cond_place);
                 let (cond_place, next) = self.deref_pattern_place(
                     current,
@@ -878,7 +880,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
         current: BasicBlockId,
         c: Operand,
         cond_place: Place<'db>,
-        pattern: Idx<Pat>,
+        pattern: PatId,
     ) -> Result<'db, (BasicBlockId, Option<BasicBlockId>)> {
         let then_target = self.new_basic_block();
         let else_target = current_else.unwrap_or_else(|| self.new_basic_block());

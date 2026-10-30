@@ -5,6 +5,7 @@
 //! `variant_find_init_error`) and `compiler/rustc_lint/src/lints.rs`
 //! (`BuiltinUnpermittedTypeInit`) (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
 use hir_def::{

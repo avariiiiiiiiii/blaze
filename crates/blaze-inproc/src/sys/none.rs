@@ -7,11 +7,12 @@ use std::time::Duration;
 
 use super::Rights;
 use crate::channel::Channel;
+use crate::handshake::{Grant, Overlay};
 use crate::{Access, Error};
 
 fn unsupported<T>() -> Result<T, Error> {
     Err(Error::new(
-        "no dual-mapped code memory or loader here: blaze-inproc runs on Linux x86-64 and AArch64, \
+        "no dual-mapped code memory or start hook here: blaze-inproc runs on Linux x86-64 and AArch64, \
          macOS AArch64 and Windows x86-64",
     ))
 }
@@ -94,14 +95,6 @@ impl Stream {
     pub(crate) fn set_timeout(&mut self, _: Option<Duration>) -> Result<(), Error> {
         match *self {}
     }
-
-    pub(crate) fn raw(&self) -> i64 {
-        match *self {}
-    }
-
-    pub(crate) fn from_raw(_: i64) -> Result<Stream, Error> {
-        unsupported()
-    }
 }
 
 pub(crate) enum Listener {}
@@ -123,7 +116,11 @@ pub(crate) fn connect(_: &str) -> Result<Stream, Error> {
 pub(crate) enum Remote {}
 
 impl Remote {
-    pub(crate) fn map(&self, _: u32, _: u64, _: u64, _: u64, _: Access) -> Result<u64, Error> {
+    pub(crate) fn map(&self, _: u32, _: Access) -> Result<u64, Error> {
+        match *self {}
+    }
+
+    pub(crate) fn overlay(&self, _: u64, _: &Grant) -> Result<(), Error> {
         match *self {}
     }
 }
@@ -143,20 +140,20 @@ impl Granted {
         match *self {}
     }
 
-    pub(crate) fn map(&self, _: &mut Channel, _: u64, _: u64, _: u64, _: Access) -> Result<u64, Error> {
-        match *self {}
-    }
-
-    pub(crate) fn view(&self, _: &mut Channel) -> Result<View, Error> {
+    pub(crate) fn map_anywhere(&self, _: &mut Channel, _: Access) -> Result<u64, Error> {
         match *self {}
     }
 }
 
-pub(crate) fn reserve(_: &mut Channel, _: u64, _: Option<u64>) -> Result<u64, Error> {
+pub(crate) fn overlay(_: &mut Channel, _: &[Granted], _: &[Overlay], _: u64) -> Result<(), Error> {
     unsupported()
 }
 
-pub(crate) fn protect(_: u64, _: u64, _: Access) -> Result<(), Error> {
+pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+    unsupported()
+}
+
+pub(crate) fn clone_file(_: &Path, _: &Path) -> Result<bool, Error> {
     unsupported()
 }
 

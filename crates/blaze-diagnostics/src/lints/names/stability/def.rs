@@ -7,6 +7,7 @@
 //! `try_print_visible_def_path`, `path_crate`) and `compiler/rustc_middle/src/ty/print/mod.rs`
 //! (`default_print_def_path`, `default_print_impl_path`) (MIT or Apache-2.0).
 
+use base_db::Db;
 use blaze_items::ItemId;
 use hir::{
     Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasSource as _, HasVisibility as _, InFile, ModuleDef,
@@ -38,7 +39,7 @@ impl Def {
 
     /// What a path in the value namespace resolving to `def` names: the constructor of a
     /// tuple or unit struct or variant, else `def`.
-    pub(super) fn value(db: &dyn hir::db::HirDatabase, def: ModuleDef) -> Def {
+    pub(super) fn value(db: &Db, def: ModuleDef) -> Def {
         let variant = match def {
             ModuleDef::Adt(Adt::Struct(it)) => Variant::Struct(it),
             ModuleDef::EnumVariant(it) => Variant::EnumVariant(it),
@@ -51,7 +52,7 @@ impl Def {
     }
 
     /// The item `self` is or is of.
-    pub(super) fn item(self, db: &dyn hir::db::HirDatabase) -> ModuleDef {
+    pub(super) fn item(self, db: &Db) -> ModuleDef {
         match self {
             Def::Item(it) => it,
             Def::Field(it) => Def::variant(it.parent_def(db)).item(db),
@@ -59,7 +60,7 @@ impl Def {
         }
     }
 
-    pub(super) fn krate(self, db: &dyn hir::db::HirDatabase) -> Option<hir::Crate> {
+    pub(super) fn krate(self, db: &Db) -> Option<hir::Crate> {
         match self.item(db) {
             ModuleDef::Module(it) => Some(it.krate(db)),
             it => Some(it.module(db)?.krate(db)),
@@ -67,7 +68,7 @@ impl Def {
     }
 
     /// rustc's `def_descr`.
-    pub(super) fn descr(self, db: &dyn hir::db::HirDatabase) -> &'static str {
+    pub(super) fn descr(self, db: &Db) -> &'static str {
         match self {
             Def::Field(_) => "field",
             Def::Ctor(variant) => match (variant, kind(db, variant)) {
@@ -110,7 +111,7 @@ impl Def {
 
     /// Whether rustc checks the stability of `self` across crates: it is public
     /// (`skip_stability_check_due_to_privacy`).
-    pub(super) fn is_public(self, db: &dyn hir::db::HirDatabase) -> bool {
+    pub(super) fn is_public(self, db: &Db) -> bool {
         let visibility = match self {
             Def::Field(it) => it.visibility(db),
             Def::Ctor(it) => match it {
@@ -135,7 +136,7 @@ impl Def {
     }
 
     /// The item whose signature holds what `self` is declared with, for a fact.
-    pub(super) fn item_id(self, db: &dyn hir::db::HirDatabase) -> Option<ItemId> {
+    pub(super) fn item_id(self, db: &Db) -> Option<ItemId> {
         Some(match self.item(db) {
             ModuleDef::Function(it) => ItemId::Function(hir_def::FunctionId::try_from(it).ok()?),
             ModuleDef::Adt(it) => ItemId::Adt(it.into()),
@@ -190,7 +191,7 @@ impl Def {
 }
 
 /// The shape of `variant`'s fields.
-pub(super) fn kind(db: &dyn hir::db::HirDatabase, variant: Variant) -> StructKind {
+pub(super) fn kind(db: &Db, variant: Variant) -> StructKind {
     match variant {
         Variant::Struct(it) => it.kind(db),
         Variant::Union(it) => it.kind(db),
@@ -201,7 +202,7 @@ pub(super) fn kind(db: &dyn hir::db::HirDatabase, variant: Variant) -> StructKin
 /// The item `item` is, if it is the item of a trait impl: the trait's item of its name, whose
 /// stability and deprecation are the ones that count (`AssocContainer::TraitImpl`'s
 /// `trait_item_def_id`).
-pub(super) fn trait_item(db: &dyn hir::db::HirDatabase, item: ModuleDef) -> ModuleDef {
+pub(super) fn trait_item(db: &Db, item: ModuleDef) -> ModuleDef {
     let assoc = match item {
         ModuleDef::Function(it) => it.as_assoc_item(db),
         ModuleDef::Const(it) => it.as_assoc_item(db),

@@ -9,7 +9,8 @@
 
 use std::fmt::Write as _;
 
-use base_db::SourceDatabase;
+use base_db::Db;
+use blaze_ids::rng::SplitMix64;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
@@ -26,7 +27,7 @@ use crate::{
         path_resolution::{PathRead, ReachedFixedPoint, ResolveMode, ResolvePathResult},
     },
     per_ns::PerNs,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
     visibility::Visibility,
 };
 
@@ -82,7 +83,7 @@ impl From<ResolvePathResult> for Res {
 
 #[derive(Clone, Copy)]
 struct Reference<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     local: &'a LocalDefMap,
     mode: ResolveMode,
     shadow: BuiltinShadowMode,
@@ -320,7 +321,7 @@ fn macro_use(map: &DefMap, name: &Name) -> PerNs {
     })
 }
 
-fn is_test_harness(db: &dyn SourceDatabase, module: ModuleId) -> bool {
+fn is_test_harness(db: &Db, module: ModuleId) -> bool {
     let map = module.def_map(db);
     let Some(parent) = map.module(db, module).parent else { return false };
     map.module(db, parent)
@@ -330,7 +331,7 @@ fn is_test_harness(db: &dyn SourceDatabase, module: ModuleId) -> bool {
 }
 
 fn adjust<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     mut map: &'db DefMap,
     mut module: ModuleId,
 ) -> (&'db DefMap, ModuleId) {
@@ -345,35 +346,6 @@ fn adjust<'db>(
 
 fn name(s: &str) -> Name {
     Name::new_symbol_root(Symbol::intern(s))
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
-        &xs[self.below(xs.len())]
-    }
 }
 
 /// Every name the generated crates declare or import, plus builtins, crates and one unbound.
@@ -442,28 +414,28 @@ pub mod prelude {
 }
 "#;
 
-fn gen_use(rng: &mut Rng, out: &mut String, renames: &mut usize) {
-    let vis = rng.pick(VIS);
-    let mut path = rng.pick(USE_PREFIXES).to_string();
-    for _ in 0..rng.below(3) {
-        let _ = write!(path, "{}::", rng.pick(NAMES));
+fn gen_use(rng: &mut SplitMix64, out: &mut String, renames: &mut usize) {
+    let vis = rng.pick(VIS).unwrap();
+    let mut path = rng.pick(USE_PREFIXES).unwrap().to_string();
+    for _ in 0..rng.index(3) {
+        let _ = write!(path, "{}::", rng.pick(NAMES).unwrap());
     }
-    match rng.below(3) {
+    match rng.index(3) {
         0 if !path.is_empty() => {
             let _ = writeln!(out, "{vis}use {path}*;");
         }
         0 | 1 => {
-            let _ = writeln!(out, "{vis}use {path}{};", rng.pick(NAMES));
+            let _ = writeln!(out, "{vis}use {path}{};", rng.pick(NAMES).unwrap());
         }
         _ => {
-            let _ = writeln!(out, "{vis}use {path}{} as r{renames};", rng.pick(NAMES));
+            let _ = writeln!(out, "{vis}use {path}{} as r{renames};", rng.pick(NAMES).unwrap());
             *renames += 1;
         }
     }
 }
 
-fn gen_items(rng: &mut Rng, out: &mut String) {
-    if rng.chance(20) {
+fn gen_items(rng: &mut SplitMix64, out: &mut String) {
+    if rng.below(100) < 20 {
         out.push_str("macro_rules! mac0 { () => {} }\n");
     }
     let decls: [(&str, &str); 7] = [
@@ -476,33 +448,33 @@ fn gen_items(rng: &mut Rng, out: &mut String) {
         ("K0", "const K0: u8 = 0;"),
     ];
     for (_, decl) in decls {
-        if rng.chance(40) {
-            let _ = writeln!(out, "{}{decl}", rng.pick(VIS));
+        if rng.below(100) < 40 {
+            let _ = writeln!(out, "{}{decl}", rng.pick(VIS).unwrap());
         }
     }
     let mut renames = 0;
-    for _ in 0..rng.below(5) {
+    for _ in 0..rng.index(5) {
         gen_use(rng, out, &mut renames);
     }
 }
 
-fn gen_module(rng: &mut Rng, depth: usize, out: &mut String, block: &mut bool) {
+fn gen_module(rng: &mut SplitMix64, depth: usize, out: &mut String, block: &mut bool) {
     gen_items(rng, out);
     if depth < 3 {
         for m in ["m0", "m1", "m2", "m3"] {
-            if rng.chance(30) {
-                let _ = writeln!(out, "{}mod {m} {{", rng.pick(VIS));
+            if rng.below(100) < 30 {
+                let _ = writeln!(out, "{}mod {m} {{", rng.pick(VIS).unwrap());
                 gen_module(rng, depth + 1, out, block);
                 out.push_str("}\n");
             }
         }
     }
-    if !*block && (depth == 0 || rng.chance(25)) {
+    if !*block && (depth == 0 || rng.below(100) < 25) {
         *block = true;
         out.push_str("fn fb() {\n");
         gen_items(rng, out);
-        if rng.chance(70) {
-            let _ = writeln!(out, "{}mod mb {{", rng.pick(VIS));
+        if rng.below(100) < 70 {
+            let _ = writeln!(out, "{}mod mb {{", rng.pick(VIS).unwrap());
             gen_items(rng, out);
             out.push_str("}\n");
         }
@@ -511,7 +483,7 @@ fn gen_module(rng: &mut Rng, depth: usize, out: &mut String, block: &mut bool) {
 }
 
 fn gen_fixture(seed: u64) -> String {
-    let mut rng = Rng::new(seed);
+    let mut rng = SplitMix64::new(seed);
     let edition = match seed % 4 {
         0 => " edition:2015",
         _ => "",
@@ -519,9 +491,9 @@ fn gen_fixture(seed: u64) -> String {
     let mut out = format!(
         "//- /main.rs crate:main{edition} deps:dep,pre\n#[prelude_import]\nuse ::pre::prelude::*;\n"
     );
-    if rng.chance(30) {
+    if rng.below(100) < 30 {
         out.push_str("mod __blaze_test_harness {\nuse super::*;\n");
-        if rng.chance(50) {
+        if rng.below(100) < 50 {
             out.push_str("use super::m0::*;\n");
         }
         out.push_str("}\n");
@@ -532,7 +504,7 @@ fn gen_fixture(seed: u64) -> String {
     out
 }
 
-fn gen_path(rng: &mut Rng) -> ModPath {
+fn gen_path(rng: &mut SplitMix64) -> ModPath {
     let kind = *rng.pick(&[
         PathKind::Plain,
         PathKind::Plain,
@@ -542,13 +514,14 @@ fn gen_path(rng: &mut Rng) -> ModPath {
         PathKind::Super(1),
         PathKind::Super(2),
         PathKind::Abs,
-    ]);
+    ])
+    .unwrap();
     let min = match kind {
         PathKind::Plain | PathKind::Abs => 1,
         _ => 0,
     };
-    let len = min + rng.below(4 - min);
-    ModPath::from_segments(kind, (0..len).map(|_| name(rng.pick(NAMES))))
+    let len = min + rng.index(4 - min);
+    ModPath::from_segments(kind, (0..len).map(|_| name(rng.pick(NAMES).unwrap())))
 }
 
 /// Resolves every path in `paths` from every module of the crate and of the block at `$0`,
@@ -650,7 +623,7 @@ fn fb() {
 }
 "#,
     ];
-    let mut rng = Rng::new(7);
+    let mut rng = SplitMix64::new(7);
     let mut total = 0;
     for fixture in fixtures {
         let fixture = format!("{fixture}{DEP}");
@@ -671,7 +644,7 @@ fn paths_match_reference_on_random_crates() {
     let mut total = 0;
     for seed in 0..48 {
         let fixture = gen_fixture(seed);
-        let mut rng = Rng::new(seed + 1000);
+        let mut rng = SplitMix64::new(seed + 1000);
         total += check_fixture(&fixture, &mut || (0..30).map(|_| gen_path(&mut rng)).collect());
     }
     assert!(total > 1000, "only {total} lookups resolved");

@@ -7,6 +7,7 @@
 //!
 //! So the monomorphization should be called even if the substitution is empty.
 
+use base_db::Db;
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{
@@ -127,6 +128,7 @@ impl<'db> Filler<'db> {
         let normalize = |ty| {
             ObligationCtxt::new(&self.infcx)
                 .structurally_normalize_ty(&ObligationCause::dummy(), self.trait_env.param_env, ty)
+                // alloc: error path
                 .map_err(|_| MirLowerError::NotSupported(format!("can't normalize alias {ty:?}")))
         };
         if !alias.has_escaping_bound_vars() {
@@ -145,7 +147,7 @@ impl<'db> Filler<'db> {
         ))
     }
 
-    fn new(db: &'db dyn HirDatabase, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
+    fn new(db: &'db Db, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         Self { infcx, trait_env: env, subst, universes: Vec::new() }
@@ -195,6 +197,7 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
+            // alloc: error path
             Err(MirLowerError::NotSupported(format!(
                 "monomorphization resulted in errors: {:?}",
                 t.as_ref()
@@ -208,6 +211,7 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
+            // alloc: error path
             Err(MirLowerError::NotSupported(format!(
                 "monomorphization resulted in errors: {:?}",
                 t.as_ref()
@@ -221,6 +225,7 @@ impl<'db> Filler<'db> {
         // Can't deep normalized as that'll try to normalize consts and fail.
         *t = t.as_ref().try_fold_with(self)?.store();
         if references_non_lt_error(&t.as_ref()) {
+            // alloc: error path
             Err(MirLowerError::NotSupported(format!(
                 "monomorphization resulted in errors: {:?}",
                 t.as_ref()
@@ -373,7 +378,7 @@ impl<'db> Filler<'db> {
 /// `body` with `subst` in place of its generic parameters. The queries below keep the result;
 /// a caller that needs it once asks here instead.
 pub fn monomorphized<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &MirBody<'db>,
     subst: &StoredGenericArgs,
     trait_env: &StoredParamEnvAndCrate,
@@ -388,7 +393,7 @@ pub fn monomorphized<'db>(
 /// is with `args`, once they name the impl: `None` for one of another function, or while they
 /// don't.
 pub fn opaque_of_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     opaque: InternedOpaqueTyId<'db>,
     args: GenericArgs<'db>,
@@ -486,16 +491,15 @@ pub fn opaque_of_impl<'db>(
 
 /// `ty` of a monomorphized body with its aliases normalized, as the body's own types are.
 pub(crate) fn normalized_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: Ty<'db>,
     trait_env: ParamEnvAndCrate<'db>,
 ) -> Result<Ty<'db>, MirLowerError<'db>> {
     ty.try_fold_with(&mut Filler::new(db, trait_env, GenericArgs::empty()))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_cycle_result)]
-pub fn monomorphized_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_mir_body<'db>(
+    db: &'db Db,
     owner: InferBodyId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -506,7 +510,7 @@ pub fn monomorphized_mir_body_query<'db>(
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
 #[salsa::tracked(returns(as_ref))]
 pub fn monomorphized_promoted_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     expr: hir_def::hir::ExprId,
     subst: StoredGenericArgs,
@@ -516,19 +520,8 @@ pub fn monomorphized_promoted_mir_body_query<'db>(
     monomorphized(db, body, &subst, &trait_env)
 }
 
-fn monomorphized_mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InferBodyId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_closure_cycle_result)]
-pub fn monomorphized_mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -536,19 +529,8 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     monomorphized(db, db.mir_body_for_closure(closure)?, &subst, &trait_env)
 }
 
-fn monomorphized_mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedClosureId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
-pub fn monomorphized_mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -556,22 +538,11 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     monomorphized(db, db.mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = monomorphized_mir_body_for_coroutine_cycle_result)]
-pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_monomorphized_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
     monomorphized(db, db.mir_body_for_coroutine_by_move(coroutine)?, &subst, &trait_env)
-}
-
-fn monomorphized_mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _: InternedCoroutineId<'db>,
-    _: StoredGenericArgs,
-    _: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    Err(MirLowerError::Loop)
 }

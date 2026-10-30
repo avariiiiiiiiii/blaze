@@ -149,6 +149,7 @@ where
 
     /// Returns the `constructor_name` in `Options` if it is `Some`, else `new`
     pub(crate) fn constructor_name(&self) -> syn::Ident {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         match self.args.constructor_name.clone() {
             Some(name) => name,
             None => Ident::new("new", self.struct_item.ident.span()),
@@ -158,6 +159,7 @@ where
     /// Returns the `id` in `Options` if it is `Some`, else `salsa::Id`.
     pub(crate) fn id(&self) -> syn::Path {
         match &self.args.id {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             Some(id) => id.clone(),
             None => parse_quote!(salsa::Id),
         }
@@ -185,6 +187,7 @@ where
             if ef.has_tracked_attr {
                 return Err(syn::Error::new_spanned(
                     ef.field,
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     format!("`#[tracked]` cannot be used with `#[salsa::{}]`", A::KIND),
                 ));
             }
@@ -210,6 +213,7 @@ where
             if ef.has_default_attr {
                 return Err(syn::Error::new_spanned(
                     ef.field,
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     format!("`#[default]` cannot be used with `#[salsa::{}]`", A::KIND),
                 ));
             }
@@ -227,6 +231,7 @@ where
             if field.manual_retention_proof.is_some() {
                 return Err(syn::Error::new_spanned(
                     field.field,
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     format!(
                         "`#[salsa_value(...)]` cannot be used with `#[salsa::{}]`",
                         A::KIND
@@ -255,30 +260,35 @@ where
         self.fields
             .iter()
             .map(|f| f.field.ident.as_ref().unwrap())
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn tracked_ids(&self) -> Vec<&syn::Ident> {
         self.tracked_fields_iter()
             .map(|(_, f)| f.field.ident.as_ref().unwrap())
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_indices(&self) -> Vec<Literal> {
         (0..self.fields.len())
             .map(Literal::usize_unsuffixed)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn tracked_field_indices(&self) -> Vec<Literal> {
         self.tracked_fields_iter()
             .map(|(index, _)| Literal::usize_unsuffixed(index))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_field_indices(&self) -> Vec<Literal> {
         self.untracked_fields_iter()
             .map(|(index, _)| Literal::usize_unsuffixed(index))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
@@ -302,42 +312,50 @@ where
                     Some(quote!(#ident #ty))
                 }
             })
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_vis(&self) -> Vec<&syn::Visibility> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(|f| &f.field.vis).collect()
     }
 
     pub(crate) fn tracked_vis(&self) -> Vec<&syn::Visibility> {
         self.tracked_fields_iter()
             .map(|(_, f)| &f.field.vis)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_vis(&self) -> Vec<&syn::Visibility> {
         self.untracked_fields_iter()
             .map(|(_, f)| &f.field.vis)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_getter_ids(&self) -> Vec<&syn::Ident> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(|f| &f.get_name).collect()
     }
 
     pub(crate) fn tracked_getter_ids(&self) -> Vec<&syn::Ident> {
         self.tracked_fields_iter()
             .map(|(_, f)| &f.get_name)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_getter_ids(&self) -> Vec<&syn::Ident> {
         self.untracked_fields_iter()
             .map(|(_, f)| &f.get_name)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_setter_ids(&self) -> Vec<&syn::Ident> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(|f| &f.set_name).collect()
     }
 
@@ -345,10 +363,12 @@ where
         self.fields
             .iter()
             .map(|f| quote::format_ident!("{}_durability", f.field.ident.as_ref().unwrap()))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_tys(&self) -> Vec<&syn::Type> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(|f| &f.field.ty).collect()
     }
 
@@ -358,18 +378,21 @@ where
         self.fields
             .iter()
             .map(|field| field.manual_retention_proof.as_ref())
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn tracked_tys(&self) -> Vec<&syn::Type> {
         self.tracked_fields_iter()
             .map(|(_, f)| &f.field.ty)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_tys(&self) -> Vec<&syn::Type> {
         self.untracked_fields_iter()
             .map(|(_, f)| &f.field.ty)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
@@ -378,38 +401,45 @@ where
             .iter()
             .enumerate()
             .map(|(i, _)| quote::format_ident!("T{i}"))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_attrs(&self) -> Vec<&[&syn::Attribute]> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(|f| &*f.unknown_attrs).collect()
     }
 
     pub(crate) fn tracked_field_attrs(&self) -> Vec<&[&syn::Attribute]> {
         self.tracked_fields_iter()
             .map(|f| &*f.1.unknown_attrs)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_field_attrs(&self) -> Vec<&[&syn::Attribute]> {
         self.untracked_fields_iter()
             .map(|f| &*f.1.unknown_attrs)
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn field_options(&self) -> Vec<TokenStream> {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.fields.iter().map(SalsaField::options).collect()
     }
 
     pub(crate) fn tracked_options(&self) -> Vec<TokenStream> {
         self.tracked_fields_iter()
             .map(|(_, f)| f.options())
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
     pub(crate) fn untracked_options(&self) -> Vec<TokenStream> {
         self.untracked_fields_iter()
             .map(|(_, f)| f.options())
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect()
     }
 
@@ -441,6 +471,7 @@ where
     pub(crate) fn serialize_fn(&self) -> impl Iterator<Item = syn::Path> + '_ {
         self.args
             .persist
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             .clone()
             .map(|persist| {
                 persist
@@ -456,6 +487,7 @@ where
     pub(crate) fn deserialize_fn(&self) -> impl Iterator<Item = syn::Path> + '_ {
         self.args
             .persist
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             .clone()
             .map(|persist| {
                 persist
@@ -469,15 +501,18 @@ where
 impl<'s> SalsaField<'s> {
     fn new(field: &'s syn::Field) -> syn::Result<Self> {
         let field_name = field.ident.as_ref().unwrap();
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let field_name_str = field_name.to_string();
         if BANNED_FIELD_NAMES.iter().any(|n| *n == field_name_str) {
             return Err(syn::Error::new(
                 field_name.span(),
+                // alloc: proc macro, at expansion time once per annotated item; no query runs this
                 format!("the field name `{field_name_str}` is disallowed in salsa structs",),
             ));
         }
 
         let get_name = Ident::new(&field_name_str, field_name.span());
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let set_name = Ident::new(&format!("set_{field_name_str}",), field_name.span());
         let returns = Ident::new("ref", field.span());
         let mut result = SalsaField {
@@ -510,10 +545,12 @@ impl<'s> SalsaField<'s> {
         // Validate return mode
         if !ALLOWED_RETURN_MODES
             .iter()
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .any(|mode| mode == &result.returns.to_string())
         {
             return Err(syn::Error::new(
                 result.returns.span(),
+                // alloc: proc macro, at expansion time once per annotated item; no query runs this
                 format!("Invalid return mode. Allowed modes are: {ALLOWED_RETURN_MODES:?}"),
             ));
         }

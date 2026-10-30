@@ -3,10 +3,11 @@
 //!
 //! blaze compiles a proc-macro crate for `wasm32-wasip1` with [`GUEST`] in place of the
 //! standard library's `proc_macro`: the same API, whose token streams live in the module's
-//! memory and whose spans are numbers the host gives out, so syn, quote and proc-macro2 build
-//! against it unchanged. An expansion is given its input encoded ([`wire`]), asks the host
-//! what only the host knows (what a span joins to, a string lexed), and hands back its output,
-//! encoded the same way.
+//! memory and whose spans are words of the host's span parts, so syn, quote and proc-macro2
+//! build against it unchanged. An expansion is given its input as a token tree's columns
+//! ([`wire`]), asks the host what only the host knows (what a span joins to, a string lexed),
+//! and hands back its output as the columns blaze's builder makes of it, which the host reads
+//! as they are.
 //!
 //! Whether a module keeps state between expansions is seen, not guessed: the guest's
 //! allocator counts the bytes live, and an expansion that leaves some behind tells the host
@@ -51,7 +52,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base_db::{Crate, Env, Nonce, SourceDatabase};
+use base_db::{Db, Crate, Env, Nonce};
 use blaze_core::Traced;
 use blaze_expand::{
     Mode, Put,
@@ -80,7 +81,7 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder,
 };
 
-use crate::wire::{Reader, Spans, Tree, Writer};
+use crate::wire::{NONE, Part, Parts, Tree};
 
 /// The `proc_macro` crate a proc macro compiled to WebAssembly is built against.
 pub const GUEST: &str = include_str!("../guest/proc_macro.rs");
@@ -105,7 +106,7 @@ const HOST: &str = "blaze_proc_macro";
 
 /// The version of what this host gives a module (its functions, its WASI, how it writes
 /// tokens), in what each expansion is given: another when any of that changes.
-const HOST_VERSION: &str = "blaze v2 wasm proc-macro host 1";
+const HOST_VERSION: &str = "blaze v2 wasm proc-macro host 2";
 
 /// The most memory one instance may have.
 const MEMORY: usize = 4 << 30;
@@ -143,19 +144,20 @@ const CPU_FEATURES: &[&str] = if cfg!(target_arch = "x86_64") {
 
 /// The database a running expansion asks, for as long as it runs.
 #[derive(Clone, Copy)]
-struct Db(*const (dyn SourceDatabase + 'static));
+struct SessionDb(*const Db);
 
-// SAFETY: a `Db` is only read on the thread that expands, while `Session::run` holds the
+// SAFETY: a `SessionDb` is only read on the thread that expands, while `Session::run` holds the
 // database it points to, and clears the pointer even when the host unwinds.
-unsafe impl Send for Db {}
+unsafe impl Send for SessionDb {}
 // SAFETY: as for `Send`: the pointer is dereferenced only on the thread that expands, while
 // `Session::run` holds the database, which it clears before returning or resuming an unwind.
-unsafe impl Sync for Db {}
+unsafe impl Sync for SessionDb {}
 
 /// What an instance has while it runs.
 pub(crate) struct State {
-    spans: Spans,
-    sites: [u32; 3],
+    parts: Parts,
+    /// The words of the def, call and mixed sites.
+    sites: [u64; 3],
     files: wasi::Files,
     /// The module's environment, sorted by name ([`guest_env`]).
     env: Vec<(OsString, OsString)>,
@@ -174,15 +176,15 @@ pub(crate) struct State {
     /// Each question the expansion asked of a span of its input and what it was answered, as a
     /// read set has them ([`Value::read`]).
     asks: Vec<(String, String)>,
-    db: Option<Db>,
+    db: Option<SessionDb>,
     limits: StoreLimits,
 }
 
 impl State {
     pub(crate) fn empty() -> State {
         State {
-            spans: Spans::default(),
-            sites: [0; 3],
+            parts: Parts::default(),
+            sites: [NONE; 3],
             files: wasi::Files::new(None),
             env: Vec::new(),
             buffer: Vec::new(),
@@ -201,9 +203,9 @@ impl State {
     fn ask(&mut self, req: SubRequest) -> Option<SubResponse> {
         self.asked = true;
         let db = self.db?;
-        // SAFETY: `self.db` is `Some` only inside `Session::run`, which set it from a
-        // `&dyn SourceDatabase` borrowed for that call and clears it before returning or
-        // resuming an unwind; host functions, this one's callers, run only synchronously
+        // SAFETY: `self.db` is `Some` only inside `Session::run`, which set it from a `&Db`
+        // borrowed for that call and clears it before returning or resuming an unwind; host
+        // functions, this one's callers, run only synchronously
         // inside it, on its thread. So the database is live and only shared-borrowed here;
         // read after `run`, the pointer would dangle.
         Some(load_cargo::answer(unsafe { &*db.0 }, req))
@@ -229,8 +231,20 @@ impl State {
         answer
     }
 
-    fn span(&self, number: u32) -> Option<Span> {
-        self.spans.get(number)
+    fn span(&self, word: u64) -> Option<Span> {
+        self.parts.get(word)
+    }
+
+    /// The word of `span`, which makes it one of the expansion's.
+    fn pack(&mut self, span: Span) -> u64 {
+        self.parts.pack(span)
+    }
+
+    /// Puts `tree` in [`State::buffer`] as the module reads a tree, for its `take`.
+    fn give_tree(&mut self, tree: &tt::TopSubtree) -> i32 {
+        self.buffer.clear();
+        wire::relative(tree, &mut self.parts, &mut self.buffer);
+        self.buffer.len() as i32
     }
 
     fn give(&mut self, text: Option<String>) -> i32 {
@@ -455,32 +469,32 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "def_site", |caller: Caller<'_, State>| caller.data().sites[0])?;
     linker.func_wrap(HOST, "call_site", |caller: Caller<'_, State>| caller.data().sites[1])?;
     linker.func_wrap(HOST, "mixed_site", |caller: Caller<'_, State>| caller.data().sites[2])?;
-    linker.func_wrap(HOST, "span_join", |mut caller: Caller<'_, State>, a: u32, b: u32| {
+    linker.func_wrap(HOST, "span_join", |mut caller: Caller<'_, State>, a: u64, b: u64| {
         let state = caller.data_mut();
-        let (Some(first), Some(second)) = (state.span(a), state.span(b)) else { return 0 };
-        join(state, first, second).map_or(0, |it| state.spans.number(it))
+        let (Some(first), Some(second)) = (state.span(a), state.span(b)) else { return NONE };
+        join(state, first, second).map_or(NONE, |it| state.pack(it))
     })?;
     linker.func_wrap(
         HOST,
         "span_resolved_at",
-        |mut caller: Caller<'_, State>, a: u32, at: u32| {
+        |mut caller: Caller<'_, State>, a: u64, at: u64| {
             let state = caller.data_mut();
             let (Some(span), Some(at)) = (state.span(a), state.span(at)) else { return a };
-            state.spans.number(Span { ctx: at.ctx, ..span })
+            state.pack(Span { ctx: at.ctx, ..span })
         },
     )?;
     linker.func_wrap(
         HOST,
         "span_located_at",
-        |mut caller: Caller<'_, State>, a: u32, b: u32| {
+        |mut caller: Caller<'_, State>, a: u64, b: u64| {
             let state = caller.data_mut();
             let (Some(span), Some(other)) = (state.span(a), state.span(b)) else { return b };
-            state.spans.number(Span { ctx: span.ctx, ..other })
+            state.pack(Span { ctx: span.ctx, ..other })
         },
     )?;
-    linker.func_wrap(HOST, "span_parent", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_parent", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
-        let Some(span) = state.span(a) else { return 0 };
+        let Some(span) = state.span(a) else { return NONE };
         let req = SubRequest::SpanParent {
             file_id: span.anchor.file_id.as_u32(),
             ast_id: span.anchor.ast_id.into_raw(),
@@ -490,12 +504,12 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         };
         match state.ask(req) {
             Some(SubResponse::SpanParentResult { parent_span: Some(it) }) => {
-                state.spans.number(spanned(it.file_id, it.ast_id, it.start, it.end, it.ctx))
+                state.pack(spanned(it.file_id, it.ast_id, it.start, it.end, it.ctx))
             }
-            _ => 0,
+            _ => NONE,
         }
     })?;
-    linker.func_wrap(HOST, "span_source", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_source", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return a };
         let req = SubRequest::SpanSource {
@@ -507,40 +521,61 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         };
         match state.ask(req) {
             Some(SubResponse::SpanSourceResult { file_id, ast_id, start, end, ctx }) => {
-                state.spans.number(spanned(file_id, ast_id, start, end, ctx))
+                state.pack(spanned(file_id, ast_id, start, end, ctx))
             }
             _ => a,
         }
     })?;
-    linker.func_wrap(HOST, "span_start", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_start", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return a };
         if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
             return a;
         }
-        state.spans.number(Span { range: TextRange::empty(span.range.start()), ..span })
+        state.pack(Span { range: TextRange::empty(span.range.start()), ..span })
     })?;
-    linker.func_wrap(HOST, "span_end", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_end", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return a };
         if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
             return a;
         }
-        state.spans.number(Span { range: TextRange::empty(span.range.end()), ..span })
+        state.pack(Span { range: TextRange::empty(span.range.end()), ..span })
     })?;
     linker.func_wrap(
         HOST,
         "span_subspan",
-        |mut caller: Caller<'_, State>, a: u32, start: u64, end: u64| {
+        |mut caller: Caller<'_, State>, a: u64, start: u64, end: u64| {
             let state = caller.data_mut();
-            let Some(span) = state.span(a) else { return 0 };
-            subspan(span, start, end).map_or(0, |it| state.spans.number(it))
+            let Some(span) = state.span(a) else { return NONE };
+            subspan(span, start, end).map_or(NONE, |it| state.pack(it))
+        },
+    )?;
+    linker.func_wrap(
+        HOST,
+        "span_pack",
+        |mut caller: Caller<'_, State>, start: u32, len: u32, part: u32| {
+            caller.data_mut().parts.pack_fields(start, len, part)
+        },
+    )?;
+    linker.func_wrap(
+        HOST,
+        "span_unpack",
+        |mut caller: Caller<'_, State>, a: u64, out: u32| -> wasmtime::Result<()> {
+            let fields = caller.data().parts.fields(a);
+            let mut bytes = [0u8; 12];
+            for (at, field) in fields.into_iter().enumerate() {
+                bytes[4 * at..4 * at + 4].copy_from_slice(&field.to_le_bytes());
+            }
+            let memory = memory(&mut caller)?;
+            memory.write(&mut caller, out as usize, &bytes)?;
+            Ok(())
         },
     )?;
     linker.func_wrap(
         HOST,
         "span_byte_range",
-        |mut caller: Caller<'_, State>, a: u32, out: u32| -> wasmtime::Result<()> {
+        |mut caller: Caller<'_, State>, a: u64, out: u32| -> wasmtime::Result<()> {
             let state = caller.data_mut();
             let Some(span) = state.span(a) else { return Ok(()) };
             let range = match state.ask_value(Value::ByteRange, span) {
@@ -555,24 +590,24 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             Ok(())
         },
     )?;
-    linker.func_wrap(HOST, "span_line", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_line", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let span = state.span(a);
         span.and_then(|span| line_column(state, span)).map_or(1, |(line, _)| line)
     })?;
-    linker.func_wrap(HOST, "span_column", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_column", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let span = state.span(a);
         span.and_then(|span| line_column(state, span)).map_or(1, |(_, column)| column)
     })?;
-    linker.func_wrap(HOST, "span_debug", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_debug", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         // What it says is of the database's numbering, which the key does not have.
         state.asked = true;
         let text = state.span(a).map(|it| format!("{it:?}"));
         state.give(text)
     })?;
-    linker.func_wrap(HOST, "span_file", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_file", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
         let name = match state.ask_value(Value::File, span) {
@@ -581,7 +616,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         };
         state.give(Some(name))
     })?;
-    linker.func_wrap(HOST, "span_local_file", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_local_file", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
         let name = match state.ask_value(Value::LocalFile, span) {
@@ -590,7 +625,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         };
         state.give(name)
     })?;
-    linker.func_wrap(HOST, "span_source_text", |mut caller: Caller<'_, State>, a: u32| {
+    linker.func_wrap(HOST, "span_source_text", |mut caller: Caller<'_, State>, a: u64| {
         let state = caller.data_mut();
         let Some(span) = state.span(a) else { return -1 };
         let text = match state.ask_value(Value::SourceText, span) {
@@ -609,12 +644,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                 return Ok(-1 - state.give(Some(NO_CALL.to_owned())));
             };
             Ok(match lex::stream(&text, call_site) {
-                Ok(trees) => {
-                    let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
-                    writer.trees(&trees);
-                    state.buffer = writer.out;
-                    state.buffer.len() as i32
-                }
+                Ok(trees) => state.give_tree(&wire::invisible(&trees, call_site)),
                 Err(e) => {
                     let e = format!("failed to parse str to token stream: {e}");
                     -1 - state.give(Some(e))
@@ -631,10 +661,8 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let Some(call_site) = state.span(state.sites[1]) else { return Ok(-1) };
             Ok(match lex::literal_from_str(&text, call_site) {
                 Some(literal) => {
-                    let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
-                    writer.trees(&[Tree::Leaf(tt::Leaf::Literal(literal))]);
-                    state.buffer = writer.out;
-                    state.buffer.len() as i32
+                    let trees = [Tree::Leaf(tt::Leaf::Literal(literal))];
+                    state.give_tree(&wire::invisible(&trees, call_site))
                 }
                 None => -1,
             })
@@ -654,7 +682,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "track_path", |_: u32, _: u32| {})?;
     linker.func_wrap(HOST, "track_env_var", |_: u32, _: u32| {})?;
     // As rust-analyzer's proc-macro server, which shows no diagnostic of a macro's.
-    linker.func_wrap(HOST, "diagnostic", |_: u32, _: u32, _: u32, _: u32| {})?;
+    linker.func_wrap(HOST, "diagnostic", |_: u32, _: u32, _: u32, _: u64| {})?;
     linker.func_wrap(
         HOST,
         "output",
@@ -918,7 +946,7 @@ impl Wasm {
         &self,
         index: u32,
         listed: &Listed,
-        db: Option<&dyn SourceDatabase>,
+        db: Option<&Db>,
         call: &Call<'_>,
     ) -> Ran {
         expand(&code(&self.digest), &|| Ok(self), index, listed, db, call)
@@ -931,7 +959,7 @@ impl Session {
         &mut self,
         index: u32,
         listed: &Listed,
-        db: Option<&dyn SourceDatabase>,
+        db: Option<&Db>,
         call: &Call<'_>,
     ) -> Ran {
         let start = Instant::now();
@@ -946,8 +974,9 @@ impl Session {
             };
         }
         let state = self.store.data_mut();
-        state.sites =
-            [call.def_site, call.call_site, call.mixed_site].map(|span| state.spans.number(span));
+        // The words the module holds from earlier calls stay those of their spans, so the
+        // session's parts are only added to.
+        state.sites = [call.def_site, call.call_site, call.mixed_site].map(|span| state.pack(span));
         state.buffer.clear();
         state.output = None;
         state.panic = None;
@@ -955,26 +984,24 @@ impl Session {
         state.files.output.clear();
         // Nothing a session makes is kept, so what it read is of no use.
         state.files.take_traced();
-        let mut writer = Writer { out: Vec::new(), spans: &mut state.spans };
-        writer.top(call.subtree);
-        let input = std::mem::take(&mut writer.out);
+        let mut input = Vec::new();
+        wire::relative(call.subtree, &mut state.parts, &mut input);
         let attr = call.attrs.map(|it| {
-            writer.top(it);
-            std::mem::take(&mut writer.out)
+            let mut attr = Vec::new();
+            wire::relative(it, &mut state.parts, &mut attr);
+            attr
         });
         let attr = match listed.kind {
-            ProcMacroKind::Attr => Some(attr.unwrap_or_else(|| 0u32.to_le_bytes().to_vec())),
+            ProcMacroKind::Attr => Some(attr.unwrap_or_default()),
             _ => attr,
         };
         let output = self.run(index, db, &input, attr.as_deref()).and_then(|output| {
-            let trees = Reader::new(&output, &self.store.data().spans)
-                .stream()
+            let tree = wire::read(&output, &self.store.data().parts)
                 .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
-            let trees = match &self.root {
-                Some(root) => placed(trees, root),
-                None => trees,
-            };
-            Ok(wire::top_subtree(trees, call.call_site))
+            Ok(match &self.root {
+                Some(root) => placed(tree, root),
+                None => tree,
+            })
         });
         if output.is_err() {
             self.failed = true;
@@ -987,21 +1014,14 @@ impl Session {
     fn run(
         &mut self,
         index: u32,
-        db: Option<&dyn SourceDatabase>,
+        db: Option<&Db>,
         input: &[u8],
         attr: Option<&[u8]>,
     ) -> Result<Vec<u8>, ProcMacroExpansionError> {
-        self.store.data_mut().db = db.map(|db| {
-            // SAFETY: only the lifetime changes; `run` sets `db` to `None` before it returns
-            // or resumes an unwind, so the pointer is never read after the borrow it came
-            // from ends, and the session keeps no database between calls.
-            Db(unsafe {
-                std::mem::transmute::<
-                    *const dyn SourceDatabase,
-                    *const (dyn SourceDatabase + 'static),
-                >(db)
-            })
-        });
+        // `run` sets `db` to `None` before it returns or resumes an unwind, so the pointer is
+        // never read after the borrow it came from ends, and the session keeps no database
+        // between calls.
+        self.store.data_mut().db = db.map(|db| SessionDb(std::ptr::from_ref(db)));
         let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
             let system = |e: wasmtime::Error| ProcMacroExpansionError::System(format!("{e:#}"));
             let alloc = self
@@ -1154,14 +1174,14 @@ pub fn check_module(bytes: &[u8]) -> Result<(), String> {
     linked(&module).map(drop).map_err(|e| format!("{e:#}"))
 }
 
-/// rust-analyzer's tree of `bytes`, a stream as a module writes it, with spans 1, 2 and 3
-/// being `sites` (def site, call site, mixed site) and the stream at the call site.
+/// The tree of `bytes`, a tree as a module writes one, whose span parts 0, 1 and 2 are those
+/// of `sites` (def site, call site, mixed site), each distinct one given the next index.
 pub fn decode(bytes: &[u8], sites: [Span; 3]) -> Result<tt::TopSubtree, String> {
-    let mut spans = Spans::default();
+    let mut parts = Parts::default();
     for site in sites {
-        spans.push(site);
+        parts.pack(site);
     }
-    Ok(wire::top_subtree(Reader::new(bytes, &spans).stream()?, sites[1]))
+    wire::read(bytes, &parts)
 }
 
 /// What the module of `bytes` carries in its [`exports::LIST_SECTION`] custom section, read
@@ -1331,38 +1351,44 @@ fn owned_env(env: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
     env.iter().map(|&(name, value)| (name.into(), value.into())).collect()
 }
 
-/// `trees` with the package's path where the module put [`wasi::PACKAGE`] in a string, as
-/// a path `include_str!` is to read.
-fn placed(trees: Vec<Tree>, root: &Path) -> Vec<Tree> {
+/// `tree` with the package's path where the module put [`wasi::PACKAGE`] in a string, as
+/// a path `include_str!` is to read: itself when no string has it.
+fn placed(tree: tt::TopSubtree, root: &Path) -> tt::TopSubtree {
+    let string = |kind: tt::LitKind| matches!(kind, tt::LitKind::Str | tt::LitKind::StrRaw(_));
+    let mut found = false;
+    tree.token_trees().for_each_token(|token, _| {
+        if let tt::FlatToken::Literal { sym, kind, .. } = token {
+            found |= string(kind) && sym.as_str().contains(wasi::PACKAGE);
+        }
+    });
+    if !found {
+        return tree;
+    }
     let root = root.to_string_lossy();
-    trees
-        .into_iter()
-        .map(|tree| match tree {
-            Tree::Group { kind, open, close, entire, trees } => {
-                Tree::Group { kind, open, close, entire, trees: placed(trees, Path::new(&*root)) }
-            }
-            Tree::Leaf(tt::Leaf::Literal(literal))
-                if matches!(literal.kind, tt::LitKind::Str | tt::LitKind::StrRaw(_))
-                    && literal.text().contains(wasi::PACKAGE) =>
+    // alloc: a rebuilt tree, only for an output that names the package, which is rare.
+    let flat = tree
+        .as_token_trees()
+        .iter_flat_tokens()
+        .map(|token| match token {
+            tt::TokenTree::Leaf(tt::Leaf::Literal(literal))
+                if string(literal.kind) && literal.text().contains(wasi::PACKAGE) =>
             {
                 let (text, suffix) = literal.text_and_suffix();
                 let text = text.replace(wasi::PACKAGE, &root);
-                Tree::Leaf(tt::Leaf::Literal(tt::Literal::new(
-                    &text,
-                    literal.span,
-                    literal.kind,
-                    suffix,
-                )))
+                let literal = tt::Literal::new(&text, literal.span, literal.kind, suffix);
+                tt::TokenTree::Leaf(tt::Leaf::Literal(literal))
             }
             other => other,
         })
-        .collect()
+        .collect();
+    tt::TopSubtree::from_serialized(flat)
 }
 
-/// The spans of an expansion's input as its key has them: each its byte range and which of
-/// the input's anchors and contexts it has, numbered as they first appear. A kept output's
-/// spans are written the same way, so the next call, with other anchors and contexts in the
-/// same places, is given them back as its own.
+/// The span parts of an expansion's input as its key has them: which of the input's anchors
+/// and contexts each has, numbered as they first appear, then the def, call and mixed sites'
+/// words, whose ranges the input's bytes don't have. A kept output's parts are written the
+/// same way, so the next call, with other anchors and contexts in the same places, is given
+/// them back as its own.
 struct Shapes {
     anchors: Vec<SpanAnchor>,
     contexts: Vec<SyntaxContext>,
@@ -1378,27 +1404,34 @@ fn position<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
 }
 
 impl Shapes {
-    fn of(spans: &[Span]) -> Shapes {
-        let mut shapes = Shapes { anchors: Vec::new(), contexts: Vec::new(), bytes: Vec::new() };
-        for span in spans {
-            let anchor = position(&mut shapes.anchors, span.anchor);
-            let context = position(&mut shapes.contexts, span.ctx);
-            for it in [span.range.start().into(), span.range.end().into(), anchor, context] {
+    fn of(parts: &[Part], sites: [u64; 3]) -> Shapes {
+        let mut shapes = Shapes {
+            anchors: Vec::new(),
+            contexts: Vec::new(),
+            bytes: Vec::with_capacity(8 * parts.len() + 24),
+        };
+        for &(anchor, ctx) in parts {
+            let anchor = position(&mut shapes.anchors, anchor);
+            let context = position(&mut shapes.contexts, ctx);
+            for it in [anchor, context] {
                 shapes.bytes.extend_from_slice(&u32::to_le_bytes(it));
             }
+        }
+        for site in sites {
+            shapes.bytes.extend_from_slice(&site.to_le_bytes());
         }
         shapes
     }
 
-    /// What is kept of an output: the shapes of every span the expansion numbered, then the
-    /// output. `None` when one has an anchor or a context the input has not.
-    fn written(&self, spans: &Spans, output: &[u8]) -> Option<Vec<u8>> {
-        let mut value = Vec::new();
-        value.extend_from_slice(&(spans.all().len() as u32).to_le_bytes());
-        for span in spans.all() {
-            let anchor = self.anchors.iter().position(|it| *it == span.anchor)? as u32;
-            let context = self.contexts.iter().position(|it| *it == span.ctx)? as u32;
-            for it in [span.range.start().into(), span.range.end().into(), anchor, context] {
+    /// What is kept of an output: the shapes of every part of the expansion, then the output.
+    /// `None` when one has an anchor or a context the input has not.
+    fn written(&self, parts: &Parts, output: &[u8]) -> Option<Vec<u8>> {
+        let mut value = Vec::with_capacity(4 + 8 * parts.len() + output.len());
+        value.extend_from_slice(&(parts.len() as u32).to_le_bytes());
+        for (anchor, ctx) in parts.all() {
+            let anchor = self.anchors.iter().position(|it| it == anchor)? as u32;
+            let context = self.contexts.iter().position(|it| it == ctx)? as u32;
+            for it in [anchor, context] {
                 value.extend_from_slice(&u32::to_le_bytes(it));
             }
         }
@@ -1406,20 +1439,24 @@ impl Shapes {
         Some(value)
     }
 
-    fn read(&self, value: &[u8]) -> Option<Vec<Tree>> {
-        let count = u32::from_le_bytes(value.get(..4)?.try_into().ok()?) as usize;
-        let table = value.get(4..4 + count.checked_mul(16)?)?;
-        let mut spans = Spans::default();
-        for shape in table.as_chunks::<16>().0 {
+    /// The output kept as [`Shapes::written`] wrote it, its parts this input's.
+    fn read(&self, value: &[u8]) -> Result<tt::TopSubtree, String> {
+        let count = value.get(..4).map(|it| u32::from_le_bytes(it.try_into().unwrap()) as usize);
+        let table = count.and_then(|count| value.get(4..4 + count.checked_mul(8)?));
+        let Some(table) = table else { return Err("its table of span parts is cut short".into()) };
+        let mut parts = Parts::default();
+        for (at, shape) in table.as_chunks::<8>().0.iter().enumerate() {
             let field = |at: usize| u32::from_le_bytes(shape[at..at + 4].try_into().unwrap());
-            let span = Span {
-                range: range(field(0), field(4)),
-                anchor: *self.anchors.get(field(8) as usize)?,
-                ctx: *self.contexts.get(field(12) as usize)?,
+            let anchor = self.anchors.get(field(0) as usize);
+            let ctx = self.contexts.get(field(4) as usize);
+            let Some((&anchor, &ctx)) = anchor.zip(ctx) else {
+                return Err(format!("its span part {at} is of no anchor and context of the input"));
             };
-            spans.push(span);
+            if parts.part(anchor, ctx) as usize != at {
+                return Err(format!("its span part {at} is an earlier one again"));
+            }
         }
-        Reader::new(&value[4 + count * 16..], &spans).stream().ok()
+        wire::read(&value[4 + table.len()..], &parts)
     }
 }
 
@@ -1470,7 +1507,7 @@ struct Now<'a> {
 
 /// What a read set has for the question `read` ([`Value::read`]) of the input of `shapes`, as
 /// `db` answers it: no database answers nothing ([`Value::said`]).
-fn answer(read: &str, shapes: &Shapes, db: Option<&dyn SourceDatabase>) -> String {
+fn answer(read: &str, shapes: &Shapes, db: Option<&Db>) -> String {
     match Value::parse(read, shapes) {
         Some((value, span)) => {
             let answer = db.map(|db| load_cargo::answer(db, value.request(span)));
@@ -1550,7 +1587,7 @@ fn find_answered<T>(
     root: Option<&Path>,
     env: &[(&str, &str)],
     shapes: &Shapes,
-    db: Option<&dyn SourceDatabase>,
+    db: Option<&Db>,
     look: impl Fn(Found<'_>) -> T,
 ) -> Result<T, FindError<Unreadable>> {
     let none = inputs::Env::default();
@@ -1615,7 +1652,7 @@ fn expand<'a>(
     wasm: &dyn Fn() -> Result<&'a Wasm, String>,
     index: u32,
     listed: &Listed,
-    db: Option<&dyn SourceDatabase>,
+    db: Option<&Db>,
     call: &Call<'_>,
 ) -> Ran {
     let start = Instant::now();
@@ -1624,32 +1661,22 @@ fn expand<'a>(
     };
     let root = package_dir(call.env);
     let env = guest_env(call.env);
-    // The module's `def_site`, `call_site` and `mixed_site` are 1, 2 and 3, the same
-    // spans or not.
-    let mut spans = Spans::default();
-    for span in [call.def_site, call.call_site, call.mixed_site] {
-        spans.push(span);
-    }
+    let mut parts = Parts::default();
+    let sites = [call.def_site, call.call_site, call.mixed_site].map(|span| parts.pack(span));
     let mut input = Reused::take();
     let mut attr = Reused::take();
-    let mut writer = Writer { out: std::mem::take(&mut input.0), spans: &mut spans };
-    writer.top(call.subtree);
-    input.0 = std::mem::take(&mut writer.out);
-    // rust-analyzer gives an attribute written without arguments (`#[twice]`) none.
+    wire::relative(call.subtree, &mut parts, &mut input.0);
+    // rust-analyzer gives an attribute written without arguments (`#[twice]`) none, which
+    // the module is given as no bytes, an empty stream.
     let attr = match (call.attrs, listed.kind) {
         (Some(it), _) => {
-            writer.out = std::mem::take(&mut attr.0);
-            writer.top(it);
-            attr.0 = std::mem::take(&mut writer.out);
+            wire::relative(it, &mut parts, &mut attr.0);
             Some(attr)
         }
-        (None, ProcMacroKind::Attr) => {
-            attr.0.extend_from_slice(&0u32.to_le_bytes());
-            Some(attr)
-        }
+        (None, ProcMacroKind::Attr) => Some(attr),
         (None, _) => None,
     };
-    let shapes = Shapes::of(spans.all());
+    let shapes = Shapes::of(parts.all(), sites);
     let mut given = Given::new(RunKind::ProcMacro);
     given
         .part("host", HOST_VERSION.as_bytes())
@@ -1660,12 +1687,9 @@ fn expand<'a>(
         .part("spans", &shapes.bytes);
     given.env_keyed(env.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
     let run = RunKey { code: *code, given: given.finish() };
-    let restore = |trees: Vec<Tree>| {
-        let trees = match &root {
-            Some(root) => placed(trees, root),
-            None => trees,
-        };
-        wire::top_subtree(trees, call.call_site)
+    let restore = |tree: tt::TopSubtree| match &root {
+        Some(root) => placed(tree, root),
+        None => tree,
     };
     let keeping = blaze_expand::keeping();
     let found = match keeping {
@@ -1689,7 +1713,7 @@ fn expand<'a>(
                 Ok(Err(kept)) => {
                     let output = kept
                         .map(&restore)
-                        .ok_or_else(|| failed("the store's expansion of it is not one".to_owned()));
+                        .map_err(|why| failed(format!("the store's expansion of it is not one: {why}")));
                     count(Counted::Found, start.elapsed());
                     return Ran { output, found: true, retained: false, took: start.elapsed() };
                 }
@@ -1712,8 +1736,8 @@ fn expand<'a>(
         let mut state = State::empty();
         state.anchors = shapes.anchors.clone();
         state.contexts = shapes.contexts.clone();
-        state.spans = spans;
-        state.sites = [1, 2, 3];
+        state.parts = parts;
+        state.sites = sites;
         state.files = wasi::Files::new(root.as_deref());
         state.env = owned_env(&env);
         let mut instance = wasm.instance_with(state, root.clone())?;
@@ -1722,11 +1746,10 @@ fn expand<'a>(
     });
     let mut retained = false;
     let output = ran.and_then(|(mut state, output)| {
-        let trees = Reader::new(&output, &state.spans)
-            .stream()
+        let tree = wire::read(&output, &state.parts)
             .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
         retained = state.retained;
-        let value = shapes.written(&state.spans, &output);
+        let value = shapes.written(&state.parts, &output);
         if let Some(kept) = &found {
             if value.as_deref().map(blaze_expand::checked).as_ref() != Some(kept) {
                 return Err(failed(format!(
@@ -1735,10 +1758,10 @@ fn expand<'a>(
                     blaze_expand::CACHE
                 )));
             }
-            return Ok(restore(trees));
+            return Ok(restore(tree));
         }
         if keeping.is_none() {
-            return Ok(restore(trees));
+            return Ok(restore(tree));
         }
         let traced = what_it_read(&mut state);
         match (traced, value) {
@@ -1754,7 +1777,7 @@ fn expand<'a>(
             }
             (Some(_), None) => {}
         }
-        Ok(restore(trees))
+        Ok(restore(tree))
     });
     count(Counted::Ran, start.elapsed());
     Ran { output, found: false, retained, took: start.elapsed() }
@@ -2132,7 +2155,7 @@ impl ProcMacroExpander for Expander {
 
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -2158,7 +2181,7 @@ impl ProcMacroExpander for Expander {
 
     fn expand_in(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         calling_crate: base_db::Crate,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
@@ -2304,12 +2327,41 @@ mod tests {
         let text =
             "#[derive(Debug)] struct S<T> { a: [u8; 3], b: (T, \"s\", b'x', r#\"raw\"#, 2.5e3) }";
         let top = tokens(text, span(3, 9)).unwrap();
-        let mut spans = Spans::default();
-        let mut writer = Writer { out: Vec::new(), spans: &mut spans };
-        writer.top(&top);
-        let bytes = writer.out;
-        let trees = Reader::new(&bytes, &spans).stream().unwrap();
-        assert_eq!(wire::top_subtree(trees, span(3, 9)).to_string(), top.to_string());
+        let sites = [span(0, 1), span(1, 2), span(2, 3)];
+        let mut parts = Parts::default();
+        for site in sites {
+            parts.pack(site);
+        }
+        let mut bytes = Vec::new();
+        wire::relative(&top, &mut parts, &mut bytes);
+        let back = decode(&bytes, sites).unwrap();
+        assert!(back == top, "{back} came back of {top}");
+    }
+
+    #[test]
+    fn a_tree_is_decoded_whole_and_of_the_expansions_parts_or_not_at_all() {
+        let sites = [span(0, 1), span(1, 2), span(2, 3)];
+        let mut parts = Parts::default();
+        for site in sites {
+            parts.pack(site);
+        }
+        let mut bytes = Vec::new();
+        wire::relative(&tokens("a (b [c]) \"d\" 1u8", span(4, 5)).unwrap(), &mut parts, &mut bytes);
+        assert!(decode(&bytes, sites).is_ok());
+        assert!(decode(&u32::MAX.to_le_bytes(), sites).is_err());
+        for len in 0..bytes.len() {
+            assert!(decode(&bytes[..len], sites).is_err(), "{len} of {} bytes", bytes.len());
+        }
+        let mut longer = bytes.clone();
+        longer.extend([0; 4]);
+        assert!(decode(&longer, sites).unwrap_err().contains("bytes after the token tree"));
+        let at = wire::sections(&bytes).unwrap().parts;
+        let mut past = bytes.clone();
+        past[at..at + 4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode(&past, sites).unwrap_err().contains("span parts"));
+        let mut raw = bytes.clone();
+        raw[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decode(&raw, sites).unwrap_err().contains("span parts"));
     }
 
     #[test]
@@ -2335,30 +2387,6 @@ mod tests {
         let long = format!("1{}", "a".repeat(lex::SUFFIX_MOST + 1));
         assert!(tokens(&long, span(0, 0)).is_err());
         assert!(tokens(&long[..lex::SUFFIX_MOST + 1], span(0, 0)).is_ok());
-    }
-
-    #[test]
-    fn a_stream_is_decoded_without_believing_its_counts_or_depth() {
-        let sites = [span(0, 1), span(1, 2), span(2, 3)];
-        assert!(decode(&u32::MAX.to_le_bytes(), sites).is_err());
-        let nested = |depth: u32| {
-            let mut bytes = 1u32.to_le_bytes().to_vec();
-            for level in 0..depth {
-                bytes.extend([0, 0]);
-                for number in [1u32, 2, 3, u32::from(level + 1 < depth)] {
-                    bytes.extend(number.to_le_bytes());
-                }
-            }
-            bytes
-        };
-        assert!(decode(&nested(64), sites).is_ok());
-        assert!(decode(&nested(wire::DEPTH_MOST + 1), sites).is_err());
-        let mut literal = 1u32.to_le_bytes().to_vec();
-        literal.extend([3, 2, 0, 0, 0, 0, 0]);
-        literal.extend([1, 0, 0, 0, b'1']);
-        literal.extend(((lex::SUFFIX_MOST + 1) as u32).to_le_bytes());
-        literal.extend(std::iter::repeat_n(b'a', lex::SUFFIX_MOST + 1));
-        assert!(decode(&literal, sites).is_err());
     }
 
     #[test]
@@ -2431,16 +2459,17 @@ mod tests {
     #[test]
     fn a_question_of_a_span_is_asked_again_of_the_span_in_its_place() {
         let asked = span(3, 9);
+        let of = |span: Span| Shapes::of(&[(span.anchor, span.ctx)], [NONE; 3]);
         let read = Value::LineColumn.read([3, 9, 0, 0]);
-        let (value, again) = Value::parse(&read, &Shapes::of(&[asked])).unwrap();
+        let (value, again) = Value::parse(&read, &of(asked)).unwrap();
         assert!(value == Value::LineColumn);
         assert_eq!(again, asked);
         // The next call's span in the same place, of another anchor.
         let mut moved = asked;
         moved.anchor.ast_id = ErasedFileAstId::from_raw(5);
-        assert_eq!(Value::parse(&read, &Shapes::of(&[moved])).unwrap().1, moved);
-        assert!(Value::parse(&Value::File.read([0, 0, 1, 0]), &Shapes::of(&[asked])).is_none());
-        assert!(Value::parse("src/lib.rs", &Shapes::of(&[asked])).is_none());
+        assert_eq!(Value::parse(&read, &of(moved)).unwrap().1, moved);
+        assert!(Value::parse(&Value::File.read([0, 0, 1, 0]), &of(asked)).is_none());
+        assert!(Value::parse("src/lib.rs", &of(asked)).is_none());
         let answer = SubResponse::LineColumnResult { line: 3, column: 4 };
         assert_eq!(Value::LineColumn.said(Some(&answer)), "3:4");
         assert_eq!(Value::SourceText.said(None), "-");
@@ -2507,7 +2536,7 @@ mod tests {
     }
 
     fn now_of(package: &Path, traced: &Traced) -> Traced {
-        let shapes = Shapes::of(&[]);
+        let shapes = Shapes::of(&[], [NONE; 3]);
         let answers = FxHashMap::default();
         let mut now = now(Some(package), &shapes, &answers);
         index::Shape::of(traced).values(&mut now).unwrap()
@@ -2568,7 +2597,8 @@ mod tests {
         state.asks.push((Value::LineColumn.read([3, 9, 0, 0]), "3:4".to_owned()));
         let traced = what_it_read(&mut state).unwrap();
         assert_eq!(traced.env.len(), 1);
-        let shapes = Shapes::of(&[span(3, 9)]);
+        let asked = span(3, 9);
+        let shapes = Shapes::of(&[(asked.anchor, asked.ctx)], [NONE; 3]);
         let read = traced.env[0].0.to_str().unwrap().to_owned();
         let mut answers = FxHashMap::default();
         // A question with no answer yet is noted, once, for the database to answer with no
@@ -2601,7 +2631,7 @@ mod tests {
 
     #[test]
     fn a_path_outside_the_package_is_no_input_of_a_module() {
-        let shapes = Shapes::of(&[]);
+        let shapes = Shapes::of(&[], [NONE; 3]);
         let answers = FxHashMap::default();
         let mut now = now(Some(Path::new("/p")), &shapes, &answers);
         assert!(now.file(Path::new("/etc/passwd")).is_err());

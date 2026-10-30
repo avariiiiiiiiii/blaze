@@ -1,6 +1,9 @@
+mod api;
 mod db;
+mod infer;
+mod lower;
 
-use base_db::{SourceDatabase, all_crates};
+use base_db::{RunOrder, all_crates, set_run_order};
 use blaze_format::{Aligned, Persist, Record, Rel, Writer};
 use hir_def::{
     AdtId, AssocItemId, ConstId, DefWithBodyId, FunctionId, ImplId, ModuleDefId, TraitId,
@@ -45,6 +48,16 @@ fn count(executed: &[String], query: &str) -> usize {
     executed.iter().filter(|it| *it == query).count()
 }
 
+/// hir names nothing of hir-ty-mir: linking hir is what links hir-ty-mir's table and
+/// hir-ide's, and each panics unless exactly one is linked.
+#[test]
+fn the_mir_and_display_providers_are_linked() {
+    let mir = hir_ide::providers::mir();
+    let display = hir_ide::providers::display();
+    assert!(std::ptr::eq(mir, hir_ide::providers::mir()));
+    assert!(std::ptr::eq(display, hir_ide::providers::display()));
+}
+
 #[test]
 fn check_infers_only_workspace_bodies() {
     let db = TestDB::with_files(
@@ -66,7 +79,7 @@ fn main() {
     crate::attach_db(&db, || {
         let workspace = crate::check::workspace_crates(&db);
         assert_eq!(workspace.len(), 1, "only `main` is a workspace member");
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             crate::check::check_workspace(&db, false);
         });
         assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
@@ -118,20 +131,23 @@ fn a_check_is_the_same_whatever_order_its_modules_ran_in() {
     };
     let in_order = TestDB::with_files(MODULES);
     let reversed = TestDB::with_files(MODULES);
-    reversed.reverse_batches();
+    let before = set_run_order(RunOrder::InOrder);
     let found = check(&in_order);
+    set_run_order(RunOrder::Reversed);
+    let found_reversed = check(&reversed);
+    set_run_order(before);
     assert_eq!(found.len(), 1, "one workspace crate");
     assert!(
         found[0].iter().filter(|it| *it == "TypeMismatch").count() >= 4,
         "every module's mismatches are there: {found:?}"
     );
-    assert_eq!(found, check(&reversed));
+    assert_eq!(found, found_reversed);
 }
 
 #[test]
 fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
     let db = TestDB::with_files(MODULES);
-    db.reverse_batches();
+    let before = set_run_order(RunOrder::Reversed);
     crate::attach_db(&db, || {
         let krate = crate::check::workspace_crates(&db)[0];
         let modules = crate::check::file_modules(&db, krate);
@@ -144,6 +160,7 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
         assert_eq!(kinds(&batch), kinds(&one_by_one));
         assert_eq!(format!("{batch:?}"), format!("{one_by_one:?}"));
     });
+    set_run_order(before);
 }
 
 #[test]
@@ -261,7 +278,7 @@ fn a_live_patch_has_code_before_the_check_that_refuses_it() {
     crate::attach_db(&db, || {
         let bad = function(&db, "moved_twice");
         let (unchecked, pending) = hir_ty_borrowck::speculate(bad);
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             let mir = unchecked.mir(&db, db.mir_body(InferBodyId::DefWithBodyId(bad))).unwrap();
             assert_eq!(mir.unchecked().owner(), bad);
             assert!(!mir.basic_blocks.is_empty());
@@ -310,18 +327,18 @@ pub fn g() {}
     db.set_file_text(other, "pub fn g() {}\npub fn h() {}\n");
 
     crate::attach_db(&db, || {
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             hir_ty_borrowck::borrowck(&db, f);
         });
         assert_eq!(count(&executed, "borrowck"), 0, "{executed:#?}");
         assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
 
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(f));
         });
         assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
 
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             let mir = db.mir_body(InferBodyId::DefWithBodyId(f)).unwrap();
             assert_eq!((mir.basic_blocks.len(), mir.locals.len()), before);
         });
@@ -504,13 +521,13 @@ impl<T> Tr for B<T> where T: Tr {}
     db.set_file_text(imp, "use super::*;\nimpl Tr for A {}\nimpl<T> Tr for B<T> where T: Other {}\n");
 
     crate::attach_db(&db, || {
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             InferenceResult::of(&db, InferBodyId::DefWithBodyId(unrelated));
         });
         assert_eq!(count(&executed, "infer_body_query"), 0, "{executed:#?}");
         // `second` took the goal's reads with its answer, so it reruns as `first` does.
         for body in [second, first] {
-            let executed = db.executed(|| {
+            let executed = db.log_executed(|| {
                 InferenceResult::of(&db, InferBodyId::DefWithBodyId(body));
             });
             assert_eq!(count(&executed, "infer_body_query"), 1, "{executed:#?}");
@@ -755,7 +772,7 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
         assert_eq!(main_impls.len(), 2);
 
         let (mut batched, mut per_item) = (Vec::new(), Vec::new());
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             batched = lowered(&db, &dep_variants, &dep_impls);
             per_item = lowered(&db, &main_variants, &main_impls);
         });
@@ -824,7 +841,7 @@ fn a_workspace_crate_has_no_batch() {
     crate::attach_db(&db, || {
         let (_, main) = dep_and_main(&db);
         let (variants, impls) = signatures(&db, main);
-        let executed = db.executed(|| {
+        let executed = db.log_executed(|| {
             lowered(&db, &variants, &impls);
         });
         for batch in BATCHES {

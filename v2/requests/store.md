@@ -206,3 +206,33 @@ crate-root attribute only, in the original evaluation order (`||` short-circuits
   `// SAFETY: setting a signal back to its default action is safe from any thread, and `signal` is one the runtime reported.` `unsafe { libc::signal(signal, libc::SIG_DFL) };` then
   `// SAFETY: raising a signal is safe from any thread; with the default action in place it ends the process as the signal would have.` `unsafe { libc::raise(signal) };`.
 - Checked, no other finding: `remote.rs:771` and `:808` each map a sealed pack (never written again) with one op, and read it only through safe slicing (`pack_keys`, `zstd::bulk::compress`).
+
+## dedup: `blaze-store`'s first-byte bucket pass onto `radix::Csr`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr`
+(`crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into rows; `sorted`'s
+hand-written bucket pass (count by first byte, prefix sum, scatter, split) is that sort. The
+per-bucket radix sorts on threads stay as they are.
+
+`crates/blaze-store/src/lib.rs`, `fn sorted`: replace from `let bucket = |slot: &Slot| (slot.start >> 56) as usize;`
+through the `for end in ends { ... }` split loop with
+
+```rust
+    let bucket = |slot: &Slot| (slot.start >> 56) as u32;
+    let (starts, mut run) =
+        radix::Csr::build(256, pieces.iter().flatten().map(|slot| (bucket(slot), *slot))).into_parts();
+    drop(pieces);
+    let total = run.len();
+    let mut buckets = Vec::with_capacity(256);
+    let mut rest = &mut run[..];
+    for at in 0..256 {
+        let (bucket, after) = std::mem::take(&mut rest).split_at_mut((starts[at + 1] - starts[at]) as usize);
+        buckets.push(bucket);
+        rest = after;
+    }
+```
+
+(`Slot` is `Copy`; `total` is still used for `threads` below). Why: one counting sort in the
+tree; the shared one places without first filling the run with `Slot::default()`.
+
+> applied by requests (store DONE): `sorted` buckets with `radix::Csr::build(256, ..).into_parts()` and splits the run by `starts`, as written; `drop(pieces)` after; `total` still feeds `threads`.

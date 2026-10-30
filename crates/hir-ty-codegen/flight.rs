@@ -13,9 +13,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{FunctionId, HasModule, signatures::FunctionSignature};
-use hir_ty::db::HirDatabase;
 use rustc_hash::FxHashMap;
 
 use crate::{Instance, InstanceDef, StoredParamEnvAndCrate};
@@ -78,12 +77,12 @@ pub fn slowest() -> Vec<Flown> {
 pub(crate) struct Flight(Option<u64>);
 
 impl Flight {
-    pub(crate) fn root(db: &dyn HirDatabase, func: FunctionId) -> Flight {
+    pub(crate) fn root(db: &Db, func: FunctionId) -> Flight {
         Flight::of(|| (func.krate(db), root_name(db, func).clone()))
     }
 
     pub(crate) fn instance(
-        db: &dyn HirDatabase,
+        db: &Db,
         instance: &Instance,
         env: &StoredParamEnvAndCrate,
     ) -> Flight {
@@ -105,14 +104,14 @@ impl Flight {
 // spelled from (bodies, for one) out of the compile's inputs, so an edit that leaves the name
 // as it was recompiles nothing.
 #[salsa::tracked(returns(ref))]
-fn root_name(db: &dyn HirDatabase, func: FunctionId) -> String {
+fn root_name(db: &Db, func: FunctionId) -> String {
     let name = hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[]);
     name.unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
 #[salsa::tracked(returns(ref))]
 fn instance_named(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> (Crate, String) {

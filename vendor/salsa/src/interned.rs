@@ -527,7 +527,9 @@ impl<C: Configuration> Jar for JarImpl<C> {
     fn create_ingredients(
         _zalsa: &mut Zalsa,
         first_index: IngredientIndex,
+    // alloc: setup, once per ingredient when its jar registers
     ) -> Vec<Box<dyn Ingredient>> {
+        // alloc: setup, once per ingredient when its jar registers
         vec![Box::new(IngredientImpl::<C>::new(first_index)) as _]
     }
 
@@ -547,6 +549,7 @@ where
         Self {
             ingredient_index,
             hasher: FxBuildHasher,
+            // alloc: setup, once per ingredient when its jar registers
             memo_table_types: Arc::new(MemoTableTypes::default()),
             revision_queue: RevisionQueue::new(C::REVISIONS),
             shift,
@@ -1356,6 +1359,7 @@ where
             // SAFETY: The memo table belongs to a value that we allocated, so it
             // has the correct type. The caller guarantees exclusive database access.
             .map(|entry| unsafe { entry.value.memory_usage(&self.memo_table_types) })
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect();
 
         Some(memory_usage)
@@ -1373,6 +1377,7 @@ where
     unsafe fn serialize<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        // alloc: the edge: persistence, once per serialized database
         f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
         f(&persistence::SerializeIngredient {
@@ -1513,6 +1518,7 @@ impl RevisionQueue {
         } else {
             (0..capacity.get())
                 .map(|_| AtomicRevision::start())
+                // alloc: setup, once per interned ingredient with a bounded revision queue
                 .collect()
         };
 
@@ -1712,6 +1718,7 @@ where
 
 impl Lookup<String> for &str {
     fn into_owned(self) -> String {
+        // alloc: an intern miss stores an owned copy of the key, once per distinct value; a hit compares borrowed
         self.to_owned()
     }
 }
@@ -1758,6 +1765,7 @@ impl<A, T: Hash + Eq + PartialEq<A>> HashEqLike<&[A]> for Vec<T> {
 
 impl<A: Hash + Eq + PartialEq<T> + Clone + Lookup<T>, T> Lookup<Vec<T>> for &[A] {
     fn into_owned(self) -> Vec<T> {
+        // alloc: an intern miss stores an owned copy of the key, once per distinct value; a hit compares borrowed
         self.iter().map(|a| Lookup::into_owned(a.clone())).collect()
     }
 }
@@ -1771,7 +1779,9 @@ impl<const N: usize, A, T: Hash + Eq + PartialEq<A>> HashEqLike<[A; N]> for Vec<
 impl<const N: usize, A: Hash + Eq + PartialEq<T> + Clone + Lookup<T>, T> Lookup<Vec<T>> for [A; N] {
     fn into_owned(self) -> Vec<T> {
         self.into_iter()
+            // alloc: an intern miss stores an owned copy of the key, once per distinct value; a hit compares borrowed
             .map(|a| Lookup::into_owned(a.clone()))
+            // alloc: an intern miss stores an owned copy of the key, once per distinct value; a hit compares borrowed
             .collect()
     }
 }
@@ -1784,6 +1794,7 @@ impl HashEqLike<&Path> for PathBuf {
 
 impl Lookup<PathBuf> for &Path {
     fn into_owned(self) -> PathBuf {
+        // alloc: an intern miss stores an owned copy of the key, once per distinct value; a hit compares borrowed
         self.to_owned()
     }
 }

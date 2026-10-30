@@ -26,6 +26,30 @@ For more information about this error, try `rustc --explain E0432`.
 }
 
 #[test]
+fn under_cargo_the_missing_crate_help_says_cargo_add() {
+    // tests/ui/error-codes/E0432.rs with `rustc-env:CARGO_CRATE_NAME=foo`, as blaze runs it.
+    let source = "//@ edition:2015\nuse something::Foo; //~ ERROR E0432\n\nfn main () {\n}\n";
+    let stderr = r#"error[E0432]: unresolved import `something`
+  --> $DIR/E0432.rs:2:5
+   |
+LL | use something::Foo;
+   |     ^^^^^^^^^ use of unresolved module or unlinked crate `something`
+   |
+help: if you wanted to use a crate named `something`, use `cargo add something` to add it to your `Cargo.toml` and import it in your code
+   |
+LL + extern crate something;
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0432`.
+"#;
+    let mut options = crate::check::Options::default();
+    options.lints.check_cfg.cargo = true;
+    assert_eq!(crate::tests::ui_with("E0432.rs", "2015", source, &options), stderr);
+}
+
+#[test]
 fn a_module_with_no_file_says_where_to_create_it() {
     // tests/ui/error-codes/E0583.rs
     let source = "mod module_that_doesnt_exist; //~ ERROR E0583\n\nfn main() {\n}\n";

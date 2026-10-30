@@ -17,6 +17,7 @@ use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as 
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
+use smallvec::SmallVec;
 
 use crate::model::{
     Apply, Binding, Data, Name, Names, NativeFixup, Object, Section, SectionKind, Symbol, SymbolDef,
@@ -26,6 +27,7 @@ use crate::model::{
 type Header = macho::MachHeader64<LE>;
 type Nlist = macho::Nlist64<LE>;
 type Relocation = macho::Relocation<LE>;
+type Section64 = macho::Section64<LE>;
 
 /// No symbol: an `N_STAB` entry's in [`Reader::map`], an atom without its section symbol yet in
 /// [`Reader::section_symbols`].
@@ -37,89 +39,114 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     let data = bytes;
     let magic = match data {
         [a, b, c, d, ..] => u32::from_be_bytes([*a, *b, *c, *d]),
+        // alloc: error path
         _ => return Err(format!("{name}: too short for a Mach-O header")),
     };
     match magic {
         macho::MH_CIGAM_64 => {}
+        // alloc: error path
         macho::MH_MAGIC_64 => return Err(format!("{name}: a big-endian Mach-O object")),
+        // alloc: error path
         macho::MH_MAGIC | macho::MH_CIGAM => return Err(format!("{name}: a 32-bit Mach-O object")),
         macho::FAT_MAGIC | macho::FAT_CIGAM | macho::FAT_MAGIC_64 | macho::FAT_CIGAM_64 => {
+            // alloc: error path
             return Err(format!("{name}: a universal (fat) file, not a thin Mach-O object"));
         }
+        // alloc: error path
         other => return Err(format!("{name}: not a Mach-O object (magic {other:#010x})")),
     }
+    // alloc: error path
     let header = Header::parse(data, 0).map_err(|e| format!("{name}: {e}"))?;
     let cpu = match arch {
         Arch::Aarch64 => macho::CPU_TYPE_ARM64,
         Arch::X86_64 => macho::CPU_TYPE_X86_64,
+        // alloc: error path
         Arch::Wasm32 => return Err(format!("{name}: a Mach-O object in a wasm32 link")),
     };
     let found = header.cputype(LE);
     if found != cpu {
+        // alloc: error path
         return Err(format!("{name}: a Mach-O object for CPU type {found:#x}, not {arch:?} ({cpu:#x})"));
     }
     let filetype = header.filetype(LE);
     if filetype != macho::MH_OBJECT {
+        // alloc: error path
         return Err(format!("{name}: Mach-O file type {filetype}, not a relocatable object (MH_OBJECT)"));
     }
     let subsections = header.flags(LE) & macho::MH_SUBSECTIONS_VIA_SYMBOLS != 0;
 
+    // alloc: error path
     let mut commands = header.load_commands(LE, data, 0).map_err(|e| format!("{name}: {e}"))?;
-    let mut headers = Vec::new();
+    // Each segment's section headers, read in place: an object has one segment.
+    let mut headers: SmallVec<[&[Section64]; 1]> = SmallVec::new();
     let mut symtab = None;
+    // The object's `LC_LINKER_OPTION`s: a `String` each, as `Object::libraries` holds them.
+    // alloc: empty, which allocates nothing, unless the object asks for libraries
     let mut libraries = Vec::new();
+    // alloc: error path
     while let Some(command) = commands.next().map_err(|e| format!("{name}: {e}"))? {
         match command.cmd() {
             macho::LC_SEGMENT_64 => {
                 if let Some((segment, sections)) =
+                    // alloc: error path
                     command.segment_64().map_err(|e| format!("{name}: {e}"))?
                 {
-                    headers.extend(
-                        segment.sections(LE, sections).map_err(|e| format!("{name}: {e}"))?,
-                    );
+                    // alloc: error path
+                    headers.push(segment.sections(LE, sections).map_err(|e| format!("{name}: {e}"))?);
                 }
             }
+            // alloc: error path
             macho::LC_SEGMENT => return Err(format!("{name}: a 32-bit segment (LC_SEGMENT)")),
+            // alloc: error path
             macho::LC_SYMTAB => symtab = command.symtab().map_err(|e| format!("{name}: {e}"))?,
             macho::LC_LINKER_OPTION => libraries.push(linker_option(name, command.raw_data())?),
             _ => {}
         }
     }
+    let count = headers.iter().map(|it| it.len()).sum::<usize>();
 
-    let mut nlists: &[Nlist] = &[];
-    let mut raw: Vec<&[u8]> = Vec::new();
     // The arena's bytes: every symbol's core name (at most one byte longer than its Mach-O
     // name) and every section's `SEG,SECT` (at most 33 bytes), so it is allocated once.
-    let mut arena = 33 * headers.len();
-    if let Some(symtab) = symtab {
-        let table = symtab.symbols::<Header, _>(LE, data).map_err(|e| format!("{name}: {e}"))?;
-        let strings = table.strings();
-        nlists = table.iter().as_slice();
-        raw.reserve_exact(nlists.len());
-        for nlist in nlists {
-            let it = nlist.name(LE, strings).map_err(|e| format!("{name}: {e}"))?;
-            if nlist.n_type() & macho::N_STAB == 0 {
-                arena += it.len() + 1;
+    let mut arena = 33 * count;
+    let (nlists, raw): (&[Nlist], Vec<&[u8]>) = match symtab {
+        Some(symtab) => {
+            // alloc: error path
+            let table = symtab.symbols::<Header, _>(LE, data).map_err(|e| format!("{name}: {e}"))?;
+            let strings = table.strings();
+            let nlists = table.iter().as_slice();
+            let mut raw = Vec::with_capacity(nlists.len());
+            for nlist in nlists {
+                // alloc: error path
+                let it = nlist.name(LE, strings).map_err(|e| format!("{name}: {e}"))?;
+                if nlist.n_type() & macho::N_STAB == 0 {
+                    arena += it.len() + 1;
+                }
+                raw.push(it);
             }
-            raw.push(it);
+            (nlists, raw)
         }
-    }
+        None => Default::default(),
+    };
     let mut names = Names::with_capacity(arena);
+    // alloc: error path
     let pushed = |e: String| format!("{name}: {e}");
     // Every atom's section symbol is named so.
     let empty = names.push("").map_err(pushed)?;
 
-    let mut inputs = Vec::with_capacity(headers.len());
-    let mut full = String::with_capacity(33);
-    for header in headers {
+    let mut inputs = Vec::with_capacity(count);
+    for header in headers.iter().flat_map(|it| it.iter()) {
         let segment = text(name, header.segment_name())?;
         let section = text(name, header.name())?;
-        full.clear();
-        full.push_str(segment);
-        full.push(',');
-        full.push_str(section);
+        // `SEG,SECT`: each name is at most 16 bytes.
+        let mut buf = [0u8; 33];
+        let len = segment.len() + 1 + section.len();
+        buf[..segment.len()].copy_from_slice(segment.as_bytes());
+        buf[segment.len()] = b',';
+        buf[segment.len() + 1..len].copy_from_slice(section.as_bytes());
+        let full = std::str::from_utf8(&buf[..len]).expect("two `str`s and a comma");
         let flags = header.flags(LE);
         let what =
+            // alloc: error path
             super::classify(segment, section, flags).map_err(|e| format!("{name}: {full}: {e}"))?;
         let size = header.size(LE);
         let kind = flags & macho::SECTION_TYPE;
@@ -128,13 +155,16 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             _ => Some(
                 header
                     .data(LE, data)
+                    // alloc: error path
                     .map_err(|()| format!("{name}: {full}: its bytes are outside the file"))?,
             ),
         };
         let align = header.align(LE);
         if align >= 64 {
+            // alloc: error path
             return Err(format!("{name}: {full}: alignment 2^{align}"));
         }
+        // alloc: error path
         let relocations = header.relocations(LE, data).map_err(|e| format!("{name}: {full}: {e}"))?;
         let splits = subsections
             && matches!(what, SectionKind::Alloc(..))
@@ -146,7 +176,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
                     | macho::S_16BYTE_LITERALS
             );
         inputs.push(Input {
-            full: names.push(&full).map_err(pushed)?,
+            full: names.push(full).map_err(pushed)?,
             addr: header.addr(LE),
             size,
             flags,
@@ -161,6 +191,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             bounds: 0..0,
             first: 0,
             atoms: 0,
+            fixed: 0..0,
         });
     }
 
@@ -188,6 +219,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             next += 1;
         }
         input.bounds = from as u32..bounds.len() as u32;
+        // alloc: error path
         input.first = u32::try_from(starts.len()).map_err(|_| format!("{name}: too many atoms"))?;
         starts.push(0);
         if input.splits {
@@ -198,11 +230,19 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     drop(points);
 
     let mut sections = Vec::with_capacity(starts.len());
+    // ld64's `dontDeadStripIfReferencesLive`: every loaded atom of an `S_ATTR_LIVE_SUPPORT`
+    // section. `__eh_frame` has the attribute too; its records are kept by function instead.
+    let supports = |input: &Input<'_>| {
+        input.flags & macho::S_ATTR_LIVE_SUPPORT != 0 && matches!(input.what, SectionKind::Alloc(..))
+    };
+    let mut live_support =
+        Vec::with_capacity(inputs.iter().filter(|&it| supports(it)).map(|it| it.atoms as usize).sum());
     let mut relocations = 0;
     for input in &mut inputs {
         let first = input.first as usize;
         let atoms = &starts[first..first + input.atoms as usize];
         let retain = input.flags & macho::S_ATTR_NO_DEAD_STRIP != 0;
+        let supports = supports(input);
         for (j, &start) in atoms.iter().enumerate() {
             let end = atoms.get(j + 1).copied().unwrap_or(input.size);
             // `start <= end <= size`, and `offset..offset + size` is in the input (`bytes`).
@@ -212,40 +252,55 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             };
             let align =
                 if start == 0 { input.align } else { input.align.min(1 << start.trailing_zeros()) };
-            // The last atom takes the kind: a `Class::Named` holds a `String`, cloned only for
-            // the other atoms of a split named section.
+            // The last atom takes the kind; the others clone it, which for a `Class::Named` is a
+            // `SectionName` reference count, never an allocation.
             let what = if j + 1 == atoms.len() {
                 std::mem::replace(&mut input.what, SectionKind::Dropped)
             } else {
+                // clone: allocates nothing (`SectionName` is a `&'static str` or an `Arc<str>`)
                 input.what.clone()
             };
+            if supports {
+                live_support.push(sections.len() as u32);
+            }
             sections.push(Section { name: input.full, what, align, data, fixups: 0..0, retain });
         }
         if input.relocated {
             relocations += input.relocations.len();
+        }
+        // The pointers of `__eh_frame` no relocation covers become fixups: at most two an FDE
+        // (`pc_begin` and the LSDA) and one a CIE (the personality), each of at least 21 bytes
+        // with two of them.
+        if input.eh_frame {
+            relocations += input.bytes.map_or(0, <[u8]>::len) / 10;
         }
     }
 
     let mut reader = Reader {
         name,
         arch,
+        // alloc: one column an object, sized once
         section_symbols: vec![NONE; sections.len()],
         inputs,
         nlists,
         raw,
         names,
         empty,
-        map: Vec::new(),
+        // alloc: one column an object, sized once
+        map: vec![NONE; nlists.len()],
         bounds,
         starts,
+        // Each nlist entry's, and at most one section symbol an atom.
+        symbols: Vec::with_capacity(nlists.len() + sections.len()),
         sections,
-        symbols: Vec::with_capacity(nlists.len()),
         fixups: Vec::with_capacity(relocations),
     };
     reader.read_symbols()?;
     for s in 0..reader.inputs.len() {
         if reader.inputs[s].relocated {
+            let from = reader.fixups.len();
             reader.relocate(s)?;
+            reader.inputs[s].fixed = from..reader.fixups.len();
         }
     }
     for s in 0..reader.inputs.len() {
@@ -255,6 +310,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     }
     let Reader { mut sections, symbols, mut fixups, names, .. } = reader;
     if u32::try_from(fixups.len()).is_err() {
+        // alloc: error path
         return Err(format!("{name}: more than 2^32 relocations"));
     }
     // Stable: fixups of one place keep the order they were read in. Each atom's are then one
@@ -266,28 +322,22 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
         sections[group[0].0 as usize].fixups = at..end;
         at = end;
     }
-    let fixups = fixups.into_iter().map(|it| it.1).collect();
-    Ok(Object {
-        sections,
-        symbols,
-        fixups,
-        groups: Vec::new(),
-        grouped: Vec::new(),
-        names,
-        imports: Vec::new(),
-        libraries,
-        directives: Vec::new(),
-    })
+    let mut column = Vec::with_capacity(fixups.len());
+    column.extend(fixups.iter().map(|it| it.1));
+    drop(fixups);
+    Ok(Object { sections, symbols, fixups: column, names, libraries, live_support, ..Object::default() })
 }
 
 fn text<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str, String> {
     std::str::from_utf8(bytes)
+        // alloc: error path
         .map_err(|_| format!("{name}: a section name that isn't UTF-8: {bytes:?}"))
 }
 
 /// An `LC_LINKER_OPTION`: its words joined by a space (`-framework CoreFoundation`).
 fn linker_option(name: &str, command: &[u8]) -> Result<String, String> {
     let Some(&[a, b, c, d]) = command.get(8..12) else {
+        // alloc: error path
         return Err(format!("{name}: a truncated LC_LINKER_OPTION"));
     };
     let count = u32::from_le_bytes([a, b, c, d]);
@@ -297,8 +347,10 @@ fn linker_option(name: &str, command: &[u8]) -> Result<String, String> {
         let end = rest
             .iter()
             .position(|&it| it == 0)
+            // alloc: error path
             .ok_or_else(|| format!("{name}: an LC_LINKER_OPTION with fewer than {count} strings"))?;
         let word = std::str::from_utf8(&rest[..end])
+            // alloc: error path
             .map_err(|_| format!("{name}: an LC_LINKER_OPTION that isn't UTF-8"))?;
         if i != 0 {
             option.push(' ');
@@ -322,15 +374,18 @@ fn position(
     nlist: &Nlist,
     symbol: &[u8],
 ) -> Result<(usize, u64), String> {
+    // alloc: error path
     let shown = || String::from_utf8_lossy(symbol).into_owned();
     let n_sect = usize::from(nlist.n_sect());
     let input = n_sect
         .checked_sub(1)
         .and_then(|it| inputs.get(it))
+        // alloc: error path
         .ok_or_else(|| format!("{name}: symbol {} is in section {n_sect}, which the object doesn't have", shown()))?;
     let value = nlist.n_value(LE);
     match value.checked_sub(input.addr) {
         Some(offset) if offset <= input.size => Ok((n_sect - 1, offset)),
+        // alloc: error path
         _ => Err(format!("{name}: symbol {} at {value:#x} is outside {}", shown(), names.at(input.full))),
     }
 }
@@ -361,6 +416,8 @@ struct Input<'a> {
     /// [`Reader::starts`] of the same indexes (the first at 0).
     first: u32,
     atoms: u32,
+    /// The run of [`Reader::fixups`] its relocations made.
+    fixed: Range<usize>,
 }
 
 /// A relocation read, before it is put in its atom.
@@ -418,13 +475,13 @@ impl Reader<'_> {
     fn read_symbols(&mut self) -> Result<(), String> {
         let name = self.name;
         let nlists = self.nlists;
-        self.map = vec![NONE; nlists.len()];
         for (index, nlist) in nlists.iter().enumerate() {
             let n_type = nlist.n_type();
             if n_type & macho::N_STAB != 0 {
                 continue;
             }
             let raw = self.raw[index];
+            // alloc: error path
             let shown = || String::from_utf8_lossy(raw).into_owned();
             let n_desc = nlist.n_desc(LE);
             let value = nlist.n_value(LE);
@@ -463,9 +520,11 @@ impl Reader<'_> {
                 ),
                 macho::N_UNDF => (SymbolDef::Undefined, SymbolKind::Other),
                 macho::N_INDR => {
+                    // alloc: error path
                     return Err(format!("{name}: symbol {} is an indirect symbol (N_INDR)", shown()));
                 }
                 other => {
+                    // alloc: error path
                     return Err(format!("{name}: symbol {} has n_type {other:#x}", shown()));
                 }
             };
@@ -483,6 +542,7 @@ impl Reader<'_> {
             };
             self.map[index] = self.symbols.len() as u32;
             self.symbols.push(Symbol {
+                // alloc: error path
                 name: super::push_core_name(&mut self.names, raw).map_err(|e| format!("{name}: {e}"))?,
                 def,
                 binding,
@@ -498,6 +558,7 @@ impl Reader<'_> {
     fn relocate(&mut self, s: usize) -> Result<(), String> {
         let relocations = self.inputs[s].relocations;
         if relocations.iter().any(|it| it.r_word0.get(LE) & macho::R_SCATTERED != 0) {
+            // alloc: error path
             return Err(format!(
                 "{}: a scattered relocation in {}, which a 64-bit object can't have",
                 self.name,
@@ -517,13 +578,15 @@ impl Reader<'_> {
                 }
             }
             Arch::Wasm32 if relocations.is_empty() => {}
+            // alloc: error path
             Arch::Wasm32 => return Err(format!("{}: a Mach-O object in a wasm32 link", self.name)),
         }
         Ok(())
     }
 
-    /// Where a relocation is, for an error.
+    /// Where a relocation is, for an error: called only to build one.
     fn place_of(&self, s: usize, at: u64) -> String {
+        // alloc: error path
         format!("{}: {} at {at:#x}", self.name, self.full(s))
     }
 
@@ -534,6 +597,7 @@ impl Reader<'_> {
             macho::ARM64_RELOC_ADDEND => {
                 let addend = i64::from(((r.r_symbolnum << 8) as i32) >> 8);
                 let Some(next) = relocations.get(1).map(|it| it.info(LE)) else {
+                    // alloc: error path
                     return Err(format!(
                         "{}: ARM64_RELOC_ADDEND with no relocation after it",
                         self.place_of(s, r.r_address.into())
@@ -543,6 +607,7 @@ impl Reader<'_> {
                     next.r_type,
                     macho::ARM64_RELOC_PAGE21 | macho::ARM64_RELOC_PAGEOFF12 | macho::ARM64_RELOC_BRANCH26
                 ) {
+                    // alloc: error path
                     return Err(format!(
                         "{}: ARM64_RELOC_ADDEND before {}, not PAGE21, PAGEOFF12 or BRANCH26",
                         self.place_of(s, next.r_address.into()),
@@ -584,6 +649,7 @@ impl Reader<'_> {
             (macho::ARM64_RELOC_TLVP_LOAD_PAGE21, true, 2) => (Apply::TlvPage21, 0, false),
             (macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12, false, 2) => (Apply::TlvLo12, 0, false),
             (kind, pcrel, length) => {
+                // alloc: error path
                 return Err(format!(
                     "{}: {} (type {kind}, pcrel {pcrel}, {} bytes) is a relocation blaze doesn't read",
                     self.place_of(s, at),
@@ -593,6 +659,7 @@ impl Reader<'_> {
             }
         };
         if !r.r_extern {
+            // alloc: error path
             return Err(format!(
                 "{}: {} against a section rather than a symbol",
                 self.place_of(s, at),
@@ -614,6 +681,7 @@ impl Reader<'_> {
             let simd = insn & 1 << 26 != 0;
             return Ok(if simd && size == 0 && insn & 1 << 23 != 0 { 4 } else { size });
         }
+        // alloc: error path
         Err(format!(
             "{}: ARM64_RELOC_PAGEOFF12 on instruction {insn:#010x}, neither an ADD (immediate) nor a load or store with an unsigned offset",
             self.place_of(s, at)
@@ -642,6 +710,7 @@ impl Reader<'_> {
             }
             (macho::X86_64_RELOC_TLV, true, 2) => (Apply::TlvRel32, 0, false),
             (kind, pcrel, length) => {
+                // alloc: error path
                 return Err(format!(
                     "{}: {} (type {kind}, pcrel {pcrel}, {} bytes) is a relocation blaze doesn't read",
                     self.place_of(s, at),
@@ -658,6 +727,7 @@ impl Reader<'_> {
             (symbol, offset + bias)
         } else {
             if !anchor {
+                // alloc: error path
                 return Err(format!(
                     "{}: {} against a section rather than a symbol",
                     self.place_of(s, at),
@@ -683,6 +753,7 @@ impl Reader<'_> {
             && at % 24 == 16
         {
             if r.r_length != 3 {
+                // alloc: error path
                 return Err(format!(
                     "{}: a thread-local descriptor's offset relocated in {} bytes, not 8",
                     self.place_of(s, at),
@@ -716,6 +787,7 @@ impl Reader<'_> {
         let r = relocations[0].info(LE);
         let at = u64::from(r.r_address);
         if r.r_pcrel || !matches!(r.r_length, 2 | 3) {
+            // alloc: error path
             return Err(format!(
                 "{}: a SUBTRACTOR of {} bytes{}",
                 self.place_of(s, at),
@@ -724,9 +796,11 @@ impl Reader<'_> {
             ));
         }
         if !r.r_extern {
+            // alloc: error path
             return Err(format!("{}: a SUBTRACTOR of a section rather than a symbol", self.place_of(s, at)));
         }
         let Some(next) = relocations.get(1).map(|it| it.info(LE)) else {
+            // alloc: error path
             return Err(format!("{}: a SUBTRACTOR with no UNSIGNED after it", self.place_of(s, at)));
         };
         if next.r_type != unsigned
@@ -734,6 +808,7 @@ impl Reader<'_> {
             || next.r_length != r.r_length
             || next.r_pcrel
         {
+            // alloc: error path
             return Err(format!(
                 "{}: a SUBTRACTOR followed by {} at {:#x}, not an UNSIGNED of the same place and size",
                 self.place_of(s, at),
@@ -763,9 +838,11 @@ impl Reader<'_> {
         let (Some(nlist), Some(symbol)) =
             (nlists.get(index as usize), self.map.get(index as usize).copied())
         else {
+            // alloc: error path
             return Err(format!("{name}: a relocation names symbol {index}, which the object doesn't have"));
         };
         if symbol == NONE {
+            // alloc: error path
             return Err(format!("{name}: a relocation names debugging symbol {index} (N_STAB)"));
         }
         let n_type = nlist.n_type();
@@ -785,10 +862,12 @@ impl Reader<'_> {
         let s = (ordinal as usize)
             .checked_sub(1)
             .filter(|&it| it < self.inputs.len())
+            // alloc: error path
             .ok_or_else(|| format!("{name}: a relocation names section {ordinal}, which the object doesn't have"))?;
         let input = &self.inputs[s];
         let offset = match addr.checked_sub(input.addr) {
             Some(offset) if offset <= input.size => offset,
+            // alloc: error path
             _ => return Err(format!("{name}: a relocation to {addr:#x}, outside {}", self.full(s))),
         };
         let (section, start, _) = self.atom(s, offset);
@@ -820,11 +899,13 @@ impl Reader<'_> {
     fn read(&self, s: usize, at: u64, length: u8, signed: bool) -> Result<i64, String> {
         let width = 1usize << length;
         let Some(bytes) = self.inputs[s].bytes else {
+            // alloc: error path
             return Err(format!("{}: a relocation in a zero-filled section", self.place_of(s, at)));
         };
         let field = usize::try_from(at)
             .ok()
             .and_then(|at| bytes.get(at..at.checked_add(width)?))
+            // alloc: error path
             .ok_or_else(|| format!("{}: a relocation past the end of the section", self.place_of(s, at)))?;
         let mut word = [0u8; 8];
         word[..width].copy_from_slice(field);
@@ -841,6 +922,7 @@ impl Reader<'_> {
     fn place(&mut self, s: usize, fix: Fix) -> Result<(), String> {
         let (section, start, end) = self.atom(s, fix.at);
         if fix.at.checked_add(fix.width).is_none_or(|it| it > end) {
+            // alloc: error path
             return Err(format!(
                 "{}: a relocation of {} bytes that reaches past its atom ({start:#x}..{end:#x})",
                 self.place_of(s, fix.at),
@@ -859,25 +941,28 @@ impl Reader<'_> {
 
     /// An error in section `s`'s call frame information at `at`.
     fn frame_error(&self, s: usize, at: usize, what: &str) -> String {
+        // alloc: error path
         format!("{}: {} at {at:#x}: {what}", self.name, self.full(s))
     }
 
     /// The pointers of `__eh_frame` that no relocation covers: clang leaves an FDE's
     /// pc-relative `pc_begin` and LSDA as the distance in the object (ld64 reads them so),
     /// which only holds while both ends stay where they were. Each becomes an explicit
-    /// `Rel32`/`Rel64` to the atom it points at.
+    /// `Rel32`/`Rel64` to the atom it points at, as the entry it is in is read.
     fn eh_frame(&mut self, s: usize) -> Result<(), String> {
         let Some(bytes) = self.inputs[s].bytes else {
             return Ok(());
         };
-        // `__eh_frame` is never split: its one atom's fixups are the section's.
-        let first = self.inputs[s].first;
-        let mut covered: Vec<u64> =
-            self.fixups.iter().filter(|it| it.0 == first).map(|it| it.1.at).collect();
+        // `__eh_frame` is never split: its one atom's fixups are the run its relocations made.
+        let (from, to) = (self.inputs[s].fixed.start, self.inputs[s].fixed.end);
+        let mut covered = Vec::with_capacity(to - from);
+        covered.extend(self.fixups[from..to].iter().map(|it| it.1.at));
         radix::sort(&mut covered);
-        // In entry order, so by offset: an FDE finds its CIE by binary search.
-        let mut cies: Vec<(usize, Cie)> = Vec::new();
-        let mut fields: Vec<(usize, u8)> = Vec::new();
+        // In entry order, so by offset: an FDE finds its CIE by binary search. An object has
+        // one or two.
+        let mut cies: SmallVec<[(usize, Cie); 8]> = SmallVec::new();
+        let mut personalities: SmallVec<[(usize, u8); 2]> = SmallVec::new();
+        let mut by_addr: Option<Vec<u32>> = None;
         let mut at = 0;
         while at < bytes.len() {
             let mut entry = Cursor { bytes, at };
@@ -896,8 +981,12 @@ impl Reader<'_> {
             let mut c = Cursor { bytes: &bytes[..end], at: start };
             let id = c.u32().map_err(|it| self.frame_error(s, start, it))?;
             if id == 0 {
-                let cie = Cie::parse(&mut c, &mut fields).map_err(|it| self.frame_error(s, start, &it))?;
+                personalities.clear();
+                let cie = Cie::parse(&mut c, &mut personalities).map_err(|it| self.frame_error(s, start, &it))?;
                 cies.push((at, cie));
+                for &(field, encoding) in &personalities {
+                    self.eh_pointer(s, field, encoding, &covered, &mut by_addr)?;
+                }
             } else {
                 // The CIE pointer is the distance back from itself to the CIE's length field.
                 let cie = start
@@ -905,57 +994,74 @@ impl Reader<'_> {
                     .and_then(|it| cies.binary_search_by_key(&it, |(cie, _)| *cie).ok())
                     .map(|found| cies[found].1)
                     .ok_or_else(|| self.frame_error(s, start, "an FDE whose CIE isn't before it"))?;
-                fields.push((c.at, cie.fde));
+                let pc_begin = c.at;
                 c.pointer(cie.fde).map_err(|it| self.frame_error(s, c.at, &it))?;
                 c.pointer(cie.fde & 0x0f).map_err(|it| self.frame_error(s, c.at, &it))?;
+                let mut lsda = None;
                 if cie.z {
                     c.uleb().map_err(|it| self.frame_error(s, c.at, it))?;
-                    if let Some(lsda) = cie.lsda {
-                        fields.push((c.at, lsda));
-                    }
+                    lsda = cie.lsda.map(|encoding| (c.at, encoding));
+                }
+                self.eh_pointer(s, pc_begin, cie.fde, &covered, &mut by_addr)?;
+                if let Some((field, encoding)) = lsda {
+                    self.eh_pointer(s, field, encoding, &covered, &mut by_addr)?;
                 }
             }
             at = end;
         }
-        let mut by_addr: Option<Vec<u32>> = None;
-        for (at, encoding) in fields {
-            if encoding == DW_EH_PE_OMIT || covered.binary_search(&(at as u64)).is_ok() {
-                continue;
-            }
-            let length = match encoding & 0x0f {
-                0x03 | 0x0b => 2,
-                0x00 | 0x04 | 0x0c => 3,
-                _ => {
-                    let what = format!("pointer encoding {encoding:#x} without a relocation");
-                    return Err(self.frame_error(s, at, &what));
-                }
-            };
-            match encoding & 0x70 {
-                0x10 => {
-                    let value = self.read(s, at as u64, length, true)?;
-                    let target = (self.inputs[s].addr.wrapping_add(at as u64)).wrapping_add_signed(value);
-                    if by_addr.is_none() {
-                        by_addr = Some(self.by_addr()?);
-                    }
-                    let sorted = by_addr.as_deref().unwrap_or(&[]);
-                    let ordinal = self.ordinal_of(sorted, target).ok_or_else(|| {
-                        let what = format!("a pc-relative pointer to {target:#x}, in no section");
-                        self.frame_error(s, at, &what)
-                    })?;
-                    let (symbol, addend) = self.at_address(ordinal, target)?;
-                    let apply = if length == 3 { Apply::Rel64 } else { Apply::Rel32 };
-                    let fix = Fix { at: at as u64, width: 1 << length, apply, symbol, addend, minus: None };
-                    self.place(s, fix)?;
-                }
-                0x00 => {
-                    if self.read(s, at as u64, length, false)? != 0 {
-                        return Err(self.frame_error(s, at, "an absolute pointer without a relocation"));
-                    }
-                }
-                _ => return Err(self.frame_error(s, at, &format!("pointer encoding {encoding:#x}"))),
-            }
-        }
         Ok(())
+    }
+
+    /// Makes the pointer of `encoding` at `at` of section `s`'s call frame information a
+    /// fixup, unless a relocation (at an offset in `covered`) already says it. `by_addr` is
+    /// [`Reader::by_addr`], made when a pointer first needs it.
+    fn eh_pointer(
+        &mut self,
+        s: usize,
+        at: usize,
+        encoding: u8,
+        covered: &[u64],
+        by_addr: &mut Option<Vec<u32>>,
+    ) -> Result<(), String> {
+        if encoding == DW_EH_PE_OMIT || covered.binary_search(&(at as u64)).is_ok() {
+            return Ok(());
+        }
+        let length = match encoding & 0x0f {
+            0x03 | 0x0b => 2,
+            0x00 | 0x04 | 0x0c => 3,
+            _ => {
+                // alloc: error path
+                let what = format!("pointer encoding {encoding:#x} without a relocation");
+                return Err(self.frame_error(s, at, &what));
+            }
+        };
+        match encoding & 0x70 {
+            0x10 => {
+                let value = self.read(s, at as u64, length, true)?;
+                let target = (self.inputs[s].addr.wrapping_add(at as u64)).wrapping_add_signed(value);
+                if by_addr.is_none() {
+                    *by_addr = Some(self.by_addr()?);
+                }
+                let sorted = by_addr.as_deref().unwrap_or(&[]);
+                let ordinal = self.ordinal_of(sorted, target).ok_or_else(|| {
+                    // alloc: error path
+                    let what = format!("a pc-relative pointer to {target:#x}, in no section");
+                    self.frame_error(s, at, &what)
+                })?;
+                let (symbol, addend) = self.at_address(ordinal, target)?;
+                let apply = if length == 3 { Apply::Rel64 } else { Apply::Rel32 };
+                let fix = Fix { at: at as u64, width: 1 << length, apply, symbol, addend, minus: None };
+                self.place(s, fix)
+            }
+            0x00 => {
+                if self.read(s, at as u64, length, false)? != 0 {
+                    return Err(self.frame_error(s, at, "an absolute pointer without a relocation"));
+                }
+                Ok(())
+            }
+            // alloc: error path
+            _ => Err(self.frame_error(s, at, &format!("pointer encoding {encoding:#x}"))),
+        }
     }
 
     /// The sections that hold bytes, by address: 4 bytes a section, an address found by binary
@@ -963,13 +1069,14 @@ impl Reader<'_> {
     /// be ambiguous.
     fn by_addr(&self) -> Result<Vec<u32>, String> {
         let inputs = &self.inputs;
-        let mut out: Vec<u32> =
-            (0..inputs.len() as u32).filter(|&it| inputs[it as usize].size != 0).collect();
-        radix::sort_by_key(&mut out, |&it| radix::pack_64(inputs[it as usize].addr, u64::from(it)));
+        let mut out = Vec::with_capacity(inputs.len());
+        out.extend((0..inputs.len() as u32).filter(|&it| inputs[it as usize].size != 0));
+        radix::sort_copy_by_key(&mut out, |&it| radix::pack_64(inputs[it as usize].addr, u64::from(it)));
         for pair in out.windows(2) {
             let (a, b) = (&inputs[pair[0] as usize], &inputs[pair[1] as usize]);
             if a.addr.saturating_add(a.size) > b.addr {
                 let (a, b) = (self.names.at(a.full), self.names.at(b.full));
+                // alloc: error path
                 return Err(format!("{}: sections {a} and {b} overlap", self.name));
             }
         }
@@ -999,10 +1106,12 @@ struct Cie {
 }
 
 impl Cie {
-    /// Reads a CIE after its id, noting its personality pointer in `fields`.
-    fn parse(c: &mut Cursor<'_>, fields: &mut Vec<(usize, u8)>) -> Result<Cie, String> {
+    /// Reads a CIE after its id, noting where its personality pointer is, and its encoding, in
+    /// `personalities`.
+    fn parse(c: &mut Cursor<'_>, personalities: &mut SmallVec<[(usize, u8); 2]>) -> Result<Cie, String> {
         let version = c.u8()?;
         if version != 1 && version != 3 {
+            // alloc: error path
             return Err(format!("a CIE of version {version}"));
         }
         let augmentation = c.string()?;
@@ -1023,15 +1132,17 @@ impl Cie {
                     match it {
                         b'P' => {
                             let encoding = c.u8()?;
-                            fields.push((c.at, encoding));
+                            personalities.push((c.at, encoding));
                             c.pointer(encoding)?;
                         }
                         b'L' => cie.lsda = Some(c.u8()?),
                         b'R' => cie.fde = c.u8()?,
                         b'S' | b'B' | b'G' => {}
                         other => {
+                            // alloc: error path
                             return Err(format!(
                                 "a CIE augmentation {:?} ({:?} unknown)",
+                                // alloc: error path
                                 String::from_utf8_lossy(augmentation),
                                 other as char
                             ));
@@ -1040,8 +1151,10 @@ impl Cie {
                 }
             }
             _ => {
+                // alloc: error path
                 return Err(format!(
                     "a CIE augmentation {:?}",
+                    // alloc: error path
                     String::from_utf8_lossy(augmentation)
                 ));
             }
@@ -1095,6 +1208,7 @@ impl<'a> Cursor<'a> {
             0x02 | 0x0a => self.take(2).map(drop)?,
             0x03 | 0x0b => self.take(4).map(drop)?,
             0x01 | 0x09 => self.uleb()?,
+            // alloc: error path
             other => return Err(format!("pointer format {other:#x}")),
         }
         Ok(())
@@ -1136,7 +1250,7 @@ fn x86_64_name(kind: u8) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use blaze_codegen::Arch;
     use object::macho;
 
@@ -1690,6 +1804,20 @@ mod tests {
     }
 
     #[test]
+    fn live_support_lists_every_atom_and_retains_none() {
+        let mut obj = Obj::new(macho::CPU_TYPE_ARM64);
+        let text = obj.section("__TEXT", "__text", 0, words(&[NOP; 2]), 2, TEXT);
+        let pcs = obj.section("__DATA", "__sancov_pcs", 8, vec![0; 32], 3, macho::S_ATTR_LIVE_SUPPORT);
+        obj.symbol("_f", SECT | EXT, text, 0, 0);
+        obj.symbol("_p0", SECT | EXT, pcs, 0, 8);
+        obj.symbol("_p1", SECT | EXT, pcs, 0, 24);
+        let object = obj.read(Arch::Aarch64).unwrap();
+        assert_eq!(object.live_support, [1, 2], "both atoms of the live support section, not the text");
+        assert!(object.sections.iter().all(|it| !it.retain));
+        assert!(object.ties.is_empty());
+    }
+
+    #[test]
     fn refused_inputs() {
         let mut obj = Obj::new(macho::CPU_TYPE_ARM64);
         let data = obj.section("__DATA", "__data", 0, vec![0; 8], 3, 0);
@@ -1805,6 +1933,56 @@ mod tests {
             (76, Apply::Rel64, 0, SymbolDef::Section { section: 2, value: 0, size: 16 }),
             (104, Apply::Rel64, 0, SymbolDef::Section { section: 0, value: 0, size: 16 }),
         ]);
+    }
+
+    /// An x86-64 object of `n` functions `_f{i}` of 16 bytes, each an atom, a `__data` of `n`
+    /// pointers to the undefined `_u{i}`, and an `__eh_frame` of one CIE and an FDE a function
+    /// whose `pc_begin` no relocation covers: every path of a read, `n` times.
+    pub(in crate::macho) fn sized(n: usize) -> Vec<u8> {
+        let mut obj = Obj::new(macho::CPU_TYPE_X86_64);
+        let (text_len, data_len) = (16 * n as u64, 8 * n as u64);
+        let text = obj.section("__TEXT", "__text", 0, vec![0x90; text_len as usize], 4, TEXT);
+        let data = obj.section("__DATA", "__data", text_len, vec![0; data_len as usize], 3, 0);
+        let leak = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
+        for i in 0..n {
+            obj.symbol(leak(format!("_f{i}")), SECT | EXT, text, 0, 16 * i as u64);
+        }
+        obj.symbol("_d", SECT | EXT, data, 0, text_len);
+        for i in 0..n {
+            let undefined = obj.symbol(leak(format!("_u{i}")), EXT, 0, 0, 0);
+            let unsigned = rel(8 * i as u32, undefined, false, 3, true, macho::X86_64_RELOC_UNSIGNED);
+            obj.relocate(data, unsigned);
+        }
+        let frame = text_len + data_len;
+        let mut eh = Vec::new();
+        w32(&mut eh, 16);
+        w32(&mut eh, 0);
+        eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
+        for i in 0..n {
+            let at = eh.len();
+            w32(&mut eh, 24);
+            w32(&mut eh, (at + 4) as u32);
+            w64(&mut eh, (16 * i as i64 - (frame as i64 + at as i64 + 8)) as u64);
+            w64(&mut eh, 16);
+            eh.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        obj.section("__TEXT", "__eh_frame", frame, eh, 3, EH_FRAME);
+        obj.bytes()
+    }
+
+    #[test]
+    fn a_sized_object_reads() {
+        let object = read("sized.o", &sized(100), Arch::X86_64).unwrap();
+        // 100 function atoms, `__data` and `__eh_frame`.
+        assert_eq!(object.sections.len(), 102);
+        assert_eq!(object.section_fixups(&object.sections[100]).len(), 100);
+        let eh = object.section_fixups(&object.sections[101]);
+        assert_eq!(eh.len(), 100);
+        for (i, fixup) in eh.iter().enumerate() {
+            assert_eq!((fixup.at, fixup.apply, fixup.addend), (20 + 28 * i as u64 + 8, Apply::Rel64, 0));
+            let def = object.symbols[fixup.symbol as usize].def;
+            assert_eq!(def, SymbolDef::Section { section: i as u32, value: 0, size: 16 });
+        }
     }
 
     /// xorshift64: the differential test's seeded inputs.

@@ -13,7 +13,7 @@ use hir_expand::proc_macro::{
 };
 use ide_db::{
     RootDatabase,
-    base_db::{Crate, CrateOrigin, Env, SourceDatabase, salsa::Setter as _},
+    base_db::{Crate, CrateOrigin, Db, Env, salsa::Setter as _},
 };
 use intern::Symbol;
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace};
@@ -40,7 +40,7 @@ impl ProcMacroExpander for Recorder {
 
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -65,7 +65,7 @@ impl ProcMacroExpander for Recorder {
 
     fn expand_in(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         calling_crate: ide_db::base_db::Crate,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,

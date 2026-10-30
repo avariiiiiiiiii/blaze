@@ -24,7 +24,7 @@
 
 use std::{convert::Infallible, iter::Peekable, ops::ControlFlow};
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -61,7 +61,7 @@ pub use self::docs::{Docs, IsInnerDoc};
 
 #[inline]
 fn attrs_from_ast_id_loc<N: AstNode + Into<ast::AnyHasAttrs>>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule>,
 ) -> (InFile<ast::AnyHasAttrs>, Crate) {
     let loc = lookup.lookup(db);
@@ -711,7 +711,7 @@ bitflags::bitflags! {
 
 const _: () = assert!(size_of::<AttrFlags>() == 16);
 
-pub fn parse_extra_crate_attrs(db: &dyn SourceDatabase, krate: Crate) -> Option<SourceFile> {
+pub fn parse_extra_crate_attrs(db: &Db, krate: Crate) -> Option<SourceFile> {
     let crate_data = krate.data(db);
     let crate_attrs = &crate_data.crate_attrs;
     if crate_attrs.is_empty() {
@@ -743,7 +743,7 @@ pub fn parse_extra_crate_attrs(db: &dyn SourceDatabase, krate: Crate) -> Option<
 
 /// Whether the crate root declares `#![no_std]`, looking through `cfg_attr` gating.
 #[salsa::tracked(returns(copy))]
-pub(crate) fn crate_supports_no_std(db: &dyn SourceDatabase, krate: Crate) -> bool {
+pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
     fn contains_no_std(meta: ast::Meta) -> bool {
         match meta {
             ast::Meta::PathMeta(meta) => path_is(meta.path(), "no_std"),
@@ -765,7 +765,7 @@ pub(crate) fn crate_supports_no_std(db: &dyn SourceDatabase, krate: Crate) -> bo
 }
 
 fn attrs_source(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: AttrDefId,
 ) -> (InFile<ast::AnyHasAttrs>, Option<InFile<ast::Module>>, Option<SourceFile>, Crate) {
     let (owner, krate) = match owner {
@@ -818,7 +818,7 @@ fn attrs_source(
     (owner, None, None, krate)
 }
 
-fn resolver_for_attr_def_id(db: &dyn SourceDatabase, owner: AttrDefId) -> Resolver<'_> {
+fn resolver_for_attr_def_id(db: &Db, owner: AttrDefId) -> Resolver<'_> {
     match owner {
         AttrDefId::ModuleId(id) => id.resolver(db),
         AttrDefId::AdtId(AdtId::StructId(id)) => id.resolver(db),
@@ -841,7 +841,7 @@ fn resolver_for_attr_def_id(db: &dyn SourceDatabase, owner: AttrDefId) -> Resolv
 }
 
 fn collect_attrs<BreakValue>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: AttrDefId,
     callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
@@ -851,7 +851,7 @@ fn collect_attrs<BreakValue>(
 
 /// [`collect_attrs`] over a source [`attrs_source`] already found.
 fn collect_attrs_in<BreakValue>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     source: &InFile<ast::AnyHasAttrs>,
     outer_mod_decl: Option<InFile<ast::Module>>,
     extra_crate_attrs: Option<SourceFile>,
@@ -874,7 +874,7 @@ fn collect_attrs_in<BreakValue>(
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
-pub(crate) fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> Option<Symbol> {
+pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbol> {
     let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
     let value =
         collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, |attr| match attr {
@@ -890,7 +890,7 @@ pub(crate) fn symbol_attr(db: &dyn SourceDatabase, owner: AttrDefId, name: &str)
 /// The string a key-value attribute's value is, with the macros in it expanded by the
 /// resolver of `owner`.
 fn attr_value(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: AttrDefId,
     krate: Crate,
     value: InFile<ast::Expr>,
@@ -917,7 +917,7 @@ fn attr_value(
 }
 
 fn collect_field_attrs<T>(
-    db: &dyn SourceDatabase,
+    db: &Db,
     variant: VariantId,
     mut field_attrs: impl FnMut(&CfgOptions, InFile<ast::AnyHasAttrs>) -> T,
 ) -> ArenaMap<LocalFieldId, T> {
@@ -935,7 +935,7 @@ fn collect_field_attrs<T>(
 /// Calls `each` with the index, the crate's cfg options and the syntax of every field of
 /// `variant` its cfg leaves in, in order: the indices are `0..` with no gap.
 fn for_each_field(
-    db: &dyn SourceDatabase,
+    db: &Db,
     variant: VariantId,
     mut each: impl FnMut(u32, &CfgOptions, InFile<ast::AnyHasAttrs>),
 ) {
@@ -1142,14 +1142,14 @@ fn extract_cfgs(result: &mut Vec<CfgExpr>, attr: ast::Meta) -> ControlFlow<Infal
 #[salsa::tracked]
 impl AttrFlags {
     #[salsa::tracked(returns(copy))]
-    pub fn query(db: &dyn SourceDatabase, owner: AttrDefId) -> AttrFlags {
+    pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
         let mut attr_flags = AttrFlags::empty();
         collect_attrs(db, owner, |attr| match_attr_flags(&mut attr_flags, attr));
         attr_flags
     }
 
     #[inline]
-    pub fn query_field(db: &dyn SourceDatabase, field: FieldId) -> AttrFlags {
+    pub fn query_field(db: &Db, field: FieldId) -> AttrFlags {
         return field_attr_flags(db, field.parent)
             .get(u32::from(field.local_id.into_raw()) as usize)
             .copied()
@@ -1158,7 +1158,7 @@ impl AttrFlags {
         /// The flags of each field the cfg leaves in, indexed by `LocalFieldId`: 16 bytes a
         /// field, read by index.
         #[salsa::tracked(returns(ref))]
-        fn field_attr_flags(db: &dyn SourceDatabase, variant: VariantId) -> Box<[AttrFlags]> {
+        fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
             let mut result = SmallVec::<[AttrFlags; 8]>::new();
             for_each_field(db, variant, |_, cfg_options, field| {
                 let mut attr_flags = AttrFlags::empty();
@@ -1175,7 +1175,7 @@ impl AttrFlags {
 
     #[inline]
     pub fn query_generic_params(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> &(ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
     {
@@ -1189,7 +1189,7 @@ impl AttrFlags {
 
         #[salsa::tracked(returns(ref))]
         fn generic_params_attr_flags(
-            db: &dyn SourceDatabase,
+            db: &Db,
             def: GenericDefId,
         ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
         {
@@ -1230,7 +1230,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn query_lifetime_param(db: &dyn SourceDatabase, owner: LifetimeParamId) -> AttrFlags {
+    pub fn query_lifetime_param(db: &Db, owner: LifetimeParamId) -> AttrFlags {
         AttrFlags::query_generic_params(db, owner.parent)
             .0
             .get(owner.local_id)
@@ -1239,7 +1239,7 @@ impl AttrFlags {
     }
     #[inline]
     pub fn query_type_or_const_param(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: TypeOrConstParamId,
     ) -> AttrFlags {
         AttrFlags::query_generic_params(db, owner.parent)
@@ -1276,20 +1276,20 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn lang_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         AttrFlags::query(db, owner).lang_item_with_attrs(db, owner)
     }
 
     /// The symbol a foreign item is declared to link against, if it is not its own name.
     #[inline]
-    pub fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn link_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_NAME) {
             return None;
         }
         return link_name(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn link_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn link_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_name")
         }
     }
@@ -1297,14 +1297,14 @@ impl AttrFlags {
     /// The diagnostic item `#[rustc_diagnostic_item = ".."]` names an item, rustc's
     /// `diagnostic_items` entry for it.
     #[inline]
-    pub fn diagnostic_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn diagnostic_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_DIAGNOSTIC_ITEM) {
             return None;
         }
         return diagnostic_item(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn diagnostic_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn diagnostic_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "rustc_diagnostic_item")
         }
     }
@@ -1312,7 +1312,7 @@ impl AttrFlags {
     /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
     /// those whose `cfg(...)` the crate does not have left out, in the order written.
     #[salsa::tracked(returns(ref))]
-    pub fn native_libs(db: &dyn SourceDatabase, owner: ExternBlockId) -> Box<[NativeLib]> {
+    pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
         let krate = owner.lookup(db).container.krate(db);
         let mut libs = Vec::new();
         collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
@@ -1332,7 +1332,7 @@ impl AttrFlags {
     /// The module a wasm module imports the functions of an `extern` block from,
     /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
     #[salsa::tracked(returns(clone))]
-    pub fn wasm_import_module(db: &dyn SourceDatabase, owner: ExternBlockId) -> Option<Symbol> {
+    pub fn wasm_import_module(db: &Db, owner: ExternBlockId) -> Option<Symbol> {
         collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = &attr
                 && path_is(attr.path(), "link")
@@ -1347,49 +1347,49 @@ impl AttrFlags {
 
     /// The section `#[link_section]` puts an item in.
     #[inline]
-    pub fn link_section(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn link_section(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINK_SECTION) {
             return None;
         }
         return link_section(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn link_section(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn link_section(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_section")
         }
     }
 
     /// The linkage `#[linkage]` asks of an item, as `extern_weak`.
     #[inline]
-    pub fn linkage(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn linkage(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_LINKAGE) {
             return None;
         }
         return linkage(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn linkage(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn linkage(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "linkage")
         }
     }
 
     /// The symbol `#[export_name]` gives an item.
     #[inline]
-    pub fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn export_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::HAS_EXPORT_NAME) {
             return None;
         }
         return export_name(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn export_name(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn export_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "export_name")
         }
     }
 
     /// Whether `owner` has the attribute `#[name]`, once its `cfg_attr`s are expanded. The words
     /// the flags record are one bit test; any other name walks the attributes.
-    pub fn has_word(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> bool {
+    pub fn has_word(db: &Db, owner: AttrDefId, name: &str) -> bool {
         let flag = match word(name) {
             Some(Word::rustc_nounwind) => AttrFlags::RUSTC_NOUNWIND,
             Some(Word::rustc_comptime) => AttrFlags::RUSTC_COMPTIME,
@@ -1400,7 +1400,7 @@ impl AttrFlags {
     }
 
     /// [`AttrFlags::has_word`] read from the source.
-    fn has_word_in_source(db: &dyn SourceDatabase, owner: AttrDefId, name: &str) -> bool {
+    fn has_word_in_source(db: &Db, owner: AttrDefId, name: &str) -> bool {
         let found = collect_attrs(db, owner, |attr| match attr {
             ast::Meta::PathMeta(attr) if path_is(attr.path(), name) => ControlFlow::Break(()),
             _ => ControlFlow::Continue(()),
@@ -1409,7 +1409,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn lang_item_with_attrs(self, db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn lang_item_with_attrs(self, db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !self.contains(AttrFlags::LANG_ITEM) {
             // Don't create the query in case this is not a lang item, this wastes memory.
             return None;
@@ -1418,7 +1418,7 @@ impl AttrFlags {
         return lang_item(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn lang_item(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
                     && path_is(attr.path(), "lang")
@@ -1433,7 +1433,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn repr(db: &dyn SourceDatabase, owner: AdtId) -> Option<ReprOptions> {
+    pub fn repr(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_REPR) {
             // Don't create the query in case this has no repr, this wastes memory.
             return None;
@@ -1447,7 +1447,7 @@ impl AttrFlags {
     /// Prefer [`AttrFlags::repr()`] in non-perf-sensitive places as it also has a check that
     /// that the ADT has repr.
     #[salsa::tracked(returns(copy))]
-    pub fn repr_assume_has(db: &dyn SourceDatabase, owner: AdtId) -> Option<ReprOptions> {
+    pub fn repr_assume_has(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         let mut result = None;
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
             let mut current = None;
@@ -1494,7 +1494,7 @@ impl AttrFlags {
     /// Call this only if there are legacy const generics, to save memory.
     #[salsa::tracked(returns(ref))]
     pub(crate) fn legacy_const_generic_indices(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: FunctionId,
     ) -> Option<Box<[u32]>> {
         let result = collect_attrs(db, owner.into(), |attr| {
@@ -1513,7 +1513,7 @@ impl AttrFlags {
 
     // There aren't typically many crates, so it's okay to always make this a query without a flag.
     #[salsa::tracked(returns(ref))]
-    pub fn doc_html_root_url(db: &dyn SourceDatabase, krate: Crate) -> Option<SmolStr> {
+    pub fn doc_html_root_url(db: &Db, krate: Crate) -> Option<SmolStr> {
         let root_file_id = krate.root_file_id(db);
         let syntax = root_file_id.parse(db).tree();
         let extra_crate_attrs =
@@ -1546,7 +1546,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn target_features(db: &dyn SourceDatabase, owner: FunctionId) -> &FxHashSet<Symbol> {
+    pub fn target_features(db: &Db, owner: FunctionId) -> &FxHashSet<Symbol> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
             return const { &FxHashSet::with_hasher(rustc_hash::FxBuildHasher) };
         }
@@ -1554,7 +1554,7 @@ impl AttrFlags {
         return target_features(db, owner);
 
         #[salsa::tracked(returns(ref))]
-        fn target_features(db: &dyn SourceDatabase, owner: FunctionId) -> FxHashSet<Symbol> {
+        fn target_features(db: &Db, owner: FunctionId) -> FxHashSet<Symbol> {
             let mut result = FxHashSet::default();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -1590,7 +1590,7 @@ impl AttrFlags {
     /// The features `#[target_feature(enable = ..)]` names, in the order the attributes name
     /// them, each as often as it is named: rustc's `CodegenFnAttrs::target_features` before
     /// it adds what each implies, which its MIR inliner compares in order.
-    pub fn target_feature_list(db: &dyn SourceDatabase, owner: FunctionId) -> Vec<Symbol> {
+    pub fn target_feature_list(db: &Db, owner: FunctionId) -> Vec<Symbol> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
             return Vec::new();
         }
@@ -1627,13 +1627,13 @@ impl AttrFlags {
     /// Whether the function is `#[rustc_nounwind]`, which rustc's `fn_can_unwind` takes as
     /// never unwinding.
     #[inline]
-    pub fn is_rustc_nounwind(db: &dyn SourceDatabase, owner: FunctionId) -> bool {
+    pub fn is_rustc_nounwind(db: &Db, owner: FunctionId) -> bool {
         AttrFlags::query(db, owner.into()).contains(AttrFlags::RUSTC_NOUNWIND)
     }
 
     #[inline]
     pub fn rustc_layout_scalar_valid_range(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: AdtId,
     ) -> RustcLayoutScalarValidRange {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE)
@@ -1645,7 +1645,7 @@ impl AttrFlags {
 
         #[salsa::tracked(returns(copy))]
         fn rustc_layout_scalar_valid_range(
-            db: &dyn SourceDatabase,
+            db: &Db,
             owner: AdtId,
         ) -> RustcLayoutScalarValidRange {
             let mut result = RustcLayoutScalarValidRange::default();
@@ -1675,7 +1675,7 @@ impl AttrFlags {
     #[inline]
     pub fn doc_aliases(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: Either<AttrDefId, FieldId>,
     ) -> &[Symbol] {
         if !self.contains(AttrFlags::HAS_DOC_ALIASES) {
@@ -1690,7 +1690,7 @@ impl AttrFlags {
         };
 
         #[salsa::tracked(returns(ref))]
-        fn doc_aliases(db: &dyn SourceDatabase, owner: AttrDefId) -> Box<[Symbol]> {
+        fn doc_aliases(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
             let mut result = Vec::new();
             collect_attrs::<Infallible>(db, owner, |attr| extract_doc_aliases(&mut result, attr));
             result.into_boxed_slice()
@@ -1698,7 +1698,7 @@ impl AttrFlags {
 
         #[salsa::tracked(returns(ref))]
         fn fields_doc_aliases(
-            db: &dyn SourceDatabase,
+            db: &Db,
             variant: VariantId,
         ) -> ArenaMap<LocalFieldId, Box<[Symbol]>> {
             collect_field_attrs(db, variant, |cfg_options, field| {
@@ -1716,7 +1716,7 @@ impl AttrFlags {
     #[inline]
     pub fn cfgs(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: Either<AttrDefId, FieldId>,
     ) -> Option<&CfgExpr> {
         if !self.contains(AttrFlags::HAS_CFG) {
@@ -1731,7 +1731,7 @@ impl AttrFlags {
 
         // We LRU this query because it is only used by IDE.
         #[salsa::tracked(returns(ref), lru = 250)]
-        fn cfgs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<CfgExpr> {
+        fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
             let mut result = Vec::new();
             collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
             match result.len() {
@@ -1744,7 +1744,7 @@ impl AttrFlags {
         // We LRU this query because it is only used by IDE.
         #[salsa::tracked(returns(ref), lru = 50)]
         fn fields_cfgs(
-            db: &dyn SourceDatabase,
+            db: &Db,
             variant: VariantId,
         ) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
             collect_field_attrs(db, variant, |cfg_options, field| {
@@ -1764,14 +1764,14 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn doc_keyword(db: &dyn SourceDatabase, owner: ModuleId) -> Option<Symbol> {
+    pub fn doc_keyword(db: &Db, owner: ModuleId) -> Option<Symbol> {
         if !AttrFlags::query(db, AttrDefId::ModuleId(owner)).contains(AttrFlags::HAS_DOC_KEYWORD) {
             return None;
         }
         return doc_keyword(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn doc_keyword(db: &dyn SourceDatabase, owner: ModuleId) -> Option<Symbol> {
+        fn doc_keyword(db: &Db, owner: ModuleId) -> Option<Symbol> {
             collect_attrs(db, AttrDefId::ModuleId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && path_is(attr.path(), "doc")
@@ -1792,7 +1792,7 @@ impl AttrFlags {
 
     // We LRU this query because it is only used by IDE.
     #[salsa::tracked(returns(as_deref), lru = 250)]
-    pub fn docs(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<Docs>> {
+    pub fn docs(db: &Db, owner: AttrDefId) -> Option<Box<Docs>> {
         let (source, outer_mod_decl, _extra_crate_attrs, krate) = attrs_source(db, owner);
         let inner_attrs_node = docs::inner_docs_node(&source.value);
         // Note: we don't have to pass down `_extra_crate_attrs` here, since `extract_docs`
@@ -1810,14 +1810,14 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn field_docs(db: &dyn SourceDatabase, field: FieldId) -> Option<&Docs> {
+    pub fn field_docs(db: &Db, field: FieldId) -> Option<&Docs> {
         Self::fields_docs(db, field.parent).get(field.local_id).and_then(|it| it.as_deref())
     }
 
     // We LRU this query because it is only used by IDE.
     #[salsa::tracked(returns(ref), lru = 50)]
     pub fn fields_docs(
-        db: &dyn SourceDatabase,
+        db: &Db,
         variant: VariantId,
     ) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
         let krate = variant.module(db).krate(db);
@@ -1835,7 +1835,7 @@ impl AttrFlags {
     }
 
     #[inline]
-    pub fn derive_info(db: &dyn SourceDatabase, owner: MacroId) -> Option<&DeriveInfo> {
+    pub fn derive_info(db: &Db, owner: MacroId) -> Option<&DeriveInfo> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO) {
             return None;
         }
@@ -1843,7 +1843,7 @@ impl AttrFlags {
         return derive_info(db, owner).as_ref();
 
         #[salsa::tracked(returns(ref))]
-        fn derive_info(db: &dyn SourceDatabase, owner: MacroId) -> Option<DeriveInfo> {
+        fn derive_info(db: &Db, owner: MacroId) -> Option<DeriveInfo> {
             collect_attrs(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && (path_is(attr.path(), "proc_macro_derive")
@@ -1880,7 +1880,7 @@ impl AttrFlags {
         }
     }
 
-    pub fn unstable_feature(self, db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+    pub fn unstable_feature(self, db: &Db, owner: AttrDefId) -> Option<Symbol> {
         if !self.contains(AttrFlags::IS_UNSTABLE) {
             return None;
         }
@@ -1888,7 +1888,7 @@ impl AttrFlags {
         return unstable_feature(db, owner);
 
         #[salsa::tracked(returns(clone))]
-        fn unstable_feature(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Symbol> {
+        fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && path_is(attr.path(), "unstable")
@@ -1916,14 +1916,14 @@ impl AttrFlags {
 
     /// Returns `None` if there is no `#[must_use]`, `Some(None)` if there is a `#[must_use]` without a message,
     /// and `Some(Some(message))` if there is a `#[must_use]` with a message.
-    pub fn must_use_message(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Option<&str>> {
+    pub fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Option<&str>> {
         if !AttrFlags::query(db, owner).contains(AttrFlags::IS_MUST_USE) {
             return None;
         }
         return Some(must_use_message(db, owner));
 
         #[salsa::tracked(returns(as_deref))]
-        fn must_use_message(db: &dyn SourceDatabase, owner: AttrDefId) -> Option<Box<str>> {
+        fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Box<str>> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
                     && path_is(attr.path(), "must_use")
@@ -1938,14 +1938,14 @@ impl AttrFlags {
 
     /// The type aliases a function names in `#[define_opaque(..)]`, which has expanded to
     /// `#[rust_analyzer::define_opaque(..)]` by now.
-    pub fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> &[ModPath] {
+    pub fn define_opaque(db: &Db, owner: FunctionId) -> &[ModPath] {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_DEFINE_OPAQUE) {
             return &[];
         }
         return define_opaque(db, owner);
 
         #[salsa::tracked(returns(deref))]
-        fn define_opaque(db: &dyn SourceDatabase, owner: FunctionId) -> Box<[ModPath]> {
+        fn define_opaque(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
             let mut result = Vec::new();
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -1986,7 +1986,7 @@ impl AttrFlags {
         }
     }
 
-    pub fn must_implement_one_of(db: &dyn SourceDatabase, owner: TraitId) -> Option<&[Name]> {
+    pub fn must_implement_one_of(db: &Db, owner: TraitId) -> Option<&[Name]> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_RUSTC_MUST_IMPLEMENT_ONE_OF)
         {
             return None;
@@ -1995,7 +1995,7 @@ impl AttrFlags {
 
         #[salsa::tracked(returns(as_deref))]
         pub fn must_implement_one_of(
-            db: &dyn SourceDatabase,
+            db: &Db,
             owner: TraitId,
         ) -> Option<Box<[Name]>> {
             collect_attrs(db, owner.into(), |attr| {

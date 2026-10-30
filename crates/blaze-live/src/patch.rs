@@ -448,7 +448,17 @@ pub const MESSAGE_PREFIX: &str = "message-";
 /// The file of the message a program at generation `generation` waits for (a patch on it, or
 /// a rollback or restart from it).
 pub fn message_file(generation: u64) -> String {
-    format!("{MESSAGE_PREFIX}{generation:016x}")
+    let mut name = String::with_capacity(MESSAGE_PREFIX.len() + 16);
+    message_file_into(generation, &mut name);
+    name
+}
+
+/// [`message_file`] into `name`, cleared first: no allocation once it has room.
+pub fn message_file_into(generation: u64, name: &mut String) {
+    use std::fmt::Write as _;
+    name.clear();
+    name.push_str(MESSAGE_PREFIX);
+    write!(name, "{generation:016x}").expect("a String takes any text");
 }
 
 /// What the program answers, in the file `ANSWER` of the directory (replaced each time).
@@ -643,6 +653,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     fn descriptor() -> Descriptor {
@@ -893,13 +905,7 @@ mod tests {
     /// never a panic; whatever a view reads, iterating it doesn't panic either.
     #[test]
     fn corrupted_bytes_never_panic() {
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut random = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let encoded: Vec<Vec<u8>> = messages()
             .iter()
             .map(Message::encode)
@@ -923,11 +929,11 @@ mod tests {
             }
             for _ in 0..2000 {
                 let mut corrupt = bytes.clone();
-                for _ in 0..1 + random() % 4 {
-                    let at = (random() % corrupt.len() as u64) as usize;
-                    corrupt[at] = random() as u8;
+                for _ in 0..1 + rng.below(4) {
+                    let at = rng.index(corrupt.len());
+                    corrupt[at] = rng.next_u64() as u8;
                 }
-                let len = (random() % (corrupt.len() as u64 + 1)) as usize;
+                let len = rng.index(corrupt.len() + 1);
                 corrupt.truncate(len);
                 read(&corrupt);
             }

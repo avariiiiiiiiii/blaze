@@ -101,8 +101,20 @@ pub(crate) mod yield_outside_coroutine;
 pub enum Phase {
     /// The parser.
     Parse,
-    /// Expansion and name resolution (`rustc_expand`, `rustc_resolve`), with the early lints.
+    /// The crate root's attributes rustc reads before expansion (`passes.rs`:
+    /// `#![crate_type]`, `#![recursion_limit]`), whose errors are fatal.
+    CrateAttrs,
+    /// Expansion (`rustc_expand`: macro errors, E0583, macros not found).
+    Expand,
+    /// AST validation (`rustc_ast_passes::ast_validation`), after expansion and before the
+    /// resolver's errors (`configure_and_expand`).
+    Validate,
+    /// Name resolution's errors at the end of `resolve_crate`, the feature gates and the
+    /// early lints.
     Resolve,
+    /// Lowering the AST to HIR (`rustc_ast_lowering`: E0728 `await` outside `async`, E0267
+    /// and E0268 `break` outside a loop, E0426 an undeclared label, E0767).
+    Lower,
     /// The checks of items (`rustc_hir_analysis`: collect, coherence, well-formedness).
     Items,
     /// Type checking of bodies (`typeck`), with what it checks of patterns and calls.
@@ -111,6 +123,9 @@ pub enum Phase {
     Mir,
     /// After the abort: late lints, dead code, privacy (`misc_checking_3`).
     Late,
+    /// rustc's stashed warnings (the soft feature gates'), written last and only when the
+    /// crate had no error at all, lints' included.
+    Stashed,
 }
 
 /// A diagnostic found, before its lint level (when it is a lint's) is decided.
@@ -135,7 +150,7 @@ impl Found {
 }
 
 /// `d` as rustc gives it: none, one, or several diagnostics.
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: AnyDiagnostic<'_>) -> Vec<Found> {
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> {
     match d {
         AnyDiagnostic::BadRtn(d) => bad_rtn::lower(cx, &d),
         AnyDiagnostic::ElidedLifetimesInPath(d) => elided_lifetimes_in_path::lower(cx, &d),

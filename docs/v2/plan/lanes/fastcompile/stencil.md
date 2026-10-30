@@ -47,10 +47,13 @@ Building Cranelift IR costs about a fifth of Cranelift's compile. The remaining 
 writes one buffer:
 
 1. **Scan** (`patch/scan.rs`). Use counts, which values are `iconst`s (folded as immediates
-   where a shape takes one), the last use of each value local to one block, and which result
-   can stay in the accumulator. Each is a column indexed by `ir::Value`, in scratch reused
-   across compiles.
-2. **Slots** (`patch/slots.rs`). Every value that is not folded gets a slot in the frame: 8
+   where a shape takes one), and the last use of each value local to one block. Each is a
+   column indexed by `ir::Value`, in scratch reused across compiles. Selection
+   (`patch/select.rs`) then picks each instruction's shape, taking a fusion only when the
+   library has the fused shape.
+2. **Slots** (`patch/slots.rs`). Which result stays in the accumulator is decided here, after
+   selection, so it can ask the library for the accumulator shape. Every value that is not
+   folded or kept in the accumulator gets a slot in the frame: 8
    bytes for scalars up to 64 bits, 16 for `i128`, `f128` and vectors. A value used only in
    its own block frees its slot after its last use, and the next definition reuses it: a
    linear scan in layout order, with no liveness analysis across blocks. Values that cross
@@ -67,9 +70,10 @@ writes one buffer:
    without that jump (`tail` bytes, recorded by the generator) when the next code follows
    directly. Straight-line code is then the stencils' bodies back to back.
 6. **Edges.** Block arguments are parallel moves between slots. Copy stencils write them,
-   with a cycle broken through a scratch slot. An edge with moves gets its own label after
-   the block. An edge without moves jumps straight to its block, and a jump to the next block
-   is dropped.
+   with a cycle broken through a scratch slot. An edge gets its own label and code after
+   the block when it has moves, is a back edge (for its count) or is a landing pad. Any other
+   edge jumps straight to its block, and a jump to the next block is dropped.
+   [stencil-patch.md](stencil-patch.md) has the patcher's passes in their exact order.
 7. **Finish.** It writes trap stubs (one per trap code used), then the function's constants
    (`vconst`, shuffle masks, 16-byte aligned, reached PC-relatively). Label fixups are
    resolved and the unwind rows closed, and the result is returned as `Code`.
@@ -168,9 +172,10 @@ stencil and reads the registers from its bytes, and the build fails if they are 
 callee-saved in SysV, Win64 and AAPCS64, so `frame` survives every call the glue makes with no
 reload.
 
-Stencils are **leaf and stackless**. The generator compiles with `-stack-size-section` and
-rejects any stencil whose stack size is not 0. It also rejects any relocation other than a
-hole. A stencil never calls, never spills and never moves `rsp`/`sp`, so stack alignment, CFI
+Stencils are **leaf and stackless**. LLVM's C API has no setter for the stack-size section,
+so the generator checks each stencil's disassembly instead, which is stricter: it rejects
+every instruction that names the stack pointer, the frame pointer, `x18`, `x29` or `x30`,
+and every push, pop, call and return. It also rejects any relocation other than a hole. A stencil never calls, never spills and never moves `rsp`/`sp`, so stack alignment, CFI
 and unwinding never depend on stencil code. The operations Cranelift itself lowers to a
 libcall on the baseline CPU are glue calls of the same libcall: `ceil`, `floor`, `trunc` and
 `nearest` without SSE4.1, `fma` without FMA, `X86Pshufb` without SSSE3. They run the same
@@ -203,13 +208,20 @@ One library per architecture variant, chosen by `Target::cpu`, matching the CPU 
 Format (`table/format.rs`, little-endian, read in place):
 
 ```
-Header   magic "BZSTENC1", shape::VERSION, variant, counts, offsets, id: [u8; 32]
-Stencil  [count]  { code: u32, len: u16, tail: u8, holes: u8, first_hole: u32 }   12 bytes
-Hole     [holes]  { at: u16, form: u8, kind: u8, addend: i32 }                     8 bytes
+Header   84 bytes: magic "BZSTENC1", FORMAT (3), shape::VERSION, variant, counts, seed, id
+Stencil  [stencils] { code: u32, len: u16, tail: u8, holes: u8, first_hole: u32,
+                      first_fault: u24 | faults: u8 }                              16 bytes
+Hole     [holes]    { at: u16, form: u8, kind: u8, addend: i32 }                   8 bytes
+Fault    [faults]   u16: where an access of the op's memory starts
 Index    pilots [buckets] u16, slots [n] (key: u32, stencil: u32)                  PTHash
-Code     bytes
-Rodata   bytes, with each stencil's range in its `Rodata` holes' addends
+Code     bytes, padded to 16
+Rodata   [entries] 16 bytes each, named by `Rodata` holes
 ```
+
+Every column's offset follows from the counts. A load's, store's or atomic's faults are where
+it can trap on memory; the patcher records each with the instruction's trap code in
+`Code::traps`, as Cranelift records one at each trapping access. `table/format.rs`'s module
+docs are the exact layout.
 
 The index is a perfect hash built by the generator (PTHash: one pilot per bucket, a
 multiply-shift hash), from `Shape::key` to the stencil. A lookup is two multiplies, one load
@@ -296,7 +308,7 @@ next run starts hot functions at their last tier (idea 15).
 
 The stencils are made when blaze is built, by `build.rs` running the generator in `gen/`. The
 generator drives LLVM through `vendor/llvm-sys` (a build dependency): it writes each stencil's
-LLVM IR as text, parses it with `LLVMParseIRInContext`, compiles one module per variant with
+LLVM IR as text, parses it with `LLVMParseIRInContext2`, compiles one module per variant with
 `LLVMTargetMachineEmitToMemoryBuffer`, reads the object with `object`, and writes the library
 to `OUT_DIR`. The alternatives:
 

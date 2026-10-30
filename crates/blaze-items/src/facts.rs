@@ -17,6 +17,7 @@
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
 
+use base_db::Db;
 use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
 use either::Either;
 use hir_def::{
@@ -92,11 +93,11 @@ fn domain(fact: &Fact) -> &'static str {
 }
 
 /// What `fact` stands for in the current database (see the module doc).
-pub fn value(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> {
+pub fn value(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
     hir_ty::attach_db(db, || value_in(db, fact))
 }
 
-fn value_in(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> {
+fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
     let domain = domain(fact);
     let absent = || Ok(Hasher::new(domain).part(b"absent").finish());
     let mut h = Hasher::new(domain);
@@ -232,19 +233,19 @@ fn value_in(db: &dyn HirDatabase, fact: &Fact) -> Result<ContentId, Unhashable> 
 }
 
 /// The first 128 bits of [`value`]: what a dependency edge records.
-pub fn fingerprint(db: &dyn HirDatabase, fact: &Fact) -> Result<Fingerprint, Unhashable> {
+pub fn fingerprint(db: &Db, fact: &Fact) -> Result<Fingerprint, Unhashable> {
     Ok(value(db, fact)?.fingerprint())
 }
 
-pub fn signature(db: &dyn HirDatabase, f: FunctionId) -> Fact {
+pub fn signature(db: &Db, f: FunctionId) -> Fact {
     Fact::Signature(key::item_key(db, ItemId::Function(f)))
 }
 
-pub fn layout(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+pub fn layout(db: &Db, ty: AdtId) -> Fact {
     Fact::Layout(key::item_key(db, ItemId::Adt(ty)))
 }
 
-pub fn field(db: &dyn HirDatabase, variant: VariantId, field: hir_def::LocalFieldId) -> Fact {
+pub fn field(db: &Db, variant: VariantId, field: hir_def::LocalFieldId) -> Fact {
     let ty = match variant {
         VariantId::StructId(it) => key::item_key(db, ItemId::Adt(it.into())),
         VariantId::UnionId(it) => key::item_key(db, ItemId::Adt(it.into())),
@@ -253,80 +254,80 @@ pub fn field(db: &dyn HirDatabase, variant: VariantId, field: hir_def::LocalFiel
     Fact::Field { ty, field: u32::from(field.into_raw()) }
 }
 
-pub fn method(db: &dyn HirDatabase, self_ty: &HirSimplifiedType<'_>, name: &Name) -> Fact {
+pub fn method(db: &Db, self_ty: &HirSimplifiedType<'_>, name: &Name) -> Fact {
     Fact::Method { self_ty: key::simplified(db, self_ty), name: key::name_hash(name.as_str()) }
 }
 
-pub fn implements(db: &dyn HirDatabase, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
+pub fn implements(db: &Db, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
     Fact::Implements {
         trait_: key::item_key(db, ItemId::Trait(trait_)),
         self_ty: key::simplified(db, self_ty),
     }
 }
 
-pub fn resolves(db: &dyn HirDatabase, scope: ModuleId, name: &Name) -> Fact {
+pub fn resolves(db: &Db, scope: ModuleId, name: &Name) -> Fact {
     Fact::Resolves { scope: key::module_key(db, scope), name: key::name_hash(name.as_str()) }
 }
 
-pub fn code(db: &dyn HirDatabase, id: ItemId) -> Fact {
+pub fn code(db: &Db, id: ItemId) -> Fact {
     Fact::Code(key::item_key(db, id))
 }
 
-pub fn const_value(db: &dyn HirDatabase, konst: ConstId) -> Fact {
+pub fn const_value(db: &Db, konst: ConstId) -> Fact {
     Fact::ConstValue(key::item_key(db, ItemId::Const(konst)))
 }
 
-pub fn name(db: &dyn HirDatabase, id: ItemId) -> Fact {
+pub fn name(db: &Db, id: ItemId) -> Fact {
     Fact::Name(key::item_key(db, id))
 }
 
-pub fn captures(db: &dyn HirDatabase, closure: InternedClosureId<'_>) -> Fact {
+pub fn captures(db: &Db, closure: InternedClosureId<'_>) -> Fact {
     Fact::Captures(key::closure_key(db, closure))
 }
 
-pub fn auto_traits(db: &dyn HirDatabase, owner: ItemId, index: u32) -> Fact {
+pub fn auto_traits(db: &Db, owner: ItemId, index: u32) -> Fact {
     Fact::AutoTraits(key::opaque_key(db, owner, index))
 }
 
-pub fn coherence(db: &dyn HirDatabase, imp: ImplId) -> Fact {
+pub fn coherence(db: &Db, imp: ImplId) -> Fact {
     Fact::Coherence(key::item_key(db, ItemId::Impl(imp)))
 }
 
-pub fn specializes(db: &dyn HirDatabase, imp: ImplId) -> Fact {
+pub fn specializes(db: &Db, imp: ImplId) -> Fact {
     Fact::Specializes(key::item_key(db, ItemId::Impl(imp)))
 }
 
-pub fn drop_check(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+pub fn drop_check(db: &Db, ty: AdtId) -> Fact {
     Fact::DropCheck(key::item_key(db, ItemId::Adt(ty)))
 }
 
-pub fn vtable(db: &dyn HirDatabase, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
+pub fn vtable(db: &Db, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact {
     Fact::Vtable {
         trait_: key::item_key(db, ItemId::Trait(trait_)),
         self_ty: key::simplified(db, self_ty),
     }
 }
 
-pub fn derive(db: &dyn HirDatabase, ty: AdtId) -> Fact {
+pub fn derive(db: &Db, ty: AdtId) -> Fact {
     Fact::Derive(key::item_key(db, ItemId::Adt(ty)))
 }
 
 /// The item `subject` names, `None` if none does.
-fn item(db: &dyn HirDatabase, subject: ItemKey, fact: &Fact) -> Option<ItemId> {
+fn item(db: &Db, subject: ItemKey, fact: &Fact) -> Option<ItemId> {
     match key::resolve(db, subject)? {
         Resolved::Item(id) => Some(id),
         other => unreachable!("{fact:?} names {other:?}, which is no item"),
     }
 }
 
-fn adt(db: &dyn HirDatabase, key: ItemKey, fact: &Fact) -> Option<AdtId> {
+fn adt(db: &Db, key: ItemKey, fact: &Fact) -> Option<AdtId> {
     match item(db, key, fact)? {
         ItemId::Adt(it) => Some(it),
         other => unreachable!("{fact:?} names {other:?}, which is no type"),
     }
 }
 
-fn impl_of(db: &dyn HirDatabase, key: ItemKey, fact: &Fact) -> Option<ImplId> {
+fn impl_of(db: &Db, key: ItemKey, fact: &Fact) -> Option<ImplId> {
     match item(db, key, fact)? {
         ItemId::Impl(it) => Some(it),
         other => unreachable!("{fact:?} names {other:?}, which is no impl"),
@@ -350,7 +351,7 @@ fn write_symbol(h: &mut Hasher, symbol: Option<intern::Symbol>) {
 /// The offset of a field of a type without generics, from its layout. A generic type has a
 /// layout per instance: its layout hash stands for all of them.
 fn field_offset(
-    db: &dyn HirDatabase,
+    db: &Db,
     h: &mut Hasher,
     adt: AdtId,
     variant: VariantId,
@@ -392,7 +393,7 @@ fn field_offset(
 
 /// The interface hashes of the items of `items` named `name`, sorted.
 fn named(
-    db: &dyn HirDatabase,
+    db: &Db,
     items: &[(Name, AssocItemId)],
     name: NameHash,
 ) -> Result<Vec<ContentId>, Unhashable> {
@@ -410,7 +411,7 @@ fn named(
 /// The inherent impls for the type with an item of the name, and the traits with an item of
 /// the name with whether the type implements them: every candidate method probing may find.
 fn write_method(
-    db: &dyn HirDatabase,
+    db: &Db,
     h: &mut Hasher,
     self_ty: SimplifiedType,
     name: NameHash,
@@ -450,7 +451,7 @@ fn write_method(
 /// A const's value: evaluated for one without generics, else its code (each instance is
 /// evaluated where it is used, from that code).
 fn write_const_value(
-    db: &dyn HirDatabase,
+    db: &Db,
     h: &mut Hasher,
     konst: ConstId,
 ) -> Result<(), Unhashable> {
@@ -518,7 +519,7 @@ fn write_const_value(
 }
 
 fn ty_hash<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: ItemId,
     ty: Ty<'db>,
 ) -> Result<ContentId, Unhashable> {
@@ -536,7 +537,7 @@ fn eval_error_kind(err: &ConstEvalError<'_>) -> String {
     format!("{stage} {kind}")
 }
 
-fn name_of(db: &dyn HirDatabase, h: &mut Hasher, id: ItemId) {
+fn name_of(db: &Db, h: &mut Hasher, id: ItemId) {
     key::path_part(db, id, &mut |bytes| {
         h.update(bytes);
     });
@@ -558,7 +559,7 @@ fn name_of(db: &dyn HirDatabase, h: &mut Hasher, id: ItemId) {
 /// What inferred the closure at `expr` of `store`: the innermost anonymous const it is in, else
 /// the body.
 fn closure_owner<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     store: ExpressionStoreOwnerId,
     expr: ExprId,
 ) -> InferBodyId<'db> {
@@ -597,7 +598,7 @@ fn subtree_containing(store: &ExpressionStore, root: ExprId, target: ExprId) -> 
     found.then_some(size)
 }
 
-fn infer_owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> ItemId {
+fn infer_owner_item(db: &Db, owner: InferBodyId<'_>) -> ItemId {
     match owner {
         InferBodyId::DefWithBodyId(body) => ItemId::of_body(db, body),
         InferBodyId::AnonConstId(anon) => key::generic_def_item(anon.loc(db).owner.generic_def(db)),
@@ -607,7 +608,7 @@ fn infer_owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> ItemId {
 /// The orphan and coherence checks' results for `imp`, and every impl it could overlap: those
 /// of its trait for its simplified self type and the blanket ones, all of the trait's for a
 /// blanket impl, or the inherent impls for its self type.
-fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashable> {
+fn write_coherence(db: &Db, h: &mut Hasher, imp: ImplId) -> Result<(), Unhashable> {
     let self_ty = impl_self_ty(db, imp);
     match db.impl_trait(imp) {
         Some(trait_ref) => {
@@ -636,7 +637,7 @@ fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<
 }
 
 /// The type, its `Drop` impl if it has one, and that impl's `#[may_dangle]` parameters.
-fn write_drop_check(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
+fn write_drop_check(db: &Db, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
     h.id(&hash::interface_hash(db, ItemId::Adt(adt))?.0);
     let Some(imp) = hir_ty::drop::destructor(db, adt) else {
         h.part(b"no drop");
@@ -660,7 +661,7 @@ fn write_drop_check(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<
 /// Every impl a derive on `adt` wrote, sorted by trait key: the built-in derives' and those in
 /// the expansions of derive macros, at the top of the expansion or in the blocks of its
 /// unnamed consts (`const _: () = { impl .. };`).
-fn write_derive(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
+fn write_derive(db: &Db, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
     let at: AstId<ast::Adt> = match adt {
         AdtId::StructId(it) => it.lookup(db).id.map(|it| it.upcast()),
         AdtId::EnumId(it) => it.lookup(db).id.map(|it| it.upcast()),
@@ -704,7 +705,7 @@ fn write_derive(db: &dyn HirDatabase, h: &mut Hasher, adt: AdtId) -> Result<(), 
 }
 
 fn expansion_impls(
-    db: &dyn HirDatabase,
+    db: &Db,
     scope: &ItemScope,
     call: MacroCallId,
     wrote: &mut Vec<(Option<ItemKey>, InterfaceHash)>,
@@ -737,7 +738,7 @@ fn expansion_impls(
 }
 
 /// Whether `file` is the expansion of `call` or of a macro call inside it.
-fn written_by(db: &dyn HirDatabase, mut file: HirFileId, call: MacroCallId) -> bool {
+fn written_by(db: &Db, mut file: HirFileId, call: MacroCallId) -> bool {
     while let HirFileId::MacroFile(inner) = file {
         if inner == call {
             return true;

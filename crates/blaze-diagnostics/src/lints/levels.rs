@@ -469,9 +469,10 @@ mod tests {
         let cmd = CommandLine::parse(&args).unwrap();
         let db = &checked.db;
         hir::attach_db(db, || {
-            let sema = Semantics::new_dyn(db);
+            let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
-            let cx = Cx::new(&sema, krate, &checked.names);
+            let frame = crate::tests::frame();
+            let cx = Cx::new(&sema, krate, &checked.names, &frame);
             let walk = Walk::of(&cx);
             let mut out = Vec::new();
             for tree in &walk.trees {

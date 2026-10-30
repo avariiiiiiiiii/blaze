@@ -32,7 +32,18 @@ pub use check::check;
 pub use de::from_slice;
 pub use ser::{Writer, append, to_vec};
 
-use std::fmt;
+use std::{cmp::Ordering, fmt};
+
+/// The bytewise order of two encoded map keys, decided by their first bytes when those differ:
+/// a text key's first byte holds its length below 24, so keys of two lengths are ordered with
+/// no call to compare the rest.
+#[inline]
+fn key_order(a: &[u8], b: &[u8]) -> Ordering {
+    match (a.first(), b.first()) {
+        (Some(x), Some(y)) if x != y => x.cmp(y),
+        _ => a.cmp(b),
+    }
+}
 
 /// Why a value has no encoding here, or bytes are no value.
 #[derive(Debug, Clone, PartialEq, Eq)]

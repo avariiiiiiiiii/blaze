@@ -36,7 +36,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     ApiError, Arrived, Envelope, LONGEST_REQUEST, Reply, Request, RequestRef, Response,
     frames::{self, Frames, Refused},
-    http::{self, HttpRequest, RequestParser},
+    http::{self, HttpRequestRef, RequestParser},
     json,
 };
 
@@ -448,7 +448,8 @@ impl Server {
         self.flush(conn, effects);
     }
 
-    /// The whole requests an HTTP connection has sent, while none is being answered.
+    /// The whole requests an HTTP connection has sent, while none is being answered. Each is
+    /// read where it lies in the connection's parser, taken out of the connection meanwhile.
     fn http_requests(&mut self, conn: Conn, effects: &mut Vec<Effect>) {
         loop {
             let Some(Connection {
@@ -459,21 +460,32 @@ impl Server {
             else {
                 return;
             };
-            let request = match parser.next() {
-                Ok(Some(request)) => request,
-                Ok(None) => return,
+            let mut parser = std::mem::replace(parser, RequestParser::new(0));
+            let more = match parser.next_ref() {
+                Ok(Some(request)) => {
+                    self.http_request(conn, request, effects);
+                    true
+                }
+                Ok(None) => false,
                 Err(error) => {
                     let bytes = plain(error.status, &[("Connection", "close")], &error.what);
                     self.queue(conn, &bytes, effects);
                     self.close(conn);
-                    return;
+                    false
                 }
             };
-            self.http_request(conn, request, effects);
+            if let Some(Connection { reader: Reader::Http { parser: kept, .. }, .. }) =
+                self.conns.get_mut(&conn)
+            {
+                *kept = parser;
+            }
+            if !more {
+                return;
+            }
         }
     }
 
-    fn http_request(&mut self, conn: Conn, request: HttpRequest, effects: &mut Vec<Effect>) {
+    fn http_request(&mut self, conn: Conn, request: HttpRequestRef<'_>, effects: &mut Vec<Effect>) {
         let close = request.header("Connection").is_some_and(|it| {
             it.split(',').any(|option| option.trim().eq_ignore_ascii_case("close"))
         });
@@ -507,7 +519,7 @@ impl Server {
             return;
         };
         http::chunked_into(queue, 200, &[("Content-Type", kind)]);
-        match frames::decode::<Request>(&request.body) {
+        match frames::decode::<Request>(request.body) {
             Ok(envelope) => {
                 *answering = Some(Answering { id: envelope.id, json, close });
                 self.told.push(Arrived::Request {
@@ -625,7 +637,7 @@ fn plain(status: u16, extra: &[(&str, &str)], what: &str) -> Vec<u8> {
     http::response(status, &headers, what.as_bytes())
 }
 
-fn authorized(request: &HttpRequest, token: &str) -> bool {
+fn authorized(request: &HttpRequestRef<'_>, token: &str) -> bool {
     let Some(value) = request.header("Authorization") else { return false };
     let Some((scheme, credentials)) = value.split_once(' ') else { return false };
     scheme.eq_ignore_ascii_case("bearer") && same(credentials.trim().as_bytes(), token.as_bytes())

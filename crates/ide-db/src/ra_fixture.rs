@@ -12,45 +12,45 @@ use syntax::{
 };
 
 use crate::{
-    MiniCore, RootDatabase, SymbolKind, active_parameter::ActiveParameter,
+    MiniCore, RootDatabase, RootDatabaseExt, SymbolKind, active_parameter::ActiveParameter,
     documentation::Documentation, range_mapper::RangeMapper, search::ReferenceCategory,
 };
 
 pub use span::FileId;
 
-impl RootDatabase {
-    fn from_ra_fixture(
-        text: &str,
-        minicore: MiniCore<'_>,
-    ) -> Result<(RootDatabase, Vec<(FileId, usize)>, Vec<FileId>), ()> {
-        // We don't want a mistake in the fixture to crash r-a, so we wrap this in `catch_unwind()`.
-        std::panic::catch_unwind(|| {
-            let mut db = RootDatabase::default();
-            let fixture =
-                test_fixture::ChangeFixture::parse_with_proc_macros(text, minicore.0, Vec::new());
-            db.apply_change(fixture.change);
-            let files = fixture
-                .files
-                .into_iter()
-                .zip(fixture.file_lines)
-                .map(|(file_id, range)| (file_id.file_id(), range))
-                .collect();
-            (db, files, fixture.sysroot_files)
-        })
-        .map_err(|error| {
-            tracing::error!(
-                "cannot crate the crate graph: {}\nCrate graph:\n{}\n",
-                if let Some(&s) = error.downcast_ref::<&'static str>() {
-                    s
-                } else if let Some(s) = error.downcast_ref::<String>() {
-                    s.as_str()
-                } else {
-                    "Box<dyn Any>"
-                },
-                text,
-            );
-        })
-    }
+/// A database made from a fixture, as a test's is: one in which a fixture's change finds the
+/// roots and crate graph it sets.
+fn db_from_ra_fixture(
+    text: &str,
+    minicore: MiniCore<'_>,
+) -> Result<(RootDatabase, Vec<(FileId, usize)>, Vec<FileId>), ()> {
+    // We don't want a mistake in the fixture to crash r-a, so we wrap this in `catch_unwind()`.
+    std::panic::catch_unwind(|| {
+        let mut db = RootDatabase::for_tests();
+        let fixture =
+            test_fixture::ChangeFixture::parse_with_proc_macros(text, minicore.0, Vec::new());
+        db.apply_change(fixture.change);
+        let files = fixture
+            .files
+            .into_iter()
+            .zip(fixture.file_lines)
+            .map(|(file_id, range)| (file_id.file_id(), range))
+            .collect();
+        (db, files, fixture.sysroot_files)
+    })
+    .map_err(|error| {
+        tracing::error!(
+            "cannot crate the crate graph: {}\nCrate graph:\n{}\n",
+            if let Some(&s) = error.downcast_ref::<&'static str>() {
+                s
+            } else if let Some(s) = error.downcast_ref::<String>() {
+                s.as_str()
+            } else {
+                "Box<dyn Any>"
+            },
+            text,
+        );
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -191,7 +191,7 @@ impl RaFixtureAnalysis {
         let combined = mapper.take_text();
         let combined_len = TextSize::of(&combined);
         let (analysis, tmp_file_ids, sysroot_files) =
-            RootDatabase::from_ra_fixture(&combined, minicore).ok()?;
+            db_from_ra_fixture(&combined, minicore).ok()?;
 
         // We use a `Vec` because we know the `FileId`s will always be close.
         let mut virtual_file_id_to_line = Vec::new();

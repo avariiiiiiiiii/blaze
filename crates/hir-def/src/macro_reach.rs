@@ -11,7 +11,7 @@
 //! the caller's: [`macro_reach_module`] says whether a macro takes part, and
 //! [`MacroReachable::update_from_macro`] is one pass's visit of it.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::MacroDefKind;
 use rustc_hash::FxHashSet;
 use span::Transparency;
@@ -29,7 +29,7 @@ mod tests;
 /// that isn't opaque (a `macro_rules!` unless `#[rustc_macro_transparency = "opaque"]`, a
 /// `macro` with another transparency), a procedural macro, and one whose parent is no module (a
 /// block's).
-pub fn macro_reach_module(db: &dyn SourceDatabase, id: MacroId) -> Option<ModuleId> {
+pub fn macro_reach_module(db: &Db, id: MacroId) -> Option<ModuleId> {
     let def = id.definition(db);
     let transparency = match def.kind {
         MacroDefKind::Declarative(ast_id, _) => ast_id.decl_macro_expander(db, def.krate).transparency,
@@ -82,7 +82,7 @@ impl MacroReachable {
     /// yet walked for it in each later pass, up to the crate root.
     pub fn update_from_macro(
         &mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         defining: ModuleId,
         mut each: impl FnMut(Reached),
     ) {
@@ -104,7 +104,7 @@ impl MacroReachable {
     /// `module` was new.
     pub fn update_macro_reachable(
         &mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         module: ModuleId,
         defining: ModuleId,
         each: &mut impl FnMut(Reached),
@@ -160,7 +160,7 @@ impl MacroReachable {
 
 /// The fields of a struct or union accessible from `defining`, whose types rustc reaches.
 fn fields(
-    db: &dyn SourceDatabase,
+    db: &Db,
     variant: VariantId,
     defining: ModuleId,
     each: &mut impl FnMut(Reached),

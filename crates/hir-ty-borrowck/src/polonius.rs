@@ -4,6 +4,7 @@
 //! live, forwards for a covariant one, backwards for a contravariant one and both ways for an
 //! invariant one. A loan is in scope until the first point it is not live at.
 
+use hir_ty::db::HirDatabase;
 use blaze_ids::radix;
 use rustc_type_ir::{Variance, inherent::IntoKind};
 
@@ -69,12 +70,10 @@ pub(super) fn live_loans<'db>(
             universal.insert(rv);
         }
     }
-    let direction: Vec<Direction> = (0..count)
-        .map(|rv| match universal.contains(rv) {
-            true => Direction::Forward,
-            false => directions.get(rv).copied().flatten().unwrap_or(Direction::Both),
-        })
-        .collect();
+    let direction = |rv: Rv| match universal.contains(rv) {
+        true => Direction::Forward,
+        false => directions.get(rv).copied().flatten().unwrap_or(Direction::Both),
+    };
     let all = {
         let mut all = IntervalSet::default();
         if cfg.points > 0 {
@@ -147,7 +146,7 @@ pub(super) fn live_loans<'db>(
             let block = cfg.location(start).block;
             let (first, last) = (cfg.point(Location { block, statement: 0 }), last_of(block));
             let region_live = live_at(region);
-            let direction = direction[region];
+            let direction = direction(region);
             for (start, end) in visited[region].insert_new(start, end) {
                 for &sub in logical.of(region) {
                     stack.push((sub as Rv, start, end));

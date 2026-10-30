@@ -7,7 +7,7 @@
 //! Only the items of a crate's modules are in its batch. An item declared in a block is in a
 //! body, and a signature query reads no body, so such items keep a query of their own.
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::radix;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 use rustc_type_ir::inherent::Ty as _;
@@ -38,7 +38,7 @@ use crate::{
 /// allocations per item. A workspace crate is edited, so its items keep a query each. An edited
 /// path dependency is a library too: it recomputes its batch, a crate's worth of signatures, on
 /// each edit of one of them.
-pub(crate) fn batched_crate(db: &dyn HirDatabase, module: ModuleId) -> Option<Crate> {
+pub(crate) fn batched_crate(db: &Db, module: ModuleId) -> Option<Crate> {
     if module.block(db).is_some() {
         return None;
     }
@@ -178,7 +178,7 @@ pub type CrateImplTraits<'db> = Batch<'db, ImplId, Option<StoredEarlyBinder<Stor
 pub type CrateImplPredicates<'db> = Batch<'db, ImplId, GenericPredicates>;
 
 impl<'db> CrateImplSelfTys<'db> {
-    pub fn of(db: &'db dyn HirDatabase, krate: Crate) -> &'db Self {
+    pub fn of(db: &'db Db, krate: Crate) -> &'db Self {
         crate_impl_self_tys(db, krate)
     }
 
@@ -189,7 +189,7 @@ impl<'db> CrateImplSelfTys<'db> {
 }
 
 impl<'db> CrateImplTraits<'db> {
-    pub fn of(db: &'db dyn HirDatabase, krate: Crate) -> &'db Self {
+    pub fn of(db: &'db Db, krate: Crate) -> &'db Self {
         crate_impl_traits(db, krate)
     }
 
@@ -206,7 +206,7 @@ impl<'db> CrateImplTraits<'db> {
 }
 
 impl<'db> CrateImplPredicates<'db> {
-    pub fn of(db: &'db dyn HirDatabase, krate: Crate) -> &'db Self {
+    pub fn of(db: &'db Db, krate: Crate) -> &'db Self {
         crate_impl_predicates(db, krate)
     }
 
@@ -229,7 +229,7 @@ pub struct CrateFieldTypes<'db> {
 }
 
 impl<'db> CrateFieldTypes<'db> {
-    pub fn of(db: &'db dyn HirDatabase, krate: Crate) -> &'db Self {
+    pub fn of(db: &'db Db, krate: Crate) -> &'db Self {
         crate_field_types(db, krate)
     }
 
@@ -274,7 +274,7 @@ impl<'db> CrateFieldTypes<'db> {
 }
 
 /// The variants of a crate's modules, ascending.
-fn module_variants(db: &dyn HirDatabase, krate: Crate) -> Vec<VariantId> {
+fn module_variants(db: &Db, krate: Crate) -> Vec<VariantId> {
     let mut variants = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
@@ -301,7 +301,7 @@ fn module_variants(db: &dyn HirDatabase, krate: Crate) -> Vec<VariantId> {
 }
 
 /// The impls of a crate's modules, ascending.
-fn module_impls(db: &dyn HirDatabase, krate: Crate) -> Vec<ImplId> {
+fn module_impls(db: &Db, krate: Crate) -> Vec<ImplId> {
     let mut impls = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         impls.extend(module.scope(db).impls());
@@ -315,17 +315,17 @@ fn module_impls(db: &dyn HirDatabase, krate: Crate) -> Vec<ImplId> {
 }
 
 #[salsa::tracked(returns(ref))]
-fn crate_field_types<'db>(db: &'db dyn HirDatabase, krate: Crate) -> CrateFieldTypes<'db> {
+fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
     CrateFieldTypes::build(module_variants(db, krate), |variant| lower_field_types(db, variant))
 }
 
 #[salsa::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle)]
-fn crate_impl_self_tys<'db>(db: &'db dyn HirDatabase, krate: Crate) -> CrateImplSelfTys<'db> {
+fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
     Batch::build(module_impls(db, krate), |impl_id| lower_impl_self_ty(db, impl_id))
 }
 
 fn crate_impl_self_tys_cycle<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplSelfTys<'db> {
@@ -337,7 +337,7 @@ fn crate_impl_self_tys_cycle<'db>(
 
 /// Reads the crate's self types: a trait's arguments may name `Self`.
 #[salsa::tracked(returns(ref), cycle_result = crate_impl_traits_cycle)]
-fn crate_impl_traits<'db>(db: &'db dyn HirDatabase, krate: Crate) -> CrateImplTraits<'db> {
+fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     let keys = self_tys.keys.to_vec();
     Batch::build(keys, |impl_id| {
@@ -353,7 +353,7 @@ fn crate_impl_traits<'db>(db: &'db dyn HirDatabase, krate: Crate) -> CrateImplTr
 }
 
 fn crate_impl_traits_cycle<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplTraits<'db> {
@@ -362,13 +362,13 @@ fn crate_impl_traits_cycle<'db>(
 
 /// Reads the crate's self types and traits: a where clause may name `Self` and `Self::Assoc`.
 #[salsa::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle)]
-fn crate_impl_predicates<'db>(db: &'db dyn HirDatabase, krate: Crate) -> CrateImplPredicates<'db> {
+fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
     let keys = CrateImplSelfTys::of(db, krate).keys.to_vec();
     Batch::build(keys, |impl_id| generic_predicates(db, impl_id.into()))
 }
 
 fn crate_impl_predicates_cycle<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     krate: Crate,
 ) -> CrateImplPredicates<'db> {
@@ -390,7 +390,7 @@ mod tests {
         TyLoweringDiagnostic::PathDiagnostic {
             source: TypeRefId::from_raw(RawIdx::from_u32(segment)),
             diag: PathLoweringDiagnostic::GenericArgsProhibited {
-                segment,
+                segments: Box::new([segment]),
                 reason: GenericArgsProhibitedReason::Module,
             },
         }

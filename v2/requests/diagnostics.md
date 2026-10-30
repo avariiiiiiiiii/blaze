@@ -52,6 +52,8 @@ cargo shows them and an agent reads them. Giving them as `Note` would print them
 > applied: `Level::FailureNote` in `crates/blaze-api/src/lib.rs` (ci is DONE), with ci's matches changed with it: `blaze-api/src/session/best_of.rs` and `blaze-ci/src/service.rs` count it as neither error nor warning, `service.rs` names it `failure-note`, and `blaze-ui/src/api.rs` prints its message with no level before it.
 > forwarded to cargo: `crates/blaze-cargo/src/cli/json.rs:224` `level` matches `Level` exhaustively and needs `Level::FailureNote => "failure-note"`.
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/cli/json.rs:256 (`failure-note`).
+
 ## 3. `crates/blaze-engine` (codegen): builds refuse every error rustc gives (#1522, #1440, #780)
 
 What: `lib.rs` `refusal`, `broken_in` (6487), `errors_of` (6593) and the allowlists `SURE`,
@@ -96,6 +98,7 @@ blaze-diagnostics refuses it with ``blaze cannot borrow-check `<path>`: <reason>
 borrowck checks it.
 
 > forwarded to db
+> applied by db-ty-d-hir: `hir/src/diagnostics.rs` `collect_borrowck` pushes `BorrowckSkipped` for every `result.skipped` with no environment variable, at the owner's item when the body's root has no syntax; the doc says so. Test `a_body_borrowck_skipped_is_always_reported` (`hir/src/tests/api.rs`, the `twice!(twice!(n += 1;))` MIR lowering refuses, #154).
 
 ## diagnostics-bodies: the front end's values of `hir::Type`, `hir::TraitRef`, `hir::TraitPredicate` (db)
 
@@ -140,6 +143,7 @@ printing, not rustc's, and `hir::Type` has no public way to the structure (`TyKi
 The E0308/E0277 lowering needs the same of trait refs and predicates.
 
 > forwarded to db: `crates/hir/` is lane db's.
+> applied by db-ty-d-hir: `Type::to_next_solver`/`derived_from_next_solver`, `TraitRef::to_next_solver`/`derived_from_next_solver` (bound with `EarlyBinder::bind_no_rigid_aliases`: `bind` takes an interner in this tree) and `TraitClause::to_next_solver` (`hir/src/lib.rs`). `hir::TraitPredicate` and `hir::PredicatePolarity` are now `hir::TraitClause` and `ClausePolarity` (the solver's rename): blaze-diagnostics' uses of the old names move to them. Test `a_variant_s_fields_have_the_type_s_arguments` round-trips a `Type`.
 
 ## diagnostics-bodies: `rustc_type_ir` for blaze-diagnostics (the parent, `diagnostics`)
 
@@ -173,6 +177,7 @@ item's own late-bound lifetimes and of `ReLateParam`). A type written `for<'x> f
 prints as `for<'a> fn(&'a u8)` until then.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-ty-d-lower: a `for<'a>` binds `BoundRegionKind::NamedForPrinting(name)` with the name written (no `next_solver` change: the variant was there, persisted and hashed without the name). The printer's arm is requested in `v2/requests/db-ty.md` `## db-ty-d-lower` item 3.
 
 ## diagnostics-lints-bodies: what type checking finds unreachable (db, `crates/hir-ty`)
 
@@ -228,6 +233,7 @@ inference as it goes (a type that is `!` when checked), which only hir-ty knows.
 `crates/blaze-diagnostics/src/lints/bodies/reachable.rs` lowers it as written above.
 
 > forwarded to db: `crates/hir-ty/src/infer.rs` is db's (db-ty).
+> applied by db-ty-d-infer1: `Unreachable`, `UnreachableAt` (also `Hash`) and `InferenceResult::unreachable()` as written, exported at hir-ty's root and persisted (`C32::Unreachables`, six words an entry; `InferenceRecord` version 4). hir-ty's `Diverges` is now rustc's (`Maybe`, `Always { span, custom_note }`, `WarnedAlways`, its `&` and `|`; at 16d1ffac those are explicit, not an `Ord`), recorded at rustc's sites: before each expression, after one whose children diverged (not `Block`, `If`, `Let`, `Loop`, `Match`, `Cast`, a destructuring assignment, `.await` or a `try` block's `from_output`), each statement, each argument of the first pass, the arms of a `match` whose scrutinee diverged, an `if`'s block, a `let`'s initializer; the all-arms note on a `match` that is not a desugaring (`?`, `for`); none in an `#[automatically_derived]` impl. Not ported: the never-pattern note and `function_diverges_because_of_empty_arguments` (hir-def has no never patterns), and the async-body exception (hir-def has no `DropTemps` around the body to warn on). Tests: `crates/hir/src/tests/infer.rs`, `type_checking_finds_where_a_body_stops_being_reachable`.
 
 ## diagnostics-lints-bodies: what match checking lints (db, `crates/hir-ty` or a crate of its own, `crates/hir`)
 
@@ -603,6 +609,7 @@ unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-1829
    `crates/blaze-diagnostics/src/lower/macro_def_error.rs` to give rustc's text.
 
 > forwarded to db: lane db is still running: 1 to 3 (`crates/hir-expand/`). > forwarded to format: 4 (`crates/mbe/src/parser.rs`).
+> applied by db-expand: 2: only a declarative macro's expansion has its trailing `;` dropped silently; a builtin's or proc macro's gives rustc's "macro expansion ignores `;` and any tokens following" with its note (`ignored_semicolon` in `crates/hir-expand/src/lib.rs`). 1: `parse_macro_expansion` now returns the dropped `;`'s span, but a tracked query would expand the call again (`macro_expand` isn't memoized), so the query waits on a `dropped_semicolon` field in `span::SpanMap` (format). 3: `ExpandTo::of_call_site` gives an error for an unknown parent; the tail-expression rule waits on format's `collect_macro_as_stmt` (`crates/hir-def/src/expr_store/lower.rs`) taking an expression expansion, and on `item_tree/lower.rs` and `expr_store/expander.rs` calling `of_call_site` (requests in `v2/requests/db-expand.md`).
 > forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 1).
 
 ## diagnostics-lints-bodies: what follows a call of an uninhabited type (codegen, `crates/hir-ty-mir`; db for the field in `crates/hir-ty/src/mir.rs`)
@@ -698,6 +705,7 @@ can only guess at from the syntax today:
    `#[track_caller]`), to be tried with std's macro in a VM.
 
 > forwarded to db: lane db is still running (`crates/hir-ty`, `crates/hir`).
+> applied by db-ty-d-infer2: 2, 3, 5 and 6. 2: `TypeMismatch.at_error` (`Option<(String, String)>`, the types with an undecided literal's type as `{integer}`/`{float}` once hir-ide prints them so). 3: ambiguity errors reported as rustc's `report_ambiguity_errors` (`TypeMustBeKnown.kind` E0282/E0283/E0284 and `ambiguity`: the goal, rustc's listed candidates and the merged goals), and every other fulfillment error code as the new `AnyDiagnostic::TraitSolverError`. 5: `hir::Closure::kind_origin`. 6: `ClosureKindMismatch.closure`. What the lowerings need is `v2/requests/db-ty.md`, `## db-ty-d-infer2`, items 1 to 3. 4 needs the solver's type variable origins (`v2/requests/solver-sync-inbox.md`, "From db-ty-d-infer2"); 1's cause codes likewise.
 
 ## diagnostics-lints-mir-unsafe: what rustc's unsafety checking finds that `hir::MissingUnsafe` does not give (db, `crates/hir-ide/src/diagnostics/unsafe_check.rs`, `crates/hir/src/diagnostics.rs`, `crates/hir-def/src/signatures.rs`)
 
@@ -744,6 +752,7 @@ can only guess at from the syntax today:
    rejects can pass.
 
 > forwarded to db: 6 (`hir-def/src/signatures.rs`), 7 (`hir-ty/src/target_feature.rs`) and the `hir::MissingUnsafe` fields. > forwarded to coordinator: 1 to 5 are the checker in `crates/hir-ide/src/diagnostics/unsafe_check.rs`, which `crates.md` removes at integration; porting rustc's `check_unsafety` into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate it moves to first, then the port goes there.
+> applied by db-ty-d-lower: 7 was in the tree (fix-names-features' `TargetArch` and per-arch implications in `target_feature.rs`); added `implications_are_rustcs_of_each_arch` in `target_feature/tests.rs` (an `aes` caller covers a `neon` callee on AArch64, not on x86).
 
 ## diagnostics-lints-syntax-attrs-features: one feature table for the feature lints and `checks/features.rs` (the parents, `lints.rs`, `lints/syntax.rs`, `lints/syntax/attrs.rs`; `diagnostics-items`)
 
@@ -1016,6 +1025,7 @@ the callee's local binding (`let f = || ..; f(1)`), so a closure without paramet
 otherwise gets no note.
 
 > forwarded to db: lane db is still running (`crates/hir/`).
+> applied by db-ty-d-hir: `impl HasSource for hir::Closure` (`hir/src/has_source.rs`), `Ast = ast::ClosureExpr`, through the owner's expression store source map; `None` when the expression has no closure syntax. Test `a_closure_s_source_is_its_expression`.
 
 ## diagnostics-bodies-calls: the unmet predicates of an operator
 
@@ -1031,6 +1041,7 @@ suggestion on the element type, "consider further restricting type parameter `T`
 predicates; `lower/binary_operator_cannot_be_applied.rs` knows only the operator's own trait.
 
 > forwarded to db: lane db is still running (`crates/hir-ty`, `crates/hir`).
+> applied by db-ty-d-infer1: `InferenceDiagnostic::BinaryOperatorCannotBeApplied` gains `unmet: Vec<StoredGoal>` (each fulfillment error's leaf goal, through `into_fulfillment_error`, as rustc's `evaluate_obligations_error_on_ambiguity` gives them) and `output: Option<StoredTy>` (`expected.only_has_type` at the lookup, rustc's `ObligationCauseCode::BinOp { output_ty }`); `UnaryOperatorCannotBeApplied` gains `unmet`. Persisted. hir: `unmet: Vec<SolverGoal>`, `output: Option<Type>`. Whether the trait itself failed: `unmet` is empty when the trait is missing or the goal holds (rustc's "the trait `..` is not implemented for" case), and the operator's own goal is a leaf when nothing nested failed. Test `an_operator_error_carries_its_unmet_goals`. The lowering's use is requested in `v2/requests/db-ty-d-infer1.md`.
 
 ## diagnostics-bodies-calls: casts with unknown pointer kinds are E0641, not accepted
 
@@ -1056,6 +1067,7 @@ Why: E0070 and E0067 differ by it; `lower/invalid_lhs_of_assignment.rs` finds th
 `BinExpr` from the syntax, which breaks for a left-hand side inside a macro expansion.
 
 > forwarded to db: lane db is still running (`infer/expr.rs`, `hir/src/diagnostics.rs`).
+> applied by db-ty-d-infer1: `InferenceDiagnostic::InvalidLhsOfAssignment { lhs, assign, op: Option<ArithOp> }` (persisted), pushed by `check_lhs_assignable` from `a op= b` and now also from a plain `=` whose left-hand side is not a place; `hir::InvalidLhsOfAssignment` gains `assign: InFile<ExprOrPatPtr>` and `op: Option<ast::ArithOp>`. The lowering's syntax search for the `BinExpr` can go (request in `v2/requests/db-ty-d-infer1.md`).
 
 ## diagnostics-bodies-calls: `MethodCallIllegalSizedBound` carries the pick
 
@@ -1336,6 +1348,7 @@ rustc's message once a diagnostic reaches them; what's missing is the diagnostic
    and `must_use-tuple.rs` can't be checked against minicore.
 
 > forwarded to db: `hir-def` and `hir-ty` are lane db's.
+> applied by db-ty-d-infer1: items 1 and 3. `InferenceDiagnostic::UnlabeledJumpInLabeledBlock { expr, is_break }` (E0695) when an unlabeled jump's innermost labeled block, loop or closure is a user-labeled block (not a `try` block's desugared label), in place of `BreakOutsideOfLoop`, still typed as a jump to the loop; `InferenceDiagnostic::AsyncCoroutinesNotSupported { expr }` (E0727) for a `yield` in an `async` coroutine (the operand is still checked, the `yield` is the error type). hir: `hir::UnlabeledJumpInLabeledBlock`, `hir::AsyncCoroutinesNotSupported`. The lowerings' arms are requested in `v2/requests/db-ty-d-infer1.md`. Items 2, 4 and 5 were not dispatched with it and stay open.
 
 ## diagnostics-lints-bodies: `become` in hir-ty's MIR (codegen, `crates/hir-ty-mir`; db for the variant in `crates/hir-ty/src/mir.rs`)
 
@@ -1404,6 +1417,7 @@ From `crates/blaze-diagnostics/src/checks/impls/{builtin,compare}.rs` and
    minicore without it.
 
 > applied: 4, as lane items is DONE: `hir_ty::impl_unconstrained_params(db, impl) -> Vec<TypeOrConstParamId>` in `specialization.rs`, the type and const parameters E0207 names in declaration order (empty when the header has an error type); `impl_has_unconstrained_params` is now `!is_empty()` of it, so it answers as before. rustc's lifetime half (`enforce_impl_lifetime_params_are_constrained`, lifetimes in associated types' values) is not in it. > forwarded to db: 1 and 5 (`hir`, `hir-ty`). > forwarded to coordinator: 2, 3, 6 to 8, and 4's lifetime half, are ports of whole rustc checks (fulfillment errors with root obligations, `overlapping_impls`, late-bound lifetimes, E0367, `coerce_unsized_info`) in items' paths with lane items DONE: new work for a lane the coordinator names, not edits. 9 (`crates/test-utils`) is the coordinator's "every other path".
+> applied by db-ty-d-hir: 1, `hir::Type::variant_fields(db, EnumVariant) -> Vec<(Field, Type)>`; 5, `hir_ty_wfcheck::compare_impl_method_signature` (`hir-ty-wfcheck/src/compare.rs`, rustc's `compare_method_clause_entailment`: E0050/E0049-shaped differences and error types give `None`; the hybrid environment, the impl method's signature instantiated with fresh variables and both deeply normalized, `sup(trait, impl)`), as `hir::Function::impl_signature_mismatch(db) -> Option<ImplSignatureMismatch { trait_method, at, types, expected, found }>`, `at` the parameter (`self` counted) or return type and whether only mutability differs. Test `an_impl_method_s_signature_is_compared_with_the_trait_s` (rustc's `mismatched_types/E0053.rs`, a return type, a projection that normalizes equal).
 
 ## diagnostics-lints-bodies-types-casts: compiletest's `-A unused` goes to every UI test but a `run-pass` one (`tests/lints/bodies/calls.rs`; `diagnostics-lints-bodies-calls`)
 
@@ -1478,6 +1492,7 @@ short of rustc's at four places in `invalid_from_utf8.stderr` (lines 61, 63, 123
 Test waiting: `tests/lints/bodies/calls/items.rs`, `invalid_from_utf8`.
 
 > forwarded to db: `crates/hir-expand/`'s builtin macros are lane db's.
+> applied by db-expand: `concat_bytes_expand` gives the literal `call_site`, which builtin expanders get as the macro path's span, so it maps to `concat_bytes` (test `concat_bytes_literal_has_the_call_span`); a label covering the whole call needs `Cx::span` to widen a call site to rustc's `sp`, as `call_span` in `fn_macro.rs` does.
 
 ## diagnostics-lints-bodies-types-values: `rustc_abi` for blaze-diagnostics (the parent, `diagnostics`)
 
@@ -1610,6 +1625,7 @@ than rustc on a plain `lib`).
 > `hir::Crate::crate_types`, and cargo's `load-cargo/src/v2.rs:340` and codegen's
 > `blaze-engine/src/doctest.rs:1078` `BuiltCrateData` literals, which need the field (asked in
 > `v2/requests/db-expand.md`).
+> applied by db-ty-d-hir: `hir::Crate::crate_types(db) -> base_db::CrateTypes`, beside `target_kind`.
 
 ## diagnostics-lints-levels: `CheckCfg` for `CommandLine` (`lints/syntax/check_cfg.rs`, `diagnostics-lints-syntax`)
 
@@ -1646,6 +1662,7 @@ missing fact that want the query. When it lands, `lookup.rs` becomes calls to it
 
 > forwarded to db: `crates/hir-def/src/attrs.rs` is lane db's.
 > applied by db-expand: `hir_def::attrs::stability` (`crates/hir-def/src/attrs/stability.rs`). `deprecation_entry(db, StabilityDef) -> Option<DeprecationEntry { deprecation: &Deprecation, origin: StabilityDef }>` (with `same_origin`) and `stability(db, StabilityDef) -> Option<&Stability>`, where `StabilityDef` is `Def(AttrDefId) | Field(FieldId)`. The types are rustc's: `Stability { level, feature }` with `StabilityLevel::{Unstable { reason, issue, is_soft, implied_by, old_name }, Stable { since: StableSince, allowed_through_unstable_modules }}`, a superset of the shape asked for. `DeprecatedSince` and `RustcVersion` are as asked, with `RustcVersion::current(db, krate)` read from the graph's toolchain, so a toolchain bump needs no edit, and `Deprecation::is_in_effect(current)`. The parse is your `attr.rs` port plus `soft` (rustc accepts it; `name_values` refused the whole attribute), a trailing comma only (an empty item elsewhere is malformed), the last `rustc_allowed_through_unstable_modules` wins, and `#[deprecated = m!()]` is expanded. Inheritance follows rustc's parent chain, including an item in a block, whose parent is the function (or const, field, ...) the block is in, not the module. Each definition stores only where its value comes from (copied), and parses only when `AttrFlags` (new `IS_STABLE`) say it has the attribute. `-Zforce-unstable-if-unmarked`, which cargo passes to the standard library's units, gives every definition of a `CrateOrigin::Lang` crate without `staged_api` rustc's `FORCE_UNSTABLE`. Tests are in `attrs/tests.rs` `mod stability`. What waits: db-ty wraps them in `hir`; then `lints/names/stability/lookup.rs` calls them (its `macro_deprecation` stays: a macro's `SyntaxExtension` reads its own attribute only).
+> applied by db-ty-d-hir: `HasAttrs::deprecation(db) -> Option<DeprecationEntry>` and `HasAttrs::stability(db) -> Option<&Stability>` (`hir/src/attrs.rs`), so every `HasAttrs` definition has them: `ModuleDef`, `Field`, `Variant` (now `HasAttrs`), `AssocItem` and its items, `Macro`, `Module`, `Crate` (its root module); `None` for generic parameters and built-in derives. `hir` re-exports the stability types. Test `deprecation_is_its_own_or_its_module_s`.
 
 ## diagnostics-lints-names-stability: the unstable candidates a method probe passed over (db, `crates/hir-ty/src/method_resolution/probe.rs`, `crates/hir`)
 
@@ -1688,6 +1705,7 @@ of a signature (labels, suggestions), so a diagnostic per site is all it needs. 
 `tests/ui/error-codes/E0106.rs` is not among the tests.
 
 > forwarded to db: lane db's (`crates/hir-ty`, `crates/hir`).
+> applied by db-ty-d-lower: `TyLoweringDiagnostic::MissingLifetimes { sites, kind }` and `hir::MissingLifetimes`, sites `&T`, `'_` and paths without their lifetimes; `Missing` (E0106 per site: fields, free type aliases), `ElisionFailure` (one E0106 for all of a return type's: fn items, fn pointers, `Fn()`) and `NotAllowed` (E0637: bounds, where clauses, const parameter types, defaults, associated types), as rustc's `resolve_anonymous_lifetime` ribs. `hir::MissingLifetime` gained `kind`. A static's `&str` is `'static`. The arms in `lower/mod.rs` are requested in `v2/requests/db-ty.md` `## db-ty-d-lower`.
 
 ## diagnostics-items-generics: `MissingLifetime` and `ElisionFailure` kept apart (crates/hir)
 
@@ -1717,6 +1735,7 @@ which turns that case into the `late_bound_lifetime_arguments` lint or E0794). W
 ones.
 
 > forwarded to db: lane db's (`crates/hir-ty`, `crates/hir`).
+> applied by db-ty-d-lower: `check_generic_args_len` skips lifetime counting for a function with late-bound lifetimes given lifetime arguments and reports `hir::LateBoundLifetimeArgs { generics_or_segment, def, hard_error }` (E0794 for a value path whose count differs from the early-bound one, else the lint; always the lint for a method call, through `InferenceDiagnostic::MethodCallLateBoundLifetimeArgs`). The method call's side in `confirm.rs` is requested of items in `v2/requests/db-ty.md` `## db-ty-d-lower`.
 
 ## diagnostics-items-generics: which branch of `generic_arg_mismatch_err` (crates/hir-ty `lower/path.rs`, `crates/hir`)
 
@@ -1725,6 +1744,7 @@ only the argument. Why: `lower/incorrect_generics_order.rs` recomputes it by rep
 `lower_generic_args` over the syntax; hir-ty knows it at the point it reports.
 
 > forwarded to db: lane db's (`crates/hir-ty`, `crates/hir`).
+> applied by db-ty-d-lower: `hir::IncorrectGenericsOrder` has `param: GenericParam`, the parameter the argument met, for paths and method calls.
 
 ## diagnostics-items-generics: the trait's signature for `_` in a trait impl's method (crates/hir)
 
@@ -1735,6 +1755,7 @@ replacing `_` with the type in the corresponding trait method signature" with th
 type; `lower/infer_vars_not_allowed.rs` does not give that suggestion.
 
 > forwarded to db: `crates/hir/` is lane db's.
+> applied by db-ty-d-hir: `hir::Function::trait_signature_in_impl(db) -> Option<(Function, FnSignature)>`, the trait method's signature with the impl's arguments in the impl method's generics, late-bound lifetimes liberated (`hir_ty_wfcheck::trait_signature_in_impl`); `FnSignature::{params, ret, safety, abi, c_variadic, to_next_solver}`.
 
 ## diagnostics-items-generics: E0229 for parenthesized args on a segment that takes none (crates/hir-ty `lower/path.rs`)
 
@@ -1921,6 +1942,7 @@ placeholder), but they still re-walk part of the signature and, for E0109, re-re
 path's prefixes. With the group at the source, lowering is one pass per error.
 
 > forwarded to db (`hir-ty` `lower/path.rs`, `infer`, `hir`).
+> applied by db-ty-d-lower: one diagnostic per rustc error, its sites a boxed slice (error paths only): a return type's elision failures (`MissingLifetimes` `ElisionFailure`), the placeholders of a type its body infers (`InferVarsNotAllowed { sources }`, hir `nodes`; a return type, a const's or a static's with a body) and the segments of one `prohibit_generic_args` (`GenericArgsProhibited { segments }`, hir `all_args`: the leading segments, with the last for a type parameter, `Self`, a primitive or a module ending a type path). `ColdBatch` schema 2. Readers can take the sites in place of re-walking (`v2/requests/db-ty.md` `## db-ty-d-lower` item 5).
 
 ## diagnostics-bodies-members: what E0599 of a path and `..` without a base need from hir (crates/hir `diagnostics.rs`, crates/hir-ty `infer/path.rs`, crates/hir-ide `diagnostics/expr.rs`)
 
@@ -1944,6 +1966,7 @@ From `diagnostics-bodies-members` (report `/tmp/blaze-lanes/v2-diagnostics-bodie
    the variant it gives these forms in `default_fields`.
 
 > applied (hir-ide): `ExprValidator` also reports a struct expression with `..`, no base, and no field without a default left out, as `RecordMissingFields` with an empty `missed_fields` (`record_literal_spread_only` in `diagnostics/expr.rs`); `record_literal_missing_fields`, which the IDE reads, still answers `None` there. forwarded to db: item 1, and for item 2 `hir`'s conversion (`hir/src/diagnostics.rs:1792`) giving `MissingFields` its `variant` and making one for an empty list (`ide-diagnostics`' handler must then skip an empty list).
+> applied by db-ty-d-lower: item 1, `hir::UnresolvedAssocItem<'db> { expr_or_pat, ty, name }` with the type inference looked the item up on (not reported when that type has an error, as rustc's `report_method_error`); item 2's `hir` side, `MissingFields { variant, .. }` in both conversions, an empty list passed through. The `ide-diagnostics` handler and the readers' `<'_>` are requested in `v2/requests/db-ty.md` `## db-ty-d-lower` item 5.
 
 ## diagnostics-lints-bodies-calls-desugar: typeck's prelude-collision lints (crates/hir-ty `method_resolution`, crates/hir `diagnostics.rs`)
 
@@ -2272,6 +2295,7 @@ variant of the same name exists. Until then the lint is not reported (listed in 
 report), never guessed from syntax.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-ty-d-lower: `PathLoweringDiagnostic::AmbiguousAssociatedItem` from `select_associated_type`'s `Self` branch, `hir::AmbiguousAssociatedItem { path, variant, item, self_ty, bound }`. It fires only for a type-relative type path, as rustc's (an inherent `E::A` const does not lint there; rustc's UI test `enum-variant-priority-lint-ambiguous_associated_items.rs` is the case).
 
 ## diagnostics-lints-names-items: default field values in the item tree (crates/hir-def `signatures.rs`)
 
@@ -2292,6 +2316,7 @@ What: `Dependency` gets rustc's `--extern priv:name` (cargo's `public = false` u
 dependency; the dependency's privacy is the only input blaze lacks for it.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-expand: `Dependency::with_private(self, bool)` and `is_private(&self)` (`crates/base-db/src/input.rs`), kept by `CrateGraphBuilder::set_in_db` and in the crate's content id (`Crate::DOMAIN` "blaze v2 crate 3"). Test `a_private_dependency_reads_back_private_and_changes_the_id` (`base-db/src/tests.rs`). Cargo sets it from `UnitDep::public == Some(false)`: requested of cargo in `v2/requests/db-expand.md`, "db-expand-inputs2: a dependency's `priv` flag, and the target tuple".
 
 ## diagnostics-lints-bodies-calls: re "`-A unused` for failing UI tests" and "the UI harness's `std` ignores its `#[lang]` items"
 
@@ -2341,6 +2366,7 @@ foreign type; `lints/names/dead/reach.rs` follows parameter bounds only, and `ma
 or `dyn` self type only.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-ty-d-hir: `hir::GenericDef::where_predicates(db) -> Vec<WherePredicate>` (the own explicit predicates; `WherePredicate::{as_trait, types, to_next_solver}`) and `hir::Type::as_foreign(db) -> Option<TypeAlias>`. Tests `where_predicates_are_the_written_ones`, `a_foreign_type_is_its_alias`.
 
 ## diagnostics-lints-bodies: whether rustc would codegen, for the drop-elaborated lints (the parent, `diagnostics-lints`, `lints.rs`; `diagnostics` for `Options` and the UI harness)
 
@@ -2369,6 +2395,7 @@ rustc's `check_representability_ty`, which recurses into the element whatever th
 misses `struct S<const N: usize>([S<N>; N]);`, which rustc rejects.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-ty-d-hir: `hir::Type::as_array_element(db) -> Option<Type>`, whatever the length. Test `an_array_s_element_whatever_its_length`.
 
 ## diagnostics-items-defs: rustc's constrained parameters of an ADT (crates/hir-ty, crates/hir)
 
@@ -2379,6 +2406,7 @@ the walk over fields and projections; the front end should hold that semantics o
 `semantics-in-front-end`), and the diagnostics read it.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-ty-d-hir: `hir_ty::adt_unused_params(db, adt)` (`hir-ty/src/variance/unused.rs`), rustc's `check_variances_for_type_defn`: the bivariant parameters no projection of the where clauses constrains (`identify_constrained_generic_params`), empty when a field's type has an error (`HasErrorDeep`); `hir::Adt::unused_params(db) -> Vec<GenericParam>`. Test `a_parameter_no_field_or_projection_uses_is_unused`.
 
 ## diagnostics-items-defs: which names of a scope are imports, and ambiguous ones (crates/hir-def `item_scope.rs`, crates/hir)
 
@@ -2466,6 +2494,7 @@ instantiated `FnSig` nor the diagnostic item), so `check_proc_macro` is not give
 
 > for: diagnostics (parent): which lane owns proc macro signatures in hir-ty.
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+> applied by db-ty-d-hir: `hir::Function::signature(db) -> Option<FnSignature>` (lowered, late-bound lifetimes liberated; `params`, `ret`, `safety`, `abi`, `c_variadic`, `to_next_solver`); `hir::Crate::diagnostic_item_adt(db, &Symbol) -> Option<Adt>` (rustc's `get_diagnostic_item` over `hir_def::diagnostic_item::diagnostic_items`); and the check itself in the front end, `hir_ty_wfcheck::compare_proc_macro_signature` (rustc's `check_proc_macro`: fresh arguments, normalized, equated with safe Rust `fn(TokenStream..) -> TokenStream`), as `hir::Function::proc_macro_signature_mismatch(db, attribute) -> Option<ProcMacroSignatureMismatch { at, expected, found }>`; `at` is `SignatureMismatchAt::{Param(i), ParamMutability(i), Return, ReturnMutability, ParamCount, Signature}`. Test `a_proc_macro_s_signature_is_fn_token_stream_to_token_stream`.
 
 ## diagnostics-items-attrs: the target's `has_thumb_interworking` (db, `crates/base-db/src/input.rs`)
 
@@ -2478,6 +2507,7 @@ crate's cfg (`target_arch`, `target_os`, ..) gives neither. `checks/attrs/parser
 
 > for: db (target info of a crate).
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+> applied by db-expand: `TargetData { tuple: Symbol, has_thumb_interworking: bool, .. }` (`crates/base-db/src/target.rs`), both in its content id (`TargetData::DOMAIN` "blaze v2 target data 2"); read them through `krate.workspace_data(db).target`. Test `targets_differing_in_the_tuple_or_thumb_interworking_have_different_ids` (`base-db/src/tests.rs`). Cargo fills them from the recorded spec: requested of cargo in `v2/requests/db-expand.md`, "db-expand-inputs2: a dependency's `priv` flag, and the target tuple".
 
 ## diagnostics-items-attrs: the crate root's feature fact (`checks/features/attributes.rs`)
 
@@ -2762,10 +2792,15 @@ Counts: 27 sites in 13 files of `crates/blaze-diagnostics/src/lints/bodies*` (be
 `ide-diagnostics` and the rest of `blaze-diagnostics` (`lower/`, `lints/syntax/`, whose
 `statements()` are `syntax::ast`'s) have none.
 
+> forwarded to diagnostics (told by tmux).
+> applied by diagnostics: all 27 sites in the 13 files below, as listed (the desugar slice pattern became `is_empty`); no other `&Statement` is left in `crates/blaze-diagnostics`.
+
 ### crates/blaze-diagnostics/src/lints/bodies.rs  (8)
 - `fn child_exprs`, the `Expr::Block` arm (~L373-378): `out.extend(*initializer);`  ->  `out.extend(initializer);`; `pat(*p, out);`  ->  `pat(p, out);`; `out.extend(*else_branch);`  ->  `out.extend(else_branch);`; `Statement::Expr { expr, .. } => out.push(*expr),`  ->  `Statement::Expr { expr, .. } => out.push(expr),`
 - the walker's `Expr::Block` arm (~L621-634): `self.expr(*it);` (both, the `initializer` and `else_branch` ones)  ->  `self.expr(it);`; `self.pat(*pat);`  ->  `self.pat(pat);`; `Statement::Expr { expr, .. } => self.expr(*expr),`  ->  `Statement::Expr { expr, .. } => self.expr(expr),`
 - unchanged: `for (index, statement) in statements.iter().enumerate()`, `if let Statement::Item(_) = statement`.
+
+> forwarded to diagnostics (told by tmux).
 
 ### crates/blaze-diagnostics/src/lints/bodies/reachable.rs  (3)
 - ~L108  `fn statement_node(b: &BodyCx<'_, '_>, statement: &Statement) -> Option<InFile<SyntaxNodePtr>> {`  ->  `fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {`
@@ -2773,42 +2808,1120 @@ Counts: 27 sites in 13 files of `crates/blaze-diagnostics/src/lints/bodies*` (be
 - ~L111  `Statement::Let { pat, .. } => (b.pat_node(*pat)?, true),`  ->  `Statement::Let { pat, .. } => (b.pat_node(pat)?, true),`
 - unchanged: the caller `statement_node(b, statements.get(index as usize)?)?` (~L88).
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/unsafety.rs  (1)
 - ~L154  `                        pats.push(*pat);`  ->  `                        pats.push(pat);`
+
+> forwarded to diagnostics (told by tmux).
 
 ### crates/blaze-diagnostics/src/lints/bodies/types/pointers.rs  (2)
 - ~L147  `&& let Some(id) = binding(*pat)`  ->  `&& let Some(id) = binding(pat)`
 - ~L149  `self.map.insert(id, *init);`  ->  `self.map.insert(id, init);`
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/types/pointers/dangling.rs  (2)
 - ~L100  `initializer.iter().chain(else_branch).for_each(|it| this.expr(*it));`  ->  `initializer.into_iter().chain(else_branch).for_each(|it| this.expr(it));` (both are `Option<ExprId>` by value now; `iter()` would chain `&ExprId` with `ExprId`)
 - ~L102  `Statement::Expr { expr, .. } => this.expr(*expr),`  ->  `Statement::Expr { expr, .. } => this.expr(expr),`
+
+> forwarded to diagnostics (told by tmux).
 
 ### crates/blaze-diagnostics/src/lints/bodies/calls/items/invalid_from_utf8.rs  (2)
 - ~L200  `&& let Pat::Bind { id, .. } = store.pat(*pat)`  ->  `&& let Pat::Bind { id, .. } = store.pat(pat)`
 - ~L203  `return *initializer;`  ->  `return initializer;`
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/calls/items/drop_forget_useless.rs  (1)
 - ~L72  `Some(Statement::Expr { expr, has_semi: true }) => Some(*expr),`  ->  `Some(Statement::Expr { expr, has_semi: true }) => Some(expr),`
+
+> forwarded to diagnostics (told by tmux).
 
 ### crates/blaze-diagnostics/src/lints/bodies/types/casts/static_mut_refs.rs  (1)
 - ~L99  delete the line `        let (pat, init) = (*pat, *init);` (the `let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index)` above it binds both by value now)
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/liveness/source.rs  (1)
 - ~L75  `let Statement::Let { pat, initializer: Some(init), else_branch, .. } = *statement else {`  ->  `let Statement::Let { pat, initializer: Some(init), else_branch, .. } = statement else {`
+
+> forwarded to diagnostics (told by tmux).
 
 ### crates/blaze-diagnostics/src/lints/bodies/calls/desugar/if_let_rescope.rs  (1)
 - ~L79  `place(*expr, Parent::Stmt);`  ->  `place(expr, Parent::Stmt);`
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/calls/methods/map_unit_fn.rs  (1)
 - ~L57  `let Statement::Expr { expr, has_semi: true } = *statements.get(index)? else { return None };`  ->  `let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };`
+
+> forwarded to diagnostics (told by tmux).
+
+## diagnostics-lints-names-dead: value-path resolutions recorded by inference (crates/hir-ty `infer.rs`)
+
+What: `InferenceResult` records what each value path in a body resolved to, keyed by
+`ExprOrPatId`, as it already records `variant_resolution_for_expr_or_pat` and
+`assoc_resolutions_for_expr_or_pat`. It would cover a path expression or path pattern that
+resolved to a function, static, constant, const parameter, unit or tuple struct, or local
+binding (`ValueNs`). Ideally it is a dense column rather than a hash map. Why: rustc's
+`MarkSymbolVisitor` reads `qpath_res` and never resolves again. The dead-code pass now walks
+bodies over the store (`lints/names/dead/mark/body.rs`) and reads every other resolution from
+inference. Value paths it must still resolve itself: `update_to_inner_scope` and
+`resolve_path_in_value_ns_fully` for each path, about 13 ms of its 20 ms on a 100,000-line
+crate (`docs/v2/plan/lanes/diagnostics/speed-of-light.md`). Inference already resolves each
+of these paths to type it, so recording the result costs one store per path. Any other pass
+that maps a body path back to a definition would read the same column. `Walk::resolve`
+already tries what inference recorded first, so with this column the dead-code side gains one
+more read.
+
+Status: open
 
 ### crates/blaze-diagnostics/src/lints/bodies/calls/statements.rs  (3)
 - ~L65  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'db Statement> {`  ->  `fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {` (its body `Expr::Block { statements, .. } => statements.get(index),` is unchanged)
 - ~L76  `Statement::Expr { expr, has_semi: true } => Some(*expr),`  ->  `Statement::Expr { expr, has_semi: true } => Some(expr),`
 - ~L193  `Some(Local { pat: *pat, init: *initializer, typed: type_ref.is_some(), assign: None })`  ->  `Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })`
 
+> forwarded to diagnostics (told by tmux).
+
 ### crates/blaze-diagnostics/src/lints/bodies/calls/desugar.rs  (1)
 - ~L54  `    let Expr::Block { statements: [], tail: Some(next), .. } = store.expr(body) else { return None };`  ->  `    let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };\n    if !statements.is_empty() {\n        return None;\n    }`
+
+Status: open
+
+> forwarded to diagnostics (told by tmux).
+
+## 7. `crates/hir-ty` `infer/expr.rs`, `crates/hir` `diagnostics.rs` (db): a body path of more than one segment that resolves to nothing
+
+What: `infer_expr_path`'s `None` branch (and the path patterns' and the qualified struct
+literals' equivalents) pushes `InferenceDiagnostic::UnresolvedIdent` only when the path is one
+identifier or `self` (`mod_path.is_ident() || mod_path.is_self()`); a path such as
+`page_size::get()` or `std::nothere::f()` gives no diagnostic. Push one for every path whose
+resolution fails, with the index of the first segment that fails: a new
+`InferenceDiagnostic::UnresolvedPath { id: ExprOrPatIdPacked, segment: u32 }` (or
+`UnresolvedIdent` gaining the segment), and `hir::UnresolvedPath { node, segment }` in
+`AnyDiagnostic`, mapped to syntax as `UnresolvedIdent` is. A path whose prefix resolves to a type
+and whose last segment is an associated item inference cannot find is E0599, not this, and is
+not pushed. blaze-diagnostics lowers it with `checks/names/failure.rs`'s E0433 (a prefix segment
+fails: "cannot find module or crate `page_size` in this scope", "use of unresolved module or
+unlinked crate `page_size`", with `cargo add` help under cargo) and E0425 for the last segment
+("cannot find function `get` in module `a`").
+
+Why: every error rustc gives must be given. rustc's late resolver checks every path in a body
+(`rustc_resolve/src/late.rs` `smart_resolve_path_fragment`, `report_path_resolution_error`);
+today blaze accepts `fn main() { let n = page_size::get(); }`, which rustc rejects
+(`tests/ui/typeck/path-to-method-sugg-unresolved-expr.rs`). Inference already resolves each
+body path to type it, so the failure is found where the resolution is, with no second walk.
+
+Status: open
+
+> forwarded to db (hir-ty and hir are db's; db-ty-next2 told).
+
+## frontend-db: blaze-diagnostics takes `&Db` (frontend.md item 15; 2026-10-29)
+
+From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). Every query takes the one
+concrete `base_db::Db`, so a memo hit is a static call. When your lane is done (or now, if
+nothing else of yours is open in these files), run:
+
+```sh
+PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \
+  '{"root": ".", "crates": ["blaze-diagnostics"], "write": true}'
+```
+
+Dry run: 48 sites rewritten. It leaves 4, which it prints:
+- `src/tests/db.rs`: the test database becomes `pub(crate) type TestDB = base_db::Db;` (made by
+  `Db::for_tests()`; the tool rewrites `TestDB::default()`). Its helpers go into a
+  crate-private trait implemented for `Db`, so call sites stay. `executed` becomes
+  `Db::log_executed`. The `hir::impl_hir_database!(TestDB);` line (L131) goes; put
+  `use hir as _;` in its place so the MIR providers are linked.
+- `src/tests/bodies/calls.rs:453` and `:472`: drop the `as &dyn ..` casts and pass the `&Db`.
+
+Then `hot_lint` over the crate shows no `dyn` database. New code takes `&Db` from now on.
+
+Status: open
+
+> forwarded to diagnostics (told by tmux).
+
+> applied by frontend-db-hir: the tool run (48 sites), `tests/db.rs` is `type TestDB = base_db::Db;` with `use hir as _;`, `Semantics::new_dyn` -> `Semantics::new` and `Semantics<'_, Db>` -> `Semantics<'_>` (hir's `Semantics` lost its parameter). The two `as &dyn` in `tests/bodies/calls.rs` are fixture source, not databases: left. `hot_lint` shows no `dyn` database.
+
+## diagnostics-lints-names-dead: `blaze-alloc-count` in `blaze-diagnostics` tests (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)
+
+What: two lines outside my paths so that the crate can hold its hot paths to allocation
+budgets, as the coordinator asks of every lane:
+
+- `Cargo.toml`, `[dev-dependencies]`: `blaze-alloc-count.workspace = true` (it is already a
+  workspace dependency; `tt`, `blaze-mem`, `blaze-core` and `blaze-link` use it this way);
+- `src/lib.rs`: `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting =
+  blaze_alloc_count::Counting;`, as in `crates/tt/src/lib.rs`.
+
+Why: the dead-code pass's budget tests are written (`lints/names/dead/tests.rs`: a cached
+level or attribute answer, a lookup in the crate's numbering, and a bitset test and insert, each
+zero allocations). They are not declared yet, because without these two lines they would not
+compile. Once these land, `diagnostics-lints-names-dead` adds `#[cfg(test)] mod tests;` to
+`lints/names/dead.rs`. Every other lane of the crate can then use `assert_at_most` the same way.
+
+Status: open
+
+> forwarded to diagnostics (`crates/blaze-diagnostics/` is its, still running; told).
+
+## diagnostics-lints-names-dead: `blaze-mem` in `blaze-diagnostics` (crates/blaze-diagnostics `Cargo.toml`, `src/lib.rs`)
+
+What: `blaze-mem.workspace = true` in `[dependencies]`, and `#![feature(allocator_api)]` in
+`src/lib.rs`, so the crate's passes can put per-run working state in a worker's frame
+(`blaze_mem::frame::task`, `Vec<T, &Frame>`), as docs/v2/plan/design/memory.md settles. The
+crate stays `#![forbid(unsafe_code)]`: blaze-mem's allocators are safe to use.
+
+Why: the dead-code pass rebuilds about 1.5 MB of per-run tables and worklists on every check
+of a crate, with about 150 to 200 global-allocator calls. memory.md's warm loop allows none. The
+lifetime plan and the hash-map question are with mem (`v2/requests/mem.md`).
+`lints/names/dead/` moves onto the frame once both are answered. Every other pass of the
+crate has the same shape (per-run state, then an output vector).
+
+Status: open
+
+
+## dedup: stdx::edit_distance
+
+From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). rustc's edit
+distance and `find_best_match_for_name` exist twice in this crate (`src/lints/edit_distance.rs`
+and `src/lower/unresolved_field.rs` 474-617) and four more times elsewhere. The one copy is
+`stdx::edit_distance` (`v2/requests/coordinator.md`, `## dedup: one stdx::edit_distance`; its tests
+carry this crate's tests and a proptest differential against rustc's code). `stdx` is already a
+dependency here. Its API is generic over the candidate type: `find_best_match_for_name*(&[S], ..)`
+for `S: AsRef<str>` returns `Option<&S>`, so a `&[&str]` call takes `.copied()` and a `&[String]`
+call that wants an owned `String` takes `.cloned()`. Apply once the coordinator's request lands.
+
+1. Delete `src/lints/edit_distance.rs`. In `src/lints.rs` delete `pub mod edit_distance;` and the
+   doc line `//! - [`edit_distance`]: rustc's choice of a similar name to suggest.`
+2. `src/lower/unresolved_field.rs`: delete lines 474-617 (`find_best_match_for_name`,
+   `find_best_match_for_name_with_substrings`, `find_best_match_for_name_impl`, `sort_by_words`,
+   `edit_distance`, `edit_distance_with_substrings`); keep `name_series_display`. Delete
+   `use std::{cmp, mem};` (line 15; no other use) and add
+   `use stdx::edit_distance::find_best_match_for_name;`. In the module doc, replace
+   "Also the "a field with a similar name exists" rule its siblings share: rustc's
+   `find_best_match_for_name`." by nothing and drop "and `compiler/rustc_span/src/edit_distance.rs`".
+   Line 302: `let similar = find_best_match_for_name(&names, field, None);` becomes
+   `let similar = find_best_match_for_name(&names, field, None).cloned();`
+3. Imports: replace `lints::edit_distance::X` (or `lints::{code_fact, edit_distance::X}`) by a
+   separate `use stdx::edit_distance::X;` in `checks/features/library.rs`, `checks/names/failure.rs`,
+   `checks/names/lifetimes.rs` (`edit_distance`), `checks/names/paths.rs`,
+   `lints/syntax/attrs/diagnostic.rs`, `lints/syntax/attrs/parse.rs`
+   (`find_best_match_for_name_with_substrings`), `lints/syntax/check_cfg/unexpected.rs`,
+   `lower/trait_impl_redundant_assoc_items.rs`, `lower/undeclared_label.rs` (keep `lints::code_fact`),
+   `lower/unresolved_import.rs`, `lower/unresolved_macro_call.rs`; in `lints/registry.rs` line 33
+   `use crate::lints::edit_distance;` becomes `use stdx::edit_distance;` (the call stays
+   `edit_distance::find_best_match_for_names`). From `lower::unresolved_field::{..}`:
+   `lower/unresolved_ident.rs` line 25 drops `unresolved_field::find_best_match_for_name` and gains
+   `use stdx::edit_distance::find_best_match_for_name;`; `lower/no_such_field.rs` keeps
+   `unresolved_field::name_series_display` and gains `use stdx::edit_distance::find_best_match_for_name;`;
+   `lower/unresolved_method_call.rs` keeps `fn_def_span, type_param_span` and gains
+   `use stdx::edit_distance::{edit_distance_with_substrings, find_best_match_for_name_with_substrings};`.
+4. Call sites (before → after):
+   - `lower/unresolved_macro_call.rs:202` `find_best_match_for_name(&words, name, None) else` → `find_best_match_for_name(&words, name, None).copied() else`
+   - `lints/bodies/liveness/source.rs:335` `crate::lints::edit_distance::find_best_match_for_name(&names, name, None)` → `stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()`
+   - `lints/bodies/liveness/source.rs:344` `crate::lints::edit_distance::find_best_match_for_name(&names, name, None)?` → `stdx::edit_distance::find_best_match_for_name(&names, name, None).copied()?`
+   - `checks/names/failure.rs:238` and `lower/unresolved_import.rs:694` `find_best_match_for_name(&candidates, name, None).filter(` → `find_best_match_for_name(&candidates, name, None).copied().filter(`
+   - `lower/unresolved_import.rs:455` `find_best_match_for_name(&names, &source.name, None).map(` → `find_best_match_for_name(&names, &source.name, None).copied().map(`
+   - `lints/syntax/attrs/parse.rs:420` `find_best_match_for_name_with_substrings(STABLE, &text, Some(5))` → `find_best_match_for_name_with_substrings(STABLE, &text, Some(5)).copied()`
+   - `lints/syntax/check_cfg/unexpected.rs:427` `find_best_match_for_name(&expected.names, name, None)` → `find_best_match_for_name(&expected.names, name, None).copied()`
+   - `lints/syntax/check_cfg/unexpected.rs:580` `find_best_match_for_name(&possibilities, value, None)` → `find_best_match_for_name(&possibilities, value, None).copied()`
+   - `lints/registry.rs:723` `edit_distance::find_best_match_for_names(&names, &lookups, None);` → `edit_distance::find_best_match_for_names(&names, &lookups, None).copied();`
+   - `checks/names/paths.rs:535` `find_best_match_for_name(&names, name, None) else` → `find_best_match_for_name(&names, name, None).copied() else`
+   - `checks/features/library.rs:315` `.or_else(|| find_best_match_for_name(names, feature, None))` → `.or_else(|| find_best_match_for_name(names, feature, None).copied())`
+   - `lints/syntax/attrs/diagnostic.rs:274` `find_best_match_for_name(&candidates, name, None)` → `find_best_match_for_name(&candidates, name, None).copied()`
+   - `lower/trait_impl_redundant_assoc_items.rs:91` `find_best_match_for_name(&candidates, name, None)` → `find_best_match_for_name(&candidates, name, None).copied()`
+   - `lower/unresolved_ident.rs:280` `find_best_match_for_name(&names, name, None) else` → `find_best_match_for_name(&names, name, None).cloned() else`
+   - `lower/no_such_field.rs:324` `find_best_match_for_name(&available, name, None)` → `find_best_match_for_name(&available, name, None).cloned()`
+   - `lower/no_such_field.rs:388` `find_best_match_for_name(std::slice::from_ref(&candidate), &record.fields[last].name, None);` → `find_best_match_for_name(std::slice::from_ref(&candidate), &record.fields[last].name, None).cloned();`
+   - `lower/unresolved_method_call.rs:534` `find_best_match_for_name_with_substrings(&names, lookup, None)?;` → `find_best_match_for_name_with_substrings(&names, lookup, None).cloned()?;`
+   - unchanged: `lower/undeclared_label.rs:92` (`.is_some()`), `checks/names/lifetimes.rs:180` and
+     `lower/unresolved_method_call.rs:511` (distances).
+5. `src/lints/edit_distance.rs`'s tests `distances_as_rustc_counts_them`, `the_name_rustc_suggests`
+   and `substrings_score_near` are in stdx's tests verbatim; nothing to move.
+
+Status: open
+
+## dedup: dead code's `csr` onto `blaze_ids::radix::Csr`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_radix::Csr<T>` (reached as
+`blaze_ids::radix::Csr`; `crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into
+compressed sparse rows: `Csr::build(rows, pairs)` / `csr.rebuild(rows, pairs, &mut cursors)` walk a
+cloneable iterator of `(row: u32, item)` twice (count, then place at each row's cursor), with
+`row(r) -> &[T]`, `range(r)`, `items()`, `into_parts() -> (starts, items)` (`starts` has
+`rows + 1` entries). A warm `rebuild` allocates nothing. Its tests have the old copies as the
+proptest reference.
+
+`crates/blaze-diagnostics/src/lints/names/dead/defs.rs`, `fn csr`: the body becomes
+
+```rust
+    // alloc: setup, the CSR's offsets and list and the sort's cursors, once per crate
+    radix::Csr::build(len, edges.iter().copied()).into_parts()
+```
+
+(`radix` is already imported; `DefIdx` is `u32`). Why: one counting sort in the tree.
+
+
+## speed-hir-store-paths: paths as columns (2026-10-29)
+
+From `speed-hir-store-paths-consumers` (child of `speed-hir-store-paths`). hir-def's paths and
+generic arguments are columns now (`crates/hir-def/src/expr_store/path.rs`; the API is in
+`/tmp/blaze-lanes/v2-speed-hir-store-paths.md`, "The API"): `Path<'a>`, `GenericArgs<'a>`,
+`AssociatedTypeBinding<'a>`, `PathGenericArgs<'a>` and `Bindings<'a>` are `Copy` views decoded
+from the store; `TypeBound` and `WherePredicate` are `Copy` records whose `for<..>` binders and
+`use<..>` arguments are runs (`Names`, `UseArgs`) read with `store.names(..)` and
+`store.use_args(..)`. Apply these with the paths lane's own edits to `hir.rs`/`expr_store*`
+(one compile). Nothing here is built (common.md).
+
+The consumer rule:
+
+1. `&Path` parameters and fields become `Path<'_>` (by value; `Copy`). Where a function keeps
+   `&Path<'_>`, callers pass `&path`. `&store[p]` / `&map[p]` for a `PathId` -> `store.path(p)`.
+2. `Path::Normal(it) => &it.mod_path` -> `it.mod_path` (already a reference).
+   `it.generic_args` / `it.type_anchor` field reads are unchanged.
+3. `generic_args()` yields slots by value: `.into_iter().flatten().flatten()` still gives
+   `GenericArgs<'_>`; `.iter().any(Option::is_some)` -> `.iter().any(|it| it.is_some())`;
+   `generic_args()?.last()?.as_ref()?` -> `generic_args()?.last()??`; `&generic_args[i]` ->
+   `generic_args.get(i)`.
+4. `&GenericArgs` parameters -> `GenericArgs<'_>`; `Option<&GenericArgs>` -> `Option<GenericArgs<'_>>`
+   (drop `.as_ref()`/`.as_deref()`; `*args` -> `args`). `args.bindings.iter()`, `for b in
+   &args.bindings`, `.first()`, `.is_empty()`, `.len()` keep working; `bindings[i]` ->
+   `bindings.get(i).unwrap()` (or restructure), `&*bindings`/`bindings.as_ref()` -> iterate.
+5. `binding.args.as_ref()` -> `binding.args`; `&binding.bounds` / `binding.bounds.iter()`
+   unchanged (`&'a [TypeBound]`).
+6. `TypeBound::ForLifetime(lifetimes, path)`: `lifetimes` is `Names`; read with
+   `store.names(lifetimes)`. `TypeBound::Use(args)`: `store.use_args(args)`. `bound.clone()` ->
+   `*bound`; `&TypeBound::Path(p, m)` patterns keep working.
+7. `WherePredicate::TypeBound { lifetimes: Some(l), .. }`: `l` is `Names`; `store.names(l)`.
+8. `Path::from_known_path_with_no_generic(m)` -> `Path::from_known_path_with_no_generic(&m)`
+   (bind the `ModPath` to a local if it is a temporary used past the statement).
+9. `path.qualifier()` gives `Qualifier<'_>`: use `.path()` for a `Path<'_>` (bind the
+   qualifier to a local first: `let q = path.qualifier()?; let q = q.path();`).
+
+Applied the same way everywhere, so that callers in one crate agree with signatures in another:
+every `&Path`, `Option<&GenericArgs>`, `&GenericArgs`, `&[Option<GenericArgs>]` parameter,
+field and return becomes the by-value view, hir-def's `Resolver::resolve_path_in_*` and
+`record_path_uses` and hir-ty's path lowering included. Bodies are by-value views
+(`store.expr(id) -> Expr<'_>`), so `Expr::Path(p)` binds `p: Path<'_>` and most call sites
+keep their text. Also `args.args` is `&[GenericArg]` now, so `for arg in &args.args` becomes
+`for arg in args.args` (`&&[T]` is not `IntoIterator`).
+
+The edits assume, from the paths lane: `Expr::Path`/`Pat::Path`/`RecordLit`/`Pat::Record`/
+`Pat::TupleStruct` hold `Path<'a>`; `Expr::MethodCall { generic_args: Option<GenericArgs<'a>> }`;
+`AsmOperand::Sym(PathIdx)` read with `store.path_at(idx)` (both `pub`); `Index<PathId> for
+ExpressionStore` removed; `StoreVisitor::on_path`/`on_generic_args`/`on_type_bound` taking the
+views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
+
+Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
+old text (where the same text is on several lines, the function named beside it picks).
+
+
+### crates/blaze-diagnostics/src/lints/names/dead/mark/body.rs
+
+`store.expr`/`store.pat`/`store.type_ref` already return by-value views, so `Expr::Path(path)`,
+`Expr::RecordLit { path, .. }`, `Pat::Path(path)`, `Pat::TupleStruct { path, .. }`,
+`Pat::Record { path, .. }`, `TypeRef::Path(path)` and the tuple match
+`(Expr::Path(l), Expr::Path(r))` at 545 all bind `Path<'_>` now (were `&Path`). The helpers
+that take them change to match; `StoreVisitorExt::on_path(self, path)` (254, 272, 285) then
+passes the value, as the new `on_path(path: Path<'_>)` takes it. `Path::Normal(it) if
+it.type_anchor.is_some()` (344) and `path.mod_path()` (339) are unchanged. `asm.operands` is
+iterated by reference, so `AsmOperand::Sym(path)` binds `&PathIdx`.
+
+- lines 161-162:
+
+```old
+                    if let AsmOperand::Sym(path) = operand {
+                        let r = self.resolve(None, path, Site::Value, HygieneId::ROOT);
+```
+
+```new
+                    if let AsmOperand::Sym(path) = operand {
+                        let r = self.resolve(None, store.path_at(*path), Site::Value, HygieneId::ROOT);
+```
+
+- line 296: `fn pat_path(&mut self, pat: PatId, path: &Path, site: Site) -> Resolved {` -> `fn pat_path(&mut self, pat: PatId, path: Path<'_>, site: Site) -> Resolved {`
+- line 338: `fn resolve(&mut self, at: Option<ExprOrPatId>, path: &Path, site: Site, hygiene: HygieneId) -> Resolved {` -> `fn resolve(&mut self, at: Option<ExprOrPatId>, path: Path<'_>, site: Site, hygiene: HygieneId) -> Resolved {`
+- line 555: `fn local(&mut self, expr: ExprId, path: &Path) -> Option<BindingId> {` -> `fn local(&mut self, expr: ExprId, path: Path<'_>) -> Option<BindingId> {`
+- line 625: `fn ident(path: &Path) -> Option<&Name> {` -> `fn ident(path: Path<'_>) -> Option<&Name> {`
+
+(`ident`'s body `match path { Path::BarePath(it) => it.as_ident(), _ => None }` returns a
+`&'a Name` of the view's lifetime, which elision ties to the one input lifetime. The closures
+in `resolve` (363-380) and `local` (558) use `path` by copy.)
+
+Status: open
+
+## speed-hir-sol-expand: `macro_arg_considering_derives` returns its span by value
+
+What: `hir_expand::MacroCallId::macro_arg_considering_derives` changes from returning
+`&'db (TopSubtree, SyntaxFixupUndoInfo, Span)` to `(&'db TopSubtree, &'db SyntaxFixupUndoInfo,
+Span)`, so an eager call's argument is read from its interned location instead of copied into a
+memo (`v2/requests/db-expand-macros.md`, `## speed-hir-sol-expand`, block 1). The one caller
+outside hir-expand that breaks:
+
+Where: `crates/blaze-diagnostics/src/lints/syntax/early/macros.rs`, `fn dropped_semicolon`. Old:
+```rust
+    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, *span);
+```
+New:
+```rust
+    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, span);
+```
+Why: land it with the hir-expand change; with neither, both compile; with only one, this line
+doesn't. (`hir-def`'s caller, `expr_store/expander.rs:218`, takes `.2` and compiles either way.)
+
+Status: open
+
+## dedup: one diagnostic model, `Level` and emitter, shared with `blaze-lints` (from dedup-scan-diag)
+
+From `dedup-scan-diag` (report `/tmp/blaze-lanes/v2-dedup-scan-diag.md`, notes
+`docs/v2/plan/lanes/dedup/scan-diag.md`). `blaze-lints` had copies of `model.rs` (`Span`,
+`Expansion`, `MacroKind`, `MultiSpan`, `SpanLabel`, `Sublevel`, `Child`, `Applicability`,
+`SuggestionStyle`, `Suggestion`, a `Diagnostic` builder), `emit.rs` (the text and JSON emitter),
+`lints::registry::Level` and `lints::CommandLine::parse`. `blaze-diagnostics`' are the better
+ports of rustc's (a later rustc, BOM and `\r\n`, error codes, failure notes, `-Z ui-testing`,
+recursive macro calls, the def-site rule of macro labels, rustc's `--cap-lints` levels, text
+borrowed not copied), so they stay and `blaze-lints` uses them (`v2/requests/coordinator.md`,
+same heading). `blaze-diagnostics` does not depend on `blaze-lints`, nor anything it depends on
+(only `blaze-engine` and `blaze-cargo` depend on `blaze-lints`). What this crate needs for it:
+
+### 1. `model.rs`: one macro backtrace and one "originates in" note
+
+Today `Diag::originates_in` (the child `check::finish` adds) and `emit::originates_in` (what
+the emitter writes unless a child has it) are two copies that disagree: the model's walks
+`std::iter::successors` (no removal of a macro's recursive calls of itself, as rustc's
+`Span::macro_backtrace` does) and writes `warning` for every level that is not `Error` (rustc's
+`Display` of `Level` writes `note`, `help`, `failure-note`). When they differ the text has the
+note twice and the JSON keeps the wrong one. One function, the emitter's:
+
+In `impl Span` (after `is_empty`), add:
+
+```rust
+    /// rustc's `Span::macro_backtrace`: the expansions it is in, innermost first, leaving out
+    /// a macro's recursive calls of itself.
+    pub fn macro_backtrace(&self) -> impl Iterator<Item = &Expansion> {
+        let mut prev: Option<&Span> = None;
+        let mut at = self;
+        std::iter::from_fn(move || {
+            loop {
+                let expansion = at.expansion.as_deref()?;
+                let recursive = prev.is_some_and(|it| it.source_equal(&expansion.call_site));
+                prev = Some(at);
+                at = &expansion.call_site;
+                if !recursive {
+                    return Some(expansion);
+                }
+            }
+        })
+    }
+
+    /// rustc's `Span::source_equal`: the same bytes of the same file.
+    pub fn source_equal(&self, other: &Span) -> bool {
+        self.file == other.file && self.lo == other.lo && self.hi == other.hi
+    }
+```
+
+Replace `Diag::originates_in` (the whole fn, from its doc comment `/// rustc's note on a
+diagnostic in a macro's expansion` to its closing `}`) with:
+
+```rust
+    /// rustc's note on a diagnostic in a macro's expansion, as a child: which macro it came
+    /// from (`fix_multispans_in_extern_macros_and_render_macro_backtrace` without
+    /// `-Z macro-backtrace`). The emitter writes it itself when no child has it.
+    pub fn originates_in(&mut self) -> &mut Diag {
+        match self.origin_note() {
+            Some(note) => self.note(note),
+            None => self,
+        }
+    }
+
+    /// The text of [`Diag::originates_in`]'s note, when a primary span of it or of a child is
+    /// in a macro's expansion: the innermost macro, and the outermost when it is another.
+    pub fn origin_note(&self) -> Option<String> {
+        let spans = self.span.primary.iter().chain(self.children.iter().flat_map(|it| &it.span.primary));
+        let mut macros = spans.flat_map(Span::macro_backtrace);
+        let first = macros.next()?;
+        let last = macros.last().unwrap_or(first);
+        let and_then = match last.name != first.name {
+            true => format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name),
+            false => String::new(),
+        };
+        Some(format!(
+            "this {} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
+            self.level.name(),
+            first.kind.descr(),
+            first.name
+        ))
+    }
+
+    /// Whether cargo counts it as one `cargo fix` (`cargo clippy --fix`) applies: it has a
+    /// suggestion rustfix takes as it is.
+    pub fn is_fixable(&self) -> bool {
+        !self.suggestions_disabled
+            && self.suggestions.iter().any(|it| it.applicability == Applicability::MachineApplicable)
+    }
+```
+
+(`is_fixable` is `blaze-lints`' `Diagnostic::is_fixable`, which `blaze-lints/src/serve.rs` reads
+for cargo's "run `cargo clippy --fix` to apply N suggestions".)
+
+On `pub enum Level`, add to its doc comment the line: `/// Not [`blaze_api::Level`]: that is
+the agent API's versioned schema, which changes only with its version.` (the copy kept on
+purpose: `blaze-api` is below this crate and its `Level` is wire format; `api.rs`'s `level`
+maps them.)
+
+Tests, in `model.rs`'s `mod tests` (moved from `emit.rs`'s, which go: see 2):
+
+```rust
+    fn expanded(lo: u32, hi: u32, name: &str, call_site: Span) -> Span {
+        Span {
+            file: "a.rs".to_owned(),
+            lo,
+            hi,
+            expansion: Some(Box::new(Expansion {
+                call_site,
+                kind: MacroKind::Bang,
+                name: name.to_owned(),
+                def_site: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn the_backtrace_is_innermost_first() {
+        let root = Span { file: "a.rs".to_owned(), lo: 0, hi: 10, expansion: None };
+        let at = expanded(3, 4, "inner", expanded(20, 30, "outer", root));
+        let names: Vec<&str> = at.macro_backtrace().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["inner", "outer"]);
+    }
+
+    #[test]
+    fn a_call_where_the_span_two_steps_back_is_is_left_out_of_the_backtrace() {
+        let root = Span { file: "a.rs".to_owned(), lo: 3, hi: 4, expansion: None };
+        let at = expanded(3, 4, "m", expanded(20, 30, "m", root));
+        let names: Vec<&str> = at.macro_backtrace().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["m"]);
+    }
+
+    #[test]
+    fn the_note_leaves_out_a_recursive_call_as_the_emitter_does() {
+        let root = Span { file: "a.rs".to_owned(), lo: 3, hi: 4, expansion: None };
+        let at = expanded(3, 4, "a", expanded(20, 30, "b", root));
+        let mut diag = Diag::error(None, "x", at);
+        diag.originates_in();
+        assert_eq!(
+            diag.children[0].message,
+            "this error originates in the macro `a` (in Nightly builds, run with -Z macro-backtrace for more info)"
+        );
+        assert_eq!(diag.origin_note().as_deref(), Some(diag.children[0].message.as_str()));
+    }
+
+    #[test]
+    fn the_note_names_the_level_as_rustc_does() {
+        let root = Span { file: "a.rs".to_owned(), lo: 0, hi: 10, expansion: None };
+        let mut diag = Diag::new(Level::Note, None, "x");
+        diag.span = MultiSpan::of(expanded(3, 4, "m", root));
+        assert!(diag.origin_note().unwrap().starts_with("this note originates in the macro `m`"));
+    }
+
+    #[test]
+    fn a_machine_applicable_suggestion_is_fixable_unless_suggestions_are_off() {
+        let mut diag = Diag::lint("clippy::needless_bool", "x", span(0, 1));
+        assert!(!diag.is_fixable());
+        diag.suggestion(span(0, 1), "y", "z", Applicability::MaybeIncorrect);
+        assert!(!diag.is_fixable());
+        diag.suggestion(span(0, 1), "y", "z", Applicability::MachineApplicable);
+        assert!(diag.is_fixable());
+        diag.suggestions_disabled = true;
+        assert!(!diag.is_fixable());
+    }
+```
+
+### 2. `emit.rs` and `emit/json.rs`: use them, and take a `rendered` already made
+
+`emit.rs`:
+- Delete `fn backtrace`, `fn same_place` and `fn originates_in` (with their doc comments).
+- In `render`: `if let Some(note) = originates_in(diag)` becomes `if let Some(note) = diag.origin_note()`.
+- In `macro_labels`: `backtrace(primary)` becomes `primary.macro_backtrace()`.
+- The `use crate::model::{...}` line drops `Expansion` (nothing else in the file names it).
+- In `mod tests`: delete `fn expanded`, `the_backtrace_is_innermost_first` and
+  `a_call_where_the_span_two_steps_back_is_is_left_out_of_the_backtrace` (moved to `model.rs`).
+- After `pub fn json`, add (`blaze-lints`' `serve.rs` renders once for its dedup and its JSON):
+
+```rust
+/// [`json`] with `rendered` as its text: [`written`] of `diag` in the same style, made
+/// already.
+pub fn json_rendered(diag: &Diag, sources: &mut Sources, rendered: String) -> String {
+    let placed = Placed::new(diag, sources);
+    json::line(diag, &placed, rendered)
+}
+```
+
+- After `mod json;`, add `#[cfg(test)]` and `mod reference;`, and move
+  `v2/requests/dedup-scan-diag/emit_reference.rs` to `crates/blaze-diagnostics/src/emit/reference.rs`
+  (complete: the deleted `blaze-lints` emitter as the reference, taking a `Diag`, and the
+  proptest `the_emitter_writes_what_the_reference_wrote` over ASCII files of `\n` lines, one or
+  two files, 1-2 primary spans, labels with tabs, children with and without spans, every
+  suggestion style and applicability, disjoint parts, inline and attribute suggestions, short,
+  colour and a narrow width: `written` equal byte for byte, `json` equal as JSON values,
+  `json_rendered` equal to `json`).
+
+`emit/json.rs`:
+- `use super::{File, Placed, backtrace, codes, originates_in};` becomes `use super::{File, Placed, codes};`.
+- In `line`: `let added = originates_in(diag);` becomes `let added = diag.origin_note();`.
+- In `suggestion`: `let backtrace: Backtrace<'a> = backtrace(span).collect();` becomes
+  `let backtrace: Backtrace<'a> = span.macro_backtrace().collect();`.
+- In `spans`: `let backtrace: Backtrace<'a> = backtrace(it.span).collect();` becomes
+  `let backtrace: Backtrace<'a> = it.span.macro_backtrace().collect();`.
+
+`Cargo.toml` `[dev-dependencies]`: add `proptest.workspace = true` (a root workspace dependency).
+
+### 2b. `emit.rs`: a primary span given twice is marked once (ported from `blaze-lints`)
+
+rustc's `MultiSpan::span_labels` (and `model::MultiSpan::span_labels`, and `blaze-lints`' emitter
+through it) adds an unlabelled primary span only when no span label has it yet, so a primary span
+given twice is one annotation. `collect_annotations` builds its own list and keeps both, and
+`annotate-snippets` then draws the mark twice. In `collect_annotations`, before:
+
+```rust
+    let unlabelled: SmallVec<[&'a Span; 2]> = span
+        .primary
+        .iter()
+        .filter(|it| !span.labels.iter().any(|(at, _)| at == *it) && !extra.iter().any(|(at, _)| at == it))
+        .collect();
+```
+
+after:
+
+```rust
+    let mut unlabelled: SmallVec<[&'a Span; 2]> = SmallVec::new();
+    for at in &span.primary {
+        let labelled = span.labels.iter().any(|(it, _)| it == at) || extra.iter().any(|(it, _)| *it == at);
+        if !labelled && !unlabelled.contains(&at) {
+            unlabelled.push(at);
+        }
+    }
+```
+
+Test, in `emit.rs`'s `mod tests`:
+
+```rust
+    #[test]
+    fn a_primary_span_given_twice_is_marked_once() {
+        let mut sources = Sources::of([("a.rs".to_owned(), "let x = 1;\n".to_owned())]);
+        let at = Span { file: "a.rs".to_owned(), lo: 4, hi: 5, expansion: None };
+        let once = Diag::error(None, "x", at.clone());
+        let mut twice = once.clone();
+        twice.primary(at);
+        assert_eq!(rendered(&twice, &mut sources, Style::default()), rendered(&once, &mut sources, Style::default()));
+    }
+```
+
+### 3. `cx.rs`: every macro has its definition as its def site
+
+`emit::macro_labels` writes "in this macro invocation" only on an expansion whose `def_site` is
+`Some` (rustc's `render_multispan_macro_backtrace` skips a dummy `def_site`), but
+`Cx::expansion_of` gives a `def_site` only to a proc macro, so no `macro_rules!` call is ever
+labelled, which rustc labels (and the expectations of `tests/lints/bodies/liveness.rs:132`,
+`tests/items/features/attributes.rs:269`, `tests/lints/mir/scopes.rs:797` and
+`tests/lints/names/items/inside-macro_rules.stderr:13` want). rustc's `ExpnData::def_site` is the
+span of the macro's definition for every macro with one (`macro_rules!`, `macro`, a built-in's
+`#[rustc_builtin_macro]` item in `core`); `json.rs`'s `guess_head_span` of it is what
+`a_macro_expansion_in_json` expects ("macro_rules! g {", columns 1 to 15). In `expansion_of`,
+before:
+
+```rust
+        let def_site = match loc.def.kind {
+            MacroDefKind::ProcMacro(id, ..) => {
+                let file = id.file_id.file_id()?.file_id(db);
+                let item = id.to_node(db);
+                Some(self.span_in_file(file, signature_range(&item)))
+            }
+            _ => None,
+        };
+```
+
+after:
+
+```rust
+        let def_site = match loc.def.kind {
+            MacroDefKind::ProcMacro(id, ..) => {
+                let file = id.file_id.file_id()?.file_id(db);
+                let item = id.to_node(db);
+                Some(self.span_in_file(file, signature_range(&item)))
+            }
+            MacroDefKind::Declarative(id, _)
+            | MacroDefKind::BuiltIn(id, _)
+            | MacroDefKind::BuiltInAttr(id, _)
+            | MacroDefKind::BuiltInDerive(id, _)
+            | MacroDefKind::BuiltInEager(id, _)
+            | MacroDefKind::UnimplementedBuiltIn(id) => {
+                let item = id.to_node(db);
+                Some(self.span(id.with_value(item_range(item.syntax()))))
+            }
+        };
+```
+
+(`self.span` places a definition that is itself in an expansion; the match has no `_`, so a new
+`MacroDefKind` is a compile error here, not a silent `None`.) A def site in `core` is named by
+`Files::name` and read by the emitter's `Sources` (`blaze-cargo`'s `Mounted::sources` reads the
+sysroot by its absolute path); a file neither knows panics in `Placed::file_named`, as for any
+span: that is a naming bug to fix there, not here.
+
+### 4. Kept on purpose (no change)
+
+`blaze_api::{Diagnostic, Level, Span}` (the API's placed, versioned shape; `api.rs` maps),
+`hir-ty-borrowck`'s `Sublevel`/`Applicability`/`Child` (below this crate, spans not yet placed),
+`blaze-manifest/src/diagnostic.rs` and `blaze-fmt/src/format_report_formatter.rs` (cargo's and
+rustfmt's own renderers, not rustc's), `ide-diagnostics` (rust-analyzer's IDE model).
+
+Status: open
+
+## dedup: bits: blaze-diagnostics the lint passes' bit sets onto `blaze_ids::bits`
+
+From `dedup-bits-diag` (child of `dedup-bits`, lane dedup; report
+`/tmp/blaze-lanes/v2-dedup-bits-diag.md`). `crates/blaze-ids/src/bits.rs` is now the one bit-set
+family (`Bits<S, I>` over any word storage, `BitSet<I>` = `Vec` words, `BitArray<W, I>` inline,
+`BitMatrix<I>`, the trait `BitIndex`; tests and a proptest differential in `bits/tests.rs`). This
+crate had seven copies. Each goes; what is left is a type alias or, for `LintSet`, a newtype that
+keeps its `Debug`. `blaze-ids` is already a dependency here: no `Cargo.toml` change. Every hunk
+is quoted by its code (line numbers move). Why: one bit set in the tree, its word loops written
+once, and the liveness dataflow's entry sets in one buffer instead of a `Vec` per block.
+
+Behavior: the same members everywhere and the same panics on an insert past a fixed set's
+capacity. Two differences, neither reachable: `contains` past the capacity is `false` (the copies
+in `bodies/bits.rs`, `liveness/flow.rs`, `dead/defs.rs` and `LintSet` indexed out of bounds), and
+`remove` past it is `false` (`bodies/bits.rs` and `flow.rs` panicked); every index is a block,
+local, place, definition or lint below the size the set was made with. Equality is of the words
+as before. `LintSet`'s `Hash` is unchanged (an array hashes as its slice: length, then words). No
+set here is persisted. `Debug` of `dead`'s `Live` now prints the members, not the raw words.
+
+### 1. `src/lints/bodies/bits.rs` goes
+
+- Delete `src/lints/bodies/bits.rs`, and `mod bits;` in `src/lints/bodies.rs`.
+- `src/lints/bodies/recursion.rs`: `use super::{BodyCx, bits::Bits};` becomes `use super::BodyCx;`;
+  after `use base_db::Db;` add `use blaze_ids::bits::BitSet;`. In `fn search`:
+
+```rust
+    let (mut visited, mut settled, mut is_recursive) = (Bits::new(blocks), Bits::new(blocks), Bits::new(blocks));
+```
+becomes
+```rust
+    let (mut visited, mut settled, mut is_recursive): (BitSet, BitSet, BitSet) =
+        (BitSet::new(blocks), BitSet::new(blocks), BitSet::new(blocks));
+```
+
+- `src/lints/bodies/panics.rs`: `use super::{BodyCx, bits::Bits};` becomes `use super::BodyCx;`;
+  after `use base_db::Db;` add `use blaze_ids::bits::BitSet;`. In `struct Scratch`,
+  `assigned: Bits,`, `visited: Bits,` and `written: Bits,` become `assigned: BitSet,`,
+  `visited: BitSet,` and `written: BitSet,` (`#[derive(Default)]` stays: `BitSet` is `Default`).
+  `reset`, `insert`, `contains` and `remove` keep their names and `usize` arguments. In `fn run`:
+
+```rust
+                if self.s.written.contains(local) {
+                    self.s.written.remove(local);
+                    self.s.locals[local] = Value::Uninit;
+                }
+```
+becomes
+```rust
+                if self.s.written.remove(local) {
+                    self.s.locals[local] = Value::Uninit;
+                }
+```
+
+### 2. `src/lints/bodies/liveness/flow.rs`: `PlaceSet`, the entry sets a `BitMatrix`
+
+Before `use hir_ty::mir::{` add `use blaze_ids::bits::{BitMatrix, BitSet};`. Replace from
+`/// A set of checked places: rustc's `DenseBitSet<PlaceIndex>`.` through the end of `impl Bits`
+(its `fn clear` and closing `}`) with:
+
+```rust
+/// A set of checked places: rustc's `DenseBitSet<PlaceIndex>`.
+pub(super) type PlaceSet = BitSet<Index>;
+```
+
+Then every other `Bits` in the file becomes `PlaceSet`: `Seen`'s `ever_live: Bits` and
+`ever_dropped: Bits`, the `state: &mut Bits` / `live: &mut Bits` / `live: &Bits` parameters of
+`exit`, `block`, `statement`, `terminator`, `by_ref_captures`, `rvalue`, `operand`, `place` and
+`sight`, and the `Bits::new(..)` calls in `solve` and `assignments`. Then:
+
+`struct Flow`:
+```rust
+    /// The state where each block starts.
+    entry: Vec<Bits>,
+```
+becomes
+```rust
+    /// The state where each block starts, a row per block.
+    entry: BitMatrix<Index>,
+```
+
+`Flow::new`: `let entry = vec![Bits::new(places.len()); mir.basic_blocks.len()];` becomes
+`let entry = BitMatrix::new(mir.basic_blocks.len(), places.len());`
+
+`fn solve`:
+```rust
+        let mut queued = vec![false; n];
+        let mut queue: VecDeque<BasicBlockId> = VecDeque::with_capacity(self.cfg.postorder.len());
+        for &block in &self.cfg.postorder {
+            queued[raw(block)] = true;
+            queue.push_back(block);
+        }
+        let mut state = Bits::new(self.places.len());
+        while let Some(block) = queue.pop_front() {
+            queued[raw(block)] = false;
+            self.exit(block, &mut state);
+            self.block(block, &mut state, closures);
+            if state != self.entry[raw(block)] {
+                self.entry[raw(block)].clone_from(&state);
+                for &pred in &self.cfg.pred[raw(block)] {
+                    if !std::mem::replace(&mut queued[raw(pred)], true) {
+                        queue.push_back(pred);
+                    }
+                }
+            }
+        }
+```
+becomes
+```rust
+        let mut queued: BitSet = BitSet::new(n);
+        let mut queue: VecDeque<BasicBlockId> = VecDeque::with_capacity(self.cfg.postorder.len());
+        for &block in &self.cfg.postorder {
+            queued.insert(raw(block));
+            queue.push_back(block);
+        }
+        let mut state = PlaceSet::new(self.places.len());
+        while let Some(block) = queue.pop_front() {
+            queued.remove(raw(block));
+            self.exit(block, &mut state);
+            self.block(block, &mut state, closures);
+            if state.as_slice() != self.entry.row(raw(block)) {
+                self.entry.row_mut(raw(block)).copy_from(&state);
+                for &pred in &self.cfg.pred[raw(block)] {
+                    if queued.insert(raw(pred)) {
+                        queue.push_back(pred);
+                    }
+                }
+            }
+        }
+```
+
+`fn exit`: `state.union(&self.entry[raw(next)]);` becomes
+`state.union_with(&self.entry.row(raw(next)));`
+
+`fn place`, the match on `def_use`:
+```rust
+            Some(true) => live.remove(at),
+            Some(false) => live.insert(at),
+            None => {}
+```
+becomes (both now return whether they changed the set)
+```rust
+            Some(true) => {
+                live.remove(at);
+            }
+            Some(false) => {
+                live.insert(at);
+            }
+            None => {}
+```
+
+`fn assignments`: both `found.ever_live.union(&state);` become
+`found.ever_live.union_with(&state);`, and
+```rust
+        let start = &self.entry[raw(self.cfg.start)];
+        found.ever_live.union(start);
+```
+becomes
+```rust
+        let start = self.entry.row(raw(self.cfg.start));
+        found.ever_live.union_with(&start);
+```
+(`start.contains(at)` below stays.)
+
+`Cfg::new`, the byte-per-block sets become bits:
+```rust
+        let mut unreached = vec![false; n];
+        for &it in &mir.unreached {
+            unreached[raw(it)] = true;
+        }
+```
+becomes
+```rust
+        let mut unreached: BitSet = BitSet::new(n);
+        for &it in &mir.unreached {
+            unreached.insert(raw(it));
+        }
+```
+`succ[raw(block)] = edges.into_iter().filter(|it| !unreached[raw(*it)]).collect();` becomes
+`succ[raw(block)] = edges.into_iter().filter(|it| !unreached.contains(raw(*it))).collect();`
+and
+```rust
+        let mut visited = vec![false; n];
+        let mut postorder = Vec::new();
+        let mut stack: Vec<(BasicBlockId, usize)> = vec![(start, succ[raw(start)].len())];
+        visited[raw(start)] = true;
+```
+becomes
+```rust
+        let mut visited: BitSet = BitSet::new(n);
+        let mut postorder = Vec::new();
+        let mut stack: Vec<(BasicBlockId, usize)> = vec![(start, succ[raw(start)].len())];
+        visited.insert(raw(start));
+```
+and
+```rust
+            if !visited[raw(next)] {
+                visited[raw(next)] = true;
+                stack.push((next, succ[raw(next)].len()));
+            }
+```
+becomes
+```rust
+            if visited.insert(raw(next)) {
+                stack.push((next, succ[raw(next)].len()));
+            }
+```
+
+`Cfg::reaches`: `let mut visited = vec![false; self.pred.len()];` becomes
+`let mut visited: BitSet = BitSet::new(self.pred.len());`, and
+`if std::mem::replace(&mut visited[raw(block)], true) {` becomes `if !visited.insert(raw(block)) {`.
+
+`src/lints/bodies/liveness.rs`: in `use self::flow::{Access, Bits, CaptureKind, ...}`, `Bits`
+becomes `PlaceSet` (after `Places`: `..., Loc, PlaceSet, Places, Special}`), and
+```rust
+        let drop_guards: Bits = {
+            let mut it = Bits::new(n);
+```
+becomes
+```rust
+        let drop_guards: PlaceSet = {
+            let mut it = PlaceSet::new(n);
+```
+
+### 3. `src/lints/names/dead/`: `DefSet`
+
+`defs.rs`: `use blaze_ids::radix;` becomes `use blaze_ids::{bits::BitSet, radix};`. Replace from
+`/// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.` through the end of
+`impl Bits` with:
+
+```rust
+/// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.
+pub(super) type DefSet = BitSet<DefIdx>;
+```
+
+`mark.rs`: `defs::{Bits, DefIdx, Id, Kind, Parent, anon_key, cast, is_anon},` becomes
+`defs::{DefIdx, DefSet, Id, Kind, Parent, anon_key, cast, is_anon},`. In `struct Live`,
+`live: Bits,` becomes `live: DefSet,`. In `Live::snapshot`, `live: self.live.snapshot(),`
+becomes `live: self.live.clone(), // clone: once per crate, rustc's pre-deferred summary`.
+`self.live.get(def)` (in `Live::contains`) and `Parent::Def(it) => self.live.get(it),` (in
+`parent_live`) take `contains` for `get`. In `fn live`,
+`scanned: [Bits::new(len), Bits::new(len)],` and `live: Live { live: Bits::new(len), ..Live::default() },`
+take `DefSet::new(len)`. In `struct Mark`, `scanned: [Bits; 2],` becomes `scanned: [DefSet; 2],`.
+In `extract_live`, `it.trait_def.is_none_or(|it| live.get(it)) && it.self_adt.is_none_or(|it| live.get(it))`
+becomes `it.trait_def.is_none_or(|it| live.contains(it)) && it.self_adt.is_none_or(|it| live.contains(it))`.
+
+`reach.rs`: `use super::defs::{Bits, DefIdx, Defs, Id, ImplOf, Kind, Parent};` becomes
+`use super::defs::{DefIdx, DefSet, Defs, Id, ImplOf, Kind, Parent};`. `public: Bits,` (in
+`Reach` and `Walk`), `nominal: Bits,`, both `Bits::new(defs.len())` and
+`fn nominal_pub(defs: &Defs) -> Bits {` take `DefSet` for `Bits`. Each `.get(` on these sets
+becomes `.contains(`: `self.public.get(def)` (`is_reachable`), `self.nominal.get(def)`
+(`update`), `self.public.get(it.def)` and `|it| self.public.get(it)` (the impls' fixpoint) and
+`nominal.get(it)` (`nominal_pub`).
+
+`tests.rs` (`bitset_test_and_insert` keeps its zero-allocation budget):
+`defs::{Bits, Defs},` becomes `defs::{DefSet, Defs},`; `let mut bits = Bits::new(1000);`
+becomes `let mut bits = DefSet::new(1000);`; `assert!(!bits.get(at));` becomes
+`assert!(!bits.contains(at));`.
+
+### 4. `src/lints/names/imports/`: `SmallSet`
+
+`used.rs`: before `use hashbrown::HashTable;` add `use blaze_ids::bits::Bits;`. Replace from
+`/// A set of small indices (a `use` item's trees, a macro's rules): one bit each, one inline`
+through the end of `impl Bits` (its `fn iter` and closing `}`) with:
+
+```rust
+/// A set of small indices (a `use` item's trees, a macro's rules): one bit each, one inline
+/// word up to 64, grown as it is inserted in.
+pub(super) type SmallSet = Bits<SmallVec<[u64; 1]>>;
+```
+
+`pub(super) arms: FxHashMap<MacroId, Bits>,` becomes `pub(super) arms: FxHashMap<MacroId, SmallSet>,`,
+and `self.arms.entry(id).or_default().insert(arm as usize);` becomes
+`self.arms.entry(id).or_default().insert_growing(arm as usize);`. (`macros.rs`'s
+`it.contains(n)` stays.)
+
+`unused.rs`: `use super::used::{Binding, Bits, Entry, ExternCrate, Ns, Tree, TreeKind, UseItem, Used, Uses, entry};`
+becomes `use super::used::{Binding, Entry, ExternCrate, Ns, SmallSet, Tree, TreeKind, UseItem, Used, Uses, entry};`;
+`type Trees = Bits;` becomes `type Trees = SmallSet;`; the three `unused.insert(j);` (the
+exported `_` trait import, the empty list, the unused simple or glob tree) become
+`unused.insert_growing(j);`. `unused.remove(j);`, `is_empty`, `iter` and `Trees::default()` stay.
+
+### 5. `src/lints/syntax/early/labels.rs`
+
+Before `use hir::{HirFileId, InFile};` add `use blaze_ids::bits::BitSet;`. Delete
+`/// A set of a body's labels by their arena index: one bit each, a word per 64 labels.` through
+the end of `impl Bits`. In `fn unused`:
+`let (mut declared, mut used) = (Vec::new(), Bits::default());` becomes
+`let (mut declared, mut used) = (Vec::new(), BitSet::<u32>::default());`; `used.clear();`
+becomes `used.reset(0);` (empty, buffer kept, as before); and
+```rust
+                Expr::Break { label: Some(label), .. } | Expr::Continue { label: Some(label) } => {
+                    used.insert(u32::from(label.into_raw()))
+                }
+```
+becomes
+```rust
+                Expr::Break { label: Some(label), .. } | Expr::Continue { label: Some(label) } => {
+                    used.insert_growing(u32::from(label.into_raw()));
+                }
+```
+
+### 6. `src/lints/registry/set.rs`: `LintSet` over `BitArray<WORDS, LintId>`
+
+Replace the whole file with:
+
+```rust
+//! Sets of lints as bitsets over [`LintId`]: a group's members, the lints some level is set
+//! for in a crate, the command line's lints at one level.
+
+use blaze_ids::bits::{BitArray, BitIndex, Ones};
+
+use super::{LintId, index::LINT_COUNT};
+
+const WORDS: usize = LINT_COUNT.div_ceil(64);
+
+impl BitIndex for LintId {
+    #[inline]
+    fn to_bit(self) -> usize {
+        usize::from(self.0)
+    }
+
+    #[inline]
+    fn from_bit(bit: usize) -> LintId {
+        LintId(u16::from_bit(bit))
+    }
+}
+
+/// A set of lints: 8 bytes for every 64 lints (40 for rustc's 270 and blaze's); a test, an
+/// insert or a removal is one load and one bit operation. Its own type, not a [`BitArray`],
+/// for a `Debug` that names its lints.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LintSet(BitArray<WORDS, LintId>);
+
+const _: () = assert!(size_of::<LintSet>() == 8 * WORDS);
+
+impl LintSet {
+    pub const EMPTY: LintSet = LintSet(BitArray::<WORDS, LintId>::EMPTY);
+
+    #[inline]
+    pub fn contains(&self, id: LintId) -> bool {
+        self.0.contains(id)
+    }
+
+    /// Adds `id`; whether it was not a member.
+    #[inline]
+    pub fn insert(&mut self, id: LintId) -> bool {
+        self.0.insert(id)
+    }
+
+    /// Takes `id` out; whether it was a member.
+    #[inline]
+    pub fn remove(&mut self, id: LintId) -> bool {
+        self.0.remove(id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The lints of the set, in the order of their ids.
+    pub fn iter(&self) -> Ones<'_, LintId> {
+        self.0.iter()
+    }
+}
+
+impl Default for LintSet {
+    fn default() -> Self {
+        LintSet::EMPTY
+    }
+}
+
+impl std::fmt::Debug for LintSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter().map(|it| it.lint().name)).finish()
+    }
+}
+
+impl FromIterator<LintId> for LintSet {
+    fn from_iter<I: IntoIterator<Item = LintId>>(ids: I) -> Self {
+        let mut set = LintSet::EMPTY;
+        for id in ids {
+            set.insert(id);
+        }
+        set
+    }
+}
+```
+
+(`LintId`'s field is private to `registry`; `set` is its child, as before. Every caller, in
+`registry.rs`, `levels/builder.rs` and `registry/tests.rs` (`lint_sets_are_as_sets`), uses
+`insert` and `remove` as statements, so the `bool` they now return changes nothing; the tests
+stay as they are.)
+
+### 7. `src/lints/levels.rs`: `Shared::fulfilled`
+
+Before `use cfg::CfgOptions;` add `use blaze_ids::bits::BitSet;`. In `struct Shared`,
+`fulfilled: Vec<u64>,` becomes `fulfilled: BitSet,`; in `Shared::new`, `fulfilled: Vec::new(),`
+becomes `fulfilled: BitSet::default(),`. Then
+```rust
+    fn fulfill(&mut self, id: ExpectId) {
+        let (word, bit) = (id.index() / 64, id.index() % 64);
+        if self.fulfilled.len() <= word {
+            self.fulfilled.resize(word + 1, 0);
+        }
+        self.fulfilled[word] |= 1 << bit;
+    }
+
+    fn is_fulfilled(&self, id: ExpectId) -> bool {
+        let (word, bit) = (id.index() / 64, id.index() % 64);
+        self.fulfilled.get(word).is_some_and(|it| it & (1 << bit) != 0)
+    }
+```
+becomes
+```rust
+    fn fulfill(&mut self, id: ExpectId) {
+        self.fulfilled.insert_growing(id.index());
+    }
+
+    fn is_fulfilled(&self, id: ExpectId) -> bool {
+        self.fulfilled.contains(id.index())
+    }
+```
+
+### Kept (no change)
+
+`checks/attrs/parsers/doc.rs`'s `State::diagnostic`, a `u8` of the at most 8 diagnostic
+attribute groups inside a parser's state (its test checks they fit): a flag byte, not a set
+type. `crates/ide-diagnostics` has no bit set.
+
+Status: open
+
+## 8. The lane's "Done when" `rg 'unimplemented!|todo!'` check (coordinator)
+
+What: scope the check to unfinished code, for example `rg '\b(unimplemented|todo)!\(' -g '*.rs'`,
+with matches inside string literals and test expectations not counted. Alternatively, say
+plainly that the strings below must change.
+
+Why: every match left in `crates/blaze-diagnostics` is text that blaze writes for the user, not
+unfinished code:
+- Suggestions inserted into the user's source, as rustc's: the `_ => todo!()` arm for E0004
+  (`lower/missing_match_arms.rs`), `else { todo!() }` for E0005 (`lower/non_exhaustive_let.rs`)
+  and `fn f() { todo!() }` for E0046 (`lower/trait_impl_missing_assoc_items.rs`).
+- The examples in the error-code explanations `emit/codes/E0373.md`, `E0706.md` and `E0772.md`.
+- The test expectations that check them.
+
+Replacing `todo!()` in a suggestion with something that dodges the pattern (such as `panic!()`)
+would make the suggestion worse, just to pass a check. `crates/ide-diagnostics`' matches are real
+handler code; they go when the crate is deleted after request 3.
 
 Status: open

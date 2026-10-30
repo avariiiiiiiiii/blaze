@@ -1,5 +1,5 @@
 //! Builtin attributes.
-use base_db::SourceDatabase;
+use base_db::Db;
 use intern::sym;
 use span::Span;
 
@@ -18,7 +18,7 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$variant),*];
 
-            pub fn expander(&self) -> fn (&dyn SourceDatabase, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> fn (&Db, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
                 match *self {
                     $( BuiltinAttrExpander::$variant => $expand, )*
                 }
@@ -51,7 +51,7 @@ macro_rules! register_builtin {
 impl BuiltinAttrExpander {
     pub fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
@@ -91,12 +91,12 @@ pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
 }
 
 fn dummy_attr_expand(
-    _db: &dyn SourceDatabase,
+    _db: &Db,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     _span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    ExpandResult::ok(tt.clone())
+    ExpandResult::ok(tt.clone()) // clone: the expansion is the input, written once
 }
 
 /// The static, and what calls it in the allocator's place: rustc's expansion defines `__rg_alloc`
@@ -104,19 +104,19 @@ fn dummy_attr_expand(
 /// stand-in rustc builds for a crate whose code is blaze's calls from a `#[global_allocator]`
 /// of its own (blaze's `stub.rs`).
 fn global_allocator_expand(
-    _db: &dyn SourceDatabase,
+    _db: &Db,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let ident = |it: tt::TtElement<'_>| match it {
-        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()),
+        tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()), // clone: a copy (symbol and span); `#[global_allocator]`, once per crate
         _ => None,
     };
     let mut idents = tt.iter().filter_map(ident);
     idents.find(|it| it.sym.as_str() == "static");
     let Some(name) = idents.find(|it| it.sym.as_str() != "mut") else {
-        return ExpandResult::ok(tt.clone());
+        return ExpandResult::ok(tt.clone()); // clone: the expansion is the input, written once
     };
     let name = &name;
     let result = quote::quote! { span=>
@@ -172,13 +172,13 @@ fn global_allocator_expand(
 /// The item keeps the list as a tool attribute, which type inference reads and name resolution
 /// does not expand again.
 fn define_opaque_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let MacroCallKind::Attr { attr_args: Some(args), .. } = &id.loc(db).kind else {
-        return ExpandResult::ok(tt.clone());
+        return ExpandResult::ok(tt.clone()); // clone: the expansion is the input, written once
     };
     let args = &**args;
     let result = quote::quote! { span=>
@@ -189,7 +189,7 @@ fn define_opaque_expand(
 }
 
 fn dummy_gate_test_expand(
-    _db: &dyn SourceDatabase,
+    _db: &Db,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
@@ -223,7 +223,7 @@ fn dummy_gate_test_expand(
 /// So this hacky approach is a lot more friendly for us, though it does require a bit of support in
 /// hir::Semantics to make this work.
 fn derive_expand(
-    db: &dyn SourceDatabase,
+    db: &Db,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,

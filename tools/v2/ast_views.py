@@ -104,7 +104,7 @@ def read_nodes(text: str) -> Model:
     anys: dict[str, str] = {}
     for m in IMPL.finditer(text):
         owner, body = m.group(1), m.group(2)
-        found = [accessor(*it) for it in METHOD.findall(body)]
+        found = [accessor(*m.group(1, 2, 3, 4)) for m in METHOD.finditer(body)]
         new = NEW_ANY.search(body)
         if new:
             if new.group(2) != owner:
@@ -251,6 +251,49 @@ def write_nodes(model: Model) -> str:
     return "".join(out)
 
 
+def write_check(model: Model) -> str:
+    """The test that every view accessor answers as its handle's, node by node."""
+    out = [HEADER.format(name="nodes")]
+    out.append(
+        "//! Every accessor of every typed view against the handle's, on the same node.\n\n"
+        "use syntax::{AstNode as _, SyntaxNode, ast, view::{self, AstNode as _}};\n\n"
+        "fn range(it: &SyntaxNode) -> (syntax::SyntaxKind, syntax::TextRange) {\n"
+        "    (it.kind(), it.text_range())\n}\n\n"
+        "fn view_range(it: view::Node<'_>) -> (syntax::SyntaxKind, syntax::TextRange) {\n"
+        "    (it.kind(), it.text_range())\n}\n\n"
+        "/// Checks `handle` and `node`, the same node of the same tree, as every type they cast to.\n"
+        "pub fn check(handle: &SyntaxNode, node: view::Node<'_>) {\n"
+        "    assert_eq!(range(handle), view_range(node));\n"
+    )
+    nodes = [it for it in model.structs if it not in model.anys]
+    for name in [*nodes, *(name for name, _ in model.enums), *model.anys]:
+        out.append(
+            f"    assert_eq!(<ast::{name}>::can_cast(handle.kind()), <view::{name}<'_>>::can_cast(node.kind()));\n"
+            f"    if let (Some(h), Some(v)) = (ast::{name}::cast(handle.clone()), view::{name}::cast(node)) {{\n"
+            "        assert_eq!(range(h.syntax()), view_range(v.syntax()));\n"
+        )
+        for it in model.methods.get(name, []):
+            match it.shape:
+                case "token":
+                    out.append(
+                        f"        assert_eq!(h.{it.name}().map(|it| (it.kind(), it.text_range())), "
+                        f"v.{it.name}().map(|it| (it.kind(), it.text_range())), \"{name}::{it.name}\");\n"
+                    )
+                case "child":
+                    out.append(
+                        f"        assert_eq!(h.{it.name}().map(|it| range(it.syntax())), "
+                        f"v.{it.name}().map(|it| view_range(it.syntax())), \"{name}::{it.name}\");\n"
+                    )
+                case _:
+                    out.append(
+                        f"        assert!(h.{it.name}().map(|it| range(it.syntax())).eq("
+                        f"v.{it.name}().map(|it| view_range(it.syntax()))), \"{name}::{it.name}\");\n"
+                    )
+        out.append("    }\n")
+    out.append("}\n")
+    return "".join(out)
+
+
 def write_tokens(text: str) -> str:
     names = TOKEN_STRUCT.findall(text)
     kinds = dict(TOKEN_KIND.findall(text))
@@ -288,22 +331,27 @@ def main() -> None:
         case _:
             print(f"usage: {SCRIPT} '{{\"root\": \"<workspace>\"}}'", file=sys.stderr)
             sys.exit(2)
-    root = Path(cfg.root) / "crates" / "syntax" / "src"
-    handles, views = root / "ast" / "generated", root / "view" / "generated"
+    crate = Path(cfg.root) / "crates" / "syntax"
+    handles, views = crate / "src" / "ast" / "generated", crate / "src" / "view" / "generated"
     try:
-        nodes = write_nodes(read_nodes((handles / "nodes.rs").read_text()))
+        model = read_nodes((handles / "nodes.rs").read_text())
+        nodes, check = write_nodes(model), write_check(model)
         tokens = write_tokens((handles / "tokens.rs").read_text())
     except Refused as e:
         print(f"{SCRIPT}: refused: {e}", file=sys.stderr)
         sys.exit(2)
     stale = []
-    for name, text in (("nodes.rs", nodes), ("tokens.rs", tokens)):
-        path = views / name
+    outputs = (
+        (views / "nodes.rs", nodes),
+        (views / "tokens.rs", tokens),
+        (crate / "tests" / "view" / "accessors.rs", check),
+    )
+    for path, text in outputs:
         if cfg.check:
             if not path.is_file() or path.read_text() != text:
                 stale.append(str(path))
             continue
-        views.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text)
     for path in stale:
         print(f"{path}: differs from what {SCRIPT} writes", file=sys.stderr)

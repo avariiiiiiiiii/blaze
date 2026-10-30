@@ -1,9 +1,12 @@
 //! `rustc_pattern_analysis`'s `PatCx` over hir-ty's types: rustc's `RustcPatCtxt`
 //! (`rustc_pattern_analysis/src/rustc.rs`) with hir-ty's inhabitedness and field types.
 
-use std::{cell::Cell, fmt};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AdtId, EnumId, EnumVariantId, HasModule, LocalFieldId, ModuleId, VariantId, attrs::AttrFlags,
     hir::PatId, signatures::VariantFields,
@@ -55,11 +58,11 @@ impl rustc_pattern_analysis::Idx for VariantIdx {
 }
 
 impl VariantIdx {
-    pub(crate) fn of(db: &dyn HirDatabase, variant: EnumVariantId) -> Self {
+    pub(crate) fn of(db: &Db, variant: EnumVariantId) -> Self {
         VariantIdx(variant.index(db) as u32)
     }
 
-    pub(crate) fn id(self, db: &dyn HirDatabase, enum_: EnumId) -> EnumVariantId {
+    pub(crate) fn id(self, db: &Db, enum_: EnumId) -> EnumVariantId {
         enum_.enum_variants(db).variants[self.0 as usize].0
     }
 }
@@ -73,7 +76,17 @@ pub(crate) enum CxError {
     /// doesn't fit it, which type checking has reported.
     Bug,
     /// A deref pattern and a normal constructor matched on one place.
-    MixedDerefPatterns,
+    MixedDerefPatterns { deref_pat: PatId, normal_pat: PatId },
+}
+
+/// A range lint the analysis raised while it ran, for the visitor to report once the
+/// analysis is kept.
+#[derive(Debug, Clone)]
+pub(crate) enum RangeLint<'db> {
+    /// `lint_overlapping_range_endpoints`.
+    Overlap { pat: PatId, ty: Ty<'db>, on: IntRange, with: Box<[PatId]> },
+    /// `lint_non_contiguous_range_endpoints`: `pat` is the range `range`.
+    Gap { pat: PatId, ty: Ty<'db>, range: IntRange, gap: IntRange, with: Box<[PatId]> },
 }
 
 /// The facts of an integer type a range is read with: rustc's `Integer::size` and sign.
@@ -85,7 +98,7 @@ pub(crate) struct IntInfo {
 }
 
 pub(crate) struct Cx<'a, 'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) infcx: &'a InferCtxt<'db>,
     pub(crate) env: ParamEnv<'db>,
     pub(crate) module: ModuleId,
@@ -95,6 +108,8 @@ pub(crate) struct Cx<'a, 'db> {
     pub(crate) deref_patterns: bool,
     /// Whether a deref pattern was lowered in the match being checked.
     pub(crate) has_deref_pat: Cell<bool>,
+    /// What the analysis running now linted.
+    pub(crate) range_lints: RefCell<Vec<RangeLint<'db>>>,
 }
 
 impl fmt::Debug for Cx<'_, '_> {
@@ -208,13 +223,15 @@ impl<'a, 'db> Cx<'a, 'db> {
         let visible = |ty| (ty, PrivateUninhabitedField(false));
         match ctor {
             Struct | Variant(_) | UnionField => match ty.kind() {
+                // alloc: a `SmallVec` of two inline, as `ctor_sub_tys` returns.
                 TyKind::Tuple(tys) => tys.iter().map(visible).collect(),
                 TyKind::Adt(def, args) => {
                     let adt = def.def_id();
-                    let Some(variant) = self.variant_of(ctor, adt) else { return smallvec![] };
+                    let Some(variant) = self.variant_of(ctor, adt) else { return SmallVec::new() };
                     let is_enum = matches!(adt, AdtId::EnumId(_));
                     let visibilities =
                         (!is_enum).then(|| VariantFields::field_visibilities(self.db, variant));
+                    // alloc: as above.
                     self.variant_fields(args, variant)
                         .map(|(fid, ty)| {
                             let is_visible = visibilities
@@ -223,22 +240,25 @@ impl<'a, 'db> Cx<'a, 'db> {
                             let skip = !is_visible && self.is_uninhabited(ty);
                             (ty, PrivateUninhabitedField(skip))
                         })
-                        .collect()
+                        .collect() // alloc: as above.
                 }
-                _ => smallvec![],
+                _ => SmallVec::new(),
             },
             Ref => match ty.kind() {
+                // alloc: as above.
                 TyKind::Ref(_, pointee, _) => smallvec![visible(pointee)],
-                _ => smallvec![],
+                _ => SmallVec::new(),
             },
             Slice(slice) => match ty.builtin_index() {
+                // alloc: as above.
                 Some(elem) => (0..slice.arity()).map(|_| visible(elem)).collect(),
-                None => smallvec![],
+                None => SmallVec::new(),
             },
+            // alloc: as above.
             DerefPattern(pointee) => smallvec![visible(*pointee)],
             Bool(..) | IntRange(..) | F16Range(..) | F32Range(..) | F64Range(..)
             | F128Range(..) | Str(..) | Opaque(..) | Never | NonExhaustive | Hidden | Missing
-            | PrivateUninhabited | Wildcard | Or => smallvec![],
+            | PrivateUninhabited | Wildcard | Or => SmallVec::new(),
         }
     }
 }
@@ -400,9 +420,41 @@ impl<'a, 'db> PatCx for Cx<'a, 'db> {
 
     fn report_mixed_deref_pat_ctors(
         &self,
-        _deref_pat: &DeconstructedPat<Self>,
-        _normal_pat: &DeconstructedPat<Self>,
+        deref_pat: &DeconstructedPat<Self>,
+        normal_pat: &DeconstructedPat<Self>,
     ) -> Self::Error {
-        CxError::MixedDerefPatterns
+        CxError::MixedDerefPatterns { deref_pat: *deref_pat.data(), normal_pat: *normal_pat.data() }
+    }
+
+    fn lint_overlapping_range_endpoints(
+        &self,
+        pat: &DeconstructedPat<Self>,
+        overlaps_on: IntRange,
+        overlaps_with: &[&DeconstructedPat<Self>],
+    ) {
+        self.range_lints.borrow_mut().push(RangeLint::Overlap {
+            pat: *pat.data(),
+            ty: *pat.ty(),
+            on: overlaps_on,
+            // alloc: the patterns of one lint, which the analysis raises only where it fires.
+            with: overlaps_with.iter().map(|p| *p.data()).collect(),
+        });
+    }
+
+    fn lint_non_contiguous_range_endpoints(
+        &self,
+        pat: &DeconstructedPat<Self>,
+        gap: IntRange,
+        gapped_with: &[&DeconstructedPat<Self>],
+    ) {
+        let IntRange(range) = pat.ctor() else { return };
+        self.range_lints.borrow_mut().push(RangeLint::Gap {
+            pat: *pat.data(),
+            ty: *pat.ty(),
+            range: *range,
+            gap,
+            // alloc: as above.
+            with: gapped_with.iter().map(|p| *p.data()).collect(),
+        });
     }
 }

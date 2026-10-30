@@ -15,10 +15,15 @@ The input is one JSON object (inline, a file's path, or `-`):
                     has to be short)
     projects        whose rows run, of nushell, ripgrep, ruff and blaze (this checkout); all
     budgets         which budgets run (the names below); all
-    runs            how many times an edit, a no-op build or a warm start is timed: the median
-                    is the number, with its 95% interval from 6 runs on (10, hyperfine's least)
-    runtime_runs    how many times each program runs for the code-speed budgets, after two runs
-                    that warm the page cache (10)
+    runs            the fewest times an edit, a no-op build, a warm start, a restart or a bound's
+                    program is timed: the median is the number, with its 95% interval from 6
+                    runs on (10, hyperfine's least). Runs go on until the interval is at most
+                    10% of the budget wide or leaves the budget out (`enough`), so "within 10%
+                    of the bound" is a measured answer and not noise; each outcome says how many
+                    runs it took and how many its spread needs (`runs_for`)
+    most_runs       the most times one is timed, settled or not (60)
+    runtime_runs    the fewest times each program runs for the code-speed budgets, after two runs
+                    that warm the page cache (10); more until each side's median is known to 5%
     slack           the signature budget: at most `slack` functions compiled per place the edit
                     changed (4.0)
     noise           how far over 1.0 a code-speed ratio may be and still pass (0.05)
@@ -80,6 +85,10 @@ their pinned revisions, except blaze, which is the files of this checkout as the
                    relocation 16
     cache-misses   nushell: the machine's cache misses over the build of bench's `body` edit
                    (`perf stat -a`, Linux); docs/v2/plan/design/data.md asks for it and sets no budget
+    bounds         every lane's speed-of-light bounds (bounds.py: the `bound` blocks of each
+                   docs/v2/plan/lanes/<lane>/speed-of-light.md), each program beside `blaze` run
+                   until settled: at most the bound x 1.1 (at least the bound / 1.1 for a rate);
+                   unmeasured on v1, which has none of v2's components
 
 Each project's checkout has a blaze home and store of its own and a cargo target directory
 outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
@@ -113,13 +122,14 @@ from typed_input import fail, parse
 import engine
 import report
 import bench
+import bounds
 import blaze_cli
 import memory
 
 SCRIPT = "budgets.py"
 Budget = Literal[
     "body", "signature", "format", "comment", "rename", "move", "memory", "warm-start", "noop", "dev-speed",
-    "release-speed", "big-crate", "cold-blaze", "ci", "restart", "layout", "cache-misses",
+    "release-speed", "big-crate", "cold-blaze", "ci", "restart", "layout", "cache-misses", "bounds",
 ]
 type Restart = Literal["clean", "kill9"]
 Project = Literal["nushell", "ripgrep", "ruff", "blaze"]
@@ -175,6 +185,7 @@ class Input:
     projects: tuple[Project, ...] = get_args(Project)
     budgets: tuple[Budget, ...] = get_args(Budget)
     runs: int = 10
+    most_runs: int = 60
     runtime_runs: int = 10
     slack: float = 4.0
     noise: float = 0.05
@@ -312,6 +323,44 @@ def median_interval(xs: Sequence[float], level: float = 0.95) -> tuple[float, fl
     return (ordered[k - 1], ordered[n - k]) if k else None
 
 
+# "Within 10% of the bound" is measurable when the median's 95% interval is at most this share of
+# the budget wide.
+WIDTH = 0.1
+
+
+def runs_for(cv: float, width: float = WIDTH) -> int:
+    """The runs a median needs for its 95% interval to be at most `width` of it wide, for samples
+    whose standard deviation is `cv` of their median: the median's standard error is sqrt(pi / 2)
+    sigma / sqrt(n) for normal samples, so n = (2 x 1.96 x 1.2533 x cv / width)^2, about
+    (49 cv)^2 at 10%; and never fewer than 6, the least that has a 95% interval at all."""
+    return max(6, math.ceil((2 * 1.959964 * math.sqrt(math.pi / 2) * cv / width) ** 2))
+
+
+def enough(xs: Sequence[float], limit: float, args: Input) -> bool:
+    """Whether `xs` settle a budget of `limit`: `runs` of them at least, and the 95% interval of
+    their median at most `WIDTH` of the limit wide or not taking the limit in; or `most_runs`
+    of them, settled or not (the outcome then says `settled: false`)."""
+    if len(xs) < args.runs:
+        return False
+    if len(xs) >= args.most_runs:
+        return True
+    if (interval := median_interval(xs)) is None:
+        return False
+    low, high = interval
+    return high - low <= WIDTH * abs(limit) or not low <= limit <= high
+
+
+def known(xs: Sequence[float], share: float, least: int, most: int) -> bool:
+    """Whether the median of `xs` is known to `share` of itself (its interval that narrow), with
+    `least` to `most` samples: for a ratio of two medians, each to half the width."""
+    if len(xs) < least:
+        return False
+    if len(xs) >= most:
+        return True
+    interval = median_interval(xs)
+    return interval is not None and interval[1] - interval[0] <= share * abs(statistics.median(xs))
+
+
 def outliers(xs: Sequence[float]) -> int:
     """How many of `xs` are outliers by the modified Z-score (Iglewicz and Hoaglin: |0.6745 (x -
     median) / MAD| > 3.5), as hyperfine warns of them; with a MAD of 0, every sample off the
@@ -341,9 +390,12 @@ def spread(xs: Sequence[float], unit: str, prefix: str = "") -> dict[str, report
 
 
 def timed(xs: Sequence[float], unit: str, **numbers: report.Number) -> Measured:
-    """The median of `xs` with its samples, their spread and its interval."""
-    return Measured(statistics.median(xs), numbers=dict(numbers, **{f"samples_{unit}": samples(xs)}, **spread(xs, unit)),
-                    interval=median_interval(xs))
+    """The median of `xs` with its samples, their spread, its interval, how many runs it took
+    and how many its spread needs for an interval `WIDTH` of it wide (`runs_for`)."""
+    middle = statistics.median(xs)
+    cv = statistics.stdev(xs) / abs(middle) if len(xs) > 1 and middle else 0.0
+    return Measured(middle, numbers=dict(numbers, **{f"samples_{unit}": samples(xs)}, **spread(xs, unit), runs=len(xs),
+                                         runs_needed=runs_for(cv)), interval=median_interval(xs))
 
 
 def judge(rep: report.Report, row: Row, measure: Callable[[], Measured]) -> None:
@@ -729,9 +781,6 @@ class Edits:
         return dict(median_ms=round(statistics.median(ms), 3), samples_ms=samples(ms), places=self.places,
                     compiled_each=" ".join(map(str, self.compiled)) or None, **spread(ms, "ms"))
 
-    def interval_ms(self) -> tuple[float, float] | None:
-        return median_interval([s * 1000 for s in self.seconds])
-
 
 @dataclass(frozen=True)
 class Cold:
@@ -821,13 +870,16 @@ class Lane:
             return None
         return f"{self.name}: {step}: the program blaze built says something else than cargo's: {difference(ours, cargos)}"
 
-    def edits(self, step: str, apply: Apply, revert: Revert, count: bool) -> Edits:
-        """`runs` times: the edit, a timed build (with `count`, what it compiled), and the edit
-        taken back and built. After the first, the program is checked against cargo's."""
+    def edits(self, step: str, apply: Apply, revert: Revert, count: bool, limit_ms: float | None = None) -> Edits:
+        """The edit, a timed build (with `count`, what it compiled), and the edit taken back and
+        built: `runs` times, or with `limit_ms` until the times settle it (`enough`). After the
+        first, the program is checked against cargo's."""
         seconds: list[float] = []
         compiled: list[int] = []
         places = 0
-        for n in range(self.args.runs):
+        n = 0
+        while (len(seconds) < self.args.runs if limit_ms is None
+               else not enough([s * 1000 for s in seconds], limit_ms, self.args)):
             places = apply(n)
             try:
                 took, work = self.build(f"{step} {n + 1}", count)
@@ -841,6 +893,7 @@ class Lane:
             finally:
                 revert(n)
             self.build(f"{step} {n + 1} taken back", False)
+            n += 1
         return Edits(tuple(seconds), tuple(compiled), places)
 
     def text_edit(self, file: str, make: Callable[[str, int], str]) -> tuple[Apply, Revert]:
@@ -867,9 +920,9 @@ class Lane:
 
         return apply, revert
 
-    def timed_edit(self, step: str) -> Measured:
-        e = self.edits(step, *self.bench_edit("body"), False)
-        return Measured(statistics.median(e.seconds) * 1000, numbers=e.numbers(), interval=e.interval_ms())
+    def timed_edit(self, step: str, limit_ms: float) -> Measured:
+        e = self.edits(step, *self.bench_edit("body"), False, limit_ms)
+        return timed([s * 1000 for s in e.seconds], "ms", places=e.places)
 
     def nothing_compiled(self, step: str, make: Callable[[str, int], str]) -> Measured:
         file, _ = self.anchor()
@@ -881,14 +934,17 @@ class Lane:
         return Measured(max(e.compiled), self.args.slack * e.places, f"{e.places} places changed",
                         dict(e.numbers(), slack=self.args.slack))
 
-    def noop(self) -> Measured:
+    def noop(self, limit_ms: float) -> Measured:
         self.build("the no-op build that warms up", False)
-        ms = [self.build(f"no-op build {n + 1}", False)[0] * 1000 for n in range(self.args.runs)]
+        ms: list[float] = []
+        while not enough(ms, limit_ms, self.args):
+            ms.append(self.build(f"no-op build {len(ms) + 1}", False)[0] * 1000)
         return timed(ms, "ms")
 
-    def warm_start(self) -> Measured:
+    def warm_start(self, limit_ms: float) -> Measured:
         ms: list[float] = []
-        for n in range(self.args.runs):
+        while not enough(ms, limit_ms, self.args):
+            n = len(ms)
             self.eng.stop(self.ws, self.env)
             began = time.monotonic()
             self.build(f"the first build after stopping the daemon {n + 1}", False)
@@ -910,12 +966,15 @@ class Lane:
         env = engine.scrubbed()
         times: dict[str, list[float]] = {label: [] for label in programs}
         said: dict[str, tuple[int, str]] = {}
-        for turn in range(self.args.runtime_runs + 2):
+        least, most = self.args.runtime_runs, max(self.args.runtime_runs, self.args.most_runs)
+        turn = 0
+        while turn < 2 or not all(known(xs, WIDTH / 2, least, most) for xs in times.values()):
+            turn += 1
             for label, path in programs.items():
                 ran = engine.run(f"{self.name}: {label}'s {profile} {program}", [str(path), *args], self.ws, env,
                                  RUN_SECS)
                 said.setdefault(label, (ran.returncode, ran.stdout))
-                if turn >= 2:
+                if turn > 2:
                     times[label].append(ran.seconds)
         if said["cargo"][0] != 0:
             raise engine.Failed(f"{self.name}: cargo's {profile} {program} exited {said['cargo'][0]}")
@@ -926,7 +985,8 @@ class Lane:
         return Measured(ours / cargos, 1.0 + self.args.noise,
                         numbers=dict(blaze_median_s=round(ours, 4), cargo_median_s=round(cargos, 4),
                                      blaze_samples_s=samples(times["blaze"]), cargo_samples_s=samples(times["cargo"]),
-                                     **spread(times["blaze"], "s", "blaze_"), **spread(times["cargo"], "s", "cargo_")))
+                                     **spread(times["blaze"], "s", "blaze_"), **spread(times["cargo"], "s", "cargo_"),
+                                     runs=len(times["blaze"])))
 
     def layout(self, key: str) -> Measured:
         name = TABLES[key]
@@ -1036,14 +1096,14 @@ def third_party(eng: engine.Engine, rep: report.Report, args: Input, work: Path,
             if key in rows:
                 judge(rep, rows[key], lambda: lane.layout(key))
         if "noop" in rows:
-            judge(rep, rows["noop"], lane.noop)
+            judge(rep, rows["noop"], lambda: lane.noop(rows["noop"].limit))
         if "dev-speed" in rows:
             judge(rep, rows["dev-speed"], lambda: lane.speed("debug"))
         if "release-speed" in rows:
             judge(rep, rows["release-speed"], lambda: lane.speed("release"))
         for key in ("body", "big-crate"):
             if key in rows:
-                judge(rep, rows[key], lambda: lane.timed_edit("body edit"))
+                judge(rep, rows[key], lambda: lane.timed_edit("body edit", rows[key].limit))
         if "signature" in rows:
             judge(rep, rows["signature"], lane.signature)
         if "cache-misses" in rows:
@@ -1057,7 +1117,7 @@ def third_party(eng: engine.Engine, rep: report.Report, args: Input, work: Path,
                 judge(rep, rows[key], lambda: lane.nothing_compiled(key, lambda text, n: make(text, lane.anchor()[1], n)))
         lane.items(rep, rows)
         if "warm-start" in rows:
-            judge(rep, rows["warm-start"], lane.warm_start)
+            judge(rep, rows["warm-start"], lambda: lane.warm_start(rows["warm-start"].limit))
     finally:
         lane.stop(rep)
 
@@ -1120,7 +1180,7 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
         if "cold-critical" in rows:
             judge(rep, rows["cold-critical"], critical)
         if "ci" in rows:
-            judge(rep, rows["ci"], lambda: ci(eng, args, ws, env))
+            judge(rep, rows["ci"], lambda: ci(eng, args, ws, env, rows["ci"].limit))
         for how in get_args(Restart):
             if (key := f"restart-first-answer-{how}") in rows:
                 judge(rep, rows[key], lambda: restart(eng, args, ws, env, how))
@@ -1131,7 +1191,7 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
             rep.add("blaze: stopping the daemon", "error", str(e))
 
 
-def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str]) -> Measured:
+def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], limit_s: float) -> Measured:
     tests = dict(env, BLAZE_TESTS="affected")
 
     def test(step: str) -> int:
@@ -1150,7 +1210,8 @@ def ci(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str]) -> Measur
     changes: list[Change] = [(edit.file, edit.opening, edit.opening + LET)]
     seconds: list[float] = []
     ran_tests = 0
-    for n in range(args.runs):
+    while not enough(seconds, limit_s, args):
+        n = len(seconds)
         write_edit(str(ws), varied(changes, n), False)
         try:
             began = time.monotonic()
@@ -1227,8 +1288,9 @@ def kill_group(pid: int) -> int:
 
 
 def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how: Restart) -> Measured:
-    """`runs` times: a warm no-op `blaze check`, the daemon stopped (`how`), and the first answer
-    after it, a no-op `blaze check` timed from the command to its result."""
+    """Until the first answers settle the budget (`enough`, against the limit of the warm checks so
+    far): a warm no-op `blaze check`, the daemon stopped (`how`), and the first answer after it,
+    a no-op `blaze check` timed from the command to its result."""
 
     def check(step: str) -> float:
         began = time.monotonic()
@@ -1241,11 +1303,15 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
     said = {"clean": "a clean stop", "kill9": "kill -9 of the daemon's process group"}[how]
     if args.activation:
         units("install")
+    files = source_files(ws)
+    sweeps = sys.platform == "linux"
     warm: list[float] = []
     first: list[float] = []
     try:
         check("the no-op check that warms up")
-        for n in range(args.runs):
+        while not first or not enough(first, restart_limit(statistics.median(warm), files, args.restart_slack_ms, sweeps),
+                                      args):
+            n = len(first)
             warm.append(check(f"warm no-op check {n + 1}"))
             status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
             pid = daemon_pid(status.stdout)
@@ -1259,8 +1325,6 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
     finally:
         if args.activation:
             units("uninstall")
-    files = source_files(ws)
-    sweeps = sys.platform == "linux"
     warm_ms = statistics.median(warm)
     limit = restart_limit(warm_ms, files, args.restart_slack_ms, sweeps)
     got = timed(first, "ms", warm_median_ms=round(warm_ms, 3), warm_samples_ms=samples(warm), files=files,
@@ -1271,9 +1335,33 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
                     f"{args.restart_slack_ms:.4g} ms{sweep}", got.numbers, got.interval)
 
 
+def bound_row(found: bounds.Found) -> Row:
+    """A lane's bound as a row: its budget is the bound x 1.1 (a rate's, the bound / 1.1)."""
+    b = found.bound
+    return Row(f"bound-{b.name}", "bounds", "blaze", f"{b.name}: speed of light {b.bound:g} {b.unit} ({found.where})",
+               found.budget, not b.rate, b.unit, "the bound, from the lane's arithmetic; not measured before")
+
+
+def measure_bound(eng: engine.Engine, args: Input, found: bounds.Found) -> Measured:
+    """The bound's program, beside the measured `blaze`, run until its values settle the budget."""
+    b = found.bound
+    if eng.kind == "v1":
+        raise engine.Unmeasurable(f"v1 has none of v2's components; {b.name} is v2's ({found.where})")
+    program = Path(args.engine.blaze).resolve().parent / (b.program + engine.EXE)
+    values: list[float] = []
+    while not enough(values, found.budget, args):
+        step = f"{b.name}: `{b.program}` run {len(values) + 1}"
+        ran = engine.run(step, [str(program), *b.args], engine.ROOT, engine.scrubbed(), RUN_SECS, check=True)
+        values.append(bounds.value_of(ran.stdout, step))
+    return timed(values, b.unit, bound=b.bound, where=found.where)
+
+
 def main(args: Input) -> None:
     if args.runs < 1 or args.runtime_runs < 1:
         fail(SCRIPT, f"runs and runtime_runs: at least 1, not {args.runs} and {args.runtime_runs}")
+    if args.most_runs < args.runs:
+        fail(SCRIPT, f"most_runs: at least runs ({args.runs}), not {args.most_runs}")
+    found_bounds = bounds.read_all(engine.ROOT) if "bounds" in args.budgets else []
     try:
         eng = engine.Engine.of(args.engine)
     except engine.Failed as e:
@@ -1292,8 +1380,11 @@ def main(args: Input) -> None:
             third_party(eng, rep, args, work, project, rows)
         if not args.keep:
             shutil.rmtree(work / project, ignore_errors=True)
-    rep.extra.update(work=str(work), runs=args.runs, runtime_runs=args.runtime_runs, slack=args.slack,
-                     noise=args.noise, critical_slack=args.critical_slack)
+    for found in found_bounds:
+        judge(rep, bound_row(found), lambda: measure_bound(eng, args, found))
+    rep.extra.update(work=str(work), runs=args.runs, most_runs=args.most_runs, runtime_runs=args.runtime_runs,
+                     slack=args.slack, noise=args.noise, critical_slack=args.critical_slack,
+                     bounds=len(found_bounds))
     rep.finish()
 
 
@@ -1449,6 +1540,23 @@ def selftest() -> None:
     plain = parse(Input, spec + "}", SCRIPT)
     expect(plain.restart_slack_ms == 5.0 and not plain.activation, "5 ms of slack and no activation unless given")
     expect(parse(Input, spec + ', "activation": true}', SCRIPT).activation, "the restart budget socket-activated")
+    expect([runs_for(cv) for cv in (0.0, 0.01, 0.04, 0.05, 0.07, 0.1)] == [6, 6, 6, 7, 12, 25],
+           f"runs for an interval 10% wide: {[runs_for(cv) for cv in (0.0, 0.01, 0.04, 0.05, 0.07, 0.1)]}")
+    few = parse(Input, spec + ', "runs": 6, "most_runs": 20}', SCRIPT)
+    expect(not enough([10.0] * 5, 10.0, few) and enough([10.0] * 6, 10.0, few), "6 runs at least, then a narrow interval")
+    wide = [5.0, 15.0] * 3
+    expect(not enough(wide, 10.0, few), "an interval wider than 10% that takes the budget in needs more runs")
+    expect(enough(wide * 4, 10.0, few) and len(wide * 4) >= few.most_runs, "most_runs ends it, settled or not")
+    expect(enough([1.0, 1, 1, 1, 1, 2], 10.0, few), "an interval that leaves the budget out settles it")
+    expect(not known([9.0, 11.0] * 5, 0.05, 6, 20) and known([10.0] * 6, 0.05, 6, 20),
+           "a median known to 5% of itself")
+    got_runs = timed([10.0, 10.2, 9.8, 10.1, 9.9, 10.0], "ms").numbers
+    expect(got_runs["runs"] == 6 and got_runs["runs_needed"] == 6, f"timed says the runs taken and needed: {got_runs}")
+    try:
+        parse(Input, spec + ', "most_runs": 5.0}', SCRIPT)
+        expect(False, "most_runs is a whole number")
+    except SystemExit:
+        pass
     for bad in (', "restart_slack_ms": 5}', ', "budgets": ["restart-clean"]}', ', "activation": 1}'):
         try:
             parse(Input, spec + bad, SCRIPT)

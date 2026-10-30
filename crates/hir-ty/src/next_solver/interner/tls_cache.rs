@@ -14,10 +14,9 @@
 //! shared cache is replaced by the first use in a later revision (a query's never sees one),
 //! and a cache given away is freed once no task can still hold it.
 
-use crate::db::HirDatabase;
 
 use super::DbInterner;
-use base_db::{Crate, Nonce};
+use base_db::{Db, Crate, Nonce};
 use blaze_reclaim::Limbo;
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::search_graph::GlobalCache;
@@ -121,8 +120,7 @@ static SHARED: LazyLock<Shared<Scope, Revision, Erased>> =
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
 #[inline]
 pub(super) fn shared<'db, R>(
-    // dyn: hir-ty's database handle, one call a lookup (request 4 moves it to the interner).
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Option<Crate>,
     regions: bool,
     f: impl FnOnce(&GlobalCache<DbInterner<'db>>) -> R,
@@ -403,8 +401,7 @@ const _: () = assert!(
 /// Runs `f` on the cache of the interner `solved` alone.
 #[inline]
 pub(super) fn of_query<'db, R>(
-    // dyn: hir-ty's database handle, called only by debug builds' check.
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     solved: Solved,
     f: impl FnOnce(&GlobalCache<DbInterner<'db>>) -> R,
 ) -> R {

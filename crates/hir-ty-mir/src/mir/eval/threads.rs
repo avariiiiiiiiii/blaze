@@ -11,9 +11,11 @@ use rustc_hash::FxHashMap;
 
 use super::{
     Address, Allocated, BasicBlockId, Evaluator, Interval, MirBody, MirEvalError, MirSpan,
-    Result, Running, StackFrame, Then, TlsData,
+    Result, Running, StackFrame, Then,
     machine::{EvalThread, Machine},
-    not_supported, stack_offset,
+    not_supported,
+    shim::{Resume, TlsData},
+    stack_offset,
     unwind::Unwinding,
 };
 
@@ -22,12 +24,11 @@ pub(super) enum Wait {
     /// `pthread_join`: `thread` to end. On waking, its return value (a pointer) is written to
     /// `retval` unless that is null, then `0` to the blocked call's destination.
     Join { thread: EvalThread, retval: Address },
-    /// The futex word at `addr`: woken by a `wake` of `addr` whose bitset meets `bitset`
-    /// (`u32::MAX` for a plain wait). On waking `woken` is written to the destination. When
-    /// every thread waits and this one has a `timeout`, it wakes with those bytes instead (a
-    /// timed wait times out only when nothing else can run, and the virtual clock moves to
-    /// its deadline).
-    Futex { addr: usize, bitset: u32, woken: Vec<u8>, timeout: Option<(u64, Vec<u8>)> },
+    /// A shim's wait on the object at `addr` (a futex word, a mutex, a condition variable):
+    /// woken by a `wake` of `addr` whose bitset meets `bitset` (`u32::MAX` for a plain wait),
+    /// or once the virtual clock passes `deadline`, which it moves to only when nothing else
+    /// can run. The shim goes on with `resume` ([`Evaluator::resume_shim`]) on waking.
+    Shim { addr: usize, bitset: u32, deadline: Option<u64>, resume: Resume },
 }
 
 /// The bytes of the stack region of each thread: thread `t`'s starts at `t` times this.
@@ -38,9 +39,53 @@ pub(super) fn thread_stack_span() -> usize {
 /// How many threads the addresses of the stack have room for.
 const MAX_THREADS: usize = 240;
 
-/// A pthread key made by `pthread_key_create`, with its destructor (a function pointer's
-/// bytes) if it has one; `None` once deleted.
-pub(super) type TlsKey = Option<Option<usize>>;
+/// The thread whose stack region the stack offset `offset` is in, and the position in it.
+#[inline]
+pub(super) fn stack_position(offset: usize) -> (usize, usize) {
+    let span = thread_stack_span();
+    (offset / span, offset % span)
+}
+
+/// The bytes of thread `t`'s stack: `stack`, the evaluator's own, for the running one.
+#[inline]
+pub(super) fn region<'a>(
+    stack: &'a [u8],
+    threads: &'a [Thread<'_>],
+    running: EvalThread,
+    t: usize,
+) -> Option<&'a [u8]> {
+    match t == running as usize {
+        true => Some(stack),
+        false => threads.get(t).map(|it| &it.stack[..]),
+    }
+}
+
+#[inline]
+pub(super) fn region_mut<'a>(
+    stack: &'a mut Vec<u8>,
+    threads: &'a mut [Thread<'_>],
+    running: EvalThread,
+    t: usize,
+) -> Option<&'a mut Vec<u8>> {
+    match t == running as usize {
+        true => Some(stack),
+        false => threads.get_mut(t).map(|it| &mut it.stack),
+    }
+}
+
+/// The stack allocations of thread `t`, as [`region`] its bytes.
+#[inline]
+pub(super) fn region_allocations<'a>(
+    allocations: &'a [Allocated],
+    threads: &'a [Thread<'_>],
+    running: EvalThread,
+    t: usize,
+) -> &'a [Allocated] {
+    match t == running as usize {
+        true => allocations,
+        false => threads.get(t).map_or(&[], |it| &it.stack_allocations[..]),
+    }
+}
 
 pub(super) enum Run {
     /// Not started yet: it calls `start` with `arg` when first picked.
@@ -54,16 +99,18 @@ pub(super) enum Run {
 }
 
 /// What a woken thread does as it goes on, in its own context: the machine sees the
-/// synchronization, then the writes that finish the call it blocked in.
+/// synchronization, then the call it blocked in finishes.
 #[derive(Default)]
-pub(super) struct Resume {
-    /// The futex word it acquires (`Machine::acquire`).
+struct Woken {
+    /// The object it waited on, which it acquires (`Machine::acquire`) unless it timed out.
     acquire: Option<u64>,
     /// The thread it joined (`Machine::join`).
     joined: Option<EvalThread>,
     /// A pointer to write (`retval` of a join), and the bytes of the call's result.
     pointer: Option<(Address, Address)>,
     result: Option<(Interval, Vec<u8>)>,
+    /// The shim's wait to go on with, whether it timed out, and the call's destination.
+    shim: Option<(Resume, bool, Interval)>,
 }
 
 pub(super) struct Thread<'db> {
@@ -79,7 +126,7 @@ pub(super) struct Thread<'db> {
     statics: FxHashMap<StaticId, Address>,
     unwinding: Option<Unwinding<'db>>,
     running: Option<Running<'db>>,
-    resume: Resume,
+    woken: Woken,
     /// Calls to make when its start function returns, last registered first.
     at_exit: Vec<(usize, Address)>,
     /// What its start function returned, once it did.
@@ -104,7 +151,7 @@ impl<'db> Thread<'db> {
             statics: FxHashMap::default(),
             unwinding: None,
             running: None,
-            resume: Resume::default(),
+            woken: Woken::default(),
             at_exit: Vec::new(),
             result: None,
             result_slot,
@@ -114,18 +161,6 @@ impl<'db> Thread<'db> {
         }
     }
 
-    /// The bytes of the stack of a thread that doesn't run.
-    pub(super) fn stack(&self) -> &Vec<u8> {
-        &self.stack
-    }
-
-    pub(super) fn stack_mut(&mut self) -> &mut Vec<u8> {
-        &mut self.stack
-    }
-
-    pub(super) fn stack_allocations(&self) -> &[Allocated] {
-        &self.stack_allocations
-    }
 }
 
 impl<'db, M: Machine<'db>> Evaluator<'db, M> {
@@ -183,7 +218,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .iter()
             .enumerate()
             .filter_map(|(i, thread)| match &thread.run {
-                Run::Blocked { wait: Wait::Futex { addr: at, bitset: bits, .. }, since, .. }
+                Run::Blocked { wait: Wait::Shim { addr: at, bitset: bits, .. }, since, .. }
                     if *at == addr && bits & bitset != 0 =>
                 {
                     Some((*since, i))
@@ -202,6 +237,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// `pthread_detach`: nobody joins it; an error if it was joined or detached.
     pub(super) fn detach_thread(&mut self, thread: EvalThread) -> Result<'db, ()> {
         if !self.joinable(thread) {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "detaching thread {thread}, which was joined or detached, or never made"
             )));
@@ -227,44 +263,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.yielded = true;
     }
 
-    /// A new pthread key, with the destructor `dtor` (a function pointer's bytes, `unsafe
-    /// extern "C" fn(*mut u8)`) if it has one.
-    pub(super) fn tls_create_key(&mut self, dtor: Option<usize>) -> usize {
-        self.tls_keys.push(Some(dtor));
-        self.tls_keys.len() - 1
-    }
-
-    pub(super) fn tls_delete_key(&mut self, key: usize) -> Result<'db, ()> {
-        match self.tls_keys.get_mut(key) {
-            Some(it @ Some(_)) => {
-                *it = None;
-                Ok(())
-            }
-            _ => Err(MirEvalError::UndefinedBehavior(format!("deleting invalid tls key {key}"))),
-        }
-    }
-
-    /// The running thread's value of `key`.
-    pub(super) fn tls_get(&self, key: usize) -> Result<'db, u128> {
-        self.check_tls_key(key)?;
-        Ok(self.thread_local_storage.keys.get(key).copied().unwrap_or(0))
-    }
-
-    pub(super) fn tls_set(&mut self, key: usize, value: u128) -> Result<'db, ()> {
-        self.check_tls_key(key)?;
-        let keys = &mut self.thread_local_storage.keys;
-        if keys.len() <= key {
-            keys.resize(key + 1, 0);
-        }
-        keys[key] = value;
-        Ok(())
-    }
-
-    fn check_tls_key(&self, key: usize) -> Result<'db, ()> {
-        match self.tls_keys.get(key) {
-            Some(Some(_)) => Ok(()),
-            _ => Err(MirEvalError::UndefinedBehavior(format!("using invalid tls key {key}"))),
-        }
+    /// The running thread's pthread key values and the rest the shims keep per thread.
+    pub(super) fn tls(&mut self) -> &mut TlsData {
+        &mut self.thread_local_storage
     }
 
     /// A destructor to call (`func`: a function pointer's bytes, `unsafe extern "C"
@@ -285,10 +286,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.clock
     }
 
-    /// Advances the virtual clock by `nanos` (`nanosleep`).
-    pub(super) fn sleep(&mut self, nanos: u64) {
+    /// Moves the virtual clock on by `nanos`.
+    pub(super) fn advance_clock(&mut self, nanos: u64) {
         self.clock = self.clock.saturating_add(nanos);
-        self.yield_thread();
     }
 
     /// Whether the running thread may switch: there are others, and the evaluator is in its
@@ -314,6 +314,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         if !runnable.contains(&next) {
             return Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("the machine scheduled thread {next}, which can't run").into(),
             ));
         }
@@ -338,11 +339,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub(super) fn block_call(&mut self, wait: Wait, destination: Interval) -> Result<'db, bool> {
         if let Wait::Join { thread, retval } = wait {
             let Some(joined) = self.threads.get(thread as usize) else {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "joining thread {thread}, which was never made"
                 )));
             };
             if joined.joined || joined.detached || thread == self.thread {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "joining thread {thread}, which is the running one, or joined or detached"
                 )));
@@ -362,14 +365,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let others_run = self.threads.iter().enumerate().any(|(i, thread)| {
             i != self.thread as usize && matches!(thread.run, Run::Runnable | Run::Start { .. })
         });
-        if !others_run && let Wait::Futex { timeout: Some((deadline, bytes)), .. } = &wait {
+        if !others_run && let Wait::Shim { deadline: Some(deadline), resume, .. } = wait {
             // Nothing else can run, so the wait times out now.
-            self.clock = self.clock.max(*deadline);
-            destination.write_from_bytes(self, &bytes[..destination.size.min(bytes.len())])?;
-            return Ok(false);
+            self.clock = self.clock.max(deadline);
+            self.resume_shim(resume, true, destination)?;
+            return match self.waiting.take() {
+                Some(wait) => self.block_call(wait, destination),
+                None => Ok(false),
+            };
         }
         if self.threads.len() <= 1 {
             return Err(MirEvalError::UndefinedBehavior(
+                // alloc: error path
                 "deadlock: the only thread blocks".to_owned(),
             ));
         }
@@ -402,24 +409,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return;
         };
         match wait {
-            Wait::Futex { addr, woken, timeout, .. } => {
-                let bytes = match (timed_out, timeout) {
-                    (true, Some((_, bytes))) => bytes,
-                    _ => {
-                        thread.resume.acquire = Some(addr as u64);
-                        woken
-                    }
-                };
-                thread.resume.result = Some((destination, bytes));
+            Wait::Shim { addr, resume, .. } => {
+                thread.woken.acquire = (!timed_out).then_some(addr as u64);
+                thread.woken.shim = Some((resume, timed_out, destination));
             }
             Wait::Join { thread: joined, retval } => {
-                thread.resume.joined = Some(joined);
+                thread.woken.joined = Some(joined);
                 if retval.to_usize() != 0 {
                     let result = self.threads[joined as usize].result;
                     let thread = &mut self.threads[i];
-                    thread.resume.pointer = Some((retval, result.unwrap_or(Address::invalid(0))));
+                    thread.woken.pointer = Some((retval, result.unwrap_or(Address::invalid(0))));
                 }
-                self.threads[i].resume.result = Some((destination, 0i32.to_le_bytes().to_vec()));
+                self.threads[i].woken.result = Some((destination, 0i32.to_le_bytes().to_vec()));
             }
         }
     }
@@ -453,13 +454,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.switch_thread(None, block)
     }
 
+    /// The main thread's start (`main`, a test) returned: its `at_thread_exit` destructors
+    /// run, last registered first, as glibc and dyld run them at exit; key destructors don't.
+    pub(super) fn main_returned(&mut self, body: &'db MirBody<'db>) -> Result<'db, ()> {
+        let unit = Interval::new(Address::invalid(1), 0);
+        while let Some((func, arg)) = self.at_exit.pop() {
+            self.call_fn_pointer_word(func, &[arg], unit, body, MirSpan::Unknown, Then::Nested)?;
+        }
+        Ok(())
+    }
+
     /// The next exit call of the running thread, made a frame: an `at_thread_exit`
     /// destructor, else a pthread key's destructor of a key whose value is not null (which
     /// is set to null first, as pthread does). Where it starts, if there is one.
     fn next_exit_call(&mut self) -> Result<'db, Option<BasicBlockId>> {
         let next = match self.at_exit.pop() {
             Some(it) => Some(it),
-            None => self.next_key_destructor()?,
+            None => self.next_key_destructor(),
         };
         let Some((func, arg)) = next else { return Ok(None) };
         let me = self.thread as usize;
@@ -471,19 +482,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.code_stack.push(frame);
             block
         }))
-    }
-
-    fn next_key_destructor(&mut self) -> Result<'db, Option<(usize, Address)>> {
-        for key in 0..self.tls_keys.len() {
-            let Some(Some(dtor)) = self.tls_keys[key] else { continue };
-            let value = self.thread_local_storage.keys.get(key).copied().unwrap_or(0);
-            if value == 0 {
-                continue;
-            }
-            self.thread_local_storage.keys[key] = 0;
-            return Ok(Some((dtor, Address::from_usize(value as usize))));
-        }
-        Ok(None)
     }
 
     /// Switches to another thread: `next` if the machine picked it, else (the running thread
@@ -523,7 +521,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .iter()
             .enumerate()
             .filter_map(|(i, thread)| match &thread.run {
-                Run::Blocked { wait: Wait::Futex { timeout: Some((deadline, _)), .. }, since, .. } => {
+                Run::Blocked { wait: Wait::Shim { deadline: Some(deadline), .. }, since, .. } => {
                     Some((*deadline, *since, i))
                 }
                 _ => None,
@@ -531,6 +529,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .min();
         let Some((deadline, _, i)) = timed else {
             return Err(MirEvalError::UndefinedBehavior(
+                // alloc: error path
                 "deadlock: every thread is blocked".to_owned(),
             ));
         };
@@ -567,7 +566,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.running = thread.running.take();
         self.at_exit = mem::take(&mut thread.at_exit);
         let block = thread.block;
-        let resume = mem::take(&mut thread.resume);
+        let woken = mem::take(&mut thread.woken);
         if let Run::Start { start, arg } = mem::replace(&mut thread.run, Run::Runnable) {
             let (body, span) = thread.origin;
             let slot = thread.result_slot;
@@ -580,17 +579,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.code_stack.push(frame);
             return Ok(block);
         }
-        if let Some(addr) = resume.acquire {
+        if let Some(addr) = woken.acquire {
             self.machine.acquire(addr)?;
         }
-        if let Some(joined) = resume.joined {
+        if let Some(joined) = woken.joined {
             self.machine.join(joined)?;
         }
-        if let Some((at, to)) = resume.pointer {
+        if let Some((at, to)) = woken.pointer {
             self.write_pointer(at, to)?;
         }
-        if let Some((destination, bytes)) = resume.result {
+        if let Some((destination, bytes)) = woken.result {
             destination.write_from_bytes(self, &bytes[..destination.size.min(bytes.len())])?;
+        }
+        if let Some((resume, timed_out, destination)) = woken.shim {
+            self.resume_shim(resume, timed_out, destination)?;
+            if let Some(wait) = self.waiting.take()
+                && self.block_call(wait, destination)?
+            {
+                return self.switch_thread(None, block);
+            }
         }
         Ok(block)
     }

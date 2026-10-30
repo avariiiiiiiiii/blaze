@@ -92,6 +92,7 @@ impl Edges {
     pub(crate) fn new(generation: u32) -> Edges {
         assert_ne!(generation, 0, "salsa: edge array generation 0 marks a task's empty chunk");
         Edges {
+            // alloc: setup, once per database: the edge array's page directory
             pages: (0..PAGES).map(|_| OnceLock::new()).collect(),
             len: AtomicU32::new(0),
             generation,

@@ -5,9 +5,6 @@ use span::{FileId, TextSize};
 use super::{Db, RunOrder, set_run_order};
 use crate::FileText;
 
-#[global_allocator]
-static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
-
 const fn is_shared<T: Send + Sync>() {}
 const _: () = is_shared::<Db>();
 

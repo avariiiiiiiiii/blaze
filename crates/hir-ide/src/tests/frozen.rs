@@ -4,7 +4,7 @@
 
 use std::sync::Mutex;
 
-use base_db::{Crate, SourceDatabase, all_crates};
+use base_db::{Crate, all_crates};
 use hir_def::nameres::frozen::{self as frozen_def, Frozen, Mode};
 use rustc_hash::FxHashMap;
 use test_fixture::WithFixture;

@@ -7,6 +7,7 @@
 //! bound first, and Windows cannot bind an `AF_UNIX` socket to no name.
 
 use std::{
+    cell::UnsafeCell,
     io,
     net::SocketAddr,
     os::windows::io::{AsRawSocket as _, FromRawSocket as _, OwnedSocket},
@@ -232,18 +233,18 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
 }
 
 /// An accept in flight: the socket it makes the connection on, and where it writes both
-/// ends' addresses, which stay where they are until its completion (they are boxed and kept
-/// in the request).
+/// ends' addresses, inline in the request, whose entry stays where it is until its completion
+/// (the kernel writes them meanwhile: `UnsafeCell`).
 pub(super) struct Accepting {
     pub(super) listener: Listener,
     accepted: Option<OwnedSocket>,
-    addresses: Box<[u8; 2 * ADDRESS]>,
+    addresses: UnsafeCell<[u8; 2 * ADDRESS]>,
     pub(super) stopping: bool,
 }
 
 impl Accepting {
     pub(super) fn new(listener: Listener) -> Accepting {
-        Accepting { listener, accepted: None, addresses: Box::new([0; 2 * ADDRESS]), stopping: false }
+        Accepting { listener, accepted: None, addresses: UnsafeCell::new([0; 2 * ADDRESS]), stopping: false }
     }
 
     /// Asks for the next connection, completing through `overlapped`.
@@ -251,12 +252,13 @@ impl Accepting {
         let accepted = stream(self.listener.family)?;
         let mut got = 0;
         // SAFETY: two open sockets, the address buffer of the lengths given, and an
-        // `OVERLAPPED`, which all outlive the request (see `Accepting`).
+        // `OVERLAPPED`, all in the request's entry, which is kept until the completion is
+        // taken (`Iocp::requests`).
         let ok = unsafe {
             AcceptEx(
                 raw(&self.listener.socket),
                 raw(&accepted),
-                self.addresses.as_mut_ptr().cast(),
+                self.addresses.get().cast(),
                 0,
                 ADDRESS as u32,
                 ADDRESS as u32,
@@ -309,49 +311,64 @@ fn nodelay(socket: &OwnedSocket) -> io::Result<()> {
     set(socket, IPPROTO_TCP, TCP_NODELAY, &1i32)
 }
 
-/// A connect in flight: the socket and the address, which stays where it is until its
-/// completion (boxed, kept in the request).
+/// A connect: the address, inline in the request, whose entry stays where it is until the
+/// connect's completion, and the socket, once it is asked for.
 pub(super) struct Connecting {
-    pub(super) socket: OwnedSocket,
-    address: Box<SockAddr>,
+    socket: Option<OwnedSocket>,
+    address: SockAddr,
 }
 
 impl Connecting {
-    /// A TCP connect to `at`, asked for through `overlapped`.
+    /// A TCP connect to `at`, to be asked for once the request holding it is in place.
+    pub(super) fn new(root: &Path, at: &Address) -> io::Result<Connecting> {
+        Ok(Connecting { socket: None, address: sockaddr(root, at)? })
+    }
+
+    /// The socket the connect is on, once asked for: what a cancel names.
+    pub(super) fn raw(&self) -> SOCKET {
+        self.socket.as_ref().map_or(INVALID_SOCKET, raw)
+    }
+
+    /// Asks for the connect, through `overlapped`.
     pub(super) fn start(
-        root: &Path,
-        at: &Address,
+        &mut self,
         associate: impl FnOnce(&OwnedSocket) -> io::Result<()>,
         overlapped: *mut OVERLAPPED,
-    ) -> io::Result<Connecting> {
-        let address = Box::new(sockaddr(root, at)?);
-        let socket = stream(address.family)?;
+    ) -> io::Result<()> {
+        let family = self.address.family;
+        let socket = stream(family)?;
         // `ConnectEx` takes only a bound socket: bound to any address of its family.
-        let any = match address.family {
-            AF_INET6 => Address::Tcp(SocketAddr::from(([0u16; 8], 0))),
-            _ => Address::Tcp(SocketAddr::from(([0u8; 4], 0))),
+        let any = match family {
+            AF_INET6 => SocketAddr::from(([0u16; 8], 0)),
+            _ => SocketAddr::from(([0u8; 4], 0)),
         };
-        let any = sockaddr(root, &any)?;
+        let any = sockaddr(Path::new(""), &Address::Tcp(any))?;
         // SAFETY: an open socket and an address of the length given.
         if unsafe { bind(raw(&socket), any.ptr(), any.len) } != 0 {
             return Err(last());
         }
         associate(&socket)?;
         let connect_ex = connect_ex(&socket)?;
-        // SAFETY: a bound socket, an address that outlives the request (boxed in the
-        // `Connecting` the request keeps), no data to send, and an `OVERLAPPED` that outlives
-        // it too.
+        // SAFETY: a bound socket, an address and an `OVERLAPPED` in the request's entry, which
+        // is kept until the completion is taken (`Iocp::requests`), and no data to send.
         let ok = unsafe {
-            connect_ex(raw(&socket), address.ptr(), address.len, std::ptr::null(), 0, std::ptr::null_mut(), overlapped)
+            connect_ex(
+                raw(&socket),
+                self.address.ptr(),
+                self.address.len,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                overlapped,
+            )
         };
-        pending(ok != 0)?;
-        Ok(Connecting { socket, address })
+        self.socket = Some(socket);
+        pending(ok != 0)
     }
 
     /// The connection, once the connect has completed.
     pub(super) fn take(self) -> io::Result<OwnedSocket> {
-        let Connecting { socket, address } = self;
-        drop(address);
+        let socket = self.socket.expect("a connect completed was asked for");
         // So the socket is connected in every call that asks (shutdown, its names).
         // SAFETY: a connected socket; the option takes no value.
         if unsafe { setsockopt(raw(&socket), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, std::ptr::null(), 0) } != 0 {
@@ -411,13 +428,14 @@ pub(super) fn connect_blocking(root: &Path, at: &Address) -> io::Result<OwnedSoc
     Ok(socket)
 }
 
-/// A receive into `bytes`, completing through `overlapped`; both, and `flags`, outlive the
-/// request (kept in it).
-pub(super) fn recv(socket: SOCKET, bytes: &mut [u8], flags: &mut u32, overlapped: *mut OVERLAPPED) -> io::Result<()> {
+/// A receive into `bytes`, completing through `overlapped`; both, and `flags` (which Winsock
+/// may write as it completes), are the request's, kept until its completion is taken.
+pub(super) fn recv(socket: SOCKET, bytes: &mut [u8], flags: *mut u32, overlapped: *mut OVERLAPPED) -> io::Result<()> {
     let buffer = WSABUF { len: bytes.len().min(u32::MAX as usize) as u32, buf: bytes.as_mut_ptr() };
-    *flags = 0;
+    // SAFETY: the request's flags, which nothing reads or writes while no receive is in flight.
+    unsafe { flags.write(0) };
     // SAFETY: an open socket; Winsock takes the `WSABUF` before it returns, and the bytes it
-    // names and the `OVERLAPPED` outlive the request.
+    // names, the flags and the `OVERLAPPED` are the request's, kept until its completion.
     let ok = unsafe { WSARecv(socket, &buffer, 1, std::ptr::null_mut(), flags, overlapped, None) };
     pending(ok == 0)
 }

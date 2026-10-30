@@ -30,8 +30,8 @@ use vfs::{
 };
 
 use crate::{
-    FileText, Files, FxIndexMap, SourceDatabase, SourceRoot, SourceRootId, content,
-    files::{RootContent, Writer, index_file},
+    Db, FileText, Files, FxIndexMap, SourceRoot, SourceRootId, content,
+    files::{RootContent, Roots, Writer, index_file},
 };
 
 /// One file of a view, as blaze-vfs reads it.
@@ -68,7 +68,7 @@ pub struct ViewChange {
     /// Files under the view's base taken out of their source root: the view has them no more.
     pub removed: Vec<FileId>,
     /// Of the files set or added, those whose bytes are not UTF-8: they have no text
-    /// ([`SourceDatabase::has_file_text`] is false).
+    /// ([`Db::has_file_text`] is false).
     pub no_text: Vec<FileId>,
     /// Source roots whose files were added or removed: a crate root may have come or gone.
     pub roots: Vec<SourceRootId>,
@@ -115,6 +115,7 @@ impl std::error::Error for ViewError {}
 ///
 /// Per path: its text once, its file, and a 4-byte mark of the last call that saw it, so
 /// finding the paths a view lacks is a pass over the marks.
+#[derive(Default)]
 pub(crate) struct ViewIndex {
     paths: FxIndexMap<Box<str>, FileId>,
     seen: Vec<u32>,
@@ -122,8 +123,8 @@ pub(crate) struct ViewIndex {
 }
 
 impl ViewIndex {
-    pub(crate) fn new(base: &VfsPath, by_path: &FxHashMap<VfsPath, FileId>) -> ViewIndex {
-        let mut index = ViewIndex { paths: FxIndexMap::default(), seen: Vec::new(), call: 0 };
+    pub(crate) fn new(base: &AbsPath, by_path: &FxHashMap<VfsPath, FileId>) -> ViewIndex {
+        let mut index = ViewIndex::default();
         for (path, &file) in by_path {
             index.note(base, path, file);
         }
@@ -131,8 +132,8 @@ impl ViewIndex {
     }
 
     /// Notes that a source root names `file` at `path`, if `path` is under `base`.
-    pub(crate) fn note(&mut self, base: &VfsPath, path: &VfsPath, file: FileId) {
-        let Some(rel) = path.strip_prefix(base) else { return };
+    pub(crate) fn note(&mut self, base: &AbsPath, path: &VfsPath, file: FileId) {
+        let Some(rel) = path.as_path().and_then(|path| path.strip_prefix(base)) else { return };
         let rel = rel_key(rel.as_str());
         if rel.is_empty() {
             return;
@@ -219,17 +220,32 @@ impl Files {
     /// against its bytes before anything is written, and a mismatch refuses the whole view.
     pub fn set_view_root(
         &self,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         view: ViewRoot<'_>,
     ) -> Result<ViewChange, ViewError> {
         let mut writer = self.lock();
-        let base = VfsPath::from(view.base.to_path_buf());
-        let mut index = match writer.views.remove(&base) {
-            Some(index) => index,
-            None => ViewIndex::new(&base, &writer.by_path),
+        // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
+        let normalized;
+        let base = match view.base.components().any(|it| matches!(it.as_str(), "." | "..")) {
+            true => {
+                // alloc: only for a base with a `.` or `..` part.
+                normalized = view.base.normalize();
+                &*normalized
+            }
+            false => view.base,
+        };
+        let mut index = match writer.views.get_mut(base) {
+            Some(index) => std::mem::take(index),
+            None => ViewIndex::new(base, &writer.by_path),
         };
         let plan = self.plan_view(&writer, &mut index, &view);
-        writer.views.insert(base, index);
+        match writer.views.get_mut(base) {
+            Some(slot) => *slot = index,
+            None => {
+                // alloc: the base's key, once per view base.
+                writer.views.insert(base.to_path_buf(), index);
+            }
+        }
         Ok(self.write_view(&mut writer, db, &view, plan?))
     }
 
@@ -243,18 +259,20 @@ impl Files {
         let call = index.begin();
         let mut fresh: FxHashSet<&str> = FxHashSet::default();
         let mut plan =
-            Plan { writes: Vec::new(), added: Vec::new(), removed: Vec::new(), next_file: writer.next_file };
+            Plan { writes: Vec::new(), added: Vec::new(), removed: Vec::new(), next_file: writer.next_file }; // alloc: none until a file changed.
         for (at, file) in view.files.iter().enumerate() {
             check_path(file.path)?;
             let known = match index.find(file.path) {
                 Some(slot) => {
                     if !index.mark(slot, call) {
+                        // alloc: the refusal's message (an error path).
                         return Err(ViewError::Duplicate(file.path.to_owned()));
                     }
                     Some(index.file(slot))
                 }
                 None => {
                     if !fresh.insert(file.path) {
+                        // alloc: the refusal's message (an error path).
                         return Err(ViewError::Duplicate(file.path.to_owned()));
                     }
                     None
@@ -262,7 +280,7 @@ impl Files {
             };
             let in_root = known.and_then(|id| writer.roots_of(id).first().copied());
             if let (Some(id), Some(_)) = (known, in_root)
-                && writer.view_ids.get(&id) == Some(&file.file.id)
+                && writer.view_ids.get(id) == Some(&file.file.id)
             {
                 continue;
             }
@@ -275,12 +293,14 @@ impl Files {
                         .classify_path(&path)
                         .map_or(view.other, |set| SourceRootId(set as u32));
                     if !self.has_source_root(root) {
+                        // alloc: the refusal's message (an error path).
                         return Err(ViewError::NoSourceRoot { path: file.path.to_owned(), root });
                     }
                     let id = match known {
                         Some(id) => id,
                         None => self
                             .unused_file_id(writer, &mut plan.next_file)
+                            // alloc: the refusal's message (an error path).
                             .ok_or_else(|| ViewError::NoFileId(file.path.to_owned()))?,
                     };
                     plan.added.push((id, root, path));
@@ -290,12 +310,14 @@ impl Files {
             plan.writes.push(Write { at, id, root, added });
         }
 
+        // alloc: one list per call, of the changed files only (empty, no allocation, when none is).
         let bytes: Vec<&[u8]> = plan.writes.iter().map(|it| view.files[it.at].file.bytes).collect();
         let ids = ContentId::of_many(blaze_vfs::FILE_DOMAIN, &bytes);
         for (write, &bytes) in plan.writes.iter().zip(&ids) {
             let file = &view.files[write.at];
             if bytes != file.file.id {
                 return Err(ViewError::Mismatch {
+                    // alloc: the refusal's message (an error path).
                     path: file.path.to_owned(),
                     given: file.file.id,
                     bytes,
@@ -310,7 +332,7 @@ impl Files {
                 true => Some(Cow::Borrowed("")),
                 false => Some(rel_key(built.strip_prefix(view.base)?.as_str())),
             })
-            .collect();
+            .collect(); // alloc: one per call, an entry per `built` directory.
         for (rel, id) in index.unseen(call) {
             if built.iter().any(|built| under(rel, built)) {
                 continue;
@@ -324,7 +346,7 @@ impl Files {
     fn write_view(
         &self,
         writer: &mut Writer,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         view: &ViewRoot<'_>,
         plan: Plan,
     ) -> ViewChange {
@@ -333,8 +355,10 @@ impl Files {
             .writes
             .iter()
             .map(|it| std::str::from_utf8(view.files[it.at].file.bytes).ok())
-            .collect();
+            .collect(); // alloc: per call, of the changed files only.
+        // alloc: per call, of the changed files only.
         let mut bytes = Vec::new();
+        // alloc: per call, of the changed files only.
         let mut ranges = Vec::new();
         for (write, text) in plan.writes.iter().zip(&texts) {
             if text.is_none() {
@@ -347,7 +371,7 @@ impl Files {
         }
         let mut contents = content::hash_ranges(FileText::DOMAIN, &bytes, &ranges).into_iter();
 
-        let mut changed_roots = Vec::new();
+        let mut changed_roots = Roots::new();
         for (write, text) in plan.writes.iter().zip(texts) {
             let content = match text {
                 Some(_) => contents.next().expect("a text ID for each file with text"),
@@ -395,7 +419,7 @@ impl Files {
             .iter()
             .map(|it| it.1)
             .chain(plan.removed.iter().map(|it| it.0))
-            .collect();
+            .collect(); // alloc: per call, the roots that gained or lost a file.
         radix::sort_copy_by_key(&mut roots, |it| it.0);
         roots.dedup();
         self.write_root_files(writer, db, &plan, &roots, &mut changed_roots);
@@ -403,7 +427,7 @@ impl Files {
         writer.named.publish(db);
 
         for &(_, id) in &plan.removed {
-            writer.view_ids.remove(&id);
+            writer.view_ids.remove(id);
             change.removed.push(id);
         }
         for write in &plan.writes {
@@ -425,24 +449,27 @@ impl Files {
     fn write_root_files(
         &self,
         writer: &mut Writer,
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         plan: &Plan,
         roots: &[SourceRootId],
-        changed: &mut Vec<SourceRootId>,
+        changed: &mut Roots,
     ) {
+        // alloc: per added file, hashed in one batch.
         let keys: Vec<Vec<u8>> = plan.added.iter().map(|(_, _, path)| content::path_key(path)).collect();
+        // alloc: per added file, hashed in one batch.
         let key_bytes: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
         let path_hashes = ContentId::of_many(SourceRoot::PATH_DOMAIN, &key_bytes);
         let mut keys: Vec<Option<(Box<[u8]>, u8)>> = keys
             .into_iter()
             .zip(&path_hashes)
             .map(|(key, hash)| Some((key.into_boxed_slice(), RootContent::bucket(hash))))
-            .collect();
+            .collect(); // alloc: as above.
 
         for &root in roots {
             let input = self.source_root(root);
             let old = input.source_root(&*db);
             let gone: FxHashSet<FileId> =
+                // alloc: per root that lost a file.
                 plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1).collect();
             let mut files = FileSet::default();
             for id in old.iter() {
@@ -450,6 +477,7 @@ impl Files {
                     continue;
                 }
                 if let Some(path) = old.path_for_file(&id) {
+                    // clone: `vfs::FileSet` has no remove, so a root that gains or loses a file is rebuilt (lane vfs).
                     files.insert(id, path.clone());
                 }
             }
@@ -464,12 +492,13 @@ impl Files {
                 if *added_root != root {
                     continue;
                 }
+                // clone: an added file's path in the new set.
                 files.insert(*id, path.clone());
                 let (key, bucket) = keys[at].take().expect("an added file is put in one root");
                 index.insert(*id, key, bucket, self.entry_content(&*db, *id));
             }
             for &id in &gone {
-                if let Some(roots) = writer.in_roots.get_mut(&id) {
+                if let Some(roots) = writer.in_roots.get_mut(id) {
                     roots.retain(|it| *it != root);
                 }
             }
@@ -477,7 +506,7 @@ impl Files {
                 if *added_root != root {
                     continue;
                 }
-                let roots = writer.in_roots.entry(*id).or_default();
+                let roots = writer.in_roots.slot(*id).get_or_insert_default();
                 if !roots.contains(&root) {
                     roots.push(root);
                 }
@@ -487,6 +516,7 @@ impl Files {
                 true => SourceRoot::new_library(files),
                 false => SourceRoot::new_local(files),
             };
+            // alloc: the root's new file set, as above.
             input.set_source_root_field(db).with_durability(Durability::MEDIUM).to(Arc::new(new));
             if !changed.contains(&root) {
                 changed.push(root);
@@ -512,6 +542,7 @@ fn check_path(path: &str) -> Result<(), ViewError> {
     let bad = path.is_empty()
         || path.starts_with('/')
         || path.split('/').any(|part| part.is_empty() || part == "." || part == "..");
+    // alloc: the refusal's message (an error path).
     if bad { Err(ViewError::BadPath(path.to_owned())) } else { Ok(()) }
 }
 

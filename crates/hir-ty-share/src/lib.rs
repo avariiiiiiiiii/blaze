@@ -36,6 +36,7 @@ mod tests;
 
 use std::fmt;
 
+use base_db::Db;
 use blaze_ids::{ContentId, Fingerprint};
 use hir_def::FunctionId;
 use hir_ty::{
@@ -210,7 +211,7 @@ impl fmt::Display for Unshared {
 /// The share key of `instance` in `env`, with its body under each of `options`: equal keys of
 /// two instances of one body mean their code is the same.
 pub fn share_key<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &ShareInstance,
     env: &StoredParamEnvAndCrate,
     options: BodyOptions,

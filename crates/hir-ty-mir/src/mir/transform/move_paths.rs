@@ -15,6 +15,7 @@ use rustc_type_ir::inherent::IntoKind;
 use smallvec::SmallVec;
 
 use crate::{
+    db::HirDatabase,
     consteval::try_const_usize,
     mir::{
         BasicBlockId, BorrowKind, FieldIndex, LocalId, MirBody, OperandKind, Place, PlaceElem,

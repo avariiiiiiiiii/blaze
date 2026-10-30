@@ -922,6 +922,7 @@ impl ExpressionStoreSourceMap {
 
 #[cfg(test)]
 pub(in crate::expr_store) mod tests {
+    use blaze_ids::rng::SplitMix64;
     use rustc_hash::FxHashMap;
     use salsa::plumbing::FromId;
     use smallvec::SmallVec;
@@ -952,23 +953,11 @@ pub(in crate::expr_store) mod tests {
         InFile::new(file_id, ptr.expect("a pointer of its type"))
     }
 
-    /// xorshift64*: the same pushes on every run.
-    pub(in crate::expr_store) struct Seeded(pub(in crate::expr_store) u64);
-
-    impl Seeded {
-        pub(in crate::expr_store) fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
-        }
-    }
-
     const EXPR_KINDS: [SyntaxKind; 3] =
         [SyntaxKind::PATH_EXPR, SyntaxKind::CALL_EXPR, SyntaxKind::LITERAL];
 
     /// A pointer from a small domain, so that pushes repeat keys.
-    fn seeded_src(rng: &mut Seeded) -> ExprSource {
+    fn seeded_src(rng: &mut SplitMix64) -> ExprSource {
         let start = rng.below(8) as u32;
         let end = start + rng.below(4) as u32;
         let kind = EXPR_KINDS[rng.below(3) as usize];
@@ -983,7 +972,7 @@ pub(in crate::expr_store) mod tests {
     #[test]
     fn a_source_table_answers_as_a_hash_map_does() {
         for seed in 0..64 {
-            let mut rng = Seeded(seed * 2 + 1);
+            let mut rng = SplitMix64::new(seed);
             let mut pushed = Vec::new();
             let mut model = FxHashMap::default();
             for value in 0..rng.below(300) as u32 {
@@ -1040,7 +1029,7 @@ pub(in crate::expr_store) mod tests {
     /// Seeded pushes for an arena of `len` ids: ids pushed twice, ids never pushed, runs of ids
     /// in one file, macro files between.
     fn seeded_back_pushes(
-        rng: &mut Seeded,
+        rng: &mut SplitMix64,
         len: u32,
     ) -> Vec<(ExprId, InFile<AstPtr<Either<ast::Expr, ast::Pat>>>)> {
         let mut pushes = Vec::new();
@@ -1088,7 +1077,7 @@ pub(in crate::expr_store) mod tests {
     fn a_back_map_answers_as_its_pushes_do() {
         let mut scratch = FreezeScratch::default();
         for seed in 0..64 {
-            let mut rng = Seeded(seed * 2 + 1);
+            let mut rng = SplitMix64::new(seed);
             let len = rng.below(200) as u32 + 1;
             let pushes = seeded_back_pushes(&mut rng, len);
             let mut pushed = BackPushes::default();
@@ -1123,7 +1112,7 @@ pub(in crate::expr_store) mod tests {
             SyntaxNodePtr::from_parts(ptr.kind(), ptr.text_range() + TextSize::from(100))
         };
         for seed in 0..32 {
-            let mut rng = Seeded(seed * 2 + 1);
+            let mut rng = SplitMix64::new(seed);
             let len = rng.below(100) as u32 + 1;
             let pushes = seeded_back_pushes(&mut rng, len);
             let mut pushed = BackPushes::default();
@@ -1139,7 +1128,7 @@ pub(in crate::expr_store) mod tests {
     #[test]
     fn binding_patterns_are_their_pushes_in_order() {
         for seed in 0..64 {
-            let mut rng = Seeded(seed * 2 + 1);
+            let mut rng = SplitMix64::new(seed);
             let bindings = rng.below(50) as u32;
             let mut pushed = Vec::new();
             if bindings > 0 {

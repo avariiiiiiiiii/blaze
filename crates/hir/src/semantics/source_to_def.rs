@@ -87,7 +87,7 @@
 
 use std::sync::Arc;
 
-use base_db::{Crate, relevant_crates};
+use base_db::{Db, Crate, relevant_crates};
 use either::Either;
 use hir_def::{
     AdtId, BlockId, BuiltinDeriveImplId, ConstId, ConstParamId, DefWithBodyId, EnumId,
@@ -137,7 +137,7 @@ pub(super) struct SourceToDefCache<'db> {
 /// package is in the source root of each of its targets, and each would otherwise have its
 /// module tree built.
 fn crates_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     within: Option<&FxHashSet<Crate>>,
     file: FileId,
 ) -> [Vec<Crate>; 2] {
@@ -159,7 +159,7 @@ impl<'db> SourceToDefCache<'db> {
 
     pub(super) fn get_or_insert_include_for(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         file: EditionedFileId,
     ) -> Option<MacroCallId> {
         if let Some(&m) = self.included_file_cache.get(&file) {
@@ -181,7 +181,7 @@ impl<'db> SourceToDefCache<'db> {
 
     pub(super) fn get_or_insert_expansion(
         &mut self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         macro_file: MacroCallId,
     ) -> &ExpansionInfo<'db> {
         self.expansion_info_cache.entry(macro_file).or_insert_with(|| {
@@ -208,7 +208,7 @@ impl<'db> SourceToDefCache<'db> {
 }
 
 pub(super) struct SourceToDefCtx<'db, 'cache> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) cache: &'cache mut SourceToDefCache<'db>,
 }
 
@@ -777,7 +777,7 @@ impl_from! {
 }
 
 impl ChildContainer {
-    fn child_by_source(self, db: &dyn HirDatabase, file_id: HirFileId) -> DynMap {
+    fn child_by_source(self, db: &Db, file_id: HirFileId) -> DynMap {
         let _p = tracing::info_span!("ChildContainer::child_by_source").entered();
         match self {
             ChildContainer::DefWithBodyId(it) => it.child_by_source(db, file_id),

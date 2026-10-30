@@ -127,6 +127,7 @@ impl<T: Record> Mapped<T> {
     /// any value is interned; the image stays mapped until the process exits. On an error no
     /// value was restored, so no section naming these IDs may be used.
     pub fn restore<S: Stable>(&'static self, image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+        // alloc: once a restore, so the image outlives every ID read from it
         let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
         Table::restore_into(&self.table, Self::shape(), image, self.section(), self.schema(), jobs)
     }

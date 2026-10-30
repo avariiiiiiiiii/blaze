@@ -25,7 +25,7 @@ use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr,
+    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
     ast::{self, HasModuleItem},
 };
 
@@ -35,12 +35,17 @@ use crate::cx::Cx;
 pub(super) type DefIdx = u32;
 
 /// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(super) struct Bits(Vec<u64>);
 
 impl Bits {
     pub(super) fn new(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)])
+        Bits(vec![0; len.div_ceil(64)]) // alloc: setup, one buffer per set, sized once
+    }
+
+    /// A copy of the set, for `mark`'s pre-deferred liveness.
+    pub(super) fn snapshot(&self) -> Bits {
+        Bits(self.0.clone()) // clone: once per crate, rustc's pre-deferred summary
     }
 
     #[inline]
@@ -213,21 +218,24 @@ pub(super) struct Defs {
     /// (the front end keeps no `global_asm!`), or a `pub macro` makes the items of its module
     /// reachable (`update_reachability_from_macro`, not ported).
     pub(super) unported: bool,
+    /// Some definition is in a closure or an anonymous constant ([`Parent::Anon`]), so which of
+    /// those are walked matters.
+    pub(super) in_anon: bool,
 }
 
 impl Defs {
     pub(super) fn of(cx: &Cx<'_, '_>) -> Defs {
         let mut walk = Walk {
             cx,
-            defs: Vec::new(),
+            defs: Vec::new(), // alloc: setup, the crate's tables, once per crate
             ids: FxHashMap::default(),
-            edges: Vec::new(),
-            modules: Vec::new(),
-            module_of: Vec::new(),
-            trait_items: Vec::new(),
-            impl_items: Vec::new(),
-            free_owners: Vec::new(),
-            foreign_owners: Vec::new(),
+            edges: Vec::new(), // alloc: setup, once per crate
+            modules: Vec::new(), // alloc: setup, once per crate
+            module_of: Vec::new(), // alloc: setup, once per crate
+            trait_items: Vec::new(), // alloc: setup, once per crate
+            impl_items: Vec::new(), // alloc: setup, once per crate
+            free_owners: Vec::new(), // alloc: setup, once per crate
+            foreign_owners: Vec::new(), // alloc: setup, once per crate
             derives: FxHashMap::default(),
             scopes: FxHashSet::default(),
             unported: false,
@@ -257,17 +265,19 @@ impl Defs {
         owners.extend(walk.trait_items);
         owners.extend(walk.impl_items);
         owners.extend(walk.foreign_owners);
+        let in_anon = walk.defs.iter().any(|it| matches!(it.parent, Parent::Anon(_)));
         let mut defs = Defs {
             defs: walk.defs,
             ids: walk.ids,
             child_at,
             child_list,
-            impls: Vec::new(),
+            impls: Vec::new(), // alloc: empty until `resolve_impls` fills it below
             modules: walk.modules,
             module_ids,
             module_of: walk.module_of,
             owners,
             unported: walk.unported,
+            in_anon,
         };
         defs.impls = defs.resolve_impls(cx);
         defs
@@ -276,7 +286,7 @@ impl Defs {
     /// What each impl's trait and self type are, one query each.
     fn resolve_impls(&self, cx: &Cx<'_, '_>) -> Vec<ImplOf> {
         let db = cx.db;
-        let mut impls = Vec::new();
+        let mut impls = Vec::new(); // alloc: setup, once per crate
         for def in self.all() {
             let of = match self[def].id {
                 Id::Impl(id) => {
@@ -354,15 +364,15 @@ impl std::ops::Index<DefIdx> for Defs {
 /// The CSR of `edges` (owner, child), each owner's children in the order they were added: a
 /// counting sort by owner, two passes.
 fn csr(len: usize, edges: &[(DefIdx, DefIdx)]) -> (Vec<u32>, Vec<DefIdx>) {
-    let mut at = vec![0u32; len + 1];
+    let mut at = vec![0u32; len + 1]; // alloc: setup, the CSR's offsets, once per crate
     for &(owner, _) in edges {
         at[owner as usize + 1] += 1;
     }
     for i in 0..len {
         at[i + 1] += at[i];
     }
-    let mut next: Vec<u32> = at[..len].to_vec();
-    let mut list = vec![0; edges.len()];
+    let mut next: Vec<u32> = at[..len].to_vec(); // alloc: setup, the sort's cursors, once per crate
+    let mut list = vec![0; edges.len()]; // alloc: setup, the CSR's list, once per crate
     for &(owner, child) in edges {
         let slot = &mut next[owner as usize];
         list[*slot as usize] = child;
@@ -447,7 +457,7 @@ impl Walk<'_, '_, '_> {
                         }
                     }
                 }
-                _ => self.node(file, &child, inner),
+                _ => self.node(file, child, inner),
             }
         }
     }
@@ -465,38 +475,38 @@ impl Walk<'_, '_, '_> {
 
     /// `node`, inside the item whose nested items have `parent`: dispatched on its kind, so that
     /// a node that is no item, macro call or anonymous definition costs its children's walk.
-    fn node(&mut self, file: HirFileId, node: &SyntaxNode, parent: Parent) {
+    fn node(&mut self, file: HirFileId, node: SyntaxNode, parent: Parent) {
         let kind = node.kind();
-        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, node) {
+        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, &node) {
             return;
         }
-        if is_item(node) {
+        if is_item(&node) {
             if kind == SyntaxKind::ASM_EXPR {
-                self.global_asm(node);
-            } else if let Some(item) = ast::Item::cast(node.clone()) {
+                self.global_asm(&node);
+            } else if let Some(item) = ast::Item::cast(node) {
                 self.item(InFile::new(file, item), Container::Module, parent);
             }
             return;
         }
         if kind == SyntaxKind::MACRO_CALL {
-            let Some(call) = ast::MacroCall::cast(node.clone()) else { return };
+            let Some(call) = ast::MacroCall::cast(node) else { return };
             let Some(expansion) = self.expand(InFile::new(file, &call)) else { return };
             match expansion.value.kind() {
                 SyntaxKind::MACRO_ITEMS | SyntaxKind::MACRO_STMTS => {
                     for child in expansion.value.children() {
-                        self.node(expansion.file_id, &child, parent);
+                        self.node(expansion.file_id, child, parent);
                     }
                 }
-                _ => self.node(expansion.file_id, &expansion.value, parent),
+                _ => self.node(expansion.file_id, expansion.value, parent),
             }
             return;
         }
-        let parent = match is_anon(node) {
-            true => Parent::Anon(InFile::new(file, SyntaxNodePtr::new(node))),
+        let parent = match is_anon(&node) {
+            true => Parent::Anon(anon_key(file, &node)),
             false => parent,
         };
         for child in node.children() {
-            stdx::ensure_sufficient_stack(|| self.node(file, &child, parent));
+            stdx::ensure_sufficient_stack(|| self.node(file, child, parent));
         }
     }
 
@@ -735,8 +745,7 @@ impl Walk<'_, '_, '_> {
 /// Whether the visibility of `node` is written `pub`, with no restriction: rustc's
 /// `local_visibility` is `Visibility::Public` for what has a visibility of its own.
 fn written_pub(node: &SyntaxNode) -> bool {
-    let vis = ast::AnyHasVisibility::cast(node.clone()).and_then(|it| ast::HasVisibility::visibility(&it));
-    vis.is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub))
+    node.children().find_map(ast::Visibility::cast).is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub))
 }
 
 /// Whether `node` is an item of HIR's: an item, an associated item or an item of an `extern`
@@ -758,9 +767,9 @@ fn is_item(node: &SyntaxNode) -> bool {
 pub(super) fn is_anon(node: &SyntaxNode) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
-        SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| {
-            it.const_token().is_some() || it.async_token().is_some() || it.gen_token().is_some()
-        }),
+        SyntaxKind::BLOCK_EXPR => {
+            node.children_with_tokens().any(|it| matches!(it.kind(), T![const] | T![async] | T![gen]))
+        }
         kind if !ast::Expr::can_cast(kind) => false,
         _ => match node.parent() {
             Some(parent) => match parent.kind() {
@@ -776,6 +785,31 @@ pub(super) fn is_anon(node: &SyntaxNode) -> bool {
     }
 }
 
+/// What a closure or an anonymous constant is known by: its node inside any parentheses, which
+/// is the node the front end maps the expression back to.
+pub(super) fn anon_key(file: HirFileId, node: &SyntaxNode) -> InFile<SyntaxNodePtr> {
+    let inner = |node: &SyntaxNode| {
+        (node.kind() == SyntaxKind::PAREN_EXPR)
+            .then(|| node.children().find(|it| ast::Expr::can_cast(it.kind())))
+            .flatten()
+    };
+    let mut ptr = SyntaxNodePtr::new(node);
+    let mut next = inner(node);
+    while let Some(node) = next {
+        ptr = SyntaxNodePtr::new(&node);
+        next = inner(&node);
+    }
+    InFile::new(file, ptr)
+}
+
+/// `node` as `N`, if it is one. rowan's `cast` takes the node by value, and a `SyntaxNode` clone
+/// is a reference count, with no allocation; the kind is tested first, so a node of another
+/// kind costs nothing.
+pub(super) fn cast<N: AstNode>(node: &SyntaxNode) -> Option<N> {
+    // clone: a refcount, no allocation; `cast` takes the node by value.
+    if N::can_cast(node.kind()) { N::cast(node.clone()) } else { None }
+}
+
 /// Whether the `cfg`s of `node`, an attribute owner, keep it, its `cfg_attr`s expanded. A node's
 /// attributes are its first children, so one without an attribute first has none and costs one
 /// step.
@@ -783,7 +817,7 @@ fn enabled(cx: &Cx<'_, '_>, node: &SyntaxNode) -> bool {
     if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
         return true;
     }
-    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return true };
+    let Some(owner) = cast::<ast::AnyHasAttrs>(node) else { return true };
     let cfg = cx.krate.cfg(cx.db);
     let off = hir_expand::attrs::expand_cfg_attr(
         ast::HasAttrs::attrs(&owner),

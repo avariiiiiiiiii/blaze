@@ -15,13 +15,13 @@
 //! Each [`Finding`] is on one [`Side`]: over (the build reran more than the facts say), under
 //! (less: stale), or unmeasured (the traces hold no key of a kind the case counts).
 
-use std::{collections::BTreeMap, ops::RangeInclusive};
+use std::ops::RangeInclusive;
 
 use blaze_ids::Fingerprint;
 use blaze_query::{QueryKey, QueryKind};
 use serde::Serialize;
 
-use crate::{Apart, Stale, Trace, apart, over, under};
+use crate::{Stale, Trace, same_edges, under};
 
 /// The kinds the cases read. Kind numbers are a schema: one number is one query for every
 /// blaze, never given to another, so these are the defining crates' numbers.
@@ -35,17 +35,10 @@ pub mod kinds {
     /// `blaze_items::kinds::RESOLVES`: what a name is in a scope, globs included.
     pub const RESOLVES: QueryKind = QueryKind(0x1005);
 
-    // hir-def's resolver (`crates/hir-def/src/nameres/facts`), each named as in the shared brief
-    // of lane frontend-nameres and docs/v2/plan/lanes/frontend/nameres.md section 3.
+    // hir-def's resolver: the numbers of `hir_def::nameres::kinds`
+    // (`crates/hir-def/src/nameres/facts/kinds.rs`) the cases name.
     /// `module_decls`: one module's round-0 declarations. Names no round.
     pub const MODULE_DECLS: QueryKind = QueryKind(0x2200);
-    pub const LEGACY_EXPORTS: QueryKind = QueryKind(0x2201);
-    pub const SUBTREE_MACRO_EXPORTS: QueryKind = QueryKind(0x2202);
-    pub const MODULE_ROUND: QueryKind = QueryKind(0x2203);
-    pub const IMPORT_SHAPE: QueryKind = QueryKind(0x2204);
-    pub const PARTITION: QueryKind = QueryKind(0x2205);
-    pub const MODULE_ROWS: QueryKind = QueryKind(0x2206);
-    pub const LATEST: QueryKind = QueryKind(0x2207);
     pub const SCC_STATE: QueryKind = QueryKind(0x2208);
     pub const FACT_HANDLE: QueryKind = QueryKind(0x2209);
     pub const MACRO_STEP: QueryKind = QueryKind(0x220a);
@@ -54,22 +47,9 @@ pub mod kinds {
     /// `module_impls`: one module's impls in declaration order. Names no round.
     pub const MODULE_IMPLS: QueryKind = QueryKind(0x220c);
 
-    /// Every query of the resolver.
-    pub const RESOLVER: &[QueryKind] = &[
-        MODULE_DECLS,
-        LEGACY_EXPORTS,
-        SUBTREE_MACRO_EXPORTS,
-        MODULE_ROUND,
-        IMPORT_SHAPE,
-        PARTITION,
-        MODULE_ROWS,
-        LATEST,
-        SCC_STATE,
-        FACT_HANDLE,
-        MACRO_STEP,
-        MODULE_SCOPE_NAME,
-        MODULE_IMPLS,
-    ];
+    /// The numbers the resolver may give (`hir_def::nameres::kinds::RANGE`): every one of its
+    /// queries, those it adds later included.
+    pub const RESOLVER: std::ops::Range<u16> = 0x2200..0x2240;
 }
 
 /// What a case says of one kind of key: how many keys of it with a result in both the build
@@ -184,13 +164,14 @@ pub enum Finding {
     /// Neither trace has a result of a kind the case counts.
     Unrecorded { what: &'static str, kind: QueryKind },
     /// Kept by the incremental build though `read`, of a kind the case watches, is not what it
-    /// saw (`now`, `None` when the build has no result for it): its reader did not rerun.
+    /// saw (`now`, `None` when the build has no result for it): its reader did not rerun
+    /// ([`Stale::Unverified`] of a watched read).
     Kept { query: QueryKey, read: QueryKey, saw: Fingerprint, now: Option<Fingerprint> },
     /// Ran in the incremental build though everything it read in the build before is as it was.
     Unexplained { query: QueryKey },
-    /// Ran and read and made what it did before ([`over`]).
+    /// Ran, read and made what it did before ([`crate::over`]'s needless).
     Needless { query: QueryKey },
-    /// Stale against the build from scratch ([`under`]).
+    /// A watched result stale against the build from scratch ([`under`]).
     Stale(Stale),
 }
 
@@ -211,70 +192,85 @@ fn of_kind(trace: &Trace, kind: QueryKind) -> std::ops::Range<usize> {
     start..start + trace.keys[start..].partition_point(|k| k.kind == kind)
 }
 
-fn results(trace: &Trace, kind: QueryKind) -> BTreeMap<QueryKey, Fingerprint> {
-    of_kind(trace, kind).filter_map(|i| Some((trace.keys[i], trace.result(i as u32)?))).collect()
+/// The keys of `kind` with a result in both traces whose fingerprints differ, in key order, and
+/// whether either trace has a result of the kind: [`crate::apart`]'s `Differ`s over the two runs of
+/// the kind, by one merge of the sorted columns with nothing allocated but the answer.
+fn differ(before: &Trace, after: &Trace, kind: QueryKind) -> (Vec<QueryKey>, bool) {
+    let (xs, ys) = (of_kind(before, kind), of_kind(after, kind));
+    let any = xs.clone().any(|i| before.has.get(i as u32)) || ys.clone().any(|i| after.has.get(i as u32));
+    let (mut x, mut y) = (xs.start, ys.start);
+    let mut keys = Vec::new();
+    while x < xs.end && y < ys.end {
+        match before.keys[x].cmp(&after.keys[y]) {
+            std::cmp::Ordering::Less => x += 1,
+            std::cmp::Ordering::Greater => y += 1,
+            std::cmp::Ordering::Equal => {
+                if let (Some(was), Some(now)) = (before.result(x as u32), after.result(y as u32))
+                    && was != now
+                {
+                    keys.push(before.keys[x]);
+                }
+                x += 1;
+                y += 1;
+            }
+        }
+    }
+    (keys, any)
 }
 
 /// Where `before`, `incremental` and `scratch` are not what `case` says, in this order: the
-/// counts of its [`Expect`]s, then results kept though a watched read changed, results rerun
-/// for no change, reruns for nothing and stale results. A kind is watched when the case counts
-/// it or it is the resolver's ([`kinds::RESOLVER`]).
+/// counts of its [`Expect`]s; results that reran though nothing they read had changed, and
+/// those that also made what they did before ([`crate::over`]'s needless); then what [`under`] finds,
+/// a result kept though a watched read changed as [`Finding::Kept`]. A kind is watched when the
+/// case counts it or it is the resolver's ([`kinds::RESOLVER`]).
+///
+/// One pass over each counted kind's keys, one join of the incremental build's reruns against
+/// the build before, and [`under`]'s one pass: the traces are read once each.
 pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) -> Vec<Finding> {
-    let watched = |kind: QueryKind| kinds::RESOLVER.contains(&kind) || case.expect.iter().any(|e| e.kind == kind);
+    let watched = |kind: QueryKind| kinds::RESOLVER.contains(&kind.0) || case.expect.iter().any(|e| e.kind == kind);
     let mut found = Vec::new();
     for e in case.expect {
-        let (was, now) = (results(before, e.kind), results(incremental, e.kind));
-        if was.is_empty() && now.is_empty() {
+        let (keys, any) = differ(before, incremental, e.kind);
+        if !any {
             found.push(Finding::Unrecorded { what: e.what, kind: e.kind });
             continue;
         }
-        let keys: Vec<QueryKey> = apart(&was, &now)
-            .into_iter()
-            .filter_map(|it| match it {
-                Apart::Differ { key, .. } => Some(key),
-                Apart::OnlyFirst { .. } | Apart::OnlySecond { .. } => None,
-            })
-            .collect();
         let changed = u32::try_from(keys.len()).expect("a trace has fewer than 2^32 keys");
         if !e.changed.contains(&changed) {
             let (min, max) = (*e.changed.start(), *e.changed.end());
             found.push(Finding::Changed { what: e.what, kind: e.kind, changed, min, max, keys });
         }
     }
-    for j in 0..incremental.keys.len() as u32 {
-        if incremental.ran.get(j) || !incremental.has.get(j) {
-            continue;
-        }
-        let stale = incremental.edges(j).find(|&(read, saw)| {
-            watched(incremental.keys[read as usize].kind) && incremental.result(read) != Some(saw)
-        });
-        if let Some((read, saw)) = stale {
-            let (query, read, now) = (incremental.keys[j as usize], incremental.keys[read as usize], incremental.result(read));
-            found.push(Finding::Kept { query, read, saw, now });
-        }
-    }
+    let mut needless = Vec::new();
     let mut cursor = 0;
     for i in 0..incremental.keys.len() as u32 {
         let query = incremental.keys[i as usize];
-        if !incremental.ran.get(i) || !incremental.has.get(i) || !watched(query.kind) {
+        if !incremental.ran.get(i) || !watched(query.kind) {
             continue;
         }
-        let Some(j) = before.index_from(&mut cursor, &query).filter(|&j| before.has.get(j)) else { continue };
+        let Some(now) = incremental.result(i) else { continue };
+        let Some(j) = before.index_from(&mut cursor, &query) else { continue };
+        let Some(was) = before.result(j) else { continue };
         let changed = before.edges(j).any(|(read, saw)| {
             incremental.index(&before.keys[read as usize]).and_then(|r| incremental.result(r)) != Some(saw)
         });
         if !changed {
             found.push(Finding::Unexplained { query });
         }
+        if was == now && same_edges(before, j, incremental, i) {
+            needless.push(Finding::Needless { query });
+        }
     }
-    let (_, needless) = over(before, incremental);
-    found.extend(needless.into_iter().filter(|k| watched(k.kind)).map(|query| Finding::Needless { query }));
-    found.extend(
-        under(incremental, scratch, &[])
-            .into_iter()
-            .filter(|s| watched(s.query().kind) || matches!(s, Stale::Unverified { read, .. } if watched(read.kind)))
-            .map(Finding::Stale),
-    );
+    found.append(&mut needless);
+    for stale in under(incremental, scratch, &[]) {
+        match stale {
+            Stale::Unverified { query, read, saw, now } if watched(read.kind) => {
+                found.push(Finding::Kept { query, read, saw, now });
+            }
+            stale if watched(stale.query().kind) => found.push(Finding::Stale(stale)),
+            _ => {}
+        }
+    }
     found
 }
 
@@ -536,14 +532,8 @@ mod tests {
         let found = m.check("nameres-negative", &[(released, false)]);
         let (query, read) = (key(INFER, "released"), key(RESOLVES, "chooser drop"));
         let (saw, now) = (Fingerprint(60), Some(Fingerprint(61)));
-        assert_eq!(
-            found,
-            vec![
-                Finding::Kept { query, read, saw, now },
-                Finding::Stale(Stale::Unverified { query, read, saw, now }),
-            ]
-        );
-        assert!(found.iter().all(|f| f.side() == Side::Under));
+        assert_eq!(found, vec![Finding::Kept { query, read, saw, now }]);
+        assert_eq!(found[0].side(), Side::Under);
     }
 
     #[test]
@@ -604,14 +594,56 @@ mod tests {
     }
 
     #[test]
+    fn differ_finds_what_apart_finds() {
+        use std::collections::BTreeMap;
+
+        let build = |rng: &mut crate::Rng| -> Trace {
+            let mut trace = TraceBuilder::default();
+            for _ in 0..rng.below(60) {
+                let kind = [RESOLVES, METHOD, IMPLEMENTS][rng.below(3) as usize];
+                let k = key(kind, &rng.below(40).to_string());
+                // Some read a key no build has a result for: named, not counted.
+                let read = key(kind, "only read");
+                let edges = if rng.below(4) == 0 { vec![Edge { read, saw: Fingerprint(0) }] } else { Vec::new() };
+                trace.insert(k, Fingerprint(u128::from(rng.below(3) as u8)), &edges, true);
+            }
+            trace.finish()
+        };
+        let map = |trace: &Trace, kind: QueryKind| -> BTreeMap<QueryKey, Fingerprint> {
+            (0..trace.keys.len() as u32)
+                .filter(|&i| trace.keys[i as usize].kind == kind)
+                .filter_map(|i| Some((trace.keys[i as usize], trace.result(i)?)))
+                .collect()
+        };
+        for seed in 0..200 {
+            let mut rng = crate::Rng::new(seed);
+            let (a, b) = (build(&mut rng), build(&mut rng));
+            for kind in [RESOLVES, METHOD, IMPLEMENTS, MODULE_DECLS] {
+                let (x, y) = (map(&a, kind), map(&b, kind));
+                let want: Vec<QueryKey> = crate::apart(&x, &y)
+                    .into_iter()
+                    .filter_map(|it| match it {
+                        crate::Apart::Differ { key, .. } => Some(key),
+                        crate::Apart::OnlyFirst { .. } | crate::Apart::OnlySecond { .. } => None,
+                    })
+                    .collect();
+                assert_eq!(differ(&a, &b, kind), (want, !x.is_empty() || !y.is_empty()), "seed {seed}");
+            }
+        }
+    }
+
+    #[test]
     fn the_kinds_are_distinct_and_in_their_ranges() {
-        let mut all: Vec<QueryKind> = RESOLVER.to_vec();
+        let named = [MODULE_DECLS, SCC_STATE, FACT_HANDLE, MACRO_STEP, MODULE_SCOPE_NAME, MODULE_IMPLS];
+        let mut all: Vec<QueryKind> = named.to_vec();
         all.extend([METHOD, IMPLEMENTS, RESOLVES]);
         let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());
-        assert!(RESOLVER.iter().all(|k| blaze_query::kinds::FRONT.contains(&k.0)));
+        assert!(named.iter().all(|k| RESOLVER.contains(&k.0)));
+        assert!(blaze_query::kinds::FRONT.contains(&RESOLVER.start));
+        assert!(blaze_query::kinds::FRONT.contains(&(RESOLVER.end - 1)));
         assert!([METHOD, IMPLEMENTS, RESOLVES].iter().all(|k| blaze_query::kinds::FACTS.contains(&k.0)));
     }
 

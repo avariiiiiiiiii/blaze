@@ -16,6 +16,10 @@ pub fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
 /// `bytes` as `T`s, `None` when they are not aligned for `T` or not a whole number of them.
 pub fn cast<T: Record>(bytes: &[u8]) -> Option<&[T]> {
     const { assert!(T::PLAIN, "only a plain record is read from an image in place") };
+    if bytes.is_empty() && size_of::<T>() != 0 {
+        // An empty slice may sit at any address (`&[]` is at 1), and zero `T`s are never misaligned.
+        return Some(&[]);
+    }
     if size_of::<T>() == 0
         || !bytes.len().is_multiple_of(size_of::<T>())
         || !(bytes.as_ptr() as usize).is_multiple_of(align_of::<T>())
@@ -42,5 +46,7 @@ mod tests {
         assert_eq!(cast::<u64>(&bytes[1..9]), None, "misaligned");
         assert_eq!(cast::<u64>(&bytes[..12]), None, "not whole");
         assert_eq!(cast::<u8>(&bytes[3..7]), Some(&bytes[3..7]));
+        assert_eq!(cast::<u64>(&[]), Some(&[][..]), "none of them, wherever the slice is");
+        assert_eq!(cast::<u64>(&bytes[1..1]), Some(&[][..]));
     }
 }

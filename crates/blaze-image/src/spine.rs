@@ -228,6 +228,7 @@ pub(crate) fn parse<'a>(
         return Err(OpenError::Header("groups no section holds"));
     }
     let tops_at = HEADER + count * SECTION_ENTRY;
+    // alloc: the CRC table's top CRCs, once an image opened
     let tops = (0..tops as usize).map(|index| u32_at(bytes, tops_at + index * 4)).collect();
     Ok(Spine { hash: found, len, shift, groups, crc_at, sections, tops })
 }

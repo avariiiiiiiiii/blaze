@@ -14,6 +14,7 @@
 //!
 //! [`body`]: crate::expr_store::body
 
+pub(crate) mod col;
 pub(crate) mod columns;
 pub mod format_args;
 pub mod generics;
@@ -34,7 +35,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     expr_store::{
         HygieneId,
-        path::{GenericArgs, Path},
+        path::{GenericArgs, Path, PathIdx},
     },
     type_ref::{Mutability, Rawness},
 };
@@ -186,6 +187,11 @@ impl FloatTypeWrapper {
         Self(sym)
     }
 
+    /// The literal's text, as it is written (and as `Display` writes it).
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
     pub fn to_f128(&self) -> Quad {
         self.0.as_str().parse().unwrap_or_default()
     }
@@ -205,10 +211,11 @@ impl FloatTypeWrapper {
     /// The literal with its sign flipped, as `-1.0` is written in a pattern.
     fn negate(&self) -> Self {
         let text = self.0.as_str();
-        Self(Symbol::intern(&match text.strip_prefix('-') {
-            Some(positive) => positive.to_owned(),
-            None => format!("-{text}"),
-        }))
+        Self(match text.strip_prefix('-') {
+            Some(positive) => Symbol::intern(positive),
+            // alloc: a negative float in a pattern, once per such literal
+            None => Symbol::intern(&format!("-{text}")),
+        })
     }
 }
 
@@ -311,7 +318,7 @@ pub enum Unsafe {
 pub enum Expr<'a> {
     /// This is produced if the syntax tree does not have a required expression piece.
     Missing,
-    Path(&'a Path),
+    Path(Path<'a>),
     If {
         condition: ExprId,
         then_branch: ExprId,
@@ -342,7 +349,7 @@ pub enum Expr<'a> {
         receiver: ExprId,
         method_name: &'a Name,
         args: &'a [ExprId],
-        generic_args: Option<&'a GenericArgs>,
+        generic_args: Option<GenericArgs<'a>>,
     },
     Match {
         expr: ExprId,
@@ -368,7 +375,7 @@ pub enum Expr<'a> {
         expr: Option<ExprId>,
     },
     RecordLit {
-        path: &'a Path,
+        path: Path<'a>,
         fields: &'a [RecordLitField],
         spread: RecordSpread,
     },
@@ -562,6 +569,7 @@ impl AsmOptions {
     pub const NAKED_OPTIONS: Self = Self::ATT_SYNTAX.union(Self::RAW).union(Self::NORETURN);
 
     pub fn human_readable_names(&self) -> Vec<&'static str> {
+        // alloc: for printing (the edge)
         let mut options = vec![];
 
         if self.contains(AsmOptions::PURE) {
@@ -626,7 +634,8 @@ pub enum AsmOperand {
     },
     Label(ExprId),
     Const(ExprId),
-    Sym(Path),
+    /// A path of the store's, read with `ExpressionStore::path_at`.
+    Sym(PathIdx),
 }
 
 impl AsmOperand {
@@ -935,7 +944,7 @@ pub enum Pat<'a> {
     },
     Or(&'a [PatId]),
     Record {
-        path: &'a Path,
+        path: Path<'a>,
         args: &'a [RecordFieldPat],
         ellipsis: bool,
     },
@@ -949,14 +958,14 @@ pub enum Pat<'a> {
         slice: Option<PatId>,
         suffix: &'a [PatId],
     },
-    Path(&'a Path),
+    Path(Path<'a>),
     Lit(ExprId),
     Bind {
         id: BindingId,
         subpat: Option<PatId>,
     },
     TupleStruct {
-        path: &'a Path,
+        path: Path<'a>,
         args: &'a [PatId],
         ellipsis: Option<u32>,
     },

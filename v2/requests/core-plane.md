@@ -78,6 +78,8 @@
 
 > forwarded to cargo: the daemon's match is lane cargo's (cargo.md, "From core").
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/plane.rs:242 (`critical` goes to `Pool::submit_critical`).
+
 ## 6. A batch of nodes as one record (ci)
 
 - What: an `Event::Nodes { first: u32, kinds: Vec<NodeKind>, names: String, name_at: Vec<u32>,

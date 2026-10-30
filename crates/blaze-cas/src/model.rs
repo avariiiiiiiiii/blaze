@@ -14,7 +14,7 @@ use blaze_check::{
     model, thread,
 };
 use blaze_ids::ContentId;
-use blaze_reclaim::{Limbo, enter};
+use blaze_reclaim::enter;
 
 use crate::{
     Key, Kind, Unit,
@@ -39,8 +39,9 @@ struct Val {
 unsafe impl Sync for Val {}
 
 impl Val {
-    fn new(key: u64, n: u64, drops: &Arc<AtomicUsize>) -> Box<Val> {
-        let val = Box::new(Val { key, n: UnsafeCell::new(0), drops: Arc::clone(drops) });
+    /// A value whose `n` is written once here: the cell's tracking moves with it into the table.
+    fn new(key: u64, n: u64, drops: &Arc<AtomicUsize>) -> Val {
+        let val = Val { key, n: UnsafeCell::new(0), drops: Arc::clone(drops) };
         // SAFETY: a `u64` of a value no other thread can reach yet.
         val.n.with_mut(|it| unsafe { *it = n });
         val
@@ -172,19 +173,14 @@ fn model_table_replace_frees_the_old_value_after_its_readers() {
                 get(&table, &history, 5);
             })
         };
-        let mut limbo = Limbo::new();
-        history.record(MapOp::Replace(5, 2), |_| match table.replace(Val::new(5, 2, &drops)) {
-            Ok(old) => {
-                let n = old.n();
-                limbo.retire(old);
-                MapRet::Replaced(Some(n))
-            }
+        history.record(MapOp::Replace(5, 2), |_| match table.replace(Held::writer(&*table), Val::new(5, 2, &drops)) {
+            Ok(old) => MapRet::Replaced(Some(old.n())),
             Err(_) => MapRet::Replaced(None),
         });
-        limbo.collect();
+        table.collect();
         reader.join().unwrap();
-        limbo.collect();
-        assert!(limbo.is_empty(), "a grace outlived every task");
+        table.collect();
+        assert_eq!(table.retired(), 0, "a grace outlived every task");
         assert_eq!(drops.load(Ordering::Relaxed), 1, "the replaced value was freed once");
         history.check(Map::default());
         drop(table);

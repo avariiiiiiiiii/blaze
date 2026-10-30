@@ -18,7 +18,7 @@
 
 use std::sync::LazyLock;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
@@ -124,7 +124,7 @@ impl ResolvePathResult {
 #[derive(Clone, Copy)]
 struct PathQuery<'a> {
     local_def_map: &'a LocalDefMap,
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     mode: ResolveMode,
     shadow: BuiltinShadowMode,
     expected_macro_subns: Option<MacroSubNs>,
@@ -136,7 +136,7 @@ static TEST_HARNESS: LazyLock<Symbol> = LazyLock::new(|| Symbol::intern("__blaze
 impl PerNs {
     pub(super) fn filter_macro(
         mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         expected: Option<MacroSubNs>,
     ) -> Self {
         self.macros = self.macros.filter(|def| sub_namespace_match(db, def.def, expected));
@@ -149,7 +149,7 @@ impl DefMap {
     pub(crate) fn resolve_visibility(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         // module to import to
         original_module: ModuleId,
         // pub(path)
@@ -204,7 +204,7 @@ impl DefMap {
     pub(super) fn resolve_path_fp_with_macro(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         mode: ResolveMode,
         // module to import to
         original_module: ModuleId,
@@ -223,7 +223,7 @@ impl DefMap {
     pub(super) fn resolve_path_fp_recording(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         mode: ResolveMode,
         original_module: ModuleId,
         path: &ModPath,
@@ -238,7 +238,7 @@ impl DefMap {
     pub(super) fn resolve_path_fp_with_macro_single(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         mode: ResolveMode,
         original_module: ModuleId,
         path: &ModPath,
@@ -247,6 +247,28 @@ impl DefMap {
     ) -> ResolvePathResult {
         let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
         self.resolve_single(q, original_module, path.kind, path.segments(), &mut |_| {})
+    }
+
+    /// `segments` of a path of `kind`, as [`Self::resolve_path_fp_with_macro`] resolves them
+    /// (`around`: in the def maps around a block too) or
+    /// [`Self::resolve_path_fp_with_macro_single`] does: what [`super::uses`] resolves each
+    /// prefix of a path with.
+    pub(super) fn resolve_segments(
+        &self,
+        q: (&LocalDefMap, &Db, ResolveMode),
+        original_module: ModuleId,
+        kind: PathKind,
+        segments: &[Name],
+        shadow: BuiltinShadowMode,
+        expected_macro_subns: Option<MacroSubNs>,
+        around: bool,
+    ) -> ResolvePathResult {
+        let (local_def_map, db, mode) = q;
+        let q = PathQuery { local_def_map, db, mode, shadow, expected_macro_subns };
+        match around {
+            true => self.resolve_fp(q, original_module, kind, segments, &mut |_| {}),
+            false => self.resolve_single(q, original_module, kind, segments, &mut |_| {}),
+        }
     }
 
     /// The path in this def map and then, for a block, in the def maps around it. The loop runs
@@ -478,7 +500,7 @@ impl DefMap {
     /// harness rustc writes does: a private one too.
     fn is_test_harness<R: FnMut(PathRead)>(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         module: ModuleId,
         reads: &mut R,
     ) -> bool {
@@ -500,7 +522,7 @@ impl DefMap {
     /// reached the enum by, under the name `named`.
     fn declared_enum_visibility<R: FnMut(PathRead)>(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         e: EnumId,
         reached: TypesItem,
         named: Option<&Name>,
@@ -681,7 +703,7 @@ impl DefMap {
     fn resolve_name_in_module<R: FnMut(PathRead)>(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         module: ModuleId,
         name: &Name,
         shadow: BuiltinShadowMode,
@@ -755,7 +777,7 @@ impl DefMap {
     fn resolve_name_in_all_preludes<R: FnMut(PathRead)>(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         name: &Name,
         types_only: bool,
         reads: &mut R,
@@ -807,7 +829,7 @@ impl DefMap {
     fn resolve_name_in_crate_root_or_extern_prelude<R: FnMut(PathRead)>(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         module: ModuleId,
         name: &Name,
         types_only: bool,
@@ -832,13 +854,13 @@ impl DefMap {
         from_crate_root.or(self.resolve_name_in_extern_prelude(local_def_map, name, reads))
     }
 
-    pub(super) fn resolve_in_prelude(&self, db: &dyn SourceDatabase, name: &Name) -> PerNs {
+    pub(super) fn resolve_in_prelude(&self, db: &Db, name: &Name) -> PerNs {
         self.resolve_in_prelude_reading(db, name, &mut |_| {})
     }
 
     fn resolve_in_prelude_reading<R: FnMut(PathRead)>(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         name: &Name,
         reads: &mut R,
     ) -> PerNs {
@@ -856,7 +878,7 @@ impl DefMap {
 /// Given a block module, returns its nearest non-block module and the `DefMap` it belongs to.
 #[inline]
 fn adjust_to_nearest_non_block_module<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     mut def_map: &'db DefMap,
     mut local_id: ModuleId,
 ) -> (&'db DefMap, ModuleId) {

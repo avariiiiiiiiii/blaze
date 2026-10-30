@@ -96,7 +96,6 @@ impl LatePass for StaticMutRefs {
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Expr::Block { statements, .. } = b.store().expr(block) else { return };
         let Some(Statement::Let { pat, initializer: Some(init), .. }) = statements.get(index) else { return };
-        let (pat, init) = (*pat, *init);
         let Pat::Bind { id, .. } = b.store().pat(pat) else { return };
         let mutable = match b.store()[id].mode {
             BindingAnnotation::Ref => false,

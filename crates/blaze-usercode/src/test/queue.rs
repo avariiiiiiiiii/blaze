@@ -27,8 +27,8 @@
 //! The hot path, a test started and ended, allocates nothing past its result: a test is a
 //! `u32` unit indexing columns, the order is bitsets over ranks, attempts and tags are slabs
 //! reused through free lists, a record's paths and variables are interned once per server and
-//! its lines kept as `u32`s, and every deadline is one timer wheel (`queue/wheel.rs`) behind one
-//! driver timer at its next expiry.
+//! its lines kept as `u32`s, and every deadline is one timer wheel (`blaze_core::wheel`) behind one
+//! driver timer at its soonest deadline.
 //!
 //! The queue asks with tags `tags..tags + 2^32` ([`Config::tags`]). It reads no clock: the
 //! driver's `now` comes with each call. It is [`Queue::finished`] once every test has a result
@@ -41,8 +41,10 @@ use rustc_hash::FxHashMap;
 
 use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
+    wheel::{Handle, Wheel},
 };
 use blaze_ids::{ContentId, radix};
+use blaze_inproc::host::{Program, Started};
 
 use super::wire::{self, End, Executed, Frame, Frames};
 use crate::{
@@ -51,10 +53,8 @@ use crate::{
 };
 
 mod names;
-mod wheel;
 
 use names::Names;
-use wheel::{UNSET, Wheel};
 
 /// How a binary's tests run.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -96,6 +96,27 @@ pub struct Binary {
     pub memory: Option<u64>,
     pub mode: Mode,
     pub jobs: Vec<Job>,
+    /// The binary as blaze's loader holds it in memory: it is started through the loader
+    /// ([`Program::command`]), never from `program` on disk.
+    pub loaded: Option<Loaded>,
+}
+
+/// A binary loaded into memory by blaze's loader. Two are the same when they are one program.
+#[derive(Clone)]
+pub struct Loaded(pub Arc<Program>);
+
+impl PartialEq for Loaded {
+    fn eq(&self, other: &Loaded) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Loaded {}
+
+impl std::fmt::Debug for Loaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Loaded")
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -298,7 +319,7 @@ enum For {
     Send(u32),
     Hangup,
     Read(u32),
-    /// The driver timer at the wheel's next expiry.
+    /// The driver timer at the wheel's soonest deadline.
     Tick,
     Whole(u32),
 }
@@ -340,6 +361,8 @@ struct Server {
     socket: FileName,
     record: FileName,
     spawn: Option<Tag>,
+    /// Its start through the loader, said to have exited when its spawn completes.
+    loaded: Option<Started>,
     listen: Option<Tag>,
     conn: Option<Conn>,
     hung_up: bool,
@@ -395,17 +418,19 @@ struct Attempt {
     running: bool,
     timed_out: bool,
     started: Duration,
-    /// Its timers in the wheel, or [`UNSET`].
-    deadline: u64,
-    grace: u64,
+    /// Its timers in the wheel, while set.
+    deadline: Option<Handle>,
+    grace: Option<Handle>,
 }
 
 struct Whole {
     spawn: Tag,
+    /// Its start through the loader, said to have exited when its spawn completes.
+    loaded: Option<Started>,
     started: Duration,
     slots: usize,
     timed_out: bool,
-    deadline: u64,
+    deadline: Option<Handle>,
 }
 
 struct Bin {
@@ -535,7 +560,7 @@ pub struct Queue {
     free_tags: Vec<u32>,
     wheel: Wheel<Due>,
     fired: Vec<Due>,
-    /// The driver timer at the wheel's next expiry, and the tick it is for.
+    /// The driver timer at the wheel's soonest deadline, and the tick it is for.
     armed: Option<(Tag, u64)>,
     /// Servers with frames in their outbox.
     dirty: Vec<u32>,
@@ -576,7 +601,11 @@ impl Queue {
             free_attempts: Vec::with_capacity(cores),
             tags: Vec::with_capacity(2 * cores + 4 * bins),
             free_tags: Vec::with_capacity(2 * cores + 4 * bins),
-            wheel: Wheel::new(tick(now), 2 * cores + bins),
+            wheel: {
+                let mut wheel = Wheel::new();
+                wheel.advance(tick(now), |_, _: Due| {});
+                wheel
+            },
             fired: Vec::with_capacity(cores),
             armed: None,
             dirty: Vec::with_capacity(bins),
@@ -716,6 +745,14 @@ impl Queue {
                 let b = b as usize;
                 let server = self.server(b);
                 server.spawn = None;
+                // The spawn completes once its sandbox ended every process of it, the
+                // children the server forked among them.
+                if let Some(started) = server.loaded.take()
+                    && let Some(loaded) = &self.bins[b].plan.loaded
+                {
+                    loaded.0.exited(started);
+                }
+                let server = self.server(b);
                 let (why, output) = match completion.done {
                     Done::Exited(exit) => {
                         let why = server.lost.take().unwrap_or_else(|| ended(&exit));
@@ -807,8 +844,8 @@ impl Queue {
                     running: false,
                     timed_out: false,
                     started: self.now,
-                    deadline: UNSET,
-                    grace: UNSET,
+                    deadline: None,
+                    grace: None,
                 });
                 at
             }
@@ -822,8 +859,8 @@ impl Queue {
             running: false,
             timed_out: false,
             started: self.now,
-            deadline: UNSET,
-            grace: UNSET,
+            deadline: None,
+            grace: None,
         };
         (u64::from(attempt.generation) << 32) | u64::from(at)
     }
@@ -833,9 +870,8 @@ impl Queue {
         let attempt = &mut self.attempts[at];
         attempt.live = false;
         attempt.generation = attempt.generation.wrapping_add(1);
-        let timers = [attempt.deadline, attempt.grace];
-        for timer in timers {
-            self.wheel.remove(timer);
+        for timer in [attempt.deadline, attempt.grace].into_iter().flatten() {
+            self.wheel.cancel(timer);
         }
         self.free_attempts.push(at as u32);
     }
@@ -843,13 +879,13 @@ impl Queue {
     /// The timers due by now, acted on.
     fn expire(&mut self, effects: &mut Vec<Effect>) {
         let mut fired = std::mem::take(&mut self.fired);
-        self.wheel.advance(tick(self.now), &mut fired);
+        self.wheel.advance(tick(self.now), |_, due| fired.push(due));
         for due in fired.drain(..) {
             match due {
                 Due::Deadline(id) => {
                     let Some(at) = self.attempt(id) else { continue };
                     let attempt = &mut self.attempts[at];
-                    attempt.deadline = UNSET;
+                    attempt.deadline = None;
                     if !attempt.running || attempt.timed_out {
                         continue;
                     }
@@ -857,11 +893,11 @@ impl Queue {
                     let b = self.unit_bin[attempt.unit as usize] as usize;
                     self.send(b, &Frame::Kill { id });
                     let grace = self.wheel.insert(due_tick(self.now, self.config.kill_grace), Due::Grace(id));
-                    self.attempts[at].grace = grace;
+                    self.attempts[at].grace = Some(grace);
                 }
                 Due::Grace(id) => {
                     let Some(at) = self.attempt(id) else { continue };
-                    self.attempts[at].grace = UNSET;
+                    self.attempts[at].grace = None;
                     if !self.attempts[at].running {
                         continue;
                     }
@@ -877,7 +913,7 @@ impl Queue {
                     if let Some(whole) = &mut self.bins[b as usize].whole
                         && !whole.timed_out
                     {
-                        whole.deadline = UNSET;
+                        whole.deadline = None;
                         whole.timed_out = true;
                         effects.push(Effect::Kill { tag: whole.spawn });
                     }
@@ -900,6 +936,7 @@ impl Queue {
             socket,
             record: record.clone(), // clone: setup, once per server
             spawn: None,
+            loaded: None,
             listen: None,
             conn: None,
             hung_up: false,
@@ -959,12 +996,25 @@ impl Queue {
             memory: plan.memory,
         };
         let at = Address::Unix(server.socket.clone()); // clone: setup, once per server: the driver's command owns its parts
+        let (command, loaded) = match &plan.loaded {
+            None => (command, None),
+            Some(loaded) => match loaded.0.command(command, true) {
+                Ok((command, started)) => (command, Some(started)),
+                Err(error) => {
+                    let why = format!("{} could not be started through blaze's loader: {error}", plan.program.display()); // alloc: error path
+                    self.server(b).phase = Phase::Ended;
+                    self.server_ended(b, why, Vec::new(), effects); // alloc: empty, allocates nothing
+                    return;
+                }
+            },
+        };
         let listen = self.tag(For::Listen(b as u32));
         let spawn = self.tag(For::Spawn(b as u32));
         let server = self.server(b);
         server.phase = Phase::Starting;
         server.listen = Some(listen);
         server.spawn = Some(spawn);
+        server.loaded = loaded;
         effects.push(Effect::Listen { at, tag: listen });
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn }); // alloc: setup, once per server: the driver's command owns its parts
     }
@@ -1094,9 +1144,8 @@ impl Queue {
                 self.busy -= 1;
                 let attempt = &mut self.attempts[at];
                 attempt.running = false;
-                let timers = [std::mem::replace(&mut attempt.deadline, UNSET), std::mem::replace(&mut attempt.grace, UNSET)];
-                for timer in timers {
-                    self.wheel.remove(timer);
+                for timer in [attempt.deadline.take(), attempt.grace.take()].into_iter().flatten() {
+                    self.wheel.cancel(timer);
                 }
                 let Attempt { unit, number, .. } = self.attempts[at];
                 let outcome = self.outcome(at, &end);
@@ -1354,7 +1403,7 @@ impl Queue {
     }
 
     /// What this call said to each server, as one send of all its frames; then the driver
-    /// timer moved earlier if the wheel's next expiry is.
+    /// timer moved earlier if the wheel's soonest deadline is.
     fn flush(&mut self, effects: &mut Vec<Effect>) {
         let mut dirty = std::mem::take(&mut self.dirty);
         for &b in &dirty {
@@ -1362,7 +1411,7 @@ impl Queue {
         }
         dirty.clear();
         self.dirty = dirty;
-        let Some(next) = self.wheel.next() else { return };
+        let Some(next) = self.wheel.next_deadline() else { return };
         if self.armed.is_some_and(|it| it.1 <= next) {
             return;
         }
@@ -1497,7 +1546,7 @@ impl Queue {
         let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Deadline(id));
         let attempt = &mut self.attempts[id as u32 as usize];
         attempt.running = true;
-        attempt.deadline = deadline;
+        attempt.deadline = Some(deadline);
     }
 
     fn start_whole(&mut self, b: usize, effects: &mut Vec<Effect>) {
@@ -1521,16 +1570,45 @@ impl Queue {
             memory: plan.memory,
         };
         let timeout = *timeout;
+        let (command, loaded) = match &plan.loaded {
+            None => (command, None),
+            Some(loaded) => match loaded.0.command(command, false) {
+                Ok((command, started)) => (command, Some(started)),
+                Err(error) => {
+                    let why = format!("{} could not be started through blaze's loader: {error}", plan.program.display()); // alloc: once per binary run whole
+                    let unit = self.bins[b].first;
+                    self.finish(
+                        unit,
+                        Went {
+                            outcome: Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
+                            attempts: 1,
+                            output: Vec::new(), // alloc: empty, allocates nothing
+                            took: Duration::ZERO,
+                            trace: Trace::Unknown(why),
+                            executed: Executed::Not(WHOLE_UNRECORDED.to_owned()), // alloc: once per binary run whole
+                        },
+                    );
+                    return;
+                }
+            },
+        };
         let spawn = self.tag(For::Whole(b as u32));
         let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Whole(b as u32));
         self.busy += slots;
-        self.bins[b].whole = Some(Whole { spawn, started: self.now, slots, timed_out: false, deadline });
+        self.bins[b].whole = Some(Whole { spawn, loaded, started: self.now, slots, timed_out: false, deadline: Some(deadline) });
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn }); // alloc: setup, once per binary run whole: the driver's command owns its parts
     }
 
     fn whole_ended(&mut self, b: usize, done: Done) {
         let Some(whole) = self.bins[b].whole.take() else { return };
-        self.wheel.remove(whole.deadline);
+        if let Some(started) = whole.loaded
+            && let Some(loaded) = &self.bins[b].plan.loaded
+        {
+            loaded.0.exited(started);
+        }
+        if let Some(deadline) = whole.deadline {
+            self.wheel.cancel(deadline);
+        }
         self.busy -= whole.slots;
         let took = self.now.saturating_sub(whole.started);
         let timeout = match &self.bins[b].plan.mode {

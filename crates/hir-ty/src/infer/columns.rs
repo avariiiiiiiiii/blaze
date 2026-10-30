@@ -55,6 +55,69 @@ fn place(index: usize) -> u32 {
     place
 }
 
+/// Which keys of a sparse column have a row, and where it is: a bit per key, and per word of
+/// bits how many keys before it have one, so a row's place is one popcount (rank as in
+/// Vigna's rank9). That is 1.5 bits a key where a `u32` place per key is 32, and the ranks are
+/// made again from the bits, never stored.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct Presence {
+    /// Its last word is never zero.
+    words: Box<[u64]>,
+    ranks: Box<[u32]>,
+}
+
+impl Presence {
+    fn new(words: Vec<u64>) -> Result<Presence, &'static str> {
+        if words.last() == Some(&0) {
+            return Err("a sparse column whose last word of keys has none");
+        }
+        let mut ranks = Vec::with_capacity(words.len());
+        let mut before = 0u32;
+        for &word in &words {
+            ranks.push(before);
+            before = before.checked_add(word.count_ones()).ok_or("a column of 2^32 rows")?;
+        }
+        Ok(Presence { words: words.into_boxed_slice(), ranks: ranks.into_boxed_slice() })
+    }
+
+    /// How many keys have a row.
+    fn count(&self) -> usize {
+        match (self.ranks.last(), self.words.last()) {
+            (Some(&rank), Some(word)) => rank as usize + word.count_ones() as usize,
+            _ => 0,
+        }
+    }
+
+    /// The place of `index`'s row among the rows, if it has one.
+    #[inline]
+    fn place(&self, index: usize) -> Option<usize> {
+        let (at, bit) = (index / 64, index % 64);
+        let word = *self.words.get(at)?;
+        if word & (1 << bit) == 0 {
+            return None;
+        }
+        Some(self.ranks[at] as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+    }
+
+    /// Each key with a row and the row's place, in key order.
+    fn keys(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
+        self.words.iter().zip(&self.ranks).enumerate().flat_map(|(at, (&word, &rank))| {
+            (0..64usize).filter(move |&bit| word & (1 << bit) != 0).map(move |bit| {
+                (at * 64 + bit, rank as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+            })
+        })
+    }
+}
+
+/// Sets `index`'s bit in `words`, growing them.
+fn set_bit(words: &mut Vec<u64>, index: usize) {
+    let at = index / 64;
+    if at >= words.len() {
+        words.resize(at + 1, 0);
+    }
+    words[at] |= 1 << (index % 64);
+}
+
 /// The values of `entries` by key, in key order.
 fn dense<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<Option<V>> {
     let mut dense: Vec<Option<V>> = Vec::new();
@@ -176,59 +239,47 @@ impl<K: DenseKey + fmt::Debug> fmt::Debug for TyColumn<K> {
     }
 }
 
-/// A row per key with one: `at[key]` is the key's place in `rows`, the rows in key order.
+/// A row per key with one, for columns most keys have no row in: which keys have one as a
+/// [`Presence`], the rows in key order.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct IndexColumn<K, V> {
-    at: Box<[u32]>,
+    present: Presence,
     rows: Box<[V]>,
     key: PhantomData<fn() -> K>,
 }
 
 impl<K, V> Default for IndexColumn<K, V> {
     fn default() -> Self {
-        IndexColumn { at: Box::default(), rows: Box::default(), key: PhantomData }
+        IndexColumn { present: Presence::default(), rows: Box::default(), key: PhantomData }
     }
 }
 
 impl<K: DenseKey, V> IndexColumn<K, V> {
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let mut rows = Vec::new();
-        let at = dense(entries)
-            .into_iter()
-            .map(|row| match row {
-                None => NONE,
-                Some(row) => {
-                    rows.push(row);
-                    place(rows.len() - 1)
-                }
-            })
-            .collect();
-        IndexColumn { at, rows: rows.into_boxed_slice(), key: PhantomData }
-    }
-
-    /// The column of `at` and `rows` as [`Self::at`] and [`Self::rows`] give them, refused
-    /// when it is not one [`Self::from_entries`] makes.
-    pub(crate) fn from_parts(at: Box<[u32]>, rows: Box<[V]>) -> Result<Self, &'static str> {
-        if at.last() == Some(&NONE) {
-            return Err("a row column that ends in a key without a row");
-        }
-        let mut next = 0u32;
-        for &place in &at {
-            match place {
-                NONE => {}
-                _ if place == next => next += 1,
-                _ => return Err("a row column out of key order"),
+        let (mut words, mut rows) = (Vec::new(), Vec::new());
+        for (index, row) in dense(entries).into_iter().enumerate() {
+            if let Some(row) = row {
+                set_bit(&mut words, index);
+                rows.push(row);
             }
         }
-        if next as usize != rows.len() {
-            return Err("a row column with a row no key has");
-        }
-        Ok(IndexColumn { at, rows, key: PhantomData })
+        let present = Presence::new(words).expect("a bit is set in every word that is made");
+        IndexColumn { present, rows: rows.into_boxed_slice(), key: PhantomData }
     }
 
-    /// Where each key's row is in [`Self::rows`], [`NONE`] for a key without one.
-    pub fn at(&self) -> &[u32] {
-        &self.at
+    /// The column of `present` and `rows` as [`Self::present`] and [`Self::rows`] give them,
+    /// refused when it is not one [`Self::from_entries`] makes.
+    pub(crate) fn from_parts(present: Vec<u64>, rows: Box<[V]>) -> Result<Self, &'static str> {
+        let present = Presence::new(present)?;
+        if present.count() != rows.len() {
+            return Err("a row column whose keys and rows differ in number");
+        }
+        Ok(IndexColumn { present, rows, key: PhantomData })
+    }
+
+    /// Which keys have a row: bit `key % 64` of word `key / 64`, the last word never zero.
+    pub fn present(&self) -> &[u64] {
+        &self.present.words
     }
 
     /// The rows, in key order.
@@ -238,20 +289,15 @@ impl<K: DenseKey, V> IndexColumn<K, V> {
 
     #[inline]
     pub fn get(&self, key: K) -> Option<&V> {
-        match self.at.get(key.to_index()) {
-            Some(&place) if place != NONE => Some(&self.rows[place as usize]),
-            _ => None,
-        }
+        self.present.place(key.to_index()).map(|place| &self.rows[place])
     }
 
     pub fn contains_idx(&self, key: K) -> bool {
-        self.get(key).is_some()
+        self.present.place(key.to_index()).is_some()
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (K, &V)> + '_ {
-        (self.at.iter().enumerate())
-            .filter(|&(_, &place)| place != NONE)
-            .map(|(index, &place)| (K::from_index(index), &self.rows[place as usize]))
+        self.present.keys().map(|(index, place)| (K::from_index(index), &self.rows[place]))
     }
 
     pub fn len(&self) -> usize {
@@ -492,62 +538,64 @@ impl Range {
 
 const _: () = assert!(size_of::<Range>() == 8);
 
-/// A list per key as CSR: each key's [`Range`] into one flat array, the lists in key order.
+/// A list per key as CSR, for columns most keys have no list in: which keys have one (an
+/// empty list is not none) as a [`Presence`], and where each list ends in one flat array, the
+/// lists in key order.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Csr<K, T> {
-    ranges: Box<[Range]>,
+    present: Presence,
+    ends: Box<[u32]>,
     items: Box<[T]>,
     key: PhantomData<fn() -> K>,
 }
 
 impl<K, T> Default for Csr<K, T> {
     fn default() -> Self {
-        Csr { ranges: Box::default(), items: Box::default(), key: PhantomData }
+        Csr { present: Presence::default(), ends: Box::default(), items: Box::default(), key: PhantomData }
     }
 }
 
 impl<K: DenseKey, T> Csr<K, T> {
-    /// The column of `ranges` and `items` as [`Self::ranges`] and [`Self::items`] give them,
-    /// refused when it is not one [`CsrBuilder::freeze`] makes.
-    pub(crate) fn from_parts(ranges: Box<[Range]>, items: Box<[T]>) -> Result<Self, &'static str> {
-        if ranges.last().is_some_and(|range| range.is_absent()) {
-            return Err("a list column that ends in a key without a list");
+    /// The column of `present`, `ends` and `items` as [`Self::present`], [`Self::ends`] and
+    /// [`Self::items`] give them, refused when it is not one [`CsrBuilder::freeze`] makes.
+    pub(crate) fn from_parts(
+        present: Vec<u64>,
+        ends: Box<[u32]>,
+        items: Box<[T]>,
+    ) -> Result<Self, &'static str> {
+        let present = Presence::new(present)?;
+        if present.count() != ends.len() {
+            return Err("a list column whose keys and lists differ in number");
         }
-        let mut next = 0u64;
-        for range in &ranges {
-            if range.is_absent() {
-                if range.len != 0 {
-                    return Err("an absent list with a length");
-                }
-                continue;
-            }
-            if u64::from(range.start) != next {
-                return Err("a list out of its column's order");
-            }
-            next += u64::from(range.len);
+        if !ends.is_sorted() {
+            return Err("a list column whose lists end out of order");
         }
-        if next != items.len() as u64 {
+        if ends.last().map_or(0, |&end| end as usize) != items.len() {
             return Err("a list column whose lists do not cover its items");
         }
-        Ok(Csr { ranges, items, key: PhantomData })
+        Ok(Csr { present, ends, items, key: PhantomData })
+    }
+
+    #[inline]
+    fn list(&self, place: usize) -> &[T] {
+        let start = match place {
+            0 => 0,
+            _ => self.ends[place - 1] as usize,
+        };
+        &self.items[start..self.ends[place] as usize]
     }
 
     #[inline]
     pub fn get(&self, key: &K) -> Option<&[T]> {
-        match self.ranges.get(key.to_index()) {
-            Some(&range) if !range.is_absent() => Some(&self.items[range.slice()]),
-            _ => None,
-        }
+        self.present.place(key.to_index()).map(|place| self.list(place))
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
-        self.ranges.get(key.to_index()).is_some_and(|range| !range.is_absent())
+        self.present.place(key.to_index()).is_some()
     }
 
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = (K, &[T])> + '_ {
-        (self.ranges.iter().enumerate())
-            .filter(|(_, range)| !range.is_absent())
-            .map(|(index, range)| (K::from_index(index), &self.items[range.slice()]))
+        self.present.keys().map(|(index, place)| (K::from_index(index), self.list(place)))
     }
 
     pub fn values(&self) -> impl DoubleEndedIterator<Item = &[T]> + '_ {
@@ -555,11 +603,17 @@ impl<K: DenseKey, T> Csr<K, T> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.ranges.iter().all(|range| range.is_absent())
+        self.ends.is_empty()
     }
 
-    pub fn ranges(&self) -> &[Range] {
-        &self.ranges
+    /// Which keys have a list: bit `key % 64` of word `key / 64`, the last word never zero.
+    pub fn present(&self) -> &[u64] {
+        &self.present.words
+    }
+
+    /// Where each list ends in [`Self::items`], in key order.
+    pub fn ends(&self) -> &[u32] {
+        &self.ends
     }
 
     /// Every key's list, one after another.
@@ -697,34 +751,31 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
     /// O(keys) when inference wrote the lists in key order without replacing one (the flat
     /// array is kept as it is), else one move of every live item.
     pub(crate) fn freeze(self) -> Csr<K, T> {
-        let CsrBuilder { mut ranges, items, .. } = self;
-        while ranges.last().is_some_and(|range| range.is_absent()) {
-            ranges.pop();
-        }
+        let CsrBuilder { ranges, items, .. } = self;
+        let mut words = Vec::new();
+        let mut ends = Vec::new();
         let mut next = 0usize;
-        let in_order = ranges.iter().filter(|range| !range.is_absent()).all(|range| {
-            let here = range.start as usize == next;
+        let mut in_order = true;
+        for (index, range) in ranges.iter().enumerate() {
+            if range.is_absent() {
+                continue;
+            }
+            set_bit(&mut words, index);
+            in_order &= range.start as usize == next;
             next += range.len as usize;
-            here
-        });
+            ends.push(place(next));
+        }
+        let present = Presence::new(words).expect("a bit is set in every word that is made");
+        let ends = ends.into_boxed_slice();
         if in_order && next == items.len() {
-            let (ranges, items) = (ranges.into_boxed_slice(), items.into_boxed_slice());
-            return Csr { ranges, items, key: PhantomData };
+            return Csr { present, ends, items: items.into_boxed_slice(), key: PhantomData };
         }
         let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
-        let mut flat = Vec::with_capacity(items.len());
-        let ranges = ranges
-            .into_iter()
-            .map(|range| {
-                if range.is_absent() {
-                    return Range::ABSENT;
-                }
-                let start = place(flat.len());
-                flat.extend(items[range.slice()].iter_mut().map(|it| it.take().unwrap()));
-                Range { start, len: range.len }
-            })
-            .collect();
-        Csr { ranges, items: flat.into_boxed_slice(), key: PhantomData }
+        let mut flat = Vec::with_capacity(next);
+        for range in ranges.iter().filter(|range| !range.is_absent()) {
+            flat.extend(items[range.slice()].iter_mut().map(|it| it.take().unwrap()));
+        }
+        Csr { present, ends, items: flat.into_boxed_slice(), key: PhantomData }
     }
 }
 
@@ -1069,6 +1120,7 @@ impl VarSet {
 mod tests {
     use std::collections::BTreeMap;
 
+    use blaze_ids::rng::SplitMix64;
     use la_arena::{Idx, RawIdx};
 
     use super::*;
@@ -1082,14 +1134,10 @@ mod tests {
 
     /// A deterministic sequence of `(key, value)` writes, with overwrites.
     fn writes(seed: u64, count: usize, keys: u32, values: u32) -> Vec<(u32, u32)> {
-        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        (0..count).map(|_| ((next() % keys as u64) as u32, (next() % values as u64) as u32)).collect()
+        let mut rng = SplitMix64::new(seed);
+        (0..count)
+            .map(|_| (rng.below(u64::from(keys)) as u32, rng.below(u64::from(values)) as u32))
+            .collect()
     }
 
     #[test]
@@ -1197,12 +1245,36 @@ mod tests {
                 assert_eq!(twice, model.get(&k).map(|it| it.iter().map(|it| it * 2).collect()));
             }
             let again = Csr::<Key, u32>::from_parts(
-                frozen.ranges().to_vec().into_boxed_slice(),
-                frozen.items().to_vec().into_boxed_slice(),
+                frozen.present().to_vec(),
+                frozen.ends().into(),
+                frozen.items().into(),
             )
             .unwrap();
             assert!(again == frozen);
         }
+    }
+
+    #[test]
+    fn presence_places_agree_with_counting_the_keys_before() {
+        for seed in 0..32 {
+            let keys: std::collections::BTreeSet<u32> =
+                writes(seed, 120, 700, 1).into_iter().map(|(k, _)| k).collect();
+            let mut words = Vec::new();
+            keys.iter().for_each(|&k| set_bit(&mut words, k as usize));
+            let present = Presence::new(words).unwrap();
+            assert_eq!(present.count(), keys.len());
+            for k in 0..800u32 {
+                let naive = keys.contains(&k).then(|| keys.range(..k).count());
+                assert_eq!(present.place(k as usize), naive);
+            }
+            let listed: Vec<(usize, usize)> = present.keys().collect();
+            let model: Vec<(usize, usize)> = keys.iter().enumerate().map(|(at, &k)| (k as usize, at)).collect();
+            assert_eq!(listed, model);
+            let backward: Vec<(usize, usize)> = present.keys().rev().collect();
+            assert_eq!(backward, model.into_iter().rev().collect::<Vec<_>>());
+        }
+        assert!(Presence::new(vec![1, 0]).is_err());
+        assert_eq!(Presence::new(Vec::new()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1228,19 +1300,22 @@ mod tests {
         assert!(backward.remove_in_place(&key(7)));
         let (forward, backward) = (forward.freeze(), backward.freeze());
         assert!(forward == backward);
-        assert_eq!(backward.ranges().len(), 2);
-        let trailing = Csr::<Key, u32>::from_parts(
-            Box::new([Range::ABSENT, Range { start: 0, len: 1 }, Range::ABSENT]),
-            Box::new([1]),
-        );
+        assert_eq!(backward.present(), &[1 << 1]);
+        let trailing = Csr::<Key, u32>::from_parts(vec![1 << 1, 0], Box::new([1]), Box::new([1]));
         assert!(trailing.is_err());
+        let uncovered = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([1]), Box::new([1, 2]));
+        assert!(uncovered.is_err());
+        let backwards = Csr::<Key, u32>::from_parts(vec![0b110], Box::new([2, 1]), Box::new([1, 2]));
+        assert!(backwards.is_err());
+        let extra = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([0, 1]), Box::new([1]));
+        assert!(extra.is_err());
     }
 
     #[test]
     fn a_column_ending_in_a_key_without_a_value_is_refused() {
         let types = &crate::next_solver::default_types().types;
         assert!(TyColumn::<Key>::from_parts(Box::new([0, NONE]), Box::new([types.i32.store()])).is_err());
-        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0, NONE]), Box::new([5])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(vec![1, 0], Box::new([5])).is_err());
         assert!(ModeColumn::<Key>::from_codes(Box::new([0, MODE_NONE])).is_err());
         assert!(ModeColumn::<Key>::from_codes(Box::new([MODE_NONE, 3])).is_ok());
     }
@@ -1248,11 +1323,13 @@ mod tests {
     #[test]
     fn index_column_takes_back_its_parts_and_refuses_others() {
         let column = IndexColumn::from_entries([(key(4), 40u32), (key(1), 10), (key(9), 90)]);
-        let again = IndexColumn::<Key, u32>::from_parts(column.at().into(), column.rows().into()).unwrap();
+        let again = IndexColumn::<Key, u32>::from_parts(column.present().to_vec(), column.rows().into()).unwrap();
         assert!(again == column);
-        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([1, NONE, 0]), Box::new([1, 2])).is_err());
-        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0, NONE, 1]), Box::new([1])).is_err());
-        assert!(IndexColumn::<Key, u32>::from_parts(Box::new([0]), Box::new([1, 2])).is_err());
+        assert_eq!(column.present(), &[1 << 1 | 1 << 4 | 1 << 9]);
+        assert_eq!(column.rows(), &[10, 40, 90]);
+        assert!(IndexColumn::<Key, u32>::from_parts(vec![0b101], Box::new([1])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(vec![0b1], Box::new([1, 2])).is_err());
+        assert!(IndexColumn::<Key, u32>::from_parts(vec![0, 0], Box::new([])).is_err());
     }
 
     #[test]

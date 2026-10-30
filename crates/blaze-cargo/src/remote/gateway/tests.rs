@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use blaze_ids::rng::SplitMix64;
 use http_body_util::{BodyExt, Full};
 use hyper::{
     Request, Response, StatusCode,
@@ -364,13 +365,9 @@ fn with_fake<F: Future<Output = ()>>(test: impl FnOnce(Arc<Fake>) -> F) {
 /// A pack of this store's format, `len` bytes that do not compress.
 fn pack_bytes(len: usize, seed: u64) -> Vec<u8> {
     let mut pack = [&b"blazepk"[..], &[STORE_FORMAT as u8]].concat();
-    let mut state = seed | 1;
-    while pack.len() < len {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        pack.extend_from_slice(&state.to_le_bytes());
-    }
+    let header = pack.len();
+    pack.resize(len.max(header), 0);
+    SplitMix64::new(seed).fill(&mut pack[header..]);
     pack.truncate(len);
     pack
 }

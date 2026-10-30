@@ -87,9 +87,9 @@ and dedups by a linear scan; `mtime_recursive` stats each entry by its full path
 
 blaze joins every path in one reused `PathBuf` and copies it out only when it was not met
 before; dedup is a scan up to 16 entries and a hash of each value past that (a script naming
-every file it reads lists hundreds). `Rerun::stale` reuses one buffer the same way. The
-recursive walk reads each entry's own time from its directory (`DirEntry::metadata`, which
-is `fstatat` on Unix) and makes its full path only for a link or a directory. `to_link`
+every file it reads lists hundreds). `Rerun::stale` builds each path in the thread's path
+buffer (`blaze_mem::scratch::with_path`), and compares variables borrowed. The recursive walk reads each entry's
+own time from its directory (`DirEntry::metadata`, which is `fstatat` on Unix) and makes its full path only for a link or a directory. `to_link`
 (cargo's `build_map`) asks the graph for each dependency's node once per edge where it asked
 twice, and does not follow a dependency that is neither for the host nor linked, which can
 give nothing.

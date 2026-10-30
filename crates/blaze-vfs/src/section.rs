@@ -36,6 +36,7 @@ impl Section {
     /// `range` of this section, sharing its mapping; `None` when it is not inside it.
     pub fn slice(&self, range: Range<usize>) -> Option<Section> {
         (range.start <= range.end && range.end <= self.len()).then(|| Section {
+            // clone: an `Arc` of the mapping, once per sub-section.
             map: self.map.clone(),
             start: self.start + range.start,
             end: self.start + range.end,

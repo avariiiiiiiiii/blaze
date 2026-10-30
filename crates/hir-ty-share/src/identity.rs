@@ -5,10 +5,12 @@
 //! layout and the `Drop` impls its drop glue reads; a coroutine by its code. So two places
 //! with one identity are one thing to the code generator, in this revision and after an edit.
 
+use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{
     ItemId, ItemKey, Unhashable, coroutine_code, interface_hash, item_key, key, layout_hash,
 };
+use either::Either;
 use hir_def::{AdtId, CallableDefId, VariantId};
 use hir_ty::{
     db::HirDatabase,
@@ -20,34 +22,35 @@ use rustc_type_ir::{
     PatternKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
+use smallvec::SmallVec;
 
 use crate::{ADT_DOMAIN, IDENTITY_DOMAIN, Unshared};
 
-pub(crate) fn ty<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, Unshared> {
+pub(crate) fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db);
     spell.ty(ty)?;
-    Ok(ContentId::of(IDENTITY_DOMAIN, &spell.out))
+    Ok(spell.out.finish())
 }
 
 pub(crate) fn args<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     args: GenericArgs<'db>,
 ) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db);
     spell.args(args)?;
-    Ok(ContentId::of(IDENTITY_DOMAIN, &spell.out))
+    Ok(spell.out.finish())
 }
 
 pub(crate) fn konst<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     konst: Const<'db>,
 ) -> Result<ContentId, Unshared> {
     let mut spell = Spell::new(db);
     spell.konst(konst)?;
-    Ok(ContentId::of(IDENTITY_DOMAIN, &spell.out))
+    Ok(spell.out.finish())
 }
 
-pub(crate) fn unhashable(db: &dyn HirDatabase) -> impl Fn(Unhashable) -> Unshared + '_ {
+pub(crate) fn unhashable(db: &Db) -> impl Fn(Unhashable) -> Unshared + '_ {
     move |it| Unshared::Unhashable(it.describe(db))
 }
 
@@ -58,7 +61,7 @@ fn no_content(what: String) -> Unshared {
 /// An ADT as its identity says it: its key, its interface (fields, variants, `repr`), its
 /// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively.
 #[salsa::tracked(returns(ref))]
-pub(crate) fn adt(db: &dyn HirDatabase, adt: AdtId) -> Result<ContentId, Unshared> {
+pub(crate) fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);
     h.id(&item_key(db, item).0)
@@ -66,7 +69,9 @@ pub(crate) fn adt(db: &dyn HirDatabase, adt: AdtId) -> Result<ContentId, Unshare
         .id(&layout_hash(db, adt).map_err(unhashable(db))?.0);
     let mut seen: FxHashSet<AdtId> = FxHashSet::default();
     seen.insert(adt);
+    // alloc: the ADTs the fields reach, once per ADT: this query's miss, memoized after
     let mut next = vec![adt];
+    // alloc: as `next`; sorted, because the walk's order is not the ADT's
     let mut dropping: Vec<(ItemKey, ContentId)> = Vec::new();
     while let Some(at) = next.pop() {
         if let Some(imp) = hir_ty::drop::destructor(db, at) {
@@ -95,49 +100,66 @@ pub(crate) fn adt(db: &dyn HirDatabase, adt: AdtId) -> Result<ContentId, Unshare
 }
 
 /// The variants of `adt` in declaration order: one for a struct or union.
-pub(crate) fn variants(db: &dyn HirDatabase, adt: AdtId) -> Vec<VariantId> {
+pub(crate) fn variants<'db>(
+    db: &'db Db,
+    adt: AdtId,
+) -> impl Iterator<Item = VariantId> + 'db {
     match adt {
-        AdtId::StructId(it) => vec![it.into()],
-        AdtId::UnionId(it) => vec![it.into()],
-        AdtId::EnumId(it) => it
-            .enum_variants(db)
-            .variants
-            .iter()
-            .map(|(_, (variant, _))| VariantId::from(*variant))
-            .collect(),
+        AdtId::StructId(it) => Either::Left(std::iter::once(it.into())),
+        AdtId::UnionId(it) => Either::Left(std::iter::once(it.into())),
+        AdtId::EnumId(it) => Either::Right(
+            it.enum_variants(db).variants.iter().map(|(_, (variant, _))| VariantId::from(*variant)),
+        ),
     }
 }
 
-/// A type or constant spelled by content into one buffer, hashed once by the caller.
+/// A type or constant spelled by content straight into its hash: nothing is buffered.
 pub(crate) struct Spell<'db> {
-    db: &'db dyn HirDatabase,
-    pub(crate) out: Vec<u8>,
+    db: &'db Db,
+    pub(crate) out: Hasher,
+}
+
+/// `fmt::Write` into a spelling: a `Debug` name hashed without a `String`.
+struct Text<'a>(&'a mut Hasher);
+
+impl std::fmt::Write for Text<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.update(text.as_bytes());
+        Ok(())
+    }
 }
 
 impl<'db> Spell<'db> {
-    pub(crate) fn new(db: &'db dyn HirDatabase) -> Spell<'db> {
-        Spell { db, out: Vec::with_capacity(256) }
+    pub(crate) fn new(db: &'db Db) -> Spell<'db> {
+        Spell { db, out: Hasher::new(IDENTITY_DOMAIN) }
     }
 
     fn u8(&mut self, value: u8) {
-        self.out.push(value);
+        self.out.update(&[value]);
     }
 
     fn u32(&mut self, value: u32) {
-        self.out.extend_from_slice(&value.to_le_bytes());
+        self.out.update(&value.to_le_bytes());
     }
 
     fn len(&mut self, len: usize) {
-        self.out.extend_from_slice(&(len as u64).to_le_bytes());
+        self.out.update(&(len as u64).to_le_bytes());
     }
 
     fn id(&mut self, id: &ContentId) {
-        self.out.extend_from_slice(&id.0);
+        self.out.id(id);
     }
 
     fn str(&mut self, text: &str) {
-        self.len(text.len());
-        self.out.extend_from_slice(text.as_bytes());
+        self.out.part(text.as_bytes());
+    }
+
+    /// `value`'s `Debug` text, ended by `0xff`, which no UTF-8 text holds.
+    fn debug(&mut self, value: &impl std::fmt::Debug) {
+        use std::fmt::Write as _;
+        // `Text` never fails, so neither does the write.
+        let _ = write!(Text(&mut self.out), "{value:?}");
+        self.u8(0xff);
     }
 
     fn key(&mut self, key: ItemKey) {
@@ -227,7 +249,8 @@ impl<'db> Spell<'db> {
                 for ty in tys.iter() {
                     self.ty(ty)?;
                 }
-                self.str(&format!("{:?} {:?}", header.abi(), header.safety()));
+                self.debug(&header.abi());
+                self.debug(&header.safety());
                 self.u8(header.c_variadic() as u8);
             }
             TyKind::UnsafeBinder(inner) => {
@@ -239,7 +262,7 @@ impl<'db> Spell<'db> {
             TyKind::Dynamic(predicates, _) => {
                 self.u8(16);
                 // The order the bounds are written in is not the type's.
-                let mut each = Vec::new();
+                let mut each: SmallVec<[ContentId; 4]> = SmallVec::new();
                 for predicate in predicates.iter() {
                     let mut inner = Spell::new(db);
                     inner.len(predicate.bound_vars().len());
@@ -272,7 +295,7 @@ impl<'db> Spell<'db> {
                             inner.item(ItemId::Trait(it.0));
                         }
                     }
-                    each.push(ContentId::of(IDENTITY_DOMAIN, &inner.out));
+                    each.push(inner.out.finish());
                 }
                 each.sort_unstable();
                 self.len(each.len());
@@ -332,15 +355,15 @@ impl<'db> Spell<'db> {
                     AliasTyKind::Opaque { .. } => "an opaque type",
                     AliasTyKind::Free { .. } => "a type alias",
                 };
-                return Err(no_content(format!("{what} left unnormalized in `{ty:?}`")));
+                return Err(no_content(format!("{what} left unnormalized in `{ty:?}`"))); // alloc: error path
             }
             TyKind::Placeholder(_) => {
-                return Err(no_content(format!("a placeholder type `{ty:?}`")));
+                return Err(no_content(format!("a placeholder type `{ty:?}`"))); // alloc: error path
             }
             TyKind::Infer(_) => {
-                return Err(no_content(format!("an inference variable `{ty:?}`")));
+                return Err(no_content(format!("an inference variable `{ty:?}`"))); // alloc: error path
             }
-            TyKind::Error(_) => return Err(no_content("a type with an error".to_owned())),
+            TyKind::Error(_) => return Err(no_content("a type with an error".to_owned())), // alloc: error path
         }
         Ok(())
     }
@@ -410,19 +433,19 @@ impl<'db> Spell<'db> {
                 self.u32(bound.var.as_u32());
             }
             ConstKind::Alias(..) => {
-                return Err(no_content(format!("the constant `{konst:?}` is not evaluated")));
+                return Err(no_content(format!("the constant `{konst:?}` is not evaluated"))); // alloc: error path
             }
             ConstKind::Expr(_) => {
-                return Err(no_content(format!("the constant expression `{konst:?}`")));
+                return Err(no_content(format!("the constant expression `{konst:?}`"))); // alloc: error path
             }
             ConstKind::Infer(InferConst::Var(_) | InferConst::Fresh(_)) => {
-                return Err(no_content(format!("an inference variable `{konst:?}`")));
+                return Err(no_content(format!("an inference variable `{konst:?}`"))); // alloc: error path
             }
             ConstKind::Placeholder(_) => {
-                return Err(no_content(format!("a placeholder constant `{konst:?}`")));
+                return Err(no_content(format!("a placeholder constant `{konst:?}`"))); // alloc: error path
             }
             ConstKind::Error(_) => {
-                return Err(no_content("a constant with an error".to_owned()));
+                return Err(no_content("a constant with an error".to_owned())); // alloc: error path
             }
         }
         Ok(())
@@ -432,8 +455,8 @@ impl<'db> Spell<'db> {
         match value.kind() {
             ValTreeKind::Leaf(scalar) => {
                 self.u8(0);
-                self.out.extend_from_slice(&scalar.size().bytes().to_le_bytes());
-                self.out.extend_from_slice(&scalar.to_bits_unchecked().to_le_bytes());
+                self.out.update(&scalar.size().bytes().to_le_bytes());
+                self.out.update(&scalar.to_bits_unchecked().to_le_bytes());
             }
             ValTreeKind::Branch(consts) => {
                 self.u8(1);

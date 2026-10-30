@@ -353,11 +353,11 @@ mod tests {
     /// A run of `sh` in the sandbox, where one can be made: it writes where it may, its report
     /// is whole and has what it read, and its status is the program's. Skipped where no
     /// sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_launcher_runs_the_program_and_reports_what_it_read() {
-        // In this process: `available` runs `blaze sandbox --probe`, and this is no blaze.
-        if let Err(why) = crate::sandbox::probe(crate::sandbox::Probe::V2) {
+        // Not `available`, which runs `blaze sandbox --probe`: this is no blaze.
+        if let Err(why) = crate::sandbox::alone::probe(crate::sandbox::Probe::V2) {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
@@ -373,7 +373,7 @@ mod tests {
             data.display()
         );
         spec.args.push(script.into());
-        assert_eq!(super::launch(&spec), 3);
+        assert_eq!(crate::sandbox::alone::launch(&spec), 3);
         assert_eq!(std::fs::read_to_string(dir.join("out/copy")).unwrap(), "input\n");
         let report = trace::decode(&std::fs::read(&spec.report).unwrap()).unwrap();
         let Report::Ran(Some(traced)) = report else { panic!("{report:?}") };

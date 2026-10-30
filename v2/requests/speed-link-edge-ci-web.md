@@ -62,3 +62,8 @@ With only `to_vec`, each record costs one more allocation and one more copy of i
 (the kept one writes its length prefix after, into a reserved 4 bytes).
 
 > forwarded to speed: speed-link-edge-wire's.
+
+> applied: `cbor::append` and a reusable `cbor::Writer` are in `crates/blaze-protocol/src/cbor/ser.rs`,
+> exported from `cbor.rs` (speed-link-edge-wire). By speed-link-edge, `blaze-web` uses it in
+> `Program::tell` (straight into `told`), `State::record` (straight into `pending`) and
+> `Workspace::keep` (one reused `Workspace::item` buffer).

@@ -453,7 +453,7 @@ pub(crate) fn stand_ins(exe: &Path) -> anyhow::Result<Vec<String>> {
     // section are looked at, by every build that is over, a no-op's too.
     // SAFETY: nothing writes the file meanwhile: who asks linked it (a worker, a doc test), or
     // is a client that holds it unwritten ([`crate::splice::unwritten`]).
-    let bytes = unsafe { memmap2::Mmap::map(&file) }
+    let bytes = unsafe { blaze_core::fs::Mapped::map(&file) }
         .with_context(|| format!("reading {}", exe.display()))?;
     if wasmparser::Parser::is_core_wasm(&bytes) {
         let (_, name) = hir_ty_codegen::stand_in_section(object::BinaryFormat::Wasm);

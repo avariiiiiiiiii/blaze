@@ -2,7 +2,7 @@
 
 use std::mem::offset_of;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_format::{FormatError, Record, Slice, Writer};
 use hir_def::{
     ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId, StaticId,
@@ -188,7 +188,7 @@ pub(crate) fn literal_ty<'db>(
 }
 
 /// Interns a possibly-unknown target usize
-pub fn usize_const<'db>(db: &'db dyn HirDatabase, value: Option<u128>, krate: Crate) -> Const<'db> {
+pub fn usize_const<'db>(db: &'db Db, value: Option<u128>, krate: Crate) -> Const<'db> {
     let interner = DbInterner::new_no_crate(db);
     let value = match value {
         Some(value) => value,
@@ -214,7 +214,7 @@ pub fn allocation_as_usize(ec: Allocation<'_>) -> u128 {
 /// trait impl has none: MIR names the trait's const (a projection) and `lookup_impl_const`
 /// resolves it at eval time, so meeting one here is a bug.
 pub fn mir_const_alias_kind<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     konst: ConstId,
 ) -> AliasConstKind<'db> {
     match konst.lookup(db).container {
@@ -234,7 +234,7 @@ pub fn mir_const_alias_kind<'db>(
 /// The value of `unevaluated`, read from the cached result by reference: an array length asks
 /// this on every check, and one that fails to evaluate clones no error.
 fn evaluated<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     unevaluated: AliasConst<'db>,
 ) -> Option<Allocation<'db>> {
     let result = match unevaluated.kind {
@@ -254,7 +254,7 @@ fn evaluated<'db>(
     result.as_ref().ok().map(|it| it.as_ref())
 }
 
-pub fn try_const_usize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<u128> {
+pub fn try_const_usize<'db>(db: &'db Db, c: Const<'db>) -> Option<u128> {
     match c.kind() {
         ConstKind::Param(_) => None,
         ConstKind::Infer(_) => None,
@@ -277,7 +277,7 @@ pub fn allocation_as_isize(ec: Allocation<'_>) -> i128 {
     i128::from_le_bytes(pad16(&ec.memory, IsSigned::Yes))
 }
 
-pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<i128> {
+pub fn try_const_isize<'db>(db: &'db Db, c: Const<'db>) -> Option<i128> {
     match c.kind() {
         ConstKind::Param(_) => None,
         ConstKind::Infer(_) => None,
@@ -312,7 +312,7 @@ pub(crate) enum CreateConstError<'db> {
 }
 
 pub(crate) fn path_to_const<'a, 'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     resolver: &Resolver<'db>,
     generics: &dyn Fn() -> &'a Generics<'db>,
     forbid_params_after: Option<u32>,
@@ -430,7 +430,7 @@ pub(crate) fn create_anon_const<'a, 'db>(
 
 #[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone))]
 pub(crate) fn const_eval_discriminant_variant<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     variant_id: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     let def = variant_id.into();
@@ -465,14 +465,14 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
 }
 
 fn const_eval_discriminant_cycle_result<'db>(
-    _: &'db dyn HirDatabase,
+    _: &'db Db,
     _: salsa::Id,
     _: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
-type TraceConst = fn(&dyn HirDatabase, ConstId, bool) -> Option<fn(std::time::Instant)>;
+type TraceConst = fn(&Db, ConstId, bool) -> Option<fn(std::time::Instant)>;
 static TRACE_CONST: std::sync::OnceLock<TraceConst> = std::sync::OnceLock::new();
 
 /// Has `observer` see each request for a named constant (`false`) and each run of its query
@@ -481,14 +481,14 @@ pub fn trace_consts_with(observer: TraceConst) {
     _ = TRACE_CONST.set(observer);
 }
 
-fn trace_const(db: &dyn HirDatabase, def: ConstId, executing: bool) -> Option<impl Drop> {
+fn trace_const(db: &Db, def: ConstId, executing: bool) -> Option<impl Drop> {
     let finish = TRACE_CONST.get()?(db, def, executing)?;
     let start = std::time::Instant::now();
     Some(stdx::defer(move || finish(start)))
 }
 
 pub(crate) fn const_eval<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ConstId,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
@@ -502,7 +502,7 @@ pub(crate) fn const_eval<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0)]
 pub(crate) fn const_eval_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ConstId,
     subst: StoredGenericArgs,
     trait_env: Option<StoredParamEnvAndCrate>,
@@ -524,7 +524,7 @@ pub(crate) fn const_eval_query<'db>(
 }
 
 fn const_eval_cycle_result<'db>(
-    _: &'db dyn HirDatabase,
+    _: &'db Db,
     _: salsa::Id,
     _: ConstId,
     _: StoredGenericArgs,
@@ -534,7 +534,7 @@ fn const_eval_cycle_result<'db>(
 }
 
 pub(crate) fn anon_const_eval<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: AnonConstId<'db>,
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
@@ -547,7 +547,7 @@ pub(crate) fn anon_const_eval<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0)]
 pub(crate) fn anon_const_eval_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: AnonConstId<'db>,
     subst: StoredGenericArgs,
     trait_env: Option<StoredParamEnvAndCrate>,
@@ -566,7 +566,7 @@ pub(crate) fn anon_const_eval_query<'db>(
 }
 
 fn anon_const_eval_cycle_result<'db>(
-    _: &'db dyn HirDatabase,
+    _: &'db Db,
     _: salsa::Id,
     _: AnonConstId<'db>,
     _: StoredGenericArgs,
@@ -576,7 +576,7 @@ fn anon_const_eval_cycle_result<'db>(
 }
 
 pub(crate) fn const_eval_static<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: StaticId,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     match const_eval_static_query(db, def) {
@@ -587,7 +587,7 @@ pub(crate) fn const_eval_static<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0)]
 pub(crate) fn const_eval_static_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     let body = db.monomorphized_runtime_mir_body(
@@ -601,7 +601,7 @@ pub(crate) fn const_eval_static_query<'db>(
 }
 
 fn const_eval_static_cycle_result<'db>(
-    _: &'db dyn HirDatabase,
+    _: &'db Db,
     _: salsa::Id,
     _: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {

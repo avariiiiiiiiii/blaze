@@ -50,8 +50,10 @@ use blaze_query::{QueryKey, Why};
 use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
-/// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 10;
+/// The version of every body's schema. A change to any type here is a new number. 11: every
+/// `Vec<u8>` (a run's output, a test's, cargo's files) is one byte string, not an array. 12:
+/// [`Request::Memory`] and [`Response::Memory`].
+pub const SCHEMA: u32 = 12;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -119,9 +121,28 @@ pub struct Cargo {
     /// The files outside the view cargo reads, by absolute path: `$CARGO_HOME/config.toml`,
     /// the `.cargo/config.toml` of each directory above the root, a `--config` file outside
     /// it. Never credentials.
+    #[serde(with = "files")]
     pub files: Vec<(String, Vec<u8>)>,
     /// `build`, `check`, `test`, `bench` or `run`.
     pub command: String,
+}
+
+/// [`Cargo::files`], each file's bytes one byte string.
+mod files {
+    use blaze_protocol::bytes::{Buf, Bytes};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(files: &[(String, Vec<u8>)], to: S) -> Result<S::Ok, S::Error> {
+        to.collect_seq(files.iter().map(|(path, bytes)| (path, Bytes(bytes))))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        from: D,
+    ) -> Result<Vec<(String, Vec<u8>)>, D::Error> {
+        let files = Vec::<(String, Buf)>::deserialize(from)?;
+        // alloc: none past the list's own; the same layout is collected in place.
+        Ok(files.into_iter().map(|(path, Buf(bytes))| (path, bytes)).collect())
+    }
 }
 
 /// The environment's values may be secrets: Debug names the variables only.
@@ -214,6 +235,9 @@ pub enum Request {
     /// with `test`) ahead as [`Request::WillTest`] builds ahead; a commit to `head` that makes
     /// the same root takes the work over, and one that makes another root cancels it.
     WillSave { ops: Vec<Op>, head: String, test: bool, targets: Targets, wait_ms: u64 },
+    /// What each subsystem's memory is doing, from blaze-mem's counters; answered with
+    /// [`Response::Memory`].
+    Memory,
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -247,7 +271,13 @@ pub enum Response {
     /// What a build, test or run did, before its [`Response::Done`].
     Work(Worked),
     TestResult(TestResult),
-    Ran { code: Option<i32>, stderr: Vec<u8>, stdout: Vec<u8> },
+    Ran {
+        code: Option<i32>,
+        #[serde(with = "blaze_protocol::bytes")]
+        stderr: Vec<u8>,
+        #[serde(with = "blaze_protocol::bytes")]
+        stdout: Vec<u8>,
+    },
     Diff { changes: Vec<Change> },
     Why(Why),
     Status(Status),
@@ -272,6 +302,7 @@ pub enum Response {
     Edited(Edited),
     /// The root a [`Request::WillTest`] or [`Request::WillSave`] builds ahead.
     Announced { root: ContentId },
+    Memory(Memory),
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -470,6 +501,7 @@ pub struct TestResult {
     /// `Unreached` with `millis` 0.
     pub cached: Option<Cached>,
     pub millis: u64,
+    #[serde(with = "blaze_protocol::bytes")]
     pub output: Vec<u8>,
     pub outcome: TestOutcome,
 }
@@ -509,6 +541,37 @@ pub struct Status {
     pub requests: Vec<u64>,
     pub budget_bytes: u64,
     pub memory_bytes: u64,
+}
+
+/// The daemon's memory by subsystem ([`Request::Memory`]): blaze-mem's counters
+/// (`blaze_mem::tag`), read with relaxed loads, so each number is exact and the set is not
+/// one instant.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Memory {
+    /// One per `blaze_mem::Tag`, in its order.
+    pub tags: Vec<TagMemory>,
+    /// Bytes committed in every region of blaze-mem's now, whatever holds them: with the
+    /// global allocator's, what admission counts as blaze's own.
+    pub committed: u64,
+    pub committed_high_water: u64,
+}
+
+/// One subsystem's memory: what it holds now and at most, what it handed out in all, the
+/// rate it hands out at, the most one task of it took from its frame, and the most it should
+/// hold.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct TagMemory {
+    /// The tag's name: `parse`, `infer`, `codegen`, `io` and the rest.
+    pub tag: String,
+    pub live: u64,
+    /// Bytes a second handed out since the last [`Request::Memory`] of the daemon; 0 for the
+    /// first.
+    pub rate: u64,
+    /// `u64::MAX` for no budget.
+    pub budget: u64,
+    pub allocated: u64,
+    pub task_peak: u64,
+    pub high_water: u64,
 }
 
 /// What failed, and where.
@@ -612,5 +675,50 @@ mod tests {
         let back: Envelope<Request> = blaze_protocol::cbor::from_slice(&bytes).unwrap();
         assert_eq!(back, request);
         assert_eq!(back.schema, SCHEMA);
+    }
+
+    /// A run's output is one byte string; JSON shows it as the array of numbers it was.
+    #[test]
+    fn bytes_go_out_as_byte_strings() {
+        let ran = Response::Ran { code: Some(0), stderr: vec![1], stdout: b"hi".to_vec() };
+        let bytes = blaze_protocol::cbor::to_vec(&ran).unwrap();
+        let mut want = vec![0xa1, 0x63, b'R', b'a', b'n', 0xa3, 0x64, b'c', b'o', b'd', b'e', 0x00];
+        want.extend_from_slice(&[0x66, b's', b't', b'd', b'e', b'r', b'r', 0x41, 1]);
+        want.extend_from_slice(&[0x66, b's', b't', b'd', b'o', b'u', b't', 0x42, b'h', b'i']);
+        assert_eq!(bytes, want);
+        assert_eq!(blaze_protocol::cbor::from_slice::<Response>(&bytes).unwrap(), ran);
+        let json = serde_json::to_string(&ran).unwrap();
+        assert_eq!(json, r#"{"Ran":{"code":0,"stderr":[1],"stdout":[104,105]}}"#);
+        assert_eq!(serde_json::from_str::<Response>(&json).unwrap(), ran);
+
+        let result = TestResult {
+            name: "t".to_owned(),
+            binary: "b".to_owned(),
+            cached: None,
+            millis: 1,
+            output: vec![9; 30],
+            outcome: TestOutcome::Passed,
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&result).unwrap();
+        let mut output = vec![0x66, b'o', b'u', b't', b'p', b'u', b't', 0x58, 30];
+        output.extend_from_slice(&[9; 30]);
+        assert!(bytes.windows(output.len()).any(|it| it == output), "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<TestResult>(&bytes).unwrap(), result);
+
+        let cargo = Cargo {
+            cwd: "/w".to_owned(),
+            env: Vec::new(),
+            args: Vec::new(),
+            root: "/w".to_owned(),
+            color: false,
+            files: vec![("/c".to_owned(), vec![1, 2])],
+            command: "build".to_owned(),
+        };
+        let bytes = blaze_protocol::cbor::to_vec(&cargo).unwrap();
+        let files = [0x65, b'f', b'i', b'l', b'e', b's', 0x81, 0x82, 0x62, b'/', b'c', 0x42, 1, 2];
+        assert!(bytes.windows(files.len()).any(|it| it == files), "{bytes:02x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Cargo>(&bytes).unwrap(), cargo);
+        let json = serde_json::to_value(&cargo).unwrap();
+        assert_eq!(json["files"], serde_json::json!([["/c", [1, 2]]]));
     }
 }

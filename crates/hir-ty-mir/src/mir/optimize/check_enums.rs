@@ -13,6 +13,7 @@ use rustc_abi::{Scalar, Size};
 use rustc_type_ir::inherent::IntoKind;
 
 use crate::{
+    db::HirDatabase,
     layout::{TagEncoding, Variants},
     mir::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, CastKind, MirBody, MirLowerError, MirSpan,
@@ -148,6 +149,7 @@ fn find<'db>(
             let mut valid = Vec::new();
             for (variant, _) in id.enum_variants(ctx.db).variants.values() {
                 let value = ctx.db.const_eval_discriminant(*variant).map_err(|error| {
+                    // alloc: error path
                     MirLowerError::ConstEvalError("the discriminant".into(), Box::new(error))
                 })?;
                 // rustc's `Discr::val`: the bits of the value.
@@ -194,6 +196,7 @@ fn discr_of<'db>(ctx: &Ctx<'db>, value: rustc_abi::Primitive) -> Result<'db, Dis
         }
     };
     let Some(size) = ctx.size_of(ty) else {
+        // alloc: error path
         return Err(MirLowerError::NotSupported(format!("UB checks: no layout of the tag {ty:?}")));
     };
     Ok(Discr { ty, size: Size::from_bytes(size) })
@@ -208,6 +211,7 @@ fn uint_of_size<'db>(ctx: &Ctx<'db>, size: Size) -> Result<'db, Ty<'db>> {
         8 => UintTy::U64,
         16 => UintTy::U128,
         invalid => {
+            // alloc: error path
             return Err(MirLowerError::NotSupported(format!(
                 "UB checks: a value of {invalid} bytes transmuted to an enum"
             )));

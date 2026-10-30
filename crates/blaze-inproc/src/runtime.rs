@@ -1,86 +1,222 @@
-//! The run process's side, linked into the program: its quiescent points, its threads' fence
-//! slots, and requests to the daemon over the channel.
+//! The run process's side, linked into the program: the start hook that attaches it to the
+//! daemon before `main` (the crate docs' "The start of a run"), its quiescent points, its
+//! threads' fence slots, and requests to the daemon over the channel.
 //!
-//! The loader leaves `BLAZE_INPROC_BOOT` in the program's environment: the address of its
-//! [`Boot`], which says where the control words are and which channel to use. A program
-//! started otherwise has no fence to report to: [`attach`] says so and [`quiesce`] does
-//! nothing.
+//! The link puts a pointer to [`blaze_inproc_start`] first among the executable's initializers:
+//! the ELF `.preinit_array`, the Mach-O `__mod_init_func`, a PE TLS callback in `.CRT$XLAB`. The
+//! daemon's own executable never has one. A program whose link has none, or that was started
+//! with no `BLAZE_INPROC` (run by hand), runs its file as it is: [`attach`] says why, and
+//! [`quiesce`] does nothing.
 
 use std::cell::Cell;
 use std::sync::{Mutex, OnceLock};
 
 use crate::channel::Channel;
 use crate::fence::{MOST_FRAMES, Thread};
-use crate::frame::Kind;
-use crate::{Error, sys};
-
-/// The environment variable naming the [`Boot`]'s address, in hex.
-pub const BOOT_VAR: &str = "BLAZE_INPROC_BOOT";
-
-pub(crate) const BOOT_MAGIC: u64 = u64::from_le_bytes(*b"bzboot01");
-
-/// What the loader tells the program it started, at a fixed layout: the loader and the
-/// program each have their own copy of this crate.
-#[repr(C)]
-pub struct Boot {
-    pub magic: u64,
-    /// Where the control words are mapped, and their length.
-    pub control: u64,
-    pub control_len: u64,
-    /// The channel's fd (Unix) or handle (Windows), inherited from the loader.
-    pub channel: i64,
-    /// Where the code memory's offset 0 is, and its length.
-    pub base: u64,
-    pub len: u64,
-}
-
-const _: () = assert!(size_of::<Boot>() == 48);
+use crate::frame::{Kind, Reader, Writer, kinds};
+use crate::handshake::{Grant, HOST_VAR, Hello, VERSION, host_var};
+use crate::{Access, Error, Format, image, sys};
 
 pub struct Attached {
     control: &'static [std::sync::atomic::AtomicU64],
     /// Taken for one request and its answer, by the thread that asks: requests are stub misses
     /// and the like, never a hot path, and nothing is called with it held.
     channel: Mutex<Channel>,
-    base: u64,
-    len: u64,
+    slide: u64,
     pid: u32,
 }
 
+/// Set once, by the start hook, before any thread of the program runs.
 static ATTACHED: OnceLock<Result<Attached, Error>> = OnceLock::new();
 
-/// This process's side of the fence and channel, once.
+/// This process's side of the fence and channel, as the start hook left it.
 pub fn attach() -> Result<&'static Attached, Error> {
-    ATTACHED.get_or_init(open).as_ref().map_err(Clone::clone)
+    match ATTACHED.get() {
+        Some(attached) => attached.as_ref().map_err(Clone::clone),
+        None => Err(Error::new(
+            "the start hook never ran: the executable's link has no pointer to blaze_inproc_start among its first \
+             initializers",
+        )),
+    }
 }
 
-fn open() -> Result<Attached, Error> {
-    let at = std::env::var(BOOT_VAR)
-        .map_err(|_| Error::new(format!("{BOOT_VAR} is not set: this program was not started by blaze's loader")))?;
-    let at = u64::from_str_radix(at.trim_start_matches("0x"), 16)
-        .map_err(|_| Error::new(format!("{BOOT_VAR}={at} is not a hex address")))?;
-    let boot = sys::boot(at)?;
-    if boot.magic != BOOT_MAGIC {
-        return Err(Error::new(format!("{BOOT_VAR} at {at:#x} is not a boot record of this version")));
-    }
-    let control = sys::adopt_words(boot.control, boot.control_len)?;
-    if !Thread::ready(&control) {
-        return Err(Error::new(format!("the control words at {:#x} are not set up", boot.control)));
-    }
-    let channel = Channel::from_raw(boot.channel)?;
-    Ok(Attached {
-        control,
-        channel: Mutex::new(channel),
-        base: boot.base,
-        len: boot.len,
-        pid: std::process::id(),
-    })
-}
-
-/// A quiescent point of the calling thread, when this process was started by the loader.
+/// A quiescent point of the calling thread, when this process was started by the daemon.
 pub fn quiesce() {
     if let Ok(attached) = attach() {
         attached.quiesce();
     }
+}
+
+/// The start hook, on Linux: `.preinit_array` entries get `argc`, `argv` and `envp`. libc's
+/// `environ` is not set yet (libc's own initializer runs after), so the variable comes from
+/// `envp` and leaves it in place: the pointers after it move down one, so libc, the program
+/// and its children never see it.
+///
+/// # Safety
+///
+/// Called by the dynamic linker as a `.preinit_array` entry, once, before any other code of
+/// the program, with the process's own `envp`.
+#[cfg(target_os = "linux")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn blaze_inproc_start(
+    _: std::ffi::c_int,
+    _: *const *const std::ffi::c_char,
+    envp: *mut *const std::ffi::c_char,
+) {
+    // SAFETY: `envp` is the process's environment, null-terminated, which nothing else reads
+    // or writes yet (the caller's contract).
+    let var = unsafe { take_from(envp) };
+    start(var);
+}
+
+/// Takes `BLAZE_INPROC=...` out of the null-terminated `envp`, moving the entries after it
+/// down: its value.
+///
+/// # Safety
+///
+/// `envp` is null or a null-terminated array of NUL-terminated strings, written by nothing
+/// else meanwhile.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn take_from(envp: *mut *const std::ffi::c_char) -> Option<Vec<u8>> {
+    if envp.is_null() {
+        return None;
+    }
+    let prefix = HOST_VAR.as_bytes();
+    let mut index = 0;
+    loop {
+        // SAFETY: `index` is at or before the terminating null (the loop stops there).
+        let entry = unsafe { *envp.add(index) };
+        if entry.is_null() {
+            return None;
+        }
+        // SAFETY: a NUL-terminated string of the environment.
+        let bytes = unsafe { std::ffi::CStr::from_ptr(entry) }.to_bytes();
+        if bytes.len() > prefix.len() && bytes.starts_with(prefix) && bytes[prefix.len()] == b'=' {
+            let value = bytes[prefix.len() + 1..].to_vec();
+            let mut at = index;
+            loop {
+                // SAFETY: `at + 1` is at or before the terminating null, and `at` before it:
+                // both in the array.
+                let next = unsafe { *envp.add(at + 1) };
+                // SAFETY: as above; the array is writable, the process's own.
+                unsafe { *envp.add(at) = next };
+                if next.is_null() {
+                    return Some(value);
+                }
+                at += 1;
+            }
+        }
+        index += 1;
+    }
+}
+
+/// The start hook, on macOS: the first `__mod_init_func` entry, after libSystem's initializers,
+/// so the environment is set up.
+#[cfg(target_os = "macos")]
+#[unsafe(no_mangle)]
+pub extern "C" fn blaze_inproc_start() {
+    let var = std::env::var_os(HOST_VAR).map(std::os::unix::ffi::OsStringExt::into_vec);
+    if var.is_some() {
+        // SAFETY: the program's own code has not run, so none of its threads reads the
+        // environment; dyld runs initializers on one thread.
+        unsafe { std::env::remove_var(HOST_VAR) };
+    }
+    start(var);
+}
+
+/// The start hook, on Windows: a TLS callback, run before the CRT's start, on the process's
+/// first thread at `DLL_PROCESS_ATTACH`.
+///
+/// # Safety
+///
+/// Called by the system loader as a TLS callback.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn blaze_inproc_start(_: *mut std::ffi::c_void, reason: u32, _: *mut std::ffi::c_void) {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    if reason != DLL_PROCESS_ATTACH {
+        return;
+    }
+    let var = std::env::var(HOST_VAR).ok().map(String::into_bytes);
+    if var.is_some() {
+        // SAFETY: the program's own code has not run (TLS callbacks come before the CRT's
+        // start), so none of its threads reads the environment.
+        unsafe { std::env::remove_var(HOST_VAR) };
+    }
+    start(var);
+}
+
+/// Attaches, or stops the process: a run whose code memory can't be laid over its image must
+/// not run the file's code in its place.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), expect(dead_code, reason = "no start hook here"))]
+fn start(var: Option<Vec<u8>>) {
+    if ATTACHED.get().is_some() {
+        return;
+    }
+    let Some(var) = var else {
+        let _ = ATTACHED.set(Err(Error::new(format!("{HOST_VAR} is not set: this program was not started by blaze"))));
+        return;
+    };
+    let mut channel = None;
+    match open(&var, &mut channel) {
+        Ok(attached) => {
+            let _ = ATTACHED.set(Ok(attached));
+        }
+        Err(error) => {
+            if let Some(channel) = &mut channel {
+                let mut body = Vec::new();
+                Writer::new(&mut body).str(&error.to_string());
+                let _ = channel.send(kinds::FAILED, 0, &body);
+            }
+            eprintln!("{error}");
+            std::process::exit(127);
+        }
+    }
+}
+
+fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
+    let (address, token) = host_var(var)?;
+    let format = Format::host().ok_or_else(|| Error::new("no executable format on this platform"))?;
+    let page = sys::page();
+    let (header, headers) = sys::own_image()?;
+    let own = image::layout(format, headers, page)?;
+    let channel = out.insert(Channel::new(sys::connect(address)?));
+
+    let mut hello = Vec::with_capacity(40);
+    Hello { token, pid: std::process::id(), version: VERSION, page, header }.encode(&mut hello);
+    channel.send(kinds::HELLO, 0, &hello)?;
+    let grant = {
+        let frame = channel.recv()?;
+        match frame.kind {
+            kinds::GRANT => Grant::decode(frame.body)?,
+            kinds::REFUSED => {
+                let why = Reader::new(frame.body).str().unwrap_or("(not UTF-8)").to_owned();
+                return Err(Error::new(format!("the daemon refused this run: {why}")));
+            }
+            other => return Err(Error::new(format!("the daemon answered hello with a frame of kind {:#06x}", other.0))),
+        }
+    };
+    grant.check(&own, page)?;
+    let objects = sys::recv_objects(channel, grant.objects.len())?;
+    for (index, (object, (len, _))) in objects.iter().zip(&grant.objects).enumerate() {
+        if object.len() != *len {
+            return Err(Error::new(format!("object {index} is {:#x} bytes, where the grant says {len:#x}", object.len())));
+        }
+    }
+    let slide = header.wrapping_sub(grant.header);
+    let control = &objects[1];
+    let at = control.map_anywhere(channel, Access::Shared)?;
+    let words = sys::adopt_words(at, control.len())?;
+    if !Thread::ready(&words) {
+        return Err(Error::new(format!("the control words at {at:#x} are not set up")));
+    }
+    sys::overlay(channel, &objects, &grant.overlays, slide)?;
+
+    let mut started = Vec::with_capacity(8);
+    Writer::new(&mut started).u64(sys::thread_id());
+    channel.send(kinds::STARTED, 0, &started)?;
+    let channel = out.take().ok_or_else(|| Error::new("the channel went away while starting"))?;
+    Ok(Attached { control: words, channel: Mutex::new(channel), slide, pid: std::process::id() })
 }
 
 /// The calling thread's slot and the epoch it last reported, and its release when it ends.
@@ -109,14 +245,15 @@ impl Drop for Local {
         let Some(index) = self.slot.get() else { return };
         let Some(Ok(attached)) = ATTACHED.get() else { return };
         let mut frames = [0u64; MOST_FRAMES];
-        let walked = sys::backtrace(&mut frames).map(|len| &frames[..len]);
+        let walked = attached.walk(&mut frames);
         let epoch = Thread::epoch(&attached.control);
-        if Thread::seen(&attached.control, epoch, walked) == epoch {
+        let seen = Thread::seen(&attached.control, epoch, walked);
+        if seen == epoch {
             Thread::release(&attached.control, index);
         } else {
             // A frame returns into retired code: the slot holds its fence until the daemon
             // finds the thread gone.
-            Thread::report(&attached.control, index, Thread::seen(&attached.control, epoch, walked));
+            Thread::report(&attached.control, index, seen);
         }
     }
 }
@@ -126,22 +263,24 @@ thread_local! {
 }
 
 impl Attached {
-    /// Where the code memory's offset 0 is in this process.
-    pub fn base(&self) -> u64 {
-        self.base
-    }
-
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+    /// What this process adds to a linked address: where its image's header is minus where the
+    /// link put it.
+    pub fn slide(&self) -> u64 {
+        self.slide
     }
 
     /// What the daemon last announced ([`crate::CodeMemory::announce`]): one load.
     pub fn announced(&self) -> u64 {
         Thread::announced(&self.control)
+    }
+
+    /// The calling thread's return addresses as linked addresses, the fence's.
+    fn walk<'a>(&self, frames: &'a mut [u64; MOST_FRAMES]) -> Option<&'a [u64]> {
+        let len = sys::backtrace(frames)?;
+        for frame in &mut frames[..len] {
+            *frame = frame.wrapping_sub(self.slide);
+        }
+        Some(&frames[..len])
     }
 
     /// A quiescent point of the calling thread: it is in no code it could leave and return
@@ -161,7 +300,7 @@ impl Attached {
             }
             sys::serialize();
             let mut frames = [0u64; MOST_FRAMES];
-            let walked = sys::backtrace(&mut frames).map(|len| &frames[..len]);
+            let walked = self.walk(&mut frames);
             let seen = Thread::seen(&self.control, epoch, walked);
             match local.slot.get() {
                 Some(index) if Thread::holds(&self.control, index, self.pid, tid) => {

@@ -23,11 +23,17 @@
 //! Each index is columns (docs/v2/plan/design/data.md): the searched column apart, so a binary
 //! search touches only it, keys and the cold payloads beside it, and lists as runs of one
 //! flat array ([`Runs`], [`ScopeNames`]).
+//!
+//! Each column is allocated once at its final length; the rows it is sorted from are the
+//! building query's, in its task's frame. Scopes' frames are tagged [`Tag::Nameres`] (what a
+//! name is in a scope is name resolution's answer), the impl and trait indexes' [`Tag::Other`].
 
+// alloc: only with `KeyHashing`, which folds a key's own words: no SipHash.
 use std::collections::HashMap;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{Frame, Tag, frame};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, BuiltinDeriveImplId, EnumId, HasModule, ImplId, ModuleDefId, ModuleId,
@@ -50,6 +56,7 @@ use crate::{
     SimplifiedType,
     hash::{self, Unhashable},
     key::{self, KeyHashing, Resolved},
+    table::column,
 };
 
 const IMPLS_DOMAIN: &str = "blaze v2 index impls 1";
@@ -58,13 +65,18 @@ const BUILTIN_DERIVE_DOMAIN: &str = "blaze v2 builtin derive interface 1";
 
 /// The hash of each of `names`, in order, as [`key::name_hash`] gives it, in one batched call.
 pub(crate) fn name_hashes<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<NameHash> {
-    let inputs: Vec<&[u8]> = names.into_iter().map(str::as_bytes).collect();
-    ContentId::of_many(NAME_DOMAIN, &inputs).into_iter().map(NameHash).collect()
+    let hashes = frame::task(Tag::Other, |frame| {
+        let mut inputs: Vec<&[u8], &Frame> = Vec::new_in(frame);
+        inputs.extend(names.into_iter().map(str::as_bytes));
+        ContentId::of_many(NAME_DOMAIN, &inputs)
+    });
+    // alloc: none: collected in place, in the buffer `of_many` returned.
+    hashes.into_iter().map(NameHash).collect()
 }
 
 /// The impls of `key.trait_` whose simplified self type is `key.self_ty`, by key and
 /// interface hash, sorted; empty is "no impl". Answers `Implements` both ways.
-pub fn impls(db: &dyn HirDatabase, key: ImplIndexKey) -> Result<ImplEntry, Unhashable> {
+pub fn impls(db: &Db, key: ImplIndexKey) -> Result<ImplEntry, Unhashable> {
     match resolve_trait(db, key.trait_) {
         Some(trait_) => entry(db, impls_of(db, trait_, key.self_ty).iter()),
         None => Ok(ImplEntry::TraitAbsent),
@@ -73,7 +85,7 @@ pub fn impls(db: &dyn HirDatabase, key: ImplIndexKey) -> Result<ImplEntry, Unhas
 
 /// The impls of `trait_` whose self type simplifies to nothing (`impl<T> Trait for T`): they
 /// unify with any self type.
-pub fn blanket_impls(db: &dyn HirDatabase, trait_: ItemKey) -> Result<ImplEntry, Unhashable> {
+pub fn blanket_impls(db: &Db, trait_: ItemKey) -> Result<ImplEntry, Unhashable> {
     match resolve_trait(db, trait_) {
         Some(trait_) => entry(db, blanket_impls_of(db, trait_).iter()),
         None => Ok(ImplEntry::TraitAbsent),
@@ -81,7 +93,7 @@ pub fn blanket_impls(db: &dyn HirDatabase, trait_: ItemKey) -> Result<ImplEntry,
 }
 
 /// What `key.name` is in `key.scope`; "nothing" is an answer. Answers `Resolves` both ways.
-pub fn scope(db: &dyn HirDatabase, key: ScopeIndexKey) -> Result<ScopeEntry, Unhashable> {
+pub fn scope(db: &Db, key: ScopeIndexKey) -> Result<ScopeEntry, Unhashable> {
     let Some(resolved) = key::resolve(db, key.scope) else { return Ok(ScopeEntry::ScopeAbsent) };
     let owner = match resolved {
         Resolved::Module(it) => ScopeOwner::Module(it),
@@ -254,7 +266,7 @@ fn write_vis(hasher: &mut Hasher, vis: Vis) {
     };
 }
 
-fn vis(db: &dyn HirDatabase, visibility: Visibility) -> Vis {
+fn vis(db: &Db, visibility: Visibility) -> Vis {
     match visibility {
         Visibility::Public => Vis::Public,
         Visibility::PubCrate(krate) => Vis::Crate(key::crate_key(db, krate)),
@@ -275,7 +287,7 @@ const _: () = assert!(size_of::<AnyImpl>() == 8);
 /// derive writes for its type, so it is its key (which names the trait) and the type's
 /// interface.
 pub(crate) fn impl_interface(
-    db: &dyn HirDatabase,
+    db: &Db,
     imp: AnyImpl,
 ) -> Result<InterfaceHash, Unhashable> {
     match imp {
@@ -289,21 +301,23 @@ pub(crate) fn impl_interface(
 }
 
 /// `impls` with their interface hashes, in the order given.
-pub(crate) fn entry(
-    db: &dyn HirDatabase,
-    impls: impl IntoIterator<Item = (ItemKey, AnyImpl)>,
-) -> Result<ImplEntry, Unhashable> {
-    let impls = impls
-        .into_iter()
-        .map(|(key, imp)| Ok((key, impl_interface(db, imp)?)))
-        .collect::<Result<Box<[_]>, Unhashable>>()?;
-    Ok(ImplEntry::Impls(impls))
+pub(crate) fn entry<I>(db: &Db, impls: I) -> Result<ImplEntry, Unhashable>
+where
+    I: IntoIterator<Item = (ItemKey, AnyImpl)>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let impls = impls.into_iter();
+    let mut found = Vec::with_capacity(impls.len());
+    for (key, imp) in impls {
+        found.push((key, impl_interface(db, imp)?));
+    }
+    Ok(ImplEntry::Impls(found.into_boxed_slice()))
 }
 
 /// The value of `Implements { trait_, self_ty }`: the impls for that self type and the
 /// blanket ones.
 pub(crate) fn implements_value(
-    db: &dyn HirDatabase,
+    db: &Db,
     domain: &'static str,
     trait_: TraitId,
     self_ty: SimplifiedType,
@@ -316,7 +330,7 @@ pub(crate) fn implements_value(
 /// for every fact that reads them.
 #[salsa::tracked]
 fn implements_entries(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Result<(ContentId, ContentId), Unhashable> {
@@ -329,13 +343,13 @@ fn implements_entries(
 /// coherence reads, hashed once per trait rather than once per blanket impl.
 #[salsa::tracked]
 pub(crate) fn all_impls_value(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
 ) -> Result<ContentId, Unhashable> {
     Ok(entry(db, trait_impls(db, trait_).all().iter())?.value())
 }
 
-pub(crate) fn resolve_trait(db: &dyn HirDatabase, trait_: ItemKey) -> Option<TraitId> {
+pub(crate) fn resolve_trait(db: &Db, trait_: ItemKey) -> Option<TraitId> {
     match key::resolve(db, trait_)? {
         Resolved::Item(ItemId::Trait(it)) => Some(it),
         _ => unreachable!("{trait_:?} names something that is not a trait"),
@@ -344,7 +358,7 @@ pub(crate) fn resolve_trait(db: &dyn HirDatabase, trait_: ItemKey) -> Option<Tra
 
 /// The hash of an impl's simplified self type, as hir-ty's `TraitImpls` and `InherentImpls`
 /// find it: `None` for a blanket impl.
-pub(crate) fn impl_self_ty(db: &dyn HirDatabase, imp: ImplId) -> Option<SimplifiedType> {
+pub(crate) fn impl_self_ty(db: &Db, imp: ImplId) -> Option<SimplifiedType> {
     let self_ty = match db.impl_trait(imp) {
         Some(trait_ref) => trait_ref.instantiate_identity().skip_norm_wip().self_ty(),
         None => db.impl_self_ty(imp).instantiate_identity().skip_norm_wip(),
@@ -368,28 +382,27 @@ pub(crate) struct Runs<S, T> {
 }
 
 impl<S: Copy + Ord, T: Copy> Runs<S, T> {
-    fn new(mut rows: Vec<(Option<S>, ItemKey, T)>) -> Self {
+    /// The columns of `rows`, which it sorts.
+    fn new(rows: &mut [(Option<S>, ItemKey, T)]) -> Self {
         rows.sort_unstable_by_key(|&(at, key, _)| (at, key));
-        let mut searched = Vec::new();
-        let mut starts = Vec::new();
-        let mut keys = Vec::with_capacity(rows.len());
-        let mut values = Vec::with_capacity(rows.len());
-        for (row, (at, key, value)) in rows.into_iter().enumerate() {
-            if let Some(at) = at {
-                if searched.last() != Some(&at) {
-                    searched.push(at);
-                    starts.push(row_index(row));
-                }
+        let opens = |row: usize| rows[row].0.is_some() && (row == 0 || rows[row - 1].0 != rows[row].0);
+        let runs = (0..rows.len()).filter(|&row| opens(row)).count();
+        let mut searched = Vec::with_capacity(runs);
+        let mut starts = Vec::with_capacity(runs + 1);
+        for (row, &(at, _, _)) in rows.iter().enumerate() {
+            if let Some(at) = at
+                && opens(row)
+            {
+                searched.push(at);
+                starts.push(row_index(row));
             }
-            keys.push(key);
-            values.push(value);
         }
-        starts.push(row_index(keys.len()));
+        starts.push(row_index(rows.len()));
         Runs {
-            searched: searched.into(),
-            starts: starts.into(),
-            keys: keys.into(),
-            values: values.into(),
+            searched: searched.into_boxed_slice(),
+            starts: starts.into_boxed_slice(),
+            keys: column(rows.iter().map(|&(_, key, _)| key)),
+            values: column(rows.iter().map(|&(_, _, value)| value)),
         }
     }
 
@@ -402,6 +415,7 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
                 Err(_) => 0..0,
             },
         };
+        // clone: a range, two indexes.
         Columns { keys: &self.keys[rows.clone()], values: &self.values[rows] }
     }
 
@@ -415,6 +429,7 @@ impl<S: Copy + Ord, T: Copy> Runs<S, T> {
         let none = self.run(None).iter().map(|(key, value)| (None, key, value));
         let runs = self.searched.iter().enumerate().flat_map(move |(i, &at)| {
             let rows = self.starts[i] as usize..self.starts[i + 1] as usize;
+            // clone: a range, two indexes.
             Columns { keys: &self.keys[rows.clone()], values: &self.values[rows] }
                 .iter()
                 .map(move |(key, value)| (Some(at), key, value))
@@ -435,7 +450,7 @@ pub(crate) struct Columns<'a, T> {
 }
 
 impl<'a, T: Copy> Columns<'a, T> {
-    pub(crate) fn iter(self) -> impl Iterator<Item = (ItemKey, T)> + 'a {
+    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = (ItemKey, T)> + 'a {
         self.keys.iter().copied().zip(self.values.iter().copied())
     }
 }
@@ -448,17 +463,23 @@ pub(crate) struct Keyed<T> {
 }
 
 impl<T: Copy> Keyed<T> {
-    fn sorted(mut rows: Vec<(ItemKey, T)>) -> Self {
+    /// The columns of `rows`, which it sorts.
+    fn sorted(rows: &mut [(ItemKey, T)]) -> Self {
         rows.sort_unstable_by_key(|&(key, _)| key);
-        Keyed::of(rows)
+        Keyed::of(rows.iter().copied())
     }
 
-    fn of(rows: impl IntoIterator<Item = (ItemKey, T)>) -> Self {
-        let (keys, values): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
-        Keyed { keys: keys.into(), values: values.into() }
+    fn of(rows: impl ExactSizeIterator<Item = (ItemKey, T)>) -> Self {
+        let mut keys = Vec::with_capacity(rows.len());
+        let mut values = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            keys.push(key);
+            values.push(value);
+        }
+        Keyed { keys: keys.into_boxed_slice(), values: values.into_boxed_slice() }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (ItemKey, T)> + '_ {
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (ItemKey, T)> + '_ {
         Columns { keys: &self.keys, values: &self.values }.iter()
     }
 }
@@ -466,50 +487,53 @@ impl<T: Copy> Keyed<T> {
 /// The impls of `trait_` in `krate`, as [`trait_impls`] holds them.
 #[salsa::tracked(returns(ref))]
 fn trait_impls_in(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     trait_: TraitId,
 ) -> Runs<SimplifiedType, AnyImpl> {
-    let mut found = Vec::new();
-    TraitImpls::for_crate(db, krate).for_trait(trait_, |impls| match impls {
-        Either::Left(impls) => found.extend(impls.iter().map(|&it| {
-            (impl_self_ty(db, it), key::item_key(db, ItemId::Impl(it)), AnyImpl::Impl(it))
-        })),
-        Either::Right(derives) => found.extend(derives.iter().map(|&it| {
-            let adt = HirSimplifiedType::Adt(it.loc(db).adt.into());
-            (
-                Some(key::simplified(db, &adt)),
-                key::builtin_derive_key(db, it),
-                AnyImpl::BuiltinDerive(it),
-            )
-        })),
-    });
-    Runs::new(found)
+    frame::task(Tag::Other, |frame| {
+        let mut found: Vec<_, &Frame> = Vec::new_in(frame);
+        TraitImpls::for_crate(db, krate).for_trait(trait_, |impls| match impls {
+            Either::Left(impls) => found.extend(impls.iter().map(|&it| {
+                (impl_self_ty(db, it), key::item_key(db, ItemId::Impl(it)), AnyImpl::Impl(it))
+            })),
+            Either::Right(derives) => found.extend(derives.iter().map(|&it| {
+                let adt = HirSimplifiedType::Adt(it.loc(db).adt.into());
+                (
+                    Some(key::simplified(db, &adt)),
+                    key::builtin_derive_key(db, it),
+                    AnyImpl::BuiltinDerive(it),
+                )
+            })),
+        });
+        Runs::new(&mut found)
+    })
 }
 
 /// The impls of `trait_` in every crate, by simplified self type (the blanket ones as their
 /// own run, first), then key.
 #[salsa::tracked(returns(ref))]
-pub(crate) fn trait_impls(db: &dyn HirDatabase, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
-    Runs::new(
-        dependents(db, trait_.krate(db))
-            .iter()
-            .flat_map(|&krate| trait_impls_in(db, krate, trait_).rows())
-            .collect(),
-    )
+pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyImpl> {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
+        for &krate in dependents(db, trait_.krate(db)) {
+            rows.extend(trait_impls_in(db, krate, trait_).rows());
+        }
+        Runs::new(&mut rows)
+    })
 }
 
 /// `krate` and the crates that depend on it, directly or not: the only ones that can hold an
 /// impl of one of its traits, which the impl names.
 #[salsa::tracked(returns(deref))]
-fn dependents(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
+fn dependents(db: &Db, krate: Crate) -> Box<[Crate]> {
     krate.transitive_rev_deps(db)
 }
 
 /// The impls of `trait_` whose simplified self type is `self_ty`, sorted by key.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn impls_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     self_ty: SimplifiedType,
 ) -> Keyed<AnyImpl> {
@@ -518,76 +542,81 @@ pub(crate) fn impls_of(
 
 /// The blanket impls of `trait_`, sorted by key.
 #[salsa::tracked(returns(ref))]
-pub(crate) fn blanket_impls_of(db: &dyn HirDatabase, trait_: TraitId) -> Keyed<AnyImpl> {
+pub(crate) fn blanket_impls_of(db: &Db, trait_: TraitId) -> Keyed<AnyImpl> {
     Keyed::of(trait_impls(db, trait_).run(None).iter())
 }
 
 /// The inherent impls of `krate`, by the hash of their simplified self type, then key.
 #[salsa::tracked(returns(ref))]
-fn inherent_impls_in(db: &dyn HirDatabase, krate: Crate) -> Runs<SimplifiedType, ImplId> {
-    Runs::new(
-        InherentImpls::for_crate(db, krate)
-            .iter()
-            .flat_map(|(self_ty, impls)| {
-                let self_ty = key::simplified(db, self_ty);
-                impls
-                    .iter()
-                    .map(move |&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it))
-            })
-            .collect(),
-    )
+fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
+        for (self_ty, impls) in InherentImpls::for_crate(db, krate).iter() {
+            let self_ty = key::simplified(db, self_ty);
+            rows.extend(
+                impls.iter().map(|&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it)),
+            );
+        }
+        Runs::new(&mut rows)
+    })
 }
 
 /// The inherent impls of every crate for `self_ty`, sorted by key.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn inherent_impls_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     self_ty: SimplifiedType,
     _: (),
 ) -> Keyed<ImplId> {
-    Keyed::sorted(
-        base_db::all_crates(db)
-            .iter()
-            .flat_map(|&krate| inherent_impls_in(db, krate).run(Some(self_ty)).iter())
-            .collect(),
-    )
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
+        for &krate in base_db::all_crates(db).iter() {
+            rows.extend(inherent_impls_in(db, krate).run(Some(self_ty)).iter());
+        }
+        Keyed::sorted(&mut rows)
+    })
 }
 
 /// The traits declared in `krate`'s modules, by the hash of each name one of their items
 /// has, then key.
 #[salsa::tracked(returns(ref))]
-fn traits_in(db: &dyn HirDatabase, krate: Crate) -> Runs<NameHash, TraitId> {
-    let mut names = Vec::new();
-    let mut traits = Vec::new();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        for def in module.scope(db).declarations() {
-            let ModuleDefId::TraitId(trait_) = def else { continue };
-            let key = key::item_key(db, ItemId::Trait(trait_));
-            for (name, _) in trait_.trait_items(db).items.iter() {
-                names.push(name.as_str());
-                traits.push((key, trait_));
+fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+    frame::task(Tag::Other, |frame| {
+        let mut names: Vec<&str, &Frame> = Vec::new_in(frame);
+        let mut traits: Vec<_, &Frame> = Vec::new_in(frame);
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for def in module.scope(db).declarations() {
+                let ModuleDefId::TraitId(trait_) = def else { continue };
+                let key = key::item_key(db, ItemId::Trait(trait_));
+                for (name, _) in trait_.trait_items(db).items.iter() {
+                    names.push(name.as_str());
+                    traits.push((key, trait_));
+                }
             }
         }
-    }
-    let mut found: Vec<_> = name_hashes(names)
-        .into_iter()
-        .zip(traits)
-        .map(|(name, (key, trait_))| (Some(name), key, trait_))
-        .collect();
-    found.sort_unstable_by_key(|&(name, key, _)| (name, key));
-    found.dedup_by_key(|&mut (name, key, _)| (name, key));
-    Runs::new(found)
+        let mut found: Vec<_, &Frame> = Vec::with_capacity_in(traits.len(), frame);
+        found.extend(
+            name_hashes(names.iter().copied())
+                .into_iter()
+                .zip(traits.iter().copied())
+                .map(|(name, (key, trait_))| (Some(name), key, trait_)),
+        );
+        found.sort_unstable_by_key(|&(name, key, _)| (name, key));
+        found.dedup_by_key(|&mut (name, key, _)| (name, key));
+        Runs::new(&mut found)
+    })
 }
 
 /// The traits of every crate with an item whose name hashes to `name`, sorted by key.
 #[salsa::tracked(returns(ref))]
-pub(crate) fn traits_with(db: &dyn HirDatabase, name: NameHash, _: ()) -> Keyed<TraitId> {
-    Keyed::sorted(
-        base_db::all_crates(db)
-            .iter()
-            .flat_map(|&krate| traits_in(db, krate).run(Some(name)).iter())
-            .collect(),
-    )
+pub(crate) fn traits_with(db: &Db, name: NameHash, _: ()) -> Keyed<TraitId> {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
+        for &krate in base_db::all_crates(db).iter() {
+            rows.extend(traits_in(db, krate).run(Some(name)).iter());
+        }
+        Keyed::sorted(&mut rows)
+    })
 }
 
 /// A scope names are looked up in.
@@ -655,7 +684,9 @@ impl ScopeNames {
             }
             ScopeColumns::Assoc { starts, keys, visibilities } => {
                 let items = run(starts);
+                // clone: a range, two indexes.
                 let keys = keys[items.clone()].iter().copied();
+                // alloc: `ScopeEntry` owns its items; see v2/requests/mem-backend-items.md.
                 ScopeEntry::Assoc(keys.zip(visibilities[items].iter().copied()).collect())
             }
         }
@@ -664,82 +695,93 @@ impl ScopeNames {
 
 /// Every name of `owner` with what it is there, sorted by the name's hash.
 #[salsa::tracked(returns(ref))]
-fn scope_names(db: &dyn HirDatabase, owner: ScopeOwner, _: ()) -> ScopeNames {
+fn scope_names(db: &Db, owner: ScopeOwner, _: ()) -> ScopeNames {
+    frame::task(Tag::Nameres, |frame| scope_names_in(db, owner, frame))
+}
+
+fn scope_names_in(db: &Db, owner: ScopeOwner, frame: &Frame) -> ScopeNames {
     match owner {
-        ScopeOwner::Module(module) => module_names(db, module),
+        ScopeOwner::Module(module) => module_names(db, module, frame),
         ScopeOwner::Enum(it) => {
             let variants = &it.enum_variants(db).variants;
-            let mut rows: Vec<_> = name_hashes(variants.keys().map(|name| name.as_str()))
-                .into_iter()
-                .zip(variants.values())
-                .enumerate()
-                .map(|(position, (name, &(variant, _)))| {
-                    (name, key::variant_key(db, variant), position as u32)
-                })
-                .collect();
+            let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(variants.len(), frame);
+            rows.extend(
+                name_hashes(variants.keys().map(|name| name.as_str()))
+                    .into_iter()
+                    .zip(variants.values())
+                    .enumerate()
+                    .map(|(position, (name, &(variant, _)))| {
+                        (name, key::variant_key(db, variant), position as u32)
+                    }),
+            );
             rows.sort_unstable_by_key(|&(name, _, _)| name);
             ScopeNames {
-                names: rows.iter().map(|it| it.0).collect(),
+                names: column(rows.iter().map(|it| it.0)),
                 entries: ScopeColumns::Variant {
-                    variants: rows.iter().map(|it| it.1).collect(),
-                    positions: rows.iter().map(|it| it.2).collect(),
+                    variants: column(rows.iter().map(|it| it.1)),
+                    positions: column(rows.iter().map(|it| it.2)),
                 },
             }
         }
         ScopeOwner::Variant(variant) => {
             let visibilities = VariantFields::field_visibilities(db, variant);
             let fields = variant.fields(db).fields();
-            let mut rows: Vec<_> = name_hashes(fields.iter().map(|(_, data)| data.name.as_str()))
-                .into_iter()
-                .zip(fields.iter())
-                .map(|(name, (field, _))| {
-                    let visibility = visibilities.get(field).expect("every field has a visibility");
-                    (name, u32::from(field.into_raw()), vis(db, *visibility))
-                })
-                .collect();
+            let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(fields.len(), frame);
+            rows.extend(
+                name_hashes(fields.iter().map(|(_, data)| data.name.as_str()))
+                    .into_iter()
+                    .zip(fields.iter())
+                    .map(|(name, (field, _))| {
+                        let visibility =
+                            visibilities.get(field).expect("every field has a visibility");
+                        (name, u32::from(field.into_raw()), vis(db, *visibility))
+                    }),
+            );
             rows.sort_unstable_by_key(|&(name, position, _)| (name, position));
             ScopeNames {
-                names: rows.iter().map(|it| it.0).collect(),
+                names: column(rows.iter().map(|it| it.0)),
                 entries: ScopeColumns::Field {
-                    positions: rows.iter().map(|it| it.1).collect(),
-                    visibilities: rows.iter().map(|it| it.2).collect(),
+                    positions: column(rows.iter().map(|it| it.1)),
+                    visibilities: column(rows.iter().map(|it| it.2)),
                 },
             }
         }
-        ScopeOwner::Trait(it) => assoc_names(db, &it.trait_items(db).items),
-        ScopeOwner::Impl(it) => assoc_names(db, &it.impl_items(db).items),
+        ScopeOwner::Trait(it) => assoc_names(db, &it.trait_items(db).items, frame),
+        ScopeOwner::Impl(it) => assoc_names(db, &it.impl_items(db).items, frame),
     }
 }
 
 /// A trait's or impl's items by name, each name's run sorted by key (a type and a value may
 /// share a name).
 fn assoc_names(
-    db: &dyn HirDatabase,
+    db: &Db,
     items: &[(hir_expand::name::Name, AssocItemId)],
+    frame: &Frame,
 ) -> ScopeNames {
-    let mut rows: Vec<_> = name_hashes(items.iter().map(|(name, _)| name.as_str()))
-        .into_iter()
-        .zip(items)
-        .map(|(name, &(_, item))| {
+    let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(items.len(), frame);
+    rows.extend(name_hashes(items.iter().map(|(name, _)| name.as_str())).into_iter().zip(items).map(
+        |(name, &(_, item))| {
             (name, key::item_key(db, ItemId::from(item)), vis(db, item.assoc_visibility(db)))
-        })
-        .collect();
+        },
+    ));
     rows.sort_unstable_by_key(|&(name, key, _)| (name, key));
-    let mut names = Vec::new();
-    let mut starts = Vec::new();
+    let opens = |row: usize| row == 0 || rows[row - 1].0 != rows[row].0;
+    let runs = (0..rows.len()).filter(|&row| opens(row)).count();
+    let mut names = Vec::with_capacity(runs);
+    let mut starts = Vec::with_capacity(runs + 1);
     for (row, &(name, _, _)) in rows.iter().enumerate() {
-        if names.last() != Some(&name) {
+        if opens(row) {
             names.push(name);
             starts.push(row_index(row));
         }
     }
     starts.push(row_index(rows.len()));
     ScopeNames {
-        names: names.into(),
+        names: names.into_boxed_slice(),
         entries: ScopeColumns::Assoc {
-            starts: starts.into(),
-            keys: rows.iter().map(|it| it.1).collect(),
-            visibilities: rows.iter().map(|it| it.2).collect(),
+            starts: starts.into_boxed_slice(),
+            keys: column(rows.iter().map(|it| it.1)),
+            visibilities: column(rows.iter().map(|it| it.2)),
         },
     }
 }
@@ -754,10 +796,12 @@ struct ModuleName {
     legacy: Option<usize>,
 }
 
-fn module_names(db: &dyn HirDatabase, module: ModuleId) -> ScopeNames {
+fn module_names(db: &Db, module: ModuleId, frame: &Frame) -> ScopeNames {
     let scope = module.def_map(db).module(db, module).scope(db);
-    let entries: Vec<_> = scope.entries().filter(|(_, per_ns)| !per_ns.is_none()).collect();
-    let legacy: Vec<_> = scope.legacy_macros().collect();
+    let mut entries: Vec<_, &Frame> = Vec::new_in(frame);
+    entries.extend(scope.entries().filter(|(_, per_ns)| !per_ns.is_none()));
+    let mut legacy: Vec<_, &Frame> = Vec::new_in(frame);
+    legacy.extend(scope.legacy_macros());
     let names = name_hashes(
         entries
             .iter()
@@ -765,6 +809,7 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> ScopeNames {
             .chain(legacy.iter().map(|(name, _)| name.as_str())),
     );
     let (entry_names, legacy_names) = names.split_at(entries.len());
+    // alloc: one table at its final size per module scope; std's map takes no allocator.
     let mut by_name: HashMap<NameHash, ModuleName, KeyHashing> =
         HashMap::with_capacity_and_hasher(names.len(), KeyHashing);
     let through_ns = |import: Option<ImportOrExternCrate>| match import {
@@ -798,11 +843,13 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> ScopeNames {
     for (position, &name) in legacy_names.iter().enumerate() {
         by_name.entry(name).or_default().legacy = Some(position);
     }
-    let mut rows: Vec<_> = by_name.into_iter().collect();
+    let mut rows: Vec<_, &Frame> = Vec::with_capacity_in(by_name.len(), frame);
+    rows.extend(by_name);
     rows.sort_unstable_by_key(|&(name, _)| name);
     let mut starts = Vec::with_capacity(rows.len() + 1);
-    let mut legacy_macros = Vec::new();
-    for (_, it) in &rows {
+    let count = rows.iter().filter_map(|(_, it)| it.legacy).map(|at| legacy[at].1.len()).sum();
+    let mut legacy_macros = Vec::with_capacity(count);
+    for (_, it) in rows.iter() {
         starts.push(row_index(legacy_macros.len()));
         if let Some(position) = it.legacy {
             let (_, macros) = legacy[position];
@@ -811,18 +858,18 @@ fn module_names(db: &dyn HirDatabase, module: ModuleId) -> ScopeNames {
     }
     starts.push(row_index(legacy_macros.len()));
     ScopeNames {
-        names: rows.iter().map(|&(name, _)| name).collect(),
+        names: column(rows.iter().map(|&(name, _)| name)),
         entries: ScopeColumns::Module {
-            types: rows.iter().map(|(_, it)| it.types).collect(),
-            values: rows.iter().map(|(_, it)| it.values).collect(),
-            macros: rows.iter().map(|(_, it)| it.macros).collect(),
-            starts: starts.into(),
-            legacy_macros: legacy_macros.into(),
+            types: column(rows.iter().map(|(_, it)| it.types)),
+            values: column(rows.iter().map(|(_, it)| it.values)),
+            macros: column(rows.iter().map(|(_, it)| it.macros)),
+            starts: starts.into_boxed_slice(),
+            legacy_macros: legacy_macros.into_boxed_slice(),
         },
     }
 }
 
-fn target(db: &dyn HirDatabase, def: ModuleDefId) -> Target {
+fn target(db: &Db, def: ModuleDefId) -> Target {
     let item = |id| Target::Item(key::item_key(db, id));
     match def {
         ModuleDefId::ModuleId(it) => Target::Item(key::module_key(db, it)),

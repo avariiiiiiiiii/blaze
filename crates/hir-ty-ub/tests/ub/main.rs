@@ -917,6 +917,122 @@ fn main() {
     );
 }
 
+// --- The SIMD shim's memory events ---
+
+macro_rules! simd {
+    ($body:literal) => {
+        concat!(
+            "//- minicore: sized, copy\n",
+            prelude!(),
+            r#"
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct P2([*const u8; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct U2([usize; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct I2([i64; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct B2([u8; 2]);
+#[repr(simd)]
+#[derive(Clone, Copy)]
+struct M2([i8; 2]);
+
+#[rustc_intrinsic]
+unsafe fn simd_shuffle<T, U, V>(a: T, b: T, idx: U) -> V;
+#[rustc_intrinsic]
+unsafe fn simd_gather<T, U, V>(val: T, ptr: U, mask: V) -> T;
+#[rustc_intrinsic]
+unsafe fn simd_expose_provenance<T, U>(ptr: T) -> U;
+#[rustc_intrinsic]
+unsafe fn simd_with_exposed_provenance<T, U>(addr: T) -> U;
+#[rustc_intrinsic]
+unsafe fn simd_add<T>(a: T, b: T) -> T;
+
+fn main() {
+"#,
+            $body,
+            "}\n"
+        )
+    };
+}
+
+#[test]
+fn simd_shuffled_pointers_keep_their_provenance() {
+    pass(simd!(
+        r#"
+    let a = 1u8;
+    let b = 2u8;
+    let v = P2([&a, &b]);
+    let s: P2 = unsafe { simd_shuffle(v, v, [1u32, 0]) };
+    let _x = unsafe { *s.0[0] };
+"#
+    ));
+}
+
+#[test]
+fn simd_gather_out_of_bounds() {
+    ub(
+        simd!(
+            r#"
+    let v = [0u8; 4];
+    let p = unsafe { arith_offset(&v as *const [u8; 4] as *const u8, 5) };
+    let _g: B2 = unsafe { simd_gather(B2([0, 0]), P2([p, p]), M2([-1, 0])) };
+"#
+        ),
+        "beyond the end of the allocation",
+    );
+}
+
+#[test]
+fn simd_with_exposed_provenance_of_an_address_never_exposed() {
+    ub(
+        simd!(
+            r#"
+    let p: P2 = unsafe { simd_with_exposed_provenance(U2([64, 64])) };
+    let _x = unsafe { *p.0[0] };
+"#
+        ),
+        "no provenance",
+    );
+}
+
+#[test]
+fn simd_exposed_lanes_get_their_provenance_back() {
+    pass(simd!(
+        r#"
+    let a = 1u8;
+    let u: U2 = unsafe { simd_expose_provenance(P2([&a, &a])) };
+    let p: P2 = unsafe { simd_with_exposed_provenance(u) };
+    let _x = unsafe { *p.0[0] };
+"#
+    ));
+}
+
+/// The copy of `u.v` (validity) or `simd_add`'s `require_init` stops it, whichever the
+/// evaluator reaches first: both name uninitialized bytes.
+#[test]
+fn simd_add_of_an_uninitialized_lane() {
+    ub(
+        simd!(
+            r#"
+    #[derive(Clone, Copy)]
+    union U {
+        v: I2,
+        b: (),
+    }
+    let u = U { b: () };
+    let x = unsafe { u.v };
+    let _s = unsafe { simd_add(x, I2([1, 1])) };
+"#
+        ),
+        "uninitialized",
+    );
+}
+
 // --- Outcomes other than UB ---
 
 #[test]
@@ -987,6 +1103,180 @@ fn main() {
         assert_eq!(plain_out.stdout(), "bcde");
         assert_eq!(plain_out.stderr(), checked_out.stderr());
     });
+}
+
+// --- The evaluator's atomics and memory shims under the checker ---
+
+// A pointer through an atomic store and load keeps its provenance.
+#[test]
+fn pass_atomic_pointer_keeps_provenance() {
+    pass(program!(
+        "sized, copy",
+        r#"
+fn main() {
+    let x = 7u32;
+    let mut slot = 0 as *const u32;
+    unsafe {
+        atomic_store_release(&raw mut slot, &x as *const u32);
+        let p = atomic_load_acquire(&raw const slot);
+        let _v = *p;
+    }
+}
+"#
+    ));
+}
+
+#[test]
+fn atomic_rmw_of_uninitialized_memory() {
+    let (found, _) = ub(
+        program!(
+            "sized, copy",
+            r#"
+union U {
+    a: u32,
+    b: (),
+}
+
+fn main() {
+    let mut u = U { b: () };
+    unsafe { atomic_xadd_seqcst(&raw mut u.a, 1) };
+}
+"#
+        ),
+        "uninitialized",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::Uninit(_))));
+}
+
+// copy_nonoverlapping.rs
+#[test]
+fn copy_nonoverlapping_of_overlapping_ranges() {
+    let (found, _) = ub(
+        program!(
+            "sized",
+            r#"
+#[rustc_intrinsic]
+unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
+
+fn main() {
+    let mut a = [1u8, 2, 3, 4];
+    let p = &raw mut a as *mut u8;
+    unsafe { copy_nonoverlapping(p as *const u8, arith_offset(p as *const u8, 1) as *mut u8, 2) };
+}
+"#
+        ),
+        "`copy_nonoverlapping` called on overlapping ranges",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::CopyOverlapping)));
+}
+
+#[test]
+fn pass_copy_of_overlapping_ranges() {
+    pass(program!(
+        "sized",
+        r#"
+#[rustc_intrinsic]
+unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);
+
+fn main() {
+    let mut a = [1u8, 2, 3, 4];
+    let p = &raw mut a as *mut u8;
+    unsafe { copy(p as *const u8, arith_offset(p as *const u8, 1) as *mut u8, 2) };
+    let _b = a;
+}
+"#
+    ));
+}
+
+#[test]
+fn memcpy_from_freed_memory() {
+    let (found, _) = ub(
+        program!(
+            "sized",
+            r#"
+extern "C" {
+    fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+fn main() {
+    unsafe {
+        let p = __rust_alloc(4, 4);
+        __rust_dealloc(p, 4, 4);
+        let mut b = [0u8; 4];
+        memcpy(&raw mut b as *mut u8, p as *const u8, 4);
+    }
+}
+"#
+        ),
+        "has been freed, so this pointer is dangling",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::UseAfterFree { .. })));
+}
+
+// unaligned_pointers/atomic_unaligned.rs
+#[test]
+fn atomic_load_unaligned() {
+    let (found, _) = ub(
+        program!(
+            "sized",
+            r#"
+fn main() {
+    let x = [0u32; 2];
+    let p = unsafe { arith_offset(&x as *const [u32; 2] as *const u8, 1) } as *const u32;
+    let _v = unsafe { atomic_load_relaxed(p) };
+}
+"#
+        ),
+        "but alignment 4 is required",
+    );
+    assert!(matches!(found.ub, Ub::Memory(MemError::Misaligned { .. })));
+}
+
+#[test]
+fn pass_unaligned_volatile_load() {
+    pass(program!(
+        "sized",
+        r#"
+#[rustc_intrinsic]
+unsafe fn unaligned_volatile_load<T>(src: *const T) -> T;
+
+fn main() {
+    let x = [1u8, 2, 3, 4, 5];
+    let p = unsafe { arith_offset(&x as *const [u8; 5] as *const u8, 1) } as *const u16;
+    let _v = unsafe { unaligned_volatile_load(p) };
+}
+"#
+    ));
+}
+
+// A failed compare-exchange is a load with its failure ordering, which races with a
+// non-atomic write on another thread.
+#[test]
+fn failed_cxchg_races_with_a_non_atomic_write() {
+    let (found, _) = ub(
+        program!(
+            "sized, copy",
+            r#"
+#[rustc_intrinsic]
+unsafe fn atomic_cxchg_seqcst_relaxed<T>(dst: *mut T, old: T, src: T) -> (T, bool);
+
+static mut X: u32 = 0;
+
+extern "C" fn child(_: *mut u8) -> *mut u8 {
+    unsafe { X = 1 };
+    0 as *mut u8
+}
+
+fn main() {
+    let t = spawn(child, 0 as *mut u8);
+    let _r = unsafe { atomic_cxchg_seqcst_relaxed(&raw mut X, 5, 6) };
+    join(t);
+}
+"#
+        ),
+        "atomic load",
+    );
+    assert!(matches!(found.ub, Ub::Race(_)));
 }
 
 #[test]

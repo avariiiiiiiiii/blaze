@@ -14,8 +14,12 @@ macro_rules! setup_tracked_fn {
         // Name of the `'db` lifetime that the user gave; if they didn't, then defaults to `'db`
         db_lt: $db_lt:lifetime,
 
-        // Path to the database trait that the user's database parameter used
-        Db: $Db:path,
+        // The type behind the user's database parameter: `dyn Trait` for a database trait, or a
+        // `#[salsa::db]` struct, whose calls are then static.
+        DbView: $DbView:ty,
+
+        // The function that registers the downcaster to `$DbView`, taking `&$DbView`.
+        register_downcaster: $register_downcaster:path,
 
         // Name of the database parameter given by the user.
         db: $db:ident,
@@ -98,7 +102,7 @@ macro_rules! setup_tracked_fn {
         #[allow(clippy::needless_lifetimes)]
         $(#[$attr])*
         $vis fn $fn_name<$db_lt>(
-            $db: &$db_lt dyn $Db,
+            $db: &$db_lt $DbView,
             $($input_id: $input_ty,)*
         ) -> ::salsa::plumbing::return_mode_ty!(($return_mode, __), $db_lt, $output_ty) {
             use ::salsa::plumbing as $zalsa;
@@ -275,23 +279,23 @@ macro_rules! setup_tracked_fn {
             }
 
             impl $Configuration {
-                fn fn_ingredient(db: &dyn $Db) -> &$zalsa::function::IngredientImpl<$Configuration> {
+                fn fn_ingredient(db: &$DbView) -> &$zalsa::function::IngredientImpl<$Configuration> {
                     let zalsa = db.zalsa();
                     Self::fn_ingredient_(db, zalsa)
                 }
 
                 #[inline]
-                fn fn_ingredient_<'z>(db: &dyn $Db, zalsa: &'z $zalsa::Zalsa) -> &'z $zalsa::function::IngredientImpl<$Configuration> {
+                fn fn_ingredient_<'z>(db: &$DbView, zalsa: &'z $zalsa::Zalsa) -> &'z $zalsa::function::IngredientImpl<$Configuration> {
                     // SAFETY: The ingredient at offset 0 in `$fn_name` has type
                     // `function::IngredientImpl<$Configuration>`.
                     unsafe {
                         $FN_CACHE.get_or_create::<$fn_name, 0>(zalsa)
                     }
-                    .get_or_init(|| *<dyn $Db as $Db>::zalsa_register_downcaster(db))
+                    .get_or_init(|| *$register_downcaster(db))
                 }
 
-                pub fn fn_ingredient_mut(db: &mut dyn $Db) -> &mut $zalsa::function::IngredientImpl<Self> {
-                    let view = *<dyn $Db as $Db>::zalsa_register_downcaster(db);
+                pub fn fn_ingredient_mut(db: &mut $DbView) -> &mut $zalsa::function::IngredientImpl<Self> {
+                    let view = *$register_downcaster(&*db);
                     let zalsa_mut = db.zalsa_mut();
                     let index = zalsa_mut.lookup_jar_by_type::<$fn_name>();
                     let (ingredient, _) = zalsa_mut.lookup_ingredient_mut(index);
@@ -333,7 +337,7 @@ macro_rules! setup_tracked_fn {
                 const DEBUG_NAME: &'static str = concat!($(stringify!($self_ty), "::", )? stringify!($fn_name));
                 const PERSIST: bool = $persist;
 
-                type DbView = dyn $Db;
+                type DbView = $DbView;
 
                 type SalsaStruct<$db_lt> = $InternedData<$db_lt>;
 
@@ -366,7 +370,7 @@ macro_rules! setup_tracked_fn {
                 }
 
                 fn recover_from_cycle<$db_lt>(
-                    db: &$db_lt dyn $Db,
+                    db: &$db_lt $DbView,
                     cycle: &::salsa::Cycle,
                     last_provisional_value: &Self::Output<$db_lt>,
                     value: Self::Output<$db_lt>,
@@ -378,6 +382,7 @@ macro_rules! setup_tracked_fn {
                 fn id_to_input<$db_lt>(zalsa: &$db_lt $zalsa::Zalsa, key: ::salsa::Id) -> Self::Input<$db_lt> {
                     $zalsa::macro_if! {
                         if $needs_interner {
+                            // clone: once per execution of a multi-argument function: its arguments, rebuilt by value for the user's function
                             $Configuration::intern_ingredient_(zalsa).data(zalsa, key).clone()
                         } else {
                             $zalsa::FromIdWithDb::from_id(key, zalsa)
@@ -457,12 +462,17 @@ macro_rules! setup_tracked_fn {
                     );
                     $zalsa::macro_if! {
                         if $needs_interner {
+                            // alloc: setup, once per ingredient when its jar registers
                             vec![
+                                // alloc: setup, once per ingredient when its jar registers
                                 Box::new(fn_ingredient),
+                                // alloc: setup, once per ingredient when its jar registers
                                 Box::new(intern_ingredient),
                             ]
                         } else {
+                            // alloc: setup, once per ingredient when its jar registers
                             vec![
+                                // alloc: setup, once per ingredient when its jar registers
                                 Box::new(fn_ingredient),
                             ]
                         }
@@ -477,7 +487,7 @@ macro_rules! setup_tracked_fn {
             impl $fn_name {
                 $zalsa::gate_accumulated! {
                     pub fn accumulated<$db_lt, A: ::salsa::Accumulator>(
-                        $db: &$db_lt dyn $Db,
+                        $db: &$db_lt $DbView,
                         $($input_id: $interned_input_ty,)*
                     ) -> Vec<&$db_lt A> {
                         use ::salsa::plumbing as $zalsa;
@@ -496,7 +506,7 @@ macro_rules! setup_tracked_fn {
 
                 $zalsa::macro_if! { $is_specifiable =>
                     pub fn specify<$db_lt>(
-                        $db: &$db_lt dyn $Db,
+                        $db: &$db_lt $DbView,
                         $($input_id: $interned_input_ty,)*
                         value: $output_ty,
                     ) {
@@ -510,7 +520,7 @@ macro_rules! setup_tracked_fn {
                 }
 
                 /// Sets the lru capacity. It takes `&mut`, like a write.
-                fn set_lru_capacity(db: &mut dyn $Db, value: usize) where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
+                fn set_lru_capacity(db: &mut $DbView, value: usize) where for<'trivial_bounds> $Eviction: $zalsa::function::HasCapacity {
                     $Configuration::fn_ingredient_mut(db).set_capacity(value);
                 }
 
@@ -523,7 +533,7 @@ macro_rules! setup_tracked_fn {
                 /// Only functions whose output implements `Hash` have this. It takes `&mut`, like
                 /// a write, so no query runs while it drops values.
                 #[allow(dead_code)]
-                $vis fn evict_values(db: &mut dyn $Db) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
+                $vis fn evict_values(db: &mut $DbView) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
                     let zalsa = db.zalsa_mut();
                     let index = zalsa.lookup_jar_by_type::<$fn_name>();
                     $zalsa::function::IngredientImpl::<$Configuration>::evict_values(zalsa, index, None)
@@ -535,12 +545,13 @@ macro_rules! setup_tracked_fn {
                         /// only.
                         #[allow(dead_code, clippy::needless_lifetimes, clippy::extra_unused_lifetimes)]
                         $vis fn evict_values_of<$db_lt>(
-                            db: &mut dyn $Db,
+                            db: &mut $DbView,
                             keys: impl ::std::iter::IntoIterator<Item = ($($interned_input_ty),*)>,
                         ) -> usize where for<'trivial_bounds> <$Configuration as $zalsa::function::Configuration>::Output<'trivial_bounds>: ::std::hash::Hash {
                             let keys: ::std::vec::Vec<$zalsa::Id> = keys
                                 .into_iter()
                                 .map(|key| $zalsa::AsId::as_id(&key))
+                                // alloc: the edge: `evict_values_of` takes its keys from the caller, once per call with `&mut`
                                 .collect();
                             let zalsa = db.zalsa_mut();
                             let index = zalsa.lookup_jar_by_type::<$fn_name>();
@@ -559,7 +570,7 @@ macro_rules! setup_tracked_fn {
                 }
 
                 #[inline]
-                fn fn_ingredient_<'z>(db: &dyn $Db, zalsa: &'z $zalsa::Zalsa) -> &'z $zalsa::function::IngredientImpl<$Configuration> {
+                fn fn_ingredient_<'z>(db: &$DbView, zalsa: &'z $zalsa::Zalsa) -> &'z $zalsa::function::IngredientImpl<$Configuration> {
                     $Configuration::fn_ingredient_(db, zalsa)
                 }
             }

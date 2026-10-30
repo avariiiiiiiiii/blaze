@@ -8,13 +8,13 @@ use blaze_ids::ContentId;
 use blaze_items::CodeHash;
 
 use crate::{
-    Line,
+    Covered, Line,
     content::{arch_of, arch_tag, kind_of, kind_tag},
     fold::{Constant, Masked},
     template::{Ref, StaticTemplate, Template, TemplateData, TemplateInit, TemplateReloc, TemplateUnwind},
 };
 
-const TEMPLATE_MAGIC: [u8; 4] = *b"BZT2";
+const TEMPLATE_MAGIC: [u8; 4] = *b"BZT3";
 const STATIC_MAGIC: [u8; 4] = *b"BZS1";
 
 /// Why bytes are not a template.
@@ -82,6 +82,10 @@ impl Out {
                     self.u8(3);
                     self.u32(at);
                 }
+                Ref::Coverage(array) => {
+                    self.u8(4);
+                    self.u32(array);
+                }
             }
         }
     }
@@ -133,6 +137,22 @@ impl Out {
             self.u32(line.at);
             self.id(&line.span.anchor);
             self.u32(line.span.index);
+        }
+    }
+
+    fn coverage(&mut self, covered: Option<&Covered>) {
+        let Some(Covered { counters, flags, guards, pcs }) = covered else {
+            self.u8(0);
+            return;
+        };
+        self.u8(1);
+        self.u32(*counters);
+        self.u32(*flags);
+        self.u32(*guards);
+        self.len(pcs.len());
+        for (at, pc_flags) in pcs {
+            self.u32(*at);
+            self.0.extend_from_slice(&pc_flags.to_le_bytes());
         }
     }
 }
@@ -203,6 +223,10 @@ impl<'a> In<'a> {
                 1 => Ref::Data(self.u32()?),
                 2 => Ref::Position(SpanRef { anchor: self.id()?, index: self.u32()? }),
                 3 => Ref::Extern(self.u32()?),
+                4 => match self.u32()? {
+                    array if array < Covered::ARRAYS => Ref::Coverage(array),
+                    _ => return self.fail("no such coverage array"),
+                },
                 _ => return self.fail("no such reference"),
             };
             relocs.push(TemplateReloc { at, kind, target, addend });
@@ -264,6 +288,20 @@ impl<'a> In<'a> {
         Ok(lines)
     }
 
+    fn coverage(&mut self) -> Result<Option<Covered>, BlobError> {
+        if !self.bool()? {
+            return Ok(None);
+        }
+        let (counters, flags, guards) = (self.u32()?, self.u32()?, self.u32()?);
+        let count = self.count(4 + 8)?;
+        let mut pcs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let at = self.u32()?;
+            pcs.push((at, u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes"))));
+        }
+        Ok(Some(Covered { counters, flags, guards, pcs }))
+    }
+
     fn magic(&mut self, magic: [u8; 4]) -> Result<(), BlobError> {
         if self.take(4)? != magic {
             return self.fail("another kind of blob, or another version of this one");
@@ -305,6 +343,7 @@ pub fn encode(template: &Template) -> Vec<u8> {
     for name in &template.externs {
         out.bytes(name.as_bytes());
     }
+    out.coverage(template.coverage.as_ref());
     out.0
 }
 
@@ -336,8 +375,9 @@ pub fn decode(bytes: &[u8]) -> Result<Template, BlobError> {
             Err(_) => return input.fail("a symbol name that is not UTF-8"),
         }
     }
+    let coverage = input.coverage()?;
     input.end()?;
-    Ok(Template { arch, align, code, relocs, data, inlined, side, unwind, lines, refs, externs })
+    Ok(Template { arch, align, code, relocs, data, inlined, side, unwind, lines, refs, externs, coverage })
 }
 
 pub fn encode_static(template: &StaticTemplate) -> Vec<u8> {
@@ -493,6 +533,7 @@ mod tests {
                 reloc(Ref::Data(0)),
                 reloc(Ref::Position(SpanRef { anchor: ContentId([4; 32]), index: 9 })),
                 reloc(Ref::Extern(0)),
+                reloc(Ref::Coverage(2)),
             ],
             data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![reloc(Ref::Place(0))] }],
             inlined: vec![CodeHash(ContentId([5; 32]))],
@@ -509,6 +550,7 @@ mod tests {
             lines: vec![Line { at: 4, span: SpanRef { anchor: ContentId([7; 32]), index: 3 } }],
             refs: 3,
             externs: vec!["bcmp".to_owned()],
+            coverage: Some(Covered { counters: 2, flags: 0, guards: 8, pcs: vec![(0, 1), (4, 0)] }),
         }
     }
 
@@ -519,6 +561,7 @@ mod tests {
         assert_eq!(decode(&encode(&it)).unwrap(), it);
         it.unwind = None;
         it.lines.clear();
+        it.coverage = None;
         assert_eq!(decode(&encode(&it)).unwrap(), it);
     }
 

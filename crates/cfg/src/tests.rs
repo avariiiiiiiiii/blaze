@@ -1,7 +1,7 @@
 use arbitrary::{Arbitrary, Unstructured};
 use expect_test::{Expect, expect};
 use intern::Symbol;
-use syntax::{AstNode, Edition, ast};
+use syntax::{AstNode, Edition, ast, view::AstNode as _};
 use syntax_bridge::{
     DocCommentDesugarMode,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
@@ -29,6 +29,9 @@ fn assert_parse_result(input: &str, expected: CfgExpr) {
     assert_eq!(cfg, expected);
     let cfg = parse_ast_cfg(pred_ast);
     assert_eq!(cfg, expected);
+    let parse = ast::SourceFile::parse(input, Edition::CURRENT);
+    let pred_view = parse.root().descendants().find_map(syntax::view::CfgPredicate::cast).unwrap();
+    assert_eq!(CfgExpr::parse_from_view(pred_view), expected);
 }
 
 #[track_caller]

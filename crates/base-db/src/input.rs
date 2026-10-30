@@ -23,7 +23,7 @@ use triomphe::Arc;
 use vfs::{AbsPathBuf, AnchoredPath, FileId, VfsPath, file_set::FileSet};
 
 use crate::{
-    CrateWorkspaceData, EditionedFileId, FxIndexSet, SourceDatabase, all_crates,
+    CrateWorkspaceData, Db, EditionedFileId, FxIndexSet, all_crates,
     content::{self, InputId, cfg_options_content},
     refresh_crate_graph_content, set_all_crates_with_durability,
 };
@@ -292,6 +292,7 @@ impl CrateDisplayName {
 
 impl From<CrateName> for CrateDisplayName {
     fn from(crate_name: CrateName) -> CrateDisplayName {
+        // clone: a crate name is built once (setup).
         let canonical_name = crate_name.0.clone();
         CrateDisplayName { crate_name, canonical_name }
     }
@@ -547,6 +548,7 @@ impl fmt::Debug for Env {
         }
         f.debug_struct("Env")
             .field("entries", &{
+                // alloc: `Debug` output (the edge).
                 let mut entries: Vec<_> = self.entries.iter().collect();
                 entries.sort();
                 EnvDebug(entries)
@@ -696,7 +698,7 @@ impl Crate {
     /// A crate outside a [`CrateGraphBuilder`], all its fields with `durability`. Its root
     /// file must be in a source root already, and its dependencies made.
     pub fn create(
-        db: &mut dyn SourceDatabase,
+        db: &mut Db,
         data: BuiltCrateData,
         extra: ExtraCrateData,
         workspace: Arc<CrateWorkspaceData>,
@@ -710,33 +712,33 @@ impl Crate {
             .new(&*db)
     }
 
-    pub fn set_data(self, db: &mut dyn SourceDatabase, data: BuiltCrateData) {
+    pub fn set_data(self, db: &mut Db, data: BuiltCrateData) {
         self.set_data_field(db).to(data);
         refresh_contents(db, self);
     }
 
-    pub fn set_extra_data(self, db: &mut dyn SourceDatabase, extra: ExtraCrateData) {
+    pub fn set_extra_data(self, db: &mut Db, extra: ExtraCrateData) {
         self.set_extra_data_field(db).to(extra);
         refresh_contents(db, self);
     }
 
-    pub fn set_workspace_data(self, db: &mut dyn SourceDatabase, workspace: Arc<CrateWorkspaceData>) {
+    pub fn set_workspace_data(self, db: &mut Db, workspace: Arc<CrateWorkspaceData>) {
         self.set_workspace_data_field(db).to(workspace);
         refresh_contents(db, self);
     }
 
-    pub fn set_cfg_options(self, db: &mut dyn SourceDatabase, cfg: CfgOptions) {
+    pub fn set_cfg_options(self, db: &mut Db, cfg: CfgOptions) {
         self.set_cfg_options_field(db).to(cfg);
         refresh_contents(db, self);
     }
 
-    pub fn set_env(self, db: &mut dyn SourceDatabase, env: Env) {
+    pub fn set_env(self, db: &mut Db, env: Env) {
         self.set_env_field(db).to(env);
         refresh_contents(db, self);
     }
 
     fn content_of(
-        db: &dyn SourceDatabase,
+        db: &Db,
         data: &BuiltCrateData,
         extra: &ExtraCrateData,
         workspace: &CrateWorkspaceData,
@@ -817,10 +819,11 @@ impl Crate {
 }
 
 /// The path of a crate's root file: its identity in the crate's content ID.
-fn root_path(db: &dyn SourceDatabase, file: FileId) -> VfsPath {
+fn root_path(db: &Db, file: FileId) -> VfsPath {
     let root_id = db.file_source_root(file).source_root_id(db);
-    let root = db.source_root(root_id).source_root(db);
+    let root = db.source_root(root_id).source_root_ref(db);
     match root.path_for_file(&file) {
+        // clone: the crate's root path, once per crate whose content ID is made (setup).
         Some(path) => path.clone(),
         None => panic!(
             "the root file {file:?} of a crate is not in its source root {root_id:?}: \
@@ -831,7 +834,7 @@ fn root_path(db: &dyn SourceDatabase, file: FileId) -> VfsPath {
 
 /// Sets the content ID of `krate`, and of every crate that depends on it whose ID changes
 /// with it, after one of its fields was set.
-fn refresh_contents(db: &mut dyn SourceDatabase, krate: Crate) {
+fn refresh_contents(db: &mut Db, krate: Crate) {
     if !refresh_content(db, krate) {
         return;
     }
@@ -850,7 +853,7 @@ fn refresh_contents(db: &mut dyn SourceDatabase, krate: Crate) {
 }
 
 /// Sets `krate`'s content ID from its fields as they are; whether it changed.
-fn refresh_content(db: &mut dyn SourceDatabase, krate: Crate) -> bool {
+fn refresh_content(db: &mut Db, krate: Crate) -> bool {
     let content = Crate::content_of(
         &*db,
         krate.data(&*db),
@@ -871,11 +874,13 @@ impl Crate {
     /// including the crate itself.
     ///
     /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    pub fn transitive_deps(self, db: &dyn salsa::Database) -> Vec<Crate> {
+    pub fn transitive_deps(self, db: &Db) -> Vec<Crate> {
         // There is a bit of duplication here and in `CrateGraphBuilder` in the same method, but it's not terrible
         // and removing that is a bit difficult.
+        // alloc: a walk of the crate graph (setup; the method says not to call it from hir).
         let mut worklist = vec![self];
         let mut deps_seen = FxHashSet::default();
+        // alloc: as above.
         let mut deps = Vec::new();
 
         while let Some(krate) = worklist.pop() {
@@ -893,7 +898,8 @@ impl Crate {
     /// including the crate itself.
     ///
     /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    pub fn transitive_rev_deps(self, db: &dyn SourceDatabase) -> Box<[Crate]> {
+    pub fn transitive_rev_deps(self, db: &Db) -> Box<[Crate]> {
+        // alloc: a walk of the crate graph (setup; the method says not to call it from hir).
         let mut worklist = vec![self];
         let mut rev_deps = FxHashSet::default();
         rev_deps.insert(self);
@@ -950,12 +956,14 @@ impl CrateGraphBuilder {
         }
         let crate_attrs: Vec<_> = crate_attrs
             .into_iter()
+            // alloc: a crate's attributes, once per crate added to a graph (setup).
             .map(|raw_attr| format!("#![{raw_attr}]").into_boxed_str())
-            .collect();
+            .collect(); // alloc: as above.
         self.arena.alloc(CrateBuilder {
             basic: CrateData {
                 root_file_id,
                 edition,
+                // alloc: none until a dependency is added (setup).
                 dependencies: Vec::new(),
                 origin,
                 crate_attrs: crate_attrs.into_boxed_slice(),
@@ -982,6 +990,7 @@ impl CrateGraphBuilder {
         // `from`.
         if let Some(path) = self.find_path(&mut FxHashSet::default(), dep.crate_id, from) {
             let path =
+                // clone: the cycle's error (an error path).
                 path.into_iter().map(|it| (it, self[it].extra.display_name.clone())).collect();
             let err = CyclicDependenciesError { path };
             assert!(err.from().0 == from && err.to().0 == dep.crate_id);
@@ -992,7 +1001,7 @@ impl CrateGraphBuilder {
         Ok(())
     }
 
-    pub fn set_in_db(self, db: &mut dyn SourceDatabase) -> CratesIdMap {
+    pub fn set_in_db(self, db: &mut Db) -> CratesIdMap {
         let old_all_crates = all_crates(db);
 
         // For some reason in some repositories we have duplicate crates, so we use a set and not `Vec`.
@@ -1027,7 +1036,7 @@ impl CrateGraphBuilder {
 
         fn go(
             graph: &CrateGraphBuilder,
-            db: &mut dyn SourceDatabase,
+            db: &mut Db,
             crates_map: &mut FxHashMap<UniqueCrateData, Crate>,
             visited: &mut FxHashMap<CrateBuilderId, Crate>,
             visited_root_files: &mut FxHashSet<FileId>,
@@ -1038,6 +1047,7 @@ impl CrateGraphBuilder {
                 return crate_id;
             }
             let krate = &graph[source];
+            // alloc: each crate's data built for the graph being set (setup): its dependencies and fields.
             let dependencies = krate
                 .basic
                 .dependencies
@@ -1052,25 +1062,31 @@ impl CrateGraphBuilder {
                         all_crates,
                         dep.crate_id,
                     ),
+                    // clone: as above.
                     name: dep.name.clone(),
                     prelude: dep.prelude,
                     sysroot: dep.sysroot,
                     private: dep.private,
                 })
+                // alloc: as above.
                 .collect::<Vec<_>>();
             let crate_data = BuiltCrateData {
                 dependencies,
                 edition: krate.basic.edition,
                 target_kind: krate.basic.target_kind,
                 crate_types: krate.basic.crate_types,
+                // clone: as above.
                 origin: krate.basic.origin.clone(),
+                // clone: as above.
                 crate_attrs: krate.basic.crate_attrs.clone(),
                 root_file_id: krate.basic.root_file_id,
+                // clone: as above.
                 proc_macro_cwd: krate.basic.proc_macro_cwd.clone(),
             };
             let disambiguator = if visited_root_files.insert(krate.basic.root_file_id) {
                 None
             } else {
+                // alloc: a second crate on one root file is keyed by its data (setup).
                 Some(Box::new((crate_data.clone(), krate.cfg_options.to_hashable())))
             };
 
@@ -1098,24 +1114,28 @@ impl CrateGraphBuilder {
                         old_crate
                             .set_extra_data_field(db)
                             .with_durability(Durability::MEDIUM)
+                            // clone: only a field that changed is set (setup).
                             .to(krate.extra.clone());
                     }
                     if krate.cfg_options != *old_crate.cfg_options(db) {
                         old_crate
                             .set_cfg_options_field(db)
                             .with_durability(Durability::MEDIUM)
+                            // clone: only a field that changed is set (setup).
                             .to(krate.cfg_options.clone());
                     }
                     if krate.env != *old_crate.env(db) {
                         old_crate
                             .set_env_field(db)
                             .with_durability(Durability::MEDIUM)
+                            // clone: only a field that changed is set (setup).
                             .to(krate.env.clone());
                     }
                     if krate.ws_data != *old_crate.workspace_data(db) {
                         old_crate
                             .set_workspace_data_field(db)
                             .with_durability(Durability::MEDIUM)
+                            // clone: only a field that changed is set (setup).
                             .to(krate.ws_data.clone());
                     }
                     if content != old_crate.content(db) {
@@ -1129,9 +1149,13 @@ impl CrateGraphBuilder {
                 Entry::Vacant(entry) => {
                     let input = Crate::builder(
                         crate_data,
+                        // clone: a new crate's fields (setup).
                         krate.extra.clone(),
+                        // clone: a new crate's fields (setup).
                         krate.ws_data.clone(),
+                        // clone: a new crate's fields (setup).
                         krate.cfg_options.clone(),
+                        // clone: a new crate's fields (setup).
                         krate.env.clone(),
                         InputId(content),
                     )
@@ -1154,6 +1178,7 @@ impl CrateGraphBuilder {
     /// Returns an iterator over all transitive dependencies of the given crate,
     /// including the crate itself.
     pub fn transitive_deps(&self, of: CrateBuilderId) -> impl Iterator<Item = CrateBuilderId> {
+        // alloc: a walk of the builder's graph (setup).
         let mut worklist = vec![of];
         let mut deps = FxHashSet::default();
 
@@ -1171,6 +1196,7 @@ impl CrateGraphBuilder {
     /// Returns all crates in the graph, sorted in topological order (i.e. dependencies of a crate
     /// come before the crate itself).
     fn crates_in_topological_order(&self) -> Vec<CrateBuilderId> {
+        // alloc: a walk of the builder's graph (setup).
         let mut res = Vec::new();
         let mut visited = FxHashSet::default();
 
@@ -1230,11 +1256,13 @@ impl CrateGraphBuilder {
             radix::sort_by_key(&mut crate_data.basic.dependencies, |dep| dep.crate_id.into_raw().into_u32());
 
             let find = self.arena.iter().take(m).find_map(|(k, v)| (v == crate_data).then_some(k));
+            // clone: a crate of the graph being merged in (setup).
             let new_id = find.unwrap_or_else(|| self.arena.alloc(crate_data.clone()));
             id_map.insert(topo, new_id);
         }
 
         *proc_macros =
+            // alloc: as above.
             mem::take(proc_macros).into_iter().map(|(id, macros)| (id_map[&id], macros)).collect();
         id_map
     }
@@ -1250,6 +1278,7 @@ impl CrateGraphBuilder {
         }
 
         if from == to {
+            // alloc: the cycle's path (an error path).
             return Some(vec![to]);
         }
 
@@ -1289,6 +1318,7 @@ impl CrateGraphBuilder {
         &mut self,
         to_keep: &[CrateBuilderId],
     ) -> Vec<Option<CrateBuilderId>> {
+        // alloc: once per `remove_crates_except` (setup).
         let mut id_map = vec![None; self.arena.len()];
         self.arena = std::mem::take(&mut self.arena)
             .into_iter()
@@ -1299,7 +1329,7 @@ impl CrateGraphBuilder {
                     Some(CrateBuilderId::from_raw(RawIdx::from_u32(new_id as u32)));
                 data
             })
-            .collect();
+            .collect(); // alloc: as above.
         for (_, data) in self.arena.iter_mut() {
             data.basic.dependencies.iter_mut().for_each(|dep| {
                 dep.crate_id =
@@ -1315,7 +1345,7 @@ impl CrateGraphBuilder {
 }
 
 impl Crate {
-    pub fn root_file_id(self, db: &dyn salsa::Database) -> EditionedFileId {
+    pub fn root_file_id(self, db: &Db) -> EditionedFileId {
         let data = self.data(db);
         EditionedFileId::new(db, data.root_file_id, data.edition)
     }
@@ -1338,6 +1368,7 @@ impl Env {
 
     /// Of its variables sorted by name, each as its name and value.
     pub fn content(&self) -> ContentId {
+        // alloc: an env's variables sorted, once per crate content ID (setup).
         let mut entries: Vec<_> = self.entries.iter().collect();
         entries.sort_unstable();
         let mut hasher = Hasher::new(Env::DOMAIN);
@@ -1349,6 +1380,7 @@ impl Env {
     }
 
     pub fn set(&mut self, env: &str, value: impl Into<String>) {
+        // alloc: setting a variable (setup).
         self.entries.insert(env.to_owned(), value.into());
     }
 
@@ -1361,6 +1393,7 @@ impl Env {
     }
 
     pub fn extend_from_other(&mut self, other: &Env) {
+        // alloc: as above.
         self.entries.extend(other.entries.iter().map(|(x, y)| (x.to_owned(), y.to_owned())));
     }
 
@@ -1379,6 +1412,7 @@ impl Env {
 
 impl From<Env> for Vec<(String, String)> {
     fn from(env: Env) -> Vec<(String, String)> {
+        // alloc: the edge: the env handed out as a list.
         let mut entries: Vec<_> = env.entries.into_iter().collect();
         entries.sort();
         entries
@@ -1432,9 +1466,12 @@ impl CyclicDependenciesError {
 impl fmt::Display for CyclicDependenciesError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let render = |(id, name): &(CrateBuilderId, Option<CrateDisplayName>)| match name {
+            // alloc: the cycle's message (an error path).
             Some(it) => format!("{it}({id:?})"),
+            // alloc: as above.
             None => format!("{id:?}"),
         };
+        // alloc: as above.
         let path = self.path.iter().rev().map(render).collect::<Vec<String>>().join(" -> ");
         write!(
             f,

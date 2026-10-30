@@ -12,6 +12,7 @@ use rustc_type_ir::inherent::{SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
+    db::HirDatabase,
     ExplicitDropMethodUseKind, InferenceDiagnostic, Span, ValueTyDefId,
     infer::{
         InferenceTyLoweringVarsCtx, diagnostics::InferenceTyLoweringContext as TyLoweringContext,
@@ -357,7 +358,15 @@ impl<'db> InferenceContext<'db> {
             Err(error) => match error {
                 MethodError::PrivateMatch(candidate_id) => (candidate_id.item, false),
                 _ => {
-                    self.push_diagnostic(InferenceDiagnostic::UnresolvedAssocItem { id });
+                    // rustc's `report_method_error`: an error in the type was reported already.
+                    if !ty.references_non_lt_error() {
+                        self.push_diagnostic(InferenceDiagnostic::UnresolvedAssocItem {
+                            id,
+                            ty: ty.store(),
+                            // clone: an error's name, a refcount.
+                            name: name.clone(),
+                        });
+                    }
                     return None;
                 }
             },

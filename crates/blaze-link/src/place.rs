@@ -18,6 +18,7 @@ use blaze_ids::radix;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
+use crate::arena::{FrameVec, collect_in};
 use crate::LinkError;
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{Apply, Class, Counts, Region, Sym};
@@ -227,16 +228,18 @@ fn by_key(entries: &mut [Entry]) {
     radix::sort_copy_by_key(entries, |it| radix::pack_64(it.key[0], it.key[1]));
 }
 
-impl Stage<'_> {
+impl<'a> Stage<'a> {
     /// The region an incremental link puts a new piece of `class` in.
-    fn patch_class(&self, class: &Class) -> Class {
+    fn patch_class<'c>(&self, class: &'c Class) -> &'c Class {
+        static PATCH_CODE: Class = Class::Patch;
+        static PATCH_DATA: Class = Class::PatchData;
         if self.plan.indexed_code {
-            return class.clone();
+            return class;
         }
         match class {
-            Class::Text => Class::Patch,
-            Class::Rodata | Class::RelRo | Class::Data | Class::Bss => Class::PatchData,
-            other => other.clone(),
+            Class::Text => &PATCH_CODE,
+            Class::Rodata | Class::RelRo | Class::Data | Class::Bss => &PATCH_DATA,
+            other => other,
         }
     }
 
@@ -291,9 +294,9 @@ impl Stage<'_> {
 
     /// What the image exports: the name, the symbol it is, and whether it is data whatever
     /// it is defined in (`/EXPORT:name=symbol,DATA`).
-    pub fn exports(&self) -> Vec<(&str, &str, bool)> {
+    pub fn exports(&self) -> FrameVec<'a, (&str, &str, bool)> {
         let mut seen: FxHashSet<&str> = FxHashSet::default();
-        let mut out: Vec<(&str, &str, bool)> = Vec::new();
+        let mut out = Vec::new_in(self.arena);
         if let crate::OutputKind::Shared { exports, .. } = &self.output.kind {
             out.reserve(exports.len());
             for it in exports {
@@ -337,17 +340,15 @@ impl Stage<'_> {
 
     /// The pieces of `class` in the order they are laid out in: import address table cells
     /// first, by DLL and import; then by rank, link-line order and symbol.
-    fn sort_pieces(&self, class: &Class, ids: &[PieceId]) -> Vec<PieceId> {
+    fn sort_pieces(&self, class: &Class, ids: &[PieceId]) -> impl Iterator<Item = PieceId> + use<'a> {
         let iat = self.plan.got_by_library && *class == Class::Got;
-        let mut entries: Vec<Entry> = ids
-            .iter()
-            .map(|id| {
-                let piece = self.new.piece(*id).expect("live");
-                Entry::of(self.symbols, piece, if iat { self.iat_key(piece) } else { NOT_IAT })
-            })
-            .collect();
+        let mut entries = Vec::with_capacity_in(ids.len(), self.arena);
+        entries.extend(ids.iter().map(|id| {
+            let piece = self.new.piece(*id).expect("live");
+            Entry::of(self.symbols, piece, if iat { self.iat_key(piece) } else { NOT_IAT })
+        }));
         sort_entries(self.symbols, &mut entries);
-        entries.into_iter().map(|it| it.id).collect()
+        entries.into_iter().map(|it| it.id)
     }
 
     /// Places `ids` in this order from `start`: each piece's address, and the region's size.
@@ -368,17 +369,22 @@ impl Stage<'_> {
     fn lay_out(&mut self) -> Result<(), LinkError> {
         let incremental = self.output.incremental;
         let synthetic = self.writer.synthetic(&self.counts());
-        let mut extra: Vec<Class> = synthetic.iter().map(|it| it.0.clone()).collect();
+        let mut extra: FrameVec<'a, u16> = Vec::with_capacity_in(synthetic.len() + 8, self.arena);
+        for (class, _) in &synthetic {
+            extra.push(self.new.class_id(class).0);
+        }
         if incremental && !self.plan.indexed_code {
-            extra.extend([Class::Patch, Class::PatchData, Class::Got, Class::Plt, Class::EhFrame, Class::Tdata, Class::Tbss]);
+            for class in [Class::Patch, Class::PatchData, Class::Got, Class::Plt, Class::EhFrame, Class::Tdata, Class::Tbss] {
+                extra.push(self.new.class_id(&class).0);
+            }
             if self.plan.tls_descriptors {
-                extra.push(Class::ThreadVars);
+                extra.push(self.new.class_id(&Class::ThreadVars).0);
             }
         }
-        let extra: Vec<u16> = extra.iter().map(|it| self.new.class_id(it).0).collect();
+        // alloc: a full link: a list of pieces per class, which the classes' sorts own
         let mut groups: Vec<Vec<PieceId>> = Vec::new();
-        let mut present: Vec<bool> = Vec::new();
-        let mark = |groups: &mut Vec<Vec<PieceId>>, present: &mut Vec<bool>, class: u16| {
+        let mut present: FrameVec<'a, bool> = Vec::new_in(self.arena);
+        let mark = |groups: &mut Vec<Vec<PieceId>>, present: &mut FrameVec<'a, bool>, class: u16| {
             let at = class as usize;
             if groups.len() <= at {
                 groups.resize_with(at + 1, Vec::new);
@@ -394,33 +400,34 @@ impl Stage<'_> {
             mark(&mut groups, &mut present, class);
         }
         let iat = self.plan.got_by_library.then(|| self.new.find_class(&Class::Got)).flatten();
-        let mut sorted: Vec<Vec<PieceId>> = {
+        {
             let symbols: &Symbols = self.symbols;
             let state = &self.new;
-            groups
-                .par_iter()
-                .enumerate()
-                .map(|(class, ids)| {
-                    if iat.is_some_and(|it| it.0 as usize == class) {
-                        return Vec::new();
-                    }
-                    let mut entries: Vec<Entry> =
-                        ids.iter().map(|id| Entry::of(symbols, state.piece(*id).expect("live"), NOT_IAT)).collect();
-                    sort_entries(symbols, &mut entries);
-                    entries.into_iter().map(|it| it.id).collect()
-                })
-                .collect()
-        };
+            groups.par_iter_mut().enumerate().for_each(|(class, ids)| {
+                if iat.is_some_and(|it| it.0 as usize == class) {
+                    return;
+                }
+                let mut entries: Vec<Entry> = Vec::with_capacity(ids.len());
+                entries.extend(ids.iter().map(|id| Entry::of(symbols, state.piece(*id).expect("live"), NOT_IAT)));
+                sort_entries(symbols, &mut entries);
+                ids.clear();
+                ids.extend(entries.iter().map(|it| it.id));
+            });
+        }
         if let Some(iat) = iat {
             if let Some(ids) = groups.get(iat.0 as usize) {
-                sorted[iat.0 as usize] = self.sort_pieces(&Class::Got, ids);
+                let order = collect_in(self.sort_pieces(&Class::Got, ids), self.arena);
+                let ids = &mut groups[iat.0 as usize];
+                ids.clear();
+                ids.extend(order);
             }
         }
-        drop(groups);
-        let mut classes: Vec<Class> = (0..present.len())
-            .filter(|it| present[*it])
-            .map(|it| self.new.class(ClassId(it as u16)).clone())
-            .collect();
+        let mut sorted = groups;
+        let mut classes: Vec<Class> = Vec::with_capacity(present.len());
+        for (at, _) in present.iter().enumerate().filter(|it| *it.1) {
+            // clone: a full link, once per class, for the writer's order
+            classes.push(self.new.class(ClassId(at as u16)).clone());
+        }
         self.writer.order(&mut classes);
         let mut spaces = Vec::with_capacity(classes.len());
         let mut addr = self.plan.base + self.plan.headers;
@@ -489,46 +496,51 @@ impl Stage<'_> {
             let space = self
                 .new
                 .space_of(&class)
+                // alloc: error path
                 .ok_or_else(|| error(None, format!("the image has no {class:?} region: link it from scratch")))?;
             let capacity = self.new.spaces[space].region.capacity;
             if bound > capacity {
                 return Err(error(
                     None,
+                    // alloc: error path
                     format!("{class:?} may need {bound} bytes and has room for {capacity}: link the image from scratch"),
                 ));
             }
         }
-        let mut relay: Vec<usize> = Vec::new();
-        for id in &self.removed {
+        let arena = self.arena;
+        let mut relay: FrameVec<'a, usize> = Vec::new_in(arena);
+        for id in self.removed.iter() {
             if let Some(old) = self.old.piece(*id) {
                 if self.ordered(old.class()) {
                     relay.push(old.region as usize);
                 }
             }
         }
-        let mut by_class: Vec<(ClassId, Vec<PieceId>)> = Vec::new();
+        let mut fresh: FrameVec<'a, (ClassId, PieceId)> = Vec::new_in(arena);
         for id in self.fresh.iter() {
             let Some(piece) = self.new.piece(id) else { continue };
-            if piece.placed() {
-                continue;
-            }
-            match by_class.iter_mut().find(|it| it.0 == piece.class) {
-                Some(group) => group.1.push(id),
-                None => by_class.push((piece.class, vec![id])),
+            if !piece.placed() {
+                fresh.push((piece.class, id));
             }
         }
-        by_class.sort_by(|a, b| self.new.class(a.0).cmp(self.new.class(b.0)));
-        for (class_id, ids) in by_class {
-            let class = self.new.class(class_id).clone();
-            let mut entries: Vec<Entry> =
-                ids.iter().map(|id| Entry::of(self.symbols, self.new.piece(*id).expect("live"), NOT_IAT)).collect();
+        fresh.sort_unstable_by(|a, b| self.new.class(a.0).cmp(self.new.class(b.0)).then(a.1.cmp(&b.1)));
+        let mut rest = &fresh[..];
+        while let Some(&(class_id, _)) = rest.first() {
+            let run = rest.iter().take_while(|it| it.0 == class_id).count();
+            let (ids, after) = rest.split_at(run);
+            rest = after;
+            let mut entries: FrameVec<'a, Entry> = Vec::with_capacity_in(ids.len(), arena);
+            entries.extend(ids.iter().map(|(_, id)| Entry::of(self.symbols, self.new.piece(*id).expect("live"), NOT_IAT)));
             sort_entries(self.symbols, &mut entries);
-            let target = self.patch_class(&class);
-            let ordered = self.ordered(&class);
+            let class = self.new.class(class_id);
+            let ordered = self.ordered(class);
+            let target_space = self.new.space_of(self.patch_class(class));
             for Entry { id, sym, .. } in entries {
-                let space = self.new.space_of(&target).ok_or_else(|| {
+                let space = target_space.ok_or_else(|| {
+                    let target = self.patch_class(self.new.class(class_id));
                     error(
                         None,
+                        // alloc: error path
                         format!(
                             "{} needs a {target:?} region, which the image was laid out without: link it from scratch",
                             self.symbols.describe(sym)
@@ -546,8 +558,10 @@ impl Stage<'_> {
                 let at = align_up(region.addr + region.size, piece.align()) - region.addr;
                 let end = at + piece.size;
                 if end > region.capacity {
+                    let target = &region.class;
                     return Err(error(
-                        function_of(&self.new, piece),
+                        function_of(piece),
+                        // alloc: error path
                         format!(
                             "{} does not fit in {target:?} ({} of {} bytes used): link the image from scratch",
                             self.symbols.describe(sym),
@@ -570,14 +584,34 @@ impl Stage<'_> {
             self.tls();
             return Ok(());
         }
-        let mut members: Vec<Vec<PieceId>> = vec![Vec::new(); relay.len()];
+        // Each relaid region's pieces, in id order, one run each in `members`: counted, then
+        // placed.
+        let ends = arena.alloc_slice_fill_with(relay.len(), |_| 0usize);
         for piece in self.new.live_pieces() {
             if let Ok(at) = relay.binary_search(&(piece.region as usize)) {
-                members[at].push(piece.id);
+                ends[at] += 1;
             }
         }
-        for (space, ids) in relay.into_iter().zip(members) {
-            self.relay(space, &ids)?;
+        let mut total = 0;
+        for end in ends.iter_mut() {
+            total += *end;
+            *end = total;
+        }
+        let members = arena.alloc_slice_fill_with(total, |_| 0 as PieceId);
+        let next = arena.alloc_slice_fill_with(relay.len(), |_| 0usize);
+        for (at, start) in next.iter_mut().enumerate() {
+            *start = if at == 0 { 0 } else { ends[at - 1] };
+        }
+        for piece in self.new.live_pieces() {
+            if let Ok(at) = relay.binary_search(&(piece.region as usize)) {
+                members[next[at]] = piece.id;
+                next[at] += 1;
+            }
+        }
+        let mut start = 0;
+        for (space, end) in relay.iter().zip(ends.iter()) {
+            self.relay(*space, &members[start..*end])?;
+            start = *end;
         }
         self.tls();
         Ok(())
@@ -587,14 +621,14 @@ impl Stage<'_> {
     /// written again (from their old bytes, which relocation reads for a moved piece), and
     /// what refers to them.
     fn relay(&mut self, space: usize, ids: &[PieceId]) -> Result<(), LinkError> {
-        let class = self.new.spaces[space].region.class.clone();
-        let ids = self.sort_pieces(&class, ids);
+        let arena = self.arena;
+        let ids = collect_in(self.sort_pieces(&self.new.spaces[space].region.class, ids), arena);
         let start = self.new.spaces[space].region.addr;
         let capacity = self.new.spaces[space].region.capacity;
         let zero = self.new.spaces[space].zero;
         let mut size = 0;
-        let mut moved: Vec<(PieceId, u64)> = Vec::new();
-        for id in &ids {
+        let mut moved: FrameVec<'a, (PieceId, u64)> = Vec::new_in(arena);
+        for id in ids.iter() {
             let piece = self.new.piece(*id).expect("live");
             size = align_up(start + size, piece.align()) - start;
             let addr = start + size;
@@ -604,8 +638,10 @@ impl Stage<'_> {
             size += piece.size;
         }
         if size > capacity {
+            let class = &self.new.spaces[space].region.class;
             return Err(error(
                 None,
+                // alloc: error path
                 format!("{class:?} needs {size} bytes and has room for {capacity}: link the image from scratch"),
             ));
         }
@@ -631,25 +667,19 @@ impl Stage<'_> {
     /// Where the TLS template is: from the first thread-local region to the end of the
     /// last one's room, so that offsets stay as they are while it fills.
     fn tls(&mut self) {
-        let tls: Vec<&Region> = self
-            .new
-            .spaces
-            .iter()
-            .map(|it| &it.region)
-            .filter(|it| matches!(it.class, Class::Tdata | Class::Tbss))
-            .collect();
-        let (Some(first), Some(last)) = (tls.first(), tls.last()) else {
+        let spaces = &self.new.spaces;
+        let tls = || spaces.iter().map(|it| &it.region).filter(|it| matches!(it.class, Class::Tdata | Class::Tbss));
+        let (Some(first), Some(last)) = (tls().next(), tls().last()) else {
             self.new.tls = None;
             return;
         };
-        let init = tls.iter().find(|it| it.class == Class::Tdata).map_or(0, |it| it.size);
-        let align = tls.iter().map(|it| it.align).max().unwrap_or(1);
-        self.new.tls = Some(crate::model::Tls {
+        let tls = Some(crate::model::Tls {
             addr: first.addr,
-            init,
+            init: tls().find(|it| it.class == Class::Tdata).map_or(0, |it| it.size),
             size: last.addr + last.capacity.max(last.size) - first.addr,
-            align,
+            align: tls().map(|it| it.align).max().unwrap_or(1),
         });
+        self.new.tls = tls;
     }
 }
 

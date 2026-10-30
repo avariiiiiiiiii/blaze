@@ -17,7 +17,7 @@ use crate::{
     closure_analysis::Place,
     display::{DisplayTarget, HirDisplay},
     next_solver::TyKind,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 use super::{setup_tracing, visit_module};

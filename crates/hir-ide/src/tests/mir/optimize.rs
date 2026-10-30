@@ -10,7 +10,7 @@ use crate::{
     db::HirDatabase,
     mir::{MirOptLevel, MirOptions, print_mir_body},
     setup_tracing,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 use super::eval::check_pass_and_stdio;

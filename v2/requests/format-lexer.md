@@ -41,3 +41,64 @@ Why: the lexer's speed of light (`docs/v2/plan/lanes/format/speed-of-light.md`, 
 item 3). It lowers the lexer's per-token minimum from about 13.5 instructions to about 11.5.
 
 > forwarded to format-grammar (told by tmux).
+> applied: by format-grammar in `crates/parser/src/syntax_kind/keywords.rs`. The strict table
+> is a multiplicative perfect hash over the identifier as a zero-padded 8-byte word, with the
+> multiplier found by a `const` search. There is no data-dependent branch, and the answers are
+> the same as before for every keyword and edition (`tables_give_what_the_match_gave`, extended).
+> Two lookups: `from_keyword(&str)` (four 2-byte loads, about 24 instructions) and the new
+> `from_keyword_in(text, start, len, edition)` (one 8-byte load, about 19). The lexer still calls
+> the first; calling the second is the request below. The old perfect hash was about 60
+> instructions, not 15 (a byte loop and three folds).
+
+## format-lexer: a scratch buffer lent until dropped (mem, `crates/blaze-mem/src/scratch.rs`)
+
+What: a form of `scratch::with_u32s` that is not scoped to a closure. For example,
+`scratch::lend_u32s() -> Lent<Vec<u32>>`, which gives out the calling thread's buffer, empty.
+When dropped, the `Lent` returns the buffer to the shelf of the thread it is dropped on. It
+frees the buffer if that shelf is full or the thread is ending. It must be `Send` and deref to
+`Vec<u32>`.
+
+Why: a warm lex still makes two general-purpose allocations, the token column and the
+checkpoint column of `LexedStr`. Both live until the parser has read them, past any closure in
+`lex`. With `Lent`, `LexedStr` holds both columns from the worker's shelf without changing its
+API, so a warm lex makes zero allocations. That is memory.md's warm-loop bar, and
+`a_warm_lex_allocates_its_two_columns_once` then asserts 0.
+
+Two other designs would work:
+- Columns in the caller's `Frame` (`Vec<u32, &Frame>`). This gives `LexedStr` a frame lifetime,
+  and every caller in `syntax` and `hir-expand` would change.
+- A request arena.
+
+Mem's choice; format-lexer moves the columns as soon as either one exists.
+
+> forwarded to mem (running; told by tmux).
+
+## format-lexer: `blaze-mem` as a dependency of `parser` (coordinator, `crates/parser/Cargo.toml`)
+
+What: add `blaze-mem.workspace = true` under `[dependencies]` in `crates/parser/Cargo.toml`.
+`blaze-alloc-count` is already in, under `[dev-dependencies]`; this is the other half of that
+request in `v2/requests/format.md`. `blaze-mem` is a workspace dependency, and it doesn't
+depend on `parser`, so there is no cycle.
+
+Why: `LexedStr::lex` (`crates/parser/src/lexed_str.rs`) puts the byte classes in the worker's
+scratch, through `blaze_mem::scratch::with_u64s` (docs/v2/plan/design/memory.md). Without this
+line the parser does not compile.
+
+> applied by requests (format is DONE): `blaze-mem.workspace = true` under `[dependencies]` in `crates/parser/Cargo.toml` (blaze-mem depends only on blaze-reclaim, libc/windows-sys and blaze-check; new edge in the lock).
+
+## format-grammar: call `SyntaxKind::from_keyword_in` (`crates/parser/src/lexed_str.rs:559`)
+
+What: the lexer's identifier kind becomes `SyntaxKind::from_keyword_in(text.as_bytes(), start,
+len, edition)` on the file's text, in place of `from_keyword(&text[start..end], edition)`. It
+reads the identifier with one 8-byte load where the text has 8 bytes at `start`, and gives the
+same answer (`keywords::tests::tables_give_what_the_match_gave` checks both). Why: about 19
+instructions an identifier, against `from_keyword`'s 24 (four 2-byte loads, because a `&str`
+can't be read past its end). Both are down from about 60 with `blaze_phf`; see "Keyword lookup"
+in `docs/v2/plan/lanes/format/speed-of-light.md`.
+
+> forwarded to format-lexer (it is editing `lexed_str.rs` now; told by tmux).
+> applied: by format-lexer. `ident_kind(text, start, len, edition)` calls
+> `SyntaxKind::from_keyword_in` on the file's text, from the fast path, `extend_token`'s `Ident`
+> and `UnknownPrefix`, and the scan test. A `debug_assert` in `extend_token` holds that the
+> token's text starts at the converter's offset. The lexer's speed-of-light numbers now use 19
+> instructions an identifier.

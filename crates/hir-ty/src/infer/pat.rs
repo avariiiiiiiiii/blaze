@@ -26,6 +26,7 @@ use span::Edition;
 use tracing::{debug, instrument, trace};
 
 use crate::{
+    db::HirDatabase,
     BindingMode, InferenceDiagnostic, Span,
     infer::{
         AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
@@ -637,7 +638,7 @@ impl<'db> InferenceContext<'db> {
             // `deref_patterns` is enabled.
             Pat::Lit(expr) => {
                 let lit_ty = self.infer_expr_pat_unadjusted(expr);
-                let lit_ty = self.infcx().resolve_vars_if_possible(lit_ty);
+                let lit_ty = self.infcx().deeply_resolve_ignoring_regions(lit_ty);
                 // If `deref_patterns` is enabled, allow `if let "foo" = &&"foo" {}`.
                 if self.features.deref_patterns {
                     let mut peeled_ty = lit_ty;

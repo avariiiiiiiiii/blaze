@@ -55,6 +55,7 @@ pub(crate) fn require_db_lifetime(generics: &syn::Generics) -> syn::Result<()> {
 /// The generics ought to have been checked with `require_db_lifetime` already.
 pub(crate) fn db_lifetime(generics: &syn::Generics) -> syn::Lifetime {
     if let Some(lt) = generics.lifetimes().next() {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         lt.lifetime.clone()
     } else {
         default_db_lifetime(generics.span())

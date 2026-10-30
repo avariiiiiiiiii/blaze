@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use super::*;
-use crate::frame::Reader;
 
 fn granule() -> u64 {
     page()
@@ -38,7 +37,7 @@ fn a_read_view_refuses_writes_and_out_of_bounds() {
 }
 
 #[test]
-fn a_copy_is_private_and_can_be_made_read_only() {
+fn a_copy_is_private() {
     let object = Object::create("test", granule()).unwrap();
     let mut shared = object.map_here(Access::Shared).unwrap();
     let mut copy = object.map_here(Access::Copy).unwrap();
@@ -47,29 +46,40 @@ fn a_copy_is_private_and_can_be_made_read_only() {
     copy.bytes_mut(0..4).unwrap().copy_from_slice(b"mine");
     assert_eq!(shared.bytes(0..4).unwrap(), b"daem");
     assert_eq!(copy.bytes(0..4).unwrap(), b"mine");
-    protect(copy.address(), 4096, Access::Read).unwrap();
-    assert!(protect(copy.address(), 4096, Access::Execute).is_err());
-    assert!(protect(copy.address(), 4096, Access::Shared).is_err());
 }
 
 #[test]
-fn finding_a_placeholder() {
-    let list = [(0x10_0000, 0x4_0000), (0x20_0000, 0x1_0000)];
-    assert_eq!(find(&list, 0x10_0000, 0x4_0000).unwrap(), Some(0));
-    assert_eq!(find(&list, 0x11_0000, 0x1_0000).unwrap(), Some(0));
-    assert_eq!(find(&list, 0x20_0000, 0x1_0000).unwrap(), Some(1));
-    assert_eq!(find(&list, 0x30_0000, 0x1_0000).unwrap(), None);
-    assert!(find(&list, 0x13_0000, 0x2_0000).is_err());
-    assert!(find(&list, 0x0f_0000, 0x2_0000).is_err());
-    assert!(find(&list, u64::MAX - 4, 0x1_0000).is_err());
+fn an_image_span_splits_at_its_overlays() {
+    let g = 0x1_0000;
+    let span = 0x10 * g..0x20 * g;
+    assert_eq!(pieces(span.clone(), &[]).unwrap(), [Piece::Private { at: 0x10 * g, len: 0x10 * g }]);
+    assert_eq!(pieces(span.clone(), &[0x11 * g..0x13 * g, 0x13 * g..0x14 * g, 0x18 * g..0x20 * g]).unwrap(), [
+        Piece::Private { at: 0x10 * g, len: g },
+        Piece::View { at: 0x11 * g, len: 2 * g, index: 0 },
+        Piece::View { at: 0x13 * g, len: g, index: 1 },
+        Piece::Private { at: 0x14 * g, len: 4 * g },
+        Piece::View { at: 0x18 * g, len: 8 * g, index: 2 },
+    ]);
+    assert!(pieces(span.clone(), &[0x12 * g..0x13 * g, 0x11 * g..0x12 * g]).is_err(), "out of order");
+    assert!(pieces(span.clone(), &[0x1f * g..0x21 * g]).is_err(), "past the span");
+    assert!(pieces(span, &[0x12 * g..0x12 * g]).is_err(), "empty");
 }
 
 #[test]
-fn cutting_a_placeholder() {
-    assert_eq!(cut((0x10_0000, 0x4_0000), 0x10_0000, 0x4_0000), (0, 0));
-    assert_eq!(cut((0x10_0000, 0x4_0000), 0x11_0000, 0x1_0000), (0x1_0000, 0x2_0000));
-    assert_eq!(cut((0x10_0000, 0x4_0000), 0x10_0000, 0x1_0000), (0, 0x3_0000));
-    assert_eq!(cut((0x10_0000, 0x4_0000), 0x13_0000, 0x1_0000), (0x3_0000, 0));
+fn what_an_image_keeps_is_outside_its_overlays() {
+    let overlays = [0x2000..0x4000, 0x6000..0x7000];
+    assert_eq!(outside(0x1000..0x8000, &overlays), [0x1000..0x2000, 0x4000..0x6000, 0x7000..0x8000]);
+    assert_eq!(outside(0x2000..0x4000, &overlays), Vec::<Range<u64>>::new());
+    assert_eq!(outside(0x3000..0x5000, &overlays), [0x4000..0x5000]);
+    assert_eq!(outside(0x8000..0x9000, &overlays), [0x8000..0x9000]);
+}
+
+#[test]
+fn kept_pages_are_data_only() {
+    assert_eq!(private_protection(PAGE_WRITECOPY).unwrap(), PAGE_READWRITE);
+    assert_eq!(private_protection(PAGE_READONLY).unwrap(), PAGE_READONLY);
+    assert!(private_protection(PAGE_EXECUTE_READ).is_err(), "code outside an overlay would run from the file");
+    assert!(private_protection(PAGE_READONLY | 0x100).is_err(), "a guard page");
 }
 
 #[test]
@@ -87,13 +97,13 @@ fn rights_bound_what_a_run_process_maps() {
     assert!(allowed(Rights::Code, Access::Read));
     assert!(allowed(Rights::Code, Access::Copy));
     assert!(!allowed(Rights::Code, Access::Shared));
-    assert!(allowed(Rights::Control, Access::Shared));
-    assert!(allowed(Rights::Control, Access::Read));
-    assert!(!allowed(Rights::Control, Access::Execute));
-    assert!(!allowed(Rights::Control, Access::Copy));
+    assert!(allowed(Rights::Words, Access::Shared));
+    assert!(allowed(Rights::Words, Access::Read));
+    assert!(!allowed(Rights::Words, Access::Execute));
+    assert!(!allowed(Rights::Words, Access::Copy));
 }
 
-/// A connected pair: the daemon's end (with the peer's ID) and the loader's.
+/// A connected pair: the daemon's end (with the peer's ID) and the start hook's.
 fn pair() -> ((Channel, u32), Channel) {
     let dir = std::env::temp_dir();
     let (listener, address) = Listener::bind(&dir).unwrap();
@@ -139,24 +149,15 @@ fn only_pipes_of_blaze_inproc_are_opened() {
     assert!(connect(r"\\.\pipe\someone-else").is_err());
 }
 
-#[test]
-fn a_raw_handle_must_be_a_pipe() {
-    assert!(Stream::from_raw(0).is_err());
-    assert!(Stream::from_raw(-1).is_err());
-}
-
-/// Serves MAP frames as the host does, until the loader hangs up.
+/// Serves MAP frames as the host does, until the start hook hangs up.
 fn serve(mut channel: Channel, remote: Remote) {
     loop {
         let Ok(frame) = channel.recv() else { return };
         let (kind, seq, body) = (frame.kind, frame.seq, frame.body.to_vec());
         assert_eq!(kind, kinds::MAP);
-        let mut read = Reader::new(&body);
-        let (object, offset, len, at) =
-            (read.u32().unwrap(), read.u64().unwrap(), read.u64().unwrap(), read.u64().unwrap());
-        let access = Access::from_tag(read.u8().unwrap()).unwrap();
+        let (object, access) = crate::handshake::decode_map(&body).unwrap();
         let mut answer = Vec::new();
-        match remote.map(object, offset, len, at, access) {
+        match remote.map(object, access) {
             Ok(address) => {
                 Writer::new(&mut answer).u64(address);
                 channel.send(kinds::MAPPED, seq, &answer).unwrap();
@@ -170,56 +171,48 @@ fn serve(mut channel: Channel, remote: Remote) {
 }
 
 #[test]
-fn the_daemon_maps_into_the_loaders_placeholders() {
-    let ((mut daemon, pid), mut loader) = pair();
-    let image = Object::create("image", 4 * granule()).unwrap();
+fn the_daemon_maps_granted_objects_into_the_hook() {
+    let ((mut daemon, pid), mut hook) = pair();
+    let image = Object::create("image", 2 * granule()).unwrap();
     let control = Object::create("control", granule()).unwrap();
     let mut view = image.map_here(Access::Shared).unwrap();
     view.bytes_mut(0..4).unwrap().copy_from_slice(b"code");
-    view.bytes_mut(2 * granule() as usize..2 * granule() as usize + 4).unwrap().copy_from_slice(b"data");
-    let remote = send_objects(&mut daemon, pid, b"grant", &[(&image, Rights::Code), (&control, Rights::Control)]).unwrap();
+    let remote = send_objects(&mut daemon, pid, b"grant", &[(&image, Rights::Code), (&control, Rights::Words)]).unwrap();
     let serving = std::thread::spawn(move || serve(daemon, remote));
 
-    let frame = loader.recv().unwrap();
+    let frame = hook.recv().unwrap();
     assert_eq!((frame.kind, frame.seq, frame.body), (kinds::GRANT, 0, &b"grant"[..]));
-    let objects = recv_objects(&mut loader, 2).unwrap();
-    assert_eq!((objects[0].len(), objects[1].len()), (4 * granule(), granule()));
+    let objects = recv_objects(&mut hook, 2).unwrap();
+    assert_eq!((objects[0].len(), objects[1].len()), (2 * granule(), granule()));
 
-    let base = reserve(&mut loader, 4 * granule(), None).unwrap();
-    assert!(base.is_multiple_of(granule()));
-    // Code and data in one reservation, cut to fit: first the middle, then the ends.
-    let at = objects[0].map(&mut loader, 2 * granule(), granule(), base + 2 * granule(), Access::Copy).unwrap();
-    assert_eq!(at, base + 2 * granule());
-    assert_eq!(objects[0].map(&mut loader, 0, 2 * granule(), base, Access::Execute).unwrap(), base);
-    assert_eq!(
-        objects[0].map(&mut loader, 3 * granule(), granule(), base + 3 * granule(), Access::Execute).unwrap(),
-        base + 3 * granule()
-    );
-    // SAFETY: the views were just mapped readable at these addresses and stay for the test.
-    let (code, data) = unsafe { (*(base as *const [u8; 4]), *((base + 2 * granule()) as *const [u8; 4])) };
-    assert_eq!((&code, &data), (b"code", b"data"));
-    // The daemon's later writes show through the shared code view.
+    let read = objects[0].map_anywhere(&mut hook, Access::Read).unwrap();
+    // SAFETY: the daemon just mapped the image object readable here, for the rest of the test.
+    assert_eq!(unsafe { *(read as *const [u8; 4]) }, *b"code");
     view.bytes_mut(4..8).unwrap().copy_from_slice(b"more");
     // SAFETY: as above.
-    assert_eq!(unsafe { *((base + 4) as *const [u8; 4]) }, *b"more");
+    assert_eq!(unsafe { *((read + 4) as *const [u8; 4]) }, *b"more", "the daemon's writes show through");
 
-    // Mapping over what is mapped, writable code, executable control words: refused.
-    assert!(objects[0].map(&mut loader, 0, granule(), base, Access::Execute).is_err());
-    let spare = reserve(&mut loader, granule(), None).unwrap();
-    assert!(objects[0].map(&mut loader, 0, granule(), spare, Access::Shared).is_err());
-    assert!(objects[1].map(&mut loader, 0, granule(), spare, Access::Execute).is_err());
-    // A map larger than its placeholder is refused here; one past the object's end by the
-    // daemon. Either leaves the placeholder there to map into.
-    assert!(objects[0].map(&mut loader, 0, 2 * granule(), spare, Access::Read).is_err());
-    assert!(objects[0].map(&mut loader, 4 * granule(), granule(), spare, Access::Read).is_err());
-    let words = objects[1].map(&mut loader, 0, granule(), spare, Access::Shared).unwrap();
-    assert_eq!(words, spare);
-
-    let whole = objects[0].view(&mut loader).unwrap();
-    assert_eq!(whole.bytes(0..8).unwrap(), b"codemore");
-    assert_eq!(whole.bytes(2 * granule() as usize..2 * granule() as usize + 4).unwrap(), b"data");
-    drop(loader);
+    assert!(objects[0].map_anywhere(&mut hook, Access::Shared).is_err(), "code shared writable");
+    assert!(objects[0].map_anywhere(&mut hook, Access::Execute).is_err(), "code anywhere but an overlay");
+    assert!(objects[1].map_anywhere(&mut hook, Access::Execute).is_err(), "executable words");
+    let words = objects[1].map_anywhere(&mut hook, Access::Shared).unwrap();
+    // SAFETY: the control object, mapped shared and writable here just now.
+    unsafe { std::ptr::write_volatile(words as *mut u64, 7) };
+    assert_eq!(control.map_here(Access::Read).unwrap().word(0).load(std::sync::atomic::Ordering::Acquire), 7);
+    drop(hook);
     serving.join().unwrap();
+}
+
+#[test]
+fn this_process_names_its_own_image() {
+    let (base, headers) = own_image().unwrap();
+    let layout = crate::image::layout(crate::Format::Pe, headers, page());
+    assert!(base.is_multiple_of(granule()));
+    // A test binary is linked by the pinned toolchain, whose sections sit on 4 KiB: refused,
+    // naming the granule, never read as a layout to overlay.
+    if let Err(error) = layout {
+        assert!(error.what.contains("page"), "{error}");
+    }
 }
 
 #[test]

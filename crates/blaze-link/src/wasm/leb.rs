@@ -32,16 +32,26 @@ pub(super) fn uleb_into(place: &mut [u8], mut value: u64) -> usize {
     }
 }
 
-pub(super) fn sleb(out: &mut Vec<u8>, mut value: i64) {
+pub(super) fn sleb(out: &mut Vec<u8>, value: i64) {
+    let mut bytes = [0; 10];
+    let len = sleb_into(&mut bytes, value);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+/// Writes `value` as a signed LEB128 at the start of `place`, which has room for it (10
+/// bytes hold any), and says how many bytes that took.
+pub(super) fn sleb_into(place: &mut [u8], mut value: i64) -> usize {
+    let mut at = 0;
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
         if done {
-            out.push(byte);
-            return;
+            place[at] = byte;
+            return at + 1;
         }
-        out.push(byte | 0x80);
+        place[at] = byte | 0x80;
+        at += 1;
     }
 }
 
@@ -85,10 +95,10 @@ pub(super) fn section(out: &mut Vec<u8>, id: u8, contents: &[u8]) {
 
 /// A custom section: id 0, its size, its name, then `payload`.
 pub(super) fn custom(out: &mut Vec<u8>, custom: &str, payload: &[u8]) {
-    let mut contents = Vec::with_capacity(custom.len() + 5 + payload.len());
-    name(&mut contents, custom);
-    contents.extend(payload);
-    section(out, 0, &contents);
+    out.push(0);
+    uleb(out, (uleb_len(custom.len() as u64) + custom.len() + payload.len()) as u64);
+    name(out, custom);
+    out.extend_from_slice(payload);
 }
 
 /// `i32.const value; end`: a constant expression.
@@ -145,6 +155,11 @@ mod tests {
         assert_eq!(s(-65), [0xbf, 0x7f]);
         assert_eq!(s(-123_456), [0xc0, 0xbb, 0x78]);
         assert_eq!(s(i32::MIN.into()), [0x80, 0x80, 0x80, 0x80, 0x78]);
+        for value in [0, -1, 63, 64, -64, -65, i64::MIN, i64::MAX] {
+            let mut place = [0xaa; 11];
+            let len = sleb_into(&mut place, value);
+            assert_eq!(&place[..len], s(value), "{value}");
+        }
     }
 
     #[test]

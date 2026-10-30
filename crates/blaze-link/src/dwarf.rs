@@ -73,27 +73,31 @@ const UNNAMED: u8 = 3;
 
 const PRODUCER: &[u8] = b"blaze\0";
 
-/// The DWARF sections, by name (`.debug_info`), of the functions; empty sections left out.
+/// The DWARF sections, by name (`.debug_info`), of the functions.
 pub(crate) fn sections(
     functions: &[DebugFunction<'_>],
     rows: &[Row],
     files: &[&str],
     address_size: u8,
-) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+) -> Result<[(&'static str, Vec<u8>); 4], String> {
     for file in files {
         if file.is_empty() || file.contains('\0') {
+            // alloc: error path
             return Err(format!("a span in the file {file:?}, which DWARF can't name"));
         }
     }
-    let mut order: Vec<u32> = (0..functions.len() as u32).collect();
+    let mut order: Vec<u32> = Vec::with_capacity(functions.len());
+    order.extend(0..functions.len() as u32);
     radix::sort_copy_by_key(&mut order, |it| functions[*it as usize].addr);
     let asz = usize::from(address_size);
     let addr = |out: &mut Vec<u8>, value: u64| -> Result<(), String> {
         match address_size {
             4 => out.extend_from_slice(
+                // alloc: error path
                 &u32::try_from(value).map_err(|_| format!("the address {value:#x} past 32 bits"))?.to_le_bytes(),
             ),
             8 => out.extend_from_slice(&value.to_le_bytes()),
+            // alloc: error path
             other => return Err(format!("an address size of {other} bytes")),
         }
         Ok(())
@@ -128,6 +132,7 @@ pub(crate) fn sections(
         match function.name {
             Some(name) => {
                 if name.contains('\0') {
+                    // alloc: error path
                     return Err(format!("the function name {name:?}, which DWARF can't hold"));
                 }
                 info.push(NAMED);
@@ -176,6 +181,7 @@ pub(crate) fn sections(
         for row in rows {
             let at = u64::from(row.at);
             if at >= function.size || at < offset {
+                // alloc: error path
                 return Err(format!(
                     "a line at offset {at:#x} of a function {:#x} bytes long, or out of order",
                     function.size
@@ -183,6 +189,7 @@ pub(crate) fn sections(
             }
             let this_file = u64::from(row.file) + 1;
             if row.file as usize >= files.len() {
+                // alloc: error path
                 return Err(format!("a line in file {} of {}", row.file, files.len()));
             }
             if this_file != file {
@@ -252,12 +259,7 @@ pub(crate) fn sections(
     abbrev.extend_from_slice(&[DW_AT_LOW_PC, DW_FORM_ADDR, DW_AT_HIGH_PC, DW_FORM_UDATA, 0, 0]);
     abbrev.push(0);
 
-    Ok(vec![
-        (".debug_abbrev", abbrev),
-        (".debug_info", info),
-        (".debug_line", line),
-        (".debug_str", strings),
-    ])
+    Ok([(".debug_abbrev", abbrev), (".debug_info", info), (".debug_line", line), (".debug_str", strings)])
 }
 
 #[cfg(test)]

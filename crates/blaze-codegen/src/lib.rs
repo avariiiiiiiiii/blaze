@@ -108,6 +108,28 @@ pub struct CompiledFunction {
     /// Its code offsets and the spans they are of, by `at`, for debug info. Spans are
     /// position-independent (anchor and index), so a reformat changes no function.
     pub lines: Vec<Line>,
+    /// What SanitizerCoverage made for it ([`crate::settings::Coverage`]): `None` without.
+    pub coverage: Option<Covered>,
+}
+
+/// What LLVM's SanitizerCoverage made for one function: its arrays, which start zeroed and
+/// which the link gathers with every other function's into one section each, in one order,
+/// and its PC table.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Covered {
+    /// Bytes of its 8-bit counters (`__sancov_cntrs`), flags (`__sancov_bools`) and
+    /// guards (`__sancov_guards`, 4 bytes each); 0 for an array it has not.
+    pub counters: u32,
+    pub flags: u32,
+    pub guards: u32,
+    /// Of each block it counts, in the order of its arrays: how far into `code` it starts,
+    /// and its flags (1 for the function's entry), as `__sancov_pcs` has them.
+    pub pcs: Vec<(u32, u64)>,
+}
+
+impl Covered {
+    /// How many arrays a function has: [`Target::Coverage`] names one by its index.
+    pub const ARRAYS: u32 = 3;
 }
 
 /// A code offset of a function and the span its instructions from there are of.
@@ -257,6 +279,10 @@ pub enum Target {
     /// A position the program observes (`line!()`, `#[track_caller]`'s `Location`): the
     /// span side table's entry, filled at link time, so a reformat compiles nothing.
     Position(SpanRef),
+    /// The function's own SanitizerCoverage array ([`CompiledFunction::coverage`]): 0 its
+    /// counters, 1 its flags, 2 its guards; the relocation's addend is into it. A function
+    /// names no other's, and nothing else names one.
+    Coverage(u32),
 }
 
 /// Why a unit did not compile: names the instance and the item.

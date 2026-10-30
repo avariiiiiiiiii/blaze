@@ -7,12 +7,10 @@ use std::{
 };
 
 use blaze_format::{Record, SchemaHash};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, crc32c::crc32c};
 
 use crate::{
-    Cause, Corrupt, OpenError, Refused, Section, SectionId,
-    crc::crc32c,
-    raw,
+    Cause, Corrupt, OpenError, Refused, Section, SectionId, raw,
     spine::{self, Spine},
 };
 
@@ -109,6 +107,7 @@ impl Touched {
 }
 
 fn words(bits: u64) -> Box<[AtomicU64]> {
+    // alloc: the checked and bad bitmaps, once an image opened
     (0..bits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()
 }
 
@@ -240,6 +239,7 @@ impl<S: Stable> Image<S> {
     /// for tests and a check by hand. A whole-image check on the daemon's path is
     /// [`Image::check`] over chunks of groups on its pool.
     pub fn verify(&self) -> Vec<Corrupt> {
+        // alloc: the failures of a whole check by hand or in a test; the daemon uses `Image::check`
         let mut failed = Vec::new();
         for section in &self.spine.sections {
             for group in 0..section.groups {

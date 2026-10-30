@@ -24,9 +24,10 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
         .map(|(file, path)| (file.file_id(&db), format!("$DIR/{path}")))
         .collect();
     hir::attach_db(&db, || {
-        let sema = Semantics::new_dyn(&db);
+        let sema = Semantics::new(&db);
         let krate = hir::check::workspace_crates(&db)[0];
-        let cx = Cx::new(&sema, krate, &names);
+        let frame = crate::tests::frame();
+        let cx = Cx::new(&sema, krate, &names, &frame);
         let source = sema.parse(files[0]);
         source
             .syntax()

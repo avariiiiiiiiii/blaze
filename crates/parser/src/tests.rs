@@ -78,11 +78,12 @@ fn sources() -> Vec<String> {
     out
 }
 
-/// Lexing allocates its three columns once each (the byte classes, the tokens and the
-/// checkpoints) and nothing per token, when the text has no frontmatter, no lexer error and no
-/// more tokens than the columns are sized for (one per 3 bytes); nine in ten real files fit.
+/// A warm lex allocates its two output columns once each (the tokens and the checkpoints) and
+/// nothing per token, when the text has no frontmatter, no lexer error and no more tokens than
+/// the columns are sized for (one per 3 bytes); nine in ten real files fit. The byte classes
+/// are in the worker's scratch, warm after the first lex of a text that size on the thread.
 #[test]
-fn lexing_allocates_its_three_columns_once() {
+fn a_warm_lex_allocates_its_two_columns_once() {
     let texts = sources();
     let mut fit = 0;
     for text in &texts {
@@ -91,7 +92,7 @@ fn lexing_allocates_its_three_columns_once() {
             continue;
         }
         fit += 1;
-        blaze_alloc_count::assert_at_most(3, "lexing a source file", || {
+        blaze_alloc_count::assert_at_most(2, "a warm lex of a source file", || {
             LexedStr::new(Edition::CURRENT, text)
         });
     }
@@ -100,7 +101,7 @@ fn lexing_allocates_its_three_columns_once() {
 
 /// A text denser than the columns are sized for grows them by doubling, not per token: a
 /// megabyte of `;` is a million tokens in columns sized for a third of that, so two doublings
-/// of each.
+/// of each, and one growth of the scratch for the classes if the thread's is smaller.
 #[test]
 fn a_dense_text_grows_the_columns_by_doubling() {
     let text = ";".repeat(1 << 20);
@@ -336,4 +337,268 @@ fn run_and_expect_errors_with_edition(path: &str, edition: Edition) {
     p.push(path);
     p.set_extension("rast");
     expect_file![p].assert_eq(&actual)
+}
+
+/// Every entry point of the grammar finishes on every token sequence: windows of the parser's
+/// own sources, changed the ways `blaze-fuzz` changes bytes (truncated, a token's kind or
+/// jointness changed, tokens inserted, removed, repeated or spliced from another source), and
+/// made-up sequences. This is the fuzz target over `TopEntryPoint` and `PrefixEntryPoint` as a
+/// property test: `fuzz/Cargo.toml`, where targets are registered, was being edited by another
+/// lane, and `blaze-fuzz`'s counting allocator cannot share a test binary with this one's.
+mod termination {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    use blaze_ids::rng::SplitMix64;
+
+    use crate::{Edition, Input, LexedStr, PrefixEntryPoint, Reparser, SyntaxKind, TopEntryPoint};
+
+    /// How many changed sequences are parsed, unless `BLAZE_FUZZ_RUNS` says.
+    const RUNS: usize = 2_000;
+    /// The longest window taken of a source.
+    const WINDOW: usize = 256;
+    /// How long all the runs may take before one is taken to be stuck.
+    const DEADLINE: Duration = Duration::from_secs(300);
+
+    const TOP: [TopEntryPoint; 7] = [
+        TopEntryPoint::SourceFile,
+        TopEntryPoint::MacroStmts,
+        TopEntryPoint::MacroItems,
+        TopEntryPoint::Pattern,
+        TopEntryPoint::Type,
+        TopEntryPoint::Expr,
+        TopEntryPoint::MetaItem,
+    ];
+    const PREFIX: [PrefixEntryPoint; 10] = [
+        PrefixEntryPoint::Vis,
+        PrefixEntryPoint::Block,
+        PrefixEntryPoint::Stmt,
+        PrefixEntryPoint::Pat,
+        PrefixEntryPoint::PatTop,
+        PrefixEntryPoint::Ty,
+        PrefixEntryPoint::Expr,
+        PrefixEntryPoint::Path,
+        PrefixEntryPoint::Item,
+        PrefixEntryPoint::MetaItem,
+    ];
+
+    /// A token as `Input::token` gives it: kind, contextual kind, edition, joint, fragment
+    /// start.
+    type Token = (SyntaxKind, SyntaxKind, Edition, bool, bool);
+
+    /// What tokens may be: every kind the lexer gives the parser, and for identifiers every
+    /// contextual kind.
+    struct Alphabet {
+        kinds: Vec<SyntaxKind>,
+        contextual: Vec<SyntaxKind>,
+        editions: Vec<Edition>,
+    }
+
+    impl Alphabet {
+        fn new() -> Alphabet {
+            let kinds: Vec<SyntaxKind> = (SyntaxKind::EOF as u16 + 1..=SyntaxKind::SHEBANG as u16)
+                .map(SyntaxKind::from)
+                .filter(|&kind| !kind.is_trivia())
+                .collect();
+            let mut contextual: Vec<SyntaxKind> = kinds
+                .iter()
+                .copied()
+                .filter(|&kind| Edition::iter().any(|edition| kind.is_contextual_keyword(edition)))
+                .collect();
+            contextual.push(SyntaxKind::IDENT);
+            Alphabet { kinds, contextual, editions: Edition::iter().collect() }
+        }
+
+        fn token(&self, random: &mut SplitMix64, edition: Edition) -> Token {
+            let kind = self.kinds[random.index(self.kinds.len())];
+            let contextual = match kind {
+                SyntaxKind::IDENT => self.contextual[random.index(self.contextual.len())],
+                _ => SyntaxKind::EOF,
+            };
+            (kind, contextual, edition, random.index(2) == 0, random.index(16) == 0)
+        }
+
+        /// Changes `tokens` in one of the ways a damaged or a made-up input differs from a
+        /// written one.
+        fn change(
+            &self,
+            random: &mut SplitMix64,
+            tokens: &mut Vec<Token>,
+            known: &[Vec<Token>],
+            edition: Edition,
+        ) {
+            let at = random.index(tokens.len());
+            match random.index(8) {
+                0 => tokens.truncate(at),
+                1 if !tokens.is_empty() => tokens[at].3 ^= true,
+                2 if !tokens.is_empty() => tokens[at] = self.token(random, edition),
+                3 => tokens.insert(at, self.token(random, edition)),
+                4 if !tokens.is_empty() => _ = tokens.remove(at),
+                // An opening or closing delimiter repeated: deep nesting, or many closers.
+                5 => {
+                    let delimiter = [
+                        SyntaxKind::L_CURLY,
+                        SyntaxKind::L_PAREN,
+                        SyntaxKind::L_BRACK,
+                        SyntaxKind::L_ANGLE,
+                        SyntaxKind::R_CURLY,
+                        SyntaxKind::R_PAREN,
+                        SyntaxKind::R_BRACK,
+                        SyntaxKind::R_ANGLE,
+                    ][random.index(8)];
+                    let token = (delimiter, SyntaxKind::EOF, edition, false, false);
+                    let count = 1 + random.index(64);
+                    tokens.splice(at..at, std::iter::repeat_n(token, count));
+                }
+                6 => {
+                    let other = &known[random.index(known.len())];
+                    let from = random.index(other.len());
+                    let to = (from + random.index(WINDOW)).min(other.len());
+                    tokens.splice(at.., other[from..to].iter().copied());
+                }
+                _ => {
+                    for _ in 0..random.index(16) {
+                        let token = self.token(random, edition);
+                        tokens.insert(random.index(tokens.len() + 1), token);
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill(input: &mut Input, tokens: &[Token]) {
+        input.clear();
+        for (i, &(kind, contextual, edition, joint, fragment)) in tokens.iter().enumerate() {
+            match kind {
+                SyntaxKind::IDENT => input.push_ident(contextual, edition),
+                _ => input.push(kind, edition),
+            }
+            if joint {
+                input.was_joint();
+            }
+            if fragment {
+                input.mark_fragment_start(i);
+            }
+        }
+    }
+
+    /// Parses `input` with every entry point, full and as an outline.
+    fn parse_everywhere(input: &Input) {
+        for entry in TOP {
+            let _guard = stdx::panic_context::enter(format!("{entry:?}"));
+            entry.parse(input);
+            entry.parse_outline(input);
+        }
+        for entry in PREFIX {
+            let _guard = stdx::panic_context::enter(format!("{entry:?}"));
+            entry.parse(input);
+        }
+        let _guard = stdx::panic_context::enter("Reparser::top_level_item".to_owned());
+        Reparser::top_level_item().parse(input);
+    }
+
+    fn run(done: &AtomicUsize) {
+        let alphabet = Alphabet::new();
+        let known: Vec<Vec<Token>> = super::sources()
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let edition = alphabet.editions[i % alphabet.editions.len()];
+                let input = LexedStr::new(edition, text).to_input(edition);
+                (0..input.len()).map(|i| input.token(i)).collect()
+            })
+            .collect();
+        let runs = std::env::var("BLAZE_FUZZ_RUNS").ok().and_then(|it| it.parse().ok());
+        let mut random = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        let mut input = Input::with_capacity(4 * WINDOW);
+        for run in 0..runs.unwrap_or(RUNS) {
+            let edition = alphabet.editions[random.index(alphabet.editions.len())];
+            let mut tokens = match run % 4 {
+                // Made up: no source under it.
+                0 => (0..random.index(64)).map(|_| alphabet.token(&mut random, edition)).collect(),
+                _ => {
+                    let source = &known[run % known.len()];
+                    let from = random.index(source.len());
+                    let to = (from + 1 + random.index(WINDOW)).min(source.len());
+                    source[from..to].to_vec()
+                }
+            };
+            for _ in 0..=random.index(4) {
+                alphabet.change(&mut random, &mut tokens, &known, edition);
+            }
+            let _guard = stdx::panic_context::enter(format!("run {run}: {tokens:?}"));
+            fill(&mut input, &tokens);
+            parse_everywhere(&input);
+            done.store(run + 1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn every_entry_point_finishes_on_every_input() {
+        let done = Arc::new(AtomicUsize::new(0));
+        let (finished, wait) = mpsc::channel();
+        let worker = {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                run(&done);
+                _ = finished.send(());
+            })
+        };
+        match wait.recv_timeout(DEADLINE) {
+            Ok(()) => worker.join().unwrap(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+                Ok(()) => unreachable!("the runs end by sending"),
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "run {} did not finish within {DEADLINE:?}: the grammar loops without starting \
+                 a node, making an error or consuming a token",
+                done.load(Ordering::Relaxed)
+            ),
+        }
+    }
+}
+
+/// A warm parse takes its event list and its forward-parent list from the thread's scratch
+/// (`event::lend_events`, `event::ForwardParents`), so of the general-purpose allocator it asks
+/// only for the output's words, which live until the tree is built.
+mod warm_parse {
+    use crate::{Edition, LexedStr, TopEntryPoint};
+
+    #[test]
+    fn a_warm_parse_allocates_nothing() {
+        for text in super::sources() {
+            let lexed = LexedStr::new(Edition::CURRENT, &text);
+            let input = lexed.to_input(Edition::CURRENT);
+            drop(TopEntryPoint::SourceFile.parse(&input));
+            drop(TopEntryPoint::SourceFile.parse_outline(&input));
+            blaze_alloc_count::assert_at_most(0, "a warm parse of one of the parser's sources", || {
+                TopEntryPoint::SourceFile.parse(&input)
+            });
+            blaze_alloc_count::assert_at_most(0, "a warm outline of one of the parser's sources", || {
+                TopEntryPoint::SourceFile.parse_outline(&input)
+            });
+        }
+    }
+
+    /// The thread keeps the larger of two event lists: a small parse after a large one leaves
+    /// the large one warm.
+    #[test]
+    fn a_small_parse_keeps_the_large_list_warm() {
+        let large = "fn f() { let x = (1, 2, 3); x.0 + x.1 * x.2; }\n".repeat(200);
+        let small = "fn g() {}";
+        let large = LexedStr::new(Edition::CURRENT, &large).to_input(Edition::CURRENT);
+        let small = LexedStr::new(Edition::CURRENT, small).to_input(Edition::CURRENT);
+        drop(TopEntryPoint::SourceFile.parse(&large));
+        drop(TopEntryPoint::SourceFile.parse(&small));
+        blaze_alloc_count::assert_at_most(0, "a large parse after a small one", || {
+            TopEntryPoint::SourceFile.parse(&large)
+        });
+    }
 }

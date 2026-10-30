@@ -206,9 +206,11 @@ def selftest() -> list[str]:
 
 
 def old_outputs(target: Path, profile: str) -> dict[str, str]:
-    """`engine.outputs` as it was (iterdir, an lstat a file, a read a megabyte): its model."""
-    import hashlib
+    """`engine.outputs` as it was (iterdir, an lstat a file, the whole file read and hashed on
+    one core): its model."""
     import stat
+
+    import blake3
 
     top = target / profile
     found: dict[str, str] = {}
@@ -220,7 +222,7 @@ def old_outputs(target: Path, profile: str) -> dict[str, str]:
             if not stat.S_ISREG(info.st_mode):
                 continue
             if (bool(info.st_mode & 0o111) and not path.suffix) or path.suffix in engine.OUTPUT_SUFFIXES:
-                found[str(path.relative_to(top))] = hashlib.sha256(path.read_bytes()).hexdigest()
+                found[str(path.relative_to(top))] = blake3.blake3(path.read_bytes()).hexdigest()
     return found
 
 

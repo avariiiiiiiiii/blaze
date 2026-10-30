@@ -1,11 +1,11 @@
 #![cfg(all(feature = "inventory", not(feature = "shuttle")))]
 
 //! One database shared by `&` across threads, and tasks pumped above a waiting task on the same
-//! thread (`salsa::set_task_depth`).
+//! thread (`Database::task_depth`).
 
 use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 
 use salsa::{Cancelled, Setter};
 
@@ -28,7 +28,11 @@ impl Db {
 }
 
 #[salsa::db]
-impl salsa::Database for Db {}
+impl salsa::Database for Db {
+    fn task_depth(&self) -> u32 {
+        u32::try_from(depth()).expect("a thread runs more than `u32::MAX` tasks")
+    }
+}
 
 #[salsa::db]
 impl LogDb for Db {
@@ -60,11 +64,6 @@ std::thread_local! {
 
 fn depth() -> usize {
     DEPTH.with(Cell::get)
-}
-
-fn install_depth_hook() {
-    static HOOK: Once = Once::new();
-    HOOK.call_once(|| salsa::set_task_depth(depth));
 }
 
 /// Runs `f` as the task the current thread runs above the one it runs now, as a work pool does
@@ -120,7 +119,6 @@ fn total(db: &dyn LogDb, numbers: Numbers, i: u32) -> u32 {
 /// `outer`'s value and whether it ran, the first time, after `b` changes and after `a` changes,
 /// with `pump` the first time.
 fn outer_runs(pump: Pump) -> Vec<(u32, bool)> {
-    install_depth_hook();
     let mut db = Db::default();
     let numbers = Numbers::new(&db, 1, 2);
     let mut runs = Vec::new();
@@ -176,7 +174,6 @@ fn one_database_shared_across_threads_computes_each_value_once() {
 
 #[test]
 fn pumped_task_reads_are_not_edges_of_the_query_below() {
-    install_depth_hook();
     PUMP.with(|cell| cell.set(Pump::Inner));
     let mut db = Db::default();
     let numbers = Numbers::new(&db, 1, 2);
@@ -196,7 +193,6 @@ fn pumped_task_reads_are_not_edges_of_the_query_below() {
 
 #[test]
 fn pumped_task_asking_the_key_below_is_cancelled() {
-    install_depth_hook();
     PUMP.with(|cell| cell.set(Pump::Outer));
     let db = Db::default();
     let numbers = Numbers::new(&db, 1, 2);

@@ -25,6 +25,7 @@ extern crate rustc_type_ir;
 mod attrs;
 mod from_id;
 mod has_source;
+mod match_lints;
 mod semantics;
 mod source_analyzer;
 
@@ -51,7 +52,7 @@ use std::{
 
 use arrayvec::ArrayVec;
 use base_db::{
-    CrateDisplayName, CrateOrigin, LangCrateOrigin, SourceDatabase, TargetKind, all_crates,
+    CrateDisplayName, CrateOrigin, Db, LangCrateOrigin, TargetKind, all_crates,
 };
 use blaze_hashcons::Interned;
 use either::Either;
@@ -158,6 +159,11 @@ pub use crate::{
     attrs::{AttrsWithOwner, HasAttrs, resolve_doc_path_on},
     diagnostics::*,
     has_source::HasSource,
+    match_lints::{
+        BindingOrigin, BindingWithVariantName, IrrefutableLet, LetSource, MatchLint,
+        NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
+        UnreachablePattern,
+    },
     semantics::{
         LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,
@@ -178,7 +184,13 @@ pub use {
     hir_def::{
         Complete,
         FindPathConfig,
-        attrs::{Docs, IsInnerDoc},
+        attrs::{
+            Docs, IsInnerDoc,
+            stability::{
+                DeprecatedSince, Deprecation, DeprecationEntry, RustcVersion, StableSince,
+                Stability, StabilityLevel, UnstableReason,
+            },
+        },
         expr_store::Body,
         find_path::PrefixKind,
         import_map,
@@ -214,7 +226,6 @@ pub use {
         display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError, HirWrite},
         drop::DropGlue,
         dyn_compatibility::{DynCompatibilityViolation, MethodViolationCode},
-        impl_hir_database,
         layout::LayoutError,
         mir::{MirEvalError, MirLowerError},
         mir_pretty::ConstEvalErrorPretty,
@@ -224,6 +235,7 @@ pub use {
     },
     // FIXME: These are needed for import assets, properly encapsulate them.
     hir_ide::{method_resolution::TraitImpls, next_solver::SimplifiedType},
+    hir_ty_wfcheck::SignatureMismatchAt,
     intern::{Symbol, sym},
 };
 
@@ -258,15 +270,15 @@ impl Crate {
         self.id
     }
 
-    pub fn origin(self, db: &dyn HirDatabase) -> CrateOrigin {
+    pub fn origin(self, db: &Db) -> CrateOrigin {
         self.id.data(db).origin.clone()
     }
 
-    pub fn is_builtin(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_builtin(self, db: &Db) -> bool {
         matches!(self.origin(db), CrateOrigin::Lang(_))
     }
 
-    pub fn dependencies(self, db: &dyn HirDatabase) -> Vec<CrateDependency> {
+    pub fn dependencies(self, db: &Db) -> Vec<CrateDependency> {
         self.id
             .data(db)
             .dependencies
@@ -279,7 +291,7 @@ impl Crate {
             .collect()
     }
 
-    pub fn reverse_dependencies(self, db: &dyn HirDatabase) -> Vec<Crate> {
+    pub fn reverse_dependencies(self, db: &Db) -> Vec<Crate> {
         let all_crates = all_crates(db);
         all_crates
             .iter()
@@ -291,12 +303,12 @@ impl Crate {
 
     pub fn transitive_reverse_dependencies(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
     ) -> impl Iterator<Item = Crate> {
         self.id.transitive_rev_deps(db).into_iter().map(|id| Crate { id })
     }
 
-    pub fn notable_traits_in_deps(self, db: &dyn HirDatabase) -> impl Iterator<Item = &TraitId> {
+    pub fn notable_traits_in_deps(self, db: &Db) -> impl Iterator<Item = &TraitId> {
         self.id
             .transitive_deps(db)
             .into_iter()
@@ -304,49 +316,58 @@ impl Crate {
             .flatten()
     }
 
-    pub fn root_module(self, db: &dyn HirDatabase) -> Module {
+    pub fn root_module(self, db: &Db) -> Module {
         Module { id: crate_def_map(db, self.id).root_module_id() }
     }
 
-    pub fn modules(self, db: &dyn HirDatabase) -> Vec<Module> {
+    pub fn modules(self, db: &Db) -> Vec<Module> {
         let def_map = crate_def_map(db, self.id);
         def_map.modules(db).map(|(id, _)| id.into()).collect()
     }
 
-    pub fn root_file(self, db: &dyn HirDatabase) -> FileId {
+    pub fn root_file(self, db: &Db) -> FileId {
         self.id.data(db).root_file_id
     }
 
     /// Whether the root file's `#![cfg(...)]` is false, which leaves the crate empty.
-    pub fn is_configured_out(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_configured_out(self, db: &Db) -> bool {
         let file = self.id.root_file_id(db);
         hir_def::item_tree::file_item_tree(db, file.into(), self.id).configured_out()
     }
 
-    pub fn edition(self, db: &dyn HirDatabase) -> Edition {
+    pub fn edition(self, db: &Db) -> Edition {
         self.id.data(db).edition
     }
 
-    pub fn version(self, db: &dyn HirDatabase) -> Option<String> {
+    pub fn version(self, db: &Db) -> Option<String> {
         self.id.extra_data(db).version.clone()
     }
 
-    pub fn display_name(self, db: &dyn HirDatabase) -> Option<CrateDisplayName> {
+    pub fn display_name(self, db: &Db) -> Option<CrateDisplayName> {
         self.id.extra_data(db).display_name.clone()
     }
 
-    pub fn target_kind(self, db: &dyn HirDatabase) -> TargetKind {
+    pub fn target_kind(self, db: &Db) -> TargetKind {
         self.id.data(db).target_kind
     }
 
     /// rustc's `--crate-type`s the crate is built as; empty when the build named none.
-    pub fn crate_types(self, db: &dyn HirDatabase) -> base_db::CrateTypes {
+    pub fn crate_types(self, db: &Db) -> base_db::CrateTypes {
         self.id.data(db).crate_types
+    }
+
+    /// The ADT `#[rustc_diagnostic_item = name]` names among the items this crate sees (rustc's
+    /// `get_diagnostic_item`), as `TokenStream` names `proc_macro::TokenStream`.
+    pub fn diagnostic_item_adt(self, db: &Db, name: &Symbol) -> Option<Adt> {
+        match hir_def::diagnostic_item::diagnostic_items(db, self.id).get(name)? {
+            hir_def::AttrDefId::AdtId(adt) => Some(adt.into()),
+            _ => None,
+        }
     }
 
     pub fn query_external_importables(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         query: import_map::Query,
     ) -> impl Iterator<Item = (Either<ModuleDef, Macro>, Complete)> {
         let _p = tracing::info_span!("query_external_importables").entered();
@@ -361,31 +382,31 @@ impl Crate {
         )
     }
 
-    pub fn all(db: &dyn HirDatabase) -> Vec<Crate> {
+    pub fn all(db: &Db) -> Vec<Crate> {
         all_crates(db).iter().map(|&id| Crate { id }).collect()
     }
 
     /// Try to get the root URL of the documentation of a crate.
-    pub fn get_html_root_url(self, db: &dyn HirDatabase) -> Option<String> {
+    pub fn get_html_root_url(self, db: &Db) -> Option<String> {
         // Look for #![doc(html_root_url = "...")]
         let doc_url = AttrFlags::doc_html_root_url(db, self.id);
         doc_url.as_ref().map(|s| s.trim_matches('"').trim_end_matches('/').to_owned() + "/")
     }
 
-    pub fn cfg<'db>(&self, db: &'db dyn HirDatabase) -> &'db CfgOptions {
+    pub fn cfg<'db>(&self, db: &'db Db) -> &'db CfgOptions {
         self.id.cfg_options(db)
     }
 
-    pub fn potential_cfg<'db>(&self, db: &'db dyn HirDatabase) -> &'db CfgOptions {
+    pub fn potential_cfg<'db>(&self, db: &'db Db) -> &'db CfgOptions {
         let data = self.id.extra_data(db);
         data.potential_cfg_options.as_ref().unwrap_or_else(|| self.id.cfg_options(db))
     }
 
-    pub fn to_display_target(self, db: &dyn HirDatabase) -> DisplayTarget {
+    pub fn to_display_target(self, db: &Db) -> DisplayTarget {
         DisplayTarget::from_crate(db, self.id)
     }
 
-    fn core(db: &dyn HirDatabase) -> Option<Crate> {
+    fn core(db: &Db) -> Option<Crate> {
         all_crates(db)
             .iter()
             .copied()
@@ -395,7 +416,7 @@ impl Crate {
             .map(Crate::from)
     }
 
-    pub fn is_unstable_feature_enabled(self, db: &dyn HirDatabase, feature: &Symbol) -> bool {
+    pub fn is_unstable_feature_enabled(self, db: &Db, feature: &Symbol) -> bool {
         UnstableFeatures::query(db, self.id).is_enabled(feature)
     }
 }
@@ -440,7 +461,7 @@ impl_from!(
 );
 
 impl ModuleDef {
-    pub fn module(self, db: &dyn HirDatabase) -> Option<Module> {
+    pub fn module(self, db: &Db) -> Option<Module> {
         match self {
             ModuleDef::Module(it) => it.parent(db),
             ModuleDef::Function(it) => Some(it.module(db)),
@@ -455,7 +476,7 @@ impl ModuleDef {
         }
     }
 
-    pub fn canonical_path(&self, db: &dyn HirDatabase, edition: Edition) -> Option<String> {
+    pub fn canonical_path(&self, db: &Db, edition: Edition) -> Option<String> {
         let name = self.name(db)?;
         let segments = self.module(db)?.path_segments(db).chain(Some(name));
         Some(segments.map(|it| it.display(db, edition).to_string()).join("::"))
@@ -463,12 +484,12 @@ impl ModuleDef {
 
     pub fn canonical_module_path(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
     ) -> Option<impl Iterator<Item = Module>> {
         self.module(db).map(|it| it.path_to_root(db).into_iter().rev())
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         let name = match self {
             ModuleDef::Module(it) => it.name(db)?,
             ModuleDef::Const(it) => it.name(db)?,
@@ -531,7 +552,7 @@ impl ModuleDef {
         }
     }
 
-    pub fn attrs(&self, db: &dyn HirDatabase) -> Option<AttrsWithOwner> {
+    pub fn attrs(&self, db: &Db) -> Option<AttrsWithOwner> {
         Some(match self {
             ModuleDef::Module(it) => it.attrs(db),
             ModuleDef::Function(it) => HasAttrs::attrs(*it, db),
@@ -548,7 +569,7 @@ impl ModuleDef {
 }
 
 impl HasCrate for ModuleDef {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         match self.module(db) {
             Some(module) => module.krate(db),
             None => Crate::core(db).unwrap_or_else(|| all_crates(db)[0].into()),
@@ -557,7 +578,7 @@ impl HasCrate for ModuleDef {
 }
 
 impl HasAttrs for ModuleDef {
-    fn attr_id(self, db: &dyn HirDatabase) -> attrs::AttrsOwner {
+    fn attr_id(self, db: &Db) -> attrs::AttrsOwner {
         match self {
             ModuleDef::Module(it) => it.attr_id(db),
             ModuleDef::Function(it) => it.attr_id(db),
@@ -574,7 +595,7 @@ impl HasAttrs for ModuleDef {
 }
 
 impl HasVisibility for ModuleDef {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         match *self {
             ModuleDef::Module(it) => it.visibility(db),
             ModuleDef::Function(it) => it.visibility(db),
@@ -592,29 +613,29 @@ impl HasVisibility for ModuleDef {
 
 impl Module {
     /// Name of this module.
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         self.id.name(db)
     }
 
     /// Returns the crate this module is part of.
-    pub fn krate(self, db: &dyn HirDatabase) -> Crate {
+    pub fn krate(self, db: &Db) -> Crate {
         Crate { id: self.id.krate(db) }
     }
 
     /// Topmost parent of this module. Every module has a `crate_root`, but some
     /// might be missing `krate`. This can happen if a module's file is not included
     /// in the module tree of any target in `Cargo.toml`.
-    pub fn crate_root(self, db: &dyn HirDatabase) -> Module {
+    pub fn crate_root(self, db: &Db) -> Module {
         let def_map = crate_def_map(db, self.id.krate(db));
         Module { id: def_map.crate_root(db) }
     }
 
-    pub fn is_crate_root(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_crate_root(self, db: &Db) -> bool {
         self.crate_root(db) == self
     }
 
     /// Iterates over all child modules.
-    pub fn children(self, db: &dyn HirDatabase) -> impl Iterator<Item = Module> {
+    pub fn children(self, db: &Db) -> impl Iterator<Item = Module> {
         let def_map = self.id.def_map(db);
         let children = def_map
             .module(db, self.id)
@@ -626,14 +647,14 @@ impl Module {
     }
 
     /// Finds a parent module.
-    pub fn parent(self, db: &dyn HirDatabase) -> Option<Module> {
+    pub fn parent(self, db: &Db) -> Option<Module> {
         let def_map = self.id.def_map(db);
         let parent_id = def_map.containing_module(db, self.id)?;
         Some(Module { id: parent_id })
     }
 
     /// Finds nearest non-block ancestor `Module` (`self` included).
-    pub fn nearest_non_block_module(self, db: &dyn HirDatabase) -> Module {
+    pub fn nearest_non_block_module(self, db: &Db) -> Module {
         let mut id = self.id;
         while id.is_block_module(db) {
             id = id.containing_module(db).expect("block without parent module");
@@ -644,7 +665,7 @@ impl Module {
         Module { id: unsafe { id.to_static() } }
     }
 
-    pub fn path_to_root(self, db: &dyn HirDatabase) -> Vec<Module> {
+    pub fn path_to_root(self, db: &Db) -> Vec<Module> {
         let mut res = vec![self];
         let mut curr = self;
         while let Some(next) = curr.parent(db) {
@@ -664,11 +685,11 @@ impl Module {
     /// [`ModuleDef::canonical_module_path`] is the same walk yielding the `Module`s
     /// themselves, for callers that need more than the name — each module's own
     /// edition, say.
-    pub fn path_segments(self, db: &dyn HirDatabase) -> impl Iterator<Item = Name> {
+    pub fn path_segments(self, db: &Db) -> impl Iterator<Item = Name> {
         self.path_to_root(db).into_iter().rev().filter_map(|it| it.name(db))
     }
 
-    pub fn modules_in_scope(&self, db: &dyn HirDatabase, pub_only: bool) -> Vec<(Name, Module)> {
+    pub fn modules_in_scope(&self, db: &Db, pub_only: bool) -> Vec<(Name, Module)> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
 
@@ -688,7 +709,7 @@ impl Module {
     /// Returns a `ModuleScope`: a set of items, visible in this module.
     pub fn scope(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
         visible_from: Option<Module>,
     ) -> Vec<(Name, ScopeDef<'_>)> {
         self.id
@@ -712,7 +733,7 @@ impl Module {
 
     pub fn resolve_mod_path(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         segments: impl IntoIterator<Item = Name>,
     ) -> Option<impl Iterator<Item = ItemInNs>> {
         let items = self
@@ -725,7 +746,7 @@ impl Module {
     /// Fills `acc` with the module's diagnostics.
     pub fn diagnostics<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         acc: &mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
     ) {
@@ -736,7 +757,7 @@ impl Module {
     /// those of the items themselves are all there.
     pub fn diagnostics_of_bodies<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         acc: &mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
         bodies: &dyn Fn(DefWithBody) -> bool,
@@ -745,7 +766,7 @@ impl Module {
         crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, bodies);
     }
 
-    pub fn declarations(self, db: &dyn HirDatabase) -> Vec<ModuleDef> {
+    pub fn declarations(self, db: &Db) -> Vec<ModuleDef> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope
@@ -755,33 +776,33 @@ impl Module {
             .collect()
     }
 
-    pub fn legacy_macros(self, db: &dyn HirDatabase) -> Vec<Macro> {
+    pub fn legacy_macros(self, db: &Db) -> Vec<Macro> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| it.into()).collect()
     }
 
-    pub fn extern_blocks(self, db: &dyn HirDatabase) -> Vec<ExternBlock> {
+    pub fn extern_blocks(self, db: &Db) -> Vec<ExternBlock> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope.extern_blocks().map(|id| ExternBlock { id }).collect()
     }
 
     /// The `use` items written in the module.
-    pub fn use_decls(self, db: &dyn HirDatabase) -> Vec<UseDecl> {
+    pub fn use_decls(self, db: &Db) -> Vec<UseDecl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope.use_decls().map(|id| UseDecl { id }).collect()
     }
 
     /// The `extern crate` items written in the module.
-    pub fn extern_crate_decls(self, db: &dyn HirDatabase) -> Vec<ExternCrateDecl> {
+    pub fn extern_crate_decls(self, db: &Db) -> Vec<ExternCrateDecl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope.extern_crate_decls().map(|id| ExternCrateDecl { id }).collect()
     }
 
-    pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
+    pub fn impl_defs(self, db: &Db) -> Vec<Impl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
         scope.impls().map(Impl::from).chain(scope.builtin_derive_impls().map(Impl::from)).collect()
@@ -791,7 +812,7 @@ impl Module {
     /// this module, if possible.
     pub fn find_path(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         item: impl Into<ItemInNs>,
         cfg: FindPathConfig,
     ) -> Option<ModPath> {
@@ -809,7 +830,7 @@ impl Module {
     /// this module, if possible. This is used for returning import paths for use-statements.
     pub fn find_use_path(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         item: impl Into<ItemInNs>,
         prefix_kind: PrefixKind,
         cfg: FindPathConfig,
@@ -825,19 +846,19 @@ impl Module {
     }
 
     #[inline]
-    pub fn doc_keyword(self, db: &dyn HirDatabase) -> Option<Symbol> {
+    pub fn doc_keyword(self, db: &Db) -> Option<Symbol> {
         AttrFlags::doc_keyword(db, self.id)
     }
 
     /// Whether it has `#[path = "..."]` attribute.
     #[inline]
-    pub fn has_path(&self, db: &dyn HirDatabase) -> bool {
+    pub fn has_path(&self, db: &Db) -> bool {
         self.attrs(db).attrs.contains(AttrFlags::HAS_PATH)
     }
 }
 
 impl HasVisibility for Module {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let def_map = self.id.def_map(db);
         let module_data = &def_map.module(db, self.id);
         module_data.visibility
@@ -862,7 +883,7 @@ impl<'db> TupleField<'db> {
         Name::new_tuple_field(self.index as usize)
     }
 
-    pub fn ty(&self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty(&self, db: &'db Db) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         let ty = InferenceResult::of(db, self.owner)
             .tuple_field_access_type(self.tuple)
@@ -910,7 +931,7 @@ impl AstNode for FieldSource {
 }
 
 impl Field {
-    pub fn name(&self, db: &dyn HirDatabase) -> Name {
+    pub fn name(&self, db: &Db) -> Name {
         VariantId::from(self.parent).fields(db).fields()[self.id].name.clone()
     }
 
@@ -920,23 +941,23 @@ impl Field {
 
     /// Returns the type as in the signature of the struct. Only use this in the
     /// context of the field definition.
-    pub fn ty<'db>(&self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty<'db>(&self, db: &'db Db) -> Type<'db> {
         let var_id = self.parent.into();
         let ty = db.field_types(var_id)[self.id].ty().instantiate_identity().skip_norm_wip();
         Type::new(db, var_id.adt_id(db).into(), ty)
     }
 
-    pub fn layout<'db>(&self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
+    pub fn layout<'db>(&self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
         self.ty(db).layout(db)
     }
 
-    pub fn parent_def(&self, _db: &dyn HirDatabase) -> Variant {
+    pub fn parent_def(&self, _db: &Db) -> Variant {
         self.parent
     }
 }
 
 impl HasVisibility for Field {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let variant_data = VariantId::from(self.parent).fields(db);
         let visibility = &variant_data.fields()[self.id].visibility;
         let parent_id: hir_def::VariantId = self.parent.into();
@@ -951,15 +972,15 @@ pub struct Struct {
 }
 
 impl Struct {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.lookup(db).container }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         StructSignature::of(db, self.id).name.clone()
     }
 
-    pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
+    pub fn fields(self, db: &Db) -> Vec<Field> {
         self.id
             .fields(db)
             .fields()
@@ -968,19 +989,19 @@ impl Struct {
             .collect()
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_def(db, self.id)
     }
 
-    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn constructor_ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
 
-    pub fn repr(self, db: &dyn HirDatabase) -> Option<ReprOptions> {
+    pub fn repr(self, db: &Db) -> Option<ReprOptions> {
         AttrFlags::repr(db, self.id.into())
     }
 
-    pub fn kind(self, db: &dyn HirDatabase) -> StructKind {
+    pub fn kind(self, db: &Db) -> StructKind {
         match self.variant_fields(db).shape {
             hir_def::item_tree::FieldsShape::Record => StructKind::Record,
             hir_def::item_tree::FieldsShape::Tuple => StructKind::Tuple,
@@ -988,17 +1009,17 @@ impl Struct {
         }
     }
 
-    fn variant_fields(self, db: &dyn HirDatabase) -> &VariantFields {
+    fn variant_fields(self, db: &Db) -> &VariantFields {
         self.id.fields(db)
     }
 
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
     }
 }
 
 impl HasVisibility for Struct {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -1011,23 +1032,23 @@ pub struct Union {
 }
 
 impl Union {
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         UnionSignature::of(db, self.id).name.clone()
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.lookup(db).container }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_def(db, self.id)
     }
 
-    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn constructor_ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
 
-    pub fn kind(self, db: &dyn HirDatabase) -> StructKind {
+    pub fn kind(self, db: &Db) -> StructKind {
         match self.id.fields(db).shape {
             hir_def::item_tree::FieldsShape::Record => StructKind::Record,
             hir_def::item_tree::FieldsShape::Tuple => StructKind::Tuple,
@@ -1035,7 +1056,7 @@ impl Union {
         }
     }
 
-    pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
+    pub fn fields(self, db: &Db) -> Vec<Field> {
         self.id
             .fields(db)
             .fields()
@@ -1043,13 +1064,13 @@ impl Union {
             .map(|(id, _)| Field { parent: self.into(), id })
             .collect()
     }
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
     }
 }
 
 impl HasVisibility for Union {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -1062,32 +1083,32 @@ pub struct Enum {
 }
 
 impl Enum {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.lookup(db).container }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         EnumSignature::of(db, self.id).name.clone()
     }
 
-    pub fn variants(self, db: &dyn HirDatabase) -> Vec<EnumVariant> {
+    pub fn variants(self, db: &Db) -> Vec<EnumVariant> {
         self.id.enum_variants(db).variants.values().map(|&(id, _)| EnumVariant { id }).collect()
     }
 
-    pub fn num_variants(self, db: &dyn HirDatabase) -> usize {
+    pub fn num_variants(self, db: &Db) -> usize {
         self.id.enum_variants(db).variants.len()
     }
 
-    pub fn repr(self, db: &dyn HirDatabase) -> Option<ReprOptions> {
+    pub fn repr(self, db: &Db) -> Option<ReprOptions> {
         AttrFlags::repr(db, self.id.into())
     }
 
-    pub fn ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty<'db>(self, db: &'db Db) -> Type<'db> {
         Type::from_def(db, self.id)
     }
 
     /// The type of the enum variant bodies.
-    pub fn variant_body_ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn variant_body_ty<'db>(self, db: &'db Db) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         Type::no_params(
             db,
@@ -1124,21 +1145,21 @@ impl Enum {
     }
 
     /// Returns true if at least one variant of this enum is a non-unit variant.
-    pub fn is_data_carrying(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_data_carrying(self, db: &Db) -> bool {
         self.variants(db).iter().any(|v| !matches!(v.kind(db), StructKind::Unit))
     }
 
-    pub fn layout<'db>(self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
+    pub fn layout<'db>(self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
         Adt::from(self).layout(db)
     }
 
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
     }
 }
 
 impl HasVisibility for Enum {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -1151,23 +1172,23 @@ pub struct EnumVariant {
 }
 
 impl EnumVariant {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 
-    pub fn parent_enum(self, db: &dyn HirDatabase) -> Enum {
+    pub fn parent_enum(self, db: &Db) -> Enum {
         self.id.lookup(db).parent.into()
     }
 
-    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn constructor_ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         self.id.lookup(db).name.clone()
     }
 
-    pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
+    pub fn fields(self, db: &Db) -> Vec<Field> {
         self.id
             .fields(db)
             .fields()
@@ -1176,7 +1197,7 @@ impl EnumVariant {
             .collect()
     }
 
-    pub fn kind(self, db: &dyn HirDatabase) -> StructKind {
+    pub fn kind(self, db: &Db) -> StructKind {
         match self.id.fields(db).shape {
             hir_def::item_tree::FieldsShape::Record => StructKind::Record,
             hir_def::item_tree::FieldsShape::Tuple => StructKind::Tuple,
@@ -1184,15 +1205,15 @@ impl EnumVariant {
         }
     }
 
-    pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
+    pub fn value(self, db: &Db) -> Option<ast::Expr> {
         self.source(db)?.value.const_arg()?.expr()
     }
 
-    pub fn eval(self, db: &dyn HirDatabase) -> Result<i128, ConstEvalError<'_>> {
+    pub fn eval(self, db: &Db) -> Result<i128, ConstEvalError<'_>> {
         db.const_eval_discriminant(self.into())
     }
 
-    pub fn layout<'db>(&self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
+    pub fn layout<'db>(&self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
         let parent_enum = self.parent_enum(db);
         let parent_layout = parent_enum.layout(db)?;
         Ok(match &parent_layout.0.variants {
@@ -1208,7 +1229,7 @@ impl EnumVariant {
         })
     }
 
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
     }
 }
@@ -1222,7 +1243,7 @@ pub enum StructKind {
 
 /// Variants inherit visibility from the parent enum.
 impl HasVisibility for EnumVariant {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         self.parent_enum(db).visibility(db)
     }
 }
@@ -1237,11 +1258,11 @@ pub enum Adt {
 impl_from!(Struct, Union, Enum for Adt);
 
 impl Adt {
-    pub fn has_non_default_type_params(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_non_default_type_params(self, db: &Db) -> bool {
         has_non_default_type_params(db, self.into())
     }
 
-    pub fn layout<'db>(self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
+    pub fn layout<'db>(self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
         let interner = DbInterner::new_no_crate(db);
         let adt_id = AdtId::from(self);
         let args = GenericArgs::for_item_with_defaults(interner, adt_id.into(), |_, id, _| {
@@ -1254,12 +1275,12 @@ impl Adt {
     /// Turns this ADT into a type. Any type parameters of the ADT will be
     /// turned into unknown types, which is good for e.g. finding the most
     /// general set of completions, but will not look very nice when printed.
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         let id = AdtId::from(self);
         Type::from_def(db, id)
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             Adt::Struct(s) => s.module(db),
             Adt::Union(s) => s.module(db),
@@ -1267,7 +1288,7 @@ impl Adt {
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         match self {
             Adt::Struct(s) => s.name(db),
             Adt::Union(u) => u.name(db),
@@ -1276,7 +1297,7 @@ impl Adt {
     }
 
     /// Returns the lifetime of the DataType
-    pub fn lifetime(&self, db: &dyn HirDatabase) -> Option<LifetimeParamData> {
+    pub fn lifetime(&self, db: &Db) -> Option<LifetimeParamData> {
         let resolver = match self {
             Adt::Struct(s) => s.id.resolver(db),
             Adt::Union(u) => u.id.resolver(db),
@@ -1304,13 +1325,13 @@ impl Adt {
     /// The generic parameters its variance leaves bivariant and no projection of its where
     /// clauses constrains, in declaration order: each one rustc's E0392. Empty when a field's
     /// type has an error.
-    pub fn unused_params(self, db: &dyn HirDatabase) -> Vec<GenericParam> {
+    pub fn unused_params(self, db: &Db) -> Vec<GenericParam> {
         hir_ide::adt_unused_params(db, self.into()).into_iter().map(GenericParam::from).collect()
     }
 }
 
 impl HasVisibility for Adt {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         match self {
             Adt::Struct(it) => it.visibility(db),
             Adt::Union(it) => it.visibility(db),
@@ -1328,7 +1349,7 @@ pub enum Variant {
 impl_from!(Struct, Union, EnumVariant for Variant);
 
 impl Variant {
-    pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
+    pub fn fields(self, db: &Db) -> Vec<Field> {
         match self {
             Variant::Struct(it) => it.fields(db),
             Variant::Union(it) => it.fields(db),
@@ -1336,7 +1357,7 @@ impl Variant {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             Variant::Struct(it) => it.module(db),
             Variant::Union(it) => it.module(db),
@@ -1344,7 +1365,7 @@ impl Variant {
         }
     }
 
-    pub fn name(&self, db: &dyn HirDatabase) -> Name {
+    pub fn name(&self, db: &Db) -> Name {
         match self {
             Variant::Struct(s) => (*s).name(db),
             Variant::Union(u) => (*u).name(db),
@@ -1352,7 +1373,7 @@ impl Variant {
         }
     }
 
-    pub fn adt(&self, db: &dyn HirDatabase) -> Adt {
+    pub fn adt(&self, db: &Db) -> Adt {
         match *self {
             Variant::Struct(it) => it.into(),
             Variant::Union(it) => it.into(),
@@ -1367,18 +1388,18 @@ pub struct AnonConst<'db> {
 }
 
 impl<'db> AnonConst<'db> {
-    pub fn owner(self, db: &dyn HirDatabase) -> ExpressionStoreOwner {
+    pub fn owner(self, db: &Db) -> ExpressionStoreOwner {
         self.id.loc(db).owner.into()
     }
 
-    pub fn ty(self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty(self, db: &'db Db) -> Type<'db> {
         let loc = self.id.loc(db);
         Type { owner: TypeOwnerId::from_anon_const(self.id, db), ty: loc.ty.get() }
     }
 
     pub fn eval(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> Result<EvaluatedConst<'db>, ConstEvalError<'db>> {
         let ty = self.id.loc(db).ty.get().instantiate_identity().skip_norm_wip();
         db.anon_const_eval(self.id, GenericArgs::empty(), None).map(|it| EvaluatedConst {
@@ -1424,7 +1445,7 @@ impl_from!(
 );
 
 impl ExpressionStoreOwner {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             Self::Body(body) => body.module(db),
             Self::Signature(generic_def) => generic_def.module(db),
@@ -1444,7 +1465,7 @@ pub enum DefWithBody {
 impl_from!(Function, Const, Static, EnumVariant for DefWithBody);
 
 impl DefWithBody {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             DefWithBody::Const(c) => c.module(db),
             DefWithBody::Function(f) => f.module(db),
@@ -1453,7 +1474,7 @@ impl DefWithBody {
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         match self {
             DefWithBody::Function(f) => Some(f.name(db)),
             DefWithBody::Static(s) => Some(s.name(db)),
@@ -1463,7 +1484,7 @@ impl DefWithBody {
     }
 
     /// Returns the type this def's body has to evaluate to.
-    pub fn body_type(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn body_type(self, db: &Db) -> Type<'_> {
         match self {
             DefWithBody::Function(it) => it.ret_type(db),
             DefWithBody::Static(it) => it.ty(db),
@@ -1485,13 +1506,13 @@ impl DefWithBody {
     }
 
     #[deprecated = "you should really not use this, this is exported for analysis-stats only"]
-    pub fn run_mir_body(self, db: &dyn HirDatabase) -> Result<(), MirLowerError<'_>> {
+    pub fn run_mir_body(self, db: &Db) -> Result<(), MirLowerError<'_>> {
         let Some(id) = self.id() else { return Ok(()) };
         db.mir_body(id.into()).map(drop)
     }
 
     /// A textual representation of the HIR of this def's body for debugging purposes.
-    pub fn debug_hir(self, db: &dyn HirDatabase) -> String {
+    pub fn debug_hir(self, db: &Db) -> String {
         let Some(id) = self.id() else {
             return String::new();
         };
@@ -1500,7 +1521,7 @@ impl DefWithBody {
     }
 
     /// A textual representation of the MIR of this def's body for debugging purposes.
-    pub fn debug_mir(self, db: &dyn HirDatabase) -> String {
+    pub fn debug_mir(self, db: &Db) -> String {
         let Some(id) = self.id() else {
             return String::new();
         };
@@ -1514,7 +1535,7 @@ impl DefWithBody {
     /// Returns an iterator over the inferred types of all expressions in this body.
     pub fn expression_types<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
@@ -1526,7 +1547,7 @@ impl DefWithBody {
     }
 
     /// Returns an iterator over the inferred types of all patterns in this body.
-    pub fn pattern_types<'db>(self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Type<'db>> {
+    pub fn pattern_types<'db>(self, db: &'db Db) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
@@ -1537,7 +1558,7 @@ impl DefWithBody {
     }
 
     /// Returns an iterator over the inferred types of all bindings in this body.
-    pub fn binding_types<'db>(self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Type<'db>> {
+    pub fn binding_types<'db>(self, db: &'db Db) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
@@ -1566,7 +1587,7 @@ impl fmt::Debug for Function {
 }
 
 impl Function {
-    pub fn lang(db: &dyn HirDatabase, krate: Crate, lang_item: LangItem) -> Option<Function> {
+    pub fn lang(db: &Db, krate: Crate, lang_item: LangItem) -> Option<Function> {
         let lang_items = hir_def::lang_item::lang_items(db, krate.id);
         match lang_item.from_lang_items(lang_items)? {
             LangItemTarget::FunctionId(it) => Some(it.into()),
@@ -1577,7 +1598,7 @@ impl Function {
     /// Whether this function of a trait cannot be used through `impl_`: one of its where-clauses
     /// that names only the trait's parameters cannot hold there, as `Self: DoubleEndedIterator`
     /// of `Iterator::rev` for an iterator that is not, as far as `krate` can know.
-    pub fn is_impossible_in(self, db: &dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
+    pub fn is_impossible_in(self, db: &Db, impl_: Impl, krate: Crate) -> bool {
         let (AnyFunctionId::FunctionId(id), Ok(impl_id)) = (self.id, ImplId::try_from(impl_))
         else {
             return false;
@@ -1588,14 +1609,14 @@ impl Function {
         traits::is_impossible_associated_item(db, krate.id, impl_id, id.into())
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self.id {
             AnyFunctionId::FunctionId(id) => id.module(db).into(),
             AnyFunctionId::BuiltinDeriveImplMethod { impl_, .. } => impl_.module(db).into(),
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).name.clone(),
             AnyFunctionId::BuiltinDeriveImplMethod { method, .. } => {
@@ -1604,7 +1625,7 @@ impl Function {
         }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         match self.id {
             AnyFunctionId::FunctionId(id) => Type::from_value_def(db, id),
             AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ } => {
@@ -1619,7 +1640,7 @@ impl Function {
         }
     }
 
-    pub fn fn_ptr_type(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn fn_ptr_type(self, db: &Db) -> Type<'_> {
         match self.id {
             AnyFunctionId::FunctionId(id) => {
                 let interner = DbInterner::new_no_crate(db);
@@ -1640,7 +1661,7 @@ impl Function {
         }
     }
 
-    fn fn_sig<'db>(self, db: &'db dyn HirDatabase) -> (TypeOwnerId, PolyFnSig<'db>) {
+    fn fn_sig<'db>(self, db: &'db Db) -> (TypeOwnerId, PolyFnSig<'db>) {
         let fn_ptr = self.fn_ptr_type(db);
         let TyKind::FnPtr(sig_tys, hdr) = fn_ptr.ty.skip_binder().kind() else {
             unreachable!();
@@ -1648,19 +1669,88 @@ impl Function {
         (fn_ptr.owner, sig_tys.with(hdr))
     }
 
-    fn erased_fn_sig<'db>(self, db: &'db dyn HirDatabase) -> (TypeOwnerId, FnSig<'db>) {
+    fn erased_fn_sig<'db>(self, db: &'db Db) -> (TypeOwnerId, FnSig<'db>) {
         let (owner, sig) = self.fn_sig(db);
         let sig = DbInterner::new_no_crate(db).instantiate_bound_regions_with_erased(sig);
         (owner, sig)
     }
 
+    /// The lowered signature, its late-bound lifetimes free lifetimes of the function
+    /// (rustc's `liberate_late_bound_regions`), as rustc's checks of a signature read it.
+    /// `None` for a built-in derive's method, which has none of its own.
+    pub fn signature(self, db: &Db) -> Option<FnSignature<'_>> {
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        let poly = db.callable_item_signature(id.into()).instantiate_identity().skip_norm_wip();
+        let sig = DbInterner::new_no_crate(db).liberate_late_bound_regions(id.into(), poly);
+        Some(FnSignature { owner: GenericDefId::FunctionId(id), sig })
+    }
+
+    /// For a method of a trait impl, the trait's method's signature with the impl's arguments,
+    /// in this method's generics (rustc's `suggest_trait_fn_ty_for_impl_fn_infer`), and that
+    /// method.
+    pub fn trait_signature_in_impl(self, db: &Db) -> Option<(Function, FnSignature<'_>)> {
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        let (trait_method, sig) = hir_ty_wfcheck::trait_signature_in_impl(db, id)?;
+        Some((trait_method.into(), FnSignature { owner: GenericDefId::FunctionId(id), sig }))
+    }
+
+    /// For a method of a trait impl, the first place its signature is not a subtype of the
+    /// trait's method's with the impl's arguments, normalized in this method's environment:
+    /// rustc's E0053 (`compare_method_clause_entailment`).
+    pub fn impl_signature_mismatch(self, db: &Db) -> Option<ImplSignatureMismatch<'_>> {
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        let it = hir_ty_wfcheck::compare_impl_method_signature(db, id)?;
+        let owner = GenericDefId::FunctionId(id);
+        let interner = DbInterner::new_no_crate(db);
+        Some(ImplSignatureMismatch {
+            trait_method: it.trait_method.into(),
+            at: it.at,
+            types: it.types.map(|types| {
+                (
+                    Type::new_in(interner, owner, types.expected),
+                    Type::new_in(interner, owner, types.found),
+                )
+            }),
+            expected: FnSignature { owner, sig: it.expected },
+            found: FnSignature { owner, sig: it.found },
+        })
+    }
+
+    /// For a `#[proc_macro]` or `#[proc_macro_derive]` function, or with `attribute` a
+    /// `#[proc_macro_attribute]` one, the first place its signature differs from safe Rust
+    /// `fn(TokenStream) -> TokenStream` (two `TokenStream`s for an attribute): rustc's
+    /// `ProcMacroBadSig` (`check_proc_macro`).
+    pub fn proc_macro_signature_mismatch(
+        self,
+        db: &Db,
+        attribute: bool,
+    ) -> Option<ProcMacroSignatureMismatch<'_>> {
+        let AnyFunctionId::FunctionId(id) = self.id else {
+            return None;
+        };
+        let inputs = if attribute { 2 } else { 1 };
+        let it = hir_ty_wfcheck::compare_proc_macro_signature(db, id, inputs)?;
+        let owner = GenericDefId::FunctionId(id);
+        Some(ProcMacroSignatureMismatch {
+            at: it.at,
+            expected: FnSignature { owner, sig: it.expected },
+            found: FnSignature { owner, sig: it.found },
+        })
+    }
+
     /// Get this function's return type
-    pub fn ret_type(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ret_type(self, db: &Db) -> Type<'_> {
         let (owner, sig) = self.erased_fn_sig(db);
         Type { owner, ty: EarlyBinder::bind(DbInterner::new_no_crate(db), sig.output()) }
     }
 
-    pub fn async_ret_type<'db>(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn async_ret_type<'db>(self, db: &'db Db) -> Option<Type<'db>> {
         let AnyFunctionId::FunctionId(id) = self.id else {
             return None;
         };
@@ -1681,7 +1771,7 @@ impl Function {
         None
     }
 
-    pub fn has_self_param(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_self_param(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).has_self_param(),
             AnyFunctionId::BuiltinDeriveImplMethod { method, .. } => match method {
@@ -1696,11 +1786,11 @@ impl Function {
         }
     }
 
-    pub fn self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
+    pub fn self_param(self, db: &Db) -> Option<SelfParam> {
         self.has_self_param(db).then_some(SelfParam { func: self })
     }
 
-    pub fn assoc_fn_params(self, db: &dyn HirDatabase) -> Vec<Param<'_>> {
+    pub fn assoc_fn_params(self, db: &Db) -> Vec<Param<'_>> {
         let (owner, sig) = self.erased_fn_sig(db);
         let interner = DbInterner::new_no_crate(db);
         let func = match self.id {
@@ -1720,7 +1810,7 @@ impl Function {
             .collect()
     }
 
-    pub fn num_params(self, db: &dyn HirDatabase) -> usize {
+    pub fn num_params(self, db: &Db) -> usize {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).params.len(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => {
@@ -1729,12 +1819,12 @@ impl Function {
         }
     }
 
-    pub fn method_params(self, db: &dyn HirDatabase) -> Option<Vec<Param<'_>>> {
+    pub fn method_params(self, db: &Db) -> Option<Vec<Param<'_>>> {
         self.self_param(db)?;
         Some(self.params_without_self(db))
     }
 
-    pub fn params_without_self(self, db: &dyn HirDatabase) -> Vec<Param<'_>> {
+    pub fn params_without_self(self, db: &Db) -> Vec<Param<'_>> {
         let mut params = self.assoc_fn_params(db);
         if self.has_self_param(db) {
             params.remove(0);
@@ -1742,35 +1832,35 @@ impl Function {
         params
     }
 
-    pub fn is_const(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_const(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_const(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
-    pub fn is_async(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_async(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_async(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
-    pub fn is_unsafe(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unsafe(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_unsafe(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
-    pub fn is_varargs(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_varargs(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_varargs(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
-    pub fn extern_block(self, db: &dyn HirDatabase) -> Option<ExternBlock> {
+    pub fn extern_block(self, db: &Db) -> Option<ExternBlock> {
         match self.id {
             AnyFunctionId::FunctionId(id) => match id.lookup(db).container {
                 ItemContainerId::ExternBlockId(id) => Some(ExternBlock { id }),
@@ -1780,7 +1870,7 @@ impl Function {
         }
     }
 
-    pub fn returns_impl_future(self, db: &dyn HirDatabase) -> bool {
+    pub fn returns_impl_future(self, db: &Db) -> bool {
         if self.is_async(db) {
             return true;
         }
@@ -1808,14 +1898,14 @@ impl Function {
     }
 
     /// Does this function have `#[test]` attribute?
-    pub fn is_test(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_test(self, db: &Db) -> bool {
         self.attrs(db).contains(AttrFlags::IS_TEST)
     }
 
     /// is this a `fn main` or a function with an `export_name` of `main`? A crate of
     /// procedural macros has no entry point: its `fn main` is a function as any other (tokio's
     /// `#[proc_macro_attribute] pub fn main`).
-    pub fn is_main(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_main(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => {
                 self.exported_main(db)
@@ -1827,7 +1917,7 @@ impl Function {
         }
     }
 
-    fn attrs(self, db: &dyn HirDatabase) -> AttrFlags {
+    fn attrs(self, db: &Db) -> AttrFlags {
         match self.id {
             AnyFunctionId::FunctionId(id) => AttrFlags::query(db, id.into()),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => AttrFlags::empty(),
@@ -1835,28 +1925,28 @@ impl Function {
     }
 
     /// Is this a function with an `export_name` of `main`?
-    pub fn exported_main(self, db: &dyn HirDatabase) -> bool {
+    pub fn exported_main(self, db: &Db) -> bool {
         self.attrs(db).contains(AttrFlags::IS_EXPORT_NAME_MAIN)
     }
 
     /// Does this function have the ignore attribute?
-    pub fn is_ignore(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_ignore(self, db: &Db) -> bool {
         self.attrs(db).contains(AttrFlags::IS_IGNORE)
     }
 
     /// Does this function have `#[bench]` attribute?
-    pub fn is_bench(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_bench(self, db: &Db) -> bool {
         self.attrs(db).contains(AttrFlags::IS_BENCH)
     }
 
     /// Is this function marked as unstable with `#[feature]` attribute?
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         self.attrs(db).contains(AttrFlags::IS_UNSTABLE)
     }
 
     pub fn is_unsafe_to_call(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
         caller: Option<Function>,
         call_edition: Edition,
     ) -> bool {
@@ -1896,14 +1986,14 @@ impl Function {
     /// Whether this function declaration has a definition.
     ///
     /// This is false in the case of required (not provided) trait methods.
-    pub fn has_body(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_body(self, db: &Db) -> bool {
         match self.id {
             AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).has_body(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => true,
         }
     }
 
-    pub fn as_proc_macro(self, db: &dyn HirDatabase) -> Option<Macro> {
+    pub fn as_proc_macro(self, db: &Db) -> Option<Macro> {
         let AnyFunctionId::FunctionId(id) = self.id else {
             return None;
         };
@@ -1913,7 +2003,7 @@ impl Function {
 
     pub fn eval(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
         span_formatter: impl Fn(FileId, TextRange) -> String,
     ) -> Result<String, ConstEvalError<'_>> {
         let AnyFunctionId::FunctionId(id) = self.id else {
@@ -2006,11 +2096,11 @@ impl<'db> Param<'db> {
         &self.ty
     }
 
-    pub fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(&self, db: &Db) -> Option<Name> {
         Some(self.as_local(db)?.name(db))
     }
 
-    pub fn as_local(&self, db: &'db dyn HirDatabase) -> Option<Local<'db>> {
+    pub fn as_local(&self, db: &'db Db) -> Option<Local<'db>> {
         match self.func {
             Callee::Def(CallableDefId::FunctionId(it)) => {
                 let parent = DefWithBodyId::FunctionId(it);
@@ -2054,7 +2144,7 @@ impl<'db> Param<'db> {
         }
     }
 
-    pub fn pattern_source(self, db: &dyn HirDatabase) -> Option<ast::Pat> {
+    pub fn pattern_source(self, db: &Db) -> Option<ast::Pat> {
         self.source(db).and_then(|p| p.value.right()?.pat())
     }
 }
@@ -2065,7 +2155,7 @@ pub struct SelfParam {
 }
 
 impl SelfParam {
-    pub fn access(self, db: &dyn HirDatabase) -> Access {
+    pub fn access(self, db: &Db) -> Access {
         match self.func.id {
             AnyFunctionId::FunctionId(id) => {
                 let func_data = FunctionSignature::of(db, id);
@@ -2099,14 +2189,14 @@ impl SelfParam {
         self.func
     }
 
-    pub fn ty<'db>(&self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty<'db>(&self, db: &'db Db) -> Type<'db> {
         let (owner, sig) = self.func.erased_fn_sig(db);
         Type { owner, ty: EarlyBinder::bind(DbInterner::new_no_crate(db), sig.inputs()[0]) }
     }
 }
 
 impl HasVisibility for Function {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         match self.id {
             AnyFunctionId::FunctionId(id) => AssocItemId::from(id).assoc_visibility(db),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => Visibility::Public,
@@ -2120,11 +2210,11 @@ pub struct ExternCrateDecl {
 }
 
 impl ExternCrateDecl {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.id.module(db).into()
     }
 
-    pub fn resolved_crate(self, db: &dyn HirDatabase) -> Option<Crate> {
+    pub fn resolved_crate(self, db: &Db) -> Option<Crate> {
         let loc = self.id.lookup(db);
         let krate = loc.container.krate(db);
         let name = self.name(db);
@@ -2137,13 +2227,13 @@ impl ExternCrateDecl {
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         as_name_opt(source.value.name_ref())
     }
 
-    pub fn alias(self, db: &dyn HirDatabase) -> Option<ImportAlias> {
+    pub fn alias(self, db: &Db) -> Option<ImportAlias> {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         let rename = source.value.rename()?;
@@ -2157,7 +2247,7 @@ impl ExternCrateDecl {
     }
 
     /// Returns the name under which this crate is made accessible, taking `_` into account.
-    pub fn alias_or_name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn alias_or_name(self, db: &Db) -> Option<Name> {
         match self.alias(db) {
             Some(ImportAlias::Underscore) => None,
             Some(ImportAlias::Alias(alias)) => Some(alias),
@@ -2167,7 +2257,7 @@ impl ExternCrateDecl {
 }
 
 impl HasVisibility for ExternCrateDecl {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -2180,28 +2270,28 @@ pub struct Const {
 }
 
 impl Const {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         ConstSignature::of(db, self.id).name.clone()
     }
 
-    pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
+    pub fn value(self, db: &Db) -> Option<ast::Expr> {
         self.source(db)?.value.body()
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
 
-    pub fn has_body(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_body(self, db: &Db) -> bool {
         ConstSignature::of(db, self.id).has_body()
     }
 
     /// Evaluate the constant.
-    pub fn eval(self, db: &dyn HirDatabase) -> Result<EvaluatedConst<'_>, ConstEvalError<'_>> {
+    pub fn eval(self, db: &Db) -> Result<EvaluatedConst<'_>, ConstEvalError<'_>> {
         let ty = db.value_ty(self.id.into()).unwrap().instantiate_identity().skip_norm_wip();
         db.const_eval(self.id, GenericArgs::empty(), None).map(|it| EvaluatedConst {
             allocation: it,
@@ -2212,7 +2302,7 @@ impl Const {
 }
 
 impl HasVisibility for Const {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         AssocItemId::from(self.id).assoc_visibility(db)
     }
 }
@@ -2224,11 +2314,11 @@ pub struct EvaluatedConst<'db> {
 }
 
 impl<'db> EvaluatedConst<'db> {
-    pub fn render(&self, db: &dyn HirDatabase, display_target: DisplayTarget) -> String {
+    pub fn render(&self, db: &Db, display_target: DisplayTarget) -> String {
         format!("{}", self.allocation.display(db, display_target))
     }
 
-    pub fn render_debug(&self, db: &'db dyn HirDatabase) -> Result<String, MirEvalError<'db>> {
+    pub fn render_debug(&self, db: &'db Db) -> Result<String, MirEvalError<'db>> {
         let ty = self.allocation.ty.kind();
         if let TyKind::Int(_) | TyKind::Uint(_) = ty {
             let b = &self.allocation.memory;
@@ -2254,27 +2344,27 @@ pub struct Static {
 }
 
 impl Static {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         StaticSignature::of(db, self.id).name.clone()
     }
 
-    pub fn is_mut(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_mut(self, db: &Db) -> bool {
         StaticSignature::of(db, self.id).flags.contains(StaticFlags::MUTABLE)
     }
 
-    pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
+    pub fn value(self, db: &Db) -> Option<ast::Expr> {
         self.source(db)?.value.body()
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_value_def(db, self.id)
     }
 
-    pub fn extern_block(self, db: &dyn HirDatabase) -> Option<ExternBlock> {
+    pub fn extern_block(self, db: &Db) -> Option<ExternBlock> {
         match self.id.lookup(db).container {
             ItemContainerId::ExternBlockId(id) => Some(ExternBlock { id }),
             _ => None,
@@ -2282,7 +2372,7 @@ impl Static {
     }
 
     /// Evaluate the static initializer.
-    pub fn eval(self, db: &dyn HirDatabase) -> Result<EvaluatedConst<'_>, ConstEvalError<'_>> {
+    pub fn eval(self, db: &Db) -> Result<EvaluatedConst<'_>, ConstEvalError<'_>> {
         let ty = db.value_ty(self.id.into()).unwrap().instantiate_identity().skip_norm_wip();
         db.const_eval_static(self.id).map(|it| EvaluatedConst {
             allocation: it,
@@ -2293,7 +2383,7 @@ impl Static {
 }
 
 impl HasVisibility for Static {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -2306,7 +2396,7 @@ pub struct Trait {
 }
 
 impl Trait {
-    pub fn lang(db: &dyn HirDatabase, krate: Crate, lang_item: LangItem) -> Option<Trait> {
+    pub fn lang(db: &Db, krate: Crate, lang_item: LangItem) -> Option<Trait> {
         let lang_items = hir_def::lang_item::lang_items(db, krate.id);
         match lang_item.from_lang_items(lang_items)? {
             LangItemTarget::TraitId(it) => Some(it.into()),
@@ -2314,25 +2404,25 @@ impl Trait {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.lookup(db).container }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         TraitSignature::of(db, self.id).name.clone()
     }
 
-    pub fn direct_supertraits(self, db: &dyn HirDatabase) -> Vec<Trait> {
+    pub fn direct_supertraits(self, db: &Db) -> Vec<Trait> {
         let traits = direct_super_traits(db, self.into());
         traits.iter().map(|tr| Trait::from(*tr)).collect()
     }
 
-    pub fn all_supertraits(self, db: &dyn HirDatabase) -> Vec<Trait> {
+    pub fn all_supertraits(self, db: &Db) -> Vec<Trait> {
         let traits = all_super_traits(db, self.into());
         traits.iter().map(|tr| Trait::from(*tr)).collect()
     }
 
-    pub fn function(self, db: &dyn HirDatabase, name: impl PartialEq<Name>) -> Option<Function> {
+    pub fn function(self, db: &Db, name: impl PartialEq<Name>) -> Option<Function> {
         self.id.trait_items(db).items.iter().find(|(n, _)| name == *n).and_then(|&(_, it)| match it
         {
             AssocItemId::FunctionId(id) => Some(id.into()),
@@ -2340,25 +2430,25 @@ impl Trait {
         })
     }
 
-    pub fn items(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
+    pub fn items(self, db: &Db) -> Vec<AssocItem> {
         self.id.trait_items(db).items.iter().map(|(_name, it)| (*it).into()).collect()
     }
 
-    pub fn items_with_supertraits(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
+    pub fn items_with_supertraits(self, db: &Db) -> Vec<AssocItem> {
         self.all_supertraits(db).into_iter().flat_map(|tr| tr.items(db)).collect()
     }
 
-    pub fn is_auto(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_auto(self, db: &Db) -> bool {
         TraitSignature::of(db, self.id).flags.contains(TraitFlags::AUTO)
     }
 
-    pub fn is_unsafe(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unsafe(&self, db: &Db) -> bool {
         TraitSignature::of(db, self.id).flags.contains(TraitFlags::UNSAFE)
     }
 
     pub fn type_or_const_param_count(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         count_required_only: bool,
     ) -> usize {
         GenericParams::of(db,self.id.into())
@@ -2368,13 +2458,13 @@ impl Trait {
             .count()
     }
 
-    pub fn dyn_compatibility(&self, db: &dyn HirDatabase) -> Option<DynCompatibilityViolation> {
+    pub fn dyn_compatibility(&self, db: &Db) -> Option<DynCompatibilityViolation> {
         hir_ide::dyn_compatibility::dyn_compatibility(db, self.id)
     }
 
     pub fn dyn_compatibility_all_violations(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
     ) -> Option<Vec<DynCompatibilityViolation>> {
         let mut violations = vec![];
         _ = hir_ide::dyn_compatibility::dyn_compatibility_with_callback(
@@ -2389,7 +2479,7 @@ impl Trait {
     }
 
     /// `#[rust_analyzer::completions(...)]` mode.
-    pub fn complete(self, db: &dyn HirDatabase) -> Complete {
+    pub fn complete(self, db: &Db) -> Complete {
         Complete::extract(true, self.attrs(db).attrs)
     }
 
@@ -2402,17 +2492,17 @@ impl Trait {
     // to import it will prefer to import it `as _` (but allow to import it normally as well).
     //
     // Malformed attributes will be ignored without warnings.
-    pub fn prefer_underscore_import(self, db: &dyn HirDatabase) -> bool {
+    pub fn prefer_underscore_import(self, db: &Db) -> bool {
         AttrFlags::query(db, self.id.into()).contains(AttrFlags::PREFER_UNDERSCORE_IMPORT)
     }
 
-    pub fn must_implement_one_of(self, db: &dyn HirDatabase) -> Option<&[Name]> {
+    pub fn must_implement_one_of(self, db: &Db) -> Option<&[Name]> {
         AttrFlags::must_implement_one_of(db, self.id)
     }
 }
 
 impl HasVisibility for Trait {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         let loc = self.id.lookup(db);
         let source = loc.source(db);
         visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
@@ -2425,29 +2515,29 @@ pub struct TypeAlias {
 }
 
 impl TypeAlias {
-    pub fn has_non_default_type_params(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_non_default_type_params(self, db: &Db) -> bool {
         has_non_default_type_params(db, self.id.into())
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::from_def(db, self.id)
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         TypeAliasSignature::of(db, self.id).name.clone()
     }
 
-    pub fn has_type(self, db: &dyn HirDatabase) -> bool {
+    pub fn has_type(self, db: &Db) -> bool {
         TypeAliasSignature::of(db, self.id).ty.is_some()
     }
 }
 
 impl HasVisibility for TypeAlias {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         AssocItemId::from(self.id).assoc_visibility(db)
     }
 }
@@ -2458,7 +2548,7 @@ pub struct ExternBlock {
 }
 
 impl ExternBlock {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 }
@@ -2470,7 +2560,7 @@ pub struct UseDecl {
 }
 
 impl UseDecl {
-    pub fn source(self, db: &dyn HirDatabase) -> InFile<ast::Use> {
+    pub fn source(self, db: &Db) -> InFile<ast::Use> {
         self.id.lookup(db).source(db)
     }
 }
@@ -2505,7 +2595,7 @@ impl BuiltinType {
         BuiltinType { inner: hir_def::builtin_type::BuiltinType::Bool }
     }
 
-    pub fn ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty<'db>(self, db: &'db Db) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         let ty = Ty::from_builtin_type(interner, self.inner);
         Type::no_params(db, Type::builtin_type_crate(db), ty)
@@ -2574,11 +2664,11 @@ pub struct Macro {
 }
 
 impl Macro {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         Module { id: self.id.module(db) }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         match self.id {
             MacroId::Macro2Id(id) => {
                 let loc = id.lookup(db);
@@ -2608,7 +2698,7 @@ impl Macro {
         matches!(self.id, MacroId::ProcMacroId(_))
     }
 
-    pub fn kind(&self, db: &dyn HirDatabase) -> MacroKind {
+    pub fn kind(&self, db: &Db) -> MacroKind {
         match self.id {
             MacroId::Macro2Id(it) => match it.lookup(db).expander {
                 MacroExpander::Declarative { .. } => MacroKind::Declarative,
@@ -2636,14 +2726,14 @@ impl Macro {
         }
     }
 
-    pub fn is_fn_like(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_fn_like(&self, db: &Db) -> bool {
         matches!(
             self.kind(db),
             MacroKind::Declarative | MacroKind::DeclarativeBuiltIn | MacroKind::ProcMacro
         )
     }
 
-    pub fn builtin_derive_kind(&self, db: &dyn HirDatabase) -> Option<BuiltinDeriveMacroKind> {
+    pub fn builtin_derive_kind(&self, db: &Db) -> Option<BuiltinDeriveMacroKind> {
         let expander = match self.id {
             MacroId::Macro2Id(it) => it.lookup(db).expander,
             MacroId::MacroRulesId(it) => it.lookup(db).expander,
@@ -2655,7 +2745,7 @@ impl Macro {
         }
     }
 
-    pub fn is_env_or_option_env(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_env_or_option_env(&self, db: &Db) -> bool {
         match self.id {
             MacroId::Macro2Id(it) => {
                 matches!(it.lookup(db).expander, MacroExpander::BuiltInEager(eager) if eager.is_env_or_option_env())
@@ -2668,7 +2758,7 @@ impl Macro {
     }
 
     /// Is this `asm!()`, or a variant of it (e.g. `global_asm!()`)?
-    pub fn is_asm_like(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_asm_like(&self, db: &Db) -> bool {
         match self.id {
             MacroId::Macro2Id(it) => {
                 matches!(it.lookup(db).expander, MacroExpander::BuiltIn(m) if m.is_asm())
@@ -2680,15 +2770,15 @@ impl Macro {
         }
     }
 
-    pub fn is_attr(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_attr(&self, db: &Db) -> bool {
         matches!(self.kind(db), MacroKind::Attr | MacroKind::AttrBuiltIn)
     }
 
-    pub fn is_derive(&self, db: &dyn HirDatabase) -> bool {
+    pub fn is_derive(&self, db: &Db) -> bool {
         matches!(self.kind(db), MacroKind::Derive | MacroKind::DeriveBuiltIn)
     }
 
-    pub fn preferred_brace_style(&self, db: &dyn HirDatabase) -> Option<MacroBraces> {
+    pub fn preferred_brace_style(&self, db: &Db) -> Option<MacroBraces> {
         let attrs = self.attrs(db);
         MacroBraces::extract(attrs.attrs)
     }
@@ -2737,7 +2827,7 @@ impl MacroBraces {
 pub struct BuiltinDeriveMacroKind(BuiltinDeriveExpander);
 
 impl HasVisibility for Macro {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         match self.id {
             MacroId::Macro2Id(id) => {
                 let loc = id.lookup(db);
@@ -2794,14 +2884,14 @@ impl ItemInNs {
     }
 
     /// Returns the crate defining this item (or `None` if `self` is built-in).
-    pub fn krate(&self, db: &dyn HirDatabase) -> Option<Crate> {
+    pub fn krate(&self, db: &Db) -> Option<Crate> {
         match self {
             ItemInNs::Types(did) | ItemInNs::Values(did) => did.module(db).map(|m| m.krate(db)),
             ItemInNs::Macros(id) => Some(id.module(db).krate(db)),
         }
     }
 
-    pub fn attrs(&self, db: &dyn HirDatabase) -> Option<AttrsWithOwner> {
+    pub fn attrs(&self, db: &Db) -> Option<AttrsWithOwner> {
         match self {
             ItemInNs::Types(it) | ItemInNs::Values(it) => it.attrs(db),
             ItemInNs::Macros(it) => Some(it.attrs(db)),
@@ -2819,11 +2909,11 @@ pub enum ExternAssocItem {
 }
 
 pub trait AsExternAssocItem {
-    fn as_extern_assoc_item(self, db: &dyn HirDatabase) -> Option<ExternAssocItem>;
+    fn as_extern_assoc_item(self, db: &Db) -> Option<ExternAssocItem>;
 }
 
 impl AsExternAssocItem for Function {
-    fn as_extern_assoc_item(self, db: &dyn HirDatabase) -> Option<ExternAssocItem> {
+    fn as_extern_assoc_item(self, db: &Db) -> Option<ExternAssocItem> {
         let AnyFunctionId::FunctionId(id) = self.id else {
             return None;
         };
@@ -2832,13 +2922,13 @@ impl AsExternAssocItem for Function {
 }
 
 impl AsExternAssocItem for Static {
-    fn as_extern_assoc_item(self, db: &dyn HirDatabase) -> Option<ExternAssocItem> {
+    fn as_extern_assoc_item(self, db: &Db) -> Option<ExternAssocItem> {
         as_extern_assoc_item(db, ExternAssocItem::Static, self.id)
     }
 }
 
 impl AsExternAssocItem for TypeAlias {
-    fn as_extern_assoc_item(self, db: &dyn HirDatabase) -> Option<ExternAssocItem> {
+    fn as_extern_assoc_item(self, db: &Db) -> Option<ExternAssocItem> {
         as_extern_assoc_item(db, ExternAssocItem::TypeAlias, self.id)
     }
 }
@@ -2868,11 +2958,11 @@ pub enum AssocItemContainer {
 }
 
 pub trait AsAssocItem {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem>;
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem>;
 }
 
 impl AsAssocItem for Function {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         match self.id {
             AnyFunctionId::FunctionId(id) => as_assoc_item(db, AssocItem::Function, id),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => Some(AssocItem::Function(self)),
@@ -2881,19 +2971,19 @@ impl AsAssocItem for Function {
 }
 
 impl AsAssocItem for Const {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         as_assoc_item(db, AssocItem::Const, self.id)
     }
 }
 
 impl AsAssocItem for TypeAlias {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         as_assoc_item(db, AssocItem::TypeAlias, self.id)
     }
 }
 
 impl AsAssocItem for ModuleDef {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         match self {
             ModuleDef::Function(it) => it.as_assoc_item(db),
             ModuleDef::Const(it) => it.as_assoc_item(db),
@@ -2904,7 +2994,7 @@ impl AsAssocItem for ModuleDef {
 }
 
 impl AsAssocItem for DefWithBody {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         match self {
             DefWithBody::Function(it) => it.as_assoc_item(db),
             DefWithBody::Const(it) => it.as_assoc_item(db),
@@ -2914,7 +3004,7 @@ impl AsAssocItem for DefWithBody {
 }
 
 impl AsAssocItem for GenericDef {
-    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         match self {
             GenericDef::Function(it) => it.as_assoc_item(db),
             GenericDef::Const(it) => it.as_assoc_item(db),
@@ -2925,7 +3015,7 @@ impl AsAssocItem for GenericDef {
 }
 
 fn as_assoc_item<'db, ID, DEF, LOC>(
-    db: &(dyn HirDatabase + 'db),
+    db: &Db,
     ctor: impl FnOnce(DEF) -> AssocItem,
     id: ID,
 ) -> Option<AssocItem>
@@ -2941,7 +3031,7 @@ where
 }
 
 fn as_extern_assoc_item<'db, ID, DEF, LOC>(
-    db: &(dyn HirDatabase + 'db),
+    db: &Db,
     ctor: impl FnOnce(DEF) -> ExternAssocItem,
     id: ID,
 ) -> Option<ExternAssocItem>
@@ -2959,7 +3049,7 @@ where
 }
 
 impl ExternAssocItem {
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         match self {
             Self::Function(it) => it.name(db),
             Self::Static(it) => it.name(db),
@@ -2967,7 +3057,7 @@ impl ExternAssocItem {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             Self::Function(f) => f.module(db),
             Self::Static(c) => c.module(db),
@@ -2998,7 +3088,7 @@ impl ExternAssocItem {
 }
 
 impl AssocItem {
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         match self {
             AssocItem::Function(it) => Some(it.name(db)),
             AssocItem::Const(it) => it.name(db),
@@ -3006,7 +3096,7 @@ impl AssocItem {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             AssocItem::Function(f) => f.module(db),
             AssocItem::Const(c) => c.module(db),
@@ -3014,7 +3104,7 @@ impl AssocItem {
         }
     }
 
-    pub fn container(self, db: &dyn HirDatabase) -> AssocItemContainer {
+    pub fn container(self, db: &Db) -> AssocItemContainer {
         let container = match self {
             AssocItem::Function(it) => match it.id {
                 AnyFunctionId::FunctionId(id) => id.lookup(db).container,
@@ -3036,28 +3126,28 @@ impl AssocItem {
         }
     }
 
-    pub fn container_trait(self, db: &dyn HirDatabase) -> Option<Trait> {
+    pub fn container_trait(self, db: &Db) -> Option<Trait> {
         match self.container(db) {
             AssocItemContainer::Trait(t) => Some(t),
             _ => None,
         }
     }
 
-    pub fn implemented_trait(self, db: &dyn HirDatabase) -> Option<Trait> {
+    pub fn implemented_trait(self, db: &Db) -> Option<Trait> {
         match self.container(db) {
             AssocItemContainer::Impl(i) => i.trait_(db),
             _ => None,
         }
     }
 
-    pub fn container_or_implemented_trait(self, db: &dyn HirDatabase) -> Option<Trait> {
+    pub fn container_or_implemented_trait(self, db: &Db) -> Option<Trait> {
         match self.container(db) {
             AssocItemContainer::Trait(t) => Some(t),
             AssocItemContainer::Impl(i) => i.trait_(db),
         }
     }
 
-    pub fn implementing_ty(self, db: &dyn HirDatabase) -> Option<Type<'_>> {
+    pub fn implementing_ty(self, db: &Db) -> Option<Type<'_>> {
         match self.container(db) {
             AssocItemContainer::Impl(i) => Some(i.self_ty(db)),
             _ => None,
@@ -3087,7 +3177,7 @@ impl AssocItem {
 }
 
 impl HasVisibility for AssocItem {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
+    fn visibility(&self, db: &Db) -> Visibility {
         match self {
             AssocItem::Function(f) => f.visibility(db),
             AssocItem::Const(c) => c.visibility(db),
@@ -3121,7 +3211,7 @@ impl_from!(
 );
 
 impl GenericDef {
-    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(self, db: &Db) -> Option<Name> {
         match self {
             GenericDef::Function(it) => Some(it.name(db)),
             GenericDef::Adt(it) => Some(it.name(db)),
@@ -3133,7 +3223,7 @@ impl GenericDef {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             GenericDef::Function(it) => it.module(db),
             GenericDef::Adt(it) => it.module(db),
@@ -3145,7 +3235,7 @@ impl GenericDef {
         }
     }
 
-    pub fn params(self, db: &dyn HirDatabase) -> Vec<GenericParam> {
+    pub fn params(self, db: &Db) -> Vec<GenericParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
@@ -3165,7 +3255,7 @@ impl GenericDef {
             .collect()
     }
 
-    pub fn lifetime_params(self, db: &dyn HirDatabase) -> Vec<LifetimeParam> {
+    pub fn lifetime_params(self, db: &Db) -> Vec<LifetimeParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
@@ -3177,7 +3267,7 @@ impl GenericDef {
             .collect()
     }
 
-    pub fn type_or_const_params(self, db: &dyn HirDatabase) -> Vec<TypeOrConstParam> {
+    pub fn type_or_const_params(self, db: &Db) -> Vec<TypeOrConstParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
@@ -3193,7 +3283,7 @@ impl GenericDef {
 
     /// Every predicate of its own where clauses and parameter bounds, not its parent's (rustc's
     /// `explicit_predicates_of`), in the order written.
-    pub fn where_predicates(self, db: &dyn HirDatabase) -> Vec<WherePredicate<'_>> {
+    pub fn where_predicates(self, db: &Db) -> Vec<WherePredicate<'_>> {
         let Some(id) = self.id() else {
             return Vec::new();
         };
@@ -3266,7 +3356,7 @@ impl<'db> GenericSubstitution<'db> {
 
     fn types_impl(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> impl Iterator<Item = (Ty<'db>, Option<Name>)> {
         let container = match self.def {
             GenericDefId::ConstId(id) => Some(id.lookup(db).container),
@@ -3298,7 +3388,7 @@ impl<'db> GenericSubstitution<'db> {
     }
 
     /// Returns type arguments with type parameter names.
-    pub fn types(&self, db: &'db dyn HirDatabase) -> Vec<(Symbol, Type<'db>)> {
+    pub fn types(&self, db: &'db Db) -> Vec<(Symbol, Type<'db>)> {
         let interner = DbInterner::new_no_crate(db);
         self.types_impl(db)
             .filter_map(|(ty, name)| {
@@ -3316,7 +3406,7 @@ impl<'db> GenericSubstitution<'db> {
     /// corresponding type parameter name.
     // Note: this method is not used by rust-analyzer itself as of writing, but is
     // used by external tools, so please do not remove it even if it appears unused.
-    pub fn all_types(&self, db: &'db dyn HirDatabase) -> Vec<Type<'db>> {
+    pub fn all_types(&self, db: &'db Db) -> Vec<Type<'db>> {
         let interner = DbInterner::new_no_crate(db);
         self.types_impl(db)
             .map(|(ty, _)| Type { ty: EarlyBinder::bind(interner, ty), owner: self.owner })
@@ -3352,7 +3442,7 @@ impl<'db> LocalSource<'db> {
         }
     }
 
-    pub fn original_file(&self, db: &dyn HirDatabase) -> EditionedFileId {
+    pub fn original_file(&self, db: &Db) -> EditionedFileId {
         self.source.file_id.original_file(db)
     }
 
@@ -3374,7 +3464,7 @@ impl<'db> LocalSource<'db> {
 }
 
 impl<'db> Local<'db> {
-    pub fn is_param(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_param(self, db: &Db) -> bool {
         // FIXME: This parses!
         let src = self.primary_source(db);
         match src.source.value {
@@ -3388,7 +3478,7 @@ impl<'db> Local<'db> {
         }
     }
 
-    pub fn as_self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
+    pub fn as_self_param(self, db: &Db) -> Option<SelfParam> {
         match self.parent {
             ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(func)) if self.is_self(db) => {
                 Some(SelfParam { func: func.into() })
@@ -3397,30 +3487,30 @@ impl<'db> Local<'db> {
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         ExpressionStore::of(db, self.parent)[self.binding_id].name.clone()
     }
 
-    pub fn is_self(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_self(self, db: &Db) -> bool {
         self.name(db) == sym::self_
     }
 
-    pub fn is_mut(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_mut(self, db: &Db) -> bool {
         ExpressionStore::of(db, self.parent)[self.binding_id].mode == BindingAnnotation::Mutable
     }
 
-    pub fn is_ref(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_ref(self, db: &Db) -> bool {
         matches!(
             ExpressionStore::of(db, self.parent)[self.binding_id].mode,
             BindingAnnotation::Ref | BindingAnnotation::RefMut
         )
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
+    pub fn parent(self, _db: &Db) -> ExpressionStoreOwner {
         self.parent.into()
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.parent(db).module(db)
     }
 
@@ -3428,7 +3518,7 @@ impl<'db> Local<'db> {
         self.binding_id.into_raw().into_u32()
     }
 
-    pub fn ty(self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty(self, db: &'db Db) -> Type<'db> {
         let def = self.parent;
         let infer = InferenceResult::of(db, self.parent_infer);
         let ty = infer.binding_ty(self.binding_id);
@@ -3436,7 +3526,7 @@ impl<'db> Local<'db> {
     }
 
     /// All definitions for this local. Example: `let (a$0, _) | (_, a$0) = it;`
-    pub fn sources(self, db: &dyn HirDatabase) -> Vec<LocalSource<'db>> {
+    pub fn sources(self, db: &Db) -> Vec<LocalSource<'db>> {
         let b;
         let (_, source_map) = match self.parent {
             ExpressionStoreOwnerId::Signature(generic_def_id) => {
@@ -3477,7 +3567,7 @@ impl<'db> Local<'db> {
     }
 
     /// The leftmost definition for this local. Example: `let (a$0, _) | (_, a) = it;`
-    pub fn primary_source(self, db: &dyn HirDatabase) -> LocalSource<'db> {
+    pub fn primary_source(self, db: &Db) -> LocalSource<'db> {
         let b;
         let (_, source_map) = match self.parent {
             ExpressionStoreOwnerId::Signature(generic_def_id) => {
@@ -3541,7 +3631,7 @@ impl DeriveHelper {
         Macro { id: self.derive }
     }
 
-    pub fn name(&self, db: &dyn HirDatabase) -> Name {
+    pub fn name(&self, db: &Db) -> Name {
         AttrFlags::derive_info(db, self.derive)
             .and_then(|it| it.helpers.get(self.idx as usize))
             .map(|helper| Name::new_symbol_root(helper.clone()))
@@ -3578,7 +3668,7 @@ pub struct ToolModule {
 }
 
 impl ToolModule {
-    pub(crate) fn by_name(db: &dyn HirDatabase, krate: Crate, name: &str) -> Option<Self> {
+    pub(crate) fn by_name(db: &Db, krate: Crate, name: &str) -> Option<Self> {
         let krate = krate.id;
         let idx =
             crate_def_map(db, krate).registered_tools().iter().position(|it| it.as_str() == name)?
@@ -3586,7 +3676,7 @@ impl ToolModule {
         Some(ToolModule { krate, idx })
     }
 
-    pub fn name(&self, db: &dyn HirDatabase) -> Name {
+    pub fn name(&self, db: &Db) -> Name {
         Name::new_symbol_root(
             crate_def_map(db, self.krate).registered_tools()[self.idx as usize].clone(),
         )
@@ -3604,15 +3694,15 @@ pub struct Label {
 }
 
 impl Label {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.parent(db).module(db)
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
+    pub fn parent(self, _db: &Db) -> ExpressionStoreOwner {
         self.parent.into()
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         ExpressionStore::of(db, self.parent)[self.label_id].name.clone()
     }
 }
@@ -3626,7 +3716,7 @@ pub enum GenericParam {
 impl_from!(TypeParam, ConstParam, LifetimeParam for GenericParam);
 
 impl GenericParam {
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self {
             GenericParam::TypeParam(it) => it.module(db),
             GenericParam::ConstParam(it) => it.module(db),
@@ -3634,7 +3724,7 @@ impl GenericParam {
         }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         match self {
             GenericParam::TypeParam(it) => it.name(db),
             GenericParam::ConstParam(it) => it.name(db),
@@ -3650,7 +3740,7 @@ impl GenericParam {
         }
     }
 
-    pub fn variance(self, db: &dyn HirDatabase) -> Option<Variance> {
+    pub fn variance(self, db: &Db) -> Option<Variance> {
         let parent = match self {
             GenericParam::TypeParam(it) => it.id.parent(),
             // const parameters are always invariant
@@ -3708,21 +3798,21 @@ impl TypeParam {
         TypeOrConstParam { id: self.id.into() }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         self.merge().name(db)
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> GenericDef {
+    pub fn parent(self, _db: &Db) -> GenericDef {
         self.id.parent().into()
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.id.parent().module(db).into()
     }
 
     /// Is this type parameter implicitly introduced (eg. `Self` in a trait or an `impl Trait`
     /// argument)?
-    pub fn is_implicit(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_implicit(self, db: &Db) -> bool {
         let params = GenericParams::of(db, self.id.parent());
         let data = &params[self.id.local_id()];
         match data.type_param().unwrap().provenance {
@@ -3731,7 +3821,7 @@ impl TypeParam {
         }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         let interner = DbInterner::new_no_crate(db);
         let index = hir_ide::type_or_const_param_idx(db, self.id.into());
         let ty = Ty::new_param(interner, self.id, index);
@@ -3741,7 +3831,7 @@ impl TypeParam {
     /// FIXME: this only lists trait bounds from the item defining the type
     /// parameter, not additional bounds that might be added e.g. by a method if
     /// the parameter comes from an impl!
-    pub fn trait_bounds(self, db: &dyn HirDatabase) -> Vec<Trait> {
+    pub fn trait_bounds(self, db: &Db) -> Vec<Trait> {
         let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
         GenericPredicates::query_explicit(db, self.id.parent())
             .iter_identity()
@@ -3755,7 +3845,7 @@ impl TypeParam {
     }
 
     /// [`TypeParam::trait_bounds`] with the bounds' generic arguments, for blaze's lints.
-    pub fn trait_refs(self, db: &dyn HirDatabase) -> Vec<TraitRef<'_>> {
+    pub fn trait_refs(self, db: &Db) -> Vec<TraitRef<'_>> {
         let interner = DbInterner::new_no_crate(db);
         let owner = TypeOwnerId::GenericDefId(self.id.parent());
         let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
@@ -3770,7 +3860,7 @@ impl TypeParam {
             .collect()
     }
 
-    pub fn default(self, db: &dyn HirDatabase) -> Option<Type<'_>> {
+    pub fn default(self, db: &Db) -> Option<Type<'_>> {
         let ty = generic_arg_from_param(db, self.id.into())?;
         match ty.kind() {
             rustc_type_ir::GenericArgKind::Type(it) if !it.is_ty_error() => {
@@ -3780,7 +3870,7 @@ impl TypeParam {
         }
     }
 
-    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unstable(self, db: &Db) -> bool {
         self.attrs(db).is_unstable()
     }
 }
@@ -3791,16 +3881,16 @@ pub struct LifetimeParam {
 }
 
 impl LifetimeParam {
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         let params = GenericParams::of(db, self.id.parent);
         params[self.id.local_id].name.clone()
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.id.parent.module(db).into()
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> GenericDef {
+    pub fn parent(self, _db: &Db) -> GenericDef {
         self.id.parent.into()
     }
 }
@@ -3815,7 +3905,7 @@ impl ConstParam {
         TypeOrConstParam { id: self.id.into() }
     }
 
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         let params = GenericParams::of(db, self.id.parent());
         match params[self.id.local_id()].name() {
             Some(it) => it.clone(),
@@ -3826,26 +3916,26 @@ impl ConstParam {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.id.parent().module(db).into()
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> GenericDef {
+    pub fn parent(self, _db: &Db) -> GenericDef {
         self.id.parent().into()
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         Type::new(db, self.id.parent(), db.const_param_ty(self.id))
     }
 
-    pub fn default(self, db: &dyn HirDatabase, display_target: DisplayTarget) -> Option<String> {
+    pub fn default(self, db: &Db, display_target: DisplayTarget) -> Option<String> {
         let arg = generic_arg_from_param(db, self.id.into())?;
         Some(arg.display(db, display_target).to_string())
     }
 
     pub fn default_source_code(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
         target_module: Module,
     ) -> Option<ast::ConstArg> {
         let arg = generic_arg_from_param(db, self.id.into())?;
@@ -3853,7 +3943,7 @@ impl ConstParam {
     }
 }
 
-fn generic_arg_from_param(db: &dyn HirDatabase, id: TypeOrConstParamId) -> Option<GenericArg<'_>> {
+fn generic_arg_from_param(db: &Db, id: TypeOrConstParamId) -> Option<GenericArg<'_>> {
     let local_idx = hir_ide::type_or_const_param_idx(db, id);
     let defaults = db.generic_defaults(id.parent);
     let ty = defaults.get(local_idx as usize)?;
@@ -3867,7 +3957,7 @@ pub struct TypeOrConstParam {
 }
 
 impl TypeOrConstParam {
-    pub fn name(self, db: &dyn HirDatabase) -> Name {
+    pub fn name(self, db: &Db) -> Name {
         let params = GenericParams::of(db, self.id.parent);
         match params[self.id.local_id].name() {
             Some(n) => n.clone(),
@@ -3875,15 +3965,15 @@ impl TypeOrConstParam {
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         self.id.parent.module(db).into()
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> GenericDef {
+    pub fn parent(self, _db: &Db) -> GenericDef {
         self.id.parent.into()
     }
 
-    pub fn split(self, db: &dyn HirDatabase) -> Either<ConstParam, TypeParam> {
+    pub fn split(self, db: &Db) -> Either<ConstParam, TypeParam> {
         let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => {
@@ -3895,14 +3985,14 @@ impl TypeOrConstParam {
         }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn ty(self, db: &Db) -> Type<'_> {
         match self.split(db) {
             Either::Left(it) => it.ty(db),
             Either::Right(it) => it.ty(db),
         }
     }
 
-    pub fn as_type_param(self, db: &dyn HirDatabase) -> Option<TypeParam> {
+    pub fn as_type_param(self, db: &Db) -> Option<TypeParam> {
         let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => {
@@ -3912,7 +4002,7 @@ impl TypeOrConstParam {
         }
     }
 
-    pub fn as_const_param(self, db: &dyn HirDatabase) -> Option<ConstParam> {
+    pub fn as_const_param(self, db: &Db) -> Option<ConstParam> {
         let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => None,
@@ -3929,12 +4019,12 @@ pub struct Impl {
 }
 
 impl Impl {
-    pub fn all_in_crate(db: &dyn HirDatabase, krate: Crate) -> Vec<Impl> {
+    pub fn all_in_crate(db: &Db, krate: Crate) -> Vec<Impl> {
         let mut result = Vec::new();
         extend_with_def_map(db, crate_def_map(db, krate.id), &mut result);
         return result;
 
-        fn extend_with_def_map(db: &dyn HirDatabase, def_map: &DefMap, result: &mut Vec<Impl>) {
+        fn extend_with_def_map(db: &Db, def_map: &DefMap, result: &mut Vec<Impl>) {
             for (_, module) in def_map.modules(db) {
                 result.extend(module.scope(db).impls().map(Impl::from));
                 result.extend(module.scope(db).builtin_derive_impls().map(Impl::from));
@@ -3948,7 +4038,7 @@ impl Impl {
         }
     }
 
-    pub fn all_in_module(db: &dyn HirDatabase, module: Module) -> Vec<Impl> {
+    pub fn all_in_module(db: &Db, module: Module) -> Vec<Impl> {
         module.impl_defs(db)
     }
 
@@ -3957,7 +4047,7 @@ impl Impl {
     /// blanket impls, and only does a shallow type constructor check. In fact, this should've probably been on `Adt`
     /// etc., and not on `Type`. If you would want to create a precise list of all impls applying to a type,
     /// you would need to include blanket impls, and try to prove to predicates for each candidate.
-    pub fn all_for_type<'db>(db: &'db dyn HirDatabase, ty: Type<'db>) -> Vec<Impl> {
+    pub fn all_for_type<'db>(db: &'db Db, ty: Type<'db>) -> Vec<Impl> {
         let mut result = Vec::new();
         let interner = DbInterner::new_no_crate(db);
         let Some(simplified_ty) = fast_reject::simplify_type(
@@ -4001,7 +4091,7 @@ impl Impl {
         result.into_iter().unique().collect()
     }
 
-    pub fn all_for_trait(db: &dyn HirDatabase, trait_: Trait) -> Vec<Impl> {
+    pub fn all_for_trait(db: &Db, trait_: Trait) -> Vec<Impl> {
         let module = trait_.module(db).id;
         let mut all = Vec::new();
         let mut handle_impls = |impls: &TraitImpls<'_>| {
@@ -4022,7 +4112,7 @@ impl Impl {
         all.into_iter().unique().collect()
     }
 
-    pub fn trait_(self, db: &dyn HirDatabase) -> Option<Trait> {
+    pub fn trait_(self, db: &Db) -> Option<Trait> {
         match self.id {
             AnyImplId::ImplId(id) => {
                 let trait_ref = db.impl_trait(id)?;
@@ -4037,7 +4127,7 @@ impl Impl {
         }
     }
 
-    pub fn trait_ref(self, db: &dyn HirDatabase) -> Option<TraitRef<'_>> {
+    pub fn trait_ref(self, db: &Db) -> Option<TraitRef<'_>> {
         match self.id {
             AnyImplId::ImplId(id) => {
                 let trait_ref = db.impl_trait(id)?.instantiate_identity().skip_norm_wip();
@@ -4056,7 +4146,7 @@ impl Impl {
         }
     }
 
-    pub fn self_ty(self, db: &dyn HirDatabase) -> Type<'_> {
+    pub fn self_ty(self, db: &Db) -> Type<'_> {
         match self.id {
             AnyImplId::ImplId(id) => {
                 let ty = db.impl_self_ty(id).instantiate_identity().skip_norm_wip();
@@ -4073,7 +4163,7 @@ impl Impl {
         }
     }
 
-    pub fn items(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
+    pub fn items(self, db: &Db) -> Vec<AssocItem> {
         match self.id {
             AnyImplId::ImplId(id) => {
                 id.impl_items(db).items.iter().map(|&(_, it)| it.into()).collect()
@@ -4092,28 +4182,28 @@ impl Impl {
         }
     }
 
-    pub fn is_negative(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_negative(self, db: &Db) -> bool {
         match self.id {
             AnyImplId::ImplId(id) => ImplSignature::of(db, id).flags.contains(ImplFlags::NEGATIVE),
             AnyImplId::BuiltinDeriveImplId(_) => false,
         }
     }
 
-    pub fn is_unsafe(self, db: &dyn HirDatabase) -> bool {
+    pub fn is_unsafe(self, db: &Db) -> bool {
         match self.id {
             AnyImplId::ImplId(id) => ImplSignature::of(db, id).flags.contains(ImplFlags::UNSAFE),
             AnyImplId::BuiltinDeriveImplId(_) => false,
         }
     }
 
-    pub fn module(self, db: &dyn HirDatabase) -> Module {
+    pub fn module(self, db: &Db) -> Module {
         match self.id {
             AnyImplId::ImplId(id) => id.module(db).into(),
             AnyImplId::BuiltinDeriveImplId(id) => id.module(db).into(),
         }
     }
 
-    pub fn check_orphan_rules(self, db: &dyn HirDatabase) -> bool {
+    pub fn check_orphan_rules(self, db: &Db) -> bool {
         match self.id {
             AnyImplId::ImplId(id) => check_orphan_rules(db, id),
             AnyImplId::BuiltinDeriveImplId(_) => true,
@@ -4184,7 +4274,7 @@ pub struct Closure<'db> {
 }
 
 impl<'db> Closure<'db> {
-    fn as_ty(&self, db: &'db dyn HirDatabase) -> Ty<'db> {
+    fn as_ty(&self, db: &'db Db) -> Ty<'db> {
         let interner = DbInterner::new_no_crate(db);
         match self.id {
             AnyClosureId::ClosureId(id) => Ty::new_closure(interner, id.into(), self.subst),
@@ -4194,21 +4284,21 @@ impl<'db> Closure<'db> {
         }
     }
 
-    pub fn display_with_id(&self, db: &dyn HirDatabase, display_target: DisplayTarget) -> String {
+    pub fn display_with_id(&self, db: &Db, display_target: DisplayTarget) -> String {
         self.as_ty(db)
             .display(db, display_target)
             .with_closure_style(ClosureStyle::ClosureWithId)
             .to_string()
     }
 
-    pub fn display_with_impl(&self, db: &dyn HirDatabase, display_target: DisplayTarget) -> String {
+    pub fn display_with_impl(&self, db: &Db, display_target: DisplayTarget) -> String {
         self.as_ty(db)
             .display(db, display_target)
             .with_closure_style(ClosureStyle::ImplFn)
             .to_string()
     }
 
-    pub fn captured_items(&self, db: &'db dyn HirDatabase) -> Vec<ClosureCapture<'db>> {
+    pub fn captured_items(&self, db: &'db Db) -> Vec<ClosureCapture<'db>> {
         let closure = match self.id {
             AnyClosureId::ClosureId(it) => it.loc(db),
             AnyClosureId::CoroutineClosureId(it) => it.loc(db),
@@ -4216,7 +4306,34 @@ impl<'db> Closure<'db> {
         captured_items(db, closure)
     }
 
-    pub fn fn_trait(&self, _db: &dyn HirDatabase) -> FnTrait {
+    /// rustc's `closure_kind_origins`: for a closure whose kind was inferred `FnMut` or
+    /// `FnOnce`, the use that made it so and the capture that use is of.
+    pub fn kind_origin(
+        &self,
+        db: &'db Db,
+    ) -> Option<(InFile<AstPtr<Either<ast::Expr, ast::Pat>>>, ClosureCapture<'db>)> {
+        let InternedClosure { owner: infer_owner, expr: closure, .. } = match self.id {
+            AnyClosureId::ClosureId(it) => it.loc(db),
+            AnyClosureId::CoroutineClosureId(it) => it.loc(db),
+        };
+        let infer = InferenceResult::of(db, infer_owner);
+        let data = &infer.closures_data[&closure];
+        let (node, place) = data.kind_origin.as_ref()?;
+        let owner = infer_owner.expression_store_owner(db);
+        // The capture is of the place or of one it starts with: a capture is truncated, never
+        // made more precise.
+        let capture = data.min_captures.values().flatten().find(|it| {
+            it.place.base == place.base && place.projections.starts_with(&it.place.projections)
+        })?;
+        let (_, source_map) = ExpressionStore::with_source_map(db, owner);
+        let node = match node.unpack() {
+            ExprOrPatId::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+            ExprOrPatId::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+        };
+        Some((node, ClosureCapture { owner, infer_owner, closure, capture }))
+    }
+
+    pub fn fn_trait(&self, _db: &Db) -> FnTrait {
         match self.id {
             AnyClosureId::ClosureId(_) => match self.subst.as_closure().kind() {
                 rustc_type_ir::ClosureKind::Fn => FnTrait::Fn,
@@ -4240,13 +4357,13 @@ pub struct Coroutine<'db> {
 
 impl<'db> Coroutine<'db> {
     /// Returns the values captured by this coroutine.
-    pub fn captured_items(&self, db: &'db dyn HirDatabase) -> Vec<ClosureCapture<'db>> {
+    pub fn captured_items(&self, db: &'db Db) -> Vec<ClosureCapture<'db>> {
         captured_items(db, self.id.loc(db))
     }
 }
 
 fn captured_items<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedClosure<'db>,
 ) -> Vec<ClosureCapture<'db>> {
     let InternedClosure { owner: infer_owner, expr: closure, .. } = closure;
@@ -4320,7 +4437,7 @@ impl FnTrait {
         }
     }
 
-    pub fn get_id(self, db: &dyn HirDatabase, krate: Crate) -> Option<Trait> {
+    pub fn get_id(self, db: &Db, krate: Crate) -> Option<Trait> {
         Trait::lang(db, krate, self.lang_item())
     }
 }
@@ -4370,7 +4487,7 @@ impl<'db> ClosureCapture<'db> {
     }
 
     /// Converts the place to a name that can be inserted into source code.
-    pub fn place_to_name(&self, db: &dyn HirDatabase, edition: Edition) -> String {
+    pub fn place_to_name(&self, db: &Db, edition: Edition) -> String {
         let mut result = self.local().name(db).display(db, edition).to_string();
         for (i, proj) in self.capture.place.projections.iter().enumerate() {
             match proj.kind {
@@ -4400,7 +4517,7 @@ impl<'db> ClosureCapture<'db> {
         result
     }
 
-    pub fn display_place_source_code(&self, db: &dyn HirDatabase, edition: Edition) -> String {
+    pub fn display_place_source_code(&self, db: &Db, edition: Edition) -> String {
         let mut result = self.local().name(db).display(db, edition).to_string();
         // We only need the derefs that have no field access after them, autoderef will do the rest.
         let mut last_derefs = 0;
@@ -4436,13 +4553,13 @@ impl<'db> ClosureCapture<'db> {
         result
     }
 
-    pub fn ty(&self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn ty(&self, db: &'db Db) -> Type<'db> {
         Type::new_body(db, self.owner, self.capture.place.ty())
     }
 
     /// The type that is stored in the closure, which is different from [`Self::ty()`], representing
     /// the place's type, when the capture is by ref.
-    pub fn captured_ty(&self, db: &'db dyn HirDatabase) -> Type<'db> {
+    pub fn captured_ty(&self, db: &'db Db) -> Type<'db> {
         Type::new_body(db, self.owner, self.capture.captured_ty(db))
     }
 }
@@ -4476,7 +4593,7 @@ impl CaptureUsages<'_> {
         }
     }
 
-    pub fn sources(&self, db: &dyn HirDatabase) -> Vec<CaptureUsageSource> {
+    pub fn sources(&self, db: &Db) -> Vec<CaptureUsageSource> {
         let (store, source_map) = ExpressionStore::with_source_map(db, self.parent);
         let mut result = Vec::with_capacity(self.sources.len());
         for source in self.sources {
@@ -4536,7 +4653,7 @@ impl_from!(
 impl TypeOwnerId {
     /// We associated anon consts with their parent, because they can never have generics of their own.
     /// It can have *less* than the parent, but providing more generic args is not a problem.
-    fn from_anon_const<'db>(id: AnonConstId<'db>, db: &'db dyn HirDatabase) -> TypeOwnerId {
+    fn from_anon_const<'db>(id: AnonConstId<'db>, db: &'db Db) -> TypeOwnerId {
         TypeOwnerId::GenericDefId(id.loc(db).owner.generic_def(db))
     }
 
@@ -4561,7 +4678,7 @@ impl TypeOwnerId {
 
     fn can_rebase_into(
         self,
-        db: &dyn HirDatabase,
+        db: &Db,
         rebase_into: Self,
         self_ty: EarlyBinder<'_, Ty<'_>>,
     ) -> bool {
@@ -4630,7 +4747,7 @@ impl<'db> PartialEq for Type<'db> {
 impl<'db> Eq for Type<'db> {}
 
 impl<'db> Type<'db> {
-    fn new(db: &'db dyn HirDatabase, owner: GenericDefId, ty: Ty<'db>) -> Self {
+    fn new(db: &'db Db, owner: GenericDefId, ty: Ty<'db>) -> Self {
         Self::new_in(DbInterner::new_no_crate(db), owner, ty)
     }
 
@@ -4640,30 +4757,30 @@ impl<'db> Type<'db> {
         Type { owner: TypeOwnerId::GenericDefId(owner), ty: EarlyBinder::bind(interner, ty) }
     }
 
-    fn new_body(db: &'db dyn HirDatabase, owner: ExpressionStoreOwnerId, ty: Ty<'db>) -> Self {
+    fn new_body(db: &'db Db, owner: ExpressionStoreOwnerId, ty: Ty<'db>) -> Self {
         Self::new(db, owner.generic_def(db), ty)
     }
 
-    fn no_params(db: &'db dyn HirDatabase, krate: base_db::Crate, ty: Ty<'db>) -> Self {
+    fn no_params(db: &'db Db, krate: base_db::Crate, ty: Ty<'db>) -> Self {
         let ty = EarlyBinder::bind(DbInterner::new_no_crate(db), ty);
         Type { owner: TypeOwnerId::NoParams(krate), ty }
     }
 
-    fn builtin_type_crate(db: &'db dyn HirDatabase) -> base_db::Crate {
+    fn builtin_type_crate(db: &'db Db) -> base_db::Crate {
         // It doesn't really matter.
         all_crates(db)[0]
     }
 
     /// The type owned by no item's generics, when it names none of them, so that it can be
     /// asked of together with the types of any item: for blaze's lints.
-    pub fn without_params(&self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn without_params(&self, db: &'db Db) -> Option<Type<'db>> {
         if self.ty.skip_binder().has_param() {
             return None;
         }
         Some(Type { owner: TypeOwnerId::NoParams(Self::builtin_type_crate(db)), ty: self.ty })
     }
 
-    fn from_def(db: &'db dyn HirDatabase, def: impl Into<TyDefId>) -> Self {
+    fn from_def(db: &'db Db, def: impl Into<TyDefId>) -> Self {
         let def = def.into();
         let ty = db.ty(def);
         let owner = match def {
@@ -4674,7 +4791,7 @@ impl<'db> Type<'db> {
         Type { owner, ty }
     }
 
-    fn from_value_def(db: &'db dyn HirDatabase, def: impl Into<ValueTyDefId>) -> Self {
+    fn from_value_def(db: &'db Db, def: impl Into<ValueTyDefId>) -> Self {
         let def = def.into();
         let Some(ty) = db.value_ty(def) else {
             return Type::unknown(db);
@@ -4695,7 +4812,7 @@ impl<'db> Type<'db> {
     }
 
     /// Replace any generic parameters with error types.
-    pub fn instantiate_with_errors(&self, db: &'db dyn HirDatabase) -> Self {
+    pub fn instantiate_with_errors(&self, db: &'db Db) -> Self {
         let interner = DbInterner::new_no_crate(db);
         let krate = self.krate(db);
         let args = match self.owner {
@@ -4711,7 +4828,7 @@ impl<'db> Type<'db> {
     // FIXME: Find some way with const params, maybe even lifetimes?
     pub fn instantiate(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         args: impl IntoIterator<Item: Borrow<Type<'db>>>,
     ) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
@@ -4732,7 +4849,7 @@ impl<'db> Type<'db> {
     /// trait goals on the result are solved as in the type's own crate and environment.
     pub fn instantiate_type_params(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         args: impl IntoIterator<Item: Borrow<Type<'db>>>,
     ) -> Type<'db> {
         let TypeOwnerId::GenericDefId(def) = self.owner else { return self.clone() };
@@ -4778,7 +4895,7 @@ impl<'db> Type<'db> {
     ///  - `rebase_into` is in the context of a child of our context (for example, a function in an impl).
     pub fn try_rebase_into(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         rebase_into: &Type<'db>,
     ) -> Option<Self> {
         if self.owner.can_rebase_into(db, rebase_into.owner, self.ty) {
@@ -4792,7 +4909,7 @@ impl<'db> Type<'db> {
     /// and returns that.
     pub fn rebase_into_or_error(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         rebase_into: &Type<'db>,
     ) -> Type<'db> {
         self.try_rebase_into(db, rebase_into).unwrap_or_else(|| self.instantiate_with_errors(db))
@@ -4800,7 +4917,7 @@ impl<'db> Type<'db> {
 
     pub fn try_rebase_into_owner(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         new_owner: GenericDef,
     ) -> Option<Self> {
         let new_owner = new_owner.id()?.into();
@@ -4813,24 +4930,24 @@ impl<'db> Type<'db> {
 
     pub fn rebase_into_owner_or_error(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         new_owner: GenericDef,
     ) -> Self {
         self.try_rebase_into_owner(db, new_owner).unwrap_or_else(|| self.instantiate_with_errors(db))
     }
 
-    pub fn unknown(db: &'db dyn HirDatabase) -> Self {
+    pub fn unknown(db: &'db Db) -> Self {
         let interner = DbInterner::new_no_crate(db);
         Type::no_params(db, Self::builtin_type_crate(db), Ty::new_error(interner, ErrorGuaranteed))
     }
 
-    pub fn new_slice(db: &'db dyn HirDatabase, ty: Self) -> Self {
+    pub fn new_slice(db: &'db Db, ty: Self) -> Self {
         let interner = DbInterner::new_no_crate(db);
         Type { owner: ty.owner, ty: ty.ty.map_bound(|ty| Ty::new_slice(interner, ty)) }
     }
 
     pub fn new_tuple(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         tys: impl IntoIterator<Item: Borrow<Type<'db>>>,
     ) -> Self {
         let interner = DbInterner::new_no_crate(db);
@@ -4853,7 +4970,7 @@ impl<'db> Type<'db> {
         Type { owner, ty: EarlyBinder::bind(interner, ty) }
     }
 
-    pub fn new_unit(db: &'db dyn HirDatabase) -> Self {
+    pub fn new_unit(db: &'db Db) -> Self {
         let interner = DbInterner::new_no_crate(db);
         Type::no_params(db, Self::builtin_type_crate(db), Ty::new_unit(interner))
     }
@@ -4885,7 +5002,7 @@ impl<'db> Type<'db> {
         matches!(self.ty.skip_binder().kind(), TyKind::Ref(..))
     }
 
-    pub fn contains_reference(&self, db: &'db dyn HirDatabase) -> bool {
+    pub fn contains_reference(&self, db: &'db Db) -> bool {
         let interner = DbInterner::new_no_crate(db);
         return self
             .ty
@@ -4894,7 +5011,7 @@ impl<'db> Type<'db> {
             .visit_with(&mut Visitor { interner })
             .is_break();
 
-        fn is_phantom_data(db: &dyn HirDatabase, adt_id: AdtId) -> bool {
+        fn is_phantom_data(db: &Db, adt_id: AdtId) -> bool {
             match adt_id {
                 AdtId::StructId(s) => {
                     let flags = StructSignature::of(db, s).flags;
@@ -4979,7 +5096,7 @@ impl<'db> Type<'db> {
         self.as_reference().map(|(inner, _)| inner)
     }
 
-    pub fn add_reference(&self, db: &'db dyn HirDatabase, mutability: Mutability) -> Self {
+    pub fn add_reference(&self, db: &'db Db, mutability: Mutability) -> Self {
         let interner = DbInterner::new_no_crate(db);
         let ty_mutability = match mutability {
             Mutability::Shared => hir_ide::next_solver::Mutability::Not,
@@ -5042,7 +5159,7 @@ impl<'db> Type<'db> {
         self.ty.skip_binder().is_ty_error()
     }
 
-    fn krate(&self, db: &'db dyn HirDatabase) -> base_db::Crate {
+    fn krate(&self, db: &'db Db) -> base_db::Crate {
         match self.owner {
             TypeOwnerId::GenericDefId(def) => hir_def::HasModule::krate(&def, db),
             TypeOwnerId::BuiltinDeriveImplId(def) => {
@@ -5052,7 +5169,7 @@ impl<'db> Type<'db> {
         }
     }
 
-    fn param_env(&self, db: &'db dyn HirDatabase) -> ParamEnvAndCrate<'db> {
+    fn param_env(&self, db: &'db Db) -> ParamEnvAndCrate<'db> {
         let krate = self.krate(db);
         match self.owner {
             TypeOwnerId::GenericDefId(def) => {
@@ -5069,7 +5186,7 @@ impl<'db> Type<'db> {
     /// Checks that particular type `ty` implements `std::future::IntoFuture` or
     /// `std::future::Future` and returns the `Output` associated type.
     /// This function is used in `.await` syntax completion.
-    pub fn into_future_output(&self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn into_future_output(&self, db: &'db Db) -> Option<Type<'db>> {
         let env = self.param_env(db);
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let (trait_, output_assoc_type) = lang_items
@@ -5090,7 +5207,7 @@ impl<'db> Type<'db> {
     }
 
     /// This does **not** resolve `IntoFuture`, only `Future`.
-    pub fn future_output(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn future_output(self, db: &'db Db) -> Option<Type<'db>> {
         let krate = self.krate(db);
         let lang_items = hir_def::lang_item::lang_items(db, krate);
         let future_output = lang_items.FutureOutput?;
@@ -5098,14 +5215,14 @@ impl<'db> Type<'db> {
     }
 
     /// This does **not** resolve `IntoIterator`, only `Iterator`.
-    pub fn iterator_item(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn iterator_item(self, db: &'db Db) -> Option<Type<'db>> {
         let krate = self.krate(db);
         let lang_items = hir_def::lang_item::lang_items(db, krate);
         let iterator_item = lang_items.IteratorItem?;
         self.normalize_trait_assoc_type(db, &[], iterator_item.into())
     }
 
-    pub fn impls_iterator(self, db: &'db dyn HirDatabase) -> bool {
+    pub fn impls_iterator(self, db: &'db Db) -> bool {
         let env = self.param_env(db);
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let Some(iterator_trait) = lang_items.Iterator else {
@@ -5120,7 +5237,7 @@ impl<'db> Type<'db> {
     }
 
     /// Resolves the projection `<Self as IntoIterator>::IntoIter` and returns the resulting type
-    pub fn into_iterator_iter(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
+    pub fn into_iterator_iter(self, db: &'db Db) -> Option<Type<'db>> {
         let env = self.param_env(db);
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let trait_ = lang_items.IntoIterator?;
@@ -5142,7 +5259,7 @@ impl<'db> Type<'db> {
     ///
     /// This function can be used to check if a particular type is callable, since FnOnce is a
     /// supertrait of Fn and FnMut, so all callable types implements at least FnOnce.
-    pub fn impls_fnonce(&self, db: &'db dyn HirDatabase) -> bool {
+    pub fn impls_fnonce(&self, db: &'db Db) -> bool {
         let env = self.param_env(db);
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let fnonce_trait = match lang_items.FnOnce {
@@ -5159,7 +5276,7 @@ impl<'db> Type<'db> {
     }
 
     // FIXME: Find better API that also handles const generics
-    pub fn impls_trait(&self, db: &'db dyn HirDatabase, trait_: Trait, args: &[Type<'db>]) -> bool {
+    pub fn impls_trait(&self, db: &'db Db, trait_: Trait, args: &[Type<'db>]) -> bool {
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
         let (args, _owner) =
@@ -5182,7 +5299,7 @@ impl<'db> Type<'db> {
     /// to this function.
     pub fn has_any_impl(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         trait_: Trait,
         args: &[Type<'db>],
     ) -> bool {
@@ -5203,7 +5320,7 @@ impl<'db> Type<'db> {
 
     /// Whether the two types unify with each one's generic parameters as inference variables,
     /// whatever owns them: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
-    pub fn unifies_with_any_params(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
+    pub fn unifies_with_any_params(&self, db: &'db Db, other: &Type<'db>) -> bool {
         traits::could_unify_with_infcx(db, self.krate(db), &mut |infcx| {
             let a = Self::instantiate_many_with_infer([self], infcx).next().unwrap();
             let b = Self::instantiate_many_with_infer([other], infcx).next().unwrap();
@@ -5215,7 +5332,7 @@ impl<'db> Type<'db> {
     /// impl's as inference variables and an ambiguous answer counting: rustdoc's test of the
     /// blanket impls a type gets. Solved in `krate`, rustdoc's local crate, whose dependencies
     /// may reach an impl the type's own crate cannot see.
-    pub fn may_have_impl(&self, db: &'db dyn HirDatabase, impl_: Impl, krate: Crate) -> bool {
+    pub fn may_have_impl(&self, db: &'db Db, impl_: Impl, krate: Crate) -> bool {
         let Ok(id) = ImplId::try_from(impl_) else { return false };
         traits::impl_may_apply(db, krate.id, id, &mut |infcx| {
             Self::instantiate_many_with_infer([self], infcx).next().unwrap()
@@ -5224,7 +5341,7 @@ impl<'db> Type<'db> {
 
     pub fn normalize_trait_assoc_type(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         args: &[Type<'db>],
         alias: TypeAlias,
     ) -> Option<Type<'db>> {
@@ -5252,7 +5369,7 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub fn is_copy(&self, db: &'db dyn HirDatabase) -> bool {
+    pub fn is_copy(&self, db: &'db Db) -> bool {
         let env = self.param_env(db);
         let lang_items = hir_def::lang_item::lang_items(db, env.krate);
         let Some(copy_trait) = lang_items.Copy else {
@@ -5261,7 +5378,7 @@ impl<'db> Type<'db> {
         self.impls_trait(db, copy_trait.into(), &[])
     }
 
-    pub fn as_callable(&self, db: &'db dyn HirDatabase) -> Option<Callable<'db>> {
+    pub fn as_callable(&self, db: &'db Db) -> Option<Callable<'db>> {
         let interner = DbInterner::new_no_crate(db);
         let callee = match self.ty.skip_binder().kind() {
             TyKind::Closure(id, subst) => Callee::Closure(id.0, subst),
@@ -5331,7 +5448,7 @@ impl<'db> Type<'db> {
         matches!(self.ty.skip_binder().kind(), TyKind::Array(..))
     }
 
-    pub fn is_packed(&self, _db: &'db dyn HirDatabase) -> bool {
+    pub fn is_packed(&self, _db: &'db Db) -> bool {
         match self.ty.skip_binder().kind() {
             TyKind::Adt(adt_def, ..) => adt_def.is_packed(),
             _ => false,
@@ -5369,7 +5486,7 @@ impl<'db> Type<'db> {
         self.ty.skip_binder().references_non_lt_error()
     }
 
-    pub fn fields(&self, db: &'db dyn HirDatabase) -> Vec<(Field, Self)> {
+    pub fn fields(&self, db: &'db Db) -> Vec<(Field, Self)> {
         let interner = DbInterner::new_no_crate(db);
         let (variant_id, substs) = match self.ty.skip_binder().kind() {
             TyKind::Adt(adt_def, substs) => {
@@ -5397,7 +5514,7 @@ impl<'db> Type<'db> {
     /// arguments. Empty when this is not the enum `variant` belongs to.
     pub fn variant_fields(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         variant: EnumVariant,
     ) -> Vec<(Field, Self)> {
         let interner = DbInterner::new_no_crate(db);
@@ -5418,7 +5535,7 @@ impl<'db> Type<'db> {
             .collect()
     }
 
-    pub fn tuple_fields(&self, _db: &'db dyn HirDatabase) -> Vec<Self> {
+    pub fn tuple_fields(&self, _db: &'db Db) -> Vec<Self> {
         if let TyKind::Tuple(substs) = self.ty.skip_binder().kind() {
             substs.iter().map(|ty| self.derived(ty)).collect()
         } else {
@@ -5426,7 +5543,7 @@ impl<'db> Type<'db> {
         }
     }
 
-    pub fn as_array(&self, db: &'db dyn HirDatabase) -> Option<(Self, usize)> {
+    pub fn as_array(&self, db: &'db Db) -> Option<(Self, usize)> {
         if let TyKind::Array(ty, len) = self.ty.skip_binder().kind() {
             try_const_usize(db, len).map(|it| (self.derived(ty), it as usize))
         } else {
@@ -5435,7 +5552,7 @@ impl<'db> Type<'db> {
     }
 
     /// The element type of `[T; N]`, whatever `N` is (a parameter, a constant not evaluated).
-    pub fn as_array_element(&self, _db: &'db dyn HirDatabase) -> Option<Self> {
+    pub fn as_array_element(&self, _db: &'db Db) -> Option<Self> {
         match self.ty.skip_binder().kind() {
             TyKind::Array(ty, _) => Some(self.derived(ty)),
             _ => None,
@@ -5443,7 +5560,7 @@ impl<'db> Type<'db> {
     }
 
     /// The `extern { type T; }` this type is.
-    pub fn as_foreign(&self, _db: &'db dyn HirDatabase) -> Option<TypeAlias> {
+    pub fn as_foreign(&self, _db: &'db Db) -> Option<TypeAlias> {
         match self.ty.skip_binder().kind() {
             TyKind::Foreign(def) => Some(TypeAlias { id: def.0 }),
             _ => None,
@@ -5453,7 +5570,7 @@ impl<'db> Type<'db> {
     // FIXME: We should probably remove this.
     pub fn fingerprint_for_trait_impl(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> Option<SimplifiedType<'db>> {
         fast_reject::simplify_type(
             DbInterner::new_no_crate(db),
@@ -5466,13 +5583,13 @@ impl<'db> Type<'db> {
     /// iterator won't yield the same type more than once even if the deref chain contains a cycle.
     pub fn autoderef(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> impl Iterator<Item = Type<'db>> + use<'_, 'db> {
         let interner = DbInterner::new_no_crate(db);
         self.autoderef_(db).map(move |ty| self.derived_with(interner, ty))
     }
 
-    fn autoderef_(&self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Ty<'db>> {
+    fn autoderef_(&self, db: &'db Db) -> impl Iterator<Item = Ty<'db>> {
         let interner = DbInterner::new_no_crate(db);
         let env = self.param_env(db);
         // There should be no inference vars in types passed here
@@ -5484,7 +5601,7 @@ impl<'db> Type<'db> {
     // lifetime problems, because we need to borrow temp `CrateImplDefs`.
     pub fn iterate_assoc_items<T>(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
         let mut slot = None;
@@ -5497,7 +5614,7 @@ impl<'db> Type<'db> {
 
     fn iterate_assoc_items_dyn(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         callback: &mut dyn FnMut(AssocItemId) -> bool,
     ) {
         let mut handle_impls = |impls: &[ImplId]| {
@@ -5587,7 +5704,7 @@ impl<'db> Type<'db> {
     /// ```
     pub fn type_and_const_arguments<'a>(
         &'a self,
-        db: &'a dyn HirDatabase,
+        db: &'a Db,
         display_target: DisplayTarget,
     ) -> impl Iterator<Item = SmolStr> + 'a {
         self.ty
@@ -5610,7 +5727,7 @@ impl<'db> Type<'db> {
     /// Combines lifetime indicators, type and constant parameters into a single `Iterator`
     pub fn generic_parameters<'a>(
         &'a self,
-        db: &'a dyn HirDatabase,
+        db: &'a Db,
         display_target: DisplayTarget,
     ) -> impl Iterator<Item = SmolStr> + 'a {
         // iterate the lifetime
@@ -5626,7 +5743,7 @@ impl<'db> Type<'db> {
 
     pub fn iterate_method_candidates_with_traits<T>(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
@@ -5648,7 +5765,7 @@ impl<'db> Type<'db> {
 
     pub fn iterate_method_candidates<T>(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         scope: &SemanticsScope<'_>,
         name: Option<&Name>,
         callback: impl FnMut(Function) -> Option<T>,
@@ -5664,7 +5781,7 @@ impl<'db> Type<'db> {
 
     fn with_method_resolution<R>(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         resolver: &Resolver<'db>,
         traits_in_scope: &FxHashSet<TraitId>,
         f: impl FnOnce(&MethodResolutionContext<'_, 'db>) -> R,
@@ -5702,7 +5819,7 @@ impl<'db> Type<'db> {
     /// are considered inherent methods.
     pub fn iterate_method_candidates_split_inherent(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
@@ -5782,7 +5899,7 @@ impl<'db> Type<'db> {
     #[tracing::instrument(skip_all, fields(name = ?name))]
     pub fn iterate_path_candidates<T>(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
@@ -5811,7 +5928,7 @@ impl<'db> Type<'db> {
     #[tracing::instrument(skip_all, fields(name = ?name))]
     pub fn iterate_path_candidates_split_inherent(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         name: Option<&Name>,
@@ -5899,7 +6016,7 @@ impl<'db> Type<'db> {
     /// or an empty iterator otherwise.
     pub fn applicable_inherent_traits(
         &self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> impl Iterator<Item = Trait> {
         let _p = tracing::info_span!("applicable_inherent_traits").entered();
         self.autoderef_(db)
@@ -5909,7 +6026,7 @@ impl<'db> Type<'db> {
             .map(Trait::from)
     }
 
-    pub fn env_traits(&self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Trait> {
+    pub fn env_traits(&self, db: &'db Db) -> impl Iterator<Item = Trait> {
         let _p = tracing::info_span!("env_traits").entered();
         let env = self.param_env(db);
         self.autoderef_(db)
@@ -5928,7 +6045,7 @@ impl<'db> Type<'db> {
             .map(Trait::from)
     }
 
-    pub fn as_impl_traits(&self, db: &'db dyn HirDatabase) -> Option<impl Iterator<Item = Trait>> {
+    pub fn as_impl_traits(&self, db: &'db Db) -> Option<impl Iterator<Item = Trait>> {
         self.ty.skip_binder().impl_trait_bounds(db).map(|it| {
             it.into_iter().filter_map(|pred| match pred.kind().skip_binder() {
                 ClauseKind::Trait(trait_ref) => Some(Trait::from(trait_ref.def_id().0)),
@@ -5937,7 +6054,7 @@ impl<'db> Type<'db> {
         })
     }
 
-    pub fn as_associated_type_parent_trait(&self, db: &'db dyn HirDatabase) -> Option<Trait> {
+    pub fn as_associated_type_parent_trait(&self, db: &'db Db) -> Option<Trait> {
         let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id }, .. }) =
             self.ty.skip_binder().kind()
         else {
@@ -5972,9 +6089,9 @@ impl<'db> Type<'db> {
 
     /// Visits every type, including generic arguments, in this type. `callback` is called with type
     /// itself first, and then with its generic arguments.
-    pub fn walk(&self, db: &'db dyn HirDatabase, callback: impl FnMut(Type<'db>)) {
+    pub fn walk(&self, db: &'db Db, callback: impl FnMut(Type<'db>)) {
         struct Visitor<'db, F> {
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             interner: DbInterner<'db>,
             owner: TypeOwnerId,
             callback: F,
@@ -6015,7 +6132,7 @@ impl<'db> Type<'db> {
     ///
     /// Note that we consider placeholder types to unify with everything.
     /// For example `Option<T>` and `Option<U>` unify although there is unresolved goal `T = U`.
-    pub fn could_unify_with(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
+    pub fn could_unify_with(&self, db: &'db Db, other: &Type<'db>) -> bool {
         self.owner.must_unify(other.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
@@ -6030,7 +6147,7 @@ impl<'db> Type<'db> {
     ///
     /// This means that placeholder types are not considered to unify if there are any bounds set on
     /// them. For example `Option<T>` and `Option<U>` do not unify as we cannot show that `T = U`
-    pub fn could_unify_with_deeply(&self, db: &'db dyn HirDatabase, other: &Type<'db>) -> bool {
+    pub fn could_unify_with_deeply(&self, db: &'db Db, other: &Type<'db>) -> bool {
         self.owner.must_unify(other.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
@@ -6041,7 +6158,7 @@ impl<'db> Type<'db> {
         hir_ide::could_unify_deeply(db, env, &tys)
     }
 
-    pub fn could_coerce_to(&self, db: &'db dyn HirDatabase, to: &Type<'db>) -> bool {
+    pub fn could_coerce_to(&self, db: &'db Db, to: &Type<'db>) -> bool {
         self.owner.must_unify(to.owner);
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
@@ -6052,7 +6169,7 @@ impl<'db> Type<'db> {
         hir_ide::could_coerce(db, env, &tys)
     }
 
-    pub fn as_type_param(&self, _db: &'db dyn HirDatabase) -> Option<TypeParam> {
+    pub fn as_type_param(&self, _db: &'db Db) -> Option<TypeParam> {
         match self.ty.skip_binder().kind() {
             TyKind::Param(param) => Some(TypeParam { id: param.id }),
             _ => None,
@@ -6060,20 +6177,20 @@ impl<'db> Type<'db> {
     }
 
     /// Returns unique `GenericParam`s contained in this type.
-    pub fn generic_params(&self, db: &'db dyn HirDatabase) -> FxHashSet<GenericParam> {
+    pub fn generic_params(&self, db: &'db Db) -> FxHashSet<GenericParam> {
         hir_ide::collect_params(&self.ty.skip_binder())
             .into_iter()
             .map(|id| TypeOrConstParam { id }.split(db).either_into())
             .collect()
     }
 
-    pub fn layout(&self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
+    pub fn layout(&self, db: &'db Db) -> Result<Layout<'db>, LayoutError> {
         let env = self.param_env(db);
         db.layout_of_ty(self.ty.skip_binder().store(), env.store())
             .map(|layout| Layout(layout, db.target_data_layout(env.krate).unwrap()))
     }
 
-    pub fn drop_glue(&self, db: &'db dyn HirDatabase) -> DropGlue {
+    pub fn drop_glue(&self, db: &'db Db) -> DropGlue {
         let env = self.param_env(db);
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
@@ -6089,11 +6206,11 @@ pub struct InlineAsmOperand {
 }
 
 impl InlineAsmOperand {
-    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
+    pub fn parent(self, _db: &Db) -> ExpressionStoreOwner {
         self.owner.into()
     }
 
-    pub fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
+    pub fn name(&self, db: &Db) -> Option<Name> {
         let body = ExpressionStore::of(db, self.owner);
         match body.expr(self.expr) {
             hir_def::hir::Expr::InlineAsm(e) => e.operands.get(self.index)?.0.clone(),
@@ -6170,7 +6287,7 @@ impl<'db> Callable<'db> {
         }
     }
 
-    pub fn receiver_param(&self, db: &'db dyn HirDatabase) -> Option<(SelfParam, Type<'db>)> {
+    pub fn receiver_param(&self, db: &'db Db) -> Option<(SelfParam, Type<'db>)> {
         if !self.is_bound_method {
             return None;
         }
@@ -6365,7 +6482,7 @@ impl ScopeDef<'_> {
         items
     }
 
-    pub fn attrs(&self, db: &dyn HirDatabase) -> Option<AttrsWithOwner> {
+    pub fn attrs(&self, db: &Db) -> Option<AttrsWithOwner> {
         match self {
             ScopeDef::ModuleDef(it) => it.attrs(db),
             ScopeDef::GenericParam(it) => Some(it.attrs(db)),
@@ -6377,7 +6494,7 @@ impl ScopeDef<'_> {
         }
     }
 
-    pub fn krate(&self, db: &dyn HirDatabase) -> Option<Crate> {
+    pub fn krate(&self, db: &Db) -> Option<Crate> {
         match self {
             ScopeDef::ModuleDef(it) => it.module(db).map(|m| m.krate(db)),
             ScopeDef::GenericParam(it) => Some(it.module(db).krate(db)),
@@ -6426,8 +6543,8 @@ pub enum AutoBorrow {
 pub struct OverloadedDeref(pub Mutability);
 
 pub trait HasVisibility {
-    fn visibility(&self, db: &dyn HirDatabase) -> Visibility;
-    fn is_visible_from(&self, db: &dyn HirDatabase, module: Module) -> bool {
+    fn visibility(&self, db: &Db) -> Visibility;
+    fn is_visible_from(&self, db: &Db, module: Module) -> bool {
         let vis = self.visibility(db);
         vis.is_visible_from(db, module.id)
     }
@@ -6521,131 +6638,190 @@ impl<'db> WherePredicate<'db> {
     }
 }
 
+/// A function's signature in its own generics, with no bound lifetimes: [`Function::signature`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnSignature<'db> {
+    sig: FnSig<'db>,
+    owner: GenericDefId,
+}
+
+impl<'db> FnSignature<'db> {
+    /// The parameters' types, `self` included.
+    pub fn params(&self, db: &'db Db) -> Vec<Type<'db>> {
+        let interner = DbInterner::new_no_crate(db);
+        self.sig.inputs().iter().map(|&ty| Type::new_in(interner, self.owner, ty)).collect()
+    }
+
+    pub fn ret(&self, db: &'db Db) -> Type<'db> {
+        Type::new(db, self.owner, self.sig.output())
+    }
+
+    pub fn safety(&self) -> Safety {
+        self.sig.safety()
+    }
+
+    /// `ExternAbi::Rust` for a function with no `extern`.
+    pub fn abi(&self) -> hir_def::layout::ExternAbi {
+        self.sig.abi()
+    }
+
+    /// Whether the last parameter is C's `...`.
+    pub fn c_variadic(&self) -> bool {
+        self.sig.c_variadic()
+    }
+
+    pub fn to_next_solver(&self) -> FnSig<'db> {
+        self.sig
+    }
+}
+
+/// [`Function::impl_signature_mismatch`]: where a trait impl's method's signature differs
+/// from its trait's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplSignatureMismatch<'db> {
+    pub trait_method: Function,
+    pub at: SignatureMismatchAt,
+    /// The trait's type and the impl's at `at`, when it is a parameter's or the return type.
+    pub types: Option<(Type<'db>, Type<'db>)>,
+    /// The trait method's signature with the impl's arguments, in the impl method's generics.
+    pub expected: FnSignature<'db>,
+    pub found: FnSignature<'db>,
+}
+
+/// [`Function::proc_macro_signature_mismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcMacroSignatureMismatch<'db> {
+    pub at: SignatureMismatchAt,
+    /// `fn(TokenStream) -> TokenStream`, or with two `TokenStream`s.
+    pub expected: FnSignature<'db>,
+    pub found: FnSignature<'db>,
+}
+
 /// Trait for obtaining the defining crate of an item.
 pub trait HasCrate {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate;
+    fn krate(&self, db: &Db) -> Crate;
 }
 
 impl<T: hir_def::HasModule> HasCrate for T {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db).into()
     }
 }
 
 impl HasCrate for AssocItem {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Struct {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Union {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Enum {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Field {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.parent_def(db).module(db).krate(db)
     }
 }
 
 impl HasCrate for EnumVariant {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Function {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Const {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for TypeAlias {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Type<'_> {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.krate(db).into()
     }
 }
 
 impl HasCrate for Macro {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Trait {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Static {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Adt {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Impl {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         self.module(db).krate(db)
     }
 }
 
 impl HasCrate for Module {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         Module::krate(*self, db)
     }
 }
 
 impl<'db> HasCrate for AnonConst<'db> {
-    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+    fn krate(&self, db: &Db) -> Crate {
         hir_def::HasModule::krate(&self.id.loc(db).owner, db).into()
     }
 }
 
 pub trait HasContainer {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer;
+    fn container(&self, db: &Db) -> ItemContainer;
 }
 
 impl HasContainer for ExternCrateDecl {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         container_id_to_hir(self.id.lookup(db).container.into())
     }
 }
 
 impl HasContainer for Module {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         // FIXME: handle block expressions as modules (their parent is in a different DefMap)
         let def_map = self.id.def_map(db);
         match def_map.module(db, self.id).parent {
@@ -6656,7 +6832,7 @@ impl HasContainer for Module {
 }
 
 impl HasContainer for Function {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         match self.id {
             AnyFunctionId::FunctionId(id) => container_id_to_hir(id.lookup(db).container),
             AnyFunctionId::BuiltinDeriveImplMethod { impl_, .. } => {
@@ -6667,62 +6843,62 @@ impl HasContainer for Function {
 }
 
 impl HasContainer for Struct {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         ItemContainer::Module(Module { id: self.id.lookup(db).container })
     }
 }
 
 impl HasContainer for Union {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         ItemContainer::Module(Module { id: self.id.lookup(db).container })
     }
 }
 
 impl HasContainer for Enum {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         ItemContainer::Module(Module { id: self.id.lookup(db).container })
     }
 }
 
 impl HasContainer for TypeAlias {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         container_id_to_hir(self.id.lookup(db).container)
     }
 }
 
 impl HasContainer for Const {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         container_id_to_hir(self.id.lookup(db).container)
     }
 }
 
 impl HasContainer for Static {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         container_id_to_hir(self.id.lookup(db).container)
     }
 }
 
 impl HasContainer for Trait {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         ItemContainer::Module(Module { id: self.id.lookup(db).container })
     }
 }
 
 impl HasContainer for ExternBlock {
-    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+    fn container(&self, db: &Db) -> ItemContainer {
         ItemContainer::Module(Module { id: self.id.lookup(db).container })
     }
 }
 
 pub trait HasName {
-    fn name(&self, db: &dyn HirDatabase) -> Option<Name>;
+    fn name(&self, db: &Db) -> Option<Name>;
 }
 
 macro_rules! impl_has_name {
     ( $( $ty:ident ),* $(,)? ) => {
         $(
             impl HasName for $ty {
-                fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
+                fn name(&self, db: &Db) -> Option<Name> {
                     (*self).name(db).into()
                 }
             }
@@ -6765,7 +6941,7 @@ macro_rules! impl_has_name_no_db {
     ( $( $ty:ident ),* $(,)? ) => {
         $(
             impl HasName for $ty {
-                fn name(&self, _db: &dyn HirDatabase) -> Option<Name> {
+                fn name(&self, _db: &Db) -> Option<Name> {
                     (*self).name().into()
                 }
             }
@@ -6776,19 +6952,19 @@ macro_rules! impl_has_name_no_db {
 impl_has_name_no_db!(StaticLifetime, BuiltinType, BuiltinAttr);
 
 impl HasName for Local<'_> {
-    fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
+    fn name(&self, db: &Db) -> Option<Name> {
         (*self).name(db).into()
     }
 }
 
 impl HasName for TupleField<'_> {
-    fn name(&self, _db: &dyn HirDatabase) -> Option<Name> {
+    fn name(&self, _db: &Db) -> Option<Name> {
         (*self).name().into()
     }
 }
 
 impl HasName for Param<'_> {
-    fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
+    fn name(&self, db: &Db) -> Option<Name> {
         self.name(db)
     }
 }
@@ -6857,7 +7033,7 @@ where
 }
 
 pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     mut segments: I,
 ) -> impl Iterator<Item = ItemInNs> + use<'a, I> {
     segments
@@ -6934,7 +7110,7 @@ fn generic_args_from_tys<'db>(
     (args, owner)
 }
 
-fn has_non_default_type_params(db: &dyn HirDatabase, generic_def: GenericDefId) -> bool {
+fn has_non_default_type_params(db: &Db, generic_def: GenericDefId) -> bool {
     let params = GenericParams::of(db, generic_def);
     let defaults = db.generic_defaults(generic_def);
     params
@@ -6948,7 +7124,7 @@ fn has_non_default_type_params(db: &dyn HirDatabase, generic_def: GenericDefId) 
 }
 
 fn param_env_from_has_crate<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     id: impl hir_def::HasModule + Into<GenericDefId> + Copy,
 ) -> ParamEnvAndCrate<'db> {
     ParamEnvAndCrate { param_env: db.trait_environment(id.into()), krate: id.krate(db) }
@@ -6956,18 +7132,18 @@ fn param_env_from_has_crate<'db>(
 
 // FIXME: We probably don't want to expose this.
 pub trait MacroCallIdExt {
-    fn loc(self, db: &dyn HirDatabase) -> &hir_expand::MacroCallLoc;
+    fn loc(self, db: &Db) -> &hir_expand::MacroCallLoc;
 }
 impl MacroCallIdExt for span::MacroCallId {
     #[inline]
-    fn loc(self, db: &dyn HirDatabase) -> &hir_expand::MacroCallLoc {
+    fn loc(self, db: &Db) -> &hir_expand::MacroCallLoc {
         hir_expand::MacroCallId::from(self).loc(db)
     }
 }
 
 // Like https://github.com/rust-lang/rust/blob/7c3c88f42ad444f4688b865591d84660be4ece2f/compiler/rustc_middle/src/ty/util.rs#L254-L310
 fn struct_tail_raw<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     interner: DbInterner<'db>,
     mut ty: Ty<'db>,
     mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use blaze_api::{ApiError, FactRead, Span};
-use blaze_ids::Fingerprint;
+use blaze_ids::{Fingerprint, rng::SplitMix64};
 
 use super::*;
 use crate::config::TargetsConfig;
@@ -575,26 +575,10 @@ fn held_checkouts_are_bounded() {
     assert!(!sim.service.state().checkouts.contains_key("branch/b0"));
 }
 
-/// xorshift64*, for seeded loops without a dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
 /// The rest of the world, answering every output in a random order: GitHub, the workers, the
 /// daemon, the pin connection.
 struct World {
-    rng: Rng,
+    rng: SplitMix64,
     /// Inputs waiting, each queue in its order; which queue goes next is random.
     queues: BTreeMap<u64, VecDeque<Input>>,
     next_queue: u64,
@@ -623,7 +607,7 @@ impl World {
                 Output::Create { run, check, .. } => {
                     assert!(self.named.contains(&check.commit), "{check:?}");
                     self.awaiting_created.insert(run);
-                    let result = if self.rng.below(20) == 0 {
+                    let result = if self.rng.index(20) == 0 {
                         Err("GitHub is down".to_owned())
                     } else {
                         Ok(github_id(run))
@@ -634,20 +618,20 @@ impl World {
                 Output::Checkout { job, commit, .. } => {
                     assert!(self.named.contains(&commit));
                     let result =
-                        if self.rng.below(8) == 0 { Err("git failed".to_owned()) } else { Ok(root(&commit)) };
+                        if self.rng.index(8) == 0 { Err("git failed".to_owned()) } else { Ok(root(&commit)) };
                     self.queue(vec![Input::CheckedOut { job, result }]);
                 }
                 Output::Send { job, run, .. } => {
                     let mut inputs = Vec::new();
-                    for _ in 0..self.rng.below(3) {
-                        let response = match self.rng.below(3) {
+                    for _ in 0..self.rng.index(3) {
+                        let response = match self.rng.index(3) {
                             0 => error("e", "a.rs"),
                             1 => test_result("t", TestOutcome::Failed, "boom"),
                             _ => Response::Verified { mismatches: Vec::new() },
                         };
                         inputs.push(Input::Response { job, run, response });
                     }
-                    inputs.push(Input::Ended { job, run, ok: self.rng.below(2) == 0 });
+                    inputs.push(Input::Ended { job, run, ok: self.rng.index(2) == 0 });
                     let key = self.queue(inputs);
                     self.of_run.insert(run, key);
                 }
@@ -701,7 +685,7 @@ impl World {
             return None;
         }
         let keys: Vec<u64> = self.queues.keys().copied().collect();
-        let key = keys[self.rng.below(keys.len())];
+        let key = keys[self.rng.index(keys.len())];
         let queue = self.queues.get_mut(&key).expect("it is there");
         let input = queue.pop_front();
         if queue.is_empty() {
@@ -716,7 +700,7 @@ fn random_orders_complete_every_check_run_and_post_only_to_named_commits() {
     for seed in 1..=200u64 {
         let mut sim = Sim::new(3);
         let mut world = World {
-            rng: Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1),
+            rng: SplitMix64::new(seed),
             queues: BTreeMap::new(),
             next_queue: 0,
             of_run: BTreeMap::new(),
@@ -729,26 +713,26 @@ fn random_orders_complete_every_check_run_and_post_only_to_named_commits() {
         let mut events = 0;
         let mut commits = 0;
         loop {
-            sim.now += world.rng.below(400) as u64;
-            let inject = events < 30 && (world.queues.is_empty() || world.rng.below(3) == 0);
+            sim.now += world.rng.index(400) as u64;
+            let inject = events < 30 && (world.queues.is_empty() || world.rng.index(3) == 0);
             let input = if inject {
                 events += 1;
                 commits += 1;
                 let commit = format!("{seed}-{commits}");
                 world.named.insert(commit.clone());
-                let event = match world.rng.below(4) {
+                let event = match world.rng.index(4) {
                     0 => Event::Push { branch: "main".to_owned(), commit },
-                    1 => Event::Push { branch: format!("b{}", world.rng.below(2)), commit },
+                    1 => Event::Push { branch: format!("b{}", world.rng.index(2)), commit },
                     2 => {
                         let base = world.named.iter().next().cloned().unwrap_or_default();
                         Event::PullRequest {
-                            number: world.rng.below(3) as u64,
+                            number: world.rng.index(3) as u64,
                             head: commit,
                             base,
-                            from_fork: world.rng.below(2) == 0,
+                            from_fork: world.rng.index(2) == 0,
                         }
                     }
-                    _ => Event::Tag { name: format!("v{}", world.rng.below(3)), commit },
+                    _ => Event::Tag { name: format!("v{}", world.rng.index(3)), commit },
                 };
                 Input::Event(event)
             } else if let Some(input) = world.next() {
@@ -819,15 +803,15 @@ fn the_tail_of_a_test_output_is_the_tail_of_the_whole_output() {
         b"\xff",
         b"\r",
     ];
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for round in 0..2000 {
         let mut output = Vec::new();
-        for _ in 0..rng.below(400) {
-            output.extend_from_slice(pieces[rng.below(pieces.len())]);
+        for _ in 0..rng.index(400) {
+            output.extend_from_slice(pieces[rng.index(pieces.len())]);
         }
         if round % 3 == 0 {
-            for _ in 0..rng.below(200) {
-                output.extend_from_slice(pieces[rng.below(3)]);
+            for _ in 0..rng.index(200) {
+                output.extend_from_slice(pieces[rng.index(3)]);
             }
         }
         assert_eq!(tail(&output), tail_of_whole(&output), "round {round}: {output:?}");

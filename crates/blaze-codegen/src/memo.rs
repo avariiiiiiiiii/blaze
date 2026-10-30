@@ -224,6 +224,7 @@ mod tests {
             lines: Vec::new(),
             refs: 0,
             externs: Vec::new(),
+            coverage: None,
         }
     }
 

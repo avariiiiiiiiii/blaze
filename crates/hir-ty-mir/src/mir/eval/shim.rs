@@ -12,6 +12,7 @@ use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike, Ty as _};
 use stdx::never;
 
 use crate::{
+    db::HirDatabase,
     InferBodyId,
     drop::{DropGlue, has_drop_glue},
     intrinsic::{
@@ -22,9 +23,10 @@ use crate::{
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
-        MirEvalError, MirSpan, Mutability, Origin, Result, Ty, TyKind, TypeIdOf, VTableOfBytes,
+        MirEvalError, MirSpan, Mutability, Origin, Result, Then, Ty, TyKind, TypeIdOf,
+        VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
-        machine::{Access, AtomicOrd, Machine, Shadow},
+        machine::{Access, AtomicOrd, Machine, RetagMode, Shadow},
     },
     mir::location::{source_location_in_file, source_path, track_caller},
     next_solver::Region,
@@ -87,6 +89,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.exec_llvm_intrinsic(name, args, destination)?;
             return Ok(true);
         }
+        if self.exec_panic_runtime(
+            def,
+            function_data.name.as_str(),
+            args,
+            locals,
+            destination,
+            span,
+        )? {
+            return Ok(true);
+        }
         let is_extern_c = match def.lookup(self.db).container {
             hir_def::ItemContainerId::ExternBlockId(block) => {
                 matches!(block.abi(self.db), ExternAbi::C { .. })
@@ -146,8 +158,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         &mut self,
         def: FunctionId,
     ) -> Result<'db, Option<FunctionId>> {
-        // `PanicFmt` is redirected to `ConstPanicFmt`
-        if Some(def) == self.lang_items().PanicFmt {
+        // Core's `panic_impl` is the crate graph's `#[panic_handler]`; with none (a
+        // constant's evaluation, a graph without std) `PanicFmt` goes to `ConstPanicFmt`, as in
+        // rustc's CTFE.
+        if Some(def) == self.lang_items().PanicImpl
+            && let Some(handler) = self.panic_handler()
+        {
+            return Ok(Some(handler));
+        }
+        if Some(def) == self.lang_items().PanicFmt && self.panic_handler().is_none() {
             let Some(const_panic_fmt) = self.lang_items().ConstPanicFmt else {
                 not_supported!("const_panic_fmt lang item not found or not a function");
             };
@@ -206,7 +225,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     GenericArgs::new_from_slice(&[self_ty.into()]),
                     locals,
                     destination,
-                    None,
+                    Then::Nested,
                     span,
                 )?;
             }
@@ -301,7 +320,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let lang_items = self.lang_items();
         let attrs = AttrFlags::query(self.db, def.into());
 
-        if attrs.contains(AttrFlags::RUSTC_CONST_PANIC_STR) {
+        // With a `#[panic_handler]` a panic runs the standard library's own code.
+        let const_panics = self.panic_handler().is_none();
+        if const_panics && attrs.contains(AttrFlags::RUSTC_CONST_PANIC_STR) {
             // `#[rustc_const_panic_str]` is treated like `lang = "begin_panic"` by rustc CTFE.
             return Some(BeginPanic);
         }
@@ -309,7 +330,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         // We want to execute these functions with special logic
         // `PanicFmt` is not detected here as it's redirected later.
         if let Some((_, candidate)) = [
-            (lang_items.BeginPanic, BeginPanic),
+            (lang_items.BeginPanic.filter(|_| const_panics), BeginPanic),
             (lang_items.SliceLen, SliceLen),
             (lang_items.DropInPlace, DropInPlace),
         ]
@@ -362,6 +383,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         ty,
                     };
                 }
+                // alloc: error path
                 Err(MirEvalError::Panic(format!("unknown-panic-payload: {:?}", arg.ty.kind())))
             }
             SliceLen => {
@@ -381,14 +403,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let arg = args.next().ok_or(MirEvalError::InternalError(
                     "argument of drop_in_place is not provided".into(),
                 ))?;
-                let arg = arg.interval.get(self)?.to_owned();
-                self.run_drop_glue_deep(
-                    ty,
-                    locals,
-                    Address::from_bytes(&arg[0..self.ptr_size()])?,
-                    &arg[self.ptr_size()..],
-                    span,
-                )?;
+                let addr = self.read_pointer(arg.interval.addr)?;
+                let metadata = arg.interval.get(self)?[self.ptr_size()..].to_vec();
+                let then = self.call_then;
+                self.pending = self.run_drop_glue(ty, locals, addr, &metadata, span, then)?;
                 Ok(vec![])
             }
         }
@@ -456,6 +474,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             "memcpy" | "memmove" => {
                 let [dst, src, size] = args else {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("{as_str} args are not provided").into(),
                     ));
                 };
@@ -593,7 +612,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         match intrinsic {
             Intrinsic::Atomic(op, orders) => {
                 return self
-                    .exec_atomic_intrinsic(op, orders, args, generic_args, destination, locals, span)
+                    .exec_atomic_intrinsic(
+                        op,
+                        orders,
+                        args,
+                        generic_args,
+                        destination,
+                        locals,
+                        span,
+                    )
                     .map(|()| true);
             }
             Intrinsic::Simd(op) => {
@@ -716,8 +743,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "type_name generic arg is not provided".into(),
                     ));
                 };
-                let ty_name = crate::mir::type_name::rustc_type_name(self.db, ty)
-                    .unwrap_or_else(|| self.db.type_name(ty, locals.body.owner.module(self.db)));
+                let module = locals.body.owner.module(self.db);
+                let Some(ty_name) = crate::mir::type_name::rustc_type_name(self.db, ty)
+                    .or_else(|| self.db.type_name(ty, module))
+                else {
+                    // alloc: error path
+                    return Err(MirEvalError::NotSupported(format!(
+                        "`type_name::<{ty:?}>()`: the type has no path to print"
+                    )));
+                };
                 let len = ty_name.len();
                 let addr = self.heap_allocate(len, 1)?;
                 self.write_memory(addr, ty_name.as_bytes())?;
@@ -793,8 +827,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "ptr_offset_from args are not provided".into(),
                     ));
                 };
-                let lhs = self.read_pointer(lhs.interval.addr)?.to_usize() as i128;
-                let rhs = self.read_pointer(rhs.interval.addr)?.to_usize() as i128;
+                let lhs = self.read_pointer(lhs.interval.addr)?;
+                let rhs = self.read_pointer(rhs.interval.addr)?;
+                if M::CHECKS {
+                    let unsigned = matches!(intrinsic, Intrinsic::PtrOffsetFromUnsigned);
+                    self.machine.offset_from(self.ptr(lhs), self.ptr(rhs), unsigned)?;
+                }
+                let lhs = lhs.to_usize() as i128;
+                let rhs = rhs.to_usize() as i128;
                 let ans = lhs.wrapping_sub(rhs);
                 let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
                     return Err(MirEvalError::InternalError(
@@ -837,6 +877,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             | Intrinsic::ExactDiv => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("{intrinsic} args are not provided").into(),
                     ));
                 };
@@ -896,6 +937,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::Copy | Intrinsic::CopyNonoverlapping => {
                 let [src, dst, count] = args else {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("{intrinsic} args are not provided").into(),
                     ));
                 };
@@ -905,6 +947,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Intrinsic::VolatileCopyMemory | Intrinsic::VolatileCopyNonoverlappingMemory => {
                 let [dst, src, count] = args else {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("{intrinsic} args are not provided").into(),
                     ));
                 };
@@ -939,6 +982,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let len = from_bytes!(usize, len);
                 let index = from_bytes!(usize, index.get(self)?);
                 if index >= len {
+                    // alloc: error path
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "slice_get_unchecked index {index} is out of bounds for slice of length {len}"
                     )));
@@ -974,7 +1018,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         ));
                     }
                     match ty0.kind() {
-                        TyKind::RawPtr(ty, _) => ty,
+                        TyKind::RawPtr(ty, _) => (ty, matches!(ty1.kind(), TyKind::Int(_))),
                         _ => {
                             return Err(MirEvalError::InternalError(
                                 "offset generic arg is not a raw pointer".into(),
@@ -987,13 +1031,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             "arith_offset generic arg is not provided".into(),
                         ));
                     };
-                    ty
+                    (ty, true)
                 };
-                let ptr = u128::from_le_bytes(pad16(ptr.get(self)?, IsSigned::No));
-                let offset = u128::from_le_bytes(pad16(offset.get(self)?, IsSigned::No));
-                let size = self.size_of_sized(ty, locals, "offset ptr type")? as u128;
-                let ans = ptr + offset * size;
-                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
+                let base = self.read_pointer(ptr.interval.addr)?;
+                let count = pad16(self.read_scalar(offset.interval)?, signed.into());
+                let size = self.size_of_sized(ty, locals, "offset ptr type")? as i128;
+                let by = i128::from_le_bytes(count).wrapping_mul(size);
+                // `arith_offset` (`wrapping_offset`) may leave the allocation; `offset` may not.
+                if M::CHECKS && intrinsic == Intrinsic::Offset {
+                    let Ok(by) = i64::try_from(by) else {
+                        // alloc: error path.
+                        return Err(MirEvalError::UndefinedBehavior(format!(
+                            "`offset` by {by} bytes, which overflows an `isize`"
+                        )));
+                    };
+                    self.machine.offset(self.ptr(base), by)?;
+                }
+                let ans = (base.to_usize() as u128).wrapping_add(by as u128);
+                let to = Address::from_bytes(&ans.to_le_bytes()[..self.ptr_size()])?;
+                self.write_pointer(destination.addr, Address { prov: base.prov, ..to })
             }
             Intrinsic::AssertInhabited
             | Intrinsic::AssertZeroValid
@@ -1188,63 +1244,127 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     args.push(IntervalAndTy::new(addr, field, self, locals)?);
                 }
                 if let Some(def) = self.lang_items().FnOnce_call_once {
-                    self.exec_fn_trait(
+                    let then = self.call_then;
+                    self.pending = self.exec_fn_trait(
                         def,
                         &args,
                         // FIXME: wrong for manual impls of `FnOnce`
                         GenericArgs::empty(),
                         locals,
                         destination,
-                        None,
+                        then,
                         span,
                     )?;
                     return Ok(true);
                 }
                 not_supported!("FnOnce was not available for executing const_eval_select");
             }
-            Intrinsic::ReadViaCopy | Intrinsic::VolatileLoad => {
+            Intrinsic::ReadViaCopy | Intrinsic::VolatileLoad | Intrinsic::UnalignedVolatileLoad => {
                 let [arg] = args else {
                     return Err(MirEvalError::InternalError(
-                        "read_via_copy args are not provided".into(),
+                        // alloc: error path.
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let addr = Address::from_bytes(arg.interval.get(self)?)?;
-                destination.write_from_interval(self, Interval { addr, size: destination.size })
+                let src = self.read_pointer(arg.interval.addr)?;
+                let ty = type_arg(generic_args, intrinsic)?;
+                let src = match intrinsic {
+                    Intrinsic::UnalignedVolatileLoad => src,
+                    _ => self.aligned_to(src, ty)?,
+                };
+                self.move_value(destination.addr, src, destination.size)
             }
-            Intrinsic::WriteViaMove => {
+            Intrinsic::WriteViaMove
+            | Intrinsic::VolatileStore
+            | Intrinsic::UnalignedVolatileStore => {
                 let [ptr, val] = args else {
                     return Err(MirEvalError::InternalError(
-                        "write_via_move args are not provided".into(),
+                        // alloc: error path.
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let dst = Address::from_bytes(ptr.get(self)?)?;
-                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
-                    return Err(MirEvalError::InternalError(
-                        "write_via_copy generic arg is not provided".into(),
-                    ));
+                let dst = self.read_pointer(ptr.interval.addr)?;
+                let dst = match intrinsic {
+                    Intrinsic::UnalignedVolatileStore => dst,
+                    _ => self.aligned_to(dst, type_arg(generic_args, intrinsic)?)?,
                 };
-                let size = self.size_of_sized(ty, locals, "write_via_move ptr type")?;
-                Interval { addr: dst, size }.write_from_interval(self, val.interval)?;
-                Ok(())
+                self.move_value(dst, val.interval.addr, val.interval.size)
             }
-            Intrinsic::WriteBytes => {
+            Intrinsic::WriteBytes | Intrinsic::VolatileSetMemory => {
                 let [dst, val, count] = args else {
                     return Err(MirEvalError::InternalError(
-                        "write_bytes args are not provided".into(),
+                        // alloc: error path.
+                        format!("{intrinsic} args are not provided").into(),
                     ));
                 };
-                let count = from_bytes!(usize, count.get(self)?);
-                let val = from_bytes!(u8, val.get(self)?);
-                let Some(ty) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
-                    return Err(MirEvalError::InternalError(
-                        "write_bytes generic arg is not provided".into(),
-                    ));
+                let ty = type_arg(generic_args, intrinsic)?;
+                let count = from_bytes!(usize, self.read_scalar(count.interval)?);
+                let val = from_bytes!(u8, self.read_scalar(val.interval)?);
+                let (size, align) =
+                    self.size_align_of_sized(ty, locals, "the type `write_bytes` writes")?;
+                let Some(size) = count.checked_mul(size) else {
+                    // alloc: error path.
+                    return Err(MirEvalError::UndefinedBehavior(format!(
+                        "overflow computing the total size of `{intrinsic}`"
+                    )));
                 };
-                let dst = Address::from_bytes(dst.get(self)?)?;
-                let size = self.size_of_sized(ty, locals, "copy_nonoverlapping ptr type")?;
-                let size = count * size;
+                let dst = self.read_pointer(dst.interval.addr)?.aligned(align);
                 self.write_memory_using_ref(dst, size)?.fill(val);
                 Ok(())
+            }
+            Intrinsic::TypedSwapNonoverlapping => {
+                let [x, y] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "typed_swap_nonoverlapping args are not provided".into(),
+                    ));
+                };
+                let ty = type_arg(generic_args, intrinsic)?;
+                let size = self.size_of_sized(ty, locals, "the type `typed_swap_nonoverlapping`")?;
+                let x = self.aligned_to(self.read_pointer(x.interval.addr)?, ty)?;
+                let y = self.aligned_to(self.read_pointer(y.interval.addr)?, ty)?;
+                let (a, b) = (x.to_usize(), y.to_usize());
+                if size != 0 && a < b + size && b < a + size {
+                    return Err(MirEvalError::UndefinedBehavior(
+                        // alloc: error path.
+                        "`typed_swap_nonoverlapping` called on overlapping ranges".to_owned(),
+                    ));
+                }
+                let (bytes, x_shadow) = self.read_shadowed(x, size)?;
+                // alloc: the temporary `ptr::swap_nonoverlapping` would hold, of any size.
+                let x_bytes = bytes.to_vec();
+                let (bytes, y_shadow) = self.read_shadowed(y, size)?;
+                // alloc: as above.
+                let y_bytes = bytes.to_vec();
+                self.write_shadowed(x, &y_bytes, &y_shadow)?;
+                self.write_shadowed(y, &x_bytes, &x_shadow)?;
+                if M::CHECKS {
+                    self.typed_copy(x, ty, size, RetagMode::None)?;
+                    self.typed_copy(y, ty, size, RetagMode::None)?;
+                }
+                Ok(())
+            }
+            Intrinsic::RawEq => {
+                let [a, b] = args else {
+                    return Err(MirEvalError::InternalError("raw_eq args are not provided".into()));
+                };
+                let ty = type_arg(generic_args, intrinsic)?;
+                let size = self.size_of_sized(ty, locals, "the type `raw_eq` compares")?;
+                let a = self.aligned_to(self.read_pointer(a.interval.addr)?, ty)?;
+                let b = self.aligned_to(self.read_pointer(b.interval.addr)?, ty)?;
+                let eq = self.read_scalar(Interval::new(a, size))?
+                    == self.read_scalar(Interval::new(b, size))?;
+                destination.write_from_bytes(self, &[u8::from(eq)])
+            }
+            Intrinsic::PtrMask => {
+                let [ptr, mask] = args else {
+                    return Err(MirEvalError::InternalError(
+                        "ptr_mask args are not provided".into(),
+                    ));
+                };
+                let base = self.read_pointer(ptr.interval.addr)?;
+                let mask = from_bytes!(usize, self.read_scalar(mask.interval)?);
+                let to = Address::from_usize(base.to_usize() & mask);
+                self.write_pointer(destination.addr, Address { prov: base.prov, ..to })
             }
             Intrinsic::PtrMetadata => {
                 let [ptr] = args else {
@@ -1330,6 +1450,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Intrinsic::Unreachable => {
                 return Err(MirEvalError::UndefinedBehavior(
+                    // alloc: error path
                     "`unreachable` intrinsic executed".to_owned(),
                 ));
             }
@@ -1341,10 +1462,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "compare_bytes args are not provided".into(),
                     ));
                 };
-                let left = Address::from_bytes(left.get(self)?)?;
-                let right = Address::from_bytes(right.get(self)?)?;
-                let bytes = from_bytes!(usize, bytes.get(self)?);
-                let order = self.read_memory(left, bytes)?.cmp(self.read_memory(right, bytes)?);
+                let left = self.read_pointer(left.interval.addr)?;
+                let right = self.read_pointer(right.interval.addr)?;
+                let bytes = from_bytes!(usize, self.read_scalar(bytes.interval)?);
+                let left = self.read_scalar(Interval::new(left, bytes))?;
+                let order = left.cmp(self.read_scalar(Interval::new(right, bytes))?);
                 destination.write_from_bytes(self, &(order as i32).to_le_bytes())
             }
             Intrinsic::ConstAllocate => {
@@ -1488,6 +1610,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 float(arg)?.unary(intrinsic).ok_or_else(|| {
                     MirEvalError::InternalError(
+                        // alloc: error path
                         format!("{intrinsic} is not a float intrinsic of one argument").into(),
                     )
                 })?
@@ -1637,16 +1760,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn exec_atomic_intrinsic(
         &mut self,
         op: AtomicOp,
+        orders: AtomicOrders,
         args: &[IntervalAndTy<'db>],
         generic_args: GenericArgs<'db>,
         destination: Interval,
         locals: &Locals<'db>,
         _span: MirSpan,
     ) -> Result<'db, ()> {
-        // We are a single threaded runtime with no UB checking and no optimization, so
-        // we can implement atomic intrinsics as normal functions. The orderings are const
-        // generics (`atomic_load::<T, ORD, VOLATILE>`), which change nothing here.
+        // One thread runs at a time, so an atomic is a read and a write of its bytes. The
+        // machine sees them as atomic accesses of the orderings, which change nothing else.
+        let (ord, failure) = match M::CHECKS {
+            true => self.atomic_orders(op, orders, generic_args)?,
+            false => (AtomicOrd::SeqCst, AtomicOrd::SeqCst),
+        };
         if let AtomicOp::Fence | AtomicOp::SingleThreadFence = op {
+            if M::CHECKS {
+                self.machine.fence(ord, op == AtomicOp::SingleThreadFence)?;
+            }
             return Ok(());
         }
 
@@ -1660,92 +1790,222 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 "atomic intrinsic arg0 is not provided".into(),
             ));
         };
-        let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
-        let arg0_interval =
-            Interval::new(arg0_addr, self.size_of_sized(ty, locals, "atomic intrinsic type arg")?);
+        let size = self.size_of_sized(ty, locals, "atomic intrinsic type arg")?;
+        // An atomic access is aligned to its size.
+        let addr = self.read_pointer(arg0.interval.addr)?.aligned(size);
+        let access = |rmw| Access::Atomic { ord, rmw, cxchg_failed: false };
         if op == AtomicOp::Load {
-            return destination.write_from_interval(self, arg0_interval);
+            if !M::CHECKS {
+                return destination.write_from_interval(self, Interval::new(addr, size));
+            }
+            let (latest, shadow) = self.atomic_read(addr, size, access(false))?;
+            return match self.machine.atomic_load(self.ptr(addr), size as u64, ord, &latest)? {
+                Some(bytes) => {
+                    self.write_shadowed(destination.addr, &bytes, &M::Shadow::init(bytes.len()))
+                }
+                None => self.write_shadowed(destination.addr, &latest, &shadow),
+            };
         }
         let Some(arg1) = args.get(1) else {
             return Err(MirEvalError::InternalError(
                 "atomic intrinsic arg1 is not provided".into(),
             ));
         };
-        let size = arg0_interval.size;
-        let signed = matches!(ty.kind(), TyKind::Int(_));
-        let read = |this: &Self, interval: Interval, sign: bool| -> Result<'db, u128> {
-            let bytes = interval.get(this)?;
-            Ok(u128::from_le_bytes(pad16(&bytes[..size.min(bytes.len())], sign.into())))
-        };
-        let ans = match op {
-            AtomicOp::Store => return arg0_interval.write_from_interval(self, arg1.interval),
-            AtomicOp::Xchg => {
-                destination.write_from_interval(self, arg0_interval)?;
-                return arg0_interval.write_from_interval(self, arg1.interval);
-            }
-            AtomicOp::Xadd
-            | AtomicOp::Xsub
-            | AtomicOp::And
-            | AtomicOp::Nand
-            | AtomicOp::Or
-            | AtomicOp::Xor
-            | AtomicOp::Umax
-            | AtomicOp::Umin => {
-                let lhs = read(self, arg0_interval, false)?;
-                let rhs = read(self, arg1.interval, false)?;
-                match op {
-                    AtomicOp::Xadd => lhs.wrapping_add(rhs),
-                    AtomicOp::Xsub => lhs.wrapping_sub(rhs),
-                    AtomicOp::And => lhs & rhs,
-                    AtomicOp::Nand => !(lhs & rhs),
-                    AtomicOp::Or => lhs | rhs,
-                    AtomicOp::Xor => lhs ^ rhs,
-                    AtomicOp::Umax => lhs.max(rhs),
-                    _ => lhs.min(rhs),
-                }
-            }
-            AtomicOp::Max | AtomicOp::Min => {
-                let lhs = read(self, arg0_interval, signed)? as i128;
-                let rhs = read(self, arg1.interval, signed)? as i128;
-                (if op == AtomicOp::Max { lhs.max(rhs) } else { lhs.min(rhs) }) as u128
-            }
-            AtomicOp::Cxchg | AtomicOp::CxchgWeak => {
-                let Some(arg2) = args.get(2) else {
-                    return Err(MirEvalError::InternalError(
-                        "atomic intrinsic arg2 is not provided".into(),
-                    ));
-                };
-                let dest = if arg1.get(self)? == arg0_interval.get(self)? {
-                    arg0_interval.write_from_interval(self, arg2.interval)?;
-                    (arg1.interval, true)
-                } else {
-                    (arg0_interval, false)
-                };
-                let result_ty = Ty::new_tup_from_iter(
-                    self.interner(),
-                    [ty, Ty::new_bool(self.interner())].into_iter(),
-                );
-                let layout = self.layout(result_ty)?;
-                let result = self.construct_with_layout(
-                    layout.size.bytes_usize(),
-                    &layout,
-                    None,
-                    [
-                        IntervalOrOwned::Borrowed(dest.0),
-                        IntervalOrOwned::Owned(vec![u8::from(dest.1)]),
-                    ]
-                    .into_iter(),
-                )?;
-                return destination.write_from_bytes(self, &result);
-            }
-            AtomicOp::Load | AtomicOp::Fence | AtomicOp::SingleThreadFence => {
+        let (value, value_shadow) = self.read_shadowed(arg1.interval.addr, arg1.interval.size)?;
+        let value = Word::from_slice(value);
+        if op == AtomicOp::Store {
+            return self.atomic_write(addr, &value, &value_shadow, ord, false);
+        }
+
+        if let AtomicOp::Cxchg | AtomicOp::CxchgWeak = op {
+            let Some(arg2) = args.get(2) else {
                 return Err(MirEvalError::InternalError(
-                    "an atomic load or fence taken for a read-modify-write".into(),
+                    "atomic intrinsic arg2 is not provided".into(),
+                ));
+            };
+            // The expected value is compared as a number.
+            if M::CHECKS {
+                self.machine.require_init(&value_shadow, 0..value.len())?;
+            }
+            let (new, new_shadow) = self.read_shadowed(arg2.interval.addr, arg2.interval.size)?;
+            let new = Word::from_slice(new);
+            let (old, old_shadow) = self.atomic_read(addr, size, access(true))?;
+            if M::CHECKS {
+                self.machine.require_init(&old_shadow, 0..size)?;
+            }
+            let exchanged = old == value;
+            if exchanged {
+                self.atomic_write(addr, &new, &new_shadow, ord, true)?;
+            } else if M::CHECKS {
+                let failed = Access::Atomic { ord: failure, rmw: true, cxchg_failed: true };
+                self.machine.read(self.ptr(addr), size as u64, addr.align(), failed)?;
+            }
+            let result_ty = Ty::new_tup_from_iter(
+                self.interner(),
+                [ty, Ty::new_bool(self.interner())].into_iter(),
+            );
+            let layout = self.layout(result_ty)?;
+            let (at, flag) =
+                (layout.fields.offset(0).bytes_usize(), layout.fields.offset(1).bytes_usize());
+            let len = layout.size.bytes_usize();
+            if len < (at + size).max(flag + 1) {
+                return Err(MirEvalError::InternalError(
+                    "the result of a compare-exchange is smaller than its fields".into(),
                 ));
             }
+            let mut result = smallvec::SmallVec::<[u8; 32]>::from_elem(0, len);
+            result[at..at + size].copy_from_slice(&old);
+            result[flag] = u8::from(exchanged);
+            let mut shadow = M::Shadow::init(result.len());
+            shadow.put(at, &old_shadow);
+            return self.write_shadowed(destination.addr, &result, &shadow);
+        }
+
+        let computes = op != AtomicOp::Xchg;
+        if M::CHECKS && computes {
+            self.machine.require_init(&value_shadow, 0..value.len())?;
+        }
+        let (old, old_shadow) = self.atomic_read(addr, size, access(true))?;
+        let (new, new_shadow) = match computes {
+            false => (value, value_shadow),
+            true => {
+                if M::CHECKS {
+                    self.machine.require_init(&old_shadow, 0..size)?;
+                }
+                let signed = matches!(ty.kind(), TyKind::Int(_));
+                let new = rmw_value(op, &old, &value, signed)?;
+                // Arithmetic on an atomic pointer keeps the old pointer's provenance.
+                let shadow = match ty.kind() {
+                    TyKind::RawPtr(..) => M::Shadow::pointer(size, old_shadow.prov_at(0, size)),
+                    _ => M::Shadow::init(size),
+                };
+                (Word::from_slice(&new.to_le_bytes()[..size]), shadow)
+            }
         };
-        destination.write_from_interval(self, arg0_interval)?;
-        arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..size])
+        self.atomic_write(addr, &new, &new_shadow, ord, true)?;
+        self.write_shadowed(destination.addr, &old, &old_shadow)
+    }
+
+    /// The machine's orderings of an atomic: its ordering, and a compare-exchange's failure
+    /// ordering (its ordering, for any other atomic).
+    fn atomic_orders(
+        &self,
+        op: AtomicOp,
+        orders: AtomicOrders,
+        generic_args: GenericArgs<'db>,
+    ) -> Result<'db, (AtomicOrd, AtomicOrd)> {
+        let Some((ord, failure)) = atomic_orderings(self.db, op, orders, generic_args) else {
+            not_supported!("atomic `{op:?}` of orderings that are not known `AtomicOrdering`s")
+        };
+        let failure = match (op, failure) {
+            (AtomicOp::Cxchg | AtomicOp::CxchgWeak, None) => {
+                not_supported!("atomic `{op:?}` with no failure ordering")
+            }
+            (_, failure) => failure.unwrap_or(ord),
+        };
+        Ok((atomic_ord(ord), atomic_ord(failure)))
+    }
+
+    /// The bytes an atomic reads at `addr` and what they hold: one machine `read` of `access`.
+    fn atomic_read(
+        &self,
+        addr: Address,
+        size: usize,
+        access: Access,
+    ) -> Result<'db, (Word, M::Shadow)> {
+        let shadow = match M::CHECKS {
+            true => self.machine.read(self.ptr(addr), size as u64, addr.align(), access)?,
+            false => M::Shadow::default(),
+        };
+        Ok((Word::from_slice(self.peek_memory(addr, size)?), shadow))
+    }
+
+    /// An atomic's write of `bytes` to `addr`: one machine `write`, the bytes, and right after
+    /// them the machine's `atomic_store` with the bytes they replaced.
+    fn atomic_write(
+        &mut self,
+        addr: Address,
+        bytes: &[u8],
+        shadow: &M::Shadow,
+        ord: AtomicOrd,
+        rmw: bool,
+    ) -> Result<'db, ()> {
+        if !M::CHECKS {
+            self.poke_memory(addr, bytes.len())?.copy_from_slice(bytes);
+            return Ok(());
+        }
+        let ptr = self.ptr(addr);
+        let access = Access::Atomic { ord, rmw, cxchg_failed: false };
+        self.machine.write(ptr, bytes.len() as u64, addr.align(), access, shadow)?;
+        let old = Word::from_slice(self.peek_memory(addr, bytes.len())?);
+        self.poke_memory(addr, bytes.len())?.copy_from_slice(bytes);
+        self.machine.atomic_store(ptr, ord, bytes, &old)
+    }
+
+    /// `addr` accessed as a value of `ty`, at its alignment, which only the machine checks.
+    fn aligned_to(&self, addr: Address, ty: Ty<'db>) -> Result<'db, Address> {
+        if !M::CHECKS {
+            return Ok(addr);
+        }
+        Ok(addr.aligned(self.layout(ty)?.align.bytes() as usize))
+    }
+
+    /// The value of `size` bytes at `src` written to `dst`: a read of it, then a write of what
+    /// it holds, provenance included.
+    fn move_value(&mut self, dst: Address, src: Address, size: usize) -> Result<'db, ()> {
+        if !M::CHECKS {
+            return self.copy_from_interval(dst, Interval::new(src, size));
+        }
+        let (bytes, shadow) = self.read_shadowed(src, size)?;
+        // alloc: only under the checker; `Plain` copies in place.
+        let bytes = bytes.to_vec();
+        self.write_shadowed(dst, &bytes, &shadow)
+    }
+
+    /// `count` values of `ty` from the pointer in `src` to the one in `dst`: `copy` and
+    /// `volatile_copy_memory` (`overlapping`), `copy_nonoverlapping` and its volatile one.
+    fn copy_values(
+        &mut self,
+        dst: &IntervalAndTy<'db>,
+        src: &IntervalAndTy<'db>,
+        count: &IntervalAndTy<'db>,
+        ty: Ty<'db>,
+        overlapping: bool,
+        locals: &Locals<'db>,
+    ) -> Result<'db, ()> {
+        let (size, align) = self.size_align_of_sized(ty, locals, "the type of a copy")?;
+        let src = self.read_pointer(src.interval.addr)?;
+        let dst = self.read_pointer(dst.interval.addr)?;
+        let count = from_bytes!(usize, self.read_scalar(count.interval)?);
+        let Some(size) = count.checked_mul(size) else {
+            return Err(MirEvalError::UndefinedBehavior(
+                // alloc: error path.
+                "overflow computing the total size of a copy".to_owned(),
+            ));
+        };
+        self.copy_memory(dst, src, size, align, overlapping)
+    }
+
+    /// `size` bytes from `src` to `dst`, both accessed at alignment `align`, which the machine
+    /// sees as one copy: `overlapping` for `memmove` and `copy`, not for `memcpy` and
+    /// `copy_nonoverlapping`, where the machine fails if they overlap.
+    fn copy_memory(
+        &mut self,
+        dst: Address,
+        src: Address,
+        size: usize,
+        align: usize,
+        overlapping: bool,
+    ) -> Result<'db, ()> {
+        let (dst, src) = (dst.aligned(align), src.aligned(align));
+        if !M::CHECKS || overlapping {
+            return self.copy_from_interval(dst, Interval::new(src, size));
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        self.machine.copy(self.ptr(dst), self.ptr(src), size as u64, align as u64, false)?;
+        self.move_memory(dst, Interval::new(src, size))
     }
 
     /// The bytes of the `TypeId` of `of`, made when it is the first one asked for.
@@ -1759,7 +2019,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// What the `TypeId` in `arg` stands for.
     fn type_id_entry(&self, arg: &IntervalAndTy<'db>) -> Result<'db, Option<&TypeIdOf<'db>>> {
-        let id = from_bytes!(u128, arg.get(self)?);
+        let id = from_bytes!(u128, self.read_scalar(arg.interval)?);
         Ok(id.checked_sub(1).and_then(|it| self.type_ids.get(it as usize)))
     }
 
@@ -1778,6 +2038,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn type_id_ty(&self, ty: Ty<'db>) -> Result<'db, Ty<'db>> {
         use rustc_type_ir::TypeFoldable;
         let ty = crate::mir::monomorphization::normalized_ty(self.db, ty, self.param_env)
+            // alloc: error path
             .map_err(|e| MirEvalError::NotSupported(format!("a `TypeId` of {ty:?}: {e:?}")))?;
         let interner = self.interner();
         let erased = Region::new_erased(interner);
@@ -1844,9 +2105,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.write_memory(addr.offset(name.len()), &[0])?;
         let args = GenericArgs::new_from_slice(&[Region::new_erased(self.interner()).into()]);
         let (size, layout, tag) = self.layout_of_variant(id.into(), args, locals)?;
-        let fields = id.fields(self.db).fields().iter().map(|(_, field)| {
+        let mut file_field = None;
+        let fields = id.fields(self.db).fields().iter().enumerate().map(|(i, (_, field))| {
             Ok(IntervalOrOwned::Owned(match field.name.as_str() {
-                "filename" | "file" => [addr.to_bytes(), super::word_bytes(name.len())].concat(),
+                "filename" | "file" => {
+                    file_field = Some(i);
+                    [addr.to_bytes(), super::word_bytes(name.len())].concat()
+                }
                 "line" => line.to_le_bytes().into(),
                 "col" => col.to_le_bytes().into(),
                 "_filename" => Vec::new(),
@@ -1857,6 +2122,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let bytes = self.construct_with_layout(size, &layout, tag, fields.into_iter())?;
         let location = self.heap_allocate(size, layout.align.abi.bytes() as usize)?;
         self.write_memory(location, &bytes)?;
+        // The file name's pointer again, with the provenance of the name's allocation.
+        if M::CHECKS && let Some(i) = file_field {
+            let at = location.offset(layout.fields.offset(i).bytes_usize());
+            self.write_pointer(at, addr)?;
+        }
         Ok(location)
     }
 
@@ -1864,7 +2134,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn write_str(&mut self, destination: Interval, text: &str) -> Result<'db, ()> {
         let addr = self.heap_allocate(text.len(), 1)?;
         self.write_memory(addr, text.as_bytes())?;
-        destination.slice(0..self.ptr_size()).write_from_bytes(self, &addr.to_bytes())?;
+        self.write_pointer(destination.addr, addr)?;
         destination
             .slice(self.ptr_size()..2 * self.ptr_size())
             .write_from_bytes(self, &super::word_bytes(text.len()))
@@ -1902,10 +2172,72 @@ fn float_width<'db>(intrinsic: Intrinsic, args: &[IntervalAndTy<'db>]) -> Result
         Some(TyKind::Float(FloatTy::F128)) => FloatWidth::F128,
         _ => {
             return Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("{intrinsic} of an argument that is not a float").into(),
             ));
         }
     })
+}
+
+/// The bytes of an atomic's value: at most a `u128`'s.
+type Word = smallvec::SmallVec<[u8; 16]>;
+
+/// The type `intrinsic` is generic over: its first generic argument.
+fn type_arg<'db>(generic_args: GenericArgs<'db>, intrinsic: Intrinsic) -> Result<'db, Ty<'db>> {
+    match generic_args.as_slice().first().and_then(|it| it.ty()) {
+        Some(ty) => Ok(ty),
+        None => Err(MirEvalError::InternalError(
+            // alloc: error path.
+            format!("{intrinsic} generic arg is not provided").into(),
+        )),
+    }
+}
+
+/// The value the atomic read-modify-write `op` stores, of the old value `lhs` and the operand
+/// `rhs`, as many bytes as `lhs`; `max` and `min` compare as `signed` numbers.
+fn rmw_value<'db>(op: AtomicOp, lhs: &[u8], rhs: &[u8], signed: bool) -> Result<'db, u128> {
+    let size = lhs.len();
+    let int = |bytes: &[u8], sign: bool| {
+        u128::from_le_bytes(pad16(&bytes[..size.min(bytes.len())], sign.into()))
+    };
+    let (l, r) = (int(lhs, false), int(rhs, false));
+    Ok(match op {
+        AtomicOp::Xadd => l.wrapping_add(r),
+        AtomicOp::Xsub => l.wrapping_sub(r),
+        AtomicOp::And => l & r,
+        AtomicOp::Nand => !(l & r),
+        AtomicOp::Or => l | r,
+        AtomicOp::Xor => l ^ r,
+        AtomicOp::Umax => l.max(r),
+        AtomicOp::Umin => l.min(r),
+        AtomicOp::Max | AtomicOp::Min => {
+            let (l, r) = (int(lhs, signed) as i128, int(rhs, signed) as i128);
+            (if op == AtomicOp::Max { l.max(r) } else { l.min(r) }) as u128
+        }
+        AtomicOp::Xchg
+        | AtomicOp::Cxchg
+        | AtomicOp::CxchgWeak
+        | AtomicOp::Load
+        | AtomicOp::Store
+        | AtomicOp::Fence
+        | AtomicOp::SingleThreadFence => {
+            return Err(MirEvalError::InternalError(
+                // alloc: error path.
+                format!("atomic `{op:?}` taken for an arithmetic read-modify-write").into(),
+            ));
+        }
+    })
+}
+
+/// core's `AtomicOrdering` as the machine has it.
+fn atomic_ord(ord: AtomicOrdering) -> AtomicOrd {
+    match ord {
+        AtomicOrdering::Relaxed => AtomicOrd::Relaxed,
+        AtomicOrdering::Acquire => AtomicOrd::Acquire,
+        AtomicOrdering::Release => AtomicOrd::Release,
+        AtomicOrdering::AcqRel => AtomicOrd::AcqRel,
+        AtomicOrdering::SeqCst => AtomicOrd::SeqCst,
+    }
 }
 
 /// A float the evaluator computes float intrinsics in, each in its own width.
@@ -1979,5 +2311,78 @@ impl<'db> rustc_type_ir::TypeFolder<crate::next_solver::DbInterner<'db>> for Ano
     {
         use rustc_type_ir::{Interner, TypeSuperFoldable};
         self.0.anonymize_bound_vars(binder.super_fold_with(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bytes `op` stores, as the evaluator writes them: as many as `lhs`.
+    fn stored(op: AtomicOp, lhs: &[u8], rhs: &[u8], signed: bool) -> Option<Vec<u8>> {
+        let value = rmw_value(op, lhs, rhs, signed).ok()?;
+        Some(value.to_le_bytes()[..lhs.len()].to_vec())
+    }
+
+    #[test]
+    fn rmw_arithmetic_wraps_at_the_atomic_size() {
+        assert_eq!(stored(AtomicOp::Xadd, &[0xff], &[1], false), Some(vec![0]));
+        assert_eq!(stored(AtomicOp::Xsub, &[0], &[1], false), Some(vec![0xff]));
+        let (lhs, rhs) = (u32::MAX.to_le_bytes(), 2u32.to_le_bytes());
+        assert_eq!(stored(AtomicOp::Xadd, &lhs, &rhs, false), Some(1u32.to_le_bytes().to_vec()));
+    }
+
+    #[test]
+    fn rmw_bitwise() {
+        assert_eq!(stored(AtomicOp::And, &[0b1100], &[0b1010], false), Some(vec![0b1000]));
+        assert_eq!(stored(AtomicOp::Or, &[0b1100], &[0b1010], false), Some(vec![0b1110]));
+        assert_eq!(stored(AtomicOp::Xor, &[0b1100], &[0b1010], false), Some(vec![0b0110]));
+        assert_eq!(stored(AtomicOp::Nand, &[0b1100], &[0b1010], false), Some(vec![!0b1000]));
+    }
+
+    #[test]
+    fn rmw_max_and_min_by_signedness() {
+        // -1 and 1 as `i8`, or 255 and 1 as `u8`.
+        assert_eq!(stored(AtomicOp::Max, &[0xff], &[1], true), Some(vec![1]));
+        assert_eq!(stored(AtomicOp::Min, &[0xff], &[1], true), Some(vec![0xff]));
+        assert_eq!(stored(AtomicOp::Max, &[0xff], &[1], false), Some(vec![0xff]));
+        assert_eq!(stored(AtomicOp::Umax, &[0xff], &[1], true), Some(vec![0xff]));
+        assert_eq!(stored(AtomicOp::Umin, &[0xff], &[1], true), Some(vec![1]));
+        let (lhs, rhs) = ((-5i32).to_le_bytes(), 3i32.to_le_bytes());
+        assert_eq!(stored(AtomicOp::Min, &lhs, &rhs, true), Some(lhs.to_vec()));
+        assert_eq!(stored(AtomicOp::Max, &lhs, &rhs, true), Some(rhs.to_vec()));
+    }
+
+    #[test]
+    fn rmw_operand_wider_than_the_atomic() {
+        // `atomic_xadd::<*mut T, usize>` on a narrower target, and the like: the operand's
+        // bytes past the atomic's are not part of it.
+        assert_eq!(stored(AtomicOp::Xadd, &[1, 0], &[1, 0, 0xff, 0xff], false), Some(vec![2, 0]));
+    }
+
+    #[test]
+    fn rmw_refuses_what_is_not_arithmetic() {
+        use AtomicOp::*;
+        for op in [Xchg, Cxchg, CxchgWeak, Load, Store, Fence, SingleThreadFence] {
+            assert_eq!(stored(op, &[0], &[0], false), None, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn orderings_map_one_to_one() {
+        let all = [
+            (AtomicOrdering::Relaxed, AtomicOrd::Relaxed),
+            (AtomicOrdering::Acquire, AtomicOrd::Acquire),
+            (AtomicOrdering::Release, AtomicOrd::Release),
+            (AtomicOrdering::AcqRel, AtomicOrd::AcqRel),
+            (AtomicOrdering::SeqCst, AtomicOrd::SeqCst),
+        ];
+        for (ordering, ord) in all {
+            assert_eq!(atomic_ord(ordering), ord);
+        }
+        // A suffix intrinsic's orderings, as `atomic_orderings` reads them, map the same way.
+        let (success, failure) = AtomicOrders::AcqRelAcquire.named().unwrap();
+        assert_eq!(atomic_ord(success), AtomicOrd::AcqRel);
+        assert_eq!(failure.map(atomic_ord), Some(AtomicOrd::Acquire));
     }
 }

@@ -7,6 +7,7 @@
 
 use std::borrow::Cow;
 
+use base_db::Db;
 use crate::RootDatabase;
 use crate::documentation::{Documentation, HasDocs};
 use crate::famous_defs::FamousDefs;
@@ -926,7 +927,7 @@ impl<'db> From<Either<PathResolution<'db>, InlineAsmOperand>> for Definition<'db
 }
 
 impl AsAssocItem for Definition<'_> {
-    fn as_assoc_item(self, db: &dyn hir::db::HirDatabase) -> Option<AssocItem> {
+    fn as_assoc_item(self, db: &Db) -> Option<AssocItem> {
         match self {
             Definition::Function(it) => it.as_assoc_item(db),
             Definition::Const(it) => it.as_assoc_item(db),
@@ -937,7 +938,7 @@ impl AsAssocItem for Definition<'_> {
 }
 
 impl AsExternAssocItem for Definition<'_> {
-    fn as_extern_assoc_item(self, db: &dyn hir::db::HirDatabase) -> Option<ExternAssocItem> {
+    fn as_extern_assoc_item(self, db: &Db) -> Option<ExternAssocItem> {
         match self {
             Definition::Function(it) => it.as_extern_assoc_item(db),
             Definition::Static(it) => it.as_extern_assoc_item(db),

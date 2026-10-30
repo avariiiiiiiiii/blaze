@@ -27,6 +27,8 @@
 > the CLI forms of requests 2, 3 and 8, which wait on cargo; until then they fail naming the command.
 > `engine.Missing` is gone.
 
+> answered by lane cargo (cargo-inbox): done for the CLI: under `--message-format=json` a `Response::Work` is one `{"reason": "blaze-work", ...}` line of `blaze_ui::api::work_json` (crates/blaze-cargo/src/cli/print.rs `on`), test `what_a_request_did_is_one_json_line_of_blazes` (cli/print/tests.rs). The daemon fills `Work` with the job's counts in serve/job.rs once cargo-sync hands the file over.
+
 ## 2. blaze-api: codegen inputs of a view
 
 - What: `Request::CodegenInputs { view: ViewRef, targets: Targets }` answered with
@@ -39,6 +41,8 @@
 
 > applied: the API by ci (`Request::CodegenInputs`, `Response::CodegenInputs`).
 > forwarded to cargo: the CLI's `blaze codegen-inputs --format=json`.
+
+> answered by lane cargo (cargo-inbox): done for the CLI: `blaze codegen-inputs [--format=json] [build flags]` (crates/blaze-cargo/src/cli/inspect.rs `main`/`answer`, cli/args.rs `Asked::Inspect`), printing `blaze_ui::api::codegen_inputs_json`; tests in cli/inspect/tests.rs.
 
 ## 3. blaze-api: a view's trace
 
@@ -55,6 +59,8 @@
   `engine.Missing` until then.
 
 > applied: by ci (`Request::Trace`, `Response::Trace(Vec<Traced>)`; `blaze_ui::api::trace_cbor` writes `blaze_v2_proof::Trace`).
+
+> answered by lane cargo (cargo-inbox): done for the CLI: `blaze trace --out PATH [build flags]` writes `blaze_ui::api::trace_cbor` of the answer (crates/blaze-cargo/src/cli/inspect.rs); a missing `--out` is refused; tests in cli/inspect/tests.rs.
 
 ## 4. pyproject.toml: lint and type-check harness/v2
 
@@ -124,6 +130,8 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
 > applied: by ci (`Request::Tables`, `Response::Tables(Vec<Table>)`).
 > forwarded to cargo: the CLI's `blaze tables --format=json`.
 
+> answered by lane cargo (cargo-inbox): done for the CLI: `blaze tables --format=json` prints `{"<name>": {"elements": N, "bytes": N}, ...}` (crates/blaze-cargo/src/cli/inspect.rs `tables_json`); tests in cli/inspect/tests.rs.
+
 ## 9. format and store: run every column codec through `blaze_v2_proof::columns::round_trips`
 
 - What: `blaze-v2-proof` as a dev-dependency (`blaze-v2-proof.workspace = true` once the
@@ -176,3 +184,415 @@ every single-op block in that statement's tuple.
   For the last vector use `last` and `// SAFETY: `n >= W`, so `last + W == n`.`. For NEON, `let m = same(unsafe { eq(a0, b0) });`.
 - `crates/blaze-v2-proof/src/main.rs:1` target root: it declares no modules and has no `unsafe` (it uses the library); add `#![forbid(unsafe_code)]`.
 - Checked, no other finding: the four dispatch blocks in `first_difference_with` (`:71`-`:89`) and `Mapped::open` (`:330`) are one op each with real comments. The map is of finished build outputs that nothing writes while they are compared, and its bytes are read only as a safe `&[u8]`.
+
+## From speed-link-edge-sol-proof (2026-10-29): `crates/blaze-v2-proof/src/lib.rs`, three edits
+
+`lib.rs` is named by `frontend-nameres` (IN PROGRESS), so it is not free for me; lane proof is
+DONE, so these are `requests`' to apply. The new modules `src/wire.rs` and `src/join.rs` are
+written (with their tests) and `src/main.rs` already calls them; they compile only once these
+land.
+
+1. After `pub mod columns;` add `pub mod join;`, and after `pub mod nameres;` add `pub mod wire;`.
+2. `Trace`'s derive (`lib.rs:66`): `#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]`
+   becomes `#[derive(Clone, PartialEq, Eq, Debug, Default)]`. `wire.rs` implements `Serialize`
+   and `Deserialize` for `Trace` (version 2: one CBOR byte string per column). The `serde` import
+   stays, since `Bits`, `Stale`, `Work` and `Apart` still derive.
+3. In the module doc's list, after the `[`columns`]` line:
+   `//! - [`join`]: [`under`] and [`over`] across cores, on owned traces or on [`wire::View`]s read in place.`
+   `//! - [`wire`]: a trace as a file, one byte string per column, read in place by [`wire::View`].`
+
+Why: a derived `Trace` encodes every byte of every `[u8; 32]` key input and `[u8; 16]`
+fingerprint as a CBOR item of its own (35 items a key, 17 an edge). Decoding nushell's trace
+(about 5 M keys and 50 M edges) then costs about 1 to 2 s on one core, against about 50 ms to
+stream its 1.3 GB. As columns it is nine items and a length check, read in place, and `join`
+splits the joins across cores. Callers keep compiling: `blaze-ui`'s `trace_cbor` still writes
+`cbor::to_vec(&trace.finish())` and its test reads it back with `cbor::from_slice`, and
+`tests.rs`'s round trip still holds. The serial `under` and `over` stay as the reference
+`join`'s tests compare against. Numbers: `docs/v2/plan/lanes/proof/speed-of-light.md`, "The
+oracle and the harness".
+
+> applied by requests (proof DONE): `pub mod join;` after `columns`, `pub mod wire;` after `nameres`; `Trace` derives `Clone, PartialEq, Eq, Debug, Default` only (`wire.rs` 214/244 implement serde); the two module-doc lines after `[`columns`]`. `serde` import kept for `Bits` and the rest.
+
+## dedup: blaze-v2-proof's `bytes::Mapped` onto blaze_core::fs::Mapped
+
+From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). Every read-only file map moves onto
+one type, `blaze_core::fs::Mapped` (`crates/blaze-core/src/fs/mapped.rs`), and memmap2 leaves the
+workspace. The proof's `Mapped` wraps memmap2 the same way; it keeps its API (`open`,
+`open_lazily`, `bytes`) and becomes a wrapper of the shared type. Quoted as of 20:20.
+
+1. `crates/blaze-v2-proof/src/bytes.rs`, `pub struct Mapped(Option<memmap2::Mmap>);` becomes
+
+       pub struct Mapped(blaze_core::fs::Mapped);
+
+2. Same file, `fn map` and `fn bytes` of `impl Mapped`, before:
+
+       fn map(path: &Path, populate: bool) -> io::Result<Mapped> {
+           let file = File::open(path)?;
+           if file.metadata()?.len() == 0 {
+               return Ok(Mapped(None));
+           }
+           let mut options = memmap2::MmapOptions::new();
+           if populate {
+               options.populate();
+           }
+           // SAFETY: a read-only private map of a file nothing writes while it is mapped (the
+           // type's contract above).
+           let map = unsafe { options.map(&file)? };
+           Ok(Mapped(Some(map)))
+       }
+
+       pub fn bytes(&self) -> &[u8] {
+           self.0.as_deref().unwrap_or(&[])
+       }
+
+   after (an empty file maps nothing in the shared type too):
+
+       fn map(path: &Path, populate: bool) -> io::Result<Mapped> {
+           let options = blaze_core::fs::MapOptions::new().populate(populate);
+           // SAFETY: a read-only map of a file nothing writes while it is mapped (the type's
+           // contract above).
+           Ok(Mapped(unsafe { options.open(path) }?))
+       }
+
+       pub fn bytes(&self) -> &[u8] {
+           self.0.bytes()
+       }
+
+3. Same file, line 13: `use std::{fs::File, io, path::Path, sync::OnceLock};` becomes
+   `use std::{io, path::Path, sync::OnceLock};` (`fn map` was the only user of `File`).
+4. `crates/blaze-v2-proof/Cargo.toml`: replace `memmap2.workspace = true` with
+   `blaze-core.workspace = true` (blaze-core depends on nothing of the proof's).
+
+Callers (`first_file_difference`, `main.rs`, `tests.rs`) are unchanged.
+
+Status: open
+
+> applied by requests (proof DONE): items 1-4 as written: `Mapped(blaze_core::fs::Mapped)`, `map` through `MapOptions::new().populate(..)` and `open` with its SAFETY line, `bytes` from the shared type, `File` dropped from the import, `memmap2` -> `blaze-core` in the manifest. Callers unchanged.
+
+## dedup: bits: blaze-v2-proof `Bits` onto `blaze_ids::bits::BitSet<u32>`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::BitSet<u32>` (`crates/blaze-ids/src/bits.rs`) is `Bits<Vec<u64>, u32>`: the
+same `Vec<u64>` of words, `new(len)` sized as `with_len`, `contains` (was `get`), `insert` (was
+`set`; returns whether it was new), `count`, `words()`/`from_words(vec)` for what `.0` did.
+Behavior: same members and words, same `PartialEq` (of the words), `Clone`, `Default`; `Debug`
+now prints the members rather than the words. `contains` past the capacity is `false` where
+`get` panicked on the vector index: no caller asks past the trace's keys (every index is a key
+index, checked by `View::check`). `Trace` serializes by hand (`wire.rs`), byte for byte as
+before. The test `bits_cross_word_boundaries` is in `crates/blaze-ids/src/bits/tests.rs`
+already. One request because every hunk depends on the type change; the `blaze-ui` test line
+at the end goes with it (lane ci, told).
+
+1. `crates/blaze-v2-proof/src/lib.rs`: delete `/// A bit per index, 64 to a word.`, the
+   `#[derive(...)] pub struct Bits(pub Vec<u64>);` and its whole `impl Bits`.
+
+   Imports, before: `use blaze_ids::{Fingerprint, radix};` after:
+   `use blaze_ids::{Fingerprint, bits::BitSet, radix};`
+
+   `Trace`, before:
+
+   ```rust
+       pub has: Bits,
+       /// Executed by this build, rather than kept from an earlier one.
+       pub ran: Bits,
+   ```
+
+   after:
+
+   ```rust
+       pub has: BitSet<u32>,
+       /// Executed by this build, rather than kept from an earlier one.
+       pub ran: BitSet<u32>,
+   ```
+
+   `TraceBuilder::finish`, before / after:
+
+   ```rust
+               has: Bits::with_len(n),
+               ran: Bits::with_len(n),
+   ```
+
+   ```rust
+               has: BitSet::new(n),
+               ran: BitSet::new(n),
+   ```
+
+   and before / after:
+
+   ```rust
+                   trace.has.set(i);
+                   if row.ran {
+                       trace.ran.set(i);
+                   }
+   ```
+
+   ```rust
+                   trace.has.insert(i);
+                   if row.ran {
+                       trace.ran.insert(i);
+                   }
+   ```
+
+   `Trace::result`: `self.has.get(i).then(...)` becomes `self.has.contains(i).then(...)`.
+
+   `Trace::reachable`, before:
+
+   ```rust
+       pub fn reachable(&self, roots: &[QueryKey]) -> Bits {
+           if roots.is_empty() {
+               return self.has.clone();
+           }
+           let mut seen = Bits::with_len(self.keys.len());
+           let mut next: Vec<u32> = roots.iter().filter_map(|k| self.index(k)).collect();
+           while let Some(i) = next.pop() {
+               if seen.get(i) {
+                   continue;
+               }
+               seen.set(i);
+               next.extend(self.edges(i).map(|(read, _)| read));
+           }
+           seen
+       }
+   ```
+
+   after:
+
+   ```rust
+       pub fn reachable(&self, roots: &[QueryKey]) -> BitSet<u32> {
+           if roots.is_empty() {
+               return self.has.clone();
+           }
+           let mut seen = BitSet::new(self.keys.len());
+           let mut next: Vec<u32> = roots.iter().filter_map(|k| self.index(k)).collect();
+           while let Some(i) = next.pop() {
+               if seen.insert(i) {
+                   next.extend(self.edges(i).map(|(read, _)| read));
+               }
+           }
+           seen
+       }
+   ```
+
+   In `under` (~line 370) `if !incremental.ran.get(j) {` becomes `if !incremental.ran.contains(j) {`;
+   in `over` (~line 409) `.filter(|_| after.ran.get(i))` becomes `.filter(|_| after.ran.contains(i))`.
+
+2. `crates/blaze-v2-proof/src/join.rs`: imports, before:
+
+   ```rust
+   use blaze_ids::Fingerprint;
+   use blaze_query::QueryKey;
+
+   use crate::{Bits, Stale, Trace, Work};
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::{Fingerprint, bits::BitSet};
+   use blaze_query::QueryKey;
+
+   use crate::{Stale, Trace, Work};
+   ```
+
+   `impl Columns for Trace`: `self.has.get(i as u32)` becomes `self.has.contains(i as u32)`,
+   `self.ran.get(i as u32)` becomes `self.ran.contains(i as u32)`.
+
+   `fn reachable`, before:
+
+   ```rust
+   fn reachable<C: Columns>(c: &C, roots: &[QueryKey]) -> Option<Bits> {
+       if roots.is_empty() {
+           return None;
+       }
+       let mut seen = Bits::with_len(c.keys());
+   ```
+
+   after:
+
+   ```rust
+   fn reachable<C: Columns>(c: &C, roots: &[QueryKey]) -> Option<BitSet<u32>> {
+       if roots.is_empty() {
+           return None;
+       }
+       let mut seen = BitSet::new(c.keys());
+   ```
+
+   and its loop, before:
+
+   ```rust
+       while let Some(i) = next.pop() {
+           if seen.get(i as u32) {
+               continue;
+           }
+           seen.set(i as u32);
+           next.extend(c.edges_of(i).map(|e| c.read(e) as usize));
+       }
+   ```
+
+   after:
+
+   ```rust
+       while let Some(i) = next.pop() {
+           if seen.insert(i as u32) {
+               next.extend(c.edges_of(i).map(|e| c.read(e) as usize));
+           }
+       }
+   ```
+
+   In `under_in`: `.is_none_or(|r| r.get(i as u32))` becomes `.is_none_or(|r| r.contains(i as u32))`.
+
+   In `tests::edited`, before:
+
+   ```rust
+                   1 => trace.ran.0[i as usize / 64] ^= 1 << (i % 64),
+                   2 if trace.has.get(i) => trace.has.0[i as usize / 64] &= !(1 << (i % 64)),
+   ```
+
+   after:
+
+   ```rust
+                   1 => trace.ran.set(i, !trace.ran.contains(i)),
+                   2 if trace.has.contains(i) => {
+                       trace.has.remove(i);
+                   }
+   ```
+
+3. `crates/blaze-v2-proof/src/wire.rs`: imports, before:
+
+   ```rust
+   use blaze_ids::{ContentId, Fingerprint};
+   ```
+
+   ```rust
+   use crate::{
+       Bits, Trace,
+       join::{self, Columns},
+   };
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::{
+       ContentId, Fingerprint,
+       bits::{self, BitSet},
+   };
+   ```
+
+   ```rust
+   use crate::{
+       Trace,
+       join::{self, Columns},
+   };
+   ```
+
+   `fn bit` stays a reader of the mapped little-endian words (unaligned `[u8; 8]`s, not
+   `&[u64]`), its arithmetic from `bits`. Before:
+
+   ```rust
+   fn bit(words: &[[u8; 8]], i: usize) -> bool {
+       (u64::from_le_bytes(words[i / 64]) >> (i % 64)) & 1 == 1
+   }
+   ```
+
+   after:
+
+   ```rust
+   /// Bit `i` of mapped little-endian words, which need not be aligned for a `BitSlice`.
+   fn bit(words: &[[u8; 8]], i: usize) -> bool {
+       let (word, mask) = bits::locate(i);
+       u64::from_le_bytes(words[word]) & mask != 0
+   }
+   ```
+
+   `View::check`: `let words = n.div_ceil(64);` becomes `let words = bits::words_for(n);`.
+
+   `View::to_trace`, before:
+
+   ```rust
+           let words = |column: &[[u8; 8]]| -> Bits { Bits(column.iter().map(|w| u64::from_le_bytes(*w)).collect()) };
+   ```
+
+   after:
+
+   ```rust
+           let words = |column: &[[u8; 8]]| -> BitSet<u32> {
+               BitSet::from_words(column.iter().map(|w| u64::from_le_bytes(*w)).collect())
+           };
+   ```
+
+   `impl Serialize for Trace`, before:
+
+   ```rust
+           let words = |bits: &Bits| bits.0.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+   ```
+
+   after:
+
+   ```rust
+           let words = |set: &BitSet<u32>| set.words().iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+   ```
+
+4. `crates/blaze-v2-proof/src/nameres.rs`: in `differ`, `before.has.get(i as u32)` and
+   `after.has.get(i as u32)` become `before.has.contains(i as u32)` and
+   `after.has.contains(i as u32)`; (~line 248) `!incremental.ran.get(i)` becomes
+   `!incremental.ran.contains(i)`.
+
+5. `crates/blaze-v2-proof/src/bench.rs`: imports, before:
+
+   ```rust
+   use blaze_ids::{ContentId, Fingerprint};
+   use blaze_query::{QueryKey, QueryKind};
+   use blaze_v2_proof::{Bits, Rng, Trace, bytes, join, wire::View};
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::{ContentId, Fingerprint, bits::BitSet};
+   use blaze_query::{QueryKey, QueryKind};
+   use blaze_v2_proof::{Rng, Trace, bytes, join, wire::View};
+   ```
+
+   before:
+
+   ```rust
+       let mut has = Bits::with_len(n);
+       let mut ran = Bits::with_len(n);
+       for i in 0..n as u32 {
+           has.set(i);
+           if rng.below(100) == 0 {
+               ran.set(i);
+           }
+       }
+   ```
+
+   after:
+
+   ```rust
+       let mut has = BitSet::<u32>::new(n);
+       let mut ran = BitSet::<u32>::new(n);
+       for i in 0..n as u32 {
+           has.insert(i);
+           if rng.below(100) == 0 {
+               ran.insert(i);
+           }
+       }
+   ```
+
+6. `crates/blaze-v2-proof/src/tests.rs`: delete the test `bits_cross_word_boundaries` (moved
+   to blaze-ids). `assert!(!trace.ran.get(two));` becomes `assert!(!trace.ran.contains(two));`.
+   In `mod model`: `use blaze_ids::Fingerprint;` becomes
+   `use blaze_ids::{Fingerprint, bits::BitSet};` and `use crate::{Apart, Bits, Stale, Trace, Work};`
+   becomes `use crate::{Apart, Stale, Trace, Work};`; `has: Bits::with_len(n),` /
+   `ran: Bits::with_len(n),` become `has: BitSet::new(n),` / `ran: BitSet::new(n),`;
+   `trace.has.set(i as u32);` / `trace.ran.set(i as u32);` become `trace.has.insert(i as u32);` /
+   `trace.ran.insert(i as u32);`; `if !incremental.ran.get(j)` becomes
+   `if !incremental.ran.contains(j)` and `.filter(|_| after.ran.get(i))` becomes
+   `.filter(|_| after.ran.contains(i))`.
+
+7. `crates/blaze-ui/src/api.rs` (lane ci; its test of a trace read back, ~line 529):
+   `assert!(trace.ran.get(1) && !trace.ran.get(0));` becomes
+   `assert!(trace.ran.contains(1) && !trace.ran.contains(0));`.
+
+Status: open

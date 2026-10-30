@@ -9,6 +9,7 @@
 //! a trait's method may be to a `const` impl, which rustc decides by its const conditions,
 //! and is left alone. An intrinsic not declared `const` is refused as rustc refuses it.
 
+use base_db::Db;
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
     expr_store::Body,
@@ -60,7 +61,7 @@ impl ConstContext {
 /// The const context `def`'s body is, if it is one: a `const fn` (not one of a trait or of a
 /// trait's `impl`, which rustc checks by the trait's constness), a `const`, a `static` or an
 /// enum discriminant.
-pub fn const_context(db: &dyn HirDatabase, def: DefWithBodyId) -> Option<ConstContext> {
+pub fn const_context(db: &Db, def: DefWithBodyId) -> Option<ConstContext> {
     match def {
         DefWithBodyId::FunctionId(func) => {
             if !FunctionSignature::of(db, func).is_const() || of_a_trait(db, func) {
@@ -74,7 +75,7 @@ pub fn const_context(db: &dyn HirDatabase, def: DefWithBodyId) -> Option<ConstCo
 }
 
 /// Whether `func` is a trait's method or one of an `impl` of a trait.
-pub(crate) fn of_a_trait(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub(crate) fn of_a_trait(db: &Db, func: FunctionId) -> bool {
     match func.lookup(db).container {
         ItemContainerId::TraitId(_) => true,
         ItemContainerId::ImplId(it) => ImplSignature::of(db, it).target_trait.is_some(),
@@ -84,7 +85,7 @@ pub(crate) fn of_a_trait(db: &dyn HirDatabase, func: FunctionId) -> bool {
 
 /// What rustc's const checker reports in `def`'s body, when it is a const context.
 #[salsa::tracked(returns(ref))]
-pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCheck {
+pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
     let mut result = ConstCheck::default();
     let Some(kind) = const_context(db, def) else { return result };
     if let DefWithBodyId::FunctionId(func) = def
@@ -118,6 +119,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                     report(
                         "",
                         statement.span,
+                        // alloc: the text of a diagnostic, made when it is reported
                         "pointers cannot be cast to integers during const eval".to_owned(),
                     );
                 }
@@ -134,6 +136,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                     report(
                         "",
                         statement.span,
+                        // alloc: the text of a diagnostic, made when it is reported
                         "pointers cannot be reliably compared during const eval".to_owned(),
                     );
                 }
@@ -141,6 +144,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                     report(
                         "E0015",
                         statement.span,
+                        // alloc: the text of a diagnostic, made when it is reported
                         format!("inline assembly is not allowed in {}", kind.plural()),
                     );
                 }
@@ -154,18 +158,19 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
         };
         let Some(expr) = written(terminator.span) else { continue };
         match operand_ty(body, func) {
-            Some(TyKind::FnPtr(..)) if matches!(store[expr], Expr::Call { .. }) => {
+            Some(TyKind::FnPtr(..)) if matches!(store.expr(expr), Expr::Call { .. }) => {
                 report(
                     "",
                     terminator.span,
+                    // alloc: the text of a diagnostic, made when it is reported
                     format!("function pointer calls are not allowed in {}", kind.plural()),
                 );
             }
             Some(TyKind::FnDef(callee, _)) => {
                 let CallableDefId::FunctionId(callee) = callee.0 else { continue };
                 // The function the source calls, and not one lowering calls for it.
-                let called = match &store[expr] {
-                    Expr::Call { callee: path, .. } => match infer.expr_ty(*path).kind() {
+                let called = match store.expr(expr) {
+                    Expr::Call { callee: path, .. } => match infer.expr_ty(path).kind() {
                         TyKind::FnDef(it, _) => it.0 == CallableDefId::FunctionId(callee),
                         _ => false,
                     },
@@ -183,6 +188,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                     report(
                         "",
                         terminator.span,
+                        // alloc: the text of a diagnostic, made when it is reported
                         format!(
                             "cannot call non-const intrinsic `{intrinsic}` in {}",
                             kind.plural()
@@ -194,6 +200,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                 report(
                     "E0015",
                     terminator.span,
+                    // alloc: the text of a diagnostic, made when it is reported
                     format!("cannot call non-const {descr} `{path}` in {}", kind.plural()),
                 );
             }
@@ -205,7 +212,7 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
 
 /// Whether `func` is written with `#[rustc_do_not_const_check]`, whose body rustc does not
 /// check: core's `panic!` makes such a `const fn` in the body it is written in.
-fn not_const_checked(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn not_const_checked(db: &Db, func: FunctionId) -> bool {
     use hir_def::src::HasSource;
     use syntax::ast::HasAttrs;
     let source = func.lookup(db).source(db);
@@ -224,7 +231,7 @@ fn not_const_checked(db: &dyn HirDatabase, func: FunctionId) -> bool {
 ///
 /// A comptime function called from a `const fn` is accepted too, where rustc may refuse it: this
 /// check reports only what rustc reports.
-fn is_const_callable(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn is_const_callable(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).is_const()
         || of_a_trait(db, func)
         || hir_def::attrs::AttrFlags::has_word(db, func.into(), "rustc_comptime")
@@ -233,7 +240,7 @@ fn is_const_callable(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// How rustc's message names the function called: `function`, `method` or `associated
 /// function`, and its path, which leaves out the crate when it is the caller's.
 fn described(
-    db: &dyn HirDatabase,
+    db: &Db,
     caller: DefWithBodyId,
     func: FunctionId,
 ) -> (&'static str, String) {
@@ -249,12 +256,16 @@ fn described(
             let ty = super::type_name::rustc_type_name(db, self_ty)
                 .map(|it| {
                     let bare = it.split('<').next().unwrap_or(&it);
+                    // alloc: the text of a diagnostic, made when it is reported
                     bare.rsplit("::").next().unwrap_or(bare).to_owned()
                 })
+                // alloc: the text of a diagnostic, made when it is reported
                 .unwrap_or_else(|| "_".to_owned());
+            // alloc: the text of a diagnostic, made when it is reported
             (descr, format!("{ty}::{name}"))
         }
         _ => {
+            // alloc: the text of a diagnostic, made when it is reported
             let mut segments = vec![name.to_owned()];
             let mut module = func.module(db);
             loop {
@@ -263,11 +274,13 @@ fn described(
                     if krate != caller.module(db).krate(db)
                         && let Some(it) = krate.extra_data(db).display_name.as_ref()
                     {
+                        // alloc: the text of a diagnostic, made when it is reported
                         segments.push(it.crate_name().as_str().to_owned());
                     }
                     break;
                 };
                 if let Some(it) = module.name(db) {
+                    // alloc: the text of a diagnostic, made when it is reported
                     segments.push(it.as_str().to_owned());
                 }
                 module = parent;

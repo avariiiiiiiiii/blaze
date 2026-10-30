@@ -73,7 +73,7 @@ struct Macro {
 
 struct ValidFn<'item> {
     db_ident: &'item syn::Ident,
-    db_path: &'item syn::Path,
+    db_ty: DbType<'item>,
 }
 
 const ALLOWED_RETURN_MODES: &[&str] = &["copy", "clone", "ref", "deref", "as_ref", "as_deref"];
@@ -81,7 +81,8 @@ const ALLOWED_RETURN_MODES: &[&str] = &["copy", "clone", "ref", "deref", "as_ref
 #[allow(non_snake_case)]
 impl Macro {
     fn try_fn(&self, item: syn::ItemFn) -> syn::Result<TokenStream> {
-        let ValidFn { db_ident, db_path } = self.validity_check(&item)?;
+        let ValidFn { db_ident, db_ty } = self.validity_check(&item)?;
+        let (db_view, register_downcaster) = db_ty.view_and_downcaster();
 
         let attrs = &item.attrs;
         let fn_name = &item.sig.ident;
@@ -93,6 +94,7 @@ impl Macro {
         let interned_input_tys = input_tys
             .iter()
             .map(|&ty| with_db_lifetime(ty))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect::<Vec<_>>();
         let output_ty = with_db_lifetime(&self.output_ty(&db_lt, &item)?);
         let (cycle_recovery_fn, cycle_recovery_initial, cycle_recovery_strategy) =
@@ -149,6 +151,7 @@ impl Macro {
             }
         };
 
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         let mut inner_fn = item.clone();
         inner_fn.attrs.retain_mut(fn_util::retain_body_attr);
         inner_fn.vis = syn::Visibility::Inherited;
@@ -209,16 +212,19 @@ impl Macro {
         let return_mode = self
             .args
             .returns
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             .clone()
             .unwrap_or(Ident::new("ref", Span::call_site()));
 
         // Validate return mode
         if !ALLOWED_RETURN_MODES
             .iter()
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .any(|mode| mode == &return_mode.to_string())
         {
             return Err(syn::Error::new(
                 return_mode.span(),
+                // alloc: proc macro, at expansion time once per annotated item; no query runs this
                 format!("Invalid return mode. Allowed modes are: {ALLOWED_RETURN_MODES:?}"),
             ));
         }
@@ -236,6 +242,7 @@ impl Macro {
                 .map(|input_ty| {
                     crate::salsa_value::assert_salsa_value_field(&db_lt, &zalsa, input_ty, false)
                 })
+                // alloc: proc macro, at expansion time once per annotated item; no query runs this
                 .collect()
         } else {
             quote! {}
@@ -252,7 +259,8 @@ impl Macro {
                 vis: #vis,
                 fn_name: #fn_name,
                 db_lt: #db_lt,
-                Db: #db_path,
+                DbView: #db_view,
+                register_downcaster: #register_downcaster,
                 db: #db_ident,
                 input_ids: [#(#input_ids),*],
                 input_tys: [#(#input_tys),*],
@@ -297,10 +305,10 @@ impl Macro {
             ));
         }
 
-        let (db_ident, db_path) =
+        let (db_ident, db_ty) =
             check_db_argument(&item.sig.inputs[0], item.sig.generics.lifetimes().next())?;
 
-        Ok(ValidFn { db_ident, db_path })
+        Ok(ValidFn { db_ident, db_ty })
     }
 
     fn cycle_recovery(&self) -> syn::Result<(TokenStream, TokenStream, TokenStream)> {
@@ -376,7 +384,7 @@ fn function_type(item_fn: &syn::ItemFn) -> FunctionType {
 pub fn check_db_argument<'arg>(
     fn_arg: &'arg syn::FnArg,
     explicit_lt: Option<&'arg syn::LifetimeParam>,
-) -> syn::Result<(&'arg syn::Ident, &'arg syn::Path)> {
+) -> syn::Result<(&'arg syn::Ident, DbType<'arg>)> {
     match fn_arg {
         syn::FnArg::Receiver(_) => {
             // If we see `&self` where a database was expected, that indicates
@@ -431,7 +439,9 @@ pub fn check_db_argument<'arg>(
             }
 
             let tykind_error_msg =
-                "must have type `&dyn Db`, where `Db` is some Salsa Database trait";
+                // dyn: proc macro, at expansion time once per annotated item; no query runs this
+                "must have type `&dyn Db`, where `Db` is some Salsa Database trait, or `&Db`, \
+                 where `Db` is a `#[salsa::db]` struct";
 
             let syn::Type::Reference(ref_type) = &*typed.ty else {
                 return Err(syn::Error::new(typed.ty.span(), tykind_error_msg));
@@ -442,17 +452,22 @@ pub fn check_db_argument<'arg>(
             {
                 return Err(syn::Error::new_spanned(
                     ref_type.and_token,
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     format!("must have a `{}` lifetime", lt.lifetime.to_token_stream()),
                 ));
             }
 
-            let extract_db_path = || -> Result<&'arg syn::Path, Span> {
+            let extract_db_path = || -> Result<DbType<'arg>, Span> {
                 if let Some(m) = &ref_type.mutability {
                     return Err(m.span());
                 }
 
-                let syn::Type::TraitObject(d) = &*ref_type.elem else {
-                    return Err(ref_type.span());
+                let d = match &*ref_type.elem {
+                    syn::Type::TraitObject(d) => d,
+                    syn::Type::Path(syn::TypePath { qself: None, path }) => {
+                        return Ok(DbType::Concrete(path));
+                    }
+                    _ => return Err(ref_type.span()),
                 };
 
                 if d.bounds.len() != 1 {
@@ -482,13 +497,40 @@ pub fn check_db_argument<'arg>(
                     return Err(lt.span());
                 }
 
-                Ok(path)
+                Ok(DbType::Dyn(path))
             };
 
-            let db_path =
+            let db_ty =
                 extract_db_path().map_err(|span| syn::Error::new(span, tykind_error_msg))?;
 
-            Ok((db_ident, db_path))
+            Ok((db_ident, db_ty))
+        }
+    }
+}
+
+/// The type behind a tracked function's database parameter.
+#[derive(Copy, Clone)]
+pub enum DbType<'arg> {
+    /// `&dyn Trait` for a `#[salsa::db]` trait.
+    Dyn(&'arg syn::Path),
+    /// `&Db` for a `#[salsa::db]` struct: the calls on it are static.
+    Concrete(&'arg syn::Path),
+}
+
+impl DbType<'_> {
+    /// The database type, as `Configuration::DbView`, and the path of the function that
+    /// registers its downcaster, which takes `&DbView`.
+    fn view_and_downcaster(self) -> (TokenStream, TokenStream) {
+        match self {
+            DbType::Dyn(path) => (
+                // dyn: proc macro, at expansion time once per annotated item; no query runs this
+                quote!(dyn #path),
+                quote!(#path::zalsa_register_downcaster),
+            ),
+            DbType::Concrete(path) => (
+                quote!(#path),
+                quote!(salsa::plumbing::ConcreteView::zalsa_register_concrete_downcaster),
+            ),
         }
     }
 }

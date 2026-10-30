@@ -33,6 +33,7 @@ struct LaneIds {
 
 /// The lane indices of the process: a thread takes one when it first copies in and gives it
 /// back when it ends, so the lanes in use stay as many as the threads.
+// alloc: none: an empty `Vec` in a static; it grows by one a thread.
 static LANE_IDS: ShortLock<LaneIds> = ShortLock::new(LaneIds { next: 0, free: Vec::new() });
 
 struct Lane(u32);
@@ -85,6 +86,7 @@ impl<T: Default> Lanes<T> {
 
     pub(crate) fn get(&self, lane: u32) -> &T {
         let (chunk, at) = lane_place(lane);
+        // alloc: once a chunk of lanes, made when its first lane asks.
         &self.chunks[chunk].get_or_init(|| (0..LANE_FIRST << chunk).map(|_| T::default()).collect())[at]
     }
 
@@ -119,6 +121,7 @@ impl Segment {
         // SAFETY: `layout` has a nonzero size.
         let base = unsafe { alloc::alloc(layout) };
         let base = NonNull::new(base).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        // alloc: one header a segment (16 KiB to 4 MiB of copies), freed with it.
         Box::new(Segment { base, cap, holds: AtomicI64::new(holds), sealed: AtomicBool::new(sealed) })
     }
 }

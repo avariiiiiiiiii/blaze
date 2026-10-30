@@ -8,7 +8,7 @@ use std::{
     ops::Range,
 };
 
-use base_db::{ConstEvalBudget, Crate};
+use base_db::{Db, ConstEvalBudget, Crate};
 use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -60,7 +60,7 @@ use crate::{
 use super::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, LocalId, MirBody, MirPhase, MirSpan,
     Operand, OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, Statement, StatementKind,
-    StoredPlace, TerminatorKind, UnOp, return_slot,
+    StoredPlace, Terminator, TerminatorKind, UnOp, return_slot,
 };
 use super::{Budget, IsSigned, MirEvalError, VTableMap, pad16};
 
@@ -127,6 +127,7 @@ where
 
 macro_rules! not_supported {
     ($it: expr) => {
+        // alloc: error path
         return Err($crate::mir::MirEvalError::NotSupported(format!($it)))
     };
 }
@@ -141,33 +142,6 @@ impl<'db> VTableOfBytes<'db> for VTableMap<'db> {
     fn ty_of_bytes(&self, bytes: &[u8]) -> Result<'db, Ty<'db>> {
         let id = from_bytes!(usize, bytes);
         self.ty(id)
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct TlsData {
-    keys: Vec<u128>,
-}
-
-impl TlsData {
-    fn create_key(&mut self) -> usize {
-        self.keys.push(0);
-        self.keys.len() - 1
-    }
-
-    fn get_key(&mut self, key: usize) -> Result<'static, u128> {
-        let r = self.keys.get(key).ok_or_else(|| {
-            MirEvalError::UndefinedBehavior(format!("Getting invalid tls key {key}"))
-        })?;
-        Ok(*r)
-    }
-
-    fn set_key(&mut self, key: usize, value: u128) -> Result<'static, ()> {
-        let r = self.keys.get_mut(key).ok_or_else(|| {
-            MirEvalError::UndefinedBehavior(format!("Setting invalid tls key {key}"))
-        })?;
-        *r = value;
-        Ok(())
     }
 }
 
@@ -224,6 +198,24 @@ impl<'db> StackFrame<'db> {
 /// The function a frame runs and the span of its call, for errors.
 type Running<'db> = (Option<FunctionId>, (MirSpan, InferBodyId<'db>));
 
+/// How a frame stopped running.
+enum Ran<'db> {
+    /// It called this frame, which runs next.
+    Called(StackFrame<'db>),
+    Returned,
+    /// Its cleanup ended in `UnwindResume`: the panic unwinds out of it.
+    Resume,
+    /// Its thread gives way: to this one, or (`None`) to the one the machine picks, as the
+    /// running one blocked.
+    Switch(Option<EvalThread>),
+}
+
+/// An error out of a frame's statement (its index in the block) or (`None`) terminator.
+struct Raised<'db> {
+    error: MirEvalError<'db>,
+    statement: Option<usize>,
+}
+
 #[derive(Clone)]
 enum MirOrDynIndex<'db> {
     Mir(&'db MirBody<'db>),
@@ -254,6 +246,9 @@ enum Origin {
     /// `const_allocate`, freed by `const_deallocate`. A constant's value may point to it once
     /// `const_make_global` has made it global.
     ConstHeap { global: bool },
+    /// The thread shims' (anonymous `mmap`, `errno` cells, dispatch semaphores), freed only
+    /// by their shims (`munmap`, `dispatch_release`).
+    Machine,
 }
 
 impl Origin {
@@ -262,6 +257,7 @@ impl Origin {
             Origin::Evaluator => MemKind::Global,
             Origin::Allocator => MemKind::Rust,
             Origin::ConstHeap { .. } => MemKind::ConstHeap,
+            Origin::Machine => MemKind::Machine,
         }
     }
 }
@@ -269,11 +265,15 @@ impl Origin {
 /// A block of the heap: the size and alignment it was asked for, the bytes it takes, of a
 /// size class ([`size_class`]) a freed block of the same class and alignment is reused for,
 /// and what made it.
-/// What is left of a drop ([`Evaluator::run_drop_glue_deep`]).
+/// What is left of a drop ([`Evaluator::run_drop_glue`]).
 enum DropStep<'db> {
     /// The drop glue of a value: its type, where it is, and its metadata if unsized.
     Glue(Ty<'db>, Address, Vec<u8>),
-    /// The `Drop` impl of a `Box`, once what it points to is dropped.
+    /// The parts of an ADT, once its `Drop` impl ran: read then, as the impl may change
+    /// them (an enum's variant).
+    Fields(Ty<'db>, Address, Vec<u8>),
+    /// The `Drop` impl of a value: an ADT's before its parts, a `Box`'s once what it points
+    /// to is dropped.
     DropImpl(Ty<'db>, Address),
 }
 
@@ -307,7 +307,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// The checker of undefined behavior the run reports to; [`Plain`] for none.
     machine: Hooks<M>,
     provs: RefCell<Provs<M::Prov>>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     param_env: ParamEnvAndCrate<'db>,
     target_data_layout: &'db TargetDataLayout,
     stack: Vec<u8>,
@@ -349,8 +349,8 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     at_exit: Vec<(usize, Address)>,
     /// The running thread's `#[thread_local]` statics, as [`Self::static_locations`].
     thread_statics: FxHashMap<StaticId, Address>,
-    /// Every pthread key made.
-    tls_keys: Vec<threads::TlsKey>,
+    /// What the thread shims keep for the whole process: pthread keys, signal actions.
+    process: shim::Process,
     /// The virtual clock, in nanoseconds since the run started.
     clock: u64,
     /// Waits made so far, which orders a futex's waiters.
@@ -361,6 +361,11 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     call_then: Then,
     /// The frame a shim made of the call being made (`drop_in_place`, `const_eval_select`).
     pending: Option<StackFrame<'db>>,
+    /// The places of the call being made's `Operand::Move` arguments, which the callee's
+    /// frame protects ([`Machine::protect`]); kept only with checks.
+    moved_args: Vec<Interval>,
+    /// A panic left the run of [`Self::interpret_mir`] being ended, with its frames on it.
+    escaped: bool,
     /// The `#[panic_handler]` of the crate graph, once looked for.
     panic_handler: std::cell::OnceCell<Option<FunctionId>>,
     /// Stores the global location of the statics. We const evaluate every static first time we need it
@@ -383,7 +388,7 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// store the type as an interned id in place of function and vtable pointers, and we recover back the type at the
     /// time of use.
     vtable_map: VTableMap<'db>,
-    thread_local_storage: TlsData,
+    thread_local_storage: shim::TlsData,
     random_state: oorandom::Rand64,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -674,7 +679,7 @@ impl MirOutput {
 }
 
 pub fn interpret_mir<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &'db MirBody<'db>,
     // FIXME: This is workaround. Ideally, const generics should have a separate body (issue #7434), but now
     // they share their body with their parent, so in MIR lowering we have locals of the parent body, which
@@ -703,7 +708,7 @@ pub fn interpret_mir<'db>(
 /// Runs `func`, a function of no arguments and no generics (a `#[test]`), with `machine`
 /// watching, and asks it to `finish` once the main thread returns.
 pub fn run_function<'db, M: Machine<'db>>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     machine: M,
 ) -> (Result<'db, ()>, MirOutput, M) {
@@ -718,6 +723,7 @@ pub fn run_function<'db, M: Machine<'db>>(
     ) {
         Ok(body) => body,
         Err(e) => {
+            // alloc: error path
             let output = MirOutput { stdout: Vec::new(), stderr: Vec::new() };
             return (Err(MirEvalError::MirLowerError(func, e)), output, machine);
         }
@@ -726,6 +732,7 @@ pub fn run_function<'db, M: Machine<'db>>(
         match Evaluator::with_machine(db, body.owner, false, Some(env), machine) {
             Ok(it) => it,
             Err((e, machine)) => {
+                // alloc: error path
                 let output = MirOutput { stdout: Vec::new(), stderr: Vec::new() };
                 return (Err(e), output, machine);
             }
@@ -733,6 +740,7 @@ pub fn run_function<'db, M: Machine<'db>>(
     let called = Some((func, MirSpan::Unknown, body.owner));
     let result = evaluator
         .interpret_mir(body, iter::empty(), called)
+        .and_then(|_| evaluator.main_returned(body))
         .and_then(|_| evaluator.machine.finish());
     let output = MirOutput {
         stdout: mem::take(&mut evaluator.stdout),
@@ -778,7 +786,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
 impl<'db> Evaluator<'db> {
     pub fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         owner: InferBodyId<'db>,
         assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
@@ -791,7 +799,7 @@ impl<'db> Evaluator<'db> {
 impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// An evaluator that reports to `machine`, or gives it back with the error.
     pub fn with_machine(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         owner: InferBodyId<'db>,
         assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
@@ -839,15 +847,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             yielded: false,
             at_exit: Vec::new(),
             thread_statics: FxHashMap::default(),
-            tls_keys: Vec::new(),
+            process: shim::Process::default(),
             clock: 0,
             wait_counter: 0,
             unwinding: None,
             call_then: Then::Nested,
             pending: None,
+            moved_args: Vec::new(),
+            escaped: false,
             panic_handler: std::cell::OnceCell::new(),
             vtable_map: VTableMap::default(),
-            thread_local_storage: TlsData::default(),
+            thread_local_storage: shim::TlsData::default(),
             static_locations: Default::default(),
             static_memory: Vec::new(),
             read_statics: None,
@@ -1026,6 +1036,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let offset = match &layout.variants {
                         Variants::Empty => {
                             return Err(MirEvalError::UndefinedBehavior(
+                                // alloc: error path
                                 "field of an uninhabited type".to_owned(),
                             ));
                         }
@@ -1192,6 +1203,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     Some((Either::Left(f), frame.span.0, frame.span.1))
                 })
                 .collect();
+            // alloc: error path
             MirEvalError::InFunction(Box::new(e), error_stack)
         })
     }
@@ -1207,12 +1219,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.body_running = Some(frame.locals.body);
             match self.run_frame(&mut frame, &mut block) {
                 Ok(Ran::Called(callee)) => {
-                    if self.limits_frames {
-                        let Some(it) = self.stack_depth_limit.checked_sub(1) else {
-                            return Err(MirEvalError::StackOverflow);
-                        };
-                        self.stack_depth_limit = it;
-                    }
+                    self.count_frame()?;
                     frame.at = block;
                     block = callee.locals.body.start_block;
                     self.code_stack.push(frame);
@@ -1294,8 +1301,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             TerminatorKind::Assert { cond, expected, msg, target, .. } => {
                 let cond = self.eval_operand(cond, locals)?;
                 let holds = self.read_scalar(cond)?[0] != 0;
-                let skipped = msg.is_optional_overflow_check() && !self.checks_overflow(locals);
-                if holds != *expected && !skipped {
+                if holds != *expected
+                    && !(msg.is_optional_overflow_check() && !self.checks_overflow(locals))
+                {
                     return Err(MirEvalError::Panic(self.assert_message(msg, locals)?));
                 }
                 *block = *target;
@@ -1328,6 +1336,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             TerminatorKind::Return => return Ok(Some(Ran::Returned)),
             TerminatorKind::Unreachable => {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior("unreachable executed".to_owned()));
             }
             TerminatorKind::Drop { place, target, unwind: _ } => {
@@ -1360,8 +1369,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<Ran<'db>>> {
         let destination_interval = self.place_interval(destination, locals)?;
         let fn_ty = self.operand_ty(func, locals)?;
-        let args_evaluated =
-            args.iter().map(|it| self.operand_ty_and_eval(it, locals)).collect::<Result<'db, Vec<_>>>()?;
+        let args_evaluated = args
+            .iter()
+            .map(|it| self.operand_ty_and_eval(it, locals))
+            .collect::<Result<'db, Vec<_>>>()?;
         if M::CHECKS {
             self.moved_args.clear();
             for (operand, arg) in args.iter().zip(&args_evaluated) {
@@ -1410,19 +1421,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if let Some(callee) = callee.or_else(|| self.pending.take()) {
             return Ok(Some(Ran::Called(callee)));
         }
-        if self.unwinding.is_some() && self.raised_by_shim {
-            self.raised_by_shim = false;
-            return Err(MirEvalError::Panic(String::new()));
-        }
         let Some(target) = target else {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior("Diverging function returned".to_owned()));
         };
         *block = target;
-        if let Some(wait) = self.waiting.take() {
-            if self.block_call(wait, destination_interval)? {
-                return Ok(Some(Ran::Switch(None)));
-            }
-        } else if mem::take(&mut self.yielded) && self.may_switch() {
+        if let Some(wait) = self.waiting.take()
+            && self.block_call(wait, destination_interval)?
+        {
             return Ok(Some(Ran::Switch(None)));
         }
         Ok(None)
@@ -1453,6 +1459,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             }
             Then::Diverges => {
                 return Err(MirEvalError::UndefinedBehavior(
+                    // alloc: error path
                     "Diverging function returned".to_owned(),
                 ));
             }
@@ -1468,6 +1475,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Then::Nested => unreachable!("handled above"),
         }
         Ok(None)
+    }
+
+    /// A frame is pushed above the running one: in a constant's evaluation it counts toward
+    /// the recursion limit, given back as it returns or unwinds.
+    fn count_frame(&mut self) -> Result<'db, ()> {
+        if self.limits_frames {
+            let Some(it) = self.stack_depth_limit.checked_sub(1) else {
+                return Err(MirEvalError::StackOverflow);
+            };
+            self.stack_depth_limit = it;
+        }
+        Ok(())
     }
 
     /// The rest of a drop a frame that returned was a step of, in its caller (the top of
@@ -1489,6 +1508,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let callee = self.drop_steps(drops, &caller.locals, span, then)?;
         let made = callee.is_some();
         if let Some(callee) = callee {
+            self.count_frame()?;
             caller.at = *block;
             *block = callee.locals.body.start_block;
             self.code_stack.push(caller);
@@ -1545,6 +1565,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => RetagMode::Default,
         };
         let size = self.size_of_sized(ty, locals, "the place of an assignment")?;
+        self.typed_copy(addr, ty, size, mode)
+    }
+
+    /// The machine's check of the value of `ty` (of `size` bytes) just copied to `addr`, and
+    /// the retag of what it holds by `mode`.
+    fn typed_copy(&self, addr: Address, ty: Ty<'db>, size: usize, mode: RetagMode) -> Result<'db, ()> {
         let bytes = self.peek_memory(addr, size)?;
         let cx = TypedCx {
             db: self.db,
@@ -1563,7 +1589,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn truncate_stack(&mut self, len: usize) -> Result<'db, ()> {
-        let end = Address::stack(len).to_usize();
+        let end = Address::stack(self.stack_base() + len).to_usize();
         let kept = self.stack_allocations.partition_point(|it| it.start < end);
         if M::CHECKS {
             for allocated in self.stack_allocations[kept..].iter().filter(|it| it.tracked) {
@@ -1625,17 +1651,49 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         marked
     }
 
+    /// A frame of `body` with `locals` starts: the machine sees the call, the protected
+    /// places (the `Operand::Move` arguments, and the return place when `in_place_return`, as
+    /// it is the caller's), and the arguments written to its parameters.
+    fn enter_frame(
+        &mut self,
+        body: &'db MirBody<'db>,
+        locals: &mut Locals<'db>,
+        args: impl Iterator<Item = IntervalOrOwned<M::Shadow>>,
+        in_place_return: bool,
+    ) -> Result<'db, ()> {
+        if M::CHECKS {
+            self.machine.call()?;
+            for moved in mem::take(&mut self.moved_args) {
+                self.machine.protect(self.ptr(moved.addr), moved.size as u64)?;
+            }
+            let ret = locals.ptr[return_slot()];
+            if in_place_return && ret.size != 0 {
+                self.machine.protect(self.ptr(ret.addr), ret.size as u64)?;
+            }
+        }
+        self.fill_locals_for_body(body, locals, args)
+    }
+
     fn fill_locals_for_body(
         &mut self,
         body: &'db MirBody<'db>,
         locals: &mut Locals<'db>,
-        args: impl Iterator<Item = IntervalOrOwned>,
+        args: impl Iterator<Item = IntervalOrOwned<M::Shadow>>,
     ) -> Result<'db, ()> {
         let mut remain_args = body.param_locals.len();
-        for ((_, interval), value) in locals.ptr.iter().skip(1).zip(args) {
-            match value {
-                IntervalOrOwned::Owned(value) => interval.write_from_bytes(self, &value)?,
-                IntervalOrOwned::Borrowed(value) => interval.write_from_interval(self, value)?,
+        for ((local, interval), value) in locals.ptr.iter().skip(1).zip(args) {
+            let interval = *interval;
+            self.copy_from_interval_or_owned(interval.addr, value)?;
+            if M::CHECKS && interval.size != 0 {
+                let cx = TypedCx {
+                    db: self.db,
+                    env: self.param_env,
+                    target: self.target_data_layout,
+                    vtables: &self.vtable_map,
+                };
+                let ty = body.locals[local].ty.as_ref();
+                let bytes = self.peek_memory(interval.addr, interval.size)?;
+                self.machine.typed(&cx, self.ptr(interval.addr), ty, bytes, RetagMode::FnEntry)?;
             }
             if remain_args == 0 {
                 return Err(MirEvalError::InternalError("too many arguments".into()));
@@ -1703,7 +1761,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 let my_ptr = stack_ptr;
                 stack_ptr += size;
-                let addr = Address::stack(my_ptr).aligned(align);
+                let addr = Address::stack(self.stack_base() + my_ptr).aligned(align);
                 locals.ptr.insert(id, Interval { addr, size });
                 self.stack_allocations.push(Allocated {
                     start: addr.to_usize(),
@@ -1723,7 +1781,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let marked = self.storage_marked(body);
             let ids: Vec<LocalId> = locals.ptr.iter().map(|(id, _)| id).collect();
             for id in ids {
-                let in_frame = locals.ptr[id].addr.to_usize() >= Address::stack(prev_stack_pointer).to_usize();
+                let frame_start = Address::stack(self.stack_base() + prev_stack_pointer);
+                let in_frame = locals.ptr[id].addr.to_usize() >= frame_start.to_usize();
                 if !marked.contains(&id) && in_frame {
                     self.set_storage(id, &mut locals, true)?;
                 }
@@ -1835,6 +1894,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let size = if let Some((element, element_align)) = element {
                         if *op != BinOp::Eq {
                             return Err(MirEvalError::NotSupported(
+                                // alloc: error path
                                 "Only eq is builtin for `str` and slices".to_owned(),
                             ));
                         }
@@ -2011,18 +2071,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 BinOp::Mul if wraps => l128.wrapping_mul(r128),
                                 BinOp::Sub if wraps => l128.wrapping_sub(r128),
                                 BinOp::Add => l128.checked_add(r128).ok_or_else(|| {
+                                    // alloc: error path
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
                                 BinOp::Mul => l128.checked_mul(r128).ok_or_else(|| {
+                                    // alloc: error path
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
                                 BinOp::Div => l128.checked_div(r128).ok_or_else(|| {
+                                    // alloc: error path
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
                                 BinOp::Rem => l128.checked_rem(r128).ok_or_else(|| {
+                                    // alloc: error path
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
                                 BinOp::Sub => l128.checked_sub(r128).ok_or_else(|| {
+                                    // alloc: error path
                                     MirEvalError::Panic(format!("Overflow in {op:?}"))
                                 })?,
                                 BinOp::BitAnd => l128 & r128,
@@ -2048,6 +2113,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         _ => unreachable!(),
                                     };
                                     if shift_amount as usize >= lc.len() * 8 {
+                                        // alloc: error path
                                         return Err(MirEvalError::Panic(format!(
                                             "Overflow in {op:?}"
                                         )));
@@ -2056,6 +2122,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         break 'b r;
                                     }
                                 };
+                                // alloc: error path
                                 return Err(MirEvalError::Panic(format!("Overflow in {op:?}")));
                             };
                             Owned(r.to_bytes())
@@ -2365,8 +2432,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, String> {
         Ok(match msg {
             AssertKind::BoundsCheck { len, index } => {
-                let len = from_bytes!(usize, self.eval_operand(len, locals)?.get(self)?);
-                let index = from_bytes!(usize, self.eval_operand(index, locals)?.get(self)?);
+                let len = {
+                    let len = self.eval_operand(len, locals)?;
+                    from_bytes!(usize, self.read_scalar(len)?)
+                };
+                let index = {
+                    let index = self.eval_operand(index, locals)?;
+                    from_bytes!(usize, self.read_scalar(index)?)
+                };
                 format!("index out of bounds: the len is {len} but the index is {index}")
             }
             AssertKind::Overflow(op, ..) => format!("Overflow in {op:?}"),
@@ -2375,8 +2448,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             AssertKind::RemainderByZero(_) => "Overflow in Rem".to_owned(),
             // core's words for the panics of the UB checks (`core::panicking`).
             AssertKind::MisalignedPointerDereference { required, found } => {
-                let required = from_bytes!(usize, self.eval_operand(required, locals)?.get(self)?);
-                let found = from_bytes!(usize, self.eval_operand(found, locals)?.get(self)?);
+                let required = {
+                    let required = self.eval_operand(required, locals)?;
+                    from_bytes!(usize, self.read_scalar(required)?)
+                };
+                let found = {
+                    let found = self.eval_operand(found, locals)?;
+                    from_bytes!(usize, self.read_scalar(found)?)
+                };
                 format!(
                     "misaligned pointer dereference: address must be a multiple of {required:#x} but is {found:#x}"
                 )
@@ -2384,7 +2463,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             AssertKind::NullPointerDereference => "null pointer dereference occurred".to_owned(),
             AssertKind::NullReferenceConstructed => "null reference produced".to_owned(),
             AssertKind::InvalidEnumConstruction(source) => {
-                let source = from_bytes!(u128, self.eval_operand(source, locals)?.get(self)?);
+                let source = {
+                    let source = self.eval_operand(source, locals)?;
+                    u128::from_le_bytes(pad16(self.read_scalar(source)?, IsSigned::No))
+                };
                 format!("trying to construct an enum from an invalid value {source:#x}")
             }
         })
@@ -2400,6 +2482,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         };
         match &layout.variants {
             Variants::Empty => Err(MirEvalError::UndefinedBehavior(
+                // alloc: error path
                 "reading the discriminant of an uninhabited enum".to_owned(),
             )),
             Variants::Single { index } => {
@@ -2633,6 +2716,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Some(it) => it.copy_from_slice(&value.to_le_bytes()[0..size]),
                 None => {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!(
                             "encoded tag ({offset}, {size}, {value}) is out of bounds 0..{size}"
                         )
@@ -2648,6 +2732,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Some(it) => it.copy_from_slice(op),
                 None => {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("field offset ({offset}) is out of bounds 0..{size}").into(),
                     ));
                 }
@@ -2680,6 +2765,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Some(it) => it.copy_from_slice(&value.to_le_bytes()[0..tag_size]),
                 None => {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!(
                             "encoded tag ({offset}, {tag_size}, {value}) is out of bounds 0..{size}"
                         )
@@ -2697,6 +2783,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 Some(it) => it.copy_from_slice(bytes),
                 None => {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!("field offset ({offset}) is out of bounds 0..{size}").into(),
                     ));
                 }
@@ -2923,6 +3010,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     self.write_memory(ref_addr.offset(self.ptr_size()), &len[..self.ptr_size()])?;
                     Ok(Interval::new(ref_addr, self.ptr_size() * 2))
                 }
+                // dyn: error path
                 TyKind::Dynamic(..) => not_supported!("`dyn Trait` consts not supported yet"),
                 _ => {
                     let inner_addr = self.allocate_valtree_in_heap(inner_ty, valtree, locals)?;
@@ -3011,12 +3099,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     GeneralConstId::ConstId(const_id) => {
                         self.db.const_eval(const_id, subst, Some(self.param_env)).map_err(|e| {
                             let name = id.name(self.db);
+                            // alloc: error path
                             MirEvalError::ConstEvalError(name, Box::new(e))
                         })?
                     }
                     GeneralConstId::StaticId(static_id) => {
                         self.db.const_eval_static(static_id).map_err(|e| {
                             let name = id.name(self.db);
+                            // alloc: error path
                             MirEvalError::ConstEvalError(name, Box::new(e))
                         })?
                     }
@@ -3025,6 +3115,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         .anon_const_eval(anon_const_id, subst, Some(self.param_env))
                         .map_err(|e| {
                             let name = id.name(self.db);
+                            // alloc: error path
                             MirEvalError::ConstEvalError(name, Box::new(e))
                         })?,
                 };
@@ -3064,6 +3155,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         )
         .map_err(|e| {
             let name = GeneralConstId::AnonConstId(konst).name(self.db);
+            // alloc: error path
             MirEvalError::ConstEvalError(name, Box::new(ConstEvalError::MirLowerError(e)))
         })?;
         let mark = self.stack.len();
@@ -3073,7 +3165,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let addr = self.heap_allocate(result.size, align)?;
         let interval = Interval::new(addr, result.size);
         interval.write_from_interval(self, result)?;
-        self.free_stack(mark);
+        self.free_stack(mark)?;
         Ok(interval)
     }
 
@@ -3216,19 +3308,31 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if size == 0 {
             return Ok(&[]);
         }
-        let (mem, pos) = match addr.at() {
-            Stack(it) => (&self.stack, it),
+        let (mem, pos): (&[u8], usize) = match addr.at() {
+            Stack(it) => {
+                let (t, pos) = threads::stack_position(it);
+                let Some(region) = threads::region(&self.stack, &self.threads, self.thread, t)
+                else {
+                    // alloc: error path
+                    return Err(MirEvalError::UndefinedBehavior(format!(
+                        "read of the stack of thread {t}, which was never made"
+                    )));
+                };
+                (region, pos)
+            }
             Heap(it) => {
                 self.check_static_is_evaluated(it, size)?;
                 (&self.heap, it)
             }
             Invalid(it) => {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "read invalid memory address {it} with size {size}"
                 )));
             }
         };
         mem.get(pos..pos + size)
+            // alloc: error path
             .ok_or_else(|| MirEvalError::UndefinedBehavior("out of bound memory read".to_owned()))
     }
 
@@ -3254,6 +3358,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .chain(&self.unevaluated_statics)
             .find(|&&(start, len, _)| pos < start + len && start < pos + size);
         let Some(&(.., id)) = written else { return Ok(()) };
+        // alloc: error path
         Err(MirEvalError::UndefinedBehavior(format!(
             "modifying the initial value of static `{}` from a static's initializer",
             StaticSignature::of(self.db, id).name.as_str()
@@ -3283,15 +3388,29 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.check_static_write(pos, size)?;
         }
         let (mem, pos) = match addr.at() {
-            Stack(it) => (&mut self.stack, it),
+            Stack(it) => {
+                let (t, pos) = threads::stack_position(it);
+                let running = self.thread;
+                let Some(region) =
+                    threads::region_mut(&mut self.stack, &mut self.threads, running, t)
+                else {
+                    // alloc: error path
+                    return Err(MirEvalError::UndefinedBehavior(format!(
+                        "write of the stack of thread {t}, which was never made"
+                    )));
+                };
+                (region, pos)
+            }
             Heap(it) => (&mut self.heap, it),
             Invalid(it) => {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "write invalid memory address {it} with size {size}"
                 )));
             }
         };
         mem.get_mut(pos..pos + size)
+            // alloc: error path
             .ok_or_else(|| MirEvalError::UndefinedBehavior("out of bound memory write".to_owned()))
     }
 
@@ -3398,7 +3517,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let align = addr.align().max(r.addr.align());
             self.machine.copy(self.ptr(addr), self.ptr(r.addr), r.size as u64, align, true)?;
         }
+        self.move_memory(addr, r)
+    }
 
+    /// The bytes of `r` moved to `addr`, which may overlap them, unseen by the machine: what
+    /// a copy does once the machine saw it.
+    fn move_memory(&mut self, addr: Address, r: Interval) -> Result<'db, ()> {
+        if r.size == 0 {
+            return Ok(());
+        }
+        // alloc: error path
         let oob = || MirEvalError::UndefinedBehavior("out of bounds memory write".to_owned());
 
         if let Heap(src) = r.addr.at() {
@@ -3407,12 +3535,29 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if let Heap(dst) = addr.at() {
             self.check_static_write(dst, r.size)?;
         }
+        let running = self.thread;
         match (addr.at(), r.addr.at()) {
             (Stack(dst), Stack(src)) => {
-                if self.stack.len() < src + r.size || self.stack.len() < dst + r.size {
-                    return Err(oob());
+                let ((dst_thread, dst), (src_thread, src)) =
+                    (threads::stack_position(dst), threads::stack_position(src));
+                if dst_thread == src_thread {
+                    let stack =
+                        threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
+                            .ok_or_else(oob)?;
+                    if stack.len() < src + r.size || stack.len() < dst + r.size {
+                        return Err(oob());
+                    }
+                    stack.copy_within(src..src + r.size, dst)
+                } else {
+                    let bytes = threads::region(&self.stack, &self.threads, running, src_thread)
+                        .and_then(|it| it.get(src..src + r.size))
+                        .ok_or_else(oob)?
+                        .to_vec();
+                    threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
+                        .and_then(|it| it.get_mut(dst..dst + r.size))
+                        .ok_or_else(oob)?
+                        .copy_from_slice(&bytes);
                 }
-                self.stack.copy_within(src..src + r.size, dst)
             }
             (Heap(dst), Heap(src)) => {
                 if self.heap.len() < src + r.size || self.heap.len() < dst + r.size {
@@ -3421,18 +3566,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.heap.copy_within(src..src + r.size, dst)
             }
             (Stack(dst), Heap(src)) => {
-                self.stack
-                    .get_mut(dst..dst + r.size)
+                let (dst_thread, dst) = threads::stack_position(dst);
+                threads::region_mut(&mut self.stack, &mut self.threads, running, dst_thread)
+                    .and_then(|it| it.get_mut(dst..dst + r.size))
                     .ok_or_else(oob)?
                     .copy_from_slice(self.heap.get(src..src + r.size).ok_or_else(oob)?);
             }
             (Heap(dst), Stack(src)) => {
-                self.heap
-                    .get_mut(dst..dst + r.size)
-                    .ok_or_else(oob)?
-                    .copy_from_slice(self.stack.get(src..src + r.size).ok_or_else(oob)?);
+                let (src_thread, src) = threads::stack_position(src);
+                let bytes = threads::region(&self.stack, &self.threads, running, src_thread)
+                    .and_then(|it| it.get(src..src + r.size))
+                    .ok_or_else(oob)?;
+                self.heap.get_mut(dst..dst + r.size).ok_or_else(oob)?.copy_from_slice(bytes);
             }
             _ => {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "invalid memory write at address {addr:?}"
                 )));
@@ -3525,9 +3673,16 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// The allocation `addr` is in.
     fn allocation_at(&self, addr: usize) -> Option<Allocated> {
         match Address::from_usize(addr).at() {
-            Stack(_) => {
-                let i = self.stack_allocations.partition_point(|it| it.start <= addr);
-                let &allocation = self.stack_allocations.get(i.checked_sub(1)?)?;
+            Stack(offset) => {
+                let (t, _) = threads::stack_position(offset);
+                let allocations = threads::region_allocations(
+                    &self.stack_allocations,
+                    &self.threads,
+                    self.thread,
+                    t,
+                );
+                let i = allocations.partition_point(|it| it.start <= addr);
+                let &allocation = allocations.get(i.checked_sub(1)?)?;
                 (addr - allocation.start < allocation.size).then_some(allocation)
             }
             Heap(offset) => {
@@ -3584,6 +3739,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         zeroed: bool,
     ) -> Result<'db, Address> {
         if !align.is_power_of_two() || align > 10000 {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!("Alignment {align} is invalid")));
         }
         if size == 0 {
@@ -3621,6 +3777,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => None,
         };
         let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "`{what}` of a pointer that is not the start of memory allocated by it"
             )));
@@ -3644,6 +3801,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let Some((pos, block)) = block.filter(|(_, it)| it.origin == Origin::Allocator) else {
             return Err(MirEvalError::UndefinedBehavior(
                 "`__rust_realloc` of a pointer that is not the start of memory allocated by it"
+                    // alloc: error path
                     .to_owned(),
             ));
         };
@@ -3679,6 +3837,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => Err(MirEvalError::UndefinedBehavior(
                 "`const_make_global` of a pointer that is not the start of memory \
                  `const_allocate` allocated and nothing made global yet"
+                    // alloc: error path
                     .to_owned(),
             )),
         }
@@ -4032,6 +4191,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             this.param_env.param_env,
                             ty,
                         )
+                        // alloc: error path
                         .map_err(|_| MirEvalError::NotSupported("couldn't normalize".to_owned()))?;
 
                     rec(this, bytes, ty, locals, mm, stack_depth_limit - 1)?;
@@ -4413,7 +4573,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let interval =
                 self.interpret_mir(mir_body, arg_values.into_iter(), None).map_err(|e| {
                     MirEvalError::InFunction(
+                        // alloc: error path
                         Box::new(e),
+                        // alloc: error path
                         vec![(Either::Right(closure), span, locals.body.owner)],
                     )
                 })?;
@@ -4529,6 +4691,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             )
             .map_err(|e| {
                 MirEvalError::InFunction(
+                    // alloc: error path
                     Box::new(MirEvalError::MirLowerError(imp, e)),
                     vec![(Either::Left(imp), span, locals.body.owner)],
                 )
@@ -4552,6 +4715,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
+        if intrinsic == Intrinsic::CatchUnwind {
+            return self.exec_catch_unwind(args, locals, destination, then, span);
+        }
+        self.call_then = then;
+        let moved = mem::take(&mut self.moved_args);
         if self.exec_intrinsic_call(
             def,
             intrinsic,
@@ -4563,6 +4731,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         )? {
             return Ok(None);
         }
+        self.moved_args = moved;
         self.exec_fn_body(def, args, generic_args, locals, destination, then, span)
     }
 
@@ -4576,6 +4745,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         then: Then,
         span: MirSpan,
     ) -> Result<'db, Option<StackFrame<'db>>> {
+        self.call_then = then;
+        let moved = mem::take(&mut self.moved_args);
         if self.detect_and_exec_special_function(
             def,
             args,
@@ -4586,6 +4757,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         )? {
             return Ok(None);
         }
+        self.moved_args = moved;
         self.exec_fn_body(def, args, generic_args, locals, destination, then, span)
     }
 
@@ -4664,7 +4836,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let called = Some((def, span, locals.body.owner));
             let result = self.interpret_mir(mir_body, arg_bytes, called).map_err(|e| {
                 MirEvalError::InFunction(
+                    // alloc: error path
                     Box::new(e),
+                    // alloc: error path
                     vec![(Either::Left(def), span, locals.body.owner)],
                 )
             })?;
@@ -4763,7 +4937,28 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if let Some(o) = self.static_locations.get(&st) {
             return Ok(*o);
         };
+        if let Some(o) = self.thread_statics.get(&st) {
+            return Ok(*o);
+        }
         let static_data = StaticSignature::of(self.db, st);
+        if hir_def::attrs::AttrFlags::query(self.db, st.into())
+            .contains(hir_def::attrs::AttrFlags::THREAD_LOCAL)
+        {
+            // Each thread's copy starts from the static's value when it first uses it.
+            let allocation = self.db.const_eval_static(st).map_err(|e| {
+                // alloc: error path
+                MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
+            })?;
+            let (size, align) =
+                self.size_align_of(allocation.ty, locals)?.unwrap_or((allocation.memory.len(), 1));
+            let memory = self.heap_allocate(size, align)?;
+            let location = self.heap_allocate(self.ptr_size(), self.ptr_size())?;
+            self.write_pointer(location, memory)?;
+            self.thread_statics.insert(st, location);
+            self.write_allocation(locals, allocation, memory, size)?;
+            self.static_memory.push((memory.to_usize(), size, st));
+            return Ok(location);
+        }
         let is_read = self.read_statics.as_ref().is_none_or(|read| read.contains(&st));
         let unevaluated = if is_read || static_data.flags.contains(StaticFlags::EXTERN) {
             None
@@ -4779,6 +4974,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Interval::new(addr, size)
         } else if !static_data.flags.contains(StaticFlags::EXTERN) {
             let allocation = self.db.const_eval_static(st).map_err(|e| {
+                // alloc: error path
                 MirEvalError::ConstEvalError(static_data.name.as_str().to_owned(), Box::new(e))
             })?;
             let (size, align) =
@@ -4795,6 +4991,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let Some((size, align)) = self.size_align_of(ty, locals)? else {
                 not_supported!("unsized extern static");
             };
+            // Zeroed: an `extern_weak` one is unresolved, so std's `Option<fn>` for
+            // `__cxa_thread_atexit_impl` is `None` and it registers thread-local destructors
+            // through a pthread key, which the thread shims run.
             let addr = self.heap_allocate(size, align)?;
             Interval::new(addr, size)
         };
@@ -4827,6 +5026,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         .unwrap()
                         .display(db, edition),
                 );
+                // alloc: error path
                 Err(MirEvalError::ConstEvalError(name, Box::new(e)))
             }
         }
@@ -4837,13 +5037,14 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         place: &StoredPlace,
         locals: &mut Locals<'db>,
         span: MirSpan,
-    ) -> Result<'db, ()> {
+        then: Then,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
         let (addr, ty, metadata) = self.place_addr_and_ty_and_metadata(place, locals)?;
         let metadata = match metadata {
             Some(it) => it.get(self)?.to_vec(),
             None => vec![],
         };
-        self.run_drop_glue_deep(ty, locals, addr, &metadata, span)
+        self.run_drop_glue(ty, locals, addr, &metadata, span, then)
     }
 
     /// Drops the value of type `ty` at `addr`, as rustc's `drop_in_place::<ty>`: its `Drop`
@@ -4852,39 +5053,60 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// it points to before its `Drop` frees it.
     ///
     /// The parts wait on a stack of steps rather than the native one: a list of a thousand
-    /// boxes is a thousand levels deep.
-    fn run_drop_glue_deep(
+    /// boxes is a thousand levels deep. A `Drop` impl's call is a frame going on at `then`
+    /// that finishes the drop once it returns; with [`Then::Nested`] the drop runs to its end.
+    fn run_drop_glue(
         &mut self,
         ty: Ty<'db>,
         locals: &Locals<'db>,
         addr: Address,
         metadata: &[u8],
         span: MirSpan,
-    ) -> Result<'db, ()> {
+        then: Then,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
+        self.drop_steps(vec![DropStep::Glue(ty, addr, metadata.to_vec())], locals, span, then)
+    }
+
+    /// Runs `steps`, last first, until one calls a `Drop` impl: the frame of that call, with
+    /// the steps left to run once it returns.
+    fn drop_steps(
+        &mut self,
+        mut steps: Vec<DropStep<'db>>,
+        locals: &Locals<'db>,
+        span: MirSpan,
+        then: Then,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
         if self.lang_items().Drop_drop.is_none() {
-            return Ok(());
+            return Ok(None);
         }
-        let mut steps = vec![DropStep::Glue(ty, addr, metadata.to_vec())];
         while let Some(step) = steps.pop() {
             match step {
                 DropStep::Glue(ty, addr, metadata) => {
-                    self.drop_glue_step(ty, locals, addr, &metadata, span, &mut steps)?
+                    self.drop_glue_step(ty, locals, addr, &metadata, false, &mut steps)?
                 }
-                DropStep::DropImpl(ty, addr) => self.call_drop_impl(ty, locals, addr, span)?,
+                DropStep::Fields(ty, addr, metadata) => {
+                    self.drop_glue_step(ty, locals, addr, &metadata, true, &mut steps)?
+                }
+                DropStep::DropImpl(ty, addr) => {
+                    if let Some(mut frame) = self.call_drop_impl(ty, locals, addr, span, then)? {
+                        frame.drops = steps;
+                        return Ok(Some(frame));
+                    }
+                }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
-    /// One step of [`Self::run_drop_glue_deep`]: runs what comes first in dropping the value
-    /// and pushes the rest onto `steps`, last first.
+    /// One step of [`Self::drop_steps`]: pushes what dropping the value does onto `steps`,
+    /// last first. With `fields_only`, an ADT's `Drop` impl ran already.
     fn drop_glue_step(
         &mut self,
         ty: Ty<'db>,
         locals: &Locals<'db>,
         addr: Address,
         metadata: &[u8],
-        span: MirSpan,
+        fields_only: bool,
         steps: &mut Vec<DropStep<'db>>,
     ) -> Result<'db, ()> {
         if !self.has_drop_glue(ty) {
@@ -4901,6 +5123,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         ty,
                     )
                     .map_err(|_| {
+                        // alloc: error path
                         MirEvalError::NotSupported(format!(
                             "dropping {ty:?}, which does not normalize"
                         ))
@@ -4941,8 +5164,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         contents_metadata.to_vec(),
                     ));
                     parts.push(DropStep::DropImpl(ty, addr));
-                } else {
-                    self.call_drop_impl(ty, locals, addr, span)?;
+                } else if !fields_only {
+                    steps.push(DropStep::Fields(ty, addr, metadata.to_vec()));
+                    steps.push(DropStep::DropImpl(ty, addr));
+                    return Ok(());
                 }
                 let bytes;
                 let (variant, layout): (VariantId, Cow<'_, Layout>) = match id {
@@ -5013,15 +5238,17 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         it
     }
 
-    /// `<ty as Drop>::drop` on the value at `addr`, if `ty` has a `Drop` impl.
+    /// `<ty as Drop>::drop` on the value at `addr`, if `ty` has a `Drop` impl: its frame,
+    /// going on at `then`, unless that is [`Then::Nested`] and it ran.
     fn call_drop_impl(
         &mut self,
         ty: Ty<'db>,
         locals: &Locals<'db>,
         addr: Address,
         span: MirSpan,
-    ) -> Result<'db, ()> {
-        let Some(drop_fn) = self.lang_items().Drop_drop else { return Ok(()) };
+        then: Then,
+    ) -> Result<'db, Option<StackFrame<'db>>> {
+        let Some(drop_fn) = self.lang_items().Drop_drop else { return Ok(None) };
         let generic_args = GenericArgs::new_from_slice(&[ty.into()]);
         let (drop_impl, drop_args) = self.db.lookup_impl_method(
             ParamEnvAndCrate { param_env: self.param_env.param_env, krate: self.crate_id },
@@ -5038,17 +5265,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 self.param_env.store(),
             )
             .map_err(|it| MirEvalError::MirLowerError(drop_impl, it))?;
-            self.exec_looked_up_function(
+            let this = self.pointer_value(addr, None)?;
+            return self.exec_looked_up_function(
                 body,
                 locals,
                 drop_impl,
-                iter::once(IntervalOrOwned::Owned(addr.to_bytes().to_vec())),
+                iter::once(this),
                 span,
                 Interval { addr: Address::invalid(0), size: 0 },
-                None,
-            )?;
+                then,
+            );
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The drops of the fields of the tuple or closure `ty` at `addr`, of types `fields`, in order.
@@ -5096,7 +5324,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 }
 
 pub fn render_const_using_debug_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     c: Allocation<'db>,
     ty: Ty<'db>,
@@ -5106,6 +5334,7 @@ pub fn render_const_using_debug_impl<'db>(
         ptr: ArenaMap::new(),
         body: db
             .runtime_mir_body(owner)
+            // alloc: error path
             .map_err(|_| MirEvalError::NotSupported("unreachable".to_owned()))?,
     };
     let data = evaluator.allocate_allocation_in_heap(locals, c)?;

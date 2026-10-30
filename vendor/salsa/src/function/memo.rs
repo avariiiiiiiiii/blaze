@@ -12,6 +12,7 @@ use crate::key::DatabaseKeyIndex;
 use crate::revision::AtomicRevision;
 use crate::sync::atomic::Ordering;
 use crate::table::memo::{DummyMemo, MemoSlot, MemoTableWithTypesMut, ToDynMemo};
+use crate::task::TaskId;
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
 use crate::zalsa_local::{QueryOriginRef, QueryRevisions};
 use crate::{Cancelled, Event, EventKind, Id, Revision};
@@ -404,6 +405,7 @@ impl<C: Configuration> crate::table::memo::Memo for Memo<C> {
                 debug_name: std::any::type_name::<C::Output<'static>>(),
                 size_of_fields: std::mem::size_of::<C::Output<'static>>(),
                 heap_size_of_fields: heap_size,
+                // alloc: the edge: memory-usage reports, run with `&mut` outside builds
                 memos: Vec::new(),
             },
         }
@@ -548,13 +550,17 @@ pub(super) enum TryClaimHeadsResult {
 pub(super) struct TryClaimCycleHeadsIter<'a> {
     zalsa: &'a Zalsa,
 
+    /// The task that claims the heads.
+    task: TaskId,
+
     cycle_heads: CycleHeadsIterator<'a>,
 }
 
 impl<'a> TryClaimCycleHeadsIter<'a> {
-    pub(super) fn new(zalsa: &'a Zalsa, cycle_heads: &'a CycleHeads) -> Self {
+    pub(super) fn new(zalsa: &'a Zalsa, task: TaskId, cycle_heads: &'a CycleHeads) -> Self {
         Self {
             zalsa,
+            task,
 
             cycle_heads: cycle_heads.iter(),
         }
@@ -577,7 +583,7 @@ impl Iterator for TryClaimCycleHeadsIter<'_> {
 
         match function
             .sync_table()
-            .peek_claim(self.zalsa, head_key_index, Reentrancy::Deny)
+            .peek_claim(self.zalsa, self.task, head_key_index, Reentrancy::Deny)
         {
             ClaimResult::Cycle { .. } => {
                 // We hit a cycle blocking on the cycle head; this means this query actively
@@ -687,6 +693,7 @@ mod _memory_usage {
         const PERSIST: bool = false;
         const CYCLE_STRATEGY: CycleRecoveryStrategy = CycleRecoveryStrategy::Panic;
 
+        // dyn: the edge: salsa's public database handle, one vtable call per query entry
         type DbView = dyn Database;
         type SalsaStruct<'db> = DummyStruct;
         type Input<'db> = ();

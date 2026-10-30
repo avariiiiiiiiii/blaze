@@ -22,7 +22,7 @@ const state = {
   model: null, view: null, began: null, rebuilt: [], unlisted: 0, analysis: null,
   pendingFlash: new Set(), flushTimer: 0, spreadBuild: null, litThisBuild: 0, dead: false,
   connection: "connecting", ws: null, mouse: [0, 0], snapshots: 0, records: 0, frames: 0,
-  viewAdded: [], viewEdges: 0, viewDirty: false, viewFrame: 0,
+  viewAdded: [], viewEdges: 0, viewTouched: [], viewRelit: false, viewDirty: false, viewFrame: 0,
 };
 const tooltip = new Tooltip();
 let dag, search, treemap, timeline, editView;
@@ -101,6 +101,8 @@ function onSnapshot(bytes) {
   state.viewDirty = false;
   state.viewAdded = [];
   state.viewEdges = 0;
+  state.viewTouched = [];
+  state.viewRelit = false;
   const host = $("graph-canvas");
   if (state.view) {
     state.view.graph.destroy();
@@ -152,6 +154,7 @@ function onRecord(r) {
       state.litThisBuild = 0;
       state.model.current = ev.build;
       state.view.clearSpread();
+      state.viewRelit = true;
       scheduleView();
       timeline.reset(ev);
       break;
@@ -169,6 +172,7 @@ function onRecord(r) {
         state.viewEdges += res.newEdges;
         search.invalidate();
       }
+      for (const i of res.touched) state.viewTouched.push(i);
       scheduleView();
       treemap.invalidate();
       dag.invalidate();
@@ -193,7 +197,8 @@ function onRecord(r) {
 }
 
 // The graph is drawn again once a frame, whatever the records of it changed: a cold build sends
-// hundreds of Functions records, and each would otherwise restyle and upload every point.
+// hundreds of Functions records, and each would otherwise upload every point. Only the points
+// the records touched are restyled, and those drawn lit when a new build is shown.
 function scheduleView() {
   state.viewDirty = true;
   if (!state.viewFrame) state.viewFrame = requestAnimationFrame(applyView);
@@ -206,12 +211,13 @@ function applyView() {
   state.viewFrame = 0;
   if (!state.viewDirty || !state.view) return;
   state.viewDirty = false;
-  const added = state.viewAdded;
-  const edges = state.viewEdges;
+  const { viewAdded: added, viewEdges: edges, viewTouched: touched, viewRelit: relit } = state;
   state.viewAdded = [];
   state.viewEdges = 0;
-  if (added.length || edges) state.view.addNodes(added, edges);
-  else state.view.restyleAll();
+  state.viewTouched = [];
+  state.viewRelit = false;
+  if (added.length || edges) state.view.addNodes(added, edges, touched, relit);
+  else state.view.restyle(touched, relit);
 }
 
 // Functions and Rebuilt come in bursts: the glow and the edit's spread are worked out once a burst

@@ -33,7 +33,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use base_db::{Crate, LangCrateOrigin};
+use base_db::{Db, Crate, LangCrateOrigin};
 use cranelift_codegen::ir::{InstBuilder, Value, types};
 use hir_def::{
     AdtId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId, VariantId,
@@ -79,17 +79,17 @@ const CODEC: &str = "__blaze_codec";
 const FORMAT: u32 = 1;
 
 /// Whether `func` is the function a cached function asks for the code of its body.
-pub(super) fn is_code(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub(super) fn is_code(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).name.as_str() == CODE
 }
 
-fn is_codec(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn is_codec(db: &Db, func: FunctionId) -> bool {
     FunctionSignature::of(db, func).name.as_str() == CODEC
 }
 
 /// The closure that `#[blaze::cache]` put the body of `func` in, when it is a cached
 /// function: the one it asks for the code of.
-pub(super) fn cached_closure(db: &dyn HirDatabase, func: FunctionId) -> Option<salsa::Id> {
+pub(super) fn cached_closure(db: &Db, func: FunctionId) -> Option<salsa::Id> {
     if !uses_cache(db, func.krate(db)) {
         return None;
     }
@@ -98,7 +98,7 @@ pub(super) fn cached_closure(db: &dyn HirDatabase, func: FunctionId) -> Option<s
 
 /// Whether `krate` can have cached functions: the attribute calls into the `blaze` crate, so
 /// a crate without it as a dependency has none, and costs nothing to look through.
-pub(super) fn uses_cache(db: &dyn HirDatabase, krate: Crate) -> bool {
+pub(super) fn uses_cache(db: &Db, krate: Crate) -> bool {
     krate.data(db).dependencies.iter().any(|dep| {
         dep.crate_id
             .extra_data(db)
@@ -110,7 +110,7 @@ pub(super) fn uses_cache(db: &dyn HirDatabase, krate: Crate) -> bool {
 
 #[salsa::tracked]
 fn cached_closure_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
 ) -> Option<InternedClosureId<'db>> {
     let body = db.mir_body(func.into()).ok()?;
@@ -145,7 +145,7 @@ fn fn_item<'db>(operand: &Operand) -> Option<(FunctionId, GenericArgs<'db>)> {
 /// reaches, or why the function can't be cached.
 #[salsa::tracked(returns(ref))]
 pub(super) fn cache_code(
-    db: &dyn HirDatabase,
+    db: &Db,
     closure: Instance,
     env: StoredParamEnvAndCrate,
 ) -> std::result::Result<u128, String> {
@@ -198,7 +198,7 @@ pub(super) fn cache_code(
 /// what is below it, what it reaches of each kind, is kept in the store by the name, so that
 /// a daemon with the store compiles none of it.
 pub fn tests_reach(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     roots: &[FunctionId],
 ) -> Vec<Reach> {
@@ -522,7 +522,7 @@ impl Below {
 /// or a coroutine with nothing of the checkout in its name. `None` for anything else, and for
 /// what has no stable name.
 fn sealed_name(
-    db: &dyn HirDatabase,
+    db: &Db,
     names: &super::stable::StableNames<'_, '_>,
     node: &Node,
 ) -> Option<String> {
@@ -805,7 +805,7 @@ impl Kind {
 }
 
 /// The name of the function whose body `closure` is, as a backtrace has it.
-pub(super) fn cached_name(db: &dyn HirDatabase, closure: &Instance) -> String {
+pub(super) fn cached_name(db: &Db, closure: &Instance) -> String {
     let InstanceDef::Closure(id) = closure.def else { return "?".to_owned() };
     match InternedClosureId::from_id(id).loc(db).owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(func)) => {
@@ -815,12 +815,12 @@ pub(super) fn cached_name(db: &dyn HirDatabase, closure: &Instance) -> String {
     }
 }
 
-fn function_name(db: &dyn HirDatabase, func: FunctionId, args: GenericArgs<'_>) -> String {
+fn function_name(db: &Db, func: FunctionId, args: GenericArgs<'_>) -> String {
     hir_ty_mir::mir::type_name::rustc_function_name(db, func, args.as_slice())
         .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
 }
 
-pub(crate) fn crate_name(db: &dyn HirDatabase, krate: Crate) -> String {
+pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
     krate.extra_data(db).display_name.as_ref().map_or_else(|| "?".to_owned(), |it| it.to_string())
 }
 
@@ -878,7 +878,7 @@ impl Why {
 }
 
 struct Walk<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     homes: Homes,
     nodes: Vec<Seen>,
     index: FxHashMap<Node, u32>,
@@ -912,7 +912,7 @@ enum LibraryBody<'db> {
 }
 
 impl<'db> Walk<'db> {
-    fn new(db: &'db dyn HirDatabase, counted: bool) -> Walk<'db> {
+    fn new(db: &'db Db, counted: bool) -> Walk<'db> {
         Walk {
             db,
             homes: Homes::default(),
@@ -1731,7 +1731,7 @@ fn locates_errno(symbol: &str) -> bool {
 /// also numbers where what it gives doesn't depend on them, as in slice iteration and `memchr`.
 /// So `addr` and `expose_provenance` count where code of the workspace calls them (`own`), as
 /// its casts do (`raw_use`): core and alloc call them to align and to tell a dangling pointer.
-fn gives_address(db: &dyn HirDatabase, func: FunctionId, own: bool) -> Option<&'static str> {
+fn gives_address(db: &Db, func: FunctionId, own: bool) -> Option<&'static str> {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Core))
     {
         return None;
@@ -1765,7 +1765,7 @@ fn gives_address(db: &dyn HirDatabase, func: FunctionId, own: bool) -> Option<&'
 /// called: the walk knows what it does by the function called, and a body built into its
 /// caller is not called. `own` is whether the caller is code of the workspace.
 pub(super) fn kept_a_call(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     args: GenericArgs<'_>,
     own: bool,
@@ -1777,7 +1777,7 @@ pub(super) fn kept_a_call(
 }
 
 /// Whether `func` makes a `RandomState`, whose seed is another in every run.
-fn makes_seed(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn makes_seed(db: &Db, func: FunctionId) -> bool {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
         return false;
     }
@@ -1798,7 +1798,7 @@ fn makes_seed(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// of its entries, which the seed decides, or gives the seed itself. What only looks up,
 /// inserts or counts gives the same whatever the seed.
 fn seeded_order(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     args: GenericArgs<'_>,
 ) -> Option<&'static str> {
@@ -1846,7 +1846,7 @@ fn seeded_order(
 }
 
 /// The hasher of std's `HashMap` or `HashSet` when `ty` is one.
-fn hasher_of<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> Option<Ty<'db>> {
+fn hasher_of<'db>(db: &Db, ty: Ty<'db>) -> Option<Ty<'db>> {
     let TyKind::Adt(def, args) = ty.kind() else { return None };
     let AdtId::StructId(id) = def.def_id() else { return None };
     if !matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
@@ -1861,7 +1861,7 @@ fn hasher_of<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> Option<Ty<'db>> {
 }
 
 /// Whether `func` is a method of std's `Backtrace`, or of a trait for it.
-fn of_backtrace(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn of_backtrace(db: &Db, func: FunctionId) -> bool {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std)) {
         return false;
     }
@@ -1872,7 +1872,7 @@ fn of_backtrace(db: &dyn HirDatabase, func: FunctionId) -> bool {
 /// Whether a static of `ty` that can change is state other tests of the process can change:
 /// all but a cell set once (`LazyLock`, `OnceLock`, once_cell's and lazy_static's), which code
 /// the test reaches sets to what that code gives, unless it holds a lock, a cell or an atomic.
-fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
+fn shared<'db>(db: &Db, ty: Ty<'db>) -> bool {
     const ONCE: &[&str] = &["LazyLock", "OnceLock", "LazyCell", "OnceCell", "Lazy", "Once"];
     const CHANGES: &[&str] =
         &["Mutex", "RwLock", "ReentrantMutex", "RefCell", "Cell", "UnsafeCell", "SyncUnsafeCell"];
@@ -1894,7 +1894,7 @@ fn shared<'db>(db: &dyn HirDatabase, ty: Ty<'db>) -> bool {
 /// it is no function the code reached names, and can be any. Not one of what it loaded from a
 /// static `cache` says chooses a function ([`dispatch`]).
 fn fn_from_data(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: &MirBody<'_>,
     cache: &dyn Fn(StaticId) -> bool,
 ) -> Option<MirSpan> {
@@ -1915,16 +1915,16 @@ fn fn_from_data(
 }
 
 /// Whether `func` is std's `min_stack`, which reads `RUST_MIN_STACK` for a thread's stack.
-fn sizes_stack(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn sizes_stack(db: &Db, func: FunctionId) -> bool {
     is_std_function(db, func, "min_stack")
 }
 
-fn is_std_function(db: &dyn HirDatabase, func: FunctionId, name: &str) -> bool {
+fn is_std_function(db: &Db, func: FunctionId, name: &str) -> bool {
     matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
         && FunctionSignature::of(db, func).name.as_str() == name
 }
 
-fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {
+fn is_std_struct(db: &Db, ty: Ty<'_>, name: &str) -> bool {
     let TyKind::Adt(def, _) = ty.kind() else { return false };
     let AdtId::StructId(id) = def.def_id() else { return false };
     matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Std))
@@ -1933,7 +1933,7 @@ fn is_std_struct(db: &dyn HirDatabase, ty: Ty<'_>, name: &str) -> bool {
 
 /// What a function of alloc's `Rc`, `Arc` or their `Weak` does that depends on how many hold
 /// the value, or on whether two hold the same one.
-fn reads_count(db: &dyn HirDatabase, func: FunctionId) -> Option<&'static str> {
+fn reads_count(db: &Db, func: FunctionId) -> Option<&'static str> {
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Alloc))
     {
         return None;
@@ -1956,7 +1956,7 @@ fn reads_count(db: &dyn HirDatabase, func: FunctionId) -> Option<&'static str> {
 }
 
 /// Whether `adt` is what an `Rc` or an `Arc` points to: its value with the counts.
-fn holds_counts(db: &dyn HirDatabase, adt: AdtId) -> bool {
+fn holds_counts(db: &Db, adt: AdtId) -> bool {
     let AdtId::StructId(id) = adt else { return false };
     matches!(id.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Alloc))
         && matches!(StructSignature::of(db, id).name.as_str(), "RcInner" | "ArcInner")
@@ -1966,7 +1966,7 @@ fn holds_counts(db: &dyn HirDatabase, adt: AdtId) -> bool {
 /// and never compiles: `TypeId::of`, a hash only rustc computes, and the methods of `dyn Any`,
 /// which compare it. What they give is decided by the type they are instantiated with, which
 /// their name has.
-fn taken_from_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn taken_from_rustc(db: &Db, func: FunctionId) -> bool {
     use rustc_type_ir::inherent::BoundExistentialPredicates as _;
     if !matches!(func.krate(db).data(db).origin, base_db::CrateOrigin::Lang(LangCrateOrigin::Core))
     {
@@ -1992,12 +1992,12 @@ fn taken_from_rustc(db: &dyn HirDatabase, func: FunctionId) -> bool {
     }
 }
 
-fn diverges(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn diverges(db: &Db, func: FunctionId) -> bool {
     let output = db.callable_item_signature(func.into()).skip_binder().skip_binder().output();
     matches!(output.kind(), TyKind::Never)
 }
 
-fn static_name(db: &dyn HirDatabase, id: StaticId) -> String {
+fn static_name(db: &Db, id: StaticId) -> String {
     let mut path = vec![StaticSignature::of(db, id).name.as_str().to_owned()];
     if let ItemContainerId::ModuleId(module) = id.lookup(db).container {
         let mut module = Some(module);
@@ -2013,7 +2013,7 @@ fn static_name(db: &dyn HirDatabase, id: StaticId) -> String {
     path.join("::")
 }
 
-fn describe(db: &dyn HirDatabase, node: &Node) -> String {
+fn describe(db: &Db, node: &Node) -> String {
     match node {
         Node::Root(func) => {
             format!("`{}`", function_name(db, *func, GenericArgs::new_from_slice(&[])))
@@ -2056,7 +2056,7 @@ fn describe(db: &dyn HirDatabase, node: &Node) -> String {
 
 /// File, line and column of a place in a body, the file relative to the workspace.
 pub(super) fn location(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: InferBodyId<'_>,
     span: MirSpan,
 ) -> Option<String> {
@@ -2076,7 +2076,7 @@ pub(super) fn location(
 /// What `body`, of core or alloc, does itself that is not pure; else the bodies of core and
 /// alloc it calls, or makes a closure or a function pointer of, are pushed to `calls`.
 fn library_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: LibraryBody<'db>,
     calls: &mut Vec<LibraryBody<'db>>,
 ) -> Option<String> {
@@ -2127,7 +2127,7 @@ fn library_body<'db>(
 /// What an operand of a body of core or alloc reads or names that is not pure; else the
 /// function of core or alloc it names, if one, is pushed to `calls`.
 fn library_operand<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     operand: &Operand,
     calls: &mut Vec<LibraryBody<'db>>,
@@ -2183,14 +2183,14 @@ fn library_operand<'db>(
     None
 }
 
-fn is_library(db: &dyn HirDatabase, krate: Crate) -> bool {
+fn is_library(db: &Db, krate: Crate) -> bool {
     matches!(
         krate.data(db).origin,
         base_db::CrateOrigin::Lang(LangCrateOrigin::Core | LangCrateOrigin::Alloc)
     )
 }
 
-fn library_name(db: &dyn HirDatabase, body: LibraryBody<'_>) -> String {
+fn library_name(db: &Db, body: LibraryBody<'_>) -> String {
     match body {
         LibraryBody::Fn(func) => {
             format!("`{}`", function_name(db, func, GenericArgs::new_from_slice(&[])))
@@ -2208,14 +2208,14 @@ fn library_name(db: &dyn HirDatabase, body: LibraryBody<'_>) -> String {
 }
 
 /// The symbol a foreign static is linked by, if `id` is one.
-fn foreign_static(db: &dyn HirDatabase, id: StaticId) -> Option<String> {
+fn foreign_static(db: &Db, id: StaticId) -> Option<String> {
     super::static_link_name(db, id)
 }
 
 /// Why the arguments of the closure can't be what a result is kept by, and whether one holds
 /// the reference counts of an `Rc` or an `Arc`.
 fn arguments_trouble(
-    db: &dyn HirDatabase,
+    db: &Db,
     closure: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> (Option<String>, bool) {
@@ -2241,7 +2241,7 @@ fn arguments_trouble(
 /// of an `Rc` or an `Arc` change behind one, but only what reads them sees that, and the walk
 /// refuses that instead (`reads_count`): `counted` is set when `ty` holds some.
 fn trouble<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     interner: DbInterner<'db>,
     ty: Ty<'db>,
     in_library: bool,

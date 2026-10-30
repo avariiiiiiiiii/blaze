@@ -30,6 +30,7 @@ intern.workspace = true
 syntax-bridge.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 test-utils.workspace = true
 expect-test.workspace = true
 syntax.workspace = true

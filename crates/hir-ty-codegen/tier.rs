@@ -28,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use base_db::Db;
 use cranelift_codegen::ir::{self, InstBuilder, Opcode, types};
 use hir_def::{FunctionId, HasModule, attrs::AttrFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -43,6 +44,16 @@ use super::{
 /// The symbol of the function that hands out the counters, which `blaze-live` defines in
 /// every program that takes edits.
 pub const COUNTERS: &str = "blaze_live_counters";
+
+/// How many counters a function's own begin on a multiple of: 128 bytes, the pair of cache
+/// lines x86-64 and arm64 fetch together, so no two functions count into one pair and two
+/// threads in two hot functions never pass a line between their cores.
+pub const COUNTER_ALIGN: u32 = 16;
+
+/// The `user_id` of the alias region of the counters' adds, by which LLVM's lowering
+/// (`llvm/lower.rs`) knows them and makes them relaxed: they order nothing, and the sampler
+/// reads them with relaxed loads.
+pub(super) const COUNTER_REGION: u32 = u32::from_be_bytes(*b"bctr");
 
 /// How deep functions are built into each other; how many instructions a hot body built in
 /// may have, and any other, counted with its locals out of the frame; how many a body LLVM
@@ -105,7 +116,7 @@ pub(super) enum Kind {
 }
 
 impl Node {
-    fn serial(&self, db: &dyn HirDatabase) -> u128 {
+    fn serial(&self, db: &Db) -> u128 {
         match &self.0 {
             Kind::Root(func) => root_serial(db, *func),
             Kind::Instance(instance, env) => instance_serial(db, instance.clone(), env.clone()),
@@ -279,7 +290,7 @@ impl Tiers {
 
     /// The code of `node` at its level, unless it has none above 1 or an edit changed what
     /// that code was compiled from.
-    pub(super) fn code(&self, db: &dyn HirDatabase, node: &Node) -> Option<&CompiledFunction> {
+    pub(super) fn code(&self, db: &Db, node: &Node) -> Option<&CompiledFunction> {
         let tiered = self.nodes.get(node)?;
         let edited = if node.serial(db) != tiered.serial {
             Some("edited")
@@ -404,7 +415,7 @@ pub(super) fn across() -> bool {
 /// build it in at all: a hot one up to [`HOT_INSTRUCTIONS`], any other up to
 /// [`SMALL_INSTRUCTIONS`], as rustc builds in what is small. The body is then built with
 /// [`hot_body`].
-pub(super) fn inline_limit(db: &dyn HirDatabase, instance: &Instance) -> Option<usize> {
+pub(super) fn inline_limit(db: &Db, instance: &Instance) -> Option<usize> {
     let func = match instance.def {
         InstanceDef::Fn(func) => Some(func),
         InstanceDef::Closure(_) => None,
@@ -449,7 +460,7 @@ pub(super) fn builds_in_nothing() -> bool {
 /// only if it is generic or `#[inline]`, as rustc does across crates. The library keeps what
 /// the rest of its functions refer to to itself (the `static`s of `std::rt`), and has them
 /// compiled already.
-pub(super) fn shared(db: &dyn HirDatabase, instance: &Instance) -> bool {
+pub(super) fn shared(db: &Db, instance: &Instance) -> bool {
     let InstanceDef::Fn(func) = instance.def else { return true };
     !func.krate(db).data(db).origin.is_lang()
         || AttrFlags::query(db, func.into()).contains(AttrFlags::IS_INLINE)
@@ -475,7 +486,7 @@ impl Inlining {
 /// calls built into it in turn, if it has at most `limit` instructions once its locals are
 /// out of the frame.
 pub(super) fn hot_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     limit: usize,
@@ -539,7 +550,7 @@ fn untally(before: Option<(usize, usize)>) {
 /// itself where its own measure, after optimization, finds it small enough. What its
 /// `#[inline]` asks comes with it.
 pub(super) fn seen_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
@@ -620,7 +631,7 @@ pub(super) fn seen_body(
 
 /// The body of `instance`, built once per compile.
 fn body(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
@@ -745,7 +756,7 @@ fn spend(instance: &Instance, env: &StoredParamEnvAndCrate, body: &super::fragme
 }
 
 /// Says why a body is not built in, with `BLAZE_DUMP_TIER`.
-fn refused(db: &dyn HirDatabase, instance: &Instance, why: &str) {
+fn refused(db: &Db, instance: &Instance, why: &str) {
     if !super::dumps_tier() {
         return;
     }
@@ -760,7 +771,7 @@ fn refused(db: &dyn HirDatabase, instance: &Instance, why: &str) {
 }
 
 fn build_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     tracked: bool,
@@ -841,7 +852,7 @@ fn build_body(
 
 /// Compiles the function `asked` names at the level it asks for: [`prepare`], then
 /// [`Prepared::finish`] with no counters to count in.
-pub fn compile(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Tiered, String> {
+pub fn compile(db: &Db, asked: &Asked) -> std::result::Result<Tiered, String> {
     prepare(db, asked)?.finish(None)
 }
 
@@ -857,7 +868,7 @@ pub struct Prepared {
 
 /// Builds the IR of the function `asked` names, with what it builds in, for LLVM to compile
 /// at the level asked for once the database is let go of (an edit is then applied at once).
-pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepared, String> {
+pub fn prepare(db: &Db, asked: &Asked) -> std::result::Result<Prepared, String> {
     let start = std::time::Instant::now();
     if asked.level == Level::Cranelift {
         return Err("level 1 is what every build compiles".to_owned());
@@ -907,7 +918,7 @@ pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepa
     let compiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &asked.node.0 {
         Kind::Root(func) => super::root_code(db, *func, true),
         Kind::Instance(instance, env) => {
-            super::instance_code(db, instance.clone(), env.clone(), super::Detach::Tier)
+            super::instance_code(db, instance.clone(), env.clone(), super::Detach::Tier, None)
         }
     }));
     let inlining = INLINING.with(|it| std::mem::replace(&mut *it.borrow_mut(), held));
@@ -944,14 +955,19 @@ pub fn prepare(db: &dyn HirDatabase, asked: &Asked) -> std::result::Result<Prepa
 
 impl Prepared {
     /// LLVM's code of the function, which takes nothing of the database. Code of level 2
-    /// counts in the counters from the first of `counters` on, if all it counts fits in the
-    /// second, how many there are.
+    /// counts in the counters from the first multiple of [`COUNTER_ALIGN`] at or past the
+    /// first of `counters` on ([`Tiered::counters`] says which), if all it counts fits in
+    /// the second, how many there are.
     pub fn finish(self, counters: Option<(u32, u32)>) -> std::result::Result<Tiered, String> {
         let Prepared { level, profile, pending, serial, inlined, start } = self;
         let branches = branches(pending.func()).len() as u32;
         let counters = counters
-            .filter(|&(first, room)| level == Level::Llvm && first + 1 + 2 * branches <= room)
-            .map(|(first, _)| first);
+            .filter(|_| level == Level::Llvm)
+            .and_then(|(first, room)| {
+                let first = first.checked_next_multiple_of(COUNTER_ALIGN)?;
+                let end = first.checked_add(1)?.checked_add(branches.checked_mul(2)?)?;
+                (end <= room).then_some(first)
+            });
         let request = Request { level, counters, profile, branches: std::cell::Cell::new(0) };
         let code = pending.produce(&request).map_err(|e| e.to_string())?;
         Ok(Tiered {

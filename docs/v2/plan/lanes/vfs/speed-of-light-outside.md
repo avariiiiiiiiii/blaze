@@ -131,19 +131,22 @@ written by a check.
 
 ## 6. Memory
 
-- **Per directory:** a 48-byte `Dir` (two `u64` generations, a `u32`, and the path's boxed
-  slice, aligned to 16 so the generations share a line) plus the path's bytes.
+- **Per directory:** a 32-byte entry (two `u64` generations, the `u32` of the directory that
+  covers it, and the `u32` start and length of its path in the paths column, aligned to 16 so
+  the generations share a line) plus the path's bytes.
 - **Index:** 8 bytes per place, at most half full.
 - **Per answer, on usercode's side:** a `Cover` (16 bytes) and a generation (8). With \(W\) in
   single digits and the directories a trace names in the hundreds, this is a few tens of KB per
   process.
 
 **By lifetime** ([../../design/memory.md](../../design/memory.md)):
-- **The process's life:** the table lives as long as the process does and never moves (each
-  chunk of directories is made once and kept, and readers stay on old index tables). Today
-  these are general-purpose allocations, made once per doubling, on `want`'s cold path. They
-  move onto a reserved region counted under `Tag::Vfs` once blaze-mem has a column with one
-  writer and lock-free readers (v2/requests/requests-outside.md items 3 and 4).
+- **The process's life:** the table lives as long as the process does and never moves: its
+  directories (32 bytes each), their paths' bytes and the index's tables are
+  `blaze_mem::AppendVec` columns over regions reserved once (128 MB of address space, for
+  \(2^{20}\) directories) and committed as they fill, counted under `Tag::Vfs`; readers stay on
+  old index tables. A `want` past the high-water mark commits pages and never calls the
+  general-purpose allocator (`wants_past_the_high_water_mark_allocate_nothing`). The driver's
+  watches are a `RegionVec` beside them.
 - **The warm loop** (a request's flush round, its checks, a change heard) makes no
   general-purpose allocation:
   - effects go into the caller's buffer;

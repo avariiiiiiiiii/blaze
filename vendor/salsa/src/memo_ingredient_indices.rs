@@ -18,6 +18,7 @@ impl From<IngredientIndex> for IngredientIndices {
     #[inline]
     fn from(value: IngredientIndex) -> Self {
         Self {
+            // alloc: setup, once per tracked function when its jar registers
             indices: Box::new([value]),
         }
     }
@@ -32,6 +33,7 @@ impl IngredientIndices {
     }
 
     pub fn merge(iter: impl IntoIterator<Item = Self>) -> Self {
+        // alloc: setup, once per tracked function when its jar registers
         let mut indices = Vec::new();
         for index in iter {
             indices.extend(index.indices);
@@ -81,6 +83,7 @@ impl NewMemoIngredientIndices for MemoIngredientIndices {
             unreachable!("Attempting to construct struct memo mapping for non tracked function?")
         };
 
+        // alloc: setup, once per tracked function when its jar registers
         let mut indices = Vec::new();
         indices.resize(
             (last.as_u32() as usize) + 1,

@@ -19,8 +19,9 @@ use std::{
     sync::LazyLock,
 };
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::{ContentId, radix};
+use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ItemContainerId, LocalFieldId, Lookup,
@@ -177,6 +178,7 @@ const SPARE_BYTES: usize = 1 << 20;
 
 thread_local! {
     static SPARE: RefCell<Spare> =
+        // alloc: none: empty until forms are given back, then at most `SPARE_COUNT` deep.
         const { RefCell::new(Spare { forms: Vec::new(), canons: Vec::new() }) };
 }
 
@@ -193,14 +195,8 @@ impl Form {
     }
 
     fn quiet() -> Form {
-        Form {
-            digest: Vec::new(),
-            spans: Vec::new(),
-            refs: Vec::new(),
-            slots: FxHashMap::default(),
-            missed: None,
-            quiet: true,
-        }
+        let FormBuffers { digest, spans, refs, slots } = FormBuffers::default();
+        Form { digest, spans, refs, slots, missed: None, quiet: true }
     }
 
     fn update(&mut self, bytes: &[u8]) {
@@ -450,7 +446,7 @@ const SEEN: usize = 64;
 const _: () = assert!(size_of::<Option<(Ty<'static>, &'static Code)>>() == 16);
 
 pub(crate) struct Cx<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     /// The type forms asked of [`ty_form`] lately, direct-mapped by the type's hash: one probe
     /// and no allocation, against salsa's interning of the key (a shard lock) and its memo
     /// lookup. A `Cx` lives inside one query, so a hit skips only a read that query recorded.
@@ -463,7 +459,7 @@ pub(crate) struct Cx<'db> {
 /// revisions while what it reads is unchanged: rustc's stable hash cached in each interned
 /// type, with salsa's backdating on top.
 #[salsa::tracked(returns(ref), cycle_result = ty_form_cycle)]
-pub(crate) fn ty_form(db: &dyn HirDatabase, ty: StoredTy) -> Code {
+pub(crate) fn ty_form(db: &Db, ty: StoredTy) -> Code {
     let mut form = Form::new("ty");
     Cx::new(db).spell(&mut form, ty.as_ref());
     form.code()
@@ -471,7 +467,7 @@ pub(crate) fn ty_form(db: &dyn HirDatabase, ty: StoredTy) -> Code {
 
 /// A type met again while it is spelled contains itself, which only a program rustc rejects
 /// has: every type of the cycle gets this, whichever of them was asked for first.
-fn ty_form_cycle(_: &dyn HirDatabase, _: salsa::Id, _: StoredTy) -> Code {
+fn ty_form_cycle(_: &Db, _: salsa::Id, _: StoredTy) -> Code {
     let mut form = Form::new("ty");
     form.error(Missed::ErrorType);
     form.code()
@@ -511,7 +507,8 @@ fn unobserved() -> AttrFlags {
 
 /// The auto traits a crate declares, by key.
 #[salsa::tracked(returns(ref))]
-fn crate_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
+fn crate_auto_traits(db: &Db, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
+    // alloc: the memo's own list, its length known once the crate is walked.
     let mut traits = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         for def in module.scope(db).declarations() {
@@ -527,24 +524,26 @@ fn crate_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, Trait
 
 /// The auto traits of the crates `krate` loads, in the order of their keys.
 #[salsa::tracked(returns(ref))]
-fn loaded_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[TraitId]> {
-    let mut traits: Vec<(ItemKey, TraitId)> = loaded_crates(db, krate)
-        .iter()
-        .flat_map(|&it| crate_auto_traits(db, it).iter().copied())
-        .collect();
-    traits.sort_unstable();
-    traits.dedup();
-    traits.into_iter().map(|(_, it)| it).collect()
+fn loaded_auto_traits(db: &Db, krate: Crate) -> Box<[TraitId]> {
+    frame::task(Tag::Other, |frame| {
+        let mut traits: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
+        for &it in loaded_crates(db, krate).iter() {
+            traits.extend_from_slice(crate_auto_traits(db, it));
+        }
+        traits.sort_unstable();
+        traits.dedup();
+        crate::table::column(traits.iter().map(|&(_, it)| it))
+    })
 }
 
 /// What an item's visibility is resolved to, once per item.
 #[salsa::tracked(returns(copy))]
-fn item_visibility(db: &dyn HirDatabase, id: ItemId) -> Visibility {
+fn item_visibility(db: &Db, id: ItemId) -> Visibility {
     item_visibility_uncached(db, id)
 }
 
 impl<'db> Cx<'db> {
-    pub(crate) fn new(db: &'db dyn HirDatabase) -> Cx<'db> {
+    pub(crate) fn new(db: &'db Db) -> Cx<'db> {
         Cx {
             db,
             seen: [const { Cell::new(None) }; SEEN],
@@ -555,7 +554,7 @@ impl<'db> Cx<'db> {
 
     /// A `Cx` that spells types itself, as every `Cx` did before [`ty_form`].
     #[cfg(test)]
-    pub(crate) fn reference(db: &'db dyn HirDatabase) -> Cx<'db> {
+    pub(crate) fn reference(db: &'db Db) -> Cx<'db> {
         Cx { reference: Some(Reference::default()), ..Cx::new(db) }
     }
 
@@ -2727,7 +2726,7 @@ enum Named {
 /// called with. Only the intrinsics do; a generic fn that calls one with its parameters is
 /// an instance that does, and codegen keys such an instance on the [`crate::Fact::Name`] of
 /// the nominal types in its arguments.
-pub fn observes_names(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn observes_names(db: &Db, func: FunctionId) -> bool {
     // A call of an unknown intrinsic is refused when it is lowered; keying it on the names
     // as well misses no input.
     matches!(
@@ -2746,7 +2745,7 @@ fn same_kind(a: AssocItemId, b: AssocItemId) -> bool {
 }
 
 /// The item whose store a closure is written in.
-fn store_item(db: &dyn HirDatabase, loc: InternedClosure<'_>) -> ItemId {
+fn store_item(db: &Db, loc: InternedClosure<'_>) -> ItemId {
     match loc.owner.expression_store_owner(db) {
         ExpressionStoreOwnerId::Signature(def) => generic_def_item(def),
         ExpressionStoreOwnerId::Body(body) => ItemId::of_body(db, body),
@@ -2758,7 +2757,7 @@ fn store_item(db: &dyn HirDatabase, loc: InternedClosure<'_>) -> ItemId {
     }
 }
 
-fn variant_module(db: &dyn HirDatabase, variant: VariantId) -> ModuleId {
+fn variant_module(db: &Db, variant: VariantId) -> ModuleId {
     match variant {
         VariantId::EnumVariantId(it) => it.lookup(db).parent.module(db),
         VariantId::StructId(it) => it.module(db),
@@ -2768,7 +2767,7 @@ fn variant_module(db: &dyn HirDatabase, variant: VariantId) -> ModuleId {
 
 /// The visibility of an item that is not associated: a function, constant or type alias has
 /// [`AssocItemId::assoc_visibility`] wherever it is.
-fn item_visibility_uncached(db: &dyn HirDatabase, id: ItemId) -> Visibility {
+fn item_visibility_uncached(db: &Db, id: ItemId) -> Visibility {
     match id {
         ItemId::Function(it) => AssocItemId::FunctionId(it).assoc_visibility(db),
         ItemId::Const(it) => AssocItemId::ConstId(it).assoc_visibility(db),
@@ -3063,7 +3062,7 @@ pub(crate) mod check {
     /// The locals the first walk finds used, by index: with the quiet form it walks with, and
     /// with a form that writes everything, as it walked before.
     pub(crate) fn uses<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         body: &MirBody<'db>,
     ) -> (Vec<usize>, Vec<usize>) {
         let used = |mut form: Form| {

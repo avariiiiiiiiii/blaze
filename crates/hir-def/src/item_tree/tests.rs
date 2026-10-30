@@ -1,4 +1,4 @@
-use base_db::{EditionedFileId, SourceDatabase};
+use base_db::EditionedFileId;
 use blaze_format::Persist;
 use expect_test::{Expect, expect};
 use hir_expand::HirFileId;

@@ -16,8 +16,11 @@ pub(crate) fn supertype(input: proc_macro::TokenStream) -> proc_macro::TokenStre
 }
 
 fn enum_impl(enum_item: syn::ItemEnum) -> syn::Result<TokenStream> {
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let enum_name = enum_item.ident.clone();
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     let mut variant_names = Vec::new();
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     let mut variant_types = Vec::new();
     if enum_item.variants.is_empty() {
         return Err(syn::Error::new(
@@ -28,7 +31,9 @@ fn enum_impl(enum_item: syn::ItemEnum) -> syn::Result<TokenStream> {
     for variant in &enum_item.variants {
         let valid = match &variant.fields {
             syn::Fields::Unnamed(fields) => {
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 variant_names.push(variant.ident.clone());
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 variant_types.push(fields.unnamed[0].ty.clone());
                 fields.unnamed.len() == 1
             }
@@ -72,11 +77,14 @@ fn enum_impl(enum_item: syn::ItemEnum) -> syn::Result<TokenStream> {
     let enum_lifetimes: Vec<syn::Lifetime> = enum_item
         .generics
         .lifetimes()
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         .map(|lt| lt.lifetime.clone())
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect();
     let variant_types_static: Vec<syn::Type> = variant_types
         .iter()
         .map(|ty| replace_lifetimes_with_static(ty, &enum_lifetimes))
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect();
 
     // Generate variant index identifiers for the const concatenation
@@ -84,6 +92,7 @@ fn enum_impl(enum_item: syn::ItemEnum) -> syn::Result<TokenStream> {
         .iter()
         .enumerate()
         .map(|(i, _)| quote::format_ident!("__VARIANT_{}", i))
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         .collect();
 
     let salsa_struct_in_db = quote! {
@@ -195,6 +204,7 @@ fn replace_lifetimes_with_static(ty: &syn::Type, lifetimes: &[syn::Lifetime]) ->
         }
     }
 
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let mut ty = ty.clone();
     LifetimeReplacer(lifetimes).visit_type_mut(&mut ty);
     ty

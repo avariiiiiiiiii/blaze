@@ -8,7 +8,7 @@
 //! instances it compiles.
 //!
 //! The unit of work is a file module with the inline modules written in it ([`check_module`]).
-//! The modules of a check go to the database as one batch ([`SourceDatabase::run_all`]), which
+//! The modules of a check go to the database as one batch ([`Db::run_all`]), which
 //! runs them as plane tasks over the one database; each task's diagnostics go in its module's
 //! slot, and the result is read in the def maps' order, so it is the same whatever order the
 //! tasks ran in.
@@ -20,11 +20,11 @@
 
 use std::{ptr, sync::OnceLock};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_def::nameres::crate_def_map;
 
 use crate::{
-    AnyDiagnostic, Crate, DefWithBody, Module, db::HirDatabase, diagnostics::DiagnosticsCollector,
+    AnyDiagnostic, Crate, DefWithBody, Module, diagnostics::DiagnosticsCollector,
 };
 
 /// Which bodies a check asks for: all of them when `None`.
@@ -35,13 +35,13 @@ pub type Bodies<'a> = Option<&'a (dyn Fn(DefWithBody) -> bool + Sync)>;
 const ITEMS_PER_TASK: usize = if cfg!(test) { 4 } else { 32 };
 
 /// The crates `blaze check` checks: the workspace's members.
-pub fn workspace_crates(db: &dyn HirDatabase) -> Vec<Crate> {
+pub fn workspace_crates(db: &Db) -> Vec<Crate> {
     Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
 }
 
 /// The modules of `krate` a check takes one at a time: every module but the inline ones, which
 /// are checked with the module they are written in, in the def map's order.
-pub fn file_modules(db: &dyn HirDatabase, krate: Crate) -> Vec<Module> {
+pub fn file_modules(db: &Db, krate: Crate) -> Vec<Module> {
     crate_def_map(db, krate.id)
         .modules(db)
         .filter(|(_, data)| !data.origin.is_inline())
@@ -54,7 +54,7 @@ pub fn file_modules(db: &dyn HirDatabase, krate: Crate) -> Vec<Module> {
 /// (a driver that knows which bodies an edit left as they were checked). The work of one plane
 /// task: it asks queries of the database and keeps nothing.
 pub fn check_module<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     module: Module,
     style_lints: bool,
     bodies: Bodies<'_>,
@@ -67,7 +67,7 @@ pub fn check_module<'db>(
 
 /// [`check_module`] of each of [`file_modules`] of `krate`, in their order.
 pub fn check_crate<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     style_lints: bool,
     bodies: Bodies<'_>,
@@ -77,7 +77,7 @@ pub fn check_crate<'db>(
 
 /// [`check_crate`] of each of `crates`, in their order, their modules all in one batch.
 pub fn check_crates<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     crates: &[Crate],
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'db>>)> {
@@ -93,7 +93,7 @@ pub fn check_crates<'db>(
 
 /// [`check_crates`] of [`workspace_crates`].
 pub fn check_workspace(
-    db: &dyn HirDatabase,
+    db: &Db,
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'_>>)> {
     check_crates(db, &workspace_crates(db), style_lints)
@@ -102,7 +102,7 @@ pub fn check_workspace(
 /// [`check_module`] of each of `modules` as one batch of the database's tasks; the diagnostics
 /// of each, in the order of `modules`.
 fn check_modules<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     modules: &[Module],
     style_lints: bool,
     bodies: Bodies<'_>,
@@ -113,10 +113,8 @@ fn check_modules<'db>(
     }
     let slots: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>> =
         modules.iter().map(|_| OnceLock::new()).collect();
-    HirDatabase::zalsa_register_downcaster(db);
     let home = ptr::from_ref(db).cast::<()>().addr();
-    db.run_all(starts.len(), &|task_db, task| {
-        let task_db = hir_db(task_db);
+    db.run_all(starts.len(), |task_db, task| {
         assert_eq!(
             ptr::from_ref(task_db).cast::<()>().addr(),
             home,
@@ -125,7 +123,7 @@ fn check_modules<'db>(
         // SAFETY: `task_db` is the object `db` points at (checked above), which is borrowed for
         // `'db` by this call, and `run_all` returns only once every task has run. `'db` brands
         // the diagnostics as that database's, which this one is.
-        let task_db: &'db dyn HirDatabase = unsafe { &*ptr::from_ref(task_db) };
+        let task_db: &'db Db = unsafe { &*ptr::from_ref(task_db) };
         let end = starts.get(task + 1).map_or(modules.len(), |&it| it as usize);
         for at in starts[task] as usize..end {
             let found = check_module(task_db, modules[at], style_lints, bodies);
@@ -140,7 +138,7 @@ fn check_modules<'db>(
 
 /// Where each task of `modules` starts: a run of modules, together of [`ITEMS_PER_TASK`]
 /// items or more but for the last, in order.
-pub(crate) fn tasks(db: &dyn HirDatabase, modules: &[Module]) -> Vec<u32> {
+pub(crate) fn tasks(db: &Db, modules: &[Module]) -> Vec<u32> {
     let mut starts = Vec::with_capacity(modules.len());
     let mut items = ITEMS_PER_TASK;
     for (at, module) in modules.iter().enumerate() {
@@ -152,12 +150,4 @@ pub(crate) fn tasks(db: &dyn HirDatabase, modules: &[Module]) -> Vec<u32> {
         items += 1 + scope.declarations().count() + scope.impls().len();
     }
     starts
-}
-
-/// `db` as the `HirDatabase` it is, once [`HirDatabase::zalsa_register_downcaster`] was called on
-/// it.
-fn hir_db(db: &dyn SourceDatabase) -> &(dyn HirDatabase + 'static) {
-    let caster = salsa::plumbing::views(db).downcaster_for::<dyn HirDatabase>();
-    // SAFETY: a database's views are made for that database's own type.
-    unsafe { caster.downcast_unchecked(db.into()) }
 }

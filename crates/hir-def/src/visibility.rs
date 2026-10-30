@@ -2,7 +2,7 @@
 
 use std::iter;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use hir_expand::{InFile, Lookup};
 use la_arena::ArenaMap;
 use syntax::ast::{self, HasVisibility};
@@ -31,7 +31,7 @@ const _: () = assert!(size_of::<Visibility>() <= 12);
 /// Whether `ancestor` is `module` or a module above it in their `DefMap`, by the parent each
 /// module id carries.
 fn is_ancestor_in_def_map<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     ancestor: ModuleIdLt<'db>,
     module: ModuleIdLt<'db>,
 ) -> bool {
@@ -41,7 +41,7 @@ fn is_ancestor_in_def_map<'db>(
 
 impl Visibility {
     pub fn resolve(
-        db: &dyn SourceDatabase,
+        db: &Db,
         resolver: &crate::resolver::Resolver<'_>,
         raw_vis: &RawVisibility,
     ) -> Self {
@@ -56,7 +56,7 @@ impl Visibility {
     #[tracing::instrument(skip_all)]
     pub fn is_visible_from<'db>(
         self,
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         from_module: ModuleIdLt<'db>,
     ) -> bool {
         let to_module = match self {
@@ -81,7 +81,7 @@ impl Visibility {
 
     pub(crate) fn is_visible_from_def_map<'db>(
         self,
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         def_map: &'db DefMap,
         from_module: ModuleIdLt<'db>,
     ) -> bool {
@@ -114,7 +114,7 @@ impl Visibility {
     /// the module its block is in), never a `DefMap`: `to_module` may be in the one being
     /// computed.
     fn is_visible_from_def_map_<'db>(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         def_map_block: Option<BlockIdLt<'db>>,
         mut to_module: ModuleIdLt<'db>,
         mut from_module: ModuleIdLt<'db>,
@@ -157,7 +157,7 @@ impl Visibility {
     /// visible in unrelated modules).
     pub(crate) fn max(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         other: Visibility,
         def_map: &DefMap,
     ) -> Option<Visibility> {
@@ -220,7 +220,7 @@ impl Visibility {
     /// visible in unrelated modules).
     pub(crate) fn min(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         other: Visibility,
         def_map: &DefMap,
     ) -> Option<Visibility> {
@@ -288,7 +288,7 @@ impl VariantFields {
     /// Resolve visibility of all specific fields of a struct or union variant.
     #[salsa::tracked(returns(ref))]
     pub fn field_visibilities(
-        db: &dyn SourceDatabase,
+        db: &Db,
         variant_id: VariantId,
     ) -> ArenaMap<LocalFieldId, Visibility> {
         let variant_fields = variant_id.fields(db);
@@ -306,7 +306,7 @@ impl VariantFields {
 }
 
 pub fn visibility_from_ast(
-    db: &dyn SourceDatabase,
+    db: &Db,
     has_resolver: impl HasResolver + HasModule,
     ast_vis: InFile<Option<ast::Visibility>>,
 ) -> Visibility {
@@ -328,7 +328,7 @@ pub fn visibility_from_ast(
 impl AssocItemId {
     /// Resolve visibility of an assoc item.
     #[salsa::tracked(returns(copy))]
-    pub fn assoc_visibility(self, db: &dyn SourceDatabase) -> Visibility {
+    pub fn assoc_visibility(self, db: &Db) -> Visibility {
         match self {
             AssocItemId::FunctionId(function_id) => {
                 let loc = function_id.lookup(db);
@@ -356,7 +356,7 @@ impl AssocItemId {
 }
 
 fn trait_item_visibility(
-    db: &dyn SourceDatabase,
+    db: &Db,
     container: ItemContainerId,
 ) -> Option<Visibility> {
     match container {
@@ -365,7 +365,7 @@ fn trait_item_visibility(
     }
 }
 
-fn trait_visibility(db: &dyn SourceDatabase, def: TraitId) -> Visibility {
+fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
     let loc = def.lookup(db);
     let source = loc.source(db);
     visibility_from_ast(db, def, source.map(|src| src.visibility()))

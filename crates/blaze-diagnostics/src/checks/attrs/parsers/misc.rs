@@ -127,11 +127,13 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
         }
         ["crate_type"] => {
             let range = cx.attr_range();
-            let _ = name_value_str(cx, args, range, None);
+            let _ = early_fatal(cx, |cx| name_value_str(cx, args, range, None));
             state.crate_type = true;
             Accepted::Group("crate_type")
         }
-        ["recursion_limit"] => Accepted::Single(limit_of(cx, args).map(|_| other("RecursionLimit"))),
+        ["recursion_limit"] => {
+            Accepted::Single(early_fatal(cx, |cx| limit_of(cx, args)).map(|_| other("RecursionLimit")))
+        }
         ["move_size_limit"] => Accepted::Single(limit_of(cx, args).map(|_| other("MoveSizeLimit"))),
         ["type_length_limit"] => Accepted::Single(limit_of(cx, args).map(|_| other("TypeLengthLimit"))),
         ["pattern_complexity_limit"] => {
@@ -227,6 +229,16 @@ pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>,
 fn name_value_str(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, range: TextRange, name: Option<&str>) -> Option<String> {
     let nv = cx.expect_name_value(args, range, name)?;
     cx.expect_string_literal(nv)
+}
+
+/// `parse` of an attribute of the crate root rustc reads before expansion
+/// (`collect_crate_types`, `get_recursion_limit`: `ShouldEmit::EarlyFatal`), its errors fatal
+/// there; elsewhere the attribute is parsed as any other.
+fn early_fatal<'a, 'c, 'db, T>(
+    cx: &mut Accept<'a, 'c, 'db>,
+    parse: impl FnOnce(&mut Accept<'a, 'c, 'db>) -> T,
+) -> T {
+    if cx.owner.target == Target::Crate && cx.attr.inner { cx.fatal(parse) } else { parse(cx) }
 }
 
 /// rustc's `RecursionLimitParser` and the other limits': `#![recursion_limit = "N"]`.
@@ -520,7 +532,8 @@ fn path(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
         && args.as_name_value().and_then(NameValue::value_as_str).is_none()
         && cx.owner.attrs.iter().position(|it| it.is("path")) == Some(cx.index)
     {
-        let diag = malformed(cx.cx, cx.attr, "path", &PATH, cx.attr.inner);
+        let mut diag = malformed(cx.cx, cx.attr, "path", &PATH, cx.attr.inner);
+        diag.stop();
         cx.emit_err(diag);
         return None;
     }
@@ -655,10 +668,16 @@ fn unexpanded_value(
         "crate_name" | "crate_type" | "recursion_limit"
             if attr.inner && parent.kind() == SyntaxKind::SOURCE_FILE && in_root_file(cx, attr) =>
         {
-            Some(literal())
+            let mut diag = literal();
+            if name != Some("crate_name") {
+                diag.stop();
+            }
+            Some(diag)
         }
         "path" if parent.kind() == SyntaxKind::MODULE && first_path(&parent, written) => {
-            Some(malformed(cx, attr, "path", &PATH, attr.inner))
+            let mut diag = malformed(cx, attr, "path", &PATH, attr.inner);
+            diag.stop();
+            Some(diag)
         }
         _ => None,
     }

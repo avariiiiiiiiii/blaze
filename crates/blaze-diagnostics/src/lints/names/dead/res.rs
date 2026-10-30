@@ -13,7 +13,11 @@
 //! `compiler/rustc_hir/src/def.rs` (`Res`) (MIT or Apache-2.0).
 
 use hir::{GenericDef, ModuleDef, PathResolution};
-use hir_def::{AdtId, FunctionId};
+use hir_def::{
+    AdtId, EnumVariantId, FunctionId, GenericDefId, TypeParamId,
+    resolver::{TypeNs, ValueNs},
+};
+use hir_ty::method_resolution::CandidateId;
 
 use super::defs::{DefIdx, Defs, Id, Kind, Parent};
 use crate::cx::Cx;
@@ -88,6 +92,67 @@ impl Res {
         match FunctionId::try_from(function) {
             Ok(id) => Res::assoc(defs, Id::Fn(id)),
             Err(()) => Res::None,
+        }
+    }
+
+    /// An associated item of the crate, mapped as [`Res::def`] maps it.
+    pub(super) fn item(defs: &Defs, def: DefIdx) -> Res {
+        Res::assoc(defs, defs[def].id)
+    }
+
+    /// What inference resolved a method call to.
+    pub(super) fn method(defs: &Defs, function: FunctionId) -> Res {
+        Res::assoc(defs, Id::Fn(function))
+    }
+
+    /// What inference resolved a type-relative path to (typeck's `type_dependent_def_id`).
+    pub(super) fn candidate(defs: &Defs, candidate: CandidateId) -> Res {
+        match candidate {
+            CandidateId::FunctionId(it) => Res::assoc(defs, Id::Fn(it)),
+            CandidateId::ConstId(it) => Res::assoc(defs, Id::Const(it)),
+        }
+    }
+
+    pub(super) fn variant(defs: &Defs, variant: EnumVariantId) -> Res {
+        defs.get(Id::Variant(variant)).map_or(Res::None, Res::Variant)
+    }
+
+    /// What the resolver resolved a path to in the value namespace, as [`Res::path`] maps
+    /// the same path through `hir`.
+    pub(super) fn value(defs: &Defs, value: ValueNs, self_ctor: bool) -> Res {
+        match value {
+            ValueNs::FunctionId(it) => Res::assoc(defs, Id::Fn(it)),
+            ValueNs::ConstId(it) => Res::assoc(defs, Id::Const(it)),
+            ValueNs::StaticId(it) => Res::of(defs, Id::Static(it)),
+            ValueNs::StructId(it) => Res::of(defs, Id::Adt(AdtId::StructId(it))),
+            ValueNs::EnumVariantId(it) => Res::variant(defs, it),
+            ValueNs::ImplSelf(_) if self_ctor => Res::SelfCtor,
+            ValueNs::ImplSelf(it) => Res::of(defs, Id::Impl(it)),
+            ValueNs::LocalBinding(_) | ValueNs::GenericParam(_) => Res::None,
+        }
+    }
+
+    /// What the resolver resolved a path to in the type namespace, as [`Res::path`] maps it.
+    pub(super) fn ty(defs: &Defs, ty: TypeNs, self_ctor: bool) -> Res {
+        match ty {
+            TypeNs::SelfType(_) if self_ctor => Res::SelfCtor,
+            TypeNs::SelfType(it) => Res::of(defs, Id::Impl(it)),
+            TypeNs::GenericParam(it) => Res::type_param(defs, it),
+            TypeNs::AdtId(it) | TypeNs::AdtSelfType(it) => Res::of(defs, Id::Adt(it)),
+            TypeNs::EnumVariantId(it) => Res::variant(defs, it),
+            TypeNs::TypeAliasId(it) => Res::assoc(defs, Id::Alias(it)),
+            TypeNs::TraitId(it) => Res::of(defs, Id::Trait(it)),
+            TypeNs::BuiltinType(_) | TypeNs::ModuleId(_) => Res::None,
+        }
+    }
+
+    /// A type parameter: `Self` in a trait is rustc's `Res::SelfTyParam { trait_ }`.
+    pub(super) fn type_param(defs: &Defs, param: TypeParamId) -> Res {
+        match param.parent() {
+            GenericDefId::TraitId(trait_) if param == TypeParamId::trait_self(trait_) => {
+                Res::of(defs, Id::Trait(trait_))
+            }
+            _ => Res::None,
         }
     }
 }

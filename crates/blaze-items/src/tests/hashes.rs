@@ -181,7 +181,7 @@ fn g() -> u32 { f() }
 "#,
     );
     let g = item(&db, "g");
-    let executed = db.executed(|| {
+    let executed = db.log_executed(|| {
         crate::interface_hash(&db, g).unwrap();
     });
     assert!(

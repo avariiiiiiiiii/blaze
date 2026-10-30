@@ -163,6 +163,7 @@ impl Table {
                     ctrl: AtomicU64::new(0),
                     nodes: std::array::from_fn(|_| AtomicU32::new(0)),
                 })
+                // alloc: growth: one table per doubling of the node count, the old one freed at the next revision
                 .collect(),
         }
     }
@@ -256,9 +257,12 @@ impl Nodes {
             .max(LEAST_SHARD_BITS);
         let shards = 1usize << shard_bits;
         Nodes {
+            // alloc: setup, once per database
             heads: (0..shards).map(|_| Head::new()).collect(),
+            // alloc: setup, once per database
             writers: (0..shards).map(|_| Writer(Mutex::new(0))).collect(),
             shard_bits,
+            // alloc: setup, once per database
             pages: (0..PAGES).map(|_| OnceLock::new()).collect(),
             next: AtomicU32::new(0),
         }
@@ -303,6 +307,7 @@ impl Nodes {
         let entries = cache.entries.get_or_init(|| {
             (0..CACHE)
                 .map(|_| Cell::new(CacheEntry::EMPTY))
+                // alloc: setup, once per task: its 1024-entry node cache
                 .collect()
         });
         let hash = hash_parts(id, ingredient);
@@ -439,20 +444,12 @@ impl Nodes {
 mod tests {
     use std::collections::HashMap;
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::{FIRST_PAGE_BITS, NodeCache, Nodes, locate};
     use crate::Id;
     use crate::key::DatabaseKeyIndex;
     use crate::zalsa::IngredientIndex;
-
-    fn stream(mut state: u64) -> impl FnMut() -> u64 {
-        move || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-    }
 
     fn key(ingredient: u32, index: u32, generation: u32) -> DatabaseKeyIndex {
         // SAFETY: Test indices are below `Id::MAX_U32`.
@@ -478,12 +475,12 @@ mod tests {
         let nodes = Nodes::new();
         let cache = NodeCache::default();
         let mut model: HashMap<DatabaseKeyIndex, u32> = HashMap::new();
-        let mut next = stream(7);
+        let mut rng = SplitMix64::new(7);
         for step in 0..60_000u32 {
             let k = key(
-                (next() % 40) as u32,
-                (next() % 3000) as u32,
-                (next() % 3) as u32,
+                rng.below(40) as u32,
+                rng.below(3000) as u32,
+                rng.below(3) as u32,
             );
             let fresh = model.len() as u32;
             let want = *model.entry(k).or_insert(fresh);
@@ -540,11 +537,8 @@ mod tests {
                     let (nodes, keys) = (&nodes, &keys);
                     scope.spawn(move || {
                         let cache = NodeCache::default();
-                        let mut next = stream(t);
                         let mut order: Vec<usize> = (0..keys.len()).collect();
-                        for i in (1..order.len()).rev() {
-                            order.swap(i, (next() % (i as u64 + 1)) as usize);
-                        }
+                        SplitMix64::new(t).shuffle(&mut order);
                         let mut got = vec![0; keys.len()];
                         for i in order {
                             got[i] = nodes.node_cached(&cache, keys[i]);

@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
@@ -36,6 +37,7 @@ span.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 hir.workspace = true
 test-fixture.workspace = true
 test-utils.workspace = true

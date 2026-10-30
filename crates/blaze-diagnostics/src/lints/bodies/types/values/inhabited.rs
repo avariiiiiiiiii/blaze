@@ -6,6 +6,7 @@
 //! `inhabited_predicate_adt`, `VariantDef::inhabited_predicate`) and
 //! `compiler/rustc_middle/src/ty/inhabitedness/inhabited_predicate.rs` (MIT or Apache-2.0).
 
+use base_db::Db;
 use hir::db::HirDatabase;
 use hir_def::{
     AdtId, AttrDefId, HasModule as _, ModuleId, VariantId,
@@ -47,7 +48,7 @@ pub(super) enum Pred<'db> {
 /// The predicates of one lint's types: their `And`s and `Or`s, and those of the ADTs seen.
 pub(super) struct Preds<'s, 'db> {
     solver: &'s Solver<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: base_db::Crate,
     pairs: Vec<[Pred<'db>; 2]>,
     adts: FxHashMap<AdtId, Pred<'db>>,

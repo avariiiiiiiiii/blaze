@@ -1,9 +1,9 @@
 //! What the bridge's `proc_macro` is answered (`proc_macro/lib.rs`, `__native::Host`):
 //! what the wasm host answers a module (`crates/blaze-macro-wasm/src/lib.rs`, `add_host`), the
-//! same number for the same span and the same question of the database for the same call, so
+//! same word for the same span and the same question of the database for the same call, so
 //! that a macro expands to the same tokens either way.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use load_cargo::{SubRequest, SubResponse};
 use span::{
     EditionedFileId, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
@@ -12,16 +12,16 @@ use span::{
 
 use super::{
     lex,
-    wire::{Spans, Tree, Writer},
+    wire::{self, NONE, Parts, Tree},
 };
 
 /// The host of one expansion.
 pub(super) struct Host<'a> {
     /// What is asked of a span, or `None` where nothing can be, as in a test.
-    pub(super) db: Option<&'a dyn SourceDatabase>,
-    pub(super) spans: Spans,
-    /// The numbers of the def, call and mixed sites.
-    pub(super) sites: [u32; 3],
+    pub(super) db: Option<&'a Db>,
+    pub(super) parts: &'a mut Parts,
+    /// The words of the def, call and mixed sites.
+    pub(super) sites: [u64; 3],
 }
 
 impl Host<'_> {
@@ -29,8 +29,12 @@ impl Host<'_> {
         Some(load_cargo::answer(self.db?, req))
     }
 
-    fn span(&self, number: u32) -> Option<Span> {
-        self.spans.get(number)
+    fn span(&self, word: u64) -> Option<Span> {
+        self.parts.get(word)
+    }
+
+    fn number(&mut self, span: Span) -> u64 {
+        self.parts.pack(span)
     }
 
     fn join(&mut self, first: Span, second: Span) -> Option<Span> {
@@ -88,13 +92,14 @@ impl Host<'_> {
     }
 
     fn call_site_span(&self) -> Span {
-        self.span(self.sites[1]).expect("the current call site is numbered")
+        self.span(self.sites[1]).expect("the current call site is one of the expansion's")
     }
 
+    /// `trees` as the columns the macro reads of text it asked to be tokens of.
     fn written(&mut self, trees: &[Tree]) -> Vec<u8> {
-        let mut writer = Writer { out: Vec::new(), spans: &mut self.spans };
-        writer.trees(trees);
-        writer.out
+        let mut out = Vec::new();
+        wire::relative(&wire::invisible(trees, self.call_site_span()), self.parts, &mut out);
+        out
     }
 }
 
@@ -150,79 +155,87 @@ fn located(span: Span) -> (u32, u32, u32, u32) {
 }
 
 impl native_proc_macro::__native::Host for Host<'_> {
-    fn def_site(&mut self) -> u32 {
+    fn def_site(&mut self) -> u64 {
         self.sites[0]
     }
 
-    fn call_site(&mut self) -> u32 {
+    fn call_site(&mut self) -> u64 {
         self.sites[1]
     }
 
-    fn mixed_site(&mut self) -> u32 {
+    fn mixed_site(&mut self) -> u64 {
         self.sites[2]
     }
 
-    fn span_join(&mut self, a: u32, b: u32) -> u32 {
-        let (Some(first), Some(second)) = (self.span(a), self.span(b)) else { return 0 };
-        self.join(first, second).map_or(0, |it| self.spans.number(it))
+    fn span_join(&mut self, a: u64, b: u64) -> u64 {
+        let (Some(first), Some(second)) = (self.span(a), self.span(b)) else { return NONE };
+        self.join(first, second).map_or(NONE, |it| self.number(it))
     }
 
-    fn span_resolved_at(&mut self, a: u32, at: u32) -> u32 {
+    fn span_resolved_at(&mut self, a: u64, at: u64) -> u64 {
         let (Some(span), Some(at)) = (self.span(a), self.span(at)) else { return a };
-        self.spans.number(Span { ctx: at.ctx, ..span })
+        self.number(Span { ctx: at.ctx, ..span })
     }
 
-    fn span_located_at(&mut self, a: u32, b: u32) -> u32 {
+    fn span_located_at(&mut self, a: u64, b: u64) -> u64 {
         let (Some(span), Some(other)) = (self.span(a), self.span(b)) else { return b };
-        self.spans.number(Span { ctx: span.ctx, ..other })
+        self.number(Span { ctx: span.ctx, ..other })
     }
 
-    fn span_parent(&mut self, a: u32) -> u32 {
-        let Some(span) = self.span(a) else { return 0 };
+    fn span_parent(&mut self, a: u64) -> u64 {
+        let Some(span) = self.span(a) else { return NONE };
         let (file_id, ast_id, start, end) = located(span);
         let req = SubRequest::SpanParent { file_id, ast_id, start, end, ctx: span.ctx.into_u32() };
         match self.ask(req) {
             Some(SubResponse::SpanParentResult { parent_span: Some(it) }) => {
-                self.spans.number(spanned(it.file_id, it.ast_id, it.start, it.end, it.ctx))
+                self.number(spanned(it.file_id, it.ast_id, it.start, it.end, it.ctx))
             }
-            _ => 0,
+            _ => NONE,
         }
     }
 
-    fn span_source(&mut self, a: u32) -> u32 {
+    fn span_source(&mut self, a: u64) -> u64 {
         let Some(span) = self.span(a) else { return a };
         let (file_id, ast_id, start, end) = located(span);
         let req = SubRequest::SpanSource { file_id, ast_id, start, end, ctx: span.ctx.into_u32() };
         match self.ask(req) {
             Some(SubResponse::SpanSourceResult { file_id, ast_id, start, end, ctx }) => {
-                self.spans.number(spanned(file_id, ast_id, start, end, ctx))
+                self.number(spanned(file_id, ast_id, start, end, ctx))
             }
             _ => a,
         }
     }
 
-    fn span_start(&mut self, a: u32) -> u32 {
+    fn span_start(&mut self, a: u64) -> u64 {
         let Some(span) = self.span(a) else { return a };
         if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
             return a;
         }
-        self.spans.number(Span { range: TextRange::empty(span.range.start()), ..span })
+        self.number(Span { range: TextRange::empty(span.range.start()), ..span })
     }
 
-    fn span_end(&mut self, a: u32) -> u32 {
+    fn span_end(&mut self, a: u64) -> u64 {
         let Some(span) = self.span(a) else { return a };
         if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
             return a;
         }
-        self.spans.number(Span { range: TextRange::empty(span.range.end()), ..span })
+        self.number(Span { range: TextRange::empty(span.range.end()), ..span })
     }
 
-    fn span_subspan(&mut self, a: u32, start: u64, end: u64) -> u32 {
-        let Some(span) = self.span(a) else { return 0 };
-        subspan(span, start, end).map_or(0, |it| self.spans.number(it))
+    fn span_subspan(&mut self, a: u64, start: u64, end: u64) -> u64 {
+        let Some(span) = self.span(a) else { return NONE };
+        subspan(span, start, end).map_or(NONE, |it| self.number(it))
     }
 
-    fn span_byte_range(&mut self, a: u32) -> [u32; 2] {
+    fn span_pack(&mut self, start: u32, len: u32, part: u32) -> u64 {
+        self.parts.pack_fields(start, len, part)
+    }
+
+    fn span_unpack(&mut self, a: u64) -> [u32; 3] {
+        self.parts.fields(a)
+    }
+
+    fn span_byte_range(&mut self, a: u64) -> [u32; 2] {
         let Some(span) = self.span(a) else { return [0, 0] };
         let (file_id, ast_id, start, end) = located(span);
         let range = match self.ask(SubRequest::ByteRange { file_id, ast_id, start, end }) {
@@ -232,21 +245,21 @@ impl native_proc_macro::__native::Host for Host<'_> {
         [range.start as u32, range.end as u32]
     }
 
-    fn span_line(&mut self, a: u32) -> u32 {
+    fn span_line(&mut self, a: u64) -> u32 {
         let span = self.span(a);
         span.and_then(|span| self.line_column(span)).map_or(1, |(line, _)| line)
     }
 
-    fn span_column(&mut self, a: u32) -> u32 {
+    fn span_column(&mut self, a: u64) -> u32 {
         let span = self.span(a);
         span.and_then(|span| self.line_column(span)).map_or(1, |(_, column)| column)
     }
 
-    fn span_debug(&mut self, a: u32) -> Option<String> {
+    fn span_debug(&mut self, a: u64) -> Option<String> {
         self.span(a).map(|it| format!("{it:?}"))
     }
 
-    fn span_file(&mut self, a: u32) -> Option<String> {
+    fn span_file(&mut self, a: u64) -> Option<String> {
         let span = self.span(a)?;
         let req = SubRequest::FilePath { file_id: span.anchor.file_id.file_id().index() };
         match self.ask(req) {
@@ -255,7 +268,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
         }
     }
 
-    fn span_local_file(&mut self, a: u32) -> Option<String> {
+    fn span_local_file(&mut self, a: u64) -> Option<String> {
         let span = self.span(a)?;
         let req = SubRequest::LocalFilePath { file_id: span.anchor.file_id.file_id().index() };
         match self.ask(req) {
@@ -264,7 +277,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
         }
     }
 
-    fn span_source_text(&mut self, a: u32) -> Option<String> {
+    fn span_source_text(&mut self, a: u64) -> Option<String> {
         let span = self.span(a)?;
         let (file_id, ast_id, start, end) = located(span);
         match self.ask(SubRequest::SourceText { file_id, ast_id, start, end }) {
@@ -283,5 +296,13 @@ impl native_proc_macro::__native::Host for Host<'_> {
     fn literal_from_str(&mut self, text: &str) -> Option<Vec<u8>> {
         let literal = lex::literal_from_str(text, self.call_site_span())?;
         Some(self.written(&[Tree::Leaf(tt::Leaf::Literal(literal))]))
+    }
+
+    fn pack(&mut self, span: Span) -> u64 {
+        self.parts.pack(span)
+    }
+
+    fn get(&self, word: u64) -> Option<Span> {
+        self.parts.get(word)
     }
 }

@@ -5,7 +5,7 @@
 //! query is an index or two; building them allocates only the exact-size columns.
 use std::{cell::Cell, mem};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use blaze_ids::radix;
 use hir_expand::{MacroDefId, name::Name};
 use la_arena::{Idx, RawIdx};
@@ -114,19 +114,19 @@ impl ScopeByExpr {
 #[salsa::tracked]
 impl ExprScopes {
     #[salsa::tracked(returns(ref))]
-    pub fn body_expr_scopes(db: &dyn SourceDatabase, def: DefWithBodyId) -> ExprScopes {
+    pub fn body_expr_scopes(db: &Db, def: DefWithBodyId) -> ExprScopes {
         let body = Body::of(db, def);
         build(|scopes| walk_body(scopes, body))
     }
 
     #[salsa::tracked(returns(ref))]
-    pub fn sig_expr_scopes(db: &dyn SourceDatabase, def: GenericDefId) -> ExprScopes {
+    pub fn sig_expr_scopes(db: &Db, def: GenericDefId) -> ExprScopes {
         let (_, store) = GenericParams::with_store(db, def);
         build(|scopes| walk_store(scopes, store, store.expr_roots()))
     }
 
     #[salsa::tracked(returns(ref))]
-    pub fn variant_scopes(db: &dyn SourceDatabase, def: VariantId) -> ExprScopes {
+    pub fn variant_scopes(db: &Db, def: VariantId) -> ExprScopes {
         let fields = VariantFields::of(db, def);
         build(|scopes| walk_store(scopes, &fields.store, fields.store.expr_roots()))
     }
@@ -134,7 +134,7 @@ impl ExprScopes {
 
 impl ExprScopes {
     #[inline]
-    pub fn of(db: &dyn SourceDatabase, def: impl Into<ExpressionStoreOwnerId>) -> &ExprScopes {
+    pub fn of(db: &Db, def: impl Into<ExpressionStoreOwnerId>) -> &ExprScopes {
         match def.into() {
             ExpressionStoreOwnerId::Body(def) => Self::body_expr_scopes(db, def),
             ExpressionStoreOwnerId::Signature(def) => Self::sig_expr_scopes(db, def),
@@ -300,6 +300,7 @@ impl Building {
         if !self.scope_entries.is_sorted_by_key(|&(scope, _)| scope) {
             radix::sort_by_key(&mut self.scope_entries, |&(scope, _)| scope);
         }
+        // alloc: the frozen column, once per store.
         let mut entries: Box<[[u32; 2]]> = vec![[0, 0]; self.parent.len()].into_boxed_slice();
         for (at, &(scope, _)) in self.scope_entries.iter().enumerate() {
             let range = &mut entries[scope as usize];
@@ -313,6 +314,7 @@ impl Building {
             kind: Box::from(&*self.kind),
             data: Box::from(&*self.data),
             entries,
+            // alloc: the frozen column, once per store, exact size from the drain.
             scope_entries: self.scope_entries.drain(..).map(|(_, entry)| entry).collect(),
             blocks: Box::from(&*self.blocks),
             macro_defs: Box::from(&*self.macro_defs),
@@ -391,7 +393,7 @@ fn add_binding(
 ) {
     let Binding { name, .. } = &store[binding];
     let hygiene = store.binding_hygiene(binding);
-    sink.push_entry(scope, ScopeEntry { name: name.clone(), binding, hygiene });
+    sink.push_entry(scope, ScopeEntry { name: *name, binding, hygiene });
 }
 
 struct ExprScopeVisitor<'a, S> {

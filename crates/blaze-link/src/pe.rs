@@ -18,12 +18,13 @@ mod image;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
 use std::sync::Mutex;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer};
+use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// Where link.exe loads an executable and a DLL when the loader does not move them.
@@ -61,21 +62,29 @@ const ABSENT: &[&str] = &[
     "__enclave_config",
 ];
 
-pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
     if output.format != Format::Pe {
-        return Err(error(format!("the PE writer was asked for a {:?} image", output.format)));
+        return Err(error(format_args!("the PE writer was asked for a {:?} image", output.format)));
     }
     if output.arch != Arch::X86_64 {
-        return Err(error(format!(
+        return Err(error(format_args!(
             "a PE image for {:?}: blaze links PE for x86_64-pc-windows-msvc only",
             output.arch
         )));
     }
-    Ok(Box::new(Pe { output: output.clone(), descriptors: Mutex::default() }))
+    // alloc: once per link: the writer's own copy of the output it makes
+    Ok(Pe { output: output.clone(), descriptors: Mutex::default() })
 }
 
-pub(crate) fn error(what: String) -> LinkError {
-    LinkError { function: None, what }
+/// An error, formatted only when it is returned.
+pub(crate) fn error(what: impl fmt::Display) -> LinkError {
+    // alloc: error path
+    LinkError { function: None, what: what.to_string() }
+}
+
+/// A [`Class::Named`] of a section name.
+pub(crate) fn named(name: SectionName, write: bool, exec: bool) -> Class {
+    Class::Named { name, write, exec }
 }
 
 pub(crate) struct Pe {
@@ -239,21 +248,23 @@ impl Writer for Pe {
             Some((base, suffix)) => (base, Some(suffix)),
             None => (name, None),
         };
-        let named = |name: &str, write, exec| Class::Named { name: name.to_owned(), write, exec };
         let class = match base {
             ".text" => Class::Text,
             ".rdata" | ".xdata" => Class::Rodata,
             ".data" => Class::Data,
             ".bss" => Class::Bss,
             ".tls" => Class::Tdata,
-            OBJ_PDATA | CRT | RSRC => named(base, false, false),
+            OBJ_PDATA => named(OBJ_PDATA.into(), false, false),
+            CRT => named(CRT.into(), false, false),
+            RSRC => named(RSRC.into(), false, false),
             ".idata" | ".edata" | ".reloc" | ".didat" => {
+                // alloc: error path
                 return Err(format!(
                     "section {name} holds tables the linker makes; no input may define it"
                 ));
             }
             _ if tls => Class::Tdata,
-            _ => named(base, write, exec),
+            _ => named(SectionName::new(base), write, exec),
         };
         Ok((class, rank(suffix)))
     }
@@ -268,7 +279,7 @@ impl Writer for Pe {
             _ => name
                 .strip_prefix("__imp_")
                 .filter(|it| !it.is_empty())
-                .map(|it| Special::Got(it.to_owned())),
+                .map(|_| Special::Got { from: "__imp_".len() as u32 }),
         }
     }
 
@@ -289,6 +300,7 @@ impl Writer for Pe {
         addend: i64,
     ) -> Result<(), String> {
         let _ = (bytes, s, addend);
+        // alloc: error path
         Err(format!(
             "PE has no relocation of its own (type {r_type} at {p:#x}): every AMD64 relocation \
              is read as one the core applies"
@@ -314,6 +326,7 @@ impl Writer for Pe {
     fn own(&self, class: &Class) -> (Class, u32) {
         match class {
             Class::Tdata | Class::Tbss => (Class::Tdata, rank(Some(""))),
+            // clone: the core asks once per class and keeps the answer (`stage.rs`'s `own`)
             _ => (class.clone(), u32::MAX),
         }
     }

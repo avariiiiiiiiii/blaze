@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+use hir_ty::db::HirDatabase;
 use cranelift_codegen::ir::{
     self, AbiParam, Endianness, InstBuilder, MemFlagsData, Type, Value,
     condcodes::{FloatCC, IntCC},
@@ -1233,6 +1234,8 @@ fn untyped_vector_intrinsic(name: &str) -> Option<(&'static [Type], Type, How)> 
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     #[test]
@@ -1450,24 +1453,13 @@ mod tests {
         assert!(!admits(Vectors::Neon, Op::ReduceAdd, F32, true));
     }
 
-    /// A seeded xorshift, for the model tests.
-    fn seeded(seed: u64) -> impl FnMut() -> u64 {
-        let mut state = seed | 1;
-        move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        }
-    }
-
     /// The factor repeats a lane as storing it in every lane of 8 bytes would.
     #[test]
     fn repeat_factor_repeats_the_lane() {
-        let mut next = seeded(0x5eed);
+        let mut rng = SplitMix64::new(0x5eed);
         for _ in 0..1000 {
             for bits in [8u32, 16, 32] {
-                let lane = next() & ((1u64 << bits) - 1);
+                let lane = rng.next_u64() & ((1u64 << bits) - 1);
                 let factor = repeat_factor(bits).expect("a factor") as u64;
                 let mut lanes = 0u64;
                 for at in (0..64).step_by(bits as usize) {
@@ -1484,10 +1476,10 @@ mod tests {
     /// lane, for each lane width and combination.
     #[test]
     fn rotations_reduce_every_lane() {
-        let mut next = seeded(0xb1a2e);
+        let mut rng = SplitMix64::new(0xb1a2e);
         for _ in 0..500 {
             let mut bytes = [0u8; 16];
-            bytes.iter_mut().for_each(|it| *it = next() as u8);
+            rng.fill(&mut bytes);
             for lane in [1u8, 2, 4, 8] {
                 let read = |bytes: &[u8; 16], i: usize| {
                     let mut word = [0u8; 8];

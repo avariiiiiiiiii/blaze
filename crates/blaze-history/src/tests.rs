@@ -11,6 +11,7 @@ use blaze_graph::{
     admission::{Predict, TaskKind},
     machine::{NodeId, Outcome, Pool, Spec},
 };
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::NodeKind;
 
 use crate::{
@@ -20,28 +21,10 @@ use crate::{
     table::{self, RUNS, Record, WAYS, Writer, halves},
 };
 
-struct SplitMix(u64);
-
-impl SplitMix {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n.max(1)
-    }
-
-    fn key(&mut self) -> Key {
-        let mut bytes = [0; 32];
-        for chunk in bytes.chunks_mut(8) {
-            chunk.copy_from_slice(&self.next_u64().to_le_bytes());
-        }
-        Key(bytes)
-    }
+fn random_key(random: &mut SplitMix64) -> Key {
+    let mut bytes = [0; 32];
+    random.fill(&mut bytes);
+    Key(bytes)
 }
 
 /// Keys of one bucket of any table: the same first eight bytes, then `n`.
@@ -95,7 +78,7 @@ fn a_record_peak_rises_at_once_and_comes_down_by_halves() {
 
 #[test]
 fn a_kind_mean_stays_between_its_runs() {
-    let mut random = SplitMix(3);
+    let mut random = SplitMix64::new(3);
     let mut history = History::new(config(16));
     let (mut least, mut most) = (u64::MAX, 0);
     for _ in 0..5000 {
@@ -181,20 +164,20 @@ impl Model {
 #[test]
 fn the_table_holds_what_the_model_says() {
     for seed in 0..100u64 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let slots = [WAYS, 16, 64][random.below(3) as usize];
-        let keys: Vec<Key> = (0..1 + random.below(60)).map(|_| random.key()).collect();
+        let keys: Vec<Key> = (0..1 + random.below(60)).map(|_| random_key(&mut random)).collect();
         let mut writer = Writer::new(slots);
         let reader = writer.reader();
         let mut model = Model::default();
         for _ in 0..2000 {
             let kind = TaskKind(random.below(3) as u32);
-            let key = &keys[random.below(keys.len() as u64) as usize];
+            let key = &keys[random.index(keys.len())];
             let (ran, peak) = (random.below(1 << 20) as u32, random.below(1 << 40));
             writer.observe(kind, key, ran, peak);
             model.observe(slots, kind, key, ran, peak);
             let kind = TaskKind(random.below(3) as u32);
-            let key = &keys[random.below(keys.len() as u64) as usize];
+            let key = &keys[random.index(keys.len())];
             let got = writer.get(kind, key);
             assert_eq!(got, reader.get(kind, key), "seed {seed}: the reader reads what the writer does");
             assert_eq!(got.map(|it| (it.ran_us(), it.peak)), model.get(slots, kind, key), "seed {seed}");
@@ -205,12 +188,12 @@ fn the_table_holds_what_the_model_says() {
 
 /// Observations of a few kinds and keys, some keyless, some of kinds never seen again.
 fn observed(seed: u64, slots: usize) -> History {
-    let mut random = SplitMix(seed);
-    let keys: Vec<Key> = (0..1 + random.below(300)).map(|_| random.key()).collect();
+    let mut random = SplitMix64::new(seed);
+    let keys: Vec<Key> = (0..1 + random.below(300)).map(|_| random_key(&mut random)).collect();
     let mut history = History::new(config(slots));
     for _ in 0..1 + random.below(3000) {
         let kind = TaskKind(random.below(6) as u32 * 0x1001);
-        let key = (random.below(5) != 0).then(|| keys[random.below(keys.len() as u64) as usize]);
+        let key = (random.below(5) != 0).then(|| keys[random.index(keys.len())]);
         history.observe(kind, key.as_ref(), random.below(1 << 34), random.below(1 << 36));
     }
     history
@@ -221,10 +204,10 @@ fn the_same_observations_give_the_same_predictions_and_bytes() {
     for seed in 0..40u64 {
         let (a, b) = (observed(seed, 64), observed(seed, 64));
         assert_eq!(a.encode(), b.encode(), "seed {seed}");
-        let mut random = SplitMix(seed ^ 0xabc);
+        let mut random = SplitMix64::new(seed ^ 0xabc);
         for _ in 0..200 {
             let kind = TaskKind(random.below(6) as u32 * 0x1001);
-            let key = random.key();
+            let key = random_key(&mut random);
             assert_eq!(a.predict(kind, Some(&key)), b.predict(kind, Some(&key)), "seed {seed}");
         }
     }
@@ -424,9 +407,9 @@ fn the_plane_runs_the_longest_path_of_history_first() {
 #[test]
 fn the_plane_orders_random_graphs_by_the_history_critical_path() {
     for seed in 0..200u64 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let n = 2 + random.below(30) as usize;
-        let keys: Vec<Key> = (0..n).map(|_| random.key()).collect();
+        let keys: Vec<Key> = (0..n).map(|_| random_key(&mut random)).collect();
         let mut history = History::new(config(256));
         for key in &keys {
             for _ in 0..1 + random.below(5) {

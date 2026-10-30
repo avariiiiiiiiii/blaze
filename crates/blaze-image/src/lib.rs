@@ -31,7 +31,6 @@
 //! instructions, about 3 µs for 64 KiB.
 
 mod build;
-mod crc;
 mod image;
 mod raw;
 mod spine;
@@ -39,13 +38,19 @@ mod spine;
 #[cfg(test)]
 mod tests;
 
+/// Counts allocations so the read paths' tests hold them to a budget.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+
 use std::fmt;
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 
 pub use crate::build::{Builder, SectionWriter, TooLarge};
-pub use crate::crc::crc32c;
+pub use blaze_ids::crc32c::crc32c;
 pub use crate::image::{Image, Stable};
 pub use crate::raw::{bytes_of, cast};
 
@@ -53,9 +58,11 @@ pub use crate::raw::{bytes_of, cast};
 /// `jobs(n, job)` runs `job(0)` to `job(n - 1)` on as many workers as it has and returns when
 /// all are done. The daemon passes its pool (`blaze_graph::pool`'s `run_jobs` has this shape);
 /// [`serial`] runs them on the calling thread.
+// dyn: the pool's interface, one call a 1 MiB job, never a value
 pub type Jobs<'a> = &'a (dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync);
 
 /// [`Jobs`] on the calling thread.
+// dyn: as `Jobs`
 pub fn serial(n: usize, job: &(dyn Fn(usize) + Sync)) {
     (0..n).for_each(job);
 }

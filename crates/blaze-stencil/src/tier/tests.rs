@@ -4,6 +4,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use blaze_ids::rng::SplitMix64 as Rng;
 use cranelift_codegen::{
     cursor::{Cursor as _, FuncCursor},
     ir::{self, InstBuilder as _, condcodes::IntCC, types::I64},
@@ -15,23 +16,6 @@ use super::*;
 
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
-
-/// SplitMix64: the tests' one source of randomness, seeded, so a failure reproduces.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
 
 fn policy() -> Policy {
     Policy { warm: 100, hot: 1000, back_edge_weight: 2, highest: Tier::Llvm }
@@ -212,7 +196,7 @@ fn random_snapshots_keep_every_promise() {
 
 fn run_random(seed: u64) -> Vec<(u32, Promote)> {
     const FUNCTIONS: u32 = 16;
-    let mut rng = Rng(seed);
+    let mut rng = Rng::new(seed);
     let policy = Policy {
         warm: 1 + rng.below(200),
         hot: 1 + rng.below(4000),
@@ -334,7 +318,7 @@ fn a_warm_round_allocates_nothing() {
 
 #[test]
 fn cells_are_bound_densely() {
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     let mut counters = Counters::new(64);
     let mut model: Vec<Option<u64>> = vec![None; 64];
     for _ in 0..5000 {
@@ -514,7 +498,7 @@ fn the_round_trip_in_simulation() {
     const FUNCTIONS: u32 = 8;
     let (mut daemon, mut driver) = Daemon::new(FUNCTIONS, 64);
     daemon.broken.push(5);
-    let mut rng = Rng(42);
+    let mut rng = Rng::new(42);
     for _ in 0..400 {
         for _ in 0..200 {
             // Function 0 loops, 1 and 5 are called often, 2 seldom (about 600 calls in all:

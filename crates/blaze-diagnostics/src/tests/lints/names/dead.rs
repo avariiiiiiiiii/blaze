@@ -315,3 +315,35 @@ fn main() {
 "#;
     assert_eq!(dead(fixture), ["dead_code: field `1` is never read"]);
 }
+
+/// A pattern's qualifier is a use: the alias in `Alias::A(x)` is live (rustc's `visit_qpath`
+/// of the pattern's path).
+#[test]
+fn alias_in_pattern_qualifier() {
+    let fixture = r#"
+//- /main.rs crate:main
+enum E { A(i32) }
+type Alias = E;
+fn main() {
+    let Alias::A(x) = E::A(1);
+    let _ = x;
+}
+"#;
+    assert_eq!(dead(fixture), Vec::<String>::new());
+}
+
+/// The assignee of a destructuring assignment is a pattern: `E::A = e` does not construct `A`.
+#[test]
+fn assignee_variant_not_constructed() {
+    let fixture = r#"
+//- /main.rs crate:main
+enum E { A }
+fn take(e: E) {
+    E::A = e;
+}
+fn main() {
+    let _f: fn(E) = take;
+}
+"#;
+    assert_eq!(dead(fixture), ["dead_code: variant `A` is never constructed"]);
+}

@@ -330,6 +330,7 @@ impl Dominators {
 #[cfg(test)]
 mod tests {
     use super::{Dominators, block, index};
+    use blaze_ids::rng::SplitMix64;
     use hir_ty_mir::mir::BasicBlockId;
 
     /// Whether `a` dominates `b`, from each block's set of dominators found to a fixed point.
@@ -363,28 +364,22 @@ mod tests {
 
     #[test]
     fn match_the_dominator_sets() {
-        let mut seed = 0x2545f4914f6cdd1du64;
-        let mut next = |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % bound as u64) as usize
-        };
+        let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
         for round in 0..500 {
-            let count = 1 + next(24);
-            let edges = next(count * 3 + 1);
+            let count = 1 + rng.index(24);
+            let edges = rng.index(count * 3 + 1);
             let mut succs = vec![Vec::new(); count];
             let mut preds = vec![Vec::new(); count];
             // A chain from the start keeps most blocks reachable, as a body's are.
             for b in 1..count {
-                if next(4) != 0 {
-                    let from = next(b);
+                if rng.index(4) != 0 {
+                    let from = rng.index(b);
                     succs[from].push(block(b));
                     preds[b].push(block(from));
                 }
             }
             for _ in 0..edges {
-                let (from, to) = (next(count), next(count));
+                let (from, to) = (rng.index(count), rng.index(count));
                 if !succs[from].contains(&block(to)) {
                     succs[from].push(block(to));
                     preds[to].push(block(from));

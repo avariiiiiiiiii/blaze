@@ -39,7 +39,7 @@ fn item(text: &str) -> (ast::Adt, span::SpanMap) {
 
 struct Input<'a>(&'a ast::Adt, &'a span::SpanMap);
 
-impl reference::SourceDatabase for Input<'_> {
+impl reference::ItemSource for Input<'_> {
     fn adt(&self) -> (&ast::Adt, &span::SpanMap) {
         (self.0, self.1)
     }

@@ -3,7 +3,7 @@
 use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_ids::radix;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
@@ -144,7 +144,7 @@ struct MirLowerCtx<'a, 'db> {
     current_loop_blocks: Option<LoopBlocks>,
     labeled_loop_blocks: FxHashMap<LabelId, LoopBlocks>,
     discr_temp: Option<StoredPlace>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     store: &'a ExpressionStore,
     infer: &'a InferenceResult<'db>,
     types: &'db crate::next_solver::DefaultAny<'db>,
@@ -263,13 +263,16 @@ impl Drop for DropScopeToken {
 
 macro_rules! not_supported {
     ($it: expr) => {
+        // alloc: error path
         return Err(MirLowerError::NotSupported(format!($it)))
     };
 }
 
 macro_rules! implementation_error {
     ($it: expr) => {{
+        // alloc: error path
         ::stdx::never!("MIR lower implementation bug: {}", format!($it));
+        // alloc: error path
         return Err(MirLowerError::ImplementationError(format!($it)));
     }};
 }
@@ -278,7 +281,7 @@ type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         owner: InferBodyId<'db>,
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
@@ -388,7 +391,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current: BasicBlockId,
     ) -> Result<'db, Option<(Operand, BasicBlockId)>> {
         if !self.has_adjustments(expr_id)
-            && let Expr::Literal(l) = &self.store[expr_id]
+            && let Expr::Literal(l) = self.store.expr(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
             let mut operand = self.lower_literal_to_operand(ty, l)?;
@@ -561,7 +564,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: Place<'db>,
         mut current: BasicBlockId,
     ) -> Result<'db, Option<BasicBlockId>> {
-        match &self.store[expr_id] {
+        match self.store.expr(expr_id) {
             Expr::OffsetOf(offset) => {
                 let field = self.offset_of_place(offset, current, expr_id.into())?;
                 // The field of a value at address 0 is at its offset.
@@ -632,7 +635,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             // operand's type, never a temporary of the function, whatever the
                             // expression (`const 0x0100_0000`, `const SHIFT_BITS`,
                             // `const size_of::<T>()`). A literal is one as it is.
-                            let operand = match &self.store[*value] {
+                            let operand = match self.store.expr(*value) {
                                 Expr::Literal(l) if !self.has_adjustments(*value) => {
                                     let ty = self.expr_ty_without_adjust(*value);
                                     self.lower_literal_to_operand(ty, l)?
@@ -665,7 +668,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             );
                             let named = self.resolver.resolve_path_in_value_ns_fully(
                                 self.db,
-                                path,
+                                self.store.path_at(*path),
                                 HygieneId::ROOT,
                             );
                             self.resolver.reset_to_guard(guard);
@@ -777,6 +780,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let assoc = f.lookup(self.db);
                     if let ItemContainerId::TraitId(t) = assoc.container {
                         let name = &FunctionSignature::of(self.db, f).name;
+                        // clone: error path
                         return Err(MirLowerError::TraitFunctionDefinition(t, name.clone()));
                     }
                 }
@@ -810,6 +814,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             .resolve_path_in_value_ns_fully(self.db, p, hygiene)
                             .ok_or_else(|| MirLowerError::UnresolvedName {
                                 owner: self.owner.expression_store_owner(self.db),
+                                // clone: error path
                                 path: p.clone(),
                             })?;
                         self.resolver.reset_to_guard(resolver_guard);
@@ -904,37 +909,37 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::If { condition, then_branch, else_branch } => {
                 // A literal condition, as in `if cfg!(..)`, stays a constant operand so that a
                 // backend can leave out the branch that cannot run.
-                let plain =
-                    self.has_let(*condition) || matches!(self.store[*condition], Expr::Literal(_));
+                let plain = self.has_let(condition)
+                    || matches!(self.store.expr(condition), Expr::Literal(_));
                 // What `if let` binds, and the temporaries of what it matches on, are dropped
                 // when the branch that was taken ends.
-                let bindings = self.has_let(*condition).then(|| self.push_drop_scope());
-                let branches = match self.store[*condition] {
+                let bindings = self.has_let(condition).then(|| self.push_drop_scope());
+                let branches = match self.store.expr(condition) {
                     Expr::Let { pat, expr } => {
-                        Some(self.lower_if_let(*condition, pat, expr, current, false)?)
+                        Some(self.lower_if_let(condition, pat, expr, current, false)?)
                     }
-                    Expr::BinaryOp { .. } if self.has_let(*condition) => {
-                        Some(self.lower_let_chain(*condition, current, false)?)
+                    Expr::BinaryOp { .. } if self.has_let(condition) => {
+                        Some(self.lower_let_chain(condition, current, false)?)
                     }
                     _ => None,
                 };
                 let condition_value = if let Some(branches) = branches {
                     branches.map(Either::Right)
                 } else if plain {
-                    self.lower_expr_to_some_operand(*condition, current)?.map(Either::Left)
+                    self.lower_expr_to_some_operand(condition, current)?.map(Either::Left)
                 } else {
                     // The condition's temporaries are dropped before either branch runs.
                     let ty = Ty::new_bool(self.interner());
                     let result: Place<'db> = self.temp(ty, current, MirSpan::Unknown)?.into();
                     let scope = self.push_drop_scope();
-                    let Some(c) = self.lower_expr_to_place(*condition, result, current)? else {
+                    let Some(c) = self.lower_expr_to_place(condition, result, current)? else {
                         scope.pop_assume_dropped(self);
                         return Ok(None);
                     };
-                    let current = scope.pop_and_drop(self, c, (*condition).into());
+                    let current = scope.pop_and_drop(self, c, condition.into());
                     let discr = Operand {
                         kind: OperandKind::Copy(result.store()),
-                        span: Some((*condition).into()),
+                        span: Some(condition.into()),
                     };
                     Some(Either::Left((discr, current)))
                 };
@@ -966,20 +971,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         this.emit_drop_and_storage_dead_for_scope(
                             bound,
                             &mut block,
-                            (*condition).into(),
+                            condition.into(),
                         );
                     }
                     block
                 };
                 let end_of_then = self
-                    .lower_branch_to_place(*then_branch, place, start_of_then)?
+                    .lower_branch_to_place(then_branch, place, start_of_then)?
                     .map(|block| drop_bound(self, block));
                 // From the 2024 edition on, the `else` branch runs after the drops.
                 let early = self.edition().at_least_2024();
                 let else_block =
                     if early { drop_bound(self, start_of_else) } else { start_of_else };
                 let end_of_else = if let Some(else_branch) = else_branch {
-                    self.lower_branch_to_place(*else_branch, place, else_block)?
+                    self.lower_branch_to_place(else_branch, place, else_block)?
                 } else {
                     self.push_assign_unit(else_block, place, expr_id.into());
                     Some(else_block)
@@ -995,7 +1000,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()))
             }
             Expr::Let { pat, expr } => {
-                let Some((cond_place, current)) = self.lower_expr_as_place(current, *expr, true)?
+                let Some((cond_place, current)) = self.lower_expr_as_place(current, expr, true)?
                 else {
                     return Ok(None);
                 };
@@ -1003,7 +1008,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
                 let (then_target, else_target) =
-                    self.pattern_match(current, None, cond_place, *pat)?;
+                    self.pattern_match(current, None, cond_place, pat)?;
                 self.resolver.reset_to_guard(resolver_guard);
                 self.write_bytes_to_place(
                     then_target,
@@ -1025,9 +1030,9 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Block { id: _, statements, tail, label, unsafe_: _ } => {
                 if let Some(label) = label {
-                    self.lower_loop(current, place, Some(*label), expr_id.into(), |this, begin| {
+                    self.lower_loop(current, place, Some(label), expr_id.into(), |this, begin| {
                         if let Some(current) =
-                            this.lower_block_to_place(statements, begin, *tail, place, expr_id)?
+                            this.lower_block_to_place(statements, begin, tail, place, expr_id)?
                         {
                             let end = this.current_loop_end()?;
                             this.set_goto(current, end, expr_id.into());
@@ -1035,13 +1040,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Ok(())
                     })
                 } else {
-                    self.lower_block_to_place(statements, current, *tail, place, expr_id)
+                    self.lower_block_to_place(statements, current, tail, place, expr_id)
                 }
             }
             Expr::Loop { body, label, source: _ } => {
-                self.lower_loop(current, place, *label, expr_id.into(), |this, begin| {
+                self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
                     let scope = this.push_drop_scope();
-                    if let Some((_, mut current)) = this.lower_expr_as_place(begin, *body, true)? {
+                    if let Some((_, mut current)) = this.lower_expr_as_place(begin, body, true)? {
                         current = scope.pop_and_drop(this, current, body.into());
                         this.set_goto(current, begin, expr_id.into());
                     } else {
@@ -1060,14 +1065,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let func = Operand::from_bytes(Box::default(), ty);
                     return self.lower_call_and_args(
                         func,
-                        iter::once(*callee).chain(args.iter().copied()),
+                        iter::once(callee).chain(args.iter().copied()),
                         place,
                         current,
                         self.is_uninhabited(expr_id),
                         expr_id,
                     );
                 }
-                let callee_ty = self.expr_ty_after_adjustments(*callee);
+                let callee_ty = self.expr_ty_after_adjustments(callee);
                 match callee_ty.kind() {
                     TyKind::FnDef(def, _)
                         if let CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) =
@@ -1104,7 +1109,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                     TyKind::FnPtr(..) => {
                         let Some((func, current)) =
-                            self.lower_expr_to_some_operand(*callee, current)?
+                            self.lower_expr_to_some_operand(callee, current)?
                         else {
                             return Ok(None);
                         };
@@ -1132,13 +1137,14 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let (func_id, generic_args) =
                     self.infer.method_resolution(expr_id).ok_or_else(|| {
                         MirLowerError::UnresolvedMethod(
+                            // alloc: error path
                             method_name.display(self.db, self.edition()).to_string(),
                         )
                     })?;
                 let func = Operand::from_fn(self.db, func_id, generic_args);
                 self.lower_call_and_args(
                     func,
-                    iter::once(*receiver).chain(args.iter().copied()),
+                    iter::once(receiver).chain(args.iter().copied()),
                     place,
                     current,
                     self.is_uninhabited(expr_id),
@@ -1150,7 +1156,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // ends, wherever the loop is written.
                 let temporaries = self.is_for_loop(arms).then(|| self.push_drop_scope());
                 let Some((cond_place, mut current)) =
-                    self.lower_expr_as_place(current, *expr, true)?
+                    self.lower_expr_as_place(current, expr, true)?
                 else {
                     if let Some(temporaries) = temporaries {
                         temporaries.pop_assume_dropped(self);
@@ -1278,7 +1284,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Continue { label } => {
                 let loop_data = match label {
                     Some(l) => {
-                        self.labeled_loop_blocks.get(l).ok_or(MirLowerError::UnresolvedLabel)?
+                        self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
                     }
                     None => self
                         .current_loop_blocks
@@ -1289,7 +1295,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.exit_to(scope, current, begin, expr_id.into());
                 Ok(None)
             }
-            &Expr::Break { expr, label } => {
+            Expr::Break { expr, label } => {
                 let loop_data = match label {
                     Some(l) => {
                         self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?
@@ -1330,7 +1336,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Return { expr } => {
                 if let Some(expr) = expr {
                     if let Some(c) =
-                        self.lower_expr_to_place(*expr, return_slot().into(), current)?
+                        self.lower_expr_to_place(expr, return_slot().into(), current)?
                     {
                         current = c;
                     } else {
@@ -1357,6 +1363,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
                         MirLowerError::UnresolvedName {
                             owner: self.owner.expression_store_owner(self.db),
+                            // clone: error path
                             path: path.clone(),
                         }
                     })?;
@@ -1384,7 +1391,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         self.declare_operands_last(expr_id, declared, operands.iter().flatten());
                         // The fields are evaluated in the order written, and the base after
                         // them.
-                        let spread_place = match *spread {
+                        let spread_place = match spread {
                             RecordSpread::Expr(it) => {
                                 let Some((p, c)) = self.lower_expr_as_place(current, it, true)?
                                 else {
@@ -1429,7 +1436,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         Ok(Some(current))
                     }
                     VariantId::UnionId(_union_id) => {
-                        let [RecordLitField { name, expr }] = fields.as_ref() else {
+                        let [RecordLitField { name, expr }] = fields else {
                             not_supported!("Union record literal with more than one field");
                         };
                         let local_id =
@@ -1439,7 +1446,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                 }
             }
-            &Expr::Await { expr } => self.lower_await(expr, expr_id, place, current),
+            Expr::Await { expr } => self.lower_await(expr, expr_id, place, current),
             Expr::Yeet { .. } => not_supported!("yeet"),
             Expr::Const(_) if let Some(konst) = self.inline_const(expr_id) => {
                 let subst = GenericArgs::identity_for_item(
@@ -1449,7 +1456,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.lower_const(konst.into(), current, place, subst, expr_id.into())?;
                 Ok(Some(current))
             }
-            &Expr::Const(id) => {
+            Expr::Const(id) => {
                 // Inline const blocks (`const { .. }`) are stored with their inner expression in
                 // the same body (see inference, which infers the inner expression directly), so we
                 // lower that expression in place. Const-ness is irrelevant here: MIR evaluation
@@ -1471,19 +1478,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Expr::Cast { expr, type_ref: _ } => {
                 // Since we don't have THIR, this is the "zipped" version of [rustc's HIR lowering](https://github.com/rust-lang/rust/blob/e71f9529121ca8f687e4b725e3c9adc3f1ebab4d/compiler/rustc_mir_build/src/thir/cx/expr.rs#L165-L178)
                 // and [THIR lowering as RValue](https://github.com/rust-lang/rust/blob/a4601859ae3875732797873612d424976d9e3dd0/compiler/rustc_mir_build/src/build/expr/as_rvalue.rs#L193-L313)
-                let (rvalue, current) = if self.infer.coercion_casts.contains(expr) {
-                    let Some((it, current)) = self.lower_expr_to_some_operand(*expr, current)?
+                let (rvalue, current) = if self.infer.coercion_casts.contains(&expr) {
+                    let Some((it, current)) = self.lower_expr_to_some_operand(expr, current)?
                     else {
                         return Ok(None);
                     };
                     (Rvalue::Use(it), current)
                 } else {
-                    let source_ty = self.infer.expr_ty(*expr);
+                    let source_ty = self.infer.expr_ty(expr);
                     let target_ty = self.infer.expr_ty(expr_id);
                     // A variant named as a value casts to its discriminant; one named as
                     // its constructor function is a function like any other.
                     let (it, source_ty, current) = if let Some(VariantId::EnumVariantId(variant_id)) =
-                        self.infer.variant_resolution_for_expr(*expr)
+                        self.infer.variant_resolution_for_expr(expr)
                         && !matches!(source_ty.kind(), TyKind::FnDef(..))
                     {
                         self.lower_variant_discriminant(current, variant_id)?
@@ -1491,7 +1498,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         && adt.is_enum()
                     {
                         let Some((enum_place, current)) =
-                            self.lower_expr_as_place(current, *expr, true)?
+                            self.lower_expr_as_place(current, expr, true)?
                         else {
                             return Ok(None);
                         };
@@ -1515,12 +1522,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         )
                     } else {
                         let Some((it, current)) =
-                            self.lower_expr_to_some_operand(*expr, current)?
+                            self.lower_expr_to_some_operand(expr, current)?
                         else {
                             return Ok(None);
                         };
                         // The operand carries the cast's coercion, e.g. fn item to pointer.
-                        (it, self.expr_ty_after_adjustments(*expr), current)
+                        (it, self.expr_ty_after_adjustments(expr), current)
                     };
                     // `f as *const ()` and `f as usize` go through a function pointer.
                     let (it, source_ty) = if let TyKind::FnDef(..) = source_ty.kind()
@@ -1560,28 +1567,28 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             Expr::Ref { expr, rawness: _, mutability } => {
                 let locals = self.result.locals.len();
-                let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
+                let Some((p, current)) = self.lower_expr_as_place(current, expr, true)? else {
                     return Ok(None);
                 };
                 // A mutable borrow is promoted only of an empty array, as rustc's `&mut []`.
-                if (mutability.is_shared() || self.is_empty_array(*expr))
+                if (mutability.is_shared() || self.is_empty_array(expr))
                     && p.local.into_raw().into_u32() as usize >= locals
                     // Behind a deref the local is a pointer, an overloaded index's result say,
                     // and not the value.
                     && !p.projection.as_slice().iter().any(|it| matches!(it, ProjectionElem::Deref))
                     // What a `const { .. }` block borrows is a constant whatever it is made of.
-                    && (self.inline_consts > 0 || self.is_promotable_place(*expr))
+                    && (self.inline_consts > 0 || self.is_promotable_place(expr))
                 {
                     // The local holds what the fields and elements are taken out of.
-                    let mut constant = *expr;
+                    let mut constant = expr;
                     while let Expr::Field { expr: base, .. } | Expr::Index { base, .. } =
-                        self.store[constant]
+                        self.store.expr(constant)
                     {
                         constant = base;
                     }
                     self.result.promoted_locals.push((p.local, constant));
                 }
-                let bk = BorrowKind::from_hir_mutability(*mutability);
+                let bk = BorrowKind::from_hir_mutability(mutability);
                 self.push_assignment(current, place, Rvalue::Ref(bk, p.store()), expr_id.into());
                 Ok(Some(current))
             }
@@ -1606,7 +1613,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 op: op @ (hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg),
             } => {
                 let is_builtin = matches!(
-                    self.expr_ty_without_adjust(*expr).kind(),
+                    self.expr_ty_without_adjust(expr).kind(),
                     TyKind::Bool | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
                 );
                 if !is_builtin
@@ -1615,7 +1622,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let func = Operand::from_fn(self.db, func_id, generic_args);
                     return self.lower_call_and_args(
                         func,
-                        [*expr].into_iter(),
+                        [expr].into_iter(),
                         place,
                         current,
                         self.is_uninhabited(expr_id),
@@ -1624,18 +1631,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 // `-128i8` is that number, not the negation of one `i8` does not have.
                 if let hir_def::hir::UnaryOp::Neg = op
-                    && !self.has_adjustments(*expr)
+                    && !self.has_adjustments(expr)
                     && let Expr::Literal(literal @ hir_def::hir::Literal::Int(..)) =
-                        &self.store[*expr]
+                        self.store.expr(expr)
                     && let Some(negated) = literal.clone().negate()
                 {
-                    let ty = self.expr_ty_without_adjust(*expr);
+                    let ty = self.expr_ty_without_adjust(expr);
                     let mut operand = self.lower_literal_to_operand(ty, &negated)?;
                     operand.span = Some(expr_id.into());
                     self.push_assignment(current, place, Rvalue::Use(operand), expr_id.into());
                     return Ok(Some(current));
                 }
-                let Some((operand, current)) = self.lower_expr_to_some_operand(*expr, current)?
+                let Some((operand, current)) = self.lower_expr_to_some_operand(expr, current)?
                 else {
                     return Ok(None);
                 };
@@ -1657,8 +1664,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 let is_builtin = 'b: {
                     // Without adjust here is a hack. We assume that we know every possible adjustment
                     // for binary operator, and use without adjust to simplify our conditions.
-                    let lhs_ty = self.expr_ty_without_adjust(*lhs);
-                    let rhs_ty = self.expr_ty_without_adjust(*rhs);
+                    let lhs_ty = self.expr_ty_without_adjust(lhs);
+                    let rhs_ty = self.expr_ty_without_adjust(rhs);
                     // Every comparison of raw pointers is builtin. Treating `<` as a method call
                     // makes core's `impl PartialOrd for *const T` call itself.
                     if matches!(op, BinaryOp::CmpOp(_))
@@ -1697,7 +1704,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     let func = Operand::from_fn(self.db, func_id, generic_args);
                     return self.lower_call_and_args(
                         func,
-                        [*lhs, *rhs].into_iter(),
+                        [lhs, rhs].into_iter(),
                         place,
                         current,
                         self.is_uninhabited(expr_id),
@@ -1706,7 +1713,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 if let hir_def::hir::BinaryOp::Assignment { op: Some(op) } = op {
                     // last adjustment is `&mut` which we don't want it.
-                    let adjusts = match self.infer.expr_adjustments.get(lhs) {
+                    let adjusts = match self.infer.expr_adjustments.get(&lhs) {
                         Some(it) if let Some((_, rest)) = it.split_last() => rest,
                         // A scalar's operator is not looked up while its type is still an
                         // integer variable (`let mut n = 0; n += i;`), so there is no `&mut`
@@ -1720,12 +1727,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     };
                     // rustc evaluates the right-hand side of a built-in compound assignment
                     // before the place it assigns to.
-                    let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)?
+                    let Some((rhs_op, current)) = self.lower_expr_to_some_operand(rhs, current)?
                     else {
                         return Ok(None);
                     };
                     let Some((lhs_place, current)) =
-                        self.lower_expr_as_place_with_adjust(current, *lhs, false, adjusts)?
+                        self.lower_expr_as_place_with_adjust(current, lhs, false, adjusts)?
                     else {
                         return Ok(None);
                     };
@@ -1741,28 +1748,28 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 // Each side of `&&` and `||` drops its temporaries when it is done, unless it
                 // is a `let`, whose temporaries live as long as what it binds.
                 let lazy = matches!(op, hir_def::hir::BinaryOp::LogicOp(_));
-                let (lhs_op, current) = if lazy && !self.has_let(*lhs) {
+                let (lhs_op, current) = if lazy && !self.has_let(lhs) {
                     let ty = Ty::new_bool(self.interner());
                     let result: Place<'db> = self.temp(ty, current, MirSpan::Unknown)?.into();
                     let scope = self.push_drop_scope();
                     self.drop_scopes.last_mut().unwrap().temporaries = true;
-                    let Some(c) = self.lower_expr_to_place(*lhs, result, current)? else {
+                    let Some(c) = self.lower_expr_to_place(lhs, result, current)? else {
                         scope.pop_assume_dropped(self);
                         return Ok(None);
                     };
-                    let current = scope.pop_and_drop(self, c, (*lhs).into());
+                    let current = scope.pop_and_drop(self, c, lhs.into());
                     let operand = Operand {
                         kind: OperandKind::Copy(result.store()),
-                        span: Some((*lhs).into()),
+                        span: Some(lhs.into()),
                     };
                     (operand, current)
                 } else if compares_scalars {
-                    let Some(it) = self.lower_scalar_operand(*lhs, current)? else {
+                    let Some(it) = self.lower_scalar_operand(lhs, current)? else {
                         return Ok(None);
                     };
                     it
                 } else {
-                    let Some(it) = self.lower_expr_to_some_operand(*lhs, current)? else {
+                    let Some(it) = self.lower_expr_to_some_operand(lhs, current)? else {
                         return Ok(None);
                     };
                     it
@@ -1781,13 +1788,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     );
                     let end_of_then = Some(start_of_then);
                     let start_of_else = self.new_basic_block();
-                    let end_of_else = if self.has_let(*rhs) {
-                        self.lower_expr_to_place(*rhs, place, start_of_else)?
+                    let end_of_else = if self.has_let(rhs) {
+                        self.lower_expr_to_place(rhs, place, start_of_else)?
                     } else {
                         let scope = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
-                        match self.lower_expr_to_place(*rhs, place, start_of_else)? {
-                            Some(block) => Some(scope.pop_and_drop(self, block, (*rhs).into())),
+                        match self.lower_expr_to_place(rhs, place, start_of_else)? {
+                            Some(block) => Some(scope.pop_and_drop(self, block, rhs.into())),
                             None => {
                                 scope.pop_assume_dropped(self);
                                 None
@@ -1809,8 +1816,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     return Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()));
                 }
                 let rhs_op = match compares_scalars {
-                    true => self.lower_scalar_operand(*rhs, current)?,
-                    false => self.lower_expr_to_some_operand(*rhs, current)?,
+                    true => self.lower_scalar_operand(rhs, current)?,
+                    false => self.lower_expr_to_some_operand(rhs, current)?,
                 };
                 let Some((rhs_op, current)) = rhs_op else {
                     return Ok(None);
@@ -1835,7 +1842,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 );
                 Ok(Some(current))
             }
-            &Expr::Assignment { target, value: rhs } => {
+            Expr::Assignment { target, value: rhs } => {
                 // What the pattern takes of a place is all that is moved out of it, as a
                 // `let` of the pattern moves: `_ = place` moves nothing.
                 let Some((value, mut current)) = self.lower_expr_as_place(current, rhs, true)?
@@ -2010,19 +2017,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             "Array repeat expression with non array type",
                         ));
                     };
-                    if let Some(constant) = self.constant_operand(*initializer)? {
+                    if let Some(constant) = self.constant_operand(initializer)? {
                         let r = Rvalue::Repeat(constant, len.store());
                         self.push_assignment(current, place, r, expr_id.into());
                         return Ok(Some(current));
                     }
                     let Some((init, current)) =
-                        self.lower_expr_to_some_operand(*initializer, current)?
+                        self.lower_expr_to_some_operand(initializer, current)?
                     else {
                         return Ok(None);
                     };
                     // An inline `const { .. }` is lowered in place, into a temporary: each element
                     // is a copy of its bytes and the temporary is used up, `[const { .. }; 0]` too.
-                    if self.names_constant(*initializer) {
+                    if self.names_constant(initializer) {
                         let r = Rvalue::Repeat(self.moved(init), len.store());
                         self.push_assignment(current, place, r, expr_id.into());
                         return Ok(Some(current));
@@ -2114,8 +2121,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         place: &mut Place<'db>,
         expr_id: ExprId,
     ) -> Result<'db, ()> {
-        if let Expr::Field { expr, name } = &self.store[expr_id] {
-            if let TyKind::Tuple(tys) = self.expr_ty_after_adjustments(*expr).kind() {
+        if let Expr::Field { expr, name } = self.store.expr(expr_id) {
+            if let TyKind::Tuple(tys) = self.expr_ty_after_adjustments(expr).kind() {
                 let index =
                     name.as_tuple_index().ok_or(MirLowerError::TypeError("named field on tuple"))?
                         as u32;
@@ -2148,7 +2155,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn lower_literal_or_const(&mut self, ty: Ty<'db>, loc: &ExprId) -> Result<'db, Operand> {
-        match &self.store[*loc] {
+        match self.store.expr(*loc) {
             Expr::Literal(l) => self.lower_literal_to_operand(ty, l),
             Expr::Path(c) => {
                 if let Some((CandidateId::ConstId(c), subst)) =
@@ -2158,6 +2165,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 let unresolved_name = || MirLowerError::UnresolvedName {
                     owner: self.owner.expression_store_owner(self.db),
+                    // clone: error path
                     path: c.clone(),
                 };
                 let pr = self
@@ -2407,7 +2415,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         current: BasicBlockId,
         guard: bool,
     ) -> Result<'db, Option<(BasicBlockId, BasicBlockId)>> {
-        match self.store[condition] {
+        match self.store.expr(condition) {
             Expr::Let { pat, expr } => self.lower_if_let(condition, pat, expr, current, guard),
             Expr::BinaryOp {
                 lhs,
@@ -2467,7 +2475,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// Whether these are the arms of the `match` that a `for` loop is written as.
     fn is_for_loop(&self, arms: &[MatchArm]) -> bool {
         matches!(arms, [arm] if matches!(
-            self.store[arm.expr],
+            self.store.expr(arm.expr),
             Expr::Loop { source: LoopSource::ForLoop, .. }
         ))
     }
@@ -2590,8 +2598,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             Some((Adjustment { kind: Adjust::Deref(None), .. }, rest)) => {
                 self.lower_expr_to_some_place_with_adjust(arg, current, rest)?
             }
-            None => match &self.store[arg] {
-                &Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref }
+            None => match self.store.expr(arg) {
+                Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref }
                     if match self.expr_ty_without_adjust(expr).kind() {
                         TyKind::Ref(..) | TyKind::RawPtr(..) => true,
                         TyKind::Adt(id, _) => id.is_box(),
@@ -2715,7 +2723,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// an element is borrowed out of whatever the index, which the borrow does not read
     /// (`&ALL[i]`), but not an element read as a value (`&(ALL[i] + 1)`).
     fn is_promotable_place(&mut self, expr: ExprId) -> bool {
-        match self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Index { base, .. }
                 if matches!(self.expr_ty_without_adjust(base).kind(), TyKind::Array(..)) =>
             {
@@ -2729,23 +2737,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn is_promotable(&mut self, expr: ExprId) -> bool {
-        if let &Expr::Index { base, index } = &self.store[expr]
+        if let Expr::Index { base, index } = self.store.expr(expr)
             && let TyKind::Array(_, len) = self.expr_ty_without_adjust(base).kind()
         {
             // Indexing an array is built in, whatever adjustments inference left on it. rustc
             // promotes it only by a constant it can tell is in bounds: a literal less than the
             // length, or a constant item, but not a `const { .. }` block, which it does not
             // evaluate there.
-            let literal = match self.store[index] {
-                Expr::Literal(Literal::Int(it, _)) => u128::try_from(it).ok(),
-                Expr::Literal(Literal::Uint(it, _)) => Some(it),
+            let literal = match self.store.expr(index) {
+                Expr::Literal(&Literal::Int(it, _)) => u128::try_from(it).ok(),
+                Expr::Literal(&Literal::Uint(it, _)) => Some(it),
                 _ => None,
             };
             let in_bounds = match literal {
                 Some(it) => {
                     crate::consteval::try_const_usize(self.db, len).is_some_and(|len| it < len)
                 }
-                None => matches!(self.store[index], Expr::Path(_)) && self.names_constant(index),
+                None => {
+                    matches!(self.store.expr(index), Expr::Path(_)) && self.names_constant(index)
+                }
             };
             return in_bounds && self.is_promotable_unadjusted(base);
         }
@@ -2765,19 +2775,21 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             | [
                 Adjustment { kind: Adjust::Pointer(PointerCast::ReifyFnPointer), .. },
                 Adjustment { kind: Adjust::Pointer(PointerCast::UnsafeFnPointer), .. },
-            ] => is_fn && matches!(self.store[expr], Expr::Path(_)),
+            ] => is_fn && matches!(self.store.expr(expr), Expr::Path(_)),
             // A closure that captures nothing, as a function pointer, is a constant: rustc's
             // `promote_consts::Validator` promotes the cast of a closure aggregate with no
             // upvars. minijinja's `type_erase!` builds `DynObject`'s vtable of such closures by
             // reference in a generic function; not promoted, the vtable was a slot of the frame
             // the function returned a reference to, and the borrow checker refused it (E0515).
             [Adjustment { kind: Adjust::Pointer(PointerCast::ClosureFnPointer(_)), .. }] => {
-                matches!(self.store[expr], Expr::Closure { closure_kind: ClosureKind::Closure, .. })
-                    && self
-                        .infer
-                        .closures_data
-                        .get(&expr)
-                        .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
+                matches!(
+                    self.store.expr(expr),
+                    Expr::Closure { closure_kind: ClosureKind::Closure, .. }
+                ) && self
+                    .infer
+                    .closures_data
+                    .get(&expr)
+                    .is_some_and(|it| it.min_captures.values().flatten().next().is_none())
             }
             // A reborrow `&*expr` of a shared reference is a copy of the reference, as in
             // rustc's `promote_consts::Validator::validate_rvalue`.
@@ -2797,7 +2809,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// making it once per element, rather than a value the array takes.
     /// The constant a path names, as an operand, as rustc's MIR has it in `[CONSTANT; N]`.
     fn constant_operand(&mut self, expr: ExprId) -> Result<'db, Option<Operand>> {
-        let Expr::Path(path) = &self.store[expr] else { return Ok(None) };
+        let Expr::Path(path) = self.store.expr(expr) else { return Ok(None) };
         if self.has_adjustments(expr) {
             return Ok(None);
         }
@@ -2819,8 +2831,8 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn names_constant(&mut self, expr: ExprId) -> bool {
-        let Expr::Path(path) = &self.store[expr] else {
-            return matches!(self.store[expr], Expr::Const(_));
+        let Expr::Path(path) = self.store.expr(expr) else {
+            return matches!(self.store.expr(expr), Expr::Const(_));
         };
         if let Some((candidate, _)) = self.infer.assoc_resolutions_for_expr(expr) {
             return matches!(candidate, CandidateId::ConstId(_));
@@ -2849,7 +2861,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)
             )
         };
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Literal(_) => true,
             Expr::Path(path) => {
                 // `Type::CONST` is resolved by inference, not by name.
@@ -2877,16 +2889,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
             }
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
-                exprs.clone().iter().all(|&it| self.is_promotable(it))
+                exprs.iter().all(|&it| self.is_promotable(it))
             }
             // The length is a constant already.
-            &Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
+            Expr::Array(Array::Repeat { initializer, .. }) => self.is_promotable(initializer),
             Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                fields.clone().iter().all(|it| self.is_promotable(it.expr))
+                fields.iter().all(|it| self.is_promotable(it.expr))
             }
-            &Expr::Field { expr, .. } => self.is_promotable(expr),
+            Expr::Field { expr, .. } => self.is_promotable(expr),
             Expr::Call { callee, args } => {
-                let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(*callee).kind() else {
+                let TyKind::FnDef(def, _) = self.expr_ty_without_adjust(callee).kind() else {
                     return false;
                 };
                 // A tuple struct or variant is made of its fields, as a record literal is.
@@ -2897,20 +2909,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     }
                     CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => true,
                 };
-                makes_value && args.clone().iter().all(|&it| self.is_promotable(it))
+                makes_value && args.iter().all(|&it| self.is_promotable(it))
             }
-            &Expr::Ref { expr, mutability, .. } => {
+            Expr::Ref { expr, mutability, .. } => {
                 (mutability.is_shared() || self.is_empty_array(expr)) && self.is_promotable(expr)
             }
-            &Expr::UnaryOp {
+            Expr::UnaryOp {
                 expr,
                 op: hir_def::hir::UnaryOp::Not | hir_def::hir::UnaryOp::Neg,
             } => scalar(self, expr) && self.is_promotable(expr),
-            &Expr::Cast { expr: inner, .. } => {
+            Expr::Cast { expr: inner, .. } => {
                 let from = self.expr_ty_without_adjust(inner);
                 let to = self.expr_ty_without_adjust(expr);
                 // `function as fn()` is the function's address, as the coercion to it is.
-                let is_fn_address = matches!(self.store[inner], Expr::Path(_))
+                let is_fn_address = matches!(self.store.expr(inner), Expr::Path(_))
                     && matches!(from.kind(), TyKind::FnDef(..))
                     && matches!(to.kind(), TyKind::FnPtr(..));
                 // rustc's `promote_consts::Validator::validate_rvalue` lets every cast through
@@ -2921,7 +2933,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 ) && matches!(to.kind(), TyKind::Int(_) | TyKind::Uint(_));
                 is_fn_address || !exposes_address && self.is_promotable(inner)
             }
-            &Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
+            Expr::BinaryOp { lhs, rhs, op: Some(op) } => {
                 let promoted = match op {
                     BinaryOp::ArithOp(ArithOp::Div | ArithOp::Rem) => {
                         self.division_promotable(lhs, rhs)
@@ -2955,12 +2967,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             TyKind::Uint(it) => (false, it.bit_width()),
             _ => return true,
         };
-        let literal = |expr: ExprId| match &self.store[expr] {
-            &Expr::Literal(Literal::Int(it, _)) => Some(it),
-            &Expr::Literal(Literal::Uint(it, _)) => i128::try_from(it).ok(),
-            &Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Neg } => match self.store[expr] {
-                Expr::Literal(Literal::Int(it, _)) => Some(-it),
-                Expr::Literal(Literal::Uint(it, _)) => i128::try_from(it).ok().map(|it| -it),
+        let literal = |expr: ExprId| match self.store.expr(expr) {
+            Expr::Literal(&Literal::Int(it, _)) => Some(it),
+            Expr::Literal(&Literal::Uint(it, _)) => i128::try_from(it).ok(),
+            Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Neg } => match self.store.expr(expr) {
+                Expr::Literal(&Literal::Int(it, _)) => Some(-it),
+                Expr::Literal(&Literal::Uint(it, _)) => i128::try_from(it).ok().map(|it| -it),
                 _ => None,
             },
             _ => None,
@@ -3201,6 +3213,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.set_goto(prev_block, begin, span);
         f(self, begin)?;
         let my = mem::replace(&mut self.current_loop_blocks, prev).ok_or(
+            // alloc: error path
             MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_owned()),
         )?;
         if let Some(prev) = prev_label {
@@ -3223,7 +3236,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             return self.lower_expr_to_some_operand(expr_id, current);
         };
         if rest.is_empty()
-            && let Expr::Literal(l) = &self.store[expr_id]
+            && let Expr::Literal(l) = self.store.expr(expr_id)
         {
             let ty = self.expr_ty_without_adjust(expr_id);
             let mut operand = self.lower_literal_to_operand(ty, l)?;
@@ -3270,6 +3283,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .current_loop_blocks
             .as_mut()
             .ok_or(MirLowerError::ImplementationError(
+                // alloc: error path
                 "Current loop access out of loop".to_owned(),
             ))?
             .end
@@ -3280,6 +3294,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 self.current_loop_blocks
                     .as_mut()
                     .ok_or(MirLowerError::ImplementationError(
+                        // alloc: error path
                         "Current loop access out of loop".to_owned(),
                     ))?
                     .end = Some(s);
@@ -3344,12 +3359,12 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     }
 
     fn extend_in(&mut self, expr: ExprId, scope: usize) {
-        match &self.store[expr] {
-            &Expr::Ref { expr, .. } => {
+        match self.store.expr(expr) {
+            Expr::Ref { expr, .. } => {
                 self.extend_operand(expr, scope);
                 self.extend_in(expr, scope);
             }
-            &Expr::Cast { expr, .. } => self.extend_in(expr, scope),
+            Expr::Cast { expr, .. } => self.extend_in(expr, scope),
             Expr::Tuple { exprs } | Expr::Array(Array::ElementList { elements: exprs }) => {
                 exprs.iter().for_each(|&it| self.extend_in(it, scope))
             }
@@ -3358,16 +3373,16 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             }
             // A tuple struct's or variant's constructor named as such, `Some(&temp())` or
             // `Self(&temp())`, not through a variable (`let some = Some; some(&temp())`).
-            Expr::Call { callee, args } if self.names_constructor(*callee) => {
+            Expr::Call { callee, args } if self.names_constructor(callee) => {
                 args.iter().for_each(|&it| self.extend_in(it, scope))
             }
-            &Expr::Block { tail, .. } => {
+            Expr::Block { tail, .. } => {
                 self.extended_blocks.insert(expr, scope);
                 if let Some(tail) = tail {
                     self.extend_in(tail, scope);
                 }
             }
-            &Expr::If { then_branch, else_branch, .. } => {
+            Expr::If { then_branch, else_branch, .. } => {
                 self.extend_in(then_branch, scope);
                 if let Some(else_branch) = else_branch {
                     self.extend_in(else_branch, scope);
@@ -3380,7 +3395,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 
     fn names_constructor(&self, callee: ExprId) -> bool {
         self.infer.variant_resolution_for_expr(callee).is_some()
-            || matches!(&self.store[callee], Expr::Path(path) if path.is_self_type())
+            || matches!(self.store.expr(callee), Expr::Path(path) if path.is_self_type())
                 && matches!(
                     self.infer.expr_ty(callee).kind(),
                     TyKind::FnDef(def, _) if !matches!(def.0, CallableDefId::FunctionId(_))
@@ -3390,11 +3405,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     fn extend_operand(&mut self, mut expr: ExprId, scope: usize) {
         loop {
             self.extended_temporaries.insert(expr, scope);
-            expr = match &self.store[expr] {
-                &Expr::Ref { expr, .. }
-                | &Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref }
-                | &Expr::Field { expr, .. } => expr,
-                &Expr::Index { base, .. } => base,
+            expr = match self.store.expr(expr) {
+                Expr::Ref { expr, .. }
+                | Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref }
+                | Expr::Field { expr, .. } => expr,
+                Expr::Index { base, .. } => base,
                 _ => return,
             };
         }
@@ -3403,19 +3418,19 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
     /// Whether an `if` condition binds names, in which case its temporaries are needed in the
     /// branches.
     fn has_let(&self, expr: ExprId) -> bool {
-        match &self.store[expr] {
+        match self.store.expr(expr) {
             Expr::Let { .. } => true,
-            &Expr::BinaryOp { lhs, rhs, .. } => self.has_let(lhs) || self.has_let(rhs),
+            Expr::BinaryOp { lhs, rhs, .. } => self.has_let(lhs) || self.has_let(rhs),
             _ => false,
         }
     }
 
     /// A literal statement among them is an argument `format_args!` put in its template,
     /// kept for inference and nothing else.
-    fn is_super_let_block(&self, statements: &[hir_def::hir::Statement]) -> bool {
+    fn is_super_let_block(&self, statements: hir_def::hir::Statements<'_>) -> bool {
         let literal = |mut expr: ExprId| loop {
-            match &self.store[expr] {
-                Expr::Ref { expr: inner, .. } => expr = *inner,
+            match self.store.expr(expr) {
+                Expr::Ref { expr: inner, .. } => expr = inner,
                 Expr::Literal(_) => return true,
                 _ => return false,
             }
@@ -3423,17 +3438,17 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         statements.iter().any(|it| matches!(it, hir_def::hir::Statement::Let { .. }))
             && statements.iter().all(|statement| match statement {
                 hir_def::hir::Statement::Let { pat, initializer: Some(_), is_super, .. } => {
-                    *is_super
-                        || matches!(self.store[*pat], Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
+                    is_super
+                        || matches!(self.store.pat(pat), Pat::Bind { id, subpat: None } if self.store[id].name.is_generated())
                 }
-                hir_def::hir::Statement::Expr { expr, .. } => literal(*expr),
+                hir_def::hir::Statement::Expr { expr, .. } => literal(expr),
                 _ => false,
             })
     }
 
     fn lower_block_to_place(
         &mut self,
-        statements: &[hir_def::hir::Statement],
+        statements: hir_def::hir::Statements<'_>,
         mut current: BasicBlockId,
         tail: Option<ExprId>,
         place: Place<'db>,
@@ -3456,18 +3471,18 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     continue;
                 };
                 if let Some(scope) = extended {
-                    self.extend_temporaries(*initializer, *pat, scope);
+                    self.extend_temporaries(initializer, pat, scope);
                 }
-                self.declare_bindings(*pat);
+                self.declare_bindings(pat);
                 let Some((init_place, c)) =
-                    self.lower_expr_as_place(current, *initializer, true)?
+                    self.lower_expr_as_place(current, initializer, true)?
                 else {
                     return Ok(None);
                 };
                 let resolver_guard =
-                    self.resolver.update_to_inner_scope(self.db, self.store_owner, *initializer);
+                    self.resolver.update_to_inner_scope(self.db, self.store_owner, initializer);
                 self.super_let = Some(extended.unwrap_or(self.drop_scopes.len() - 1));
-                let matched = self.pattern_match(c, None, init_place, *pat);
+                let matched = self.pattern_match(c, None, init_place, pat);
                 self.super_let = None;
                 (current, _) = matched?;
                 self.resolver.reset_to_guard(resolver_guard);
@@ -3482,25 +3497,25 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     pat, initializer, else_branch, is_super, ..
                 } => {
                     // rustc declares what the pattern binds before it lowers the initializer.
-                    self.declare_bindings(*pat);
+                    self.declare_bindings(pat);
                     // `let x = e` with `x` bound by value: rustc lowers `e` into `x` itself
                     // (`expr_into_pattern`), so `x` holds the value before the temporaries of
                     // `e` are dropped, which is what a coroutine's storage conflicts see. A
                     // value of a type without a size can't be a local, so that goes the other
                     // way, which says so.
                     if let (Some(expr_id), None, false, Pat::Bind { id, subpat: None }) =
-                        (initializer, else_branch, *is_super, &self.store[*pat])
+                        (initializer, else_branch, is_super, self.store.pat(pat))
                         && matches!(
-                            self.store[*id].mode,
+                            self.store[id].mode,
                             BindingAnnotation::Unannotated | BindingAnnotation::Mutable
                         )
                         && !matches!(
-                            self.infer.binding_ty(*id).kind(),
+                            self.infer.binding_ty(id).kind(),
                             TyKind::Slice(_) | TyKind::Str | TyKind::Dynamic(..)
                         )
                     {
-                        let binding = *id;
-                        self.extend_temporaries(*expr_id, *pat, self.drop_scopes.len() - 1);
+                        let binding = id;
+                        self.extend_temporaries(expr_id, pat, self.drop_scopes.len() - 1);
                         let local = self.binding_local(binding)?;
                         // rustc's storage_live_binding: the storage starts here, and the drop of
                         // the value is scheduled only once it holds one, after the initializer
@@ -3513,7 +3528,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         );
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
-                        let Some(c) = self.lower_expr_to_place(*expr_id, local.into(), current)?
+                        let Some(c) = self.lower_expr_to_place(expr_id, local.into(), current)?
                         else {
                             temporaries.pop_assume_dropped(self);
                             scope.pop_assume_dropped(self);
@@ -3522,7 +3537,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         // rustc's `FakeReadCause::ForLet` of `x`, before the initializer's
                         // temporaries are dropped: what the value borrows from a `match` arm's
                         // bindings, dropped as the arm ends, must outlive them.
-                        self.push_fake_read(c, local.into(), MirSpan::PatId(*pat));
+                        self.push_fake_read(c, local.into(), MirSpan::PatId(pat));
                         current = temporaries.pop_and_drop(self, c, span);
                         if let Some(scope) =
                             self.drop_scopes.iter_mut().rev().find(|it| !it.temporaries)
@@ -3535,11 +3550,11 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     if let Some(expr_id) = initializer {
                         let else_block;
                         let declared = self.drop_scopes.last().map_or(0, |it| it.locals.len());
-                        self.extend_temporaries(*expr_id, *pat, self.drop_scopes.len() - 1);
+                        self.extend_temporaries(expr_id, pat, self.drop_scopes.len() - 1);
                         let temporaries = self.push_drop_scope();
                         self.drop_scopes.last_mut().unwrap().temporaries = true;
                         let Some((init_place, c)) =
-                            self.lower_expr_as_place(current, *expr_id, true)?
+                            self.lower_expr_as_place(current, expr_id, true)?
                         else {
                             temporaries.pop_assume_dropped(self);
                             scope.pop_assume_dropped(self);
@@ -3548,20 +3563,20 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         current = c;
                         // rustc's `FakeReadCause::ForLet`, at the pattern, where the borrow
                         // checker finds the place a `let _: T` ascribes.
-                        self.push_fake_read(current, init_place, MirSpan::PatId(*pat));
+                        self.push_fake_read(current, init_place, MirSpan::PatId(pat));
                         // Using the initializer for the resolver scope is good enough for us, as it cannot create new declarations
                         // and has all declarations of the `let`.
                         let resolver_guard = self.resolver.update_to_inner_scope(
                             self.db,
                             self.store_owner,
-                            *expr_id,
+                            expr_id,
                         );
-                        self.super_let = enclosing.filter(|_| *is_super);
+                        self.super_let = enclosing.filter(|_| is_super);
                         let matched = match else_branch {
                             Some(_) => self
-                                .pattern_match_linked(current, init_place, *pat)
+                                .pattern_match_linked(current, init_place, pat)
                                 .map(|(then, otherwise)| (then, Some(otherwise))),
-                            None => self.pattern_match(current, None, init_place, *pat),
+                            None => self.pattern_match(current, None, init_place, pat),
                         };
                         self.super_let = None;
                         (current, else_block) = matched?;
@@ -3572,13 +3587,13 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                                 self.set_terminator(else_block, TerminatorKind::Unreachable, span);
                             }
                             (Some(else_block), Some(else_branch)) => {
-                                self.lower_let_else(else_block, *else_branch, declared, span)?;
+                                self.lower_let_else(else_block, else_branch, declared, span)?;
                             }
                         }
                         current = temporaries.pop_and_drop(self, current, span);
                     } else {
                         let mut err = None;
-                        self.store.walk_bindings_in_pat(*pat, |b| {
+                        self.store.walk_bindings_in_pat(pat, |b| {
                             if let Err(e) = self.push_storage_live(b, current) {
                                 err = Some(e);
                             }
@@ -3588,7 +3603,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         }
                     }
                 }
-                &hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
+                hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
                     let scope2 = self.push_drop_scope();
                     // A place used as a statement (`*x;`, `S[0];`) is moved out of into a
                     // temporary, as rustc's `stmt_expr` does with `as_temp`, sized or not, and
@@ -3719,7 +3734,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         self.result.param_locals.extend(params.clone().map(|(it, ty)| {
             let local_id = self.result.locals.alloc(Local { ty: ty.store() });
             self.drop_scopes.last_mut().unwrap().locals.push(local_id);
-            if let Pat::Bind { id, subpat: None } = self.store[it]
+            if let Pat::Bind { id, subpat: None } = self.store.pat(it)
                 && matches!(
                     self.store[id].mode,
                     BindingAnnotation::Unannotated | BindingAnnotation::Mutable
@@ -3753,7 +3768,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
             .into_iter()
             .skip(base_param_count + self_binding.is_some() as usize);
         for ((param, _), local) in params.zip(local_params) {
-            if let Pat::Bind { id, .. } = self.store[param]
+            if let Pat::Bind { id, .. } = self.store.pat(param)
                 && local == self.binding_local(id)?
             {
                 continue;
@@ -3824,6 +3839,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                         .unwrap()
                         .display(db, edition),
                 );
+                // alloc: error path
                 Err(MirLowerError::ConstEvalError(name.into(), Box::new(e)))
             }
         }
@@ -4328,7 +4344,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
 }
 
 fn convert_closure_capture_projections(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     place: &HirPlace,
 ) -> impl Iterator<Item = PlaceElem> {
     place.projections.iter().enumerate().flat_map(|(i, proj)| {
@@ -4360,7 +4376,7 @@ fn convert_closure_capture_projections(
 }
 
 fn cast_kind<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     source_ty: Ty<'db>,
     target_ty: Ty<'db>,
 ) -> Result<'db, CastKind> {
@@ -4384,7 +4400,7 @@ fn cast_kind<'db>(
 /// The constant a `const { .. }` block `expr` of `owner` is lowered to, a body of its own; `None`
 /// where it is lowered in place, as an inline const of a constant's or static's value is.
 pub fn inline_const_at<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     infer: &InferenceResult<'db>,
     expr: ExprId,
@@ -4409,18 +4425,16 @@ pub fn inline_const_at<'db>(
     ))
 }
 
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_closure_cycle_result, lru = 0)]
-pub fn mir_body_for_closure_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_mir_body_for_closure<'db>(
+    db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     lower_closure_body(db, closure.loc(db), CoroutineCaptures::Own)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result, lru = 0)]
-pub fn mir_body_for_coroutine_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_mir_body_for_coroutine<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::Own)
@@ -4429,25 +4443,16 @@ pub fn mir_body_for_coroutine_query<'db>(
 /// The body of the `async` block of an `async` closure that is called by value though it could
 /// be called again: the future that makes owns what the closure captured, where the block
 /// itself borrows from the closure.
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_for_coroutine_cycle_result, lru = 0)]
-pub fn mir_body_for_coroutine_by_move_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_mir_body_for_coroutine_by_move<'db>(
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
 }
 
-fn mir_body_for_coroutine_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _def: InternedCoroutineId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
 /// Refuses a body with a macro call that failed to expand, or whose expansion is not what
 /// rustc parses it as: what stands in for the expansion is a guess, where rustc stops.
-fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Result<'db, ()> {
+fn check_expansions<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Result<'db, ()> {
     if let Some(message) = failed_expansion(db, owner) {
         not_supported!("{message}");
     }
@@ -4458,7 +4463,7 @@ fn check_expansions<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> R
 /// expansion is not what rustc parses it as. A query of its own: the source map it reads
 /// changes with every edit above the body, and what it finds does not.
 #[salsa::tracked(returns(ref))]
-fn failed_expansion<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Option<String> {
+fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String> {
     use syntax::AstNode;
     let (source_map, own) = match owner.expression_store_owner(db) {
         ExpressionStoreOwnerId::Body(def) => {
@@ -4605,14 +4610,14 @@ enum CoroutineCaptures {
 }
 
 fn lower_closure_body<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     InternedClosure { owner: body_owner, expr, .. }: InternedClosure<'db>,
     held: CoroutineCaptures,
 ) -> Result<'db, MirBody<'db>> {
     let store = ExpressionStore::of(db, body_owner.expression_store_owner(db));
     let infer = InferenceResult::of(db, body_owner);
     check_expansions(db, body_owner)?;
-    let Expr::Closure { args, body: root, closure_kind, .. } = &store[expr] else {
+    let Expr::Closure { args, body: root, closure_kind, .. } = store.expr(expr) else {
         implementation_error!("closure expression is not closure");
     };
     let Some(closure_data) = infer.closures_data.get(&expr) else {
@@ -4623,7 +4628,7 @@ fn lower_closure_body<'db>(
         CoroutineCaptures::OfClosure => {
             let closure = ExpressionStore::closure_for_coroutine(expr);
             let (Expr::Closure { args, .. }, Some(of_closure)) =
-                (&store[closure], infer.closures_data.get(&closure))
+                (store.expr(closure), infer.closures_data.get(&closure))
             else {
                 implementation_error!("async block of a closure that is not one");
             };
@@ -4769,16 +4774,16 @@ fn lower_closure_body<'db>(
     }
 
     ctx.resolver.reset_to_guard(resolver_guard);
-    ctx.ends_temporaries.insert(*root);
+    ctx.ends_temporaries.insert(root);
     if let ClosureKind::Coroutine { source: CoroutineSource::Fn | CoroutineSource::Closure, .. } =
         closure_kind
-        && let Expr::Block { tail: Some(body), .. } = &store[*root]
+        && let Expr::Block { tail: Some(body), .. } = store.expr(root)
     {
-        ctx.drop_temps.insert(*body);
+        ctx.drop_temps.insert(body);
     }
-    if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
+    if let Some(current) = ctx.lower_expr_to_place(root, return_slot().into(), current)? {
         let current = ctx.pop_drop_scope_assert_finished(current, root.into())?;
-        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(*root).end());
+        ctx.set_terminator(current, TerminatorKind::Return, MirSpan::from(root).end());
     }
     if let Some(CoroutineLocals { poll, .. }) = ctx.result.coroutine {
         let ready = ctx.poll_variant(true)?;
@@ -4866,7 +4871,7 @@ type Capture<'a> = (&'a CapturedPlace, LocalId, usize);
 /// The capture that `place` is, or is inside of, or holds, and how many of the projections
 /// of `place` the capture stands for.
 fn captured_place<'a>(
-    db: &dyn HirDatabase,
+    db: &Db,
     captures: &[Capture<'a>],
     place: &StoredPlace,
 ) -> Option<(usize, Capture<'a>)> {
@@ -4899,18 +4904,8 @@ fn captured_place<'a>(
     })
 }
 
-/// How many of the lowered bodies salsa keeps the value of once a revision is over; 0 keeps
-/// every one.
-pub fn set_mir_capacity(db: &mut dyn HirDatabase, capacity: usize) {
-    mir_body_query::set_lru_capacity(db, capacity);
-    mir_body_for_closure_query::set_lru_capacity(db, capacity);
-    mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
-    mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
-}
-
-#[salsa::tracked(returns(as_ref), cycle_result = mir_body_cycle_result, lru = 0)]
-pub fn mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+pub(crate) fn compute_mir_body<'db>(
+    db: &'db Db,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
     let krate = def.krate(db);
@@ -4955,7 +4950,7 @@ pub fn mir_body_query<'db>(
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
 #[salsa::tracked(returns(as_ref))]
 pub fn promoted_mir_body_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: InferBodyId<'db>,
     expr: ExprId,
 ) -> Result<'db, MirBody<'db>> {
@@ -4983,26 +4978,10 @@ pub fn promoted_mir_body_query<'db>(
     Ok(ctx.result)
 }
 
-fn mir_body_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _def: InferBodyId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
-fn mir_body_for_closure_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
-    _: salsa::Id,
-    _def: InternedClosureId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    Err(MirLowerError::Loop)
-}
-
 /// Extracts params from `body.params`/`body.self_param` and the callable signature,
 /// then delegates to [`lower_to_mir_with_store`].
 pub fn lower_body_to_mir<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,
@@ -5045,7 +5024,7 @@ pub fn lower_body_to_mir<'db>(
 ///   bindings with no owner); `false` when lowering an inline const or anonymous
 ///   const (picks bindings owned by `root_expr`).
 pub fn lower_to_mir_with_store<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,

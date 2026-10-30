@@ -174,6 +174,15 @@ pub(crate) fn lz4(raw: &[u8]) -> Option<Vec<u8>> {
     (stored.len() + raw.len() / 8 <= raw.len()).then_some(stored)
 }
 
+/// [`lz4`] into `out`, a buffer the caller reuses: the same bytes, in `out` when it says so.
+pub(crate) fn lz4_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
+    out.clear();
+    out.resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
+    let len = lz4_flex::block::compress_into(raw, out).expect("the most LZ4 can grow a block by fits");
+    out.truncate(len);
+    len + raw.len() / 8 <= raw.len()
+}
+
 pub(crate) fn unlz4(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
     // A block's densest byte, a match length's 255, is what an LZ4 block can grow by per byte;
     // `raw` is unverified, and it is allocated before a byte is decoded.
@@ -250,7 +259,7 @@ mod tests {
 
     /// A long value whose repeats are further apart than zstd's default window reaches.
     fn long_value() -> Vec<u8> {
-        let mut rng = blaze_core::sim::Rng::new(5);
+        let mut rng = blaze_ids::rng::SplitMix64::new(5);
         let block: Vec<u8> = (0..LONG_FROM / 2).map(|_| rng.next_u64() as u8).collect();
         let mut value = block.clone();
         value.extend((0..LONG_FROM).map(|_| rng.next_u64() as u8));
@@ -292,8 +301,21 @@ mod tests {
         let stored = lz4(&text).unwrap();
         assert_eq!(unlz4(&stored, text.len() as u64).unwrap(), text);
         assert!(unlz4(&stored, text.len() as u64 + 1).is_err());
-        let mut rng = blaze_core::sim::Rng::new(6);
+        let mut rng = blaze_ids::rng::SplitMix64::new(6);
         let noise: Vec<u8> = (0..64 << 10).map(|_| rng.next_u64() as u8).collect();
         assert_eq!(lz4(&noise), None);
+    }
+
+    /// The on-disk bytes do not change with the buffer: into a reused one, each value is what
+    /// `lz4` makes, kept exactly when `lz4` keeps it.
+    #[test]
+    fn lz4_into_a_reused_buffer_makes_the_same_bytes() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(7);
+        let noise: Vec<u8> = (0..64 << 10).map(|_| rng.next_u64() as u8).collect();
+        let mut out = vec![0xAA; 3];
+        for value in [sample(1).repeat(64), noise, sample(2).repeat(3), Vec::new(), sample(3).repeat(500)] {
+            let kept = lz4_into(&value, &mut out);
+            assert_eq!(lz4(&value), kept.then(|| out.clone()), "{} bytes", value.len());
+        }
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     expr_store::pretty::{print_function, print_struct},
     nameres::crate_def_map,
     signatures::{FunctionSignature, StructSignature},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 use expect_test::{Expect, expect};
 use test_fixture::WithFixture;

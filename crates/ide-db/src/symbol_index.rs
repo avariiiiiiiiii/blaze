@@ -28,7 +28,7 @@ use std::{
 };
 
 use base_db::{
-    CrateOrigin, InternedSourceRootId, LangCrateOrigin, LibraryRoots, LocalRoots, SourceRootId,
+    CrateOrigin, Db, InternedSourceRootId, LangCrateOrigin, LibraryRoots, LocalRoots, SourceRootId,
     salsa::SalsaValue, source_root_crates,
 };
 use fst::{Automaton, Streamer, raw::IndexedValue};
@@ -39,7 +39,6 @@ use hir::{
     symbols::{FileSymbol, SymbolCollector},
 };
 use itertools::Itertools;
-use rayon::prelude::*;
 
 use crate::RootDatabase;
 
@@ -188,7 +187,7 @@ impl Query {
 }
 
 /// The symbol indices of modules that make up a given crate.
-pub fn crate_symbols(db: &dyn HirDatabase, krate: Crate) -> Box<[&SymbolIndex<'_>]> {
+pub fn crate_symbols(db: &Db, krate: Crate) -> Box<[&SymbolIndex<'_>]> {
     let _p = tracing::info_span!("crate_symbols").entered();
     krate.modules(db).into_iter().map(|module| SymbolIndex::module_symbols(db, module)).collect()
 }
@@ -244,24 +243,16 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<FileSymbol<'_>>
 
         target_modules.iter().map(|&module| SymbolIndex::module_symbols(db, module)).collect()
     } else if query.libs {
-        LibraryRoots::get(db)
-            .roots(db)
-            .par_iter()
-            .for_each_with(db.clone(), |snap, &root| _ = SymbolIndex::library_symbols(snap, root));
-        LibraryRoots::get(db)
-            .roots(db)
-            .iter()
-            .map(|&root| SymbolIndex::library_symbols(db, root))
-            .collect()
+        let roots: Vec<SourceRootId> = LibraryRoots::get(db).roots(db).iter().copied().collect();
+        db.run_all(roots.len(), |db, at| _ = SymbolIndex::library_symbols(db, roots[at]));
+        roots.into_iter().map(|root| SymbolIndex::library_symbols(db, root)).collect()
     } else {
         let mut crates = Vec::new();
 
         for &root in LocalRoots::get(db).roots(db).iter() {
             crates.extend(source_root_crates(db, root).iter().copied())
         }
-        crates
-            .par_iter()
-            .for_each_with(db.clone(), |snap, &krate| _ = crate_symbols(snap, krate.into()));
+        db.run_all(crates.len(), |db, at| _ = crate_symbols(db, crates[at].into()));
         crates
             .into_iter()
             .flat_map(|krate| Vec::from(crate_symbols(db, krate.into())))
@@ -288,7 +279,7 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<FileSymbol<'_>>
 /// 1. Finding crates matching the first segment
 /// 2. Walking down the module tree following subsequent segments
 fn resolve_path_to_modules(
-    db: &dyn HirDatabase,
+    db: &Db,
     path_filter: &[String],
     anchor_to_crate: bool,
     case_sensitive: bool,
@@ -368,12 +359,12 @@ pub struct SymbolIndex<'db> {
 impl<'db> SymbolIndex<'db> {
     /// The symbol index for a given source root within library_roots.
     pub fn library_symbols(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         source_root_id: SourceRootId,
     ) -> &'db SymbolIndex<'db> {
         #[salsa::tracked(returns(ref))]
         fn library_symbols<'db>(
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             source_root_id: InternedSourceRootId<'db>,
         ) -> SymbolIndex<'db> {
             let _p = tracing::info_span!("library_symbols").entered();
@@ -398,10 +389,10 @@ impl<'db> SymbolIndex<'db> {
 
     /// The symbol index for a given module. These modules should only be in source roots that
     /// are inside local_roots.
-    pub fn module_symbols(db: &dyn HirDatabase, module: Module) -> &SymbolIndex<'_> {
+    pub fn module_symbols(db: &Db, module: Module) -> &SymbolIndex<'_> {
         #[salsa::tracked(returns(ref))]
         fn module_symbols<'db>(
-            db: &'db dyn HirDatabase,
+            db: &'db Db,
             module: hir::ModuleId,
         ) -> SymbolIndex<'db> {
             let _p = tracing::info_span!("module_symbols").entered();
@@ -421,9 +412,9 @@ impl<'db> SymbolIndex<'db> {
     }
 
     /// The symbol index for all extern prelude crates.
-    pub fn extern_prelude_symbols(db: &dyn HirDatabase) -> &SymbolIndex<'_> {
+    pub fn extern_prelude_symbols(db: &Db) -> &SymbolIndex<'_> {
         #[salsa::tracked(returns(ref))]
-        fn extern_prelude_symbols<'db>(db: &'db dyn HirDatabase) -> SymbolIndex<'db> {
+        fn extern_prelude_symbols<'db>(db: &'db Db) -> SymbolIndex<'db> {
             let _p = tracing::info_span!("extern_prelude_symbols").entered();
 
             // We call this without attaching because this runs in parallel, so we need to attach here.

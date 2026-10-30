@@ -14,7 +14,9 @@ use std::borrow::Cow;
 
 use blaze_ids::radix;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
+use crate::arena::collect_in;
 use crate::LinkError;
 use crate::cow::CowBytes;
 use crate::model::Class;
@@ -48,25 +50,22 @@ const BLOCK: usize = 4096;
 /// parts, each sorted by offset, and the slots the writer encodes, laid over the regions.
 /// Parts are copied last, so they win where they overlap anything.
 struct Layout<'s> {
-    spaces: Vec<(u64, u64, &'s CowBytes)>,
+    spaces: SmallVec<[(u64, u64, &'s CowBytes); 32]>,
     encoded: &'s [(u64, u64)],
-    parts: Vec<(u64, &'s [u8])>,
+    parts: SmallVec<[(u64, &'s [u8]); 16]>,
 }
 
 impl<'s> Layout<'s> {
     fn of(state: &'s State) -> Layout<'s> {
-        let mut spaces: Vec<(u64, u64, &CowBytes)> = state
-            .spaces
-            .iter()
-            .filter_map(|space| {
-                let offset = space.offset.filter(|_| !space.zero)?;
-                let len = space.region.size.min(space.bytes.len() as u64);
-                (len > 0).then_some((offset, len, &space.bytes))
-            })
-            .collect();
+        let mut spaces = SmallVec::new();
+        spaces.extend(state.spaces.iter().filter_map(|space| {
+            let offset = space.offset.filter(|_| !space.zero)?;
+            let len = space.region.size.min(space.bytes.len() as u64);
+            (len > 0).then_some((offset, len, &space.bytes))
+        }));
         radix::sort_by_key(&mut spaces, |it| it.0);
-        let mut parts: Vec<(u64, &[u8])> =
-            state.parts.iter().filter(|it| !it.1.is_empty()).map(|(at, bytes)| (*at, &bytes[..])).collect();
+        let mut parts = SmallVec::new();
+        parts.extend(state.parts.iter().filter(|it| !it.1.is_empty()).map(|(at, bytes)| (*at, &bytes[..])));
         radix::sort_copy_by_key(&mut parts, |it| it.0);
         Layout { spaces, encoded: &state.encoded, parts }
     }
@@ -97,6 +96,7 @@ impl<'s> Layout<'s> {
     }
 
     fn bytes(&self, at: u64, len: u64) -> Vec<u8> {
+        // alloc: one buffer per write, which the commit owns (`Finished::writes`)
         let mut out = vec![0; len as usize];
         self.copy(at, &mut out);
         out
@@ -104,7 +104,8 @@ impl<'s> Layout<'s> {
 
     /// Every range of the file anything is in, merged where closer than `gap`.
     fn extents(&self, gap: u64) -> Vec<(u64, u64)> {
-        let mut all: Vec<(u64, u64)> = self.spaces.iter().map(|it| (it.0, it.1)).collect();
+        let mut all = Vec::with_capacity(self.spaces.len() + self.parts.len());
+        all.extend(self.spaces.iter().map(|it| (it.0, it.1)));
         all.extend(self.parts.iter().map(|it| (it.0, it.1.len() as u64)));
         merge(all, gap)
     }
@@ -141,7 +142,9 @@ fn runs(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 
 /// The bytes of `ranges` of `layout`'s file, built in parallel.
 fn fill(layout: &Layout<'_>, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {
-    ranges.par_iter().with_min_len(4).map(|&(at, len)| (at, layout.bytes(at, len))).collect()
+    let mut out = Vec::with_capacity(ranges.len());
+    out.par_extend(ranges.par_iter().with_min_len(4).map(|&(at, len)| (at, layout.bytes(at, len))));
+    out
 }
 
 /// Every byte of `state`'s file, as runs of at most [`RUN`] bytes. The gaps between regions
@@ -180,6 +183,7 @@ fn slots_in_file(spaces: &[Space], slots: &[(u64, u64)]) -> Result<Vec<(u64, u64
     let mut next = 0;
     for &(addr, value) in slots {
         if addr < next {
+            // alloc: error path
             return Err(error(None, format!("the writer encoded the slot at {addr:#x} out of order or overlapping another")));
         }
         next = addr.saturating_add(8);
@@ -190,8 +194,10 @@ fn slots_in_file(spaces: &[Space], slots: &[(u64, u64)]) -> Result<Vec<(u64, u64
         let space = spaces
             .get(at)
             .filter(|it| it.region.addr <= addr && next <= end(it))
+            // alloc: error path
             .ok_or_else(|| error(None, format!("the writer encoded a slot at {addr:#x}, outside every placed region")))?;
         let (Some(offset), false) = (space.offset, space.zero) else {
+            // alloc: error path
             return Err(error(None, format!("the writer encoded a slot at {addr:#x}, in a region not in the file")));
         };
         out.push((offset + addr - space.region.addr, value));
@@ -241,23 +247,26 @@ impl<'a> Stage<'a> {
     pub fn finish(mut self) -> Result<Finished, LinkError> {
         self.update_lists()?;
         let mut parts = self.parts()?;
-        let contents: Vec<Cow<'_, [u8]>> = self.new.spaces.iter().map(contents).collect();
+        let arena = self.arena;
+        let contents = collect_in(self.new.spaces.iter().map(contents), arena);
         let synthetic = {
-            let refs: Vec<&[u8]> = contents.iter().map(|it| &**it).collect();
+            let refs = collect_in(contents.iter().map(|it| &**it), arena);
             let symbol = |name: &str| self.address_of(&parts.regions, name);
             let placed = parts.placed(&self, &refs, &symbol);
             self.writer.synthesize(&placed)?
         };
-        let mut homes = Vec::with_capacity(synthetic.len());
+        let mut homes = Vec::with_capacity_in(synthetic.len(), arena);
         for (class, bytes) in &synthetic {
             let at = self
                 .new
                 .space_of(class)
+                // alloc: error path
                 .ok_or_else(|| error(None, format!("the writer filled {class:?}, which the image has no region for")))?;
             let capacity = self.new.spaces[at].region.capacity;
             if bytes.len() as u64 > capacity {
                 return Err(error(
                     None,
+                    // alloc: error path
                     format!(
                         "{class:?} is {} bytes and has room for {capacity}: link the image from scratch",
                         bytes.len()
@@ -268,13 +277,13 @@ impl<'a> Stage<'a> {
             homes.push(at);
         }
         let (offsets, file, encoded) = {
-            let mut refs: Vec<&[u8]> = contents.iter().map(|it| &**it).collect();
+            let mut refs = collect_in(contents.iter().map(|it| &**it), arena);
             for (at, (_, bytes)) in homes.iter().zip(&synthetic) {
                 refs[*at] = bytes.as_slice();
             }
             let symbol = |name: &str| self.address_of(&parts.regions, name);
             let placed = parts.placed(&self, &refs, &symbol);
-            let offsets: Vec<Option<u64>> = parts.regions.iter().map(|it| self.writer.offset(&placed, it)).collect();
+            let offsets = collect_in(parts.regions.iter().map(|it| self.writer.offset(&placed, it)), arena);
             let encoded = self.writer.encode(&placed)?;
             (offsets, self.writer.file(&placed)?, encoded)
         };
@@ -287,22 +296,28 @@ impl<'a> Stage<'a> {
         for (space, offset) in self.new.spaces.iter_mut().zip(offsets) {
             space.offset = if space.zero { None } else { offset };
         }
-        self.new.encoded =
-            if encoded.is_empty() { std::sync::Arc::default() } else { std::sync::Arc::new(slots_in_file(&self.new.spaces, &encoded)?) };
+        self.new.encoded = if encoded.is_empty() {
+            std::sync::Arc::default()
+        } else {
+            // alloc: once per stage whose writer encodes slots; the state shares them
+            std::sync::Arc::new(slots_in_file(&self.new.spaces, &encoded)?)
+        };
         self.new.file_len = file.len;
+        // alloc: once per stage; the state shares the writer's parts
         self.new.parts = std::sync::Arc::new(file.parts);
         let message = self.output.live.is_some().then(|| self.message());
         let writes = if self.full { whole(&self.new) } else { self.dirty() };
         let (undo, old_len) = match (self.old.laid_out, self.full) {
+            // alloc: none, an empty Vec holds no buffer
             (false, _) => (Vec::new(), 0),
+            // alloc: none, an empty Vec holds no buffer
             (true, true) => (Vec::new(), self.old.file_len),
             (true, false) => {
                 let len = self.old.file_len;
-                let undo = writes
-                    .iter()
-                    .filter(|(at, _)| *at < len)
-                    .map(|(at, bytes)| (*at, (bytes.len() as u64).min(len - at)))
-                    .collect();
+                let mut undo = Vec::with_capacity(writes.len());
+                undo.extend(
+                    writes.iter().filter(|(at, _)| *at < len).map(|(at, bytes)| (*at, (bytes.len() as u64).min(len - at))),
+                );
                 (undo, len)
             }
         };
@@ -345,13 +360,7 @@ impl<'a> Stage<'a> {
                         ranges.push((offset + size, old.region.size - size));
                     }
                     if matches!(space.region.class, Class::Synthetic(_)) {
-                        let (a, b) = (contents(old), contents(space));
-                        for start in (0..b.len()).step_by(BLOCK) {
-                            let end = (start + BLOCK).min(b.len());
-                            if a.get(start..end) != Some(&b[start..end]) {
-                                ranges.push((offset + start as u64, (end - start) as u64));
-                            }
-                        }
+                        changed_blocks(offset, &contents(old), &contents(space), &mut ranges);
                     }
                 }
                 _ => ranges.push((offset, size.max(old.map_or(0, |it| it.region.size)))),
@@ -360,17 +369,27 @@ impl<'a> Stage<'a> {
         if !std::sync::Arc::ptr_eq(&self.old.encoded, &self.new.encoded) {
             changed_slots(&self.old.encoded, &self.new.encoded, self.new.file_len, &mut ranges);
         }
-        let mut old_parts: Vec<(u64, &[u8])> = self.old.parts.iter().map(|(at, bytes)| (*at, &bytes[..])).collect();
+        let mut old_parts = collect_in(self.old.parts.iter().map(|(at, bytes)| (*at, &bytes[..])), self.arena);
         radix::sort_copy_by_key(&mut old_parts, |it| it.0);
         for (offset, bytes) in self.new.parts.iter() {
-            let same = old_parts
-                .binary_search_by_key(offset, |it| it.0)
-                .is_ok_and(|at| old_parts[at].1 == &bytes[..]);
-            if !same {
-                ranges.push((*offset, bytes.len() as u64));
+            match old_parts.binary_search_by_key(offset, |it| it.0) {
+                Ok(at) if old_parts[at].1 == &bytes[..] => {}
+                Ok(at) => changed_blocks(*offset, old_parts[at].1, bytes, &mut ranges),
+                Err(_) => ranges.push((*offset, bytes.len() as u64)),
             }
         }
         fill(&Layout::of(&self.new), &merge(ranges, GAP))
+    }
+}
+
+/// Pushes each `BLOCK` of `new`, at file offset `offset`, that differs from `old`, the bytes the
+/// last link wrote there.
+fn changed_blocks(offset: u64, old: &[u8], new: &[u8], ranges: &mut Vec<(u64, u64)>) {
+    for start in (0..new.len()).step_by(BLOCK) {
+        let end = (start + BLOCK).min(new.len());
+        if old.get(start..end) != Some(&new[start..end]) {
+            ranges.push((offset + start as u64, (end - start) as u64));
+        }
     }
 }
 
@@ -384,6 +403,20 @@ mod tests {
         assert_eq!(merged, [(0, 108), (5000, 4010)]);
         assert_eq!(merge(vec![(0, 10), (10 + GAP + 1, 1)], GAP), [(0, 10), (10 + GAP + 1, 1)]);
         assert_eq!(merge(vec![(0, 10), (10 + GAP, 1)], GAP), [(0, 11 + GAP)]);
+    }
+
+    #[test]
+    fn a_changed_part_rewrites_only_its_changed_blocks() {
+        let old = vec![7u8; 3 * BLOCK];
+        let mut new = old.clone();
+        new[BLOCK + 5] = 0;
+        new.extend_from_slice(&[1, 2, 3]);
+        let mut ranges = Vec::new();
+        changed_blocks(100, &old, &new, &mut ranges);
+        assert_eq!(ranges, [(100 + BLOCK as u64, BLOCK as u64), (100 + 3 * BLOCK as u64, 3)]);
+        ranges.clear();
+        changed_blocks(0, &new, &old, &mut ranges);
+        assert_eq!(ranges, [(BLOCK as u64, BLOCK as u64)], "a shorter part rewrites none past its end");
     }
 
     #[test]
@@ -409,6 +442,7 @@ mod tests {
         let parts: Vec<(u64, Vec<u8>)> = vec![(0, vec![1; 64]), (0x1100, vec![2; 4]), (0x5000, vec![3; 3])];
         let layout = Layout {
             spaces: regions.iter().map(|(at, bytes)| (*at, bytes.len() as u64, bytes)).collect(),
+            encoded: &[],
             parts: parts.iter().map(|(at, bytes)| (*at, &bytes[..])).collect(),
         };
         let mut reference = vec![0u8; 0x5003];

@@ -81,6 +81,7 @@ should fail with `blaze_macro_wasm::rule::refused(name, why)`. Use them in place
 there.
 
 > forwarded to cargo
+> answered by lane cargo (cargo-inbox-user): done at crates/blaze-cargo/src/cargo/own_macro.rs:161 (`runs` over `rule::runs`, used by `runs_as_wasm` :193 and `libraries_of` :310; `wasm()` :145 reads the rule's `TurnedOff`; `WASM`/`NATIVE_KEY` are the rule's), :413 (`refusal` is `rule::refused` plus the manifest's path)
 
 ## 5. Native expanders: withdrawn (2026-10-29)
 

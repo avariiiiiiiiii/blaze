@@ -2,6 +2,7 @@
 
 use std::{io::Read, path::Path, sync::Arc, time::Duration};
 
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, Fns, Function, How, Record, Summary};
 
 use crate::{
@@ -426,22 +427,6 @@ fn item_len(bytes: &[u8]) -> usize {
     }
 }
 
-/// xorshift64, for seeded runs.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % n
-    }
-}
-
 const KRATES: [&str; 2] = ["anim", "core"];
 
 /// The one name of function `key`: some in modules, some methods of a type.
@@ -471,7 +456,7 @@ fn summary() -> Summary {
 /// patches whose calls name ids of later records and of none, other records, and now and then
 /// one of the build before, late.
 fn seeded(seed: u64, roots: u32, n: usize) -> Vec<(u32, u64, Record)> {
-    let mut rng = Rng::new(seed);
+    let mut rng = SplitMix64::new(seed);
     let (mut build, mut builds) = (0u64, vec![0u64; roots as usize]);
     let mut out = Vec::with_capacity(n);
     for at in 0..n as u64 {
@@ -903,11 +888,11 @@ fn a_module_path_read_in_place_is_the_one_collected_step_by_step() {
         "anim", "core", "::", "::", "<", ">", " as ", "&", "&mut ", "dyn ", "{closure#0}", "(",
         ")", "[", "]", "fn(", "->", "'a ", "Vec", "T", ", ", " ", "é", "::<",
     ];
-    let mut rng = Rng::new(11);
+    let mut rng = SplitMix64::new(11);
     for _ in 0..20_000 {
         let mut name = String::new();
         for _ in 0..1 + rng.below(14) {
-            name.push_str(PIECES[rng.below(PIECES.len() as u64) as usize]);
+            name.push_str(PIECES[rng.index(PIECES.len())]);
         }
         assert_eq!(module_path(&name), old::module_path(&name), "{name:?}");
     }

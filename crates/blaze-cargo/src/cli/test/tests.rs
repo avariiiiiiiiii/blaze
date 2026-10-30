@@ -47,8 +47,22 @@ fn speaking() -> Speaking<'static> {
 
 fn tested(asked: &Invocation, fake: &mut Fake, speaking: Speaking<'_>) -> (i32, String) {
     let mut err = Vec::new();
-    let code = run(asked, &built(), speaking, &mut err, fake).unwrap();
+    let code = run(asked, &built(), 1, speaking, &mut err, fake).unwrap();
     (code, String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn rerun_names_the_package_as_cargos_needs_spec_flag_does() {
+    assert!(!needs_spec_flag(&asked(Command::Test, &[]), 1));
+    assert!(needs_spec_flag(&asked(Command::Test, &[]), 2), "a workspace of two");
+    assert!(needs_spec_flag(&asked(Command::Test, &["-p", "foo"]), 1));
+    assert!(needs_spec_flag(&asked(Command::Test, &["--workspace", "--exclude", "bar"]), 1));
+
+    let mut fake = Fake { ends: vec![("foo-0123abcd", Ended::Code(101))], ..Fake::default() };
+    let mut err = Vec::new();
+    let code = run(&asked(Command::Test, &[]), &built(), 3, speaking(), &mut err, &mut fake).unwrap();
+    assert_eq!(code, 101);
+    assert!(String::from_utf8(err).unwrap().ends_with("error: test failed, to rerun pass `-p foo --lib`\n"));
 }
 
 #[test]
@@ -165,7 +179,7 @@ fn quiet_and_bench() {
 
 fn result(binary: &str, name: &str, outcome: TestOutcome, output: &str) -> TestResult {
     let millis = if outcome == TestOutcome::Ignored { 0 } else { 5 };
-    TestResult { binary: binary.to_owned(), name: name.to_owned(), outcome, output: output.as_bytes().to_vec(), millis }
+    TestResult { binary: binary.to_owned(), name: name.to_owned(), outcome, output: output.as_bytes().to_vec(), millis, cached: None }
 }
 
 #[test]

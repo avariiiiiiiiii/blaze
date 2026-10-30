@@ -11,7 +11,7 @@ use crate::{
     name::{AsName, Name},
     tt,
 };
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use intern::{InternedSlice, Symbol, sym};
 use parser::T;
 use smallvec::SmallVec;
@@ -40,6 +40,7 @@ fn intern_segments(segments: &[Name]) -> Option<InternedSlice<PathSegments>> {
     if segments.is_empty() {
         return None;
     }
+    // alloc: none: `to_owned` makes the interned reference an owned handle, a pointer copy
     Some(InternedSlice::from_header_and_slice((), segments).to_owned())
 }
 
@@ -91,18 +92,19 @@ impl PathKind {
 
 impl ModPath {
     pub fn from_src(
-        db: &dyn SourceDatabase,
+        db: &Db,
         path: ast::Path,
-        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+        span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
         convert_path(db, path, span_for_range)
     }
 
-    pub fn from_tt(db: &dyn SourceDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+    pub fn from_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
         convert_path_tt(db, tt)
     }
 
     pub fn from_segments(kind: PathKind, segments: impl IntoIterator<Item = Name>) -> ModPath {
+        // alloc: none for up to 8 segments, gathered on the stack
         let segments: SegmentBuf = segments.into_iter().collect();
         ModPath { kind, segments: intern_segments(&segments) }
     }
@@ -113,8 +115,8 @@ impl ModPath {
     }
 
     pub fn from_tokens(
-        db: &dyn SourceDatabase,
-        span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+        db: &Db,
+        span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
         is_abs: bool,
         segments: impl Iterator<Item = SyntaxToken>,
     ) -> Option<ModPath> {
@@ -232,13 +234,13 @@ impl ModPath {
             _ => None,
         }
     }
-    pub fn display_verbatim<'a>(&'a self, db: &'a dyn SourceDatabase) -> impl fmt::Display + 'a {
+    pub fn display_verbatim<'a>(&'a self, db: &'a Db) -> impl fmt::Display + 'a {
         Display { db, path: self, edition: None }
     }
 
     pub fn display<'a>(
         &'a self,
-        db: &'a dyn SourceDatabase,
+        db: &'a Db,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         Display { db, path: self, edition: Some(edition) }
@@ -254,7 +256,7 @@ impl Extend<Name> for ModPath {
 }
 
 struct Display<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     path: &'a ModPath,
     edition: Option<Edition>,
 }
@@ -272,7 +274,7 @@ impl From<Name> for ModPath {
 }
 
 fn display_fmt_path(
-    db: &dyn SourceDatabase,
+    db: &Db,
     path: &ModPath,
     f: &mut fmt::Formatter<'_>,
     edition: Option<Edition>,
@@ -312,9 +314,9 @@ fn display_fmt_path(
 }
 
 fn convert_path(
-    db: &dyn SourceDatabase,
+    db: &Db,
     path: ast::Path,
-    span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
+    span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
 ) -> Option<ModPath> {
     let mut segments = path.segments();
 
@@ -394,7 +396,7 @@ fn convert_path(
     Some(ModPath { kind, segments: intern_segments(&names) })
 }
 
-fn convert_path_tt(db: &dyn SourceDatabase, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
+fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
     let mut leaves = tt.iter().filter_map(|tt| match tt {
         tt::TtElement::Leaf(leaf) => Some(leaf),
         tt::TtElement::Subtree(..) => None,
@@ -436,7 +438,7 @@ fn convert_path_tt(db: &dyn SourceDatabase, tt: tt::TokenTreesView<'_>) -> Optio
     Some(ModPath { kind, segments: intern_segments(&segments) })
 }
 
-pub fn resolve_crate_root(db: &dyn SourceDatabase, mut ctxt: SyntaxContext) -> Option<Crate> {
+pub fn resolve_crate_root(db: &Db, mut ctxt: SyntaxContext) -> Option<Crate> {
     // When resolving `$crate` from a `macro_rules!` invoked in a `macro`,
     // we don't want to pretend that the `macro_rules!` definition is in the `macro`
     // as described in `SyntaxContextId::apply_mark`, so we ignore prepended opaque marks.
@@ -516,6 +518,8 @@ macro_rules! __tool_path {
 mod tests {
     use std::hash::BuildHasher;
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     fn names(texts: &[&str]) -> Vec<Name> {
@@ -543,18 +547,12 @@ mod tests {
             PathKind::Super(0),
             PathKind::Super(2),
         ];
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         (0..400)
             .map(|_| {
-                let kind = KINDS[next() as usize % KINDS.len()];
-                let len = next() as usize % 12;
-                let words = (0..len).map(|_| WORDS[next() as usize % WORDS.len()]).collect();
+                let kind = KINDS[rng.index(KINDS.len())];
+                let len = rng.index(12);
+                let words = (0..len).map(|_| WORDS[rng.index(WORDS.len())]).collect();
                 (kind, words)
             })
             .collect()

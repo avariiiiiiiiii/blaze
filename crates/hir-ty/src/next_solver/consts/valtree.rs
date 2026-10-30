@@ -1,9 +1,11 @@
 use std::{borrow::Cow, fmt, hash::Hash, marker::PhantomData, num::{NonZero, NonZeroU32}};
 
+use base_db::Db;
 use hir_def::{AdtId, VariantId};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_type_ir::{GenericTypeVisitable, TypeFoldable, TypeVisitable, inherent::IntoKind};
+use smallvec::SmallVec;
 use stdx::never;
 
 use crate::{
@@ -51,7 +53,7 @@ impl<'db> ValueConst<'db> {
     #[inline]
     pub fn try_to_bits(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         param_env: ParamEnvAndCrate<'db>,
     ) -> Option<u128> {
         let (TyKind::Bool | TyKind::Char | TyKind::Uint(_) | TyKind::Int(_) | TyKind::Float(_)) =
@@ -224,7 +226,7 @@ pub(super) fn allocation_to_const<'db>(
             let Ok(layout) = db.layout_of_ty(ty.store(), param_env.store()) else {
                 return Const::error(interner);
             };
-            let mut items = Vec::new();
+            let mut items = SmallVec::<[_; 8]>::new();
             let (variant, layout): (VariantId, Cow<'_, Layout>) = match def.def_id() {
                 AdtId::StructId(id) => (id.into(), Cow::Borrowed(&*layout)),
                 AdtId::UnionId(_) => return Const::error(interner),

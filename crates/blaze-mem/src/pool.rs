@@ -10,6 +10,10 @@
 //! pool's stack of strays, which caches drain before carving new slots. Slots go back to the
 //! pool, never to the kernel: the warm loop makes no system call and no global allocation.
 //!
+//! Objects readers may still hold when they are retired (under [`blaze_reclaim`] guards) go
+//! to a [`Limbo`], which keeps them in their slots and returns them to the pool once their
+//! grace has passed: no box per retirement and no list that grows in the warm loop.
+//!
 //! Cost: an allocation or free through a cache is an array push or pop and a write of the
 //! value; one compare-and-swap per 64 of them on the shared stacks.
 
@@ -21,8 +25,10 @@ use std::{
     ptr::NonNull,
 };
 
+use blaze_reclaim::Grace;
+
 use crate::{
-    MemError, Region, Tag,
+    MemError, Region, RegionVec, Tag,
     error::fail,
     stack::{LinkTable, Stack},
     sync::atomic::{AtomicU32, Ordering},
@@ -385,5 +391,122 @@ impl<T> Drop for Pooled<'_, T> {
 impl<T: fmt::Debug> fmt::Debug for Pooled<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Retired {
+    grace: Grace,
+    index: u32,
+}
+
+/// Objects of one pool that were unlinked while readers may still hold them, each kept in its
+/// slot until its grace has passed (docs/v2/plan/design/concurrency.md "Task boundaries
+/// reclaim memory"), then dropped and its slot returned through the limbo's own cache. For
+/// one owner (a writer of the table they were unlinked from).
+///
+/// Graces are held in start order, so the passed ones are a prefix and [`Limbo::collect`]
+/// finds it with a binary search. Its list sits in a reserved column as long as the pool, so
+/// it never allocates; a drained prefix is reused in place.
+pub struct Limbo<'p, T> {
+    cache: Cache<'p, T>,
+    held: RegionVec<Retired>,
+    /// Entries before it were collected.
+    head: usize,
+}
+
+impl<'p, T> Limbo<'p, T> {
+    /// A limbo for `pool`, with room for every slot it can make.
+    pub fn new(pool: &'p Pool<T>) -> Result<Limbo<'p, T>, MemError> {
+        Ok(Limbo {
+            cache: pool.cache(),
+            held: RegionVec::new(pool.max() as usize, pool.tag())?,
+            head: 0,
+        })
+    }
+
+    pub fn pool(&self) -> &'p Pool<T> {
+        self.cache.pool
+    }
+
+    /// Objects held, not yet collected.
+    pub fn len(&self) -> usize {
+        self.held.len() - self.head
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Retires `pooled`, which the caller has unlinked (its release stores done): it is
+    /// dropped once every task that may have read it has ended.
+    pub fn retire(&mut self, pooled: Pooled<'p, T>) {
+        self.hold(Grace::start(), pooled);
+    }
+
+    /// Retires `pooled` under a grace the caller started after unlinking it (one grace for a
+    /// batch). A grace older than one held already is held as the newer one: later, never
+    /// sooner.
+    pub fn hold(&mut self, grace: Grace, pooled: Pooled<'p, T>) {
+        assert!(std::ptr::eq(pooled.pool, self.cache.pool), "a Pooled of another pool");
+        let pooled = mem::ManuallyDrop::new(pooled);
+        let grace = match self.held.last() {
+            Some(last) if self.head < self.held.len() => grace.max(last.grace),
+            _ => grace,
+        };
+        if self.head == self.held.len() {
+            self.held.clear();
+            self.head = 0;
+        } else if self.head > 0
+            && (self.head * 2 >= self.held.len() || self.held.len() == self.held.max_len())
+        {
+            let live = self.held.len() - self.head;
+            self.held.copy_within(self.head.., 0);
+            self.held.truncate(live);
+            self.head = 0;
+        }
+        // Each entry owns a distinct slot and `pooled` owns one more, so the entries fit in a
+        // column as long as the pool.
+        self.held.push(Retired { grace, index: pooled.index });
+    }
+
+    /// Drops every object whose grace has passed and keeps its slot for the pool. Returns how
+    /// many it freed.
+    pub fn collect(&mut self) -> usize {
+        let passed = self.held[self.head..].partition_point(|retired| retired.grace.passed());
+        for at in self.head..self.head + passed {
+            let index = self.held[at].index;
+            // SAFETY: the slot holds the value its `Pooled` owned when it was retired (the
+            // `Pooled` was forgotten), no reader can reach it once its grace has passed, and the
+            // head moves past it below, so it is dropped once.
+            unsafe { self.cache.pool.slot(index).drop_in_place() };
+            self.cache.keep(index);
+        }
+        self.head += passed;
+        passed
+    }
+}
+
+impl<T> Drop for Limbo<'_, T> {
+    fn drop(&mut self) {
+        // As `blaze_reclaim::Limbo`: its owner drops it only once no reader can reach what it
+        // holds, so everything goes at once.
+        for at in self.head..self.held.len() {
+            let index = self.held[at].index;
+            // SAFETY: the slot holds the value retired into it, dropped once: the limbo is
+            // going away and its owner says no reader is left.
+            unsafe { self.cache.pool.slot(index).drop_in_place() };
+            self.cache.keep(index);
+        }
+        self.head = self.held.len();
+    }
+}
+
+impl<T> fmt::Debug for Limbo<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Limbo")
+            .field("tag", &self.cache.pool.tag)
+            .field("held", &self.len())
+            .finish()
     }
 }

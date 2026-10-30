@@ -49,7 +49,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
     Spliced, Stamp,
+    journal::Journal,
     lasting::{Lasting, Own, is_lasting, left_behind},
+    names::Names,
 };
 
 /// What segments are aligned to on AArch64.
@@ -83,27 +85,7 @@ fn put64(bytes: &mut [u8], at: usize, value: u64) {
 }
 
 fn uleb(bytes: &[u8], at: &mut usize) -> anyhow::Result<u64> {
-    let (mut value, mut shift) = (0u64, 0);
-    loop {
-        let byte = *bytes.get(*at).context("a number that ends early")?;
-        *at += 1;
-        value |= u64::from(byte & 0x7f).checked_shl(shift).context("a number too large")?;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-    }
-}
-
-fn push_uleb(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        out.push(if value == 0 { byte } else { byte | 0x80 });
-        if value == 0 {
-            return;
-        }
-    }
+    Ok(blaze_format::leb::read_u64(bytes, at)?)
 }
 
 /// What a splice has to know of the executable. Nothing of the file is read again but the
@@ -118,8 +100,8 @@ pub struct Image {
     sectioned: usize,
     /// Where `commands` has what refers into `__LINKEDIT`.
     at: Commands,
-    symbols: FxHashMap<Box<[u8]>, Named>,
-    imports: FxHashMap<Box<[u8]>, Import>,
+    symbols: Names<Named>,
+    imports: Names<Import>,
     unwind: Table,
     frames: Table,
     /// How much is in front of `__eh_frame` that only `__unwind_info` takes: the room the
@@ -271,7 +253,7 @@ impl Signature {
         &self,
         file: &File,
         kept: u64,
-        dirty: &[(u64, Vec<u8>)],
+        dirty: impl Iterator<Item = (u64, usize)>,
         added: &[u8],
         last: Option<&Appended>,
         give_up: &AtomicBool,
@@ -284,9 +266,9 @@ impl Signature {
         let mut hashes =
             self.hashes.get(..kept * Self::HASH).context("a short signature")?.to_vec();
         let mut page = vec![0; page_len];
-        let pages: FxHashSet<usize> = (dirty.iter())
-            .flat_map(|(at, bytes)| {
-                *at as usize / page_len..=(*at as usize + bytes.len().max(1) - 1) / page_len
+        let pages: FxHashSet<usize> = dirty
+            .flat_map(|(at, len)| {
+                at as usize / page_len..=(at as usize + len.max(1) - 1) / page_len
             })
             .filter(|page| *page < kept)
             .collect();
@@ -444,9 +426,9 @@ impl Rebases {
                 .take_while(|(it, nth)| **it == first + nth * 8 && **it < end)
                 .count();
             stream.push(macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segment as u8);
-            push_uleb(&mut stream, first - segments[segment]);
+            blaze_format::leb::write_u64(&mut stream, first - segments[segment]);
             stream.push(macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES);
-            push_uleb(&mut stream, run as u64);
+            blaze_format::leb::write_u64(&mut stream, run as u64);
             rest = &rest[run..];
         }
         stream.push(macho::REBASE_OPCODE_DONE);
@@ -459,7 +441,11 @@ impl Image {
     /// Whether a patch can call the C symbol `name`: the executable defines it, or has the
     /// address slot of the library's that defines it, as a patch reaches what it calls.
     pub fn can_call(&self, name: &str) -> bool {
-        self.gives(format!("_{name}").as_bytes())
+        blaze_mem::scratch::with_bytes(|symbol| {
+            symbol.push(b'_');
+            symbol.extend_from_slice(name.as_bytes());
+            self.gives(symbol)
+        })
     }
 
     /// Whether a patch that refers to the symbol `name`, as its object names it, is given
@@ -639,20 +625,21 @@ impl Image {
         let mut starts: Vec<u64> = defined.iter().map(|it| it.0).collect();
         radix::sort(&mut starts);
         starts.dedup();
-        let mut symbols = FxHashMap::<Box<[u8]>, Named>::default();
+        let mut symbols = Names::<Named>::with_capacity(defined.len())?;
         for (address, section_end, kind, entry) in defined {
             let next = starts.get(starts.partition_point(|it| *it <= address));
             let end = next.map_or(section_end, |next| section_end.min(*next));
             let defined =
                 Defined { address, size: end.saturating_sub(address), kind, entry: entry as u64 };
-            match symbols.get_mut(name(entry)?) {
-                None => _ = symbols.insert(name(entry)?.into(), Named::One(defined)),
-                Some(Named::One(known)) if *known == Defined { entry: known.entry, ..defined } => {}
-                Some(known) => *known = Named::Many,
+            match symbols.get_or_insert(name(entry)?, Named::One(defined))? {
+                (_, true) => {}
+                (Named::One(known), false)
+                    if *known == Defined { entry: known.entry, ..defined } => {}
+                (known, false) => *known = Named::Many,
             }
         }
 
-        let mut imports = FxHashMap::<Box<[u8]>, Import>::default();
+        let mut imports = Names::<Import>::with_capacity(64)?;
         let indirect = u32_at(commands, at.indirect + 56)? as usize;
         for &(address, len, flags, first, stub) in &sections {
             let each = match flags & macho::SECTION_TYPE {
@@ -671,7 +658,7 @@ impl Image {
                 {
                     continue;
                 }
-                let import = imports.entry(name(entry)?.into()).or_default();
+                let (import, _) = imports.get_or_insert(name(entry)?, Import::default())?;
                 let at = Some(address + nth * each);
                 match each {
                     8 if flags & macho::SECTION_TYPE == macho::S_NON_LAZY_SYMBOL_POINTERS => {
@@ -703,7 +690,7 @@ impl Image {
     /// Takes the signature of `bytes`, the executable as someone else signed it again after
     /// the splice `undo` puts back. Each splice starts from the file as it was before any,
     /// so the hashes of the pages `undo` puts back are of what it puts back.
-    pub fn signed_again(&mut self, bytes: &[u8], undo: &[(u64, Vec<u8>)]) -> anyhow::Result<()> {
+    pub(crate) fn signed_again(&mut self, bytes: &[u8], undo: &Journal) -> anyhow::Result<()> {
         let count = u32_at(bytes, 16)?;
         let (mut at, mut uuid, mut signature) = (HEADER, None, None);
         for _ in 0..count {
@@ -726,16 +713,14 @@ impl Image {
         let mut new = Signature::read(signature.context("the file ends early")?)?;
         let page = new.page;
         let pages: FxHashSet<usize> = (undo.iter())
-            .flat_map(|(at, old)| {
-                *at as usize / page..=(*at as usize + old.len().max(1) - 1) / page
-            })
+            .flat_map(|(at, old)| at as usize / page..=(at as usize + old.len().max(1) - 1) / page)
             .collect();
         for index in pages {
             let start = index * page;
             let end = (start + page).min(offset);
             let mut content = bytes.get(start..end).context("a short file")?.to_vec();
             for (at, old) in undo.iter().rev() {
-                let (at, end) = (*at as usize, *at as usize + old.len());
+                let (at, end) = (at as usize, at as usize + old.len());
                 let (from, to) = (at.max(start), end.min(start + content.len()));
                 if from < to {
                     content[from - start..to - start].copy_from_slice(&old[from - at..to - at]);
@@ -2268,11 +2253,13 @@ struct Addition {
 
 /// Brings the executable at `path` from what the linker wrote to that with `patch` in place
 /// of the functions it defines.
-pub fn splice(
+/// `undone` is room to keep `undo` as it was in, for when the splice fails.
+pub(crate) fn splice(
     image: &Image,
     path: &Path,
     baked: &[Box<[u8]>],
-    undo: &mut Vec<(u64, Vec<u8>)>,
+    undo: &mut Journal,
+    undone: &mut Journal,
     originals: &mut FxHashMap<u64, Vec<u8>>,
     stamp: &mut Stamp,
     last: &mut Option<Appended>,
@@ -2300,37 +2287,38 @@ pub fn splice(
     step("copy", &mut from);
     // What is undone of the last splice is the copy's: the executable keeps it until the
     // rename, and a splice given up on leaves it as it was.
-    let undone = undo.clone();
+    undone.copy_from(undo)?;
     let mut fresh = None;
     let written = (|| -> anyhow::Result<Stamp> {
         super::go_on(give_up)?;
         let file = OpenOptions::new().read(true).write(true).open(&copy)?;
-        for (offset, bytes) in undo.drain(..).rev() {
-            super::write_all_at(&file, &bytes, offset)?;
-        }
+        let put_back = (undo.iter().rev())
+            .try_for_each(|(offset, bytes)| super::write_all_at(&file, bytes, offset));
+        undo.clear();
+        put_back?;
         file.set_len(addition.offset)?;
         let kept = addition.overwritten.len();
-        let dirty: Vec<(u64, Vec<u8>)> =
-            addition.overwritten.iter().chain(&addition.tables).cloned().collect();
-        for (nth, (offset, bytes)) in dirty.iter().enumerate() {
-            let mut old = vec![0; bytes.len()];
-            super::read_exact_at(&file, &mut old, *offset)?;
+        let dirty = || addition.overwritten.iter().chain(&addition.tables);
+        for (nth, (offset, bytes)) in dirty().enumerate() {
+            let old = undo.record(*offset, bytes.len(), |old| {
+                Ok(super::read_exact_at(&file, old, *offset)?)
+            })?;
             // The last splice is undone: this is what the linker wrote.
             if nth < kept {
                 let address = image.address_of(*offset)?;
                 let known = originals.entry(address).or_default();
                 if known.len() < old.len() {
-                    known.clone_from(&old);
+                    known.clear();
+                    known.extend_from_slice(old);
                 }
             }
-            undo.push((*offset, old));
             super::write_all_at(&file, bytes, *offset)?;
         }
         step("overwrite", &mut from);
         let (signature, hashes) = image.signature.of(
             &file,
             addition.offset,
-            &dirty,
+            dirty().map(|(offset, bytes)| (*offset, bytes.len())),
             &addition.appended,
             last.as_ref(),
             give_up,
@@ -2356,7 +2344,7 @@ pub fn splice(
     }
     if written.is_err() {
         _ = std::fs::remove_file(&copy);
-        *undo = undone;
+        std::mem::swap(undo, undone);
     }
     let spliced =
         Spliced { redirected: addition.redirected, appended: addition.appended.len(), copied: 0 };

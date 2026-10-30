@@ -47,7 +47,6 @@ serde_json.workspace = true
 cfg.workspace = true
 toolchain.workspace = true
 intern.workspace = true
-memmap2 = "0.9"
 wasmparser = { version = "0.236", default-features = false, features = ["std"] }
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
@@ -65,6 +64,8 @@ shlex = "2"
 toml.workspace = true
 cargo_metadata.workspace = true
 
+base-db.workspace = true
+blaze-core.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
@@ -106,6 +107,9 @@ blaze-wasi = { path = "../blaze-wasi" }
 libc.workspace = true
 tikv-jemallocator = "0.5.4"
 
+
+[build-dependencies]
+blaze-sha256.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.47", features = ["net"] }

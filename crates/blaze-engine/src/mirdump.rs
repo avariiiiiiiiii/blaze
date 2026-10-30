@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base_db::Db;
 use anyhow::Context;
 use hir_def::{FunctionId, ItemContainerId, Lookup};
 use hir_ty::{
@@ -114,7 +115,9 @@ impl<'a> Dump<'a> {
     /// `file:line` of where an `impl` is written, as rustc's `<impl at file:line:col: ..>`.
     fn impl_place(&self, id: hir_def::ImplId) -> String {
         let (file, at) = impl_written_at(self.db, id);
-        let line = ide_db::line_index(self.db, file).line_col(at).line + 1;
+        let text = self.db.file_text(file);
+        let place = base_db::line_index(self.db, text).place(at);
+        let line = place.expect("an impl is in its file").line();
         let path = self.vfs.file_path(file).to_string();
         let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
         format!("{name}:{line}")
@@ -141,7 +144,7 @@ impl<'a> Dump<'a> {
     }
 
     fn body(&mut self, def: InferBodyId<'a>) -> Option<&'a MirBody<'a>> {
-        let db: &'a dyn HirDatabase = self.db;
+        let db: &'a Db = self.db;
         let start = Instant::now();
         let runtime = db.runtime_mir_body(def);
         self.timing.built += start.elapsed();
@@ -160,7 +163,7 @@ impl<'a> Dump<'a> {
     }
 
     fn closure_body(&mut self, closure: InternedClosureId<'a>) -> Option<&'a MirBody<'a>> {
-        let db: &'a dyn HirDatabase = self.db;
+        let db: &'a Db = self.db;
         let start = Instant::now();
         let runtime = db.runtime_mir_body_for_closure(closure);
         self.timing.built += start.elapsed();
@@ -208,7 +211,7 @@ impl<'a> Dump<'a> {
             if !seen.insert(closure) {
                 continue;
             }
-            let db: &dyn HirDatabase = self.db;
+            let db: &Db = self.db;
             let suffix = closure_path_suffix(db, closure).unwrap_or_else(|| "::{closure}".into());
             let name = format!("{path}{suffix}");
             let Some(body) = self.closure_body(closure) else {

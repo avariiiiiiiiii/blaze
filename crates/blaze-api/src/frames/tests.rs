@@ -1,4 +1,4 @@
-use blaze_core::sim::Rng;
+use blaze_ids::rng::SplitMix64 as Rng;
 
 use super::*;
 use crate::{Request, Response};
@@ -42,6 +42,111 @@ fn items_come_out_whole_whatever_the_cuts() {
         }
         assert_eq!(out, items, "seed {seed}");
         assert_eq!(frames.held(), 0, "seed {seed}");
+    }
+}
+
+/// The frames as they were, all they hold in one `Vec` cut to its length: the reference the
+/// kept, zeroed-once buffer is held to.
+#[derive(Default)]
+struct Model {
+    bytes: Vec<u8>,
+}
+
+impl Model {
+    fn next(&mut self) -> Option<Vec<u8>> {
+        let len = u32::from_be_bytes(self.bytes.get(..4)?.try_into().unwrap()) as usize;
+        if self.bytes.len() < 4 + len {
+            return None;
+        }
+        let item = self.bytes[4..4 + len].to_vec();
+        self.bytes.drain(..4 + len);
+        Some(item)
+    }
+
+    fn wanted(&self, least: usize) -> usize {
+        let held = self.bytes.len();
+        let Some(head) = self.bytes.get(..4) else { return least };
+        let len = u32::from_be_bytes(head.try_into().unwrap());
+        if len > LONGEST_REQUEST {
+            return least;
+        }
+        (4 + len as usize).saturating_sub(held).min(held).max(least)
+    }
+}
+
+/// A reader that gives at most `most` bytes a read.
+struct Trickle<'a> {
+    bytes: &'a [u8],
+    most: usize,
+}
+
+impl Read for Trickle<'_> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let len = into.len().min(self.most).min(self.bytes.len());
+        into[..len].copy_from_slice(&self.bytes[..len]);
+        self.bytes = &self.bytes[len..];
+        Ok(len)
+    }
+}
+
+/// Pushes, adopted buffers and fills, mixed and cut anywhere, hand out what the old frames
+/// did, and say the same of what they hold and want.
+#[test]
+fn every_way_in_gives_what_the_old_frames_gave() {
+    for seed in 0..400 {
+        let mut rng = Rng::new(seed);
+        let mut stream = Vec::new();
+        for id in 0..(1 + rng.below(12)) {
+            let request = match rng.below(3) {
+                0 => Request::Status,
+                1 => Request::Cancel { id: rng.below(u64::MAX) },
+                _ => Request::Close { root: blaze_ids::ContentId([rng.below(256) as u8; 32]) },
+            };
+            stream.extend(encode(&Envelope::new(id, request)).unwrap());
+        }
+        let (mut frames, mut model) = (Frames::new(), Model::default());
+        let mut at = 0;
+        while at < stream.len() {
+            let len = (rng.below(90) as usize).min(stream.len() - at);
+            let piece = &stream[at..at + len];
+            match rng.below(3) {
+                0 => frames.push(piece),
+                1 => frames.push_vec(piece.to_vec()),
+                _ => {
+                    let most = 1 + rng.below(200) as usize;
+                    let mut from = Trickle { bytes: piece, most: 1 + rng.below(50) as usize };
+                    let mut got = 0;
+                    while got < len {
+                        got += frames.fill(&mut from, most.min(len - got)).unwrap();
+                    }
+                }
+            }
+            model.bytes.extend_from_slice(piece);
+            at += len;
+            assert_eq!(frames.held(), model.bytes.len(), "seed {seed}");
+            assert_eq!(frames.wanted(64), model.wanted(64), "seed {seed}");
+            while let Some(item) = frames.next_ref().unwrap() {
+                assert_eq!(Some(item.to_vec()), model.next(), "seed {seed}");
+            }
+            assert_eq!(model.next(), None, "seed {seed}");
+        }
+        assert_eq!(frames.held(), 0, "seed {seed}");
+    }
+}
+
+/// Once its buffer has grown, a fill reads into it with no allocation and no zeroing.
+#[test]
+fn a_warm_fill_allocates_nothing() {
+    let frame = encode(&Envelope::new(4, Request::Status)).unwrap();
+    let mut frames = Frames::new();
+    frames.fill(&mut &frame[..], 64 << 10).unwrap();
+    assert!(frames.next_ref().unwrap().is_some());
+    for _ in 0..100 {
+        let read = blaze_alloc_count::assert_at_most(0, "a fill of a warm buffer", || {
+            frames.fill(&mut &frame[..], 64 << 10).unwrap()
+        });
+        assert_eq!(read, frame.len());
+        assert_eq!(frames.next_ref().unwrap(), Some(&frame[4..]));
     }
 }
 

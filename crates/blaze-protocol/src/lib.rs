@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bytes;
 pub mod cbor;
 pub mod events;
 pub mod follow;

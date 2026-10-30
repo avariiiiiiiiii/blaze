@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use hir::{Adt, AssocItem, HasAttrs, HasSource, Module, ModuleDef};
-use ide_db::{RootDatabase, base_db::SourceDatabase, rust_doc::is_rust_fence};
+use ide_db::{RootDatabase, rust_doc::is_rust_fence};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 use syntax::{AstNode, SyntaxKind, TextRange, TextSize, ast::HasName};
 
@@ -344,8 +344,9 @@ impl Found<'_> {
 
     fn line_of(&self, file: hir::EditionedFileId, at: TextSize) -> Option<(PathBuf, usize)> {
         let file = file.file_id(self.db);
-        let line = ide_db::line_index(self.db, file).line_col(at).line;
-        Some((self.path(file)?, line as usize + 1))
+        let text = self.db.file_text(file);
+        let line = base_db::line_index(self.db, text).place(at)?.line();
+        Some((self.path(file)?, line as usize))
     }
 }
 

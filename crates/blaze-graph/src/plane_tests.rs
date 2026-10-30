@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod memory;
 mod reference;
 
 use std::sync::{Arc, Mutex};

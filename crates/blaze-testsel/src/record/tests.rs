@@ -1,13 +1,6 @@
-use super::*;
+use blaze_ids::rng::SplitMix64;
 
-/// splitmix64: a seed's sequence, the same on every machine.
-fn next(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
+use super::*;
 
 /// The byte-at-a-time scan [`hits_of`] must equal.
 fn reference(map: &[u8]) -> Vec<u32> {
@@ -16,12 +9,12 @@ fn reference(map: &[u8]) -> Vec<u32> {
 
 #[test]
 fn the_word_scan_finds_what_the_byte_scan_finds() {
-    let mut state = 7;
+    let mut rng = SplitMix64::new(7);
     for len in 0..200usize {
         for density in [0u64, 1, 8, 64, 255] {
             let map: Vec<u8> = (0..len)
                 .map(|_| {
-                    let roll = next(&mut state);
+                    let roll = rng.next_u64();
                     match roll % 256 < density {
                         // Any value but zero is a hit, the high bit alone included.
                         true => [1u8, 0x80, 0xff, 0x7f, 2][(roll >> 8) as usize % 5],

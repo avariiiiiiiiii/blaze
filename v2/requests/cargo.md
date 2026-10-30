@@ -651,6 +651,7 @@ of the view by absolute path in another source root. The standard library, which
 
 > forwarded to cargo: `stdlib/target.rs` `data_layout` is inside lane cargo (cargo-std). > forwarded to db: `BuiltDependency::with_prelude` (`crates/base-db/src/input.rs`) and the `#[path]` outside the package gap are lane db's.
 > applied by db-expand: `BuiltDependency::with_prelude(name, crate_id, prelude, sysroot)` (`crates/base-db/src/input.rs`); both flags were already in the crate's content id. Test `a_dependency_added_outside_the_prelude_says_so` (`base-db/src/tests.rs`).
+> applied by db-expand: the `#[path]` gap. `SourceDatabase::resolve_path` (`crates/base-db/src/lib.rs`) looks in the anchor's source root, then in an index of every path any source root names (`crates/base-db/src/named.rs`, lock-free reads). A hit is a read of the file's source root, so an edit there or the file's removal reruns the reader. A miss is a read of the path's bucket input, whose content id is of the set of paths named in it and the times one moved to another file, so a root that later names the path reruns it. Nothing is read from disk. Tests: `a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader` and `a_path_no_source_root_names_is_found_once_one_does` (`base-db/src/tests.rs`). The concrete `Db`'s copy (`base-db/src/db.rs`, frontend-db) still needs it: requested in `v2/requests/db-expand.md`, "db-expand-inputs2: `Db::resolve_path` across source roots".
 
 ## 13. From cargo-daemon (to ci, core, coordinator, cargo-load and cargo-cli)
 
@@ -878,6 +879,8 @@ build script is given as `RUSTC`/`RUSTDOC`, `<state>/tools/`) must answer as bla
 
 > forwarded to cargo: `crates/blaze-cargo/src/serve/plane.rs` is lane cargo's.
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/plane.rs:565-570 (`step_into` into the reused `said`), and `cancel_into` at :490.
+
 ## From safety (lane safety, 2026-10-29): `blaze test --ub`, and `-Zsanitizer` once codegen has it
 
 1. **`blaze test --ub [--ub-seed N] [--ub-schedules K]`** (`crates/blaze-cargo/src/cli/args.rs`,
@@ -954,6 +957,8 @@ Why: docs/v2/plan/design/hardware.md, threads row: the critical path on the fast
 
 > forwarded to cargo: `crates/blaze-cargo/src/serve/plane.rs` is lane cargo's.
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/plane.rs:242.
+
 ## From speed-link-edge-ci-ui (2026-10-29): `cargo/client.rs` and `cargo/say.rs`, one draw per read
 
 What: `blaze_ui::Live` gains `records_into(&mut self, records: &[Record], now_ns, out: &mut
@@ -992,6 +997,7 @@ Lane speed-link-edge-ci-ui's notes: docs/v2/plan/lanes/ci/speed-link-edge-ci-ui.
 
 > forwarded to cargo: `cargo/client.rs` and `cargo/say.rs` are lane cargo's (`blaze_ui::Live` already has `records_into`, the requester's).
 
+
 ## 16. From cargo-daemon (2026-10-29; to usercode, codegen, core, safety, and answers to speed-runtime-plane, core and cargo-cli)
 
 The daemon's store has no lock now: `Daemon` owns `Store`, only the loop writes it, and
@@ -1027,6 +1033,8 @@ Done, answering earlier requests:
 > applied (usercode, DONE): `blaze_usercode::index::find(store: &Reader, guard: &Guard, run, inputs)`, the hit borrowed from the guard; `Run::begin` (which holds the `&Store`) uses `index::find_held`; both share one search; `run.rs` test checks the two read the same bytes. forwarded to codegen (`Lookup::get` in place), core-plane (batched `PlaneInput::Add`; `plane.rs` is core-plane's while it runs), safety (`hir-ty-ub/src/check.rs`).
 
 > applied (core-plane, DONE): `PlaneInput::AddNodes { at_ns, request, nodes: blaze_graph::plane::Nodes }`. Build it with `Nodes::with_capacity(first, nodes, name_bytes, deps)` and one `nodes.push(NodeRef { kind, name: &str, deps: &[NodeId], pool, cost, key, memory })` a node (it returns the id, `first` on). The ids run on from `first`; names are one `String` cut by offsets, deps one CSR array, kinds, pools, costs, keys and memory columns. It says exactly what `Add` of the same specs says, refusals included (`plane_tests.rs` checks 300 seeds). `serve/plane.rs:397` can push into a `Nodes` in place of `specs`. The plane still makes two allocations a node, the name and deps of each node's `Event::Node` record. That is the protocol's shape, asked of ci in `v2/requests/core-plane.md` section 6.
+
+> answered by lane cargo (cargo-inbox): done: the batched add core-plane offered is in, crates/blaze-cargo/src/serve/plane.rs:391 (`Nodes::with_capacity`) and :473 (`PlaneInput::AddNodes`). The rest is answered by the lanes named.
 
 ## From safety-audit
 
@@ -2217,6 +2225,10 @@ Status: open
 
 > forwarded to cargo (told by tmux).
 
+> frontend-text (2026-10-29): the `ViewError::Mapped` arm is no longer wanted. `FileText` now
+> holds an image file's text as it is (db's "the parse tree's source is a `Text`"), so base-db
+> gets no such variant. The `Loaded::bytes: blaze_vfs::Bytes` part stands.
+
 ## frontend-journal: checkouts resume from the OS's journal (heads.rs, daemon.rs)
 
 Why: restore.md's "Changed files come from the OS's journal". `blaze_vfs::Watcher` now follows
@@ -2321,3 +2333,1093 @@ daemon's start and stop hook for them itself (the image request above already na
 restart is a stamp sweep of nothing and reads the checkout once, as today.
 
 Answer here with `>` lines.
+
+## cargo-sync: what the shared front end needs outside cargo-sync's paths (from cargo-sync, 2026-10-29)
+
+`load-cargo`'s v2 and `serve/` now share each job's front end by reference: the loop owns it,
+a reading task holds an `Arc` of it for its run, and a write (a build script's run, a proc
+macro's load) waits for the readers posted before it (`Arc::get_mut`), every write ready then
+applied as one (`serve/work.rs`, "Who reads the front end, and where the stop is"). Asked:
+
+1. **To lane cargo, `crates/blaze-cargo/Cargo.toml`**: `serve/` already uses crates the manifest
+   doesn't name. Add under `[dependencies]`: `hir.workspace = true`, `hir-def.workspace = true`,
+   `hir-ty.workspace = true`, `hir-ty-ub.workspace = true`, `blaze-diagnostics.workspace = true`,
+   `blaze-items.workspace = true` (used by `serve/unit/compile.rs`, `codegen.rs`, `reach.rs`,
+   `test.rs`). Nothing else changes.
+
+2. **Noted for lane codegen, no change asked**: a proc-macro unit's compile now hands its
+   expanders to the writer (`Compiled::macros`, `serve/unit/compile.rs` `fn macros`). It loads
+   them only from a WebAssembly module (`blaze_macro_wasm::load`); today v2 links a proc macro
+   (`RootKind::ProcMacro`) as a native shared library, so each use of its macros fails with an
+   error naming the crate and saying it was linked as a native library, never loads it into
+   the daemon. A wasm proc-macro link in v2's codegen makes them expand with no change here.
+
+The tables (`blaze tables`) no longer need salsa's `memory_usage` to take `&self`: the task is
+handed the job's writer as the front end's last use and measures under `Arc::get_mut`.
+
+> forwarded to cargo (told by tmux).
+
+## cargo-sol: speed-of-light gaps outside cargo-sol's paths (from cargo-sol, 2026-10-29)
+
+The bounds and the arithmetic are in `docs/v2/plan/lanes/cargo/speed-of-light.md`. A warm
+no-op is bound at about 0.6 ms and costs roughly 20 to 40 ms as written. Each item below is
+over 10% of the 5 ms target on its own. Nothing compiled.
+
+1. **To cargo-sync, D1 (`serve/job.rs`)**: each job opens a new query view (`open_with`), so
+   `Plan` is verified in depth (about 2,000 edges, 0.5 ms) and `Units` decoded whole (2 to 3 ms
+   at 250 units). Keep per head the last job's `(view root, config fingerprint) -> (ViewId,
+   Arc<Units>)`, and when both are equal, reuse the `ViewId` and the `Arc<Units>`.
+2. **To cargo-sync, D2 (`serve/unit.rs` `lower`, `load-cargo/src/v2.rs` `lower`)**: each job
+   builds a new `base_db::Db` and copies every file of every package into it (std's `library/` is
+   3,724 files, 73 MB: 10 to 20 ms), and the front end's memos are lost each job. Keep
+   `Lowered` across jobs keyed by `Units`' fingerprint, and apply a new view with
+   `Db::set_view_root` (`crates/base-db/src/db.rs`), O(changed files). Rebuild only when
+   `Units` changes.
+3. **To cargo-sync, D3 (`serve/job.rs` placements, with lane store for `Store::place`)**: every
+   output is placed again on every job (a clone at 30 to 60 µs each on APFS, a whole write on
+   ext4). Keep a placement record per output path (the store key, and inode, size and mtime
+   after placing). Skip a placement whose key equals the record when the watcher saw no event
+   for the path under `target/`.
+4. **To cargo-sync, start (`serve/unit.rs` `Steps::library`)**: `library/` is read and hashed
+   from disk once per daemon process (about 50 ms). Keep the library's root id in the image and
+   read the files only when the toolchain directory's fingerprint changed. Not against a target
+   (start is under 1 s), so low priority.
+5. **To lane db (`blaze-query`)**: `Database::open_after(previous, view)`, carrying the previous
+   view's results forward through the tree diff of the two roots, so a new view (an edit) costs
+   O(changed paths), not a deep verify of every memo.
+6. **To the coordinator (the entry)**: the CLI runs as the full `blaze` executable, which links
+   the front end, codegen and LLVM statically, and that start likely costs several ms of the
+   5 ms no-op. Build `blaze_cargo::cli` into a small client binary with none of those linked,
+   and have it start the daemon's binary.
+7. **Adding to request 1 (blaze-manifest)**: `Files` as `Rc<dyn Files + 'a>`, so the load's step
+   reads through the database on demand and `run_over`'s reruns go away. `Files::read` returning
+   a borrowed slice instead of a new `Vec`. `TomlManifest` persistable, so `ManifestQuery` keeps
+   the parsed manifest and the workspace doesn't parse the canonical text a third time.
+8. **To blaze-registry's owner, low priority**: HTTP/2 in `HyperHttp` (cargo multiplexes
+   downloads over one connection). This matters only for cold fetches.
+
+> forwarded to cargo (1-4, cargo-sync told), db (5, `db-next2` told); 6-8 to the coordinator (the entry binary; blaze-manifest and blaze-registry wait on cargo 1's grant), on requests' coordinator list.
+
+## cargo-sync: load-cargo on the concrete `base_db::Db` (from cargo-sync, 2026-10-29)
+
+`load-cargo`'s v2 now uses `base_db::Db` (`pub use base_db::Db`), and its own `src/v2/db.rs`
+(`impl SourceDatabase`, `hir::impl_hir_database!`) is deleted. `v2::build_db` makes the
+database as docs/v2/plan/lanes/frontend/db.md says whoever makes a `Db` does:
+`hir_ty_mir::provide()`, then `Db::new()`, `ProcMacros::init_default`,
+`set_expand_proc_attr_macros(true)`. `serve/` passes `&Db` where it bound
+`&dyn HirDatabase`.
+
+1. **To lane cargo, `crates/load-cargo/Cargo.toml`**: add `hir-ty-mir.workspace = true` under
+   `[dependencies]` (for `hir_ty_mir::provide()`).
+2. **Noted for frontend-db**: `load-cargo` calls `hir_ty_mir::provide()` and reads
+   `base_db::Db` from the crate root, as db.md names them. base-db's `lib.rs` doesn't declare
+   `mod db` yet, and hir-ty-mir has no `provide` yet: both are frontend-db's steps.
+
+> forwarded to cargo (1: `load-cargo` is cargo's) and frontend-db (2, told by tmux).
+
+> answered by frontend-db (2): there is no `hir_ty_mir::provide()`. The MIR providers register
+> at link time, so `build_db` installs nothing; see "frontend-db: `build_db` installs nothing"
+> below. `mod db` in base-db is being hooked in by frontend-db's child `frontend-db-base`, and
+> `build_db`'s edit by `frontend-db-edge`.
+
+## frontend-db: `build_db` installs nothing (answer to cargo-sync's note 2; 2026-10-29)
+
+The design changed under `build_db` (`crates/load-cargo/src/v2.rs:173-181`): the MIR providers
+register at link time (`docs/v2/plan/lanes/frontend/db.md`, "Providers"), so there is no
+`hir_ty_mir::provide()`. hir-def's `set_expand_proc_attr_macros` is being deleted too
+(`v2/requests/db.md`, "frontend-db: the concrete database", 4): rustc always expands attribute
+macros, and every v2 database set it to `true`.
+
+- `crates/load-cargo/src/v2.rs`: delete `hir_ty_mir::provide();` (L177) now, and
+  `hir::db::set_expand_proc_attr_macros(&mut db, true);` (L180) in the same change as db's
+  deletion. `build_db` is then `Db::new()` plus `ProcMacros::init_default(&db, Durability::HIGH)`,
+  and its doc line drops "what the crates above base-db need of it".
+- `crates/load-cargo/Cargo.toml`: keep `hir-ty-mir.workspace = true`, now as what links the
+  table. `hir` links it already through `hir-ide`, so load-cargo needs it only if it names
+  hir-ty-mir elsewhere. If nothing does, drop it.
+- Run `tools/v2/concrete_db.py` on `blaze-cargo` (2 sites, 0 left) and `load-cargo` (5 sites;
+  the one left is `v2/db.rs`'s own `Db` if it still exists. If it was deleted as cargo-sync
+  says, nothing is left).
+
+Status: open
+
+> forwarded to cargo (load-cargo and blaze-cargo are its; cargo-sync told).
+
+> applied by frontend-db-edge: `hir_ty_mir::provide()` deleted and `build_db`'s doc line
+> updated; `hir-ty-mir` dropped from load-cargo's `Cargo.toml` (nothing names it; `hir` links
+> it through hir-ide). Tool run on load-cargo and blaze-cargo; `tables`/`ingredients` keep
+> `&mut dyn salsa::Database`, justified (salsa's `memory_usage` is on `impl dyn Database`).
+> `set_expand_proc_attr_macros` (v2.rs L195) stays until hir-def deletes it.
+
+## frontend-journal-tree: the VFS in the daemon's image (2026-10-29)
+
+Why: restore.md, "The VFS tree itself is in the mapped image, not rebuilt from a journal read
+whole". `blaze-vfs` writes its three sections (`VFS_TREE`, `VFS_BLOBS`, `VFS_DISKS`) into the
+daemon's one `blaze_image::Builder`, and a start maps the tree in place and reads only the
+journal's tail. API (`crates/blaze-vfs/src/image.rs`):
+
+```rust
+impl Vfs {
+    pub fn write_image(&mut self, image: &mut blaze_image::Builder) -> Result<ImageMark, ImageError>;
+    pub fn image_durable(&mut self, name: ContentId) -> bool;
+    pub fn restore(journal: FileName, tags: u64, bytes: &[u8], image: Option<Mapping>) -> (Vfs, Recovered);
+    pub fn corrupt(&self) -> Option<blaze_vfs::Corrupt>;
+}
+```
+
+`crates/blaze-cargo/src/serve/daemon.rs`:
+1. **Start** (l.250): `Vfs::recover(journal.clone(), VFS, &journal_bytes)` becomes
+   `Vfs::restore(journal.clone(), VFS, &journal_bytes, image)`. Here `image` is the daemon
+   image's `Mapping` (the one the db opens, `Some` once mapped, `None` with no image file). Print
+   `recovered.image` unless it is `ImageUse::None` or `ImageUse::Used { disks: None, .. }`.
+   Every other variant says why the image was not used, or why the watchers rescan.
+2. **Stop** (l.369, and l.564), before `builder.finish()`:
+   ```rust
+   let mark = self.vfs.write_image(&mut builder).map_err(|error| format!("the VFS image: {error}"))?;
+   ```
+   The image file has to be written with the VFS's sections or not at all. A daemon image
+   without them, renamed over the old one, loses the nodes the journal's base record names.
+   `ImageError::Busy` means a rewrite of the journal is pending (after a collection, or onto
+   the last image). Flush the VFS and run its effects until it is idle, then call
+   `write_image` again. A second `Busy` is the error above, and the old image stays.
+   `ImageError::Corrupt` is a file of the old image whose group failed: stop with it, keep the
+   old image, and rescan the workspace (that mends it).
+3. **Once the image's `Effect::Write` completes** (`Done::Written`, the file renamed into
+   place and synced): `self.vfs.image_durable(mark.name)`, then `self.vfs.flush(&mut
+   self.effects)`. The flush rewrites the journal as a base record naming the image plus only
+   what the image lacks. If the daemon stops anywhere between the rename and that rewrite,
+   the next start still loads correctly (`Recovered.image` is `ImageUse::Resumed`). The test
+   is `blaze-vfs`'s `image::tests::a_stop_at_any_step_of_moving_onto_an_image_loads_what_was_durable`.
+4. **A read that gives `Corrupt`** (from `Vfs::read`, the db's `Tree::file`, or
+   `Vfs::corrupt()` after one): print it (it names the section and group), and rescan the
+   head's checkout. The scan's writes mend the node in place. Do not treat the file as
+   missing. A corrupt tree section is handled at `restore`: the image is unused, the journal
+   is loaded whole, and `recovered.image` is `ImageUse::Corrupt(..)`.
+
+Status: open
+
+> forwarded to cargo (`serve/daemon.rs` is its; cargo-sync told). blaze-vfs's side is applied by requests (`frontend-journal.md`).
+
+### Amendment: where the hooks go in today's `daemon.rs` (frontend-journal-tree, 2026-10-29)
+
+blaze-vfs's side is in the tree: `lib.rs` has `mod image` and exports `ImageError`, `ImageMark`,
+`ImageUse`, `Bytes` and `Corrupt`. `Recovered.image` is an `ImageUse`. The daemon is behind
+`blaze-query`: it calls `self.db.write_image(&mut self.effects)` (in `stop` and in the settling
+step of `write_estimates`), while `Database::write_image` is now
+`(&self, &mut blaze_image::Builder, &mut intern::Live) -> Result<(), DbError>`. So the daemon
+owns the one builder, and both writers go into it:
+
+1. **Start**: `read.image.flatten()` is mapped before the VFS is made. Take it first and give
+   the VFS a count of it. Only then build `config` and the db from the same mapping:
+   ```rust
+   let mapping = read.image.flatten();
+   // clone: a count of the mapping, shared by the VFS and the db.
+   let (vfs, recovered) =
+       Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping.clone());
+   ```
+   Print `recovered.image` as in item 1 above, and match on `mapping` where the code now
+   matches on `read.image.flatten()`.
+2. **Each image write** (both call sites): one function makes the builder, then calls
+   `self.db.write_image(&mut builder, &mut live)?` and
+   `let mark = self.vfs.write_image(&mut builder)?` (handling `Busy` and `Corrupt` as in item 2
+   above), then `builder.finish_on(jobs)` (or `finish()`). It pushes the one `Effect::Write`
+   and keeps `mark` until its `Done::Written`, where item 3 above runs.
+
+   The VFS's sections are `VFS_TREE`, `VFS_BLOBS` and `VFS_DISKS`. They don't clash with the
+   db's. Calling `write_image` twice on one builder panics (the `Builder` asserts that a section
+id appears only once), so call it once for each image.
+3. A side note, not this request: the `Err(DbError::Image(..)) => Database::new(config)` arm
+   at start falls back to an empty database. If it stays, the VFS's `restore` was still given
+   the same mapping and keeps using its own sections. `ImageUse` says whether they fit.
+
+> frontend-journal-tree: sent to tmux window `cargo`.
+
+## cargo-inbox-user: to lane fastcompile, the entry that runs a proc-macro crate on blaze's compiler (compile-time.md change 20; 2026-10-29)
+
+From cargo-inbox-user (child of cargo-inbox, lane cargo). The daemon's `serve/unit/compile.rs`
+`fn macros` today loads a proc-macro unit only as a wasm module (`blaze_macro_wasm::load`) and
+refuses a native image, so every build that uses a proc macro fails (v2 links proc macros as
+native libraries). Change 20 says the macro runs as its own code on the MIR evaluator and
+copy-and-patch, in process. No entry for that exists in the tree or in fastcompile's reports, so
+the daemon can't be wired to it yet. Asked, in a crate of fastcompile's choosing:
+
+```rust
+/// The expanders of proc-macro crate `krate` (lowered in `db` like any crate the build
+/// compiles), each running the macro's own `#[proc_macro]`, `#[proc_macro_derive]` or
+/// `#[proc_macro_attribute]` function on the evaluator and the copy-and-patch tier through
+/// `blaze_expand::native::expand`, keeping and finding its expansions by
+/// `blaze_expand::given(toolchain, ..)`. A crate it can't run is
+/// `Err(ProcMacroLoadingError::ProcMacroSrvError(<why, naming the macro>))`; anything a macro
+/// does outside the bridge's shims stops that expansion with an error naming the macro.
+pub fn load(db: &base_db::Db, krate: base_db::Crate, toolchain: blaze_ids::ContentId)
+    -> hir_expand::proc_macro::ProcMacroLoadResult;
+```
+
+The daemon will call it from `fn macros` once a proc-macro unit's compile has passed its checks
+(no image read: an in-process macro needs none), with the job's front end and the unit's
+`job.crates.krate(unit)`, and hand the result to `Writer::macros` as today. Until it exists the
+native refusal stays (no fallback: never a native load into the daemon or an unsandboxed
+process). Please answer under this section with the real path and signature (or changes to the
+one above); cargo-inbox-user writes the daemon's side against exactly that.
+
+Status: open
+
+> forwarded to fastcompile (running; told). The answer goes under this section.
+
+## dedup: rename blaze-units' unit `Interner` to `UnitInterner`
+
+From `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/blaze-units/src/graph.rs`'s
+`Interner` is an interner that differs on purpose from the shared one (`crate intern`): it
+lives for one unit-graph build, is single-threaded (`&mut`), its IDs are positions in that
+graph, and it keys units without their profile because cargo compares profiles without the
+deferred bit (a `Vec` of candidates per key). It stays, under cargo's own name and with a
+comment saying why, so it reads as cargo's `UnitInterner` and not as `intern`'s.
+
+In `crates/blaze-units/src/graph.rs`, every `Interner` (lines 87, 93, 185, 221, 883, 938, 1042)
+becomes `UnitInterner`, and the doc at lines 84-85:
+```rust
+/// cargo's `UnitInterner`: a unit equal to one made before is that one. Profiles compare as
+/// cargo's do, without whether a setting is deferred, so the first one made is kept.
+```
+becomes:
+```rust
+/// cargo's `UnitInterner`: a unit equal to one made before is that one. Profiles compare as
+/// cargo's do, without whether a setting is deferred, so the first one made is kept. Not
+/// `intern`'s interner: it lives for one graph build behind `&mut`, its IDs are this graph's
+/// positions, and the profile is compared outside the key.
+```
+
+## cargo-inbox: to the coordinator (harness/), `library.py` keeps library/UPSTREAM's notes (from cargo-inbox, 2026-10-29)
+
+What: `harness/library.py`'s `Upstream.text()` rewrites `library/UPSTREAM` whole on `import` and
+on a bump (lines 235, 324, 343), so the `#` block "blaze's changes to library/" at its end is
+lost. Keep every line from that heading on when rewriting (read it in `Upstream.read`, append it
+in `text`). Why: blaze's changes to `library/` must be listed in UPSTREAM's notes; the first is
+std's `__blaze_environ_walked` hook (v2/requests/usercode.md item 6).
+
+## cargo-inbox-user: what fastcompile-global 3's build-script half needs outside lane cargo's daemon (2026-10-29)
+
+From cargo-inbox-user (child of cargo-inbox, lane cargo). The daemon's script half
+(`serve/unit/script/global.rs`) proves a run's shape slots and result public with
+`blaze_global::Rule::run(&RunMade { run, given, code, caller, traced }, part)` and fetches them
+before the run. Three inputs aren't reachable yet:
+
+1. **To lane usercode (`crates/blaze-usercode/src/script.rs`):** `Prepared` keeps the `Given` its
+   key was made of: a field `pub made: Given` (set to `given` in `prepare`, before
+   `given.finish()` makes `key.given`; `Given` is `Clone`). `RunMade::given` must be that value
+   (`Rule::run` checks `given.finish() == run.given`), and rebuilding it outside `prepare` would
+   copy `run_only` and could drift.
+2. **To lane cargo (`crates/blaze-units/src/query.rs`, `PackagePlan`):** `pub checksum:
+   Option<[u8; 32]>`, the SHA-256 of the `.crate` the lock file names (and the download was
+   checked against, `load/source.rs`), for a crates.io package; `None` for any other source.
+   `Origin::CratesIo { name, version, checksum }` is how `Rule` names a public crate.
+3. **To lanes fastcompile and usercode, a finding:** a build script's `RunKey::given` holds this
+   machine's absolute paths: the `program` and `dir` parts (`script::prepare`), and cargo's
+   variables (`CARGO_MANIFEST_DIR` under `~/.cargo/registry/src/<index>-<hash>/`, `OUT_DIR` under
+   the user's target directory, `CARGO`, `RUSTC`). So no key a builder publishes equals a key a
+   user's daemon makes, and `Client::fetch` of a run never hits on another machine. A global hit
+   needs the run keyed by paths relative to the roots `Rule` names (each root as its `Origin`),
+   with the run itself seeing the real paths. Lane cargo's half is written so it works unchanged
+   once the key is relative.
+
+Status: open
+
+## cargo-inbox-user: to lane core, the time a written file is given (`crates/blaze-core/src/lib.rs`, 2026-10-29)
+
+From cargo-inbox-user (lane cargo). `Effect::Write` (or a new `Effect::Times { file, modified_ns:
+u64, tag }` completing with `Done::Timed`) sets the file's access and modification time.
+
+Why: cargo's file of what a build script printed (`output`, `stdout`) has the time the run began
+as its mtime (`filetime::set_file_times(output_file, timestamp, timestamp)`), so a source changed
+while the script ran makes it run again. The daemon now writes cargo's files of a run through
+`Effect::Write` (usercode-fast-scripts 2) and can't set that time; nothing in blaze reads it (v2
+writes no `.fingerprint`, so cargo would rerun the script anyway), but the file should be cargo's
+byte for byte and time for time.
+
+Status: open
+
+## dedup: blaze-cargo's build-script SHA-256 onto blaze-sha256
+
+From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). The four SHA-256 copies
+(`blaze-cargo/build.rs`, `blaze-engine/build.rs`, `blaze-link/src/macho/sha256.rs`,
+`blaze-splice/src/sha256.rs`) are now one crate, `crates/blaze-sha256` (no dependencies;
+`digest`, `fast`, and a streaming `Sha256` with `new`/`update`/`finish` that never allocates;
+SHA-NI on x86-64, ARMv8 SHA-256 on aarch64, portable otherwise; every copy's tests moved there plus
+a proptest against the build scripts' copy). Its workspace dependency line is requested in
+`v2/requests/coordinator.md` ("## dedup: workspace dependency `blaze-sha256`").
+
+1. `crates/blaze-cargo/Cargo.toml`: add
+
+       [build-dependencies]
+       blaze-sha256.workspace = true
+
+2. `crates/blaze-cargo/build.rs`:
+   - doc lines 1-3, before: "The SHA-256 is written here rather than taken from `sha2`, as in
+     crates/blaze-engine/build.rs: a build dependency is built for the machine that builds."
+     after: "The SHA-256 is `blaze-sha256`'s, which has no dependencies, rather than `sha2`'s:
+     a build dependency is built for the machine that builds (see crates/blaze-engine/build.rs)."
+   - after `use std::path::PathBuf;` add `use blaze_sha256::Sha256;` (as `use blaze_sha256::Sha256;`
+     on its own line after a blank line, the external-crate group).
+   - delete everything from `/// SHA-256 (FIPS 180-4).` (line 55) to the end of the file (the
+     `Sha256` struct, `K`, and `impl Sha256`). The call site (`Sha256::new()`,
+     `hash.update(&..)`, `hash.finish()`) is unchanged: `update` returns `&mut Sha256`, `finish`
+     takes `&self` and returns `[u8; 32]`.
+
+## dedup: blaze-cargo off memmap2
+
+From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). `crates/blaze-cargo/src/remote.rs`
+(store's path, free) now maps packs with `blaze_core::fs::Mapped`; it was the crate's only user
+of memmap2. In `crates/blaze-cargo/Cargo.toml`, delete line 44:
+
+    memmap2 = "0.9"
+
+(`blaze-core.workspace = true` is already there.) `rg memmap2 crates/blaze-cargo` then finds only
+that line.
+
+Status: open
+
+## dedup: the unit graph's dependents onto `blaze_ids::radix::Csr`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_radix::Csr<T>` (reached as
+`blaze_ids::radix::Csr`; `crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into
+compressed sparse rows: `Csr::build(rows, pairs)` / `csr.rebuild(rows, pairs, &mut cursors)` walk a
+cloneable iterator of `(row: u32, item)` twice (count, then place at each row's cursor), with
+`row(r) -> &[T]`, `range(r)`, `items()`, `into_parts() -> (starts, items)` (`starts` has
+`rows + 1` entries). A warm `rebuild` allocates nothing. Its tests have the old copies as the
+proptest reference.
+
+`crates/blaze-cargo/src/serve/unit/graph.rs`, `Graph`'s build: replace from
+`let mut up_start = vec![0u32; count + 1];` through the placing loop (`up[next[dep as usize] as
+usize] = from as u32; ...`) with
+
+```rust
+        let (up_start, up) = blaze_ids::radix::Csr::build(
+            count,
+            (0..count).flat_map(|from| {
+                deps[dep_start[from] as usize..dep_start[from + 1] as usize].iter().map(move |&dep| (dep, from as u32))
+            }),
+        )
+        .into_parts();
+```
+
+(the comment above stays; `up` keeps each unit's dependents in unit order). Why: one counting
+sort in the tree; this one cloned its starts.
+
+## cargo-inbox-tests: to lane codegen, the execution table that fastcompile-ident-select 7 needs (2026-10-29)
+
+From `cargo-inbox-tests` (lane cargo). `v2/requests/fastcompile.md` fastcompile-ident-select 5
+(`blaze_codegen::ExecTable`) is unanswered and `rg ExecTable crates` finds nothing, so cargo can't
+build a `blaze_testsel::Image` and can't select or record a test through blaze-testsel
+(fastcompile-ident-select 7, usercode-fast-tests 4). Until then, cargo keeps selecting with
+`blaze_usercode::test::select`, as today. It doesn't switch to an `Image` with no slots, which
+would rerun every test on any edit.
+
+What cargo needs of the table, beyond request 5's fields (`fns: Vec<(ContentId, ContentId)>` as
+`(FnId, Bound)`, `slot_fn: Vec<u32>`, `beside: ContentId`, `tests: Vec<(String, Vec<u32>)>`):
+- It comes back from `codegen::generate` or `codegen::link` with the test binary it describes,
+  for example as a field of `Generated` or of the link's result.
+- It derives `Serialize, Deserialize`. cargo keeps it in the unit's record (`Made`, under
+  `RECORD`), because a fresh test binary is replayed, not linked again, and its tests are still
+  selected by it.
+- `tests` is in the harness's order, the same as `Roots::tests`, so each `TestOf` gets its
+  reached indices by position.
+
+Once it lands, cargo-inbox-tests builds the `Image` in `serve/unit/test/` and calls `choose`/`keep`.
+
+Status: open
+
+## dedup: bits: blaze-units, blaze-cargo feature sets, unit sets and reported packages onto `blaze_ids::bits`
+
+From `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). Three bit sets of
+their own become `blaze_ids::bits` types (`crates/blaze-ids/src/bits.rs`), their bit logic
+deleted. Both crates already depend on `blaze-ids` (`blaze-units` through its `query` feature,
+which is the feature `stdlib` is compiled under), so no `Cargo.toml` changes. Nothing here is
+persisted or hashed; members, equality and the panics of an index past the capacity on insert
+are the same.
+
+### 1. `crates/blaze-units/src/stdlib/target.rs`: `Bits` becomes `Features = BitArray<4, u16>`
+
+The same 32 inline bytes (asserted), `Copy`, `Default`, `PartialEq`. Its test
+`a_feature_set_is_its_bits` is in `crates/blaze-ids/src/bits/tests.rs` already, so it leaves
+`stdlib/tests.rs` (part 1e).
+
+1a. The module doc (line 10), before / after:
+
+```rust
+//! interned to bits of a [`Bits`] in their sorted order, what each turns on and off as a set,
+```
+
+```rust
+//! interned to bits of a [`Features`] in their sorted order, what each turns on and off as a set,
+```
+
+The imports, before / after:
+
+```rust
+use blaze_resolve::Cfg;
+use serde::Deserialize;
+```
+
+```rust
+use blaze_ids::bits::BitArray;
+use blaze_resolve::Cfg;
+use serde::Deserialize;
+```
+
+1b. The definition (lines 89-154), before:
+
+```rust
+/// A set of a target's feature names, by their index in [`Compiled::names`]: 32 bytes, so a
+/// union, difference or subset test is four word operations.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(super) struct Bits([u64; MAX_FEATURES / 64]);
+
+const _: () = assert!(std::mem::size_of::<Bits>() == 32);
+
+impl Bits {
+    pub(super) fn has(&self, index: u16) -> bool {
+    ... (every method through `iter`, to the `}` closing the impl, before `/// What a target's spec says`)
+}
+```
+
+after:
+
+```rust
+/// A set of a target's feature names, by their index in [`Compiled::names`]: 32 bytes, so a
+/// union, difference or subset test is four word operations.
+pub(super) type Features = BitArray<{ MAX_FEATURES / 64 }, u16>;
+
+const _: () = assert!(std::mem::size_of::<Features>() == 32);
+```
+
+1c. Every other `Bits` in the file becomes `Features` (the doc of `Compiled` at line 164, its
+fields `own`, `on`, `has_on`, `rustc_features`, `off`, `has_off`, `pulls`, `cpus`, the
+`Bits::default()`s at lines 258, 265, 273 and 286, `apply`'s `have: &mut Bits` and `tuned`'s
+`Result<Bits, String>`), and the methods map as: `has` -> `contains`, `union` ->
+`union_with`, `within` -> `is_subset`, `len` -> `count`, `intersection(x)` -> `and(x)` (by value,
+`const`); `insert`, `remove`, `subtract`, `is_empty`, `iter` keep their names. `insert` and
+`subtract` now return whether they changed the set, so the two match arms that used their `()`
+as the arm's value get braces:
+
+```rust
+        match feature_of(line) {
+            Some(name) => own.insert(index(name)),
+            None => base.push(line.clone().into_boxed_str()),
+        }
+```
+
+```rust
+        match feature_of(line) {
+            Some(name) => {
+                own.insert(index(name));
+            }
+            None => base.push(line.clone().into_boxed_str()),
+        }
+```
+
+`Compiled::apply` (lines 377-410), before:
+
+```rust
+    fn apply(&self, triple: &str, have: &mut Bits, enable: bool, name: &str, from_host: bool) -> Result<(), String> {
+        let at = self.index(name);
+        let on = at.filter(|it| self.has_on.has(*it));
+        match (enable, on, at) {
+            (true, Some(it), _) => {
+                have.union(&self.on[usize::from(it)]);
+                // The target's own features it needs, should they be off.
+                have.union(&self.pulls[usize::from(it)]);
+            }
+            (false, _, Some(it)) if self.has_off.has(it) => have.subtract(&self.off[usize::from(it)]),
+            (false, Some(it), _) if !self.own.has(it) => {
+                // Off with it go the features that turn it on.
+                let turned = &self.on[usize::from(it)];
+                if !turned.is_empty() {
+                    for other in have.intersection(&self.rustc_features).iter() {
+                        if turned.within(&self.on[usize::from(other)]) {
+                            have.remove(other);
+                        }
+                    }
+                }
+            }
+```
+
+after:
+
+```rust
+    fn apply(&self, triple: &str, have: &mut Features, enable: bool, name: &str, from_host: bool) -> Result<(), String> {
+        let at = self.index(name);
+        let on = at.filter(|it| self.has_on.contains(*it));
+        match (enable, on, at) {
+            (true, Some(it), _) => {
+                have.union_with(&self.on[usize::from(it)]);
+                // The target's own features it needs, should they be off.
+                have.union_with(&self.pulls[usize::from(it)]);
+            }
+            (false, _, Some(it)) if self.has_off.contains(it) => {
+                have.subtract(&self.off[usize::from(it)]);
+            }
+            (false, Some(it), _) if !self.own.contains(it) => {
+                // Off with it go the features that turn it on.
+                let turned = &self.on[usize::from(it)];
+                if !turned.is_empty() {
+                    for other in (*have).and(&self.rustc_features).iter() {
+                        if turned.is_subset(&self.on[usize::from(other)]) {
+                            have.remove(other);
+                        }
+                    }
+                }
+            }
+```
+
+(`(*have).and(..)` is a copy, so the loop removes from `have` while it walks the copy, as the
+by-value `intersection` did.)
+
+`Compiled::tuned`, its signature and the `listed` line, before / after:
+
+```rust
+    fn tuned(&self, triple: &str, cpu: Option<(&str, Option<&str>)>, features: &[(bool, String)]) -> Result<Bits, String> {
+```
+
+```rust
+    fn tuned(&self, triple: &str, cpu: Option<(&str, Option<&str>)>, features: &[(bool, String)]) -> Result<Features, String> {
+```
+
+```rust
+            let listed = self.index(name).is_some_and(|it| self.has_on.has(it) || self.has_off.has(it));
+```
+
+```rust
+            let listed = self.index(name).is_some_and(|it| self.has_on.contains(it) || self.has_off.contains(it));
+```
+
+1d. `target_cfg`, three lines, before / after:
+
+```rust
+    let static_default = target.crt_static.is_some_and(|it| target.own.has(it));
+```
+
+```rust
+    let static_default = target.crt_static.is_some_and(|it| target.own.contains(it));
+```
+
+```rust
+    let mut cfgs = Vec::with_capacity(target.base.len() + features.len() + args.cfgs.len() + 6);
+```
+
+```rust
+    let mut cfgs = Vec::with_capacity(target.base.len() + features.count() + args.cfgs.len() + 6);
+```
+
+```rust
+            if features.has(*at) {
+```
+
+```rust
+            if features.contains(*at) {
+```
+
+(`features.remove(it)` and `features.iter()` stay as they are; `iter` now borrows.)
+
+1e. `crates/blaze-units/src/stdlib/tests.rs`: delete `a_feature_set_is_its_bits` (lines 97-112,
+from `#[test]` through its closing `}`); it is `a_feature_set_is_its_bits` in
+`crates/blaze-ids/src/bits/tests.rs`, over `BitArray<4, u16>`.
+
+### 2. `crates/blaze-cargo/src/serve/unit/graph.rs`: `Bits` becomes `BitSet<u32>`
+
+The same operations under the same names (`new`, `insert -> bool` panicking past the capacity,
+`contains` false past it, `clear`).
+
+Imports, before / after:
+
+```rust
+use blaze_build_script::apply::{GraphUnit, to_link};
+```
+
+```rust
+use blaze_build_script::apply::{GraphUnit, to_link};
+use blaze_ids::bits::BitSet;
+```
+
+Delete the definition (lines 36-62, `/// A set of units, one bit each.` through the `}` closing
+`impl Bits`).
+
+Then, every use: the fields `applied: Bits,` (`Waits`), `build_time: Bits,` and
+`lib_packages: Bits,` (`Graph`) become `applied: BitSet<u32>,`, `build_time: BitSet<u32>,`,
+`lib_packages: BitSet<u32>,`; and every `Bits::new(` (lines 85, 105, 231, 232, 259, 348, 373)
+becomes `BitSet::<u32>::new(`. E.g.
+
+```rust
+        let mut seen = Bits::new(count);
+```
+
+```rust
+        let mut seen = BitSet::<u32>::new(count);
+```
+
+### 3. `crates/blaze-cargo/src/serve/job.rs`: `reported` becomes `BitSet<u32>`
+
+Imports, before / after:
+
+```rust
+use blaze_ids::{ContentId, Hasher};
+```
+
+```rust
+use blaze_ids::{ContentId, Hasher, bits::BitSet};
+```
+
+The field (now line 362):
+
+```rust
+    reported: Vec<u64>,
+```
+
+```rust
+    reported: BitSet<u32>,
+```
+
+Where it is made (now line 1188):
+
+```rust
+        let reported = vec![0; units.packages.len().div_ceil(64)];
+```
+
+```rust
+        let reported = BitSet::<u32>::new(units.packages.len());
+```
+
+In `started_unit` (now lines 1273-1277), the package already checked to be in range by the
+`packages.get` above:
+
+```rust
+        let (word, bit) = (build.package_of[at] as usize / 64, 1 << (build.package_of[at] % 64));
+        if build.reported[word] & bit != 0 {
+            return;
+        }
+        build.reported[word] |= bit;
+```
+
+```rust
+        if !build.reported.insert(build.package_of[at]) {
+            return;
+        }
+```
+
+## dedup: one copy of each piece the load ported from v1's cargo crates (from dedup-scan-cargo, 2026-10-29)
+
+`crates/blaze-units/src/load/` holds ports of `blaze-metadata`, `blaze-registry` and
+`blaze-resolve` code that v2 could not call, because `blaze-metadata` depends on `blaze-units`
+(`load/summary.rs` says so). The fix is the other direction: `blaze-units`, the lower crate, owns
+each piece ungated (nothing in them reads a file), and v1 calls down. Items 1-3 are lane cargo's
+half; the v1 half is `v2/requests/coordinator.md` "dedup: the v1 cargo crates call blaze-units'
+copies", which request 1 (the grant) turns into lane cargo's too. Nothing here changes what a
+build does, beyond the differences each item names.
+
+### 1. `load/summary.rs` becomes `read.rs`, ungated
+
+- `crates/blaze-units/Cargo.toml`: `toml` and `url` lose `optional = true` and leave the `query`
+  feature's list (both build for wasm32-wasip1).
+- `crates/blaze-units/src/read.rs`: after `Read`, add everything of `load/summary.rs` but its
+  header, its `pub use crate::Read;` and its `normalize`, with each `pub(crate) fn` made `pub fn`
+  and `Root`'s fields `pub`. Replace its own `normalize(...)` (three calls: `patch_dependency`,
+  `patch_paths`, `path_dependencies`) with `blaze_manifest::paths::normalize_path(...)`, cargo-util's
+  rule exactly (it keeps a leading `..` of a relative path, which the copy dropped; every caller
+  passes an absolute path, so no output changes). Move the `#[cfg(test)] mod tests` with it.
+  The module doc becomes: "What the resolve reads of a package as `cargo metadata` prints it, and
+  of the root manifest's `[patch]` and `[replace]` tables, given as text: one copy for the load,
+  blaze-metadata, blaze-tree and blaze-units' `metadata_resolve` example."
+- Also move there, `pub`, from `load/manifest.rs` `manifest_source` (lines 272-300), and from
+  `load/resolve.rs` `rust_versions` (lines 535-557) with the union of the two copies' signatures:
+
+  ```rust
+  pub fn rust_versions(
+      ctx: &Context,
+      behavior: ResolveBehavior,
+      members: &[RustVersion],
+      rustc_version: Option<&str>,
+  ) -> anyhow::Result<Option<Vec<PartialVersion>>> {
+      // ... body as in load/resolve.rs up to `if members.is_empty() {`
+      if members.is_empty() {
+          let rustc_version = rustc_version.context(
+              "the resolve prefers packages that support the workspace's Rust version, no member \
+               names a `rust-version`, and the release of the rustc that builds is not known",
+          )?;
+          let release = rustc_version.split(' ').next().unwrap_or(rustc_version);
+          return Ok(Some(vec![release.parse()?]));
+      }
+      Ok(Some(members.iter().map(RustVersion::to_partial).collect()))
+  }
+  ```
+  `load/resolve.rs:169` passes `Some(&spec.rustc_version)`.
+- `crates/blaze-units/src/lib.rs`: `mod read;` becomes `pub mod read;`.
+- `crates/blaze-units/src/load.rs`: delete `mod summary;`; `pub use self::summary::Read;` becomes
+  `pub use crate::Read;`. Delete `load/summary.rs`.
+- `load/resolve.rs:30` `use super::summary::{self, Read};` becomes
+  `use crate::read::{self as summary, Read, rust_versions};` (no other line changes); delete its
+  `fn rust_versions`. `load/resolve.rs:28` `use super::manifest::manifest_source;` becomes
+  `use crate::read::manifest_source;`, and `load/manifest.rs:84` calls
+  `crate::read::manifest_source`. `load/view.rs:17` and `load/units.rs:23`:
+  `use super::summary::Read;` becomes `use crate::Read;`.
+- New `crates/blaze-units/examples/metadata_resolve.rs`: `blaze-resolve/examples/metadata_resolve.rs`
+  (the harness `resolve_graph.py` builds it) on these, so the example's own copies of
+  `package_source`, `dependency`, `normalize`, `patch_dependency` and the summary loop go: each
+  package is `blaze_units::read::read(package)?` (its `summary`, and `lib` for `lib_names`), and
+  the `[patch]` tables are `blaze_units::read::patch_tables(&Root::new(workspace_root, &text)?)?`
+  with each `Patch` kept only when `registry.query_vec(&patch.dep, QueryKind::Exact)` lists it
+  (the example's own filter). The rest of `main` is unchanged. The coordinator deletes the old
+  example and points the harness at `-p blaze-units` (coordinator request, same heading).
+
+Tests: `read.rs` keeps `load/summary.rs`'s three tests; the coordinator's half moves
+blaze-metadata's `a_spec_names_its_own_source`, `no_replace_table_is_no_replacement` and the
+`version = "0.1"` and string cases of `what_cargo_refuses_is_refused` here, on `Root::new`.
+
+### 2. `load/source/index.rs` becomes `blaze_units::index`, ungated, with v1's artifact
+
+- Move `crates/blaze-units/src/load/source/index.rs` to `crates/blaze-units/src/index.rs`
+  (`pub mod index;` in `lib.rs`; `mod index;` leaves `load/source.rs`, whose
+  `use self::index::{crate_url, index_path};` becomes `use crate::index::{crate_url, index_path};`,
+  and `load/source/{registry,tests}.rs` use `crate::index::...`). Every `pub(crate)` becomes `pub`.
+- The union with v1's copy: `RegistryDependency` gains `#[serde(default)] lib: bool`, and
+  `IndexDependency.artifact` becomes `Option<Artifact>` with v1's type and checker:
+
+  ```rust
+  /// An artifact dependency (`-Zbindeps`), checked as cargo checks one.
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  pub struct Artifact {
+      pub kinds: Vec<String>,
+      pub lib: bool,
+      pub target: Option<String>,
+  }
+  ```
+  `check_artifact(kinds, target) -> Result<()>` becomes v1's
+  `fn artifact(kinds: Vec<String>, lib: bool, target: Option<String>) -> Result<Artifact>` (the
+  same checks, then `Ok(Artifact { kinds, lib, target })`), and `dependency` sets
+  `artifact: dep.artifact.map(|kinds| artifact(kinds, dep.lib, dep.bindep_target)).transpose()?`.
+  `summary_dependency` still refuses an artifact dependency with the same message until request
+  14 (#601) reads them.
+- Tests: v1's `paths`, `lines` and `crates_io_drops_its_own_registry`
+  (`blaze-registry/src/index.rs` 522-597) move to `crates/blaze-units/src/index/tests.rs`, beside
+  `load/source/tests.rs`' `a_line_of_serde_s_entry_reads_as_cargo_reads_it`,
+  `a_summary_s_features_are_in_name_order_whatever_the_line_s_order` and `prefix_paths_are_cargos`,
+  which move there too.
+
+Differences from v1 the coordinator's half takes on: a dependency's requirement is parsed from the
+text the index wrote (`req_text`, as cargo's `registry_dependency_into_dep` does), not from
+`VersionReq`'s re-rendering; `rust-version` is blaze-resolve's `RustVersion` directly.
+
+### 3. `[source]` replacement and `describe`: `blaze_units::sources`, ungated
+
+New `crates/blaze-units/src/sources.rs` (`pub mod sources;` in `lib.rs`), the replacement chain
+both copies have (`blaze-registry/src/sources.rs` 44-206 and `load/source.rs` 427-589), with v1's
+lazy `[registries]` lookup, which keeps cargo's "invalid index URL for registry" error:
+
+```rust
+//! `[source]` replacement as cargo 1.99 does it (`SourceConfigMap` in `src/sources/config.rs`):
+//! which source a source's packages come from, and how cargo describes a source (each
+//! `Source::describe`). One map for the load (`load::source`, from blaze-manifest's
+//! configuration) and v1's blaze-registry (from its `SourceConfig`); each reads its tables and
+//! adds them here.
+
+use anyhow::{Context as _, bail};
+use blaze_resolve::{CRATES_IO_REGISTRY, SourceId, SourceKind};
+use rustc_hash::FxHashMap;
+
+#[derive(Clone)]
+struct Replacement {
+    id: SourceId,
+    /// The name of the source that replaces it and where that is defined.
+    with: Option<(String, String)>,
+}
+
+/// The sources cargo knows by name, and which of them replaces which.
+pub struct SourceMap {
+    by_name: FxHashMap<String, Replacement>,
+    names: FxHashMap<SourceId, String>,
+    /// `registries.<name>.index` of each `[registries.<name>]` a `replace-with` may name.
+    registries: FxHashMap<String, String>,
+    crates_io: SourceId,
+}
+
+impl SourceMap {
+    /// crates.io alone, its packages read from `crates_io` (its git or its sparse index).
+    pub fn new(crates_io: SourceId, registries: FxHashMap<String, String>) -> anyhow::Result<SourceMap> {
+        let mut map =
+            SourceMap { by_name: FxHashMap::default(), names: FxHashMap::default(), registries, crates_io };
+        map.add(CRATES_IO_REGISTRY, SourceId::crates_io(), None)?;
+        map.add(CRATES_IO_REGISTRY, crates_io, None)?;
+        Ok(map)
+    }
+
+    pub fn crates_io(&self) -> SourceId {
+        self.crates_io
+    }
+
+    /// `[source.<name>]` at `id`, replaced by `with` (that source's name and where its
+    /// `replace-with` is defined).
+    pub fn add(&mut self, name: &str, id: SourceId, with: Option<(String, String)>) -> anyhow::Result<()> {
+        if let Some(old) = self.names.insert(id, name.to_owned())
+            && name != CRATES_IO_REGISTRY
+        {
+            bail!(/* see "Which name comes first" below */);
+        }
+        self.by_name.insert(name.to_owned(), Replacement { id, with });
+        Ok(())
+    }
+
+    /// `[registries.<name>]`'s index.
+    pub fn add_registry(&mut self, name: String, index: String) {
+        self.registries.insert(name, index);
+    }
+
+    /// The names a `replace-with` gives that no `[source]` defines, in no order.
+    pub fn unknown_replacements(&self) -> Vec<String> {
+        self.by_name
+            .values()
+            .filter_map(|it| it.with.as_ref().map(|(name, _)| name.clone()))
+            .filter(|name| !self.by_name.contains_key(name))
+            .collect()
+    }
+
+    /// v1's `SourceMap::replacement` (blaze-registry/src/sources.rs 147-192), unchanged.
+    pub fn replacement(&self, id: SourceId) -> anyhow::Result<SourceId> { /* ... */ }
+
+    /// v1's `SourceMap::registry` (sources.rs 195-205), unchanged.
+    fn registry(&self, name: &str) -> Option<anyhow::Result<SourceId>> { /* ... */ }
+
+    /// As cargo's `ReplacedSource::describe`: the source read, and the one it replaces unless
+    /// that is crates.io read over its sparse index.
+    pub fn describe(&self, source: SourceId) -> String {
+        let from = self.replacement(source).unwrap_or(source);
+        if from == source || (from.is_crates_io() && source.is_crates_io()) {
+            describe(from)
+        } else {
+            format!("{} (which is replacing {source})", describe(from))
+        }
+    }
+
+    pub fn is_replaced(&self, source: SourceId) -> bool {
+        let from = self.replacement(source).unwrap_or(source);
+        from != source && !(from.is_crates_io() && source.is_crates_io())
+    }
+}
+
+/// How cargo's sources describe themselves (each `Source::describe`).
+pub fn describe(id: SourceId) -> String { /* load/source.rs 413-427, unchanged */ }
+
+fn supports_checksums(id: SourceId) -> bool { /* unchanged */ }
+
+fn requires_precise(id: SourceId) -> bool { /* unchanged */ }
+```
+
+`load/source.rs`: delete `Replacement`, `SourceMap` and its impl, `describe`, `supports_checksums`,
+`requires_precise`; keep `source_id`. Its constructor becomes a free function:
+
+```rust
+fn source_map(config: &Config) -> anyhow::Result<SourceMap> {
+    let crates_io = match config.crates_io_maybe_sparse_http()?.kind {
+        manifest_core::SourceKind::SparseRegistry => SourceId::crates_io_sparse(),
+        _ => SourceId::crates_io(),
+    };
+    let mut map = SourceMap::new(crates_io, FxHashMap::default())?;
+    for (name, def) in config.source_configs()? {
+        if name == CRATES_IO_REGISTRY && def.replace_with.is_none() {
+            continue;
+        }
+        let id = match name.as_str() {
+            CRATES_IO_REGISTRY => crates_io,
+            _ => source_id(&name, &def.id)?,
+        };
+        map.add(&name, id, def.replace_with.clone())?;
+    }
+    for name in map.unknown_replacements() {
+        if let Ok(id) = blaze_manifest::source::SourceId::alt_registry(config, &name) {
+            map.add_registry(name, id.url.to_string());
+        }
+    }
+    Ok(map)
+}
+```
+with `use crate::sources::SourceMap;`; line 83 calls `source_map(config)?`; `Sources::describe`
+and `Sources::is_replaced` become `self.map.describe(source)` and `self.map.is_replaced(source)`.
+
+**Which name comes first.** The copies disagree on the doubly-defined-source error: v1 (with a
+test, `blaze-registry/src/sources.rs:495`) says "source `{name}` defines source {id}, but that
+source is already defined by `{old}`", v2 the names swapped. The shared `add` must print cargo
+1.99's order (`SourceConfigMap::add` in `src/sources/config.rs`); I could not read cargo's source
+here, so check it against cargo before choosing, and keep v1's test with the answer.
+
+### 4. `load/plan/hash.rs` uses blaze-manifest's `CrateType` and `TargetKind`
+
+`hash.rs` 23-157 mirror `blaze_manifest::targets::{CrateType, TargetKind}` variant for variant
+(`plan.rs:155` already matches one against the other). Once the coordinator adds the methods
+(coordinator request, same heading, item 4): in `hash.rs` delete both enums and their impls,
+import `use blaze_manifest::targets::{CrateType, TargetKind};`, and keep the two unit-graph
+readers as functions:
+
+```rust
+/// A crate type as the unit graph prints it (`proc-macro` with its `-`, which cargo's
+/// `CrateType::from` of a manifest's `crate-type` spells `procmacro`).
+pub(super) fn crate_type(name: &str) -> CrateType {
+    match name {
+        "proc-macro" => CrateType::ProcMacro,
+        other => CrateType::from(&other.to_owned()),
+    }
+}
+
+/// The kind a target of the unit graph prints (body of today's `TargetKind::of`, with
+/// `CrateType::parse` as `crate_type`).
+pub(super) fn target_kind(target: &schema::Target) -> TargetKind { /* ... */ }
+```
+`plan.rs:265` `TargetKind::of(&unit.target)` becomes `hash::target_kind(&unit.target)`;
+`plan.rs:18`'s `use blaze_manifest::targets::TargetKind as ManifestKind;` goes and the `same`
+match at 154-160 stays with `TargetKind` on both sides;
+`outputs.rs:9` and `tests.rs:11` import `CrateType`/`TargetKind` from `blaze_manifest::targets`.
+Derived `Hash` is unchanged (same variants, same order), so `-C metadata` is too;
+`tests.rs`' hash-pinning tests check it.
+
+### 5. One dev profile for the tests
+
+Four tests build cargo's `dev` profile field by field: `blaze-cargo/src/serve/unit/tests.rs:35`,
+`blaze-cargo/src/serve/tests.rs:132`, `load-cargo/src/v2/tests.rs:75`,
+`blaze-units/src/load/plan/tests.rs:494` (`dev(debuginfo)`). Add to `crates/blaze-units/src/schema.rs`:
+
+```rust
+impl Profile {
+    /// cargo's built-in `dev` profile as `--unit-graph` prints it for a dependency: nothing set
+    /// in a manifest, no `incremental` (cargo turns that on for members only).
+    pub fn dev() -> Profile {
+        Profile {
+            name: "dev".to_owned(),
+            opt_level: "0".to_owned(),
+            lto: "false".to_owned(),
+            codegen_backend: None,
+            codegen_units: None,
+            debuginfo: DebugInfo::Level(2),
+            split_debuginfo: None,
+            debug_assertions: true,
+            overflow_checks: true,
+            rpath: false,
+            incremental: false,
+            panic: "unwind".to_owned(),
+            strip: Strip::Deferred(Stripped::None),
+            rustflags: Vec::new(),
+            trim_paths: None,
+            hint_mostly_unused: None,
+        }
+    }
+}
+```
+and the four become `Profile::dev()`; `serve/unit/tests.rs` `Profile { incremental: true, ..Profile::dev() }`;
+`plan/tests.rs`' `dev(n)` `Profile { debuginfo: DebugInfo::Level(n), ..Profile::dev() }`.
+
+### 6. `answers/own.rs` on `stdlib/target.rs`, one `rustc.json`
+
+`crates/blaze-cargo/src/answers/rustc.json` and `crates/blaze-units/src/stdlib/rustc.json` are the
+same 423 KB, each read by its own interpreter (`own.rs`' `Release`/`Target`/`tuned`, 21-195, and
+`target.rs`' compiled columns). `target.rs` is the faster one (feature sets as 32-byte `Bits`,
+lookups by binary search, read once), so it is the one; `own.rs` keeps only what is rustc's command
+line (`Given`, the prints, the warnings) and asks `target.rs` for the target's facts.
+
+`crates/blaze-units/src/stdlib/target.rs` gains what `own.rs` needs that it lacks:
+
+- `RawRelease.unknown_feature: Option<String>` (`#[serde(default)]`), kept in `Release`, and
+  `pub fn unknown_feature_warning(feature: &str) -> Option<String>` (the text with `{feature}`
+  replaced).
+- `CfgArgs.stable: bool`: rustc asked as on a channel that allows no unstable features
+  (`RUSTC_BOOTSTRAP=-1`). With it `target_cfg` leaves out `nightly_cfg`, `overflow_checks` and
+  `ub_checks` (as `own.rs` 586-637 does) and refuses tuning (`target_cpu` or a feature list other
+  than the target's own `crt-static`) with an error naming it: the data records the features of
+  the nightly only. `false` (the `Default`) is today's behavior.
+- `Compiled::tuned` returns the features it skipped (`(Bits, Vec<&str>)`, names as given), and
+  `pub fn target_cfg_told(triple, args) -> Result<(Vec<String>, Vec<String>), String>` returns them
+  beside the cfgs (`target_cfg` stays, dropping them).
+- `Compiled.spec_json: Box<[(Box<str>, Box<str>)]>` (`target_spec_json` by host, sorted), and
+  `pub fn target_spec_json(triple: &str, host: &str) -> Result<Option<&'static str>, String>`:
+  `own.rs`' `spec_on` (the host's own, else the one every recorded host agrees on).
+- `pub fn split_debuginfo(triple: &str) -> Result<&'static [Box<str>], String>` (today only inside
+  `target_facts`, which also requires the spec to say whether the target has std).
+
+`crates/blaze-cargo/src/answers/own.rs` then deletes `RELEASES`, `Release`, `Target` and its impl,
+`releases`, `arch`, `BUILTIN_CFGS`, `is_plain_cfg`; `Toolchain` keeps `host` and checks
+`blaze_units::stdlib::target::rustc_version() == crate::cargo::toolchain::ours_says()` instead of
+finding a release; `-V`/`-vV` print `rustc_version()`/`rustc_verbose_version(host)`;
+`split-debuginfo`, `file-names` (`file_name(tuple, kind, name)`, `Ok(None)` a dropped kind, `Err`
+no answer) and `target-spec-json` ask `target.rs`; `cfg` builds a `CfgArgs` from `Given`
+(`opt_level`, `debug_assertions`, `overflow_checks`, `panic`, `target_cpu`, `host_cpu` from
+`hir_ty_codegen::host_cpu()` with `arch(toolchain.host)`, `target_features`, `cfgs`, `proc_macro`
+from `crate_types`, `stable: !nightly`), calls `target_cfg_told` (an `Err` is no answer, `None`, as
+every refusal of `own.rs` is), and warns of the unknown features with `unknown_feature_warning`.
+Delete `crates/blaze-cargo/src/answers/rustc.json`; the coordinator points `harness/answers.py`
+at `crates/blaze-units/src/stdlib/rustc.json` (coordinator request, same heading).
+`own.rs`' tests stay, and are the differential test of the two (they pin `own.rs`' answers).
+
+### 7. `cargo/directives.rs` asks blaze-build-script which keys are reserved
+
+`crates/blaze-cargo/src/cargo/directives.rs` 28-46 (`RESERVED`) is
+`blaze-build-script/src/output.rs`' `KEYS` less `error` and `metadata`, which `output.rs` already
+reads as `has_reserved_prefix`. Once usercode makes it public (`v2/requests/usercode.md`,
+"dedup: one list of build-script keys, one table of signal names", item 1): delete `RESERVED` and make line 217
+
+```rust
+(None, Some(data)) if blaze_build_script::output::has_reserved_prefix(data) => data,
+```
+which also stops formatting a string per key per line.
+
+### 8. `cli/say.rs` takes blaze-core's signal names
+
+`crates/blaze-core/src/signal.rs` (written, `blaze_core::signal::described`) is the one table.
+In `crates/blaze-cargo/src/cli/say.rs` delete both `signal_named` (307-331) and make `ended`'s arm
+`Ended::Signal(signal) => format!("signal: {signal}{}", blaze_core::signal::described(signal))`.
+`say/tests.rs:147` stays as it is. blaze-cargo already depends on blaze-core.
+
+### 9. `serve/fetch/archive.rs` takes blaze-registry's `LimitErrorReader`
+
+`archive.rs` 153-171 is `blaze-registry/src/download.rs` 345-363. Once the coordinator makes
+blaze-registry's public (coordinator request, same heading, item 5), delete archive.rs' struct and
+impl and `use blaze_registry::download::LimitErrorReader;` (construction stays
+`LimitErrorReader { inner, left }`, its fields made `pub`).
+
+### 10. Lexical path normalizing: cargo-util's rule, once
+
+`blaze_manifest::paths::normalize_path` is cargo-util's `normalize_path` exactly (a relative
+path's leading `..` kept). These copies drop a leading `..` instead and say they are cargo's:
+
+- `crates/blaze-cargo/src/cargo/own/remove.rs:585` and `crates/blaze-cargo/src/cli/place.rs:67`:
+  delete each `normalize` and call `blaze_manifest::paths::normalize_path` (`place.rs`' is `pub`;
+  its callers in `cli/` change name only).
+- View paths (`/`-separated text): `crates/load-cargo/src/v2/files.rs:183` (`normalize`, keeps a
+  drive) and `crates/blaze-units/src/load/source/tree.rs:272` (`normalize`, no drive) are one rule;
+  make load-cargo's `pub fn normal_text(path: &str) -> String` in `crates/blaze-units/src/load/files.rs`
+  beside `normal`, re-exported `pub use self::files::normal_text;` in `load.rs`, and call it from
+  both (tree.rs' inputs are absolute view paths, for which the two agree).
+
+### 11. `load/plan/flags.rs` once blaze-manifest's feature map is blaze-resolve's
+
+The coordinator's item 4 makes `blaze_manifest::dependency::FeatureMap` blaze-resolve's (keys
+`InternedString`, so the manifest's copy, which named an arbitrary unused optional dependency,
+goes). `crates/blaze-units/src/load/plan/flags.rs:99` `.map(String::as_str)` then becomes
+`.map(|it| it.as_str())`; nothing else here changes.
+
+Status: open
+
+## from speed-link-edge-sol-ci: tick the terminal view when its held frame is due (2026-10-29)
+
+`blaze_ui::Live` now draws at most once a frame (`blaze_ui::FRAME_NS`, 1/60 s). Records that come
+within a frame of the last draw are applied, and their lines and the region wait for the next
+draw. A build's end is never held: the `Finished` record writes its held lines and the summary
+at once. `Live::due_ns()` says when the held draw is due (`None` when nothing is held).
+
+The ask, in `crates/blaze-cargo/src/cargo/client.rs` `exchange` and `say::Shown`:
+
+1. Before each `read`, set the read timeout to the shorter of `TICK` and the time until
+   `live.due_ns()` (from `Shown`'s clock, at least 1 ms, since `set_read_timeout` refuses zero).
+   A `Shown::due()` that returns it for `Rendering::Live` and `None` otherwise is enough.
+   Today the client ticks only after 100 ms with no data, so after a burst the screen shows the
+   last frame up to 100 ms late instead of 16.7 ms.
+2. Hand each read's records to `Live::records_into` together (one `&[Record]`, one `out`
+   buffer kept in `Shown`, one `write`) instead of `record` once per record. This makes one
+   allocation per read instead of a `String` per record, and one `write` per frame.
+
+Why: the terminal view's bound is one `write` per frame of only the bytes that change, at most
+60 a second. `Live` meets it now. The caller's timing in item 1 is what keeps a held frame from
+being shown late.

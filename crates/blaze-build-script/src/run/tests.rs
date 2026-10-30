@@ -6,6 +6,8 @@
 
 use std::{ffi::OsString, os::unix::fs::PermissionsExt, path::PathBuf};
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::unit::{Package, Profile};
 
@@ -209,12 +211,10 @@ fn what_is_logged_is_read_as_the_lossy_lines_have_it() {
             })
             .collect()
     };
-    let mut state = 0x9fb2_1c65_1e98_df25u64;
+    let mut rng = SplitMix64::new(0x9fb2_1c65_1e98_df25);
     for _ in 0..20_000 {
         let mut stdout = Vec::new();
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
+        let state = rng.next_u64();
         for at in 0..(state % 9) {
             stdout.extend_from_slice(pieces[(state.rotate_left(at as u32 * 7) % 10) as usize]);
         }

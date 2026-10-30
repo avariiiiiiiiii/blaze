@@ -1,12 +1,20 @@
 //! `blaze-v2-proof '{"incremental": "a.cbor", "scratch": "b.cbor", "before": "p.cbor"}'`: the
-//! oracle's comparison of two [`Trace`]s (deterministic CBOR files), as JSON on stdout. Its
+//! oracle's comparison of two traces (`blaze_v2_proof::wire`'s files), read in place and joined
+//! across cores (`blaze_v2_proof::join`), as JSON on stdout. Its
 //! one argument is a JSON value inline, the path of a file holding one, or `-` for stdin;
 //! `before`, the trace of the build before the incremental one, adds what it reran for
-//! nothing. Exits 1 when anything is stale, 2 when it could not compare.
+//! nothing. Exits 1 when anything is stale, 2 when it could not compare. With `"slot"`, the
+//! fixture slot the edit moved, and `before`, the slot's case in [`blaze_v2_proof::nameres`] is
+//! checked too; a finding over or under exits 1 as well.
 //!
 //! `blaze-v2-proof '{"first": "a", "second": "b"}'` compares two files byte for byte instead
 //! (`blaze_v2_proof::bytes`, by the CPU's SIMD) and prints where they first differ.
+//!
+//! `blaze-v2-proof '{"bench": "join"}'` times one of the reference workloads in `bench.rs` and
+//! prints `{"value": MS}`, for the bounds `harness/v2/bounds.py` reads.
 #![forbid(unsafe_code)]
+
+mod bench;
 
 use std::{
     fs,
@@ -16,7 +24,13 @@ use std::{
 };
 
 use blaze_query::QueryKey;
-use blaze_v2_proof::{Stale, Trace, over, under};
+use blaze_v2_proof::{
+    Stale,
+    bytes::Mapped,
+    join,
+    nameres::{self, Finding, Side},
+    wire::View,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -24,6 +38,13 @@ use serde::{Deserialize, Serialize};
 enum Given {
     Traces(Input),
     Files(Files),
+    Bench(Bench),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bench {
+    bench: bench::Workload,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +61,9 @@ struct Input {
     scratch: PathBuf,
     #[serde(default)]
     before: Option<PathBuf>,
+    /// The fixture slot the edit moved; its `nameres` case, if it has one, is checked.
+    #[serde(default)]
+    slot: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +80,40 @@ struct Output {
     culprits: usize,
     work: Option<blaze_v2_proof::Work>,
     needless: Vec<String>,
+    nameres: Option<Nameres>,
+}
+
+#[derive(Serialize)]
+struct Nameres {
+    slot: &'static str,
+    claim: &'static str,
+    findings: Vec<NameresFound>,
+}
+
+#[derive(Serialize)]
+struct NameresFound {
+    side: Side,
+    detail: String,
+}
+
+fn nameres_found(finding: &Finding) -> NameresFound {
+    let detail = match finding {
+        Finding::Changed { what, changed, min, max, keys, .. } => {
+            let keys: Vec<String> = keys.iter().take(8).map(name).collect();
+            format!("{changed} {what} changed, the facts allow {min} to {max}: {}", keys.join(", "))
+        }
+        Finding::Unrecorded { what, kind } => format!("neither trace has {what} (kind {:#06x})", kind.0),
+        Finding::Kept { query, read, saw, now } => {
+            format!("{} was kept though it read {} at {saw:?}, which is now {now:?}", name(query), name(read))
+        }
+        Finding::Unexplained { query } => format!("{} reran though nothing it read changed", name(query)),
+        Finding::Needless { query } => format!("{} reran, read and made what it did before", name(query)),
+        Finding::Stale(stale) => {
+            let f = found(stale);
+            format!("{} {}: {}", f.what, f.query, f.detail)
+        }
+    };
+    NameresFound { side: finding.side(), detail }
 }
 
 /// `kkkk:` and the first 8 bytes of the input in hex, written into one 21-byte string.
@@ -102,28 +160,52 @@ fn read_input(arg: &str) -> Result<Given, String> {
         fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
     };
     serde_json::from_str(&text).map_err(|e| {
-        format!("the input: {{\"incremental\", \"scratch\", \"before\"?}} or {{\"first\", \"second\"}}: {e}")
+        format!("the input: {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} or {{\"first\", \"second\"}}: {e}")
     })
 }
 
-fn trace(path: &Path) -> Result<Trace, String> {
-    let mapped = blaze_v2_proof::bytes::Mapped::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    blaze_protocol::cbor::from_slice(mapped.bytes()).map_err(|e| format!("{}: {e}", path.display()))
+/// A trace's file mapped with no page faulted in: the joins across cores fault in their own.
+fn mapped(path: &Path) -> Result<Mapped, String> {
+    Mapped::open_lazily(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn view<'a>(path: &Path, mapped: &'a Mapped) -> Result<View<'a>, String> {
+    View::parse(mapped.bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn compare(input: &Input) -> Result<Output, String> {
-    let incremental = trace(&input.incremental)?;
-    let scratch = trace(&input.scratch)?;
-    let stale: Vec<Found> = under(&incremental, &scratch, &[]).iter().map(found).collect();
-    let (work, needless) = match &input.before {
+    let (incremental, scratch) = (mapped(&input.incremental)?, mapped(&input.scratch)?);
+    let before = input.before.as_deref().map(mapped).transpose()?;
+    let incremental = view(&input.incremental, &incremental)?;
+    let scratch = view(&input.scratch, &scratch)?;
+    let before = match (input.before.as_deref(), &before) {
+        (Some(path), Some(file)) => Some(view(path, file)?),
+        _ => None,
+    };
+    let stale: Vec<Found> = join::under(&incremental, &scratch, &[]).iter().map(found).collect();
+    let (work, needless) = match &before {
         Some(before) => {
-            let (work, needless) = over(&trace(before)?, &incremental);
+            let (work, needless) = join::over(before, &incremental);
             (Some(work), needless.iter().map(name).collect())
         }
         None => (None, Vec::new()),
     };
+    let nameres = match (input.slot.as_deref().and_then(nameres::case), &before) {
+        (Some(case), Some(before)) => Some(Nameres {
+            slot: case.slot,
+            claim: case.claim,
+            findings: nameres::check(case, &before.to_trace(), &incremental.to_trace(), &scratch.to_trace())
+                .iter()
+                .map(nameres_found)
+                .collect(),
+        }),
+        (Some(case), None) => {
+            return Err(format!("the `{}` case needs `before`, the trace of the build before the edit", case.slot));
+        }
+        (None, _) => None,
+    };
     let culprits = stale.iter().filter(|f| f.culprit).count();
-    Ok(Output { stale, culprits, work, needless })
+    Ok(Output { stale, culprits, work, needless, nameres })
 }
 
 fn compare_files(files: &Files) -> ExitCode {
@@ -144,8 +226,8 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [arg] = args.as_slice() else {
         eprintln!(
-            "usage: blaze-v2-proof JSON (inline, a file's path, or -): {{\"incremental\", \"scratch\", \"before\"?}} \
-             or {{\"first\", \"second\"}}"
+            "usage: blaze-v2-proof JSON (inline, a file's path, or -): {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} \
+             or {{\"first\", \"second\"}} or {{\"bench\": \"first-difference\" or \"join\"}}"
         );
         return ExitCode::from(2);
     };
@@ -159,10 +241,15 @@ fn main() -> ExitCode {
     let input = match given {
         Given::Traces(input) => input,
         Given::Files(files) => return compare_files(&files),
+        Given::Bench(b) => {
+            println!("{}", serde_json::json!({ "value": bench::run(b.bench) }));
+            return ExitCode::SUCCESS;
+        }
     };
     match compare(&input) {
         Ok(output) => {
-            let stale = !output.stale.is_empty();
+            let wrong = output.nameres.as_ref().is_some_and(|n| n.findings.iter().any(|f| f.side != Side::Unmeasured));
+            let stale = !output.stale.is_empty() || wrong;
             println!("{}", serde_json::to_string_pretty(&output).expect("the output is JSON"));
             if stale { ExitCode::from(1) } else { ExitCode::SUCCESS }
         }

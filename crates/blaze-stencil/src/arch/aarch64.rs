@@ -5,15 +5,85 @@
 
 use cranelift_codegen::ir;
 
-use super::{Area, Cx, Glue};
-use crate::{Error, Target, code};
+use super::{Area, Cx, Glue, Loc};
+use crate::{
+    Error, Target,
+    buf::{Buf, Label},
+    code::{self, Name, Rule},
+};
+
+mod abi;
+mod frame;
+mod glue;
+mod inst;
+#[cfg(test)]
+mod tests;
+
+pub use frame::Frame;
 
 /// AArch64.
 pub struct Aarch64;
 
-/// One function's frame on AArch64.
-#[derive(Default)]
-pub struct Frame {}
+/// What the glue bodies read and record: [`Cx`], or a test's stand-in for the patcher.
+trait Ctx<'f> {
+    fn buf(&mut self) -> &mut Buf;
+    fn func(&self) -> &'f ir::Function;
+    fn target(&self) -> &'f Target;
+    fn frame(&self) -> &'f Frame;
+    fn loc(&self, value: ir::Value) -> Loc;
+    fn returned(&self, inst: ir::Inst, k: usize) -> Loc;
+    fn payload(&self, inst: ir::Inst, k: usize) -> Loc;
+    fn edge(&self, inst: ir::Inst, i: usize) -> Label;
+    fn rule_at(&mut self, at: u32, rule: Rule);
+    fn call_site(&mut self, ret: u32, inst: ir::Inst);
+    fn name(&self, name: &ir::ExternalName) -> Result<Name, Error>;
+}
+
+impl<'a> Ctx<'a> for Cx<'a, Aarch64> {
+    fn buf(&mut self) -> &mut Buf {
+        self.buf
+    }
+
+    fn func(&self) -> &'a ir::Function {
+        self.func
+    }
+
+    fn target(&self) -> &'a Target {
+        self.target
+    }
+
+    fn frame(&self) -> &'a Frame {
+        self.frame
+    }
+
+    fn loc(&self, value: ir::Value) -> Loc {
+        Cx::loc(self, value)
+    }
+
+    fn returned(&self, inst: ir::Inst, k: usize) -> Loc {
+        Cx::returned(self, inst, k)
+    }
+
+    fn payload(&self, inst: ir::Inst, k: usize) -> Loc {
+        Cx::payload(self, inst, k)
+    }
+
+    fn edge(&self, inst: ir::Inst, i: usize) -> Label {
+        Cx::edge(self, inst, i)
+    }
+
+    fn rule_at(&mut self, at: u32, rule: Rule) {
+        Cx::rule_at(self, at, rule);
+    }
+
+    fn call_site(&mut self, ret: u32, inst: ir::Inst) {
+        Cx::call_site(self, ret, inst);
+    }
+
+    fn name(&self, name: &ir::ExternalName) -> Result<Name, Error> {
+        Cx::name(self, name)
+    }
+}
 
 impl Glue for Aarch64 {
     const ARCH: blaze_codegen::Arch = blaze_codegen::Arch::Aarch64;
@@ -26,62 +96,62 @@ impl Glue for Aarch64 {
     type Frame = Frame;
 
     fn frame(func: &ir::Function, target: &Target, area: Area) -> Result<Frame, Error> {
-        let _ = (func, target, area);
-        unimplemented!("fastcompile-stencil-a64")
+        let mut frame = frame::layout(func, target, area)?;
+        frame.entry = glue::entry_bound(func, &frame);
+        Ok(frame)
     }
 
     fn takes(func: &ir::Function, target: &Target, inst: ir::Inst) -> bool {
-        let _ = (func, target, inst);
-        unimplemented!("fastcompile-stencil-a64")
+        let _ = target;
+        glue::takes(func.dfg.insts[inst].opcode())
     }
 
     fn bound(func: &ir::Function, target: &Target, inst: ir::Inst) -> u32 {
-        let _ = (func, target, inst);
-        unimplemented!("fastcompile-stencil-a64")
+        glue::bound(func, target, inst)
     }
 
     fn bound_fixed(frame: &Frame) -> u32 {
-        let _ = frame;
-        unimplemented!("fastcompile-stencil-a64")
+        glue::bound_fixed(frame)
     }
 
     fn prologue(cx: &mut Cx<'_, Aarch64>) -> Result<(), Error> {
-        let _ = cx;
-        unimplemented!("fastcompile-stencil-a64")
+        glue::prologue(cx)
     }
 
     fn inst(cx: &mut Cx<'_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
-        let _ = (cx, inst);
-        unimplemented!("fastcompile-stencil-a64")
+        glue::inst(cx, inst)
     }
 
     fn landing(cx: &mut Cx<'_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
-        let _ = (cx, inst);
-        unimplemented!("fastcompile-stencil-a64")
+        glue::landing(cx, inst)
     }
 
     fn trap(cx: &mut Cx<'_, Aarch64>, code: ir::TrapCode) {
-        let _ = (cx, code);
-        unimplemented!("fastcompile-stencil-a64")
+        let _ = code;
+        cx.buf.put4(inst::UDF);
     }
 
     fn count_back_edge(cx: &mut Cx<'_, Aarch64>) {
-        let _ = cx;
-        unimplemented!("fastcompile-stencil-a64")
+        glue::count(cx.buf, glue::BACK_EDGES);
     }
 
     fn relay(cx: &mut Cx<'_, Aarch64>, from: u32, to: u32, bytes: u8) {
-        let _ = (cx, from, to, bytes);
-        unimplemented!("fastcompile-stencil-a64")
+        glue::relay(cx.buf, from, to, bytes);
     }
 
     fn unwind(cx: &mut Cx<'_, Aarch64>) -> Result<Option<code::Unwind>, Error> {
-        let _ = cx;
-        unimplemented!("fastcompile-stencil-a64")
+        let len = cx.buf.len();
+        if cx.frame.windows {
+            return Ok(Some(code::Unwind::WindowsArm64 {
+                len,
+                codes: frame::windows_codes(cx.frame),
+            }));
+        }
+        // alloc: once per function, the unwind information it hands back.
+        Ok(Some(code::Unwind::Dwarf { len, rows: cx.rows().to_vec() }))
     }
 
     fn slot_base(frame: &Frame) -> (u16, i32) {
-        let _ = frame;
-        unimplemented!("fastcompile-stencil-a64")
+        frame::slot_base(frame)
     }
 }

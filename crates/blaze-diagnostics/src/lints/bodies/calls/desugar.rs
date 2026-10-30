@@ -51,7 +51,10 @@ fn for_loop(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ForLoop> {
     let Expr::Match { expr: into_iter, arms: [arm] } = store.expr(expr) else { return None };
     let Expr::Call { args: [head], .. } = store.expr(into_iter) else { return None };
     let Expr::Loop { body, source: LoopSource::ForLoop, .. } = store.expr(arm.expr) else { return None };
-    let Expr::Block { statements: [], tail: Some(next), .. } = store.expr(body) else { return None };
+    let Expr::Block { statements, tail: Some(next), .. } = store.expr(body) else { return None };
+    if !statements.is_empty() {
+        return None;
+    }
     let Expr::Match { arms: [_, some], .. } = store.expr(next) else { return None };
     let Pat::TupleStruct { args: [pat], .. } = store.pat(some.pat) else { return None };
     Some(ForLoop { into_iter, head: *head, pat: *pat })

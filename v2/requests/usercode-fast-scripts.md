@@ -107,14 +107,18 @@
   `to_link_in` allocates nothing on a memo hit, which `a_unit_met_again_is_free` holds it
   to. `to_link` stays, as the owned copy, until no caller wants one.
 
+> forwarded to cargo (told by tmux).
+
 ## 9. Cargo.lock: blaze-build-script's dependencies changed (required)
 
-- What: drop `blaze-ids` from `blaze-build-script`'s dependencies and add `blaze-alloc-count`
-  (a dev-dependency) in `Cargo.lock`, as the next resolve does.
+- What: drop `blaze-ids` from `blaze-build-script`'s dependencies and add `blaze-mem` and
+  `blaze-alloc-count` (a dev-dependency) in `Cargo.lock`, as the next resolve does.
 - Where: `Cargo.lock`, the `blaze-build-script` package entry.
 - Why: `blaze-ids` is no longer used (its `radix` was the last use, gone from `apply.rs`);
   `blaze-alloc-count` counts allocations for this crate's allocation-budget tests. The
   manifest lint passes.
+
+> applied: listed under lock additions in requests' report, for the first compile (requests edits no lock).
 
 ## 10. tools/v2/hot_lint.py: `crates` as a tuple (required, the lint fails without it)
 
@@ -126,6 +130,8 @@
   `{"root": ".", "crates": ["blaze-build-script"]}` fails before reading a file. This lane
   ran the lint's own `lint_file` over the crate, with the same skips, to reach 0 findings.
 
+> forwarded to the coordinator (`tools/`), listed in requests' report.
+
 ## 11. Callers: what changed in blaze-build-script's API (for information)
 
 - `Clone` is gone from `Env`, `run::{Invocation, Ran, Failed, Files}`, `Watched`,
@@ -135,7 +141,31 @@
   not be cloned, its owner can drop that derive and this lane drops `Output`'s.
 - `Compile::args` returns `Vec<Cow<'_, str>>` (borrowed but for paths and `link-arg=`); its
   one caller is this crate's tests.
-- `Rerun::stale` and `to_link` take the lookups and the graph as generics, not `dyn`; an
-  existing call compiles unchanged.
+- `to_link` takes the graph as a generic, not `dyn`; an existing call compiles unchanged.
+- `Rerun::stale` takes lookups returning `Option<&str>` (were `Option<String>`); it has no
+  caller outside this crate.
+- New `elide::elide_into(root, files, out) -> bool`, printing into a reused buffer; `elide`
+  is unchanged. `elide::lex::normalize` takes a `&Frame` and returns `&str` (no outside user).
 - `output::parse_rustc_flags` and `output::parse_rustc_env` are gone (no user outside this
   crate; the second lives on as the reference in `output/tests/reference.rs`).
+
+> forwarded to cargo and usercode (information; told by tmux).
+
+## 12. blaze-mem: a path scratch, and the frame for a read root file (optional, mem lane)
+
+- What: a `scratch::with_path` shelf lending a thread's `PathBuf` empty, as `with_string`
+  lends a `String`; and, once tasks carry a `Frame`, a way for a caller to hand elision one,
+  so its printed text and argument list are bumped, not allocated.
+- Where: `crates/blaze-mem/src/scratch.rs` (lane mem); then `blaze_build_script::apply::Rerun::stale`
+  and `elide::elide` (this lane) take them.
+- Why: `Rerun::stale` now takes the caller's path buffer, which is the design's scratch kept in
+  worker state; a shelf would let it take none. Elision makes three allocations per root
+  file read (`what_elision_allocates`), all for that one task.
+
+> forwarded to mem (told by tmux).
+
+> answered (mem, mem-codegen, 10-29) and applied (usercode-fast-scripts): `Rerun::stale` joins
+> paths in `blaze_mem::scratch::with_path` and takes no buffer; elision runs in
+> `frame::task(Tag::Usercode, ..)` with its temporaries in the frame and lent strings, and
+> prints into the caller's buffer through the new `elide_into` (requests 2 and 3 of
+> `v2/requests/mem-codegen.md`).

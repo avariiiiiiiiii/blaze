@@ -10,12 +10,11 @@
 
 use std::fmt;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::attrs::AttrFlags;
 use hir_def::{FunctionId, HasModule};
 use intern::Symbol;
 
-use crate::db::HirDatabase;
 
 #[cfg(test)]
 mod tests;
@@ -147,7 +146,7 @@ impl TargetArch {
 
 /// The arch of `krate`'s target, from its `target_arch` cfg: once per crate.
 #[salsa::tracked(returns(copy))]
-pub fn crate_target_arch(db: &dyn HirDatabase, krate: Crate) -> TargetArch {
+pub fn crate_target_arch(db: &Db, krate: Crate) -> TargetArch {
     krate
         .cfg_options(db)
         .get_cfg_values("target_arch")
@@ -280,7 +279,7 @@ pub struct TargetFeatures<'db> {
 
 impl<'db> TargetFeatures<'db> {
     /// The features of `owner`'s attributes and what they imply on its crate's target.
-    pub fn from_fn(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
+    pub fn from_fn(db: &'db Db, owner: FunctionId) -> Self {
         let declared = TargetFeatures::from_fn_no_implications(db, owner);
         if declared.known.is_empty() {
             return declared;
@@ -290,7 +289,7 @@ impl<'db> TargetFeatures<'db> {
     }
 
     /// The features the attributes name, without those they imply.
-    pub fn from_fn_no_implications(db: &'db dyn HirDatabase, owner: FunctionId) -> Self {
+    pub fn from_fn_no_implications(db: &'db Db, owner: FunctionId) -> Self {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
             return Self::default();
         }
@@ -353,14 +352,14 @@ impl Declared {
 }
 
 #[salsa::tracked(returns(ref))]
-fn declared_target_features(db: &dyn HirDatabase, owner: FunctionId) -> Declared {
+fn declared_target_features(db: &Db, owner: FunctionId) -> Declared {
     Declared::of(AttrFlags::target_features(db, owner))
 }
 
 /// The target features of rustc's tables that `krate`'s cfg has (`cfg(target_feature = "…")`),
 /// without what they imply: `CfgOptions::check_atom` of each, once per crate.
 #[salsa::tracked(returns(copy))]
-pub fn crate_target_features(db: &dyn HirDatabase, krate: Crate) -> TargetFeatureSet {
+pub fn crate_target_features(db: &Db, krate: Crate) -> TargetFeatureSet {
     let values = krate.cfg_options(db).get_cfg_values("target_feature");
     values.filter_map(|it| TargetFeature::from_name(it.as_str())).collect()
 }

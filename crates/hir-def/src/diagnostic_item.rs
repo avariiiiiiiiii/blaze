@@ -4,7 +4,7 @@
 
 use std::collections::hash_map::Entry;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -59,7 +59,7 @@ impl DiagnosticItems {
 /// bodies that may declare one ([`demand::walk_bodies_saying`]): those whose text says
 /// `rustc_diagnostic_item` or names a macro that may write it.
 #[salsa::tracked(returns(ref))]
-pub fn crate_diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> DiagnosticItems {
+pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
     let mut collect = Collect { db, items: DiagnosticItems::default() };
     for (module, data) in crate_def_map(db, krate).modules(db) {
@@ -80,7 +80,7 @@ pub fn crate_diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> Diagnost
 /// crates in its extern prelude and, in turn, theirs, breadth first. A name given in two crates
 /// keeps the first; `duplicates` lists `krate`'s own and those across crates.
 #[salsa::tracked(returns(ref))]
-pub fn diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> DiagnosticItems {
+pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("diagnostic_items_query").entered();
     let own = crate_diagnostic_items(db, krate);
     let mut result = own.clone();
@@ -108,7 +108,7 @@ pub fn diagnostic_items(db: &dyn SourceDatabase, krate: Crate) -> DiagnosticItem
 }
 
 struct Collect<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     items: DiagnosticItems,
 }
 

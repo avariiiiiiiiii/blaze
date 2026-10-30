@@ -3,6 +3,7 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
+use base_db::Db;
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup, attrs::AttrFlags, expr_store::Body,
     hir::ExprId, signatures::FunctionSignature,
@@ -39,7 +40,7 @@ pub fn written_range(node: &SyntaxNode) -> TextRange {
 /// changing with it.
 #[salsa::tracked(returns(ref))]
 pub fn location_macros<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
 ) -> FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
     let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
@@ -65,7 +66,7 @@ pub fn location_macros<'db>(
 /// `file!()` among them, each with the expansion it is in.
 #[salsa::tracked(returns(ref))]
 pub fn located_concats<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
 ) -> FxHashMap<ExprId, HirFileId> {
     let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
@@ -87,7 +88,7 @@ pub enum Placed {
     Text(String),
 }
 
-type SourcePaths = dyn Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync;
+type SourcePaths = dyn Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync;
 
 /// How a build names files, told by [`name_sources`]. Two rules with the same `key` name every
 /// file the same: the key is all the rule depends on besides what it reads of the database.
@@ -115,9 +116,9 @@ pub struct SourceNames {
 /// blaze. `key` names everything `paths` depends on besides the database (the checkout and its
 /// base, say); telling the same key again changes nothing, so no constant is evaluated again.
 pub fn name_sources(
-    db: &mut dyn HirDatabase,
+    db: &mut Db,
     key: &str,
-    paths: impl Fn(&dyn HirDatabase, base_db::FileId) -> Option<String> + Send + Sync + 'static,
+    paths: impl Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
     let rule = NamingRule { key: key.into(), paths: std::sync::Arc::new(paths) };
     match SourceNames::try_get(db) {
@@ -136,12 +137,12 @@ pub fn name_sources(
 
 /// What the build calls `file`, as `file!()` and `Location::file` say: none when the
 /// evaluator was not told ([`name_sources`]).
-pub fn source_path<'db>(db: &'db dyn HirDatabase, file: base_db::FileId) -> Option<&'db str> {
+pub fn source_path<'db>(db: &'db Db, file: base_db::FileId) -> Option<&'db str> {
     file_source_path(db, db.file_text(file))
 }
 
 #[salsa::tracked(returns(as_deref))]
-fn file_source_path<'db>(db: &'db dyn HirDatabase, file: base_db::FileText) -> Option<String> {
+fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String> {
     let Some(names) = SourceNames::try_get(db) else {
         db.report_untracked_read();
         return None;
@@ -152,7 +153,7 @@ fn file_source_path<'db>(db: &'db dyn HirDatabase, file: base_db::FileText) -> O
 /// The value of the literal `expr` of `owner` when it is what `line!()`, `column!()`,
 /// `file!()` or a `concat!` of them expanded to: rust-analyzer expands them to placeholders,
 /// and a constant is evaluated from what it expanded them to.
-pub fn placed(db: &dyn HirDatabase, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
+pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     let path = |file| source_path(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         let call = file_id.macro_file()?.loc(db).to_node(db);
@@ -254,7 +255,7 @@ fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
 
 /// The macro call an expansion comes from that is itself written out, in the source or in
 /// what a macro was passed, and not by another macro.
-pub fn written_call(db: &dyn HirDatabase, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
+pub fn written_call(db: &Db, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
     let mut call = file_id.macro_file()?.loc(db).to_node(db);
     while let Some(outer) = call.file_id.macro_file() {
         let start = TextRange::empty(call.value.text_range().start());
@@ -267,7 +268,7 @@ pub fn written_call(db: &dyn HirDatabase, file_id: HirFileId) -> Option<InFile<S
 }
 
 pub fn location_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     file_id: HirFileId,
     range: TextRange,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -285,7 +286,7 @@ pub fn location_of(
 
 /// File, line and column of where a range of a file begins.
 pub fn line_and_column(
-    db: &dyn HirDatabase,
+    db: &Db,
     FileRange { file_id, range }: FileRange,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = file_id.file_id(db);
@@ -300,7 +301,7 @@ pub fn line_and_column(
 
 /// Where each line of a file begins, the first of them at 0.
 #[salsa::tracked(returns(ref))]
-fn line_starts(db: &dyn HirDatabase, text: base_db::FileText) -> Vec<u32> {
+fn line_starts(db: &Db, text: base_db::FileText) -> Vec<u32> {
     let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
     std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
 }
@@ -324,7 +325,7 @@ pub fn column_width(ch: char) -> usize {
 /// body is in its file: the code generator also finds them from the body alone.
 #[salsa::tracked]
 pub fn source_location_in_file<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(base_db::FileId, u32, u32)> {
@@ -335,7 +336,7 @@ pub fn source_location_in_file<'db>(
 /// The file a place in a body is written in, which may be what a macro expands to, and
 /// where in it rustc has the place begin.
 pub fn source_range<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: DefWithBodyId,
     span: MirSpan,
 ) -> Option<(HirFileId, TextRange)> {
@@ -345,10 +346,10 @@ pub fn source_range<'db>(
         // The block an `async fn` is taken to wrap its body in is not written anywhere, and
         // ends where the body does.
         MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+            match (source_map.expr_syntax(expr), Body::of(db, owner).expr(expr)) {
                 (Ok(written), _) => written,
                 (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
+                    source_map.expr_syntax(tail).ok()?
                 }
                 (Err(_), _) => return None,
             }
@@ -377,7 +378,7 @@ pub fn source_range<'db>(
 /// from the method's name on, an index through `Index` from its bracket on, and any other
 /// expression together with the parentheses it is written in.
 pub fn reported_range(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     expr: ExprId,
     file_id: HirFileId,
@@ -388,7 +389,7 @@ pub fn reported_range(
         return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
     }
     if let Some(written) = ast::IndexExpr::cast(node.clone())
-        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner)[expr]
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner).expr(expr)
         && !is_builtin_index(InferenceResult::of(db, owner), base, index)
     {
         return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
@@ -399,7 +400,7 @@ pub fn reported_range(
 /// The range of an expression with the parentheses around it. rustc's span of an expression
 /// includes them when both are written in one place, and not when a macro put the
 /// parentheses around what it was passed.
-fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+fn parenthesized(db: &Db, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
     let passed_in = |range: TextRange| {
         file_id.macro_file().is_none()
             || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
@@ -414,7 +415,7 @@ fn parenthesized(db: &dyn HirDatabase, file_id: HirFileId, node: &SyntaxNode) ->
 
 /// Whether calls to `func` pass a `&Location` after the declared arguments. A method of a trait
 /// impl inherits the attribute from the trait's declaration.
-pub fn track_caller(db: &dyn HirDatabase, func: FunctionId) -> bool {
+pub fn track_caller(db: &Db, func: FunctionId) -> bool {
     let has =
         |func: FunctionId| AttrFlags::query(db, func.into()).contains(AttrFlags::TRACK_CALLER);
     if has(func) {

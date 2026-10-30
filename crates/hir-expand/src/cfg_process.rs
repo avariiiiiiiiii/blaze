@@ -2,7 +2,7 @@
 use std::{cell::OnceCell, ops::ControlFlow};
 
 use ::tt::TextRange;
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use cfg::CfgExpr;
 use parser::T;
 use smallvec::SmallVec;
@@ -20,6 +20,12 @@ use crate::{
 };
 
 struct ItemIsCfgedOut;
+
+/// The callback's answers that insert no tokens, keeping or skipping the token.
+// alloc: none, an empty `Vec`
+const KEEP: (bool, Vec<tt::Leaf>) = (true, Vec::new());
+// alloc: none, an empty `Vec`
+const SKIP: (bool, Vec<tt::Leaf>) = (false, Vec::new());
 
 #[derive(Debug)]
 struct ExpandedAttrToProcess {
@@ -45,7 +51,7 @@ struct AstAttrToProcess {
 }
 
 fn macro_input_callback(
-    db: &dyn SourceDatabase,
+    db: &Db,
     is_derive: bool,
     censor_item_tree_attr_ids: &[AttrId],
     krate: Crate,
@@ -72,6 +78,7 @@ fn macro_input_callback(
         }
     };
 
+    // alloc: one list per input, reused for every node with attributes
     let mut attrs = Vec::new();
     let mut attrs_idx = 0;
     let mut has_inner_attrs_owner = false;
@@ -82,7 +89,7 @@ fn macro_input_callback(
         match event {
             WalkEvent::Enter(SyntaxElement::Node(node)) => {
                 if done_with_attrs {
-                    return (true, Vec::new());
+                    return KEEP;
                 }
 
                 if ast::Attr::can_cast(node.kind()) {
@@ -94,19 +101,19 @@ fn macro_input_callback(
                     {
                         attrs_idx += 1;
                     }
-                } else if !in_attr && let Some(has_attrs) = ast::AnyHasAttrs::cast(node.clone()) {
+                } else if !in_attr && let Some(has_attrs) = ast::AnyHasAttrs::cast(node.clone()) { // clone: a node handle, a non-atomic count
                     // Attributes of the form `key = value` have `ast::Expr` in them, which returns `Some` for
                     // `AnyHasAttrs::cast()`, so we also need to check `in_attr`.
 
                     if has_inner_attrs_owner {
                         has_inner_attrs_owner = false;
-                        return (true, Vec::new());
+                        return KEEP;
                     }
 
                     if did_top_attrs && !is_derive {
                         // Derives need all attributes handled, but attribute macros need only the top attributes handled.
                         done_with_attrs = true;
-                        return (true, Vec::new());
+                        return KEEP;
                     }
                     did_top_attrs = true;
 
@@ -119,6 +126,7 @@ fn macro_input_callback(
                     let node_attrs = ast::attrs_including_inner(&has_attrs);
 
                     attrs.clear();
+                    // clone: an iterator of node handles
                     node_attrs.clone().for_each(|attr| {
                         let span_for = |token: Option<SyntaxToken>| {
                             token
@@ -187,6 +195,7 @@ fn macro_input_callback(
                         'eat_comma: {
                             // If there is a comma after this node, eat it too.
                             let mut events_until_comma = 0;
+                            // clone: a cursor, for a cfg'd-out item only
                             for event in preorder.clone() {
                                 match event {
                                     WalkEvent::Enter(SyntaxElement::Node(_))
@@ -205,7 +214,7 @@ fn macro_input_callback(
                             preorder.nth(events_until_comma);
                         }
 
-                        return (false, Vec::new());
+                        return SKIP;
                     }
                 }
             }
@@ -217,18 +226,18 @@ fn macro_input_callback(
             }
             WalkEvent::Enter(SyntaxElement::Token(token)) => {
                 if !in_attr {
-                    return (true, Vec::new());
+                    return KEEP;
                 }
 
                 let Some(ast_attr) = attrs.get_mut(attrs_idx) else {
-                    return (true, Vec::new());
+                    return KEEP;
                 };
                 let token_range = token.text_range();
                 let Some(expanded_attr) = ast_attr.expanded_attrs.get(ast_attr.expanded_attrs_idx)
                 else {
                     // No expanded attributes in this `ast::Attr`, or we finished them all already, either way
                     // the remaining tokens should be discarded.
-                    return (false, Vec::new());
+                    return SKIP;
                 };
                 match ast_attr.next_expanded_attr {
                     NextExpandedAttrState::NotStarted => {
@@ -258,12 +267,13 @@ fn macro_input_callback(
                             return (true, insert_tokens);
                         } else {
                             // Before any attribute or between the attributes.
-                            return (false, Vec::new());
+                            return SKIP;
                         }
                     }
                     NextExpandedAttrState::InTheMiddle => {
                         if token_range.start() >= expanded_attr.attr.syntax().text_range().end() {
                             // Finished the current attribute.
+                            // alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec`
                             let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {
                                 char: ']',
                                 spacing: tt::Spacing::Alone,
@@ -279,19 +289,19 @@ fn macro_input_callback(
                             return (false, insert_tokens);
                         } else {
                             // Still in the middle.
-                            return (true, Vec::new());
+                            return KEEP;
                         }
                     }
                 }
             }
             WalkEvent::Leave(SyntaxElement::Token(_)) => {}
         }
-        (true, Vec::new())
+        KEEP
     }
 }
 
 pub(crate) fn attr_macro_input_to_token_tree(
-    db: &dyn SourceDatabase,
+    db: &Db,
     node: &SyntaxNode,
     span_map: SpanMap<'_>,
     span: Span,

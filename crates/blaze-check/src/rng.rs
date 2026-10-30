@@ -1,7 +1,6 @@
-//! The seeded generator of the random runs: `blaze_core::sim::Rng`'s SplitMix64, step for step,
-//! so a seed means the same here as in a `Sim`. It is a copy, not a dependency: `blaze-check`
-//! is a leaf, below every crate with model tests, and `blaze-core` is not (it uses `blaze-ids`).
-//! `tests.rs` holds it to SplitMix64's reference outputs.
+//! The seeded generator of the random runs: `blaze_ids::rng::SplitMix64`, step for step, so a
+//! seed means the same here as in every other crate's tests. It is a copy, not a dependency:
+//! `blaze-ids` depends on `blaze-check`. `tests.rs` holds it to SplitMix64's reference outputs.
 
 #[derive(Clone, Debug)]
 pub(crate) struct Rng(u64);

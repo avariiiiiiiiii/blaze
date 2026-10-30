@@ -765,6 +765,9 @@ fn canonical_toml(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
     let table: toml::Table = toml::from_str(text).ok()?;
     let again = toml::to_string(&table).ok()?;
+    if again.as_bytes() == bytes {
+        return Some(again);
+    }
     // Kept only when it reads back as the same table.
     (toml::from_str::<toml::Table>(&again).ok()? == table).then_some(again)
 }

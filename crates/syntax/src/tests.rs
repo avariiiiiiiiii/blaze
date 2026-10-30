@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};
 
-use crate::{AstNode, SourceFile, SyntaxError, ast, fuzz};
+use crate::{AstNode, SourceFile, SyntaxError, Text, TextRange, TextSize, ast, fuzz};
 
 #[test]
 fn parse_smoke_test() {
@@ -33,6 +33,33 @@ fn statements_that_are_no_expression_parse_as_macro_statements() {
     assert_eq!(parse.errors(), Vec::<SyntaxError>::new());
     assert!(parse.tree().statements().next().is_some());
     assert!(!ast::MacroStmts::parse("let = ;", Edition::CURRENT).errors().is_empty());
+}
+
+#[test]
+fn a_reparse_onto_a_known_edit_is_the_whole_parse() {
+    let before = "fn f() { 1 }\nfn g() {}\n";
+    let after = "fn f() { 12 }\nfn g() {}\n";
+    let insert_at = TextSize::from(10);
+    for outline in [false, true] {
+        let parse = |text: &str| match outline {
+            true => SourceFile::parse_outline(text, Edition::CURRENT),
+            false => SourceFile::parse_shared(text, Edition::CURRENT),
+        };
+        let old = parse(before);
+        let new = old.reparse_onto(TextRange::empty(insert_at), after, Edition::CURRENT);
+        assert_eq!(new, parse(after));
+        assert_eq!(new, old.reparse_to(after, Edition::CURRENT));
+        assert_eq!(new.errors_with_bodies(), parse(after).errors_with_bodies());
+    }
+}
+
+#[test]
+fn a_weak_parse_upgrades_to_the_same_parse_while_the_tree_is_held() {
+    let parse = SourceFile::parse("fn f() { 1 + }", Edition::CURRENT);
+    let weak = parse.downgrade();
+    let upgraded = weak.upgrade().expect("the parse holds its tree");
+    assert_eq!(upgraded, parse);
+    assert_eq!(upgraded.errors(), parse.errors());
 }
 
 #[test]
@@ -159,7 +186,7 @@ fn outline_is_the_full_parse() {
         .into_par_iter()
         .map(|(path, text)| {
             let full = SourceFile::parse(&text, Edition::CURRENT);
-            let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
             let tree = outline.tree.as_ref().unwrap().flat().clone();
             let _ = outline.errors();
             assert!(
@@ -211,7 +238,7 @@ const C: () = { fn h() {} };
 fn m() -> u8 { if true { 1 } else { 2 } }
 fn k() { #[a] }
 ";
-    let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+    let outline = SourceFile::parse_outline(Text::from(text), Edition::CURRENT);
     let tree = outline.tree.as_ref().unwrap().flat().clone();
     let lazy: Vec<&str> = tree.lazies().map(|at| &text[tree.range(at)]).collect();
     assert_eq!(lazy, ["{ 1 }", "{ 2 }", "{}", "{ if true { 1 } else { 2 } }"]);

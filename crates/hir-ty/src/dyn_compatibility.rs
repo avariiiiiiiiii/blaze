@@ -2,6 +2,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir_def::{
     AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId, TypeAliasId,
     TypeOrConstParamId, TypeParamId,
@@ -55,7 +56,7 @@ pub enum MethodViolationCode {
 }
 
 pub fn dyn_compatibility(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
 ) -> Option<DynCompatibilityViolation> {
     let interner = DbInterner::new_no_crate(db);
@@ -73,7 +74,7 @@ pub fn dyn_compatibility(
 }
 
 pub fn dyn_compatibility_with_callback<F>(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     cb: &mut F,
 ) -> ControlFlow<()>
@@ -91,7 +92,7 @@ where
 }
 
 pub fn dyn_compatibility_of_trait_with_callback<F>(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     cb: &mut F,
 ) -> ControlFlow<()>
@@ -124,7 +125,7 @@ where
 
 #[salsa::tracked(returns(copy))]
 pub fn dyn_compatibility_of_trait_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
 ) -> Option<DynCompatibilityViolation> {
     let mut res = None;
@@ -137,7 +138,7 @@ pub fn dyn_compatibility_of_trait_query(
 }
 
 #[salsa::tracked(returns(copy))]
-pub fn generics_require_sized_self(db: &dyn HirDatabase, def_id: GenericDefId) -> bool {
+pub fn generics_require_sized_self(db: &Db, def_id: GenericDefId) -> bool {
     let krate = def_id.krate(db);
     let interner = DbInterner::new_with(db, krate);
     let Some(sized_def_id) = interner.lang_items().Sized else {
@@ -166,14 +167,14 @@ pub fn generics_require_sized_self(db: &dyn HirDatabase, def_id: GenericDefId) -
 // rustc gathers all the spans that references `Self` for error rendering,
 // but we don't have good way to render such locations.
 // So, just return single boolean value for existence of such `Self` reference
-fn predicates_reference_self(db: &dyn HirDatabase, trait_: TraitId) -> bool {
+fn predicates_reference_self(db: &Db, trait_: TraitId) -> bool {
     GenericPredicates::query_explicit(db, trait_.into()).iter_identity().any(|pred| {
         predicate_references_self(db, trait_, pred.skip_norm_wip(), AllowSelfProjections::No)
     })
 }
 
 // Same as the above, `predicates_reference_self`
-fn bounds_reference_self(db: &dyn HirDatabase, trait_: TraitId) -> bool {
+fn bounds_reference_self(db: &Db, trait_: TraitId) -> bool {
     let trait_data = trait_.trait_items(db);
     trait_data
         .items
@@ -200,7 +201,7 @@ enum AllowSelfProjections {
 }
 
 fn predicate_references_self<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     trait_: TraitId,
     predicate: Clause<'db>,
     allow_self_projection: AllowSelfProjections,
@@ -219,13 +220,13 @@ fn predicate_references_self<'db>(
 }
 
 fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbInterner<'db>>>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     trait_: TraitId,
     t: &T,
     allow_self_projection: AllowSelfProjections,
 ) -> bool {
     struct IllegalSelfTypeVisitor<'db> {
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         trait_: TraitId,
         super_traits: Option<SmallVec<[TraitId; 4]>>,
         allow_self_projection: AllowSelfProjections,
@@ -273,7 +274,7 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
 }
 
 fn dyn_compatibility_violation_for_assoc_item<'db, F>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     features: &mut Option<&'db UnstableFeatures>,
     trait_: TraitId,
     item: AssocItemId,
@@ -314,7 +315,7 @@ where
 }
 
 fn virtual_call_violations_for_method<F>(
-    db: &dyn HirDatabase,
+    db: &Db,
     trait_: TraitId,
     func: FunctionId,
     cb: &mut F,
@@ -398,7 +399,7 @@ where
 }
 
 fn receiver_is_dispatchable<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     trait_: TraitId,
     func: FunctionId,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
@@ -490,7 +491,7 @@ fn receiver_for_self_ty<'db>(
 }
 
 fn contains_illegal_impl_trait_in_trait<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
 ) -> Option<MethodViolationCode> {
     struct OpaqueTypeCollector<'db>(FxHashSet<InternedOpaqueTyId<'db>>);

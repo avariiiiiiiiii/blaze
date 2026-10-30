@@ -5,14 +5,14 @@
 
 use std::fmt::Write;
 
-use base_db::FileId;
+use base_db::{Db, FileId};
 use either::Either;
 use hir_def::{
     expr_store::{Body, ExpressionStore},
     signatures::FunctionSignature,
 };
 use hir_expand::InFile;
-use hir_ty::{InferBodyId, db::HirDatabase, mir::MirSpan};
+use hir_ty::{InferBodyId, mir::MirSpan};
 use syntax::{SyntaxNodePtr, TextRange};
 
 use super::{Checker, Frame};
@@ -22,8 +22,7 @@ use crate::{
     ub::{Found, Ub},
 };
 
-// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, found: &Found, stack: &[Frame<'db>]) -> String {
+pub(super) fn render<'db>(db: &'db Db, checker: &Checker<'db>, found: &Found, stack: &[Frame<'db>]) -> String {
     let r = Report { db, checker };
     // alloc: the edge: the report of a failure.
     let mut out = String::new();
@@ -95,8 +94,7 @@ fn site_of(column: &[SiteId], alloc: AllocId) -> SiteId {
 }
 
 struct Report<'a, 'db> {
-    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     checker: &'a Checker<'db>,
 }
 
@@ -143,8 +141,7 @@ impl<'db> Report<'_, 'db> {
 }
 
 /// The file and range of `span` in the body of `def` (as hir-ide's `mir_pretty::errors`).
-// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
-fn source_range(db: &dyn HirDatabase, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
+fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {
             let body = &Body::with_source_map(db, def).1;

@@ -30,7 +30,7 @@ mod plain;
 #[cfg(test)]
 mod tests;
 
-pub use live::Live;
+pub use live::{FRAME_NS, Live};
 pub use plain::Plain;
 
 use std::fmt;

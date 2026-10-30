@@ -51,6 +51,8 @@ impl<P: Stable> Lent<P> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     /// What is lent is the value kept, the same as a safe list read by index gives, however
@@ -62,11 +64,9 @@ mod tests {
         let mut reference = Vec::new();
         let mut lent = Vec::new();
         let mut given = Vec::new();
-        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..5000 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
+            let seed = rng.next_u64();
             reference.push(seed);
             lent.push(boxes.alloc(Box::new(seed)));
             let arc = Arc::new(seed);

@@ -92,7 +92,10 @@ In `crates/hir-def/src/deps/tests.rs`:
 
 ## Left, with who
 
-- db: declare `pub mod deps;` in `crates/hir-def/src/lib.rs` (`v2/requests/db.md`).
+- db: declare `pub mod deps;` in `crates/hir-def/src/lib.rs` (`v2/requests/db.md`); the
+  signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)); and
+  `parse_file` in `EditionedFileId::parse` from `frontend-deps-reparse` (notes:
+  [reparse.md](reparse.md)).
 - cargo-daemon: the `ImageStore` adapter over `blaze-cas`, `serve` once inputs are final,
   `store` after the build, a daily `Mode::Check` run (`v2/requests/cargo.md`).
 - usercode and db: a content ID of each proc-macro expansion's traced inputs, kept with the

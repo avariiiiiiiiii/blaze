@@ -165,22 +165,13 @@ pub(super) fn backward(
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::{GenKill, backward, forward};
     use crate::{
         bitset::{BitSet, Transfer, iter_words},
         cfg::{Cfg, block, index},
     };
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self, bound: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 % bound.max(1) as u64) as usize
-        }
-    }
 
     /// What one point does: bits it removes, then bits it adds.
     #[derive(Clone, Default)]
@@ -200,13 +191,13 @@ mod tests {
         }
     }
 
-    fn effect(rng: &mut Rng, domain: usize) -> Effect {
+    fn effect(rng: &mut SplitMix64, domain: usize) -> Effect {
         let mut out = Effect::default();
-        for _ in 0..rng.next(3) {
-            out.kill.push(rng.next(domain));
+        for _ in 0..rng.index(3) {
+            out.kill.push(rng.index(domain));
         }
-        for _ in 0..rng.next(3) {
-            out.gen_.push(rng.next(domain));
+        for _ in 0..rng.index(3) {
+            out.gen_.push(rng.index(domain));
         }
         out
     }
@@ -221,29 +212,29 @@ mod tests {
         boundary: Vec<usize>,
     }
 
-    fn case(rng: &mut Rng) -> Case {
-        let blocks = 1 + rng.next(16);
-        let domain = 1 + rng.next(150);
+    fn case(rng: &mut SplitMix64) -> Case {
+        let blocks = 1 + rng.index(16);
+        let domain = 1 + rng.index(150);
         let mut edges = Vec::new();
         for b in 1..blocks {
-            if rng.next(5) != 0 {
-                edges.push((rng.next(b), b));
+            if rng.index(5) != 0 {
+                edges.push((rng.index(b), b));
             }
         }
-        for _ in 0..rng.next(blocks * 2 + 1) {
-            edges.push((rng.next(blocks), rng.next(blocks)));
+        for _ in 0..rng.index(blocks * 2 + 1) {
+            edges.push((rng.index(blocks), rng.index(blocks)));
         }
-        let lens: Vec<usize> = (0..blocks).map(|_| 1 + rng.next(5)).collect();
+        let lens: Vec<usize> = (0..blocks).map(|_| 1 + rng.index(5)).collect();
         let cfg = Cfg::from_edges(&lens, &edges);
         let points =
             lens.iter().map(|&len| (0..len).map(|_| effect(rng, domain)).collect()).collect();
         let mut edge_effects = Vec::new();
         for (from, to) in edges {
-            if rng.next(3) == 0 && !edge_effects.iter().any(|(it, _)| *it == (from, to)) {
+            if rng.index(3) == 0 && !edge_effects.iter().any(|(it, _)| *it == (from, to)) {
                 edge_effects.push(((from, to), effect(rng, domain)));
             }
         }
-        let boundary = (0..rng.next(4)).map(|_| rng.next(domain)).collect();
+        let boundary = (0..rng.index(4)).map(|_| rng.index(domain)).collect();
         Case { cfg, domain, points, edges: edge_effects, boundary }
     }
 
@@ -363,20 +354,20 @@ mod tests {
     /// them to it one after another does.
     #[test]
     fn composed_ranges_match_walking() {
-        let mut rng = Rng(0x9e3779b97f4a7c15);
+        let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
         for round in 0..2000 {
-            let domain = 1 + rng.next(300);
+            let domain = 1 + rng.index(300);
             let mut walked = BitSet::new(domain);
-            for _ in 0..rng.next(domain) {
-                walked.insert(rng.next(domain));
+            for _ in 0..rng.index(domain) {
+                walked.insert(rng.index(domain));
             }
             let mut start = walked.words().to_vec();
             let mut transfer = GenKill::new(1, domain);
             let mut row = transfer.row(0);
-            for _ in 0..rng.next(12) {
-                let from = rng.next(domain);
-                let to = from + rng.next(domain - from + 1);
-                match rng.next(4) {
+            for _ in 0..rng.index(12) {
+                let from = rng.index(domain);
+                let to = from + rng.index(domain - from + 1);
+                match rng.index(4) {
                     0 => (walked.gen_(from), row.gen_(from)),
                     1 => (walked.kill(from), row.kill(from)),
                     2 => (walked.gen_range(from..to), row.gen_range(from..to)),
@@ -394,7 +385,7 @@ mod tests {
 
     #[test]
     fn forward_matches_a_point_at_a_time() {
-        let mut rng = Rng(0x2545f4914f6cdd1d);
+        let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
         for round in 0..400 {
             let case = case(&mut rng);
             let want = naive_forward(&case);
@@ -414,7 +405,7 @@ mod tests {
 
     #[test]
     fn backward_matches_a_point_at_a_time() {
-        let mut rng = Rng(0x853c49e6748fea9b);
+        let mut rng = SplitMix64::new(0x853c49e6748fea9b);
         for round in 0..400 {
             let case = case(&mut rng);
             let want = naive_backward(&case);

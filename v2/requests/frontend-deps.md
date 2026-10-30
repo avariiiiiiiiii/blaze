@@ -32,3 +32,808 @@ and `crates/syntax/tests/view.rs`; they need three lines in files you own.
 Answer here with a `>` line.
 
 > forwarded to frontend-deps (it is addressed there; frontend lead told by tmux).
+> applied by frontend-deps-reparse: `pub mod view;` after `pub mod ast;` in `crates/syntax-tree/src/lib.rs` and after `pub mod utils;` in `crates/syntax/src/lib.rs`; `blaze-alloc-count.workspace = true` in `crates/syntax/Cargo.toml`'s `[dev-dependencies]`. Not built.
+
+## frontend-deps-sigs: share the test lock with `deps/signatures/tests.rs` (2026-10-29)
+
+`crates/hir-def/src/deps/signatures/tests.rs` serves images through `DepImages`, the same
+process-wide state your tests turn, so its tests take your lock.
+
+- File: `crates/hir-def/src/deps/tests.rs`, L42
+- Old: `static TURN: Mutex<()> = Mutex::new(());`
+- New: `pub(super) static TURN: Mutex<()> = Mutex::new(());`
+- Why: one lock for every test that sets `DepImages`; `signatures/tests.rs` locks it as
+  `crate::deps::tests::TURN` (a child of `deps`, so `pub(super)` reaches it).
+
+Status: open
+
+> forwarded to frontend-deps (its `deps/tests.rs`; told by tmux).
+> applied by frontend-deps: `pub(super) static TURN` in `crates/hir-def/src/deps/tests.rs`. Not built.
+
+## frontend-tokens: `lazy_block_len` takes the parser's borrowed input
+
+Why: item 4 (docs/v2/plan/design/frontend.md) is to have no conversion left. The parser will
+read `parser::Tokens<'t>`, a borrowed slice of its words, so that it parses a token tree's
+words where they lie (design: docs/v2/plan/lanes/frontend/tokens.md, "Item 4"). `Parser`
+calls your `outline::lazy_block_len(self.inp, self.pos)`, so its argument has to be able to be a
+`Tokens`.
+
+What: in `crates/parser/src/outline.rs:27`, change
+`pub fn lazy_block_len(input: &Input, start: usize) -> Option<u32>` to
+`pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<u32>`, with
+`let input = input.into();` first. `Tokens` has the same `kind(i)` the body uses, and
+`From<&Input>`, so `syntax/src/parsing/reparsing.rs:440` and every other caller stay as they
+are. `Tokens` is in `crates/parser/src/input.rs` now. Or answer that I may make this one-line
+change myself, together with the `Parser` change that needs it. The grammar is unchanged:
+`Parser<'t>` keeps its signature.
+
+> forwarded to frontend-deps (told by tmux).
+> applied by frontend-deps: `lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize)` with `let input = input.into();` in `crates/parser/src/outline.rs`; `Input` import replaced by `Tokens`. Callers unchanged. Not built.
+
+## frontend-deps-sigs: the image's bytes for a store that borrows them (2026-10-29)
+
+speed-hir-store's zero-copy store decode (`v2/requests/speed-hir-store.md`, "For
+frontend-deps-sigs: decode a signature's store borrowing the image") needs the count of the
+buffer an image's stores are read from. `deps/signatures.rs` `served` now calls
+`read(db, krate, what, image.bytes(), record)`.
+
+- File: `crates/hir-def/src/deps.rs`, in `impl Image`, after `pub fn view`
+- New:
+  ```rust
+  /// The buffer the image is read from: what a value read from it in place borrows.
+  pub fn bytes(&self) -> &Arc<blaze_format::Aligned> {
+      &self.bytes
+  }
+  ```
+- Why: a store read in place keeps a count of this buffer instead of copying its columns out.
+
+Status: open
+
+> applied by frontend-deps: `Image::bytes` in `crates/hir-def/src/deps.rs`, as given. Not built.
+
+## speed-hir-sol-defs: hot_lint and budgets
+
+From `speed-hir-sol-defs` (round 2 of `speed-hir`; report `/tmp/blaze-lanes/v2-speed-hir-sol-defs.md`).
+hot_lint's findings in `crates/hir-def/src/deps/` other than `dyn SourceDatabase` (which is
+frontend-db-def's rewrite). `serve` and `store` run once per session start, so they are setup;
+error text is an error path. Old text is what to find; lines are as of 10-29 20:30.
+
+### `crates/hir-def/src/deps/image.rs`
+
+Fix: `write_image`'s part records are a fixed three, so an array, not a `Vec` per image
+(`push_slice` takes `&[T]`; `recs.len()` is the same 3):
+```rust
+    let recs: Vec<PartRec> = (Part::ALL.iter().zip(placed).enumerate())
+        .map(|(index, (&part, (bytes_at, len)))| {
+            let field = recs_at
+                + (index * size_of::<PartRec>()) as u64
+                + std::mem::offset_of!(PartRec, bytes) as u64;
+            let bytes = match len {
+                0 => Slice::EMPTY,
+                len => Slice::between(field, bytes_at, len),
+            };
+            PartRec { tag: part as u32, bytes }
+        })
+        .collect();
+```
+becomes
+```rust
+    let recs: [PartRec; Part::ALL.len()] = std::array::from_fn(|index| {
+        let (bytes_at, len) = placed[index];
+        let field = recs_at
+            + (index * size_of::<PartRec>()) as u64
+            + std::mem::offset_of!(PartRec, bytes) as u64;
+        let bytes = match len {
+            0 => Slice::EMPTY,
+            len => Slice::between(field, bytes_at, len),
+        };
+        PartRec { tag: Part::ALL[index] as u32, bytes }
+    });
+```
+
+### `crates/hir-def/src/deps/key.rs`
+
+- ~L75 `let deps: Vec<ContentId> =` (flagged at its `.collect();` on ~L76): on the line above
+  `data.dependencies.iter()..collect();`:
+  `// alloc: setup: once per crate per session`
+
+### `crates/hir-def/src/deps/serve.rs`
+
+Fix:
+- ~L121 `let mut hits = Vec::new();` becomes `let mut hits = Vec::with_capacity(order.len());`
+  (one allocation, never grown), with `// alloc: setup: once per session` above it.
+
+Justify, a comment on the line above each:
+- ~L94 `Some(name) => name.to_string(),` and ~L95 `None => format!("of root file {:?}", ..)`
+  (`crate_name`): `// alloc: error text`
+- ~L112 and ~L171 `images: &dyn ImageStore,`:
+  `// dyn: the driver's store, one call per crate per session`
+- ~L116 `let mut order: Vec<Crate> = keys.keys().copied().collect();` and ~L173-174 (`store`'s
+  `order`, flagged at `.collect();`): `// alloc: setup: once per session`
+- ~L126 `format!("reading the image of crate ..")`, ~L132 `.map_err(|why| format!(..))?;`,
+  ~L135 `return Err(format!(`, ~L188 `format!("keeping the image of crate ..")`:
+  `// alloc: error text`
+- ~L154 `let images = Arc::new(images);`: `// alloc: setup: the one input value, once per session`
+- ~L216, ~L223 and ~L229 (`refusal`'s `format!`s):
+  `// alloc: why a crate is refused, once per refused crate`
+
+Why: the coordinator's rule ("Allocation, `dyn` and clones are controlled mechanically"). The read
+path's speed of light is in `docs/v2/plan/lanes/db/speed-of-light.md`, "hir-def: attributes,
+interned locs, lang items (speed-hir-sol-defs)".
+
+Status: open
+
+## speed-hir-sol-items: hot_lint and budgets (2026-10-29)
+
+From `speed-hir-sol-items` (child of `speed-hir`). These are your files (`item_tree.rs`,
+`item_tree/`), so here are exact edits, grouped by what they do. The arithmetic is in
+`docs/v2/plan/lanes/format/speed-of-light.md`, "The item tree: `hir-def` `item_tree*`
+(speed-hir-sol-items)".
+
+hot_lint (`tools/v2/hot_lint.py`, whole workspace, 20:10) finds nothing in `item_tree*`: every
+allocation, `dyn` and clone there is justified. The edits below are costs the regex can't
+see. A, B, C and E are independent. D's tests assume A, C and E, and its decode test also
+assumes the two `hir/persist.rs` changes filed in `v2/requests/speed-hir-store.md`
+("speed-hir-sol-items"). F is a design decision for you, plus one small edit.
+
+### A. `lower.rs`: no sort of the attribute owners at `finish`
+
+Why: `finish` radix-sorts `attr_owners`. Above the sort's insertion size, that allocates a
+scratch of the owners and makes four passes, once per tree. Every owner but the top level's is
+pushed right after its item's id is made, so they arrive in id order: `lower_mod_item` lowers
+the item, then its attributes; a module's or an extern block's children, attributes included,
+come before the holder's id. Only the top level's owner (`TOP_OWNER`, the greatest) is pushed
+first, by `lower_top_attrs` / `lower_block`. Holding it aside and pushing it last gives the
+same column with no sort. An `assert!`, one compare per push, keeps the order a checked
+invariant rather than an assumption.
+
+1. Delete the import `use blaze_ids::radix;` (L10, its only use is the sort).
+2. In `struct TreeBuilder`, old:
+   ```rust
+       attr_owners: Vec<AttrOwner>,
+       attrs: Vec<Attr>,
+       cfgs: Vec<CfgExpr>,
+   }
+   ```
+   new:
+   ```rust
+       attr_owners: Vec<AttrOwner>,
+       /// The top level's owner, pushed after every item's at `finish`.
+       top_attrs: Option<AttrOwner>,
+       attrs: Vec<Attr>,
+       cfgs: Vec<CfgExpr>,
+   }
+   ```
+3. In `TreeBuilder::finish`, old:
+   ```rust
+           debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
+           radix::sort_copy_by_key(&mut self.attr_owners, |owner| owner.owner.index);
+           ItemTree {
+   ```
+   new (the `attr_index` line is edit C's; without C, leave it out):
+   ```rust
+           debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
+           self.attr_owners.extend(self.top_attrs.take());
+           let attr_index = super::attr_index(&self.attr_owners, self.kinds.len());
+           ItemTree {
+   ```
+4. In `TreeBuilder::add_attrs`, old:
+   ```rust
+           let attrs = IdRange { start: id(start), len: id(len) };
+           self.attr_owners.push(AttrOwner { owner, attrs, cfg });
+       }
+   ```
+   new:
+   ```rust
+           let attrs = IdRange { start: id(start), len: id(len) };
+           let row = AttrOwner { owner, attrs, cfg };
+           if owner == ModItemId::TOP_OWNER {
+               debug_assert!(self.top_attrs.is_none(), "the top level's attributes lowered twice");
+               self.top_attrs = Some(row);
+               return;
+           }
+           // `ItemTree::attrs` relies on the order; each item's attributes are lowered right
+           // after its id is made, so this holds without a sort.
+           assert!(
+               self.attr_owners.last().is_none_or(|last| last.owner < owner),
+               "attribute owners out of the order of their items"
+           );
+           self.attr_owners.push(row);
+       }
+   ```
+
+### B. `lower.rs`: `Scoped::seal` without clearing a big table
+
+Why: `seal` runs once per top-level item for names, paths and visibilities. `drain(..)` of a
+whole `FxIndexSet` clears its hash table (indexmap's `erase_indices`), which writes every
+control byte at the table's high-water capacity. Once a worker has lowered an inline module
+with 1 000 names, every later item it seals writes about 1 KiB, about 32 cycles against about
+170 for the item. Emptying a table much larger than its entries one entry at a time
+(`pop`, one probe each) keeps the capacity, allocates nothing and costs O(entries). The values
+come out in the same order, so the ids are the same.
+
+Old:
+```rust
+    /// Ends the item being lowered: no later value is deduplicated against its.
+    fn seal(&mut self) {
+        self.done.extend(self.scope.drain(..));
+    }
+```
+New:
+```rust
+    /// Ends the item being lowered: no later value is deduplicated against its.
+    fn seal(&mut self) {
+        match self.scope.len() {
+            0 => {}
+            // Draining clears the table, which writes every control byte of its capacity: after
+            // one item of many names, far more than taking a few entries out one by one.
+            len if len * 16 < self.scope.capacity() => {
+                let from = self.done.len();
+                while let Some(value) = self.scope.pop() {
+                    self.done.push(value);
+                }
+                self.done[from..].reverse();
+            }
+            _ => self.done.extend(self.scope.drain(..)),
+        }
+    }
+```
+
+### C. `item_tree.rs` (+ `lower.rs`, `items.rs`, `persist.rs`): `attrs(id)` in O(1)
+
+Why: `attrs(id)` is a binary search over `attr_owners`. For 500 owners that is about 9
+dependent probes with a mispredict on about half, about 100 cycles, and the def map collector
+asks it for every item (`nameres/collector.rs:2331,2933`): about 14 µs a 500-item file, more
+than lowering the file's outline costs. A rank index makes it one load, a mask, a `popcnt` and
+the owner's load. Per 64 items it stores a `u64` of which items have attributes and the count of
+those before them: 16 bytes per 64 items, 0.25 bytes an item, where a per-item `u32` column
+would cost 4. It is derived from `attr_owners`, so it is not persisted (the bytes are
+unchanged) and `PartialEq` still compares what it did. Callers are unchanged. Nothing asks
+`attrs(TOP_OWNER)` (`TOP_OWNER` is private; `pretty.rs:112` asks it per item;
+`top_level_attrs` reads the last owner).
+
+1. `item_tree.rs`, in `struct ItemTree`, old:
+   ```rust
+       /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
+       attr_owners: Box<[AttrOwner]>,
+   ```
+   new:
+   ```rust
+       /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
+       attr_owners: Box<[AttrOwner]>,
+       /// Which items have an owner in `attr_owners`, and where: made from it ([`attr_index`]),
+       /// so not written ([`persist`]).
+       attr_index: Box<[AttrBlock]>,
+   ```
+2. `item_tree.rs`, after the `ITEM_BYTES` assertion (`const _: () = assert!(ITEM_BYTES == 9);`),
+   add:
+   ```rust
+
+   /// 64 items: which of them have attributes (bit `i % 64` of item `i`), and how many items
+   /// before them do, so an item's [`AttrOwner`] is found with a `popcnt`. 16 bytes per 64 items.
+   #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+   struct AttrBlock {
+       bits: u64,
+       before: u32,
+   }
+
+   const _: () = assert!(size_of::<AttrBlock>() == 16);
+
+   /// The [`AttrBlock`]s of a tree of `items` items whose attribute owners are `owners`, sorted
+   /// and in the tree (what `persist`'s `check` holds a decoded tree to).
+   fn attr_index(owners: &[AttrOwner], items: usize) -> Box<[AttrBlock]> {
+       // alloc: the tree's column, once a tree at its length; none for a tree of no items
+       let mut blocks = vec![AttrBlock::default(); items.div_ceil(64)].into_boxed_slice();
+       for owner in owners.iter().filter(|owner| owner.owner != ModItemId::TOP_OWNER) {
+           let at = owner.owner.index as usize;
+           blocks[at / 64].bits |= 1 << (at % 64);
+       }
+       let mut before = 0;
+       for block in blocks.iter_mut() {
+           block.before = before;
+           before += block.bits.count_ones();
+       }
+       blocks
+   }
+   ```
+3. `item_tree.rs`, `ItemTree::attrs`, old:
+   ```rust
+       #[inline]
+       pub(crate) fn attrs(&self, of: ModItemId) -> Option<AttrsOrCfgRef<'_>> {
+           let at = self.attr_owners.binary_search_by_key(&of, |owner| owner.owner).ok()?;
+           Some(self.attrs_of(&self.attr_owners[at]))
+       }
+   ```
+   new:
+   ```rust
+       #[inline]
+       pub(crate) fn attrs(&self, of: ModItemId) -> Option<AttrsOrCfgRef<'_>> {
+           let block = self.attr_index.get(of.index as usize / 64)?;
+           let bit = 1u64 << (of.index % 64);
+           if block.bits & bit == 0 {
+               return None;
+           }
+           let at = block.before + (block.bits & (bit - 1)).count_ones();
+           Some(self.attrs_of(&self.attr_owners[at as usize]))
+       }
+   ```
+4. `lower.rs`, `TreeBuilder::finish`: the `let attr_index = ...` line of A.3, and in the
+   `ItemTree { .. }` literal, old:
+   ```rust
+               attr_owners: column(&mut self.attr_owners),
+               attrs: column(&mut self.attrs),
+   ```
+   new:
+   ```rust
+               attr_owners: column(&mut self.attr_owners),
+               attr_index,
+               attrs: column(&mut self.attrs),
+   ```
+   (Without A, put `let attr_index = super::attr_index(&self.attr_owners, self.kinds.len());`
+   right after the `radix::sort_copy_by_key` line.)
+5. `items.rs`, `assemble`, old:
+   ```rust
+       attr_owners.extend_from_slice(&top.attr_owners);
+
+       ItemTree {
+   ```
+   new:
+   ```rust
+       attr_owners.extend_from_slice(&top.attr_owners);
+       let attr_index = super::attr_index(&attr_owners, kinds.len());
+
+       ItemTree {
+   ```
+   and in its literal, old `        attr_owners: attr_owners.into(),` new:
+   ```rust
+           attr_owners: attr_owners.into(),
+           attr_index,
+   ```
+   This adds one allocation to every tree that has items, so `assembly_allocates_once_a_column`
+   still compares equal counts.
+6. `persist.rs`, `ItemTreeRef::decode`: old `        let tree = ItemTree {` new
+   `        let mut tree = ItemTree {`. In the literal, old:
+   ```rust
+               attr_owners: column(&root.attr_owners, buffer)?,
+   ```
+   new:
+   ```rust
+               attr_owners: column(&root.attr_owners, buffer)?,
+               attr_index: Box::default(),
+   ```
+   and old:
+   ```rust
+           check(&tree).map_err(invalid)?;
+           Ok(tree)
+   ```
+   new:
+   ```rust
+           check(&tree).map_err(invalid)?;
+           tree.attr_index = super::attr_index(&tree.attr_owners, tree.kinds.len());
+           Ok(tree)
+   ```
+   (`check` has proved each owner is in the tree or `TOP_OWNER`, so the index can't go out of
+   bounds.)
+7. Test, appended to `item_tree/tests.rs`. It checks the index against the search it replaces,
+   over every item of a tree with attributes on about two items in three, nested modules and
+   `cfg`s:
+   ```rust
+   #[test]
+   fn attributes_are_found_as_a_search_of_their_owners_finds_them() {
+       use crate::item_tree::{AttrsOrCfgRef, ModItemId};
+
+       fn same(a: AttrsOrCfgRef<'_>, b: AttrsOrCfgRef<'_>) -> bool {
+           match (a, b) {
+               (AttrsOrCfgRef::Enabled { attrs: a }, AttrsOrCfgRef::Enabled { attrs: b }) => {
+                   (a.as_ptr(), a.len()) == (b.as_ptr(), b.len())
+               }
+               (AttrsOrCfgRef::CfgDisabled(c, a), AttrsOrCfgRef::CfgDisabled(d, b)) => {
+                   std::ptr::eq(c, d) && (a.as_ptr(), a.len()) == (b.as_ptr(), b.len())
+               }
+               _ => false,
+           }
+       }
+
+       let items: String = (0..200)
+           .map(|i| match i % 3 {
+               0 => format!("#[a{i}] fn f{i}() {{}}\n"),
+               1 => format!("struct S{i};\n"),
+               _ => format!("#[cfg(false)] mod m{i} {{ #[b] fn g() {{}} fn h() {{}} }}\n"),
+           })
+           .collect();
+       let (db, file_id) = TestDB::with_single_file(&format!("#![c]\n{items}"));
+       let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+       assert!(tree.kinds.len() > 128, "more than two blocks of items");
+       for index in 0..tree.kinds.len() as u32 {
+           let id = ModItemId::new(index);
+           let searched = (tree.attr_owners.binary_search_by_key(&id, |owner| owner.owner).ok())
+               .map(|at| tree.attrs_of(&tree.attr_owners[at]));
+           match (tree.attrs(id), searched) {
+               (None, None) => {}
+               (Some(found), Some(searched)) => assert!(same(found, searched), "item {index}"),
+               (found, searched) => panic!("item {index}: {found:?} against {searched:?}"),
+           }
+       }
+       assert!(tree.top_level_attrs().is_some());
+       crate::item_tree::persist::assert_round_trip(tree);
+   }
+   ```
+
+### D. `item_tree/tests.rs`: allocation budgets
+
+Why: the coordinator's rule 3. A memo hit is already asserted at 0
+(`items/tests.rs` `trees_asked_again_allocate_nothing`). Not yet asserted: the accessors,
+`Use::expand`, a lowering on a warm builder and a decode. These need `blaze-alloc-count`'s
+allocator in hir-def's test binary, requested by speed-hir-store in `v2/requests/db.md`
+("one counting allocator for hir-def's tests"), as `items/tests.rs` does already. The fixture's
+attributes have no input, because a `Box<AttrInput>` is hir-expand's allocation (shared inputs
+are requested in `v2/requests/db-expand.md`). It has no `cfg` either, because a `CfgExpr` holds
+boxes.
+
+Append to `item_tree/tests.rs`:
+```rust
+/// A file with every kind of item, and attributes with no input.
+const EVERY_KIND: &str = r#"
+#![no_std]
+extern crate core as c;
+pub use a::{b::{c, d}, e::*, f as g};
+#[my_attr] pub(crate) struct S(pub u8, pub(in crate::m) u16);
+pub struct R { a: u8 }
+pub union U { a: u8 }
+pub enum E { A }
+pub trait T {}
+impl T for S {}
+pub type A = S;
+pub const C: u8 = 0;
+const _: () = ();
+pub static ST: u8 = 0;
+pub mod m { #[my_attr] pub fn inner() {} mod deeper; }
+extern "C" { fn ext(); static X: u8; }
+macro_rules! mac { () => {} }
+pub macro m2() {}
+mac!();
+pub fn f() {}
+"#;
+
+/// The columns of `tree` that hold anything: lowering on a warm builder and decoding allocate
+/// once for each.
+fn non_empty_columns(tree: &ItemTree) -> u64 {
+    let lens = [
+        tree.top_level.len(),
+        tree.kinds.len(),
+        tree.data.len(),
+        tree.ast_ids.len(),
+        tree.children.len(),
+        tree.consts.len(),
+        tree.enums.len(),
+        tree.extern_blocks.len(),
+        tree.extern_crates.len(),
+        tree.functions.len(),
+        tree.impls.len(),
+        tree.macro2s.len(),
+        tree.macro_calls.len(),
+        tree.macro_rules.len(),
+        tree.mods.len(),
+        tree.statics.len(),
+        tree.structs.len(),
+        tree.traits.len(),
+        tree.type_aliases.len(),
+        tree.unions.len(),
+        tree.uses.len(),
+        tree.use_trees.len(),
+        tree.use_tree_lists.len(),
+        tree.ctor_vis.len(),
+        tree.names.len(),
+        tree.paths.len(),
+        tree.vis.len(),
+        tree.attr_owners.len(),
+        tree.attr_index.len(),
+        tree.attrs.len(),
+        tree.cfgs.len(),
+    ];
+    lens.iter().filter(|&&len| len > 0).count() as u64
+}
+
+/// Reads every item under `items` through the accessors the def map collector uses; returns how
+/// many it read.
+fn read_all(tree: &ItemTree, items: &[crate::item_tree::ModItemId]) -> usize {
+    use crate::item_tree::ModKind;
+    use std::hint::black_box;
+
+    let mut read = 0;
+    for &item in items {
+        read += 1;
+        black_box((item.ast_id(tree), tree.attrs(item)));
+        match tree.index(item) {
+            ModItemKind::Mod(_, m) => {
+                black_box((tree.get_name(m.name), &tree[m.visibility]));
+                if let ModKind::Inline { items } = tree.mod_kind(m) {
+                    read += read_all(tree, items);
+                }
+            }
+            ModItemKind::ExternBlock(_, block) => read += read_all(tree, tree.items(block.children)),
+            ModItemKind::Struct(_, s) => {
+                black_box((tree.get_name(s.name), &tree[s.visibility], tree.value_ns_ctor(s)));
+            }
+            ModItemKind::Use(_, u) => {
+                black_box((&tree[u.visibility], tree.use_tree(u.use_tree).kind(tree)));
+            }
+            ModItemKind::ExternCrate(_, e) => {
+                black_box((tree.get_name(e.name), tree.import_alias(e.alias)));
+            }
+            ModItemKind::MacroCall(_, call) => {
+                black_box(&tree[call.path]);
+            }
+            other => {
+                black_box(other);
+            }
+        }
+    }
+    read
+}
+
+#[test]
+fn reading_a_tree_allocates_nothing() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    assert_eq!(read_all(tree, tree.top_level_items()), tree.kinds.len(), "every item read");
+    blaze_alloc_count::assert_at_most(0, "reading every item of a tree", || {
+        std::hint::black_box(read_all(tree, tree.top_level_items()));
+        std::hint::black_box(tree.top_level_attrs());
+    });
+}
+
+#[test]
+fn expanding_use_trees_whose_paths_are_interned_allocates_nothing() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let expand = || {
+        let mut imports = 0;
+        for &item in tree.top_level_items() {
+            if let ModItemKind::Use(_, it) = tree.index(item) {
+                it.expand(tree, |idx, path, kind, alias| {
+                    std::hint::black_box((idx, path, kind, alias));
+                    imports += 1;
+                });
+            }
+        }
+        imports
+    };
+    assert_eq!(expand(), 4, "`a::b::c`, `a::b::d`, `a::e::*` and `a::f as g`");
+    blaze_alloc_count::assert_at_most(0, "expanding the use trees again", || expand());
+}
+
+#[test]
+fn a_warm_builder_lowers_a_file_in_one_allocation_a_column() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let (file, krate) = (HirFileId::from(file_id), db.test_crate());
+    let cold = super::lower_whole(&db, file, krate);
+    let columns = non_empty_columns(&cold);
+    let warm = blaze_alloc_count::assert_at_most(columns, "lowering on a warm builder", || {
+        super::lower_whole(&db, file, krate)
+    });
+    assert_eq!(warm, cold);
+}
+
+#[test]
+fn decoding_a_tree_allocates_once_a_column() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let buffer = blaze_format::Aligned::copy_from(&blaze_format::to_bytes(tree));
+    let read = ItemTree::read(&buffer).expect("a tree written");
+    assert_eq!(read.decode().expect("a tree written"), *tree);
+    let decoded = blaze_alloc_count::assert_at_most(
+        non_empty_columns(tree),
+        "decoding a tree whose names are interned",
+        || read.decode().expect("a tree written"),
+    );
+    assert_eq!(decoded, *tree);
+}
+
+#[test]
+fn a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one() {
+    let small = "pub fn a() {}\nmod m { struct S; }\nuse x::{y, z};\n";
+    let names: String = (0..600).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    let big = format!("mod many {{\n{names}}}\n");
+    let lower = |text: &str| {
+        let (db, file_id) = TestDB::with_single_file(text);
+        owned_tree(&db, file_id.into()).1
+    };
+    let first = lower(small);
+    lower(&big);
+    assert_eq!(lower(small), first, "a tree lowered after an item of 600 names, same thread");
+}
+```
+Without C, drop the `tree.attr_index.len(),` line. Without E, the decode test fails on the
+`kinds`/`macro_calls` doubling. Without speed-hir-store's two `hir/persist.rs` changes, it
+fails on `seq`'s doubling and on the `Vec` per path. A failure there is a budget missed, not a
+flaky test.
+
+### E. `persist.rs`: `kinds` and `macro_calls` at their exact length
+
+Why: `collect::<Result<Box<[_]>, _>>()` runs through a shunt whose size hint is 0, so the `Vec`
+behind it grows by doubling and then shrinks into the box: about \(\log_2 n + 2\) allocations
+and copies per column, where `column()` makes one.
+
+In `ItemTreeRef::decode`, old:
+```rust
+        // alloc: the tree's column, once a store read, the edge
+        let kinds = (self.kinds.iter())
+            .map(|&kind| ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range")))
+            .collect::<Result<Box<[ItemKind]>, FormatError>>()?;
+```
+new:
+```rust
+        if self.kinds.iter().any(|&kind| ItemKind::from_u8(kind).is_none()) {
+            return Err(invalid("an item kind out of range"));
+        }
+        let kinds: Box<[ItemKind]> = (self.kinds.iter())
+            .map(|&kind| ItemKind::ALL[kind as usize])
+            .collect(); // alloc: the tree's column, once a store read, the edge
+```
+and old:
+```rust
+        let macro_calls = (root.macro_calls.follow(buffer)?.iter())
+            .map(|call| {
+                let expand_to = expand_to_of(call.expand_to)
+                    .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
+                let ctxt = syntax_context(call.ctxt)
+                    .ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
+                Ok(MacroCall { path: call.path, ctxt, expand_to })
+            })
+            .collect::<Result<Box<[MacroCall]>, FormatError>>()?;
+```
+new:
+```rust
+        let calls = root.macro_calls.follow(buffer)?;
+        // alloc: the tree's column, once a store read, the edge
+        let mut macro_calls = Vec::with_capacity(calls.len());
+        for call in calls {
+            let expand_to = expand_to_of(call.expand_to)
+                .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
+            let ctxt =
+                syntax_context(call.ctxt).ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
+            macro_calls.push(MacroCall { path: call.path, ctxt, expand_to });
+        }
+        let macro_calls = macro_calls.into_boxed_slice();
+```
+(`ItemKind::ALL` is private to `item_tree.rs`, and `persist.rs` is its child module, so it can
+read it. The error, its message and the order of the checks are unchanged: kinds are still
+checked before anything else is read.)
+
+Also in the `ItemTree { .. }` literal of `decode`, read the five tables through
+`Code for Box<[T]>`, which compiles today and allocates once per table once speed-hir-store's
+`Read::boxed` lands (`v2/requests/speed-hir-store.md`, "speed-hir-sol-items" 1). Old:
+```rust
+            names: words.from(root.names_at).seq()?,
+            paths: words.from(root.paths_at).seq()?,
+            vis: words.from(root.vis_at).seq()?,
+```
+new:
+```rust
+            names: words.from(root.names_at).get()?,
+            paths: words.from(root.paths_at).get()?,
+            vis: words.from(root.vis_at).get()?,
+```
+and old:
+```rust
+            attrs: words.from(root.attrs_at).seq()?,
+            cfgs: words.from(root.cfgs_at).seq()?,
+```
+new:
+```rust
+            attrs: words.from(root.attrs_at).get()?,
+            cfgs: words.from(root.cfgs_at).get()?,
+```
+Same words read, so the same values and errors.
+
+### F. `items.rs`: the per-item queries against the whole-file lowering (a decision for you)
+
+The arithmetic (speed-of-light section, "An edit"): by your own section's figures for a
+500-item file, an edit through `item_sources` → `item_fragment` → `assemble` costs about
+166 µs. Salsa verifying the 499 unchanged `item_fragment` memos adds about 14 µs. Re-lowering
+the whole outline with `lower_whole` costs about 29 µs with today's code, and its bound is about
+11 µs. Cold, the per-item path costs about 1 950 cycles an item against about 170, and about 10
+allocations an item against 31 a file.
+
+Per-item salsa queries have a floor of about 250 cycles an item per edit (a tracked struct
+matched and a memo verified), which is more than lowering the item. So they can at best tie
+the whole-file lowering. The design that beats both is the one your section's item 4 points
+at, carried through:
+1. the parse carries each top-level item's subtree hash;
+2. one query per file reuses rows by that hash, from the file's last tree kept beside salsa,
+   keyed by every input lowering reads (the item hash, ids, anchors and the crate's `cfg`
+   set);
+3. a cold file, with no last tree, is lowered whole.
+
+That reaches about 2 µs an edit and `lower_whole`'s cost cold. Until then, routing
+`HirFileId::FileId` through `lower_whole` is faster on both paths, but it would turn
+`an_edit_of_one_item_lowers_it_alone` and frontend.md item 14's "re-lowers only those items"
+around. That is your lane's call; I have not filed it as an edit.
+
+One small edit holds under either design. `hash_full` feeds the 16-byte `subtree_hash` of any
+subtree of 4 KiB or more instead of its text. The flat tree keeps those hashes (`keeps` in
+`syntax-tree/src/flat.rs`: text plus 4 bytes an element ≥ 4 096) and carries them across
+edits, so a big `macro_rules!`, macro call, `enum` or `struct` is read once, not on every edit.
+Whether a subtree is fed this way depends only on its own text length, so equal subtrees give
+equal feeds. The bytes hashed change, so the domain's version goes up.
+
+Old:
+```rust
+static ITEM: Domain = Domain::new("blaze v2 item syntax 1");
+```
+new:
+```rust
+static ITEM: Domain = Domain::new("blaze v2 item syntax 2");
+```
+Old:
+```rust
+const NODE: u8 = 0;
+const TOKEN: u8 = 1;
+const SKIPPED: u8 = 2;
+const END: u8 = 3;
+
+fn hash_full(node: &SyntaxNode, state: &mut Feed<'_>) {
+    let (tree, at) = node.flat().expect("a node of a flat tree");
+    NODE.hash(state);
+    tree.hash_subtree(at, state);
+}
+```
+new:
+```rust
+const NODE: u8 = 0;
+const TOKEN: u8 = 1;
+const SKIPPED: u8 = 2;
+const END: u8 = 3;
+const KEPT: u8 = 4;
+
+/// Subtrees of this much text keep their hash in their tree ([`FlatTree::subtree_hash`]),
+/// across edits that don't touch them.
+const KEPT_TEXT: u32 = 4096;
+
+fn hash_full(node: &SyntaxNode, state: &mut Feed<'_>) {
+    let (tree, at) = node.flat().expect("a node of a flat tree");
+    if u32::from(node.text_range().len()) >= KEPT_TEXT {
+        return (KEPT, tree.subtree_hash(at)).hash(state);
+    }
+    NODE.hash(state);
+    tree.hash_subtree(at, state);
+}
+```
+Test, appended to `items/tests.rs`. It checks that an item with a body of 4 KiB or more keeps
+its tree when another item is edited, and gets a new one when it is edited itself (your
+`items_lowered_by` counts `item_fragment` runs):
+```rust
+#[test]
+fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
+    let rules: String = (0..300).map(|i| format!("    (a{i}) => {{ {i} }};\n")).collect();
+    let text = format!("macro_rules! big {{\n{rules}}}\nfn f() {{}}\nstruct S;\n");
+    assert!(text.len() > 4096 + 32);
+    let (mut db, file) = db_of(&text);
+    crate::file_item_tree(&db, file.into(), db.test_crate());
+    assert_eq!(items_lowered_by(&mut db, file, &text.replace("struct S;", "struct T;")), 1);
+    let renamed = text.replace("struct S;", "struct T;").replace("(a7)", "(b7)");
+    assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
+}
+```
+(Read `items_lowered_by`'s signature in `items/tests.rs` before applying: as of 20:20 it is
+`fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize`.)
+
+Status: open
+
+### speed-hir-sol-defs: `serve`'s read path is serial and copies each part (design)
+
+Counted in `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def: attributes, interned
+locs, lang items (speed-hir-sol-defs)". For 300 crates and an assumed 50 MB of images, it is
+≈ 12 ms today against ≈ 0.6 ms at the bound.
+- `serve` calls `images.get` one crate at a time, so the store's read and BLAKE3 check of
+  every image run on the calling thread. The change: `ImageStore::get_many(&self, keys:
+  &[ContentId]) -> Result<Vec<Option<Arc<Aligned>>>, String>`, which lets the store adapter
+  read and verify in parallel. `serve` then loops over the results in key order, as today.
+- `Frozen { bytes: def_map.into() }` and the lang-items part copy each part into a new
+  `Arc<[u8]>`. The change: `nameres/frozen.rs`'s `Frozen` holds the image's `Arc<Aligned>`
+  and the part's byte range, so there is no copy and the image's alignment is kept.
+  `frozen.rs` is nameres' (speed-hir-sol-nameres and db-expand-names), so agree on the type
+  with them.
+
+Status: open

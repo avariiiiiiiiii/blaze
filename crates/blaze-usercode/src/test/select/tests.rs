@@ -7,7 +7,7 @@ use std::{
 
 use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
 use blaze_core::{Traced, Untraceable};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64};
 use blaze_items::CodeHash;
 
 use super::*;
@@ -69,17 +69,17 @@ impl Inputs for World {
         Ok(None)
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
-        self.env.sort();
+        self.env.sort_unstable();
         &self.env
     }
 
-    fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-        Ok(None)
+    fn names(&mut self, _: &Path, _: &mut crate::trace::Names<'_>) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
@@ -280,8 +280,8 @@ fn a_history_entry_round_trips() {
     let empty = trace::encode(&Report::Ran(None));
     assert!(Entry { traced: &empty, ..entry }.traced().is_err());
     let set = [code(1), code(2)];
-    assert_eq!(decode_reached(&encode_reached(&set)), Ok(set.to_vec()));
-    assert!(decode_reached(&encode_reached(&set)[..40]).is_err());
+    assert_eq!(decode_reached(&encode_reached(set.len(), set.iter())), Ok(set.to_vec()));
+    assert!(decode_reached(&encode_reached(set.len(), set.iter())[..40]).is_err());
 }
 
 /// A record not in normal order keeps what its normal order keeps: the order is fixed before
@@ -361,33 +361,24 @@ fn reasons_read_as_explanations() {
     assert_eq!(Why::Read(Input::Env("FOO".into())).to_string(), "read $FOO, changed");
 }
 
-fn xorshift(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 /// Seeded sets of every size around the radix sort's threshold, with repeats and with hashes
 /// that share their first four bytes (the runs sorted by the whole hash).
 fn seeded_sets() -> Vec<Vec<CodeHash>> {
-    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     let mut sets = Vec::new();
     for len in (0..200).chain([1_000, 4_096, 10_000]) {
         let mut set: Vec<CodeHash> = Vec::with_capacity(len);
         for _ in 0..len {
             let mut bytes = [0u8; 32];
-            for chunk in bytes.chunks_mut(8) {
-                chunk.copy_from_slice(&xorshift(&mut state).to_le_bytes());
-            }
-            match xorshift(&mut state) % 8 {
+            rng.fill(&mut bytes);
+            match rng.below(8) {
                 0 if !set.is_empty() => {
-                    let at = (xorshift(&mut state) % set.len() as u64) as usize;
+                    let at = rng.index(set.len());
                     set.push(set[at]);
                     continue;
                 }
                 1 if !set.is_empty() => {
-                    let at = (xorshift(&mut state) % set.len() as u64) as usize;
+                    let at = rng.index(set.len());
                     bytes[..4].copy_from_slice(&set[at].0.0[..4]);
                 }
                 2 => bytes[..4].fill(0),
@@ -427,4 +418,66 @@ fn the_identity_is_the_hash_of_each_reached_hash_in_order() {
         }
         assert_eq!(test.identity(), hasher.finish(), "{} hashes", test.reached.len());
     }
+}
+
+/// A test's identity sorts in its worker's scratch (the radix sort's buffer included, its
+/// counters on the stack) and hashes from the stack: warm, it allocates nothing, small or
+/// large.
+#[test]
+fn a_warm_identity_allocates_nothing() {
+    let small = Test { name: "tests::a".into(), reached: (0..50u8).map(code).collect(), attrs: Attrs::default(), outside: false };
+    std::hint::black_box(small.identity());
+    blaze_alloc_count::assert_at_most(0, "the identity of a test reaching 50 functions, warm", || small.identity());
+    let large = Test { reached: seeded_sets().pop().unwrap(), ..small };
+    assert_eq!(large.reached.len(), 10_000);
+    std::hint::black_box(large.identity());
+    blaze_alloc_count::assert_at_most(0, "the identity of a test reaching 10,000 functions, warm", || large.identity());
+}
+
+/// A test whose pass is kept is skipped with nothing allocated, warm: its history's end is
+/// found and read in place, its identity hashed from the worker's scratch, and the kept shape
+/// checked against the files and variables it read, each lent and hashed into the key.
+#[cfg(unix)]
+#[test]
+fn a_warm_skip_allocates_nothing() {
+    let mut store = Mem::default();
+    let mut world = World::with(1, "1");
+    let given = suite().given();
+    let a = Test { reached: (0..50u8).map(code).collect(), ..test("tests::a", &[]) };
+    let traced = reads(&mut world);
+    for took in 1..=5 {
+        pass(&mut store, given, &a, &traced, took);
+    }
+    let skipped = Decision::Skip { took: Some(Duration::from_millis(5)) };
+    assert_eq!(decide(&store, given, &a, &mut world), skipped);
+    let decision = blaze_alloc_count::assert_at_most(0, "a kept pass found and the test skipped, warm", || {
+        select(&store, given, &a, false, &mut world)
+    });
+    assert_eq!(decision.unwrap(), skipped);
+}
+
+/// Whether a test is asked for is a scan of the filter's names: nothing allocated.
+#[test]
+fn a_filter_allocates_nothing() {
+    let quick = test("parse::quick", &[1]);
+    let mut ignored = test("parse::slow", &[1]);
+    ignored.attrs.ignore = true;
+    let filters = [
+        Filter::default(),
+        Filter { names: vec!["quick".into(), "lex".into()], ..Filter::default() },
+        Filter { names: vec!["parse::quick".into()], exact: true, ..Filter::default() },
+        Filter { skip: vec!["slow".into()], ignored: Ignored::Include, ..Filter::default() },
+    ];
+    let wanted = blaze_alloc_count::assert_at_most(0, "a test's filter checked", || {
+        filters.each_ref().map(|filter| (wanted(&quick, filter), wanted(&ignored, filter)))
+    });
+    assert_eq!(
+        wanted,
+        [
+            (Wanted::Yes, Wanted::Ignored),
+            (Wanted::Yes, Wanted::Filtered),
+            (Wanted::Yes, Wanted::Filtered),
+            (Wanted::Yes, Wanted::Filtered),
+        ]
+    );
 }

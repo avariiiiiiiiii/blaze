@@ -9,12 +9,11 @@
 
 #![forbid(unsafe_code)]
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
 use super::{SymbolResolver, crate_checks_overflow};
-use hir_ty::db::HirDatabase;
 
 /// The crates of a program that differ in `-C overflow-checks`.
 pub(super) struct Mixed {
@@ -37,7 +36,7 @@ impl Mixed {
     /// `None` for a program of `built` whose crates all check alike: every copy of an
     /// instance behaves as every other, and none of this is asked.
     pub(super) fn of(
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         built: &FxHashSet<Crate>,
     ) -> Option<Mixed> {
@@ -78,7 +77,7 @@ impl Mixed {
 
     /// The crate that made the copy whose symbol ends in `id`. The standard library is built
     /// without checks.
-    pub(super) fn holder(&self, db: &dyn HirDatabase, id: u64) -> Option<Holder> {
+    pub(super) fn holder(&self, db: &Db, id: u64) -> Option<Holder> {
         let krate = *self.by_id.get(&id)?;
         Some((krate, crate_checks_overflow(db, krate).unwrap_or(false)))
     }

@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use blaze_ids::rng::SplitMix64;
 use serde::{
     Deserialize, Serialize,
     de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -12,21 +13,18 @@ use serde::{
     },
 };
 
-use super::{Error, Writer, append, from_slice, reference, to_vec};
+use super::{Error, Writer, append, from_slice, key_order, reference, to_vec};
 
-/// A small generator: the same values in every run.
-struct Random(u64);
+/// Shapes and bytes from a seed, the same in every run.
+struct Random(SplitMix64);
 
 impl Random {
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.0.next_u64()
     }
 
     fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+        self.0.below(n)
     }
 
     fn text(&mut self) -> String {
@@ -37,9 +35,7 @@ impl Random {
     }
 
     fn shuffle<T>(&mut self, items: &mut [T]) {
-        for at in (1..items.len()).rev() {
-            items.swap(at, self.below(at as u64 + 1) as usize);
-        }
+        self.0.shuffle(items);
     }
 }
 
@@ -332,7 +328,7 @@ fn same_reading(bytes: &[u8]) {
 
 #[test]
 fn every_shape_is_the_bytes_it_was() {
-    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let mut random = Random(SplitMix64::new(0x9e37_79b9_7f4a_7c15));
     let (mut written, mut refused) = (0, 0);
     for _ in 0..3000 {
         let shape = shape(&mut random, 4);
@@ -355,7 +351,7 @@ fn every_shape_is_the_bytes_it_was() {
 /// own, and a value with no encoding leaves the buffer as it was.
 #[test]
 fn a_kept_writer_writes_what_a_new_one_does() {
-    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let mut random = Random(SplitMix64::new(0x2545_f491_4f6c_dd1d));
     let mut writer = Writer::new();
     let (mut out, mut expected) = (vec![0xee], vec![0xee]);
     for _ in 0..1000 {
@@ -486,7 +482,7 @@ fn mutate(random: &mut Random, bytes: &mut Vec<u8>) {
 /// for error.
 #[test]
 fn any_bytes_read_as_the_two_passes_read_them() {
-    let mut random = Random(0x0123_4567_89ab_cdef);
+    let mut random = Random(SplitMix64::new(0x0123_4567_89ab_cdef));
     for _ in 0..4000 {
         let shape = shape(&mut random, 3);
         let Ok(mut bytes) = to_vec(&shape) else { continue };
@@ -574,4 +570,21 @@ fn a_field_is_named_only_as_text() {
     }
     let named = Typed { id: Some(7), kind: None, body: None };
     assert_eq!(from_slice::<Typed>(&[0xa1, 0x62, b'i', b'd', 0x07]), Ok(named));
+}
+
+/// Keys are ordered by their first bytes alone only where those differ, so the order is the
+/// bytes' order for any two keys, of one length or two, a prefix of the other or empty.
+#[test]
+fn keys_are_ordered_as_their_bytes_are() {
+    let mut random = Random(SplitMix64::new(0x6b65_7973));
+    let bytes = [0x60, 0x61, 0x62, 0x78, b'a', b'b', 0xff];
+    let key = |random: &mut Random| -> Vec<u8> {
+        let len = random.below(5) as usize;
+        (0..len).map(|_| bytes[random.below(7) as usize]).collect()
+    };
+    for _ in 0..20_000 {
+        let a = key(&mut random);
+        let b = if random.below(4) == 0 { a.clone() } else { key(&mut random) };
+        assert_eq!(key_order(&a, &b), a.cmp(&b), "{a:02x?} {b:02x?}");
+    }
 }

@@ -1,8 +1,8 @@
 //! Functionality for obtaining data related to traits from the DB.
 
 use crate::{RootDatabase, defs::Definition};
-use base_db::FxIndexMap;
-use hir::{AsAssocItem, HasAttrs, HasCrate, Semantics, db::HirDatabase, sym};
+use base_db::{Db, FxIndexMap};
+use hir::{AsAssocItem, HasAttrs, HasCrate, Semantics, sym};
 use syntax::{AstNode, ast};
 
 /// Given the `impl` block, attempts to find the trait this `impl` corresponds to.
@@ -160,7 +160,7 @@ fn diff_assoc_items(
 
 /// Converts associated trait impl items to their trait definition counterpart
 pub(crate) fn convert_to_def_in_trait<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: Definition<'db>,
 ) -> Definition<'db> {
     (|| {
@@ -173,7 +173,7 @@ pub(crate) fn convert_to_def_in_trait<'db>(
 
 /// If this is an trait (impl) assoc item, returns the assoc item of the corresponding trait definition.
 pub(crate) fn as_trait_assoc_def<'db>(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: Definition<'db>,
 ) -> Option<Definition<'db>> {
     let assoc = def.as_assoc_item(db)?;
@@ -185,7 +185,7 @@ pub(crate) fn as_trait_assoc_def<'db>(
 }
 
 fn assoc_item_of_trait<'db>(
-    db: &dyn HirDatabase,
+    db: &Db,
     assoc: hir::AssocItem,
     trait_: hir::Trait,
 ) -> Option<Definition<'db>> {
@@ -212,13 +212,13 @@ mod tests {
     use syntax::ast::{self, AstNode};
     use test_fixture::ChangeFixture;
 
-    use crate::RootDatabase;
+    use crate::{RootDatabase, RootDatabaseExt};
 
     /// Creates analysis from a multi-file fixture, returns positions marked with $0.
     pub(crate) fn position(
         #[rust_analyzer::rust_fixture] ra_fixture: &str,
     ) -> (RootDatabase, FilePosition) {
-        let mut database = RootDatabase::default();
+        let mut database = RootDatabase::for_tests();
         let change_fixture = ChangeFixture::parse(ra_fixture);
         database.apply_change(change_fixture.change);
         let (file_id, range_or_offset) =

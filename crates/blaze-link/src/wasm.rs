@@ -28,7 +28,7 @@ use blaze_codegen::{Arch, RelocKind};
 
 use crate::LinkError;
 use crate::model::{
-    Apply, Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer,
+    Apply, Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer,
 };
 use crate::output::{Format, NativeKind, Output, OutputKind};
 
@@ -47,11 +47,13 @@ const DEFAULT_PRIORITY: u32 = 65535;
 const STACK_POINTER: u32 = 0;
 const TABLE: u32 = 0;
 
-pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+pub(crate) fn writer(output: &Output) -> Result<Wasm, LinkError> {
     if output.format != Format::Wasm {
+        // alloc: error path
         return Err(error(format!("the wasm writer for an output of {:?}", output.format)));
     }
     if output.arch != Arch::Wasm32 {
+        // alloc: error path
         return Err(error(format!(
             "wasm: an output for {:?}; a wasm module is wasm32 (wasm32-wasip1, \
              wasm32-unknown-unknown)",
@@ -62,8 +64,9 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
     let stack = stack
         .checked_next_multiple_of(STACK_ALIGN)
         .filter(|&it| it < 1 << 32)
+        // alloc: error path
         .ok_or_else(|| error(format!("wasm: a stack of {stack} bytes, past 32-bit memory")))?;
-    Ok(Box::new(Wasm { kind: output.kind.clone(), stack }))
+    Ok(Wasm { kind: output.kind.clone(), stack }) // clone: once per link, kept by it
 }
 
 /// How the core maps a codegen relocation of wasm code (`in_code`) or data to the one the
@@ -78,6 +81,7 @@ pub(crate) fn codegen_apply(kind: RelocKind, in_code: bool) -> Result<Apply, Str
         (RelocKind::WasmMemory, true) => reloc::MEMORY_ADDR_SLEB,
         (RelocKind::WasmMemory, false) => reloc::MEMORY_ADDR_I32,
         (kind, _) => {
+            // alloc: error path
             return Err(format!(
                 "wasm: a {kind:?} relocation, where wasm code has only WasmFunction, WasmTable \
                  and WasmMemory"
@@ -91,7 +95,7 @@ fn error(what: String) -> LinkError {
     LinkError { function: None, what }
 }
 
-struct Wasm {
+pub(crate) struct Wasm {
     kind: OutputKind,
     /// The stack's size, a multiple of 16: data starts there.
     stack: u64,
@@ -99,12 +103,12 @@ struct Wasm {
 
 /// A data segment of this name, which `__start_`/`__stop_` name when it is a C identifier.
 fn named_data(name: &str) -> Class {
-    Class::Named { name: name.to_owned(), write: true, exec: false }
+    Class::Named { name: SectionName::new(name), write: true, exec: false }
 }
 
 /// A custom section of the module: placed after the heap, in no memory.
 fn custom(name: &str) -> Class {
-    Class::Named { name: name.to_owned(), write: false, exec: false }
+    Class::Named { name: SectionName::new(name), write: false, exec: false }
 }
 
 fn is_code(class: &Class) -> bool {
@@ -187,6 +191,7 @@ fn init_priority(name: &str) -> Result<Option<u32>, String> {
     match name.strip_prefix(".init_array.") {
         Some(priority) => match priority.parse::<u32>() {
             Ok(priority) if priority <= DEFAULT_PRIORITY => Ok(Some(priority)),
+            // alloc: error path
             _ => Err(format!("`{name}`: an init priority must be a number up to 65535")),
         },
         None => Ok(None),
@@ -241,12 +246,14 @@ impl Writer for Wasm {
         _tls: bool,
     ) -> Result<(Class, u32), String> {
         if exec {
+            // alloc: error path
             return Err(format!("`{name}` is a section of code: wasm code is functions"));
         }
         if let Some(priority) = init_priority(name)? {
             return Ok((Class::InitArray, priority));
         }
         if name.starts_with(".fini_array") {
+            // alloc: error path
             return Err(format!("`{name}`: wasm has no fini functions (LLVM refuses them too)"));
         }
         Ok((custom(name), 0))
@@ -285,6 +292,7 @@ impl Writer for Wasm {
 
     /// `__wasm_call_ctors` takes one unit of the code space, the heap's start none.
     fn synthetic(&self, _counts: &Counts) -> Vec<(Class, u64)> {
+        // alloc: once per link, the `Vec` `Writer::synthetic` returns
         vec![(Class::Synthetic(FUNCTIONS), 1), (Class::Synthetic(HEAP), 0)]
     }
 
@@ -302,7 +310,9 @@ impl Writer for Wasm {
     /// `__wasm_call_ctors` is written with the module ([`Writer::file`]), from the init array
     /// as it is then: its region holds one unit, which the code space counts it by.
     fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+        // alloc: error path
         module::init_functions(placed).map_err(|e| error(format!("wasm: {e}")))?;
+        // alloc: once per link, the regions' bytes `Writer::synthesize` returns
         Ok(vec![(Class::Synthetic(FUNCTIONS), vec![0]), (Class::Synthetic(HEAP), Vec::new())])
     }
 
@@ -311,7 +321,9 @@ impl Writer for Wasm {
     }
 
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
+        // alloc: error path
         let module = module::write(self, placed).map_err(|e| error(format!("wasm: {e}")))?;
+        // alloc: once per link, the one part of the `File` (the module, written whole)
         Ok(File { len: module.len() as u64, parts: vec![(0, module)] })
     }
 }

@@ -207,6 +207,7 @@ modules v2 never reaches: `units.rs`, `cached.rs`, `flight.rs`, `counted.rs`, `p
    says), so the read is a memo lookup and the dependency is recorded.
 
 > forwarded to codegen: every finding is in lane codegen's own crates (`blaze-codegen`, `hir-ty-codegen`, `hir-ty-mir`); lane codegen is still running.
+> applied by codegen-v1 (2026-10-29): checked, nothing left in hir-ty-codegen outside `v2/`: items 4 (`asm.rs` lock-free tables, `inline_of` gone) and 5 (`backend.rs` per-thread `Counts`) are in the code.
 
 ## 5. coordinator: vendor `cranelift-codegen` for sibling calls (from codegen-fold)
 
@@ -263,6 +264,15 @@ Files that import the HIR types and need no change: `mir/lower/deref_pattern.rs`
 the view keeps the name).
 
 > forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's; `hir-def` has the views now.
+
+> applied by codegen-mir (2026-10-29): every edit below, in all seven files; nothing left reads
+> `store[expr]`/`store[pat]`/`body[expr]` in `crates/hir-ty-mir`. Beyond the list: the
+> `Expr::Let` arm's `*pat` (`pattern_match(.., pat)`), `is_super_let_block`'s
+> `Expr::Ref { expr: inner, .. } => expr = inner`, the `*callee` of `extend_in` and
+> `is_promotable_unadjusted`, and three lines rewrapped to 100 columns. Not compiled (this lane
+> may not build). Blocks still pass `statements` (`Statements<'a>`) to
+> `lower_block_to_place`/`is_super_let_block`, which take `&[Statement]`: the Statement-columns
+> change.
 
 ### crates/hir-ty-mir/src/mir/lower.rs  (~150 sites)
 Store edits (old text exact; each line is every occurrence unless a line is given):
@@ -516,6 +526,38 @@ by the instrumented binary with the same report as rustc's build.
 > the coverage sections (`link.md`). The rustc differential (a reported out-of-bounds, race and
 > uninitialized read) waits on all of these and on a VM to run in.
 
+### S3. codegen-mir: `MemKind::Mmap` for anonymous `mmap` (`crates/hir-ty-mir/src/mir/eval/machine.rs`, 2026-10-29)
+
+What:
+- Add a variant `MemKind::Mmap`: memory from the shims' anonymous `mmap`, freed by `munmap`,
+  which calls `free(.., MemKind::Mmap)`.
+- `MemKind::Machine` keeps the rest of the shims' memory: errno cells, dispatch semaphores
+  (freed by `dispatch_release` with `MemKind::Machine`), TLS, the arguments and the environment.
+- In the same change, make two exact replacements in `crates/hir-ty-ub/src/check.rs` (lane
+  safety's), so the checker's matches stay exhaustive:
+  1. In `fn kind`: after `MemKind::Machine => Kind::Machine,` add `MemKind::Mmap => Kind::Mmap,`.
+  2. In `Checker::alloc`: `MemKind::Stack | MemKind::Rust | MemKind::C => Some(self.thread),`
+     becomes `MemKind::Stack | MemKind::Rust | MemKind::C | MemKind::Mmap => Some(self.thread),`.
+- `Kind::Mmap` is already in `crates/hir-ty-ub/src/memory.rs`, with its test
+  `munmap_frees_only_mmap_memory_and_neither_leaks`.
+
+Why: this ports Miri's rule exactly. Miri has a memory kind of its own for `mmap`
+(`MiriMemoryKind::Mmap`). Its race detector counts it as written by the allocating thread
+(`data_race.rs`, `VClockAlloc::new_allocation`, the arm with `Rust | Miri | C | WinHeap |
+WinLocal | Mmap`), while runtime memory such as errno is written at time zero. Its free checks
+the kind, so `munmap` of anything that `mmap` didn't make is UB ("deallocating .., which is
+machine-managed memory memory, using mmap deallocation operation"). With `mmap` folded into
+`MemKind::Machine`, an unsynchronized `munmap` on another thread isn't reported as a race with
+the mapping, and `munmap` of an errno cell or a semaphore passes. Both kinds may leak and
+neither is a leak-check root, as in Miri. Plain needs no change: the hook takes the kind as data.
+
+The other changes in your note need nothing from the checker:
+- `free` of `MemKind::Machine`: `Memory::free` already accepts it when the kinds match.
+- `Shadow::put` leaving the gap uninitialized: `Bytes::put` already does.
+- The main thread's `at_thread_exit` destructors running before `finish`: `finish` exits the
+  main thread in the race detector itself, then checks for threads left and leaks. The
+  destructors' frees and accesses come first, as Miri's TLS destructors do.
+
 ## 7. cargo: `ItemHashes::new` takes a `Send + Sync` closure
 
 Where: `crates/blaze-cargo/src/serve/unit/codegen.rs:260-265` (`names`).
@@ -739,6 +781,8 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
 - `crates/hir-ty-codegen/fncache/dispatch.rs:59` block: no SAFETY (in the \`while let\` loop). Proposed: `// SAFETY: \`it\`'s module is only used within this call to find the next outer module, and none is stored or returned (\`owners\` returns body ids), so no \`ModuleId\` leaks out of the query, as \`ModuleIdLt::to_static\` requires.`
   > done by `speed-backend-code` (2026-10-29, see `v2/requests/safety.md`): both `dispatch.rs` blocks (57, 59 then; now in `why_not`) carry a SAFETY comment naming `to_static`'s invariant; checked by safety-audit-linkgen, nothing left.
 
+> applied by codegen-v1 (2026-10-29): checked, nothing left for hir-ty-codegen or `vendor/llvm-sys/wrappers/passes.cpp`: every line above is in the code (`build.rs` forbids unsafe, `Lent` is in `lent.rs`, `arg_of` is `unsafe fn`), and `LLVMBlazeRunPasses` refuses a module of another context as `llvm.rs`'s SAFETY says.
+
 ## From requests-nodes (2026-10-29): say the crate graph as one `Event::Nodes` (core-plane.md section 6)
 
 - What: `blaze-protocol` now has `Event::Nodes { first: u32, kinds: Vec<NodeKind>, names: String,
@@ -784,6 +828,7 @@ linear and needs no change.
 
 > forwarded to codegen: `crates/hir-ty-codegen/` is its (told by tmux).
 > forwarded to codegen: `crates/hir-ty-codegen/` is its, and it is running.
+> applied by codegen-v1 (2026-10-29): `Assembled`, `Assembled::to_bytes` and `Assembled::from_bytes` are `pub` and `mod.rs` has `pub use asm::Assembled;`; fields and the module stay private.
 
 ## From speed-backend-sanitize (2026-10-29): what S2 and F2 need outside `llvm.rs`, `llvm/` and `vendor/llvm-sys/`
 
@@ -1089,6 +1134,8 @@ fn anchored(db: &dyn HirDatabase, owner: DefWithBodyId, offset: TextSize) -> Opt
 `starts` did, and `display_width` is the old sum of `column_width` (ASCII as a length plus 3
 per tab), so `Place::Anchored` is the same for every offset.
 
+> applied by codegen-v1 (2026-10-29): items 2 and 3, `mod.rs` no longer imports `column_width` and `places.rs`'s `anchor_rows`/`anchored` are on `span::LineIndex::row` and `span::display_width`.
+
 ### 4. `crates/blaze-engine`: ide-db's `line_index` -> base-db's
 
 - `src/mirdump.rs`, `impl_place`:
@@ -1138,10 +1185,11 @@ From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. For `codegen-
 statement, a `let`'s ids in `extra`), where it was a 32-byte enum in a flat array. These land
 together with that change.
 
-**Written against the text after "## speed-hir-store: hir-ty-mir onto the HIR column views"
-above is applied** (not yet applied when this was written). That section's notes "keep `*pat` /
-`*else_branch` / `*initializer` / `*expr`: a `Statement` field" are reversed by this one: apply
-that section first, then this.
+**Applies to the current `mir/lower.rs`**, with "## speed-hir-store: hir-ty-mir onto the HIR
+column views" applied (checked 2026-10-29 20:15: every old text below is in the file as written,
+`fn is_super_let_block` now at ~L3419, `fn lower_block_to_place` at ~L3438; the line numbers
+below are a few lines low). That section's notes "keep `*pat` / `*else_branch` / `*initializer`
+/ `*expr`: a `Statement` field" are reversed by this one.
 
 **The rule.** `Statement` is now `Statement<'a>`, a `Copy` view decoded from the rows, with
 today's variant and field names. `Expr::Block { statements, .. }` gives `statements:
@@ -1167,6 +1215,8 @@ Counts: 29 sites, all in `crates/hir-ty-mir/src/mir/lower.rs`, in `fn is_super_l
 `fn lower_block_to_place`. No other file of `crates/hir-ty-mir/` or `crates/hir-ty-codegen/`
 reads a HIR statement (`location.rs`, `type_name.rs`, `places.rs` match `Expr::Block` only for
 its `id`/`tail`).
+
+> forwarded to codegen (window `codegen-next1`, told by tmux).
 
 ### crates/hir-ty-mir/src/mir/lower.rs  (29)
 In `fn is_super_let_block` (~L3415-3432):
@@ -1197,3 +1247,1266 @@ replacements scoped to the function. One by one:
 - unchanged: `for statement in statements {` (~L3452), `for statement in statements.iter() {` (~L3479), `self.is_super_let_block(statements)` (~L3443), `hir_def::hir::Statement::Item(_) => (),`, the column-view section's `self.store[id].mode`, `binding_ty(id)`, `let binding = id;` (`id` from the `Pat::Bind` view).
 
 Status: open
+
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
+## From codegen-inlined (the code-generator side of the MIR inliner)
+
+Full list: `~/restart-2026-10-28/briefs/v2/codegen-inlined.requests.md`. For other lanes:
+
+- **cargo**: call `.with_policy(&policy)` on the `HirFrontend` that `generate` uses
+  (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `frontend()`, line 220). Without it every
+  v2 describe/prepare stops with "the front end was made with no policy".
+- **codegen (blaze-codegen)**: `through_slot` should refuse only `patchable` callees, not
+  tiered ones (std is MIR-inlined into every unit); a live member's LLVM tier inlines
+  patchable callees unless `Spec` says the build is live; `always_inlinable` is a salsa query
+  that reads the thread-local `building()`; `FunctionCx::always_inlinable_callee` is still
+  missing (codegen-adapter request, line 461); the v2 DWARF writer should emit
+  `Side::inlined` as `DW_TAG_inlined_subroutine`.
+
+Status: open
+
+> forwarded to cargo (`with_policy` in `serve/unit/codegen.rs`) and codegen (`through_slot`), told by tmux; nothing in requests' paths.
+
+## frontend-db: hir-ty-mir registers the MIR providers; the codegen crates take `&Db` (frontend.md item 15; 2026-10-29)
+
+> applied by frontend-db-ty (hir-ty-mir only; hir-ty-codegen and blaze-engine are
+> frontend-db-tyx's and frontend-db-edge's): items 1-4 (`compute_X`, registration in
+> `crates/hir-ty-mir/src/mir/providers.rs`, `type_name`'s `None` is a `MirEvalError::NotSupported`
+> naming the type, the crate doc) and the tool on hir-ty-mir (its test database is the alias).
+
+From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`; the hir-ty side is in
+`v2/requests/db.md`, "frontend-db: the concrete database", section 5). The memos behind
+`HirDatabase`'s MIR methods move into hir-ty (`hir_ty::providers`), because hir-ty,
+hir-ty-borrowck and blaze-items read them from below. Their code stays here and becomes the
+providers.
+
+1. In `crates/hir-ty-mir/src/mir/{lower,monomorphization,optimize}.rs` (and wherever the
+   `runtime_*` forms are), each `#[salsa::tracked(...)] pub fn X_query` that a `HirDatabase`
+   method calls (today through `impl_hir_database!`) loses its attribute and becomes
+   `pub(crate) fn compute_X`. The rename is what makes every caller that bypassed the memo
+   fail to compile; such a caller calls `hir_ty::providers::X(db, ..)` or `db.X(..)` instead.
+   The `promoted_*` queries stay tracked here, as they are. Their cycle-result fns move to
+   hir-ty with the memos.
+2. New in hir-ty-mir's `lib.rs` (or a `providers.rs`), the one registration:
+   ```rust
+   inventory::submit! {
+       hir_ty::providers::Mir {
+           mir_body: mir::lower::compute_mir_body,
+           // ... one field per moved query, and
+           interpret_mir: mir::eval::interpret_mir,
+           opaque_of_impl: mir::monomorphization::opaque_of_impl,
+       }
+   }
+   ```
+   `crates/hir-ty-mir/Cargo.toml`: `inventory.workspace = true` (the coordinator adds the
+   workspace entry, 0.3.24, the version already locked for salsa). There is no `provide()` to
+   call. rustc links a `#[used]` static from every rlib in the graph (rust-lang/rust#95604), so
+   any binary that links hir-ty-mir has the table, and one that doesn't panics on the first MIR
+   miss, naming what to link.
+3. `db.type_name(ty, module)` returns `Option<String>` now. The `type_name` intrinsic in
+   `mir/eval` turns `None` into a `MirEvalError` that names the type. The old body's fallback
+   to the human-readable display (`impl_db_macro.rs` L267-275) goes, because rustc's
+   `type_name` is always the path.
+4. The module doc at `lib.rs:6` ("`impl_hir_database!` implements with them") becomes "hir-ty
+   declares the memos (`hir_ty::providers`); this crate registers their code".
+5. Run `tools/v2/concrete_db.py` on `hir-ty-mir`, `hir-ty-codegen` (its `mod.rs` and `v2/`)
+   and `blaze-engine` (dry run: 170, 382 and 19 sites; 2, 3 and 1 left, each printed with what
+   to do):
+   ```sh
+   PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \
+     '{"root": ".", "crates": ["hir-ty-mir"], "write": true}'
+   ```
+   blaze-engine's `Cargo.toml` needs `base-db.workspace = true`. Test databases become
+   `type TestDB = base_db::Db;` made by `Db::for_tests()` (the tool rewrites
+   `TestDB::default()`), and their `impl_hir_database!` goes.
+   `optimize/inline/fixtures.rs` is one of them.
+
+> applied by frontend-db-tyx (item 5, hir-ty-codegen only): the tool (383 sites); `v2/tests/db.rs`
+> is `pub(crate) type TestDB = base_db::Db;` with `use hir as _;`; `Databases` in
+> `v2/frontend.rs` holds `&'db Db` (the tool had written `&'db (Db + Sync)`). The tool's third
+> note, `v2/fold.rs:1007`, is an `as &dyn Fn`, not a database, and stays. No caller bypasses a
+> moved memo: the direct calls left are `*_promoted_mir_body_query` (still tracked in hir-ty-mir)
+> and the unmemoized `interpret_mir`.
+
+Why: a memo hit on `&Db` is a static call with no vtable (frontend.md item 15). The table is
+read only on a miss.
+
+Status: open
+
+> forwarded to codegen (codegen-next1 told). The root `inventory = "0.3.24"` is in (requests).
+
+## dedup: rename `hir-ty-codegen`'s IR-emitting `align_up` (from dedup-mem)
+
+`crates/hir-ty-codegen/mod.rs:8697` `fn align_up(&mut self, value: Value, align: Value) -> Value`
+emits Cranelift instructions (`iadd_imm`, `iadd`, `band_not`); it is not a copy of
+`blaze_mem::align::align_up` (a number), which the tree now has one of. Rename it
+`emit_align_up` (definition and its three calls, lines 8671, 8673, 8727), so the name `align_up`
+means one thing in the tree.
+
+Status: open
+> applied by codegen-v1 (2026-10-29): `FunctionCx::align_up` is `emit_align_up`, definition and its three calls in `mod.rs`.
+
+## From codegen (lead): what Z1, Z2 and `Spec::mir_inline` change outside codegen's crates (2026-10-29)
+
+Codegen landed Z1 (`Sanitize` in `Spec` and `Policy`), Z2 (`CompiledFunction::coverage`,
+`Target::Coverage`) and `Spec::mir_inline`. These sites in other lanes don't build until
+they change:
+
+1. lane cargo, `crates/blaze-cargo/src/serve/unit/codegen.rs:188`: the `Policy` gets
+   `sanitize`, from the unit's `-Zsanitizer=` (`ADDRESS`, `THREAD`, `MEMORY`),
+   `-Zsanitizer-recover=`, `-Zsanitizer-memory-track-origins` and `-Cpasses=sancov-module` with
+   `-Cllvm-args=-sanitizer-coverage-*` (`Coverage`, canonical as documented in
+   `blaze-codegen/src/settings.rs`). Without those flags it is `Sanitize::default()`. The same
+   file makes the `HirFrontend` it builds with: call `.with_policy(&policy)` on it
+   (`hir-ty-codegen/v2/frontend.rs:126`), or every function fails with "the front end was made
+   with no policy".
+2. lane lazy, `crates/blaze-lazy/src/tests.rs:25`: `sanitize: Sanitize::default()` in the
+   `Policy`, and `coverage: None` in its two `CompiledFunction` literals.
+3. lane global, `crates/blaze-global/src/public.rs:550`: the test `Spec` gets
+   `mir_inline: false, sanitize: Sanitize::default()`.
+4. lane link:
+   - `crates/blaze-link/src/stage.rs:170` `wide`: an arm for `Target::Coverage(array)`. It is
+     the function's own array, so it is keyed by the function's key and the array, never
+     shared between functions. `CompiledFunction::coverage` gives each array's size.
+   - The link lays the arrays out in `__sancov_cntrs`, `__sancov_bools` and
+     `__sancov_guards`, and the PC table in `__sancov_pcs` (`v2/requests/link.md`, "From
+     speed-backend-sanitize").
+   - `coverage: None` in the `CompiledFunction` literals of `src/tests.rs` (2) and
+     `src/tests/ties.rs` (1).
+5. lane premap:
+   - `crates/blaze-premap/src/key.rs:342` `target_into`: an arm for `Target::Coverage(array)`
+     under a new tag. A premapped image of covered code keys on it.
+   - `src/model.rs:193`: an arm that places the function's own array.
+   - `coverage: None` in the two literals of `src/tests.rs`.
+
+Also:
+- Code dedupe (`blaze-codegen/src/dedupe.rs`) never merges a function that has `coverage`:
+  two copies would share counters.
+- A static that names a coverage array is refused (`TemplateError::Coverage`).
+- `CODE_DOMAIN`, `TARGET_DOMAIN`, `TEMPLATE_DOMAIN` and the template blob magic (`BZT3`) are
+  bumped, so no older entry is read as a newer one.
+
+Status: open
+
+> forwarded: 1 to cargo, 2, 3 and 5 to fastcompile (lazy, global, premap), 4 to requests-link-fuzz (holds blaze-link). Each told by tmux.
+
+## From speed-link-edge-sol-live: level-2 counters share cache lines across functions (`hir-ty-codegen/tier.rs` `count`, and whoever picks `first`)
+
+Status: open, does not block. For lead `codegen`. See "The live runtime" in
+`docs/v2/plan/lanes/link/speed-of-light.md`, "The sampler's counters".
+
+`count` makes each counted function `call blaze_live_counters()` at entry, then a plain
+`load; iadd_imm 1; store` per counter, into `first .. first + 1 + 2 * branches` of one
+`[u64; 65536]`. Functions' ranges are packed one after another, so eight counters share a
+64-byte line (sixteen a 128-byte pair, which x86 and arm64 prefetch together), and two hot
+functions on two threads write one line: each add then waits for the line to come from the other
+core (about 50 to 100 ns on one socket, against about one cycle for an add to a line the core
+owns). The adds are also not atomic, so two threads in the same function lose counts, and the
+sampler's relaxed loads race them (item 12 d of `v2/requests/link.md`).
+1. Start every function's range on a multiple of 16 counters (128 bytes): `first` rounded up
+   where ranges are handed out, so no two functions share a line pair. That costs at most 15
+   counters per function of the 65536.
+2. Make the add `atomic_rmw add` with relaxed ordering (`ldadd` / `lock xadd`), so no count is
+   lost and the sampler's loads don't race. It costs nothing more while one thread runs the
+   function, the case 1 leaves.
+3. The bound, if one function is hot on many threads at once: a block of counters per thread,
+   summed by the sampler. That needs `blaze_live_counters` to hand out a thread's own block and
+   the sampler to know every block; ask blaze-live's owner if 1 and 2 measure short.
+
+## dedup: blaze-engine off memmap2, onto blaze_core::fs::Mapped
+
+From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). Every read-only file map moves onto
+one type, `blaze_core::fs::Mapped` (`crates/blaze-core/src/fs/mapped.rs`): the same `MAP_SHARED`
+`PROT_READ` map, `Deref<Target = [u8]>` like `memmap2::Mmap`, an empty file maps nothing, and
+`MapOptions` for `populate`, huge pages and `madvise`. memmap2 then leaves the workspace.
+
+1. `crates/blaze-engine/src/link.rs:456`, before:
+
+       let bytes = unsafe { memmap2::Mmap::map(&file) }
+           .with_context(|| format!("reading {}", exe.display()))?;
+
+   after:
+
+       let bytes = unsafe { blaze_core::fs::Mapped::map(&file) }
+           .with_context(|| format!("reading {}", exe.display()))?;
+
+   (The SAFETY comment above it stays as it is.)
+2. `crates/blaze-engine/src/lib.rs:1366`, before:
+
+       let Ok(bytes) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+
+   after:
+
+       let Ok(bytes) = (unsafe { blaze_core::fs::Mapped::map(&file) }) else { continue };
+
+3. `crates/blaze-engine/Cargo.toml`: delete `memmap2 = "0.9"` (line 50) and add
+   `blaze-core.workspace = true` to `[dependencies]` (it has it only through blaze-cargo and
+   blaze-splice today; blaze-core depends on none of blaze-engine's crates).
+
+`&bytes` and `&*bytes` read as `&[u8]` exactly as with `Mmap`, so nothing else changes.
+
+Status: open
+
+
+## dedup: hir_def::test_items
+
+From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). The fixture lookups
+`declarations`, `function`, `alias`, `static_named`, `constant` are written again in four test
+modules of this lane's crates; the one copy is `hir_def::test_items` (`v2/requests/db.md`,
+`## dedup: hir_def::test_items`; same bodies, same panic messages). Each copy becomes a wrapper
+binding the fixture's crate, so no call site changes. Apply once db lands it.
+
+- `crates/hir-ty-codegen/v2/hashes/tests.rs`: replace `fn declarations`, `fn function` and `fn alias`
+  (lines 34-74, with their `#[track_caller]`s) with
+  ```rust
+  #[track_caller]
+  fn function(db: &TestDB, name: &str) -> FunctionId {
+      hir_def::test_items::function(db, db.test_crate(), name)
+  }
+
+  #[track_caller]
+  fn alias(db: &TestDB, name: &str) -> TypeAliasId {
+      hir_def::test_items::type_alias(db, db.test_crate(), name)
+  }
+  ```
+  (nothing else in the file calls `declarations`); drop imports left unused
+  (`crate_def_map`, `FunctionSignature`, `TypeAliasSignature`, `ModuleDefId` if so).
+- `crates/hir-ty-codegen/v2/refs/tests.rs`: replace `fn declarations`, `fn function` and
+  `fn static_named` (lines 93-133) with
+  ```rust
+  #[track_caller]
+  fn function(db: &TestDB, name: &str) -> FunctionId {
+      hir_def::test_items::function(db, db.test_crate(), name)
+  }
+
+  #[track_caller]
+  fn static_named(db: &TestDB, name: &str) -> StaticId {
+      hir_def::test_items::static_item(db, db.test_crate(), name)
+  }
+  ```
+  (same import cleanup).
+- `crates/hir-ty-codegen/v2/tests.rs` 122-138: `fn function` becomes the same three-line
+  `hir_def::test_items::function(db, db.test_crate(), name)` wrapper.
+- `crates/hir-ty-mir/tests/mir/main.rs`: replace `fn declarations`, `fn function` and `fn constant`
+  (lines 25-66) with
+  ```rust
+  #[track_caller]
+  fn function(db: &TestDB, name: &str) -> FunctionId {
+      hir_def::test_items::function(db, db.test_crate(), name)
+  }
+
+  #[track_caller]
+  fn constant(db: &TestDB, name: &str) -> ConstId {
+      hir_def::test_items::constant(db, db.test_crate(), name)
+  }
+  ```
+  and drop `ModuleDefId`, `nameres::crate_def_map`, `signatures::{ConstSignature, FunctionSignature}`
+  from its `use hir_def::{..}` if nothing else there uses them.
+
+These take `&TestDB` as `&Db`: `hir-ty-codegen`'s is already `type TestDB = base_db::Db;`;
+`hir-ty-mir/tests/mir/db.rs` is still a struct, which frontend-db-ty is turning into the same
+alias (common.md, "The database is concrete").
+
+Status: open
+
+## dedup: blaze-engine's build-script SHA-256 onto blaze-sha256
+
+From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). The four SHA-256 copies
+(`blaze-cargo/build.rs`, `blaze-engine/build.rs`, `blaze-link/src/macho/sha256.rs`,
+`blaze-splice/src/sha256.rs`) are now one crate, `crates/blaze-sha256` (no dependencies;
+`digest`, `fast`, and a streaming `Sha256` with `new`/`update`/`finish` that never allocates;
+SHA-NI on x86-64, ARMv8 SHA-256 on aarch64, portable otherwise; every copy's tests moved there plus
+a proptest against the build scripts' copy). Its workspace dependency line is requested in
+`v2/requests/coordinator.md` ("## dedup: workspace dependency `blaze-sha256`").
+
+1. `crates/blaze-engine/Cargo.toml`: add
+
+       [build-dependencies]
+       blaze-sha256.workspace = true
+
+2. `crates/blaze-engine/build.rs`:
+   - doc lines 12-14, before: "The SHA-256 is written here rather than taken from `sha2`: a
+     build dependency is built for the machine that builds, and `tools/nix/units` holds one graph
+     per target computed on Linux, where `sha2`'s `cpufeatures` needs no `libc`, which it needs on
+     Apple's aarch64."
+     after: "The SHA-256 is `blaze-sha256`'s, which has no dependencies, rather than `sha2`'s: a
+     build dependency is built for the machine that builds, and `tools/nix/units` holds one graph
+     per target computed on Linux, where `sha2`'s `cpufeatures` needs no `libc`, which it needs on
+     Apple's aarch64."
+   - after `use std::path::{Path, PathBuf};` add a blank line and `use blaze_sha256::Sha256;`.
+   - delete everything from `/// SHA-256 (FIPS 180-4).` (line 168) to the end of the file. The
+     call sites (`Sha256::new()`, `hash.update(..)` inside the `field` closure, `hash.finish()`)
+     are unchanged.
+
+## dedup: hir-ty-codegen/v2/fold.rs's hasher forwarders and SplitMix64 onto blaze-ids
+
+From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). `hir-ty-codegen` already
+depends on `blaze-ids`. New in `blaze-ids`: the macro `blaze_ids::fixed_width_writes!()`
+(`crates/blaze-ids/src/std_hash.rs`: the `write_u8`..`write_isize` methods of a
+`std::hash::Hasher`, each the little-endian bytes through `self.write`, `usize`/`isize` as 64 bits,
+the same bytes `Le` writes) and `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src/rng.rs`; its
+`below(n)` is `mix(state += GAMMA) % n`, the same stream `Draws::below` draws).
+
+1. `crates/hir-ty-codegen/v2/fold.rs`, `impl std::hash::Hasher for Le<'_>` (about lines 273-327):
+   keep `finish` and `write`; replace `write_u8` through `write_isize` (twelve methods) by the one
+   line `blaze_ids::fixed_width_writes!();`. The doc on `struct Le` stays.
+
+2. Same file, test module, `struct Draws` (about line 1400):
+
+   before:
+
+       struct Draws {
+           state: u64,
+           count: u32,
+           mutate: Option<u32>,
+       }
+
+       impl Draws {
+           fn new(seed: u64, mutate: Option<u32>) -> Draws {
+               Draws { state: seed, count: 0, mutate }
+           }
+
+           fn below(&mut self, n: u32) -> u32 {
+               self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+               let mut z = self.state;
+               z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+               z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+               let value = ((z ^ (z >> 31)) % u64::from(n)) as u32;
+
+   after:
+
+       struct Draws {
+           rng: blaze_ids::rng::SplitMix64,
+           count: u32,
+           mutate: Option<u32>,
+       }
+
+       impl Draws {
+           fn new(seed: u64, mutate: Option<u32>) -> Draws {
+               Draws { rng: blaze_ids::rng::SplitMix64::new(seed), count: 0, mutate }
+           }
+
+           fn below(&mut self, n: u32) -> u32 {
+               let value = self.rng.below(u64::from(n)) as u32;
+
+   (the rest of `below` unchanged; the doc "SplitMix64. With `mutate`, ..." stays). Same draws for
+   every seed, so no test's inputs change.
+
+
+## speed-hir-store-paths: paths as columns (2026-10-29)
+
+From `speed-hir-store-paths-consumers` (child of `speed-hir-store-paths`). hir-def's paths and
+generic arguments are columns now (`crates/hir-def/src/expr_store/path.rs`; the API is in
+`/tmp/blaze-lanes/v2-speed-hir-store-paths.md`, "The API"): `Path<'a>`, `GenericArgs<'a>`,
+`AssociatedTypeBinding<'a>`, `PathGenericArgs<'a>` and `Bindings<'a>` are `Copy` views decoded
+from the store; `TypeBound` and `WherePredicate` are `Copy` records whose `for<..>` binders and
+`use<..>` arguments are runs (`Names`, `UseArgs`) read with `store.names(..)` and
+`store.use_args(..)`. Apply these with the paths lane's own edits to `hir.rs`/`expr_store*`
+(one compile). Nothing here is built (common.md).
+
+The consumer rule:
+
+1. `&Path` parameters and fields become `Path<'_>` (by value; `Copy`). Where a function keeps
+   `&Path<'_>`, callers pass `&path`. `&store[p]` / `&map[p]` for a `PathId` -> `store.path(p)`.
+2. `Path::Normal(it) => &it.mod_path` -> `it.mod_path` (already a reference).
+   `it.generic_args` / `it.type_anchor` field reads are unchanged.
+3. `generic_args()` yields slots by value: `.into_iter().flatten().flatten()` still gives
+   `GenericArgs<'_>`; `.iter().any(Option::is_some)` -> `.iter().any(|it| it.is_some())`;
+   `generic_args()?.last()?.as_ref()?` -> `generic_args()?.last()??`; `&generic_args[i]` ->
+   `generic_args.get(i)`.
+4. `&GenericArgs` parameters -> `GenericArgs<'_>`; `Option<&GenericArgs>` -> `Option<GenericArgs<'_>>`
+   (drop `.as_ref()`/`.as_deref()`; `*args` -> `args`). `args.bindings.iter()`, `for b in
+   &args.bindings`, `.first()`, `.is_empty()`, `.len()` keep working; `bindings[i]` ->
+   `bindings.get(i).unwrap()` (or restructure), `&*bindings`/`bindings.as_ref()` -> iterate.
+5. `binding.args.as_ref()` -> `binding.args`; `&binding.bounds` / `binding.bounds.iter()`
+   unchanged (`&'a [TypeBound]`).
+6. `TypeBound::ForLifetime(lifetimes, path)`: `lifetimes` is `Names`; read with
+   `store.names(lifetimes)`. `TypeBound::Use(args)`: `store.use_args(args)`. `bound.clone()` ->
+   `*bound`; `&TypeBound::Path(p, m)` patterns keep working.
+7. `WherePredicate::TypeBound { lifetimes: Some(l), .. }`: `l` is `Names`; `store.names(l)`.
+8. `Path::from_known_path_with_no_generic(m)` -> `Path::from_known_path_with_no_generic(&m)`
+   (bind the `ModPath` to a local if it is a temporary used past the statement).
+9. `path.qualifier()` gives `Qualifier<'_>`: use `.path()` for a `Path<'_>` (bind the
+   qualifier to a local first: `let q = path.qualifier()?; let q = q.path();`).
+
+Applied the same way everywhere, so that callers in one crate agree with signatures in another:
+every `&Path`, `Option<&GenericArgs>`, `&GenericArgs`, `&[Option<GenericArgs>]` parameter,
+field and return becomes the by-value view, hir-def's `Resolver::resolve_path_in_*` and
+`record_path_uses` and hir-ty's path lowering included. Bodies are by-value views
+(`store.expr(id) -> Expr<'_>`), so `Expr::Path(p)` binds `p: Path<'_>` and most call sites
+keep their text. Also `args.args` is `&[GenericArg]` now, so `for arg in &args.args` becomes
+`for arg in args.args` (`&&[T]` is not `IntoIterator`).
+
+The edits assume, from the paths lane: `Expr::Path`/`Pat::Path`/`RecordLit`/`Pat::Record`/
+`Pat::TupleStruct` hold `Path<'a>`; `Expr::MethodCall { generic_args: Option<GenericArgs<'a>> }`;
+`AsmOperand::Sym(PathIdx)` read with `store.path_at(idx)` (both `pub`); `Index<PathId> for
+ExpressionStore` removed; `StoreVisitor::on_path`/`on_generic_args`/`on_type_bound` taking the
+views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
+
+Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
+old text (where the same text is on several lines, the function named beside it picks).
+
+
+### crates/hir-ty-mir/src/mir/lower.rs
+
+- line 660-669 (`asm!` `sym` operand; `operand: &AsmOperand`, so `path: &PathIdx`):
+
+```old
+                                self.db,
+                                path,
+                                HygieneId::ROOT,
+```
+
+```new
+                                self.db,
+                                self.store.path_at(*path),
+                                HygieneId::ROOT,
+```
+
+- line 813: `path: p.clone(),` -> `path: p.mod_path().copied(),`
+- line 1360: `path: path.clone(),` -> `path: path.mod_path().copied(),`
+- line 2161: `path: c.clone(),` -> `path: c.mod_path().copied(),`
+
+### crates/hir-ty-mir/src/mir/lower/pattern_matching.rs
+
+- line 598: `path: p.clone(),` -> `path: p.mod_path().copied(),`
+
+### crates/hir-ty-mir/src/mir/eval.rs
+
+- line 5324: `&hir_def::expr_store::path::Path::from_known_path_with_no_generic(path![std::fmt::format]),` -> `hir_def::expr_store::path::Path::from_known_path_with_no_generic(&path![std::fmt::format]),`
+  (the `path!` temporary lives to the end of the `let .. else`; the result borrows nothing)
+
+### No change (checked)
+
+- hir-ty-mir: `lower/as_place.rs`, `lower/match_tree.rs` (`Pat::Path(_)`, `Pat::TupleStruct
+  { args, ellipsis, .. }`, `Pat::Record { args, .. }`: no path read), `const_check.rs`
+  (`Expr::MethodCall { .. }`), `type_name.rs` (`StoreVisitor` impl overrides only `on_expr`,
+  `on_anon_const_expr`, `on_pat`), `monomorphization.rs`, `optimize.rs`, `pretty.rs` (MIR's
+  `AsmOperand::Sym`), `lower.rs` `Expr::MethodCall { receiver, args, method_name, .. }` (no
+  `generic_args`), `names_constructor`'s `path.is_self_type()`, every other listed file
+  (`next_solver` `GenericArgs` only).
+- hir-ty-codegen: no hir-def path, generic-argument or bound use anywhere in the crate. Every hit
+  is `next_solver`/`rustc_type_ir` `GenericArgs`, MIR's `AsmOperand::Sym`, `std::path::Path` or
+  the symbol table's `symbols.path(..)`.
+- blaze-engine (`lib.rs`, `doctest.rs` and the rest): `std::path::Path` and syntax `ast` paths
+  (`call.path()`, `path.qualifier()` at lib.rs ~L2224-2276) only. `DOES_NOT_COMPILE`'s
+  `"UnresolvedName"` (lib.rs L6366) matches the variant name, so the field change below keeps it
+  working.
+
+Status: open
+
+## dedup: one type identity (hashes.rs onto hir-ty-share)
+
+From `dedup-scan-ident` (lane `dedup`), 2026-10-29. Notes:
+`docs/v2/plan/lanes/dedup/scan-ident.md`.
+
+This is paired with `v2/requests/fastcompile-ident-share.md`, `## dedup: one type identity for
+the code generator and the share key`, which has the full reasoning, the shared code and the
+differential test. Apply that one first, since this one calls what it makes public. The
+fastcompile request 1 (the share key in `Described::args`) adds the same `hir-ty-share`
+dependency.
+
+**Why.** `v2/hashes.rs`'s `Spell`, `adt_content` and `variants` are a copy of
+`hir-ty-share/src/identity.rs`: the scan found seven runs, the same walk tag for tag. Also,
+`FunctionCx::is_plain_data` (`mod.rs`) is a copy of `hir-ty-share/src/fact.rs`'s.
+
+The two type spellings tell the same types apart within one revision, but not across an edit:
+share's old one spelled a coroutine by `blaze_items::coroutine_code` alone, without its binding
+names. This crate's spelling is the finer one, because `Hashes::ty` is also the `TypeId` value
+(`places.rs` `fill_type_ids`) and the debug-info type (`side::Variable::ty`), and a coroutine's
+debug info names its saved locals. With the share key in `Described::args`, the coarser spelling
+would miss an input of the cache key.
+
+The fix is one spelling, this crate's semantics, in `hir_ty_share::identity`. The body code
+(`with_spans`, `names`, `table_of`, `item_code`, `closure_code_in`, `coroutine_code_in`,
+`by_move_code_in`) moves with it, verbatim, into `hir_ty_share::code`, because a coroutine's
+identity holds its compiled code. Consequences:
+
+- `Hashes::code` values do not change: same bytes, same domains.
+- `Hashes::ty` and `Hashes::konst` values change: new domains, and the FnPtr ABI is spelled as
+  share's (`Debug` text ended by `0xff`). The types they tell apart do not change; share's
+  differential test checks this.
+- Error strings become `Unshared`'s `Display`, for example `no content: a type with an error`.
+
+`hashes.rs` is being moved to `&Db` by `frontend-db` right now. The text below is written
+against that `&Db` state; apply it after that edit lands, or merge by function name.
+
+### 1. `crates/hir-ty-codegen/Cargo.toml`
+
+Under `[dependencies]`, after `hir-ty-mir.workspace = true`, add the line below (it is the
+same line as fastcompile request 1; add it once):
+
+```toml
+hir-ty-share.workspace = true
+```
+
+No cycle: `hir-ty-share` depends on `base-db`, `hir-def`, `hir-ty`, `hir-ty-mir`, `blaze-ids`
+and `blaze-items`, and none of these depends on `hir-ty-codegen`.
+
+### 2. `crates/hir-ty-codegen/v2/hashes.rs` (replace the whole file)
+
+Deleted from today's file:
+
+- the domains `TY_DOMAIN`, `CONST_DOMAIN`, `ADT_DOMAIN`, `CODE_DOMAIN`, `DISCRIMINANT_DOMAIN`
+  and `NAMES_DOMAIN` (nothing outside this file names them);
+- the table constants `EXPRS` to `UNKNOWN` and `TABLES`, now `hir_ty_share::code::*`;
+- `ITEM`, `CLOSURE`, `COROUTINE`, `BY_MOVE`;
+- `table_of`, `unhashable`, `with_spans`, `names`, `no_mir`, `item_code`, `closure_code_in`,
+  `coroutine_code_in`, `by_move_code_in`, `adt_content`, `variants` and `Spell`.
+
+Kept: `SPAN_DOMAIN`, `DECLARATION`, `ItemHashes`, `Anchors`, `anchors`.
+
+```rust
+//! [`super::Hashes`] over the front end's code identity: what the code generator puts in place
+//! of the database's dense ids.
+//!
+//! - A body's code is [`hir_ty_share::code`]'s: its item's code hash, which takes each callee by
+//!   its interface hash, with its bindings' names and the positions its MIR names (the spans of
+//!   [`ItemHashes::span`]) beside it: a template that names an expression by its id is never
+//!   reused once that id is another expression's.
+//! - A type or constant is [`hir_ty_share::identity`]'s spelling by content, the one the share
+//!   key reads too: an ADT by its key, its interface, its layout and what drop glue reads of
+//!   it, a coroutine by its compiled code, and its arguments the same way. Regions are left out.
+//! - A position is a [`SpanRef`] into one of the tables of the body's owner, one per kind of
+//!   span ([`hir_ty_share::code::table_of`]), indexed by the span's id in the owner's store: an
+//!   edit elsewhere in the file moves no index, and a formatting edit changes the table only
+//!   ([`ItemHashes::span_tables`]).
+//!
+//! Nothing here is shared between threads but salsa's memos: no lock on any path.
+
+#[cfg(test)]
+mod tests;
+
+use base_db::Db;
+use blaze_format::SpanRef;
+use blaze_ids::{ContentId, Hasher};
+use blaze_items::{CodeHash, ItemId, ItemKey, item_key, key};
+use hir_def::{DefWithBodyId, ExpressionStoreOwnerId, FunctionId, expr_store::Body as BodyStore};
+use hir_ty::{
+    db::{InternedClosureId, InternedCoroutineId},
+    next_solver::{Const, Ty},
+};
+use hir_ty_mir::mir::MirSpan;
+use hir_ty_share::{
+    code::{self, TABLES},
+    identity,
+};
+use salsa::plumbing::FromId;
+
+use super::{Body, Hashes};
+
+pub const SPAN_DOMAIN: &str = "blaze v2 codegen span table 1";
+
+/// The table of a function's declaration, apart from its body's.
+const DECLARATION: u8 = TABLES as u8;
+
+/// The items lane's hashes as the code generator asks for them, and what the program calls
+/// each file.
+pub struct ItemHashes {
+    names: Box<dyn Fn(base_db::FileId) -> Option<String> + Send + Sync>,
+}
+
+impl ItemHashes {
+    /// `names` says what the program calls a file (`file!()`): its path relative to its
+    /// package's root, `None` for a file the build did not name.
+    pub fn new(names: Box<dyn Fn(base_db::FileId) -> Option<String> + Send + Sync>) -> ItemHashes {
+        ItemHashes { names }
+    }
+
+    /// Every span table of `owner`'s body that [`Hashes::span`] names, by its anchor: the span
+    /// at each index, for the linker's table to give the position of
+    /// (`hir_ty_mir::mir::location::source_location_in_file`). A span that function finds no syntax for
+    /// (a binding, the self parameter, [`MirSpan::Unknown`]) is where its owner is. The tables
+    /// are in [`code::table_of`]'s order.
+    pub fn span_tables(db: &Db, owner: DefWithBodyId) -> Vec<(ContentId, Vec<MirSpan>)> {
+        let anchors = anchors(db, owner).0;
+        let store = BodyStore::of(db, owner);
+        let spans: [Vec<MirSpan>; TABLES] = [
+            store.exprs().map(|(it, _)| MirSpan::ExprId(it)).collect(),
+            store.exprs().map(|(it, _)| MirSpan::ExprEnd(it)).collect(),
+            store.pats().map(|(it, _)| MirSpan::PatId(it)).collect(),
+            store.bindings().map(|(it, _)| MirSpan::BindingId(it)).collect(),
+            vec![MirSpan::SelfParam],
+            vec![MirSpan::Unknown],
+        ];
+        anchors.into_iter().zip(spans).collect()
+    }
+
+    /// The anchor of the table [`Hashes::declaration`] names: one span, where `func` is
+    /// declared.
+    pub fn declaration_table(db: &Db, func: FunctionId) -> ContentId {
+        let mut h = Hasher::new(SPAN_DOMAIN);
+        h.id(&item_key(db, ItemId::Function(func)).0).update(&[DECLARATION]);
+        h.finish()
+    }
+}
+
+impl Hashes for ItemHashes {
+    fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String> {
+        Ok(item_key(db, item))
+    }
+
+    fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
+        hir_ty::attach_db(db, || {
+            let code = match body {
+                Body::Item(def) => code::of_item(db, def),
+                Body::Closure(id) => code::of_closure(db, InternedClosureId::from_id(id)),
+                Body::Coroutine(id) => code::of_coroutine(db, InternedCoroutineId::from_id(id)),
+                Body::CoroutineByMove(id) => {
+                    code::of_coroutine_by_move(db, InternedCoroutineId::from_id(id))
+                }
+            };
+            code.clone().map(CodeHash).map_err(|why| why.to_string())
+        })
+    }
+
+    fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
+        hir_ty::attach_db(db, || identity::ty(db, ty).map_err(|why| why.to_string()))
+    }
+
+    fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
+        hir_ty::attach_db(db, || identity::konst(db, konst).map_err(|why| why.to_string()))
+    }
+
+    fn span(
+        &self,
+        db: &Db,
+        owner: DefWithBodyId,
+        span: MirSpan,
+    ) -> Result<SpanRef, String> {
+        let Ok((table, index)) = code::table_of(span) else {
+            return Err(format!(
+                "{span:?} of the body of {owner:?}, a span of code inlined into it, which is of \
+                 the body it was inlined from: its place is the inlined span's"
+            ));
+        };
+        Ok(SpanRef { anchor: anchors(db, owner).0[table], index })
+    }
+
+    fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String> {
+        Ok(SpanRef { anchor: ItemHashes::declaration_table(db, func), index: 0 })
+    }
+
+    fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
+        (self.names)(file).ok_or_else(|| {
+            format!(
+                "the file {file:?} has no name in the program: the build did not name it, so \
+                 `file!()` and the positions of its code have none"
+            )
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Anchors([ContentId; TABLES]);
+
+/// The anchors of a body's span tables: of the key of its store, which an edit of what the
+/// body is keeps.
+#[salsa::tracked(returns(copy))]
+fn anchors(db: &Db, owner: DefWithBodyId) -> Anchors {
+    let store = key::store_key(db, ExpressionStoreOwnerId::Body(owner));
+    Anchors(std::array::from_fn(|table| {
+        let mut h = Hasher::new(SPAN_DOMAIN);
+        h.id(&store.0).update(&[table as u8]);
+        h.finish()
+    }))
+}
+```
+
+`hir_ty_mir::mir::MirSpan` is `hir_ty::mir::MirSpan` re-exported (`hir-ty-mir/src/mir.rs`
+`pub use hir_ty::mir::*`), so it is the type `code::table_of` takes.
+
+`v2/hashes/tests.rs` stays as it is. It goes through `ItemHashes` and `Hashes`, whose API does
+not change, and its assertions hold under the shared spelling:
+
+- a type is its arguments and not its alias;
+- a fields' type's drop impl is in the type;
+- a constant is its value;
+- the callee's body edit and the local rename (both of `Hashes::code`, which is
+  bit-identical).
+
+### 3. `crates/hir-ty-codegen/mod.rs`: `FunctionCx::is_plain_data` onto `hir_ty_share::is_plain_data`
+
+In `reference_pointee`, before:
+
+```rust
+        if !element.is_none_or(|it| self.is_plain_data(it, 0)) {
+            return Ok(None);
+        }
+```
+
+After:
+
+```rust
+        let plain = |it: Ty<'db>| {
+            hir_ty_share::is_plain_data(self.cg.db, self.interner, &self.infcx, self.env.param_env, it)
+        };
+        if !element.is_none_or(plain) {
+            return Ok(None);
+        }
+```
+
+Then delete the method `FunctionCx::is_plain_data`: from its doc comment `/// Whether `ty`
+is made of scalars, pointers and references only, through arrays, tuples` down to its closing
+brace (on disk about lines 11230 to 11272, just after `reference_pointee`). It has no other
+caller: `rg -n 'is_plain_data' crates/hir-ty-codegen` finds only the call in
+`reference_pointee` and the method's own recursion.
+
+`hir_ty_share::is_plain_data` is the same body. The one difference is that its normalization
+(hir-ty's `traits::structurally_normalize_ty`) also turns inference variables into errors.
+That changes no answer, because both reach `_ => false`. Share's
+`is_plain_data_is_the_code_generators` test checks it on the corpus against a copy of this
+method.
+
+### Not part of this request (recorded so nobody merges them)
+
+- `v2/frontend.rs` `args_of` composes `Hashes::ty` and `Hashes::konst` over an instance's
+  arguments. It is not a second spelling: it goes through the `Hashes` seam that
+  `v2/tests.rs` and `v2/refs/tests.rs` fake with `ById`. It stays.
+- `type_id.rs` (rustc's `TypeId` stable hash, for code that compares with rustc's),
+  `stable.rs` (stable symbol names) and `fncache.rs` walk types too, but compute other things,
+  on the v1 paths.
+- `blaze-items/src/form.rs` spells types for the code and interface hashes: by item key, with
+  regions, recording rather than failing. That is another grammar on purpose.
+- `v2/shape.rs` `part` tags, `hir-ty-share` `walk.rs` and `fact.rs` `tag`, and
+  `blaze-link/src/wasm/object.rs` `id`: the scan matched them, but they are separate schemas
+  numbered 1 to N (the wasm ones are fixed by the wasm spec). They are not copies.
+- `v2/fold.rs` `Le` is a little-endian `std::hash::Hasher` feed, as are
+  `hir-ty-share/src/layout.rs`'s `Feed` and `blaze-hashcons`' `hash_std`. That is sibling
+  `dedup-codec`'s, which has been told.
+
+## dedup: bits: hir-ty-mir, hir-ty-codegen, blaze-codegen onto `blaze_ids::bits`
+
+From `dedup-bits-codegen` (report `/tmp/blaze-lanes/v2-dedup-bits-codegen.md`; parent
+`dedup-bits`). Every bit set below becomes the one family in `crates/blaze-ids/src/bits.rs`:
+`BitSet<I>` (`Bits<Vec<u64>, I>`), `Bits<SmallVec<[u64; 4]>>`, `BitMatrix<I>`. All three crates
+already depend on `blaze-ids`. Same members, same results, same panics on a bad index for
+`insert` (past the capacity); `contains`/`remove` past the capacity are `false` where the copies
+indexed out of bounds, and every caller here only asks below the domain it sized the set to.
+Nothing below is persisted or hashed. After it, `hir-ty-mir` names `rustc_index` nowhere, so it
+drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
+
+### hir-ty-mir
+
+1. `crates/hir-ty-mir/src/mir/transform/move_paths.rs`: the `Bits` copy goes; `InitState`
+   holds `BitSet`s.
+
+   Imports, before:
+
+       use la_arena::ArenaMap;
+       use rustc_hash::{FxHashMap, FxHashSet};
+
+   after:
+
+       use blaze_ids::bits::BitSet;
+       use la_arena::ArenaMap;
+       use rustc_hash::{FxHashMap, FxHashSet};
+
+   Delete, whole (about lines 391-421):
+
+       /// A set of move paths.
+       #[derive(Clone, PartialEq, Eq, Debug)]
+       pub(super) struct Bits(Vec<u64>);
+
+       impl Bits {
+           ...
+           /// Adds the members of `other`, and says whether that changed anything.
+           fn union(&mut self, other: &Bits) -> bool {
+               ...
+           }
+       }
+
+   `InitState`, before:
+
+       pub(super) struct InitState {
+           pub(super) maybe_init: Bits,
+           pub(super) maybe_uninit: Bits,
+       }
+
+       impl InitState {
+           pub(super) fn bottom(len: usize) -> Self {
+               InitState { maybe_init: Bits::new(len), maybe_uninit: Bits::new(len) }
+           }
+
+           fn join(&mut self, other: &InitState) -> bool {
+               let init = self.maybe_init.union(&other.maybe_init);
+               let uninit = self.maybe_uninit.union(&other.maybe_uninit);
+               init || uninit
+           }
+
+   after:
+
+       pub(super) struct InitState {
+           pub(super) maybe_init: BitSet<PathId>,
+           pub(super) maybe_uninit: BitSet<PathId>,
+       }
+
+       impl InitState {
+           pub(super) fn bottom(len: usize) -> Self {
+               InitState { maybe_init: BitSet::new(len), maybe_uninit: BitSet::new(len) }
+           }
+
+           fn join(&mut self, other: &InitState) -> bool {
+               let init = self.maybe_init.union_with(&other.maybe_init);
+               let uninit = self.maybe_uninit.union_with(&other.maybe_uninit);
+               init || uninit
+           }
+
+   `InitState::apply`, before (`insert` now returns whether it added, which `for_each` won't
+   take):
+
+               Change::Borrowed => paths.iter().for_each(|&path| self.maybe_init.insert(path)),
+
+   after:
+
+               Change::Borrowed => {
+                   for &path in paths {
+                       self.maybe_init.insert(path);
+                   }
+               }
+
+   `InitAnalysis::run`, before:
+
+                   if skip_init {
+                       unwound.maybe_init = Bits::new(len);
+                   }
+                   if skip_uninit {
+                       unwound.maybe_uninit = Bits::new(len);
+                   }
+
+   after:
+
+                   if skip_init {
+                       unwound.maybe_init.clear();
+                   }
+                   if skip_uninit {
+                       unwound.maybe_uninit.clear();
+                   }
+
+   (the same empty set of `len` paths, its words kept rather than a new allocation; `clear` is
+   `fill(0)`). The calls `insert`, `remove` and `contains` in `set` and `of` and in
+   `holds_nothing` (`state.maybe_init.contains(it)`) are unchanged.
+
+2. `crates/hir-ty-mir/src/mir/optimize/dse.rs`: the `Bits` copy goes.
+
+   Before:
+
+       use crate::mir::{
+           LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+           return_slot,
+       };
+
+   after:
+
+       use blaze_ids::bits::BitSet;
+
+       use crate::mir::{
+           LocalId, MirBody, OperandKind, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
+           return_slot,
+       };
+
+   Delete, whole (lines 21-42): `#[derive(Clone, PartialEq, Eq)] struct Bits(Vec<u64>);` and its
+   `impl Bits { new, contains, insert, remove, union }`.
+
+   Then, in the file, every type `Bits` becomes `BitSet` (`always_live: &Bits` in
+   `removable_destination` and `statement_effect`; `live: &mut Bits` in `transfer`,
+   `statement_effect`, `terminator_effect`, `insert_index_locals`; `Vec<Bits>` and `&[Bits]` in
+   `dead_store_elimination`), every `Bits::new(` becomes `BitSet::new(` (four: `always_live`,
+   `entry`, `exit_of`'s `live`, `remove_unused_storage_markers`' `used`), and:
+
+   `transfer`, before:
+
+           Mention::Assigned | Mention::CallReturned => live.remove(local_index(local)),
+           Mention::AssignedPart | Mention::Storage => (),
+           Mention::Read | Mention::SharedBorrow | Mention::Mutated => live.insert(local_index(local)),
+
+   after (the arms are `()` again, `remove`/`insert` returning a `bool` now):
+
+           Mention::Assigned | Mention::CallReturned => {
+               live.remove(local_index(local));
+           }
+           Mention::AssignedPart | Mention::Storage => (),
+           Mention::Read | Mention::SharedBorrow | Mention::Mutated => {
+               live.insert(local_index(local));
+           }
+
+   `exit_of`, before:
+
+                   live.union(&entry[block_index(target)]);
+
+   after:
+
+                   live.union_with(&entry[block_index(target)]);
+
+   Every other `insert`/`remove`/`contains` call there is already a statement or a test.
+
+3. `crates/hir-ty-mir/src/mir/storage.rs`: rustc_index's `DenseBitSet`/`BitMatrix` (local to the
+   pass; `StorageConflicts`' fields are private) become `BitSet`/`BitMatrix`. `DenseBitSet` keeps
+   its words in a `Vec<u64>` (ra-ap-rustc_index 0.166), so the allocations are the same.
+
+   Before:
+
+       use rustc_index::bit_set::{BitMatrix, DenseBitSet};
+
+   after:
+
+       use blaze_ids::bits::{BitMatrix, BitSet};
+
+   `StorageConflicts`, before:
+
+           always: DenseBitSet<usize>,
+           conflicts: BitMatrix<usize, usize>,
+
+   after:
+
+           always: BitSet<usize>,
+           conflicts: BitMatrix<usize>,
+
+   (`conflict`'s `self.conflicts.contains(a, b)` is unchanged.)
+
+   In `frame_storage_conflicts`, every `DenseBitSet<usize>` becomes `BitSet<usize>` (the
+   closures `read`, `write`, `through_statement`, `live_in`, `through_terminator`, `entry` and
+   `holding`), and:
+
+   - `DenseBitSet::new_empty(count)` becomes `BitSet::new(count)` (seven: `marked`, `borrowed`,
+     `entry[start]`, `through_terminator`'s `live`, `holding`'s `vec!`, the two `None =>` arms);
+   - `DenseBitSet::new_filled(count)` becomes `BitSet::filled(count)` (`always`, `tracked`);
+   - `.intersect(&` becomes `.intersect_with(&` (`always.intersect(&borrowed)`,
+     `marked.intersect(&borrowed)`);
+   - `.union(&` becomes `.union_with(&`, all ten (`state.union(&live)` in the marked-locals
+     flow, whose `bool` is `changed`; the four `live.union(&live_in(..))` in
+     `through_terminator`; the five `at_once.union(..)` below);
+   - `.subtract(&` stays (`always.subtract(&marked)`, `tracked.subtract(..)` twice,
+     `marked.subtract(&always)`).
+
+   `all_pairs`, before:
+
+           let mut conflicts = BitMatrix::new(count, count);
+           let all_pairs = |conflicts: &mut BitMatrix<usize, usize>, at_once: &DenseBitSet<usize>| {
+               for at in at_once.iter() {
+                   conflicts.union_row_with(at_once, at);
+               }
+           };
+
+   after (the row first here):
+
+           let mut conflicts = BitMatrix::new(count, count);
+           let all_pairs = |conflicts: &mut BitMatrix<usize>, at_once: &BitSet<usize>| {
+               for at in at_once.iter() {
+                   conflicts.union_row_with(at, at_once);
+               }
+           };
+
+4. `crates/hir-ty-mir/src/lib.rs`, before:
+
+       extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
+       extern crate ra_ap_rustc_index as rustc_index;
+
+   after:
+
+       extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
+
+5. `crates/hir-ty-mir/Cargo.toml`: delete the line `ra-ap-rustc_index.workspace = true`
+   (`rg rustc_index crates/hir-ty-mir` finds nothing else after 3 and 4).
+
+### hir-ty-codegen
+
+6. `crates/hir-ty-codegen/overlap.rs`, before:
+
+       use rustc_hash::FxHashMap;
+       use rustc_index::bit_set::{BitMatrix, DenseBitSet};
+
+   after:
+
+       use blaze_ids::bits::{BitMatrix, BitSet};
+       use rustc_hash::FxHashMap;
+
+   `FrameLocals`, before:
+
+           pub(super) conflicts: BitMatrix<usize, usize>,
+
+   after:
+
+           pub(super) conflicts: BitMatrix<usize>,
+
+   `share_slots`, before:
+
+           let mut groups: Vec<(ir::StackSlot, DenseBitSet<usize>)> = Vec::new();
+           ...
+               groups.push((slot(at), DenseBitSet::new_empty(frame.slots.len())));
+           ...
+               let into = &mut groups[index];
+               for it in frame.conflicts.iter(at) {
+                   into.1.insert(it);
+               }
+
+   after (the row or'ed in a word at a time, as the comment above `groups` says; the matrix's
+   rows are `frame.slots.len()` bits, as both makers of `FrameLocals` size it):
+
+           let mut groups: Vec<(ir::StackSlot, BitSet<usize>)> = Vec::new();
+           ...
+               groups.push((slot(at), BitSet::new(frame.slots.len())));
+           ...
+               let into = &mut groups[index];
+               into.1.union_with(&frame.conflicts.row(at));
+
+   The test module (`use super::*`) is unchanged: `BitMatrix::new(locals, locals)`,
+   `conflicts.insert(a, b);` and `frame.conflicts.contains(it, at)` read the same.
+
+7. `crates/hir-ty-codegen/mod.rs`, about line 13336, before:
+
+           let mut conflicts = rustc_index::bit_set::BitMatrix::new(count, count);
+
+   after:
+
+           let mut conflicts = blaze_ids::bits::BitMatrix::new(count, count);
+
+8. `crates/hir-ty-codegen/v2/refs.rs`: `Blocks` keeps its name and its `BasicBlockId`
+   methods (an `la_arena::Idx` can't implement `blaze_ids::bits::BitIndex` from here or from
+   hir-ty, the orphan rule), its bits a `BitSet`.
+
+   Before:
+
+       use salsa::plumbing::AsId;
+       use smallvec::{SmallVec, smallvec};
+
+   after:
+
+       use blaze_ids::bits::BitSet;
+       use salsa::plumbing::AsId;
+       use smallvec::{SmallVec, smallvec};
+
+   Before (about lines 419-444):
+
+       /// A set of the blocks of a body, a bit a block.
+       struct Blocks(Vec<u64>);
+
+       impl Blocks {
+           fn new(count: usize) -> Self {
+               Blocks(vec![0; count.div_ceil(64)])
+           }
+
+           fn bit(id: BasicBlockId) -> (usize, u64) {
+               let index = id.into_raw().into_u32() as usize;
+               (index / 64, 1 << (index % 64))
+           }
+
+           /// Adds `id`, saying whether it was not in the set.
+           fn insert(&mut self, id: BasicBlockId) -> bool {
+               let (word, bit) = Self::bit(id);
+               let new = self.0[word] & bit == 0;
+               self.0[word] |= bit;
+               new
+           }
+
+           fn contains(&self, id: BasicBlockId) -> bool {
+               let (word, bit) = Self::bit(id);
+               self.0[word] & bit != 0
+           }
+       }
+
+   after:
+
+       /// A set of the blocks of a body, a bit a block, by the block's index in the body's arena.
+       struct Blocks(BitSet);
+
+       impl Blocks {
+           fn new(count: usize) -> Self {
+               Blocks(BitSet::new(count))
+           }
+
+           /// Adds `id`, saying whether it was not in the set.
+           fn insert(&mut self, id: BasicBlockId) -> bool {
+               self.0.insert(id.into_raw().into_u32() as usize)
+           }
+
+           fn contains(&self, id: BasicBlockId) -> bool {
+               self.0.contains(id.into_raw().into_u32() as usize)
+           }
+       }
+
+   Callers (`reachable`, and the walk at about lines 874-898) are unchanged.
+
+9. `crates/hir-ty-codegen/v2/backend.rs` `colocate`: the inline words become a `Bits` over the
+   same `SmallVec<[u64; 4]>` (no allocation up to 256 callees, as before).
+
+   Before:
+
+       use blaze_ids::ContentId;
+
+   after:
+
+       use blaze_ids::{ContentId, bits::Bits};
+
+   Before:
+
+           // One bit a callee: no allocation for the usual few hundred.
+           let mut addressed: SmallVec<[u64; 4]> = SmallVec::new();
+           addressed.resize(stencil.dfg.ext_funcs.len().div_ceil(64), 0);
+           for block in stencil.layout.blocks() {
+               for inst in stencil.layout.block_insts(block) {
+                   if let ir::InstructionData::FuncAddr { func_ref, .. } = stencil.dfg.insts[inst] {
+                       let at = func_ref.as_u32() as usize;
+                       addressed[at / 64] |= 1 << (at % 64);
+                   }
+               }
+           }
+           for (func_ref, ext) in stencil.dfg.ext_funcs.iter_mut() {
+               let at = func_ref.as_u32() as usize;
+               match own(&ext.name) {
+                   Some(true) => ext.colocated = true,
+                   Some(false) if addressed[at / 64] & (1 << (at % 64)) == 0 => ext.colocated = true,
+
+   after:
+
+           // One bit a callee: no allocation for the usual few hundred.
+           let mut addressed: Bits<SmallVec<[u64; 4]>> = Bits::new(stencil.dfg.ext_funcs.len());
+           for block in stencil.layout.blocks() {
+               for inst in stencil.layout.block_insts(block) {
+                   if let ir::InstructionData::FuncAddr { func_ref, .. } = stencil.dfg.insts[inst] {
+                       addressed.insert(func_ref.as_u32() as usize);
+                   }
+               }
+           }
+           for (func_ref, ext) in stencil.dfg.ext_funcs.iter_mut() {
+               let at = func_ref.as_u32() as usize;
+               match own(&ext.name) {
+                   Some(true) => ext.colocated = true,
+                   Some(false) if !addressed.contains(at) => ext.colocated = true,
+
+   (`use smallvec::SmallVec;` stays: `wanted` at about line 451 uses it too.)
+
+### blaze-codegen
+
+10. `crates/blaze-codegen/src/imports.rs`: the `Bits` copy (node numbers, `u32`) goes.
+
+    Before:
+
+        use rayon::prelude::*;
+        use rustc_hash::{FxHashMap, FxHashSet};
+
+    after:
+
+        use blaze_ids::bits::BitSet;
+        use rayon::prelude::*;
+        use rustc_hash::{FxHashMap, FxHashSet};
+
+    Delete, whole (about lines 141-160): `/// A set of node numbers, one bit each.`,
+    `struct Bits(Vec<u64>);` and its `impl Bits { new, get, set, unset }`.
+
+    Then: the field types `closed: Bits` (in `Graph`) and `reached: Bits` (in `Passed`) become
+    `closed: BitSet<u32>` and `reached: BitSet<u32>`; the four `Bits::new(` (`closed`,
+    `addressed` in `Graph::of`, `reached` in `constants`, `on_stack` in `components`) become
+    `BitSet::new(`; on those sets `get` becomes `contains`, `set` becomes `insert` and `unset`
+    becomes `remove`. Every `set`/`unset` call is a statement, so the `bool` `insert`/`remove`
+    now return is dropped.
+
+    Exactly, by line in the current file:
+
+    - 271 `addressed.set(node);` → `addressed.insert(node);`
+    - 277 `!addressed.get(node as u32)` → `!addressed.contains(node as u32)`
+    - 278 `graph.closed.set(node as u32);` → `graph.closed.insert(node as u32);`
+    - 306 `self.closed.get(node as u32)` → `self.closed.contains(node as u32)`
+    - 314 `!self.closed.get(callee)` → `!self.closed.contains(callee)`
+    - 319 `!passed.reached.get(callee)` → `!passed.reached.contains(callee)`
+    - 320 `passed.reached.set(callee);` → `passed.reached.insert(callee);`
+    - 422 `passed.reached.get(importer)` → `passed.reached.contains(importer)`
+    - 441 `self.closed.get(it)` → `self.closed.contains(it)`
+    - 567 `on_stack.set(root);` → `on_stack.insert(root);`
+    - 578 `on_stack.set(to);` → `on_stack.insert(to);`
+    - 580 `on_stack.get(to)` → `on_stack.contains(to)`
+    - 593 `on_stack.unset(member);` → `on_stack.remove(member);`
+
+    (`call.args.get(at)`, `constants.get(key)`, `edges[node].get(edge)` and `index.get(..)` are
+    not sets and stay.)
+
+## dedup: kind_tag is pub (from dedup-scan)
+
+`crates/blaze-codegen/src/content.rs`: `pub(crate) fn kind_tag(kind: RelocKind) -> u8` →
+`pub fn kind_tag(kind: RelocKind) -> u8`, with the doc `/// The byte a [`RelocKind`] hashes as
+in a content key, and in blaze-premap's.` blaze-premap deletes its copy `reloc_tag`
+(fastcompile.md).
+
+## dedup: one FrameRule in blaze-codegen (from dedup-scan)
+
+hir-ty-codegen `unwind.rs`'s `FrameRule` and blaze-stencil `code.rs`'s `Rule` are one enum (stencil
+adds `RaSignState`); both crates depend on blaze-codegen, which has serde's derive.
+
+- New `crates/blaze-codegen/src/unwind.rs`, `pub mod unwind;` in lib.rs:
+  ```rust
+  //! The call frame rules a function's code gives its unwinder, as DWARF has them.
+
+  /// A DWARF call frame instruction. Registers are DWARF register numbers, offsets are bytes.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+  pub enum FrameRule {
+      Cfa(u16, i32),
+      CfaRegister(u16),
+      CfaOffset(i32),
+      Offset(u16, i32),
+      Restore(u16),
+      SameValue(u16),
+      Undefined(u16),
+      RememberState,
+      RestoreState,
+      ArgsSize(u32),
+      /// AArch64's return-address signing state from here (`true`: signed), DWARF's
+      /// `RA_SIGN_STATE` pseudo-register 34 as `ValExpression(34, [DW_OP_lit0 or DW_OP_lit1])`,
+      /// as Cranelift's `Aarch64SetPointerAuth` row writes it.
+      RaSignState(bool),
+  }
+  ```
+  `RaSignState` is last, so every `FrameRule` persisted today decodes the same.
+- `crates/hir-ty-codegen/unwind.rs`: delete the enum, `use blaze_codegen::unwind::FrameRule;`
+  with `pub(super) use` where `super::` names it. The `impl FrameRule` becomes two free
+  functions (an inherent impl can't stay on a foreign type): `pub(super) fn on_entry(arch:
+  super::Arch) -> &'static [FrameRule]` (same `#[cfg(feature = "llvm")]`) and `fn
+  instruction(rule: FrameRule) -> CallFrameInstruction`, which gains
+  ```rust
+  FrameRule::RaSignState(signed) => {
+      let mut expression = gimli::write::Expression::new();
+      expression.op(if signed { gimli::DW_OP_lit1 } else { gimli::DW_OP_lit0 });
+      CallFrameInstruction::ValExpression(register(34), expression)
+  }
+  ```
+  Callers: `rule.instruction()` → `instruction(rule)` in unwind.rs, and
+  `FrameRule::on_entry(arch)` → `super::unwind::on_entry(arch)` in `llvm/emitted.rs`.
+- blaze-stencil re-exports it as its `Rule` (fastcompile.md).
+
+## dedup: no-op landing pads once, in hir-ty-mir (from dedup-scan)
+
+`hir-ty-codegen/mod.rs`'s `fn resumes_only(body: &MirBody<'db>) -> FxHashSet<BasicBlockId>` is
+the fixpoint of `hir-ty-mir/src/mir/transform/cleanup.rs`'s `remove_noop_landing_pads` (rustc's
+`RemoveNoopLandingPads`: cleanup, only storage/fake-read/nop statements, resume or goto one).
+Same set; the cleanup copy only skips ones already found.
+
+- `cleanup.rs`: split the loop out as
+  ```rust
+  /// The cleanup blocks of `body` that do nothing but go on unwinding: only storage markers,
+  /// fake reads and nops, ending in resuming the unwind or going to such a block.
+  pub fn noop_landing_pads(body: &MirBody<'_>) -> FxHashSet<BasicBlockId> {
+      let mut noop: FxHashSet<BasicBlockId> = FxHashSet::default();
+      loop { /* the loop as it is, `break` → `return noop` */ }
+  }
+
+  pub(in crate::mir) fn remove_noop_landing_pads(body: &mut MirBody<'_>) {
+      let noop = noop_landing_pads(body);
+      for (_, block) in body.basic_blocks.iter_mut() { /* as it is */ }
+  }
+  ```
+  `transform.rs`: `pub(super) use cleanup::remove_noop_landing_pads;` →
+  `pub use cleanup::{noop_landing_pads, remove_noop_landing_pads};` (the second stays
+  `pub(in crate::mir)` at its definition). `mir.rs`: add `noop_landing_pads` to `pub use transform::{…}`.
+- `hir-ty-codegen/mod.rs`: delete `fn resumes_only` and its doc, keeping the why in one line at
+  the call: `// rustc's RemoveNoopLandingPads: such a pad costs a call LLVM doesn't know resumes.`
+  `Self::resumes_only(body)` → `hir_ty_mir::mir::noop_landing_pads(body)`; in `v2/refs.rs`
+  `FunctionCx::resumes_only(body)` → the same.
+
+## dedup: optimize.rs successors are TerminatorKind::all_successors (from dedup-scan)
+
+`hir-ty-mir/src/mir/optimize.rs`'s `fn successors(kind: &TerminatorKind) ->
+SmallVec<[BasicBlockId; 4]>` is borrowck's `cfg.rs` `successors` and blaze-items' `form.rs`
+`push_successors` reversed: every successor, unwind last. After db adds
+`TerminatorKind::all_successors` (db.md), delete `fn successors` and call
+`kind.all_successors()` where it was called (the stack becomes `SmallVec<[BasicBlockId; 2]>`
+where it was `[_; 4]`, or `.into_iter()` into the existing one). `successors_mut` stays.

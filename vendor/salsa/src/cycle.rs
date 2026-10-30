@@ -227,6 +227,7 @@ impl CycleHeads {
     }
 
     pub(crate) fn initial(database_key_index: DatabaseKeyIndex, iteration: IterationStamp) -> Self {
+        // alloc: only while a cycle iterates; queries outside cycles hold the empty `ThinVec`, which allocates nothing
         Self(thin_vec![CycleHead {
             database_key_index,
             iteration: iteration.into(),
@@ -448,6 +449,7 @@ impl<'a> std::iter::IntoIterator for &'a CycleHeads {
 
 impl From<CycleHead> for CycleHeads {
     fn from(value: CycleHead) -> Self {
+        // alloc: only while a cycle iterates; queries outside cycles hold the empty `ThinVec`, which allocates nothing
         Self(thin_vec![value])
     }
 }
@@ -485,6 +487,7 @@ impl Cycle<'_> {
     /// This always contains the [`Id`] of the current query but it can contain additional cycle head [`Id`]s
     /// if this query is nested in an outer cycle or if it has nested cycles.
     pub fn head_ids(&self) -> CycleHeadIdsIterator<'_> {
+        // clone: a borrowed slice iterator, two words, no allocation
         self.head_ids.clone()
     }
 

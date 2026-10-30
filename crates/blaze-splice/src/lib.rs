@@ -69,6 +69,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_core::fs::Mapped;
 use blaze_ids::radix;
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags,
@@ -78,13 +79,23 @@ use object::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use self::lasting::Lasting;
-use self::lasting::{Own, is_lasting, left_behind};
+use self::{
+    journal::Journal,
+    lasting::{Own, is_lasting, left_behind},
+    names::Names,
+};
 
 pub mod debug;
+mod journal;
 pub mod lasting;
 pub mod macho;
+mod names;
 pub mod pe;
-pub mod sha256;
+pub use blaze_sha256 as sha256;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The executable of the last full link, which is read on a thread of its own while the
 /// daemon waits for the next edit.
@@ -123,7 +134,9 @@ pub struct Baseline {
     /// them means the function is as it first was again, which the executable no longer has.
     baked: Vec<Box<[u8]>>,
     /// What the last splice wrote over, to put back before the next.
-    undo: Vec<(u64, Vec<u8>)>,
+    undo: Journal,
+    /// Where a Mach-O splice keeps `undo` as it was, to have it again when the splice fails.
+    undone: Journal,
     /// What the linker wrote where any splice since has written, by address: a program
     /// started from a spliced executable has the splice's jumps in memory, and an edit
     /// that puts a function back as it first was has the linker's bytes put back there.
@@ -222,7 +235,8 @@ impl Parsed {
             path,
             image: Arc::new(image),
             baked,
-            undo: Vec::new(),
+            undo: Journal::default(),
+            undone: Journal::default(),
             originals: FxHashMap::default(),
             left: Left::default(),
             copies,
@@ -246,7 +260,7 @@ impl Baseline {
         let stamp = Stamp::of(&file)?;
         // SAFETY: the daemon is the one that has the link write the file, and it does not
         // start another while this reads.
-        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes = unsafe { Mapped::map(&file)? };
         if rustcs {
             let image = object::File::parse(&*bytes)?;
             ensure!(
@@ -295,7 +309,8 @@ impl Baseline {
             path: self.path.clone(),
             image: Arc::clone(&self.image),
             baked: self.baked.clone(),
-            undo: Vec::new(),
+            undo: Journal::default(),
+            undone: Journal::default(),
             originals: self.originals.clone(),
             left: Left::default(),
             copies: self.copies.clone(),
@@ -353,9 +368,9 @@ impl Baseline {
                 return Ok(spliced);
             }
             Executable::MachO(image) => {
-                let Baseline { path, baked, undo, originals, stamp, appended, .. } = self;
+                let Baseline { path, baked, undo, undone, originals, stamp, appended, .. } = self;
                 let (spliced, lasting) = macho::splice(
-                    image, path, baked, undo, originals, stamp, appended, patch, give_up,
+                    image, path, baked, undo, undone, originals, stamp, appended, patch, give_up,
                 )?;
                 self.spliced_with(lasting);
                 return Ok(spliced);
@@ -369,9 +384,10 @@ impl Baseline {
             Stamp::of(&writing.lock)? == self.stamp,
             "the executable was written by someone else"
         );
-        for (offset, bytes) in self.undo.drain(..).rev() {
-            write_all_at(&file, &bytes, offset)?;
-        }
+        let put_back = (self.undo.iter().rev())
+            .try_for_each(|(offset, bytes)| write_all_at(file, bytes, offset));
+        self.undo.clear();
+        put_back?;
         // Until this is through, nothing is known of what is behind the linker's.
         let left = std::mem::take(&mut self.left);
         let described = &addition.described;
@@ -412,9 +428,7 @@ impl Baseline {
         }
         let written_at = start.elapsed();
         for (offset, bytes) in &addition.overwritten {
-            let mut old = vec![0; bytes.len()];
-            read_exact_at(&file, &mut old, *offset)?;
-            self.undo.push((*offset, old));
+            self.undo.record(*offset, bytes.len(), |old| Ok(read_exact_at(file, old, *offset)?))?;
             write_all_at(&file, bytes, *offset)?;
         }
         self.stamp = Stamp::of(&file)?;
@@ -539,7 +553,7 @@ impl Baseline {
             bail!("the executable was signed again while an edit was published with it")
         };
         // SAFETY: as in `read`; whoever signed it is through.
-        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes = unsafe { Mapped::map(&file)? };
         image.signed_again(&bytes, &self.undo)?;
         self.stamp = stamp;
         Ok(())
@@ -689,7 +703,7 @@ pub fn headerpad_of_objects(paths: &[&Path]) -> anyhow::Result<Option<u64>> {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         // SAFETY: the daemon wrote the objects and the archives are the prebuilt standard
         // library's: nothing writes one while the link that reads it is under way.
-        let bytes = unsafe { memmap2::Mmap::map(&file)? };
+        let bytes = unsafe { Mapped::map(&file)? };
         let read = |unwinding: &mut macho::Unwinding, object: &[u8]| -> anyhow::Result<()> {
             if object.get(..4) != Some(&object::macho::MH_MAGIC_64.to_le_bytes()) {
                 return Ok(());
@@ -1245,9 +1259,9 @@ struct Image {
     /// Addresses are relative to where the program is loaded, and the loader adds that to
     /// every address stored in data.
     pie: bool,
-    symbols: FxHashMap<Box<[u8]>, Named>,
+    symbols: Names<Named>,
     /// The address slots the loader fills with what other libraries define.
-    imports: FxHashMap<Box<[u8]>, u64>,
+    imports: Names<u64>,
     unwind: UnwindTable,
     /// `None` when the loader has no addresses to fix up.
     relocations: Option<LoadRelocations>,
@@ -1321,7 +1335,7 @@ impl Image {
         };
         let segments = file.elf_program_headers().to_vec();
 
-        let mut symbols = FxHashMap::<Box<[u8]>, Named>::default();
+        let mut symbols = Names::<Named>::with_capacity(file.elf_symbol_table().len())?;
         let (table, _) = (file.section_by_name(".symtab").and_then(|it| it.file_range()))
             .context("the executable has no symbol table")?;
         let code = |section| {
@@ -1375,10 +1389,10 @@ impl Image {
                 kind: symbol.kind(),
                 entry: table + (symbol.index().0 * size_of::<elf::Sym64<Endianness>>()) as u64,
             };
-            match symbols.get_mut(name) {
-                None => _ = symbols.insert(name.into(), Named::One(defined)),
-                Some(Named::One(known)) if known.is(&defined) => {}
-                Some(known) => *known = Named::Many,
+            match symbols.get_or_insert(name, Named::One(defined))? {
+                (_, true) => {}
+                (Named::One(known), false) if known.is(&defined) => {}
+                (known, false) => *known = Named::Many,
             }
         }
 
@@ -1422,7 +1436,7 @@ impl Image {
             radix::sort_copy_by_key(&mut pads, |&(at, len)| radix::pack_64(at, len));
         }
 
-        let mut imports = FxHashMap::default();
+        let mut imports = Names::with_capacity(file.elf_dynamic_symbol_table().len())?;
         if let (Some(relocations), Some(dynamic)) =
             (file.dynamic_relocations(), file.dynamic_symbol_table())
         {
@@ -1431,7 +1445,7 @@ impl Image {
                 let RelocationTarget::Symbol(symbol) = relocation.target() else { continue };
                 if machine.imports(r_type) {
                     let name = dynamic.symbol_by_index(symbol)?.name_bytes()?;
-                    imports.entry(name.into()).or_insert(slot);
+                    imports.get_or_insert(name, slot)?;
                 }
             }
         }
@@ -1987,7 +2001,9 @@ impl<'a> Patch<'a> {
             };
             patch.sections[segment as usize].push(section.index());
             if section.name_bytes()? == b".eh_frame" {
-                patch.frames += Self::frames_in(section.data()?, 0)?.len();
+                let mut frames = 0;
+                Self::each_frame(section.data()?, 0, |_, _| frames += 1)?;
+                patch.frames += frames;
             }
         }
         let loaded: FxHashSet<SectionIndex> = patch.sections.iter().flatten().copied().collect();
@@ -2193,15 +2209,18 @@ impl<'a> Patch<'a> {
         }
     }
 
-    /// The frames in an `.eh_frame` section loaded at `address`: where the code of each
-    /// starts, and where the frame is.
-    fn frames_in(section: &[u8], address: u64) -> anyhow::Result<Vec<(u64, u64)>> {
+    /// Gives `found` each frame in an `.eh_frame` section loaded at `address`: where the code
+    /// of it starts, and where the frame is.
+    fn each_frame(
+        section: &[u8],
+        address: u64,
+        mut found: impl FnMut(u64, u64),
+    ) -> anyhow::Result<()> {
         let early = "an unwind table that ends early";
         let u32_at = |at: usize| -> anyhow::Result<u32> {
             let bytes = section.get(at..at + 4).context(early)?;
             Ok(u32::from_le_bytes(bytes.try_into()?))
         };
-        let mut found = Vec::new();
         let mut at = 0;
         while at < section.len() {
             let len = u32_at(at)? as usize;
@@ -2223,11 +2242,11 @@ impl<'a> Patch<'a> {
                         .wrapping_add_signed(i64::from(u32_at(start)? as i32)),
                     other => bail!("frames whose addresses are encoded as {other:#x}"),
                 };
-                found.push((begins, address + at as u64));
+                found(begins, address + at as u64);
             }
             at += 4 + len;
         }
-        Ok(found)
+        Ok(())
     }
 
     /// Lays the patch out behind the executable and gives everything in it its address.
@@ -2558,7 +2577,8 @@ impl<'a> Patch<'a> {
             }
             if section.name_bytes()? == b".eh_frame" {
                 let relocated = &appended[start as usize..][..data.len()];
-                frames.extend(Self::frames_in(relocated, base + start)?);
+                let start = base + start;
+                Self::each_frame(relocated, start, |code, frame| frames.push((code, frame)))?;
             }
             for (new, value) in in_place.iter().zip(values) {
                 overwritten.push((image.offset_of(new.old.address)?, value));

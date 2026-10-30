@@ -25,8 +25,11 @@ mod differential;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use span::{Edition, Span, SyntaxContext};
-use syntax_bridge::to_matcher_input_into;
 use tt::DelimSpan;
 use tt::iter::TtIter;
 
@@ -434,7 +437,9 @@ pub fn expect_fragment<'t>(
     // read nothing past them: its position only moves forward, and it reads at most
     // `PARSER_LOOKAHEAD - 1` tokens past it (`Parser::nth` asserts `n <= 3`, and glued
     // punctuation looks two further). A fragment costs its own length, not the rest of the
-    // level's, so `$($e:expr),*` is linear, not quadratic.
+    // level's, so `$($e:expr),*` is linear, not quadratic. Its tokens are the words the input
+    // tree keeps (`syntax_bridge::view_tokens`, made once, at its first fragment), read in place
+    // when the window ends where the tree does and otherwise copied, never converted.
     let mut window_trees = FIRST_WINDOW_TREES;
     let mut parser_input =
         MATCHER_INPUT.take().unwrap_or_else(|| parser::Input::with_capacity(4 * window_trees));
@@ -447,9 +452,10 @@ pub fn expect_fragment<'t>(
             taken += 1;
         }
         let whole = fork.is_empty();
-        to_matcher_input_into(fork.from_savepoint(savepoint), &mut edition, &mut parser_input);
-        let output = entry_point.parse(&parser_input);
-        if whole || consumed_input_tokens(&output) + PARSER_LOOKAHEAD <= parser_input.len() {
+        let window = fork.from_savepoint(savepoint);
+        let tokens = syntax_bridge::view_tokens(window, true, &mut edition, &mut parser_input);
+        let output = entry_point.parse(tokens);
+        if whole || consumed_input_tokens(&output) + PARSER_LOOKAHEAD <= tokens.len() {
             break output;
         }
         window_trees *= 2;

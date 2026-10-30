@@ -3,6 +3,7 @@
 
 use std::{borrow::Cow, iter::Enumerate};
 
+use base_db::Db;
 use base_db::target::{self, TargetData};
 use hir_def::{
     EnumId, EnumVariantId, FunctionId, Lookup, TraitId, lang_item::LangItems,
@@ -24,12 +25,12 @@ pub fn fn_traits(lang_items: &LangItems) -> impl Iterator<Item = TraitId> + '_ {
 }
 
 /// Returns an iterator over the direct super traits (including the trait itself).
-pub fn direct_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+pub fn direct_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
     SupertraitsInfo::query(db, trait_).direct_supertraits()
 }
 
 /// Returns the whole super trait hierarchy (including the trait itself).
-pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
+pub fn all_super_traits(db: &Db, trait_: TraitId) -> &[TraitId] {
     SupertraitsInfo::query(db, trait_).all_supertraits()
 }
 
@@ -55,7 +56,7 @@ pub fn target_feature_is_safe_in_target(target: &TargetData) -> TargetFeatureIsS
 }
 
 pub fn is_fn_unsafe_to_call(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     caller_target_features: &TargetFeatures<'_>,
     call_edition: Edition,
@@ -97,7 +98,7 @@ pub fn is_fn_unsafe_to_call(
 
 pub fn detect_variant_from_bytes<'a>(
     layout: &'a Layout,
-    db: &dyn HirDatabase,
+    db: &Db,
     target_data_layout: &TargetDataLayout,
     b: &[u8],
     e: EnumId,

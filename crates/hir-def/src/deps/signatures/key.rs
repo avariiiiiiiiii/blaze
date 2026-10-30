@@ -12,8 +12,8 @@
 //! An item in a block (of a body or of a signature) has no key: its module is made when that
 //! block is lowered, and the part holds the items of the crate's modules only.
 
-use base_db::{Crate, SourceDatabase};
-use blaze_ids::ContentId;
+use base_db::{Crate, Db};
+use blaze_ids::{ContentId, Domain};
 use hir_expand::{HirFileId, MacroCallId, MacroCallKind};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -26,6 +26,9 @@ use crate::{
 
 /// The domain of an item's key.
 pub(super) const KEY_DOMAIN: &str = "blaze v2 dependency signature key 1";
+
+/// [`KEY_DOMAIN`] with its context key derived once, not on every key a serve hashes.
+static DOMAIN: Domain = Domain::new(KEY_DOMAIN);
 
 /// One record of the part: a signature query and the item it is asked of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -64,7 +67,7 @@ impl Item {
     }
 
     /// The module the item is in.
-    pub(super) fn module(self, db: &dyn SourceDatabase) -> ModuleId {
+    pub(super) fn module(self, db: &Db) -> ModuleId {
         match self {
             Item::Struct(it) => it.lookup(db).container,
             Item::Union(it) => it.lookup(db).container,
@@ -82,13 +85,14 @@ impl Item {
 
 /// The modules of `krate`'s `DefMap` by their index in it.
 #[salsa::tracked(returns(ref))]
-pub(super) fn module_indexes(db: &dyn SourceDatabase, krate: Crate) -> FxHashMap<ModuleId, u32> {
+pub(super) fn module_indexes(db: &Db, krate: Crate) -> FxHashMap<ModuleId, u32> {
     let modules = crate_def_map(db, krate).modules(db);
+    // alloc: once per crate, the map every key of the crate reads.
     modules.enumerate().map(|(index, (module, _))| (module, index as u32)).collect()
 }
 
 /// The key of `item`'s record, and its crate; `None` for an item in a block.
-pub(super) fn of(db: &dyn SourceDatabase, item: Item) -> Option<(Crate, ContentId)> {
+pub(super) fn of(db: &Db, item: Item) -> Option<(Crate, ContentId)> {
     let module = item.module(db);
     if module.block(db).is_some() {
         return None;
@@ -137,11 +141,11 @@ pub(super) fn of(db: &dyn SourceDatabase, item: Item) -> Option<(Crate, ContentI
             key.ast(loc.id);
         }
     }
-    Some((krate, ContentId::of(KEY_DOMAIN, &key.bytes)))
+    Some((krate, ContentId::of_domain(&DOMAIN, &key.bytes)))
 }
 
 struct Key<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     indexes: &'a FxHashMap<ModuleId, u32>,
     bytes: SmallVec<[u8; 64]>,
 }

@@ -9,8 +9,9 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use blaze_items::{Fact, ItemId};
-use hir::{InFile, db::HirDatabase};
+use hir::InFile;
 use hir_def::{
     ConstId, FunctionId, HasModule as _, ItemContainerId, Lookup as _,
     hir::{Expr, ExprId},
@@ -109,7 +110,7 @@ impl LatePass for InteriorMutableConsts {
 
 /// rustc's `find_attr!(.., RustcShouldNotBeCalledOnConstItems)` of `method`, its `cfg_attr`s
 /// expanded.
-fn should_not_be_called_on_const_items(db: &dyn HirDatabase, method: FunctionId) -> bool {
+fn should_not_be_called_on_const_items(db: &Db, method: FunctionId) -> bool {
     let cfg = method.krate(db).cfg_options(db);
     let attrs = method.lookup(db).source(db).value.attrs();
     expand_cfg_attr(attrs, || cfg, |meta, _| match meta {

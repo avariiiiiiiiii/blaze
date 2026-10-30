@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use base_db::{Crate, SourceDatabase, SourceRoot, SourceRootId, TargetKind, VfsPath};
+use base_db::{Crate, SourceRoot, SourceRootId, TargetKind, VfsPath};
 use blaze_ids::ContentId;
 use blaze_query::MemTree;
 use blaze_units::{
@@ -34,19 +34,34 @@ const LIB_TEST: usize = 6;
 
 const WORKSPACE: &str = "[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n\n[workspace.metadata.blaze]\nconst-eval = { steps = 5000 }\n";
 
+/// The view's files.
+const FILES: &[(&str, &[u8])] = &[
+    ("Cargo.toml", WORKSPACE.as_bytes()),
+    ("a/Cargo.toml", b"[package]\nname = \"a\"\n"),
+    ("a/build.rs", b"fn main() {}\n"),
+    ("a/src/lib.rs", b"include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n"),
+    ("a/src/more.rs", b"pub fn more() {}\n"),
+    ("b/Cargo.toml", b"[package]\nname = \"b\"\n"),
+    ("b/src/main.rs", b"fn main() { alpha::gen(); }\n"),
+    ("m/Cargo.toml", b"[package]\nname = \"m\"\n"),
+    ("m/src/lib.rs", b"extern crate proc_macro;\n"),
+    ("target/debug/stale.rs", b"not a source\n"),
+];
+
 fn view(tree: &MemTree) -> ContentId {
-    tree.root(&[
-        ("Cargo.toml", WORKSPACE.as_bytes()),
-        ("a/Cargo.toml", b"[package]\nname = \"a\"\n"),
-        ("a/build.rs", b"fn main() {}\n"),
-        ("a/src/lib.rs", b"include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\n"),
-        ("a/src/more.rs", b"pub fn more() {}\n"),
-        ("b/Cargo.toml", b"[package]\nname = \"b\"\n"),
-        ("b/src/main.rs", b"fn main() { alpha::gen(); }\n"),
-        ("m/Cargo.toml", b"[package]\nname = \"m\"\n"),
-        ("m/src/lib.rs", b"extern crate proc_macro;\n"),
-        ("target/debug/stale.rs", b"not a source\n"),
-    ])
+    tree.root(FILES)
+}
+
+/// [`FILES`] with each of `changes` made: a path's new bytes, or none for a file gone.
+fn changed(tree: &MemTree, changes: &[(&'static str, Option<&'static [u8]>)]) -> ContentId {
+    let mut files: Vec<(&str, &[u8])> = FILES.to_vec();
+    for &(path, bytes) in changes {
+        files.retain(|it| it.0 != path);
+        if let Some(bytes) = bytes {
+            files.push((path, bytes));
+        }
+    }
+    tree.root(&files)
 }
 
 fn library(tree: &MemTree) -> ContentId {
@@ -558,6 +573,48 @@ fn a_units_identity_covers_what_it_is_made_from_deeply() {
     assert_ne!(first.lowered.identity(LIB), after[2]);
     first.lowered.ran(RUN, &ran("pub fn gen() {}\n")).unwrap();
     assert_eq!(first.lowered.identity(LIB), after[2], "the same inputs, the same identity");
+}
+
+#[test]
+fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
+    let units = units();
+    let mut built = lowered(&units).unwrap();
+    let core = built.lowered.identity(CORE);
+    let lib = built.lowered.identity(LIB);
+    let bin_root = krate(&built, BIN).data(built.lowered.db()).root_file_id;
+    // The library's root is not in this tree: a refresh that read it would fail.
+    let tree = MemTree::default();
+    let (more, new): (&'static [u8], &'static [u8]) = (b"pub fn more() -> u8 { 1 }\n", b"pub fn new() {}\n");
+    let root = changed(&tree, &[("a/src/more.rs", Some(more)), ("a/src/new.rs", Some(new))]);
+    let config = config(root, library(&MemTree::default()));
+    let refreshed = built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None });
+    assert_eq!(refreshed, Ok(true));
+    let db = built.lowered.db();
+    let a = root_of(db, krate(&built, LIB));
+    let more = a.file_for_path(&path("/w/a/src/more.rs")).copied().unwrap();
+    assert!(db.file_text(more).text(&db).starts_with("pub fn more() -> u8"));
+    let new = a.file_for_path(&path("/w/a/src/new.rs")).copied().unwrap();
+    assert_eq!(built.lowered.paths().get(&new).map(String::as_str), Some("/w/a/src/new.rs"));
+    assert_eq!(krate(&built, BIN).data(db).root_file_id, bin_root, "a file that did not change keeps its id");
+    assert_eq!(built.lowered.identity(CORE), core, "nothing of the library changed");
+    assert_ne!(built.lowered.identity(LIB), lib);
+}
+
+#[test]
+fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower() {
+    let units = units();
+    let tree = MemTree::default();
+    let library = library(&tree);
+    let refresh = |changes: &[(&'static str, Option<&'static [u8]>)]| {
+        let mut built = lowered(&units).unwrap();
+        let root = changed(&tree, changes);
+        let config = config(root, library);
+        built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+    };
+    let Err(error) = refresh(&[("b/src/main.rs", None)]) else { panic!("a crate's root file went and nothing said so") };
+    assert!(error.what.contains("root file"), "{error}");
+    let manifest: &'static [u8] = b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n";
+    assert_eq!(refresh(&[("Cargo.toml", Some(manifest))]), Ok(false), "the workspace's const-eval is every crate's");
 }
 
 #[test]

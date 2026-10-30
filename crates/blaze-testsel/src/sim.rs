@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use blaze_core::Traced;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use blaze_usercode::test::Attrs;
 
 use crate::{
@@ -31,22 +31,6 @@ const SLOTS: u32 = 26;
 const TESTS: u32 = 12;
 const DATA: &str = "/ws/sim";
 
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
 /// What a function does at a version: whom it calls, each under a bit of the input or always;
 /// whether it reads the input; whether it fails.
 struct Body {
@@ -56,8 +40,8 @@ struct Body {
 }
 
 fn body(n: u32, version: u32) -> Body {
-    let mut rng = Rng((u64::from(n) << 32) | u64::from(version));
-    rng.next();
+    let mut rng = Rng::new((u64::from(n) << 32) | u64::from(version));
+    rng.next_u64();
     let calls: Vec<(u32, Option<u8>)> = (0..rng.below(4))
         .map(|_| {
             let callee = rng.below(u64::from(FNS)) as u32;
@@ -185,9 +169,9 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
     let names: Vec<String> = (0..TESTS).map(|t| format!("t{t}")).collect();
     let (mut skipped, mut ran) = (0u32, 0u32);
     for seed in 0..24u64 {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let mut program = Program::new();
-        let mut data = rng.next() as u8;
+        let mut data = rng.next_u64() as u8;
         let mut store = Mem::default();
         let mut pasts: Vec<Vec<Past>> = (0..TESTS).map(|_| Vec::new()).collect();
         for _ in 0..60 {
@@ -218,7 +202,7 @@ fn record_edit_select_never_skips_what_would_run_otherwise() {
                 }
             }
             match rng.below(10) {
-                0 => data = rng.next() as u8,
+                0 => data = rng.next_u64() as u8,
                 1 => program.beside += 1,
                 // Going back: code that was, a revert.
                 2 => {
@@ -242,12 +226,12 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
     let attrs = Attrs::default();
     let (mut cached, mut runs) = (0u32, 0u32);
     for seed in 0..600u64 {
-        let mut rng = Rng(seed ^ 0x5eed);
+        let mut rng = Rng::new(seed ^ 0x5eed);
         let mut program = Program::new();
         for version in &mut program.versions {
             *version = rng.below(3) as u32;
         }
-        let data = rng.next() as u8;
+        let data = rng.next_u64() as u8;
         let root = rng.below(u64::from(SLOTS)) as u32;
         let truth = program.run(root, data);
         if !truth.passed {
@@ -267,7 +251,7 @@ fn a_test_runs_exactly_when_what_it_executed_or_read_changed() {
             let n = rng.below(u64::from(FNS)) as usize;
             program.versions[n] += 1;
         }
-        let now = if rng.below(4) == 0 { rng.next() as u8 } else { data };
+        let now = if rng.below(4) == 0 { rng.next_u64() as u8 } else { data };
         let changed: Vec<u32> = (0..FNS).filter(|&n| program.versions[n as usize] != before.versions[n as usize]).collect();
         let should_run = changed.iter().any(|n| truth.executed.binary_search(n).is_ok())
             || changed.iter().any(|&n| n >= SLOTS)

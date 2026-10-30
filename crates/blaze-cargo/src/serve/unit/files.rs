@@ -10,6 +10,7 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 use base_db::FileId;
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
+use blaze_vfs::{Bytes, Corrupt};
 
 /// The mounts of a build, to find a path's file in.
 #[derive(Clone)]
@@ -47,32 +48,34 @@ impl Mounted {
         })
     }
 
-    /// The bytes of the file at absolute `path`, with its content ID.
-    pub(crate) fn read(&self, path: &str) -> Option<(ContentId, blaze_vfs::Mode, Arc<[u8]>)> {
-        let (root, inner) = self.locate(path)?;
+    /// The bytes of the file at absolute `path`, with its content ID; `Err` for bytes of the
+    /// mapped image that fail their check.
+    pub(crate) fn read(&self, path: &str) -> Result<Option<(ContentId, blaze_vfs::Mode, Bytes)>, Corrupt> {
+        let Some((root, inner)) = self.locate(path) else { return Ok(None) };
         self.reader.file(root, &inner)
     }
 
     /// Every file below the directory at absolute `dir`, by `/`-separated path under it.
-    pub(crate) fn walk(&self, dir: &str) -> Option<Vec<(String, Arc<[u8]>)>> {
-        let (root, inner) = self.locate(dir)?;
+    pub(crate) fn walk(&self, dir: &str) -> Result<Option<Vec<(String, Bytes)>>, Corrupt> {
+        let Some((root, inner)) = self.locate(dir) else { return Ok(None) };
         let mut out = Vec::new();
         let mut pending = vec![String::new()];
         while let Some(at) = pending.pop() {
             let full = join(&inner, &at);
-            for (name, is_dir) in self.reader.list(root, &full)? {
+            let Some(names) = self.reader.list(root, &full) else { return Ok(None) };
+            for (name, is_dir) in names {
                 let rel = join(&at, &name);
                 match is_dir {
                     true => pending.push(rel),
                     false => {
-                        let (_, _, bytes) = self.reader.file(root, &join(&inner, &rel))?;
+                        let Some((_, _, bytes)) = self.reader.file(root, &join(&inner, &rel))? else { return Ok(None) };
                         out.push((rel, bytes));
                     }
                 }
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        Some(out)
+        Ok(Some(out))
     }
 
     /// The absolute path of a name rustc gave: relative ones are from the workspace's root.
@@ -92,11 +95,12 @@ impl Mounted {
         }
     }
 
-    /// The sources a diagnostic's snippets are read from, by the names [`Mounted::name`] gives.
+    /// The sources a diagnostic's snippets are read from, by the names [`Mounted::name`] gives;
+    /// a file whose bytes fail their check gives no snippet.
     pub(crate) fn sources(&self) -> blaze_diagnostics::emit::Sources {
         let mounted = self.clone();
         blaze_diagnostics::emit::Sources::new(move |name| {
-            let (_, _, bytes) = mounted.read(&mounted.absolute(name))?;
+            let (_, _, bytes) = mounted.read(&mounted.absolute(name)).ok()??;
             String::from_utf8(bytes.to_vec()).ok()
         })
     }

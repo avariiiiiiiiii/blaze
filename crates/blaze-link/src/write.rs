@@ -23,9 +23,10 @@ use blaze_ids::radix;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{
-    Apply, Bind, Class, Export, Fixup, Function, GotEntry, Holds, Import, Placed, Region, Special, Sym,
+    Apply, Bind, Class, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Placed, Region, Special, Sym,
     SymbolKind, Tls, WindowsUnwind, Writer,
 };
 use crate::place::Totals;
@@ -59,9 +60,12 @@ enum Why {
 impl Why {
     fn say(&self, symbols: &Symbols) -> String {
         match self {
+            // alloc: error path
             Why::Undefined(sym) => format!("{} is not defined", symbols.describe(*sym)),
             Why::Removed => "a symbol in a removed piece".into(),
+            // alloc: error path
             Why::Alias(sym) => format!("{} is an alias of itself", symbols.describe(*sym)),
+            // clone: error path
             Why::Special(what) => what.clone(),
         }
     }
@@ -110,28 +114,37 @@ impl Resolver<'_> {
                     sym = to;
                     continue;
                 }
-                Def::Special(at) => self.special(&self.state.specials[at as usize])?,
+                Def::Special(at) => self.special(sym, &self.state.specials[at as usize])?,
                 Def::None => return Err(Why::Undefined(sym)),
             });
         }
         Err(Why::Alias(sym))
     }
 
-    fn special(&self, special: &Special) -> Result<Value, Why> {
-        let bounds = |matches: &dyn Fn(&Class) -> bool, what: &dyn Fn() -> String| -> Result<(u64, u64), Why> {
-            let mut found = self.regions.iter().filter(|it| matches(&it.class));
-            let first = found.next().ok_or_else(|| Why::Special(format!("the image has no {}", what())))?;
-            let last = found.last().unwrap_or(first);
-            Ok((first.addr, last.addr + last.size))
-        };
+    /// The first address of the first region `matches` takes and the end of the last; `what`
+    /// names them in the error when there is none.
+    fn bounds(
+        &self,
+        matches: impl Fn(&Class) -> bool,
+        what: impl std::fmt::Display,
+    ) -> Result<(u64, u64), Why> {
+        let mut found = self.regions.iter().filter(|it| matches(&it.class));
+        // alloc: error path
+        let first = found.next().ok_or_else(|| Why::Special(format!("the image has no {what}")))?;
+        let last = found.last().unwrap_or(first);
+        Ok((first.addr, last.addr + last.size))
+    }
+
+    /// The value of `special`, the linker's symbol `sym` is.
+    fn special(&self, sym: Sym, special: &Special) -> Result<Value, Why> {
         Ok(match special {
             Special::ImageBase => Value::Image(self.base),
-            Special::Start(class) => Value::Image(bounds(&|it| it == class, &|| format!("{class:?}"))?.0),
-            Special::Stop(class) => Value::Image(bounds(&|it| it == class, &|| format!("{class:?}"))?.1),
+            Special::Start(class) => Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.0),
+            Special::Stop(class) => Value::Image(self.bounds(|it| it == class, format_args!("{class:?}"))?.1),
             Special::Section { name, end } => {
-                let (start, stop) = bounds(
-                    &|it| matches!(it, Class::Named { name: n, .. } if n == name),
-                    &|| format!("section `{name}`"),
+                let (start, stop) = self.bounds(
+                    |it| matches!(it, Class::Named { name: n, .. } if n == name),
+                    format_args!("section `{name}`"),
                 )?;
                 Value::Image(if *end { stop } else { start })
             }
@@ -144,13 +157,19 @@ impl Resolver<'_> {
                     .ok_or_else(|| Why::Special("an image with no live descriptor".into()))?;
                 self.value(sym)?
             }
-            Special::Got(name) => {
-                let sym = self
+            Special::Got { .. } => {
+                let name = self.symbols.name_of(sym).and_then(|it| special.got_target(it)).ok_or_else(|| {
+                    // alloc: error path
+                    Why::Special(format!("{} names no GOT cell's target", self.symbols.describe(sym)))
+                })?;
+                let target = self
                     .symbols
                     .find_sym_name(name)
+                    // alloc: error path
                     .ok_or_else(|| Why::Special(format!("`{name}` is not defined")))?;
-                let cell = self.cell(GotKind::Address, sym).ok_or_else(|| {
-                    Why::Special(format!("no GOT cell of {}", self.symbols.describe(sym)))
+                let cell = self.cell(GotKind::Address, target).ok_or_else(|| {
+                    // alloc: error path
+                    Why::Special(format!("no GOT cell of {}", self.symbols.describe(target)))
                 })?;
                 Value::Image(cell)
             }
@@ -187,7 +206,10 @@ const NO_CELLS: Cells = Cells { got: [NONE; 4], plt: NONE };
 /// The value of every symbol a stage's writes refer to, by [`Symbols::split`]: per symbol
 /// its value and a word of its kind (low byte) and its [`Cells`] (index + 1, high half).
 struct Column {
-    shards: Vec<Vec<[u64; 2]>>,
+    /// Every shard's slots, one after another: shard `s` at `starts[s]..starts[s] + lens[s]`.
+    slots: Vec<[u64; 2]>,
+    starts: [usize; Symbols::SHARDS],
+    lens: [usize; Symbols::SHARDS],
     whys: Vec<Why>,
     cells: Vec<Cells>,
 }
@@ -211,17 +233,42 @@ impl Wants {
 }
 
 impl Column {
+    /// A column with a slot for each of `syms` (and the ids below them in their shards), all
+    /// unset, and room for `cells` symbols' cells.
+    fn sized(syms: &[Sym], cells: usize) -> Column {
+        let mut lens = [0usize; Symbols::SHARDS];
+        for sym in syms {
+            let (shard, at) = Symbols::split(*sym);
+            lens[shard] = lens[shard].max(at + 1);
+        }
+        let mut starts = [0usize; Symbols::SHARDS];
+        let mut total = 0;
+        for (start, len) in starts.iter_mut().zip(lens) {
+            *start = total;
+            total += len;
+        }
+        let mut slots = Vec::with_capacity(total);
+        slots.resize(total, [0, UNSET]);
+        Column {
+            slots,
+            starts,
+            lens,
+            // alloc: none until a symbol has no value (an error, or a removed function's unwind record)
+            whys: Vec::new(),
+            cells: Vec::with_capacity(cells),
+        }
+    }
+
     fn build(resolver: &Resolver<'_>, mut wants: Wants) -> Column {
         radix::sort_copy_by_key(&mut wants.syms, |it| it.0);
         wants.syms.dedup();
-        let values: Vec<Result<Value, Why>> = wants.syms.par_iter().with_min_len(1024).map(|it| resolver.value(*it)).collect();
-        let mut sizes = vec![0usize; Symbols::SHARDS];
-        for sym in &wants.syms {
-            let (shard, at) = Symbols::split(*sym);
-            sizes[shard] = sizes[shard].max(at + 1);
-        }
-        let mut column =
-            Column { shards: sizes.iter().map(|it| vec![[0u64; 2]; *it]).collect(), whys: Vec::new(), cells: Vec::new() };
+        radix::sort_copy_by_key(&mut wants.got, |&(kind, sym)| radix::pack_32(kind as u32, sym.0));
+        wants.got.dedup();
+        radix::sort_copy_by_key(&mut wants.plt, |it| it.0);
+        wants.plt.dedup();
+        let mut values = Vec::with_capacity(wants.syms.len());
+        values.par_extend(wants.syms.par_iter().with_min_len(1024).map(|it| resolver.value(*it)));
+        let mut column = Column::sized(&wants.syms, wants.got.len() + wants.plt.len());
         for (sym, value) in wants.syms.iter().zip(values) {
             let slot = match value {
                 Ok(Value::Image(it)) => [it, IMAGE],
@@ -235,15 +282,11 @@ impl Column {
             };
             *column.slot_mut(*sym) = slot;
         }
-        radix::sort_copy_by_key(&mut wants.got, |&(kind, sym)| radix::pack_32(kind as u32, sym.0));
-        wants.got.dedup();
-        let got: Vec<u64> =
-            wants.got.par_iter().map(|(kind, sym)| resolver.cell(*kind, *sym).unwrap_or(NONE)).collect();
+        let mut got = Vec::with_capacity(wants.got.len());
+        got.par_extend(wants.got.par_iter().map(|(kind, sym)| resolver.cell(*kind, *sym).unwrap_or(NONE)));
         for ((kind, sym), at) in wants.got.iter().zip(got) {
             column.cells_mut(*sym).got[*kind as usize] = at;
         }
-        radix::sort_copy_by_key(&mut wants.plt, |it| it.0);
-        wants.plt.dedup();
         wants.plt.retain(|it| column.slot(*it)[1] == IMPORT);
         for sym in wants.plt {
             column.cells_mut(sym).plt = resolver.plt(sym).unwrap_or(NONE);
@@ -254,12 +297,13 @@ impl Column {
     #[inline]
     fn slot(&self, sym: Sym) -> [u64; 2] {
         let (shard, at) = Symbols::split(sym);
-        self.shards[shard].get(at).copied().unwrap_or([0, UNSET])
+        if at < self.lens[shard] { self.slots[self.starts[shard] + at] } else { [0, UNSET] }
     }
 
     fn slot_mut(&mut self, sym: Sym) -> &mut [u64; 2] {
         let (shard, at) = Symbols::split(sym);
-        &mut self.shards[shard][at]
+        assert!(at < self.lens[shard], "a symbol the column was not built for");
+        &mut self.slots[self.starts[shard] + at]
     }
 
     fn cells_mut(&mut self, sym: Sym) -> &mut Cells {
@@ -301,6 +345,7 @@ impl Column {
     fn why(&self, symbols: &Symbols, sym: Sym, at: u32) -> String {
         match self.whys.get(at as usize) {
             Some(why) => why.say(symbols),
+            // alloc: error path
             None => format!("{} was not resolved before relocation", symbols.describe(sym)),
         }
     }
@@ -330,22 +375,14 @@ const SPLIT: usize = 2048;
 
 /// Where a piece's fixups split into jobs: each job's first byte and first fixup, when they
 /// can (no format relocation, sorted, none overlapping the next); a single job otherwise.
-fn split(fixups: &[Fixup]) -> Vec<(u64, u32)> {
-    let whole = vec![(0, 0)];
-    if fixups.len() <= SPLIT {
-        return whole;
-    }
-    for pair in fixups.windows(2) {
-        if matches!(pair[0].apply, Apply::Native(_)) || pair[0].at + reloc::width(pair[0].apply) as u64 > pair[1].at {
-            return whole;
-        }
-    }
-    if fixups.last().is_some_and(|it| matches!(it.apply, Apply::Native(_))) {
-        return whole;
-    }
-    let mut out = vec![(0, 0)];
-    out.extend((SPLIT..fixups.len()).step_by(SPLIT).map(|at| (fixups[at].at, at as u32)));
-    out
+fn split(fixups: &[Fixup]) -> impl Iterator<Item = (u64, u32)> + '_ {
+    let whole = fixups.len() <= SPLIT
+        || fixups.last().is_some_and(|it| matches!(it.apply, Apply::Native(_)))
+        || fixups.windows(2).any(|pair| {
+            matches!(pair[0].apply, Apply::Native(_)) || pair[0].at + reloc::width(pair[0].apply) as u64 > pair[1].at
+        });
+    let rest = if whole { 0..0 } else { SPLIT..fixups.len() };
+    std::iter::once((0, 0)).chain(rest.step_by(SPLIT).map(|at| (fixups[at].at, at as u32)))
 }
 
 /// What relocation left for the loader, per batch of jobs: each job's lists as ranges of
@@ -365,7 +402,7 @@ struct Reloc<'s> {
     symbols: &'s Symbols,
     state: &'s State,
     column: &'s Column,
-    writer: &'s dyn Writer,
+    writer: &'s Formats,
     arch: Arch,
     format: Format,
     base: u64,
@@ -397,6 +434,7 @@ impl Reloc<'_> {
         let mismatch = |len: u64| {
             error(
                 function_of(piece),
+                // alloc: error path
                 format!("{} has {len} bytes for a piece of {}", symbols.describe(piece.sym), piece.size),
             )
         };
@@ -434,9 +472,15 @@ impl Reloc<'_> {
         let unwind = matches!(what, What::Native { unwind: true, .. });
         let tls_base = self.tls.map_or(0, |it| it.addr);
         let fixups = &piece.fixups()[job.fixups.start as usize..job.fixups.end as usize];
+        // Every fixup that can push to the loader's lists is an `Abs64`: room for them all
+        // now, so no fixup allocates.
+        let abs = fixups.iter().filter(|it| it.apply == Apply::Abs64).count();
+        out.rebase.reserve(abs);
+        out.binds.reserve(abs);
         let fail = |fixup: &Fixup, what: String| {
             error(
                 function_of(piece),
+                // alloc: error path
                 format!("{:?} at {:#x} in {}: {what}", fixup.apply, fixup.at, symbols.describe(piece.sym)),
             )
         };
@@ -488,6 +532,7 @@ impl Reloc<'_> {
                             _ => {
                                 return Err(fail(
                                     fixup,
+                                    // alloc: error path
                                     format!(
                                         "{} is not defined, and a call by index has no null function to go to",
                                         symbols.describe(fixup.target)
@@ -509,6 +554,7 @@ impl Reloc<'_> {
                 Some(kind) => {
                     let target = got_target(symbols, fixup);
                     match self.column.cells(target).got[kind as usize] {
+                        // alloc: error path
                         NONE => return Err(fail(fixup, format!("no GOT cell of {}", symbols.describe(target)))),
                         at => at,
                     }
@@ -527,6 +573,7 @@ impl Reloc<'_> {
                 Value::Import(_) if self.got_by_library && kind.is_none() => {
                     return Err(fail(
                         fixup,
+                        // alloc: error path
                         format!(
                             "{} is imported data, which is reached only through its import address table \
                              cell (`__imp_`)",
@@ -536,6 +583,7 @@ impl Reloc<'_> {
                 }
                 Value::Import(at) if fixup.apply == Apply::Abs64 => {
                     let Some(place) = place.get_mut(..8) else {
+                        // alloc: error path
                         return Err(fail(fixup, Bad::PastEnd { apply: fixup.apply, need: 8 }.to_string()));
                     };
                     place.fill(0);
@@ -546,6 +594,7 @@ impl Reloc<'_> {
                 Value::Import(_) => {
                     return Err(fail(
                         fixup,
+                        // alloc: error path
                         format!(
                             "{} is imported: reaching it this way needs a copy relocation, which blaze \
                              does not make; reach it through the GOT",
@@ -559,6 +608,7 @@ impl Reloc<'_> {
                 out.rebase.push(fixup.at);
             }
             let ctx = Ctx { arch: self.arch, format: self.format, s, a: fixup.addend, p, g, m, base: self.base, tls: self.tls };
+            // alloc: error path
             reloc::apply(fixup.apply, &ctx, place).map_err(|it| fail(fixup, it.to_string()))?;
         }
         Ok(())
@@ -566,13 +616,16 @@ impl Reloc<'_> {
 
     /// The jump table's cells in a full link: each filled slot's body's address, rebased.
     fn cells(&self, piece: PieceRef<'_>, field: &mut [u8], out: &mut Loader) -> Result<(), LinkError> {
+        out.rebase.reserve(field.len() / 8);
         for (slot, body) in self.state.filled_cells() {
             let at = slot as usize * 8;
             let addr = self
                 .state
                 .addr_of(body)
+                // alloc: error path
                 .ok_or_else(|| error(None, format!("{} is not defined", self.symbols.describe(body))))?;
             let cell = field.get_mut(at..at + 8).ok_or_else(|| {
+                // alloc: error path
                 error(None, format!("slot {slot} is past the jump table's {} bytes", piece.size))
             })?;
             cell.copy_from_slice(&addr.to_le_bytes());
@@ -591,17 +644,20 @@ impl<'a> Stage<'a> {
     /// The function indexes of wasm code by code address: the imports first (every wasm
     /// import is a function), then the pieces of the code space and the functions the
     /// writer synthesizes (one at the start of each of its code regions), by address.
-    fn wasm_code(&self, regions: &[Region]) -> Vec<u64> {
-        let mut code: Vec<u64> = self
-            .new
-            .live_pieces()
-            .filter(|it| regions.get(it.region as usize).is_some_and(|r| r.prot.exec))
-            .map(|it| it.addr)
-            .chain(regions.iter().filter(|it| it.prot.exec && matches!(it.class, Class::Synthetic(_))).map(|it| it.addr))
-            .collect();
+    fn wasm_code(&self, regions: &[Region]) -> &'a [u64] {
+        let mut code = collect_in(
+            self.new
+                .live_pieces()
+                .filter(|it| regions.get(it.region as usize).is_some_and(|r| r.prot.exec))
+                .map(|it| it.addr)
+                .chain(
+                    regions.iter().filter(|it| it.prot.exec && matches!(it.class, Class::Synthetic(_))).map(|it| it.addr),
+                ),
+            self.arena,
+        );
         radix::sort(&mut code);
         code.dedup();
-        code
+        code.leak()
     }
 
     /// Where a piece's bytes come from: what the stage made it, else (in a full link or
@@ -631,25 +687,24 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        let mut ids: Vec<(u32, u64, PieceId)> =
-            self.write.iter().filter_map(|id| self.new.piece(id).map(|it| (it.region, it.addr, id))).collect();
+        let arena = self.arena;
+        let mut ids: FrameVec<'a, (u32, u64, PieceId)> = Vec::with_capacity_in(self.write.len(), arena);
+        ids.extend(self.write.iter().filter_map(|id| self.new.piece(id).map(|it| (it.region, it.addr, id))));
         radix::sort_copy_by_key(&mut ids, |&(region, addr, id)| {
             (u128::from(region) << 96) | (u128::from(addr) << 32) | u128::from(id)
         });
         let regions = self.new.regions();
-        let mut buffers: Vec<Vec<u8>> = if full {
-            self.new
-                .spaces
-                .iter()
-                .map(|it| if has_bytes(it) { vec![0; it.region.size as usize] } else { Vec::new() })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let mut scratch: Vec<u8> = Vec::new();
+        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(if full { self.new.spaces.len() } else { 0 });
+        if full {
+            for space in &self.new.spaces {
+                // alloc: a full link's regions, one zeroed buffer each, kept as the image's bytes
+                buffers.push(if has_bytes(space) { vec![0; space.region.size as usize] } else { Vec::new() });
+            }
+        }
+        let mut scratch: &'a mut [u8] = &mut [];
         let mut cells: Option<PieceId> = None;
-        let mut owners: Vec<PieceId> = Vec::new();
-        let mut back: Vec<(u32, usize, Range<usize>)> = Vec::new();
+        let mut owners: FrameVec<'a, PieceId> = Vec::with_capacity_in(ids.len(), arena);
+        let mut back: FrameVec<'a, (u32, usize, Range<usize>)> = Vec::new_in(arena);
         let loaders = {
             let state = &self.new;
             let symbols: &Symbols = self.symbols;
@@ -660,10 +715,16 @@ impl<'a> Stage<'a> {
                 .with_min_len(64)
                 .fold(Wants::default, |mut wants, &(_, _, id)| {
                     let piece = state.piece(id).expect("live");
+                    let fixups = piece.fixups();
+                    // At most a target, a minus and a GOT target each: one growth per piece at
+                    // most, never one per fixup.
+                    wants.syms.reserve(1 + 3 * fixups.len());
+                    wants.got.reserve(fixups.len());
+                    wants.plt.reserve(fixups.len());
                     if let What::Got { target, .. } = piece.what() {
                         wants.syms.push(target);
                     }
-                    for fixup in piece.fixups() {
+                    for fixup in fixups {
                         wants.syms.push(fixup.target);
                         wants.syms.extend(fixup.minus);
                         if let Some(kind) = reloc::got_kind(fixup.apply) {
@@ -681,7 +742,7 @@ impl<'a> Stage<'a> {
                 })
                 .reduce(Wants::default, Wants::join);
             let column = Column::build(&resolver, wants);
-            let wasm = if self.output.format == Format::Wasm { self.wasm_code(&regions) } else { Vec::new() };
+            let wasm: &[u64] = if self.output.format == Format::Wasm { self.wasm_code(&regions) } else { &[] };
             if !full {
                 let len: u64 = ids
                     .iter()
@@ -691,16 +752,17 @@ impl<'a> Stage<'a> {
                         (has_bytes(space) && piece.what() != What::Cells).then_some(piece.size)
                     })
                     .sum();
-                scratch = vec![0; len as usize];
+                scratch = arena.alloc_slice_fill_with(len as usize, |_| 0);
             }
-            let mut rest: Vec<&mut [u8]> = buffers.iter_mut().map(Vec::as_mut_slice).collect();
-            let mut taken = vec![0u64; state.spaces.len()];
-            let mut free: &mut [u8] = &mut scratch;
+            let mut rest = collect_in(buffers.iter_mut().map(Vec::as_mut_slice), arena);
+            let taken = arena.alloc_slice_fill_with(state.spaces.len(), |_| 0u64);
+            let mut free: &mut [u8] = &mut *scratch;
             let mut used = 0usize;
             let mut jobs: Vec<Job<'_, '_>> = Vec::with_capacity(ids.len());
-            for &(region, _, id) in &ids {
+            for &(region, _, id) in ids.iter() {
                 let piece = state.piece(id).expect("live");
                 let Some(space) = state.spaces.get(region as usize) else {
+                    // alloc: error path
                     return Err(error(function_of(piece), format!("{} is in no region", symbols.describe(piece.sym))));
                 };
                 if !has_bytes(space) {
@@ -709,6 +771,7 @@ impl<'a> Stage<'a> {
                     }
                     return Err(error(
                         function_of(piece),
+                        // alloc: error path
                         format!("{} has relocations in a zeroed region", symbols.describe(piece.sym)),
                     ));
                 }
@@ -721,6 +784,7 @@ impl<'a> Stage<'a> {
                     let Some(skip) = offset.checked_sub(taken[region as usize]) else {
                         return Err(error(
                             function_of(piece),
+                            // alloc: error path
                             format!("{} overlaps the piece before it", symbols.describe(piece.sym)),
                         ));
                     };
@@ -739,10 +803,10 @@ impl<'a> Stage<'a> {
                 };
                 let source = self.source(piece);
                 let fixups = piece.fixups();
-                let cuts = split(fixups);
+                let mut cuts = split(fixups).peekable();
                 let mut field = field;
-                for (at, &(lo, first)) in cuts.iter().enumerate() {
-                    let (hi, last) = cuts.get(at + 1).map_or((piece.size, fixups.len() as u32), |it| (it.0, it.1));
+                while let Some((lo, first)) = cuts.next() {
+                    let (hi, last) = cuts.peek().map_or((piece.size, fixups.len() as u32), |it| (it.0, it.1));
                     let (mine, after) = std::mem::take(&mut field).split_at_mut((hi - lo) as usize);
                     field = after;
                     owners.push(id);
@@ -760,7 +824,7 @@ impl<'a> Stage<'a> {
                 tls: state.tls,
                 got_by_library,
                 imports: &state.resolved.imports,
-                wasm: &wasm,
+                wasm,
             };
             let loaders: Vec<Loader> = jobs
                 .into_par_iter()
@@ -770,6 +834,7 @@ impl<'a> Stage<'a> {
                     reloc.run(index as u32, job, &mut out);
                     out
                 })
+                // alloc: one loader per rayon batch of jobs, a few per thread, never one per job
                 .collect();
             loaders
         };
@@ -788,14 +853,14 @@ impl<'a> Stage<'a> {
                 self.new.spaces[region as usize].bytes.write(offset, &scratch[range]);
             }
         }
-        drop(scratch);
-        let mut records: Vec<(u32, u32, u32, u32, u32, u32)> = Vec::new();
+        let mut records: FrameVec<'a, (u32, u32, u32, u32, u32, u32)> =
+            Vec::with_capacity_in(loaders.iter().map(|it| it.records.len()).sum(), arena);
         for (at, loader) in loaders.iter().enumerate() {
             records.extend(loader.records.iter().map(|it| (it.0, at as u32, it.1, it.2, it.3, it.4)));
         }
         radix::sort_copy_by_key(&mut records, |it| it.0);
-        let mut rebase: Vec<u64> = Vec::new();
-        let mut binds: Vec<state::Bind> = Vec::new();
+        let mut rebase: FrameVec<'a, u64> = Vec::new_in(arena);
+        let mut binds: FrameVec<'a, state::Bind> = Vec::new_in(arena);
         let mut at = 0;
         while at < records.len() {
             let piece = owners[records[at].0 as usize];
@@ -830,14 +895,16 @@ impl<'a> Stage<'a> {
         let piece = self.new.piece(id).expect("live");
         let region = piece.region as usize;
         let start = (piece.addr - self.new.spaces[region].region.addr) as usize;
-        let mut writes: Vec<(usize, [u8; 8])> = Vec::with_capacity(self.dirty_cells.len());
+        let mut writes: FrameVec<'a, (usize, [u8; 8])> = Vec::with_capacity_in(self.dirty_cells.len(), self.arena);
         for slot in self.dirty_cells.iter() {
             let Some(body) = self.new.cell(slot) else { continue };
             let addr = self
                 .new
                 .addr_of(body)
+                // alloc: error path
                 .ok_or_else(|| error(None, format!("{} is not defined", self.symbols.describe(body))))?;
             if u64::from(slot) * 8 + 8 > piece.size {
+                // alloc: error path
                 return Err(error(None, format!("slot {slot} is past the jump table's {} bytes", piece.size)));
             }
             writes.push((start + slot as usize * 8, addr.to_le_bytes()));
@@ -847,7 +914,7 @@ impl<'a> Stage<'a> {
             bytes.write(at, &cell);
         }
         if !self.dirty_cells.is_empty() || !self.emptied.is_empty() {
-            let rebase: Vec<u64> = self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8).collect();
+            let rebase = collect_in(self.new.filled_cells().map(|(slot, _)| u64::from(slot) * 8), self.arena);
             self.new.set_loader(id, &rebase, &[]);
         }
         Ok(())
@@ -901,12 +968,14 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
     fn build(mut entries: Vec<(PieceId, T)>) -> Owned<T> {
         radix::sort_by_key(&mut entries, |(id, it)| radix::pack_64(it.addr(), u64::from(*id)));
         let (owners, items) = entries.into_iter().unzip();
+        // alloc: once per list per full link; the state shares the list
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
 
     /// The list without the entries of `drop`'s pieces, and with `entries`: one pass.
     fn splice(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>) -> Owned<T> {
         if drop.is_empty() && entries.is_empty() {
+            // clone: two reference counts; the list is shared, not copied
             return self.clone();
         }
         radix::sort_by_key(&mut entries, |(id, it)| radix::pack_64(it.addr(), u64::from(*id)));
@@ -921,6 +990,7 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
                 items.push(it);
                 owners.push(id);
             }
+            // clone: an entry is addresses and ids, and a function's name an `Arc<str>`: no allocation
             items.push(item.clone());
             owners.push(*owner);
         }
@@ -928,6 +998,7 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
             items.push(it);
             owners.push(id);
         }
+        // alloc: once per list a stage changes; the state shares the list
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
 }
@@ -941,7 +1012,7 @@ pub(crate) struct Lists {
     pub got: Owned<GotEntry>,
     pub functions: Owned<Function>,
     /// The debug sections, by DWARF name.
-    pub debug: Arc<Vec<(&'static str, Vec<u8>)>>,
+    pub debug: Arc<[(&'static str, Vec<u8>)]>,
     pub totals: Totals,
 }
 
@@ -1049,6 +1120,7 @@ impl Entries<'_> {
                 };
                 match kind {
                     GotKind::TpOff => Holds::TpOff(
+                        // alloc: error path
                         reloc::tp_offset(self.arch, tls, tls.addr + at).map_err(|it| error(None, it.to_string()))?,
                     ),
                     GotKind::TlsGd => Holds::TlsGd { import: None, offset: at },
@@ -1060,12 +1132,11 @@ impl Entries<'_> {
     }
 
     /// The entries of `ids`' live pieces, in parallel.
-    fn collect(&self, ids: &[PieceId], want: Want) -> Result<Batch, LinkError> {
+    fn collect(&self, ids: impl IndexedParallelIterator<Item = PieceId>, want: Want) -> Result<Batch, LinkError> {
         let state = self.resolver.state;
-        ids.par_iter()
-            .with_min_len(256)
+        ids.with_min_len(256)
             .try_fold(Batch::default, |mut out, id| {
-                if let Some(piece) = state.piece(*id) {
+                if let Some(piece) = state.piece(id) {
                     self.of(piece, want, &mut out)?;
                 }
                 Ok(out)
@@ -1097,9 +1168,9 @@ impl<'a> Stage<'a> {
             indexed_code: self.plan.indexed_code,
         };
         let all = Want { loader: true, got: true, functions: true };
+        let arena = self.arena;
         let (mut lists, functions_changed) = if self.full || !self.old.laid_out {
-            let ids: Vec<PieceId> = (0..self.new.piece_count()).collect();
-            let batch = entries.collect(&ids, all)?;
+            let batch = entries.collect((0..self.new.piece_count()).into_par_iter(), all)?;
             let lists = Lists {
                 rebase: Owned::build(batch.rebase),
                 binds: Owned::build(batch.binds),
@@ -1115,25 +1186,26 @@ impl<'a> Stage<'a> {
             affected.extend(self.write.iter());
             affected.extend(self.fresh.iter());
             affected.extend(self.removed.iter().copied());
-            let ids: Vec<PieceId> = affected.iter().collect();
+            let ids = collect_in(affected.iter(), arena);
             let (old_resolved, new_resolved) = (&self.old.resolved, &self.new.resolved);
             let imports = !Arc::ptr_eq(&old_resolved.imports, &new_resolved.imports)
                 || !Arc::ptr_eq(&old_resolved.libraries, &new_resolved.libraries)
                 || self.old.tls != self.new.tls;
-            let batch = entries.collect(&ids, Want { loader: true, got: !imports, functions: true })?;
+            let batch = entries.collect(ids.par_iter().copied(), Want { loader: true, got: !imports, functions: true })?;
             let (binds, got) = if imports {
-                let every: Vec<PieceId> = (0..self.new.piece_count()).collect();
-                let more = entries.collect(&every, Want { loader: false, got: true, functions: false })?;
+                let count = self.new.piece_count();
+                let more = entries.collect((0..count).into_par_iter(), Want { loader: false, got: true, functions: false })?;
                 let state = &self.new;
-                let binds: Vec<(PieceId, Bind)> = every
-                    .par_iter()
-                    .filter_map(|id| state.piece(*id))
+                let binds: Vec<(PieceId, Bind)> = (0..count)
+                    .into_par_iter()
+                    .filter_map(|id| state.piece(id))
                     .flat_map_iter(|piece| {
                         piece
                             .binds()
                             .iter()
                             .map(move |(at, import, addend)| (piece.id, Bind { addr: piece.addr + at, import: *import, addend: *addend }))
                     })
+                    // alloc: only when the imports change: every bind made again, as in a full link
                     .collect();
                 (Owned::build(binds), Owned::build(more.got))
             } else {
@@ -1158,8 +1230,10 @@ impl<'a> Stage<'a> {
             }
             let mut functions = batch.functions;
             if !stale.is_empty() {
-                let ids: Vec<PieceId> = stale.iter().collect();
-                functions.extend(entries.collect(&ids, Want { loader: false, got: false, functions: true })?.functions);
+                let ids = collect_in(stale.iter(), arena);
+                functions.extend(
+                    entries.collect(ids.par_iter().copied(), Want { loader: false, got: false, functions: true })?.functions,
+                );
                 affected.extend(ids);
             }
             let touched = affected.iter().any(|id| {
@@ -1171,6 +1245,7 @@ impl<'a> Stage<'a> {
                 binds,
                 got,
                 functions: old.functions.splice(&affected, functions),
+                // clone: a reference count; the sections are shared until a function changes
                 debug: old.debug.clone(),
                 totals,
             };
@@ -1179,9 +1254,10 @@ impl<'a> Stage<'a> {
         drop(entries);
         lists.debug = match self.output.debug {
             Debug::None => Arc::default(),
-            Debug::Lines if functions_changed || self.spans_changed || self.full => Arc::new(self.debug(&lists)?),
+            Debug::Lines if functions_changed || self.spans_changed || self.full => Arc::from(self.debug(&lists)?),
             Debug::Lines => lists.debug,
         };
+        // alloc: once per stage; the state shares the lists
         self.new.lists = Arc::new(lists);
         Ok(())
     }
@@ -1194,12 +1270,15 @@ impl<'a> Stage<'a> {
         let mut out = Vec::with_capacity(exports.len());
         for (name, symbol, data) in exports {
             let Some(sym) = self.symbols.find_sym_name(symbol) else {
+                // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not defined")));
             };
             let value = resolver
                 .value(sym)
+                // alloc: error path
                 .map_err(|it| error(None, format!("the export `{name}`: {}", it.say(self.symbols))))?;
             let Value::Image(addr) = value else {
+                // alloc: error path
                 return Err(error(None, format!("the export `{name}` is not in the image")));
             };
             let (kind, size) = match self.new.home(sym).and_then(|(p, o)| Some((self.new.piece(p)?, o))) {
@@ -1215,6 +1294,7 @@ impl<'a> Stage<'a> {
                 None => (SymbolKind::Other, 0),
             };
             let kind = if data { SymbolKind::Data } else { kind };
+            // alloc: the writer's export table owns its names (model.rs `Export`), one per export
             out.push(Export { name: name.to_owned(), addr, size, kind });
         }
         let image = |name: &str| -> Option<u64> {
@@ -1229,12 +1309,15 @@ impl<'a> Stage<'a> {
         };
         let entry = match entry {
             Some(entry) => {
+                // alloc: error path
                 Some(image(entry).ok_or_else(|| error(None, format!("the entry point `{entry}` is not in the image")))?)
             }
             None => None,
         };
-        let generation = self.new.generation.to_le_bytes();
-        let full = blaze_ids::ContentId::of("blaze v2 link image 1", &[&self.new.lineage[..], &generation].concat());
+        let full = blaze_ids::Hasher::new("blaze v2 link image 1")
+            .update(&self.new.lineage[..])
+            .update(&self.new.generation.to_le_bytes())
+            .finish();
         let mut id = [0; 16];
         id.copy_from_slice(&full.0[..16]);
         let (init, fini) = (image("_init"), image("_fini"));
@@ -1243,10 +1326,12 @@ impl<'a> Stage<'a> {
 
     /// The debug sections of every Rust function, in address order: one pass over their
     /// lines into rows, then [`crate::dwarf::sections`].
-    fn debug(&self, lists: &Lists) -> Result<Vec<(&'static str, Vec<u8>)>, LinkError> {
+    fn debug(&self, lists: &Lists) -> Result<[(&'static str, Vec<u8>); 4], LinkError> {
         let state = &self.new;
-        let mut functions = Vec::new();
-        let mut infos = Vec::new();
+        let arena = self.arena;
+        let count = lists.functions.items.len();
+        let mut functions = Vec::with_capacity_in(count, arena);
+        let mut infos = Vec::with_capacity_in(count, arena);
         let mut rows_len = 0usize;
         for (owner, function) in lists.functions.owners.iter().zip(lists.functions.items.iter()) {
             let Some(info) = state.piece(*owner).and_then(PieceRef::function) else { continue };
@@ -1254,10 +1339,10 @@ impl<'a> Stage<'a> {
             infos.push(info);
             functions.push(function);
         }
-        let mut rows: Vec<crate::dwarf::Row> = Vec::with_capacity(rows_len);
-        let mut files: Vec<&str> = Vec::new();
+        let mut rows: FrameVec<'a, crate::dwarf::Row> = Vec::with_capacity_in(rows_len, arena);
+        let mut files: FrameVec<'_, &str> = Vec::new_in(arena);
         let mut file_of: FxHashMap<(IdNo, u32), u32> = FxHashMap::default();
-        let mut views = Vec::with_capacity(functions.len());
+        let mut views = Vec::with_capacity_in(functions.len(), arena);
         let mut last: Option<(&blaze_ids::ContentId, IdNo, &crate::position::Spans)> = None;
         for (info, function) in infos.into_iter().zip(functions) {
             let start = rows.len() as u32;
@@ -1268,6 +1353,7 @@ impl<'a> Stage<'a> {
                     _ => {
                         let found = self.symbols.find_id(anchor).and_then(|id| Some((id, state.span_table(id)?)));
                         let (id, table) = found.ok_or_else(|| {
+                            // alloc: error path
                             error(Some(info.key), format!("a line in {anchor:?}, whose span table the link was not given"))
                         })?;
                         last = Some((anchor, id, table));
@@ -1275,6 +1361,7 @@ impl<'a> Stage<'a> {
                     }
                 };
                 let at = table.span(line.span.index).ok_or_else(|| {
+                    // alloc: error path
                     error(Some(info.key), format!("span {} of {anchor:?}, past its table", line.span.index))
                 })?;
                 let next = files.len() as u32;
@@ -1295,6 +1382,7 @@ impl<'a> Stage<'a> {
             Arch::Wasm32 => 4,
             Arch::X86_64 | Arch::Aarch64 => 8,
         };
+        // alloc: error path
         crate::dwarf::sections(&views, &rows, &files, size).map_err(|it| error(None, format!("debug info: {it}")))
     }
 
@@ -1313,6 +1401,7 @@ impl Parts {
         &'p self,
         stage: &'p Stage<'_>,
         contents: &'p [&'p [u8]],
+        // dyn: `Placed::symbol`'s type (model.rs); a writer asks it a few fixed names per link
         symbol: &'p dyn Fn(&str) -> Option<u64>,
     ) -> Placed<'p> {
         let lists = &stage.new.lists;
@@ -1351,18 +1440,19 @@ mod tests {
     #[test]
     fn many_fixups_split_at_their_boundaries_and_others_do_not() {
         let few: Vec<Fixup> = (0..10).map(|it| fixup(it * 8, Apply::Abs64)).collect();
-        assert_eq!(split(&few), [(0, 0)]);
+        let cuts = |fixups: &[Fixup]| split(fixups).collect::<Vec<_>>();
+        assert_eq!(cuts(&few), [(0, 0)]);
         let many: Vec<Fixup> = (0..SPLIT as u64 * 2 + 5).map(|it| fixup(it * 8, Apply::Abs64)).collect();
-        assert_eq!(split(&many), [(0, 0), (SPLIT as u64 * 8, SPLIT as u32), (SPLIT as u64 * 16, 2 * SPLIT as u32)]);
+        assert_eq!(cuts(&many), [(0, 0), (SPLIT as u64 * 8, SPLIT as u32), (SPLIT as u64 * 16, 2 * SPLIT as u32)]);
         let mut overlapping = many.clone();
         overlapping[100].at = overlapping[99].at + 4;
-        assert_eq!(split(&overlapping), [(0, 0)]);
+        assert_eq!(cuts(&overlapping), [(0, 0)]);
         let mut native = many.clone();
         native[7].apply = Apply::Native(1);
-        assert_eq!(split(&native), [(0, 0)]);
+        assert_eq!(cuts(&native), [(0, 0)]);
         let mut unsorted = many;
         unsorted.swap(3, 4);
-        assert_eq!(split(&unsorted), [(0, 0)]);
+        assert_eq!(cuts(&unsorted), [(0, 0)]);
     }
 
     /// A splice against rebuilding the list from what is left and what is new.
@@ -1386,14 +1476,8 @@ mod tests {
     /// The column gives back what was put in it, and nothing for a symbol it was not given.
     #[test]
     fn a_column_reads_back_values_cells_and_errors() {
-        let mut column = Column { shards: vec![Vec::new(); Symbols::SHARDS], whys: Vec::new(), cells: Vec::new() };
         let syms: Vec<Sym> = (0..6).map(|it| Symbols::join(it % 3, it * 5)).collect();
-        for sym in &syms {
-            let (shard, at) = Symbols::split(*sym);
-            if column.shards[shard].len() <= at {
-                column.shards[shard].resize(at + 1, [0, UNSET]);
-            }
-        }
+        let mut column = Column::sized(&syms, 0);
         *column.slot_mut(syms[0]) = [0x1000, IMAGE];
         *column.slot_mut(syms[1]) = [7, ABSOLUTE];
         *column.slot_mut(syms[2]) = [3, IMPORT];

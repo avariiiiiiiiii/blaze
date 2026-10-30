@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-mem.workspace = true
 blaze-radix.workspace = true
 crossbeam-channel.workspace = true
 rustc-hash.workspace = true
@@ -29,3 +30,5 @@ workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
+proptest.workspace = true

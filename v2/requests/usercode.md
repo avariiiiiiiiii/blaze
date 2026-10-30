@@ -114,6 +114,8 @@ reads through its own internal calls, which no interposer sees: glibc's `localti
 
 Until all three are in, every traced run keeps `E *`, which is sound.
 
+> answered by lane cargo (cargo-inbox): done at library/std/src/sys/env/unix.rs `pub fn walked` (called first in `env()`) and library/std/src/sys/process/unix/unix.rs `Command::spawn`/`exec` (after `capture_env`, when it is `None`, i.e. the child gets `environ` whole; a changed-but-not-cleared environment is captured through `env()`, so it is covered there). The symbol is resolved with std's own weak mechanism: `dlsym` on glibc and Apple, `extern_weak` on other Linux and Android, so an interposer preloaded into the process defines it; other Unix targets make no call. Signature: `void __blaze_environ_walked(void)`. The marker is part 2, link's, as revised; std exports nothing. Listed in library/UPSTREAM's notes.
+
 ## From concurrency: lock audit (2026-10-29)
 
 Read-only audit of `crates/blaze-expand/`, `proc-macro-api/`, `proc-macro-srv/`,
@@ -258,6 +260,18 @@ I will make the `Trace` change in `test/queue.rs` once this is in; nothing of mi
 
 > forwarded to usercode: `crates/blaze-usercode/src/trace.rs` is lane usercode's.
 
+> applied (usercode): `trace::assemble` takes `impl IntoIterator<Item = &'l Line>`, and
+> `trace::assemble_seen` (public) takes borrowed `(Seen, &str)` pairs, so `Trace::Lines` can chain an
+> `Arc<[Line]>` of the server's lines with the test's own at no copy. The `test/queue.rs` change is
+> yours, as you said.
+
+> and (usercode): the queue half is in already. `Server` interns the record's lines once and keeps
+> the lines of no scope once (`common`, `common_kinds`), and results share them as one
+> `Arc<Run>` (`shared`), so no line is cloned per test.
+
+> dropped by usercode-fast-tests (2026-10-29): the parent, usercode, makes the queue half in
+> `test/queue.rs` itself.
+
 ## From safety-audit
 
 From `safety-audit-usercode` (report `/tmp/blaze-lanes/v2-safety-audit-usercode.md`). The
@@ -284,16 +298,30 @@ Texts used many times below (paste the text, with the name filled in):
 ### MAY BE UNSOUND
 
 1. `crates/blaze-cargo/src/sandbox/linux.rs:1709` (`send`) and `:1733` (`received`): the control buffer is `let mut space = [0u8; 64]`, alignment 1, but `CMSG_FIRSTHDR(&msg)` returns its start as `*mut cmsghdr` and the code writes (`(*cmsg).cmsg_level = ..`, `cmsg_type`, `cmsg_len`) and reads (`(*cmsg).cmsg_type`) fields through it, which needs `align_of::<cmsghdr>()` (8). Nothing aligns `space`. Fix: `#[repr(C, align(8))] struct Control([u8; 64]);` (or `[u64; 8]`), used for `space` in both. The SAFETY comments proposed below for those derefs assume that fix.
+
+   > applied (usercode-safety-sandbox): `send`/`received` are `raw::send_descriptor`/`received_descriptor` in `sandbox/linux/raw.rs` (usercode-safety moved them), whose `space` is `#[repr(C, align(8))] struct Control([u8; 64])` with `const _: () = assert!(align_of::<libc::cmsghdr>() <= align_of::<Control>())`. Verified, and the comments' offsets corrected for 32-bit (header 12, CMSG_SPACE(4) 16 there).
 2. `crates/blaze-cargo/src/sandbox/linux.rs` tests (`:2473` `probe`, `:2602` `run_as`, `:2636`, `:2687`, `:2834` `run`) and `crates/blaze-cargo/src/sandbox/macos.rs:801` (`probe`) call the sandbox in the test binary's own process, which libtest runs on many threads. The forked children then allocate, format and print (`confined`, `sandbox`, `first_process`, `eprintln!`, `sandbox_init_with_parameters`), which after a fork of a multi-threaded process may use a lock another thread held (a deadlock, or allocator state torn mid-update). The [fork] invariant holds for `blaze sandbox` only. Fix: have the tests run the sandbox through the command (`current_exe` + `sandbox`, as `probed` does), or in a child process of their own.
+
+   > applied (usercode-safety-sandbox): in a child process of their own. `current_exe` in a test is the test binary, not blaze, and libtest runs each test on a thread of its own even with `--test-threads=1` (`library/test/src/lib.rs` `run_test`), so re-running a test is no one-thread process. New `crates/blaze-cargo/src/sandbox/alone.rs` (`#[cfg(all(test, any(linux, macos)))]`): `alone::{probe, launch, run, run_as}` run the test binary again with `BLAZE_SANDBOX_TEST_ALONE=<job JSON>` and a flag libtest refuses; a `#[used]` `.init_array` / `__DATA,__mod_init_func` entry (`take_over`) does the job before `main`, while the process is one thread, writes the `Result<i32, String>` to a file and exits. linux.rs `probe`, `v2::launch`, `run_as`, `store_bash`'s and `run_in`'s `run` and the refused-view `run`; macos.rs `probe` and `v2::launch`; v2.rs `the_launcher_runs_the_program...` `probe` and `launch` all go through it. `run_as` is `pub(super)` for it; `Probe` derives serde under `cfg(test)`. v2.rs `a_sandbox_that_cannot_be_made...` stays in-process: it fails in `backend_spec`, before any fork. Not compiled.
 3. `crates/blaze-usercode/src/trace.rs:400` (`os_from`, `#[cfg(not(unix))]`): `OsStr::from_encoded_bytes_unchecked(bytes)` on bytes from `trace::decode` and `index::Shape::decode`, both safe `pub fn`s that take any `&[u8]` (a report file read back in `confine.rs:102`, a shape from the store). Bytes not from `as_encoded_bytes` of this platform and this Rust version are UB on Windows, and nothing checks them. Fix: encode and decode the Windows form as UTF-16 units (`encode_wide` / `OsString::from_wide`), which is safe for any bytes; or check the bytes before the call.
+
+> applied (usercode-safety-crates): `trace::os_bytes` returns `Cow<'_, [u8]>`: borrowed on Unix and WASI (same bytes as before), and on Windows the UTF-16 units, little-endian (`le_of_wide`); `os_from` decodes them with `OsString::from_wide` (`wide_of_le`, any even length), so `os_in`, `path_in`, `trace::decode` and `index::Shape::decode` take any bytes safely. The WTF-8 decoder an earlier change used is gone. `index::keyed` now merges the environment by `OsStr` order (the order `env_all` and `normalize` sort by) and encodes `ALL_ENV_NAME` and its hex value through `os_bytes`, so it agrees with `RunKey::traced` on every platform (on Unix the same comparisons and bytes as before). The hidden-directory test in `walk_in` reads `as_encoded_bytes` (ASCII is itself there). On Windows only, every domain over these bytes is another (`trace::os_domain!` adds ` utf-16le`: listing, package tree, tree, `RunKey::DOMAIN`, `Given::DOMAIN`, disk path and stamp, warm key, shape id), and the report and shape magics are `blaze v2 report2` and `blaze v2 shape 2`. Tests: `windows_names_round_trip_as_their_units`, `os_bytes_and_os_from_agree`. `crates/blaze-global/src/public.rs` calls `os_bytes` too: request 1 of `v2/requests/usercode-safety-crates.md` (use `as_encoded_bytes` there).
 4. `crates/blaze-macro-wasm/src/lib.rs:742`: `Module::deserialize_file(engine(), &file)` loads `<module>.<key>.cwasm` beside the module as native code with no check of its bytes. The comment says it is "what `serialize` wrote for this key", but only the store's copy is checked against its checksum. Any other writer of that path (another process of the user's, a stale or foreign file of the same name) gets its bytes run as machine code in blaze. Fix: check the file's hash against what the store has under `key` (or load only from the store) before `deserialize_file`.
+
+> applied (usercode-safety-crates): already fixed in the tree before this lane: `Wasm::compile` loads machine code only from the store (`get_lasting(&code_key(..))`, which checks each value's checksum, then `Module::deserialize`), and nothing is written beside or read from a `.cwasm` next to the module (the `prepare_soon` test asserts none is there). Checked; no change. Noted for blaze-store's owner: a value whose checksum fails is forgotten and read as a miss, so the module is compiled again; that is the store's rule, not this crate's.
 5. (text, not crate code) `crates/blaze-macro-wasm/guest/proc_macro.rs:1343`: `__blaze::input` does `slice::from_raw_parts(ptr, len)` for the safe `pub fn`s `__blaze::expand1` and `expand2`, which any crate built against this `proc_macro` can call with any pointer. The exports pass what the host wrote, but the safe API doesn't hold that. It stays inside the wasm instance. Fix: make `expand1`/`expand2` `unsafe fn` with `/// # Safety\n/// \`ptr\`..\`ptr + len\` (and \`attr\`..\`attr + attr_len\`) is memory of this module the host wrote the input into (\`__blaze::alloc\`), live until the call returns.` and an `unsafe {}` at the generated export's call.
 
+> applied (usercode-safety-crates): already sound in the tree, by a stronger fix than this one, so `expand1`/`expand2` stay safe: `__blaze::input` no longer reads through the pointer; it finds `ptr` among the buffers `__blaze::alloc` gave out (`ROOM`) and slices that `Vec` to `len`, panicking otherwise, so no caller can make it read memory that is not an input. An `unsafe fn` with the proposed `# Safety` would state an obligation the code no longer has. Checked; no change.
+
 ### crates/blaze-cargo/src/sandbox.rs
+
+> applied (usercode-safety-sandbox): verified: the `pass_signals_to` block is split into `mem::zeroed`, `sigemptyset` and `sigaction`, each with its SAFETY (usercode-safety), and `pass_on`'s `kill` has one. Added `mod alone` (tests only, MAY BE UNSOUND 2).
 
 - `crates/blaze-cargo/src/sandbox.rs:757` block: 3 ops (`mem::zeroed`, `sigemptyset`, `sigaction`). Split inside the `for` body: `// SAFETY: \`sigaction\` is plain C data for which all-zero bytes are a valid value (no handler, no flags, an empty mask).` `let mut action: libc::sigaction = unsafe { std::mem::zeroed() };` / `action.sa_sigaction = ..;` / `// SAFETY: \`action.sa_mask\` is a live \`sigset_t\` of this frame.` `unsafe { libc::sigemptyset(&mut action.sa_mask) };` / `// SAFETY: \`action\` is initialized and outlives the call, and its handler \`pass_on\` only loads an atomic and calls \`kill\`, both async-signal-safe; a null old action is allowed.` `unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };`
 
 ### crates/blaze-cargo/src/sandbox/linux.rs
+
+> applied (usercode-safety-sandbox): usercode-safety moved every system call below into safe functions of `sandbox/linux/raw.rs` (one op and a SAFETY each; `fork` and `close` stay `unsafe fn` with `# Safety`; `const` size asserts on the kernel structures), so linux.rs keeps 23 blocks: `raw::fork`, `raw::close` and the test's `sysconf`/`mmap`/`add`/`copy_nonoverlapping`/`munmap`, each split and commented as listed. Checked every one against the code. Rewrote: the `namespaces` fork (the child also unshares), the two `run_in` forks and the two first-process forks, which named `blaze sandbox` as the only one-thread process (now also a test's `alone` process); raw.rs's `send`/`received` offsets, true on 64-bit only before.
 
 - `:462` block: 2 ops, no SAFETY. [ids].
 - `:478` block (`failed`): no SAFETY. [exit].
@@ -394,6 +422,8 @@ Texts used many times below (paste the text, with the name filled in):
 
 ### crates/blaze-cargo/src/sandbox/macos.rs
 
+> applied (usercode-safety-sandbox): every item was in place (one op, a SAFETY each); checked against the code. Added the optional SAFETY on `unsafe extern "C"`. The fork's comment now says the child may allocate and print, and names a test's `alone` process as the other one-thread one.
+
 - `:66` `unsafe extern "C"`: not checked by the lint; optional: `// SAFETY: libsystem_sandbox's \`int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char *const parameters[], char **errorbuf)\`, as \`sandbox-exec\` calls it.`
 - `:214` block: no SAFETY. `// SAFETY: \`buffer\` is 1024 writable bytes of this frame and its length is passed, so confstr writes at most that many; the length it needed is checked below before the slice.`
 - `:472` block: no SAFETY. `// SAFETY: \`setsid\` takes no arguments and reads no memory; in this forked child it only makes it a session leader.`
@@ -412,6 +442,8 @@ Texts used many times below (paste the text, with the name filled in):
 
 ### crates/blaze-cargo/src/sandbox/v2.rs
 
+> applied (usercode-safety-sandbox): both in place (`[zstat]` on `mem::zeroed`, a SAFETY on `fstat`, `[int fcntl]`); checked. The launcher test is `cfg(any(linux, macos))` now, as `alone` is.
+
 - `:126` block: no SAFETY. [zstat].
 - `:132` block: no SAFETY. [int `fcntl(fd, F_GETFL)`] (a closed descriptor is an error return).
 
@@ -419,10 +451,14 @@ Texts used many times below (paste the text, with the name filled in):
 
 ### crates/blaze-usercode
 
+> applied (usercode-safety-crates): `trace.rs` has no `unsafe` left (MAY BE UNSOUND 3), and `src/lib.rs` already has `#![forbid(unsafe_code)]`. `src/test/fork_server.rs` and `fork_server/recorded.rs` (text): every block has a `// SAFETY:` above it and one op; the `kqueue` and `setpgid` comments already say more than the proposed ones. Nothing in `src/test/queue.rs`.
+
 - `src/trace.rs:400`: MAY BE UNSOUND 3 above. It is the crate's only compiled unsafe (non-unix), so no `forbid`.
 - `src/test/fork_server.rs` is text (`include_str!`'d into the test harness blaze writes), not under the lints: its 26 blocks each have a SAFETY comment and one op; its 3 flagged "fns" are extern declarations. Optional: `:151` and `:457` say only "a plain call". Better: `// SAFETY: \`kqueue\` takes no arguments and reads no memory.` and `// SAFETY: \`setpgid\` takes integers only and reads no memory; \`pid\` is this server's child, not reaped yet.`
 
 ### crates/blaze-macro-wasm
+
+> applied (usercode-safety-crates): already in the tree, checked against the code: `unsafe impl Sync for Db` has its comment, the `Db(unsafe { transmute })` comment is right above it, and the `deserialize` is now of the store's checked bytes with a true comment (MAY BE UNSOUND 4). `guest/proc_macro.rs`: every block has a `// SAFETY:` and one op, and `unsafe impl GlobalAlloc` has its comment; `expand1`/`expand2` stay safe (MAY BE UNSOUND 5). No change.
 
 - `src/lib.rs:151` `unsafe impl Sync for Db`: no SAFETY (the comment above `:150` covers only `Send`). Proposed: `// SAFETY: as for \`Send\`: the pointer is dereferenced only on the thread that expands, while \`Session::run\` holds the database, which it clears before returning or resuming an unwind.`
 - `src/lib.rs:748` block: no SAFETY (the comment at `:739` is above the `let beside`, and the `match` stops the lint). Proposed, on its own line above `.and_then(|it| unsafe {..})`: `// SAFETY: the store gave what it keeps under \`key\`, checked against its checksum as it was read, which \`serialize\` wrote for this key; Wasmtime refuses code of another version, configuration or CPU; other bytes would run as machine code.`
@@ -438,6 +474,8 @@ Texts used many times below (paste the text, with the name filled in):
 
 ### crates/blaze-expand
 
+> applied (usercode-safety-crates): already in the tree, checked against the code: `span_byte_range` is split into its three ops, every `pub unsafe fn` of `sys` has a `# Safety` (the pointer ones say what the caller holds, the rest "None: ..."), and every block has a `// SAFETY:` and one op, including `with_host`'s transmute and `host`'s `&mut *host`. No change.
+
 - `src/native/host.rs:66`, `:138`: SAFETY comments present, one op each. The crate root keeps unsafe, so no `forbid`.
 - `src/native/proc_macro/lib.rs` (crate `blaze-native-proc-macro`, a workspace member through blaze-expand's dependency, with no `[lints]`, so the clippy lints don't reach it; edition 2024 still warns `unsafe_op_in_unsafe_fn`, and none is bare):
   - `:100` block: 3 ops (`write`, `add`, `write`). Split: `// SAFETY: the caller gives \`out\` room for two \`u32\`s (# Safety).` `unsafe { out.write(start) };` / `// SAFETY: the second of those two is inside the same room.` `let second = unsafe { out.add(1) };` / `// SAFETY: \`second\` is the second \`u32\` of the caller's room.` `unsafe { second.write(end) };`
@@ -447,10 +485,14 @@ Texts used many times below (paste the text, with the name filled in):
 
 ### crates/proc-macro-api
 
+> applied (usercode-safety-crates): superseded by usercode-wire's rewrite: the `flat.rs:84` block is gone, and every raw context is now made in `proc_macro_api::wire::raw_context`, which refuses `u32::MAX` first and whose `// SAFETY:` (contexts checked back against `Sent` before use; memory safety doesn't rest on it) is true to `SyntaxContext::from_u32`'s `# Safety`. Checked, with the new `proc-macro-srv/src/wire.rs` and the tests' `from_u32` calls: each block has a `// SAFETY:` and one op. No change by this lane.
+
 - `src/legacy_protocol/msg/flat.rs:84` block: its comment says nothing true ("If someone mess up the communication UB can happen"); `from_u32`'s # Safety says memory safety doesn't rest on the value. Replace: `// SAFETY: \`e\` is a context the server echoes back from the spans this client sent it (\`into_u32\` of this database's contexts); another value gives a panic or another context's hygiene, never UB (\`SyntaxContext::from_u32\`'s # Safety).`
 - `src/legacy_protocol/msg.rs:208` (test): fine.
 
 ### crates/proc-macro-srv
+
+> applied (usercode-safety-crates): already in the tree: `EnvChange::drop`'s `set_var`/`remove_var` are one block per match arm, each with a comment; true to the code (the variables are set before the macro's thread is spawned and restored after it is joined, under `ENV_LOCK`). No change. Also: `blaze-wasi/std/process.rs`'s `blaze_run_tool` comment now says what the host does with `request`.
 
 - `src/lib.rs:359` block: 2 ops (`set_var`, `remove_var`, one per match arm). Split into the arms: `match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {` `// SAFETY: \`ENV_LOCK\` is held (\`_guard\`) until this drop ends, and every expansion, the only code here that changes the environment, runs under it.` `Some(prev_val) => unsafe { env::set_var(name, prev_val) },` `// SAFETY: as for the arm above.` `None => unsafe { env::remove_var(name) },` `}`
 - `src/lib.rs:343`, `src/scope.rs:32`, `src/tests/utils.rs:16`: fine (`scope.rs:18` is an extern block, not an `unsafe fn`).
@@ -734,6 +776,15 @@ a copy of the columns each way, not a token tree per token, a hash per span and 
 
 > forwarded to usercode (told by tmux).
 
+Addendum (19:55): `read_wire` now views the node and span columns in place, so the bytes it is
+given must start at a 4-byte boundary. A `Vec<u8>` read from the pipe does, and so does each
+tree after another in one buffer, since every tree is padded to a word. Bytes that don't are
+refused with `WireError::Malformed`.
+
+> in progress (usercode): items 1-2 by usercode-wire-next1 (proc-macro-api, proc-macro-srv: `wire.rs` both sides on `write_wire`/`read_wire`), items 3-4 by usercode-wire-macros (blaze-macro-wasm, blaze-expand native).
+
+> applied (usercode-wire): items 1-2. Protocol version `WIRE_TREES` = 8 (`CURRENT_API_VERSION`) adds `ExpandMacroWire` to both protocols. Its request carries the input and attribute trees as `write_wire` bytes plus the three sites as `WireSpan`, and the answer is one tree's bytes. The client (`proc_macro_api::wire`, `Sent`) accepts any anchor combined with any context that the request's trees or sites sent, plus the spans it gave back in `SpanSource`, `SpanParent` and `SpanJoin` sub-responses (`resolved_at` puts one span's context on another's anchor). Any other part is an error naming its file, AST id or context, and so are bytes after the tree. A server older than 8 keeps `FlatTree` by negotiation, and every span of the table it sends back is held to the same `Sent`. On the server side, `proc_macro_srv::TokenStream::read_wire` and `write_wire` (`crates/proc-macro-srv/src/wire.rs`) take parts through `proc_macro_api::wire::raw_part`. The vendored CLI blaze runs still speaks 6, so the client negotiates `FlatTree` with it; porting it is `v2/requests/usercode-wire.md` section 4. Not built or run (this lane may not).
+
 ## From safety-fuzz-procmacro (2026-10-29): the client crashes on a proc-macro server's token trees
 
 Found by reading `crates/proc-macro-api` while writing the fuzz targets `fuzz/targets/proc_macro_*`
@@ -829,3 +880,652 @@ sends, and each one crashes or misleads the client (rust-analyzer's process, or 
    equality ignores order, so the `Debug` path goes away too.
 
 > forwarded to usercode (`crates/proc-macro-api/` is its; told by tmux).
+
+> applied (usercode-wire): items 1-6 and 8. (1, 2) `deserialize_span_data_index_map` and `to_subtree_resolved` (and the server's `to_tokenstream_*`) return `Result<_, String>`. The reader first checks the writer's breadth-first guarantees (consecutive ranges; the k-th subtree named once, by an earlier one, as index k + 1; every index in bounds; valid kinds, spacing, chars, rawness and suffix length), then builds in preorder with its own stack, in linear work. Each input in the table, plus `bug-two-groups-of-one-range`, is a test in `legacy_protocol/msg/flat.rs` `mod tests` that must come back as an error. (3) A span id past the table, a span listed twice, and a literal the server's lexer refuses are errors. (4) `transport::LONGEST` (1 GiB) applies to both transports, and a longer frame fails naming its length. (5) `pub struct LinkReader` has `pub fn new`. (6) A last line without a newline, a postcard stream ending inside a frame, and bytes after the message in a frame are errors (postcard frames are unstuffed by hand to see them). (8) `PartialEq, Eq` are derived on every message type and `FlatTree`. (7) is forwarded to load-cargo, and safety-fuzz's `.ok()?` change is noted, in `v2/requests/usercode-wire.md` sections 1 and 2. `blaze-expand`'s `read` must take the `Result` (section 3). Not built or run.
+
+## 13. cargo: `queue::Binary` gains `loaded` (`crates/blaze-cargo/src/serve/unit/test.rs`)
+
+What: the `Binary { .. }` literal at `serve/unit/test.rs` (about line 406) gets `loaded: None`, or
+`loaded: Some(blaze_usercode::test::queue::Loaded(program))` once the daemon runs tests from
+blaze's loader (fastcompile-inproc 3, v2/requests/fastcompile.md).
+
+Why: fastcompile-inproc 3. Without the field the crate does not compile.
+
+> forwarded to cargo (told by tmux).
+
+
+## frontend-db: blaze-expand and blaze-macro-wasm take `&Db` (frontend.md item 15; 2026-10-29)
+
+From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). Every query takes the one
+concrete `base_db::Db`. When your lane is done with these files:
+
+1. `crates/blaze-macro-wasm/src/lib.rs:146`: the session's pointer
+   `struct Db(*const (dyn SourceDatabase + 'static));` becomes
+   `struct SessionDb(*const base_db::Db);`, with its `Send`/`Sync` impls (L150, L153), its
+   `// SAFETY:` comment (L148, unchanged in substance) and its uses (`db: Option<Db>` at L177,
+   ...) renamed to match. The pointer is then thin, and reading through it is a static call.
+2. Run the tool on both crates (dry run: 10 and 13 sites):
+   ```sh
+   PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \
+     '{"root": ".", "crates": ["blaze-expand", "blaze-macro-wasm"], "write": true}'
+   ```
+   It leaves `blaze-expand/src/lib.rs:660` and `blaze-macro-wasm/src/lib.rs:2214`: `as &dyn ..`
+   casts. Drop them and pass the `&Db`.
+
+New code takes `&Db` from now on.
+
+Status: open
+
+> forwarded to usercode (told by tmux).
+
+> applied by frontend-db-edge: `SessionDb(*const Db)` with its impls and field; `Session::run`
+> takes the pointer with `ptr::from_ref` (no lifetime `transmute`: `Db` has none). Tool run on
+> both crates (10 + 10 sites). The two "left" casts are `as &dyn Any` in `eq_dyn`, not databases.
+
+## 14. cargo (the driver's spawn): a warm sandbox launcher, one exec a run
+
+What: today a sandboxed run is `blaze sandbox --v2 SPEC`, exec'd by the driver, which then starts
+the program: two execs (two `CreateProcessW` on Windows). Asked: the driver starts one
+`blaze sandbox --serve` per daemon, single-threaded, connected over a Unix socket (a named pipe
+on Windows). Each sandboxed `Effect::Spawn` becomes one request on it, with the spec and the
+descriptors for stdin, stdout and stderr passed over the socket (`SCM_RIGHTS`, or
+`DuplicateHandle` on Windows). The launcher forks, confines the child and execs the program, and
+answers with the exit and the record's path, as the report does now.
+- A launcher that dies is an error for the runs in it, and the driver starts a new launcher for
+  the next run, which is the same rule as a warm server's.
+- usercode writes the launcher's side, `sandbox::v2::serve`, once the driver's side is agreed
+  here.
+
+Why: docs/v2/plan/lanes/usercode/speed-of-light.md, "The sandbox" and "The Windows sandbox". The
+launcher's exec is about 1 ms a run, and the bound is the program's exec alone (buck2's
+forkserver does this).
+
+> forwarded to cargo (the driver's spawn is in `blaze-cargo`; cargo told).
+
+## 15. coordinator: `tools/v2/hot_lint.py` refuses any `crates`
+
+What: `Input.crates: list[str]`, but `typed_input` reads tuples only (`tuple[str, ...]`), so
+`{"root": ".", "crates": ["blaze-usercode"]}` raises `TypeError: typed_input: crates has a type it
+does not read: list[str]`. Make it `crates: tuple[str, ...] = HOT`. Lane usercode's crates are
+not in `HOT`, so until then they are linted by calling `hot_lint.lint_file` directly
+(`/tmp/hot_mine.py`).
+
+> forwarded to the coordinator (`tools/`; same as speed.md's hot_lint request); on requests' coordinator list.
+
+
+## dedup: one bridge for the wasm and in-process proc-macro paths (from dedup-macros, 2026-10-29)
+
+For `usercode-wire-macros`, which owns every file below and is rewriting them for the
+frontend-tokens request. Do this as part of that rewrite, so the new `Parts` and the
+column-bytes reader and writer are written once rather than twice and held equal by a text test.
+Design and reasons: `docs/v2/plan/lanes/dedup/macros.md`. `blaze-macro-wasm` already depends on
+`blaze-expand`, and the bridge is the path that survives change 20, so the one copy goes in
+`blaze-expand`. No new crate and no root `Cargo.toml` change.
+
+1. **The host's wire, lexer and span operations: one module each, in `blaze-expand`.**
+   - Move `crates/blaze-expand/src/native/wire.rs` to `crates/blaze-expand/src/bridge/wire.rs`
+     and `native/lex.rs` to `bridge/lex.rs`, as they are after your rewrite (with `Parts`, the
+     relative bytes, and `pack`/`get`/`clear`). New `crates/blaze-expand/src/bridge.rs`:
+     `//! What the wasm host and the in-process bridge share: ...` then `pub mod lex;`,
+     `pub mod spans;`, `pub mod wire;`. In `crates/blaze-expand/src/lib.rs`, add
+     `pub mod bridge;` beside `pub mod native;`. The items both hosts use become `pub` (they are
+     `pub(crate)` now). Drop the `#[allow(dead_code)]` on them in `native/mod.rs`, which now
+     says `use crate::bridge::{lex, wire};`.
+   - New `crates/blaze-expand/src/bridge/spans.rs` holds the two span operations both hosts
+     answer, with the bodies they have today in `native/host.rs` (37-75 and 101-128) and in
+     `blaze-macro-wasm/src/lib.rs` (`join` 387-427 and `subspan` 357-385). Keep the `// SAFETY:`
+     comment on `SyntaxContext::from_u32`, reworded for `ask`:
+     `pub fn subspan(span: Span, start: u64, end: u64) -> Option<Span>` and
+     `pub fn join(first: Span, second: Span, ask: impl FnOnce(SubRequest) -> Option<SubResponse>) -> Option<Span>`.
+     The callers become `spans::join(first, second, |req| self.ask(req))` in `native/host.rs` and
+     `spans::join(first, second, |req| state.ask(req))` in `add_host`. The wasm `ask` still sets
+     `asked`, because the closure calls it.
+   - Delete `crates/blaze-macro-wasm/src/wire.rs` and `src/lex.rs`, and the `subspan` and `join`
+     fns in its `lib.rs`. In `lib.rs`, replace `mod lex;` / `mod wire;` with
+     `use blaze_expand::bridge::{lex, spans, wire};`. Anything only the wasm host needs (if a
+     depth bound or a wasm-memory reader survives the move to `read_wire`) stays in
+     `blaze-macro-wasm` under a name of its own, with a comment saying why it differs.
+   - Delete the test `the_wire_and_the_lexer_are_the_wasm_hosts` and the `WASM_WIRE`/`WASM_LEX`
+     constants in `native/tests.rs`. Move the wire and lexer tests of both crates into
+     `bridge/wire.rs` / `bridge/lex.rs` test modules, deduplicated by name.
+   - `native/tests.rs`'s `reference` module (the wasm two-pass reader) goes with the old
+     readers. tt's column format has its own differential tests in `crates/tt/src/storage/`.
+
+2. **The guest `proc_macro`: one text, `include!`d natively and `concat!`ed for wasm.**
+   - New `crates/blaze-expand/src/native/proc_macro/api.rs`: the guest's `use std::{...};` and
+     everything from `fn taken(` to the end of `pub mod wire { ... }`. That is exactly the region
+     `the_proc_macro_is_the_guests_but_for_its_imports_and_exports` compares today, plus the
+     `use`. It has no `//!` and no `#![...]` (an `include!`d file can't), only a first line
+     `// Included by lib.rs here and concatenated into blaze_macro_wasm::GUEST: no inner attributes.`
+   - `native/proc_macro/lib.rs` keeps its `//!` header, `#![allow(...)]`, `mod sys` (the
+     `Host` calls) and `pub mod __native`. Between `mod sys` and `__native` it has one line:
+     `include!("api.rs");`.
+   - `crates/blaze-macro-wasm/guest/proc_macro.rs` keeps its `//!` header, `#![allow(...)]`,
+     `mod sys` (the wasm imports), and its exports from `/// What blaze's list of a crate's
+     macros calls` to the end. The region now in `api.rs` is deleted from it.
+   - `crates/blaze-macro-wasm/src/lib.rs` line 86:
+     before `pub const GUEST: &str = include_str!("../guest/proc_macro.rs");`
+     after `pub const GUEST: &str = concat!(include_str!("../guest/proc_macro.rs"), include_str!("../../blaze-expand/src/native/proc_macro/api.rs"));`
+     The guest's `macro_rules!` (`extend_items`, `suffixed_int_literals`,
+     `unsuffixed_int_literals`, `diagnostic_child_methods`) are all in `api.rs` and used only
+     there, so appending `api.rs` after the exports keeps their textual order. The same holds
+     for `include!` after `mod sys` natively.
+   - Replace `the_proc_macro_is_the_guests_but_for_its_imports_and_exports` in `native/tests.rs`
+     with two tests:
+     - `GUEST.ends_with(include_str!("proc_macro/api.rs"))`, and `GUEST` contains `"\nfn taken("`
+       exactly once.
+     - `the_two_sys_modules_declare_the_same_functions`: from the text between `"\nmod sys {"`
+       and the next `"\n}\n"` in `include_str!("proc_macro/lib.rs")` and in the guest file
+       (`include_str!("../../../blaze-macro-wasm/guest/proc_macro.rs")`), take each line that,
+       trimmed, starts with `pub fn ` or `pub unsafe fn `. Normalize each line: drop `unsafe `,
+       cut it at the first `{` or `;`, trim it, and drop a leading `_` from each parameter name.
+       Then the two lists of `name(params) -> ret` are equal as sorted vectors.
+
+3. After this, `rg -n 'lit_kind_number|fn lit_kind' crates/blaze-expand crates/blaze-macro-wasm`
+   finds nothing, because the column bytes carry tt's literal codes (see the frontend-tokens
+   request `## dedup: LitKind's wire number, once`). If the guest still needs its own `LitKind`
+   numbers on the wire (it can't depend on `tt`), they stay only in `api.rs`, with a comment
+   naming `tt::LitKind::code` as the numbering they must equal and a test in `native/tests.rs`
+   that runs every kind through both.
+
+> forwarded to usercode (`blaze-expand`, `blaze-macro-wasm` are its, running; usercode-wire-macros told).
+
+## dedup: `proc-macro-api`'s `Connections` is `blaze_mem::Column` (from dedup-mem)
+
+`crates/proc-macro-api/src/pool.rs:23-70` hand-builds an append-only, never-moving, lock-free
+list (chunk `k` of `FIRST << k` `OnceLock` slots, an index claimed by `fetch_add`): exactly
+`blaze_mem::Column<T>` (reserved region, one `fetch_add` and one release `fetch_or` per push,
+one acquire load per read). Replace lines 23-70 (`FIRST`, `CHUNKS`, `struct Connections`,
+`chunk_of`, `impl Connections`) with:
+
+```rust
+/// More connections to one server than any machine runs expansions at once.
+const MAX_CONNECTIONS: usize = 4096;
+
+/// The connections, append-only and never moved, so a reader takes no lock.
+struct Connections(Column<ProcMacroServerProcess>);
+
+impl Connections {
+    fn new() -> Result<Connections, ServerError> {
+        Column::new(MAX_CONNECTIONS, Tag::Expand).map(Connections).map_err(|error| ServerError {
+            message: format!("reserving the proc-macro server's connection table: {error}"),
+            io: None,
+        })
+    }
+
+    fn push(&self, process: ProcMacroServerProcess) -> Result<(), ServerError> {
+        self.0.push(process).map(drop).map_err(|error| ServerError {
+            message: format!("more than {MAX_CONNECTIONS} connections to one proc-macro server at once: {error}"),
+            io: None,
+        })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ProcMacroServerProcess> {
+        self.0.iter().map(|(_, process)| process)
+    }
+}
+```
+
+with `use blaze_mem::{Column, Tag};`, `OnceLock` and `AtomicUsize`/`Ordering` dropped from the
+`std::sync` import if nothing else uses them, line 94 `connections: Connections::new()` becoming
+`connections: Connections::new()?`, and the test `slots_cover_every_index_in_order`
+(lines 181-196) deleted (Column's index stability is tested in `crates/blaze-mem/src/tests.rs`).
+`crates/proc-macro-api/Cargo.toml` `[dependencies]` gains `blaze-mem.workspace = true` (no
+cycle). `ProcMacroServerProcess` is already `Send + Sync` (it was shared through `Arc<Inner>`),
+which `Column`'s `Sync` needs.
+
+The two process pools stay two: `blaze_usercode::pool::Pool` starts, keeps and stops warm
+sandboxed processes by `WarmKey` (sans-I/O, one owner), and `ProcMacroServerPool` is the
+client's set of connections to the servers it hands out, claimed one per expansion in flight.
+They are two layers of one design (`proc-macro-api/src/warm.rs` asks the first for the second's
+servers), not copies.
+
+Status: open
+
+> forwarded to usercode-wire-next1 (holds `crates/proc-macro-api/`; told by tmux).
+
+## speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows, by a warm launcher (from speed-link-edge-sol-usercode, 2026-10-29)
+
+Context: `v2/requests/usercode-sandbox.md` section 6 item 5, which you declined for running the
+launcher inside the daemon. This keeps your three reasons and still removes the second process.
+
+**What it costs now.** Every sandboxed run on Windows is two `CreateProcessW`: the daemon starts
+`blaze sandbox --v2 SPEC` (blaze's own large binary: image load, its DLLs, Rust's start, the
+spec read, the report written), which starts the program in the AppContainer. Process creation on
+Windows is milliseconds, so the launcher alone is about as much as the program's own creation:
+the run's fixed cost is about 2 to 3 times its bound (`docs/v2/plan/lanes/usercode/speed-of-light.md`,
+"The Windows sandbox"). It also stops anything being made once: the container SID, the well-known
+SIDs, the standard handles, the session lock's handle and every read path's DACL check are made
+again per run, because each run is a fresh process.
+
+**The change.** A warm launcher: one `blaze sandbox --v2-serve` process per daemon on Windows,
+started once and kept like a pool worker, outside the daemon and outside any sandbox. The
+driver's `Confine` hands it a spec over a pipe (the same JSON `Spec`, one frame each way:
+the spec in, the exit code out) and reads the report as now. In it, `windows::run` runs once per
+spec on a thread of its own (it holds nothing process-wide but `JOBS`, `RUNS` and the console
+handler, which already serve several runs).
+- Your reasons hold: the job objects and the console handler are the launcher's, not the
+  daemon's; a fault while launching ends the launcher, and the driver fails each run in flight
+  naming it, then starts a new launcher for the next (an error per run, never a run outside the
+  sandbox).
+- Your third reason (`confine` one `Command` on every platform) is the real cost: a small
+  client command in front of the warm launcher would be a process again, so `Confine` has to be
+  able to hand a spec to a running process instead of returning a `Command`. That is the
+  driver's API (lane core) and yours, which is why this is a request.
+- Then made once per launcher: the container SID, ALL APPLICATION PACKAGES and the network SIDs,
+  the session lock's handle (already once per process in `windows.rs`), and the read checks:
+  a path seen covered stays covered until a `ReadDirectoryChangesW` watch with
+  `FILE_NOTIFY_CHANGE_SECURITY` on its root says its DACL changed, so a run checks only paths
+  not seen before (R `GetSecurityInfo` per run down to 0 in steady state).
+
+**With it**, a run is one `CreateProcessW` (in its job from creation, as `windows.rs` now does),
+three job calls, the run's write grant and its revoke, the wait and the exit code: within 10% of
+the bound. Without it, `windows.rs` is at the bound of a launcher-per-run design (about 176 system
+calls a run against about 283 before this pass, for 22 read paths and one write directory), but
+the run is 2 to 3 times its fixed bound.
+
+Status: open
+
+> accepted (usercode), after usercode-hot-sandbox (editing `sandbox/windows.rs`) finishes: the `--v2-serve` launcher and the driver handing it a spec need `Confine` to hand a spec to a running process (with cargo's request 14 above, the warm launcher on Linux and macOS).
+
+## dedup: the test queue onto `blaze_core::wheel::Wheel`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). The queue's timing wheel
+(`crates/blaze-usercode/src/test/queue/wheel.rs`) is a copy of `blaze_core::wheel::Wheel` (same
+11 levels of 64 slots). The core one does all the queue needs and more: generational `Handle`s
+from a `blaze_mem::Slab` tagged `Io` (nothing allocated in steady state), insertion order within a
+deadline, and `next_deadline()` is the soonest deadline itself, so the driver timer wakes once per
+deadline rather than at each cascade. The copy and its tests are now in
+`crates/blaze-core/src/wheel/differential_tests.rs` (a proptest differential against it, its three
+tests adapted); `Wheel::slots()` is requested from mem-core in `v2/requests/mem-core.md`. No
+`Cargo.toml` change: `blaze-usercode` depends on `blaze-core` already, which depends on neither.
+
+`crates/blaze-usercode/src/test/queue.rs`:
+
+1. Module doc: "every deadline is one timer wheel (`queue/wheel.rs`) behind one driver timer at
+   its next expiry" becomes "every deadline is one timer wheel (`blaze_core::wheel`) behind one
+   driver timer at its soonest deadline".
+2. Delete `mod wheel;` and `use wheel::{UNSET, Wheel};`; the `blaze_core` import gains
+   `wheel::{Handle, Wheel},`.
+3. `struct Attempt`: `/// Its timers in the wheel, or [`UNSET`]. deadline: u64, grace: u64,` become
+   `/// Its timers in the wheel, while set. deadline: Option<Handle>, grace: Option<Handle>,`.
+   `struct Whole`: `deadline: u64,` becomes `deadline: Option<Handle>,`.
+4. `For::Tick`'s doc and `armed`'s doc: "the wheel's next expiry" becomes "the wheel's soonest
+   deadline"; `flush`'s doc "if the wheel's next expiry is" becomes "if the wheel's soonest
+   deadline is".
+5. `Queue::new`: `wheel: Wheel::new(tick(now), 2 * cores + bins),` becomes
+
+```rust
+            wheel: {
+                let mut wheel = Wheel::new();
+                wheel.advance(tick(now), |_, _: Due| {});
+                wheel
+            },
+```
+
+6. Every `deadline: UNSET,` / `grace: UNSET,` (the two `Attempt { .. }` in `new_attempt`) and every
+   `attempt.deadline = UNSET;`, `self.attempts[at].grace = UNSET;`, `whole.deadline = UNSET;` (in
+   `expire`) become `None`.
+7. `free_attempt`:
+
+```rust
+        let timers = [attempt.deadline, attempt.grace];
+        for timer in timers {
+            self.wheel.remove(timer);
+        }
+```
+
+   becomes
+
+```rust
+        for timer in [attempt.deadline, attempt.grace].into_iter().flatten() {
+            self.wheel.cancel(timer);
+        }
+```
+
+8. `expire`: `self.wheel.advance(tick(self.now), &mut fired);` becomes
+   `self.wheel.advance(tick(self.now), |_, due| fired.push(due));`, and
+   `self.attempts[at].grace = grace;` becomes `self.attempts[at].grace = Some(grace);`.
+9. Where a test ends (~line 1145):
+
+```rust
+                let timers = [std::mem::replace(&mut attempt.deadline, UNSET), std::mem::replace(&mut attempt.grace, UNSET)];
+                for timer in timers {
+                    self.wheel.remove(timer);
+                }
+```
+
+   becomes
+
+```rust
+                for timer in [attempt.deadline.take(), attempt.grace.take()].into_iter().flatten() {
+                    self.wheel.cancel(timer);
+                }
+```
+
+10. `flush`: `let Some(next) = self.wheel.next() else { return };` becomes
+    `let Some(next) = self.wheel.next_deadline() else { return };`.
+11. Starting a test: `attempt.deadline = deadline;` becomes `attempt.deadline = Some(deadline);`.
+    Running a binary whole: `Whole { .., deadline }` becomes `Whole { .., deadline: Some(deadline) }`.
+    `whole_ended`: `self.wheel.remove(whole.deadline);` becomes
+    `if let Some(deadline) = whole.deadline { self.wheel.cancel(deadline); }`.
+
+`crates/blaze-usercode/src/test/queue/tests.rs`: both `queue.wheel.made()` (~lines 959, 966) become
+`queue.wheel.slots()`.
+
+Delete `crates/blaze-usercode/src/test/queue/wheel.rs`.
+
+One behaviour to know: a timer due at or before the wheel's time fires at the next advance (the
+copy pushed it to the next tick). `due_tick` rounds up, so no timer fires early.
+
+> applied (usercode): items 1-9, plus what they left: `flush` reads `next_deadline()`, the two `insert`s store `Some(handle)`, and `whole_ended` cancels `whole.deadline` when set. `queue/wheel.rs` is deleted. `the_steady_state_reuses_its_slabs` bounds `wheel.len()` (timers set) where it bounded `made()`; the core slab's steady state is covered by the test's per-test allocation budget. Needs mem-core's `mod differential_tests;` in `blaze-core` (v2/requests/mem-core.md) for the copy's tests to run. Not built.
+
+## dedup: bits: blaze-usercode the test queue's rank set onto `blaze_ids::bits`
+
+From `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). The queue's `Bits`
+keeps a cursor of its own (`low`, so `first` only scans forward), so it stays as a small
+wrapper, renamed `Ranks`, whose words are a `blaze_ids::bits::BitSet<u32>`; its own bit logic
+goes. `blaze-ids` is already a dependency of the crate. Nothing is persisted or hashed.
+`has` and `clear` past the capacity now answer false and do nothing where they panicked;
+every caller passes a rank below `order.len()`, the size the sets are made with.
+
+`crates/blaze-usercode/src/test/queue.rs`, the import:
+
+```rust
+use blaze_ids::{ContentId, radix};
+```
+
+after:
+
+```rust
+use blaze_ids::{ContentId, bits::BitSet, radix};
+```
+
+The definition (now lines 448-513), before:
+
+```rust
+/// A set of `u32` positions as bits, with the lowest word that may have one, so the first is
+/// found by a scan that only moves forward until a lower bit is set again.
+#[derive(Clone, Debug)]
+struct Bits {
+    words: Vec<u64>,
+    low: usize,
+}
+
+impl Bits {
+    fn empty(len: usize) -> Bits {
+        let words = vec![0; len.div_ceil(64)]; // alloc: setup, once per run
+        Bits { low: words.len(), words }
+    }
+
+    fn full(len: usize) -> Bits {
+        let mut words = vec![u64::MAX; len.div_ceil(64)]; // alloc: setup, once per run
+        if let Some(last) = words.last_mut()
+            && len % 64 != 0
+        {
+            *last = (1 << (len % 64)) - 1;
+        }
+        Bits { words, low: 0 }
+    }
+
+    fn has(&self, at: u32) -> bool {
+        self.words[at as usize / 64] & (1 << (at % 64)) != 0
+    }
+
+    fn set(&mut self, at: u32) {
+        let word = at as usize / 64;
+        self.words[word] |= 1 << (at % 64);
+        self.low = self.low.min(word);
+    }
+
+    fn clear(&mut self, at: u32) {
+        self.words[at as usize / 64] &= !(1 << (at % 64));
+    }
+
+    fn clear_all(&mut self) {
+        self.words.fill(0);
+        self.low = self.words.len();
+    }
+
+    fn first(&mut self) -> Option<u32> {
+        while self.low < self.words.len() {
+            let word = self.words[self.low];
+            if word != 0 {
+                return Some((self.low * 64) as u32 + word.trailing_zeros());
+            }
+            self.low += 1;
+        }
+        None
+    }
+
+    /// The positions set, in order.
+    fn ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(at, &word)| {
+            let mut left = word;
+            std::iter::from_fn(move || {
+                let bit = (left != 0).then(|| left.trailing_zeros())?;
+                left &= left - 1;
+                Some((at * 64) as u32 + bit)
+            })
+        })
+    }
+}
+```
+
+after:
+
+```rust
+/// A set of `u32` positions, with the lowest word that may have one, so the first is found by
+/// a scan that only moves forward until a lower bit is set again.
+#[derive(Clone, Debug)]
+struct Ranks {
+    bits: BitSet<u32>,
+    low: usize,
+}
+
+impl Ranks {
+    fn empty(len: usize) -> Ranks {
+        let bits = BitSet::<u32>::new(len); // alloc: setup, once per run
+        Ranks { low: bits.words().len(), bits }
+    }
+
+    fn full(len: usize) -> Ranks {
+        Ranks { bits: BitSet::<u32>::filled(len), low: 0 } // alloc: setup, once per run
+    }
+
+    fn has(&self, at: u32) -> bool {
+        self.bits.contains(at)
+    }
+
+    fn set(&mut self, at: u32) {
+        self.bits.insert(at);
+        self.low = self.low.min(at as usize / 64);
+    }
+
+    fn clear(&mut self, at: u32) {
+        self.bits.remove(at);
+    }
+
+    fn clear_all(&mut self) {
+        self.bits.clear();
+        self.low = self.bits.words().len();
+    }
+
+    fn first(&mut self) -> Option<u32> {
+        let words = self.bits.words();
+        while let Some(&word) = words.get(self.low) {
+            if word != 0 {
+                return Some((self.low * 64) as u32 + word.trailing_zeros());
+            }
+            self.low += 1;
+        }
+        None
+    }
+
+    /// The positions set, in order.
+    fn ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.bits.iter()
+    }
+}
+```
+
+The fields of `Queue` (now lines 552-553), before / after:
+
+```rust
+    pending: Bits,
+    ready: Bits,
+```
+
+```rust
+    pending: Ranks,
+    ready: Ranks,
+```
+
+In `Queue::new` (now lines 597-598), before / after:
+
+```rust
+            pending: Bits::empty(0),
+            ready: Bits::empty(0),
+```
+
+```rust
+            pending: Ranks::empty(0),
+            ready: Ranks::empty(0),
+```
+
+and (now lines 647-648):
+
+```rust
+        queue.pending = Bits::full(count);
+        queue.ready = Bits::empty(count);
+```
+
+```rust
+        queue.pending = Ranks::full(count);
+        queue.ready = Ranks::empty(count);
+```
+
+In `Queue::stop` (now line 1339):
+
+```rust
+        let pending = std::mem::replace(&mut self.pending, Bits::empty(self.order.len()));
+```
+
+```rust
+        let pending = std::mem::replace(&mut self.pending, Ranks::empty(self.order.len()));
+```
+
+`crates/blaze-usercode/src/test/queue/tests.rs`, `bits_are_a_set` stays (it tests the cursor;
+the set itself is tested in `crates/blaze-ids/src/bits/tests.rs`), renamed, with its two
+constructors:
+
+```rust
+/// The bitsets against a sorted set, over seeded sets, clears and firsts.
+#[test]
+fn bits_are_a_set() {
+```
+
+```rust
+/// The rank sets against a sorted set, over seeded sets, clears and firsts: the cursor never
+/// skips a member set below it.
+#[test]
+fn ranks_are_a_set_with_a_cursor() {
+```
+
+```rust
+        let mut bits = Bits::full(len);
+```
+
+```rust
+        let mut bits = Ranks::full(len);
+```
+
+```rust
+        let mut empty = Bits::empty(len);
+```
+
+```rust
+        let mut empty = Ranks::empty(len);
+```
+
+## dedup: one list of build-script keys, one table of signal names (from dedup-scan-cargo, 2026-10-29)
+
+Two copies between `blaze-build-script` and `blaze-cargo` (the other halves are lane cargo's,
+`v2/requests/cargo.md` "dedup: one copy of each piece the load ported from v1's cargo crates",
+items 7 and 8). Nothing a build prints changes.
+
+### 1. `has_reserved_prefix` public
+
+`blaze-cargo/src/serve/unit/directives.rs` keeps its own `RESERVED` list of the keys cargo reads
+after `cargo::` to suggest `cargo::metadata=` for a `cargo::rustc-*`-looking key. blaze-build-script's
+`output.rs` already has the check (and its test against cargo's list, `output/tests.rs:414`).
+
+`crates/blaze-build-script/src/output.rs:311`:
+
+```rust
+fn has_reserved_prefix(flag: &str) -> bool {
+```
+
+becomes
+
+```rust
+pub fn has_reserved_prefix(flag: &str) -> bool {
+```
+
+(`output` is already `pub mod`). Lane cargo then deletes `RESERVED` and calls it.
+
+### 2. `status_to_string` on `blaze_core::signal::described`
+
+`crates/blaze-build-script/src/run.rs` 347-371 and `blaze-cargo/src/serve/say.rs`
+`signal_named` are cargo-util's `exit_status_to_string` table twice. The one table is now
+`crates/blaze-core/src/signal.rs` (`pub fn described(signal: i32) -> &'static str`, the same
+fourteen names and texts, `""` for any other number and on a target without signals; tested
+against libc's numbers).
+
+- `crates/blaze-build-script/Cargo.toml`: `[dependencies]` += `blaze-core.workspace = true`; the
+  `[target.'cfg(unix)'.dependencies]` table with `libc` goes (the match was its only use).
+- `run.rs`:
+
+  ```rust
+  /// `exit_status_to_string` of cargo-util.
+  fn status_to_string(status: ExitStatus) -> String {
+      #[cfg(unix)]
+      {
+          use std::os::unix::process::ExitStatusExt;
+          if let Some(signal) = status.signal() {
+              // alloc: error path.
+              return format!("signal: {signal}{}", blaze_core::signal::described(signal));
+          }
+      }
+      // alloc: error path.
+      status.to_string()
+  }
+  ```
+
+No cycle: `blaze-core` depends on `blaze-mem`, `blaze-radix`, `crossbeam` and `libc`, none of
+which depend on blaze-build-script.
+
+Status: open
+
+## dedup: blaze_core::create_process (from dedup-scan)
+
+`crates/blaze-core/src/create_process.rs` now holds this file's `command_line`/`append_arg`/
+`environment`/`upper` (the same rules, std's `Command`'s) and their tests. In
+`crates/blaze-cargo/src/sandbox/windows.rs`:
+
+- delete `fn command_line`, `fn append_arg`, `fn environment`, `fn upper` with their doc comments,
+  and the tests `arguments_are_quoted_as_the_msvc_runtime_splits_them` and
+  `the_environment_block_is_sorted_without_regard_to_case_and_ends_in_two_nuls` (moved);
+- in the spawn, before → after:
+  ```rust
+  let block = environment(&env)?;
+  let mut line = command_line(&spec.program, &spec.args)?;
+  ```
+  ```rust
+  let block = blaze_core::create_process::environment(&env).map_err(|it| it.to_string())?;
+  let mut line =
+      blaze_core::create_process::command_line(&spec.program, &spec.args).map_err(|it| it.to_string())?;
+  ```
+- drop `use rustc_hash::FxHashMap;` (its one other use was `environment`).
+
+Output is byte-for-byte what this file makes today. Why: blaze-core's driver had a second copy.

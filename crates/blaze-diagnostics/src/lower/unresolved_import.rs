@@ -598,12 +598,7 @@ impl Resolver<'_, '_, '_> {
                 return error(
                     format!("cannot find module or crate `{name}` in {scope}"),
                     format!("use of unresolved module or unlinked crate `{name}`"),
-                    Some(Suggestion {
-                        parts,
-                        message: format!(
-                            "you might be missing a crate named `{name}`, add it to your project and import it in your code"
-                        ),
-                    }),
+                    Some(Suggestion { parts, message: missing_crate_2015(cx, name) }),
                 );
             }
             return error(message, format!("could not find `{name}` in the crate root"), None);
@@ -646,9 +641,8 @@ impl Resolver<'_, '_, '_> {
             let label = format!("{} `{name}` is not a crate or module", value_descr(cx, def));
             return error(message, label, suggestion);
         }
-        let suggestion = suggestion.or_else(|| {
-            Some(Suggestion { parts: Vec::new(), message: format!("you might be missing a crate named `{name}`") })
-        });
+        let suggestion =
+            suggestion.or_else(|| Some(Suggestion { parts: Vec::new(), message: missing_crate(cx, name) }));
         error(message, format!("use of unresolved module or unlinked crate `{name}`"), suggestion)
     }
 
@@ -730,6 +724,27 @@ impl Resolver<'_, '_, '_> {
 }
 
 /// What rustc's `report_path_resolution_error` gives.
+/// rustc's help for a first segment that names no crate (`report_path_resolution_error`), with
+/// `cargo add` when cargo runs the compile.
+pub(crate) fn missing_crate(cx: &Cx<'_, '_>, name: &str) -> String {
+    if cx.cargo() {
+        format!("if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml`")
+    } else {
+        format!("you might be missing a crate named `{name}`")
+    }
+}
+
+/// [`missing_crate`] on Rust 2015, where it comes with an `extern crate` to insert.
+pub(crate) fn missing_crate_2015(cx: &Cx<'_, '_>, name: &str) -> String {
+    if cx.cargo() {
+        format!(
+            "if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml` and import it in your code"
+        )
+    } else {
+        format!("you might be missing a crate named `{name}`, add it to your project and import it in your code")
+    }
+}
+
 struct PathError {
     message: String,
     label: String,

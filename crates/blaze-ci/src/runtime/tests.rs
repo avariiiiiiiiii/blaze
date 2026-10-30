@@ -11,7 +11,7 @@ use blaze_ids::ContentId;
 use blaze_vfs::{Mode, Op};
 
 use super::{
-    Post, batches, listen, load, post, save,
+    Post, Posts, batches, listen, load, post, save,
     listen::{Listener, Seen},
 };
 use crate::{
@@ -227,6 +227,85 @@ fn updates_of_different_runs_are_all_sent_in_order() {
     assert_eq!(github.lock().unwrap().updated, statuses);
 }
 
+/// Takes `wait` per call, counting how many calls are in flight at once across every lane.
+struct Slow {
+    wait: Duration,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    most: Arc<std::sync::atomic::AtomicUsize>,
+    calls: Arc<Mutex<Vec<(u64, CheckStatus)>>>,
+}
+
+impl Checks for Slow {
+    fn create(&mut self, run: &CheckRun) -> Result<u64, GitHubError> {
+        use std::sync::atomic::Ordering;
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        thread::sleep(self.wait);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        let id: u64 = run.name.parse().unwrap();
+        self.calls.lock().unwrap().push((id, run.status));
+        Ok(id)
+    }
+
+    fn update(&mut self, id: u64, run: &CheckRun) -> Result<(), GitHubError> {
+        self.create(&CheckRun { name: id.to_string(), ..run.clone() }).map(drop)
+    }
+}
+
+/// Lanes as `serve` makes them, over fakes that share their counters.
+fn slow_lanes(wait: Duration) -> (Posts, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<(u64, CheckStatus)>>>, mpsc::Receiver<Input>) {
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let most = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (service, inputs) = mpsc::channel();
+    let mut lanes = Vec::new();
+    for _ in 0..super::POST_LANES {
+        let (to_lane, posts) = mpsc::channel();
+        let fake = Slow { wait, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone() };
+        let service = service.clone();
+        thread::spawn(move || post(Arc::new(Mutex::new(fake)), posts, service, Duration::ZERO));
+        lanes.push(to_lane);
+    }
+    (Posts { lanes }, most, calls, inputs)
+}
+
+#[test]
+fn the_runs_of_a_job_post_at_once_each_on_its_lane() {
+    let (posts, most, calls, inputs) = slow_lanes(Duration::from_millis(50));
+    let runs = super::POST_LANES as u64;
+    for run in 0..runs {
+        let check = CheckRun { name: run.to_string(), ..run_check() };
+        posts.send(Post::Create { run: RunId(run), check });
+    }
+    let started = std::time::Instant::now();
+    for _ in 0..runs {
+        assert!(matches!(inputs.recv_timeout(Duration::from_secs(5)), Ok(Input::Created { result: Ok(_), .. })));
+    }
+    assert!(most.load(std::sync::atomic::Ordering::SeqCst) > 1, "every creation was sent alone");
+    assert!(started.elapsed() < Duration::from_millis(50) * runs as u32, "{:?}", started.elapsed());
+    assert_eq!(calls.lock().unwrap().len(), runs as usize);
+}
+
+#[test]
+fn a_runs_posts_stay_in_order_on_its_lane() {
+    let (posts, _, calls, _inputs) = slow_lanes(Duration::from_millis(1));
+    let statuses = [CheckStatus::Queued, CheckStatus::InProgress, CheckStatus::Failure];
+    for status in statuses {
+        for run in 0..3 * super::POST_LANES as u64 {
+            posts.send(update(run, run, status));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(posts);
+    thread::sleep(Duration::from_millis(200));
+    let calls = calls.lock().unwrap();
+    for run in 0..3 * super::POST_LANES as u64 {
+        let seen: Vec<CheckStatus> = calls.iter().filter(|(id, _)| *id == run).map(|(_, status)| *status).collect();
+        assert!(seen.windows(2).all(|pair| statuses.iter().position(|it| *it == pair[0]) < statuses.iter().position(|it| *it == pair[1])), "{run}: {seen:?}");
+        assert_eq!(seen.last(), Some(&CheckStatus::Failure), "{run}: {seen:?}");
+    }
+}
+
 #[test]
 fn a_large_file_keeps_its_buffer_for_the_first_piece() {
     let bytes = vec![3u8; 2500];
@@ -290,4 +369,64 @@ fn needs_loopback_a_delivery_is_checked_answered_and_handed_on_once() {
     assert_eq!(status, 403);
     assert!(said.contains("x/y"), "{said}");
     assert!(inputs.recv_timeout(Duration::from_millis(200)).is_err(), "only the first was handed on");
+}
+
+fn loopback_listener() -> (std::net::SocketAddr, Arc<Secret>, mpsc::Receiver<Input>) {
+    let path = temp(&format!("webhook-secret-{:?}", thread::current().id()));
+    std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
+    let secret = Arc::new(Secret::read(&path).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let at = listener.local_addr().unwrap();
+    let (service, inputs) = mpsc::channel();
+    let shared = Arc::new(Listener::new(secret.clone(), "o/r".to_owned(), service));
+    thread::spawn(move || listen::serve(listener, shared));
+    (at, secret, inputs)
+}
+
+fn push_body(n: usize) -> String {
+    format!(r#"{{"ref":"refs/heads/b{n}","after":"{:040x}","repository":{{"full_name":"o/r"}}}}"#, n + 1)
+}
+
+#[test]
+fn needs_loopback_deliveries_at_once_are_each_answered_by_a_kept_handler() {
+    let (at, secret, inputs) = loopback_listener();
+    for round in 0..3 {
+        let answered: Vec<u16> = thread::scope(|scope| {
+            let sent: Vec<_> = (0..16)
+                .map(|n| {
+                    let body = push_body(round * 16 + n);
+                    let signature = sign(secret.expose(), body.as_bytes());
+                    let id = format!("d{round}-{n}");
+                    scope.spawn(move || deliver(at, &id, &signature, body.as_bytes()).0)
+                })
+                .collect();
+            sent.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        assert!(answered.iter().all(|status| *status == 202), "{answered:?}");
+    }
+    let mut branches: Vec<String> = (0..48)
+        .map(|_| match inputs.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Input::Event(Event::Push { branch, .. }) => branch,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    branches.sort();
+    let mut expected: Vec<String> = (0..48).map(|n| format!("b{n}")).collect();
+    expected.sort();
+    assert_eq!(branches, expected);
+}
+
+#[test]
+fn needs_loopback_a_connection_over_the_most_open_is_answered_503() {
+    let (at, secret, inputs) = loopback_listener();
+    let held: Vec<TcpStream> = (0..listen::MOST_CONNECTIONS).map(|_| TcpStream::connect(at).unwrap()).collect();
+    thread::sleep(Duration::from_millis(200));
+    let body = push_body(0);
+    let (status, said) = deliver(at, "over", &sign(secret.expose(), body.as_bytes()), body.as_bytes());
+    assert_eq!(status, 503, "{said}");
+    drop(held);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(deliver(at, "after", &sign(secret.expose(), body.as_bytes()), body.as_bytes()).0, 202);
+    assert!(matches!(inputs.recv_timeout(Duration::from_secs(5)), Ok(Input::Event(_))));
 }

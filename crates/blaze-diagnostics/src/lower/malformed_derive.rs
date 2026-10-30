@@ -56,7 +56,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MalformedDerive) -> Vec<Found> {
             ],
             Applicability::MachineApplicable,
         );
-        return vec![Found::new(diag, Phase::Resolve)];
+        return vec![Found::new(diag, Phase::Expand)];
     }
     vec![malformed(span, inner)]
 }
@@ -71,7 +71,7 @@ fn malformed(span: Span, inner: &str) -> Found {
         Applicability::HasPlaceholders,
         SuggestionStyle::ShowAlways,
     );
-    Found::new(diag, Phase::Resolve)
+    Found::new(diag, Phase::Expand)
 }
 
 /// The errors rustc gives of the elements of the list `tt` of a `#[derive(...)]` that is in
@@ -93,7 +93,7 @@ pub(crate) fn elements(cx: &Cx<'_, '_>, tt: InFile<ast::TokenTree>) -> Vec<Found
                 Some(name) => diag.help(format!("try using `#[derive({name})]`")),
                 None => diag.help("for example, write `#[derive(Debug)]` for `Debug`"),
             };
-            found.push(Found::new(diag, Phase::Resolve));
+            found.push(Found::new(diag, Phase::Expand));
             continue;
         }
         let path_len = rest.iter().take_while(|it| is_path_part(it)).count() + 1;
@@ -112,7 +112,7 @@ pub(crate) fn elements(cx: &Cx<'_, '_>, tt: InFile<ast::TokenTree>) -> Vec<Found
         };
         let mut diag = Diag::error(None, message, at.clone());
         diag.suggestion(at, help, "", Applicability::MachineApplicable);
-        found.push(Found::new(diag, Phase::Resolve));
+        found.push(Found::new(diag, Phase::Expand));
     }
     found
 }

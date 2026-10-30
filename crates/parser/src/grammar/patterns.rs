@@ -597,6 +597,7 @@ fn pat_list(p: &mut Parser<'_>, ket: SyntaxKind) {
         pattern_top_guard(p);
         if !p.eat(T![,]) {
             if p.at_ts(PAT_TOP_FIRST) {
+                // alloc: error path only, the message names the token found
                 p.error(format!("expected {:?}, got {:?}", T![,], p.current()));
             } else {
                 break;

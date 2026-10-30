@@ -67,6 +67,14 @@ with its `// SAFETY:` argument:
 Why: `docs/v2/plan/design/unsafe.md`. `rustc_type_ir_macros`' patch `0001` lets the derive's
 own `unsafe impl` through the `deny`.
 
+### 0005-simplified-type-ord
+
+What: `SimplifiedType` derives `PartialOrd` and `Ord` (every field already is `Ord`).
+
+Why: hir-ty keeps impls keyed by simplified self type in sorted tables (`v2/requests/items.md`,
+"items-hirty: simplified self types as `u32`"). The order is only a table key: no output may
+depend on it, since it follows `DefId`'s order.
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

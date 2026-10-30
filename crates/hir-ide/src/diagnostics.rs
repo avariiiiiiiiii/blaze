@@ -1,7 +1,6 @@
 //! Type inference-based diagnostics.
 mod decl_check;
 mod expr;
-mod match_check;
 mod unsafe_check;
 
 pub use crate::diagnostics::{

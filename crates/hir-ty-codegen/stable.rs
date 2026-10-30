@@ -24,7 +24,7 @@ use rustc_type_ir::{
 use salsa::plumbing::FromId;
 use span::ErasedFileAstId;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 
 use super::{Instance, InstanceDef, SymbolResolver};
 use hir_ty::{
@@ -58,12 +58,12 @@ enum Declared {
 
 /// Lowers what [`StableNames`] lists of `crates`, so that a build that lists them later
 /// finds it done. `lower` is given the bodies of each round to lower at once.
-pub fn lower_declared(db: &dyn HirDatabase, crates: &[Crate], lower: &dyn Fn(&[DefWithBodyId])) {
+pub fn lower_declared(db: &Db, crates: &[Crate], lower: &dyn Fn(&[DefWithBodyId])) {
     declared(db, crates, lower, &mut |_| ());
 }
 
 /// The statics `crates` declare, in their modules and in the blocks of their bodies.
-pub(super) fn declared_statics(db: &dyn HirDatabase, crates: &[Crate]) -> Vec<StaticId> {
+pub(super) fn declared_statics(db: &Db, crates: &[Crate]) -> Vec<StaticId> {
     let mut statics = Vec::new();
     declared(db, crates, &|_| (), &mut |it| {
         if let Declared::Static(id) = it {
@@ -76,7 +76,7 @@ pub(super) fn declared_statics(db: &dyn HirDatabase, crates: &[Crate]) -> Vec<St
 /// The functions and statics `crates` declare, in their modules and in the blocks of their
 /// bodies: a `static` is often written by a macro.
 fn declared(
-    db: &dyn HirDatabase,
+    db: &Db,
     crates: &[Crate],
     lower: &dyn Fn(&[DefWithBodyId]),
     found: &mut dyn FnMut(Declared),
@@ -163,7 +163,7 @@ struct Listed {
 }
 
 pub(super) struct StableNames<'a, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     symbols: &'a dyn SymbolResolver,
     /// The crates whose code changes under the daemon.
     owned: FxHashSet<Crate>,
@@ -193,7 +193,7 @@ pub(super) struct StableNames<'a, 'db> {
 
 impl<'a, 'db> StableNames<'a, 'db> {
     pub(super) fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         symbols: &'a dyn SymbolResolver,
         owned: FxHashSet<Crate>,
         by_content: bool,
@@ -869,7 +869,7 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
 /// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.
 fn file_name(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     out: &mut String,
     file: HirFileId,
@@ -902,7 +902,7 @@ fn file_name(
 /// [`file_name`] for [`StableNames::static_across_edits`]: a file by its id, and a call of a
 /// macro written as one (`name!(...)`) by its text, the same wherever the call moves in its
 /// file. A derive's or an attribute's call is the item's, which its name stands for.
-fn file_across_edits(db: &dyn HirDatabase, out: &mut String, file: HirFileId) -> Option<()> {
+fn file_across_edits(db: &Db, out: &mut String, file: HirFileId) -> Option<()> {
     match file {
         HirFileId::FileId(file) => write!(out, "{:?}", file.file_id(db)).ok(),
         HirFileId::MacroFile(call) => {
@@ -977,7 +977,7 @@ fn path_everywhere(path: String, cargo_home: Option<&str>, library: Option<&str>
 /// one function, or two `const _` of one module, can each hold an item of the same name.
 /// `None` for a function outside of any block.
 pub fn block_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -993,7 +993,7 @@ pub fn block_place(
 /// (an `impl` for a type it has no name for, such as `!`, `dyn Trait` or a type taking a
 /// constant), the place names it instead.
 pub fn function_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -1006,7 +1006,7 @@ pub fn function_place(
 
 /// Where a static inside a block is written, as [`block_place`] has it of a function.
 pub fn static_place(
-    db: &dyn HirDatabase,
+    db: &Db,
     symbols: &dyn SymbolResolver,
     id: hir_def::StaticId,
 ) -> Option<String> {

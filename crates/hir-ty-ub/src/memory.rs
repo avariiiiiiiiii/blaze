@@ -43,8 +43,11 @@ pub enum Kind {
     Global,
     /// `const_allocate`.
     ConstHeap,
-    /// The evaluator's own: program arguments, the environment, thread-local storage.
+    /// The evaluator's own: program arguments, the environment, thread-local storage, errno
+    /// cells, dispatch semaphores (freed by `dispatch_release`).
     Machine,
+    /// Anonymous `mmap`, freed by `munmap`.
+    Mmap,
 }
 
 impl Kind {
@@ -56,7 +59,7 @@ impl Kind {
         match self {
             Kind::Stack | Kind::Rust | Kind::C => false,
             Kind::ConstHeap => made_global,
-            Kind::Global | Kind::Machine => true,
+            Kind::Global | Kind::Machine | Kind::Mmap => true,
         }
     }
 }
@@ -72,6 +75,7 @@ impl fmt::Display for Kind {
             Kind::Global => "global (static or const)",
             Kind::ConstHeap => "heap allocation",
             Kind::Machine => "machine-managed memory",
+            Kind::Mmap => "mmap",
         })
     }
 }

@@ -44,5 +44,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedModule) -> Vec<Found> {
         }
         [] => Diag::error(Some("E0583"), format!("file not found for module `{name}`"), span),
     };
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }

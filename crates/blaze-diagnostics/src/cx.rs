@@ -3,11 +3,12 @@
 //! when it is the crate's), the text of what a span covers, rustc's printing of types and
 //! paths, and the keys of the facts a diagnostic read.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
-use base_db::SourceDatabase as _;
+use base_db::Db;
 use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
-use hir::{DisplayTarget, InFile, MacroCallId, Semantics, db::HirDatabase};
+use blaze_mem::Frame;
+use hir::{DisplayTarget, InFile, MacroCallId, Semantics};
 use hir_expand::{MacroCallKind, MacroDefKind};
 use rustc_hash::FxHashMap;
 use span::{Edition, FileId};
@@ -34,21 +35,30 @@ impl Files for FxHashMap<FileId, String> {
 
 /// A diagnostic of a crate being lowered.
 pub struct Cx<'a, 'db> {
-    pub sema: &'a Semantics<'db, dyn HirDatabase>,
-    pub db: &'db dyn HirDatabase,
+    pub sema: &'a Semantics<'db>,
+    pub db: &'db Db,
     pub krate: hir::Crate,
     pub edition: Edition,
     pub display_target: DisplayTarget,
     files: &'a dyn Files,
+    /// The check's task frame: what a pass builds for the crate (numberings, worklists,
+    /// bitsets) is allocated here, `Vec<T, &Frame>`, and freed when the check returns.
+    frame: &'a Frame,
+    /// The lint flags the crate is checked with, for a lowering whose words depend on a
+    /// lint's level; none is rustc's defaults.
+    lints: Option<&'a crate::lints::CommandLine>,
     /// The file each name shown stands for, as spans were made.
     named: RefCell<FxHashMap<String, FileId>>,
+    /// The paths types are printed by, made the first time one is printed.
+    paths: OnceCell<crate::print::Paths>,
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
     pub fn new(
-        sema: &'a Semantics<'db, dyn HirDatabase>,
+        sema: &'a Semantics<'db>,
         krate: hir::Crate,
         files: &'a dyn Files,
+        frame: &'a Frame,
     ) -> Cx<'a, 'db> {
         let db = sema.db;
         Cx {
@@ -58,8 +68,41 @@ impl<'a, 'db> Cx<'a, 'db> {
             edition: krate.edition(db),
             display_target: krate.to_display_target(db),
             files,
+            frame,
+            lints: None,
             named: RefCell::new(FxHashMap::default()),
+            paths: OnceCell::new(),
         }
+    }
+
+    /// The check's task frame, for the crate-sized tables a pass builds.
+    pub fn frame(&self) -> &'a Frame {
+        self.frame
+    }
+
+    /// What rustc's printing of paths reads: the crate's visible names, for trimmed paths.
+    pub(crate) fn paths(&self) -> &crate::print::Paths {
+        self.paths.get_or_init(|| crate::print::Paths::new(self))
+    }
+
+    /// The context checking with the lint flags `lints`.
+    pub fn with_lints(self, lints: &'a crate::lints::CommandLine) -> Cx<'a, 'db> {
+        Cx { lints: Some(lints), ..self }
+    }
+
+    /// The level `lint` has at `at`, from the attributes there and the lint flags, as rustc
+    /// decides it (`unsafe_op_in_unsafe_fn`'s level changes E0133's words).
+    pub fn lint_level(&self, lint: &str, at: InFile<SyntaxNodePtr>) -> crate::lints::Level {
+        match self.lints {
+            Some(cmd) => crate::lints::level_at(self, cmd, lint, at),
+            None => crate::lints::level_at(self, &crate::lints::CommandLine::default(), lint, at),
+        }
+    }
+
+    /// Whether cargo runs the compile (rustc's `was_invoked_from_cargo`: `CARGO_CRATE_NAME` is
+    /// set), as it is under blaze: some help then names `cargo add` and `Cargo.toml`.
+    pub fn cargo(&self) -> bool {
+        self.lints.is_some_and(|it| it.check_cfg.cargo)
     }
 
     /// The name rustc shows `file` by.

@@ -27,6 +27,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex, OnceLock, atomic::Ordering},
 };
 
+use base_db::Db;
 use cranelift_codegen::ir;
 use hir_def::{attrs::AttrFlags, signatures::FunctionSignature};
 use hir_ty::{db::HirDatabase, next_solver::StoredGenericArgs, traits::StoredParamEnvAndCrate};
@@ -178,7 +179,7 @@ static EXPORTS: LazyLock<Exports> =
 /// The export of `instance`, built if no compile asked for it before. `None` for one that is
 /// not imported: too large, a coroutine, or a body LLVM has no lowering for.
 fn export(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<Arc<Export>> {
@@ -200,7 +201,7 @@ fn export(
 /// The export of `instance`: its body built alone, with nothing of what it calls built in but
 /// the small functions of the standard library every compile builds in.
 fn build(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
 ) -> Option<Export> {

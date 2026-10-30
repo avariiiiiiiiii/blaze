@@ -29,7 +29,7 @@ pub mod wire;
 
 use std::{io::Write as _, time::Duration};
 
-pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Mode, Outcome, Queue, Trace};
+pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, Outcome, Queue, Trace};
 pub use select::{
     Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why,
 };
@@ -82,7 +82,7 @@ pub enum Reported {
 }
 
 /// A result in the shape of `blaze_api::TestResult`: the fields map one to one.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Report {
     pub binary: String,
     /// The test; empty for a binary run whole as libtest's threads.
@@ -136,3 +136,9 @@ fn millis(took: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+/// Counts allocations for the budget tests of the hot paths here (the wire, the region read,
+/// the interner, the wheel, the queue's steady state, a test's identity).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

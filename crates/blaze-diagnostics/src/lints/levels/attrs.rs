@@ -12,8 +12,9 @@
 
 use std::{borrow::Cow, ops::ControlFlow};
 
+use base_db::Db;
 use cfg::CfgOptions;
-use hir::{InFile, Semantics, db::HirDatabase};
+use hir::{InFile, Semantics};
 use hir_expand::MacroCallKind;
 use smallvec::SmallVec;
 use span::Edition;
@@ -324,7 +325,7 @@ pub(super) fn registered_tools(root: &ast::AnyHasAttrs, cfg: &CfgOptions, editio
 /// macro's expansion, what is around the call (around the item, for a derive or an attribute
 /// macro); for the root of a module's file, its `mod` item.
 pub(super) fn parent(
-    sema: &Semantics<'_, dyn HirDatabase>,
+    sema: &Semantics<'_>,
     node: &InFile<SyntaxNode>,
 ) -> Option<InFile<SyntaxNode>> {
     if let Some(parent) = node.value.parent() {
@@ -350,7 +351,7 @@ pub(super) fn parent(
 /// Where rustc's walk of the crate comes to `node`: the places of the `mod` items and macro
 /// calls it is reached through, outermost first, then its own. What a derive makes comes after
 /// the item it is on.
-pub(super) fn place(sema: &Semantics<'_, dyn HirDatabase>, node: &InFile<SyntaxNode>) -> Vec<(u32, u32)> {
+pub(super) fn place(sema: &Semantics<'_>, node: &InFile<SyntaxNode>) -> Vec<(u32, u32)> {
     let mut place = vec![entered(node.value.text_range())];
     let mut file = node.file_id;
     loop {

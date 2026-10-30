@@ -8,10 +8,9 @@ use hir_def::{
 use test_fixture::WithFixture;
 
 use crate::{
-    db::HirDatabase,
     display::{DisplayTarget, HirDisplay},
     effects::{NonConst, non_const_calls},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 /// Checks the non-const calls of the crate root's fns and consts, one line per call:

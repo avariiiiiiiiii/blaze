@@ -47,6 +47,15 @@ impl ViewCaster {
 type ErasedDatabaseDownCasterSig = unsafe fn(RawDatabase<'_>) -> NonNull<()>;
 type DatabaseDownCasterSig<DbView> = unsafe fn(RawDatabase<'_>) -> NonNull<DbView>;
 
+/// The view of a concrete database as itself, for the tracked functions that take `&Db` for a
+/// `#[salsa::db]` struct `Db` instead of `&dyn Trait`: `#[salsa::db]` on the struct implements
+/// it, and the function's ingredient caches the downcaster on its cold path, as it does a
+/// trait's.
+#[doc(hidden)]
+pub trait ConcreteView: Database {
+    fn zalsa_register_concrete_downcaster(&self) -> &DatabaseDownCaster<Self>;
+}
+
 #[repr(transparent)]
 pub struct DatabaseDownCaster<DbView: ?Sized>(ViewCaster, PhantomData<fn() -> DbView>);
 
@@ -95,7 +104,9 @@ impl<DbView: ?Sized + Any> DatabaseDownCaster<DbView> {
 impl Views {
     pub(crate) fn new<Db: Database>() -> Self {
         let source_type_id = TypeId::of::<Db>();
+        // alloc: setup, once per database: its view casters
         let view_casters = boxcar::Vec::new();
+        // alloc: setup, once per database: its view casters
         view_casters.push(ViewCaster::new::<dyn Database>(|db| db.ptr.cast::<Db>()));
         Self {
             source_type_id,

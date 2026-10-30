@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use blaze_ids::rng::SplitMix64;
 use salsa::plumbing::AsId;
 use salsa::{Database, DatabaseImpl, Setter};
 
@@ -85,21 +86,10 @@ fn intern_spread(db: &dyn Database, keys: Keys) -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// A splitmix64 stream: seeded, so a failure reproduces.
-fn stream(mut seed: u64) -> impl FnMut() -> u64 {
-    move || {
-        seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-}
-
 /// One to five keys below `range`.
-fn some_keys(next: &mut impl FnMut() -> u64, range: u64) -> Vec<u32> {
-    let len = 1 + next() % 5;
-    (0..len).map(|_| (next() % range) as u32).collect()
+fn some_keys(rng: &mut SplitMix64, range: u64) -> Vec<u32> {
+    let len = 1 + rng.below(5);
+    (0..len).map(|_| rng.below(range) as u32).collect()
 }
 
 /// The reuse sweep of one shard as `interned.rs` documents it: values in allocation order, a
@@ -177,16 +167,16 @@ impl Model {
 fn reusable_ids_match_the_sweep_model() {
     let mut reused = 0;
     for seed in 0..8 {
-        let mut next = stream(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut db = DatabaseImpl::new();
-        let keys = Keys::new(&db, some_keys(&mut next, 10));
+        let keys = Keys::new(&db, some_keys(&mut rng, 10));
         let mut model = Model::new(3);
         // The table index of each model slot, learned when the model allocates it.
         let mut index_of: Vec<u32> = Vec::new();
         let mut revision = 1;
         for step in 0..300 {
             if step > 0 {
-                keys.set_keys(&mut db).to(some_keys(&mut next, 10));
+                keys.set_keys(&mut db).to(some_keys(&mut rng, 10));
                 revision += 1;
             }
             let wanted = keys.keys(&db).clone();
@@ -218,14 +208,14 @@ fn reusable_ids_match_the_sweep_model() {
 #[test]
 fn immortal_ids_are_stable() {
     for seed in 0..4 {
-        let mut next = stream(100 + seed);
+        let mut rng = SplitMix64::new(100 + seed);
         let mut db = DatabaseImpl::new();
-        let keys = Keys::new(&db, some_keys(&mut next, 40));
+        let keys = Keys::new(&db, some_keys(&mut rng, 40));
         let mut colliding: HashMap<u32, u32> = HashMap::new();
         let mut spread: HashMap<u32, u32> = HashMap::new();
         for step in 0..200 {
             if step > 0 {
-                keys.set_keys(&mut db).to(some_keys(&mut next, 40));
+                keys.set_keys(&mut db).to(some_keys(&mut rng, 40));
             }
             let wanted = keys.keys(&db).clone();
             for (got, seen) in [
@@ -249,8 +239,8 @@ fn immortal_ids_are_stable() {
 
 /// Keys for thread `thread` in `round`: overlapping with every other thread's.
 fn thread_keys(seed: u64, thread: u64, round: u64) -> Vec<u32> {
-    let mut next = stream(seed * 1_000 + round * 10 + thread);
-    (0..6).map(|_| (next() % 12) as u32).collect()
+    let mut rng = SplitMix64::new(seed * 1_000 + round * 10 + thread);
+    (0..6).map(|_| rng.below(12) as u32).collect()
 }
 
 /// Eight threads interning overlapping keys from queries, in revisions where many of the values
@@ -306,10 +296,10 @@ fn racing_threads_get_one_id_per_key() {
             let workers: Vec<_> = (0..8u64)
                 .map(|thread| {
                     scope.spawn(move || {
-                        let mut next = stream(seed * 77 + thread);
+                        let mut rng = SplitMix64::new(seed * 77 + thread);
                         (0..2_000)
                             .map(|_| {
-                                let key = (next() % 500) as u32;
+                                let key = rng.below(500) as u32;
                                 let value = Spread::new(db, key);
                                 assert_eq!(value.key(db), key);
                                 (key, value.as_id())

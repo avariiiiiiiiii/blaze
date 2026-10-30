@@ -2,11 +2,11 @@
 //! content, whose code it is, and what it refers to.
 
 
-use base_db::{Crate, CrateOrigin};
+use base_db::{Db, Crate, CrateOrigin};
 use blaze_codegen::{
     CodegenError,
     backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
-    plan::Origin,
+    plan::{Origin, PlanError, Policy},
 };
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemId, ItemKey};
@@ -20,12 +20,12 @@ use hir_ty::{
     next_solver::{DbInterner, GenericArgs, ParamEnv, TyKind},
 };
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use salsa::plumbing::FromId;
 use smallvec::{SmallVec, smallvec};
 
-use super::{Body, BuildTime, Hashes, HirInstance, HirStatic, Kind, refs, undescribed};
+use super::{Body, BuildTime, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
 use crate::{
     Instance, InstanceDef, exported_static, exported_symbol, fncache, home::Homes,
     linked_symbol,
@@ -34,15 +34,15 @@ use crate::{
 /// The build's database, `Sync` and shared by reference by every task. Nothing here locks:
 /// each call has its own [`Homes`], which lives as long as the task's work on one instance.
 pub struct Databases<'db> {
-    db: &'db (dyn HirDatabase + Sync),
+    db: &'db Db,
 }
 
 impl<'db> Databases<'db> {
-    pub fn new(db: &'db (dyn HirDatabase + Sync)) -> Self {
+    pub fn new(db: &'db Db) -> Self {
         Databases { db }
     }
 
-    pub(crate) fn with<T>(&self, work: impl FnOnce(&dyn HirDatabase, &mut Homes) -> T) -> T {
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
         work(self.db, &mut Homes::default())
     }
 }
@@ -52,11 +52,114 @@ pub struct HirFrontend<'db> {
     pub(crate) databases: Databases<'db>,
     pub(crate) hashes: Box<dyn Hashes>,
     pub(crate) build_time: BuildTime,
+    /// Which origins' units MIR-inline: what a function's references are walked for.
+    inlining: Option<Inlining>,
+}
+
+/// Whether some unit of each origin of the build's [`Policy`] MIR-inlines
+/// (`Spec::mir_inline`), the first spec or the one a live build tiers it up to.
+struct Inlining {
+    /// A member's, a dependency's, build-time code's, of a package the profile names no
+    /// override for.
+    member: Result<bool, PlanError>,
+    dependency: Result<bool, PlanError>,
+    build_time: Result<bool, PlanError>,
+    /// Of a package the profile names (`[profile.*.package.<name>]`), the same three.
+    packages: FxHashMap<String, [Result<bool, PlanError>; 3]>,
+    std: Result<bool, PlanError>,
+    /// Some origin's units inline: what a generic, which every origin may ask for, is walked
+    /// with.
+    any: bool,
+}
+
+impl Inlining {
+    /// Made once a build, choosing for each origin as the plan does.
+    fn of(policy: &Policy) -> Inlining {
+        let inlines = |origin: Origin| {
+            policy.choose(&origin, None).map(|choice| {
+                let then = choice.then.is_some_and(|it| Build::of(&it).inlines);
+                Build::of(&choice.first).inlines || then
+            })
+        };
+        let kinds = |name: &str| {
+            [
+                inlines(Origin::Member(name.to_owned())),
+                inlines(Origin::Dependency(name.to_owned())),
+                inlines(Origin::BuildTime(name.to_owned())),
+            ]
+        };
+        // No package is named the empty name: these are of one the profile has nothing for.
+        let [member, dependency, build_time] = kinds("");
+        let packages: FxHashMap<_, _> = (policy.profile.packages.keys())
+            .filter(|it| *it != "*")
+            .map(|name| (name.clone(), kinds(name)))
+            .collect();
+        let std = inlines(Origin::Std);
+        let any = [&member, &dependency, &build_time, &std]
+            .into_iter()
+            .chain(packages.values().flatten())
+            .any(|it| it == &Ok(true));
+        Inlining { member, dependency, build_time, packages, std, any }
+    }
+
+    fn of_origin(&self, origin: &Origin) -> &Result<bool, PlanError> {
+        let (name, kind) = match origin {
+            Origin::Std => return &self.std,
+            Origin::Member(name) => (name, 0),
+            Origin::Dependency(name) => (name, 1),
+            Origin::BuildTime(name) => (name, 2),
+        };
+        match self.packages.get(name) {
+            Some(kinds) => &kinds[kind],
+            None => [&self.member, &self.dependency, &self.build_time][kind],
+        }
+    }
 }
 
 impl<'db> HirFrontend<'db> {
     pub fn new(databases: Databases<'db>, hashes: Box<dyn Hashes>, build_time: BuildTime) -> Self {
-        HirFrontend { databases, hashes, build_time }
+        HirFrontend { databases, hashes, build_time, inlining: None }
+    }
+
+    /// The front end of a build compiled as `policy` says: what describing and preparing a
+    /// function need, which list what its code calls as the units of its origin inline it.
+    pub fn with_policy(mut self, policy: &Policy) -> Self {
+        self.inlining = Some(Inlining::of(policy));
+        self
+    }
+
+    /// Whether a unit of `instance` MIR-inlines bodies of crates other than the library's,
+    /// whose code then calls what they call: one of its crate's origin when it is not
+    /// generic, else of any origin, as any may ask for it. What its references are walked
+    /// for ([`refs::walk`]).
+    pub(crate) fn inlines(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+    ) -> Result<bool, String> {
+        self.inlines_as(db, instance, None)
+    }
+
+    /// [`Self::inlines`], with the origin of the instance's crate when the caller has it.
+    fn inlines_as(
+        &self,
+        db: &Db,
+        instance: &HirInstance,
+        origin: Option<&Origin>,
+    ) -> Result<bool, String> {
+        let Some(inlining) = &self.inlining else {
+            return Err("the front end was made with no policy (`HirFrontend::with_policy`), so \
+                        it can't tell which units inline the instance's MIR"
+                .to_owned());
+        };
+        let of_origin = match crate_of(db, &instance.0) {
+            Some(krate) if !generic(&instance.0) => match origin {
+                Some(origin) => inlining.of_origin(origin),
+                None => inlining.of_origin(&self.origin(db, krate)),
+            },
+            _ => return Ok(inlining.any),
+        };
+        of_origin.as_ref().copied().map_err(|it| it.to_string())
     }
 
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
@@ -87,13 +190,13 @@ impl<'db> HirFrontend<'db> {
             .map_err(|what| undescribed(&krate, None, format!("its allocator shim: {what}")))
     }
 
-    pub(crate) fn with<T>(&self, work: impl FnOnce(&dyn HirDatabase, &mut Homes) -> T) -> T {
+    pub(crate) fn with<T>(&self, work: impl FnOnce(&Db, &mut Homes) -> T) -> T {
         self.databases.with(work)
     }
 
     fn described(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         homes: &mut Homes,
         instance: &HirInstance,
         requester: &Origin,
@@ -115,8 +218,9 @@ impl<'db> HirFrontend<'db> {
         };
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0);
-        let refs = refs::walk(db, instance, homes).map_err(fail)?;
-        let built_in = refs::built_in(db, instance).map_err(fail)?.to_vec();
+        let inlined = self.inlines_as(db, instance, Some(&origin)).map_err(fail)?;
+        let refs = refs::walk(db, instance, inlined, homes).map_err(fail)?;
+        let built_in = refs::built_in(db, instance, inlined).map_err(fail)?.to_vec();
         Ok(Described {
             item,
             code,
@@ -131,7 +235,7 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// Whose code a crate's is, for its settings.
-    pub(crate) fn origin(&self, db: &dyn HirDatabase, krate: Crate) -> Origin {
+    pub(crate) fn origin(&self, db: &Db, krate: Crate) -> Origin {
         let data = krate.data(db);
         let name = match &data.origin {
             CrateOrigin::Lang(_) => return Origin::Std,
@@ -153,7 +257,7 @@ impl<'db> HirFrontend<'db> {
 
     fn described_static(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         homes: &mut Homes,
         value: &HirStatic,
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
@@ -199,38 +303,40 @@ impl Frontend for HirFrontend<'_> {
 
 /// The code hashes of the instances whose bodies the IR of `instance` builds in, at any depth,
 /// sorted, each once: its [`blaze_codegen::CompiledFunction::inlined`]. Nothing is allocated
-/// for one that builds nothing in, as nearly every one.
+/// for one that builds nothing in, as nearly every one. `inlined` is whether its references
+/// were walked for a unit that MIR-inlines ([`HirFrontend::inlines`]), and so the callees'
+/// are: what was inlined into a callee was inlined with it.
 pub(crate) fn inlined<'a>(
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     hashes: &dyn Hashes,
-    instance: &'a HirInstance,
+    (instance, inlined): (&'a HirInstance, bool),
 ) -> Result<Vec<CodeHash>, String> {
-    let mut inlined = Vec::new();
+    let mut found = Vec::new();
     let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
     let mut seen = FxHashSet::default();
     while let Some(at) = queue.pop() {
-        let built_in = refs::built_in(db, at)?;
+        let built_in = refs::built_in(db, at, inlined)?;
         if built_in.is_empty() {
             continue;
         }
-        let refs = refs::walked(db, at)?;
+        let refs = refs::walked(db, at, inlined)?;
         for &place in built_in {
             let Some(FrontRef::Function(callee)) = refs.get(place as usize) else {
                 return Err(format!("{at:?} builds in place {place}, which is no function"));
             };
             if seen.insert(callee) {
-                inlined.push(code_of(db, hashes, &callee.0)?);
+                found.push(code_of(db, hashes, &callee.0)?);
                 queue.push(callee);
             }
         }
     }
-    inlined.sort_unstable();
-    inlined.dedup();
-    Ok(inlined)
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
 }
 
 /// The body of a closure or coroutine, by its interned id.
-fn closure_loc<'db>(db: &'db dyn HirDatabase, def: InstanceDef) -> Option<InternedClosure<'db>> {
+fn closure_loc<'db>(db: &'db Db, def: InstanceDef) -> Option<InternedClosure<'db>> {
     match def {
         InstanceDef::Closure(id) => Some(InternedClosureId::from_id(id).loc(db)),
         InstanceDef::Coroutine(id) | InstanceDef::CoroutineByMove(id) => {
@@ -240,7 +346,7 @@ fn closure_loc<'db>(db: &'db dyn HirDatabase, def: InstanceDef) -> Option<Intern
     }
 }
 
-fn owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> Result<ItemId, String> {
+fn owner_item(db: &Db, owner: InferBodyId<'_>) -> Result<ItemId, String> {
     match owner {
         InferBodyId::DefWithBodyId(owner) => Ok(match owner {
             DefWithBodyId::FunctionId(it) => ItemId::Function(it),
@@ -256,7 +362,7 @@ fn owner_item(db: &dyn HirDatabase, owner: InferBodyId<'_>) -> Result<ItemId, St
 
 /// Which item an instance is of. A shim is of the trait method or lang item rustc names it
 /// by: drop glue is `drop_in_place`, a vtable's `call_once` is `FnOnce::call_once`.
-pub(super) fn item_of(db: &dyn HirDatabase, kind: &Kind) -> Result<ItemId, String> {
+pub(super) fn item_of(db: &Db, kind: &Kind) -> Result<ItemId, String> {
     let (instance, env) = match kind {
         Kind::Code(instance, env) => (instance, env),
         Kind::Start(main) => return Ok(ItemId::Function(*main)),
@@ -303,7 +409,7 @@ const ARGS_DOMAIN: &str = "blaze v2 args 1";
 
 /// What an instance's code is. A shim's is what kind of shim it is, with the code of the
 /// function whose signature it adapts: what else it reads is its type argument's.
-fn code_of(db: &dyn HirDatabase, hashes: &dyn Hashes, kind: &Kind) -> Result<CodeHash, String> {
+fn code_of(db: &Db, hashes: &dyn Hashes, kind: &Kind) -> Result<CodeHash, String> {
     let instance = match kind {
         Kind::Code(instance, _) => instance,
         Kind::Asm(text) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
@@ -345,7 +451,7 @@ fn code_of(db: &dyn HirDatabase, hashes: &dyn Hashes, kind: &Kind) -> Result<Cod
 }
 
 /// The content ID of an instance's generic arguments, regions left out.
-fn args_of(db: &dyn HirDatabase, hashes: &dyn Hashes, kind: &Kind) -> Result<ContentId, String> {
+fn args_of(db: &Db, hashes: &dyn Hashes, kind: &Kind) -> Result<ContentId, String> {
     let Kind::Code(instance, _) = kind else { return Ok(ContentId::default()) };
     let mut hasher = Hasher::new(ARGS_DOMAIN);
     for arg in instance.args.as_ref().iter() {
@@ -378,7 +484,7 @@ fn generic(kind: &Kind) -> bool {
 }
 
 /// The crate an instance's code is written in, for one that is not generic.
-fn crate_of(db: &dyn HirDatabase, kind: &Kind) -> Option<Crate> {
+pub(super) fn crate_of(db: &Db, kind: &Kind) -> Option<Crate> {
     match kind {
         Kind::Code(instance, _) => match instance.def {
             InstanceDef::Fn(func) => Some(func.krate(db)),
@@ -391,7 +497,7 @@ fn crate_of(db: &dyn HirDatabase, kind: &Kind) -> Option<Crate> {
 
 /// The overflow checks the MIR of a generic says, as rustc builds a crate's MIR with its own:
 /// none in the standard library's, and the instantiating crate's where the body inherits them.
-fn written_checks(db: &dyn HirDatabase, kind: &Kind) -> Option<bool> {
+fn written_checks(db: &Db, kind: &Kind) -> Option<bool> {
     let Kind::Code(instance, _) = kind else { return None };
     let (krate, inherits) = match instance.def {
         InstanceDef::Fn(func) => (
@@ -412,7 +518,7 @@ fn written_checks(db: &dyn HirDatabase, kind: &Kind) -> Option<bool> {
 
 /// The symbol outside code names an instance by: `#[no_mangle]`, `#[export_name]`, the
 /// standard library's functions linked by name, the C `main`.
-pub(super) fn symbol_of(db: &dyn HirDatabase, kind: &Kind) -> Option<String> {
+pub(super) fn symbol_of(db: &Db, kind: &Kind) -> Option<String> {
     match kind {
         Kind::Code(instance, _) => match instance.def {
             InstanceDef::Fn(func) if instance.args.as_ref().iter().all(|it| it.region().is_some()) => {

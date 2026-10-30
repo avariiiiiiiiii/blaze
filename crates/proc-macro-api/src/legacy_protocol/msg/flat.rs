@@ -42,11 +42,12 @@ use std::collections::VecDeque;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use serde_derive::{Deserialize, Serialize};
-use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
+use span::{ErasedFileAstId, Span, SpanAnchor, TextRange};
 
 use crate::{
     legacy_protocol::SpanId,
     version::{ENCODE_CLOSE_SPAN_VERSION, EXTENDED_LEAF_DATA},
+    wire::{raw_context, raw_file_id},
 };
 
 pub type SpanDataIndexMap =
@@ -67,30 +68,40 @@ pub fn serialize_span_data_index_map(map: &SpanDataIndexMap) -> Vec<u32> {
         .into_flattened()
 }
 
-pub fn deserialize_span_data_index_map(map: &[u32]) -> SpanDataIndexMap {
-    let (chunks, remainder) = map.as_chunks();
-    assert!(remainder.is_empty());
-    chunks
-        .iter()
-        .map(|&[file_id, ast_id, start, end, e]| {
-            Span {
-                anchor: SpanAnchor {
-                    file_id: EditionedFileId::from_raw(file_id),
-                    ast_id: ErasedFileAstId::from_raw(ast_id),
-                },
-                range: TextRange::new(start.into(), end.into()),
-                // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's
-                // contexts. These come back from the proc-macro server, which only echoes the
-                // contexts this process sent it (`serialize_span_data_index_map`). Memory
-                // safety doesn't rest on it: a value the server made up panics in `from_u32`
-                // or in salsa's checked lookup, or names another context's hygiene.
-                ctx: unsafe { SyntaxContext::from_u32(e) },
-            }
-        })
-        .collect()
+/// The span table [`serialize_span_data_index_map`] wrote, each span's ids checked to be ones
+/// `as_u32` and `into_u32` give and its range to end after it starts. A table naming one span
+/// twice is refused: the set would keep one and every later id would name the span after it.
+pub fn deserialize_span_data_index_map(map: &[u32]) -> Result<SpanDataIndexMap, String> {
+    let (chunks, remainder) = map.as_chunks::<5>();
+    if !remainder.is_empty() {
+        return Err(format!("a span table of {} numbers, not five a span", map.len()));
+    }
+    let mut table = SpanDataIndexMap::default();
+    table.reserve(chunks.len());
+    for (at, &[file_id, ast_id, start, end, ctx]) in chunks.iter().enumerate() {
+        let span_at = |why: String| format!("span {at} of the span table: {why}");
+        if start > end {
+            return Err(span_at(format!("its range {start}..{end} ends before it starts")));
+        }
+        let span = Span {
+            anchor: SpanAnchor {
+                file_id: raw_file_id(file_id).map_err(span_at)?,
+                ast_id: ErasedFileAstId::from_raw(ast_id),
+            },
+            range: TextRange::new(start.into(), end.into()),
+            ctx: raw_context(ctx).map_err(span_at)?,
+        };
+        if !table.insert(span) {
+            return Err(span_at("the table has it twice".to_owned()));
+        }
+    }
+    Ok(table)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// The longest suffix a token tree's literal holds: its node keeps the length in 18 bits.
+const LONGEST_SUFFIX: usize = (u32::MAX >> 14) as usize;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct FlatTree {
     subtree: Vec<u32>,
     literal: Vec<u32>,
@@ -169,34 +180,46 @@ impl FlatTree {
         }
     }
 
+    /// The tree, its span ids looked up in `span_data_table`. Columns that are not what the
+    /// writer makes of a tree, or an id past the table, are an error naming where.
     pub fn to_subtree_resolved(
         self,
         version: u32,
         span_data_table: &SpanDataIndexMap,
-    ) -> tt::TopSubtree {
-        Reader::<Span> {
+    ) -> Result<tt::TopSubtree, String> {
+        self.reader::<Span>(version, span_data_table)?.read_subtree()
+    }
+
+    /// The columns read and checked ([`Reader::check`]).
+    fn reader<'t, S: SpanTransformer>(
+        self,
+        version: u32,
+        span_data_table: &'t S::Table,
+    ) -> Result<Reader<'t, S>, String> {
+        let reader = Reader::<S> {
             subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                read_vec(self.subtree, SubtreeRepr::read_with_close_span)
+                read_vec("subtree", self.subtree, SubtreeRepr::read_with_close_span)?
             } else {
-                read_vec(self.subtree, SubtreeRepr::read)
+                read_vec("subtree", self.subtree, SubtreeRepr::read)?
             },
             literal: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.literal, LiteralRepr::read_with_kind)
+                read_vec("literal", self.literal, LiteralRepr::read_with_kind)?
             } else {
-                read_vec(self.literal, LiteralRepr::read)
+                read_vec("literal", self.literal, LiteralRepr::read)?
             },
-            punct: read_vec(self.punct, PunctRepr::read),
+            punct: read_vec("punct", self.punct, PunctRepr::read)?,
             ident: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.ident, IdentRepr::read_with_rawness)
+                read_vec("ident", self.ident, IdentRepr::read_with_rawness)?
             } else {
-                read_vec(self.ident, IdentRepr::read)
+                read_vec("ident", self.ident, IdentRepr::read)?
             },
             token_tree: self.token_tree,
             text: self.text,
             span_data_table,
             version,
-        }
-        .read_subtree()
+        };
+        reader.check()?;
+        Ok(reader)
     }
 }
 
@@ -291,30 +314,8 @@ impl FlatTree {
         self,
         version: u32,
         span_join: impl Fn(T::Span, T::Span) -> T::Span,
-    ) -> proc_macro_srv::TokenStream<T::Span> {
-        Reader::<T> {
-            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                read_vec(self.subtree, SubtreeRepr::read_with_close_span)
-            } else {
-                read_vec(self.subtree, SubtreeRepr::read)
-            },
-            literal: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.literal, LiteralRepr::read_with_kind)
-            } else {
-                read_vec(self.literal, LiteralRepr::read)
-            },
-            punct: read_vec(self.punct, PunctRepr::read),
-            ident: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.ident, IdentRepr::read_with_rawness)
-            } else {
-                read_vec(self.ident, IdentRepr::read)
-            },
-            token_tree: self.token_tree,
-            text: self.text,
-            span_data_table: &(),
-            version,
-        }
-        .read_tokenstream(span_join)
+    ) -> Result<proc_macro_srv::TokenStream<T::Span>, String> {
+        self.reader::<T>(version, &())?.read_tokenstream(span_join)
     }
 
     pub fn to_tokenstream_resolved(
@@ -322,37 +323,55 @@ impl FlatTree {
         version: u32,
         span_data_table: &SpanDataIndexMap,
         span_join: impl Fn(Span, Span) -> Span,
-    ) -> proc_macro_srv::TokenStream<Span> {
-        Reader::<Span> {
-            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                read_vec(self.subtree, SubtreeRepr::read_with_close_span)
-            } else {
-                read_vec(self.subtree, SubtreeRepr::read)
-            },
-            literal: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.literal, LiteralRepr::read_with_kind)
-            } else {
-                read_vec(self.literal, LiteralRepr::read)
-            },
-            punct: read_vec(self.punct, PunctRepr::read),
-            ident: if version >= EXTENDED_LEAF_DATA {
-                read_vec(self.ident, IdentRepr::read_with_rawness)
-            } else {
-                read_vec(self.ident, IdentRepr::read)
-            },
-            token_tree: self.token_tree,
-            text: self.text,
-            span_data_table,
-            version,
-        }
-        .read_tokenstream(span_join)
+    ) -> Result<proc_macro_srv::TokenStream<Span>, String> {
+        self.reader::<Span>(version, span_data_table)?.read_tokenstream(span_join)
     }
 }
 
-fn read_vec<T, F: Fn([u32; N]) -> T, const N: usize>(xs: Vec<u32>, f: F) -> Vec<T> {
-    let (chunks, remainder) = xs.as_chunks();
-    assert!(remainder.is_empty());
-    chunks.iter().map(|chunk| f(*chunk)).collect()
+/// The rows of `N` numbers of the column `what`, each read by `f`.
+fn read_vec<T, const N: usize>(
+    what: &str,
+    xs: Vec<u32>,
+    f: impl Fn([u32; N]) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let (chunks, remainder) = xs.as_chunks::<N>();
+    if !remainder.is_empty() {
+        return Err(format!("a {what} column of {} numbers, not {N} a row", xs.len()));
+    }
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(at, &chunk)| f(chunk).map_err(|why| format!("{what} {at}: {why}")))
+        .collect()
+}
+
+fn delimiter_kind(kind: u32) -> Result<tt::DelimiterKind, String> {
+    Ok(match kind {
+        0 => tt::DelimiterKind::Invisible,
+        1 => tt::DelimiterKind::Parenthesis,
+        2 => tt::DelimiterKind::Brace,
+        3 => tt::DelimiterKind::Bracket,
+        other => return Err(format!("delimiter kind {other}")),
+    })
+}
+
+/// A literal's kind as the writer encodes it: the kind's number, then a raw string's hashes.
+fn lit_kind(kind: u16) -> Result<tt::LitKind, String> {
+    use tt::LitKind as Kind;
+    Ok(match u16::to_le_bytes(kind) {
+        [0, 0] => Kind::Err(()),
+        [1, 0] => Kind::Byte,
+        [2, 0] => Kind::Char,
+        [3, 0] => Kind::Integer,
+        [4, 0] => Kind::Float,
+        [5, 0] => Kind::Str,
+        [6, r] => Kind::StrRaw(r),
+        [7, 0] => Kind::ByteStr,
+        [8, r] => Kind::ByteStrRaw(r),
+        [9, 0] => Kind::CStr,
+        [10, r] => Kind::CStrRaw(r),
+        _ => return Err(format!("literal kind {kind:#06x}")),
+    })
 }
 
 fn write_vec<T, F: Fn(T) -> [u32; N], const N: usize>(xs: Vec<T>, f: F) -> Vec<u32> {
@@ -369,15 +388,9 @@ impl SubtreeRepr {
         };
         [self.open.0, kind, self.tt[0], self.tt[1]]
     }
-    fn read([open, kind, lo, len]: [u32; 4]) -> SubtreeRepr {
-        let kind = match kind {
-            0 => tt::DelimiterKind::Invisible,
-            1 => tt::DelimiterKind::Parenthesis,
-            2 => tt::DelimiterKind::Brace,
-            3 => tt::DelimiterKind::Bracket,
-            other => panic!("bad kind {other}"),
-        };
-        SubtreeRepr { open: SpanId(open), close: SpanId(!0), kind, tt: [lo, len] }
+    fn read([open, kind, lo, len]: [u32; 4]) -> Result<SubtreeRepr, String> {
+        let kind = delimiter_kind(kind)?;
+        Ok(SubtreeRepr { open: SpanId(open), close: SpanId(!0), kind, tt: [lo, len] })
     }
     fn write_with_close_span(self) -> [u32; 5] {
         let kind = match self.kind {
@@ -388,15 +401,9 @@ impl SubtreeRepr {
         };
         [self.open.0, self.close.0, kind, self.tt[0], self.tt[1]]
     }
-    fn read_with_close_span([open, close, kind, lo, len]: [u32; 5]) -> SubtreeRepr {
-        let kind = match kind {
-            0 => tt::DelimiterKind::Invisible,
-            1 => tt::DelimiterKind::Parenthesis,
-            2 => tt::DelimiterKind::Brace,
-            3 => tt::DelimiterKind::Bracket,
-            other => panic!("bad kind {other}"),
-        };
-        SubtreeRepr { open: SpanId(open), close: SpanId(close), kind, tt: [lo, len] }
+    fn read_with_close_span([open, close, kind, lo, len]: [u32; 5]) -> Result<SubtreeRepr, String> {
+        let kind = delimiter_kind(kind)?;
+        Ok(SubtreeRepr { open: SpanId(open), close: SpanId(close), kind, tt: [lo, len] })
     }
 }
 
@@ -404,14 +411,17 @@ impl LiteralRepr {
     fn write(self) -> [u32; 2] {
         [self.id.0, self.text]
     }
-    fn read([id, text]: [u32; 2]) -> LiteralRepr {
-        LiteralRepr { id: SpanId(id), text, kind: 0, suffix: !0 }
+    fn read([id, text]: [u32; 2]) -> Result<LiteralRepr, String> {
+        Ok(LiteralRepr { id: SpanId(id), text, kind: 0, suffix: !0 })
     }
     fn write_with_kind(self) -> [u32; 4] {
         [self.id.0, self.text, self.kind as u32, self.suffix]
     }
-    fn read_with_kind([id, text, kind, suffix]: [u32; 4]) -> LiteralRepr {
-        LiteralRepr { id: SpanId(id), text, kind: kind as u16, suffix }
+    fn read_with_kind([id, text, kind, suffix]: [u32; 4]) -> Result<LiteralRepr, String> {
+        let Ok(kind) = u16::try_from(kind) else {
+            return Err(format!("literal kind {kind:#x}"));
+        };
+        Ok(LiteralRepr { id: SpanId(id), text, kind, suffix })
     }
 }
 
@@ -423,13 +433,16 @@ impl PunctRepr {
         };
         [self.id.0, self.char as u32, spacing]
     }
-    fn read([id, char, spacing]: [u32; 3]) -> PunctRepr {
+    fn read([id, char, spacing]: [u32; 3]) -> Result<PunctRepr, String> {
         let spacing = match spacing {
             0 => tt::Spacing::Alone,
             1 => tt::Spacing::Joint,
-            other => panic!("bad spacing {other}"),
+            other => return Err(format!("spacing {other}")),
         };
-        PunctRepr { id: SpanId(id), char: char.try_into().unwrap(), spacing }
+        let Some(char) = char::from_u32(char) else {
+            return Err(format!("{char:#x}, which is no char"));
+        };
+        Ok(PunctRepr { id: SpanId(id), char, spacing })
     }
 }
 
@@ -437,14 +450,19 @@ impl IdentRepr {
     fn write(self) -> [u32; 2] {
         [self.id.0, self.text]
     }
-    fn read(data: [u32; 2]) -> IdentRepr {
-        IdentRepr { id: SpanId(data[0]), text: data[1], is_raw: false }
+    fn read(data: [u32; 2]) -> Result<IdentRepr, String> {
+        Ok(IdentRepr { id: SpanId(data[0]), text: data[1], is_raw: false })
     }
     fn write_with_rawness(self) -> [u32; 3] {
         [self.id.0, self.text, self.is_raw as u32]
     }
-    fn read_with_rawness([id, text, is_raw]: [u32; 3]) -> IdentRepr {
-        IdentRepr { id: SpanId(id), text, is_raw: is_raw == 1 }
+    fn read_with_rawness([id, text, is_raw]: [u32; 3]) -> Result<IdentRepr, String> {
+        let is_raw = match is_raw {
+            0 => false,
+            1 => true,
+            other => return Err(format!("rawness {other}")),
+        };
+        Ok(IdentRepr { id: SpanId(id), text, is_raw })
     }
 }
 
@@ -452,7 +470,8 @@ pub trait SpanTransformer {
     type Table;
     type Span: Copy;
     fn token_id_of(table: &mut Self::Table, s: Self::Span) -> SpanId;
-    fn span_for_token_id(table: &Self::Table, id: SpanId) -> Self::Span;
+    /// The span `id` stands for, or why there is none.
+    fn span_for_token_id(table: &Self::Table, id: SpanId) -> Result<Self::Span, String>;
 }
 impl SpanTransformer for SpanId {
     type Table = ();
@@ -461,8 +480,8 @@ impl SpanTransformer for SpanId {
         token_id
     }
 
-    fn span_for_token_id((): &Self::Table, id: SpanId) -> Self::Span {
-        id
+    fn span_for_token_id((): &Self::Table, id: SpanId) -> Result<Self::Span, String> {
+        Ok(id)
     }
 }
 impl SpanTransformer for Span {
@@ -471,8 +490,11 @@ impl SpanTransformer for Span {
     fn token_id_of(table: &mut Self::Table, span: Self::Span) -> SpanId {
         SpanId(table.insert_full(span).0 as u32)
     }
-    fn span_for_token_id(table: &Self::Table, id: SpanId) -> Self::Span {
-        *table.get_index(id.0 as usize).unwrap_or_else(|| &table[0])
+    fn span_for_token_id(table: &Self::Table, id: SpanId) -> Result<Self::Span, String> {
+        match table.get_index(id.0 as usize) {
+            Some(span) => Ok(*span),
+            None => Err(format!("span id {} past the span table of {}", id.0, table.len())),
+        }
     }
 }
 
@@ -594,7 +616,7 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
 /// What is in the parentheses of an expression a macro was passed and passed on: a group
 /// without delimiters around parentheses of the same span. The parentheses are there for our
 /// parser and a proc macro is not to see them.
-fn fragment_contents<'a>(
+pub(crate) fn fragment_contents<'a>(
     subtree: &tt::Subtree,
     mut contents: tt::iter::TtIter<'a>,
 ) -> Option<tt::iter::TtIter<'a>> {
@@ -772,230 +794,230 @@ struct Reader<'span, S: SpanTransformer> {
     span_data_table: &'span S::Table,
 }
 
-impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
-    pub(crate) fn read_subtree(self) -> tt::TopSubtree {
-        let mut res: Vec<Option<(tt::Delimiter, Vec<tt::TokenTree>)>> =
-            vec![None; self.subtree.len()];
-        let read_span = |id| T::span_for_token_id(self.span_data_table, id);
-        for i in (0..self.subtree.len()).rev() {
-            let repr = &self.subtree[i];
-            let token_trees = &self.token_tree[repr.tt[0] as usize..repr.tt[1] as usize];
-            let delimiter = tt::Delimiter {
-                open: read_span(repr.open),
-                close: read_span(repr.close),
-                kind: repr.kind,
-            };
-            let mut s = Vec::new();
-            for &idx_tag in token_trees {
-                let tag = idx_tag & 0b11;
+impl<S: SpanTransformer> Reader<'_, S> {
+    /// Holds the columns to what the writer makes of a tree, breadth first: the top subtree
+    /// first, each subtree's token trees right after the last one's and all of them in one, each
+    /// subtree but the top held once, by one before it, numbered in the order they are held, and
+    /// every leaf one of its column. Reading then visits each token tree once, so it costs as
+    /// much as the columns are long.
+    fn check(&self) -> Result<(), String> {
+        if self.subtree.is_empty() {
+            return Err("a tree with no subtree".to_owned());
+        }
+        let mut next_held = 1;
+        let mut end = 0;
+        for (at, repr) in self.subtree.iter().enumerate() {
+            let [lo, hi] = repr.tt.map(|it| it as usize);
+            if lo != end || hi < lo || hi > self.token_tree.len() {
+                return Err(format!(
+                    "subtree {at} holds token trees {lo}..{hi}, not those from {end}, the last \
+                     subtree's end, within the {}",
+                    self.token_tree.len()
+                ));
+            }
+            end = hi;
+            for &idx_tag in &self.token_tree[lo..hi] {
                 let idx = (idx_tag >> 2) as usize;
-                match tag {
-                    // XXX: we iterate subtrees in reverse to guarantee
-                    // that this unwrap doesn't fire.
+                let (what, len) = match idx_tag & 0b11 {
                     0b00 => {
-                        let (delimiter, subtree) = res[idx].take().unwrap();
-                        s.push(tt::TokenTree::Subtree(tt::Subtree {
-                            delimiter,
-                            len: subtree.len() as u32,
-                        }));
-                        s.extend(subtree)
+                        if idx != next_held || idx <= at {
+                            return Err(format!(
+                                "subtree {at} holds subtree {idx}, where the next held is \
+                                 {next_held}"
+                            ));
+                        }
+                        next_held += 1;
+                        continue;
                     }
-                    0b01 => {
-                        use tt::LitKind::*;
-                        let repr = &self.literal[idx];
-                        let text = self.text[repr.text as usize].as_str();
-                        let span = read_span(repr.id);
-                        let suffix = if repr.suffix != !0 {
-                            self.text[repr.suffix as usize].as_str()
-                        } else {
-                            ""
-                        };
-                        // `Literal::i32_suffixed(-1)` is one token to the macro and a minus
-                        // sign and a literal to the compiler.
-                        let numeric = self.version < EXTENDED_LEAF_DATA
-                            || matches!(u16::to_le_bytes(repr.kind), [3 | 4, _]);
-                        let text = match text.strip_prefix('-') {
-                            Some(magnitude) if numeric => {
-                                let minus =
-                                    tt::Punct { char: '-', spacing: tt::Spacing::Alone, span };
-                                s.push(tt::Leaf::Punct(minus).into());
-                                magnitude
-                            }
-                            _ => text,
-                        };
-                        s.push(
-                            tt::Leaf::Literal(if self.version >= EXTENDED_LEAF_DATA {
-                                tt::Literal::new(
-                                    text,
-                                    span,
-                                    match u16::to_le_bytes(repr.kind) {
-                                        [0, _] => Err(()),
-                                        [1, _] => Byte,
-                                        [2, _] => Char,
-                                        [3, _] => Integer,
-                                        [4, _] => Float,
-                                        [5, _] => Str,
-                                        [6, r] => StrRaw(r),
-                                        [7, _] => ByteStr,
-                                        [8, r] => ByteStrRaw(r),
-                                        [9, _] => CStr,
-                                        [10, r] => CStrRaw(r),
-                                        _ => unreachable!(),
-                                    },
-                                    suffix,
-                                )
-                            } else {
-                                tt::token_to_literal(text, span)
-                            })
-                            .into(),
-                        )
-                    }
-                    0b10 => {
-                        let repr = &self.punct[idx];
-                        s.push(
-                            tt::Leaf::Punct(tt::Punct {
-                                char: repr.char,
-                                spacing: repr.spacing,
-                                span: read_span(repr.id),
-                            })
-                            .into(),
-                        )
-                    }
-                    0b11 => {
-                        let repr = &self.ident[idx];
-                        let text = self.text[repr.text as usize].as_str();
-                        let (is_raw, text) = if self.version >= EXTENDED_LEAF_DATA {
-                            (
-                                if repr.is_raw { tt::IdentIsRaw::Yes } else { tt::IdentIsRaw::No },
-                                text,
-                            )
-                        } else {
-                            tt::IdentIsRaw::split_from_symbol(text)
-                        };
-                        s.push(
-                            tt::Leaf::Ident(tt::Ident {
-                                sym: Symbol::intern(text),
-                                span: read_span(repr.id),
-                                is_raw,
-                            })
-                            .into(),
-                        )
-                    }
-                    other => panic!("bad tag: {other}"),
+                    0b01 => ("literal", self.literal.len()),
+                    0b10 => ("punct", self.punct.len()),
+                    _ => ("ident", self.ident.len()),
+                };
+                if idx >= len {
+                    return Err(format!("subtree {at} holds {what} {idx}, past the {len}"));
                 }
             }
-            res[i] = Some((delimiter, s));
         }
+        if end != self.token_tree.len() {
+            return Err(format!("token trees {end}.. are in no subtree"));
+        }
+        if next_held != self.subtree.len() {
+            return Err(format!("subtrees {next_held}.. are held by none"));
+        }
+        Ok(())
+    }
 
-        let (delimiter, mut res) = res[0].take().unwrap();
-        res.insert(0, tt::TokenTree::Subtree(tt::Subtree { delimiter, len: res.len() as u32 }));
-        tt::TopSubtree::from_serialized(res)
+    fn read_span(&self, id: SpanId) -> Result<S::Span, String> {
+        S::span_for_token_id(self.span_data_table, id)
+    }
+
+    fn string(&self, at: u32) -> Result<&str, String> {
+        match self.text.get(at as usize) {
+            Some(text) => Ok(text),
+            None => Err(format!("text {at} past the {}", self.text.len())),
+        }
+    }
+
+    /// The text and suffix of literal `idx`, its kind when the version has it.
+    fn literal_text(&self, idx: usize) -> Result<(&str, &str), String> {
+        let repr = &self.literal[idx];
+        let text = self.string(repr.text)?;
+        let suffix = if repr.suffix != !0 { self.string(repr.suffix)? } else { "" };
+        if suffix.len() > LONGEST_SUFFIX {
+            return Err(format!(
+                "literal {idx} has a suffix of {} bytes, past the {LONGEST_SUFFIX} a token tree \
+                 holds",
+                suffix.len()
+            ));
+        }
+        Ok((text, suffix))
+    }
+
+    fn ident_text(&self, idx: usize) -> Result<(tt::IdentIsRaw, &str), String> {
+        let repr = &self.ident[idx];
+        let text = self.string(repr.text)?;
+        Ok(if self.version >= EXTENDED_LEAF_DATA {
+            (if repr.is_raw { tt::IdentIsRaw::Yes } else { tt::IdentIsRaw::No }, text)
+        } else {
+            tt::IdentIsRaw::split_from_symbol(text)
+        })
+    }
+}
+
+impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
+    /// The tree the checked columns hold, built in preorder with a stack of the subtrees open.
+    fn read_subtree(self) -> Result<tt::TopSubtree, String> {
+        let top = &self.subtree[0];
+        let delimiter = tt::Delimiter {
+            open: self.read_span(top.open)?,
+            close: self.read_span(top.close)?,
+            kind: top.kind,
+        };
+        let mut builder = tt::TopSubtreeBuilder::with_capacity(delimiter, self.token_tree.len());
+        // alloc: one stack per tree read, as deep as its nesting.
+        let mut open: Vec<(usize, usize)> = Vec::new();
+        let (mut at, mut next) = (0, top.tt[0] as usize);
+        loop {
+            if next == self.subtree[at].tt[1] as usize {
+                let Some((outer, after)) = open.pop() else { break };
+                builder.close(self.read_span(self.subtree[at].close)?);
+                (at, next) = (outer, after);
+                continue;
+            }
+            let idx_tag = self.token_tree[next];
+            next += 1;
+            let idx = (idx_tag >> 2) as usize;
+            match idx_tag & 0b11 {
+                0b00 => {
+                    let repr = &self.subtree[idx];
+                    builder.open(repr.kind, self.read_span(repr.open)?);
+                    open.push((at, next));
+                    (at, next) = (idx, repr.tt[0] as usize);
+                }
+                0b01 => self.push_literal(&mut builder, idx)?,
+                0b10 => {
+                    let repr = &self.punct[idx];
+                    builder.push(tt::Leaf::Punct(tt::Punct {
+                        char: repr.char,
+                        spacing: repr.spacing,
+                        span: self.read_span(repr.id)?,
+                    }))
+                }
+                _ => {
+                    let (is_raw, text) = self.ident_text(idx)?;
+                    builder.push(tt::Leaf::Ident(tt::Ident {
+                        sym: Symbol::intern(text),
+                        span: self.read_span(self.ident[idx].id)?,
+                        is_raw,
+                    }))
+                }
+            }
+        }
+        Ok(builder.build())
+    }
+
+    fn push_literal(&self, builder: &mut tt::TopSubtreeBuilder, idx: usize) -> Result<(), String> {
+        let repr = &self.literal[idx];
+        let (text, suffix) = self.literal_text(idx)?;
+        let span = self.read_span(repr.id)?;
+        let kind = match self.version >= EXTENDED_LEAF_DATA {
+            true => Some(lit_kind(repr.kind)?),
+            false => None,
+        };
+        // `Literal::i32_suffixed(-1)` is one token to the macro and a minus sign and a literal
+        // to the compiler.
+        let numeric = matches!(kind, None | Some(tt::LitKind::Integer | tt::LitKind::Float));
+        let text = match text.strip_prefix('-') {
+            Some(magnitude) if numeric => {
+                let minus = tt::Punct { char: '-', spacing: tt::Spacing::Alone, span };
+                builder.push(tt::Leaf::Punct(minus));
+                magnitude
+            }
+            _ => text,
+        };
+        let literal = match kind {
+            Some(kind) => tt::Literal::new(text, span, kind, suffix),
+            None => tt::token_to_literal(text, span),
+        };
+        if literal.suffix_len as usize > LONGEST_SUFFIX {
+            return Err(format!(
+                "literal {idx} has a suffix of {} bytes, past the {LONGEST_SUFFIX} a token tree \
+                 holds",
+                literal.suffix_len
+            ));
+        }
+        builder.push(tt::Leaf::Literal(literal));
+        Ok(())
     }
 }
 
 #[cfg(feature = "in-rust-tree")]
 impl<T: SpanTransformer> Reader<'_, T> {
+    /// The stream the checked columns hold, each subtree's group made before the one holding it
+    /// (the last first): every subtree is held once, by one before it.
     pub(crate) fn read_tokenstream(
         self,
         span_join: impl Fn(T::Span, T::Span) -> T::Span,
-    ) -> proc_macro_srv::TokenStream<T::Span> {
+    ) -> Result<proc_macro_srv::TokenStream<T::Span>, String> {
         let mut res: Vec<Option<proc_macro_srv::Group<T::Span>>> = vec![None; self.subtree.len()];
-        let read_span = |id| T::span_for_token_id(self.span_data_table, id);
         for i in (0..self.subtree.len()).rev() {
             let repr = &self.subtree[i];
             let token_trees = &self.token_tree[repr.tt[0] as usize..repr.tt[1] as usize];
-
-            let stream = token_trees
-                .iter()
-                .copied()
-                .map(|idx_tag| {
-                    let tag = idx_tag & 0b11;
-                    let idx = (idx_tag >> 2) as usize;
-                    match tag {
-                        // XXX: we iterate subtrees in reverse to guarantee
-                        // that this unwrap doesn't fire.
-                        0b00 => proc_macro_srv::TokenTree::Group(res[idx].take().unwrap()),
-                        0b01 => {
-                            let repr = &self.literal[idx];
-                            let text = self.text[repr.text as usize].as_str();
-                            let span = read_span(repr.id);
-                            proc_macro_srv::TokenTree::Literal(
-                                if self.version >= EXTENDED_LEAF_DATA {
-                                    proc_macro_srv::Literal {
-                                        symbol: Symbol::intern(text),
-                                        span,
-                                        kind: match u16::to_le_bytes(repr.kind) {
-                                            [0, _] => proc_macro_srv::LitKind::ErrWithGuar,
-                                            [1, _] => proc_macro_srv::LitKind::Byte,
-                                            [2, _] => proc_macro_srv::LitKind::Char,
-                                            [3, _] => proc_macro_srv::LitKind::Integer,
-                                            [4, _] => proc_macro_srv::LitKind::Float,
-                                            [5, _] => proc_macro_srv::LitKind::Str,
-                                            [6, r] => proc_macro_srv::LitKind::StrRaw(r),
-                                            [7, _] => proc_macro_srv::LitKind::ByteStr,
-                                            [8, r] => proc_macro_srv::LitKind::ByteStrRaw(r),
-                                            [9, _] => proc_macro_srv::LitKind::CStr,
-                                            [10, r] => proc_macro_srv::LitKind::CStrRaw(r),
-                                            _ => unreachable!(),
-                                        },
-                                        suffix: if repr.suffix != !0 {
-                                            Some(Symbol::intern(
-                                                self.text[repr.suffix as usize].as_str(),
-                                            ))
-                                        } else {
-                                            None
-                                        },
-                                    }
-                                } else {
-                                    proc_macro_srv::literal_from_str(text, span).unwrap_or_else(
-                                        |_| proc_macro_srv::Literal {
-                                            symbol: Symbol::intern("internal error"),
-                                            span,
-                                            kind: proc_macro_srv::LitKind::ErrWithGuar,
-                                            suffix: None,
-                                        },
-                                    )
-                                },
-                            )
+            let mut stream = Vec::with_capacity(token_trees.len());
+            for &idx_tag in token_trees {
+                let idx = (idx_tag >> 2) as usize;
+                stream.push(match idx_tag & 0b11 {
+                    0b00 => match res[idx].take() {
+                        Some(group) => proc_macro_srv::TokenTree::Group(group),
+                        None => return Err(format!("subtree {idx} held twice")),
+                    },
+                    0b01 => proc_macro_srv::TokenTree::Literal(self.server_literal(idx)?),
+                    0b10 => {
+                        let repr = &self.punct[idx];
+                        if !repr.char.is_ascii() {
+                            return Err(format!("punct {idx} is {:?}, not ASCII", repr.char));
                         }
-                        0b10 => {
-                            let repr = &self.punct[idx];
-                            proc_macro_srv::TokenTree::Punct(proc_macro_srv::Punct {
-                                ch: repr.char as u8,
-                                joint: repr.spacing == tt::Spacing::Joint,
-                                span: read_span(repr.id),
-                            })
-                        }
-                        0b11 => {
-                            let repr = &self.ident[idx];
-                            let text = self.text[repr.text as usize].as_str();
-                            let (is_raw, text) = if self.version >= EXTENDED_LEAF_DATA {
-                                (
-                                    if repr.is_raw {
-                                        tt::IdentIsRaw::Yes
-                                    } else {
-                                        tt::IdentIsRaw::No
-                                    },
-                                    text,
-                                )
-                            } else {
-                                tt::IdentIsRaw::split_from_symbol(text)
-                            };
-                            proc_macro_srv::TokenTree::Ident(proc_macro_srv::Ident {
-                                sym: Symbol::intern(text),
-                                span: read_span(repr.id),
-                                kind: match is_raw {
-                                    tt::IdentIsRaw::Yes => proc_macro_srv::IdentKind::Raw,
-                                    tt::IdentIsRaw::No => proc_macro_srv::IdentKind::Normal,
-                                },
-                            })
-                        }
-                        other => panic!("bad tag: {other}"),
+                        proc_macro_srv::TokenTree::Punct(proc_macro_srv::Punct {
+                            ch: repr.char as u8,
+                            joint: repr.spacing == tt::Spacing::Joint,
+                            span: self.read_span(repr.id)?,
+                        })
                     }
-                })
-                .collect::<Vec<_>>();
-            let open = read_span(repr.open);
-            let close = read_span(repr.close);
+                    _ => {
+                        let (is_raw, text) = self.ident_text(idx)?;
+                        proc_macro_srv::TokenTree::Ident(proc_macro_srv::Ident {
+                            sym: Symbol::intern(text),
+                            span: self.read_span(self.ident[idx].id)?,
+                            kind: match is_raw {
+                                tt::IdentIsRaw::Yes => proc_macro_srv::IdentKind::Raw,
+                                tt::IdentIsRaw::No => proc_macro_srv::IdentKind::Normal,
+                            },
+                        })
+                    }
+                });
+            }
+            let open = self.read_span(repr.open)?;
+            let close = self.read_span(repr.close)?;
             let g = proc_macro_srv::Group {
                 delimiter: match repr.kind {
                     tt::DelimiterKind::Parenthesis => proc_macro_srv::Delimiter::Parenthesis,
@@ -1013,11 +1035,216 @@ impl<T: SpanTransformer> Reader<'_, T> {
             };
             res[i] = Some(g);
         }
-        let group = res[0].take().unwrap();
-        if group.delimiter == proc_macro_srv::Delimiter::None {
+        let Some(group) = res[0].take() else {
+            return Err("the top subtree is held by another".to_owned());
+        };
+        Ok(if group.delimiter == proc_macro_srv::Delimiter::None {
             group.stream.unwrap_or_default()
         } else {
             TokenStream::new(vec![proc_macro_srv::TokenTree::Group(group)])
+        })
+    }
+
+    fn server_literal(&self, idx: usize) -> Result<proc_macro_srv::Literal<T::Span>, String> {
+        let repr = &self.literal[idx];
+        let (text, suffix) = self.literal_text(idx)?;
+        let span = self.read_span(repr.id)?;
+        if self.version < EXTENDED_LEAF_DATA {
+            return proc_macro_srv::literal_from_str(text, span)
+                .map_err(|_| format!("literal {idx}, {text:?}, is not one literal"));
+        }
+        use proc_macro_srv::LitKind as Kind;
+        Ok(proc_macro_srv::Literal {
+            symbol: Symbol::intern(text),
+            span,
+            kind: match lit_kind(repr.kind)? {
+                tt::LitKind::Err(()) => Kind::ErrWithGuar,
+                tt::LitKind::Byte => Kind::Byte,
+                tt::LitKind::Char => Kind::Char,
+                tt::LitKind::Integer => Kind::Integer,
+                tt::LitKind::Float => Kind::Float,
+                tt::LitKind::Str => Kind::Str,
+                tt::LitKind::StrRaw(r) => Kind::StrRaw(r),
+                tt::LitKind::ByteStr => Kind::ByteStr,
+                tt::LitKind::ByteStrRaw(r) => Kind::ByteStrRaw(r),
+                tt::LitKind::CStr => Kind::CStr,
+                tt::LitKind::CStrRaw(r) => Kind::CStrRaw(r),
+            },
+            suffix: (repr.suffix != !0).then(|| Symbol::intern(suffix)),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the client makes of a corpus input of the fuzz target `proc_macro_flat_tree`: a byte
+    /// picking the version (`4 + byte % 4`), then the postcard tree and span table of an answer.
+    fn resolved(hex: &str) -> Result<tt::TopSubtree, String> {
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|it| u8::from_str_radix(it, 16).expect("a corpus input is hex bytes"))
+            .collect();
+        let version = 4 + u32::from(bytes[0] % 4);
+        let (tree, table): (FlatTree, Vec<u32>) =
+            postcard::from_bytes(&bytes[1..]).expect("a corpus input is a tree and a span table");
+        tree.to_subtree_resolved(version, &deserialize_span_data_index_map(&table)?)
+    }
+
+    fn refused(hex: &str) -> String {
+        match resolved(hex) {
+            Ok(tree) => panic!("{hex} reads as {tree:?}"),
+            Err(why) => why,
+        }
+    }
+
+    #[test]
+    fn bug_no_group() {
+        refused("03 00 00 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_an_empty_span_table() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_span_table_of_four() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 04 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_group_of_four_numbers() {
+        refused("03 04 00 00 00 00 00 00 00 00 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_span_ending_before_it_starts() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 05 00 00 05 01 00");
+    }
+
+    #[test]
+    fn bug_a_file_id_with_the_reserved_bit() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 05 80 80 80 80 08 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_file_id_of_edition_127() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 05 80 80 80 fc 07 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_context_u32_max() {
+        refused("03 05 00 00 00 00 00 00 00 00 00 00 05 00 00 00 00 ff ff ff ff 0f");
+    }
+
+    #[test]
+    fn bug_delimiter_kind_4() {
+        refused("03 05 00 00 04 00 00 00 00 00 00 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_group_range_past_the_end() {
+        refused("03 05 00 00 00 00 09 00 00 00 00 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_group_range_reversed() {
+        refused("03 05 00 00 00 01 00 00 03 00 40 01 00 01 02 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_group_in_itself() {
+        refused("03 05 00 00 00 00 01 00 00 00 01 00 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_a_literal_past_the_end() {
+        refused("03 05 00 00 00 00 01 00 00 00 01 15 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_an_ident_text_past_the_end() {
+        refused("03 05 00 00 00 00 01 00 00 03 00 03 00 01 03 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_punct_spacing_2() {
+        refused("03 05 00 00 00 00 01 00 03 00 40 02 00 01 02 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_punct_a_surrogate() {
+        refused("03 05 00 00 00 00 01 00 03 00 80 b0 03 00 00 01 02 00 05 00 00 00 00 00");
+    }
+
+    #[test]
+    fn bug_literal_kind_11() {
+        refused(
+            "03 05 00 00 00 00 01 04 00 00 0b ff ff ff ff 0f 00 00 01 01 01 01 61 05 00 00 00 00 00",
+        );
+    }
+
+    #[test]
+    fn bug_two_groups_of_one_range() {
+        refused(
+            "03 0a 00 00 00 00 01 00 00 00 00 01 00 03 00 40 01 00 01 02 00 05 00 00 00 00 00",
+        );
+    }
+
+    #[test]
+    fn bug_a_span_id_past_the_table() {
+        let why = refused("03 05 00 00 00 00 01 00 03 07 40 01 00 01 02 00 05 00 00 00 00 00");
+        assert!(why.contains("past the span table"), "{why}");
+    }
+
+    #[test]
+    fn bug_a_span_table_with_a_span_twice() {
+        let why = refused(
+            "03 05 00 00 00 00 01 00 03 02 40 01 00 01 02 00 0f 00 00 00 01 00 00 00 00 01 00 00 \
+             00 02 03 00",
+        );
+        assert!(why.contains("twice"), "{why}");
+    }
+
+    #[test]
+    fn a_nested_tree_reads_back_as_written() {
+        let span = |start| Span {
+            range: TextRange::empty(start.into()),
+            anchor: SpanAnchor {
+                file_id: span::EditionedFileId::new(
+                    span::FileId::from_raw(7),
+                    span::Edition::CURRENT,
+                ),
+                ast_id: span::ROOT_ERASED_FILE_AST_ID,
+            },
+            // SAFETY: no database; the context is compared, never looked up.
+            ctx: unsafe { span::SyntaxContext::from_u32(3) },
+        };
+        let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter {
+            open: span(0),
+            close: span(1),
+            kind: tt::DelimiterKind::Invisible,
+        });
+        for depth in 0..200u32 {
+            builder.open(tt::DelimiterKind::Bracket, span(depth));
+            builder.push(tt::Leaf::Punct(tt::Punct {
+                char: '#',
+                spacing: tt::Spacing::Alone,
+                span: span(depth + 1),
+            }));
+        }
+        builder.push(tt::Leaf::Literal(tt::Literal::new("-1", span(5), tt::LitKind::Str, "")));
+        for depth in 0..200u32 {
+            builder.close(span(depth + 2));
+        }
+        let tree = builder.build();
+        use crate::version::{CURRENT_API_VERSION, RUST_ANALYZER_SPAN_SUPPORT};
+        for version in RUST_ANALYZER_SPAN_SUPPORT..=CURRENT_API_VERSION {
+            let mut table = SpanDataIndexMap::default();
+            let flat = FlatTree::from_subtree(tree.view(), version, &mut table);
+            assert_eq!(flat.to_subtree_resolved(version, &table), Ok(tree.clone()), "{version}");
         }
     }
 }

@@ -3,12 +3,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use base_db::{EditionedFileId, SourceDatabase};
+use base_db::EditionedFileId;
+use blaze_ids::rng::SplitMix64;
 use test_fixture::WithFixture;
 
 use crate::{
     item_tree::{ItemTree, lower_whole, tests::assert_assembled_is_whole},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 /// Real files with nested and outline modules, `use` trees, macros, `extern` blocks, `impl`s
@@ -16,7 +17,8 @@ use crate::{
 fn corpus() -> Vec<(String, String)> {
     let root = test_utils::project_root().into_std_path_buf();
     let mut files = Vec::new();
-    for dir in ["crates/hir-def/src/item_tree", "crates/hir-def/src/nameres", "crates/syntax/src/ast"]
+    for dir in
+        ["crates/hir-def/src/item_tree", "crates/hir-def/src/nameres", "crates/syntax/src/ast"]
     {
         collect_rs(&root.join(dir), &mut files);
     }
@@ -61,17 +63,7 @@ fn real_files_assemble_to_their_whole_trees() {
     }
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n.max(1) as u64) as usize
-    }
-}
-
+#[rustfmt::skip]
 const INSERTS: &[&str] = &[
     "", " ", "\n", "{", "}", "(", ")", ";", ",", "x", "::", "#[a]", "#![a]", "#[cfg(false)] ",
     "#![cfg(false)]\n", "/// d\n", "//! d\n", "pub ", "pub(crate) ", "pub(in crate::m) ",
@@ -84,22 +76,22 @@ const INSERTS: &[&str] = &[
 ];
 
 /// An edit of `text`: a range of it and what replaces it, from [`INSERTS`] or `text` itself.
-fn random_edit(rng: &mut Rng, text: &str) -> (Range<usize>, String) {
+fn random_edit(rng: &mut SplitMix64, text: &str) -> (Range<usize>, String) {
     let boundary = |mut at: usize| {
         while !text.is_char_boundary(at) {
             at -= 1;
         }
         at
     };
-    let start = boundary(rng.below(text.len() + 1));
-    let end = boundary((start + rng.below(12)).min(text.len())).max(start);
+    let start = boundary(rng.index(text.len() + 1));
+    let end = boundary((start + rng.index(12)).min(text.len())).max(start);
     let insert = match rng.below(3) {
         0 => {
-            let from = boundary(rng.below(text.len() + 1));
-            let to = boundary((from + rng.below(48)).min(text.len())).max(from);
+            let from = boundary(rng.index(text.len() + 1));
+            let to = boundary((from + rng.index(48)).min(text.len())).max(from);
             text[from..to].to_owned()
         }
-        _ => INSERTS[rng.below(INSERTS.len())].to_owned(),
+        _ => INSERTS[rng.index(INSERTS.len())].to_owned(),
     };
     (start..end, insert)
 }
@@ -108,7 +100,7 @@ fn random_edit(rng: &mut Rng, text: &str) -> (Range<usize>, String) {
 /// items it lowered again is the tree a fresh database lowers the text to whole.
 #[test]
 fn random_edits_assemble_to_a_fresh_whole_tree() {
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     let (mut db, file) = TestDB::with_single_file("");
     for (path, text) in corpus().iter().step_by(2) {
         let mut text = text.clone();
@@ -152,7 +144,7 @@ fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize
     let file_id = file.file_id(&*db);
     db.set_file_text(file_id, text);
     let db = &*db;
-    let events = db.log_executed(|| {
+    let events = db.executed_in_read_order(|| {
         crate::file_item_tree(db, file.into(), krate);
     });
     assert_assembled_is_whole(db, file, text);
@@ -192,4 +184,42 @@ fn an_edit_of_one_item_lowers_it_alone() {
         let edited = ITEMS.replace(from, to);
         assert_eq!(items_lowered_by(&mut db, file, &edited), 1, "after {to}");
     }
+}
+
+/// A tree asked again is a memo hit of its query and of each of its parts', none of which
+/// allocates.
+#[test]
+fn trees_asked_again_allocate_nothing() {
+    let (db, file) = db_of(ITEMS);
+    let krate = db.test_crate();
+    crate::file_item_tree(&db, file.into(), krate);
+    blaze_alloc_count::assert_at_most(0, "a memo hit of `file_item_tree`", || {
+        std::hint::black_box(crate::file_item_tree(&db, file.into(), krate));
+    });
+    blaze_alloc_count::assert_at_most(0, "memo hits of a file's parts", || {
+        std::hint::black_box(super::top_attrs(&db, file, krate));
+        for &item in super::item_sources(&db, file, krate) {
+            std::hint::black_box(super::item_fragment(&db, item));
+        }
+    });
+}
+
+/// Assembling a file's tree allocates once a column, however many items the file has.
+#[test]
+fn assembly_allocates_once_a_column() {
+    let allocations = |items: usize| {
+        let text: String = (0..items)
+            .map(|i| format!("pub struct S{i}(pub u8);\nfn f{i}() {{}}\nuse a::b{i};\n"))
+            .collect();
+        let (db, file) = db_of(&text);
+        let krate = db.test_crate();
+        let top = super::top_attrs(&db, file, krate);
+        let fragments: Vec<&ItemTree> = (super::item_sources(&db, file, krate).iter())
+            .map(|&item| super::item_fragment(&db, item))
+            .collect();
+        let (tree, used) = blaze_alloc_count::measure(|| super::assemble(top, &fragments));
+        assert_eq!(tree, lower_whole(&db, file.into(), krate));
+        used.allocations
+    };
+    assert_eq!(allocations(4), allocations(64));
 }

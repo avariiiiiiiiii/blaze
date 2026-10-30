@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use blaze_format::Aligned;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -7,7 +7,7 @@ use test_fixture::WithFixture;
 use super::*;
 use crate::{
     deps::{ImageRef, ImageStore, keys, serve, store, write_image},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 /// Every kind of signature, with generics, where clauses, defaults, cfg'd-out fields and
@@ -136,17 +136,17 @@ fn all(db: &TestDB) -> Vec<Crate> {
 /// A store in memory.
 #[derive(Default)]
 struct Memory {
-    images: RefCell<FxHashMap<ContentId, std::sync::Arc<Aligned>>>,
+    images: Mutex<FxHashMap<ContentId, std::sync::Arc<Aligned>>>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<std::sync::Arc<Aligned>>, String> {
-        Ok(self.images.borrow().get(key).cloned())
+        Ok(self.images.lock().unwrap().get(key).cloned())
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
         let image = std::sync::Arc::new(Aligned::copy_from(&image));
-        self.images.borrow_mut().entry(key).or_insert(image);
+        self.images.lock().unwrap().entry(key).or_insert(image);
         Ok(())
     }
 }
@@ -186,7 +186,8 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
     let what = item.what();
     macro_rules! same {
         ($code:ident, $sig:ident, $served:ident, $id:expr) => {{
-            let direct = values.then(|| $served(db, $id).expect("an item of a crate with an image"));
+            let direct =
+                values.then(|| $served(db, $id).expect("an item of a crate with an image"));
             let served: &$sig = match &direct {
                 Some(it) => it,
                 None => $sig::of(db, $id),
@@ -215,7 +216,8 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
         Item::TypeAlias(id) => same!(TypeAlias, TypeAliasSignature, served_type_alias, id),
         Item::Fields(id) => same!(Fields, VariantFields, served_variant_fields, id),
         Item::Variants(id) => {
-            let direct = values.then(|| served_enum_variants(db, id).expect("an enum with an image"));
+            let direct =
+                values.then(|| served_enum_variants(db, id).expect("an enum with an image"));
             let served = match &direct {
                 Some(it) => it,
                 None => EnumVariants::of(db, id),
@@ -348,7 +350,7 @@ fn serving_a_signature_parses_nothing() {
     let items = declared(&db, krate);
     // The keys' module indexes, made once per crate from its def map.
     assert!(serve_one(&db, items[0]));
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         for &item in &items {
             assert!(serve_one(&db, item), "{item:?}");
         }
@@ -400,12 +402,13 @@ fn a_memo_hit_of_a_served_signature_allocates_nothing() {
 }
 
 /// `item`'s record of `of`, which reads back as `of` in the database that wrote it.
-fn round_trip<S: Sig>(db: &TestDB, krate: Crate, item: Item, of: &S::Of) -> Aligned
+fn round_trip<S: Sig>(db: &TestDB, krate: Crate, item: Item, of: &S::Of) -> std::sync::Arc<Aligned>
 where
     S::Of: PartialEq + std::fmt::Debug,
 {
-    let bytes = Aligned::copy_from(&record::<S>(db, krate, item.what(), of).unwrap());
-    let value = read::<S>(db, krate, item.what(), &bytes).unwrap();
+    let record = record::<S>(db, krate, item.what(), of).unwrap();
+    let bytes = std::sync::Arc::new(Aligned::copy_from(&record));
+    let value = read::<S>(db, krate, item.what(), &bytes, &bytes).unwrap();
     assert_eq!(S::of(&value), of, "{item:?}");
     bytes
 }
@@ -490,7 +493,9 @@ fn function_f(db: &TestDB) -> FunctionId {
     let krate = crate_named(db, "lib");
     (declared(db, krate).into_iter())
         .find_map(|item| match item {
-            Item::Function(it) if FunctionSignature::with_source_map(db, it).0.name == f => Some(it),
+            Item::Function(it) if FunctionSignature::with_source_map(db, it).0.name == f => {
+                Some(it)
+            }
             _ => None,
         })
         .unwrap()
@@ -502,10 +507,10 @@ fn with_signatures(fixture: &str, memory: &Memory, part: &[u8]) {
     let db = TestDB::with_files(fixture);
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
-    let image = memory.images.borrow()[&key].clone();
+    let image = memory.images.lock().unwrap()[&key].clone();
     let image = ImageRef::open(&image, key).unwrap();
     let bytes = write_image(key, [image.part(Part::DefMap), image.part(Part::LangItems), part]);
-    memory.images.borrow_mut().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
+    memory.images.lock().unwrap().insert(key, std::sync::Arc::new(Aligned::copy_from(&bytes)));
 }
 
 /// The signatures part of `lib` in a fresh database of `fixture`.
@@ -566,10 +571,10 @@ fn a_record_of_another_query_is_refused() {
     let f = function_f(&db);
     let what = Item::Function(f).what();
     let written = record::<codes::Function>(&db, krate, what, FunctionSignature::of(&db, f));
-    let bytes = Aligned::copy_from(&written.unwrap());
-    assert!(read::<codes::Function>(&db, krate, what, &bytes).is_ok());
+    let bytes = std::sync::Arc::new(Aligned::copy_from(&written.unwrap()));
+    assert!(read::<codes::Function>(&db, krate, what, &bytes, &bytes).is_ok());
     let a_struct = items(&db, krate).into_iter().find(|it| matches!(it, Item::Struct(_)));
-    let error = read::<codes::Struct>(&db, krate, a_struct.unwrap().what(), &bytes);
+    let error = read::<codes::Struct>(&db, krate, a_struct.unwrap().what(), &bytes, &bytes);
     assert!(error.is_err_and(|it| it.contains("a record of query")));
 }
 

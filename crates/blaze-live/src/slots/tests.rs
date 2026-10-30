@@ -10,6 +10,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use blaze_ids::rng::SplitMix64;
+
 use super::{
     Outcome, hook, image,
     switch::{Dwarf, HOST_ARCH, KEPT, Layout, Memory, POOL, Span, Switch, Writes},
@@ -562,26 +564,20 @@ fn the_pool_holds_what_a_whole_table_per_generation_would() {
     let program = Program::with_slots(SLOTS);
     let mut switch = program.switch(false);
     let mut model = HashMap::from([(FIRST_GENERATION, program.table.to_vec())]);
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let mut random = move |below: u64| {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed % below
-    };
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let mut next = FIRST_GENERATION + 1;
     for _ in 0..2000 {
-        if random(3) == 0 {
+        if rng.one_in(3) {
             let kept = switch.kept();
-            let to = kept[random(kept.len() as u64) as usize];
+            let to = kept[rng.index(kept.len())];
             switch.roll_back(to).expect("a kept generation");
         } else {
             let base = switch.current();
             let mut table = model[&base].clone();
             let mut cells = Vec::new();
             for slot in 0..SLOTS {
-                if random(4) == 0 {
-                    let target = 0x10_0000 + random(1 << 20) * 8;
+                if rng.one_in(4) {
+                    let target = 0x10_0000 + rng.below(1 << 20) * 8;
                     table[slot] = target;
                     cells.push((slot as u32, unslid(target)));
                 }
@@ -608,6 +604,7 @@ fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
     assert_ne!(first, second);
     assert_eq!(switch.table_of(1), Some(first));
     assert_eq!(program.calls(), (2, 1));
+    let pooled = switch.pooled();
 
     switch.roll_back(1).expect("generation 1 is kept");
     assert_eq!(program.cell.load(Ordering::Relaxed), first);
@@ -618,7 +615,33 @@ fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
     switch.roll_back(2).expect("generation 2 is kept");
     assert_eq!(program.cell.load(Ordering::Relaxed), second);
     assert_eq!(program.calls(), (2, 1));
-    assert_eq!(switch.pooled(), 2);
+    assert_eq!(switch.pooled(), pooled);
+}
+
+/// Before its switch, a patch stores its own cells and nothing else: the table it goes
+/// into was brought to its base right after the switch before, however full the pool.
+#[test]
+fn a_patch_stores_only_its_own_cells_before_the_switch() {
+    const SLOTS: usize = 64;
+    let program = Program::with_slots(SLOTS);
+    let mut switch = program.switch(false);
+    let mut table = program.table.to_vec();
+    for generation in 1..=4 * POOL as u64 {
+        let cells: Vec<(u32, u64)> = (0..generation as u32 % 7 + 1)
+            .map(|it| {
+                let slot = (it * 9 + generation as u32) % SLOTS as u32;
+                (slot, unslid(0x20_0000 + generation * 0x100 + u64::from(it) * 8))
+            })
+            .collect();
+        for &(slot, target) in &cells {
+            table[slot as usize] = target.wrapping_add(SLIDE);
+        }
+        let count = cells.len();
+        applied(&mut switch, patch(generation, generation - 1, cells));
+        assert_eq!(switch.stored(), count, "generation {generation}");
+        assert_eq!(program.slots(), table, "generation {generation}");
+    }
+    assert_eq!(switch.pooled(), POOL);
 }
 
 /// `put` of every range against the bytes written whole and rebased one field at a time,
@@ -669,4 +692,63 @@ fn outcomes_say_what_became_of_a_patch() {
     assert_eq!(restart.to_string(), "restart needed at generation 3: a layout changed");
     let declined = Outcome::Declined { generation: 4, why: "no".into() };
     assert_eq!(declined.to_string(), "generation 4 not applied: no");
+}
+
+/// A warm patch's table work allocates nothing: the log's columns and the lasting ranges
+/// are reserved regions, the pool is full and the scratch buffers are at their high-water
+/// mark. Each patch sets one cell of a 16-slot table and is taken from encoded bytes, as
+/// `Live::poll` takes a message from its kept buffer.
+#[test]
+fn a_warm_patch_allocates_nothing() {
+    const SLOTS: u64 = 16;
+    let program = Program::with_slots(SLOTS as usize);
+    let mut switch = program.switch(false);
+    let message = |generation: u64, base: u64| {
+        let slot = (generation % SLOTS) as u32;
+        let target = if generation % 2 == 0 { address(one) } else { address(two) };
+        Message::Patch(patch(generation, base, vec![(slot, unslid(target))])).encode()
+    };
+    for _ in 0..POOL + KEPT + 8 {
+        let base = switch.current();
+        let cell = ((base % SLOTS) as u32, unslid(address(two)));
+        applied(&mut switch, patch(base + 1, base, vec![cell]));
+    }
+    let first = switch.current();
+    let messages: Vec<Vec<u8>> = (0..64).map(|it| message(first + it + 1, first + it)).collect();
+    blaze_alloc_count::assert_at_most(0, "a warm patch's table work and its switch", || {
+        for bytes in &messages {
+            let view = Message::view(bytes).expect("an encoded message reads back");
+            let (outcome, answer) = switch.take(&view);
+            assert!(matches!(outcome, Outcome::Applied { .. }), "{outcome}");
+            assert!(answer.is_some());
+        }
+    });
+    assert_eq!(switch.current(), first + 64);
+}
+
+/// The lasting ranges merge as `Vec::splice` would: against a model kept in a `Vec`.
+#[test]
+fn lasting_ranges_merge_as_a_sorted_list_would() {
+    use super::switch::{Holds, Lasting};
+    let mut lasting = Lasting::new().expect("reserved");
+    let mut model: Vec<(Range<u64>, u64, Holds)> = Vec::new();
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
+    for number in 0..3000u64 {
+        let seed = rng.next_u64();
+        let start = seed % 4096 * 16;
+        let range = start..start + 1 + seed % 64;
+        let holds = if seed % 3 == 0 { Holds::Unwind } else { Holds::Code };
+        lasting.add(range.clone(), number, holds);
+        let at = model.partition_point(|it| it.0.end <= range.start);
+        let (mut merged, mut kind, mut end) = (range, holds, at);
+        while let Some((next, _, other)) = model.get(end).filter(|it| it.0.start < merged.end) {
+            merged = merged.start.min(next.start)..merged.end.max(next.end);
+            if *other == Holds::Code {
+                kind = Holds::Code;
+            }
+            end += 1;
+        }
+        model.splice(at..end, [(merged, number, kind)]);
+        assert_eq!(&lasting.ranges[..], &model[..]);
+    }
 }

@@ -314,11 +314,11 @@ pub(crate) fn store(db: &ide_db::RootDatabase, served: &Served) -> anyhow::Resul
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads.min(unstored.len()) {
-            let (db, unstored, next) = (db.clone(), &unstored, &next);
+            let (unstored, next) = (&unstored, &next);
             let (stored, refused) = (&stored, &refused);
             scope.spawn(move || {
                 while let Some(&(part, krate, key)) = unstored.get(next.fetch_add(1, Relaxed)) {
-                    match part.encode(&db, krate) {
+                    match part.encode(db, krate) {
                         Ok(bytes) => {
                             store.insert(&key, &bytes);
                             stored.fetch_add(1, Relaxed);

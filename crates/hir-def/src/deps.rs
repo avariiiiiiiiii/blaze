@@ -25,31 +25,37 @@ mod tests;
 
 use std::sync::Arc;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use rustc_hash::FxHashMap;
 
 pub use crate::deps::{
-    image::{IMAGE_SCHEMA, ImageError, ImageRef, Part, write_image},
+    image::{IMAGE_SCHEMA, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, PRODUCER, eligible, keys},
     serve::{ImageStore, Refused, Served, Stored, serve, store},
 };
 pub use crate::nameres::frozen::Mode;
 
 /// An image a database was given: the buffer, which [`serve`] opened and checked against its
-/// key, and what is done with it.
+/// key, where its parts are, and what is done with it.
 #[derive(Clone)]
 pub struct Image {
     key: base_db::ContentId,
     bytes: Arc<blaze_format::Aligned>,
+    parts: [std::ops::Range<usize>; Part::ALL.len()],
     mode: Mode,
 }
 
 impl Image {
-    /// The image, read in place. [`serve`] checked the buffer when it made the image, so this
-    /// opens it again without a hash.
+    /// The image, read in place: three slices of the buffer [`serve`] checked, so a reader of
+    /// one signature pays no check of the image.
+    #[inline]
     pub fn view(&self) -> ImageRef<'_> {
-        ImageRef::open(&self.bytes, self.key)
-            .unwrap_or_else(|why| panic!("a served image of key {:?} stopped reading: {why}", self.key))
+        ImageRef::at(&self.bytes, &self.parts)
+    }
+
+    /// The buffer the image is read from: what a value read from it in place borrows.
+    pub fn bytes(&self) -> &Arc<blaze_format::Aligned> {
+        &self.bytes
     }
 
     pub fn key(&self) -> base_db::ContentId {
@@ -96,13 +102,13 @@ pub struct DepImages {
 }
 
 /// The image `krate` is read from, if it is.
-pub(crate) fn image(db: &dyn SourceDatabase, krate: Crate) -> Option<ImageRef<'_>> {
+pub(crate) fn image(db: &Db, krate: Crate) -> Option<ImageRef<'_>> {
     DepImages::try_get(db)?.images(db).get(&krate).map(Image::view)
 }
 
 /// What is done with the image of `krate`, if it has one: [`Mode::Serve`] reads it in place of
 /// computing, [`Mode::Check`] computes as well and records a difference, [`Mode::Verify`]
 /// writes what was read and records a difference from the bytes.
-pub(crate) fn mode(db: &dyn SourceDatabase, krate: Crate) -> Option<Mode> {
+pub(crate) fn mode(db: &Db, krate: Crate) -> Option<Mode> {
     DepImages::try_get(db)?.images(db).get(&krate).map(Image::mode)
 }

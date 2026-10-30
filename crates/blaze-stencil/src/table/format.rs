@@ -4,9 +4,11 @@
 //! [`crate::shape`] and [`crate::enc`].
 //!
 //! ```text
-//! Header   80 bytes: MAGIC, FORMAT, shape::VERSION, variant, counts, seed, then id
-//! Stencil  [stencils] 12 bytes: code offset u32, len u16, tail u8, holes u8, first hole u32
+//! Header   84 bytes: MAGIC, FORMAT, shape::VERSION, variant, counts, seed, faults, then id
+//! Stencil  [stencils] 16 bytes: code offset u32, len u16, tail u8, holes u8, first hole u32,
+//!                     first fault u24 | faults u8
 //! Hole     [holes]     8 bytes: at u16, form u8, kind u8, addend i32
+//! Fault    [faults]    u16: where an access of the op's memory starts
 //! Pilots   [buckets]   u16, padded to 4 bytes
 //! Slots    [slots]     8 bytes: key u32, stencil u32 (an empty slot: both u32::MAX)
 //! Code     bytes, padded to 16
@@ -39,6 +41,13 @@
 //! - `Const`: the place of the instruction's 16-byte constant (16-aligned) in the function.
 //! - `Rodata`: see [`Hole::rodata`]: the place of a 16-byte entry of the library's rodata,
 //!   copied (16-aligned) once into the function that uses it.
+//!
+//! # Faults
+//!
+//! A stencil of a load, a store or an atomic lists ([`Stencil::faults`]) the offset of each
+//! instruction that accesses the operation's memory, not its slots: where it can fault, which
+//! the patcher records with the instruction's `MemFlags` trap code, as Cranelift records one
+//! at each trapping access. An exclusive-pair loop has two.
 
 use std::fmt;
 
@@ -46,10 +55,13 @@ use crate::{enc::Form, shape::Shape};
 
 pub const MAGIC: [u8; 8] = *b"BZSTENC1";
 /// Bumped with any change to this layout.
-pub const FORMAT: u32 = 2;
-pub const HEADER: usize = 48 + 32;
-pub const STENCIL: usize = 12;
+pub const FORMAT: u32 = 3;
+pub const HEADER: usize = ID + 32;
+/// Where the header's id starts.
+const ID: usize = 52;
+pub const STENCIL: usize = 16;
 pub const HOLE: usize = 8;
+pub const FAULT: usize = 2;
 pub const SLOT: usize = 8;
 /// Bytes of one rodata entry.
 pub const ENTRY: usize = 16;
@@ -242,12 +254,19 @@ pub struct Stencil<'a> {
     /// The `Next` hole in those bytes is then not patched.
     pub tail: u8,
     holes: &'a [u8],
+    faults: &'a [u8],
 }
 
 impl<'a> Stencil<'a> {
     pub fn holes(&self) -> impl ExactSizeIterator<Item = Hole> + 'a {
         let holes: &'a [u8] = self.holes;
         holes.chunks_exact(HOLE).map(decode_hole)
+    }
+
+    /// Where each access of the op's memory starts in `code` (the module docs' "Faults").
+    pub fn faults(&self) -> impl ExactSizeIterator<Item = u16> + 'a {
+        let faults: &'a [u8] = self.faults;
+        faults.chunks_exact(FAULT).map(|it| u16::from_le_bytes([it[0], it[1]]))
     }
 
     /// Bytes copied when the next instruction follows directly.
@@ -257,12 +276,24 @@ impl<'a> Stencil<'a> {
     }
 }
 
+#[inline]
 fn u16_at(bytes: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+    let mut half = [0; 2];
+    half.copy_from_slice(&bytes[at..at + 2]);
+    u16::from_le_bytes(half)
 }
 
+#[inline]
 fn u32_at(bytes: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    let mut word = [0; 4];
+    word.copy_from_slice(&bytes[at..at + 4]);
+    u32::from_le_bytes(word)
+}
+
+/// A stencil row's last word: its first fault (low 24 bits) and how many (high 8).
+#[inline]
+const fn fault_range(word: u32) -> (usize, usize) {
+    ((word & 0xff_ffff) as usize, (word >> 24) as usize)
 }
 
 /// A hole from its 8 bytes, which [`Reader::new`] checked.
@@ -362,6 +393,7 @@ const fn position(h: u64, pilot: u16, slots: u32) -> u32 {
 struct Layout {
     stencils: usize,
     holes: usize,
+    faults: usize,
     pilots: usize,
     slots: usize,
     code: usize,
@@ -373,12 +405,13 @@ impl Layout {
     fn of(counts: &Counts) -> Option<Layout> {
         let stencils = HEADER;
         let holes = stencils.checked_add((counts.stencils as usize).checked_mul(STENCIL)?)?;
-        let pilots = holes.checked_add((counts.holes as usize).checked_mul(HOLE)?)?;
+        let faults = holes.checked_add((counts.holes as usize).checked_mul(HOLE)?)?;
+        let pilots = faults.checked_add((counts.faults as usize).checked_mul(FAULT)?)?;
         let slots = pilots.checked_add((counts.buckets as usize).checked_mul(2)?)?.next_multiple_of(4);
         let code = slots.checked_add((counts.slots as usize).checked_mul(SLOT)?)?;
         let rodata = code.checked_add(counts.code as usize)?.next_multiple_of(ENTRY);
         let end = rodata.checked_add((counts.entries as usize).checked_mul(ENTRY)?)?;
-        Some(Layout { stencils, holes, pilots, slots, code, rodata, end })
+        Some(Layout { stencils, holes, faults, pilots, slots, code, rodata, end })
     }
 }
 
@@ -392,6 +425,7 @@ struct Counts {
     code: u32,
     entries: u32,
     seed: u32,
+    faults: u32,
 }
 
 /// A library read in place: every count, offset and hole checked once by [`Reader::new`],
@@ -432,6 +466,7 @@ impl<'a> Reader<'a> {
             code: u32_at(bytes, 36),
             entries: u32_at(bytes, 40),
             seed: u32_at(bytes, 44),
+            faults: u32_at(bytes, 48),
         };
         let layout = Layout::of(&counts).ok_or(FormatError::Bounds("the columns"))?;
         if layout.end != bytes.len() {
@@ -463,6 +498,16 @@ impl<'a> Reader<'a> {
             }
             if first.checked_add(holes).is_none_or(|end| end > self.counts.holes as usize) {
                 return Err(FormatError::Bounds("a stencil's holes"));
+            }
+            let (first_fault, faults) = fault_range(u32_at(self.bytes, row + 12));
+            if first_fault + faults > self.counts.faults as usize {
+                return Err(FormatError::Bounds("a stencil's faults"));
+            }
+            for fault in first_fault..first_fault + faults {
+                let at = usize::from(u16_at(self.bytes, self.layout.faults + fault * FAULT));
+                if at >= len || (a64 && at % 4 != 0) {
+                    return Err(FormatError::Bounds("a fault"));
+                }
             }
             for hole in first..first + holes {
                 let at = self.layout.holes + hole * HOLE;
@@ -543,7 +588,7 @@ impl<'a> Reader<'a> {
     /// The BLAKE3 hash of the bytes with this field zeroed, which the writer computed.
     pub fn id(&self) -> [u8; 32] {
         let mut id = [0; 32];
-        id.copy_from_slice(&self.bytes[48..HEADER]);
+        id.copy_from_slice(&self.bytes[ID..HEADER]);
         id
     }
 
@@ -574,7 +619,14 @@ impl<'a> Reader<'a> {
         let len = usize::from(u16_at(bytes, row + 4));
         let first = self.layout.holes + u32_at(bytes, row + 8) as usize * HOLE;
         let holes = usize::from(bytes[row + 7]) * HOLE;
-        Stencil { code: &bytes[code..code + len], tail: bytes[row + 6], holes: &bytes[first..first + holes] }
+        let (first_fault, faults) = fault_range(u32_at(bytes, row + 12));
+        let first_fault = self.layout.faults + first_fault * FAULT;
+        Stencil {
+            code: &bytes[code..code + len],
+            tail: bytes[row + 6],
+            holes: &bytes[first..first + holes],
+            faults: &bytes[first_fault..first_fault + faults * FAULT],
+        }
     }
 
     /// The key stencil `index` was written for, from the index's slots (a scan: for tests and
@@ -614,6 +666,7 @@ pub struct Writer {
     code: Vec<u8>,
     rodata: Vec<u8>,
     hole_count: u32,
+    faults: Vec<u8>,
 }
 
 impl Writer {
@@ -626,6 +679,7 @@ impl Writer {
             code: Vec::new(),
             rodata: Vec::new(),
             hole_count: 0,
+            faults: Vec::new(),
         }
     }
 
@@ -648,13 +702,26 @@ impl Writer {
         Ok(index as u32)
     }
 
-    /// Appends one stencil; its index.
+    /// Appends one stencil with no faults; its index.
     pub fn push(
         &mut self,
         shape: Shape,
         code: &[u8],
         tail: u8,
         holes: &[Hole],
+    ) -> Result<u32, FormatError> {
+        self.push_with_faults(shape, code, tail, holes, &[])
+    }
+
+    /// Appends one stencil, `faults` the offsets of its memory accesses (the module docs'
+    /// "Faults"); its index.
+    pub fn push_with_faults(
+        &mut self,
+        shape: Shape,
+        code: &[u8],
+        tail: u8,
+        holes: &[Hole],
+        faults: &[u16],
     ) -> Result<u32, FormatError> {
         let key = shape.key();
         if !shape.exists_on(self.variant.isa()) || self.keys.contains(&key) {
@@ -678,6 +745,14 @@ impl Writer {
                 return Err(FormatError::Bounds("a rodata hole's entry"));
             }
         }
+        let first_fault = self.faults.len() / FAULT;
+        if faults.len() > usize::from(u8::MAX) || first_fault + faults.len() > 0xff_ffff {
+            return Err(FormatError::Bounds("a stencil's faults"));
+        }
+        let a64 = matches!(self.variant.isa(), crate::shape::Isa::Aarch64);
+        if faults.iter().any(|at| usize::from(*at) >= code.len() || (a64 && at % 4 != 0)) {
+            return Err(FormatError::Bounds("a fault"));
+        }
         let index = self.keys.len() as u32;
         let at = u32::try_from(self.code.len()).map_err(|_| FormatError::Bounds("the code"))?;
         self.stencils.extend_from_slice(&at.to_le_bytes());
@@ -685,8 +760,13 @@ impl Writer {
         self.stencils.push(tail);
         self.stencils.push(holes.len() as u8);
         self.stencils.extend_from_slice(&self.hole_count.to_le_bytes());
+        let fault_word = first_fault as u32 | (faults.len() as u32) << 24;
+        self.stencils.extend_from_slice(&fault_word.to_le_bytes());
         for hole in holes {
             encode_hole(*hole, &mut self.holes);
+        }
+        for at in faults {
+            self.faults.extend_from_slice(&at.to_le_bytes());
         }
         self.hole_count += holes.len() as u32;
         self.code.extend_from_slice(code);
@@ -707,6 +787,7 @@ impl Writer {
             code: u32::try_from(self.code.len()).map_err(|_| FormatError::Bounds("the code"))?,
             entries: (self.rodata.len() / ENTRY) as u32,
             seed,
+            faults: (self.faults.len() / FAULT) as u32,
         };
         let layout = Layout::of(&counts).ok_or(FormatError::Bounds("the columns"))?;
         let mut out = Vec::with_capacity(layout.end);
@@ -714,12 +795,16 @@ impl Writer {
         out.extend_from_slice(&FORMAT.to_le_bytes());
         out.extend_from_slice(&crate::shape::VERSION.to_le_bytes());
         out.extend_from_slice(&[self.variant as u8, 0, 0, 0]);
-        for it in [counts.stencils, counts.holes, buckets, slots, counts.code, counts.entries, seed] {
+        let header =
+            [counts.stencils, counts.holes, buckets, slots, counts.code, counts.entries, seed, counts.faults];
+        for it in header {
             out.extend_from_slice(&it.to_le_bytes());
         }
+        debug_assert_eq!(out.len(), ID);
         out.extend_from_slice(&[0; 32]);
         out.extend_from_slice(&self.stencils);
         out.extend_from_slice(&self.holes);
+        out.extend_from_slice(&self.faults);
         for pilot in &pilots {
             out.extend_from_slice(&pilot.to_le_bytes());
         }
@@ -733,7 +818,7 @@ impl Writer {
         out.extend_from_slice(&self.rodata);
         debug_assert_eq!(out.len(), layout.end);
         let id = hash(&out);
-        out[48..HEADER].copy_from_slice(&id);
+        out[ID..HEADER].copy_from_slice(&id);
         Ok(out)
     }
 }
@@ -748,9 +833,9 @@ fn index(keys: &[u32]) -> Result<(u32, u32, u32, Vec<u16>, Vec<(u32, u32)>), For
     if n == 0 {
         return Ok((0, 0, 0, Vec::new(), Vec::new()));
     }
-    // Load factor 0.98 and about 5 n / log2 n buckets: PTHash's usual point, where a pilot
-    // is found in a few tries for most buckets.
-    let slots = n + n / 50 + 1;
+    // Load factor about 0.95 and about 5 n / log2 n buckets: PTHash's usual point, where a
+    // pilot is found in a few tries for most buckets.
+    let slots = n + n / 19 + 1;
     let log = 32 - n.leading_zeros();
     for scale in [5u32, 7, 10, 16] {
         let buckets = (n * scale / log.max(1)).max(1);

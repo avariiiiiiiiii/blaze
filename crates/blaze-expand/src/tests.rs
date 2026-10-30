@@ -9,6 +9,11 @@ use span::{EditionedFileId, Edition, ErasedFileAstId, Span, SpanAnchor, SyntaxCo
 
 use crate::{Call, Mode, given, read, written};
 
+/// Counts each test thread's allocations, for the allocation-budget tests of the hot paths
+/// here (docs/v2/plan/goals/principles.md).
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 fn span(file: u32, ast: u32, start: u32, end: u32) -> Span {
     Span {
         range: TextRange::new(start.into(), end.into()),

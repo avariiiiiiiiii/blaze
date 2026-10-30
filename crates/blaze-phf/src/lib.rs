@@ -320,22 +320,14 @@ mod tests {
 
     #[test]
     fn many_names() {
-        // A splitmix64 stream: seeded, so a failure reproduces.
-        let mut state = 0x6e61_6d65_73u64;
-        let mut next = move || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x6e61_6d65_73);
         let alphabet = b"abcdefghijklmnopqrstuvwxyz_0123456789";
         let mut names: Vec<String> = Vec::new();
         let mut unique = std::collections::HashSet::new();
         while names.len() < 3000 {
-            let len = 1 + (next() % 40) as usize;
+            let len = 1 + rng.index(40);
             let name: String =
-                (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize] as char).collect();
+                (0..len).map(|_| alphabet[rng.index(alphabet.len())] as char).collect();
             if unique.insert(name.clone()) {
                 names.push(name);
             }

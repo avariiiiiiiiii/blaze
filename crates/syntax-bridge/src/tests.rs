@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use blaze_ids::rng::SplitMix64;
 use expect_test::expect;
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::{Edition, Span};
@@ -290,6 +291,7 @@ fn assert_same_as_reference(
         let old = reference::to_matcher_input(view, &mut *edition);
         assert!(reference::same_input(&new, &old), "{}: the matcher's input", what());
     }
+    assert_words_same_as_reference(tree, edition, what);
     use parser::TopEntryPoint::*;
     for entry in [MacroItems, MacroStmts, Expr, Pattern, Type, MetaItem] {
         let new = caught(|| {
@@ -313,19 +315,66 @@ fn assert_same_as_reference(
     }
 }
 
-/// xorshift64*, for trees that are the same on every run.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+/// Every view a caller can take of `tree`, at every depth: what is left from each token tree
+/// on (all of them for a small tree, the last 8 of a level for a large one, whose views are
+/// long), and each run of up to 4 token trees, a matcher's window, which ends inside the tree.
+fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
+    fn level<'a>(iter: tt::iter::TtIter<'a>, small: bool, out: &mut Vec<tt::TokenTreesView<'a>>) {
+        let n = iter.clone().count();
+        let mut at = iter;
+        for i in 0..=n {
+            if small || n - i <= 8 {
+                out.push(at.remaining());
+            }
+            let start = at.savepoint();
+            let mut end = at.clone();
+            for _ in 0..4.min(n - i) {
+                end.next();
+                out.push(end.from_savepoint(start));
+            }
+            match at.next() {
+                Some(TtElement::Subtree(_, inner)) => level(inner, small, out),
+                Some(TtElement::Leaf(_)) => (),
+                None => break,
+            }
+        }
     }
+    let small = tree.token_trees().len() <= 2048;
+    let mut out = vec![tree.view().strip_invisible(), tree.token_trees(), tree.as_token_trees()];
+    level(tree.iter(), small, &mut out);
+    out
+}
 
-    fn chance(&mut self, one_in: u64) -> bool {
-        self.next() % one_in == 0
+/// Asserts the parser's tokens of every view of `tree` read from the words it keeps
+/// ([`crate::view_tokens`]) are the reference's input of that view, token by token, as a matcher's
+/// and as an expansion's. Making a tree's words converts all of it, so it panics on a token only
+/// a matcher's input of the whole tree panics on: a lone `'` or a punct that is no token's.
+fn assert_words_same_as_reference(
+    tree: &tt::TopSubtree,
+    edition: &mut dyn FnMut(span::SyntaxContext) -> Edition,
+    what: &dyn Fn() -> String,
+) {
+    let whole_panics = caught(|| reference::to_matcher_input(tree.view(), &mut *edition)).is_none();
+    let mut copy = parser::Input::with_capacity(0);
+    for view in every_view(tree) {
+        for fragments in [true, false] {
+            let new = caught(|| {
+                let tokens = crate::view_tokens(view, fragments, &mut *edition, &mut copy);
+                (0..tokens.len()).map(|i| tokens.token(i)).collect::<Vec<_>>()
+            });
+            let old = caught(|| match fragments {
+                true => reference::to_matcher_input(view, &mut *edition),
+                false => reference::to_parser_input(view, &mut *edition),
+            });
+            match (new, old) {
+                (Some(new), Some(old)) => {
+                    let old = (0..old.len()).map(|i| old.token(i)).collect::<Vec<_>>();
+                    assert_eq!(new, old, "{}: the words of {view:?}, fragments {fragments}", what());
+                }
+                (None, _) => assert!(whole_panics, "{}: the words of {view:?} panicked", what()),
+                (Some(_), None) => panic!("{}: only the reference panicked on {view:?}", what()),
+            }
+        }
     }
 }
 
@@ -338,23 +387,23 @@ const EDITIONS: [Edition; 4] =
 /// and its name stay in one group, as the lexer and every fragment keep them.
 fn regroup(
     trees: tt::TokenTreesView<'_>,
-    rng: &mut Rng,
+    rng: &mut SplitMix64,
     ctx: &mut usize,
     out: &mut TopSubtreeBuilder,
 ) {
-    fn with_ctx(span: Span, rng: &mut Rng, ctx: &mut usize) -> Span {
-        if rng.chance(6) {
-            *ctx = (rng.next() % EDITIONS.len() as u64) as usize;
+    fn with_ctx(span: Span, rng: &mut SplitMix64, ctx: &mut usize) -> Span {
+        if rng.one_in(6) {
+            *ctx = rng.index(EDITIONS.len());
         }
         Span { ctx: span::SyntaxContext::root(EDITIONS[*ctx]), ..span }
     }
     let mut iter = trees.iter();
     while let Some(tree) = iter.next() {
-        if rng.chance(16) {
+        if rng.one_in(16) {
             out.open(tt::DelimiterKind::Invisible, DUMMY);
             out.close(DUMMY);
         }
-        let group = rng.chance(4);
+        let group = rng.one_in(4);
         if group {
             out.open(tt::DelimiterKind::Invisible, with_ctx(DUMMY, rng, ctx));
         }
@@ -408,12 +457,20 @@ fn parser_input_is_the_old_conversions() {
             }
             let tree = token_tree(&node);
             let seed = (file as u64) << 20 | idx as u64;
-            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut rng = SplitMix64::new(seed);
             let mut out = TopSubtreeBuilder::new(tree.top_subtree().delimiter);
             regroup(tree.token_trees(), &mut rng, &mut 0, &mut out);
             let regrouped = out.build();
             assert_same_as_reference(&regrouped, &mut by_root, &|| {
                 format!("{path}: {node:?} regrouped\n{regrouped:?}")
+            });
+            // The words the tree keeps hold `by_root`'s editions; read with other answers, each
+            // view's are made afresh, and the kept ones stay `by_root`'s.
+            assert_words_same_as_reference(&regrouped, &mut current, &|| {
+                format!("{path}: {node:?} regrouped, read in {:?}\n{regrouped:?}", Edition::CURRENT)
+            });
+            assert_words_same_as_reference(&regrouped, &mut by_root, &|| {
+                format!("{path}: {node:?} regrouped, read again by root\n{regrouped:?}")
             });
         }
     }

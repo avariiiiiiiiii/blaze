@@ -23,7 +23,7 @@ mod trait_aliases;
 mod traits;
 mod variance;
 
-use base_db::{Crate, EditionedFileId, SourceDatabase};
+use base_db::{Crate, EditionedFileId};
 use expect_test::Expect;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, GenericDefId, HasModule, ModuleDefId, ModuleId,
@@ -50,7 +50,7 @@ use crate::{
     display::{DisplayTarget, HirDisplay},
     next_solver::Ty,
     setup_tracing,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 // These tests compare the inference results for all expressions in a file

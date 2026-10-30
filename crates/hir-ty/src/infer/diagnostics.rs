@@ -5,6 +5,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::ops::{Deref, DerefMut};
 
+use base_db::Db;
 use either::Either;
 use hir_def::expr_store::path::Path;
 use hir_def::{ExpressionStoreOwnerId, GenericDefId};
@@ -101,7 +102,7 @@ pub(super) struct InferenceTyLoweringContext<'db, 'a> {
 impl<'db, 'a> InferenceTyLoweringContext<'db, 'a> {
     #[inline]
     pub(super) fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         resolver: &'a Resolver<'db>,
         store: &'db ExpressionStore,
         diagnostics: &'a Diagnostics,

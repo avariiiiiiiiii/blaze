@@ -93,6 +93,15 @@ struct Counted {
     /// Every warning, its duplicates too (cargo's `errors_seen`, `warnings_seen`).
     warnings: u32,
     warned: say::Warned,
+    /// Its summary was printed when it ended ([`Response::UnitEnded`]), as cargo prints it.
+    ended: bool,
+}
+
+/// What the build placed, once it said ([`Response::Built`]).
+struct Built {
+    artifacts: Vec<Artifact>,
+    profile: String,
+    members: u32,
 }
 
 /// cargo's lines of a build, as its responses come.
@@ -111,7 +120,7 @@ pub struct Printer<'a, O: Write, E: Write> {
     of_package: FxHashMap<Box<str>, Vec<u32>>,
     /// The hash of every diagnostic printed, as cargo's `DiagDedupe` keeps them.
     printed: FxHashSet<u64>,
-    built: Option<(Vec<Artifact>, String)>,
+    built: Option<Built>,
 }
 
 impl<'a, O: Write, E: Write> Printer<'a, O, E> {
@@ -133,7 +142,12 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
 
     /// What the build placed, once it said, taken out of the printer.
     pub fn take_artifacts(&mut self) -> Vec<Artifact> {
-        self.built.as_mut().map_or_else(Vec::new, |(artifacts, _)| std::mem::take(artifacts))
+        self.built.as_mut().map_or_else(Vec::new, |built| std::mem::take(&mut built.artifacts))
+    }
+
+    /// The workspace's member count the build said; 1 before it did.
+    pub fn members(&self) -> u32 {
+        self.built.as_ref().map_or(1, |built| built.members)
     }
 
     pub fn err(&mut self) -> &mut E {
@@ -203,7 +217,7 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                 self.line.push('\n');
                 self.out.write_all(self.line.as_bytes())?;
             }
-            Response::Built { artifacts, profile } => {
+            Response::Built { artifacts, profile, members } => {
                 if self.shown.format.json() {
                     self.line.clear();
                     for artifact in &artifacts {
@@ -212,7 +226,23 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
                     }
                     self.out.write_all(self.line.as_bytes())?;
                 }
-                self.built = Some((artifacts, profile));
+                self.built = Some(Built { artifacts, profile, members });
+            }
+            // cargo prints a unit's "generated N warnings" or "could not compile" as it ends.
+            Response::UnitEnded(unit) => {
+                let at = self.unit(&unit);
+                let (unit, counted) = &mut self.units[at];
+                if counted.ended {
+                    return Ok(());
+                }
+                counted.ended = true;
+                self.line.clear();
+                summary(&mut self.line, unit, counted, self.shown);
+                self.err.write_all(self.line.as_bytes())?;
+            }
+            // blaze's own, for the proof harness: what the request did.
+            Response::Work(worked) if self.shown.format.json() => {
+                self.out.write_all(blaze_ui::api::work_json(&worked).as_bytes())?;
             }
             Response::Error(error) => {
                 self.err.write_all(say::error(&error.what, self.shown.color).as_bytes())?;
@@ -309,25 +339,16 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         let color = self.shown.color;
         self.line.clear();
         for (unit, counted) in &self.units {
-            let package = say::package_name(&unit.package_id);
-            if counted.errors > 0 {
-                let said = say::could_not_compile(package, &unit.target, unit.test, counted.errors, counted.warnings);
-                self.line.push_str(&say::error(&said, color));
-                continue;
-            }
-            let local = unit.package_id.starts_with("path+");
-            if let Some(said) = say::generated(package, &unit.target, unit.test, local, counted.warned)
-                && !self.shown.quiet
-            {
-                self.line.push_str(&say::warning(&said, color));
+            if !counted.ended {
+                summary(&mut self.line, unit, counted, self.shown);
             }
         }
         if ok
             && !self.shown.quiet
-            && let Some((_, profile)) = &self.built
+            && let Some(built) = &self.built
         {
             say::status_word(&mut self.line, "Finished", color);
-            self.line.push_str(&say::finished(profile, took));
+            self.line.push_str(&say::finished(&built.profile, took));
             self.line.push('\n');
         }
         self.err.write_all(self.line.as_bytes())?;
@@ -339,6 +360,22 @@ impl<'a, O: Write, E: Write> Printer<'a, O, E> {
         }
         self.out.flush()?;
         self.err.flush()
+    }
+}
+
+/// A unit's "could not compile" or "generated N warnings", into `line`.
+fn summary(line: &mut String, unit: &UnitOf, counted: &Counted, shown: Shown) {
+    let package = say::package_name(&unit.package_id);
+    if counted.errors > 0 {
+        let said = say::could_not_compile(package, &unit.target, unit.test, counted.errors, counted.warnings);
+        line.push_str(&say::error(&said, shown.color));
+        return;
+    }
+    let local = unit.package_id.starts_with("path+");
+    if let Some(said) = say::generated(package, &unit.target, unit.test, local, counted.warned)
+        && !shown.quiet
+    {
+        line.push_str(&say::warning(&said, shown.color));
     }
 }
 

@@ -1,15 +1,15 @@
 //! How a run process gets its memory entries: a Unix socket can't carry Mach ports, and the
 //! daemon can't map into a child (`task_for_pid` needs an entitlement, and a task port a child
-//! sends is immovable), so the loader asks the daemon's rendezvous service for them, as
+//! sends is immovable), so the start hook asks the daemon's rendezvous service for them, as
 //! Chromium's `MachPortRendezvousServer` hands ports to its children.
 //!
 //! The daemon checks in `dev.blaze.inproc.<its pid>` with its bootstrap server once and serves
 //! it on a thread of its own. To grant, it makes the entries, files them under the run
 //! process's audit token (the channel's `LOCAL_PEERTOKEN`, checked against the process ID it
-//! launched), and sends the GRANT frame. The loader names the daemon by the same option on its
+//! launched), and sends the GRANT frame. The start hook names the daemon by the same option on its
 //! end, looks the service up, and sends a request with a send-once reply port; the service
 //! takes the entries filed under the request's audit token (the kernel's trailer, which no
-//! sender can forge) and moves them into the reply, which the loader takes only with the
+//! sender can forge) and moves them into the reply, which the start hook takes only with the
 //! daemon's audit token in its trailer. So the ports go only to the process on the channel,
 //! and only from the daemon it connected to.
 //!
@@ -66,7 +66,7 @@ const DESCRIPTOR: usize = 12;
 const AUDIT_TRAILER: usize = 52;
 const AUDIT_AT: usize = 20;
 
-/// The request: the header, then this protocol's version and how many objects the loader was
+/// The request: the header, then this protocol's version and how many objects the start hook was
 /// told it is granted (the GRANT frame's count).
 const REQUEST: usize = HEADER + 8;
 const REQUEST_ID: i32 = 0x626c_7a00;
@@ -105,7 +105,7 @@ fn bootstrap_error(what: &str, code: Kern) -> Error {
 pub(super) fn protection(rights: Rights) -> c_int {
     match rights {
         Rights::Code => VM_PROT_READ | VM_PROT_EXECUTE,
-        Rights::Control => VM_PROT_READ | VM_PROT_WRITE,
+        Rights::Words => VM_PROT_READ | VM_PROT_WRITE,
     }
 }
 
@@ -229,7 +229,7 @@ pub(super) fn encode_reply(out: &mut Message, to: Port, objects: &[(Port, u64)])
     size as u32
 }
 
-/// The objects of a reply as the loader received it, and its sender's audit token.
+/// The objects of a reply as the start hook received it, and its sender's audit token.
 pub(super) fn decode_reply(bytes: &[u8], count: usize) -> Result<(Vec<(Port, u64)>, Token), String> {
     let size = reply_size(count);
     let header = get(bytes, 0).ok_or("a reply shorter than its header")?;
@@ -295,7 +295,7 @@ impl Drop for Ports {
     }
 }
 
-/// Objects filed for a run process, until its loader asks.
+/// Objects filed for a run process, until its start hook asks.
 struct Pending {
     token: Token,
     ports: Ports,
@@ -371,7 +371,7 @@ fn serve(port: Port) {
         let objects: Vec<(Port, u64)> = pending.ports.0.iter().copied().zip(pending.lens.iter().copied()).collect();
         let mut reply = Message::new();
         let size = encode_reply(&mut reply, request.reply, &objects);
-        // The rights go into the reply: sent, they are the loader's; not sent, the kernel
+        // The rights go into the reply: sent, they are the start hook's; not sent, the kernel
         // gives them back in it, and `destroy` releases them.
         pending.ports.0.clear();
         // SAFETY: sends `size` bytes of `reply`, which moves the send-once right of the request
@@ -406,17 +406,21 @@ fn spoke(fd: i64) -> bool {
     got != 0
 }
 
-/// The daemon's side of a run process: nothing, since the loader maps what it is given.
+/// The daemon's side of a run process: nothing, since the start hook maps what it is given.
 pub(crate) struct Remote;
 
 impl Remote {
-    pub(crate) fn map(&self, object: u32, _: u64, _: u64, _: u64, _: Access) -> Result<u64, Error> {
-        Err(Error::new(format!("a loader asked the daemon to map object {object}: on macOS the loader maps it")))
+    pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
+        Err(Error::new(format!("a start hook asked the daemon to map object {object}: on macOS the hook maps it")))
+    }
+
+    pub(crate) fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
+        Err(Error::new("a start hook asked the daemon to lay its overlays: on macOS the hook lays them"))
     }
 }
 
 /// Files the objects for the run process on `channel`, sends the GRANT frame, and waits until
-/// the service gave them to its loader. A loader that writes to the channel before it asked
+/// the service gave them to its start hook. A hook that writes to the channel before it asked
 /// (its FAILED frame) is left for the host to read.
 pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
     if objects.len() > MOST_OBJECTS {

@@ -2,19 +2,33 @@
 //! schedules a round's expansions and a crate's dependencies as it likes.
 
 use super::*;
-use crate::test_db::{RUN_ORDER, RunOrder};
+use base_db::{RunOrder, set_run_order};
 
 /// The def map of the fixture's test crate, with its diagnostics, collected with every batch
 /// run in `order`.
 fn collected_in(order: RunOrder, #[rust_analyzer::rust_fixture] ra_fixture: &str) -> String {
-    let previous = RUN_ORDER.replace(order);
+    let previous = set_run_order(order);
     let db = TestDB::with_files(ra_fixture);
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let diagnostics: Vec<String> =
         def_map.diagnostics().iter().map(|it| format!("{:?}", it.kind)).collect();
-    let collected = format!("{}\n{diagnostics:#?}", def_map.dump(&db));
-    RUN_ORDER.set(previous);
+    let records = super::uses::render_records(&db, def_map);
+    let used = super::uses::render_used(&db, krate);
+    let scopes: Vec<String> = def_map
+        .modules(&db)
+        .map(|(_, it)| {
+            let scope = it.scope(&db);
+            let globs = scope.glob_ambiguities().iter().map(|it| it.name.as_str().to_owned());
+            let shadowed = scope.shadowed_imports().iter().map(|it| it.name.as_str().to_owned());
+            format!("{:?} {:?}", globs.collect::<Vec<_>>(), shadowed.collect::<Vec<_>>())
+        })
+        .collect();
+    let collected = format!(
+        "{}\n{diagnostics:#?}\n{records}\n{used}\n{scopes:#?}",
+        def_map.dump(&db)
+    );
+    set_run_order(previous);
     collected
 }
 
@@ -209,5 +223,52 @@ made!(X4);
 pub enum Derived { A, B }
 "#,
         &["Plain", "crate::inner", "X1", "X4", "Derived"],
+    );
+}
+
+/// What the imports and macro calls resolved through, as the dependencies and expansions of a
+/// round come in any order: globs read through globs, two globs that disagree, `#[macro_use]`.
+#[test]
+fn name_records_are_the_same_in_any_order() {
+    check_same_in_any_order(
+        r#"
+//- /main.rs crate:main deps:a,b
+#[macro_use]
+extern crate a;
+pub use a::*;
+pub use b::*;
+pub use inner::*;
+made!(Made);
+mod inner {
+    pub use super::Made as Again;
+    pub use crate::outer::*;
+}
+mod outer { pub struct Out; }
+pub struct Shared;
+pub use a::Shared;
+fn f(_: Again, _: Out, _: Same) { both(); }
+
+//- /a.rs crate:a
+pub fn both() {}
+pub struct Same;
+pub struct Shared;
+#[macro_export]
+macro_rules! made {
+    ($name:ident) => { pub struct $name; };
+}
+
+//- /b.rs crate:b
+pub fn both() {}
+pub use crate::Same as Other;
+pub struct Same;
+"#,
+        &[
+            "Made",
+            "Again",
+            "super::Made as Again Other",
+            "crate::outer::* Other [Out]",
+            "ambiguous both Values",
+            "use made Macros",
+        ],
     );
 }

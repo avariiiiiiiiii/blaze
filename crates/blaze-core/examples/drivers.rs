@@ -17,6 +17,7 @@ use std::time::Instant;
 use blaze_core::{
     Completion, Done, Driver, Effect, FileName, Tag, run_until_idle, threads::Threads,
 };
+use blaze_ids::rng::SplitMix64;
 
 fn percentile(values: &mut [f64], p: f64) -> f64 {
     values.sort_by(f64::total_cmp);
@@ -86,15 +87,12 @@ fn reads(driver: &mut dyn Driver, dir: &std::path::Path) -> Vec<f64> {
     std::fs::write(&path, vec![3u8; 64 << 20]).unwrap();
     let _ = std::fs::read(&path).unwrap();
     let file = FileName::new(name).unwrap();
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     (0..5)
         .map(|_| {
             let mut effects: Vec<Effect> = (0..4096)
                 .map(|n| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let at = seed % ((64 << 20) - (4 << 10));
+                    let at = rng.below((64 << 20) - (4 << 10));
                     Effect::Read { file: file.clone(), at, len: 4 << 10, tag: Tag(n) }
                 })
                 .collect();

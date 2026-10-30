@@ -38,8 +38,8 @@ use hir_ty_codegen::{
 use ide_db::{
     ChangeWithProcMacros, RootDatabase,
     base_db::{
-        CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, DependencyBuilder, Env,
-        LangCrateOrigin, SourceDatabase as _, SourceRoot, TargetKind,
+        CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, DependencyBuilder, Env,
+        LangCrateOrigin, SourceRoot, TargetKind,
         target::{Arch, TargetData},
     },
 };
@@ -146,7 +146,7 @@ impl Default for Compiler {
         // MIR is lowered for the target's address size, which is said when it is selected.
         hir_ty_codegen::Target::current();
         Compiler {
-            db: RootDatabase::new(None),
+            db: Db::new(),
             files: FxHashMap::default(),
             new_files: false,
             known: Rejections::default(),

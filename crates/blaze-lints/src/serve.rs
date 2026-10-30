@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ide_db::{RootDatabase, base_db::Crate};
+use base_db::{Crate, Db, FileId};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
@@ -77,13 +77,13 @@ pub struct Message {
 /// Lints the crates of `crates` the packages of `ask` have. Files are named from `root`, the
 /// workspace's, when they are below it; `path_of` is where a file is.
 pub fn answer(
-    db: &RootDatabase,
+    db: &Db,
     crates: &[Crate],
     root: &Path,
-    path_of: &dyn Fn(ide_db::FileId) -> Option<PathBuf>,
+    path_of: &dyn Fn(FileId) -> Option<PathBuf>,
     ask: &Ask,
 ) -> Answer {
-    let name_of = |file: ide_db::FileId| -> Option<String> {
+    let name_of = |file: FileId| -> Option<String> {
         let path = path_of(file)?;
         Some(match path.strip_prefix(root) {
             Ok(relative) => relative.to_string_lossy().into_owned(),
@@ -111,7 +111,7 @@ pub fn answer(
     };
     // A crate built for its tests as well is linted once, as that build: what it finds outside
     // `cfg(test)` is what the plain build finds.
-    let tested: FxHashSet<ide_db::FileId> = crates
+    let tested: FxHashSet<FileId> = crates
         .iter()
         .filter(|&&it| has_tests(it))
         .map(|&it| hir::Crate::from(it).root_file(db))

@@ -112,6 +112,7 @@ impl Macro {
         let field_indices = salsa_struct.field_indices();
 
         let absolute_tracked_indices = salsa_struct.tracked_field_indices();
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let relative_tracked_indices = (0..absolute_tracked_indices.len()).collect::<Vec<_>>();
 
         let absolute_untracked_indices = salsa_struct.untracked_field_indices();

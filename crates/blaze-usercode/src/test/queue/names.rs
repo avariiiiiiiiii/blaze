@@ -111,22 +111,34 @@ impl Names {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use rustc_hash::FxHashMap;
 
     use super::*;
+
+    #[test]
+    fn a_name_interned_again_allocates_nothing() {
+        let mut names = Names::new();
+        let all: Vec<String> = (0..1_000).map(|n| format!("/ws/{n}")).collect();
+        for name in &all {
+            names.intern(name).unwrap();
+        }
+        blaze_alloc_count::assert_at_most(0, "an interner hit", || {
+            for name in &all {
+                assert!(names.intern(name).is_some() && names.find(name).is_some());
+            }
+        });
+    }
 
     /// Against a map, over seeded names that repeat: the same ID for the same name, in the
     /// order first seen, every name read back as it was given.
     #[test]
     fn names_intern_as_a_map_would() {
-        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
         let mut names = Names::new();
         let mut map: FxHashMap<String, u32> = FxHashMap::default();
         for _ in 0..20_000 {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let name = format!("/ws/{}", state % 3_000);
+            let name = format!("/ws/{}", rng.below(3_000));
             let expected = *map.entry(name.clone()).or_insert(map.len() as u32);
             assert_eq!(names.intern(&name), Some(expected));
             assert_eq!(names.find(&name), Some(expected));

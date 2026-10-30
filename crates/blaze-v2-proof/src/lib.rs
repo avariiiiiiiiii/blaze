@@ -20,6 +20,8 @@
 //! - [`Rng`] and [`sample`]: the seeded choice of what to check when not everything is.
 //! - [`bytes`]: where two outputs first differ, by SIMD chosen at run time.
 //! - [`columns`]: the exact round trip every column encoding must make.
+//! - [`join`]: [`under`] and [`over`] across cores, on owned traces or on [`wire::View`]s read in place.
+//! - [`wire`]: a trace as a file, one byte string per column, read in place by [`wire::View`].
 //! - [`nameres`]: the cases for name resolution and the impl buckets, per fixture slot.
 //!
 //! A trace of nushell has millions of results and tens of millions of edges, so it is columns
@@ -30,7 +32,9 @@
 
 pub mod bytes;
 pub mod columns;
+pub mod join;
 pub mod nameres;
+pub mod wire;
 
 use std::collections::BTreeMap;
 
@@ -63,7 +67,7 @@ impl Bits {
 /// What one build left in the database: every key it names (its results and what they read),
 /// sorted, and per key index whether there is a result, its fingerprint, whether this build
 /// ran it, and its edges in read order.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Trace {
     pub keys: Vec<QueryKey>,
     pub has: Bits,

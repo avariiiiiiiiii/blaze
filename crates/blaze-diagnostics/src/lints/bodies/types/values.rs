@@ -20,7 +20,7 @@ mod intrinsics;
 mod invalid;
 mod transmutes;
 
-use hir::db::HirDatabase;
+use base_db::Db;
 use hir_def::{FunctionId, HasModule as _, hir::ExprId};
 use hir_ty::{
     intrinsic::{Intrinsic, intrinsic_of},
@@ -44,7 +44,7 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
 /// rustc's `is_intrinsic(def, sym::transmute)`: `def` is the intrinsic `transmute`. An
 /// intrinsic rustc doesn't have is none of rustc's, `transmute` included; MIR lowering refuses
 /// its calls.
-fn is_transmute(db: &dyn HirDatabase, def: FunctionId) -> bool {
+fn is_transmute(db: &Db, def: FunctionId) -> bool {
     matches!(intrinsic_of(db, def), Ok(Some(Intrinsic::Transmute)))
 }
 

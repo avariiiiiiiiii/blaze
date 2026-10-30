@@ -1,13 +1,51 @@
 //! This files contains the declaration of diagnostics kinds for ty and path lowering.
 
-use hir_def::{GenericDefId, GenericParamId, type_ref::TypeRefId};
+use hir_def::{
+    EnumVariantId, GenericDefId, GenericParamId, ImplId, TypeAliasId,
+    type_ref::{LifetimeRefId, TypeRefId},
+};
 
 use crate::Span;
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum TyLoweringDiagnostic {
     PathDiagnostic { source: TypeRefId, diag: PathLoweringDiagnostic },
-    InferVarsNotAllowed { source: Span },
+    /// `_` placeholders where no inference is: one each, but those of a type its body infers (a
+    /// return type, a const's or a static's), which rustc reports in one error.
+    InferVarsNotAllowed { sources: Box<[Span]> },
+    /// Lifetimes left out (`&T`, `'_`, a path without its lifetime arguments) where there is
+    /// none to elide to. One site but for [`MissingLifetimeKind::ElisionFailure`], which has
+    /// every site of one return type, as rustc reports them in one error.
+    MissingLifetimes { sites: Box<[ElidedLifetimeSite]>, kind: MissingLifetimeKind },
+}
+
+/// Where a lifetime is left out.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum ElidedLifetimeSite {
+    /// `&T`: the reference type.
+    Reference(TypeRefId),
+    /// `'_`.
+    Placeholder(LifetimeRefId),
+    /// A path to `def` without its lifetime arguments; `source` is the path type.
+    Path {
+        source: TypeRefId,
+        generics_source: PathGenericsSource,
+        def: GenericDefId,
+        expected_count: u32,
+    },
+}
+
+/// Why a lifetime left out has nothing to elide to, as rustc's lifetime ribs tell.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum MissingLifetimeKind {
+    /// In an item with no lifetime to elide to, a field or a free type alias: E0106.
+    Missing,
+    /// In a return type whose parameters give no single lifetime: E0106 with what the
+    /// parameters have.
+    ElisionFailure,
+    /// Where `&` and `'_` are not allowed: a bound, a where clause, a const parameter's type,
+    /// a parameter default, an associated type: E0637. A path there is E0106, `Missing`.
+    NotAllowed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -37,8 +75,11 @@ pub enum PathGenericsSource {
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum PathLoweringDiagnostic {
+    /// Generic arguments on the `segments` (in order, at least one) that rustc's one
+    /// `prohibit_generic_args` checks: a path's leading segments, with the last when it is a
+    /// type parameter, `Self`, a primitive type or a module; `reason` is the last one's.
     GenericArgsProhibited {
-        segment: u32,
+        segments: Box<[u32]>,
         reason: GenericArgsProhibitedReason,
     },
     ParenthesizedGenericArgsWithoutFnTrait {
@@ -81,6 +122,23 @@ pub enum PathLoweringDiagnostic {
     GenericDefaultRefersToSelf {
         /// Index of the `Self` segment.
         segment: u32,
+    },
+    /// Lifetime arguments given to a function with late-bound lifetime parameters: rustc's
+    /// `prohibit_explicit_late_bound_lifetimes`. E0794 when `hard_error` (a path to the function
+    /// with other than one argument per early-bound lifetime), else the
+    /// `late_bound_lifetime_arguments` lint; the lifetime arguments are ignored either way.
+    LateBoundLifetimeArgs {
+        generics_source: PathGenericsSource,
+        def: GenericDefId,
+        hard_error: bool,
+    },
+    /// `Self::Name` in a trait impl for an enum with a variant `Name`, resolved to the trait's
+    /// associated type: the `ambiguous_associated_items` lint.
+    AmbiguousAssociatedItem {
+        segment: u32,
+        variant: EnumVariantId,
+        item: TypeAliasId,
+        impl_: ImplId,
     },
 }
 

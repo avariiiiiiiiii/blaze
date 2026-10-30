@@ -10,14 +10,14 @@ use crate::{
             ExprCollector,
             path::{SEGMENT_LOWERING_MAP, hir_segment_to_ast_segment},
         },
-        path::Path,
+        path::PathIdx,
         pretty,
     },
     nameres::crate_def_map,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
-fn lower_path(path: ast::Path) -> (TestDB, ExpressionStore, Option<Path>) {
+fn lower_path(path: ast::Path) -> (TestDB, ExpressionStore, Option<PathIdx>) {
     let (db, file_id) = TestDB::with_single_file("");
     let krate = db.fetch_test_crate();
     let mut ctx = ExprCollector::new(
@@ -121,7 +121,7 @@ fn keywords_in_middle_fail_lowering3() {
 fn check_path_lowering(path: &str, expected: Expect) {
     let (db, store, lowered_path) = lower_path(make::path_from_text(path));
     let lowered_path = lowered_path.expect("failed to lower path");
-    let buf = pretty::print_path(&db, &store, &lowered_path, Edition::CURRENT);
+    let buf = pretty::print_path(&db, &store, store.path_at(lowered_path), Edition::CURRENT);
     expected.assert_eq(&buf);
 }
 

@@ -401,6 +401,7 @@ impl<'db> Consts<'db> {
         let usize_ty = Ty::new_uint(interner, rustc_type_ir::UintTy::Usize);
         let Some(word) = ctx.size_of(usize_ty) else {
             return Err(MirLowerError::NotSupported(
+                // alloc: error path
                 "UB checks: the target has no layout of `usize`".to_owned(),
             ));
         };
@@ -448,6 +449,7 @@ fn type_property<'db>(
     ty: Ty<'db>,
 ) -> Result<'db, Operand> {
     let Some(item) = item else {
+        // alloc: error path
         return Err(MirLowerError::NotSupported(format!(
             "UB checks: no `{name}` lang item in core"
         )));

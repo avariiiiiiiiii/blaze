@@ -51,6 +51,7 @@ Why: `lower/macro_error.rs` gives them as "blaze can't expand macro `x`: {text}"
 what, but not rustc's.
 
 > forwarded to db: `hir-expand`'s builtin macros are lane db's.
+> applied by db-expand: `env!` (with `is_cargo_env_var`, the similar-variable help and `edit_distance` ported), `option_env!`, `include*!`, `line!`/`column!`, `concat!`, `concat_bytes!` and the `From`/`CoercePointee` derives give `rustc_builtin_macros`' texts, codes, notes and spans as `ExpandErrorKind::Builtin` (kind `builtin-macro-error`, or `builtin-derive-error` for derives); tests in `crates/hir-def/src/macro_expansion_tests/builtin_errors.rs`. Showing them without the "blaze can't expand" prefix waits on `lower/macro_error.rs` and `hir::MacroError` (requests in `v2/requests/db-expand.md`).
 
 ## 4. A parse error of a token stream in rustc's words (diagnostics-items / parse)
 
@@ -78,6 +79,7 @@ crate named `x`, use `cargo add x` to add it to your `Cargo.toml`" under cargo;
 `lower/unresolved_import.rs` gives the non-cargo text.
 
 > forwarded to diagnostics: `Options` is in `crates/blaze-diagnostics/src/check.rs`, its own; `blaze-api` needs no change (the daemon that sets the flag is lane cargo's).
+> applied by diagnostics: `Cx::cargo()` reads the flag check-cfg already had (`CommandLine::check_cfg.cargo`, `CARGO_CRATE_NAME` set), so there is one source rather than a second `Options` field. `lower::unresolved_import::{missing_crate, missing_crate_2015}` give rustc's two `cargo add` texts and its two non-cargo ones, used by `unresolved_import.rs` and `checks/names/failure.rs`. Test: `tests/items/resolve.rs` `under_cargo_the_missing_crate_help_says_cargo_add`. Still missing: the 2015 case of a crate passed by `--extern` (rustc's "upgrade your edition" help and MachineApplicable).
 
 ## 6. `#![forbid(unsafe_code)]` on `blaze-diagnostics` (diagnostics)
 

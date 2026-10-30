@@ -1,4 +1,4 @@
-use blaze_core::sim::Rng;
+use blaze_ids::rng::SplitMix64 as Rng;
 
 use super::*;
 
@@ -71,6 +71,73 @@ fn a_request_comes_out_the_same_whatever_the_cuts() {
         }
         assert_eq!(out, whole, "seed {seed}");
         assert_eq!(parser.held(), 0, "seed {seed}");
+    }
+}
+
+/// Requests read in place are the owned ones, whatever the cuts, and say the same of what is
+/// held; refusals are the same refusals.
+#[test]
+fn a_request_in_place_is_the_request() {
+    let mut stream = request("POST", "h", "/a", &[("X-One", "1"), ("X-Two", " two\t")], b"first");
+    stream.extend_from_slice(
+        b"\r\nPOST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\nT: 1\r\n\r\n",
+    );
+    stream.extend(request("GET", "h", "/c", &[], b""));
+    stream.extend(request("PUT", "h", "/d", &[("Content-Type", "x")], &[7; 300]));
+    for seed in 0..300 {
+        let mut rng = Rng::new(seed);
+        let (mut owned, mut lent) = (RequestParser::new(1 << 20), RequestParser::new(1 << 20));
+        let (mut want, mut got) = (Vec::new(), Vec::new());
+        let mut at = 0;
+        while at < stream.len() {
+            let len = (rng.below(40) as usize).min(stream.len() - at);
+            owned.push(&stream[at..at + len]);
+            match rng.below(2) == 0 {
+                true => lent.push(&stream[at..at + len]),
+                false => lent.push_vec(stream[at..at + len].to_vec()),
+            }
+            at += len;
+            while let Some(request) = owned.next().unwrap() {
+                want.push(request);
+            }
+            while let Some(request) = lent.next_ref().unwrap() {
+                got.push(request.to_request());
+                assert_eq!(request.header("x-two"), got.last().unwrap().header("X-Two"));
+            }
+            assert_eq!(lent.held(), owned.held(), "seed {seed}");
+        }
+        assert_eq!(got, want, "seed {seed}");
+        assert_eq!(want.len(), 4);
+    }
+    let bad: [&[u8]; 6] = [
+        b"GET / HTTP/1.1\nHost: x\r\n\r\n",
+        b"GET / HTTP/1.1\r\nA: \xff\r\nB\r\n\r\n",
+        b"GET / HTTP/1.1\r\nA: a\rb\r\nB\r\n\r\n",
+        b"GET /  HTTP/1.1\r\nA\r\n\r\n",
+        b"POST / HTTP/1.1\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n",
+        b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nabc\r\n",
+    ];
+    for bytes in bad {
+        let mut lent = RequestParser::new(1 << 20);
+        lent.push(bytes);
+        assert_eq!(lent.next_ref().unwrap_err(), parse(bytes).unwrap_err(), "{bytes:?}");
+    }
+    assert_eq!(parse(bad[1]).unwrap_err().what, "a head that is not UTF-8");
+    assert_eq!(parse(bad[2]).unwrap_err().what, "a CR inside a head line");
+}
+
+/// The API server's read of a request: nothing allocated once the bytes are here.
+#[test]
+fn a_request_in_place_allocates_nothing() {
+    let bytes = request("POST", "h", "/api", &[("Content-Type", "application/cbor")], &[1; 64]);
+    let mut parser = RequestParser::new(1 << 20);
+    for _ in 0..10 {
+        parser.push(&bytes);
+        let (path, body) = blaze_alloc_count::assert_at_most(0, "a request read in place", || {
+            let request = parser.next_ref().unwrap().unwrap();
+            (request.path.len(), request.body.len())
+        });
+        assert_eq!((path, body), (4, 64));
     }
 }
 

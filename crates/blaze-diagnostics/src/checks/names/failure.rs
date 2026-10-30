@@ -14,7 +14,7 @@ pub(super) use crate::lower::unresolved_import::{ROOT, Segment};
 use crate::{
     cx::Cx,
     lints::edit_distance::find_best_match_for_name,
-    lower::unresolved_import::value_descr,
+    lower::unresolved_import::{missing_crate, missing_crate_2015, value_descr},
     model::{Applicability, Diag, Span},
 };
 
@@ -54,7 +54,7 @@ pub(super) fn diag(cx: &Cx<'_, '_>, place: &At<'_>, path: &[Segment], at: usize,
             message = format!("cannot find module or crate `{name}` in {scope}");
             suggestion = Some((
                 vec![(crate_insert_span(cx), format!("extern crate {name};\n"))],
-                format!("you might be missing a crate named `{name}`, add it to your project and import it in your code"),
+                missing_crate_2015(cx, name),
             ));
             format!("use of unresolved module or unlinked crate `{name}`")
         } else {
@@ -95,7 +95,7 @@ pub(super) fn diag(cx: &Cx<'_, '_>, place: &At<'_>, path: &[Segment], at: usize,
             Some(def) => format!("{} `{name}` is not a crate or module", value_descr(cx, def)),
             None => {
                 if suggestion.is_none() {
-                    suggestion = Some((Vec::new(), format!("you might be missing a crate named `{name}`")));
+                    suggestion = Some((Vec::new(), missing_crate(cx, name)));
                 }
                 format!("use of unresolved module or unlinked crate `{name}`")
             }

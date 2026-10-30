@@ -31,7 +31,7 @@ pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
-    unix::{__register_frame, image_base, in_image, load_cell, loaders},
+    unix::{__register_frame, Segments, load_cell, loaders},
 };
 
 #[repr(C)]
@@ -120,8 +120,8 @@ pub(super) struct Os {
     protection: i32,
     /// The protection of the table cell's region.
     cell: i32,
-    /// Where the image is loaded, which every data write is checked to be in.
-    base: u64,
+    /// Where the image is mapped, which every data write is checked to be in.
+    segments: Segments,
 }
 
 impl Os {
@@ -149,9 +149,13 @@ impl Os {
             at = region.end;
         }
         let (_, cell) = region_at(layout.cell())?;
-        let base = image_base(layout.cell())
-            .ok_or_else(|| format!("no image has the table cell at {:#x}", layout.cell()))?;
-        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell, base })
+        let segments = Segments::of(layout.cell())?;
+        Ok(Os { code, protection: protection.unwrap_or(READ | EXECUTE), cell, segments })
+    }
+
+    /// Where the image is mapped, from its first segment to its last, in memory.
+    pub(super) fn image(&self) -> Range<u64> {
+        self.segments.hull()
     }
 }
 
@@ -164,7 +168,7 @@ impl Memory for Os {
     }
 
     fn in_image(&self, range: &Range<u64>) -> Result<(), String> {
-        in_image(range, self.base)?;
+        self.segments.check(range)?;
         let mut at = range.start;
         while at < range.end {
             let (region, protection) = region_at(at)?;
@@ -178,7 +182,7 @@ impl Memory for Os {
 
     fn bytes(&self, range: &Range<u64>) -> Result<&'static [u8], String> {
         self.in_image(range)?;
-        super::unix::bytes(range, self.base)
+        super::unix::bytes(range, self.segments.base())
     }
 
     fn loaders(&self, at: u64, slots: u64) -> &[u64] {
@@ -208,7 +212,7 @@ impl Memory for Os {
         let mut region: Option<(Range<u64>, i32)> = None;
         let mut run: Option<(Range<u64>, i32)> = None;
         for span in writes.spans {
-            in_image(&span.range(), self.base)?;
+            self.segments.check(&span.range())?;
             let mut at = span.at;
             while at < span.end() {
                 let (found, protection) = match &region {

@@ -13,9 +13,8 @@
 //! when parsed; outlines are for the files of dependency crates, which rustc builds.
 
 use crate::{
-    Input,
     SyntaxKind::{EOF, IDENT, OUTER_DOC_COMMENT},
-    T,
+    T, Tokens,
 };
 
 /// The number of tokens of the balanced `{ ... }` starting at token `start` of `input`, when an
@@ -24,7 +23,8 @@ use crate::{
 /// doc comment right before a `}` (the statement expected after it takes the `}`), a `#` or a
 /// `<` right before a brace (the expression or generic parameter expected there takes it) and
 /// `builtin #` (whose `asm` operands' recovery takes any token).
-pub fn lazy_block_len(input: &Input, start: usize) -> Option<u32> {
+pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<u32> {
+    let input = input.into();
     if input.kind(start) != T!['{'] {
         return None;
     }

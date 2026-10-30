@@ -1,4 +1,4 @@
-//! Compile errors and warnings as rustc gives them (docs/v2/plan.md section 18; #1522,
+//! Compile errors and warnings as rustc gives them (docs/v2/plan/process/building.md section 18; #1522,
 //! #1440, #780): computed from the front end's queries that found them, each with the facts
 //! it read, and written as rustc and cargo write them. Every error rustc gives is given: a
 //! program rustc rejects that blaze accepts is a bug of this crate or of the front end.
@@ -12,8 +12,16 @@
 //! - [`emit`]: rustc's text (human, short, colour) and JSON, and its closing lines.
 //! - [`check`]: a crate's diagnostics in the order rustc gives them, stopping where it stops.
 //! - [`api`]: a diagnostic as the agent API sends it.
+//!
+//! A check is one task: its tables live in the task's [`blaze_mem::Frame`] ([`Cx::frame`]),
+//! freed in one go when it returns. Only the diagnostics it gives outlive it.
 
+#![feature(allocator_api)]
 #![forbid(unsafe_code)]
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub mod api;
 pub mod check;

@@ -4,10 +4,13 @@
 //! A store's expressions, patterns and statements are written as the columns they are in memory
 //! ([`HirColumns`]): the kind bytes, the data words, `extra` and the list arrays copied as they
 //! are, the arms and record fields as records of words (a field's name a [`Str`]), and the cold
-//! side tables (names, paths, literals, generic args, `offset_of!`, `asm!`, macro definitions)
-//! in the words, as [`Code`] writes them. Type refs are written the same way, as the columns of
-//! [`TypeColumns`]: kinds, data words, `extra` and the list array copied, the side tables
-//! (bounds, paths, references, arrays, fn pointers, type params) in the words. Bindings, labels
+//! side tables (names, literals, `offset_of!`, `asm!`, macro definitions) in the words, as
+//! [`Code`] writes them. Type refs are written the same way, as the columns of [`TypeColumns`]:
+//! kinds, data words, `extra` and the list array copied, the side tables (bounds, references,
+//! arrays, fn pointers, type params) in the words. So are the store's paths ([`PathColumns`],
+//! which expressions and patterns share with type refs): kinds, data words, `extra` and slots
+//! copied, their tables (mod paths, lang items, generic argument rows, arguments, binding rows,
+//! bounds, names, `use<..>` arguments) in the words. Bindings, labels
 //! and lifetimes are one [`Node`] column per arena, their fields in the same words. Source maps
 //! are buffers of their own, so that spans stay out of what is hashed ([`source_map`]).
 //!
@@ -26,6 +29,7 @@ use blaze_format::{
 use hir_expand::{
     MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
+    mod_path::ModPath,
     name::Name,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
@@ -46,16 +50,14 @@ use crate::{
         Body, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
         NO_OWNER,
         body::Param,
-        path::{
-            AssociatedTypeBinding, GenericArg, GenericArgs, GenericArgsParentheses, NormalPath,
-            Path,
-        },
+        path::{BindingRow, GenericArg, GenericArgsRow, Names, PathColumns, PathTag, UseArgs},
     },
     hir::{
         AsmOperand, AsmOptions, AsmPiece, Binding, BindingAnnotation, BindingId, BindingProblems,
         ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
         InlineAsmRegOrRegClass, Label, Literal, MatchArm, OffsetOf, PatId, RecordFieldPat,
         RecordLitField,
+        col::{SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
     },
@@ -112,7 +114,7 @@ blaze_format::record! {
     /// are in memory, each id a raw `u32`, the side tables in the words from `side` and
     /// `ty_side` on.
     #[derive(Clone, Copy)]
-    pub(crate) struct StoreRoot: 4 {
+    pub(crate) struct StoreRoot: 5 {
         pub(crate) expr_kind: Slice<u8>,
         pub(crate) expr_data: Slice<u32>,
         pub(crate) pat_kind: Slice<u8>,
@@ -135,6 +137,11 @@ blaze_format::record! {
         pub(crate) ty_extra: Slice<u32>,
         /// The tuples' element ids, raw.
         pub(crate) ty_lists: Slice<u32>,
+        /// The paths' columns, as [`PathColumns`] keeps them; their tables are in the words.
+        pub(crate) path_kind: Slice<u8>,
+        pub(crate) path_data: Slice<u32>,
+        pub(crate) path_extra: Slice<u32>,
+        pub(crate) path_slots: Slice<u32>,
         pub(crate) lifetimes: Slice<Node>,
         /// The owner of each binding, or [`NO_OWNER`]; empty when the top level owns them all.
         pub(crate) binding_owners: Slice<u32>,
@@ -149,11 +156,11 @@ blaze_format::record! {
         /// The type and the syntax context, by type in increasing order.
         pub(crate) type_hygiene: Slice<IdPair>,
         pub(crate) words: WordsRec,
-        /// The word the side tables begin at: names, paths, literals, generic args,
-        /// `offset_of!`s, `asm!`s and macro definitions, each a count and its values.
+        /// The word the side tables begin at: names, literals, `offset_of!`s, `asm!`s and macro
+        /// definitions, each a count and its values.
         pub(crate) side: u32,
-        /// The word the type side tables begin at: bounds, paths, references, arrays, fn
-        /// pointers and type params, each a count and its values.
+        /// The word the type side tables begin at: bounds, the paths' tables ([`TypeSide`]),
+        /// references, arrays, fn pointers and type params, each a count and its values.
         pub(crate) ty_side: u32,
         /// [`HAS_EXPRS`] and [`HAS_TYPE_HYGIENE`].
         pub(crate) flags: u32,
@@ -387,6 +394,7 @@ fn put_bytes(w: &mut Words, bytes: &[u8]) {
 
 fn get_bytes(r: &mut Read<'_>) -> Result<Box<[u8]>, FormatError> {
     let len = r.u32()? as usize;
+    // alloc: the decode's one copy; capacity isn't taken from the unchecked length.
     let mut bytes = Vec::new();
     for _ in 0..len.div_ceil(4) {
         bytes.extend_from_slice(&r.u32()?.to_le_bytes());
@@ -402,7 +410,6 @@ fn get_bytes(r: &mut Read<'_>) -> Result<Box<[u8]>, FormatError> {
 struct Ids<'s> {
     exprs: u32,
     pats: u32,
-    lifetimes: u32,
     types: &'s TypeColumns<Frozen>,
 }
 
@@ -428,64 +435,12 @@ impl Ids<'_> {
         below(raw(pat), self.pats, "a pattern id past its arena")
     }
 
-    fn lifetime(&self, lifetime: LifetimeRefId) -> Checked {
-        below(raw(lifetime), self.lifetimes, "a lifetime id past its arena")
-    }
-
     fn ty(&self, ty: TypeRefId) -> Checked {
         below(raw(ty), self.types.kind.len() as u32, "a type id past its arena")
     }
 
     fn ty_opt(&self, ty: Option<TypeRefId>) -> Checked {
         ty.map_or(Ok(()), |ty| self.ty(ty))
-    }
-
-    fn path_id(&self, path: PathId) -> Checked {
-        match self.types.kind.get(raw(path.type_ref()) as usize) {
-            Some(&kind) if kind == TypeRefKind::Path as u8 => Ok(()),
-            Some(_) => Err("a path id of a type that is not a path"),
-            None => Err("a type id past its arena"),
-        }
-    }
-
-    fn path(&self, path: &Path) -> Checked {
-        match path {
-            Path::BarePath(_) | Path::LangItem(..) => Ok(()),
-            Path::Normal(path) => {
-                let NormalPath { generic_args, type_anchor, mod_path: _ } = &**path;
-                generic_args.iter().flatten().try_for_each(|args| self.generic_args(args))?;
-                self.ty_opt(*type_anchor)
-            }
-        }
-    }
-
-    fn generic_args(&self, args: &GenericArgs) -> Checked {
-        let GenericArgs { args, has_self_type: _, bindings, parenthesized: _ } = args;
-        for arg in args {
-            match *arg {
-                GenericArg::Type(ty) => self.ty(ty)?,
-                GenericArg::Lifetime(lifetime) => self.lifetime(lifetime)?,
-                GenericArg::Const(ConstRef { expr }) => self.expr(expr)?,
-            }
-        }
-        for AssociatedTypeBinding { name: _, args, type_ref, bounds } in bindings {
-            args.iter().try_for_each(|args| self.generic_args(args))?;
-            self.ty_opt(*type_ref)?;
-            self.bounds(bounds)?;
-        }
-        Ok(())
-    }
-
-    fn bounds(&self, bounds: &[TypeBound]) -> Checked {
-        bounds.iter().try_for_each(|bound| match bound {
-            &TypeBound::Path(path, _) | &TypeBound::ForLifetime(_, path) => self.path_id(path),
-            &TypeBound::Lifetime(lifetime) => self.lifetime(lifetime),
-            TypeBound::Use(args) => args.iter().try_for_each(|arg| match *arg {
-                UseArgRef::Lifetime(lifetime) => self.lifetime(lifetime),
-                UseArgRef::Name(_) => Ok(()),
-            }),
-            TypeBound::Error => Ok(()),
-        })
     }
 
     fn asm(&self, asm: &InlineAsm) -> Checked {
@@ -499,22 +454,14 @@ impl Ids<'_> {
                 self.expr(in_expr)?;
                 self.expr_opt(out_expr)
             }
-            AsmOperand::Sym(path) => self.path(path),
+            AsmOperand::Sym(_) => Ok(()),
         })
     }
 
     /// The ids the side tables' values hold, which [`HirColumns::check`] does not look into.
     fn side_tables(&self, side: &SideTables) -> Checked {
-        side.paths.iter().try_for_each(|path| self.path(path))?;
-        side.generic_args.iter().try_for_each(|args| self.generic_args(args))?;
         side.offset_ofs.iter().try_for_each(|offset_of| self.ty(offset_of.container))?;
         side.asms.iter().try_for_each(|asm| self.asm(asm))
-    }
-
-    /// The ids the type side table of paths holds (type anchors, generic args), which
-    /// [`TypeColumns::check`] leaves to the encoding.
-    fn type_paths(&self) -> Checked {
-        self.types.paths.iter().try_for_each(|path| self.path(path))
     }
 }
 
@@ -530,6 +477,7 @@ fn column<'v, T: 'v>(
             let kind = put(value, w);
             Node { kind, at }
         })
+        // alloc: the encode's one copy of the column, once per store.
         .collect()
 }
 
@@ -567,9 +515,7 @@ fn slice<'c, T>(
 /// The cold side tables of [`HirColumns`], read back from the words.
 struct SideTables {
     names: Vec<Name>,
-    paths: Vec<Path>,
     literals: Vec<Literal>,
-    generic_args: Vec<GenericArgs>,
     offset_ofs: Vec<OffsetOf>,
     asms: Vec<InlineAsm>,
     macro_defs: Vec<MacroDefId>,
@@ -581,9 +527,7 @@ impl SideTables {
     fn put(w: &mut Words, hir: Option<&HirColumns<Frozen>>) -> u32 {
         let at = w.at();
         w.seq(slice(hir, |c| &c.names[..]).iter());
-        w.seq(slice(hir, |c| &c.paths[..]).iter());
         w.seq(slice(hir, |c| &c.literals[..]).iter());
-        w.seq(slice(hir, |c| &c.generic_args[..]).iter());
         w.seq(slice(hir, |c| &c.offset_ofs[..]).iter());
         w.seq(slice(hir, |c| &c.asms[..]).iter());
         w.seq(slice(hir, |c| &c.macro_defs[..]).iter());
@@ -593,9 +537,7 @@ impl SideTables {
     fn get(r: &mut Read<'_>) -> Result<SideTables, FormatError> {
         Ok(SideTables {
             names: r.seq::<Name, _>()?,
-            paths: r.seq::<Path, _>()?,
             literals: r.seq::<Literal, _>()?,
-            generic_args: r.seq::<GenericArgs, _>()?,
             offset_ofs: r.seq::<OffsetOf, _>()?,
             asms: r.seq::<InlineAsm, _>()?,
             macro_defs: r.seq::<MacroDefId, _>()?,
@@ -603,22 +545,27 @@ impl SideTables {
     }
 
     fn is_empty(&self) -> bool {
-        let SideTables { names, paths, literals, generic_args, offset_ofs, asms, macro_defs } =
-            self;
+        let SideTables { names, literals, offset_ofs, asms, macro_defs } = self;
         names.is_empty()
-            && paths.is_empty()
             && literals.is_empty()
-            && generic_args.is_empty()
             && offset_ofs.is_empty()
             && asms.is_empty()
             && macro_defs.is_empty()
     }
 }
 
-/// The side tables of [`TypeColumns`], read back from the words.
+/// The side tables of [`TypeColumns`] and the tables of its [`PathColumns`], read back from the
+/// words.
 struct TypeSide {
     bounds: Vec<TypeBound>,
-    paths: Vec<Path>,
+    mod_paths: Vec<ModPath>,
+    lang_items: Vec<LangItemTarget>,
+    generic_args: Vec<GenericArgsRow>,
+    args: Vec<GenericArg>,
+    bindings: Vec<BindingRow>,
+    binding_bounds: Vec<TypeBound>,
+    names: Vec<Name>,
+    use_args: Vec<UseArgRef>,
     refs: Vec<RefType>,
     arrays: Vec<ArrayType>,
     fns: Vec<FnType>,
@@ -630,8 +577,16 @@ impl TypeSide {
     /// begin at.
     fn put(w: &mut Words, types: &TypeColumns<Frozen>) -> u32 {
         let at = w.at();
+        let paths = &types.paths;
         w.seq(types.bounds.iter());
-        w.seq(types.paths.iter());
+        w.seq(paths.mod_paths.iter());
+        w.seq(paths.lang_items.iter());
+        w.seq(paths.generic_args.iter());
+        w.seq(paths.args.iter());
+        w.seq(paths.bindings.iter());
+        w.seq(paths.bounds.iter());
+        w.seq(paths.names.iter());
+        w.seq(paths.use_args.iter());
         w.seq(types.refs.iter());
         w.seq(types.arrays.iter());
         w.seq(types.fns.iter());
@@ -642,7 +597,14 @@ impl TypeSide {
     fn get(r: &mut Read<'_>) -> Result<TypeSide, FormatError> {
         Ok(TypeSide {
             bounds: r.seq::<TypeBound, _>()?,
-            paths: r.seq::<Path, _>()?,
+            mod_paths: r.seq::<ModPath, _>()?,
+            lang_items: r.seq::<LangItemTarget, _>()?,
+            generic_args: r.seq::<GenericArgsRow, _>()?,
+            args: r.seq::<GenericArg, _>()?,
+            bindings: r.seq::<BindingRow, _>()?,
+            binding_bounds: r.seq::<TypeBound, _>()?,
+            names: r.seq::<Name, _>()?,
+            use_args: r.seq::<UseArgRef, _>()?,
             refs: r.seq::<RefType, _>()?,
             arrays: r.seq::<ArrayType, _>()?,
             fns: r.seq::<FnType, _>()?,
@@ -670,7 +632,7 @@ impl FieldNames {
             u32::try_from(self.text.len()).expect("more than 4 GiB of field names in one buffer");
         let len = u32::try_from(symbol.as_str().len()).expect("a name of 4 GiB or more");
         self.text.push_str(symbol.as_str());
-        self.by_symbol.insert(symbol.clone(), (start, len));
+        self.by_symbol.insert(*symbol, (start, len));
     }
 
     /// Writes `fields`, each a name and an id, as a column of [`FieldRec`]s, their names in
@@ -693,6 +655,7 @@ impl FieldNames {
                 };
                 FieldRec { name, id }
             })
+            // alloc: the encode's one copy of the column, once per store.
             .collect();
         let column = Column::push(out, &records);
         debug_assert_eq!(column.at, at, "`Writer::next` is not where `push_slice` writes");
@@ -720,6 +683,7 @@ fn decoded<R, T>(
             check(&value).map_err(|what| FormatError::Invalid { at: at_of(record, buffer), what })?;
             Ok(value)
         })
+        // alloc: the decode's one copy of the column.
         .collect()
 }
 
@@ -747,6 +711,10 @@ struct StoreColumns {
     ty_data: Column,
     ty_extra: Column,
     ty_lists: Column,
+    path_kind: Column,
+    path_data: Column,
+    path_extra: Column,
+    path_slots: Column,
     lifetimes: Column,
     binding_owners: Column,
     block_scopes: Column,
@@ -788,16 +756,24 @@ impl StoreColumns {
             names.column(out, text_at, field_pats.iter().map(|field| (&field.name, raw(field.pat))));
         let arms: Vec<ArmRec> = (slice(hir, |c| &c.arms[..]).iter())
             .map(|arm| ArmRec { pat: raw(arm.pat), guard: opt_raw(arm.guard), expr: raw(arm.expr) })
+            // `Writer` takes slices, and pushing each column as it is made would reorder the buffer.
+            // alloc: the encode's one copy of each column, once per store.
             .collect();
         let expr_lists: Vec<u32> =
+            // alloc: the encode's one copy of the column, once per store.
             slice(hir, |c| &c.expr_lists[..]).iter().map(|&expr| raw(expr)).collect();
         let pat_lists: Vec<u32> =
+            // alloc: the encode's one copy of the column, once per store.
             slice(hir, |c| &c.pat_lists[..]).iter().map(|&pat| raw(pat)).collect();
         let type_lists: Vec<u32> =
+            // alloc: the encode's one copy of the column, once per store.
             slice(hir, |c| &c.type_lists[..]).iter().map(|&ty| opt_raw(ty)).collect();
+        // alloc: the encode's one copy of the column, once per store.
         let ty_lists: Vec<u32> = types.lists.iter().map(|&ty| raw(ty)).collect();
 
+        // alloc: empty unless the store has expressions; then each is the column's one copy.
         let (mut binding_owners, mut block_scopes, mut ident_hygiene) = (vec![], vec![], vec![]);
+        // alloc: empty unless the store has expressions; then each is the column's one copy.
         let (mut block_editions, mut overflow_inheriting, mut expr_roots) = (vec![], vec![], vec![]);
         if let Some(it) = expr_only {
             let ExpressionOnlyStore {
@@ -811,14 +787,19 @@ impl StoreColumns {
                 overflow_inheriting: inheriting,
                 expr_roots: roots,
             } = it;
+            // alloc: the encode's one copy of the column, once per store.
             binding_owners = owners.to_vec();
+            // alloc: the encode's one copy of the column, once per store.
             block_scopes = blocks.iter().map(|&block| bits(block)).collect();
             ident_hygiene = (hygiene.iter())
                 .map(|&(id, hygiene)| IdPair { a: packed_bits(id), b: hygiene_bits(hygiene) })
+                // alloc: the encode's one copy of the column, once per store.
                 .collect();
             block_editions = (editions.iter())
                 .map(|&(block, edition)| IdPair { a: raw(block), b: edition as u32 })
+                // alloc: the encode's one copy of the column, once per store.
                 .collect();
+            // alloc: the encode's one copy of the column, once per store.
             overflow_inheriting = inheriting.iter().map(|&closure| raw(closure)).collect();
             expr_roots = (roots.iter())
                 .map(|root| ExprRootRec {
@@ -827,10 +808,12 @@ impl StoreColumns {
                     pats_end: raw(root.pats_end),
                     bindings_end: raw(root.bindings_end),
                 })
+                // alloc: the encode's one copy of the column, once per store.
                 .collect();
         }
         let type_hygiene_pairs: Vec<IdPair> = (type_hygiene.iter().flat_map(|it| it.iter()))
             .map(|&(ty, hygiene)| IdPair { a: raw(ty), b: hygiene_bits(hygiene) })
+            // alloc: the encode's one copy of the column, once per store.
             .collect();
         let flags = (if expr_only.is_some() { HAS_EXPRS } else { 0 })
             | (if type_hygiene.is_some() { HAS_TYPE_HYGIENE } else { 0 });
@@ -857,6 +840,10 @@ impl StoreColumns {
             ty_data: Column::push(out, &types.data[..]),
             ty_extra: Column::push(out, &types.extra[..]),
             ty_lists: Column::push(out, &ty_lists),
+            path_kind: Column::push(out, &types.paths.kind[..]),
+            path_data: Column::push(out, &types.paths.data[..]),
+            path_extra: Column::push(out, &types.paths.extra[..]),
+            path_slots: Column::push(out, &types.paths.slots[..]),
             lifetimes: Column::push(out, &lifetimes),
             binding_owners: Column::push(out, &binding_owners),
             block_scopes: Column::push(out, &block_scopes),
@@ -892,6 +879,10 @@ impl StoreColumns {
             ty_data: self.ty_data.slice(field(offset_of!(StoreRoot, ty_data))),
             ty_extra: self.ty_extra.slice(field(offset_of!(StoreRoot, ty_extra))),
             ty_lists: self.ty_lists.slice(field(offset_of!(StoreRoot, ty_lists))),
+            path_kind: self.path_kind.slice(field(offset_of!(StoreRoot, path_kind))),
+            path_data: self.path_data.slice(field(offset_of!(StoreRoot, path_data))),
+            path_extra: self.path_extra.slice(field(offset_of!(StoreRoot, path_extra))),
+            path_slots: self.path_slots.slice(field(offset_of!(StoreRoot, path_slots))),
             lifetimes: self.lifetimes.slice(field(offset_of!(StoreRoot, lifetimes))),
             binding_owners: self.binding_owners.slice(field(offset_of!(StoreRoot, binding_owners))),
             block_scopes: self.block_scopes.slice(field(offset_of!(StoreRoot, block_scopes))),
@@ -933,6 +924,10 @@ pub struct ExpressionStoreRef<'a> {
     ty_data: &'a [u32],
     ty_extra: &'a [u32],
     ty_lists: &'a [u32],
+    path_kind: &'a [u8],
+    path_data: &'a [u32],
+    path_extra: &'a [u32],
+    path_slots: &'a [u32],
     lifetimes: &'a [Node],
     binding_owners: &'a [u32],
     block_scopes: &'a [u64],
@@ -968,6 +963,10 @@ impl<'a> ExpressionStoreRef<'a> {
             ty_data: root.ty_data.follow(buffer)?,
             ty_extra: root.ty_extra.follow(buffer)?,
             ty_lists: root.ty_lists.follow(buffer)?,
+            path_kind: root.path_kind.follow(buffer)?,
+            path_data: root.path_data.follow(buffer)?,
+            path_extra: root.path_extra.follow(buffer)?,
+            path_slots: root.path_slots.follow(buffer)?,
             lifetimes: root.lifetimes.follow(buffer)?,
             binding_owners: root.binding_owners.follow(buffer)?,
             block_scopes: root.block_scopes.follow(buffer)?,
@@ -989,7 +988,8 @@ impl<'a> ExpressionStoreRef<'a> {
         let datas = self.expr_data.len() == self.expr_kind.len()
             && self.pat_data.len() == self.pat_kind.len()
             && self.stmt_data.len() == self.stmt_kind.len()
-            && self.ty_data.len() == self.ty_kind.len();
+            && self.ty_data.len() == self.ty_kind.len()
+            && self.path_data.len() == self.path_kind.len();
         ensure(datas, root, buffer, "a data column that is not one word for each node")?;
         check_kinds(self.expr_kind, ExprKind::ALL.len(), buffer, "an expression kind out of range")?;
         check_kinds(self.pat_kind, PatKind::ALL.len(), buffer, "a pattern kind out of range")?;
@@ -1000,6 +1000,7 @@ impl<'a> ExpressionStoreRef<'a> {
             "a statement kind out of range",
         )?;
         check_kinds(self.ty_kind, TypeRefKind::ALL.len(), buffer, "a type kind out of range")?;
+        check_kinds(self.path_kind, PathTag::ALL.len(), buffer, "a path kind out of range")?;
         check_nodes(self.bindings, 1, words, buffer, "a binding kind out of range")?;
         check_nodes(self.labels, 1, words, buffer, "a label kind out of range")?;
         check_nodes(
@@ -1115,6 +1116,10 @@ impl<'a> ExpressionStoreRef<'a> {
         self.ty_kind.len()
     }
 
+    pub fn paths_len(self) -> usize {
+        self.path_kind.len()
+    }
+
     pub fn lifetimes_len(self) -> usize {
         self.lifetimes.len()
     }
@@ -1182,15 +1187,43 @@ impl<'a> ExpressionStoreRef<'a> {
         let bindings = arena(self.bindings, &words, buffer, only_kind, get_binding)?;
         let labels = arena(self.labels, &words, buffer, only_kind, get_label)?;
         let side = SideTables::get(&mut words.from(self.root.side))?;
-        let TypeSide { bounds, paths: type_paths, refs, arrays, fns, type_params } =
-            TypeSide::get(&mut words.from(self.root.ty_side))?;
+        let TypeSide {
+            bounds,
+            mod_paths,
+            lang_items,
+            generic_args: generic_arg_rows,
+            args,
+            bindings: binding_rows,
+            binding_bounds,
+            names: path_names,
+            use_args,
+            refs,
+            arrays,
+            fns,
+            type_params,
+        } = TypeSide::get(&mut words.from(self.root.ty_side))?;
+        let paths = PathColumns {
+            kind: self.path_kind.into(),
+            data: self.path_data.into(),
+            extra: self.path_extra.into(),
+            mod_paths,
+            lang_items,
+            slots: self.path_slots.into(),
+            generic_args: generic_arg_rows,
+            args,
+            bindings: binding_rows,
+            bounds: binding_bounds,
+            names: path_names,
+            use_args,
+        };
         let types = TypeColumns::<Frozen> {
             kind: self.ty_kind.into(),
             data: self.ty_data.into(),
             extra: self.ty_extra.into(),
+            // alloc: the decode's one copy of the column.
             lists: self.ty_lists.iter().map(|&ty| idx(ty)).collect(),
             bounds: bounds.into(),
-            paths: type_paths.into(),
+            paths,
             refs: refs.into(),
             arrays: arrays.into(),
             fns: fns.into(),
@@ -1199,14 +1232,7 @@ impl<'a> ExpressionStoreRef<'a> {
         let (exprs, pats) = (self.expr_kind.len(), self.pat_kind.len());
         (types.check(exprs, pats, lifetimes.len()))
             .map_err(|what| FormatError::Invalid { at: at_of(self.root, buffer), what })?;
-        let ids = Ids {
-            exprs: exprs as u32,
-            pats: pats as u32,
-            lifetimes: lifetimes.len() as u32,
-            types: &types,
-        };
-        (ids.type_paths())
-            .map_err(|what| FormatError::Invalid { at: at_of(&self.root.words, buffer), what })?;
+        let ids = Ids { exprs: exprs as u32, pats: pats as u32, types: &types };
         (ids.side_tables(&side))
             .map_err(|what| FormatError::Invalid { at: at_of(&self.root.words, buffer), what })?;
         if !self.has_exprs() {
@@ -1235,52 +1261,77 @@ impl<'a> ExpressionStoreRef<'a> {
             |rec| Ok(RecordFieldPat { name: field_name(rec, buffer)?, pat: idx(rec.id) }),
             |field| ids.pat(field.pat),
         )?;
-        let expr_lists: Vec<ExprId> =
+        let mut expr_lists: Vec<ExprId> =
             decoded(self.expr_lists, buffer, |&word| Ok(idx(word)), |&expr| ids.expr(expr))?;
-        let pat_lists: Vec<PatId> =
+        let mut pat_lists: Vec<PatId> =
             decoded(self.pat_lists, buffer, |&word| Ok(idx(word)), |&pat| ids.pat(pat))?;
-        let type_lists: Vec<Option<TypeRefId>> =
+        let mut type_lists: Vec<Option<TypeRefId>> =
             decoded(self.type_lists, buffer, |&word| Ok(opt_idx(word)), |&ty| ids.ty_opt(ty))?;
-        let SideTables { names, paths, literals, generic_args, offset_ofs, asms, macro_defs } = side;
+        let SideTables { names, literals, offset_ofs, asms, mut macro_defs } = side;
+        // The `Copy` columns in one slab, in `HirColumns::freeze_into`'s order.
+        let mut layout = SlabLayout::default();
+        layout.add::<MacroDefId>(macro_defs.len());
+        layout.add::<Option<TypeRefId>>(type_lists.len());
+        layout.add::<u32>(self.expr_data.len());
+        layout.add::<u32>(self.pat_data.len());
+        layout.add::<u32>(self.extra.len());
+        layout.add::<u32>(self.stmt_data.len());
+        layout.add::<ExprId>(expr_lists.len());
+        layout.add::<PatId>(pat_lists.len());
+        layout.add::<u8>(self.expr_kind.len());
+        layout.add::<u8>(self.pat_kind.len());
+        layout.add::<u8>(self.stmt_kind.len());
+        let mut slab = SlabWriter::new(layout);
+        let macro_defs = slab.take(&mut macro_defs);
+        let type_lists = slab.take(&mut type_lists);
+        let expr_data = slab.copy(self.expr_data);
+        let pat_data = slab.copy(self.pat_data);
+        let extra = slab.copy(self.extra);
+        let stmt_data = slab.copy(self.stmt_data);
+        let expr_lists = slab.take(&mut expr_lists);
+        let pat_lists = slab.take(&mut pat_lists);
         let columns = HirColumns::<Frozen> {
-            expr_kind: self.expr_kind.into(),
-            expr_data: self.expr_data.into(),
-            pat_kind: self.pat_kind.into(),
-            pat_data: self.pat_data.into(),
-            extra: self.extra.into(),
-            expr_lists: expr_lists.into(),
-            pat_lists: pat_lists.into(),
-            stmt_kind: self.stmt_kind.into(),
-            stmt_data: self.stmt_data.into(),
+            expr_kind: slab.copy(self.expr_kind),
+            expr_data,
+            pat_kind: slab.copy(self.pat_kind),
+            pat_data,
+            extra,
+            expr_lists,
+            pat_lists,
+            stmt_kind: slab.copy(self.stmt_kind),
+            stmt_data,
             arms: arms.into(),
             record_fields: record_fields.into(),
             field_pats: field_pats.into(),
-            type_lists: type_lists.into(),
+            type_lists,
             names: names.into(),
-            paths: paths.into(),
             literals: literals.into(),
-            generic_args: generic_args.into(),
             offset_ofs: offset_ofs.into(),
             asms: asms.into(),
-            macro_defs: macro_defs.into(),
+            macro_defs,
         };
-        (columns.check(bindings.len(), labels.len(), types.len()))
+        (columns.check(bindings.len(), labels.len(), types.len(), &types.paths))
             .map_err(|what| FormatError::Invalid { at: at_of(self.root, buffer), what })?;
 
         let expr_only = match self.has_exprs() {
             false => None,
+            // alloc: once per decoded store, as `finish` boxes it.
             true => Some(Box::new(ExpressionOnlyStore {
                 columns,
                 bindings,
                 labels,
                 binding_owners: self.binding_owners.into(),
+                // alloc: the decode's one copy of the column.
                 block_scopes: self.block_scopes().collect(),
                 ident_hygiene: (self.ident_hygiene.iter())
                     .map(|pair| (packed_of(pair.a), hygiene_of(pair.b)))
+                    // alloc: the decode's one copy of the column.
                     .collect(),
                 block_editions: (self.block_editions.iter())
                     .filter_map(|pair| Some((idx(pair.a), edition_of(pair.b)?)))
+                    // alloc: the decode's one copy of the column.
                     .collect(),
+                // alloc: the decode's one copy of the column.
                 overflow_inheriting: self.overflow_inheriting.iter().map(|&it| idx(it)).collect(),
                 expr_roots: (self.expr_roots.iter())
                     .map(|root| ExprRoot {
@@ -1293,6 +1344,7 @@ impl<'a> ExpressionStoreRef<'a> {
             })),
         };
         let type_hygiene = (self.root.flags & HAS_TYPE_HYGIENE != 0).then(|| {
+            // alloc: the decode's one copy of the column.
             (self.type_hygiene.iter()).map(|pair| (idx(pair.a), hygiene_of(pair.b))).collect()
         });
         Ok(ExpressionStore { expr_only, types, lifetimes, type_hygiene })
@@ -1310,7 +1362,7 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(4),
+        Part::U64(5),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1366,6 +1418,7 @@ impl<'a> BodyRef<'a> {
     pub fn decode(self) -> Result<Body, FormatError> {
         Ok(Body {
             store: self.store.decode()?,
+            // alloc: the decode's one copy of the column.
             params: self.params().collect(),
             self_param: self.self_param(),
         })
@@ -1382,7 +1435,7 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(4),
+        Part::U64(5),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -1390,10 +1443,11 @@ impl Persist for Body {
     fn write(&self, out: &mut Writer) -> u64 {
         let Body { store, params, self_param } = self;
         let columns = StoreColumns::write(store, out);
+        // alloc: the encode's one copy of the column, once per body.
         let params: Vec<IdPair> = params.iter().map(param_pair).collect();
         let params = Column::push(out, &params);
-        let self_param: Vec<IdPair> = self_param.iter().map(param_pair).collect();
-        let self_param = Column::push(out, &self_param);
+        let self_param = self_param.as_ref().map(param_pair);
+        let self_param = Column::push(out, self_param.as_slice());
         let at = out.next::<BodyRoot>();
         let field = |offset: usize| at + offset as u64;
         let root = BodyRoot {
@@ -1515,11 +1569,6 @@ unit_codes! {
         1 => TraitBoundModifier::Maybe,
         2 => TraitBoundModifier::Const,
         3 => TraitBoundModifier::MaybeConst,
-    }
-    GenericArgsParentheses {
-        0 => GenericArgsParentheses::No,
-        1 => GenericArgsParentheses::ReturnTypeNotation,
-        2 => GenericArgsParentheses::ParenSugar,
     }
     BuiltinInt {
         0 => BuiltinInt::Isize,
@@ -1665,85 +1714,65 @@ impl Code for ConstRef {
     }
 }
 
-impl Code for Path {
+impl Code for GenericArgsRow {
     fn put(&self, w: &mut Words) {
-        match self {
-            Path::BarePath(path) => {
-                w.u32(0);
-                path.put(w);
-            }
-            Path::Normal(path) => {
-                w.u32(1);
-                path.put(w);
-            }
-            Path::LangItem(target, name) => {
-                w.u32(2);
-                target.put(w);
-                name.put(w);
-            }
-        }
+        let GenericArgsRow { args: [args_at, args_len], bindings: [bindings_at, bindings_len], flags } =
+            *self;
+        w.u32(args_at);
+        w.u32(args_len);
+        w.u32(bindings_at);
+        w.u32(bindings_len);
+        w.u32(flags);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(match r.tag(3, "a path kind out of range")? {
-            0 => Path::BarePath(r.get()?),
-            1 => Path::Normal(r.get()?),
-            _ => {
-                let target = r.get()?;
-                Path::LangItem(target, r.get()?)
-            }
+        Ok(GenericArgsRow {
+            args: [r.u32()?, r.u32()?],
+            bindings: [r.u32()?, r.u32()?],
+            flags: r.u32()?,
         })
     }
 }
 
-impl Code for NormalPath {
+impl Code for BindingRow {
     fn put(&self, w: &mut Words) {
-        let NormalPath { generic_args, type_anchor, mod_path } = self;
-        generic_args.put(w);
-        type_anchor.put(w);
-        mod_path.put(w);
+        let BindingRow { name, args, type_ref, bounds: [bounds_at, bounds_len] } = *self;
+        w.u32(name);
+        w.u32(args);
+        w.u32(type_ref);
+        w.u32(bounds_at);
+        w.u32(bounds_len);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(NormalPath { generic_args: r.get()?, type_anchor: r.get()?, mod_path: r.get()? })
-    }
-}
-
-impl Code for GenericArgs {
-    fn put(&self, w: &mut Words) {
-        let GenericArgs { args, has_self_type, bindings, parenthesized } = self;
-        args.put(w);
-        has_self_type.put(w);
-        bindings.put(w);
-        parenthesized.put(w);
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(GenericArgs {
-            args: r.get()?,
-            has_self_type: r.get()?,
-            bindings: r.get()?,
-            parenthesized: r.get()?,
+        Ok(BindingRow {
+            name: r.u32()?,
+            args: r.u32()?,
+            type_ref: r.u32()?,
+            bounds: [r.u32()?, r.u32()?],
         })
     }
 }
 
-impl Code for AssociatedTypeBinding {
+impl Code for Names {
     fn put(&self, w: &mut Words) {
-        let AssociatedTypeBinding { name, args, type_ref, bounds } = self;
-        name.put(w);
-        args.put(w);
-        type_ref.put(w);
-        bounds.put(w);
+        w.u32(self.start);
+        w.u32(self.len);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        Ok(AssociatedTypeBinding {
-            name: r.get()?,
-            args: r.get()?,
-            type_ref: r.get()?,
-            bounds: r.get()?,
-        })
+        Ok(Names { start: r.u32()?, len: r.u32()? })
+    }
+}
+
+impl Code for UseArgs {
+    fn put(&self, w: &mut Words) {
+        w.u32(self.start);
+        w.u32(self.len);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        Ok(UseArgs { start: r.u32()?, len: r.u32()? })
     }
 }
 
@@ -1848,7 +1877,7 @@ impl Code for FnType {
 
 impl Code for FloatTypeWrapper {
     fn put(&self, w: &mut Words) {
-        w.str(&self.to_string());
+        w.str(self.as_str());
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
@@ -2254,7 +2283,7 @@ mod tests {
         hir::{Expr, Pat},
         nameres::crate_def_map,
         signatures::FunctionSignature,
-        test_db::TestDB,
+        test_db::{TestDB, TestDBExt},
         type_ref::TypeRef,
     };
 
@@ -2346,6 +2375,7 @@ mod tests {
         assert_eq!(read.bindings_len(), store.bindings().count());
         assert_eq!(read.labels_len(), store.expr_only.as_ref().map_or(0, |it| it.labels.len()));
         assert_eq!(read.types_len(), store.types.len());
+        assert_eq!(read.paths_len(), store.types.paths.len());
         assert_eq!(read.lifetimes_len(), store.lifetimes.len());
         for (id, expr) in store.exprs() {
             assert_eq!(read.expr_kind(id), Some(expr_kind_of(expr)), "{expr:?}");
@@ -2731,5 +2761,42 @@ fn f() -> u32 {
         let past = with_word(&bytes, element, read.types_len() as u32);
         let past = ExpressionStore::read(&past).expect("only `ty_lists` changed");
         assert!(past.decode().is_err(), "a tuple element past the types");
+    }
+
+    #[test]
+    fn a_corrupted_path_column_is_refused() {
+        let (db, defs) = bodies("fn f(a: Option<u32>) -> Option<u32> { a }");
+        let DefWithBodyId::FunctionId(function) = defs[0] else { panic!("`f` is a function") };
+        let (signature, _) = FunctionSignature::with_source_map(&db, function);
+        let store: &ExpressionStore = &signature.store;
+        let bytes = blaze_format::to_bytes(store);
+        let buffer = Aligned::copy_from(&bytes);
+        let read = ExpressionStore::read(&buffer).expect("a store just written");
+        let paths = read.paths_len() as u32;
+        assert!(paths > 0);
+
+        let mut bad = bytes.clone();
+        bad[offset_in(read.path_kind, &buffer)] = PathTag::ALL.len() as u8;
+        assert!(ExpressionStore::read(&Aligned::copy_from(&bad)).is_err(), "a path kind out of range");
+
+        let data_len = at_of(&read.root.path_data, &buffer) as usize + offset_of!(Slice<u32>, len);
+        let short = with_word(&bytes, data_len, paths - 1);
+        assert!(ExpressionStore::read(&short).is_err(), "a path data column of fewer words than paths");
+
+        let slot = (read.path_slots.iter().position(|&word| word != 0))
+            .expect("`Option<u32>`'s segment has arguments");
+        let slot_at = offset_in(read.path_slots, &buffer) + slot * size_of::<u32>();
+        let rows = store.types.paths.generic_args.len() as u32;
+        let past = with_word(&bytes, slot_at, rows + 1);
+        let past = ExpressionStore::read(&past).expect("only a slot changed");
+        assert!(past.decode().is_err(), "a slot naming generic arguments past their rows");
+
+        let bare = (store.types.paths.kind.iter())
+            .position(|&kind| kind == PathTag::Bare as u8)
+            .expect("`u32` is a bare path");
+        let data_at = offset_in(read.path_data, &buffer) + bare * size_of::<u32>();
+        let past = with_word(&bytes, data_at, store.types.paths.mod_paths.len() as u32);
+        let past = ExpressionStore::read(&past).expect("only a path's data word changed");
+        assert!(past.decode().is_err(), "a bare path's mod path past its table");
     }
 }

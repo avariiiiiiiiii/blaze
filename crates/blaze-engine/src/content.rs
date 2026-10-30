@@ -10,10 +10,7 @@ use std::{
 };
 
 use hir_ty_codegen::{CARGO_HOME, ContentId, LibrarySources, moved};
-use ide_db::{
-    RootDatabase,
-    base_db::{Crate, SourceDatabase as _},
-};
+use ide_db::{RootDatabase, base_db::Crate};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 use triomphe::Arc;

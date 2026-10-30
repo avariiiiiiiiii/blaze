@@ -19,6 +19,7 @@
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
 
+pub mod leb;
 mod raw;
 mod schema;
 pub mod tiers;
@@ -297,7 +298,7 @@ fn target<T>(field_at: u64, offset: i32, count: u32, buffer: &[u8]) -> Result<us
         return Err(bad);
     }
     let target = target as u64;
-    let len = (size_of::<T>() as u64).checked_mul(count as u64).ok_or(bad.clone())?;
+    let len = (size_of::<T>() as u64).checked_mul(count as u64).ok_or(FormatError::OutOfBounds { at: field_at })?;
     if target.checked_add(len).is_none_or(|end| end > field_at) {
         return Err(bad);
     }
@@ -772,6 +773,7 @@ pub struct Aligned {
 
 impl Aligned {
     pub fn copy_from(bytes: &[u8]) -> Aligned {
+        // alloc: an aligned copy of bytes that came unaligned, once a buffer opened from them
         let mut blocks = vec![Block([0; ALIGN]); bytes.len().div_ceil(ALIGN)];
         for (block, chunk) in blocks.iter_mut().zip(bytes.chunks(ALIGN)) {
             block.0[..chunk.len()].copy_from_slice(chunk);
@@ -852,6 +854,7 @@ pub struct Spans {
 
 impl Spans {
     pub fn new(anchor: ContentId) -> Spans {
+        // alloc: `Vec::new` allocates nothing until a span is pushed
         Spans { anchor, spans: Vec::new() }
     }
 
@@ -893,6 +896,7 @@ impl SpansRef<'_> {
     }
 
     pub fn to_spans(&self) -> Spans {
+        // alloc: an owned copy, asked for by name
         Spans { anchor: self.anchor, spans: self.spans.to_vec() }
     }
 }

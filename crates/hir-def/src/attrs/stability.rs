@@ -15,7 +15,7 @@
 
 use std::{num::NonZero, ops::ControlFlow, sync::LazyLock};
 
-use base_db::{Crate, CrateOrigin, SourceDatabase};
+use base_db::{Db, Crate, CrateOrigin};
 use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
@@ -66,7 +66,7 @@ impl RustcVersion {
     /// `RustcVersion::CURRENT` for `krate`: the release of the rustc its graph is built as
     /// (`CrateWorkspaceData::toolchain`, `1.101.0` for `1.101.0-nightly`). None for a graph
     /// that names no toolchain.
-    pub fn current(db: &dyn SourceDatabase, krate: Crate) -> Option<RustcVersion> {
+    pub fn current(db: &Db, krate: Crate) -> Option<RustcVersion> {
         let version = krate.workspace_data(db).toolchain.as_ref()?;
         Some(RustcVersion {
             major: u16::try_from(version.major).ok()?,
@@ -208,7 +208,7 @@ static FORCE_UNSTABLE: LazyLock<Stability> = LazyLock::new(|| Stability {
 /// it is in. rustc's `inherit_deprecation` holds for every definition here (only generic
 /// parameters don't inherit).
 pub fn deprecation_entry(
-    db: &dyn SourceDatabase,
+    db: &Db,
     def: StabilityDef,
 ) -> Option<DeprecationEntry<'_>> {
     let origin = deprecation_from(db, def)?;
@@ -219,14 +219,14 @@ pub fn deprecation_entry(
 /// `#[unstable]`, else the one of the definition it is in when that is unstable or `def`
 /// is a field or a variant (`inherit_stability`). A crate without `staged_api` has none,
 /// unless it is built with `-Zforce-unstable-if-unmarked`.
-pub fn stability(db: &dyn SourceDatabase, def: StabilityDef) -> Option<&Stability> {
+pub fn stability(db: &Db, def: StabilityDef) -> Option<&Stability> {
     match stability_from(db, def)? {
         StabilityFrom::Own(origin) => own(db, origin)?.stability.as_ref(),
         StabilityFrom::ForceUnstable => Some(&FORCE_UNSTABLE),
     }
 }
 
-fn deprecation_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<StabilityDef> {
+fn deprecation_from(db: &Db, def: StabilityDef) -> Option<StabilityDef> {
     return match def {
         StabilityDef::Def(def) => deprecation_origin(db, def),
         StabilityDef::Field(field) => {
@@ -235,12 +235,12 @@ fn deprecation_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<Stabil
     };
 
     #[salsa::tracked(returns(copy))]
-    fn deprecation_origin(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityDef> {
+    fn deprecation_origin(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
         deprecation_or_parent(db, def.into(), || parent(db, def))
     }
 
     fn deprecation_or_parent(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: StabilityDef,
         parent: impl FnOnce() -> Option<StabilityDef>,
     ) -> Option<StabilityDef> {
@@ -259,7 +259,7 @@ enum StabilityFrom {
     ForceUnstable,
 }
 
-fn stability_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<StabilityFrom> {
+fn stability_from(db: &Db, def: StabilityDef) -> Option<StabilityFrom> {
     return match def {
         StabilityDef::Def(def) => stability_origin(db, def),
         StabilityDef::Field(field) => {
@@ -269,13 +269,13 @@ fn stability_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<Stabilit
     };
 
     #[salsa::tracked(returns(copy))]
-    fn stability_origin(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityFrom> {
+    fn stability_origin(db: &Db, def: AttrDefId) -> Option<StabilityFrom> {
         let inherits = matches!(def, AttrDefId::EnumVariantId(_));
         stability_or_parent(db, def.into(), def.krate(db), || parent(db, def), inherits)
     }
 
     fn stability_or_parent(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: StabilityDef,
         krate: Crate,
         parent: impl FnOnce() -> Option<StabilityDef>,
@@ -304,7 +304,7 @@ fn stability_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<Stabilit
 /// it to every unit of the standard library's graph, the crates load-cargo gives a
 /// `CrateOrigin::Lang` origin, and blaze refuses it anywhere else (`blaze-cargo`'s
 /// `unstable.rs`).
-fn forces_unstable(db: &dyn SourceDatabase, krate: Crate) -> bool {
+fn forces_unstable(db: &Db, krate: Crate) -> bool {
     matches!(krate.data(db).origin, CrateOrigin::Lang(_))
 }
 
@@ -318,7 +318,7 @@ struct Own {
 const NONE: &Own = &Own { deprecation: None, stability: None };
 
 /// The own attributes of `def`, parsed only when its flags say it has one of them.
-fn own(db: &dyn SourceDatabase, def: StabilityDef) -> Option<&Own> {
+fn own(db: &Db, def: StabilityDef) -> Option<&Own> {
     const READ: AttrFlags =
         AttrFlags::IS_DEPRECATED.union(AttrFlags::IS_STABLE).union(AttrFlags::IS_UNSTABLE);
     let own = match def {
@@ -339,7 +339,7 @@ fn own(db: &dyn SourceDatabase, def: StabilityDef) -> Option<&Own> {
 }
 
 #[salsa::tracked(returns(ref))]
-fn own_of_def(db: &dyn SourceDatabase, def: AttrDefId) -> Own {
+fn own_of_def(db: &Db, def: AttrDefId) -> Own {
     let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, def);
     let context = Context::of(db, krate);
     let mut reader = Reader::default();
@@ -352,7 +352,7 @@ fn own_of_def(db: &dyn SourceDatabase, def: AttrDefId) -> Own {
 
 /// The own attributes of each field of `variant` its cfg leaves in, by `LocalFieldId`.
 #[salsa::tracked(returns(ref))]
-fn own_of_fields(db: &dyn SourceDatabase, variant: VariantId) -> Box<[Own]> {
+fn own_of_fields(db: &Db, variant: VariantId) -> Box<[Own]> {
     let krate = variant.krate(db);
     let context = Context::of(db, krate);
     let mut fields = Vec::new();
@@ -381,7 +381,7 @@ struct Context {
 }
 
 impl Context {
-    fn of(db: &dyn SourceDatabase, krate: Crate) -> Context {
+    fn of(db: &Db, krate: Crate) -> Context {
         Context {
             staged: UnstableFeatures::query(db, krate).staged_api,
             current: RustcVersion::current(db, krate),
@@ -622,7 +622,7 @@ fn is_ident(text: &str) -> bool {
 /// The definition `def` is in, as rustc's def path has it (`opt_local_parent`): an item's
 /// module, impl, trait or extern block, a variant's enum, a module's parent; none for a crate
 /// root. A block's items are in the definition the block is written in.
-fn parent(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityDef> {
+fn parent(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
     let container = match def {
         AttrDefId::ModuleId(module) => {
             let def_map = module.def_map(db);
@@ -658,7 +658,7 @@ fn parent(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityDef> {
 
 /// The definition an item declared in `module` is in: the module, or for a block's own
 /// module, which rustc has no definition for, the definition the block is written in.
-fn in_module(db: &dyn SourceDatabase, module: ModuleId) -> Option<StabilityDef> {
+fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
     let def_map = module.def_map(db);
     match def_map.block_id() {
         Some(block) if def_map.module(db, module).parent.is_none() => Some(block_owner(db, block)),
@@ -671,7 +671,7 @@ fn in_module(db: &dyn SourceDatabase, module: ModuleId) -> Option<StabilityDef> 
 /// exists only for a block a definition's syntax holds, so there is always one; not finding
 /// it is a bug of the def maps, and stops.
 #[salsa::tracked(returns(copy))]
-fn block_owner<'db>(db: &'db dyn SourceDatabase, block: BlockIdLt<'db>) -> StabilityDef {
+fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
     let module = block.module(db);
     InFile::new(ast_id.file_id, ast_id.to_node(db).syntax().clone())
@@ -703,7 +703,7 @@ fn is_definition(kind: SyntaxKind) -> bool {
 
 /// The definition declared in `module` (or in an impl or trait of it) whose syntax `node` is.
 fn definition_at(
-    db: &dyn SourceDatabase,
+    db: &Db,
     module: ModuleIdLt<'_>,
     node: &InFile<SyntaxNode>,
 ) -> Option<StabilityDef> {

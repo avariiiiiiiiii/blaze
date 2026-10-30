@@ -145,15 +145,26 @@ struct Failed {
     code: Option<i32>,
 }
 
-/// `test` or `bench` once the build placed `artifacts`: cargo's exit code.
-pub fn run(asked: &Invocation, artifacts: &[Artifact], speaking: Speaking<'_>, err: &mut dyn Write, programs: &mut dyn Programs) -> io::Result<i32> {
+/// cargo's `Packages::needs_spec_flag`: whether "to rerun pass" names the package. `members` is
+/// the workspace's member count, which stands for cargo's default members too.
+pub fn needs_spec_flag(asked: &Invocation, members: u32) -> bool {
+    !asked.flags.packages.is_empty() || !asked.flags.excludes.is_empty() || members > 1
+}
+
+/// `test` or `bench` once the build placed `artifacts`, of a workspace of `members`: cargo's
+/// exit code.
+pub fn run(
+    asked: &Invocation,
+    artifacts: &[Artifact],
+    members: u32,
+    speaking: Speaking<'_>,
+    err: &mut dyn Write,
+    programs: &mut dyn Programs,
+) -> io::Result<i32> {
     let bench = asked.command() == Command::Bench;
     let unit_kind = if bench { Kind::Bench } else { Kind::Test };
     let (tests, docs) = executables(artifacts);
-    let mut packages: Vec<&str> = tests.iter().chain(&docs).filter(|it| it.package.starts_with("path+")).map(|it| it.package.as_str()).collect();
-    packages.sort_unstable();
-    packages.dedup();
-    let spec_flag = !asked.flags.packages.is_empty() || packages.len() > 1;
+    let spec_flag = needs_spec_flag(asked, members);
     if asked.flags.no_run {
         for test in &tests {
             let shown = match speaking.verbose {

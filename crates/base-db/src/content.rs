@@ -27,7 +27,9 @@ pub const CFG_OPTIONS_DOMAIN: &str = "blaze v2 cfg options 1";
 /// not matter.
 pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
     // Every atom encoded into one buffer, then sorted as byte strings.
+    // alloc: a crate's cfg, encoded when its content ID is made (setup).
     let mut bytes = Vec::new();
+    // alloc: as above.
     let mut atoms: Vec<Range<usize>> = Vec::new();
     for atom in cfg {
         let start = bytes.len();
@@ -44,7 +46,7 @@ pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
         }
         atoms.push(start..bytes.len());
     }
-    atoms.sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
+    atoms.sort_unstable_by(|a, b| bytes[a.start..a.end].cmp(&bytes[b.start..b.end]));
     let mut hasher = Hasher::new(CFG_OPTIONS_DOMAIN);
     len(&mut hasher, atoms.len());
     for atom in atoms {
@@ -60,6 +62,7 @@ fn frame(bytes: &mut Vec<u8>, part: &str) {
 
 /// A path as content: whether it is on disk (0) or virtual (1), then its text.
 pub(crate) fn path_key(path: &VfsPath) -> Vec<u8> {
+    // alloc: one key per path a source root gains (per changed file), or per crate (setup).
     let mut key = vec![if path.as_path().is_some() { 0 } else { 1 }];
     write!(key, "{path}").expect("writing to a Vec does not fail");
     key
@@ -91,8 +94,9 @@ pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
 /// domain's key derived once for all of them, and the inputs laid out in one buffer.
 pub(crate) fn hash_ranges(domain: &'static str, buf: &[u8], ranges: &[Range<usize>]) -> Vec<ContentId> {
     if ranges.is_empty() {
-        return Vec::new();
+        return Vec::new(); // alloc: none, an empty `Vec`.
     }
-    let inputs: Vec<&[u8]> = ranges.iter().map(|range| &buf[range.clone()]).collect();
+    // alloc: one list per batch, beside the batch's IDs `of_many` returns.
+    let inputs: Vec<&[u8]> = ranges.iter().map(|range| &buf[range.start..range.end]).collect();
     ContentId::of_many(domain, &inputs)
 }

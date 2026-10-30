@@ -15,6 +15,7 @@
 
 mod unused;
 
+use base_db::Db;
 pub use unused::adt_unused_params;
 
 use hir_def::{
@@ -23,6 +24,7 @@ use hir_def::{
 };
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::{TypeFlags, TypeVisitableExt as _, Variance, inherent::IntoKind};
+use smallvec::{SmallVec, smallvec};
 use stdx::never;
 
 use crate::{
@@ -35,7 +37,7 @@ use crate::{
     },
 };
 
-pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> VariancesOf<'_> {
+pub(crate) fn variances_of(db: &Db, def: GenericDefId) -> VariancesOf<'_> {
     variances_of_query(db, def).as_ref()
 }
 
@@ -44,7 +46,7 @@ pub(crate) fn variances_of(db: &dyn HirDatabase, def: GenericDefId) -> Variances
     cycle_fn = crate::variance::variances_of_cycle_fn,
     cycle_initial = crate::variance::variances_of_cycle_initial,
 )]
-fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariancesOf {
+fn variances_of_query(db: &Db, def: GenericDefId) -> StoredVariancesOf {
     tracing::debug!("variances_of(def={:?})", def);
     match def {
         GenericDefId::FunctionId(_) => (),
@@ -70,8 +72,7 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
         return VariancesOf::empty().store();
     }
     let variances =
-        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db }
-            .solve();
+        Context { generics, variances: smallvec![Variance::Bivariant; count], db }.solve();
 
     VariancesOf::new_from_slice(&variances).store()
 }
@@ -81,12 +82,12 @@ fn variances_of_query(db: &dyn HirDatabase, def: GenericDefId) -> StoredVariance
 /// `fn(fields..) -> Adt<..>`, not from the ADT's. A parameter its fields use appears both as an
 /// argument and in the result, so it is invariant (`SomeStruct::<&'static u32>` can't be called
 /// with a shorter borrow); one only another variant uses keeps the ADT's variance.
-pub fn ctor_variances(db: &dyn HirDatabase, ctor: VariantId) -> VariancesOf<'_> {
+pub fn ctor_variances(db: &Db, ctor: VariantId) -> VariancesOf<'_> {
     ctor_variances_query(db, ctor).as_ref()
 }
 
 #[salsa::tracked(returns(ref))]
-fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariancesOf {
+fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     let adt: GenericDefId = match ctor {
         VariantId::StructId(s) => AdtId::StructId(s).into(),
         VariantId::EnumVariantId(v) => AdtId::EnumId(v.loc(db).parent).into(),
@@ -97,8 +98,7 @@ fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariance
     if count == 0 {
         return VariancesOf::empty().store();
     }
-    let mut cx =
-        Context { generics, variances: vec![Variance::Bivariant; count].into_boxed_slice(), db };
+    let mut cx = Context { generics, variances: smallvec![Variance::Bivariant; count], db };
     let callable = match ctor {
         VariantId::StructId(s) => CallableDefId::StructId(s),
         VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
@@ -116,7 +116,7 @@ fn ctor_variances_query(db: &dyn HirDatabase, ctor: VariantId) -> StoredVariance
 }
 
 pub(crate) fn variances_of_cycle_fn(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     _: &salsa::Cycle<'_>,
     _last_provisional_value: &StoredVariancesOf,
     value: StoredVariancesOf,
@@ -146,7 +146,7 @@ fn glb(v1: Variance, v2: Variance) -> Variance {
 }
 
 pub(crate) fn variances_of_cycle_initial(
-    db: &dyn HirDatabase,
+    db: &Db,
     _: salsa::Id,
     def: GenericDefId,
 ) -> StoredVariancesOf {
@@ -156,14 +156,18 @@ pub(crate) fn variances_of_cycle_initial(
     VariancesOf::new_from_iter(std::iter::repeat_n(Variance::Bivariant, count)).store()
 }
 
+/// An item's variances while they are worked out: one byte a parameter, on the stack for up
+/// to 16.
+type Variances = SmallVec<[Variance; 16]>;
+
 struct Context<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     generics: Generics<'db>,
-    variances: Box<[Variance]>,
+    variances: Variances,
 }
 
 impl<'db> Context<'db> {
-    fn solve(mut self) -> Box<[Variance]> {
+    fn solve(mut self) -> Variances {
         tracing::debug!("solve(generics={:?})", self.generics);
         match self.generics.def() {
             GenericDefId::AdtId(adt) => {

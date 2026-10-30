@@ -1,54 +1,62 @@
-//! The daemon image: every memo of the database in one file, mapped at start and read in
-//! place, so a start is an mmap that pages in only what it touches (docs/v2/plan/lanes/db.md section 7).
+//! The database's part of the daemon image (docs/v2/plan/design/restore.md): five sections of
+//! `blaze-image`'s file, read where they are mapped, so a start is an mmap that pages in only
+//! what it touches (docs/v2/plan/lanes/db.md section 7).
 //!
-//! Layout, little-endian, every section at a 16-byte boundary:
+//! Each section is the database's alone, with a schema of its own; little-endian:
 //!
-//! - a header as `blaze_format::Header` lays it out: `MAGIC`, the image's [`SchemaHash`], the
-//!   file's length, where the root is;
-//! - the root: ten `u64`s naming the sections (memos, edges, table, inputs, blob: where and how
-//!   many);
-//! - memos, [`MEMO_RECORD`] bytes each, sorted by key, a key's memos in a row;
-//! - edges, [`EDGE_RECORD`] bytes each ([`EdgeRecord`]'s layout, so read in place), a memo's
-//!   in the order they were read;
-//! - an open-addressed table of `u64`s, a power of two of them: 1 + the index of a key's first
-//!   memo, 0 for empty, probed linearly from the key's slot;
-//! - inputs, [`INPUT_RECORD`] bytes each: an input key and the path it names;
-//! - the blob: values (each at a 16-byte boundary, read in place), keys' bytes, paths.
+//! - **memos** ([`SectionId::DB_MEMOS`]): [`MEMO_RECORD`] bytes each, sorted by key, a key's
+//!   memos in a row;
+//! - **edges** ([`SectionId::DB_EDGES`]): [`EDGE_RECORD`] bytes each ([`EdgeRecord`]'s layout,
+//!   so read in place), a memo's in the order they were read;
+//! - **table** ([`SectionId::DB_TABLE`]): an open-addressed table of `u64`s, a power of two of
+//!   them: 1 + the index of a key's first memo, 0 for empty, probed linearly from the key's
+//!   slot;
+//! - **inputs** ([`SectionId::DB_INPUTS`]): [`INPUT_RECORD`] bytes each: an input key and the
+//!   path it names;
+//! - **blob** ([`SectionId::DB_BLOB`]): values (each at a 16-byte boundary, read in place),
+//!   keys' bytes, paths. Records name offsets into it.
 //!
-//! The header, root, section bounds and the edge section's alignment are checked when the
-//! image is opened; each record is checked when it is first read, so a start reads nothing it
-//! does not use.
+//! Opening reads no byte of them: it finds the five in the spine `blaze-image` checked and
+//! checks their lengths. Each group of a section is checked by its CRC32C the first time a read
+//! reaches it. A group that fails is [`Corrupt`]: the keys whose memos it held have no image
+//! memo (they are computed again, and their dependents verify against the new fingerprint as
+//! after any miss), and it is noted once for the daemon to report. Bytes that pass their CRC
+//! but are not what [`write`] writes (a table slot past the memos, edges past the edge section)
+//! are a bug in [`write`], and stop the database naming it.
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use blaze_core::Mapping;
-use blaze_format::{FormatError, MAGIC, SchemaHash};
+use blaze_format::{SchemaHash, schema};
 use blaze_ids::{ContentId, Fingerprint};
+use blaze_image::{Builder, Cause, Corrupt, Image, Section, SectionId};
 use blaze_reclaim::Guard;
 
 use crate::{
-    Input, QueryKey, QueryKind, kinds,
+    DbError, Input, QueryKey, QueryKind, kinds,
     memo::{MemoId, Store},
-    table::{EDGE_RECORD, EdgeRecord},
+    table::{EDGE_RECORD, EdgeRecord, FxSet, ShortLock},
 };
 
 pub(crate) const MEMO_RECORD: usize = 192;
 pub(crate) const INPUT_RECORD: usize = 64;
-const HEADER: usize = 56;
-const ROOT_AT: usize = 64;
-const ROOT: usize = 80;
 const EVICTED: u64 = u64::MAX;
 
-const LAYOUT: &str = "header(magic 8, schema 32, len 8, root 8) pad 64; \
-root(memos at, memos, edges at, edges, table at, table len, inputs at, inputs, blob at, blob len: u64); \
-memo(kind u16, pad 6, input 32, fingerprint 16, schema 32, producer 32, value id 32, \
-edges from u32, edges u32, value at u64, value len u64 or max, key at u64, key len u64) 192; \
-edge(kind u16, pad 6, input 32, saw 16) 56; table u64 1+memo; \
-input(kind u16, pad 6, input 32, what u8, pad 7, path at u64, path len u64) 64; blob";
-
-pub(crate) fn schema() -> SchemaHash {
-    SchemaHash(ContentId::of("blaze v2 db image 1", LAYOUT.as_bytes()))
-}
+pub(crate) const MEMOS: SchemaHash = schema(
+    "blaze v2 db memos 2: memo(kind u16, pad 6, input 32, fingerprint 16, schema 32, producer 32, \
+     value id 32, edges from u32, edges u32, value at u64 in blob, value len u64 or max, \
+     key at u64 in blob, key len u64) 192; sorted by key, a key's memos in a row",
+);
+pub(crate) const EDGES: SchemaHash =
+    schema("blaze v2 db edges 2: edge(kind u16, pad 6, input 32, saw 16) 56; a memo's in the order read");
+pub(crate) const TABLE: SchemaHash =
+    schema("blaze v2 db table 2: u64 1 + a key's first memo or 0; a power of two, probed linearly");
+pub(crate) const INPUTS: SchemaHash = schema(
+    "blaze v2 db inputs 2: input(kind u16, pad 6, input 32, what u8, pad 7, path at u64 in blob, \
+     path len u64) 64; sorted by key",
+);
+pub(crate) const BLOB: SchemaHash =
+    schema("blaze v2 db blob 2: values at 16-byte boundaries, keys' bytes, paths");
 
 /// What one key contributes to an image: its memos are `memos` of the [`Entries`] it is in.
 pub(crate) struct Entry<'g> {
@@ -64,12 +72,6 @@ pub(crate) struct Entries<'g> {
     pub(crate) memos: Vec<MemoId>,
 }
 
-fn pad(out: &mut Vec<u8>, to: usize) {
-    while out.len() % to != 0 {
-        out.push(0);
-    }
-}
-
 fn slot_of(key: &QueryKey, mask: usize) -> usize {
     let mut low = [0; 8];
     low.copy_from_slice(&key.input.0[..8]);
@@ -77,149 +79,155 @@ fn slot_of(key: &QueryKey, mask: usize) -> usize {
     (mixed as usize) & mask
 }
 
-fn put_key(out: &mut Vec<u8>, key: &QueryKey) {
-    out.extend_from_slice(&key.kind.0.to_le_bytes());
-    out.extend_from_slice(&[0; 6]);
-    out.extend_from_slice(&key.input.0);
+fn put_key(record: &mut [u8], key: &QueryKey) {
+    record[..2].copy_from_slice(&key.kind.0.to_le_bytes());
+    record[8..40].copy_from_slice(&key.input.0);
 }
 
-/// The image of `entries` (sorted by key, each key's memos in a fixed order) and `inputs`.
-pub(crate) fn write(task: &Guard, store: &Store, all: &Entries<'_>, inputs: &[(QueryKey, Input)]) -> Vec<u8> {
-    let entries = &all.keys;
-    let memo_count = all.memos.len();
-    let edge_count: usize = all.memos.iter().map(|&memo| store.edges(task, memo).len()).sum();
-    let codes = store.codes();
-    let table_len = (entries.len() * 2).next_power_of_two().max(2);
+fn put_u64(record: &mut [u8], at: usize, word: u64) {
+    record[at..at + 8].copy_from_slice(&word.to_le_bytes());
+}
 
-    let memos_at = ROOT_AT + ROOT;
-    let edges_at = memos_at + memo_count * MEMO_RECORD;
-    let table_at = (edges_at + edge_count * EDGE_RECORD).next_multiple_of(16);
-    let inputs_at = table_at + table_len * 8;
-    let blob_at = (inputs_at + inputs.len() * INPUT_RECORD).next_multiple_of(16);
+fn path_of(input: &Input) -> (u8, &str) {
+    match input {
+        Input::File(path) => (0, path.as_str()),
+        Input::Dir(path) => (1, path.as_str()),
+        Input::Config => (2, ""),
+    }
+}
 
-    let mut blob = Vec::new();
-    let mut memos = Vec::with_capacity(memo_count * MEMO_RECORD);
-    let mut edges = Vec::with_capacity(edge_count * EDGE_RECORD);
-    let mut table = vec![0u64; table_len];
-    let mut first_edge = 0u32;
-    let mut index = 0u64;
-    for entry in entries {
-        let (key_at, key_len) = match entry.key_bytes {
-            Some(bytes) => {
-                let at = blob_at + blob.len();
-                blob.extend_from_slice(bytes);
-                (at as u64, bytes.len() as u64)
+/// Where one memo's value went in the blob: at, length (or [`EVICTED`]), content ID.
+struct Placed {
+    at: u64,
+    len: u64,
+    id: ContentId,
+}
+
+/// Writes the database's five sections of `entries` (sorted by key, each key's memos in a fixed
+/// order) and `inputs` into `builder`, calling `symbols(key, value)` on each value written so
+/// the caller can mark the symbols it names.
+pub(crate) fn write(
+    task: &Guard,
+    store: &Store,
+    all: &Entries<'_>,
+    inputs: &[(QueryKey, Input)],
+    builder: &mut Builder,
+    mut symbols: impl FnMut(QueryKey, &[u8]),
+) {
+    // The blob first: where each value, key and path went is what the records hold. What a
+    // value is (in memory, evicted) is read once, here, so the records agree with the blob
+    // even if another thread evicts it meanwhile.
+    // alloc: once per image, as are the lists below.
+    let mut values: Vec<Placed> = Vec::with_capacity(all.memos.len());
+    let mut keys: Vec<(u64, u64)> = Vec::with_capacity(all.keys.len());
+    let mut paths: Vec<u64> = Vec::with_capacity(inputs.len());
+    {
+        let mut blob = builder.section(SectionId::DB_BLOB, BLOB);
+        for entry in &all.keys {
+            keys.push(entry.key_bytes.map_or((0, 0), |bytes| (blob.bytes(bytes), bytes.len() as u64)));
+            for &memo in &all.memos[entry.memos.start..entry.memos.end] {
+                values.push(match store.bytes(task, memo) {
+                    Some(bytes) => {
+                        symbols(entry.key, bytes);
+                        blob.align(16);
+                        Placed { at: blob.bytes(bytes), len: bytes.len() as u64, id: crate::value_id(bytes) }
+                    }
+                    None => Placed { at: 0, len: EVICTED, id: ContentId::default() },
+                });
             }
-            None => (0, 0),
-        };
-        if !entry.memos.is_empty() {
-            let mask = table_len - 1;
+        }
+        for (_, input) in inputs {
+            paths.push(blob.bytes(path_of(input).1.as_bytes()));
+        }
+    }
+
+    let codes = store.codes();
+    {
+        let mut out = builder.section(SectionId::DB_MEMOS, MEMOS);
+        let mut first_edge = 0u32;
+        let mut index = 0;
+        for (entry, &(key_at, key_len)) in all.keys.iter().zip(&keys) {
+            for &memo in &all.memos[entry.memos.start..entry.memos.end] {
+                let hot = store.hot(task, memo);
+                let (schema, producer) = codes[hot.code() as usize];
+                let edges = u32::try_from(store.edges(task, memo).len()).expect("2^32 edges of one memo");
+                let value = &values[index];
+                let mut record = [0u8; MEMO_RECORD];
+                put_key(&mut record, &entry.key);
+                record[40..56].copy_from_slice(&hot.fingerprint().0.to_le_bytes());
+                record[56..88].copy_from_slice(&schema.0.0);
+                record[88..120].copy_from_slice(&producer.0);
+                record[120..152].copy_from_slice(&value.id.0);
+                record[152..156].copy_from_slice(&first_edge.to_le_bytes());
+                record[156..160].copy_from_slice(&edges.to_le_bytes());
+                put_u64(&mut record, 160, value.at);
+                put_u64(&mut record, 168, value.len);
+                put_u64(&mut record, 176, key_at);
+                put_u64(&mut record, 184, key_len);
+                out.bytes(&record);
+                first_edge = first_edge.checked_add(edges).expect("2^32 edges in one image");
+                index += 1;
+            }
+        }
+    }
+
+    {
+        let mut out = builder.section(SectionId::DB_EDGES, EDGES);
+        for &memo in &all.memos {
+            out.bytes(EdgeRecord::as_bytes(store.edges(task, memo)));
+        }
+    }
+
+    {
+        let table_len = (all.keys.len() * 2).next_power_of_two().max(2);
+        let mask = table_len - 1;
+        let mut table = vec![0u64; table_len]; // alloc: see `values`
+        for entry in all.keys.iter().filter(|entry| !entry.memos.is_empty()) {
             let mut slot = slot_of(&entry.key, mask);
             while table[slot] != 0 {
                 slot = (slot + 1) & mask;
             }
-            table[slot] = index + 1;
+            table[slot] = entry.memos.start as u64 + 1;
         }
-        for &memo in &all.memos[entry.memos.start..entry.memos.end] {
-            let hot = store.hot(task, memo);
-            let (schema, producer) = codes[hot.code() as usize];
-            let memo_edges = store.edges(task, memo);
-            put_key(&mut memos, &entry.key);
-            memos.extend_from_slice(&hot.fingerprint().0.to_le_bytes());
-            memos.extend_from_slice(&schema.0.0);
-            memos.extend_from_slice(&producer.0);
-            let (value_id, value_at, value_len) = match store.bytes(task, memo) {
-                Some(bytes) => {
-                    pad(&mut blob, 16);
-                    let at = blob_at + blob.len();
-                    blob.extend_from_slice(bytes);
-                    (crate::value_id(bytes), at as u64, bytes.len() as u64)
-                }
-                None => (ContentId::default(), 0, EVICTED),
-            };
-            memos.extend_from_slice(&value_id.0);
-            memos.extend_from_slice(&first_edge.to_le_bytes());
-            memos.extend_from_slice(&(memo_edges.len() as u32).to_le_bytes());
-            memos.extend_from_slice(&value_at.to_le_bytes());
-            memos.extend_from_slice(&value_len.to_le_bytes());
-            memos.extend_from_slice(&key_at.to_le_bytes());
-            memos.extend_from_slice(&key_len.to_le_bytes());
-            edges.extend_from_slice(EdgeRecord::as_bytes(memo_edges));
-            first_edge += memo_edges.len() as u32;
-            index += 1;
+        let mut out = builder.section(SectionId::DB_TABLE, TABLE);
+        for slot in table {
+            out.bytes(&slot.to_le_bytes());
         }
-    }
-    let mut input_records = Vec::with_capacity(inputs.len() * INPUT_RECORD);
-    for (key, input) in inputs {
-        let (what, path) = match input {
-            Input::File(path) => (0u8, path.as_str()),
-            Input::Dir(path) => (1, path.as_str()),
-            Input::Config => (2, ""),
-        };
-        let at = blob_at + blob.len();
-        blob.extend_from_slice(path.as_bytes());
-        put_key(&mut input_records, key);
-        input_records.push(what);
-        input_records.extend_from_slice(&[0; 7]);
-        input_records.extend_from_slice(&(at as u64).to_le_bytes());
-        input_records.extend_from_slice(&(path.len() as u64).to_le_bytes());
     }
 
-    let len = blob_at + blob.len();
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&schema().0.0);
-    out.extend_from_slice(&(len as u64).to_le_bytes());
-    out.extend_from_slice(&(ROOT_AT as u64).to_le_bytes());
-    debug_assert_eq!(out.len(), HEADER);
-    pad(&mut out, 16);
-    for word in [
-        memos_at,
-        memo_count,
-        edges_at,
-        edge_count,
-        table_at,
-        table_len,
-        inputs_at,
-        inputs.len(),
-        blob_at,
-        blob.len(),
-    ] {
-        out.extend_from_slice(&(word as u64).to_le_bytes());
+    let mut out = builder.section(SectionId::DB_INPUTS, INPUTS);
+    for ((key, input), &path_at) in inputs.iter().zip(&paths) {
+        let (what, path) = path_of(input);
+        let mut record = [0u8; INPUT_RECORD];
+        put_key(&mut record, key);
+        record[40] = what;
+        put_u64(&mut record, 48, path_at);
+        put_u64(&mut record, 56, path.len() as u64);
+        out.bytes(&record);
     }
-    debug_assert_eq!(out.len(), memos_at);
-    out.extend_from_slice(&memos);
-    out.extend_from_slice(&edges);
-    pad(&mut out, 16);
-    debug_assert_eq!(out.len(), table_at);
-    for slot in table {
-        out.extend_from_slice(&slot.to_le_bytes());
-    }
-    out.extend_from_slice(&input_records);
-    pad(&mut out, 16);
-    debug_assert_eq!(out.len(), blob_at);
-    out.extend_from_slice(&blob);
-    out
 }
 
-/// A mapped image, its sections checked.
+/// The database's sections of a mapped image. Nothing in them is read until a key is looked
+/// up; each group read is checked the first time.
 pub(crate) struct ImageMap {
-    mapping: Mapping,
-    memos_at: usize,
+    image: Arc<Image<Mapping>>,
+    memos: Section,
+    edges: Section,
+    table: Section,
+    inputs: Section,
+    blob: Section,
     memo_count: usize,
-    edges_at: usize,
     edge_count: usize,
-    table_at: usize,
     table_len: usize,
-    inputs_at: usize,
     input_count: usize,
-    blob_at: usize,
-    blob_len: usize,
+    corrupt: ShortLock<Found>,
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> Result<u64, FormatError> {
-    let word = bytes.get(at..at + 8).ok_or(FormatError::OutOfBounds { at: at as u64 })?;
-    Ok(u64::from_le_bytes(word.try_into().expect("8 bytes")))
+/// The groups found corrupt: each reported once.
+#[derive(Default)]
+struct Found {
+    seen: FxSet<(SectionId, u32)>,
+    new: Vec<Corrupt>,
 }
 
 fn id_at(bytes: &[u8], at: usize) -> ContentId {
@@ -230,8 +238,12 @@ fn key_at(bytes: &[u8], at: usize) -> QueryKey {
     QueryKey { kind: QueryKind(u16::from_le_bytes([bytes[at], bytes[at + 1]])), input: id_at(bytes, at + 8) }
 }
 
-fn size(word: u64, at: usize) -> Result<usize, FormatError> {
-    usize::try_from(word).map_err(|_| FormatError::OutOfBounds { at: at as u64 })
+fn u64_at(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
+fn u32_at(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
 }
 
 /// One memo of the image, read in place: its edges and value stay in the mapping.
@@ -245,196 +257,206 @@ pub(crate) struct ImageMemo<'a> {
 }
 
 impl ImageMap {
-    pub(crate) fn open(mapping: Mapping) -> Result<ImageMap, FormatError> {
-        let bytes = mapping.bytes();
-        if bytes.len() < ROOT_AT + ROOT {
-            return Err(FormatError::Header("shorter than an image's header and root"));
-        }
-        if bytes[..8] != MAGIC {
-            return Err(FormatError::Header("not an image: wrong magic"));
-        }
-        let found = SchemaHash(id_at(bytes, 8));
-        if found != schema() {
-            return Err(FormatError::Schema { found, wanted: schema() });
-        }
-        if u64_at(bytes, 40)? != bytes.len() as u64 {
-            return Err(FormatError::Header("the image's length is not the file's"));
-        }
-        if u64_at(bytes, 48)? != ROOT_AT as u64 {
-            return Err(FormatError::Invalid { at: 48, what: "the root is not where images keep it" });
-        }
-        let mut words = [0usize; 10];
-        for (index, word) in words.iter_mut().enumerate() {
-            let at = ROOT_AT + index * 8;
-            *word = size(u64_at(bytes, at)?, at)?;
-        }
-        let [memos_at, memo_count, edges_at, edge_count, table_at, table_len, inputs_at, input_count, blob_at, blob_len] =
-            words;
-        let within = |at: usize, count: usize, each: usize, field: usize| {
-            let end = count.checked_mul(each).and_then(|len| len.checked_add(at));
-            match end {
-                Some(end) if end <= bytes.len() => Ok(()),
-                _ => Err(FormatError::OutOfBounds { at: (ROOT_AT + field * 8) as u64 }),
-            }
+    /// The database's sections of `image`. A section missing or of another schema is
+    /// [`DbError::Refused`]; one whose length is not whole records is [`DbError::Invalid`].
+    pub(crate) fn open(image: Arc<Image<Mapping>>) -> Result<ImageMap, DbError> {
+        let section = |id, schema| image.section(id, schema).map_err(DbError::Refused);
+        let (memos, edges, table, inputs, blob) = (
+            section(SectionId::DB_MEMOS, MEMOS)?,
+            section(SectionId::DB_EDGES, EDGES)?,
+            section(SectionId::DB_TABLE, TABLE)?,
+            section(SectionId::DB_INPUTS, INPUTS)?,
+            section(SectionId::DB_BLOB, BLOB)?,
+        );
+        let count = |section: &Section, each: usize, what: &'static str| {
+            usize::try_from(section.len)
+                .ok()
+                .filter(|len| len % each == 0)
+                .map(|len| len / each)
+                .ok_or(DbError::Invalid { section: section.id, what })
         };
-        within(memos_at, memo_count, MEMO_RECORD, 0)?;
-        within(edges_at, edge_count, EDGE_RECORD, 2)?;
-        within(table_at, table_len, 8, 4)?;
-        within(inputs_at, input_count, INPUT_RECORD, 6)?;
-        within(blob_at, blob_len, 1, 8)?;
-        if !table_len.is_power_of_two() || table_at % 8 != 0 || blob_at % 16 != 0 {
-            return Err(FormatError::Invalid { at: ROOT_AT as u64, what: "a section misaligned" });
+        let memo_count = count(&memos, MEMO_RECORD, "not a whole number of memo records")?;
+        let edge_count = count(&edges, EDGE_RECORD, "not a whole number of edge records")?;
+        let table_len = count(&table, 8, "not a whole number of table slots")?;
+        let input_count = count(&inputs, INPUT_RECORD, "not a whole number of input records")?;
+        if !table_len.is_power_of_two() {
+            return Err(DbError::Invalid { section: table.id, what: "a table whose length is not a power of two" });
         }
-        if (bytes.as_ptr().addr() + edges_at) % align_of::<EdgeRecord>() != 0 {
-            return Err(FormatError::Invalid { at: (ROOT_AT + 16) as u64, what: "the edges are not at an 8-byte boundary" });
+        // Sections start at group boundaries (at least 4 KiB into the file), so a base at a
+        // 16-byte boundary puts every value and edge record at its own.
+        if image.owner().bytes().as_ptr().addr() % 16 != 0 {
+            return Err(DbError::Invalid { section: blob.id, what: "mapped at an address off a 16-byte boundary" });
         }
         Ok(ImageMap {
-            mapping,
-            memos_at,
+            image,
+            memos,
+            edges,
+            table,
+            inputs,
+            blob,
             memo_count,
-            edges_at,
             edge_count,
-            table_at,
             table_len,
-            inputs_at,
             input_count,
-            blob_at,
-            blob_len,
+            corrupt: ShortLock::default(),
         })
     }
 
-    fn bytes(&self) -> &[u8] {
-        self.mapping.bytes()
+    /// `len` bytes at `at` of `section`, their groups checked. A group that fails its CRC is
+    /// `Err`; a read past the section is a record naming bytes [`write`] never wrote: a bug.
+    fn read(&self, section: &Section, at: u64, len: u64) -> Result<&[u8], Corrupt> {
+        self.image.range(section, at, len).map_err(|corrupt| match corrupt.cause {
+            Cause::Crc { .. } | Cause::CrcTable { .. } => corrupt,
+            Cause::Bounds { .. } | Cause::Misaligned { .. } => {
+                panic!("the daemon image's records name bytes the database never wrote: {corrupt}")
+            }
+        })
     }
 
-    fn table(&self, slot: usize) -> u64 {
-        u64_at(self.bytes(), self.table_at + slot * 8).expect("checked at open")
+    /// Notes `corrupt` for [`ImageMap::take_corrupt`], once a group.
+    pub(crate) fn note(&self, corrupt: Corrupt) {
+        let mut found = self.corrupt.lock();
+        if found.seen.insert((corrupt.section, corrupt.group)) {
+            found.new.push(corrupt);
+        }
     }
 
-    fn memo_key(&self, index: usize) -> QueryKey {
-        key_at(self.bytes(), self.memos_at + index * MEMO_RECORD)
+    /// The groups found corrupt since the last call, each once ever.
+    pub(crate) fn take_corrupt(&self) -> Vec<Corrupt> {
+        std::mem::take(&mut self.corrupt.lock().new)
     }
 
-    /// The indices of `key`'s memos.
-    pub(crate) fn find(&self, key: &QueryKey) -> Option<std::ops::Range<usize>> {
+    fn table_slot(&self, slot: usize) -> Result<u64, Corrupt> {
+        Ok(u64_at(self.read(&self.table, slot as u64 * 8, 8)?, 0))
+    }
+
+    fn memo_key(&self, index: usize) -> Result<QueryKey, Corrupt> {
+        Ok(key_at(self.read(&self.memos, (index * MEMO_RECORD) as u64, 40)?, 0))
+    }
+
+    fn checked_memo(&self, first: u64) -> usize {
+        match usize::try_from(first - 1) {
+            Ok(index) if index < self.memo_count => index,
+            _ => panic!("the daemon image's table names memo {} of {}: a bug in its writer", first - 1, self.memo_count),
+        }
+    }
+
+    /// The indices of `key`'s memos; `Err` when a group they are found through is corrupt.
+    pub(crate) fn find(&self, key: &QueryKey) -> Result<Option<Range<usize>>, Corrupt> {
         let mask = self.table_len - 1;
         let mut slot = slot_of(key, mask);
         for _ in 0..self.table_len {
-            let first = self.table(slot);
+            let first = self.table_slot(slot)?;
             if first == 0 {
-                return None;
+                return Ok(None);
             }
-            let first = self.checked_memo(first - 1);
-            if self.memo_key(first) == *key {
+            let first = self.checked_memo(first);
+            if self.memo_key(first)? == *key {
                 let mut end = first + 1;
-                while end < self.memo_count && self.memo_key(end) == *key {
+                while end < self.memo_count && self.memo_key(end)? == *key {
                     end += 1;
                 }
-                return Some(first..end);
+                return Ok(Some(first..end));
             }
             slot = (slot + 1) & mask;
         }
-        None
+        Ok(None)
     }
 
-    fn checked_memo(&self, index: u64) -> usize {
-        match usize::try_from(index) {
-            Ok(index) if index < self.memo_count => index,
-            _ => panic!("the daemon image is corrupt: its table names memo {index} of {}", self.memo_count),
+    /// Calls `f` on every key with memos in the image whose table slot and first memo read
+    /// whole; a corrupt group is noted and its keys skipped (they have no image memo).
+    pub(crate) fn for_each_key(&self, mut f: impl FnMut(QueryKey)) {
+        let per_group = (self.image.group_len() / 8) as usize;
+        let mut slot = 0;
+        while slot < self.table_len {
+            let first = match self.table_slot(slot) {
+                Ok(first) => first,
+                Err(corrupt) => {
+                    self.note(corrupt);
+                    slot = (slot / per_group + 1) * per_group;
+                    continue;
+                }
+            };
+            slot += 1;
+            if first == 0 {
+                continue;
+            }
+            match self.memo_key(self.checked_memo(first)) {
+                Ok(key) => f(key),
+                Err(corrupt) => self.note(corrupt),
+            }
         }
-    }
-
-    /// Every key with memos in the image.
-    pub(crate) fn keys(&self) -> impl Iterator<Item = QueryKey> + '_ {
-        (0..self.table_len)
-            .map(|slot| self.table(slot))
-            .filter(|first| *first != 0)
-            .map(|first| self.memo_key(self.checked_memo(first - 1)))
-    }
-
-    fn blob_range(&self, at: u64, len: u64, what: &str) -> (usize, usize) {
-        let ok = usize::try_from(at).ok().zip(usize::try_from(len).ok()).filter(|(at, len)| {
-            *at >= self.blob_at && at.checked_add(*len).is_some_and(|end| end <= self.blob_at + self.blob_len)
-        });
-        ok.unwrap_or_else(|| panic!("the daemon image is corrupt: {what} at {at}+{len} leaves the blob"))
     }
 
     /// The memo at `index`, read in place.
-    pub(crate) fn memo(&self, index: usize) -> ImageMemo<'_> {
-        let bytes = self.bytes();
-        let at = self.memos_at + index * MEMO_RECORD;
-        let record = &bytes[at..at + MEMO_RECORD];
+    pub(crate) fn memo(&self, index: usize) -> Result<ImageMemo<'_>, Corrupt> {
+        let record = self.read(&self.memos, (index * MEMO_RECORD) as u64, MEMO_RECORD as u64)?;
         let key = key_at(record, 0);
-        let fingerprint = Fingerprint(u128::from_le_bytes(record[40..56].try_into().expect("16")));
+        let fingerprint = Fingerprint(u128::from_le_bytes(record[40..56].try_into().expect("16 bytes")));
         let schema = SchemaHash(id_at(record, 56));
         let producer = id_at(record, 88);
         let value_id = id_at(record, 120);
-        let first_edge = u32::from_le_bytes(record[152..156].try_into().expect("4")) as usize;
-        let edge_len = u32::from_le_bytes(record[156..160].try_into().expect("4")) as usize;
+        let first_edge = u32_at(record, 152) as usize;
+        let edge_len = u32_at(record, 156) as usize;
         if first_edge.checked_add(edge_len).is_none_or(|end| end > self.edge_count) {
-            panic!("the daemon image is corrupt: memo {index}'s edges leave the edge section");
+            panic!("the daemon image's memo {index} names edges past its edge section: a bug in its writer");
         }
-        let from = self.edges_at + first_edge * EDGE_RECORD;
-        // SAFETY: inside the edge section, whose bounds and 8-byte alignment `open` checked; any
-        // bytes are a valid record.
-        let edges = unsafe { EdgeRecord::from_bytes(&bytes[from..from + edge_len * EDGE_RECORD]) };
-        let value_at = u64::from_le_bytes(record[160..168].try_into().expect("8"));
-        let value_len = u64::from_le_bytes(record[168..176].try_into().expect("8"));
+        let bytes = self.read(&self.edges, (first_edge * EDGE_RECORD) as u64, (edge_len * EDGE_RECORD) as u64)?;
+        // SAFETY: the edge section starts at a group boundary of a mapping `open` found at a
+        // 16-byte boundary, and records are 56 bytes, so each is at an 8-byte boundary.
+        let edges = unsafe { EdgeRecord::from_bytes(bytes) };
+        let (value_at, value_len) = (u64_at(record, 160), u64_at(record, 168));
         let value = if value_len == EVICTED {
             None
         } else {
-            let (at, len) = self.blob_range(value_at, value_len, "a value");
-            if at % 16 != 0 {
-                panic!("the daemon image is corrupt: memo {index}'s value is misaligned");
+            if value_at % 16 != 0 {
+                panic!("the daemon image's memo {index} has its value off a 16-byte boundary: a bug in its writer");
             }
-            Some((&bytes[at..at + len], value_id))
+            Some((self.read(&self.blob, value_at, value_len)?, value_id))
         };
-        ImageMemo { key, fingerprint, schema, producer, edges, value }
+        Ok(ImageMemo { key, fingerprint, schema, producer, edges, value })
     }
 
     /// The bytes of the key of the memo at `index`, if it was kept.
-    pub(crate) fn key_bytes(&self, index: usize) -> Option<&[u8]> {
-        let record = &self.bytes()[self.memos_at + index * MEMO_RECORD..][..MEMO_RECORD];
-        let at = u64::from_le_bytes(record[176..184].try_into().expect("8"));
-        let len = u64::from_le_bytes(record[184..192].try_into().expect("8"));
+    pub(crate) fn key_bytes(&self, index: usize) -> Result<Option<&[u8]>, Corrupt> {
+        let record = self.read(&self.memos, (index * MEMO_RECORD + 176) as u64, 16)?;
+        let (at, len) = (u64_at(record, 0), u64_at(record, 8));
         if len == 0 {
-            return None;
+            return Ok(None);
         }
-        let (at, len) = self.blob_range(at, len, "a key");
-        Some(&self.bytes()[at..at + len])
+        Ok(Some(self.read(&self.blob, at, len)?))
     }
 
-    pub(crate) fn inputs(&self) -> Vec<(QueryKey, Input)> {
-        let bytes = self.bytes();
-        (0..self.input_count)
-            .map(|index| {
-                let record = &bytes[self.inputs_at + index * INPUT_RECORD..][..INPUT_RECORD];
-                let key = key_at(record, 0);
-                let at = u64::from_le_bytes(record[48..56].try_into().expect("8"));
-                let len = u64::from_le_bytes(record[56..64].try_into().expect("8"));
-                let (at, len) = self.blob_range(at, len, "a path");
-                let path = std::str::from_utf8(&bytes[at..at + len])
-                    .unwrap_or_else(|_| panic!("the daemon image is corrupt: input {index}'s path"))
-                    .to_owned();
-                let input = match (record[40], key.kind) {
-                    (0, kinds::FILE) => Input::File(path),
-                    (1, kinds::DIR) => Input::Dir(path),
-                    (2, kinds::CONFIG) => Input::Config,
-                    (what, kind) => panic!(
-                        "the daemon image is corrupt: input {index} is a {what} of kind {}",
-                        kind.0
-                    ),
-                };
-                (key, input)
-            })
-            .collect()
+    /// Every input the image's memos were checked against: read whole at start.
+    pub(crate) fn inputs(&self) -> Result<Vec<(QueryKey, Input)>, Corrupt> {
+        // alloc: once when an image is opened, as is each path.
+        let mut inputs = Vec::with_capacity(self.input_count);
+        for index in 0..self.input_count {
+            let record = self.read(&self.inputs, (index * INPUT_RECORD) as u64, INPUT_RECORD as u64)?;
+            let key = key_at(record, 0);
+            let path = self.read(&self.blob, u64_at(record, 48), u64_at(record, 56))?;
+            let path = std::str::from_utf8(path).unwrap_or_else(|_| {
+                panic!("the daemon image's input {index} has a path that is not UTF-8: a bug in its writer")
+            });
+            let input = match (record[40], key.kind) {
+                (0, kinds::FILE) => Input::File(path.to_owned()), // alloc: see above
+                (1, kinds::DIR) => Input::Dir(path.to_owned()),   // alloc: see above
+                (2, kinds::CONFIG) => Input::Config,
+                (what, kind) => panic!(
+                    "the daemon image's input {index} is a {what} of kind {}: a bug in its writer",
+                    kind.0
+                ),
+            };
+            inputs.push((key, input));
+        }
+        Ok(inputs)
     }
 }
 
 #[cfg(test)]
 pub(crate) fn encode_edge(edge: &crate::Edge) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = vec![0; EDGE_RECORD];
     put_key(&mut out, &edge.read);
-    out.extend_from_slice(&edge.saw.0.to_le_bytes());
+    out[40..56].copy_from_slice(&edge.saw.0.to_le_bytes());
     out
 }

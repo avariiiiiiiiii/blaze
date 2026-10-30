@@ -1,4 +1,5 @@
-use blaze_core::{IoError, sim::Rng};
+use blaze_core::IoError;
+use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::cbor;
 
 use super::*;

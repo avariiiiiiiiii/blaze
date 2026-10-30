@@ -17,6 +17,7 @@
 #[cfg(test)]
 mod tests;
 
+use base_db::Db;
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{
@@ -86,7 +87,7 @@ impl ItemHashes {
     /// at each index, for the linker's table to give the position of
     /// (`hir_ty_mir::mir::location::source_location_in_file`). A span that function finds no syntax for
     /// (a binding, the self parameter, [`MirSpan::Unknown`]) is where its owner is.
-    pub fn span_tables(db: &dyn HirDatabase, owner: DefWithBodyId) -> Vec<(ContentId, Vec<MirSpan>)> {
+    pub fn span_tables(db: &Db, owner: DefWithBodyId) -> Vec<(ContentId, Vec<MirSpan>)> {
         let anchors = anchors(db, owner).0;
         let store = BodyStore::of(db, owner);
         let spans: [Vec<MirSpan>; TABLES] = [
@@ -102,7 +103,7 @@ impl ItemHashes {
 
     /// The anchor of the table [`Hashes::declaration`] names: one span, where `func` is
     /// declared.
-    pub fn declaration_table(db: &dyn HirDatabase, func: FunctionId) -> ContentId {
+    pub fn declaration_table(db: &Db, func: FunctionId) -> ContentId {
         let mut h = Hasher::new(SPAN_DOMAIN);
         h.id(&item_key(db, ItemId::Function(func)).0).update(&[DECLARATION]);
         h.finish()
@@ -110,11 +111,11 @@ impl ItemHashes {
 }
 
 impl Hashes for ItemHashes {
-    fn item(&self, db: &dyn HirDatabase, item: ItemId) -> Result<ItemKey, String> {
+    fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String> {
         Ok(item_key(db, item))
     }
 
-    fn code(&self, db: &dyn HirDatabase, body: Body) -> Result<CodeHash, String> {
+    fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
         hir_ty::attach_db(db, || {
             let code = match body {
                 Body::Item(def) => item_code(db, def),
@@ -126,7 +127,7 @@ impl Hashes for ItemHashes {
         })
     }
 
-    fn ty<'db>(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, String> {
+    fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
         hir_ty::attach_db(db, || {
             let mut spell = Spell::new(db);
             spell.ty(ty)?;
@@ -134,7 +135,7 @@ impl Hashes for ItemHashes {
         })
     }
 
-    fn konst<'db>(&self, db: &'db dyn HirDatabase, konst: Const<'db>) -> Result<ContentId, String> {
+    fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
         hir_ty::attach_db(db, || {
             let mut spell = Spell::new(db);
             spell.konst(konst)?;
@@ -144,7 +145,7 @@ impl Hashes for ItemHashes {
 
     fn span(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         span: MirSpan,
     ) -> Result<SpanRef, String> {
@@ -157,11 +158,11 @@ impl Hashes for ItemHashes {
         Ok(SpanRef { anchor: anchors(db, owner).0[table], index })
     }
 
-    fn declaration(&self, db: &dyn HirDatabase, func: FunctionId) -> Result<SpanRef, String> {
+    fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String> {
         Ok(SpanRef { anchor: ItemHashes::declaration_table(db, func), index: 0 })
     }
 
-    fn file_name(&self, _: &dyn HirDatabase, file: base_db::FileId) -> Result<String, String> {
+    fn file_name(&self, _: &Db, file: base_db::FileId) -> Result<String, String> {
         (self.names)(file).ok_or_else(|| {
             format!(
                 "the file {file:?} has no name in the program: the build did not name it, so \
@@ -191,7 +192,7 @@ struct Anchors([ContentId; TABLES]);
 /// The anchors of a body's span tables: of the key of its store, which an edit of what the
 /// body is keeps.
 #[salsa::tracked(returns(copy))]
-fn anchors(db: &dyn HirDatabase, owner: DefWithBodyId) -> Anchors {
+fn anchors(db: &Db, owner: DefWithBodyId) -> Anchors {
     let store = key::store_key(db, ExpressionStoreOwnerId::Body(owner));
     Anchors(std::array::from_fn(|table| {
         let mut h = Hasher::new(SPAN_DOMAIN);
@@ -200,7 +201,7 @@ fn anchors(db: &dyn HirDatabase, owner: DefWithBodyId) -> Anchors {
     }))
 }
 
-fn unhashable(db: &dyn HirDatabase) -> impl Fn(Unhashable) -> String + '_ {
+fn unhashable(db: &Db) -> impl Fn(Unhashable) -> String + '_ {
     move |it| it.describe(db)
 }
 
@@ -208,7 +209,7 @@ fn unhashable(db: &dyn HirDatabase) -> impl Fn(Unhashable) -> String + '_ {
 /// leaves out: the names of its bindings, which its debug info tells, and the positions it
 /// names, by table and index, in the order of its blocks.
 fn with_spans(
-    db: &dyn HirDatabase,
+    db: &Db,
     kind: u8,
     parts: &[ContentId],
     body: &MirBody<'_>,
@@ -258,7 +259,7 @@ fn with_spans(
 
 /// The name of each of `body`'s bindings, in the order of their locals, each framed by its
 /// local and its length.
-fn names(db: &dyn HirDatabase, body: &MirBody<'_>) -> ContentId {
+fn names(db: &Db, body: &MirBody<'_>) -> ContentId {
     let store = ExpressionStore::of(db, body.owner.expression_store_owner(db));
     let mut out = Vec::new();
     for (local, binding) in body.local_to_binding_map().iter() {
@@ -277,7 +278,7 @@ fn no_mir(what: impl std::fmt::Debug, error: impl std::fmt::Debug) -> String {
 /// The code of a function, constant or static: its item's code hash. An enum variant's
 /// discriminant is a body of its enum's interface.
 #[salsa::tracked(returns(ref))]
-fn item_code(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<ContentId, String> {
+fn item_code(db: &Db, def: DefWithBodyId) -> Result<ContentId, String> {
     let item = ItemId::of_body(db, def);
     let code = match def {
         DefWithBodyId::VariantId(variant) => {
@@ -305,7 +306,7 @@ fn item_code(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<ContentId, Stri
 
 #[salsa::tracked(returns(ref))]
 fn closure_code_in<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Result<ContentId, String> {
     let code = closure_code(db, closure).map_err(unhashable(db))?;
@@ -315,7 +316,7 @@ fn closure_code_in<'db>(
 
 #[salsa::tracked(returns(ref))]
 fn coroutine_code_in<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<ContentId, String> {
     let code = coroutine_code(db, coroutine).map_err(unhashable(db))?;
@@ -328,7 +329,7 @@ fn coroutine_code_in<'db>(
 /// captures and how.
 #[salsa::tracked(returns(ref))]
 fn by_move_code_in<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<ContentId, String> {
     let code = coroutine_code(db, coroutine).map_err(unhashable(db))?;
@@ -353,7 +354,7 @@ fn by_move_code_in<'db>(
 /// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively,
 /// which drop glue reads.
 #[salsa::tracked(returns(ref))]
-fn adt_content(db: &dyn HirDatabase, adt: AdtId) -> Result<ContentId, String> {
+fn adt_content(db: &Db, adt: AdtId) -> Result<ContentId, String> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);
     h.id(&item_key(db, item).0)
@@ -389,7 +390,7 @@ fn adt_content(db: &dyn HirDatabase, adt: AdtId) -> Result<ContentId, String> {
     Ok(h.finish())
 }
 
-fn variants(db: &dyn HirDatabase, adt: AdtId) -> Vec<VariantId> {
+fn variants(db: &Db, adt: AdtId) -> Vec<VariantId> {
     match adt {
         AdtId::StructId(it) => vec![it.into()],
         AdtId::UnionId(it) => vec![it.into()],
@@ -404,12 +405,12 @@ fn variants(db: &dyn HirDatabase, adt: AdtId) -> Vec<VariantId> {
 
 /// A type or constant spelled by content into one buffer, hashed once by the caller.
 struct Spell<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     out: Vec<u8>,
 }
 
 impl<'db> Spell<'db> {
-    fn new(db: &'db dyn HirDatabase) -> Spell<'db> {
+    fn new(db: &'db Db) -> Spell<'db> {
         Spell { db, out: Vec::with_capacity(256) }
     }
 

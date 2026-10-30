@@ -32,6 +32,7 @@ use blaze_image::{Corrupt, Image, Refused, Section, SectionId, SectionWriter, St
 
 use crate::{
     arena::{Entry, Store},
+    swiss::{self, Ctrl},
     sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 
@@ -55,23 +56,6 @@ pub(crate) const MAX_ALIGN: usize = 16;
 
 /// Slots in a group of the mapped index: tag bytes 0 to 7 of its control word.
 const GROUP: usize = 8;
-const LOW_BITS: u64 = 0x0101_0101_0101_0101;
-const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
-
-fn tag(hash: u64) -> u64 {
-    0x80 | (hash >> 57)
-}
-
-/// A byte's high bit set for each byte of `word` that may equal `tag`: every equal one, and
-/// rarely the byte above one (the subtraction's borrow), which the caller checks.
-fn matching(word: u64, tag: u64) -> u64 {
-    let x = word ^ (LOW_BITS * tag);
-    x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
-}
-
-fn empty(word: u64) -> u64 {
-    !word & HIGH_BITS
-}
 
 /// The hash of a value's bytes, in every table, mapped or not. Defined here, not by a hasher
 /// crate, so an image's index means the same to every blaze that opens it: FxHash's
@@ -211,6 +195,7 @@ fn slots(len: usize) -> Box<[AtomicPtr<Head>]> {
 /// The checker's atomics are not plain words, so a model build makes each one.
 #[cfg(blaze_check)]
 fn slots(len: usize) -> Box<[AtomicPtr<Head>]> {
+    // alloc: the model checker's build only, once a table
     (0..len).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect()
 }
 
@@ -263,7 +248,7 @@ impl Column {
 
 /// The IDs the owners of an image's other sections still name, marked before the image is
 /// written: a value whose ID is not marked is not kept.
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct Live {
     bits: Vec<u64>,
 }
@@ -607,28 +592,10 @@ impl Table {
         if ctrl.is_empty() {
             return None;
         }
-        let mask = ctrl.len() - 1;
-        let tag = tag(hash);
-        let mut at = hash as usize & mask;
-        loop {
-            let word = ctrl[at];
-            let mut hits = matching(word, tag);
-            while hits != 0 {
-                let byte = (hits.trailing_zeros() / 8) as usize;
-                hits &= hits - 1;
-                if (word >> (byte * 8)) & 0xff != tag {
-                    continue;
-                }
-                let id = self.base.ids[at * GROUP + byte];
-                if self.get(id) == Some(bytes) {
-                    return Some(id);
-                }
-            }
-            if empty(word) != 0 {
-                return None;
-            }
-            at = (at + 1) & mask;
-        }
+        swiss::find(hash, swiss::tag(hash), ctrl.len(), |at| Ctrl::<GROUP>(ctrl[at]), |at| {
+            let id = self.base.ids[at.index()];
+            (self.get(id) == Some(bytes)).then_some(id)
+        })
     }
 
     /// The bytes of `id`, `None` when it names no value: never made, or freed by the GC of the
@@ -690,8 +657,11 @@ impl Table {
         let count = (end - self.first) as usize;
         let mut starts = Vec::with_capacity(count + 1);
         let mut keys = Vec::with_capacity(count);
+        // alloc: `Table::write`'s columns, once an image written at the daemon's stop
         let mut live_bits = vec![0u64; count.div_ceil(64)];
+        // alloc: as the starts
         let mut bytes = Vec::new();
+        // alloc: as the starts
         let mut free = Vec::new();
         let mut kept = Vec::with_capacity(live.count().min(count));
         starts.push(0u32);
@@ -711,34 +681,20 @@ impl Table {
 
         let slots = (self.first as usize - 1 + kept.len()) * 2;
         let groups = slots.div_ceil(GROUP).next_power_of_two().max(1);
+        // alloc: `Table::write`'s index, once an image written
         let mut ctrl = vec![0u64; groups];
+        // alloc: as the index
         let mut ids = vec![0u32; groups * GROUP];
         let mut put = |id: u32, value: &[u8], dedupe: bool| {
             let hash = value_hash(value);
-            let (mask, tag) = (groups - 1, tag(hash));
-            let mut at = hash as usize & mask;
-            loop {
-                let word = ctrl[at];
-                if dedupe {
-                    let mut hits = matching(word, tag);
-                    while hits != 0 {
-                        let byte = (hits.trailing_zeros() / 8) as usize;
-                        hits &= hits - 1;
-                        let other = ids[at * GROUP + byte];
-                        if (word >> (byte * 8)) & 0xff == tag && self.get(other) == Some(value) {
-                            return;
-                        }
-                    }
-                }
-                let free = empty(word);
-                if free != 0 {
-                    let byte = (free.trailing_zeros() / 8) as usize;
-                    ctrl[at] = word | (tag << (byte * 8));
-                    ids[at * GROUP + byte] = id;
-                    return;
-                }
-                at = (at + 1) & mask;
+            let tag = swiss::tag(hash);
+            let word = |at: usize| Ctrl::<GROUP>(ctrl[at]);
+            if dedupe && swiss::find(hash, tag, groups, word, |at| (self.get(ids[at.index()]) == Some(value)).then_some(())).is_some() {
+                return;
             }
+            let at = swiss::vacant(hash, groups, |at| Ctrl::<GROUP>(ctrl[at]));
+            ctrl[at.group] = at.tagged(tag).0;
+            ids[at.index()] = id;
         };
         // A value compiled in twice is the first, as in the overlay.
         for id in 1..self.first {

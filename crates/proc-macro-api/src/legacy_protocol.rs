@@ -14,11 +14,11 @@ use crate::{
     ProcMacro, ProcMacroKind, ServerError,
     legacy_protocol::msg::{
         ExpandMacro, ExpandMacroData, ExpnGlobals, FlatTree, Message, Request, Response,
-        ServerConfig, SpanDataIndexMap, deserialize_span_data_index_map,
-        flat::serialize_span_data_index_map,
+        ServerConfig, SpanDataIndexMap, flat::serialize_span_data_index_map,
     },
     process::Claimed,
     version,
+    wire::{ExpandMacroWire, Sent, WireSpan, flat_answer, read_tree, write_tree},
 };
 
 pub(crate) use crate::legacy_protocol::msg::SpanMode;
@@ -85,6 +85,25 @@ pub(crate) fn expand(
     current_dir: String,
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
     let version = process.version();
+    if version >= version::WIRE_TREES {
+        let mut sent = Sent::new();
+        let task = ExpandMacroWire::of(
+            proc_macro,
+            subtree,
+            attr,
+            env,
+            [def_site, call_site, mixed_site],
+            current_dir,
+            &mut sent,
+        );
+        return match send_task(process, Request::ExpandMacroWire(Box::new(task)))? {
+            Response::ExpandMacroWire(Ok(tree)) => {
+                Ok(Ok(read_tree(&tree, &sent, &mut Vec::new()).map_err(answer_error)?))
+            }
+            Response::ExpandMacroWire(Err(msg)) => Ok(Err(msg.0)),
+            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+        };
+    }
     let mut span_data_table = SpanDataIndexMap::default();
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
@@ -114,30 +133,60 @@ pub(crate) fn expand(
 
     let response = send_task(process, Request::ExpandMacro(Box::new(task)))?;
 
-    match response {
-        Response::ExpandMacro(it) => Ok(it
-            .map(|tree| {
-                let mut expanded = FlatTree::to_subtree_resolved(tree, version, &span_data_table);
-                if proc_macro.needs_fixup_change() {
-                    proc_macro.change_fixup_to_match_old_server(&mut expanded);
-                }
-                expanded
-            })
-            .map_err(|msg| msg.0)),
-        Response::ExpandMacroExtended(it) => Ok(it
-            .map(|resp| {
-                let mut expanded = FlatTree::to_subtree_resolved(
-                    resp.tree,
-                    version,
-                    &deserialize_span_data_index_map(&resp.span_data_table),
-                );
-                if proc_macro.needs_fixup_change() {
-                    proc_macro.change_fixup_to_match_old_server(&mut expanded);
-                }
-                expanded
-            })
-            .map_err(|msg| msg.0)),
-        _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+    let (tree, answered) = match response {
+        Response::ExpandMacro(Ok(tree)) => (tree, None),
+        Response::ExpandMacroExtended(Ok(resp)) => (resp.tree, Some(resp.span_data_table)),
+        Response::ExpandMacro(Err(msg)) | Response::ExpandMacroExtended(Err(msg)) => {
+            return Ok(Err(msg.0));
+        }
+        _ => return Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+    };
+    let sent = Sent::of_table(&span_data_table);
+    let mut expanded = flat_answer(tree, version, &span_data_table, answered.as_deref(), &sent)
+        .map_err(answer_error)?;
+    if proc_macro.needs_fixup_change() {
+        proc_macro.change_fixup_to_match_old_server(&mut expanded);
+    }
+    Ok(Ok(expanded))
+}
+
+/// A server's answer that is no tree, or names what the request did not send: the server's
+/// fault, never the macro's.
+pub(crate) fn answer_error(why: String) -> ServerError {
+    ServerError { message: format!("the proc-macro server's answer: {why}"), io: None }
+}
+
+impl ExpandMacroWire {
+    /// The request of an expansion of `proc_macro`, noting in `sent` each span part it sends.
+    pub(crate) fn of(
+        proc_macro: &ProcMacro,
+        subtree: tt::SubtreeView<'_>,
+        attr: Option<tt::SubtreeView<'_>>,
+        env: Vec<(String, String)>,
+        [def_site, call_site, mixed_site]: [Span; 3],
+        current_dir: String,
+        sent: &mut Sent,
+    ) -> ExpandMacroWire {
+        for site in [def_site, call_site, mixed_site] {
+            sent.span(&site);
+        }
+        let has_attributes = attr.is_some();
+        let mut trees = Vec::new();
+        write_tree(subtree, sent, &mut trees);
+        if let Some(attr) = attr {
+            write_tree(attr, sent, &mut trees);
+        }
+        ExpandMacroWire {
+            lib: proc_macro.dylib_path.to_path_buf().into(),
+            env,
+            current_dir: Some(current_dir),
+            macro_name: proc_macro.name.to_string(),
+            trees,
+            has_attributes,
+            def_site: WireSpan::of(def_site),
+            call_site: WireSpan::of(call_site),
+            mixed_site: WireSpan::of(mixed_site),
+        }
     }
 }
 

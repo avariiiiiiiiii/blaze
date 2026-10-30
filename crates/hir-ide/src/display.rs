@@ -7,7 +7,7 @@ use std::{
     mem,
 };
 
-use base_db::{Crate, FxIndexMap};
+use base_db::{Db, Crate, FxIndexMap};
 use either::Either;
 use hir_def::{
     CallableDefId, ExpressionStoreOwnerId, FindPathConfig, GenericDefId, GenericParamId, HasModule,
@@ -99,6 +99,16 @@ fn async_gen_item_ty_from_yield_ty<'db>(
 
 pub type Result<T = (), E = HirDisplayError> = std::result::Result<T, E>;
 
+inventory::submit! {
+    hir_ty::providers::Display { type_name }
+}
+
+/// `std::any::type_name`'s path of `ty` from `module`: `None` when it has no source path to
+/// print, which the intrinsic reports as an error naming the type.
+pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>, module: ModuleId) -> Option<String> {
+    ty.display_source_code(db, module, true).ok()
+}
+
 pub trait HirWrite: fmt::Write {
     fn start_location_link(&mut self, _location: ModuleDefId) {}
     fn start_location_link_generic(&mut self, _location: GenericParamId) {}
@@ -113,7 +123,7 @@ impl HirWrite for fmt::Formatter<'_> {}
 
 pub struct HirFormatter<'a, 'db> {
     /// The database handle
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     pub interner: DbInterner<'db>,
     /// The sink to write into
     fmt: &'a mut dyn HirWrite,
@@ -236,7 +246,7 @@ pub trait HirDisplay<'db> {
     /// Returns a `Display`able type that is human-readable.
     fn into_displayable<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         max_size: Option<usize>,
         limited_size: Option<usize>,
         omit_verbose_types: bool,
@@ -271,7 +281,7 @@ pub trait HirDisplay<'db> {
     /// Use this for showing types to the user (e.g. diagnostics)
     fn display<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, 'db, Self>
     where
@@ -296,7 +306,7 @@ pub trait HirDisplay<'db> {
     /// Use this for showing types to the user where space is constrained (e.g. doc popups)
     fn display_truncated<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         max_size: Option<usize>,
         display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, 'db, Self>
@@ -322,7 +332,7 @@ pub trait HirDisplay<'db> {
     /// Use this for showing definitions which may contain too many items, like `trait`, `struct`, `enum`
     fn display_limited<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         limited_size: Option<usize>,
         display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, 'db, Self>
@@ -348,7 +358,7 @@ pub trait HirDisplay<'db> {
     /// Use this when generating code (e.g. assists)
     fn display_source_code<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         module_id: ModuleId,
         allow_opaque: bool,
     ) -> Result<String, DisplaySourceCodeError> {
@@ -382,7 +392,7 @@ pub trait HirDisplay<'db> {
     /// Returns a String representation of `self` for test purposes
     fn display_test<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, 'db, Self>
     where
@@ -407,7 +417,7 @@ pub trait HirDisplay<'db> {
     /// the container for functions
     fn display_with_container_bounds<'a>(
         &'a self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         show_container_bounds: bool,
         display_target: DisplayTarget,
     ) -> HirDisplayWrapper<'a, 'db, Self>
@@ -514,12 +524,12 @@ pub struct DisplayTarget {
 }
 
 impl DisplayTarget {
-    pub fn from_crate(db: &dyn HirDatabase, krate: Crate) -> Self {
+    pub fn from_crate(db: &Db, krate: Crate) -> Self {
         let edition = krate.data(db).edition;
         Self { krate, edition }
     }
 
-    pub fn from_crate_and_edition(db: &dyn HirDatabase, krate: Crate, edition: Edition) -> Self {
+    pub fn from_crate_and_edition(db: &Db, krate: Crate, edition: Edition) -> Self {
         let _ = db;
         Self { krate, edition }
     }
@@ -572,7 +582,7 @@ impl From<fmt::Error> for HirDisplayError {
 }
 
 pub struct HirDisplayWrapper<'a, 'db, T> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     t: &'a T,
     max_size: Option<usize>,
     limited_size: Option<usize>,
@@ -2648,7 +2658,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeBound {
                     TraitBoundModifier::Const => write!(f, "const ")?,
                     TraitBoundModifier::MaybeConst => write!(f, "[const] ")?,
                 }
-                store[path].hir_fmt(f, owner, store)
+                store.path(path).hir_fmt(f, owner, store)
             }
             TypeBound::Lifetime(lifetime) => lifetime.hir_fmt(f, owner, store),
             TypeBound::ForLifetime(lifetimes, path) => {
@@ -2656,13 +2666,14 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeBound {
                 write!(
                     f,
                     "for<{}> ",
-                    lifetimes.iter().map(|it| it.display(f.db, edition)).format(", ")
+                    store.names(*lifetimes).iter().map(|it| it.display(f.db, edition)).format(", ")
                 )?;
-                store[*path].hir_fmt(f, owner, store)
+                store.path(*path).hir_fmt(f, owner, store)
             }
             TypeBound::Use(args) => {
                 write!(f, "use<")?;
                 let edition = f.edition();
+                let args = store.use_args(*args);
                 let last = args.len().saturating_sub(1);
                 for (idx, arg) in args.iter().enumerate() {
                     match arg {
@@ -2680,7 +2691,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for TypeBound {
     }
 }
 
-impl<'db> HirDisplayWithExpressionStore<'db> for Path {
+impl<'db> HirDisplayWithExpressionStore<'db> for Path<'_> {
     fn hir_fmt(
         &self,
         f: &mut HirFormatter<'_, 'db>,
@@ -2769,7 +2780,7 @@ impl<'db> HirDisplayWithExpressionStore<'db> for Path {
                                 generic_args.args[0].hir_fmt(f, owner, store)?;
                             }
                         }
-                        if let Some(ret) = generic_args.bindings[0].type_ref
+                        if let Some(ret) = generic_args.bindings.get(0).unwrap().type_ref
                             && !matches!(store.type_ref(ret), TypeRef::Tuple(v) if v.is_empty())
                         {
                             write!(f, " -> ")?;

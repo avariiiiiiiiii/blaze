@@ -10,11 +10,13 @@
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build.
+//! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`).
 
 #![forbid(unsafe_code)]
 
 pub mod args;
 pub mod daemon;
+pub mod inspect;
 pub mod json;
 pub mod place;
 pub mod print;
@@ -59,6 +61,10 @@ Commands:
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing
+    daemon      install: the system starts the daemon on demand; uninstall
+    codegen-inputs --format=json   Each instance the last build made, with its code hash
+    trace --out PATH               Every result of the last build, with its edges, as CBOR
+    tables --format=json           The size of each of the daemon's long-lived tables
 
 Options:
     -V, --version  Print version info and exit
@@ -127,13 +133,15 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 serve, stop and status"
+                 serve, stop, status, daemon, codegen-inputs, trace and tables"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
         Asked::Status => said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color())),
+        Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
+        Asked::Inspect(what, words) => inspect::main(what, words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
     }
 }
@@ -172,14 +180,20 @@ fn in_daemon(asked: &Invocation) -> bool {
 
 /// Everything of the machine the request needs: where it runs and what it sends.
 fn prepared(asked: &Invocation, color: bool) -> Result<(Place, Request), String> {
+    let (place, cargo) = prepared_cargo(asked, color)?;
+    let request = request(asked, cargo)?;
+    Ok((place, request))
+}
+
+/// Where the command runs, and its command line as the daemon's load reads it.
+fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), String> {
     let cwd = std::env::current_dir().map_err(|error| format!("the current directory: {error}"))?;
     let env = place::env(std::env::vars_os())?;
     let place = place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
     let home = crate::cargo::home::cargo_home();
     let files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
     let cargo = place::cargo(asked, &place, env, files, color)?;
-    let request = request(asked, cargo)?;
-    Ok((place, request))
+    Ok((place, cargo))
 }
 
 /// `build`, `check`, `run`, `test` or `bench`.
@@ -270,6 +284,7 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     }
     let speaking = Speaking { cwd: &place.cwd, color: shown.color, quiet: shown.quiet, verbose: shown.verbose };
     let artifacts = printer.take_artifacts();
+    let members = printer.members();
     match asked.command() {
         Command::Build | Command::Check => Ok(Then::Exit(0)),
         Command::Run => {
@@ -293,7 +308,9 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
             let passed = test::reached(&results, speaking, out, err)?;
             Ok(Then::Exit(if passed { 0 } else { FAILED }))
         }
-        Command::Test | Command::Bench => test::run(asked, &artifacts, speaking, printer.err(), programs).map(Then::Exit),
+        Command::Test | Command::Bench => {
+            test::run(asked, &artifacts, members, speaking, printer.err(), programs).map(Then::Exit)
+        }
     }
 }
 

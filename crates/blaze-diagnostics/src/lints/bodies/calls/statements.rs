@@ -16,6 +16,7 @@
 
 use std::sync::OnceLock;
 
+use base_db::Db;
 use hir::InFile;
 use intern::Symbol;
 use hir_def::{
@@ -62,7 +63,7 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
 }
 
 /// Statement `index` of the block `block`.
-fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'db Statement> {
+fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {
     match b.store().expr(block) {
         Expr::Block { statements, .. } => statements.get(index),
         _ => None,
@@ -73,7 +74,7 @@ fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'
 /// `StmtKind::Semi`).
 fn semi_expr(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<ExprId> {
     match statement(b, block, index)? {
-        Statement::Expr { expr, has_semi: true } => Some(*expr),
+        Statement::Expr { expr, has_semi: true } => Some(expr),
         _ => None,
     }
 }
@@ -95,7 +96,7 @@ fn needs_drop<'db>(solver: &Solver<'db>, ty: Ty<'db>) -> bool {
     has_drop_glue(&solver.infcx, ty, solver.env) != DropGlue::None
 }
 
-fn is_must_use(db: &dyn HirDatabase, def: AttrDefId) -> bool {
+fn is_must_use(db: &Db, def: AttrDefId) -> bool {
     AttrFlags::must_use_message(db, def).is_some()
 }
 
@@ -190,7 +191,7 @@ impl Local {
     /// The `let` statement `index` of `block`.
     fn of_stmt(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Local> {
         let Statement::Let { pat, type_ref, initializer, .. } = statement(b, block, index)? else { return None };
-        Some(Local { pat: *pat, init: *initializer, typed: type_ref.is_some(), assign: None })
+        Some(Local { pat, init: initializer, typed: type_ref.is_some(), assign: None })
     }
 
     /// The `let` a destructuring assignment `expr` is lowered to (`(a, _) = ..`, `_ = ..`):

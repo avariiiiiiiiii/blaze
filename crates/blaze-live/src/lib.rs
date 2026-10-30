@@ -37,6 +37,10 @@
 
 use std::{fmt, path::PathBuf, sync::OnceLock, time::Duration};
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 /// The setting `BLAZE_<name>`.
 fn setting(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(format!("BLAZE_{name}"))

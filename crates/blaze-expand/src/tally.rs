@@ -46,14 +46,14 @@ pub struct Tally<const N: usize> {
 
 impl<const N: usize> Tally<N> {
     pub const fn new() -> Tally<N> {
-        Tally { blocks: Mutex::new(Vec::new()), free: Mutex::new(Vec::new()) }
+        Tally { blocks: Mutex::new(Vec::new()), free: Mutex::new(Vec::new()) } // alloc: empty, allocates nothing
     }
 
     fn block(&'static self) -> &'static Block<N> {
         if let Some(block) = self.free.lock().unwrap_or_else(|it| it.into_inner()).pop() {
             return block;
         }
-        let block: &'static Block<N> = Box::leak(Box::new(Block::new()));
+        let block: &'static Block<N> = Box::leak(Box::new(Block::new())); // alloc: setup: once per thread, kept for the process
         self.blocks.lock().unwrap_or_else(|it| it.into_inner()).push(block);
         block
     }
@@ -128,5 +128,21 @@ mod tests {
         std::thread::spawn(|| Mine::of(&TALLY).add(0, Duration::ZERO)).join().unwrap();
         assert_eq!(TALLY.blocks.lock().unwrap().len(), before);
         assert_eq!(TALLY.get(0).0, 1);
+    }
+
+    /// A count is a load and a store of the thread's own block, and a sum a walk of the
+    /// blocks: neither allocates once the thread has its block.
+    #[test]
+    fn a_count_and_a_sum_allocate_nothing() {
+        static TALLY: Tally<2> = Tally::new();
+        let mine = Mine::of(&TALLY);
+        let sum = blaze_alloc_count::assert_at_most(0, "expansions counted and summed", || {
+            for _ in 0..1000 {
+                mine.add(1, Duration::from_nanos(3));
+            }
+            TALLY.get(1)
+        });
+        assert_eq!(sum.0, 1000);
+        assert!((sum.1 - 3_000.0 / 1e9).abs() < 1e-12);
     }
 }

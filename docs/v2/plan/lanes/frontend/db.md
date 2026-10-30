@@ -120,13 +120,30 @@ wires up at each concrete database.
 The rustc way to do this, and the one chosen: each such query is declared, with its memo, in
 hir-ty (the crate of its key and value types: `MirBody`, `MirLowerError` and `MirOptLevel` are
 hir-ty's), as a tracked function over `&Db`. Its cycle result (`Err(MirLowerError::Loop)`) is
-declared there too, and its body is one call through `hir_ty::providers()`, a table of `fn`
-pointers that hir-ty-mir fills in once per process (`hir_ty_mir::provide()`, called by whoever
-makes a `Db`: load-cargo, and each test helper). So a hit from any crate is static, and only a
-miss calls through the table, as only a miss calls `execute` in rustc. A table that was never
-filled panics, naming the query and `hir_ty_mir::provide`: there is no default body to fall
-back to. `opaque_of_impl`, `interpret_mir` and `type_name` are not memoized, so each is one
-call through the table, made from inside a miss of its caller's own query.
+declared there too, and its body is one call through a table of `fn` pointers,
+`hir_ty::providers::Mir`. hir-ty-mir registers its one table at link time
+(`inventory::submit!`, the mechanism salsa's `register_jar!` already uses for every ingredient
+in this workspace), and hir-ty reads it once, on the first miss, into a `OnceLock`; `type_name`'s
+table, `hir_ty::providers::Display`, is registered the same way by the display code. So a hit
+from any crate is static, and only a miss calls through the table, as only a miss calls
+`execute` in rustc; and nothing has to be installed where a `Db` is made, so no maker (a build,
+a test, a tool) can forget to. A binary that links no table, or two, panics on the first miss,
+naming the query and the crate that registers it: there is no default body to fall back to. A
+crate whose tests read MIR links one with `use hir as _;` (or `use hir_ty_mir as _;`). The
+registration is a `#[used]` static, which rustc links from every rlib in the graph whether or
+not anything names it (since 1.62, rust-lang/rust#95604: the `symbols.o` that references each
+`#[used]` symbol), so linking the crate is enough; blaze's own linker keeps the same rule, as
+salsa's ingredients already need. hir-ty's own unit tests link no table and miss no MIR query.
+An `extern "Rust"` symbol per provider, defined in hir-ty-mir, was the other way to need no
+install call: a direct call and a link error when it is missing, but every hir-ty test binary
+would then fail to link.
+`opaque_of_impl`, `interpret_mir` and `type_name` are not memoized, so each is one call through
+the table, made from inside a miss of its caller's own query.
+
+rustc's `Providers` is a struct filled in by each crate's `provide(&mut providers)`, called from
+`rustc_interface`. Here no one place calls them all; registering at link time keeps the one
+table without that place, and the check that there is exactly one turns a missing or doubled
+crate into an error that names it.
 
 ### salsa: tracked functions over a concrete database
 
@@ -135,22 +152,35 @@ The salsa fork's tracked-function macro takes `db: &dyn Trait` only. It is exten
 `fn`s take `&Db` and `&mut Db`. The struct's `#[salsa::db]` also generates the hidden
 `zalsa_register_downcaster` for the identity view, so the cold path's view lookup is unchanged.
 
-`attach` and `TaskLocals::current` read the task depth through `Database::task_depth()`, an
-associated function the concrete type implements statically (base-db's calls
+`attach` and `TaskLocals::current` read the task depth through `Database::task_depth(&self)`,
+a provided method (0, one task per thread) that the concrete type overrides (base-db's calls
 `blaze_graph::pump::depth`), instead of through the process-wide `set_task_depth` hook. The
 salsa paths that have no database (claims, the runtime's blocking) take the depth from the
-task's `ZalsaLocal`, which records its `TaskId` when it is made. So no indirect call is left
-on the hit path.
+task's `ZalsaLocal`, which records its `TaskId` when it is made. A method on `&self` is
+static where the database is concrete (`attach` is generic over it and reads the depth before
+it makes the `&dyn Database` it stores; `zalsa_local` is the blanket impl over `HasStorage`,
+monomorphized per database),
+and a virtual call only where a caller already holds a `dyn Database`. So no indirect call is
+left on the hit path.
 
 ### Test databases
 
 The twelve test databases (hir-def, hir, hir-ide, hir-ty-mir, hir-ty-codegen, hir-ty-share,
 hir-ty-ub, hir-ty-unsafeck, blaze-items, blaze-intent, blaze-diagnostics, base-db) each
-implemented the traits again. Each becomes `pub(crate) struct TestDB { db: Db }`, with `Deref`
-and `DerefMut` to `Db`, plus its own helpers, made from `Db::for_tests()` and its crate's
-setup (`set_expand_proc_attr_macros`, `hir_ty_mir::provide()`). `&TestDB` coerces to `&Db` at
-every call, so the tests' calls don't change. `test-fixture`'s `WithFixture` changes its bound
-from `SourceDatabase` to `DerefMut<Target = Db>`.
+implemented the traits again. Each becomes `pub(crate) type TestDB = base_db::Db;`, made by
+`Db::for_tests()`. A wrapper struct with `Deref` to `Db` would not do: salsa's accessors
+(`krate.data(db)`, `id.lookup(db)`) are generic over the database, so a `&TestDB` would not
+coerce to `&Db` there and every such call in the tests would change. Each crate's helpers (a
+`fetch_test_crate`) become a crate-private extension trait implemented for `Db`, so their
+call sites stay, and `executed` becomes `Db::log_executed`. `Db` has no `Default`, so a `TestDB::default()` that would quietly make a
+build's database fails to compile; the tool rewrites it to `TestDB::for_tests()`.
+`test-fixture`'s `WithFixture` is implemented for `Db` alone and makes `Db::for_tests()`.
+
+The per-crate setup the test databases did goes away rather than moving. The providers need
+none (above). `set_expand_proc_attr_macros(true)`, which every v2 database sets, is
+rust-analyzer's switch for not expanding attribute macros in an editor; rustc always expands
+them, so hir-def's `ExpandProcAttrMacros` input and the check in `nameres/collector.rs` are
+deleted, and attribute macros always expand.
 
 ## The migration
 
@@ -161,16 +191,17 @@ The work is mechanical at 2,745 sites, and the rest is a short list per crate.
   lifetime, become `&Db` (and `&mut` likewise);
 - `db.as_dyn()` becomes `db`;
 - closures `Fn(&dyn SourceDatabase, usize)` become `Fn(&Db, usize)`;
-- `use` lines get `base_db::Db` and lose `SourceDatabase`.
+- `use` lines get `base_db::Db` and lose `SourceDatabase`;
+- `TestDB::default()` becomes `TestDB::for_tests()`.
 
-It then prints what it couldn't rewrite: `impl SourceDatabase for`, generic bounds
-`DB: HirDatabase`, and `dyn` database uses in macros. Each crate's owner runs it on their crate
+It then prints what it couldn't rewrite: `impl SourceDatabase for`, `impl_hir_database!`,
+generic bounds `DB: HirDatabase`, casts `as &dyn`, and `dyn` database uses in macros. Each crate's owner runs it on their crate
 once their lane is done (or I do, once the crate is free), fixes what it printed, and runs
 `hot_lint`, which must show no `dyn` database.
 
 The order, bottom up, each step complete before the next: salsa (the macro and
 `task_depth`), then base-db (the `mod db` hook, `Files`' signatures, the trait's deletion), then
-hir-expand, hir-def, hir-ty (with the providers), hir-ty-mir (with `provide()`),
+hir-expand, hir-def, hir-ty (with the providers), hir-ty-mir (registering its table),
 hir-ty-borrowck, hir-ty-wfcheck, hir-ty-share, hir-ty-ub, hir-ty-unsafeck, hir-ty-codegen, hir,
 blaze-items, blaze-diagnostics, blaze-intent, blaze-engine, blaze-cargo and load-cargo. Since
 nothing is compiled until every lane is done, the order only matters for which crate's code is
@@ -192,6 +223,8 @@ From the moment base-db's `Db` exists, new front-end code takes `&Db`.
     the test binary's own out-of-line hit and fails on any `call`/`jmp` through a pointer.
 - hir-ty: a `compile_fail` doc test that `dyn HirDatabase` is rejected, replacing the
   `hir_database_is_dyn_compatible` test.
+- hir: `the_mir_and_display_providers_are_linked`, in a test binary that links `hir` and names
+  nothing of hir-ty-mir: `hir_ty::providers::mir()` and `display()` find exactly one table.
 - The front-end test suites run unchanged on the test databases above, which now share the
   build's `Db`, so the tests and a build run the same database code.
 - `hot_lint` over each finished crate finds no `dyn` database.

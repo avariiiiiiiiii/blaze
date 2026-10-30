@@ -14,6 +14,7 @@ pub(crate) fn accumulator(
     let hygiene = Hygiene::from1(&input);
     let args = syn::parse_macro_input!(args as Options<Accumulator>);
     let struct_item = parse_macro_input!(input as syn::ItemStruct);
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let ident = struct_item.ident.clone();
     let m = StructMacro {
         hygiene,
@@ -60,6 +61,7 @@ struct StructMacro {
 #[allow(non_snake_case)]
 impl StructMacro {
     fn try_expand(self) -> syn::Result<TokenStream> {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         let ident = self.struct_item.ident.clone();
 
         let zalsa = self.hygiene.ident("zalsa");

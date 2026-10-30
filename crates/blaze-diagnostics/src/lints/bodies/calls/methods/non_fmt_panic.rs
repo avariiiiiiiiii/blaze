@@ -15,6 +15,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir::{InFile, MacroCallId, db::HirDatabase};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, HasModule as _, ModuleDefId, TraitId,
@@ -399,7 +400,7 @@ fn at(b: &BodyCx<'_, '_>, node: InFile<SyntaxNode>) -> Option<At> {
 }
 
 /// rustc's span of a token of an expansion.
-fn token(db: &dyn HirDatabase, token: InFile<SyntaxToken>) -> Option<At> {
+fn token(db: &Db, token: InFile<SyntaxToken>) -> Option<At> {
     let range = token.value.text_range();
     let shown = token.with_value(range);
     let (written, ctxt) = shown.original_node_file_range_opt(db)?;
@@ -427,7 +428,7 @@ fn last_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 /// Whether `node` is the whole expansion of `call`, a call of a built-in macro other than
 /// `include!` (whose expansion is the included file's code, spanned where it is written).
-fn is_builtin_output(db: &dyn HirDatabase, call: MacroCallId, node: &SyntaxNode) -> bool {
+fn is_builtin_output(db: &Db, call: MacroCallId, node: &SyntaxNode) -> bool {
     let builtin = match call.loc(db).def.kind {
         MacroDefKind::BuiltIn(..) => true,
         MacroDefKind::BuiltInEager(_, expander) => !matches!(expander, EagerExpander::Include),
@@ -501,7 +502,7 @@ fn macro_symbol(b: &BodyCx<'_, '_>, call: MacroCallId) -> String {
 
 /// The name `#[rustc_diagnostic_item = "name"]` gives the macro `def`, its `cfg_attr`s
 /// expanded: what rustc's `get_diagnostic_name` gives of a macro's `DefId`.
-fn macro_item(db: &dyn HirDatabase, def: MacroDefId) -> Option<String> {
+fn macro_item(db: &Db, def: MacroDefId) -> Option<String> {
     let attrs: Vec<ast::Attr> = match def.kind {
         MacroDefKind::Declarative(id, _)
         | MacroDefKind::BuiltIn(id, _)

@@ -36,7 +36,7 @@ use object::{
 use pdb::FallibleIterator;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{Addition, relative};
+use super::{Addition, names::Names, relative};
 
 /// What a splice has to know of the executable, every address relative to where it is
 /// loaded. Nothing of the file is read again.
@@ -53,9 +53,9 @@ pub struct Image {
     base: u64,
     file_alignment: u64,
     section_alignment: u64,
-    symbols: FxHashMap<Box<[u8]>, Named>,
+    symbols: Names<Named>,
     /// How many bytes each static has to itself, `None` for one that shares its place.
-    rooms: FxHashMap<Box<[u8]>, Option<u64>>,
+    rooms: Names<Option<u64>>,
     /// `.pdata`: the functions that have unwind information, sorted by where they start.
     functions: Vec<u8>,
     /// `.reloc`: where the image stores addresses. `None` for an image that is not moved.
@@ -139,8 +139,8 @@ impl Image {
             base: optional.image_base(),
             file_alignment,
             section_alignment,
-            symbols: FxHashMap::default(),
-            rooms: FxHashMap::default(),
+            symbols: Names::with_capacity(1 << 12)?,
+            rooms: Names::with_capacity(1 << 12)?,
             functions: Vec::new(),
             fixups: None,
             guid: [0; 16],
@@ -166,7 +166,7 @@ impl Image {
         image.read_symbols(path, &debug)?;
         for object in objects {
             for (name, room) in rooms(&CoffFile::parse(*object)?)? {
-                image.rooms.entry(name.into()).or_insert(room);
+                image.rooms.get_or_insert(name, room)?;
             }
         }
         Ok(image)
@@ -196,7 +196,7 @@ impl Image {
             let Some(address) = public.offset.to_rva(&address_map) else { continue };
             let address = u64::from(address.0);
             *names_of.entry(address).or_default() += 1;
-            found.push((public.name.as_bytes().into(), address));
+            found.push((public.name.as_bytes(), address));
         }
 
         let ends: FxHashMap<u64, u64> = (self.functions.chunks_exact(FUNCTION))
@@ -214,13 +214,11 @@ impl Image {
                 Kind::Data
             };
             let defined = Defined { address, kind };
-            self.symbols
-                .entry(name)
-                .and_modify(|named| match named {
-                    Named::One(other) if other.address == address => {}
-                    _ => *named = Named::Many,
-                })
-                .or_insert(Named::One(defined));
+            match self.symbols.get_or_insert(name, Named::One(defined))? {
+                (_, true) => {}
+                (Named::One(other), false) if other.address == address => {}
+                (named, false) => *named = Named::Many,
+            }
         }
         Ok(())
     }
@@ -566,10 +564,20 @@ impl<'a> Patch<'a> {
             Some(Named::Many) => bail!("{} names several things in the executable", shown()),
             // What a library exports is called through a stub of the linker's, which there
             // is none of when everything so far went through the slot the loader fills.
-            None => match image.symbols.get(&*[b"__imp_", name].concat()) {
-                Some(Named::One(slot)) => Ok(Target::Import(slot.address)),
-                _ => bail!("{} is not in the executable", shown()),
-            },
+            None => {
+                let slot = blaze_mem::scratch::with_bytes(|imported| {
+                    imported.extend_from_slice(b"__imp_");
+                    imported.extend_from_slice(name);
+                    match image.symbols.get(imported) {
+                        Some(Named::One(slot)) => Some(slot.address),
+                        _ => None,
+                    }
+                });
+                match slot {
+                    Some(slot) => Ok(Target::Import(slot)),
+                    None => bail!("{} is not in the executable", shown()),
+                }
+            }
         }
     }
 

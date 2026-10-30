@@ -3,6 +3,8 @@
 //! rust-lang/cargo at 5f94df478, MIT or Apache-2.0), with the messages cargo fails with. Each
 //! names the test it comes from; `[ROOT]` is `/p`.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::unit::Target;
 
@@ -380,12 +382,10 @@ fn a_line_is_a_directive_exactly_when_cargo_reads_one() {
     let cargo = |line: &[u8]| {
         std::str::from_utf8(line).ok().map(str::trim).filter(|it| it.starts_with("cargo:"))
     };
-    let mut state = 0x853c_49e6_748f_ea9bu64;
+    let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
     for _ in 0..50_000 {
         let mut line = Vec::new();
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
+        let state = rng.next_u64();
         for at in 0..(state % 6) {
             line.extend_from_slice(pieces[((state >> (8 + 4 * at)) % pieces.len() as u64) as usize]);
         }
@@ -446,11 +446,9 @@ fn a_key_is_found_exactly_by_its_name() {
             }
         }
     }
-    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for _ in 0..20_000 {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
+        let state = rng.next_u64();
         let len = (state % 25) as usize;
         names.push(
             (0..len).map(|at| b"rustc-linkargbe"[(state >> (at % 60)) as usize % 15]).collect(),
@@ -516,33 +514,27 @@ fn the_single_pass_reads_as_the_old_parser() {
             [None, Some("1.60"), Some("1.80.0")].map(|msrv| foo("0.1.0", msrv, targets.clone()))
         })
         .collect();
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = |bound: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % bound as u64) as usize
-    };
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let (mut agreed_ok, mut agreed_err) = (0, 0);
     for _ in 0..40_000 {
         let mut printed = Vec::new();
-        for _ in 0..1 + next(5) {
-            printed.extend_from_slice(prefixes[next(prefixes.len())].as_bytes());
-            printed.extend_from_slice(keys[next(keys.len())].as_bytes());
-            if next(6) > 0 {
+        for _ in 0..1 + rng.index(5) {
+            printed.extend_from_slice(prefixes[rng.index(prefixes.len())].as_bytes());
+            printed.extend_from_slice(keys[rng.index(keys.len())].as_bytes());
+            if rng.index(6) > 0 {
                 printed.push(b'=');
             }
-            printed.extend_from_slice(values[next(values.len())].as_bytes());
-            printed.extend_from_slice(ends[next(ends.len())]);
+            printed.extend_from_slice(values[rng.index(values.len())].as_bytes());
+            printed.extend_from_slice(ends[rng.index(ends.len())]);
         }
-        let package = &packages[next(packages.len())];
-        let generated = if next(2) == 0 { "/old/out" } else { "/new/out" };
-        let rustc_bootstrap = [None, Some("1"), Some("foo")][next(3)].map(str::to_owned);
+        let package = &packages[rng.index(packages.len())];
+        let generated = if rng.index(2) == 0 { "/old/out" } else { "/new/out" };
+        let rustc_bootstrap = [None, Some("1"), Some("foo")][rng.index(3)].map(str::to_owned);
         let cx = Context {
             package,
             out_dir_when_generated: Path::new(generated),
             out_dir: Path::new("/new/out"),
-            nightly_features_allowed: next(2) == 0,
+            nightly_features_allowed: rng.index(2) == 0,
             rustc_bootstrap,
         };
         let (new, old) = (parse(&printed, &cx), reference::parse(&printed, &cx));

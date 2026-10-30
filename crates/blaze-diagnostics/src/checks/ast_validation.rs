@@ -34,6 +34,7 @@ mod types;
 
 use std::{cell::OnceCell, ops::ControlFlow};
 
+use base_db::Db;
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};
 use syntax::{
@@ -123,12 +124,12 @@ impl V<'_, '_, '_, '_> {
 
     /// Gives `diag`, found at `node`, as the walk comes to it.
     fn emit(&self, out: &mut Out, node: &SyntaxNode, diag: Diag) {
-        self.push(out, node, diag, Phase::Resolve, Pass::Early);
+        self.push(out, node, diag, Phase::Validate, Pass::Early);
     }
 
     /// Gives `diag`, found at `node`, as the walk leaves it.
     fn emit_after(&self, out: &mut Out, node: &SyntaxNode, diag: Diag) {
-        self.push(out, node, diag, Phase::Resolve, Pass::Post);
+        self.push(out, node, diag, Phase::Validate, Pass::Post);
     }
 
     /// Gives `diag`, an error rustc's parser gives of `node`.
@@ -256,7 +257,7 @@ impl V<'_, '_, '_, '_> {
 
 /// The nodes a node is in (see [`V::ancestors`]).
 struct Ancestors<'db> {
-    db: &'db dyn hir::db::HirDatabase,
+    db: &'db Db,
     file: HirFileId,
     next: Option<SyntaxNode>,
 }

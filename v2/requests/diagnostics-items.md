@@ -28,6 +28,7 @@ so a crate with both kinds lists them in a different order from rustc's. Until t
 use `Phase::Resolve` and `checks::PASSES`.
 
 > forwarded to diagnostics: the parent's files.
+> applied by diagnostics: `Phase` is now `Parse, CrateAttrs, Expand, Validate, Resolve, Lower, Items, Bodies, Mir, Late, Stashed`. Macro errors, macro definitions, E0583, macros not found, derives, `extern crate`, `#![feature]`'s read and expansion's gates, `validate` and macro calls' attributes are at `Expand`; `checks::ast_validation` is at `Validate`; `checks::attrs::parsed` is at `Lower`, except macro calls'. The lints' own phases are unchanged.
 
 ## 3. The follow-set errors of `macro_rules!` matchers (`diagnostics-lints-syntax-early`: `crates/blaze-diagnostics/src/lints/syntax/early/macros/matchers/follow.rs`)
 

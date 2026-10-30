@@ -1,8 +1,9 @@
 //! The platform: memory objects and their mappings, the channel's transport, handing objects
-//! to a run process, its threads, the instruction cache and stack walks. Every `unsafe` of
-//! the crate outside the loader is under this module, behind the safe API each platform
-//! module exports with the same names and these signatures (`Error` is `crate::Error`,
-//! `Channel` is `crate::channel::Channel`, `Access` is `crate::Access`):
+//! to a run process and laying them over its executable, its threads, the instruction cache
+//! and stack walks. Every `unsafe` of the crate is under this module, behind the safe API each
+//! platform module exports with the same names and these signatures (`Error` is
+//! `crate::Error`, `Channel` is `crate::channel::Channel`, `Access` is `crate::Access`,
+//! `Overlay` and `Grant` are `crate::handshake`'s):
 //!
 //! - `fn page() -> u64`: the mapping granule (Linux's page size, 16 KiB on macOS AArch64,
 //!   the 64 KiB allocation granularity on Windows).
@@ -28,34 +29,40 @@
 //! - `struct Stream` (`Send`): a connected byte stream of the channel.
 //!   `fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>` (0 when the peer hung up),
 //!   `fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error>`,
-//!   `fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error>`,
-//!   `fn raw(&self) -> i64` (the fd or handle the program's runtime is given; it stays open
-//!   when the `Stream` is forgotten) and `fn from_raw(raw: i64) -> Result<Stream, Error>`.
+//!   `fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error>`.
 //! - `struct Listener` (daemon, `Send`): `fn bind(dir: &Path) -> Result<(Listener, String),
 //!   Error>`, the `String` being what `connect` takes; `fn accept(&self) -> Result<(Stream,
 //!   u32), Error>`, the peer's process ID as the OS says it, refusing peers of another user.
-//! - `fn connect(address: &str) -> Result<Stream, Error>` (loader).
+//! - `fn connect(address: &str) -> Result<Stream, Error>` (start hook).
 //! - `fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object,
 //!   Rights)]) -> Result<Remote, Error>` (daemon): sends the GRANT frame of body `grant`
-//!   (kind `kinds::GRANT`, sequence 0) and, with it or after it, `objects` so the loader of
-//!   process `pid` can map each with the rights `Rights` says and no more.
+//!   (kind `kinds::GRANT`, sequence 0) and, with it or after it, `objects` so the start hook
+//!   of process `pid` can map each with the rights `Rights` says and no more.
 //!   `fn recv_objects(channel: &mut Channel, count: usize) -> Result<Vec<Granted>, Error>`
-//!   (loader), called once the GRANT frame was read, gives them in the same order.
-//! - `struct Remote` (daemon, `Send`): what the daemon keeps to act in the run process;
-//!   `fn map(&self, object: u32, offset: u64, len: u64, at: u64, access: Access) ->
-//!   Result<u64, Error>` serves a loader's MAP frame where the platform maps from the
-//!   daemon's side (Windows, `at` 0 meaning anywhere), and is an error elsewhere.
-//! - `fn reserve(channel: &mut Channel, len: u64, at: Option<u64>) -> Result<u64, Error>`
-//!   (loader): address space of `len` bytes mapped with no access, at `at` or anywhere,
-//!   aligned to `page()`, for `Granted::map` to map into.
-//! - `struct Granted` (loader): an object the loader was given. `fn len(&self) -> u64`,
-//!   `fn map(&self, channel: &mut Channel, offset: u64, len: u64, at: u64, access: Access) ->
-//!   Result<u64, Error>` (at `at` exactly, inside a reservation of `reserve` or in free
-//!   address space; never over anything else), `fn view(&self, channel: &mut Channel) ->
-//!   Result<View, Error>` (the whole object, read-only, to parse the image from).
-//! - `fn protect(at: u64, len: u64, access: Access) -> Result<(), Error>` (loader): the
-//!   protection of pages of a private copy it mapped (`Access::Copy` to `Access::Read` for an
-//!   ELF RELRO segment after relocation); never of code.
+//!   (start hook), called once the GRANT frame was read, gives them in the same order.
+//! - `struct Remote` (daemon, `Send`): what the daemon keeps to act in the run process.
+//!   `fn map(&self, object: u32, access: Access) -> Result<u64, Error>` maps a whole granted
+//!   object anywhere in the run process, for a hook's MAP frame where the platform maps from
+//!   the daemon's side (Windows); an error elsewhere. `fn overlay(&self, slide: u64, grant:
+//!   &Grant) -> Result<(), Error>` lays the grant's overlays over the run process's image
+//!   (Windows, for a hook's OVERLAY frame), each at its linked address plus `slide`, every
+//!   other byte of the image's span as it was; an error elsewhere. On a failure past the
+//!   first change it ends the process, which can't run half laid over.
+//! - `struct Granted` (start hook): an object the hook was given. `fn len(&self) -> u64`,
+//!   `fn map_anywhere(&self, channel: &mut Channel, access: Access) -> Result<u64, Error>`
+//!   (the whole object, for the rest of the process).
+//! - `fn overlay(channel: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64)
+//!   -> Result<(), Error>` (start hook): replaces each overlay's pages of this process's
+//!   executable, at its linked address plus `slide`, with the mapping of its object, at once
+//!   (one `mmap` or `mach_vm_map` each; Windows asks the daemon, OVERLAY). The caller proved
+//!   every overlay is a code segment of the image, with the bytes it replaces, or inside a
+//!   reservation ([`crate::handshake::Grant::check`]).
+//! - `fn own_image() -> Result<(u64, &'static [u8]), Error>` (start hook): where this
+//!   process's executable has its header, and its headers' bytes (the program headers, load
+//!   commands or section table), as the system loader mapped them.
+//! - `fn clone_file(from: &Path, to: &Path) -> Result<bool, Error>` (daemon): makes `to`, new,
+//!   a clone of `from` sharing its blocks (Linux `FICLONE`, macOS `clonefile`); `false` when
+//!   the filesystem has no clones (the caller writes the bytes), an error otherwise.
 //! - `fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error>`: replaces `out` with the
 //!   IDs of the live threads of process `pid` as `thread_id` names them; none for a process
 //!   that is gone.
@@ -103,36 +110,23 @@ pub(crate) use none::*;
 /// What a run process may do with an object it is given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Rights {
-    /// Map it to read, execute or copy, never to write it shared: the image, a premapped one.
+    /// Map it to read, execute or copy, never to write it shared: the image and arena, a
+    /// fixed map's.
     Code,
-    /// Map it shared, writable: the fence's control words.
-    Control,
+    /// Map it shared and writable, never executable: the fence's control words, the cells.
+    Words,
 }
 
-/// The boot record the loader of this process left at `at`
-/// ([`crate::runtime::BOOT_VAR`]).
-pub(crate) fn boot(at: u64) -> Result<crate::runtime::Boot, crate::Error> {
-    if at == 0 || !at.is_multiple_of(align_of::<crate::runtime::Boot>() as u64) {
-        return Err(crate::Error::new(format!("a boot record at {at:#x}")));
-    }
-    // SAFETY: the loader of this process (blaze-inproc-run) put a `Boot` at `at` in its own
-    // static data, which lives as long as the process, and named it in the environment
-    // before it jumped into the program; it is never written after. The address is non-null
-    // and aligned (checked above). The fields are plain integers: any bits are a value.
-    Ok(unsafe { std::ptr::read(at as *const crate::runtime::Boot) })
-}
-
-/// The control words the loader of this process mapped at `at`, `len` bytes, for the rest of
-/// the process.
+/// The control words the start hook mapped at `at`, `len` bytes, for the rest of the process.
 pub(crate) fn adopt_words(at: u64, len: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
     if at == 0 || !at.is_multiple_of(8) || len < crate::fence::CONTROL_BYTES || len > isize::MAX as u64 {
         return Err(crate::Error::new(format!("control words of {len} bytes at {at:#x}")));
     }
-    // SAFETY: the loader mapped the control object shared and writable at `at`, `len` bytes,
-    // and never unmaps it (`load::main` leaks its mapping); the boot record says so. It is
-    // non-null, 8-aligned and of `len / 8` whole words (checked above). Every access to it,
-    // here and in the daemon's process, is atomic, so a `&[AtomicU64]` to it is sound for
-    // the rest of the process.
+    // SAFETY: the start hook mapped the control object shared and writable at `at`, `len`
+    // bytes, with `Granted::map_anywhere`, which never unmaps it. It is non-null, 8-aligned
+    // and of `len / 8` whole words (checked above). Every access to it, here and in the
+    // daemon's process, is atomic, so a `&[AtomicU64]` to it is sound for the rest of the
+    // process.
     Ok(unsafe { std::slice::from_raw_parts(at as *const std::sync::atomic::AtomicU64, (len / 8) as usize) })
 }
 

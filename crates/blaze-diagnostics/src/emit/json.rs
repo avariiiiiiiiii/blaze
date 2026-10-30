@@ -83,7 +83,9 @@ pub(super) fn line<'a>(diag: &'a Diag, placed: &Placed<'a>, rendered: String) ->
     );
     children.extend(suggestions.iter().map(|it| suggestion(it, placed)));
     let code = diag.code.as_ref().map(|code| match code {
-        Code::Error(code) => DiagnosticCode { code, explanation: codes::explanation(code) },
+        Code::Error(code) | Code::LintWithCode { code, .. } => {
+            DiagnosticCode { code, explanation: codes::explanation(code) }
+        }
         Code::Lint(name) => DiagnosticCode { code: name, explanation: None },
     });
     let diagnostic = Diagnostic {

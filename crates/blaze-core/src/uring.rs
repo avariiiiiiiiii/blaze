@@ -1172,7 +1172,7 @@ struct Connection {
 struct Job {
     tag: Tag,
     root: OwnedFd,
-    names: Names,
+    names: Arc<Names>,
     chunks: usize,
     /// The next chunk to claim.
     next: AtomicUsize,
@@ -1194,7 +1194,7 @@ unsafe impl Sync for Job {}
 unsafe impl Send for Job {}
 
 impl Job {
-    fn new(tag: Tag, root: OwnedFd, names: Names, offload: &Offload) -> Job {
+    fn new(tag: Tag, root: OwnedFd, names: Arc<Names>, offload: &Offload) -> Job {
         // alloc: the sweep's result, one per sweep, handed to its asker.
         let mut out = vec![Stamp::UNKNOWN; names.len()];
         let base = out.as_mut_ptr();
@@ -1931,7 +1931,7 @@ impl Uring {
 
     /// Starts the sweep of [`Effect::Stamp`] `tag` over `names` on the [`Stampers`], made for
     /// the first. Fails only where the root cannot be opened or the stampers cannot start.
-    fn sweep(&mut self, tag: Tag, names: Names) -> io::Result<()> {
+    fn sweep(&mut self, tag: Tag, names: Arc<Names>) -> io::Result<()> {
         let root = open_dir(&self.root)
             // alloc: the error of a sweep that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", self.root.display())))?;
@@ -3822,7 +3822,7 @@ mod tests {
     /// file (one through the directory's link), directories, the links, and names with nothing
     /// there (under a file, under a dangling link, through the directory's link). Undone by
     /// [`unsweep`].
-    fn sweep_tree(root: &Path, files: usize) -> Names {
+    fn sweep_tree(root: &Path, files: usize) -> Arc<Names> {
         let mut names = Names::default();
         for n in 0..files {
             if n % 100 == 0 {
@@ -3844,7 +3844,7 @@ mod tests {
         for name in GONE.iter().chain(&others) {
             assert!(names.push_str(name));
         }
-        names
+        Arc::new(names)
     }
 
     /// Files of [`sweep_tree`]'s besides the `files` in `src/d*`.
@@ -3958,8 +3958,8 @@ mod tests {
         let mut effects = vec![
             Effect::Stamp { files: names.clone(), tag: Tag(1) },
             Effect::Append { file: FileName::new("log").unwrap(), bytes: b"x".to_vec(), tag: Tag(2) },
-            Effect::Stamp { files: reversed, tag: Tag(3) },
-            Effect::Stamp { files: Names::default(), tag: Tag(4) },
+            Effect::Stamp { files: Arc::new(reversed), tag: Tag(3) },
+            Effect::Stamp { files: Arc::default(), tag: Tag(4) },
             Effect::Timer { after: Duration::from_millis(1), tag: Tag(5) },
             Effect::Entries { dir: src, tag: Tag(6) },
             Effect::Entries { dir: FileName::new("src/missing").unwrap(), tag: Tag(7) },

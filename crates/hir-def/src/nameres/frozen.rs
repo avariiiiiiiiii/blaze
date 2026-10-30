@@ -18,7 +18,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use base_db::{FileId, VfsPath};
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
@@ -56,16 +56,17 @@ use crate::{
     builtin_type::BuiltinType,
     expr_store::Body,
     item_scope::{
-        DeriveMacroInvocation, GlobId, ImportId, ImportOrDef, ImportOrExternCrate, ImportOrGlob,
-        ItemScope,
+        DeriveMacroInvocation, GlobAmbiguity, GlobId, ImportId, ImportOrDef, ImportOrExternCrate,
+        ImportOrGlob, ItemInNs, ItemScope, ShadowedImport, UnderscoreImport,
     },
     item_tree::{TreeId, VisibilityExplicitness},
     lang_item::{LangItemEnum, LangItemTarget, LangItems},
     nameres::{
         DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin, ModulesSlot,
         diagnostics::DefDiagnosticKind,
+        uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use, Used},
     },
-    per_ns::Item,
+    per_ns::{Item, Namespace},
     unstable_features::UnstableFeatures,
     visibility::Visibility,
 };
@@ -75,7 +76,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 8";
+pub const ENCODING: &str = "blaze frozen def map 9";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,7 +104,7 @@ pub struct FrozenDefMaps {
 }
 
 /// Has name resolution use `maps`.
-pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     use salsa::{Durability, Setter};
     let maps = Arc::new(maps);
     match FrozenDefMaps::try_get(db) {
@@ -155,13 +156,13 @@ fn agrees(krate: Crate, kind: &'static str) {
     DIFFERENCES.record(krate, kind, None);
 }
 
-fn differs(db: &dyn SourceDatabase, krate: Crate, what: &str, written: &[u8], frozen: &[u8]) {
+fn differs(db: &Db, krate: Crate, what: &str, written: &[u8], frozen: &[u8]) {
     record_difference(db, krate, "def map", what, written, frozen);
 }
 
 /// Records that the frozen `kind` of `krate` differs from `what`, which wrote `written`.
 pub fn record_difference(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
     kind: &'static str,
     what: &str,
@@ -181,7 +182,7 @@ pub fn record_difference(
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
 /// `DefMap` is frozen.
-pub(super) fn served(db: &dyn SourceDatabase, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
+pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     let frozen = FrozenDefMaps::try_get(db)?.maps(db).get(&krate)?.clone();
     if frozen.mode == Mode::Check {
         return None;
@@ -200,7 +201,7 @@ pub(super) fn served(db: &dyn SourceDatabase, krate: Crate) -> Option<(DefMap, L
 
 /// Records a difference between the `DefMap` resolving found and the frozen one, in
 /// [`Mode::Check`].
-pub(super) fn check(db: &dyn SourceDatabase, krate: Crate, def_map: &DefMap, local: &LocalDefMap) {
+pub(super) fn check(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap) {
     let Some(frozen) = FrozenDefMaps::try_get(db).and_then(|it| it.maps(db).get(&krate).cloned())
     else {
         return;
@@ -219,7 +220,7 @@ pub(super) fn check(db: &dyn SourceDatabase, krate: Crate, def_map: &DefMap, loc
 
 /// Why the frozen bytes of `krate` cannot be read in this database: a file they name is not
 /// loaded.
-pub fn unreadable(db: &dyn SourceDatabase, krate: Crate, bytes: &[u8]) -> Option<String> {
+pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
     let mut dec = Dec::new(db, krate, bytes);
     dec.files().err()
 }
@@ -232,7 +233,7 @@ pub struct FrozenLangItems {
 }
 
 /// Has finding the lang items of a crate use `maps`.
-pub fn set_lang_items(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
+pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     use salsa::{Durability, Setter};
     let maps = Arc::new(maps);
     match FrozenLangItems::try_get(db) {
@@ -245,14 +246,14 @@ pub fn set_lang_items(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen
     }
 }
 
-fn frozen_lang_items(db: &dyn SourceDatabase, krate: Crate) -> Option<Frozen> {
+fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
     FrozenLangItems::try_get(db)?.maps(db).get(&krate).cloned()
 }
 
 /// What [`crate_lang_items`](crate::lang_item::crate_lang_items) reads for `krate` instead of
 /// finding them, when they are frozen.
 pub(crate) fn served_lang_items(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
 ) -> Option<Option<Box<LangItems>>> {
     let frozen = frozen_lang_items(db, krate).filter(|it| it.mode != Mode::Check)?;
@@ -281,7 +282,7 @@ pub(crate) fn served_lang_items(
 
 /// The bytes of the lang items of `krate` as they are now: found, or read in [`Mode::Serve`]
 /// and [`Mode::Verify`].
-pub fn encode_lang_items(db: &dyn SourceDatabase, krate: Crate) -> R<Vec<u8>> {
+pub fn encode_lang_items(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
     enc.option(crate::lang_item::crate_lang_items(db, krate), |enc, items| {
         enc.usize(LangItemEnum::ALL.len())?;
@@ -295,7 +296,7 @@ pub fn encode_lang_items(db: &dyn SourceDatabase, krate: Crate) -> R<Vec<u8>> {
 
 /// Records a difference between the frozen lang items of `krate` and the live ones in
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
-pub fn check_lang_items(db: &dyn SourceDatabase, krate: Crate) {
+pub fn check_lang_items(db: &Db, krate: Crate) {
     let Some(frozen) = frozen_lang_items(db, krate) else { return };
     let what = match frozen.mode {
         Mode::Serve => return,
@@ -314,14 +315,14 @@ pub fn check_lang_items(db: &dyn SourceDatabase, krate: Crate) {
 
 /// The bytes of the `DefMap` of `krate` as name resolution computes it, or why it cannot be
 /// frozen.
-pub fn encode(db: &dyn SourceDatabase, krate: Crate) -> R<Vec<u8>> {
+pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let pair = super::crate_local_def_map(db, krate);
     encode_maps(db, krate, pair.def_map(db), pair.local(db))
 }
 
 /// `krate` and the crates it depends on, transitively, breadth first in the order the crate
 /// graph lists dependencies: the crates frozen bytes name by index.
-fn closure(db: &dyn SourceDatabase, krate: Crate) -> Vec<Crate> {
+fn closure(db: &Db, krate: Crate) -> Vec<Crate> {
     let mut order = vec![krate];
     let mut seen: FxHashSet<Crate> = order.iter().copied().collect();
     let mut at = 0;
@@ -338,7 +339,7 @@ fn closure(db: &dyn SourceDatabase, krate: Crate) -> Vec<Crate> {
 
 /// The directory of the root file of `krate`, which frozen bytes name its files from, and its
 /// source root.
-fn root_dir(db: &dyn SourceDatabase, krate: Crate) -> R<(String, bool, base_db::SourceRootId)> {
+fn root_dir(db: &Db, krate: Crate) -> R<(String, bool, base_db::SourceRootId)> {
     let root = krate.data(db).root_file_id;
     let source_root = db.file_source_root(root).source_root_id(db);
     let path = db.source_root(source_root).source_root(db).path_for_file(&root).cloned();
@@ -372,14 +373,14 @@ fn vfs_path(real: bool, text: String) -> VfsPath {
 /// the same in every checkout. No path or literal holds a NUL.
 const OUT: &str = "\0OUT_DIR";
 
-fn out_dir(db: &dyn SourceDatabase, krate: Crate) -> Option<String> {
+fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
     let out = out.trim_end_matches('/');
     (!out.is_empty()).then(|| out.to_owned())
 }
 
 /// The `OUT_DIR` of each crate of `closure` that has one, by its index there.
-fn out_dirs(db: &dyn SourceDatabase, closure: &[Crate]) -> Vec<(u32, String)> {
+fn out_dirs(db: &Db, closure: &[Crate]) -> Vec<(u32, String)> {
     let dirs = closure.iter().enumerate();
     dirs.filter_map(|(index, &krate)| Some((index as u32, out_dir(db, krate)?))).collect()
 }
@@ -423,7 +424,7 @@ const SEEN: u8 = 1;
 /// Writes values that name items of `krate` and its dependencies as frozen bytes; see the
 /// module documentation.
 pub struct Enc<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     out: Vec<u8>,
     /// Writing a fingerprint: macro calls and syntax contexts are written as hashes of what
     /// they are, and nothing is named by an index.
@@ -467,7 +468,7 @@ fn hash128(bytes: &[u8]) -> u128 {
 }
 
 fn encode_maps(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
     def_map: &DefMap,
     local: &LocalDefMap,
@@ -484,7 +485,7 @@ fn encode_maps(
 
 impl<'a> Enc<'a> {
     /// Writes values of `krate`, which names its dependencies by their index in its closure.
-    pub fn new(db: &'a dyn SourceDatabase, krate: Crate) -> Self {
+    pub fn new(db: &'a Db, krate: Crate) -> Self {
         let closure = closure(db, krate);
         let crates = closure.iter().enumerate().map(|(i, &it)| (it, i as u32)).collect();
         let out_dirs = out_dirs(db, &closure);
@@ -1366,6 +1367,23 @@ impl Enc<'_> {
         }
     }
 
+    fn item_in_ns(&mut self, it: ItemInNs) -> R {
+        match it {
+            ItemInNs::Types(it) => {
+                self.u8(0);
+                self.def(it)
+            }
+            ItemInNs::Values(it) => {
+                self.u8(1);
+                self.def(it)
+            }
+            ItemInNs::Macros(it) => {
+                self.u8(2);
+                self.macro_id(it)
+            }
+        }
+    }
+
     fn import_or_def(&mut self, it: ImportOrDef) -> R {
         match it {
             ImportOrDef::Import(ImportId { use_, idx }) => {
@@ -1423,6 +1441,9 @@ impl Enc<'_> {
             extern_blocks,
             unnamed_consts,
             unnamed_trait_imports,
+            underscore_imports,
+            glob_ambiguities,
+            shadowed_imports,
             use_imports_types,
             use_imports_values,
             use_imports_macros,
@@ -1490,6 +1511,27 @@ impl Enc<'_> {
             self.def(ModuleDefId::TraitId(it))?;
             self.visibility(vis)?;
             self.option(import, |enc, ImportId { use_, idx }| enc.import(use_, idx))?;
+        }
+        self.usize(underscore_imports.len())?;
+        for &UnderscoreImport { import: ImportId { use_, idx }, def, vis } in underscore_imports {
+            self.import(use_, idx)?;
+            self.option(def, Self::def)?;
+            self.visibility(vis)?;
+        }
+        self.usize(glob_ambiguities.len())?;
+        for &GlobAmbiguity { ref name, other, glob: GlobId { use_, idx }, vis } in glob_ambiguities
+        {
+            self.name(name)?;
+            self.item_in_ns(other)?;
+            self.import(use_, idx)?;
+            self.visibility(vis)?;
+        }
+        self.usize(shadowed_imports.len())?;
+        for &ShadowedImport { import, ref name, item, vis } in shadowed_imports {
+            self.import_or_extern_crate(import)?;
+            self.name(name)?;
+            self.item_in_ns(item)?;
+            self.visibility(vis)?;
         }
         let types =
             self.sorted(use_imports_types.iter(), |enc, k| enc.import_or_extern_crate(**k))?;
@@ -1739,6 +1781,7 @@ impl Enc<'_> {
             diagnostics_by_module: _,
             data,
             session_macros,
+            names,
         } = it;
         let db = self.db;
         if *session_macros {
@@ -1867,11 +1910,79 @@ impl Enc<'_> {
             self.def(function.into())?;
             self.macro_id(id.into())?;
         }
+        self.name_records(names)?;
         self.usize(diagnostics.len())?;
         for it in diagnostics {
             self.diagnostic(it)?;
         }
         Ok(())
+    }
+
+    fn name_records(&mut self, it: &NameRecords) -> R {
+        let NameRecords {
+            uses,
+            unresolved,
+            glob_targets,
+            macro_calls,
+            derive_helpers,
+            not_introducing,
+        } = it;
+        self.usize(uses.len())?;
+        for &Use { import, ref name, ns, used } in uses {
+            self.import_or_extern_crate(import)?;
+            self.name(name)?;
+            self.namespace(ns);
+            self.u8(match used {
+                Used::Scope => 0,
+                Used::Other => 1,
+            });
+        }
+        self.usize(unresolved.len())?;
+        for &it in unresolved {
+            self.import_or_extern_crate(it)?;
+        }
+        self.usize(glob_targets.len())?;
+        for &(GlobId { use_, idx }, module) in glob_targets {
+            self.import(use_, idx)?;
+            self.module(module)?;
+        }
+        self.usize(macro_calls.len())?;
+        for &MacroCallRecord { call, def, via } in macro_calls {
+            self.call(call)?;
+            self.macro_id(def)?;
+            match via {
+                MacroVia::Textual => self.u8(0),
+                MacroVia::Path(import) => {
+                    self.u8(1);
+                    self.option(import, Self::import_or_extern_crate)?;
+                }
+                MacroVia::MacroUse(extern_crate) => {
+                    self.u8(2);
+                    self.option(extern_crate, Self::extern_crate)?;
+                }
+                MacroVia::Prelude => self.u8(3),
+            }
+        }
+        self.usize(derive_helpers.len())?;
+        for &DeriveHelperUse { item, attr, derive, before_derive } in derive_helpers {
+            self.ast_id(item)?;
+            self.u32(attr.item_tree_index());
+            self.macro_id(derive)?;
+            self.bool(before_derive);
+        }
+        self.usize(not_introducing.len())?;
+        for &it in not_introducing {
+            self.extern_crate(it)?;
+        }
+        Ok(())
+    }
+
+    fn namespace(&mut self, it: Namespace) {
+        self.u8(match it {
+            Namespace::Types => 0,
+            Namespace::Values => 1,
+            Namespace::Macros => 2,
+        });
     }
 
     fn local(&mut self, it: &LocalDefMap) -> R {
@@ -1888,7 +1999,7 @@ impl Enc<'_> {
 
 /// Reads what [`Enc`] wrote.
 pub struct Dec<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     bytes: &'a [u8],
     at: usize,
     krate: Crate,
@@ -1907,7 +2018,7 @@ pub struct Dec<'a> {
 }
 
 impl<'a> Dec<'a> {
-    fn new(db: &'a dyn SourceDatabase, krate: Crate, bytes: &'a [u8]) -> Self {
+    fn new(db: &'a Db, krate: Crate, bytes: &'a [u8]) -> Self {
         Dec {
             db,
             bytes,
@@ -1925,7 +2036,7 @@ impl<'a> Dec<'a> {
     }
 
     /// Reads `bytes` [`Enc::finish`] gave of values of `krate`, from the files they name.
-    pub fn new_checked(db: &'a dyn SourceDatabase, krate: Crate, bytes: &'a [u8]) -> R<Self> {
+    pub fn new_checked(db: &'a Db, krate: Crate, bytes: &'a [u8]) -> R<Self> {
         let mut dec = Dec::new(db, krate, bytes);
         dec.files()?;
         Ok(dec)
@@ -1959,7 +2070,7 @@ impl<'a> Dec<'a> {
     }
 }
 
-fn decode(db: &dyn SourceDatabase, krate: Crate, bytes: &[u8]) -> R<(DefMap, LocalDefMap)> {
+fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<(DefMap, LocalDefMap)> {
     let mut dec = Dec::new(db, krate, bytes);
     dec.files()?;
     dec.in_def_map = true;
@@ -2587,6 +2698,16 @@ impl Dec<'_> {
         })
     }
 
+    fn item_in_ns(&mut self) -> R<ItemInNs> {
+        Ok(match self.u8()? {
+            0 => ItemInNs::Types(self.def()?),
+            1 => ItemInNs::Values(self.def()?),
+            2 => ItemInNs::Macros(self.macro_id()?),
+            // alloc: a decode error, the edge.
+            it => return Err(format!("item in namespace {it}")),
+        })
+    }
+
     fn import_or_def(&mut self) -> R<ImportOrDef> {
         Ok(match self.u8()? {
             0 => {
@@ -2721,6 +2842,26 @@ impl Dec<'_> {
                 Ok(ImportId { use_, idx })
             })?;
             Ok((it, Item { def: (), vis, import }))
+        })?;
+        self.fill(&mut scope.underscore_imports, ThinVec::reserve_exact, |dec| {
+            let (use_, idx) = dec.import()?;
+            let def = dec.option(Self::def)?;
+            let vis = dec.visibility()?;
+            Ok(UnderscoreImport { import: ImportId { use_, idx }, def, vis })
+        })?;
+        self.fill(&mut scope.glob_ambiguities, ThinVec::reserve_exact, |dec| {
+            let name = dec.name()?;
+            let other = dec.item_in_ns()?;
+            let (use_, idx) = dec.import()?;
+            let vis = dec.visibility()?;
+            Ok(GlobAmbiguity { name, other, glob: GlobId { use_, idx }, vis })
+        })?;
+        self.fill(&mut scope.shadowed_imports, ThinVec::reserve_exact, |dec| {
+            let import = dec.import_or_extern_crate()?;
+            let name = dec.name()?;
+            let item = dec.item_in_ns()?;
+            let vis = dec.visibility()?;
+            Ok(ShadowedImport { import, name, item, vis })
         })?;
         let (n, room) = self.len_and_room()?;
         scope.use_imports_types.reserve(room);
@@ -3010,8 +3151,68 @@ impl Dec<'_> {
         data.exported_derives = exported.into_iter().collect();
         data.fn_proc_macro_mapping_back = functions.iter().map(|&(f, id)| (id, f)).collect();
         data.fn_proc_macro_mapping = functions.into_iter().collect();
+        def_map.names = self.name_records()?;
         def_map.diagnostics = self.many(Self::diagnostic)?;
         Ok(def_map)
+    }
+
+    fn name_records(&mut self) -> R<NameRecords> {
+        let uses = self.many(|dec| {
+            let import = dec.import_or_extern_crate()?;
+            let name = dec.name()?;
+            let ns = dec.namespace()?;
+            let used = match dec.u8()? {
+                0 => Used::Scope,
+                1 => Used::Other,
+                // alloc: a decode error, the edge.
+                it => return Err(format!("use {it}")),
+            };
+            Ok(Use { import, name, ns, used })
+        })?;
+        let unresolved = self.many(Self::import_or_extern_crate)?;
+        let glob_targets = self.many(|dec| {
+            let (use_, idx) = dec.import()?;
+            Ok((GlobId { use_, idx }, dec.module()?))
+        })?;
+        let macro_calls = self.many(|dec| {
+            let call = dec.call()?;
+            let def = dec.macro_id()?;
+            let via = match dec.u8()? {
+                0 => MacroVia::Textual,
+                1 => MacroVia::Path(dec.option(Self::import_or_extern_crate)?),
+                2 => MacroVia::MacroUse(dec.option(Self::extern_crate)?),
+                3 => MacroVia::Prelude,
+                // alloc: a decode error, the edge.
+                it => return Err(format!("macro found through {it}")),
+            };
+            Ok(MacroCallRecord { call, def, via })
+        })?;
+        let derive_helpers = self.many(|dec| {
+            let item = dec.ast_id()?;
+            let attr = AttrId::from_item_tree_index(dec.u32()?);
+            let derive = dec.macro_id()?;
+            let before_derive = dec.bool()?;
+            Ok(DeriveHelperUse { item, attr, derive, before_derive })
+        })?;
+        let not_introducing = self.many(Self::extern_crate)?;
+        Ok(NameRecords {
+            uses: uses.into_boxed_slice(),
+            unresolved: unresolved.into_boxed_slice(),
+            glob_targets: glob_targets.into_boxed_slice(),
+            macro_calls: macro_calls.into_boxed_slice(),
+            derive_helpers: derive_helpers.into_boxed_slice(),
+            not_introducing: not_introducing.into_boxed_slice(),
+        })
+    }
+
+    fn namespace(&mut self) -> R<Namespace> {
+        Ok(match self.u8()? {
+            0 => Namespace::Types,
+            1 => Namespace::Values,
+            2 => Namespace::Macros,
+            // alloc: a decode error, the edge.
+            it => return Err(format!("namespace {it}")),
+        })
     }
 
     fn local(&mut self) -> R<LocalDefMap> {
@@ -3033,6 +3234,8 @@ mod tests {
 
     const FIXTURE: &str = r#"
 //- /main.rs crate:main deps:lib
+#[macro_use]
+extern crate lib;
 use lib::{Shown, shown};
 mod inner;
 #[derive(Clone, Debug)]
@@ -3040,6 +3243,17 @@ struct Local(u8);
 fn main() { shown!(); }
 #[cfg(any())]
 fn left_out() {}
+mod globs {
+    pub mod a { pub fn x() {} }
+    pub mod b { pub fn x() {} }
+    pub use a::*;
+    pub use b::*;
+}
+pub use globs::*;
+pub use lib::deep::deeper as d;
+pub use d::f;
+pub struct Shadowing;
+pub use lib::Shown as Shadowing;
 
 //- /inner.rs
 pub(super) use super::Local as Again;
@@ -3134,6 +3348,30 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
                 enc.out
             })
             .collect()
+    }
+
+    /// The fixture has what the records hold, so the bytes above cover them.
+    #[test]
+    fn the_name_records_read_back() {
+        let bytes = frozen();
+        let live = TestDB::with_files(FIXTURE);
+        let served = with(Mode::Serve, &bytes);
+        let main = |db: &TestDB| super::super::crate_def_map(db, crate_named(db, "main"));
+        let records = main(&live).name_records();
+        assert!(!records.uses.is_empty() && !records.glob_targets.is_empty());
+        assert!(!records.macro_calls.is_empty() && !records.not_introducing.is_empty());
+        let scopes = |db: &TestDB| {
+            let def_map = main(db);
+            let root = def_map.module(db, def_map.root).scope(db);
+            let globs: usize =
+                def_map.modules(db).map(|(_, it)| it.scope(db).glob_ambiguities().len()).sum();
+            (root.shadowed_imports().len(), globs)
+        };
+        // `Shadowing` in both namespaces, and `x` of `globs`.
+        assert_eq!(scopes(&live), (2, 1));
+        assert_eq!(scopes(&served), scopes(&live));
+        let encoded = |db: &TestDB| encode(db, crate_named(db, "main")).unwrap();
+        assert_eq!(encoded(&served), encoded(&live));
     }
 
     #[test]

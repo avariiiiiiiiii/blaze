@@ -84,6 +84,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -463,7 +464,7 @@ class Reference:
 
 def cargo_configs(ws: Path, env: dict[str, str]) -> str:
     """The cargo configuration files outside the checkout that apply to a build in it (those
-    of every directory above it and of CARGO_HOME), each by its path and sha256."""
+    of every directory above it and of CARGO_HOME), each by its path and digest (`engine.digest`)."""
     home = Path(env.get("CARGO_HOME") or Path.home() / ".cargo")
     found: list[str] = []
     for directory in (*[d / ".cargo" for d in ws.parents], home):
@@ -646,6 +647,24 @@ def run_program(engines: list[tuple[Forced | None, engine.Engine]], program: Pro
     return found, lock
 
 
+def largest_first(programs: list[Program]) -> list[int]:
+    """The indices of `programs` in the order to start them: the whole workspaces (blaze, nushell, ripgrep,
+    helix: minutes each) before the crates.io crates (seconds each), each group as given. The
+    longest first is Graham's LPT rule, so no big build runs alone at the end while the other
+    slots sit idle; the report keeps the input's order all the same."""
+    return sorted(range(len(programs)), key=lambda i: programs[i].name.startswith("crates.io/"))
+
+
+def overhead(before: os.times_result, after: os.times_result, wall_s: float) -> dict[str, float]:
+    """The harness's own CPU time over a run against its children's (cargo, rustc, blaze's
+    command line, the programs), whose share is to stay under 1%. A daemon blaze detaches is no
+    child, so its CPU time is left out: the share is an upper bound."""
+    own = (after.user - before.user) + (after.system - before.system)
+    children = (after.children_user - before.children_user) + (after.children_system - before.children_system)
+    return dict(wall_s=round(wall_s, 3), harness_cpu_s=round(own, 3), children_cpu_s=round(children, 3),
+                harness_share=round(own / (own + children), 5) if own + children > 0 else 0.0)
+
+
 def programs_of(args: Input, corpus: Corpus, cache: Path) -> list[Program]:
     names = args.projects or get_args(Name)
     chosen: list[Program] = []
@@ -696,9 +715,11 @@ def main(args: Input) -> None:
         toolchain = engine.toolchain_identity(engine.scrubbed())
     except engine.Failed as e:
         fail(SCRIPT, str(e))
+    began, wall = os.times(), time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        running = {pool.submit(run_program, engines, p, work / p.dir, store, args.keep, kept, toolchain): p.name
-                   for p in programs}
+        submitted = {i: pool.submit(run_program, engines, programs[i], work / programs[i].dir, store, args.keep, kept,
+                                    toolchain) for i in largest_first(programs)}
+        running = {submitted[i]: p.name for i, p in enumerate(programs)}
         # In the order of the projects, not the order they end in: one report for one input.
         for done, name in running.items():
             founds, lock = done.result()
@@ -706,6 +727,7 @@ def main(args: Input) -> None:
             for found in founds:
                 rep.add(found.name, found.verdict, found.detail, **found.numbers)
     rep.extra["locks"] = dict(sorted(locks.items()))
+    rep.extra.update(overhead(began, os.times(), time.monotonic() - wall))
     if not args.keep:
         shutil.rmtree(store, ignore_errors=True)
     rep.finish()
@@ -965,8 +987,25 @@ def test_compare_backends() -> None:
     assert compare_backends("p@1", steps, [("stencil", same)]) == []
 
 
+def test_largest_first() -> None:
+    def program(name: str) -> Program:
+        return Program(name, name, lambda ws: None, ())
+
+    given = [program(n) for n in ("crates.io/a@1", "nushell@0.1", "crates.io/b@2", "blaze@abc")]
+    assert largest_first(given) == [1, 3, 0, 2], largest_first(given)
+
+
+def test_overhead() -> None:
+    before = os.times_result((1.0, 0.5, 10.0, 5.0, 0.0))
+    after = os.times_result((1.5, 0.6, 70.0, 25.0, 100.0))
+    got = overhead(before, after, 12.0)
+    assert got == dict(wall_s=12.0, harness_cpu_s=0.6, children_cpu_s=80.0, harness_share=round(0.6 / 80.6, 5)), got
+    assert overhead(before, before, 0.0)["harness_share"] == 0.0
+
+
 SELFTESTS = (test_kept_cargo, test_index_path, test_listed_cksum, test_verified, test_unpack, test_judge, test_test_results, test_corpus,
-             test_pinned, test_backends_input, test_dev_backend, test_panics, test_compare_backends)
+             test_pinned, test_backends_input, test_dev_backend, test_panics, test_compare_backends, test_overhead,
+             test_largest_first)
 
 
 def selftest() -> int:

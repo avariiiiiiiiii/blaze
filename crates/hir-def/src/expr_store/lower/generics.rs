@@ -7,20 +7,28 @@ use either::Either;
 use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;
-use syntax::ast::{self, HasName, HasTypeBounds};
-use thin_vec::ThinVec;
+use syntax::{
+    AstPtr,
+    ast::{self, HasName, HasTypeBounds},
+};
 
 use crate::{
     GenericDefId, TypeOrConstParamId, TypeParamId,
     expr_store::{
         ListMark, TypePtr,
         lower::{ExprCollector, LifetimeBoundScope, NamedLifetimeStore},
+        path::{Names, UseArgs},
     },
-    hir::generics::{
-        ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData, TypeOrConstParamData,
-        TypeParamData, TypeParamProvenance, WherePredicate,
+    hir::{
+        columns::len,
+        generics::{
+            ConstParamData, GenericParams, LifetimeBoundType, LifetimeParamData,
+            TypeOrConstParamData, TypeParamData, TypeParamProvenance, WherePredicate,
+        },
     },
-    type_ref::{LifetimeRef, LifetimeRefId, TypeBound, TypeRef, TypeRefId},
+    type_ref::{
+        LifetimeRef, LifetimeRefId, TraitBoundModifier, TypeBound, TypeRef, TypeRefId, UseArgRef,
+    },
 };
 
 /// Lowers an `impl Trait` type whose bounds are on the builder's bound stack above the mark.
@@ -112,7 +120,7 @@ impl GenericParamsCollector {
                         ec.lower_type_ref(it, &mut ExprCollector::impl_trait_error_allocator)
                     });
                     let param = TypeParamData {
-                        name: Some(name.clone()),
+                        name: Some(name),
                         default,
                         provenance: TypeParamProvenance::TypeParamList,
                     };
@@ -141,7 +149,7 @@ impl GenericParamsCollector {
                     let lifetime = ec.lower_lifetime_ref_opt(lifetime_param.lifetime());
                     if let LifetimeRef::Named(name) = &ec.store.lifetimes[lifetime] {
                         let param = LifetimeParamData {
-                            name: name.clone(),
+                            name: name.clone(), // clone: the parameter owns its interned name
                             bound_type: LifetimeBoundType::EarlyBound,
                         };
                         let _idx = self.lifetimes.alloc(param);
@@ -175,20 +183,19 @@ impl GenericParamsCollector {
                     continue;
                 };
 
-                let lifetimes: Option<Box<_>> =
+                // Higher-Ranked Trait Bounds: one run of names, shared by the predicate's bounds.
+                let lifetimes =
                     pred.for_binder().and_then(|it| it.generic_param_list()).map(|param_list| {
-                        // Higher-Ranked Trait Bounds
-                        param_list
-                            .lifetime_params()
-                            .map(|lifetime_param| {
+                        ec.store.paths_mut().push_names(param_list.lifetime_params().map(
+                            |lifetime_param| {
                                 lifetime_param
                                     .lifetime()
                                     .map_or_else(Name::missing, |lt| Name::new_lifetime(lt.text()))
-                            })
-                            .collect()
+                            },
+                        ))
                     });
                 for bound in pred.type_bound_list().iter().flat_map(|l| l.bounds()) {
-                    self.lower_type_bound_as_predicate(ec, bound, lifetimes.as_deref(), target);
+                    self.lower_type_bound_as_predicate(ec, bound, lifetimes, target);
                 }
             }
         });
@@ -209,7 +216,7 @@ impl GenericParamsCollector {
         &mut self,
         ec: &mut ExprCollector<'_>,
         bound: ast::TypeBound,
-        hrtb_lifetimes: Option<&[Name]>,
+        hrtb_lifetimes: Option<Names>,
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
         let bound = ec.lower_type_bound(
@@ -222,11 +229,9 @@ impl GenericParamsCollector {
         );
         let predicate = match (target, bound) {
             (_, TypeBound::Error | TypeBound::Use(_)) => return,
-            (Either::Left(type_ref), bound) => WherePredicate::TypeBound {
-                lifetimes: hrtb_lifetimes.map(|h| ThinVec::from_iter(h.iter().cloned())),
-                target: type_ref,
-                bound,
-            },
+            (Either::Left(type_ref), bound) => {
+                WherePredicate::TypeBound { lifetimes: hrtb_lifetimes, target: type_ref, bound }
+            }
             (Either::Right(lifetime), TypeBound::Lifetime(bound)) => {
                 WherePredicate::Lifetime { target: lifetime, bound }
             }
@@ -300,5 +305,72 @@ impl GenericParamsCollector {
 
             lifetime.bound_type = LifetimeBoundType::LateBound
         }
+    }
+}
+
+impl ExprCollector<'_> {
+    /// A bound; its `for<..>` binder and `use<..>` arguments are pushed as runs into the store's
+    /// paths, so the bound itself is a plain record.
+    pub(super) fn lower_type_bound(
+        &mut self,
+        node: ast::TypeBound,
+        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+    ) -> TypeBound {
+        let Some(kind) = node.kind() else { return TypeBound::Error };
+        match kind {
+            ast::TypeBoundKind::PathType(binder, path_type) => {
+                let binder = self.lower_bound_binder(binder);
+                let m = if node.question_mark_token().is_some() {
+                    TraitBoundModifier::Maybe
+                } else if node.const_token().is_none() {
+                    TraitBoundModifier::None
+                } else if node.tilde_token().is_some() || node.l_brack_token().is_some() {
+                    TraitBoundModifier::MaybeConst
+                } else {
+                    TraitBoundModifier::Const
+                };
+                let Some(path) =
+                    path_type.path().and_then(|it| self.lower_path(it, impl_trait_lower_fn))
+                else {
+                    return TypeBound::Error;
+                };
+                let path = self.alloc_path(path, AstPtr::new(&path_type).upcast());
+                if binder.is_empty() {
+                    TypeBound::Path(path, m)
+                } else {
+                    TypeBound::ForLifetime(binder, path)
+                }
+            }
+            ast::TypeBoundKind::Use(gal) => {
+                // Lowering a lifetime pushes no `use<..>` argument, so the pushes are one run.
+                let start = len(self.store.paths().use_args.len());
+                for arg in gal.use_bound_generic_args() {
+                    let arg = match arg {
+                        ast::UseBoundGenericArg::Lifetime(l) => {
+                            UseArgRef::Lifetime(self.lower_lifetime_ref(l))
+                        }
+                        ast::UseBoundGenericArg::NameRef(n) => UseArgRef::Name(n.as_name()),
+                    };
+                    self.store.paths_mut().use_args.push(arg);
+                }
+                let end = len(self.store.paths().use_args.len());
+                TypeBound::Use(UseArgs { start, len: end - start })
+            }
+            ast::TypeBoundKind::Lifetime(lifetime) => {
+                TypeBound::Lifetime(self.lower_lifetime_ref(lifetime))
+            }
+        }
+    }
+
+    /// The lifetimes of a bound's `for<..>`, as a run of names (empty without a binder).
+    fn lower_bound_binder(&mut self, binder: Option<ast::ForBinder>) -> Names {
+        let Some(params) = binder.and_then(|it| it.generic_param_list()) else {
+            return Names::EMPTY;
+        };
+        self.store.paths_mut().push_names(
+            params
+                .lifetime_params()
+                .flat_map(|lp| lp.lifetime().map(|lt| Name::new_lifetime(lt.text()))),
+        )
     }
 }

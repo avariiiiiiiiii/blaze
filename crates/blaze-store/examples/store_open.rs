@@ -12,6 +12,7 @@
 
 use std::{path::Path, time::Instant};
 
+use blaze_ids::rng::SplitMix64;
 use blaze_store::{KEY, Store};
 use sha2::{Digest, Sha256};
 
@@ -21,16 +22,13 @@ fn key(n: u64) -> [u8; KEY] {
 
 /// A value that compresses about as compiled code does: a third of it noise.
 fn value(n: u64, len: usize) -> Vec<u8> {
-    let mut state = n.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut rng = SplitMix64::new(n);
     (0..len)
         .map(|at| {
             if at % 3 != 0 {
                 return (at / 7) as u8;
             }
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
+            rng.next_u64() as u8
         })
         .collect()
 }

@@ -158,7 +158,7 @@ why). The two maps of that outline need the same list form, in `crates/span`:
   relative offsets change.
 
 The single-node forms above can stay as one-element calls of these.
-Status: open
+Status: done (both parts applied; see the answers below)
 
 > taken by requests (format and speed-syntax are DONE): child `requests-subtree-hash`, after the subtree hashes; the outcome follows.
 
@@ -181,3 +181,11 @@ Status: open
 >   range, and the relative map holds nothing else. `a_map_without_ranges_is_the_map_of_the_text_left`
 >   checks cases by hand, and `without_agrees_with_cutting_the_pairs` checks against a seeded
 >   model. hot_lint is clean on `crates/span`. Nothing has been built or run, per my brief.
+
+> applied by requests (child requests-subtree-hash): the list form, in `crates/syntax-tree`. `SyntaxNode::clone_subtree_without(&self, elided: &[SyntaxNode<L>])` (`api.rs`; `cursor.rs` takes an iterator of cursor nodes) calls `FlatTree::subtree_without(at, elided: &[u32])` (`flat.rs`, `pub(crate)`). The nodes must be in this node's flat tree (its part's for a lazy node; an assert names the node otherwise). The list must be ascending, disjoint and strictly under `at`, also asserted. It is one pass over the elements outside the elided nodes with a stack of open nodes: no parent lookups, and nothing inside an elided node (elements, text, lazy nodes, parts) is read. Each elided node becomes an empty node of its kind. Lazy nodes outside keep their parsed parts, moved. Kept subtree hashes outside the elided nodes are carried, and their ancestors' are dropped and made again when asked. An empty list is `clone_subtree`. The test `a_subtree_without_nodes_is_the_subtree_with_them_replaced` covers random and nested trees, full and outline, with some parts parsed and some not and some hashes made and some not, for no node, single nodes, and a random disjoint list. It checks that each copy equals `subtree(at)` with each elided node replaced in turn by `replace_subtree`: elements, parents, ranges, lazies, parts and errors, kept set, carried hashes, and every hash against a fresh pass. `a_cursor_clones_a_subtree_without_nodes` covers the cursor form. Not built or run.
+
+> frontend-text (2026-10-29, for the coordinator): done. The list form is in `crates/syntax-tree`
+> (`FlatTree::subtree_without(at, &[u32])`, `SyntaxNode::clone_subtree_without(&[SyntaxNode])`,
+> by requests-subtree-hash) and in `crates/span` (`relative_without(.., &[SyntaxNodePtr])`,
+> `RealSpanMap::without(&[TextRange])`). hir-def's `signatures.rs` already calls the list form
+> (L195, L374). The tree's source is a `Text` now (blaze-bytes), and the new code uses it.

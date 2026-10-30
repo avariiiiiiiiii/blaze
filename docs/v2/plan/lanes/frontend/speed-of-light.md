@@ -129,13 +129,11 @@ text. Reading is the same copy plus the checks untrusted bytes need, and one int
 - **Write.**
   - Bound: a memory copy, 16 bytes a leaf at L2's 32 bytes a cycle, so 0.5 cycles a leaf (DRAM:
     16 B / 25 GB/s ≈ 0.64 ns).
-  - Design: one resize, then each column written as fixed-size rows. The zero fill is a memset
-    at about 64 bytes a cycle, then the rows are stored, so about 1 cycle a leaf: **about 50%**.
-  - In the way: `tt` forbids unsafe code, so a column can't be viewed as its bytes. With
-    `zerocopy` (already in `Cargo.lock`, not yet a workspace dependency), `Node`, `PackedSpan`
-    and `WideSpan` as `#[repr(C)]` `IntoBytes` make each column one `extend_from_slice` on
-    little-endian targets, which is at the bound. Requested of the coordinator in
-    `v2/requests/frontend.md`.
+  - Design, applied: one `reserve`, then the node, span and wide-span columns appended as their
+    bytes (`zerocopy` `IntoBytes` on the `#[repr(C)]` columns in `tt/src/storage/columns.rs`,
+    with a little-endian host asserted at compile time). There is no zero fill. The parts, the
+    symbols' ends and the header are small rows. That is the copy plus a row a symbol: **about
+    90%**.
 - **Read.**
   - Bound: the copy (0.5 cycles a leaf), plus the least an untrusted tree needs: a tag and
     bounds check a node (about 5 instructions), a part-order check a span (about 4), and one
@@ -151,9 +149,12 @@ text. Reading is the same copy plus the checks untrusted bytes need, and one int
     - Node checks rebuild each node through its constructor and compare it, about 8
       instructions.
 
-    That is about 15 instructions a leaf, about 4 cycles: **about 80%**.
-  - In the way: the same as write. With `zerocopy` `FromBytes` each column is one copy before
-    its checks.
+    - The node and span columns are viewed where they lie in the bytes (`zerocopy`
+      `FromBytes`), checked there, and copied once into the tree. There is no decode a word, and
+      no allocation for bytes that fail the checks.
+
+    That is about 13 instructions a leaf, about 3.3 cycles: **about 90%**. Input must start at a
+    4-byte boundary, and input that doesn't is refused.
 - **A whole proc-macro call** costs two writes and two reads, against rustc's bridge, which
   crosses one token tree at a time through RPC handles at hundreds of cycles a token. Above the
   wire, the critical path is the macro itself.
@@ -355,6 +356,10 @@ sections).
      item and the spine. Its bound is then the item's size plus \(I\) spine words, under 1 µs.
      That is a layout change for format to weigh.
 
+  Step 1 is applied (requests-subtree-hash, `v2/requests/format.md`): `replace_subtree` copies
+  the arrays in three runs and patches what the edit moves, with `repack` gone. Not yet
+  measured; step 2 remains.
+
 ### 4. Cutting out the items (`hir_def::item_tree::items::item_sources`)
 
 Work: on every edit of the file, one `ItemSource` for each top-level item, the same one as
@@ -437,3 +442,87 @@ The stages above are mine. The stages between them are not: the reparse itself, 
 | **total** | **40 µs** | **480 µs** | **340 µs** | **90 µs, then 45 µs** |
 
 Nothing has been measured. `proof`'s budgets time each row once things compile.
+
+## frontend-tree: borrowed views over the flat tree (frontend.md item 16)
+
+Design: [tree.md](tree.md). Below, \(e\) is a file's elements. Rust has about 6 bytes of source
+per element, so a 100 KiB file is about \(e = 17\,000\).
+
+### 1. A whole-file walk (`Node::descendants_with_tokens`, `preorder_with_tokens`)
+
+**Bound.** The walk has to read each element's word once. These are 4-byte words in a single
+array, streamed in order: \(4e\) bytes, which is 68 KB for the file above, held in L2. One step
+is a load, a tag test, an increment and the 24-byte view it yields. That is about 4 instructions,
+so 1 cycle at an IPC of 4. The bound is therefore \(e\) cycles, about 5 µs for the 100 KiB file.
+
+**Design.** `Scan` reaches the bound. It walks `at..end` linearly with no stack, no refcount and
+no allocation. A lazy node costs two more things:
+- finding its part, a binary search over the file's lazy nodes (a few hundred at most, so about
+  9 steps);
+- an acquire load of the part's `OnceLock`.
+
+That is about 40 cycles per lazy node. Lazy nodes are fewer than 1 in 50 elements, so this adds
+under 1 cycle per element on average.
+
+`preorder_with_tokens` also reads `end` of each node to emit its leave event, and that word is
+already in L1. The rowan-style cursor does more work at each step:
+- a `Cell` refcount increment and decrement;
+- a branch to free the cursor;
+- the root `Box` that `Tree::root` allocates per call;
+- a `RefCell` map lookup per part.
+
+That is about 3 times the bound before its allocations.
+
+**Gap.** `text_range()` on a view recomputes the start from the nearest of every eighth start,
+which reads up to 15 words: about 10 cycles, all L1 hits. A walk that asks every element's range
+pays that per element, about 10 times the walk itself. The fix is a walk that carries the
+running offset, so each element's start is one add (`descendants_with_ranges`). It is
+straightforward and goes in before callers that need every range move over. Until then, that
+use is at about 10 times the bound, not within 10%.
+
+### 2. Navigation (`parent`, `children`, siblings)
+
+- **A token's parent** is a subtraction from its word, 1 load.
+- **A node's parent** is its rank (one bitset word, one count word and a popcount) plus a load
+  from the parents column: 3 loads, about 15 cycles counting the L1 hits. The bound is 1 load,
+  because the parent has to be stored somewhere. The rank costs 2 loads to save 4 bytes per
+  element, and that trade belongs to the tree's design ([flat.rs](../../../../../crates/syntax-tree/src/flat.rs)),
+  not to the views.
+- **Children** step by `end`: 1 load per child, however large the child's subtree. This meets
+  the bound.
+- **A typed accessor** (`support::child`) is a scan of children that compares kinds, which is the
+  same as the bound for a lookup with no index.
+
+### 3. The view itself
+
+A view is 24 bytes: file tree, tree, part and element. It is `Copy`, and making one costs
+nothing beyond the registers that hold it. A `NodeId` that is kept is 8 bytes. A smaller view,
+16 bytes with the file tree found from the part, would need a load to walk back up out of a
+part. That would make the common case, reading within one tree, slower to save stack space that
+is already in registers.
+
+### 4. Descendants that are only nodes
+
+`descendants()` walks tokens and skips them, so it does \(e\) steps to produce \(n \approx 0.45e\)
+nodes. The tree's node bitset would let it jump from node to node with one `tzcnt` per 64
+elements, about \(n\) steps. That needs a `pub(crate)` accessor in `flat.rs`, which this lane
+does not own; it is requested once callers that walk only nodes are on the build path. Until
+then, a node walk runs at about \(e/n \approx 2\) times its bound.
+
+Nothing has been measured. `crates/syntax/tests/view.rs` checks the allocation half, zero
+allocations per walk. The cycle figures need `proof`'s timing budgets once the crates compile.
+
+## frontend-journal: changed files from the OS's journal (restore.md)
+
+The full arithmetic is in [journal.md](journal.md), "Speed of light", and in each platform's note
+([macos](journal/macos.md), [windows](journal/windows.md), [linux](journal/linux.md)). For a warm
+restart with N = 100 000 tracked files of which k changed:
+
+- **macOS and Windows:** the work is O(k). There is one column search and one batched stamp
+  per path the journal names, and a read and a hash only where the stamp moved. Nothing is
+  done for an unchanged file, so this is at the bound (the k reads and hashes).
+- **Linux:** the `statx` sweep is N·t/C, about 6.3 ms on 8 cores and 0.78 ms on 64. The
+  watcher adds about 0.35 ms of serial work: one copy of the mapped column's names, decoding
+  the saved stamps, and comparing N stamps. That is 6% on 8 cores, inside the bar. On 64 cores
+  it is about 45% over. To close that, the stampers would compare against the mapped column in
+  place and return only the indices that moved; that is open (see journal.md).

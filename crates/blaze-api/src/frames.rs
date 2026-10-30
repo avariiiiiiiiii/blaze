@@ -16,9 +16,12 @@ use crate::{ApiError, Envelope, LONGEST_REQUEST, SCHEMA};
 /// Bytes of a stream, cut into frames' items as they arrive.
 #[derive(Default, Debug)]
 pub struct Frames {
+    /// The stream's bytes are `bytes[at..end]`. What is past `end` is room a read fills, zeroed
+    /// once when the buffer grew to it rather than on every read.
     bytes: Vec<u8>,
     /// Where the next frame starts in `bytes`.
     at: usize,
+    end: usize,
     broken: Option<ApiError>,
 }
 
@@ -28,10 +31,15 @@ impl Frames {
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.broken.is_none() {
-            self.compact();
-            self.bytes.extend_from_slice(bytes);
+        if self.broken.is_some() {
+            return;
         }
+        self.compact();
+        let room = (self.bytes.len() - self.end).min(bytes.len());
+        let (here, rest) = bytes.split_at(room);
+        self.bytes[self.end..self.end + room].copy_from_slice(here);
+        self.bytes.extend_from_slice(rest);
+        self.end += bytes.len();
     }
 
     /// [`Frames::push`] of a buffer that is the caller's no more: kept as it is, uncopied, when
@@ -41,6 +49,7 @@ impl Frames {
             return;
         }
         if self.held() == 0 {
+            self.end = bytes.len();
             self.bytes = bytes;
             self.at = 0;
         } else {
@@ -59,7 +68,7 @@ impl Frames {
         let Some(len) = self.declared()? else { return Ok(None) };
         let start = self.at + 4;
         let end = start + len;
-        if self.bytes.len() < end {
+        if self.end < end {
             return Ok(None);
         }
         self.at = end;
@@ -68,7 +77,13 @@ impl Frames {
 
     /// How many bytes are held that are not yet a whole item.
     pub(crate) fn held(&self) -> usize {
-        self.bytes.len() - self.at
+        self.end - self.at
+    }
+
+    /// The length the frame under way declares, once its four bytes are here.
+    fn length(&self) -> Option<u32> {
+        let head = self.bytes[..self.end].get(self.at..self.at + 4)?;
+        Some(u32::from_be_bytes(head.try_into().ok()?))
     }
 
     /// How many bytes to read next: what the frame under way still lacks, but no more than
@@ -76,8 +91,7 @@ impl Frames {
     /// and never fewer than `least`.
     pub fn wanted(&self, least: usize) -> usize {
         let held = self.held();
-        let Some(&[a, b, c, d]) = self.bytes.get(self.at..self.at + 4) else { return least };
-        let len = u32::from_be_bytes([a, b, c, d]);
+        let Some(len) = self.length() else { return least };
         if len > LONGEST_REQUEST {
             return least;
         }
@@ -89,20 +103,20 @@ impl Frames {
     /// has hung up.
     pub fn fill(&mut self, from: &mut impl Read, most: usize) -> io::Result<usize> {
         self.compact();
-        let len = self.bytes.len();
-        self.bytes.resize(len + most, 0);
+        let end = self.end;
+        if self.bytes.len() < end + most {
+            self.bytes.resize(end + most, 0);
+        }
         let read = loop {
-            match from.read(&mut self.bytes[len..]) {
+            match from.read(&mut self.bytes[end..end + most]) {
                 Ok(read) => break Ok(read),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => break Err(error),
             }
         };
-        let got = match &read {
-            Ok(got) => *got,
-            Err(_) => 0,
-        };
-        self.bytes.truncate(len + got);
+        if let Ok(got) = &read {
+            self.end += got;
+        }
         read
     }
 
@@ -111,23 +125,24 @@ impl Frames {
         if let Some(error) = &self.broken {
             return Err(error.clone());
         }
-        let Some(&[a, b, c, d]) = self.bytes.get(self.at..self.at + 4) else { return Ok(None) };
-        let len = u32::from_be_bytes([a, b, c, d]);
+        let Some(len) = self.length() else { return Ok(None) };
         if len > LONGEST_REQUEST {
             let error =
                 ApiError::new(format!("a frame of {len} bytes, longer than {LONGEST_REQUEST}"), None);
             self.broken = Some(error.clone());
             self.bytes = Vec::new();
             self.at = 0;
+            self.end = 0;
             return Err(error);
         }
         Ok(Some(len as usize))
     }
 
-    /// Drops the items handed out, once they are at least half the buffer.
+    /// Drops the items handed out, once they are at least half of what is held.
     fn compact(&mut self) {
-        if self.at > 0 && self.at >= self.bytes.len() / 2 {
-            self.bytes.drain(..self.at);
+        if self.at > 0 && self.at >= self.end / 2 {
+            self.bytes.copy_within(self.at..self.end, 0);
+            self.end -= self.at;
             self.at = 0;
         }
     }

@@ -77,17 +77,16 @@ pub(crate) fn write_stub(arch: Arch, slot: u32, out: &mut [u8]) {
     }
 }
 
-/// The stubs of slots `0..count`, one after another, written in parallel into one buffer.
-pub(crate) fn stubs(arch: Arch, count: u32) -> Vec<u8> {
+/// The stubs of slots from 0, one after another, written in parallel over the whole of `out`
+/// (a multiple of [`stub_size`] long).
+pub(crate) fn stubs(arch: Arch, out: &mut [u8]) {
     let size = stub_size(arch) as usize;
-    let mut code = vec![0; size * count as usize];
     if size == 0 {
-        return code;
+        return;
     }
-    code.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
+    out.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
         write_stub(arch, slot as u32, out);
     });
-    code
 }
 
 /// The stub of `slot`: its bytes and fixups.
@@ -195,7 +194,8 @@ mod tests {
     fn the_bulk_stubs_are_each_slots_stub() {
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let size = stub_size(arch) as usize;
-            let all = stubs(arch, 9000);
+            let mut all = vec![0; size * 9000];
+            stubs(arch, &mut all);
             assert_eq!(all.len(), size * 9000);
             for slot in [0u32, 1, 4095, 4096, 8191, 8999] {
                 let (one, _) = stub(arch, slot);

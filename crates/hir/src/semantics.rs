@@ -10,7 +10,7 @@ use std::{
     ops::{self, ControlFlow, Not},
 };
 
-use base_db::{FxIndexSet, all_crates, toolchain_channel};
+use base_db::{Db, FxIndexSet, all_crates, toolchain_channel};
 use either::Either;
 use hir_def::{
     BuiltinDeriveImplId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule, MacroId,
@@ -159,8 +159,8 @@ impl<'db> TypeInfo<'db> {
 }
 
 /// Primary API to get semantic information, like types, from syntax trees.
-pub struct Semantics<'db, DB: ?Sized> {
-    pub db: &'db DB,
+pub struct Semantics<'db> {
+    pub db: &'db Db,
     imp: SemanticsImpl<'db>,
 }
 
@@ -169,7 +169,7 @@ type ExprToAnonConst<'db> = FxHashMap<ExprId, AnonConstId<'db>>;
 type DefAnonConstsMap<'db> = FxHashMap<DefWithoutBodyWithAnonConsts, ExprToAnonConst<'db>>;
 
 pub struct SemanticsImpl<'db> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     s2d_cache: RefCell<SourceToDefCache<'db>>,
     /// MacroCall to its expansion's MacroCallId cache
     macro_call_cache: RefCell<FxHashMap<InFile<ast::MacroCall>, MacroCallId>>,
@@ -177,13 +177,13 @@ pub struct SemanticsImpl<'db> {
     signature_anon_consts_cache: RefCell<DefAnonConstsMap<'db>>,
 }
 
-impl<DB: ?Sized> fmt::Debug for Semantics<'_, DB> {
+impl fmt::Debug for Semantics<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Semantics {{ ... }}")
     }
 }
 
-impl<'db, DB: ?Sized> ops::Deref for Semantics<'db, DB> {
+impl<'db> ops::Deref for Semantics<'db> {
     type Target = SemanticsImpl<'db>;
 
     fn deref(&self) -> &Self::Target {
@@ -200,20 +200,8 @@ pub enum LintAttr {
     Forbid,
 }
 
-// Note: while this variant of `Semantics<'_, _>` might seem unused, as it does not
-// find actual use within the rust-analyzer project itself, it exists to enable the use
-// within e.g. tracked salsa functions in third-party crates that build upon `ra_ap_hir`.
-impl Semantics<'_, dyn HirDatabase> {
-    /// Creates an instance that's weakly coupled to its underlying database type.
-    pub fn new_dyn(db: &'_ dyn HirDatabase) -> Semantics<'_, dyn HirDatabase> {
-        let impl_ = SemanticsImpl::new(db);
-        Semantics { db, imp: impl_ }
-    }
-}
-
-impl<DB: HirDatabase> Semantics<'_, DB> {
-    /// Creates an instance that's strongly coupled to its underlying database type.
-    pub fn new(db: &DB) -> Semantics<'_, DB> {
+impl<'db> Semantics<'db> {
+    pub fn new(db: &'db Db) -> Semantics<'db> {
         let impl_ = SemanticsImpl::new(db);
         Semantics { db, imp: impl_ }
     }
@@ -221,18 +209,14 @@ impl<DB: HirDatabase> Semantics<'_, DB> {
     /// Like `new`, with a file taken as a module of only those of `crates` it is in, when it
     /// is in any.
     pub fn new_within(
-        db: &DB,
+        db: &'db Db,
         crates: std::sync::Arc<rustc_hash::FxHashSet<base_db::Crate>>,
-    ) -> Semantics<'_, DB> {
+    ) -> Semantics<'db> {
         let mut impl_ = SemanticsImpl::new(db);
         impl_.s2d_cache.get_mut().within = Some(crates);
         Semantics { db, imp: impl_ }
     }
-}
 
-// Note: We take `DB` as `?Sized` here in order to support type-erased
-// use of `Semantics` via `Semantics<'_, dyn HirDatabase>`:
-impl<DB: HirDatabase + ?Sized> Semantics<'_, DB> {
     pub fn hir_file_for(&self, syntax_node: &SyntaxNode) -> HirFileId {
         self.imp.find_file(syntax_node).file_id
     }
@@ -410,7 +394,7 @@ impl<DB: HirDatabase + ?Sized> Semantics<'_, DB> {
     }
 
     pub fn is_nightly(&self, krate: Crate) -> bool {
-        let toolchain = toolchain_channel(self.db.as_dyn_database(), krate.into());
+        let toolchain = toolchain_channel(self.db, krate.into());
         // `toolchain == None` means we're in some detached files. Since we have no information on
         // the toolchain being used, let's just allow unstable items to be listed.
         matches!(toolchain, Some(base_db::ReleaseChannel::Nightly) | None)
@@ -470,7 +454,7 @@ impl<DB: HirDatabase + ?Sized> Semantics<'_, DB> {
 }
 
 impl<'db> SemanticsImpl<'db> {
-    fn new(db: &'db dyn HirDatabase) -> Self {
+    fn new(db: &'db Db) -> Self {
         SemanticsImpl {
             db,
             s2d_cache: Default::default(),
@@ -2728,7 +2712,7 @@ impl<'db> ToDef<'db> for ast::IdentPat {
 /// you'd better use the `resolve_` family of methods.
 #[derive(Debug)]
 pub struct SemanticsScope<'db> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     infer_body: Option<InferBodyId<'db>>,
     file_id: HirFileId,
     resolver: Resolver<'db>,
@@ -2897,7 +2881,7 @@ impl ops::Deref for VisibleTraits {
 }
 
 struct RenameConflictsVisitor<'a> {
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     owner: ExpressionStoreOwnerId,
     resolver: Resolver<'a>,
     body: &'a ExpressionStore,

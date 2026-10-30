@@ -24,9 +24,9 @@
 
 use std::cell::Cell;
 
+use base_db::Db;
 use span::{Edition, MacroCallId, Span, SyntaxContext};
 
-use base_db::SourceDatabase;
 
 pub use span::Transparency;
 
@@ -63,7 +63,7 @@ impl<K: Copy + Eq, V: Copy> MarkCache<K, V> {
 }
 
 pub fn span_with_def_site_ctxt(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
@@ -72,7 +72,7 @@ pub fn span_with_def_site_ctxt(
 }
 
 pub fn span_with_call_site_ctxt(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
@@ -81,7 +81,7 @@ pub fn span_with_call_site_ctxt(
 }
 
 pub fn span_with_mixed_site_ctxt(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     expn_id: MacroCallId,
     edition: Edition,
@@ -90,7 +90,7 @@ pub fn span_with_mixed_site_ctxt(
 }
 
 fn span_with_ctxt_from_mark(
-    db: &dyn SourceDatabase,
+    db: &Db,
     span: Span,
     expn_id: MacroCallId,
     transparency: Transparency,
@@ -103,7 +103,7 @@ fn span_with_ctxt_from_mark(
 }
 
 pub(super) fn apply_mark(
-    db: &dyn SourceDatabase,
+    db: &Db,
     ctxt: span::SyntaxContext,
     call_id: span::MacroCallId,
     transparency: Transparency,
@@ -140,7 +140,7 @@ pub(super) fn apply_mark(
 }
 
 fn apply_mark_internal(
-    db: &dyn SourceDatabase,
+    db: &Db,
     ctxt: SyntaxContext,
     call_id: MacroCallId,
     transparency: Transparency,
@@ -175,6 +175,8 @@ fn apply_mark_internal(
 mod tests {
     use std::cell::RefCell;
 
+    use blaze_ids::rng::SplitMix64;
+
     use super::MarkCache;
 
     /// Over seeded key sequences, the cache gives what the function gives, and computes a key
@@ -182,16 +184,13 @@ mod tests {
     #[test]
     fn cache_gives_the_function() {
         let f = |key: u32| key.wrapping_mul(2_654_435_761) ^ 7;
-        let mut state = 0x9e37_79b9u32;
+        let mut rng = SplitMix64::new(0x9e37_79b9);
         for distinct in [1u32, 2, 3, 4, 5, 9] {
             let calls = RefCell::new(Vec::new());
             let cache = MarkCache::new();
             let mut misses_model: Vec<u32> = Vec::new();
             for _ in 0..500 {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                let key = state % distinct;
+                let key = rng.next_u32() % distinct;
                 let got = cache.get_or_insert_with(key, |it| {
                     calls.borrow_mut().push(it);
                     f(it)

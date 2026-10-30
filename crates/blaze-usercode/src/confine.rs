@@ -8,12 +8,13 @@
 //! read, hashed as the files are then ([`crate::inputs::Disk`]).
 
 use std::{
+    borrow::Cow,
     ffi::OsString,
     path::{Path, PathBuf},
 };
 
 use blaze_core::{Command, Confine, Confined, Sandbox, Traced};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::trace::{self, Report};
 
@@ -58,38 +59,58 @@ pub struct Spec {
     pub not_inputs: Vec<PathBuf>,
 }
 
+/// A [`Spec`] lent from the command it runs: what [`Launcher::confine`] writes, the same JSON
+/// as the `Spec` the launcher reads back, with nothing of the command copied.
+#[derive(Serialize, Debug)]
+pub struct SpecOf<'a> {
+    program: &'a Path,
+    args: &'a [OsString],
+    env: Passed<'a>,
+    dir: &'a Path,
+    read: &'a [PathBuf],
+    write: &'a [PathBuf],
+    network: bool,
+    trace: bool,
+    live: Cow<'a, Path>,
+    report: PathBuf,
+    not_inputs: &'a [PathBuf],
+}
+
+/// A command's environment as the program sees it: without [`LIVE`], which is the launcher's.
+#[derive(Debug)]
+struct Passed<'a>(&'a [(OsString, OsString)]);
+
+impl Serialize for Passed<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().filter(|(name, _)| name != LIVE))
+    }
+}
+
 /// The sandbox blaze makes: its launcher at `program`, which is blaze itself.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Launcher {
     pub program: PathBuf,
 }
 
 impl Launcher {
     /// The spec of `command`, run with `scratch` as its scratch directory.
-    pub fn spec(command: &Command, scratch: &Path) -> Result<Spec, String> {
+    pub fn spec<'a>(command: &'a Command, scratch: &Path) -> Result<SpecOf<'a>, String> {
         let Sandbox::On { read, write, network, trace } = &command.sandbox else {
-            return Err(format!("{}: its sandbox is off", command.program.display()));
+            return Err(format!("{}: its sandbox is off", command.program.display())); // alloc: error path
         };
-        let mut env = Vec::with_capacity(command.env.len());
-        let mut live = None;
-        for (name, value) in &command.env {
-            match name == LIVE {
-                true => live = Some(PathBuf::from(value)),
-                false => env.push((name.clone(), value.clone())),
-            }
-        }
-        Ok(Spec {
-            program: command.program.clone(),
-            args: command.args.clone(),
-            env,
-            dir: command.dir.clone(),
-            read: read.clone(),
-            write: write.clone(),
+        let live = command.env.iter().rev().find(|(name, _)| name == LIVE);
+        Ok(SpecOf {
+            program: &command.program,
+            args: &command.args,
+            env: Passed(&command.env),
+            dir: &command.dir,
+            read,
+            write,
             network: *network,
             trace: *trace,
-            live: live.unwrap_or_else(|| scratch.join(LIVE_FILE)),
+            live: live.map_or_else(|| Cow::Owned(scratch.join(LIVE_FILE)), |(_, value)| Cow::Borrowed(Path::new(value))),
             report: scratch.join(REPORT_FILE),
-            not_inputs: vec![command.program.clone()],
+            not_inputs: std::slice::from_ref(&command.program),
         })
     }
 
@@ -97,9 +118,9 @@ impl Launcher {
     pub fn report(scratch: &Path) -> Result<Report, String> {
         let file = scratch.join(REPORT_FILE);
         let bytes = std::fs::read(&file).map_err(|error| {
-            format!("the launcher left no report at {} ({error}): it did not end as it should", file.display())
+            format!("the launcher left no report at {} ({error}): it did not end as it should", file.display()) // alloc: error path
         })?;
-        trace::decode(&bytes).map_err(|why| format!("{}: {why}", file.display()))
+        trace::decode(&bytes).map_err(|why| format!("{}: {why}", file.display())) // alloc: error path
     }
 }
 
@@ -107,27 +128,31 @@ impl Confine for Launcher {
     fn confine(&self, command: &Command, scratch: &Path) -> Result<Confined, String> {
         let spec = Launcher::spec(command, scratch)?;
         let file = scratch.join(SPEC_FILE);
-        let text = serde_json::to_vec(&spec).map_err(|error| format!("the spec: {error}"))?;
-        std::fs::write(&file, text).map_err(|error| format!("{}: {error}", file.display()))?;
-        let mut args: Vec<OsString> = LAUNCH.iter().map(OsString::from).collect();
+        blaze_mem::scratch::with_bytes(|text| {
+            serde_json::to_writer(&mut *text, &spec).map_err(|error| format!("the spec: {error}"))?; // alloc: error path
+            std::fs::write(&file, &*text).map_err(|error| format!("{}: {error}", file.display())) // alloc: error path
+        })?;
+        let mut args = Vec::with_capacity(LAUNCH.len() + 1);
+        args.extend(LAUNCH.map(OsString::from));
         args.push(file.into_os_string());
         Ok(Confined {
-            program: self.program.clone(),
+            program: self.program.clone(), // clone: the edge: `Confined` owns the process it starts
             args,
             // The launcher reads no variable: the program's environment is in the spec.
-            env: Vec::new(),
-            dir: scratch.to_owned(),
+            env: Vec::new(), // alloc: empty, allocates nothing
+            dir: scratch.to_owned(), // alloc: the edge: `Confined` owns the process it starts
         })
     }
 
     fn traced(&self, command: &Command, scratch: &Path) -> Result<Traced, String> {
         match Launcher::report(scratch)? {
             Report::NotMade(why) => {
-                Err(format!("{}: no sandbox could be made: {why}", command.program.display()))
+                Err(format!("{}: no sandbox could be made: {why}", command.program.display())) // alloc: error path
             }
             Report::Ran(Some(traced)) => Ok(traced),
             Report::Ran(None) => match &command.sandbox {
                 Sandbox::On { trace: false, .. } => Ok(Traced::default()),
+                // alloc: error path
                 _ => Err(format!(
                     "{}: the sandbox traces, and its report has no record of what was read",
                     command.program.display()
@@ -153,13 +178,27 @@ mod tests {
         }
     }
 
+    /// The spec of `command` as the launcher reads it back.
+    fn read_back(command: &Command, scratch: &Path) -> Spec {
+        let text = serde_json::to_vec(&Launcher::spec(command, scratch).unwrap()).unwrap();
+        serde_json::from_slice(&text).unwrap()
+    }
+
     #[test]
     fn the_live_variable_is_the_launchers_not_the_programs() {
-        let spec = Launcher::spec(&command(true), Path::new("/s")).unwrap();
+        let spec = read_back(&command(true), Path::new("/s"));
         assert_eq!(spec.env, vec![("CC".into(), "cc".into())]);
         assert_eq!(spec.live, PathBuf::from("/root/live/7"));
         assert_eq!(spec.report, PathBuf::from("/s/report"));
         assert_eq!(spec.not_inputs, vec![PathBuf::from("/build/script")]);
+        assert_eq!(
+            (spec.program, spec.args, spec.dir, spec.read, spec.write, spec.network, spec.trace),
+            ("/build/script".into(), vec!["a".into()], "/ws".into(), vec!["/ws".into()], vec!["/out".into()], false, true)
+        );
+        let mut unnamed = command(false);
+        unnamed.env.retain(|(name, _)| name != LIVE);
+        let spec = read_back(&unnamed, Path::new("/s"));
+        assert_eq!((spec.live, spec.trace), (PathBuf::from("/s/live"), false));
         let mut off = command(true);
         off.sandbox = Sandbox::Off;
         assert!(Launcher::spec(&off, Path::new("/s")).is_err());
@@ -176,7 +215,7 @@ mod tests {
         assert_eq!(confined.args[..2], [OsString::from("sandbox"), OsString::from("--v2")]);
         let text = std::fs::read(scratch.join(SPEC_FILE)).unwrap();
         let spec: Spec = serde_json::from_slice(&text).unwrap();
-        assert_eq!(spec, Launcher::spec(&command(true), &scratch).unwrap());
+        assert_eq!(spec, read_back(&command(true), &scratch));
         assert!(launcher.traced(&command(true), &scratch).is_err());
         std::fs::write(scratch.join(REPORT_FILE), trace::encode(&Report::NotMade("no".into()))).unwrap();
         assert!(launcher.traced(&command(true), &scratch).unwrap_err().contains("no sandbox"));

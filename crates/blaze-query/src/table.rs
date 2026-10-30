@@ -2,8 +2,8 @@
 //! that never move, and maps on [`QueryKey`]s over them that a lookup reads with acquire loads
 //! alone.
 //!
-//! - A [`Rows`] is chunked storage by row index: chunk `k` holds `ROW_FIRST << k` rows and is
-//!   made once, so a row's address never changes. [`Ids`] hands out row indices from blocks a
+//! - A [`Rows`] is storage by row index in one reserved region ([`blaze_mem::Region`]): row
+//!   `i` is at `base + i × size`, committed as it is written, so a row's address never changes. [`Ids`] hands out row indices from blocks a
 //!   [`Free`] claims, and a [`Free`] keeps the rows its owner retired until their grace has
 //!   passed, then readies them for reuse.
 //! - A [`Map`] is [`blaze_ids::shard_count`] shards, each one open-addressed table of `u64`
@@ -20,11 +20,10 @@
 #[allow(clippy::disallowed_types)]
 use std::sync::{Mutex, MutexGuard};
 use std::{
-    alloc::{self, Layout},
     collections::VecDeque,
     hash::BuildHasherDefault,
     marker::PhantomData,
-    ptr::{self, NonNull},
+    ptr,
     sync::{
         OnceLock, PoisonError,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
@@ -32,13 +31,14 @@ use std::{
 };
 
 use blaze_ids::{ContentId, Fingerprint};
+use blaze_mem::{Region, Tag};
 use blaze_reclaim::{Grace, Guard, Limbo};
 use rustc_hash::FxHasher;
 
 use crate::{Edge, QueryKey, QueryKind};
 
-pub(crate) type FxMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-pub(crate) type FxSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+pub(crate) type FxMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>; // alloc: FxHash, not SipHash
+pub(crate) type FxSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>; // alloc: FxHash, not SipHash
 
 /// A lock held for a few loads and stores: claiming or swapping a slot, copying a table to
 /// grow it, claiming rows, holding what was unlinked. Nothing that holds it calls a query,
@@ -69,23 +69,16 @@ impl<T: Default> Default for ShortLock<T> {
     }
 }
 
-/// Chunk `k` of a [`Rows`] holds `ROW_FIRST << k` rows, so a row's chunk and place in it are
-/// arithmetic, and 27 chunks hold every `u32`.
-const ROW_FIRST: usize = 64;
-const ROW_CHUNKS: usize = 27;
+/// The address space one [`Rows`] reserves: 2^30 rows of 64 bytes. Reserving takes no
+/// memory; pages are committed as rows are written.
+const ROWS_RESERVED: usize = 64 << 30;
 
-/// How many rows a [`Free`] claims at a time: one word of a chunk's live bits, so writers
-/// claiming in different shards share no word.
+/// How many rows a [`Free`] claims at a time: a line of live flags, so writers claiming in
+/// different shards rarely write one line.
 const BLOCK: u32 = 64;
 
 /// Rows are below this: a place keeps `row + 1` in 32 bits, beside [`TOMB`].
 const ROW_END: u32 = u32::MAX - 2 * BLOCK;
-
-fn chunk_of(row: u32) -> (usize, usize) {
-    let biased = row as usize / ROW_FIRST + 1;
-    let chunk = (usize::BITS - 1 - biased.leading_zeros()) as usize;
-    (chunk, row as usize - ROW_FIRST * ((1 << chunk) - 1))
-}
 
 /// Asks the core to start loading the line at `at` into L1. A hint only: it reads nothing a
 /// load can see, never faults, and on other targets does nothing.
@@ -106,57 +99,39 @@ pub(crate) fn prefetch<T>(at: *const T) {
     let _ = at;
 }
 
-/// A row of a multiple of 64 bytes starts a cache line, so reading it touches one line a 64.
-fn row_align<T>() -> usize {
-    if size_of::<T>() % 64 == 0 { align_of::<T>().max(64) } else { align_of::<T>() }
+/// The query database's reservation of `bytes`, on huge pages if `huge`; stops naming what it
+/// was for when the kernel refuses (a database without its tables can do nothing).
+fn reserve(bytes: usize, huge: bool, what: &str) -> Region {
+    let region = if huge { Region::reserve_huge(bytes, Tag::Query) } else { Region::reserve(bytes, Tag::Query) };
+    region.unwrap_or_else(|error| panic!("the query database could not reserve its {what}: {error}"))
 }
 
-fn chunk_layout<T>(len: usize) -> Layout {
-    Layout::from_size_align(size_of::<T>() * len, row_align::<T>()).expect("a chunk's layout")
+/// Commits `region` through `len` bytes; stops naming what it was for when it cannot.
+#[inline]
+fn commit(region: &Region, len: usize, what: &str) {
+    if let Err(error) = region.ensure(len) {
+        panic!("the query database could not grow its {what}: {error}")
+    }
 }
 
-struct Chunk<T> {
-    rows: NonNull<T>,
-    len: usize,
+/// Rows of `T` by `u32` index in one reserved region: row `i` is at `base + i × size` for the
+/// region's life, so finding it is a multiply and an add, with no table of chunks to load
+/// first. Pages are committed as rows are written, and committed memory is zeroed, so a row
+/// never written reads as not live. Which rows hold a value is the owner's to know ([`Ids`],
+/// [`Free`]); a row is written once by the one thread that claimed it, read by any thread it
+/// was published to, and dropped once no thread can reach it.
+///
+/// Per row: `size_of::<T>()` bytes (line-aligned when a multiple of 64, as the region's base
+/// is a page) and one byte of live flag. A read: the row itself. Writing one: a plain store of
+/// the row and of its flag, no read-modify-write, and a load of the committed length.
+pub(crate) struct Rows<T> {
+    rows: Region,
     /// One flag a row, set while it holds a value: what [`Rows`]' drop drops. Written only by
     /// the row's owner, with a plain store.
-    live: Box<[AtomicBool]>,
-}
-
-impl<T> Chunk<T> {
-    fn new(len: usize) -> Chunk<T> {
-        let layout = chunk_layout::<T>(len);
-        assert!(layout.size() > 0, "rows of a zero-sized type");
-        // SAFETY: `layout` has a nonzero size.
-        let rows = NonNull::new(unsafe { alloc::alloc(layout) }.cast::<T>())
-            .unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        Chunk { rows, len, live: (0..len).map(|_| AtomicBool::new(false)).collect() }
-    }
-
-    fn row(&self, at: usize) -> *mut T {
-        debug_assert!(at < self.len);
-        // SAFETY: `at` is below the chunk's length, so inside its allocation.
-        unsafe { self.rows.as_ptr().add(at) }
-    }
-}
-
-impl<T> Drop for Chunk<T> {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `Chunk::new` with this layout; its values were dropped by
-        // `Rows`' drop, which runs first.
-        unsafe { alloc::dealloc(self.rows.as_ptr().cast(), chunk_layout::<T>(self.len)) };
-    }
-}
-
-/// Rows of `T` by `u32` index, in chunks that never move. Which rows hold a value is the
-/// owner's to know ([`Ids`], [`Free`]); a row is written once by the one thread that claimed
-/// it, read by any thread it was published to, and dropped once no thread can reach it.
-///
-/// Per row: `size_of::<T>()` bytes (line-aligned when a multiple of 64) and one byte of live
-/// flag. A read: one load of the chunk's base (27 bases, always in L1) and the row itself.
-/// Writing one: a plain store of the row and of its flag, no read-modify-write.
-pub(crate) struct Rows<T> {
-    chunks: [OnceLock<Chunk<T>>; ROW_CHUNKS],
+    live: Region,
+    /// Rows below this fit the reservation.
+    max: usize,
+    _owns: PhantomData<T>,
 }
 
 // SAFETY: a row is written by the one thread that claimed it before it is published, read only
@@ -168,24 +143,62 @@ unsafe impl<T: Send> Send for Rows<T> {}
 unsafe impl<T: Send + Sync> Sync for Rows<T> {}
 
 impl<T> Rows<T> {
+    const SIZE: usize = {
+        assert!(size_of::<T>() > 0, "rows of a zero-sized type");
+        assert!(align_of::<T>() <= 4096, "a row aligned past a page");
+        size_of::<T>()
+    };
+
+    /// As many rows as fit [`ROWS_RESERVED`], and below [`ROW_END`].
+    const FIT: usize = {
+        let fit = ROWS_RESERVED / Self::SIZE;
+        if fit < ROW_END as usize { fit } else { ROW_END as usize }
+    };
+
+    /// Rows on base pages: for a view's maps and the database's smaller tables.
     pub(crate) fn new() -> Rows<T> {
-        Rows { chunks: std::array::from_fn(|_| OnceLock::new()) }
+        Rows::with(false)
     }
 
-    fn chunk(&self, chunk: usize) -> &Chunk<T> {
-        self.chunks[chunk].get_or_init(|| Chunk::new(ROW_FIRST << chunk))
+    /// Rows on huge pages: for the tables every hit reads (memo lines, slots, results).
+    pub(crate) fn hot() -> Rows<T> {
+        Rows::with(true)
     }
 
-    /// Where `row` is, without reading it, if its chunk was made: for [`prefetch`].
-    fn address(&self, row: u32) -> Option<*const T> {
-        let (chunk, at) = chunk_of(row);
-        self.chunks[chunk].get().map(|chunk| chunk.row(at).cast_const())
+    /// Rows `0..max` on base pages: for a table indexed by a small number.
+    pub(crate) fn sized(max: usize) -> Rows<T> {
+        Rows::reserved(max.min(Self::FIT), false)
     }
 
-    fn made(&self, row: u32) -> (&Chunk<T>, usize) {
-        let (chunk, at) = chunk_of(row);
-        let chunk = self.chunks[chunk].get().expect("a row of a chunk never made");
-        (chunk, at)
+    fn with(huge: bool) -> Rows<T> {
+        Rows::reserved(Self::FIT, huge)
+    }
+
+    fn reserved(max: usize, huge: bool) -> Rows<T> {
+        Rows {
+            rows: reserve(max * Self::SIZE, huge, "rows"),
+            live: reserve(max, false, "rows' live flags"),
+            max,
+            _owns: PhantomData,
+        }
+    }
+
+    /// Where `row` is, without reading it: for [`prefetch`], which never faults.
+    fn address(&self, row: u32) -> *const T {
+        self.rows.at(row as usize * Self::SIZE).as_ptr().cast_const().cast()
+    }
+
+    fn row(&self, row: u32) -> *mut T {
+        debug_assert!((row as usize + 1) * Self::SIZE <= self.rows.committed(), "a row never written");
+        self.rows.at(row as usize * Self::SIZE).as_ptr().cast()
+    }
+
+    fn live(&self, row: u32) -> &AtomicBool {
+        debug_assert!((row as usize) < self.live.committed(), "a flag never written");
+        // SAFETY: the flag's byte is committed (written by `put` before any reader or dropper
+        // reaches the row, or checked by the drop's bound), and committed memory is zeroed, a
+        // valid `AtomicBool`; it lives as long as `self`.
+        unsafe { self.live.at(row as usize).cast::<AtomicBool>().as_ref() }
     }
 
     /// Writes `value` into `row`.
@@ -195,11 +208,13 @@ impl<T> Rows<T> {
     /// The caller owns `row`: it claimed it from [`Ids::claim`] and has not published it, so
     /// no other thread reads or writes it, and it holds no value.
     pub(crate) unsafe fn put(&self, row: u32, value: T) {
-        let (chunk, at) = chunk_of(row);
-        let chunk = self.chunk(chunk);
-        // SAFETY: the caller owns the row, which holds no value.
-        unsafe { chunk.row(at).write(value) };
-        chunk.live[at].store(true, Ordering::Relaxed);
+        let at = row as usize;
+        assert!(at < self.max, "row {at} past the {} a table reserves", self.max);
+        commit(&self.rows, (at + 1) * Self::SIZE, "rows");
+        commit(&self.live, at + 1, "rows' live flags");
+        // SAFETY: committed just now; the caller owns the row, which holds no value.
+        unsafe { self.row(row).write(value) };
+        self.live(row).store(true, Ordering::Relaxed);
     }
 
     /// The value at `row`.
@@ -211,9 +226,34 @@ impl<T> Rows<T> {
     /// caller is in a task that began before any grace that would let it go, or it owns
     /// the row.
     pub(crate) unsafe fn get(&self, row: u32) -> &T {
-        let (chunk, at) = self.made(row);
         // SAFETY: the caller's contract: the row holds a published value that outlives this.
-        unsafe { &*chunk.row(at) }
+        unsafe { &*self.row(row) }
+    }
+
+    /// The value at `row` if one was written there: for a table whose rows are written once
+    /// and dropped only with it, read at numbers nobody claimed.
+    ///
+    /// # Safety
+    ///
+    /// A value written at `row` was published to this thread and is not dropped while the
+    /// borrow lives.
+    #[inline]
+    pub(crate) unsafe fn written(&self, row: u32) -> Option<&T> {
+        if row as usize >= self.live.committed() || !self.live(row).load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: live, so `put` committed and wrote the row; the caller's contract keeps it.
+        Some(unsafe { &*self.row(row) })
+    }
+
+    /// The value at `row`, to change.
+    ///
+    /// # Safety
+    ///
+    /// `row` holds a value.
+    pub(crate) unsafe fn get_mut(&mut self, row: u32) -> &mut T {
+        // SAFETY: the caller's contract; `&mut self` excludes every reader.
+        unsafe { &mut *self.row(row) }
     }
 
     /// Drops the value at `row`.
@@ -222,22 +262,23 @@ impl<T> Rows<T> {
     ///
     /// `row` holds a value that no thread can reach any more.
     pub(crate) unsafe fn drop_row(&self, row: u32) {
-        let (chunk, at) = self.made(row);
-        chunk.live[at].store(false, Ordering::Relaxed);
+        self.live(row).store(false, Ordering::Relaxed);
         // SAFETY: the caller's contract: nothing reads the value any more.
-        unsafe { ptr::drop_in_place(chunk.row(at)) };
+        unsafe { ptr::drop_in_place(self.row(row)) };
     }
 }
 
 impl<T> Drop for Rows<T> {
     fn drop(&mut self) {
-        for chunk in self.chunks.iter_mut().filter_map(OnceLock::get_mut) {
-            for at in 0..chunk.len {
-                if *chunk.live[at].get_mut() {
-                    // SAFETY: a live flag is set by `put` and cleared by `drop_row`, so the row
-                    // holds a value; `&mut` excludes every reader.
-                    unsafe { ptr::drop_in_place(chunk.row(at)) };
-                }
+        if !std::mem::needs_drop::<T>() {
+            return;
+        }
+        let written = (self.rows.committed() / Self::SIZE).min(self.live.committed());
+        for row in 0..written as u32 {
+            if self.live(row).load(Ordering::Relaxed) {
+                // SAFETY: a live flag is set by `put` and cleared by `drop_row`, so the row
+                // holds a value; `&mut` excludes every reader.
+                unsafe { ptr::drop_in_place(self.row(row)) };
             }
         }
     }
@@ -245,23 +286,27 @@ impl<T> Drop for Rows<T> {
 
 /// A `u32` a row that outlives what the row holds: its generation, bumped each time the row is
 /// claimed, so a row and its generation name one value however often the row is reused (until
-/// one row is reused 2^32 times while a word naming it is kept). 4 bytes a row.
+/// one row is reused 2^32 times while a word naming it is kept). 4 bytes a row, in one
+/// reserved region (zeroed as committed: generation 0).
 pub(crate) struct Generations {
-    chunks: [OnceLock<Box<[AtomicU32]>>; ROW_CHUNKS],
+    words: Region,
 }
 
 impl Generations {
     pub(crate) fn new() -> Generations {
-        Generations { chunks: std::array::from_fn(|_| OnceLock::new()) }
+        Generations { words: reserve(ROW_END as usize * size_of::<AtomicU32>(), false, "generations") }
     }
 
     /// The row's next generation: called once each time the row is claimed, by its claimer,
     /// which alone writes it (so a load and a store, no read-modify-write).
     pub(crate) fn bump(&self, row: u32) -> u32 {
-        let (chunk, at) = chunk_of(row);
-        let words = self.chunks[chunk].get_or_init(|| (0..ROW_FIRST << chunk).map(|_| AtomicU32::new(0)).collect());
-        let next = words[at].load(Ordering::Relaxed).wrapping_add(1);
-        words[at].store(next, Ordering::Relaxed);
+        let at = row as usize * size_of::<AtomicU32>();
+        commit(&self.words, at + size_of::<AtomicU32>(), "generations");
+        // SAFETY: committed just now, aligned (the base is a page and `at` a multiple of 4),
+        // and zeroed memory is a valid `AtomicU32`; it lives as long as `self`.
+        let word = unsafe { self.words.at(at).cast::<AtomicU32>().as_ref() };
+        let next = word.load(Ordering::Relaxed).wrapping_add(1);
+        word.store(next, Ordering::Relaxed);
         next
     }
 }
@@ -321,8 +366,9 @@ impl Free {
     }
 
     /// Hands each retired row whose grace has passed to `drop` (which drops what it holds),
-    /// then readies it. Graces are started under the lock that guards this, so they come in
-    /// order: when the newest has passed every one has, and otherwise the oldest are checked
+    /// then readies it. Graces are started by whoever holds this (a shard's lock holder, or a
+    /// lane's one thread), so they come in order: when the newest has passed every one has,
+    /// and otherwise the oldest are checked
     /// until one has not.
     pub(crate) fn reclaim(&mut self, mut drop: impl FnMut(u32)) -> usize {
         let Some(&(newest, _)) = self.retired.back() else { return 0 };
@@ -404,6 +450,7 @@ const _: () = assert!(usize::BITS == 64, "a table's length is kept in its pointe
 
 fn new_table(len: usize) -> *mut AtomicU64 {
     debug_assert!(len.is_power_of_two());
+    // alloc: once a table: on a shard's first insert, and each time it doubles.
     let places: Box<[AtomicU64]> = (0..len).map(|_| AtomicU64::new(EMPTY)).collect();
     let raw = Box::into_raw(places).cast::<AtomicU64>();
     assert!(raw.addr() >> LEN_SHIFT == 0, "a table mapped above 2^58");
@@ -475,14 +522,24 @@ pub(crate) struct Map<V> {
 }
 
 impl<V: Send + Sync + 'static> Map<V> {
+    /// A map whose entries are on base pages.
     pub(crate) fn new() -> Map<V> {
+        Map::with(Rows::new())
+    }
+
+    /// A map whose entries are on huge pages: for the maps every hit reads.
+    pub(crate) fn hot() -> Map<V> {
+        Map::with(Rows::hot())
+    }
+
+    fn with(rows: Rows<Entry<V>>) -> Map<V> {
         let count = blaze_ids::shard_count();
         Map {
             shards: (0..count)
                 .map(|_| Shard { writer: ShortLock::default(), table: AtomicPtr::new(ptr::null_mut()) })
-                .collect(),
+                .collect(), // alloc: once a map
             ids: Ids::new(),
-            rows: Rows::new(),
+            rows,
             mask: count - 1,
         }
     }
@@ -577,7 +634,7 @@ impl<V: Send + Sync + 'static> Map<V> {
     pub(crate) fn prefetch_entry(&self, task: &Guard, key: &QueryKey) {
         let Some(table) = Self::table(self.shard(key), task) else { return };
         let place = table[tag(key) as usize & (table.len() - 1)].load(Ordering::Relaxed);
-        if let Some(at) = row_of(place).and_then(|row| self.rows.address(row)) {
+        if let Some(at) = row_of(place).map(|row| self.rows.address(row)) {
             prefetch(at);
         }
     }
@@ -723,9 +780,11 @@ impl<V: Send + Sync + 'static> Map<V> {
         mut edit: impl FnMut(&QueryKey, &V) -> Edit<V>,
         mut applied: impl FnMut(&V, Option<&V>),
     ) {
+        // alloc: once a pass over the map, reused for every shard.
+        let (mut edits, mut gone) = (Vec::new(), Vec::new());
         for shard in self.shards.iter() {
             let Some(table) = Self::table(shard, task) else { continue };
-            let mut edits = Vec::new();
+            edits.clear();
             for place in table.iter() {
                 let place = place.load(Ordering::Acquire);
                 // SAFETY: loaded from a table of this map in the caller's task.
@@ -739,8 +798,8 @@ impl<V: Send + Sync + 'static> Map<V> {
                 continue;
             }
             let mut writer = shard.writer.lock();
-            let mut gone = Vec::new();
-            for (seen, key, edit) in edits {
+            gone.clear();
+            for (seen, key, edit) in edits.drain(..) {
                 let current = shard.table.load(Ordering::Acquire);
                 // SAFETY: a table exists (`seen` was in one, and tables are only ever replaced),
                 // and only this lock's holder unlinks it.
@@ -771,7 +830,7 @@ impl<V: Send + Sync + 'static> Map<V> {
             }
             if !gone.is_empty() {
                 let grace = Grace::start();
-                for row in gone {
+                for row in gone.drain(..) {
                     writer.free.retire(grace, row);
                 }
                 self.tidy(&mut writer);
@@ -795,7 +854,7 @@ impl<V: Send + Sync + 'static> Map<V> {
             // SAFETY: a retired row's grace has passed: no task that could reach it is left.
             writer.free.reclaim(|row| unsafe { rows.drop_row(row) });
             if !writer.tables.is_empty() {
-                writer.tables.collect();
+                writer.tables.collect(); // alloc: `Limbo::collect` frees, allocating nothing
             }
         }
     }
@@ -832,8 +891,9 @@ impl<V: Send + Sync + 'static> Map<V> {
 
 impl<V: Send + Sync + Clone + 'static> Map<V> {
     pub(crate) fn snapshot(&self, task: &Guard) -> Vec<(QueryKey, V)> {
+        // alloc: once per image write, the inputs it lists; clone: see above.
         let mut all = Vec::new();
-        self.for_each(task, |key, value| all.push((*key, value.clone())));
+        self.for_each(task, |key, value| all.push((*key, value.clone()))); // clone: see above
         all
     }
 }
@@ -878,6 +938,7 @@ impl<T: Send + Sync + 'static> Column<T> {
     fn place(&self, index: u32) -> &AtomicPtr<T> {
         let (chunk, at) = column_place(index);
         &self.chunks[chunk].get_or_init(|| {
+            // alloc: once a chunk of the column.
             (0..COLUMN_FIRST << chunk).map(|_| AtomicPtr::new(ptr::null_mut())).collect()
         })[at]
     }
@@ -886,6 +947,7 @@ impl<T: Send + Sync + 'static> Column<T> {
     pub(crate) fn push(&self, make: impl FnOnce(u32) -> T) -> u32 {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(index < u32::MAX, "a column of 2^32 values");
+        // alloc: one a value of a column (a view's state: once a view opened).
         self.place(index).store(Box::into_raw(Box::new(make(index))), Ordering::Release);
         index
     }
@@ -929,7 +991,7 @@ impl<T: Send + Sync + 'static> Column<T> {
     /// Every value, taken out, and the next index; for [`Column::restore`].
     pub(crate) fn take_all(&mut self) -> (u32, Vec<Box<T>>) {
         let next = *self.next.get_mut();
-        (next, (0..next).filter_map(|index| self.take(index)).collect())
+        (next, (0..next).filter_map(|index| self.take(index)).collect()) // alloc: once a settle
     }
 
     /// `values` at the indices `index_of` gives, the next index pushed `next`.

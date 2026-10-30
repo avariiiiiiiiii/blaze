@@ -21,7 +21,7 @@ mod tests;
 
 use std::ops::Range;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use either::Either;
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -54,7 +54,7 @@ use crate::{
     traits::ParamEnvAndCrate,
 };
 
-use super::block_id;
+use super::{block_id, fn_can_unwind};
 
 pub use spans::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
 
@@ -88,7 +88,7 @@ pub(super) struct Attrs {
 }
 
 impl Attrs {
-    pub(super) fn of_fn(db: &dyn HirDatabase, func: FunctionId) -> Self {
+    pub(super) fn of_fn(db: &Db, func: FunctionId) -> Self {
         let flags = AttrFlags::query(db, func.into());
         let inline = if flags.contains(AttrFlags::RUSTC_FORCE_INLINE) {
             InlineAttr::Force
@@ -104,7 +104,7 @@ impl Attrs {
         Attrs { inline, flags }
     }
 
-    fn of(db: &dyn HirDatabase, body: InlinedBody<'_>) -> Self {
+    fn of(db: &Db, body: InlinedBody<'_>) -> Self {
         match body {
             InlinedBody::Fn(func) => Self::of_fn(db, func),
             InlinedBody::Closure(_) => {
@@ -135,7 +135,7 @@ impl Attrs {
 
 /// The target features `body` is compiled with, as declared: a closure has its function's.
 fn target_features<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: InlinedBody<'db>,
 ) -> &'db FxHashSet<Symbol> {
     let func = match body {
@@ -149,32 +149,9 @@ fn target_features<'db>(
 }
 
 /// rustc's `fn_can_unwind` where panics unwind: whether unwinding may leave the body.
-fn can_unwind(db: &dyn HirDatabase, body: InlinedBody<'_>) -> bool {
+fn can_unwind(db: &Db, body: InlinedBody<'_>) -> bool {
     let InlinedBody::Fn(func) = body else { return true };
-    !AttrFlags::query(db, func.into()).contains(AttrFlags::RUSTC_NOUNWIND)
-        && abi_can_unwind(FunctionSignature::of(db, func).abi)
-}
-
-fn abi_can_unwind(abi: ExternAbi) -> bool {
-    match abi {
-        ExternAbi::Rust
-        | ExternAbi::RustCall
-        | ExternAbi::RustCold
-        | ExternAbi::RustInvalid
-        | ExternAbi::RustPreserveNone
-        | ExternAbi::RustTail => true,
-        ExternAbi::C { unwind }
-        | ExternAbi::System { unwind }
-        | ExternAbi::Aapcs { unwind }
-        | ExternAbi::Cdecl { unwind }
-        | ExternAbi::Stdcall { unwind }
-        | ExternAbi::Fastcall { unwind }
-        | ExternAbi::Thiscall { unwind }
-        | ExternAbi::Vectorcall { unwind }
-        | ExternAbi::SysV64 { unwind }
-        | ExternAbi::Win64 { unwind } => unwind,
-        _ => false,
-    }
+    fn_can_unwind(db, func)
 }
 
 /// Whether unwinding may leave `body`: an edge that continues unwinding out of it.
@@ -231,7 +208,7 @@ pub(super) fn inline<'db>(
 /// rustc's `NormalInliner` and its `CallSite`s.
 struct Inliner<'a, 'db> {
     ctx: &'a Ctx<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     caller: InlinedBody<'db>,
     caller_attrs: Attrs,
     caller_features: &'db FxHashSet<Symbol>,
@@ -495,7 +472,7 @@ impl<'a, 'db> Inliner<'a, 'db> {
 
 /// rustc's `is_inline_valid_on_fn`. An intrinsic never resolves to a callee.
 fn is_inline_valid_on_fn(
-    db: &dyn HirDatabase,
+    db: &Db,
     callee: InlinedBody<'_>,
     attrs: Attrs,
 ) -> Option<()> {
@@ -511,7 +488,7 @@ fn is_inline_valid_on_fn(
 /// rustc's `is_inline_valid_on_body` (a tail call, which this MIR has none of), and what this
 /// inliner refuses that rustc takes.
 fn is_inline_valid_on_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     callee: InlinedBody<'_>,
     body: &MirBody<'_>,
 ) -> Option<()> {
@@ -587,7 +564,7 @@ fn check_signature<'db>(
 
 /// The optimized body of `body` with `options`, if it has one.
 fn optimized<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: InlinedBody<'db>,
     options: MirOptions,
 ) -> Option<&'db MirBody<'db>> {
@@ -604,7 +581,7 @@ fn optimized<'db>(
 /// checks; a crate of the build has the caller's, its `debug_assertions` deciding its UB
 /// checks.
 fn callee_options(
-    db: &dyn HirDatabase,
+    db: &Db,
     caller: Crate,
     callee: Crate,
     options: MirOptions,
@@ -626,7 +603,7 @@ fn callee_options(
 /// function only where its inliner runs and the build is not incremental, which `inline`
 /// says.
 #[salsa::tracked]
-fn cross_crate_inlinable(db: &dyn HirDatabase, func: FunctionId, options: MirOptions) -> bool {
+fn cross_crate_inlinable(db: &Db, func: FunctionId, options: MirOptions) -> bool {
     let attrs = Attrs::of_fn(db, func);
     if attrs.extern_indicator() {
         return false;
@@ -662,7 +639,7 @@ fn cross_crate_inlinable(db: &dyn HirDatabase, func: FunctionId, options: MirOpt
 
 /// [`written_checked_at`] of `body`, its own setting read once.
 fn written_checker<'b, 'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     body: &'b MirBody<'db>,
 ) -> impl FnMut(MirSpan) -> bool + use<'b, 'db> {
     let own = overflow::body_written_checked(db, body);

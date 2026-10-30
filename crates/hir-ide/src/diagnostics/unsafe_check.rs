@@ -3,6 +3,7 @@
 
 use std::mem;
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId, GenericDefId,
@@ -21,7 +22,6 @@ use span::Edition;
 
 use crate::{
     InferenceResult, TargetFeatures,
-    db::HirDatabase,
     next_solver::{CallableIdWrapper, TyKind, abi::Safety},
     utils::{TargetFeatureIsSafeInTarget, is_fn_unsafe_to_call, target_feature_is_safe_in_target},
 };
@@ -34,7 +34,7 @@ pub struct MissingUnsafeResult {
     pub deprecated_safe_calls: Vec<ExprId>,
 }
 
-pub fn missing_unsafe(db: &dyn HirDatabase, def: DefWithBodyId) -> MissingUnsafeResult {
+pub fn missing_unsafe(db: &Db, def: DefWithBodyId) -> MissingUnsafeResult {
     let _p = tracing::info_span!("missing_unsafe").entered();
 
     let is_unsafe = match def {
@@ -104,7 +104,7 @@ enum UnsafeDiagnostic {
 }
 
 pub fn unsafe_operations(
-    db: &dyn HirDatabase,
+    db: &Db,
     infer: &InferenceResult<'_>,
     def: ExpressionStoreOwnerId,
     body: &ExpressionStore,
@@ -122,7 +122,7 @@ pub fn unsafe_operations(
 }
 
 struct UnsafeVisitor<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     infer: &'db InferenceResult<'db>,
     body: &'db ExpressionStore,
     resolver: Resolver<'db>,
@@ -141,7 +141,7 @@ struct UnsafeVisitor<'db> {
 
 impl<'db> UnsafeVisitor<'db> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         infer: &'db InferenceResult<'db>,
         body: &'db ExpressionStore,
         def: ExpressionStoreOwnerId,
@@ -375,7 +375,7 @@ impl<'db> UnsafeVisitor<'db> {
                 self.with_inside_unsafe_block(InsideUnsafeBlock::Yes, |this| {
                     this.walk_pats_top(
                         statements.iter().filter_map(|statement| match statement {
-                            &Statement::Let { pat, .. } => Some(pat),
+                            Statement::Let { pat, .. } => Some(pat),
                             _ => None,
                         }),
                         current,
@@ -387,7 +387,7 @@ impl<'db> UnsafeVisitor<'db> {
             Expr::Block { unsafe_: Unsafe::No, statements, .. } => {
                 self.walk_pats_top(
                     statements.iter().filter_map(|statement| match statement {
-                        &Statement::Let { pat, .. } => Some(pat),
+                        Statement::Let { pat, .. } => Some(pat),
                         _ => None,
                     }),
                     current,
@@ -408,7 +408,7 @@ impl<'db> UnsafeVisitor<'db> {
         self.body.walk_child_exprs_without_pats(current, |child| self.walk_expr(child));
     }
 
-    fn mark_unsafe_path(&mut self, node: ExprOrPatId, path: &Path) {
+    fn mark_unsafe_path(&mut self, node: ExprOrPatId, path: Path<'_>) {
         let hygiene = self.body.expr_or_pat_path_hygiene(node);
         let value_or_partial = self.resolver.resolve_path_in_value_ns(self.db, path, hygiene);
         if let Some(ResolveValueResult::ValueNs(ValueNs::StaticId(id))) = value_or_partial {

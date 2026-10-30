@@ -2,6 +2,7 @@
 //! whose type has it may still be used, and where a local may still be dropped while it may
 //! be initialized, for the regions dropping it uses.
 
+use base_db::Db;
 use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -90,6 +91,26 @@ fn assigned(local: LocalId, projection: &[PlaceElem], effects: &mut Effects<'_>)
     }
 }
 
+/// A fake read of the value an expression statement leaves, which rustc's MIR does not read:
+/// liveness and the explanation of a borrow error both pass over it.
+pub(super) fn reads_nothing<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+    place: &hir_ty::mir::StoredPlace,
+    span: hir_ty_mir::mir::MirSpan,
+) -> bool {
+    let hir_ty_mir::mir::MirSpan::ExprId(expr) = span else { return false };
+    let Some(value) = ctx.scan.statement_value(expr) else { return false };
+    value.is_none_or(|value| {
+        place.projection.is_empty()
+            && rustc_type_ir::fold_regions(
+                ctx.infcx.interner,
+                body.locals[place.local].ty.as_ref(),
+                |_, _| Region::new_erased(ctx.infcx.interner),
+            ) == value
+    })
+}
+
 /// What the point at `location` does to the locals; a drop only where what it drops may be
 /// initialized, which `drops_initialized` says by point.
 fn effects_at<'db>(
@@ -114,17 +135,7 @@ fn effects_at<'db>(
                 }
                 assigned(place.local, place.projection.as_slice(), effects);
             }
-            StatementKind::FakeRead(place)
-                if let hir_ty_mir::mir::MirSpan::ExprId(expr) = statement.span
-                    && let Some(value) = ctx.scan.statement_value(expr)
-                    && value.is_none_or(|value| {
-                        place.projection.is_empty()
-                            && rustc_type_ir::fold_regions(
-                                ctx.infcx.interner,
-                                body.locals[place.local].ty.as_ref(),
-                                |_, _| Region::new_erased(ctx.infcx.interner),
-                            ) == value
-                    }) => {}
+            StatementKind::FakeRead(place) if reads_nothing(ctx, body, place, statement.span) => {}
             StatementKind::FakeRead(place) => {
                 place_uses(place.local, place.projection.as_slice(), effects)
             }
@@ -645,7 +656,7 @@ struct DropConstraint {
 }
 
 #[salsa::tracked(returns(ref), cycle_result = drop_constraint_cycle)]
-fn drop_constraint(db: &dyn HirDatabase, adt: AdtId) -> DropConstraint {
+fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
     let interner = DbInterner::new_no_crate(db);
     let mut regions = Vec::new();
     let mut whole = Vec::new();
@@ -686,13 +697,13 @@ fn drop_constraint(db: &dyn HirDatabase, adt: AdtId) -> DropConstraint {
 }
 
 /// An ADT that holds itself by value has no size and no answer.
-fn drop_constraint_cycle(_db: &dyn HirDatabase, _: salsa::Id, _adt: AdtId) -> DropConstraint {
+fn drop_constraint_cycle(_db: &Db, _: salsa::Id, _adt: AdtId) -> DropConstraint {
     DropConstraint::default()
 }
 
 /// Takes `ty`, a field's type or part of one, apart for [`drop_constraint`].
 fn take_apart<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     interner: DbInterner<'db>,
     ty: Ty<'db>,
     regions: &mut Vec<Region<'db>>,
@@ -741,7 +752,7 @@ fn take_apart<'db>(
 
 /// Per generic argument of the type a `Drop` impl is for, whether the impl says
 /// `#[may_dangle]` of it: that dropping does not use it.
-fn may_dangle(db: &dyn HirDatabase, drop_impl: hir_def::ImplId, count: usize) -> Vec<bool> {
+fn may_dangle(db: &Db, drop_impl: hir_def::ImplId, count: usize) -> Vec<bool> {
     let (lifetimes, types) = AttrFlags::query_generic_params(db, drop_impl.into());
     let self_ty = db.impl_self_ty(drop_impl).skip_binder();
     let TyKind::Adt(_, args) = self_ty.kind() else { return vec![false; count] };
@@ -908,7 +919,7 @@ pub(super) fn normalize_erased<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<T
         let interner = infcx.interner;
         Some(rustc_type_ir::fold_regions(
             interner,
-            infcx.resolve_vars_if_possible(normalized),
+            infcx.deeply_resolve_ignoring_regions(normalized),
             |_, _| Region::new_static(interner),
         ))
     })

@@ -244,10 +244,21 @@ pub enum Asked {
     Stop,
     /// `blaze status`: what the daemon is doing.
     Status,
+    /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
+    Daemon(DaemonVerb),
+    /// `blaze codegen-inputs`, `blaze trace` or `blaze tables`: what the daemon's last build of
+    /// the checkout did, with the words after the command, which [`super::inspect`] reads.
+    Inspect(super::inspect::Inspected, Vec<OsString>),
     Help(Option<Command>),
     Version,
     /// A command that is none of blaze's.
     Unknown(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonVerb {
+    Install,
+    Uninstall,
 }
 
 /// One of cargo's build commands, read.
@@ -399,6 +410,14 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("--version" | "-V") => return Ok(Asked::Version),
             Some("stop") => return Ok(Asked::Stop),
             Some("status") => return Ok(Asked::Status),
+            Some("daemon") => {
+                return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
+                    Some("install") => Asked::Daemon(DaemonVerb::Install),
+                    Some("uninstall") => Asked::Daemon(DaemonVerb::Uninstall),
+                    Some(other) => Asked::Unknown(format!("daemon {other}")),
+                    None => Asked::Unknown("daemon".to_owned()),
+                });
+            }
             Some(other) if other.starts_with('-') && other.len() > 1 => {
                 // A global flag before the command, and its value when that is the next word.
                 let attached = match other.strip_prefix("--") {
@@ -419,7 +438,13 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
                         false => Asked::Cargo(Box::new(it)),
                     });
                 }
-                None => return Ok(Asked::Unknown(name.to_owned())),
+                None => match super::inspect::Inspected::named(name) {
+                    Some(what) => {
+                        globals.extend(words);
+                        return Ok(Asked::Inspect(what, globals));
+                    }
+                    None => return Ok(Asked::Unknown(name.to_owned())),
+                },
             },
             None => return Ok(Asked::Unknown(word.to_string_lossy().into_owned())),
         }

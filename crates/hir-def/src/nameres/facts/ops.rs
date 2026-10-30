@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use either::Either;
 use hir_expand::{
-    ExpandTo, MacroCallId,
+    ExpandTo, MacroCallId, MacroDefId,
     attrs::{Attr, AttrId},
     builtin::BuiltinDeriveExpander,
     mod_path::ModPath,
@@ -27,14 +27,16 @@ use crate::{
     ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, ProcMacroId, UseId,
     item_scope::ImportOrExternCrate,
     item_tree::{ImportAlias, ImportKind, ModItemId, TreeId},
-    nameres::{ModuleOrigin, diagnostics::DefDiagnostic, mod_resolution::ModDir},
+    nameres::{
+        ModuleOrigin, diagnostics::DefDiagnostic, mod_resolution::ModDir, uses::DeriveHelperUse,
+    },
     per_ns::PerNs,
     visibility::{RawVisibility, Visibility},
 };
 
 /// Where an import comes from: its use tree, its `use` item, whether it is the
 /// `#[prelude_import]`, and its kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ImportSource {
     pub(crate) use_tree: Idx<ast::UseTree>,
     pub(crate) id: UseId,
@@ -195,9 +197,24 @@ pub(crate) enum DeclOp {
     ExportedDerive { mac: MacroId, helpers: Box<[Name]> },
     ProcMacroFn { func: FunctionId, mac: ProcMacroId },
 
+    /// An `extern crate` of the root naming a crate the extern prelude has from the
+    /// dependencies anyway (the old `not_introducing`).
+    NotIntroducing(ExternCrateId),
+
     // The def map's own tables. The per-item ones (derive helpers, skipped and active
     // attributes, deferred derives) are a module's `SideTables`, carried by its macro steps.
     Diagnostic(DefDiagnostic),
+    /// A macro path that resolved, for `NameRecords` (the old `resolved_macro_paths`):
+    /// `bang` is `MacroSubNs::Bang`, else `MacroSubNs::Attr`.
+    ResolvedMacroPath {
+        module: ModuleId,
+        path: ModPath,
+        bang: bool,
+        def: MacroDefId,
+        call: Option<MacroCallId>,
+    },
+    /// A derive helper attribute that resolved (the old `derive_helper_uses`).
+    DeriveHelperUse(DeriveHelperUse),
     /// A macro with compilation-local state ran.
     SessionMacros,
 }
@@ -231,9 +248,80 @@ impl DeclOp {
             | DeclOp::MacroUsePrelude { .. }
             | DeclOp::ExportedDerive { .. }
             | DeclOp::ProcMacroFn { .. }
+            | DeclOp::NotIntroducing(_)
             | DeclOp::Diagnostic(_)
+            | DeclOp::ResolvedMacroPath { .. }
+            | DeclOp::DeriveHelperUse(_)
             | DeclOp::SessionMacros => None,
         }
+    }
+
+    /// A copy of a resolution op ([`Self::is_resolution_op`]), `None` for any other: what
+    /// `module_round` hands from the step that made it to the module that gains it.
+    pub(crate) fn clone_resolution_op(&self) -> Option<DeclOp> {
+        Some(match self {
+            DeclOp::Init { module, origin, visibility, parent, inherited } => DeclOp::Init {
+                module: *module,
+                origin: *origin,
+                visibility: *visibility,
+                parent: *parent,
+                inherited: inherited.clone(),
+            },
+            &DeclOp::PushChild { parent, name, child } => DeclOp::PushChild { parent, name, child },
+            &DeclOp::Declare { module, def } => DeclOp::Declare { module, def },
+            DeclOp::Update { module, resolutions, vis, import } => DeclOp::Update {
+                module: *module,
+                resolutions: resolutions.clone(),
+                vis: *vis,
+                import: *import,
+            },
+            &DeclOp::DefineImpl { module, imp, is_trait_impl, is_reservation } => {
+                DeclOp::DefineImpl { module, imp, is_trait_impl, is_reservation }
+            }
+            &DeclOp::DefineBuiltinDeriveImpl { module, imp } => {
+                DeclOp::DefineBuiltinDeriveImpl { module, imp }
+            }
+            &DeclOp::DefineExternBlock { module, id } => DeclOp::DefineExternBlock { module, id },
+            &DeclOp::DefineExternCrateDecl { module, id } => {
+                DeclOp::DefineExternCrateDecl { module, id }
+            }
+            &DeclOp::DefineUseDecl { module, id } => DeclOp::DefineUseDecl { module, id },
+            &DeclOp::DefineUnnamedConst { module, id } => DeclOp::DefineUnnamedConst { module, id },
+            &DeclOp::DefineLegacyMacro { module, name, mac } => {
+                DeclOp::DefineLegacyMacro { module, name, mac }
+            }
+            &DeclOp::AddMacroInvoc { module, call, id } => DeclOp::AddMacroInvoc { module, call, id },
+            &DeclOp::AddAttrMacroInvoc { module, item, id } => {
+                DeclOp::AddAttrMacroInvoc { module, item, id }
+            }
+            &DeclOp::SetDeriveMacroInvoc { module, adt, call, attr, idx } => {
+                DeclOp::SetDeriveMacroInvoc { module, adt, call, attr, idx }
+            }
+            DeclOp::InitDeriveAttribute { module, adt, attr, attr_call, derive_calls } => {
+                DeclOp::InitDeriveAttribute {
+                    module: *module,
+                    adt: *adt,
+                    attr: *attr,
+                    attr_call: *attr_call,
+                    derive_calls: derive_calls.clone(),
+                }
+            }
+            DeclOp::Import(it) => DeclOp::Import(it.clone()),
+            DeclOp::Macro(_)
+            | DeclOp::Splice { .. }
+            | DeclOp::SetModDir { .. }
+            | DeclOp::Prelude { .. }
+            | DeclOp::ExternPrelude { .. }
+            | DeclOp::UnresolvedExternCrate { .. }
+            | DeclOp::MacroUsePrelude { .. }
+            | DeclOp::ExportedDerive { .. }
+            | DeclOp::ProcMacroFn { .. }
+            | DeclOp::NotIntroducing(_)
+            | DeclOp::Diagnostic(_)
+            | DeclOp::ResolvedMacroPath { .. }
+            | DeclOp::DeriveHelperUse(_)
+            | DeclOp::SessionMacros => return None,
+        })
     }
 
     /// A copy of a scope op of `root` (what a module's `#[macro_export]` or proc macro does
@@ -269,7 +357,10 @@ impl DeclOp {
                 | DeclOp::MacroUsePrelude { .. }
                 | DeclOp::ExportedDerive { .. }
                 | DeclOp::ProcMacroFn { .. }
+                | DeclOp::NotIntroducing(_)
                 | DeclOp::Diagnostic(_)
+                | DeclOp::ResolvedMacroPath { .. }
+                | DeclOp::DeriveHelperUse(_)
                 | DeclOp::SessionMacros
         )
     }

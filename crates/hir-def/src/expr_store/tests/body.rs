@@ -2,9 +2,10 @@ mod block;
 
 use crate::{
     DefWithBodyId, ModuleDefId,
+    expr_store::path::{GenericArg, Path},
     hir::{Item, MatchArm, Statement},
     nameres::crate_def_map,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 use expect_test::{Expect, expect};
 use la_arena::RawIdx;
@@ -424,6 +425,38 @@ fn every_variant_fits_the_column_budget() {
         columns.extra.len(),
         per(columns.expr_lists.len(), exprs),
     );
+}
+
+#[test]
+fn every_path_is_a_row_of_the_store_columns() {
+    let (db, def) = lower(EVERY_VARIANT);
+    let body = Body::of(&db, def);
+    let (mut bare, mut lang, mut turbofish) = (0, 0, 0);
+    for (_, expr) in body.exprs() {
+        match expr {
+            Expr::Path(path) | Expr::RecordLit { path, .. } => match path {
+                Path::BarePath(_) => bare += 1,
+                Path::LangItem(..) => lang += 1,
+                Path::Normal(_) => {}
+            },
+            Expr::MethodCall { generic_args: Some(args), .. } => {
+                assert!(matches!(args.args, [GenericArg::Type(_)]), "`m::<i32>`: {args:?}");
+                turbofish += 1;
+            }
+            _ => {}
+        }
+    }
+    let mut pat_paths = 0;
+    for (_, pat) in body.pats() {
+        if let Pat::Path(_) | Pat::Record { .. } | Pat::TupleStruct { .. } = pat {
+            pat_paths += 1;
+        }
+    }
+    assert!(bare > 0, "no bare path expression");
+    assert!(lang > 0, "no lang item path (`0..x` and `..` desugar to them)");
+    assert_eq!(turbofish, 1, "the one turbofish, `s.m::<i32>(x)`");
+    let rows = body.types.paths.iter().len();
+    assert!(rows >= bare + lang + pat_paths, "{rows} path rows");
 }
 
 #[test]

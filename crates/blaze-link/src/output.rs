@@ -84,7 +84,9 @@ pub struct Native<'a> {
     pub id: ContentId,
     /// What errors call it: its path as the link line has it.
     pub name: &'a str,
-    pub bytes: &'a [u8],
+    /// Shared with the image, which keeps it for as long as the input is on the link line:
+    /// never copied.
+    pub bytes: &'a std::sync::Arc<[u8]>,
     pub kind: NativeKind,
     /// Its place on the link line: symbols resolve to the first definition in this order,
     /// and an archive's members are taken for what is undefined when it is reached.

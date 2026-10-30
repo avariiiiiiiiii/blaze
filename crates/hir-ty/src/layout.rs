@@ -2,7 +2,7 @@
 
 use std::{cell::OnceCell, fmt, ops::Deref, sync::LazyLock};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_hashcons::{Consed, HashCons, Interned};
 use blaze_ids::{Domain, Hasher};
 use hir_def::{
@@ -172,7 +172,7 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 /// What a layout reads of a struct's signature: its flags. A rename, or a change to its
 /// generics or their bounds, leaves this equal.
 #[salsa::tracked]
-pub fn struct_flags(db: &dyn HirDatabase, id: StructId) -> StructFlags {
+pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
 }
 
@@ -181,7 +181,7 @@ pub fn struct_flags(db: &dyn HirDatabase, id: StructId) -> StructFlags {
 /// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
 /// it is asked once per struct and crate rather than once per instantiation.
 #[salsa::tracked]
-pub fn struct_tail_may_be_unsized(db: &dyn HirDatabase, id: StructId, krate: Crate) -> bool {
+pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
     variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
         let interner = DbInterner::new_with(db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
@@ -193,13 +193,13 @@ pub fn struct_tail_may_be_unsized(db: &dyn HirDatabase, id: StructId, krate: Cra
 /// The fields of a variant, in order: what a layout reads of them besides their types. A
 /// field's rename or visibility leaves this equal.
 #[salsa::tracked(returns(deref))]
-pub fn variant_field_ids(db: &dyn HirDatabase, variant: VariantId) -> Box<[LocalFieldId]> {
+pub fn variant_field_ids(db: &Db, variant: VariantId) -> Box<[LocalFieldId]> {
     variant.fields(db).fields().iter().map(|(id, _)| id).collect()
 }
 
 /// The variants of an enum, in order: what a layout reads of them besides their fields.
 #[salsa::tracked(returns(deref))]
-pub fn enum_variant_ids(db: &dyn HirDatabase, id: EnumId) -> Box<[EnumVariantId]> {
+pub fn enum_variant_ids(db: &Db, id: EnumId) -> Box<[EnumVariantId]> {
     id.enum_variants(db).variants.values().map(|&(variant, _)| variant).collect()
 }
 
@@ -215,7 +215,7 @@ impl<'a> LayoutCx<'a> {
 
 // FIXME: move this to the `rustc_abi`.
 fn layout_of_simd_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     id: StructId,
     repr_packed: bool,
     args: &GenericArgs<'db>,
@@ -248,7 +248,7 @@ fn layout_of_simd_ty<'db>(
 /// such: rustc's `scalable_vector_parts` and `layout_of_scalable_vector_type`. Its size is that
 /// of the vector at the least vector length, `size_of::<T>() * N` times the vectors of a tuple.
 fn layout_of_scalable_vector_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     id: StructId,
     args: &GenericArgs<'db>,
     env: ParamEnvAndCrate<'db>,
@@ -296,7 +296,7 @@ fn layout_of_scalable_vector_ty<'db>(
 /// The layout of a field of an aggregate (a struct, enum, tuple, array, closure or coroutine),
 /// which a scalable vector is not laid out as: see [`LayoutError::ScalableVectorField`].
 pub(crate) fn field_layout<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: StoredTy,
     env: StoredParamEnvAndCrate,
 ) -> Result<&'static Layout, LayoutError> {
@@ -318,7 +318,7 @@ fn needs_normalizing(ty: Ty<'_>) -> bool {
 /// and the inference context are built for the first type that needs them and shared by the
 /// ones after, as one context was for all of them.
 struct Normalizer<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     param_env: ParamEnv<'db>,
     cause: ObligationCause,
@@ -326,7 +326,7 @@ struct Normalizer<'db> {
 }
 
 impl<'db> Normalizer<'db> {
-    fn new(db: &'db dyn HirDatabase, krate: Crate, param_env: ParamEnv<'db>) -> Self {
+    fn new(db: &'db Db, krate: Crate, param_env: ParamEnv<'db>) -> Self {
         Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: OnceCell::new() }
     }
 
@@ -350,7 +350,7 @@ const FIELDS_INLINE: usize = 8;
 /// A tuple's or closure's fields laid out as one variant.
 fn univariant<'db>(
     cx: &LayoutCx<'_>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     tys: impl Iterator<Item = Ty<'db>>,
     trait_env: &StoredParamEnvAndCrate,
     kind: StructKind,
@@ -376,7 +376,7 @@ fn univariant_of(
 
 #[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone))]
 pub fn layout_of_ty_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     ty: StoredTy,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
@@ -773,7 +773,7 @@ pub fn layout_of_ty_query(
 }
 
 fn layout_of_ty_cycle_result(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
@@ -801,7 +801,7 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
 }
 
 pub fn struct_tail_erasing_lifetimes<'a>(
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     pointee: Ty<'a>,
     normalize: &dyn Fn(Ty<'a>) -> Ty<'a>,
 ) -> Ty<'a> {
@@ -834,7 +834,7 @@ pub fn struct_tail_erasing_lifetimes<'a>(
 }
 
 fn field_ty<'a>(
-    db: &'a dyn HirDatabase,
+    db: &'a Db,
     def: hir_def::VariantId,
     fd: LocalFieldId,
     args: GenericArgs<'a>,
@@ -900,6 +900,7 @@ impl CoroutineFrame {
 mod tests {
     use std::ops::ControlFlow;
 
+    use blaze_ids::rng::SplitMix64;
     use hir_def::{ConstId, TypeAliasId};
     use rustc_type_ir::{TypeSuperVisitable, TypeVisitable, TypeVisitor};
     use salsa::plumbing::FromId;
@@ -912,17 +913,6 @@ mod tests {
     };
 
     /// A deterministic stream of choices: xorshift64.
-    pub(super) struct Seed(pub(super) u64);
-
-    impl Seed {
-        pub(super) fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 % n as u64) as usize
-        }
-    }
-
     /// Field layouts of every shape the calculator treats apart: niches (`bool`, `char`, a
     /// reference), plain integers, a zero-sized and an uninhabited field, an array, a wide
     /// pointer.
@@ -986,11 +976,11 @@ mod tests {
         let cx = LayoutCx::new(&dl);
         let pool = sized_fields(&dl);
         let tail = unsized_field(&dl);
-        let mut seed = Seed(0x9e37_79b9_7f4a_7c15);
+        let mut seed = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for case in 0..400 {
             // Up to twelve fields, past the eight kept on the stack.
-            let len = seed.below(13);
-            let mut fields: Vec<&Layout> = (0..len).map(|_| &pool[seed.below(pool.len())]).collect();
+            let len = seed.index(13);
+            let mut fields: Vec<&Layout> = (0..len).map(|_| &pool[seed.index(pool.len())]).collect();
             let kinds: &[StructKind] = match case % 3 {
                 // A closure: every field free to move.
                 0 => &[StructKind::AlwaysSized],

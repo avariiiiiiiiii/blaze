@@ -116,7 +116,8 @@ What each part matches or beats:
   - **A hit allocates nothing.** `index::find` reads the shape in place, from bytes borrowed
     from the store's guard; on Unix a stored name is the path's bytes, with no `PathBuf`.
   - **Each input is hashed into the result key as it is asked** (`trace::Keyer`). No `Traced`
-    is built and none is encoded.
+    is built and none is encoded. The entries go through an 8 KiB stack buffer, so BLAKE3 hashes
+    chunks side by side in SIMD lanes instead of one block per tiny update.
   - **The whole environment is merged in order**, from the sorted `Env` that `Inputs::env_all`
     lends. Its names hash is made on the stack.
   - **A shape whose directory is gone stops at that directory**, with no further `stat`s.
@@ -128,7 +129,8 @@ What each part matches or beats:
   `--watchfs` answer from the watcher.
   - View files come from the query database, which the VFS watcher keeps current (watchman's
     model).
-  - `inputs::Files` keeps each canonical outside path's last answer with its
+  - `inputs::Files` keys its table by two seeded FxHash passes and compares the stored path;
+    BLAKE3 there cost ten times the rest of a check. It keeps each canonical outside path's last answer with its
     `blaze_vfs::Cover` and the generation read before it, under a sequence lock. A miss wants
     the path's parent watched. A path with a symlink, `.` or `..` in it is `stat`ed at every
     check, since a watch hears nothing of a link's target.

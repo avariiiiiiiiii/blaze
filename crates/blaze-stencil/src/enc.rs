@@ -270,3 +270,205 @@ fn get4(code: &[u8], at: usize) -> u32 {
 fn put4(code: &mut [u8], at: usize, it: u32) {
     code[at..at + 4].copy_from_slice(&it.to_le_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each form's bounds: the least and greatest value it takes, the step its values come in,
+    /// and what reading the field back gives for a value it took.
+    struct Bounds {
+        form: Form,
+        min: i64,
+        max: i64,
+        step: i64,
+        /// Whether there is a value past each bound (the unchecked forms take every value).
+        checked: bool,
+    }
+
+    const fn b(form: Form, min: i64, max: i64, step: i64) -> Bounds {
+        Bounds { form, min, max, step, checked: true }
+    }
+
+    const fn any(form: Form) -> Bounds {
+        Bounds { form, min: i64::MIN, max: i64::MAX, step: 1, checked: false }
+    }
+
+    const BOUNDS: [Bounds; 23] = [
+        b(Form::Abs8, -128, 255, 1),
+        b(Form::Abs32, 0, u32::MAX as i64, 1),
+        b(Form::Abs32S, i32::MIN as i64, i32::MAX as i64, 1),
+        any(Form::Abs64),
+        b(Form::Rel32, i32::MIN as i64, i32::MAX as i64, 1),
+        b(Form::A64MovwG0, 0, (1 << 16) - 1, 1),
+        any(Form::A64MovwG0Nc),
+        b(Form::A64MovwG1, 0, (1 << 32) - 1, 1),
+        any(Form::A64MovwG1Nc),
+        b(Form::A64MovwG2, 0, (1 << 48) - 1, 1),
+        any(Form::A64MovwG2Nc),
+        any(Form::A64MovwG3),
+        b(Form::A64AddLo12, 0, 4095, 1),
+        b(Form::A64Ldst8Lo12, 0, 4095, 1),
+        b(Form::A64Ldst16Lo12, 0, 4095 * 2, 2),
+        b(Form::A64Ldst32Lo12, 0, 4095 * 4, 4),
+        b(Form::A64Ldst64Lo12, 0, 4095 * 8, 8),
+        b(Form::A64Ldst128Lo12, 0, 4095 * 16, 16),
+        b(Form::A64Jump26, -(1 << 27), (1 << 27) - 4, 4),
+        b(Form::A64CondBr19, -(1 << 20), (1 << 20) - 4, 4),
+        b(Form::A64TestBr14, -(1 << 15), (1 << 15) - 4, 4),
+        b(Form::A64AdrLo21, -(1 << 20), (1 << 20) - 1, 1),
+        b(Form::A64LdrLit19, -(1 << 20), (1 << 20) - 4, 4),
+    ];
+
+    /// What [`read`] gives for `value` written in `form`: the part of it the field holds.
+    fn held(form: Form, value: i64) -> i64 {
+        let bits = |lo: u32| ((value as u64 >> lo) & 0xffff) << lo;
+        match form {
+            Form::Abs8 => value & 0xff,
+            Form::Abs32 => value & 0xffff_ffff,
+            Form::A64MovwG0 | Form::A64MovwG0Nc => bits(0) as i64,
+            Form::A64MovwG1 | Form::A64MovwG1Nc => bits(16) as i64,
+            Form::A64MovwG2 | Form::A64MovwG2Nc => bits(32) as i64,
+            Form::A64MovwG3 => bits(48) as i64,
+            _ => value,
+        }
+    }
+
+    /// The bits of the field in its 4-byte instruction.
+    fn mask(form: Form) -> u32 {
+        match form {
+            Form::A64MovwG0
+            | Form::A64MovwG0Nc
+            | Form::A64MovwG1
+            | Form::A64MovwG1Nc
+            | Form::A64MovwG2
+            | Form::A64MovwG2Nc
+            | Form::A64MovwG3 => 0xffff << 5,
+            Form::A64AddLo12
+            | Form::A64Ldst8Lo12
+            | Form::A64Ldst16Lo12
+            | Form::A64Ldst32Lo12
+            | Form::A64Ldst64Lo12
+            | Form::A64Ldst128Lo12 => 0xfff << 10,
+            Form::A64Jump26 => (1 << 26) - 1,
+            Form::A64CondBr19 | Form::A64LdrLit19 => ((1 << 19) - 1) << 5,
+            Form::A64TestBr14 => ((1 << 14) - 1) << 5,
+            Form::A64AdrLo21 => (3 << 29) | (0x7ffff << 5),
+            Form::Abs8 => 0xff,
+            Form::Abs32 | Form::Abs32S | Form::Rel32 | Form::Abs64 => u32::MAX,
+        }
+    }
+
+    fn round_trip(form: Form, value: i64) {
+        for fill in [0x00u8, 0xff] {
+            let mut code = [fill; 12];
+            write(form, &mut code, 2, value).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(read(form, &code, 2), held(form, value), "{form:?} {value:#x} on {fill:#x}");
+            assert_eq!(code[..2], [fill; 2], "{form:?} wrote before its field");
+            let end = 2 + usize::from(form.bytes());
+            assert!(code[end..].iter().all(|it| *it == fill), "{form:?} wrote past its field");
+        }
+        assert_eq!(check(form, value), Ok(()));
+    }
+
+    fn refused(form: Form, value: i64) {
+        let mut code = [0x5a; 12];
+        assert_eq!(write(form, &mut code, 2, value), Err(Overflow { form, value }), "{form:?} {value:#x}");
+        assert_eq!(code, [0x5a; 12], "{form:?} wrote a value it refused");
+        assert_eq!(check(form, value), Err(Overflow { form, value }));
+    }
+
+    #[test]
+    fn the_bounds_cover_every_form_in_order() {
+        for (at, bounds) in BOUNDS.iter().enumerate() {
+            assert_eq!(bounds.form, Form::ALL[at]);
+            assert_eq!(Form::from_u8(at as u8), Some(bounds.form));
+        }
+        assert_eq!(Form::from_u8(Form::ALL.len() as u8), None);
+    }
+
+    #[test]
+    fn every_form_round_trips_at_its_bounds_and_refuses_one_past() {
+        for Bounds { form, min, max, step, checked } in BOUNDS {
+            for value in [min, min + step, 0, max - step, max] {
+                round_trip(form, value);
+            }
+            if checked {
+                refused(form, min - step);
+                refused(form, max + step);
+                if step > 1 {
+                    refused(form, step / 2);
+                    refused(form, max - step / 2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_form_round_trips_a_spread_of_values() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for Bounds { form, min, max, step, .. } in BOUNDS {
+            for _ in 0..2000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let span = (max as i128 - min as i128) / i128::from(step) + 1;
+                let value = min as i128 + (i128::from(x) % span) * i128::from(step);
+                round_trip(form, value as i64);
+            }
+        }
+    }
+
+    #[test]
+    fn an_aarch64_field_keeps_the_instruction_s_other_bits() {
+        for Bounds { form, .. } in BOUNDS.iter().filter(|it| it.form as u8 >= Form::A64MovwG0 as u8) {
+            let mut code = u32::MAX.to_le_bytes();
+            write(*form, &mut code, 0, 0).unwrap();
+            assert_eq!(u32::from_le_bytes(code), !mask(*form), "{form:?}");
+        }
+    }
+
+    #[test]
+    fn pc_relative_forms_are_the_branches_and_literals() {
+        for form in Form::ALL {
+            let expected = matches!(
+                form,
+                Form::Rel32
+                    | Form::A64Jump26
+                    | Form::A64CondBr19
+                    | Form::A64TestBr14
+                    | Form::A64AdrLo21
+                    | Form::A64LdrLit19
+            );
+            assert_eq!(form.pc_relative(), expected, "{form:?}");
+        }
+    }
+
+    #[test]
+    fn known_encodings() {
+        // `b .+8`: imm26 = 2.
+        let mut code = 0x1400_0000u32.to_le_bytes();
+        write(Form::A64Jump26, &mut code, 0, 8).unwrap();
+        assert_eq!(u32::from_le_bytes(code), 0x1400_0002);
+        // `b.eq .-4`: imm19 all ones.
+        let mut code = 0x5400_0000u32.to_le_bytes();
+        write(Form::A64CondBr19, &mut code, 0, -4).unwrap();
+        assert_eq!(u32::from_le_bytes(code), 0x54ff_ffe0);
+        // `ldr x0, [x20, #16]`: imm12 = 2.
+        let mut code = 0xf940_0280u32.to_le_bytes();
+        write(Form::A64Ldst64Lo12, &mut code, 0, 16).unwrap();
+        assert_eq!(u32::from_le_bytes(code), 0xf940_0a80);
+        // `adr x0, .+5`: immlo = 1, immhi = 1.
+        let mut code = 0x1000_0000u32.to_le_bytes();
+        write(Form::A64AdrLo21, &mut code, 0, 5).unwrap();
+        assert_eq!(u32::from_le_bytes(code), 0x3000_0020);
+        // `movz x0, #0xbeef, lsl #16`.
+        let mut code = 0xd2a0_0000u32.to_le_bytes();
+        write(Form::A64MovwG1, &mut code, 0, 0xbeef_0000).unwrap();
+        assert_eq!(u32::from_le_bytes(code), 0xd2b7_dde0);
+        // x86-64 `jmp rel32` to 0x10 past its field.
+        let mut code = [0xe9, 0, 0, 0, 0];
+        write(Form::Rel32, &mut code, 1, 0x10).unwrap();
+        assert_eq!(code, [0xe9, 0x10, 0, 0, 0]);
+    }
+}

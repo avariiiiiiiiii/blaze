@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
 };
 
-use base_db::{Crate, EditionedFileId, FileId};
+use base_db::{Db, Crate, EditionedFileId, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use hir_def::{
@@ -25,7 +25,7 @@ use span::ErasedFileAstId;
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, FxBuildHasher>;
 
-use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
+use hir_ty::{traits::StoredParamEnvAndCrate};
 
 use super::{
     CodegenError, ContentId, Instance, InstanceDef, ObjectCodegen, OwnStatics, Phases, Rejections,
@@ -45,7 +45,7 @@ use super::{
 /// and an edit compiles what it can have changed to compare, naming the crates of the
 /// checkout by their ids in the base. `None` when something it refers to has no stable name.
 pub(super) fn stable_mark(
-    db: &dyn HirDatabase,
+    db: &Db,
     names: &StableNames<'_, '_>,
     compiled: &CompiledFunction,
     debug: bool,
@@ -113,7 +113,7 @@ pub(super) fn stable_mark(
 /// wrote it. While nothing but bodies changes, code whose items read the same is the code it
 /// was, or code nothing calls by its name any more.
 pub(super) fn written_items(
-    db: &dyn HirDatabase,
+    db: &Db,
     names: &StableNames<'_, '_>,
     instance: &Instance,
     compiled: &CompiledFunction,
@@ -146,7 +146,7 @@ pub(super) fn written_items(
 /// [`item_print`] of the item a body is of, with its file and its id there.
 #[salsa::tracked(returns(ref))]
 fn body_print(
-    db: &dyn HirDatabase,
+    db: &Db,
     body: DefWithBodyId,
 ) -> Option<(EditionedFileId, u32, u64, (u32, u32))> {
     let (file, id) = match body {
@@ -162,7 +162,7 @@ fn body_print(
 
 /// A hash of the text of the item `id` of `file`, and the line and column it begins on.
 fn item_print(
-    db: &dyn HirDatabase,
+    db: &Db,
     file: EditionedFileId,
     id: ErasedFileAstId,
 ) -> Option<(u64, (u32, u32))> {
@@ -178,7 +178,7 @@ fn item_print(
 
 /// Whether each of `items` that is of a file in `edited`, by its name, reads as it did.
 fn items_unchanged(
-    db: &dyn HirDatabase,
+    db: &Db,
     items: &[WrittenItem],
     edited: &FxHashMap<String, EditionedFileId>,
 ) -> bool {
@@ -202,7 +202,7 @@ struct Mark {
 }
 
 impl Mark {
-    fn new(db: &dyn HirDatabase, serial: u128, requests: &Requests) -> Mark {
+    fn new(db: &Db, serial: u128, requests: &Requests) -> Mark {
         let mut hasher = rustc_hash::FxHasher::default();
         for request in &requests.datas {
             match request {
@@ -219,7 +219,7 @@ impl Mark {
     /// The mark of a function, whose code is a patch's to describe again when `debug` is set
     /// and a line of it is another: an edit above it in the file moves them all.
     fn of_function(
-        db: &dyn HirDatabase,
+        db: &Db,
         serial: u128,
         compiled: &CompiledFunction,
         debug: bool,
@@ -235,7 +235,7 @@ impl Mark {
     }
 
     /// The mark of a root, `None` when it does not compile.
-    fn of_root(db: &dyn HirDatabase, root: FunctionId, debug: bool) -> Option<Mark> {
+    fn of_root(db: &Db, root: FunctionId, debug: bool) -> Option<Mark> {
         if debug {
             return root_mark(db, root);
         }
@@ -245,7 +245,7 @@ impl Mark {
 
     /// The mark of an instance, `None` when it does not compile.
     fn of_instance(
-        db: &dyn HirDatabase,
+        db: &Db,
         instance: &Instance,
         env: &StoredParamEnvAndCrate,
         debug: bool,
@@ -269,7 +269,7 @@ impl Mark {
 /// can reach, and found again it would ask where each row of the code is; kept, asking again
 /// verifies the places it read, which instances of one function share.
 #[salsa::tracked(returns(copy))]
-fn root_mark(db: &dyn HirDatabase, root: FunctionId) -> Option<Mark> {
+fn root_mark(db: &Db, root: FunctionId) -> Option<Mark> {
     let compiled = compiled_root(db, root).as_ref().ok()?;
     Some(Mark::of_function(db, root_serial(db, root), compiled, true))
 }
@@ -277,7 +277,7 @@ fn root_mark(db: &dyn HirDatabase, root: FunctionId) -> Option<Mark> {
 /// [`root_mark`], of an instance.
 #[salsa::tracked(returns(copy))]
 fn instance_mark(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
 ) -> Option<Mark> {
@@ -325,19 +325,19 @@ fn probe<T>(query: impl FnOnce() -> T) -> Option<T> {
 
 /// Whether `root` has a type or constant to be given, of its own or of its `impl` or trait
 /// (`Self` of a trait's method).
-pub(super) fn copied_by_rustc(db: &dyn HirDatabase, root: FunctionId) -> bool {
+pub(super) fn copied_by_rustc(db: &Db, root: FunctionId) -> bool {
     let generics = hir_ty::generics::generics(db, root.into());
     generics.iter(false).any(|(id, _)| !matches!(id, hir_def::GenericParamId::LifetimeParamId(_)))
 }
 
 /// What a closure of the body of `root`, which is not generic, is compiled in.
-fn closure_env(db: &dyn HirDatabase, root: FunctionId) -> StoredParamEnvAndCrate {
+fn closure_env(db: &Db, root: FunctionId) -> StoredParamEnvAndCrate {
     let param_env = hir_ty::next_solver::ParamEnv::empty();
     hir_ty::traits::ParamEnvAndCrate { param_env, krate: root.krate(db) }.store()
 }
 
 fn closure_mark(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
     debug: bool,
@@ -389,7 +389,7 @@ struct TheirWalk {
 impl TheirWalk {
     /// Marks what of the base the walk went through, and keeps the rest.
     fn new(
-        db: &dyn HirDatabase,
+        db: &Db,
         found: &TheirStatics,
         walked: Walked,
         instances: &mut FxIndexMap<Instance, BaseInstance>,
@@ -455,7 +455,7 @@ impl Reached {
     /// function of ours: rustc's code calls it by its symbol, which ours takes over. The
     /// functions of crates the build has none of are only rustc's, and no edit reaches them.
     fn walk(
-        db: &dyn HirDatabase,
+        db: &Db,
         from_rustc: &[FunctionId],
         compiled: &[(FunctionId, String)],
         skipped: &[(FunctionId, CodegenError)],
@@ -517,7 +517,7 @@ impl Reached {
         reached
     }
 
-    fn mark(&self, db: &dyn HirDatabase) -> Option<Mark> {
+    fn mark(&self, db: &Db) -> Option<Mark> {
         let (serial, compiled) = match &self.node {
             Node::Root(func) => (root_serial(db, *func), compiled_root(db, *func)),
             Node::Instance(instance) => (
@@ -530,7 +530,7 @@ impl Reached {
     }
 
     /// The function whose code it is.
-    fn func(&self, db: &dyn HirDatabase) -> Option<FunctionId> {
+    fn func(&self, db: &Db) -> Option<FunctionId> {
         match &self.node {
             Node::Root(func) => Some(*func),
             Node::Instance(instance) => written_in(db, instance),
@@ -568,7 +568,7 @@ struct Left {
 }
 
 impl Left {
-    fn of(db: &dyn HirDatabase, root: FunctionId) -> Left {
+    fn of(db: &Db, root: FunctionId) -> Left {
         let code = compiled_root(db, root).as_ref().ok();
         Left {
             code: code.map(|it| Mark::new(db, root_serial(db, root), &it.requests)),
@@ -642,7 +642,7 @@ impl RustcValues {
     ///
     /// An edit of bodies alone is no edit of a value: those are bodies of functions that are
     /// not `const` ([`Rejections::touch_bodies`]), which no value is evaluated through.
-    pub(crate) fn kept(&self, db: &dyn HirDatabase, id: StaticId) -> bool {
+    pub(crate) fn kept(&self, db: &Db, id: StaticId) -> bool {
         let Ok(compiled) = compiled_static(db, id).as_ref() else { return true };
         let now = Mark::new(db, static_serial(db, id), &compiled.requests);
         let touched = self.touched.contains(&id.krate(db));
@@ -689,7 +689,7 @@ impl Frozen {
     /// edit has reached: asked before an edit reaches them, so that a build that first asks
     /// about one after it, as a build in full of code no build compiled before does, still
     /// knows rustc's ([`RustcValues`]).
-    pub(crate) fn take_values(&mut self, db: &dyn HirDatabase, crates: FxHashSet<Crate>) {
+    pub(crate) fn take_values(&mut self, db: &Db, crates: FxHashSet<Crate>) {
         let untouched =
             |it: &Crate| !self.edited_values.contains(it) && !self.distrusted.contains(it);
         let fresh: Vec<Crate> =
@@ -713,7 +713,7 @@ impl Frozen {
     }
 
     /// Whether an edit since the daemon started can have changed what the root is.
-    fn touched_root(&self, db: &dyn HirDatabase, root: FunctionId) -> bool {
+    fn touched_root(&self, db: &Db, root: FunctionId) -> bool {
         self.edited.contains(&root.krate(db))
             || self.edited_bodies.contains(&body_file(db, root.into()))
     }
@@ -722,7 +722,7 @@ impl Frozen {
     /// function of `krate` that is generic over nothing: an edit of the crate, or of what it
     /// depends on, which is in `edited` too; or of the bodies of a file of the crate or of one
     /// it depends on, whose generic and inline functions rustc copies into it.
-    fn touched_from(&self, db: &dyn HirDatabase, krate: Crate) -> bool {
+    fn touched_from(&self, db: &Db, krate: Crate) -> bool {
         if self.edited.contains(&krate) {
             return true;
         }
@@ -735,7 +735,7 @@ impl Frozen {
             .any(|&file| base_db::relevant_crates(db, file).iter().any(|it| crates.contains(it)))
     }
 
-    fn touched(&self, db: &dyn HirDatabase, reached: &Reached) -> bool {
+    fn touched(&self, db: &Db, reached: &Reached) -> bool {
         let bodies = match &reached.files {
             // What it calls is of its crates or of what they depend on: rustc copies the
             // generic functions of those into it.
@@ -759,7 +759,7 @@ impl Frozen {
     /// A function or instance of `base` that rustc's copy is no longer right for, and why. The
     /// first call with a base of ours notes what rustc compiled: of what no edit has reached by
     /// then.
-    pub(crate) fn out_of_date(&mut self, db: &dyn HirDatabase, base: &Base) -> Option<OutOfDate> {
+    pub(crate) fn out_of_date(&mut self, db: &Db, base: &Base) -> Option<OutOfDate> {
         let now = || {
             let theirs = base.skipped.iter().filter(|it| !it.1.no_symbol());
             theirs.map(|(root, why)| (*root, why))
@@ -1214,7 +1214,7 @@ struct FromStore {
 
 impl FromStore {
     fn new(
-        db: &dyn HirDatabase,
+        db: &Db,
         cg: &ObjectCodegen<'_, '_>,
         compiled: &[(FunctionId, String)],
         stored_marks: &FxHashMap<u32, u128>,
@@ -1335,7 +1335,7 @@ impl Base {
 
     /// `None` when the build has something in it a patch could not keep track of.
     pub(super) fn record(
-        db: &dyn HirDatabase,
+        db: &Db,
         cg: &ObjectCodegen<'_, '_>,
         entries: &[FunctionId],
         compiled: &[(FunctionId, String)],
@@ -1358,9 +1358,9 @@ impl Base {
             .filter_map(|(i, it)| Some((i, Box::from(it.items?))))
             .collect();
         let stored = |i: usize| stored_marks.contains_key(&(i as u32));
-        let root_mark = |db: &dyn HirDatabase, root| Mark::of_root(db, root, debug);
+        let root_mark = |db: &Db, root| Mark::of_root(db, root, debug);
         let instance_mark =
-            |db: &dyn HirDatabase, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
+            |db: &Db, (instance, env): &(Instance, StoredParamEnvAndCrate)| {
                 (Mark::of_instance(db, instance, env, debug), body_files(db, instance))
             };
         // The marks are a hash of each function's code and of its lines, which every thread
@@ -1577,7 +1577,7 @@ impl Base {
     /// bodies. The source is what rustc compiled until then, so the marks are of rustc's copies.
     pub(super) fn home(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         file: FileId,
         functions: &[FunctionId],
@@ -1664,7 +1664,7 @@ impl Base {
     /// the copies the executable has of the functions of each name.
     fn home_copies(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         functions: &[FunctionId],
         callers: &[FunctionId],
@@ -1796,7 +1796,7 @@ impl Base {
     /// are instances of the base, which a patch replaces under it.
     fn home_closures(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         root: FunctionId,
     ) {
@@ -1853,7 +1853,7 @@ impl Base {
     }
 
     /// Notes that a file changed: one of `crates`, or with `None` one we can't place.
-    pub(super) fn touch(&mut self, db: &dyn HirDatabase, crates: Option<&[Crate]>) {
+    pub(super) fn touch(&mut self, db: &Db, crates: Option<&[Crate]>) {
         // rustc's copies of what sees the file are of before, and nothing here says which.
         self.outdate_rustc("an edit that is more than the bodies of functions");
         let Some(crates) = crates else {
@@ -1875,7 +1875,7 @@ impl Base {
     /// `crates`, no file of them named the new functions before (or names those taken away
     /// after), and `files` are their files. What rustc compiled of them is then known when
     /// [`Self::home`] took in every one of those files.
-    pub(super) fn touch_added(&mut self, db: &dyn HirDatabase, crates: &[Crate], files: &[FileId]) {
+    pub(super) fn touch_added(&mut self, db: &Db, crates: &[Crate], files: &[FileId]) {
         if !files.iter().all(|it| self.homed.contains(it)) {
             return self.touch(db, Some(crates));
         }
@@ -1886,7 +1886,7 @@ impl Base {
 
     /// Notes that a file changed in the bodies of functions alone, none of which the rest of
     /// the program sees into.
-    pub(super) fn touch_bodies(&mut self, db: &dyn HirDatabase, file: FileId) {
+    pub(super) fn touch_bodies(&mut self, db: &Db, file: FileId) {
         self.touched.bodies.insert(file);
         if !self.homed.contains(&file) {
             self.outdate_rustc("a file whose functions were not looked at before it changed");
@@ -1904,7 +1904,7 @@ impl Base {
     }
 
     /// Takes what every part of [`Base::stale`] found as where the next edit starts from.
-    pub(super) fn settle(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
+    pub(super) fn settle(&mut self, db: &Db, found: &mut [Stale]) {
         self.their_statics(db, found);
         self.touched.settle(found);
     }
@@ -1912,7 +1912,7 @@ impl Base {
     /// Declines when the functions the base left to rustc reach other statics than they did.
     /// Walking to them is slow, and nothing changes where the walk goes but the code of what
     /// it went through.
-    fn their_statics(&mut self, db: &dyn HirDatabase, found: &mut [Stale]) {
+    fn their_statics(&mut self, db: &Db, found: &mut [Stale]) {
         let check_all = std::env::var_os("BLAZE_CHECK_ALL").is_some();
         let changed = found.iter().any(|it| it.their_walk_changed);
         let Some(first) = found.first_mut() else { return };
@@ -2019,7 +2019,7 @@ impl Base {
     /// as they did when it was compiled is then the code it was, and is not compiled to tell.
     fn bodies_edited(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         names: &StableNames<'_, '_>,
     ) -> Option<FxHashMap<String, EditionedFileId>> {
         let touched = &self.touched;
@@ -2038,7 +2038,7 @@ impl Base {
     /// changed, comparing what it compiles to now with the mark the store had of it.
     fn stale_hydrated(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         names: &StableNames<'_, '_>,
         check_all: bool,
         part: usize,
@@ -2122,7 +2122,7 @@ impl Base {
     /// now. `None` when nothing that called it does any more.
     fn found_instance(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         names: &StableNames<'_, '_>,
         homes: &mut super::home::Homes,
         found: &mut FoundHydrated,
@@ -2166,7 +2166,7 @@ impl Base {
     /// The code of a caller of one of [`Self::hydrated`] as it compiles now.
     fn caller_code<'q>(
         &self,
-        db: &'q dyn HirDatabase,
+        db: &'q Db,
         names: &StableNames<'_, '_>,
         homes: &mut super::home::Homes,
         found: &mut FoundHydrated,
@@ -2202,7 +2202,7 @@ impl Base {
     /// Each changed caller is compiled again, and what it calls now with it.
     fn dropped(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         names: &StableNames<'_, '_>,
         homes: &mut super::home::Homes,
         found: &mut FoundHydrated,
@@ -2242,7 +2242,7 @@ impl Base {
     /// `symbols` names what the base has from the store, which nothing else tells an edit of.
     pub(super) fn stale(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
@@ -2486,7 +2486,7 @@ impl Base {
     }
 
     /// Whether a root still refers to the node, directly or through others.
-    fn reaches(&self, db: &dyn HirDatabase, node: &Node, unchanged: &Unchanged) -> bool {
+    fn reaches(&self, db: &Db, node: &Node, unchanged: &Unchanged) -> bool {
         let mut seen = FxHashSet::default();
         let mut stack = vec![node];
         while let Some(node) = stack.pop() {
@@ -2514,7 +2514,7 @@ impl Base {
     /// compiles again refers to one.
     fn moved(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         changed: &[StaticId],
     ) -> std::result::Result<(FxHashSet<StaticId>, Vec<Node>), &'static str> {
         let (mut moved, mut referrers) = (FxHashSet::default(), Vec::new());
@@ -2593,7 +2593,7 @@ impl Base {
     /// Whether what referred to the node in the base does so after the edit.
     fn still_asks_for(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         parent: &Node,
         node: &Node,
         unchanged: &Unchanged,
@@ -2638,7 +2638,7 @@ impl Base {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn patch(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         on_demand: &FxHashSet<FunctionId>,

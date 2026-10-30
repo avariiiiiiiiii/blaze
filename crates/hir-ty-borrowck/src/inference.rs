@@ -39,7 +39,7 @@ pub(super) fn infer(
     regions: &Regions<'_>,
     count: usize,
     points: usize,
-    live: Vec<IntervalSet>,
+    live: &[IntervalSet],
 ) -> RegionValues {
     // `sup: sub` makes `sup` hold what `sub` does: an edge from `sup` to `sub`, appended in
     // `sup` order, so no sort.
@@ -54,8 +54,8 @@ pub(super) fn infer(
     // Tarjan's algorithm numbers a component after every component it reaches.
     let mut values = vec![IntervalSet::default(); sccs];
     let mut universals = BitMatrix::new(sccs, regions.universals.len());
-    for (rv, it) in live.into_iter().enumerate() {
-        values[scc[rv] as usize].union(&it);
+    for (rv, it) in live.iter().enumerate() {
+        values[scc[rv] as usize].union(it);
     }
     for (index, &(rv, _)) in regions.universals.iter().enumerate() {
         if rv >= count {

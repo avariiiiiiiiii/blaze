@@ -3,8 +3,10 @@
 //! Every salsa struct ingredient has one [`MemoTableTypes`], shared by all its slots, and in it one
 //! [`Column`] per tracked function keyed on the struct. A slot's [`MemoTable`] is only its row
 //! number. A column holds, for each row, a pointer to the row's current memo, and the memos
-//! themselves in a slab of the memo type: pages that double and never move, filled by a bump
-//! counter and by the slots freed at the last revision boundary.
+//! themselves in a slab of the memo type. Both are blaze-mem regions (docs/v2/plan/design/
+//! memory.md): address space reserved when the column is made, committed as it fills, never
+//! moved, so a row's pointer is at `8 * row` and a slot at `size * slot`. The slab fills from a
+//! bump counter and from the slots freed at the last revision boundary.
 //!
 //! So a memo costs its own size in the slab (no heap allocation and no allocator rounding of its
 //! own) and an 8-byte row pointer in its function's column; a function with no memo for a range
@@ -31,14 +33,17 @@ use std::ptr::{self, NonNull};
 
 use crate::DatabaseKeyIndex;
 use crate::function::ErasedMemo;
-use crate::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
-use crate::sync::{Mutex, OnceLock};
+use blaze_mem::{Region, Tag};
+
+use crate::sync::Mutex;
+use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::zalsa::MemoIngredientIndex;
 use crate::zalsa::Zalsa;
 
 /// Adds the registered concrete memo type's vtable without dereferencing the pointer.
 ///
 /// Dereferencing the result requires a live, aligned allocation of the same concrete type.
+// dyn: one vtable per memo column, used when a slot is cleared, at reclaim and in reports, never on a hit
 pub(crate) type ToDynMemo = fn(NonNull<DummyMemo>) -> NonNull<dyn Memo>;
 
 /// The "memo table" of a salsa struct slot: its row in each of its ingredient's memo columns.
@@ -94,8 +99,11 @@ pub struct MemoEntryType {
     /// A type-coercion function for the erased memo type `M`.
     to_dyn_fn: ToDynMemo,
 
-    /// The layout of `M`, which the column's slab pages are arrays of.
+    /// The layout of `M`, the stride of the column's slab.
     layout: Layout,
+
+    /// `M`'s name, for the column's errors.
+    type_name: &'static str,
 }
 
 impl MemoEntryType {
@@ -105,10 +113,12 @@ impl MemoEntryType {
             type_id: TypeId::of::<M>(),
             to_dyn_fn: Self::to_dyn_fn::<M>(),
             layout: Layout::new::<M>(),
+            type_name: std::any::type_name::<M>(),
         }
     }
 
     pub(crate) const fn to_dyn_fn<M: Memo>() -> ToDynMemo {
+        // dyn: one vtable per memo column, used when a slot is cleared, at reclaim and in reports, never on a hit
         fn to_dyn<M: Memo>(memo: NonNull<DummyMemo>) -> NonNull<dyn Memo> {
             let memo: NonNull<M> = memo.cast();
             memo
@@ -138,6 +148,7 @@ impl Memo for DummyMemo {
                 size_of_metadata: 0,
                 size_of_fields: 0,
                 heap_size_of_fields: None,
+                // alloc: the edge: memory-usage reports, run with `&mut` outside builds
                 memos: Vec::new(),
             },
         }
@@ -150,21 +161,22 @@ impl Drop for DummyMemo {
     }
 }
 
-/// Row page `p` holds `1 << (FIRST_ROW_BITS + p)` rows; 23 pages hold every `u32` row.
-const FIRST_ROW_BITS: u32 = 10;
-const ROW_PAGES: usize = 23;
+/// Rows a struct ingredient can hand out. Each column reserves an 8-byte row pointer for every
+/// one: 2 GB of address space, committed only as far as rows hold memos.
+const MAX_ROWS: usize = 1 << 28;
 
-/// Slab page `p` holds `1 << (FIRST_SLAB_BITS + p)` memos.
-const FIRST_SLAB_BITS: u32 = 6;
-const SLAB_PAGES: usize = 40;
+/// Memos one column can hold at once, current, retired or free.
+const MAX_MEMOS: usize = 1 << 24;
 
-/// The page and offset of item `index` in pages that double from `1 << first_bits` items.
-#[inline]
-fn locate(index: usize, first_bits: u32) -> (usize, usize) {
-    let x = index + (1 << first_bits);
-    let bits = usize::BITS - 1 - x.leading_zeros();
-    ((bits - first_bits) as usize, x - (1 << bits))
-}
+/// The most address space one column's slab reserves, for very large memo types.
+const MAX_SLAB_BYTES: usize = 1 << 34;
+
+const ROW_BYTES: usize = mem::size_of::<RowPtr>();
+
+/// A row's pointer to its current memo. A plain atomic, not `crate::sync`'s: rows live in
+/// kernel-zeroed pages of a [`Region`], and all-zero bits are a null `AtomicPtr`, which
+/// shuttle's atomics (objects of their own) are not.
+type RowPtr = std::sync::atomic::AtomicPtr<DummyMemo>;
 
 /// A memo pointer that the column owns: the current memo of a row, a retired one, or a free slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,67 +189,32 @@ unsafe impl Send for MemoPtr {}
 // SAFETY: As above.
 unsafe impl Sync for MemoPtr {}
 
-/// One page of a column's slab: `len` uninitialized or initialized memos of `layout`.
-struct SlabPage {
-    base: NonNull<u8>,
-    layout: Layout,
-}
-
-// SAFETY: The page is plain memory owned by its column; the memos in it are `Send + Sync`.
-unsafe impl Send for SlabPage {}
-// SAFETY: As above.
-unsafe impl Sync for SlabPage {}
-
-impl SlabPage {
-    fn new(memo: Layout, len: usize) -> SlabPage {
-        let layout = Layout::from_size_align(
-            memo.size()
-                .checked_mul(len)
-                .expect("salsa: a memo slab page fits in memory"),
-            memo.align(),
-        )
-        .expect("salsa: a memo slab page fits in memory");
-        assert!(layout.size() > 0, "salsa: memos are never zero-sized");
-        // SAFETY: `layout` has a nonzero size.
-        let base = unsafe { std::alloc::alloc(layout) };
-        let Some(base) = NonNull::new(base) else {
-            std::alloc::handle_alloc_error(layout);
-        };
-        SlabPage { base, layout }
-    }
-
-    fn contains(&self, memo: NonNull<DummyMemo>) -> bool {
-        let start = self.base.as_ptr() as usize;
-        let at = memo.as_ptr() as usize;
-        at >= start && at < start + self.layout.size()
-    }
-}
-
-impl Drop for SlabPage {
-    fn drop(&mut self) {
-        // SAFETY: `base` was allocated with `layout` by `SlabPage::new`, and the column dropped
-        // every memo in it before dropping its pages.
-        unsafe { std::alloc::dealloc(self.base.as_ptr(), self.layout) };
-    }
-}
-
-/// One tracked function's memos for every row of a struct ingredient.
+/// One tracked function's memos for every row of a struct ingredient, in two reserved regions
+/// of blaze-mem (docs/v2/plan/design/memory.md): addresses fixed when the database is made,
+/// pages committed as they fill, never moved, so a row's pointer and a memo's place are
+/// computed from their numbers with no directory to load.
 ///
-/// `repr(C)` and line-aligned so a hit's type check and its row page pointer (`rows[0]` for the
-/// first 1024 rows) share the column's first cache line; the arrays are inline, not boxed, so
-/// a hit loads no line between the column and the row page.
+/// `repr(C)` and line-aligned so a hit's row region (its base and committed length) and the
+/// type check share the column's first cache line (a `const` assertion below).
 #[repr(C, align(64))]
 struct Column {
+    /// Row `r`'s pointer at `r * 8`, null until a memo is stored; zeroed by the kernel when
+    /// committed, and committed (`Region::ensure`) by the first `insert` at or past it.
+    rows: Region,
+
+    /// `type_.type_id`, beside `rows` for the hit's type check.
+    type_id: TypeId,
+
     type_: MemoEntryType,
 
-    /// The current memo of each row, or null; pages allocated on the first memo in their range.
-    rows: [OnceLock<Box<[AtomicPtr<DummyMemo>]>>; ROW_PAGES],
-
-    /// The memos, in pages that never move.
-    slab: [OnceLock<SlabPage>; SLAB_PAGES],
+    /// The memos: slot `i` at `i * type_.layout.size()`.
+    slab: Region,
 
     /// Slab slots ever handed out by the bump counter.
     slab_len: AtomicUsize,
+
+    /// Slab slots the reservation holds.
+    slab_max: usize,
 
     /// Free slots, written only by `reclaim` (exclusive) and read by `alloc` while shared.
     free: UnsafeCell<Vec<MemoPtr>>,
@@ -249,45 +226,73 @@ struct Column {
     retired: Mutex<Vec<MemoPtr>>,
 }
 
-#[cfg(all(not(feature = "shuttle"), target_pointer_width = "64"))]
-const _: () = assert!(
-    mem::offset_of!(Column, rows) + mem::size_of::<OnceLock<Box<[AtomicPtr<DummyMemo>]>>>() <= 64
-);
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(mem::offset_of!(Column, rows) == 0);
+    assert!(mem::offset_of!(Column, type_id) + mem::size_of::<TypeId>() <= 64);
+};
 
 // SAFETY: `free` is only written by `reclaim` and `Drop`, which have exclusive access to the
-// column (their contracts), and only read through `&self` otherwise; everything else is atomic,
-// locked, or immutable after construction, and the memos are `Send + Sync`.
+// column (their contracts), and only read through `&self` otherwise; the regions are `Sync`
+// and their contents atomic or owned by the protocol above; everything else is atomic, locked,
+// or immutable after construction, and the memos are `Send + Sync`.
 unsafe impl Sync for Column {}
-// SAFETY: The column owns its memos, which are `Send`, and its slab pages.
+// SAFETY: The column owns its memos, which are `Send`, and its regions.
 unsafe impl Send for Column {}
 
 impl Column {
     fn new(type_: MemoEntryType) -> Column {
-        debug_assert!(type_.layout.size() > 0, "salsa: memos are never zero-sized");
-        debug_assert_eq!(type_.layout.size() % type_.layout.align(), 0);
+        let size = type_.layout.size();
+        assert!(size > 0, "salsa: memos are never zero-sized");
+        debug_assert_eq!(size % type_.layout.align(), 0);
+        assert!(
+            type_.layout.align() <= blaze_mem::page_size(),
+            "salsa: the memo type `{}` is aligned past a page",
+            type_.type_name
+        );
+        let slab_max = MAX_MEMOS.min(MAX_SLAB_BYTES / size);
+        let reserve = |bytes: usize, what: &str| {
+            Region::reserve(bytes, Tag::Query).unwrap_or_else(|err| {
+                panic!("salsa: reserving the {what} of `{}`'s memo column: {err}", type_.type_name)
+            })
+        };
         Column {
+            rows: reserve(MAX_ROWS * ROW_BYTES, "rows"),
+            type_id: type_.type_id,
             type_,
-            rows: std::array::from_fn(|_| OnceLock::new()),
-            slab: std::array::from_fn(|_| OnceLock::new()),
+            slab: reserve(slab_max * size, "slab"),
             slab_len: AtomicUsize::new(0),
+            slab_max,
+            // alloc: `Vec::new` allocates nothing; a column's free and retired lists grow once and are reused every revision
             free: UnsafeCell::new(Vec::new()),
             free_taken: AtomicUsize::new(0),
+            // alloc: `Vec::new` allocates nothing; a column's free and retired lists grow once and are reused every revision
             retired: Mutex::new(Vec::new()),
         }
     }
 
-    /// The row's pointer, if its page exists.
+    /// The row's pointer, if its page is committed.
     #[inline]
-    fn row(&self, row: u32) -> Option<&AtomicPtr<DummyMemo>> {
-        let (page, offset) = locate(row as usize, FIRST_ROW_BITS);
-        Some(&self.rows[page].get()?[offset])
+    fn row(&self, row: u32) -> Option<&RowPtr> {
+        let at = row as usize * ROW_BYTES;
+        if at + ROW_BYTES > self.rows.committed() {
+            return None;
+        }
+        // SAFETY: `[at, at + 8)` is committed, so readable and writable for the region's life,
+        // which is the column's; it holds zero or a pointer `insert` stored, both valid
+        // `AtomicPtr`s; and it is 8-aligned, the base being page-aligned.
+        Some(unsafe { self.rows.at(at).cast::<RowPtr>().as_ref() })
     }
 
-    /// The row's pointer, allocating its page.
+    /// The row's pointer, committing its page.
     #[inline]
-    fn row_or_init(&self, row: u32) -> &AtomicPtr<DummyMemo> {
-        let (page, offset) = locate(row as usize, FIRST_ROW_BITS);
-        &self.rows[page].get_or_init(|| null_rows(1 << (FIRST_ROW_BITS as usize + page)))[offset]
+    fn row_or_init(&self, row: u32) -> &RowPtr {
+        debug_assert!((row as usize) < MAX_ROWS);
+        let end = (row as usize + 1) * ROW_BYTES;
+        self.rows.ensure(end).unwrap_or_else(|err| {
+            panic!("salsa: committing a row of `{}`'s memo column: {err}", self.type_.type_name)
+        });
+        self.row(row).expect("salsa: a row is committed once `ensure` returns")
     }
 
     /// A slab slot for one memo, uninitialized and owned by the caller until it is published.
@@ -299,26 +304,31 @@ impl Column {
             return slot;
         }
         let index = self.slab_len.fetch_add(1, Ordering::Relaxed);
-        let (page, offset) = locate(index, FIRST_SLAB_BITS);
-        let layout = self.type_.layout;
-        let page = self
-            .slab
-            .get(page)
-            .expect("salsa: a memo column outgrew its last slab page")
-            .get_or_init(|| SlabPage::new(layout, 1 << (FIRST_SLAB_BITS as usize + page)));
-        // SAFETY: `offset` is below the page's length, so the slot lies inside its allocation.
-        let slot = unsafe { page.base.add(offset * layout.size()) }.cast::<DummyMemo>();
-        debug_assert!(page.contains(slot));
-        debug_assert_eq!(slot.as_ptr() as usize % layout.align(), 0);
+        if index >= self.slab_max {
+            self.slab_len.fetch_sub(1, Ordering::Relaxed);
+            panic!(
+                "salsa: `{}`'s memo column holds more than {} memos (current, retired and free)",
+                self.type_.type_name, self.slab_max
+            );
+        }
+        let size = self.type_.layout.size();
+        self.slab.ensure((index + 1) * size).unwrap_or_else(|err| {
+            panic!("salsa: committing a slot of `{}`'s memo column: {err}", self.type_.type_name)
+        });
+        let slot = self.slab.at(index * size).cast::<DummyMemo>();
+        debug_assert!(self.owns(slot));
+        debug_assert_eq!(slot.as_ptr() as usize % self.type_.layout.align(), 0);
         slot
     }
 
-    /// Whether `memo` lies in one of this column's slab pages.
+    /// Whether `memo` is the start of a slot this column's slab has handed out.
     fn owns(&self, memo: NonNull<DummyMemo>) -> bool {
-        self.slab
-            .iter()
-            .filter_map(OnceLock::get)
-            .any(|page| page.contains(memo))
+        let start = self.slab.base().as_ptr() as usize;
+        let size = self.type_.layout.size();
+        let Some(offset) = (memo.as_ptr() as usize).checked_sub(start) else {
+            return false;
+        };
+        offset % size == 0 && offset / size < self.slab_len.load(Ordering::Relaxed)
     }
 
     /// Takes the row's memo out and retires it, returning it: it stays valid until `reclaim`.
@@ -335,11 +345,8 @@ impl Column {
 
     /// The memos the rows point at.
     fn current(&self) -> impl Iterator<Item = NonNull<DummyMemo>> + '_ {
-        self.rows
-            .iter()
-            .filter_map(OnceLock::get)
-            .flat_map(|page| page.iter())
-            .filter_map(|row| NonNull::new(row.load(Ordering::Acquire)))
+        let rows = (self.rows.committed() / ROW_BYTES) as u32;
+        (0..rows).filter_map(|row| NonNull::new(self.row(row)?.load(Ordering::Acquire)))
     }
 
     /// Checks that every slab slot is in exactly one state (module docs), with no task writing.
@@ -387,27 +394,16 @@ impl Drop for Column {
         let retired = mem::take(&mut *self.retired.lock());
         #[cfg(debug_assertions)]
         self.check_accounting(&retired);
-        let current: Vec<NonNull<DummyMemo>> = self.current().collect();
-        for memo in current.into_iter().chain(retired.into_iter().map(|MemoPtr(memo)| memo)) {
+        let current = self.current();
+        let retired = retired.into_iter().map(|MemoPtr(memo)| memo);
+        for memo in current.chain(retired) {
             // SAFETY: Each current or retired memo is initialized, of the column's type, owned by
-            // the column in one place only, and with `&mut self` not borrowed.
+            // the column in one place only, and with `&mut self` not borrowed. Dropping one
+            // doesn't touch the rows the iterator reads.
             unsafe { ptr::drop_in_place((self.type_.to_dyn_fn)(memo).as_ptr()) };
         }
-        // The free slots hold no memo, and dropping `slab` frees the pages.
+        // The free slots hold no memo; dropping the regions gives their pages back.
     }
-}
-
-/// `len` null row pointers, from a zeroed allocation so rows never written stay untouched.
-#[cfg(not(feature = "shuttle"))]
-fn null_rows(len: usize) -> Box<[AtomicPtr<DummyMemo>]> {
-    // SAFETY: All-zero bits are a null `AtomicPtr`.
-    unsafe { crate::graph::zeroed(len) }
-}
-
-/// `len` null row pointers; shuttle's atomics are not plain words, so they are made one by one.
-#[cfg(feature = "shuttle")]
-fn null_rows(len: usize) -> Box<[AtomicPtr<DummyMemo>]> {
-    (0..len).map(|_| AtomicPtr::new(ptr::null_mut())).collect()
 }
 
 /// A salsa struct ingredient's memo columns, shared by all its slots.
@@ -420,6 +416,7 @@ pub struct MemoTableTypes {
 impl Default for MemoTableTypes {
     fn default() -> Self {
         MemoTableTypes {
+            // alloc: `Vec::new` allocates nothing; columns are added at setup
             columns: Vec::new(),
             rows: AtomicU32::new(0),
         }
@@ -449,7 +446,10 @@ impl MemoTableTypes {
 
     fn next_row(&self) -> u32 {
         let row = self.rows.fetch_add(1, Ordering::Relaxed);
-        assert!(row != u32::MAX, "salsa: more than 2^32 - 1 slots of one struct");
+        assert!(
+            (row as usize) < MAX_ROWS,
+            "salsa: a struct ingredient made more than {MAX_ROWS} slots, its memo columns' reservation"
+        );
         row
     }
 
@@ -643,6 +643,7 @@ impl<'a> MemoTableWithTypes<'a> {
     /// duration of this call, so memos cannot be replaced or freed during traversal.
     #[cfg(feature = "salsa_unstable")]
     pub(crate) unsafe fn memory_usage(&self) -> Vec<crate::database::MemoInfo> {
+        // alloc: the edge: memory-usage reports, run with `&mut` outside builds
         let mut memory_usage = Vec::new();
         for column in self.columns {
             let Some(memo) = column
@@ -654,6 +655,7 @@ impl<'a> MemoTableWithTypes<'a> {
 
             // SAFETY: The column's memos are of its type (`insert` checks it). The caller
             // guarantees exclusive database access, so the memo remains valid while we measure it.
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             let dyn_memo: &dyn Memo = unsafe { (column.type_.to_dyn_fn)(memo).as_ref() };
             memory_usage.push(dyn_memo.memory_usage());
         }
@@ -710,6 +712,7 @@ impl MemoTableWithTypesMut<'_> {
     /// # Safety
     ///
     /// As for [`MemoTableWithTypesMut::drop`].
+    // dyn: clearing a slot (a struct deleted or reused), once per memo it held
     pub(crate) unsafe fn take_memos(&mut self, mut f: impl FnMut(MemoIngredientIndex, &dyn Memo)) {
         for (index, column) in self.columns.iter().enumerate() {
             let Some(memo) = column.retire_row(self.memos.row) else {
@@ -717,6 +720,7 @@ impl MemoTableWithTypesMut<'_> {
             };
             // SAFETY: The memo is of the column's type, and retired memos stay valid until the
             // next reclaim, which needs exclusive access to the whole database.
+            // dyn: clearing a slot (a struct deleted or reused), once per memo it held
             let memo: &dyn Memo = unsafe { (column.type_.to_dyn_fn)(memo).as_ref() };
             f(MemoIngredientIndex::from_usize(index), memo);
         }
@@ -742,7 +746,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{Memo, MemoEntryType, MemoTable, MemoTableTypes, locate};
+    use super::{MAX_ROWS, Memo, MemoEntryType, MemoTable, MemoTableTypes, ROW_BYTES};
     use crate::DatabaseKeyIndex;
     use crate::zalsa::{MemoIngredientIndex, Zalsa};
 
@@ -818,13 +822,34 @@ mod tests {
     const SECOND: MemoIngredientIndex = MemoIngredientIndex::from_usize(1);
 
     #[test]
-    fn pages_tile_rows_and_slots() {
-        assert_eq!(locate(0, 10), (0, 0));
-        assert_eq!(locate(1023, 10), (0, 1023));
-        assert_eq!(locate(1024, 10), (1, 0));
-        assert_eq!(locate(3072, 10), (2, 0));
-        let (page, _) = locate(u32::MAX as usize - 1, super::FIRST_ROW_BITS);
-        assert!(page < super::ROW_PAGES);
+    fn rows_and_slots_sit_at_fixed_offsets() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let types = types(1);
+        let column = &types.columns[0];
+        assert!(column.row(5000).is_none(), "nothing is committed before a memo is stored");
+        // SAFETY: The tables are used with `types` only.
+        let tables: Vec<MemoTable> = (0..5001).map(|_| unsafe { MemoTable::new(&types) }).collect();
+        // SAFETY: `types` is the tables' types table.
+        let (first, last) = unsafe {
+            (
+                types.attach_memos(&tables[0]).insert(FIRST, counted(0, &drops)),
+                types.attach_memos(&tables[5000]).insert(FIRST, counted(5000, &drops)),
+            )
+        };
+        let base = column.rows.base().as_ptr() as usize;
+        let row = |row: u32| column.row(row).expect("committed") as *const _ as usize;
+        assert_eq!(row(0), base);
+        assert_eq!(row(5000), base + 5000 * ROW_BYTES);
+        let stride = column.type_.layout.size();
+        assert_eq!(first.as_ptr() as usize, column.slab.base().as_ptr() as usize);
+        assert_eq!(last.as_ptr() as usize - first.as_ptr() as usize, stride);
+        assert!(column.owns(first.cast()) && column.owns(last.cast()));
+        assert!(!column.owns(
+            std::ptr::NonNull::new((last.as_ptr() as usize + stride) as *mut _).unwrap()
+        ));
+        assert!(MAX_ROWS * ROW_BYTES <= column.rows.reserved());
+        drop(types);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     }
 
     #[test]

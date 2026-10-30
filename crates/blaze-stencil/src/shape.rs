@@ -11,7 +11,17 @@ use std::fmt;
 
 /// Bumped with any change to what a shape means or which shapes exist: the library's header
 /// carries it, and a library of another version is refused.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
+
+/// The registers the stencils' convention (`preserve_none`) passes `frame` and `acc` in, by
+/// hardware number. The generator checks LLVM's choice against these (its probe stencil), and
+/// the crate's tests that `arch::x64::X64::FRAME` and `arch::aarch64::Aarch64::FRAME` agree.
+pub mod pinned {
+    /// `r12` and `r13`.
+    pub const X64: (u8, u8) = (12, 13);
+    /// `x20` and `x21`.
+    pub const AARCH64: (u8, u8) = (20, 21);
+}
 
 /// A value's type, as stencils see it: the types the IR builder makes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -419,9 +429,9 @@ impl Isa {
 
 /// The operation of a stencil: Cranelift's opcodes that a stencil implements, with the
 /// `_imm` forms folded into their base op (an [`Src::Imm`] operand), `select_spectre_guard`
-/// into [`Op::Select`], `stack_load`/`stack_store`/`stack_addr` kept as frame-relative ops,
-/// and the fusions [`Op::BrIcmp`] and [`Op::SelectIcmp`]. Opcodes not here are the glue's
-/// (`arch::Glue`) or refused with an error naming them (`patch/select.rs`).
+/// into [`Op::Select`], `stack_addr` kept as a frame-relative op, and the fusions
+/// [`Op::BrIcmp`] and [`Op::SelectIcmp`]. Opcodes not here are the glue's (`arch::Glue`) or
+/// refused with an error naming them (`patch/select.rs`).
 ///
 /// Operand types are [`Shape::arg`]'s and result types [`Shape::result`]'s. The amount of a
 /// shift or rotate (operand 1) is read as its low 8 bits, so any integer type of amount takes
@@ -430,7 +440,7 @@ impl Isa {
 #[repr(u8)]
 pub enum Op {
     // Moves and constants.
-    /// A slot or accumulator to a slot or accumulator: block arguments, `iconcat`'s halves.
+    /// A slot to a slot: block arguments on edges.
     Copy,
     /// `iconst` into a slot or accumulator (one no shape takes as an [`Src::Imm`]): `aux` 0
     /// when the value fits 32 bits sign-extended, 1 for an `Imm0` hole of all 64 (`i64` only).
@@ -480,9 +490,6 @@ pub enum Op {
     Bor,
     Bxor,
     Bnot,
-    BandNot,
-    BorNot,
-    BxorNot,
     Rotl,
     Rotr,
     Ishl,
@@ -598,8 +605,6 @@ pub enum Op {
     Sload32x2,
     /// The frame register plus `Offset` (the stack slot's place plus the offset).
     StackAddr,
-    StackLoad,
-    StackStore,
     /// Atomics are sequentially consistent and have no offset; operands in Cranelift's
     /// order (`atomic_store x, p`; `atomic_rmw p, x`; `atomic_cas p, e, x`).
     AtomicLoad,
@@ -640,17 +645,22 @@ impl Op {
     }
 
     /// Whether `isa`'s library has stencils of it. On x86-64's baseline (SSE2), Cranelift
-    /// lowers `ceil`, `floor`, `trunc`, `nearest` and `fma` to libcalls, and so does the glue;
-    /// the `x86_*` ops and `x86_blendv` are x86-64's alone.
+    /// lowers `ceil`, `floor`, `trunc`, `nearest` and `fma` to libcalls, and so does the glue.
+    /// `blendv` (SSE4.1), `x86_pshufb`, `x86_pmulhrsw` and `x86_pmaddubsw` (SSSE3) have no
+    /// lowering on either baseline, so no IR Cranelift compiles has them; `x86_cvtt2dq` is
+    /// x86-64's alone. Without SSSE3 Cranelift does `swizzle` and the general `shuffle` with
+    /// the `X86Pshufb` libcall, and a byte shuffle by a mask known only when patched has no
+    /// stackless SSE2 form, so on x86-64 both are the glue's.
     pub const fn on(self, isa: Isa) -> bool {
+        if matches!(self, Op::Blendv | Op::X86Pshufb | Op::X86Pmulhrsw | Op::X86Pmaddubsw) {
+            return false;
+        }
         match isa {
-            Isa::X86_64 => {
-                !matches!(self, Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma)
-            }
-            Isa::Aarch64 => !matches!(
+            Isa::X86_64 => !matches!(
                 self,
-                Op::Blendv | Op::X86Pshufb | Op::X86Pmulhrsw | Op::X86Pmaddubsw | Op::X86Cvtt2dq
+                Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma | Op::Swizzle | Op::Shuffle
             ),
+            Isa::Aarch64 => !matches!(self, Op::X86Cvtt2dq),
         }
     }
 }
@@ -695,6 +705,10 @@ pub struct Info {
     pub acc: u8,
     /// Whether result 0 may go to an accumulator ([`Dst::Acc`], [`Dst::Both`]).
     pub dst_acc: bool,
+    /// Whether result 0 may go to the accumulator and its slot at once ([`Dst::Both`]): not
+    /// for compares (their one use is mostly the next stencil) nor lane moves, and never for
+    /// a vector, which keeps the set near 7,000 stencils.
+    pub both: bool,
     /// Whether it has a `Trap` hole.
     pub traps: bool,
     /// Whether it has a `Target` hole (a branch).
@@ -715,9 +729,19 @@ impl Info {
             imm: 0,
             acc: (1 << args) - 1,
             dst_acc: results > 0,
+            both: results > 0,
             traps: false,
             branches: false,
         }
+    }
+
+    /// Operands and result in slots or immediates only: ops too rare to cache.
+    const fn no_acc(self) -> Info {
+        Info { acc: 0, dst_acc: false, both: false, ..self }
+    }
+
+    const fn no_both(self) -> Info {
+        Info { both: false, ..self }
     }
 
     const fn aux(self, aux: Aux) -> Info {
@@ -787,14 +811,16 @@ const BLEND_TYS: TySet = TySet::of(&[Ty::I8x16, Ty::I32x4, Ty::I64x2, Ty::F32x4,
 /// One [`Info`] per op, by its number: each row from Cranelift's lowering rules of the opcode
 /// on x64 and AArch64 (which types it takes) and the IR builder's use of it.
 const TABLE: [Info; Op::Trapnz as usize + 1] = [
-    unary(Op::Copy, "copy", TySet::ALL),
+    // Only edges' block-argument moves are copies, slot to slot: no accumulator lives across
+    // a branch.
+    unary(Op::Copy, "copy", TySet::ALL).no_acc(),
     Info::new(Op::Iconst, "iconst", 0, 1, TySet::INTS).aux(Aux::Wide),
     Info::new(Op::Fconst, "fconst", 0, 1, TySet::of(&[Ty::F16, Ty::F32, Ty::F64])).aux(Aux::Wide),
     Info::new(Op::Vconst, "vconst", 0, 1, TySet::VECTORS.union(ty(Ty::F128))),
     binary_imm(Op::Iadd, "iadd", TySet::INT_MATH),
     binary_imm(Op::Isub, "isub", TySet::INT_MATH),
     unary(Op::Ineg, "ineg", TySet::INT_MATH),
-    unary(Op::Iabs, "iabs", TySet::INTS.union(TySet::INT_VECTORS)),
+    unary(Op::Iabs, "iabs", TySet::INT_MATH),
     binary_imm(Op::Imul, "imul", MUL_TYS),
     binary_imm(Op::Umulhi, "umulhi", MULHI_TYS),
     binary_imm(Op::Smulhi, "smulhi", MULHI_TYS),
@@ -803,7 +829,7 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     binary_imm(Op::Urem, "urem", TySet::INTS).traps(),
     binary_imm(Op::Srem, "srem", TySet::INTS).traps(),
     binary(Op::SqmulRoundSat, "sqmul_round_sat", TySet::of(&[Ty::I16x8, Ty::I32x4])),
-    binary(Op::AvgRound, "avg_round", NARROWED),
+    binary(Op::AvgRound, "avg_round", TySet::INT_VECTORS),
     binary(Op::UaddSat, "uadd_sat", SAT_LANES),
     binary(Op::SaddSat, "sadd_sat", SAT_LANES),
     binary(Op::UsubSat, "usub_sat", SAT_LANES),
@@ -827,9 +853,6 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     binary_imm(Op::Bor, "bor", TySet::BITS),
     binary_imm(Op::Bxor, "bxor", TySet::BITS),
     unary(Op::Bnot, "bnot", TySet::BITS),
-    binary_imm(Op::BandNot, "band_not", TySet::BITS),
-    binary_imm(Op::BorNot, "bor_not", TySet::BITS),
-    binary_imm(Op::BxorNot, "bxor_not", TySet::BITS),
     binary_imm(Op::Rotl, "rotl", TySet::INTS_WIDE),
     binary_imm(Op::Rotr, "rotr", TySet::INTS_WIDE),
     binary_imm(Op::Ishl, "ishl", TySet::INT_MATH),
@@ -840,13 +863,13 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     unary(Op::Cls, "cls", TySet::INTS_WIDE),
     unary(Op::Ctz, "ctz", TySet::INTS_WIDE),
     unary(Op::Bswap, "bswap", I16_TO_I128),
-    unary(Op::Popcnt, "popcnt", TySet::INT_MATH),
+    unary(Op::Popcnt, "popcnt", TySet::INTS_WIDE.union(ty(Ty::I8x16))),
     Info::new(Op::Bitselect, "bitselect", 3, 1, TySet::INTS_WIDE.union(TySet::VECTORS)),
     conversion(Op::Bmask, "bmask", TySet::INTS_WIDE, TySet::INTS_WIDE),
-    binary_imm(Op::Icmp, "icmp", TySet::INT_MATH).aux(Aux::IntCc),
-    binary(Op::Fcmp, "fcmp", TySet::FLOAT_MATH).aux(Aux::FloatCc),
+    binary_imm(Op::Icmp, "icmp", TySet::INT_MATH).aux(Aux::IntCc).no_both(),
+    binary(Op::Fcmp, "fcmp", TySet::FLOAT_MATH).aux(Aux::FloatCc).no_both(),
     Info::new(Op::Select, "select", 3, 1, TySet::ALL).aux(Aux::Ty(TySet::INTS)).imm(0b110),
-    binary_imm(Op::SelectIcmp, "select_icmp", TySet::INTS).aux(Aux::IntCcTy),
+    binary_imm(Op::SelectIcmp, "select_icmp", TySet::INTS).aux(Aux::IntCcTy).no_both(),
     binary(Op::Fadd, "fadd", TySet::FLOAT_MATH),
     binary(Op::Fsub, "fsub", TySet::FLOAT_MATH),
     binary(Op::Fmul, "fmul", TySet::FLOAT_MATH),
@@ -891,12 +914,12 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     unary(Op::Splat, "splat", TySet::VECTORS).imm(0b1),
     binary(Op::Swizzle, "swizzle", ty(Ty::I8x16)).acc(0),
     binary(Op::Shuffle, "shuffle", ty(Ty::I8x16)).acc(0),
-    binary(Op::Insertlane, "insertlane", TySet::VECTORS).aux(Aux::Lane),
-    unary(Op::Extractlane, "extractlane", TySet::VECTORS).aux(Aux::Lane),
+    binary(Op::Insertlane, "insertlane", TySet::VECTORS).aux(Aux::Lane).acc(0b01).no_both(),
+    unary(Op::Extractlane, "extractlane", TySet::VECTORS).aux(Aux::Lane).no_both(),
     unary(Op::VanyTrue, "vany_true", TySet::INT_VECTORS),
     unary(Op::VallTrue, "vall_true", TySet::INT_VECTORS),
     conversion(Op::VhighBits, "vhigh_bits", TySet::VECTORS, TySet::INTS),
-    Info::new(Op::Blendv, "x86_blendv", 3, 1, BLEND_TYS),
+    Info::new(Op::Blendv, "blendv", 3, 1, BLEND_TYS),
     binary(Op::X86Pshufb, "x86_pshufb", ty(Ty::I8x16)).acc(0),
     binary(Op::X86Pmulhrsw, "x86_pmulhrsw", ty(Ty::I16x8)),
     binary(Op::X86Pmaddubsw, "x86_pmaddubsw", ty(Ty::I16x8)),
@@ -919,16 +942,14 @@ const TABLE: [Info; Op::Trapnz as usize + 1] = [
     load(Op::Uload32x2, "uload32x2", ty(Ty::I64x2)),
     load(Op::Sload32x2, "sload32x2", ty(Ty::I64x2)),
     Info::new(Op::StackAddr, "stack_addr", 0, 1, ty(Ty::I64)),
-    Info::new(Op::StackLoad, "stack_load", 0, 1, TySet::ALL),
-    Info::new(Op::StackStore, "stack_store", 1, 0, TySet::ALL).imm(0b1),
-    load(Op::AtomicLoad, "atomic_load", TySet::INTS),
-    store(Op::AtomicStore, "atomic_store", TySet::INTS),
-    Info::new(Op::AtomicRmw, "atomic_rmw", 2, 1, TySet::INTS).aux(Aux::Rmw).imm(0b10).acc(0b10),
-    Info::new(Op::AtomicCas, "atomic_cas", 3, 1, TySet::INTS_WIDE).acc(0),
+    load(Op::AtomicLoad, "atomic_load", TySet::INTS).no_acc(),
+    store(Op::AtomicStore, "atomic_store", TySet::INTS).no_acc(),
+    Info::new(Op::AtomicRmw, "atomic_rmw", 2, 1, TySet::INTS).aux(Aux::Rmw).imm(0b10).no_acc(),
+    Info::new(Op::AtomicCas, "atomic_cas", 3, 1, TySet::INTS_WIDE).no_acc(),
     Info::new(Op::Fence, "fence", 0, 0, I8),
     Info::new(Op::Jump, "jump", 0, 0, I8),
     Info::new(Op::Brif, "brif", 1, 0, TySet::INTS_WIDE).branches(),
-    binary_imm(Op::BrIcmp, "br_icmp", TySet::INTS_WIDE).aux(Aux::IntCc).branches(),
+    Info::new(Op::BrIcmp, "br_icmp", 2, 0, TySet::INTS_WIDE).imm(0b10).aux(Aux::IntCc).branches(),
     Info::new(Op::Trapz, "trapz", 1, 0, TySet::INTS_WIDE).traps(),
     Info::new(Op::Trapnz, "trapnz", 1, 0, TySet::INTS_WIDE).traps(),
 ];
@@ -1117,7 +1138,7 @@ impl Shape {
 
     /// Whether the shape is one of `isa`'s set: its op is `isa`'s and has the type, `aux` is
     /// in range, the sources and the destination are ones the op's [`Info`] allows for the
-    /// types, and at most one source is an accumulator.
+    /// types, at most one source is an accumulator, and it is not pruned.
     pub fn exists_on(self, isa: Isa) -> bool {
         let info = self.op.info();
         if !self.op.on(isa) || !info.tys.contains(self.ty) || !self.aux_ok() {
@@ -1140,13 +1161,36 @@ impl Shape {
         if accs > 1 {
             return false;
         }
-        match self.dst {
+        let ok = match self.dst {
             Dst::None => info.results == 0,
             Dst::Slot => info.results > 0,
             Dst::Acc | Dst::Both => {
                 info.results > 0 && info.dst_acc && self.result(0).acc().is_some()
             }
+        };
+        ok && self.kept()
+    }
+
+    /// Whether a shape the op allows is kept in the set: the base shape (operands from slots
+    /// or immediates, the result to its slot) always is, as selection falls back to it; the
+    /// accumulator forms are pruned where selection would seldom make them.
+    fn kept(self) -> bool {
+        let base = !self.srcs.contains(&Src::Acc) && matches!(self.dst, Dst::None | Dst::Slot);
+        if base {
+            return true;
         }
+        // `select` of a condition wider than the `i8` an `icmp` gives is rare: base only.
+        if self.op == Op::Select && self.aux != Ty::I8 as u8 {
+            return false;
+        }
+        if self.dst == Dst::Both {
+            let info = self.op.info();
+            let vector = self.ty.is_vector()
+                || self.result(0).is_vector()
+                || (info.args > 0 && self.arg(0).is_vector());
+            return info.both && !vector;
+        }
+        true
     }
 }
 
@@ -1304,8 +1348,6 @@ mod tests {
             Op::Bitcast,
             Op::Load,
             Op::Store,
-            Op::StackLoad,
-            Op::StackStore,
         ];
         each(|shape| {
             if matches!(shape.ty, Ty::F16 | Ty::F128) {
@@ -1317,9 +1359,62 @@ mod tests {
     #[test]
     fn baseline_libcalls_have_no_x86_stencils() {
         each_on(Isa::X86_64, |shape| {
-            assert!(!matches!(shape.op, Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma));
+            assert!(!matches!(
+                shape.op,
+                Op::Ceil | Op::Floor | Op::Trunc | Op::Nearest | Op::Fma | Op::Swizzle | Op::Shuffle
+            ));
         });
         each_on(Isa::Aarch64, |shape| assert!(!shape.op.info().name.starts_with("x86_")));
+    }
+
+    #[test]
+    fn every_shape_has_its_base_shape() {
+        for isa in Isa::ALL {
+            each_on(isa, |shape| {
+                let mut base = shape;
+                for src in &mut base.srcs {
+                    if *src == Src::Acc {
+                        *src = Src::Slot;
+                    }
+                }
+                if matches!(base.dst, Dst::Acc | Dst::Both) {
+                    base.dst = Dst::Slot;
+                }
+                assert!(base.exists_on(isa), "{shape} without its base {base}");
+            });
+        }
+    }
+
+    #[test]
+    fn each_isa_has_about_7000_stencils() {
+        for isa in Isa::ALL {
+            let mut n = 0;
+            each_on(isa, |_| n += 1);
+            assert!((6000..8000).contains(&n), "{isa:?} has {n}");
+        }
+    }
+
+    #[test]
+    fn br_icmp_has_no_result_and_fuses_every_condition() {
+        for cc in IntCc::ALL {
+            let shape = Shape {
+                op: Op::BrIcmp,
+                ty: Ty::I64,
+                aux: cc as u8,
+                srcs: [Src::Slot, Src::Imm, Src::None],
+                dst: Dst::None,
+            };
+            assert!(shape.exists(), "{shape}");
+        }
+    }
+
+    #[test]
+    fn the_info_table_is_in_number_order() {
+        for (i, info) in INFO.iter().enumerate() {
+            assert_eq!(info.op as usize, i);
+            assert_eq!(Op::from_u8(i as u8), Some(info.op));
+        }
+        assert_eq!(Op::from_u8(Op::COUNT), None);
     }
 
     #[test]

@@ -1,7 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use blaze_core::{Conn, FileName};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64};
+use blaze_mem::{
+    Tag,
+    tag::{Counters, Snapshot},
+};
 use blaze_query::{Database, QueryKey, QueryKind};
 use blaze_vfs::{Change, ChangeKind, Mode, Op, View, Vfs};
 
@@ -61,6 +68,7 @@ impl World {
             pid: 30,
             memory_bytes: 10,
             budget_bytes: 20,
+            memory: counters,
         };
         f(&mut self.session, &mut cx, &mut out);
         out
@@ -445,6 +453,64 @@ fn status_lists_every_connections_requests_sorted() {
     assert_eq!(world.request(3, 1, Request::Status), [reply(3, 1, Response::Status(status)), done(3, 1, true)]);
 }
 
+/// How many times [`counters`] was read: the parse tag hands out 3 MB between reads.
+static READS: AtomicU64 = AtomicU64::new(0);
+
+/// blaze-mem's counters as a test's daemon has them: every tag's numbers its own, `infer`
+/// over a budget of 4 KiB, and `parse` handing out 3 MB a read.
+fn counters() -> Snapshot {
+    let reads = READS.fetch_add(1, Ordering::Relaxed);
+    let mut tags = [Counters::default(); Tag::COUNT];
+    for (at, it) in tags.iter_mut().enumerate() {
+        let at = at as u64;
+        *it = Counters {
+            live: 10 + at,
+            high_water: 20 + at,
+            allocated: 30 + at,
+            task_peak: 40 + at,
+            budget: u64::MAX,
+        };
+    }
+    tags[Tag::Infer.index()].budget = 4096;
+    tags[Tag::Parse.index()].allocated = 3_000_000 * reads;
+    Snapshot { tags, committed: 1 << 20, committed_high_water: 1 << 21 }
+}
+
+/// A memory request is answered with one record per tag, in blaze-mem's order, each the
+/// counters' numbers, and the committed bytes; the rate is what a tag handed out a second
+/// between two requests on the session's clock, 0 for the first.
+#[test]
+fn memory_gives_each_subsystems_counters_and_rate() {
+    let mut world = World::new();
+    world.tick(1_000_000_000);
+    let first = world.request(1, 1, Request::Memory);
+    let [Reply { response: Response::Memory(memory), .. }, end] = &first[..] else {
+        panic!("one memory record, then the end: {first:?}");
+    };
+    assert_eq!(end, &done(1, 1, true));
+    assert_eq!((memory.committed, memory.committed_high_water), (1 << 20, 1 << 21));
+    let names: Vec<&str> = memory.tags.iter().map(|it| it.tag.as_str()).collect();
+    let want: Vec<&str> = Tag::ALL.iter().map(|it| it.name()).collect();
+    assert_eq!(names, want);
+    let io = &memory.tags[Tag::Io.index()];
+    let at = Tag::Io.index() as u64;
+    assert_eq!(
+        (io.live, io.high_water, io.allocated, io.task_peak, io.budget, io.rate),
+        (10 + at, 20 + at, 30 + at, 40 + at, u64::MAX, 0)
+    );
+    assert_eq!(memory.tags[Tag::Infer.index()].budget, 4096);
+    assert!(memory.tags.iter().all(|it| it.rate == 0), "no rate before a second sample");
+
+    world.tick(3_000_000_000);
+    let second = world.request(1, 2, Request::Memory);
+    let [Reply { response: Response::Memory(memory), .. }, _] = &second[..] else {
+        panic!("one memory record, then the end: {second:?}");
+    };
+    let parse = &memory.tags[Tag::Parse.index()];
+    assert_eq!(parse.rate, 1_500_000, "3 MB over 2 s");
+    assert!(memory.tags.iter().filter(|it| it.tag != "parse").all(|it| it.rate == 0));
+}
+
 #[test]
 fn a_reach_diffs_the_views_and_runs_on_the_later() {
     let mut world = World::new();
@@ -701,18 +767,6 @@ fn a_best_of_cancel_cancels_every_running_candidate() {
     assert_eq!(replies.last(), Some(&done(1, 1, true)));
 }
 
-/// A small xorshift, so the interleavings are the same on every run.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: usize) -> usize {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 % n as u64) as usize
-    }
-}
-
 /// What the replies so far say, checked as they come.
 #[derive(Default)]
 struct Seen {
@@ -737,7 +791,7 @@ impl Seen {
 #[test]
 fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection() {
     for seed in 1..=200u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut rng = SplitMix64::new(seed);
         let mut world = World::new();
         let mut seen = Seen::default();
         let mut conns: Vec<u64> = vec![0, 1, 2];
@@ -747,13 +801,13 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
         let mut written = 0;
 
         for _ in 0..200 {
-            match rng.below(8) {
+            match rng.index(8) {
                 0..=2 if !conns.is_empty() => {
-                    let conn = conns[rng.below(conns.len())];
+                    let conn = conns[rng.index(conns.len())];
                     let next = ids.entry(conn).or_insert(0);
                     let id = *next;
                     *next += 1;
-                    let request = match rng.below(7) {
+                    let request = match rng.index(7) {
                         0 => Request::Check { view: head("main"), targets: targets() },
                         1 => Request::Snapshot,
                         2 => Request::BestOf {
@@ -764,7 +818,7 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                                 vec![write("y.rs", "y")],
                             ],
                             targets: targets(),
-                            test: rng.below(2) == 0,
+                            test: rng.index(2) == 0,
                             filter: Vec::new(),
                         },
                         3 => {
@@ -773,7 +827,7 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                             let ops = vec![write(&format!("f{written}.rs"), "")];
                             Request::Commit { head: "main".to_owned(), base, ops }
                         }
-                        4 if id > 0 => Request::Cancel { id: rng.below(id as usize) as u64 },
+                        4 if id > 0 => Request::Cancel { id: rng.index(id as usize) as u64 },
                         5 => Request::Open { view: head("main") },
                         _ => Request::Status,
                     };
@@ -782,8 +836,8 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                     seen.take(replies);
                 }
                 3 | 4 if !world.builder.started.is_empty() => {
-                    let job = world.builder.started[rng.below(world.builder.started.len())].0;
-                    let response = if rng.below(2) == 0 {
+                    let job = world.builder.started[rng.index(world.builder.started.len())].0;
+                    let response = if rng.index(2) == 0 {
                         diagnostic(Level::Error)
                     } else {
                         test_result(TestOutcome::Passed)
@@ -792,17 +846,17 @@ fn random_interleavings_end_each_request_once_and_never_answer_a_gone_connection
                     seen.take(replies);
                 }
                 5 if !world.builder.started.is_empty() => {
-                    let job = world.builder.started[rng.below(world.builder.started.len())].0;
+                    let job = world.builder.started[rng.index(world.builder.started.len())].0;
                     finished.insert(job);
-                    let replies = world.finish(job, rng.below(2) == 0, None);
+                    let replies = world.finish(job, rng.index(2) == 0, None);
                     seen.take(replies);
                 }
                 6 => {
                     let replies = world.durable();
                     seen.take(replies);
                 }
-                7 if !conns.is_empty() && rng.below(4) == 0 => {
-                    let conn = conns.swap_remove(rng.below(conns.len()));
+                7 if !conns.is_empty() && rng.index(4) == 0 => {
+                    let conn = conns.swap_remove(rng.index(conns.len()));
                     seen.gone.insert(Conn(conn));
                     let replies = world.gone(conn);
                     seen.take(replies);
@@ -1073,7 +1127,7 @@ fn an_intent_is_cancelled_by_a_newer_one_its_connections_end_or_its_wait() {
 #[test]
 fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
     for seed in 1..=200u64 {
-        let mut rng = Rng(seed.wrapping_mul(0xd1b5_4a32_d192_ed03) | 1);
+        let mut rng = SplitMix64::new(seed);
         let mut world = World::new();
         let mut seen = Seen::default();
         let mut conns: Vec<u64> = vec![0, 1, 2];
@@ -1085,19 +1139,19 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
 
         for _ in 0..200 {
             let (promoted, cancelled) = (world.builder.promoted.len(), world.builder.cancelled.len());
-            match rng.below(8) {
+            match rng.index(8) {
                 0..=2 if !conns.is_empty() => {
-                    let conn = conns[rng.below(conns.len())];
+                    let conn = conns[rng.index(conns.len())];
                     let next = ids.entry(conn).or_insert(0);
                     let id = *next;
                     *next += 1;
-                    let text = texts[rng.below(texts.len())];
-                    let wait_ms = rng.below(40) as u64;
-                    let request = match rng.below(5) {
+                    let text = texts[rng.index(texts.len())];
+                    let wait_ms = rng.index(40) as u64;
+                    let request = match rng.index(5) {
                         0 => Request::WillSave {
                             ops: vec![write("a.rs", text)],
                             head: "main".to_owned(),
-                            test: rng.below(2) == 0,
+                            test: rng.index(2) == 0,
                             targets: targets(),
                             wait_ms,
                         },
@@ -1118,7 +1172,7 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     seen.take(replies);
                 }
                 3 => {
-                    now += rng.below(30) as u64 * 1_000_000;
+                    now += rng.index(30) as u64 * 1_000_000;
                     world.tick(now);
                     assert!(world.session.deadline().is_none_or(|it| it > now), "seed {seed}");
                 }
@@ -1127,14 +1181,14 @@ fn random_intents_are_taken_over_or_cancelled_once_and_free_their_views() {
                     jobs.extend(world.builder.speculated.iter().map(|it| it.0));
                     jobs.retain(|it| !finished.contains(it));
                     if !jobs.is_empty() {
-                        let job = jobs[rng.below(jobs.len())];
+                        let job = jobs[rng.index(jobs.len())];
                         finished.insert(job);
-                        let replies = world.finish(job, rng.below(2) == 0, None);
+                        let replies = world.finish(job, rng.index(2) == 0, None);
                         seen.take(replies);
                     }
                 }
-                6 if !conns.is_empty() && rng.below(3) == 0 => {
-                    let conn = conns.swap_remove(rng.below(conns.len()));
+                6 if !conns.is_empty() && rng.index(3) == 0 => {
+                    let conn = conns.swap_remove(rng.index(conns.len()));
                     seen.gone.insert(Conn(conn));
                     let replies = world.gone(conn);
                     seen.take(replies);

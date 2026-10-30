@@ -37,19 +37,19 @@ The most frequent operation in a warm build.
   with the last edge and a 4-byte store). Hot: 2 × 4.5 + 20 / 2 ≈ 19 cycles, **5.4 ns**. Cold:
   independent callers' misses overlap, about 20 in flight, so **≈ 5.5 ns** per hit per core in
   throughput, 220 ns latency.
-- **Today (memos as columns, 19:55):** 6 lines, 5 deep:
+- **Today (memos as columns on blaze-mem regions, 20:15):** 5 lines, 4 deep:
   1. the `boxcar` bucket;
-  2. the `Page`, which now keeps its ingredient's column slice beside its `Arc`;
-  3. the slot (validation and the 4-byte row number), and the `Column` (the type check and
-     the row page pointer share its first line: `repr(C, align(64))`, arrays inline, held by a
-     `const` assertion), loaded in parallel since both depend only on the page;
-  4. the row page entry;
-  5. the memo.
+  2. the `Page`, which keeps its ingredient's column slice beside its `Arc`;
+  3. the slot (validation and the 4-byte row number), and the `Column`, loaded in parallel
+     since both depend only on the page. The column's first line holds the rows region's base
+     and committed length and the type id (`repr(C, align(64))`, held by a `const` assertion);
+  4. the row pointer, at `rows.base + 8 * row`: computed, no row-page directory;
+  5. the memo, at `slab.base + size * slot`.
 
-  About 50 instructions. Hot: 5 × 4.5 + 25 ≈ 48 cycles, 14 ns, **2.5× off**. Cold: 5 dependent
-  misses, 550 ns latency, **2.5× off**. Before columns: 7 lines, 7 deep (ingredient cache,
-  bucket, `Page`, slot, the slot's memo table array, the `MemoEntry` pointer, the boxed memo),
-  18 ns hot.
+  About 45 instructions. Hot: 4 × 4.5 + 22 ≈ 40 cycles, 11 ns, **2× off**. Cold: 4 dependent
+  misses, 440 ns latency, **2× off**. With columns on boxed pages it was 6 lines, 5 deep; before
+  columns, 7 lines, 7 deep (ingredient cache, bucket, `Page`, slot, the slot's memo table array,
+  the `MemoEntry` pointer, the boxed memo), 18 ns hot.
 - **What stands in the way, and the change that removes it:**
   1. The bucket and the `Page`: two lines found again on every hit though neither moves once
      published.
@@ -189,7 +189,7 @@ The most frequent operation in a warm build.
 
 | component | bound | today | off | removes the gap |
 |---|---|---|---|---|
-| memo hit | 2 lines, 5 ns hot | 6 lines (5 deep), 14 ns | 2.5× | rows by page plus a per-task row-block cache |
+| memo hit | 2 lines, 5 ns hot | 5 lines (4 deep), 11 ns | 2× | rows by page plus a per-task row-block cache |
 | record a read | 4-byte store, 3 ns | node probe at finish, ≈ 15 ns | 5× | a node column beside the rows and the struct slots |
 | edges at rest | 25 bits, 312 MB (nushell) | 4 bytes, 400 MB | 1.28× | bit-packed compaction |
 | memo at rest | 16 + value | 24 + value + 8 | 1.67× (8-byte value) | `u32` revisions |
@@ -347,14 +347,15 @@ The sizes used, for a typical item:
     which reads each byte once, about 15 ns. It runs only when salsa compares a re-run's value,
     and it is exact where a 128-bit hash could collide and reuse a stale signature.
   - Result: ≈ 0.75 µs, **9.5× off**.
-- **Requested** (frontend-text, `v2/requests/frontend-text.md`, "clone_subtree_without, one
-  pass"):
-  - make the outline copy in one pass over the elements outside the elided node, never
-    reading or copying the elided part;
+- **Applied since** (over frontend-text's `clone_subtree_without`, `v2/requests/frontend-text.md`):
+  - the copy is made in one pass over the elements outside the elided node, never reading or
+    copying the elided part;
   - that replaces the clone, the repack, the empty tree and the text copy (360 ns) with about
     120 ns, giving ≈ 0.5 µs, **6.5× off**;
   - for a fn whose body was lowered, or a large impl, it also removes the cost that grows with
-    the body or the item list (about 1.5 µs for a 20-method impl).
+    the body or the item list (about 1.5 µs for a 20-method impl);
+  - and it now runs only when the item's part of the file outline changed (next section), not
+    on every edit of its file.
 - **What stands in the way after that:**
   - **About 25 allocations per `SignatureSyntax`, ≈ 250 ns:** the tree's 10 columns, the ast
     id map's and span map's vectors, and the `Arc`. Reaching the bound's one allocation means
@@ -374,23 +375,43 @@ The sizes used, for a typical item:
 - **Before the relative job:** every signature, `VariantFields` and `EnumVariants` of the file
   lowered again: 150 × about 2 to 3 µs of lowering, the signature, its fields and its
   variants each re-run and backdated, ≈ **300 to 450 µs**, about 200× off.
-- **Today:** each item's `signature_syntax` runs and backdates, and nothing lowers. 150 ×
-  0.75 µs ≈ **110 µs**, 55× off. After `clone_subtree_without`: 75 µs, 37× off.
-- **What stands in the way:** each item's syntax query reads the file's parse, so salsa runs all
-  150 of them on any edit of the file, even when every result is unchanged.
-- **The design that removes it:**
-  - A `file_outline(db, HirFileId)` query in this file: the file's tree with the body of every
-    fn, const and static that is its own anchor left out, and its ast id map and span map.
-  - It is made in one pass by the list form of `clone_subtree_without`,
-    `AstIdMap::relative_without` and `RealSpanMap::without`, all requested from frontend-text.
+- **Before `file_outline`:** each item's `signature_syntax` read the file's parse, so all 150
+  ran and backdated on any edit of the file: 150 × 0.75 µs ≈ **110 µs**, 55× off.
+- **Applied: `file_outline(db, EditionedFileId)`** in this file.
+  - It holds the file's tree with the body of every fn, const and static that is its own
+    anchor left out, its ast id map and span map, and where each body was cut.
+  - It is made over the list forms of `clone_subtree_without`, `AstIdMap::relative_without` and
+    `RealSpanMap::without`:
+    - one walk of the file's items, about 300 nodes, ≈ 1 µs;
+    - the copy, one pass over the outline's elements and text, 42 KB in and out, ≈ 3 µs;
+    - the ast id map's walk of those elements, about 6,000 at ≈ 1.5 ns, ≈ 9 µs;
+    - the span map's one pass, under 1 µs.
   - It is compared by content, so it backdates on every body edit. Positions in it don't move
-    when a body's length changes, because bodies aren't in it.
-  - `signature_syntax` then reads `file_outline` instead of the parse. On a body edit, one query
-    runs (≈ 2 µs, the bound) and each item's memo costs a deep verify of one edge (≈ 5 ns at
-    salsa's bound, 0.75 µs for the file).
-  - Bodies of items anchored at an enclosing item stay in the outline. Cutting them would move
-    their neighbours' anchor-relative offsets.
-  - This is the next change once the list APIs land.
+    when a body's length changes, because bodies aren't in it. The comparison is 84 KB read,
+    ≈ 1.7 µs.
+  - `signature_syntax` and `variants_syntax` read it and not the parse. On a body edit, this
+    one query runs. Each item's memo then costs a deep verify of one edge: ≈ 5 ns at salsa's
+    bound, 0.75 µs for the file.
+- **Now:** ≈ 15 µs per body edit of a 150-item file for the syntax this file reads.
+  - The signature queries also read `AttrFlags::query`, `repr` and `repr_assume_has`, which
+    read the item off the live parse and ast id map. So every item's attribute query re-runs
+    and backdates on a body edit: 150 × 300 ns ≈ **45 µs more**, found by speed-hir-sol-defs.
+  - That makes ≈ 60 µs against a bound of ≈ 2 µs: **≈ 30× off**, from 55×.
+  - The attribute part goes when attributes are read off the outline (`v2/requests/db-expand.md`
+    item 12, with the arithmetic in speed-hir-sol-defs' section of this file). Then this
+    file's ≈ 15 µs is all that's left: ≈ 7× off.
+- **What stands in the way:**
+  - The outline is made again from the whole file on each edit: three passes (copy, ast ids,
+    spans), and the ast id walk visits every element. Reaching the bound means making the
+    outline incremental. The reparse already knows which lazy bodies an edit touched
+    (`replace_subtree` carries the rest), so it could hand over the old outline with the
+    changed bodies swapped, and the three maps fused into the copy's one pass. That is a change
+    to `syntax-tree`'s reparse and `span`'s maps (frontend-text), to ask for if `proof`
+    measures this above 10% of an edit.
+  - Bodies of items anchored at an enclosing item stay in the outline: items of an impl, trait
+    or module with attributes, or of a module nested in a module. Cutting them would move their
+    neighbours' anchor-relative offsets. An edit of one of these re-runs the file's syntax
+    queries, as every edit did before.
 
 ### `X::relative`: lowering a signature (cold, or when its outline changed)
 
@@ -436,8 +457,8 @@ The sizes used, for a typical item:
 | component | bound | before | today | off today | removes the rest |
 |---|---|---|---|---|---|
 | read a signature | 1 memo hit | 1 memo hit | 1 memo hit | 1× (this file's part) | salsa's hit path |
-| `signature_syntax` per item | ≈ 80 ns | ≈ 1.0 µs | ≈ 0.75 µs | 9.5× | `clone_subtree_without` (6.5×), one-block layout, salsa execution cost |
-| signatures re-run per body edit, 150-item file | ≈ 2 µs | ≈ 300–450 µs (all lowered) | ≈ 110 µs (none lowered) | 55× | `file_outline` over the list APIs |
+| `signature_syntax` per item (runs only when its outline changed) | ≈ 80 ns | ≈ 1.0 µs | ≈ 0.5 µs | 6.5× | one-block layout, salsa execution cost |
+| signatures re-run per body edit, 150-item file | ≈ 2 µs | ≈ 300–450 µs (all lowered) | ≈ 15 µs (`file_outline` alone runs) + ≈ 45 µs of attribute re-runs | ≈ 30× (≈ 7× once attributes read the outline) | attributes off the outline (db-expand item 12); an incremental outline from the reparse, maps fused into the copy |
 | lowering one fn signature | ≈ 70 ns | ≈ 1–2 µs | same | ≈ 15× | store allocations (speed-hir-store), salsa |
 | moving a source map | ≈ 20 ns | ≈ 200 ns | ≈ 150 ns | 7× | `Move` as one shift (speed-hir-store), only if measured |
 
@@ -500,18 +521,19 @@ The most frequent operation: every read of a query inside a query, on every warm
   - Cold: 3 × 110 + 14 (the shard's pointer, in L2) ≈ 344 ns, **1.04× off: within 10%**.
   - Hot: 6 dependent L1 loads (shard pointer, place, the result chunk's base, result, the memo
     chunk's base, memo) + ~45 instructions ≈ 50 cycles, 14 ns, **1.6× off**.
-- **What stands in the way (hot only):** the two chunk-base loads (each `Rows` keeps 27
+- **What stood in the way (hot only):** the two chunk-base loads (each `Rows` kept 27
   chunks, found by the row's index) and the kind's `FxMap` probe (`kind_of`, about 15 cycles).
-  - A reserved region per column (`blaze_mem::Region`: address space taken once, committed as
-    it grows, never moved) makes a row's address base + index × size. The base is a field,
-    loaded off the critical path, so the chain becomes the bound's 3 lines plus the shard
-    pointer. `blaze-mem` is not a workspace dependency yet: requested
-    (`v2/requests/db-query.md`, 3).
-  - `kind_of` checks the kind on every hit only to name a query asked under another's kind; a
-    `[u32; 65536]` index by `QueryKind` would make it one L1 load. That is about 10% of a hot
-    hit, so it is done with the region change.
-  - With both: ≈ 4 × 4.5 + 40 / 2 ≈ 38 cycles, **1.2× off** hot. The remaining shard pointer
-    can be folded in only by giving up sharded writers.
+- **Applied second (10-29, with `blaze-mem`):**
+  - Every `Rows` is one reserved region (`blaze_mem::Region`, `Tag::Query`: 64 GiB of address
+    space, committed as it grows, never moved), so a row's address is base + index × size. The
+    base is a field, loaded off the critical path. The memo lines, the database's slots and a
+    view's results are on huge pages (`Rows::hot`, `Map::hot`), so a hit's three lines need
+    no page walk past the first touch. Generations are a region too.
+  - The kinds are a dense table by `QueryKind` (`Kinds`, a `Rows` of 2^16): a kind's live flag
+    and row are two independent L1 loads, with no hash probed.
+  - Hot: 4 dependent L1 loads (shard pointer, place, result, memo) + ~40 instructions ≈ 38
+    cycles, 11 ns, **1.2× off**. The remaining shard pointer can be folded in only by giving
+    up sharded writers, which making a memo needs; that is the one thing left in the way.
 - `Q::input(key)` (hashing a typed key into its `QueryKey`) is the query's own cost and is
   counted with it. A query that asks with a key it already has as a `QueryKey` pays nothing.
 
@@ -645,16 +667,987 @@ The most frequent operation: every read of a query inside a query, on every warm
 - **What stands in the way:** the comparison sort. A radix sort on the keys' leading bytes
   takes it to the bound. It runs once per cold build, off the warm loop, so it comes after the
   hit, verify and miss paths are measured.
+- **On `blaze-image` (10-29):** the sections are written once each into the daemon's
+  `Builder`, each record built on the stack, with no file-sized buffer of the database's own.
+  The image's CRC32Cs are `blaze-image`'s, at about 28 GB/s a core, spread over the pool
+  (≈ 10 GB / (28 GB/s × 16) ≈ 22 ms). Marking symbols walks each value once through its
+  kind's `Persist::symbols`, which reads nothing for a value that names none (every value
+  today). A start's reads add one CRC32C per 64 KiB group the first time it is touched
+  (≈ 2.3 µs at 28 GB/s), against ≈ 16 page faults of the same group: within the fault cost.
 
 ### Summary
 
 | component | bound | before | today | off today | removes the rest |
 |---|---|---|---|---|---|
 | warm hit, cold | 3 lines, 330 ns | 4 lines + headers, 455 ns | 344 ns | 1.04× | — |
-| warm hit, hot | ≈ 31 cycles | ≈ 58 cycles | ≈ 50 cycles | 1.6× | reserved regions for rows (requested), kind index |
+| warm hit, hot | ≈ 31 cycles | ≈ 58 cycles | ≈ 38 cycles | 1.2× | only unsharded writers would drop the shard pointer |
 | record a read | 4 cycles | 8 | 8 | 8% of the read | — |
 | make a memo | ≈ 125 cycles | ≈ 330 | ≈ 170 | 1.35× | `born` stamped in the cold row |
 | verify, per edge | 11 ns (2 lines, overlapped) | 41 ns | 14 ns | 1.25× | prefetch window tuned; dense key IDs for the 1-line bound |
-| collect | 6 ms all-core (nushell) | 1.8 s | 1.1 s | 180× (off the edit path) | parallel marking on the plane (requested) |
+| collect | 6 ms all-core (nushell) | 1.8 s | 1.1 s | 180× (off the edit path) | parallel marking on the plane (`Pool::scope` is in; next here) |
 | cold pack check | `memcmp`, 30 GB/s | a second hash | `memcmp` | ≈ 1× in CPU; faults dominate | populated maps, once measured |
 | image write | ≈ 1.7 s (10 GB) | ≈ 2.6 s | ≈ 2.1 s | 1.24× (once per cold build) | radix sort of the keys |
+
+## hir-def: name resolution (speed-hir-sol-nameres)
+
+What this covers:
+- `crate_def_map` and `block_def_map`: collection, imports and globs to a fixed point, round
+  by round;
+- a module's scope (`ItemScope`) and its per-name fact (`ModuleScope::name`);
+- `resolve_path` of an \(s\)-segment path;
+- the `Resolver` a body walk builds;
+- `find_path`, at the edge.
+
+Name resolution is being rebuilt as these lines are written. frontend-nameres moves the collector
+onto per-module facts (`nameres/facts/`, design in
+[frontend/nameres.md](../frontend/nameres.md), contract in
+[frontend/nameres-core.md](../frontend/nameres-core.md)), and db-expand-names adds records to the
+def map. Costs are counted from the code and those notes as of 10-29 20:30, not measured.
+`facts/queries.rs` exists, but `unit.rs`, `collect.rs`, `macros.rs` and `driver.rs` are not
+written yet, so the facts engine is costed from its contract. The old collector
+(`collector.rs`) is still what `crate_local_def_map` runs.
+
+nameres.md §6 has its own "Speed of light": the per-edit floor of the facts engine, as a
+perfect oracle of the changed facts would pay. This section takes that floor as given and adds
+four things:
+- the cold build;
+- the edit's validation term, which nameres.md accepts and this bar does not;
+- path resolution;
+- the resolver.
+
+The figures used, for one crate:
+- \(m = 1000\) modules;
+- 20k declarations;
+- 4k imports, 300 of them globs, bringing in about 18k names;
+- \(k = 4\) expansion rounds;
+- 150 items per file;
+- paths of 2.5 segments on average.
+
+Salsa costs are speed-salsa's, above:
+- a memo hit is 11 ns today and 5.4 ns at its bound;
+- an intern hit is about 15 cycles (4.3 ns), already at its bound;
+- an execution's bookkeeping is about 140 ns today and about 35 ns at its bound;
+- a read of an immortal interned id's field (`module.krate(db)`) is one line, about 2 ns.
+
+### `ItemScope::get` (every name looked up in a scope being built, and every fact's execution)
+
+- **Work:** find the name's entry in each of the three namespaces.
+- **Bound:** 3 dependent lines and the unpacking, about 30 cycles, **≈ 9 ns hot**:
+  - the scope;
+  - the index slot;
+  - the entries, which are independent of each other. One hash.
+- **Today:** one FxHash, one probe run over `u32` slots (6 tag bits reject 63 in 64 other
+  names) and the entries, loaded in parallel. That is the bound's lines, so it is **at the
+  bound**. A scope of 8 names or fewer is a scan of at most 8 entries a column. Nothing is
+  allocated.
+- The only way to save a line is to keep a name's three entries together. That costs 40 bytes
+  for each namespace a name lacks, for a line saved only on names in two namespaces.
+
+### `resolve_path` of an \(s\)-segment path (every path a body or signature names)
+
+- **Work:** per segment, the meaning of one name in one module (the fact), and a visibility
+  check.
+- **Bound:** the fact is one salsa read keyed by (module, name): one intern and one memo hit.
+  That is 4.3 + 5.4 ≈ **10 ns per segment**, plus one builtin-table probe for the first segment
+  (about 5 ns). The read has to be recorded, because it is the edge that lets an edit elsewhere
+  in the module leave this reader alone. For \(s = 3\): **≈ 35 ns**.
+- **Today, for a segment in a collected map (`resolve_remaining_segments`), ≈ 37 ns:**
+  - `module.krate(db)` and `module.block(db)`, about 4 ns;
+  - `self.module(db, module)`, which is `Modules::module`: an intern of (`Modules`, module) and
+    a memo hit, 15 ns;
+  - `name_in_scope`, which is `ModuleScope::name`: an intern of (scope, name), a memo hit and a
+    128-byte `PerNs` copied out, 17 ns;
+  - the visibility filter: one tag compare for `Public`, one field read per level for a
+    restricted one.
+
+  A three-segment path is ≈ 42 + 2 × 37 ≈ **115 ns, 3.3× off**. It allocates nothing
+  (`nameres/tests/paths.rs`, `resolved_path_allocates_nothing`, and below).
+- **Inside a unit** (a scope still `Building`), a segment is `ItemScope::get` directly, about
+  10 ns: at the bound.
+- **What stands in the way:**
+  1. **The round trip through `Modules::module` (15 ns a segment):** it fetches a
+     `ModuleData` only to read its scope's id. The change is one tracked function for collected
+     maps, `scope_name(db, module: ModuleId, name: Name) -> PerNs`. On a miss it runs
+     `module.def_map(db).module(db, module).scope(db).get(&name)`. It has the same
+     dependencies as today's two reads and backdates the same way (on `PerNs` equality).
+     `resolve_remaining_segments` and `resolve_name_in_module` call it when the module's map is
+     collected (`ModulesSlot::Collected`, or a map other than `self`). Inside a unit they keep
+     today's path, because the facts engine's edges are `ModuleScope::name` of a round's
+     handle. It replaces one memo kind with the other for collected reads, so the memo count is
+     unchanged. A segment then costs one intern and one memo hit: ≈ 15 ns today and ≈ 10 ns at
+     salsa's bound, which is **the bound**. Requested of db-expand-names
+     (`v2/requests/db-expand.md`).
+  2. **The memo hit itself (11 → 5.4 ns):** salsa's rows by page (speed-salsa).
+
+### A def-map memo hit (`crate_def_map`, `ModuleId::def_map`, `block_def_map`)
+
+- **Work:** return the map.
+- **Bound:** two salsa reads, the `crate_local_def_map` memo and the `DefMapPair::def_map`
+  field: **≈ 11 ns**. The pair's split is what lets readers of `local` (every block map, the
+  resolver) leave a crate map's edit alone, so it is worth its read. A block map is one memo
+  hit, ≈ 5.4 ns.
+- **Today:**
+  - **≈ 22 ns** for the two reads;
+  - plus the `block` and `krate` field reads in `ModuleId::def_map`, so **≈ 26 ns**;
+  - a block map is 11 ns.
+
+  That is **2× off, all of it salsa's hit path**. The `tracing` span in `crate_local_def_map`
+  runs only on execution. Nothing is allocated (a budget test is requested, below).
+
+### The `Resolver` a body walk builds, a scope push and a lookup
+
+- **Work:** the module's maps, the item's generic parameters and the body's expression scopes,
+  pushed as a stack of `Copy` scopes (24 bytes each, asserted).
+- **Bound:** 4 salsa reads at 5.4 ns: the def map (2), `GenericParams::of` and
+  `ExprScopes::of`. Plus a 24-byte store per scope and no allocation: **≈ 25 ns**.
+- **Today, for a fn with no block (`FunctionId::resolver`, then `resolver_for_scope`), ≈ 85 ns
+  and 1 allocation:**
+  - the fn's location, 2 ns;
+  - `local_def_map`, 3 reads, 33 ns;
+  - `GenericParams::of`, 11 ns;
+  - the first push grows `scopes` from empty, about 20 ns;
+  - `ExprScopes::of`, 11 ns;
+  - the pushes.
+
+  A chain of more than 3 scopes reallocates once more at `reserve`. Each block adds a
+  `block_def_map` hit. That is **≈ 3.5× off, and allocates where the rule says none**. It runs
+  once per body walk (inference, lowering, diagnostics), so it is under 5% of a body's time,
+  but every body pays it.
+- **A push** (`update_to_inner_scope`) into reserved capacity is a 24-byte store; leaving is a
+  truncate.
+- **A lookup** of a local is a reverse scan of the innermost scopes' entries: a name and a
+  hygiene compare each. A body's scopes hold a few bindings, so the scan beats a probe (rustc's
+  `Rib` is a hash map per rib). A lookup of an item is the path cost above. Both are at the
+  bound and allocate nothing.
+- **What stands in the way:** the heap `Vec`. The change is `scopes: SmallVec<[Scope<'db>; 8]>`:
+  192 bytes inline. The builder moves a `Resolver` by value (`push_scope(mut self)`) two or
+  three times per build, about 5 ns of copying. With it, a resolver of up to 8 scopes allocates
+  nothing; a deeper body grows once per walk and is reused by `update_to_inner_scope`. A
+  `blaze_mem::Frame` vector would be leaner, but `Resolver<'db>` outlives the call that builds
+  it (it is stored in `InferenceContext`), so a frame would need a second lifetime on every
+  holder. Requested of db-expand-names.
+
+### `crate_def_map`, cold: the fixed point over the crate's items
+
+- **Work:** write every (module, name) slot and resolve every import until nothing changes,
+  round by round. Expanding macros is hir-expand's work and lowering item trees is format's;
+  neither is counted here.
+- **Bound:**
+  - **Slots written:** 20k declarations, 3.7k single-import bindings and 18k names brought in by
+    globs, ≈ 42k.
+  - **Lookups:** each import resolves at least once, and the worklist's measured retry ratio is
+    about 2 per import (round 1: 127 calls for 64 imports). At 2.5 probes each:
+    4k × 2 × 2.5 ≈ 20k.
+  - **Cost per probe or write:** a hash, a slot line and an entry line. The crate's scopes are
+    42k × 45 B ≈ 1.9 MB, so these are L2/L3 lines. Independent imports overlap about 4 in
+    flight: ≈ 30 cycles, 9 ns.
+  - **Reading the declarations:** 20k × 64 B ≈ 1.3 MB at 30 GB/s, ≈ 45 µs.
+  - Total: 62k × 9 ns + 45 µs ≈ **0.6 ms** for this crate.
+- **Today on the build's path (the old collector, one query):** round 1 brought the import loop
+  to the worklist bound. An import is retried only when a slot it read is written, and a glob
+  step allocates nothing. So its operation count is near the bound. What it adds on top:
+  - the columns' doubling growth, about log2(names) reallocations per column;
+  - one `ModuleScope` tracked struct per module at hand-over, ≈ 50 ns each;
+  - the `Modules` table.
+
+  No profile exists, so this is not put in ns.
+- **The facts engine (what replaces it):** the same resolution work, scheduled per module and
+  per component, plus the cost of each query execution. Counted from `facts/queries.rs` and
+  nameres-core.md §2:
+  - round 0, per module: `module_decls`, `decl_handle`, `child_key`, and `legacy_exports` and
+    `subtree_macro_exports` per child, ≈ 5m;
+  - every round, per module: `module_round`, `fact_handle`, `macro_step` and
+    `unresolved_named`;
+  - every round, per component: `scc_state` and `latest`, ≈ 4m + 2c;
+  - plus an intern per key.
+
+  With \(c \approx 900\) (most modules are their own component) and \(k = 4\), that is
+  5k + 4 × 5.8k ≈ **28k executions**. That is ≈ 3.9 ms at today's 140 ns and ≈ 1.0 ms at
+  salsa's bound, against a 0.6 ms bound: **≈ 7.5× off today, ≈ 2.6× at salsa's bound, from
+  bookkeeping alone**. Clones come on top:
+  - a component that changes at a round clones its `UnitState` and hands new `ModuleScope`s
+    (a copy of each member's scope);
+  - a macro step clones its module's `ItemScope` for each round it has a pending directive,
+    about 1.7 KB and 4 allocations.
+- **What stands in the way of 90%:** per-(module, round) queries for modules the round doesn't
+  touch. After round 0, most modules have no macro call left, gain no op, and sit in a component
+  with no changed input, yet every round runs four queries for each of them. The changes, all
+  in frontend-nameres-core's files (requested in `v2/requests/frontend-nameres.md`):
+  1. `RoundModules` carries the round's active modules as a sorted `u32` column beside `order`.
+     A module is active if it has a pending directive, gained an op, or is a member of a
+     component whose input changed. It also carries, per module, the round its component last
+     changed (`since`).
+  2. Readers ask `fact_handle(since[M], M)`, so an untouched module has one handle query for
+     the whole build instead of one per round. `scc_state` runs only for components with an
+     active member.
+  3. `macro_step`, `module_round` and `unresolved_named` run only for active modules, and
+     `round_progress` folds over the active list.
+  4. Round 0's firewalls become conditional. `legacy_exports` and `subtree_macro_exports` are
+     asked only of a child whose `ModuleDecls` says it has `macro_rules!` or
+     `#[macro_export]` (a flag bit). `child_key` becomes an index into
+     `ModuleDecls::children`, since the key already travels in the child's `Splice` op.
+
+  Then executions are ≈ 2m + 4·A + 2·(active components). Here \(A\) is the number of
+  (module, round) pairs that are active. With 300 modules holding macro calls over 4 rounds,
+  \(A\) ≈ 1.2k, giving ≈ 9k executions: ≈ 0.3 ms at salsa's bound, **≈ 0.9 ms in all, 1.5×**.
+  What is left is the firewalls' own price and the clones:
+  - two executions per module, ≈ 70 ns, against ≈ 600 ns of resolution per module: 12%;
+  - copy-on-write rows for the clones, which nameres-core.md §7 already names as the next cut.
+
+  A component built of `use super::*` cycles reruns from its carried state each round it
+  changes, which is what the old collector paid for it. It is no worse than before.
+
+### An edit that changes no name (a signature, a field's type, a private body)
+
+- **Work:** collect the edited file's module again and show its declarations are equal.
+- **Bound:** about **3 µs**:
+  - one pass over the file's 150 items: read each item-tree entry (64 B), write its op (32 B),
+    compare with the old log (32 B). That is ≈ 20 KB through L2 plus about 10 ns of dispatch per
+    item, ≈ 2.5 µs;
+  - one salsa execution.
+- **Today (the old collector):**
+  - the whole crate is collected again, which is the cold cost, milliseconds for this crate;
+  - the `DefMap` is compared: 42k entries × 40 B ≈ 1.7 MB, ≈ 60 µs;
+  - it then backdates, and `nameres/tests/backdate.rs` holds dependents to zero runs.
+
+  That is **≈ 1000× off**.
+- **The facts engine:**
+  - `module_decls` of the edited module runs (≈ 3 µs) and backdates on an equal `OpLog`;
+  - before `crate_local_def_map` can be green again, salsa verifies every other query of the
+    crate's resolver graph, because every reader asks for the map whole (`ModuleId::def_map`).
+    The first read after the edit walks every `fact_handle`, `scc_state` and `macro_step` once.
+  - In this crate that is ≈ 28k nodes and ≈ 80k edges: ≈ 1.6 ms at salsa's in-cache verify
+    (≈ 20 ns an edge);
+  - ≈ 0.5 ms with the active-set change above (≈ 27k edges);
+  - ≈ 0.12 ms at blaze-query's hot verify bound (15 cycles an edge).
+
+  Against 3 µs that is **≥ 40× off at the best of these**. nameres.md §6 counts this term (≈ 200
+  µs for 1000 modules) and accepts it.
+- **What stands in the way:** pull-based verification costs O(graph) per edit. Today only
+  durability bounds it: an edit in a workspace crate leaves the HIGH-durability crates' graphs
+  unwalked. To reach the bound, verification has to start from what changed. The change is
+  pushed forward over reverse edges from the edited input, stopping at the first memo that
+  backdates. That is Adapton's dirty propagation, and how Jane Street's Incremental and Skip
+  work. Here the backdated `module_decls` stops it at once, so nothing beyond the file is
+  touched. That is a change to the query engine (salsa now, blaze-query later), not to name
+  resolution. It goes to speed-salsa and db-query through speed-hir.
+
+### `find_path` (the edge: diagnostics and the IDE)
+
+- **Work:** the shortest path to an item visible from a module, by rust-analyzer's choice rules
+  (prelude first, `std` over `core`, the fewest segments).
+- **Bound, for those rules:**
+  - one probe per (module visited, candidate);
+  - one `ImportMap::of` memo hit per dependency it looks in;
+  - one allocation, the answer.
+- **Today:** round 1 builds one `ModPath` per call and compares candidates as (kind, name,
+  length) with no path built (`FindPathScratch`). That is **at the bound for these rules**, in
+  allocations and probes. rustc's `visible_parent_map` answers a narrower question (rustc's
+  path, not the shortest one visible from a given module) in O(path length); taking it would
+  change every printed path.
+- `find_path` is not on a build's path, so no further change is asked. Its hot_lint findings are
+  `Name` copies written as `.clone()` (below).
+
+### Summary
+
+| operation | bound | today | off | removes the rest |
+|---|---|---|---|---|
+| `ItemScope::get` | 3 lines, ≈ 9 ns | same lines | 1× | — |
+| `resolve_path`, 3 segments, collected map | ≈ 35 ns (1 intern + 1 hit a segment) | ≈ 115 ns | 3.3× | `scope_name(module, name)` (db-expand-names), then salsa's hit |
+| def-map memo hit | 2 reads, ≈ 11 ns | ≈ 26 ns | 2× | salsa's hit path |
+| `Resolver` per body | 4 reads, 0 allocations, ≈ 25 ns | ≈ 85 ns, 1–2 allocations | 3.5× | `SmallVec<[Scope; 8]>` (db-expand-names), salsa's hit |
+| scope push, lookup | a store; a scan or a path | same | 1× | — |
+| `crate_def_map` cold, 1000 modules | ≈ 0.6 ms | old collector: near it in operations, not profiled; facts as designed ≈ 1.6 ms at salsa's bound, ≈ 4.5 ms today | 2.6× at salsa's bound (facts) | active-set rounds (frontend-nameres-core): ≈ 1.5×, then copy-on-write rows |
+| edit that changes no name | ≈ 3 µs | old: ms (whole crate); facts: ≈ 0.12–1.6 ms of verify | ≥ 40× | forward invalidation in the query engine (speed-salsa, db-query) |
+| `find_path` | probes per candidate, 1 allocation | same | 1× | — |
+
+The benchmark for the whole is rustc's `rustc_resolve`, which re-resolves the whole crate on
+every build. It is not incremental below the crate (its incremental system starts after
+resolution), and per lookup it does one `resolve_ident_in_module` probe per segment. Per lookup,
+this code matches it inside a unit and comes within the salsa read of it after collection. Per
+edit, the facts engine beats it by the share of modules an edit leaves alone, and a forward
+invalidating query engine is what would reach the per-file bound. Hit-path and verify costs are
+speed-salsa's section's.
+
+## hir-ty-matchck: match checking (db-matchck)
+
+Files: `crates/hir-ty-matchck/src/{lib,visit,lower,cx,print,typo}.rs` and
+`crates/hir/src/match_lints.rs`. Nothing was run: the costs below are counted from the code, with
+the unit costs above, a small allocation plus its free at ≈ 20 ns, and a `Resolver` at the
+≈ 85 ns that the name resolution section gives. The reference is rustc's own `check_match`, which
+does this work for every body on every build. Here it is one salsa query per body
+(`match_check`, `returns(ref)`, `Hash`/`Eq` result), so a warm build pays one memo hit for each
+body that didn't change.
+
+### A body with no `match`, no `let` expression or `let`-`else`, and no refutable pattern (most bodies)
+
+- **Work:** find that there is nothing to check, and lint `bindings_with_variant_name`, the only
+  thing that can fire. It needs no type context beyond the inference result that type checking
+  already made.
+- **Bound:** one read of each expression's kind and each binding pattern's type. For a body of
+  n = 200 expressions and b = 20 bindings that is 200 tag reads plus 20 type-kind reads, about
+  200 + 20 × 10 ≈ 400 cycles, **≈ 0.1 µs**. No allocation, no inference context, no layout.
+- **Today:** `needs_analysis` scans the expression column once (`exprs()` decodes each row,
+  ≈ 10 to 20 cycles a row), then a `Visitor` with no lowerer walks the tree for the lint:
+  ≈ 200 × 15 + 200 × 15 + 200 ≈ 6 000 cycles, **≈ 1.7 µs, ≈ 15× off**. No inference context,
+  layout or type is built, and nothing allocates unless a lint fires (the visitor's `Vec`s start
+  empty).
+- **What stands in the way:** two full decodes of the body where a tag scan would do.
+  - A kind-only scan from hir-def (one byte per expression, no row decode) would make the test
+    ≈ 200 cycles.
+  - Folding the lint into the same scan of the pattern column would remove the walk. Every binding
+    site of such a body is irrefutable, so `suggest` is just "the enum has one variant". The lints
+    would then come out in pattern-id order, not THIR order (parameters last). That is the same
+    set, but the emitter would have to put them back in rustc's order.
+  - With both, ≈ 400 cycles, at the bound.
+
+### A body with matches (per `match` of m arms, p pattern nodes in all)
+
+- **Work:** lower the p nodes to `DeconstructedPat`s, run rustc's usefulness algorithm, and turn
+  what it reports into lints and errors. Only an error prints a witness or allocates text.
+- **Bound:**
+  - The usefulness algorithm is rustc's, ported unchanged (`ra-ap-rustc_pattern_analysis`), so its
+    cost is rustc's and is the floor.
+  - Lowering is one node per pattern node with its fields in an arena: p × ≈ 30 cycles. For
+    m = 4 arms of `Some(x)`-like patterns (p = 8) that is ≈ 240 cycles, under the analysis's own
+    cost (matrix rows, a `split` per column, ≈ 1 to 2 µs for such a match).
+  - The bound is the analysis plus ≈ 0.1 µs.
+- **Today:**
+  - Each non-leaf node is a `Vec` of fields, because `DeconstructedPat::new` takes one (leaves
+    pass an empty `Vec`, which doesn't allocate). That is about 4 allocations for this match,
+    ≈ 80 ns.
+  - The lowered patterns live in one `Vec` per match, which the report borrows.
+  - The scrutinee validity check (`is_known_valid_scrutinee`) builds a `Resolver` for a path
+    scrutinee, to see whether it names a static: ≈ 85 ns.
+  - A path pattern that is not a variant (a constant) builds one too.
+  - In all, analysis + ≈ 0.2 µs, **within 10% for a match of more than a few arms** and ≈ 1.15×
+    for the smallest.
+  - The guard-free second analysis (`would_be_exhaustive_without_guards`) runs only for a
+    non-exhaustive match with a guard, which is an error.
+- **What stands in the way:**
+  - The `Vec` per node is `rustc_pattern_analysis`'s API; an arena there would remove it.
+  - The `Resolver` per path scrutinee could go: type checking already resolved the path, so a
+    per-expression "names a static" bit in `InferenceResult` makes it a lookup.
+
+### A failed or erroneous body
+
+- A body that type checking found an error in (`has_errors`, a type mismatch, or `is_erroneous`)
+  returns `not_checked` before reading the body, as rustc's `thir_body` does: one memo read of
+  the inference result, ≈ 10 ns.
+- A pattern that fails to lower (an erroneous type, a constant that does not evaluate) stops that
+  match and marks the body `failed`, without reporting more.
+
+### Summary
+
+| operation | bound | today | off | removes the rest |
+|---|---|---|---|---|
+| body with nothing to check, n = 200 | ≈ 0.1 µs | ≈ 1.7 µs, 0 allocations | ≈ 15× | kind-only scan (hir-def), lint folded into it |
+| `match`, 4 arms | analysis + ≈ 0.1 µs | analysis + ≈ 0.2 µs, ≈ 4 + 1 allocations | ≈ 1.15× | arena in `rustc_pattern_analysis`, a "names a static" bit in inference |
+| erroneous body | 1 memo read | same | 1× | — |
+| warm body, unchanged | salsa memo hit | same | speed-salsa's | — |
+
+Witness text, typo search (a walk of the crate's module scopes, only for an unreachable catch-all
+binding) and source-map conversion in `hir` run only for a diagnostic that fires, so they are on
+no build's path.
+
+## hir-def: attributes, interned locs, lang items (speed-hir-sol-defs)
+
+What this covers, all in `crates/hir-def/src/`:
+- `AttrFlags::query` of an item (`attrs.rs`), cold and as a hit;
+- a value query gated by a flag (`export_name`, `repr`, `lang_item`);
+- docs (`attrs/docs.rs`), cold;
+- interning a loc (`lib.rs`);
+- `crate_lang_items` and `lang_items` of a crate (`lang_item.rs`);
+- `upvars_mentioned` of a body (`upvars.rs`);
+- the read path of `deps/serve.rs`.
+
+Costs are counted from the code as of 10-29 21:00, not measured. Salsa costs are speed-salsa's,
+above: a memo hit is 11 ns today and 5.4 ns at its bound, and an execution's bookkeeping is
+140 ns today and 35 ns at its bound. A file has 150 items. Zero-allocation budgets for the hit
+paths are in `alloc_budgets.rs` (the crate's counting allocator is requested from db-expand, in
+`v2/requests/db-expand.md`).
+
+### `AttrFlags::query`: an item's attribute flags
+
+- **Work:** find the item's attributes, which are the first children of its node, read each
+  one's name, and set one bit per known name. A typical item has one attribute of about 20 bytes.
+- **Bound, cold, one attribute:**
+  - locate the item's first element: one line if the ast id gives the element index, ≈ 4 ns;
+  - walk the attribute children: 1 to 2 lines, ≈ 5 ns;
+  - per attribute: the name's bytes, already in those lines, then one hash and one compare in
+    the `name_set!` perfect hash, ≈ 30 cycles, ≈ 9 ns;
+  - the salsa execution, 35 ns;
+  - **≈ 55 ns per item**, ≈ 8 µs for a file of 150 items.
+- **Today, cold, one attribute (`attrs_source` → `collect_attrs_in` → `match_attr_flags`):**
+  - `lookup` of the loc, ≈ 2 ns;
+  - `loc.source(db)`: memo hits on `ast_id_map` and `parse`, 2 × 11 ns;
+  - `parse_or_expand` makes a new root (`SyntaxNode::new_flat_root`): one `Box`, an atomic
+    increment and decrement of the file tree's `Arc`, and a free, ≈ 30 ns. That count's line is
+    shared by every worker reading items of the same file, so under contention it costs more;
+  - `AstPtr::to_node` → `FlatTree::node_at_range`: a binary search over the start column of
+    the file's ≈ 30k elements, which is 15 dependent loads, mostly L2 hits, ≈ 210 cycles,
+    ≈ 60 ns, plus 1 to 3 parent steps;
+  - `loc.krate(db)`, ≈ 2 ns;
+  - the walk of the item's children and the inner-attribute check, ≈ 17 ns;
+  - per attribute: `meta`, `path`, `segment` and `name_ref` cursor steps, then the perfect
+    hash, ≈ 80 cycles, ≈ 23 ns;
+  - the salsa execution, 140 ns;
+  - **≈ 300 ns and 1 allocation per item, ≈ 5.5× off**; ≈ 45 µs per file.
+- **Hit:** one memo hit and a 16-byte copy, 11 ns today against 5.4 ns at the bound. That is
+  salsa's 2×, and allocates nothing (`attribute_flag_reads_allocate_nothing`).
+- **A body edit, the larger gap:**
+  - `AttrFlags::query` reads the item off the live `parse` and `ast_id_map`, and both change
+    on every edit of the file;
+  - the signature queries read it (`signatures.rs` lines 612, 714, 822, 929, 1024, and through
+    `repr` and `repr_assume_has`), so verifying them after a body edit re-runs the flag query
+    of every item of the file. `fields_attrs` and `query_generic_params` re-run the same way;
+  - each result backdates, so nothing downstream runs, but the edit pays ≈ 150 × 300 ns
+    ≈ **45 µs per file** for items, plus one run per variant's fields and per generic def's
+    params;
+  - at the bound, the queries read only `file_outline`, which a body edit leaves the same, so
+    each is one deep-verify edge: 150 × 5.4 ns ≈ 0.8 µs. That is ≈ 50× off. The signatures
+    section above counts these 45 µs in its body-edit total: ≈ 60 µs per file today, ≈ 15 µs
+    once this change lands.
+- **What stands in the way, in order:**
+  1. **Read attributes off `file_outline`, not the parse** (`attrs_source` through
+     `item_syntax`'s outline lookup in `signatures.rs`). This removes the per-edit re-runs.
+     A cut body loses any inner attributes it starts with (`fn f() { #![allow(x)] ... }`), so
+     `bodies_under` must leave uncut a body whose text, after trivia, starts with `#!`. Items
+     not in the outline, those inside bodies or written by macros, keep reading their file:
+     an edit there changes what they are read from anyway.
+  2. **Walk the borrowed view (`syntax::view`, `Parse::view`) instead of owned cursors.** This
+     removes the root `Box` and the shared `Arc` write per item. It needs a view form of
+     `hir_expand`'s `expand_cfg_attr`.
+  3. **Keep the element index in the ast id map** (`span`'s `AstIdMap`), so `to_node` is one
+     load, not a 15-step search. This helps every `loc.source` in the front end.
+  4. **One pass per file:** a `file_attr_flags(db, file)` column of every item's flags, built
+     in one walk of the outline (≈ 150 × 20 ns ≈ 3 µs), with `AttrFlags::query` as a tracked
+     read of one entry, so an attribute edit still changes only its own item's result. Cold,
+     each item then costs one execution and one load.
+  5. Salsa's execution cost, 140 ns → 35 ns, is speed-salsa's.
+
+### A value query gated by a flag (`export_name`, `link_section`, `repr`, `lang_item`)
+
+- **Without the attribute** (most items): the flag hit, then one bit test that returns `None`.
+  That is 11 ns today against 5.4 ns at the bound, with 0 allocations
+  (`gated_value_reads_allocate_nothing`). At salsa's bound.
+- **With the attribute, cold**, once per item that has one (1 to 5% of items):
+  - **Bound:** the value's bytes are in the lines the flag walk read. Locating them takes
+    ≈ 15 ns, interning a name (`Symbol::intern`: one hash and one probe) ≈ 25 ns, parsing a
+    `repr` hint ≈ 20 ns, and the execution 35 ns, so **≈ 75 ns**.
+  - **Today:** a second `attrs_source` and walk (≈ 160 ns, including the root `Box`), the
+    value (`symbol_attr` for a literal, `parse_repr_tt` for `repr`,
+    `LangItemEnum::from_symbol`, which is one load through `KnownNames`), and a 140 ns
+    execution, so **≈ 330 ns, ≈ 4.5× off**. `parse_repr_tt` also clones a token per `packed`
+    or `align` hint; requested from db-expand.
+  - **What stands in the way:** changes 1 to 3 of `AttrFlags::query`. The second walk itself
+    stays: only items with the attribute pay it, and storing every value with the flags would
+    widen the 16-byte flag memo that every item reads.
+
+### Docs, cold
+
+- Read only by `blaze-doc` and `hir` (hover), never by a build.
+- **Bound:** copy the doc's bytes once into a buffer sized from the sum of the line lengths,
+  then strip the `///` and the indent of each line. A 10-line doc of 500 bytes is ≈ 20 ns of
+  copy, 10 × 5 ns of stripping, one allocation and an execution, so **≈ 130 ns**.
+- **Today:** `attrs_source` (≈ 140 ns of the cost above), a `String` grown line by line (≈ 7
+  reallocations for 500 bytes), line vectors per block comment in `get_vertical_trim` and
+  `remove_indent`, and a source-map entry per line. That is about ten allocations and
+  **≈ 1 µs, ≈ 8× off**.
+- Not pursued: it is on no build's path. If `blaze-doc` makes it matter, the change is a
+  sizing pass before the copy and one scratch buffer per worker for the line vectors.
+
+### Interning a loc (a hit)
+
+- **Work:** hash the loc's packed words, probe the intern table, compare the key.
+  `ItemLoc` is 24 bytes (3 Fx rounds through `hash_ast_id`'s packing), `AssocItemLoc` 28 bytes
+  (3 rounds), and `EnumVariantLoc` and `ProcMacroLoc` 32 bytes (4 rounds).
+- **Bound:** 3 dependent Fx rounds at ≈ 4 cycles each, ≈ 12 cycles, then salsa's probe: the
+  control group line and the value line, ≈ 15 cycles hot, with the compare in the value line.
+  So **≈ 27 cycles, ≈ 8 ns**.
+- **Today:** the same. Locs are immortal (`revisions = usize::MAX` in `impl_intern_key`), so
+  `intern_id` takes no lock, records no revision, and reports no read
+  (`report_tracked_read_if_reusable` skips a value that can't be reused). **At the bound**,
+  with 0 allocations (`interning_a_known_loc_allocates_nothing`).
+
+### `crate_lang_items` and `lang_items` of a crate
+
+- **A crate without `#![feature(lang_items)]`** (all but a few): one `crate_def_map` memo hit
+  and the feature test, then `None`. ≈ 20 ns, at the bound.
+- **`core` from its image** (every build after the toolchain's first): `served_lang_items`
+  decodes ≈ 0.7 KB (182 entries of 4 bytes), ≈ 1 µs. At the bound.
+- **`core` resolved, cold** (≈ 25k items, counting associated items and variants, ≈ 400 of them
+  lang items):
+  - **Bound:** a scan of the items' flags as columns (25k × 16 bytes = 400 KB at 30 GB/s,
+    ≈ 13 µs), plus ≈ 400 value reads at ≈ 75 ns, ≈ 30 µs. So **≈ 45 µs**, and the columns'
+    cost is the one `AttrFlags` already pays, spread across workers.
+  - **Today:** one pass over the modules that calls `AttrFlags::lang_item` per item, with memo
+    hits on `trait_items`, `impl_items` and `enum_variants` per container. With every flag
+    warm, ≈ 25k × 14 ns ≈ 0.35 ms, ≈ 8× off. If this pass is the first reader of `core`'s
+    flags, it runs them all on one thread: 25k × 300 ns ≈ **7.5 ms serial**.
+  - **What stands in the way:** change 4 of `AttrFlags::query` (flags as per-file columns,
+    built in parallel), then a pass that reads the columns' `LANG_ITEM` bits.
+- **`lang_items(db, krate)`**, once per crate: a copy of the crate's own ≈ 0.7 KB, then for
+  each of \(d\) crates in its extern prelude, a memo hit and `merge_prefer_self` over 182
+  entries (≈ 100 ns). For \(d = 10\), ≈ 1.2 µs plus an execution. That is the work itself, at
+  the bound.
+- **A lookup** (`lang_items(db, krate).Sized`, `LangItemEnum::from_symbol`): one memo hit and
+  one load, 11 ns today against 5.4 ns at the bound, with 0 allocations
+  (`lang_item_lookups_allocate_nothing`). Salsa's 2×.
+
+### `upvars_mentioned` of a body
+
+Figures: a body of \(n = 200\) expressions, 20 bindings, one closure of 30 expressions with 5
+single-segment paths that may name a local.
+
+- **A body with no closure:**
+  - **Bound:** one bit, `has closures`, kept in the store at lowering: one load and an
+    execution, ≈ 40 ns.
+  - **Today:** an `ExpressionStore::of` hit, then a scan of the 200 `Expr`s (≈ 8 KB at
+    30 GB/s, ≈ 0.3 µs), then the execution: **≈ 0.45 µs, ≈ 11× off**. The bit is the
+    store's, which is speed-hir-store's.
+- **A body with a closure:**
+  - **Bound:** walk the closure's own expressions (30 × 3 ns). For each candidate path, one
+    load of the local it resolves to if lowering kept it (5 × 5 ns), and a compare of that
+    local's owner. Then one allocation for the result and the execution: **≈ 170 ns**.
+  - **Today:**
+    - the scan, ≈ 0.3 µs;
+    - `owner.resolver(db)`: several memo hits and the scope chain's `Vec`, ≈ 0.15 µs;
+    - the `binding_names` set, 20 inserts and 1 to 2 allocations, ≈ 0.15 µs;
+    - the visitor over all 200 expressions, ≈ 1 µs;
+    - per candidate, `update_to_inner_scope` and `resolve_path_in_value_ns_fully`, ≈ 150 ns,
+      so 0.75 µs;
+    - the result map, its `Box` and each closure's `Box<[BindingId]>`, 3 to 4 allocations;
+    - **≈ 2.4 µs, ≈ 14× off.**
+  - **What stands in the way:**
+    - The walk covers the whole body. A closure's expressions are lowered before it, so they
+      sit in a contiguous range ending at the closure, and the walk can cover just those.
+    - The `Resolver` is built only to find locals. `ExprScopes`' lookup from the expression's
+      scope, with the path's hygiene, is exactly the local part of the resolver's answer:
+      locals shadow items in the value namespace, so a name that a scope holds is that local.
+      rustc's `upvars_mentioned` reads `Res::Local` off HIR, already resolved. The same
+      result here is the local each path names, recorded when the store is lowered.
+- **A read** (`upvars_mentioned(db, owner)` then `get(closure)`): a memo hit and one FxHash
+  probe, ≈ 15 ns, with 0 allocations (`upvar_reads_allocate_nothing`).
+
+### `deps/serve.rs`: serving dependency images, once per session
+
+Figures: 300 dependency crates whose images total \(S\) bytes. \(S = 50\) MB is assumed here;
+the image sizes are not measured.
+
+- **Work:** key each crate (BLAKE3 over its content, source root and dependencies' keys, about
+  200 bytes each), fetch each image, check its bytes against its key, open its header and
+  parts, check that its files are the crate's, and set the `DepImages` input.
+- **Bound:** the bytes are hashed once, in parallel. BLAKE3 at ≈ 6 GB/s per core on 16 cores
+  takes 50 MB in ≈ 0.5 ms. The parts are used in place, with no copy. Keys take 300 × 0.2 µs
+  ≈ 60 µs, and the opens and checks ≈ 300 × 0.2 µs. So **≈ 0.6 ms**.
+- **Today:** the loop in `serve` is serial. Per crate, it calls `images.get` (the store's read
+  and its BLAKE3 check, on the calling thread), then `ImageRef::open`, then
+  `frozen::unreadable`. Then `def_map.into()` and the lang-items part copy each part into a
+  new `Arc<[u8]>`. That is 50 MB / 6 GB/s ≈ 8.3 ms of hashing plus ≈ 3 ms of copy at 15 GB/s,
+  not counting the store's own read: **≈ 12 ms, ≈ 20× off.**
+- **What stands in the way:**
+  - A batched store read. `ImageStore::get_many(&[ContentId])` would let the store read and
+    verify the images in parallel; this is frontend-deps' interface and the store adapter's
+    implementation.
+  - The copy. `Frozen` could hold the image's `Arc<Aligned>` and the part's range in place of
+    an `Arc<[u8]>` copy, which also keeps the image's alignment.
+  - `hits` is not sized ahead; requested from frontend-deps, it is minor.
+
+### Summary
+
+| operation | bound | today | off | removes the rest |
+|---|---|---|---|---|
+| `AttrFlags::query`, cold, per item | ≈ 55 ns | ≈ 300 ns, 1 allocation | ≈ 5.5× | outline, view, element index, per-file column |
+| `AttrFlags` per file after a body edit | ≈ 0.8 µs | ≈ 45 µs | ≈ 50× | read attributes off `file_outline` |
+| `AttrFlags` hit | 5.4 ns | 11 ns, 0 allocations | 2× | salsa's |
+| gated value, no attribute | 5.4 ns | 11 ns, 0 allocations | 2× | salsa's |
+| gated value with the attribute, cold | ≈ 75 ns | ≈ 330 ns | ≈ 4.5× | as `AttrFlags` |
+| docs, 10 lines, cold | ≈ 130 ns | ≈ 1 µs, ≈ 10 allocations | ≈ 8× | not on a build's path |
+| loc intern hit | ≈ 8 ns | ≈ 8 ns, 0 allocations | 1× | — |
+| `crate_lang_items`, no lang feature | ≈ 20 ns | ≈ 20 ns | 1× | — |
+| `crate_lang_items` of `core`, cold | ≈ 45 µs | ≈ 0.35 ms warm flags, 7.5 ms cold | 8× to 170× | flags as per-file columns |
+| lang-item lookup | 5.4 ns | 11 ns, 0 allocations | 2× | salsa's |
+| `upvars`, no closure | ≈ 40 ns | ≈ 0.45 µs | ≈ 11× | a `has closures` bit in the store |
+| `upvars`, one closure | ≈ 170 ns | ≈ 2.4 µs | ≈ 14× | the closure's range, locals kept at lowering |
+| `serve`, 300 crates, 50 MB | ≈ 0.6 ms | ≈ 12 ms | ≈ 20× | batched parallel store read, parts in place |
+
+## hir-expand: macro expansion (speed-hir-sol-expand)
+
+What this covers, per macro call:
+- `macro_arg`: the argument's syntax to a token tree;
+- a `macro_rules` expansion, apart from `mbe`'s matcher and transcriber (format's, whose cost
+  this section takes as given and calls \(M\));
+- `parse_macro_expansion`: the expansion's tokens to a flat tree and its span map;
+- a builtin derive of a struct of \(f\) fields;
+- a memo hit, a `Name` and a `ModPath`, a span lookup, a hygiene mark;
+- and the critical path of one expansion round.
+
+Costs are counted from the code as of 10-29 (after frontend-db-def's `&Db` migration), not
+measured; "today" includes the changes requested of db-expand-macros in
+`v2/requests/db-expand-macros.md` (`## speed-hir-sol-expand`) only where it says "after".
+Machine figures are the lane's: 3.5 GHz, IPC about 2 on this branchy code (so 1 instruction is
+about 0.14 ns), L1 4–5 cycles, L2 about 14. Salsa's figures are speed-salsa's, above: a memo hit
+is 11 ns today and 5.4 ns at its bound, an intern hit about 4.3 ns, an execution's bookkeeping
+about 140 ns today and 35 ns at its bound. An allocation and its free are taken as about 20 ns.
+
+### A memo hit (`parse_macro_expansion`, `macro_arg_considering_derives`, `span_map`, `ast_id_map`, `expand_proc_macro`)
+
+- **Work:** one salsa fetch. Every one of these is `returns(ref)`, keyed by an id.
+- **Bound:** salsa's hit, **5.4 ns**; hir-expand's own part is nothing, and 0 allocations.
+- **Today:** salsa's 11 ns, nothing added: values come back by reference, `span_map` is an enum
+  of a reference. A derive's argument is its `#[derive]` attribute's, one memo for all its
+  derives. An eager call (`concat!`, `include_str!`, `env!` and the rest) today runs `macro_arg`
+  once to copy its already-expanded argument out of its location into a memo: \(t \times 16\) B
+  and about 5 allocations, kept until evicted. **After** request block 1 it reads the location
+  in place (one interned read, about 2 ns, no memo), and only eager calls pay for it, because
+  the test is on the `kind` the caller already holds.
+- **Gap:** speed-salsa's 2×. Budget test: `macro_expansion_tests/budgets.rs` (requested), 0
+  allocations for all four hits.
+
+### A `Name`, a `ModPath`, a span lookup
+
+- **`Name`** is a `Symbol` (4 bytes, `Copy`). From a symbol that exists: a move, 0 instructions
+  beyond it. From text (`Name::new_root`): one symbol-interner hit, hashing the text; nothing
+  hir-expand can remove. Tuple-field names 0 to 15 are pre-interned. **At the bound**, 0
+  allocations. Request block 4 drops a `(*self.name).clone()` and the doc comment's "8 bytes".
+- **`ModPath`** is 16 bytes, `Copy`: a kind and an interned slice of segments, gathered on the
+  stack (8 inline). From segments whose list exists, or `pop_segment`/`push_segment` onto one: an
+  intern hit hashing \(4s\) bytes, about 15–20 ns for \(s \le 4\). `from_kind` is a constant.
+  **At the bound**, 0 allocations.
+- **Span lookup:** in order (the `InOrder` cursor `macro_arg` uses): two compares, about 2 ns.
+  Scattered: a binary search of the file's anchors (about 150 a file, so 8 dependent probes,
+  mostly L1, about 15–20 ns) or of an expansion's 4-byte `ends` column (16 to a line, so the last
+  4 probes share one). **At the bound**, 0 allocations. What is left is span size: an entry is
+  24 B (a 20-byte `Span` against rustc's 8), speed-span's.
+- Budget tests: `hir-expand/src/budget_tests.rs` (requested), 0 allocations each.
+
+### `macro_arg`: a call's argument, syntax to tokens (\(t\) tokens)
+
+- **Work:** find the call's node from its `AstId`, then per token: its kind and range from the
+  flat tree, intern its text if an identifier or literal, its span by the in-order cursor, and
+  write a node (8 B) and a packed span (8 B).
+- **Bound:**
+  - Per token, about 40 instructions: 10 to walk, about 15 to intern (an intern hit of about 30,
+    on half the tokens), 5 for the span and 10 to write. That is 20 cycles, **≈ 5.7 ns a token**.
+    It writes 16 B a token, so bandwidth is not the limit.
+  - Fixed: salsa's execution (35 ns), the pointer to node descent (about 10 levels, 15 ns), the
+    call path's span (one binary search, 20 ns), and one allocation for the output (20 ns):
+    **≈ 0.1 µs**.
+  - A typical call of \(t = 20\): **≈ 0.2 µs**, **1 allocation**.
+- **Today:** the per-token loop is the bound's (syntax-bridge's `convert_tokens`, with the
+  builder sized by the subtree's length, so it does not grow). The fixed part is salsa's 140 ns
+  plus about 10 allocations: the builder's columns, then `TopSubtree`'s five boxed columns
+  (nodes, spans, wide, parts, symbols) packed exact by `finish`. That is about 0.2 µs of
+  allocation, so **≈ 0.5 µs for \(t = 20\), about 2.5× off**, all in the fixed part and none of
+  it in hir-expand's code.
+  - Attribute and derive inputs add `cfg_process` (a memo hit on the file's syntax-error ranges,
+    then the item's attributes); after request block 5 an answer that keeps or drops a node
+    allocates nothing, and an expanded `cfg_attr` costs 2 small allocations (the bridge's
+    callback returns a `Vec<tt::Leaf>`).
+  - `fixup_syntax` runs only when a syntax error touches the item, so it is off the build path.
+- **Gap:** format's `TopSubtree` as one allocation (the five columns in one block) and a
+  reused per-thread builder (as the parser's input already is), with salsa's execution bound:
+  then within 10% of the bound.
+- **Budget:** a stated constant, today at most 12 allocations a call and the same for 16
+  tokens as for 1024 (`an_argument_costs_a_constant_number_of_allocations`, requested);
+  1 at the bound.
+
+### A `macro_rules` expansion (\(n\) output tokens)
+
+- **Work:** \(M\), plus the definition (`decl_macro_expander`, a memo hit) and a hygiene mark on
+  each transcribed token's span.
+- **Bound:** \(M\) + 5.4 ns + per token one look in a 4-entry cache (about 5 instructions, under
+  1 ns) + per distinct (context, call) pair one mark: 1 to 3 `SyntaxContext` interns, about 15 ns
+  on hits. A body carries 1 or 2 contexts, so **\(M\) + ≈ 0.75 ns × \(n\) + ≈ 40 ns**.
+- **Today:** that is what `declarative.rs` does (`MarkCache`, round 1). **At the bound** in
+  hir-expand's part. A new context is an execution (salsa's 140 ns today) the first time it
+  appears in the build, once per call and context, not per token.
+
+### `parse_macro_expansion` (\(n\) output tokens)
+
+- **Work:** the tokens to parser input, the parse, the flat tree and its span map (one 24 B entry
+  a token), then for an expression whose expansion ends in `;`, that `;` dropped.
+- **Bound:** the grammar's cost a token (format's) + about 10 cycles a token for the input and
+  tree building (≈ 3 ns) + the span map's 24 B write; a constant number of allocations (the tree's
+  columns and the map's two). Editions are asked once per context (`Editions`, the last one and
+  a few near it), not per token.
+- **Today:** that, plus `without_last_semicolon`'s scan of the top-level tokens of an expression
+  expansion (2 or 3 instructions a token). When the expansion does end in `;` (rare: a
+  statement-like body called as an expression) it copies the tree without it (\(n \times 16\) B,
+  about 5 allocations). **At the bound** but for that rare copy; the rest is format's.
+
+### A builtin derive of a struct of \(f\) fields
+
+- **Work:** read the item's name, generics and \(f\) field names (and, for some derives, types),
+  and write each output token once. `Clone` writes about 18 tokens a field
+  (`f0: ::core::clone::Clone::clone(&self.f0),`) and about 40 more.
+- **Bound:** the item's shape is read from syntax that already exists: the file's own tree,
+  or, when `cfg_attr` changed the item, one parse per `#[derive]` attribute shared by its
+  derives. Per field about 18 tokens × 10 instructions, **≈ 26 ns a field**, plus salsa's
+  execution and one output allocation, **≈ 0.1 µs**. `#[derive(Clone)]` of 16 fields:
+  **≈ 0.5 µs**, a constant number of allocations independent of \(f\).
+- **Today:**
+  - Each derive reparses the item from its token tree (`to_adt_syntax`, a full
+    `token_tree_to_syntax_node`): for an item of \(t\) tokens at roughly 12 ns a token, 0.9 µs
+    for a 16-field struct (about 75 tokens), where the bound parses nothing.
+  - Each generic parameter and bound is converted back to a token tree of its own (about 5
+    allocations each).
+  - The output builder starts empty and doubles, about 4 columns × \(\log_2(18f)\) allocations.
+  - After request block 6, the field list is reserved once; no allocation is per field
+    (`a_derive_allocates_nothing_per_field`, requested: at most 64 for 16 fields, and 256 fields
+    adds at most 48).
+  - In all, about 35 allocations (0.7 µs) for `Clone` of 16 fields: **≈ 2 µs a derive, about 4×
+    off**, and 5 derives on one item spend about 4.5 µs reparsing next to 2.5 µs of output.
+- **Gap, in order of size:**
+  1. No reparse: `BasicAdtInfo` from a query keyed by the `#[derive]` attribute's call, read by
+     each derive, built from the file's syntax (or from one parse when `cfg_attr` changed the
+     item).
+  2. The builder sized from \(f\) (each derive knows its tokens a field).
+  3. Generic parameters as ranges of the argument tree, not copies.
+
+### One expansion round: the critical path
+
+- **Work:** every call collected in the round expands (argument, expansion, parse), then name
+  resolution reads the results.
+- **Bound:** \(\max(\text{longest single expansion}, W / c)\) for the round's work \(W\) on
+  \(c\) cores. Expansions in a round don't depend on each other: each reads its own argument
+  and an immortal definition. For a crate of a few thousand calls of 0.5–2 µs, \(W\) is a few
+  ms, so \(W / c\) dominates unless one call is a large `include!` or a deep recursive
+  `macro_rules`, whose own chain is then the floor.
+- **Today:** the collector expands a round's calls one after another on one thread
+  (speed-hir-sol-nameres's section, "`crate_def_map`, cold"), so the round costs \(W\), **\(c\)
+  times the bound**. hir-expand's queries take `&Db` and share nothing mutable across calls (the
+  mark cache is per expansion), so they are ready for a parallel round. The order is fixed by
+  the call's position, not by which finishes first. What stands in the way is the collector,
+  name resolution's.
+
+### Summary
+
+| operation | bound | today | off | removes the rest |
+|---|---|---|---|---|
+| memo hit | 5.4 ns, 0 allocations | 11 ns, 0 allocations | 2× | speed-salsa's |
+| `Name` / `ModPath` / span lookup | a move / an intern hit / 2 compares | same | 1× | — (span size: speed-span) |
+| `macro_arg`, \(t = 20\) | ≈ 0.2 µs, 1 allocation | ≈ 0.5 µs, ≈ 10 allocations | ≈ 2.5× | one-block `TopSubtree`, reused builder (format); salsa's execution |
+| eager call's argument | one interned read | a copy and a memo | — | request block 1 |
+| `macro_rules`, \(n\) tokens | \(M\) + 0.75 ns × \(n\) | same | 1× | — |
+| `parse_macro_expansion` | grammar + 3 ns × \(n\) | same, a rare copy | ≈ 1× | — |
+| `#[derive(Clone)]`, 16 fields | ≈ 0.5 µs | ≈ 2 µs, ≈ 35 allocations | ≈ 4× | no reparse per derive, sized builder, generics as ranges |
+| a round | \(\max(\text{longest}, W / c)\) | \(W\) | \(c\)× | a parallel collector (nameres) |
+
+## base-db: inputs and views (speed-hir-sol-basedb)
+
+Files: `crates/base-db/src/{files,table,view,lib,editioned_file_id,input,content}.rs`. Costs are
+counted from the code as of 10-29 20:40, not measured. Round 1's before/after (no locks on reads,
+nothing done per unchanged file of a view, batched BLAKE3) is in
+[speed-hir-basedb.md](speed-hir-basedb.md). The exact edits named "block N" below are in
+`v2/requests/frontend-db-base.md`, under "speed-hir-sol-basedb". base-db is owned by
+frontend-db-base during the `&Db` migration, so they are requested, not applied. The budget tests
+are in `crates/base-db/src/budget_tests.rs`. A "line" is a dependent cache-line load, as in
+speed-salsa's section above. salsa's input-field read is counted like the first lines of its memo
+hit: bucket, page, slot.
+
+### A file-text read (`db.file_text(file).text(db)` in a query)
+
+- **Work:** map the file's dense ID to its `FileText` input, read the `text` field with its
+  revision and durability, and record the read.
+- **Bound:** the ID is an index, so the field's address is arithmetic.
+  - That is 1 line (the input's slot) plus recording the read (3 ns for a new key, 1 ns for a
+    repeat, at salsa's bound).
+  - Hot: 4.5 cycles + about 15 instructions / 2 ≈ 12 cycles ≈ 3.5 ns, so **≈ 5 ns** with the
+    record.
+  - Cold: 1 miss, 110 ns latency, **≈ 5.5 ns** per read in throughput.
+- **Today:** 0 allocations, 0 locks, nothing written (round 1). 8 dependent loads:
+  - base-db's `Column`: the `Arc<Files>` pointer, the column's page directory, the page's
+    `OnceLock` (one line shared by 4,096 files), and the page's word for the file;
+  - salsa's input read: the ingredient cache, the table bucket, the page, and the slot.
+
+  Six of the eight are lines shared by thousands of files and stay in L1. The per-file ones are
+  the column word and salsa's slot. Hot: 8 × 4.5 + 15 ≈ 51 cycles, 15 ns, **3× off**. Cold: 2
+  misses, 11 ns in throughput, **2× off**.
+- **What stands in the way:** the file ID becomes the input's ID twice: once in base-db's
+  column (file ID to salsa ID), then in salsa's table (salsa ID to slot).
+  - The change: a salsa input whose slots are indexed by a dense key its creator gives, in a
+    reserved region of `MAX_FILE_ID + 1` slots, with the slot at `base + size × index`. Then
+    `FileText` of file `i` is slot `i`, and base-db's three `Column`s (text, source roots, file
+    source roots) go. A read is the slot's line: the bound.
+  - It rewrites how salsa allocates input IDs, so it waits on S5's first compile like speed-salsa's
+    other changes. Owner: speed-salsa, then base-db.
+
+### A source-root read
+
+`db.file_source_root(file).source_root_id(db)`, then `db.source_root(root).source_root_ref(db)`.
+- **Bound:** the file's input slot (1 line, per file) and the root's (1 line, shared by all the
+  root's files, so hot): ≈ **8 ns hot**, 1 miss cold.
+- **Today:** two reads of the file-text read's shape. Hot ≈ 30 ns, **3.5× off**. Cold: 2 per-file
+  misses (the column word, the `FileSourceRootInput` slot), **2× off**. 0 allocations, and no
+  `Arc` clone (`source_root_ref`, round 1).
+- **What stands in the way:** the dense-input change above.
+
+### `relevant_crates` (a memo hit)
+
+- **Work:** the file's source root, then the memo of the crates rooted in it.
+- **Bound:** the source-root read (1 per-file line), then one memo hit whose lines every file of
+  the root shares: 5 + 5.4 ≈ **10 ns hot**, 1 miss cold.
+- **Today:** ≈ **30 ns hot, 3× off**, made of:
+  - the source-root ID read, 15 ns;
+  - an `info_span!`: with no subscriber, a callsite load and a branch; with an info subscriber,
+    a span made and dropped in the subscriber's registry, ≈ 100 ns;
+  - interning `InternedSourceRootId`: an FxHash and 2 lines, plus, the first time each root is
+    read in a revision, a CAS on the interned value. That CAS is a shared write on a read path,
+    and every worker reading a file of that root makes it at the start of a revision;
+  - salsa's memo hit, 11 ns.
+- **Requested (block 3):** no span, and the query keyed by the root's `SourceRootInput`, read from
+  its column (L1 loads, no hash, nothing written). Hot it stays ≈ 30 ns: the column read costs
+  what the intern hit did. What it removes is the shared write and the span.
+- **What stands in the way after that:** the dense-input change, and salsa's memo hit (speed-salsa's
+  rows by page). Both are outside base-db.
+
+### `EditionedFileId::parse` (a memo hit)
+
+- **Bound:** one salsa memo hit: 5.4 ns hot, 5.5 ns in throughput cold.
+- **Today:** base-db's part is at the bound:
+  - `returns(ref)`, so no `Parse` clone (round 1);
+  - `EditionedFileId` is interned immortal (`revisions = usize::MAX`), so the key is never
+    validated;
+  - the span and the reparse run only on execution;
+  - 0 allocations (`a_cache_hit_of_parse_allocates_nothing`, `reads_allocate_nothing`).
+
+  The hit itself is salsa's 11 ns, 2× off, closed by rows by page.
+
+### `set_view_root`: a view of \(n\) files, \(k\) of them changed
+
+- **Work:**
+  - for each of the \(n\) files, tell whether it is what it was: its blaze-vfs ID against the
+    one it was last set from;
+  - for the \(k\) changed files, check the given ID against the bytes, set the text input, and
+    update the source root's content ID;
+  - find the files under the base that the view lacks.
+- **Bound:**
+  - **Unchanged file:**
+    - one probe of the base's index by the path: an FxHash of a path of about 40 bytes (about 10
+      cycles), the index slot and the entry (holding the file, its last ID and its mark), and a
+      32-byte compare;
+    - streaming the view's own entry: about 100 bytes (path, ID, slice) at 30 GB/s, ≈ 3 ns.
+    - Files are independent, so their misses overlap: 2 × 5.5 ≈ **11 ns** from DRAM, ≈ 3 ns when
+      the index sits in L3. At about 100 bytes per path, 100k paths are 10 MB, inside a 32 MB
+      L3.
+    - So \(n\) = 100k unchanged files take **≈ 0.4 ms (L3) to 1.4 ms (DRAM)**, with 0 allocations
+      and 0 system calls.
+  - **Removed files:** a pass over \(n\) 4-byte marks: 400 KB / 30 GB/s ≈ **13 µs** at 100k.
+  - **Changed file:**
+    - its bytes through BLAKE3 at the SIMD rate: about 0.5 cycles a byte with AVX-512 on Turin,
+      about 1 on Graviton's NEON, so a 10 KB file is ≈ 1.5 µs;
+    - its text ID: one compression in an 8-lane batch, ≈ 10 ns;
+    - three input writes, ≈ 60 ns;
+    - the root's content ID: \(O(\log n)\) BLAKE3. With 16-way nodes of 512 B, 100k files are 5
+      levels, 2.5 KB, ≈ 0.4 µs.
+    - Total **≈ 2 µs per changed 10 KB file**, and a constant number of allocations.
+  - **System calls:** base-db needs none. The bytes are blaze-vfs's mapping.
+- **Today:**
+  - **Unchanged file:** 0 allocations, 0 locks (one `Mutex` per call), no BLAKE3 (round 1).
+    Then:
+    - a `check_path` scan, about 1 cycle a byte;
+    - the path's FxHash and three probes: the base's `FxIndexMap` (index slot, then entry, then
+      the key's own `Box<str>`: 3 dependent lines), then `in_roots` and `view_ids`, two
+      `FxHashMap`s by `FileId` (a control word and a bucket each, after the entry gives the
+      file).
+    - That is 7 random lines, 5 deep: ≈ 7 × 5.5 ≈ **38 ns from DRAM, 3.5× off** (≈ 2.5× in L3).
+    - On top of that, each call allocates 1 to 2 times, for the base's `VfsPath`.
+  - **Requested (blocks 1 and 2):**
+    - `in_roots` and `view_ids` become direct indexes by file ID (`ByFile`), a line each with no
+      hash;
+    - view bases are keyed by `AbsPathBuf` and looked up by `&AbsPath`, so a call allocates
+      nothing.
+    - Then an unchanged file is the index slot (random) plus four lines that follow the view's
+      order: the entry, the key, `in_roots[file]` and `view_ids[file]`. File IDs and index
+      entries are made in the order paths are first named, and blaze-vfs lists a view sorted,
+      so in the usual case the four stream and only the slot misses. That is ≈ 5.5 + 4 ≈ 10 ns,
+      **at the bound**. A view whose order differs from the order its paths were first named
+      makes the four random: ≈ 27 ns, 2.5×.
+    - The fix for that case is to keep the file, its first root and its last ID in the index
+      entry. That is a second copy of `view_ids` and `in_roots` to keep in step, so it waits
+      for `proof` to show that out-of-order views matter.
+  - **Removed files:** a pass over the marks, at the bound.
+  - **Changed file:**
+    - **Bytes:** hashed once, in one `ContentId::of_many` batch, which is now SIMD across
+      inputs (blaze-ids `many.rs`: 16 lanes on AVX-512 for full blocks, 8 for last blocks). A
+      file over 1 KiB goes through blake3's own SIMD over its chunks. That is at the bound for
+      one file. On a branch switch, though, \(k\) files of 1 to 16 KiB (most source files) are
+      each hashed alone, and a 4 KiB file fills 4 of 16 lanes: up to **4× off** the SIMD rate.
+      The change: `of_many` puts chunks of different inputs into one `hash_many` and merges each
+      input's chunk values after. Owner: lane format (`crates/blaze-ids`).
+    - **Text:** the text ID in one batch (at the bound), and a copy into an `Arc<str>`, 0.3 µs
+      per 10 KB. With the reparse slot that is 2 allocations per file, a constant
+      (`a_changed_file_costs_a_constant`). Reading the text in place from blaze-vfs's mapping
+      is frontend-text's design, and not base-db's alone.
+    - **Root content ID:** the dirty buckets of the root's 64 are hashed again whole, after a
+      walk of each bucket's `BTreeMap` (a heap key per entry).
+      - A 1k-file root has 16 entries a bucket, 1.4 KB, ≈ 0.4 µs: at the bound.
+      - A 100k-file root has 1,560 entries a bucket: 140 KB hashed, ≈ 20 µs, plus about 3,000
+        dependent lines walking it, ≈ 15 µs. That is **≈ 35 µs a changed file, ≈ 80× the
+        bound** for a monorepo-sized root.
+      - The change: the root's content as a tree of 16-way nodes over its sorted keys, with the
+        keys in one arena, so a change rehashes \(\log_{16} n\) nodes of 512 B. It changes the
+        bytes hashed, so `SourceRoot::DOMAIN` and `BUCKET_DOMAIN` go up a version. It is base-db's
+        own design change, not a mechanical edit: the next pass on base-db, after the migration.
+    - **A file added or removed:** the root's `FileSet` is rebuilt, a clone of every path, about
+      50 ns each, so 5 ms for a 100k-file root, against an \(O(\log n)\) bound. `vfs::FileSet`
+      has no `remove`.
+      - The change: `FileSet::remove` (lane vfs, `crates/vfs`), and the root's set edited in
+        place. salsa's setter `.to()` hands back the old `Arc<SourceRoot>`; take it, edit it,
+        and set it back.
+      - It needs every reader to hold the root by reference (`source_root_ref`, blocks 6 and 7),
+        so that the `Arc` is unique when the setter runs.
+  - **Per call:** about 15 to 25 allocations for the batches, a constant
+    (`a_changed_file_costs_a_constant` holds 64 a call and 6 a changed file).
+
+### A crate-graph set (`CrateGraphBuilder::set_in_db`, \(N\) crates, nothing changed)
+
+- **Work:** compare each crate's fields with what is set; set and rehash only what changed, and
+  the crates that depend on it.
+- **Bound:** \(N\) field compares (about 1 KB a crate of dependencies, cfg and env: 35 ns at 30
+  GB/s) and one `CratesMap` probe (about 20 ns): ≈ 60 ns a crate, **≈ 30 µs for 500 crates**, 0
+  allocations. A changed crate adds its own BLAKE3 (about 2 KB, 0.5 µs) and its dependents'.
+- **Today:**
+  - Every crate's data is built again: a `Vec` of dependencies, and clones of `origin`, the
+    attributes and `proc_macro_cwd`.
+  - Every crate's content ID is computed before it is compared: a clone of the root path (and
+    of the `Arc<SourceRoot>`, removed by block 6), a path key, the cfg encoded into two `Vec`s and
+    sorted, the env sorted into a `Vec`, and 1 to 2 KB through BLAKE3.
+  - That is ≈ 12 allocations and ≈ 3 µs a crate: **≈ 1.5 ms for 500 crates, ≈ 50× off**.
+  - It runs on load, and when a manifest or a build script's output changes; never in a query
+    and never on a keystroke. Its budget is a constant per crate, which it meets.
+- **The change:** compare first. Hash only a crate whose fields changed or whose dependencies'
+  IDs changed (a set of changed crates, as `refresh_contents` keeps), and build
+  `BuiltCrateData` only for a crate that changed or is new. base-db's, in the next pass with the
+  root-content tree.
+
+### What queries note (`included_file`, `include_source`, `env_is_read`, `env_is_unset`)
+
+Already noted, each is one FxHash and a probe of a lock-free `Table`: 0 locks, 0 allocations
+(round 1). That is the bound for a lookup by a key the caller holds.
+
+### Summary
+
+| operation | bound | today | off | removes the rest |
+|---|---|---|---|---|
+| file-text read | 1 line + the read's record, 5 ns hot | 8 loads (2 per file), 15 ns, 0 allocations | 3× hot, 2× cold | salsa inputs indexed by a dense key (speed-salsa) |
+| source-root read | 1 per-file line, 8 ns | 2 per-file lines, 30 ns | 3.5× hot, 2× cold | as above |
+| `relevant_crates` hit | 10 ns | 30 ns, a CAS per root per revision, a span | 3× | block 3 (no span, no shared write), then the two above and salsa's hit |
+| `parse` hit | 1 memo hit | 1 memo hit, 0 allocations | 1× (base-db's part) | salsa's hit path |
+| `set_view_root`, unchanged file | 1 probe, 11 ns, 0 allocations | 3 probes, 38 ns, 0 allocations (+1–2 a call) | 3.5× | blocks 1–2: ≈ 10 ns in view order, 0 a call |
+| `set_view_root`, changed file (10 KB) | ≈ 2 µs, a constant of allocations | ≈ 2 µs for a small root, ≈ 35 µs for a 100k-file root; 2 allocations | 1× to 80× by root size | a 16-way tree for the root's content ID |
+| file added or removed | \(O(\log n)\) | \(O(n)\): 5 ms at 100k | large roots only | `FileSet::remove` (lane vfs), the root edited in place |
+| crate-graph set, 500 crates unchanged | 30 µs | 1.5 ms | 50× (setup) | compare before hashing |
+
+The benchmarks:
+- **rustc's `SourceMap`:** an append-only vector behind `FreezeLock` and `RwLock`, which are real
+  locks in the parallel front end. base-db's reads take none. They are within salsa's two-level
+  lookup of the bound.
+- **Unison:** an unchanged definition is compared by hash, never rehashed. `set_view_root`
+  already compares an unchanged file and never hashes it.
+- **git's index:** a stat compare per file, then a hash only of what changed. The bound above is
+  that shape with no stat, since blaze-vfs hands the IDs over. Like git's index, the root's
+  content ID needs a tree (git's `cache-tree`) to be \(O(\log n)\) per change. base-db's 64
+  buckets are one level of that tree, enough up to a few thousand files a root.

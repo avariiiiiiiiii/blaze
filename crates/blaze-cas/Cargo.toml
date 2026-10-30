@@ -17,6 +17,7 @@ doctest = false
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-reclaim.workspace = true
 lz4_flex.workspace = true
 rustc-hash.workspace = true
@@ -24,6 +25,7 @@ serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-v2-proof.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]

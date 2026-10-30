@@ -6,7 +6,7 @@ use test_fixture::WithFixture;
 
 use crate::{
     db::HirDatabase, display::DisplayTarget, mir::MirLowerError,
-    mir_pretty::MirEvalErrorPretty as _, next_solver::GenericArgs, setup_tracing, test_db::TestDB,
+    mir_pretty::MirEvalErrorPretty as _, next_solver::GenericArgs, setup_tracing, test_db::{TestDB, TestDBExt as _},
 };
 
 use crate::mir::{MirEvalError, MirOptLevel, MirOptions, interpret_mir, set_interpreter_mir_opt_level};
@@ -1695,6 +1695,1104 @@ fn main() {
     let loc = core::panic::Location::caller();
     if loc.line() != 1 || loc.column() != 1 {
         should_not_reach();
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn copy_intrinsics() {
+    // `copy` and `volatile_copy_memory` take overlapping ranges either way; the argument order
+    // of the volatile ones is `dst, src`.
+    check_pass(
+        r#"
+//- minicore: coerce_unsized, index, slice, panic
+#[rustc_intrinsic]
+pub unsafe fn copy<T>(src: *const T, dst: *mut T, count: usize);
+#[rustc_intrinsic]
+pub unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize);
+#[rustc_intrinsic]
+pub unsafe fn volatile_copy_memory<T>(dst: *mut T, src: *const T, count: usize);
+#[rustc_intrinsic]
+pub unsafe fn volatile_copy_nonoverlapping_memory<T>(dst: *mut T, src: *const T, count: usize);
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut x = [1i32, 2, 3, 4, 5];
+        let p = &mut x as *mut [i32; 5] as *mut i32;
+        copy((p as usize + 4) as *const i32, p, 3);
+        if x[0] != 2 || x[1] != 3 || x[2] != 4 || x[3] != 4 || x[4] != 5 {
+            should_not_reach();
+        }
+        copy(p as *const i32, (p as usize + 8) as *mut i32, 3);
+        if x[0] != 2 || x[1] != 3 || x[2] != 2 || x[3] != 3 || x[4] != 4 {
+            should_not_reach();
+        }
+        volatile_copy_memory((p as usize + 4) as *mut i32, p as *const i32, 4);
+        if x[0] != 2 || x[1] != 2 || x[2] != 3 || x[3] != 2 || x[4] != 3 {
+            should_not_reach();
+        }
+
+        let src = [(1u8, 2u16), (3, 4)];
+        let mut dst = [(0u8, 0u16); 3];
+        let s = &src as *const [(u8, u16); 2] as *const (u8, u16);
+        let d = &mut dst as *mut [(u8, u16); 3] as *mut (u8, u16);
+        copy_nonoverlapping(s, (d as usize + 4) as *mut (u8, u16), 2);
+        if dst[0].0 != 0 || dst[0].1 != 0 || dst[1].0 != 1 || dst[1].1 != 2 {
+            should_not_reach();
+        }
+        if dst[2].0 != 3 || dst[2].1 != 4 {
+            should_not_reach();
+        }
+        copy_nonoverlapping(s, d, 0);
+        if dst[0].0 != 0 || dst[0].1 != 0 {
+            should_not_reach();
+        }
+
+        let mut y = 0u64;
+        volatile_copy_nonoverlapping_memory(&mut y, &0x1122_3344_5566_7788u64, 1);
+        if y != 0x1122_3344_5566_7788 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn write_bytes_intrinsics() {
+    check_pass(
+        r#"
+//- minicore: coerce_unsized, index, slice, panic
+#[rustc_intrinsic]
+pub unsafe fn write_bytes<T>(dst: *mut T, val: u8, count: usize);
+#[rustc_intrinsic]
+pub unsafe fn volatile_set_memory<T>(dst: *mut T, val: u8, count: usize);
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut x = [0x1111_1111u32; 4];
+        let p = &mut x as *mut [u32; 4] as *mut u32;
+        write_bytes((p as usize + 4) as *mut u32, 0xab, 2);
+        if x[0] != 0x1111_1111 || x[1] != 0xabab_abab || x[2] != 0xabab_abab {
+            should_not_reach();
+        }
+        if x[3] != 0x1111_1111 {
+            should_not_reach();
+        }
+        volatile_set_memory(p, 0, 1);
+        if x[0] != 0 || x[1] != 0xabab_abab || x[3] != 0x1111_1111 {
+            should_not_reach();
+        }
+        write_bytes(p, 0xff, 0);
+        if x[0] != 0 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn read_and_write_intrinsics() {
+    // The unaligned ones read and write a `u32` at an odd address.
+    check_pass(
+        r#"
+//- minicore: coerce_unsized, index, slice, panic
+#[rustc_intrinsic]
+pub unsafe fn read_via_copy<T>(ptr: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn write_via_move<T>(ptr: *mut T, value: T);
+#[rustc_intrinsic]
+pub unsafe fn volatile_load<T>(src: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn volatile_store<T>(dst: *mut T, val: T);
+#[rustc_intrinsic]
+pub unsafe fn unaligned_volatile_load<T>(src: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn unaligned_volatile_store<T>(dst: *mut T, val: T);
+
+struct Pair {
+    a: u8,
+    b: u32,
+}
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut x = 0x1234_5678u32;
+        if read_via_copy(&x) != 0x1234_5678 {
+            should_not_reach();
+        }
+        write_via_move(&mut x, 7);
+        if x != 7 {
+            should_not_reach();
+        }
+        volatile_store(&mut x, 0xffff_fffe);
+        if x != 0xffff_fffe || volatile_load(&x) != 0xffff_fffe {
+            should_not_reach();
+        }
+
+        let mut p = Pair { a: 1, b: 2 };
+        let q = read_via_copy(&p);
+        if q.a != 1 || q.b != 2 {
+            should_not_reach();
+        }
+        write_via_move(&mut p, Pair { a: 3, b: 4 });
+        if p.a != 3 || p.b != 4 {
+            should_not_reach();
+        }
+        volatile_store(&mut p, Pair { a: 5, b: 6 });
+        let r = volatile_load(&p);
+        if r.a != 5 || r.b != 6 {
+            should_not_reach();
+        }
+
+        let mut bytes = [0u8; 8];
+        let base = &mut bytes as *mut [u8; 8] as usize;
+        unaligned_volatile_store((base + 1) as *mut u32, 0x0403_0201);
+        if bytes[0] != 0 || bytes[1] != 1 || bytes[2] != 2 || bytes[3] != 3 || bytes[4] != 4 {
+            should_not_reach();
+        }
+        if bytes[5] != 0 {
+            should_not_reach();
+        }
+        if unaligned_volatile_load((base + 1) as *const u32) != 0x0403_0201 {
+            should_not_reach();
+        }
+        if unaligned_volatile_load((base + 2) as *const u16) != 0x0302 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn typed_swap_nonoverlapping_intrinsic() {
+    // Two halves of one array touch but do not overlap; a zero-sized value may swap with itself.
+    check_pass(
+        r#"
+//- minicore: coerce_unsized, index, slice, panic
+#[rustc_intrinsic]
+pub unsafe fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T);
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut a = (1u8, 0x0102_0304_0506_0708u64);
+        let mut b = (9u8, 7u64);
+        typed_swap_nonoverlapping(&mut a, &mut b);
+        if a.0 != 9 || a.1 != 7 || b.0 != 1 || b.1 != 0x0102_0304_0506_0708 {
+            should_not_reach();
+        }
+
+        let mut x = [1u32, 2, 3, 4];
+        let p = &mut x as *mut [u32; 4] as *mut [u32; 2];
+        typed_swap_nonoverlapping(p, (p as usize + 8) as *mut [u32; 2]);
+        if x[0] != 3 || x[1] != 4 || x[2] != 1 || x[3] != 2 {
+            should_not_reach();
+        }
+
+        let mut u = ();
+        let pu = &mut u as *mut ();
+        typed_swap_nonoverlapping(pu, pu);
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn typed_swap_nonoverlapping_of_overlapping_ranges() {
+    check_error_with(
+        r#"
+#[rustc_intrinsic]
+pub unsafe fn typed_swap_nonoverlapping<T>(x: *mut T, y: *mut T);
+
+fn main() {
+    let mut x = [1u32, 2, 3];
+    let p = &mut x as *mut [u32; 3] as *mut [u32; 2];
+    unsafe {
+        typed_swap_nonoverlapping(p, (p as usize + 4) as *mut [u32; 2]);
+    }
+}
+"#,
+        |e| {
+            let mut err = &e;
+            while let MirEvalError::InFunction(inner, _) = err {
+                err = inner;
+            }
+            matches!(err, MirEvalError::UndefinedBehavior(_))
+        },
+    );
+}
+
+#[test]
+fn raw_eq_intrinsic() {
+    check_pass(
+        r#"
+//- minicore: panic
+#[rustc_intrinsic]
+pub unsafe fn raw_eq<T>(a: &T, b: &T) -> bool;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        if !raw_eq(&[1u8, 2, 3], &[1u8, 2, 3]) {
+            should_not_reach();
+        }
+        if raw_eq(&[1u8, 2, 3], &[1u8, 2, 4]) {
+            should_not_reach();
+        }
+        if raw_eq(&0x0102u16, &0x0201u16) {
+            should_not_reach();
+        }
+        if !raw_eq(&[7u64, 9], &[7u64, 9]) || raw_eq(&[7u64, 9], &[7u64, 8]) {
+            should_not_reach();
+        }
+        if !raw_eq(&(), &()) {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn ptr_mask_intrinsic() {
+    // A `[u32; 4]` is at an address aligned to 4, so masking the low two bits of an address
+    // inside its third element gives that element.
+    check_pass(
+        r#"
+//- minicore: panic
+#[rustc_intrinsic]
+pub fn ptr_mask<T>(ptr: *const T, mask: usize) -> *const T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    let x = [10u32, 20, 30, 40];
+    let p = &x as *const [u32; 4] as *const u32;
+    unsafe {
+        let masked = ptr_mask((p as usize + 9) as *const u32, !3);
+        if masked as usize != p as usize + 8 || *masked != 30 {
+            should_not_reach();
+        }
+        let same = ptr_mask(p, !0);
+        if same as usize != p as usize || *same != 10 {
+            should_not_reach();
+        }
+        if ptr_mask(p, 0) as usize != 0 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn compare_bytes_intrinsic() {
+    // The bytes compare unsigned, and the order is -1, 0 or 1.
+    check_pass(
+        r#"
+//- minicore: panic
+#[rustc_intrinsic]
+pub unsafe fn compare_bytes(left: *const u8, right: *const u8, bytes: usize) -> i32;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    let a = [1u8, 2, 3, 200];
+    let b = [1u8, 2, 4, 0];
+    let pa = &a as *const [u8; 4] as *const u8;
+    let pb = &b as *const [u8; 4] as *const u8;
+    unsafe {
+        if compare_bytes(pa, pb, 4) != -1 || compare_bytes(pb, pa, 4) != 1 {
+            should_not_reach();
+        }
+        if compare_bytes(pa, pb, 2) != 0 || compare_bytes(pa, pb, 0) != 0 {
+            should_not_reach();
+        }
+        let a3 = (pa as usize + 3) as *const u8;
+        let b3 = (pb as usize + 3) as *const u8;
+        if compare_bytes(a3, b3, 1) != 1 || compare_bytes(b3, a3, 1) != -1 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn offset_and_arith_offset_intrinsics() {
+    // `offset` by a negative `isize`, and `arith_offset` far past the end and back.
+    check_pass(
+        r#"
+//- minicore: panic
+#[rustc_intrinsic]
+pub unsafe fn offset<Ptr, Delta>(dst: Ptr, offset: Delta) -> Ptr;
+#[rustc_intrinsic]
+pub unsafe fn arith_offset<T>(dst: *const T, offset: isize) -> *const T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    let x = [10u16, 20, 30, 40, 50];
+    let first = &x as *const [u16; 5] as *const u16;
+    unsafe {
+        let last = offset(first, 4usize);
+        if *last != 50 || last as usize != first as usize + 8 {
+            should_not_reach();
+        }
+        let back = offset(last, -3isize);
+        if *back != 20 || back as usize != first as usize + 2 {
+            should_not_reach();
+        }
+        if *offset(back, -1isize) != 10 {
+            should_not_reach();
+        }
+
+        let far = arith_offset(first, 1000);
+        if far as usize != first as usize + 2000 {
+            should_not_reach();
+        }
+        let near = arith_offset(far, -997);
+        if *near != 40 || near as usize != first as usize + 6 {
+            should_not_reach();
+        }
+        let before = arith_offset(first, -5);
+        if before as usize != first as usize - 10 || *arith_offset(before, 7) != 30 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn extern_c_memory_functions() {
+    // `memcpy`, `memmove` and `memset` return their destination; `memset` writes the low byte
+    // of its `c_int`.
+    check_pass(
+        r#"
+//- minicore: coerce_unsized, index, slice, panic
+type c_void = u8;
+type c_int = i32;
+
+extern "C" {
+    fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
+    fn memset(s: *mut c_void, c: c_int, n: usize) -> *mut c_void;
+    fn memcmp(s1: *const c_void, s2: *const c_void, n: usize) -> c_int;
+    fn strlen(s: *const u8) -> usize;
+}
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let src = [1u8, 2, 3, 4];
+        let mut dst = [0u8; 6];
+        let s = &src as *const [u8; 4] as *const u8;
+        let d = &mut dst as *mut [u8; 6] as *mut u8;
+        let r = memcpy((d as usize + 1) as *mut u8, s, 4);
+        if r as usize != d as usize + 1 {
+            should_not_reach();
+        }
+        if dst[0] != 0 || dst[1] != 1 || dst[2] != 2 || dst[3] != 3 || dst[4] != 4 || dst[5] != 0 {
+            should_not_reach();
+        }
+
+        let mut buf = [1u8, 2, 3, 4, 5, 6];
+        let b = &mut buf as *mut [u8; 6] as *mut u8;
+        let r = memmove((b as usize + 2) as *mut u8, b, 4);
+        if r as usize != b as usize + 2 {
+            should_not_reach();
+        }
+        if buf[0] != 1 || buf[1] != 2 || buf[2] != 1 || buf[3] != 2 || buf[4] != 3 || buf[5] != 4 {
+            should_not_reach();
+        }
+        let r = memmove(b, (b as usize + 1) as *const u8, 5);
+        if r as usize != b as usize {
+            should_not_reach();
+        }
+        if buf[0] != 2 || buf[1] != 1 || buf[2] != 2 || buf[3] != 3 || buf[4] != 4 || buf[5] != 4 {
+            should_not_reach();
+        }
+
+        let mut z = [7u8; 5];
+        let p = &mut z as *mut [u8; 5] as *mut u8;
+        let r = memset((p as usize + 1) as *mut u8, 0x1ab, 3);
+        if r as usize != p as usize + 1 {
+            should_not_reach();
+        }
+        if z[0] != 7 || z[1] != 0xab || z[2] != 0xab || z[3] != 0xab || z[4] != 7 {
+            should_not_reach();
+        }
+        let r = memset(p, 0, 0);
+        if r as usize != p as usize || z[0] != 7 {
+            should_not_reach();
+        }
+
+        let other = [1u8, 2, 9, 0];
+        let o = &other as *const [u8; 4] as *const u8;
+        if memcmp(s, o, 4) >= 0 || memcmp(o, s, 3) <= 0 {
+            should_not_reach();
+        }
+        if memcmp(s, o, 2) != 0 || memcmp(s, o, 0) != 0 {
+            should_not_reach();
+        }
+
+        let hello = b"hello\0";
+        if strlen(hello as *const _) != 5 || strlen(b"\0" as *const _) != 0 {
+            should_not_reach();
+        }
+        if strlen((hello as *const [u8; 6] as usize + 2) as *const u8) != 3 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn suffix_atomic_loads_stores_exchanges_and_fences() {
+    check_pass(
+        r#"
+//- minicore: copy, panic
+#[rustc_intrinsic]
+pub unsafe fn atomic_load_relaxed<T: Copy>(src: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_load_acquire<T: Copy>(src: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_load_seqcst<T: Copy>(src: *const T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_store_relaxed<T: Copy>(dst: *mut T, val: T);
+#[rustc_intrinsic]
+pub unsafe fn atomic_store_release<T: Copy>(dst: *mut T, val: T);
+#[rustc_intrinsic]
+pub unsafe fn atomic_store_seqcst<T: Copy>(dst: *mut T, val: T);
+#[rustc_intrinsic]
+pub unsafe fn atomic_xchg_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xchg_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xchg_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xchg_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xchg_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_fence_acquire();
+#[rustc_intrinsic]
+pub unsafe fn atomic_fence_release();
+#[rustc_intrinsic]
+pub unsafe fn atomic_fence_acqrel();
+#[rustc_intrinsic]
+pub unsafe fn atomic_fence_seqcst();
+#[rustc_intrinsic]
+pub unsafe fn atomic_singlethreadfence_acquire();
+#[rustc_intrinsic]
+pub unsafe fn atomic_singlethreadfence_release();
+#[rustc_intrinsic]
+pub unsafe fn atomic_singlethreadfence_acqrel();
+#[rustc_intrinsic]
+pub unsafe fn atomic_singlethreadfence_seqcst();
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut a = 0u8;
+        atomic_store_relaxed(&mut a, 200);
+        if a != 200 || atomic_load_relaxed(&a) != 200 {
+            should_not_reach();
+        }
+        atomic_fence_acquire();
+        if atomic_xchg_relaxed(&mut a, 7) != 200 || a != 7 {
+            should_not_reach();
+        }
+        if atomic_xchg_seqcst(&mut a, 255) != 7 || atomic_load_seqcst(&a) != 255 {
+            should_not_reach();
+        }
+
+        let mut b = 0u32;
+        atomic_store_release(&mut b, 0xdead_beef);
+        atomic_fence_release();
+        if b != 0xdead_beef || atomic_load_acquire(&b) != 0xdead_beef {
+            should_not_reach();
+        }
+        if atomic_xchg_acquire(&mut b, 1) != 0xdead_beef || b != 1 {
+            should_not_reach();
+        }
+
+        let mut c = 0usize;
+        atomic_store_seqcst(&mut c, !0usize);
+        atomic_fence_acqrel();
+        if c != !0usize || atomic_load_seqcst(&c) != !0usize {
+            should_not_reach();
+        }
+        if atomic_xchg_release(&mut c, 12) != !0usize || atomic_load_relaxed(&c) != 12 {
+            should_not_reach();
+        }
+
+        let mut d = 0i32;
+        atomic_store_relaxed(&mut d, -9);
+        atomic_fence_seqcst();
+        atomic_singlethreadfence_acquire();
+        atomic_singlethreadfence_release();
+        atomic_singlethreadfence_acqrel();
+        atomic_singlethreadfence_seqcst();
+        if atomic_load_acquire(&d) != -9 {
+            should_not_reach();
+        }
+        if atomic_xchg_acqrel(&mut d, 5) != -9 || d != 5 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn suffix_atomic_add_and_sub() {
+    // Both wrap at the width of the type.
+    check_pass(
+        r#"
+//- minicore: copy, panic
+#[rustc_intrinsic]
+pub unsafe fn atomic_xadd_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xadd_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xadd_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xadd_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xadd_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xsub_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xsub_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xsub_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xsub_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xsub_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut a = 250u8;
+        if atomic_xadd_relaxed(&mut a, 10) != 250 || a != 4 {
+            should_not_reach();
+        }
+        if atomic_xsub_acquire(&mut a, 5) != 4 || a != 255 {
+            should_not_reach();
+        }
+        if atomic_xsub_relaxed(&mut a, 255) != 255 || a != 0 {
+            should_not_reach();
+        }
+
+        let mut b = 1u32;
+        if atomic_xadd_acquire(&mut b, 0xffff_ffff) != 1 || b != 0 {
+            should_not_reach();
+        }
+        if atomic_xsub_release(&mut b, 1) != 0 || b != 0xffff_ffff {
+            should_not_reach();
+        }
+
+        let mut c = 100usize;
+        if atomic_xadd_release(&mut c, 23) != 100 || c != 123 {
+            should_not_reach();
+        }
+        if atomic_xsub_acqrel(&mut c, 123) != 123 || c != 0 {
+            should_not_reach();
+        }
+
+        let mut d = -5i32;
+        if atomic_xadd_acqrel(&mut d, 3) != -5 || d != -2 {
+            should_not_reach();
+        }
+        if atomic_xsub_seqcst(&mut d, -10) != -2 || d != 8 {
+            should_not_reach();
+        }
+        if atomic_xadd_seqcst(&mut d, 2147483647) != 8 || d != -2147483641 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn suffix_atomic_bitwise() {
+    check_pass(
+        r#"
+//- minicore: copy, panic
+#[rustc_intrinsic]
+pub unsafe fn atomic_and_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_and_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_and_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_and_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_and_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_nand_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_nand_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_nand_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_nand_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_nand_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_or_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_or_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_or_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_or_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_or_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xor_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xor_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xor_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xor_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_xor_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut a = 0b1100_1010u8;
+        if atomic_and_relaxed(&mut a, 0b1010_0110) != 0b1100_1010 || a != 0b1000_0010 {
+            should_not_reach();
+        }
+        if atomic_nand_acquire(&mut a, 0x80) != 0b1000_0010 || a != 0x7f {
+            should_not_reach();
+        }
+        if atomic_or_release(&mut a, 0x80) != 0x7f || a != 0xff {
+            should_not_reach();
+        }
+        if atomic_xor_acqrel(&mut a, 0x0f) != 0xff || a != 0xf0 {
+            should_not_reach();
+        }
+        if atomic_and_seqcst(&mut a, 0x3c) != 0xf0 || a != 0x30 {
+            should_not_reach();
+        }
+        if atomic_nand_relaxed(&mut a, 0x30) != 0x30 || a != 0xcf {
+            should_not_reach();
+        }
+        if atomic_or_acquire(&mut a, 0x30) != 0xcf || a != 0xff {
+            should_not_reach();
+        }
+        if atomic_xor_release(&mut a, 0xaa) != 0xff || a != 0x55 {
+            should_not_reach();
+        }
+
+        let mut b = 0xffff_0000u32;
+        if atomic_and_acquire(&mut b, 0x0ff0_0ff0) != 0xffff_0000 || b != 0x0ff0_0000 {
+            should_not_reach();
+        }
+        if atomic_nand_release(&mut b, 0x0f00_0000) != 0x0ff0_0000 || b != 0xf0ff_ffff {
+            should_not_reach();
+        }
+        if atomic_or_acqrel(&mut b, 0x0f00_0000) != 0xf0ff_ffff || b != 0xffff_ffff {
+            should_not_reach();
+        }
+        if atomic_xor_seqcst(&mut b, 0xffff_ffff) != 0xffff_ffff || b != 0 {
+            should_not_reach();
+        }
+
+        let mut c = 6usize;
+        if atomic_and_release(&mut c, 3) != 6 || c != 2 {
+            should_not_reach();
+        }
+        if atomic_nand_acqrel(&mut c, 3) != 2 || c != !2usize {
+            should_not_reach();
+        }
+        if atomic_or_seqcst(&mut c, 2) != !2usize || c != !0usize {
+            should_not_reach();
+        }
+        if atomic_xor_relaxed(&mut c, !0usize) != !0usize || c != 0 {
+            should_not_reach();
+        }
+
+        let mut d = -1i32;
+        if atomic_and_acqrel(&mut d, 2147483647) != -1 || d != 2147483647 {
+            should_not_reach();
+        }
+        if atomic_nand_seqcst(&mut d, -1) != 2147483647 || d != !2147483647 {
+            should_not_reach();
+        }
+        if atomic_or_relaxed(&mut d, 1) != !2147483647 || d != -2147483647 {
+            should_not_reach();
+        }
+        if atomic_xor_acquire(&mut d, -1) != -2147483647 || d != 2147483646 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn suffix_atomic_max_and_min() {
+    // `max` and `min` compare as signed numbers (on `i32`), `umax` and `umin` as unsigned ones:
+    // each step's operand is one the other comparison would order the other way.
+    check_pass(
+        r#"
+//- minicore: copy, panic
+#[rustc_intrinsic]
+pub unsafe fn atomic_max_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_max_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_max_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_max_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_max_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_min_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_min_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_min_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_min_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_min_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umax_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umax_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umax_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umax_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umax_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umin_relaxed<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umin_acquire<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umin_release<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umin_acqrel<T: Copy>(dst: *mut T, src: T) -> T;
+#[rustc_intrinsic]
+pub unsafe fn atomic_umin_seqcst<T: Copy>(dst: *mut T, src: T) -> T;
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut d = -5i32;
+        if atomic_max_relaxed(&mut d, -10) != -5 || d != -5 {
+            should_not_reach();
+        }
+        if atomic_max_acquire(&mut d, 3) != -5 || d != 3 {
+            should_not_reach();
+        }
+        if atomic_max_release(&mut d, -1) != 3 || d != 3 {
+            should_not_reach();
+        }
+        if atomic_max_acqrel(&mut d, 2147483647) != 3 || d != 2147483647 {
+            should_not_reach();
+        }
+        if atomic_max_seqcst(&mut d, !2147483647) != 2147483647 || d != 2147483647 {
+            should_not_reach();
+        }
+        if atomic_min_relaxed(&mut d, 2147483646) != 2147483647 || d != 2147483646 {
+            should_not_reach();
+        }
+        if atomic_min_acquire(&mut d, -1) != 2147483646 || d != -1 {
+            should_not_reach();
+        }
+        if atomic_min_release(&mut d, 0) != -1 || d != -1 {
+            should_not_reach();
+        }
+        if atomic_min_acqrel(&mut d, !2147483647) != -1 || d != !2147483647 {
+            should_not_reach();
+        }
+        if atomic_min_seqcst(&mut d, 5) != !2147483647 || d != !2147483647 {
+            should_not_reach();
+        }
+
+        let mut a = 100u8;
+        if atomic_umax_relaxed(&mut a, 200) != 100 || a != 200 {
+            should_not_reach();
+        }
+        if atomic_umin_acquire(&mut a, 255) != 200 || a != 200 {
+            should_not_reach();
+        }
+        if atomic_umin_relaxed(&mut a, 7) != 200 || a != 7 {
+            should_not_reach();
+        }
+        if atomic_umax_seqcst(&mut a, 6) != 7 || a != 7 {
+            should_not_reach();
+        }
+
+        let mut b = 1u32;
+        if atomic_umax_acquire(&mut b, 0x8000_0000) != 1 || b != 0x8000_0000 {
+            should_not_reach();
+        }
+        if atomic_umin_release(&mut b, 0xffff_ffff) != 0x8000_0000 || b != 0x8000_0000 {
+            should_not_reach();
+        }
+        if atomic_umin_acqrel(&mut b, 2) != 0x8000_0000 || b != 2 {
+            should_not_reach();
+        }
+
+        let mut c = 5usize;
+        if atomic_umax_release(&mut c, !0usize) != 5 || c != !0usize {
+            should_not_reach();
+        }
+        if atomic_umax_acqrel(&mut c, 1) != !0usize || c != !0usize {
+            should_not_reach();
+        }
+        if atomic_umin_seqcst(&mut c, 9) != !0usize || c != 9 {
+            should_not_reach();
+        }
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn suffix_atomic_compare_exchange() {
+    // Every success and failure ordering of `cxchg` and `cxchgweak`, each type with a success
+    // and a failure; the evaluator's weak exchange never fails spuriously.
+    check_pass(
+        r#"
+//- minicore: copy, panic
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_relaxed_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_relaxed_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_relaxed_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acquire_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acquire_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acquire_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_release_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_release_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_release_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acqrel_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acqrel_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_acqrel_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_seqcst_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_seqcst_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchg_seqcst_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_relaxed_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_relaxed_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_relaxed_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acquire_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acquire_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acquire_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_release_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_release_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_release_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acqrel_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acqrel_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_acqrel_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_seqcst_relaxed<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_seqcst_acquire<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+#[rustc_intrinsic]
+pub unsafe fn atomic_cxchgweak_seqcst_seqcst<T: Copy>(dst: *mut T, old: T, src: T) -> (T, bool);
+
+fn should_not_reach() { panic!() }
+
+fn main() {
+    unsafe {
+        let mut a = 1u8;
+        let (old, ok) = atomic_cxchg_relaxed_relaxed(&mut a, 1, 2);
+        if old != 1 || !ok || a != 2 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_relaxed_acquire(&mut a, 1, 3);
+        if old != 2 || ok || a != 2 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_relaxed_seqcst(&mut a, 2, 255);
+        if old != 2 || !ok || a != 255 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_acquire_relaxed(&mut a, 254, 0);
+        if old != 255 || ok || a != 255 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_relaxed_relaxed(&mut a, 255, 0);
+        if old != 255 || !ok || a != 0 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_relaxed_acquire(&mut a, 1, 9);
+        if old != 0 || ok || a != 0 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_relaxed_seqcst(&mut a, 0, 9);
+        if old != 0 || !ok || a != 9 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acquire_relaxed(&mut a, 0, 1);
+        if old != 9 || ok || a != 9 {
+            should_not_reach();
+        }
+
+        let mut b = 0xffff_ffffu32;
+        let (old, ok) = atomic_cxchg_acquire_acquire(&mut b, 0xffff_ffff, 0);
+        if old != 0xffff_ffff || !ok || b != 0 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_acquire_seqcst(&mut b, 0xffff_ffff, 1);
+        if old != 0 || ok || b != 0 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_release_relaxed(&mut b, 0, 0x1234_5678);
+        if old != 0 || !ok || b != 0x1234_5678 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_release_acquire(&mut b, 0x1234_5679, 5);
+        if old != 0x1234_5678 || ok || b != 0x1234_5678 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acquire_acquire(&mut b, 0x1234_5678, 7);
+        if old != 0x1234_5678 || !ok || b != 7 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acquire_seqcst(&mut b, 8, 1);
+        if old != 7 || ok || b != 7 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_release_relaxed(&mut b, 7, 8);
+        if old != 7 || !ok || b != 8 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_release_acquire(&mut b, 7, 9);
+        if old != 8 || ok || b != 8 {
+            should_not_reach();
+        }
+
+        let mut c = 0usize;
+        let (old, ok) = atomic_cxchg_release_seqcst(&mut c, 0, !0usize);
+        if old != 0 || !ok || c != !0usize {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_acqrel_relaxed(&mut c, 0, 1);
+        if old != !0usize || ok || c != !0usize {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_acqrel_acquire(&mut c, !0usize, 3);
+        if old != !0usize || !ok || c != 3 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_acqrel_seqcst(&mut c, 4, 5);
+        if old != 3 || ok || c != 3 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_release_seqcst(&mut c, 3, 4);
+        if old != 3 || !ok || c != 4 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acqrel_relaxed(&mut c, 3, 5);
+        if old != 4 || ok || c != 4 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acqrel_acquire(&mut c, 4, 6);
+        if old != 4 || !ok || c != 6 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_acqrel_seqcst(&mut c, 4, 7);
+        if old != 6 || ok || c != 6 {
+            should_not_reach();
+        }
+
+        let mut d = -1i32;
+        let (old, ok) = atomic_cxchg_seqcst_relaxed(&mut d, -1, 7);
+        if old != -1 || !ok || d != 7 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_seqcst_acquire(&mut d, -1, 8);
+        if old != 7 || ok || d != 7 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchg_seqcst_seqcst(&mut d, 7, !2147483647);
+        if old != 7 || !ok || d != !2147483647 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_seqcst_relaxed(&mut d, 2147483647, 0);
+        if old != !2147483647 || ok || d != !2147483647 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_seqcst_acquire(&mut d, !2147483647, -2);
+        if old != !2147483647 || !ok || d != -2 {
+            should_not_reach();
+        }
+        let (old, ok) = atomic_cxchgweak_seqcst_seqcst(&mut d, 2, 3);
+        if old != -2 || ok || d != -2 {
+            should_not_reach();
+        }
     }
 }
 "#,

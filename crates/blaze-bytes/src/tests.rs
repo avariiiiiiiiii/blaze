@@ -4,6 +4,7 @@ use std::{
 };
 
 use blaze_alloc_count::assert_at_most;
+use blaze_ids::rng::SplitMix64;
 
 use crate::{Bytes, Text, ascii_prefix, check, text_of};
 
@@ -13,18 +14,12 @@ use crate::{Bytes, Text, ascii_prefix, check, text_of};
 fn the_check_is_stds() {
     const PIECES: [&[u8]; 9] =
         [b"a", b"fn x() {}\n", b"\xc3\xa9", b"\xe2\x82\xac", b"\xf0\x9f\xa6\x80", b"\x80", b"\xc3", b"\xff", b"\xed\xa0\x80"];
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move |below: u64| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state % below
-    };
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..4000 {
-        let mut bytes = vec![b'x'; next(300) as usize];
-        for _ in 0..next(4) {
-            let piece = PIECES[next(PIECES.len() as u64) as usize];
-            let at = next(bytes.len() as u64 + 1) as usize;
+        let mut bytes = vec![b'x'; rng.index(300)];
+        for _ in 0..rng.index(4) {
+            let piece = PIECES[rng.index(PIECES.len())];
+            let at = rng.index(bytes.len() + 1);
             bytes.splice(at..at, piece.iter().copied());
         }
         assert_eq!(check(&bytes), std::str::from_utf8(&bytes).map(drop), "{bytes:?}");

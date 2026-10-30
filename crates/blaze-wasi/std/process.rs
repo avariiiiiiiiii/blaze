@@ -299,7 +299,8 @@ impl Run {
 
 /// Has the host run `request` ([`blaze_run_tool`]).
 fn call(request: &[u8]) -> Result<Ran, (io::ErrorKind, String)> {
-    // SAFETY: `request` is readable for its length.
+    // SAFETY: `request` is borrowed for the call, so its `request.len()` bytes at
+    // `request.as_ptr()` stay live and unchanged; the host only reads them, during the call.
     let len = unsafe { blaze_run_tool(request.as_ptr(), request.len()) };
     let Ok(len) = usize::try_from(len) else {
         return Err((io::ErrorKind::InvalidInput, "blaze: the host could not read the command".into()));

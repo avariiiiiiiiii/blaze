@@ -347,7 +347,7 @@ fn library_of(cx: &Cx<'_, '_>, krate: hir::Crate) -> Library {
     if !krate.is_unstable_feature_enabled(cx.db, &intern::sym::staged_api) {
         return Library::default();
     }
-    let dependency = Cx::new(cx.sema, krate, &NoSpans);
+    let dependency = Cx::new(cx.sema, krate, &NoSpans, cx.frame());
     let walk = Walk::of(&dependency);
     collect(&owners(&dependency, &walk), None)
 }

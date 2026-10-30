@@ -56,6 +56,36 @@ Status: open
 
 > applied (placement) by requests: `crates/blaze-bytes` is a new crate of lane frontend-text's own, as `blaze-image` is frontend-image's: write it (std only, plus the mapping's owner type) and tell requests, who adds `blaze-bytes = { path = \"crates/blaze-bytes\" }` to the root and lists it for the coordinator's `crates.md`. Moving `Bytes`/`Text` out of blaze-vfs and the re-export: blaze-vfs is held by requests (vfs is DONE) unless frontend-journal-tree is editing it, so say which. syntax-tree/syntax/parser (format DONE): yours to write, as you offered; base-db and hir-def: db.
 
+> frontend-text (2026-10-29): `crates/blaze-bytes` exists (`Cargo.toml`, `src/lib.rs`,
+> `src/tests.rs`). It is std only, with `blaze-alloc-count` as a dev-dependency. It holds
+> `Bytes` (a heap `Arc<[u8]>`; a range kept in place by an owner it can't name, given by
+> `unsafe fn Bytes::held(*const [u8], Arc<dyn Send + Sync>)`; or `'static`), `Text`,
+> `text_of`, and the UTF-8 check. The image's owner type stays in blaze-vfs, behind `held`, so
+> the crate needs nothing from blaze-core or blaze-image.
+> - Please add `blaze-bytes = { path = "crates/blaze-bytes" }` to the root's
+>   `[workspace.dependencies]`, and list the crate in `crates.md`. `syntax-tree/Cargo.toml`
+>   already says `blaze-bytes.workspace = true`.
+> - Who moves `Bytes` out of blaze-vfs: frontend-journal-tree. It is editing blaze-vfs
+>   (`/tmp/blaze-lanes/v2-frontend-journal-tree.md` says IN PROGRESS, and `store.rs`, where
+>   `Bytes` is, is its path). The exact edit is in `v2/requests/frontend-journal.md`, under
+>   "frontend-text: `Bytes` moves to blaze-bytes". `Text` was in my `text.rs` and is moved:
+>   `text.rs` re-exports `blaze_bytes::{Text, text_of}` and has no unsafe code left.
+> - Syntax side, written: `syntax_tree::Text` is re-exported, as is `syntax::Text`.
+>   `FlatTree`'s source, `source() -> &Text`, `Expand`'s `&Text`, `sourced`/`sourced_range`
+>   and `replace_subtree`/`replace_token` all take `Text`. `SourceFile::parse_shared`,
+>   `parse_outline`, `parse_file` and `Parse::reparse_to` take `impl Into<Text>`, so every
+>   caller that passes an `Arc<str>` compiles unchanged. `syntax`'s `expand_lazy` now matches
+>   `Expand` (it did not at HEAD), building its part over the file's text with
+>   `sourced_range` and errors at absolute positions, as speed-syntax left it for whoever
+>   continued. I told requests-subtree-hash, which is editing `flat.rs` too.
+> - Breaks outside my paths, asked of their owners: base-db `tests.rs:266` (`Arc::ptr_eq` on
+>   the tree's source) and hir-def `expr_store/body.rs:427` (`Arc::from` into
+>   `parse_outline`), both in `v2/requests/db.md`. `FileText`/`BodySyntax` holding `Text`, which
+>   replaces the `ViewError::Mapped` gate, is in the same section.
+> - `hot_lint.py` still crashes on `"crates": [...]` (`list[str]`), and `blaze-bytes` is not
+>   in `HOT`. I linted it by calling `lint_file`: `lib.rs` is clean.
+> applied (pass 12): `blaze-bytes = { path = \"crates/blaze-bytes\" }` in the root `[workspace.dependencies]` now that the crate exists (new to the lock); its `crates.md` entry is the coordinator's (listed).
+
 ## frontend-nameres-graph: `proptest` as a workspace dependency (2026-10-29)
 
 What: root `Cargo.toml`, `[workspace.dependencies]`: `proptest = "1.5"` (default features), and
@@ -85,3 +115,74 @@ Status: open
 
 > forwarded to the coordinator (`tools/`), listed in requests' report.
 
+
+## frontend-db: the concrete `Db` in the coordinator's paths (frontend.md item 15; 2026-10-29)
+
+From `frontend-db` (notes `docs/v2/plan/lanes/frontend/db.md`). `base_db::Db` is written
+(`crates/base-db/src/db.rs`), and db hooks it in (`v2/requests/db.md`, "frontend-db: the
+concrete database"). Broadcast once db's section 3 lands: new front-end code takes `&Db`
+(`base_db::Db`), never `&dyn HirDatabase` or `&dyn SourceDatabase`.
+
+1. **Root `Cargo.toml`**, `[workspace.dependencies]`: `inventory = "0.3.24"`. salsa's
+   `inventory` feature already locks this version, so nothing new is fetched. hir-ty collects
+   the MIR and display provider tables with it, and hir-ty-mir and hir-ide register them.
+2. **`crates/test-fixture/src/lib.rs`**: `pub trait WithFixture: Default + SourceDatabase + 'static`
+   (L142) and its blanket impl (L234) become `pub trait WithFixture: Sized`, which keeps the
+   signatures, and `impl WithFixture for base_db::Db { .. }`, which takes the bodies with
+   `Db` for `Self`. Each `Self::default()` (L148, L161, L176, L189, L218) becomes
+   `Db::for_tests()`. `Db` has no `Default`, so a build's database is never made by
+   accident. Then run `tools/v2/concrete_db.py` on test-fixture (11 sites, 2
+   left: these two lines). The `_: &dyn SourceDatabase` parameters of the proc-macro expanders
+   (L886-1207) become `&Db`.
+3. **`crates/hir-ide`**:
+   - `impl_db_macro.rs` is deleted, along with its re-export (`hir/src/lib.rs:223` is db's,
+     requested there).
+   - The `type_name` body (L267) becomes the display provider. In a hir-ide module that the
+     display code is in:
+     ```rust
+     inventory::submit! {
+         hir_ty::providers::Display { type_name: crate::display::type_name }
+     }
+     pub(crate) fn type_name<'db>(db: &'db Db, ty: Ty<'db>, module: ModuleId) -> Option<String> {
+         ty.display_source_code(db, module, true).ok()
+     }
+     ```
+     The old body's fallback to the human-readable display on `Err` goes (no-fallback). rustc's
+     `type_name` is always a path, and the intrinsic reports `None` as an error naming the
+     type (codegen's request).
+   - `test_db.rs` becomes `pub(crate) type TestDB = base_db::Db;`, with its helpers in a
+     `pub(crate) trait TestDBExt` implemented for `Db`.
+   - `Cargo.toml`: `inventory.workspace = true`.
+   - Run the tool on hir-ide (61 sites, 6 left, each printed).
+4. **Docs**: `docs/v2/plan/design/frontend.md` item 15 can point at
+   `docs/v2/plan/lanes/frontend/db.md` for the design.
+
+Status: open
+
+> held by requests: item 1 applied, root `inventory = "0.3.24"` (in the lock). Items 2 and 3 (test-fixture, hir-ide) are held until base-db exports `Db` (`mod db;`, db's section 3) and `hir_ty::providers::Display` exists (section 5); neither is in the tree (checked pass 14). Item 4 (docs/v2) is the coordinator's, on requests' list.
+> taken by requests (base-db now exports `Db`, `hir_ty::providers::Display` exists): child `requests-db-fixture` applies items 2-3; the outcome follows.
+> applied by frontend-db-hir (items 2 and 3; requests-db-fixture told by tmux): test-fixture's `WithFixture: Sized` with its one impl for `Db` (`Db::for_tests()`); hir-ide's `impl_db_macro.rs` and `__private` deleted, `display.rs` registers `hir_ty::providers::Display { type_name }` (`None` on `Err`, no fallback), `test_db.rs` is `type TestDB = Db` with `TestDBExt`, `inventory` in its manifest, the tool run on both. hir-ide's `const_macro::enable` is gone (one `Db`, no view to register): load-cargo's call (`lib.rs:408`) goes, told frontend-db-edge.
+> applied by requests (child requests-db-fixture): items 2-3 hold in the tree. test-fixture: `WithFixture: Sized`, `impl WithFixture for Db`, `Db::for_tests()`, expanders take `&Db` (as `hir_expand`'s trait does); tool 0 left. hir-ide: `impl_db_macro.rs` gone, `display::type_name` registered as `hir_ty::providers::Display` with no fallback, `TestDB = Db` with `TestDBExt`, `inventory.workspace = true`, `const_macro::enable`/`hir_db` downcast gone, unused `HirDatabase` imports dropped (match_check, unsafe_check, tests/const_effects); tool's 3 left are `as &dyn Any` and two fixture strings, not databases. MIR table: hir-ide links hir-ty-mir, whose `submit!` is codegen.md's request. load-cargo's `const_macro::enable` call: requests.md. Nothing built.
+
+## frontend-db: the concrete `Db` in the coordinator's other crates (2026-10-29)
+
+`blaze-intent`, `blaze-wasm`, `blaze-doc` and `blaze-lints` are the coordinator's (crates.md,
+"every other path"). Run `tools/v2/concrete_db.py` on them (dry run: 18, 7, 1 and 3 sites),
+then fix what it prints:
+- `blaze-intent/src/tests/db.rs`: `type TestDB = base_db::Db;` with its helpers in a
+  crate-private trait implemented for `Db`. The `hir::impl_hir_database!` line (L149) becomes
+  `use hir as _;`.
+- `blaze-wasm/src/pack.rs:166` and `pack/record.rs:95`: drop the `as &dyn ..` casts.
+- `blaze-wasm/Cargo.toml` and `blaze-lints/Cargo.toml`: `base-db.workspace = true`.
+
+Status: open
+
+> applied by frontend-db-edge (blaze-wasm, blaze-doc, blaze-lints): tool run on blaze-wasm (7)
+> and blaze-doc (1); the two "left" casts are `as &dyn Any` in `eq_dyn`, not databases.
+> blaze-wasm's `Cargo.toml` gains `base-db` (a path dependency: it is a workspace of its own).
+> blaze-lints has no `dyn` database and already depends on base-db; its `RootDatabase` uses are
+> lane lints' rewrite (told). `RootDatabase` itself: `v2/requests/frontend-db-edge.md`.
+
+> applied by frontend-db-hir (blaze-intent): the tool run, `tests/db.rs` is `type TestDB = base_db::Db;` with `use hir as _;` (it had no helpers), `Semantics::new_dyn` -> `Semantics::new`, `Semantics<'_, Db>` -> `Semantics<'_>`. blaze-wasm, blaze-doc and blaze-lints are frontend-db-edge's.
+
+> forwarded to fastcompile (`blaze-intent`, its crate; told) and the coordinator (`blaze-wasm`, `blaze-doc`, `blaze-lints`: "every other path", not requests'; on requests' coordinator list), each once db's section 3 lands.

@@ -1173,6 +1173,15 @@ Found by speed-hir-store-ty.
 >   seven functions across `check.rs`, `liveness.rs` and `lib.rs`, left for the next borrowck
 >   pass.
 
+> applied by db-ty-d-borrowck: `hir-ty-borrowck/src/scan.rs` `Scan::new` walks `store.exprs()`
+> once per owner (the store its closures, coroutines and inline consts share), not once per
+> table and per body, and fills all seven (`matched` and `union_literals` as bitsets,
+> `tested_at` dense by `PatId`, the store half of `guard_borrows`, `scrutinee_of`,
+> `guard_bindings`, `statement_values`) plus regions' three per-body scans (`lets`,
+> `pattern_paths`, `path_arguments`'s paths with their closure; its parent map is now built
+> only when a path spells generics). `Ctx::scan` carries it. Test: `scan/tests.rs` checks every
+> table against the old scans, copied verbatim, over a fixture that gives each entries.
+
 ## speed-hir-store: `ExpressionStoreDiagnostics::InactiveCode` loses `opts` (from speed-hir-store)
 
 Each cfg'd-out field, parameter or statement used to copy the crate's whole `CfgOptions` hash set
@@ -2371,6 +2380,9 @@ pub fn line_index(db: &dyn SourceDatabase, text: FileText) -> span::LineIndex {
 
 (`span` is already a base-db dependency; `LineIndex` is `Clone + Eq + Debug + 'static`.)
 
+> applied by frontend-db-base: in `crates/base-db/src/lib.rs` after `impl FileText`, as
+> `line_index(db: &Db, text: FileText)` (the database is concrete now). Sections 2 on are not.
+
 ### 2. `crates/hir-expand/src/builtin/fn_macro.rs`: `line_and_column` on it
 
 Old (from `pub fn line_and_column` to the end of `line_starts`):
@@ -2707,6 +2719,8 @@ also needs speed-hir-store's `## speed-hir-store: one counting allocator for hir
 items 2-4 above.
 Status: open
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ty, hir-ty-borrowck, hir-ty-unsafeck)
 
 From speed-hir-store-stmts (child of speed-hir-store), 2026-10-29. `hir-def` (`hir.rs`,
@@ -2744,6 +2758,8 @@ none), hir-ty-borrowck 17 in 3 files (`scan.rs` 7, `check.rs` 4, `regions.rs` 6;
 `crates/hir-ty-wfcheck/` have none. `check.rs` was being edited when this was written: its line
 numbers may have moved, the old texts are exact.
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ### crates/hir-ty/src/infer/expr.rs  (7)
 - ~L12  `RecordSpread, Statement, UnaryOp,`  ->  `RecordSpread, Statement, Statements, UnaryOp,`
 - ~L1499 (in `fn infer_block`)  `        statements: &[Statement],`  ->  `        statements: Statements<'_>,`
@@ -2753,18 +2769,26 @@ numbers may have moved, the old texts are exact.
 - ~L1534  `&Statement::Expr { expr, has_semi } => {`  ->  `Statement::Expr { expr, has_semi } => {`
 - unchanged: `type_ref.as_ref().map(|&tr| this.make_ty(tr))` (`Option<TypeRefId>` by value still has `as_ref`), the call `self.infer_block(tgt_expr, statements, tail, label, expected)` at ~L404.
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ### crates/hir-ty/src/infer/mutability.rs  (4, all in the `Expr::Block` arm, ~L100-112)
 - `self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));`  ->  `self.infer_mut_expr(i, self.pat_bound_mutability(pat));`
 - `self.infer_mut_expr(*e, Mutability::Not);`  ->  `self.infer_mut_expr(e, Mutability::Not);`
 - `                            self.infer_mut_expr(*expr, Mutability::Not);` (the `Statement::Expr` arm, ~L111)  ->  `                            self.infer_mut_expr(expr, Mutability::Not);`
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ### crates/hir-ty/src/infer/closure/analysis.rs  (1)
 - ~L324  `let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {`  ->  `let Statement::Let { pat, initializer: Some(init), .. } = stmt else {`
+
+> forwarded to db (window `db-next2`, told by tmux).
 
 ### crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs  (2)
 - ~L694  `    fn walk_stmt(&mut self, stmt: &Statement) -> Result {`  ->  `    fn walk_stmt(&mut self, stmt: Statement<'_>) -> Result {`
 - ~L695  `        match *stmt {`  ->  `        match stmt {`
 - unchanged: `for stmt in statements { self.walk_stmt(stmt)?; }` at ~L638.
+
+> forwarded to db (window `db-next2`, told by tmux).
 
 ### crates/hir-ty-borrowck/src/scan.rs  (7, the `Expr::Block` arm, ~L143-162)
 - `matches!(store.pat(*pat), Pat::Bind { subpat: None, .. });`  ->  `matches!(store.pat(pat), Pat::Bind { subpat: None, .. });`
@@ -2775,16 +2799,3882 @@ numbers may have moved, the old texts are exact.
 - `statement_values.insert(*expr, Some(value));`  ->  `statement_values.insert(expr, Some(value));`
 - `statement_values.insert(*expr, None);`  ->  `statement_values.insert(expr, None);`
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ### crates/hir-ty-borrowck/src/check.rs  (4)
 - in `fn let_bound_block_value` (~L355-357): `if matches!(ctx.store.pat(*pat), Pat::Bind { subpat: None, .. })`  ->  `if matches!(ctx.store.pat(pat), Pat::Bind { subpat: None, .. })`; `&& matches!(ctx.store.expr(*init), Expr::Block { .. })`  ->  `&& matches!(ctx.store.expr(init), Expr::Block { .. })`; `&& value(*init) == expr`  ->  `&& value(init) == expr`
 - ~L3065  `                        Statement::Let { pat, .. } => Some(*pat),`  ->  `                        Statement::Let { pat, .. } => Some(pat),`
+
+> forwarded to db (window `db-next2`, told by tmux).
 
 ### crates/hir-ty-borrowck/src/regions.rs  (6)
 - ~L2182  `&& spelled(self.ctx.store.pat(*pat))`  ->  `&& spelled(self.ctx.store.pat(pat))`
 - ~L2184  `found.push((*pat, *initializer));`  ->  `found.push((pat, initializer));`
 - ~L2443-2446 (in `fn lets`)  `pat: *pat,\n                        type_ref: *type_ref,\n                        initializer: *initializer,`  ->  `pat,\n                        type_ref,\n                        initializer,`
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ### crates/hir-ty-unsafeck/src/lib.rs  (1)
 - ~L519  `                    match *statement {`  ->  `                    match statement {`
+
+Status: open
+
+> forwarded to db (window `db-next2`, told by tmux).
+
+## frontend-deps-sigs: serve signatures from a dependency image (frontend.md item 5; 2026-10-29)
+
+`crates/hir-def/src/deps/signatures.rs` (lane `frontend-deps-sigs`, declared by `deps.rs` as
+`pub(crate) mod signatures`) writes the signatures part of a dependency image and serves each
+signature query from it. It needs four changes in db's paths. Nothing else in db's paths moves;
+without an image every `served_*` is `None` and the queries behave as today.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 1. `crates/hir-def/src/nameres/frozen.rs`: five id codes visible to the crate
+
+`deps/signatures/table.rs` encodes a record's relocation table with frozen's `Enc`/`Dec`, so a
+table names files, macro calls, ast ids and hygiene contexts exactly as the def map part does.
+These are private today:
+
+- `Enc` (L671, L693, L706, L716, L874): `fn file(`, `fn hir_file(`, `fn ast_id<`, `fn call(`,
+  `fn context(` -> `pub(crate) fn file(` and so on, bodies unchanged.
+- `Dec` (L2086, L2093, L2101, L2111, L2218): the same five -> `pub(crate) fn`.
+- Why: one encoding of a portable id, not a second copy of it in `deps/`.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 2. `crates/hir-def/src/signatures.rs`: the hook at the head of each `of`
+
+In each of `StructSignature::of` (L439), `UnionSignature::of` (L541), `EnumSignature::of`
+(L649), `ConstSignature::of` (L754), `StaticSignature::of` (L849), `ImplSignature::of` (L943),
+`TraitSignature::of` (L1061), `FunctionSignature::of` (L1181), `TypeAliasSignature::of`
+(L1372) and `VariantFields::of` (L1580):
+
+- Old:
+  ```rust
+  pub fn of(db: &dyn SourceDatabase, id: StructId) -> Arc<Self> {
+      match Self::relative(db, id) {
+  ```
+- New:
+  ```rust
+  pub fn of(db: &dyn SourceDatabase, id: StructId) -> Arc<Self> {
+      if let Some(it) = crate::deps::signatures::served_struct(db, id) {
+          return it;
+      }
+      match Self::relative(db, id) {
+  ```
+  with `served_union`, `served_enum`, `served_const`, `served_static`, `served_impl`,
+  `served_trait`, `served_function`, `served_type_alias`, `served_variant_fields` in the others.
+- Why: the query, not each caller, decides where the value comes from; inside `of` so a block
+  the record names is made by the query (blocks are tracked structs).
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 3. `crates/hir-def/src/signatures.rs`: `EnumVariants::of` split into hook and lowering
+
+- Old (L1772-1820): `#[salsa::tracked(returns(ref))] pub(crate) fn of(db, e) -> (EnumVariants,
+  ThinVec<InactiveEnumVariantCode>) { let loc = e.lookup(db); ... (EnumVariants { variants,
+  explicit_discriminant }, diagnostics) }`
+- New:
+  ```rust
+  #[salsa::tracked(returns(ref))]
+  pub(crate) fn of(
+      db: &dyn SourceDatabase, // dyn: salsa's query database, `dyn` across the front end
+      e: EnumId,
+  ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+      if let Some(it) = crate::deps::signatures::served_enum_variants(db, e) {
+          return it;
+      }
+      Self::lower(db, e)
+  }
+  ```
+  and, in a plain (untracked) `impl EnumVariants`, `pub(crate) fn lower(db: &Db, e: EnumId)
+  -> (EnumVariants, ThinVec<InactiveEnumVariantCode>)` holding the old body unchanged. (`of`'s own
+  `db` parameter becomes `&Db` with the rest of the file in the `&Db` migration; `served_*` and
+  `lower` take `&Db` already, as new code must.)
+- Why: checking an image (`Mode::Check`) lowers the variants from syntax to compare with the
+  record, which `of` itself no longer does once it serves.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 4. `crates/hir-def/src/signatures.rs`: build the two values from their parts
+
+`VariantFields::fields` and `EnumVariants::explicit_discriminant` are private, so a decoded
+record cannot be made into the value. In `impl VariantFields` and `impl EnumVariants` (plain
+impls):
+
+```rust
+/// Fields read back from a dependency image.
+pub(crate) fn from_parts(
+    fields: Arena<FieldData>,
+    store: ExpressionStore,
+    shape: FieldsShape,
+) -> VariantFields {
+    VariantFields { fields, store, shape }
+}
+```
+
+```rust
+/// Variants read back from a dependency image; `explicit[i]` is whether variant `i` is
+/// written with `= expr`.
+pub(crate) fn from_parts(
+    variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
+    explicit: &[bool],
+) -> EnumVariants {
+    let mut explicit_discriminant = VariantBits::with_len(variants.len());
+    for (index, &it) in explicit.iter().enumerate() {
+        explicit_discriminant.set(index, it);
+    }
+    EnumVariants { variants, explicit_discriminant }
+}
+```
+
+- Why: the decoder (`deps/signatures/codes.rs`) builds each value it reads; the bits stay
+  private to `signatures.rs`. An enum with no variants gets `with_len(0)`, an empty `SmallVec`,
+  equal to the `VariantBits::default()` lowering gives it.
+
+Already asked by `speed-hir-store` above (one counting allocator for hir-def's tests): the
+allocation tests in `deps/signatures/tests.rs` use `blaze_alloc_count::assert_at_most`.
+
+Status: open
+
+> forwarded to db (hir-def is its; told by tmux).
+
+## frontend-nameres-core: crate_local_def_map and block_def_map on the per-module resolver
+
+From `frontend-nameres-core` (report `/tmp/blaze-lanes/v2-frontend-nameres-core.md`, notes
+`docs/v2/plan/lanes/frontend/nameres-core.md`). Puts the def maps on `nameres/facts/` (the
+per-module, per-SCC resolver of `docs/v2/plan/lanes/frontend/nameres.md`) and takes the old
+`collector` fixpoint off the build's path (test-only, for the differential tests). Every edit
+below is needed together; `facts/` is written against them.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 1. `crates/hir-def/src/nameres.rs`, module lines
+
+old:
+```rust
+pub mod attr_resolution;
+mod collector;
+pub mod demand;
+```
+new:
+```rust
+pub mod attr_resolution;
+#[cfg(test)]
+mod collector;
+pub mod demand;
+mod facts;
+pub use self::facts::kinds;
+```
+Why: `collector` stays only as the differential tests' reference; `facts` is the resolver;
+`kinds` gives `blaze-v2-proof` the resolver's `QueryKind`s (lane oracle's ask). (The impls
+child's `pub use self::facts::impls::{ModuleImpls, module_impls};` is its own request.)
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 2. `crates/hir-def/src/nameres.rs`, `crate_local_def_map` body
+
+old (from `if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {` to the end of
+the fn):
+```rust
+    if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
+        return DefMapPair::new(db, def_map, local_def_map);
+    }
+    let root_file_id = crate_id.root_file_id(db);
+    let module_data = ModuleData::new(
+        ModuleOrigin::CrateRoot { definition: root_file_id },
+        Visibility::Public,
+        None,
+    );
+
+    let def_map = DefMap::empty(
+        db,
+        crate_id,
+        Arc::new(DefMapCrateData::new(krate.edition)),
+        module_data,
+        None,
+    );
+    let (mut def_map, local_def_map) =
+        collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
+    def_map.hand_over_scopes(db);
+    frozen::check(db, crate_id, &def_map, &local_def_map);
+
+    DefMapPair::new(db, def_map, local_def_map)
+}
+```
+new:
+```rust
+    if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
+        return DefMapPair::new(db, def_map, local_def_map);
+    }
+    let (def_map, local_def_map) = facts::collect_crate(db, crate_id);
+    frozen::check(db, crate_id, &def_map, &local_def_map);
+
+    DefMapPair::new(db, def_map, local_def_map)
+}
+```
+and delete the now-unused first line of the body, `let krate = crate_id.data(db);` (the
+tracing span reads `crate_id` only). `collect_crate` returns the map with scopes handed over
+and `diagnostics_by_module` made.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 3. `crates/hir-def/src/nameres.rs`, `block_def_map` body end
+
+old:
+```rust
+    let (mut def_map, _) = collector::collect_defs(
+        db,
+        def_map,
+        TreeId::new(ast_id.file_id, Some(block_id)),
+        Some(local_def_map.local(db)),
+    );
+    def_map.hand_over_scopes(db);
+    def_map
+}
+```
+new:
+```rust
+    facts::collect_block(
+        db,
+        def_map,
+        TreeId::new(ast_id.file_id, Some(block_id)),
+        local_def_map.local(db),
+    )
+}
+```
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 4. `crates/hir-def/src/nameres.rs`, `ModulesSlot`: a resolver view
+
+old:
+```rust
+enum ModulesSlot {
+    /// While the `DefMap` is being collected.
+    Building(ModulesMap),
+    /// A `Modules`, once it is.
+    Collected(salsa::Id),
+}
+```
+new:
+```rust
+enum ModulesSlot {
+    /// While the `DefMap` is being collected.
+    Building(ModulesMap),
+    /// A `Modules`, once it is.
+    Collected(salsa::Id),
+    /// A view of the per-module resolver (`facts`): the modules it holds, and every other
+    /// module of its crate read through `facts::row` of `rows` (a `facts` `RowsKey`).
+    Unit { own: ModulesMap, rows: salsa::Id },
+}
+```
+In `impl ModulesSlot`, `fn building`: old `ModulesSlot::Building(modules) => modules,` new
+`ModulesSlot::Building(modules) | ModulesSlot::Unit { own: modules, .. } => modules,`.
+
+In `DefMap::module`, old:
+```rust
+        let found = match &self.modules {
+            ModulesSlot::Building(modules) => modules.get(&id),
+```
+new:
+```rust
+        let found = match &self.modules {
+            ModulesSlot::Building(modules) => modules.get(&id),
+            ModulesSlot::Unit { own, rows } => match own.get(&id) {
+                Some(it) => Some(it),
+                None => facts::row(db, *rows, id),
+            },
+```
+In `DefMap::table`, after the `ModulesSlot::Building(modules) => modules,` arm add:
+```rust
+            ModulesSlot::Unit { .. } => panic!("the modules of a resolver view are not listed"),
+```
+Why: a unit (one strongly connected component of a round) holds its members and reads every
+other module's row lazily, so a unit costs its members, not the crate's module count. Path
+resolution and visibility only call `DefMap::module` (checked: no `table`/`modules` call in
+`path_resolution.rs` or `visibility.rs`). `shrink_to_fit` and `hand_over_scopes` match
+`Building` only and stay as they are (views are never handed over).
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 5. `crates/hir-def/src/nameres.rs`, `ScopeSlot`: a scope read as a fact
+
+old:
+```rust
+enum ScopeSlot {
+    /// While the `DefMap` is being collected.
+    Building(Box<BuildingScope>),
+    /// A `ModuleScope`, once it is.
+    Collected(salsa::Id),
+}
+```
+new:
+```rust
+enum ScopeSlot {
+    /// While the `DefMap` is being collected.
+    Building(Box<BuildingScope>),
+    /// A `ModuleScope`, once it is.
+    Collected(salsa::Id),
+    /// The `ModuleScope` a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
+    Fact(salsa::Id),
+}
+
+impl ScopeSlot {
+    /// The `ModuleScope` of a handed-over or fact slot.
+    fn handle(&self, db: &dyn SourceDatabase) -> Option<salsa::Id> {
+        match self {
+            ScopeSlot::Building(_) => None,
+            ScopeSlot::Collected(id) => Some(*id),
+            ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
+        }
+    }
+}
+```
+Then in `impl ModuleData`, in each of `scope`, `name_in_scope`, `legacy_macro_in_scope`,
+`traits_in_scope`, `children`: replace the `ScopeSlot::Collected(id) =>` arm's pattern by
+`ScopeSlot::Collected(_) | ScopeSlot::Fact(_) =>` and, in that arm's body, `*id` by
+`self.scope.handle(db).expect("a handed-over slot")`. For example `scope`:
+```rust
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                let id = self.scope.handle(db).expect("a handed-over slot");
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).scope(db)
+            }
+```
+In `children_mut` and `scope_mut`, old `ScopeSlot::Collected(_) =>` new
+`ScopeSlot::Collected(_) | ScopeSlot::Fact(_) =>` (same panic). The size assert
+(`size_of::<ScopeSlot>() <= 16`) still holds. Why: a unit reads another component's module
+through its round's `fact_handle` only when a path reaches it, so the salsa edge is per name
+read (`ModuleScope::name`), the fact of `nameres.md` §3. `frozen.rs` matches on `ScopeSlot`?
+(`rg -n 'ScopeSlot::' crates/hir-def/src` shows only `nameres.rs`; if `frozen.rs` matches it
+exhaustively, give `Fact` the `Collected` arm's body through `handle`.)
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 6. `crates/hir-def/src/nameres/mod_resolution.rs`: `ModDir` is a key
+
+old: `#[derive(Clone, Copy, Debug)]` above `pub(super) struct ModDir {` and above
+`struct DirPath(Symbol);`
+new: `#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]` on both.
+Why: a module's round-0 key (`facts::queries::Decl`) and its `SetModDir` op hold its `ModDir`
+(16 bytes, an interned symbol: comparing is two words).
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 7. `crates/hir-def/src/item_scope.rs`: `PerNsGlobImports` is carried
+
+old: `#[derive(Debug, Default)]` above `pub struct PerNsGlobImports {`
+new: `#[derive(Debug, Default, Clone, PartialEq, Eq)]`
+Why: a unit carries its glob-import marks from one round to the next (`// clone:` there:
+once per round a component changes), and a macro step's view starts from its module's.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 8. `crates/hir-def/Cargo.toml`: blaze-query
+
+In `[dependencies]` add `blaze-query.workspace = true` (it is a workspace dependency already;
+blaze-query does not depend on hir-def). Why: `facts/kinds.rs` gives the resolver's queries
+`blaze_query::QueryKind` numbers, as `hir_ty::db::kinds` does.
+
+> forwarded to db (hir-def is its; told by tmux).
+
+### 9. Other `collector::` uses
+
+`rg -n 'collector::' crates/hir-def/src` finds, besides the two bodies above, only
+`nameres/tests/worklist.rs` (a test module, `#[cfg(test)]` through `mod tests`), which keeps
+working with `#[cfg(test)] mod collector;`. Nothing else to move.
+
+Status: open
+
+> forwarded to db (hir-def is its; told by tmux).
+
+## frontend-text: the parse tree's source is a `Text`; `FileText` and `BodySyntax` hold one (2026-10-29)
+
+Coordinator request "one `Text` from the VFS to the parse tree" (`v2/requests/frontend.md`).
+`crates/blaze-bytes` holds `Bytes` and `Text` (checked UTF-8, `Deref<Target = str>`, `Clone` by
+one count, `Eq`/`Hash` as the `str`, `From<Arc<str>>` with no copy, `ptr_eq`). The syntax side is
+written: `FlatTree::source() -> &syntax::Text`, and `SourceFile::parse_shared`, `parse_outline`,
+`parse_file` and `Parse::reparse_to` take `impl Into<syntax::Text>`, so a caller that passes an
+`Arc<str>` compiles unchanged.
+
+> forwarded to db (told by tmux).
+
+### 1. Breaks now (two lines)
+
+- `crates/base-db/src/tests.rs:266`:
+  `assert!(std::sync::Arc::ptr_eq(tree.source(), db.file_text(files[1]).text(&db)));` becomes
+  `assert!(tree.source().as_ptr() == db.file_text(files[1]).text(&db).as_ptr());`, and
+  `assert!(tree.source().ptr_eq(db.file_text(files[1]).text(&db)));` once section 2 lands.
+- `crates/hir-def/src/expr_store/body.rs:427`:
+  `ast::SourceFile::parse_outline(std::sync::Arc::from(self.text()), self.edition)` becomes
+  `ast::SourceFile::parse_outline(self.text(), self.edition)`. `Arc::from` no longer infers
+  against `impl Into<Text>`. A `&str` is a copy into an `Arc`, as before.
+
+`crates/hir-def/src/signatures.rs:174-180` (`replace_subtree(at, &empty.finish(), text.into())`
+from a `String`) compiles unchanged.
+
+> forwarded to db (told by tmux).
+
+### 2. `FileText` holds a `Text`, and the `ViewError::Mapped` gate goes
+
+This replaces the amendment above, "section 3: `Bytes` and `Text`", in two places:
+`ViewError::Mapped` and the `.shared().expect(...)` in `write_view` are no longer wanted. An
+image file's text is held as it is, with no copy and nothing refused.
+
+- `crates/base-db/src/lib.rs`: `FileText`'s field `text: std::sync::Arc<str>` becomes
+  `text: syntax::Text`, and `FileText::text` returns `&'db syntax::Text`. Where it is set
+  (`FileText::new` / `set_text_field`), an `Arc<str>` becomes `syntax::Text::from(arc)`.
+- `view.rs`, `write_view`: `blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()` is the
+  `Option<Text>` it stores (a `Vec<Option<syntax::Text>>`). There is no `shared()`, and
+  `plan_view` gets no `ViewError::Mapped`. `ViewFile::bytes: &blaze_vfs::Bytes` stays as the
+  amendment says. Until frontend-journal-tree's "`Bytes` moves to blaze-bytes" (in
+  `v2/requests/frontend-journal.md`) lands, `blaze_vfs::Bytes` is not yet `blaze_bytes::Bytes`.
+- `crates/hir-def/src/expr_store/body.rs`: `BodySyntax::text: Arc<str>` becomes
+  `syntax::Text`. Its fill at ~L666 (`db.file_text(file).text(db).clone()`) is unchanged.
+- `EditionedFileId::parse` passes the text to `SourceFile::parse_file`, which takes it as it is.
+- Outside db, these keep compiling but get a `Text` where they had an `Arc<str>`:
+  `blaze-doc/src/source.rs:79` and `blaze-engine/src/lib.rs:4039` (`.text(db).clone()`).
+  `blaze-doc/src/source.rs:51` (`Arc::from(&**...)`) compiles as is.
+Status: open
+
+> forwarded to db (told by tmux).
+
+## frontend-tree: views of a file's tree, borrowed from the database (2026-10-29)
+
+frontend.md item 16 (notes: `docs/v2/plan/lanes/frontend/tree.md`) moves the build path from the
+counted handles (`SyntaxNode`, `ast::*`) to borrowed `Copy` views (`syntax::view`). The parse a
+query keeps is returned by reference (`EditionedFileId::parse`, `parse_macro_expansion` are
+`returns(ref)`), so a view of it lives as long as the `&'db Db`: no handle, no
+refcount. These two additions let every caller in `hir-expand`, `hir-def`, `hir`, `hir-ty` move
+one call at a time; nothing existing changes.
+
+1. File: `crates/hir-expand/src/lib.rs`, in `impl HirFileId`, after `pub fn parse_or_expand`
+   (L1823-1830). New:
+
+   ```rust
+   /// The file's root as a view, borrowed from the parse the database keeps: what
+   /// [`Self::parse_or_expand`] is, with no handle made.
+   pub fn root(self, db: &base_db::Db) -> syntax::view::Node<'_> {
+       match self {
+           HirFileId::FileId(file_id) => file_id.parse(db).root(),
+           HirFileId::MacroFile(macro_file) => macro_file.parse_macro_expansion(db).value.0.root(),
+       }
+   }
+   ```
+
+2. File: `crates/hir-expand/src/files.rs`, after `impl<N: AstNode> AstId<N> { ... }` (ends L117).
+   New:
+
+   ```rust
+   impl<N: AstNode + syntax::view::Typed> AstId<N> {
+       /// The node as a view of the tree the database keeps: [`Self::to_node`] with no handle.
+       pub fn to_view<'db>(&self, db: &'db base_db::Db) -> N::Of<'db> {
+           self.to_ptr(db).to_view(self.file_id.root(db))
+       }
+   }
+   ```
+
+Why: the views are the build path's tree API from item 16 on; with these, a caller writes
+`let f = id.to_view(db);` (an `ast::Fn<'db>` under `use syntax::view as ast`) where it wrote
+`id.to_node(db)`. `syntax::view` is declared through frontend-deps' request.
+
+Also, for your lanes: new code that reads syntax should read it through `syntax::view`
+(`use syntax::view as ast;`, same names, methods take `self`, text is `&'t str`). When a crate
+of yours (`hir-expand`, `hir-def`, `hir`, `hir-ty`, `base-db`) reports DONE, frontend-tree's
+children move the rest of it; tell `frontend-tree` by tmux.
+
+Status: open
+
+> forwarded to db (told by tmux).
+> applied by db-expand: both as written (`HirFileId::root` after `parse_or_expand` in `crates/hir-expand/src/lib.rs`, `AstId::to_view` after `impl<N: AstNode> AstId<N>` in `files.rs`); `ignored_semicolon` (lib.rs) reads the call's path through `to_view`.
+
+## frontend-tree: to db-expand-macros-next1, hand over `crates/span/src/ast_id.rs` (2026-10-29)
+
+frontend-text (span's other owner) reports DONE and gives frontend-tree the move of span's public
+syntax API onto views (frontend.md item 16). That API is `AstIdMap::from_source(&SyntaxNode)`,
+`relative_to` and `relative_without(&SyntaxNode, &SyntaxNode, &[SyntaxNodePtr])`, plus the
+item naming under them (`ErasedFileAstId::ast_id_for`, `has_name_ast_id`, the `Impl`/`Use`/
+`ExternBlock`/`AsmExpr` id functions). The walks are already over `FlatTree` numbers; only the
+entry points and the per-item naming still make cursors.
+
+- File: `crates/span/src/ast_id.rs`. Your brief also lists `crates/span/`.
+- What frontend-tree would do there:
+  - add `from_view(root: syntax::view::Node<'_>)`, `relative_to_view` and
+    `relative_without_view` beside the handle versions;
+  - make the naming read `syntax::view` (no cursor per item);
+  - keep the handle entry points as thin wrappers over the view ones (`node.to_flat()` gives
+    the same `(tree, at)`) until hir-def and hir-expand stop calling them.
+  - No change to the map, its ids or its hashing.
+- Ask: answer with a `>` line. Either you don't touch `ast_id.rs` and frontend-tree may edit it,
+  or you name what you are changing there and when you will be done. Until then frontend-tree
+  does not edit `crates/span`.
+
+Status: open
+
+> db-expand-macros: I don't touch `crates/span/` (my brief gives it to format, not me) and have no edit in `ast_id.rs`; frontend-tree may edit it.
+
+> forwarded to db-expand-macros-next1 (told by tmux).
+
+## frontend-db: the concrete database, `base_db::Db` (frontend.md item 15; 2026-10-29)
+
+From `frontend-db` (report `/tmp/blaze-lanes/v2-frontend-db.md`, notes
+`docs/v2/plan/lanes/frontend/db.md`, which say why: rustc's `TyCtxt` on salsa, with
+`&'db Db` as `TyCtxt<'tcx>`). The type is written: `crates/base-db/src/db.rs` and its tests
+`crates/base-db/src/db/tests.rs` (new files, frontend-db's). What follows hooks it in and moves
+db's crates onto it. `tools/v2/concrete_db.py` does the mechanical part of 4 and 6 (dry run over
+db's crates: 2,066 sites, 31 left for a person, each printed with what to do):
+
+```sh
+PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \
+  '{"root": ".", "crates": ["hir-def"], "write": true}'
+```
+
+Status: open
+
+> forwarded to db (db-next2 told); the root `inventory` line is in (requests).
+
+### 1. salsa: tracked functions over a concrete database (`vendor/salsa*`)
+
+Today a tracked function's database must be `&dyn Trait` (`salsa-macros/src/tracked_fn.rs`,
+`validity_check`, ~L440 "must have type `&dyn Db`"), and `setup_tracked_fn!` writes `dyn $Db`
+in 14 places. Make it take `&Db` for a `#[salsa::db] struct Db` too:
+
+- `vendor/salsa/src/views.rs`, exported from `plumbing`:
+  ```rust
+  /// What a tracked function's database parameter is: `dyn Trait` for a `#[salsa::db]` trait,
+  /// or a `#[salsa::db]` struct itself.
+  pub trait DbView: Any {
+      fn zalsa_register_downcaster(&self) -> &DatabaseDownCaster<Self>;
+  }
+  ```
+- `salsa-macros/src/db.rs`: for a `#[salsa::db]` trait, also emit
+  `impl salsa::plumbing::DbView for dyn #TraitPath { #[inline(always)] fn zalsa_register_downcaster(&self) -> &salsa::plumbing::DatabaseDownCaster<Self> { <dyn #TraitPath as #TraitPath>::zalsa_register_downcaster(self) } }`;
+  for a `#[salsa::db]` struct, emit
+  `impl salsa::plumbing::DbView for #Name { #[cold] #[inline(never)] fn zalsa_register_downcaster(&self) -> &salsa::plumbing::DatabaseDownCaster<Self> { salsa::plumbing::views(self).add::<Self, Self>(|db| db) } }`
+  (the identity view: `Concrete = DbView = Self`).
+- `salsa-macros/src/tracked_fn.rs`, `extract_db_path`: besides `&dyn Path`, accept `&Path`
+  (`syn::Type::Path`, not `mut`), and pass `setup_tracked_fn!` `DbView: [dyn #path]` or
+  `DbView: [#path]` where it passes `Db: #db_path` (~L261). The message becomes "must have type
+  `&dyn Db` or `&Db`, where `Db` is a Salsa database trait or a `#[salsa::db]` struct".
+- `salsa-macro-rules/src/setup_tracked_fn.rs`: the parameter `Db: $Db:path` becomes
+  `DbView: [$($DbView:tt)*]`; every `dyn $Db` becomes `$($DbView)*`; and
+  `<dyn $Db as $Db>::zalsa_register_downcaster(db)` (L290, L294) becomes
+  `<$($DbView)* as $zalsa::DbView>::zalsa_register_downcaster(db)`.
+- A salsa test, `tests/tracked_fn_concrete_db.rs`: a `#[salsa::db] struct`, a tracked fn over
+  `&Db` that executes once, hits, and reruns after a write; and one over `&dyn Database`
+  beside it on the same database, so both views live together.
+
+Why: with `DbView = Db`, `fn_ingredient_` is static, and a hit has no vtable call.
+
+### 2. salsa: the task depth is a method of the database, not a process hook
+
+`task::current_depth()` calls through `TASK_DEPTH: OnceLock<fn() -> usize>` on every hit
+(`attach.rs` L70, L93, L124; `TaskLocals::current`, `task.rs` L141, under every
+`zalsa_local()`).
+
+- `Database` gets `fn task_depth(&self) -> u32 { 0 }` (one task per thread), which
+  `base_db::Db` overrides (written: `blaze_graph::pump::depth`).
+- `attach` and `attach_allow_change` read `db.task_depth()` before `as_dyn_database()`; the
+  guards take the depth as an argument.
+- `TaskLocals::current(&self)` becomes `current(&self, depth: u32)`; `storage.rs` L147's blanket
+  `zalsa_local` passes `self.task_depth()` (static: the impl is per database type).
+- `ZalsaLocal` records its `TaskId` when `TaskLocals::insert` makes it; `TaskId::current()`
+  (`function/sync.rs` L167, L241, L298; `runtime.rs` L339, L439) becomes the caller's
+  `zalsa_local.task()`. Where one of them has no `ZalsaLocal` at hand, it gets one passed down
+  rather than reading a global.
+- `TASK_DEPTH`, `set_task_depth` and `current_depth` are deleted.
+
+Why: these are the hit path's last indirect calls. A `&self` method is static where the
+database is concrete, and costs a vtable call only where a caller already holds `dyn Database`.
+
+> frontend-db-base (20:30): section 1 is in salsa (speed-salsa: `DbType::Concrete`,
+> `ConcreteView`, `tests/concrete_db.rs`). Section 2 is half in: `task_depth` exists and
+> `attach`/`zalsa_local` read it, but `TASK_DEPTH`/`set_task_depth`/`current_depth` stay and
+> `TaskId::current()` (function/sync.rs L167 L241 L298, runtime.rs L339 L439; each has a
+> `ZalsaLocal` in scope) reads the hook, with debug_asserts that the two agree. No v2 build path
+> calls `set_task_depth`, so a pumped task's claims carry depth 0. Asked speed-salsa-next2
+> (window 19) and db-next2 to finish it; base-db's `install_plane_hooks` goes when it lands.
+
+> speed-salsa (10-29, done in the working tree, compiles with the first build): section 2 is all
+> in. `ZalsaLocal::new(task)` records its `TaskId` (made by `TaskLocals::insert` from the thread
+> and the depth `current` was passed), read by `zalsa_local.task()`. `try_claim`,
+> `try_claim_transferred` and the claim guard's `transfer_lock` use it; `peek_claim` and
+> `TryClaimCycleHeadsIter` take the task as an argument (their callers in `execute.rs` and
+> `maybe_changed_after.rs` pass `zalsa_local.task()`); `Runtime::block` and
+> `Runtime::transfer_lock` take it as a parameter. `TASK_DEPTH`, `set_task_depth`,
+> `current_depth` and both debug asserts are deleted, and `Database::task_depth` defaults to 0.
+> `tests/task_sync.rs` pumps through a `task_depth` override now. `install_plane_hooks` can go:
+> `salsa::set_task_depth` no longer exists, so `crates/base-db/src/lib.rs:325` won't compile
+> until it does.
+
+### 3. base-db: hook `Db` in
+
+- `crates/base-db/src/lib.rs`: add `mod db;` beside `mod content;`, and
+  `pub use crate::db::{Db, RunOrder, run_on_pool, set_run_order};`.
+- Delete `pub trait SourceDatabase` (L311-417: `Db` has each method inherently, with the
+  real `included_file`, `include_source`, `env_is_read` and `env_is_unset` that load-cargo's
+  database lacked), `install_plane_hooks` (L421: request 2 replaces it) and the old
+  `run_on_pool` (L439: `db.rs` has it over `&Db`).
+- `crates/base-db/src/named.rs:193`: `resolve<Db: ?Sized + SourceDatabase>(db: &Db, ...)`
+  becomes `resolve(db: &crate::Db, ...)` (db-expand-inputs2's resolve is in `Db::resolve_path`).
+- Run the tool on base-db: `files.rs`, `view.rs`, `input.rs` and the rest take `&Db`/`&mut Db`.
+- `crates/base-db/src/tests.rs`: its `TestDb` (L36 on) goes; the tests make
+  `Db::for_tests()`. Its two `install_plane_hooks()` calls (L811-812) go with the test of that
+  hook.
+- `crates/base-db/Cargo.toml`: nothing (blaze-alloc-count is a dev-dependency already).
+
+> applied by frontend-db-base: `mod db` and its re-exports in `lib.rs`; the tool on every base-db
+> file (`change.rs`, `editioned_file_id.rs`, `files.rs`, `input.rs`, `lib.rs`, `view.rs`,
+> `tests.rs`); `named.rs`'s `resolve` was already `lookup`, now `lookup(db: &Db, ..)` and
+> `publish(&mut self, db: &mut Db)`; `tests.rs`'s `TestDb` is gone (`Db::for_tests()`); the old
+> `run_on_pool` and `pub trait SourceDatabase` are deleted (every remaining user outside base-db
+> is a file frontend-db-def/-ty/-tyx/-hir/-edge are converting). Also added `line_index(db: &Db,
+> text: FileText) -> span::LineIndex` (frontend-text's request above, section 1), which
+> `Db::line_column` calls and nobody had added. `install_plane_hooks` is deleted too, now that
+> section 2 is in salsa. Its one caller left, `crates/ide-db/src/lib.rs:385`, is in ide, which
+> this migration leaves alone (it also implements the deleted `SourceDatabase`).
+
+### 4. hir-expand, hir-def, hir-ty-borrowck, hir-ty-wfcheck
+
+Run the tool on each. Besides what it prints:
+
+- hir-def's test database (`crates/hir-def/src/test_db.rs`) becomes
+  `pub(crate) type TestDB = base_db::Db;`. Its helpers (`fetch_test_crate`,
+  `module_at_position`, ...) become a `pub(crate) trait TestDBExt` that the file implements for
+  `Db`, so the `db.fetch_test_crate()` call sites stay; they import it where they import
+  `TestDB`. `log` becomes `Db::log` inside
+  `base_db::set_run_order(RunOrder::LeftToReaders)` (and restore the order after), and
+  `log_executed` becomes `Db::log_executed`. salsa's accessors are generic over the database, so
+  a wrapper struct would not coerce there. That is why it is the type itself.
+- hir-def: delete `ExpandProcAttrMacros` and `set_expand_proc_attr_macros`
+  (`lib.rs` L110-123), and in `nameres/collector.rs` L1193 the arm guarded by
+  `!crate::ExpandProcAttrMacros::get(self.db).enabled(self.db)`. Every v2 database sets it to
+  `true`. It is rust-analyzer's editor switch, and rustc always expands attribute macros.
+  Callers to drop: load-cargo (cargo's, told), blaze-items' old test database (done), and each
+  `TestDB::default`.
+- hir-ty-wfcheck's `Cargo.toml` needs `base-db.workspace = true`.
+
+> applied by frontend-db-def: hir-expand and hir-def (tool file by file, plus the hand items;
+> report `/tmp/blaze-lanes/v2-frontend-db-def.md`). `TestDBExt`'s two logging helpers are
+> `log_in_read_order` and `executed_in_read_order`, not `log`/`log_executed`: `Db`'s inherent
+> methods of those names would shadow them, and the old helpers ran under `LeftToReaders`.
+> `ExpandProcAttrMacros` is gone, with its arm in both `nameres/collector.rs` and
+> `nameres/facts/collect.rs`, and load-cargo's call. hir-ty-borrowck and hir-ty-wfcheck are
+> not frontend-db-def's.
+
+> applied by frontend-db-tyx (hir-ty-borrowck, hir-ty-wfcheck): the tool on both (40 and 25
+> sites); each test database is `pub(crate) type TestDB = base_db::Db;` with `use hir_ty_mir as _;`
+> for the MIR providers, so their `hir-ide`/`span`/`triomphe` (and wfcheck's `syntax`)
+> dev-dependencies went, wfcheck's for `hir-ty-mir`. wfcheck already had `base-db`. Two comments
+> in `regions.rs` that the tool rewrote (they name salsa's `dyn Database` in a user's program) were
+> restored.
+
+### 5. hir-ty: `HirDatabase` has one impl, and the MIR queries move in
+
+> applied by frontend-db-ty: sealed trait with `NOT_DYN`, bodies in `impl HirDatabase for Db`,
+> `crates/hir-ty/src/providers.rs` (24 memos keep their `X_query` names, cycle results, kinds
+> 0x2490-0x24a7, `set_mir_capacity`/`set_runtime_mir_capacity` moved in), the tool on all of
+> hir-ty. The `compile_fail` doc test is written but hir-ty has `doctest = false`
+> (report `/tmp/blaze-lanes/v2-frontend-db-ty.md`).
+
+- `crates/hir-ty/src/db.rs`: `pub trait HirDatabase: SourceDatabase + 'static` becomes
+  `pub trait HirDatabase: sealed::Sealed` with `mod sealed { pub trait Sealed {} impl Sealed for base_db::Db {} }`
+  and `#[doc(hidden)] const NOT_DYN: () = ();` (an associated const makes it not
+  dyn-compatible). Delete `as_dyn`. Every provided method's body moves into
+  `impl HirDatabase for base_db::Db` with `self` for `db` (`crate::lower::ty_query(self, def)`),
+  so the trait holds signatures only. A caller's `db.ty(def)` is a static call to a body it can
+  inline.
+- The `hir_database_is_dyn_compatible` test (L498) becomes a `compile_fail` doc test on the
+  trait: `fn f(_: &dyn hir_ty::db::HirDatabase) {}`.
+- New `crates/hir-ty/src/providers.rs` (`pub mod providers;` in `lib.rs`):
+  ```rust
+  pub struct Mir {
+      pub mir_body: for<'db> fn(&'db Db, InferBodyId<'db>) -> Result<Arc<MirBody<'db>>, MirLowerError<'db>>,
+      // one field per query hir-ty-mir computes, in hir-ty-mir's signature and result types
+      pub interpret_mir: for<'db> fn(&'db Db, &'db MirBody<'db>, bool, Option<ParamEnvAndCrate<'db>>) -> Result<Allocation<'db>, MirEvalError<'db>>,
+      pub opaque_of_impl: for<'db> fn(&'db Db, ParamEnvAndCrate<'db>, InternedOpaqueTyId<'db>, GenericArgs<'db>) -> Option<Ty<'db>>,
+  }
+  pub struct Display {
+      // `None` when the type has no source path to print; the caller makes that an error.
+      pub type_name: for<'db> fn(&'db Db, Ty<'db>, ModuleId) -> Option<String>,
+  }
+  inventory::collect!(Mir);
+  inventory::collect!(Display);
+  pub fn mir() -> &'static Mir { static ONE: OnceLock<&'static Mir> = OnceLock::new(); ONE.get_or_init(|| one::<Mir>("hir-ty-mir")) }
+  pub fn display() -> &'static Display { /* the same, "hir-ide" */ }
+  fn one<T: inventory::Collect>(by: &str) -> &'static T {
+      let mut all = inventory::iter::<T>();
+      let first = all.next().unwrap_or_else(|| panic!("no `{}` is linked: link {by} (`use hir as _;`)", std::any::type_name::<T>()));
+      assert!(all.next().is_none(), "two `{}` are linked", std::any::type_name::<T>());
+      first
+  }
+  ```
+  Then each MIR memo behind one of the trait's MIR methods (`mir_body_query`, the
+  `_for_closure`, `_for_coroutine`, `_by_move`, `monomorphized_*`, `runtime_*` and
+  `optimized_*` forms, plus `coroutine_witnesses` once db-ty's request adds it; not the
+  `promoted_*` ones, which only crates above hir-ty-mir read and which stay there) is declared here, with its `#[salsa::tracked(...)]` attribute unchanged
+  (`returns(as_ref)`, `lru`, `cycle_result`). Its cycle-result fn
+  (`Err(MirLowerError::Loop)`) moves too. Its body is one call: `(mir().mir_body)(db, def)`.
+  The trait's MIR methods call these. `interpret_mir`, `opaque_of_impl` and `type_name` call
+  through the table directly.
+- `crates/hir-ty/Cargo.toml`: `inventory.workspace = true`. The root `Cargo.toml` gets
+  `inventory = "0.3.24"` under `[workspace.dependencies]` (the version salsa's lockfile entry
+  is: nothing new is fetched); the root manifest is the coordinator's, so frontend-db asks
+  there too.
+- Run the tool on hir-ty (`method_resolution*` included: frontend-nameres-impls is told).
+
+Why: hir-ty, hir-ty-borrowck and blaze-items read MIR, and its code is above them in
+hir-ty-mir. Declaring the memo in hir-ty makes a hit static from every crate. Only a miss calls
+through the table, as only a miss calls `execute` in rustc. hir-ty-mir registers the table at
+link time (codegen's request), so no maker of a `Db` installs anything, and none can forget to.
+A binary with no table, or two, panics on the first miss, naming what to link.
+
+### 6. hir
+
+Run the tool. `impl_hir_database` leaves the re-exports (L223). Add the test
+`the_mir_and_display_providers_are_linked` in hir's tests: it asserts that
+`hir_ty::providers::mir()` and `display()` return, in a binary that names nothing of hir-ty-mir.
+
+> applied by frontend-db-hir: the tool run (652 sites); `Semantics<'db>` non-generic over `&'db Db` (`new_dyn` gone), `term_search`/`symbols` lost their `DB` parameter, the `impl_hir_database` and `set_expand_proc_attr_macros` re-exports gone, `check.rs`'s view downcast gone (`run_all` takes the closure by value), `tests/db.rs` is `type TestDB = base_db::Db;` (`executed` -> `log_executed`, `reverse_batches` -> `set_run_order(RunOrder::Reversed)`), and the test is in `src/tests.rs`.
+
+### 7. hir-ty-matchck
+
+Not in crates.md's table; db-matchck made it, so it goes to db. Run the tool on it (8 sites, 0
+left).
+
+> applied by frontend-db-tyx: the tool (12 sites, 0 left); the test database is
+> `pub(crate) type TestDB = base_db::Db;` with `use hir_ty_mir as _;` (no `provide()`, no
+> `set_expand_proc_attr_macros`), and the tests' `&*db` became `&db`.
+
+## frontend-journal-tree: `Reader::file` is a `Result` of `Bytes` (blaze-query's `Tree`; 2026-10-29)
+
+Why: restore.md, "The VFS tree itself is in the mapped image". A file of a restored tree is a
+range of the daemon's mapped image, checked by its page group's CRC32C when it is first read.
+`blaze_vfs::Reader::file` is now
+`Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, blaze_vfs::Corrupt>`. `Bytes` is
+`blaze_bytes::Bytes`, re-exported: a heap `Arc<[u8]>` or the image's range, `Deref<Target =
+[u8]>`, and a clone takes one count. `Corrupt { section, group, cause }` names the bad group.
+`crates/blaze-query/src/tree.rs:29-31` no longer compiles as written. Its `bytes.clone()` was
+one `Arc` count; on a `Result` it is a type error.
+
+What I'd do, but the shape is yours:
+1. `Tree::file` -> `Result<Option<(ContentId, Mode, blaze_vfs::Bytes)>, blaze_vfs::Corrupt>`.
+   For `blaze_vfs::Reader`: `blaze_vfs::Reader::file(self, root, path)`, with no clone, because
+   it already gives owned `Bytes`. `MemTree`'s `Files` holds `Bytes`, built with
+   `Bytes::from(Arc::<[u8]>::from(bytes))`, and its `file` is `Ok(..cloned())`.
+2. `InputData::File` holds `Option<(ContentId, Mode, Bytes)>`. `Ctx::file` lends `&**bytes`, as
+   it does now.
+3. `read_input` on `Err(corrupt)`: insert nothing into `state.inputs`, and stop the run with
+   the error, as a cancellation does, so the request fails naming the section and group.
+   It must not be cached: the daemon mends the file by rescanning the path (the watcher
+   writes the disk's bytes again, and `Tree::file` gives the node those bytes). The same root
+   then reads fine, and a memoized error would outlive the repair. Treating it as `None`
+   would be a fallback: the file would look absent, and the build would differ.
+
+No error can happen before the daemon restores from an image (cargo's request), because until
+then every file is a heap file.
+Status: open
+
+> forwarded to db (`blaze-query/src/tree.rs` is its; db-query-next2 told).
+
+## frontend-nameres-core-macros: `PerNsGlobImports::of_scope` (2026-10-29)
+
+From `frontend-nameres-core-macros` (report `/tmp/blaze-lanes/v2-frontend-nameres-core-macros.md`),
+for `crates/hir-def/src/nameres/facts/macros.rs`. One addition, nothing changed.
+
+`crates/hir-def/src/item_scope.rs`, in `impl PerNsGlobImports {`, after `contains_macro`, add:
+```rust
+    /// The marks of `module`'s names, read off its scope: a name is marked in a namespace
+    /// exactly when its entry there came from a glob (`push_res_with_import` and the
+    /// collector's glob branch keep the two together).
+    pub(crate) fn of_scope(module: ModuleId, scope: &ItemScope) -> PerNsGlobImports {
+        let mut marks = PerNsGlobImports::default();
+        for (name, item) in scope.types.iter() {
+            if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
+                marks.types.insert((module, *name));
+            }
+        }
+        for (name, item) in scope.values.iter() {
+            if matches!(item.import, Some(ImportOrGlob::Glob(_))) {
+                marks.values.insert((module, *name));
+            }
+        }
+        for (name, item) in scope.macros.iter() {
+            if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
+                marks.macros.insert((module, *name));
+            }
+        }
+        marks
+    }
+```
+Why: a macro step (`facts::macros::macro_step`) holds one module whose scope it clones from the
+round's `ModuleScope` and applies its expansions' `DeclOp::Update`s to, as the old
+`push_res_and_update_glob_vis` did; `push_res_with_import` needs the module's glob marks to let a
+definition shadow a glob-imported name. The marks live in the unit's state, and reading that
+state from a step would make every step of a component rerun when any member changes (the step
+reads only its module's `fact_handle`, which backdates). Every entry whose `import` is a glob is
+marked and no other: a glob write inserts the mark with the entry, a non-glob write that replaces
+the entry removes it, and `update_def_*`/`update_visibility_*` keep the entry's import. The fields
+are private to `item_scope.rs`, hence the hook.
+
+Status: open
+
+> forwarded to db (running; `db-next2` was told by the asker and again by requests).
+
+## dedup: frozen trees take LitKind's number from tt (from dedup-macros, 2026-10-29)
+
+`crates/hir-def/src/nameres/frozen.rs` writes and reads `LitKind`'s number 0 to 10 with its own
+two `match`es, equal to `crates/tt/src/storage.rs`'s. `tt::LitKind::code` and `from_code` are
+requested of frontend-tokens (`v2/requests/frontend-tokens.md`, same heading). Apply this after
+they land. Design: `docs/v2/plan/lanes/dedup/macros.md`.
+
+1. The writer (around line 958, in the `Leaf::Literal` arm): replace
+   `let (kind, hashes) = match kind { LitKind::Byte => (0, 0), ... LitKind::Err(()) => (10, 0), };`
+   (eleven arms) with `let (kind, hashes) = kind.code();`.
+2. The reader (around line 2289, the `1 =>` arm): replace
+   `let kind = match kind { 0 => LitKind::Byte, ... 10 => LitKind::Err(()), it => return Err(format!("literal kind {it}")), };`
+   with `let kind = LitKind::from_code(kind, hashes).ok_or_else(|| format!("literal kind {kind}"))?;`.
+   The error is the same (`R` is `Result<_, String>`).
+
+The bytes are unchanged, so no format version bump. Status: open
+
+## dedup: `ProcMacroExpander` takes its call as one struct (proposal from dedup-macros, 2026-10-29)
+
+The trait's eight parameters (`db, subtree, attrs, env, def_site, call_site, mixed_site,
+current_dir`) are repeated, and forwarded, by every wrapping impl: `blaze_expand::Kept`
+(`crates/blaze-expand/src/lib.rs` ~554-640), `blaze_macro_wasm::Expander` (`lib.rs` ~2128-2180),
+`blaze-wasm`'s `Recorder` and `Replay` (`src/pack/record.rs`, `src/pack.rs`), `load-cargo`'s
+`Expander`, and about 15 test expanders. The copy-paste scan reports these as the largest runs
+left between those crates. A wrapper also has to clone `current_dir: String` to call its inner
+expander twice (`Kept::expand` under `compare::enabled`).
+
+Proposal, for whoever does frontend-db's `&Db` move of this trait, so each impl is touched once.
+In `crates/hir-expand/src/proc_macro.rs`:
+
+```rust
+/// One call of a proc macro: what every expander is given.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcMacroCall<'a> {
+    pub subtree: &'a tt::TopSubtree,
+    pub attrs: Option<&'a tt::TopSubtree>,
+    pub env: &'a Env,
+    pub def_site: Span,
+    pub call_site: Span,
+    pub mixed_site: Span,
+    pub current_dir: &'a str,
+}
+```
+
+`fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError>`
+and `fn expand_in(&self, db: &Db, calling_crate: Crate, call: ProcMacroCall<'_>) -> ...`
+(default: `self.expand(db, call)`). A wrapper forwards `call` as is. The one caller that builds
+it (`impl CustomProcMacroExpander` in `hir-expand/src/proc_macro.rs`, ~391) passes
+`calling_crate.data(db).proc_macro_cwd.as_str()` (an `Arc<AbsPathBuf>`; `as_str` is
+`paths`') and drops its `to_string()` (the `FIXME: Can we avoid
+the string allocation here?` there). An impl that needs an owned directory (the proc-macro-api client, for its
+message) makes it there.
+
+This is an interface change across lanes (usercode, cargo, coordinator's `blaze-wasm`, tests),
+so it is a proposal. If db takes it, dedup-macros writes the exact per-impl edits as requests to
+each owner. Status: open
+
+
+## dedup: stdx::edit_distance
+
+From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). `crates/hir-expand/src/builtin/fn_macro.rs`
+1400-1448 is one of six copies of rustc's `edit_distance`; the one copy is `stdx::edit_distance`
+(`v2/requests/coordinator.md`, `## dedup: one stdx::edit_distance`, with a proptest differential
+against rustc's code). `stdx` is already a dependency of `hir-expand`. Apply once that lands:
+
+- Delete lines 1400-1448 (the doc comment and `fn edit_distance`).
+- Add `use stdx::edit_distance::edit_distance;` to the file's imports.
+- `similar_cargo_var` (rustc's `find_similar_cargo_var`, with its `PACKAGE`/`PKG` rule) stays: it
+  is not `find_best_match_for_name`.
+
+Status: open
+
+
+## dedup: `hir_def::test_items`, a fixture's items by name for the tests above hir-def
+
+From `dedup-scan` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-scan.md`). Six test modules
+wrote the same `declarations(db)` (every `ModuleDefId` of a crate's modules) and the same
+"the one function/type alias/static/constant named `x`" lookups:
+`hir-ty-codegen/v2/hashes/tests.rs` 34-72, `hir-ty-codegen/v2/refs/tests.rs` 92-128,
+`hir-ty-codegen/v2/tests.rs` 123-138, `hir-ty-mir/tests/mir/main.rs` 25-66,
+`hir-ty-share/src/tests/mod.rs` 124-161, `blaze-items/src/tests/{narrow,coherence}.rs`
+(`declarations`, `impls`). They need `crate_def_map`, so the one copy is in hir-def (not
+base-db). It is compiled always, not under `cfg(test)`: the tests that use it are other
+crates' (a `cfg(test)` module of hir-def is invisible to them), and it is 60 lines. With the test
+databases becoming `type TestDB = base_db::Db;` (frontend-db), it takes `&Db`. The callers'
+edits: `v2/requests/codegen.md`, `v2/requests/fastcompile-ident-share.md`, `v2/requests/items.md`,
+each under `## dedup: hir_def::test_items`.
+
+### 1. `crates/hir-def/src/lib.rs`: after `pub mod visibility;` (line 49) add
+
+```rust
+pub mod test_items;
+```
+
+### 2. New file `crates/hir-def/src/test_items.rs`
+
+```rust
+//! A fixture's items found by name, for the tests of the crates above hir-def: the lookups each
+//! of their test modules wrote again.
+
+use base_db::{Crate, Db};
+
+use crate::{
+    ConstId, FunctionId, ImplId, ModuleDefId, StaticId, TypeAliasId,
+    nameres::crate_def_map,
+    signatures::{ConstSignature, FunctionSignature, StaticSignature, TypeAliasSignature},
+};
+
+/// Every item declared in `krate`'s modules, module by module, each in the order written.
+pub fn declarations(db: &Db, krate: Crate) -> Vec<ModuleDefId> {
+    crate_def_map(db, krate)
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
+        .collect()
+}
+
+/// Every impl in `krate`'s modules, module by module, each in the order written.
+pub fn impls(db: &Db, krate: Crate) -> Vec<ImplId> {
+    crate_def_map(db, krate)
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
+        .collect()
+}
+
+/// The one function named `name` in `krate`; panics with how many there are otherwise.
+#[track_caller]
+pub fn function(db: &Db, krate: Crate, name: &str) -> FunctionId {
+    one(db, krate, "functions", name, |def| match def {
+        ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => Some(it),
+        _ => None,
+    })
+}
+
+/// The one type alias named `name` in `krate`; panics with how many there are otherwise.
+#[track_caller]
+pub fn type_alias(db: &Db, krate: Crate, name: &str) -> TypeAliasId {
+    one(db, krate, "type aliases", name, |def| match def {
+        ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => Some(it),
+        _ => None,
+    })
+}
+
+/// The one static named `name` in `krate`; panics with how many there are otherwise.
+#[track_caller]
+pub fn static_item(db: &Db, krate: Crate, name: &str) -> StaticId {
+    one(db, krate, "statics", name, |def| match def {
+        ModuleDefId::StaticId(it) if StaticSignature::of(db, it).name.as_str() == name => Some(it),
+        _ => None,
+    })
+}
+
+/// The one named constant `name` in `krate`; panics with how many there are otherwise.
+#[track_caller]
+pub fn constant(db: &Db, krate: Crate, name: &str) -> ConstId {
+    one(db, krate, "constants", name, |def| match def {
+        ModuleDefId::ConstId(it)
+            if ConstSignature::of(db, it).name.as_ref().is_some_and(|it| it.as_str() == name) =>
+        {
+            Some(it)
+        }
+        _ => None,
+    })
+}
+
+#[track_caller]
+fn one<T: Copy>(db: &Db, krate: Crate, what: &str, name: &str, pick: impl FnMut(ModuleDefId) -> Option<T>) -> T {
+    let found: Vec<T> = declarations(db, krate).into_iter().filter_map(pick).collect();
+    match found[..] {
+        [one] => one,
+        _ => panic!("{} {what} named `{name}`", found.len()),
+    }
+}
+```
+
+Its tests are its callers' (every helper is used by several suites above); hir-def's own
+`test_db.rs` can call `test_items::function(&db, db.test_crate(), "f")` wherever it looks one up.
+
+Status: open
+
+## dedup: salsa's `Sip` hasher forwarders onto `blaze_ids::fixed_width_writes!`
+
+From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). `vendor/salsa/src/fingerprint.rs`
+`impl Hasher for Sip<C, D>` (about lines 216-262) hand-writes `write_u8`..`write_isize` as
+little-endian bytes through `self.write`, `usize`/`isize` as 64 bits; so did `hir-ty-codegen`,
+`hir-ty-share` and `blaze-hashcons`. The one copy is the macro `blaze_ids::fixed_width_writes!()`
+in `crates/blaze-ids/src/std_hash.rs` (the same bytes; tested against the hand-written form).
+
+1. `vendor/salsa/Cargo.toml`, a dependency (the manifest is in cargo's normalized form):
+
+       [dependencies.blaze-ids]
+       path = "../../crates/blaze-ids"
+
+   (`blaze-ids` depends on `blake3`, `blaze-radix` and `serde` only, none of them on salsa.)
+
+2. `vendor/salsa/src/fingerprint.rs`, in `impl<const C: usize, const D: usize> Hasher for Sip<C, D>`:
+   keep `write` and `finish`; replace the twelve methods `write_u8` through `write_isize` by the
+   one line `blaze_ids::fixed_width_writes!();`. (`write_u8` becomes `self.write(&[i])`, as now;
+   `write_isize` becomes `(i as i64).to_le_bytes()`, the bytes of `i as i64 as u64` now.)
+
+
+## speed-hir-store-paths: paths as columns (2026-10-29)
+
+From `speed-hir-store-paths-consumers` (child of `speed-hir-store-paths`). hir-def's paths and
+generic arguments are columns now (`crates/hir-def/src/expr_store/path.rs`; the API is in
+`/tmp/blaze-lanes/v2-speed-hir-store-paths.md`, "The API"): `Path<'a>`, `GenericArgs<'a>`,
+`AssociatedTypeBinding<'a>`, `PathGenericArgs<'a>` and `Bindings<'a>` are `Copy` views decoded
+from the store; `TypeBound` and `WherePredicate` are `Copy` records whose `for<..>` binders and
+`use<..>` arguments are runs (`Names`, `UseArgs`) read with `store.names(..)` and
+`store.use_args(..)`. Apply these with the paths lane's own edits to `hir.rs`/`expr_store*`
+(one compile). Nothing here is built (common.md).
+
+The consumer rule:
+
+1. `&Path` parameters and fields become `Path<'_>` (by value; `Copy`). Where a function keeps
+   `&Path<'_>`, callers pass `&path`. `&store[p]` / `&map[p]` for a `PathId` -> `store.path(p)`.
+2. `Path::Normal(it) => &it.mod_path` -> `it.mod_path` (already a reference).
+   `it.generic_args` / `it.type_anchor` field reads are unchanged.
+3. `generic_args()` yields slots by value: `.into_iter().flatten().flatten()` still gives
+   `GenericArgs<'_>`; `.iter().any(Option::is_some)` -> `.iter().any(|it| it.is_some())`;
+   `generic_args()?.last()?.as_ref()?` -> `generic_args()?.last()??`; `&generic_args[i]` ->
+   `generic_args.get(i)`.
+4. `&GenericArgs` parameters -> `GenericArgs<'_>`; `Option<&GenericArgs>` -> `Option<GenericArgs<'_>>`
+   (drop `.as_ref()`/`.as_deref()`; `*args` -> `args`). `args.bindings.iter()`, `for b in
+   &args.bindings`, `.first()`, `.is_empty()`, `.len()` keep working; `bindings[i]` ->
+   `bindings.get(i).unwrap()` (or restructure), `&*bindings`/`bindings.as_ref()` -> iterate.
+5. `binding.args.as_ref()` -> `binding.args`; `&binding.bounds` / `binding.bounds.iter()`
+   unchanged (`&'a [TypeBound]`).
+6. `TypeBound::ForLifetime(lifetimes, path)`: `lifetimes` is `Names`; read with
+   `store.names(lifetimes)`. `TypeBound::Use(args)`: `store.use_args(args)`. `bound.clone()` ->
+   `*bound`; `&TypeBound::Path(p, m)` patterns keep working.
+7. `WherePredicate::TypeBound { lifetimes: Some(l), .. }`: `l` is `Names`; `store.names(l)`.
+8. `Path::from_known_path_with_no_generic(m)` -> `Path::from_known_path_with_no_generic(&m)`
+   (bind the `ModPath` to a local if it is a temporary used past the statement).
+9. `path.qualifier()` gives `Qualifier<'_>`: use `.path()` for a `Path<'_>` (bind the
+   qualifier to a local first: `let q = path.qualifier()?; let q = q.path();`).
+
+Applied the same way everywhere, so that callers in one crate agree with signatures in another:
+every `&Path`, `Option<&GenericArgs>`, `&GenericArgs`, `&[Option<GenericArgs>]` parameter,
+field and return becomes the by-value view, hir-def's `Resolver::resolve_path_in_*` and
+`record_path_uses` and hir-ty's path lowering included. Bodies are by-value views
+(`store.expr(id) -> Expr<'_>`), so `Expr::Path(p)` binds `p: Path<'_>` and most call sites
+keep their text. Also `args.args` is `&[GenericArg]` now, so `for arg in &args.args` becomes
+`for arg in args.args` (`&&[T]` is not `IntoIterator`).
+
+The edits assume, from the paths lane: `Expr::Path`/`Pat::Path`/`RecordLit`/`Pat::Record`/
+`Pat::TupleStruct` hold `Path<'a>`; `Expr::MethodCall { generic_args: Option<GenericArgs<'a>> }`;
+`AsmOperand::Sym(PathIdx)` read with `store.path_at(idx)` (both `pub`); `Index<PathId> for
+ExpressionStore` removed; `StoreVisitor::on_path`/`on_generic_args`/`on_type_bound` taking the
+views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
+
+Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
+old text (where the same text is on several lines, the function named beside it picks).
+
+
+### crates/hir-def/src/resolver.rs
+
+`path: &Path` becomes `path: Path<'_>` in all seven methods that take a path
+(`resolve_path_in_type_ns`, `resolve_path_in_type_ns_with_prefix_info`,
+`resolve_path_in_type_ns_fully`, `resolve_path_in_value_ns`,
+`resolve_path_in_value_ns_with_prefix_info`, `resolve_path_in_value_ns_fully`,
+`record_path_uses`); the inner calls pass `path` on unchanged (`Path` is `Copy`). In the
+`match path` that opens three of them, `Path::LangItem(l, ..)` binds `l: LangItemTarget` by
+value now, so `match *l` becomes `match l`.
+
+- line 211: `        path: &Path,` -> `        path: Path<'_>,`
+- line 229: `        path: &Path,` -> `        path: Path<'_>,`
+- line 239: `            Path::Normal(it) => &it.mod_path,` -> `            Path::Normal(it) => it.mod_path,`
+- line 241: `                let type_ns = match *l {` -> `                let type_ns = match l {`
+- line 341: `        path: &Path,` -> `        path: Path<'_>,`
+- line 379: `        path: &Path,` -> `        path: Path<'_>,`
+- line 399: `        path: &Path,` -> `        path: Path<'_>,`
+- line 404: `            Path::Normal(it) => &it.mod_path,` -> `            Path::Normal(it) => it.mod_path,`
+- line 407: `                    ResolveValueResult::ValueNs(match *l {` -> `                    ResolveValueResult::ValueNs(match l {`
+- line 425: `                let type_ns = match *l {` -> `                let type_ns = match l {`
+- line 591: `        path: &Path,` -> `        path: Path<'_>,`
+- line 638: `        path: &Path,` -> `        path: Path<'_>,` (`record_path_uses`)
+- line 645: `            Path::Normal(it) => &it.mod_path,` -> `            Path::Normal(it) => it.mod_path,`
+- line 871: `.resolve_path_in_type_ns_fully(db, &impl_data.store[target_trait.path])` -> `.resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))`
+
+### crates/hir-def/src/upvars.rs
+
+- line 151: `    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: &Path) {` -> `    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: Path<'_>) {`
+- lines 206-208 (`Expr::Path(path) => { self.resolve_maybe_upvar(expr, path); self.on_path(path); }`)
+  stay as they are: `path` is `Path<'_>` from the by-value view. This needs
+  `StoreVisitor::on_path` (`expr_store.rs`, the paths lane's) to take `path: Path<'_>` by
+  value, per the signature rule.
+
+### crates/hir-def/src/nameres/uses.rs
+
+- line 557: `resolver.record_path_uses(db, &path, Namespace::Types, hygiene, out);` -> `resolver.record_path_uses(db, path, Namespace::Types, hygiene, out);`
+- lines 535-551 stay: `Expr::Path(path)`, `Expr::RecordLit { path, .. }`, `Pat::Path(path)`,
+  `Pat::TupleStruct { path, .. }`, `Pat::Record { path, .. }` bind `Path<'_>` from the
+  by-value `store.exprs()`/`store.pats()` and pass it on as is.
+
+
+### crates/hir-ty/src/lower/path.rs
+
+- line 63: `    path: &'a Path,` -> `    path: Path<'a>,`
+- line 77: `        path: &'a Path,` -> `        path: Path<'a>,`
+- line 762: `        args_and_bindings: Option<&HirGenericArgs>,` -> `        args_and_bindings: Option<HirGenericArgs<'_>>,`
+- line 1023: `                            binding.args.as_ref(),` -> `                            binding.args,`
+- line 1125: `    Path(&'a Path),` -> `    Path(Path<'a>),`
+- line 1196: `    args_and_bindings: Option<&HirGenericArgs>,` -> `    args_and_bindings: Option<HirGenericArgs<'_>>,`
+- line 1312: `    args_and_bindings: Option<&HirGenericArgs>,` -> `    args_and_bindings: Option<HirGenericArgs<'_>>,`
+- line 1330: `args_and_bindings.map(|it| &*it.args)` -> `args_and_bindings.map(|it| it.args)`
+
+Sites that keep compiling as written: `self.path` passed to the resolver (`:349`, `:352`, `:405`,
+by value under the rule) and `matches!(self.path, Path::LangItem(..))`; every
+`.args_and_bindings.is_some()/is_none()`; `:708` `if let Some(args) = ..args_and_bindings`
+(a `Copy` value now); `:989`-`:990` `args_and_bindings.bindings.iter().enumerate()` in the
+`move` closure (yields `AssociatedTypeBinding<'a>`; `binding.name.clone()`, `binding.type_ref`,
+`binding.bounds.iter()` unchanged); `:1186` `&args_and_bindings.args[..]`; `:1319`
+`is_some_and(|it| it.has_self_type)`; `:1550` `TypeRef::Path(path) => TypeLikeConst::Path(path)`
+(`store.type_ref` is by value).
+
+### crates/hir-ty/src/lower.rs
+
+- line 818: `pub(crate) fn lower_path_as_const(&mut self, path: &Path, _const_type: Ty<'db>)` -> `pub(crate) fn lower_path_as_const(&mut self, path: Path<'_>, _const_type: Ty<'db>)`
+- line 1221: `            &self.store[path_id],` -> `            self.store.path(path_id),`
+- line 1226: `pub(crate) fn lower_path(&mut self, path: &Path, path_id: PathId)` -> `pub(crate) fn lower_path(&mut self, path: Path<'_>, path_id: PathId)`
+- line 1252: `pub fn lower_value_path_qualifier(&mut self, path: &Path) -> Option<Ty<'db>> {` -> `pub fn lower_value_path_qualifier(&mut self, path: Path<'_>) -> Option<Ty<'db>> {`
+- line 1260: `PathLoweringContext::new(self, on_diagnostic, &qualifier);` -> `PathLoweringContext::new(self, on_diagnostic, qualifier.path());`
+- line 1315: `self.with_shifted_in(lifetimes, |ctx| lower_type_outlives(ctx, target, bound)).0` -> `self.with_shifted_in(self.store.names(*lifetimes), |ctx| lower_type_outlives(ctx, target, bound)).0`
+  (`lifetimes: &Names`; `ctx.store` is the predicate's store: callers `set_owner` to the
+  generics whose predicates they lower, `:2808`, `:3556`, traits.rs `:417`)
+- lines 1360-1364 (the `for<..>` bound of an associated type's bound):
+
+```old
+            &TypeBound::ForLifetime(ref binder, path)
+                if of_assoc_ty
+                    && self.bound_vars_with_elided().len() == self.peek_bound_vars().len() =>
+            {
+                let generic_def = self.generic_def;
+```
+
+```new
+            &TypeBound::ForLifetime(binder, path)
+                if of_assoc_ty
+                    && self.bound_vars_with_elided().len() == self.peek_bound_vars().len() =>
+            {
+                let binder = self.store.names(binder);
+                let generic_def = self.generic_def;
+```
+
+  (`binder` borrows `*self.store`, not `self`, so `self.bound_vars.last_mut()` after it is fine;
+  `binder.iter()` at `:1367`-`:1368` reads the slice unchanged)
+- lines 1376-1377:
+
+```old
+            &TypeBound::ForLifetime(ref binder, path) => {
+                self.with_shifted_in(binder, |ctx| {
+```
+
+```new
+            &TypeBound::ForLifetime(binder, path) => {
+                self.with_shifted_in(self.store.names(binder), |ctx| {
+```
+
+- line 2754: `resolver.resolve_path_in_type_ns_fully(db, &signature.store[bounded_trait])` -> `resolver.resolve_path_in_type_ns_fully(db, signature.store.path(bounded_trait))`
+- line 4159: `path_lifetimes(db, resolver, store, &store[*path], found, self_references)?` -> `path_lifetimes(db, resolver, store, store.path(*path), found, self_references)?`
+- line 4175: `    path: &Path,` -> `    path: Path<'_>,`
+
+Keep compiling as written: `:880`-`:882` and `:4109` (`TypeRef::Path(path)` from the by-value
+`store.type_ref`, passed on by value); `:1137`-`:1147` (`path` by value to
+`resolve_path_in_type_ns`); `:2692`-`:2709`, `:2810`-`:2827`, `:3492`-`:3501` (`TypeBound::Path`
+/ `ForLifetime(_, p)` patterns on `*bound`, `PathId`s); `:4155`
+`path.generic_args().into_iter().flatten().flatten()` (gives `GenericArgs<'_>`; `it.bindings
+.is_empty()`, `it.parenthesized`, `it.args.iter()` unchanged); `:1100` (`FnType::binder` is
+unchanged).
+
+### crates/hir-ty/src/consteval.rs
+
+- line 319: `    path: &Path,` -> `    path: Path<'_>,`
+
+`:393` `Expr::Path(path)` from `match expr` (`store.expr` by value) binds `Path<'_>` and passes
+it as is.
+
+### crates/hir-ty/src/mir.rs
+
+- line 14: `    expr_store::{ExpressionStore, path::Path},` -> `    expr_store::ExpressionStore,`
+- line 17: `use hir_expand::name::Name;` -> `use hir_expand::{mod_path::ModPath, name::Name};`
+- line 2180:
+
+```old
+        path: Path,
+    },
+    RecordLiteralWithoutPath,
+```
+
+```new
+        /// `None` for a lang item path.
+        path: Option<ModPath>,
+    },
+    RecordLiteralWithoutPath,
+```
+
+  (`ModPath` has no lifetime, so `derive(SalsaValue)` accepts it as the old `Path` was; the
+  constructors in hir-ty-mir are under Cross-part)
+
+`mir.rs`'s `AsmOperand::Sym` hits are MIR's own `AsmOperand`, not hir-def's.
+
+### Checked, nothing breaks
+
+- `crates/hir-ty/src/generics.rs:194`-`:210`: `TypeRef::Path(path)` by value; `type_anchor()`,
+  `segments()`, `.args_and_bindings.is_none()`, `mod_path().and_then(|it| it.as_ident())` all
+  keep their types; the `&WherePredicate::TypeBound { lifetimes: None, .. }` pattern works with
+  `Option<Names>`.
+- `crates/hir-ty/src/effects.rs:285`: `Expr::MethodCall { .. }`.
+- `crates/hir-ty/src/db.rs:759`: `matches!(store.expr(..), Expr::Const(_))`.
+- False hits only (rustc_type_ir's `GenericArgs`/`GenericArg`, diagnostic enum names
+  `GenericArgsProhibited`, `ParenthesizedGenericArgsWithoutFnTrait`): `builtin_derive.rs`,
+  `dyn_compatibility.rs`, `inhabitedness.rs`, `intrinsic.rs`, `lib.rs`, `lower/batch.rs`,
+  `lower/diagnostics.rs`, `lower/persist.rs`, `representability.rs`, `solver_errors.rs`,
+  `variance.rs`, `next_solver/*` (`binder.rs`, `consts.rs`, `generic_arg.rs`, `interner.rs`,
+  `ir_print.rs`, `persist.rs`, `solver.rs`, `ty.rs`, `util.rs`, `infer/*`, `predicate.rs`,
+  `inspect.rs`, `next_solver.rs`). The rest of `crates/hir-ty/src/` outside `infer/`,
+  `infer.rs` and the items part's files (`mir/`, `variance/`, `target_feature/`, `autoderef.rs`,
+  `utils.rs`, `primitive.rs`, `lang_items.rs`, `evict.rs`) has no hit.
+
+
+### crates/hir-ty/src/infer.rs
+
+- line 2435 (`make_path_as_const`): `pub(crate) fn make_path_as_const(&mut self, path: &Path) -> Const<'db> {` -> `pub(crate) fn make_path_as_const(&mut self, path: Path<'_>) -> Const<'db> {`
+  (the `path_to_const(.., path)` call in its body stays: `path_to_const` takes `Path<'_>`, see
+  the `lower` part).
+- line 2580 (`fn resolve_variant`, the parameter after `node: ExprOrPatIdPacked,`): `        path: &Path,` -> `        path: Path<'_>,`
+  (body stays: `path.type_anchor()`, `path.segments()`, `path.mod_path()` and
+  `ctx.at_path(path, node)` all take the value).
+
+### crates/hir-ty/src/infer/diagnostics.rs
+
+- line 138 (`at_path`): `        path: &'b Path,` -> `        path: Path<'b>,`
+- line 155 (`at_path_forget_diagnostics`): `        path: &'b Path,` -> `        path: Path<'b>,`
+  (both `PathLoweringContext::new(&mut self.ctx, on_diagnostic, path)` calls stay; `new` takes
+  `Path<'a>`.)
+
+### crates/hir-ty/src/infer/path.rs
+
+- line 33 (`infer_path`): `        path: &Path,` -> `        path: Path<'_>,`
+- line 64 (`resolve_value_path`): `        path: &Path,` -> `        path: Path<'_>,`
+- line 149 (`resolve_value_path_inner`): `        path: &Path,` -> `        path: Path<'_>,`
+  (bodies stay: `if let Path::LangItem(..) = path` and `matches!(path, Path::LangItem(..))`
+  match the value; `ctx.at_path(path, id)`, `ctx.at_path_forget_diagnostics(path)` and the
+  `with_ty_lowering(|ctx| .. ctx.at_path(path, id) ..)` closure take the `Copy` value.)
+
+### crates/hir-ty/src/infer/expr.rs
+
+- line 930: `AsmOperand::Sym(ref path) => {` -> `AsmOperand::Sym(path) => {`
+- line 934: `self.infer_path(path, tgt_expr.into())` -> `self.infer_path(self.store.path_at(path), tgt_expr.into())`
+  (`AsmOperand::Sym` holds a `PathIdx`; `self.store` is `&'db ExpressionStore`, so the view
+  borrows the store, not `self`.)
+- line 1053 (`infer_record_expr`): `        path: &Path,` -> `        path: Path<'_>,`
+- line 1360: `fn infer_expr_path(&mut self, path: &Path, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {` -> `fn infer_expr_path(&mut self, path: Path<'_>, id: ExprOrPatIdPacked, scope_id: ExprId) -> Ty<'db> {`
+- line 1905 (`infer_method_call`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+
+Stay as written: `Expr::Path(p) => self.infer_expr_path(p, ..)` (521), `Expr::RecordLit { path,
+.. } => self.infer_record_expr(.., path, ..)` (648), `Expr::MethodCall { .., generic_args } =>
+self.infer_method_call(.., generic_args, ..)` (450), `is_syntactic_place_expr`'s
+`Expr::Path(Path::Normal(path)) => path.type_anchor.is_none()` and
+`resolve_path_in_value_ns_fully(self.db, path, ..)` (225-237; `match self.store.expr(expr)` is
+by value), and `lookup_method_including_private(.., None, ..)` (1768).
+
+### crates/hir-ty/src/infer/pat.rs
+
+- line 984: `fn resolve_record_pat(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {` -> `fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {`
+- line 1011: `fn resolve_pat_path(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {` -> `fn resolve_pat_path(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {`
+- line 1041 (`resolve_tuple_struct_pat`): `        path: &Path,` -> `        path: Path<'_>,`
+  (the callers at 308-310 match `self.store.pat(pat_id)` by value and pass `path` as is.)
+
+### No edits
+
+- `infer/closure/analysis.rs:331` and `infer/closure/analysis/expr_use_visitor.rs:950, 1344`:
+  `Expr::Path(path)` / `Pat::Path(path)` of by-value `store.expr`/`store.pat` passed to
+  `resolve_path_in_value_ns_fully`, which takes `Path<'_>`.
+- `expr_use_visitor.rs:605` `AsmOperand::Sym { .. }`, `infer/mutability.rs:83, 120, 145, 201`:
+  patterns that ignore the field.
+- `infer/persist.rs`, `unify.rs`, `callee.rs`, `op.rs`, `place_op.rs`, `coerce.rs`,
+  `closure.rs`: only `next_solver` `GenericArgs`/`GenericArg` and `MethodCallee`/diagnostic
+  names (false hits).
+
+
+### crates/hir-ty-matchck/src/lower.rs
+
+- line 320: `path: &Path,` -> `path: Path<'_>,`
+
+(Callers at lines 192, 340 and 578 bind `path` by value from `self.body.pat(..)` /
+`self.body.expr(..)` and pass it as is; line 326 passes it to `resolve_path_in_value_ns_fully`,
+which takes `Path<'_>`.)
+
+### crates/hir-ty-unsafeck/src/lib.rs
+
+- line 900: `fn check_static(&mut self, current: ExprId, path: &Path) {` -> `fn check_static(&mut self, current: ExprId, path: Path<'_>) {`
+
+(Line 389 passes `path` bound by value from `store.expr(current)`, where `store` is a copy of
+`self.store`, so the `&mut self` call doesn't conflict; line 912 passes it to
+`resolve_path_in_value_ns` as is.)
+
+### crates/hir-ty-wfcheck/src/lib.rs
+
+- line 594: `store[*path].segments()` -> `store.path(*path).segments()`
+
+(`compare.rs`, `outlives.rs`, `outlives/tests.rs`: only `next_solver` hits, no edits.)
+
+### crates/hir-ty-borrowck/src/regions.rs
+
+- line 330 (`opaque_captures`; `args` is now a `UseArgs` run with no `iter`; `listed` is read
+  with `.iter()` at lines 389 and 429, which keep working on the slice): `TypeBound::Use(args) => Some(args),` -> `TypeBound::Use(args) => Some(signature.store.use_args(*args)),`
+- line 474 (`nth_impl_trait`): `let in_path = |path: &'s hir_def::expr_store::path::Path, index: &mut usize| {` -> `let in_path = |path: hir_def::expr_store::path::Path<'s>, index: &mut usize| {`
+- line 475 (`args.args` is `&'s [GenericArg]` now; `&&[T]` is not `IntoIterator`): first of the two
+  `for arg in &args.args {` -> `for arg in args.args {`
+- line 496: `in_path(&store[*path], index)` -> `in_path(store.path(*path), index)`
+- lines 4183 (`written_self`), 4396 (`spelled_positions`), 4444 (`spelled_projections`), 4643
+  (`lower_written_qualifier`), 6772 (`names_through_type`), all five occurrences:
+  `path: &hir_def::expr_store::path::Path,` -> `path: hir_def::expr_store::path::Path<'_>,`
+- line 4420 (`spelled_positions`; `args` is `Option<GenericArgs<'_>>`, consumer rule 4): `.as_ref()?` -> `?`
+- line 6615 (`writes_self`): `fn args(store: &hir_def::expr_store::ExpressionStore, generic: &GenericArgs) -> bool {` -> `fn args(store: &hir_def::expr_store::ExpressionStore, generic: GenericArgs<'_>) -> bool {`
+- line 6622: `binding.args.as_ref().is_some_and(|it| args(store, it))` -> `binding.args.is_some_and(|it| args(store, it))`
+- line 6626: `fn path(store: &hir_def::expr_store::ExpressionStore, path: &Path) -> bool {` -> `fn path(store: &hir_def::expr_store::ExpressionStore, path: Path<'_>) -> bool {`
+- line 6660 (`writes_elided`): `let path = |path: &Path| {` -> `let path = |path: Path<'_>| {`
+- line 6679: `TypeBound::Path(it, _) => path(&store[*it]),` -> `TypeBound::Path(it, _) => path(store.path(*it)),`
+- line 6726 (`elided_lifetimes`): second of the two `for arg in &args.args {` -> `for arg in args.args {`
+- line 6852: `pub(super) fn spells_generics(path: &hir_def::expr_store::path::Path) -> bool {` -> `pub(super) fn spells_generics(path: hir_def::expr_store::path::Path<'_>) -> bool {`
+- line 6853 (`iter` yields `Option<GenericArgs<'_>>` by value; `Option::is_some` takes `&self`): `args.iter().any(Option::is_some)` -> `args.iter().any(|it| it.is_some())`
+
+Sites that keep compiling once those signatures change (checked, no edit): every
+`Expr::Path(path)` / `Pat::Path(path)` / `Expr::RecordLit { path, .. }` bound by value from
+`store.expr(..)` / `store.pat(..)` and passed to `spells_generics`, `written_self`,
+`spelled_projections`, `spelled_positions`, `names_through_type` or the resolver (lines ~2106,
+2113, 2233, 2360, 3883–3897, 4120–4142, 4958, 4999, 5047–5049); `path.generic_args()
+.into_iter().flatten().flatten()` (lines 474, 2118, 6629, 6660, 6722); `args.bindings.iter()`,
+`&args.bindings`, `args.bindings.is_empty()`; `qualifier.args_and_bindings?` (line ~4648,
+now `Option<GenericArgs>` by value); `path.qualifier().is_some_and(|it| it.is_self_type())`
+(`Qualifier::is_self_type` exists); `bound.as_path(store)` (line ~6632, gives `Path<'_>`);
+`TypeRef::Path(path)` from `store.type_ref(..)` (by value, lines 509, 5419, 6635, 6671, 6714).
+
+### crates/hir-ty-borrowck/src/scan.rs, scan/tests.rs, loans.rs, qualifs.rs
+
+No edits: `Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(path)` and
+`Expr::Path(path)` bind `Path<'_>` by value (`spelled(pat: Pat<'_>)`, `store.exprs()`,
+`store.expr(..)`), passed to `spells_generics` (now `Path<'_>`) or
+`resolve_path_in_value_ns_fully` as is; `path.is_self_type()` (loans.rs 208) works on the view.
+
+### crates/hir-ty-borrowck/src/check.rs, lib.rs, liveness.rs, names.rs, polonius.rs, moves.rs
+
+No edits: `next_solver` `GenericArgs`, MIR `AsmOperand`, and `self.bindings` / `store[binding]`
+(binding ids, not paths).
+
+### crates/hir-ty-matchck/src/cx.rs
+
+No edits: `next_solver` `GenericArgs` only.
+
+
+### crates/hir/src/attrs.rs
+
+```old
+    let path = Path::from_known_path_with_no_generic(path);
+    let base_def = resolver.resolve_path_in_type_ns_fully(db, &path)?;
+```
+```new
+    let path = Path::from_known_path_with_no_generic(&path);
+    let base_def = resolver.resolve_path_in_type_ns_fully(db, path)?;
+```
+(lines 432-433; the shadowed `ModPath` stays alive to the end of the function.)
+
+### crates/hir/src/display.rs
+
+- line 252-262 (in `write_function`, the async return type):
+  ```old
+                    *data.store[path]
+                        .segments()
+                        .iter()
+                        .last()
+                        .unwrap()
+                        .args_and_bindings
+                        .unwrap()
+                        .bindings[0]
+                        .type_ref
+                        .as_ref()
+                        .unwrap(),
+  ```
+  ```new
+                    data.store
+                        .path(path)
+                        .segments()
+                        .iter()
+                        .last()
+                        .unwrap()
+                        .args_and_bindings
+                        .unwrap()
+                        .bindings
+                        .get(0)
+                        .unwrap()
+                        .type_ref
+                        .unwrap(),
+  ```
+- line 298: `hir_display_with_store(&impl_data.store[target_trait.path], impl_.into(), &impl_data.store)` -> `hir_display_with_store(impl_data.store.path(target_trait.path), impl_.into(), &impl_data.store)`
+  (`T = Path<'a>` borrowing `impl_data.store`, which is `&'a`; needs hir-ide's `impl .. for Path<'_>` above)
+
+- line 834: `lifetimes.iter().map(|it| it.display(f.db, f.edition())).join(", ");` -> `store.names(*lifetimes).iter().map(|it| it.display(f.db, f.edition())).join(", ");`
+  (`write_where_predicates` gets the generics' own store at both calls, 148 and 780)
+
+Unchanged: 328-329 `TypeRef::Path(p) if p.is_self_type()` (by-value view), 793, 817-850 otherwise.
+
+### crates/hir/src/source_analyzer.rs
+
+Assumes `ExprCollector::lower_path` returns `Option<PathIdx>` (see "For speed-hir-store-paths").
+
+- lines 961-967 (in `resolve_record_field`):
+  ```old
+            let path = Path::from_known_path_with_no_generic(ModPath::from_segments(
+                PathKind::Plain,
+                once(local_name.clone()),
+            ));
+            match self.resolver.resolve_path_in_value_ns_fully(
+                db,
+                &path,
+  ```
+  ```new
+            let mod_path = ModPath::from_segments(PathKind::Plain, once(local_name.clone()));
+            let path = Path::from_known_path_with_no_generic(&mod_path);
+            match self.resolver.resolve_path_in_value_ns_fully(
+                db,
+                path,
+  ```
+- lines 1287-1291 (in `resolve_path`):
+  ```old
+        let hir_path =
+            collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+        let parent_hir_path = path
+            .parent_path()
+            .and_then(|p| collector.lower_path(p, &mut ExprCollector::impl_trait_error_allocator));
+        let (store, _) = collector.store.finish();
+  ```
+  ```new
+        let hir_path =
+            collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+        let parent_hir_path = path
+            .parent_path()
+            .and_then(|p| collector.lower_path(p, &mut ExprCollector::impl_trait_error_allocator));
+        let (store, _) = collector.store.finish();
+        let hir_path = store.path_at(hir_path);
+        let parent_hir_path = parent_hir_path.map(|it| store.path_at(it));
+  ```
+- line 1300: `return resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store)` -> `return resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store)`
+- line 1317: `return match resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store) {` -> `return match resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store) {`
+- line 1405: `return match resolve_hir_path_as_attr_macro(db, &self.resolver, &hir_path) {` -> `return match resolve_hir_path_as_attr_macro(db, &self.resolver, hir_path) {`
+- line 1421: `resolve_hir_path_qualifier(db, &self.resolver, &hir_path, &store).map(|it| (it, None))` -> `resolve_hir_path_qualifier(db, &self.resolver, hir_path, &store).map(|it| (it, None))`
+- line 1428: `                &hir_path,` -> `                hir_path,`
+- lines 1495-1500 (in `resolve_hir_path_per_ns`):
+  ```old
+        let (store, _) = collector.store.finish();
+        Some(resolve_hir_path_(
+            db,
+            &self.resolver,
+            self.infer_body,
+            &hir_path,
+  ```
+  ```new
+        let (store, _) = collector.store.finish();
+        let hir_path = store.path_at(hir_path);
+        Some(resolve_hir_path_(
+            db,
+            &self.resolver,
+            self.infer_body,
+            hir_path,
+  ```
+- lines 1641 and 1681 (both, in `resolve_offset_in_format_args` and `as_format_args_parts`): `&Path::from_known_path_with_no_generic(ModPath::from_segments(` -> `Path::from_known_path_with_no_generic(&ModPath::from_segments(`
+  (the `ModPath` temporary lives to the end of the enclosing expression; the result doesn't borrow it)
+- line 1855: `    path: &Path,` -> `    path: Path<'_>,` (`resolve_hir_path`)
+- line 1866: `    path: &Path,` -> `    path: Path<'_>,` (`resolve_hir_path_as_attr_macro`)
+- line 1878: `    path: &Path,` -> `    path: Path<'_>,` (`resolve_hir_path_`)
+- line 2046: `    path: &Path,` -> `    path: Path<'_>,` (`resolve_hir_value_path`)
+- line 2086: `    path: &Path,` -> `    path: Path<'_>,` (`resolve_hir_path_qualifier`)
+
+Unchanged and checked: 1050/1054 `Expr::Path(path) => path` / `Pat::Path(path) => path` (by-value
+views) passed to `resolve_hir_value_path` at 1065; the bodies of the five functions (`path` is
+`Copy`, captured by the `types`/`values`/`items`/`macros` closures; `path.segments().first()`,
+`path.mod_path()?`, `path.type_anchor()` and the resolver calls take it by value); 1336-1340
+`hir_path.mod_path()`, `parent_hir_path.segments().get(1).map(|it| it.name)`; 2183.
+
+### crates/hir/src/semantics.rs
+
+- line 2465: `let is_not_generated = |path: &Path| {` -> `let is_not_generated = |path: Path<'_>| {`
+  (2527 `Expr::Path(path) = store.expr(..)` gives `Some(path)` by value; 2537 `is_not_generated(path)` and 2541 `resolve_path_in_value_ns_fully(self.db, path, hygiene)` pass it as is)
+- line 2827: `&Path::BarePath(ModPath::from_segments(kind, segments)),` -> `Path::BarePath(&ModPath::from_segments(kind, segments)),`
+- line 2895: `fn resolve_path(&mut self, node: ExprOrPatId, path: &Path) {` -> `fn resolve_path(&mut self, node: ExprOrPatId, path: Path<'_>) {`
+  (2912 `if let Path::BarePath(path) = path` binds `&ModPath` as before; caller 2942-2944 passes the by-value `Expr::Path(path)`)
+
+Unchanged: 1730 `TypeRef::Path(path) => path` (by-value `type_ref` view) into `resolve_path_in_type_ns_fully`.
+
+### crates/hir/src/diagnostics.rs
+
+- line 1924: `let args = store[*path].generic_args()?.last()?.as_ref()?;` -> `let args = store.path(*path).generic_args()?.last()??;`
+
+Unchanged: 1771-1773 (`TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path)` bind `&PathId`;
+`path.type_ref()`), 1840 `args.bindings.first()?.type_ref?`. Every other hit is a diagnostic's
+name (`UnresolvedMethodCall`, `GenericArgsProhibited`, ...).
+
+### hir, no edit
+
+- `lib.rs`: every hit is next-solver `GenericArgs`/`GenericArg`, `Mode::MethodCall`,
+  `CallableKind::TupleStruct`, or the private `use hir_def::expr_store::path::Path` (241, still valid).
+  `hir::WherePredicate` (6572) is a next-solver clause, not hir-def's.
+- `tests.rs`: next-solver `GenericArgs`, `.bindings()` on a binder. `term_search/expr.rs`: `ModPath`.
+- `source_analyzer.rs:387`: `where_predicate_must_hold(.., predicate)` (hir-ty `traits.rs`, the `lower` part's).
+
+Status: open
+
+## frontend-nameres-core-macros: `Debug` on `MacroSubNs` (2026-10-29)
+
+From `frontend-nameres-core-macros` (report `/tmp/blaze-lanes/v2-frontend-nameres-core-macros.md`).
+
+`crates/hir-def/src/nameres.rs`, above `pub enum MacroSubNs {`: old
+`#[derive(Clone, Copy, PartialEq, Eq)]`, new `#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]`.
+
+Why: `collector.rs`'s `#[derive(Debug)] struct ResolvedMacroPath` (the `NameRecords` work) holds
+a `MacroSubNs` and does not compile without it. (The facts resolver's `DeclOp::ResolvedMacroPath`
+carries `bang: bool` instead, so it does not need this.)
+
+Status: open
+
+## dedup: bits: hir-ty-borrowck onto `blaze_ids::bits` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `crates/hir-ty-borrowck/src/bitset.rs` is one of a dozen copies of the same `u64`-word bit
+set; `blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`) is the one family now. Its `BitSet`,
+`BitMatrix`, `masks` (`range_masks`), `union_words`, `iter_words` and `words_for` are deleted; the
+`Transfer` trait stays in borrowck (an analysis trait) and moves to `dataflow.rs` beside
+`GenKill`, implemented there for `blaze_ids::bits::BitSet`. `bitset.rs`'s four tests are already
+in `crates/blaze-ids/src/bits/tests.rs`. Behavior is unchanged: same members, the same panics
+(insert and ranges past the capacity), `contains` past it false. `hir-ty-borrowck/Cargo.toml`
+already has `blaze-ids.workspace = true`. Edit by content: `dataflow.rs`'s tests are being
+edited by another agent (the `SplitMix64` move), so line numbers drift.
+
+Renames at call sites: `BitSet::union` is `union_with`, `BitSet::load(words)` is
+`assign_words(words)`, `iter_words(m.row(r))` is `m.iter_row(r)`. `BitMatrix::row`/`row_mut`
+now return `BitSlice`/`BitSliceMut` views, not `&[u64]`/`&mut [u64]`: take `.words()` where a
+slice is wanted. `BitMatrix::insert` now returns `bool` (whether it was new), so a closure
+that ends in it gains braces (`liveness.rs`'s `locals_in` callers).
+
+### 1. `crates/hir-ty-borrowck/src/bitset.rs`: delete the file.
+
+### 2. `crates/hir-ty-borrowck/src/lib.rs`
+
+Before:
+
+```rust
+mod bitset;
+mod cfg;
+```
+
+After:
+
+```rust
+mod cfg;
+```
+
+### 3. `crates/hir-ty-borrowck/src/dataflow.rs`
+
+Imports and the `Transfer` trait. Before:
+
+```rust
+use std::collections::VecDeque;
+
+use hir_ty_mir::mir::BasicBlockId;
+
+use super::{
+    bitset::{BitMatrix, BitSet, Transfer, masks, union_words, words_for},
+    cfg::{Cfg, index},
+};
+
+```
+
+After:
+
+```rust
+use std::{collections::VecDeque, ops::Range};
+
+use blaze_ids::bits::{BitMatrix, BitSet, range_masks, words_for};
+use hir_ty_mir::mir::BasicBlockId;
+
+use super::cfg::{Cfg, index};
+
+/// What a statement does to a set: adds and removes bits, whatever is in it. Applied to a
+/// [`BitSet`] as a walk goes, or composed into a block's gen and kill sets ([`GenKill::row`]),
+/// from the one function either way.
+pub(super) trait Transfer {
+    fn gen_range(&mut self, range: Range<usize>);
+    fn kill_range(&mut self, range: Range<usize>);
+
+    #[inline]
+    fn gen_(&mut self, bit: usize) {
+        self.gen_range(bit..bit + 1);
+    }
+
+    #[inline]
+    fn kill(&mut self, bit: usize) {
+        self.kill_range(bit..bit + 1);
+    }
+}
+
+impl Transfer for BitSet {
+    #[inline]
+    fn gen_range(&mut self, range: Range<usize>) {
+        self.insert_range(range);
+    }
+
+    #[inline]
+    fn kill_range(&mut self, range: Range<usize>) {
+        self.remove_range(range);
+    }
+}
+
+```
+
+In `impl Transfer for Row<'_>`, both `masks(range, |word, mask| {` become
+`range_masks(range, |word, mask| {` (two places), and `fn gen_range(&mut self, range:
+std::ops::Range<usize>)` / `fn kill_range(&mut self, range: std::ops::Range<usize>)` may drop the
+`std::ops::` (now imported; leaving it also compiles).
+
+`forward`, before:
+
+```rust
+    for (word, from) in entry.row_mut(index(start)).iter_mut().zip(boundary.words()) {
+        *word = *from;
+    }
+    let mut out = vec![0u64; blocks.words];
+    let mut along = vec![0u64; blocks.words];
+    let mut queue = WorkQueue::new(count, cfg.order.iter().copied());
+    while let Some(at) = queue.pop() {
+        out.copy_from_slice(entry.row(index(at)));
+        blocks.apply(index(at), &mut out);
+        for &to in cfg.successors(at) {
+            along.copy_from_slice(&out);
+            edge(at, to, &mut along);
+            if union_words(entry.row_mut(index(to)), &along) {
+                queue.push(to);
+            }
+        }
+    }
+```
+
+After (`boundary` has the row's words: every caller sizes it to the analysis's domain):
+
+```rust
+    entry.row_mut(index(start)).copy_from(boundary);
+    let mut out = BitSet::new(blocks.words * 64);
+    let mut along = BitSet::new(blocks.words * 64);
+    let mut queue = WorkQueue::new(count, cfg.order.iter().copied());
+    while let Some(at) = queue.pop() {
+        out.copy_from(&entry.row(index(at)));
+        blocks.apply(index(at), out.words_mut());
+        for &to in cfg.successors(at) {
+            along.copy_from(&out);
+            edge(at, to, along.words_mut());
+            if entry.union_row_with(index(to), &along) {
+                queue.push(to);
+            }
+        }
+    }
+```
+
+`backward`, before:
+
+```rust
+    let mut exit = vec![0u64; blocks.words];
+    let mut along = vec![0u64; blocks.words];
+    let mut queue = WorkQueue::new(count, cfg.order.iter().rev().copied());
+    while let Some(at) = queue.pop() {
+        exit.fill(0);
+        for &to in cfg.successors(at) {
+            along.copy_from_slice(entry.row(index(to)));
+            edge(at, to, &mut along);
+            union_words(&mut exit, &along);
+        }
+        blocks.apply(index(at), &mut exit);
+        if entry.row(index(at)) != exit.as_slice() {
+            entry.row_mut(index(at)).copy_from_slice(&exit);
+```
+
+After:
+
+```rust
+    let mut exit = BitSet::new(blocks.words * 64);
+    let mut along = BitSet::new(blocks.words * 64);
+    let mut queue = WorkQueue::new(count, cfg.order.iter().rev().copied());
+    while let Some(at) = queue.pop() {
+        exit.clear();
+        for &to in cfg.successors(at) {
+            along.copy_from(&entry.row(index(to)));
+            edge(at, to, along.words_mut());
+            exit.union_with(&along);
+        }
+        blocks.apply(index(at), exit.words_mut());
+        if entry.row(index(at)).words() != exit.words() {
+            entry.row_mut(index(at)).copy_from(&exit);
+```
+
+Tests module, before:
+
+```rust
+    use super::{GenKill, backward, forward};
+    use crate::{
+        bitset::{BitSet, Transfer, iter_words},
+        cfg::{Cfg, block, index},
+    };
+```
+
+After (keep whatever other `use` lines the module has, such as `blaze_ids::rng::SplitMix64`):
+
+```rust
+    use blaze_ids::bits::{BitMatrix, BitSet};
+
+    use super::{GenKill, Transfer, backward, forward};
+    use crate::cfg::{Cfg, block, index};
+```
+
+and before:
+
+```rust
+    fn rows(entry: &crate::bitset::BitMatrix, blocks: usize) -> Vec<Vec<usize>> {
+        (0..blocks).map(|b| iter_words(entry.row(b)).collect()).collect()
+    }
+```
+
+After:
+
+```rust
+    fn rows(entry: &BitMatrix, blocks: usize) -> Vec<Vec<usize>> {
+        (0..blocks).map(|b| entry.iter_row(b).collect()).collect()
+    }
+```
+
+### 4. `crates/hir-ty-borrowck/src/loans.rs`
+
+Before:
+
+```rust
+use super::{
+    Ctx,
+    bitset::{BitMatrix, BitSet, Transfer},
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, forward},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::{BitMatrix, BitSet};
+
+use super::{
+    Ctx,
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, Transfer, forward},
+```
+
+No other change (`BitSet::new`, `insert`, `BitMatrix::new` keep their meaning).
+
+### 5. `crates/hir-ty-borrowck/src/moves.rs`
+
+Before:
+
+```rust
+use super::{
+    Ctx,
+    bitset::{BitMatrix, BitSet, Transfer},
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, forward},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::{BitMatrix, BitSet};
+
+use super::{
+    Ctx,
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, Transfer, forward},
+```
+
+No other change (`first_in`, `filled`, `kill_range` through `Transfer`, `insert`).
+
+### 6. `crates/hir-ty-borrowck/src/liveness.rs`
+
+Imports, before:
+
+```rust
+use super::{
+    Ctx,
+    bitset::{BitMatrix, BitSet, Transfer, union_words},
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, backward, forward},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::{BitMatrix, BitSet};
+
+use super::{
+    Ctx,
+    cfg::{Cfg, Location, index},
+    dataflow::{GenKill, Transfer, backward, forward},
+```
+
+`live_ranges`, before:
+
+```rust
+    let mut live = BitSet::new(locals);
+    let mut along = vec![0u64; live.words().len()];
+    for &block in &cfg.order {
+        live.clear();
+        for &successor in cfg.successors(block) {
+            along.copy_from_slice(entry.row(index(successor)));
+            edge(block, successor, &mut along);
+            union_words(live.words_mut(), &along);
+        }
+```
+
+After:
+
+```rust
+    let mut live = BitSet::new(locals);
+    let mut along = BitSet::new(locals);
+    for &block in &cfg.order {
+        live.clear();
+        for &successor in cfg.successors(block) {
+            along.copy_from(&entry.row(index(successor)));
+            edge(block, successor, along.words_mut());
+            live.union_with(&along);
+        }
+```
+
+`maybe_initialized_at_drops`, before:
+
+```rust
+        state.load(entry.row(index(block)));
+```
+
+After:
+
+```rust
+        state.assign_words(entry.row(index(block)).words());
+```
+
+and before:
+
+```rust
+        locals_in(moves, &state, |local| exit.insert(index(block), local));
+        if returns_to[index(block)].is_some() {
+            maybe_init_effect(moves, cfg, terminator, &mut state, true);
+            locals_in(moves, &state, |local| returned.insert(index(block), local));
+        }
+```
+
+After:
+
+```rust
+        locals_in(moves, &state, |local| {
+            exit.insert(index(block), local);
+        });
+        if returns_to[index(block)].is_some() {
+            maybe_init_effect(moves, cfg, terminator, &mut state, true);
+            locals_in(moves, &state, |local| {
+                returned.insert(index(block), local);
+            });
+        }
+```
+
+`InitAtExit::restrict`, before:
+
+```rust
+        for (word, mask) in live.iter_mut().zip(mask) {
+```
+
+After:
+
+```rust
+        for (word, mask) in live.iter_mut().zip(mask.words()) {
+```
+
+(`values[rv].union(..)` in this file is `IntervalSet::union`: unchanged.)
+
+### 7. `crates/hir-ty-borrowck/src/check.rs`
+
+Before:
+
+```rust
+use super::{
+    Applicability, BorrowckDiagnostic, Ctx, Mode, PartSpan,
+    bitset::BitSet,
+    cfg::{Cfg, Dominators, Location, index},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+
+use super::{
+    Applicability, BorrowckDiagnostic, Ctx, Mode, PartSpan,
+    cfg::{Cfg, Dominators, Location, index},
+```
+
+Before:
+
+```rust
+        checker.uninit.load(flow.uninit_entry.row(index(block)));
+        checker.ever.load(flow.ever_entry.row(index(block)));
+        checker.in_scope.load(borrows_entry.row(index(block)));
+```
+
+After:
+
+```rust
+        checker.uninit.assign_words(flow.uninit_entry.row(index(block)).words());
+        checker.ever.assign_words(flow.ever_entry.row(index(block)).words());
+        checker.in_scope.assign_words(borrows_entry.row(index(block)).words());
+```
+
+### 8. `crates/hir-ty-borrowck/src/check/explain.rs`
+
+Before:
+
+```rust
+use super::Checker;
+use crate::{
+    BorrowckDiagnostic, PartSpan,
+    bitset::BitSet,
+    cfg::Location,
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+
+use super::Checker;
+use crate::{
+    BorrowckDiagnostic, PartSpan,
+    cfg::Location,
+```
+
+### 9. `crates/hir-ty-borrowck/src/scan.rs`
+
+Before:
+
+```rust
+use crate::{
+    bitset::BitSet,
+    regions::{Annotation, spells_generics},
+};
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+
+use crate::regions::{Annotation, spells_generics};
+```
+
+### 10. `crates/hir-ty-borrowck/src/polonius.rs`
+
+Before:
+
+```rust
+use super::{
+    Ctx,
+    bitset::BitSet,
+    cfg::{Cfg, Location, index},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+
+use super::{
+    Ctx,
+    cfg::{Cfg, Location, index},
+```
+
+(`polonius.rs` already has `use blaze_ids::radix;`; the two may merge into
+`use blaze_ids::{bits::BitSet, radix};`.)
+
+### 11. `crates/hir-ty-borrowck/src/inference.rs`
+
+Before:
+
+```rust
+use super::{
+    bitset::{BitMatrix, iter_words},
+    intervals::IntervalSet,
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitMatrix;
+
+use super::{
+    intervals::IntervalSet,
+```
+
+Before:
+
+```rust
+        iter_words(self.universals.row(self.scc[rv] as usize))
+```
+
+After:
+
+```rust
+        self.universals.iter_row(self.scc[rv] as usize)
+```
+
+### 12. `crates/hir-ty-borrowck/src/regions.rs`
+
+Before:
+
+```rust
+use super::{
+    Ctx,
+    bitset::BitMatrix,
+    cfg::{Cfg, Location},
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitMatrix;
+
+use super::{
+    Ctx,
+    cfg::{Cfg, Location},
+```
+
+No other change (`BitMatrix::default`, `new`, `insert`, `contains`, `union_rows`).
+
+### 13. `crates/hir-ty-borrowck/src/constraints.rs`: the inline `from_closure` words
+
+Before:
+
+```rust
+use hir_ty::mir::MirSpan;
+
+use super::{
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+use hir_ty::mir::MirSpan;
+
+use super::{
+```
+
+Before:
+
+```rust
+    from_closure: Vec<u64>,
+```
+
+After:
+
+```rust
+    from_closure: BitSet,
+```
+
+Before (in `push`):
+
+```rust
+        if at.is_multiple_of(64) {
+            self.from_closure.push(0);
+        }
+        if it.from_closure {
+            self.from_closure[at / 64] |= 1 << (at % 64);
+        }
+```
+
+After (a word per 64 constraints whatever the last bit, as before):
+
+```rust
+        self.from_closure.set_growing(at, it.from_closure);
+```
+
+Before (in `get`):
+
+```rust
+            from_closure: self.from_closure[at / 64] & (1 << (at % 64)) != 0,
+```
+
+After:
+
+```rust
+            from_closure: self.from_closure.contains(at),
+```
+
+Status: open
+
+## dedup: bits: hir-ty `infer/columns.rs` sets onto `blaze_ids::bits` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `Presence` is the rank9 set `blaze_ids::bits::Ranked` is; `IdxSet`, `VarSet` and `set_bit`
+are the growable `u64`-word set `blaze_ids::bits::BitSet` is. `Presence` stays as a one-field
+wrapper because it keeps an invariant `Ranked` does not (its last word is never zero, so a column
+has one form and derived `Eq` means "same keys"); `IdxSet` stays as a wrapper for the same
+invariant and its `DenseKey` keys (an `Idx<T>` can't implement `BitIndex` here, both foreign).
+`VarSet` and `set_bit` are deleted. Behavior is unchanged: the same members, places and
+iteration order, `from_parts`/`from_words` refuse what they refused, and the persisted columns
+(`present()`, `words()`) are the same words. `Hash` of `IdxSet` is unchanged (a `BitSet` hashes
+its word slice, as a `Vec<u64>` does); `Hash` of `Presence` now also hashes `Ranked`'s `len`
+(`words.len() * 64`, a function of the words), so in-memory hash values of `IndexColumn`/`Csr`
+change, which is harmless: nothing persists a `std::hash::Hash` value, and equality is the same.
+`hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+### 1. `crates/hir-ty/src/infer/columns.rs`
+
+Imports, before:
+
+```rust
+use blaze_ids::radix;
+```
+
+After:
+
+```rust
+use blaze_ids::{
+    bits::{BitSet, Ranked},
+    radix,
+};
+```
+
+`Presence` and `set_bit`, before (from the doc comment of `struct Presence` through the end of
+`fn set_bit`):
+
+```rust
+/// Which keys of a sparse column have a row, and where it is: a bit per key, and per word of
+/// bits how many keys before it have one, so a row's place is one popcount (rank as in
+/// Vigna's rank9). That is 1.5 bits a key where a `u32` place per key is 32, and the ranks are
+/// made again from the bits, never stored.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct Presence {
+    /// Its last word is never zero.
+    words: Box<[u64]>,
+    ranks: Box<[u32]>,
+}
+
+impl Presence {
+    fn new(words: Vec<u64>) -> Result<Presence, &'static str> {
+        if words.last() == Some(&0) {
+            return Err("a sparse column whose last word of keys has none");
+        }
+        let mut ranks = Vec::with_capacity(words.len());
+        let mut before = 0u32;
+        for &word in &words {
+            ranks.push(before);
+            before = before.checked_add(word.count_ones()).ok_or("a column of 2^32 rows")?;
+        }
+        Ok(Presence { words: words.into_boxed_slice(), ranks: ranks.into_boxed_slice() })
+    }
+
+    /// How many keys have a row.
+    fn count(&self) -> usize {
+        match (self.ranks.last(), self.words.last()) {
+            (Some(&rank), Some(word)) => rank as usize + word.count_ones() as usize,
+            _ => 0,
+        }
+    }
+
+    /// The place of `index`'s row among the rows, if it has one.
+    #[inline]
+    fn place(&self, index: usize) -> Option<usize> {
+        let (at, bit) = (index / 64, index % 64);
+        let word = *self.words.get(at)?;
+        if word & (1 << bit) == 0 {
+            return None;
+        }
+        Some(self.ranks[at] as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+    }
+
+    /// Each key with a row and the row's place, in key order.
+    fn keys(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
+        self.words.iter().zip(&self.ranks).enumerate().flat_map(|(at, (&word, &rank))| {
+            (0..64usize).filter(move |&bit| word & (1 << bit) != 0).map(move |bit| {
+                (at * 64 + bit, rank as usize + (word & ((1u64 << bit) - 1)).count_ones() as usize)
+            })
+        })
+    }
+}
+
+/// Sets `index`'s bit in `words`, growing them.
+fn set_bit(words: &mut Vec<u64>, index: usize) {
+    let at = index / 64;
+    if at >= words.len() {
+        words.resize(at + 1, 0);
+    }
+    words[at] |= 1 << (index % 64);
+}
+```
+
+After:
+
+```rust
+/// Which keys of a sparse column have a row, and where it is: a bit per key, ranked, so a
+/// row's place is one popcount. Not a bare [`Ranked`]: its last word is never zero, so a column
+/// has one form and two that hold the same keys are equal. The ranks are made again from the
+/// bits, never stored.
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+struct Presence(Ranked);
+
+impl Presence {
+    fn new(words: Vec<u64>) -> Result<Presence, &'static str> {
+        if words.last() == Some(&0) {
+            return Err("a sparse column whose last word of keys has none");
+        }
+        let len = words.len() * 64;
+        Ranked::from_words(words, len).map(Presence).ok_or("a column of 2^32 rows")
+    }
+
+    /// Which keys have a row: bit `key % 64` of word `key / 64`.
+    fn words(&self) -> &[u64] {
+        self.0.words()
+    }
+
+    /// How many keys have a row.
+    fn count(&self) -> usize {
+        self.0.count()
+    }
+
+    /// The place of `index`'s row among the rows, if it has one.
+    #[inline]
+    fn place(&self, index: usize) -> Option<usize> {
+        self.0.place(index)
+    }
+
+    /// Each key with a row and the row's place, in key order.
+    fn keys(&self) -> impl DoubleEndedIterator<Item = (usize, usize)> + '_ {
+        self.0.iter_ranked()
+    }
+}
+```
+
+`IndexColumn::from_entries`, before:
+
+```rust
+        let (mut words, mut rows) = (Vec::new(), Vec::new());
+        for (index, row) in dense(entries).into_iter().enumerate() {
+            if let Some(row) = row {
+                set_bit(&mut words, index);
+                rows.push(row);
+            }
+        }
+        let present = Presence::new(words).expect("a bit is set in every word that is made");
+```
+
+After:
+
+```rust
+        let (mut words, mut rows) = (BitSet::<usize>::default(), Vec::new());
+        for (index, row) in dense(entries).into_iter().enumerate() {
+            if let Some(row) = row {
+                words.insert_growing(index);
+                rows.push(row);
+            }
+        }
+        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
+```
+
+`IndexColumn::present` and `Csr::present` (two places), before:
+
+```rust
+        &self.present.words
+```
+
+After:
+
+```rust
+        self.present.words()
+```
+
+`CsrBuilder::freeze`, before:
+
+```rust
+        let mut words = Vec::new();
+        let mut ends = Vec::new();
+```
+
+After:
+
+```rust
+        let mut words = BitSet::<usize>::default();
+        let mut ends = Vec::new();
+```
+
+before:
+
+```rust
+            set_bit(&mut words, index);
+            in_order &= range.start as usize == next;
+```
+
+After:
+
+```rust
+            words.insert_growing(index);
+            in_order &= range.start as usize == next;
+```
+
+before:
+
+```rust
+        let present = Presence::new(words).expect("a bit is set in every word that is made");
+        let ends = ends.into_boxed_slice();
+```
+
+After:
+
+```rust
+        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
+        let ends = ends.into_boxed_slice();
+```
+
+`IdxSet`, before (the struct through `fn shrink_to_fit`'s impl block end):
+
+```rust
+/// A set of keys as a bitset, its last word never zero.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct IdxSet<K> {
+    words: Vec<u64>,
+    key: PhantomData<fn() -> K>,
+}
+
+impl<K> Default for IdxSet<K> {
+    fn default() -> Self {
+        IdxSet { words: Vec::new(), key: PhantomData }
+    }
+}
+
+impl<K: DenseKey> IdxSet<K> {
+    /// Adds `key`, returning whether it was not in the set.
+    pub(crate) fn insert(&mut self, key: K) -> bool {
+        let index = key.to_index();
+        let word = index / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        let bit = 1u64 << (index % 64);
+        let new = self.words[word] & bit == 0;
+        self.words[word] |= bit;
+        new
+    }
+
+    #[inline]
+    pub fn contains(&self, key: &K) -> bool {
+        let index = key.to_index();
+        self.words.get(index / 64).is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = K> + '_ {
+        self.words.iter().enumerate().flat_map(|(at, &word)| {
+            (0..64).filter(move |bit| word & (1 << bit) != 0).map(move |bit| K::from_index(at * 64 + bit))
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    pub(crate) fn from_words(words: Vec<u64>) -> Result<Self, &'static str> {
+        match words.last() {
+            Some(0) => Err("a set whose last word is zero"),
+            _ => Ok(IdxSet { words, key: PhantomData }),
+        }
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.words.shrink_to_fit();
+    }
+}
+```
+
+After (it only grows, so its last word stays nonzero):
+
+```rust
+/// A set of keys as a bitset, its last word never zero, so two that hold the same keys are
+/// equal.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct IdxSet<K> {
+    words: BitSet,
+    key: PhantomData<fn() -> K>,
+}
+
+impl<K> Default for IdxSet<K> {
+    fn default() -> Self {
+        IdxSet { words: BitSet::default(), key: PhantomData }
+    }
+}
+
+impl<K: DenseKey> IdxSet<K> {
+    /// Adds `key`, returning whether it was not in the set.
+    pub(crate) fn insert(&mut self, key: K) -> bool {
+        self.words.insert_growing(key.to_index())
+    }
+
+    #[inline]
+    pub fn contains(&self, key: &K) -> bool {
+        self.words.contains(key.to_index())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = K> + '_ {
+        self.words.iter().map(K::from_index)
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words.words().is_empty()
+    }
+
+    pub fn words(&self) -> &[u64] {
+        self.words.words()
+    }
+
+    pub(crate) fn from_words(words: Vec<u64>) -> Result<Self, &'static str> {
+        match words.last() {
+            Some(0) => Err("a set whose last word is zero"),
+            _ => Ok(IdxSet { words: BitSet::from_words(words), key: PhantomData }),
+        }
+    }
+
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.words.shrink_to_fit();
+    }
+}
+```
+
+`VarSet`, delete (from its doc comment through the end of `impl VarSet`):
+
+```rust
+/// The type variables a coercion of `!` reached, by their index: rustc's
+/// `diverging_type_vars`, which only ever holds type variables.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct VarSet {
+    words: Vec<u64>,
+}
+
+impl VarSet {
+    pub(crate) fn insert(&mut self, var: u32) {
+        ...
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, var: u32) -> bool {
+        ...
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        ...
+    }
+}
+```
+
+Tests, `presence_places_agree_with_counting_the_keys_before`, before:
+
+```rust
+            let mut words = Vec::new();
+            keys.iter().for_each(|&k| set_bit(&mut words, k as usize));
+            let present = Presence::new(words).unwrap();
+```
+
+After:
+
+```rust
+            let words: BitSet = keys.iter().map(|&k| k as usize).collect();
+            let present = Presence::new(words.into_words()).unwrap();
+```
+
+Tests, `var_set_lists_what_it_holds`, before:
+
+```rust
+        let mut set = VarSet::default();
+        for var in [0, 63, 64, 200, 3, 63] {
+            set.insert(var);
+        }
+```
+
+After:
+
+```rust
+        let mut set = BitSet::<u32>::default();
+        for var in [0, 63, 64, 200, 3, 63] {
+            set.insert_growing(var);
+        }
+```
+
+(the rest of that test is unchanged: `iter()` yields `u32`, `contains(var)` takes a `u32`).
+
+### 2. `crates/hir-ty/src/infer/unify.rs`
+
+Before:
+
+```rust
+use smallvec::SmallVec;
+use thin_vec::ThinVec;
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+use smallvec::SmallVec;
+use thin_vec::ThinVec;
+```
+
+Before:
+
+```rust
+    infer::columns::VarSet,
+```
+
+After: the line deleted (from the `use crate::{ ... }` list).
+
+Before:
+
+```rust
+    pub(super) diverging_type_vars: VarSet,
+```
+
+After (rustc's `diverging_type_vars`: the type variables a coercion of `!` reached, by index):
+
+```rust
+    pub(super) diverging_type_vars: BitSet<u32>,
+```
+
+Before:
+
+```rust
+            diverging_type_vars: VarSet::default(),
+```
+
+After:
+
+```rust
+            diverging_type_vars: BitSet::default(),
+```
+
+Before (in `set_diverging`):
+
+```rust
+            self.diverging_type_vars.insert(vid.as_u32());
+```
+
+After:
+
+```rust
+            self.diverging_type_vars.insert_growing(vid.as_u32());
+```
+
+### 3. `crates/hir-ty/src/infer/fallback.rs`
+
+Before:
+
+```rust
+use rustc_hash::FxHashMap;
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+use rustc_hash::FxHashMap;
+```
+
+Before:
+
+```rust
+    infer::{InferenceContext, columns::VarSet},
+```
+
+After:
+
+```rust
+    infer::InferenceContext,
+```
+
+Before:
+
+```rust
+        let mut diverging_roots = VarSet::default();
+```
+
+After:
+
+```rust
+        let mut diverging_roots = BitSet::<u32>::default();
+```
+
+Before:
+
+```rust
+                diverging_roots.insert(self.table.infer_ctxt.root_var(vid).as_u32());
+```
+
+After:
+
+```rust
+                diverging_roots.insert_growing(self.table.infer_ctxt.root_var(vid).as_u32());
+```
+
+(`diverging_roots.contains(...)` and `self.table.diverging_type_vars.iter()` are unchanged:
+`contains` takes the `u32`, `iter` yields `u32`s.)
+
+Status: open
+
+## dedup: bits: hir-ty `TargetFeatureSet` onto `blaze_ids::bits::BitArray` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `TargetFeatureSet` is an inline `[u64; WORDS]` set with its own copy of the word ops;
+`blaze_ids::bits::BitArray` is that set, with `const` `with_bit`/`has_bit`/`or` for the
+`IMPLIED` table built at compile time. It stays as a one-field struct (its `Debug` names the
+features, and its `const fn` API takes `TargetFeature`s, used by `hir-ty-codegen`), its own bit
+logic deleted; `TargetFeature` becomes a `BitIndex`. Nothing changes for callers: the same API,
+72 bytes (asserted), the same `Eq`, and the same `Hash` value (an array and a `Bits` both hash
+the word slice, length first). `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+### `crates/hir-ty/src/target_feature.rs`
+
+Imports, before:
+
+```rust
+use base_db::{Db, Crate};
+```
+
+After:
+
+```rust
+use base_db::{Db, Crate};
+use blaze_ids::bits::{BitArray, BitIndex};
+```
+
+Before (`impl fmt::Debug for TargetFeature` through the end of `impl TargetFeatureSet`):
+
+```rust
+/// A set of target features, one bit each: 72 bytes, a test is one load and a shift.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TargetFeatureSet([u64; WORDS]);
+
+const _: () = assert!(size_of::<TargetFeatureSet>() == 72);
+
+impl TargetFeatureSet {
+    pub const EMPTY: Self = Self([0; WORDS]);
+```
+
+After:
+
+```rust
+impl BitIndex for TargetFeature {
+    #[inline]
+    fn to_bit(self) -> usize {
+        self.index()
+    }
+
+    #[inline]
+    fn from_bit(bit: usize) -> Self {
+        Self(<u16 as BitIndex>::from_bit(bit))
+    }
+}
+
+/// A set of target features, one bit each: 72 bytes, a test is one load and a shift. A struct
+/// of its own for a `Debug` that names the features.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TargetFeatureSet(BitArray<WORDS, TargetFeature>);
+
+const _: () = assert!(size_of::<TargetFeatureSet>() == 72);
+
+impl TargetFeatureSet {
+    pub const EMPTY: Self = Self(BitArray::<WORDS, TargetFeature>::EMPTY);
+```
+
+Before (`with` through `union`):
+
+```rust
+    #[inline]
+    pub const fn with(mut self, feature: TargetFeature) -> Self {
+        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
+        self
+    }
+
+    #[inline]
+    pub fn insert(&mut self, feature: TargetFeature) {
+        self.0[feature.index() / 64] |= 1 << (feature.index() % 64);
+    }
+
+    #[inline]
+    pub const fn contains(&self, feature: TargetFeature) -> bool {
+        (self.0[feature.index() / 64] >> (feature.index() % 64)) & 1 != 0
+    }
+
+    #[inline]
+    pub const fn union(&self, other: &Self) -> Self {
+        let mut out = *self;
+        let mut i = 0;
+        while i < WORDS {
+            out.0[i] |= other.0[i];
+            i += 1;
+        }
+        out
+    }
+
+    /// Whether every feature of `other` is in `self`.
+    #[inline]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.0.iter().zip(&other.0).all(|(mine, theirs)| theirs & !mine == 0)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|&word| word == 0)
+    }
+```
+
+After:
+
+```rust
+    #[inline]
+    pub const fn with(self, feature: TargetFeature) -> Self {
+        Self(self.0.with_bit(feature.index()))
+    }
+
+    #[inline]
+    pub fn insert(&mut self, feature: TargetFeature) {
+        self.0.insert(feature);
+    }
+
+    #[inline]
+    pub const fn contains(&self, feature: TargetFeature) -> bool {
+        self.0.has_bit(feature.index())
+    }
+
+    #[inline]
+    pub const fn union(&self, other: &Self) -> Self {
+        Self(self.0.or(&other.0))
+    }
+
+    /// Whether every feature of `other` is in `self`.
+    #[inline]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other.0.is_subset(&self.0)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+```
+
+Before (`iter`):
+
+```rust
+    pub fn iter(&self) -> impl Iterator<Item = TargetFeature> + '_ {
+        self.0.iter().enumerate().flat_map(|(at, &word)| {
+            let mut rest = word;
+            std::iter::from_fn(move || {
+                if rest == 0 {
+                    return None;
+                }
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                Some(TargetFeature((at * 64) as u16 + bit as u16))
+            })
+        })
+    }
+```
+
+After:
+
+```rust
+    pub fn iter(&self) -> impl Iterator<Item = TargetFeature> + '_ {
+        self.0.iter()
+    }
+```
+
+Before (`same`):
+
+```rust
+    const fn same(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < WORDS {
+            if self.0[i] != other.0[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+```
+
+After (`==` is not `const`):
+
+```rust
+    const fn same(&self, other: &Self) -> bool {
+        let (ours, theirs) = (self.0.array(), other.0.array());
+        let mut i = 0;
+        while i < WORDS {
+            if ours[i] != theirs[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+```
+
+`of`, `implied_in`, `names`, `FromIterator`, `Debug`, `IMPLIED` and `target_feature/tests.rs`
+are unchanged.
+
+Status: open
+
+## dedup: bits: hir-ty `ParamsInRepr` onto `blaze_ids::bits` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `ParamsInRepr` is a growable bit set (a first word inline, the rest in a `ThinVec`) with its
+own bit logic. As `blaze_ids::bits::Bits<SmallVec<[u64; 1]>>` it is 24 bytes instead of 16 and
+still allocates nothing for an ADT of up to 64 parameters (nearly all). 8 bytes more per ADT's
+memo is small next to the memo's own revision data, so the 16-byte layout is not worth a copy of
+the set kept on purpose. The same members; `contains` past the words is false, as `get` was.
+`ParamsInRepr` is private to the file, so nothing outside changes. `hir-ty/Cargo.toml` already
+has `blaze-ids.workspace = true` and `smallvec.workspace = true`.
+
+### `crates/hir-ty/src/representability.rs`
+
+Before:
+
+```rust
+use base_db::Db;
+use hir_def::{AdtId, VariantId};
+use rustc_type_ir::inherent::IntoKind;
+use thin_vec::ThinVec;
+```
+
+After:
+
+```rust
+use base_db::Db;
+use blaze_ids::bits::Bits;
+use hir_def::{AdtId, VariantId};
+use rustc_type_ir::inherent::IntoKind;
+use smallvec::SmallVec;
+```
+
+Before (the doc comment through the end of `impl ParamsInRepr`):
+
+```rust
+/// Which of an ADT's generic parameters, by index, appear in its representation: a bitset, the
+/// first 64 parameters in one word, which allocates nothing for nearly every ADT.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+struct ParamsInRepr {
+    first: u64,
+    rest: ThinVec<u64>,
+}
+
+const _: () = assert!(size_of::<ParamsInRepr>() == 16);
+
+impl ParamsInRepr {
+    #[inline]
+    fn get(&self, index: usize) -> bool {
+        ...
+    }
+
+    fn insert(&mut self, index: usize) {
+        ...
+    }
+}
+```
+
+After:
+
+```rust
+/// Which of an ADT's generic parameters, by index, appear in its representation: a bitset, the
+/// first 64 parameters in its one inline word, which allocates nothing for nearly every ADT.
+type ParamsInRepr = Bits<SmallVec<[u64; 1]>>;
+
+const _: () = assert!(size_of::<ParamsInRepr>() == 24);
+```
+
+In `representability_adt_ty`, before:
+
+```rust
+            && params_in_repr.get(i)
+```
+
+After:
+
+```rust
+            && params_in_repr.contains(i)
+```
+
+In `params_in_repr`, before:
+
+```rust
+    params_in_repr.rest.shrink_to_fit();
+    params_in_repr
+```
+
+After:
+
+```rust
+    params_in_repr.shrink_to_fit();
+    params_in_repr
+```
+
+In `params_in_repr_ty`, before:
+
+```rust
+                    && inner_params_in_repr.get(i)
+```
+
+After:
+
+```rust
+                    && inner_params_in_repr.contains(i)
+```
+
+before:
+
+```rust
+        TyKind::Param(param) => params_in_repr.insert(param.index as usize),
+```
+
+After:
+
+```rust
+        TyKind::Param(param) => {
+            params_in_repr.insert_growing(param.index as usize);
+        }
+```
+
+Tests, before:
+
+```rust
+    #[test]
+    fn params_in_repr_is_a_bitset_past_one_word() {
+        let mut set = ParamsInRepr::default();
+        for index in [0, 5, 63, 64, 130] {
+            set.insert(index);
+        }
+        let set_bits: Vec<usize> = (0..200).filter(|&it| set.get(it)).collect();
+        assert_eq!(set_bits, [0, 5, 63, 64, 130]);
+        assert_eq!(set.rest.len(), 2);
+    }
+
+    #[test]
+    fn params_in_repr_of_few_params_allocates_nothing() {
+        let mut set = ParamsInRepr::default();
+        set.insert(3);
+        set.insert(40);
+        assert!(set.rest.is_empty());
+        assert!(set.get(3) && set.get(40) && !set.get(4) && !set.get(64));
+    }
+```
+
+After:
+
+```rust
+    #[test]
+    fn params_in_repr_is_a_bitset_past_one_word() {
+        let mut set = ParamsInRepr::default();
+        for index in [0, 5, 63, 64, 130] {
+            set.insert_growing(index);
+        }
+        let set_bits: Vec<usize> = (0..200).filter(|&it| set.contains(it)).collect();
+        assert_eq!(set_bits, [0, 5, 63, 64, 130]);
+        assert_eq!(set.words().len(), 3);
+    }
+
+    #[test]
+    fn params_in_repr_of_few_params_allocates_nothing() {
+        let mut set = ParamsInRepr::default();
+        set.insert_growing(3);
+        set.insert_growing(40);
+        assert!(!set.into_words().spilled());
+        let mut set = ParamsInRepr::default();
+        set.insert_growing(3);
+        set.insert_growing(40);
+        assert!(set.contains(3) && set.contains(40) && !set.contains(4) && !set.contains(64));
+    }
+```
+
+(`thin_vec` stays a dependency of `hir-ty` for its other users.)
+
+Status: open
+
+## dedup: TerminatorKind::all_successors (from dedup-scan)
+
+Four copies of "every successor, the unwind last" (borrowck `cfg.rs` `successors`, hir-ty-mir
+`optimize.rs` `successors`, blaze-items `form.rs` `push_successors` reversed; all agree on every
+terminator). In `crates/hir-ty/src/mir.rs`, after `TerminatorKind::unwind`:
+```rust
+/// Every block this terminator may go to: its successors, the imaginary edge of a
+/// `FalseEdge`, and the block it unwinds to, last.
+pub fn all_successors(&self) -> SmallVec<[BasicBlockId; 2]> {
+    match self {
+        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+            smallvec![*real_target, *imaginary_target]
+        }
+        _ => {
+            let mut all = self.successors();
+            all.extend(self.unwind());
+            all
+        }
+    }
+}
+```
+`crates/hir-ty-borrowck/src/cfg.rs`: delete `pub(super) fn successors(kind: &TerminatorKind)` and
+call `kind.all_successors()` where it was called (`Cfg::successors(&self, block)` keeps its name).
+Callers in codegen.md and items.md.
+
+## dedup: ARITH_OPS is ArithOp::ALL (from dedup-scan)
+
+`crates/hir-def/src/hir/columns.rs` and `crates/hir-ty/src/infer/persist.rs` each have
+`const ARITH_OPS: [ArithOp; 10]` in `syntax::ast::ArithOp`'s declaration order; both are
+persisted codes. After frontend-tree adds `ArithOp::ALL` (frontend-tree.md), delete both consts
+and use `ArithOp::ALL` at each `ARITH_OPS` (columns.rs 571, 578, 2022, 2023; persist.rs 424, 431,
+2349, 2943). Same order, so every code decodes as before.
+
+## dedup: block_may_start_with_inner_attr once, in syntax::view (from dedup-scan)
+
+`crates/hir-def/src/attrs/docs.rs`'s `block_may_start_with_inner_doc` and `block_comment_len` are
+syntax's `block_may_start_with_inner_attr` and `block_comment_len` (in both `ast/traits.rs` and
+`view/traits.rs`) except that `//!` and `/*!` answer true. After frontend-tree makes the view one
+`pub fn block_may_start_with_inner_attr(block: &str, inner_docs: bool) -> bool`
+(frontend-tree.md), delete both functions from docs.rs and call
+`syntax::view::block_may_start_with_inner_attr(block, true)` where
+`block_may_start_with_inner_doc(block)` was.
+
+## dedup: bits: hir-ty `mir/held.rs` off `rustc_index::DenseBitSet` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `held.rs`'s `Set` is a local analysis set, not a type of a rustc interface, so it is the one
+bit set `blaze_ids::bits::BitSet` (the `DenseBitSet`s that stay in hir-ty are
+`UnsizingParams`, rustc_type_ir's `Interner::UnsizingParams` target, and `layout.rs`'s
+`BitMatrix`, the argument of rustc_abi's `layout_of_coroutine`). Same members and results:
+every set of one analysis is made with the same size, so equality (`live_in[..] != state`) is
+unchanged. One check is weaker: `DenseBitSet::insert` asserts the bit is below the domain size,
+`BitSet::insert` only below the word capacity (the next multiple of 64); every index here is a
+local of the body, below `count`. `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+### `crates/hir-ty/src/mir/held.rs`
+
+Before:
+
+```rust
+use rustc_index::bit_set::DenseBitSet;
+use smallvec::SmallVec;
+```
+
+After:
+
+```rust
+use blaze_ids::bits::BitSet;
+use smallvec::SmallVec;
+```
+
+Before:
+
+```rust
+type Set = DenseBitSet<usize>;
+```
+
+After:
+
+```rust
+type Set = BitSet;
+```
+
+Renames, every occurrence in the file (tests included):
+
+- `Set::new_empty(` becomes `Set::new(` (18 places);
+- `Set::new_filled(` becomes `Set::filled(` (1 place, `always_storage_live`);
+- `.union(` becomes `.union_with(` (8 places: lines about 231, 244, 362, 425, 432, 438, 541,
+  653; every one is on a `Set`, and line 362's `changed |= known.union_with(new)` keeps its
+  `bool`);
+- `.intersect(` becomes `.intersect_with(` (4 places: about 232, 534, 647, 651).
+
+In the tests' `model`, before:
+
+```rust
+        let count = held.domain_size();
+```
+
+After (`together` is indexed by locals, all below it):
+
+```rust
+        let count = held.capacity();
+```
+
+`insert`, `remove`, `contains`, `clear`, `clone_from`, `clone`, `iter` and `!=` keep their
+meaning.
+
+Status: open
+
+## frontend-db: the `compile_fail` test that `HirDatabase` is not dyn-compatible doesn't run (2026-10-29)
+
+`frontend-db-ty` sealed `HirDatabase` and gave it `const NOT_DYN: ()`, so `dyn HirDatabase` is a
+compile error, and wrote the `compile_fail` doc test that says so (db.md's request, section 5).
+`crates/hir-ty/Cargo.toml:13` has `doctest = false` (hir, hir-ide and base-db too), so the test
+never runs. The compiler enforces the property either way (E0038 on any `dyn HirDatabase`); the
+test only documents it. Choose one:
+- `doctest = false` becomes `doctest = true` in `crates/hir-ty/Cargo.toml`. Every other doc
+  example in hir-ty then runs too, unless it is marked `ignore`/`text`.
+- or the test goes and its line in the notes' proof list becomes "enforced by `NOT_DYN`",
+  which frontend-db will write.
+Answer with a `>` line.
+
+Status: open
+
+## dedup: blaze_query::query_kinds! (from dedup-scan)
+
+`crates/hir-def/src/nameres/facts/kinds.rs` and `crates/hir-ty/src/db.rs`'s `pub mod kinds` each
+define the same `macro_rules! kinds`, `const NAMES` table and `fn name` (only the range and the
+word in the assert differ). One macro in `crates/blaze-query/src/lib.rs`, next to `QueryKind`:
+```rust
+/// The kind numbers of one crate's queries: `RANGE`, a constant for each kind, [`ALL`] with
+/// each query's name, `of(name)`, and `name(kind)` from a table built when compiled, which
+/// refuses a number outside `RANGE` or given twice.
+#[macro_export]
+macro_rules! query_kinds {
+    (
+        range: $range:expr, owner: $owner:literal;
+        $($(#[$meta:meta])* $name:ident = $number:literal, $query:literal;)*
+    ) => {
+        pub use $crate::QueryKind;
+
+        #[doc = ::core::concat!("The numbers ", $owner, " may give.")]
+        pub const RANGE: ::core::ops::Range<u16> = $range;
+
+        $($(#[$meta])* pub const $name: QueryKind = QueryKind($number);)*
+
+        /// Every kind, with its query as its crate names it: a function's name, or
+        /// `Type::method` for a method of a tracked `impl`.
+        pub const ALL: &[(QueryKind, &str)] = &[$(($name, $query)),*];
+
+        /// The kind of the query named `name`, as [`ALL`] names it.
+        pub fn of(name: &str) -> Option<QueryKind> {
+            match name {
+                $($query => Some($name),)*
+                _ => None,
+            }
+        }
+
+        const NAMES: [Option<&str>; (RANGE.end - RANGE.start) as usize] = {
+            let mut names = [None; (RANGE.end - RANGE.start) as usize];
+            let mut at = 0;
+            while at < ALL.len() {
+                let (kind, name) = ALL[at];
+                ::core::assert!(
+                    RANGE.start <= kind.0 && kind.0 < RANGE.end,
+                    ::core::concat!("a kind outside ", $owner, "'s range"),
+                );
+                let slot = (kind.0 - RANGE.start) as usize;
+                ::core::assert!(names[slot].is_none(), "a kind given to two queries");
+                names[slot] = Some(name);
+                at += 1;
+            }
+            names
+        };
+
+        /// The query of `kind`, if it is this crate's: one bounds check and one load.
+        pub fn name(kind: QueryKind) -> Option<&'static str> {
+            NAMES.get(kind.0.wrapping_sub(RANGE.start) as usize).copied().flatten()
+        }
+    };
+}
+```
+- `hir-def/src/nameres/facts/kinds.rs`: keep the module doc and tests; replace `pub use`,
+  `RANGE`, the macro, `NAMES` and `name` with
+  `blaze_query::query_kinds! { range: 0x2200..0x2240, owner: "the resolver"; MODULE_DECLS = 0x2200, "module_decls"; … }`
+  (the current `kinds! { … }` body unchanged).
+- `hir-ty/src/db.rs` `pub mod kinds`: the same, `range: 0x2400..0x2600, owner: "hir-ty";`.
+
+Numbers and names are unchanged, so traces and the explainer read as before.
+`hir-def/src/expr_store/persist.rs`'s `kinds!` is another macro (column enums) and stays.
+
+## dedup: bits: hir-def `item_scope.rs` `Bits`, `signatures.rs` `VariantBits`, `import_map.rs` `trait_assoc_items` onto `blaze_ids::bits` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: three more copies of the `u64`-word bit set, each with its own bit logic, onto the one
+`blaze_ids::bits::Bits` over the same storage: `item_scope.rs`'s `Bits` is
+`Bits<ThinVec<u64>>` (`set_growing` gives a set kept beside a list the list's words whatever its
+last bit, as `push` did), `VariantBits` is `Bits<SmallVec<[u64; 1]>>` (still 24 bytes, asserted,
+inline up to 64 variants), and `ImportMap::trait_assoc_items` is a `BitSet`. Same members, same
+word counts, so the same `Eq` (`ItemScope`'s and `EnumVariants`' hand-written `eq` compare these
+fields). Two reads no longer panic on an index past the words (`VariantBits::get` indexed;
+`contains` is false there); every index is a variant or row of the list beside it, so none is.
+The derived `Debug` now lists the members instead of the words. `hir-def/Cargo.toml` already has
+`blaze-ids.workspace = true`.
+
+### 1. `crates/hir-def/src/item_scope.rs`
+
+Before:
+
+```rust
+use blaze_ids::radix;
+```
+
+After:
+
+```rust
+use blaze_ids::{bits::Bits, radix};
+```
+
+Before:
+
+```rust
+/// A bit per position of a list beside it, 64 to a word; the bits past the list's end are clear,
+/// so two of the same length are equal when their words are.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Bits(ThinVec<u64>);
+
+impl Bits {
+    /// Sets bit `at` to `bit`, for the position the list just gave its newest element.
+    pub(crate) fn push(&mut self, at: usize, bit: bool) {
+        if at % 64 == 0 {
+            self.0.push(0);
+        }
+        self.0[at / 64] |= u64::from(bit) << (at % 64);
+    }
+
+    pub(crate) fn get(&self, at: usize) -> bool {
+        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
+    }
+}
+
+```
+
+After:
+
+```rust
+/// A bit per position of a list beside it, set by `set_growing` as the list grows, so it has
+/// the list's words and two of the same length are equal when their words are.
+pub(crate) type ListBits = Bits<ThinVec<u64>>;
+
+```
+
+Fields, before:
+
+```rust
+    pub(crate) trait_impl: Bits,
+    /// A bit per impl of `impls`, by position: whether it is `#[rustc_reservation_impl]`.
+    pub(crate) reservation_impl: Bits,
+```
+
+After:
+
+```rust
+    pub(crate) trait_impl: ListBits,
+    /// A bit per impl of `impls`, by position: whether it is `#[rustc_reservation_impl]`.
+    pub(crate) reservation_impl: ListBits,
+```
+
+Before:
+
+```rust
+    fn impls_where(&self, bits: &Bits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls
+            .iter()
+            .enumerate()
+            .filter(move |&(at, _)| bits.get(at) == set)
+```
+
+After:
+
+```rust
+    fn impls_where(&self, bits: &ListBits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
+        self.impls
+            .iter()
+            .enumerate()
+            .filter(move |&(at, _)| bits.contains(at) == set)
+```
+
+Before:
+
+```rust
+            .filter(|&(at, _)| self.trait_impl.get(at) && !self.reservation_impl.get(at))
+```
+
+After:
+
+```rust
+            .filter(|&(at, _)| self.trait_impl.contains(at) && !self.reservation_impl.contains(at))
+```
+
+Before (`define_impl`):
+
+```rust
+        self.trait_impl.push(at, is_trait_impl);
+        self.reservation_impl.push(at, is_reservation);
+```
+
+After:
+
+```rust
+        self.trait_impl.set_growing(at, is_trait_impl);
+        self.reservation_impl.set_growing(at, is_reservation);
+```
+
+Before (the `shrink_to_fit` list):
+
+```rust
+        trait_impl.0.shrink_to_fit();
+        reservation_impl.0.shrink_to_fit();
+```
+
+After:
+
+```rust
+        trait_impl.shrink_to_fit();
+        reservation_impl.shrink_to_fit();
+```
+
+### 2. `crates/hir-def/src/nameres/frozen.rs`
+
+Before:
+
+```rust
+            self.bool(trait_impl.get(at));
+            self.bool(reservation_impl.get(at));
+```
+
+After:
+
+```rust
+            self.bool(trait_impl.contains(at));
+            self.bool(reservation_impl.contains(at));
+```
+
+Before:
+
+```rust
+            scope.trait_impl.push(at, self.bool()?);
+            scope.reservation_impl.push(at, self.bool()?);
+```
+
+After (the persisted bytes are unchanged: a bool a position):
+
+```rust
+            scope.trait_impl.set_growing(at, self.bool()?);
+            scope.reservation_impl.set_growing(at, self.bool()?);
+```
+
+### 3. `crates/hir-def/src/nameres/facts/tests.rs`
+
+Before:
+
+```rust
+                    .map(|(at, &it)| (self.impl_(it), trait_impl.get(at), reservation_impl.get(at)))
+```
+
+After:
+
+```rust
+                    .map(|(at, &it)| (self.impl_(it), trait_impl.contains(at), reservation_impl.contains(at)))
+```
+
+### 4. `crates/hir-def/src/signatures.rs`
+
+Imports, before:
+
+```rust
+use smallvec::{SmallVec, smallvec};
+```
+
+After (`smallvec!` had no other use in the file):
+
+```rust
+use blaze_ids::bits::Bits;
+use smallvec::SmallVec;
+```
+
+Before:
+
+```rust
+/// One bit per variant, by index, kept inline up to 64 variants: no allocation for almost
+/// every enum. Bits past the last variant are zero, so equal sets are equal words.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VariantBits(SmallVec<[u64; 1]>);
+
+// The inline word and its length, or a heap pointer and its length, plus the capacity.
+const _: () = assert!(size_of::<VariantBits>() == 24);
+
+impl VariantBits {
+    /// `len` bits, all clear.
+    fn with_len(len: usize) -> VariantBits {
+        VariantBits(smallvec![0; len.div_ceil(64)]) // alloc: inline up to 64 variants
+    }
+
+    fn get(&self, index: usize) -> bool {
+        (self.0[index / 64] >> (index % 64)) & 1 == 1
+    }
+
+    fn set(&mut self, index: usize, value: bool) {
+        let (word, bit) = (&mut self.0[index / 64], index % 64);
+        *word = (*word & !(1 << bit)) | (u64::from(value) << bit);
+    }
+
+    /// Keeps the words of the first `len` bits, the rest being clear.
+    fn truncate(&mut self, len: usize) {
+        self.0.truncate(len.div_ceil(64));
+        self.0.shrink_to_fit();
+    }
+}
+```
+
+After:
+
+```rust
+/// One bit per variant, by index, kept inline up to 64 variants: no allocation for almost
+/// every enum. Bits past the last variant are zero, so equal sets are equal words.
+type VariantBits = Bits<SmallVec<[u64; 1]>>;
+
+// The inline word and its length, or a heap pointer and its length, plus the capacity.
+const _: () = assert!(size_of::<VariantBits>() == 24);
+```
+
+Before:
+
+```rust
+        let mut explicit_discriminant = VariantBits::with_len(count);
+```
+
+After:
+
+```rust
+        let mut explicit_discriminant = VariantBits::new(count); // alloc: inline up to 64 variants
+```
+
+Before:
+
+```rust
+            explicit_discriminant.truncate(variants.len());
+```
+
+After:
+
+```rust
+            explicit_discriminant.truncate(variants.len());
+            explicit_discriminant.shrink_to_fit();
+```
+
+`explicit_discriminant.set(index, explicit)` is unchanged. In `has_explicit_discriminant` and
+`with_explicit_discriminant`, before:
+
+```rust
+            .is_some_and(|index| self.explicit_discriminant.get(index))
+```
+
+```rust
+            .map(|(index, &(id, shape))| (id, shape, self.explicit_discriminant.get(index)))
+```
+
+After:
+
+```rust
+            .is_some_and(|index| self.explicit_discriminant.contains(index))
+```
+
+```rust
+            .map(|(index, &(id, shape))| (id, shape, self.explicit_discriminant.contains(index)))
+```
+
+Test `variant_bits_as_bools`: `VariantBits::with_len(` becomes `VariantBits::new(` (four
+places), `bits.get(index)` becomes `bits.contains(index)` (three places), `bits.set(...)` and
+`bits.truncate(kept)` are unchanged, and the last two lines, before:
+
+```rust
+        assert!(!VariantBits::with_len(64).0.spilled());
+        assert!(VariantBits::with_len(65).0.spilled());
+```
+
+After:
+
+```rust
+        assert!(!VariantBits::new(64).into_words().spilled());
+        assert!(VariantBits::new(65).into_words().spilled());
+```
+
+### 5. `crates/hir-def/src/import_map.rs`
+
+Imports, before:
+
+```rust
+use base_db::{Db, Crate};
+use fst::{Automaton, Streamer, raw::IndexedValue};
+```
+
+After:
+
+```rust
+use base_db::{Db, Crate};
+use blaze_ids::bits::BitSet;
+use fst::{Automaton, Streamer, raw::IndexedValue};
+```
+
+Field, before:
+
+```rust
+    /// Bit `i` set: row `i` is an associated item of a trait.
+    trait_assoc_items: Box<[u64]>,
+```
+
+After:
+
+```rust
+    /// Bit `i` set: row `i` is an associated item of a trait.
+    trait_assoc_items: BitSet,
+```
+
+Before:
+
+```rust
+        let mut trait_assoc_items = vec![0u64; rows.div_ceil(64)];
+        for (row, &is_trait_assoc_item) in found.trait_assoc_items.iter().enumerate() {
+            if is_trait_assoc_item {
+                trait_assoc_items[row / 64] |= 1 << (row % 64);
+            }
+        }
+```
+
+After:
+
+```rust
+        let mut trait_assoc_items = BitSet::new(rows);
+        for (row, &is_trait_assoc_item) in found.trait_assoc_items.iter().enumerate() {
+            if is_trait_assoc_item {
+                trait_assoc_items.insert(row);
+            }
+        }
+```
+
+Before:
+
+```rust
+            trait_assoc_items: trait_assoc_items.into_boxed_slice(),
+```
+
+After:
+
+```rust
+            trait_assoc_items,
+```
+
+Before:
+
+```rust
+        if self.trait_assoc_items[row / 64] & (1 << (row % 64)) != 0 {
+```
+
+After:
+
+```rust
+        if self.trait_assoc_items.contains(row) {
+```
+
+Status: open
+
+## dedup: bits: blaze-query `Marks` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `Marks` is a growable `u64`-word set of memo IDs with its own bit logic; it is
+`blaze_ids::bits::BitSet<MemoId>` (`MemoId` is `u32`, a `BitIndex`), sized by `new` and grown
+by `insert_growing` as `Marks::insert` grew. Same members, same "whether it was new" result.
+`blaze-query/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+### `crates/blaze-query/src/lib.rs`
+
+Imports, before:
+
+```rust
+use blaze_ids::{ContentId, Fingerprint, Hasher, Idx};
+```
+
+After:
+
+```rust
+use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, bits::BitSet};
+```
+
+Delete `struct Marks` and its `impl` (from the doc comment "A set of memo IDs as a bit each" through
+the end of `fn iter`'s impl block):
+
+```rust
+/// A set of memo IDs as a bit each, sized by the IDs handed out: marking or testing one is a
+/// shift and a word, with no hash. 1 bit a memo of the store.
+struct Marks(Vec<u64>);
+
+impl Marks {
+    fn new(end: u32) -> Marks { ... }
+    fn insert(&mut self, memo: MemoId) -> bool { ... }
+    fn contains(&self, memo: MemoId) -> bool { ... }
+    fn iter(&self) -> impl Iterator<Item = MemoId> + '_ { ... }
+}
+```
+
+In collection, before:
+
+```rust
+        let mut reached = Marks::new(self.store.end());
+        let mut hot = Marks::new(self.store.end());
+```
+
+After:
+
+```rust
+        // alloc: one bitset a collection each, 1 bit a memo.
+        let mut reached = BitSet::<MemoId>::new(self.store.end() as usize);
+        let mut hot = BitSet::<MemoId>::new(self.store.end() as usize);
+```
+
+before:
+
+```rust
+                hot.insert(memo);
+```
+
+After:
+
+```rust
+                hot.insert_growing(memo);
+```
+
+before:
+
+```rust
+            if !reached.insert(memo) {
+```
+
+After:
+
+```rust
+            if !reached.insert_growing(memo) {
+```
+
+In reclaim, before:
+
+```rust
+        let mut held = Marks::new(self.store.end());
+```
+
+After:
+
+```rust
+        // alloc: one bitset a reclaim, 1 bit a memo.
+        let mut held = BitSet::<MemoId>::new(self.store.end() as usize);
+```
+
+before:
+
+```rust
+                    held.insert(resolved.memo);
+```
+
+After:
+
+```rust
+                    held.insert_growing(resolved.memo);
+```
+
+(`hot.contains(memo)`, `reached.contains(memo)` and `held.contains(memo)` are unchanged.)
+
+### `crates/blaze-query/src/tests.rs`
+
+Imports: `Marks, ` leaves the `use crate::{ ... }` list, and the file gains
+`use blaze_ids::bits::BitSet;` beside its other `use` lines.
+
+`marks_are_a_bit_a_memo`, before:
+
+```rust
+    let mut marks = Marks::new(70);
+    assert!(marks.insert(3));
+    assert!(!marks.insert(3), "marked once");
+    assert!(marks.insert(64));
+    assert!(marks.insert(200), "past the end it was made for");
+```
+
+After:
+
+```rust
+    let mut marks = BitSet::<u32>::new(70);
+    assert!(marks.insert_growing(3));
+    assert!(!marks.insert_growing(3), "marked once");
+    assert!(marks.insert_growing(64));
+    assert!(marks.insert_growing(200), "past the end it was made for");
+```
+
+(the last two lines of the test are unchanged.)
+
+Status: open
+
+## dedup: bits: vendor/salsa `capture.rs` `Frame::old` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
+
+Why: `Frame::old` is a growable `u64`-word set of edge positions with its own bit logic; it is
+`blaze_ids::bits::BitSet<u32>`. The hot path costs the same: `read_old` is one capacity compare,
+then `insert` (one load, test and store, as before); `recycle` clears each bit it set with
+`remove` instead of storing zero over its word, which is the same result because every bit set
+in `old` is a position in `read`. The buffer is still grown once, to the frame's `base`, and
+reused by later captures. `blaze-ids` depends on nothing of salsa's (blake3, blaze-radix, serde,
+smallvec, thin-vec), so the edge is acyclic; salsa already has it as a dev-dependency.
+
+### `vendor/salsa/Cargo.toml`
+
+Move `blaze-ids` from the dev-dependencies to the dependencies. Before:
+
+```toml
+[dev-dependencies.blaze-ids]
+path = "../../crates/blaze-ids"
+```
+
+After: that entry deleted, and beside the other `[dependencies.*]` entries (alphabetically,
+before `[dependencies.salsa-macros]`'s neighbours as the file orders them):
+
+```toml
+[dependencies.blaze-ids]
+path = "../../crates/blaze-ids"
+```
+
+(The tests that used it as a dev-dependency keep working: a normal dependency is visible to
+tests.)
+
+### `vendor/salsa/src/capture.rs`
+
+Imports, before:
+
+```rust
+use std::fmt;
+
+use crate::Revision;
+```
+
+After:
+
+```rust
+use std::fmt;
+
+use blaze_ids::bits::BitSet;
+
+use crate::Revision;
+```
+
+Field, before:
+
+```rust
+    /// Bits of the positions below `base` that `read` holds; all clear in a spare frame.
+    old: Vec<u64>,
+```
+
+After:
+
+```rust
+    /// The positions below `base` that `read` holds; empty in a spare frame.
+    old: BitSet<u32>,
+```
+
+`read_old`, before:
+
+```rust
+    fn read_old(&mut self, position: u32) {
+        let (word, bit) = ((position / 64) as usize, 1u64 << (position % 64));
+        if self.old.len() <= word {
+            self.old.resize(self.base.div_ceil(64) as usize, 0);
+        }
+        if self.old[word] & bit == 0 {
+            self.old[word] |= bit;
+            self.read.push(position);
+        }
+    }
+```
+
+After:
+
+```rust
+    fn read_old(&mut self, position: u32) {
+        if self.old.capacity() <= position as usize {
+            self.old.grow(self.base as usize);
+        }
+        if self.old.insert(position) {
+            self.read.push(position);
+        }
+    }
+```
+
+`recycle`, before:
+
+```rust
+            if position < self.base {
+                self.old[(position / 64) as usize] = 0;
+            }
+```
+
+After:
+
+```rust
+            if position < self.base {
+                self.old.remove(position);
+            }
+```
+
+In `Captures::open`, before:
+
+```rust
+                // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures
+                old: Vec::new(),
+```
+
+After:
+
+```rust
+                // alloc: an empty set allocates nothing; a frame's buffers are reused by later captures
+                old: BitSet::default(),
+```
+
+Test, before:
+
+```rust
+        assert!(inner.old.iter().all(|&word| word == 0));
+```
+
+After:
+
+```rust
+        assert!(inner.old.is_empty());
+```
 
 Status: open

@@ -1,7 +1,7 @@
-//! Every path any source root has named, across source roots: where
-//! [`SourceDatabase::resolve_path`] looks when the anchor's own source root lacks a path. rustc
-//! reads a `#[path]` module or an `include!` anywhere on disk, while v2 gives each package its
-//! own source root, so a member's `#[path = "../shared/m.rs"]` names a file of another root.
+//! Every path any source root has named, across source roots: where `Db::resolve_path` looks
+//! when the anchor's own source root lacks a path. rustc reads a `#[path]` module or an `include!` anywhere on disk, while v2 gives each
+//! package its own source root, so a member's `#[path = "../shared/m.rs"]` names a file of
+//! another root.
 //!
 //! A lookup is tracked as reads of inputs, never a quiet miss and never a look at the disk:
 //! - the [`PathBucket`] of the path, whose content ID is of the set of paths named in it, so a
@@ -27,16 +27,18 @@ use salsa::{Durability, Setter};
 use vfs::{FileId, VfsPath};
 
 use crate::{
-    InputId, SourceDatabase, SourceRoot, content,
+    Db, InputId, SourceRoot, content,
     table::{Table, hash_of},
 };
 
 pub(crate) const BUCKETS: usize = 64;
 
-/// A bucket's content ID is of the paths named in it: how many (8 bytes, little-endian), then
-/// the lane-wise wrapping sum of their [`SourceRoot::PATH_DOMAIN`] IDs as four little-endian
-/// `u64`s. A function of the set alone, in any order it was named, kept in `O(1)` a path.
-pub const NAMED_PATHS_DOMAIN: &str = "blaze v2 named paths bucket 1";
+/// A bucket's content ID is of the paths named in it: how many (8 bytes, little-endian), the
+/// lane-wise wrapping sum of their [`SourceRoot::PATH_DOMAIN`] IDs as four little-endian
+/// `u64`s, then how many times one of them was given another file (8 bytes). A function of the
+/// set alone, in any order it was named, while no path moves, kept in `O(1)` a path; a move
+/// changes it, so a lookup that found the path's old file out of its root runs again.
+pub const NAMED_PATHS_DOMAIN: &str = "blaze v2 named paths bucket 2";
 
 /// The index's handles, set once when the first source root is set and never again: what it
 /// holds is in its buckets' content IDs.
@@ -81,19 +83,25 @@ pub(crate) struct Named {
     input: Option<NamedPaths>,
     counts: [u64; BUCKETS],
     sums: [[u64; 4]; BUCKETS],
-    /// Paths named since the last [`Named::publish`], with their [`hash_of`]: hashed for the
-    /// buckets in one batch there.
-    pending: Vec<(u64, VfsPath)>,
+    moves: [u64; BUCKETS],
+    /// Buckets a path of moved in since the last [`Named::publish`], a bit each.
+    moved: u64,
+    /// Paths named since the last [`Named::publish`], as their [`hash_of`] and place in the
+    /// table: hashed for the buckets in one batch there.
+    pending: Vec<(u64, u32)>,
 }
 
 impl Default for Named {
     fn default() -> Named {
         Named {
+            // alloc: once per database, when its `Files` is made.
             table: Arc::new(Table::new()),
             input: None,
             counts: [0; BUCKETS],
             sums: [[0; 4]; BUCKETS],
-            pending: Vec::new(),
+            moves: [0; BUCKETS],
+            moved: 0,
+            pending: Vec::new(), // alloc: empty until a setter names a path; reused after.
         }
     }
 }
@@ -102,12 +110,15 @@ impl Named {
     /// A source root names `file` at `path`: a new path, or one given another file.
     pub(crate) fn note(&mut self, path: &VfsPath, file: FileId) {
         let hash = hash_of(path);
+        // clone: the table's one copy of a path, made once when a source root first names it.
         let make = || NamedPath { path: path.clone(), file: AtomicU32::new(file.index()) };
         let (at, inserted) = self.table.insert(hash, |it| it.path == *path, make);
         if inserted {
-            self.pending.push((hash, path.clone()));
-        } else {
-            self.table.get(at).file.store(file.index(), Ordering::Release);
+            self.pending.push((hash, at));
+        } else if self.table.get(at).file.swap(file.index(), Ordering::Release) != file.index() {
+            let bucket = bucket_of(hash);
+            self.moves[bucket] += 1;
+            self.moved |= 1 << bucket;
         }
     }
 
@@ -117,22 +128,30 @@ impl Named {
         for lane in self.sums[bucket] {
             hasher.update(&lane.to_le_bytes());
         }
+        hasher.update(&self.moves[bucket].to_le_bytes());
         hasher.finish()
     }
 
-    /// Writes the content IDs of the buckets that gained paths, making the inputs the first
-    /// time. Called by every setter that sets a source root's files, after it has.
-    pub(crate) fn publish(&mut self, db: &mut dyn SourceDatabase) {
-        if self.input.is_some() && self.pending.is_empty() {
+    /// Writes the content IDs of the buckets that gained paths or had one move, making the
+    /// inputs the first time. Called by every setter that sets a source root's files, after
+    /// it has.
+    pub(crate) fn publish(&mut self, db: &mut Db) {
+        if self.input.is_some() && self.pending.is_empty() && self.moved == 0 {
             return;
         }
-        let keys: Vec<Vec<u8>> = self.pending.iter().map(|(_, path)| content::path_key(path)).collect();
-        let slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let table = &self.table;
+        // alloc: a setter's batch of new paths, hashed in one call; a keystroke names none.
+        let keys: Vec<Vec<u8>> = self
+            .pending
+            .iter()
+            .map(|&(_, at)| content::path_key(&table.get(at).path))
+            .collect(); // alloc: as above.
+        let slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect(); // alloc: as above.
         let ids = match slices.is_empty() {
-            true => Vec::new(),
+            true => Vec::new(), // alloc: empty, no allocation.
             false => ContentId::of_many(SourceRoot::PATH_DOMAIN, &slices),
         };
-        let mut dirty = 0u64;
+        let mut dirty = std::mem::take(&mut self.moved);
         for ((hash, _), id) in self.pending.iter().zip(&ids) {
             let bucket = bucket_of(*hash);
             self.counts[bucket] += 1;
@@ -144,14 +163,15 @@ impl Named {
         }
         self.pending.clear();
         let Some(input) = self.input else {
+            // alloc: the 64 bucket inputs, made once per database.
             let buckets: Box<[PathBucket]> = (0..BUCKETS)
                 .map(|bucket| {
                     PathBucket::builder(InputId(self.content(bucket)))
                         .durability(Durability::MEDIUM)
                         .new(&*db)
                 })
-                .collect();
-            let table = PathTable(self.table.clone());
+                .collect(); // alloc: as above.
+            let table = PathTable(self.table.clone()); // clone: a refcount, once per database.
             self.input =
                 Some(NamedPaths::builder(table, buckets).durability(Durability::HIGH).new(&*db));
             return;
@@ -168,16 +188,15 @@ impl Named {
     }
 }
 
-/// The file a source root names at `path`, found through the index: see the module.
-pub(crate) fn resolve<Db: ?Sized + SourceDatabase>(db: &Db, path: &VfsPath) -> Option<FileId> {
+/// The file a source root last named at `path`, found through the index: see the module. The
+/// caller reads that file's source root and keeps the file only if the root still names it
+/// there, which is the read a hit reruns on.
+pub(crate) fn lookup(db: &Db, path: &VfsPath) -> Option<FileId> {
     let named = NamedPaths::try_get(db)?;
     let hash = hash_of(path);
     // The read a miss reruns on.
     let _ = named.buckets(db)[bucket_of(hash)].content(db);
     let table = &named.table(db).0;
     let at = table.find(hash, |it| it.path == *path)?;
-    let file = FileId::from_raw(table.get(at).file.load(Ordering::Acquire));
-    let root = db.file_source_root(file).source_root_id(db);
-    let named_there = db.source_root(root).source_root_ref(db).file_for_path(path) == Some(&file);
-    named_there.then_some(file)
+    Some(FileId::from_raw(table.get(at).file.load(Ordering::Acquire)))
 }

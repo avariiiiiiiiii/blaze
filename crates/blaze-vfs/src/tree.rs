@@ -250,6 +250,8 @@ impl Tree {
         let old = self.store.table();
         let len = old.len();
         let mut next = Building::after(old, len as usize);
+        let mut bytes = Some(bytes);
+        // alloc: one directory's entries at a time, once per repair.
         let mut columns = Vec::new();
         for at in 0..len {
             let (id, shape) = (*old.id(at), old.shape(at));
@@ -260,7 +262,7 @@ impl Tree {
                 columns.extend((0..from.len()).map(entry));
                 next.dir(id, &columns)
             } else if at == node.0 {
-                next.file(id, bytes.clone())
+                next.file(id, bytes.take().expect("one node is repaired"))
             } else {
                 next.file_of(id, old, shape)
             };

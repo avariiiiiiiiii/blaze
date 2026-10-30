@@ -1,9 +1,9 @@
 //! The image's symbol table and the interners under it: names, 32-byte ids and symbol keys,
 //! each interned once to a `u32`.
 //!
-//! Each table is 64 shards of a SwissTable (`hashbrown::HashTable`: 16 control bytes probed
-//! at once with SSE2 or NEON) holding `u32` indexes, with each entry's hash kept beside it so
-//! growing never hashes again. A key is hashed once; bits 32..38 of that hash pick its shard
+//! Each table is 64 shards ([`crate::intern`]), each its entries in reserved regions and an
+//! open-addressing index of `u32` indexes beside the high half of their hashes, doubled in
+//! place and never moved. A key is hashed once; bits 32..38 of that hash pick its shard
 //! and the rest place it in the shard. A batch ([`Symbols::intern_all`],
 //! [`Symbols::intern_wide`]) is partitioned by shard and each shard interned by one task, so
 //! nothing is locked and nothing is hashed twice; within a shard keys go in the batch's order,
@@ -20,11 +20,12 @@ use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
-use hashbrown::HashTable;
-use hashbrown::hash_table::Entry;
+use blaze_mem::MemError;
 use rayon::prelude::*;
 use rustc_hash::FxHasher;
+use smallvec::SmallVec;
 
+use crate::intern::{IdShard, KeyShard, NameShard, Shard, shards};
 use crate::model::Sym;
 use crate::reloc::GotKind;
 
@@ -169,7 +170,7 @@ fn fold(a: u64, b: u64) -> u64 {
 }
 
 #[inline]
-fn hash_key(key: SymKey) -> u64 {
+pub(crate) fn hash_key(key: SymKey) -> u64 {
     let w = key.words();
     let a = u64::from(w[0]) | (u64::from(w[1]) << 32);
     let b = u64::from(w[2]) | (u64::from(w[3]) << 32);
@@ -177,7 +178,7 @@ fn hash_key(key: SymKey) -> u64 {
 }
 
 #[inline]
-fn hash_name(name: &str) -> u64 {
+pub(crate) fn hash_name(name: &str) -> u64 {
     let mut hasher = FxHasher::default();
     hasher.write(name.as_bytes());
     fold(hasher.finish() ^ name.len() as u64, K0)
@@ -185,7 +186,7 @@ fn hash_name(name: &str) -> u64 {
 
 /// A content id is a BLAKE3 hash: its first eight bytes are its hash.
 #[inline]
-fn hash_id(id: &ContentId) -> u64 {
+pub(crate) fn hash_id(id: &ContentId) -> u64 {
     u64::from_le_bytes(id.0[..8].try_into().expect("eight bytes"))
 }
 
@@ -205,167 +206,81 @@ fn split(it: u32) -> (usize, usize) {
     ((it >> SHIFT) as usize, (it & LOCAL) as usize)
 }
 
-/// One shard of one table: finds a key or adds it, returning its index in the shard.
-trait Shard<K>: Send {
-    fn get_or_insert(&mut self, hash: u64, key: K) -> u32;
-}
-
-#[derive(Clone, Default)]
-struct KeyShard {
-    table: HashTable<u32>,
-    hashes: Vec<u64>,
-    keys: Vec<SymKey>,
-}
-
-impl KeyShard {
-    #[inline]
-    fn find(&self, hash: u64, key: SymKey) -> Option<u32> {
-        self.table.find(hash, |&at| self.keys[at as usize] == key).copied()
-    }
-}
-
-impl Shard<SymKey> for KeyShard {
-    #[inline]
-    fn get_or_insert(&mut self, hash: u64, key: SymKey) -> u32 {
-        let (keys, hashes) = (&self.keys, &self.hashes);
-        match self.table.entry(hash, |&at| keys[at as usize] == key, |&at| hashes[at as usize]) {
-            Entry::Occupied(it) => *it.get(),
-            Entry::Vacant(it) => {
-                let at = self.keys.len() as u32;
-                it.insert(at);
-                self.keys.push(key);
-                self.hashes.push(hash);
-                at
-            }
-        }
-    }
-}
-
-/// Names: every name of the shard in one buffer, each the bytes up to its end offset.
-#[derive(Clone, Default)]
-struct NameShard {
-    table: HashTable<u32>,
-    hashes: Vec<u64>,
-    bytes: String,
-    ends: Vec<u32>,
-}
-
-#[inline]
-fn name_at<'s>(bytes: &'s str, ends: &[u32], at: u32) -> &'s str {
-    let at = at as usize;
-    let start = if at == 0 { 0 } else { ends[at - 1] as usize };
-    &bytes[start..ends[at] as usize]
-}
-
-impl NameShard {
-    #[inline]
-    fn get(&self, at: usize) -> &str {
-        name_at(&self.bytes, &self.ends, at as u32)
-    }
-
-    #[inline]
-    fn find(&self, hash: u64, name: &str) -> Option<u32> {
-        self.table.find(hash, |&at| name_at(&self.bytes, &self.ends, at) == name).copied()
-    }
-}
-
-impl<'k> Shard<&'k str> for NameShard {
-    #[inline]
-    fn get_or_insert(&mut self, hash: u64, name: &'k str) -> u32 {
-        let (bytes, ends, hashes) = (&self.bytes, &self.ends, &self.hashes);
-        match self.table.entry(hash, |&at| name_at(bytes, ends, at) == name, |&at| hashes[at as usize]) {
-            Entry::Occupied(it) => *it.get(),
-            Entry::Vacant(it) => {
-                let at = self.ends.len() as u32;
-                it.insert(at);
-                self.bytes.push_str(name);
-                self.ends.push(u32::try_from(self.bytes.len()).expect("a shard of names past 4 GiB"));
-                self.hashes.push(hash);
-                at
-            }
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-struct IdShard {
-    table: HashTable<u32>,
-    ids: Vec<ContentId>,
-}
-
-impl IdShard {
-    #[inline]
-    fn find(&self, hash: u64, id: &ContentId) -> Option<u32> {
-        self.table.find(hash, |&at| self.ids[at as usize] == *id).copied()
-    }
-}
-
-impl<'k> Shard<&'k ContentId> for IdShard {
-    #[inline]
-    fn get_or_insert(&mut self, hash: u64, id: &'k ContentId) -> u32 {
-        let ids = &self.ids;
-        match self.table.entry(hash, |&at| ids[at as usize] == *id, |&at| hash_id(&ids[at as usize])) {
-            Entry::Occupied(it) => *it.get(),
-            Entry::Vacant(it) => {
-                let at = self.ids.len() as u32;
-                it.insert(at);
-                self.ids.push(*id);
-                at
-            }
-        }
-    }
-}
-
-/// Interns a batch: each key hashed once, partitioned by shard, each shard's keys interned in
-/// the batch's order by one task. Returns the joined (shard, index) of each key.
-fn batch<K, S>(shards: &mut [S], keys: &[K], hash: impl Fn(K) -> u64 + Sync) -> Vec<u32>
+/// Interns a batch: each key hashed once, partitioned by shard (a stable counting sort, so
+/// each shard's keys keep the batch's order), each shard's keys interned by one task. Appends
+/// `wrap` of the joined (shard, index) of each key to `out`. Below [`PARALLEL`] keys nothing is
+/// allocated but `out`'s growth; above, two buffers of a pair per key.
+fn batch<K, S, T>(shards: &mut [S], keys: &[K], hash: impl Fn(K) -> u64 + Sync, wrap: impl Fn(u32) -> T, out: &mut Vec<T>)
 where
     K: Copy + Sync,
     S: Shard<K>,
+    T: Copy,
 {
+    out.reserve(keys.len());
     if keys.len() < PARALLEL {
-        return keys
-            .iter()
-            .map(|key| {
-                let hash = hash(*key);
-                let shard = shard_of(hash);
-                join(shard, shards[shard].get_or_insert(hash, *key))
-            })
-            .collect();
+        out.extend(keys.iter().map(|key| {
+            let hash = hash(*key);
+            let shard = shard_of(hash);
+            wrap(join(shard, shards[shard].get_or_insert(hash, *key)))
+        }));
+        return;
     }
-    let hashes: Vec<u64> = keys.par_iter().map(|key| hash(*key)).collect();
-    let mut by_shard: Vec<Vec<(u32, u64)>> = vec![Vec::new(); SHARDS];
-    for (at, hash) in hashes.into_iter().enumerate() {
-        by_shard[shard_of(hash)].push((at as u32, hash));
+    let mut hashed: Vec<(u32, u64)> = Vec::with_capacity(keys.len());
+    keys.par_iter().enumerate().map(|(at, key)| (at as u32, hash(*key))).collect_into_vec(&mut hashed);
+    let mut starts = [0usize; SHARDS + 1];
+    for (_, hash) in &hashed {
+        starts[shard_of(*hash) + 1] += 1;
     }
-    shards.par_iter_mut().zip(by_shard.par_iter_mut()).enumerate().for_each(|(shard, (it, items))| {
+    for shard in 0..SHARDS {
+        starts[shard + 1] += starts[shard];
+    }
+    let mut sorted: Vec<(u32, u64)> = Vec::with_capacity(hashed.len());
+    sorted.resize(hashed.len(), (0, 0));
+    let mut next = starts;
+    for item in &hashed {
+        let shard = shard_of(item.1);
+        sorted[next[shard]] = *item;
+        next[shard] += 1;
+    }
+    let mut parts: SmallVec<[&mut [(u32, u64)]; SHARDS]> = SmallVec::new();
+    let mut rest = sorted.as_mut_slice();
+    for shard in 0..SHARDS {
+        let (part, tail) = std::mem::take(&mut rest).split_at_mut(starts[shard + 1] - starts[shard]);
+        parts.push(part);
+        rest = tail;
+    }
+    shards.par_iter_mut().zip(parts.as_mut_slice().par_iter_mut()).enumerate().for_each(|(shard, (it, items))| {
         for item in items.iter_mut() {
             item.1 = u64::from(join(shard, it.get_or_insert(item.1, keys[item.0 as usize])));
         }
     });
-    let mut out = vec![0; keys.len()];
-    for (at, it) in by_shard.into_iter().flatten() {
-        out[at as usize] = it as u32;
+    let base = out.len();
+    out.resize(base + keys.len(), wrap(0));
+    for (at, it) in &sorted {
+        out[base + *at as usize] = wrap(*it as u32);
     }
-    out
 }
 
 /// The image's symbols, names and ids. Append-only for the image's life: a failed stage's
 /// symbols stay, unused.
-#[derive(Clone)]
 pub(crate) struct Symbols {
     keys: Vec<KeyShard>,
     names: Vec<NameShard>,
     ids: Vec<IdShard>,
 }
 
+impl Symbols {
+    /// Reserves the tables' regions, committing nothing until a key goes in: once per image,
+    /// three allocations (the lists of shards).
+    pub fn new() -> Result<Symbols, MemError> {
+        Ok(Symbols { keys: shards(KeyShard::new)?, names: shards(NameShard::new)?, ids: shards(IdShard::new)? })
+    }
+}
+
 impl Default for Symbols {
+    /// [`Symbols::new`], stopping with the error when the address space can't be reserved.
     fn default() -> Self {
-        Symbols {
-            keys: vec![KeyShard::default(); SHARDS],
-            names: vec![NameShard::default(); SHARDS],
-            ids: vec![IdShard::default(); SHARDS],
-        }
+        Symbols::new().unwrap_or_else(|error| panic!("{error}"))
     }
 }
 
@@ -389,8 +304,11 @@ impl Symbols {
         self.names[shard].get(at)
     }
 
+    /// Interns every name, the shards in parallel: one buffer, the result.
     pub fn names_all(&mut self, names: &[&str]) -> Vec<NameId> {
-        batch(&mut self.names, names, hash_name).into_iter().map(NameId).collect()
+        let mut out = Vec::with_capacity(names.len());
+        batch(&mut self.names, names, hash_name, NameId, &mut out);
+        out
     }
 
     pub fn id(&mut self, id: &ContentId) -> IdNo {
@@ -406,12 +324,14 @@ impl Symbols {
     }
 
     pub fn ids_all(&mut self, ids: &[&ContentId]) -> Vec<IdNo> {
-        batch(&mut self.ids, ids, hash_id).into_iter().map(IdNo).collect()
+        let mut out = Vec::with_capacity(ids.len());
+        batch(&mut self.ids, ids, hash_id, IdNo, &mut out);
+        out
     }
 
     pub fn content(&self, id: IdNo) -> &ContentId {
         let (shard, at) = split(id.0);
-        &self.ids[shard].ids[at]
+        self.ids[shard].id(at)
     }
 
     pub fn instance(&self, id: IdNo) -> InstanceKey {
@@ -438,14 +358,17 @@ impl Symbols {
 
     /// Interns every key, the shards in parallel; the symbols in the keys' order.
     pub fn intern_all(&mut self, keys: &[SymKey]) -> Vec<Sym> {
-        batch(&mut self.keys, keys, hash_key).into_iter().map(Sym).collect()
+        let mut out = Vec::with_capacity(keys.len());
+        batch(&mut self.keys, keys, hash_key, Sym, &mut out);
+        out
     }
 
     /// Interns keys whose ids and names are not interned yet: the ids, then the names, then
-    /// the keys, each a batch by shard.
+    /// the keys, each a batch by shard. Six buffers whatever the batch's size: the ids and
+    /// names gathered, each interned, the keys made of them, and the result.
     pub fn intern_wide(&mut self, keys: &[Wide<'_>]) -> Vec<Sym> {
         let mut ids: Vec<&ContentId> = Vec::with_capacity(keys.len());
-        let mut names: Vec<&str> = Vec::new();
+        let mut names: Vec<&str> = Vec::with_capacity(keys.iter().filter(|it| matches!(it, Wide::Name(_))).count());
         for key in keys {
             match *key {
                 Wide::Key(_) => {}
@@ -463,21 +386,19 @@ impl Symbols {
         let names = self.names_all(&names);
         let (mut id, mut name) = (ids.iter().copied(), names.iter().copied());
         let mut next = || id.next().expect("one id per id of the keys");
-        let compact: Vec<SymKey> = keys
-            .iter()
-            .map(|key| match *key {
-                Wide::Key(key) => key,
-                Wide::Name(_) => SymKey::Name(name.next().expect("one name per name of the keys")),
-                Wide::Body(_) => SymKey::Body(next()),
-                Wide::Slot(_) => SymKey::Slot(next()),
-                Wide::Data(_) => SymKey::Data(next()),
-                Wide::Static(..) => {
-                    let item = next();
-                    SymKey::Static(item, next())
-                }
-                Wide::Position(span) => SymKey::Position(next(), span.index),
-            })
-            .collect();
+        let mut compact: Vec<SymKey> = Vec::with_capacity(keys.len());
+        compact.extend(keys.iter().map(|key| match *key {
+            Wide::Key(key) => key,
+            Wide::Name(_) => SymKey::Name(name.next().expect("one name per name of the keys")),
+            Wide::Body(_) => SymKey::Body(next()),
+            Wide::Slot(_) => SymKey::Slot(next()),
+            Wide::Data(_) => SymKey::Data(next()),
+            Wide::Static(..) => {
+                let item = next();
+                SymKey::Static(item, next())
+            }
+            Wide::Position(span) => SymKey::Position(next(), span.index),
+        }));
         self.intern_all(&compact)
     }
 
@@ -490,7 +411,7 @@ impl Symbols {
     #[inline]
     pub fn key(&self, sym: Sym) -> SymKey {
         let (shard, at) = split(sym.0);
-        self.keys[shard].keys[at]
+        self.keys[shard].key(at)
     }
 
     pub fn sym_name(&mut self, name: &str) -> Sym {
@@ -559,39 +480,67 @@ impl Symbols {
 
     /// A symbol as an error names it.
     pub fn describe(&self, sym: Sym) -> String {
-        match self.key(sym) {
-            SymKey::Body(key) | SymKey::Slot(key) => format!("the function {:?}", self.instance(key)),
-            SymKey::Static(item, instance) => {
-                format!("the static {:?} ({:?})", self.item(item), self.content(instance))
-            }
-            SymKey::Name(name) => format!("`{}`", self.str(name)),
-            SymKey::Data(id) => format!("the data {:?}", self.content(id)),
-            key => self.debug(key),
-        }
+        // alloc: error messages: the one string the message is written into
+        let mut out = String::new();
+        let _ = match self.key(sym) {
+            SymKey::Body(key) | SymKey::Slot(key) => write!(out, "the function {:?}", self.instance(key)),
+            SymKey::Static(item, instance) => write!(out, "the static {:?} ({:?})", self.item(item), self.content(instance)),
+            SymKey::Name(name) => write!(out, "`{}`", self.str(name)),
+            SymKey::Data(id) => write!(out, "the data {:?}", self.content(id)),
+            key => self.write_debug(key, &mut out),
+        };
+        out
     }
 
     /// A key written out with its contents, as `{:?}` of the key once was.
     pub fn debug(&self, key: SymKey) -> String {
-        let obj = |o: Obj| format!("Obj {{ native: {:?}, member: {} }}", self.content(o.native), o.member);
-        let span = |anchor: IdNo, index: u32| format!("{:?}", self.span(anchor, index));
+        // alloc: error messages: the one string the key is written into
         let mut out = String::new();
-        let _ = match key {
+        let _ = self.write_debug(key, &mut out);
+        out
+    }
+
+    fn write_debug(&self, key: SymKey, out: &mut String) -> std::fmt::Result {
+        let obj = |out: &mut String, o: Obj| write!(out, "Obj {{ native: {:?}, member: {} }}", self.content(o.native), o.member);
+        match key {
             SymKey::Body(it) => write!(out, "Body({:?})", self.instance(it)),
             SymKey::Slot(it) => write!(out, "Slot({:?})", self.instance(it)),
             SymKey::Data(it) => write!(out, "Data({:?})", self.content(it)),
             SymKey::Static(a, b) => write!(out, "Static({:?}, {:?})", self.item(a), self.content(b)),
             SymKey::Tlv(a, b) => write!(out, "Tlv({:?}, {:?})", self.item(a), self.content(b)),
             SymKey::Name(it) => write!(out, "Name({:?})", self.str(it)),
-            SymKey::Local(o, at) => write!(out, "Local({}, {at})", obj(o)),
-            SymKey::Section(o, at) => write!(out, "Section({}, {at})", obj(o)),
-            SymKey::Position(anchor, index) => write!(out, "Position({})", span(anchor, index)),
+            SymKey::Local(o, at) => {
+                out.push_str("Local(");
+                obj(out, o)?;
+                write!(out, ", {at})")
+            }
+            SymKey::Section(o, at) => {
+                out.push_str("Section(");
+                obj(out, o)?;
+                write!(out, ", {at})")
+            }
+            SymKey::Position(anchor, index) => write!(out, "Position({:?})", self.span(anchor, index)),
             SymKey::FileName(it) => write!(out, "FileName({:?})", self.str(it)),
             SymKey::Cie(it) => write!(out, "Cie({:?})", self.content(it)),
             SymKey::Fde(it) => write!(out, "Fde({:?})", self.instance(it)),
             SymKey::WinInfo(it) => write!(out, "WinInfo({:?})", self.instance(it)),
-            SymKey::Frame(o, section, at) => write!(out, "Frame({}, {section}, {at})", obj(o)),
-            SymKey::Got(kind, it) => write!(out, "Got({kind:?}, {})", self.debug(self.key(it))),
-            SymKey::Plt(it) => write!(out, "Plt({})", self.debug(self.key(it))),
+            SymKey::Frame(o, section, at) => {
+                out.push_str("Frame(");
+                obj(out, o)?;
+                write!(out, ", {section}, {at})")
+            }
+            SymKey::Got(kind, it) => {
+                write!(out, "Got({kind:?}, ")?;
+                self.write_debug(self.key(it), out)?;
+                out.push(')');
+                Ok(())
+            }
+            SymKey::Plt(it) => {
+                out.push_str("Plt(");
+                self.write_debug(self.key(it), out)?;
+                out.push(')');
+                Ok(())
+            }
             SymKey::IatEnd(it) => write!(out, "IatEnd({:?})", self.str(it)),
             SymKey::Common(it) => write!(out, "Common({:?})", self.str(it)),
             SymKey::Generation => write!(out, "Generation"),
@@ -599,8 +548,7 @@ impl Symbols {
             SymKey::Stubs => write!(out, "Stubs"),
             SymKey::Descriptor => write!(out, "Descriptor"),
             SymKey::LiveDir => write!(out, "LiveDir"),
-        };
-        out
+        }
     }
 
     /// The symbol's key as bytes of its contents (the variant, ids' bytes, names' lengths and
@@ -671,7 +619,7 @@ impl Symbols {
 
     /// The length a column indexed by [`Symbols::dense`] needs.
     pub fn dense_len(&self) -> usize {
-        self.keys.iter().map(|it| it.keys.len()).max().unwrap_or(0) * SHARDS
+        self.keys.iter().map(|it| it.len()).max().unwrap_or(0) * SHARDS
     }
 
     /// Of an interned id, the same.
@@ -744,6 +692,36 @@ mod tests {
         assert_eq!(symbols.span(anchor, index), span);
         assert_eq!(symbols.key(syms[5]), SymKey::Cells);
         assert_eq!(symbols.intern_wide(&wide), syms);
+    }
+
+    /// A lookup, and interning what is already interned, allocate nothing; a batch of hits
+    /// allocates its result only.
+    #[test]
+    fn hits_and_lookups_allocate_nothing() {
+        let mut symbols = Symbols::default();
+        let names: Vec<String> = (0..10_000).map(|n| format!("name{n}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ids = symbols.names_all(&refs);
+        let keys: Vec<SymKey> = ids.iter().map(|it| SymKey::Name(*it)).collect();
+        let syms = symbols.intern_all(&keys);
+        let id = content(5);
+        let idno = symbols.id(&id);
+        blaze_alloc_count::assert_at_most(0, "a symbol lookup and an interner hit", || {
+            assert_eq!(symbols.find_sym_name("name4321"), Some(syms[4321]));
+            assert_eq!(symbols.find_sym_name("absent"), None);
+            assert_eq!(symbols.sym_name("name17"), syms[17]);
+            assert_eq!(symbols.name("name17"), ids[17]);
+            assert_eq!(symbols.intern(keys[99]), syms[99]);
+            assert_eq!(symbols.id(&id), idno);
+            assert_eq!(symbols.find_id(&id), Some(idno));
+            assert_eq!(symbols.str(ids[3]), "name3");
+            assert_eq!(symbols.key(syms[3]), keys[3]);
+            assert_eq!(symbols.name_of(syms[3]), Some("name3"));
+            assert_eq!(symbols.cmp(syms[3], syms[4]), "name3".cmp("name4"));
+        });
+        let (again, used) = blaze_alloc_count::measure(|| symbols.intern_all(&keys[..100]));
+        assert_eq!(used.allocations, 1, "only the result");
+        assert_eq!(again, syms[..100]);
     }
 
     /// Content order is the variant, then contents, whatever order the keys were interned in.

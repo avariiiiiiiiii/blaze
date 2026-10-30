@@ -296,7 +296,7 @@ impl<'s> PieceRef<'s> {
     }
 
     /// The same, borrowed, or copied into `arena` when it spans written pages.
-    pub fn bytes_in<'b>(self, arena: &'b bumpalo::Bump) -> &'b [u8]
+    pub fn bytes_in<'b>(self, arena: &'b blaze_mem::Frame) -> &'b [u8]
     where
         's: 'b,
     {
@@ -308,7 +308,7 @@ impl<'s> PieceRef<'s> {
         if let Some(it) = space.bytes.slice(at, len) {
             return it;
         }
-        let out = arena.alloc_slice_fill_copy(len, 0);
+        let out = arena.alloc_slice_fill_with(len, |_| 0);
         space.bytes.copy_to(at, out);
         out
     }
@@ -610,8 +610,9 @@ impl State {
 
     /// The symbols a piece's fixups refer to, once each: inline up to eight.
     pub fn targets(piece: PieceRef<'_>) -> SmallVec<[Sym; 8]> {
-        let mut out: SmallVec<[Sym; 8]> = SmallVec::new();
-        for fixup in piece.fixups() {
+        let fixups = piece.fixups();
+        let mut out: SmallVec<[Sym; 8]> = SmallVec::with_capacity(fixups.len() + fixups.iter().filter(|it| it.minus.is_some()).count());
+        for fixup in fixups {
             out.push(fixup.target);
             out.extend(fixup.minus);
         }
@@ -996,7 +997,7 @@ pub(crate) fn has_table(output: &Output, indexed_code: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Apply, Prot};
+    use crate::model::{Apply, Prot, SectionName};
 
     fn fixup(target: Sym, minus: Option<Sym>) -> Fixup {
         Fixup { at: 0, apply: Apply::Abs64, target, addend: 0, minus }
@@ -1040,20 +1041,20 @@ mod tests {
             state.set_def(sym, Def::Piece { piece: id, offset: 0 });
         }
         state.spaces.push(space(Class::Text, 0x1000, vec![0x90; 3 * CowBytes::PAGE]));
-        let named = Class::Named { name: "linkme_ITEMS".to_owned(), write: false, exec: false };
+        let named = Class::Named { name: SectionName::new("linkme_ITEMS"), write: false, exec: false };
         state.spaces.push(space(named, 0x10000, vec![0; 64]));
         Arc::make_mut(&mut state.specials).push(Special::Absolute(1));
         state
     }
 
-    /// What `Image::stage` pays to stage on a copy, whatever the image's size: the spaces list
-    /// and the one `Class::Named` region's name. Every column, arena and region is shared.
+    /// What `Image::stage` pays to stage on a copy, whatever the image's size: the spaces list.
+    /// Every column, arena and region is shared, a `Class::Named` region's read name too.
     #[test]
     fn a_clone_allocates_the_regions_list_only() {
         for pieces in [10, 5000] {
             let state = image(pieces);
             let (copy, used) = blaze_alloc_count::measure(|| state.clone());
-            assert!(used.allocations <= 2, "{pieces} pieces: {used:?}");
+            assert!(used.allocations <= 1, "{pieces} pieces: {used:?}");
             assert_eq!(copy.piece_count(), pieces);
             assert!(Arc::ptr_eq(&copy.specials, &state.specials));
         }

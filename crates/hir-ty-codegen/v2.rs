@@ -8,7 +8,7 @@
 //! ([`shape`]), and compiles it with Cranelift or LLVM ([`release`]), the code by place and
 //! data by content ([`convert`]).
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_codegen::{CodegenError, InstanceKey, Unit};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -50,27 +50,27 @@ pub use hashes::ItemHashes;
 /// run to the next.
 pub trait Hashes: Sync {
     /// Which item `item` is, by its path and kind.
-    fn item(&self, db: &dyn HirDatabase, item: ItemId) -> Result<ItemKey, String>;
+    fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String>;
     /// What a body is: its normalized MIR, each callee and type by content.
-    fn code(&self, db: &dyn HirDatabase, body: Body) -> Result<CodeHash, String>;
+    fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String>;
     /// A type by content: an ADT by its item and its layout's facts, never by its name.
     /// Regions are erased.
-    fn ty<'db>(&self, db: &'db dyn HirDatabase, ty: Ty<'db>) -> Result<ContentId, String>;
+    fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String>;
     /// A const generic argument by its value and type.
-    fn konst<'db>(&self, db: &'db dyn HirDatabase, konst: Const<'db>) -> Result<ContentId, String>;
+    fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String>;
     /// Where a statement or expression of `owner`'s body is, in its item's span table.
     fn span(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         span: MirSpan,
     ) -> Result<SpanRef, String>;
     /// Where a function is declared: what a call through a pointer to a `#[track_caller]`
     /// function passes as its caller's location.
-    fn declaration(&self, db: &dyn HirDatabase, func: FunctionId) -> Result<SpanRef, String>;
+    fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String>;
     /// The name a file is known by in the program (`file!()`, a panic location): the path
     /// relative to its package's root, as rustc prints it.
-    fn file_name(&self, db: &dyn HirDatabase, file: base_db::FileId) -> Result<String, String>;
+    fn file_name(&self, db: &Db, file: base_db::FileId) -> Result<String, String>;
 }
 
 /// A body whose code [`Hashes::code`] says. The ids are salsa's interned closures and

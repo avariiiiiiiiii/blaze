@@ -3,7 +3,7 @@
 
 use std::marker::PhantomData;
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use blaze_codegen::{
     Arch, Backend, CodegenError, CompiledFunction, Compile, Static, Unit,
     backend::{Emitted, FrontRef, Import, Prepare, Shape},
@@ -148,10 +148,10 @@ fn isa(unit: &Unit) -> Result<&'static dyn TargetIsa, CodegenError> {
 
 impl Backends<'_> {
     /// `instance` and whether its references were listed for a unit that MIR-inlines
-    /// ([`HirFrontend::inlines`]), as [`Describe`](blaze_codegen::Describe) listed them.
+    /// ([`HirFrontend::inlines`]), as describing it listed them.
     pub(super) fn prepared(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         homes: &mut Homes,
         hashes: &dyn Hashes,
         unit: &Unit,
@@ -218,7 +218,7 @@ impl Backends<'_> {
                 colocate(&mut pending.func, &places, placer.refs());
             }
         }
-        let inlined = super::frontend::inlined(db, hashes, instance).map_err(fail)?;
+        let inlined = super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
         let function = Function {
             code,
             places,
@@ -241,7 +241,7 @@ impl Backends<'_> {
 }
 
 /// The crate an instance's code is compiled in; `None` for assembly, which is no crate's.
-pub(super) fn compiled_in(db: &dyn HirDatabase, instance: &HirInstance) -> Option<Crate> {
+pub(super) fn compiled_in(db: &Db, instance: &HirInstance) -> Option<Crate> {
     match &instance.0 {
         Kind::Code(_, env) => Some(env.as_ref(db).krate),
         Kind::Start(main) => Some(main.krate(db)),
@@ -251,7 +251,7 @@ pub(super) fn compiled_in(db: &dyn HirDatabase, instance: &HirInstance) -> Optio
 }
 
 /// What a function's `#[inline]` asks of LLVM, as `imports::build` reads it.
-fn hint(db: &dyn HirDatabase, instance: &HirInstance) -> Hint {
+fn hint(db: &Db, instance: &HirInstance) -> Hint {
     let Kind::Code(Instance { def: InstanceDef::Fn(func), .. }, _) = &instance.0 else {
         return Hint::None;
     };
@@ -273,7 +273,7 @@ fn hint(db: &dyn HirDatabase, instance: &HirInstance) -> Hint {
 /// off. SanitizerCoverage is off for a `__sanitizer_*` symbol, which its pass skips by name
 /// in rustc's build and which here it would otherwise trace.
 fn unsanitized(
-    db: &dyn HirDatabase,
+    db: &Db,
     spec: &Spec,
     instance: &HirInstance,
 ) -> Result<Sanitizers, String> {
@@ -305,7 +305,7 @@ fn unsanitized(
 
 /// Whether a fold may give the instance another's code: its address is no symbol's, and it
 /// takes no C variadic arguments, whose `va_list` a thunk could not pass on.
-fn foldable(db: &dyn HirDatabase, instance: &HirInstance) -> bool {
+fn foldable(db: &Db, instance: &HirInstance) -> bool {
     if super::frontend::symbol_of(db, &instance.0).is_some() {
         return false;
     }
@@ -319,11 +319,11 @@ fn foldable(db: &dyn HirDatabase, instance: &HirInstance) -> bool {
 }
 
 /// The IR of an instance, built as a unit with overflow checks `checked` asks.
-pub(super) fn built(db: &dyn HirDatabase, instance: &HirInstance, checked: bool) -> Result<Built, String> {
+pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Built, String> {
     let produced = match &instance.0 {
         Kind::Code(instance, env) => {
             let instance = Instance { checked, ..instance.clone() };
-            instance_code(db, instance, env.clone(), Detach::Unit)
+            instance_code(db, instance, env.clone(), Detach::Unit, super::build::building())
         }
         Kind::Start(main) => {
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
@@ -361,7 +361,7 @@ fn assembled(text: &str) -> Result<Built, String> {
 /// Where each statement the function's line rows are of is written, inlined code's in the
 /// body it was inlined from.
 fn written_spans(
-    db: &dyn HirDatabase,
+    db: &Db,
     hashes: &dyn Hashes,
     source: &fragment::Source,
 ) -> Result<Vec<SpanRef>, String> {
@@ -378,7 +378,7 @@ fn written_spans(
 /// Tells `scopes` of the bodies the MIR optimizer inlined into the function: each one's call
 /// site, and which of them each statement is of.
 fn inlined_scopes(
-    db: &dyn HirDatabase,
+    db: &Db,
     hashes: &dyn Hashes,
     source: &fragment::Source,
     scopes: &mut side::Scopes,
@@ -408,7 +408,7 @@ fn inlined_scopes(
 /// statements the function's line rows are of. Their types are of a body monomorphized in
 /// `krate`.
 fn named(
-    db: &dyn HirDatabase,
+    db: &Db,
     hashes: &dyn Hashes,
     krate: Crate,
     owner: DefWithBodyId,
@@ -439,7 +439,7 @@ fn named(
 /// tries the pattern of an arm is of the scope its `match` is in; other code of no expression
 /// is of the scope of the code before it.
 fn scoped(
-    db: &dyn HirDatabase,
+    db: &Db,
     owner: DefWithBodyId,
     variables: &[&fragment::Variable],
     spans: &[MirSpan],

@@ -103,7 +103,7 @@ fn built() -> Response {
         env: Vec::new(),
         harness: true,
     };
-    Response::Built { artifacts: vec![artifact], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() }
+    Response::Built { members: 1, artifacts: vec![artifact], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() }
 }
 
 /// What the printer wrote to stdout and stderr of `responses`, ended with `ok`.
@@ -150,6 +150,49 @@ fn a_build_with_warnings_as_cargo_prints_it() {
 
     let (_, quiet) = printed(Shown { quiet: true, ..Shown::default() }, &responses, true);
     assert_eq!(quiet, UNUSED);
+}
+
+#[test]
+fn a_units_summary_comes_as_it_ends_and_once() {
+    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
+    let responses = [
+        started("foo", Verb::Compiling),
+        Response::Diagnostic(warning),
+        Response::UnitEnded(lib_of("foo")),
+        started("bar", Verb::Compiling),
+        Response::UnitEnded(lib_of("bar")),
+        built(),
+        Response::Done { ok: true },
+    ];
+    let (_, err) = printed(Shown::default(), &responses, true);
+    assert_eq!(
+        err,
+        format!(
+            "   Compiling foo v0.1.0 (/w/foo)\n{UNUSED}warning: `foo` (lib) generated 1 warning\n   Compiling bar \
+             v0.1.0 (/w/bar)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"
+        )
+    );
+}
+
+#[test]
+fn what_a_request_did_is_one_json_line_of_blazes() {
+    let worked = blaze_api::Worked {
+        link: blaze_api::LinkKind::Patched,
+        found: 3,
+        green: 40,
+        reran: 2,
+        compiled: 1,
+        critical_path_us: 1500,
+    };
+    let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
+    let (out, _) = printed(json, &[Response::Work(worked), Response::Done { ok: true }], true);
+    assert_eq!(
+        out,
+        "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
+         \"patched\", \"critical_path_us\": 1500}\n{\"reason\":\"build-finished\",\"success\":true}\n"
+    );
+    let (out, _) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
+    assert_eq!(out, "", "under the human format it is not printed");
 }
 
 #[test]

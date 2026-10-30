@@ -97,7 +97,7 @@ pub type StableHasher = Sip<1, 3>;
 
 const KEY: (u64, u64) = (0x7361_6c73_615f_6670, 0x626c_617a_655f_7632);
 
-#[derive(Clone)]
+/// Not `Clone`: 56 bytes of hasher state, copied only where a hash is finished.
 pub struct Sip<const C: usize, const D: usize> {
     v0: u64,
     v1: u64,

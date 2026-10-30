@@ -1,6 +1,6 @@
 use std::{any::TypeId, sync};
 
-use base_db::{Env, SourceDatabase, all_crates};
+use base_db::{Db, Env, all_crates};
 use hir_def::{AssocItemId, DefWithBodyId, nameres::assoc::ImplItems, nameres::crate_def_map};
 use hir_expand::{
     builtin::quote::quote,
@@ -20,7 +20,7 @@ struct ImplDeserializableExpander;
 impl ProcMacroExpander for ImplDeserializableExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         _: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &Env,

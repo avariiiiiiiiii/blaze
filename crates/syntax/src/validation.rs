@@ -58,35 +58,39 @@ pub(crate) fn validate_outline(
     }
 }
 
-/// Runs on every node of a validated tree: the kind is read once and tested against each
-/// type's kinds, and the node is cast (a cursor clone) only for the one that matches.
+/// Runs on every node of a validated tree: one `match` on the kind, so a node no check is for
+/// (most nodes) costs one jump, and the node is cast (a cursor clone) only for its check. Each
+/// type is a single kind.
 fn validate_node(node: SyntaxNode, errors: &mut Vec<SyntaxError>) {
+    use crate::SyntaxKind as K;
     macro_rules! dispatch {
-        ($($ty:ident($it:ident) => $res:expr,)*) => {{
-            let kind = node.kind();
-            $(if ast::$ty::can_cast(kind) {
-                let $it = ast::$ty::cast(node).expect("the kind casts");
-                $res;
-                return;
-            })*
-        }};
+        ($($kind:ident => $ty:ident($it:ident) => $res:expr,)*) => {
+            match node.kind() {
+                $(K::$kind => {
+                    debug_assert_eq!(<ast::$ty as AstNode>::kind(), K::$kind);
+                    let $it = ast::$ty::cast(node).expect("the kind casts");
+                    $res;
+                })*
+                _ => {}
+            }
+        };
     }
     dispatch! {
-        Literal(it) => validate_literal(it, errors),
-        Const(it) => validate_const(it, errors),
-        BlockExpr(it) => block::validate_block_expr(it, errors),
-        FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
-        RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
-        Visibility(it) => validate_visibility(it, errors),
-        RangeExpr(it) => validate_range_expr(it, errors),
-        PathSegment(it) => validate_path_keywords(it, errors),
-        RefType(it) => validate_trait_object_ref_ty(it, errors),
-        PtrType(it) => validate_trait_object_ptr_ty(it, errors),
-        FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
-        MacroRules(it) => validate_macro_rules(it, errors),
-        LetExpr(it) => validate_let_expr(it, errors),
-        DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
-        ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
+        LITERAL => Literal(it) => validate_literal(it, errors),
+        CONST => Const(it) => validate_const(it, errors),
+        BLOCK_EXPR => BlockExpr(it) => block::validate_block_expr(it, errors),
+        FIELD_EXPR => FieldExpr(it) => validate_numeric_name(it.name_ref(), errors),
+        RECORD_EXPR_FIELD => RecordExprField(it) => validate_numeric_name(it.name_ref(), errors),
+        VISIBILITY => Visibility(it) => validate_visibility(it, errors),
+        RANGE_EXPR => RangeExpr(it) => validate_range_expr(it, errors),
+        PATH_SEGMENT => PathSegment(it) => validate_path_keywords(it, errors),
+        REF_TYPE => RefType(it) => validate_trait_object_ref_ty(it, errors),
+        PTR_TYPE => PtrType(it) => validate_trait_object_ptr_ty(it, errors),
+        FN_PTR_TYPE => FnPtrType(it) => validate_trait_object_fn_ptr_ret_ty(it, errors),
+        MACRO_RULES => MacroRules(it) => validate_macro_rules(it, errors),
+        LET_EXPR => LetExpr(it) => validate_let_expr(it, errors),
+        DYN_TRAIT_TYPE => DynTraitType(it) => errors.extend(validate_trait_object_ty(it)),
+        IMPL_TRAIT_TYPE => ImplTraitType(it) => errors.extend(validate_impl_object_ty(it)),
     }
 }
 
@@ -237,6 +241,7 @@ fn validate_literal(literal: ast::Literal, acc: &mut Vec<SyntaxError>) {
 }
 
 pub(crate) fn validate_block_structure(root: &SyntaxNode) {
+    // alloc: a debug-only structure check, switched off in `syntax_node.rs`
     let mut stack = Vec::new();
     for node in root.descendants_with_tokens() {
         match node.kind() {
@@ -488,28 +493,25 @@ fn validate_const(const_: ast::Const, errors: &mut Vec<SyntaxError>) {
 }
 
 fn validate_let_expr(let_: ast::LetExpr, errors: &mut Vec<SyntaxError>) {
-    let mut token = let_.syntax().clone();
-    loop {
-        token = match token.parent() {
-            Some(it) => it,
-            None => break,
-        };
-
-        if ast::ParenExpr::can_cast(token.kind()) {
-            continue;
-        } else if let Some(it) = ast::BinExpr::cast(token.clone()) {
-            if it.op_kind() == Some(ast::BinaryOp::LogicOp(ast::LogicOp::And)) {
-                continue;
+    let mut ancestor = let_.syntax().parent();
+    while let Some(node) = ancestor {
+        let kind = node.kind();
+        if ast::ParenExpr::can_cast(kind) {
+            ancestor = node.parent();
+        } else if let Some(it) = ast::BinExpr::cast(node) {
+            if it.op_kind() != Some(ast::BinaryOp::LogicOp(ast::LogicOp::And)) {
+                break;
             }
-        } else if ast::IfExpr::can_cast(token.kind())
-            || ast::WhileExpr::can_cast(token.kind())
-            || ast::MatchGuard::can_cast(token.kind())
+            ancestor = it.syntax().parent();
+        } else if ast::IfExpr::can_cast(kind)
+            || ast::WhileExpr::can_cast(kind)
+            || ast::MatchGuard::can_cast(kind)
         {
             // It must be part of the condition since the expressions are inside a block.
             return;
+        } else {
+            break;
         }
-
-        break;
     }
     errors.push(SyntaxError::new(
         "`let` expressions are not supported here",

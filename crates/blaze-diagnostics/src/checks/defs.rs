@@ -23,8 +23,9 @@ mod generics;
 mod recursive;
 mod unused;
 
+use base_db::Db;
 use blaze_items::ItemId;
-use hir::{HasSource as _, InFile, db::HirDatabase};
+use hir::{HasSource as _, InFile};
 use hir_def::{
     expr_store::Body,
     nameres::demand::every_body,
@@ -119,7 +120,7 @@ pub(crate) fn head_span(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> Span {
 }
 
 /// The item a definition is, for its key in a fact.
-pub(crate) fn item_id(db: &dyn HirDatabase, def: hir::ModuleDef) -> Option<ItemId> {
+pub(crate) fn item_id(db: &Db, def: hir::ModuleDef) -> Option<ItemId> {
     Some(match def {
         hir::ModuleDef::Function(it) => ItemId::Function(it.try_into().ok()?),
         hir::ModuleDef::Adt(it) => ItemId::Adt(it.into()),

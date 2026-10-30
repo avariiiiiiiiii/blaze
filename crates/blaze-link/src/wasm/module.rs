@@ -161,6 +161,7 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
             let Some(header) = unit.header else { continue };
             let at = (unit.addr - region.addr) as usize;
             if at < end {
+                // alloc: error path
                 return Err(format!("the function at {} overlaps the one before it", unit.addr));
             }
             stray(&bytes[end..at], region.addr + end as u64, &region.class)?;
@@ -174,21 +175,26 @@ fn functions<'a>(placed: &'a Placed<'a>) -> Result<Vec<Unit<'a>>, String> {
 /// What a placed image can't hold and still be a wasm module.
 fn check(placed: &Placed<'_>) -> Result<(), String> {
     if let Some((name, _)) = placed.debug.first() {
+        // alloc: error path
         return Err(format!(
             "the debug section {name}: a wasm module's debug info is its name section, and \
              DWARF of function indices would be wrong"
         ));
     }
     if let Some(cell) = placed.got.first() {
+        // alloc: error path
         return Err(format!("a GOT cell at {:#x}: a wasm32 module has no GOT", cell.addr));
     }
     if let Some(bind) = placed.binds.first() {
+        // alloc: error path
         return Err(format!("a bind at {:#x}: a wasm module is never bound", bind.addr));
     }
     if let Some(addr) = placed.rebase.first() {
+        // alloc: error path
         return Err(format!("a rebase at {addr:#x}: a wasm32 module is never slid"));
     }
     if let Some(tls) = &placed.tls {
+        // alloc: error path
         return Err(format!(
             "thread-local storage at {:#x}: wasm32 without shared memory has no TLS",
             tls.addr
@@ -211,6 +217,7 @@ fn check(placed: &Placed<'_>) -> Result<(), String> {
             _ => false,
         };
         if unplaceable && region.size > 0 {
+            // alloc: error path
             return Err(format!(
                 "a {:?} region of {} at {:#x}, which a wasm module has no place for",
                 region.class, region.size, region.addr
@@ -269,6 +276,7 @@ fn imports<'a>(placed: &'a Placed<'a>, arena: &'a [u8], spans: &[(usize, usize)]
 fn fits(at: u32, len: usize, name: Option<&str>) -> Result<(), String> {
     match (at as usize).checked_add(PADDED) {
         Some(end) if end <= len => Ok(()),
+        // alloc: error path
         _ => Err(format!(
             "the function {}: a fixup at {at} of a body of {len} bytes",
             name.unwrap_or("?")
@@ -337,6 +345,7 @@ fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
             match prefix {
                 b'+' | b'=' => used.push(feature),
                 b'-' => disallowed.push(feature),
+                // alloc: error path
                 other => return Err(format!("the target feature prefix {other:#04x}")),
             };
         }
@@ -346,6 +355,7 @@ fn target_features(payloads: &[u8]) -> Result<Vec<u8>, String> {
         list.dedup();
     }
     if let Some(feature) = used.iter().find(|it| disallowed.binary_search(it).is_ok()) {
+        // alloc: error path
         return Err(format!("the target feature `{feature}` is used by one object and disallowed by another"));
     }
     let mut out = Vec::with_capacity(payloads.len());
@@ -387,7 +397,7 @@ fn segment_name(class: &Class) -> &str {
         Class::RelRo => ".data.rel.ro",
         Class::Tdata => ".tdata",
         Class::PatchData => ".data.patch",
-        Class::Named { name, .. } => name,
+        Class::Named { name, .. } => name.as_str(),
         _ => ".data",
     }
 }
@@ -403,7 +413,9 @@ fn export<'n>(
 ) -> Result<(), String> {
     match named.entry(name) {
         Entry::Occupied(it) if again && *it.get() == (kind, index) => Ok(()),
+        // alloc: error path
         Entry::Occupied(_) if again => Err(format!("two different things exported as `{name}`")),
+        // alloc: error path
         Entry::Occupied(_) => Err(format!("`{name}` exported twice")),
         Entry::Vacant(it) => {
             it.insert((kind, index));
@@ -428,6 +440,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let defined = u32::try_from(units.len()).map_err(|_| "more than 2^32 functions")?;
     let count = u64::from(imported) + u64::from(defined);
     if count >= u64::from(u32::MAX) {
+        // alloc: error path
         return Err(format!("{count} functions, more than a table of 2^32 slots holds"));
     }
     let index_at = |addr: u64| match units.binary_search_by_key(&addr, |it| it.addr) {
@@ -448,6 +461,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
     let mut spans = Vec::with_capacity(placed.imports.len());
     for import in placed.imports {
         if import.kind != SymbolKind::Function {
+            // alloc: error path
             return Err(format!(
                 "the import `{}` is {:?}: a wasm32 module imports only functions",
                 import.name, import.kind
@@ -455,6 +469,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         }
         // The core makes every wasm import from what an input says it is imported as.
         let wasm = import.wasm.as_ref().ok_or_else(|| {
+            // alloc: error path
             format!("the import `{}`: no module, field and type for it", import.name)
         })?;
         let start = arena.len();
@@ -476,6 +491,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             if let Some(it) = by_name.get(name)
                 && (it.module, it.field, it.ty) != (module, field, ty)
             {
+                // alloc: error path
                 return Err(format!(
                     "`{name}` is imported as `{}.{}`, and the function {} says `{module}.{field}` \
                      or another type",
@@ -513,6 +529,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         let len = header.body().len();
         for (at, which) in header.type_fixups() {
             let ty = *scratch.get(which as usize).ok_or_else(|| {
+                // alloc: error path
                 format!("the function {}: no type {which}", unit.name.unwrap_or("?"))
             })?;
             fits(at, len, unit.name)?;
@@ -536,6 +553,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             Some(at) => units.get(at).and_then(|it| it.header).map(|it| it.ty()),
         };
         if ty != Some(NOTHING) {
+            // alloc: error path
             return Err(format!(
                 "the init function {function} takes or returns values (it must be `fn()`), or \
                  is no function of the program's"
@@ -547,10 +565,12 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
 
     // Memory: the stack, the data, then the heap from `__heap_base`.
     if placed.region(&Class::Synthetic(HEAP)).is_none() {
+        // alloc: error path
         return Err("no heap region: the writer's synthetic regions were not placed".to_owned());
     }
     let heap = heap_base(placed.regions);
     if heap > 1 << 32 {
+        // alloc: error path
         return Err(format!("data up to {heap:#x}, past 32-bit memory"));
     }
     let pages = heap.div_ceil(PAGE).max(1);
@@ -560,12 +580,14 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             continue;
         }
         if region.addr < wasm.stack {
+            // alloc: error path
             return Err(format!(
                 "the {:?} region at {:#x}, in the stack below {:#x}",
                 region.class, region.addr, wasm.stack
             ));
         }
         if region.addr + region.size > heap {
+            // alloc: error path
             return Err(format!(
                 "the {:?} region at {:#x} reaches past the heap's start {heap:#x}",
                 region.class, region.addr
@@ -573,6 +595,7 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
         }
         let bytes = placed.bytes(index);
         if bytes.len() as u64 > region.size {
+            // alloc: error path
             return Err(format!("the {:?} region has more bytes than its size", region.class));
         }
         if !bytes.is_empty() {
@@ -602,12 +625,14 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
             }
             SymbolKind::Data | SymbolKind::Other => {
                 let value = u32::try_from(it.addr)
+                    // alloc: error path
                     .map_err(|_| format!("`{}` at {:#x}, past 32-bit memory", it.name, it.addr))?;
                 let global = globals.len() as u32;
                 export(&mut named, &mut exports, &it.name, EXPORT_GLOBAL, global, false)?;
                 globals.push((it.name.as_str(), false, value));
             }
             SymbolKind::Tls | SymbolKind::Section => {
+                // alloc: error path
                 return Err(format!("`{}` is exported and is {:?}", it.name, it.kind));
             }
         }
@@ -833,20 +858,21 @@ pub(super) fn write(wasm: &Wasm, placed: &Placed<'_>) -> Result<Vec<u8>, String>
 
     // Each merged section's parts one after the other in one reused buffer, `producers` first.
     let merged = || runs().filter(|((_, merged), _)| *merged);
-    let mut payloads = Vec::with_capacity(merged().map(|(_, run)| part_bytes(run)).max().unwrap_or(0));
+    let most = merged().map(|(_, run)| part_bytes(run)).max().unwrap_or(0);
+    let mut payloads = Vec::with_capacity(most);
     for want in ["producers", "target_features"] {
         for ((name, _), run) in merged().filter(|((name, _), _)| *name == want) {
             payloads.clear();
             for &(_, index) in run {
                 payloads.extend_from_slice(placed.bytes(index));
             }
-            let merged = match name {
+            let payload = match name {
                 "producers" => producers(&payloads),
                 _ => target_features(&payloads),
             };
             // alloc: error path
-            let merged = merged.map_err(|e| format!("the {name} sections: {e}"))?;
-            leb::custom(&mut out, name, &merged);
+            let payload = payload.map_err(|e| format!("the {name} sections: {e}"))?;
+            leb::custom(&mut out, name, &payload);
         }
     }
     Ok(out)
@@ -942,13 +968,12 @@ mod tests {
             })
         }
 
-        fn writer(&self) -> Box<dyn Writer> {
+        fn writer(&self) -> Wasm {
             super::super::writer(&self.output).unwrap()
         }
 
-        /// The module, written as the core asks for it: synthesized, then the file.
-        fn module(&mut self) -> Result<Vec<u8>, String> {
-            let writer = self.writer();
+        /// The writer's synthetic regions filled, as the core fills them before the file.
+        fn synthesize(&mut self, writer: &Wasm) -> Result<(), String> {
             let synthetic = self.with(|placed| writer.synthesize(placed)).map_err(|e| e.what)?;
             for (class, bytes) in synthetic {
                 let Some(at) = self.regions.iter().position(|it| it.class == class) else {
@@ -958,6 +983,13 @@ mod tests {
                 self.regions[at].size = bytes.len() as u64;
                 self.contents[at] = bytes;
             }
+            Ok(())
+        }
+
+        /// The module, written as the core asks for it: synthesized, then the file.
+        fn module(&mut self) -> Result<Vec<u8>, String> {
+            let writer = self.writer();
+            self.synthesize(&writer)?;
             self.with(|placed| {
                 for region in placed.regions {
                     assert_eq!(writer.offset(placed, region), None, "{:?}", region.class);
@@ -971,7 +1003,7 @@ mod tests {
         }
     }
 
-    fn region(writer: &dyn Writer, class: Class, addr: u64, size: u64) -> Region {
+    fn region(writer: &Wasm, class: Class, addr: u64, size: u64) -> Region {
         let prot = writer.prot(&class);
         Region { class, addr, capacity: size, size, prot, align: 1 }
     }
@@ -1017,15 +1049,15 @@ mod tests {
             leb::name(&mut producers, version);
         }
         let regions = vec![
-            region(&*writer, Class::Synthetic(FUNCTIONS), 0, 1),
-            region(&*writer, Class::Text, 1, text.len() as u64),
-            region(&*writer, Class::Rodata, DATA, 5),
-            region(&*writer, Class::Data, DATA + 8, 4),
-            region(&*writer, Class::Bss, DATA + 12, 4),
-            region(&*writer, Class::Synthetic(HEAP), DATA + 16, 0),
-            region(&*writer, Class::InitArray, DATA + 16, 4),
-            region(&*writer, custom("my_section"), DATA + 20, 3),
-            region(&*writer, custom("producers"), DATA + 23, producers.len() as u64),
+            region(&writer, Class::Synthetic(FUNCTIONS), 0, 1),
+            region(&writer, Class::Text, 1, text.len() as u64),
+            region(&writer, Class::Rodata, DATA, 5),
+            region(&writer, Class::Data, DATA + 8, 4),
+            region(&writer, Class::Bss, DATA + 12, 4),
+            region(&writer, Class::Synthetic(HEAP), DATA + 16, 0),
+            region(&writer, Class::InitArray, DATA + 16, 4),
+            region(&writer, custom("my_section"), DATA + 20, 3),
+            region(&writer, custom("producers"), DATA + 23, producers.len() as u64),
         ];
         let contents = vec![
             vec![0],
@@ -1043,7 +1075,7 @@ mod tests {
             size: piece.len() as u64,
             fde: None,
             windows: None,
-            name: Some(name.to_owned()),
+            name: Some(name.into()),
         };
         Image {
             plan: writer.plan(),
@@ -1227,6 +1259,47 @@ mod tests {
         };
         assert_eq!(copied(1), sources);
         assert_eq!(copied(8), sources);
+    }
+
+    /// [`command`] with `extra` more `fn()`s after `_start`, each named.
+    fn with_functions(extra: usize) -> Image {
+        let mut image = command();
+        let piece = piece(&Code { ty: sig(&[], &[]), ..Code::default() }, &[0x00, 0x0b]);
+        let text = image.regions.iter().position(|it| it.class == Class::Text).unwrap();
+        for at in 0..extra {
+            let addr = image.regions[text].addr + image.contents[text].len() as u64;
+            image.contents[text].extend_from_slice(&piece);
+            image.functions.push(Function {
+                addr,
+                size: piece.len() as u64,
+                fde: None,
+                windows: None,
+                name: Some(format!("f{at}").into()),
+            });
+        }
+        let size = image.contents[text].len() as u64;
+        (image.regions[text].size, image.regions[text].capacity) = (size, size);
+        image
+    }
+
+    #[test]
+    fn a_module_is_written_in_a_constant_number_of_buffers() {
+        // On a pool of one thread the parallel parts run on the measured thread too.
+        let used = |extra| {
+            let mut image = with_functions(extra);
+            let writer = image.writer();
+            image.synthesize(&writer).unwrap();
+            on_threads(1, || {
+                image.with(|placed| blaze_alloc_count::measure(|| writer.file(placed).is_ok()))
+            })
+        };
+        let ((small_ok, small), (large_ok, large)) = (used(100), used(2000));
+        assert!(small_ok && large_ok);
+        // About 40: the columns `write` keeps, its maps of types, exports, imports and custom
+        // sections, a radix sort's scratch, the merged producers section and the output. None
+        // per function, segment or section.
+        assert!(small.allocations <= 64, "{small:?}");
+        assert_eq!(large.allocations, small.allocations, "20 times the functions");
     }
 
     #[test]

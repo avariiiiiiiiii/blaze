@@ -27,8 +27,32 @@ pub struct Code {
     /// From each code offset where it changes, the source location the code is of
     /// (`ir::Function::srcloc` of its instruction), by offset.
     pub lines: Vec<(u32, ir::SourceLoc)>,
+    /// Each place that traps and its trap code, by offset, as Cranelift's
+    /// `MachBufferFinalized::traps` gives them: every access of a stencil's memory op that
+    /// can fault (its `MemFlags` trap code; `Stencil::faults`), and every trap stub, which
+    /// traps at its first instruction.
+    pub traps: Vec<(u32, ir::TrapCode)>,
     /// Where each stack slot is, from the frame pointer.
     pub slots: Slots,
+}
+
+impl Code {
+    /// Bytes of code, constants included.
+    pub fn size(&self) -> u32 {
+        self.bytes.len() as u32
+    }
+
+    /// The source location of the code at `offset`: the last line row at or before it.
+    pub fn line_at(&self, offset: u32) -> Option<ir::SourceLoc> {
+        let after = self.lines.partition_point(|(at, _)| *at <= offset);
+        after.checked_sub(1).map(|at| self.lines[at].1)
+    }
+
+    /// The trap code of the instruction at `offset`, `None` when it is not one that traps.
+    pub fn trap_at(&self, offset: u32) -> Option<ir::TrapCode> {
+        let at = self.traps.binary_search_by_key(&offset, |it| it.0).ok()?;
+        Some(self.traps[at].1)
+    }
 }
 
 /// A place in the code the linker fills with an address.
@@ -79,8 +103,15 @@ pub enum Unwind {
     /// DWARF CFI (ELF, Mach-O): the rules from each offset, after the rules every function
     /// starts with (`FrameRule::on_entry`), covering `len` bytes.
     Dwarf { len: u32, rows: Vec<(u32, Rule)> },
-    /// Windows x64: the `UNWIND_INFO` without a handler, covering `len` bytes.
+    /// Windows x64: the `UNWIND_INFO` without a handler, covering `len` bytes, final: as the
+    /// dev path's `unwind/seh.rs` `with_saves` leaves Cranelift's, ready for `.xdata`. Take it
+    /// as-is; a second `with_saves` would re-index the saves and add a second allocation code.
     Windows { len: u32, info: Vec<u8> },
+    /// Windows ARM64: the unwind codes only, as Cranelift's `winarm64::UnwindInfo::emit`
+    /// writes them (last first, big-endian, padded to 4 bytes), covering `len` bytes. The
+    /// `.xdata` header (function length in words, code words, the `E` bit) is codegen's, as
+    /// for Cranelift's `UnwindInfo::WindowsArm64`.
+    WindowsArm64 { len: u32, codes: Vec<u8> },
 }
 
 /// A DWARF call frame instruction, as `hir-ty-codegen/unwind.rs`'s `FrameRule`: registers
@@ -97,6 +128,10 @@ pub enum Rule {
     RememberState,
     RestoreState,
     ArgsSize(u32),
+    /// AArch64's return-address signing state from here (`true`: signed), DWARF's
+    /// `RA_SIGN_STATE` pseudo-register 34 as `ValExpression(34, [DW_OP_lit0 or DW_OP_lit1])`,
+    /// as Cranelift's `Aarch64SetPointerAuth` row writes it.
+    RaSignState(bool),
 }
 
 /// Where stack slots are, for a debugger.

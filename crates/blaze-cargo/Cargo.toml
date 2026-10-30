@@ -27,6 +27,12 @@ unsandboxed-tests = [
 # named `blaze` too.
 fn-cache = { package = "blaze-cache", path = "../blaze-cache" }
 anyhow.workspace = true
+blaze-diagnostics.workspace = true
+blaze-items.workspace = true
+hir.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-ub.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 serde_json.workspace = true
@@ -151,7 +157,7 @@ tempfile = "3"
 [target.'cfg(windows)'.dependencies]
 find-msvc-tools = "0.1"
 uds_windows = "1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_System_SystemServices", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }
 
 [features]
 # Profile jemalloc's heap and count its live bytes: see `memory.rs`. Not on Windows.

@@ -12,6 +12,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+blaze-bytes.workspace = true
 blaze-ids.workspace = true
 rustc-hash = "1.0.1"
 text-size = "1.1.0"

@@ -90,245 +90,242 @@ pub fn parallel_prime_caches(
         (reverse_deps, to_be_done_deps)
     };
 
-    let (
-        def_map_work_sender,
-        import_map_work_sender,
-        symbols_work_sender,
-        sema_work_sender,
-        progress_receiver,
-    ) = {
-        let (progress_sender, progress_receiver) = crossbeam_channel::unbounded();
-        let (def_map_work_sender, def_map_work_receiver) = crossbeam_channel::unbounded();
-        let (import_map_work_sender, import_map_work_receiver) = crossbeam_channel::unbounded();
-        let (sema_work_sender, sema_work_receiver) = crossbeam_channel::unbounded();
-        let (symbols_work_sender, symbols_work_receiver) = crossbeam_channel::unbounded();
-        let prime_caches_worker = move |db: RootDatabase| {
-            let handle_def_map = |crate_id, crate_name| {
-                progress_sender.send(ParallelPrimeCacheWorkerProgress::BeginCrateDefMap {
-                    crate_id,
-                    crate_name,
-                })?;
-
-                let cancelled = Cancelled::catch(|| {
-                    _ = hir::crate_def_map(&db, crate_id);
-                });
-
-                match cancelled {
-                    Ok(()) => progress_sender
-                        .send(ParallelPrimeCacheWorkerProgress::EndCrateDefMap { crate_id })?,
-                    Err(cancelled) => progress_sender
-                        .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
-                }
-
-                Ok::<_, crossbeam_channel::SendError<_>>(())
-            };
-            let handle_sema = |crate_id| {
-                let cancelled = Cancelled::catch(|| {
-                    hir::attach_db(&db, || {
-                        // method resolution is likely to hit all trait impls at some point
-                        // we pre-populate it here as this will hit a lot of parses ...
-                        // This also computes the lang items, which is what we want as the work for them is also highly recursive and will be trigger by the module symbols query
-                        // slowing down leaf crate analysis tremendously as we go back to being blocked on a single thread
-                        _ = hir::TraitImpls::for_crate(&db, crate_id);
-                    })
-                });
-
-                match cancelled {
-                    Ok(()) => progress_sender.send(ParallelPrimeCacheWorkerProgress::EndSema)?,
-                    Err(cancelled) => progress_sender
-                        .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
-                }
-
-                Ok::<_, crossbeam_channel::SendError<_>>(())
-            };
-            let handle_import_map = |crate_id| {
-                let cancelled = Cancelled::catch(|| _ = ImportMap::of(&db, crate_id));
-
-                match cancelled {
-                    Ok(()) => {
-                        progress_sender.send(ParallelPrimeCacheWorkerProgress::EndCrateImportMap)?
-                    }
-                    Err(cancelled) => progress_sender
-                        .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
-                }
-
-                Ok::<_, crossbeam_channel::SendError<_>>(())
-            };
-            let handle_symbols = |module: hir::Module| {
-                let cancelled = Cancelled::catch(AssertUnwindSafe(|| {
-                    _ = SymbolIndex::module_symbols(&db, module)
-                }));
-
-                match cancelled {
-                    Ok(()) => {
-                        progress_sender.send(ParallelPrimeCacheWorkerProgress::EndModuleSymbols)?
-                    }
-                    Err(cancelled) => progress_sender
-                        .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
-                }
-
-                Ok::<_, crossbeam_channel::SendError<_>>(())
-            };
-
-            loop {
-                db.unwind_if_revision_cancelled();
-
-                // Biased because we want to prefer def maps.
-                crossbeam_channel::select_biased! {
-                    recv(def_map_work_receiver) -> work => {
-                        let Ok((crate_id, crate_name)) = work else { break };
-                        handle_def_map(crate_id, crate_name)?;
-                    }
-                    recv(sema_work_receiver) -> work => {
-                        let Ok(crate_id) = work else { break };
-                        handle_sema(crate_id)?;
-                    }
-                    recv(import_map_work_receiver) -> work => {
-                        let Ok(crate_id) = work else { break };
-                        handle_import_map(crate_id)?;
-                    }
-                    recv(symbols_work_receiver) -> work => {
-                        let Ok(module) = work else { break };
-                        handle_symbols(module)?;
-                    }
-                }
-            }
-            Ok::<_, crossbeam_channel::SendError<_>>(())
-        };
-
-        for id in 0..num_worker_threads {
-            stdx::thread::Builder::new(
-                stdx::thread::ThreadIntent::Worker,
-                format!("PrimeCaches#{id}"),
-            )
-            .allow_leak(true)
-            .spawn({
-                let worker = prime_caches_worker.clone();
-                let db = db.clone();
-                move || worker(db)
-            })
-            .expect("failed to spawn thread");
-        }
-
-        (
+    // Every worker reads `db` by reference, so they are joined before this returns; they stop
+    // once the work senders below drop.
+    std::thread::scope(|workers| {
+        let (
             def_map_work_sender,
             import_map_work_sender,
             symbols_work_sender,
             sema_work_sender,
             progress_receiver,
-        )
-    };
+        ) = {
+            let (progress_sender, progress_receiver) = crossbeam_channel::unbounded();
+            let (def_map_work_sender, def_map_work_receiver) = crossbeam_channel::unbounded();
+            let (import_map_work_sender, import_map_work_receiver) = crossbeam_channel::unbounded();
+            let (sema_work_sender, sema_work_receiver) = crossbeam_channel::unbounded();
+            let (symbols_work_sender, symbols_work_receiver) = crossbeam_channel::unbounded();
+            let prime_caches_worker = move |db: &RootDatabase| {
+                let handle_def_map = |crate_id, crate_name| {
+                    progress_sender.send(ParallelPrimeCacheWorkerProgress::BeginCrateDefMap {
+                        crate_id,
+                        crate_name,
+                    })?;
 
-    let crate_def_maps_total = scope.len();
-    let mut crate_def_maps_done = 0;
-    let (mut crate_import_maps_total, mut crate_import_maps_done) = (0usize, 0usize);
-    let (mut module_symbols_total, mut module_symbols_done) = (0usize, 0usize);
-    let (mut sema_total, mut sema_done) = (0usize, 0usize);
+                    let cancelled = Cancelled::catch(|| {
+                        _ = hir::crate_def_map(db, crate_id);
+                    });
 
-    // an index map is used to preserve ordering so we can sort the progress report in order of
-    // "longest crate to index" first
-    let mut crates_currently_indexing =
-        FxIndexMap::with_capacity_and_hasher(num_worker_threads, Default::default());
+                    match cancelled {
+                        Ok(()) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::EndCrateDefMap { crate_id })?,
+                        Err(cancelled) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
+                    }
 
-    for (&krate, &to_be_done_deps) in &to_be_done_deps {
-        if to_be_done_deps != 0 {
-            continue;
-        }
+                    Ok::<_, crossbeam_channel::SendError<_>>(())
+                };
+                let handle_sema = |crate_id| {
+                    let cancelled = Cancelled::catch(|| {
+                        hir::attach_db(db, || {
+                            // method resolution is likely to hit all trait impls at some point
+                            // we pre-populate it here as this will hit a lot of parses ...
+                            // This also computes the lang items, which is what we want as the work for them is also highly recursive and will be trigger by the module symbols query
+                            // slowing down leaf crate analysis tremendously as we go back to being blocked on a single thread
+                            _ = hir::TraitImpls::for_crate(db, crate_id);
+                        })
+                    });
 
-        let name = crate_name(db, krate);
-        def_map_work_sender.send((krate, name)).ok();
-    }
+                    match cancelled {
+                        Ok(()) => progress_sender.send(ParallelPrimeCacheWorkerProgress::EndSema)?,
+                        Err(cancelled) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
+                    }
 
-    while crate_def_maps_done < crate_def_maps_total
-        || crate_import_maps_done < crate_import_maps_total
-        || module_symbols_done < module_symbols_total
-        || sema_done < sema_total
-    {
-        db.unwind_if_revision_cancelled();
+                    Ok::<_, crossbeam_channel::SendError<_>>(())
+                };
+                let handle_import_map = |crate_id| {
+                    let cancelled = Cancelled::catch(|| _ = ImportMap::of(db, crate_id));
 
-        let progress = ParallelPrimeCachesProgress {
-            crates_currently_indexing: crates_currently_indexing.values().cloned().collect(),
-            crates_done: crate_def_maps_done,
-            crates_total: crate_def_maps_total,
-            work_type: "Indexing",
-        };
+                    match cancelled {
+                        Ok(()) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::EndCrateImportMap)?,
+                        Err(cancelled) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
+                    }
 
-        cb(progress);
+                    Ok::<_, crossbeam_channel::SendError<_>>(())
+                };
+                let handle_symbols = |module: hir::Module| {
+                    let cancelled = Cancelled::catch(AssertUnwindSafe(|| {
+                        _ = SymbolIndex::module_symbols(db, module)
+                    }));
 
-        // Biased to prefer progress updates (and because it's faster).
-        let progress = match progress_receiver.recv() {
-            Ok(p) => p,
-            Err(crossbeam_channel::RecvError) => {
-                // all our workers have exited, mark us as finished and exit
-                cb(ParallelPrimeCachesProgress {
-                    crates_currently_indexing: vec![],
-                    crates_done: crate_def_maps_done,
-                    crates_total: crate_def_maps_done,
-                    work_type: "Done",
-                });
-                return;
-            }
-        };
+                    match cancelled {
+                        Ok(()) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::EndModuleSymbols)?,
+                        Err(cancelled) => progress_sender
+                            .send(ParallelPrimeCacheWorkerProgress::Cancelled(cancelled))?,
+                    }
 
-        match progress {
-            ParallelPrimeCacheWorkerProgress::BeginCrateDefMap { crate_id, crate_name } => {
-                crates_currently_indexing.insert(crate_id, crate_name);
-            }
-            ParallelPrimeCacheWorkerProgress::EndCrateDefMap { crate_id } => {
-                crates_currently_indexing.swap_remove(&crate_id);
-                crate_def_maps_done += 1;
+                    Ok::<_, crossbeam_channel::SendError<_>>(())
+                };
 
-                // Fire ready dependencies.
-                for &dep in &reverse_deps[&crate_id] {
-                    let to_be_done = to_be_done_deps.get_mut(&dep).unwrap();
-                    *to_be_done -= 1;
-                    if *to_be_done == 0 {
-                        let dep_name = crate_name(db, dep);
-                        def_map_work_sender.send((dep, dep_name)).ok();
+                loop {
+                    db.unwind_if_revision_cancelled();
+
+                    // Biased because we want to prefer def maps.
+                    crossbeam_channel::select_biased! {
+                        recv(def_map_work_receiver) -> work => {
+                            let Ok((crate_id, crate_name)) = work else { break };
+                            handle_def_map(crate_id, crate_name)?;
+                        }
+                        recv(sema_work_receiver) -> work => {
+                            let Ok(crate_id) = work else { break };
+                            handle_sema(crate_id)?;
+                        }
+                        recv(import_map_work_receiver) -> work => {
+                            let Ok(crate_id) = work else { break };
+                            handle_import_map(crate_id)?;
+                        }
+                        recv(symbols_work_receiver) -> work => {
+                            let Ok(module) = work else { break };
+                            handle_symbols(module)?;
+                        }
                     }
                 }
+                Ok::<_, crossbeam_channel::SendError<_>>(())
+            };
 
-                if crate_def_maps_done == crate_def_maps_total {
+            for id in 0..num_worker_threads {
+                let worker = prime_caches_worker.clone();
+                std::thread::Builder::new()
+                    .name(format!("PrimeCaches#{id}"))
+                    .stack_size(stdx::thread::DEFAULT_STACK_SIZE)
+                    .spawn_scoped(workers, move || worker(db))
+                    .expect("failed to spawn thread");
+            }
+
+            (
+                def_map_work_sender,
+                import_map_work_sender,
+                symbols_work_sender,
+                sema_work_sender,
+                progress_receiver,
+            )
+        };
+
+        let crate_def_maps_total = scope.len();
+        let mut crate_def_maps_done = 0;
+        let (mut crate_import_maps_total, mut crate_import_maps_done) = (0usize, 0usize);
+        let (mut module_symbols_total, mut module_symbols_done) = (0usize, 0usize);
+        let (mut sema_total, mut sema_done) = (0usize, 0usize);
+
+        // an index map is used to preserve ordering so we can sort the progress report in order of
+        // "longest crate to index" first
+        let mut crates_currently_indexing =
+            FxIndexMap::with_capacity_and_hasher(num_worker_threads, Default::default());
+
+        for (&krate, &to_be_done_deps) in &to_be_done_deps {
+            if to_be_done_deps != 0 {
+                continue;
+            }
+
+            let name = crate_name(db, krate);
+            def_map_work_sender.send((krate, name)).ok();
+        }
+
+        while crate_def_maps_done < crate_def_maps_total
+            || crate_import_maps_done < crate_import_maps_total
+            || module_symbols_done < module_symbols_total
+            || sema_done < sema_total
+        {
+            db.unwind_if_revision_cancelled();
+
+            let progress = ParallelPrimeCachesProgress {
+                crates_currently_indexing: crates_currently_indexing.values().cloned().collect(),
+                crates_done: crate_def_maps_done,
+                crates_total: crate_def_maps_total,
+                work_type: "Indexing",
+            };
+
+            cb(progress);
+
+            // Biased to prefer progress updates (and because it's faster).
+            let progress = match progress_receiver.recv() {
+                Ok(p) => p,
+                Err(crossbeam_channel::RecvError) => {
+                    // all our workers have exited, mark us as finished and exit
                     cb(ParallelPrimeCachesProgress {
                         crates_currently_indexing: vec![],
                         crates_done: crate_def_maps_done,
                         crates_total: crate_def_maps_done,
-                        work_type: "Collecting Symbols",
+                        work_type: "Done",
                     });
+                    return;
                 }
+            };
 
-                sema_work_sender.send(crate_id).ok();
-                sema_total += 1;
-                let origin = &crate_id.data(db).origin;
-                if origin.is_lang() {
-                    crate_import_maps_total += 1;
-                    import_map_work_sender.send(crate_id).ok();
-                } else if origin.is_local() {
-                    // Compute the symbol search index.
-                    // This primes the cache for `ide_db::symbol_index::world_symbols()`.
-                    //
-                    // We do this for workspace crates only (members of local_roots), because doing it
-                    // for all dependencies could be *very* unnecessarily slow in a large project.
-                    //
-                    // FIXME: We should do it unconditionally if the configuration is set to default to
-                    // searching dependencies (rust-analyzer.workspace.symbol.search.scope), but we
-                    // would need to pipe that configuration information down here.
-                    let modules = hir::Crate::from(crate_id).modules(db);
-                    module_symbols_total += modules.len();
-                    for module in modules {
-                        symbols_work_sender.send(module).ok();
+            match progress {
+                ParallelPrimeCacheWorkerProgress::BeginCrateDefMap { crate_id, crate_name } => {
+                    crates_currently_indexing.insert(crate_id, crate_name);
+                }
+                ParallelPrimeCacheWorkerProgress::EndCrateDefMap { crate_id } => {
+                    crates_currently_indexing.swap_remove(&crate_id);
+                    crate_def_maps_done += 1;
+
+                    // Fire ready dependencies.
+                    for &dep in &reverse_deps[&crate_id] {
+                        let to_be_done = to_be_done_deps.get_mut(&dep).unwrap();
+                        *to_be_done -= 1;
+                        if *to_be_done == 0 {
+                            let dep_name = crate_name(db, dep);
+                            def_map_work_sender.send((dep, dep_name)).ok();
+                        }
+                    }
+
+                    if crate_def_maps_done == crate_def_maps_total {
+                        cb(ParallelPrimeCachesProgress {
+                            crates_currently_indexing: vec![],
+                            crates_done: crate_def_maps_done,
+                            crates_total: crate_def_maps_done,
+                            work_type: "Collecting Symbols",
+                        });
+                    }
+
+                    sema_work_sender.send(crate_id).ok();
+                    sema_total += 1;
+                    let origin = &crate_id.data(db).origin;
+                    if origin.is_lang() {
+                        crate_import_maps_total += 1;
+                        import_map_work_sender.send(crate_id).ok();
+                    } else if origin.is_local() {
+                        // Compute the symbol search index.
+                        // This primes the cache for `ide_db::symbol_index::world_symbols()`.
+                        //
+                        // We do this for workspace crates only (members of local_roots), because doing it
+                        // for all dependencies could be *very* unnecessarily slow in a large project.
+                        //
+                        // FIXME: We should do it unconditionally if the configuration is set to default to
+                        // searching dependencies (rust-analyzer.workspace.symbol.search.scope), but we
+                        // would need to pipe that configuration information down here.
+                        let modules = hir::Crate::from(crate_id).modules(db);
+                        module_symbols_total += modules.len();
+                        for module in modules {
+                            symbols_work_sender.send(module).ok();
+                        }
                     }
                 }
-            }
-            ParallelPrimeCacheWorkerProgress::EndCrateImportMap => crate_import_maps_done += 1,
-            ParallelPrimeCacheWorkerProgress::EndModuleSymbols => module_symbols_done += 1,
-            ParallelPrimeCacheWorkerProgress::EndSema => sema_done += 1,
-            ParallelPrimeCacheWorkerProgress::Cancelled(cancelled) => {
-                // Cancelled::throw should probably be public
-                std::panic::resume_unwind(Box::new(cancelled));
+                ParallelPrimeCacheWorkerProgress::EndCrateImportMap => crate_import_maps_done += 1,
+                ParallelPrimeCacheWorkerProgress::EndModuleSymbols => module_symbols_done += 1,
+                ParallelPrimeCacheWorkerProgress::EndSema => sema_done += 1,
+                ParallelPrimeCacheWorkerProgress::Cancelled(cancelled) => {
+                    // Cancelled::throw should probably be public
+                    std::panic::resume_unwind(Box::new(cancelled));
+                }
             }
         }
-    }
+    });
 }
 
 fn crate_name(db: &RootDatabase, krate: Crate) -> Symbol {

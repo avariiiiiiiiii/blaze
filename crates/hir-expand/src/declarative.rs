@@ -2,7 +2,7 @@
 
 use std::ops::ControlFlow;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use span::{Edition, Span, SyntaxContext};
 use stdx::TupleExt;
 use syntax::{
@@ -31,7 +31,7 @@ pub struct DeclarativeMacroExpander {
 impl DeclarativeMacroExpander {
     pub fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         tt: &tt::TopSubtree,
         call_id: MacroCallId,
         span: Span,
@@ -64,7 +64,7 @@ impl DeclarativeMacroExpander {
 
     pub fn expand_unhygienic(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         tt: &tt::TopSubtree,
         call_style: MacroCallStyle,
         call_site: Span,
@@ -89,7 +89,7 @@ impl AstId<ast::Macro> {
     #[salsa::tracked(returns(ref))]
     pub fn decl_macro_expander(
         self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         def_crate: Crate,
     ) -> DeclarativeMacroExpander {
         let id = self;

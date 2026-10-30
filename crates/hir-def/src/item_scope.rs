@@ -14,7 +14,7 @@ use std::{
     sync::{LazyLock, OnceLock},
 };
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use blaze_ids::radix;
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
@@ -32,7 +32,7 @@ use crate::{
     AdtId, BuiltinDeriveImplId, BuiltinType, ConstId, ExternBlockId, ExternCrateId, HasModule,
     ImplId, Lookup, MacroCallStyles, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    per_ns::{Item, PerNs, TypesItem},
+    per_ns::{Item, Namespace, PerNs, TypesItem},
     visibility::{Visibility, VisibilityExplicitness},
 };
 
@@ -804,6 +804,12 @@ pub struct ItemScope {
     pub(crate) unnamed_consts: ThinVec<ConstId>,
     /// Traits imported via `use Trait as _;`.
     pub(crate) unnamed_trait_imports: ThinVec<(TraitId, Item<()>)>,
+    /// Every `use path as _;` of this scope, in the order they resolved.
+    pub(crate) underscore_imports: ThinVec<UnderscoreImport>,
+    /// The names two globs give different items, in the order the second glob came.
+    pub(crate) glob_ambiguities: ThinVec<GlobAmbiguity>,
+    /// Single imports that lost their name to another binding, in the order they came.
+    pub(crate) shadowed_imports: ThinVec<ShadowedImport>,
 
     // the resolutions of the imports of this scope
     pub(crate) use_imports_types: Keyed<ImportOrExternCrate, ImportOrDef>,
@@ -852,6 +858,9 @@ impl PartialEq for ItemScope {
             extern_blocks,
             unnamed_consts,
             unnamed_trait_imports,
+            underscore_imports,
+            glob_ambiguities,
+            shadowed_imports,
             use_imports_types,
             use_imports_values,
             use_imports_macros,
@@ -875,6 +884,9 @@ impl PartialEq for ItemScope {
             && *extern_blocks == other.extern_blocks
             && *unnamed_consts == other.unnamed_consts
             && *unnamed_trait_imports == other.unnamed_trait_imports
+            && *underscore_imports == other.underscore_imports
+            && *glob_ambiguities == other.glob_ambiguities
+            && *shadowed_imports == other.shadowed_imports
             && *use_imports_types == other.use_imports_types
             && *use_imports_values == other.use_imports_values
             && *use_imports_macros == other.use_imports_macros
@@ -895,6 +907,36 @@ pub(crate) struct DeriveMacroInvocation {
     /// The `#[derive]` call
     pub(crate) attr_call_id: MacroCallId,
     pub(crate) derive_call_ids: SmallVec<[Option<Either<MacroCallId, BuiltinDeriveImplId>>; 4]>,
+}
+
+/// A name two glob imports of a scope give different items in one namespace (rustc's ambiguity
+/// binding): the scope binds the name to the first glob's item, and this is the other's. Kept
+/// only while no declaration or single import shadows the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlobAmbiguity {
+    pub name: Name,
+    pub other: ItemInNs,
+    pub glob: GlobId,
+    pub vis: Visibility,
+}
+
+/// What a single import or `extern crate` gave a name in one namespace where the scope keeps
+/// another binding of that name: a declaration or an earlier import it is defined twice with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShadowedImport {
+    pub import: ImportOrExternCrate,
+    pub name: Name,
+    pub item: ItemInNs,
+    pub vis: Visibility,
+}
+
+/// A `use path as _;`, which binds no name: what `path` names in the types namespace, if it
+/// resolved, and the import's visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnderscoreImport {
+    pub import: ImportId,
+    pub def: Option<ModuleDefId>,
+    pub vis: Visibility,
 }
 
 /// The builtin types by name, which a root `DefMap` resolves a name to when no scope does:
@@ -1132,7 +1174,7 @@ impl ItemScope {
             .dedup()
     }
 
-    pub fn fully_resolve_import(&self, db: &dyn SourceDatabase, mut import: ImportId) -> PerNs {
+    pub fn fully_resolve_import(&self, db: &Db, mut import: ImportId) -> PerNs {
         let mut res = PerNs::none();
 
         let mut scope = self;
@@ -1284,6 +1326,42 @@ impl ItemScope {
             values: self.values.get(values),
             macros: self.macros.get(macros),
         }
+    }
+
+    /// The import that binds `name` in `ns` here, with the binding's visibility: `None` where
+    /// the scope declares the name or does not bind it in `ns`. Where in the source the import
+    /// is, `src::use_tree_to_ast` of its use tree says.
+    pub fn import_of(
+        &self,
+        name: &Name,
+        ns: Namespace,
+    ) -> Option<(ImportOrExternCrate, Visibility)> {
+        let res = self.get(name);
+        match ns {
+            Namespace::Types => res.types.and_then(|it| Some((it.import?, it.vis))),
+            Namespace::Values => res.values.and_then(|it| Some((it.import?.into(), it.vis))),
+            Namespace::Macros => res.macros.and_then(|it| Some((it.import?, it.vis))),
+        }
+    }
+
+    /// Every `use path as _;` of this scope.
+    pub fn underscore_imports(&self) -> &[UnderscoreImport] {
+        &self.underscore_imports
+    }
+
+    /// The names two glob imports give different items, with the item the scope does not bind.
+    pub fn glob_ambiguities(&self) -> &[GlobAmbiguity] {
+        &self.glob_ambiguities
+    }
+
+    /// The other item of `name` in `ns`, where two glob imports give it different ones.
+    pub fn glob_ambiguity(&self, name: &Name, ns: Namespace) -> Option<&GlobAmbiguity> {
+        (self.glob_ambiguities.iter()).find(|it| it.name == *name && namespace_of(it.other) == ns)
+    }
+
+    /// The single imports whose name another binding of the scope kept.
+    pub fn shadowed_imports(&self) -> &[ShadowedImport] {
+        &self.shadowed_imports
     }
 
     pub(crate) fn type_(&self, name: &Name) -> Option<(ModuleDefId, Visibility)> {
@@ -1534,6 +1612,66 @@ impl ItemScope {
         self.unnamed_trait_imports.push((tr, Item { def: (), vis, import }));
     }
 
+    /// Records `it`, in place of what an earlier resolution of the same import recorded.
+    pub(crate) fn push_underscore_import(&mut self, it: UnderscoreImport) {
+        match self.underscore_imports.iter_mut().find(|old| old.import == it.import) {
+            Some(old) => *old = it,
+            None => self.underscore_imports.push(it),
+        }
+    }
+
+    /// Records that glob `it.glob` gives `it.name` another item than the scope binds it to.
+    pub(crate) fn push_glob_ambiguity(&mut self, it: GlobAmbiguity) {
+        let ns = namespace_of(it.other);
+        let same = |old: &&mut GlobAmbiguity| {
+            old.name == it.name && old.glob == it.glob && namespace_of(old.other) == ns
+        };
+        match self.glob_ambiguities.iter_mut().find(same) {
+            Some(old) => *old = it,
+            None => self.glob_ambiguities.push(it),
+        }
+    }
+
+    fn drop_glob_ambiguity(&mut self, name: &Name, ns: Namespace) {
+        if !self.glob_ambiguities.is_empty() {
+            self.glob_ambiguities.retain(|it| it.name != *name || namespace_of(it.other) != ns);
+        }
+    }
+
+    /// Drops the ambiguities a later write settled: the name is no longer a glob's, or now
+    /// names the other item too. Called once, when collection is done.
+    pub(crate) fn settle_glob_ambiguities(&mut self) {
+        if self.glob_ambiguities.is_empty() {
+            return;
+        }
+        let mut ambiguities = std::mem::take(&mut self.glob_ambiguities);
+        ambiguities.retain(|it| {
+            let now = self.get(&it.name);
+            match it.other {
+                ItemInNs::Types(def) => now.types.is_some_and(|now| {
+                    matches!(now.import, Some(ImportOrExternCrate::Glob(_))) && now.def != def
+                }),
+                ItemInNs::Values(def) => now.values.is_some_and(|now| {
+                    matches!(now.import, Some(ImportOrGlob::Glob(_))) && now.def != def
+                }),
+                ItemInNs::Macros(def) => now.macros.is_some_and(|now| {
+                    matches!(now.import, Some(ImportOrExternCrate::Glob(_))) && now.def != def
+                }),
+            }
+        });
+        self.glob_ambiguities = ambiguities;
+    }
+
+    fn push_shadowed(&mut self, it: ShadowedImport) {
+        let ns = namespace_of(it.item);
+        match (self.shadowed_imports.iter_mut())
+            .find(|old| old.import == it.import && namespace_of(old.item) == ns)
+        {
+            Some(old) => *old = it,
+            None => self.shadowed_imports.push(it),
+        }
+    }
+
     pub(crate) fn push_res_with_import(
         &mut self,
         glob_imports: &mut PerNsGlobImports,
@@ -1588,7 +1726,17 @@ impl ItemScope {
                                 cov_mark::hit!(import_shadowed);
                                 self.types.entries[pos] = Entry::new(name, fld);
                                 self.by_def.take();
+                                self.drop_glob_ambiguity(&name, Namespace::Types);
                                 changed = true;
+                            } else if let Some(import) = import
+                                && self.types.at(pos).import != Some(import)
+                            {
+                                self.push_shadowed(ShadowedImport {
+                                    import,
+                                    name,
+                                    item: ItemInNs::Types(fld.def),
+                                    vis: fld.vis,
+                                });
                             }
                         }
                     }
@@ -1628,7 +1776,17 @@ impl ItemScope {
                         }
                         self.values.entries[pos] = Entry::new(name, fld);
                         self.by_def.take();
+                        self.drop_glob_ambiguity(&name, Namespace::Values);
                         changed = true;
+                    } else if let Some(import) = import
+                        && self.values.at(pos).import != Some(import)
+                    {
+                        self.push_shadowed(ShadowedImport {
+                            import: import.into(),
+                            name,
+                            item: ItemInNs::Values(fld.def),
+                            vis: fld.vis,
+                        });
                     }
                 }
                 Some(_) => {}
@@ -1669,9 +1827,22 @@ impl ItemScope {
                     }
                     self.macros.entries[pos] = Entry::new(name, fld);
                     self.by_def.take();
+                    self.drop_glob_ambiguity(&name, Namespace::Macros);
                     changed = true;
                 }
-                Some(_) => {}
+                Some(pos) => {
+                    if let Some(import) = import
+                        && !matches!(import, ImportOrExternCrate::Glob(..))
+                        && self.macros.at(pos).import != Some(import)
+                    {
+                        self.push_shadowed(ShadowedImport {
+                            import,
+                            name,
+                            item: ItemInNs::Macros(fld.def),
+                            vis: fld.vis,
+                        });
+                    }
+                }
             }
         }
 
@@ -1700,7 +1871,7 @@ impl ItemScope {
         }
     }
 
-    pub(crate) fn dump(&self, db: &dyn SourceDatabase, buf: &mut String) {
+    pub(crate) fn dump(&self, db: &Db, buf: &mut String) {
         let mut entries: Vec<_> = self.resolutions().collect();
         entries.sort_by_key(|(name, _)| *name);
 
@@ -1790,6 +1961,9 @@ impl ItemScope {
             builtin_derive_impls,
             unnamed_consts,
             unnamed_trait_imports,
+            underscore_imports,
+            glob_ambiguities,
+            shadowed_imports,
             legacy_macros,
             attr_macros,
             derive_macros,
@@ -1801,6 +1975,9 @@ impl ItemScope {
             macro_invocations,
             extern_blocks,
         } = self;
+        underscore_imports.shrink_to_fit();
+        glob_ambiguities.shrink_to_fit();
+        shadowed_imports.shrink_to_fit();
         extern_blocks.shrink_to_fit();
         types.entries.shrink_to_fit();
         values.entries.shrink_to_fit();
@@ -1930,6 +2107,14 @@ pub enum ItemInNs {
     Macros(MacroId),
 }
 
+pub(crate) fn namespace_of(item: ItemInNs) -> Namespace {
+    match item {
+        ItemInNs::Types(_) => Namespace::Types,
+        ItemInNs::Values(_) => Namespace::Values,
+        ItemInNs::Macros(_) => Namespace::Macros,
+    }
+}
+
 impl ItemInNs {
     pub fn as_module_def_id(self) -> Option<ModuleDefId> {
         match self {
@@ -1939,11 +2124,11 @@ impl ItemInNs {
     }
 
     /// Returns the crate defining this item (or `None` if `self` is built-in).
-    pub fn krate(&self, db: &dyn SourceDatabase) -> Option<Crate> {
+    pub fn krate(&self, db: &Db) -> Option<Crate> {
         self.module(db).map(|module_id| module_id.krate(db))
     }
 
-    pub fn module(&self, db: &dyn SourceDatabase) -> Option<ModuleId> {
+    pub fn module(&self, db: &Db) -> Option<ModuleId> {
         match self {
             ItemInNs::Types(id) | ItemInNs::Values(id) => id.module(db),
             ItemInNs::Macros(id) => Some(id.module(db)),

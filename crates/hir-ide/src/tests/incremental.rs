@@ -1,10 +1,9 @@
-use base_db::SourceDatabase;
 use expect_test::Expect;
 use hir_def::{DefWithBodyId, ModuleDefId};
 use salsa::EventKind;
 use test_fixture::WithFixture;
 
-use crate::{InferenceResult, method_resolution::TraitImpls, test_db::TestDB};
+use crate::{InferenceResult, method_resolution::TraitImpls, test_db::{TestDB, TestDBExt as _}};
 
 use super::visit_module;
 
@@ -745,7 +744,17 @@ fn execute_assert_events(
     expect: Expect,
 ) {
     crate::attach_db(db, || {
-        let (executed, events) = db.log_executed(f);
+        let events = db.log(f);
+        let executed: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::WillExecute { database_key } => Some(
+                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
+                        .into_owned(),
+                ),
+                _ => None,
+            })
+            .collect();
         expect.assert_debug_eq(&executed);
         for (event, count) in required {
             let n = executed.iter().filter(|it| it.contains(event)).count();

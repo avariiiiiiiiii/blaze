@@ -498,18 +498,7 @@ fn gc_keeps_parent_stricter_than_child() {
 /// every wildcard verdict is not a property Miri's GC claims.
 #[test]
 fn gc_never_changes_a_verdict() {
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-    }
+    use blaze_ids::rng::SplitMix64;
 
     const SIZE: u64 = 3;
 
@@ -574,7 +563,7 @@ fn gc_never_changes_a_verdict() {
         Ok(())
     }
 
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let mut checked_ub = 0;
     for _program in 0..3000 {
         let mut plain = Sim::new();
@@ -585,21 +574,21 @@ fn gc_never_changes_a_verdict() {
         let mut held = vec![x];
         let mut frames = 0usize;
         for _ in 0..14 {
-            let op = match rng.below(10) {
+            let op = match rng.index(10) {
                 0..=2 => Op::Retag {
-                    from: rng.below(held.len()),
-                    kind: rng.below(5) as u8,
-                    a: rng.next(),
-                    b: rng.next(),
+                    from: rng.index(held.len()),
+                    kind: rng.index(5) as u8,
+                    a: rng.next_u64(),
+                    b: rng.next_u64(),
                 },
                 3..=6 => Op::Access {
-                    through: rng.below(held.len()),
-                    write: rng.below(2) == 0,
-                    a: rng.next(),
-                    b: rng.next(),
+                    through: rng.index(held.len()),
+                    write: rng.index(2) == 0,
+                    a: rng.next_u64(),
+                    b: rng.next_u64(),
                 },
-                7 if held.len() > 1 => Op::Drop { which: 1 + rng.below(held.len() - 1) },
-                8 if frames < 2 => Op::Call { from: rng.below(held.len()), kind: rng.below(3) as u8 },
+                7 if held.len() > 1 => Op::Drop { which: 1 + rng.index(held.len() - 1) },
+                8 if frames < 2 => Op::Call { from: rng.index(held.len()), kind: rng.index(3) as u8 },
                 9 if frames > 0 => Op::Ret,
                 _ => continue,
             };

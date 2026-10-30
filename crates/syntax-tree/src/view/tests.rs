@@ -4,7 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     api, view::{Element, Node, NodeId}, Direction, FlatTree, FlatTreeBuilder, Language,
-    NodeOrToken, SyntaxKind, TextRange, TextSize, TokenAtOffset, WalkEvent,
+    NodeOrToken, SyntaxKind, Text, TextRange, TextSize, TokenAtOffset, WalkEvent,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -118,7 +118,7 @@ fn close_of(source: &str, at: usize) -> usize {
 
 fn expand(
     kind: SyntaxKind,
-    source: &Arc<str>,
+    source: &Text,
     range: TextRange,
     _data: u32,
 ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
@@ -142,7 +142,7 @@ fn tree(seed: u64) -> Arc<FlatTree> {
             _ => group_text(&mut rng, 0, &mut text),
         }
     }
-    let source: Arc<str> = text.into();
+    let source = Text::from(text);
     let mut builder = FlatTreeBuilder::sourced(source.clone());
     builder.expand_with(expand, 0);
     builder.start_node(ROOT);

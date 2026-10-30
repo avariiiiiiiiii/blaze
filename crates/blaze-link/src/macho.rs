@@ -42,11 +42,13 @@ use std::sync::Mutex;
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 use object::macho;
+use rayon::prelude::*;
 
 use crate::model::{
     Class, Counts, Data, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
-    SectionKind, Special, Writer,
+    SectionKind, SectionName, Special, Writer,
 };
+use smallvec::SmallVec;
 use crate::output::Platform;
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
@@ -65,8 +67,7 @@ fn error(what: impl Into<String>) -> LinkError {
     LinkError { function: None, what: what.into() }
 }
 
-// dyn: `model::writer`'s format dispatch, made once per image; nothing per element goes through it
-pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
     let (cpu, subtype, page) = match output.arch {
         Arch::Aarch64 => (macho::CPU_TYPE_ARM64, macho::CPU_SUBTYPE_ARM64_ALL, 0x4000),
         Arch::X86_64 => (macho::CPU_TYPE_X86_64, macho::CPU_SUBTYPE_X86_64_ALL, 0x1000),
@@ -80,10 +81,10 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
     };
     let cache = output.incremental.then(Mutex::default);
     // alloc: clone: the writer and its copy of the output, once per image
-    Ok(Box::new(MachO { output: output.clone(), cpu, subtype, page, platform, cache }))
+    Ok(MachO { output: output.clone(), cpu, subtype, page, platform, cache })
 }
 
-struct MachO {
+pub(crate) struct MachO {
     output: Output,
     cpu: u32,
     subtype: u32,
@@ -159,12 +160,66 @@ fn macho_order(a: &str, b: &str) -> Ordering {
     (a_prefix.bytes().chain(a.bytes())).cmp(b_prefix.bytes().chain(b.bytes()))
 }
 
+/// The locals' `nlist_64` entries and names, appended to `nlist` and `strings` in the order of
+/// `locals`: each 4,096 filled by its own task at offsets from the names' prefix sums. The
+/// error is the first local's in order.
+fn locals_into(
+    locals: &[(u64, &str)],
+    section_at: &(impl Fn(u64, &str) -> Result<u8, LinkError> + Sync),
+    strings: &mut Vec<u8>,
+    nlist: &mut Vec<u8>,
+) -> Result<(), LinkError> {
+    const CHUNK: usize = 4096;
+    let spelled_len = |name: &str| {
+        let (prefix, rest) = spelled(name);
+        prefix.len() + rest.len() + 1
+    };
+    let sizes: Vec<usize> =
+        // alloc: one size per 4,096 locals, per link
+        locals.par_chunks(CHUNK).map(|chunk| chunk.iter().map(|it| spelled_len(it.1)).sum()).collect();
+    let (names_at, entries_at) = (strings.len(), nlist.len());
+    strings.resize(names_at + sizes.iter().sum::<usize>(), 0);
+    nlist.resize(entries_at + locals.len() * NLIST, 0);
+    // alloc: one slice of the names per 4,096 locals, per link
+    let mut jobs = Vec::with_capacity(sizes.len());
+    let (mut left, mut at) = (&mut strings[names_at..], names_at);
+    for &size in &sizes {
+        let (these, after) = std::mem::take(&mut left).split_at_mut(size);
+        jobs.push((at, these));
+        (left, at) = (after, at + size);
+    }
+    let results: Vec<Result<(), LinkError>> = (locals.par_chunks(CHUNK))
+        .zip(nlist[entries_at..].par_chunks_mut(CHUNK * NLIST))
+        .zip(jobs)
+        .map(|((chunk, entries), (start, names))| {
+            let mut written = 0;
+            for (&(addr, name), entry) in chunk.iter().zip(entries.chunks_exact_mut(NLIST)) {
+                let (prefix, rest) = spelled(name);
+                entry[0..4].copy_from_slice(&((start + written) as u32).to_le_bytes());
+                entry[4] = macho::N_SECT;
+                entry[5] = section_at(addr, name)?;
+                entry[6..8].copy_from_slice(&0u16.to_le_bytes());
+                entry[8..16].copy_from_slice(&addr.to_le_bytes());
+                let middle = written + prefix.len();
+                names[written..middle].copy_from_slice(prefix.as_bytes());
+                names[middle..middle + rest.len()].copy_from_slice(rest.as_bytes());
+                written = middle + rest.len() + 1;
+            }
+            Ok(())
+        })
+        // alloc: one result per 4,096 locals, per link
+        .collect();
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
 /// The class the C objects' `__compact_unwind` sections are placed in: relocated as data,
 /// where each entry's personality field is a cell the loader fixes up, which `__unwind_info`
 /// refers to the personality by.
 pub(super) fn compact_unwind() -> Class {
-    // alloc: `Class::Named` owns its name (model.rs): once per C object's `__compact_unwind`
-    Class::Named { name: "__LD,__compact_unwind".to_owned(), write: true, exec: false }
+    Class::Named { name: "__LD,__compact_unwind".into(), write: true, exec: false }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -292,11 +347,14 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
 /// class, so `section$start$SEG$SECT` finds what an object or a `#[link_section]` put there.
 pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<SectionKind, String> {
     let alloc = |class| Ok(SectionKind::Alloc(class, u32::MAX));
-    let named = |segment: &str, section: &str| Class::Named {
-        // alloc: `Class::Named` owns its name (model.rs): once per section outside the standard ones
-        name: format!("{segment},{section}"),
-        write: segment != "__TEXT",
-        exec: false,
+    let named = |segment: &str, section: &str| {
+        // Mach-O's names are at most 16 bytes each, so `SEG,SECT` fits inline.
+        let mut text: SmallVec<[u8; 40]> = SmallVec::with_capacity(segment.len() + 1 + section.len());
+        text.extend_from_slice(segment.as_bytes());
+        text.push(b',');
+        text.extend_from_slice(section.as_bytes());
+        let name = std::str::from_utf8(&text).expect("two `str`s joined by a comma");
+        Class::Named { name: SectionName::new(name), write: segment != "__TEXT", exec: false }
     };
     // Before the debug check: LLVM marks `__compact_unwind` `S_ATTR_DEBUG`.
     match (segment, section) {
@@ -1291,20 +1349,15 @@ impl MachO {
             )));
         }
 
-        // The signature in pieces of a page of the file, so an incremental link, which
-        // changes few of its hashes, writes few of them.
-        let mut parts = Vec::with_capacity(3 + signature.len().div_ceil(sign::PAGE));
+        // The signature is one part: an incremental link, which changes few of its hashes,
+        // writes only the blocks of it that changed.
+        let mut parts = Vec::with_capacity(4);
         parts.push((0, headers.0));
         if let Some(at) = dwarf_at {
             parts.push((at, dwarf));
         }
         parts.push((linkedit_at, linkedit.0));
-        let mut at = code_limit;
-        for piece in signature.chunks(sign::PAGE) {
-            // alloc: `File::parts` own their bytes: one per signature page, so an incremental link writes only the pages that changed
-            parts.push((at, piece.to_vec()));
-            at += piece.len() as u64;
-        }
+        parts.push((code_limit, signature));
         Ok(File { len: linkedit_at + linkedit_size, parts })
     }
 
@@ -1389,6 +1442,7 @@ impl MachO {
         let mut strings = Out(Vec::with_capacity(names + 16));
         strings.0.extend_from_slice(b" \0");
         let mut nlist = Out(Vec::with_capacity(count * NLIST));
+        locals_into(&locals, &section_at, &mut strings.0, &mut nlist.0)?;
         let mut entry = |name: &str, kind: u8, sect: u8, desc: u16, value: u64| -> (u32, u32) {
             let at = strings.0.len() as u32;
             let (prefix, rest) = spelled(name);
@@ -1403,9 +1457,6 @@ impl MachO {
             (at, (prefix.len() + rest.len()) as u32)
         };
 
-        for &(addr, name) in &locals {
-            entry(name, macho::N_SECT, section_at(addr, name)?, 0, addr);
-        }
         let mut exports = Vec::with_capacity(defined.len());
         for &(name, addr, desc, flags) in &defined {
             let sect = section_at(addr, name)?;
@@ -1425,6 +1476,14 @@ impl MachO {
             let weak = if import.weak { macho::N_WEAK_REF } else { 0 };
             import_names[index as usize] = entry(name, macho::N_UNDF | macho::N_EXT, 0, library << 8 | weak, 0);
             index_of[index as usize] = first_undefined + nth as u32;
+        }
+        // Every `n_strx` is a name's start, below the table's length: past 4 GiB one wrapped.
+        if strings.0.len() > 1 << 32 {
+            // alloc: error path
+            return Err(error(format!(
+                "a string table of {} bytes: `n_strx` reaches only 4 GiB",
+                strings.0.len()
+            )));
         }
         strings.align(8);
 

@@ -36,6 +36,8 @@ needed (`LocalFree` is in `Win32_Foundation`; the environment block is built by 
 
 > forwarded to cargo: `crates/blaze-cargo/Cargo.toml` is lane cargo's; line 154 still has the five old features.
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/Cargo.toml:160, `windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_Console"] }`: the root's 0.61.2 entry already has Foundation, WinSock, Security, Storage_FileSystem, JobObjects, SystemServices and Threading, so together they are the ten asked.
+
 ## 2. `blaze-usercode` as a dependency of `blaze-cargo`
 
 `windows.rs` takes `blaze_usercode::confine::Spec`, and `sandbox.rs` already uses

@@ -65,12 +65,12 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec
         for attr in &owner.attrs {
             parsers::misc::validate(cx, attr, &mut errors);
         }
-        push(cx, owner, Phase::Resolve, errors, &mut found);
+        push(cx, owner, Phase::Expand, errors, &mut found);
         let mut errors = Vec::new();
         lower(cx, &session, owner, true, &mut errors);
         let phase = match owner.target {
-            Target::MacroCall => Phase::Resolve,
-            _ => Phase::Items,
+            Target::MacroCall => Phase::Expand,
+            _ => Phase::Lower,
         };
         push(cx, owner, phase, errors, &mut found);
     }
@@ -107,6 +107,11 @@ fn push(cx: &Cx<'_, '_>, owner: &Owner, phase: Phase, errors: Vec<Diag>, found: 
     for mut diag in errors {
         source_fact(cx, &mut diag, owner.at());
         diag.fact(Fact::Signature(root), "the `#![feature]`s of the crate root");
+        let phase = match (diag.fatal, owner.target) {
+            (true, Target::Crate) => Phase::CrateAttrs,
+            (true, _) => Phase::Expand,
+            (false, _) => phase,
+        };
         found.push(Found::new(diag, phase));
     }
 }

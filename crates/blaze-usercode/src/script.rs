@@ -69,8 +69,8 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
         given.env(name.to_owned(), value.to_owned());
         names.push(name.to_owned());
     }
-    given.part("program", crate::trace::os_bytes(unit.script.as_os_str()));
-    given.part("dir", crate::trace::os_bytes(unit.package.manifest_dir.as_os_str()));
+    given.part("program", &crate::trace::os_bytes(unit.script.as_os_str()));
+    given.part("dir", &crate::trace::os_bytes(unit.package.manifest_dir.as_os_str()));
     let key = RunKey { code: place.code, given: given.finish() };
     let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect();
     let command = Command {

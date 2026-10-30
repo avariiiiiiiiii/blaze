@@ -119,6 +119,7 @@ where
                 InputAccumulatedValues::Empty,
                 ThinVec::new(),
             ),
+            // alloc: `Vec::new` allocates nothing; specify has no stale structs to list
             stale_tracked_structs: Vec::new(),
         };
         if is_provisional {

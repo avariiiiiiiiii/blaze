@@ -32,6 +32,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use blaze_mem::{RegionVec, Tag};
+
 use super::{Outcome, hook};
 use crate::patch::{
     ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
@@ -44,6 +46,10 @@ pub(crate) const KEPT: usize = 64;
 /// table is written while the cell points at another, and a thread that loaded the cell
 /// before it left this one reads each slot whole, of the generation it was in or the one
 /// it is brought to, both code that is written and never written again ([`Lasting`]).
+///
+/// Right after each switch, the table the cell left longest ago is brought to the new
+/// generation ([`Switch::ready`]), or a new one copied while the pool isn't full, so the
+/// next patch stores only its own cells before its switch.
 pub(crate) const POOL: usize = 4;
 const MOST_SLOTS: u64 = 1 << 26;
 const MOST_DIR: u64 = 4096;
@@ -238,37 +244,53 @@ pub(crate) trait Memory {
 /// Every generation the program ran, by index (0 the one it started at), in columns: 29 bytes
 /// each, 20 per cell its patch set and 16 per write of code. Lookups by index are direct.
 struct Log {
-    number: Vec<u64>,
+    number: RegionVec<u64>,
     /// The generation it was applied on; its own index for the first.
-    parent: Vec<u32>,
-    depth: Vec<u32>,
+    parent: RegionVec<u32>,
+    depth: RegionVec<u32>,
     /// Whether it is kept to roll back to.
-    kept: Vec<bool>,
+    kept: RegionVec<bool>,
     /// Generation `g`'s cells are `cells[g]..cells[g + 1]` of `slot`, `new` and `old`.
-    cells: Vec<u32>,
-    slot: Vec<u32>,
+    cells: RegionVec<u32>,
+    slot: RegionVec<u32>,
     /// A slot's target in memory in the generation, and in its parent.
-    new: Vec<u64>,
-    old: Vec<u64>,
+    new: RegionVec<u64>,
+    old: RegionVec<u64>,
     /// Generation `g`'s code is `code_at[g]..code_at[g + 1]` of `code`, in memory.
-    code_at: Vec<u32>,
-    code: Vec<Range<u64>>,
+    code_at: RegionVec<u32>,
+    code: RegionVec<Range<u64>>,
+}
+
+/// The most rows of a column of the log: the `u32` counts [`Switch::apply`] checks, and the
+/// one past the last generation `cells` and `code_at` hold.
+const LOGGED: usize = u32::MAX as usize + 1;
+
+/// A column of the log, reserved for [`LOGGED`] rows and committed as it grows.
+fn column<T>() -> Result<RegionVec<T>, String> {
+    RegionVec::new(LOGGED, Tag::Link).map_err(|it| format!("reserving the log of generations: {it}"))
 }
 
 impl Log {
-    fn new(number: u64) -> Log {
-        Log {
-            number: vec![number],
-            parent: vec![0],
-            depth: vec![0],
-            kept: vec![true],
-            cells: vec![0, 0],
-            slot: Vec::new(),
-            new: Vec::new(),
-            old: Vec::new(),
-            code_at: vec![0, 0],
-            code: Vec::new(),
-        }
+    fn new(number: u64) -> Result<Log, String> {
+        let mut log = Log {
+            number: column()?,
+            parent: column()?,
+            depth: column()?,
+            kept: column()?,
+            cells: column()?,
+            slot: column()?,
+            new: column()?,
+            old: column()?,
+            code_at: column()?,
+            code: column()?,
+        };
+        log.number.push(number);
+        log.parent.push(0);
+        log.depth.push(0);
+        log.kept.push(true);
+        log.cells.extend_from_slice(&[0, 0]);
+        log.code_at.extend_from_slice(&[0, 0]);
+        Ok(log)
     }
 
     fn cells(&self, generation: u32) -> Range<usize> {
@@ -296,7 +318,7 @@ impl Log {
 
 /// What a lasting range holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Holds {
+pub(super) enum Holds {
     Code,
     Unwind,
 }
@@ -306,12 +328,21 @@ enum Holds {
 /// at (a thread can be in it however long ago the program left it), and every unwind entry
 /// registered (the unwinder reads it from then on, and not every platform can take one
 /// back). Each range is of one generation, by number.
-#[derive(Default)]
-struct Lasting {
-    ranges: Vec<(Range<u64>, u64, Holds)>,
+pub(super) struct Lasting {
+    pub(super) ranges: RegionVec<(Range<u64>, u64, Holds)>,
 }
 
+/// The most lasting ranges a program keeps: [`Switch::apply`] refuses a patch that would
+/// have more before it writes anything.
+const LASTING: usize = 1 << 26;
+
 impl Lasting {
+    pub(super) fn new() -> Result<Lasting, String> {
+        let ranges = RegionVec::new(LASTING, Tag::Link)
+            .map_err(|it| format!("reserving the lasting ranges: {it}"))?;
+        Ok(Lasting { ranges })
+    }
+
     /// The first lasting range `range` overlaps: a binary search.
     fn hit(&self, range: &Range<u64>) -> Option<&(Range<u64>, u64, Holds)> {
         let at = self.ranges.partition_point(|it| it.0.end <= range.start);
@@ -320,7 +351,7 @@ impl Lasting {
 
     /// Adds `range` of generation `number`, merged with what it overlaps: only ranges of the
     /// same generation can, since a patch over a lasting range is refused.
-    fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
+    pub(super) fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
         if range.is_empty() {
             return;
         }
@@ -334,7 +365,16 @@ impl Lasting {
             }
             end += 1;
         }
-        self.ranges.splice(at..end, [(merged, number, holds)]);
+        let merged = (merged, number, holds);
+        if end == at {
+            self.ranges.push(merged);
+            self.ranges[at..].rotate_right(1);
+        } else {
+            self.ranges[at] = merged;
+            self.ranges[at + 1..].rotate_left(end - at - 1);
+            let len = self.ranges.len() - (end - at - 1);
+            self.ranges.truncate(len);
+        }
     }
 }
 
@@ -393,9 +433,15 @@ pub(crate) struct Switch<M: Memory> {
     pool: Vec<Pooled>,
     /// The table the cell points at: the image's, or one of the pool.
     on: Option<usize>,
+    /// The table of the pool [`Switch::ready`] brought to the current generation for the
+    /// next patch, which the cell doesn't point at.
+    next: Option<usize>,
     published: u64,
     lasting: Lasting,
     scratch: Scratch,
+    /// How many slots the last switch stored before its release store.
+    #[cfg(test)]
+    stored: usize,
 }
 
 impl<M: Memory> Switch<M> {
@@ -410,8 +456,8 @@ impl<M: Memory> Switch<M> {
         let end =
             end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
         memory.in_image(&(table..end))?;
-        let log = Log::new(layout.generation);
-        Ok(Switch {
+        let log = Log::new(layout.generation)?;
+        let mut switch = Switch {
             memory,
             layout,
             current: 0,
@@ -420,10 +466,15 @@ impl<M: Memory> Switch<M> {
             image: table,
             pool: Vec::with_capacity(POOL),
             on: None,
+            next: None,
             published: 0,
-            lasting: Lasting::default(),
+            lasting: Lasting::new()?,
             scratch: Scratch::default(),
-        })
+            #[cfg(test)]
+            stored: 0,
+        };
+        switch.ready();
+        Ok(switch)
     }
 
     pub(crate) fn current(&self) -> u64 {
@@ -636,9 +687,11 @@ impl<M: Memory> Switch<M> {
             s.unwinds.push(slid_unwind..slid_unwind + len);
         }
         let cells = patch.cells();
+        let lasting = s.code.len() + s.fdes.len() + s.ends.len() + s.unwinds.len();
         if u32::try_from(self.log.slot.len() + cells.len()).is_err()
             || u32::try_from(self.log.code.len() + s.code.len()).is_err()
             || u32::try_from(self.log.number.len()).is_err()
+            || self.lasting.ranges.len() + lasting > LASTING
         {
             return Err("more generations, cells or code than this program counts".to_owned());
         }
@@ -684,7 +737,36 @@ impl<M: Memory> Switch<M> {
             let evicted = self.kept.remove(oldest);
             self.log.kept[evicted as usize] = false;
         }
+        self.ready();
         Ok(())
+    }
+
+    /// Readies a table for the next patch, after the switch: a new one, a copy of the
+    /// cell's, while the pool isn't full, else the one the cell left longest ago brought to
+    /// the current generation. The next patch then stores only its own cells into it.
+    fn ready(&mut self) {
+        if self.pool.len() < POOL {
+            let table: Box<[AtomicU64]> = match self.on {
+                None => self.image().iter().map(|it| AtomicU64::new(*it)).collect(),
+                Some(on) => {
+                    let table = &self.pool[on].table;
+                    table.iter().map(|it| AtomicU64::new(it.load(Ordering::Relaxed))).collect()
+                }
+            };
+            self.pool.push(Pooled { table, holds: self.current, at: self.published });
+            self.next = Some(self.pool.len() - 1);
+            return;
+        }
+        let Some(at) = self.spare() else { return };
+        let mut path = std::mem::take(&mut self.scratch.path);
+        self.retarget(at, self.current, &mut path);
+        self.scratch.path = path;
+        self.next = Some(at);
+    }
+
+    /// The table of the pool the cell left longest ago, other than the one it points at.
+    fn spare(&self) -> Option<usize> {
+        (0..self.pool.len()).filter(|it| Some(*it) != self.on).min_by_key(|it| self.pool[*it].at)
     }
 
     /// The loader's table, which the cell pointed at when the program started.
@@ -700,41 +782,43 @@ impl<M: Memory> Switch<M> {
         }
     }
 
-    /// A table of the pool brought to `target`: one holding it already, a new one while the
-    /// pool isn't full, else the one the cell left longest ago.
+    /// A table of the pool brought to `target`: one holding it already, else the one
+    /// [`Switch::ready`] brought to the current generation, else the one the cell left
+    /// longest ago (`ready` made one at the start and after every patch, and the cell points
+    /// at one table at most).
     fn standby(&mut self, target: u32, path: &mut Vec<u32>) -> usize {
+        #[cfg(test)]
+        {
+            self.stored = 0;
+        }
         if let Some(at) = self.pool.iter().position(|it| it.holds == target) {
             return at;
         }
-        let at = if self.pool.len() < POOL {
-            let table: Box<[AtomicU64]> = match self.on {
-                None => self.image().iter().map(|it| AtomicU64::new(*it)).collect(),
-                Some(on) => {
-                    let table = &self.pool[on].table;
-                    table.iter().map(|it| AtomicU64::new(it.load(Ordering::Relaxed))).collect()
-                }
-            };
-            self.pool.push(Pooled { table, holds: self.current, at: self.published });
-            self.pool.len() - 1
-        } else {
-            (0..self.pool.len())
-                .filter(|it| Some(*it) != self.on)
-                .min_by_key(|it| self.pool[*it].at)
-                .expect("a pool of more than one table")
-        };
-        self.retarget(at, target, path);
+        let ready = (self.next.take())
+            .filter(|it| Some(*it) != self.on && self.pool[*it].holds == self.current);
+        let at = ready
+            .or_else(|| self.spare())
+            .expect("a table the cell doesn't point at, made by `ready`");
+        let _stored = self.retarget(at, target, path);
+        #[cfg(test)]
+        {
+            self.stored = _stored;
+        }
         at
     }
 
     /// Brings the pool's table `at` from the generation it holds to `to`: the generations
     /// from the one it holds down to where the two meet are undone, the newest first, and
     /// those from there up to `to` redone, the oldest first. Each slot is one relaxed store,
-    /// which the release store of the cell publishes.
-    fn retarget(&mut self, at: usize, to: u32, path: &mut Vec<u32>) {
+    /// which the release store of the cell publishes. How many it stored.
+    fn retarget(&mut self, at: usize, to: u32, path: &mut Vec<u32>) -> usize {
         let log = &self.log;
         let table = &self.pool[at].table;
-        let undo = |generation: u32| {
-            for cell in log.cells(generation) {
+        let mut stored = 0;
+        let mut undo = |generation: u32| {
+            let cells = log.cells(generation);
+            stored += cells.len();
+            for cell in cells {
                 table[log.slot[cell] as usize].store(log.old[cell], Ordering::Relaxed);
             }
         };
@@ -757,11 +841,14 @@ impl<M: Memory> Switch<M> {
             onto = parent(onto);
         }
         for &generation in path.iter().rev() {
-            for cell in log.cells(generation) {
+            let cells = log.cells(generation);
+            stored += cells.len();
+            for cell in cells {
                 table[log.slot[cell] as usize].store(log.new[cell], Ordering::Relaxed);
             }
         }
         self.pool[at].holds = to;
+        stored
     }
 
     /// Points the cell at the image's table (`None`) or the pool's table `on`.
@@ -853,6 +940,12 @@ impl<M: Memory> Switch<M> {
     #[cfg(test)]
     pub(crate) fn pooled(&self) -> usize {
         self.pool.len()
+    }
+
+    /// How many slots the last switch stored before its release store.
+    #[cfg(test)]
+    pub(crate) fn stored(&self) -> usize {
+        self.stored
     }
 
     /// The address of the table of the generation numbered `number`, if one holds it.

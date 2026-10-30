@@ -139,12 +139,13 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let regions = placed.regions;
     let entry = match &writer.output.kind {
         OutputKind::Executable { entry } => {
-            Some(placed.entry.ok_or_else(|| error(format!("the executable's entry `{entry}` is not placed")))?)
+            Some(placed.entry.ok_or_else(|| error(format!("the executable's entry `{entry}` is not placed")))?) // alloc: error path
         }
         OutputKind::Shared { .. } => placed.entry,
     };
 
-    let mut loads: Vec<Load> = Vec::new();
+    // At most one per segment: a second run of one is an error below.
+    let mut loads: Vec<Load> = Vec::with_capacity(4);
     for region in regions {
         let segment = Segment::of(&region.class);
         let end = region.addr + region.capacity.max(region.size);
@@ -152,6 +153,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         match loads.last_mut() {
             Some(load) if load.segment == segment => {
                 if file && load.zeroed {
+                    // alloc: error path
                     return Err(error(format!(
                         "{:?} at {:#x} is in the file but follows zeroed memory in its segment",
                         region.class, region.addr
@@ -165,13 +167,16 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             }
             _ => {
                 if loads.iter().any(|it| it.segment == segment) {
+                    // alloc: error path
                     return Err(error(format!("{:?} at {:#x} splits the {segment:?} segment", region.class, region.addr)));
                 }
                 let vaddr = if loads.is_empty() { plan.base } else { region.addr };
                 if loads.is_empty() && segment != Segment::Read {
+                    // alloc: error path
                     return Err(error(format!("the image starts with {:?}, not the headers' segment", region.class)));
                 }
                 if vaddr % plan.page != 0 {
+                    // alloc: error path
                     return Err(error(format!(
                         "the {segment:?} segment starts at {vaddr:#x}, not on a {:#x} page",
                         plan.page
@@ -189,7 +194,8 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let synthetic = |name: &'static str| {
         placed.region(&Class::Synthetic(name)).map(|(index, it)| (it.addr, placed.bytes(index)))
     };
-    let mut phdrs = vec![Phdr { p_type: elf::PT_PHDR, flags: 4, vaddr: plan.base + EHDR, filesz: 0, memsz: 0, align: 8 }];
+    let mut phdrs = Vec::with_capacity(PHDRS as usize);
+    phdrs.push(Phdr { p_type: elf::PT_PHDR, flags: 4, vaddr: plan.base + EHDR, filesz: 0, memsz: 0, align: 8 });
     if let Some((addr, interp)) = synthetic(INTERP) {
         let size = interp.len() as u64;
         phdrs.push(Phdr { p_type: elf::PT_INTERP, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 1 });
@@ -236,7 +242,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         phdrs.push(Phdr { p_type: elf::PT_NOTE, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 4 });
     }
     if phdrs.len() as u64 > PHDRS {
-        return Err(error(format!("{} program headers, more than the {PHDRS} the headers have room for", phdrs.len())));
+        return Err(error(format!("{} program headers, more than the {PHDRS} the headers have room for", phdrs.len()))); // alloc: error path
     }
     let phnum = phdrs.len() as u64;
     phdrs[0].filesz = phnum * PHDR;
@@ -334,7 +340,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         .map(|chunk| {
             chunk.iter().filter_map(|it| it.name.as_deref()).fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
         })
-        .collect();
+        .collect(); // alloc: once per image, one count per chunk of functions
     let named: usize = chunks.iter().map(|it| it.0).sum();
     let function_names: usize = chunks.iter().map(|it| it.1).sum();
     let global_names = placed.exports.iter().map(|it| stored(&it.name)).sum::<usize>()
@@ -342,7 +348,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let symbols = 1 + named + placed.exports.len() + placed.imports.len();
     let strtab_len = 1 + function_names + global_names;
     if u32::try_from(strtab_len).is_err() {
-        return Err(error(format!("{strtab_len} bytes of symbol names, more than .strtab offsets reach")));
+        return Err(error(format!("{strtab_len} bytes of symbol names, more than .strtab offsets reach"))); // alloc: error path
     }
     let first_global = 1 + named as u32;
 
@@ -398,20 +404,19 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         ..Shdr::default()
     });
     if shdrs.len() >= usize::from(elf::SHN_LORESERVE) {
-        return Err(error(format!("{} sections, more than ELF numbers", shdrs.len())));
+        return Err(error(format!("{} sections, more than ELF numbers", shdrs.len()))); // alloc: error path
     }
     let shoff_at = (shstrtab_at + names.bytes.len()).next_multiple_of(8);
     let shoff = tail + shoff_at as u64;
 
-    let mut bytes = vec![0u8; shoff_at + shdrs.len() * SHDR];
-    let mut at = 0;
-    for (_, data) in placed.debug {
-        bytes[at..at + data.len()].copy_from_slice(data);
-        at += data.len();
-    }
+    // The tail after the debug sections: the padding to `.symtab`, the symbol tables and the
+    // section headers, at `len` from `tail`. Each debug section is a part of its own, so a
+    // link whose debug info is as before writes none of it again.
+    // alloc: the output buffer, the file's tail past its debug info
+    let mut bytes = vec![0u8; shoff_at + shdrs.len() * SHDR - len];
     {
-        let (head, rest) = bytes.split_at_mut(strtab_at);
-        let symtab = &mut head[symtab_at..];
+        let (head, rest) = bytes.split_at_mut(strtab_at - len);
+        let symtab = &mut head[symtab_at - len..];
         let strtab = &mut rest[..strtab_len];
         let (functions_syms, global_syms) = symtab.split_at_mut(SYM * (1 + named));
         let (function_strs, global_strs) = strtab.split_at_mut(1 + function_names);
@@ -459,8 +464,8 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
         }
     }
-    bytes[shstrtab_at..shstrtab_at + names.bytes.len()].copy_from_slice(&names.bytes);
-    for (shdr, out) in shdrs.iter().zip(bytes[shoff_at..].chunks_exact_mut(SHDR)) {
+    bytes[shstrtab_at - len..shstrtab_at - len + names.bytes.len()].copy_from_slice(&names.bytes);
+    for (shdr, out) in shdrs.iter().zip(bytes[shoff_at - len..].chunks_exact_mut(SHDR)) {
         out.copy_from_slice(&shdr.bytes());
     }
 
@@ -496,5 +501,27 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     }
     debug_assert!(head.len() as u64 <= plan.headers);
 
-    Ok(File { len: tail + bytes.len() as u64, parts: vec![(0, head), (tail, bytes)] })
+    // alloc: once per image, what `Writer::file` returns
+    let mut parts = Vec::with_capacity(2 + placed.debug.len());
+    parts.push((0, head));
+    let mut at = tail;
+    for (_, data) in placed.debug {
+        if !data.is_empty() {
+            parts.push((at, copied(data)));
+        }
+        at += data.len() as u64;
+    }
+    let file_len = at + bytes.len() as u64;
+    parts.push((at, bytes));
+    Ok(File { len: file_len, parts })
+}
+
+/// `data` copied in pieces of 1 MiB in parallel, so the copy and the first touch of the new
+/// pages are spread over the cores: a debug section is the largest part of a file.
+fn copied(data: &[u8]) -> Vec<u8> {
+    const PIECE: usize = 1 << 20;
+    // alloc: once per debug section per image, what `File::parts` owns
+    let mut out = vec![0u8; data.len()];
+    out.par_chunks_mut(PIECE).zip(data.par_chunks(PIECE)).for_each(|(out, data)| out.copy_from_slice(data));
+    out
 }

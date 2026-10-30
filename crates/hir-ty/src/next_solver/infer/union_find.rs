@@ -55,6 +55,9 @@ pub(crate) struct UnionFind<K, V> {
     undo: Vec<UndoRow<V>>,
     /// The number of variables when the innermost open snapshot started; zero outside snapshots.
     floor: u32,
+    /// Grows on every write to a set or value and on every rollback that undoes something, and
+    /// never shrinks, so an unchanged count means unchanged sets and values.
+    changes: u64,
     key: PhantomData<fn(K) -> K>,
 }
 
@@ -70,6 +73,7 @@ impl<K, V> Default for UnionFind<K, V> {
             // alloc: empty `Vec`s do not allocate.
             undo: Vec::new(),
             floor: 0,
+            changes: 0,
             key: PhantomData,
         }
     }
@@ -87,6 +91,7 @@ impl<K, V: Copy> Clone for UnionFind<K, V> {
             // clone: only `InferCtxt::fork` copies a table.
             undo: self.undo.clone(),
             floor: self.floor,
+            changes: self.changes,
             key: PhantomData,
         }
     }
@@ -107,6 +112,12 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.parent.len()
+    }
+
+    /// The count of changes to the sets and values; see the field.
+    #[inline]
+    pub(crate) fn changes(&self) -> u64 {
+        self.changes
     }
 
     pub(crate) fn new_key(&mut self, value: V) -> K {
@@ -202,6 +213,9 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
 
     pub(crate) fn rollback_to(&mut self, mark: UnionFindMark) {
         assert!(self.parent.len() >= mark.len as usize, "rolled back past a truncation");
+        if self.undo.len() > mark.undo as usize || self.parent.len() > mark.len as usize {
+            self.changes += 1;
+        }
         while self.undo.len() > mark.undo as usize {
             let UndoRow { value, index, parent, rank } = self.undo.pop().unwrap();
             let at = index as usize;
@@ -273,6 +287,7 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         self.parent[at] = parent;
         self.rank[at] = rank;
         self.value[at] = value;
+        self.changes += 1;
     }
 }
 
@@ -299,6 +314,8 @@ const _: () = assert!(size_of::<UndoRow<rustc_type_ir::FloatVarValue>>() == 12);
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,21 +409,15 @@ mod tests {
             self.value[root] = Value::unify_values(&self.value[root], &value)?;
             Ok(())
         }
-    }
 
-    /// xorshift64*, so the sequence is the same on every run.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
-        }
-
-        fn below(&mut self, n: u32) -> u32 {
-            (self.next() % u64::from(n)) as u32
+        /// What the first `n` variables observe: each one's set, named by its root, and value.
+        fn observed(&self, n: usize) -> Vec<(u32, Value)> {
+            (0..n as u32)
+                .map(|at| {
+                    let root = self.find(at);
+                    (root, self.value[root as usize])
+                })
+                .collect()
         }
     }
 
@@ -550,39 +561,40 @@ mod tests {
     /// Random sequences of every operation, nested snapshots included, against `Model`.
     #[test]
     fn matches_the_model() {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..200 {
             let mut table = UnionFind::<Key, Value>::default();
             let mut model = Model::default();
             let mut snapshots: Vec<(UnionFindMark, Model)> = Vec::new();
             for _ in 0..300 {
-                let len = model.parent.len() as u32;
+                let len = model.parent.len();
+                let (model_before, changes_before) = (model.clone(), table.changes());
                 match rng.below(10) {
                     0 | 1 => {
                         let value = if rng.below(4) == 0 {
-                            Value::Known(rng.below(5))
+                            Value::Known(rng.below(5) as u32)
                         } else {
-                            Value::Unknown(rng.below(4))
+                            Value::Unknown(rng.below(4) as u32)
                         };
                         assert_eq!(table.new_key(value), Key(model.new_key(value)));
                     }
                     2..=4 if len > 0 => {
-                        let (a, b) = (rng.below(len), rng.below(len));
+                        let (a, b) = (rng.index(len) as u32, rng.index(len) as u32);
                         assert_eq!(
                             table.unify_var_var(Key(a), Key(b)),
                             model.unify_var_var(a, b)
                         );
                     }
                     5 if len > 0 => {
-                        let a = rng.below(len);
-                        let value = Value::Known(rng.below(5));
+                        let a = rng.index(len) as u32;
+                        let value = Value::Known(rng.below(5) as u32);
                         assert_eq!(
                             table.unify_var_value(Key(a), value),
                             model.unify_var_value(a, value)
                         );
                     }
                     6 if len > 0 => {
-                        let a = rng.below(len);
+                        let a = rng.index(len) as u32;
                         assert_eq!(table.find(Key(a)), Key(model.find(a)));
                     }
                     7 => snapshots.push((table.start_snapshot(), model.clone())),
@@ -599,6 +611,12 @@ mod tests {
                     }
                     _ => {}
                 }
+                // A variable made since doesn't count: nothing that predates it can name it.
+                let kept = model_before.parent.len().min(model.parent.len());
+                let changed = model.parent.len() < model_before.parent.len()
+                    || model.observed(kept) != model_before.observed(kept);
+                assert!(table.changes() >= changes_before, "the count never shrinks");
+                assert!(!changed || table.changes() > changes_before, "a change is counted");
                 if rng.below(16) == 0 {
                     assert_same(&mut table, &model);
                 }

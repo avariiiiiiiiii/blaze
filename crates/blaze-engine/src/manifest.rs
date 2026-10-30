@@ -25,10 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ide_db::{
-    RootDatabase,
-    base_db::{Crate, SourceDatabase as _},
-};
+use ide_db::{RootDatabase, base_db::Crate};
 use rustc_hash::FxHashMap;
 use sha2::{Digest, Sha256};
 

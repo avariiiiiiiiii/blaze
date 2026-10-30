@@ -10,7 +10,7 @@ use crate::{
     DefWithBodyId, ModuleDefId,
     expr_store::{Body, scope::ExprScopes},
     nameres::crate_def_map,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 const CODE: &str = r#"

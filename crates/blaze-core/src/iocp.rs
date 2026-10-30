@@ -1728,7 +1728,7 @@ mod tests {
         }
         let mut driver = Iocp::new(&root, 2).unwrap();
         let seen = run(&mut driver, vec![
-            Effect::Stamp { files: names.clone(), tag: Tag(1) },
+            Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(1) },
             Effect::Entries { dir: name("a"), tag: Tag(2) },
             Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
             Effect::Entries { dir: name("a/f"), tag: Tag(4) },

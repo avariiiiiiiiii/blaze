@@ -26,7 +26,7 @@ use crate::{cx::Cx, lower::Found};
 pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     let defs = defs::Defs::of(cx);
     if defs.unported {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     let levels = level::Levels::new();
     let reach = reach::Reach::of(cx, &defs);

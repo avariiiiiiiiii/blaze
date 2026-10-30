@@ -39,7 +39,9 @@
 //! so a wave of build scripts is one stop.
 //!
 //! Images kept linked between jobs are the loop's too ([`Image`]): each is moved into the
-//! one compile that relinks it and back with what it made, so no worker shares them.
+//! one compile that relinks it and back with what it made, so no worker shares them. So is a
+//! checkout's last front end ([`Writer::keep`]), once no reader of it is left: it is moved
+//! into the one lowering of the checkout's next build, which moves it to the new view.
 
 #![forbid(unsafe_code)]
 
@@ -141,6 +143,18 @@ impl From<ApiError> for Failed {
     }
 }
 
+/// The standard library's `library/` as [`Steps::library`] found it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Library {
+    /// Where its sources are named: `/rustc/<commit>/library`.
+    pub at: String,
+    /// Of its digest and every file's path, size, time and mode: its files are read again
+    /// only once this changes.
+    pub fingerprint: String,
+    /// Its files; none when it is mounted as it is already.
+    pub source: Option<Source>,
+}
+
 /// A value for the store, put by the loop.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Put {
@@ -183,10 +197,15 @@ pub trait Steps: Send + Sync + 'static {
     /// its paths kept inside it, a git tree at its commit, an index file as served).
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError>;
     /// On an IO thread: the standard library's `library/`, put into the VFS once: where it is
-    /// named (`/rustc/<commit>/library`) and its files.
-    fn library(&self) -> Result<(String, Source), ApiError>;
-    /// On a worker: the job's units lowered into the front end.
-    fn lower(&self, job: &JobInput) -> Result<FrontEnd, Failed>;
+    /// named (`/rustc/<commit>/library`), its fingerprint, and its files unless `kept` (a
+    /// fingerprint, and where that library is mounted) has it there, read before by this
+    /// daemon or one before it.
+    fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError>;
+    /// On a worker: the job's units lowered into the front end. `kept` is the front end of
+    /// the head's last build ([`Writer::keep`]): built from the same units and config, it is
+    /// moved to the job's view, its memos kept, and what changed alone read again; else it
+    /// is dropped and the units lowered anew.
+    fn lower(&self, job: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed>;
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {
         blaze_units::query::register(db);
@@ -233,6 +252,21 @@ impl Reader {
             Ok(it) => *it,
             Err(_) => panic!("a reader of another front than {}", std::any::type_name::<R>()),
         }
+    }
+}
+
+/// A job's front end kept by the loop once the job is done with it, for the next job of the
+/// same head to lower into ([`Steps::lower`]).
+pub struct KeptFront(Box<dyn Any + Send>);
+
+impl KeptFront {
+    pub fn new(it: impl Any + Send) -> KeptFront {
+        KeptFront(Box::new(it))
+    }
+
+    /// What [`KeptFront::new`] was given; none for another type, kept by another front.
+    pub fn take<K: Any>(self) -> Option<K> {
+        self.0.downcast().ok().map(|it| *it)
     }
 }
 
@@ -285,6 +319,10 @@ pub trait Writer: Send + 'static {
     /// tables (name, elements, bytes), measured with it exclusive, as salsa measures; an
     /// error while a reader of it is alive.
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed>;
+    /// On the loop, once every task of the job's build has ended: the front end with every
+    /// write applied, for the head's next build to lower into. None while a reader of it is
+    /// alive or a write fails to apply: the next build lowers anew.
+    fn keep(self: Box<Self>) -> Option<KeptFront>;
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks, read only.

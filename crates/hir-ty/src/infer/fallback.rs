@@ -61,11 +61,20 @@ impl<'db> InferenceContext<'db> {
 
     fn fallback_types(&mut self) -> bool {
         // Check if we have any unresolved variables. If not, no need for fallback.
-        let unresolved_variables = self.table.infer_ctxt.unresolved_variables();
+        let (unresolved_ty, unresolved_int, unresolved_float) =
+            self.table.infer_ctxt.unresolved_root_variables();
 
-        if unresolved_variables.is_empty() {
+        if unresolved_ty.is_empty() && unresolved_int.is_empty() && unresolved_float.is_empty() {
             return false;
         }
+
+        let interner = self.interner();
+        let unresolved_variables: Vec<Ty<'db>> = unresolved_ty
+            .into_iter()
+            .map(|vid| Ty::new_var(interner, vid))
+            .chain(unresolved_int.into_iter().map(|vid| Ty::new_int_var(interner, vid)))
+            .chain(unresolved_float.into_iter().map(|vid| Ty::new_float_var(interner, vid)))
+            .collect();
 
         let diverging_fallback = self.calculate_diverging_fallback(&unresolved_variables);
 

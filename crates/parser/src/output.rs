@@ -11,7 +11,6 @@ use crate::SyntaxKind;
 /// interspersed into the original [`crate::Input`]. The output is fundamentally
 /// coordinated with the input and `n_input_tokens` refers to the number of
 /// times [`crate::Input::push`] was called.
-#[derive(Default)]
 pub struct Output {
     /// 32-bit encoding of events. If LSB is zero, then that's an index into the
     /// error vector. Otherwise, it's one of the three other variants, with data encoded as
@@ -21,8 +20,20 @@ pub struct Output {
     /// ```
     ///
     /// A lazy node's word is followed by one more, its number of input tokens.
-    event: Vec<u32>,
+    event: blaze_mem::scratch::Lent<Words>,
     error: Vec<String>,
+}
+
+crate::event::per_thread_buffer! {
+    /// An output's words: kept per thread at the most they ever held, back on the shelf of
+    /// the thread that drops the output.
+    Words, WORDS: u32
+}
+
+impl Default for Output {
+    fn default() -> Output {
+        Output::with_event_capacity(0)
+    }
 }
 
 #[derive(Debug)]
@@ -49,7 +60,9 @@ impl Output {
     /// initial capacity avoids most of the amortized `Vec::grow` allocations
     /// during `event::process`.
     pub(crate) fn with_event_capacity(cap: usize) -> Self {
-        Output { event: Vec::with_capacity(cap), error: Vec::new() }
+        let mut event = blaze_mem::scratch::lend::<Words>();
+        event.reserve(cap);
+        Output { event, error: Vec::new() } // alloc: empty until the first syntax error
     }
 
     const EVENT_MASK: u32 = 0b1;

@@ -609,20 +609,12 @@ fn level_attrs_are_as_matched() {
 
 #[test]
 fn lint_sets_are_as_sets() {
-    // A splitmix64 stream: seeded, so a failure reproduces.
-    let mut state = 0x6c69_6e74_7365_74u64;
-    let mut next = move || {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x6c69_6e74_7365_74);
     let mut set = LintSet::EMPTY;
     let mut reference = std::collections::BTreeSet::new();
     for _ in 0..10_000 {
-        let id = LintId((next() % index::LINT_COUNT as u64) as u16);
-        match next() % 3 {
+        let id = LintId(rng.index(index::LINT_COUNT) as u16);
+        match rng.below(3) {
             0 => {
                 set.remove(id);
                 reference.remove(&id);

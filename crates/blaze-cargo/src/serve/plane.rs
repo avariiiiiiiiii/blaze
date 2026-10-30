@@ -18,7 +18,6 @@ use std::{
     time::Duration,
 };
 
-use blaze_core::sim::Rng;
 use blaze_graph::{
     Budget, Error, Plane as Graph, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
     admission::{Estimates, TaskKind},
@@ -26,6 +25,7 @@ use blaze_graph::{
     machine::{NodeId, Outcome, Pool},
     plane::{NodeRef, Nodes},
 };
+use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 

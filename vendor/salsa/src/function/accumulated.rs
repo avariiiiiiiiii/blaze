@@ -32,8 +32,10 @@ where
         zalsa_local.report_untracked_read(zalsa.current_revision());
 
         let Some(accumulator) = <accumulator::IngredientImpl<A>>::from_zalsa(zalsa) else {
+            // alloc: the edge: `accumulated` returns an owned list to its caller (diagnostics), once per call
             return vec![];
         };
+        // alloc: the edge: `accumulated` returns an owned list to its caller (diagnostics), once per call
         let mut output = vec![];
 
         // First ensure the result is up to date
@@ -41,6 +43,7 @@ where
 
         let db_key = self.database_key_index(key);
         let mut visited: FxHashSet<DatabaseKeyIndex> = FxHashSet::default();
+        // alloc: the edge: `accumulated` returns an owned list to its caller (diagnostics), once per call
         let mut stack: Vec<DatabaseKeyIndex> = vec![db_key];
 
         // Do a depth-first search across the dependencies of `key`, reading the values accumulated by

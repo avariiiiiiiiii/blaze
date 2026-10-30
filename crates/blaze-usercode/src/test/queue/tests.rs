@@ -9,7 +9,7 @@ use blaze_core::{
     Traced,
     sim::{self, Faults, Rng, Sim},
 };
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64};
 
 use super::*;
 use crate::{
@@ -56,6 +56,7 @@ fn binary(name: &str, jobs: Vec<Job>) -> Binary {
         memory: None,
         mode: Mode::Process,
         jobs,
+        loaded: None,
     }
 }
 
@@ -102,6 +103,8 @@ struct Fake {
     records: BTreeMap<FileName, Vec<u8>>,
     next_conn: u64,
     results: Vec<Finished>,
+    /// What the queue allocated in its `complete` calls, and nothing of the fake's.
+    allocations: u64,
 }
 
 impl Fake {
@@ -122,6 +125,7 @@ impl Fake {
             records: BTreeMap::new(),
             next_conn: 0,
             results: Vec::new(),
+            allocations: 0,
         };
         fake.pump(effects);
         fake
@@ -129,9 +133,15 @@ impl Fake {
 
     fn complete(&mut self, tag: Tag, done: Done) {
         assert!(self.queue.owns(tag));
-        let mut effects = Vec::new();
-        self.queue.complete(Completion { tag, done }, self.now, &mut effects);
+        let mut effects = Vec::with_capacity(64);
+        self.queue_complete(Completion { tag, done }, &mut effects);
         self.pump(effects);
+    }
+
+    fn queue_complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) {
+        let (queue, now) = (&mut self.queue, self.now);
+        let ((), used) = blaze_alloc_count::measure(|| queue.complete(completion, now, effects));
+        self.allocations += used.allocations;
     }
 
     fn cancel(&mut self) {
@@ -181,7 +191,7 @@ impl Fake {
                 }
             }
             for answer in answers {
-                self.queue.complete(answer, self.now, &mut effects);
+                self.queue_complete(answer, &mut effects);
             }
         }
         self.results.extend(self.queue.drain());
@@ -842,16 +852,10 @@ fn lines_are_read_back_as_they_were_pushed() {
 #[test]
 fn a_line_is_read_in_place_as_line_parse_reads_it() {
     let alphabet = ['R', 'L', 'D', 'E', 'T', 'W', 'N', 'X', 'Q', '\t', 'a', '/', 'é', '*'];
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..20_000 {
-        let len = (next() % 12) as usize;
-        let text: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+        let len = rng.index(12);
+        let text: String = (0..len).map(|_| alphabet[rng.index(alphabet.len())]).collect();
         let read = record_line(&text).map(|(seen, scope, what)| Line { seen, scope: scope.to_owned(), what: what.to_owned() });
         assert_eq!(read, Line::parse(&text), "{text:?}");
     }
@@ -871,13 +875,7 @@ fn a_packed_line_reads_back_its_kind() {
 /// The bitsets against a sorted set, over seeded sets, clears and firsts.
 #[test]
 fn bits_are_a_set() {
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for len in [0usize, 1, 63, 64, 65, 200] {
         let mut bits = Bits::full(len);
         let mut set: BTreeSet<u32> = (0..len as u32).collect();
@@ -887,8 +885,8 @@ fn bits_are_a_set() {
             continue;
         }
         for _ in 0..2_000 {
-            let at = (next() % len as u64) as u32;
-            match next() % 3 {
+            let at = rng.below(len as u64) as u32;
+            match rng.below(3) {
                 0 => {
                     bits.set(at);
                     set.insert(at);
@@ -932,20 +930,28 @@ fn the_steady_state_reuses_its_slabs() {
         assert!(!runs.is_empty(), "nothing runs after {ended}");
         for (id, index) in runs {
             fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, names[index as usize], "/ws/x")]);
+            let before = fake.allocations;
             fake.advance(Duration::from_millis(3));
             fake.end(conn, id, End::Exited(0), b"ok");
             ended += 1;
+            // What a test costs the queue once its columns have grown: its result's output,
+            // execution record and name, its own line (kept, then its result's two buffers),
+            // the driver's record read (it owns the file name) and the send of the next run
+            // (it owns the bytes). Nothing of the lines every test read, nothing per timer.
+            const PER_TEST: u64 = 8;
+            let used = fake.allocations - before;
+            assert!(ended < 100 || used <= PER_TEST, "test {ended}: {used} allocations, budget {PER_TEST}");
         }
         let queue = &fake.queue;
         let server = queue.bins[0].server.as_ref().unwrap();
-        let now = (queue.attempts.len(), queue.tags.len(), queue.wheel.made(), server.waiting.capacity(), server.next.capacity());
+        let now = (queue.attempts.len(), queue.tags.len(), server.waiting.capacity(), server.next.capacity());
         if ended == 100 {
             high = Some(now);
         }
         if let Some(high) = high {
             assert_eq!(now, high, "after {ended} tests");
         }
-        assert!(queue.attempts.len() <= 4 && queue.wheel.made() <= 8, "{now:?}");
+        assert!(queue.attempts.len() <= 4 && queue.wheel.len() <= 8, "{now:?}");
     }
     assert_eq!(fake.results.len(), 600);
     assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));

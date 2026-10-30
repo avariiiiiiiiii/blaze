@@ -21,29 +21,32 @@ pub struct Kind(pub u16);
 pub mod kinds {
     use super::{Kind, Range};
 
-    /// This crate's: the loader's handshake.
+    /// This crate's: the start hook's handshake ([`crate::handshake`]).
     pub const INPROC: Range<u16> = 0x0000..0x0100;
     /// `blaze-lazy`'s: stub misses and their answers.
     pub const LAZY: Range<u16> = 0x0100..0x0200;
     /// `blaze-premap`'s.
     pub const PREMAP: Range<u16> = 0x0200..0x0300;
-    /// `blaze-live`'s: patches for a program the loader started.
+    /// `blaze-live`'s: patches for a running program.
     pub const LIVE: Range<u16> = 0x0300..0x0400;
 
-    /// The loader's first frame, to the daemon ([`crate::load`]).
+    /// The start hook's first frame, to the daemon: where its image is.
     pub const HELLO: Kind = Kind(0x01);
-    /// The daemon's answer: the memory objects, how to map them, the image's format.
+    /// The daemon's answer: the memory objects and the overlays.
     pub const GRANT: Kind = Kind(0x02);
-    /// A loader asking the daemon to map a range of an object into it (Windows, where the
-    /// daemon maps views into the run process).
+    /// A start hook asking the daemon to map a whole object into it (Windows, where the daemon
+    /// maps views into the run process).
     pub const MAP: Kind = Kind(0x03);
     pub const MAPPED: Kind = Kind(0x04);
-    /// The loader is about to jump into the program, which is mapped at `base`.
+    /// The start hook is about to return into the program's own start, on this thread.
     pub const STARTED: Kind = Kind(0x05);
-    /// The loader could not start the program: why, as UTF-8.
+    /// The start hook could not attach: why, as UTF-8. The process exits.
     pub const FAILED: Kind = Kind(0x06);
     /// The daemon could not do what a frame asked: why, as UTF-8.
     pub const REFUSED: Kind = Kind(0x07);
+    /// A start hook asking the daemon to lay the grant's overlays over its image (Windows).
+    pub const OVERLAY: Kind = Kind(0x08);
+    pub const OVERLAID: Kind = Kind(0x09);
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

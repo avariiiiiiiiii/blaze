@@ -10,6 +10,7 @@
 //! Follows rustc's `compiler/rustc_lint/src/dangling.rs` and `compiler/rustc_lint/src/lints.rs`
 //! (`DanglingPointersFromTemporaries`, `DanglingPointersFromLocals`) (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use hir::InFile;
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
@@ -97,9 +98,9 @@ impl Searcher<'_, '_, '_> {
                     for statement in statements {
                         match statement {
                             Statement::Let { initializer, else_branch, .. } => {
-                                initializer.iter().chain(else_branch).for_each(|it| this.expr(*it));
+                                initializer.into_iter().chain(else_branch).for_each(|it| this.expr(it));
                             }
-                            Statement::Expr { expr, .. } => this.expr(*expr),
+                            Statement::Expr { expr, .. } => this.expr(expr),
                             Statement::Item(_) => {}
                         }
                     }

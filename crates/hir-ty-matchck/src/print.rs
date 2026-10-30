@@ -152,7 +152,35 @@ impl<'a, 'db> Cx<'a, 'db> {
         }
     }
 
+    /// `print_pat_range` as text.
+    pub(crate) fn range_text(&self, range: &IntRange, ty: Ty<'db>) -> Box<str> {
+        // alloc: the text of a lint that fired.
+        let mut out = String::new();
+        self.print_range(&mut out, range, ty);
+        out.into_boxed_str()
+    }
+
+    /// The exclusive range pattern `lo..hi` (`range`) made inclusive, `lo..=hi`, as rustc's
+    /// `PatRange` prints it; `has_lo` is false for `..hi`, whose `lo` is `NegInfinity`.
+    pub(crate) fn inclusive_text(&self, range: &IntRange, ty: Ty<'db>, has_lo: bool) -> Box<str> {
+        // alloc: the text of a lint that fired.
+        let mut out = String::new();
+        let Some(info) = self.int_info(ty) else { return out.into_boxed_str() };
+        if has_lo && let Bound::Finite(bits) = hoist(info, range.lo) {
+            write_scalar(&mut out, info, ty, bits);
+        }
+        match hoist(info, range.hi) {
+            Bound::Finite(bits) => {
+                out.push_str("..=");
+                write_scalar(&mut out, info, ty, bits);
+            }
+            Bound::NegInfinity | Bound::PosInfinity => out.push_str(".."),
+        }
+        out.into_boxed_str()
+    }
+
     pub(crate) fn print_witness(&self, pat: &Witness<'a, 'db>) -> Box<str> {
+        // alloc: a witness is printed only for an error that fired.
         let mut out = String::new();
         self.write_witness(&mut out, pat);
         out.into_boxed_str()
@@ -197,6 +225,7 @@ impl<'a, 'db> Cx<'a, 'db> {
                     SliceKind::FixedLen(len) => (len, false),
                     SliceKind::VarLen(prefix_len, _) => (prefix_len, true),
                 };
+                // alloc: printing a witness of an error that fired.
                 let fields: Vec<&Witness<'a, 'db>> = pat.iter_fields().collect();
                 let split = prefix_len.min(fields.len());
                 let (mut prefix, mut suffix) = fields.split_at(split);
@@ -266,9 +295,11 @@ impl<'a, 'db> Cx<'a, 'db> {
                             let loc = v.lookup(db);
                             let is_option_or_result = lang.Option == Some(enum_)
                                 || lang.ResultOk.is_some_and(|ok| ok.lookup(db).parent == enum_);
+                            // alloc: printing a witness of an error that fired.
                             if is_option_or_result {
-                                loc.name.as_str().to_owned()
+                                loc.name.as_str().to_owned() // alloc: as above.
                             } else {
+                                // alloc: as above.
                                 format!(
                                     "{}::{}",
                                     EnumSignature::of(db, enum_).name.as_str(),
@@ -277,10 +308,12 @@ impl<'a, 'db> Cx<'a, 'db> {
                             }
                         }
                         (AdtId::StructId(s), _) => {
+                            // alloc: as above.
                             StructSignature::of(db, s).name.as_str().to_owned()
                         }
+                        // alloc: as above.
                         (AdtId::UnionId(u), _) => UnionSignature::of(db, u).name.as_str().to_owned(),
-                        (AdtId::EnumId(_), _) => String::new(),
+                        (AdtId::EnumId(_), _) => String::new(), // alloc: empty.
                     };
                     (variant, name)
                 })

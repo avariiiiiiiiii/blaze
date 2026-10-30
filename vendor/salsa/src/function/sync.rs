@@ -84,6 +84,7 @@ impl SyncTable {
                         ingredient,
                     })
                 })
+                // alloc: setup, once per ingredient when its jar registers
                 .collect(),
             ingredient,
         }
@@ -114,6 +115,7 @@ impl SyncTable {
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me> {
+        let task = zalsa_local.task();
         let hash = FxBuildHasher.hash_one(key_index);
         let shard = self.shard_for(hash);
         let mut write = shard.syncs.lock();
@@ -154,6 +156,7 @@ impl SyncTable {
                 match zalsa.runtime().block(
                     DatabaseKeyIndex::new(self.ingredient, key_index),
                     id,
+                    task,
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
@@ -163,7 +166,7 @@ impl SyncTable {
             Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(SyncState {
                     key: key_index,
-                    id: SyncOwner::Task(TaskId::current()),
+                    id: SyncOwner::Task(zalsa_local.task()),
                     anyone_waiting: false,
                     is_transfer_target: false,
                     claimed_twice: false,
@@ -179,10 +182,11 @@ impl SyncTable {
         }
     }
 
-    /// Claims the given key index, or blocks if it is running on another thread.
+    /// Claims the given key index for `task`, or blocks if it is running on another task.
     pub(crate) fn peek_claim<'me>(
         &'me self,
         zalsa: &'me Zalsa,
+        task: TaskId,
         key_index: Id,
         reentrant: Reentrancy,
     ) -> ClaimResult<'me, ()> {
@@ -193,7 +197,7 @@ impl SyncTable {
                 let id = match occupied_entry.get().id {
                     SyncOwner::Task(id) => id,
                     SyncOwner::Transferred => {
-                        return match self.peek_claim_transferred(zalsa, occupied_entry, reentrant) {
+                        return match self.peek_claim_transferred(zalsa, task, occupied_entry, reentrant) {
                             Ok(claimed) => claimed,
                             Err(other_thread) => match other_thread.block(write) {
                                 BlockResult::Cycle => ClaimResult::Cycle { inner: false },
@@ -215,6 +219,7 @@ impl SyncTable {
                 match zalsa.runtime().block(
                     DatabaseKeyIndex::new(self.ingredient, key_index),
                     id,
+                    task,
                     write,
                 ) {
                     BlockResult::Running(blocked_on) => ClaimResult::Running(blocked_on),
@@ -237,7 +242,7 @@ impl SyncTable {
     ) -> Result<ClaimResult<'me>, Box<BlockOnTransferredOwner<'me>>> {
         let key_index = entry.get().key;
         let database_key_index = DatabaseKeyIndex::new(self.ingredient, key_index);
-        let thread_id = TaskId::current();
+        let thread_id = zalsa_local.task();
 
         match zalsa
             .runtime()
@@ -289,12 +294,12 @@ impl SyncTable {
     fn peek_claim_transferred<'me>(
         &'me self,
         zalsa: &'me Zalsa,
+        thread_id: TaskId,
         mut entry: OccupiedEntry<SyncState>,
         reentrant: Reentrancy,
     ) -> Result<ClaimResult<'me, ()>, Box<BlockOnTransferredOwner<'me>>> {
         let key_index = entry.get().key;
         let database_key_index = DatabaseKeyIndex::new(self.ingredient, key_index);
-        let thread_id = TaskId::current();
 
         match zalsa
             .runtime()
@@ -501,7 +506,13 @@ impl<'me> ClaimGuard<'me> {
 
         self.zalsa
             .runtime()
-            .transfer_lock(self_key, new_owner, new_owner_thread_id, syncs)
+            .transfer_lock(
+                self_key,
+                self.zalsa_local.task(),
+                new_owner,
+                new_owner_thread_id,
+                syncs,
+            )
     }
 
     /// Drops the claim on the memo.

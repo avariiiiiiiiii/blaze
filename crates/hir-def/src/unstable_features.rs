@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use intern::{Symbol, sym};
 use rustc_hash::FxHashSet;
 
@@ -48,7 +48,7 @@ impl UnstableFeatures {
     /// This is also available as `DefMap::features()`. Use that if you have a DefMap available.
     /// Otherwise, use this, to not draw a dependency to the def map.
     #[salsa::tracked(returns(ref))]
-    pub fn query(db: &dyn SourceDatabase, krate: Crate) -> UnstableFeatures {
+    pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
         crate::crate_def_map(db, krate).features().clone()
     }
 }

@@ -31,6 +31,9 @@ hir-ty-mir.workspace = true
 hir-ty-wfcheck.workspace = true
 syntax.workspace = true
 
+[dev-dependencies]
+test-fixture.workspace = true
+
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]
 

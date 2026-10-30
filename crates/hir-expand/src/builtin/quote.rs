@@ -221,7 +221,7 @@ impl ToTokenTree for &crate::tt::TopSubtree {
 impl ToTokenTree for crate::tt::TtElement<'_> {
     fn to_tokens(self, _: Span, builder: &mut TopSubtreeBuilder) {
         match self {
-            crate::tt::TtElement::Leaf(leaf) => builder.push(leaf.clone()),
+            crate::tt::TtElement::Leaf(leaf) => builder.push(leaf.clone()), // clone: a copy (symbol and span)
             crate::tt::TtElement::Subtree(subtree, subtree_iter) => {
                 builder.open(subtree.delimiter.kind, subtree.delimiter.open);
                 builder.extend_with_tt(subtree_iter.remaining());
@@ -247,7 +247,7 @@ macro_rules! impl_to_to_tokentrees {
 /// implement the trait for their reference instead, so this never copies one.
 impl<T: ToTokenTree + Clone> ToTokenTree for &T {
     fn to_tokens(self, span: Span, builder: &mut TopSubtreeBuilder) {
-        self.clone().to_tokens(span, builder);
+        self.clone().to_tokens(span, builder); // clone: a leaf, a number or a `Copy` handle, as the doc above says
     }
 }
 

@@ -6,7 +6,7 @@ use test_fixture::WithFixture;
 use crate::{
     db::HirDatabase,
     next_solver::{DbInterner, RegionKind, TyKind},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
     tests::{check_infer, check_no_mismatches, check_types},
 };
 

@@ -17,7 +17,10 @@
 //!   the fusions, and which constants need a slot;
 //! - [`slots`]: the accumulators (a result kept in a register for the next stencil), each
 //!   value's slot by a linear scan, the stack slots and the area;
-//! - [`emit`]: the code, the edges with their parallel moves, the stubs and the constants.
+//! - the frame, by the glue ([`Glue::frame`]);
+//! - [`emit`]: each branch's edges (which have code of their own, which fall through), the
+//!   size of the code for the one reservation, the labels, then the code, the edges with
+//!   their parallel moves, the stubs and the constants.
 
 mod emit;
 mod scan;
@@ -28,7 +31,6 @@ mod slots;
 mod tests;
 
 use cranelift_codegen::ir;
-use rustc_hash::FxHashMap;
 
 use crate::{
     Error, Target,
@@ -38,6 +40,8 @@ use crate::{
     shape::{Dst, Op, Shape, Src, Ty},
     table::{Library, format::Reader},
 };
+
+pub use emit::ALIGN;
 
 /// A column entry for "none": no slot, no edge, no place in the layout.
 const NONE: u32 = u32::MAX;
@@ -58,9 +62,9 @@ impl Scratch {
     /// Gives the scratch the allocations of a [`Code`] its consumer is done with, so the next
     /// compile writes into them.
     pub fn recycle(&mut self, code: Code) {
-        let Code { bytes, relocs, calls, handlers, lines, slots, .. } = code;
+        let Code { bytes, relocs, calls, handlers, lines, traps, slots, .. } = code;
         self.buf.recycle(bytes, relocs);
-        self.side.recycle(calls, handlers, lines, slots.offsets);
+        self.side.recycle(calls, handlers, lines, traps, slots.offsets);
     }
 }
 
@@ -136,6 +140,9 @@ struct Sel {
     konst: KonstRef,
     /// A `BrIcmp`'s condition, which the emitter may complement to fall through.
     cc: ir::condcodes::IntCC,
+    /// A `BrIcmp` whose condition was complemented: `Target` is the else edge and `Next` the
+    /// then edge, which follows.
+    swapped: bool,
 }
 
 const NO_SHAPE: Shape =
@@ -155,6 +162,7 @@ impl Default for Sel {
             trap: None,
             konst: KonstRef::None,
             cc: ir::condcodes::IntCC::Equal,
+            swapped: false,
         }
     }
 }
@@ -215,6 +223,8 @@ pub(crate) struct Plan {
     // `slots`.
     /// By value: its slot's offset from the start of the value slots, `NONE` for none.
     slot: Vec<u32>,
+    /// By value: its local slot is free again.
+    released: Vec<bool>,
     /// By instruction: into `places`, for a glue instruction that gives values.
     places_of: Vec<u32>,
     places: Vec<Places>,
@@ -332,28 +342,52 @@ pub(crate) struct Side {
     rows: Vec<(u32, Rule)>,
     /// Each recorded call: where it returns to, and the instruction.
     sites: Vec<(u32, ir::Inst)>,
+    /// The stubs wanted, in the order first used.
     traps: Vec<(ir::TrapCode, Label)>,
+    /// By trap code: its stub's label, `NONE` while none is wanted.
+    trap_of: TrapOf,
     lines: Vec<(u32, ir::SourceLoc)>,
-    /// The function's 16-byte constants, each placed once.
-    consts: FxHashMap<[u8; 16], Label>,
+    /// Each place that traps, in the order written (by offset): memory accesses, then the
+    /// stubs ([`Code::traps`]).
+    trap_sites: Vec<(u32, ir::TrapCode)>,
+    /// By constant-pool handle and by immediate handle: the constant's label, `NONE` while
+    /// not placed.
+    pool_of: Vec<u32>,
+    imm_of: Vec<u32>,
     /// In the order first used, for a deterministic layout.
     const_order: Vec<([u8; 16], Label)>,
-    /// The library rodata ranges placed, with their labels.
-    rodata: Vec<(u32, u32, Label)>,
+    /// The library rodata entries placed, with their labels, in the order first used.
+    rodata: Vec<(u32, Label)>,
+    /// The parallel moves of the edge being written.
+    moves: Vec<emit::Move>,
     calls: Vec<CallSite>,
     handlers: Vec<Handler>,
     offsets: Vec<i32>,
+}
+
+/// By raw trap code: a label, `NONE` for none.
+struct TrapOf([u32; 256]);
+
+impl Default for TrapOf {
+    fn default() -> TrapOf {
+        TrapOf([NONE; 256])
+    }
 }
 
 impl Side {
     fn clear(&mut self) {
         self.rows.clear();
         self.sites.clear();
-        self.traps.clear();
+        for (code, _) in self.traps.drain(..) {
+            self.trap_of.0[usize::from(code.as_raw().get())] = NONE;
+        }
         self.lines.clear();
-        self.consts.clear();
+        self.trap_sites.clear();
+        self.pool_of.clear();
+        self.imm_of.clear();
         self.const_order.clear();
         self.rodata.clear();
+        self.moves.clear();
         self.calls.clear();
         self.handlers.clear();
         self.offsets.clear();
@@ -364,6 +398,7 @@ impl Side {
         calls: Vec<CallSite>,
         handlers: Vec<Handler>,
         lines: Vec<(u32, ir::SourceLoc)>,
+        trap_sites: Vec<(u32, ir::TrapCode)>,
         offsets: Vec<i32>,
     ) {
         fn keep<T>(mine: &mut Vec<T>, mut theirs: Vec<T>) {
@@ -375,6 +410,7 @@ impl Side {
         keep(&mut self.calls, calls);
         keep(&mut self.handlers, handlers);
         keep(&mut self.lines, lines);
+        keep(&mut self.trap_sites, trap_sites);
         keep(&mut self.offsets, offsets);
     }
 
@@ -390,11 +426,14 @@ impl Side {
         self.sites.push((ret, inst));
     }
 
+    #[inline]
     pub(crate) fn trap(&mut self, buf: &mut Buf, code: ir::TrapCode) -> Label {
-        if let Some(&(_, label)) = self.traps.iter().find(|(it, _)| *it == code) {
-            return label;
+        let at = usize::from(code.as_raw().get());
+        if self.trap_of.0[at] != NONE {
+            return Label(self.trap_of.0[at]);
         }
         let label = buf.label();
+        self.trap_of.0[at] = label.0;
         self.traps.push((code, label));
         label
     }
@@ -414,23 +453,32 @@ impl Side {
         }
     }
 
-    /// The label of the 16 bytes `bytes` in the constant area.
-    fn konst(&mut self, buf: &mut Buf, bytes: [u8; 16]) -> Label {
-        let order = &mut self.const_order;
-        *self.consts.entry(bytes).or_insert_with(|| {
-            let label = buf.label();
-            order.push((bytes, label));
-            label
-        })
+    /// The label of the constant `bytes` in the constant area, placed once per handle: the
+    /// pool's `index` when `pool` (the pool keeps one handle per distinct bytes), else the
+    /// immediate's.
+    fn konst(&mut self, buf: &mut Buf, pool: bool, index: u32, bytes: [u8; 16]) -> Label {
+        let table = if pool { &mut self.pool_of } else { &mut self.imm_of };
+        let at = index as usize;
+        if table.len() <= at {
+            table.resize(at + 1, NONE);
+        }
+        if table[at] != NONE {
+            return Label(table[at]);
+        }
+        let label = buf.label();
+        table[at] = label.0;
+        self.const_order.push((bytes, label));
+        label
     }
 
-    /// The label of library rodata `start..end`, placed once.
-    fn rodata(&mut self, buf: &mut Buf, start: u32, end: u32) -> Label {
-        if let Some(&(_, _, label)) = self.rodata.iter().find(|it| it.0 == start && it.1 == end) {
+    /// The label of library rodata entry `entry`, placed once. A function uses a few entries
+    /// (float masks and bounds), so a scan of the ones placed beats a map.
+    fn rodata(&mut self, buf: &mut Buf, entry: u32) -> Label {
+        if let Some(&(_, label)) = self.rodata.iter().find(|it| it.0 == entry) {
             return label;
         }
         let label = buf.label();
-        self.rodata.push((start, end, label));
+        self.rodata.push((entry, label));
         label
     }
 
@@ -501,11 +549,13 @@ pub(crate) fn compile_in<A: Glue>(
         return Err(Error::new("a function with no blocks"));
     }
     scan::run(plan, func)?;
-    select::run::<A>(plan, func, target)?;
-    slots::run(plan, func, library)?;
+    select::run::<A>(plan, func, target, library)?;
+    slots::run(plan, func, library, A::NEAR)?;
     let frame = A::frame(func, target, plan.area())?;
+    emit::edges(plan, func, library)?;
     let size = emit::size::<A>(plan, func, target, &frame, library)?;
     buf.reserve(size.bytes, size.labels, size.fixups);
+    side.lines.reserve(size.lines);
     emit::labels(plan, func, buf);
     emit::function::<A>(buf, plan, side, func, target, &frame, library)?;
     buf.resolve()?;
@@ -524,6 +574,7 @@ pub(crate) fn compile_in<A: Glue>(
         calls: std::mem::take(&mut side.calls),
         handlers: std::mem::take(&mut side.handlers),
         lines: std::mem::take(&mut side.lines),
+        traps: std::mem::take(&mut side.trap_sites),
         slots: Slots { base, offsets: std::mem::take(&mut side.offsets) },
     })
 }

@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxHashSet;
 
 use super::*;
@@ -523,66 +524,60 @@ fn the_sorted_environment_is_the_one_built_before() {
         "my-cfg=\"\u{e9}\"",
     ];
     let hosts = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"];
-    let mut state = 0x6a09_e667_f3bc_c908u64;
-    let mut next = |bound: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % bound as u64) as usize
-    };
+    let mut rng = SplitMix64::new(0x6a09_e667_f3bc_c908);
     for _ in 0..4_000 {
         let mut unit = bar();
-        unit.host = hosts[next(hosts.len())].into();
-        unit.features = (0..next(4)).map(|_| features[next(features.len())].to_owned()).collect();
-        unit.target_cfgs = (0..next(14)).map(|_| cfgs[next(cfgs.len())].to_owned()).collect();
-        unit.profile.debug_assertions = next(2) == 0;
-        unit.profile.debuginfo = next(2) == 0;
-        unit.profile.release = next(2) == 0;
-        unit.jobs = [0, 1, 8, 10, u32::MAX][next(5)];
-        unit.jobserver = (next(2) == 0).then(|| "fifo:/tmp/j".to_owned());
-        unit.workspace_member = next(2) == 0;
-        unit.tools.rustc_wrapper = (next(2) == 0).then(|| "/wrap".into());
-        unit.tools.rustc_workspace_wrapper = (next(2) == 0).then(|| "/ww".into());
-        unit.tools.linker = (next(3) == 0).then(|| "/ld".into());
-        unit.package.links = (next(2) == 0).then(|| "a.b-c".to_owned());
-        unit.package.description = (next(2) == 0).then(|| "d".to_owned());
-        unit.package.authors = (0..next(3)).map(|it| format!("a{it}")).collect();
-        unit.package.version = ["0.5.0", "1.2.3-pre+b", "7"][next(3)].to_owned();
-        unit.rustflags = (0..next(3)).map(|it| format!("-C{it}")).collect();
-        unit.dependencies = (0..next(3))
+        unit.host = hosts[rng.index(hosts.len())].into();
+        unit.features = (0..rng.index(4)).map(|_| features[rng.index(features.len())].to_owned()).collect();
+        unit.target_cfgs = (0..rng.index(14)).map(|_| cfgs[rng.index(cfgs.len())].to_owned()).collect();
+        unit.profile.debug_assertions = rng.index(2) == 0;
+        unit.profile.debuginfo = rng.index(2) == 0;
+        unit.profile.release = rng.index(2) == 0;
+        unit.jobs = [0, 1, 8, 10, u32::MAX][rng.index(5)];
+        unit.jobserver = (rng.index(2) == 0).then(|| "fifo:/tmp/j".to_owned());
+        unit.workspace_member = rng.index(2) == 0;
+        unit.tools.rustc_wrapper = (rng.index(2) == 0).then(|| "/wrap".into());
+        unit.tools.rustc_workspace_wrapper = (rng.index(2) == 0).then(|| "/ww".into());
+        unit.tools.linker = (rng.index(3) == 0).then(|| "/ld".into());
+        unit.package.links = (rng.index(2) == 0).then(|| "a.b-c".to_owned());
+        unit.package.description = (rng.index(2) == 0).then(|| "d".to_owned());
+        unit.package.authors = (0..rng.index(3)).map(|it| format!("a{it}")).collect();
+        unit.package.version = ["0.5.0", "1.2.3-pre+b", "7"][rng.index(3)].to_owned();
+        unit.rustflags = (0..rng.index(3)).map(|it| format!("-C{it}")).collect();
+        unit.dependencies = (0..rng.index(3))
             .map(|it| Dependency {
                 name: format!("d{it}"),
-                links: [None, Some("foo"), Some("a.b-c")][next(3)].map(str::to_owned),
-                metadata: (0..next(3))
+                links: [None, Some("foo"), Some("a.b-c")][rng.index(3)].map(str::to_owned),
+                metadata: (0..rng.index(3))
                     .map(|_| {
-                        let key = ["root", "bar-baz", "\u{e9}"][next(3)].to_owned();
-                        (key, values[next(values.len())].to_owned())
+                        let key = ["root", "bar-baz", "\u{e9}"][rng.index(3)].to_owned();
+                        (key, values[rng.index(values.len())].to_owned())
                     })
                     .collect(),
             })
             .collect();
-        unit.config_env = (0..next(4))
+        unit.config_env = (0..rng.index(4))
             .map(|_| ConfigEnv {
-                name: names[next(names.len())].into(),
-                value: values[next(values.len())].into(),
-                force: next(2) == 0,
+                name: names[rng.index(names.len())].into(),
+                value: values[rng.index(values.len())].into(),
+                force: rng.index(2) == 0,
             })
             .collect();
-        if next(3) == 0 {
+        if rng.index(3) == 0 {
             unit.dylib_search.host_root = None;
         }
-        unit.dylib_search.plugin_search = (0..next(3))
+        unit.dylib_search.plugin_search = (0..rng.index(3))
             .map(|it| match it {
                 0 => "native=/p/foo/target/debug/build/dep-1/out".into(),
                 1 => "/usr/lib".into(),
                 _ => "/p/foo/target/debug/x".into(),
             })
             .collect();
-        let mut inherited: Vec<(OsString, OsString)> = (0..next(9))
-            .map(|_| (names[next(names.len())].into(), values[next(values.len())].into()))
+        let mut inherited: Vec<(OsString, OsString)> = (0..rng.index(9))
+            .map(|_| (names[rng.index(names.len())].into(), values[rng.index(values.len())].into()))
             .collect();
         // Half the time as a caller that sorts it once passes it: by name, each name once.
-        if next(2) == 0 {
+        if rng.index(2) == 0 {
             inherited.sort_by(|a, b| a.0.cmp(&b.0));
             inherited.dedup_by(|later, first| later.0 == first.0);
         }

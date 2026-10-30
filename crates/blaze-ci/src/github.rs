@@ -8,7 +8,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -180,13 +180,19 @@ pub trait Checks {
     fn update(&mut self, id: u64, run: &CheckRun) -> Result<(), GitHubError>;
 }
 
-/// The App, installed on one repository.
+/// A token and when it expires, in Unix seconds.
+type Minted = Option<(Token, u64)>;
+
+/// The App, installed on one repository: one connection. [`GitHub::lane`] makes another that
+/// shares the App and its token, so check runs post on several connections at once.
 pub struct GitHub {
-    app: App,
+    app: Arc<App>,
     repo: String,
     tls: Arc<ClientConfig>,
-    /// The token and when it expires, in Unix seconds.
-    token: Option<(Token, u64)>,
+    /// This connection's copy of the token.
+    token: Minted,
+    /// The token every lane shares: one mints it and the others copy it, once an hour.
+    minted: Arc<Mutex<Minted>>,
     kept: Option<Kept>,
     /// The next request's JSON body, then the whole request; both reused, so a check run's
     /// update allocates no buffer once they have grown to its size.
@@ -289,7 +295,23 @@ impl GitHub {
             return Err(GitHubError::new(format!("{:?} is not a host name for GitHub's API", app.api)));
         }
         let (body, request) = (Vec::new(), Vec::new());
-        Ok(GitHub { app, repo, tls: tls()?, token: None, kept: None, body, request })
+        let minted = Arc::new(Mutex::new(None)); // alloc: once per App, shared by its lanes
+        let app = Arc::new(app); // alloc: once per App, shared by its lanes
+        Ok(GitHub { app, repo, tls: tls()?, token: None, minted, kept: None, body, request })
+    }
+
+    /// Another connection to GitHub for the same App and repository, sharing its token.
+    pub fn lane(&self) -> GitHub {
+        GitHub {
+            app: Arc::clone(&self.app),
+            repo: self.repo.clone(), // clone: once per lane, at start
+            tls: Arc::clone(&self.tls),
+            token: None,
+            minted: Arc::clone(&self.minted),
+            kept: None,
+            body: Vec::new(), // alloc: none until the lane's first call, then reused
+            request: Vec::new(), // alloc: none until the lane's first call, then reused
+        }
     }
 
     /// The installation token, minted (and kept until five minutes before it expires).
@@ -297,20 +319,28 @@ impl GitHub {
         self.fresh().cloned()
     }
 
-    /// The token kept, minted again first when it is within five minutes of expiring.
+    /// The token kept, minted again first when it is within five minutes of expiring. A lane
+    /// whose copy is stale takes the shared one when another lane has minted it already; the
+    /// lock is taken only then, so once an hour.
     fn fresh(&mut self) -> Result<&Token, GitHubError> {
         let now = now()?;
-        let valid = matches!(&self.token, Some((_, expires)) if now + RENEW_BEFORE < *expires);
-        if !valid {
+        let valid = |held: &Minted| matches!(held, Some((_, expires)) if now + RENEW_BEFORE < *expires);
+        if !valid(&self.token) {
             self.token = None;
-            let jwt = self.app.key.jwt(self.app.id, now)?;
-            self.body.clear();
-            let answer = self.call("POST", Route::Mint, Auth::Bearer(&jwt), true)?;
-            let minted: Minted<'_> = serde_json::from_slice(&answer.body).map_err(|_| {
-                GitHubError::new("GitHub's answer to minting a token is not a token and its expires_at")
-            })?;
-            let expires = unix_seconds(&minted.expires_at)?;
-            self.token = Some((Token(minted.token), expires));
+            let minted = Arc::clone(&self.minted);
+            let mut shared = minted.lock().unwrap_or_else(PoisonError::into_inner);
+            if !valid(&*shared) {
+                *shared = None;
+                let jwt = self.app.key.jwt(self.app.id, now)?;
+                self.body.clear();
+                let answer = self.call("POST", Route::Mint, Auth::Bearer(&jwt), true)?;
+                let token: MintedToken<'_> = serde_json::from_slice(&answer.body).map_err(|_| {
+                    GitHubError::new("GitHub's answer to minting a token is not a token and its expires_at")
+                })?;
+                let expires = unix_seconds(&token.expires_at)?;
+                *shared = Some((Token(token.token), expires));
+            }
+            self.token = (*shared).clone(); // clone: once per token per lane
         }
         Ok(&self.token.as_ref().expect("a token, kept or just minted").0)
     }
@@ -327,7 +357,7 @@ impl GitHub {
         auth: Auth<'_>,
         replayable: bool,
     ) -> Result<HttpResponse, GitHubError> {
-        let GitHub { app, repo, tls, token, kept, body, request } = self;
+        let GitHub { app, repo, tls, token, kept, body, request, .. } = self;
         let tls: &Arc<ClientConfig> = tls;
         let path = PathOf { route, installation: app.installation, repo: repo.as_str() };
         let api = app.api.as_str();
@@ -635,7 +665,7 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> u64 {
 }
 
 #[derive(Deserialize)]
-struct Minted<'a> {
+struct MintedToken<'a> {
     token: String,
     #[serde(borrow)]
     expires_at: Cow<'a, str>,

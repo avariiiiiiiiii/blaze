@@ -59,7 +59,13 @@ children step by `FlatTree::end`; nothing is allocated, counted or cloned anywhe
 
 Callers write `use syntax::view as ast;` so their bodies already say `ast::Fn<'t>`; deleting the
 handles makes `syntax::ast` the views and the alias goes. Types that only tag a kind
-(`FileAstId<N>`, `AstPtr<N>`) take `ast::Fn<'static>`.
+(`FileAstId<N>`, `AstPtr<N>`, `InFile<AstPtr<N>>` of source maps) keep the handle type as the
+tag (`AstPtr<syntax::ast::Fn>`, never made into a handle) until `span`'s `AstIdNode` moves;
+`AstPtr::<N>::to_view(root)` gives the view `<N as Typed>::Of<'t>`.
+
+A view of a database's tree borrows the database: `EditionedFileId::parse(db)` is
+`returns(ref)`, so `file_id.parse(db).root()` is a `Node<'db>`. For any `HirFileId`,
+`HirFileId::root(db: &Db)` and `AstId::to_view(db)` (requested of db) give the same.
 
 ## Proof
 
@@ -80,3 +86,53 @@ handles makes `syntax::ast` the views and the alias goes. Types that only tag a 
 rustc's `rustc_ast` walks are borrowed references into an arena (`&'hir Expr<'hir>`), no
 counts; Roslyn's red nodes are made lazily and cached; rust-analyzer's rowan counts every
 cursor. Views are rustc's shape over a packed array: a step is arithmetic on `u32` words.
+
+## Extension layer
+
+`crates/syntax/src/view/{node_ext,expr_ext,token_ext,prec}.rs` port `ast/{node_ext,expr_ext,
+token_ext,prec}.rs` onto views: every public item of the handle version, same name and meaning,
+so a caller switches with `use syntax::view as ast;` and lifetimes.
+
+- **Shared, not copied.** Types with no handle in them are the handle layer's own:
+  `AttrKind`, `SelfParamKind`, `CommentKind`, `CommentShape`, `QuoteOffsets`, `Radix`,
+  `prec::{ExprPrecedence, Fixity}` and the operator enums. A type that holds a handle has a
+  `Copy` view twin `X<'t>`: `Macro`, `NameLike`, `NameOrNameRef`, `PathSegmentKind`,
+  `StructKind`, `FieldKind`, `TypeBoundKind`, `TypeOrConstParam`, `VisibilityKind`,
+  `CfgAtomKey`, `TokenTreeChildren`, `SlicePatComponents`, `ElseBranch`, `ArrayExprKind`,
+  `LiteralKind`, `BlockModifier`, `CallableExpr`, `AnyComment`, `AnyString`, `IsString<'t>`.
+- **Text is lent.** `Meta`/`Attr::{as_simple_atom, simple_name}` give `&'t str` and
+  `as_simple_call` `(&'t str, TokenTree<'t>)` where the handles built a `SmolStr`; every `text`
+  is `&'t str`. Literal values (`String`/`ByteString`/`CString`/`AnyString::value`) stay `Cow`,
+  borrowed unless unescaping or a CRLF changes the value; `value_string` stays `String`.
+- **No allocation in a walk.** `Meta::skip_cfg_attrs` (a `SmallVec` built by recursion) is a
+  preorder walk that enters each `cfg_attr` and gives the metas it meets, the same metas in the
+  same order. `SlicePatComponents` holds `Take`/`Skip` of the patterns instead of two `Vec`s:
+  the prefix length is counted once, nothing is gathered. `IntNumber::value` reads the digits in
+  place (skipping `_`, the same leading `+`, the first bad digit or overflow failing with the
+  `ParseIntError` kind `from_str_radix` gives) instead of `replace('_', "")`. The remaining
+  allocations carry `// alloc:`: the CRLF rebuild of a literal, the unescape buffer once an
+  escape changes the value, `value_string`.
+- **Signatures.** Methods take `self`; functions that took `&ast::NameRef`/`&ast::Name`
+  (`Impl::for_trait_name_ref`, `RecordExprField::for_field_name`/`for_name_ref`,
+  `RecordPatField::for_field_name_ref`/`for_field_name`) take the view by value, and
+  `NameLike::as_name_ref`/`as_lifetime` give it by value. `IsString::escaped_char_ranges` takes
+  `impl FnMut` instead of `&mut dyn FnMut` (a caller's `&mut |..| ..` still fits). Iterators are
+  `impl Iterator + use<'t>`. `prec::precedence` takes the `Expr<'t>` by value and
+  `needs_parens_in{,_place_of}` take `Node<'t>`s.
+- **No `unreachable!()`.** `AnyComment::doc_kind` gives `None` for `COMMENT` and the doc kind
+  for the two doc kinds, and panics naming the kind and range on any other, where the handle
+  has `unreachable!()`. `TypeBound::kind` and `Literal::kind`, which the handles end in
+  `unreachable!()` on a tree the parser never makes, panic naming the node's range and what it
+  holds.
+- **Left out** (builds or edits a tree): `UseTreeList::remove_unnecessary_braces` (takes a
+  `SyntaxEditor`). No caller on the build path: `rg remove_unnecessary_braces` over
+  `crates/hir*`, `mbe`, `syntax-bridge`, `blaze-*`, `span`, `cfg`, `const-ast` finds none.
+
+Proof: `crates/syntax/src/view/tests.rs` parses one source rich in every construct the layer
+reads (attributes and `cfg_attr` nests, doc and plain comments, every visibility, paths with
+qualifiers and anchors, use trees, items of every kind, every operator, range and slice
+patterns, every literal kind with bad and overflowing numbers, CRLF strings, an outline), pairs
+each node or token of each kind with its handle twin by kind and range, and asserts every ported
+method gives the same node, token, text or value; `digits_value` is checked against
+`u128::from_str_radix` on every string of four bytes from `0 1 7 9 a f z _ + - é`, radixes 2,
+8, 10, 16, error kinds included, and the 2^128 edges.

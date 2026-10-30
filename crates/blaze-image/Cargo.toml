@@ -18,5 +18,8 @@ blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [lints]
 workspace = true

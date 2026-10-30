@@ -575,7 +575,7 @@ mod tests {
     use expect_test::expect;
 
     use crate::{
-        AstNode,
+        AstNode, Text,
         ast::{self, make},
     };
 
@@ -1020,17 +1020,6 @@ mod tests {
     }
 
     /// A small deterministic generator for [`random_edits_of_real_files`].
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            (self.0 % n.max(1) as u64) as usize
-        }
-    }
-
     fn collect_rs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -1061,7 +1050,7 @@ mod tests {
         let texts: Vec<String> =
             files.iter().map(|it| std::fs::read_to_string(it).unwrap()).collect();
         let edition = parser::Edition::CURRENT;
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for (number, text) in texts.iter().enumerate() {
             let donor = ast::SourceFile::parse(&texts[(number + 1) % texts.len()], edition);
             let donors: Vec<SyntaxElement> =
@@ -1069,7 +1058,7 @@ mod tests {
             for outline in [false, true] {
                 let root = match outline {
                     false => ast::SourceFile::parse(text, edition),
-                    true => ast::SourceFile::parse_outline(text.as_str().into(), edition),
+                    true => ast::SourceFile::parse_outline(Text::from(text.as_str()), edition),
                 }
                 .syntax_node();
                 let before = shape(&root.clone().into());
@@ -1082,11 +1071,11 @@ mod tests {
                     if range.is_empty() || last_end.is_some_and(|end| range.start() <= end) {
                         continue;
                     }
-                    if rng.below(elements.len()) < 8 {
+                    if rng.index(elements.len()) < 8 {
                         let edit = match rng.below(3) {
                             0 => Edit::Delete,
-                            1 => Edit::Replace(donors[rng.below(donors.len())].clone()),
-                            _ => Edit::InsertAfter(donors[rng.below(donors.len())].clone()),
+                            1 => Edit::Replace(donors[rng.index(donors.len())].clone()),
+                            _ => Edit::InsertAfter(donors[rng.index(donors.len())].clone()),
                         };
                         targets.push((element.clone(), edit));
                         last_end = Some(range.end());

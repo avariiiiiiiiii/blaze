@@ -24,11 +24,11 @@ pub mod rename;
 #[cfg(test)]
 mod tests;
 
-use base_db::{FileId, FileText, SourceDatabase};
+use base_db::{Db, FileId, FileText};
 use blaze_api::{ApiError, Edit, Edited, EditedItem};
 use blaze_ids::ContentId;
 use blaze_vfs::Op;
-use hir::{Semantics, db::HirDatabase};
+use hir::Semantics;
 use rustc_hash::FxHashMap;
 use syntax::{AstNode, Edition, Parse, SourceFile, SyntaxKind, SyntaxNode, ast};
 
@@ -64,8 +64,8 @@ pub struct Applied {
 
 /// The files a request's edits work in, as they leave them.
 pub(crate) struct Edits<'a> {
-    pub db: &'a dyn HirDatabase,
-    pub sema: Semantics<'a, dyn HirDatabase>,
+    pub db: &'a Db,
+    pub sema: Semantics<'a>,
     pub files: &'a dyn Files,
     pub working: Vec<Working>,
     pub ids: Vec<FileId>,
@@ -78,10 +78,10 @@ pub(crate) struct Edits<'a> {
 /// Makes `edits`, in order, in the view whose front end is `db` and whose files are `files`.
 /// A rename resolves in the view as it is, so every rename comes before the request's other
 /// edits.
-pub fn apply(db: &dyn HirDatabase, files: &dyn Files, edits: &[Edit]) -> Result<Applied, ApiError> {
+pub fn apply(db: &Db, files: &dyn Files, edits: &[Edit]) -> Result<Applied, ApiError> {
     let mut cx = Edits {
         db,
-        sema: Semantics::new_dyn(db),
+        sema: Semantics::new(db),
         files,
         working: Vec::new(),
         ids: Vec::new(),
@@ -211,8 +211,8 @@ impl Edits<'_> {
 /// The key ([`blaze_items::ItemKey`]) of the item `node` is, in the view the front end has;
 /// `None` for one it has none of (cfg'd out, or no item with a key).
 pub(crate) fn key_of(
-    sema: &Semantics<'_, dyn HirDatabase>,
-    db: &dyn HirDatabase,
+    sema: &Semantics<'_>,
+    db: &Db,
     node: &SyntaxNode,
 ) -> Option<ContentId> {
     use blaze_items::ItemId;
@@ -254,7 +254,7 @@ pub(crate) fn key_of(
 }
 
 /// The key of the module a file is.
-fn file_key(sema: &Semantics<'_, dyn HirDatabase>, db: &dyn HirDatabase, file: FileId) -> Option<ContentId> {
+fn file_key(sema: &Semantics<'_>, db: &Db, file: FileId) -> Option<ContentId> {
     let module = sema.file_to_module_def(file)?;
     Some(blaze_items::key::module_key(db, module.into()).0)
 }

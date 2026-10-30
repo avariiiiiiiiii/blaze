@@ -253,7 +253,7 @@ impl<'db> InferenceContext<'db> {
                 panic!("type of closure expr {:?} is not a closure {:?}", closure_expr_id, ty);
             }
         };
-        let args = self.infcx().resolve_vars_if_possible(args);
+        let args = self.infcx().deeply_resolve_ignoring_regions(args);
 
         let mut delegate = InferBorrowKind {
             closure_def_id: closure_expr_id,
@@ -363,7 +363,7 @@ impl<'db> InferenceContext<'db> {
             closure_expr_id, delegate.capture_information
         );
 
-        let (capture_information, closure_kind, _origin) = self
+        let (capture_information, closure_kind, origin) = self
             .process_collected_capture_information(capture_clause, &delegate.capture_information);
 
         self.compute_min_captures(closure_expr_id, capture_information);
@@ -405,6 +405,10 @@ impl<'db> InferenceContext<'db> {
                 Ty::from_closure_kind(self.interner(), closure_kind),
                 closure_kind_ty,
             );
+            if let Some(origin) = origin {
+                self.result.closures_data.get_mut(&closure_expr_id).unwrap().kind_origin =
+                    Some(origin);
+            }
         }
 
         // For coroutine-closures, we additionally must compute the
@@ -603,9 +607,9 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         capture_clause: CaptureBy,
         capture_information: &InferredCaptureInformation,
-    ) -> (InferredCaptureInformation, ClosureKind, Option<Place>) {
+    ) -> (InferredCaptureInformation, ClosureKind, Option<(ExprOrPatIdPacked, Place)>) {
         let mut closure_kind = ClosureKind::LATTICE_BOTTOM;
-        let mut origin: Option<Place> = None;
+        let mut origin: Option<(ExprOrPatIdPacked, Place)> = None;
 
         let processed = capture_information
             .iter()
@@ -615,19 +619,22 @@ impl<'db> InferenceContext<'db> {
                 let place = restrict_capture_precision(place, &mut capture_info);
 
                 let place = truncate_capture_for_optimization(place, &mut capture_info);
+                // rustc's `usage_span`: the use this capture is for.
+                let usage = |place: &Place| {
+                    // clone: once per closure that is not `Fn`
+                    capture_info.sources.first().map(|it| (it.final_source(), place.clone()))
+                };
 
                 let updated = match capture_info.capture_kind {
                     UpvarCapture::ByValue => match closure_kind {
-                        ClosureKind::Fn | ClosureKind::FnMut => {
-                            (ClosureKind::FnOnce, Some(place.clone()))
-                        }
+                        ClosureKind::Fn | ClosureKind::FnMut => (ClosureKind::FnOnce, usage(&place)),
                         // If closure is already FnOnce, don't update
                         ClosureKind::FnOnce => (closure_kind, origin.take()),
                     },
 
                     UpvarCapture::ByRef(BorrowKind::Mutable | BorrowKind::UniqueImmutable) => {
                         match closure_kind {
-                            ClosureKind::Fn => (ClosureKind::FnMut, Some(place.clone())),
+                            ClosureKind::Fn => (ClosureKind::FnMut, usage(&place)),
                             // Don't update the origin
                             ClosureKind::FnMut | ClosureKind::FnOnce => {
                                 (closure_kind, origin.take())
@@ -930,7 +937,7 @@ impl<'db> InferenceContext<'db> {
     }
 
     fn normalize_capture_place(&mut self, span: Span, place: Place) -> Place {
-        let place = self.infcx().resolve_vars_if_possible(place);
+        let place = self.infcx().deeply_resolve_ignoring_regions(place);
 
         // In the new solver, types in HIR `Place`s can contain unnormalized aliases,
         // which can ICE later (e.g. when projecting fields for diagnostics).

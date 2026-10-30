@@ -1,6 +1,6 @@
 //! The channel between a run process and the daemon: [`frame`](crate::frame)s over the socket
-//! (Unix) or pipe (Windows) the loader connected with. Blocking: each end reads it on a thread
-//! of its own, never on a plane worker.
+//! (Unix) or pipe (Windows) the start hook connected with. Blocking: each end reads it on a
+//! thread of its own, never on a plane worker.
 
 use std::time::Duration;
 
@@ -27,12 +27,14 @@ impl Channel {
         Channel { stream, buf: vec![0; CHUNK], start: 0, end: 0, last: 0, out: Vec::new(), seq: 0 }
     }
 
-    /// The channel of the fd or handle `raw` (as [`Channel::raw`] gave it), which the caller
-    /// owns from now on.
+    /// The channel of the fd or handle `raw`, which the caller hands over.
+    #[cfg(all(test, unix))]
     pub(crate) fn from_raw(raw: i64) -> Result<Channel, Error> {
         Ok(Channel::new(sys::Stream::from_raw(raw)?))
     }
 
+    /// The socket under the channel, for the rendezvous to ask the OS about its peer.
+    #[cfg(target_os = "macos")]
     pub(crate) fn raw(&self) -> i64 {
         self.stream.raw()
     }

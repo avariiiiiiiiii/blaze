@@ -1,5 +1,5 @@
 //! This module resolves `mod foo;` declaration to file.
-use base_db::{AnchoredPath, Crate, SourceDatabase};
+use base_db::{Db, AnchoredPath, Crate};
 use hir_expand::{EditionedFileId, name::Name};
 use intern::Symbol;
 
@@ -67,7 +67,7 @@ impl ModDir {
     /// across declarations.
     pub(super) fn resolve_declaration(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         krate: Crate,
         file_id: HirFileId,
         name: &Name,

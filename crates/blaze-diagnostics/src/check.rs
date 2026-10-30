@@ -3,15 +3,19 @@
 //! passes, stopping where rustc stops, then its closing lines.
 //!
 //! A file that doesn't parse in a way rustc can't recover from (`FatalError`) ends it there:
-//! its errors and the closing lines, nothing of resolution, types or lints.
+//! its errors and the closing lines, nothing of resolution, types or lints. So does any error
+//! marked fatal ([`Diag::stop`]): what rustc would write after it is not written. rustc's
+//! stashed warnings ([`Phase::Stashed`]) come last, and only when nothing was an error.
 //!
 //! Follows rustc's `compiler/rustc_interface/src/passes.rs` (`run_required_analyses`,
 //! `analysis`: no late lint, dead-code or privacy pass after an error that is not a lint's)
 //! and `compiler/rustc_errors/src/lib.rs` (`DiagCtxtInner::emit_diagnostic`: a diagnostic
 //! emitted again is not written again, nor a `note_once` already written).
 
+use base_db::Db;
 use blaze_ids::radix;
-use hir::{Semantics, db::HirDatabase};
+use blaze_mem::{Frame, Tag, frame};
+use hir::Semantics;
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -36,23 +40,28 @@ pub struct Options {
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
 /// closing ones ("aborting due to ...", "For more information about this error, ...").
 pub fn check_crate(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: hir::Crate,
     files: &dyn Files,
     options: &Options,
 ) -> Vec<Diag> {
-    let sema = Semantics::new_dyn(db);
+    let sema = Semantics::new(db);
     check_crate_with(&sema, krate, files, options)
 }
 
 /// [`check_crate`] with semantics the caller holds.
 pub fn check_crate_with<'db>(
-    sema: &Semantics<'db, dyn HirDatabase>,
+    sema: &Semantics<'db>,
     krate: hir::Crate,
     files: &dyn Files,
     options: &Options,
 ) -> Vec<Diag> {
-    let cx = Cx::new(sema, krate, files);
+    frame::task(Tag::Diagnostics, |frame| run(sema, krate, files, options, frame))
+}
+
+/// The check of `krate`, its tables in `frame`.
+fn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {
+    let cx = Cx::new(sema, krate, files, frame).with_lints(&options.lints);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
         return written(parsed.found.into_iter().map(|it| it.diag).collect(), options);
@@ -64,13 +73,40 @@ pub fn check_crate_with<'db>(
     found.extend(checks::check(&cx));
     found.extend(lints::early(&cx, &options.lints));
     radix::sort_by_key(&mut found, |it| it.phase as u8);
+    if let Some(at) = found.iter().position(|it| it.diag.fatal) {
+        found.truncate(at + 1);
+        return written(lints::decide(&cx, &options.lints, found, true), options);
+    }
     let aborted = found.iter().any(stops_before_late);
     if !aborted {
         let mut late = lints::late(&cx);
-        late.iter_mut().for_each(|it| it.phase = Phase::Late);
+        late.iter_mut().filter(|it| it.phase < Phase::Late).for_each(|it| it.phase = Phase::Late);
         found.extend(late);
     }
-    written(lints::decide(&cx, &options.lints, found, aborted), options)
+    let (stashed, found): (Vec<Found>, Vec<Found>) =
+        found.into_iter().partition(|it| it.phase == Phase::Stashed);
+    let mut diags = lints::decide(&cx, &options.lints, found, aborted);
+    diags.extend(unstashed(stashed, &diags));
+    written(diags, options)
+}
+
+/// rustc's stashed warnings, written at the very end and only when nothing before them was an
+/// error, lints denied included.
+fn unstashed(stashed: Vec<Found>, written: &[Diag]) -> Vec<Diag> {
+    if written.iter().any(Diag::is_error) {
+        return Vec::new();
+    }
+    stashed
+        .into_iter()
+        .map(|it| {
+            assert!(
+                it.lint_at.is_none() && !it.diag.is_lint(),
+                "a stashed diagnostic is a lint's ({:?}): its level is decided with the others",
+                it.diag.code,
+            );
+            it.diag
+        })
+        .collect()
 }
 
 /// Whether rustc stops before its late passes for `found`: an error that is not a lint's
@@ -130,6 +166,35 @@ mod tests {
 
     fn found(diag: Diag, phase: Phase) -> Found {
         Found::new(diag, phase)
+    }
+
+    fn soft_gate(lo: u32) -> Found {
+        let mut diag = Diag::new(Level::Warning, None, "the feature is unstable");
+        diag.span = MultiSpan::of(at(lo));
+        found(diag, Phase::Stashed)
+    }
+
+    #[test]
+    fn a_stashed_warning_is_written_only_when_nothing_was_an_error() {
+        let warning = Diag::lint("dead_code", "function `f` is never used", at(1));
+        let written = unstashed(vec![soft_gate(5)], std::slice::from_ref(&warning));
+        assert_eq!(written, [soft_gate(5).diag]);
+
+        let error = Diag::error(Some("E0308"), "mismatched types", at(1));
+        assert!(unstashed(vec![soft_gate(5)], &[warning, error]).is_empty());
+    }
+
+    #[test]
+    fn a_lint_denied_is_an_error_that_drops_the_stashed_warnings() {
+        let mut denied = Diag::lint("dead_code", "function `f` is never used", at(1));
+        denied.level = Level::Error;
+        assert!(unstashed(vec![soft_gate(5)], &[denied]).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "only an error rustc gives is fatal")]
+    fn a_lint_cannot_be_fatal() {
+        Diag::lint("dead_code", "function `f` is never used", at(1)).stop();
     }
 
     #[test]

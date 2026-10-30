@@ -20,7 +20,7 @@ use crate::{
     layout::{InternedLayout, LayoutError},
     next_solver::{DbInterner, GenericArgs},
     setup_tracing,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt as _},
 };
 
 mod closure;

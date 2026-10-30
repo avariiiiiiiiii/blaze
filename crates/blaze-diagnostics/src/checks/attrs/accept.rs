@@ -249,6 +249,30 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
         }
     }
 
+    /// `parse`, the errors it gives fatal (rustc's `ShouldEmit::EarlyFatal`).
+    pub(crate) fn fatal<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
+        let from = self.errors.len();
+        let parsed = parse(self);
+        for diag in &mut self.errors[from..] {
+            if diag.is_error() && !diag.is_lint() {
+                diag.stop();
+            }
+        }
+        parsed
+    }
+
+    /// `parse`, its errors fatal (rustc's `ShouldEmit::EarlyFatal`).
+    pub(crate) fn fatal<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
+        let from = self.errors.len();
+        let parsed = parse(self);
+        for diag in &mut self.errors[from..] {
+            if diag.is_error() && !diag.is_lint() {
+                diag.stop();
+            }
+        }
+        parsed
+    }
+
     /// An error with code `code` at `range` of the attribute's file.
     pub(crate) fn err(&self, code: Option<&str>, message: impl Into<String>, range: TextRange) -> Diag {
         Diag::error(code, message, self.span(range))

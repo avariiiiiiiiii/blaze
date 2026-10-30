@@ -5,6 +5,8 @@
 //! ([`Keywords`]), not from its text, and each context's edition is asked once a conversion.
 //! A token costs a few loads and one 4-byte word of [`parser::Input`]; a caller parsing many
 //! times (a macro's matcher, once a fragment) reuses one input with the `_into` functions.
+//! [`tree_words`] converts a whole tree once, into the words it keeps, so that any view of it is
+//! parsed from a slice of them with no conversion.
 
 use std::sync::LazyLock;
 
@@ -61,23 +63,152 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 ) {
     res.clear();
     res.reserve(buffer.len());
-    let keywords = &*KEYWORDS;
-    let mut editions = Editions::new(span_to_edition);
-    // Where the fragment that was opened last starts, until its first token is pushed.
-    let mut fragment_at: Option<usize> = None;
-    // Whether the last token was the `'` of a lifetime, whose name comes next.
-    let mut lifetime = false;
+    let mut conversion = Conversion::<FRAGMENTS, F>::new(span_to_edition, res, None);
+    buffer.for_each_token(|token, ctx| conversion.token(token, ctx));
+    conversion.finish();
+}
 
-    buffer.for_each_token(|token, ctx| {
-        if FRAGMENTS
-            && let Some(at) = fragment_at
-            && res.len() > at
-        {
-            res.mark_fragment_start(at);
-            fragment_at = None;
+/// The parser's words of `tree`'s tokens, as a matcher's input of the whole tree makes them,
+/// with where each token slot's word is and the group of each fragment start: what
+/// [`tt::TopSubtree::words`] keeps, so that a view's input is a slice of them.
+pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
+    tree: &tt::TopSubtree,
+    span_to_edition: &mut F,
+) -> tt::TreeWords {
+    let mut res = parser::Input::with_capacity(tree.token_slots());
+    // alloc: the index of the tree's words, kept with them in the tree.
+    let mut at = vec![0; tree.token_slots()];
+    // alloc: the tree's fragment starts, kept with its words; most trees have none.
+    let mut fragment_starts = Vec::new();
+    let slots = Slots { at: &mut at, fragment_starts: &mut fragment_starts, slot: 0, origin: 0 };
+    let mut conversion = Conversion::<true, F>::new(span_to_edition, &mut res, Some(slots));
+    tree.for_each_slotted_token(|slot, token, ctx| {
+        conversion.at_slot(slot);
+        conversion.token(token, ctx);
+    });
+    // alloc: the editions the words were made with, kept with them; a tree has a few contexts.
+    let editions = conversion.finish().answers().collect();
+    tt::TreeWords::new(
+        tree,
+        res.into_words().into_boxed_slice(),
+        at.into_boxed_slice(),
+        fragment_starts.into_boxed_slice(),
+        editions,
+    )
+}
+
+/// The parser's tokens of `view`, from the words its tree keeps ([`tree_words`], made the first
+/// time): read in place when only the words' end padding follows the view's, as for a whole
+/// tree, otherwise copied into `copy`. They are [`to_matcher_input`]'s tokens of the view, or with
+/// `fragments` false [`to_parser_input`]'s, and nothing is converted.
+///
+/// The kept words hold the editions their contexts were given when they were made. When
+/// `span_to_edition` gives any of those contexts another, the view's words are made afresh for
+/// this call, by the same conversion, and the kept ones are left as they are.
+pub fn view_tokens<'a, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
+    view: tt::TokenTreesView<'a>,
+    fragments: bool,
+    span_to_edition: &mut F,
+    copy: &'a mut parser::Input,
+) -> parser::Tokens<'a> {
+    let kept = view.tree_words(|tree| tree_words(tree, &mut *span_to_edition));
+    let (tokens, first_fragment_counts) =
+        match kept.editions().iter().all(|&(ctx, edition)| span_to_edition(ctx) == edition) {
+            true => {
+                let words = view.words(kept);
+                let tokens = match words.rest.len() - words.len == parser::Tokens::PAD {
+                    true => parser::Tokens::new(words.rest, true),
+                    false => {
+                        copy.clear();
+                        copy.extend_from_words(words.words());
+                        let copy: &'a parser::Input = copy;
+                        copy.tokens()
+                    }
+                };
+                (tokens, words.first_fragment_counts)
+            }
+            false => {
+                let made = tree_words(view.tree(), span_to_edition);
+                let words = view.words(&made);
+                copy.clear();
+                copy.extend_from_words(words.words());
+                let copy: &'a parser::Input = copy;
+                (copy.tokens(), words.first_fragment_counts)
+            }
+        };
+    let tokens = if fragments { tokens } else { tokens.ignoring_fragments() };
+    if first_fragment_counts { tokens } else { tokens.without_first_fragment() }
+}
+
+/// Where a whole tree's tokens' words are, recorded as [`tree_words`] converts it.
+struct Slots<'c> {
+    at: &'c mut [u32],
+    fragment_starts: &'c mut Vec<(u32, u32)>,
+    /// The slot of the token being converted.
+    slot: u32,
+    /// The slot of the invisible group that opened the fragment start waiting for a token.
+    origin: u32,
+}
+
+/// One conversion's state, fed one token at a time.
+struct Conversion<'c, 'f, const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized> {
+    keywords: &'static Keywords,
+    editions: Editions<'f, F>,
+    res: &'c mut parser::Input,
+    /// Where the fragment that was opened last starts, until its first token is pushed.
+    fragment_at: Option<usize>,
+    /// Whether the last token was the `'` of a lifetime, whose name comes next.
+    lifetime: bool,
+    slots: Option<Slots<'c>>,
+}
+
+impl<'c, 'f, const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>
+    Conversion<'c, 'f, FRAGMENTS, F>
+{
+    fn new(
+        span_to_edition: &'f mut F,
+        res: &'c mut parser::Input,
+        slots: Option<Slots<'c>>,
+    ) -> Self {
+        Conversion {
+            keywords: &*KEYWORDS,
+            editions: Editions::new(span_to_edition),
+            res,
+            fragment_at: None,
+            lifetime: false,
+            slots,
         }
-        if lifetime {
-            lifetime = false;
+    }
+
+    #[inline]
+    fn at_slot(&mut self, slot: u32) {
+        if let Some(slots) = &mut self.slots {
+            slots.at[slot as usize] = self.res.len() as u32;
+            slots.slot = slot;
+        }
+    }
+
+    /// Marks the token at `at` as a fragment's first, if one is waiting for it.
+    #[inline]
+    fn start_fragment(&mut self) {
+        if FRAGMENTS
+            && let Some(at) = self.fragment_at
+            && self.res.len() > at
+        {
+            self.res.mark_fragment_start(at);
+            if let Some(slots) = &mut self.slots {
+                slots.fragment_starts.push((at as u32, slots.origin));
+            }
+            self.fragment_at = None;
+        }
+    }
+
+    fn token(&mut self, token: FlatToken, ctx: SyntaxContext) {
+        self.start_fragment();
+        let res = &mut *self.res;
+        let editions = &mut self.editions;
+        if self.lifetime {
+            self.lifetime = false;
             match token {
                 FlatToken::Ident { .. } => res.push(LIFETIME_IDENT, editions.of(ctx)),
                 _ => panic!("Next token must be ident"),
@@ -85,7 +216,7 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
             return;
         }
         match token {
-            FlatToken::Punct { char: '\'', .. } => lifetime = true,
+            FlatToken::Punct { char: '\'', .. } => self.lifetime = true,
             FlatToken::Punct { char, spacing } => {
                 let kind = SyntaxKind::from_char(char)
                     .unwrap_or_else(|| panic!("{char:?} is not a valid punct"));
@@ -102,7 +233,7 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                     let kind = if is_lifetime(sym.as_str()) { LIFETIME_IDENT } else { IDENT };
                     res.push(kind, edition);
                 } else {
-                    match keywords.of(sym, edition) {
+                    match self.keywords.of(sym, edition) {
                         (kind, EOF) => res.push(kind, edition),
                         (_, contextual) => res.push_ident(contextual, edition),
                     }
@@ -126,8 +257,11 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                 tt::DelimiterKind::Brace => res.push(T!['{'], editions.of(ctx)),
                 tt::DelimiterKind::Bracket => res.push(T!['['], editions.of(ctx)),
                 tt::DelimiterKind::Invisible => {
-                    if FRAGMENTS && fragment_at.is_none() {
-                        fragment_at = Some(res.len());
+                    if FRAGMENTS && self.fragment_at.is_none() {
+                        self.fragment_at = Some(res.len());
+                        if let Some(slots) = &mut self.slots {
+                            slots.origin = slots.slot;
+                        }
                     }
                 }
             },
@@ -138,13 +272,13 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
                 tt::DelimiterKind::Invisible => (),
             },
         }
-    });
-    assert!(!lifetime, "Next token must be ident");
-    if FRAGMENTS
-        && let Some(at) = fragment_at
-        && res.len() > at
-    {
-        res.mark_fragment_start(at);
+    }
+
+    /// Ends the conversion, giving back the editions it was told.
+    fn finish(mut self) -> Editions<'f, F> {
+        assert!(!self.lifetime, "Next token must be ident");
+        self.start_fragment();
+        self.editions
     }
 }
 
@@ -213,6 +347,11 @@ impl<'f, F: FnMut(SyntaxContext) -> Edition + ?Sized> Editions<'f, F> {
         };
         self.last = (ctx, edition);
         edition
+    }
+
+    /// Each context asked about, with the edition it was given.
+    fn answers(&self) -> impl Iterator<Item = (SyntaxContext, Edition)> {
+        self.near[..self.len].iter().copied().chain(self.far.iter().map(|(&ctx, &e)| (ctx, e)))
     }
 }
 

@@ -39,8 +39,8 @@ use crate::{
 
 /// rustc's `check_mod_deathness` of every module.
 pub(super) fn report(k: &Crate<'_, '_, '_>, liveness: &Liveness) -> Vec<Found> {
-    let mut found = Vec::new();
-    let mut dead = Vec::new();
+    let mut found = Vec::new(); // alloc: the pass's output, once per crate
+    let mut dead = Vec::new(); // alloc: setup, one buffer reused for every module
     for module in 0..k.defs.modules.len() {
         if k.executable == Some(true) {
             let pre = &liveness.pre_deferred;
@@ -241,6 +241,7 @@ impl Report<'_, '_, '_, '_> {
         let defs = k.defs;
         let Some(first) = dead_codes.first() else { return };
         let Some(at) = defs[first.def].node else { return };
+        // alloc: the edge from here on: a lint that fires, its spans, text and notes.
         let spans: Vec<Span> = dead_codes.iter().filter_map(|it| self.ident_or_def_span(it.def)).collect();
         if spans.len() != dead_codes.len() {
             return;
@@ -252,13 +253,13 @@ impl Report<'_, '_, '_, '_> {
         let num = dead_codes.len();
         let names = || dead_codes.iter().map(|it| name(k, it.def));
         let message = match (num > 6, num) {
-            (true, _) => format!("multiple {descr}s are never {participle}"),
-            (false, 1) => format!("{descr} {} is never {participle}", symbol_list(names())),
-            (false, _) => format!("{descr}s {} are never {participle}", symbol_list(names())),
+            (true, _) => format!("multiple {descr}s are never {participle}"), // alloc: the edge
+            (false, 1) => format!("{descr} {} is never {participle}", symbol_list(names())), // alloc: the edge
+            (false, _) => format!("{descr}s {} are never {participle}", symbol_list(names())), // alloc: the edge
         };
-        let mut diag = Diag::lint(self.lint.name(), message, spans[0].clone());
+        let mut diag = Diag::lint(self.lint.name(), message, spans[0].clone()); // clone: the edge
         for span in &spans[1..] {
-            diag.primary(span.clone());
+            diag.primary(span.clone()); // clone: the edge
         }
         if self.lint == Lint::PubInBinary {
             diag.note(
@@ -283,12 +284,14 @@ impl Report<'_, '_, '_, '_> {
                 let fields = if num == 1 { "field" } else { "fields" };
                 if dead_codes.iter().all(|it| trailing.contains(&it.def)) {
                     let this = if num == 1 { "this" } else { "these" };
-                    diag.help(format!("consider removing {this} {fields}"));
+                    diag.help(format!("consider removing {this} {fields}")); // alloc: the edge
                 } else {
                     diag.multipart_suggestion(
+                        // alloc: the edge
                         format!(
                             "consider changing the {fields} to be of unit type to suppress this warning while preserving the field numbering, or remove the {fields}"
                         ),
+                        // clone: the edge, the suggestion's spans
                         spans.iter().map(|it| (it.clone(), "()".to_owned())).collect(),
                         Applicability::HasPlaceholders,
                     );
@@ -302,6 +305,7 @@ impl Report<'_, '_, '_, '_> {
                         let dead_descr = defs[item.def].kind.descr();
                         diag.span_note(
                             span,
+                            // alloc: the edge
                             format!(
                                 "it is impossible to refer to the {dead_descr} `{}` because it is shadowed by this enum variant with the same name",
                                 name(k, item.def)
@@ -318,8 +322,8 @@ impl Report<'_, '_, '_, '_> {
                 _ => self.ident_span(parent),
             };
             if let Some(span) = span {
-                let label = if num == 1 { descr.to_owned() } else { format!("{descr}s") };
-                diag.span_label(span, format!("{label} in this {parent_descr}"));
+                let label = if num == 1 { descr.to_owned() } else { format!("{descr}s") }; // alloc: the edge
+                diag.span_label(span, format!("{label} in this {parent_descr}")); // alloc: the edge
             }
         }
         let mut encl = parent.unwrap_or(first.def);
@@ -334,9 +338,11 @@ impl Report<'_, '_, '_, '_> {
             let encl_name = encl_name.as_str();
             let list = symbol_list(traits.iter().copied());
             let note = match traits.len() {
+                // alloc: the edge
                 1 => format!(
                     "`{encl_name}` has a derived impl for the trait {list}, but this is intentionally ignored during dead code analysis"
                 ),
+                // alloc: the edge
                 _ => format!(
                     "`{encl_name}` has derived impls for the traits {list}, but these are intentionally ignored during dead code analysis"
                 ),
@@ -374,8 +380,8 @@ impl Report<'_, '_, '_, '_> {
     fn ident_span(&self, def: DefIdx) -> Option<Span> {
         let cx = self.k.cx;
         let node = cx.syntax(self.k.defs[def].node?);
-        let name = ast::AnyHasName::cast(node.value.clone())?.name()?;
-        Some(cx.span(node.with_value(name.syntax().text_range())))
+        let name = ast::AnyHasName::cast(node.value)?.name()?;
+        Some(cx.span(InFile::new(node.file_id, name.syntax().text_range())))
     }
 
     /// rustc's `def_span`: of a variant or a field, all of it; of an item, its header.
@@ -399,7 +405,7 @@ fn name<'k>(k: &'k Crate<'_, '_, '_>, def: DefIdx) -> &'k str {
 /// rustc's `DiagSymbolList`: "`a`", "`a` and `b`", "`a`, `b`, and `c`".
 fn symbol_list<'s>(names: impl ExactSizeIterator<Item = &'s str>) -> String {
     let len = names.len();
-    let mut out = String::new();
+    let mut out = String::new(); // alloc: the edge, a lint's text
     for (at, name) in names.enumerate() {
         let sep = match (at, len) {
             (0, _) => "",

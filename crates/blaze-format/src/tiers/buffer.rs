@@ -15,8 +15,8 @@
 //! zstd. Cold: each column in its smallest codec ([`super::raw_cold`]), then zstd over the
 //! whole form with the schema's dictionary.
 
-use super::{Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed, put_varint, raw_cold};
-use crate::{ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of, open_as};
+use super::{Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed, raw_cold};
+use crate::{ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of, leb, open_as};
 
 const FORM_VERSION: u8 = 2;
 const WARM: u8 = 0;
@@ -39,6 +39,7 @@ pub fn columns_of<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<Vec<Wo
         }
     };
     let root = open_as::<R>(buffer, schema)?;
+    // alloc: the columns of a buffer moved to a tier, once a buffer
     let mut found = Vec::new();
     R::columns(bytes_of(root), buffer, &mut found);
     Ok(merged(found))
@@ -76,14 +77,15 @@ fn encode(buffer: &[u8], tables: &[WordTable], tier: u8) -> Vec<u8> {
     let table_bytes: usize = tables.iter().map(|table| end(table) - table.at).sum();
     let mut out = Vec::with_capacity(buffer.len() + 32 + 12 * tables.len());
     out.extend([FORM_VERSION, tier]);
-    put_varint(&mut out, buffer.len() as u64);
-    put_varint(&mut out, (buffer.len() - table_bytes) as u64);
+    leb::write_u64(&mut out, buffer.len() as u64);
+    leb::write_u64(&mut out, (buffer.len() - table_bytes) as u64);
     let mut last = 0;
     for table in tables {
         out.extend_from_slice(&buffer[last..table.at]);
         last = end(table);
     }
     out.extend_from_slice(&buffer[last..]);
+    // alloc: buffers reused over the buffer's tables, once a buffer encoded
     let (mut last, mut words, mut values, mut column) = (0, Vec::new(), Vec::new(), Vec::new());
     for table in tables {
         let (rows, stride) = shape(table);
@@ -93,9 +95,9 @@ fn encode(buffer: &[u8], tables: &[WordTable], tier: u8) -> Vec<u8> {
                 .chunks_exact(4)
                 .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])),
         );
-        put_varint(&mut out, (table.at - last) as u64);
-        put_varint(&mut out, rows as u64);
-        put_varint(&mut out, stride as u64);
+        leb::write_u64(&mut out, (table.at - last) as u64);
+        leb::write_u64(&mut out, rows as u64);
+        leb::write_u64(&mut out, stride as u64);
         for field in 0..stride {
             values.clear();
             values.extend(words[field..].iter().step_by(stride));
@@ -111,7 +113,7 @@ fn encode(buffer: &[u8], tables: &[WordTable], tier: u8) -> Vec<u8> {
                     &cold
                 }
             };
-            put_varint(&mut out, encoded.len() as u64);
+            leb::write_u64(&mut out, encoded.len() as u64);
             out.extend_from_slice(encoded);
         }
         last = end(table);
@@ -138,6 +140,7 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
     bytes.at = rest_end;
     let len = len as usize;
     let mut out = Vec::with_capacity(len.min(form.len().saturating_mul(64)));
+    // alloc: once a buffer decoded from its tier
     let (mut taken, mut fields) = (0, Vec::new());
     while bytes.at < form.len() {
         let gap = count(&mut bytes)?;

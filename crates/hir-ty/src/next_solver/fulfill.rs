@@ -122,11 +122,20 @@ pub struct FulfillmentCtxt<'db> {
     /// gets rolled back. Because of this we explicitly check that we only
     /// use the context in exactly this snapshot.
     usable_in_snapshot: usize,
+
+    /// `InferCtxt::state_changes` when a round last evaluated every pending obligation and
+    /// changed nothing, with nothing registered since. Each obligation then gives the answer it
+    /// gave in that round, so another round would change nothing either.
+    fixpoint: Option<u64>,
 }
 
 impl<'db> FulfillmentCtxt<'db> {
     pub fn new(infcx: &InferCtxt<'db>) -> FulfillmentCtxt<'db> {
-        FulfillmentCtxt { pending: Default::default(), usable_in_snapshot: infcx.num_open_snapshots() }
+        FulfillmentCtxt {
+            pending: Default::default(),
+            usable_in_snapshot: infcx.num_open_snapshots(),
+            fixpoint: None,
+        }
     }
 }
 
@@ -140,6 +149,7 @@ impl<'db> FulfillmentCtxt<'db> {
         obligation: PredicateObligation<'db>,
     ) {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
+        self.fixpoint = None;
         let delegate = <&SolverContext<'db>>::from(infcx);
         match compute_goal_fast_path(delegate, obligation.as_goal(), obligation.cause.span()) {
             Some(GoalEvaluation { certainty: Certainty::Yes, .. }) => {}
@@ -180,12 +190,17 @@ impl<'db> FulfillmentCtxt<'db> {
         infcx: &InferCtxt<'db>,
     ) -> Vec<NextSolverError<'db>> {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
+        if self.fixpoint == Some(infcx.state_changes()) {
+            return Vec::new(); // alloc: empty
+        }
+        self.fixpoint = None;
         let delegate = <&SolverContext<'db>>::from(infcx);
         let recursion_limit = infcx.interner.recursion_limit();
         let mut errors = Vec::new(); // alloc: empty unless a goal fails
         let mut overflowed = false;
         loop {
             let mut any_changed = false;
+            let round_start = infcx.state_changes();
 
             self.pending.retain(|obligation, opt_stalled_on| {
                 if overflowed {
@@ -247,6 +262,9 @@ impl<'db> FulfillmentCtxt<'db> {
             });
 
             if overflowed || !any_changed {
+                if !overflowed && infcx.state_changes() == round_start {
+                    self.fixpoint = Some(round_start);
+                }
                 break;
             }
         }

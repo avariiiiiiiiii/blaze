@@ -16,8 +16,8 @@ fn a_start_that_never_listens_names_the_socket() {
 
 #[test]
 fn the_status_for_people() {
-    let status = Status { requests: vec![3, 7], views: 2, memory_bytes: 3 << 29, budget_bytes: 8 << 30 };
-    assert_eq!(status_lines(&status), "requests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\n");
-    let idle = Status { requests: Vec::new(), views: 0, memory_bytes: 512, budget_bytes: 1536 };
-    assert_eq!(status_lines(&idle), "requests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\n");
+    let status = Status { pid: 41, requests: vec![3, 7], views: 2, memory_bytes: 3 << 29, budget_bytes: 8 << 30 };
+    assert_eq!(status_lines(&status), "pid: 41\nrequests: 2 (3, 7)\nviews: 2\nmemory: 1.5 GiB of 8.0 GiB\n");
+    let idle = Status { pid: 7, requests: Vec::new(), views: 0, memory_bytes: 512, budget_bytes: 1536 };
+    assert_eq!(status_lines(&idle), "pid: 7\nrequests: 0\nviews: 0\nmemory: 512 B of 1.5 KiB\n");
 }

@@ -30,8 +30,8 @@ use hir_expand::proc_macro::{
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, FxHashSet, RootDatabase,
     base_db::{
-        Crate, CrateGraphBuilder, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError,
-        SourceDatabase, SourceRoot, SourceRootId,
+        Crate, CrateGraphBuilder, Db, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError,
+        SourceRoot, SourceRootId,
         salsa::{Database as _, Durability, Setter},
     },
     prime_caches,
@@ -101,8 +101,7 @@ pub fn load_workspace(
     extra_env: &FxHashMap<String, Option<String>>,
     load_config: &LoadCargoConfig,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
-    let lru_cap = std::env::var("RA_LRU_CAP").ok().and_then(|it| it.parse::<u16>().ok());
-    let mut db = RootDatabase::new(lru_cap);
+    let mut db = Db::new();
 
     let (vfs, proc_macro_server) = load_workspace_into_db(ws, extra_env, load_config, &mut db)?;
 
@@ -349,7 +348,6 @@ impl Loaded {
             let [outside_server, outside_listed_server] =
                 [&self.unsandboxed_servers[0], &self.unsandboxed_servers[1]].map(running);
             let mut refused = Vec::new();
-            let mut const_macros = false;
             let loaded: Vec<_> = proc_macros
                 .into_iter()
                 .map(|(crate_id, path)| {
@@ -372,7 +370,6 @@ impl Loaded {
                                             .into(),
                                     )
                                 })?;
-                                const_macros = true;
                                 let edition = crate_graph[crate_id].basic.edition;
                                 return Ok(ide_db::const_macro::load(file, &text, edition));
                             }
@@ -403,9 +400,6 @@ impl Loaded {
             if !refused.is_empty() {
                 refused.sort();
                 anyhow::bail!("{}", refused.join("\n"));
-            }
-            if const_macros {
-                ide_db::const_macro::enable(&*db);
             }
             loaded.into_iter().collect()
         };
@@ -913,7 +907,7 @@ struct Expander(proc_macro_api::ProcMacro);
 impl ProcMacroExpander for Expander {
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         env: &Env,
@@ -947,7 +941,7 @@ impl ProcMacroExpander for Expander {
 /// What a proc macro asks of the database while it expands, answered as the server's
 /// callback is: the one place that answers it, whichever server or runtime asked. It counts
 /// as having asked ([`asked`]).
-pub fn answer(db: &dyn SourceDatabase, req: SubRequest) -> SubResponse {
+pub fn answer(db: &Db, req: SubRequest) -> SubResponse {
     wrap::ask();
     let answered = || -> Result<SubResponse, std::convert::Infallible> {
         match req {
@@ -1112,7 +1106,7 @@ pub fn answer(db: &dyn SourceDatabase, req: SubRequest) -> SubResponse {
 }
 
 fn resolve_sub_span(
-    db: &dyn SourceDatabase,
+    db: &Db,
     file_id: u32,
     ast_id: u32,
     range: TextRange,

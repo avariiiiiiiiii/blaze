@@ -532,6 +532,7 @@ impl<A: AllowedOptions> syn::parse::Parse for Options<A> {
             } else {
                 return Err(syn::Error::new(
                     ident.span(),
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     format!("unrecognized option `{ident}`"),
                 ));
             }

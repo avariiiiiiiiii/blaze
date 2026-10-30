@@ -6,7 +6,7 @@ use std::{
     iter,
 };
 
-use base_db::target::TargetLoadError;
+use base_db::{Db, target::TargetLoadError};
 use either::Either;
 use hir_def::{
     ExpressionStoreOwnerId, FieldId, FunctionId, GenericParamId, LocalFieldId, StaticId, TraitId,
@@ -134,7 +134,7 @@ impl<'db> Operand {
     }
 
     pub fn from_fn(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         func_id: hir_def::FunctionId,
         generic_args: GenericArgs<'db>,
     ) -> Operand {
@@ -2213,7 +2213,7 @@ impl From<LayoutError> for MirLowerError<'_> {
 /// Whether a future of this type, which the `async` block `coroutine` gives, is one that owns
 /// what its `async` closure captured.
 pub fn is_by_move_coroutine<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
     args: CoroutineArgs<DbInterner<'db>>,
 ) -> bool {

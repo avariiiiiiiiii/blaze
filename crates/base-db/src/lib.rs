@@ -1,6 +1,5 @@
-//! This crate defines the basic database trait for interacting with source code using [`salsa`].
-//!
-//! The concrete implementation DB is defined by ide.
+//! The front end's one database, [`Db`], and the [`salsa`] inputs it holds: files, source
+//! roots and the crate graph.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![forbid(unsafe_code)]
@@ -9,10 +8,10 @@
 extern crate rustc_driver as _;
 
 pub use salsa;
-use span::TextSize;
 
 mod change;
 mod content;
+mod db;
 mod editioned_file_id;
 mod files;
 mod input;
@@ -34,6 +33,7 @@ use std::{
 pub use crate::{
     change::FileChange,
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
+    db::{Db, RunOrder, run_on_pool, set_run_order},
     editioned_file_id::EditionedFileId,
     files::Files,
     input::{
@@ -126,12 +126,12 @@ impl ProcessEnv {
 }
 
 /// The variable `key` of the process the build is for.
-pub fn process_env_var(db: &dyn salsa::Database, key: &str) -> Option<String> {
+pub fn process_env_var(db: &Db, key: &str) -> Option<String> {
     ProcessEnv::try_get(db)?.vars(db).get(key)
 }
 
 /// Has builds from here on be for a process with the variables `vars`.
-pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
+pub fn set_process_env(db: &mut Db, vars: Env) {
     let content = InputId(vars.content());
     match ProcessEnv::try_get(&*db) {
         Some(env) => {
@@ -146,7 +146,7 @@ pub fn set_process_env(db: &mut dyn salsa::Database, vars: Env) {
     }
 }
 
-/// A file's text. Set only through [`Files`] (and the [`SourceDatabase`] methods that call it),
+/// A file's text. Set only through [`Files`] (and the [`Db`] methods that call it),
 /// which keeps [`FileText::content`] the content ID of the text and its appended module.
 #[salsa::input(debug)]
 pub struct FileText {
@@ -233,6 +233,14 @@ impl FileText {
     }
 }
 
+/// Where the lines of a file's text are ([`span::LineIndex`]): made the first time a
+/// diagnostic, `line!`/`column!`, a caller location, a proc macro's `Span::line` or debug info
+/// asks for a line or a column of the text, once per text, and never on load.
+#[salsa::tracked(returns(ref))]
+pub fn line_index(db: &Db, text: FileText) -> span::LineIndex {
+    span::LineIndex::new(text.text(db))
+}
+
 /// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
 #[salsa::input(debug)]
 pub struct IncludedFile {
@@ -293,6 +301,7 @@ pub struct SourceRootInput {
 
 impl SourceRootInput {
     pub fn source_root<Db: ?Sized + salsa::Database>(self, db: &Db) -> Arc<SourceRoot> {
+        // clone: the owned copy this API hands out; a reader that only looks uses `source_root_ref`.
         self.source_root_field(db).clone()
     }
 
@@ -304,174 +313,6 @@ impl SourceRootInput {
 
     pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
-    }
-}
-
-#[salsa::db]
-pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
-    /// Text of the file.
-    fn file_text(&self, file_id: vfs::FileId) -> FileText;
-
-    fn set_file_text(&mut self, file_id: vfs::FileId, text: &str);
-
-    /// Whether [`SourceDatabase::file_text`] has the file: one that is not UTF-8 has no text.
-    fn has_file_text(&self, _file_id: vfs::FileId) -> bool {
-        true
-    }
-
-    fn set_file_text_with_durability(
-        &mut self,
-        file_id: vfs::FileId,
-        text: &str,
-        durability: Durability,
-    );
-
-    /// Contents of the source root.
-    fn source_root(&self, id: SourceRootId) -> SourceRootInput;
-
-    fn file_source_root(&self, id: vfs::FileId) -> FileSourceRootInput;
-
-    fn set_file_source_root_with_durability(
-        &mut self,
-        id: vfs::FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    );
-
-    /// Source root of the file.
-    fn set_source_root_with_durability(
-        &mut self,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    );
-
-    /// See [`Files::set_appended_root_module`].
-    fn set_appended_root_module(
-        &mut self,
-        file_id: vfs::FileId,
-        module: Option<&'static str>,
-        durability: Durability,
-    );
-
-    /// Sets the inputs of one view's files, writing only those that changed: see
-    /// [`Files::set_view_root`].
-    fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError>;
-
-    /// The file `path` names, relative to its anchor's directory: in the anchor's source root,
-    /// else in whichever source root names it (a `#[path]` module or an `include!` outside
-    /// its package, as rustc reads any path). Either way it is recorded as a read of the
-    /// source root it is found in (or, found in none, of the set of paths that would name it,
-    /// [`NAMED_PATHS_DOMAIN`]), so an edit there runs the reader again. Nothing is read from
-    /// disk.
-    fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
-        let root = self.file_source_root(path.anchor).source_root_id(self);
-        let root = self.source_root(root).source_root_ref(self);
-        if let Some(file) = root.resolve_path(path) {
-            return Some(file);
-        }
-        let mut target = root.path_for_file(&path.anchor)?.clone();
-        target.pop();
-        named::resolve(self, &target.join(path.path)?)
-    }
-
-    /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,
-    /// as `krate` reads it.
-    fn included_file(&self, _krate: Crate, _path: AnchoredPath<'_>) -> Option<IncludedFile> {
-        None
-    }
-
-    /// Notes that `include!` or a module declaration names a file `resolve_path` has nothing
-    /// for: a file that is not source by its extension, or one outside its package, which the
-    /// VFS does not load until it is asked to. `krate` is the crate whose expansion or module
-    /// tree names it.
-    fn include_source(&self, _path: AnchoredPath<'_>, _krate: Crate) {}
-
-    /// Notes that `env!` or `option_env!` asked for the variable `key` in `krate`.
-    fn env_is_read(&self, _krate: Crate, _key: &str) {}
-
-    /// Notes that `env!` in `krate` found the variable `key` unset, which rustc turns the
-    /// crate down for.
-    fn env_is_unset(&self, _krate: Crate, _key: &str) {}
-
-    #[doc(hidden)]
-    fn crates_map(&self) -> Arc<CratesMap>;
-
-    /// Runs `task(db, i)` for every `i` in `0..count`, and returns once each has run: the
-    /// tasks of a round of macro expansion, or the def maps of a crate's dependencies. Each
-    /// task asks queries and nothing else, so neither the order nor the threads they run on
-    /// changes a result, and the caller reads what they computed afterwards in its own order.
-    ///
-    /// The database runs them as plane tasks on the one worker pool, each reading this database
-    /// by reference, and the calling thread pump-waits for them (docs/v2/plan/lanes/db.md, "One
-    /// database, shared by every thread"; #1301): no handle per thread, no thread of its own.
-    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync));
-
-    fn nonce_and_revision(&self) -> (Nonce, salsa::Revision);
-
-    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()>;
-}
-
-/// Tells salsa which plane task a thread runs, from the pool's pump
-/// ([`blaze_graph::pump::depth`]), so a task that would wait on one below it on its own thread
-/// unwinds with [`salsa::Cancelled::WouldWaitOnItself`] (which [`run_on_pool`] runs again)
-/// instead of waiting forever. For each database whose [`SourceDatabase::run_all`] is
-/// [`run_on_pool`]; once per process, so a second call does nothing.
-pub fn install_plane_hooks() {
-    static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| salsa::set_task_depth(blaze_graph::pump::depth));
-}
-
-/// [`SourceDatabase::run_all`] on `pool`: each task is a job near this thread's group, reading
-/// `db` by reference, and the calling thread pump-waits for the batch ([`Pool::scope`]).
-///
-/// A task that unwinds with [`salsa::Cancelled::WouldWaitOnItself`] asked for a query that a
-/// task below it on its thread runs, which can't end before it does; it runs again in another
-/// round, once every task of this one has ended. A job's completion can't reach its scope, so
-/// the round is the way back. The first other panic, salsa's other cancellations included,
-/// goes on from here once its round is over, and nothing is run again after it.
-///
-/// [`Pool::scope`]: blaze_graph::pool::Pool::scope
-pub fn run_on_pool(
-    db: &dyn SourceDatabase,
-    pool: &blaze_graph::pool::Pool,
-    count: usize,
-    task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync),
-) {
-    let near = blaze_graph::pool::group();
-    let panicked = std::sync::Mutex::new(None);
-    let again = std::sync::Mutex::new(Vec::new());
-    let mut round: Vec<usize> = (0..count).collect();
-    while !round.is_empty() {
-        pool.scope(|scope| {
-            for &at in &round {
-                let (panicked, again) = (&panicked, &again);
-                scope.submit(
-                    near,
-                    move || task(db, at),
-                    move |ran| {
-                        let Err(panic) = ran else { return };
-                        let waited_on_itself = matches!(
-                            panic.downcast_ref::<salsa::Cancelled>(),
-                            Some(salsa::Cancelled::WouldWaitOnItself)
-                        );
-                        if waited_on_itself {
-                            again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
-                        } else {
-                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
-                            first.get_or_insert(panic);
-                        }
-                    },
-                );
-            }
-        });
-        round = std::mem::take(&mut *again.lock().unwrap_or_else(|it| it.into_inner()));
-        if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
-            break;
-        }
-    }
-    if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-        panic::resume_unwind(panic);
     }
 }
 
@@ -548,6 +389,7 @@ impl CrateWorkspaceData {
         let mut hasher = Hasher::new(CrateWorkspaceData::DOMAIN);
         match &self.target {
             Ok(target) => hasher.update(&[0]).id(&target.content()),
+            // alloc: the error's text, once per workspace's content ID (setup, an error path).
             Err(error) => hasher.update(&[1]).part(error.to_string().as_bytes()),
         };
         content::opt(&mut hasher, self.toolchain.as_ref().map(Version::to_string).as_deref());
@@ -569,7 +411,7 @@ impl CrateWorkspaceData {
     }
 }
 
-pub fn toolchain_channel(db: &dyn salsa::Database, krate: Crate) -> Option<ReleaseChannel> {
+pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
@@ -584,7 +426,7 @@ struct AllCrates {
 /// The crate graph's content ID is of its crates' content IDs, in topological order.
 pub const CRATE_GRAPH_DOMAIN: &str = "blaze v2 crate graph 1";
 
-fn crate_graph_content(db: &dyn salsa::Database, crates: &[Crate]) -> ContentId {
+fn crate_graph_content(db: &Db, crates: &[Crate]) -> ContentId {
     let mut hasher = Hasher::new(CRATE_GRAPH_DOMAIN);
     content::len(&mut hasher, crates.len());
     for krate in crates {
@@ -594,7 +436,7 @@ fn crate_graph_content(db: &dyn salsa::Database, crates: &[Crate]) -> ContentId 
 }
 
 /// The content ID of [`all_crates`].
-pub fn all_crates_content(db: &dyn salsa::Database) -> ContentId {
+pub fn all_crates_content(db: &Db) -> ContentId {
     match AllCrates::try_get(db) {
         Some(all) => all.content(db).id(),
         None => crate_graph_content(db, &[]),
@@ -602,7 +444,7 @@ pub fn all_crates_content(db: &dyn salsa::Database) -> ContentId {
 }
 
 /// Sets the crate graph's content ID from its crates' as they are.
-pub(crate) fn refresh_crate_graph_content(db: &mut dyn salsa::Database) {
+pub(crate) fn refresh_crate_graph_content(db: &mut Db) {
     let Some(all) = AllCrates::try_get(&*db) else { return };
     let content = InputId(crate_graph_content(&*db, &all.crates(&*db)));
     if all.content(&*db) != content {
@@ -611,10 +453,11 @@ pub(crate) fn refresh_crate_graph_content(db: &mut dyn salsa::Database) {
 }
 
 pub fn set_all_crates_with_durability(
-    db: &mut dyn salsa::Database,
+    db: &mut Db,
     crates: impl IntoIterator<Item = Crate>,
     durability: Durability,
 ) {
+    // alloc: the crate graph's list, once per set (setup).
     let crates: std::sync::Arc<[Crate]> = crates.into_iter().collect();
     let content = InputId(crate_graph_content(&*db, &crates));
     match AllCrates::try_get(&*db) {
@@ -631,7 +474,7 @@ pub fn set_all_crates_with_durability(
 /// Returns the crates in topological order.
 ///
 /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-pub fn all_crates(db: &dyn salsa::Database) -> std::sync::Arc<[Crate]> {
+pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
     AllCrates::try_get(db).map_or(std::sync::Arc::default(), |all_crates| all_crates.crates(db))
 }
 
@@ -644,31 +487,24 @@ pub struct InternedSourceRootId {
 }
 
 /// Crates whose root file is in `id`.
-pub fn source_root_crates(db: &dyn SourceDatabase, id: SourceRootId) -> &[Crate] {
+pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     #[salsa::tracked(returns(deref))]
-    pub fn source_root_crates<'db>(
-        db: &'db dyn SourceDatabase,
-        id: InternedSourceRootId<'db>,
-    ) -> Box<[Crate]> {
+    pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
         let crates = AllCrates::get(db).crates(db);
-        let id = id.id(db);
         crates
             .iter()
             .copied()
             .filter(|&krate| {
                 let root_file = krate.data(db).root_file_id;
-                db.file_source_root(root_file).source_root_id(db) == id
+                db.source_root(db.file_source_root(root_file).source_root_id(db)) == root
             })
-            .collect()
+            .collect() // alloc: the memo's value, made again only when the crate graph changes.
     }
-    source_root_crates(db, InternedSourceRootId::new(db, id))
+    source_root_crates(db, db.source_root(id))
 }
 
-pub fn relevant_crates(db: &dyn SourceDatabase, file_id: FileId) -> &[Crate] {
-    let _p = tracing::info_span!("relevant_crates").entered();
-
-    let source_root = db.file_source_root(file_id);
-    source_root_crates(db, source_root.source_root_id(db))
+pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {
+    source_root_crates(db, db.file_source_root(file_id).source_root_id(db))
 }
 
 #[must_use]
@@ -686,6 +522,7 @@ impl DbPanicContext {
         #[expect(clippy::print_stderr, reason = "already panicking anyway")]
         fn set_hook() {
             let default_hook = panic::take_hook();
+            // alloc: the panic hook, set once per process.
             panic::set_hook(Box::new(move |panic_info| {
                 default_hook(panic_info);
                 if let Some(backtrace) = salsa::Backtrace::capture() {
@@ -711,6 +548,7 @@ impl DbPanicContext {
 
     fn with_ctx(f: impl FnOnce(&mut Vec<String>)) {
         thread_local! {
+            // alloc: none: a `const` empty `Vec`.
             static CTX: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
         }
         CTX.with(|ctx| f(&mut ctx.borrow_mut()));

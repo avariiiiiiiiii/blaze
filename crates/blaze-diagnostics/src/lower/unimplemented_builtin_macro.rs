@@ -21,5 +21,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedBuiltinMacro) -> Vec<
         format!("blaze does not expand the built-in macro `{name}` yet"),
         cx.span_of(d.node),
     );
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }

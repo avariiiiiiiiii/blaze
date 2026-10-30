@@ -12,9 +12,10 @@ use crate::{
     ProcMacroKind,
     legacy_protocol::msg::{FlatTree, Message, PanicMessage, ServerConfig},
     transport::postcard,
+    wire::ExpandMacroWire,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SubRequest {
     FilePath {
         file_id: u32,
@@ -66,7 +67,7 @@ pub enum SubRequest {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SubResponse {
     FilePathResult {
         name: String,
@@ -103,7 +104,7 @@ pub enum SubResponse {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParentSpan {
     pub file_id: u32,
     pub ast_id: u32,
@@ -112,7 +113,7 @@ pub struct ParentSpan {
     pub ctx: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpanJoin {
     pub ast_id: u32,
     pub start: u32,
@@ -120,7 +121,7 @@ pub struct SpanJoin {
     pub ctx: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BidirectionalMessage {
     Request(Request),
     Response(Response),
@@ -128,31 +129,35 @@ pub enum BidirectionalMessage {
     SubResponse(SubResponse),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Request {
     ListMacros(ListMacros),
     ExpandMacro(Box<ExpandMacro>),
     ApiVersionCheck(ApiVersionCheck),
     SetConfig(ServerConfig),
+    /// Since [`crate::version::WIRE_TREES`].
+    ExpandMacroWire(Box<ExpandMacroWire>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Response {
     ListMacros(Result<Vec<(String, ProcMacroKind)>, String>),
     ApiVersionCheck(u32),
     SetConfig(ServerConfig),
     ExpandMacro(Result<ExpandMacroResponse, PanicMessage>),
+    /// Since [`crate::version::WIRE_TREES`].
+    ExpandMacroWire(Result<ExpandMacroWireResponse, PanicMessage>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ListMacros {
     pub dylib_path: Utf8PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersionCheck {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacro {
     pub lib: Utf8PathBuf,
     pub env: Vec<(String, String)>,
@@ -160,7 +165,7 @@ pub struct ExpandMacro {
     pub data: ExpandMacroData,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacroResponse {
     pub tree: FlatTree,
     pub span_data_table: Vec<u32>,
@@ -168,7 +173,16 @@ pub struct ExpandMacroResponse {
     pub tracked_paths: FxHashSet<Box<str>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// The answer to an `ExpandMacroWire`: the tree as `write_wire` writes it, and what the macro
+/// tracked.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpandMacroWireResponse {
+    pub tree: Vec<u8>,
+    pub tracked_env_vars: FxHashMap<Box<str>, Option<Box<str>>>,
+    pub tracked_paths: FxHashSet<Box<str>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacroData {
     pub macro_body: FlatTree,
     pub macro_name: String,
@@ -179,7 +193,7 @@ pub struct ExpandMacroData {
     pub span_data_table: Vec<u32>,
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpnGlobals {
     pub def_site: usize,
     pub call_site: usize,

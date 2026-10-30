@@ -14,6 +14,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{AdtId, HasModule as _, Lookup, VariantId, nameres::crate_def_map, src::HasSource as _};
 use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr};
@@ -50,7 +51,7 @@ enum Dtor {
 
 /// The significant destructors of a body's types, each ADT's read once.
 pub(super) struct SignificantDrops<'s, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     solver: &'s Solver<'db>,
     /// The crate's `#![recursion_limit]` (rustc's `tcx.recursion_limit()`).
     limit: usize,
@@ -296,7 +297,7 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
 /// The crate's name and the names of the modules down to the ADT and its own, when each is
 /// a name in the type namespace (rustc's `DefPathData::TypeNs`): none for an ADT in a block.
 /// Only those of the crates `true_significant_drop_ty` knows are read.
-fn def_path(db: &dyn HirDatabase, adt: AdtId) -> Option<Vec<String>> {
+fn def_path(db: &Db, adt: AdtId) -> Option<Vec<String>> {
     let adt = hir::Adt::from(adt);
     let module = adt.module(db);
     let krate = module.krate(db).display_name(db)?.crate_name().to_string();
@@ -319,7 +320,7 @@ fn def_path(db: &dyn HirDatabase, adt: AdtId) -> Option<Vec<String>> {
 }
 
 /// Whether the ADT is `#[rustc_insignificant_dtor]`, its `cfg_attr`s expanded.
-fn insignificant_dtor(db: &dyn HirDatabase, adt: AdtId) -> bool {
+fn insignificant_dtor(db: &Db, adt: AdtId) -> bool {
     let attrs: Vec<ast::Attr> = match adt {
         AdtId::StructId(it) => it.lookup(db).source(db).value.attrs().collect(),
         AdtId::EnumId(it) => it.lookup(db).source(db).value.attrs().collect(),

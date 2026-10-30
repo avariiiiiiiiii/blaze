@@ -32,6 +32,7 @@ mod recursion;
 mod types;
 mod unsafety;
 
+use base_db::Db;
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::{DefWithBody, InFile, db::HirDatabase};
@@ -133,7 +134,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         Some(BodyCx { cx, owner, body, source_map, infer, tainted, mir_tainted, elaborated: false, exprs })
     }
 
-    pub(crate) fn db(&self) -> &'db dyn HirDatabase {
+    pub(crate) fn db(&self) -> &'db Db {
         self.cx.db
     }
 
@@ -338,7 +339,7 @@ fn taints(diagnostic: &InferenceDiagnostic) -> bool {
 /// resolve or expand (`DummyResult`, `DummyExpander`), and a `break` or `continue` destination
 /// of `LoopIdError::UnresolvedLabel` (E0426, E0767). A `break` outside a loop (E0267, E0268) is
 /// inference's.
-fn lowering_failed(db: &dyn HirDatabase, source_map: &BodySourceMap) -> bool {
+fn lowering_failed(db: &Db, source_map: &BodySourceMap) -> bool {
     let errors = source_map.diagnostics().iter().any(|it| {
         matches!(
             it,
@@ -371,11 +372,11 @@ fn child_exprs(store: &ExpressionStore, expr: ExprId, out: &mut Vec<ExprId>) {
             for statement in statements {
                 match statement {
                     Statement::Let { pat: p, initializer, else_branch, .. } => {
-                        out.extend(*initializer);
-                        pat(*p, out);
-                        out.extend(*else_branch);
+                        out.extend(initializer);
+                        pat(p, out);
+                        out.extend(else_branch);
                     }
-                    Statement::Expr { expr, .. } => out.push(*expr),
+                    Statement::Expr { expr, .. } => out.push(expr),
                     Statement::Item(_) => {}
                 }
             }
@@ -431,7 +432,7 @@ fn body_owners(cx: &Cx<'_, '_>) -> Vec<DefWithBodyId> {
     owners.into_iter().map(|(.., owner)| owner).collect()
 }
 
-fn owner_node(db: &dyn HirDatabase, owner: DefWithBodyId) -> InFile<SyntaxNodePtr> {
+fn owner_node(db: &Db, owner: DefWithBodyId) -> InFile<SyntaxNodePtr> {
     match owner {
         DefWithBodyId::FunctionId(it) => it.lookup(db).ast_ptr(db).map(|it| it.syntax_node_ptr()),
         DefWithBodyId::ConstId(it) => it.lookup(db).ast_ptr(db).map(|it| it.syntax_node_ptr()),
@@ -624,14 +625,14 @@ impl Late<'_, '_, '_> {
                                 all[usize::from(i)].check_local(b, expr, index, self.out);
                             }
                             if let Some(it) = initializer {
-                                self.expr(*it);
+                                self.expr(it);
                             }
-                            self.pat(*pat);
+                            self.pat(pat);
                             if let Some(it) = else_branch {
-                                self.expr(*it);
+                                self.expr(it);
                             }
                         }
-                        Statement::Expr { expr, .. } => self.expr(*expr),
+                        Statement::Expr { expr, .. } => self.expr(expr),
                         Statement::Item(_) => {}
                     }
                 }

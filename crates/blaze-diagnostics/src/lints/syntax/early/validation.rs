@@ -22,7 +22,7 @@
 //! (`visit_generic_param`) (MIT or Apache-2.0).
 
 mod parser;
-mod pretty;
+pub(crate) mod pretty;
 
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};

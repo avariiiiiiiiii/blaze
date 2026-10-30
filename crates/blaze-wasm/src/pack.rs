@@ -11,8 +11,8 @@ use hir_expand::proc_macro::{
     ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacrosBuilder,
 };
 use ide_db::base_db::{
-    CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, LangCrateOrigin, SourceDatabase, SourceRoot, TargetKind,
+    CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
+    DependencyBuilder, Env, LangCrateOrigin, SourceRoot, TargetKind,
     target::{Arch, TargetData},
 };
 use intern::Symbol;
@@ -133,7 +133,7 @@ struct Replay {
 impl ProcMacroExpander for Replay {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         _: &Env,

@@ -9,7 +9,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GENERIC_READ, GENERIC_WRITE},
+    Foundation::{GENERIC_READ, GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
         FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_END_OF_FILE_INFO,
@@ -25,7 +25,6 @@ use windows_sys::Win32::{
             FSCTL_GET_INTEGRITY_INFORMATION, FSCTL_GET_INTEGRITY_INFORMATION_BUFFER,
             FSCTL_SET_INTEGRITY_INFORMATION, FSCTL_SET_INTEGRITY_INFORMATION_BUFFER,
         },
-        Memory::{CreateFileMappingW, FILE_MAP_READ, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile},
         SystemServices::FILE_SUPPORTS_BLOCK_REFCOUNTING,
     },
 };
@@ -46,17 +45,15 @@ pub(super) enum Access {
     WriteAt,
 }
 
-/// `path` opened for the port's overlapped requests.
-pub(super) fn open(path: &Path, access: Access) -> io::Result<OwnedHandle> {
-    if access == Access::Append {
-        crate::fs::make_parent(path)?;
-    }
+/// The file at `wide` (NUL-terminated, as [`sys::Paths`] makes it) opened for the port's
+/// overlapped requests. The error is the system's, unnamed: the caller names the file.
+pub(super) fn open(wide: &[u16], access: Access) -> io::Result<OwnedHandle> {
+    debug_assert_eq!(wide.last(), Some(&0));
     let (rights, disposition) = match access {
         Access::Read => (GENERIC_READ, OPEN_EXISTING),
         Access::Append => (FILE_APPEND_DATA, OPEN_ALWAYS),
         Access::WriteAt => (GENERIC_WRITE, OPEN_EXISTING),
     };
-    let wide = sys::path(path)?;
     // SAFETY: a NUL-terminated path; no security attributes or template.
     let handle = unsafe {
         CreateFileW(
@@ -69,13 +66,14 @@ pub(super) fn open(path: &Path, access: Access) -> io::Result<OwnedHandle> {
             std::ptr::null_mut(),
         )
     };
-    sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+    sys::owned(handle)
 }
 
-pub(super) fn size(handle: &OwnedHandle) -> io::Result<u64> {
+/// The length of the file open as `handle`.
+pub(super) fn size(handle: HANDLE) -> io::Result<u64> {
     let mut size = 0i64;
-    // SAFETY: an open handle and an `i64` to write.
-    sys::check(unsafe { GetFileSizeEx(handle.as_raw_handle(), &mut size) })?;
+    // SAFETY: an open handle (the caller's) and an `i64` to write.
+    sys::check(unsafe { GetFileSizeEx(handle, &mut size) })?;
     Ok(size as u64)
 }
 
@@ -242,7 +240,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
             ),
         ));
     }
-    let len = size(&source)?;
+    let len = size(source.as_raw_handle())?;
     let target = plain(to, GENERIC_READ | GENERIC_WRITE, CREATE_NEW)?;
     let cloned = (|| {
         // Both must keep checksums alike, and the clone is in whole clusters.
@@ -293,59 +291,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     })
 }
 
-/// The whole file mapped read-only and shared. Windows refuses to replace or cut a file a
-/// view of which is open, so the pages under a mapping are never written while it lives.
-pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
-    let file = plain(path, GENERIC_READ, OPEN_EXISTING)?;
-    let len = usize::try_from(size(&file)?)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
-    if len == 0 {
-        return Ok(crate::Mapping(std::sync::Arc::new(Vec::<u8>::new())));
-    }
-    // SAFETY: an open handle; the section is the whole file, read-only, unnamed.
-    let section = unsafe {
-        CreateFileMappingW(file.as_raw_handle(), std::ptr::null(), PAGE_READONLY, 0, 0, std::ptr::null())
-    };
-    let section = sys::owned(section)?;
-    // SAFETY: the section just made; the whole of it, read-only.
-    let view = unsafe { MapViewOfFile(section.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
-    if view.Value.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // The view keeps the section and the file open after their handles close.
-    drop((section, file));
-    Ok(crate::Mapping(std::sync::Arc::new(Mapped { at: view.Value.cast_const().cast(), len })))
-}
-
-/// A view [`map`] made, unmapped when the last [`crate::Mapping`] of it goes.
-struct Mapped {
-    at: *const u8,
-    len: usize,
-}
-
-// SAFETY: read-only pages no one writes while they are mapped: `Effect::Map`'s contract bars
-// in-place writes and truncates of a mapped file (the store and the image replace a file only
-// by renaming another over it), so threads share them as they would a `&[u8]`.
-unsafe impl Send for Mapped {}
-// SAFETY: as above.
-unsafe impl Sync for Mapped {}
-
-impl AsRef<[u8]> for Mapped {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives, never written or cut
-        // short meanwhile by `Effect::Map`'s contract; if they were, this slice would see a
-        // data race or fault.
-        unsafe { std::slice::from_raw_parts(self.at, self.len) }
-    }
-}
-
-impl Drop for Mapped {
-    fn drop(&mut self) {
-        let view = windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-            Value: self.at.cast_mut().cast(),
-        };
-        // SAFETY: the view `map` made, unmapped once.
-        unsafe { UnmapViewOfFile(view) };
-    }
-}
+// The whole file mapped read-only and shared: `crate::fs::Mapped`'s, as on Unix. Windows
+// refuses to replace or cut a file a view of which is open.
+pub(crate) use crate::fs::map;
 

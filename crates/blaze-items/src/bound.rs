@@ -15,8 +15,15 @@
 //!   type picks is left to that set, so it changes with any impl of the trait.
 //!
 //! It is no part of [`crate::CodeHash`]: codegen's memo is keyed as before.
+//!
+//! What it gathers from the MIR is the task's, in its frame: nothing that asks for a bound
+//! hash is asked for by the hashes it reads, so the frame nests no deeper than they do.
 
+use std::{alloc::Allocator, fmt::Write as _};
+
+use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
 use hir_def::{CallableDefId, ItemContainerId, TraitId};
 use hir_ty::{
@@ -35,12 +42,12 @@ pub const BOUND_DOMAIN: &str = "blaze v2 bound hash 1";
 const DERIVE_METHOD_DOMAIN: &str = "blaze v2 bound derive method 1";
 
 /// The bound hash of an item with a body, `None` for one without.
-pub fn bound_hash(db: &dyn HirDatabase, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
+pub fn bound_hash(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     bound_of(db, id)
 }
 
 #[salsa::tracked(returns(copy))]
-fn bound_of(db: &dyn HirDatabase, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
+fn bound_of(db: &Db, id: ItemId) -> Result<Option<ContentId>, Unhashable> {
     let Some(code) = hash::code_hash(db, id)? else { return Ok(None) };
     let (Some(body), Some(def)) = (id.body(), id.generic_def()) else {
         unreachable!("{id:?} has a code hash and no body")
@@ -56,42 +63,49 @@ fn bound_of(db: &dyn HirDatabase, id: ItemId) -> Result<Option<ContentId>, Unhas
         };
     }
     let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate: id.krate(db) };
-    let reached = reached(db, id, InferBodyId::DefWithBodyId(body), env)?;
-    h.update(&(reached.methods.len() as u64).to_le_bytes());
-    for method in &reached.methods {
-        h.id(&method.0);
-    }
-    h.update(&(reached.traits.len() as u64).to_le_bytes());
-    for &(key, trait_) in &reached.traits {
-        h.id(&key.0).id(&index::all_impls_value(db, trait_)?);
-    }
-    Ok(Some(h.finish()))
+    frame::task(Tag::Other, |frame| -> Result<Option<ContentId>, Unhashable> {
+        let reached = reached(db, id, InferBodyId::DefWithBodyId(body), env, frame)?;
+        h.update(&(reached.methods.len() as u64).to_le_bytes());
+        for method in reached.methods.iter() {
+            h.id(&method.0);
+        }
+        h.update(&(reached.traits.len() as u64).to_le_bytes());
+        for &(key, trait_) in reached.traits.iter() {
+            h.id(&key.0).id(&index::all_impls_value(db, trait_)?);
+        }
+        Ok(Some(h.finish()))
+    })
 }
 
 /// What the MIR of a body and of every closure and coroutine in it binds to beyond its refs.
-struct Reached {
+struct Reached<'f> {
     /// What each trait method named resolves to, sorted, distinct.
-    methods: Vec<ItemKey>,
+    methods: Vec<ItemKey, &'f Frame>,
     /// Each trait an unsize coercion makes an object of, and its supertraits, sorted by key,
     /// distinct.
-    traits: Vec<(ItemKey, TraitId)>,
+    traits: Vec<(ItemKey, TraitId), &'f Frame>,
 }
 
-fn reached<'db>(
-    db: &'db dyn HirDatabase,
+fn reached<'db, 'f>(
+    db: &'db Db,
     id: ItemId,
     body: InferBodyId<'db>,
     env: ParamEnvAndCrate<'db>,
-) -> Result<Reached, Unhashable> {
+    frame: &'f Frame,
+) -> Result<Reached<'f>, Unhashable> {
     let no_mir = |_| Unhashable { item: id, what: "its MIR failed to lower" };
+    // alloc: std's set takes no allocator; one per bound hash.
     let mut seen: FxHashSet<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>> =
         FxHashSet::default();
-    let mut work: Vec<&'db MirBody<'db>> = vec![db.mir_body(body).map_err(no_mir)?];
-    let mut methods = Vec::new();
-    let mut objects: Vec<TraitId> = Vec::new();
+    let mut work: Vec<&'db MirBody<'db>, &Frame> = Vec::new_in(frame);
+    work.push(db.mir_body(body).map_err(no_mir)?);
+    let mut methods = Vec::new_in(frame);
+    let mut objects: Vec<TraitId, &Frame> = Vec::new_in(frame);
+    let mut nested: Vec<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>, &Frame> =
+        Vec::new_in(frame);
     while let Some(body) = work.pop() {
-        let mut nested: Vec<Either<InternedClosureId<'db>, InternedCoroutineId<'db>>> =
-            body.closures.iter().map(|&it| Either::Left(it)).collect();
+        nested.clear();
+        nested.extend(body.closures.iter().map(|&it| Either::Left(it)));
         for (_, block) in body.basic_blocks.iter() {
             for statement in &block.statements {
                 if let StatementKind::Assign(_, rvalue) = &statement.kind {
@@ -118,7 +132,7 @@ fn reached<'db>(
                 terminator.kind.for_each_operand(&mut |it| method(db, env, it, &mut methods));
             }
         }
-        for it in nested {
+        for &it in nested.iter() {
             if seen.insert(it) {
                 work.push(match it {
                     Either::Left(closure) => db.mir_body_for_closure(closure),
@@ -130,18 +144,21 @@ fn reached<'db>(
     }
     methods.sort_unstable();
     methods.dedup();
-    let mut traits: Vec<(ItemKey, TraitId)> = objects
-        .into_iter()
-        .flat_map(|it| all_super_traits(db, it).iter().copied())
-        .map(|it| (key::item_key(db, ItemId::Trait(it)), it))
-        .collect();
+    let mut traits: Vec<(ItemKey, TraitId), &Frame> = Vec::new_in(frame);
+    for &object in objects.iter() {
+        traits.extend(
+            all_super_traits(db, object)
+                .iter()
+                .map(|&it| (key::item_key(db, ItemId::Trait(it)), it)),
+        );
+    }
     traits.sort_unstable_by_key(|&(key, _)| key);
     traits.dedup_by_key(|&mut (key, _)| key);
     Ok(Reached { methods, traits })
 }
 
 /// The principal trait of every trait object in `ty`.
-fn objects_in(ty: Ty<'_>, out: &mut Vec<TraitId>) {
+fn objects_in<A: Allocator>(ty: Ty<'_>, out: &mut Vec<TraitId, A>) {
     for arg in ty.walk() {
         if let Some(ty) = arg.ty()
             && let TyKind::Dynamic(predicates, _) = ty.kind()
@@ -154,11 +171,11 @@ fn objects_in(ty: Ty<'_>, out: &mut Vec<TraitId>) {
 
 /// What a trait method `operand` names resolves to: a function by its key, or a method of a
 /// built-in derive by its impl's key and the method.
-fn method<'db>(
-    db: &'db dyn HirDatabase,
+fn method<'db, A: Allocator>(
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     operand: &Operand,
-    out: &mut Vec<ItemKey>,
+    out: &mut Vec<ItemKey, A>,
 ) {
     let ty = match &operand.kind {
         OperandKind::Constant { ty, .. } => ty.as_ref(),
@@ -173,11 +190,12 @@ fn method<'db>(
     }
     out.push(match db.lookup_impl_method(env, func, args).0 {
         Either::Left(it) => key::item_key(db, ItemId::Function(it)),
-        Either::Right((imp, method)) => ItemKey(
+        Either::Right((imp, method)) => ItemKey(scratch::with_string(|name| {
+            write!(name, "{method:?}").expect("writing to a string cannot fail");
             Hasher::new(DERIVE_METHOD_DOMAIN)
                 .id(&key::builtin_derive_key(db, imp).0)
-                .part(format!("{method:?}").as_bytes())
-                .finish(),
-        ),
+                .part(name.as_bytes())
+                .finish()
+        })),
     });
 }

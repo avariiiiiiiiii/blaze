@@ -22,7 +22,7 @@ use crate::{
         StaticSignature, StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
         VariantFields,
     },
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 /// Items with bodies that declare items, in every place a block can be: nested blocks, a
@@ -200,7 +200,7 @@ fn ask_signatures(db: &TestDB, krate: Crate) {
 fn signatures_lower_no_body() {
     let db = TestDB::with_files(BLOCKS);
     let krate = crate_named(&db, "lib");
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         ask_signatures(&db, krate);
         for owner in crate_body_owners(&db, krate) {
             _ = may_declare_roots(&db, owner);
@@ -239,7 +239,7 @@ pub enum Twice { A() = 1, A }
         })
         .collect();
     let mut found = Vec::new();
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         for &it in &enums {
             let name = EnumSignature::of(&db, it).name.as_str().to_owned();
             let variants = &EnumVariants::of(&db, it).0;
@@ -300,7 +300,7 @@ fn frozen_blocks_round_trip_lowering_only_their_owner() {
         assert!(!impls.is_empty(), "{name}");
         for imp in impls {
             let mut bytes = Vec::new();
-            let executed = db.log_executed(|| {
+            let executed = db.executed_in_read_order(|| {
                 let mut enc = Enc::new(&db, krate);
                 enc.impl_id(imp).unwrap_or_else(|why| panic!("{name}: {why}"));
                 bytes = enc.finish().unwrap();
@@ -315,7 +315,7 @@ fn frozen_blocks_round_trip_lowering_only_their_owner() {
             let fresh_krate = crate_named(&fresh, "lib");
             _ = crate_def_map(&fresh, fresh_krate);
             let mut read = None;
-            let executed = fresh.log_executed(|| {
+            let executed = fresh.executed_in_read_order(|| {
                 let mut dec = Dec::new_checked(&fresh, fresh_krate, &bytes).unwrap();
                 read = Some(dec.impl_id().unwrap_or_else(|why| panic!("{name}: {why}")));
             });
@@ -333,7 +333,7 @@ fn the_blocks_of_a_body_lower_only_it() {
     _ = crate_def_map(&db, krate);
     let nested = owner_named(&db, krate, "nested");
     let mut owners = Vec::new();
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         let blocks = body_blocks(&db, nested);
         assert_eq!(blocks.blocks.len(), 1);
         owners = blocks.owners;
@@ -343,7 +343,7 @@ fn the_blocks_of_a_body_lower_only_it() {
     assert_eq!(names, ["inner"]);
 
     let one = owner_named(&db, krate, "one");
-    let executed = db.log_executed(|| assert_eq!(body_blocks(&db, one).blocks.len(), 2));
+    let executed = db.executed_in_read_order(|| assert_eq!(body_blocks(&db, one).blocks.len(), 2));
     assert_eq!(bodies_lowered(&executed), 1, "{executed:#?}");
 }
 
@@ -383,7 +383,7 @@ pub fn local_macro() {
     let by_name = |name: &str| {
         crate_body_owners(&db, krate).into_iter().find(|&it| owner_name(&db, it) == name).unwrap()
     };
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         assert!(!may_declare_roots(&db, by_name("plain")));
         assert!(may_declare_roots(&db, by_name("exports")));
         assert!(may_declare_roots(&db, by_name("submits")));

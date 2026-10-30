@@ -13,6 +13,7 @@ use rustc_type_ir::{
 };
 
 use crate::{
+    db::HirDatabase,
     Adjust, Adjustment, AutoBorrow,
     autoderef::{GeneralAutoderef, InferenceContextAutoderef},
     infer::{

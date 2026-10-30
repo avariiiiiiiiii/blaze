@@ -221,8 +221,9 @@ impl Os {
     fn write(&mut self, writes: &Writes<'_>, kind: Kind) -> Result<(), String> {
         let base = self.base;
         let mut run: Option<(Range<u64>, Region)> = None;
+        let mut known = None;
         for span in writes.spans {
-            regions(&span.range(), |piece, region| {
+            regions_from(&mut known, &span.range(), |piece, region| {
                 if region.allocation != base {
                     return Err(format!(
                         "a write at {:#x}..{:#x}, outside the image at {base:#x}",
@@ -394,10 +395,28 @@ struct Region {
 /// of it nothing is committed at.
 fn regions(
     range: &Range<u64>,
+    f: impl FnMut(Range<u64>, Region) -> Result<(), String>,
+) -> Result<(), String> {
+    regions_from(&mut None, range, f)
+}
+
+/// [`regions`], starting from `known`, the region last queried, and leaving there the last
+/// one it queries: spans sorted by address in one region cost one `VirtualQuery` in all. A
+/// region's protection is the same after a write as before ([`writable`] gives it back), so
+/// what was queried stays true while a patch is written.
+fn regions_from(
+    known: &mut Option<(Range<u64>, Region)>,
+    range: &Range<u64>,
     mut f: impl FnMut(Range<u64>, Region) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut at = range.start;
     while at < range.end {
+        if let Some((region, of)) = known.as_ref().filter(|it| it.0.contains(&at)) {
+            let (piece, of) = (at..region.end.min(range.end), *of);
+            at = piece.end;
+            f(piece, of)?;
+            continue;
+        }
         let mut info = MemoryBasicInformation {
             base: std::ptr::null_mut(),
             allocation_base: std::ptr::null_mut(),
@@ -417,9 +436,11 @@ fn regions(
         if info.state != MEM_COMMIT || end <= at {
             return Err(format!("nothing is committed at {at:#x}"));
         }
+        let region = Region { allocation: info.allocation_base as u64, protect: info.protect };
+        *known = Some((info.base as u64..end, region));
         let piece = at..end.min(range.end);
         at = piece.end;
-        f(piece, Region { allocation: info.allocation_base as u64, protect: info.protect })?;
+        f(piece, region)?;
     }
     Ok(())
 }

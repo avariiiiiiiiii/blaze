@@ -14,6 +14,7 @@ use super::{Exempt, compare_fixture, fixture_db, with_fast_path};
 use crate::{
     ModuleDefId,
     nameres::facts::tests::{CDef, CModule, new_crate_local_def_map},
+    test_db::TestDBExt,
 };
 
 /// One fixture of a test file: where it is, and its text.
@@ -237,11 +238,28 @@ fn the_reader_finds_fixtures_and_skips_expectations() {
 // programs rustc rejects. Compared on everything but what `exempt` names.
 
 pub(super) struct OrderDependent {
+    /// Our own name, or the name [`fixtures`] gives one of the test files' fixtures.
     pub(super) name: &'static str,
     /// What rustc (the pinned nightly) says of the program.
     pub(super) rustc: &'static str,
+    /// The text; empty for a fixture of the test files, which is read from there.
     pub(super) fixture: &'static str,
     pub(super) exempt: Exempt,
+}
+
+impl OrderDependent {
+    fn text(&self) -> &'static str {
+        if !self.fixture.is_empty() {
+            return self.fixture;
+        }
+        NAMERES
+            .iter()
+            .chain(MACRO_EXPANSION)
+            .flat_map(|&(file, source)| fixtures(file, source))
+            .find(|it| it.name == self.name)
+            .unwrap_or_else(|| panic!("no fixture `{}` in the test files", self.name))
+            .text
+    }
 }
 
 pub(super) const ORDER_DEPENDENT: &[OrderDependent] = &[
@@ -315,7 +333,7 @@ fn order_dependent_fixtures_agree_on_everything_else() {
     let mut failures = String::new();
     for it in ORDER_DEPENDENT {
         assert!(!it.rustc.is_empty(), "{}: say what rustc says of it", it.name);
-        compare_fixture(it.name, it.fixture, &it.exempt, &mut failures);
+        compare_fixture(it.name, it.text(), &it.exempt, &mut failures);
     }
     assert!(failures.is_empty(), "old and new def maps differ:\n{failures}");
 }

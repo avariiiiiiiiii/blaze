@@ -27,6 +27,10 @@ use crate::{
 };
 
 /// The front end's database. See the module.
+///
+/// It has no `Default`: a build's is [`Db::new`] and a test's [`Db::for_tests`], and which one
+/// is never left to a default. A crate's tests name it `TestDB` (`type TestDB = Db;`), so that
+/// salsa's accessors, generic over the database, take `&TestDB` as they take `&Db`.
 #[salsa::db]
 pub struct Db {
     storage: salsa::Storage<Db>,
@@ -199,11 +203,22 @@ impl Db {
         files.set_view_root(self, view)
     }
 
-    /// The file of the VFS that `path` names relative to its anchor.
+    /// The file of the VFS that `path` names relative to its anchor: in the anchor's source
+    /// root, or else one another source root names (a `#[path]` module outside its package),
+    /// tracked through [`crate::named`] so a root that names it later reruns the reader.
     pub fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
-        let source_root = self.file_source_root(path.anchor);
-        let source_root = self.source_root(source_root.source_root_id(self));
-        source_root.source_root_ref(self).resolve_path(path)
+        let root = self.file_source_root(path.anchor).source_root_id(self);
+        let root = self.source_root(root).source_root_ref(self);
+        if let Some(file) = root.resolve_path(path) {
+            return Some(file);
+        }
+        // clone: only for a path outside the anchor's source root, rare; `join` makes one too.
+        let mut target = root.path_for_file(&path.anchor)?.clone();
+        target.pop();
+        let target = target.join(path.path)?;
+        let file = crate::named::lookup(self, &target)?;
+        let there = self.source_root(self.file_source_root(file).source_root_id(self));
+        (there.source_root_ref(self).file_for_path(&target) == Some(&file)).then_some(file)
     }
 
     /// The file `path` names relative to its anchor, when it is not one of the files of the
@@ -298,9 +313,9 @@ impl Db {
         Ok((place.line().checked_sub(1).ok_or(())?, column - 1))
     }
 
-    /// The events of `f`, in the order they happened. Batches of [`Db::run_all`] are left to
-    /// the queries that read their results, so the order is the one a test expects of the
-    /// work alone.
+    /// The events of `f`, in the order they happened. A test that wants the order of the work
+    /// alone, without a batch's tasks run ahead of their readers, runs `f` under
+    /// [`RunOrder::LeftToReaders`] ([`set_run_order`]).
     ///
     /// # Panics
     ///
@@ -308,9 +323,7 @@ impl Db {
     pub fn log(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
         let log = self.log.as_ref().expect("`Db::log` on a database not made by `Db::for_tests`");
         *log.lock().unwrap_or_else(|it| it.into_inner()) = Some(Vec::new());
-        let order = set_run_order(RunOrder::LeftToReaders);
         f();
-        set_run_order(order);
         log.lock().unwrap_or_else(|it| it.into_inner()).take().unwrap_or_default()
     }
 
@@ -329,12 +342,6 @@ impl Db {
     }
 }
 
-impl Default for Db {
-    fn default() -> Db {
-        Db::new()
-    }
-}
-
 impl fmt::Debug for Db {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("base_db::Db").field("run", &self.run).finish_non_exhaustive()
@@ -346,7 +353,7 @@ impl salsa::Database for Db {
     /// The plane task this thread runs, from the pool's pump: a thread runs several tasks at
     /// once, one above the other, and each has its own query stack.
     #[inline]
-    fn task_depth() -> u32 {
+    fn task_depth(&self) -> u32 {
         u32::try_from(blaze_graph::pump::depth()).expect("a thread runs more than `u32::MAX` tasks")
     }
 }

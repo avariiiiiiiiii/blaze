@@ -12,17 +12,18 @@
 //!   the path ([`CommitError::Conflict`]).
 //! - The journal makes heads and the nodes they reach durable through
 //!   [`blaze_core::Effect`]s, with group commit and recovery from a torn tail.
-//! - Watching: changes a driver reports ([`blaze_core::Done::Changed`]) become ops on the
-//!   workspace's head ([`Watcher`]).
+//! - Watching: what the system's journal says changed ([`blaze_core::Done::Journaled`]),
+//!   from the cursor saved with the tracked paths' stamps, becomes ops on the workspace's head
+//!   ([`Watcher`]); a file whose stamp did not move is never read.
 //! - Outside every view: the directories user code reads that no view holds, watched so a
 //!   check asks a lock-free table whether anything under a path changed ([`outside`]).
 //!
-//! Unsafe code is only in `store` and `text` (docs/v2/plan/design/unsafe.md), whose APIs
-//! are safe.
+//! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
 
 #![deny(unsafe_code)]
 
 mod disk;
+mod image;
 mod journal;
 pub mod outside;
 mod reader;
@@ -31,7 +32,6 @@ mod section;
 #[allow(unsafe_code)]
 mod store;
 mod sync;
-#[allow(unsafe_code)]
 mod text;
 mod tree;
 pub mod watch;
@@ -47,11 +47,14 @@ use crate::{
     journal::{Journal, Loaded},
     tree::{NodeId, Tree},
 };
+pub use blaze_image::Corrupt;
+
 pub use crate::{
+    image::{Bytes, ImageError, ImageMark, ImageUse},
     outside::{Cover, Outside, cover, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,
-    text::text_of,
+    text::{Text, TextFile, text_of},
     watch::{Watched, Watcher},
 };
 
@@ -149,6 +152,9 @@ pub enum OpError {
     },
     /// The base root the ops were given is not one this tree has.
     UnknownRoot(ContentId),
+    /// A file of the image the tree was restored from failed its page group's CRC32C: its
+    /// bytes are not read until the same bytes are written again ([`Vfs::corrupt`]).
+    Corrupt { section: u32, group: u32 },
 }
 
 impl fmt::Display for OpError {
@@ -166,6 +172,9 @@ impl fmt::Display for OpError {
                 write!(f, "{path} is a symlink to {target:?}, which leaves the tree or loops")
             }
             OpError::UnknownRoot(root) => write!(f, "no root {root} is known"),
+            OpError::Corrupt { section, group } => {
+                write!(f, "page group {group} of image section {section:#x} is corrupt")
+            }
         }
     }
 }
@@ -365,11 +374,13 @@ impl Vfs {
         View { root: self.tree.id(self.open_root(view)) }
     }
 
-    /// The file at `path` in `view`; `None` for none, or a directory.
-    pub fn read(&self, view: ViewId, path: &str) -> Option<File<'_>> {
-        let (node, mode) = self.tree.entry(self.open_root(view), path)?;
-        let bytes = self.tree.bytes(node)?;
-        Some(File { id: self.tree.id(node), mode, bytes })
+    /// The file at `path` in `view`; `Ok(None)` for none, or a directory. A file of the image
+    /// whose page group fails its check is `Err`.
+    pub fn read(&self, view: ViewId, path: &str) -> Result<Option<File<'_>>, Corrupt> {
+        let Some((node, mode)) = self.tree.entry(self.open_root(view), path) else {
+            return Ok(None);
+        };
+        Ok(self.tree.bytes(node)?.map(|bytes| File { id: self.tree.id(node), mode, bytes }))
     }
 
     /// The file at `path` in `view` with every symlink on the way followed, as the system opens
@@ -379,7 +390,7 @@ impl Vfs {
         let Some((node, mode)) = self.tree.resolve(self.open_root(view), path)? else {
             return Ok(None);
         };
-        Ok(self.tree.bytes(node).map(|bytes| File { id: self.tree.id(node), mode, bytes }))
+        Ok(self.tree.bytes(node)?.map(|bytes| File { id: self.tree.id(node), mode, bytes }))
     }
 
     /// The content ID of what is at `path` in `view`, a file or a directory.
@@ -455,6 +466,8 @@ pub struct Recovered {
     /// Head records whose root was not loaded, dropped; the journal is then rewritten without
     /// them.
     pub heads_dropped: usize,
+    /// What [`Vfs::restore`] did with the image it was given; `None` from [`Vfs::recover`].
+    pub image: ImageUse,
 }
 
 /// Counts each test thread's allocations, for the allocation-budget tests

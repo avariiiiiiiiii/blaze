@@ -7,8 +7,9 @@
 //! A revision's value borrows its arena: [`Built::Value<'a>`] may hold `&'a` references into
 //! memory it allocated there. Readers get it for as long as their task's guard, never longer.
 //!
-//! Cost: a read is two acquire loads and no shared write; a publish is one arena reset (its
-//! chunks back to the cache), the build, and one release store.
+//! Cost: a read is one acquire load of the current revision's record (its number and value,
+//! side by side in its arena) and no shared write; a publish is one arena reset (its chunks
+//! back to the cache), the build, and two release stores.
 
 use std::{
     cell::UnsafeCell,
@@ -54,10 +55,16 @@ impl std::fmt::Display for PublishError {
 
 impl std::error::Error for PublishError {}
 
+/// A revision as placed in its arena: what a reader reaches with one load.
+struct Placed<'a, B: Built> {
+    number: u64,
+    value: B::Value<'a>,
+}
+
 struct Slot<B: Built> {
     arena: UnsafeCell<Arena>,
-    /// The revision's value, in its arena; null when the slot holds none.
-    value: AtomicPtr<B::Value<'static>>,
+    /// The revision's record, in its arena; null when the slot holds none.
+    value: AtomicPtr<Placed<'static, B>>,
     /// Started when the slot stopped being current; its arena is reused once it has passed.
     retired: UnsafeCell<Option<Grace>>,
 }
@@ -65,9 +72,11 @@ struct Slot<B: Built> {
 /// Two arenas, one revision current in each turn.
 pub struct Revisions<B: Built> {
     slots: [Slot<B>; 2],
+    /// The current revision's record; null before the first publish. What readers load.
+    current: AtomicPtr<Placed<'static, B>>,
     /// The current revision's number shifted left by one, its slot in the low bit; 0 before
-    /// the first publish.
-    current: AtomicU64,
+    /// the first publish. The publisher's, and [`Revisions::number`]'s.
+    state: AtomicU64,
     publishing: AtomicBool,
     _built: PhantomData<B>,
 }
@@ -90,7 +99,8 @@ impl<B: Built> Revisions<B> {
     pub const fn new(tag: Tag) -> Revisions<B> {
         Revisions {
             slots: [Slot::new(tag), Slot::new(tag)],
-            current: AtomicU64::new(0),
+            current: AtomicPtr::new(ptr::null_mut()),
+            state: AtomicU64::new(0),
             publishing: AtomicBool::new(false),
             _built: PhantomData,
         }
@@ -99,23 +109,22 @@ impl<B: Built> Revisions<B> {
     /// The current revision, if one was published. `guard` is the calling thread's task (a
     /// `Guard` is not `Send`, so it is this thread's): the value stays valid while it lives.
     pub fn read<'g>(&'g self, _guard: &'g Guard) -> Option<Current<'g, B>> {
-        let current = self.current.load(Ordering::Acquire);
-        if current == 0 {
+        let placed = self.current.load(Ordering::Acquire);
+        if placed.is_null() {
             return None;
         }
-        let value = self.slots[(current & 1) as usize].value.load(Ordering::Acquire);
-        // SAFETY: `value` was published with a release store after it was built and is
+        // SAFETY: `placed` was published with a release store after it was built and is
         // dropped only after a grace started once it stopped being current has passed; this
         // thread is in a task (`guard`) that began before such a grace or sees the newer
-        // revision, so the value outlives `'g`. It was built borrowing its arena, which lives
+        // revision, so the record outlives `'g`. It was built borrowing its arena, which lives
         // as long as the slot, so reading it as `'static` and shortening to `'g` is sound.
-        let value: &'g B::Value<'static> = unsafe { &*value };
-        Some(Current { number: current >> 1, value: B::shorten(value) })
+        let placed: &'g Placed<'static, B> = unsafe { &*placed };
+        Some(Current { number: placed.number, value: B::shorten(&placed.value) })
     }
 
     /// The number of the current revision; 0 before the first publish.
     pub fn number(&self) -> u64 {
-        self.current.load(Ordering::Acquire) >> 1
+        self.state.load(Ordering::Acquire) >> 1
     }
 
     /// Builds the next revision with `build`, in the arena the revision before the current
@@ -136,7 +145,7 @@ impl<B: Built> Revisions<B> {
         }
         let _unlock = Unlock(&self.publishing);
 
-        let current = self.current.load(Ordering::Acquire);
+        let current = self.state.load(Ordering::Acquire);
         let next_slot = if current == 0 { 0 } else { 1 - (current & 1) as usize };
         let slot = &self.slots[next_slot];
         // SAFETY: only the publisher (this thread, by `publishing`) reads or writes `retired`.
@@ -152,7 +161,7 @@ impl<B: Built> Revisions<B> {
         let arena = unsafe { &mut *slot.arena.get() };
         let old = slot.value.swap(ptr::null_mut(), Ordering::Relaxed);
         if !old.is_null() {
-            // SAFETY: `old` is the value this slot's last publish placed in its arena, unread
+            // SAFETY: `old` is the record this slot's last publish placed in its arena, unread
             // now (above), dropped once.
             unsafe { ptr::drop_in_place(old) };
         }
@@ -160,16 +169,18 @@ impl<B: Built> Revisions<B> {
 
         let arena: &Arena = arena;
         let local = arena.local();
-        let value = build(&local);
-        let placed: *mut B::Value<'_> = local.alloc(value);
-        drop(local);
-        // The value borrows the arena, which lives as long as `self`; it is stored with its
-        // lifetime erased and handed out again only through `read`, shortened to a guard's.
-        let placed = placed.cast::<B::Value<'static>>();
-        slot.value.store(placed, Ordering::Release);
-
         let number = (current >> 1) + 1;
-        self.current.store((number << 1) | next_slot as u64, Ordering::Release);
+        let value = build(&local);
+        let placed: *mut Placed<'_, B> = local.alloc(Placed { number, value });
+        drop(local);
+        // The record borrows the arena, which lives as long as `self`; it is stored with its
+        // lifetime erased and handed out again only through `read`, shortened to a guard's.
+        let placed = placed.cast::<Placed<'static, B>>();
+        slot.value.store(placed, Ordering::Relaxed);
+
+        // Release: the record's bytes are seen by a reader that loads the pointer.
+        self.current.store(placed, Ordering::Release);
+        self.state.store((number << 1) | next_slot as u64, Ordering::Release);
         if current != 0 {
             let before = &self.slots[(current & 1) as usize];
             // SAFETY: the publisher alone touches `retired`.

@@ -93,9 +93,9 @@ fn random_bytes_never_panic_and_what_decodes_reencodes_the_same() {
             match rng.below(3) {
                 0 if !bytes.is_empty() => {
                     let at = rng.below(bytes.len() as u64) as usize;
-                    bytes[at] = rng.next() as u8;
+                    bytes[at] = rng.next_u64() as u8;
                 }
-                1 => bytes.push(rng.next() as u8),
+                1 => bytes.push(rng.next_u64() as u8),
                 _ => {
                     let len = rng.below(bytes.len() as u64 + 1) as usize;
                     bytes.truncate(len);

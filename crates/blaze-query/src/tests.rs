@@ -2,19 +2,21 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{
-        Arc, Barrier, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, Record, SchemaHash, Slice, Writer};
 use blaze_ids::{ContentId, Fingerprint};
-use blaze_vfs::{View, ViewId};
+use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
+use blaze_vfs::{Bytes, Mode, View, ViewId};
+use intern::Live;
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Marks, MemTree, Query,
-    QueryKey, QueryKind, Stored,
+    QueryKey, QueryKind, Stored, Tree,
     table::{Aligned, EdgeRecord},
 };
 
@@ -422,17 +424,27 @@ fn cold_values_move_to_disk_and_read_from_it() {
     assert_eq!(runs("double"), 1, "read from the cold pack, not made again");
 }
 
+/// The database's sections of an image, as the daemon writes them (it adds the symbol table
+/// and its own sections, which the database never reads).
+fn image_of(db: &Database, builder: Builder) -> (Vec<u8>, Live) {
+    let mut builder = builder;
+    let mut live = Live::new();
+    db.write_image(&mut builder, &mut live).expect("every kind is registered");
+    (builder.finish().expect("a small image"), live)
+}
+
+fn opened(bytes: &[u8]) -> Arc<Image<Mapping>> {
+    Arc::new(Image::open(mapping(bytes)).expect("an image this blaze wrote"))
+}
+
 #[test]
 fn the_image_holds_the_database() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "abc")]);
     double(&db, one, "a");
-    let mut effects = Vec::new();
-    db.write_image(&mut effects);
-    let (file, bytes, _) = written(&mut effects);
-    assert_eq!(file.as_str(), "db/image");
+    let (bytes, _) = image_of(&db, Builder::new());
 
-    let mut started = Database::from_image_with(config(&tree), mapping(&bytes)).expect("an image");
+    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
     register(&mut started);
     reset();
     let same = view(&started, &tree, &[("a", "abc")]);
@@ -443,28 +455,48 @@ fn the_image_holds_the_database() {
     let longer = view(&started, &tree, &[("a", "abcd")]);
     assert_eq!(double(&started, longer, "a"), 8);
     assert_eq!((runs("len"), runs("double")), (1, 1));
+    assert_eq!(started.take_corrupt(), vec![], "nothing read was corrupt");
 
-    let mut again = Vec::new();
-    db.write_image(&mut again);
-    assert_eq!(written(&mut again).1, bytes, "the same database writes the same image");
+    assert_eq!(image_of(&db, Builder::new()).0, bytes, "the same database writes the same image");
 }
 
+/// Values name symbols by their IDs in the image's symbol table, so an image is used only
+/// after the table was restored from it.
 #[test]
-fn an_image_of_another_schema_is_refused() {
+fn an_image_whose_symbols_were_not_restored_is_refused() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "abc")]);
     double(&db, one, "a");
-    let mut effects = Vec::new();
-    db.write_image(&mut effects);
-    let (_, mut bytes, _) = written(&mut effects);
-    bytes[8] ^= 1;
+    let (bytes, _) = image_of(&db, Builder::new());
+    assert_eq!(intern::restored_from(), None, "no test restores the process's symbols");
+    assert_eq!(Database::from_image_with(config(&tree), opened(&bytes)).err(), Some(DbError::Symbols));
+}
+
+#[test]
+fn an_image_without_the_databases_sections_is_refused() {
+    let empty = Builder::new().finish().expect("an image");
     assert!(matches!(
-        Database::from_image(mapping(&bytes)),
-        Err(DbError::Image(FormatError::Schema { .. }))
+        Database::open_image(Config::memory(), opened(&empty)),
+        Err(DbError::Refused(Refused::Missing { id: SectionId::DB_MEMOS }))
     ));
-    bytes[8] ^= 1;
-    bytes.truncate(bytes.len() - 1);
-    assert!(matches!(Database::from_image(mapping(&bytes)), Err(DbError::Image(FormatError::Header(_)))));
+    let mut other = Builder::new();
+    other.add(SectionId::DB_MEMOS, blaze_format::schema("blaze v2 db memos 1"), &[]);
+    let other = other.finish().expect("an image");
+    let error = Database::open_image(Config::memory(), opened(&other)).err();
+    assert!(matches!(error, Some(DbError::Refused(Refused::Schema { id: SectionId::DB_MEMOS, .. }))), "{error:?}");
+    assert!(error.is_some_and(|error| error.is_image()));
+}
+
+#[test]
+fn a_kind_with_memos_must_be_registered_to_write_an_image() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    double(&db, one, "a");
+    let (bytes, _) = image_of(&db, Builder::new());
+    let started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
+    let mut live = Live::new();
+    let error = started.write_image(&mut Builder::new(), &mut live).err();
+    assert!(matches!(error, Some(DbError::Unknown(_))), "{error:?}");
 }
 
 #[test]
@@ -472,22 +504,72 @@ fn settling_swaps_to_the_mapped_image() {
     let (mut db, tree) = setup();
     let one = view(&db, &tree, &[("a", "abc")]);
     double(&db, one, "a");
+    let (bytes, _) = image_of(&db, Builder::new());
     let mut effects = Vec::new();
-    db.write_image(&mut effects);
-    let (_, bytes, tag) = written(&mut effects);
-    assert_eq!(db.settle(&mut effects), Ok(false), "nothing mapped yet");
-    db.complete(Completion { tag, done: Done::Written }, &mut effects);
-    let (file, tag) = mapped(&mut effects);
-    assert_eq!(file.as_str(), "db/image");
-    db.complete(Completion { tag, done: Done::Mapped(mapping(&bytes)) }, &mut effects);
-    assert!(db.settled());
-    assert_eq!(db.settle(&mut effects), Ok(true));
+    assert_eq!(db.settle(opened(&bytes), &mut effects), Ok(()));
     assert!(effects.is_empty(), "no cold packs to remove: {effects:?}");
 
     assert_eq!(double(&db, one, "a"), 6, "the view stays open across the swap");
     assert_eq!((runs("len"), runs("double")), (1, 1));
     assert!(matches!(db.memo(&key::<Double>("a")).map(|memo| memo.value), Some(Stored::Disk(_))));
     db.reclaim();
+}
+
+/// One byte flipped in a group of a database section: the group is reported once, by section
+/// and group; the keys whose memos it held are computed again and every other key is used from
+/// the image. A group holding an input's path is read at start, so the database starts empty
+/// naming it.
+#[test]
+fn a_corrupt_group_drops_only_the_memos_in_it() {
+    const KEYS: usize = 300;
+    let (db, tree) = setup();
+    let names: Vec<String> = (0..KEYS).map(|n| format!("f{n}")).collect();
+    let contents: Vec<String> = (0..KEYS).map(|n| "x".repeat(n % 7)).collect();
+    let files: Vec<(&str, &str)> = names.iter().map(String::as_str).zip(contents.iter().map(String::as_str)).collect();
+    let one = view(&db, &tree, &files);
+    for name in &names {
+        double(&db, one, name);
+    }
+    // Groups of 4 KiB, so each section spans several.
+    let (bytes, _) = image_of(&db, Builder::with_group_shift(12));
+    let sections = opened(&bytes).sections().to_vec();
+    let mut tried = 0;
+    for section in sections.iter().filter(|it| it.id != SectionId::DB_INPUTS) {
+        for group in 0..section.groups {
+            let mut flipped = bytes.clone();
+            flipped[(section.at + u64::from(group) * 4096) as usize] ^= 0x40;
+            let image = opened(&flipped);
+            let mut started = match Database::open_image(config(&tree), image) {
+                Ok(started) => started,
+                Err(DbError::Corrupt(corrupt)) => {
+                    assert_eq!((corrupt.section, corrupt.group), (SectionId::DB_BLOB, group), "only paths are read at start");
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            register(&mut started);
+            reset();
+            let same = view(&started, &tree, &files);
+            for (n, name) in names.iter().enumerate() {
+                assert_eq!(double(&started, same, name), 2 * (n % 7) as u64, "{name} is right whatever was dropped");
+            }
+            // Writing the image reads every key's memos, so every group is read by now.
+            let _ = image_of(&started, Builder::new());
+            let found = started.take_corrupt();
+            assert_eq!(
+                found.iter().map(|it| (it.section, it.group)).collect::<Vec<_>>(),
+                vec![(section.id, group)],
+                "{} group {group}",
+                section.id
+            );
+            assert_eq!(started.take_corrupt(), vec![], "each group is reported once");
+            let reran = runs("len") + runs("double");
+            assert!(reran > 0, "{} group {group} held memos, computed again", section.id);
+            assert!(reran < KEYS, "{} group {group}: the other keys' memos are used, {reran} reran", section.id);
+            tried += 1;
+        }
+    }
+    assert!(tried > 4 * 2, "every database section spans groups: {tried} tried");
 }
 
 #[test]
@@ -803,70 +885,11 @@ fn edges_round_trip_through_their_record() {
     assert_eq!(read.iter().map(EdgeRecord::edge).collect::<Vec<_>>(), vec![edge]);
 }
 
-/// Counts this thread's allocations while [`allocations`] runs its closure; other threads'
-/// are not counted.
-mod counting {
-    use std::{
-        alloc::{GlobalAlloc, Layout, System},
-        cell::Cell,
-    };
-
-    pub(super) struct Counting;
-
-    thread_local! {
-        static ON: Cell<bool> = const { Cell::new(false) };
-        static COUNT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    fn note() {
-        _ = ON.try_with(|on| {
-            if on.get() {
-                _ = COUNT.try_with(|count| count.set(count.get() + 1));
-            }
-        });
-    }
-
-    // SAFETY: every call is passed to `System` as it came; counting touches only `const`
-    // thread-locals, which neither allocate nor run a destructor.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            note();
-            // SAFETY: the caller's contract, passed on.
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            note();
-            // SAFETY: the caller's contract, passed on.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            note();
-            // SAFETY: the caller's contract, passed on.
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: the caller's contract, passed on.
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    /// How many times `f` allocated (or grew an allocation) on this thread.
-    pub(super) fn allocations(f: impl FnOnce()) -> usize {
-        COUNT.with(|count| count.set(0));
-        ON.with(|on| on.set(true));
-        f();
-        ON.with(|on| on.set(false));
-        COUNT.with(Cell::get)
-    }
-}
-
+/// Counts each thread's allocations for the budgets below and in `memo` and `table`'s tests.
 #[global_allocator]
-static ALLOCATOR: counting::Counting = counting::Counting;
+static ALLOCATOR: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-static WARM_CX: AtomicUsize = AtomicUsize::new(usize::MAX);
+static WARM_CX: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// [`Double`] asked twice: the second time is a warm hit inside a query, its allocations
 /// counted into [`WARM_CX`].
@@ -883,9 +906,9 @@ impl Query for AskTwice {
     }
     fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
         let first = cx.get::<Double>(key)?;
-        let mut second = None;
-        WARM_CX.store(counting::allocations(|| second = Some(cx.get::<Double>(key))), Ordering::SeqCst);
-        Ok(Num(first + second.expect("asked")?))
+        let (second, used) = blaze_alloc_count::measure(|| cx.get::<Double>(key));
+        WARM_CX.store(used.allocations, Ordering::SeqCst);
+        Ok(Num(first + second?))
     }
 }
 
@@ -899,10 +922,8 @@ fn a_warm_hit_allocates_nothing() {
     let name = "a".to_owned();
     let pinned = db.pin();
     assert_eq!(pinned.get::<Double>(one, &name), Ok(6));
-    let mut got = None;
-    let count = counting::allocations(|| got = Some(pinned.get::<Double>(one, &name)));
-    assert_eq!(got, Some(Ok(6)));
-    assert_eq!(count, 0, "a warm Pinned::get allocated");
+    let got = blaze_alloc_count::assert_at_most(0, "a warm Pinned::get", || pinned.get::<Double>(one, &name));
+    assert_eq!(got, Ok(6));
     drop(pinned);
 
     assert_eq!(db.pin().get::<AskTwice>(one, &name), Ok(12));
@@ -944,4 +965,38 @@ fn marks_are_a_bit_a_memo() {
     assert!(marks.insert(200), "past the end it was made for");
     assert!(marks.contains(64) && marks.contains(200) && !marks.contains(65) && !marks.contains(1000));
     assert_eq!(marks.iter().collect::<Vec<_>>(), [3, 64, 200]);
+}
+
+const BROKEN: Corrupt = Corrupt { section: SectionId::VFS_BLOBS, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };
+
+/// A [`MemTree`] whose file `broken` names fails its check while it is set.
+struct Breaking {
+    files: MemTree,
+    broken: Mutex<Option<&'static str>>,
+}
+
+impl Tree for Breaking {
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        if *self.broken.lock().unwrap() == Some(path) {
+            return Err(BROKEN);
+        }
+        self.files.file(root, path)
+    }
+    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+        self.files.list(root, path)
+    }
+}
+
+#[test]
+fn a_file_that_fails_its_check_fails_the_request_and_is_read_again() {
+    reset();
+    let tree = Arc::new(Breaking { files: MemTree::default(), broken: Mutex::new(Some("a")) });
+    let mut db = Database::new(Config { tree: Some(tree.clone()), dir: FileName::new("db"), tags: TAGS });
+    register(&mut db);
+    let view = db.open(View { root: tree.files.root(&[("a", b"four".as_slice()), ("b", b"xy".as_slice())]) });
+    assert_eq!(db.pin().get::<Double>(view, &"a".to_owned()).err(), Some(DbError::Corrupt(BROKEN)));
+    assert_eq!(double(&db, view, "b"), 4, "another file of the view still reads");
+    *tree.broken.lock().unwrap() = None;
+    assert_eq!(double(&db, view, "a"), 8, "the failed read was not kept");
+    assert_eq!(runs("len"), 3);
 }

@@ -9,10 +9,16 @@
 //! Its end is heard from a wait of the thread pool's on the process, which posts to the port:
 //! the job's messages are, as Windows documents them, not sure to arrive, so they say only
 //! that the job went past its memory, which kills it.
+//!
+//! The process is made suspended and runs only once the driver follows it ([`follow`], then
+//! [`resume`]): its job's messages and its end come to the port with its spawn's handle, which
+//! names it only once it is in the driver's slab.
 
 use std::{
+    cell::UnsafeCell,
     ffi::{OsStr, OsString, c_void},
     io,
+    marker::PhantomPinned,
     os::windows::{
         ffi::OsStrExt as _,
         io::{AsRawHandle as _, OwnedHandle},
@@ -67,9 +73,11 @@ pub(super) const OUT_OF_MEMORY: u32 = STATUS_COMMITMENT_LIMIT as u32;
 
 static RUNS: AtomicU64 = AtomicU64::new(0);
 
-/// A process started, its pipes the driver's.
+/// A process made, suspended until [`resume`], its pipes the driver's.
 pub(super) struct Started {
     pub(super) process: OwnedHandle,
+    /// Its first thread, suspended.
+    pub(super) thread: OwnedHandle,
     pub(super) job: OwnedHandle,
     /// Where its input goes, of a command with input: closing it is the end of the input.
     pub(super) stdin: Option<OwnedHandle>,
@@ -85,15 +93,9 @@ pub(super) struct Finish {
     scratch: Option<PathBuf>,
 }
 
-/// `command` started in its sandbox, made by `confine`, unless the sandbox is off; in a job
-/// whose messages come to `port` with the key of `serial`.
-pub(super) fn start(
-    root: &Path,
-    command: Box<Command>,
-    confine: Option<&Arc<dyn Confine>>,
-    port: &Port,
-    serial: u64,
-) -> io::Result<Started> {
+/// `command` made in its sandbox, made by `confine`, unless the sandbox is off; in a job of its
+/// own, suspended until the driver follows it.
+pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn Confine>>) -> io::Result<Started> {
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
     let (confined, scratch, confine) = match &command.sandbox {
         Sandbox::Off => (
@@ -132,21 +134,21 @@ pub(super) fn start(
             }
         }
     };
-    let made = run(&confined, &command, port, serial, n);
+    let made = run(&confined, &command, n);
     let started = made.map_err(|error| {
         if let Some(scratch) = &scratch {
             _ = std::fs::remove_dir_all(scratch);
         }
         io::Error::new(error.kind(), format!("starting {}: {error}", confined.program.display()))
     })?;
-    let (process, job, stdin, stdout, stderr) = started;
-    Ok(Started { process, job, stdin, stdout, stderr, finish: Finish { command, confine, scratch } })
+    let (process, thread, job, stdin, stdout, stderr) = started;
+    Ok(Started { process, thread, job, stdin, stdout, stderr, finish: Finish { command, confine, scratch } })
 }
 
-type Handles = (OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
+type Handles = (OwnedHandle, OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
 
-fn run(confined: &Confined, command: &Command, port: &Port, serial: u64, n: u64) -> io::Result<Handles> {
-    let job = job(command.memory, port, serial)?;
+fn run(confined: &Confined, command: &Command, n: u64) -> io::Result<Handles> {
+    let job = job(command.memory)?;
     let (stdout, child_stdout) = pipe(true, n, "out")?;
     let (stderr, child_stderr) = pipe(true, n, "err")?;
     let (stdin, child_stdin) = match command.stdin.is_empty() {
@@ -198,21 +200,44 @@ fn run(confined: &Confined, command: &Command, port: &Port, serial: u64, n: u64)
         unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
         return Err(io::Error::new(error.kind(), format!("into its job: {error}")));
     }
+    // Its ends are its own now: the pipes end when it and what it starts close them.
+    drop((child_stdin, child_stdout, child_stderr));
+    Ok((process, thread, job, stdin, stdout, stderr))
+}
+
+/// The process of `thread`, made suspended in `job`, run; or, refused, its job ended.
+pub(super) fn resume(thread: OwnedHandle, job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: the process's thread, suspended once at its making.
     if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
         let error = io::Error::last_os_error();
-        // SAFETY: the job just made, holding the process.
-        unsafe { TerminateJobObject(job.as_raw_handle(), KILLED) };
+        terminate(job, KILLED);
         return Err(error);
     }
-    // Its ends are its own now: the pipes end when it and what it starts close them.
-    drop((thread, child_stdin, child_stdout, child_stderr));
-    Ok((process, job, stdin, stdout, stderr))
+    Ok(())
 }
 
-/// A job that kills what is left in it when it closes, holds the memory of everything in it
-/// to `memory`, and posts its messages to `port`.
-fn job(memory: Option<u64>, port: &Port, serial: u64) -> io::Result<OwnedHandle> {
+/// The job's messages posted to `port` with `key` (at least [`KEY_JOB`]).
+pub(super) fn follow(job: &OwnedHandle, port: &Port, key: usize) -> io::Result<()> {
+    debug_assert!(key >= KEY_JOB);
+    let associate = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+        CompletionKey: key as *mut c_void,
+        CompletionPort: port.raw(),
+    };
+    // SAFETY: an open job, and information of the class named, of its size; the key is a
+    // number, handed back with each message.
+    sys::check(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectAssociateCompletionPortInformation,
+            (&raw const associate).cast(),
+            size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+        )
+    })
+}
+
+/// A job that kills what is left in it when it closes and holds the memory of everything in
+/// it to `memory`.
+fn job(memory: Option<u64>) -> io::Result<OwnedHandle> {
     // SAFETY: no security attributes or name.
     let job = sys::owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
     // SAFETY: all zeros is a valid limit of nothing.
@@ -230,19 +255,6 @@ fn job(memory: Option<u64>, port: &Port, serial: u64) -> io::Result<OwnedHandle>
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-    })?;
-    let associate = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
-        CompletionKey: (KEY_JOB + serial as usize) as *mut c_void,
-        CompletionPort: port.raw(),
-    };
-    // SAFETY: as above; the key is a number, handed back with each message.
-    sys::check(unsafe {
-        SetInformationJobObject(
-            job.as_raw_handle(),
-            JobObjectAssociateCompletionPortInformation,
-            (&raw const associate).cast(),
-            size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
         )
     })?;
     Ok(job)
@@ -460,35 +472,48 @@ fn upper(c: u16) -> u16 {
     }
 }
 
-/// Asks the thread pool to post [`KEY_EXIT`] with `serial` to the port once the process has
-/// ended; unregistered, and waited out, when dropped.
-pub(super) struct Waiting {
-    wait: HANDLE,
-    context: *mut Waiter,
+/// What the thread pool's wait posts once the process has ended: [`KEY_EXIT`] with the bits
+/// of its spawn's handle, to the driver's port. Inline in the spawn's entry of the driver's
+/// slab, which never moves while it is there, and read by a thread of the pool's while the
+/// wait is registered (`UnsafeCell`; no `&mut` of the spawn may assume it alone reaches it:
+/// `PhantomPinned`). The driver drops the spawn's [`Waiting`], which waits out a call in
+/// progress, before the spawn leaves its entry.
+pub(super) struct Waiter {
+    posted: UnsafeCell<(HANDLE, u64)>,
+    _pinned: PhantomPinned,
 }
 
-struct Waiter {
-    port: Arc<Port>,
-    serial: u64,
+impl Waiter {
+    /// Posting to `port`, which outlives every wait of the driver's, with `id`.
+    pub(super) fn new(port: &Port, id: u64) -> Waiter {
+        Waiter { posted: UnsafeCell::new((port.raw(), id)), _pinned: PhantomPinned }
+    }
+}
+
+/// Asks the thread pool to post as its [`Waiter`] says once the process has ended;
+/// unregistered, and waited out, when dropped.
+pub(super) struct Waiting {
+    wait: HANDLE,
 }
 
 /// # Safety
-/// `context` is the `Waiter` that `Waiting::new` leaked with `Box::into_raw`, called only by
-/// the thread pool's wait, which `Waiting::drop` unregisters (waiting for a call in progress)
-/// before it frees the `Waiter`.
+/// `context` is a [`Waiter`] that stays where it is until the wait that calls this is
+/// unregistered by `Waiting::drop`, which waits for a call in progress.
 unsafe extern "system" fn ended(context: *mut c_void, _timed_out: bool) {
-    // SAFETY: the `Waiter` of `Waiting::new`, alive until its wait is unregistered, which
-    // waits for this call to return.
-    let waiter = unsafe { &*context.cast::<Waiter>() };
-    _ = waiter.port.post(KEY_EXIT, 0, waiter.serial as usize);
+    // SAFETY: as above; the waiter is written only as it is made, before its wait.
+    let (port, id) = unsafe { *context.cast::<(HANDLE, u64)>() };
+    _ = sys::post(port, KEY_EXIT, 0, id as usize);
 }
 
 impl Waiting {
-    pub(super) fn new(process: &OwnedHandle, port: &Arc<Port>, serial: u64) -> io::Result<Waiting> {
-        let context = Box::into_raw(Box::new(Waiter { port: port.clone(), serial }));
+    /// # Safety
+    ///
+    /// `waiter` stays where it is, alive, until the `Waiting` is dropped.
+    pub(super) unsafe fn new(process: &OwnedHandle, waiter: &Waiter) -> io::Result<Waiting> {
+        let context = waiter.posted.get();
         let mut wait = std::ptr::null_mut();
         // SAFETY: an open process, a callback of the signature asked for, and a context that
-        // lives until the wait is unregistered.
+        // lives until the wait is unregistered (the caller's word).
         let ok = unsafe {
             RegisterWaitForSingleObject(
                 &mut wait,
@@ -499,31 +524,35 @@ impl Waiting {
                 WT_EXECUTEONLYONCE,
             )
         };
-        if ok == 0 {
-            let error = io::Error::last_os_error();
-            // SAFETY: the context made above, which no wait holds.
-            drop(unsafe { Box::from_raw(context) });
-            return Err(error);
+        match ok {
+            0 => Err(io::Error::last_os_error()),
+            _ => Ok(Waiting { wait }),
         }
-        Ok(Waiting { wait, context })
     }
 }
 
 impl Drop for Waiting {
     fn drop(&mut self) {
         // SAFETY: the wait `new` registered; `INVALID_HANDLE_VALUE` waits for a callback in
-        // progress to return, after which no call reads the context.
+        // progress to return, after which no call reads the waiter.
         unsafe { UnregisterWaitEx(self.wait, INVALID_HANDLE_VALUE) };
-        // SAFETY: the context `new` made, read by no one now.
-        drop(unsafe { Box::from_raw(self.context) });
     }
 }
 
 impl Finish {
+    pub(super) fn program(&self) -> &Path {
+        &self.command.program
+    }
+
+    /// What the process is to be given on its standard input.
+    pub(super) fn stdin(&self) -> &[u8] {
+        &self.command.stdin
+    }
+
     /// How the process ended: its exit code, the most memory its job held, what its sandbox
     /// says it read. Removes what was made for it.
     pub(super) fn exited(
-        self,
+        &self,
         process: &OwnedHandle,
         job: &OwnedHandle,
         stdout: Vec<u8>,

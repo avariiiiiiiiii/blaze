@@ -13,14 +13,11 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
-rustc-hash.workspace = true
 smallvec.workspace = true
 salsa.workspace = true
-la-arena.workspace = true
 rustc_apfloat.workspace = true
 
 ra-ap-rustc_pattern_analysis.workspace = true
-ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true
 
 # local deps
@@ -30,13 +27,11 @@ hir-expand.workspace = true
 hir-ty.workspace = true
 intern.workspace = true
 stdx.workspace = true
-syntax.workspace = true
 
 [dev-dependencies]
-hir.workspace = true
-span.workspace = true
+# The tests' database links hir-ty-mir for the MIR providers the constants patterns name need.
+hir-ty-mir.workspace = true
 test-fixture.workspace = true
-triomphe.workspace = true
 
 [features]
 in-rust-tree = ["hir-ty/in-rust-tree"]

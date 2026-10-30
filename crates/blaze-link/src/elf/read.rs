@@ -28,7 +28,7 @@ use self::strings::Table;
 use crate::NativeKind;
 use crate::model::{
     Apply, Binding, Data, Group, Name, Names, NativeFile, NativeFixup, Object, Section,
-    SectionKind, Symbol, SymbolDef, SymbolKind,
+    SectionKind, Symbol, SymbolDef, SymbolKind, Tie,
 };
 
 type Header = elf::FileHeader64<Endianness>;
@@ -195,12 +195,15 @@ fn defined<'data>(
     data: &'data [u8],
 ) -> Result<(&'data [u8], Vec<u32>), String> {
     if !data.starts_with(&elf::ELFMAG) {
+        // alloc: error path
         return Err(format!("{name}: an archive member that is not an ELF object"));
     }
     let header = header(arch, name, data)?;
     if header.e_type(ENDIAN) != elf::ET_REL {
+        // alloc: error path
         return Err(format!("{name}: an archive member that is not a relocatable object (ET_REL)"));
     }
+    // alloc: error path
     let error = |error: object::read::Error| format!("{name}: {error}");
     let sections = header.sections(ENDIAN, data).map_err(error)?;
     let symtab = sections.symbols(ENDIAN, data, elf::SHT_SYMTAB).map_err(error)?;
@@ -226,6 +229,7 @@ fn defined<'data>(
 /// Reads a relocatable object.
 fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
     let header = header(arch, name, data)?;
+    // alloc: error path
     let error = |error: object::read::Error| format!("{name}: {error}");
     let full = full(name);
     let sections = header.sections(ENDIAN, data).map_err(error)?;
@@ -271,6 +275,25 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             self::section(arch, name, &mut shstrtab, index.0, section, data, &mut object.names)?;
         object.sections.push(section);
     }
+    // lld's `SHF_LINK_ORDER`: a loaded section is tied to the one its `sh_link` names; with
+    // `sh_link` 0 it is read as if without the flag, as lld does.
+    for (index, header) in sections.enumerate() {
+        let to = header.sh_link(ENDIAN) as usize;
+        if header.sh_flags(ENDIAN) & u64::from(elf::SHF_LINK_ORDER) == 0
+            || to == 0
+            || object.sections[index.0].what == SectionKind::Dropped
+        {
+            continue;
+        }
+        if object.sections.get(to).is_none_or(|it| it.what == SectionKind::Dropped) || to == index.0 {
+            // alloc: error path
+            return Err(format!(
+                "{name}: section {} is SHF_LINK_ORDER to section {to}, which is not another section the link loads",
+                object.name(object.sections[index.0].name)
+            ));
+        }
+        object.ties.push(Tie { section: index.0 as u32, to: to as u32, ordered: true });
+    }
 
     let mut strtab = match symtab.len() {
         0 => Table::new(name, &[])?,
@@ -305,17 +328,20 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                         .symbol_section(ENDIAN, symbol, index)
                         .map_err(error)?
                         .ok_or_else(|| {
+                            // alloc: error path
                             format!("{name}: symbol {symbol_name} has no extended section index")
                         })?
                         .0
                 } else if shndx < elf::SHN_LORESERVE {
                     usize::from(shndx)
                 } else {
+                    // alloc: error path
                     return Err(format!(
                         "{name}: symbol {symbol_name} is in reserved section {shndx:#x}"
                     ));
                 };
                 if section >= object.sections.len() {
+                    // alloc: error path
                     return Err(format!(
                         "{name}: symbol {symbol_name} is in section {section}, which the object \
                          does not have"
@@ -333,10 +359,12 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             elf::STB_WEAK => Binding::Weak,
             elf::STB_GLOBAL | elf::STB_GNU_UNIQUE => Binding::Global,
             other => {
+                // alloc: error path
                 return Err(format!("{name}: symbol {symbol_name} has binding {other}"));
             }
         };
         if symbol.st_type() == elf::STT_GNU_IFUNC {
+            // alloc: error path
             return Err(format!(
                 "{name}: symbol {symbol_name} is an IFUNC (STT_GNU_IFUNC), which blaze-link does \
                  not link yet: it has no IRELATIVE relocation to resolve one at load"
@@ -360,6 +388,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         }
         let group = object.sections[index.0].name;
         if section.sh_link(ENDIAN) as usize != symtab.section().0 {
+            // alloc: error path
             return Err(format!(
                 "{name}: group {} names a symbol table other than .symtab",
                 object.name(group)
@@ -367,6 +396,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         }
         let signature = section.sh_info(ENDIAN) as usize;
         let Some(symbol) = object.symbols.get(signature).filter(|_| signature != 0) else {
+            // alloc: error path
             return Err(format!(
                 "{name}: group {}'s signature is symbol {signature}, which the object does \
                  not have",
@@ -385,6 +415,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         for member in members {
             let member = member.get(ENDIAN);
             if member as usize >= object.sections.len() || member == 0 {
+                // alloc: error path
                 return Err(format!(
                     "{name}: group {} names section {member}, which the object does not have",
                     object.name(group_name)
@@ -416,6 +447,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         let sh_type = section.sh_type(ENDIAN);
         let relocations = object.sections[index].name;
         let Some(applied) = object.sections.get(target).filter(|_| target != 0) else {
+            // alloc: error path
             return Err(format!(
                 "{name}: relocation section {} applies to section {target}, which the object \
                  does not have",
@@ -426,6 +458,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             continue;
         }
         if sh_type != elf::SHT_RELA {
+            // alloc: error path
             return Err(format!(
                 "{name}: section {} has {} relocations ({}): x86-64 and AArch64 objects carry \
                  their addends (SHT_RELA)",
@@ -435,6 +468,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             ));
         }
         if section.sh_link(ENDIAN) as usize != symtab.section().0 {
+            // alloc: error path
             return Err(format!(
                 "{name}: relocation section {} names a symbol table other than .symtab",
                 object.name(relocations)
@@ -454,6 +488,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             let symbol = rela.r_sym(ENDIAN, false);
             let addend = rela.r_addend(ENDIAN);
             let place = |object: &Object| {
+                // alloc: error path
                 format!(
                     "{name}: section {}: relocation {} ({r_type}) at {at:#x}",
                     object.name(object.sections[target].name),
@@ -461,6 +496,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                 )
             };
             if symbol as usize >= symtab.len() {
+                // alloc: error path
                 return Err(format!(
                     "{}: symbol {symbol}, which the object does not have",
                     place(&object)
@@ -471,6 +507,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                 Arch::Aarch64 => aarch64(r_type),
                 Arch::Wasm32 => Err("an ELF relocation in a wasm32 link"),
             }
+            // alloc: error path
             .map_err(|why| format!("{}: {why}", place(&object)))?;
             let make = |apply, symbol, minus| NativeFixup { at, apply, symbol, addend, minus };
             let fixup = match how {
@@ -480,6 +517,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
                 How::Size(apply) => {
                     let size = added
                         .size(&mut object.symbols, &object.names, symtab.symbols(), symbol)
+                        // alloc: error path
                         .map_err(|why| format!("{}: {why}", place(&object)))?;
                     make(apply, size, None)
                 }
@@ -543,6 +581,7 @@ fn section(
         });
     }
     if flag(elf::SHF_COMPRESSED) {
+        // alloc: error path
         return Err(format!(
             "{name}: section {section_name} is compressed (SHF_COMPRESSED), which a loaded \
              section may not be"
@@ -559,6 +598,7 @@ fn section(
             flag(elf::SHF_EXECINSTR),
             flag(elf::SHF_TLS),
         )
+        // alloc: error path
         .map_err(|why| format!("{name}: section {section_name}: {why}"))?;
         SectionKind::Alloc(class, rank)
     };
@@ -568,6 +608,7 @@ fn section(
         // Bounds-checked against the input here, so the range below can't pass its end.
         let bytes = section
             .data(ENDIAN, data)
+            // alloc: error path
             .map_err(|error| format!("{name}: section {section_name}: {error}"))?;
         let start = section.sh_offset(ENDIAN);
         Data::Input(start..start + bytes.len() as u64)
@@ -754,18 +795,21 @@ impl Added {
         let of = &symbols[target as usize];
         match (of.def, of.binding) {
             (SymbolDef::Undefined, _) => {
+                // alloc: error path
                 return Err(format!(
                     "the size of {}, which the object does not define",
                     names.at(of.name)
                 ));
             }
             (SymbolDef::Common { .. }, _) => {
+                // alloc: error path
                 return Err(format!(
                     "the size of common symbol {}, which is known only once the link merges it",
                     names.at(of.name)
                 ));
             }
             (_, Binding::Weak) => {
+                // alloc: error path
                 return Err(format!(
                     "the size of weak symbol {}, which another object may replace",
                     names.at(of.name)

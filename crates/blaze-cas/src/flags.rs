@@ -5,9 +5,15 @@
 //!
 //! A read sets a flag with no lock (docs/v2/plan/design/concurrency.md "Reads"): each column is
 //! atomic words, as many as the table has rows when it is made, and a flag already set is only
-//! loaded, so reading a record again writes no shared cache line.
+//! loaded, so reading a record again writes no shared cache line. The words sit on a region
+//! tagged `Tag::Store` (`words.rs`), committed whole when the columns are made.
 
-use crate::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
+
+use crate::{
+    sync::atomic::{AtomicU64, Ordering},
+    words::Words,
+};
 
 /// A record's row in its tier's flag columns.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,22 +49,33 @@ pub(crate) const FLAGS: usize = 6;
 const RELAXED: Ordering = Ordering::Relaxed;
 
 /// The flag columns of a fixed number of rows (an index table's slots).
-#[derive(Debug)]
 pub(crate) struct Bits {
-    /// `FLAGS` columns of `words` words each.
-    bits: Box<[AtomicU64]>,
+    /// `FLAGS` columns of `words` words each, one stretch.
+    bits: Words<AtomicU64>,
     words: usize,
+}
+
+impl fmt::Debug for Bits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Bits").field("rows", &(self.words * 64)).finish_non_exhaustive()
+    }
 }
 
 impl Bits {
     pub(crate) fn new(rows: u64) -> Bits {
         let words = rows.div_ceil(64) as usize;
-        Bits { bits: (0..FLAGS * words).map(|_| AtomicU64::new(0)).collect(), words }
+        let bits = Words::new(FLAGS * words);
+        bits.make(0, 0, FLAGS * words);
+        Bits { bits, words }
+    }
+
+    fn all(&self) -> &[AtomicU64] {
+        self.bits.get(0, 0, FLAGS * self.words)
     }
 
     fn word(&self, row: u64, flag: Flag) -> Option<(&AtomicU64, u64)> {
         let at = usize::try_from(row / 64).ok().filter(|&at| at < self.words)?;
-        Some((&self.bits[flag as usize * self.words + at], 1 << (row % 64)))
+        Some((&self.all()[flag as usize * self.words + at], 1 << (row % 64)))
     }
 
     pub(crate) fn get(&self, row: u64, flag: Flag) -> bool {
@@ -77,10 +94,11 @@ impl Bits {
     /// A new period of reading: what was read becomes read before, what was made made before.
     /// Only the store calls it; a flag set meanwhile lands in one period or the other.
     pub(crate) fn rotate(&self) {
+        let bits = self.all();
         for (from, to) in [(Flag::Read, Flag::ReadBefore), (Flag::New, Flag::NewBefore)] {
             for at in 0..self.words {
-                let moved = self.bits[from as usize * self.words + at].swap(0, RELAXED);
-                self.bits[to as usize * self.words + at].store(moved, RELAXED);
+                let moved = bits[from as usize * self.words + at].swap(0, RELAXED);
+                bits[to as usize * self.words + at].store(moved, RELAXED);
             }
         }
     }
@@ -108,6 +126,36 @@ mod tests {
         assert!(bits.get(700, Flag::Verified), "rotating keeps the rest");
         bits.rotate();
         assert!(!bits.get(3, Flag::ReadBefore));
+    }
+
+    /// Columns of a table big enough to span many commit steps answer as a `Vec<bool>` a flag
+    /// does, through sets, rotations and rows past the end.
+    #[test]
+    #[cfg(not(blaze_check))]
+    fn the_columns_answer_as_vecs_of_bools_do() {
+        let rows = 3 << 20;
+        let bits = Bits::new(rows);
+        let flags = [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
+        let mut model = vec![vec![false; rows as usize]; FLAGS];
+        let mut rng = blaze_ids::rng::SplitMix64::new(5);
+        for step in 0..100_000u64 {
+            let row = rng.next_u64() % (rows + 64);
+            let flag = flags[(rng.next_u64() % FLAGS as u64) as usize];
+            if step % 9 == 0 {
+                bits.set(row, flag);
+                if row < rows {
+                    model[flag as usize][row as usize] = true;
+                }
+            } else if step % 10_007 == 0 {
+                bits.rotate();
+                for (from, to) in [(Flag::Read, Flag::ReadBefore), (Flag::New, Flag::NewBefore)] {
+                    model[to as usize] = std::mem::replace(&mut model[from as usize], vec![false; rows as usize]);
+                }
+            } else {
+                let want = row < rows && model[flag as usize][row as usize];
+                assert_eq!(bits.get(row, flag), want, "step {step}: row {row} {flag:?}");
+            }
+        }
     }
 
     #[test]

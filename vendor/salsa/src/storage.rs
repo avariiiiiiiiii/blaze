@@ -19,10 +19,9 @@ pub unsafe trait HasStorage: Database + Sized {
 }
 
 /// The state of a Salsa database. It is `Sync`: one database is read through `&` from any
-/// number of threads at once, each task with its own query stack (see [`set_task_depth`]), and
-/// written through `&mut` alone. There are no second handles to a database.
-///
-/// [`set_task_depth`]: crate::set_task_depth
+/// number of threads at once, each task with its own query stack (see
+/// [`Database::task_depth`](crate::Database::task_depth)), and written through `&mut` alone.
+/// There are no second handles to a database.
 pub struct Storage<Db> {
     zalsa_impl: Box<Zalsa>,
 
@@ -43,15 +42,19 @@ impl<Db: Database> Storage<Db> {
     /// Create a new database storage.
     ///
     /// The `event_callback` function is invoked by the salsa runtime at various points during execution.
+    // alloc: setup, once per database: its storage and event callback
     pub fn new(event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync + 'static>>) -> Self {
+        // alloc: setup, once per database: its storage and event callback
         Self::with_jars(event_callback, Vec::new())
     }
 
     fn with_jars(
+        // alloc: setup, once per database: its storage and event callback
         event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync + 'static>>,
         jars: Vec<ErasedJar>,
     ) -> Self {
         Self {
+            // alloc: setup, once per database: its storage and event callback
             zalsa_impl: Box::new(Zalsa::new::<Db>(event_callback, jars)),
             task_locals: TaskLocals::new(),
             phantom: PhantomData,
@@ -83,6 +86,7 @@ impl<Db: Database> Storage<Db> {
 /// This type can be created with the [`Storage::builder`] function.
 pub struct StorageBuilder<Db> {
     jars: Vec<ErasedJar>,
+    // alloc: setup, once per database: its storage and event callback
     event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync + 'static>>,
     _db: PhantomData<Db>,
 }
@@ -90,6 +94,7 @@ pub struct StorageBuilder<Db> {
 impl<Db> Default for StorageBuilder<Db> {
     fn default() -> Self {
         Self {
+            // alloc: setup, once per database: its storage and event callback
             jars: Vec::new(),
             event_callback: None,
             _db: PhantomData,
@@ -103,6 +108,7 @@ impl<Db: Database> StorageBuilder<Db> {
     /// The `event_callback` function will be invoked by the salsa runtime at various points during execution.
     pub fn event_callback(
         mut self,
+        // alloc: setup, once per database: its storage and event callback
         callback: Box<dyn Fn(crate::Event) + Send + Sync + 'static>,
     ) -> Self {
         self.event_callback = Some(callback);
@@ -137,6 +143,6 @@ unsafe impl<T: HasStorage> ZalsaDatabase for T {
 
     #[inline(always)]
     fn zalsa_local(&self) -> &ZalsaLocal {
-        self.storage().task_locals.current()
+        self.storage().task_locals.current(self.task_depth())
     }
 }

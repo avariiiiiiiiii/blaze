@@ -35,6 +35,7 @@ impl Cancelled {
     pub(crate) fn throw(self) -> ! {
         // We use resume and not panic here to avoid running the panic
         // hook (that is, to avoid collecting and printing backtrace).
+        // alloc: error path: cancellation unwinds once per cancelled task
         panic::resume_unwind(Box::new(self));
     }
 

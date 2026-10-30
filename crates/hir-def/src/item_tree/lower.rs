@@ -6,7 +6,7 @@ use std::{
     mem,
 };
 
-use base_db::{Crate, FxIndexSet, SourceDatabase};
+use base_db::{Db, Crate, FxIndexSet};
 use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
@@ -28,10 +28,9 @@ use syntax::{
 
 use crate::item_tree::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, Impl,
-    ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId,
-    ModPath, NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias,
-    Union, Use, UseTree, UseTreeId, VisibilityExplicitness,
-    attrs::lower_attrs_into,
+    ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, ModPath,
+    NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
+    UseTree, UseTreeId, VisibilityExplicitness, attrs::lower_attrs_into,
 };
 
 /// The index of the next element of an array `len` long, as a tree's `u32` ids count. The top
@@ -52,7 +51,7 @@ fn push<T>(column: &mut Vec<T>, value: T) -> u32 {
 /// Every column moved out into an exact-size one, `column` left empty with its capacity: one
 /// allocation per non-empty column, none for an empty one.
 fn column<T>(column: &mut Vec<T>) -> Box<[T]> {
-    column.drain(..).collect()
+    column.drain(..).collect() // alloc: the tree's column, once a tree at its length
 }
 
 thread_local! {
@@ -124,6 +123,7 @@ struct Scoped<T> {
 
 impl<T> Default for Scoped<T> {
     fn default() -> Self {
+        // alloc: none, both empty; the worker's builder keeps their capacity
         Scoped { done: Vec::new(), scope: FxIndexSet::default() }
     }
 }
@@ -141,7 +141,7 @@ impl<T: Hash + Eq> Scoped<T> {
 
     fn finish(&mut self) -> Box<[T]> {
         self.seal();
-        self.done.drain(..).collect()
+        self.done.drain(..).collect() // alloc: the tree's table, once a tree at its length
     }
 }
 
@@ -332,7 +332,7 @@ impl syntax_bridge::SpanMapper for Spans<'_> {
 }
 
 pub(super) struct Ctx<'db> {
-    pub(super) db: &'db dyn SourceDatabase,
+    pub(super) db: &'db Db,
     tree: TreeBuilder,
     ids: Ids<'db>,
     span_map: OnceCell<Spans<'db>>,
@@ -343,7 +343,7 @@ pub(super) struct Ctx<'db> {
 }
 
 impl<'db> Ctx<'db> {
-    pub(super) fn new(db: &'db dyn SourceDatabase, file: HirFileId, krate: Crate) -> Self {
+    pub(super) fn new(db: &'db Db, file: HirFileId, krate: Crate) -> Self {
         Self {
             db,
             tree: SCRATCH.take(),
@@ -358,7 +358,7 @@ impl<'db> Ctx<'db> {
     /// A context lowering one item of a file, at `start` of it: `ids` and `spans` its own, as
     /// [`super::items::ItemSyntax`] keeps them, so it reads nothing of the file's.
     pub(super) fn for_item(
-        db: &'db dyn SourceDatabase,
+        db: &'db Db,
         krate: Crate,
         ids: &'db [[u32; 3]],
         spans: &'db RealSpanMap,
@@ -459,7 +459,7 @@ impl<'db> Ctx<'db> {
         self.tree.seal();
     }
 
-    pub(super) fn lower_module_items(mut self, item_owner: &dyn HasModuleItem) -> ItemTree {
+    pub(super) fn lower_module_items(mut self, item_owner: &impl HasModuleItem) -> ItemTree {
         for item in item_owner.items() {
             self.pend_top(&item);
         }
@@ -542,6 +542,7 @@ impl<'db> Ctx<'db> {
     /// Its attributes are on the expression: one that is configured out is no item at all.
     fn lower_macro_stmt(&mut self, expr: &ast::MacroExpr) -> Option<ModItemId> {
         let call = expr.macro_call()?;
+        // clone: a cursor, which allocates nothing; only an `Expr` has the attributes
         if self.cfg_disabled(&ast::Expr::MacroExpr(expr.clone())) {
             return None;
         }
@@ -576,6 +577,7 @@ impl<'db> Ctx<'db> {
 
     fn lower_struct(&mut self, strukt: &ast::Struct) -> Option<ModItemId> {
         let visibility = self.lower_visibility_from_ast(strukt);
+        // clone: allocates nothing, a `ModPath` is an interned slice
         let visibility_id = self.tree.visibility(visibility.clone());
         let name = strukt.name()?.as_name();
         let ast_id = self.ids.ast_id(strukt);
@@ -767,11 +769,8 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility(extern_crate);
         let ast_id = self.ids.ast_id(extern_crate);
 
-        let res = ExternCrate {
-            name: self.tree.name(name),
-            alias: self.tree.alias(alias),
-            visibility,
-        };
+        let res =
+            ExternCrate { name: self.tree.name(name), alias: self.tree.alias(alias), visibility };
         let data = push(&mut self.tree.extern_crates, res);
         Some(self.tree.item(ItemKind::ExternCrate, ast_id.upcast(), data))
     }
@@ -869,7 +868,7 @@ impl syntax_bridge::SpanMapper for FakeSpanMap {
 }
 
 struct UseTreeLowering<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     /// The lowered trees' syntax, in the order [`Use::expand`] numbers them: a tree before its
     /// children. Only the source map ([`lower_use_tree`]) wants it.
     mapping: Option<&'a mut Arena<ast::UseTree>>,
@@ -879,7 +878,7 @@ struct UseTreeLowering<'a> {
 impl UseTreeLowering<'_> {
     fn map(&mut self, tree: &ast::UseTree) {
         if let Some(mapping) = &mut self.mapping {
-            mapping.alloc(tree.clone());
+            mapping.alloc(tree.clone()); // clone: a cursor, for the source map alone
         }
     }
 
@@ -887,6 +886,7 @@ impl UseTreeLowering<'_> {
     fn lower_use_tree(
         &mut self,
         tree: ast::UseTree,
+        // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
         span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
     ) -> Option<UseTreeId> {
         if let Some(use_tree_list) = tree.use_tree_list() {
@@ -981,8 +981,9 @@ impl UseTreeLowering<'_> {
 
 /// The syntax of `tree`'s `use` trees, in the order [`Use::expand`] numbers them.
 pub(crate) fn lower_use_tree(
-    db: &dyn SourceDatabase,
+    db: &Db,
     tree: ast::UseTree,
+    // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
     span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
 ) -> Option<Arena<ast::UseTree>> {
     let mut scratch = TreeBuilder::default();
@@ -997,8 +998,9 @@ fn private_vis() -> RawVisibility {
 }
 
 pub(crate) fn visibility_from_ast(
-    db: &dyn SourceDatabase,
+    db: &Db,
     node: Option<ast::Visibility>,
+    // dyn: `ModPath::from_src`'s callback (hir-expand), once a path
     span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
 ) -> RawVisibility {
     let Some(node) = node else { return private_vis() };

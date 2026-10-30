@@ -23,7 +23,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroExpansionParseError) -> Vec<F
     let expansion = call.as_ref().and_then(|call| cx.sema.expand_macro_call(call));
     let (Some(call), Some(expansion)) = (call, expansion) else {
         let message = format!("the expansion of this macro does not parse: {error}");
-        return vec![Found::new(Diag::error(None, message, cx.span(d.range)), Phase::Resolve)];
+        return vec![Found::new(Diag::error(None, message, cx.span(d.range)), Phase::Expand)];
     };
     let site = cx.span(InFile::new(d.range.file_id, call.syntax().text_range()));
     let diag = parse::expansion_error(
@@ -34,5 +34,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroExpansionParseError) -> Vec<F
         &error.to_string(),
         error.range().start(),
     );
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }

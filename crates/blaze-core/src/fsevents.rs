@@ -1,30 +1,40 @@
 //! Watching a tree on macOS with FSEvents: one stream per watch, file-level events with no
-//! latency, delivered on a serial dispatch queue of the stream's own and handed on as
+//! latency, delivered on a serial dispatch queue of the watch's own and handed on as
 //! [`Done::Changed`].
 //!
-//! A flush is a sync cookie, as watchman's: each stream also watches a directory of cookies of
+//! A flush is a sync cookie, as watchman's: each watch also watches a directory of cookies of
 //! its own, a flush writes a file there, and the flush is told once the stream hears of that
 //! file. fseventsd reads the kernel's one queue of events in order and hands a stream its
 //! events in that order, so by then every change made before the cookie has been heard.
 //! `FSEventStreamFlushSync` is no barrier: it flushes what fseventsd holds back for latency,
 //! not what the kernel queued that fseventsd has not read yet, and it blocks the caller.
 //!
-//! A journal ([`Stream::journal`]) is a stream started `sinceWhen` a saved event ID, which
+//! A journal ([`Watch::journal`]) is a stream started `sinceWhen` a saved event ID, which
 //! fseventsd answers from its store of the volume's events before the live ones, ending the
 //! history with `kFSEventStreamEventFlagHistoryDone`. Event IDs are the system's, in the order
 //! events happened; a saved ID means something only while the volume's store has the UUID it
 //! was saved with (`FSEventsCopyUUIDForDevice`) and the system's IDs have not passed below it
 //! (wrapped).
+//!
+//! Memory (docs/v2/plan/design/memory.md): a [`Watch`] is made once and runs one stream after
+//! another. Its directory of cookies, its dispatch queue, the CFString of its cookies and every
+//! buffer the callback uses are kept across streams, so a warm watch's start, batches and stop
+//! allocate only what a completion carries (its `Vec` and each name told once). Completions go
+//! to a [`Tell`] the driver gives, not a boxed closure. FSEvents' callback holds the address of
+//! the watch's [`Shared`]: the watch does not move while a stream runs ([`Watch::start`]'s
+//! contract, which the driver holds by keeping it in a [`blaze_mem::Slab`] entry, which never
+//! moves).
 
 use std::{
-    ffi::{CStr, CString, c_char, c_void},
+    ffi::{CStr, OsStr, c_char, c_void},
     io,
-    os::unix::ffi::{OsStrExt as _, OsStringExt as _},
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{
         Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use crate::{Completion, Cursor, Done, FileName, Journaled, Lost, Tag};
@@ -84,6 +94,10 @@ const LOSES: u32 = EVENT_MUST_SCAN_SUB_DIRS
     | EVENT_MOUNT
     | EVENT_UNMOUNT;
 
+/// How long the callback waits for room before it looks again at whether its stream is
+/// stopping: a stop waits on the queue, so a callback waiting on a full sink must give up.
+const ROOM: Duration = Duration::from_millis(1);
+
 // SAFETY: these signatures match CoreFoundation's CFString.h, CFArray.h and CFUUID.h (`CFRef`
 // is `CFTypeRef` and `CFUUIDRef`, `CFIndex` is `isize`, `CFUUIDBytes` is laid out as its
 // sixteen `UInt8` fields); a mismatch would be UB at every call.
@@ -131,6 +145,30 @@ unsafe extern "C" {
     fn dispatch_release(object: *mut c_void);
 }
 
+/// Where a watch's completions go, from its queue's thread.
+pub(crate) trait Tell: Send + Sync + 'static {
+    /// Hands `completion` on, waiting up to `wait` for room: `Err(Some(it))` when there was
+    /// none by then, `Err(None)` when nobody takes completions any more.
+    fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>>;
+}
+
+/// A bounded channel: no allocation per completion.
+impl Tell for crossbeam_channel::Sender<Completion> {
+    fn tell(&self, completion: Completion, wait: Duration) -> Result<(), Option<Completion>> {
+        self.send_timeout(completion, wait).map_err(|error| match error {
+            crossbeam_channel::SendTimeoutError::Timeout(completion) => Some(completion),
+            crossbeam_channel::SendTimeoutError::Disconnected(_) => None,
+        })
+    }
+}
+
+/// An unbounded channel: always room, and a block of it allocated per 31 completions.
+impl Tell for std::sync::mpsc::Sender<Completion> {
+    fn tell(&self, completion: Completion, _: Duration) -> Result<(), Option<Completion>> {
+        self.send(completion).map_err(|_| None)
+    }
+}
+
 /// What a stream tells of what it hears.
 enum Mode {
     /// [`Done::Changed`], from when it started.
@@ -149,31 +187,41 @@ struct Journal {
     caught_up: AtomicBool,
 }
 
-/// What the callback reads, on the stream's queue.
-struct Shared {
+/// What the callback reads, on the watch's queue. Set by [`Watch`] only while no stream runs.
+struct Shared<S> {
     tag: Tag,
-    dir: FileName,
+    /// The watched directory, from the first start on.
+    dir: Option<FileName>,
     /// The root with its symlinks resolved, as FSEvents names paths.
     root: PathBuf,
     /// The watched directory with its symlinks resolved, where it is one of its own.
     real_dir: PathBuf,
-    /// This stream's cookies, symlinks resolved: watched with `real_dir`, named by the tag of
+    /// This watch's cookies, symlinks resolved: watched with `real_dir`, named by the tag of
     /// the flush that wrote each.
     cookies: PathBuf,
     /// Each flush whose cookie the stream has not heard of yet.
     flushes: Mutex<Vec<Tag>>,
     /// `cookies`, kept to name a flush's cookie in without allocating ([`with_cookie`]).
     writing: Mutex<PathBuf>,
-    /// The callback's buffers, kept for the stream's life: on its queue only, so never
-    /// waited for.
+    /// The callback's buffers, kept for the watch's life: on its queue only, so never waited
+    /// for.
     heard: Mutex<Heard>,
-    send: Box<dyn Fn(Completion) + Send + Sync>,
+    sink: S,
     stopped: AtomicBool,
     mode: Mode,
+    /// What the callbacks allocated beyond what their completions carry.
+    #[cfg(test)]
+    overhead: AtomicU64,
+    /// What the running callback allocated for what its completions carry.
+    #[cfg(test)]
+    payload: AtomicU64,
 }
 
-/// The callback's buffers, grown once to their most and reused, so a batch that holds a
-/// cookie allocates nothing (docs/v2/plan/design/memory.md: scratch reused per worker).
+/// A name in [`Heard::text`]: its start and end.
+type Span = (u32, u32);
+
+/// The callback's buffers, grown once to their most and reused, so a batch allocates only what
+/// its completion carries (docs/v2/plan/design/memory.md: scratch reused per worker).
 struct Heard {
     /// The cookies a batch named.
     cookies: Vec<u64>,
@@ -181,6 +229,18 @@ struct Heard {
     told: Vec<Tag>,
     /// `cookies`, to name a cookie in for its removal.
     path: PathBuf,
+    /// The names a batch gave, end to end: sorted and made unique before any [`FileName`] is
+    /// made of them.
+    text: String,
+    names: Vec<Span>,
+    /// A journal batch's lost subtrees: the name, why, and the order it was heard in.
+    lost: Vec<(Span, Lost, u32)>,
+}
+
+impl Heard {
+    fn str(&self, span: Span) -> &str {
+        &self.text[span.0 as usize..span.1 as usize]
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -202,7 +262,7 @@ fn decimal(mut n: u64, digits: &mut [u8; 20]) -> &[u8] {
 
 /// `dir` in a buffer with room for a cookie's name after it, for [`with_cookie`].
 fn cookie_buffer(dir: &Path) -> PathBuf {
-    // alloc: setup, once per stream.
+    // alloc: setup, once per watch.
     let mut buffer = PathBuf::with_capacity(dir.as_os_str().len() + 21);
     buffer.push(dir);
     buffer
@@ -213,45 +273,72 @@ fn cookie_buffer(dir: &Path) -> PathBuf {
 /// std names a path this short to the system from the stack.
 fn with_cookie<R>(dir: &mut PathBuf, tag: Tag, f: impl FnOnce(&Path) -> R) -> R {
     let mut digits = [0; 20];
-    dir.push(std::ffi::OsStr::from_bytes(decimal(tag.0, &mut digits)));
+    dir.push(OsStr::from_bytes(decimal(tag.0, &mut digits)));
     let result = f(dir);
     dir.pop();
     result
 }
 
-/// Numbers each stream's directory of cookies in the process's.
-static STREAMS: AtomicU64 = AtomicU64::new(0);
+/// Numbers each watch's directory of cookies in the process's.
+static WATCHES: AtomicU64 = AtomicU64::new(0);
 
-/// A directory of cookies for one stream, made empty: under the temporary directory, which
+/// A directory of cookies for one watch, made empty: under the temporary directory, which
 /// is the process's to write wherever the watched directory is.
 fn cookies() -> io::Result<PathBuf> {
-    let number = STREAMS.fetch_add(1, Ordering::Relaxed);
+    let number = WATCHES.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir()
-        // alloc: setup, once per stream.
+        // alloc: setup, once per watch.
         .join(format!("blaze-fsevents-{}", std::process::id()))
-        .join(number.to_string()); // alloc: setup, once per stream.
+        .join(number.to_string()); // alloc: setup, once per watch.
     _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::canonicalize(&dir)
 }
 
-/// Where a watch of `dir` under `root` looks, as FSEvents names paths.
-struct Paths {
-    root: PathBuf,
-    /// The watched directory as the root names it, for errors.
-    logical_dir: PathBuf,
-    real_dir: PathBuf,
+/// `path` NUL-terminated in `into`, which keeps its room.
+fn c_string(path: &Path, into: &mut Vec<u8>) -> io::Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"));
+    }
+    into.clear();
+    into.extend_from_slice(bytes);
+    into.push(0);
+    Ok(())
 }
 
-impl Paths {
-    fn of(root: &Path, dir: &FileName) -> io::Result<Paths> {
-        let real_root = std::fs::canonicalize(root).map_err(|error| {
-            io::Error::new(error.kind(), format!("watching under {}: {error}", root.display()))
-        })?;
-        let logical_dir = real_root.join(dir.as_str());
-        let real_dir = std::fs::canonicalize(&logical_dir).unwrap_or_else(|_| logical_dir.clone());
-        Ok(Paths { root: real_root, logical_dir, real_dir })
+/// The path NUL-terminated in `path` with its symlinks resolved, written to `out` (left as it
+/// is on an error): `realpath(3)` into a buffer on the stack, as `std::fs::canonicalize` does
+/// into one it allocates.
+fn realpath(path: &[u8], out: &mut PathBuf) -> io::Result<()> {
+    debug_assert_eq!(path.last(), Some(&0));
+    let mut resolved = [0 as c_char; libc::PATH_MAX as usize];
+    // SAFETY: a NUL-terminated path, and a buffer of `PATH_MAX` bytes, the most realpath
+    // writes.
+    let got = unsafe { libc::realpath(path.as_ptr().cast(), resolved.as_mut_ptr()) };
+    if got.is_null() {
+        return Err(io::Error::last_os_error());
     }
+    // SAFETY: realpath wrote a NUL-terminated path into `resolved`, alive for this borrow.
+    let bytes = unsafe { CStr::from_ptr(resolved.as_ptr()) }.to_bytes();
+    let out = out.as_mut_os_string();
+    out.clear();
+    out.push(OsStr::from_bytes(bytes));
+    Ok(())
+}
+
+/// Whether [`FileName::new`] takes `name`, without making one: checked before a batch's names
+/// are made unique, so a name is made once. A difference from it is caught where the name is
+/// made, and told as lost.
+fn file_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..")
+}
+
+/// Whether `name` is `dir` or under it, as [`FileName::is_under`].
+fn is_under(name: &str, dir: &str) -> bool {
+    name == dir || name.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The UUID of the FSEvents store of the volume `path` is on: of its nearest ancestor that is
@@ -270,6 +357,7 @@ fn store_of(path: &Path) -> io::Result<[u8; 16]> {
     if uuid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: an error path.
             format!("the volume of device {device} keeps no FSEvents store, so no journal of it"),
         ));
     }
@@ -280,82 +368,199 @@ fn store_of(path: &Path) -> io::Result<[u8; 16]> {
     Ok(bytes.bytes)
 }
 
-impl Shared {
-    /// The name under the watched directory of a path FSEvents gave: `None` for one outside
-    /// it, `Some(None)` for one under it that no [`FileName`] can name. `buffer` is room to
-    /// write the name in, reused across the paths of a batch.
-    fn name(&self, path: &Path, buffer: &mut String) -> Option<Option<FileName>> {
+impl<S: Tell> Shared<S> {
+    fn dir(&self) -> &FileName {
+        self.dir.as_ref().expect("a stream runs only once its directory is set")
+    }
+
+    /// Where under the watched directory a path FSEvents gave is: `None` for one outside it,
+    /// `Some(None)` for one under it that no [`FileName`] can name, else its name, written at
+    /// the end of `text`.
+    fn name(&self, path: &Path, text: &mut String) -> Option<Option<Span>> {
+        let dir = self.dir().as_str();
+        let start = text.len();
+        let span = |text: &String| (start as u32, text.len() as u32);
         if let Ok(rest) = path.strip_prefix(&self.real_dir) {
-            return Some(match rest.as_os_str().is_empty() {
-                true => Some(self.dir.clone()),
-                false => rest.to_str().and_then(|rest| {
-                    buffer.clear();
-                    buffer.push_str(self.dir.as_str());
-                    buffer.push('/');
-                    buffer.push_str(rest);
-                    FileName::new(buffer.as_str())
-                }),
-            });
+            if rest.as_os_str().is_empty() {
+                text.push_str(dir);
+                return Some(Some(span(text)));
+            }
+            let Some(rest) = rest.to_str() else { return Some(None) };
+            text.push_str(dir);
+            text.push('/');
+            text.push_str(rest);
+            if !file_name_ok(&text[start..]) {
+                text.truncate(start);
+                return Some(None);
+            }
+            return Some(Some(span(text)));
         }
         let rest = path.strip_prefix(&self.root).ok()?;
         let Some(rest) = rest.to_str() else { return Some(None) };
-        let name = FileName::new(rest)?;
-        name.is_under(&self.dir).then_some(Some(name))
+        if !file_name_ok(rest) || !is_under(rest, dir) {
+            return None;
+        }
+        text.push_str(rest);
+        Some(Some(span(text)))
     }
 
-    /// The cookie number of a path in this stream's cookies: `None` for one outside them,
+    /// The cookie number of a path in this watch's cookies: `None` for one outside them,
     /// `Some(None)` for the directory itself or a name that is no cookie's.
     fn cookie(&self, path: &Path) -> Option<Option<u64>> {
         let rest = path.strip_prefix(&self.cookies).ok()?;
         Some(rest.to_str().and_then(|it| it.parse::<u64>().ok()))
     }
+
+    /// Hands `completion` to the sink, waiting for room while the stream runs: a stream being
+    /// stopped tells nothing more.
+    fn send(&self, mut completion: Completion) {
+        loop {
+            match self.sink.tell(completion, ROOM) {
+                Ok(()) | Err(None) => return,
+                Err(Some(back)) if self.stopped.load(Ordering::Acquire) => {
+                    drop(back);
+                    return;
+                }
+                Err(Some(back)) => completion = back,
+            }
+        }
+    }
+
+    /// Runs `f`, which makes what a completion carries: counted apart from the callback's own
+    /// allocations in the allocation-budget tests.
+    #[inline]
+    fn payload<R>(&self, f: impl FnOnce() -> R) -> R {
+        #[cfg(test)]
+        {
+            let (result, used) = blaze_alloc_count::measure(f);
+            self.payload.fetch_add(used.allocations, Ordering::Relaxed);
+            result
+        }
+        #[cfg(not(test))]
+        f()
+    }
 }
 
-pub(crate) struct Stream {
-    stream: FSEventStreamRef,
+/// A watch of one directory at a time under a driver's root, telling `S` what it hears. Made
+/// once ([`Watch::new`]) and started and stopped any number of times; a start after a stop
+/// reuses everything but the stream.
+pub(crate) struct Watch<S> {
+    shared: Shared<S>,
+    /// Serial: the stream's callbacks, and its stop, run on it one at a time.
     queue: DispatchQueue,
-    shared: *mut Shared,
+    /// `shared.cookies` as a CFString, for every stream's list of paths.
+    cookie_string: CFRef,
+    /// The running stream, null while none runs.
+    stream: FSEventStreamRef,
+    /// Where a path is made NUL-terminated for the system.
+    c_path: Vec<u8>,
 }
 
-// SAFETY: the stream and its queue are FSEvents' and libdispatch's objects, which may be stopped
-// and released from any thread; `Shared` is read on the queue only, and freed once the queue has
-// run its last callback.
-unsafe impl Send for Stream {}
+// SAFETY: the stream and the queue are FSEvents' and libdispatch's objects, which may be
+// stopped and released from any thread; `Shared` is read on the queue while a stream runs and
+// written only while none does (`&mut self` with `stream` null), and `S: Send + Sync`.
+unsafe impl<S: Tell> Send for Watch<S> {}
 
-impl Stream {
-    /// Watches `dir` under `root` (kFSEventStreamCreateFlagFileEvents | NoDefer |
-    /// WatchRoot, latency 0, on a dispatch queue of its own), calling `send` with a
-    /// `Completion { tag, done: Done::Changed { files, lost } }` for each batch, names
-    /// relative to `root` as `FileName`s, each once; kFSEventStreamEventFlagMustScanSubDirs,
-    /// UserDropped or KernelDropped make `lost: true`.
-    pub(crate) fn start(
-        root: &Path,
-        dir: &FileName,
-        tag: Tag,
-        send: Box<dyn Fn(Completion) + Send + Sync>,
-    ) -> io::Result<Stream> {
-        let paths = Paths::of(root, dir)?;
-        Stream::open(paths, dir, tag, send, SINCE_NOW, Mode::Watch, None)
+impl<S: Tell> Watch<S> {
+    /// A watch telling `sink`, with its directory of cookies and its queue made: none of them
+    /// is made again for any stream it runs.
+    pub(crate) fn new(sink: S) -> io::Result<Watch<S>> {
+        let cookies = cookies().map_err(|error| {
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("making the cookies of a watch: {error}"))
+        })?;
+        // alloc: setup, once per watch: room for the paths it names to the system.
+        let mut c_path = Vec::with_capacity(256);
+        c_string(&cookies, &mut c_path)?;
+        // SAFETY: a NUL-terminated path; the string is released in `Drop`.
+        let cookie_string =
+            unsafe { CFStringCreateWithFileSystemRepresentation(std::ptr::null(), c_path.as_ptr().cast()) };
+        if cookie_string.is_null() {
+            _ = std::fs::remove_dir_all(&cookies);
+            return Err(io::Error::other("CoreFoundation made no string of the cookies' path"));
+        }
+        // SAFETY: a NUL-terminated label; no attributes is a serial queue.
+        let queue = unsafe { dispatch_queue_create(c"blaze-fsevents".as_ptr(), std::ptr::null()) };
+        if queue.is_null() {
+            // SAFETY: made above, released once, not used after.
+            unsafe { CFRelease(cookie_string) };
+            _ = std::fs::remove_dir_all(&cookies);
+            return Err(io::Error::other("libdispatch made no queue"));
+        }
+        let shared = Shared {
+            tag: Tag(0),
+            dir: None,
+            // alloc: setup, once per watch: the resolved paths, at the size most have.
+            root: PathBuf::with_capacity(256),
+            real_dir: PathBuf::with_capacity(256), // alloc: as above.
+            writing: Mutex::new(cookie_buffer(&cookies)),
+            // alloc: setup, once per watch: the callback's buffers at the size a batch of a
+            // few names and cookies needs.
+            heard: Mutex::new(Heard {
+                cookies: Vec::with_capacity(4),
+                told: Vec::with_capacity(4),
+                path: cookie_buffer(&cookies),
+                text: String::with_capacity(1024),
+                names: Vec::with_capacity(32),
+                lost: Vec::with_capacity(4),
+            }),
+            cookies,
+            flushes: Mutex::new(Vec::with_capacity(4)), // alloc: setup, once per watch.
+            sink,
+            stopped: AtomicBool::new(true),
+            mode: Mode::Watch,
+            #[cfg(test)]
+            overhead: AtomicU64::new(0),
+            #[cfg(test)]
+            payload: AtomicU64::new(0),
+        };
+        Ok(Watch { shared, queue, cookie_string, stream: std::ptr::null_mut(), c_path })
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        !self.stream.is_null()
+    }
+
+    /// Watches `dir` under `root` (kFSEventStreamCreateFlagFileEvents | NoDefer | WatchRoot,
+    /// latency 0, on the watch's queue), telling a `Completion { tag, done: Done::Changed {
+    /// files, lost } }` for each batch, names relative to `root` as `FileName`s, each once;
+    /// kFSEventStreamEventFlagMustScanSubDirs, UserDropped or KernelDropped make `lost: true`.
+    ///
+    /// # Safety
+    ///
+    /// The watch does not move until [`Watch::stop`] has returned (or it is dropped in place):
+    /// the stream's callback reads it by address.
+    pub(crate) unsafe fn start(&mut self, root: &Path, dir: FileName, tag: Tag) -> io::Result<()> {
+        self.locate(root, &dir)?;
+        // SAFETY: the caller's.
+        unsafe { self.open(dir, tag, SINCE_NOW, Mode::Watch, || {}) }
     }
 
     /// The journal of `dir` under `root` from `since` ([`crate::Effect::Journal`]): a stream as
-    /// [`Stream::start`]'s, calling `send` with `Done::Journaled` batches. From a cursor of
-    /// this volume's store at or before the system's current event ID it starts `sinceWhen`
-    /// that ID, its history told with `caught_up: false` until HistoryDone; from anything else
-    /// it starts at the current ID, read before the stream is made so no event falls between,
-    /// with a first batch sent before any other: empty, at that ID, and naming `dir` lost as
-    /// [`Lost::Reset`] unless `since` was [`Cursor::None`].
-    pub(crate) fn journal(
+    /// [`Watch::start`]'s, telling `Done::Journaled` batches. From a cursor of this volume's
+    /// store at or before the system's current event ID it starts `sinceWhen` that ID, its
+    /// history told with `caught_up: false` until HistoryDone; from anything else it starts at
+    /// the current ID, read before the stream is made so no event falls between, with a first
+    /// batch handed to `first` on the caller's thread just before the stream starts, for the
+    /// caller to tell before anything the stream tells: empty, at that ID, and naming `dir`
+    /// lost as [`Lost::Reset`] unless `since` was [`Cursor::None`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Watch::start`]'s.
+    pub(crate) unsafe fn journal(
+        &mut self,
         root: &Path,
-        dir: &FileName,
+        dir: FileName,
         since: Cursor,
         tag: Tag,
-        send: Box<dyn Fn(Completion) + Send + Sync>,
-    ) -> io::Result<Stream> {
-        let paths = Paths::of(root, dir)?;
-        let volume = store_of(&paths.real_dir).map_err(|error| {
-            let at = paths.logical_dir.display();
-            io::Error::new(error.kind(), format!("the journal of {at}: {error}"))
+        first: impl FnOnce(Journaled),
+    ) -> io::Result<()> {
+        self.locate(root, &dir)?;
+        let volume = store_of(&self.shared.real_dir).map_err(|error| {
+            let at = root.join(dir.as_str()); // alloc: an error path.
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("the journal of {}: {error}", at.display()))
         })?;
         // SAFETY: no arguments; reads the system's last event ID.
         let now = unsafe { FSEventsGetCurrentEventId() };
@@ -363,13 +568,13 @@ impl Stream {
             Cursor::FsEvents { event, volume: of } if of == volume && event <= now => Some(event),
             _ => None,
         };
-        let first = match (resumed, since) {
+        let lost = match (resumed, since) {
             (Some(_), _) => None,
-            (None, Cursor::None) => Some(Vec::new()),
-            (None, _) => Some(vec![(dir.clone(), Lost::Reset)]),
+            (None, Cursor::None) => Some(Vec::new()), // alloc: none, an empty vector.
+            (None, _) => Some(vec![(dir.clone(), Lost::Reset)]), // alloc: the batch's payload.
         };
-        let first = first.map(|lost| Journaled {
-            files: Vec::new(),
+        let batch = lost.map(|lost| Journaled {
+            files: Vec::new(), // alloc: none, an empty vector.
             lost,
             cursor: Cursor::FsEvents { event: now, volume },
             caught_up: false,
@@ -377,90 +582,86 @@ impl Stream {
         let from = resumed.unwrap_or(now);
         let journal =
             Journal { volume, last: AtomicU64::new(from), caught_up: AtomicBool::new(false) };
-        Stream::open(paths, dir, tag, send, from, Mode::Journal(journal), first)
-    }
-
-    /// The stream of `paths.real_dir` and a directory of cookies from `since`, telling `first`
-    /// before anything it hears.
-    fn open(
-        paths: Paths,
-        dir: &FileName,
-        tag: Tag,
-        send: Box<dyn Fn(Completion) + Send + Sync>,
-        since: u64,
-        mode: Mode,
-        first: Option<Journaled>,
-    ) -> io::Result<Stream> {
-        let Paths { root, logical_dir, real_dir } = paths;
-        let c_path = |path: &Path| {
-            CString::new(path.as_os_str().to_owned().into_vec())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))
-        };
-        let path = c_path(&real_dir)?;
-        let cookies = cookies().map_err(|error| {
-            // alloc: an error path.
-            io::Error::new(error.kind(), format!("making the cookies of a watch: {error}"))
-        })?;
-        let cookie_path = c_path(&cookies)?;
-        let shared = Box::into_raw(Box::new(Shared {
-            tag,
-            dir: dir.clone(),
-            root,
-            real_dir,
-            writing: Mutex::new(cookie_buffer(&cookies)),
-            // alloc: setup, once per stream: the callback's buffers at the size a batch of a
-            // few cookies needs.
-            heard: Mutex::new(Heard {
-                cookies: Vec::with_capacity(4),
-                told: Vec::with_capacity(4),
-                path: cookie_buffer(&cookies),
-            }),
-            cookies,
-            flushes: Mutex::new(Vec::with_capacity(4)), // alloc: setup, once per stream.
-            send,
-            stopped: AtomicBool::new(false),
-            mode,
-        }));
-        let failed = |why: String| {
-            // SAFETY: made above and given to no stream that runs.
-            let shared = unsafe { Box::from_raw(shared) };
-            _ = std::fs::remove_dir_all(&shared.cookies);
-            io::Error::other(format!("watching {}: {why}", logical_dir.display()))
-        };
-        // SAFETY: NUL-terminated paths; the strings are released below.
-        let strings = [path.as_ptr(), cookie_path.as_ptr()]
-            .map(|it| unsafe { CFStringCreateWithFileSystemRepresentation(std::ptr::null(), it) });
-        let release = || {
-            for string in strings.into_iter().filter(|it| !it.is_null()) {
-                // SAFETY: made above, released once; an array holds its own reference.
-                unsafe { CFRelease(string) };
+        let before = || {
+            if let Some(batch) = batch {
+                first(batch);
             }
         };
-        if strings.iter().any(|it| it.is_null()) {
-            release();
-            return Err(failed("CoreFoundation made no string of the path".into()));
+        // SAFETY: the caller's.
+        unsafe { self.open(dir, tag, from, Mode::Journal(journal), before) }
+    }
+
+    /// `root` and the watched directory under it resolved into the shared paths, as FSEvents
+    /// names them; a directory that is not there (yet) is watched as the root names it.
+    fn locate(&mut self, root: &Path, dir: &FileName) -> io::Result<()> {
+        assert!(!self.is_running(), "a watch runs one stream at a time");
+        let Shared { root: real_root, real_dir, .. } = &mut self.shared;
+        let resolved = c_string(root, &mut self.c_path).and_then(|()| realpath(&self.c_path, real_root));
+        resolved.map_err(|error| {
+            // alloc: an error path.
+            io::Error::new(error.kind(), format!("watching under {}: {error}", root.display()))
+        })?;
+        real_dir.as_mut_os_string().clear();
+        real_dir.push(&*real_root);
+        real_dir.push(dir.as_str());
+        c_string(real_dir, &mut self.c_path)?;
+        _ = realpath(&self.c_path, real_dir);
+        Ok(())
+    }
+
+    /// The stream of `shared.real_dir` and the cookies from `since`, `before` run once it is
+    /// made, just before it starts.
+    ///
+    /// # Safety
+    ///
+    /// As [`Watch::start`]'s.
+    unsafe fn open(
+        &mut self,
+        dir: FileName,
+        tag: Tag,
+        since: u64,
+        mode: Mode,
+        before: impl FnOnce(),
+    ) -> io::Result<()> {
+        let failed = |shared: &Shared<S>, why: &str| {
+            // alloc: an error path.
+            io::Error::other(format!("watching {}: {why}", shared.real_dir.display()))
+        };
+        self.shared.tag = tag;
+        self.shared.dir = Some(dir);
+        self.shared.mode = mode;
+        c_string(&self.shared.real_dir, &mut self.c_path)?;
+        // SAFETY: a NUL-terminated path; the string is released below.
+        let dir_string = unsafe {
+            CFStringCreateWithFileSystemRepresentation(std::ptr::null(), self.c_path.as_ptr().cast())
+        };
+        if dir_string.is_null() {
+            return Err(failed(&self.shared, "CoreFoundation made no string of the path"));
         }
+        let strings = [dir_string, self.cookie_string];
         // SAFETY: two CFStrings, retained by the array with the callbacks of CF types.
         let paths = unsafe {
             CFArrayCreate(std::ptr::null(), strings.as_ptr(), 2, &raw const kCFTypeArrayCallBacks)
         };
-        release();
+        // SAFETY: made above, released once; the array holds its own reference.
+        unsafe { CFRelease(dir_string) };
         if paths.is_null() {
-            return Err(failed("CoreFoundation made no array of the path".into()));
+            return Err(failed(&self.shared, "CoreFoundation made no array of the path"));
         }
+        self.shared.stopped.store(false, Ordering::Release);
         let context = Context {
             version: 0,
-            info: shared.cast(),
+            info: (&raw const self.shared).cast_mut().cast(),
             retain: None,
             release: None,
             describe: None,
         };
-        // SAFETY: the context is copied by the call; `shared` lives until the stream's queue
-        // has run its last callback (`Drop`).
+        // SAFETY: the context is copied by the call; `self.shared` stays where it is until the
+        // stream's queue has run its last callback (`stop`), by the caller's contract.
         let stream = unsafe {
             FSEventStreamCreate(
                 std::ptr::null(),
-                heard,
+                heard::<S>,
                 &context,
                 paths,
                 since,
@@ -471,48 +672,58 @@ impl Stream {
         // SAFETY: the stream holds its own reference to the paths.
         unsafe { CFRelease(paths) };
         if stream.is_null() {
-            return Err(failed("FSEventStreamCreate made no stream".into()));
+            self.shared.stopped.store(true, Ordering::Release);
+            return Err(failed(&self.shared, "FSEventStreamCreate made no stream"));
         }
-        // SAFETY: a NUL-terminated label; no attributes is a serial queue.
-        let queue = unsafe { dispatch_queue_create(c"blaze-fsevents".as_ptr(), std::ptr::null()) };
-        if queue.is_null() {
-            // SAFETY: the stream made above, never started.
-            unsafe { FSEventStreamRelease(stream) };
-            return Err(failed("libdispatch made no queue".into()));
-        }
-        // SAFETY: a stream not yet started and a queue of its own.
-        unsafe { FSEventStreamSetDispatchQueue(stream, queue) };
-        if let Some(first) = first {
-            // SAFETY: made above; no callback reads it before the stream starts below.
-            let shared = unsafe { &*shared };
-            (shared.send)(Completion { tag, done: Done::Journaled(Box::new(first)) });
-        }
-        // SAFETY: the stream is scheduled on its queue.
+        // SAFETY: a stream not yet started and the watch's queue, which outlives it.
+        unsafe { FSEventStreamSetDispatchQueue(stream, self.queue) };
+        before();
+        // SAFETY: the stream is scheduled on the queue.
         if unsafe { FSEventStreamStart(stream) } == 0 {
             // SAFETY: the stream did not start, so no callback runs during or after this.
             unsafe { FSEventStreamInvalidate(stream) };
             // SAFETY: the stream made above, released once and not used after.
             unsafe { FSEventStreamRelease(stream) };
-            // SAFETY: the queue made above, released once and not used after.
-            unsafe { dispatch_release(queue) };
-            return Err(failed("FSEventStreamStart refused it".into()));
+            self.shared.stopped.store(true, Ordering::Release);
+            return Err(failed(&self.shared, "FSEventStreamStart refused it"));
         }
-        Ok(Stream { stream, queue, shared })
+        self.stream = stream;
+        Ok(())
     }
 
-    /// Stops and releases it; no batch is sent once this returns, and each flush not yet told
-    /// is told failed. The caller sends the watch's `Done::Unwatched` after.
-    pub(crate) fn stop(self) {
-        drop(self);
+    /// Stops and releases the stream; nothing is told once this returns, and each flush not
+    /// yet told is handed to `untold` (its cookie removed), for the caller to fail. The caller
+    /// tells the watch's `Done::Unwatched` after. Nothing for a watch not running.
+    pub(crate) fn stop(&mut self, mut untold: impl FnMut(Tag)) {
+        if self.stream.is_null() {
+            return;
+        }
+        self.shared.stopped.store(true, Ordering::Release);
+        let mut stream = self.stream;
+        // SAFETY: the stream is stopped and invalidated on its own queue, so no callback runs
+        // during it; `stream` outlives the call, which returns once the work has run.
+        unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
+        // SAFETY: a serial queue: this runs after any callback queued before the invalidation.
+        unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
+        // SAFETY: invalidated, with no callback left to run; released once, not used after.
+        unsafe { FSEventStreamRelease(self.stream) };
+        self.stream = std::ptr::null_mut();
+        let mut writing = lock(&self.shared.writing);
+        for tag in lock(&self.shared.flushes).drain(..) {
+            _ = with_cookie(&mut writing, tag, |it| std::fs::remove_file(it));
+            untold(tag);
+        }
     }
 
     /// Asks for a flush `tag`: its cookie is written, and once the stream hears of it
-    /// `Completion { tag, done: Done::Flushed }` is sent, after every batch of changes made
+    /// `Completion { tag, done: Done::Flushed }` is told, after every batch of changes made
     /// before (for a journal, after its history too). An error says the cookie could not be
-    /// written, and nothing is sent.
+    /// written, or no stream runs, and nothing is told.
     pub(crate) fn flush(&self, tag: Tag) -> io::Result<()> {
-        // SAFETY: `shared` lives until this stream is dropped, which `&self` outlives.
-        let shared = unsafe { &*self.shared };
+        if !self.is_running() {
+            return Err(io::Error::other("the watch is not running"));
+        }
+        let shared = &self.shared;
         lock(&shared.flushes).push(tag);
         let written = with_cookie(&mut lock(&shared.writing), tag, |it| std::fs::write(it, b""));
         match written {
@@ -530,34 +741,37 @@ impl Stream {
             }
         }
     }
+
+    /// What the callbacks allocated beyond what their completions carry, since last asked.
+    #[cfg(test)]
+    pub(crate) fn take_overhead(&self) -> u64 {
+        self.shared.overhead.swap(0, Ordering::Relaxed)
+    }
 }
 
-impl Drop for Stream {
+impl<S> Drop for Watch<S> {
     fn drop(&mut self) {
-        // SAFETY: `shared` lives until the end of this function.
-        unsafe { (*self.shared).stopped.store(true, Ordering::Release) };
-        let mut stream = self.stream;
-        // SAFETY: the stream is stopped and invalidated on its own queue, so no callback runs
-        // during it; `stream` outlives the call, which returns once the work has run.
-        unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
-        // SAFETY: a serial queue: this runs after any callback queued before the invalidation.
-        unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
-        // SAFETY: invalidated, with no callback left to run; released once, not used after.
-        unsafe { FSEventStreamRelease(self.stream) };
-        // SAFETY: the queue has run its last work; released once, not used after.
-        unsafe { dispatch_release(self.queue) };
-        // SAFETY: made by `Box::into_raw` in `open`; no callback reads it any more.
-        let shared = unsafe { Box::from_raw(self.shared) };
-        for tag in std::mem::take(&mut *lock(&shared.flushes)) {
-            let why = crate::IoError("the watch ended before the flush".into());
-            (shared.send)(Completion { tag, done: Done::Failed(why) });
+        if !self.stream.is_null() {
+            self.shared.stopped.store(true, Ordering::Release);
+            let mut stream = self.stream;
+            // SAFETY: as in `stop`.
+            unsafe { dispatch_sync_f(self.queue, (&raw mut stream).cast(), end_on_queue) };
+            // SAFETY: as in `stop`.
+            unsafe { dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing) };
+            // SAFETY: as in `stop`.
+            unsafe { FSEventStreamRelease(self.stream) };
         }
-        _ = std::fs::remove_dir_all(&shared.cookies);
+        // SAFETY: no stream uses the queue any more; released once, not used after.
+        unsafe { dispatch_release(self.queue) };
+        // SAFETY: made in `new`, released once, not used after; every array that held it is
+        // released with its stream.
+        unsafe { CFRelease(self.cookie_string) };
+        _ = std::fs::remove_dir_all(&self.shared.cookies);
     }
 }
 
 extern "C" fn end_on_queue(stream: *mut c_void) {
-    // SAFETY: `Drop` passes a pointer to its copy of the stream, alive for this call.
+    // SAFETY: `stop` passes a pointer to its copy of the stream, alive for this call.
     let stream = unsafe { *stream.cast::<FSEventStreamRef>() };
     // SAFETY: a stream started and not yet released, stopped on its own queue.
     unsafe { FSEventStreamStop(stream) };
@@ -575,10 +789,10 @@ extern "C" fn nothing(_: *mut c_void) {}
 unsafe fn path_of<'a>(path: *const c_char) -> &'a Path {
     // SAFETY: the caller's.
     let path = unsafe { CStr::from_ptr(path) };
-    Path::new(std::ffi::OsStr::from_bytes(path.to_bytes()))
+    Path::new(OsStr::from_bytes(path.to_bytes()))
 }
 
-extern "C" fn heard(
+extern "C" fn heard<S: Tell>(
     _stream: CFRef,
     info: *mut c_void,
     count: usize,
@@ -586,8 +800,9 @@ extern "C" fn heard(
     flags: *const u32,
     ids: *const u64,
 ) {
-    // SAFETY: the `Shared` of `Stream::open`, freed only after the queue's last callback.
-    let shared = unsafe { &*info.cast::<Shared>() };
+    // SAFETY: the `Shared` of the `Watch` that made the stream, which does not move until the
+    // queue has run its last callback (`Watch::start`'s contract).
+    let shared = unsafe { &*info.cast::<Shared<S>>() };
     if shared.stopped.load(Ordering::Acquire) {
         return;
     }
@@ -597,69 +812,105 @@ extern "C" fn heard(
     let paths = unsafe { std::slice::from_raw_parts(paths.cast::<*const c_char>(), count) };
     // SAFETY: and `count` event IDs.
     let ids = unsafe { std::slice::from_raw_parts(ids, count) };
-    let mut heard = lock(&shared.heard);
-    let Heard { cookies, told, path } = &mut *heard;
-    cookies.clear();
-    match &shared.mode {
-        Mode::Watch => changed(shared, flags, paths, cookies),
-        Mode::Journal(journal) => journaled(shared, journal, flags, paths, ids, cookies),
+    #[cfg(test)]
+    {
+        let ((), used) = blaze_alloc_count::measure(|| hear(shared, flags, paths, ids));
+        let payload = shared.payload.swap(0, Ordering::Relaxed);
+        shared.overhead.fetch_add(used.allocations.saturating_sub(payload), Ordering::Relaxed);
     }
-    if !cookies.is_empty() {
-        tell_flushes(shared, cookies, told, path);
+    #[cfg(not(test))]
+    hear(shared, flags, paths, ids);
+}
+
+fn hear<S: Tell>(shared: &Shared<S>, flags: &[u32], paths: &[*const c_char], ids: &[u64]) {
+    let mut heard = lock(&shared.heard);
+    heard.cookies.clear();
+    match &shared.mode {
+        Mode::Watch => changed(shared, flags, paths, &mut heard),
+        Mode::Journal(journal) => journaled(shared, journal, flags, paths, ids, &mut heard),
+    }
+    if !heard.cookies.is_empty() {
+        tell_flushes(shared, &mut heard);
     }
 }
 
+/// The names in `heard.names` sorted and each once.
+fn sort_names(heard: &mut Heard) {
+    let Heard { text, names, .. } = heard;
+    let text: &str = text;
+    let at = |span: &Span| &text[span.0 as usize..span.1 as usize];
+    names.sort_unstable_by(|a, b| at(a).cmp(at(b)));
+    names.dedup_by(|a, b| at(a) == at(b));
+}
+
+/// The [`FileName`]s of `heard.names`, in their order; whether one could not be made.
+fn make_names(heard: &Heard) -> (Vec<FileName>, bool) {
+    let mut files = Vec::with_capacity(heard.names.len());
+    let mut bad = false;
+    for &span in &heard.names {
+        match FileName::new(heard.str(span)) {
+            Some(name) => files.push(name),
+            None => bad = true,
+        }
+    }
+    (files, bad)
+}
+
 /// A watch's batch, as [`Done::Changed`].
-fn changed(shared: &Shared, flags: &[u32], paths: &[*const c_char], cookies: &mut Vec<u64>) {
-    let mut files = Vec::with_capacity(flags.len());
-    let mut buffer = String::new();
+fn changed<S: Tell>(shared: &Shared<S>, flags: &[u32], paths: &[*const c_char], heard: &mut Heard) {
+    heard.text.clear();
+    heard.names.clear();
     let mut lost = false;
     for (&flag, &path) in flags.iter().zip(paths) {
         lost |= flag & LOSES != 0;
         // SAFETY: a path FSEvents passed, alive for the callback.
         let path = unsafe { path_of(path) };
         if let Some(cookie) = shared.cookie(path) {
-            cookies.extend(cookie);
+            heard.cookies.extend(cookie);
             continue;
         }
-        match shared.name(path, &mut buffer) {
-            Some(Some(name)) => files.push(name),
+        match shared.name(path, &mut heard.text) {
+            Some(Some(span)) => heard.names.push(span),
             Some(None) => lost = true,
             None => {}
         }
     }
-    if !files.is_empty() || lost {
-        files.sort_unstable();
-        files.dedup();
-        let done = Done::Changed { files, lost };
-        (shared.send)(Completion { tag: shared.tag, done });
+    if heard.names.is_empty() && !lost {
+        return;
     }
+    sort_names(heard);
+    let (files, bad) = shared.payload(|| make_names(heard));
+    let done = Done::Changed { files, lost: lost || bad };
+    shared.send(Completion { tag: shared.tag, done });
 }
 
 /// `name` lost for `why`, once.
-fn lose(lost: &mut Vec<(FileName, Lost)>, name: &FileName, why: Lost) {
-    if !lost.iter().any(|(it, was)| it == name && *was == why) {
-        lost.push((name.clone(), why));
+fn lose(heard: &mut Heard, name: Span, why: Lost) {
+    let seen = heard.lost.iter().any(|&(it, was, _)| was == why && heard.str(it) == heard.str(name));
+    if !seen {
+        let order = heard.lost.len() as u32;
+        heard.lost.push((name, why, order));
     }
 }
 
-/// A journal's batch, as [`Done::Journaled`]: sent when it names anything, moves the cursor or
+/// A journal's batch, as [`Done::Journaled`]: told when it names anything, moves the cursor or
 /// ends the history.
-fn journaled(
-    shared: &Shared,
+fn journaled<S: Tell>(
+    shared: &Shared<S>,
     journal: &Journal,
     flags: &[u32],
     paths: &[*const c_char],
     ids: &[u64],
-    cookies: &mut Vec<u64>,
+    heard: &mut Heard,
 ) {
-    let mut files = Vec::with_capacity(flags.len());
-    let mut lost = Vec::new();
-    let mut buffer = String::new();
+    heard.text.clear();
+    heard.names.clear();
+    heard.lost.clear();
+    heard.text.push_str(shared.dir().as_str());
+    let dir: Span = (0, heard.text.len() as u32);
     let before = journal.last.load(Ordering::Relaxed);
     let was_caught_up = journal.caught_up.load(Ordering::Relaxed);
     let (mut last, mut caught_up) = (before, was_caught_up);
-    let dir = &shared.dir;
     for ((&flag, &path), &id) in flags.iter().zip(paths).zip(ids) {
         // Its path is to be ignored, and its ID is no event's of the watched paths.
         if flag & EVENT_HISTORY_DONE != 0 {
@@ -668,13 +919,13 @@ fn journaled(
         }
         if flag & EVENT_IDS_WRAPPED != 0 {
             last = id;
-            lose(&mut lost, dir, Lost::Reset);
+            lose(heard, dir, Lost::Reset);
             continue;
         }
         // RootChanged carries ID 0.
         last = last.max(id);
         if flag & (EVENT_USER_DROPPED | EVENT_KERNEL_DROPPED) != 0 {
-            lose(&mut lost, dir, Lost::Dropped);
+            lose(heard, dir, Lost::Dropped);
             continue;
         }
         // SAFETY: a path FSEvents passed, alive for the callback.
@@ -683,46 +934,68 @@ fn journaled(
             // A history may hold the cookies of an earlier stream that had this directory;
             // a flush is told only by one written once the history is told.
             if caught_up {
-                cookies.extend(cookie);
+                heard.cookies.extend(cookie);
             }
             continue;
         }
         if flag & (EVENT_ROOT_CHANGED | EVENT_MOUNT | EVENT_UNMOUNT) != 0 {
-            lose(&mut lost, dir, Lost::RootChanged);
+            lose(heard, dir, Lost::RootChanged);
             continue;
         }
-        let name = shared.name(path, &mut buffer);
+        let name = shared.name(path, &mut heard.text);
         if flag & EVENT_MUST_SCAN_SUB_DIRS != 0 {
             let name = match name {
                 Some(Some(name)) => name,
-                Some(None) => dir.clone(),
-                None if shared.real_dir.starts_with(path) => dir.clone(),
+                Some(None) => dir,
+                None if shared.real_dir.starts_with(path) => dir,
                 None => continue,
             };
-            lose(&mut lost, &name, Lost::Rescan);
+            lose(heard, name, Lost::Rescan);
             continue;
         }
         match name {
-            Some(Some(name)) => files.push(name),
-            Some(None) => lose(&mut lost, dir, Lost::Rescan),
+            Some(Some(name)) => heard.names.push(name),
+            Some(None) => lose(heard, dir, Lost::Rescan),
             None => {}
         }
     }
-    if files.is_empty() && lost.is_empty() && last == before && caught_up == was_caught_up {
+    let unchanged = last == before && caught_up == was_caught_up;
+    if heard.names.is_empty() && heard.lost.is_empty() && unchanged {
         return;
     }
-    files.sort_unstable();
-    files.dedup();
-    lost.sort_by(|a, b| a.0.cmp(&b.0));
+    sort_names(heard);
+    let (files, bad) = shared.payload(|| make_names(heard));
+    if bad {
+        lose(heard, dir, Lost::Rescan);
+    }
+    {
+        let Heard { text, lost, .. } = &mut *heard;
+        let text: &str = text;
+        let at = |span: Span| &text[span.0 as usize..span.1 as usize];
+        lost.sort_unstable_by(|a, b| at(a.0).cmp(at(b.0)).then(a.2.cmp(&b.2)));
+    }
+    let lost = shared.payload(|| {
+        let mut lost = Vec::with_capacity(heard.lost.len());
+        for &(span, why, _) in &heard.lost {
+            // The watched directory's name, or one `name` checked, under it.
+            // clone: the batch's payload, where a checked name was not one after all.
+            let name = FileName::new(heard.str(span)).unwrap_or_else(|| shared.dir().clone());
+            lost.push((name, why));
+        }
+        lost
+    });
     journal.last.store(last, Ordering::Relaxed);
     journal.caught_up.store(caught_up, Ordering::Relaxed);
     let cursor = Cursor::FsEvents { event: last, volume: journal.volume };
-    let done = Done::Journaled(Box::new(Journaled { files, lost, cursor, caught_up }));
-    (shared.send)(Completion { tag: shared.tag, done });
+    let journaled = Journaled { files, lost, cursor, caught_up };
+    // alloc: the batch's payload, boxed as `Done` carries it.
+    let done = shared.payload(|| Done::Journaled(Box::new(journaled)));
+    shared.send(Completion { tag: shared.tag, done });
 }
 
 /// Tells each flush whose cookie was heard, through the callback's buffers.
-fn tell_flushes(shared: &Shared, cookies: &[u64], told: &mut Vec<Tag>, path: &mut PathBuf) {
+fn tell_flushes<S: Tell>(shared: &Shared<S>, heard: &mut Heard) {
+    let Heard { cookies, told, path, .. } = heard;
     told.clear();
     lock(&shared.flushes).retain(|tag| {
         let heard = cookies.contains(&tag.0);
@@ -734,7 +1007,7 @@ fn tell_flushes(shared: &Shared, cookies: &[u64], told: &mut Vec<Tag>, path: &mu
     for &tag in told.iter() {
         // Its removal is heard too, of a flush told already: nothing.
         _ = with_cookie(path, tag, |it| std::fs::remove_file(it));
-        (shared.send)(Completion { tag, done: Done::Flushed });
+        shared.send(Completion { tag, done: Done::Flushed });
     }
 }
 
@@ -742,7 +1015,6 @@ fn tell_flushes(shared: &Shared, cookies: &[u64], told: &mut Vec<Tag>, path: &mu
 mod tests {
     use std::{
         collections::BTreeSet,
-        sync::mpsc,
         time::{Duration, Instant},
     };
 
@@ -759,12 +1031,14 @@ mod tests {
         root
     }
 
-    type Heard = mpsc::Receiver<Completion>;
+    /// A bounded channel, as the driver's: no allocation per completion.
+    type Sink = crossbeam_channel::Sender<Completion>;
 
-    fn sender() -> (Box<dyn Fn(Completion) + Send + Sync>, Heard) {
-        let (send, heard) = mpsc::channel();
-        let send = std::sync::Mutex::new(send);
-        (Box::new(move |completion| _ = send.lock().unwrap().send(completion)), heard)
+    type Heard = crossbeam_channel::Receiver<Completion>;
+
+    fn watch() -> (Watch<Sink>, Heard) {
+        let (send, heard) = crossbeam_channel::bounded(1024);
+        (Watch::new(send).unwrap(), heard)
     }
 
     fn journaled(completion: Completion, tag: Tag) -> Journaled {
@@ -775,33 +1049,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_file_written_under_the_watched_directory_is_heard_and_one_outside_is_not() {
-        let root = root("watch");
-        let (send, heard) = sender();
-        let dir = FileName::new("src").unwrap();
-        let stream = Stream::start(&root, &dir, Tag(4), send).unwrap();
+    /// Writes `file` under `root` until `watch` tells it, or the deadline: what it told.
+    fn hear_written(root: &Path, file: &str, heard: &Heard, tag: Tag) -> BTreeSet<FileName> {
         let mut files = BTreeSet::new();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let wanted = FileName::new("src/deep/lib.rs").unwrap();
+        let wanted = FileName::new(file).unwrap();
         while !files.contains(&wanted) && Instant::now() < deadline {
             std::fs::write(root.join("target/out"), b"not watched").unwrap();
-            std::fs::create_dir_all(root.join("src/deep")).unwrap();
-            std::fs::write(root.join("src/deep/lib.rs"), b"fn f() {}").unwrap();
+            std::fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+            std::fs::write(root.join(file), b"fn f() {}").unwrap();
             while let Ok(completion) = heard.recv_timeout(Duration::from_millis(100)) {
-                assert_eq!(completion.tag, Tag(4));
+                assert_eq!(completion.tag, tag);
                 let Done::Changed { files: batch, .. } = completion.done else {
                     panic!("{:?}", completion.done)
                 };
                 let unique: BTreeSet<_> = batch.iter().cloned().collect();
                 assert_eq!(unique.len(), batch.len(), "a name twice in one batch: {batch:?}");
+                let mut sorted = batch.clone();
+                sorted.sort();
+                assert_eq!(sorted, batch, "a batch's names sorted");
                 files.extend(batch);
             }
         }
-        stream.stop();
         assert!(files.contains(&wanted), "{files:?}");
+        files
+    }
+
+    #[test]
+    fn a_file_written_under_the_watched_directory_is_heard_and_one_outside_is_not() {
+        let root = root("watch");
+        let (mut watch, heard) = watch();
+        let dir = FileName::new("src").unwrap();
+        // SAFETY: `watch` stays in this frame until it is stopped below.
+        unsafe { watch.start(&root, dir.clone(), Tag(4)) }.unwrap();
+        let files = hear_written(&root, "src/deep/lib.rs", &heard, Tag(4));
+        watch.stop(|tag| panic!("no flush was asked: {tag:?}"));
         assert!(files.iter().all(|it| it.is_under(&dir)), "{files:?}");
-        // Nothing is sent once it has stopped.
+        // Nothing is told once it has stopped.
         std::fs::write(root.join("src/after"), b"late").unwrap();
         std::thread::sleep(Duration::from_millis(200));
         while let Ok(completion) = heard.try_recv() {
@@ -809,6 +1093,63 @@ mod tests {
             assert!(!files.contains(&FileName::new("src/after").unwrap()), "{files:?}");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A watch stopped and started again, on another directory with another tag, hears that
+    /// one only: everything kept across its streams is the new stream's.
+    #[test]
+    fn a_watch_started_again_hears_its_new_directory() {
+        let root = root("again");
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        let (mut watch, heard) = watch();
+        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
+        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        hear_written(&root, "src/a.rs", &heard, Tag(1));
+        watch.stop(|_| {});
+        while heard.try_recv().is_ok() {}
+        let other = FileName::new("other").unwrap();
+        // SAFETY: as above.
+        unsafe { watch.start(&root, other.clone(), Tag(2)) }.unwrap();
+        let files = hear_written(&root, "other/b.rs", &heard, Tag(2));
+        assert!(files.iter().all(|it| it.is_under(&other)), "{files:?}");
+        watch.flush(Tag(3)).unwrap();
+        watch.stop(|tag| assert_eq!(tag, Tag(3)));
+        assert!(watch.flush(Tag(4)).is_err(), "a flush of a stopped watch");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// After a first stream has grown its buffers, a second stream's batches allocate nothing
+    /// beyond the names and the `Vec` they carry, measured on the stream's queue.
+    #[test]
+    fn a_warm_watch_batch_allocates_only_its_payload() {
+        let root = root("budget");
+        let (mut watch, heard) = watch();
+        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
+        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        hear_written(&root, "src/warm.rs", &heard, Tag(1));
+        watch.stop(|_| {});
+        watch.take_overhead();
+        // SAFETY: as above.
+        unsafe { watch.start(&root, FileName::new("src").unwrap(), Tag(1)) }.unwrap();
+        hear_written(&root, "src/warm.rs", &heard, Tag(1));
+        watch.stop(|_| {});
+        assert_eq!(watch.take_overhead(), 0, "a warm batch allocates beyond its payload");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_file_name_is_checked_as_file_name_new_checks_it() {
+        for name in [
+            "", "a", "a/b", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "...", ".a", "a.",
+            "a/.b/c", "src/deep/lib.rs", "é/ü",
+        ] {
+            assert_eq!(file_name_ok(name), FileName::new(name).is_some(), "{name:?}");
+        }
+        let dir = FileName::new("src").unwrap();
+        for name in ["src", "src/a", "srca", "sr", "src/a/b", "other/src"] {
+            let it = FileName::new(name).unwrap();
+            assert_eq!(is_under(name, dir.as_str()), it.is_under(&dir), "{name:?}");
+        }
     }
 
     /// Takes batches until one is caught up, or the deadline: every one of them.
@@ -827,6 +1168,24 @@ mod tests {
         panic!("never caught up: {batches:?}")
     }
 
+    /// [`Watch::journal`], with the first batch it hands over.
+    ///
+    /// # Safety
+    ///
+    /// As [`Watch::start`]'s.
+    unsafe fn journal(
+        watch: &mut Watch<Sink>,
+        root: &Path,
+        dir: &FileName,
+        since: Cursor,
+        tag: Tag,
+    ) -> Option<Journaled> {
+        let mut first = None;
+        // SAFETY: the caller's.
+        unsafe { watch.journal(root, dir.clone(), since, tag, |it| first = Some(it)) }.unwrap();
+        first
+    }
+
     fn event(cursor: Cursor) -> (u64, [u8; 16]) {
         match cursor {
             Cursor::FsEvents { event, volume } => (event, volume),
@@ -838,10 +1197,11 @@ mod tests {
     fn a_journal_resumes_from_its_cursor_with_what_changed_while_it_was_stopped() {
         let root = root("journal");
         let dir = FileName::new("src").unwrap();
-        let (send, heard) = sender();
-        let stream = Stream::journal(&root, &dir, Cursor::None, Tag(1), send).unwrap();
-        // The first batch is there at once, before any the stream hears.
-        let first = journaled(heard.try_recv().expect("the first batch, at once"), Tag(1));
+        let (mut watch, heard) = watch();
+        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
+        let first = unsafe { journal(&mut watch, &root, &dir, Cursor::None, Tag(1)) };
+        // The first batch comes at once, before any the stream hears.
+        let first = first.expect("the first batch, at once");
         assert_eq!((first.files.len(), first.lost.len(), first.caught_up), (0, 0, false));
         let (start, volume) = event(first.cursor);
         let mut last = until_caught_up(&heard, Tag(1)).last().unwrap().cursor;
@@ -863,16 +1223,19 @@ mod tests {
         assert!(heard_before);
         assert!(event(last).0 > start);
         assert_eq!(event(last).1, volume);
-        stream.stop();
+        watch.stop(|_| {});
         // Written while nothing listens, then given time to reach fseventsd's store.
         std::fs::create_dir_all(root.join("src/down")).unwrap();
         std::fs::write(root.join("src/down/lib.rs"), b"fn g() {}").unwrap();
         std::fs::write(root.join("target/out"), b"not watched").unwrap();
         std::thread::sleep(Duration::from_secs(1));
-        let (send, heard) = sender();
-        let stream = Stream::journal(&root, &dir, last, Tag(2), send).unwrap();
+        while heard.try_recv().is_ok() {}
+        // The same watch, started again from the cursor.
+        // SAFETY: as above.
+        let first = unsafe { journal(&mut watch, &root, &dir, last, Tag(2)) };
+        assert!(first.is_none(), "resumed: no first batch");
         let batches = until_caught_up(&heard, Tag(2));
-        stream.stop();
+        watch.stop(|_| {});
         // The history, told up to and with the batch of HistoryDone, which may hold some of it.
         let (done, history) = batches.split_last().unwrap();
         assert!(done.caught_up && history.iter().all(|it| !it.caught_up), "{batches:?}");
@@ -896,10 +1259,11 @@ mod tests {
     fn a_cursor_of_another_store_or_past_now_is_lost_as_reset() {
         let root = root("reset");
         let dir = FileName::new("src").unwrap();
-        let (send, heard) = sender();
-        let stream = Stream::journal(&root, &dir, Cursor::None, Tag(1), send).unwrap();
-        let (now, volume) = event(journaled(heard.try_recv().unwrap(), Tag(1)).cursor);
-        stream.stop();
+        let (mut watch, _heard) = watch();
+        // SAFETY: `watch` stays in this frame until it is stopped below, each time.
+        let first = unsafe { journal(&mut watch, &root, &dir, Cursor::None, Tag(1)) };
+        let (now, volume) = event(first.unwrap().cursor);
+        watch.stop(|_| {});
         let cursors = [
             Cursor::FsEvents { event: 1, volume: [0xab; 16] },
             Cursor::FsEvents { event: u64::MAX - 1, volume },
@@ -908,10 +1272,10 @@ mod tests {
         ];
         for (n, since) in cursors.into_iter().enumerate() {
             let tag = Tag(10 + n as u64);
-            let (send, heard) = sender();
-            let stream = Stream::journal(&root, &dir, since, tag, send).unwrap();
-            let first = journaled(heard.try_recv().expect("the first batch, at once"), tag);
-            stream.stop();
+            // SAFETY: as above.
+            let first = unsafe { journal(&mut watch, &root, &dir, since, tag) };
+            watch.stop(|_| {});
+            let first = first.expect("the first batch, at once");
             assert_eq!(first.lost, [(dir.clone(), Lost::Reset)], "{since:?}");
             assert!(first.files.is_empty() && !first.caught_up);
             let (event, of) = event(first.cursor);

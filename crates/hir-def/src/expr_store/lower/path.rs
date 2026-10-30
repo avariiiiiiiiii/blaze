@@ -1,16 +1,14 @@
-//! Transforms syntax into `Path` objects, ideally with accounting for hygiene
+//! Transforms syntax into paths in the store's columns, ideally with accounting for hygiene
 
 #[cfg(test)]
 mod tests;
 
-use std::iter;
-
 use crate::{
     expr_store::{
         lower::{ExprCollector, generics::ImplTraitLowerFn},
-        path::NormalPath,
+        path::{GenericArg, GenericArgsIdx, GenericArgsParentheses, PathIdx, slot, unslot},
     },
-    type_ref::LifetimeRef,
+    type_ref::{LifetimeRef, LifetimeRefId, TypeRef},
 };
 
 use hir_expand::{
@@ -18,12 +16,11 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::sym;
+use smallvec::SmallVec;
 use syntax::{
     AstPtr,
     ast::{self, AstNode, HasGenericArgs},
 };
-
-use crate::expr_store::path::{GenericArg, GenericArgs, Path};
 
 #[cfg(test)]
 thread_local! {
@@ -31,7 +28,7 @@ thread_local! {
     pub(super) static SEGMENT_LOWERING_MAP: std::cell::RefCell<rustc_hash::FxHashMap<ast::PathSegment, usize>> = std::cell::RefCell::default();
 }
 
-/// Converts an `ast::Path` to `Path`. Works with use trees.
+/// Converts an `ast::Path` to a path of the store's columns. Works with use trees.
 /// It correctly handles `$crate` based path from macro call.
 // If you modify the logic of the lowering, make sure to check if `hir_segment_to_ast_segment()`
 // also needs an update.
@@ -39,7 +36,7 @@ pub(super) fn lower_path(
     collector: &mut ExprCollector<'_>,
     path: ast::Path,
     impl_trait_lower_fn: ImplTraitLowerFn<'_>,
-) -> Option<Path> {
+) -> Option<PathIdx> {
     let segments_base = collector.path_segments.len();
     let args_base = collector.path_generic_args.len();
     let lowered =
@@ -50,19 +47,20 @@ pub(super) fn lower_path(
 }
 
 /// `lower_path` with the segments (last first while walking up the qualifiers) and the
-/// segments' generic args on the collector's stacks above `s0` and `g0`. A path lowered inside
-/// this one (in a generic arg or a `<T as Trait>`) pushes and pops above them.
+/// segments' slot words ([`slot`]) on the collector's stacks above `s0` and `g0`. A path lowered
+/// inside this one (in a generic arg or a `<T as Trait>`) pushes and pops above them. The
+/// generic arguments are rows of the store's columns by then; the path is pushed last.
 fn lower_path_on_stacks(
     collector: &mut ExprCollector<'_>,
     mut path: ast::Path,
     impl_trait_lower_fn: ImplTraitLowerFn<'_>,
     s0: usize,
     g0: usize,
-) -> Option<Path> {
+) -> Option<PathIdx> {
     let mut kind = PathKind::Plain;
     let mut type_anchor = None;
     #[cfg(test)]
-    let mut ast_segments = Vec::new();
+    let mut ast_segments = Vec::new(); // alloc: tests only, for `SEGMENT_LOWERING_MAP`
     #[cfg(test)]
     let mut ast_segments_offset = 0;
     #[allow(unused_mut)]
@@ -122,12 +120,12 @@ fn lower_path_on_stacks(
                         )
                     })
                     .or_else(|| {
-                        segment.return_type_syntax().map(|_| GenericArgs::return_type_notation())
+                        segment.return_type_syntax().map(|_| collector.push_return_type_notation())
                     });
                 if args.is_some() {
                     let segments = collector.path_segments.len() - s0;
-                    collector.path_generic_args.resize(g0 + segments, None);
-                    collector.path_generic_args.push(args);
+                    collector.path_generic_args.resize(g0 + segments, 0);
+                    collector.path_generic_args.push(slot(args));
                 }
                 push_segment(&segment, &mut collector.path_segments, name);
             }
@@ -158,7 +156,8 @@ fn lower_path_on_stacks(
                             collector.lower_path(trait_ref.path()?, impl_trait_lower_fn)
                         })?;
                         let ptr = AstPtr::new(&trait_ref).upcast();
-                        let Some(mod_path) = path.mod_path() else {
+                        let Some(mod_path) = collector.store.path_at(path).mod_path().copied()
+                        else {
                             collector.alloc_path(path, ptr);
                             return None;
                         };
@@ -171,35 +170,25 @@ fn lower_path_on_stacks(
                             ast_segments_offset = mod_path.segments().len();
                         }
                         let segments = collector.path_segments.len() - s0;
-                        if let Some(path_generic_args) = path.generic_args() {
-                            collector.path_generic_args.resize(g0 + segments - num_segments, None);
-                            collector
-                                .path_generic_args
-                                .extend(path_generic_args.iter().rev().cloned());
-                        } else {
-                            collector.path_generic_args.resize(g0 + segments, None);
+                        // The trait's segments are the stack's `num_segments` from `first` on,
+                        // its last segment first.
+                        let first = g0 + segments - num_segments;
+                        match collector.store.path_at(path).generic_args() {
+                            Some(trait_args) => {
+                                collector.path_generic_args.resize(first, 0);
+                                collector
+                                    .path_generic_args
+                                    .extend(trait_args.slot_words().iter().rev().copied());
+                            }
+                            None => collector.path_generic_args.resize(g0 + segments, 0),
                         }
                         collector.alloc_path(path, ptr);
 
-                        let self_type = GenericArg::Type(self_type);
-
                         // Insert the type reference (T in the above example) as Self parameter for the trait
-                        let last_segment =
-                            collector.path_generic_args.get_mut(g0 + segments - num_segments)?;
-                        *last_segment = Some(match last_segment.take() {
-                            Some(it) => GenericArgs {
-                                args: iter::once(self_type)
-                                    .chain(it.args.iter().cloned())
-                                    .collect(),
-                                has_self_type: true,
-                                ..it
-                            },
-                            None => GenericArgs {
-                                args: Box::new([self_type]),
-                                has_self_type: true,
-                                ..GenericArgs::empty()
-                            },
-                        });
+                        let last_segment = *collector.path_generic_args.get(first)?;
+                        let with_self =
+                            collector.store.paths_mut().with_self_type(unslot(last_segment), self_type);
+                        collector.path_generic_args[first] = slot(Some(with_self));
                     }
                 }
             }
@@ -236,7 +225,7 @@ fn lower_path_on_stacks(
     collector.path_segments[s0..].reverse();
     let segment_count = collector.path_segments.len() - s0;
     if collector.path_generic_args.len() > g0 || type_anchor.is_some() {
-        collector.path_generic_args.resize(g0 + segment_count, None);
+        collector.path_generic_args.resize(g0 + segment_count, 0);
         collector.path_generic_args[g0..].reverse();
     }
 
@@ -271,28 +260,38 @@ fn lower_path_on_stacks(
             .with_borrow_mut(|map| map.extend(ast_segments.into_iter().zip(ast_segments_offset..)));
     }
 
-    if let Some(last_segment_args @ Some(GenericArgs { has_self_type: true, .. })) =
-        collector.path_generic_args[g0..].last_mut()
+    if let Some(last_segment_args) = collector.path_generic_args[g0..].last_mut()
+        && unslot(*last_segment_args)
+            .is_some_and(|args| collector.store.paths().generic_args_at(args).has_self_type)
     {
         // Well-formed code cannot have `<T as Trait>` without an associated item after,
         // and this causes panics in hir-ty lowering.
-        *last_segment_args = None;
+        *last_segment_args = 0;
     }
 
-    let generic_args: Box<[Option<GenericArgs>]> =
-        collector.path_generic_args.drain(g0..).collect();
     let mod_path = ModPath::from_segments(kind, collector.path_segments.drain(s0..));
 
     if let Some(old_lifetimes_constrained_by_input) = old_lifetimes_constrained_by_input {
-        let type_alias_constrained_lifetimes = collector.get_constrained_lifetimes_if_type_alias(
-            &mod_path,
-            generic_args.last().and_then(|g| g.as_ref()),
-        );
+        // The lifetime arguments of the last segment, copied out of the columns so the
+        // resolution below can borrow the collector.
+        let last_args = collector.path_generic_args[g0..].last().and_then(|&word| unslot(word));
+        let lifetime_args: Option<SmallVec<[LifetimeRefId; 4]>> = last_args.map(|args| {
+            let args = collector.store.paths().generic_args_at(args).args;
+            args.iter()
+                .filter_map(|arg| match *arg {
+                    GenericArg::Lifetime(lt_ref) => Some(lt_ref),
+                    GenericArg::Type(_) | GenericArg::Const(_) => None,
+                })
+                .collect() // alloc: inline up to 4 lifetimes, and only in an argument-bound scope
+        });
+        let type_alias_constrained_lifetimes = collector
+            .get_constrained_lifetimes_if_type_alias(&mod_path, lifetime_args.as_deref());
         if let Some(lifetimes) = type_alias_constrained_lifetimes {
             collector.named_lifetime_store.lifetimes_constrained_by_input =
                 old_lifetimes_constrained_by_input;
             collector.named_lifetime_store.lifetimes_constrained_by_input.extend(
                 lifetimes.filter_map(|lt_ref| match &collector.store.lifetimes[lt_ref] {
+                    // clone: the set owns interned names
                     LifetimeRef::Named(name) => Some(name.clone()),
                     _ => None,
                 }),
@@ -305,10 +304,126 @@ fn lower_path_on_stacks(
         }
     }
 
-    if type_anchor.is_none() && generic_args.is_empty() {
-        return Some(Path::BarePath(mod_path));
+    let paths = collector.store.paths_mut();
+    if type_anchor.is_none() && collector.path_generic_args.len() == g0 {
+        Some(paths.push_bare(mod_path))
     } else {
-        return Some(Path::Normal(Box::new(NormalPath { type_anchor, mod_path, generic_args })));
+        Some(paths.push_normal(mod_path, type_anchor, collector.path_generic_args.drain(g0..)))
+    }
+}
+
+impl ExprCollector<'_> {
+    /// The empty arguments of a return type notation, `method(..)`.
+    fn push_return_type_notation(&mut self) -> GenericArgsIdx {
+        self.store.paths_mut().push_generic_args(
+            [],
+            false,
+            [],
+            GenericArgsParentheses::ReturnTypeNotation,
+        )
+    }
+
+    /// Collect `GenericArgs` from the parts of a fn-like path, i.e. `Fn(X, Y)
+    /// -> Z` (which desugars to `Fn<(X, Y), Output=Z>`).
+    pub(in crate::expr_store) fn lower_generic_args_from_fn_path(
+        &mut self,
+        args: Option<ast::ParenthesizedArgList>,
+        ret_type: Option<ast::RetType>,
+        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+    ) -> Option<GenericArgsIdx> {
+        let params = args?;
+        let mark = self.store.list_mark();
+        for param in params.type_args() {
+            let type_ref = self.lower_type_ref_opt(param.ty(), impl_trait_lower_fn);
+            self.store.push_list_type(type_ref);
+        }
+        let tuple = self.with_lists(mark, |this, lists| {
+            this.store.alloc_type_ref(TypeRef::Tuple(lists.types_since(mark)))
+        });
+        let output = match ret_type {
+            Some(ret_type) => self.lower_type_ref_opt(ret_type.ty(), impl_trait_lower_fn),
+            // -> ()
+            None => self.alloc_type_ref_desugared(TypeRef::UNIT),
+        };
+        let paths = self.store.paths_mut();
+        let binding = paths.binding(Name::new_symbol_root(sym::Output), None, Some(output), []);
+        Some(paths.push_generic_args(
+            [GenericArg::Type(tuple)],
+            false,
+            [binding],
+            GenericArgsParentheses::ParenSugar,
+        ))
+    }
+
+    /// The generic arguments of a segment, as a row of the store's columns. Its arguments and
+    /// binding rows are collected on the collector's stacks (nested arguments push and pop above
+    /// them), so a binding's own arguments are always an earlier row.
+    pub(super) fn lower_generic_args(
+        &mut self,
+        node: ast::GenericArgList,
+        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+    ) -> Option<GenericArgsIdx> {
+        // This needs to be kept in sync with `hir_generic_arg_to_ast()`.
+        let args_base = self.generic_args.len();
+        let bindings_base = self.assoc_bindings.len();
+        for generic_arg in node.generic_args() {
+            match generic_arg {
+                ast::GenericArg::TypeArg(type_arg) => {
+                    let type_ref = self.lower_type_ref_opt(type_arg.ty(), impl_trait_lower_fn);
+                    self.generic_args.push(GenericArg::Type(type_ref));
+                }
+                ast::GenericArg::AssocTypeArg(assoc_type_arg) => {
+                    // This needs to be kept in sync with `hir_assoc_type_binding_to_ast()`.
+                    if assoc_type_arg.param_list().is_some() {
+                        // We currently ignore associated return type bounds.
+                        continue;
+                    }
+                    if let Some(name_ref) = assoc_type_arg.name_ref() {
+                        // Nested impl traits like `impl Foo<Assoc = impl Bar>` are allowed
+                        self.with_outer_impl_trait_scope(false, |this| {
+                            let name = name_ref.as_name();
+                            let args = assoc_type_arg
+                                .generic_arg_list()
+                                .and_then(|args| this.lower_generic_args(args, impl_trait_lower_fn))
+                                .or_else(|| {
+                                    assoc_type_arg
+                                        .return_type_syntax()
+                                        .map(|_| this.push_return_type_notation())
+                                });
+                            let type_ref = assoc_type_arg
+                                .ty()
+                                .map(|it| this.lower_type_ref(it, impl_trait_lower_fn));
+                            let bounds = this.type_bounds_from_ast(
+                                assoc_type_arg.type_bound_list(),
+                                impl_trait_lower_fn,
+                            );
+                            let binding = this.store.binding_with_bounds(name, args, type_ref, bounds);
+                            this.assoc_bindings.push(binding);
+                        });
+                    }
+                }
+                ast::GenericArg::LifetimeArg(lifetime_arg) => {
+                    if let Some(lifetime) = lifetime_arg.lifetime() {
+                        let lifetime_ref = self.lower_lifetime_ref(lifetime);
+                        self.generic_args.push(GenericArg::Lifetime(lifetime_ref))
+                    }
+                }
+                ast::GenericArg::ConstArg(arg) => {
+                    let arg = self.lower_const_arg(arg);
+                    self.generic_args.push(GenericArg::Const(arg))
+                }
+            }
+        }
+
+        if self.generic_args.len() == args_base && self.assoc_bindings.len() == bindings_base {
+            return None;
+        }
+        Some(self.store.paths_mut().push_generic_args(
+            self.generic_args.drain(args_base..),
+            false,
+            self.assoc_bindings.drain(bindings_base..),
+            GenericArgsParentheses::No,
+        ))
     }
 }
 
@@ -332,7 +447,7 @@ pub fn hir_segment_to_ast_segment(path: &ast::Path, segment_idx: u32) -> Option<
 
     let mut segments = path.segments();
     if let Some(ast::PathSegmentKind::Type { trait_ref: Some(trait_ref), .. }) =
-        segments.clone().next().and_then(|it| it.kind())
+        segments.clone().next().and_then(|it| it.kind()) // clone: a syntax iterator, to peek
     {
         segments.next();
         return find_segment(trait_ref.path()?.segments().chain(segments), segment_idx);

@@ -262,6 +262,15 @@ Why: docs/v2/plan/design/unsafe.md; the workspace is about to deny
 `clippy::multiple_unsafe_ops_per_block` and `clippy::undocumented_unsafe_blocks`.
 `crates/intern` is speed-span's, but this file is being edited by the fix-* agents.
 
+## speed-hir: `tools/v2/hot_lint.py` refuses its `crates` field
+
+`'{"root": ".", "crates": ["hir-def"]}'` fails: `typed_input: crates has a type it does not
+read: list[str]` (`python/typed-input/src/typed_input/__init__.py:80`; `hot_lint.py:39` declares
+`crates: list[str]`). Either `typed_input` reads `list[str]`, or the field becomes
+`tuple[str, ...]`. Until then agents run it with `{"root": "."}` and filter by path.
+
+> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.
+
 ## speed-hir: vendor `la-arena` with a niche in `RawIdx`
 
 What: copy crates.io `la-arena` 0.3.1 into `vendor/la-arena/` and point the root `Cargo.toml`'s
@@ -334,3 +343,99 @@ is `self.db`, bound above). The result is unchanged. `blaze-diagnostics`' six si
 Status: read by speed-span. All three are in the tree and kept: `tt` `storage.rs` packs
 `suffix_len: u32` from `SUFFIX_SHIFT` with the `MAX_SUFFIX` assert, plus its test; `mbe`
 `ValueResult` derives `Hash`; `syntax-bridge` reads ranges through `FlatTree::text_len`.
+
+## speed-link-edge-sol-proof
+
+> forwarded to the coordinator (see below).
+
+### `pyproject.toml` and `uv.lock`: the `blake3` Python package
+
+What: `dependencies = ["typed-input", "blake3>=1.0"]` in the root `pyproject.toml`, and
+`uv lock` to add it to `uv.lock` (blake3-py, the Rust `blake3` crate behind the GIL-free buffer
+API, with wheels for Linux x86-64 and aarch64, macOS aarch64 and Windows x86-64).
+
+Why: `harness/v2/engine.py` (`digest`, `digests`, `tree_digest`) and `harness/v2/proof.py`
+(`old_outputs`, its selftest model) now `import blake3` and hash every build output and source
+tree with BLAKE3: SIMD on one core (about 6 GB/s with AVX-512 against about 2 GB/s for SHA-256
+with SHA-NI), and from 8 MiB on every core for one file (`max_threads=blake3.AUTO`). The
+SHA-256 they replaced ran at a third of the bound per core and one core per file. The written
+code imports it, so this has to land with it. `corpus.py`'s check of the `.crate` against the
+index's checksum stays SHA-256, which is what the index lists.
+
+> forwarded to the coordinator: root `pyproject.toml` and `uv.lock` are not requests' paths, and `uv lock` is not to be run here; on requests' coordinator list.
+
+## speed-hir-sol-defs: `tools/v2/hot_lint.py` skips the files of a module declared `#[cfg(test)]`
+
+What: hot_lint skips `#[cfg(test)]` items inside a file, and files named `tests.rs`/`*tests.rs`
+or under a `tests/` directory, but not the file of a module its parent declares
+`#[cfg(test)] mod x;`. hir-def has two: `macro_expansion_tests/` (43 findings, most inside fixture
+strings, where a justify comment would change the test's input and the spans its expectations
+print) and `test_db.rs` (7). Other crates have the same shape (`rg -U '#\[cfg\(test\)\]\s*mod \w+;'`).
+
+Where: `tools/v2/hot_lint.py`.
+- After `EXEMPT = ..`:
+  ```python
+  TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
+
+
+  def declared_test_modules(src: Path) -> list[Path]:
+      """The file and directory of each module a file of `src` declares `#[cfg(test)] mod x;`."""
+      out: list[Path] = []
+      for path in src.rglob("*.rs"):
+          text = path.read_text(errors="ignore")
+          base = path.parent if path.name in ("lib.rs", "main.rs", "mod.rs") else path.with_suffix("")
+          for m in TEST_MOD.finditer(text):
+              out.extend((base / f"{m.group(1)}.rs", base / m.group(1)))
+      return out
+  ```
+- In `main`, after `found: list[str] = []`: `test_mods = declared_test_modules(src)`, and the
+  skip becomes
+  ```python
+            if "tests" in path.parts or name.endswith("tests.rs") or name == "tests.rs":
+                continue
+            if any(path == m or m in path.parents for m in test_mods):
+                continue
+  ```
+- The docstring's "Test code (..)" sentence gains "and the files of a module declared
+  `#[cfg(test)] mod x;`".
+
+A `#[path = ..]` on such a declaration is not followed (none in the hot crates today).
+Why: the brief's rule is "tests count as the edge"; this makes the lint see it without
+comments inside test fixtures.
+
+## speed-hir-sol-expand: the same `hot_lint` fix, for hir-expand too
+
+`speed-hir-sol-defs`'s request just above ("`tools/v2/hot_lint.py` skips the files of a module
+declared `#[cfg(test)]`") also clears 71 findings in hir-expand:
+`crates/hir-expand/src/builtin/derive_macro/reference.rs`, declared `#[cfg(test)] mod reference;`
+in `builtin/derive_macro.rs` (the old derive code, kept only as the tests' reference). It also
+covers the new `crates/hir-def/src/macro_expansion_tests/budgets.rs` I asked of db-expand-macros.
+Nothing more to change: one fix for both.
+
+## speed-link-edge-sol-ci
+
+> applied by requests (the root line, its one ask of requests); see below.
+
+### `sonic-rs` as a workspace dependency, for `crates/blaze-ci`'s webhook decode (2026-10-29)
+
+What: `sonic-rs = { version = "0.5", default-features = false }` under
+`[workspace.dependencies]` in the root `Cargo.toml`. Once it is there I add
+`sonic-rs.workspace = true` to `crates/blaze-ci/Cargo.toml` and change one line,
+`webhook::payload`'s `serde_json::from_slice(body)` to `sonic_rs::from_slice(body)`. The payload
+types stay the serde derives they are (borrowed `Cow<str>`, unknown fields skipped).
+
+Why: a delivery is bounded by one HMAC over the body and one validating decode of it. For a
+25 KB `pull_request` payload that is 12.5 µs of SHA-256 (SHA-NI, 2 GB/s) plus about 10 µs of
+decode at simdjson's 2.5 GB/s, about 26 µs in all, so the budget is 28 µs. serde_json validates
+and skips at 1.5 to 2 GB/s on these payloads (about 15 µs), so a delivery is 31 µs, 1.2x the
+bound. That decode is the whole gap left now that a delivery no longer starts a thread.
+`sonic-rs` is serde-compatible, validates everything it skips (it does not take malformed JSON),
+and runs at 2 to 3 GB/s with SIMD on x86-64 and aarch64.
+
+What changes: what is taken or refused, and the delivery made from it, stay the same. With the
+change I add a differential test that runs both decoders over GitHub's recorded payloads and a mutated corpus, and
+asserts equal outcomes and equal `Delivery`s. The wording of a refusal's 400 body changes: it
+carries the decoder's own error text ("the pull_request payload is not one: ..."). Nothing reads
+that body except a person looking at the delivery in GitHub's settings.
+
+> applied by requests: root `sonic-rs = { version = "0.5", default-features = false }` after `serde_json`, with a comment. New to the lock: on requests' lock additions list. The blaze-ci side is speed-link-edge-sol-ci's (told).

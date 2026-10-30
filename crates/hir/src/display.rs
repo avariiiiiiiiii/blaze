@@ -1,5 +1,6 @@
 //! HirDisplay implementations for various hir types.
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, GenericDefId,
@@ -783,7 +784,7 @@ fn write_where_clause<'db>(def: GenericDefId, f: &mut HirFormatter<'_, 'db>) -> 
 }
 
 fn has_disaplayable_predicates(
-    db: &dyn HirDatabase,
+    db: &Db,
     params: &GenericParams,
     store: &ExpressionStore,
 ) -> bool {

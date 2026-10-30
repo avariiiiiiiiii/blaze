@@ -608,7 +608,7 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use blaze_ids::ContentId;
+    use blaze_ids::{ContentId, rng::SplitMix64};
 
     use super::*;
     use crate::summary::Call;
@@ -965,36 +965,16 @@ mod tests {
         assert_eq!(decide(&FxHashMap::default(), &Limits::default()), Ok(FxHashMap::default()));
     }
 
-    /// A seeded xorshift: the same cases on every run.
-    struct Seeded(u64);
-
-    impl Seeded {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
-        }
-
-        fn one_in(&mut self, n: u64) -> bool {
-            self.below(n) == 0
-        }
-    }
-
     /// A random build of summaries: keys of which some share their first 8 bytes, calls of
     /// summaries and of functions without one, agreeing and disagreeing constants, external
     /// and addressed functions, cycles, and now and then an inconsistent summary.
-    fn random(seeded: &mut Seeded) -> (BTreeMap<InstanceKey, Summary>, Limits) {
+    fn random(seeded: &mut SplitMix64) -> (BTreeMap<InstanceKey, Summary>, Limits) {
         let len = 1 + seeded.below(48) as usize;
         let mut keys: Vec<InstanceKey> = (0..len + 4)
             .map(|_| {
                 let mut bytes = [0u8; 32];
                 for byte in &mut bytes {
-                    *byte = seeded.next() as u8;
+                    *byte = seeded.next_u64() as u8;
                 }
                 if seeded.one_in(3) {
                     bytes[..8].copy_from_slice(&[0x5a; 8]);
@@ -1060,7 +1040,7 @@ mod tests {
 
     #[test]
     fn the_columns_decide_as_the_maps_did() {
-        let mut seeded = Seeded(0x9e37_79b9_7f4a_7c15);
+        let mut seeded = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let mut decided = 0;
         for case in 0..2_000 {
             let (summaries, limits) = random(&mut seeded);
@@ -1077,7 +1057,7 @@ mod tests {
 
     #[test]
     fn the_columns_find_the_components_the_lists_did() {
-        let mut seeded = Seeded(17);
+        let mut seeded = SplitMix64::new(17);
         for _ in 0..500 {
             let len = 1 + seeded.below(30) as usize;
             let lists: Vec<Vec<usize>> = (0..len)

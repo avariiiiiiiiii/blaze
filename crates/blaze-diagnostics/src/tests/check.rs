@@ -111,3 +111,33 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0015`.
 "#);
 }
+
+/// rustc reads `#![recursion_limit]` before expansion and stops at its error
+/// (`ShouldEmit::EarlyFatal`): the type error after it is never found.
+/// `tests/ui/recursion/recursion_limit/invalid_digit_type.rs` with a body that does not type.
+#[test]
+fn an_early_fatal_error_stops_every_later_pass() {
+    let source = r#"#![recursion_limit = 123] //~ ERROR malformed `recursion_limit` attribute
+
+fn main() { let _x: u32 = "a"; }
+"#;
+    assert_eq!(ui("invalid_digit_type.rs", "2015", source), r#"error[E0539]: malformed `recursion_limit` attribute input
+  --> $DIR/invalid_digit_type.rs:1:4
+   |
+LL | #![recursion_limit = 123]
+   |    ^^^^^^^^^^^^^^^^^^---
+   |                      |
+   |                      expected a string literal here
+   |
+   = note: for more information, visit <https://doc.rust-lang.org/reference/attributes/limits.html#the-recursion_limit-attribute>
+help: must be of the form
+   |
+LL - #![recursion_limit = 123]
+LL + #![recursion_limit = "N"]
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0539`.
+"#);
+}

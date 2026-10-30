@@ -28,7 +28,7 @@ mod check_attr;
 mod diagnostic;
 mod doc;
 pub(crate) mod features;
-mod parse;
+pub(crate) mod parse;
 pub(crate) mod table;
 pub(crate) mod target;
 

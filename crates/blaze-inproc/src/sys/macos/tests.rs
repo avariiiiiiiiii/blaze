@@ -1,27 +1,19 @@
-//! Code written through one mapping of an entry runs through another, rights the kernel caps,
-//! the rendezvous between two ends of a socket in this process, and its messages decoded from
-//! any bytes without a panic.
+//! Code written through one mapping of an entry runs through an overlay of another, rights the
+//! kernel caps, this process's own image, the rendezvous between two ends of a socket in this
+//! process, and its messages decoded from any bytes without a panic.
+
+use blaze_ids::rng::SplitMix64;
 
 use super::rendezvous::{self, Message, Request, Token, decode_reply, decode_request, encode_reply};
-use super::{Granted, Object, granted, page, reserve, thread_id, threads};
+use super::{Granted, Object, View, granted, overlay, own_image, page, thread_id, threads};
 use crate::channel::Channel;
 use crate::frame::kinds;
+use crate::handshake::{Overlay, Place};
 use crate::sys::Rights;
 use crate::{Access, Error};
 
 /// `mov w0, #42` and `ret`.
 const FORTY_TWO: [u8; 8] = [0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6];
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-}
 
 fn pair() -> (Channel, Channel) {
     let mut fds = [0; 2];
@@ -30,18 +22,27 @@ fn pair() -> (Channel, Channel) {
     (Channel::from_raw(i64::from(fds[0])).unwrap(), Channel::from_raw(i64::from(fds[1])).unwrap())
 }
 
+fn over(at: u64, len: u64, access: Access, place: Place) -> Overlay {
+    Overlay { object: 0, offset: 0, len, at, access, place }
+}
+
+/// Pages of this process for an overlay to replace, as dyld's mapping of an executable is.
+fn place(len: u64) -> View {
+    Object::create("place", len).unwrap().map_here(Access::Read).unwrap()
+}
+
 #[test]
-fn code_written_in_one_view_runs_in_another() {
+fn code_overlaid_from_one_view_runs_what_the_other_writes() {
     let (mut channel, _other) = pair();
-    let len = page() * 2;
-    let object = Object::create("test", len).unwrap();
+    let object = Object::create("test", page()).unwrap();
     let mut view = object.map_here(Access::Shared).unwrap();
     view.bytes_mut(0..8).unwrap().copy_from_slice(&FORTY_TWO);
     view.publish(0..8);
 
     let code: Granted = granted(&object, Rights::Code).unwrap();
-    let at = reserve(&mut channel, len, None).unwrap();
-    assert_eq!(code.map(&mut channel, 0, page(), at, Access::Execute).unwrap(), at);
+    let place = place(page());
+    let at = place.address();
+    overlay(&mut channel, std::slice::from_ref(&code), &[over(at, page(), Access::Execute, Place::Code)], 0).unwrap();
     // SAFETY: `at` maps the object's first page readable and executable, which holds
     // `mov w0, #42; ret` made right for instruction fetch above.
     let run: extern "C" fn() -> u32 = unsafe { std::mem::transmute(at as usize) };
@@ -51,12 +52,13 @@ fn code_written_in_one_view_runs_in_another() {
     view.publish(0..4);
     assert_eq!(run(), 7, "a store through the daemon's view is what the other view runs");
 
-    let error = code.map(&mut channel, 0, page(), at + page(), Access::Shared).unwrap_err();
-    assert!(error.what.contains("mach_vm_map"), "{error}");
+    let error = overlay(&mut channel, std::slice::from_ref(&code), &[over(at, page(), Access::Shared, Place::Reserved)], 0)
+        .unwrap_err();
+    assert!(error.what.contains("mach_vm_map"), "the code entry carries no write right: {error}");
 }
 
 #[test]
-fn a_copy_is_private_and_a_view_is_read_only() {
+fn a_copy_overlay_is_private_and_code_maps_anywhere_only_to_read() {
     let (mut channel, _other) = pair();
     let len = page();
     let object = Object::create("copy", len).unwrap();
@@ -64,30 +66,35 @@ fn a_copy_is_private_and_a_view_is_read_only() {
     view.bytes_mut(0..4).unwrap().copy_from_slice(&[1, 2, 3, 4]);
 
     let code = granted(&object, Rights::Code).unwrap();
-    let at = reserve(&mut channel, len, None).unwrap();
-    assert_eq!(code.map(&mut channel, 0, len, at, Access::Copy).unwrap(), at);
+    let place = place(len);
+    let at = place.address();
+    overlay(&mut channel, std::slice::from_ref(&code), &[over(at, len, Access::Copy, Place::Reserved)], 0).unwrap();
     // SAFETY: `at` is the private copy just mapped, readable and writable, of `len` bytes.
     let copy = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, len as usize) };
     assert_eq!(&copy[..4], &[1, 2, 3, 4]);
     copy[0] = 9;
     assert_eq!(view.bytes(0..1).unwrap(), &[1]);
 
-    let mut read = code.view(&mut channel).unwrap();
-    assert_eq!(read.bytes(0..4).unwrap(), &[1, 2, 3, 4]);
-    assert!(read.bytes_mut(0..1).is_err());
-    assert!(code.map(&mut channel, len, len, at, Access::Read).is_err(), "past the object");
+    let read = code.map_anywhere(&mut channel, Access::Read).unwrap();
+    // SAFETY: `read` is the whole object mapped readable just now, for the rest of the test.
+    assert_eq!(unsafe { std::slice::from_raw_parts(read as *const u8, 4) }, &[1, 2, 3, 4]);
+    assert!(code.map_anywhere(&mut channel, Access::Shared).is_err(), "the code entry carries no write right");
+    assert!(code.map_anywhere(&mut channel, Access::Execute).is_err(), "code runs only where an overlay puts it");
+    let past = Overlay { offset: len, ..over(at, len, Access::Read, Place::Reserved) };
+    assert!(overlay(&mut channel, std::slice::from_ref(&code), &[past], 0).is_err(), "past the object");
 }
 
 #[test]
-fn a_fixed_map_outside_a_reservation_never_replaces() {
-    let (mut channel, _other) = pair();
-    let object = Object::create("fixed", page()).unwrap();
-    let taken = object.map_here(Access::Shared).unwrap();
-    let code = granted(&object, Rights::Code).unwrap();
-    let error = code.map(&mut channel, 0, page(), taken.address(), Access::Read).unwrap_err();
-    assert!(error.what.contains("mach_vm_map"), "{error}");
-    let error = reserve(&mut channel, page(), Some(taken.address())).unwrap_err();
-    assert!(error.what.contains("are taken"), "{error}");
+fn the_image_of_this_process_is_its_executable() {
+    let (header, headers) = own_image().unwrap();
+    let layout = crate::image::layout(crate::Format::MachO, headers, page()).unwrap();
+    let slide = header.wrapping_sub(layout.header);
+    let here = (own_image as usize as u64).wrapping_sub(slide);
+    assert!(
+        layout.code.iter().any(|it| (it.linked..it.linked + it.len).contains(&here)),
+        "{here:#x} is in no code segment of {:?}",
+        layout.code
+    );
 }
 
 #[test]
@@ -102,33 +109,36 @@ fn threads_name_this_one() {
 
 #[test]
 fn the_rendezvous_hands_objects_to_the_peer() {
-    let (mut daemon, mut loader) = pair();
+    let (mut daemon, mut hook) = pair();
     let image = Object::create("image", page()).unwrap();
     let control = Object::create("control", page()).unwrap();
     let mut view = image.map_here(Access::Shared).unwrap();
     view.bytes_mut(0..3).unwrap().copy_from_slice(b"abc");
 
     let taker = std::thread::spawn(move || -> Result<Vec<Granted>, Error> {
-        let frame = loader.recv()?;
+        let frame = hook.recv()?;
         assert_eq!(frame.kind, kinds::GRANT);
         assert_eq!(frame.body, b"grant");
-        let granted = super::recv_objects(&mut loader, 2)?;
-        let read = granted[0].view(&mut loader)?;
-        assert_eq!(read.bytes(0..3)?, b"abc");
-        let mut shared = granted[1].view(&mut loader)?;
-        assert!(shared.bytes_mut(0..1).is_err());
-        drop((read, shared));
+        let granted = super::recv_objects(&mut hook, 2)?;
+        let read = granted[0].map_anywhere(&mut hook, Access::Read)?;
+        // SAFETY: the image object mapped readable just now, for the rest of the process.
+        assert_eq!(unsafe { std::slice::from_raw_parts(read as *const u8, 3) }, b"abc");
+        assert!(granted[0].map_anywhere(&mut hook, Access::Shared).is_err());
+        let words = granted[1].map_anywhere(&mut hook, Access::Shared)?;
+        // SAFETY: the control object mapped shared and writable just now, page-aligned.
+        unsafe { std::ptr::write_volatile(words as *mut u64, 7) };
         Ok(granted)
     });
-    super::send_objects(&mut daemon, std::process::id(), b"grant", &[(&image, Rights::Code), (&control, Rights::Control)])
+    super::send_objects(&mut daemon, std::process::id(), b"grant", &[(&image, Rights::Code), (&control, Rights::Words)])
         .unwrap();
     let granted = taker.join().unwrap().unwrap();
     assert_eq!(granted.iter().map(Granted::len).collect::<Vec<_>>(), [page(), page()]);
+    assert_eq!(control.map_here(Access::Shared).unwrap().word(0).load(std::sync::atomic::Ordering::Acquire), 7);
 }
 
 #[test]
 fn a_grant_for_another_process_is_refused() {
-    let (mut daemon, _loader) = pair();
+    let (mut daemon, _hook) = pair();
     let image = Object::create("other", page()).unwrap();
     let error = super::send_objects(&mut daemon, std::process::id() + 1, b"", &[(&image, Rights::Code)]).unwrap_err();
     assert!(error.what.contains("not the run process"), "{error}");
@@ -162,10 +172,10 @@ fn messages_round_trip() {
     let message = received_request(0x707, 3, &token(5));
     assert_eq!(decode_request(&message.0), Some(Request { reply: 0x707, count: 3, token: token(5) }));
 
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for round in 0..200 {
-        let count = (rng.next() % 33) as usize;
-        let objects: Vec<(u32, u64)> = (0..count).map(|_| ((rng.next() as u32) | 1, rng.next())).collect();
+        let count = rng.index(33);
+        let objects: Vec<(u32, u64)> = (0..count).map(|_| (rng.next_u32() | 1, rng.next_u64())).collect();
         let objects: Vec<(u32, u64)> = objects.into_iter().map(|(port, len)| (port.min(u32::MAX - 1), len)).collect();
         let mut reply = Message::new();
         let size = encode_reply(&mut reply, 0x55, &objects) as usize;
@@ -179,20 +189,20 @@ fn messages_round_trip() {
 
 #[test]
 fn messages_from_any_bytes_decode_or_fail() {
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     let request = received_request(9, 2, &token(1));
     let mut reply = Message::new();
     let size = encode_reply(&mut reply, 9, &[(3, 4), (5, 6)]) as usize;
     with_trailer(&mut reply, size, &token(2));
     for _ in 0..20_000 {
-        let mut bytes = if rng.next() % 2 == 0 { request.0 } else { reply.0 };
-        for _ in 0..1 + rng.next() % 8 {
-            let at = (rng.next() % 128) as usize;
-            bytes[at] = rng.next() as u8;
+        let mut bytes = if rng.coin() { request.0 } else { reply.0 };
+        for _ in 0..1 + rng.below(8) {
+            let at = rng.index(128);
+            bytes[at] = rng.next_u64() as u8;
         }
-        let len = (rng.next() % bytes.len() as u64) as usize;
+        let len = rng.index(bytes.len());
         let _ = decode_request(&bytes[..len]);
-        let _ = decode_reply(&bytes[..len], (rng.next() % 40) as usize);
+        let _ = decode_reply(&bytes[..len], rng.index(40));
         let _ = decode_request(&bytes);
         let _ = decode_reply(&bytes, 2);
     }

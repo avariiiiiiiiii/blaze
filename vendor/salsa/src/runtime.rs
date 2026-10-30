@@ -120,6 +120,7 @@ fn block_checked<'me>(
         dg.wait_closes(other_id, task_id)
     };
     match closes {
+        // alloc: contention only: one box when a task blocks on a key another task is running
         dependency_graph::Closes::No => BlockResult::Running(Running(Box::new(BlockedOnInner {
             dg,
             query_mutex_guard,
@@ -333,9 +334,9 @@ impl Runtime {
         &'a self,
         database_key: DatabaseKeyIndex,
         other_id: TaskId,
+        task_id: TaskId,
         query_mutex_guard: SyncGuard<'a>,
     ) -> BlockResult<'a> {
-        let task_id = TaskId::current();
         block_checked(
             self.dependency_graph.lock(),
             database_key,
@@ -368,6 +369,7 @@ impl Runtime {
             BlockTransferredResult::ImTheOwner
         } else {
             // Lock is owned by another thread, wait for it to be released.
+            // alloc: contention only: one box when a task blocks on a key another task is running
             BlockTransferredResult::OwnedBy(Box::new(BlockOnTransferredOwner {
                 dg,
                 database_key: query,
@@ -426,6 +428,7 @@ impl Runtime {
     pub(super) fn transfer_lock(
         &self,
         query: DatabaseKeyIndex,
+        current_id: TaskId,
         new_owner_key: DatabaseKeyIndex,
         new_owner_id: SyncOwner,
         guard: SyncGuard,
@@ -434,7 +437,7 @@ impl Runtime {
         DependencyGraph::transfer_lock(
             dg,
             query,
-            TaskId::current(),
+            current_id,
             new_owner_key,
             new_owner_id,
             guard,

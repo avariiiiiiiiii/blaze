@@ -35,7 +35,7 @@ pub fn token_tree_to_syntax_node(
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
     let parser_input = to_parser_input(buffer, span_to_edition);
-    crate::parse_tokens(buffer, entry_point, &parser_input)
+    crate::parse_tokens(buffer, entry_point, parser_input.tokens())
 }
 
 /// Whether two inputs are the same tokens, each the same to the parser.

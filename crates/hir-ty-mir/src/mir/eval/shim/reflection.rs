@@ -6,6 +6,7 @@
 //! rustc does not know is refused rather than guessed. A field's id stands for the field, as
 //! rustc's field representing type does.
 
+use hir_ty::db::HirDatabase;
 use hir_def::{AttrDefId, EnumVariantId};
 use rustc_type_ir::inherent::Region as _;
 
@@ -171,6 +172,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let field = from_bytes!(usize, self.read_scalar(field.interval)?);
                 let fields = self.reflected_fields(base, variant)?.len();
                 if field >= fields {
+                    // alloc: error path
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "field {field} of a variant with {fields}"
                     )));
@@ -222,8 +224,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 // rustc skips the binder too (its "FIXME: handle lifetime bounds").
                 let sig = sig.skip_binder();
                 let inputs: Vec<Ty<'db>> = sig.inputs().iter().copied().collect();
-                let value =
-                    self.reflected_fn_ptr(fn_ptr, &inputs, sig.output(), header.fn_sig_kind, locals)?;
+                let value = self.reflected_fn_ptr(
+                    fn_ptr,
+                    &inputs,
+                    sig.output(),
+                    header.fn_sig_kind,
+                    locals,
+                )?;
                 let (value, shadow) = self.reflected_some(fn_ptr, value, locals)?;
                 self.write_shadowed(destination.addr, &value, &shadow)?;
             }
@@ -277,7 +284,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         value: Made<M::Shadow>,
         locals: &Locals<'db>,
     ) -> Result<'db, Made<M::Shadow>> {
-        let Some(some) = self.lang_items().OptionSome else { not_supported!("no `Option` in core") };
+        let Some(some) = self.lang_items().OptionSome else {
+            not_supported!("no `Option` in core")
+        };
         let args = GenericArgs::new_from_slice(&[inner.into()]);
         let (size, layout, tag) = self.layout_of_variant(some.into(), args, locals)?;
         self.reflected_construct(size, &layout, tag, vec![value])
@@ -326,8 +335,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             AdtId::UnionId(it) if index == 0 => Ok(it.into()),
             AdtId::EnumId(it) => match it.enum_variants(self.db).variants.get_index(index) {
                 Some((_, &(variant, _))) => Ok(variant.into()),
+                // alloc: error path
                 None => Err(MirEvalError::UndefinedBehavior(format!("variant {index} of {adt:?}"))),
             },
+            // alloc: error path
             _ => Err(MirEvalError::UndefinedBehavior(format!("variant {index} of {adt:?}"))),
         }
     }
@@ -351,6 +362,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     fn reflected_fields(&self, ty: Ty<'db>, variant: usize) -> Result<'db, Vec<(String, Ty<'db>)>> {
         let variants = self.reflected_variants(ty)?;
         if variant >= variants {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "variant {variant} of a type with {variants}"
             )));
@@ -709,6 +721,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, ()> {
         let TyKind::Dynamic(predicates, _) = trait_ty.kind() else {
             // rustc's `span_bug!`.
+            // dyn: error path
             not_supported!("type_id_vtable for {trait_ty:?}, which is not a `dyn Trait`")
         };
         let interner = self.interner();

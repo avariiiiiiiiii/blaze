@@ -6,6 +6,7 @@
 
 use std::{fmt::Write as _, sync::LazyLock};
 
+use base_db::Db;
 use hir::db::HirDatabase;
 use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup, hir::generics::GenericParams};
 use hir_expand::name::Name;
@@ -70,7 +71,7 @@ static LETTERS: LazyLock<[Symbol; 26]> =
 
 pub(crate) struct Printer<'p, 'a, 'db, 't> {
     pub(crate) cx: &'p Cx<'a, 'db>,
-    pub(crate) db: &'t dyn HirDatabase,
+    pub(crate) db: &'t Db,
     pub(crate) interner: DbInterner<'t>,
     pub(crate) paths: &'p Paths,
     pub(crate) mode: Mode,
@@ -96,7 +97,7 @@ pub(crate) struct Generics {
 
 impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     pub(crate) fn new(cx: &'p Cx<'a, 'db>, mode: Mode, in_value: bool) -> Self {
-        let db: &'t dyn HirDatabase = cx.db;
+        let db: &'t Db = cx.db;
         Printer {
             cx,
             db,
@@ -742,7 +743,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
 
 /// The name of an early-bound lifetime parameter; None for one its function's parameters
 /// leave out.
-fn early_name(db: &dyn HirDatabase, p: EarlyParamRegion) -> Option<Symbol> {
+fn early_name(db: &Db, p: EarlyParamRegion) -> Option<Symbol> {
     let generics = GenericParams::of(db, p.id.parent);
     if p.id.local_id.into_raw().into_u32() as usize >= generics.len_lifetimes() {
         return None;
@@ -752,7 +753,7 @@ fn early_name(db: &dyn HirDatabase, p: EarlyParamRegion) -> Option<Symbol> {
 
 /// The name of a late-bound lifetime of a function: the `var`th late-bound lifetime parameter
 /// of the definition the region names.
-fn late_name(db: &dyn HirDatabase, br: BoundRegion<'_>) -> Option<Symbol> {
+fn late_name(db: &Db, br: BoundRegion<'_>) -> Option<Symbol> {
     let BoundRegionKind::Named(def) = br.kind else { return None };
     let def = GenericDefId::try_from(def).ok()?;
     let (_, data) = GenericParams::of(db, def).iter_late_bound_lt().nth(br.var.as_usize())?;
@@ -787,7 +788,7 @@ impl<'t> TypeVisitor<DbInterner<'t>> for BoundAt<'t> {
 /// rustc's `RegionNameCollector`: the names of the regions in a value, which anonymous ones
 /// are not given.
 struct UsedNames<'t, 'x> {
-    db: &'t dyn HirDatabase,
+    db: &'t Db,
     depth: DebruijnIndex,
     signature: bool,
     out: &'x mut FxHashSet<Symbol>,

@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::alloc::{Allocator, Global};
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
@@ -215,16 +216,28 @@ impl<T: Copy> CowList<T> {
 }
 
 /// A set of dense `u32` ids (pieces, slots): a bitset answers membership, and the members are
-/// kept in the order they were first added, so iterating costs the members, not the range.
-#[derive(Default, Debug)]
-pub(crate) struct IdSet {
-    bits: Vec<u64>,
-    listed: Vec<u64>,
-    list: Vec<u32>,
+/// kept in the order they were first added, so iterating costs the members, not the range. A
+/// stage's sets live in its arena ([`IdSet::new_in`]), so a warm stage grows them without the
+/// global allocator.
+#[derive(Debug)]
+pub(crate) struct IdSet<A: Allocator + Copy = Global> {
+    bits: Vec<u64, A>,
+    listed: Vec<u64, A>,
+    list: Vec<u32, A>,
     len: usize,
 }
 
-impl IdSet {
+impl Default for IdSet {
+    fn default() -> Self {
+        IdSet::new_in(Global)
+    }
+}
+
+impl<A: Allocator + Copy> IdSet<A> {
+    pub fn new_in(alloc: A) -> Self {
+        IdSet { bits: Vec::new_in(alloc), listed: Vec::new_in(alloc), list: Vec::new_in(alloc), len: 0 }
+    }
+
     #[inline]
     pub fn contains(&self, id: u32) -> bool {
         let (word, bit) = (id as usize / 64, id % 64);
@@ -297,20 +310,24 @@ impl IdSet {
 
 /// A set of symbols: an [`IdSet`] per symbol shard.
 #[derive(Debug)]
-pub(crate) struct SymSet {
-    shards: Vec<IdSet>,
+pub(crate) struct SymSet<A: Allocator + Copy = Global> {
+    shards: Vec<IdSet<A>, A>,
     len: usize,
 }
 
 impl Default for SymSet {
     fn default() -> Self {
-        let mut shards = Vec::with_capacity(Symbols::SHARDS);
-        shards.resize_with(Symbols::SHARDS, IdSet::default);
-        SymSet { shards, len: 0 }
+        SymSet::new_in(Global)
     }
 }
 
-impl SymSet {
+impl<A: Allocator + Copy> SymSet<A> {
+    pub fn new_in(alloc: A) -> Self {
+        let mut shards = Vec::with_capacity_in(Symbols::SHARDS, alloc);
+        shards.resize_with(Symbols::SHARDS, || IdSet::new_in(alloc));
+        SymSet { shards, len: 0 }
+    }
+
     pub fn insert(&mut self, sym: Sym) -> bool {
         let (shard, at) = Symbols::split(sym);
         let new = self.shards[shard].insert(at as u32);
@@ -637,6 +654,41 @@ mod tests {
         assert_eq!(syms.iter().collect::<Vec<_>>(), vec![a]);
         assert!(syms.remove(a));
         assert!(syms.is_empty());
+    }
+
+    /// A stage's sets in its arena: the same members as sets on the heap, and once the arena is
+    /// warm, filling them makes no global allocation.
+    #[test]
+    fn sets_in_a_frame_allocate_nothing() {
+        const IDS: u32 = 200_000;
+        fn fill<A: Allocator + Copy>(ids: &mut IdSet<A>, syms: &mut SymSet<A>) {
+            for n in 0..IDS {
+                ids.insert(n.wrapping_mul(7919) % (IDS * 4));
+                syms.insert(Symbols::join(n as usize % Symbols::SHARDS, (n / 3) as usize));
+            }
+            for n in (0..IDS).step_by(5) {
+                ids.remove(n);
+                syms.remove(Symbols::join(n as usize % Symbols::SHARDS, (n / 3) as usize));
+            }
+        }
+        fn sets_in(frame: &blaze_mem::Frame) -> (IdSet<&blaze_mem::Frame>, SymSet<&blaze_mem::Frame>) {
+            let (mut ids, mut syms) = (IdSet::new_in(frame), SymSet::new_in(frame));
+            fill(&mut ids, &mut syms);
+            (ids, syms)
+        }
+        fn same<A: Allocator + Copy>(got: (IdSet<A>, SymSet<A>), ids: &IdSet, syms: &SymSet) {
+            assert_eq!(got.0.iter().collect::<Vec<_>>(), ids.iter().collect::<Vec<_>>());
+            assert_eq!(got.0.sorted(), ids.sorted());
+            assert_eq!(got.0.len(), ids.len());
+            assert_eq!(got.1.iter().collect::<Vec<_>>(), syms.iter().collect::<Vec<_>>());
+            assert_eq!(got.1.len(), syms.len());
+        }
+        let (mut ids, mut syms) = (IdSet::default(), SymSet::default());
+        fill(&mut ids, &mut syms);
+        let mut frame = crate::arena::stage_frame().unwrap();
+        same(sets_in(&frame), &ids, &syms);
+        frame.reset();
+        same(blaze_alloc_count::assert_at_most(0, "a warm stage's sets", || sets_in(&frame)), &ids, &syms);
     }
 
     /// The pages against a plain vector given the same writes.

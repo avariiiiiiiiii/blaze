@@ -44,18 +44,18 @@ use crate::{
 const PREVIOUSLY_ACCEPTED: &str = "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!";
 
 /// What the crate says that the attribute parser reads: its root file and its features.
-struct Krate {
+pub(crate) struct Krate {
     root: Option<hir_expand::EditionedFileId>,
     root_name: String,
     fn_delegation: bool,
     stmt_expr_attributes: bool,
     extern_types: bool,
-    fn_align: bool,
-    static_align: bool,
+    pub(crate) fn_align: bool,
+    pub(crate) static_align: bool,
 }
 
 impl Krate {
-    fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> Krate {
+    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> Krate {
         let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db);
         let root_name = root.map(|it| cx.file_name(it.file_id(cx.db))).unwrap_or_default();
         let mut krate = Krate {
@@ -546,7 +546,7 @@ fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, targ
 }
 
 /// rustc's `check_crate_level` where being elsewhere is a lint: `InvalidAttrStyle`.
-fn crate_level(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr) -> Diag {
+pub(crate) fn crate_level(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr) -> Diag {
     let name = attr.name();
     let message = match attr.inner {
         true => format!("the `#![{name}]` attribute can only be used at the crate root"),
@@ -600,7 +600,7 @@ fn unused_builtin(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str) -> Di
 /// rustc's `allowed_targets_applied`: the targets an attribute can be applied to, those of
 /// unstable features the crate has not enabled left out, similar ones named as a group, sorted;
 /// with whether there is one.
-fn applied(krate: &Krate, mut allowed: Vec<Target>, target: Target) -> (Vec<&'static str>, bool) {
+pub(crate) fn applied(krate: &Krate, mut allowed: Vec<Target>, target: Target) -> (Vec<&'static str>, bool) {
     use super::target::MethodKind::{Inherent, Trait, TraitImpl};
     if !krate.fn_delegation {
         allowed.retain(|it| !matches!(it, Target::Delegation { .. }));
@@ -699,7 +699,7 @@ fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, help: Option<Stri
 }
 
 /// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
-fn and_list<S: AsRef<str>>(items: &[S]) -> String {
+pub(crate) fn and_list<S: AsRef<str>>(items: &[S]) -> String {
     match items {
         [] => String::new(),
         [one] => one.as_ref().to_owned(),

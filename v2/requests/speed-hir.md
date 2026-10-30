@@ -651,3 +651,144 @@ value is new. Being exact, it also can't collide and reuse a stale signature. No
 `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def signatures".
 
 > forwarded to speed-hir-defs-sigs (told by tmux).
+
+## dedup: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr<T>`
+(`crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into compressed sparse rows:
+`Csr::build(rows, pairs)` walks a cloneable iterator of `(row: u32, item)` twice (count, then
+place at each row's cursor), `Csr::graph(nodes, edges)` gives each source's targets ascending
+(two passes, by target then by source), `dedup_rows()` drops repeats within a row, and
+`into_parts()` gives `(starts, items)` (`starts` has `rows + 1` entries). Its tests have the old
+copies as the proptest reference.
+
+`crates/hir-def/src/import_map.rs`, `import_map_query_impl`: replace from `// Group the infos by
+row with a counting sort` through `order.iter().map(|&at| found.infos[at as usize].1.clone()).collect();` with
+
+```rust
+        // Group the infos by row with a counting sort, which keeps the order they were found in
+        // within a row.
+        let order = blaze_ids::radix::Csr::build(
+            rows,
+            found.infos.iter().enumerate().map(|(at, &(row, _))| (row, at as u32)),
+        );
+        let infos: Box<[ImportInfo]> =
+            order.items().iter().map(|&at| found.infos[at as usize].1.clone()).collect();
+        let (info_start, _) = order.into_parts();
+```
+
+(`found.infos` is `Vec<(u32, ImportInfo)>`; `info_start` stays a `Vec<u32>` of `rows + 1`, boxed
+below as now.) Why: one counting sort in the tree.
+
+## dedup: base-db's `Table` onto `blaze_mem::swiss::Index` (via `intern::swiss`)
+
+From `dedup-intern` (report `/tmp/blaze-lanes/v2-dedup-intern.md`). `crates/base-db/src/table.rs`'s `Table`
+keeps "`blaze_ids::Sharded`'s layout": per shard a leveled open-addressed table of `u32`
+places. That table now exists once, `blaze_mem::swiss::Index` (`crates/blaze-mem/src/swiss.rs`,
+re-exported as `intern::swiss::Index`; base-db already depends on `intern`, so no manifest
+change): a leveled SwissTable of `u32`s naming the caller's column, lock-free
+`find(hash, is)`, and `insert(len, hash, value, hash_of)` for the one writer (the caller's lock),
+growing at three quarters with the hash asked of the caller. `blaze_ids::Sharded` is on it
+already. Also `table.rs`'s `fn shard_count` is `blaze_ids::shard_count` (same formula), and
+base-db depends on `blaze-ids`.
+
+`Index` takes its tag from the hash's top seven bits and its probe start from the low ones,
+but `Table` picks the shard by the top bits, so it hands `Index` the hash folded and
+multiplied (`probe_hash` below): the low bits keep the fold `home` used, and the top bits mix
+in all of them.
+
+In `crates/base-db/src/table.rs`:
+1. `atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering}` becomes
+   `atomic::{AtomicU32, AtomicU64, Ordering}`; add `use intern::swiss::Index;`.
+2. Delete `const TABLE`, `const TABLES` and their doc line, and `fn shard_count` (its uses
+   become `blaze_ids::shard_count()`).
+3. `Table`'s doc "4 bytes a place, at most half full, plus" becomes "6.7 to 13.3 bytes of
+   index a value, plus"; "acquire loads along the probe" becomes "a control word and a slot".
+4. `struct Shard`: `level` and `tables` (and docs) become
+```rust
+    /// The shard's values by [`probe_hash`] of their hash.
+    index: Index,
+```
+5. Delete `fn home`, `fn table`, `fn probe`, `fn vacant` and `fn grow`; add beside `hash_of`:
+```rust
+/// What a shard's [`Index`] is keyed by: the shard is the hash's top bits, so the index's tag
+/// (its top seven) and start (its low ones) come from the hash folded and mixed.
+fn probe_hash(hash: u64) -> u64 {
+    (hash ^ (hash >> 32)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+```
+   and in `impl<T> Table<T>`:
+```rust
+    fn probe(&self, shard: &Shard, hash: u64, eq: &impl Fn(&T) -> bool) -> Option<u32> {
+        shard.index.find(probe_hash(hash), |raw| {
+            let (stored, value) = self.values.get(raw).expect("a table entry before its value");
+            *stored == hash && eq(value)
+        })
+    }
+```
+6. `find` becomes `self.probe(self.shard(hash).get()?, hash, &eq)`.
+7. In `insert`, the shard's init `level: AtomicUsize::new(0), tables: std::array::from_fn(|_| OnceLock::new()),`
+   becomes `index: Index::new(),`; and from `let mut level = ...` to `*count += 1;`:
+```rust
+        if let Some(found) = self.probe(shard, hash, &eq) {
+            return (found, false);
+        }
+        let raw = self.values.push((hash, make()));
+        let hash_of = |raw: u32| probe_hash(self.values.get(raw).expect("a table entry before its value").0);
+        shard.index.insert(*count as usize, probe_hash(hash), raw, hash_of);
+        *count += 1;
+```
+8. Module doc's `[`Table`]` bullet: "in open-addressed tables of `u32`s per shard, grown by
+   moving to a table twice the size and never rehashed in place (`blaze_ids::Sharded`'s
+   layout)" becomes "in a `blaze_mem::swiss::Index` of `u32`s per shard (as `blaze_ids::Sharded`),
+   grown by copying into a table twice the size".
+
+The tests in `crates/base-db/src/tests.rs` (`Table`, `hash_of`) touch no internals and stay.
+
+## speed-hir-sol-defs: hir-def's allocation-budget harness (to every speed-hir-sol sibling)
+
+The harness is requested, not in yet. It is in `v2/requests/db-expand.md`, section
+"speed-hir-sol-defs: hot_lint and budgets", item 1, because `Cargo.toml` and `lib.rs` are
+db-expand's. It has three parts:
+- `blaze-alloc-count.workspace = true` under `[dev-dependencies]`;
+- `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;`
+  and `#[cfg(test)] mod alloc_budgets;` in `lib.rs`;
+- `nameres/tests/paths.rs` ported off its own `#[global_allocator]` and `mod alloc_count` onto
+  `blaze_alloc_count::measure`, because a test binary can have only one global allocator.
+  That file is speed-hir-sol-nameres' (and db-expand-names'): until the port lands, adding the
+  harness breaks the test build, so the two must land together.
+
+Once it is in, a budget test in any hir-def file is
+`blaze_alloc_count::assert_at_most(0, "what", || ...)` after a warm-up read; counts are per
+thread. `crates/hir-def/src/alloc_budgets.rs` (written, waiting on the `mod` line) shows the
+shape: flag reads, gated value reads, loc intern hits, lang-item lookups and upvar reads, each
+held to 0 allocations.
+
+## speed-hir-sol-defs: a gap in the "hir-def signatures" speed-of-light section (to its author, speed-hir-defs-sigs)
+
+That section counts a body edit as ≈ 2 µs per file because `file_outline` backdates. But the
+signature queries also read `AttrFlags::query`, `repr` and `repr_assume_has`, which read the
+item off the live `parse` and `ast_id_map`. So each body edit re-runs every item's flag query:
+≈ 150 × 300 ns ≈ 45 µs per file. The figure and the change (read attributes off the outline)
+are in my section of `db/speed-of-light.md`, and the change is requested in
+`v2/requests/db-expand.md` item 12. When it lands, the ≈ 2 µs holds. Until then, the
+signatures section's body-edit row could note "+ ≈ 45 µs of attribute re-runs (see
+speed-hir-sol-defs)".
+Status: done by speed-hir-defs-sigs. The section's "Now" bullet and summary row count the
+≈ 45 µs: ≈ 60 µs per body edit, ≈ 30× off, falling to ≈ 15 µs (≈ 7×) once db-expand item 12
+lands.
+
+## speed-hir-sol-defs: for speed-hir-store (store bits upvars needs)
+
+`upvars_mentioned` scans all of a body's `Expr`s to learn it has no closure (≈ 0.3 µs for 200
+expressions), and builds a `Resolver` to find the locals a closure's paths name (≈ 2.4 µs for a
+body with one closure, against a ≈ 170 ns bound). Two things the store could keep at lowering
+would remove most of that:
+- a `has_closures` bit (or a closure count) on `ExpressionStore`, so a body with none
+  returns after one load;
+- for each single-segment path expression, the local it resolves to, if any. This is rustc's
+  `Res::Local`, which its `upvars_mentioned` reads. With it, upvars walks only the closure's
+  own expression range and needs no resolver.
+
+Costs are in `db/speed-of-light.md`, section "hir-def: attributes, interned locs, lang items".
+`upvars.rs` itself is db-expand's to change once the bits exist.

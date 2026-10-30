@@ -3,6 +3,7 @@
 //! for being allowed to mutate what it mutates and, with the loans in scope, for conflicting
 //! with a loan.
 
+use hir_ty::db::HirDatabase;
 use blaze_ids::radix;
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -21,15 +22,19 @@ use hir_ty::{
 };
 
 use super::{
-    BorrowckDiagnostic, Ctx, Mode,
+    BorrowckDiagnostic, Ctx, Mode, PartSpan,
     bitset::BitSet,
     cfg::{Cfg, Dominators, Location, index},
+    intervals::IntervalSet,
     liveness,
     loans::{Activation, Bias, Depth, Loan, Loans, places_conflict},
     moves::{InitFlow, InitKind, Lookup, MoveData, Mpi, apply},
     polonius,
     regions::{self, Category, RegionValues, Regions, UniversalKind},
 };
+
+mod explain;
+mod parts;
 
 /// Checks `body`, given what the closures it makes need of it; in a closure, returns what it
 /// needs of its creator, with how many regions its type has, and the captures it needs the
@@ -60,10 +65,8 @@ pub(super) fn check<'db>(
     let live = phase(Phase::Liveness, || {
         liveness::region_liveness(ctx, body, &cfg, &moves, &regions, count)
     });
-    let live_loans_input = (ctx.mode == Mode::Polonius).then(|| live.clone());
-    let again = (!regions.members.is_empty()).then(|| live.clone());
     let (values, unnamed) = phase(Phase::Infer, || {
-        let mut values = regions::infer(&regions, count, cfg.points, live);
+        let mut values = regions::infer(&regions, count, cfg.points, &live);
         // rustc's member constraints: a region of a returned `impl Trait`'s hidden type that can
         // be none of the lifetimes it captures is an error, reported only when the body has no
         // other region error. One that can is made to outlive the least it can be, as rustc's
@@ -86,11 +89,9 @@ pub(super) fn check<'db>(
                 })
             })
             .collect();
-        if let Some(live) = again
-            && !applied.is_empty()
-        {
+        if !applied.is_empty() {
             regions.outlives.extend(applied);
-            values = regions::infer(&regions, count, cfg.points, live);
+            values = regions::infer(&regions, count, cfg.points, &live);
         }
         (values, unnamed)
     });
@@ -99,12 +100,12 @@ pub(super) fn check<'db>(
             && is_immutable_root(ctx, PlaceRef { local, projection })
     };
     let mut loans = phase(Phase::Loans, || Loans::gather(ctx, body, &cfg, &regions, unique));
-    phase(Phase::Scopes, || match live_loans_input {
-        Some(liveness) => {
-            let live = polonius::live_loans(ctx, body, &cfg, &regions, count, &liveness, &loans);
-            loans.compute_polonius_scopes(body, &cfg, &live);
+    phase(Phase::Scopes, || match ctx.mode {
+        Mode::Polonius => {
+            let live_loans = polonius::live_loans(ctx, body, &cfg, &regions, count, &live, &loans);
+            loans.compute_polonius_scopes(body, &cfg, &live_loans);
         }
-        None => loans.compute_scopes(body, &cfg, &values),
+        _ => loans.compute_scopes(body, &cfg, &values),
     });
     let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(ctx, body, &cfg));
     crate::timings::count(|it| {
@@ -171,6 +172,7 @@ pub(super) fn check<'db>(
         regions: &regions,
         region_count: count,
         values: &values,
+        live: &live,
         loans: &loans,
         in_scope: BitSet::default(),
         dead_reported: FxHashSet::default(),
@@ -259,12 +261,13 @@ pub(super) fn check<'db>(
     checker.report_region_errors();
     if unnamed && checker.errors.len() == before {
         checker.errors.push(Some(BorrowckDiagnostic {
-            code: "E0700",
-            span: MirSpan::Unknown,
-            message:
+            at_signature: true,
+            ..BorrowckDiagnostic::new(
+                "E0700",
+                MirSpan::Unknown,
                 "hidden type for `impl Trait` captures lifetime that does not appear in bounds"
                     .to_owned(),
-            at_signature: true,
+            )
         }));
     }
     let unused_mut = checker.unused_mut();
@@ -596,6 +599,17 @@ impl InitAction {
             InitAction::PartialAssignment => "partially assigned",
         }
     }
+
+    /// rustc's `as_verb_in_past_tense`.
+    fn past_tense(self) -> &'static str {
+        match self {
+            InitAction::Use => "used",
+            InitAction::Borrow => "borrowed",
+            InitAction::MatchOn => "matched on",
+            InitAction::Assignment => "assigned",
+            InitAction::PartialAssignment => "partially assigned",
+        }
+    }
 }
 
 /// Why a move out of a place is not allowed.
@@ -648,6 +662,8 @@ struct Checker<'a, 'b, 'db> {
     regions: &'a Regions<'db>,
     region_count: usize,
     values: &'a RegionValues,
+    /// The points each region is live at by liveness alone, rustc's `liveness_constraints`.
+    live: &'a [IntervalSet],
     loans: &'a Loans,
     /// The loans in scope where the checker is.
     in_scope: BitSet,
@@ -761,10 +777,15 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     fn report(&mut self, code: &'static str, span: MirSpan, message: String) {
+        self.report_with(BorrowckDiagnostic::new(code, span, message));
+    }
+
+    fn report_with(&mut self, mut diagnostic: BorrowckDiagnostic) {
         use hir_def::hir::{ClosureKind, CoroutineSource, Expr};
         // An `async` closure's future is lowered around its body with no syntax of its own;
         // rustc points at the body.
-        let span = match span {
+        let span = diagnostic.span;
+        diagnostic.span = match span {
             MirSpan::ExprId(expr)
                 if let Expr::Closure {
                     body,
@@ -777,7 +798,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             }
             _ => span,
         };
-        self.errors.push(Some(BorrowckDiagnostic { code, span, message, at_signature: false }));
+        for (at, _) in &mut diagnostic.labels {
+            if *at == PartSpan::At(span) {
+                *at = PartSpan::At(diagnostic.span);
+            }
+        }
+        self.errors.push(Some(diagnostic));
     }
 
     fn is_union_literal(&self, place: PlaceRef<'_>, span: MirSpan) -> bool {
@@ -972,7 +998,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     | TerminatorKind::Assert { .. }
             )
         {
-            self.check_for_invalidation_at_unwind();
+            self.check_for_invalidation_at_unwind(location, span);
         }
     }
 
@@ -980,7 +1006,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// rust-analyzer's MIR does not have: a terminator that may unwind takes there every loan
     /// in scope, and those whose region outlives a universal one are still in scope at the
     /// `resume`, so each of them is reported, not only the first a `StorageDead` meets.
-    fn check_for_invalidation_at_unwind(&mut self) {
+    fn check_for_invalidation_at_unwind(&mut self, location: Location, span: MirSpan) {
         let in_scope: Vec<usize> = self.in_scope.iter().collect();
         let loans = self.loans;
         for id in in_scope {
@@ -994,10 +1020,15 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 .any(|it| self.regions.universals[it].1 != UniversalKind::FnBody);
             // The unwind path drops the local the loan is of, a destructor that may see it.
             let borrowed = PlaceRef { local: loan.local, projection: loans.projection(id) };
-            if outlives_universal && self.through_destructor(borrowed) {
-                self.report_conflicts_with_destructor(id);
-            } else if outlives_universal {
-                self.report_does_not_live_long_enough(id);
+            if !outlives_universal {
+                continue;
+            }
+            match self.destructor_ty(borrowed) {
+                Some(dropped) => {
+                    let whole = PlaceRef { local: loan.local, projection: &[] };
+                    self.report_conflicts_with_destructor(id, location, whole, span, dropped)
+                }
+                None => self.report_does_not_live_long_enough(id, location, span, None),
             }
         }
     }
@@ -1284,15 +1315,17 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     }
                     match access {
                         Access::Borrow(kind) => {
-                            self.report_conflicting_borrow(place, span, kind, id)
+                            self.report_conflicting_borrow(location, place, span, kind, id)
                         }
                         _ => {
                             let what = self.quoted(place, "value");
-                            self.report(
+                            let mut diagnostic = BorrowckDiagnostic::new(
                                 "E0503",
                                 span,
                                 format!("cannot use {what} because it was mutably borrowed"),
                             );
+                            self.use_while_borrowed_parts(&mut diagnostic, location, id);
+                            self.report_with(diagnostic);
                         }
                     }
                 }
@@ -1305,34 +1338,42 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         (false, true) => MutBorrowKind::TwoPhasedBorrow,
                         (false, false) => MutBorrowKind::Default,
                     };
-                    self.report_conflicting_borrow(place, span, BorrowKind::Mut { kind }, id);
+                    let kind = BorrowKind::Mut { kind };
+                    self.report_conflicting_borrow(location, place, span, kind, id);
                 }
                 (Access::Activation(activating), _) => {
                     let kind = self.loans.loans[activating].kind;
-                    self.report_conflicting_borrow(place, span, kind, id);
+                    self.report_conflicting_borrow(location, place, span, kind, id);
                 }
                 (Access::Mutate, _) => {
                     let what = self.quoted(place, "value");
-                    self.report(
+                    let mut diagnostic = BorrowckDiagnostic::new(
                         "E0506",
                         span,
                         format!("cannot assign to {what} because it is borrowed"),
                     );
+                    self.assign_to_borrowed_parts(&mut diagnostic, location, place, id);
+                    self.report_with(diagnostic);
                 }
                 (Access::Move, _) => {
                     let what = self.quoted(place, "value");
-                    self.report(
+                    let mut diagnostic = BorrowckDiagnostic::new(
                         "E0505",
                         span,
                         format!("cannot move out of {what} because it is borrowed"),
                     );
+                    self.move_out_while_borrowed_parts(&mut diagnostic, location, place, id);
+                    self.report_with(diagnostic);
                 }
                 (Access::StorageDeadOrDrop, _) => {
                     let borrowed = PlaceRef { local: loan.local, projection: loans.projection(id) };
-                    if self.through_destructor(borrowed) && !borrowed.is_prefix_of(place) {
-                        self.report_conflicts_with_destructor(id);
-                    } else {
-                        self.report_does_not_live_long_enough(id);
+                    match self.destructor_ty(borrowed) {
+                        Some(dropped) if !borrowed.is_prefix_of(place) => self
+                            .report_conflicts_with_destructor(id, location, place, span, dropped),
+                        _ => {
+                            let whole = place.projection.is_empty().then_some(place.local);
+                            self.report_does_not_live_long_enough(id, location, span, whole)
+                        }
                     }
                 }
             }
@@ -1375,17 +1416,18 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
 
     /// rustc's `check_for_invalidation_at_exit`: a loan of a local still in scope where the
     /// body returns outlives it.
-    fn check_for_invalidation_at_exit(&mut self, _location: Location, _span: MirSpan) {
+    fn check_for_invalidation_at_exit(&mut self, location: Location, span: MirSpan) {
         let in_scope: Vec<usize> = self.in_scope.iter().collect();
         for id in in_scope {
             if !self.loans.projection(id).contains(&ProjectionElem::Deref) {
-                self.report_does_not_live_long_enough(id);
+                self.report_does_not_live_long_enough(id, location, span, None);
             }
         }
     }
 
     fn report_conflicting_borrow(
         &mut self,
+        location: Location,
         place: PlaceRef<'_>,
         span: MirSpan,
         new: BorrowKind,
@@ -1433,40 +1475,60 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             Some(&closure) => closure,
             None => span,
         };
-        self.report(code, span, message);
+        let mut diagnostic = BorrowckDiagnostic::new(code, span, message);
+        self.conflicting_borrow_parts(&mut diagnostic, location, place, new, issued);
+        self.report_with(diagnostic);
     }
 
     /// rustc's `classify_drop_access_kind` being `Destructor`: the place is reached through a
-    /// field of a value whose type implements `Drop`.
-    fn through_destructor(&self, place: PlaceRef<'_>) -> bool {
+    /// field of a value whose type implements `Drop`, that type.
+    fn destructor_ty(&self, place: PlaceRef<'_>) -> Option<Ty<'db>> {
         let mut ty = self.ctx.place_ty(self.body, place.local, &[]);
         for elem in place.projection {
             if let ProjectionElem::Field(_) | ProjectionElem::Downcast(_) = elem
                 && let TyKind::Adt(def, _) = ty.ty.kind()
                 && self.ctx.has_destructor(def.def_id())
             {
-                return true;
+                return Some(ty.ty);
             }
             ty = self.ctx.project(ty, elem);
         }
-        false
+        None
     }
 
-    /// rustc's `report_borrow_conflicts_with_destructor`.
-    fn report_conflicts_with_destructor(&mut self, id: usize) {
+    /// rustc's `report_borrow_conflicts_with_destructor`: the drop at `drop` of `place` needs
+    /// loan `id`'s place, inside a value of type `dropped`, which implements `Drop`.
+    fn report_conflicts_with_destructor(
+        &mut self,
+        id: usize,
+        location: Location,
+        place: PlaceRef<'_>,
+        drop: MirSpan,
+        dropped: Ty<'db>,
+    ) {
         let loan = &self.loans.loans[id];
         if !self.dead_reported.insert((loan.local, loan.span)) {
             return;
         }
-        self.report(
+        let mut diagnostic = BorrowckDiagnostic::new(
             "E0713",
             loan.span,
             "borrow may still be in use when destructor runs".to_owned(),
         );
+        self.conflicts_with_destructor_parts(&mut diagnostic, location, id, place, drop, dropped);
+        self.report_with(diagnostic);
     }
 
-    /// rustc's `report_borrowed_value_does_not_live_long_enough`.
-    fn report_does_not_live_long_enough(&mut self, id: usize) {
+    /// rustc's `report_borrowed_value_does_not_live_long_enough`: loan `id` is still in use at
+    /// `location`, where what it borrows is dropped at `drop`; `dropped` is the variable that
+    /// is, when it is a whole one.
+    fn report_does_not_live_long_enough(
+        &mut self,
+        id: usize,
+        location: Location,
+        drop: MirSpan,
+        dropped: Option<LocalId>,
+    ) {
         let loans = self.loans;
         let loan = &loans.loans[id];
         if !self.dead_reported.insert((loan.local, loan.span)) {
@@ -1510,11 +1572,25 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         if !blamed.from_closure && !self.regions.returns_static_opaque =>
                     {
                         let what = self.quoted(place, "value");
-                        self.report(
+                        let mut diagnostic = BorrowckDiagnostic::new(
                             "E0373",
                             closure,
                             format!("closure may outlive the current function, but it borrows {what}, which is owned by the current function"),
                         );
+                        if let MirSpan::ExprId(expr) = closure {
+                            let capture = self.capture_of(loan.assigned).map(|(_, it)| it);
+                            let returned = (matches!(blamed.category, Category::Return)
+                                && blamed.span != MirSpan::Unknown)
+                                .then(|| self.tail(blamed.span));
+                            self.escaping_closure_parts(
+                                &mut diagnostic,
+                                expr,
+                                capture,
+                                &what,
+                                returned,
+                            );
+                        }
+                        self.report_with(diagnostic);
                         return;
                     }
                     // A `const` or `static` item's value is rustc's `UseAsConst`, not returned.
@@ -1534,14 +1610,33 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         } else {
                             self.tail(blamed.span)
                         };
-                        let message = match self.describe(place) {
-                            Some(_) if place.projection.is_empty() => {
-                                "cannot return reference to local variable".to_owned()
+                        let described = self.describe(place);
+                        let local = described.is_some() && place.projection.is_empty();
+                        let message = match local {
+                            true => "cannot return reference to local variable".to_owned(),
+                            false => {
+                                "returns a value referencing data owned by the current function"
+                                    .to_owned()
                             }
-                            _ => "returns a value referencing data owned by the current function"
-                                .to_owned(),
                         };
-                        self.report("E0515", span, message);
+                        let mut diagnostic = BorrowckDiagnostic::new("E0515", span, message);
+                        diagnostic.label(
+                            PartSpan::At(span),
+                            match local {
+                                true => "returns a reference to data owned by the current function",
+                                false => {
+                                    "returns a value referencing data owned by the current function"
+                                }
+                            },
+                        );
+                        if span != loan.span {
+                            let note = match described {
+                                Some(name) => format!("`{name}` is borrowed here"),
+                                None => "temporary value created here".to_owned(),
+                            };
+                            diagnostic.label(PartSpan::At(loan.span), note);
+                        }
+                        self.report_with(diagnostic);
                         return;
                     }
                     _ => (),
@@ -1556,14 +1651,30 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     && let_bound_block_value(self.ctx, closure) =>
             {
                 let what = self.quoted(place, "value");
-                self.report(
+                let mut diagnostic = BorrowckDiagnostic::new(
                     "E0373",
                     MirSpan::ExprId(closure),
                     format!("closure may outlive the current block, but it borrows {what}, which is owned by the current block"),
                 );
+                let capture = self.capture_of(loan.assigned).map(|(_, it)| it);
+                self.escaping_closure_parts(&mut diagnostic, closure, capture, &what, None);
+                self.report_with(diagnostic);
             }
             Some(name) => {
-                self.report("E0597", loan.span, format!("`{name}` does not live long enough"))
+                let mut diagnostic = BorrowckDiagnostic::new(
+                    "E0597",
+                    loan.span,
+                    format!("`{name}` does not live long enough"),
+                );
+                self.local_does_not_live_long_enough_parts(
+                    &mut diagnostic,
+                    location,
+                    id,
+                    &name,
+                    drop,
+                    dropped,
+                );
+                self.report_with(diagnostic);
             }
             // At the temporary, as rustc's: a pattern's borrow, `match Some(s()) {
             // Some(ref m) => .. }`, at `Some(s())`, not at `ref m`.
@@ -1572,7 +1683,13 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     MirSpan::ExprId(_) => loan.span,
                     _ => temporary_span(self.body, loan.local).unwrap_or(loan.span),
                 };
-                self.report("E0716", span, "temporary value dropped while borrowed".to_owned())
+                let mut diagnostic = BorrowckDiagnostic::new(
+                    "E0716",
+                    span,
+                    "temporary value dropped while borrowed".to_owned(),
+                );
+                self.temporary_does_not_live_long_enough_parts(&mut diagnostic, location, id, drop);
+                self.report_with(diagnostic);
             }
         }
     }
@@ -1765,10 +1882,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
             }
             if blamed.category == Category::Signature {
                 self.errors.push(Some(BorrowckDiagnostic {
-                    code,
-                    span,
-                    message,
                     at_signature: true,
+                    ..BorrowckDiagnostic::new(code, span, message)
                 }));
                 continue;
             }
@@ -1826,10 +1941,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                         _ => ("E0311", format!("the {what} may not live long enough")),
                     };
                     self.errors.push(Some(BorrowckDiagnostic {
-                        code,
-                        span: test.span,
-                        message,
                         at_signature: test.signature,
+                        ..BorrowckDiagnostic::new(code, test.span, message)
                     }));
                 }
                 break;
@@ -2289,11 +2402,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         unused.retain(|&(_, binding)| seen.insert(binding));
         unused
             .into_iter()
-            .map(|(_, binding)| BorrowckDiagnostic {
-                code: "unused_mut",
-                span: MirSpan::BindingId(binding),
-                message: "variable does not need to be mutable".to_owned(),
-                at_signature: false,
+            .map(|(_, binding)| {
+                BorrowckDiagnostic::new(
+                    "unused_mut",
+                    MirSpan::BindingId(binding),
+                    "variable does not need to be mutable".to_owned(),
+                )
             })
             .collect()
     }
@@ -2450,26 +2564,53 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         {
             if let Some((index, count)) = self.mut_errors.get_mut(&place.local) {
                 *count += 1;
-                if *count == 2
-                    && let Some(error) = &mut self.errors[*index]
-                {
-                    error.span = MirSpan::BindingId(binding);
+                let count = *count;
+                if let Some(error) = &mut self.errors[*index] {
+                    if count == 2 {
+                        error.span = MirSpan::BindingId(binding);
+                        error.label(PartSpan::At(error.span), "not mutable");
+                    }
+                    if count < 10 {
+                        error.label(PartSpan::At(span), "cannot borrow as mutable");
+                    }
+                    // rustc's note, added once all the borrows are counted.
+                    if count > 10 {
+                        let note = format!("...and {} other attempted mutable borrows", count - 10);
+                        match error.children.last_mut() {
+                            Some(last) if count > 11 => last.message = note,
+                            _ => error.note(note),
+                        }
+                    }
                 }
                 return;
             }
             self.mut_errors.insert(place.local, (self.errors.len(), 1));
         }
-        self.report(code, span, message);
+        let mut diagnostic = BorrowckDiagnostic::new(code, span, message);
+        // Behind a pointer rustc's labels name the pointer, which is not ported.
+        let behind_pointer = root != usize::MAX
+            && matches!(
+                place.base(root.min(place.projection.len())).projection.last(),
+                Some(ProjectionElem::Deref)
+            );
+        if !behind_pointer {
+            let not_declared_mut = root != usize::MAX;
+            self.mutability_parts(&mut diagnostic, place, code == "E0594", not_declared_mut);
+        }
+        self.report_with(diagnostic);
     }
 
     fn report_illegal_reassignment(&mut self, place: PlaceRef<'_>, span: MirSpan) {
         let name = self.describe(place).unwrap_or_default();
-        let message = if self.body.param_locals.contains(&place.local) {
+        let from_argument = self.body.param_locals.contains(&place.local);
+        let message = if from_argument {
             format!("cannot assign to immutable argument `{name}`")
         } else {
             format!("cannot assign twice to immutable variable `{name}`")
         };
-        self.report("E0384", span, message);
+        let mut diagnostic = BorrowckDiagnostic::new("E0384", span, message);
+        self.reassignment_parts(&mut diagnostic, place, from_argument);
+        self.report_with(diagnostic);
     }
 
     /// The path of `place`, or the nearest above it, with how much of `place` it covers.
@@ -2706,7 +2847,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         span: MirSpan,
         path: Mpi,
     ) {
-        let move_outs = self.moved_indexes(location, path);
+        let (move_outs, looped) = self.moved_indexes(location, path);
         if move_outs.is_empty() {
             // rustc reports only variables: lowering leaves some temporaries unassigned, as
             // the `()` an assignment evaluates to.
@@ -2752,7 +2893,17 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let name = self.quoted(used, "value");
         let what = if partially { "partially moved value" } else { "moved value" };
         let message = format!("{} of {what}: {name}", action.noun());
-        let diagnostic = BorrowckDiagnostic { code: "E0382", span, message, at_signature: false };
+        let mut diagnostic = BorrowckDiagnostic::new("E0382", span, message);
+        self.use_of_moved_parts(
+            &mut diagnostic,
+            location,
+            action,
+            used,
+            path,
+            &move_outs,
+            looped,
+            partially,
+        );
         let mut rustc_key =
             move_outs.iter().map(|&it| self.rustc_moves[it]).collect::<Option<Vec<usize>>>();
         if let Some(key) = &mut rustc_key {
@@ -2771,8 +2922,9 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     /// The moves out of `path` or a path above it that reach `location` without an init in
-    /// between, as rustc's `get_moved_indexes`.
-    fn moved_indexes(&self, location: Location, path: Mpi) -> Vec<usize> {
+    /// between, as rustc's `get_moved_indexes`, and whether they were found only through a
+    /// loop's way back, its `traversed_back_edge`.
+    fn moved_indexes(&self, location: Location, path: Mpi) -> (Vec<usize>, bool) {
         let above = |it: Mpi| self.moves.is_ancestor_or_self(it, path);
         let mut stack = Vec::new();
         let mut back_edges = Vec::new();
@@ -2832,7 +2984,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 reached_start = true;
             }
         }
-        if (is_argument || !reached_start) && result.is_empty() {
+        let looped = (is_argument || !reached_start) && result.is_empty();
+        if looped {
             while let Some(location) = back_edges.pop() {
                 if visit(&mut result, location) {
                     continue;
@@ -2842,7 +2995,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         radix::sort(&mut result);
         result.dedup();
-        result
+        (result, looped)
     }
 
     fn report_move_errors(&mut self) {

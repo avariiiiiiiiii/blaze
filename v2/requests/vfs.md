@@ -333,3 +333,221 @@ Status (safety-audit-edge, `crates/vfs` and `crates/vfs-notify`): done by speed-
 proposed (`#![forbid(unsafe_code)]` at each crate root; neither has any `unsafe`).
 
 > applied: done by speed-runtime, as its status line says; nothing left.
+
+## From speed-link-edge-sol-wire: `Op`'s bytes as one CBOR byte string, with blaze-api's `SCHEMA` 11 (2026-10-29)
+
+blaze-api's `SCHEMA` is now 11: every `Vec<u8>` of its own types (`Response::Ran`'s output,
+`TestResult::output`, `Cargo::files`) goes out as one byte string through the new
+`blaze_protocol::bytes` (`crates/blaze-protocol/src/bytes.rs`). `Op` rides in the same schema
+(every commit, what-if, best-of, edit and will-save) and is the biggest of them: an agent's
+commit of a 50 KiB file is about 100 KiB of CBOR today, one decoder step per byte (about 5 ns
+each, so 250 µs to read it), against 50 KiB and one `memcpy` (about 2 µs) as a byte string.
+
+1. What: in `crates/blaze-vfs/src/lib.rs`, on both `bytes` fields,
+   `#[serde(with = "blaze_protocol::bytes")]`:
+   - `Write { mode: Mode, path: String, #[serde(with = "blaze_protocol::bytes")] bytes: Vec<u8> }`
+   - `Edit { at: u64, len: u64, path: String, #[serde(with = "blaze_protocol::bytes")] bytes: Vec<u8> }`
+   and in `crates/blaze-vfs/Cargo.toml` `[dependencies]`: `blaze-protocol.workspace = true`
+   (blaze-protocol depends on serde alone).
+2. Why now: blaze-api's `SCHEMA` 11 is not built or shipped yet, so `Op` changes inside it with
+   no second bump. If this lands later than the first build, it needs `SCHEMA` 12 in
+   `crates/blaze-api/src/lib.rs` (tell speed-link-edge, or lane ci).
+3. What else reads it: nothing in blaze-vfs encodes `Op` with serde (its journal has its own
+   codec in `disk.rs`), so no stored byte changes. JSON is unchanged: serde_json writes bytes as
+   the same array of numbers. A CBOR array where a byte string is due is refused (one encoding
+   per value). The tests are in `crates/blaze-protocol/src/bytes/tests.rs`; blaze-api's
+   `frames/identity.rs` then covers `Op` against the reference codec as it is.
+
+## dedup: bits: blaze-vfs `journal::Written` and `Tree::collect`'s `reached` onto `blaze_ids::bits::BitSet<NodeId>`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::BitSet<I>` (`crates/blaze-ids/src/bits.rs`) is a `Vec<u64>` set indexed by
+any `I: BitIndex`; `NodeId` becomes one. `Written` was such a set with no invariant of its own:
+`new(len, true)` is `BitSet::filled(len)`, `new(len, false)` is `BitSet::new(len)`, `get` is
+`contains` (also `false` past the words), `set` is `insert` (also panics past them), `grow` is
+`grow`. One difference: `Written::grow` was `resize`, which would drop words past a smaller
+`len`, where `BitSet::grow` never shrinks; no caller passes a smaller length (the tree's node
+count only grows between collections, a collection makes every set anew at the new count, and a
+base's `of` has the image's node count, at most the tree's). `renumbered` becomes a free
+function. Not persisted, no hash.
+
+1. `crates/blaze-vfs/src/tree.rs`: imports, before: `use blaze_ids::ContentId;` after:
+
+   ```rust
+   use blaze_ids::{
+       ContentId,
+       bits::{BitIndex, BitSet},
+   };
+   ```
+
+   After `pub(crate) struct NodeId(pub(crate) u32);` add:
+
+   ```rust
+   impl BitIndex for NodeId {
+       #[inline]
+       fn to_bit(self) -> usize {
+           self.0 as usize
+       }
+
+       #[inline]
+       fn from_bit(bit: usize) -> NodeId {
+           NodeId(u32::from_bit(bit))
+       }
+   }
+   ```
+
+   `Tree::collect`, before:
+
+   ```rust
+           let mut reached = vec![0u64; len.div_ceil(64)];
+           let mut stack: Vec<NodeId> = live.iter().copied().chain([self.empty]).collect();
+           while let Some(node) = stack.pop() {
+               let (word, bit) = (node.0 as usize / 64, 1u64 << (node.0 % 64));
+               if reached[word] & bit != 0 {
+                   continue;
+               }
+               reached[word] |= bit;
+               if let Some(entries) = self.entries(node) {
+                   stack.extend(entries.0.nodes.iter().map(|&it| NodeId(it)));
+               }
+           }
+           let count = reached.iter().map(|it| it.count_ones() as usize).sum();
+   ```
+
+   after:
+
+   ```rust
+           let mut reached = BitSet::<NodeId>::new(len);
+           let mut stack: Vec<NodeId> = live.iter().copied().chain([self.empty]).collect();
+           while let Some(node) = stack.pop() {
+               if !reached.insert(node) {
+                   continue;
+               }
+               if let Some(entries) = self.entries(node) {
+                   stack.extend(entries.0.nodes.iter().map(|&it| NodeId(it)));
+               }
+           }
+           let count = reached.count();
+   ```
+
+   and before:
+
+   ```rust
+           for at in 0..len as u32 {
+               if reached[at as usize / 64] & (1 << (at % 64)) == 0 {
+                   continue;
+               }
+               let (id, shape) = (*old.id(at), old.shape(at));
+   ```
+
+   after (the members ascending, as the loop visited them):
+
+   ```rust
+           for NodeId(at) in reached.iter() {
+               let (id, shape) = (*old.id(at), old.shape(at));
+   ```
+
+2. `crates/blaze-vfs/src/journal.rs`: imports, before: `use blaze_ids::{ContentId, Hasher};`
+   after: `use blaze_ids::{ContentId, Hasher, bits::BitSet};`
+
+   Replace the whole `Written` (from `/// By node, one bit: whether a record of it ...` through
+   the `}` closing `impl Written`) with:
+
+   ```rust
+   /// By node, one bit: whether a record of it is in the file (or the image it starts from), or
+   /// will be before any record made now.
+   type Written = BitSet<NodeId>;
+
+   /// The same bits by each node's number after a collection, and whether a node with its bit
+   /// set was dropped.
+   fn renumbered(written: &Written, renumbered: &[Option<NodeId>], len: usize) -> (Written, bool) {
+       let mut out = Written::new(len);
+       let mut dropped = false;
+       for (old, new) in renumbered.iter().enumerate() {
+           if written.contains(NodeId(old as u32)) {
+               match new {
+                   Some(new) => {
+                       out.insert(*new);
+                   }
+                   None => dropped = true,
+               }
+           }
+       }
+       (out, dropped)
+   }
+   ```
+
+   (The loop is `Written::renumbered`'s, unchanged.)
+
+   Call sites, before / after:
+
+   ```rust
+                   let of = Written::new(tree.table().base_len() as usize, true);
+   ```
+
+   ```rust
+                   let of = Written::filled(tree.table().base_len() as usize);
+   ```
+
+   ```rust
+               written: Written::new(tree.len(), true),
+   ```
+
+   ```rust
+               written: Written::filled(tree.len()),
+   ```
+
+   ```rust
+           self.staged = Some(FileBase { name, nodes, of: Written::new(nodes as usize, true) });
+   ```
+
+   ```rust
+           self.staged = Some(FileBase { name, nodes, of: Written::filled(nodes as usize) });
+   ```
+
+   ```rust
+                   None => Written::new(tree.len(), false),
+   ```
+
+   ```rust
+                   None => Written::new(tree.len()),
+   ```
+
+   In `collected`, before:
+
+   ```rust
+           self.written = self.written.renumbered(renumbered, len).0;
+           let mut lost = false;
+           for base in [&mut self.base, &mut self.switching].into_iter().flatten() {
+               let (of, dropped) = base.of.renumbered(renumbered, len);
+               base.of = of;
+               lost |= dropped;
+           }
+           for image in [&mut self.staged, &mut self.next].into_iter().flatten() {
+               image.of = image.of.renumbered(renumbered, len).0;
+           }
+   ```
+
+   after:
+
+   ```rust
+           self.written = self::renumbered(&self.written, renumbered, len).0;
+           let mut lost = false;
+           for base in [&mut self.base, &mut self.switching].into_iter().flatten() {
+               let (of, dropped) = self::renumbered(&base.of, renumbered, len);
+               base.of = of;
+               lost |= dropped;
+           }
+           for image in [&mut self.staged, &mut self.next].into_iter().flatten() {
+               image.of = self::renumbered(&image.of, renumbered, len).0;
+           }
+   ```
+
+   (`self::renumbered`: the parameter `renumbered` shadows the function's name in `collected`.)
+
+   In `write_node`: `if written.get(node) {` becomes `if written.contains(node) {`,
+   `.filter(|it| !written.get(it.1))` becomes `.filter(|it| !written.contains(it.1))`, and
+   `written.set(node);` becomes `written.insert(node);`. `self.written.grow(tree.len());` and
+   `written.grow(tree.len());` stay as they are; `base.of.clone()` stays (with its comment).
+
+Status: open

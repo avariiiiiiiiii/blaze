@@ -8,6 +8,7 @@ use crate::accumulator::{Accumulator, AnyAccumulated};
 
 #[derive(Default)]
 pub struct AccumulatedMap {
+    // dyn: one box per accumulator kind a query pushes to, only for queries that accumulate
     map: hashbrown::HashMap<IngredientIndex, Box<dyn AnyAccumulated>, FxBuildHasher>,
 }
 

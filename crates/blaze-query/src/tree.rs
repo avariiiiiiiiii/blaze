@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, ops::Bound, sync::Arc};
 
 use blaze_ids::{ContentId, Hasher};
-use blaze_vfs::Mode;
+use blaze_vfs::{Bytes, Corrupt, Mode};
 use rustc_hash::FxHashMap;
 
 use crate::table::{FxMap, ShortLock};
@@ -12,8 +12,10 @@ use crate::table::{FxMap, ShortLock};
 /// change (a root is a content ID), so every answer for a root is the same forever.
 pub trait Tree: Send + Sync {
     /// The file at `path` under `root`: its content ID, mode and bytes (a symlink's are its
-    /// target); `None` for none, a directory, or a root this tree does not have.
-    fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)>;
+    /// target); `None` for none, a directory, or a root this tree does not have. A file whose
+    /// bytes are a range of the mapped image that fails its check is `Err`, naming the
+    /// image's section and group: never `None`, which would be a file that is not there.
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt>;
     /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
     /// is a directory; `None` for none or a file.
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>>;
@@ -22,16 +24,17 @@ pub trait Tree: Send + Sync {
 /// The VFS's files: [`blaze_vfs::Vfs::reader`], a lock-free handle on its immutable nodes by
 /// content ID. Here rather than in blaze-vfs because blaze-query depends on blaze-vfs.
 ///
-/// The reader lends a file's bytes; this trait gives an `Arc`, so `file` takes one count (once
-/// per file per view, as the database keeps the input) until the database holds a view's
-/// bytes as the VFS's view keeps them (v2/requests/vfs.md item 8).
+/// A file's [`Bytes`] are the tree's own (its `Arc`, or its range of the mapped image) with
+/// one count taken, once per file per view, as the database keeps the input.
 impl Tree for blaze_vfs::Reader {
-    fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
-        blaze_vfs::Reader::file(self, root, path).map(|(id, mode, bytes)| (id, mode, bytes.clone()))
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        blaze_vfs::Reader::file(self, root, path)
     }
 
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
         let names = blaze_vfs::Reader::list(self, root, path)?;
+        // The trait's owned listing, once per directory per view (v2/requests/vfs.md item 8).
+        // alloc: see above.
         Some(names.map(|(name, dir)| (name.to_owned(), dir)).collect())
     }
 }
@@ -44,7 +47,7 @@ pub struct MemTree {
 }
 
 // BTreeMap: hashed in path order into the root's ID, and listed by prefix range.
-type Files = BTreeMap<String, (ContentId, Mode, Arc<[u8]>)>;
+type Files = BTreeMap<String, (ContentId, Mode, Bytes)>;
 
 pub const MEM_ROOT_DOMAIN: &str = "blaze v2 db memory root 2";
 
@@ -52,7 +55,7 @@ impl MemTree {
     /// The root holding exactly `files`, as `(path, bytes)`, each a regular file.
     pub fn root(&self, files: &[(&str, &[u8])]) -> ContentId {
         let files: Vec<(&str, Mode, &[u8])> =
-            files.iter().map(|&(path, bytes)| (path, Mode::Regular, bytes)).collect();
+            files.iter().map(|&(path, bytes)| (path, Mode::Regular, bytes)).collect(); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         self.root_with_modes(&files)
     }
 
@@ -62,15 +65,15 @@ impl MemTree {
             .iter()
             .map(|&(path, mode, bytes)| {
                 let id = ContentId::of(blaze_vfs::FILE_DOMAIN, bytes);
-                (path.to_owned(), (id, mode, Arc::from(bytes)))
+                (path.to_owned(), (id, mode, Bytes::from(Arc::<[u8]>::from(bytes)))) // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
             })
-            .collect();
+            .collect(); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         let mut hasher = Hasher::new(MEM_ROOT_DOMAIN);
         for (path, (id, mode, _)) in &files {
             hasher.part(path.as_bytes()).update(&mode.git().to_le_bytes()).id(id);
         }
         let root = hasher.finish();
-        self.roots.lock().insert(root, Arc::new(files));
+        self.roots.lock().insert(root, Arc::new(files)); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         root
     }
 
@@ -80,8 +83,8 @@ impl MemTree {
 }
 
 impl Tree for MemTree {
-    fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
-        self.files(root)?.get(path).cloned()
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        Ok(self.files(root).and_then(|files| files.get(path).cloned()))
     }
 
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
@@ -89,24 +92,24 @@ impl Tree for MemTree {
         if files.contains_key(path) {
             return None;
         }
-        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
+        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") }; // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         let mut names: FxHashMap<String, bool> = FxHashMap::default();
         let under = files.range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded));
         for (name, _) in under {
             let Some(rest) = name.strip_prefix(&prefix) else { break };
             match rest.split_once('/') {
                 Some((dir, _)) => {
-                    names.insert(dir.to_owned(), true);
+                    names.insert(dir.to_owned(), true); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
                 }
                 None => {
-                    names.entry(rest.to_owned()).or_insert(false);
+                    names.entry(rest.to_owned()).or_insert(false); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
                 }
             }
         }
         if names.is_empty() && !path.is_empty() {
             return None;
         }
-        let mut names: Vec<(String, bool)> = names.into_iter().collect();
+        let mut names: Vec<(String, bool)> = names.into_iter().collect(); // alloc: `MemTree` is the tree of tests and what-ifs, off every hot path
         names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Some(names)
     }

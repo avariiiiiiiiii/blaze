@@ -292,20 +292,20 @@ impl<'db> MirLowerCtx<'_, 'db> {
             place.push(Step::Deref);
         }
         let ty = self.infer.pat_ty(pattern);
-        match &self.store[pattern] {
+        match self.store.pat(pattern) {
             Pat::Wild | Pat::Bind { subpat: None, .. } => (),
-            &Pat::Bind { subpat: Some(inner), .. } => self.pairs_of(inner, place, pairs)?,
-            &Pat::Ref { pat: inner, .. } | &Pat::Box { inner } => {
+            Pat::Bind { subpat: Some(inner), .. } => self.pairs_of(inner, place, pairs)?,
+            Pat::Ref { pat: inner, .. } | Pat::Box { inner } => {
                 place.push(Step::Deref);
                 self.pairs_of(inner, place, pairs)?
             }
-            &Pat::Deref { inner } if ty.is_box() => {
+            Pat::Deref { inner } if ty.is_box() => {
                 place.push(Step::Deref);
                 self.pairs_of(inner, place, pairs)?
             }
             Pat::Tuple { args, ellipsis } => {
                 let TyKind::Tuple(fields) = ty.kind() else { return None };
-                self.pairs_of_fields(args, *ellipsis, fields.len(), &place, pairs)?
+                self.pairs_of_fields(args, ellipsis, fields.len(), &place, pairs)?
             }
             Pat::Or(alternatives) => {
                 let alternatives = alternatives.iter().map(|&it| {
@@ -318,7 +318,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 pairs.push(Pair { place, ask, inside: Vec::new() })
             }
             Pat::Lit(literal) => {
-                let ask = self.constant_ask(ty, *literal)?;
+                let ask = self.constant_ask(ty, literal)?;
                 pairs.push(Pair { place, ask, inside: Vec::new() })
             }
             Pat::Range { start, end, range_type } => {
@@ -330,7 +330,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     },
                     None => Some(missing),
                 };
-                let (lo, hi) = (end_of(start, least)?, end_of(end, most)?);
+                let (lo, hi) = (end_of(&start, least)?, end_of(&end, most)?);
                 let hi = match (range_type, end) {
                     (RangeOp::Exclusive, Some(_)) => hi.checked_sub(1)?,
                     _ => hi,
@@ -393,7 +393,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 };
                 let mut inside = Vec::new();
                 let within = variant_place(variant, &place);
-                self.pairs_of_fields(args, *ellipsis, fields.fields().len(), &within, &mut inside)?;
+                self.pairs_of_fields(args, ellipsis, fields.fields().len(), &within, &mut inside)?;
                 self.pairs_of_variant(variant, inside, place, pairs)
             }
             Pat::Record { args, .. } => {
@@ -420,7 +420,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
     /// Whether the pattern for the middle of a slice asks nothing of it: `..` or `name @ ..`.
     fn is_rest(&self, pattern: PatId) -> bool {
-        match self.store[pattern] {
+        match self.store.pat(pattern) {
             Pat::Wild | Pat::Rest | Pat::Bind { subpat: None, .. } => true,
             Pat::Bind { subpat: Some(inner), .. } => self.is_rest(inner),
             _ => false,
@@ -468,9 +468,9 @@ impl<'db> MirLowerCtx<'_, 'db> {
 
     /// What a literal in a pattern of type `ty` asks.
     fn constant_ask(&self, ty: Ty<'db>, literal: hir_def::hir::ExprId) -> Option<Ask> {
-        let literal = match &self.store[literal] {
+        let literal = match self.store.expr(literal) {
             Expr::Literal(it) => it.clone(),
-            Expr::UnaryOp { expr, op: UnaryOp::Neg } => match &self.store[*expr] {
+            Expr::UnaryOp { expr, op: UnaryOp::Neg } => match self.store.expr(expr) {
                 Expr::Literal(it) => it.clone().negate()?,
                 _ => return None,
             },

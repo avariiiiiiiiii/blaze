@@ -1,5 +1,6 @@
 //! Impl specialization related things
 
+use base_db::Db;
 use hir_def::{
     HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
     signatures::ImplSignature, unstable_features::UnstableFeatures,
@@ -32,7 +33,7 @@ use crate::{
 // create a cycle if there is an error in the impl's where clauses. I believe well formed code
 // cannot create a cycle, but a cycle handler is required nevertheless.
 fn specializes_query_cycle(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     _: salsa::Id,
     _specializing_impl_def_id: ImplId,
     _parent_impl_def_id: ImplId,
@@ -53,7 +54,7 @@ fn specializes_query_cycle(
 /// set of types.
 #[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy))]
 fn specializes_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     specializing_impl_def_id: ImplId,
     parent_impl_def_id: ImplId,
 ) -> bool {
@@ -147,7 +148,7 @@ fn specializes_query(
 // This function is used to avoid creating the query for crates that does not define `#![feature(specialization)]`,
 // as the solver is calling this a lot, and creating the query consumes a lot of memory.
 pub(crate) fn specializes(
-    db: &dyn HirDatabase,
+    db: &Db,
     specializing_impl_def_id: ImplId,
     parent_impl_def_id: ImplId,
 ) -> bool {
@@ -173,7 +174,7 @@ pub(crate) fn specializes(
 /// The impl that `impl_id` takes an item it leaves out from: the closest of the impls it
 /// specializes for which `has_item` holds.
 pub(crate) fn specialized_ancestor(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_id: ImplId,
     has_item: impl Fn(ImplId) -> bool,
 ) -> Option<ImplId> {
@@ -291,7 +292,7 @@ fn parameters_for<'db>(
 /// project an item such an impl defines, which would leave the parameter an inference
 /// variable nothing constrains, and gives an error instead.
 #[salsa::tracked(returns(copy))]
-pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> bool {
+pub(crate) fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
     let Some(constrained) = constrained_params(db, impl_id) else { return false };
     type_or_const_params(db, impl_id)
         .any(|param| !constrained.contains(&Parameter::TypeOrConst(param)))
@@ -300,7 +301,7 @@ pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplI
 /// The type and const parameters of `impl_id` that are constrained neither by its header nor
 /// by the associated types its where clauses equate with what is, in declaration order: each
 /// is one E0207. None when the header has an error type.
-pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
+pub fn impl_unconstrained_params(db: &Db, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
     let Some(constrained) = constrained_params(db, impl_id) else { return Vec::new() };
     type_or_const_params(db, impl_id)
         .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param)))
@@ -308,7 +309,7 @@ pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<T
 }
 
 fn type_or_const_params(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_id: ImplId,
 ) -> impl Iterator<Item = TypeOrConstParamId> + '_ {
     GenericParams::of(db, impl_id.into())
@@ -318,7 +319,7 @@ fn type_or_const_params(
 
 /// The parameters of `impl_id` its header and its where clauses' projections constrain, or
 /// `None` when the header has an error type.
-fn constrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Option<FxHashSet<Parameter>> {
+fn constrained_params(db: &Db, impl_id: ImplId) -> Option<FxHashSet<Parameter>> {
     let interner = DbInterner::new_no_crate(db);
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());

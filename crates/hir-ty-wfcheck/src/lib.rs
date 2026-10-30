@@ -14,11 +14,13 @@
 
 extern crate rustc_type_ir;
 
+mod compare;
 mod outlives;
 mod persist;
 
 use std::sync::LazyLock;
 
+use base_db::Db;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, FunctionId, GenericDefId, ImplId, ItemContainerId,
     LocalFieldId, Lookup as _, TraitId, TypeAliasId, VariantId,
@@ -44,6 +46,10 @@ use hir_ty::{
     },
 };
 
+pub use compare::{
+    ProcMacroSignatureMismatch, SignatureMismatch, SignatureMismatchAt,
+    compare_impl_method_signature, compare_proc_macro_signature, trait_signature_in_impl,
+};
 pub use outlives::Inferred;
 pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
@@ -85,7 +91,7 @@ pub struct WfResult {
 
 /// The well-formedness errors of the item `def`: an ADT, an impl, a trait or a function.
 #[salsa::tracked(returns(ref))]
-pub fn wfcheck(db: &dyn HirDatabase, def: GenericDefId) -> WfResult {
+pub fn wfcheck(db: &Db, def: GenericDefId) -> WfResult {
     let mut result = WfResult::default();
     if off() {
         return result;
@@ -110,7 +116,7 @@ fn off() -> bool {
 }
 
 struct Check<'a, 'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     inferred: Inferred<'db>,
     found: &'a mut Vec<WfDiagnostic>,
 }
@@ -129,20 +135,14 @@ impl<'db> Check<'_, 'db> {
     /// given its bounds, those rustc infers included.
     fn adt(&mut self, adt: AdtId) {
         let mut known = Known::new(self.clauses(adt.into()));
-        let inferred = self
-            .inferred
-            .of(self.db, adt)
-            .into_iter()
-            .filter_map(|it| {
-                let rustc_type_ir::OutlivesClause(arg, region) = it;
-                match arg.kind() {
-                    GenericArgKind::Type(ty) => Some(Needs::Type(ty, region)),
-                    GenericArgKind::Lifetime(longer) => Some(Needs::Region(longer, region)),
-                    GenericArgKind::Const(_) => None,
-                }
-            })
-            .collect();
-        known.add(inferred);
+        known.add(self.inferred.of(self.db, adt).filter_map(|it| {
+            let rustc_type_ir::OutlivesClause(arg, region) = it;
+            match arg.kind() {
+                GenericArgKind::Type(ty) => Some(Needs::Type(ty, region)),
+                GenericArgKind::Lifetime(longer) => Some(Needs::Region(longer, region)),
+                GenericArgKind::Const(_) => None,
+            }
+        }));
         let mut needs = Vec::new();
         // One inference context for the whole item, as rustc's `enter_wf_checking_ctxt`, and
         // one buffer for what each field needs.
@@ -674,7 +674,7 @@ impl<'db> Check<'_, 'db> {
 /// The lifetime elision gives a lifetime the return type elides: `&self`'s, else the one
 /// lifetime of the arguments.
 fn elided_output<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     function: FunctionId,
     inputs: &[Ty<'db>],
 ) -> Option<Region<'db>> {

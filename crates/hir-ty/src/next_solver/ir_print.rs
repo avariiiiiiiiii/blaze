@@ -1,9 +1,9 @@
 //! Things related to IR printing in the next-trait-solver.
 
+use base_db::Db;
 use hir_def::signatures::{ConstSignature, TraitSignature, TypeAliasSignature};
 use rustc_type_ir::{self as ty, AliasTermKind, ir_print::IrPrint};
 
-use crate::db::HirDatabase;
 
 use super::SolverDefId;
 use super::interner::DbInterner;
@@ -25,7 +25,7 @@ fn alias_def_id<'db>(kind: AliasTermKind<DbInterner<'db>>) -> SolverDefId<'db> {
 /// Writes `{what}({name}[{args:?}])`: a type alias or const by its name, anything else (an
 /// opaque type, an anonymous constant) by its id.
 fn print_alias<'db>(
-    db: &dyn HirDatabase,
+    db: &Db,
     what: &str,
     def_id: SolverDefId<'db>,
     args: super::GenericArgs<'db>,
@@ -77,18 +77,15 @@ impl<'db> IrPrint<ty::TraitRef<Self>> for DbInterner<'db> {
             let self_ty = &t.args.as_slice()[0];
             let trait_args = &t.args.as_slice()[1..];
             if trait_args.is_empty() {
-                fmt.write_str(&format!(
-                    "{:?}: {}",
-                    self_ty,
-                    TraitSignature::of(db, trait_).name.as_str()
-                ))
+                write!(fmt, "{:?}: {}", self_ty, TraitSignature::of(db, trait_).name.as_str())
             } else {
-                fmt.write_str(&format!(
+                write!(
+                    fmt,
                     "{:?}: {}<{:?}>",
                     self_ty,
                     TraitSignature::of(db, trait_).name.as_str(),
                     trait_args
-                ))
+                )
             }
         })
     }
@@ -138,11 +135,12 @@ impl<'db> IrPrint<ty::ExistentialTraitRef<Self>> for DbInterner<'db> {
     ) -> std::fmt::Result {
         crate::with_attached_db(|db| {
             let trait_ = t.def_id.0;
-            fmt.write_str(&format!(
+            write!(
+                fmt,
                 "ExistentialTraitRef({:?}[{:?}])",
                 TraitSignature::of(db, trait_).name.as_str(),
                 t.args
-            ))
+            )
         })
     }
 }

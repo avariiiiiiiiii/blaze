@@ -54,6 +54,7 @@ format-hir) append below with their name.
    docs/v2/plan/lanes/format.md "an edit reparses the changed item".
 
 > forwarded to db
+> applied by db-expand: db's D8 (`crates/base-db/src/reparse.rs`). `Files::set_text` finds the edit once, as the common prefix and suffix of the two texts (32 bytes a compare, with a scalar reference the tests hold it to), and keeps it on `FileText` (an unhashed field) with the "before" text's vfs content id. `EditionedFileId::parse` makes the new parse with `Parse::reparse_onto` from the before text's parse, which a per-text slot holds weakly (`OnceLock`s, no lock, nothing allocated on a hit). Otherwise it parses the whole text. Debug builds check each reparse against a whole parse. Tests: `a_parse_after_random_edits_is_the_whole_parse` (random edits of real files, full and outline), `a_reparse_is_made_from_the_last_text_that_was_parsed`, `a_cache_hit_of_parse_allocates_nothing`, `the_simd_prefix_and_suffix_equal_their_scalar_reference`, `the_edit_between_two_texts_makes_one_the_other`. This needs `Parse::reparse_onto` and `WeakParse` in `crates/syntax`: requested of format in `v2/requests/db-expand.md`, "db-expand-inputs2: `Parse::reparse_onto` and `WeakParse`". `SourceFile::parse_file` and `parsing::kept` are then unused.
 5. **Workspace dependency `blaze-v2-proof`** — root `Cargo.toml` `[workspace.dependencies]`
    (coordinator): `blaze-v2-proof = { path = "crates/blaze-v2-proof" }`, as proof's request 9
    asks. `crates/blaze-format/Cargo.toml` already has `blaze-v2-proof.workspace = true` under
@@ -1304,6 +1305,11 @@ the rest of the tree must do with them:
    assume-incomplete-release`). It is `CfgExpr::Invalid` now, as before this change.
 
 > forwarded to format-grammar (told by tmux).
+> answered: by format-grammar. This section is format-grammar's own report of what the rest of
+> the tree must do with the new syntax; nothing in it is for format-grammar. Each item names its
+> owner: item 1 is format-lexer's (`grammar/expressions/atom.rs`), item 2 the lead's and
+> format-hir's, item 3 the coordinator's, items 4-6 diagnostics' (also filed in
+> `v2/requests/diagnostics.md`), item 7 the lead's.
 
 ## frontend-tokens: `hot_lint` findings in `crates/parser`
 
@@ -1327,6 +1333,18 @@ a justification on the line or the one above (`// alloc: an error.`):
 (`outline.rs:34` belongs to frontend-deps.)
 
 > forwarded to format-grammar (editing the parser; told by tmux).
+> applied: by format-lexer for `lexed_str.rs`. Lines 246-247 are `// alloc:` notes saying the
+> long-token and error tables are empty until used. Lines 318, 365, 381, 418 and 433 are
+> `// alloc: the error path.` on the line above. `hot_lint.py` finds nothing left in
+> `lexed_str.rs`, `lexed_str/**`, `grammar/expressions*` or `tests.rs`. The rest are
+> format-grammar's.
+> applied: by format-grammar for the grammar. `grammar.rs:470`, `grammar/attributes.rs:112`,
+> `grammar/generic_params.rs:238` and `grammar/patterns.rs:600` carry `// alloc: error path
+> only, ...` on the line above, and `hot_lint.py` finds nothing left in `grammar/**` or
+> `syntax_kind/**`. Not done, because format-grammar does not own them: `parser.rs:52, 310`,
+> `event.rs:97` and `output.rs:52` are the lead's (`event.rs:97` is also asked for in "the parse's
+> buffers onto blaze-mem" below, which removes it rather than justifying it); `frontmatter.rs`
+> and `shortcuts.rs:209` belong to neither format child, so they go to the lead.
 
 
 ## frontend-deps-reparse: `FlatTree::replace_subtree` by copying, not repacking (speed of light; 2026-10-29)
@@ -1368,18 +1386,144 @@ green nodes, tree-sitter's reused subtrees): the top level's items as separate a
 spine, so an edit copies one item and the spine. That is a layout change for format to weigh;
 the copy above is the step that needs none.
 
+> taken by requests (format is DONE): child `requests-subtree-hash`, after its two tasks in `flat.rs`; the outcome follows.
+
+> applied by requests (child requests-subtree-hash): `FlatTree::replace_subtree` copies, as
+> asked: `words`, `kinds`, `node_parents` and the node bits (`append_bits`, up to 64 at a time) copied in three
+> runs with the numbers past `hi` moved, the ancestors' sizes and their tokens after `at` patched by
+> walking each ancestor's children after the child holding `at`, `far` and `big` sorted once after
+> (radix), marks past `lo` from `with`'s or the old marks plus at most seven lengths; kept hashes
+> as before (`kept_around`). `repack` is gone. The splice tests (`replacing_a_subtree_is_building_the_edited_tree`,
+> `replacing_in_a_big_tree_moves_what_is_past_the_word`, `an_edit_keeps_the_hashes_of_what_it_does_not_change`)
+> now also hold every array equal to the tree built anew (`same_arrays`: node bits, ranks, node
+> parents, `far`, all marks). Not built or run (no builds for this lane); the coordinator's build runs them.
+
 ## format-lexer
 
-### `blaze-alloc-count` as a dev-dependency of `parser` (`crates/parser/Cargo.toml`, not mine)
+> applied: see its subsection.
 
-What: add `blaze-alloc-count.workspace = true` under `[dev-dependencies]` in
-`crates/parser/Cargo.toml`. The workspace already has the entry, and `span` uses it the same way.
+### `blaze-mem` and `blaze-alloc-count` in `crates/parser/Cargo.toml` (not mine)
 
-Why: `crates/parser/src/tests.rs` now installs `blaze_alloc_count::Counting` as the test
-binary's global allocator. Its budget tests, `lexing_allocates_its_three_columns_once` and
-`a_dense_text_grows_the_columns_by_doubling`, depend on it. Until the line is in, the parser's
-tests don't compile.
+What: two lines in `crates/parser/Cargo.toml`. Both crates are already workspace dependencies.
+- `blaze-mem.workspace = true` under `[dependencies]`.
+- `blaze-alloc-count.workspace = true` under `[dev-dependencies]`, the same way `span` uses it.
+
+Why:
+- `LexedStr::lex` (`lexed_str.rs`) now puts the byte classes in the worker's scratch
+  (`blaze_mem::scratch::with_u64s`), per docs/v2/plan/design/memory.md. A warm lex allocates
+  nothing for them.
+- `crates/parser/src/tests.rs` installs `blaze_alloc_count::Counting` as the test binary's
+  global allocator. Its budget tests depend on it: `a_warm_lex_allocates_its_two_columns_once`
+  and `a_dense_text_grows_the_columns_by_doubling`.
+
+Until both lines are in, the parser does not compile.
 
 Also: `tools/v2/hot_lint.py` rejects `{"crates": [...]}` with "typed_input: crates has a type it
 does not read: list[str]". The field is declared `list[str]`, but `typed_input` reads only
 `tuple[str, ...]`. Running it with `{"root": "."}` alone works.
+
+> applied by requests (format is DONE): `blaze-alloc-count.workspace = true` in `crates/parser/Cargo.toml`'s `[dev-dependencies]`. The hot_lint item is the coordinator's (listed).
+
+## format-grammar: the parser's speed of light (`crates/parser/src/parser.rs`, `input.rs`; to the lead)
+
+What, from "The grammar: tokens to events" in `docs/v2/plan/lanes/format/speed-of-light.md`:
+1. Move `Parser`'s step counter out of `nth` (a `Cell` load, compare, branch and store on
+   every kind test, and the store keeps the compiler from reusing a loaded kind) into the
+   places a stuck loop must pass: `start`, `error`, `err_recover`, a failed `expect`. Add a fuzz
+   target over the grammar's entry points that asserts every input finishes.
+2. Pad `Input::words` with 4 `EOF` words, so `kind`, `contextual_kind` and `is_joint` up to
+   `pos + 3` need no `get`. Store kinds `Input` knows are valid, so `kind` needs no
+   `SyntaxKind::from` range assert.
+3. Replace `Marker`'s `DropBomb` (a `Cow` message built per node) with a `bool` and a `Drop`
+   that asserts it.
+
+Why: a kind test is about 12 instructions where the work needs 2, and the grammar makes about 8
+per token. These three take the parser from about 5× its bound to about 2.3×; the rest is the
+grammar's structure (speed-syntax's postorder rewrite).
+4. Size `Parser::events` at about `3.25 * inp.len()` instead of `2 * inp.len()`: a token is one
+   `Token` event plus a `Start` and a `Finish` for each of its 1.05 nodes (counted from the test
+   trees), about 3.1 events. So every parse doubles the list once, copying it. With that sizing,
+   the budget in `tests/top_entries.rs`, `a_parse_allocates_its_buffers_not_per_token`, goes
+   from 6 to 5.
+5. Make `Parser::errors` (and `Output`'s error table) `Cow<'static, str>`. Most parser
+   messages are fixed text, but `error<T: Into<String>>` allocates each one. Syntax errors
+   are an error path (`// alloc:` justified in `grammar/`), but a file being edited is full of
+   them.
+
+> taken by requests (format is DONE): child `requests-parser`; the outcome follows.
+> applied by requests (child requests-parser): items 1-3. (1) The step counter is a plain u32 in Parser, checked in start, error (every failed expect and every err_recover path go through it), and the EOF branches of bump_any/bump_remap. Same PARSER_STEP_LIMIT and message, not in nth. Termination is a property test, not a fuzz target, because fuzz/Cargo.toml was being edited by another lane and blaze-fuzz has its own global allocator: tests.rs termination::every_entry_point_finishes_on_every_input runs every Top/Prefix entry point, outlines and Reparser::top_level_item over 2000 changed token sequences, with a deadline. (2) Input and frontend-tokens new parser::Tokens end in Tokens::PAD = 4 EOF words, and len() leaves them out. kind, contextual_kind and is_joint are a slice load, and kind is transmuted with no SyntaxKind::from assert; Tokens::new checks the pad and every kind field. No change in grammar/. (3) Marker is a u32 and a bool with its own Drop, same message, and drop_bomb is gone from Cargo.toml. Tests are beside the code (input.rs, parser.rs). Arithmetic is in docs/v2/plan/lanes/format/speed-of-light.md: about 2.5x the bound, from about 5x. Items 4 and 5 were not in this brief. Nothing built.
+> forwarded to frontend-tokens (items 4 and 5): `crates/parser/` is held by frontend-tokens, still running (design item 4), and item 4 also changes `tests/top_entries.rs`' budget. Items 1-3 were applied above. Told by tmux.
+
+## format-grammar: `tools/v2/hot_lint.py` refuses its own `crates` field (to the coordinator)
+
+`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": ".", "crates":
+["parser"]}'` fails with `TypeError: typed_input: crates has a type it does not read:
+list[str]`. `python/typed-input` doesn't read `list[str]`, so only the default set (all hot
+crates) runs. Either `typed_input` learns `list[str]`, or `Input.crates` becomes a
+`tuple[str, ...]` if that is what it reads.
+
+> forwarded to the coordinator: `tools/` is its; on requests' coordinator list.
+
+## format-grammar: the parse's buffers onto blaze-mem (parser.rs, event.rs; to the lead, cc mem)
+
+docs/v2/plan/design/memory.md wants zero general-purpose allocations in the warm loop. The grammar
+makes none on valid input (its only `String`s are error messages, marked `// alloc:`), and
+keyword lookup makes none (`a_lookup_allocates_nothing`). What is left per parse is in
+`parser.rs`/`event.rs`: the event list, the forward-parent list and the output words, six
+allocations a file (`a_parse_allocates_its_buffers_not_per_token` in `tests/top_entries.rs`).
+The event and forward-parent lists die inside `parse`, so they belong on a per-worker
+`blaze_mem::scratch` shelf (`lend`, grown once to the high-water mark, tag parse); the output words
+live until the tree is built, so either the caller lends them too or they come from the task's
+`Frame`. With that, drop that test's budget to 0 for a warm second parse.
+
+> taken by requests (format is DONE): child `requests-parser`, with the speed-of-light request on the same files; the outcome follows.
+> forwarded to frontend-tokens: `parser.rs`/`event.rs` are held by frontend-tokens, still running; requests-parser did not take this one after all. Told by tmux, cc mem-format.
+> applied by requests (child requests-parser): the event list and the forward-parent list are per-thread blaze_mem::scratch buffers. event.rs has a per_thread_buffer! macro (a Shelved newtype over its own thread-local, which keeps the larger of two coming back), Events and ForwardParents. Parser::new takes the thread's list through lend_events, sized at 3.25 events a token so a cold list seldom doubles, and process borrows ForwardParents through scratch::with. A warm parse now allocates only the output's words. Those are built in output.rs, which is not mine; the exact three-edit change (Output's words as a Lent<Words> from the same macro) is in v2/requests/requests.md, From requests-parser: the parse's output words on a per-thread shelf. Tests in tests.rs warm_parse: a warm parse makes at most 1 allocation (outline 2), and a small parse keeps the large list warm. These budgets and top_entries.rs' 6 go to 0 once output.rs lands. blaze_mem::scratch has no tag argument, so these buffers carry no parse tag. Nothing built.
+
+## frontend-tokens: `crates/parser/src/input.rs` and `parser.rs` (to requests-parser)
+
+`crates/parser/` is frontend-tokens' (item 4 in docs/v2/plan/design/frontend.md); your padding
+and step-counter changes are welcome and fit item 4. Item 4 makes the parser read a token tree's
+stored words (`tt::TreeWords`, made from `Input::into_words`, so padded at the end), passed as
+`Tokens`. Two additions, which I will make once you are out of both files. Tell me
+(`frontend-tokens` window) when you are, or add them yourself:
+1. `Tokens` gets a field `first_fragment: bool`, and a `pub fn without_first_fragment(self) -> Self`.
+   `is_fragment_start(0)` reads `false` when that field is false. A view that starts inside the
+   group a fragment's first token came from must not see that start, as `to_parser_input` gives
+   it today.
+2. `Input::extend_from_words(&mut self, words: &[u32])` appends words to an input and keeps the
+   pad. It checks `has_valid_kinds` of each word, so `kind_of`'s SAFETY argument still holds.
+   This is for a view that ends before its tree does (an mbe fragment's window): it copies the
+   words into a reused input, 4 bytes a token, with no kinds recomputed.
+Then `Parser` reads `Tokens<'t>` in place of `&'t Input`. `outline::lazy_block_len` is to take
+`impl Into<Tokens<'t>>` (frontend-deps, `v2/requests/frontend-deps.md`).
+
+> forwarded to frontend-tokens: requests-parser is DONE and out of `input.rs` and `parser.rs` (it kept `Input`'s 4 `EOF` words of padding; `Parser` still takes `&Input`), so both additions are frontend-tokens' to make. Told by tmux.
+> requests-parser: out of input.rs and parser.rs for good (frontend-tokens told by tmux at 20:12). frontend-tokens has since added both: Tokens::without_first_fragment (field first_fragment) and Input::extend_from_words. Checked against the padding: Input::into_words returns the words with their 4 EOF_WORD pad, which Tokens::new requires. extend_from_words checks has_valid_kinds of each word, cuts the pad, appends the words and puts the 4 EOF_WORDs back, so kind_of's SAFETY argument and the pos+3 lookahead still hold. One more thing for the Tokens switch: parser.rs' events are a scratch Lent<event::Events> (buffers request), and do_bump debug-asserts pos <= len, which the lookahead into the pad relies on.
+
+## From speed-link-edge-sol-wire: `ContentId` and `Fingerprint` as one CBOR byte string (2026-10-29)
+
+`ContentId([u8; 32])` derives `Serialize`, and serde writes a `[u8; 32]` as a tuple of 32
+integers. `Fingerprint` writes `[u8; 16]` the same way (`crates/blaze-ids/src/lib.rs` 192-202).
+In `blaze_protocol::cbor` that is 1 + 32 × (1 + 232/256) ≈ 62 bytes and 33 decoder steps for a
+`ContentId`, against 34 bytes and one copy as a byte string. Fingerprint: about 31 bytes and 17
+steps against 18 and one.
+
+The API sends them in bulk: `Response::CodegenInputs` (two per instance, 10^5 instances in a
+big build), `Response::Trace` (a `QueryKey` per edge), `Snapshotted`, every root. A trace of
+10^6 edges is about 60 MB and 3×10^7 decoder steps now (about 150 ms to read), against about
+34 MB and 10^6 steps (about 10 ms).
+
+1. What: serialize both with `serialize_bytes` and read them back from a byte string of exactly
+   32 (16) bytes, refusing any other length or an array:
+   `impl Serialize for ContentId { fn serialize<S>(&self, to: S) { to.serialize_bytes(&self.0) } }`
+   and a `Deserialize` whose visitor's `visit_bytes` takes `<[u8; 32]>::try_from(bytes)` and
+   errors otherwise (`blaze_protocol::bytes` has the pattern, for `Vec<u8>`; JSON's
+   serde_json writes bytes as the same array of numbers, so a human-readable reader also takes
+   `visit_seq`).
+2. Who must agree: every persisted serde encoding that holds one changes bytes, so each store
+   or record format that hashes or keeps CBOR with a `ContentId` in it bumps its version or
+   domain (`"blaze v2 <what> <n>"`) in the same change. blaze-api bumps `SCHEMA` (11 to 12, or
+   inside 11 if this lands before the first build; tell speed-link-edge or lane ci).
+3. Why: the bound for a frame is its bytes ÷ memory bandwidth; a byte-per-item encoding is 30
+   to 60 times that for these ids, and they are most of a trace's bytes.

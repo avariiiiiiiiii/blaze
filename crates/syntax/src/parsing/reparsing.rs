@@ -12,10 +12,8 @@
 //! it are unchanged, and its parse is one node of its kind taking all of its text. When none
 //! is, [`incremental_reparse`] is `None` and the caller parses the whole text.
 
-use std::sync::Arc;
-
 use parser::{Edition, LexedStr, Reparser};
-use syntax_tree::{FlatTree, Language};
+use syntax_tree::{FlatTree, Language, Text};
 
 use crate::{
     AstNode, SyntaxError,
@@ -63,7 +61,7 @@ pub(crate) fn incremental_reparse(
 pub(crate) fn incremental_reparse_onto(
     tree: &FlatTree,
     delete: TextRange,
-    new_source: &Arc<str>,
+    new_source: &Text,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
     outline: Option<Edition>,
@@ -83,7 +81,7 @@ fn reparse_onto(
     tree: &FlatTree,
     delete: TextRange,
     insert: &str,
-    new_source: &Arc<str>,
+    new_source: &Text,
     errors: impl IntoIterator<Item = SyntaxError>,
     edition: Edition,
     outline: Option<Edition>,
@@ -146,7 +144,7 @@ struct Edit<'a> {
     tree: &'a FlatTree,
     delete: TextRange,
     insert: &'a str,
-    new_source: &'a Arc<str>,
+    new_source: &'a Text,
     edition: Edition,
     outline: bool,
 }
@@ -239,7 +237,8 @@ impl Edit<'_> {
             true => tree.parent(covering)?,
             false => covering,
         };
-        let ancestors: Vec<u32> = std::iter::successors(Some(start), |&it| tree.parent(it)).collect();
+        let ancestors: Vec<u32> =
+            std::iter::successors(Some(start), |&it| tree.parent(it)).collect();
         // In an outline, what is in a `fn` body that is not lazy is parsed in full.
         let mut in_full = vec![!self.outline; ancestors.len()];
         let mut in_body = false;
@@ -280,7 +279,7 @@ impl Edit<'_> {
         {
             return None;
         }
-        let mut builder = SyntaxTreeBuilder::sourced(Arc::from(text));
+        let mut builder = SyntaxTreeBuilder::sourced(Text::from(text));
         builder.lazy(BLOCK_EXPR, TextSize::of(text));
         let (with, _no_errors) = builder.finish_raw(self.edition);
         self.splice(at, with, lexer_errors(&lexed, TextSize::new(0)).collect())
@@ -305,7 +304,7 @@ impl Edit<'_> {
             true => reparser.parse(&input),
             false => reparser.parse_outline(&input),
         };
-        let (with, errors) = build_node(Arc::from(text), &lexed, &output, self.edition, kind)?;
+        let (with, errors) = build_node(Text::from(text), &lexed, &output, self.edition, kind)?;
         self.splice(at, with, errors)
     }
 
@@ -346,7 +345,7 @@ impl Edit<'_> {
         if first != kind || n_tokens != tokens {
             return None;
         }
-        let (with, errors) = build_node(Arc::from(text), &lexed, &output, self.edition, kind)?;
+        let (with, errors) = build_node(Text::from(text), &lexed, &output, self.edition, kind)?;
         self.splice(at, with, errors)
     }
 
@@ -381,7 +380,8 @@ impl Edit<'_> {
     fn lexes_alone(&self, at: u32, new: &LexedStr<'_>) -> bool {
         let (tree, source) = (self.tree, self.tree.source());
         let range = tree.range(at);
-        let bound = |it: &u32| !matches!(self.kind(*it), INT_NUMBER | T![.] | T![#] | T![-] | WHITESPACE);
+        let bound =
+            |it: &u32| !matches!(self.kind(*it), INT_NUMBER | T![.] | T![#] | T![-] | WHITESPACE);
         // A lazy node bounds at its last token, a `}`, or its first, a `{`: its body is not
         // lexed again.
         let before = (0..at).rev().filter(|&it| self.is_leaf(it)).find(bound).map_or(
@@ -535,10 +535,10 @@ mod tests {
         );
         assert_eq!(fully_reparsed.errors(), incrementally_reparsed.errors());
 
-        let outline = SourceFile::parse_outline(before.into(), Edition::CURRENT);
+        let outline = SourceFile::parse_outline(Text::from(before), Edition::CURRENT);
         check_same(
             &outline.reparse(range, replace_with, Edition::CURRENT),
-            &SourceFile::parse_outline(after.into(), Edition::CURRENT),
+            &SourceFile::parse_outline(Text::from(after), Edition::CURRENT),
         );
     }
 
@@ -588,7 +588,8 @@ mod tests {
     /// The large nodes of `reparsed`, the same tree as `parsed`, have the hashes they have in
     /// `parsed`: those an edit carried, those it made again, and those hashed when asked.
     fn same_hashes(reparsed: &Parse<SourceFile>, parsed: &Parse<SourceFile>) {
-        let (of, again) = (reparsed.tree.as_ref().unwrap().flat(), parsed.tree.as_ref().unwrap().flat());
+        let (of, again) =
+            (reparsed.tree.as_ref().unwrap().flat(), parsed.tree.as_ref().unwrap().flat());
         assert_eq!(of.len(), again.len(), "different trees");
         for at in large(parsed) {
             assert_eq!(of.subtree_hash(at), again.subtree_hash(at), "the hash of element {at}");
@@ -826,7 +827,7 @@ enum Foo {
     fn reparse_lazy_body() {
         let before = "fn f() {\n    let x = 1;\n}\nfn g() {}\n";
         let after = "fn f() {\n    let x = 2 + 3;\n}\nfn g() {}\n";
-        let outline = SourceFile::parse_outline(before.into(), Edition::CURRENT);
+        let outline = SourceFile::parse_outline(Text::from(before), Edition::CURRENT);
         let at = TextRange::at(TextSize::new(21), TextSize::new(1));
         assert_eq!(&before[at], "1");
         let (tree, errors, range) = incremental_reparse(
@@ -844,7 +845,7 @@ enum Foo {
             errors,
             Some(Edition::CURRENT),
         );
-        let parsed = SourceFile::parse_outline(after.into(), Edition::CURRENT);
+        let parsed = SourceFile::parse_outline(Text::from(after), Edition::CURRENT);
         assert_eq!(parsed.tree.as_ref().unwrap().flat().lazies().count(), 2);
         check_same(&reparsed, &parsed);
     }
@@ -862,10 +863,46 @@ enum Foo {
     }
 
     const INSERTS: &[&str] = &[
-        "", " ", "\n", "\n\n", "{", "}", "(", ")", "[", "]", ";", ",", "x", "_", "#", "#[a]",
-        "<", ">", "1.0", ".0", "0", "\"", "'", "r#", "//", "/// d\n", "/*", "*/", "let x = 1;",
-        "fn f() {}", "fn g() { 1 }", "impl S {}", "struct S { a: u8 }", "mod m {}", "=>", "::",
-        "unsafe", "async", "union", "macro_rules! m {}",
+        "",
+        " ",
+        "\n",
+        "\n\n",
+        "{",
+        "}",
+        "(",
+        ")",
+        "[",
+        "]",
+        ";",
+        ",",
+        "x",
+        "_",
+        "#",
+        "#[a]",
+        "<",
+        ">",
+        "1.0",
+        ".0",
+        "0",
+        "\"",
+        "'",
+        "r#",
+        "//",
+        "/// d\n",
+        "/*",
+        "*/",
+        "let x = 1;",
+        "fn f() {}",
+        "fn g() { 1 }",
+        "impl S {}",
+        "struct S { a: u8 }",
+        "mod m {}",
+        "=>",
+        "::",
+        "unsafe",
+        "async",
+        "union",
+        "macro_rules! m {}",
     ];
 
     /// Random edits of real files, each reparse the parse of the edited text: in full and as an
@@ -887,7 +924,7 @@ enum Foo {
             let text = std::fs::read_to_string(file).unwrap();
             let edits = if text.len() > 20_000 { 2 } else { 6 };
             let full = SourceFile::parse(&text, Edition::CURRENT);
-            let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
             hash_large(&full);
             hash_large(&outline);
             for _ in 0..edits {
@@ -903,7 +940,8 @@ enum Foo {
                     );
                     same_hashes(&reparsed, &parsed);
                     let reparsed = outline.reparse(delete, &insert, Edition::CURRENT);
-                    let parsed = SourceFile::parse_outline(after.as_str().into(), Edition::CURRENT);
+                    let parsed =
+                        SourceFile::parse_outline(Text::from(after.as_str()), Edition::CURRENT);
                     check_same(&reparsed, &parsed);
                 };
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(check)).is_err() {
@@ -926,7 +964,7 @@ enum Foo {
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
             let full = SourceFile::parse(&text, Edition::CURRENT);
-            let outline = SourceFile::parse_outline(text.as_str().into(), Edition::CURRENT);
+            let outline = SourceFile::parse_outline(Text::from(text.as_str()), Edition::CURRENT);
             hash_large(&full);
             hash_large(&outline);
             for edits in 1..4 {
@@ -935,7 +973,7 @@ enum Foo {
                     let (delete, insert) = random_edit(&mut rng, &after);
                     after.replace_range(Range::<usize>::from(delete), &insert);
                 }
-                let shared: Arc<str> = after.as_str().into();
+                let shared = Text::from(after.as_str());
                 let check = || {
                     let reparsed = full.reparse_to(shared.clone(), Edition::CURRENT);
                     let parsed = SourceFile::parse(&after, Edition::CURRENT);
@@ -945,7 +983,7 @@ enum Foo {
                     );
                     assert_eq!(reparsed.errors(), parsed.errors());
                     same_hashes(&reparsed, &parsed);
-                    assert!(Arc::ptr_eq(reparsed.tree.as_ref().unwrap().flat().source(), &shared));
+                    assert!(reparsed.tree.as_ref().unwrap().flat().source().ptr_eq(&shared));
                     let reparsed = outline.reparse_to(shared.clone(), Edition::CURRENT);
                     let parsed = SourceFile::parse_outline(shared.clone(), Edition::CURRENT);
                     check_same(&reparsed, &parsed);
@@ -981,7 +1019,8 @@ enum Foo {
         all.push((format!("{huge}é{long}"), format!("{huge}è{long}")));
         for (old, new) in &all {
             let (old, new) = (old.as_str(), new.as_str());
-            let (delete, insert) = edit_between(old, new);
+            let (delete, insert) =
+                blaze_alloc_count::assert_at_most(0, "finding an edit", || edit_between(old, new));
             let start = usize::from(delete.start());
             let made = format!(
                 "{}{}{}",

@@ -18,7 +18,7 @@ mod tests;
 
 use std::mem;
 
-use base_db::Crate;
+use base_db::{Crate, Db};
 use either::Either;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
@@ -135,8 +135,7 @@ impl UnsafetyCheck {
 
 /// rustc's `check_unsafety` of `def`, with the closures, inline consts and repeat counts in it.
 #[salsa::tracked(returns(ref))]
-// dyn: the database every hir-ty query takes.
-pub fn unsafety_check(db: &dyn HirDatabase, def: DefWithBodyId) -> UnsafetyCheck {
+pub fn unsafety_check(db: &Db, def: DefWithBodyId) -> UnsafetyCheck {
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);
     let owner = ExpressionStoreOwnerId::Body(def);
@@ -181,7 +180,7 @@ pub enum InsideUnsafeBlock {
 /// Every operation that needs `unsafe` in `current` and what it holds, inside a block or not,
 /// starting outside one: what an editor highlights. A repeat count's are not among them.
 pub fn unsafe_operations<'db>(
-    db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
+    db: &'db Db,
     infer: &InferenceResult<'_>,
     def: ExpressionStoreOwnerId,
     body: &ExpressionStore,
@@ -262,7 +261,7 @@ impl Sink for Callback<'_> {
 
 /// rustc's `UnsafetyVisitor`.
 struct Walker<'a, 'db, 'i, S> {
-    db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
+    db: &'db Db,
     infer: &'a InferenceResult<'i>,
     store: &'a ExpressionStore,
     owner: ExpressionStoreOwnerId,
@@ -293,7 +292,7 @@ struct Walker<'a, 'db, 'i, S> {
 
 impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn new(
-        db: &'db dyn HirDatabase, // dyn: the database every hir-ty query takes.
+        db: &'db Db,
         infer: &'a InferenceResult<'i>,
         store: &'a ExpressionStore,
         owner: ExpressionStoreOwnerId,

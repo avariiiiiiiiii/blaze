@@ -662,7 +662,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let cond = self.ptr_of(arg(0)?)?;
                 self.cond_ready(cond)?;
                 let count = if name == "pthread_cond_signal" { 1 } else { usize::MAX };
-                self.machine.release(cond.to_usize() as u64)?;
                 self.wake(cond.to_usize(), u32::MAX, count)?;
                 self.ret_int(destination, 0)?
             }
@@ -777,7 +776,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let semaphore = self.semaphore_of(arg(0)?)?;
                 let count = from_bytes!(i64, self.peek_memory(semaphore, 8)?);
                 self.poke_memory(semaphore, 8)?.copy_from_slice(&(count + 1).to_le_bytes());
-                self.machine.release(semaphore.to_usize() as u64)?;
                 let woken = self.wake(semaphore.to_usize(), u32::MAX, 1)?;
                 self.ret_int(destination, (woken != 0).into())?
             }
@@ -874,7 +872,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     let inval = self.target()?.errno.inval;
                     return self.fail(destination, Errors::Errno, inval).map(|()| true);
                 };
-                self.sleep(ns);
+                self.sleep_for(ns);
                 self.ret_int(destination, 0)?
             }
             "clock_nanosleep" => {
@@ -890,7 +888,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     0 => ns,
                     _ => ns.saturating_sub(base + self.now()),
                 };
-                self.sleep(ns);
+                self.sleep_for(ns);
                 self.ret_int(destination, 0)?
             }
             "mmap" | "mmap64" => self.mmap(args, destination)?,
@@ -1419,7 +1417,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         if state.count == 0 {
             state.owner = 0;
             self.mutex_set(mutex, state)?;
-            self.machine.release(mutex.to_usize() as u64)?;
             self.wake(mutex.to_usize(), u32::MAX, 1)?;
         } else {
             self.mutex_set(mutex, state)?;
@@ -1604,7 +1601,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
     /// `nanosleep` and `clock_nanosleep`: the virtual clock moves on by `ns`, and other
     /// threads get to run.
-    fn sleep(&mut self, ns: u64) {
+    fn sleep_for(&mut self, ns: u64) {
         self.advance_clock(ns);
         self.yield_thread();
     }

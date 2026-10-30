@@ -17,6 +17,8 @@
 
 #![forbid(unsafe_code)]
 
+mod ambiguity;
+mod at_error;
 mod autoderef;
 mod callee;
 pub mod cast;
@@ -44,7 +46,7 @@ use std::{
     ops::Deref,
 };
 
-use base_db::{Crate, FxIndexMap};
+use base_db::{Db, Crate, FxIndexMap};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId, FunctionId,
@@ -117,21 +119,23 @@ use crate::{
         infer::{InferCtxt, ObligationInspector, traits::ObligationCause},
     },
     solver_errors::SolverDiagnostic,
+    solver_errors::{Ambiguity, TypeAnnotationNeeded},
+    solver_errors::StoredGoal,
     utils::TargetFeatureIsSafeInTarget,
 };
 
 pub use coerce::could_coerce;
 pub use unify::{could_unify, could_unify_deeply};
 
-use cast::{CastCheck, CastError};
+use cast::{CastCheck, CastError, CastPointers};
 
 /// The entry point of type inference.
-fn infer_query<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> InferenceResult<'db> {
+fn infer_query<'db>(db: &'db Db, def: DefWithBodyId) -> InferenceResult<'db> {
     infer_query_with_inspect(db, def, None, LoweringMode::Analysis)
 }
 
 pub fn infer_query_with_inspect<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: DefWithBodyId,
     inspect: Option<ObligationInspector<'db>>,
     lowering_mode: LoweringMode,
@@ -194,7 +198,7 @@ pub fn infer_query_with_inspect<'db>(
 }
 
 fn infer_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     _: DefWithBodyId,
 ) -> InferenceResult<'db> {
@@ -206,7 +210,7 @@ fn infer_cycle_result<'db>(
 
 /// Infer types for an anonymous const expression.
 fn infer_anon_const_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     let _p = tracing::info_span!("infer_anon_const_query").entered();
@@ -237,7 +241,7 @@ fn infer_anon_const_query<'db>(
 }
 
 fn infer_anon_const_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     _: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
@@ -272,6 +276,8 @@ fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
     ctx.table.select_obligations_where_possible();
 
     ctx.handle_opaque_type_uses();
+
+    ctx.report_ambiguity_errors();
 
     ctx.merge_anon_consts();
 
@@ -384,6 +390,19 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         bad_value_break: bool,
     },
+    /// E0695: an unlabeled `break` or `continue` whose innermost labeled block, loop or closure
+    /// is a labeled block. It still jumps to the loop for typing.
+    UnlabeledJumpInLabeledBlock {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        is_break: bool,
+    },
+    /// E0727: a `yield` in an `async` block, closure or function.
+    AsyncCoroutinesNotSupported {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+    },
     NonExhaustiveRecordExpr {
         #[type_visitable(ignore)]
         expr: ExprId,
@@ -418,6 +437,17 @@ pub enum InferenceDiagnostic {
         /// diagnostic surface uses E0057 (Fn-trait call) or E0061 (regular call).
         #[type_visitable(ignore)]
         is_fn_trait_call: bool,
+        #[type_visitable(ignore)]
+        args: Box<CallArguments>,
+    },
+    /// rustc's `report_arg_errors` of a call whose argument count fits but some argument
+    /// does not (E0308 "arguments to this function are incorrect"); each such argument also
+    /// has its `TypeMismatch`.
+    IncorrectArguments {
+        #[type_visitable(ignore)]
+        call_expr: ExprId,
+        #[type_visitable(ignore)]
+        args: Box<CallArguments>,
     },
     MismatchedTupleStructPatArgCount {
         #[type_visitable(ignore)]
@@ -436,6 +466,10 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         expr: ExprId,
         found: StoredTy,
+        /// `found` as inference had it at the error, as rustc prints it (`{integer}`,
+        /// `{float}`; see `TypeMismatch::at_error`). `None` when it held no such literal's type.
+        #[type_visitable(ignore)]
+        at_error: Option<StoredTy>,
     },
     UnaryOperatorCannotBeApplied {
         #[type_visitable(ignore)]
@@ -443,6 +477,13 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         op: UnaryOp,
         found: StoredTy,
+        /// `found` as inference had it at the error, as rustc prints it (`{integer}`,
+        /// `{float}`; see `TypeMismatch::at_error`). `None` when it held no such literal's type.
+        #[type_visitable(ignore)]
+        at_error: Option<StoredTy>,
+        /// rustc's `errors` of `check_user_unop`: the leaf goal of each fulfillment error of
+        /// `found: Trait`, empty when the trait is missing or the goal holds.
+        unmet: Vec<StoredGoal>,
     },
     BinaryOperatorCannotBeApplied {
         #[type_visitable(ignore)]
@@ -451,6 +492,16 @@ pub enum InferenceDiagnostic {
         op: BinaryOp,
         lhs: StoredTy,
         rhs: StoredTy,
+        /// `lhs` and `rhs` as inference had them at the error, as rustc prints them
+        /// ("cannot add `{integer}` to `bool`"; see `TypeMismatch::at_error`).
+        #[type_visitable(ignore)]
+        at_error: Option<Box<(StoredTy, StoredTy)>>,
+        /// rustc's `errors` of `check_overloaded_binop`: the leaf goal of each fulfillment
+        /// error of `lhs: Trait<rhs>` (`X: PartialEq` for `[X; 3] == [X; 3]`), empty when the
+        /// trait is missing or the goal holds ("the trait `..` is not implemented for").
+        unmet: Vec<StoredGoal>,
+        /// `ObligationCauseCode::BinOp`'s `output_ty`: the type expected of the operation.
+        output: Option<StoredTy>,
     },
     MutRefInImmRefPat {
         #[type_visitable(ignore)]
@@ -465,6 +516,10 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         expr: ExprId,
         found: StoredTy,
+        /// `found` as inference had it at the error, as rustc prints it (`{integer}`,
+        /// `{float}`; see `TypeMismatch::at_error`). `None` when it held no such literal's type.
+        #[type_visitable(ignore)]
+        at_error: Option<StoredTy>,
     },
     TypedHole {
         #[type_visitable(ignore)]
@@ -483,6 +538,9 @@ pub enum InferenceDiagnostic {
         error: CastError,
         expr_ty: StoredTy,
         cast_ty: StoredTy,
+        /// The pointer kinds rustc's report of a pointer cast reads.
+        #[type_visitable(ignore)]
+        pointers: Option<Box<CastPointers>>,
     },
     TyDiagnostic {
         #[type_visitable(ignore)]
@@ -521,14 +579,34 @@ pub enum InferenceDiagnostic {
         #[type_visitable(ignore)]
         has_self_arg: bool,
     },
+    /// Lifetime arguments to a method with late-bound lifetimes: the
+    /// `late_bound_lifetime_arguments` lint; they are ignored.
+    MethodCallLateBoundLifetimeArgs {
+        #[type_visitable(ignore)]
+        expr: ExprId,
+        #[type_visitable(ignore)]
+        def: GenericDefId,
+    },
     InvalidLhsOfAssignment {
         #[type_visitable(ignore)]
         lhs: ExprId,
+        /// The `=` or compound assignment `lhs` is the left-hand side of.
+        #[type_visitable(ignore)]
+        assign: ExprId,
+        /// `None` for `=`, E0070; the operator of a compound assignment, E0067.
+        #[type_visitable(ignore)]
+        op: Option<hir_def::hir::ArithOp>,
     },
     TypeMustBeKnown {
         #[type_visitable(ignore)]
         at_point: Span,
         top_term: Option<StoredGenericArg>,
+        #[type_visitable(ignore)]
+        kind: TypeAnnotationNeeded,
+        /// The goal left ambiguous, for an error of a pending goal (rustc's
+        /// `maybe_report_ambiguity`); `None` where writeback or `structurally_resolve_type`
+        /// found the type undecided.
+        ambiguity: Option<Box<Ambiguity>>,
     },
     UnionExprMustHaveExactlyOneField {
         #[type_visitable(ignore)]
@@ -539,6 +617,12 @@ pub enum InferenceDiagnostic {
         node: ExprOrPatIdPacked,
         expected: StoredTy,
         found: StoredTy,
+        /// `expected` and `found` as inference had them at the error, as rustc prints them:
+        /// the type of an integer or float literal not decided yet a `FreshIntTy` /
+        /// `FreshFloatTy` (`{integer}`, `{float}`), any other variable an error. `None` when
+        /// neither held such a literal's type. For printing only: no solver may see it.
+        #[type_visitable(ignore)]
+        at_error: Option<Box<(StoredTy, StoredTy)>>,
     },
     SolverDiagnostic(SolverDiagnostic),
     ExplicitDropMethodUse {
@@ -577,7 +661,7 @@ impl InferenceDiagnostic {
             matches!(diag, PathLoweringDiagnostic::ElidedLifetimesInPath { hard_error: false, .. })
         };
         match self {
-            InferenceDiagnostic::TypeMustBeKnown { .. } => false,
+            InferenceDiagnostic::TypeMustBeKnown { ambiguity, .. } => ambiguity.is_some(),
             InferenceDiagnostic::PathDiagnostic { diag, .. }
             | InferenceDiagnostic::TyDiagnostic {
                 diag: TyLoweringDiagnostic::PathDiagnostic { diag, .. },
@@ -597,6 +681,42 @@ pub enum ReturnKind {
 pub enum ExplicitDropMethodUseKind {
     MethodCall(ExprId),
     Path(ExprOrPatIdPacked),
+}
+
+/// What rustc's `warn_if_unreachable` (`rustc_hir_typeck/src/fn_ctxt/_impl.rs`) warns of: code
+/// type checking reaches after an expression that diverges (`unreachable_code`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Unreachable {
+    pub what: UnreachableAt,
+    /// What diverged: `Diverges::Always`'s `span` (an expression, or a never pattern).
+    pub after: ExprOrPatId,
+    /// `Diverges::Always`'s `custom_note` ([`Unreachable::ALL_ARMS_DIVERGE`]), `None` for
+    /// "any code following this expression is unreachable".
+    pub note: Option<&'static str>,
+}
+
+impl Unreachable {
+    /// The note of a `match` whose arms all diverge.
+    pub const ALL_ARMS_DIVERGE: &'static str =
+        "any code following this `match` expression is unreachable, as all arms diverge";
+}
+
+/// rustc's `id`, `span` and `kind` of `warn_if_unreachable`, by its callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnreachableAt {
+    /// "expression": `check_expr_with_expectation_and_args`, before an expression and after one
+    /// whose children diverged, and `check_argument_types` for an argument.
+    Expr(ExprId),
+    /// "call": a call whose callee or arguments diverged (`ExprKind::Call`/`MethodCall`).
+    Call(ExprId),
+    /// "statement": `check_stmt`, statement `index` of the block.
+    Stmt { block: ExprId, index: u32 },
+    /// "arm": `warn_arms_when_scrutinee_diverges`, the body of arm `index` of the `match`.
+    Arm { match_expr: ExprId, index: u32 },
+    /// "block in `if` or `while` expression": `check_expr_if`, after its condition diverged.
+    IfBlock(ExprId),
+    /// "block in `let` expression": `check_expr_let`, its initializer.
+    LetInit(ExprId),
 }
 
 /// Represents coercing a value to a different type of value.
@@ -828,6 +948,8 @@ pub struct InferenceResult<'db> {
     pub has_errors: bool,
     /// A side table: during inference [`InferenceContext::diagnostics`] is filled instead.
     pub(crate) diagnostics: Box<[InferenceDiagnostic]>,
+    /// What is unreachable after an expression that diverges, in the order rustc warns of it.
+    pub(crate) unreachable: Box<[Unreachable]>,
     pub(crate) nodes_with_type_mismatches: ExprOrPatSet,
 
     /// Interned `Error` type to return references to.
@@ -1011,6 +1133,7 @@ impl<'db> InferenceTables<'db> {
         self,
         tuple_field_access_types: Box<[StoredTys]>,
         diagnostics: Box<[InferenceDiagnostic]>,
+        unreachable: Box<[Unreachable]>,
         defined_anon_consts: Box<[AnonConstId<'db>]>,
     ) -> InferenceResult<'db> {
         let InferenceTables {
@@ -1054,6 +1177,7 @@ impl<'db> InferenceTables<'db> {
             type_of_opaque: SortedMap::from_entries(type_of_opaque),
             has_errors,
             diagnostics,
+            unreachable,
             nodes_with_type_mismatches,
             error_ty,
             expr_adjustments: expr_adjustments.freeze(),
@@ -1160,14 +1284,19 @@ pub struct ClosureData {
     /// Note that `'a` is not bound (it would be an `ReLateParam`) and
     /// that the `Foo` opaque type is replaced by its hidden type.
     pub liberated_sig: StoredFnSig,
+
+    /// rustc's `closure_kind_origins`: for a closure whose kind was inferred `FnMut` or
+    /// `FnOnce`, the use that made it so and the place it captured for it.
+    pub kind_origin: Option<(ExprOrPatIdPacked, Place)>,
 }
 
 impl Hash for ClosureData {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ClosureData { min_captures, fake_reads, liberated_sig } = self;
+        let ClosureData { min_captures, fake_reads, liberated_sig, kind_origin } = self;
         hash_unordered(min_captures.iter(), state);
         fake_reads.hash(state);
         liberated_sig.hash(state);
+        kind_origin.hash(state);
     }
 }
 
@@ -1214,7 +1343,7 @@ impl CapturedPlace {
 
     /// The type of the capture stored in the closure, which is different from the type of the captured place
     /// if we capture by reference.
-    pub fn captured_ty<'db>(&self, db: &'db dyn HirDatabase) -> Ty<'db> {
+    pub fn captured_ty<'db>(&self, db: &'db Db) -> Ty<'db> {
         let place_ty = self.place.ty();
         let make_ref = |mutbl| {
             let interner = DbInterner::new_no_crate(db);
@@ -1378,7 +1507,7 @@ impl PartialOrd for UpvarCapture {
 /// [`crate::evict`] can name them to drop their values.
 #[salsa::tracked(returns(ref), cycle_result = infer_cycle_result, lru = 0)]
 pub(crate) fn infer_body_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: DefWithBodyId,
 ) -> InferenceResult<'db> {
     infer_query(db, def)
@@ -1391,7 +1520,7 @@ pub(crate) fn infer_body_query<'db>(
 /// positions within the item's signature.
 #[salsa::tracked(returns(ref), cycle_result = infer_anon_const_cycle_result, lru = 0)]
 pub(crate) fn infer_anon_const_body_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: AnonConstId<'db>,
 ) -> InferenceResult<'db> {
     infer_anon_const_query(db, def)
@@ -1400,7 +1529,7 @@ pub(crate) fn infer_anon_const_body_query<'db>(
 impl<'db> InferenceResult<'db> {
     #[inline]
     pub fn of(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: impl Into<InferBodyId<'db>>,
     ) -> &'db InferenceResult<'db> {
         match def.into() {
@@ -1428,6 +1557,7 @@ impl<'db> InferenceResult<'db> {
             assoc_resolutions: Default::default(),
             tuple_field_access_types: Default::default(),
             diagnostics: Default::default(),
+            unreachable: Default::default(),
             nodes_with_type_mismatches: Default::default(),
             type_of_expr: Default::default(),
             type_of_pat: Default::default(),
@@ -1535,6 +1665,11 @@ impl<'db> InferenceResult<'db> {
         &self.diagnostics
     }
 
+    /// In the order type checking warns of them.
+    pub fn unreachable(&self) -> &[Unreachable] {
+        &self.unreachable
+    }
+
     /// The anonymous consts of the body this inferred, including those inside them.
     pub fn defined_anon_consts(&self) -> &[AnonConstId<'db>] {
         &self.defined_anon_consts
@@ -1578,7 +1713,7 @@ impl<'db> InferenceResult<'db> {
     // This method is consumed by external tools to run rust-analyzer as a library. Don't remove, please.
     pub fn return_position_impl_trait_types<'a>(
         &'a self,
-        db: &'a dyn HirDatabase,
+        db: &'a Db,
     ) -> impl Iterator<Item = (ImplTraitIdx, Ty<'a>)> {
         self.type_of_opaque.iter().filter_map(move |(id, ty)| {
             let ImplTraitId::ReturnTypeImplTrait(_, rpit_idx) = id.loc(db) else {
@@ -1615,7 +1750,7 @@ impl<'db> InferenceResult<'db> {
     /// Like [`Self::closure_captures_tys()`], but using [`CapturedPlace::captured_ty()`].
     pub fn closure_captures_captured_tys<'a>(
         &self,
-        db: &'a dyn HirDatabase,
+        db: &'a Db,
         closure: ExprId,
     ) -> impl Iterator<Item = Ty<'a>> {
         self.closures_data[&closure]
@@ -1638,7 +1773,7 @@ enum DerefPatBorrowMode {
 /// The inference context contains all information needed during type inference.
 #[derive(Debug)]
 pub(crate) struct InferenceContext<'db> {
-    pub(crate) db: &'db dyn HirDatabase,
+    pub(crate) db: &'db Db,
     pub(crate) owner: InferBodyId<'db>,
     pub(crate) store_owner: ExpressionStoreOwnerId,
     pub(crate) generic_def: GenericDefId,
@@ -1675,7 +1810,13 @@ pub(crate) struct InferenceContext<'db> {
     return_coercion: Option<DynamicCoerceMany<'db>>,
     /// The resume type and the yield type, respectively, of the coroutine being inferred.
     resume_yield_tys: Option<(Ty<'db>, Ty<'db>)>,
+    /// The `async`/`gen` desugaring of the coroutine being inferred, `None` outside one or in a
+    /// `#[coroutine]` closure: a `yield` in an `async` body is E0727.
+    coroutine_desugaring: Option<hir_def::hir::CoroutineKind>,
     diverges: Diverges,
+    /// What [`InferenceContext::warn_if_unreachable`] found, empty (and unallocated) unless
+    /// something diverged before more code.
+    unreachable: Vec<Unreachable>,
     breakables: Vec<BreakableContext<'db>>,
     types: &'db crate::next_solver::DefaultAny<'db>,
 
@@ -1731,7 +1872,7 @@ fn find_continuable(ctxs: &[BreakableContext<'_>], label: Option<LabelId>) -> Op
 
 impl<'db> InferenceContext<'db> {
     fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         owner: InferBodyId<'db>,
         store_owner: ExpressionStoreOwnerId,
         generic_def: GenericDefId,
@@ -1754,6 +1895,7 @@ impl<'db> InferenceContext<'db> {
             table,
             tuple_field_accesses_rev: Default::default(),
             resume_yield_tys: None,
+            coroutine_desugaring: None,
             return_coercion: None,
             db,
             owner,
@@ -1767,6 +1909,7 @@ impl<'db> InferenceContext<'db> {
             block_traits: RefCell::new((None, false, std::rc::Rc::default())),
             resolver,
             diverges: Diverges::Maybe,
+            unreachable: Vec::new(),
             breakables: Vec::new(),
             deferred_cast_checks: Vec::new(),
             diagnostics: Diagnostics::default(),
@@ -1837,6 +1980,7 @@ impl<'db> InferenceContext<'db> {
         }
         self.defined_anon_consts.borrow_mut().extend(other.defined_anon_consts.iter().copied());
         self.diagnostics.extend(&other.diagnostics);
+        self.unreachable.extend(other.unreachable.iter().cloned());
 
         #[cfg_attr(debug_assertions, track_caller)]
         fn merge_index<'a, K, V: Clone + PartialEq + 'a>(
@@ -1942,9 +2086,15 @@ impl<'db> InferenceContext<'db> {
             types,
             vars_emitted_type_must_be_known_for,
             defined_anon_consts,
+            mut unreachable,
+            db,
+            owner,
             ..
         } = self;
         let diagnostics = diagnostics.finish();
+        if !unreachable.is_empty() && in_automatically_derived_impl(db, owner) {
+            unreachable = Vec::new();
+        }
         // Destructure every single field so whenever new fields are added to `InferenceTables` we
         // don't forget to handle them here.
         let InferenceTables {
@@ -2011,12 +2161,16 @@ impl<'db> InferenceContext<'db> {
             resolver.resolve_completely(&mut adjustment.source);
         }
         for closure_data in closures_data.values_mut() {
-            let ClosureData { min_captures, fake_reads, liberated_sig } = closure_data;
+            let ClosureData { min_captures, fake_reads, liberated_sig, kind_origin } = closure_data;
             let dummy_place = || Place {
                 base_ty: types.types.error.store(),
                 base: closure::analysis::expr_use_visitor::PlaceBase::Rvalue,
                 projections: Vec::new(),
             };
+            if let Some((_, place)) = kind_origin {
+                resolver.resolve_completely_with_default(place, dummy_place());
+                place.projections.shrink_to_fit();
+            }
 
             for (place, _, sources) in fake_reads {
                 resolver.resolve_completely_with_default(place, dummy_place());
@@ -2057,6 +2211,7 @@ impl<'db> InferenceContext<'db> {
         result.freeze(
             tuple_field_access_types,
             diagnostics.into_iter().collect(),
+            unreachable.into_boxed_slice(),
             defined_anon_consts.into_iter().collect(),
         )
     }
@@ -2433,10 +2588,12 @@ impl<'db> InferenceContext<'db> {
         found: Ty<'db>,
     ) {
         if self.result.nodes_with_type_mismatches.insert(node) {
+            let at_error = self.types_at_error(expected, found);
             self.diagnostics.push(InferenceDiagnostic::TypeMismatch {
                 node,
                 expected: expected.store(),
                 found: found.store(),
+                at_error,
             });
         }
     }
@@ -2512,6 +2669,8 @@ impl<'db> InferenceContext<'db> {
             self.push_diagnostic(InferenceDiagnostic::TypeMustBeKnown {
                 at_point: node.into(),
                 top_term: None,
+                kind: TypeAnnotationNeeded::E0282,
+                ambiguity: None,
             });
         }
         self.types.types.error
@@ -3050,29 +3209,73 @@ impl<'db> Expectation<'db> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// rustc's `Diverges` (`rustc_hir_typeck/src/diverges.rs`): whether executing a node may exit
+/// normally, versus return, break or panic, which leave dead code in their wake.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Diverges {
+    /// Some cases converge, or a CFG would be needed to tell.
     Maybe,
-    Always,
+    /// Known to diverge, so not to reach the next sibling or the parent.
+    Always {
+        /// What diverged (`return`, `break`, ...).
+        span: ExprOrPatId,
+        /// A note for the warning in place of "any code following this expression is
+        /// unreachable".
+        custom_note: Option<&'static str>,
+    },
+    /// `Always`, with the warning already given.
+    WarnedAlways,
 }
 
 impl Diverges {
+    fn always(span: impl Into<ExprOrPatId>) -> Diverges {
+        Diverges::Always { span: span.into(), custom_note: None }
+    }
+
     fn is_always(self) -> bool {
-        self == Diverges::Always
+        matches!(self, Diverges::Always { .. } | Diverges::WarnedAlways)
     }
 }
 
 impl std::ops::BitAnd for Diverges {
     type Output = Self;
     fn bitand(self, other: Self) -> Self {
-        std::cmp::min(self, other)
+        match (self, other) {
+            (x @ Self::Maybe, _) => x,
+            (_, x @ Self::Maybe) => x,
+            (x @ Self::Always { .. }, Self::Always { .. }) => x,
+            (Self::WarnedAlways, x) => x,
+            (x, Self::WarnedAlways) => x,
+        }
     }
 }
 
 impl std::ops::BitOr for Diverges {
     type Output = Self;
     fn bitor(self, other: Self) -> Self {
-        std::cmp::max(self, other)
+        match (self, other) {
+            (x @ Self::WarnedAlways, _) => x,
+            (_, x @ Self::WarnedAlways) => x,
+            (x @ Self::Always { .. }, Self::Always { .. }) => x,
+            (Self::Maybe, x) => x,
+            (x, Self::Maybe) => x,
+        }
+    }
+}
+
+/// rustc's `is_automatically_derived` of the impl a body is in: `warn_if_unreachable` is quiet
+/// there (a derived `Clone` or `PartialEq` of a type holding `!`).
+fn in_automatically_derived_impl(db: &Db, owner: InferBodyId<'_>) -> bool {
+    let container = match owner {
+        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => it.lookup(db).container,
+        InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(it)) => it.lookup(db).container,
+        _ => return false,
+    };
+    match container {
+        hir_def::ItemContainerId::ImplId(it) => {
+            AttrFlags::has_word(db, it.into(), "automatically_derived")
+        }
+        _ => false,
     }
 }
 

@@ -1,6 +1,6 @@
 use base_db::{
     CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, SourceDatabase, TargetKind, all_crates,
+    DependencyBuilder, Env, TargetKind, all_crates,
 };
 use expect_test::{Expect, expect};
 use intern::Symbol;
@@ -10,7 +10,7 @@ use triomphe::Arc;
 
 use crate::{
     file_item_tree,
-    nameres::{crate_def_map, tests::TestDB},
+    nameres::{crate_def_map, tests::{TestDB, TestDBExt}},
 };
 
 fn check_def_map_is_not_recomputed(
@@ -657,7 +657,7 @@ fn execute_assert_events(
     required: &[(&str, usize)],
     expect: Expect,
 ) {
-    let events = db.log_executed(f);
+    let events = db.executed_in_read_order(f);
     for (event, count) in required {
         let n = events.iter().filter(|it| it.contains(event)).count();
         assert_eq!(n, *count, "Expected {event} to be executed {count} times, but only got {n}");

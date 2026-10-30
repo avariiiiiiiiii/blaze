@@ -64,6 +64,7 @@ impl DbMacro {
         for field in input.fields.iter() {
             if let Some(i) = &field.ident {
                 if i == storage {
+                    // clone: proc macro, at expansion time once per annotated item; no query runs this
                     return Ok(i.clone());
                 }
             } else {
@@ -102,6 +103,14 @@ impl DbMacro {
                         &mut self.#storage
                     }
                 }
+
+                impl #zalsa::ConcreteView for #db {
+                    #[cold]
+                    #[inline(never)]
+                    fn zalsa_register_concrete_downcaster(&self) -> &#zalsa::DatabaseDownCaster<Self> {
+                        #zalsa::views(self).add::<Self, Self>(|db| db)
+                    }
+                }
             };
         })
     }
@@ -113,6 +122,7 @@ impl DbMacro {
             fn zalsa_register_downcaster(&self) -> &salsa::plumbing::DatabaseDownCaster<dyn #trait_name>;
         });
 
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let comment = format!(" downcast `Self` to a [`dyn {trait_name}`]");
         input.items.push(parse_quote! {
             #[doc = #comment]

@@ -125,7 +125,7 @@ fn explain(feature: &str, name: &str) -> String {
     text.to_owned()
 }
 
-/// The gates expansion meets as it configures the crate, at `Phase::Resolve`, in the order it
+/// The gates expansion meets as it configures the crate, at `Phase::Expand`, in the order it
 /// meets them: tree by tree (the crate's files, then what macros expand to), each node's
 /// `#[cfg]`s and `#[cfg_attr]`s in order (a `cfg_attr`'s attributes when its predicate holds;
 /// nothing after a `cfg` that does not, nor in the node), the predicate of each `cfg!`, and the
@@ -158,7 +158,7 @@ pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], feat
             }
             for mut diag in diags.drain(..) {
                 source_fact(cx, &mut diag, at);
-                found.push(Found::new(diag, Phase::Resolve));
+                found.push(Found::new(diag, Phase::Expand));
             }
         }
     }

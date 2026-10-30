@@ -104,10 +104,37 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
     }
     radix::sort_copy_by_key(&mut by_offset, |it| it.at);
 
-    // A core name is at most one byte longer than its Mach-O one.
+    // An offset inside another entry's string names a tail of it, and every entry of one string
+    // ends where it does, so sorted by offset they are one run of one end. Of a string, the
+    // entries whose name starts with `_` lose it, so each is a suffix of the earliest one's: one
+    // push. One without `_` gains a `\x01` before its own first byte, which no other entry's name
+    // holds: a push each. The arena is summed exactly before anything is pushed.
     let mut arena = member_bytes;
-    for run in by_offset.chunk_by(|a, b| a.at == b.at) {
-        arena += run[0].len as usize + 1;
+    for string in by_offset.chunk_by(|a, b| a.at + u64::from(a.len) == b.at + u64::from(b.len)) {
+        let mut shared = false;
+        for run in string.chunk_by(|a, b| a.at == b.at) {
+            let entry = run[0];
+            if bytes.get(entry.at as usize) == Some(&b'_') {
+                if !shared {
+                    arena += entry.len as usize - 1;
+                    shared = true;
+                }
+            } else {
+                arena += entry.len as usize + 1;
+            }
+        }
+    }
+    // Without `_`, names inside one string grow with the entries times its length: an archive
+    // no `ranlib` writes, refused before its arena is allocated (each name in the file once, and
+    // a `\x01` per entry, bound what a real index needs).
+    if arena > bytes.len() + by_offset.len() {
+        // alloc: error path
+        return Err(format!(
+            "{name}: the symbol index names {} strings at offsets inside one another, {arena} \
+             bytes of names from a {}-byte archive",
+            by_offset.len(),
+            bytes.len()
+        ));
     }
     let mut names = Names::with_capacity(arena);
     for (member_name, range) in ranges {
@@ -115,14 +142,30 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
         let member_name = names.push(member_name).map_err(|e| format!("{name}: {e}"))?;
         members.push(Member { name: member_name, bytes: range });
     }
-    for run in by_offset.chunk_by(|a, b| a.at == b.at) {
-        // The index's strings are slices of `bytes`, which `object` read the index from.
-        let (at, len) = (run[0].at as usize, run[0].len as usize);
-        let core = super::push_core_name(&mut names, &bytes[at..at + len])
-            // alloc: error path
-            .map_err(|e| format!("{name}: {e}"))?;
-        for entry in run {
-            index[entry.nth as usize].0 = core;
+    for string in by_offset.chunk_by(|a, b| a.at + u64::from(a.len) == b.at + u64::from(b.len)) {
+        // The earliest `_` entry of this string, and its core name: what later ones are suffixes of.
+        let mut shared: Option<(u64, Name)> = None;
+        for run in string.chunk_by(|a, b| a.at == b.at) {
+            // The index's strings are slices of `bytes`, which `object` read the index from.
+            let (at, len) = (run[0].at as usize, run[0].len as usize);
+            let underscore = bytes.get(at) == Some(&b'_');
+            let core = match shared {
+                Some((first, core)) if underscore => names
+                    .suffix(core, (run[0].at - first) as u32)
+                    .expect("a `_` is a character boundary inside the earlier name"),
+                _ => {
+                    let core = super::push_core_name(&mut names, &bytes[at..at + len])
+                        // alloc: error path
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    if underscore {
+                        shared = Some((run[0].at, core));
+                    }
+                    core
+                }
+            };
+            for entry in run {
+                index[entry.nth as usize].0 = core;
+            }
         }
     }
     Ok(Archive { members, index, names })
@@ -140,7 +183,7 @@ struct Entry {
 const _: () = assert!(size_of::<Entry>() == 16);
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::read;
     use crate::model::Archive;
 
@@ -161,18 +204,23 @@ mod tests {
     }
 
     /// `members` with a `__.SYMDEF` naming `symbols` (name, member index).
-    fn bsd(members: &[(&str, &[u8])], symbols: &[(&str, usize)]) -> Vec<u8> {
+    pub(in crate::macho) fn bsd(members: &[(&str, &[u8])], symbols: &[(&str, usize)]) -> Vec<u8> {
         let mut strings = Vec::new();
-        let mut strx = Vec::new();
-        for (symbol, _) in symbols {
-            strx.push(strings.len() as u32);
+        let mut entries = Vec::new();
+        for (symbol, member) in symbols {
+            entries.push((strings.len() as u32, *member));
             strings.extend_from_slice(symbol.as_bytes());
             strings.push(0);
         }
+        bsd_raw(members, strings, &entries)
+    }
+
+    /// `members` with a `__.SYMDEF` of `entries` (string offset into `strings`, member index).
+    pub(in crate::macho) fn bsd_raw(members: &[(&str, &[u8])], mut strings: Vec<u8>, entries: &[(u32, usize)]) -> Vec<u8> {
         strings.resize(strings.len().next_multiple_of(4), 0);
         let symdef_name = "__.SYMDEF SORTED";
         let symdef_padded = (symdef_name.len() + 1).next_multiple_of(8);
-        let symdef_len = 4 + 8 * symbols.len() + 4 + strings.len();
+        let symdef_len = 4 + 8 * entries.len() + 4 + strings.len();
         let mut at = 8 + 60 + symdef_padded + symdef_len;
         at += at % 2;
         let mut offsets = Vec::new();
@@ -182,8 +230,8 @@ mod tests {
             at += at % 2;
         }
         let mut symdef = Vec::new();
-        symdef.extend_from_slice(&(8 * symbols.len() as u32).to_le_bytes());
-        for ((_, member), strx) in symbols.iter().zip(strx) {
+        symdef.extend_from_slice(&(8 * entries.len() as u32).to_le_bytes());
+        for (strx, member) in entries {
             symdef.extend_from_slice(&strx.to_le_bytes());
             symdef.extend_from_slice(&(offsets[*member] as u32).to_le_bytes());
         }
@@ -319,6 +367,59 @@ mod tests {
         assert!(archive.index.iter().all(|it| *it == archive.index[0]), "one `Name` for one string");
         assert_eq!(archive.name(archive.index[0].0), core(&long));
         assert_eq!(archive.names.bytes(), "a.o".len() + core(&long).len());
+    }
+
+    /// One string, `text`, named from each of `offsets` by an entry for member 0.
+    fn one_string(text: &str, offsets: &[u32]) -> Vec<u8> {
+        let mut strings = text.as_bytes().to_vec();
+        strings.push(0);
+        let entries: Vec<(u32, usize)> = offsets.iter().map(|&at| (at, 0)).collect();
+        bsd_raw(&[("a.o", &b"aaaa"[..])], strings, &entries)
+    }
+
+    #[test]
+    fn offsets_at_underscores_inside_a_string_are_suffixes_of_its_name() {
+        // `_` at 0, 2 and 5.
+        let archive = read("libtail.a", &one_string("_a_bc_d", &[5, 0, 2, 5])).unwrap();
+        let want = [core("_d"), core("_a_bc_d"), core("_bc_d"), core("_d")];
+        let got: Vec<String> = index(&archive).into_iter().map(|(name, _)| name).collect();
+        assert_eq!(got, want);
+        // One push for all four: the arena holds `a.o` and `a_bc_d`.
+        assert_eq!(archive.names.bytes(), "a.o".len() + "a_bc_d".len());
+    }
+
+    #[test]
+    fn offsets_inside_a_string_name_what_each_names_alone() {
+        // Starting with `_` or not, at any offset: the names are those of each entry's string
+        // read alone, the old reader's answer.
+        let text = "x_y__z";
+        for first in 0..text.len() as u32 {
+            let offsets: Vec<u32> = (first..text.len() as u32).rev().chain(first..=first).collect();
+            let archive = read("libmixed.a", &one_string(text, &offsets)).unwrap();
+            let got: Vec<String> = index(&archive).into_iter().map(|(name, _)| name).collect();
+            let want: Vec<String> = offsets.iter().map(|&at| core(&text[at as usize..])).collect();
+            assert_eq!(got, want, "from {first}");
+            let pushed: usize = {
+                let mut distinct: Vec<u32> = offsets.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                let shared = distinct.iter().find(|&&at| text.as_bytes()[at as usize] == b'_');
+                let alone = distinct.iter().filter(|&&at| text.as_bytes()[at as usize] != b'_');
+                shared.map_or(0, |&at| text.len() - at as usize - 1)
+                    + alone.map(|&at| text.len() - at as usize + 1).sum::<usize>()
+            };
+            assert_eq!(archive.names.bytes(), "a.o".len() + pushed, "from {first}");
+        }
+    }
+
+    #[test]
+    fn many_offsets_without_underscores_inside_one_string_are_refused() {
+        // The fuzz seed `suffixes_of_one_string`: 640 names of about 4 KB from a 10 KB archive.
+        let text = format!("_{}", "a".repeat(4095));
+        let offsets: Vec<u32> = (0..640).collect();
+        let bytes = one_string(&text, &offsets);
+        let error = read("libsuffix.a", &bytes).unwrap_err();
+        assert!(error.contains("libsuffix.a") && error.contains("inside one another"), "{error}");
     }
 
     #[test]

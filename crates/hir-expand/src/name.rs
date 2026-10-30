@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
@@ -17,8 +17,8 @@ use syntax::{ast, format_smolstr};
 /// of the current crate, for example if it is edition 2021 complete `gen` even if the defining
 /// crate is in edition 2024 and wrote `r#gen`, and the opposite holds as well.
 ///
-/// 8 bytes, `Copy`: the interned symbol's pointer. Equality and hashing are one pointer;
-/// ordering compares text (pointers differ between runs), equal pointers first.
+/// 4 bytes, `Copy`: the interned symbol's id. Equality and hashing are one `u32`; ordering
+/// compares text (ids differ between runs), equal ids first.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Name {
@@ -188,7 +188,7 @@ impl Name {
     #[inline]
     pub fn display<'a>(
         &'a self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         edition: Edition,
     ) -> impl fmt::Display + 'a {
         _ = db;
@@ -300,7 +300,7 @@ impl AsName for ast::FieldKind {
 
 impl AsName for base_db::BuiltDependency {
     fn as_name(&self) -> Name {
-        Name::new_symbol_root((*self.name).clone())
+        Name::new_symbol_root(*self.name)
     }
 }
 

@@ -13,7 +13,6 @@
 
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
-use hir_ty::db::HirDatabase;
 use load_cargo::v2::Db;
 use rustc_hash::FxHashSet;
 
@@ -43,7 +42,7 @@ pub(crate) fn changed_facts(key: ItemKey, old: Option<&ItemHashes>, new: Option<
     facts
 }
 
-fn path(db: &dyn HirDatabase, key: ItemKey) -> Option<String> {
+fn path(db: &Db, key: ItemKey) -> Option<String> {
     match blaze_items::resolve(db, key)? {
         Resolved::Item(id) => Some(blaze_items::key::path(db, id)),
         _ => None,
@@ -59,8 +58,6 @@ pub(crate) fn reach(
     after: &Db,
     changes: &[blaze_vfs::Change],
 ) -> Result<Reach, Failed> {
-    let old_db: &dyn HirDatabase = before;
-    let new_db: &dyn HirDatabase = after;
     let mut items = Vec::new();
     let mut compiled = Vec::new();
     let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
@@ -79,10 +76,10 @@ pub(crate) fn reach(
         if to.cancelled() {
             return Err(Failed::Again);
         }
-        let new: &HashColumns = blaze_items::crate_hashes(new_db, new_krate);
+        let new: &HashColumns = blaze_items::crate_hashes(after, new_krate);
         let empty = HashColumns::default();
         let old: &HashColumns = match old_krate {
-            Some(krate) => blaze_items::crate_hashes(old_db, krate),
+            Some(krate) => blaze_items::crate_hashes(before, krate),
             None => &empty,
         };
         for key in new.changed_since(old) {
@@ -94,7 +91,7 @@ pub(crate) fn reach(
             if facts.is_empty() {
                 continue;
             }
-            let name = path(new_db, key).or_else(|| path(old_db, key)).unwrap_or_else(|| format!("{:?}", key.0));
+            let name = path(after, key).or_else(|| path(before, key)).unwrap_or_else(|| format!("{:?}", key.0));
             if was.and_then(|it| it.code) != now.and_then(|it| it.code) {
                 if let Some(code) = was.and_then(|it| it.code) {
                     changed_code.insert(code);

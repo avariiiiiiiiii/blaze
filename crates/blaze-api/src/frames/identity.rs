@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 
-use blaze_ids::{ContentId, Fingerprint};
+use blaze_ids::{ContentId, Fingerprint, rng::SplitMix64};
 use blaze_protocol::cbor::{self, reference};
 use blaze_query::{Changed, Edge, Input, QueryKey, QueryKind, Why};
 use blaze_vfs::{Change, ChangeKind, Mode, Op, View};
@@ -14,13 +14,14 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Artifact, Basis, BuildScriptRan, Cached, Cargo, Diagnostic, Edit, Edited,
-    EditedItem, Envelope, FactRead, FetchVerb, How, Level, LinkKind, Mismatch, Ranked, Reach,
-    ReachedItem, Request, Response, Span, Status, Table, Target, Targets, TestOutcome,
-    TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
+    EditedItem, Envelope, FactRead, FetchVerb, How, Level, LinkKind, Memory, Mismatch, Ranked,
+    Reach, ReachedItem, Request, Response, Span, Status, Table, TagMemory, Target, Targets,
+    TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb,
+    ViewRef, Worked,
 };
 
-const REQUESTS: usize = 22;
-const RESPONSES: usize = 26;
+const REQUESTS: usize = 23;
+const RESPONSES: usize = 27;
 
 const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
 
@@ -28,20 +29,17 @@ const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\
 /// of another crate's type whose fields are not declared in their keys' order (`Op`,
 /// `Change`, `Edge`, `Why`), which the writer puts in order.
 struct Gen {
-    state: u64,
+    rng: SplitMix64,
     plain: bool,
 }
 
 impl Gen {
     fn next(&mut self) -> u64 {
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        self.state
+        self.rng.next_u64()
     }
 
     fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
+        self.rng.below(n)
     }
 
     fn yes(&mut self) -> bool {
@@ -284,6 +282,7 @@ impl Gen {
                 targets: self.targets(),
                 wait_ms: self.wide(),
             },
+            21 => Request::Memory,
             _ => Request::Stop,
         }
     }
@@ -536,6 +535,19 @@ impl Gen {
             })),
             23 => Response::Edited(self.edited(depth)),
             24 => Response::Announced { root: self.id() },
+            25 => Response::Memory(Memory {
+                tags: self.many(depth, |g| TagMemory {
+                    tag: g.text(),
+                    live: g.wide(),
+                    rate: g.wide(),
+                    budget: g.wide(),
+                    allocated: g.wide(),
+                    task_peak: g.wide(),
+                    high_water: g.wide(),
+                }),
+                committed: self.wide(),
+                committed_high_water: self.wide(),
+            }),
             _ => {
                 Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }
             }
@@ -593,7 +605,8 @@ fn request_index(request: &Request) -> usize {
         Request::Edit { .. } => 18,
         Request::WillTest { .. } => 19,
         Request::WillSave { .. } => 20,
-        Request::Stop => 21,
+        Request::Memory => 21,
+        Request::Stop => 22,
     }
 }
 
@@ -625,7 +638,8 @@ fn response_index(response: &Response) -> usize {
         Response::Tables(_) => 22,
         Response::Edited(_) => 23,
         Response::Announced { .. } => 24,
-        Response::Of { .. } => 25,
+        Response::Memory(_) => 25,
+        Response::Of { .. } => 26,
     }
 }
 
@@ -662,7 +676,7 @@ fn same_answer<T: DeserializeOwned + PartialEq + Debug>(bytes: &[u8]) {
 
 #[test]
 fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
-    let mut g = Gen { state: 0x2545_f491_4f6c_dd1d, plain: false };
+    let mut g = Gen { rng: SplitMix64::new(0x2545_f491_4f6c_dd1d), plain: false };
     let mut writer = cbor::Writer::new();
     let (mut requests, mut responses) = ([false; REQUESTS], [false; RESPONSES]);
     for round in 0..3000 {
@@ -690,7 +704,7 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
 
 #[test]
 fn changed_bytes_read_as_the_old_codec_read_them() {
-    let mut g = Gen { state: 0x9e37_79b9_7f4a_7c15, plain: false };
+    let mut g = Gen { rng: SplitMix64::new(0x9e37_79b9_7f4a_7c15), plain: false };
     for _ in 0..1500 {
         let mut request = reference::to_vec(&Envelope::new(g.wide(), g.request())).unwrap();
         g.mutate(&mut request);

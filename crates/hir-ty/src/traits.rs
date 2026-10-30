@@ -2,7 +2,7 @@
 
 use std::{cell::OnceCell, hash::Hash};
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AdtId, AssocItemId, ExpressionStoreOwnerId, GenericDefId, HasModule, ImplId, Lookup, TraitId,
     expr_store::ExpressionStore,
@@ -61,12 +61,12 @@ pub struct StoredParamEnvAndCrate {
 
 impl StoredParamEnvAndCrate {
     #[inline]
-    pub fn param_env<'db>(&self, _db: &'db dyn HirDatabase) -> ParamEnv<'db> {
+    pub fn param_env<'db>(&self, _db: &'db Db) -> ParamEnv<'db> {
         ParamEnv { clauses: self.param_env.as_ref() }
     }
 
     #[inline]
-    pub fn as_ref<'db>(&self, db: &'db dyn HirDatabase) -> ParamEnvAndCrate<'db> {
+    pub fn as_ref<'db>(&self, db: &'db Db) -> ParamEnvAndCrate<'db> {
         ParamEnvAndCrate { param_env: self.param_env(db), krate: self.krate }
     }
 }
@@ -123,7 +123,7 @@ impl FnTrait {
 /// This should not be used in `hir-ty`, only in `hir`.
 pub fn implements_trait_unique<'db>(
     ty: Ty<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
 ) -> bool {
@@ -134,7 +134,7 @@ pub fn implements_trait_unique<'db>(
 
 /// This should not be used in `hir-ty`, only in `hir`.
 pub fn implements_trait_unique_with_args<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
     args: GenericArgs<'db>,
@@ -143,7 +143,7 @@ pub fn implements_trait_unique_with_args<'db>(
 }
 
 pub fn implements_trait_unique_with_infcx<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
     create_args: &mut dyn FnMut(&InferCtxt<'db>) -> GenericArgs<'db>,
@@ -162,7 +162,7 @@ pub fn implements_trait_unique_with_infcx<'db>(
 /// opaque types, so no check sees what another left.
 pub fn implements_traits_unique<'db>(
     ty: Ty<'db>,
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     traits: &[TraitId],
 ) -> Vec<bool> {
@@ -198,7 +198,7 @@ fn trait_ref_holds<'db>(
 /// Whether two types unify once `create_tys` has replaced their generic parameters with
 /// inference variables: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
 pub fn could_unify_with_infcx<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     create_tys: &mut dyn FnMut(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
 ) -> bool {
@@ -212,7 +212,7 @@ pub fn could_unify_with_infcx<'db>(
 /// `synthesize_blanket_impls` asks: the impl's parameters are inference variables, its self
 /// type is equated with the type, and its where-clauses and trait ref may each hold.
 pub fn impl_may_apply<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     impl_: ImplId,
     create_ty: &mut dyn FnMut(&InferCtxt<'db>) -> Ty<'db>,
@@ -251,7 +251,7 @@ pub fn impl_may_apply<'db>(
 /// the impl leaves as the trait provides it. `krate` is the crate asking, rustc's local crate:
 /// a clause it could not know the answer to holds as far as it can tell.
 pub fn is_impossible_associated_item(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     impl_: ImplId,
     item: GenericDefId,
@@ -341,7 +341,7 @@ pub fn is_impossible_associated_item(
 /// `trait_ref_is_knowable` and `orphan_check_trait_ref`, leaving out where parameters may appear.
 /// Each type looked at goes through `normalize` first.
 fn knowable<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     trait_ref: crate::next_solver::TraitRef<'db>,
     mut normalize: impl FnMut(Ty<'db>) -> Ty<'db>,
@@ -391,7 +391,7 @@ pub enum WherePredicateEvaluation {
 /// This should not be used in `hir-ty`, only in `hir`.
 /// This is exposed to allow the IDE to evaluate arbitrary predicates.
 pub fn where_predicate_must_hold<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     resolver: &Resolver<'db>,
     store: &'db ExpressionStore,
     def: ExpressionStoreOwnerId,
@@ -468,13 +468,13 @@ pub fn where_predicate_must_hold<'db>(
 /// Whether the inherent impl `impl_id` may be written in the crate of `def_map`. The answer
 /// depends on the impl, that crate and whether it is `#![rustc_coherence_is_core]`, and is
 /// kept per impl.
-pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id: ImplId) -> bool {
+pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> bool {
     inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
 }
 
 #[salsa::tracked]
 fn inherent_impl_coherent(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_id: ImplId,
     krate: Crate,
     rustc_coherence_is_core: bool,
@@ -562,16 +562,16 @@ fn inherent_impl_coherent(
 /// - All of
 ///   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
 ///   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
-pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
     orphan_rules_hold(db, impl_)
 }
 
 #[salsa::tracked]
-fn orphan_rules_hold(db: &dyn HirDatabase, impl_: ImplId) -> bool {
+fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
     check_orphan_rules_uncached(db, impl_)
 }
 
-fn check_orphan_rules_uncached<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+fn check_orphan_rules_uncached<'db>(db: &'db Db, impl_: ImplId) -> bool {
     let Some(impl_trait) = db.impl_trait(impl_) else {
         // not a trait impl
         return true;

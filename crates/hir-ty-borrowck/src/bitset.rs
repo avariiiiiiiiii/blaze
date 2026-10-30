@@ -206,6 +206,8 @@ impl BitMatrix {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::{BitMatrix, BitSet, Transfer, iter_words};
 
     #[test]
@@ -219,29 +221,23 @@ mod tests {
 
     #[test]
     fn ranges_match_a_bit_at_a_time() {
-        let mut seed = 0x9e3779b97f4a7c15u64;
-        let mut next = |bound: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % bound as u64) as usize
-        };
+        let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
         for _ in 0..2000 {
-            let size = 1 + next(300);
+            let size = 1 + rng.index(300);
             let mut fast = BitSet::new(size);
             let mut slow = vec![false; size];
             for _ in 0..8 {
-                let start = next(size + 1);
-                let end = start + next(size + 1 - start);
-                let on = next(2) == 0;
+                let start = rng.index(size + 1);
+                let end = start + rng.index(size + 1 - start);
+                let on = rng.index(2) == 0;
                 if on {
                     fast.gen_range(start..end);
                 } else {
                     fast.kill_range(start..end);
                 }
                 slow[start..end].fill(on);
-                let start = next(size + 1);
-                let end = start + next(size + 1 - start);
+                let start = rng.index(size + 1);
+                let end = start + rng.index(size + 1 - start);
                 let want = (start..end).find(|&it| slow[it]);
                 assert_eq!(fast.first_in(start..end), want);
             }

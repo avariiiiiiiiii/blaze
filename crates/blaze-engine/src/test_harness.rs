@@ -155,10 +155,12 @@ pub(crate) fn module(
         let range = source.with_value(name.syntax()).original_file_range_rooted(db);
         let file = range.file_id.file_id(db);
         test.file = file_name(file)?;
-        let lines = ide_db::line_index(db, file);
+        let text = db.file_text(file);
+        let lines = base_db::line_index(db, text);
         let at = |offset| {
-            let it = lines.line_col(offset);
-            (it.line as usize + 1, it.col as usize + 1)
+            let place = lines.place(offset).expect("a test's name is in its file");
+            let column = place.char_column(text.text(db)).expect("on a char boundary");
+            (place.line() as usize, column as usize)
         };
         (test.start, test.end) = (at(range.range.start()), at(range.range.end()));
         tests.push(test);

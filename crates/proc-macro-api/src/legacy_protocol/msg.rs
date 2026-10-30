@@ -8,10 +8,10 @@ use paths::Utf8PathBuf;
 use serde::de::DeserializeOwned;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::{ProcMacroKind, transport::json};
+use crate::{ProcMacroKind, transport::json, wire::ExpandMacroWire};
 
 /// Represents requests sent from the client to the proc-macro-srv.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Request {
     // IMPORTANT: Keep his first, otherwise postcard will break as its not a self describing format
     // As such, this is the only request that needs to be supported across all protocol versions
@@ -31,6 +31,10 @@ pub enum Request {
     /// Sets server-specific configurations.
     /// Since [`crate::version::RUST_ANALYZER_SPAN_SUPPORT`]
     SetConfig(ServerConfig),
+
+    /// Expands a procedural macro, its trees as their columns.
+    /// Since [`crate::version::WIRE_TREES`]
+    ExpandMacroWire(Box<ExpandMacroWire>),
 }
 
 /// Defines the mode used for handling span data.
@@ -45,7 +49,7 @@ pub enum SpanMode {
 }
 
 /// Represents responses sent from the proc-macro-srv to the client.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Response {
     // IMPORTANT: Keep his first, otherwise postcard will break as its not a self describing format
     // As such, this is the only request that needs to be supported across all protocol versions
@@ -69,10 +73,14 @@ pub enum Response {
     /// Returns the result of a macro expansion, including extended span data.
     /// Since [`crate::version::RUST_ANALYZER_SPAN_SUPPORT`]
     ExpandMacroExtended(Result<ExpandMacroExtended, PanicMessage>),
+
+    /// Returns the result of an `ExpandMacroWire`: the tree as `write_wire` writes it.
+    /// Since [`crate::version::WIRE_TREES`]
+    ExpandMacroWire(Result<Vec<u8>, PanicMessage>),
 }
 
 /// Configuration settings for the proc-macro-srv.
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct ServerConfig {
     /// Defines how span data should be handled.
@@ -80,7 +88,7 @@ pub struct ServerConfig {
 }
 
 /// Represents an extended macro expansion response, including span data mappings.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacroExtended {
     /// The expanded syntax tree.
     pub tree: FlatTree,
@@ -89,11 +97,11 @@ pub struct ExpandMacroExtended {
 }
 
 /// Represents an error message when a macro expansion results in a panic.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PanicMessage(pub String);
 
 /// Represents a macro expansion request sent from the client.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacro {
     /// The path to the dynamic library containing the macro.
     pub lib: Utf8PathBuf,
@@ -107,7 +115,7 @@ pub struct ExpandMacro {
 }
 
 /// Represents the input data required for expanding a macro.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpandMacroData {
     /// Argument of macro call.
     ///
@@ -134,7 +142,7 @@ pub struct ExpandMacroData {
 }
 
 /// Represents global expansion settings, including span resolution.
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpnGlobals {
     /// Determines whether to serialize the expansion settings.
     #[serde(skip_serializing)]
@@ -379,7 +387,7 @@ mod tests {
 
                 assert_eq!(
                     tt,
-                    back.data.macro_body.to_subtree_resolved(v, &span_data_table),
+                    back.data.macro_body.to_subtree_resolved(v, &span_data_table).unwrap(),
                     "version: {v}"
                 );
             }
@@ -400,16 +408,19 @@ mod tests {
                 let flat_tree = FlatTree::from_subtree(tt.view(), v, &mut span_data_table);
                 assert_eq!(
                     tt,
-                    flat_tree.clone().to_subtree_resolved(v, &span_data_table),
+                    flat_tree.clone().to_subtree_resolved(v, &span_data_table).unwrap(),
                     "version: {v}"
                 );
-                let ts = flat_tree.to_tokenstream_resolved(v, &span_data_table, |a, b| a.cover(b));
+                let ts = flat_tree
+                    .to_tokenstream_resolved(v, &span_data_table, |a, b| a.cover(b))
+                    .unwrap();
                 let call_site = *span_data_table.first().unwrap();
                 let mut span_data_table = Default::default();
                 assert_eq!(
                     tt,
                     FlatTree::from_tokenstream(ts.clone(), v, call_site, &mut span_data_table)
-                        .to_subtree_resolved(v, &span_data_table),
+                        .to_subtree_resolved(v, &span_data_table)
+                        .unwrap(),
                     "version: {v}, ts:\n{ts:#?}"
                 );
             }

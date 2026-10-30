@@ -1309,11 +1309,16 @@ fn what_the_mover_leaves_warm_or_hot_reads_in_place_for_every_column_shape() {
     }
 }
 
-/// Calls `tidy` until the store's limbo is empty and no index swap is waiting on writers. Other
-/// tests of this process hold guards of their own, so a grace can take a moment to pass.
+/// Calls `tidy` until the store's limbo and its delta tables hold nothing swapped out and no
+/// index swap is waiting on writers. Other tests of this process hold guards of their own, so a
+/// grace can take a moment to pass.
 fn reclaim_all(store: &mut Store) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while !store.limbo.is_empty() || store.migrating.is_some() {
+    let retired = |store: &Store| {
+        let own = &store.tiers[0];
+        std::iter::once(&own.delta).chain(&own.prev).map(|it| it.retired()).sum::<usize>()
+    };
+    while !store.limbo.is_empty() || store.migrating.is_some() || retired(store) > 0 {
         store.tidy();
         assert!(std::time::Instant::now() < deadline, "a grace never passed with no task of this test open");
         std::thread::yield_now();
@@ -1481,4 +1486,65 @@ fn writers_and_readers_on_other_threads_go_on_through_commits_settles_and_index_
         assert_eq!(bytes_of(&store, &key(n as u64)).as_ref(), Some(bytes), "{n}");
     }
     assert_eq!(store.verify(None), Vec::new());
+}
+
+/// A lookup that hits allocates nothing wherever its record is (a writer's segment, a pack a
+/// delta spot points at, the mapped index), the first read of a record (which verifies and
+/// flags it) included; nor does a warm writer's put, past chunk rolls and past the delta
+/// table's high-water mark into a new level.
+#[test]
+fn hits_and_warm_puts_allocate_nothing() {
+    let mut sim = Sim::new(31, quiet());
+    let mut store = open(&mut sim, "store");
+    let mut writer = store.writer();
+    let reader = store.reader();
+    let count = INDEX_AFTER as u64 * 3;
+    let values: Vec<Vec<u8>> = (0..count).map(|n| noise(40 + (n as usize * 53) % 3000, n)).collect();
+    let guard = enter();
+    let hits = |store: &Store, upto: u64, what: &str| {
+        blaze_alloc_count::assert_at_most(0, what, || {
+            for n in 0..upto {
+                let want = values[n as usize].as_slice();
+                let entry = reader.get(&guard, &key(n)).unwrap().expect("put before");
+                assert!(entry.bytes == want, "{what}: {n}");
+                assert!(store.get(&key(n)).unwrap().is_some_and(|it| it.bytes == want), "{what}: {n}");
+            }
+        });
+    };
+    // The first put warms what a thread keeps once: its writer's first chunk is made already.
+    writer.put(&guard, key(0), Kind::Query, values[0].clone()).unwrap();
+    let mut pending: Vec<(Key, Vec<u8>)> = (1..count - 16).map(|n| (key(n), values[n as usize].clone())).collect();
+    let before = store.tiers[0].delta.len();
+    blaze_alloc_count::assert_at_most(0, "warm puts", || {
+        for (key, bytes) in pending.drain(..) {
+            writer.put(&guard, key, Kind::Query, bytes).unwrap();
+        }
+    });
+    assert!(store.tiers[0].delta.len() > before + DELTA_FIRST / 2, "the puts went past the delta's first level");
+    hits(&store, count - 16, "hits in segments");
+    drop(guard);
+    flush(&mut sim, &mut store);
+    reclaim_all(&mut store);
+    let guard = enter();
+    let mut rest: Vec<(Key, Vec<u8>)> = (count - 16..count).map(|n| (key(n), values[n as usize].clone())).collect();
+    blaze_alloc_count::assert_at_most(0, "warm puts after a commit", || {
+        for (key, bytes) in rest.drain(..) {
+            writer.put(&guard, key, Kind::Query, bytes).unwrap();
+        }
+    });
+    drop(guard);
+    flush(&mut sim, &mut store);
+    assert!(store.tiers[0].head.index.is_some(), "an index was written");
+    let guard = enter();
+    let hits = |store: &Store, what: &str| {
+        blaze_alloc_count::assert_at_most(0, what, || {
+            for n in 0..count {
+                let entry = reader.get(&guard, &key(n)).unwrap().expect("put before");
+                assert!(entry.bytes == values[n as usize].as_slice(), "{what}: {n}");
+                assert!(store.has(&key(n)), "{what}: {n}");
+            }
+        });
+    };
+    hits(&store, "hits in packs and the index");
+    hits(&store, "hits again");
 }

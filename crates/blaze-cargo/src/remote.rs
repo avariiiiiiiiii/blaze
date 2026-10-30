@@ -46,6 +46,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use blaze_core::fs::{Advice, MapOptions, Mapped};
 use blaze_store::{
     FORMAT as STORE_FORMAT, StoreDir, limit_for, name_file_whole, pack_format, pack_keys,
     parse_size, write_file_whole,
@@ -768,7 +769,7 @@ fn keys_of(store: &Path, pack: Digest) -> anyhow::Result<(u64, Vec<u8>)> {
     let name = pack_file(&pack);
     let file = File::open(store.join(&name))?;
     // SAFETY: a sealed pack is never written to again.
-    let bytes = unsafe { memmap2::Mmap::map(&file)? };
+    let bytes = unsafe { Mapped::map(&file)? };
     match pack_keys(&name, &bytes) {
         Ok(keys) => Ok((bytes.len() as u64, keys.concat())),
         Err(why) => bail!("{name} of the store {why}: it is not sent"),
@@ -804,8 +805,8 @@ async fn send_pack(store: &Path, remote: &Remote, pack: Digest) -> anyhow::Resul
 /// keeps them as they are to be read in place: compiled code that compresses to a fifth.
 fn packed(path: &Path, size: u64) -> anyhow::Result<Option<Vec<u8>>> {
     let file = File::open(path)?;
-    // SAFETY: a sealed pack is never written to again.
-    let bytes = unsafe { memmap2::Mmap::map(&file)? };
+    // SAFETY: a sealed pack is never written to again; zstd reads it once, front to back.
+    let bytes = unsafe { MapOptions::new().advise(Advice::Sequential).map(&file)? };
     let packed = zstd::bulk::compress(&bytes, 3)?;
     Ok((packed.len() as u64 * 4 <= size * 3).then_some(packed))
 }

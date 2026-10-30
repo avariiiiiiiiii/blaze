@@ -12,7 +12,7 @@ use crate::visit::TypeVisitableExt as _;
 use crate::{self as ty, Const, Interner};
 
 /// See `simplify_type`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
 pub enum SimplifiedType<DefId> {
     Bool,

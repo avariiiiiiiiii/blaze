@@ -17,6 +17,7 @@
 //! `compiler/rustc_lint/src/foreign_modules.rs` and `compiler/rustc_lint/src/lints.rs`
 //! (`ImproperCTypes`, `UsesPowerAlignment`, `BuiltinClashingExtern`) (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use std::str::FromStr;
 
 use blaze_items::{Fact, ItemId};
@@ -249,7 +250,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     }
 
     fn nonnull_optimization_guaranteed(&self, adt: AdtId) -> bool {
-        let source = adt_source(self.cx.db, adt);
+        let source = adt_source(self.cx, adt);
         let Some(node) = ast::Adt::cast(source.value) else { return false };
         walk::attr(self.cx, &node, "rustc_nonnull_optimization_guaranteed").is_some()
     }
@@ -647,7 +648,8 @@ fn is_mutable_ptr(ty: Ty<'_>) -> bool {
     )
 }
 
-fn adt_source(db: &dyn hir::db::HirDatabase, adt: AdtId) -> InFile<SyntaxNode> {
+fn adt_source(cx: &Cx<'_, '_>, adt: AdtId) -> InFile<SyntaxNode> {
+    let db = cx.db;
     match adt {
         AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
         AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
@@ -881,7 +883,7 @@ impl<'db> Pass<'_, '_, 'db> {
         if let TyKind::Adt(def, _) = ty.kind()
             && types.is_local(def.def_id())
         {
-            let source = adt_source(cx.db, def.def_id());
+            let source = adt_source(cx, def.def_id());
             diag.span_note(cx.span(source.as_ref().map(def_span)), "the type is defined here");
         }
         if let Some((id, name)) = &site.fact {

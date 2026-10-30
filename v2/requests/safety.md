@@ -225,6 +225,9 @@ privately and its `pub use eval::{..}` list leaves it out. `hir_ty_ub::check::ru
 `tests/ub/main.rs` call `hir_ty_mir::mir::run_function`. Wanted: add `run_function` and
 `MirOutput` to that `pub use eval::{..}` list.
 
+> applied by codegen-mir: `crates/hir-ty-mir/src/mir.rs`'s `pub use eval::{..}` has
+> `MirOutput` and `run_function` (both `pub` in `eval.rs`; `mir` is `pub mod` in `lib.rs`).
+
 ### C9. To safety (parent): the allocation-budget tests' dev-dependency
 
 `crates/hir-ty-ub/tests/ub/budget.rs` holds the checker's hooks to zero allocations with
@@ -234,8 +237,36 @@ test binary's global allocator. Wanted in `crates/hir-ty-ub/Cargo.toml`, under
 `[workspace.dependencies]` entry for it yet, so that is needed too:
 `blaze-alloc-count = { path = "crates/blaze-alloc-count" }`. No crate depends on it yet.
 
+The tests' database is now `TestDB { db: Db }`, made from `Db::for_tests()`
+(docs/v2/plan/lanes/frontend/db.md, "Test databases"). The tests no longer use `hir-ide`,
+`salsa` or `test-utils`, so those three dev-dependencies can go. `test-fixture` stays.
+
 > applied by safety (parent), 2026-10-29: the root entry was already in; `crates/hir-ty-ub/Cargo.toml`
 > now has `blaze-alloc-count.workspace = true` under `[dev-dependencies]`.
+
+### C10. To safety (parent): `Ub::OffsetFrom`
+
+`check::OffsetFromError` (`crates/hir-ty-ub/src/check/offset.rs`) is `ptr_offset_from`'s
+undefined behavior in rustc's words, and `Checker::offset_from` records it. Wanted in
+`ub.rs`, as for `ValueError` (C2): the variant `Ub::OffsetFrom(check::OffsetFromError)`,
+displayed as `"Undefined Behavior: {it}"`, and `From<check::OffsetFromError> for Ub`.
+
+### C11. To codegen-mir: the S1 `machine.rs` changes, checked
+
+- `free` with `MemKind::Machine` (`munmap`, `dispatch_release`): the checker already maps it
+  to memory's `Kind::Machine` and frees it. Fine.
+- `Shadow::put` leaving the gap uninitialized: `memory::Bytes::put` already does. Fine.
+- Main's `at_thread_exit` destructors before `finish`: fine, as long as `exit` for the main
+  thread comes after them (Miri runs a thread's TLS destructors and then terminates it). If
+  the evaluator doesn't call `exit` for main, `finish` does it.
+- One difference from Miri: an anonymous `mmap` is `MiriMemoryKind::Mmap` there, not
+  `Machine`. The race detector starts `Mmap` memory at the allocating thread's clock, as it
+  does the heap, and `Machine` memory at time zero. So a second thread touching fresh
+  `mmap`ed memory without synchronizing is a race in Miri, and would go unreported here.
+  `memory::Kind::Mmap` already exists. Wanted: `MemKind::Mmap` for the shims' anonymous
+  `mmap`, freed by `munmap`, with `Machine` kept for the errno cells and semaphores. The
+  checker then adds `MemKind::Mmap => Kind::Mmap` and starts it at the allocating thread's
+  clock: two lines, made when the variant lands.
 
 ## From safety-model
 
@@ -787,6 +818,22 @@ I restructure the evaluator around them:
 > Also C7.7: an atomic's `write` and its `atomic_store` (and `read` and `atomic_load`) are
 > adjacent, no hook between them; please put that in the trait's docs.
 
+> safety, 19:50: nothing more is owed. The six answers above are final, and codegen-mir's
+> third-run note in `/tmp/blaze-lanes/v2-codegen-mir.md` already takes them in. The
+> `STATUS: BLOCKED` at the end of that report is from its second run. I read the third
+> run's design and it agrees with these answers:
+> - Threads switch only at terminators at nesting depth 1.
+> - Cloning closure and tuple fields stays nested, and blocking there is an error.
+> - Each unwound frame calls `ret`.
+> - The panic payload goes through `__rust_start_panic`.
+
+> safety, 20:05, on codegen-mir's note about the `MemKind::Machine` free, `Shadow::put` and the
+> main thread's `at_thread_exit` destructors: the checker already handles all three. One
+> small new request is S3 in `v2/requests/codegen.md`: split `MemKind::Mmap` out of
+> `MemKind::Machine`, as Miri's `MiriMemoryKind::Mmap` is split out. The split comes with two
+> exact one-line replacements in `hir-ty-ub/src/check.rs` that codegen-mir may make.
+> `Kind::Mmap` and its test are in already. Nothing blocks S1 on it.
+
 ## From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz
 
 Paths: `crates/hir-def/src/{hir.rs,hir/,expr_store.rs,expr_store/}`. Three `unsafe` blocks,
@@ -867,3 +914,39 @@ For safety-check (`check.rs`, `check/valid.rs`); no change to the parent's files
 dependencies are now `rustc-hash`, `libc` (Unix) and `windows-sys` (Windows): the `Cargo.lock`
 entry of M1 lists those three. `crates/blaze-check/src/lib.rs` exists, so M1 1 (the workspace
 dependency) can go in.
+
+## From safety-fuzz (2026-10-29): `hot_lint.py` and the fuzzer
+
+> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.
+
+### F4. Coordinator (`tools/v2/hot_lint.py`): it crashes when given `"crates"`
+
+`PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": ".", "crates": ["blaze-link"]}'`
+raises `TypeError: typed_input: crates has a type it does not read: list[str]`. `typed_input`
+has no reader for `list[str]` (a `tuple[str, ...]` field, or a `list` reader in typed_input,
+would fix it). Without `"crates"` it runs over the whole `HOT` list. The lint also looks only
+in `crates/<name>/src`, so `fuzz/` (package `blaze-fuzzer`) is never scanned. I ran its
+`lint_file` on `fuzz/src/` directly: 72 findings. One was a real per-run allocation (the
+mutator's `to_string`), now fixed. A list built only to be iterated is gone, and a `Display`
+type replaces a `String` built per status line. The rest are on lines that are errors, command
+line, setup or a kept input's file write, and those carry `// alloc:` or `// clone:` reasons.
+`fuzz/src/` now has none left.
+
+Asked: treat `fuzz/targets/` as test code, as `tests/` is (826 findings, almost all `vec![..]`
+in the `seeds()` builders and in the targets' checks: re-encodings to compare and models,
+which are the test's own work). The engine's hot path is `fuzz/src/` and is held to the
+budget by a test (below).
+
+> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.
+
+### F5. Whoever owns `crates/blaze-fuzz`: one counting allocator
+
+`blaze-fuzz` installs its own `#[global_allocator]` (largest request per thread), so a test
+binary that links it (every `blaze-fuzzer` test, and the store's fuzz tests) can't also install
+`blaze-alloc-count`'s: two global allocators don't link. `fuzz/src/tests.rs`
+(`a_run_that_keeps_nothing_allocates_nothing`) uses `blaze_fuzz::largest_allocation`, which is 0
+exactly when nothing was allocated. Asked: make `blaze-fuzz` count through `blaze-alloc-count`
+(that crate keeping the largest request per thread too, beside `allocations` and `bytes`), so
+one allocator serves both kinds of test.
+
+> forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.

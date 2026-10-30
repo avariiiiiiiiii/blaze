@@ -15,6 +15,7 @@
 //! sandboxed spawn to a kept result; [`script`] and [`pool`] are build scripts and the warm
 //! processes proc macros run in; [`test`] selects and runs tests (docs/v2/plan/lanes/usercode/notes.md).
 
+#![feature(allocator_api)]
 #![forbid(unsafe_code)]
 
 pub mod confine;
@@ -65,16 +66,11 @@ pub struct RunKey {
 }
 
 impl RunKey {
-    pub const DOMAIN: &'static str = "blaze v2 run traced 2";
+    pub const DOMAIN: &'static str = trace::os_domain!("blaze v2 run traced 2");
 
     /// The store's key of the result: this and the hash of what the run read.
     pub fn traced(&self, traced: &Traced) -> ContentId {
-        if trace::normal(traced) {
-            return trace::Keyer::new(self).traced(traced);
-        }
-        let mut traced = traced.clone();
-        trace::normalize(&mut traced);
-        trace::Keyer::new(self).traced(&traced)
+        trace::Keyer::new(self).traced(traced)
     }
 }
 
@@ -82,7 +78,7 @@ impl RunKey {
 /// variables blaze sets for it (cargo's, for a build script), its standard input and what
 /// else the caller names. The environment the user's shell passes through is not given: what
 /// of it the run reads is traced (#805).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Given {
     kind: RunKind,
     args: Vec<OsString>,
@@ -91,21 +87,27 @@ pub struct Given {
     /// The hash of the standard input: given bytes are hashed once, as they are given, and
     /// never copied.
     stdin: [u8; 32],
-    /// Each part's hash by its name, sorted by name: hashed in order into `RunKey::given`.
-    parts: Vec<(&'static str, [u8; 32])>,
+    /// Each part's hash by its name, sorted by name, in `parts[..len]`: hashed in order into
+    /// `RunKey::given`.
+    parts: [(&'static str, [u8; 32]); Given::PARTS],
+    len: usize,
 }
 
 impl Given {
-    pub const DOMAIN: &'static str = "blaze v2 run given 2";
+    pub const DOMAIN: &'static str = trace::os_domain!("blaze v2 run given 2");
     const PART: &'static str = "blaze v2 run given part 1";
+    /// The most parts a run is given: they are kept inline, so a key is made with no
+    /// allocation.
+    pub const PARTS: usize = 16;
 
     pub fn new(kind: RunKind) -> Given {
         Given {
             kind,
-            args: Vec::new(),
+            args: Vec::new(), // alloc: none, an empty list
             env: BTreeMap::new(),
             stdin: Hasher::new(Given::PART).finish().0,
-            parts: Vec::new(),
+            parts: [("", [0; 32]); Given::PARTS],
+            len: 0,
         }
     }
 
@@ -137,27 +139,37 @@ impl Given {
     /// lent, with no copy. Named twice, the last value is kept. [`Given::sets`] and
     /// [`Given::vars`] don't name them.
     pub fn env_keyed<'a>(&mut self, vars: impl IntoIterator<Item = (&'a [u8], &'a [u8])>) -> &mut Given {
-        let mut vars: Vec<(&[u8], &[u8])> = vars.into_iter().collect();
-        vars.sort_by(|a, b| a.0.cmp(b.0));
-        vars.dedup_by(|later, first| {
-            let same = later.0 == first.0;
-            if same {
-                *first = *later;
+        let hash = blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
+            let mut sorted: Vec<(&[u8], &[u8]), &blaze_mem::Frame> = Vec::new_in(frame);
+            sorted.extend(vars);
+            sorted.sort_by(|a, b| a.0.cmp(b.0));
+            sorted.dedup_by(|later, first| {
+                let same = later.0 == first.0;
+                if same {
+                    *first = *later;
+                }
+                same
+            });
+            let mut hasher = Hasher::new(Given::PART);
+            hasher.update(&(sorted.len() as u64).to_le_bytes());
+            for (name, value) in &sorted {
+                hasher.part(name).part(value);
             }
-            same
+            hasher.finish().0
         });
-        let mut hasher = Hasher::new(Given::PART);
-        hasher.update(&(vars.len() as u64).to_le_bytes());
-        for (name, value) in &vars {
-            hasher.part(name).part(value);
-        }
-        self.hashed("env keyed", hasher.finish().0)
+        self.hashed("env keyed", hash)
     }
 
     fn hashed(&mut self, name: &'static str, hash: [u8; 32]) -> &mut Given {
-        match self.parts.binary_search_by(|it| it.0.cmp(name)) {
+        let len = self.len;
+        match self.parts[..len].binary_search_by(|it| it.0.cmp(name)) {
             Ok(at) => self.parts[at].1 = hash,
-            Err(at) => self.parts.insert(at, (name, hash)),
+            Err(at) => {
+                assert!(len < Given::PARTS, "a run is given at most {} parts; `{name}` is one more", Given::PARTS);
+                self.parts.copy_within(at..len, at + 1);
+                self.parts[at] = (name, hash);
+                self.len = len + 1;
+            }
         }
         self
     }
@@ -171,15 +183,15 @@ impl Given {
         hasher.update(&[self.kind.byte()]);
         hasher.update(&(self.args.len() as u64).to_le_bytes());
         for arg in &self.args {
-            hasher.part(trace::os_bytes(arg));
+            hasher.part(&trace::os_bytes(arg));
         }
         hasher.update(&(self.env.len() as u64).to_le_bytes());
         for (name, value) in &self.env {
-            hasher.part(trace::os_bytes(name)).part(trace::os_bytes(value));
+            hasher.part(&trace::os_bytes(name)).part(&trace::os_bytes(value));
         }
         hasher.update(&self.stdin);
-        hasher.update(&(self.parts.len() as u64).to_le_bytes());
-        for (name, hash) in &self.parts {
+        hasher.update(&(self.len as u64).to_le_bytes());
+        for (name, hash) in &self.parts[..self.len] {
             hasher.part(name.as_bytes()).update(hash);
         }
         hasher.finish()
@@ -196,7 +208,7 @@ impl Given {
 }
 
 /// The functions one test reached, by code hash.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub struct Reached {
     pub test: String,
     pub binary: ContentId,
@@ -266,5 +278,60 @@ mod tests {
         let mut passed = Given::new(RunKind::ProcMacro);
         passed.env_keyed([(b"A".as_slice(), b"1".as_slice())]);
         assert!(!passed.sets(OsStr::new("A")));
+    }
+
+    #[test]
+    fn parts_are_in_name_order_and_the_last_of_a_name_is_kept() {
+        let mut one = Given::new(RunKind::ProcMacro);
+        one.part("b", b"2").part("a", b"0").part("c", b"3").part("a", b"1");
+        let mut two = Given::new(RunKind::ProcMacro);
+        two.part("c", b"3").part("a", b"1").part("b", b"2");
+        assert_eq!(one.finish(), two.finish());
+        two.part("d", b"");
+        assert_ne!(one.finish(), two.finish());
+    }
+
+    /// A proc macro's key, as blaze-expand makes one for each expansion it looks up.
+    fn macro_given() -> Given {
+        let vars = [("CARGO_PKG_NAME", "a"), ("A", "1"), ("CARGO_PKG_NAME", "b")];
+        let mut given = Given::new(RunKind::ProcMacro);
+        given.part("name", b"derive").part("kind", &[0]).part("input", b"tokens").part("dir", b"/w");
+        given.env_keyed(vars.iter().map(|(name, value)| (name.as_bytes(), value.as_bytes())));
+        given
+    }
+
+    #[test]
+    fn a_macros_given_and_its_finish_allocate_nothing() {
+        let warm = macro_given().finish();
+        let again = blaze_alloc_count::assert_at_most(0, "a proc macro's given, made and finished", || {
+            macro_given().finish()
+        });
+        assert_eq!(warm, again);
+        let mut script = Given::new(RunKind::BuildScript);
+        script.arg("build").env("OUT_DIR", "/o").stdin(b"").part("target", b"x86_64");
+        blaze_alloc_count::assert_at_most(0, "a build script's given, finished", || script.finish());
+    }
+
+    #[test]
+    fn a_traced_key_allocates_nothing_normal_or_not() {
+        let normal = Traced {
+            files: vec![(PathBuf::from("/a"), None), (PathBuf::from("/b"), Some([1; 32]))],
+            dirs: vec![(PathBuf::from("/d"), [2; 32])],
+            env: vec![("CC".into(), Some("cc".into()))],
+            untraceable: vec![blaze_core::Untraceable::Clock],
+        };
+        assert!(trace::normal(&normal));
+        let mut unsorted = normal.clone();
+        unsorted.files.reverse();
+        unsorted.files.push(unsorted.files[0].clone());
+        let key = key();
+        let warm = (key.traced(&normal), key.traced(&unsorted));
+        let normal_key =
+            blaze_alloc_count::assert_at_most(0, "the key of a normal Traced", || key.traced(&normal));
+        let unsorted_key = blaze_alloc_count::assert_at_most(0, "the key of a Traced not normal", || {
+            key.traced(&unsorted)
+        });
+        assert_eq!(warm, (normal_key, unsorted_key));
+        assert_eq!(normal_key, unsorted_key);
     }
 }

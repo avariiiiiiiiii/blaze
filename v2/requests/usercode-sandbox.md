@@ -74,6 +74,8 @@
 
 > forwarded to cargo: `crates/blaze-cargo/build.rs` is lane cargo's and has no `linux_interpose` yet.
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/build.rs `fn linux_interpose` (called from `main` after `sandbox_library`), as given; `CC`'s rerun line is `sandbox_library`'s already.
+
 ## 3. `windows-sys` features (from child `usercode-sandbox-windows`)
 
 - The Windows launcher needs features beyond those already on the `windows-sys` line in
@@ -81,6 +83,8 @@
   exact feature list to `v2/requests/usercode-sandbox-windows.md`; apply that too.
 
 > forwarded to cargo: as `v2/requests/usercode-sandbox-windows.md` item 1.
+
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/Cargo.toml:160 (see usercode-sandbox-windows.md item 1).
 
 ## 4. Status (second agent of `usercode-sandbox`, 2026-10-29)
 
@@ -94,6 +98,8 @@ same file, which now also calls only libSystem (`CCRandomGenerateBytes` is libco
 re-exported by libSystem).
 
 > forwarded to cargo: requests 2 and 3 are `crates/blaze-cargo/build.rs` and `crates/blaze-cargo/Cargo.toml`'s `windows-sys` features, lane cargo's own; the root now has a `windows-sys` 0.61.2 entry (core-windows 1) if blaze-cargo moves to `workspace = true`.
+
+> answered by lane cargo (cargo-inbox): done: both, at crates/blaze-cargo/build.rs `linux_interpose` and Cargo.toml:160 (now `workspace = true`).
 
 ## 5. Lane notes: the technique of the sandbox's tracing (for `docs/v2/plan/lanes/usercode/notes.md`)
 

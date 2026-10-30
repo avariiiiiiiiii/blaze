@@ -247,6 +247,8 @@ pub(crate) fn emit(
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
     let mut emitted = emitted(unit, &function, &code, &pending.wants.requests, refs)?;
+    // What the IR built in (MIR-inlined, `#[inline(always)]` of no member) is the code's too.
+    inlined.extend_from_slice(&function.inlined);
     inlined.sort_unstable();
     inlined.dedup();
     emitted.function.inlined = inlined;
@@ -273,7 +275,8 @@ fn emitted(
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
     let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
-    let side = super::side::encode(&function.variables, &code.slots).map_err(|e| failed(unit, e))?;
+    let side = super::side::of(&function.variables, &function.scopes, code)
+        .map_err(|e| failed(unit, e))?;
     let (converted, extra) = super::places::resolve_owning(&function.places, refs, |resolve| {
         super::convert::function(
             unit.instance.key(),
@@ -693,6 +696,7 @@ mod tests {
             panic: blaze_codegen::settings::Panic::Unwind,
             debuginfo: DebugInfo::None,
             fold: false,
+            mir_inline: false,
             policy: ContentId::default(),
             sanitize: blaze_codegen::settings::Sanitize::default(),
         };

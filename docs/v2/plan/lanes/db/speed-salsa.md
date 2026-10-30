@@ -85,7 +85,7 @@ level, so readers never wait: this meets concurrency.md.
 
 | operation | before | after | rustc |
 |---|---|---|---|
-| memo hit | the seven lines above; a function with `lru` takes the LRU `Mutex` and inserts on every hit; a multi-argument function interns its tuple under a shard `Mutex` | six lines, five deep (bucket, page, then slot and column in parallel, row page, memo; the page keeps its column slice and a column's type check and row page pointer share a line), with no lock and no shared write: `lru` marks nothing on a hit (S1) and interning a tuple is a lock-free probe (S2). The bound is 2 lines; [speed-of-light.md](speed-of-light.md) names the change | 1 to 2 loads |
+| memo hit | the seven lines above; a function with `lru` takes the LRU `Mutex` and inserts on every hit; a multi-argument function interns its tuple under a shard `Mutex` | five lines, four deep (bucket, page, then slot and column in parallel, row pointer at a computed address, memo; the page keeps its column slice, and the columns are blaze-mem regions), with no lock and no shared write: `lru` marks nothing on a hit (S1) and interning a tuple is a lock-free probe (S2). The bound is 2 lines; [speed-of-light.md](speed-of-light.md) names the change | 1 to 2 loads |
 | recording a read | FxHash and an `FxIndexSet` probe per read | a read of the same key as the last one is skipped before hashing (S4); the rest as before, in the task's own frame | a push, deduplicated by a scan |
 | edge record (query finishes) | one heap allocation per memo, 8 bytes an edge copied in | per edge, a probe of the task's 1024-entry node cache (L1 on a repeat key, the shared node table's lock-free probe otherwise) and one `Relaxed` store into the task's reserved chunk; one CAS per 256 edges; no allocation; published by the memo's own `Release` store | an `EdgesVec` moved into the graph |
 | deep verify | a claim per memo walked (a shard `Mutex` plus a `hashbrown` insert and remove), then a `dyn Ingredient` call per edge | no claim for a memo that ran no cycle, has no outputs and isn't provisional: an iterative walk, per edge one decode (the node's key: one page load and two column loads) then the hit check; a claim only for a memo that must run | one color load per edge, no lock |
@@ -129,15 +129,16 @@ a slot's memo table is one 4-byte row number:
 | piece | where | bytes | written by, when |
 |---|---|---|---|
 | row number (`MemoTable { row: u32 }`) | in the slot; handed out by the struct ingredient's `MemoTableTypes::next_row` when the slot is made, kept when the slot is reused | 4 per slot, folded into padding in all three struct kinds | once, at slot creation |
-| row pointer | the function's `Column`: row pages of 1024, 2048, ... `AtomicPtr`s (23 pages cover every `u32` row), made from zeroed memory on the column's first memo in that range | 8 per row in a page the column has a memo in | the publisher, one `AcqRel` swap per publish; clearing a slot swaps in null |
-| memo: `Memo<C>`, the 24-byte header and the value | the column's typed slab: pages of 64, 128, 256, ... memos that never move (40 pages) | 24 + the value | written once by the thread that took the slot, before the swap publishes it; after that only the header's atomics change, and the value only through `&mut` (eviction) |
+| row pointer | the function's `Column`: a blaze-mem `Region` (`Tag::Query`) reserving 8 bytes for each of 2^28 rows, row `r` at `8r`, committed (kernel-zeroed) as far as the highest row with a memo, at least 64 KB at a time | 8 per row up to the highest with a memo; untouched committed pages are not resident | the publisher, one `AcqRel` swap per publish; clearing a slot swaps in null |
+| memo: `Memo<C>`, the 24-byte header and the value | the column's slab, a second `Region`: slot `i` at `size * i`, never moved, up to 2^24 memos (or 16 GB of address space) per column, a panic naming the type past it | 24 + the value | written once by the thread that took the slot, before the swap publishes it; after that only the header's atomics change, and the value only through `&mut` (eviction) |
 
 - **Publish** (`MemoTableWithTypes::insert`): take a slab slot (the free list by one
   `fetch_add`, else the bump counter), write the memo there, swap the row pointer to it. The
   release half publishes the memo (and its edges, recorded before); the old memo, if any, goes on
   the column's retired list. A value is never written in place on a shared memo.
-- **Read** (`get`): the column (a type check against `TypeId`), the row page (`OnceLock`), the
-  row pointer (acquire), the memo. Loads only, no write to shared memory.
+- **Read** (`get`): the column (a type check against `TypeId` and the rows' committed length,
+  on one line), the row pointer at a computed address (acquire), the memo. Loads only, no write
+  to shared memory.
 - **Reclaim** (`Zalsa::reclaim_memos`, in `new_revision` and at the end of `evict_values`, both
   `&mut Zalsa`): `&'db` references into memos last the whole revision, so the revision boundary
   is the quiescent point. Each column drops its retired memos in place and puts their slots on the
@@ -261,6 +262,21 @@ cold fingerprints to `Edge::saw`.
   iterative (an explicit stack, eight frames inline), so a chain of any depth is verified in one
   pass with no recursion. `tests/unclaimed_verify.rs` covers a 300-deep chain, backdating, and
   eight threads verifying one chain at once.
+
+- **Tracked functions over a concrete database** (salsa's step of frontend/db.md's migration):
+  `#[salsa::tracked]` takes `db: &Db` for a `#[salsa::db]` struct `Db` as well as
+  `db: &dyn Trait`. The macro hands `setup_tracked_fn!` the database type (`DbView: dyn Trait`
+  or `DbView: Db`) and the function that registers its downcaster
+  (`Trait::zalsa_register_downcaster`, or `ConcreteView::zalsa_register_concrete_downcaster`,
+  which `#[salsa::db]` on the struct implements as the identity view, and `DatabaseImpl` by
+  hand). `Database::task_depth(&self) -> u32` is a provided method (0: one task per thread)
+  that `attach` and `zalsa_local` read, so a concrete database that overrides it (base-db's
+  `Db`) has no indirect call on a hit. It is the only source of the depth: each `ZalsaLocal`
+  records its `TaskId` when `TaskLocals` makes it for a depth, and claims, blocking and lock
+  transfers take the task from it (`zalsa_local.task()`), so the `set_task_depth` hook is gone.
+  `tests/task_sync.rs` pumps tasks through the override. `tests/concrete_db.rs` covers
+  memoizing, interned arguments, LRU, `evict_values`, `&Db` and `&dyn Database` functions on
+  one storage, `DatabaseImpl`, and the hit reading `task_depth`.
 
 ### Kept
 

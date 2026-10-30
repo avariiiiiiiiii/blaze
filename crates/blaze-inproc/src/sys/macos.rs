@@ -12,7 +12,12 @@
 //! code signing (`CS_ENFORCEMENT`, which the hardened runtime sets unless the binary has
 //! `com.apple.security.cs.allow-unsigned-executable-memory`), else `vm_fault` kills it at the
 //! first such page it runs. `allow-jit` does not help: `MAP_JIT` is for anonymous memory of the
-//! process's own. [`Granted::map`] checks before it maps code and says so.
+//! process's own. The executable is signed ad hoc by the linker, without the hardened runtime;
+//! [`overlay`] checks before it maps code and says so.
+//!
+//! The start hook lays an overlay over its executable with one `mach_vm_map` of
+//! `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`, which replaces dyld's mapping of those pages in one
+//! step of the task's map lock.
 //!
 //! The ports go by the daemon's rendezvous service ([`rendezvous`]), since a Unix socket can't
 //! carry them.
@@ -21,25 +26,26 @@ mod rendezvous;
 #[cfg(test)]
 mod tests;
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ops::Range;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::{Mutex, OnceLock, PoisonError};
 
-pub(crate) use super::unix::{Listener, Stream, backtrace, connect, protect, random, serialize};
+pub(crate) use super::unix::{Listener, Stream, backtrace, connect, random, serialize};
 pub(crate) use rendezvous::{Remote, recv_objects, send_objects};
 use crate::channel::Channel;
+use crate::handshake::Overlay;
 use crate::{Access, Error};
 
 type Port = u32;
 type Kern = c_int;
 
 const KERN_SUCCESS: Kern = 0;
-const KERN_NO_SPACE: Kern = 3;
 const MACH_PORT_NULL: Port = 0;
 const MACH_PORT_RIGHT_SEND: u32 = 0;
 
-const VM_PROT_NONE: c_int = 0;
 const VM_PROT_READ: c_int = 1;
 const VM_PROT_WRITE: c_int = 2;
 const VM_PROT_EXECUTE: c_int = 4;
@@ -91,6 +97,8 @@ unsafe extern "C" {
     /// (`dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`).
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     fn csops(pid: c_int, ops: u32, out: *mut c_void, size: usize) -> c_int;
+    /// dyld's: the Mach header of the main executable, where dyld mapped it.
+    fn _NSGetMachExecuteHeader() -> *const c_void;
 }
 
 fn task() -> Port {
@@ -224,8 +232,8 @@ impl Object {
     }
 }
 
-/// Maps `len` bytes from `offset` of the entry `port` anywhere, or at `at`: inside a
-/// reservation of [`reserve`] over its no-access pages, elsewhere only where nothing is.
+/// Maps `len` bytes from `offset` of the entry `port` anywhere, or over what is at `at`
+/// (an overlay, which [`overlay`]'s caller proved may go there).
 fn map_entry(
     port: Port,
     offset: u64,
@@ -240,16 +248,11 @@ fn map_entry(
         return Err(Error::new(format!("a map of {len:#x} bytes at offset {offset:#x}: not whole pages of {page:#x}")));
     }
     let len = len.next_multiple_of(page);
-    let flags = match at {
-        None => VM_FLAGS_ANYWHERE,
-        Some(at) if within_reservation(at, len) => VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
-        Some(_) => VM_FLAGS_FIXED,
-    };
+    let flags = if at.is_some() { VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE } else { VM_FLAGS_ANYWHERE };
     let mut address = at.unwrap_or(0);
     // SAFETY: `port` is this process's send right to an entry; `address` is a live in-out
-    // pointer. A fixed address is either inside a reservation of this process's own, whose
-    // pages hold nothing yet (VM_FLAGS_OVERWRITE replaces only them), or taken without
-    // VM_FLAGS_OVERWRITE, which fails rather than replace anything.
+    // pointer. With no address the kernel picks free space; a fixed one is an overlay, which
+    // replaces only pages its caller proved it may (`overlay`).
     let code = unsafe {
         mach_vm_map(task(), &raw mut address, len, 0, flags, port, offset, c_int::from(copy), protection, protection, inheritance)
     };
@@ -355,59 +358,6 @@ impl View {
     }
 }
 
-/// Address space reserved by `reserve`: a fixed map inside it replaces what is there (nothing
-/// yet), one outside must find the space free. Written by the loader alone, before the
-/// program runs; the lock is never held across a call.
-static RESERVED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-
-fn within_reservation(at: u64, len: u64) -> bool {
-    let end = at.saturating_add(len);
-    RESERVED
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .any(|&(start, until)| at >= start && end <= until)
-}
-
-/// Anonymous memory of no access, which `protect` may make readable and writable (a
-/// segment's zero pages) and `Granted::map` replaces; never executable.
-pub(crate) fn reserve(_: &mut Channel, len: u64, at: Option<u64>) -> Result<u64, Error> {
-    let len = len.next_multiple_of(page());
-    if len == 0 || at.is_some_and(|it| !it.is_multiple_of(page())) {
-        return Err(Error::new(format!("a reservation of {len:#x} bytes at {at:#x?}")));
-    }
-    let mut address = at.unwrap_or(0);
-    let flags = if at.is_some() { VM_FLAGS_FIXED } else { VM_FLAGS_ANYWHERE };
-    // SAFETY: anonymous memory (no entry) with no access, where the kernel picks or at `at`
-    // only if nothing is there (no VM_FLAGS_OVERWRITE); `address` is a live in-out pointer.
-    let code = unsafe {
-        mach_vm_map(
-            task(),
-            &raw mut address,
-            len,
-            0,
-            flags,
-            MACH_PORT_NULL,
-            0,
-            0,
-            VM_PROT_NONE,
-            VM_PROT_READ | VM_PROT_WRITE,
-            VM_INHERIT_COPY,
-        )
-    };
-    if let (Some(at), KERN_NO_SPACE) = (at, code) {
-        return Err(Error::new(format!(
-            "{len:#x} bytes of address space at {at:#x} are taken in this process, where the code memory has to be"
-        )));
-    }
-    if code != KERN_SUCCESS {
-        let place = at.map(|it| format!(" at {it:#x}")).unwrap_or_default();
-        return Err(kern(&format!("reserving {len:#x} bytes of address space{place}"), code));
-    }
-    RESERVED.lock().unwrap_or_else(PoisonError::into_inner).push((address, address + len));
-    Ok(address)
-}
-
 /// Whether this process may run pages with no code signature: it must not enforce code
 /// signing on its whole map. Asked once.
 fn check_unsigned_code() -> Result<(), Error> {
@@ -427,14 +377,15 @@ fn check_unsigned_code() -> Result<(), Error> {
             let runtime = if flags & CS_RUNTIME != 0 { ", the hardened runtime" } else { "" };
             Err(Error::new(format!(
                 "this process enforces code signing (code-signing flags {flags:#x}{runtime}), and the code memory's \
-                 pages carry no signature: the kernel would kill it at the first one it ran. Sign blaze's loader \
-                 without the hardened runtime, or with com.apple.security.cs.allow-unsigned-executable-memory"
+                 pages carry no signature: the kernel would kill it at the first one it ran. The dev executable \
+                 must be signed ad hoc without the hardened runtime, or with \
+                 com.apple.security.cs.allow-unsigned-executable-memory"
             )))
         })
         .clone()
 }
 
-/// A send right to an entry the daemon gave this loader.
+/// A send right to an entry the daemon gave this start hook.
 pub(crate) struct Granted {
     port: Port,
     len: u64,
@@ -453,46 +404,54 @@ impl Granted {
         self.len
     }
 
+    /// The whole object anywhere, for the rest of the process: the control words. Never code,
+    /// which runs only where an overlay puts it.
+    pub(crate) fn map_anywhere(&self, _: &mut Channel, access: Access) -> Result<u64, Error> {
+        let protection = match access {
+            Access::Read => VM_PROT_READ,
+            Access::Shared => VM_PROT_READ | VM_PROT_WRITE,
+            other => return Err(Error::new(format!("a whole granted object mapped anywhere as {other:?}"))),
+        };
+        map_entry(self.port, 0, self.len, None, protection, false, VM_INHERIT_SHARE)
+    }
+
     /// `Access::Copy` is a copy of the pages as they are now, in anonymous memory: an entry
     /// that carries no write right can't be mapped writable even privately, and the kernel
     /// copies an object of this kind at once anyway (`MEMORY_OBJECT_COPY_NONE`).
-    pub(crate) fn map(&self, _: &mut Channel, offset: u64, len: u64, at: u64, access: Access) -> Result<u64, Error> {
-        let page = page();
-        let rounded = len.next_multiple_of(page);
+    fn overlay(&self, offset: u64, len: u64, at: u64, access: Access) -> Result<(), Error> {
+        let rounded = len.next_multiple_of(page());
         if offset.checked_add(rounded).is_none_or(|end| end > self.len) {
-            return Err(Error::new(format!("a map of {len:#x} bytes at offset {offset:#x} of an object of {:#x}", self.len)));
+            return Err(Error::new(format!("an overlay of {len:#x} bytes at offset {offset:#x} of an object of {:#x}", self.len)));
         }
-        match access {
+        let protection = match access {
             Access::Execute => {
                 check_unsigned_code()?;
-                map_entry(self.port, offset, rounded, Some(at), VM_PROT_READ | VM_PROT_EXECUTE, false, VM_INHERIT_SHARE)
+                VM_PROT_READ | VM_PROT_EXECUTE
             }
-            Access::Read => map_entry(self.port, offset, rounded, Some(at), VM_PROT_READ, false, VM_INHERIT_SHARE),
-            Access::Shared => {
-                map_entry(self.port, offset, rounded, Some(at), VM_PROT_READ | VM_PROT_WRITE, false, VM_INHERIT_SHARE)
-            }
-            Access::Copy => self.copy(offset, rounded, at),
-        }
+            Access::Read => VM_PROT_READ,
+            Access::Shared => VM_PROT_READ | VM_PROT_WRITE,
+            Access::Copy => return self.copy(offset, rounded, at),
+        };
+        map_entry(self.port, offset, rounded, Some(at), protection, false, VM_INHERIT_SHARE).map(drop)
     }
 
-    fn copy(&self, offset: u64, len: u64, at: u64) -> Result<u64, Error> {
+    fn copy(&self, offset: u64, len: u64, at: u64) -> Result<(), Error> {
         if !at.is_multiple_of(page()) || len == 0 {
             return Err(Error::new(format!("a copy of {len:#x} bytes to {at:#x}: not whole pages")));
         }
         let source = map_entry(self.port, offset, len, None, VM_PROT_READ, false, VM_INHERIT_NONE)?;
         let source = View::adopt(source, len, false)?;
-        let flags = if within_reservation(at, len) { VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE } else { VM_FLAGS_FIXED };
         let mut address = at;
-        // SAFETY: anonymous readable and writable memory at `at`: inside a reservation of this
-        // process's own over its no-access pages, else only where nothing is (no
-        // VM_FLAGS_OVERWRITE); `address` is a live in-out pointer.
+        // SAFETY: anonymous readable and writable memory over `at..at + len`, which `overlay`'s
+        // caller proved is inside a reservation of this executable, holding nothing;
+        // `address` is a live in-out pointer.
         let code = unsafe {
             mach_vm_map(
                 task(),
                 &raw mut address,
                 len,
                 0,
-                flags,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
                 MACH_PORT_NULL,
                 0,
                 0,
@@ -502,30 +461,67 @@ impl Granted {
             )
         };
         if code != KERN_SUCCESS {
-            return Err(kern(&format!("mach_vm_map of {len:#x} bytes of private memory to {at:#x}"), code));
-        }
-        if address != at {
-            // SAFETY: the mapping just made, which nothing uses.
-            unsafe { mach_vm_deallocate(task(), address, len) };
-            return Err(Error::new(format!("{at:#x} is taken: the kernel mapped {len:#x} bytes at {address:#x} instead")));
+            return Err(kern(&format!("mach_vm_map of {len:#x} bytes of private memory over {at:#x}"), code));
         }
         let bytes = source.bytes(0..source.len())?;
         // SAFETY: `at..at + len` is the writable memory just mapped, which nothing else refers
         // to yet; `bytes` is the read-only view of the same length, a different mapping.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len()) };
-        Ok(at)
-    }
-
-    pub(crate) fn view(&self, _: &mut Channel) -> Result<View, Error> {
-        let at = map_entry(self.port, 0, self.len, None, VM_PROT_READ, false, VM_INHERIT_NONE)?;
-        View::adopt(at, self.len, false)
+        Ok(())
     }
 }
 
-/// A loader's grant of `object` with `rights`, made in this process as the daemon makes it.
+/// A start hook's grant of `object` with `rights`, made in this process as the daemon makes it.
 #[cfg(test)]
 pub(crate) fn granted(object: &Object, rights: super::Rights) -> Result<Granted, Error> {
     Ok(Granted { port: object.entry(rendezvous::protection(rights))?, len: object.len })
+}
+
+pub(crate) fn overlay(_: &mut Channel, objects: &[Granted], overlays: &[Overlay], slide: u64) -> Result<(), Error> {
+    for overlay in overlays {
+        let object = objects
+            .get(overlay.object as usize)
+            .ok_or_else(|| Error::new(format!("an overlay of object {} of {}", overlay.object, objects.len())))?;
+        object.overlay(overlay.offset, overlay.len, overlay.at.wrapping_add(slide), overlay.access)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn own_image() -> Result<(u64, &'static [u8]), Error> {
+    // SAFETY: no preconditions; dyld set it before any initializer runs.
+    let header = unsafe { _NSGetMachExecuteHeader() } as u64;
+    if header == 0 || !header.is_multiple_of(page()) {
+        return Err(Error::new(format!("dyld names the executable's header at {header:#x}")));
+    }
+    // SAFETY: the Mach header and load commands of the main executable are in its first page
+    // and the rest of `__TEXT` from file offset 0, which dyld mapped readable for the life of
+    // the process; 32 bytes of header are inside the first page.
+    let prefix = unsafe { std::slice::from_raw_parts(header as *const u8, 32) };
+    let len = crate::image::headers_len(crate::Format::MachO, prefix)
+        .ok_or_else(|| Error::new("the executable's Mach header is not one"))?;
+    // `__TEXT` is the segment of file offset 0 the header is in; its length is in the header,
+    // which `image::layout` reads next: here only the load commands must stay in a sane bound.
+    if len > 1 << 20 {
+        return Err(Error::new(format!("the executable's load commands are {len:#x} bytes")));
+    }
+    // SAFETY: the load commands follow the header inside `__TEXT` (ld64 and blaze's linker put
+    // them there, and dyld refuses an executable whose commands are not in its first segment),
+    // mapped as above.
+    Ok((header, unsafe { std::slice::from_raw_parts(header as *const u8, len as usize) }))
+}
+
+pub(crate) fn clone_file(from: &Path, to: &Path) -> Result<bool, Error> {
+    let path = |it: &Path| CString::new(it.as_os_str().as_bytes()).map_err(|_| Error::new(format!("{} has a NUL", it.display())));
+    let (source, target) = (path(from)?, path(to)?);
+    // SAFETY: both are NUL-terminated paths live for the call; clonefile makes `target` new.
+    if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOTSUP | libc::EXDEV) => Ok(false),
+        _ => Err(Error::new(format!("cloning {} to {}: {error}", from.display(), to.display()))),
+    }
 }
 
 pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {

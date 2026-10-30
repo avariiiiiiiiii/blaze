@@ -386,9 +386,9 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads.min(files.len()))
             .map(|part| {
-                let (db, functions) = (db.clone(), &functions);
+                let functions = &functions;
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
+                    hir::attach_db(db, || {
                         let files = files.iter().zip(functions).enumerate();
                         files
                             .skip(part)
@@ -402,7 +402,7 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
                                     }
                                     return (at, None);
                                 };
-                                (at, outline(&db, file, functions))
+                                (at, outline(db, file, functions))
                             })
                             .collect::<Vec<_>>()
                     })

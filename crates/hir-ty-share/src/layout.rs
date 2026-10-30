@@ -5,11 +5,12 @@
 
 use std::hash::Hash;
 
+use blaze_ids::Hasher;
 use hir_ty::layout::Layout;
 use rustc_abi::LayoutData;
 
-/// Appends what `layout` is to `out`.
-pub(crate) fn write(layout: &Layout, out: &mut Vec<u8>) {
+/// Hashes what `layout` is into `out`.
+pub(crate) fn write(layout: &Layout, out: &mut Hasher) {
     let LayoutData {
         fields,
         variants,
@@ -36,10 +37,10 @@ pub(crate) fn write(layout: &Layout, out: &mut Vec<u8>) {
     repr_c.hash(&mut feed);
 }
 
-/// What a derived `Hash` writes, as bytes, every integer little-endian and every `usize` and
+/// What a derived `Hash` writes, as bytes hashed into a [`Hasher`], every integer little-endian and every `usize` and
 /// `isize` 8 bytes: the same on every host. A derived `Hash` writes its enum discriminants and
 /// fields in declaration order, which the vendored `rustc_abi` fixes.
-pub(crate) struct Feed<'a>(pub(crate) &'a mut Vec<u8>);
+pub(crate) struct Feed<'a>(pub(crate) &'a mut Hasher);
 
 impl std::hash::Hasher for Feed<'_> {
     fn finish(&self) -> u64 {
@@ -47,54 +48,54 @@ impl std::hash::Hasher for Feed<'_> {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        self.0.extend_from_slice(bytes);
+        self.0.update(bytes);
     }
 
     fn write_u8(&mut self, value: u8) {
-        self.0.push(value);
+        self.0.update(&[value]);
     }
 
     fn write_u16(&mut self, value: u16) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_u32(&mut self, value: u32) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_u64(&mut self, value: u64) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_u128(&mut self, value: u128) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_usize(&mut self, value: usize) {
-        self.0.extend_from_slice(&(value as u64).to_le_bytes());
+        self.0.update(&(value as u64).to_le_bytes());
     }
 
     fn write_i8(&mut self, value: i8) {
-        self.0.push(value as u8);
+        self.0.update(&[value as u8]);
     }
 
     fn write_i16(&mut self, value: i16) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_i32(&mut self, value: i32) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_i64(&mut self, value: i64) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_i128(&mut self, value: i128) {
-        self.0.extend_from_slice(&value.to_le_bytes());
+        self.0.update(&value.to_le_bytes());
     }
 
     fn write_isize(&mut self, value: isize) {
-        self.0.extend_from_slice(&(value as i64).to_le_bytes());
+        self.0.update(&(value as i64).to_le_bytes());
     }
 }

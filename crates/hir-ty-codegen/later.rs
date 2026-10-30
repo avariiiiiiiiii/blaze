@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use base_db::Db;
 use super::*;
 
 /// What a function put in the object is.
@@ -68,7 +69,7 @@ pub(super) struct Made {
 
 /// What a [`Later`] is made with: what of the object it reads, and its own names.
 pub(super) struct Keeper<'k, 'db> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) symbols: &'k dyn SymbolResolver,
     pub(super) names: &'k stable::StableNames<'k, 'db>,
     pub(super) stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,

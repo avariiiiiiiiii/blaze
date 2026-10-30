@@ -570,28 +570,38 @@ impl InitFlow {
         let locals = body.locals.len();
         let mut uninit = GenKill::new(blocks, paths);
         let mut ever = GenKill::new(blocks, locals);
-        // A call's return: what its destination being initialized does on that edge only.
-        let mut returned_uninit = GenKill::new(blocks, paths);
-        let mut returned_ever = GenKill::new(blocks, locals);
-        let mut returns_to: Vec<Option<BasicBlockId>> = vec![None; blocks];
+        // A call's return: what its destination being initialized does on that edge only, a
+        // row per reachable call rather than per block.
+        let returning = |block: BasicBlockId| match body.basic_blocks[block].terminator.as_ref() {
+            Some(it) => match it.kind {
+                TerminatorKind::Call { target: Some(target), .. } => Some(target),
+                _ => None,
+            },
+            None => None,
+        };
+        let calls = cfg.order.iter().filter(|&&block| returning(block).is_some()).count();
+        let mut returned_uninit = GenKill::new(calls, paths);
+        let mut returned_ever = GenKill::new(calls, locals);
+        // Per block, the block its call returns to and the call's row.
+        let mut returns_to: Vec<Option<(BasicBlockId, usize)>> = vec![None; blocks];
+        let mut call = 0;
         for &block in &cfg.order {
             let data = &body.basic_blocks[block];
             let (mut uninit, mut ever) = (uninit.row(index(block)), ever.row(index(block)));
             for statement in 0..=data.statements.len() {
                 apply(body, moves, cfg, Location { block, statement }, &mut uninit, &mut ever);
             }
-            if let Some(TerminatorKind::Call { target: Some(target), .. }) =
-                data.terminator.as_ref().map(|it| &it.kind)
-            {
-                returns_to[index(block)] = Some(*target);
+            if let Some(target) = returning(block) {
+                returns_to[index(block)] = Some((target, call));
                 let location = Location { block, statement: data.statements.len() };
                 call_returned(
                     moves,
                     cfg,
                     location,
-                    &mut returned_uninit.row(index(block)),
-                    &mut returned_ever.row(index(block)),
+                    &mut returned_uninit.row(call),
+                    &mut returned_ever.row(call),
                 );
+                call += 1;
             }
         }
         let mut uninit_start = BitSet::filled(paths);
@@ -608,14 +618,18 @@ impl InitFlow {
         };
         let uninit_entry =
             forward(cfg, &uninit, body.start_block, &uninit_start, |from, to, state| {
-                if returns_to[index(from)] == Some(to) {
-                    returned_uninit.apply(index(from), state);
+                if let Some((target, call)) = returns_to[index(from)]
+                    && target == to
+                {
+                    returned_uninit.apply(call, state);
                 }
                 ends(from, state);
             });
         let ever_entry = forward(cfg, &ever, body.start_block, &ever_start, |from, to, state| {
-            if returns_to[index(from)] == Some(to) {
-                returned_ever.apply(index(from), state);
+            if let Some((target, call)) = returns_to[index(from)]
+                && target == to
+            {
+                returned_ever.apply(call, state);
             }
             ends(from, state);
         });

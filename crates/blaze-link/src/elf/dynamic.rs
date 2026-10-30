@@ -7,10 +7,10 @@ use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
-use gimli::UnwindSection;
 use object::elf;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
@@ -620,7 +620,6 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
     let other_cells = placed.binds.len() + 2 * placed.got.len();
     let mut relative = Vec::with_capacity(placed.rebase.len() + other_cells);
     relative.resize(placed.rebase.len(), Rela::default());
-    // alloc: once per image, one result per chunk of slid addresses
     let results: Vec<Result<(), LinkError>> = relative
         .par_chunks_mut(CHUNK)
         .zip(placed.rebase.par_chunks(CHUNK))
@@ -637,7 +636,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
             }
             Ok(())
         })
-        .collect();
+        .collect(); // alloc: once per image, one result per chunk of slid addresses
     first_error(results)?;
     sort_rela(&mut relative);
     let count = relative.len();
@@ -742,41 +741,27 @@ fn rel32(to: u64, from: u64, what: &str) -> Result<u32, LinkError> {
 /// functions' and the native objects'), sorted by the address each covers. Encodings as
 /// lld writes them: `pcrel|sdata4` to `.eh_frame`, a `udata4` count, `datarel|sdata4` pairs.
 ///
-/// One pass over the section: each CIE is parsed once, where the walk meets it, and its FDEs
-/// take it from there rather than parsing it again each.
+/// One pass over the records' headers ([`fdes`]), in parallel pieces split where the core
+/// placed the functions' FDEs.
 fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     let hdr = placed
         .region(&Class::Synthetic(EH_FRAME_HDR))
         .map(|(_, it)| it.addr)
         .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?; // alloc: error path
-    let mut table = Vec::with_capacity(placed.functions.len());
     let eh_frame = placed.region(&Class::EhFrame);
-    if let Some((index, region)) = eh_frame {
-        let mut section = gimli::EhFrame::new(placed.bytes(index), gimli::LittleEndian);
-        section.set_address_size(8);
-        let bases = gimli::BaseAddresses::default().set_eh_frame(region.addr);
-        let mut entries = section.entries(&bases);
-        let bad = |it: gimli::Error| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)); // alloc: error path
-        let mut cies = FxHashMap::default();
-        while let Some(entry) = entries.next().map_err(bad)? {
-            match entry {
-                gimli::CieOrFde::Cie(cie) => {
-                    cies.insert(cie.offset(), cie);
-                }
-                gimli::CieOrFde::Fde(partial) => {
-                    let fde = partial
-                        .parse(|section, bases, offset| match cies.get(&offset.0) {
-                            // clone: a gimli CIE is plain data borrowing the section, no heap; `parse` takes it by value
-                            Some(cie) => Ok(cie.clone()),
-                            None => section.cie_from_offset(bases, offset),
-                        })
-                        .map_err(bad)?;
-                    table.push((fde.initial_address(), region.addr + fde.offset() as u64));
-                }
-            }
+    let mut table = match eh_frame {
+        Some((index, region)) => {
+            let bytes = placed.bytes(index);
+            let starts = crate::unwind::fde_splits(placed, region.addr, bytes.len(), CHUNK);
+            // alloc: error path
+            fdes(bytes, region.addr, &starts).map_err(|it| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)))?
         }
+        // alloc: empty, which allocates nothing
+        None => Vec::new(),
+    };
+    if !table.is_sorted() {
+        radix::sort_copy_by_key(&mut table, |&(pc, fde): &(u64, u64)| radix::pack_64(pc, fde));
     }
-    radix::sort_copy_by_key(&mut table, |&(pc, fde): &(u64, u64)| radix::pack_64(pc, fde));
     let mut bytes = Vec::with_capacity(12 + 8 * table.len());
     bytes.u8(1);
     bytes.u8(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
@@ -785,9 +770,571 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
     let eh_frame_addr = eh_frame.map_or(hdr + 4, |(_, it)| it.addr);
     bytes.u32(rel32(eh_frame_addr, hdr + 4, ".eh_frame from .eh_frame_hdr")?);
     bytes.u32(u32::try_from(table.len()).map_err(|_| error("more FDEs than .eh_frame_hdr counts".into()))?);
-    for (pc, fde) in table {
-        bytes.u32(rel32(pc, hdr, "a function from .eh_frame_hdr")?);
-        bytes.u32(rel32(fde, hdr, "an FDE from .eh_frame_hdr")?);
-    }
+    bytes.resize(12 + 8 * table.len(), 0);
+    let results: Vec<Result<(), LinkError>> = bytes[12..]
+        .par_chunks_mut(8 * CHUNK)
+        .zip(table.par_chunks(CHUNK))
+        .map(|(out, chunk)| {
+            for (out, &(pc, fde)) in out.chunks_exact_mut(8).zip(chunk) {
+                out[..4].copy_from_slice(&rel32(pc, hdr, "a function from .eh_frame_hdr")?.to_le_bytes());
+                out[4..].copy_from_slice(&rel32(fde, hdr, "an FDE from .eh_frame_hdr")?.to_le_bytes());
+            }
+            Ok(())
+        })
+        .collect(); // alloc: once per image, one result per chunk of FDEs
+    first_error(results)?;
     Ok(bytes)
+}
+
+const DW_EH_PE_OMIT: u8 = 0xff;
+const DW_EH_PE_PCREL: u8 = 0x10;
+
+/// How a walk over a piece of `.eh_frame` ended.
+enum Stop {
+    /// At the piece's end, exactly.
+    End,
+    /// At a zero length: the section ends here, whatever follows.
+    Terminator,
+}
+
+/// Every FDE of `.eh_frame` (`bytes`, at address `section`) as (the address it covers from,
+/// the address of the FDE), in section order, as gimli reads them: CIE versions 1, 3 and 4;
+/// the `z`, `L`, `P`, `R` and `S` augmentations; `pc_begin` in the CIE's FDE pointer encoding,
+/// absolute or relative to where it is, indirection ignored; the walk ending at a zero length.
+/// Of an FDE only the length, CIE pointer, `pc_begin` and `pc_range` are read, of a CIE only
+/// what leads to its pointer encoding; nothing else is checked, so a record malformed past
+/// those fields is read where gimli refused it.
+///
+/// The section is walked in pieces from 0 and from each of `splits` (record starts, sorted),
+/// in parallel; each piece must end exactly where the next starts. The answer is the one
+/// walk from 0 gives, its first error included, on any number of cores.
+fn fdes(bytes: &[u8], section: u64, splits: &[usize]) -> Result<Vec<(u64, u64)>, String> {
+    if splits.is_empty() {
+        // alloc: once per image, the table: compilers' FDEs take 32 bytes or so, so it grows
+        // at most a few times
+        let mut table = Vec::with_capacity(bytes.len() / 32);
+        walk(bytes, section, 0, bytes.len(), &mut table)?;
+        return Ok(table);
+    }
+    let piece = |nth: usize| {
+        let start = if nth == 0 { 0 } else { splits[nth - 1] };
+        let end = splits.get(nth).copied().unwrap_or(bytes.len());
+        // alloc: once per piece of CHUNK functions' FDEs
+        let mut table = Vec::with_capacity((end - start) / 32);
+        let stop = walk(bytes, section, start, end, &mut table);
+        (table, stop)
+    };
+    // alloc: once per image, one result per piece
+    let mut pieces: Vec<(Vec<(u64, u64)>, Result<Stop, String>)> = (0..splits.len() + 1).into_par_iter().map(piece).collect();
+    // The pieces the one walk reaches: up to the first that ends the section or fails.
+    let mut kept = pieces.len();
+    for (nth, (_, stop)) in pieces.iter_mut().enumerate() {
+        match stop {
+            Ok(Stop::End) => {}
+            Ok(Stop::Terminator) => {
+                kept = nth + 1;
+                break;
+            }
+            Err(why) => return Err(std::mem::take(why)),
+        }
+    }
+    let pieces = &pieces[..kept];
+    // alloc: once per image, the table, filled in parallel at each piece's place
+    let mut table = vec![(0u64, 0u64); pieces.iter().map(|it| it.0.len()).sum()];
+    let mut rest = &mut table[..];
+    // alloc: once per image, one slice per piece
+    let mut jobs = Vec::with_capacity(pieces.len());
+    for (part, _) in pieces {
+        let (these, after) = std::mem::take(&mut rest).split_at_mut(part.len());
+        jobs.push((these, &part[..]));
+        rest = after;
+    }
+    jobs.into_par_iter().for_each(|(out, part)| out.copy_from_slice(part));
+    Ok(table)
+}
+
+/// The FDEs of the records from `start` (a record's start) up to `end`, onto `table`: an
+/// error when a record runs past `end` where `end` is not the section's.
+fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u64, u64)>) -> Result<Stop, String> {
+    // The last CIE an FDE named, then those met in this piece (in order, so sorted), then
+    // those of other pieces, found where they are.
+    let mut last: Option<(usize, u8)> = None;
+    // alloc: past 16 CIEs in one piece (one per native object), growing by doubling
+    let mut met: SmallVec<[(usize, u8); 16]> = SmallVec::new();
+    // alloc: only for a CIE another piece holds, once each
+    let mut others: FxHashMap<usize, u8> = FxHashMap::default();
+    // alloc: error path
+    let bad = |at: usize, what: &str| format!("the entry at offset {at:#x}: {what}");
+    let mut at = start;
+    while at < end {
+        let record = at;
+        let Some((body, next)) = entry(bytes, record).map_err(|it| bad(record, it))? else {
+            return Ok(Stop::Terminator);
+        };
+        if next > end {
+            // alloc: error path
+            return Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
+        }
+        at = next;
+        let mut reader = Cursor { bytes: &bytes[..next], at: body };
+        let id = reader.u32().map_err(|it| bad(record, it))?;
+        if id == 0 {
+            let encoding = cie_encoding(&mut reader, section).map_err(|it| bad(record, it))?;
+            met.push((record, encoding));
+            continue;
+        }
+        let Some(cie) = body.checked_sub(id as usize) else {
+            return Err(bad(record, "its CIE pointer is before the section"));
+        };
+        let encoding = match last {
+            Some((offset, encoding)) if offset == cie => encoding,
+            _ => {
+                let encoding = match met.binary_search_by_key(&cie, |it| it.0) {
+                    Ok(found) => met[found].1,
+                    Err(_) => match others.get(&cie) {
+                        Some(&encoding) => encoding,
+                        None => {
+                            let encoding = cie_at(bytes, cie, section).map_err(|it| bad(record, it))?;
+                            others.insert(cie, encoding);
+                            encoding
+                        }
+                    },
+                };
+                last = Some((cie, encoding));
+                encoding
+            }
+        };
+        let pc = reader.pointer(encoding, section).map_err(|it| bad(record, it))?;
+        reader.value(encoding).map_err(|it| bad(record, it))?;
+        table.push((pc, section + record as u64));
+    }
+    Ok(Stop::End)
+}
+
+/// The record at `at`: where its body (the CIE ID or pointer) starts and where it ends; none
+/// for a zero length, which ends the section.
+fn entry(bytes: &[u8], at: usize) -> Result<Option<(usize, usize)>, &'static str> {
+    let mut reader = Cursor { bytes, at };
+    let length = match reader.u32()? {
+        0 => return Ok(None),
+        0xffff_fff0..=0xffff_fffe => return Err("a reserved initial length"),
+        0xffff_ffff => reader.u64()?,
+        length => u64::from(length),
+    };
+    let body = reader.at;
+    let end = usize::try_from(length)
+        .ok()
+        .and_then(|it| body.checked_add(it))
+        .filter(|it| *it <= bytes.len())
+        .ok_or("longer than the section")?;
+    Ok(Some((body, end)))
+}
+
+/// The FDE pointer encoding of the CIE at `at`, which another piece holds.
+fn cie_at(bytes: &[u8], at: usize, section: u64) -> Result<u8, &'static str> {
+    let (body, end) = entry(bytes, at)?.ok_or("its CIE pointer names the section's end")?;
+    let mut reader = Cursor { bytes: &bytes[..end], at: body };
+    if reader.u32()? != 0 {
+        return Err("its CIE pointer names an FDE");
+    }
+    cie_encoding(&mut reader, section)
+}
+
+/// The FDE pointer encoding of the CIE `reader` is in (past its ID), what leads to it checked
+/// as gimli checks it.
+fn cie_encoding(reader: &mut Cursor<'_>, section: u64) -> Result<u8, &'static str> {
+    const UNKNOWN: &str = "a CIE of an unknown augmentation";
+    let version = reader.u8()?;
+    if !matches!(version, 1 | 3 | 4) {
+        return Err("a CIE of an unknown version");
+    }
+    let augmentation = reader.cstr()?;
+    reader.uleb()?;
+    reader.sleb()?;
+    if version == 1 {
+        reader.u8()?;
+    } else {
+        reader.uleb()?;
+    }
+    let mut encoding = 0;
+    let mut data: Option<Cursor<'_>> = None;
+    for (index, &ch) in augmentation.iter().enumerate() {
+        match ch {
+            b'z' if index == 0 => {
+                let len = reader.uleb()?;
+                let (bytes, start) = (reader.bytes, reader.at);
+                let end = usize::try_from(len)
+                    .ok()
+                    .and_then(|it| start.checked_add(it))
+                    .filter(|it| *it <= bytes.len())
+                    .ok_or("augmentation data longer than its CIE")?;
+                data = Some(Cursor { bytes: &bytes[..end], at: start });
+                reader.at = end;
+            }
+            b'L' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                pointer_encoding(data.u8()?)?;
+            }
+            b'P' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                let personality = pointer_encoding(data.u8()?)?;
+                data.pointer(personality, section)?;
+            }
+            b'R' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                encoding = pointer_encoding(data.u8()?)?;
+            }
+            b'S' => {}
+            _ => return Err(UNKNOWN),
+        }
+    }
+    Ok(encoding)
+}
+
+/// `encoding` if it is a `DW_EH_PE_*` pointer encoding.
+fn pointer_encoding(encoding: u8) -> Result<u8, &'static str> {
+    let format = matches!(encoding & 0x0f, 0x00..=0x04 | 0x09..=0x0c);
+    if encoding == DW_EH_PE_OMIT || (format && encoding & 0x70 <= 0x50) {
+        Ok(encoding)
+    } else {
+        Err("an unknown pointer encoding")
+    }
+}
+
+/// A cursor over `.eh_frame`, little endian; `at` is from the section's start.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
+        let bytes = self.bytes.get(self.at..self.at + N).ok_or("cut short")?;
+        self.at += N;
+        Ok(bytes.try_into().expect("N bytes"))
+    }
+
+    fn u8(&mut self) -> Result<u8, &'static str> {
+        Ok(self.take::<1>()?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, &'static str> {
+        Ok(u32::from_le_bytes(self.take()?))
+    }
+
+    fn u64(&mut self) -> Result<u64, &'static str> {
+        Ok(u64::from_le_bytes(self.take()?))
+    }
+
+    fn uleb(&mut self) -> Result<u64, &'static str> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = self.u8()?;
+            if shift == 63 && byte > 1 {
+                return Err("an unsigned LEB128 past 64 bits");
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+        }
+    }
+
+    fn sleb(&mut self) -> Result<i64, &'static str> {
+        let mut value = 0i64;
+        let mut shift = 0;
+        loop {
+            let byte = self.u8()?;
+            if shift == 63 && byte != 0 && byte != 0x7f {
+                return Err("a signed LEB128 past 64 bits");
+            }
+            value |= i64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                if shift < 64 && byte & 0x40 != 0 {
+                    value |= !0 << shift;
+                }
+                return Ok(value);
+            }
+        }
+    }
+
+    fn cstr(&mut self) -> Result<&'a [u8], &'static str> {
+        let rest = &self.bytes[self.at..];
+        let len = rest.iter().position(|it| *it == 0).ok_or("a string without its end")?;
+        self.at += len + 1;
+        Ok(&rest[..len])
+    }
+
+    /// A value in `encoding`'s format, signed ones sign-extended.
+    fn value(&mut self, encoding: u8) -> Result<u64, &'static str> {
+        Ok(match encoding & 0x0f {
+            0x00 | 0x04 | 0x0c => self.u64()?,
+            0x01 => self.uleb()?,
+            0x02 => u64::from(u16::from_le_bytes(self.take()?)),
+            0x03 => u64::from(self.u32()?),
+            0x09 => self.sleb()? as u64,
+            0x0a => i16::from_le_bytes(self.take()?) as u64,
+            0x0b => i32::from_le_bytes(self.take()?) as u64,
+            _ => return Err("an unknown pointer encoding"),
+        })
+    }
+
+    /// A pointer in `encoding` with only `.eh_frame`'s address (`section`) known: absolute or
+    /// relative to where it is.
+    fn pointer(&mut self, encoding: u8, section: u64) -> Result<u64, &'static str> {
+        if encoding == DW_EH_PE_OMIT {
+            return Err("a pointer whose encoding says it is omitted");
+        }
+        let base = match encoding & 0x70 {
+            0x00 => 0,
+            DW_EH_PE_PCREL => section.wrapping_add(self.at as u64),
+            _ => return Err("a pointer relative to a base other than where it is"),
+        };
+        Ok(base.wrapping_add(self.value(encoding)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gimli::UnwindSection;
+    use rustc_hash::FxHashMap;
+
+    use super::fdes;
+
+    /// The walk `eh_frame_hdr` made before: gimli's parse of every record.
+    fn reference(bytes: &[u8], section: u64) -> Result<Vec<(u64, u64)>, String> {
+        let mut eh_frame = gimli::EhFrame::new(bytes, gimli::LittleEndian);
+        eh_frame.set_address_size(8);
+        let bases = gimli::BaseAddresses::default().set_eh_frame(section);
+        let mut entries = eh_frame.entries(&bases);
+        let mut cies = FxHashMap::default();
+        let mut table = Vec::new();
+        while let Some(entry) = entries.next().map_err(|it| it.to_string())? {
+            match entry {
+                gimli::CieOrFde::Cie(cie) => {
+                    cies.insert(cie.offset(), cie);
+                }
+                gimli::CieOrFde::Fde(partial) => {
+                    let fde = partial
+                        .parse(|section, bases, offset| match cies.get(&offset.0) {
+                            Some(cie) => Ok(cie.clone()),
+                            None => section.cie_from_offset(bases, offset),
+                        })
+                        .map_err(|it| it.to_string())?;
+                    table.push((fde.initial_address(), section + fde.offset() as u64));
+                }
+            }
+        }
+        Ok(table)
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn uleb(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// The kinds of CIE compilers write: no augmentation (absolute 8-byte pointers), `zR`
+    /// with `pcrel|sdata4`, `zPLR` with an indirect personality, `zR` with `udata8`, and
+    /// version 3 with `S`.
+    #[derive(Clone, Copy)]
+    enum Cie {
+        Plain,
+        Pcrel,
+        Personality,
+        Udata8,
+        Signal,
+    }
+
+    impl Cie {
+        fn encoding(self) -> Option<u8> {
+            match self {
+                Cie::Plain => None,
+                Cie::Pcrel | Cie::Personality | Cie::Signal => Some(0x1b),
+                Cie::Udata8 => Some(0x04),
+            }
+        }
+    }
+
+    fn push_cie(out: &mut Vec<u8>, kind: Cie) -> usize {
+        let at = out.len();
+        let mut body = vec![0, 0, 0, 0];
+        let version = if matches!(kind, Cie::Signal) { 3 } else { 1 };
+        body.push(version);
+        body.extend_from_slice(match kind {
+            Cie::Plain => b"\0".as_slice(),
+            Cie::Pcrel | Cie::Udata8 => b"zR\0".as_slice(),
+            Cie::Personality => b"zPLR\0".as_slice(),
+            Cie::Signal => b"zRS\0".as_slice(),
+        });
+        uleb(&mut body, 1);
+        body.push(0x78);
+        if version == 1 {
+            body.push(16);
+        } else {
+            uleb(&mut body, 16);
+        }
+        match kind {
+            Cie::Plain => {}
+            Cie::Personality => {
+                body.push(7);
+                body.push(0x9b);
+                body.extend_from_slice(&0x1234i32.to_le_bytes());
+                body.push(0x1b);
+                body.push(0x1b);
+            }
+            _ => {
+                body.push(1);
+                body.push(kind.encoding().unwrap());
+            }
+        }
+        while (body.len() + 4) % 8 != 0 {
+            body.push(0);
+        }
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        at
+    }
+
+    fn push_fde(out: &mut Vec<u8>, section: u64, cie: usize, kind: Cie, pc: u64, rng: &mut Rng) -> usize {
+        let at = out.len();
+        let mut body = Vec::new();
+        body.extend_from_slice(&((at + 4 - cie) as u32).to_le_bytes());
+        match kind.encoding() {
+            None => {
+                body.extend_from_slice(&pc.to_le_bytes());
+                body.extend_from_slice(&0x40u64.to_le_bytes());
+            }
+            Some(0x04) => {
+                body.extend_from_slice(&pc.to_le_bytes());
+                body.extend_from_slice(&0x40u64.to_le_bytes());
+            }
+            Some(_) => {
+                let place = section + (at + 8) as u64;
+                body.extend_from_slice(&(pc.wrapping_sub(place) as u32).to_le_bytes());
+                body.extend_from_slice(&0x40u32.to_le_bytes());
+            }
+        }
+        match kind {
+            Cie::Plain => {}
+            Cie::Personality => {
+                body.push(4);
+                body.extend_from_slice(&0x88i32.to_le_bytes());
+            }
+            _ => body.push(0),
+        }
+        for _ in 0..rng.next() % 12 {
+            body.push(0);
+        }
+        while (body.len() + 4) % 4 != 0 {
+            body.push(0);
+        }
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&body);
+        at
+    }
+
+    /// A section of `n` FDEs under a few CIEs (some placed after their first FDE's CIE use
+    /// moves on), out of address order; and every FDE's start.
+    fn section(rng: &mut Rng, n: usize, section: u64) -> (Vec<u8>, Vec<usize>) {
+        let kinds = [Cie::Plain, Cie::Pcrel, Cie::Personality, Cie::Udata8, Cie::Signal];
+        let mut out = Vec::new();
+        let mut cies: Vec<(usize, Cie)> = Vec::new();
+        let mut starts = Vec::new();
+        for nth in 0..n {
+            if cies.is_empty() || rng.next() % 64 == 0 {
+                let kind = kinds[(rng.next() % kinds.len() as u64) as usize];
+                cies.push((push_cie(&mut out, kind), kind));
+            }
+            let (cie, kind) = cies[(rng.next() % cies.len() as u64) as usize];
+            let pc = 0x10_0000 + (rng.next() % (4 * n as u64 + 1)) * 16 + if nth % 97 == 0 { 0 } else { 1 };
+            starts.push(push_fde(&mut out, section, cie, kind, pc, rng));
+        }
+        (out, starts)
+    }
+
+    fn split_at(starts: &[usize], every: usize) -> Vec<usize> {
+        starts.iter().copied().filter(|&it| it > 0).step_by(every.max(1)).collect()
+    }
+
+    #[test]
+    fn the_scan_reads_what_gimli_reads() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        for round in 0..64 {
+            let n = 1 + (rng.next() % 600) as usize;
+            let base = 0x40_0000 + 0x1000 * round as u64;
+            let (mut bytes, starts) = section(&mut rng, n, base);
+            if round % 3 == 0 {
+                bytes.extend_from_slice(&[0; 4]);
+            }
+            let want = reference(&bytes, base).unwrap();
+            assert_eq!(want.len(), n);
+            for every in [0, 1, 7, 64, n] {
+                let splits = if every == 0 { Vec::new() } else { split_at(&starts, every) };
+                assert_eq!(fdes(&bytes, base, &splits).unwrap(), want, "round {round}, a split every {every}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminator_ends_the_section_in_any_piece() {
+        let mut rng = Rng(77);
+        let base = 0x20_0000;
+        let (mut bytes, mut starts) = section(&mut rng, 300, base);
+        let cut = starts[150];
+        // Everything from FDE 150 on is past a zero length, and starts with a bad record.
+        bytes.splice(cut..cut, [0, 0, 0, 0, 0xf0, 0xff, 0xff, 0xff]);
+        for it in &mut starts[150..] {
+            *it += 8;
+        }
+        let want = reference(&bytes, base).unwrap();
+        assert_eq!(want.len(), 150);
+        for every in [1, 10, 149, 151] {
+            assert_eq!(fdes(&bytes, base, &split_at(&starts, every)).unwrap(), want, "every {every}");
+        }
+    }
+
+    #[test]
+    fn errors_are_the_first_in_section_order() {
+        let mut rng = Rng(5);
+        let base = 0x30_0000;
+        let (bytes, starts) = section(&mut rng, 200, base);
+        // A bad CIE version in the first CIE, and a reserved length late in the section.
+        let mut bad = bytes.clone();
+        bad[8] = 2;
+        let late = starts[180];
+        bad[late..late + 4].copy_from_slice(&0xffff_fff3u32.to_le_bytes());
+        assert!(reference(&bad, base).is_err());
+        let serial = fdes(&bad, base, &[]).unwrap_err();
+        assert!(serial.contains("offset 0x0"), "{serial}");
+        for every in [1, 13, 50] {
+            assert_eq!(fdes(&bad, base, &split_at(&starts, every)).unwrap_err(), serial, "every {every}");
+        }
+        // A split the walk doesn't land on is an error naming where the core placed an FDE.
+        let wrong = vec![starts[100] + 4];
+        assert!(fdes(&bytes, base, &wrong).unwrap_err().contains("where the core placed an FDE"));
+        // A record cut short.
+        assert!(fdes(&bytes[..bytes.len() - 3], base, &[]).is_err());
+        assert!(reference(&bytes[..bytes.len() - 3], base).is_err());
+    }
 }

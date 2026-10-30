@@ -5,7 +5,7 @@ use std::{
 };
 
 use blaze_format::{Aligned, FormatError, Part, Persist, Record, Rel, SchemaHash, Slice, Writer, buffer_id, open_as, schema_of, to_bytes};
-use blaze_ids::{ContentId, Domain, Hasher, Idx, Interner};
+use blaze_ids::{ContentId, Domain, Hasher, Idx, Interner, rng::SplitMix64 as Rng};
 
 use crate::{
     Consed, HashCons, Interned, Load, content_of,
@@ -151,33 +151,10 @@ fn leaked<T: Consed>() -> &'static HashCons<T> {
     Box::leak(Box::new(HashCons::new()))
 }
 
-/// splitmix64: the same values in every run, no dependency.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        for i in (1..items.len()).rev() {
-            items.swap(i, self.below(i as u64 + 1) as usize);
-        }
-    }
-}
-
 const NAMES: [&str; 5] = ["", "a", "ab", "a longer name than the others", "b"];
 
 fn random_leaf(rng: &mut Rng) -> Leaf {
-    leaf(rng.below(40), NAMES[rng.below(NAMES.len() as u64) as usize])
+    leaf(rng.below(40), NAMES[rng.index(NAMES.len())])
 }
 
 #[test]
@@ -221,7 +198,7 @@ fn chunks_cover_every_place() {
 fn handles_are_equal_exactly_when_values_are() {
     let leaves = leaked::<Leaf>();
     let pairs = HashCons::<Pair>::new();
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     let mut leaf_model: BTreeMap<Leaf, Interned<'static, Leaf>> = BTreeMap::new();
     let mut pair_model: BTreeMap<(Leaf, Leaf), Interned<'_, Pair>> = BTreeMap::new();
     for _ in 0..20_000 {
@@ -411,7 +388,7 @@ fn fill(leaves: &'static HashCons<Leaf>, pairs: &HashCons<Pair>, values: &[(Leaf
 }
 
 fn values(seed: u64, count: usize) -> Vec<(Leaf, Leaf)> {
-    let mut rng = Rng(seed);
+    let mut rng = Rng::new(seed);
     (0..count).map(|_| (random_leaf(&mut rng), random_leaf(&mut rng))).collect()
 }
 
@@ -427,7 +404,7 @@ fn interleavings_give_the_same_fingerprints_and_bytes() {
         let workers: Vec<_> = (0..8u64)
             .map(|worker| {
                 let mut mine = all.clone();
-                Rng(100 + worker).shuffle(&mut mine);
+                Rng::new(100 + worker).shuffle(&mut mine);
                 let pairs = &threaded;
                 scope.spawn(move || fill(threaded_leaves, pairs, &mine))
             })

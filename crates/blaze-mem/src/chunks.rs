@@ -52,8 +52,7 @@ fn space() -> Result<&'static Space, MemError> {
                 cold: Stack::new(),
             })
         });
-        // alloc: once per process, and only when the space cannot be reserved.
-        made.map_err(|error| error.to_string())
+        made.map_err(|error| error.to_string()) // alloc: once, when the space cannot be reserved
     });
     match space {
         Ok(space) => Ok(space),

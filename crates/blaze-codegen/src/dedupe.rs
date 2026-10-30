@@ -116,7 +116,8 @@ pub fn dedupe(
     loop {
         // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
         let mut groups: FxHashMap<ContentId, Vec<InstanceKey>> = FxHashMap::default();
-        for function in functions.iter().filter(|it| mergeable(&it.key)) {
+        // A covered function counts its own blocks: merged, two would share counters.
+        for function in functions.iter().filter(|it| mergeable(&it.key) && it.coverage.is_none()) {
             groups.entry(code_id(function)).or_default().push(function.key);
         }
         let mut more: HashMap<InstanceKey, InstanceKey> = HashMap::new();
@@ -174,6 +175,7 @@ mod tests {
             side: None,
             unwind: None,
             lines: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -220,6 +222,17 @@ mod tests {
         let keys: Vec<_> = functions.iter().map(|it| it.key).collect();
         assert_eq!(keys, vec![key(2), key(4), key(6)]);
         assert_eq!(functions[2].relocs[0].target, Target::Direct(key(4)));
+    }
+
+    #[test]
+    fn covered_functions_count_apart() {
+        let covered = |n| CompiledFunction {
+            coverage: Some(crate::Covered { counters: 1, flags: 0, guards: 0, pcs: vec![(0, 1)] }),
+            ..function(n, 0x90, &[])
+        };
+        let mut functions = vec![covered(2), covered(3)];
+        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert_eq!(functions.len(), 2);
     }
 
     #[test]

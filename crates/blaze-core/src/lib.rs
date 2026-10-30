@@ -17,11 +17,12 @@
 
 #[cfg(target_os = "linux")]
 mod cgroup;
+pub mod create_process;
 #[cfg(target_os = "linux")]
 mod fanotify;
 #[cfg(target_os = "macos")]
 mod footprint;
-mod fs;
+pub mod fs;
 #[cfg(target_os = "macos")]
 mod fsevents;
 #[cfg(windows)]
@@ -33,6 +34,7 @@ pub mod kqueue;
 mod net;
 #[cfg(unix)]
 mod process;
+pub mod signal;
 pub mod sim;
 pub mod threads;
 #[cfg(target_os = "linux")]
@@ -166,8 +168,9 @@ pub enum Effect {
     /// Each file's [`Stamp`], in order, as one batch the driver runs as many at once as it
     /// can (io_uring: `IORING_OP_STATX`, thousands in flight). A symlink is stamped itself, not
     /// followed; a name that is not there is [`Stamp::GONE`]. Completes with
-    /// [`Done::Stamped`]; it fails only as a whole, never for one name.
-    Stamp { files: Names, tag: Tag },
+    /// [`Done::Stamped`]; it fails only as a whole, never for one name. `files` is shared, so
+    /// an asker that compares the stamps against the names keeps them without a copy.
+    Stamp { files: std::sync::Arc<Names>, tag: Tag },
     /// What is directly in `dir`, each name with its [`Stamp`], sorted by name; completes with
     /// [`Done::Entries`]. A `dir` that is not there, or not a directory, fails.
     Entries { dir: FileName, tag: Tag },

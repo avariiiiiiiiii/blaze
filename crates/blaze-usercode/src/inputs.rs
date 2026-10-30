@@ -10,9 +10,10 @@
 //! `stat`ed while the watch has heard nothing under it.
 
 use std::{
-    borrow::Cow,
     ffi::{OsStr, OsString},
-    fmt, io,
+    fmt,
+    hash::Hasher as _,
+    io,
     path::{Path, PathBuf},
     sync::{
         OnceLock,
@@ -21,10 +22,12 @@ use std::{
 };
 
 use blaze_ids::{ContentId, Hasher, Interner, Sharded};
+use blaze_mem::{Tag, frame};
 use blaze_query::{Cancelled, Cx};
 use blaze_vfs::outside::{Cover, Dirs};
+use rustc_hash::FxHasher;
 
-use crate::trace::{DIRECTORY, Inputs, listing, os_bytes};
+use crate::trace::{DIRECTORY, Inputs, Names, listing, os_bytes};
 
 /// What a traced path that is neither a file nor a directory hashes as.
 pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
@@ -109,6 +112,7 @@ pub struct Files {
 /// A path's last answer, under a sequence lock: written on a miss (rare, and a writer that
 /// finds another writing skips), read with three loads and a compare.
 struct Vouched {
+    path: Box<OsStr>,
     /// `None` for a path that isn't canonical, or that no watched directory covers: each of
     /// its checks looks at the disk.
     cover: Option<Cover<'static>>,
@@ -154,6 +158,14 @@ impl Vouched {
     }
 }
 
+/// splitmix64's finalizer: every bit of the result depends on every bit of `word`, as the table's
+/// shard and probe bits need.
+fn mix(mut word: u64) -> u64 {
+    word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    word ^ (word >> 31)
+}
+
 /// Whether `path` names itself the way the watch hears it: absolute, with no symlink, `.` or
 /// `..` in it. A missing path is canonical when its parent is. Cold: on a miss only.
 fn canonical(path: &Path, answer: Option<[u8; 32]>) -> bool {
@@ -183,17 +195,33 @@ impl Files {
         FILES.get_or_init(Files::new)
     }
 
+    /// Where `path`'s answer is kept: two seeded FxHash passes, mixed, in place of BLAKE3,
+    /// which costs ten times the rest of a check. The table never leaves the process, and
+    /// [`Vouched::path`] is compared on each find, so two paths that collide are told apart
+    /// (the later one is looked at on the disk every time).
     fn path_id(path: &Path) -> ContentId {
-        Hasher::new("blaze v2 disk path 1").part(os_bytes(path.as_os_str())).finish()
+        let bytes = path.as_os_str().as_encoded_bytes();
+        let pass = |seed: usize| {
+            let mut hasher = FxHasher::with_seed(seed);
+            hasher.write(bytes);
+            mix(hasher.finish())
+        };
+        let (a, b) = (pass(0x243f_6a88_85a3_08d3), pass(0x1319_8a2e_0370_7344));
+        let mut id = [0; 32];
+        for (at, word) in [a, b, mix(a ^ b), mix(a.wrapping_add(b))].into_iter().enumerate() {
+            id[at * 8..at * 8 + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        ContentId(id)
     }
 
     fn key(path: &Path, stamp: &Stamp) -> ContentId {
-        Hasher::new("blaze v2 disk stamp 1").part(os_bytes(path.as_os_str())).part(&stamp.bytes()).finish()
+        Hasher::new(crate::trace::os_domain!("blaze v2 disk stamp 1")).part(&os_bytes(path.as_os_str())).part(&stamp.bytes()).finish()
     }
 
     fn file(&self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
         let id = Files::path_id(path);
-        let known = self.vouched.find(&id).map(|it| self.vouched.get(it));
+        let found = self.vouched.find(&id).map(|it| self.vouched.get(it));
+        let known = found.filter(|it| *it.path == *path.as_os_str());
         if let Some(known) = known
             && let Some(cover) = known.cover
             && let Some((generation, answer)) = known.read()
@@ -204,9 +232,10 @@ impl Files {
         let generation = self.dirs.generation();
         let (answer, settled) = self.look(path)?;
         if settled {
-            match known {
-                Some(known) => known.write(generation, answer),
-                None => self.vouch(id, path, generation, answer),
+            match (known, found) {
+                (Some(known), _) => known.write(generation, answer),
+                (None, None) => self.vouch(id, path, generation, answer),
+                (None, Some(_)) => {}
             }
         }
         Ok(answer)
@@ -225,13 +254,17 @@ impl Files {
             false => None,
         };
         let at = self.vouched.intern(id, || Vouched {
+            path: path.as_os_str().into(), // alloc: once per path, on its first miss
             cover,
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             present: AtomicBool::new(false),
             hash: Default::default(),
         });
-        self.vouched.get(at).write(generation, answer);
+        let kept = self.vouched.get(at);
+        if *kept.path == *path.as_os_str() {
+            kept.write(generation, answer);
+        }
     }
 
     /// What `path` hashes as on the disk now, and whether that held while it was looked at.
@@ -357,17 +390,19 @@ impl Inputs for Now<'_> {
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
-        Ok(self.names(path)?.map(|names| listing(names.iter().map(|it| it.0.as_os_str()))))
+        frame::task(Tag::Usercode, |frame| {
+            let mut names = Names::new_in(frame);
+            Ok(self.names(path, &mut names)?.then(|| listing(names.iter().map(|it| it.0))))
+        })
     }
 
-    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
+    fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
         let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
-            Err(error) if missing(&error) => return Ok(None),
+            Err(error) if missing(&error) => return Ok(false),
             Err(error) => return Err(unreadable(error)),
         };
-        let mut names = Vec::with_capacity(entries.size_hint().0);
         for entry in entries {
             let entry = entry.map_err(unreadable)?;
             // The listing says what each entry is, without a `stat`; a link is what it leads
@@ -377,14 +412,15 @@ impl Inputs for Now<'_> {
                 true => std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir()),
                 false => kind.is_dir(),
             };
-            names.push((entry.file_name(), dir));
+            // alloc: std's listing owns each name: a walk of the disk allocates what `read_dir` does.
+            out.push(&entry.file_name(), dir);
         }
-        names.sort_unstable();
-        Ok(Some(names))
+        out.sort();
+        Ok(true)
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.env.get(name).map(OsStr::to_owned)
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        self.env.get(name)
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
@@ -403,12 +439,12 @@ impl Inputs for Disk {
         self.now().dir(path)
     }
 
-    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
-        self.now().names(path)
+    fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
+        self.now().names(path, out)
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.now().env(name)
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        self.env.get(name)
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
@@ -461,62 +497,68 @@ pub struct ViewInputs<'a, 'db> {
     pub hashes: &'a Hashes,
 }
 
-impl ViewInputs<'_, '_> {
-    /// `path` as the view names it, when it is in the view: borrowed from `path` when its
-    /// rest is already the view's name for it, `/`-separated with nothing to drop.
-    fn in_view<'p>(&self, path: &'p Path) -> Option<Cow<'p, str>> {
-        let rest = path.strip_prefix(self.root).ok()?;
-        let named = |text: &str| {
-            text.is_empty()
-                || (std::path::MAIN_SEPARATOR == '/'
-                    && text.split('/').all(|part| !matches!(part, "" | "." | "..")))
-        };
-        if let Some(text) = rest.to_str()
-            && named(text)
-        {
-            return Some(Cow::Borrowed(text));
-        }
-        let mut name = String::new();
+/// `path` as the view at `root` names it, lent to `f` (`None` when it is not in the view):
+/// `path`'s own text when its rest is already the view's name for it, `/`-separated with
+/// nothing to drop, else built in the thread's string ([`blaze_mem::scratch::with_string`]).
+fn in_view<R>(root: &Path, path: &Path, f: impl FnOnce(Option<&str>) -> R) -> R {
+    let Ok(rest) = path.strip_prefix(root) else { return f(None) };
+    let named = |text: &str| {
+        text.is_empty()
+            || (std::path::MAIN_SEPARATOR == '/' && text.split('/').all(|part| !matches!(part, "" | "." | "..")))
+    };
+    if let Some(text) = rest.to_str()
+        && named(text)
+    {
+        return f(Some(text));
+    }
+    blaze_mem::scratch::with_string(|name| {
         for part in rest.components() {
-            let std::path::Component::Normal(part) = part else { return None };
+            let std::path::Component::Normal(part) = part else { return f(None) };
+            let Some(part) = part.to_str() else { return f(None) };
             if !name.is_empty() {
                 name.push('/');
             }
-            name.push_str(part.to_str()?);
+            name.push_str(part);
         }
-        Some(Cow::Owned(name))
-    }
+        f(Some(name))
+    })
 }
 
 impl Inputs for ViewInputs<'_, '_> {
     type Error = ViewError;
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.now.file(path)?) };
-        if !name.is_empty()
-            && let Some(file) = self.cx.file(&name)?
-        {
-            return Ok(Some(self.hashes.of(file.id, file.bytes)));
-        }
-        Ok(self.cx.dir(&name)?.map(|_| DIRECTORY))
+        in_view(self.root, path, |name| {
+            let Some(name) = name else { return Ok(self.now.file(path)?) };
+            if !name.is_empty()
+                && let Some(file) = self.cx.file(name)?
+            {
+                return Ok(Some(self.hashes.of(file.id, file.bytes)));
+            }
+            Ok(self.cx.dir(name)?.map(|_| DIRECTORY))
+        })
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.now.dir(path)?) };
-        Ok(self.cx.dir(&name)?.map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0)))))
+        in_view(self.root, path, |name| match name {
+            None => Ok(self.now.dir(path)?),
+            Some(name) => Ok(self.cx.dir(name)?.map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0))))),
+        })
     }
 
-    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, ViewError> {
-        let Some(name) = self.in_view(path) else { return Ok(self.now.names(path)?) };
-        Ok(self.cx.dir(&name)?.map(|entries| {
-            let mut names: Vec<(OsString, bool)> =
-                entries.iter().map(|(name, dir)| (OsString::from(name), *dir)).collect();
-            names.sort();
-            names
-        }))
+    fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, ViewError> {
+        in_view(self.root, path, |name| {
+            let Some(name) = name else { return Ok(self.now.names(path, out)?) };
+            let Some(entries) = self.cx.dir(name)? else { return Ok(false) };
+            for (name, dir) in entries {
+                out.push(OsStr::new(name), *dir);
+            }
+            out.sort();
+            Ok(true)
+        })
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
         self.now.env(name)
     }
 
@@ -547,7 +589,7 @@ mod tests {
         assert_eq!(disk.dir(&dir.join("none")).unwrap(), None);
         std::fs::write(dir.join("a"), b"two, longer").unwrap();
         assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
-        assert_eq!(disk.env(OsStr::new("A")), Some("1".into()));
+        assert_eq!(disk.env(OsStr::new("A")), Some(OsStr::new("1")));
         assert_eq!(disk.env_all()[0].0, "A");
         #[cfg(unix)]
         {
@@ -596,7 +638,7 @@ mod tests {
         let mut now = Now { files: &files, env: &one };
         assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
         assert_eq!(files.stamped.len(), 2);
-        assert_eq!(now.env(OsStr::new("X")), Some("1".into()));
+        assert_eq!(now.env(OsStr::new("X")), Some(OsStr::new("1")));
         _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -630,6 +672,7 @@ mod tests {
     fn a_vouched_answer_reads_back_as_written() {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let vouched = Vouched {
+            path: OsStr::new("/nowhere/a").into(),
             cover: dirs.cover(Path::new("/nowhere/a")),
             sequence: AtomicU64::new(0),
             generation: AtomicU64::new(0),

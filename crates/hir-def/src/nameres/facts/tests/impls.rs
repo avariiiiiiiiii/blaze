@@ -3,7 +3,7 @@
 
 use std::hint::black_box;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::name::Name;
 use intern::Symbol;
 use salsa::plumbing::AsId;
@@ -12,7 +12,7 @@ use test_fixture::WithFixture;
 
 use crate::{
     AdtId, ImplId, Lookup, ModuleDefId, ModuleId, nameres::facts::impls::module_impls,
-    src::HasSource, test_db::TestDB,
+    src::HasSource, test_db::{TestDB, TestDBExt},
 };
 
 /// Each impl as written: `Trait for Type`, or `Type` for an inherent one.
@@ -43,12 +43,15 @@ fn snapshot(db: &TestDB, module: ModuleId) -> (Vec<String>, Vec<String>, usize) 
 /// The modules `module_impls` ran for while `f` ran, by key, from the same `WillExecute` events
 /// `TestDB::log_executed` names.
 fn ran_for(db: &TestDB, f: impl FnOnce()) -> Vec<salsa::Id> {
-    db.log(f)
+    let base: &Db = db;
+    db.log_in_read_order(f)
         .into_iter()
         .filter_map(|event| match event.kind {
             salsa::EventKind::WillExecute { database_key } => {
-                let name = (db as &dyn salsa::Database)
-                    .ingredient_debug_name(database_key.ingredient_index());
+                let name = salsa::Database::ingredient_debug_name(
+                    base,
+                    database_key.ingredient_index(),
+                );
                 (name == "module_impls").then(|| database_key.key_index())
             }
             _ => None,
@@ -178,7 +181,7 @@ impl crate::Tr for B {}
 
     // The same once more with the names `TestDB::log_executed` gives: one run, `a`'s.
     db.set_file_text(a_file, "pub struct A;\nimpl A {}\n");
-    let executed = db.log_executed(|| {
+    let executed = db.executed_in_read_order(|| {
         module_impls(&db, a);
         module_impls(&db, b);
     });

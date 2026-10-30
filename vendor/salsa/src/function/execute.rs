@@ -137,6 +137,7 @@ where
         // This is different from `opt_old_memo` which might be from a different revision.
         let mut last_provisional_memo_opt: Option<&Memo<C>> = None;
 
+        // alloc: `Vec::new` allocates nothing; filled only during fixpoint iteration
         let mut last_stale_tracked_ids: Vec<(Identity, Id)> = Vec::new();
         let current_revision = zalsa.current_revision();
         let cancellation_count = zalsa.runtime().cancellation_count();
@@ -618,6 +619,7 @@ fn outer_cycle(
             matches!(
                 function.sync_table().peek_claim(
                     zalsa,
+                    zalsa_local.task(),
                     head.database_key_index.key_index(),
                     Reentrancy::Deny,
                 ),
@@ -1013,6 +1015,7 @@ fn flattened_edge_fingerprints(
                 fingerprint,
             })
         })
+        // alloc: once per cycle head that converges, for its flattened edges' fingerprints
         .collect()
 }
 

@@ -225,6 +225,8 @@ K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`,
 
 > forwarded to cargo: the daemon's processes are lane cargo's (`crates/blaze-cargo/src/serve/`).
 
+> answered by lane cargo (cargo-inbox): done: `rg "std::process::Command" crates/blaze-cargo/src/serve*` finds none; every process the daemon starts goes through its driver.
+
 ## From speed-runtime: `docs/v2/plan/lanes/core/plane.md`, "Memory admission" (2026-10-29)
 
 - What: replace "`arena::Counting` is the daemon's global allocator (per-thread counts, sharded
@@ -396,3 +398,29 @@ blaze-core item are left for their owners.
 Status (safety-audit, blaze-graph `arena.rs` :301 and :314, blaze-core `fsevents.rs` extern
 blocks): done by speed-runtime, as proposed (both blocks split in two with their comments; the
 three extern blocks name the headers their signatures match).
+
+## dedup: create_process (from dedup-scan)
+
+`crates/blaze-core/src/create_process.rs` (new, `pub mod create_process;` in lib.rs) is the one
+Windows command line and environment block, with std's `Command` rules and the tests of both
+copies plus proptests (the runtime's split reads the arguments back; this file's old copy is the
+reference for both functions). In `crates/blaze-core/src/iocp/process.rs`:
+
+- delete `fn command_line`, `fn quote`, `fn environment`, `fn upper` and their doc comments, and
+  the tests `arguments_are_quoted_as_the_runtime_reads_them` and
+  `the_environment_is_sorted_its_later_names_kept` (moved there);
+- in the spawn, before → after:
+  ```rust
+  let mut line = command_line(&confined.program, &confined.args)?;
+  let env = environment(&confined.env)?;
+  ```
+  ```rust
+  let mut line = crate::create_process::command_line(&confined.program, &confined.args)?;
+  let env = crate::create_process::environment(&confined.env)?;
+  ```
+- drop `ffi::OsStrExt as _` from the imports if nothing else uses it.
+
+What changes: an argument with a quote, newline or vertical tab but no space or tab is no longer
+wrapped in quotes (std's rule; the C runtime splits it back the same, which the proptest checks),
+and variable names compare in Unicode upper case per code unit (as Windows' ordinal compare),
+not ASCII only. Why: two copies of the same rules (the other in blaze-cargo's sandbox).

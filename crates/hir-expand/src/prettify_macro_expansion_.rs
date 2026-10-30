@@ -1,6 +1,6 @@
 //! Pretty printing of macros output.
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use rustc_hash::FxHashMap;
 use syntax::SyntaxNode;
 
@@ -9,7 +9,7 @@ use crate::span_map::ExpansionSpanMap;
 /// Inserts whitespace and replaces `$crate` in macro expansions.
 #[expect(deprecated)]
 pub fn prettify_macro_expansion(
-    db: &dyn SourceDatabase,
+    db: &Db,
     syn: SyntaxNode,
     span_map: &ExpansionSpanMap,
     target_crate_id: Crate,
@@ -45,14 +45,14 @@ pub fn prettify_macro_expansion(
                     } else if let Some(crate_name) = &macro_def_crate.extra_data(db).display_name {
                         make.ident(crate_name.crate_name().as_str())
                     } else {
-                        dollar_crate.clone()
+                        dollar_crate.clone() // clone: a token handle; display of an expansion, at the edge
                     }
                 });
             if replacement.text() == "$crate" {
                 // The parent may have many children, and looking for the token may yield incorrect results.
                 return None;
             }
-            Some(replacement.clone())
+            Some(replacement.clone()) // clone: a token handle; display of an expansion, at the edge
         },
         |_| (),
     )

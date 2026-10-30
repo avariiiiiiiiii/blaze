@@ -148,6 +148,37 @@ rustc. This was diagnostics' request 6 (`v2/requests/diagnostics.md`).
 The bounds, the arithmetic and the gaps are in
 [speed-of-light.md](speed-of-light.md#hir-def-signatures-signaturesrs-speed-hir-defs-sigs).
 Applied: the tree is compared by content instead of two SipHash passes (≈ 285 ns per item per
-edit), and the source map's move reads the item's range off its ast id. The next change is
-`file_outline`, one query per file that backdates on every body edit. It waits on frontend-text's
-list forms of `clone_subtree_without`, `AstIdMap::relative_without` and `RealSpanMap::without`.
+edit), and the source map's move reads the item's range off its ast id.
+
+Also applied, over frontend-text's list forms of `clone_subtree_without`,
+`AstIdMap::relative_without` and `RealSpanMap::without`:
+- **`file_outline(db, EditionedFileId)`**: one query per file. It holds the file's tree with
+  the body of every fn, const and static that is its own span anchor left out, each replaced
+  by an empty node. It also holds that tree's ast id and span maps, and where each body was
+  cut.
+  - It is made in one pass over the file's items and one copy that never reads a cut body.
+  - It compares equal after any body edit. Nothing after a body moves, because a cut body has
+    no length in the outline.
+  - `signature_syntax` and `variants_syntax` read it and not the parse. So on a body edit, the
+    file's one outline query runs and backdates, and no per-item syntax query runs. This is
+    rustc's per-owner HIR hash, taken per file.
+- **`SignatureSyntax::new`** copies the item with `clone_subtree_without`, one pass. Before, it
+  cloned the whole item, then repacked it with `replace_subtree` and copied its text.
+- **An item anchored at one around it** is copied without the outline's empty bodies in that
+  anchor. The ast id map would otherwise take an empty fn body for one it holds. Those bodies
+  all come after the item, so nothing in it moves.
+- **An item in a cut body** is not in the outline, and is read off the file as before, the same
+  as the body it is in.
+- **What still re-runs on a body edit:**
+  - the bodies of items anchored at an enclosing item, which stay in the outline: items of an
+    impl, trait or module with attributes, or of a module nested in a module;
+  - items inside cut bodies.
+
+  For both, an edit runs the file's signature syntax queries again, as every edit did before.
+- **Tests** (`relative_tests`):
+  - `the_outline_leaves_out_each_body_of_its_own_anchor`: the outline's text, and that each cut
+    is an empty body of one of its items.
+  - `a_body_edit_runs_no_signature_syntax`: `file_outline` runs and nothing per item does.
+  - `items_anchored_at_a_fn_are_read_around_its_body`: covers an item in a cut body, read off
+    the file, and an item in a fn's parameter type, read off the outline without the fn's body.
+    Each keeps its ast id.

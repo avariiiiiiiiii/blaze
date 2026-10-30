@@ -91,6 +91,7 @@ impl Intents {
     }
 
     /// The earliest deadline of an open intent.
+    /// A scan, not a timing wheel: one intent per waiting client, a few at once.
     pub(super) fn deadline(&self) -> Option<u64> {
         self.by_job.values().filter(|it| it.open()).filter_map(|it| it.deadline_ns).min()
     }

@@ -13,21 +13,29 @@
 //!
 //! Cost: a pass reads and writes each element once, plus a prefix sum of 256 or 2048 counters
 //! per chunk; the scratch is one buffer the size of the input (for [`sort_by_key`], of
-//! `(key, u32)` pairs, then one swap per misplaced item).
+//! `(key, u32)` pairs, then one swap per misplaced item), the caller's with
+//! [`sort_copy_by_key_in`]. A serial sort keeps its counters on the stack.
+//!
+//! Grouping by a key below a known bound (a node, a row, a shard) is [`csr`]'s counting sort
+//! into compressed sparse rows, the same sort with one digit as wide as the bound.
 //!
 //! A leaf crate with no dependencies: `blaze-core`, which the model checker `blaze-check`
 //! depends on, uses it, so it can depend on nothing that takes `blaze-check`
 //! (docs/v2/plan/lanes/safety/model.md). `blaze-ids` re-exports it as `blaze_ids::radix`.
 
 use std::{
+    mem::MaybeUninit,
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     slice,
     sync::OnceLock,
 };
 
+pub mod csr;
 #[cfg(test)]
 mod tests;
+
+pub use csr::Csr;
 
 /// Up to this many elements, an insertion sort.
 pub const SMALL: usize = 64;
@@ -182,13 +190,24 @@ pub fn sort_copy_by_key<T: Copy + Send + Sync, K: Key>(
     Radix::AMBIENT.sort_copy_by_key(items, key);
 }
 
+/// [`sort_copy_by_key`] in the caller's `scratch`, whose contents after are unspecified: below
+/// [`PARALLEL`] items (or with no workers) and 2^32 items, a sort whose `scratch` has the
+/// capacity for `items` allocates nothing, its counters being on the stack.
+pub fn sort_copy_by_key_in<T: Copy + Send + Sync, K: Key>(
+    items: &mut [T],
+    key: impl Fn(&T) -> K + Sync,
+    scratch: &mut Vec<T>,
+) {
+    Radix::AMBIENT.sort_copy_by_key_in(items, key, scratch);
+}
+
 impl Radix<'_> {
     pub fn sort<K: Key>(self, keys: &mut [K]) {
-        self.run(keys, &|it: &K| *it);
+        self.run(keys, &|it: &K| *it, &mut Vec::new());
     }
 
     pub fn sort_pairs<K: Key>(self, pairs: &mut [(K, u32)]) {
-        self.run(pairs, &|it: &(K, u32)| it.0);
+        self.run(pairs, &|it: &(K, u32)| it.0, &mut Vec::new());
     }
 
     pub fn sort_by_key<T, K: Key>(self, items: &mut [T], mut key: impl FnMut(&T) -> K) {
@@ -218,10 +237,25 @@ impl Radix<'_> {
         items: &mut [T],
         key: impl Fn(&T) -> K + Sync,
     ) {
-        self.run(items, &key);
+        self.run(items, &key, &mut Vec::new());
     }
 
-    fn run<E: Copy + Send + Sync, K: Key>(self, items: &mut [E], key: &(impl Fn(&E) -> K + Sync)) {
+    /// [`Radix::sort_copy_by_key`] in the caller's `scratch`, as [`sort_copy_by_key_in`].
+    pub fn sort_copy_by_key_in<T: Copy + Send + Sync, K: Key>(
+        self,
+        items: &mut [T],
+        key: impl Fn(&T) -> K + Sync,
+        scratch: &mut Vec<T>,
+    ) {
+        self.run(items, &key, scratch);
+    }
+
+    fn run<E: Copy + Send + Sync, K: Key>(
+        self,
+        items: &mut [E],
+        key: &(impl Fn(&E) -> K + Sync),
+        scratch: &mut Vec<E>,
+    ) {
         let n = items.len();
         if n <= SMALL {
             insertion(items, key);
@@ -231,7 +265,7 @@ impl Radix<'_> {
             let mut done = false;
             let mut go = |workers: &dyn Workers| {
                 if workers.threads() > 1 {
-                    parallel(items, key, workers);
+                    parallel(items, key, workers, &mut *scratch);
                     done = true;
                 }
             };
@@ -247,7 +281,7 @@ impl Radix<'_> {
                 return;
             }
         }
-        serial(items, key);
+        serial(items, key, scratch);
     }
 }
 
@@ -341,8 +375,9 @@ impl Plan {
     }
 }
 
-/// The digits of `n` keys whose differing bits are `diff`: those where some keys differ.
-fn plan<K: Key>(diff: K, n: usize) -> Plan {
+/// The digits of `n` keys whose differing bits are `diff`: those where some keys differ. 11-bit
+/// digits only where their counters, a row per pass and one of ends, fit in `counters`.
+fn plan<K: Key>(diff: K, n: usize, counters: usize) -> Plan {
     let digits = |bits: u32| {
         let mask = (1usize << bits) - 1;
         let mut plan = Plan { shifts: [0; MAX_DIGITS], len: 0, mask };
@@ -359,53 +394,118 @@ fn plan<K: Key>(diff: K, n: usize) -> Plan {
     let narrow = digits(8);
     if n >= WIDE {
         let wide = digits(11);
-        if wide.len < narrow.len {
+        if wide.len < narrow.len && (wide.len + 1) * wide.buckets() <= counters {
             return wide;
         }
     }
     narrow
 }
 
-fn serial<E: Copy, K: Key>(items: &mut [E], key: &impl Fn(&E) -> K) {
+/// The counters a serial sort keeps on the stack (56 KiB): every 8-bit plan, and 11-bit plans
+/// of up to 6 passes (a `u64` key) with their ends.
+const STACK_COUNTERS: usize = 7 << 11;
+
+/// A pass's counter: `u32` on the stack, `usize` past 2^32 items.
+trait Count: Copy {
+    fn of(n: usize) -> Self;
+    fn get(self) -> usize;
+}
+
+impl Count for u32 {
+    #[inline(always)]
+    fn of(n: usize) -> u32 {
+        n as u32
+    }
+    #[inline(always)]
+    fn get(self) -> usize {
+        self as usize
+    }
+}
+
+impl Count for usize {
+    #[inline(always)]
+    fn of(n: usize) -> usize {
+        n
+    }
+    #[inline(always)]
+    fn get(self) -> usize {
+        self
+    }
+}
+
+fn serial<E: Copy, K: Key>(items: &mut [E], key: &impl Fn(&E) -> K, scratch: &mut Vec<E>) {
     let n = items.len();
     let Some(all) = survey(items, key) else { return };
     if all.sorted {
         return;
     }
-    let plan = plan(all.and.xor(all.or), n);
+    let diff = all.and.xor(all.or);
+    if u32::try_from(n).is_err() {
+        let plan = plan(diff, n, usize::MAX);
+        if plan.len == 0 {
+            return;
+        }
+        // alloc: past 2^32 items a `u32` counter overflows; this is one allocation per sort of
+        // that size, beside its 2^32-item scratch.
+        let mut counters = vec![0usize; (plan.len + 1) * plan.buckets()];
+        passes(items, key, &plan, &mut counters, scratch);
+        return;
+    }
+    let plan = plan(diff, n, STACK_COUNTERS);
     if plan.len == 0 {
         return;
     }
+    let mut store = [MaybeUninit::<u32>::uninit(); STACK_COUNTERS];
+    let used = (plan.len + 1) * plan.buckets();
+    store[..used].fill(MaybeUninit::new(0));
+    // SAFETY: `plan` keeps `used` within `STACK_COUNTERS` (every 8-bit plan is at most
+    // 17 * 256), its first `used` elements were just initialized, and `MaybeUninit<u32>` has
+    // `u32`'s layout.
+    let counters = unsafe { slice::from_raw_parts_mut(store.as_mut_ptr().cast::<u32>(), used) };
+    passes(items, key, &plan, counters, scratch);
+}
+
+/// The passes of a serial sort: `counters` is `plan.len` rows of `plan.buckets()` zeros, then
+/// one row of ends; `scratch` is filled with a copy of `items`, which it holds some permutation
+/// of after.
+fn passes<E: Copy, K: Key, C: Count>(
+    items: &mut [E],
+    key: &impl Fn(&E) -> K,
+    plan: &Plan,
+    counters: &mut [C],
+    scratch: &mut Vec<E>,
+) {
     let buckets = plan.buckets();
+    let (counts, ends) = counters.split_at_mut(plan.len * buckets);
     // Every pass's counts at once: the keys, and so their digits' counts, are the same in
     // every pass.
-    let mut counts = vec![0usize; plan.len * buckets];
     for item in items.iter() {
         let mine = key(item);
         for (row, &shift) in counts.chunks_exact_mut(buckets).zip(plan.shifts()) {
-            row[mine.digit(shift, plan.mask)] += 1;
+            let at = &mut row[mine.digit(shift, plan.mask)];
+            *at = C::of(at.get() + 1);
         }
     }
-    let mut scratch = items.to_vec();
-    let mut ends = vec![0usize; buckets];
+    scratch.clear();
+    scratch.extend_from_slice(items);
     let (mut src, mut dst) = (&mut *items, &mut scratch[..]);
     for (pass, (starts, &shift)) in counts.chunks_exact_mut(buckets).zip(plan.shifts()).enumerate() {
         let mut sum = 0;
         for (start, end) in starts.iter_mut().zip(ends.iter_mut()) {
-            let count = *start;
-            *start = sum;
+            let count = start.get();
+            *start = C::of(sum);
             sum += count;
-            *end = sum;
+            *end = C::of(sum);
         }
         let scattered = catch_unwind(AssertUnwindSafe(|| {
             for item in src.iter() {
                 let digit = key(item).digit(shift, plan.mask);
-                let at = starts[digit];
-                if at >= ends[digit] {
+                let at = starts[digit].get();
+                if at >= ends[digit].get() {
                     changed();
                 }
                 dst[at] = *item;
-                starts[digit] = at + 1;
+                starts[digit] = C::of(at + 1);
             }
         }));
         if let Err(panic) = scattered {
@@ -417,7 +517,7 @@ fn serial<E: Copy, K: Key>(items: &mut [E], key: &impl Fn(&E) -> K) {
         std::mem::swap(&mut src, &mut dst);
     }
     if plan.len % 2 == 1 {
-        items.copy_from_slice(&scratch);
+        items.copy_from_slice(scratch);
     }
 }
 
@@ -469,6 +569,7 @@ fn parallel<E: Copy + Send + Sync, K: Key>(
     items: &mut [E],
     key: &(impl Fn(&E) -> K + Sync),
     workers: &dyn Workers,
+    scratch: &mut Vec<E>,
 ) {
     let n = items.len();
     let jobs = workers.threads().min(n / MIN_CHUNK).clamp(1, MAX_JOBS);
@@ -492,14 +593,15 @@ fn parallel<E: Copy + Send + Sync, K: Key>(
     if all.sorted {
         return;
     }
-    let plan = plan(all.and.xor(all.or), n);
+    let plan = plan(all.and.xor(all.or), n, usize::MAX);
     if plan.len == 0 {
         return;
     }
     let buckets = plan.buckets();
     let mut starts = vec![0usize; jobs * buckets];
     let mut ends = vec![0usize; jobs * buckets];
-    let mut scratch: Vec<E> = Vec::with_capacity(n);
+    scratch.clear();
+    scratch.reserve(n);
     for (pass, &shift) in plan.shifts().iter().enumerate() {
         let (from, to) = if pass % 2 == 0 {
             (items.as_mut_ptr(), scratch.as_mut_ptr())
@@ -565,7 +667,8 @@ fn parallel<E: Copy + Send + Sync, K: Key>(
             resume_unwind(panic);
         }
         if pass == 0 {
-            // SAFETY: the first pass wrote every element of `scratch` (its capacity is `n`):
+            // SAFETY: the first pass wrote every element of `scratch`'s first `n` (it was
+            // cleared and has room for `n`):
             // each job wrote each item of its chunk once, at a distinct place of its own
             // ranges, whose lengths sum to its chunk's length, and the chunks cover `0..n`;
             // had any job panicked, `run` would have raised it before this.

@@ -251,10 +251,9 @@ fn load(fixture: &str, name: &str) -> (TestDB, EditionedFileId, span::FileId) {
         }]),
     );
     let file_id = *fixture.files.last().expect("the last crate's file");
-    let mut db = TestDB::default();
+    let mut db = TestDB::for_tests();
     fixture.change.apply(&mut db);
     let file_id = EditionedFileId::from_span_file_id(&db, file_id);
-    crate::const_macro::enable(&db);
     (db, file_id, root)
 }
 

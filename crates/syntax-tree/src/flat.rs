@@ -51,7 +51,7 @@ use std::{
 
 use blaze_ids::{radix, Domain};
 
-use crate::{SyntaxKind, TextRange, TextSize};
+use crate::{SyntaxKind, Text, TextRange, TextSize};
 
 /// Every how many elements a start is kept.
 const MARK: u32 = 8;
@@ -89,8 +89,9 @@ fn keeps(text: u32, size: u32) -> bool {
     text as u64 + 4 * size as u64 >= KEEP
 }
 
-/// The domain of [`FlatTree::subtree_hash`]. `hir-def` hashes the same writes under this name
-/// itself (`expr_store::body::subtree_hash`) and compares the two, so they must agree.
+/// The domain of [`FlatTree::subtree_hash`], which `hir-def` reads as a body's or a
+/// signature's tree hash (`expr_store::body::subtree_hash`): renaming it changes every hash
+/// stored under it.
 static SUBTREE: Domain = Domain::new("blaze v2 hir-def body tree 1");
 
 /// [`FlatTree::hash_subtree`]'s writes into BLAKE3. Its large writes (the text, the words) are
@@ -226,14 +227,14 @@ fn rank_in(nodes: &[u64], ranks: &[u32], at: u32) -> usize {
 /// the errors parsing it found, their ranges in the source.
 pub type Expand = fn(
     kind: SyntaxKind,
-    source: &Arc<str>,
+    source: &Text,
     range: TextRange,
     data: u32,
 ) -> (FlatTree, Vec<(TextRange, Box<str>)>);
 
 #[derive(Clone)]
 pub struct FlatTree {
-    source: Arc<str>,
+    source: Text,
     words: Box<[u32]>,
     /// Bit `at % 64` of word `at / 64`: whether element `at` is a node (not a token or a lazy
     /// node, whose parents are in their words).
@@ -274,7 +275,7 @@ struct Part {
 
 impl Part {
     /// This part with its text at `to` in `source` instead of at `from`.
-    fn moved(&self, source: &Arc<str>, from: u32, to: u32) -> Part {
+    fn moved(&self, source: &Text, from: u32, to: u32) -> Part {
         let moved = |range: TextRange| {
             TextRange::at((u32::from(range.start()) - from + to).into(), range.len())
         };
@@ -310,7 +311,7 @@ impl PartialEq for FlatTree {
             && self.kinds == other.kinds
             && self.marks.first() == other.marks.first()
             && self.lazy.as_ref().map(|it| it.data) == other.lazy.as_ref().map(|it| it.data)
-            && (Arc::ptr_eq(&self.source, &other.source) || self.source == other.source)
+            && (self.source.ptr_eq(&other.source) || self.source == other.source)
     }
 }
 
@@ -407,7 +408,7 @@ impl Packer {
     /// ([`Kept::new`]).
     fn finish(
         mut self,
-        source: Arc<str>,
+        source: Text,
         base: u32,
         lazy: Option<Box<Lazy>>,
         kept: &[(u32, u128)],
@@ -420,7 +421,7 @@ impl Packer {
     /// The tree, with the [`FlatTree::marks`] made while its elements were pushed.
     fn tree(
         mut self,
-        source: Arc<str>,
+        source: Text,
         marks: Box<[u32]>,
         lazy: Option<Box<Lazy>>,
         kept: &[(u32, u128)],
@@ -485,6 +486,24 @@ fn nodes(words: &[u32]) -> (Box<[u64]>, Box<[u32]>) {
     (nodes.into_boxed_slice(), ranks.into_boxed_slice())
 }
 
+/// Appends bits `from..to` of `src` to `dst`, which holds `len` bits, up to 64 at a time.
+fn append_bits(dst: &mut Vec<u64>, len: &mut usize, src: &[u64], mut from: usize, to: usize) {
+    while from < to {
+        let n = (64 - from % 64).min(to - from);
+        let bits = (src[from / 64] >> (from % 64)) & (u64::MAX >> (64 - n));
+        let at = *len % 64;
+        if at == 0 {
+            dst.push(0);
+        }
+        let last = dst.len() - 1;
+        dst[last] |= bits << at;
+        if at + n > 64 {
+            dst.push(bits >> (64 - at));
+        }
+        (*len, from) = (*len + n, from + n);
+    }
+}
+
 /// The entries of a side table sorted by element of the elements from `lo` to `hi`.
 fn in_range<T>(table: &[(u32, T)], lo: u32, hi: u32) -> &[(u32, T)] {
     let from = table.partition_point(|it| it.0 < lo);
@@ -494,7 +513,7 @@ fn in_range<T>(table: &[(u32, T)], lo: u32, hi: u32) -> &[(u32, T)] {
 
 /// `part`, parsed or not, as the part of a lazy node whose text moved from `from` to `to`,
 /// in `source`.
-fn moved_part(part: &OnceLock<Part>, source: &Arc<str>, from: u32, to: u32) -> OnceLock<Part> {
+fn moved_part(part: &OnceLock<Part>, source: &Text, from: u32, to: u32) -> OnceLock<Part> {
     let moved = OnceLock::new();
     if let Some(part) = part.get() {
         let _ = moved.set(part.moved(source, from, to));
@@ -523,7 +542,7 @@ impl FlatTree {
     /// The text the tree's ranges index: the whole file's source for a file's tree and its
     /// parts, the tree's own text for one built by appending text.
     #[inline]
-    pub fn source(&self) -> &Arc<str> {
+    pub fn source(&self) -> &Text {
         &self.source
     }
 
@@ -638,15 +657,6 @@ impl FlatTree {
             HUGE => at + self.big_value(at),
             size => at + size,
         }
-    }
-
-    /// Pushes element `at` to `packer` as a node of `size` elements or a token or lazy node,
-    /// under `parent`.
-    fn repack(&self, at: u32, packer: &mut Packer, parent: u32, size: u32) {
-        match self.words[at as usize] & TAG {
-            NODE => packer.node(self.kind(at), size, parent),
-            tag => packer.leaf(self.kind(at), tag, self.text_len(at), parent),
-        };
     }
 
     /// The children and tokens of `at`, in order.
@@ -963,7 +973,7 @@ impl FlatTree {
     pub(crate) fn subtree(&self, at: u32) -> FlatTree {
         let (lo, hi) = (at, self.end(at));
         let range = self.range(at);
-        let source: Arc<str> = Arc::from(&self.source[range]);
+        let source = Text::from(&self.source[range]);
         let mut words: Box<[u32]> = self.words[lo as usize..hi as usize].into();
         if words[0] & TAG != NODE {
             words[0] &= !(FAR << UP);
@@ -1003,9 +1013,125 @@ impl FlatTree {
         FlatTree { source, words, nodes, ranks, node_parents, far, kinds, big, marks, lazy, kept }
     }
 
+    /// [`Self::subtree`] of node `at` with the nodes `elided` under it, ascending and
+    /// disjoint, each replaced by an empty node of its kind: the copy `replace_subtree` of each
+    /// in turn would make, over the text left. Made in one pass over the elements outside
+    /// them, never reading their elements, text, lazy nodes or parts. Lazy nodes outside them
+    /// stay lazy with their parsed parts moved, and the kept hashes outside them are carried
+    /// but for their ancestors', which are made again when asked.
+    pub(crate) fn subtree_without(&self, at: u32, elided: &[u32]) -> FlatTree {
+        let (lo, hi) = (at, self.end(at));
+        assert!(!self.is_token(at), "element {at} ({:?}) is not a node", self.kind(at));
+        let mut from = lo + 1;
+        for &it in elided {
+            assert!(
+                it >= from && it < hi && !self.is_token(it),
+                "the elided element {it} is not a node under {at} (to {hi}) after those before it",
+            );
+            from = self.end(it);
+        }
+        let range = self.range(at);
+        // alloc: the elided ranges, once per copy
+        let ranges: Vec<TextRange> = elided.iter().map(|&it| self.range(it)).collect();
+        let cut: u32 = ranges.iter().map(|it| u32::from(it.len())).sum();
+        let mut text = String::with_capacity((u32::from(range.len()) - cut) as usize);
+        let mut start = range.start();
+        for it in &ranges {
+            text.push_str(&self.source[TextRange::new(start, it.start())]);
+            start = it.end();
+        }
+        text.push_str(&self.source[TextRange::new(start, range.end())]);
+        let source = Text::from(text);
+
+        /// A node of the copy whose elements are being pushed: its number, where its text
+        /// starts, the number after its subtree here, its kept hash here, and whether an
+        /// elided node is under it.
+        struct Open {
+            new: u32,
+            start: u32,
+            end: u32,
+            hash: Option<u128>,
+            cut: bool,
+        }
+        fn close(top: Open, open: &mut [Open], packer: &mut Packer, kept: &mut Vec<(u32, u128)>, offset: u32) {
+            let size = packer.words.len() as u32 - top.new;
+            packer.set_size(top.new, size);
+            if let Some(parent) = open.last_mut() {
+                parent.cut |= top.cut;
+            }
+            match (top.cut, top.hash) {
+                (true, _) if keeps(offset - top.start, size) => kept.push((top.new, 0)),
+                (false, Some(hash)) => kept.push((top.new, hash)),
+                _ => {}
+            }
+        }
+
+        let removed: u32 = elided.iter().map(|&it| self.end(it) - it - 1).sum();
+        let mut packer = Packer::with_capacity((hi - lo - removed) as usize);
+        // alloc: the copy's open nodes and kept hashes, once per copy
+        let (mut open, mut kept) = (Vec::with_capacity(32), Vec::new());
+        // alloc: the copy's lazy nodes, once per copy
+        let (mut lazy_nodes, mut lazy_parts) = (Vec::new(), Vec::new());
+        let mut olds = self.kept.between(lo, hi).peekable();
+        let base = u32::from(range.start());
+        // The next elided node, where the pass is in the copy's text, and the bytes cut before.
+        let (mut next, mut offset, mut cut) = (0, 0u32, 0u32);
+        let mut it = lo;
+        while it < hi {
+            while open.last().is_some_and(|top: &Open| top.end <= it) {
+                let top = open.pop().expect("a node open");
+                close(top, &mut open, &mut packer, &mut kept, offset);
+            }
+            let parent = open.last().map_or(NO_PARENT, |top| top.new);
+            let kind = self.kind(it);
+            if elided.get(next) == Some(&it) {
+                packer.node(kind, 1, parent);
+                open.last_mut().expect("an elided node is under the root").cut = true;
+                cut += u32::from(ranges[next].len());
+                next += 1;
+                it = self.end(it);
+                continue;
+            }
+            match self.words[it as usize] & TAG {
+                NODE => {
+                    while olds.next_if(|&(old, _)| old < it).is_some() {}
+                    let hash = olds.next_if(|&(old, _)| old == it).map(|(_, hash)| hash);
+                    let new = packer.node(kind, 0, parent);
+                    open.push(Open { new, start: offset, end: self.end(it), hash, cut: false });
+                }
+                tag => {
+                    let len = self.text_len(it);
+                    let new = packer.leaf(kind, tag, len, parent);
+                    if tag == LAZY {
+                        let lazy = self.lazy.as_deref().expect("a lazy node's tree has its lazy nodes");
+                        let n = lazy.nodes.binary_search(&it).expect("a lazy node is among the lazy nodes");
+                        lazy_nodes.push(new);
+                        lazy_parts.push(moved_part(&lazy.parts[n], &source, base + offset + cut, offset));
+                    }
+                    offset += len;
+                }
+            }
+            it += 1;
+        }
+        while let Some(top) = open.pop() {
+            close(top, &mut open, &mut packer, &mut kept, offset);
+        }
+        radix::sort_copy_by_key(&mut kept, |it| it.0);
+        let lazy = self.lazy.as_deref().filter(|_| !lazy_nodes.is_empty()).map(|lazy| {
+            // alloc: the copy's lazy nodes, once per copy
+            Box::new(Lazy {
+                nodes: lazy_nodes.into(),
+                parts: lazy_parts.into(),
+                expand: lazy.expand,
+                data: lazy.data,
+            })
+        });
+        packer.finish(source, 0, lazy, &kept)
+    }
+
     /// This tree, which has no lazy nodes, with its text at `to` in `source` instead of at
     /// `from` in its own.
-    fn moved(mut self, source: Arc<str>, from: u32, to: u32) -> FlatTree {
+    fn moved(mut self, source: Text, from: u32, to: u32) -> FlatTree {
         debug_assert!(self.lazy.is_none());
         for mark in self.marks.iter_mut() {
             *mark = *mark - from + to;
@@ -1020,7 +1146,7 @@ impl FlatTree {
     /// stay lazy and those of `with` come along; the parts already parsed of either are kept,
     /// moved to `source` (their text did not change, only where it is). A tree has one
     /// expander, so when both keep lazy nodes they must have the same `data`.
-    pub fn replace_subtree(&self, at: u32, with: &FlatTree, source: Arc<str>) -> FlatTree {
+    pub fn replace_subtree(&self, at: u32, with: &FlatTree, source: Text) -> FlatTree {
         let kind = self.kind(at);
         assert!(
             !self.is_token(at) && !with.is_token(0) && with.kind(0) == kind,
@@ -1052,34 +1178,123 @@ impl FlatTree {
         let (removed, added) = (hi - lo, with.len());
         let len = self.len() as u64 - removed as u64 + added as u64;
         assert!(len < NO_PARENT as u64, "a tree of 2^32 - 1 elements or more");
+        let len = len as u32;
         let after = |it: u32| it - removed + added;
+        let before = |it: u32| it - added + removed;
+        let up = self.parent(at);
 
-        // Repacked element by element: the ancestors' sizes change, and so does how far back
-        // the parent is of every token after `at` that is a child of an ancestor.
-        let mut packer = Packer::with_capacity(len as usize);
-        for it in 0..lo {
-            let parent = self.parent(it).unwrap_or(NO_PARENT);
+        // Copied around `at`, not repacked: what changes is the ancestors' sizes, how far back
+        // the parent is of their tokens after `at`, and the numbers past it in the tables.
+        // alloc: the new tree's columns and tables, once per edit
+        let mut words = Vec::with_capacity(len as usize);
+        words.extend_from_slice(&self.words[..lo as usize]);
+        words.extend_from_slice(&with.words);
+        words.extend_from_slice(&self.words[hi as usize..]);
+        // alloc: as `words`
+        let mut far = Vec::with_capacity(self.far.len() + with.far.len() + 1);
+        far.extend_from_slice(in_range(&self.far, 0, lo));
+        let root = &mut words[lo as usize];
+        if *root & TAG != NODE {
+            let distance = match up {
+                None => 0,
+                Some(parent) if lo - parent < FAR => lo - parent,
+                Some(parent) => {
+                    far.push((lo, parent));
+                    FAR
+                }
+            };
+            *root = (*root & !(FAR << UP)) | distance << UP;
+        }
+        far.extend(with.far.iter().map(|&(it, parent)| (it + lo, parent + lo)));
+        // Those after `hi` under an ancestor are pushed as the ancestors are walked.
+        let rest = in_range(&self.far, hi, self.len()).iter().filter(|it| it.1 >= lo);
+        far.extend(rest.map(|&(it, parent)| (after(it), after(parent))));
+        // alloc: as `words`
+        let mut big = Vec::with_capacity(self.big.len() + with.big.len());
+        // Before `lo`, a node whose subtree ends past it is an ancestor, its size set below.
+        big.extend(in_range(&self.big, 0, lo).iter().filter(|&&(it, _)| self.end(it) <= lo));
+        big.extend(with.big.iter().map(|&(it, value)| (it + lo, value)));
+        big.extend(in_range(&self.big, hi, self.len()).iter().map(|&(it, value)| (after(it), value)));
+        let (mut child, mut ancestor) = (at, up);
+        while let Some(it) = ancestor {
             let end = self.end(it);
-            let size = match end > lo {
-                true => end - it - removed + added,
-                false => end - it,
+            let size = after(end) - it;
+            let stored = match size < HUGE {
+                true => size,
+                false => {
+                    big.push((it, size));
+                    HUGE
+                }
             };
-            self.repack(it, &mut packer, parent, size);
+            let word = &mut words[it as usize];
+            *word = (*word & (FAR_KIND | TAG)) | stored << VALUE;
+            let mut next = self.end(child);
+            while next < end {
+                if self.words[next as usize] & TAG != NODE {
+                    let distance = after(next) - it;
+                    let back = match distance < FAR {
+                        true => distance,
+                        false => {
+                            far.push((after(next), it));
+                            FAR
+                        }
+                    };
+                    let word = &mut words[after(next) as usize];
+                    *word = (*word & !(FAR << UP)) | back << UP;
+                }
+                next = self.end(next);
+            }
+            (child, ancestor) = (it, self.parent(it));
         }
-        for it in 0..added {
-            let parent = match it {
-                0 => self.parent(at).unwrap_or(NO_PARENT),
-                _ => with.parent(it).expect("only the root has no parent") + lo,
-            };
-            with.repack(it, &mut packer, parent, with.end(it) - it);
-        }
-        for it in hi..self.len() {
-            let parent = match self.parent(it).expect("only the root has no parent") {
-                parent if parent < lo => parent,
-                parent => after(parent),
-            };
-            self.repack(it, &mut packer, parent, self.end(it) - it);
-        }
+        radix::sort_copy_by_key(&mut far, |it| it.0);
+        radix::sort_copy_by_key(&mut big, |it| it.0);
+        // alloc: as `words`
+        let mut kinds = Vec::with_capacity(self.kinds.len() + with.kinds.len());
+        kinds.extend_from_slice(in_range(&self.kinds, 0, lo));
+        kinds.extend(with.kinds.iter().map(|&(it, kind)| (it + lo, kind)));
+        kinds.extend(in_range(&self.kinds, hi, self.len()).iter().map(|&(it, kind)| (after(it), kind)));
+
+        let (ranked, past) = (self.rank(lo), self.nodes_before(hi));
+        let parent = up.unwrap_or(NO_PARENT);
+        let count = ranked + with.node_parents.len() + self.node_parents.len() - past;
+        // alloc: as `words`
+        let mut node_parents = Vec::with_capacity(count);
+        node_parents.extend_from_slice(&self.node_parents[..ranked]);
+        node_parents.extend(with.node_parents.iter().map(|&it| match it {
+            NO_PARENT => parent,
+            it => it + lo,
+        }));
+        node_parents.extend(self.node_parents[past..].iter().map(|&it| match it {
+            it if it < lo || it == NO_PARENT => it,
+            it => after(it),
+        }));
+        // alloc: as `words`
+        let mut nodes = Vec::with_capacity((len as usize).div_ceil(64));
+        let mut bits = 0;
+        append_bits(&mut nodes, &mut bits, &self.nodes, 0, lo as usize);
+        append_bits(&mut nodes, &mut bits, &with.nodes, 0, added as usize);
+        append_bits(&mut nodes, &mut bits, &self.nodes, hi as usize, self.len() as usize);
+        let mut counted = 0;
+        let ranks = nodes.iter().map(|it| {
+            let rank = counted;
+            counted += it.count_ones();
+            rank
+        });
+        // alloc: as `words`
+        let ranks: Box<[u32]> = ranks.collect();
+        debug_assert_eq!(counted as usize, node_parents.len(), "a node bit for each node");
+
+        // A start past `lo` is `with`'s, moved to `at`'s start, or that of the element it was
+        // before the edit, moved by what the text grew: a mark and up to seven lengths.
+        let first = lo.div_ceil(MARK);
+        let with_start = u32::from(new.start());
+        // alloc: as `words`
+        let mut marks = Vec::with_capacity((len / MARK + 1) as usize);
+        marks.extend_from_slice(&self.marks[..first as usize]);
+        marks.extend((first..=len / MARK).map(|mark| match mark * MARK {
+            it if it < lo + added => with.offset(it - lo) - with_start + start,
+            it => self.offset(before(it)) - old_end + new_end,
+        }));
 
         let ours = self.lazy.as_ref().map(|lazy| {
             let before = lazy.nodes.partition_point(|&it| it < lo);
@@ -1125,7 +1340,20 @@ impl FlatTree {
 
         let grown = u32::from(new.len()) as i64 - u32::from(old.len()) as i64;
         let hashes = self.kept_around(at, grown, (lo, hi), Some(with));
-        packer.finish(source, base, lazy, &hashes)
+        let kept = Kept::new(&nodes, &ranks, node_parents.len(), &hashes);
+        FlatTree {
+            source,
+            words: exact(words),
+            nodes: exact(nodes),
+            ranks,
+            node_parents: exact(node_parents),
+            far: exact(far),
+            kinds: exact(kinds),
+            big: exact(big),
+            marks: exact(marks),
+            lazy,
+            kept,
+        }
     }
 
     /// The tree with token `at`'s text replaced by `text` (its kind stays), over `source`, the
@@ -1133,7 +1361,7 @@ impl FlatTree {
     /// is as it was around it. No element but the token changes, so only its length and the
     /// starts kept after it are written: every lazy node stays lazy and every part already
     /// parsed is kept, those after the token moved to `source`.
-    pub fn replace_token(&self, at: u32, text: &str, source: Arc<str>) -> FlatTree {
+    pub fn replace_token(&self, at: u32, text: &str, source: Text) -> FlatTree {
         let kind = self.kind(at);
         assert!(self.is_token(at), "element {at} ({kind:?}) is not a token");
         let (old, root) = (self.range(at), self.range(0));
@@ -1265,7 +1493,7 @@ impl FlatTree {
             !part.is_token(0)
                 && part.kind(0) == kind
                 && part.lazy.is_none()
-                && Arc::ptr_eq(&part.source, &self.source)
+                && part.source.ptr_eq(&self.source)
                 && root == range,
             "the part of the lazy {kind:?} at {range:?} is not one {kind:?} over its text in \
              the tree's source without lazy nodes: its root is a {:?} at {root:?}",
@@ -1293,7 +1521,7 @@ fn exact<T: Copy>(vec: Vec<T>) -> Box<[T]> {
 pub struct FlatTreeBuilder {
     /// The text appended so far, when the builder has no source.
     text: String,
-    source: Option<Arc<str>>,
+    source: Option<Text>,
     /// The next byte of `source`.
     next: usize,
     /// Where in `source` the tree ends.
@@ -1329,7 +1557,7 @@ impl FlatTreeBuilder {
     /// A builder whose tokens are consecutive slices of `source`, which the tree keeps instead
     /// of a copy: `token` checks its text is the next bytes of `source` and moves past them,
     /// and `finish` checks every byte was reached.
-    pub fn sourced(source: Arc<str>) -> FlatTreeBuilder {
+    pub fn sourced(source: Text) -> FlatTreeBuilder {
         let range = TextRange::up_to(TextSize::of(&*source));
         FlatTreeBuilder::sourced_range(source, range)
     }
@@ -1337,7 +1565,7 @@ impl FlatTreeBuilder {
     /// A sourced builder ([`Self::sourced`]) of a tree over `range` of `source` only: its first
     /// token starts at `range.start()`, and `finish` checks every byte to `range.end()` was
     /// reached. The tree's ranges are in `source`, as a lazy node's part's are.
-    pub fn sourced_range(source: Arc<str>, range: TextRange) -> FlatTreeBuilder {
+    pub fn sourced_range(source: Text, range: TextRange) -> FlatTreeBuilder {
         let (start, end) = (usize::from(range.start()), usize::from(range.end()));
         assert!(
             end <= source.len() && source.is_char_boundary(start) && source.is_char_boundary(end),
@@ -1446,7 +1674,7 @@ impl FlatTreeBuilder {
         if len % MARK as usize == 0 {
             self.marks.push(self.offset() as u32);
         }
-        let source: Arc<str> = match self.source {
+        let source = match self.source {
             Some(source) => {
                 assert!(
                     self.next == self.end,
@@ -1457,7 +1685,7 @@ impl FlatTreeBuilder {
                 );
                 source
             }
-            None => Arc::from(self.text),
+            None => Text::from(self.text),
         };
         let lazy = match self.lazies.is_empty() {
             true => None,
@@ -1491,7 +1719,8 @@ mod tests {
     use super::{keeps, Expand, FlatTree, HUGE, LONG};
     use crate::{
         cursor::{SyntaxElement, SyntaxNode},
-        FlatTreeBuilder, NodeOrToken, SyntaxKind, TextRange, TextSize, TokenAtOffset, WalkEvent,
+        FlatTreeBuilder, NodeOrToken, SyntaxKind, Text, TextRange, TextSize, TokenAtOffset,
+        WalkEvent,
     };
 
     struct Rng(u64);
@@ -1601,7 +1830,7 @@ mod tests {
     /// source at `range`. Its error is the part's number, at the number.
     fn expand(
         kind: SyntaxKind,
-        source: &Arc<str>,
+        source: &Text,
         range: TextRange,
         data: u32,
     ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
@@ -2167,7 +2396,7 @@ mod tests {
                 assert!(!node.is_lazy() && tree.is_parsed(at));
                 let part = tree.part(at);
                 assert_eq!(tree.part_errors(at), &expanded_errors(&tree, at)[..]);
-                assert!(Arc::ptr_eq(part.source(), tree.source()));
+                assert!(part.source().ptr_eq(tree.source()));
                 assert_eq!((part.kind(0), part.range(0)), (tree.kind(at), tree.range(at)));
                 assert_eq!(part.lazies().count(), 0);
                 for child in node.children_with_tokens() {
@@ -2195,7 +2424,7 @@ mod tests {
         static CALLS: AtomicU32 = AtomicU32::new(0);
         fn counting(
             kind: SyntaxKind,
-            source: &Arc<str>,
+            source: &Text,
             range: TextRange,
             data: u32,
         ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
@@ -2250,18 +2479,18 @@ mod tests {
         let shape = Shape::Node(SyntaxKind(100), children, None);
         let mut text = String::new();
         text_of(&shape, &mut text);
-        let source: Arc<str> = text.into();
+        let source = Text::from(text);
         let mut builder = FlatTreeBuilder::sourced(source.clone());
         to_flat(&shape, &mut builder, true);
         builder.expand_with(expand, DATA);
         let tree = Arc::new(builder.finish());
-        assert!(Arc::ptr_eq(tree.source(), &source));
+        assert!(tree.source().ptr_eq(&source));
         let at = tree.lazies().next().unwrap();
-        assert!(Arc::ptr_eq(tree.part(at).source(), &source));
+        assert!(tree.part(at).source().ptr_eq(&source));
         let mut builder = FlatTreeBuilder::sourced(source.clone());
         to_flat(&shape, &mut builder, false);
         let full = builder.finish();
-        assert!(Arc::ptr_eq(full.source(), &source));
+        assert!(full.source().ptr_eq(&source));
         assert_eq!(full, build_flat(&shape, false));
         assert!(full.heap_size() <= full.len() as usize * 9 + 8, "arrays only, no text");
         let root = SyntaxNode::new_flat_root(tree.clone());
@@ -2286,7 +2515,7 @@ mod tests {
 
     #[test]
     fn a_tree_over_a_range_of_a_source_shares_it() {
-        let source: Arc<str> = "fn f() { body }".into();
+        let source = Text::from("fn f() { body }");
         let range = TextRange::new(7.into(), 15.into());
         let mut builder = FlatTreeBuilder::sourced_range(source.clone(), range);
         builder.start_node(SyntaxKind(101));
@@ -2296,7 +2525,7 @@ mod tests {
         builder.token(SyntaxKind(2), &source[13..15]);
         builder.finish_node();
         let tree = builder.finish();
-        assert!(Arc::ptr_eq(tree.source(), &source));
+        assert!(tree.source().ptr_eq(&source));
         assert_eq!(tree.range(0), range);
         assert_eq!(tree.range(2), TextRange::new(9.into(), 13.into()));
         assert_eq!(tree.token_text(3), " }");
@@ -2305,7 +2534,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "the tree ends at byte 9")]
     fn a_tree_over_a_range_reaches_its_end() {
-        let source: Arc<str> = "fn f() { body }".into();
+        let source = Text::from("fn f() { body }");
         let mut builder = FlatTreeBuilder::sourced_range(source.clone(), TextRange::new(7.into(), 15.into()));
         builder.start_node(SyntaxKind(101));
         builder.token(SyntaxKind(2), &source[7..9]);
@@ -2316,7 +2545,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "is not the source's next bytes")]
     fn a_tree_over_a_range_stays_in_it() {
-        let source: Arc<str> = "fn f() { body }".into();
+        let source = Text::from("fn f() { body }");
         let mut builder = FlatTreeBuilder::sourced_range(source.clone(), TextRange::new(7.into(), 9.into()));
         builder.start_node(SyntaxKind(101));
         builder.token(SyntaxKind(2), &source[7..10]);
@@ -2327,7 +2556,7 @@ mod tests {
     fn a_part_must_be_its_lazy_node_over_its_text() {
         fn short(
             kind: SyntaxKind,
-            source: &Arc<str>,
+            source: &Text,
             range: TextRange,
             _: u32,
         ) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
@@ -2400,7 +2629,7 @@ mod tests {
                 tree.lazies().filter(|&it| (it < lo || it >= hi) && tree.is_parsed(it)).count();
             let spliced = tree.replace_subtree(at, &build_outline(&with, expand), text.into());
             let built = build_outline(&edited, expand);
-            assert_eq!(spliced, *built, "seed {seed}");
+            same_arrays(&spliced, &built, seed);
             for it in 0..built.len() {
                 assert_eq!(
                     (spliced.parent(it), spliced.range(it), spliced.end(it), spliced.is_lazy(it)),
@@ -2424,6 +2653,17 @@ mod tests {
             }
             compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), true, seed);
         }
+    }
+
+    /// `spliced`, made by copying around an edit, is `built`, the edited tree built anew, in
+    /// every array, those equality leaves out too.
+    fn same_arrays(spliced: &FlatTree, built: &FlatTree, seed: u64) {
+        assert_eq!(spliced, built, "seed {seed}");
+        assert_eq!(
+            (&spliced.nodes, &spliced.ranks, &spliced.node_parents, &spliced.far, &spliced.marks),
+            (&built.nodes, &built.ranks, &built.node_parents, &built.far, &built.marks),
+            "seed {seed}"
+        );
     }
 
     #[test]
@@ -2480,7 +2720,7 @@ mod tests {
                 for &it in &parsed {
                     assert_eq!(new.part(it), built.part(it), "seed {seed}, lazy {it}");
                     assert_eq!(new.part_errors(it), &expanded_errors(&new, it)[..]);
-                    assert!(Arc::ptr_eq(new.part(it).source(), new.source()));
+                    assert!(new.part(it).source().ptr_eq(new.source()));
                 }
                 compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(new.clone())), false, seed);
                 assert!(new.lazies().filter(|&it| !parsed.contains(&it)).all(|it| !new.is_parsed(it)));
@@ -2514,7 +2754,7 @@ mod tests {
             text_of(&edited, &mut text);
             let spliced = tree.replace_subtree(row, &build_flat(&with, false), text.into());
             let built = build_flat(&edited, true);
-            assert_eq!(spliced, built);
+            same_arrays(&spliced, &built, seed);
             assert!((0..built.len()).all(|it| spliced.parent(it) == built.parent(it)));
             compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), false, seed);
         }
@@ -2617,8 +2857,8 @@ mod tests {
         grow(&mut Rng::new(seed), 0)
     }
 
-    /// One BLAKE3 pass over [`FlatTree::hash_subtree`]'s writes from `at`, as `hir-def`'s
-    /// `expr_store::body::subtree_hash` makes it.
+    /// One BLAKE3 pass over [`FlatTree::hash_subtree`]'s writes from `at`, made apart from
+    /// [`FlatTree::subtree_hash`] and its kept slots, to hold them to.
     fn fresh_hash(tree: &FlatTree, at: u32) -> u128 {
         struct Feed(blaze_ids::Hasher);
         impl Hasher for Feed {
@@ -2742,7 +2982,9 @@ mod tests {
             for &it in with_tree.kept.elements.iter() {
                 assert_eq!(made(&spliced, it + lo), with_made, "seed {seed}, {it} of the new");
             }
-            check_edited(&spliced, &build_flat(&edited, true), seed);
+            let built = build_flat(&edited, true);
+            same_arrays(&spliced, &built, seed);
+            check_edited(&spliced, &built, seed);
 
             // Tokens replaced, one making its ancestors keep their hashes and one not again.
             for step in 0..3 {
@@ -2804,5 +3046,137 @@ mod tests {
             }
             assert_ne!(tree.subtree_hash(0), tree.subtree_hash(first), "seed {seed}");
         }
+    }
+
+    /// `tree.subtree(at)` with the nodes `elided` replaced in turn, the last first, by empty
+    /// nodes of their kinds.
+    fn without_in_turn(tree: &FlatTree, at: u32, elided: &[u32]) -> FlatTree {
+        let mut copy = tree.subtree(at);
+        for &it in elided.iter().rev() {
+            let it = it - at;
+            let mut empty = FlatTreeBuilder::new();
+            empty.start_node(copy.kind(it));
+            empty.finish_node();
+            let range = copy.range(it);
+            let text = copy.text();
+            let text = format!("{}{}", &text[..usize::from(range.start())], &text[usize::from(range.end())..]);
+            copy = copy.replace_subtree(it, &empty.finish(), text.into());
+        }
+        copy
+    }
+
+    #[test]
+    fn a_subtree_without_nodes_is_the_subtree_with_them_replaced() {
+        for seed in 0..200 {
+            let mut rng = Rng::new(seed ^ 0x2f1d);
+            let nested = seed % 2 == 1;
+            let mut shape = match nested {
+                true => nested_shape(seed),
+                false => random_shape(seed),
+            };
+            let outline = seed % 3 != 0;
+            if outline {
+                make_lazy(&mut shape, &mut rng);
+            }
+            let tree = match outline {
+                true => build_outline(&shape, expand),
+                false => Arc::new(build_flat(&shape, seed % 4 == 1)),
+            };
+            // Some parts parsed and some not, some hashes made and some not.
+            for (i, it) in tree.lazies().enumerate() {
+                if i % 2 == 0 {
+                    let _ = tree.part(it);
+                }
+            }
+            if seed % 5 != 0 {
+                hash_all(&tree);
+            }
+            let nodes: Vec<u32> = (0..tree.len()).filter(|&it| !tree.is_token(it)).collect();
+            let ats: Vec<u32> = match nested {
+                true => std::iter::once(0)
+                    .chain((0..6).map(|_| nodes[rng.below(nodes.len() as u64) as usize]))
+                    .collect(),
+                false => nodes.clone(),
+            };
+            for at in ats {
+                let under: Vec<u32> =
+                    (at + 1..tree.end(at)).filter(|&it| !tree.is_token(it)).collect();
+                let mut lists = vec![Vec::new()];
+                for _ in 0..under.len().min(4) {
+                    lists.push(vec![under[rng.below(under.len() as u64) as usize]]);
+                }
+                let mut list = Vec::new();
+                let mut from = at + 1;
+                for &it in &under {
+                    if it >= from && rng.below(3) == 0 {
+                        list.push(it);
+                        from = tree.end(it);
+                    }
+                }
+                lists.push(list);
+                for elided in &lists {
+                    check_without(&tree, at, elided, seed);
+                }
+            }
+        }
+    }
+
+    /// `tree.subtree_without(at, elided)` is [`without_in_turn`]: the same elements and text,
+    /// parts and kept hashes, and the hashes made outside the elided nodes and their ancestors
+    /// carried.
+    fn check_without(tree: &FlatTree, at: u32, elided: &[u32], seed: u64) {
+        let context = format!("seed {seed}, {at} without {elided:?}");
+        let without = tree.subtree_without(at, elided);
+        let expected = without_in_turn(tree, at, elided);
+        assert_eq!(without, expected, "{context}");
+        for it in 0..expected.len() {
+            assert_eq!(
+                (without.parent(it), without.range(it), without.end(it), without.is_lazy(it)),
+                (expected.parent(it), expected.range(it), expected.end(it), expected.is_lazy(it)),
+                "{context}, element {it}"
+            );
+        }
+        assert!(without.lazies().eq(expected.lazies()), "{context}");
+        let parsed: Vec<u32> = without.lazies().filter(|&it| without.is_parsed(it)).collect();
+        assert!(parsed.iter().copied().eq(expected.lazies().filter(|&it| expected.is_parsed(it))));
+        for &it in &parsed {
+            assert_eq!(without.part(it), expected.part(it), "{context}, lazy {it}");
+            assert_eq!(without.part_errors(it), expected.part_errors(it), "{context}, lazy {it}");
+            assert!(without.part(it).source().ptr_eq(without.source()));
+        }
+        // Where each element outside the elided nodes is in the copy.
+        let moved = |it: u32| {
+            let removed: u32 =
+                elided.iter().filter(|&&e| tree.end(e) <= it).map(|&e| tree.end(e) - e - 1).sum();
+            it - at - removed
+        };
+        let inside = |it: u32| elided.iter().any(|&e| e <= it && it < tree.end(e));
+        let holds = |it: u32| elided.iter().any(|&e| it < e && e < tree.end(it));
+        for &it in tree.kept.elements.iter().filter(|&&it| at <= it && it < tree.end(at)) {
+            if !inside(it) && !holds(it) {
+                assert_eq!(made(&without, moved(it)), made(tree, it), "{context}, element {it}");
+            }
+        }
+        for &it in elided {
+            assert!(!made(&without, moved(it)), "{context}: an elided node is empty");
+        }
+        check_edited(&without, &expected, seed);
+    }
+
+    /// The cursor's `clone_subtree_without` is `subtree_without` of its nodes' numbers.
+    #[test]
+    fn a_cursor_clones_a_subtree_without_nodes() {
+        let tree = Arc::new(build_flat(&big_shape(1), true));
+        let root = SyntaxNode::new_flat_root(Arc::clone(&tree));
+        let rows = root.first_child().unwrap();
+        let elided: Vec<SyntaxNode> = rows.children().step_by(2).collect();
+        assert_eq!(elided.len(), 50);
+        let numbers: Vec<u32> = elided.iter().map(|it| it.flat().unwrap().1).collect();
+        let at = rows.flat().unwrap().1;
+        let copy = rows.clone_subtree_without(elided.iter());
+        assert_eq!(**copy.flat_tree().unwrap(), tree.subtree_without(at, &numbers));
+        assert_eq!(**copy.flat_tree().unwrap(), without_in_turn(&tree, at, &numbers));
+        let alone = rows.clone_subtree_without(std::iter::empty::<&SyntaxNode>());
+        assert_eq!(**alone.flat_tree().unwrap(), tree.subtree(at));
     }
 }

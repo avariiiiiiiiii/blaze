@@ -13,7 +13,7 @@ mod tests;
 
 use std::{borrow::Borrow, cell::RefCell, mem, ops::Index, sync::LazyLock};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use blaze_ids::radix;
 use cfg::CfgExpr;
 use either::Either;
@@ -27,7 +27,10 @@ use thin_vec::ThinVec;
 
 use crate::{
     AdtId, BlockId, ExpressionStoreOwnerId, GenericDefId,
-    expr_store::path::{AssociatedTypeBinding, GenericArg, GenericArgs, NormalPath, Path},
+    expr_store::path::{
+        AssociatedTypeBinding, GenericArg, GenericArgs, GenericArgsIdx, NormalPath, Path,
+        PathColumns, PathIdx,
+    },
     hir::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsm, Label, LabelId, Literal, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat,
@@ -37,7 +40,7 @@ use crate::{
     nameres::{DefMap, block_def_map},
     signatures::VariantFields,
     type_ref::{
-        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, PathId, RefType, TypeBound,
+        ArrayType, ConstRef, FnType, LifetimeRef, LifetimeRefId, RefType, TypeBound,
         TypeColumns, TypeRef, TypeRefId, UseArgRef,
     },
 };
@@ -522,6 +525,7 @@ thread_local! {
     /// This thread's spare scratch, a stack: lowering one store can run a query that lowers
     /// another on the same thread, which takes the next set (or a fresh one) and gives it back
     /// before the outer one finishes. Only this thread touches it: no lock, no shared write.
+    // alloc: const-empty, once per thread.
     static POOL: RefCell<Vec<Scratch>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -631,8 +635,10 @@ impl ExpressionStoreBuilder {
             labels: Arena::new(),
             lifetimes: Arena::new(),
             binding_owners: FxHashMap::default(),
+            // alloc: empty until a block with items, once per store.
             block_scopes: Vec::new(),
             ident_hygiene: FxHashMap::default(),
+            // alloc: empty until a macro-expanded type, once per store.
             type_hygiene: Vec::new(),
             block_editions: FxHashMap::default(),
             overflow_inheriting: FxHashSet::default(),
@@ -648,10 +654,13 @@ impl ExpressionStoreBuilder {
             lifetime_map_back,
             lifetime_map,
             binding_definitions,
+            // alloc: empty until a record field, once per store.
             field_map_back: Vec::new(),
+            // alloc: empty until a record pattern field, once per store.
             pat_field_map_back: Vec::new(),
             template_map: None,
             expansions,
+            // alloc: empty unless lowering reports one, the error path.
             diagnostics: Vec::new(),
             freeze,
             record: true,
@@ -668,9 +677,10 @@ impl ExpressionStoreBuilder {
         self.types.push(type_ref)
     }
 
-    /// A `TypeRef::Path`, `path` moved into its table where [`Self::alloc_type_ref`] clones it.
+    /// A `TypeRef::Path` of the path `path` lowering pushed, where [`Self::alloc_type_ref`]
+    /// copies a view's rows.
     #[inline]
-    pub(crate) fn alloc_path_type(&mut self, path: Path) -> TypeRefId {
+    pub(crate) fn alloc_path_type(&mut self, path: PathIdx) -> TypeRefId {
         self.types.push_path(path)
     }
 
@@ -795,17 +805,18 @@ impl ExpressionStoreBuilder {
         self.lists.truncate(mark);
     }
 
-    // The by-value allocations below move their cold values (paths, names, literals, generic
-    // arguments) into the store where building the view would clone them. Their lists are
-    // copied into the store's arrays, as `alloc_expr` copies a view's.
+    // The by-value allocations below move their cold values (names, literals) into the store
+    // where building the view would clone them, and take the paths and generic arguments
+    // lowering pushed into the store's path columns by index. Their lists are copied into the
+    // store's arrays, as `alloc_expr` copies a view's.
 
     #[inline]
-    pub(crate) fn alloc_path_expr(&mut self, path: Path) -> ExprId {
+    pub(crate) fn alloc_path_expr(&mut self, path: PathIdx) -> ExprId {
         self.columns.push_path_expr(path)
     }
 
     #[inline]
-    pub(crate) fn alloc_path_pat(&mut self, path: Path) -> PatId {
+    pub(crate) fn alloc_path_pat(&mut self, path: PathIdx) -> PatId {
         self.columns.push_path_pat(path)
     }
 
@@ -830,7 +841,7 @@ impl ExpressionStoreBuilder {
         receiver: ExprId,
         method_name: Name,
         args: &[ExprId],
-        generic_args: Option<GenericArgs>,
+        generic_args: Option<GenericArgsIdx>,
     ) -> ExprId {
         self.columns.push_method_call(receiver, method_name, args, generic_args)
     }
@@ -838,7 +849,7 @@ impl ExpressionStoreBuilder {
     #[inline]
     pub(crate) fn alloc_record_lit(
         &mut self,
-        path: Path,
+        path: PathIdx,
         fields: &[RecordLitField],
         spread: RecordSpread,
     ) -> ExprId {
@@ -848,7 +859,7 @@ impl ExpressionStoreBuilder {
     #[inline]
     pub(crate) fn alloc_record_pat(
         &mut self,
-        path: Path,
+        path: PathIdx,
         args: &[RecordFieldPat],
         ellipsis: bool,
     ) -> PatId {
@@ -858,7 +869,7 @@ impl ExpressionStoreBuilder {
     #[inline]
     pub(crate) fn alloc_tuple_struct_pat(
         &mut self,
-        path: Path,
+        path: PathIdx,
         args: &[PatId],
         ellipsis: Option<u32>,
     ) -> PatId {
@@ -873,33 +884,33 @@ impl ExpressionStoreBuilder {
 
     #[inline]
     pub(crate) fn alloc_expr(&mut self, expr: Expr<'_>) -> ExprId {
-        self.columns.push_expr(expr)
+        self.columns.push_expr(&mut self.types.paths, expr)
     }
 
     #[inline]
     pub(crate) fn alloc_pat(&mut self, pat: Pat<'_>) -> PatId {
-        self.columns.push_pat(pat)
+        self.columns.push_pat(&mut self.types.paths, pat)
     }
 
     #[inline]
     pub(crate) fn expr(&self, id: ExprId) -> Expr<'_> {
-        self.columns.expr(id)
+        self.columns.expr(&self.types.paths, id)
     }
 
     #[inline]
     pub(crate) fn pat(&self, id: PatId) -> Pat<'_> {
-        self.columns.pat(id)
+        self.columns.pat(&self.types.paths, id)
     }
 
     /// Replaces an expression: read it with [`Self::expr`], build the changed view, set it.
     #[inline]
     pub(crate) fn set_expr(&mut self, id: ExprId, expr: Expr<'_>) {
-        self.columns.set_expr(id, expr)
+        self.columns.set_expr(&mut self.types.paths, id, expr)
     }
 
     #[inline]
     pub(crate) fn set_pat(&mut self, id: PatId, pat: Pat<'_>) {
-        self.columns.set_pat(id, pat)
+        self.columns.set_pat(&mut self.types.paths, id, pat)
     }
 
     #[inline]
@@ -999,6 +1010,7 @@ impl ExpressionStoreBuilder {
                         asm_to_captures,
                         implicit_capture_to_source,
                     } = *template;
+                    // alloc: once per store with format templates, the cold side of the map.
                     Box::new(FormatTemplate {
                         format_args_to_captures: IdTable::from_pushed(format_args_to_captures),
                         asm_to_captures: IdTable::from_pushed(asm_to_captures),
@@ -1009,6 +1021,7 @@ impl ExpressionStoreBuilder {
                 });
                 let expr_only = (has_exprs || !expansions.is_empty() || !diagnostics.is_empty())
                     .then(|| {
+                        // alloc: once per store, keeps the map small for signatures.
                         Box::new(ExpressionOnlySourceMap {
                             expr_map,
                             expr_map_back,
@@ -1047,6 +1060,7 @@ impl ExpressionStoreBuilder {
                 let binding_owners = match binding_owners.is_empty() {
                     true => Box::default(),
                     false => {
+                        // alloc: the column itself, once per store.
                         let mut column = vec![NO_OWNER; bindings.len()].into_boxed_slice();
                         for (binding, owner) in binding_owners {
                             column[binding.into_raw().into_u32() as usize] =
@@ -1055,12 +1069,16 @@ impl ExpressionStoreBuilder {
                         column
                     }
                 };
+                // alloc: the frozen sorted column, once per store.
                 let mut ident_hygiene: Box<[_]> = ident_hygiene.into_iter().collect();
                 ident_hygiene.sort_unstable_by_key(|&(id, _)| id);
+                // alloc: the frozen sorted column, once per store.
                 let mut block_editions: Box<[_]> = block_editions.into_iter().collect();
                 radix::sort_copy_by_key(&mut block_editions, |&(id, _)| id.into_raw().into_u32());
+                // alloc: the frozen sorted column, once per store.
                 let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
                 radix::sort_copy_by_key(&mut overflow_inheriting, |it| it.into_raw().into_u32());
+                // alloc: once per store, keeps signature-only stores small.
                 Some(Box::new(ExpressionOnlyStore {
                     columns,
                     bindings,
@@ -1109,7 +1127,7 @@ impl ExpressionStore {
         self.types.iter()
     }
 
-    pub fn of(db: &dyn SourceDatabase, def: ExpressionStoreOwnerId) -> &ExpressionStore {
+    pub fn of(db: &Db, def: ExpressionStoreOwnerId) -> &ExpressionStore {
         match def {
             ExpressionStoreOwnerId::Signature(def) => {
                 use crate::signatures::{
@@ -1137,7 +1155,7 @@ impl ExpressionStore {
     }
 
     pub fn with_source_map(
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: ExpressionStoreOwnerId,
     ) -> (&ExpressionStore, &ExpressionStoreSourceMap) {
         match def {
@@ -1232,7 +1250,7 @@ impl ExpressionStore {
     /// Returns an iterator over all block expressions in this store that define inner items.
     pub fn blocks<'a>(
         &'a self,
-        db: &'a dyn SourceDatabase,
+        db: &'a Db,
     ) -> impl Iterator<Item = (BlockId, &'a DefMap)> + 'a {
         self.expr_only
             .as_ref()
@@ -1366,7 +1384,7 @@ impl ExpressionStore {
             Expr::MethodCall { receiver, args, generic_args, method_name: _ } => {
                 visitor.on_expr(receiver);
                 visitor.on_exprs(args);
-                visitor.on_generic_args_opt(&generic_args);
+                visitor.on_generic_args_opt(generic_args);
             }
             Expr::Match { expr, arms } => {
                 visitor.on_expr(expr);
@@ -1507,7 +1525,7 @@ impl ExpressionStore {
                 params.iter().for_each(|(_, param_ty)| visitor.on_type(*param_ty));
             }
             TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
-                visitor.on_type_bounds(bounds)
+                visit_type_bounds(&mut visitor, &self.types.paths, bounds)
             }
         }
     }
@@ -1569,18 +1587,19 @@ impl ExpressionStore {
     /// The expression `id`, decoded from the store's columns.
     #[inline]
     pub fn expr(&self, id: ExprId) -> Expr<'_> {
-        self.assert_expr_only().columns.expr(id)
+        self.assert_expr_only().columns.expr(&self.types.paths, id)
     }
 
     /// The pattern `id`, decoded from the store's columns.
     #[inline]
     pub fn pat(&self, id: PatId) -> Pat<'_> {
-        self.assert_expr_only().columns.pat(id)
+        self.assert_expr_only().columns.pat(&self.types.paths, id)
     }
 
     #[inline]
     pub fn exprs(&self) -> impl Iterator<Item = (ExprId, Expr<'_>)> {
-        self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.exprs())
+        let paths = &self.types.paths;
+        self.expr_only.as_deref().into_iter().flat_map(move |it| it.columns.exprs(paths))
     }
 
     /// How many expressions the store holds.
@@ -1616,7 +1635,8 @@ impl ExpressionStore {
 
     #[inline]
     pub fn pats(&self) -> impl Iterator<Item = (PatId, Pat<'_>)> {
-        self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.pats())
+        let paths = &self.types.paths;
+        self.expr_only.as_deref().into_iter().flat_map(move |it| it.columns.pats(paths))
     }
 
     #[inline]
@@ -1659,12 +1679,12 @@ pub trait StoreVisitor: Sized {
         let _ = lifetime;
     }
 
-    fn on_generic_args(&mut self, args: &GenericArgs) {
+    fn on_generic_args(&mut self, args: GenericArgs<'_>) {
         visit_generic_args(self, args);
     }
 }
 
-pub(crate) fn visit_generic_args<V: StoreVisitor>(visitor: &mut V, args: &GenericArgs) {
+pub(crate) fn visit_generic_args<V: StoreVisitor>(visitor: &mut V, args: GenericArgs<'_>) {
     let GenericArgs { args, bindings, parenthesized: _, has_self_type: _ } = args;
     for arg in args {
         match arg {
@@ -1675,8 +1695,34 @@ pub(crate) fn visit_generic_args<V: StoreVisitor>(visitor: &mut V, args: &Generi
     }
     for AssociatedTypeBinding { name: _, args, type_ref, bounds } in bindings {
         visitor.on_generic_args_opt(args);
-        visitor.on_type_opt(*type_ref);
-        visitor.on_type_bounds(bounds);
+        visitor.on_type_opt(type_ref);
+        visit_type_bounds(visitor, bindings.columns(), bounds);
+    }
+}
+
+/// The paths and lifetimes of `bounds`, their `use<..>` arguments read from `paths`, the
+/// columns the bounds are of.
+pub(crate) fn visit_type_bounds<V: StoreVisitor>(
+    visitor: &mut V,
+    paths: &PathColumns,
+    bounds: &[TypeBound],
+) {
+    for bound in bounds {
+        match *bound {
+            TypeBound::Path(path_id, _) | TypeBound::ForLifetime(_, path_id) => {
+                visitor.on_type(path_id.type_ref())
+            }
+            TypeBound::Lifetime(lifetime) => visitor.on_lifetime(lifetime),
+            TypeBound::Use(args) => {
+                for arg in paths.use_args(args) {
+                    match arg {
+                        UseArgRef::Lifetime(lifetime) => visitor.on_lifetime(*lifetime),
+                        UseArgRef::Name(_) => {}
+                    }
+                }
+            }
+            TypeBound::Error => {}
+        }
     }
 }
 
@@ -1697,35 +1743,17 @@ impl<V: StoreVisitor> StoreVisitor for &mut V {
         V::on_lifetime(self, lifetime);
     }
 
-    fn on_generic_args(&mut self, args: &GenericArgs) {
+    fn on_generic_args(&mut self, args: GenericArgs<'_>) {
         V::on_generic_args(self, args);
     }
 }
 
 pub trait StoreVisitorExt: StoreVisitor {
-    fn on_type_bound(&mut self, bound: &TypeBound) {
-        match bound {
-            TypeBound::Path(path_id, _) => self.on_type(path_id.type_ref()),
-            TypeBound::ForLifetime(_, path_id) => self.on_type(path_id.type_ref()),
-            TypeBound::Lifetime(lifetime) => self.on_lifetime(*lifetime),
-            TypeBound::Use(args) => {
-                for arg in args {
-                    match arg {
-                        UseArgRef::Lifetime(lifetime) => self.on_lifetime(*lifetime),
-                        UseArgRef::Name(_) => {}
-                    }
-                }
-            }
-            TypeBound::Error => {}
-        }
-    }
-
-    fn on_path(&mut self, path: &Path) {
+    fn on_path(&mut self, path: Path<'_>) {
         match path {
-            Path::Normal(path) => {
-                let NormalPath { generic_args, type_anchor, mod_path: _ } = &**path;
+            Path::Normal(NormalPath { generic_args, type_anchor, mod_path: _ }) => {
                 generic_args.iter().for_each(|generic_arg| self.on_generic_args_opt(generic_arg));
-                self.on_type_opt(*type_anchor);
+                self.on_type_opt(type_anchor);
             }
             Path::BarePath(_) | Path::LangItem(..) => {}
         }
@@ -1751,9 +1779,9 @@ pub trait StoreVisitorExt: StoreVisitor {
             self.on_lifetime(lifetime);
         }
     }
-    fn on_generic_args_opt(&mut self, args: &Option<impl Borrow<GenericArgs>>) {
+    fn on_generic_args_opt(&mut self, args: Option<GenericArgs<'_>>) {
         if let Some(args) = args {
-            self.on_generic_args(args.borrow());
+            self.on_generic_args(args);
         }
     }
 
@@ -1765,9 +1793,6 @@ pub trait StoreVisitorExt: StoreVisitor {
     }
     fn on_types(&mut self, types: impl IntoIterator<Item: Borrow<TypeRefId>>) {
         types.into_iter().for_each(|ty| self.on_type(*ty.borrow()));
-    }
-    fn on_type_bounds(&mut self, bounds: impl IntoIterator<Item: Borrow<TypeBound>>) {
-        bounds.into_iter().for_each(|bound| self.on_type_bound(bound.borrow()));
     }
 }
 impl<V: StoreVisitor> StoreVisitorExt for V {}
@@ -1796,15 +1821,6 @@ impl Index<LifetimeRefId> for ExpressionStore {
     #[inline]
     fn index(&self, b: LifetimeRefId) -> &LifetimeRef {
         &self.lifetimes[b]
-    }
-}
-
-impl Index<PathId> for ExpressionStore {
-    type Output = Path;
-
-    #[inline]
-    fn index(&self, index: PathId) -> &Self::Output {
-        self.types.path(index)
     }
 }
 
@@ -1981,7 +1997,7 @@ mod scratch_tests {
         assert_eq!((statements.iter().collect::<Vec<_>>(), tail), (vec![inner_let], Some(missing)));
         let columns = store.hir_columns().unwrap();
         assert_eq!(columns.statement_count(), 4, "each block's run, and no stack rows");
-        assert_eq!(columns.check(0, 0, 0), Ok(()));
+        assert_eq!(columns.check(0, 0, 0, &store.types.paths), Ok(()));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Utilities for mapping between hir IDs and the surface syntax.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use either::Either;
 use hir_expand::{AstId, InFile};
 use la_arena::{Arena, ArenaMap, Idx};
@@ -13,11 +13,11 @@ use crate::{
 
 pub trait HasSource {
     type Value: AstNode;
-    fn source(&self, db: &dyn SourceDatabase) -> InFile<Self::Value> {
+    fn source(&self, db: &Db) -> InFile<Self::Value> {
         let InFile { file_id, value } = self.ast_ptr(db);
         InFile::new(file_id, value.to_node(&file_id.parse_or_expand(db)))
     }
-    fn ast_ptr(&self, db: &dyn SourceDatabase) -> InFile<AstPtr<Self::Value>>;
+    fn ast_ptr(&self, db: &Db) -> InFile<AstPtr<Self::Value>>;
 }
 
 impl<T> HasSource for T
@@ -25,7 +25,7 @@ where
     T: AstIdLoc,
 {
     type Value = T::Ast;
-    fn ast_ptr(&self, db: &dyn SourceDatabase) -> InFile<AstPtr<Self::Value>> {
+    fn ast_ptr(&self, db: &Db) -> InFile<AstPtr<Self::Value>> {
         let id = self.ast_id();
         let ast_id_map = id.file_id.ast_id_map(db);
         InFile::new(id.file_id, ast_id_map.get(id.value))
@@ -34,12 +34,12 @@ where
 
 pub trait HasChildSource<ChildId> {
     type Value;
-    fn child_source(&self, db: &dyn SourceDatabase) -> InFile<ArenaMap<ChildId, Self::Value>>;
+    fn child_source(&self, db: &Db) -> InFile<ArenaMap<ChildId, Self::Value>>;
 }
 
 /// Maps a `UseTree` contained in this import back to its AST node.
 pub fn use_tree_to_ast(
-    db: &dyn SourceDatabase,
+    db: &Db,
     use_ast_id: AstId<ast::Use>,
     index: Idx<ast::UseTree>,
 ) -> ast::UseTree {
@@ -48,7 +48,7 @@ pub fn use_tree_to_ast(
 
 /// Maps a `UseTree` contained in this import back to its AST node.
 fn use_tree_source_map(
-    db: &dyn SourceDatabase,
+    db: &Db,
     use_ast_id: AstId<ast::Use>,
 ) -> Arena<ast::UseTree> {
     // Re-lower the AST item and get the source map.
@@ -67,7 +67,7 @@ impl HasChildSource<la_arena::Idx<ast::UseTree>> for UseId {
     type Value = ast::UseTree;
     fn child_source(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
     ) -> InFile<ArenaMap<la_arena::Idx<ast::UseTree>, Self::Value>> {
         let loc = self.lookup(db);
         InFile::new(loc.id.file_id, use_tree_source_map(db, loc.id).into_iter().collect())
@@ -78,7 +78,7 @@ impl HasChildSource<LocalTypeOrConstParamId> for GenericDefId {
     type Value = Either<ast::TypeOrConstParam, ast::Trait>;
     fn child_source(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
     ) -> InFile<ArenaMap<LocalTypeOrConstParamId, Self::Value>> {
         let generic_params = GenericParams::of(db, *self);
         let mut idx_iter = generic_params.iter_type_or_consts().map(|(idx, _)| idx);
@@ -112,7 +112,7 @@ impl HasChildSource<LocalLifetimeParamId> for GenericDefId {
     type Value = ast::LifetimeParam;
     fn child_source(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
     ) -> InFile<ArenaMap<LocalLifetimeParamId, Self::Value>> {
         let generic_params = GenericParams::of(db, *self);
         let idx_iter = generic_params.iter_lt().map(|(idx, _)| idx);
@@ -134,7 +134,7 @@ impl HasChildSource<LocalLifetimeParamId> for GenericDefId {
 impl HasChildSource<LocalFieldId> for VariantId {
     type Value = Either<ast::TupleField, ast::RecordField>;
 
-    fn child_source(&self, db: &dyn SourceDatabase) -> InFile<ArenaMap<LocalFieldId, Self::Value>> {
+    fn child_source(&self, db: &Db) -> InFile<ArenaMap<LocalFieldId, Self::Value>> {
         let (src, container) = match *self {
             VariantId::EnumVariantId(it) => {
                 let lookup = it.lookup(db);

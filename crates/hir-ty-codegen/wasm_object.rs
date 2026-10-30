@@ -651,15 +651,11 @@ mod tests {
     fn the_bitset_writes_the_bytes_the_set_did() {
         let names: Vec<&str> =
             KNOWN_FEATURES.iter().copied().chain(["sse2", "", "simd", "bulk-memory-opt2"]).collect();
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for _ in 0..2_000 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            let len = (seed % 12) as usize;
-            let enabled: Vec<String> = (0..len)
-                .map(|at| names[(seed >> (at * 5) % 60) as usize % names.len()].to_owned())
-                .collect();
+            let len = rng.index(12);
+            let enabled: Vec<String> =
+                (0..len).map(|_| names[rng.index(names.len())].to_owned()).collect();
             assert_eq!(target_features(enabled.clone()), reference(enabled.clone()), "{enabled:?}");
         }
         assert_eq!(target_features(Vec::new()), reference(Vec::new()));

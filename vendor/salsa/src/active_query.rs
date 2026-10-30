@@ -680,8 +680,10 @@ impl Backtrace {
                             database_key_index: query.database_key_index,
                             durability: query.durability,
                             changed_at: query.changed_at,
+                            // alloc: the edge: a backtrace captured for a panic or cycle report
                             cycle_heads: query.cycle_heads.clone(),
                         })
+                        // alloc: the edge: a backtrace captured for a panic or cycle report
                         .collect(),
                 )
             })

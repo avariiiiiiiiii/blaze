@@ -12,6 +12,7 @@ pub mod persist;
 
 use std::{cell::OnceCell, iter, mem, sync::OnceLock};
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, CallableDefId, ConstId, ConstParamId, EnumId, EnumVariantId,
@@ -31,8 +32,8 @@ use hir_def::{
     lang_item::LangItems,
     resolver::{HasResolver, LifetimeNs, Resolver, TypeNs},
     signatures::{
-        ConstSignature, FunctionSignature, ImplSignature, StaticSignature, StructSignature,
-        TraitFlags, TraitSignature, TypeAliasFlags, TypeAliasSignature,
+        ConstSignature, FunctionSignature, ImplSignature, StaticFlags, StaticSignature,
+        StructSignature, TraitFlags, TraitSignature, TypeAliasFlags, TypeAliasSignature,
     },
     type_ref::{
         ConstRef, FnType, LifetimeRef, LifetimeRefId, PathId, TraitBoundModifier,
@@ -61,7 +62,8 @@ pub use hir_def::LoweringMode;
 pub(crate) use hir_def::TrackedStructToken;
 
 use crate::{
-    ImplTraitId, Span, TyLoweringDiagnostic,
+    ElidedLifetimeSite, ImplTraitId, MissingLifetimeKind, PathLoweringDiagnostic, Span,
+    TyLoweringDiagnostic,
     consteval::{create_anon_const, path_to_const},
     db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
     generics::{Generics, SingleGenerics, generics},
@@ -73,8 +75,8 @@ use crate::{
         FnSigKind, FxIndexMap, GenericArg, GenericArgKind, GenericArgs, IsRigid, ParamConst,
         ParamEnv, PatList, Pattern, PolyFnSig, Predicate, Region, RegionExt, RegionKind,
         StoredClauses, StoredConst, StoredEarlyBinder, StoredGenericArg, StoredGenericArgs,
-        StoredPolyFnSig, StoredTraitRef, StoredTy, TraitClause, TraitRef, Ty, Tys, Unnormalized,
-        abi::Safety, default_types, mk_param, util::BottomUpFolder,
+        StoredPolyFnSig, StoredTraitRef, StoredTy, Symbol, TraitClause, TraitRef, Ty, Tys,
+        Unnormalized, abi::Safety, default_types, mk_param, util::BottomUpFolder,
     },
 };
 
@@ -135,7 +137,7 @@ struct Elision<'db> {
     anonymous: usize,
     /// The lifetimes the arguments name, as the binder sees them. A lifetime left out of the
     /// return type is the one of them, when there is one.
-    of_arguments: Vec<Region<'db>>,
+    of_arguments: SmallVec<[Region<'db>; 4]>,
     /// A bound is a signature only once its path turns out to be written as one.
     is_signature: bool,
     in_return_type: bool,
@@ -166,6 +168,10 @@ pub enum LifetimeElisionKind<'db> {
     /// rule out things like `where T: Foo<'_>`. Does not imply an
     /// error on default object bounds (e.g., `Box<dyn Foo>`).
     AnonymousReportError,
+
+    /// No lifetime to elide to, where rustc's lookup meets the item's own rib: a field or a
+    /// free type alias, where `&` and `'_` are errors as a path without its lifetimes is.
+    Item,
 
     /// Resolves elided lifetimes to `'static` if there are no other lifetimes in scope,
     /// otherwise give a warning that the previous behavior of introducing a new early-bound
@@ -203,10 +209,16 @@ impl<'db> LifetimeElisionKind<'db> {
         LifetimeElisionKind::AnonymousCreateParameter { report_in_path: data.is_async() }
     }
 
+    /// A return type, `elides` when its parameters give a lifetime to elide to. That lifetime
+    /// is an error here, which `bind_elided_lifetimes` replaces in a function's signature and
+    /// [`TyLoweringContext::elided_lifetime`] gives first in a fn pointer's or `Fn()`'s.
     #[inline]
-    pub(crate) fn for_fn_ret(interner: DbInterner<'db>) -> LifetimeElisionKind<'db> {
-        // FIXME: We should use the elided lifetime here, or `ElisionFailure`.
-        LifetimeElisionKind::Elided(Region::error(interner))
+    pub(crate) fn for_fn_ret(interner: DbInterner<'db>, elides: bool) -> LifetimeElisionKind<'db> {
+        if elides {
+            LifetimeElisionKind::Elided(Region::error(interner))
+        } else {
+            LifetimeElisionKind::ElisionFailure
+        }
     }
 }
 
@@ -240,7 +252,7 @@ pub trait TyLoweringInferVarsCtx<'db> {
 }
 
 pub struct TyLoweringContext<'db, 'a> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     pub(crate) interner: DbInterner<'db>,
     types: &'db crate::next_solver::DefaultAny<'db>,
     lang_items: &'db LangItems,
@@ -269,8 +281,14 @@ pub struct TyLoweringContext<'db, 'a> {
     /// for `&[&name as &dyn ToSql]`.
     impl_header: bool,
     is_lowering_impl_trait_bounds: bool,
-    bound_vars: Vec<(Vec<Name>, BoundVarKinds<'db>)>,
-    elisions: Vec<Elision<'db>>,
+    bound_vars: SmallVec<[(Vec<Name>, BoundVarKinds<'db>); 2]>,
+    elisions: SmallVec<[Elision<'db>; 2]>,
+    /// The index in `diagnostics` of the elision failures of the return type being lowered.
+    elision_failures: Option<usize>,
+    /// Lowering a type its body infers (a return type, a const's or a static's), whose `_`
+    /// placeholders are one diagnostic, at `placeholders` once there is one.
+    group_placeholders: bool,
+    placeholders: Option<usize>,
     /// The next bound lowered is one on an associated type, `X: for<'b> B<'a, 'b>` in
     /// `for<'a> T: A<'a, X: for<'b> B<'a, 'b>>`, whose `for` adds to the enclosing binder.
     bound_of_assoc_ty: bool,
@@ -279,7 +297,7 @@ pub struct TyLoweringContext<'db, 'a> {
 
 impl<'db, 'a> TyLoweringContext<'db, 'a> {
     pub fn new(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         resolver: &'a Resolver<'db>,
         store: &'db ExpressionStore,
         def: ExpressionStoreOwnerId,
@@ -291,8 +309,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         let impl_trait_mode = ImplTraitLoweringState::new(ImplTraitLoweringMode::Disallowed);
         let in_binders = DebruijnIndex::ZERO;
         let interner = DbInterner::new_with(db, resolver.krate());
-        let bound_vars =
-            vec![(Vec::new(), TyLoweringContext::bound_vars(db, generic_def, generics))];
+        let bound_vars = smallvec::smallvec![(
+            Vec::new(),
+            TyLoweringContext::bound_vars(db, generic_def, generics)
+        )];
         Self {
             db,
             // Can provide no block since we don't use it for trait solving.
@@ -318,7 +338,10 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             impl_header: false,
             is_lowering_impl_trait_bounds: false,
             bound_vars,
-            elisions: Vec::new(),
+            elisions: SmallVec::new(),
+            elision_failures: None,
+            group_placeholders: false,
+            placeholders: None,
             bound_of_assoc_ty: false,
             lifetime_lowering_mode,
         }
@@ -405,9 +428,113 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn push_infer_vars_not_allowed(&mut self, span: Span) {
-        if !span.is_dummy() {
-            self.push_diagnostic(TyLoweringDiagnostic::InferVarsNotAllowed { source: span });
+        if span.is_dummy() {
+            return;
         }
+        if self.group_placeholders
+            && let Some(at) = self.placeholders
+            && let Some(TyLoweringDiagnostic::InferVarsNotAllowed { sources }) =
+                self.diagnostics.get_mut(at)
+        {
+            // alloc: an error's sites.
+            let mut all = mem::take(sources).into_vec();
+            all.push(span);
+            *sources = all.into_boxed_slice();
+            return;
+        }
+        if self.group_placeholders {
+            self.placeholders = Some(self.diagnostics.len());
+        }
+        // alloc: an error's sites.
+        let sources = Box::new([span]);
+        self.push_diagnostic(TyLoweringDiagnostic::InferVarsNotAllowed { sources });
+    }
+
+    /// The `_` placeholders of the type this lowers are one diagnostic, as rustc reports those
+    /// of a type the body infers (`recover_infer_ret_ty`, `infer_placeholder_type`), when
+    /// `inferred_from_body`.
+    fn with_grouped_placeholders(mut self, inferred_from_body: bool) -> Self {
+        self.group_placeholders = inferred_from_body;
+        self
+    }
+
+    /// The region of a lifetime left out at `site` (`&T` or `'_`): rustc's
+    /// `resolve_anonymous_lifetime` under the rib `lifetime_elision` stands for.
+    fn anonymous_lifetime(&mut self, site: ElidedLifetimeSite) -> Region<'db> {
+        if let Some(region) = self.elided_lifetime() {
+            return region;
+        }
+        let kind = match self.lifetime_elision {
+            LifetimeElisionKind::ElisionFailure => {
+                self.push_elision_failure(site);
+                return self.types.regions.error;
+            }
+            _ if self.elided_region_vars => return self.next_region_var(Span::Dummy),
+            LifetimeElisionKind::Elided(region) => return region,
+            LifetimeElisionKind::StaticIfNoLifetimeInScope { only_lint: _ } => {
+                return Region::new_static(self.interner);
+            }
+            LifetimeElisionKind::AnonymousCreateParameter { report_in_path: _ }
+            | LifetimeElisionKind::Infer => return self.types.regions.error,
+            LifetimeElisionKind::Item => MissingLifetimeKind::Missing,
+            LifetimeElisionKind::AnonymousReportError => MissingLifetimeKind::NotAllowed,
+        };
+        self.push_diagnostic(TyLoweringDiagnostic::MissingLifetimes {
+            // alloc: an error's sites.
+            sites: Box::new([site]),
+            kind,
+        });
+        self.types.regions.error
+    }
+
+    /// A lifetime left out of the return type being lowered where its parameters give none to
+    /// elide to: one diagnostic for all of the return type's, as rustc's `resolve_fn_signature`
+    /// reports them.
+    #[cold]
+    fn push_elision_failure(&mut self, site: ElidedLifetimeSite) {
+        if let Some(at) = self.elision_failures
+            && let Some(TyLoweringDiagnostic::MissingLifetimes {
+                sites,
+                kind: MissingLifetimeKind::ElisionFailure,
+            }) = self.diagnostics.get_mut(at)
+        {
+            // alloc: an error's sites.
+            let mut all = mem::take(sites).into_vec();
+            all.push(site);
+            *sites = all.into_boxed_slice();
+            return;
+        }
+        self.elision_failures = Some(self.diagnostics.len());
+        self.push_diagnostic(TyLoweringDiagnostic::MissingLifetimes {
+            // alloc: an error's sites.
+            sites: Box::new([site]),
+            kind: MissingLifetimeKind::ElisionFailure,
+        });
+    }
+
+    /// Lowers a return type with `lifetime_elision`, its elision failures one diagnostic.
+    fn with_return_type_elision<T>(
+        &mut self,
+        lifetime_elision: LifetimeElisionKind<'db>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let old_lifetime_elision = mem::replace(&mut self.lifetime_elision, lifetime_elision);
+        let old_failures = self.elision_failures.take();
+        let result = f(self);
+        self.elision_failures = old_failures;
+        self.lifetime_elision = old_lifetime_elision;
+        result
+    }
+
+    /// Whether the return type of the signature being lowered has a lifetime to elide to: one
+    /// its parameters have, as rustc's `resolve_fn_params` finds (a fn pointer's or `Fn()`'s,
+    /// which have no `self`).
+    pub(crate) fn return_type_elides(&self) -> bool {
+        let innermost = self.bound_vars.len() - 1;
+        self.elisions
+            .iter()
+            .rfind(|it| it.is_signature && it.binder == innermost)
+            .is_none_or(|it| it.of_arguments.len() == 1)
     }
 
     #[track_caller]
@@ -446,10 +573,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn push_bound_vars(&mut self, binder: &[Name]) {
-        let bound_vars =
-            BoundVarKinds::new_from_iter(binder.iter().map(|_| {
-                BoundVariableKind::Region(BoundRegionKind::Named(self.generic_def.into()))
-            }));
+        let bound_vars = BoundVarKinds::new_from_iter(binder.iter().map(for_lifetime_kind));
         self.bound_vars.push((binder.to_vec(), bound_vars));
     }
 
@@ -481,7 +605,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             binder: self.bound_vars.len() - 1,
             named: self.bound_vars_with_elided().len(),
             anonymous: 0,
-            of_arguments: Vec::new(),
+            of_arguments: SmallVec::new(),
             is_signature,
             in_return_type: false,
         });
@@ -592,7 +716,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     }
 
     fn bound_vars(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
         generic: &'a OnceCell<Generics<'db>>,
     ) -> BoundVarKinds<'db> {
@@ -813,14 +937,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 Ty::new_slice(interner, inner_ty)
             }
             TypeRef::Reference(ref_) => {
-                // FIXME: It should infer the eldided lifetimes instead of stubbing with error
                 let lifetime = match ref_.lifetime {
                     Some(lifetime) => self.lower_lifetime(lifetime),
-                    None => match self.elided_lifetime() {
-                        Some(region) => region,
-                        None if self.elided_region_vars => self.next_region_var(Span::Dummy),
-                        None => self.types.regions.error,
-                    },
+                    None => self.anonymous_lifetime(ElidedLifetimeSite::Reference(type_ref_id)),
                 };
                 let inner_ty = match self.store.type_ref(ref_.ty) {
                     // `&'a dyn Trait` is `&'a (dyn Trait + 'a)`.
@@ -1017,8 +1136,11 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 ctx.lifetime_elision =
                     LifetimeElisionKind::AnonymousCreateParameter { report_in_path: false };
                 args.extend(params.iter().map(|&(_, tr)| ctx.lower_ty(tr)));
-                ctx.lifetime_elision = LifetimeElisionKind::for_fn_ret(interner);
-                args.push(ctx.in_return_type(|ctx| ctx.lower_ty(ret_ty)));
+                let elides = ctx.return_type_elides();
+                let ret_elision = LifetimeElisionKind::for_fn_ret(interner, elides);
+                args.push(ctx.with_return_type_elision(ret_elision, |ctx| {
+                    ctx.in_return_type(|ctx| ctx.lower_ty(ret_ty))
+                }));
                 ctx.bound_vars_with_elided()
             })
         });
@@ -1071,6 +1193,20 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             data: Either::Left(PathDiagnosticCallbackData(type_ref)),
             callback: |data, this, diag| {
                 let type_ref = data.as_ref().left().unwrap().0;
+                if let PathLoweringDiagnostic::ElisionFailure {
+                    generics_source,
+                    def,
+                    expected_count,
+                } = diag
+                {
+                    this.push_elision_failure(ElidedLifetimeSite::Path {
+                        source: type_ref,
+                        generics_source,
+                        def,
+                        expected_count,
+                    });
+                    return;
+                }
                 this.push_diagnostic(TyLoweringDiagnostic::PathDiagnostic {
                     source: type_ref,
                     diag,
@@ -1172,7 +1308,9 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                                    target: &TypeRefId,
                                    bound| {
             let self_ty = ctx.lower_ty(*target);
-            let clause = ctx.lower_type_bound(bound, self_ty, ignore_bindings).collect::<Vec<_>>();
+            let clause = ctx
+                .lower_type_bound(bound, self_ty, ignore_bindings)
+                .collect::<SmallVec<[_; 2]>>();
             Either::Left(clause.into_iter())
         };
 
@@ -1258,13 +1396,12 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                 if of_assoc_ty
                     && self.bound_vars_with_elided().len() == self.peek_bound_vars().len() =>
             {
-                let generic_def = self.generic_def;
                 let top = self.bound_vars.last_mut().unwrap();
                 let (names, kinds) = (top.0.len(), top.1);
                 top.0.extend(binder.iter().cloned());
-                top.1 = BoundVarKinds::new_from_iter(kinds.iter().chain(binder.iter().map(|_| {
-                    BoundVariableKind::Region(BoundRegionKind::Named(generic_def.into()))
-                })));
+                top.1 = BoundVarKinds::new_from_iter(
+                    kinds.iter().chain(binder.iter().map(for_lifetime_kind)),
+                );
                 self.with_elision(false, |ctx| lower_path_bound(ctx, path));
                 let top = self.bound_vars.last_mut().unwrap();
                 top.0.truncate(names);
@@ -1664,12 +1801,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
     pub(crate) fn lower_lifetime(&mut self, lifetime: LifetimeRefId) -> Region<'db> {
         if let LifetimeRef::Placeholder = self.store[lifetime] {
-            if let Some(region) = self.elided_lifetime() {
-                return region;
-            }
-            if self.elided_region_vars {
-                return self.next_region_var(Span::Dummy);
-            }
+            return self.anonymous_lifetime(ElidedLifetimeSite::Placeholder(lifetime));
         }
         let region = self.named_region(lifetime);
         self.named_lifetime(region);
@@ -1705,7 +1837,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
                             DebruijnIndex::from_usize(debruijn),
                             BoundRegion {
                                 var: BoundVar::from_u32(index as u32),
-                                kind: BoundRegionKind::Named(self.generic_def.into()),
+                                kind: for_lifetime_region_kind(l),
                             },
                         )
                     })
@@ -1844,6 +1976,16 @@ impl<'db, T> TyLoweringResult<'db, T> {
     }
 }
 
+/// The kind of the region a `for<'a>` binds for `'a`: its name as written, which rustc's
+/// `BoundRegionKind::Named` leads to through the parameter it names.
+fn for_lifetime_region_kind<'db>(name: &Name) -> BoundRegionKind<DbInterner<'db>> {
+    BoundRegionKind::NamedForPrinting(Symbol(name.symbol().clone()))
+}
+
+fn for_lifetime_kind<'db>(name: &Name) -> BoundVariableKind<'db> {
+    BoundVariableKind::Region(for_lifetime_region_kind(name))
+}
+
 fn replace_dummy_self_with_error<'db, T: TypeFoldable<DbInterner<'db>>>(
     interner: DbInterner<'db>,
     types: &DefaultAny<'db>,
@@ -1867,7 +2009,7 @@ pub(crate) fn lower_mutability(m: hir_def::type_ref::Mutability) -> Mutability {
 }
 
 pub(crate) fn impl_trait_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> Option<EarlyBinder<'db, TraitRef<'db>>> {
     impl_trait_with_diagnostics(db, impl_id).map(|it| it.value.get(DbInterner::new_no_crate(db)))
@@ -1876,7 +2018,7 @@ pub(crate) fn impl_trait_query<'db>(
 /// The trait an impl implements, `None` for an inherent impl. A dependency crate's module-level
 /// impls are read from its batch (`lower::batch::batched_crate`).
 pub(crate) fn impl_trait_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
     if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
@@ -1889,7 +2031,7 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result)]
 fn impl_trait_of_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
     lower_impl_trait(db, impl_id, db.impl_self_ty(impl_id).skip_binder())
@@ -1897,7 +2039,7 @@ fn impl_trait_of_impl<'db>(
 
 /// Lowers the trait `impl_id` implements, for the self type `self_ty`, which is the impl's.
 pub(crate) fn lower_impl_trait<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
     self_ty: Ty<'db>,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
@@ -1924,7 +2066,7 @@ pub(crate) fn lower_impl_trait<'db>(
 }
 
 pub(crate) fn impl_trait_with_diagnostics_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
+    _db: &'db Db,
     _: salsa::Id,
     _impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
@@ -1933,7 +2075,7 @@ pub(crate) fn impl_trait_with_diagnostics_cycle_result<'db>(
 
 impl ImplTraitId {
     #[inline]
-    pub fn bounds(self, db: &dyn HirDatabase) -> &SelfAndAssocBounds {
+    pub fn bounds(self, db: &Db) -> &SelfAndAssocBounds {
         let (impl_traits, idx) = match self {
             ImplTraitId::ReturnTypeImplTrait(owner, idx) => {
                 (SelfAndAssocBounds::return_type_impl_traits(db, owner), idx)
@@ -1946,14 +2088,14 @@ impl ImplTraitId {
     }
 
     #[inline]
-    pub fn all_bounds<'db>(self, db: &'db dyn HirDatabase) -> EarlyBinder<'db, &'db [Clause<'db>]> {
+    pub fn all_bounds<'db>(self, db: &'db Db) -> EarlyBinder<'db, &'db [Clause<'db>]> {
         self.bounds(db).all_bounds()
     }
 
     #[inline]
     pub fn self_bounds<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
         self.bounds(db).self_bounds()
     }
@@ -1961,14 +2103,14 @@ impl ImplTraitId {
 
 impl InternedOpaqueTyId<'_> {
     #[inline]
-    pub fn predicates<'db>(self, db: &'db dyn HirDatabase) -> EarlyBinder<'db, &'db [Clause<'db>]> {
+    pub fn predicates<'db>(self, db: &'db Db) -> EarlyBinder<'db, &'db [Clause<'db>]> {
         self.loc(db).all_bounds(db)
     }
 
     #[inline]
     pub fn self_predicates<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
     ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
         self.loc(db).self_bounds(db)
     }
@@ -1976,13 +2118,13 @@ impl InternedOpaqueTyId<'_> {
 
 impl SelfAndAssocBounds {
     #[inline]
-    pub fn return_type_impl_traits(db: &dyn HirDatabase, def: FunctionId) -> &[SelfAndAssocBounds] {
+    pub fn return_type_impl_traits(db: &Db, def: FunctionId) -> &[SelfAndAssocBounds] {
         &fn_sig_for_fn(db, def).value.impl_traits
     }
 
     #[inline]
     pub(crate) fn type_alias_impl_traits(
-        db: &dyn HirDatabase,
+        db: &Db,
         def: TypeAliasId,
     ) -> &[SelfAndAssocBounds] {
         &type_for_type_alias_with_diagnostics(db, def).value.impl_traits
@@ -2009,7 +2151,7 @@ pub enum ValueTyDefId {
 impl_from!(FunctionId, StructId, UnionId, EnumVariantId, ConstId, StaticId for ValueTyDefId);
 
 impl ValueTyDefId {
-    pub(crate) fn to_generic_def_id(self, db: &dyn HirDatabase) -> GenericDefId {
+    pub(crate) fn to_generic_def_id(self, db: &Db) -> GenericDefId {
         match self {
             Self::FunctionId(id) => id.into(),
             Self::StructId(id) => id.into(),
@@ -2025,7 +2167,7 @@ impl ValueTyDefId {
 /// `struct Foo(usize)`, we have two types: The type of the struct itself, and
 /// the constructor function `(usize) -> Foo` which lives in the values
 /// namespace.
-pub(crate) fn ty_query<'db>(db: &'db dyn HirDatabase, def: TyDefId) -> EarlyBinder<'db, Ty<'db>> {
+pub(crate) fn ty_query<'db>(db: &'db Db, def: TyDefId) -> EarlyBinder<'db, Ty<'db>> {
     let interner = DbInterner::new_no_crate(db);
     match def {
         TyDefId::BuiltinType(it) => EarlyBinder::bind(interner, Ty::from_builtin_type(interner, it)),
@@ -2040,7 +2182,7 @@ pub(crate) fn ty_query<'db>(db: &'db dyn HirDatabase, def: TyDefId) -> EarlyBind
 
 /// Build the declared type of a function. This should not need to look at the
 /// function body.
-fn type_for_fn<'db>(db: &'db dyn HirDatabase, def: FunctionId) -> EarlyBinder<'db, Ty<'db>> {
+fn type_for_fn<'db>(db: &'db Db, def: FunctionId) -> EarlyBinder<'db, Ty<'db>> {
     let interner = DbInterner::new_no_crate(db);
     EarlyBinder::bind(interner, Ty::new_fn_def(
         interner,
@@ -2050,7 +2192,7 @@ fn type_for_fn<'db>(db: &'db dyn HirDatabase, def: FunctionId) -> EarlyBinder<'d
 }
 
 pub(crate) fn type_for_const<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ConstId,
 ) -> EarlyBinder<'db, Ty<'db>> {
     type_for_const_with_diagnostics(db, def).value.get()
@@ -2059,7 +2201,7 @@ pub(crate) fn type_for_const<'db>(
 /// Build the declared type of a const.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn type_for_const_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ConstId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     let resolver = def.resolver(db);
@@ -2075,14 +2217,15 @@ pub(crate) fn type_for_const_with_diagnostics<'db>(
         &generics,
         LifetimeElisionKind::AnonymousReportError,
         LifetimeLoweringMode::Bound,
-    );
+    )
+    .with_grouped_placeholders(data.has_body());
     ctx.set_lifetime_elision(LifetimeElisionKind::for_const(ctx.interner, parent));
     let result = StoredEarlyBinder::bind(ctx.interner, ctx.lower_ty(data.type_ref).store());
     TyLoweringResult::from_ctx(result, ctx)
 }
 
 pub(crate) fn type_for_static<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: StaticId,
 ) -> EarlyBinder<'db, Ty<'db>> {
     type_for_static_with_diagnostics(db, def).value.get()
@@ -2091,7 +2234,7 @@ pub(crate) fn type_for_static<'db>(
 /// Build the declared type of a static.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn type_for_static_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: StaticId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     let resolver = def.resolver(db);
@@ -2106,7 +2249,8 @@ pub(crate) fn type_for_static_with_diagnostics<'db>(
         &generics,
         LifetimeElisionKind::AnonymousReportError,
         LifetimeLoweringMode::Bound,
-    );
+    )
+    .with_grouped_placeholders(data.flags.contains(StaticFlags::HAS_BODY));
     ctx.set_lifetime_elision(LifetimeElisionKind::Elided(Region::new_static(ctx.interner)));
     let result = StoredEarlyBinder::bind(ctx.interner, ctx.lower_ty(data.type_ref).store());
     TyLoweringResult::from_ctx(result, ctx)
@@ -2114,7 +2258,7 @@ pub(crate) fn type_for_static_with_diagnostics<'db>(
 
 /// Build the type of a tuple struct constructor.
 fn type_for_struct_constructor<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: StructId,
 ) -> Option<EarlyBinder<'db, Ty<'db>>> {
     let struct_data = StructSignature::of(db, def);
@@ -2135,7 +2279,7 @@ fn type_for_struct_constructor<'db>(
 
 /// Build the type of a tuple enum variant constructor.
 fn type_for_enum_variant_constructor<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: EnumVariantId,
 ) -> Option<EarlyBinder<'db, Ty<'db>>> {
     let struct_data = def.fields(db);
@@ -2155,7 +2299,7 @@ fn type_for_enum_variant_constructor<'db>(
 }
 
 pub(crate) fn value_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: ValueTyDefId,
 ) -> Option<EarlyBinder<'db, Ty<'db>>> {
     match def {
@@ -2170,7 +2314,7 @@ pub(crate) fn value_ty<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = type_for_type_alias_with_diagnostics_cycle_result)]
 pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     t: TypeAliasId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
     let type_alias_data = TypeAliasSignature::of(db, t);
@@ -2190,7 +2334,14 @@ pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
             ExpressionStoreOwnerId::Signature(t.into()),
             t.into(),
             &generics,
-            LifetimeElisionKind::AnonymousReportError,
+            match t.loc(db).container {
+                ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_) => {
+                    LifetimeElisionKind::AnonymousReportError
+                }
+                ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+                    LifetimeElisionKind::Item
+                }
+            },
             LifetimeLoweringMode::Bound,
         )
         .with_impl_trait_mode(ImplTraitLoweringMode::Opaque);
@@ -2210,7 +2361,7 @@ pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
 }
 
 pub(crate) fn type_for_type_alias_with_diagnostics_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     _adt: TypeAliasId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
@@ -2223,7 +2374,7 @@ pub(crate) fn type_for_type_alias_with_diagnostics_cycle_result<'db>(
 }
 
 pub(crate) fn impl_self_ty_query<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> EarlyBinder<'db, Ty<'db>> {
     impl_self_ty_with_diagnostics(db, impl_id).value.get()
@@ -2232,7 +2383,7 @@ pub(crate) fn impl_self_ty_query<'db>(
 /// The self type of an impl. A dependency crate's module-level impls are read from its batch
 /// (`lower::batch::batched_crate`).
 pub(crate) fn impl_self_ty_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
     if let Some(krate) = batch::batched_crate(db, impl_id.module(db)) {
@@ -2245,14 +2396,14 @@ pub(crate) fn impl_self_ty_with_diagnostics<'db>(
 
 #[salsa::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result)]
 fn impl_self_ty_of_impl<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     lower_impl_self_ty(db, impl_id)
 }
 
 pub(crate) fn lower_impl_self_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     let resolver = impl_id.resolver(db);
@@ -2275,7 +2426,7 @@ pub(crate) fn lower_impl_self_ty<'db>(
 }
 
 pub(crate) fn impl_self_ty_with_diagnostics_cycle_result<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     _: salsa::Id,
     _impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
@@ -2284,7 +2435,7 @@ pub(crate) fn impl_self_ty_with_diagnostics_cycle_result<'db>(
     ))
 }
 
-pub(crate) fn const_param_ty<'db>(db: &'db dyn HirDatabase, def: ConstParamId) -> Ty<'db> {
+pub(crate) fn const_param_ty<'db>(db: &'db Db, def: ConstParamId) -> Ty<'db> {
     const_param_types(db, def.parent()).get(def.local_id())
 }
 
@@ -2305,17 +2456,23 @@ impl ConstParamTypes {
     }
 }
 
-pub(crate) fn const_param_types(db: &dyn HirDatabase, def: GenericDefId) -> &ConstParamTypes {
+pub(crate) fn const_param_types(db: &Db, def: GenericDefId) -> &ConstParamTypes {
     &const_param_types_with_diagnostics(db, def).value
 }
 
 #[salsa::tracked(returns(ref), cycle_result = const_param_types_with_diagnostics_cycle_result)]
 pub(crate) fn const_param_types_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
     let mut result = ThinVec::new();
     let (data, store) = GenericParams::with_store(db, def);
+    if !data
+        .iter_type_or_consts()
+        .any(|(_, it)| matches!(it, TypeOrConstParamData::ConstParamData(_)))
+    {
+        return TyLoweringResult::empty(ConstParamTypes::default());
+    }
     let resolver = def.resolver(db);
     let generics = OnceCell::new();
     let mut ctx = TyLoweringContext::new(
@@ -2343,7 +2500,7 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
 }
 
 fn const_param_types_with_diagnostics_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
+    _db: &'db Db,
     _: salsa::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
@@ -2423,7 +2580,7 @@ impl<'a> IntoIterator for &'a FieldTypes {
     }
 }
 
-pub(crate) fn field_types_query(db: &dyn HirDatabase, variant_id: VariantId) -> &FieldTypes {
+pub(crate) fn field_types_query(db: &Db, variant_id: VariantId) -> &FieldTypes {
     field_types_with_diagnostics(db, variant_id).value
 }
 
@@ -2451,7 +2608,7 @@ impl FieldType {
 /// variants are read from its batch, every other variant from a query of its own
 /// (`lower::batch::batched_crate` says which and why).
 pub(crate) fn field_types_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     variant_id: VariantId,
 ) -> Lowered<'db, FieldTypes> {
     if let Some(krate) = batch::batched_crate(db, variant_id.module(db)) {
@@ -2469,7 +2626,7 @@ pub(crate) fn field_types_with_diagnostics<'db>(
 
 #[salsa::tracked(returns(ref))]
 fn field_types_of_variant<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     variant_id: VariantId,
 ) -> TyLoweringResult<'db, ThinVec<FieldType>> {
     lower_field_types(db, variant_id)
@@ -2477,7 +2634,7 @@ fn field_types_of_variant<'db>(
 
 /// Lowers the types of the fields of `variant_id`, in the order of their `LocalFieldId`s.
 pub(crate) fn lower_field_types<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     variant_id: VariantId,
 ) -> TyLoweringResult<'db, ThinVec<FieldType>> {
     let var_data = variant_id.fields(db);
@@ -2500,7 +2657,7 @@ pub(crate) fn lower_field_types<'db>(
         ExpressionStoreOwnerId::VariantFields(variant_id),
         generic_def,
         &generics,
-        LifetimeElisionKind::AnonymousReportError,
+        LifetimeElisionKind::Item,
         LifetimeLoweringMode::Bound,
     );
     for (field_id, field_data) in var_data.fields().iter() {
@@ -2564,11 +2721,11 @@ impl SupertraitsInfo {
     }
 
     #[inline]
-    pub(crate) fn query(db: &dyn HirDatabase, trait_: TraitId) -> &Self {
+    pub(crate) fn query(db: &Db, trait_: TraitId) -> &Self {
         return supertraits_info(db, trait_);
 
         #[salsa::tracked(returns(ref), cycle_result = supertraits_info_cycle)]
-        fn supertraits_info(db: &dyn HirDatabase, trait_: TraitId) -> SupertraitsInfo {
+        fn supertraits_info(db: &Db, trait_: TraitId) -> SupertraitsInfo {
             let mut all_supertraits = vec![trait_];
             let mut direct_supertraits = Vec::new();
             let mut defined_assoc_types: Vec<(Name, TypeAliasId)> = trait_
@@ -2623,7 +2780,7 @@ impl SupertraitsInfo {
         }
 
         fn supertraits_info_cycle(
-            _db: &dyn HirDatabase,
+            _db: &Db,
             _: salsa::Id,
             _trait_: TraitId,
         ) -> SupertraitsInfo {
@@ -2661,7 +2818,7 @@ enum AssocTypeShorthandResolution {
 #[tracing::instrument(skip(db), ret)]
 #[salsa::tracked(returns(ref), cycle_result = resolve_type_param_assoc_type_shorthand_cycle_result)]
 fn resolve_type_param_assoc_type_shorthand(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: GenericDefId,
     param: TypeParamId,
     assoc_name: Name,
@@ -2806,7 +2963,7 @@ fn resolve_type_param_assoc_type_shorthand(
 }
 
 fn resolve_type_param_assoc_type_shorthand_cycle_result(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     _: salsa::Id,
     _def: GenericDefId,
     _param: TypeParamId,
@@ -2817,7 +2974,7 @@ fn resolve_type_param_assoc_type_shorthand_cycle_result(
 
 #[inline]
 pub(crate) fn type_alias_bounds<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     type_alias: TypeAliasId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     type_alias_bounds_with_diagnostics(db, type_alias).value.all_bounds()
@@ -2825,7 +2982,7 @@ pub(crate) fn type_alias_bounds<'db>(
 
 #[inline]
 pub(crate) fn type_alias_self_bounds<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     type_alias: TypeAliasId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     type_alias_bounds_with_diagnostics(db, type_alias).value.self_bounds()
@@ -2833,7 +2990,7 @@ pub(crate) fn type_alias_self_bounds<'db>(
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn type_alias_bounds_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     type_alias: TypeAliasId,
 ) -> TyLoweringResult<'db, SelfAndAssocBounds> {
     let type_alias_data = TypeAliasSignature::of(db, type_alias);
@@ -3175,7 +3332,7 @@ impl GenericPredicates {
     /// dependency crate's modules are read from its batch (`lower::batch::batched_crate`), which
     /// coherence and method resolution read whole.
     pub fn query_with_diagnostics<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
     ) -> Lowered<'db, GenericPredicates> {
         if let GenericDefId::ImplId(impl_id) = def
@@ -3191,7 +3348,7 @@ impl GenericPredicates {
 
 #[salsa::tracked(returns(ref), cycle_result = generic_predicates_cycle_result)]
 fn generic_predicates_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     generic_predicates(db, def)
@@ -3199,7 +3356,7 @@ fn generic_predicates_of<'db>(
 
 /// A cycle can occur from malformed code.
 fn generic_predicates_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
+    _db: &'db Db,
     _: salsa::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
@@ -3236,13 +3393,13 @@ impl GenericPredicates {
     }
 
     #[inline]
-    pub fn query(db: &dyn HirDatabase, def: GenericDefId) -> &GenericPredicates {
+    pub fn query(db: &Db, def: GenericDefId) -> &GenericPredicates {
         Self::query_with_diagnostics(db, def).value
     }
 
     #[inline]
     pub fn query_all<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
     ) -> EarlyBinder<'db, impl Iterator<Item = Clause<'db>>> {
         Self::query(db, def).all_predicates()
@@ -3250,7 +3407,7 @@ impl GenericPredicates {
 
     #[inline]
     pub fn query_own_explicit<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
     ) -> EarlyBinder<'db, impl Iterator<Item = Clause<'db>>> {
         Self::query(db, def).own_explicit_predicates()
@@ -3258,7 +3415,7 @@ impl GenericPredicates {
 
     #[inline]
     pub fn query_explicit<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
     ) -> EarlyBinder<'db, impl Iterator<Item = Clause<'db>>> {
         Self::query(db, def).explicit_predicates()
@@ -3331,12 +3488,12 @@ pub(crate) fn param_env_from_predicates<'db>(
     ParamEnv { clauses }
 }
 
-pub(crate) fn trait_environment<'db>(db: &'db dyn HirDatabase, def: GenericDefId) -> ParamEnv<'db> {
+pub(crate) fn trait_environment<'db>(db: &'db Db, def: GenericDefId) -> ParamEnv<'db> {
     return ParamEnv { clauses: trait_environment_query(db, def).as_ref() };
 
     #[salsa::tracked(returns(ref))]
     pub(crate) fn trait_environment_query(
-        db: &dyn HirDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> StoredClauses {
         let module = def.module(db);
@@ -3350,14 +3507,14 @@ pub(crate) fn trait_environment<'db>(db: &'db dyn HirDatabase, def: GenericDefId
 /// and for a trait `Self: [const] Trait`, as `HostEffect(Maybe)` clauses (rustc's
 /// `const_conditions`). Empty unless `def` is conditionally const.
 pub(crate) fn const_conditions<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     return const_conditions_query(db, def).get().map_bound(|it| it.as_slice());
 
     #[salsa::tracked(returns(ref))]
     fn const_conditions_query(
-        db: &dyn HirDatabase,
+        db: &Db,
         def: GenericDefId,
     ) -> StoredEarlyBinder<StoredClauses> {
         let interner = DbInterner::new_no_crate(db);
@@ -3415,7 +3572,7 @@ pub(crate) fn const_conditions<'db>(
 /// with a given filter
 #[tracing::instrument(skip(db), ret)]
 pub(crate) fn generic_predicates<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     let generics = generics(db, def);
@@ -3437,8 +3594,8 @@ pub(crate) fn generic_predicates<'db>(
     let sized_trait = ctx.lang_items.Sized;
     let myself = generics.owner();
 
-    let mut own_predicates = Vec::new();
-    let mut own_assoc_ty_bounds = Vec::new();
+    let mut own_predicates = SmallVec::<[Clause<'db>; 8]>::new();
+    let mut own_assoc_ty_bounds = SmallVec::<[Clause<'db>; 8]>::new();
     let own_implicit_trait_predicate = implicit_trait_predicate(interner, def);
     let parent = if let Some(parent) = generics.parent() {
         GenericPredicates::query_with_diagnostics(db, parent.def()).value
@@ -3509,7 +3666,7 @@ pub(crate) fn generic_predicates<'db>(
         .chain(own_predicates.iter())
         .chain(own_assoc_ty_bounds.iter())
         .copied()
-        .collect::<Vec<_>>();
+        .collect::<SmallVec<[Clause<'db>; 16]>>();
     let has_trait_implied_predicate =
         parent.has_trait_implied_predicate || own_implicit_trait_predicate.is_some();
     let parent_assoc_ty_bounds_start =
@@ -3557,8 +3714,8 @@ pub(crate) fn generic_predicates<'db>(
 }
 
 fn push_const_arg_has_type_predicates<'db>(
-    db: &'db dyn HirDatabase,
-    predicates: &mut Vec<Clause<'db>>,
+    db: &'db Db,
+    predicates: &mut SmallVec<[Clause<'db>; 8]>,
     generics: &SingleGenerics<'db>,
 ) {
     let mut const_param_tys = None;
@@ -3603,7 +3760,7 @@ impl<'db> GenericDefaultsRef<'db> {
     }
 }
 
-pub(crate) fn generic_defaults(db: &dyn HirDatabase, def: GenericDefId) -> GenericDefaultsRef<'_> {
+pub(crate) fn generic_defaults(db: &Db, def: GenericDefId) -> GenericDefaultsRef<'_> {
     generic_defaults_with_diagnostics(db, def).value.as_ref()
 }
 
@@ -3612,7 +3769,7 @@ pub(crate) fn generic_defaults(db: &dyn HirDatabase, def: GenericDefId) -> Gener
 /// Diagnostics are only returned for this `GenericDefId` (returned defaults include parents).
 #[salsa::tracked(returns(ref), cycle_result = generic_defaults_with_diagnostics_cycle_result)]
 pub(crate) fn generic_defaults_with_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericDefaults> {
     let generics = generics(db, def);
@@ -3674,7 +3831,7 @@ pub(crate) fn generic_defaults_with_diagnostics<'db>(
 }
 
 fn generic_defaults_with_diagnostics_cycle_result<'db>(
-    _db: &'db dyn HirDatabase,
+    _db: &'db Db,
     _: salsa::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericDefaults> {
@@ -3683,7 +3840,7 @@ fn generic_defaults_with_diagnostics_cycle_result<'db>(
 
 /// Build the signature of a callable item (function, struct or enum variant).
 pub(crate) fn callable_item_signature<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: CallableDefId,
 ) -> EarlyBinder<'db, PolyFnSig<'db>> {
     match def {
@@ -3695,7 +3852,7 @@ pub(crate) fn callable_item_signature<'db>(
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn fn_sig_for_fn<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: FunctionId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredPolyFnSig>>> {
     let data = FunctionSignature::of(db, def);
@@ -3714,6 +3871,8 @@ pub(crate) fn fn_sig_for_fn<'db>(
     );
     let params = data.params.iter().map(|&tr| ctx_params.lower_ty(tr));
 
+    let elided = elided_lifetimes(db, def);
+    let elides = elided.output.is_some() || elided.params.iter().any(Option::is_none);
     let mut ctx_ret = TyLoweringContext::new(
         db,
         &resolver,
@@ -3721,10 +3880,11 @@ pub(crate) fn fn_sig_for_fn<'db>(
         ExpressionStoreOwnerId::Signature(def.into()),
         def.into(),
         &generics,
-        LifetimeElisionKind::for_fn_ret(interner),
+        LifetimeElisionKind::for_fn_ret(interner, elides),
         LifetimeLoweringMode::Bound,
     )
-    .with_impl_trait_mode(ImplTraitLoweringMode::Opaque);
+    .with_impl_trait_mode(ImplTraitLoweringMode::Opaque)
+    .with_grouped_placeholders(data.has_body());
     let ret = match data.ret_type {
         Some(ret_type) => ctx_ret.lower_ty(ret_type),
         None => Ty::new_unit(interner),
@@ -3735,7 +3895,7 @@ pub(crate) fn fn_sig_for_fn<'db>(
     ctx_params.diagnostics.extend(ctx_ret.diagnostics);
     ctx_params.defined_anon_consts.extend(ctx_ret.defined_anon_consts);
 
-    let binder = TyLoweringContext::bound_vars(db, def.into(), &generics);
+    let binder = ctx_params.bound_vars[0].1;
     let fn_sig_kind = FnSigKind::new(
         data.abi,
         if data.is_unsafe() { Safety::Unsafe } else { Safety::Safe },
@@ -3808,7 +3968,7 @@ impl ElidedLifetimes {
 /// it: the fn pointer rustc reifies `function` to, `fn(&T) -> &U` as `for<'a> fn(&'a T) -> &'a U`.
 /// `sig` as it is where the lifetimes left out are not known.
 pub(crate) fn bind_elided_lifetimes<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     function: FunctionId,
     sig: PolyFnSig<'db>,
 ) -> PolyFnSig<'db> {
@@ -3869,7 +4029,7 @@ pub(crate) fn bind_elided_lifetimes<'db>(
 /// `ty` with the arguments an `impl Trait` `function` returns has for the lifetimes its
 /// parameters leave out, errors, the `regions` [`ElidedLifetimes::regions`] gives.
 pub fn with_elided_regions<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: Ty<'db>,
     function: FunctionId,
     regions: &[Option<Region<'db>>],
@@ -3910,7 +4070,7 @@ pub fn with_elided_regions<'db>(
 }
 
 #[salsa::tracked(returns(ref))]
-pub fn elided_lifetimes(db: &dyn HirDatabase, function: FunctionId) -> ElidedLifetimes {
+pub fn elided_lifetimes(db: &Db, function: FunctionId) -> ElidedLifetimes {
     let data = FunctionSignature::of(db, function);
     let resolver = function.resolver(db);
     let store = &data.store;
@@ -3971,7 +4131,7 @@ pub fn elided_lifetimes(db: &dyn HirDatabase, function: FunctionId) -> ElidedLif
 /// rustc's lifetime elision meets them, with in `self_references` the indices in `found` of those
 /// of references to `Self`. `None` for a type this does not follow.
 fn input_lifetimes(
-    db: &dyn HirDatabase,
+    db: &Db,
     resolver: &Resolver<'_>,
     store: &ExpressionStore,
     ty: TypeRefId,
@@ -4020,7 +4180,7 @@ fn input_lifetimes(
 
 /// [`input_lifetimes`] of the type or trait `path` names.
 fn path_lifetimes(
-    db: &dyn HirDatabase,
+    db: &Db,
     resolver: &Resolver<'_>,
     store: &ExpressionStore,
     path: &Path,
@@ -4077,7 +4237,7 @@ fn path_lifetimes(
 /// The lifetime parameter of the `impl Trait` `function` returns for the `index`th lifetime its
 /// parameters leave out, past those the function declares.
 pub(crate) fn elided_lifetime_param(
-    db: &dyn HirDatabase,
+    db: &Db,
     function: FunctionId,
     index: u32,
 ) -> LifetimeParamId {
@@ -4088,7 +4248,7 @@ pub(crate) fn elided_lifetime_param(
     }
 }
 
-fn type_for_adt<'db>(db: &'db dyn HirDatabase, adt: AdtId) -> EarlyBinder<'db, Ty<'db>> {
+fn type_for_adt<'db>(db: &'db Db, adt: AdtId) -> EarlyBinder<'db, Ty<'db>> {
     let interner = DbInterner::new_no_crate(db);
     let args = GenericArgs::identity_for_item(interner, adt.into());
     let ty = Ty::new_adt(interner, adt, args);
@@ -4096,7 +4256,7 @@ fn type_for_adt<'db>(db: &'db dyn HirDatabase, adt: AdtId) -> EarlyBinder<'db, T
 }
 
 fn ctor_signature(
-    db: &dyn HirDatabase,
+    db: &Db,
     variant: VariantId,
     adt: AdtId,
 ) -> StoredEarlyBinder<StoredPolyFnSig> {
@@ -4113,7 +4273,7 @@ fn ctor_signature(
 
 #[salsa::tracked(returns(ref))]
 fn fn_sig_for_struct_constructor(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: StructId,
 ) -> StoredEarlyBinder<StoredPolyFnSig> {
     ctor_signature(db, def.into(), def.into())
@@ -4121,14 +4281,14 @@ fn fn_sig_for_struct_constructor(
 
 #[salsa::tracked(returns(ref))]
 fn fn_sig_for_enum_variant_constructor(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: EnumVariantId,
 ) -> StoredEarlyBinder<StoredPolyFnSig> {
     ctor_signature(db, def.into(), def.lookup(db).parent.into())
 }
 
 pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     trait_ref: TraitRef<'db>,
     name: Name,
 ) -> Option<(TypeAliasId, GenericArgs<'db>)> {
@@ -4195,7 +4355,7 @@ mod tests {
         TyLoweringDiagnostic::PathDiagnostic {
             source: TypeRefId::from_raw(la_arena::RawIdx::from_u32(segment)),
             diag: PathLoweringDiagnostic::GenericArgsProhibited {
-                segment,
+                segments: Box::new([segment]),
                 reason: GenericArgsProhibitedReason::Module,
             },
         }

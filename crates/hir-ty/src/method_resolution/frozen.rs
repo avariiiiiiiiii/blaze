@@ -7,7 +7,7 @@
 
 use std::sync::Arc as StdArc;
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference},
@@ -31,7 +31,7 @@ pub struct FrozenImpls {
 }
 
 /// Has finding the impls of a crate use `maps`.
-pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
+pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     use salsa::{Durability, Setter};
     let maps = StdArc::new(maps);
     match FrozenImpls::try_get(db) {
@@ -44,12 +44,12 @@ pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
     }
 }
 
-fn frozen(db: &dyn HirDatabase, krate: Crate) -> Option<&Frozen> {
+fn frozen(db: &Db, krate: Crate) -> Option<&Frozen> {
     FrozenImpls::try_get(db)?.maps(db).get(&krate)
 }
 
 /// Whether the impls of `krate` are read from frozen bytes rather than found.
-pub fn served(db: &dyn HirDatabase, krate: Crate) -> bool {
+pub fn served(db: &Db, krate: Crate) -> bool {
     frozen(db, krate).is_some_and(|it| it.mode != Mode::Check)
 }
 
@@ -62,7 +62,7 @@ fn part(bytes: &[u8], which: usize) -> R<&[u8]> {
 }
 
 fn read<'db, T>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
     which: usize,
     f: impl FnOnce(&mut Dec<'_>) -> R<T>,
@@ -77,7 +77,7 @@ fn read<'db, T>(
     Some(read().unwrap_or_else(|why| panic!("frozen impls do not read: {why}")))
 }
 
-pub(super) fn trait_impls<'db>(db: &'db dyn HirDatabase, krate: Crate) -> Option<TraitImpls<'db>> {
+pub(super) fn trait_impls<'db>(db: &'db Db, krate: Crate) -> Option<TraitImpls<'db>> {
     read(db, krate, 0, |dec| {
         let n = dec.len()?;
         let mut map = FxHashMap::default();
@@ -106,7 +106,7 @@ pub(super) fn trait_impls<'db>(db: &'db dyn HirDatabase, krate: Crate) -> Option
 }
 
 pub(super) fn inherent_impls<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     krate: Crate,
 ) -> Option<InherentImpls<'db>> {
     read(db, krate, 1, |dec| {
@@ -124,7 +124,7 @@ pub(super) fn inherent_impls<'db>(
 
 /// The bytes of the impls of `krate` as they are now: found, or read in [`Mode::Serve`] and
 /// [`Mode::Verify`].
-pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
+pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
     let trait_impls = &**TraitImpls::for_crate(db, krate);
     let traits =
@@ -175,7 +175,7 @@ pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
 
 /// Records a difference between the frozen impls of `krate` and the live ones in
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
-pub fn check(db: &dyn HirDatabase, krate: Crate) {
+pub fn check(db: &Db, krate: Crate) {
     let Some(frozen) = frozen(db, krate) else { return };
     let what = match frozen.mode {
         Mode::Serve => return,

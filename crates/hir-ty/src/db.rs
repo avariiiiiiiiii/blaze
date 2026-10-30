@@ -1,10 +1,10 @@
-//! The home of `HirDatabase`, which is the Salsa database containing all the
-//! type inference-related queries.
+//! The home of `HirDatabase`, the type inference-related queries as methods of the one
+//! database, `base_db::Db`.
 
 use std::sync::LazyLock;
 
 use arrayvec::ArrayVec;
-use base_db::{Crate, SourceDatabase, target::TargetLoadError};
+use base_db::{Crate, Db, target::TargetLoadError};
 use blaze_hashcons::Interned;
 use either::Either;
 use hir_def::{
@@ -37,16 +37,25 @@ use crate::{
         Allocation, Clause, EarlyBinder, GenericArgs, ParamEnv, PolyFnSig, StoredEarlyBinder,
         StoredGenericArgs, StoredPolyFnSig, StoredTraitRef, StoredTy, TraitRef, Ty, VariancesOf,
     },
+    providers,
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
-#[salsa::db]
-pub trait HirDatabase: SourceDatabase + 'static {
-    /// Manual implementation of upcasting from `dyn SourceDatabase` to `dyn HirDatabase`.
-    ///
-    /// This function is needed because Rust can't perform this upcasting automatically
-    /// in the general case, as `Self` could be unsized.
-    fn as_dyn(&self) -> &dyn HirDatabase;
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for base_db::Db {}
+}
+
+/// hir-ty's queries as methods of the one database, [`Db`]: `db.ty(def)` is a static call to a
+/// body the caller can inline. It has one impl, and it is not dyn-compatible, so no caller
+/// can take a `dyn` database and pay a vtable call on every hit:
+///
+/// ```compile_fail
+/// fn f(_: &Db) {}
+/// ```
+pub trait HirDatabase: sealed::Sealed {
+    #[doc(hidden)]
+    const NOT_DYN: () = ();
 
     // region:mir
 
@@ -215,56 +224,31 @@ pub trait HirDatabase: SourceDatabase + 'static {
         def: ConstId,
         subst: GenericArgs<'db>,
         trait_env: Option<ParamEnvAndCrate<'db>>,
-    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-        let db = self.as_dyn();
-        crate::consteval::const_eval(db, def, subst, trait_env)
-    }
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>>;
 
     fn anon_const_eval<'db>(
         &'db self,
         def: AnonConstId<'db>,
         subst: GenericArgs<'db>,
         trait_env: Option<ParamEnvAndCrate<'db>>,
-    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-        let db = self.as_dyn();
-        crate::consteval::anon_const_eval(db, def, subst, trait_env)
-    }
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>>;
 
     fn const_eval_static<'db>(
         &'db self,
         def: StaticId,
-    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-        let db = self.as_dyn();
-        crate::consteval::const_eval_static(db, def)
-    }
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>>;
 
     fn const_eval_discriminant<'db>(
         &'db self,
         def: EnumVariantId,
-    ) -> Result<i128, ConstEvalError<'db>> {
-        let db = self.as_dyn();
-        crate::consteval::const_eval_discriminant_variant(db, def)
-    }
+    ) -> Result<i128, ConstEvalError<'db>>;
 
     fn lookup_impl_method<'db>(
         &'db self,
         env: ParamEnvAndCrate<'db>,
         func: FunctionId,
         fn_subst: GenericArgs<'db>,
-    ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)
-    {
-        let db = self.as_dyn();
-        if !matches!(func.loc(db).container, hir_def::ItemContainerId::TraitId(_)) {
-            return (Either::Left(func), fn_subst);
-        }
-        let (found, args) = crate::method_resolution::lookup_impl_method_stored(
-            db,
-            env.store(),
-            func,
-            fn_subst.store(),
-        );
-        (found, args.as_ref())
-    }
+    ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>);
 
     /// What the interpreter (`hir_ty_mir::interpret_mir`) gives running `body`: the value it
     /// returns.
@@ -291,213 +275,637 @@ pub trait HirDatabase: SourceDatabase + 'static {
         def: AdtId,
         args: StoredGenericArgs,
         trait_env: StoredParamEnvAndCrate,
-    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
-        let db = self.as_dyn();
-        crate::layout::layout_of_adt_query(db, def, args, trait_env)
-    }
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError>;
 
     fn layout_of_ty(
         &self,
         ty: StoredTy,
         env: StoredParamEnvAndCrate,
-    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
-        let db = self.as_dyn();
-        crate::layout::layout_of_ty_query(db, ty, env)
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError>;
+
+    fn target_data_layout(&self, krate: Crate) -> Result<&TargetDataLayout, TargetLoadError>;
+
+    fn target_data_layout_or_default(&self, krate: Crate) -> &TargetDataLayout;
+
+    fn dyn_compatibility_of_trait(&self, trait_: TraitId) -> Option<DynCompatibilityViolation>;
+
+    fn ty<'db>(&'db self, def: TyDefId) -> EarlyBinder<'db, Ty<'db>>;
+
+    fn type_for_type_alias_with_diagnostics<'db>(
+        &'db self,
+        def: TypeAliasId,
+    ) -> &'db TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>>;
+
+    /// Returns the type of the value of the given constant, or `None` if the `ValueTyDefId` is
+    /// a `StructId` or `EnumVariantId` with a record constructor.
+    fn value_ty<'db>(&'db self, def: ValueTyDefId) -> Option<EarlyBinder<'db, Ty<'db>>>;
+
+    fn type_for_const<'db>(&'db self, def: ConstId) -> EarlyBinder<'db, Ty<'db>>;
+
+    fn type_for_const_with_diagnostics<'db>(
+        &'db self,
+        def: ConstId,
+    ) -> &'db TyLoweringResult<'db, StoredEarlyBinder<StoredTy>>;
+
+    fn type_for_static<'db>(&'db self, def: StaticId) -> EarlyBinder<'db, Ty<'db>>;
+
+    fn type_for_static_with_diagnostics<'db>(
+        &'db self,
+        def: StaticId,
+    ) -> &'db TyLoweringResult<'db, StoredEarlyBinder<StoredTy>>;
+
+    fn impl_self_ty_with_diagnostics<'db>(
+        &'db self,
+        def: ImplId,
+    ) -> Lowered<'db, StoredEarlyBinder<StoredTy>>;
+
+    fn impl_self_ty<'db>(&'db self, def: ImplId) -> EarlyBinder<'db, Ty<'db>>;
+
+    fn const_param_types_with_diagnostics<'db>(
+        &'db self,
+        def: GenericDefId,
+    ) -> &'db TyLoweringResult<'db, ConstParamTypes>;
+
+    fn const_param_types(&self, def: GenericDefId) -> &ConstParamTypes;
+
+    fn const_param_ty<'db>(&'db self, def: ConstParamId) -> Ty<'db>;
+
+    fn impl_trait_with_diagnostics<'db>(
+        &'db self,
+        def: ImplId,
+    ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>>;
+
+    fn impl_trait<'db>(&'db self, def: ImplId) -> Option<EarlyBinder<'db, TraitRef<'db>>>;
+
+    fn field_types_with_diagnostics<'db>(&'db self, var: VariantId)
+    -> Lowered<'db, FieldTypes>;
+
+    fn field_types(&self, var: VariantId) -> &FieldTypes;
+
+    fn callable_item_signature<'db>(
+        &'db self,
+        def: CallableDefId,
+    ) -> EarlyBinder<'db, PolyFnSig<'db>>;
+
+    fn fn_sig_for_fn_with_diagnostics<'db>(
+        &'db self,
+        def: FunctionId,
+    ) -> &'db TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredPolyFnSig>>>;
+
+    fn trait_environment<'db>(&'db self, def: GenericDefId) -> ParamEnv<'db>;
+
+    fn generic_defaults_with_diagnostics<'db>(
+        &'db self,
+        def: GenericDefId,
+    ) -> &'db TyLoweringResult<'db, GenericDefaults>;
+
+    /// This returns an empty list if no parameter has default.
+    ///
+    /// The binders of the returned defaults are only up to (not including) this parameter.
+    fn generic_defaults(&self, def: GenericDefId) -> GenericDefaultsRef<'_>;
+
+    fn type_alias_bounds_with_diagnostics<'db>(
+        &'db self,
+        type_alias: TypeAliasId,
+    ) -> &'db TyLoweringResult<'db, SelfAndAssocBounds>;
+
+    fn type_alias_bounds<'db>(
+        &'db self,
+        type_alias: TypeAliasId,
+    ) -> EarlyBinder<'db, &'db [Clause<'db>]>;
+
+    fn type_alias_self_bounds<'db>(
+        &'db self,
+        type_alias: TypeAliasId,
+    ) -> EarlyBinder<'db, &'db [Clause<'db>]>;
+
+    fn variances_of<'db>(&'db self, def: GenericDefId) -> VariancesOf<'db>;
+
+    /// The path of `ty` as `std::any::type_name` prints it, for the MIR intrinsic: hir-ide's
+    /// display, through [`crate::providers::Display`]. `None` when it has no source path.
+    fn type_name<'db>(&'db self, ty: Ty<'db>, module: ModuleId) -> Option<String>;
+}
+
+impl HirDatabase for Db {
+    #[inline]
+    fn mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_body_query(self, def).map_err(Clone::clone)
     }
 
+    #[inline]
+    fn mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_body_for_closure_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_body_query(self, def, subst, env).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_body_for_closure_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_body_for_coroutine_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_body_for_coroutine_by_move_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_body_for_coroutine_by_move_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_body_for_coroutine_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn runtime_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::runtime_mir_body_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn runtime_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::runtime_mir_body_for_closure_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn runtime_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::runtime_mir_body_for_coroutine_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn runtime_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::runtime_mir_body_for_coroutine_by_move_query(self, def).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn optimized_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::optimized_mir_body_query(self, def, options).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn optimized_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::optimized_mir_body_for_closure_query(self, def, options).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn optimized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::optimized_mir_body_for_coroutine_query(self, def, options).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn optimized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::optimized_mir_body_for_coroutine_by_move_query(self, def, options)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_optimized_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_optimized_mir_body_query(self, def, options, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_optimized_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_optimized_mir_body_for_closure_query(
+            self, def, options, subst, env,
+        )
+        .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_optimized_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_optimized_mir_body_for_coroutine_query(
+            self, def, options, subst, env,
+        )
+        .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        options: MirOptions,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_optimized_mir_body_for_coroutine_by_move_query(
+            self, def, options, subst, env,
+        )
+        .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_runtime_mir_body<'db>(
+        &'db self,
+        def: InferBodyId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_runtime_mir_body_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_runtime_mir_body_for_closure<'db>(
+        &'db self,
+        def: InternedClosureId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_runtime_mir_body_for_closure_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_runtime_mir_body_for_coroutine<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_runtime_mir_body_for_coroutine_query(self, def, subst, env)
+            .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_runtime_mir_body_for_coroutine_by_move<'db>(
+        &'db self,
+        def: InternedCoroutineId<'db>,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_runtime_mir_body_for_coroutine_by_move_query(
+            self, def, subst, env,
+        )
+        .map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn const_eval<'db>(
+        &'db self,
+        def: ConstId,
+        subst: GenericArgs<'db>,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+        crate::consteval::const_eval(self, def, subst, trait_env)
+    }
+
+    #[inline]
+    fn anon_const_eval<'db>(
+        &'db self,
+        def: AnonConstId<'db>,
+        subst: GenericArgs<'db>,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+        crate::consteval::anon_const_eval(self, def, subst, trait_env)
+    }
+
+    #[inline]
+    fn const_eval_static<'db>(
+        &'db self,
+        def: StaticId,
+    ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
+        crate::consteval::const_eval_static(self, def)
+    }
+
+    #[inline]
+    fn const_eval_discriminant<'db>(
+        &'db self,
+        def: EnumVariantId,
+    ) -> Result<i128, ConstEvalError<'db>> {
+        crate::consteval::const_eval_discriminant_variant(self, def)
+    }
+
+    fn lookup_impl_method<'db>(
+        &'db self,
+        env: ParamEnvAndCrate<'db>,
+        func: FunctionId,
+        fn_subst: GenericArgs<'db>,
+    ) -> (Either<FunctionId, (BuiltinDeriveImplId, BuiltinDeriveImplMethod)>, GenericArgs<'db>)
+    {
+        if !matches!(func.loc(self).container, hir_def::ItemContainerId::TraitId(_)) {
+            return (Either::Left(func), fn_subst);
+        }
+        let (found, args) = crate::method_resolution::lookup_impl_method_stored(
+            self,
+            env.store(),
+            func,
+            fn_subst.store(),
+        );
+        (found, args.as_ref())
+    }
+
+    #[inline]
+    fn interpret_mir<'db>(
+        &'db self,
+        body: &'db MirBody<'db>,
+        assert_placeholder_ty_is_unused: bool,
+        trait_env: Option<ParamEnvAndCrate<'db>>,
+    ) -> Result<Allocation<'db>, MirEvalError<'db>> {
+        (providers::mir().interpret_mir)(self, body, assert_placeholder_ty_is_unused, trait_env)
+    }
+
+    #[inline]
+    fn opaque_of_impl<'db>(
+        &'db self,
+        env: ParamEnvAndCrate<'db>,
+        opaque: InternedOpaqueTyId<'db>,
+        args: GenericArgs<'db>,
+    ) -> Option<Ty<'db>> {
+        (providers::mir().opaque_of_impl)(self, env, opaque, args)
+    }
+
+    #[inline]
+    fn layout_of_adt(
+        &self,
+        def: AdtId,
+        args: StoredGenericArgs,
+        trait_env: StoredParamEnvAndCrate,
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
+        crate::layout::layout_of_adt_query(self, def, args, trait_env)
+    }
+
+    #[inline]
+    fn layout_of_ty(
+        &self,
+        ty: StoredTy,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
+        crate::layout::layout_of_ty_query(self, ty, env)
+    }
+
+    #[inline]
     fn target_data_layout(&self, krate: Crate) -> Result<&TargetDataLayout, TargetLoadError> {
-        let db = self.as_dyn();
-        crate::layout::target_data_layout_query(db, krate).map_err(|err| err.clone())
+        crate::layout::target_data_layout_query(self, krate).map_err(|err| err.clone())
     }
 
     fn target_data_layout_or_default(&self, krate: Crate) -> &TargetDataLayout {
         static DEFAULT: LazyLock<TargetDataLayout> = LazyLock::new(TargetDataLayout::default);
 
-        let db = self.as_dyn();
-        crate::layout::target_data_layout_query(db, krate).unwrap_or_else(|_| &*DEFAULT)
+        crate::layout::target_data_layout_query(self, krate).unwrap_or_else(|_| &*DEFAULT)
     }
 
+    #[inline]
     fn dyn_compatibility_of_trait(&self, trait_: TraitId) -> Option<DynCompatibilityViolation> {
-        let db = self.as_dyn();
-        crate::dyn_compatibility::dyn_compatibility_of_trait_query(db, trait_)
+        crate::dyn_compatibility::dyn_compatibility_of_trait_query(self, trait_)
     }
 
+    #[inline]
     fn ty<'db>(&'db self, def: TyDefId) -> EarlyBinder<'db, Ty<'db>> {
-        let db = self.as_dyn();
-        crate::lower::ty_query(db, def)
+        crate::lower::ty_query(self, def)
     }
 
+    #[inline]
     fn type_for_type_alias_with_diagnostics<'db>(
         &'db self,
         def: TypeAliasId,
     ) -> &'db TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
-        let db = self.as_dyn();
-        crate::lower::type_for_type_alias_with_diagnostics(db, def)
+        crate::lower::type_for_type_alias_with_diagnostics(self, def)
     }
 
-    /// Returns the type of the value of the given constant, or `None` if the `ValueTyDefId` is
-    /// a `StructId` or `EnumVariantId` with a record constructor.
+    #[inline]
     fn value_ty<'db>(&'db self, def: ValueTyDefId) -> Option<EarlyBinder<'db, Ty<'db>>> {
-        let db = self.as_dyn();
-        crate::lower::value_ty(db, def)
+        crate::lower::value_ty(self, def)
     }
 
+    #[inline]
     fn type_for_const<'db>(&'db self, def: ConstId) -> EarlyBinder<'db, Ty<'db>> {
-        let db = self.as_dyn();
-        crate::lower::type_for_const(db, def)
+        crate::lower::type_for_const(self, def)
     }
 
+    #[inline]
     fn type_for_const_with_diagnostics<'db>(
         &'db self,
         def: ConstId,
     ) -> &'db TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
-        let db = self.as_dyn();
-        crate::lower::type_for_const_with_diagnostics(db, def)
+        crate::lower::type_for_const_with_diagnostics(self, def)
     }
 
+    #[inline]
     fn type_for_static<'db>(&'db self, def: StaticId) -> EarlyBinder<'db, Ty<'db>> {
-        let db = self.as_dyn();
-        crate::lower::type_for_static(db, def)
+        crate::lower::type_for_static(self, def)
     }
 
+    #[inline]
     fn type_for_static_with_diagnostics<'db>(
         &'db self,
         def: StaticId,
     ) -> &'db TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
-        let db = self.as_dyn();
-        crate::lower::type_for_static_with_diagnostics(db, def)
+        crate::lower::type_for_static_with_diagnostics(self, def)
     }
 
+    #[inline]
     fn impl_self_ty_with_diagnostics<'db>(
         &'db self,
         def: ImplId,
     ) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
-        let db = self.as_dyn();
-        crate::lower::impl_self_ty_with_diagnostics(db, def)
+        crate::lower::impl_self_ty_with_diagnostics(self, def)
     }
 
+    #[inline]
     fn impl_self_ty<'db>(&'db self, def: ImplId) -> EarlyBinder<'db, Ty<'db>> {
-        let db = self.as_dyn();
-        crate::lower::impl_self_ty_query(db, def)
+        crate::lower::impl_self_ty_query(self, def)
     }
 
+    #[inline]
     fn const_param_types_with_diagnostics<'db>(
         &'db self,
         def: GenericDefId,
     ) -> &'db TyLoweringResult<'db, ConstParamTypes> {
-        let db = self.as_dyn();
-        crate::lower::const_param_types_with_diagnostics(db, def)
+        crate::lower::const_param_types_with_diagnostics(self, def)
     }
 
+    #[inline]
     fn const_param_types(&self, def: GenericDefId) -> &ConstParamTypes {
-        let db = self.as_dyn();
-        crate::lower::const_param_types(db, def)
+        crate::lower::const_param_types(self, def)
     }
 
+    #[inline]
     fn const_param_ty<'db>(&'db self, def: ConstParamId) -> Ty<'db> {
-        let db = self.as_dyn();
-        crate::lower::const_param_ty(db, def)
+        crate::lower::const_param_ty(self, def)
     }
 
+    #[inline]
     fn impl_trait_with_diagnostics<'db>(
         &'db self,
         def: ImplId,
     ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
-        let db = self.as_dyn();
-        crate::lower::impl_trait_with_diagnostics(db, def)
+        crate::lower::impl_trait_with_diagnostics(self, def)
     }
 
+    #[inline]
     fn impl_trait<'db>(&'db self, def: ImplId) -> Option<EarlyBinder<'db, TraitRef<'db>>> {
-        let db = self.as_dyn();
-        crate::lower::impl_trait_query(db, def)
+        crate::lower::impl_trait_query(self, def)
     }
 
-    fn field_types_with_diagnostics<'db>(
-        &'db self,
-        var: VariantId,
-    ) -> Lowered<'db, FieldTypes> {
-        let db = self.as_dyn();
-        crate::lower::field_types_with_diagnostics(db, var)
+    #[inline]
+    fn field_types_with_diagnostics<'db>(&'db self, var: VariantId) -> Lowered<'db, FieldTypes> {
+        crate::lower::field_types_with_diagnostics(self, var)
     }
 
+    #[inline]
     fn field_types(&self, var: VariantId) -> &FieldTypes {
-        let db = self.as_dyn();
-        crate::lower::field_types_query(db, var)
+        crate::lower::field_types_query(self, var)
     }
 
+    #[inline]
     fn callable_item_signature<'db>(
         &'db self,
         def: CallableDefId,
     ) -> EarlyBinder<'db, PolyFnSig<'db>> {
-        let db = self.as_dyn();
-        crate::lower::callable_item_signature(db, def)
+        crate::lower::callable_item_signature(self, def)
     }
 
+    #[inline]
     fn fn_sig_for_fn_with_diagnostics<'db>(
         &'db self,
         def: FunctionId,
     ) -> &'db TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredPolyFnSig>>> {
-        let db = self.as_dyn();
-        crate::lower::fn_sig_for_fn(db, def)
+        crate::lower::fn_sig_for_fn(self, def)
     }
 
+    #[inline]
     fn trait_environment<'db>(&'db self, def: GenericDefId) -> ParamEnv<'db> {
-        let db = self.as_dyn();
-        crate::lower::trait_environment(db, def)
+        crate::lower::trait_environment(self, def)
     }
 
+    #[inline]
     fn generic_defaults_with_diagnostics<'db>(
         &'db self,
         def: GenericDefId,
     ) -> &'db TyLoweringResult<'db, GenericDefaults> {
-        let db = self.as_dyn();
-        crate::lower::generic_defaults_with_diagnostics(db, def)
+        crate::lower::generic_defaults_with_diagnostics(self, def)
     }
 
-    /// This returns an empty list if no parameter has default.
-    ///
-    /// The binders of the returned defaults are only up to (not including) this parameter.
+    #[inline]
     fn generic_defaults(&self, def: GenericDefId) -> GenericDefaultsRef<'_> {
-        let db = self.as_dyn();
-        crate::lower::generic_defaults(db, def)
+        crate::lower::generic_defaults(self, def)
     }
 
+    #[inline]
     fn type_alias_bounds_with_diagnostics<'db>(
         &'db self,
         type_alias: TypeAliasId,
     ) -> &'db TyLoweringResult<'db, SelfAndAssocBounds> {
-        let db = self.as_dyn();
-        crate::lower::type_alias_bounds_with_diagnostics(db, type_alias)
+        crate::lower::type_alias_bounds_with_diagnostics(self, type_alias)
     }
 
+    #[inline]
     fn type_alias_bounds<'db>(
         &'db self,
         type_alias: TypeAliasId,
     ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
-        let db = self.as_dyn();
-        crate::lower::type_alias_bounds(db, type_alias)
+        crate::lower::type_alias_bounds(self, type_alias)
     }
 
+    #[inline]
     fn type_alias_self_bounds<'db>(
         &'db self,
         type_alias: TypeAliasId,
     ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
-        let db = self.as_dyn();
-        crate::lower::type_alias_self_bounds(db, type_alias)
+        crate::lower::type_alias_self_bounds(self, type_alias)
     }
 
+    #[inline]
     fn variances_of<'db>(&'db self, def: GenericDefId) -> VariancesOf<'db> {
-        let db = self.as_dyn();
-        crate::variance::variances_of(db, def)
+        crate::variance::variances_of(self, def)
     }
 
-    // HACK: We need this for MIR intrinsic `type_name()`, and it can't access the display infra because it is inside `hir-ide`.
-    fn type_name<'db>(&'db self, ty: Ty<'db>, module: ModuleId) -> String;
-}
-
-#[test]
-fn hir_database_is_dyn_compatible() {
-    fn _assert_dyn_compatible(_: &dyn HirDatabase) {}
+    #[inline]
+    fn type_name<'db>(&'db self, ty: Ty<'db>, module: ModuleId) -> Option<String> {
+        (providers::display().type_name)(self, ty, module)
+    }
 }
 
 #[salsa::interned(debug, revisions = usize::MAX)]
@@ -525,18 +933,18 @@ pub struct ClosureKey<'db> {
 }
 
 impl<'db> ClosureKey<'db> {
-    fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
+    fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
         let closures = closure_exprs(db, loc.owner.expression_store_owner(db), ());
         let nth = closures.partition_point(|&it| it < loc.expr) as u32;
         ClosureKey { owner: loc.owner, nth, kind: loc.kind }
     }
 
     /// Where the closure is among the closures of its body.
-    pub fn nth(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> u32 {
+    pub fn nth(db: &'db Db, loc: InternedClosure<'db>) -> u32 {
         Self::new(db, loc).nth
     }
 
-    fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+    fn loc(self, db: &'db Db) -> InternedClosure<'db> {
         let closures = closure_exprs(db, self.owner.expression_store_owner(db), ());
         // A key from before an edit that took closures out of the body names none of them.
         // Whatever asks about it is not asked for its answer.
@@ -549,7 +957,7 @@ impl<'db> ClosureKey<'db> {
 /// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
 // The unit makes the arguments something salsa interns: the owner alone is no salsa struct.
 #[salsa::tracked(returns(deref))]
-fn closure_exprs(db: &dyn HirDatabase, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
+fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
     ExpressionStore::of(db, owner)
         .exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
@@ -565,12 +973,12 @@ pub struct InternedClosureId<'db> {
 }
 
 impl<'db> InternedClosureId<'db> {
-    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+    pub fn loc(self, db: &'db Db) -> InternedClosure<'db> {
         self.key(db).loc(db)
     }
 
     #[inline]
-    pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
+    pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
@@ -599,12 +1007,12 @@ pub struct InternedCoroutineId<'db> {
 }
 
 impl<'db> InternedCoroutineId<'db> {
-    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+    pub fn loc(self, db: &'db Db) -> InternedClosure<'db> {
         self.key(db).loc(db)
     }
 
     #[inline]
-    pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
+    pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
@@ -633,12 +1041,12 @@ pub struct InternedCoroutineClosureId<'db> {
 }
 
 impl<'db> InternedCoroutineClosureId<'db> {
-    pub fn loc(self, db: &'db dyn HirDatabase) -> InternedClosure<'db> {
+    pub fn loc(self, db: &'db Db) -> InternedClosure<'db> {
         self.key(db).loc(db)
     }
 
     #[inline]
-    pub fn new(db: &'db dyn HirDatabase, loc: InternedClosure<'db>) -> Self {
+    pub fn new(db: &'db Db, loc: InternedClosure<'db>) -> Self {
         if cfg!(debug_assertions) {
             let store = ExpressionStore::of(db, loc.owner.expression_store_owner(db));
             let expr = store.expr(loc.expr);
@@ -658,7 +1066,7 @@ impl<'db> InternedCoroutineClosureId<'db> {
     }
 
     /// The closure this is when called: its body returns the future of its `async` block.
-    pub fn as_closure(self, db: &'db dyn HirDatabase) -> InternedClosureId<'db> {
+    pub fn as_closure(self, db: &'db Db) -> InternedClosureId<'db> {
         InternedClosureId::new(db, self.loc(db))
     }
 }
@@ -687,26 +1095,26 @@ pub struct AnonConstId {
 }
 
 impl<'db> AnonConstId<'db> {
-    pub fn new(db: &'db dyn SourceDatabase, loc: AnonConstLoc, token: TrackedStructToken) -> Self {
+    pub fn new(db: &'db Db, loc: AnonConstLoc, token: TrackedStructToken) -> Self {
         _ = token;
         AnonConstId::new_(db, loc)
     }
 }
 
 impl HasModule for AnonConstId<'_> {
-    fn module(&self, db: &dyn SourceDatabase) -> ModuleId {
+    fn module(&self, db: &Db) -> ModuleId {
         self.loc(db).owner.module(db)
     }
 }
 
 impl HasResolver for AnonConstId<'_> {
-    fn resolver(self, db: &dyn SourceDatabase) -> Resolver<'_> {
+    fn resolver(self, db: &Db) -> Resolver<'_> {
         self.loc(db).owner.resolver(db)
     }
 }
 
 pub fn signature_anon_consts_and_diagnostics<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: GenericDefId,
 ) -> ArrayVec<(&'db [AnonConstId<'db>], &'db [TyLoweringDiagnostic]), 5> {
     let mut result = ArrayVec::new();
@@ -752,7 +1160,7 @@ pub fn signature_anon_consts_and_diagnostics<'db>(
 impl<'db> AnonConstId<'db> {
     /// A `const { .. }` block of a body, which MIR lowering makes a constant of its own. The
     /// body inferred it.
-    pub fn is_inline_const(self, db: &'db dyn HirDatabase) -> bool {
+    pub fn is_inline_const(self, db: &'db Db) -> bool {
         let loc = self.loc(db);
         matches!(loc.owner, ExpressionStoreOwnerId::Body(_))
             && matches!(
@@ -762,7 +1170,7 @@ impl<'db> AnonConstId<'db> {
     }
 
     pub fn all_from_signature(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def: GenericDefId,
     ) -> impl Iterator<Item = AnonConstId<'db>> {
         signature_anon_consts_and_diagnostics(db, def)
@@ -784,7 +1192,7 @@ pub enum GeneralConstId<'db> {
 impl_from!(impl<'db> ConstId, StaticId, AnonConstId<'db> for GeneralConstId<'db>);
 
 impl<'db> GeneralConstId<'db> {
-    pub fn generic_def(self, db: &'db dyn HirDatabase) -> Option<GenericDefId> {
+    pub fn generic_def(self, db: &'db Db) -> Option<GenericDefId> {
         match self {
             GeneralConstId::ConstId(it) => Some(it.into()),
             GeneralConstId::StaticId(it) => Some(it.into()),
@@ -792,7 +1200,7 @@ impl<'db> GeneralConstId<'db> {
         }
     }
 
-    pub fn name(self, db: &'db dyn SourceDatabase) -> String {
+    pub fn name(self, db: &'db Db) -> String {
         match self {
             GeneralConstId::StaticId(it) => {
                 StaticSignature::of(db, it).name.display(db, Edition::CURRENT).to_string()
@@ -955,6 +1363,42 @@ pub mod kinds {
         DEFINING_FUNCTIONS = 0x2484, "defining_functions";
         DEFINE_OPAQUE_FUNCTIONS = 0x2485, "define_opaque_functions";
         DEFINE_OPAQUE_AT = 0x2486, "define_opaque_at";
+
+        // MIR, declared in `providers` and computed by hir-ty-mir.
+        MIR_BODY = 0x2490, "mir_body_query";
+        MIR_BODY_FOR_CLOSURE = 0x2491, "mir_body_for_closure_query";
+        MIR_BODY_FOR_COROUTINE = 0x2492, "mir_body_for_coroutine_query";
+        MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x2493, "mir_body_for_coroutine_by_move_query";
+        MONOMORPHIZED_MIR_BODY = 0x2494, "monomorphized_mir_body_query";
+        MONOMORPHIZED_MIR_BODY_FOR_CLOSURE = 0x2495, "monomorphized_mir_body_for_closure_query";
+        MONOMORPHIZED_MIR_BODY_FOR_COROUTINE = 0x2496,
+            "monomorphized_mir_body_for_coroutine_query";
+        MONOMORPHIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x2497,
+            "monomorphized_mir_body_for_coroutine_by_move_query";
+        RUNTIME_MIR_BODY = 0x2498, "runtime_mir_body_query";
+        RUNTIME_MIR_BODY_FOR_CLOSURE = 0x2499, "runtime_mir_body_for_closure_query";
+        RUNTIME_MIR_BODY_FOR_COROUTINE = 0x249a, "runtime_mir_body_for_coroutine_query";
+        RUNTIME_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x249b,
+            "runtime_mir_body_for_coroutine_by_move_query";
+        MONOMORPHIZED_RUNTIME_MIR_BODY = 0x249c, "monomorphized_runtime_mir_body_query";
+        MONOMORPHIZED_RUNTIME_MIR_BODY_FOR_CLOSURE = 0x249d,
+            "monomorphized_runtime_mir_body_for_closure_query";
+        MONOMORPHIZED_RUNTIME_MIR_BODY_FOR_COROUTINE = 0x249e,
+            "monomorphized_runtime_mir_body_for_coroutine_query";
+        MONOMORPHIZED_RUNTIME_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x249f,
+            "monomorphized_runtime_mir_body_for_coroutine_by_move_query";
+        OPTIMIZED_MIR_BODY = 0x24a0, "optimized_mir_body_query";
+        OPTIMIZED_MIR_BODY_FOR_CLOSURE = 0x24a1, "optimized_mir_body_for_closure_query";
+        OPTIMIZED_MIR_BODY_FOR_COROUTINE = 0x24a2, "optimized_mir_body_for_coroutine_query";
+        OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x24a3,
+            "optimized_mir_body_for_coroutine_by_move_query";
+        MONOMORPHIZED_OPTIMIZED_MIR_BODY = 0x24a4, "monomorphized_optimized_mir_body_query";
+        MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_CLOSURE = 0x24a5,
+            "monomorphized_optimized_mir_body_for_closure_query";
+        MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE = 0x24a6,
+            "monomorphized_optimized_mir_body_for_coroutine_query";
+        MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x24a7,
+            "monomorphized_optimized_mir_body_for_coroutine_by_move_query";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";

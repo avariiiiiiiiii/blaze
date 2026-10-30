@@ -81,8 +81,12 @@ again.
 
 ## Memory: rows, segments, no allocation on a hit
 
-Everything is a `u32` row of a column whose chunks never move (`table::Rows`: chunk `k` holds
-`64 << k` rows), so a row's address is arithmetic on its index and nothing is boxed per entry.
+Everything is a `u32` row of a column in one reserved region that never moves (`table::Rows`
+over `blaze_mem::Region`, tagged `Tag::Query`: 64 GiB of address space, pages committed as
+rows are written), so a row's address is base + index × size and nothing is boxed per entry.
+The tables every hit reads (memo lines, slots, a view's results) are on huge pages. The
+registered kinds are a dense table by kind number (`Kinds`), so finding a query's kind probes
+no hash.
 
 | Table | Row | Per element | Lookup |
 | --- | --- | --- | --- |
@@ -172,22 +176,43 @@ Nothing has been built or measured yet. These are design comparisons, to be chec
   buffer its thread reuses (`Writer::with_buffer`, up to 8 buffers of at most 1 MiB kept a
   thread), and the store then copies it into its segment, so a value is written once and
   copied once. `QueryKey::task_key` hashes the key for the
-  plane's single flight, once per miss. An input's `Tree::file` gives an `Arc` per file per
-  view (`v2/requests/vfs.md` item 8).
+  plane's single flight, once per miss. An input's `Tree::file` gives the VFS's own `Bytes`
+  (its `Arc`, or its range of the mapped image), one count per file per view.
 
 ## The daemon image and the settle swap
 
-- `write_image` writes every memo as one file: a header in `blaze_format::Header`'s layout with
-  the image's schema hash, then memos sorted by key (192 bytes each), edges (56 bytes each), an
-  open-addressed table from key to its first memo, the inputs, and a blob of values (16-byte
-  aligned), key bytes and paths. The same database writes the same bytes.
-- `from_image_with` checks the header and section bounds and nothing else; a memo is read the
-  first time its key is asked, with its edges and value left in the mapping. A start is an mmap.
-  An image of another schema is refused (`DbError::Image`) and the daemon starts empty.
-- The settle swap (#1295, #1299): after a cold build the daemon writes the image; once it is
-  mapped, `settle` makes the database the image's, carrying open views (each resolved memo
-  matched to the image's equal one), registered queries and pending IO, and drops every arena
-  of the cold build at once.
+- The database is five sections of the daemon's one image (`blaze-image`, restore.md), each
+  with a schema of its own: memos sorted by key (192 bytes each, `DB_MEMOS`), edges (56 bytes
+  each, `DB_EDGES`), an open-addressed table from key to its first memo (`DB_TABLE`), the
+  inputs (`DB_INPUTS`), and a blob of values (16-byte aligned), key bytes and paths
+  (`DB_BLOB`), which records name by offset. `write_image(builder, live)` writes them into the
+  daemon's `Builder` and marks each symbol a value names (the kind's `Persist::symbols`) in
+  `live`, so the symbol table the daemon writes last keeps it. Every kind with a memo must be
+  registered (`DbError::Unknown` otherwise, before anything is written). The same database
+  writes the same bytes.
+- `from_image_with(config, image)` takes the daemon's `Arc<Image<Mapping>>`. It first checks
+  that the symbol table was restored from this image (`intern::restored_from`, else
+  `DbError::Symbols`), then finds the five sections in the spine (one missing or of another
+  schema is `DbError::Refused`) and reads only the inputs. A memo is read the first time its
+  key is asked, with its edges and value left in the mapping; each group is checked by its
+  CRC32C the first time a read reaches it. A start is an mmap. On any of these errors
+  (`DbError::is_image`) the daemon starts empty.
+- A group that fails its CRC (`blaze_image::Corrupt`) costs only the keys whose memos it held:
+  each gets an empty slot, so it is computed again and its dependents verify against the new
+  fingerprint as after any miss, and the group is never read again. Each such group is
+  reported once (`take_corrupt`), by section and group. The inputs are read whole at start, so
+  a corrupt input or path starts the database empty (`DbError::Corrupt`). Bytes that pass
+  their CRC but are not what `write_image` writes (a table slot past the memos, edges past the
+  edge section) are a bug in the writer and stop the database naming it.
+- A file of a restored VFS tree is a range of the same image, and `Tree::file` is `Err(Corrupt)`
+  when its group fails. That stops the run as a cancellation does, keeping nothing in the
+  view. The request fails with `DbError::Corrupt`, naming the section and group, never as a
+  file that is not there. Once the daemon mends the file, the next request reads it again.
+- The settle swap (#1295, #1299): after a cold build the daemon writes the image and maps it;
+  `settle(image, effects)` makes the database the image's, carrying open views (each resolved
+  memo matched to the image's equal one), registered queries and pending IO, and drops every
+  arena of the cold build at once. Its symbols are this process's, so it skips the symbol
+  check.
 
 ## Why did this rerun
 

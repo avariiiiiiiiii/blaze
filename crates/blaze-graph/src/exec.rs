@@ -11,8 +11,10 @@
 use std::{
     any::Any,
     cell::UnsafeCell,
+    collections::VecDeque,
+    mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
@@ -21,13 +23,14 @@ use std::{
     time::Instant,
 };
 
+use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Record};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rustc_hash::FxHashMap;
 
 use crate::{
     Cancelled, Key,
-    admission::{Predict, TaskKind},
+    admission::{self, Predict, TaskKind},
     arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
@@ -262,9 +265,9 @@ enum Msg {
     Cancel { request: RequestId },
     Done {
         at_ns: u64,
-        /// The run's slot in the owner's [`Table`], free again once this is taken; `None` for
-        /// a node run with no work, which had none.
-        slot: Option<u32>,
+        /// The run's handle in the owner's [`Table`], as bits, free again once this is taken;
+        /// `None` for a node run with no work, or with no room for its run, which had none.
+        slot: Option<u64>,
         id: NodeId,
         request: RequestId,
         kind: TaskKind,
@@ -291,6 +294,9 @@ struct Ctx {
     io: Sender<Option<Ran>>,
     pool: &'static Workers,
     start: Instant,
+    /// Every run's slot, which is its pool job: at an address that stays put while the run is
+    /// under way, reused once its `Done` is in.
+    slots: blaze_mem::Pool<Run>,
 }
 
 /// What a task's run that ended held at most, and the time it ran (its own, not the tries
@@ -312,93 +318,226 @@ struct Live {
     work: Work,
 }
 
-/// A slot of the owner's [`Table`]: the pool's job itself (its header first), so posting a run
-/// allocates nothing and clones no `Arc` or sender. Filled by the owner, then read only by the
-/// thread that runs it until it sends its `Done`; then the owner's again.
+/// A run's slot in the scheduler's [`Ctx::slots`]: the pool's job itself (its header first),
+/// so posting a run allocates nothing and clones no `Arc` or sender. Filled by the owner, then
+/// read only by the thread that runs it until it sends its `Done`; then the owner's again.
 #[repr(C)]
 struct Run {
     header: Header,
     ctx: &'static Ctx,
-    at: u32,
+    /// Its handle in the owner's [`Table`], as bits: what its `Done` names.
+    at: u64,
     live: UnsafeCell<Option<Live>>,
 }
 
-// SAFETY: `live` has one reader or writer at a time: the owner while the slot is free (or
-// filling it), then the thread holding its `Ran`, handed over by the pool's queue or the IO
-// queue and back by the `Done` message, each of which orders the writes before the reads. The
-// other fields are written only as the chunk is made.
+// SAFETY: `live` has one reader or writer at a time: the owner while it fills the slot, then
+// the thread holding its `Ran`, handed over by the pool's queue or the IO queue and back by
+// the `Done` message, each of which orders the writes before the reads. The other fields are
+// written only before the slot is first posted.
 unsafe impl Sync for Run {}
 
-/// How many slots a [`Table`] grows by.
-const RUNS: usize = 64;
+/// The most runs under way at once. The plane runs no more tasks at once than its pools have
+/// threads, so this is far past what any machine reaches; past it a node fails, naming the
+/// table's [`MemError`].
+const MAX_RUNS: u32 = 1 << 16;
 
-/// The runs under way, by slot, each reused once its `Done` is in: chunks of [`RUNS`] that
-/// never move, so a slot's address is its job's for as long as it runs. Only the owner thread
-/// takes and frees slots; a run that ends sends its slot's index back, nothing else.
-#[derive(Default)]
+/// How many slots the run table makes at once: one batch of its pool.
+const RUNS: usize = blaze_mem::pool::BATCH;
+
+/// The owner's mailbox. Only a run's `Done` comes from a run, and they are at most the runs
+/// under way; every other message is a handle's, whose sender waits while it is full. The
+/// owner itself never sends to it ([`Owner::later`]), so it always drains.
+const MAILBOX: usize = 1 << 12;
+
+/// A run under way in the owner's [`Table`]: its slot, and what holding it back needs.
+struct Slot {
+    run: Pooled<'static, Run>,
+    tag: MemTag,
+    pool: Pool,
+    near: Option<u32>,
+}
+
+/// The runs under way, named by generational handles (docs/v2/plan/design/memory.md,
+/// "Generational handles"): a `Done` naming a run whose slot was freed is detected as a stale
+/// handle, never read. Each run's own slot is in the scheduler's pool ([`Ctx::slots`]), whose
+/// slots never move, so a slot's address is its job's for as long as it runs; only the owner
+/// thread takes and frees them, through its own cache, and a run that ends sends its handle
+/// back, nothing else. A warm take and free make no call to the global allocator.
 struct Table {
-    /// Leaked boxes, freed on drop: a `Box` moved as the list grows would claim its chunk
-    /// unshared while runs read it.
-    chunks: Vec<&'static [Run]>,
-    free: Vec<u32>,
-    running: usize,
+    cache: Cache<'static, Run>,
+    /// Dropped only with no run under way: a run under way still reads its slot.
+    live: ManuallyDrop<Slab<Slot>>,
 }
 
 impl Drop for Table {
     fn drop(&mut self) {
-        // An owner unwinding with runs under way leaves their slots to them.
-        if self.running > 0 {
-            return;
-        }
-        for chunk in self.chunks.drain(..) {
-            // SAFETY: `grow` leaked the chunk, and no run is under way to name a slot of it.
-            drop(unsafe { Box::from_raw(ptr::from_ref(chunk).cast_mut()) });
+        // An owner unwinding with runs under way leaves their slots to them: the slots are the
+        // scheduler's pool, which is never freed, and the handles naming them go with them.
+        if self.live.is_empty() {
+            // SAFETY: dropped once, here, and `live` is not touched again.
+            unsafe { ManuallyDrop::drop(&mut self.live) };
         }
     }
 }
 
 impl Table {
-    fn slot(&self, at: u32) -> &Run {
-        &self.chunks[at as usize / RUNS][at as usize % RUNS]
+    fn new(ctx: &'static Ctx) -> Result<Table, MemError> {
+        Ok(Table {
+            cache: ctx.slots.cache(),
+            live: ManuallyDrop::new(Slab::new(MAX_RUNS, MemTag::Plane)?),
+        })
     }
 
-    fn take(&mut self, ctx: &'static Ctx, live: Live) -> Ran {
-        let at = match self.free.pop() {
-            Some(at) => at,
-            None => self.grow(ctx),
+    fn running(&self) -> usize {
+        self.live.len()
+    }
+
+    /// A slot filled with `live`, to be run on `pool` near `near` once `tag` lets it: its
+    /// handle's bits.
+    fn take(
+        &mut self,
+        ctx: &'static Ctx,
+        live: Live,
+        tag: MemTag,
+        pool: Pool,
+        near: Option<u32>,
+    ) -> Result<u64, MemError> {
+        let header = Header::new(run_pooled);
+        let live = UnsafeCell::new(Some(live));
+        let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live })?;
+        let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
+        let slot = self.live.get_mut(handle).expect("a run just placed is in the table");
+        slot.run.at = handle.to_bits();
+        Ok(handle.to_bits())
+    }
+
+    /// The one name of run `at`'s slot, to post it, and where it goes.
+    /// Called once per run: two `Ran`s of one slot would both run it.
+    fn ran(&self, at: u64) -> (Ran, Pool, Option<u32>) {
+        let slot = self.slot(at);
+        (Ran(NonNull::from(&*slot.run)), slot.pool, slot.near)
+    }
+
+    fn slot(&self, at: u64) -> &Slot {
+        self.live.get(blaze_mem::Handle::from_bits(at)).unwrap_or_else(|| {
+            panic!("run {at:#x} is not under way: a stale handle to the scheduler's run table")
+        })
+    }
+
+    /// Frees run `at`'s slot, its `Done` being in (the `Ran` that named it was consumed
+    /// sending it, which orders the run's last touch before this); the run's subsystem.
+    fn free(&mut self, at: u64) -> MemTag {
+        let Some(Slot { run, tag, .. }) = self.live.remove(blaze_mem::Handle::from_bits(at)) else {
+            panic!("a `Done` names run {at:#x}, which is not under way: a stale handle")
         };
-        let run = self.slot(at);
-        // SAFETY: a free slot is named by no `Ran`, so only this (the owner) thread reaches it.
-        unsafe { *run.live.get() = Some(live) };
-        self.running += 1;
-        Ran(NonNull::from(run))
-    }
-
-    /// One chunk more: its first slot, the others free.
-    fn grow(&mut self, ctx: &'static Ctx) -> u32 {
-        let first = u32::try_from(self.chunks.len() * RUNS)
-            .unwrap_or_else(|_| panic!("a scheduler with 2^32 runs under way"));
-        let end = first + RUNS as u32;
-        let chunk: Box<[Run]> = (first..end)
-            .map(|at| Run { header: Header::new(run_pooled), ctx, at, live: UnsafeCell::new(None) })
-            .collect();
-        self.chunks.push(Box::leak(chunk));
-        self.free.extend((first + 1..end).rev());
-        first
-    }
-
-    fn free(&mut self, at: u32) {
-        let run = self.slot(at);
-        // SAFETY: its `Done` is in: the `Ran` that named it was consumed sending it, so only
-        // this (the owner) thread reaches it.
-        drop(unsafe { (*run.live.get()).take() });
-        self.free.push(at);
-        self.running -= 1;
+        self.cache.recycle(run);
+        tag
     }
 }
 
-/// The one name of a filled slot, held by the thread that runs it: made by [`Table::take`],
-/// consumed by [`Ran::done`] or by posting it again.
+/// No run: the end of a [`Throttle`]'s queue.
+const NO_RUN: u64 = u64::MAX;
+
+#[derive(Clone, Copy)]
+struct Queue {
+    head: u64,
+    tail: u64,
+}
+
+/// A run held back, and the one behind it.
+struct Waiting {
+    run: u64,
+    next: u64,
+}
+
+/// Holds back the runs of a subsystem over its budget (docs/v2/plan/design/memory.md, "Each
+/// subsystem has a budget"; `blaze_mem::tag::over_budget`), before the machine's budget is
+/// reached: such a run waits while another of its subsystem runs, and starts once one ends with
+/// the subsystem under its budget again, or once none of it runs. So a subsystem whose memory
+/// sits in tables its tasks do not free still has its tasks run, one at a time, and nothing
+/// waits for an end that never comes. Runs of one subsystem start in the order the plane
+/// started them. The plane counts a held run as running, with its memory granted: holding it
+/// back never lets the plane grant more.
+struct Throttle {
+    running: [u32; MemTag::COUNT],
+    queues: [Queue; MemTag::COUNT],
+    waiting: Slab<Waiting>,
+}
+
+impl Throttle {
+    fn new() -> Result<Throttle, MemError> {
+        Ok(Throttle {
+            running: [0; MemTag::COUNT],
+            queues: [Queue { head: NO_RUN, tail: NO_RUN }; MemTag::COUNT],
+            waiting: Slab::new(MAX_RUNS, MemTag::Plane)?,
+        })
+    }
+
+    /// Whether `run`, of subsystem `tag`, starts now, `over` saying which subsystems are over
+    /// their budgets; if not, it waits in its subsystem's queue.
+    fn admit(&mut self, tag: MemTag, run: u64, over: impl Fn(MemTag) -> bool) -> bool {
+        let at = tag.index();
+        if self.running[at] > 0 && (self.queues[at].head != NO_RUN || over(tag)) {
+            let waiting = self.waiting.insert(Waiting { run, next: NO_RUN }).to_bits();
+            let queue = &mut self.queues[at];
+            match queue.tail {
+                NO_RUN => queue.head = waiting,
+                tail => {
+                    let tail = blaze_mem::Handle::from_bits(tail);
+                    self.waiting.get_mut(tail).expect("a queued run is waiting").next = waiting;
+                }
+            }
+            self.queues[at].tail = waiting;
+            return false;
+        }
+        self.running[at] += 1;
+        true
+    }
+
+    /// A run of `tag` that started has ended.
+    fn ended(&mut self, tag: MemTag) {
+        self.running[tag.index()] -= 1;
+    }
+
+    /// The next held run that may start now, and its subsystem, `over` saying which are over
+    /// their budgets: asked until `None` after each end.
+    fn next(&mut self, over: impl Fn(MemTag) -> bool) -> Option<u64> {
+        if self.waiting.is_empty() {
+            return None;
+        }
+        let tag = MemTag::ALL.into_iter().find(|&tag| {
+            let at = tag.index();
+            self.queues[at].head != NO_RUN && (self.running[at] == 0 || !over(tag))
+        })?;
+        Some(self.start(tag))
+    }
+
+    /// Any held run, started whatever the budgets: the scheduler is stopping.
+    fn any(&mut self) -> Option<u64> {
+        let tag = MemTag::ALL.into_iter().find(|&tag| self.queues[tag.index()].head != NO_RUN)?;
+        Some(self.start(tag))
+    }
+
+    fn start(&mut self, tag: MemTag) -> u64 {
+        let at = tag.index();
+        let head = blaze_mem::Handle::from_bits(self.queues[at].head);
+        let Waiting { run, next } = self.waiting.remove(head).expect("a queue's head is waiting");
+        self.queues[at].head = next;
+        if next == NO_RUN {
+            self.queues[at].tail = NO_RUN;
+        }
+        self.running[at] += 1;
+        run
+    }
+
+    #[cfg(test)]
+    fn held(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+/// The one name of a filled slot, held by the thread that runs it: made by [`Table::ran`] once
+/// per run, as the owner starts it, consumed by [`Ran::done`] or by posting it again.
 struct Ran(NonNull<Run>);
 
 // SAFETY: a `Ran` moves to the thread that runs it with the pool's queue or the IO queue (both
@@ -407,9 +546,9 @@ unsafe impl Send for Ran {}
 
 impl Ran {
     fn run(&self) -> &Run {
-        // SAFETY: a slot stays in its table (whose chunks never move) until the owner frees it,
-        // which is after this `Ran` is consumed; the owner waits for its runs before it drops
-        // the table.
+        // SAFETY: a slot is in the scheduler's pool, whose slots never move and which is never
+        // freed (its context is leaked), and the owner recycles it only once this `Ran` is
+        // consumed sending its `Done`.
         unsafe { self.0.as_ref() }
     }
 
@@ -555,9 +694,13 @@ impl Scheduler {
         pool: &'static Workers,
     ) -> Result<Scheduler, Error> {
         let io_threads = config.io;
+        if let Some(budget) = &config.budget {
+            admission::set_budgets(budget.bytes);
+        }
         let plane = Plane::with_memo(config, memo)?;
-        let (tx, rx) = unbounded::<Msg>();
-        let (io_tx, io_rx) = unbounded::<Option<Ran>>();
+        let (tx, rx) = bounded::<Msg>(MAILBOX);
+        // Each message is a run under way or the stop of one thread, so a send never waits.
+        let (io_tx, io_rx) = bounded::<Option<Ran>>(MAX_RUNS as usize + io_threads);
         let io = (0..io_threads)
             .map(|at| {
                 let io_rx = io_rx.clone();
@@ -572,15 +715,28 @@ impl Scheduler {
                     .unwrap_or_else(|why| panic!("an IO thread of the scheduler: {why}"))
             })
             .collect();
-        let ctx: &'static Ctx =
-            Box::leak(Box::new(Ctx { tx: tx.clone(), io: io_tx, pool, start: Instant::now() }));
+        let slots = blaze_mem::Pool::new(MAX_RUNS, MemTag::Plane)
+            .unwrap_or_else(|why| panic!("the scheduler's run slots: {why}"));
+        let ctx: &'static Ctx = Box::leak(Box::new(Ctx {
+            tx: tx.clone(),
+            io: io_tx,
+            pool,
+            start: Instant::now(),
+            slots,
+        }));
+        let table =
+            Table::new(ctx).unwrap_or_else(|why| panic!("the scheduler's run table: {why}"));
+        let throttle =
+            Throttle::new().unwrap_or_else(|why| panic!("the scheduler's throttle: {why}"));
         let owner = Owner {
             plane,
             predict,
             heard: FxHashMap::default(),
             works: FxHashMap::default(),
             ctx,
-            table: Table::default(),
+            table,
+            throttle,
+            later: VecDeque::new(),
             io_threads,
         };
         let owner = thread::Builder::new()
@@ -647,6 +803,10 @@ struct Owner {
     works: FxHashMap<NodeId, Entry>,
     ctx: &'static Ctx,
     table: Table,
+    throttle: Throttle,
+    /// What the owner tells itself (a node it cannot run fails), taken after the message at
+    /// hand: never through its own mailbox, which could be full.
+    later: VecDeque<Msg>,
     io_threads: usize,
 }
 
@@ -663,16 +823,29 @@ impl Owner {
         }
         let _stop_io = StopIo(self.ctx, self.io_threads);
         // The owner's one wait.
-        while let Ok(msg) = rx.recv() {
+        'serve: while let Ok(msg) = rx.recv() {
             if !self.take(msg) {
                 break;
             }
+            while let Some(msg) = self.later.pop_front() {
+                if !self.take(msg) {
+                    break 'serve;
+                }
+            }
+        }
+        // A run held back is under way to the plane: it runs, its budget aside, so that the
+        // table empties.
+        while let Some(at) = self.throttle.any() {
+            self.start(at);
         }
         // Each run under way reads a slot of the table: it ends before the table goes, and
         // nothing more comes of it.
-        while self.table.running > 0 {
+        while self.table.running() > 0 {
             match rx.recv() {
-                Ok(Msg::Done { slot: Some(slot), .. }) => self.table.free(slot),
+                Ok(Msg::Done { slot: Some(slot), .. }) => {
+                    let tag = self.table.free(slot);
+                    self.throttle.ended(tag);
+                }
                 Ok(_) => {}
                 Err(_) => unreachable!("the scheduler's context keeps a sender"),
             }
@@ -727,7 +900,8 @@ impl Owner {
             }
             Msg::Done { at_ns, slot, id, request, kind, key, did, measure, group } => {
                 if let Some(slot) = slot {
-                    self.table.free(slot);
+                    let tag = self.table.free(slot);
+                    self.throttle.ended(tag);
                 }
                 if let Some(Measure { peak, ran_ns }) = measure {
                     self.predict.observe(kind, key, ran_ns, peak);
@@ -758,12 +932,15 @@ impl Owner {
                     let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
-                let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::held() };
+                let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::own() };
                 self.step(request, held);
+                while let Some(at) = self.throttle.next(blaze_mem::tag::over_budget) {
+                    self.start(at);
+                }
             }
             Msg::Estimates { reply } => _ = reply.send(self.predict.encode()),
             #[cfg(test)]
-            Msg::Slots { reply } => _ = reply.send(self.table.chunks.len() * RUNS),
+            Msg::Slots { reply } => _ = reply.send(self.ctx.slots.carved() as usize),
             Msg::Stop => return false,
         }
         true
@@ -821,36 +998,60 @@ impl Owner {
     fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
         let Some(entry) = self.works.get(&id) else {
             // The plane runs only nodes added here, each with its work: a node it runs with
-            // none fails, saying so, through the owner's own queue.
-            _ = self.ctx.tx.send(Msg::Done {
-                at_ns: ns(self.ctx.start),
-                slot: None,
-                id,
-                request: RequestId(u32::MAX),
-                kind: TaskKind(u32::MAX),
-                key: None,
-                did: Did::failed(format!("node {id} was run with no work")),
-                measure: None,
-                group: None,
-            });
+            // none fails, saying so.
+            // alloc: a failure's message, once per failed node.
+            let why = format!("node {id} was run with no work");
+            self.fail(id, RequestId(u32::MAX), TaskKind(u32::MAX), why);
             return;
         };
         let (request, kind, key, work) = (entry.request, entry.kind, entry.key, entry.work.clone());
         let live = Live { id, request, kind, key, critical, work };
-        let run = self.table.take(self.ctx, live);
+        let tag = admission::tag_of(kind);
+        let at = match self.table.take(self.ctx, live, tag, pool, near) {
+            Ok(at) => at,
+            Err(why) => {
+                // alloc: a failure's message, once per failed node.
+                self.fail(id, request, kind, format!("node {id} could not be run: {why}"));
+                return;
+            }
+        };
+        if self.throttle.admit(tag, at, blaze_mem::tag::over_budget) {
+            self.start(at);
+        }
+    }
+
+    /// Starts run `at`, of the table.
+    fn start(&mut self, at: u64) {
+        let (run, pool, near) = self.table.ran(at);
+        let critical = run.live().critical;
         match pool {
             Pool::Work => post(self.ctx, near, critical, run),
             // The IO threads outlive this send: they end once the owner, its runs over, says so.
             Pool::Io => _ = self.ctx.io.send(Some(run)),
         }
     }
+
+    /// Node `id` fails with `why` without running, its `Done` taken after the message at hand.
+    fn fail(&mut self, id: NodeId, request: RequestId, kind: TaskKind, why: String) {
+        self.later.push_back(Msg::Done {
+            at_ns: ns(self.ctx.start),
+            slot: None,
+            id,
+            request,
+            kind,
+            key: None,
+            did: Did::failed(why),
+            measure: None,
+            group: None,
+        });
+    }
 }
 
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
 fn post(ctx: &Ctx, near: Option<u32>, critical: bool, run: Ran) {
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
-    // the slot stays in its table, unmoved, until its `Done` is taken, and `run`, moved here,
-    // was its one name.
+    // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
+    // moved here, was its one name.
     let job = unsafe { pool::Job::from_header(run.0.cast::<Header>()) };
     ctx.pool.push_placed(near, critical, job);
 }
@@ -911,7 +1112,12 @@ mod tests {
     use crossbeam_channel::bounded;
     use rustc_hash::FxHashMap;
 
-    use super::{Did, Heard, Opened, RUNS, SPARE, Scheduler, Task, Work, Workers, drive};
+    use blaze_mem::Tag as MemTag;
+
+    use super::{
+        Ctx, Did, Heard, Live, Opened, RUNS, RequestId, SPARE, Scheduler, Table, Task,
+        Throttle, Work, Workers, drive,
+    };
     use crate::{
         Cancelled, Key,
         admission::{Estimates, Predict, Prediction, TaskKind},
@@ -1226,8 +1432,8 @@ mod tests {
     }
 
     /// A thousand runs, no more than the pool's two workers under way at once and an IO task
-    /// beside each round, take one chunk of the run table: each slot is reused once its `Done`
-    /// is in.
+    /// beside each round, take one batch of the run slots' pool: each slot is reused once its
+    /// `Done` is in.
     #[test]
     fn runs_reuse_their_slots() {
         let (scheduler, _) = scheduler(2);
@@ -1350,5 +1556,178 @@ mod tests {
         let built: Work = Arc::new(|| Ok(Did::built()));
         scheduler.add(opened.request, vec![task(30, &[31], None, built)]);
         assert!(matches!(opened.heard.recv_timeout(LONG), Ok(Heard::Refused(_))));
+    }
+
+    /// A scheduler's context on a one-worker pool, for the run table alone.
+    fn ctx() -> &'static Ctx {
+        let pool = Workers::new(&Topology::flat(1), false).unwrap();
+        let pool: &'static Workers = Box::leak(Box::new(pool));
+        let (tx, _) = bounded(1);
+        let (io, _) = bounded(1);
+        let slots = blaze_mem::Pool::new(super::MAX_RUNS, MemTag::Plane).unwrap();
+        Box::leak(Box::new(Ctx { tx, io, pool, start: std::time::Instant::now(), slots }))
+    }
+
+    fn live(id: u32, work: &Work) -> Live {
+        Live {
+            id: NodeId(id),
+            request: RequestId(0),
+            kind: TaskKind(1),
+            key: None,
+            critical: false,
+            work: work.clone(),
+        }
+    }
+
+    /// What the throttle replaces when every subsystem is under its budget (a run starts as
+    /// the plane runs it), and what it must be: per subsystem a count and a FIFO queue.
+    #[derive(Default)]
+    struct Model {
+        running: [u32; MemTag::COUNT],
+        queues: [std::collections::VecDeque<u64>; MemTag::COUNT],
+    }
+
+    impl Model {
+        fn admit(&mut self, tag: MemTag, run: u64, over: bool) -> bool {
+            let at = tag.index();
+            if self.running[at] > 0 && (!self.queues[at].is_empty() || over) {
+                self.queues[at].push_back(run);
+                return false;
+            }
+            self.running[at] += 1;
+            true
+        }
+
+        fn next(&mut self, over: impl Fn(MemTag) -> bool) -> Option<u64> {
+            let tag = MemTag::ALL.into_iter().find(|&tag| {
+                let at = tag.index();
+                !self.queues[at].is_empty() && (self.running[at] == 0 || !over(tag))
+            })?;
+            self.running[tag.index()] += 1;
+            self.queues[tag.index()].pop_front()
+        }
+
+        fn held(&self) -> usize {
+            self.queues.iter().map(|it| it.len()).sum()
+        }
+    }
+
+    /// Two hundred seeds of admits, ends and restarts across four subsystems, each over its
+    /// budget or not at random: the throttle starts and holds exactly what the model does, in
+    /// the same order; with every subsystem under budget it holds nothing.
+    #[test]
+    fn the_throttle_matches_a_queue_per_subsystem() {
+        let tags = [MemTag::Infer, MemTag::Codegen, MemTag::Vfs, MemTag::Mir];
+        for seed in 0..200u64 {
+            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut rand = move |below: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % below
+            };
+            let mut throttle = Throttle::new().unwrap();
+            let mut model = Model::default();
+            let mut over = [false; MemTag::COUNT];
+            let mut started: Vec<MemTag> = Vec::new();
+            // Each run's subsystem, by run.
+            let mut tag_of = [MemTag::Other; 400];
+            let quiet = seed % 4 == 0;
+            for run in 0..400u64 {
+                if !quiet && rand(8) == 0 {
+                    let tag = tags[rand(4) as usize];
+                    over[tag.index()] = !over[tag.index()];
+                }
+                let is_over = |tag: MemTag| over[tag.index()];
+                if started.is_empty() || rand(3) > 0 {
+                    let tag = tags[rand(4) as usize];
+                    tag_of[run as usize] = tag;
+                    let now = throttle.admit(tag, run, is_over);
+                    assert_eq!(now, model.admit(tag, run, is_over(tag)), "seed {seed} run {run}");
+                    if now {
+                        started.push(tag);
+                    }
+                } else {
+                    let tag = started.swap_remove(rand(started.len() as u64) as usize);
+                    throttle.ended(tag);
+                    model.running[tag.index()] -= 1;
+                    loop {
+                        let (got, want) = (throttle.next(is_over), model.next(is_over));
+                        assert_eq!(got, want, "seed {seed} run {run}");
+                        let Some(run) = got else { break };
+                        started.push(tag_of[run as usize]);
+                    }
+                }
+                assert_eq!(throttle.held(), model.held(), "seed {seed} run {run}");
+                assert_eq!(throttle.running, model.running, "seed {seed} run {run}");
+                if quiet {
+                    assert_eq!(throttle.held(), 0, "under budget nothing waits");
+                }
+            }
+        }
+    }
+
+    /// Every subsystem over its budget for good: each run held back still starts once those
+    /// before it end, so nothing waits forever.
+    #[test]
+    fn a_subsystem_over_its_budget_still_runs_one_at_a_time() {
+        let mut throttle = Throttle::new().unwrap();
+        let over = |_: MemTag| true;
+        assert!(throttle.admit(MemTag::Infer, 0, over));
+        for run in 1..100 {
+            assert!(!throttle.admit(MemTag::Infer, run, over));
+        }
+        assert!(throttle.admit(MemTag::Codegen, 100, over), "another subsystem is not held");
+        for want in 1..100 {
+            throttle.ended(MemTag::Infer);
+            assert_eq!(throttle.next(over), Some(want));
+            assert_eq!(throttle.next(over), None, "one at a time");
+        }
+        throttle.ended(MemTag::Infer);
+        assert_eq!(throttle.held(), 0);
+        assert_eq!(throttle.any(), None);
+    }
+
+    /// A `Done` naming a run whose slot was freed is a stale handle, caught before its slot is
+    /// read: the slot it named may hold another run by now.
+    #[test]
+    #[should_panic(expected = "stale handle")]
+    fn a_done_for_a_freed_run_is_a_stale_handle() {
+        let ctx = ctx();
+        let mut table = Table::new(ctx).unwrap();
+        let built: Work = Arc::new(|| Ok(Did::built()));
+        let first = table.take(ctx, live(1, &built), MemTag::Infer, Pool::Work, None).unwrap();
+        assert_eq!(table.free(first), MemTag::Infer);
+        let second = table.take(ctx, live(2, &built), MemTag::Infer, Pool::Work, None).unwrap();
+        assert_ne!(first, second, "a reused slot is named anew");
+        assert_eq!(table.ran(second).0.live().id, NodeId(2));
+        table.free(first);
+    }
+
+    /// Once warm, a run's table slot taken, named and freed, with its admission check against
+    /// its subsystem's budget and its end, calls the global allocator zero times.
+    #[test]
+    fn a_warm_run_and_its_admission_allocate_nothing() {
+        let ctx = ctx();
+        let mut table = Table::new(ctx).unwrap();
+        let mut throttle = Throttle::new().unwrap();
+        let built: Work = Arc::new(|| Ok(Did::built()));
+        let mut cycle = |id: u32| {
+            let at = table.take(ctx, live(id, &built), MemTag::Infer, Pool::Work, None).unwrap();
+            assert!(throttle.admit(MemTag::Infer, at, blaze_mem::tag::over_budget));
+            let (ran, pool, near) = table.ran(at);
+            assert_eq!((ran.live().id, pool, near), (NodeId(id), Pool::Work, None));
+            let tag = table.free(at);
+            throttle.ended(tag);
+            assert_eq!(throttle.next(blaze_mem::tag::over_budget), None);
+        };
+        for id in 0..2 * RUNS as u32 {
+            cycle(id);
+        }
+        blaze_alloc_count::assert_at_most(0, "a warm run and its admission", || {
+            for id in 0..10_000 {
+                cycle(id);
+            }
+        });
     }
 }

@@ -1,5 +1,6 @@
 //! Detecting whether a type is infinitely-sized.
 
+use base_db::Db;
 use hir_def::{AdtId, VariantId};
 use rustc_type_ir::inherent::IntoKind;
 use thin_vec::ThinVec;
@@ -25,7 +26,7 @@ macro_rules! rtry {
 }
 
 #[salsa::tracked(cycle_result = representability_cycle, returns(copy))]
-pub(crate) fn representability(db: &dyn HirDatabase, id: AdtId) -> Representability {
+pub(crate) fn representability(db: &Db, id: AdtId) -> Representability {
     match id {
         AdtId::StructId(id) => variant_representability(db, id.into()),
         AdtId::UnionId(id) => variant_representability(db, id.into()),
@@ -39,21 +40,21 @@ pub(crate) fn representability(db: &dyn HirDatabase, id: AdtId) -> Representabil
 }
 
 pub(crate) fn representability_cycle(
-    _db: &dyn HirDatabase,
+    _db: &Db,
     _: salsa::Id,
     _id: AdtId,
 ) -> Representability {
     Representability::Infinite
 }
 
-fn variant_representability(db: &dyn HirDatabase, id: VariantId) -> Representability {
+fn variant_representability(db: &Db, id: VariantId) -> Representability {
     for ty in db.field_types(id).values() {
         rtry!(representability_ty(db, ty.ty().instantiate_identity().skip_norm_wip()));
     }
     Representability::Representable
 }
 
-fn representability_ty<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Representability {
+fn representability_ty<'db>(db: &'db Db, ty: Ty<'db>) -> Representability {
     match ty.kind() {
         TyKind::Adt(adt_id, args) => representability_adt_ty(db, adt_id.def_id(), args),
         // FIXME(#11924) allow zero-length arrays?
@@ -69,7 +70,7 @@ fn representability_ty<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> Representa
 }
 
 fn representability_adt_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def_id: AdtId,
     args: GenericArgs<'db>,
 ) -> Representability {
@@ -122,14 +123,14 @@ impl ParamsInRepr {
     }
 }
 
-fn params_in_repr_cycle(_db: &dyn HirDatabase, _: salsa::Id, _def_id: AdtId) -> ParamsInRepr {
+fn params_in_repr_cycle(_db: &Db, _: salsa::Id, _def_id: AdtId) -> ParamsInRepr {
     ParamsInRepr::default()
 }
 
 // This is a query because a chain of types that each hold the one before several times would
 // otherwise be walked once per path through it.
 #[salsa::tracked(cycle_result = params_in_repr_cycle, returns(ref))]
-fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> ParamsInRepr {
+fn params_in_repr(db: &Db, def_id: AdtId) -> ParamsInRepr {
     let mut params_in_repr = ParamsInRepr::default();
     let mut handle_variant = |variant| {
         for field in db.field_types(variant).values() {
@@ -154,7 +155,7 @@ fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> ParamsInRepr {
 }
 
 fn params_in_repr_ty<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     ty: Ty<'db>,
     params_in_repr: &mut ParamsInRepr,
 ) {

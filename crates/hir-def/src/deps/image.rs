@@ -5,8 +5,10 @@
 //! part that is a buffer of its own (the signatures) is opened in place. Finding a part is a
 //! binary search over at most [`Part::ALL`] records; nothing is copied.
 
+use std::{ops::Range, sync::Arc};
+
 use base_db::ContentId;
-use blaze_format::{FormatError, Part as SchemaPart, Record, SchemaHash, Slice, Writer};
+use blaze_format::{Aligned, FormatError, Part as SchemaPart, Record, SchemaHash, Slice, Writer};
 
 blaze_format::record! {
     /// One part: its tag and its bytes.
@@ -90,11 +92,10 @@ impl From<FormatError> for ImageError {
     }
 }
 
-/// An image, read in place.
+/// An image, read in place: each part a slice of the buffer.
 #[derive(Clone, Copy)]
 pub struct ImageRef<'a> {
-    buffer: &'a [u8],
-    parts: &'a [PartRec],
+    parts: [&'a [u8]; Part::ALL.len()],
 }
 
 impl<'a> ImageRef<'a> {
@@ -106,11 +107,12 @@ impl<'a> ImageRef<'a> {
         if root.key != key {
             return Err(ImageError::Key { found: root.key, wanted: key });
         }
-        let parts = root.parts.follow(buffer)?;
-        if parts.len() != Part::ALL.len() {
+        let recs = root.parts.follow(buffer)?;
+        if recs.len() != Part::ALL.len() {
             return Err(ImageError::Parts("not one part of each kind"));
         }
-        for (rec, part) in parts.iter().zip(Part::ALL) {
+        let mut parts: [&'a [u8]; Part::ALL.len()] = [&[]; Part::ALL.len()];
+        for ((rec, part), slot) in recs.iter().zip(Part::ALL).zip(&mut parts) {
             if rec.tag != part as u32 {
                 return Err(ImageError::Parts("a part out of order or of no kind"));
             }
@@ -118,15 +120,109 @@ impl<'a> ImageRef<'a> {
             if !(bytes.as_ptr() as usize).is_multiple_of(blaze_format::ALIGN) && !bytes.is_empty() {
                 return Err(ImageError::Parts("a part not aligned to 16 bytes"));
             }
+            *slot = bytes;
         }
-        Ok(ImageRef { buffer, parts })
+        Ok(ImageRef { parts })
     }
 
     /// The bytes of `part`, in place.
+    #[inline]
     pub fn part(self, part: Part) -> &'a [u8] {
-        let at = part as usize;
-        debug_assert_eq!(self.parts[at].tag, part as u32, "`open` checked the order");
-        self.parts[at].bytes.get(self.buffer)
+        self.parts[part as usize]
+    }
+
+    /// Where each part is in `buffer`, the buffer this was opened from: what reopening it
+    /// with [`ImageRef::at`] takes, with no check again.
+    pub(crate) fn ranges(self, buffer: &[u8]) -> [Range<usize>; Part::ALL.len()] {
+        self.parts.map(|part| {
+            let at = match part.is_empty() {
+                true => 0,
+                false => part.as_ptr() as usize - buffer.as_ptr() as usize,
+            };
+            at..at + part.len()
+        })
+    }
+
+    /// The image whose parts are `ranges` of `buffer`, as [`ImageRef::ranges`] gave them for
+    /// it: three slices, no check of the buffer.
+    #[inline]
+    pub(crate) fn at(buffer: &'a [u8], ranges: &[Range<usize>; Part::ALL.len()]) -> ImageRef<'a> {
+        ImageRef { parts: ranges.clone().map(|it| &buffer[it]) }
+    }
+}
+
+/// The bytes of a part, borrowed from the image buffer they are in (a count of it, no copy) or
+/// owned: what the frozen def maps and lang items read.
+#[derive(Clone)]
+pub enum PartBytes {
+    Owned(Arc<[u8]>),
+    In { buffer: Arc<Aligned>, range: Range<usize> },
+}
+
+impl PartBytes {
+    /// Part `part` of the image in `buffer` whose parts are `ranges` ([`ImageRef::ranges`]).
+    pub fn of(buffer: &Arc<Aligned>, ranges: &[Range<usize>; Part::ALL.len()], part: Part) -> PartBytes {
+        PartBytes::In { buffer: buffer.clone(), range: ranges[part as usize].clone() }
+    }
+}
+
+impl std::ops::Deref for PartBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            PartBytes::Owned(bytes) => bytes,
+            PartBytes::In { buffer, range } => &buffer[range.clone()],
+        }
+    }
+}
+
+impl PartialEq for PartBytes {
+    fn eq(&self, other: &PartBytes) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for PartBytes {}
+
+impl std::hash::Hash for PartBytes {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
+impl std::fmt::Debug for PartBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartBytes({} bytes)", self.len())
+    }
+}
+
+impl From<&[u8]> for PartBytes {
+    fn from(bytes: &[u8]) -> PartBytes {
+        PartBytes::Owned(bytes.into())
+    }
+}
+
+impl From<Vec<u8>> for PartBytes {
+    fn from(bytes: Vec<u8>) -> PartBytes {
+        PartBytes::Owned(bytes.into())
+    }
+}
+
+impl From<Arc<[u8]>> for PartBytes {
+    fn from(bytes: Arc<[u8]>) -> PartBytes {
+        PartBytes::Owned(bytes)
+    }
+}
+
+/// A copy: for a reader of `Arc<[u8]>`.
+impl From<PartBytes> for Arc<[u8]> {
+    fn from(bytes: PartBytes) -> Arc<[u8]> {
+        match bytes {
+            PartBytes::Owned(bytes) => bytes,
+            in_place => Arc::from(&*in_place),
+        }
     }
 }
 

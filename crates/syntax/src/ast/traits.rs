@@ -220,7 +220,7 @@ impl<A: HasName, B: HasName> HasName for Either<A, B> {}
 mod tests {
     use super::{HasAttrs, attrs_including_inner, block_may_start_with_inner_attr};
     use crate::{
-        AstNode, Edition, SourceFile,
+        AstNode, Edition, SourceFile, Text,
         ast::{self, HasModuleItem},
     };
 
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn inner_attributes_of_a_lazy_body() {
         let text = "fn f() { let x = 1; }\nfn g() { #![allow(unused)] let y = 2; }\n";
-        let outline = SourceFile::parse_outline(text.into(), Edition::CURRENT);
+        let outline = SourceFile::parse_outline(Text::from(text), Edition::CURRENT);
         let fns: Vec<ast::Fn> = outline
             .tree()
             .items()

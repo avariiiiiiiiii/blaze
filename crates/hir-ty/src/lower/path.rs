@@ -1,8 +1,9 @@
 //! A wrapper around [`TyLoweringContext`] specifically for lowering paths.
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
-    AssocItemId, GenericDefId, GenericParamId, HasModule, Lookup, TraitId, TypeParamId,
+    AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, Lookup, TraitId, TypeParamId,
     expr_store::{
         ExpressionStore, HygieneId,
         path::{
@@ -284,54 +285,77 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         self.lower_ty_relative_path(ty, Some(resolution), infer_args, span)
     }
 
+    /// Generic arguments on `segments`, one error.
+    fn prohibit_generic_args(
+        &mut self,
+        segments: Vec<u32>,
+        reason: GenericArgsProhibitedReason,
+    ) {
+        if !segments.is_empty() {
+            let segments = segments.into_boxed_slice();
+            self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited { segments, reason });
+        }
+    }
+
+    /// Reports generic arguments on `prefix`, the leading segments with them, and on the
+    /// resolved segment where its resolution takes none: one error when `ends_path`, as rustc
+    /// checks all of a path's segments for a type parameter, `Self`, a primitive or a module.
+    ///
     /// This returns whether to keep the resolution (`true`) of throw it (`false`).
     #[must_use]
-    fn handle_type_ns_resolution(&mut self, resolution: &TypeNs) -> bool {
-        let mut prohibit_generics_on_resolved = |reason| {
-            if self.current_or_prev_segment.args_and_bindings.is_some() {
-                let segment = self.current_segment_u32();
-                self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                    segment,
-                    reason,
-                });
+    fn handle_type_ns_resolution(
+        &mut self,
+        resolution: &TypeNs,
+        mut prefix: Vec<u32>,
+        ends_path: bool,
+    ) -> bool {
+        let reason = match resolution {
+            TypeNs::SelfType(_) | TypeNs::AdtSelfType(_) => {
+                Some(GenericArgsProhibitedReason::SelfTy)
             }
-        };
-
-        match resolution {
-            TypeNs::SelfType(_) => {
-                prohibit_generics_on_resolved(GenericArgsProhibitedReason::SelfTy)
-            }
-            TypeNs::GenericParam(_) => {
-                prohibit_generics_on_resolved(GenericArgsProhibitedReason::TyParam)
-            }
-            TypeNs::AdtSelfType(_) => {
-                prohibit_generics_on_resolved(GenericArgsProhibitedReason::SelfTy);
-
-                if self.ctx.forbid_params_after.is_some()
-                    && self.ctx.forbid_params_after_reason
-                        == ForbidParamsAfterReason::LoweringParamDefault
-                {
-                    // FIXME: Handle other reasons.
-                    let segment = self.current_segment_u32();
-                    self.on_diagnostic(PathLoweringDiagnostic::GenericDefaultRefersToSelf {
-                        segment,
-                    });
-                    return false;
-                }
-            }
-            TypeNs::BuiltinType(_) => {
-                prohibit_generics_on_resolved(GenericArgsProhibitedReason::PrimitiveTy)
-            }
-            TypeNs::ModuleId(_) => {
-                prohibit_generics_on_resolved(GenericArgsProhibitedReason::Module)
-            }
+            TypeNs::GenericParam(_) => Some(GenericArgsProhibitedReason::TyParam),
+            TypeNs::BuiltinType(_) => Some(GenericArgsProhibitedReason::PrimitiveTy),
+            TypeNs::ModuleId(_) => Some(GenericArgsProhibitedReason::Module),
             TypeNs::AdtId(_)
             | TypeNs::EnumVariantId(_)
             | TypeNs::TypeAliasId(_)
-            | TypeNs::TraitId(_) => {}
+            | TypeNs::TraitId(_) => None,
+        };
+        let resolved = self.current_or_prev_segment.args_and_bindings.is_some();
+        match reason {
+            Some(reason) if resolved && ends_path => {
+                prefix.push(self.current_segment_u32());
+                self.prohibit_generic_args(prefix, reason);
+            }
+            Some(reason) if resolved => {
+                self.prohibit_generic_args(prefix, GenericArgsProhibitedReason::Module);
+                // alloc: an error's segment.
+                self.prohibit_generic_args(vec![self.current_segment_u32()], reason);
+            }
+            _ => self.prohibit_generic_args(prefix, GenericArgsProhibitedReason::Module),
+        }
+
+        if matches!(resolution, TypeNs::AdtSelfType(_))
+            && self.ctx.forbid_params_after.is_some()
+            && self.ctx.forbid_params_after_reason == ForbidParamsAfterReason::LoweringParamDefault
+        {
+            // FIXME: Handle other reasons.
+            let segment = self.current_segment_u32();
+            self.on_diagnostic(PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment });
+            return false;
         }
 
         true
+    }
+
+    /// The indices of `segments` with generic arguments.
+    fn with_args(segments: PathSegments<'_>) -> Vec<u32> {
+        segments
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| it.args_and_bindings.is_some().then_some(i as u32))
+            // alloc: only for a segment with arguments where they are not allowed, an error.
+            .collect()
     }
 
     pub(crate) fn resolve_path_in_type_ns_fully(&mut self) -> Option<TypeNs> {
@@ -370,26 +394,18 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         self.current_or_prev_segment =
             segments.get(resolved_segment_idx).expect("should have resolved segment");
 
-        for (i, mod_segment) in module_segments.iter().enumerate() {
-            if mod_segment.args_and_bindings.is_some() {
-                self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                    segment: i as u32,
-                    reason: GenericArgsProhibitedReason::Module,
-                });
-            }
-        }
+        let prefix = Self::with_args(module_segments);
 
         if let Some(enum_segment) = enum_segment
             && segments.get(enum_segment).is_some_and(|it| it.args_and_bindings.is_some())
             && segments.get(enum_segment + 1).is_some_and(|it| it.args_and_bindings.is_some())
         {
-            self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                segment: (enum_segment + 1) as u32,
-                reason: GenericArgsProhibitedReason::EnumVariant,
-            });
+            // alloc: an error's segment.
+            let segments = vec![(enum_segment + 1) as u32];
+            self.prohibit_generic_args(segments, GenericArgsProhibitedReason::EnumVariant);
         }
 
-        if !self.handle_type_ns_resolution(&resolution) {
+        if !self.handle_type_ns_resolution(&resolution, prefix, remaining_index.is_none()) {
             return None;
         }
 
@@ -426,23 +442,18 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
         self.current_or_prev_segment =
             segments.get(resolved_segment_idx).expect("should have resolved segment");
 
-        for (i, mod_segment) in mod_segments.iter().enumerate() {
-            if mod_segment.args_and_bindings.is_some() {
-                self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                    segment: i as u32,
-                    reason: GenericArgsProhibitedReason::Module,
-                });
-            }
-        }
+        // A value's leading segments are one error; its own arguments, where it takes none, are
+        // another (E0107 to rustc for a static or a const parameter).
+        let prefix = Self::with_args(mod_segments);
+        self.prohibit_generic_args(prefix, GenericArgsProhibitedReason::Module);
 
         if let Some(enum_segment) = enum_segment
             && segments.get(enum_segment).is_some_and(|it| it.args_and_bindings.is_some())
             && segments.get(enum_segment + 1).is_some_and(|it| it.args_and_bindings.is_some())
         {
-            self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                segment: (enum_segment + 1) as u32,
-                reason: GenericArgsProhibitedReason::EnumVariant,
-            });
+            // alloc: an error's segment.
+            let segments = vec![(enum_segment + 1) as u32];
+            self.prohibit_generic_args(segments, GenericArgsProhibitedReason::EnumVariant);
         }
 
         match &res {
@@ -452,10 +463,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
 
                 let mut prohibit_generics_on_resolved = |reason| {
                     if resolved_segment.args_and_bindings.is_some() {
-                        self.on_diagnostic(PathLoweringDiagnostic::GenericArgsProhibited {
-                            segment: resolved_segment_idx,
-                            reason,
-                        });
+                        // alloc: an error's segment.
+                        self.prohibit_generic_args(vec![resolved_segment_idx], reason);
                     }
                 };
 
@@ -485,7 +494,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 }
             }
             ResolveValueResult::Partial(resolution, _) => {
-                if !self.handle_type_ns_resolution(resolution) {
+                // alloc: none, an empty `Vec`.
+                if !self.handle_type_ns_resolution(resolution, Vec::new(), false) {
                     return None;
                 }
             }
@@ -553,6 +563,17 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                 let (assoc_type, trait_args) = assoc_type
                     .get_with(|(assoc_type, trait_args)| (*assoc_type, trait_args.as_ref()))
                     .skip_binder();
+                if let Some((AdtId::EnumId(enum_), _)) = ty.as_adt()
+                    && let Some(variant) = enum_.enum_variants(db).variant(assoc_name)
+                {
+                    let segment = self.current_segment_u32();
+                    self.on_diagnostic(PathLoweringDiagnostic::AmbiguousAssociatedItem {
+                        segment,
+                        variant,
+                        item: assoc_type,
+                        impl_,
+                    });
+                }
                 (
                     assoc_type,
                     EarlyBinder::bind(interner, trait_args)
@@ -926,6 +947,14 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     expected_count,
                 });
             }
+
+            fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, hard_error: bool) {
+                self.ctx.on_diagnostic(PathLoweringDiagnostic::LateBoundLifetimeArgs {
+                    generics_source: self.generics_source,
+                    def,
+                    hard_error,
+                });
+            }
         }
 
         substs_from_args_and_bindings(
@@ -1021,7 +1050,8 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     let lifetime_elision =
                         if args_and_bindings.parenthesized == GenericArgsParentheses::ParenSugar {
                             // `Fn()`-style generics are elided like functions. This is `Output` (we lower to it in hir-def).
-                            LifetimeElisionKind::for_fn_ret(self.ctx.interner)
+                            let elides = self.ctx.return_type_elides();
+                            LifetimeElisionKind::for_fn_ret(self.ctx.interner, elides)
                         } else {
                             self.ctx.lifetime_elision
                         };
@@ -1034,7 +1064,10 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                             ) => {
                                 let ty = match args_and_bindings.parenthesized {
                                     GenericArgsParentheses::ParenSugar => {
-                                        this.ctx.in_return_type(|ctx| ctx.lower_ty(type_ref))
+                                        let elision = this.ctx.lifetime_elision;
+                                        this.ctx.with_return_type_elision(elision, |ctx| {
+                                            ctx.in_return_type(|ctx| ctx.lower_ty(type_ref))
+                                        })
                                     }
                                     _ => this.ctx.lower_ty(type_ref),
                                 };
@@ -1106,6 +1139,11 @@ pub(crate) trait GenericArgsLowerer<'db> {
 
     fn report_missing_lifetime(&mut self, def: GenericDefId, expected_count: u32);
 
+    /// Lifetime arguments given to the function `def`, which has late-bound lifetimes: E0794
+    /// when `hard_error` (for a path to it, a count other than its early-bound lifetimes'),
+    /// else the `late_bound_lifetime_arguments` lint, as always for a method call.
+    fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, hard_error: bool);
+
     fn report_len_mismatch(
         &mut self,
         def: GenericDefId,
@@ -1154,16 +1192,18 @@ pub(crate) trait GenericArgsLowerer<'db> {
     }
 }
 
-/// Returns true if there was an error.
+/// Returns whether there was an error, and whether the lifetime arguments are ignored as `def`
+/// has late-bound lifetimes (rustc's `ExplicitLateBound::Yes`).
 fn check_generic_args_len<'db>(
     args_and_bindings: Option<&HirGenericArgs>,
     def: GenericDefId,
     def_generics: &Generics<'db>,
+    has_late_bound_lifetimes: bool,
     infer_args: bool,
     lifetime_elision: &LifetimeElisionKind<'db>,
     lowering_assoc_type_generics: bool,
     ctx: &mut impl GenericArgsLowerer<'db>,
-) -> bool {
+) -> (bool, bool) {
     let mut had_error = false;
 
     let (mut provided_lifetimes_count, mut provided_types_and_consts_count) = (0usize, 0usize);
@@ -1180,7 +1220,13 @@ fn check_generic_args_len<'db>(
     }
 
     let lifetime_args_len = def_generics.len_lifetimes_self();
-    if provided_lifetimes_count == 0
+    // rustc's `prohibit_explicit_late_bound_lifetimes`: the lifetime arguments are not counted.
+    let explicit_late_bound = has_late_bound_lifetimes && provided_lifetimes_count > 0;
+    if explicit_late_bound {
+        let hard_error = provided_lifetimes_count != lifetime_args_len;
+        ctx.report_late_bound_lifetime_args(def, hard_error);
+        had_error |= hard_error;
+    } else if provided_lifetimes_count == 0
         && lifetime_args_len > 0
         && (!lowering_assoc_type_generics || infer_args)
     {
@@ -1191,7 +1237,7 @@ fn check_generic_args_len<'db>(
                 ctx.report_elided_lifetimes_in_path(def, lifetime_args_len as u32, report_in_path);
                 had_error |= report_in_path;
             }
-            LifetimeElisionKind::AnonymousReportError => {
+            LifetimeElisionKind::AnonymousReportError | LifetimeElisionKind::Item => {
                 ctx.report_missing_lifetime(def, lifetime_args_len as u32);
                 had_error = true
             }
@@ -1245,11 +1291,25 @@ fn check_generic_args_len<'db>(
         had_error = true;
     }
 
-    had_error
+    (had_error, explicit_late_bound)
+}
+
+/// Whether `def` is a function with late-bound lifetimes, named or left out of its parameters:
+/// rustc's `Generics::has_late_bound_regions`.
+fn has_late_bound_lifetimes(
+    db: &Db,
+    def: GenericDefId,
+    def_generics: &Generics<'_>,
+) -> bool {
+    let GenericDefId::FunctionId(function) = def else { return false };
+    def_generics
+        .iter_self_late_bound()
+        .any(|(_, param)| matches!(param, GenericParamDataRef::LifetimeParamData(_)))
+        || super::elided_lifetimes(db, function).len() > 0
 }
 
 pub(crate) fn substs_from_args_and_bindings<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     store: &ExpressionStore,
     args_and_bindings: Option<&HirGenericArgs>,
     def: GenericDefId,
@@ -1276,17 +1336,20 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         args_slice.iter().any(|arg| !matches!(arg, HirGenericArg::Lifetime(_)));
     infer_args &= !has_non_lifetime_args;
 
-    let had_count_error = check_generic_args_len(
+    let has_lifetime_args = args_slice.iter().any(|arg| matches!(arg, HirGenericArg::Lifetime(_)));
+    let (had_count_error, explicit_late_bound) = check_generic_args_len(
         args_and_bindings,
         def,
         &def_generics,
+        has_lifetime_args && has_late_bound_lifetimes(db, def, &def_generics),
         infer_args,
         &lifetime_elision,
         lowering_assoc_type_generics,
         ctx,
     );
 
-    let mut substs = Vec::with_capacity(def_generics.len(true));
+    let mut substs: SmallVec<[GenericArg<'db>; 8]> =
+        SmallVec::with_capacity(def_generics.len(true));
 
     substs.extend(
         def_generics.iter_parent_id().enumerate().map(|(idx, id)| ctx.parent_arg(idx as u32, id)),
@@ -1376,6 +1439,10 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                     args.next();
                     params.next();
                 }
+                (HirGenericArg::Lifetime(_), _) if explicit_late_bound => {
+                    // A lifetime argument for a late-bound lifetime, which rustc ignores.
+                    args.next();
+                }
                 (
                     HirGenericArg::Type(_) | HirGenericArg::Const(_),
                     GenericParamDataRef::LifetimeParamData(_),
@@ -1437,7 +1504,8 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                 //     will already have been emitted, and we can ignore it.
                 //  2. We've inferred some lifetimes, which have been provided later (i.e.
                 //     after a type or const). We want to throw an error in this case.
-                if !had_count_error {
+                //  3. Lifetime arguments for late-bound lifetimes, which are ignored.
+                if !had_count_error && !explicit_late_bound {
                     assert!(
                         matches!(arg, HirGenericArg::Lifetime(_)),
                         "the only possible situation here is incorrect lifetime order"
@@ -1456,7 +1524,8 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
                     match &lifetime_elision {
                         LifetimeElisionKind::ElisionFailure
                         | LifetimeElisionKind::AnonymousCreateParameter { report_in_path: true }
-                        | LifetimeElisionKind::AnonymousReportError => {
+                        | LifetimeElisionKind::AnonymousReportError
+                        | LifetimeElisionKind::Item => {
                             assert!(had_count_error);
                             ctx.inferred_kind(
                                 def,

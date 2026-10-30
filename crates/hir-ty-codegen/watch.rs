@@ -16,9 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{FunctionId, HasModule};
-use hir_ty::db::HirDatabase;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{Instance, InstanceDef, StoredParamEnvAndCrate};
@@ -150,7 +149,7 @@ impl Watch {
     /// when it was not compiled: when it was, the compile's time says so.
     pub(crate) fn placed(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         id: u32,
         of: Of<'_>,
         calls: Vec<u32>,

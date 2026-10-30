@@ -14,12 +14,14 @@ license = "MIT OR Apache-2.0"
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+blaze-format.workspace = true
 blaze-ids.workspace = true
 object = { version = "0.37", default-features = false, features = ["read", "std", "elf"] }
 rustc-hash = "2.1.1"
 wasm-encoder = { version = "0.244", default-features = false, features = ["std"] }
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 
+base-db = { path = "../base-db", version = "0.0.0" }
 hir = { path = "../hir", version = "0.0.0" }
 hir-def = { path = "../hir-def", version = "0.0.0" }
 hir-ty = { path = "../hir-ty", version = "0.0.0" }

@@ -221,6 +221,13 @@ pub fn held() -> u64 {
     u64::try_from(HELD.0.load(Ordering::Relaxed).wrapping_add(own)).unwrap_or(0)
 }
 
+/// Everything blaze itself holds: [`held`] (what goes through the global allocator) and the
+/// pages `blaze_mem` committed for its regions, frames, chunks and pools, which it maps itself
+/// and [`Counting`] never sees ([`blaze_mem::tag::Snapshot::committed`]).
+pub fn own() -> u64 {
+    held().saturating_add(blaze_mem::tag::snapshot().committed)
+}
+
 /// The first chunk of a [`Bump`], and the most a chunk grows to but for one value bigger.
 const FIRST_CHUNK: usize = 64 << 10;
 const LAST_CHUNK: usize = 16 << 20;
@@ -825,8 +832,8 @@ impl Drop for Grant {
 ///
 /// What others use is what is in use in blaze's own cgroup (v2's `memory.current` of the group
 /// `/proc/self/cgroup` names; v1's `memory.usage_in_bytes` where the memory controller is
-/// v1's) less what blaze itself holds ([`held`]; 0 when [`Counting`] is not the global
-/// allocator, so the budget is then the smaller). It is not the machine's `MemTotal` less
+/// v1's) less what blaze itself holds ([`own`]: [`held`], 0 when [`Counting`] is not the global
+/// allocator, so the budget is then the smaller, and the pages `blaze_mem` committed). It is not the machine's `MemTotal` less
 /// `MemAvailable`: that counts every process outside the cgroup against a limit they do not
 /// share, and a small cgroup on a busy machine would refuse builds that fit. The root cgroup
 /// keeps no count, and nothing is taken off there; nor on macOS, which has no cgroups.
@@ -837,7 +844,7 @@ pub fn machine_budget(margin: u64) -> io::Result<Budget> {
     let mut limits = machine_limits()?;
     #[cfg(unix)]
     limits.extend(rlimit_as()?.map(|bytes| (bytes, "the process's RLIMIT_AS".to_owned())));
-    let in_use = machine_in_use(held())?;
+    let in_use = machine_in_use(own())?;
     least(limits, in_use, margin)
 }
 
@@ -1057,15 +1064,16 @@ fn least(
 #[cfg(test)]
 #[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
-    use std::{
-        alloc::System,
-        sync::{Barrier, Mutex, atomic::AtomicUsize},
-    };
+    use std::sync::{Barrier, Mutex, atomic::AtomicUsize};
+
+    use blaze_ids::rng::SplitMix64;
 
     use super::*;
 
+    /// `blaze_alloc_count`'s counter under this crate's own: the allocation-budget tests count
+    /// calls, the arena's tests bytes held.
     #[global_allocator]
-    static ALLOC: Counting<System> = Counting(System);
+    static ALLOC: Counting<blaze_alloc_count::Counting> = Counting(blaze_alloc_count::Counting);
 
     const MB: usize = 1 << 20;
 
@@ -1121,6 +1129,18 @@ mod tests {
         std::hint::black_box(&big);
     }
 
+    /// What blaze holds counts the pages `blaze_mem` maps itself, which the global allocator
+    /// never sees, beside what goes through it.
+    #[test]
+    fn blaze_holds_what_blaze_mem_committed_too() {
+        let mut column = blaze_mem::RegionVec::<u64>::new(4 * MB, blaze_mem::Tag::Plane).unwrap();
+        column.extend_from_slice(&vec![7u64; MB]);
+        let committed = blaze_mem::tag::snapshot().committed;
+        assert!(committed >= 8 * MB as u64, "{committed}");
+        assert!(own() >= 8 * MB as u64, "{}", own());
+        std::hint::black_box(&column);
+    }
+
     #[test]
     fn a_bump_puts_values_in_chunks_and_frees_them_together() {
         let mut bump = Bump::new();
@@ -1168,21 +1188,21 @@ mod tests {
     #[test]
     fn bumped_values_are_aligned_apart_and_kept() {
         for seed in 0..40u64 {
-            let mut rng = SplitMix(seed);
+            let mut rng = SplitMix64::new(seed);
             let mut bump = Bump::new();
             let mut values: Vec<(usize, usize, u8)> = Vec::new();
             for step in 0..3000usize {
-                if rng.next() % 500 == 0 {
+                if rng.one_in(500) {
                     check_values(&values);
                     values.clear();
                     bump.reset();
                 }
-                let size = match rng.next() % 8 {
+                let size = match rng.below(8) {
                     0 => 0,
-                    1 => (rng.next() % 200_000) as usize,
-                    _ => (rng.next() % 300) as usize,
+                    1 => rng.index(200_000),
+                    _ => rng.index(300),
                 };
-                let align = 1usize << (rng.next() % 7);
+                let align = 1usize << rng.below(7);
                 let layout = Layout::from_size_align(size, align).unwrap();
                 let at = bump.alloc_layout(layout).unwrap();
                 assert_eq!(at.as_ptr() as usize % align, 0, "seed {seed} step {step}");
@@ -1386,18 +1406,6 @@ mod tests {
         assert!(far.to_string().contains("past the"), "{far}");
     }
 
-    struct SplitMix(u64);
-
-    impl SplitMix {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        }
-    }
-
     /// A thread's count reaches the total in batches: what it added plus what it has not yet
     /// is exactly what it allocated less what it freed, what it has not stays under a batch,
     /// and at its exit the rest is added, after which every change is added at once.
@@ -1406,14 +1414,14 @@ mod tests {
         std::thread::spawn(|| {
             std::hint::black_box(vec![0u8; 16]);
             assert_eq!(LOCAL.with(|it| it.batch.get()), BATCH);
-            let mut rng = SplitMix(7);
+            let mut rng = SplitMix64::new(7);
             let mut kept: Vec<Vec<u8>> = Vec::with_capacity(4000);
             for _ in 0..4000 {
-                if !kept.is_empty() && rng.next() % 3 == 0 {
-                    let at = (rng.next() as usize) % kept.len();
+                if !kept.is_empty() && rng.one_in(3) {
+                    let at = rng.index(kept.len());
                     drop(kept.swap_remove(at));
                 } else {
-                    kept.push(std::hint::black_box(vec![0u8; 1 + (rng.next() % 9000) as usize]));
+                    kept.push(std::hint::black_box(vec![0u8; 1 + rng.index(9000)]));
                 }
                 LOCAL.with(|it| {
                     assert!(it.unflushed.get().unsigned_abs() < BATCH as u64);

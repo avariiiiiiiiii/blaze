@@ -39,6 +39,17 @@ fn commands_and_their_aliases() {
     assert_eq!(parse(os(&["-V"])), Ok(Asked::Version));
     assert_eq!(parse(os(&["stop"])), Ok(Asked::Stop));
     assert_eq!(parse(os(&["status"])), Ok(Asked::Status));
+    assert_eq!(parse(os(&["daemon", "install"])), Ok(Asked::Daemon(DaemonVerb::Install)));
+    assert_eq!(parse(os(&["daemon", "uninstall"])), Ok(Asked::Daemon(DaemonVerb::Uninstall)));
+    assert_eq!(parse(os(&["daemon", "start"])), Ok(Asked::Unknown("daemon start".to_owned())));
+    assert_eq!(parse(os(&["daemon"])), Ok(Asked::Unknown("daemon".to_owned())));
+    use crate::cli::inspect::Inspected;
+    assert_eq!(
+        parse(os(&["codegen-inputs", "--format=json", "-p", "foo"])),
+        Ok(Asked::Inspect(Inspected::CodegenInputs, os(&["--format=json", "-p", "foo"])))
+    );
+    assert_eq!(parse(os(&["trace", "--out", "t"])), Ok(Asked::Inspect(Inspected::Trace, os(&["--out", "t"]))));
+    assert_eq!(parse(os(&["tables"])), Ok(Asked::Inspect(Inspected::Tables, Vec::new())));
     assert_eq!(parse(os(&["frobnicate"])), Ok(Asked::Unknown("frobnicate".to_owned())));
 }
 

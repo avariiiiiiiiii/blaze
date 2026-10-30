@@ -1,6 +1,6 @@
 [package]
 name = "blaze-inproc"
-description = "blaze v2's dev runs with no binary on disk: code memory mapped writable in the daemon and executable in the run process, blaze's own loader, fences for running threads, and the channel between them"
+description = "blaze v2's dev runs patched with one store: the executable written once per content key and started by the kernel, its code laid over before main by a code memory mapped writable in the daemon and executable in the run, fences for running threads, and the channel between them"
 publish = false
 
 version.workspace = true
@@ -13,9 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
-[[bin]]
-name = "blaze-inproc-run"
-path = "src/bin/blaze-inproc-run.rs"
+# Run by the coordinator as a dev run under blaze: a program that checks it is its own
+# executable at cargo's path, symbolizes its backtrace and was attached by its start hook.
+[[example]]
+name = "inproc-exact"
+path = "programs/exact.rs"
 test = false
 
 [features]
@@ -31,6 +33,9 @@ libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[dev-dependencies]
+blaze-ids.workspace = true
 
 [lints]
 workspace = true

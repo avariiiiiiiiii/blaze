@@ -54,7 +54,9 @@
 //! not refused.
 
 use std::{
-    ffi::{CString, OsString},
+    ffi::{CStr, CString, OsString},
+    fmt::Write as _,
+    ops::Range,
     os::{
         fd::{AsFd as _, AsRawFd as _},
         unix::ffi::OsStrExt as _,
@@ -65,7 +67,7 @@ use std::{
 use blaze_core::Untraceable;
 use rustc_hash::FxHashMap;
 
-use super::{Also, Bind, MARK, Recorder, Spec, View, tidy, tidy_into};
+use super::{Also, Bind, MARK, Recorder, Scope, Spec, View, push_lossy, tidy, tidy_into};
 
 mod raw;
 
@@ -93,10 +95,13 @@ fn interposer() -> Result<PathBuf, String> {
     if std::fs::read(&file).is_ok_and(|it| it == INTERPOSER) {
         return Ok(file);
     }
+    // alloc: the error, once per run, and no sandbox is made.
     std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+    // alloc: once per run, the first time the interposer is written.
     let writing = dir.join(format!("writing-{}", std::process::id()));
     std::fs::write(&writing, INTERPOSER)
         .and_then(|()| std::fs::rename(&writing, &file))
+        // alloc: the error, once per run, and no sandbox is made.
         .map_err(|it| format!("{}: {it}", file.display()))?;
     Ok(file)
 }
@@ -376,6 +381,7 @@ struct IfReq {
 }
 
 fn os(what: &str) -> String {
+    // alloc: the error, once, and the sandbox or the run stops.
     format!("{what}: {}", std::io::Error::last_os_error())
 }
 
@@ -394,7 +400,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
 }
 
 /// [`run`], in namespaces or, with why they can't be made, [`confined`].
-fn run_as(
+pub(super) fn run_as(
     spec: &Spec,
     program: Option<&[OsString]>,
     unshared: Option<String>,
@@ -408,7 +414,9 @@ fn run_as(
     let mut with;
     let spec = match &interposer {
         Some(file) => {
+            // alloc: once per sandbox, the interposer's directory as a bind of its own.
             let dir = file.parent().unwrap_or(file).to_owned();
+            // clone: once per sandbox, the spec with the interposer's directory in it.
             with = spec.clone();
             match &mut with.view {
                 Some(view) => view.binds.push(Bind::read(&dir, &dir)),
@@ -424,6 +432,7 @@ fn run_as(
     if let Some(why) = &unshared
         && !spec.overlays.is_empty()
     {
+        // alloc: the error, once, and no sandbox is made.
         return Err(format!(
             "{why}, and a sandbox with overlays (a sandboxed test's workspace) is made in one"
         ));
@@ -431,17 +440,20 @@ fn run_as(
     if let Some(why) = &unshared
         && let Err(no) = landlock::abi()
     {
+        // alloc: the error, once, and no sandbox is made.
         return Err(format!("{why}; and it can't be confined without one: {no}"));
     }
     // The confined program's own temporary directory, where a namespace would have its own
     // empty `/tmp`.
     let scratch = match unshared {
         Some(_) => {
+            // alloc: once per sandbox, its temporary directory's name.
             let dir = std::env::temp_dir().join(format!(
                 "blaze-sandbox-tmp-{}-{}",
                 std::process::id(),
                 unique()
             ));
+            // alloc: the error, once, and no sandbox is made.
             std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
             Some(dir)
         }
@@ -464,14 +476,19 @@ fn unique() -> u64 {
 /// namespaces needs, tried in a process of its own; why not when it may not.
 fn namespaces() -> Result<(), String> {
     let (uid, gid) = (raw::uid(), raw::gid());
+    // alloc: once per process, the maps the kernel is given, before the probe's fork.
     let maps = [
+        // alloc: as the maps are.
         (c"/proc/self/setgroups", "deny".to_owned()),
+        // alloc: as the maps are.
         (c"/proc/self/uid_map", format!("{uid} {uid} 1")),
+        // alloc: as the maps are.
         (c"/proc/self/gid_map", format!("{gid} {gid} 1")),
     ];
     // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
-    // (`super::command` runs before anything else in it, and nothing here starts a thread).
-    // The child only writes three files and exits.
+    // (`super::command` runs before anything else in it, and nothing here starts a thread), or
+    // in a test's of its own, one thread too (`super::alone`). The child only unshares, writes
+    // three files and exits.
     let child = unsafe { raw::fork() };
     if child < 0 {
         return Err(os("fork"));
@@ -505,10 +522,13 @@ fn namespaces() -> Result<(), String> {
     if code == 0 {
         return Ok(());
     }
+    // The error, once, and no user namespace is made.
     let what = match (code >> 6) as usize {
+        // alloc: as the error is.
         0 => "unshare".to_owned(),
         step => maps[(step - 1).min(2)].0.to_string_lossy().into_owned(),
     };
+    // alloc: as the error is.
     Err(format!("a user namespace ({what}): {}", std::io::Error::from_raw_os_error(code & 63)))
 }
 
@@ -525,7 +545,9 @@ fn run_in(
         .unwrap_or_default()
         .iter()
         .map(|it| CString::new(it.as_bytes()).unwrap_or_default())
+        // alloc: once per sandbox, the program's command line for the kernel.
         .collect();
+    // alloc: once per sandbox, the confined program's `TMPDIR`.
     let tmp = scratch.map(|it| ("TMPDIR".to_owned(), it.display().to_string()));
     let env: Vec<CString> = match also.env {
         None => spec
@@ -533,7 +555,9 @@ fn run_in(
             .iter()
             .filter(|(name, _)| tmp.is_none() || name != "TMPDIR")
             .chain(tmp.as_ref())
+            // alloc: once per sandbox, the program's environment for the kernel.
             .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap_or_default())
+            // alloc: as the variables are.
             .collect(),
         Some(given) => environment(given, tmp.as_ref(), interposer)?,
     };
@@ -546,7 +570,9 @@ fn run_in(
         .map(|_| filter_program(recorded, spec.record_reads, confining, also.network, sockets[1]));
     let scratch_dir = scratch.map(tidy);
     let own: Vec<&str> = match &scratch_dir {
+        // alloc: once per sandbox, its own directories, by reference.
         Some(dir) => CONFINED_OWN.iter().copied().chain([dir.as_str()]).collect(),
+        // alloc: as the confined sandbox's are.
         None => OWN.to_vec(),
     };
     let mut recorder = Recorder::new(spec, &own);
@@ -563,7 +589,8 @@ fn run_in(
     super::pass_signals_to(0);
     // SAFETY: the sandbox runs in `blaze sandbox`'s process, which is one thread
     // (`super::command` runs before anything else in it; the signal handlers above start
-    // none). The child makes the sandbox and forks again, as one thread too.
+    // none), or in a test's of its own, one thread too (`super::alone`). The child makes the
+    // sandbox and forks again, as one thread too.
     let first = unsafe { raw::fork() };
     if first < 0 {
         return Err(os("fork"));
@@ -649,11 +676,14 @@ fn environment(
     tmp: Option<&(String, String)>,
     interposer: Option<&Path>,
 ) -> Result<Vec<CString>, String> {
+    // Once per sandbox, the program's environment for the kernel.
     let entry = |name: &[u8], value: &[u8]| {
-        let mut bytes = name.to_vec();
+        let mut bytes = Vec::with_capacity(name.len() + 1 + value.len() + 1);
+        bytes.extend_from_slice(name);
         bytes.push(b'=');
         bytes.extend_from_slice(value);
         CString::new(bytes).map_err(|_| {
+            // alloc: the error, once, and no sandbox is made.
             format!("the variable {:?} has a nul in it", String::from_utf8_lossy(name))
         })
     };
@@ -668,7 +698,9 @@ fn environment(
             // `ours:` and theirs, even empty: the interposer gives back what follows, and
             // takes the variable away only when it is `ours` alone.
             (b"LD_PRELOAD", Some(ours)) => {
-                let mut both = ours.as_os_str().as_bytes().to_vec();
+                let ours = ours.as_os_str().as_bytes();
+                let mut both = Vec::with_capacity(ours.len() + 1 + value.len());
+                both.extend_from_slice(ours);
                 both.push(b':');
                 both.extend_from_slice(value);
                 env.push(entry(name, &both)?);
@@ -703,6 +735,15 @@ struct Made<'a> {
     /// Whether it may reach the network: there is no network namespace, and a confined one
     /// is not kept from TCP.
     network: bool,
+}
+
+/// The map of a user namespace's id `id` to itself, alone (`uid_map`, `gid_map`), in `room`.
+fn id_map(room: &mut [u8; 64], id: u32) -> &[u8] {
+    use std::io::Write as _;
+    let mut out = &mut room[..];
+    _ = write!(out, "{id} {id} 1");
+    let left = out.len();
+    &room[..64 - left]
 }
 
 /// The code a process that ended with `status` is taken to have ended with.
@@ -740,11 +781,15 @@ fn sandbox(
         }
         return Err(why);
     }
-    let write =
-        |file: &str, text: String| std::fs::write(file, text).map_err(|it| format!("{file}: {it}"));
-    write("/proc/self/setgroups", "deny".to_owned())?;
-    write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
-    write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+    // The maps the kernel is given, once per sandbox.
+    let write = |file: &str, text: &[u8]| {
+        // alloc: the error, once, and no sandbox is made.
+        std::fs::write(file, text).map_err(|it| format!("{file}: {it}"))
+    };
+    let mut map = [0u8; 64];
+    write("/proc/self/setgroups", b"deny")?;
+    write("/proc/self/uid_map", id_map(&mut map, uid))?;
+    write("/proc/self/gid_map", id_map(&mut map, gid))?;
     let root = c(Path::new("/"));
     if raw::mount(None, &root, None, libc::MS_REC | libc::MS_PRIVATE, None) < 0 {
         return Err(os("making the mounts private"));
@@ -760,8 +805,8 @@ fn sandbox(
         return Err(os("a PID namespace (unshare)"));
     }
     let cwd = c(&spec.cwd);
-    // SAFETY: this is the sandbox's first process, forked from the one thread of `blaze
-    // sandbox` (`run_in`), so it is one thread: nothing in it starts another.
+    // SAFETY: this is the sandbox's first process, forked by `run_in` from a process of one
+    // thread, so it is one thread: nothing in it starts another.
     let init = unsafe { raw::fork() };
     if init < 0 {
         return Err(os("fork"));
@@ -803,21 +848,25 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     if raw::child_subreaper() < 0 {
         return Err(os("reaping what the program leaves (prctl)"));
     }
+    // clone: once per sandbox, the directories Landlock is told, with its `TMPDIR`.
     let mut writable = spec.writable.clone();
+    // alloc: as `writable` is.
     writable.push(scratch.to_owned());
     for dir in &spec.writable {
+        // alloc: the error, once, and no sandbox is made.
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
     }
     landlock::restrict(&writable, made.network)?;
     let cwd = c(&spec.cwd);
     if raw::chdir(&cwd) < 0 {
+        // alloc: the error, once, and no sandbox is made.
         return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
     }
     if probe {
         return Ok(0);
     }
-    // SAFETY: this is the sandbox's first process, forked from the one thread of `blaze
-    // sandbox` (`run_in`), so it is one thread: Landlock and `prctl` start none.
+    // SAFETY: this is the sandbox's first process, forked by `run_in` from a process of one
+    // thread, so it is one thread: Landlock and `prctl` start none.
     let program = unsafe { raw::fork() };
     if program < 0 {
         return Err(os("fork"));
@@ -846,8 +895,10 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     // What the program left is killed, as the end of a PID namespace would: each child, and
     // each process that comes to this one as its parent ends, until none is left.
     let me = raw::pid();
+    // alloc: once, as the sandbox ends.
     let children = format!("/proc/{me}/task/{me}/children");
     loop {
+        // alloc: once per process the program left, as the sandbox ends.
         let listed = std::fs::read_to_string(&children).unwrap_or_default();
         for pid in listed.split_whitespace().filter_map(|it| it.parse::<libc::pid_t>().ok()) {
             raw::kill(pid, libc::SIGKILL);
@@ -919,8 +970,11 @@ mod landlock {
         }
         let error = std::io::Error::last_os_error();
         Err(match error.raw_os_error() {
+            // alloc: the error, once, and no sandbox is made.
             Some(libc::ENOSYS) => "this kernel has no Landlock (Linux 5.13 on has it)".to_owned(),
+            // alloc: as above.
             Some(libc::EOPNOTSUPP) => "this kernel has Landlock turned off (`lsm=`)".to_owned(),
+            // alloc: as above.
             _ => format!("Landlock: {error}"),
         })
     }
@@ -968,6 +1022,7 @@ mod landlock {
             let at = super::c(path);
             let Some(fd) = super::raw::open(&at, libc::O_PATH | libc::O_CLOEXEC) else {
                 return match required {
+                    // alloc: the error, once, and no sandbox is made.
                     true => Err(super::os(&path.display().to_string())),
                     false => Ok(()),
                 };
@@ -978,9 +1033,14 @@ mod landlock {
             let allowed = if is_dir && required { dir } else { file };
             let rule = PathBeneath { allowed_access: allowed, parent_fd: fd.as_raw_fd() };
             let added = super::raw::landlock_add_rule(ruleset, &rule);
-            let error = super::os(&format!("{} written (landlock_add_rule)", path.display()));
+            // Read before `drop` can change `errno`.
+            let error = (added < 0).then(std::io::Error::last_os_error);
             drop(fd);
-            if added < 0 { Err(error) } else { Ok(()) }
+            match error {
+                // alloc: the error, once, and no sandbox is made.
+                Some(error) => Err(format!("{} written (landlock_add_rule): {error}", path.display())),
+                None => Ok(()),
+            }
         };
         for it in writable {
             add(it, true)?;
@@ -1006,12 +1066,15 @@ fn machine(spec: &Spec) -> Result<(), String> {
     let opened = |at: &Path| -> Result<std::os::fd::OwnedFd, String> {
         let path = c(at);
         raw::open(&path, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            // alloc: the error, once, and no sandbox is made.
             .ok_or_else(|| os(&at.display().to_string()))
     };
     // The writable directories are reached through descriptors opened before anything is
     // made read-only or hidden, and bound back in place after: they stay the directories
     // outside, written for real.
+    // alloc: once per sandbox, a descriptor of each.
     let writable = spec.writable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
+    // alloc: as `writable`'s.
     let readable = spec.readable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
     let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
     if raw::mount_setattr(&root, AT_RECURSIVE, &attr) < 0 {
@@ -1029,6 +1092,7 @@ fn machine(spec: &Spec) -> Result<(), String> {
             Some(options.as_c_str()),
         ) < 0
         {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&format!("an empty {}", at.display())));
         }
         Ok(())
@@ -1036,11 +1100,14 @@ fn machine(spec: &Spec) -> Result<(), String> {
     // The overlays are reached through descriptors opened before the empty `/tmp` hides
     // what is there: a workspace under `/tmp` is mounted again inside it. Their own
     // directories are on a tmpfs that the program's `/tmp` then hides as well.
+    // alloc: once per sandbox, a descriptor of each.
     let lowers = spec.overlays.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
     let staging = Path::new("/tmp");
     tmpfs(staging)?;
     for at in 0..spec.overlays.len() {
+        // alloc: once per overlay, its directories' names.
         for it in [staging.join(format!("{at}/upper")), staging.join(format!("{at}/work"))] {
+            // alloc: the error, once, and no sandbox is made.
             std::fs::create_dir_all(&it).map_err(|error| format!("{}: {error}", it.display()))?;
         }
     }
@@ -1062,46 +1129,58 @@ fn machine(spec: &Spec) -> Result<(), String> {
                 .flatten()
                 .filter(|it| it.file_type().is_ok_and(|it| it.is_symlink()))
                 .filter_map(|it| Some((it.path(), std::fs::read_link(it.path()).ok()?)))
+                // alloc: once per sandbox, the links at the top of `/run`.
                 .collect(),
-            false => Vec::new(),
+            false => Vec::with_capacity(0),
         };
         tmpfs(dir)?;
         for (link, to) in links {
             std::os::unix::fs::symlink(&to, &link).map_err(|error| {
+                // alloc: the error, once, and no sandbox is made.
                 format!("{} in the empty {}: {error}", link.display(), dir.display())
             })?;
         }
     }
+    // Once per directory the sandbox mounts, the path it is reached by.
     let by_fd = |fd: &std::os::fd::OwnedFd, rest: &str| {
+        // alloc: as above, once per sandbox.
         PathBuf::from(format!("/proc/self/fd/{}{rest}", std::os::fd::AsRawFd::as_raw_fd(fd)))
     };
     for (at, (dir, lower)) in spec.overlays.iter().zip(&lowers).enumerate() {
+        // alloc: the error, once, and no sandbox is made.
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-        let (upper, work) =
-            (by_fd(&staged, &format!("/{at}/upper")), by_fd(&staged, &format!("/{at}/work")));
+        // alloc: once per overlay, its directories' names.
+        let upper = by_fd(&staged, &format!("/{at}/upper"));
+        // alloc: as `upper`'s.
+        let work = by_fd(&staged, &format!("/{at}/work"));
         overlay(dir, &by_fd(lower, ""), &upper, &work)?;
     }
     // The readable directories are bound back in place, read-only as their mount now is, where
     // an empty directory hid them; the writable ones go on top.
     for (dir, fd) in spec.readable.iter().zip(&readable) {
+        // alloc: the error, once, and no sandbox is made.
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
         let (from, to) = (c(&by_fd(fd, "")), c(dir));
         let flags = libc::MS_BIND | libc::MS_REC;
         if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&format!("{} seen read-only", dir.display())));
         }
     }
     for (dir, fd) in spec.writable.iter().zip(&writable) {
+        // alloc: the error, once, and no sandbox is made.
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
         let (from, to) = (c(&by_fd(fd, "")), c(dir));
         let flags = libc::MS_BIND | libc::MS_REC;
         if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&format!("{} written for real", dir.display())));
         }
         // A bind keeps the read-only mark its source was given above.
         let attr =
             MountAttr { attr_set: 0, attr_clr: MOUNT_ATTR_RDONLY, propagation: 0, userns_fd: 0 };
         if raw::mount_setattr(&to, AT_RECURSIVE, &attr) < 0 {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&format!("{} written for real (mount_setattr)", dir.display())));
         }
     }
@@ -1111,6 +1190,7 @@ fn machine(spec: &Spec) -> Result<(), String> {
     if let Some(tmp) =
         tmp.filter(|it| ["/tmp", "/var/tmp", "/dev/shm"].iter().any(|dir| it.starts_with(dir)))
     {
+        // alloc: the error, once, and no sandbox is made.
         std::fs::create_dir_all(tmp).map_err(|error| format!("{}: {error}", tmp.display()))?;
     }
     Ok(())
@@ -1119,28 +1199,29 @@ fn machine(spec: &Spec) -> Result<(), String> {
 /// Mounts at `dir` what is in `lower`, with its changes going to `upper`.
 fn overlay(dir: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), String> {
     // A path in an overlay's options has its commas, colons and backslashes escaped.
-    let escaped = |it: &Path| {
-        let mut out = Vec::new();
+    let escaped = |out: &mut Vec<u8>, it: &Path| {
         for &byte in it.as_os_str().as_bytes() {
             if matches!(byte, b',' | b':' | b'\\') {
                 out.push(b'\\');
             }
             out.push(byte);
         }
-        out
     };
     let (kind, at) = (c(Path::new("overlay")), c(dir));
-    let mut last = String::new();
+    let mut last = String::with_capacity(0);
     // `userxattr` keeps what overlayfs notes in the user's attributes, which a user
     // namespace may write; a kernel or a tmpfs without them takes none.
     for extra in [&b",userxattr"[..], b""] {
-        let mut options = b"lowerdir=".to_vec();
-        options.extend(escaped(lower));
-        options.extend(b",upperdir=");
-        options.extend(escaped(upper));
-        options.extend(b",workdir=");
-        options.extend(escaped(work));
-        options.extend(extra);
+        // The options the kernel is given, once per overlay.
+        let paths = [lower, upper, work].map(|it| it.as_os_str().len());
+        let mut options = Vec::with_capacity(64 + 2 * paths.iter().sum::<usize>());
+        options.extend_from_slice(b"lowerdir=");
+        escaped(&mut options, lower);
+        options.extend_from_slice(b",upperdir=");
+        escaped(&mut options, upper);
+        options.extend_from_slice(b",workdir=");
+        escaped(&mut options, work);
+        options.extend_from_slice(extra);
         let options = CString::new(options).unwrap_or_default();
         if raw::mount(
             Some(kind.as_c_str()),
@@ -1152,6 +1233,7 @@ fn overlay(dir: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), St
         {
             return Ok(());
         }
+        // alloc: the error, at most twice, and no sandbox is made when both fail.
         last = os(&format!("an overlay on {}", dir.display()));
     }
     Err(last)
@@ -1180,6 +1262,7 @@ fn check_view(spec: &Spec, view: &View) -> Result<(), String> {
     if !(spec.overlays.is_empty() && spec.writable.is_empty() && spec.readable.is_empty()) {
         return Err("a sandbox with a view sees what its binds name and nothing else: its \
                     overlays, writable and readable directories are to be binds of the view"
+            // alloc: the error, once, and no sandbox is made.
             .to_owned());
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -1192,21 +1275,25 @@ fn check_view(spec: &Spec, view: &View) -> Result<(), String> {
                 .all(|it| matches!(it, Component::RootDir | Component::Normal(_)));
         let inside_tidy = tidy(&bind.inside);
         if !whole || inside_tidy == "/" {
+            // alloc: the error, once, and no sandbox is made.
             return Err(format!(
                 "the view binds {outside} at {inside}, which is not a whole path \
                  below `/` with no `..`"
             ));
         }
         if ["/proc", "/dev"].iter().any(|it| super::under(&inside_tidy, it)) {
+            // alloc: the error, once, and no sandbox is made.
             return Err(format!(
                 "the view binds {outside} at {inside}, which is in the view's own \
                  `/proc` or `/dev`"
             ));
         }
         if !seen.insert(inside_tidy) {
+            // alloc: the error, once, and no sandbox is made.
             return Err(format!("the view binds two things at {inside}"));
         }
         if let Err(error) = std::fs::metadata(&bind.outside) {
+            // alloc: the error, once, and no sandbox is made.
             return Err(format!(
                 "the view binds {outside} at {inside}, and {outside} is not there \
                  to be bound ({error})"
@@ -1235,12 +1322,15 @@ fn put_view(
         .map(|bind| {
             let path = c(&bind.outside);
             raw::open(&path, libc::O_PATH | libc::O_CLOEXEC).ok_or_else(|| {
+                // alloc: the error, once, and no sandbox is made.
                 os(&format!("{}, bound at {}", bind.outside.display(), bind.inside.display()))
             })
         })
+        // alloc: once per sandbox, a descriptor of each bind's source.
         .collect::<Result<Vec<_>, _>>()?;
     let root = Path::new(VIEW_ROOT);
     let made = |it: std::io::Result<()>, at: &Path| {
+        // alloc: the error, once, and no sandbox is made.
         it.map_err(|error| format!("{}: {error}", at.display()))
     };
     let tmpfs = |at: &Path, flags: libc::c_ulong, mode: &str| -> Result<(), String> {
@@ -1253,6 +1343,7 @@ fn put_view(
             Some(options.as_c_str()),
         ) < 0
         {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&format!("the view's {}", at.display())));
         }
         Ok(())
@@ -1280,15 +1371,19 @@ fn put_view(
         (_, 0) => ("blaze", "root"),
         _ => ("blaze", "blaze"),
     };
+    // The view's `/etc`, once per sandbox.
     let etc = [
         (
             "passwd",
+            // alloc: as above.
             format!(
                 "{user}:x:{uid}:{gid}:{user}:/homeless-shelter:/noshell\n\
                  nobody:x:65534:65534:nobody:/:/noshell\n"
             ),
         ),
+        // alloc: as above.
         ("group", format!("{group}:x:{gid}:\nnogroup:x:65534:\n")),
+        // alloc: as above.
         ("hosts", "127.0.0.1 localhost\n::1 localhost\n".to_owned()),
     ];
     for (name, text) in etc {
@@ -1296,19 +1391,23 @@ fn put_view(
         made(std::fs::write(&at, text), &at)?;
     }
     // Outer binds first, so that one inside another lands on what the outer one shows.
+    // alloc: once per sandbox, the order of its binds.
     let mut order: Vec<usize> = (0..view.binds.len()).collect();
     blaze_ids::radix::sort_by_key(&mut order, |&at| view.binds[at].inside.components().count());
-    let mut bound: Vec<String> = Vec::new();
+    let mut bound: Vec<String> = Vec::with_capacity(view.binds.len());
     for at in order {
         let (it, source) = (&view.binds[at], &sources[at]);
         let Some(stat) = raw::stat_of(source.as_raw_fd()) else {
+            // alloc: the error, once, and no sandbox is made.
             return Err(os(&it.outside.display().to_string()));
         };
         let dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
         let to = mount_point(root, &it.inside, dir, &bound)?;
+        // alloc: once per bind, the path its source is reached by.
         let from = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
         let read_only = if it.writable { 0 } else { MOUNT_ATTR_RDONLY };
         bind(&from, &to, MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | read_only).map_err(|error| {
+            // alloc: the error, once, and no sandbox is made.
             format!("binding {} at {}: {error}", it.outside.display(), it.inside.display())
         })?;
         bound.push(tidy(&it.inside));
@@ -1321,6 +1420,7 @@ fn put_view(
     }
     for at in [dev.as_path(), root] {
         set_attr(at, MOUNT_ATTR_RDONLY, false)
+            // alloc: the error, once, and no sandbox is made.
             .map_err(|error| format!("the view's {} read-only: {error}", at.display()))?;
     }
     Ok(())
@@ -1331,14 +1431,19 @@ fn put_view(
 /// `bound` already binds, which is the machine's, and no link is followed, which could lead
 /// out of the view.
 fn mount_point(root: &Path, inside: &Path, dir: bool, bound: &[String]) -> Result<PathBuf, String> {
-    let parts: Vec<_> = inside.components().skip(1).collect();
-    let (mut at, mut seen) = (root.to_owned(), PathBuf::from("/"));
-    for (count, part) in parts.iter().enumerate() {
+    let parts = inside.components().skip(1).count();
+    let room = root.as_os_str().len() + 1 + inside.as_os_str().len();
+    let mut at = PathBuf::with_capacity(room);
+    at.push(root);
+    let mut seen = PathBuf::with_capacity(inside.as_os_str().len() + 1);
+    seen.push("/");
+    for (count, part) in inside.components().skip(1).enumerate() {
         at.push(part);
         seen.push(part);
-        let last = count + 1 == parts.len();
+        let last = count + 1 == parts;
         match at.symlink_metadata() {
             Ok(meta) if meta.file_type().is_symlink() => {
+                // alloc: the error, once, and no sandbox is made.
                 return Err(format!(
                     "the view binds something at {}, and {} is a link in what is bound there",
                     inside.display(),
@@ -1347,6 +1452,7 @@ fn mount_point(root: &Path, inside: &Path, dir: bool, bound: &[String]) -> Resul
             }
             Ok(meta) if meta.is_dir() == (dir || !last) => {}
             Ok(_) => {
+                // alloc: the error, once, and no sandbox is made.
                 return Err(format!(
                     "the view binds a {} at {}, and {} is not one",
                     if dir || !last { "directory" } else { "file" },
@@ -1357,6 +1463,7 @@ fn mount_point(root: &Path, inside: &Path, dir: bool, bound: &[String]) -> Resul
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let seen_s = tidy(&seen);
                 if let Some(outer) = bound.iter().find(|it| super::under(&seen_s, it)) {
+                    // alloc: the error, once, and no sandbox is made.
                     return Err(format!(
                         "the view binds something at {}, inside what it binds at {outer}, which \
                          has no {}",
@@ -1368,8 +1475,10 @@ fn mount_point(root: &Path, inside: &Path, dir: bool, bound: &[String]) -> Resul
                     true => std::fs::create_dir(&at),
                     false => std::fs::File::create(&at).map(drop),
                 };
+                // alloc: the error, once, and no sandbox is made.
                 made.map_err(|error| format!("{}: {error}", at.display()))?;
             }
+            // alloc: the error, once, and no sandbox is made.
             Err(error) => return Err(format!("{}: {error}", at.display())),
         }
     }
@@ -1381,6 +1490,7 @@ fn bind(from: &Path, to: &Path, attr: u64) -> Result<(), String> {
     let (from_c, to_c) = (c(from), c(to));
     let flags = libc::MS_BIND | libc::MS_REC;
     if raw::mount(Some(from_c.as_c_str()), &to_c, None, flags, None) < 0 {
+        // alloc: the error, once, and no sandbox is made.
         return Err(os(&format!("binding {} at {}", from.display(), to.display())));
     }
     if attr != 0 {
@@ -1395,6 +1505,7 @@ fn set_attr(at: &Path, attr: u64, recursive: bool) -> Result<(), String> {
     let attr = MountAttr { attr_set: attr, attr_clr: 0, propagation: 0, userns_fd: 0 };
     let flags = if recursive { AT_RECURSIVE } else { 0 };
     if raw::mount_setattr(&at_c, flags, &attr) < 0 {
+        // alloc: the error, once, and no sandbox is made.
         return Err(os(&format!("{} (mount_setattr)", at.display())));
     }
     Ok(())
@@ -1427,6 +1538,7 @@ fn enter_view() -> Result<(), String> {
 /// of the machine's. What is left is pipes, sockets and devices, a jobserver's among them.
 fn close_machine_files() {
     let fds: Vec<libc::c_int> = match std::fs::read_dir("/proc/self/fd") {
+        // alloc: once, in the program's process just before it runs the program.
         Ok(it) => it.flatten().filter_map(|it| it.file_name().to_str()?.parse().ok()).collect(),
         Err(_) => return,
     };
@@ -1484,6 +1596,7 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
         raw::mount(Some(kind.as_c_str()), &proc_, Some(kind.as_c_str()), flags, None);
     }
     if raw::chdir(cwd) < 0 {
+        // alloc: the error, once, and no sandbox is made.
         return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
     }
     if probe {
@@ -1537,6 +1650,7 @@ fn exec(made: &Made<'_>) -> String {
     // pair, owned by no `OwnedFd`; the program is not to have it, and nothing uses it after.
     unsafe { raw::close(made.socket) };
     raw::execve(made.argv, made.env);
+    // alloc: the error, once, and the program's process ends.
     std::io::Error::last_os_error().to_string()
 }
 
@@ -1575,7 +1689,9 @@ fn filter_program(
     let (notify, allow) =
         (insn(RET_K, 0, 0, SECCOMP_RET_USER_NOTIF), insn(RET_K, 0, 0, SECCOMP_RET_ALLOW));
     let errno = |it: i32| insn(RET_K, 0, 0, SECCOMP_RET_ERRNO | it as u32);
-    let mut program = vec![
+    // The head, then at most 9 instructions for each call, then the last.
+    let mut program = Vec::with_capacity(16 + 9 * CALLS.len());
+    program.extend([
         insn(LD_W_ABS, 0, 0, 4), // the architecture
         insn(JEQ_K, 1, 0, ARCH),
         errno(libc::ENOSYS),
@@ -1591,9 +1707,9 @@ fn filter_program(
         errno(libc::EPERM),
         insn(JEQ_K, 0, 1, NR_IO_URING_SETUP),
         errno(libc::ENOSYS),
-    ];
+    ]);
     // A null address is a connected socket's message.
-    let sendto_with_address = vec![
+    let sendto_with_address = [
         insn(LD_W_ABS, 0, 0, low(4)),
         insn(JEQ_K, 1, 0, 0),
         notify,
@@ -1602,41 +1718,48 @@ fn filter_program(
         allow,
         notify,
     ];
-    let sendmsg =
-        vec![insn(LD_W_ABS, 0, 0, low(0)), insn(JEQ_K, 0, 1, socket as u32), allow, notify];
+    let sendmsg = [insn(LD_W_ABS, 0, 0, low(0)), insn(JEQ_K, 0, 1, socket as u32), allow, notify];
     for call in CALLS {
-        let block = match (recorded, reads, call.does) {
-            (_, _, Does::Signal(_)) if confined => vec![notify],
-            (_, _, Does::Signal(_)) => continue,
-            (_, _, Does::Connect) => vec![notify],
-            (false, _, Does::SendMsg) if confined || network => sendmsg.clone(),
-            (false, _, Does::SendTo) => sendto_with_address.clone(),
-            (false, _, _) => continue,
-            (true, _, Does::SendMsg) => sendmsg.clone(),
+        let start = program.len();
+        match (recorded, reads, call.does) {
+            (_, _, Does::Signal(_)) if confined => program.push(notify),
+            (_, _, Does::Signal(_)) => {}
+            (_, _, Does::Connect) => program.push(notify),
+            (false, _, Does::SendMsg) if confined || network => program.extend(sendmsg),
+            (false, _, Does::SendTo) => program.extend(sendto_with_address),
+            (false, _, _) => {}
+            (true, _, Does::SendMsg) => program.extend(sendmsg),
             (true, true, Does::Clock(Some(id))) => {
-                let mut block = vec![insn(LD_W_ABS, 0, 0, low(id))];
+                program.push(insn(LD_W_ABS, 0, 0, low(id)));
                 for (at, clock) in REALTIME.iter().enumerate() {
                     // To the `notify` after the last comparison and the `allow`.
-                    block.push(insn(JEQ_K, (REALTIME.len() - at) as u8, 0, *clock));
+                    program.push(insn(JEQ_K, (REALTIME.len() - at) as u8, 0, *clock));
                 }
-                block.extend([allow, notify]);
-                block
+                program.extend([allow, notify]);
             }
-            (true, true, _) | (true, false, Does::Change | Does::Address) => vec![notify],
-            (true, false, Does::Look | Does::Run) => continue,
-            (true, false, Does::List(_) | Does::Random | Does::Clock(_)) => continue,
-            (true, false, Does::Open(flags)) => {
-                vec![insn(LD_W_ABS, 0, 0, low(flags)), insn(JSET_K, 0, 1, WRITES), notify, allow]
-            }
-            (true, false, Does::Access(mode)) => {
-                vec![insn(LD_W_ABS, 0, 0, low(mode)), insn(JEQ_K, 0, 1, 0), notify, allow]
-            }
-            (true, false, Does::SendTo) => sendto_with_address.clone(),
-        };
-        // Past the block when it is another call. Every block returns, so the call's number
-        // is still what the next comparison reads.
-        program.push(insn(JEQ_K, 0, block.len() as u8, call.nr));
-        program.extend(block);
+            (true, true, _) | (true, false, Does::Change | Does::Address) => program.push(notify),
+            (true, false, Does::Look | Does::Run) => {}
+            (true, false, Does::List(_) | Does::Random | Does::Clock(_)) => {}
+            (true, false, Does::Open(flags)) => program.extend([
+                insn(LD_W_ABS, 0, 0, low(flags)),
+                insn(JSET_K, 0, 1, WRITES),
+                notify,
+                allow,
+            ]),
+            (true, false, Does::Access(mode)) => program.extend([
+                insn(LD_W_ABS, 0, 0, low(mode)),
+                insn(JEQ_K, 0, 1, 0),
+                notify,
+                allow,
+            ]),
+            (true, false, Does::SendTo) => program.extend(sendto_with_address),
+        }
+        // A call not asked about has no block. Past the block when it is another call: every
+        // block returns, so the call's number is still what the next comparison reads.
+        let block = program.len() - start;
+        if block > 0 {
+            program.insert(start, insn(JEQ_K, 0, block as u8, call.nr));
+        }
     }
     program.push(allow);
     program
@@ -1653,6 +1776,7 @@ fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
             return Err("a seccomp filter: this process is in a sandbox already, whose seccomp \
                         listener the kernel takes as the only one a process has; run this \
                         outside it (a test with `unsandboxed-tests`)"
+                // alloc: the error, once, and the program does not run.
                 .to_owned());
         }
         return Err(os("a seccomp filter"));
@@ -1683,10 +1807,12 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
     raw::set_notif_flags(listener, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP);
     let mut scratch = Scratch::default();
     let pidfd = raw::pidfd_open(first);
-    let mut fds = vec![libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 }];
-    if let Some(pidfd) = &pidfd {
-        fds.push(libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
-    }
+    // `poll` passes over a negative descriptor, whose `revents` stays 0: no pidfd.
+    let ended_fd = pidfd.as_ref().map_or(-1, |it| it.as_raw_fd());
+    let mut fds = [
+        libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: ended_fd, events: libc::POLLIN, revents: 0 },
+    ];
     loop {
         fds.iter_mut().for_each(|it| it.revents = 0);
         let ready = raw::poll(&mut fds, -1);
@@ -1700,9 +1826,7 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
             answer(listener, recorder, watch, &mut scratch);
             continue;
         }
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0
-            || fds.get(1).is_some_and(|it| it.revents != 0)
-        {
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 || fds[1].revents != 0 {
             break;
         }
     }
@@ -1719,7 +1843,8 @@ struct Watch {
 }
 
 /// The supervisor's buffers, kept from one notification to the next: a path a call names is
-/// read, made whole and noted without allocating.
+/// read, made whole and noted, an address read and named, what `/proc` says of a thread read
+/// and a Unix socket's links followed, without allocating once each has the room.
 #[derive(Default)]
 struct Scratch {
     /// The path as the program named it, or the link `/proc` has for a descriptor.
@@ -1728,6 +1853,46 @@ struct Scratch {
     joined: Vec<u8>,
     /// The path made whole.
     path: String,
+    /// What is read of the program's memory beside a path: an address, a message's header.
+    memory: Vec<u8>,
+    /// A path as the program sees it, through `/proc/PID/root`.
+    inside: Vec<u8>,
+    /// A path with its nul, for the kernel.
+    room: Vec<u8>,
+    /// What a refused line names: an address as text.
+    text: String,
+    procs: Procs,
+    resolving: Resolving,
+}
+
+/// The supervisor's buffers for what `/proc` says of a process.
+#[derive(Default)]
+struct Procs {
+    /// A file of `/proc`, read whole.
+    file: Vec<u8>,
+    /// A directory of `/proc`, as `getdents64` lists it.
+    listing: Vec<u8>,
+    /// The threads of a process.
+    tasks: Vec<u64>,
+    /// The threads of a process, while `tasks` has those of the one being walked.
+    others: Vec<u64>,
+}
+
+/// The supervisor's buffers for following a Unix socket's links ([`resolved`]).
+#[derive(Default)]
+struct Resolving {
+    /// What is resolved so far, links followed: a whole path.
+    done: Vec<u8>,
+    /// What is left to resolve, from its front.
+    rest: Vec<u8>,
+    /// What is left after a link, as it is put together.
+    spare: Vec<u8>,
+    /// A link's target.
+    link: Vec<u8>,
+    /// The path a link is read at, through `/proc/PID/root`, with its nul.
+    at: Vec<u8>,
+    /// The path resolved, made whole.
+    out: String,
 }
 
 impl Watch {
@@ -1735,15 +1900,17 @@ impl Watch {
     /// thread of a new process: in the scope the thread that forked it had when it did, which
     /// is the one it has now, its next mark being taken only once the processes it forked
     /// before have theirs ([`Watch::forked`]).
-    fn process(&mut self, recorder: &mut Recorder, thread: u64) -> u64 {
+    fn process(&mut self, recorder: &mut Recorder, thread: u64, procs: &mut Procs) -> u64 {
         if let Some(&process) = self.processes.get(&thread) {
             return process;
         }
-        let (process, parent) = ids(thread).unwrap_or((thread, 0));
+        let (process, parent) = ids(thread, &mut procs.file).unwrap_or((thread, 0));
         let scope = match (process == thread, parent > 0) {
-            (true, true) => forker(parent, thread).map(|it| recorder.scope(it)).unwrap_or_default(),
-            (true, false) => String::new(),
-            (false, _) => shared_scope(recorder, process, thread),
+            (true, true) => {
+                forker(parent, thread, procs).map_or(Scope::NONE, |it| recorder.scope_of(it))
+            }
+            (true, false) => Scope::NONE,
+            (false, _) => shared_scope(recorder, process, thread, procs),
         };
         recorder.starts(thread, scope);
         self.processes.insert(thread, process);
@@ -1753,52 +1920,131 @@ impl Watch {
     /// `thread` of `process` is about to take another mark, in a call the kernel holds until
     /// it is answered: each process it forked that is not seen yet starts in the scope it has
     /// before it does.
-    fn forked(&mut self, recorder: &mut Recorder, thread: u64, process: u64) {
-        let children = std::fs::read_to_string(format!("/proc/{process}/task/{thread}/children"));
-        let scope = recorder.scope(thread);
-        for child in children.unwrap_or_default().split_whitespace().filter_map(|it| it.parse().ok()) {
-            if !recorder.knows(child) {
-                recorder.starts(child, scope.clone());
-                self.processes.insert(child, child);
+    fn forked(&mut self, recorder: &mut Recorder, thread: u64, process: u64, procs: &mut Procs) {
+        let mut name = [0u8; 64];
+        let children = proc_path(&mut name, format_args!("/proc/{process}/task/{thread}/children"));
+        let listed = children.is_some_and(|it| read_file(it, &mut procs.file));
+        let scope = recorder.scope_of(thread);
+        if let (true, Ok(children)) = (listed, std::str::from_utf8(&procs.file)) {
+            for child in children.split_whitespace().filter_map(|it| it.parse().ok()) {
+                if !recorder.knows(child) {
+                    recorder.starts(child, scope);
+                    self.processes.insert(child, child);
+                }
             }
         }
         // The threads it made before this mark start in the scope they were made in.
-        for task in tasks(process).into_iter().filter(|it| *it != thread && !recorder.knows(*it)) {
-            let scope = shared_scope(recorder, process, task);
+        let mut threads = std::mem::take(&mut procs.tasks);
+        tasks(process, &mut procs.listing, &mut threads);
+        for &task in &threads {
+            if task == thread || recorder.knows(task) {
+                continue;
+            }
+            let scope = shared_scope(recorder, process, task, procs);
             recorder.starts(task, scope);
             self.processes.insert(task, process);
+        }
+        procs.tasks = threads;
+    }
+}
+
+/// A path of `/proc` as `args` writes it, with its nul, in `room`; `None` when it does not fit.
+fn proc_path<'a>(room: &'a mut [u8], args: std::fmt::Arguments<'_>) -> Option<&'a CStr> {
+    use std::io::Write as _;
+    let size = room.len();
+    let mut at = &mut room[..];
+    at.write_fmt(args).ok()?;
+    at.write_all(b"\0").ok()?;
+    let left = at.len();
+    CStr::from_bytes_with_nul(&room[..size - left]).ok()
+}
+
+/// The file of `/proc` at `path`, read whole into `into`; false when it can't be.
+fn read_file(path: &CStr, into: &mut Vec<u8>) -> bool {
+    into.clear();
+    let Some(fd) = raw::open(path, libc::O_RDONLY | libc::O_CLOEXEC) else { return false };
+    loop {
+        if into.capacity() - into.len() < 1024 {
+            into.reserve(4096);
+        }
+        match raw::read(fd.as_fd(), into) {
+            0 => return true,
+            read if read > 0 => {}
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return false,
         }
     }
 }
 
-/// The threads of `process`, by `/proc`; none when it is gone.
-fn tasks(process: u64) -> Vec<u64> {
-    let Ok(entries) = std::fs::read_dir(format!("/proc/{process}/task")) else { return Vec::new() };
-    entries.flatten().filter_map(|it| it.file_name().to_str()?.parse().ok()).collect()
+/// The entries of the directory of `/proc` at `path` that are numbers (its processes, or a
+/// process's threads), into `into`, listed into `listing`: none when it can't be opened, and
+/// those listed before an error stops the listing.
+fn numbered(path: &CStr, listing: &mut Vec<u8>, into: &mut Vec<u64>) {
+    // `struct linux_dirent64`: `d_reclen` at 16, `d_name` at 19, nul-terminated.
+    const NAME: usize = 19;
+    into.clear();
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let Some(fd) = raw::open(path, flags) else { return };
+    loop {
+        listing.clear();
+        listing.reserve(4096);
+        let read = raw::dents(fd.as_fd(), listing);
+        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if read <= 0 {
+            return;
+        }
+        let mut at = 0;
+        while let Some(entry) = listing.get(at..at + NAME) {
+            let size = usize::from(u16::from_ne_bytes([entry[16], entry[17]]));
+            let Some(name) = listing.get(at + NAME..at + size) else { break };
+            let name = &name[..name.iter().position(|&it| it == 0).unwrap_or(name.len())];
+            if let Some(id) = std::str::from_utf8(name).ok().and_then(|it| it.parse().ok()) {
+                into.push(id);
+            }
+            at += size;
+        }
+    }
+}
+
+/// The threads of `process`, by `/proc`, into `into`; none when it is gone.
+fn tasks(process: u64, listing: &mut Vec<u8>, into: &mut Vec<u64>) {
+    let mut name = [0u8; 64];
+    match proc_path(&mut name, format_args!("/proc/{process}/task")) {
+        Some(path) => numbered(path, listing, into),
+        None => into.clear(),
+    }
 }
 
 /// The scope a new `thread` of `process` starts in: the one every other thread of it is in,
 /// when each is known and all are in one, so whichever made it was in that one; otherwise
 /// none, which is every scope's.
-fn shared_scope(recorder: &Recorder, process: u64, thread: u64) -> String {
-    let mut shared: Option<String> = None;
-    for other in tasks(process).into_iter().filter(|it| *it != thread) {
+fn shared_scope(recorder: &Recorder, process: u64, thread: u64, procs: &mut Procs) -> Scope {
+    tasks(process, &mut procs.listing, &mut procs.others);
+    let mut shared = None;
+    for &other in procs.others.iter().filter(|it| **it != thread) {
         if !recorder.knows(other) {
-            return String::new();
+            return Scope::NONE;
         }
-        let scope = recorder.scope(other);
-        match &shared {
-            Some(it) if *it != scope => return String::new(),
+        let scope = recorder.scope_of(other);
+        match shared {
+            Some(it) if it != scope => return Scope::NONE,
             Some(_) => {}
             None => shared = Some(scope),
         }
     }
-    shared.unwrap_or_default()
+    shared.unwrap_or(Scope::NONE)
 }
 
-/// The process (the thread group) and the parent process of `thread`, by `/proc`.
-fn ids(thread: u64) -> Option<(u64, u64)> {
-    let status = std::fs::read_to_string(format!("/proc/{thread}/status")).ok()?;
+/// The process (the thread group) and the parent process of `thread`, by `/proc`, read into
+/// `file`.
+fn ids(thread: u64, file: &mut Vec<u8>) -> Option<(u64, u64)> {
+    let mut name = [0u8; 64];
+    if !read_file(proc_path(&mut name, format_args!("/proc/{thread}/status"))?, file) {
+        return None;
+    }
+    let status = std::str::from_utf8(file).ok()?;
     let field = |name: &str| {
         status.lines().find_map(|it| it.strip_prefix(name)?.trim().parse::<u64>().ok())
     };
@@ -1806,12 +2052,14 @@ fn ids(thread: u64) -> Option<(u64, u64)> {
 }
 
 /// The thread of `parent` that forked `child`, by the children `/proc` lists for each.
-fn forker(parent: u64, child: u64) -> Option<u64> {
-    let threads = std::fs::read_dir(format!("/proc/{parent}/task")).ok()?;
-    threads.flatten().find_map(|it| {
-        let thread: u64 = it.file_name().to_str()?.parse().ok()?;
-        let children = std::fs::read_to_string(it.path().join("children")).ok()?;
-        children.split_whitespace().any(|it| it.parse() == Ok(child)).then_some(thread)
+fn forker(parent: u64, child: u64, procs: &mut Procs) -> Option<u64> {
+    let mut name = [0u8; 64];
+    tasks(parent, &mut procs.listing, &mut procs.tasks);
+    procs.tasks.iter().copied().find(|&thread| {
+        let path = proc_path(&mut name, format_args!("/proc/{parent}/task/{thread}/children"));
+        path.is_some_and(|it| read_file(it, &mut procs.file))
+            && std::str::from_utf8(&procs.file)
+                .is_ok_and(|it| it.split_whitespace().any(|it| it.parse() == Ok(child)))
     })
 }
 
@@ -1853,11 +2101,12 @@ fn noted(
     scratch: &mut Scratch,
 ) -> Option<i32> {
     let (pid, thread) = (notif.pid, u64::from(notif.pid));
-    let process = watch.process(recorder, thread);
+    let process = watch.process(recorder, thread, &mut scratch.procs);
     match call.does {
         Does::Signal(target) => {
             let Around::Confined(first) = watch.around else { return None };
-            return signal_outside(pid, target, notif.args[0], first).then_some(libc::EPERM);
+            let outside = signal_outside(pid, target, notif.args[0], first, &mut scratch.procs.file);
+            return outside.then_some(libc::EPERM);
         }
         Does::List(fd) => {
             match proc_link(pid, Some(notif.args[fd] as i32), &mut scratch.raw) {
@@ -1879,18 +2128,20 @@ fn noted(
         }
         _ => {}
     }
-    let address = |at: usize, len: usize| sockaddr(pid, notif.args[at], len);
+    let memory = &mut scratch.memory;
     let reached = match call.does {
-        Does::Address | Does::Connect => address(1, notif.args[2] as usize),
-        Does::SendTo => address(4, notif.args[5] as usize),
+        Does::Address | Does::Connect => {
+            sockaddr(pid, notif.args[1], notif.args[2] as usize, memory)
+        }
+        Does::SendTo => sockaddr(pid, notif.args[4], notif.args[5] as usize, memory),
         Does::SendMsg => {
             // `struct msghdr` starts with the address and its length.
-            let header = bytes_at(pid, notif.args[1], 12).unwrap_or_default();
-            match header.get(..12) {
+            let read = bytes_at(pid, notif.args[1], 12, memory);
+            match memory.get(..12).filter(|_| read) {
                 Some(it) => {
                     let name = u64::from_ne_bytes(it[..8].try_into().unwrap_or_default());
                     let len = u32::from_ne_bytes(it[8..12].try_into().unwrap_or_default());
-                    sockaddr(pid, name, len as usize)
+                    sockaddr(pid, name, len as usize, memory)
                 }
                 None => None,
             }
@@ -1909,27 +2160,33 @@ fn noted(
         // Confined, the loopback is the machine's, and every address a call reaches is refused
         // as a network namespace with only its own loopback answers it.
         Some(Address::Ip { at, local }) if confined && to_unix => {
-            recorder.refused_net(thread, &at);
+            recorder.refused_net(thread, shown(&mut scratch.text, at));
             return Some(if local { libc::ECONNREFUSED } else { libc::ENETUNREACH });
         }
-        Some(Address::Ip { at, local: false }) => recorder.refused_net(thread, &at),
+        Some(Address::Ip { at, local: false }) => {
+            recorder.refused_net(thread, shown(&mut scratch.text, at))
+        }
         Some(Address::Abstract(name)) if confined || watch.network => {
-            recorder.refused_net(thread, &format!("unix:@{}", String::from_utf8_lossy(&name)));
+            scratch.text.clear();
+            scratch.text.push_str("unix:@");
+            push_lossy(&scratch.memory[name], &mut scratch.text);
+            recorder.refused_net(thread, &scratch.text);
             return Some(if to_unix { libc::ECONNREFUSED } else { libc::EACCES });
         }
         Some(Address::Unix(path)) if to_unix => {
-            scratch.raw = path;
-            let path = match whole(pid, None, scratch) {
-                true => resolved(pid, &scratch.path),
-                false => None,
-            };
-            match path {
-                Some(path) if recorder.may_connect(&path) => {}
-                path => {
-                    let path = path.unwrap_or_else(|| "a path the sandbox could not follow".into());
-                    recorder.refused_net(thread, &format!("unix:{path}"));
-                    return Some(libc::EACCES);
-                }
+            scratch.raw.clear();
+            scratch.raw.extend_from_slice(&scratch.memory[path]);
+            let found = whole(pid, None, scratch)
+                && resolved(pid, &scratch.path, &mut scratch.resolving);
+            if !(found && recorder.may_connect(&scratch.resolving.out)) {
+                scratch.text.clear();
+                scratch.text.push_str("unix:");
+                scratch.text.push_str(match found {
+                    true => scratch.resolving.out.as_str(),
+                    false => "a path the sandbox could not follow",
+                });
+                recorder.refused_net(thread, &scratch.text);
+                return Some(libc::EACCES);
             }
         }
         _ => {}
@@ -1953,7 +2210,7 @@ fn noted(
         }
         if matches!(call.does, Does::Access(_)) {
             if scratch.raw.starts_with(MARK.as_bytes()) {
-                watch.forked(recorder, thread, process);
+                watch.forked(recorder, thread, process, &mut scratch.procs);
             }
             if recorder.marked(thread, process, &scratch.raw) {
                 continue;
@@ -1966,8 +2223,13 @@ fn noted(
         if writes && written && !recorder.may_write(path) {
             // In a view what is there is seen through the program's root, not the machine's.
             let refused = match watch.around {
-                Around::View => refused_write(&format!("/proc/{pid}/root{path}")),
-                Around::Namespaces | Around::Confined(_) => refused_write(path),
+                Around::View => {
+                    inside(&mut scratch.inside, pid, path);
+                    refused_write(&scratch.inside, &mut scratch.room)
+                }
+                Around::Namespaces | Around::Confined(_) => {
+                    refused_write(path.as_bytes(), &mut scratch.room)
+                }
             };
             if refused {
                 recorder.refused_write(thread, path);
@@ -1978,7 +2240,7 @@ fn noted(
             Does::Look | Does::Access(_) => recorder.looked(thread, path),
             Does::Run => {
                 recorder.read(thread, path);
-                ran(recorder, pid, thread, process, path);
+                ran(recorder, pid, thread, process, path, &mut scratch.inside);
             }
             Does::Open(_) | Does::Change if path == "/dev/random" || path == "/dev/urandom" => {
                 recorder.random()
@@ -1993,69 +2255,121 @@ fn noted(
 /// can't be run, fails to start, and is no program the interposer has to say it is in. Run by
 /// another thread than the process's first, in another scope, its image takes the first's id,
 /// whose scope it can't be told to keep: the process is in none from then on.
-fn ran(recorder: &mut Recorder, pid: u32, thread: u64, process: u64, path: &str) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let inside = format!("/proc/{pid}/root{path}");
-    let runnable = std::fs::metadata(&inside)
-        .is_ok_and(|it| it.is_file() && it.permissions().mode() & 0o111 != 0);
+fn ran(
+    recorder: &mut Recorder,
+    pid: u32,
+    thread: u64,
+    process: u64,
+    path: &str,
+    room: &mut Vec<u8>,
+) {
+    inside(room, pid, path);
+    room.push(0);
+    let runnable = CStr::from_bytes_with_nul(room).ok().and_then(|it| raw::stat(it, true));
+    let runnable = runnable
+        .is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFREG && it.st_mode & 0o111 != 0);
     if !runnable {
         return;
     }
-    let scope = match thread != process && recorder.scope(thread) != recorder.scope(process) {
+    let elsewhere = thread != process && recorder.scope_of(thread) != recorder.scope_of(process);
+    let scope = match elsewhere {
         true => {
             recorder.marked(process, process, MARK.as_bytes());
-            String::new()
+            Scope::NONE
         }
-        false => recorder.scope(thread),
+        false => recorder.scope_of(thread),
     };
     recorder.runs(process, path, scope);
 }
 
+/// `path` as the process `pid` sees it, through its root (`/proc/PID/root`), into `into`.
+fn inside(into: &mut Vec<u8>, pid: u32, path: &str) {
+    use std::io::Write as _;
+    into.clear();
+    _ = write!(into, "/proc/{pid}/root");
+    into.extend_from_slice(path.as_bytes());
+}
+
 /// Whether a write to `path`, outside where the program may write, is refused by the sandbox
 /// rather than by what is there: the path or its directory is there (and read-only inside).
-fn refused_write(path: &str) -> bool {
-    let path = Path::new(path);
-    path.symlink_metadata().is_ok() || path.parent().is_some_and(|it| it.is_dir())
+/// `room` has each path with its nul, for the kernel.
+fn refused_write(path: &[u8], room: &mut Vec<u8>) -> bool {
+    let stat = |path: &[u8], follow: bool, room: &mut Vec<u8>| {
+        room.clear();
+        room.extend_from_slice(path);
+        room.push(0);
+        raw::stat(CStr::from_bytes_with_nul(room).ok()?, follow)
+    };
+    stat(path, false, room).is_some()
+        || parent(path).is_some_and(|it| {
+            stat(it, true, room).is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFDIR)
+        })
+}
+
+/// The directory `path` is in, as `Path::parent` has it for a whole path: `None` for `/`.
+fn parent(path: &[u8]) -> Option<&[u8]> {
+    let mut end = path.len();
+    while end > 1 && path[end - 1] == b'/' {
+        end -= 1;
+    }
+    let path = &path[..end];
+    if path == b"/" || path.is_empty() {
+        return None;
+    }
+    match path.iter().rposition(|&it| it == b'/') {
+        Some(0) => Some(b"/"),
+        Some(at) => Some(&path[..at]),
+        None => Some(b""),
+    }
+}
+
+/// `it` as text, in `text`, which keeps its room from one to the next.
+fn shown(text: &mut String, it: impl std::fmt::Display) -> &str {
+    text.clear();
+    _ = write!(text, "{it}");
+    text
 }
 
 /// An address a call names that the sandbox minds.
 enum Address {
-    /// An IPv4 or IPv6 address as `address:port`, and whether it is the loopback or
-    /// unspecified: a network namespace refuses every other.
-    Ip { at: String, local: bool },
-    /// A Unix socket's path, as the program named it.
-    Unix(Vec<u8>),
+    /// An IPv4 or IPv6 address, and whether it is the loopback or unspecified: a network
+    /// namespace refuses every other.
+    Ip { at: std::net::SocketAddr, local: bool },
+    /// A Unix socket's path, as the program named it: where it is in what was read.
+    Unix(Range<usize>),
     /// An abstract Unix socket's name (a nul first, not kept): the network namespace's own,
-    /// the machine's when there is none.
-    Abstract(Vec<u8>),
+    /// the machine's when there is none. Where it is in what was read.
+    Abstract(Range<usize>),
 }
 
-/// The address of `len` bytes at `at` in `pid`, when it is one the sandbox minds.
-fn sockaddr(pid: u32, at: u64, len: usize) -> Option<Address> {
-    if at == 0 || len < 2 {
+/// The address of `len` bytes at `at` in `pid`, read into `bytes`, when it is one the sandbox
+/// minds.
+fn sockaddr(pid: u32, at: u64, len: usize, bytes: &mut Vec<u8>) -> Option<Address> {
+    use std::net::{SocketAddrV4, SocketAddrV6};
+    if at == 0 || len < 2 || !bytes_at(pid, at, len.min(128), bytes) {
         return None;
     }
-    let bytes = bytes_at(pid, at, len.min(128))?;
     let family = u16::from_ne_bytes([*bytes.first()?, *bytes.get(1)?]) as i32;
     let port = || u16::from_be_bytes([bytes[2], bytes[3]]);
     match family {
         libc::AF_INET if bytes.len() >= 8 => {
             let ip = std::net::Ipv4Addr::new(bytes[4], bytes[5], bytes[6], bytes[7]);
             let local = ip.is_loopback() || ip.is_unspecified();
-            Some(Address::Ip { at: format!("{ip}:{}", port()), local })
+            Some(Address::Ip { at: SocketAddrV4::new(ip, port()).into(), local })
         }
         libc::AF_INET6 if bytes.len() >= 24 => {
             let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(&bytes[8..24]).ok()?);
             let local = ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.to_ipv4_mapped().is_some_and(|it| it.is_loopback() || it.is_unspecified());
-            Some(Address::Ip { at: format!("[{ip}]:{}", port()), local })
+            // Shown as `[ip]:port`: no flow label, and no scope id, which would follow `%`.
+            Some(Address::Ip { at: SocketAddrV6::new(ip, port(), 0, 0).into(), local })
         }
         libc::AF_UNIX => match bytes.get(2..)? {
-            [0, name @ ..] => Some(Address::Abstract(name.to_vec())),
+            [0, ..] => Some(Address::Abstract(3..bytes.len())),
             path => {
-                let path = &path[..path.iter().position(|&it| it == 0).unwrap_or(path.len())];
-                (!path.is_empty()).then(|| Address::Unix(path.to_vec()))
+                let len = path.iter().position(|&it| it == 0).unwrap_or(path.len());
+                (len > 0).then_some(Address::Unix(2..2 + len))
             }
         },
         _ => None,
@@ -2066,7 +2380,13 @@ fn sockaddr(pid: u32, at: u64, len: usize) -> Option<Address> {
 /// argument `arg` as naming, goes outside the confined sandbox whose first process is `first`:
 /// to every process, or to one (or the group of one) that is not `first` or below it. A
 /// process the sandbox can't follow counts as outside.
-fn signal_outside(caller: u32, target: Target, arg: u64, first: libc::pid_t) -> bool {
+fn signal_outside(
+    caller: u32,
+    target: Target,
+    arg: u64,
+    first: libc::pid_t,
+    file: &mut Vec<u8>,
+) -> bool {
     let to = match target {
         // The caller's own group is the sandbox's: its first process is a session of its own.
         Target::Kill => match arg as i32 {
@@ -2077,8 +2397,11 @@ fn signal_outside(caller: u32, target: Target, arg: u64, first: libc::pid_t) -> 
         },
         Target::Process => arg as i32,
         Target::Pidfd => {
-            let info = std::fs::read_to_string(format!("/proc/{caller}/fdinfo/{}", arg as i32));
-            let pid = info.ok().and_then(|it| {
+            let mut name = [0u8; 64];
+            let info = proc_path(&mut name, format_args!("/proc/{caller}/fdinfo/{}", arg as i32));
+            let read = info.is_some_and(|it| read_file(it, file));
+            let info = std::str::from_utf8(file).ok().filter(|_| read);
+            let pid = info.and_then(|it| {
                 it.lines().find_map(|it| it.strip_prefix("Pid:")?.trim().parse::<i32>().ok())
             });
             match pid {
@@ -2091,12 +2414,13 @@ fn signal_outside(caller: u32, target: Target, arg: u64, first: libc::pid_t) -> 
     if to <= 0 {
         return false;
     }
-    !below(to, first)
+    !below(to, first, file)
 }
 
 /// Whether the process (or thread) `pid` is `first` or one of its descendants, by the parents
-/// `/proc` has. The first process reaps the orphans, so a program's daemon stays below it.
-fn below(pid: libc::pid_t, first: libc::pid_t) -> bool {
+/// `/proc` has, read into `file`. The first process reaps the orphans, so a program's daemon
+/// stays below it.
+fn below(pid: libc::pid_t, first: libc::pid_t, file: &mut Vec<u8>) -> bool {
     let mut at = pid;
     for _ in 0..4096 {
         if at == first {
@@ -2105,7 +2429,12 @@ fn below(pid: libc::pid_t, first: libc::pid_t) -> bool {
         if at <= 1 {
             return false;
         }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{at}/stat")) else { return false };
+        let mut name = [0u8; 64];
+        let path = proc_path(&mut name, format_args!("/proc/{at}/stat"));
+        if !path.is_some_and(|it| read_file(it, file)) {
+            return false;
+        }
+        let Ok(stat) = std::str::from_utf8(file) else { return false };
         // `pid (comm) state ppid ...`, the name being anything up to the last `)`.
         let parent = stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1));
         match parent.and_then(|it| it.parse().ok()) {
@@ -2118,55 +2447,82 @@ fn below(pid: libc::pid_t, first: libc::pid_t) -> bool {
 
 /// `path`, whole, as the process `pid` of the sandbox sees it, with every link on the way
 /// followed in its view of the file system (`/proc/PID/root`): where a connection to it goes.
-/// `None` when a part of it could not be looked at for another reason than its not being
-/// there or not being a link, which is refused. (The program may change what is there between
-/// this and its call: the residual docs/cargo.md names.)
-fn resolved(pid: u32, path: &str) -> Option<String> {
-    use std::path::Component;
-    let root = format!("/proc/{pid}/root");
-    let mut done = PathBuf::from("/");
-    let mut rest: Vec<OsString> =
-        Path::new(path).components().rev().map(|it| it.as_os_str().to_owned()).collect();
-    let mut links = 0;
-    while let Some(part) = rest.pop() {
-        match Path::new(&part).components().next() {
-            Some(Component::RootDir) => done = PathBuf::from("/"),
-            Some(Component::ParentDir) => _ = done.pop(),
-            Some(Component::Normal(name)) => {
-                let next = done.join(name);
-                let mut at = OsString::from(&root);
-                at.push(next.as_os_str());
-                match std::fs::read_link(&at) {
-                    Ok(to) if links < 40 => {
-                        links += 1;
-                        rest.extend(to.components().rev().map(|it| it.as_os_str().to_owned()));
+/// Into [`Resolving::out`]; false when a part of it could not be looked at for another reason
+/// than its not being there or not being a link, which is refused. (The program may change
+/// what is there between this and its call: the residual docs/cargo.md names.)
+fn resolved(pid: u32, path: &str, resolving: &mut Resolving) -> bool {
+    use std::io::Write as _;
+    let Resolving { done, rest, spare, link, at, out } = resolving;
+    rest.clear();
+    rest.extend_from_slice(path.as_bytes());
+    done.clear();
+    done.push(b'/');
+    // A link's target is shorter than `PATH_MAX`, so it fits whole.
+    link.clear();
+    link.reserve(libc::PATH_MAX as usize + 1);
+    let (mut from, mut links) = (0, 0);
+    while from < rest.len() {
+        if rest[from] == b'/' {
+            // A path, or a link's target, that starts at the root.
+            if from == 0 {
+                done.truncate(1);
+            }
+            from += 1;
+            continue;
+        }
+        let end = rest[from..].iter().position(|&it| it == b'/').map_or(rest.len(), |it| from + it);
+        match &rest[from..end] {
+            b"." => {}
+            b".." => {
+                let up = done.iter().rposition(|&it| it == b'/').unwrap_or(0);
+                done.truncate(up.max(1));
+            }
+            name => {
+                let base = done.len();
+                if base > 1 {
+                    done.push(b'/');
+                }
+                done.extend_from_slice(name);
+                at.clear();
+                _ = write!(at, "/proc/{pid}/root");
+                at.extend_from_slice(done);
+                at.push(0);
+                let Ok(named) = CStr::from_bytes_with_nul(at) else { return false };
+                let read = raw::readlink_into(named, link);
+                if read >= 0 {
+                    if links >= 40 || read as usize >= link.capacity() {
+                        return false;
                     }
-                    Ok(_) => return None,
-                    Err(error)
-                        if matches!(
-                            error.raw_os_error(),
-                            Some(libc::EINVAL | libc::ENOENT | libc::ENOTDIR)
-                        ) =>
-                    {
-                        done = next
-                    }
-                    Err(_) => return None,
+                    links += 1;
+                    // What is left is the link's target, then what was left after it.
+                    done.truncate(base);
+                    spare.clear();
+                    spare.extend_from_slice(link);
+                    spare.push(b'/');
+                    spare.extend_from_slice(&rest[end..]);
+                    std::mem::swap(rest, spare);
+                    from = 0;
+                    continue;
+                }
+                let error = std::io::Error::last_os_error().raw_os_error();
+                if !matches!(error, Some(libc::EINVAL | libc::ENOENT | libc::ENOTDIR)) {
+                    return false;
                 }
             }
-            _ => {}
         }
+        from = end;
     }
-    Some(tidy(&done))
+    tidy_into(done, out);
+    true
 }
 
-/// `len` bytes of `pid`'s memory at `at`, as many as are there.
-fn bytes_at(pid: u32, at: u64, len: usize) -> Option<Vec<u8>> {
-    let mut buffer = Vec::with_capacity(len);
+/// `len` bytes of `pid`'s memory at `at` into `into`, as many as are there; false when none
+/// are.
+fn bytes_at(pid: u32, at: u64, len: usize, into: &mut Vec<u8>) -> bool {
+    into.clear();
+    into.reserve(len);
     let remote = [libc::iovec { iov_base: at as *mut libc::c_void, iov_len: len }];
-    if raw::read_memory_into(pid as libc::pid_t, &remote, &mut buffer) <= 0 {
-        return None;
-    }
-    Some(buffer)
+    raw::read_memory_into(pid as libc::pid_t, &remote, into) > 0
 }
 
 /// Reads the string of `pid`'s memory at `address`, up to its nul and at most a path's 4096
@@ -2245,7 +2601,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use crate::sandbox::{Also, Bind, Reached, Spec, View, read_record};
+    use crate::sandbox::{Bind, Reached, Spec, View, alone, read_record};
 
     #[test]
     fn a_unix_socket_is_where_its_links_lead() {
@@ -2257,7 +2613,11 @@ mod tests {
         std::os::unix::fs::symlink("loop", dir.join("loop")).unwrap();
         let pid = std::process::id();
         let dir_s = super::tidy(&std::fs::canonicalize(&dir).unwrap());
-        let at = |it: &str| super::resolved(pid, &format!("{dir_s}/{it}"));
+        let mut resolving = super::Resolving::default();
+        let mut at = |it: &str| {
+            let found = super::resolved(pid, &format!("{dir_s}/{it}"), &mut resolving);
+            found.then(|| resolving.out.clone())
+        };
         assert_eq!(at("abs/s.sock").as_deref(), Some(&*format!("{dir_s}/real/s.sock")));
         assert_eq!(at("rel/s.sock").as_deref(), Some(&*format!("{dir_s}/real/s.sock")));
         assert_eq!(at("missing/../real/s").as_deref(), Some(&*format!("{dir_s}/real/s")));
@@ -2346,6 +2706,52 @@ mod tests {
         assert_eq!(scratch.path, "/c/d");
     }
 
+    /// The supervisor's hot path allocates nothing for what it has read before, each into the
+    /// buffer it keeps: the path a call names, read from the program's memory and made whole
+    /// from its working directory; what `/proc` says of its thread; a Unix socket's links
+    /// followed; whether a write is refused; and an address read and named.
+    #[test]
+    fn a_path_read_into_the_supervisors_buffers_allocates_nothing() {
+        let pid = std::process::id();
+        let named = c"./a//b/.";
+        let mut v4 = [0u8; 16];
+        v4[..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        v4[2..4].copy_from_slice(&443u16.to_be_bytes());
+        v4[4..8].copy_from_slice(&[1, 2, 3, 4]);
+        let mut scratch = super::Scratch::default();
+        // Room for the threads other tests start meanwhile.
+        scratch.procs.tasks.reserve(4096);
+        let read = |scratch: &mut super::Scratch| {
+            assert!(super::string_at(pid, named.as_ptr() as u64, &mut scratch.raw));
+            assert!(super::whole(pid, None, scratch));
+            let ids = super::ids(u64::from(pid), &mut scratch.procs.file);
+            assert_eq!(ids.map(|it| it.0), Some(u64::from(pid)));
+            let mut threads = std::mem::take(&mut scratch.procs.tasks);
+            super::tasks(u64::from(pid), &mut scratch.procs.listing, &mut threads);
+            assert!(threads.contains(&u64::from(pid)));
+            scratch.procs.tasks = threads;
+            assert!(super::resolved(pid, &scratch.path, &mut scratch.resolving));
+            assert!(super::refused_write(b"/proc/no-such-file", &mut scratch.room));
+            assert!(!super::refused_write(b"/proc/no-such-dir/x", &mut scratch.room));
+            let at = v4.as_ptr() as u64;
+            match super::sockaddr(pid, at, v4.len(), &mut scratch.memory) {
+                Some(super::Address::Ip { at, local: false }) => {
+                    assert_eq!(super::shown(&mut scratch.text, at), "1.2.3.4:443");
+                }
+                _ => panic!("not the address"),
+            }
+        };
+        read(&mut scratch);
+        let path = scratch.path.clone();
+        blaze_alloc_count::assert_at_most(0, "a path read into the supervisor's buffers", || {
+            for _ in 0..10 {
+                read(&mut scratch);
+            }
+        });
+        assert_eq!(scratch.path, path);
+        assert!(path.ends_with("/a/b"), "{path}");
+    }
+
     #[test]
     fn every_run_refuses_terminal_input_and_io_uring() {
         for (recorded, reads) in [(false, false), (true, false), (true, true)] {
@@ -2421,7 +2827,7 @@ mod tests {
     #[test]
     fn a_traced_run_loads_the_interposer_and_sees_none_of_it() {
         use blaze_usercode::{confine, trace::{self, Seen}};
-        if let Err(why) = crate::sandbox::probe(crate::sandbox::Probe::V2) {
+        if let Err(why) = alone::probe(crate::sandbox::Probe::V2) {
             let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
             assert!(!required, "{why}");
             eprintln!("skipped: {why}");
@@ -2447,7 +2853,7 @@ for it in "$OUT"/*; do :; done
             report: dir.join("report"),
             not_inputs: vec!["/bin/sh".into()],
         };
-        assert_eq!(crate::sandbox::v2::launch(&spec), 0);
+        assert_eq!(alone::launch(&spec), 0);
         let read = |it: &Path| std::fs::read_to_string(it).unwrap();
         assert_eq!(read(&out.join("env")), "unset|unset");
         assert_eq!(read(&out.join("child")), "unset");
@@ -2549,8 +2955,8 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             ..Spec::default()
         };
         let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
-        let forced = Some("a user namespace: not made in this test".to_owned());
-        assert_eq!(super::run_as(&spec, Some(&program), forced, Also::default()), Ok(0));
+        let forced = "a user namespace: not made in this test".to_owned();
+        assert_eq!(alone::run_as(&spec, Some(&program), forced), Ok(0));
         let read = |it: &str| std::fs::read_to_string(out.join(it)).unwrap();
         assert_eq!(read("d/moved"), "hi\n");
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
@@ -2584,7 +2990,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         else {
             return skip("no bash of the Nix store on PATH");
         };
-        if super::run(&Spec { cwd: "/".into(), ..Spec::default() }, None, Also::default()) != Ok(0) {
+        if alone::run(&Spec { cwd: "/".into(), ..Spec::default() }, None) != Ok(0) {
             return skip("no sandbox can be made here");
         }
         let Some(interpreter) = interpreter(&bash) else {
@@ -2635,7 +3041,7 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
         let env = env.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect();
         let spec = Spec { cwd: "/out".into(), env, record, view: Some(view), ..Spec::default() };
         let program: Vec<OsString> = vec![bash.into(), "-c".into(), script.into()];
-        super::run(&spec, Some(&program), Also::default())
+        alone::run(&spec, Some(&program))
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -2782,7 +3188,7 @@ echo hi > /out/written
         let made = |binds: Vec<Bind>, overlays: Vec<PathBuf>| {
             let spec =
                 Spec { cwd: "/".into(), overlays, view: Some(View { binds }), ..Spec::default() };
-            super::run(&spec, Some(&["/bin/true".into()]), Also::default()).unwrap_err()
+            alone::run(&spec, Some(&["/bin/true".into()])).unwrap_err()
         };
         let why = made(vec![Bind::read("/nix/store/x", &missing)], Vec::new());
         assert!(

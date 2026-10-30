@@ -363,6 +363,33 @@ fn a_cursor_is_saved_only_with_what_it_covers() {
     }
 }
 
+/// A watch's looks in flight are slots of its slab: once a rescan's worth has been in flight,
+/// another rescan's takes the same slots and gives them back with no allocation, each tag
+/// naming its own look.
+#[test]
+fn looks_in_flight_reuse_their_slots_without_allocating() {
+    const N: usize = 4096;
+    let mut watcher = Watcher::new("disk", name("ws"), TAGS);
+    let mut tags = Vec::with_capacity(N);
+    for round in 0..2 {
+        let mut ask_and_take = || {
+            tags.clear();
+            for at in 0..N {
+                tags.push(watcher.tag(super::Pending::Read(0, at)));
+            }
+            assert!(tags.iter().all(|it| watcher.owns(*it)));
+            for (at, tag) in tags.iter().enumerate().rev() {
+                assert!(matches!(watcher.take(*tag), super::Pending::Read(0, it) if it == at));
+            }
+        };
+        match round {
+            0 => ask_and_take(),
+            _ => blaze_alloc_count::assert_at_most(0, "a rescan's looks in flight", ask_and_take),
+        }
+    }
+    assert!(watcher.pending.is_empty());
+}
+
 /// Random edits, deletes, renames and chmods while blaze is down, for each system, over many
 /// seeds and several restarts: the head is always the disk, and a file is read only when it
 /// was written or chmodded while down, or renamed onto a path that had a file.

@@ -1,5 +1,6 @@
 //! Term search
 
+use base_db::Db;
 use hir_def::type_ref::Mutability;
 use hir_ide::db::HirDatabase;
 use itertools::Itertools;
@@ -110,7 +111,7 @@ impl<'db> LookupTable<'db> {
     }
 
     /// Find all `Expr`s that unify with the `ty`
-    fn find(&mut self, db: &'db dyn HirDatabase, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
+    fn find(&mut self, db: &'db Db, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
         let res = self
             .data
             .iter()
@@ -135,7 +136,7 @@ impl<'db> LookupTable<'db> {
     ///
     /// For example if we have type `i32` in data and we query for `&i32` it map all the type
     /// trees we have for `i32` with `Expr::Reference` and returns them.
-    fn find_autoref(&mut self, db: &'db dyn HirDatabase, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
+    fn find_autoref(&mut self, db: &'db Db, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
         let res = self
             .data
             .iter()
@@ -176,7 +177,7 @@ impl<'db> LookupTable<'db> {
     /// but they clearly do not unify themselves.
     fn insert(
         &mut self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         ty: Type<'db>,
         exprs: impl Iterator<Item = Expr<'db>>,
     ) {
@@ -220,9 +221,9 @@ impl<'db> LookupTable<'db> {
 
 /// Context for the `term_search` function
 #[derive(Debug)]
-pub struct TermSearchCtx<'a, 'db, DB: HirDatabase> {
+pub struct TermSearchCtx<'a, 'db> {
     /// Semantics for the program
-    pub sema: &'a Semantics<'db, DB>,
+    pub sema: &'a Semantics<'db>,
     /// Semantic scope, captures context for the term search
     pub scope: &'a SemanticsScope<'db>,
     /// Target / expected output type
@@ -267,7 +268,7 @@ impl Default for TermSearchConfig {
 /// Note that there are usually more ways we can get to the `goal` type but some are discarded to
 /// reduce the memory consumption. It is also unlikely anyone is willing ti browse through
 /// thousands of possible responses so we currently take first 10 from every tactic.
-pub fn term_search<'db, DB: HirDatabase>(ctx: &TermSearchCtx<'_, 'db, DB>) -> Vec<Expr<'db>> {
+pub fn term_search<'db>(ctx: &TermSearchCtx<'_, 'db>) -> Vec<Expr<'db>> {
     let module = ctx.scope.module();
     let mut defs = FxHashSet::default();
     defs.insert(ScopeDef::ModuleDef(ModuleDef::Module(module)));

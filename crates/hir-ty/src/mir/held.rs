@@ -636,6 +636,8 @@ fn live_terminator(terminator: &TerminatorKind, state: &mut Set) {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::{Conflicts, Set};
 
     /// The matrix as it was computed before [`Conflicts`]: a row of every local per local.
@@ -662,41 +664,30 @@ mod tests {
         conflicts
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-
-        fn set(&mut self, count: usize, one_in: u64) -> Set {
-            let mut set = Set::new_empty(count);
-            for local in 0..count {
-                if self.next() % one_in == 0 {
-                    set.insert(local);
-                }
+    fn random_set(rng: &mut SplitMix64, count: usize, one_in: u64) -> Set {
+        let mut set = Set::new_empty(count);
+        for local in 0..count {
+            if rng.one_in(one_in) {
+                set.insert(local);
             }
-            set
         }
+        set
     }
 
     #[test]
     fn conflicts_over_held_positions_are_the_full_matrix() {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for round in 0..200 {
-            let count = [0, 1, 2, 63, 64, 65, 130][round % 7] + (rng.next() % 40) as usize;
-            let density = 1 + rng.next() % 4;
-            let held = rng.set(count, density);
-            let density = 1 + rng.next() % 8;
-            let always_live = rng.set(count, density);
+            let count = [0, 1, 2, 63, 64, 65, 130][round % 7] + rng.index(40);
+            let density = 1 + rng.below(4);
+            let held = random_set(&mut rng, count, density);
+            let density = 1 + rng.below(8);
+            let always_live = random_set(&mut rng, count, density);
             let saved: Vec<usize> = held.iter().collect();
             let mut states = Vec::new();
-            for _ in 0..rng.next() % 12 {
-                let density = 1 + rng.next() % 5;
-                states.push(rng.set(count, density));
+            for _ in 0..rng.below(12) {
+                let density = 1 + rng.below(5);
+                states.push(random_set(&mut rng, count, density));
             }
             let mut matrix = Conflicts::new(count, &always_live, &held, &saved);
             for state in &states {

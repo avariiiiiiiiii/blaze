@@ -17,7 +17,7 @@
 //! `x20` points at the area's bottom, so its first `NEAR` bytes (most of a function's slots)
 //! are one `ldr`/`str` away.
 
-use cranelift_codegen::ir::{self, ArgumentPurpose, GlobalValueData, InstructionData};
+use cranelift_codegen::ir::{self, ArgumentPurpose, GlobalValueData, InstructionData, Opcode};
 
 use super::{
     abi,
@@ -27,29 +27,30 @@ use crate::{Error, Os, Target, TlsModel, arch::Area, buf::Buf, code::Rule};
 
 /// Bytes of the registers every function saves: `x19` to `x28` and the low halves of `d8`
 /// to `d15`, Cranelift's `compute_clobber_size` of all of them.
-pub const SAVES: u32 = 10 * 8 + 8 * 8;
+pub(super) const SAVES: u32 = 10 * 8 + 8 * 8;
 
 /// The pairs `gen_clobber_save` pushes, in its order: the X registers sorted and paired,
 /// last pair first, then the D registers the same way.
-pub const X_PAIRS: [(u8, u8); 5] = [(27, 28), (25, 26), (23, 24), (21, 22), (19, 20)];
-pub const D_PAIRS: [(u8, u8); 4] = [(14, 15), (12, 13), (10, 11), (8, 9)];
+pub(super) const X_PAIRS: [(u8, u8); 5] = [(27, 28), (25, 26), (23, 24), (21, 22), (19, 20)];
+pub(super) const D_PAIRS: [(u8, u8); 4] = [(14, 15), (12, 13), (10, 11), (8, 9)];
 
 /// DWARF numbers: `x0`..`x31` are 0..31, `v0`..`v31` are 64..95.
-pub const DWARF_FP: u16 = 29;
-pub const DWARF_LR: u16 = 30;
-pub const DWARF_X20: u16 = 20;
+pub(super) const DWARF_FP: u16 = 29;
+pub(super) const DWARF_LR: u16 = 30;
+pub(super) const DWARF_X20: u16 = 20;
 const DWARF_V0: u16 = 64;
 
 /// How the prologue touches the pages of a frame larger than one: Cranelift's
 /// `gen_inline_probestack`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Probe {
+pub(super) enum Probe {
     #[default]
     None,
     /// `count` (at most 3) steps of `guard` bytes, each touched, then `sp` put back.
     Unroll { count: u32, guard: u32 },
-    /// A loop over `size` bytes in steps of `guard`.
-    Loop { size: u32, guard: u32 },
+    /// A loop over `size` bytes in steps of a guard, `step` as its `sub` immediate (12 bits,
+    /// shifted by 12 or not).
+    Loop { size: u32, step: u16, shift: bool },
 }
 
 /// Cranelift's `PROBE_MAX_UNROLL`.
@@ -60,33 +61,34 @@ const PROBE_MAX_UNROLL: u32 = 3;
 pub struct Frame {
     /// Bytes from `sp` up to the saved registers: Cranelift's `fixed_frame_storage_size +
     /// outgoing_args_size`, which one `sub sp` allocates.
-    pub stack: u32,
+    pub(super) stack: u32,
     /// The outgoing stack argument area at `sp`: the largest of the function's calls'.
-    pub outgoing: u32,
+    pub(super) outgoing: u32,
     /// From `sp` to the frame register, before any realignment.
-    pub base: u32,
+    pub(super) base: u32,
     /// The frame register's alignment, a power of two of at least 16.
-    pub align: u32,
+    pub(super) align: u32,
     /// The StructReturn pointer's own slot, from `sp`: Cranelift returns it in `x8`.
-    pub sret: Option<u32>,
-    pub probe: Probe,
-    /// Whether the function makes a call (Cranelift's `FunctionCalls::Regular`).
-    pub calls: bool,
+    pub(super) sret: Option<u32>,
+    pub(super) probe: Probe,
     /// The unwind information is Windows', not DWARF's.
-    pub windows: bool,
+    pub(super) windows: bool,
+    /// The most bytes the prologue writes, the parameters' stores included.
+    pub(super) entry: u32,
 }
 
 impl Frame {
     /// The offset of `x20` from `x29` when it is not realigned.
-    pub fn base_from_fp(&self) -> i32 {
+    pub(super) fn base_from_fp(&self) -> i32 {
         self.base as i32 - (self.stack + SAVES) as i32
     }
 }
 
 /// Lays out the frame of `func`, whose area above the frame register the patcher sized.
-pub fn layout(func: &ir::Function, target: &Target, area: Area) -> Result<Frame, Error> {
+pub(super) fn layout(func: &ir::Function, target: &Target, area: Area) -> Result<Frame, Error> {
     abi::check(func.signature.call_conv)?;
     if !area.align.is_power_of_two() || area.align < 16 || area.size % 16 != 0 {
+        // alloc: the error's message, once, as the function fails to compile.
         return Err(Error::new(format!(
             "an area of {} bytes aligned to {}: it must be 16-byte sized and aligned to a power \
              of two of at least 16",
@@ -114,10 +116,12 @@ pub fn layout(func: &ir::Function, target: &Target, area: Area) -> Result<Frame,
     let stack = fixed + u64::from(outgoing);
     // Cranelift's `maximum_frame_size` is the limit of its `i32` offsets.
     if stack + u64::from(SAVES) + 16 > i32::MAX as u64 {
+        // alloc: the error's message, once, as the function fails to compile.
         return Err(Error::new(format!("a frame of {stack} bytes, past 2 GB")));
     }
     let stack = stack as u32;
     if target.os == Os::Windows && stack >= (1 << 24) * 16 {
+        // alloc: the error's message, once, as the function fails to compile.
         return Err(Error::new(format!(
             "a frame of {stack} bytes on Windows, past the 256 MB an `alloc_l` unwind code says"
         )));
@@ -134,13 +138,13 @@ pub fn layout(func: &ir::Function, target: &Target, area: Area) -> Result<Frame,
         align: area.align,
         sret: sret.then_some(outgoing),
         probe,
-        calls,
         windows: target.os == Os::Windows,
+        entry: 0,
     })
 }
 
 /// The signature of `inst` when it is a call that returns to the function.
-pub fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::SigRef> {
+pub(super) fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::SigRef> {
     match func.dfg.insts[inst] {
         InstructionData::Call { func_ref, .. } | InstructionData::TryCall { func_ref, .. } => {
             Some(func.dfg.ext_funcs[func_ref].signature)
@@ -156,14 +160,16 @@ pub fn call_signature(func: &ir::Function, inst: ir::Inst) -> Option<ir::SigRef>
 /// Whether `inst` finds a thread-local's address with a call (ELF's TLS descriptor, Mach-O's
 /// `tlv` thunk), as Cranelift's `ElfTlsGetAddr` and `MachOTlsGetAddr` are calls.
 fn makes_tls_call(func: &ir::Function, target: &Target, inst: ir::Inst) -> bool {
-    let InstructionData::UnaryGlobalValue { global_value, .. } = func.dfg.insts[inst] else {
+    let InstructionData::UnaryGlobalValue { opcode: Opcode::TlsValue, global_value } =
+        func.dfg.insts[inst]
+    else {
         return false;
     };
     matches!(target.tls, TlsModel::ElfGd | TlsModel::MachO) && reaches_tls(func, global_value)
 }
 
 /// Whether `gv` is, or is computed from, a thread-local symbol.
-pub fn reaches_tls(func: &ir::Function, mut gv: ir::GlobalValue) -> bool {
+pub(super) fn reaches_tls(func: &ir::Function, mut gv: ir::GlobalValue) -> bool {
     loop {
         match func.global_values[gv] {
             GlobalValueData::Symbol { tls, .. } => return tls,
@@ -178,6 +184,7 @@ pub fn reaches_tls(func: &ir::Function, mut gv: ir::GlobalValue) -> bool {
 /// The probe of a frame of `size` bytes below the frame record, pages of `1 << log2`.
 fn probe(size: u32, log2: u8) -> Result<Probe, Error> {
     if log2 >= 31 {
+        // alloc: the error's message, once, as the function fails to compile.
         return Err(Error::new(format!("a probe interval of 2^{log2} bytes")));
     }
     let guard = 1u32 << log2;
@@ -186,18 +193,19 @@ fn probe(size: u32, log2: u8) -> Result<Probe, Error> {
         Ok(Probe::None)
     } else if count <= PROBE_MAX_UNROLL {
         Ok(Probe::Unroll { count, guard })
-    } else if inst::imm12(u64::from(guard)).is_none() {
+    } else if let Some((step, shift)) = inst::imm12(u64::from(guard)) {
+        Ok(Probe::Loop { size, step, shift })
+    } else {
+        // alloc: the error's message, once, as the function fails to compile.
         Err(Error::new(format!(
             "a probe interval of {guard} bytes, which no `sub` immediate encodes (Cranelift's \
              `StackProbeLoop` needs one)"
         )))
-    } else {
-        Ok(Probe::Loop { size, guard })
     }
 }
 
 /// The rows a prologue records, at most 24 of them, without allocating.
-pub struct Rows {
+pub(super) struct Rows {
     rows: [(u32, Rule); 24],
     len: usize,
 }
@@ -214,13 +222,13 @@ impl Rows {
         self.len += 1;
     }
 
-    pub fn as_slice(&self) -> &[(u32, Rule)] {
+    pub(super) fn as_slice(&self) -> &[(u32, Rule)] {
         &self.rows[..self.len]
     }
 }
 
 /// The most bytes [`enter`] writes.
-pub fn enter_bound(frame: &Frame) -> u32 {
+pub(super) fn enter_bound(frame: &Frame) -> u32 {
     let probe = match frame.probe {
         Probe::None => 0,
         Probe::Unroll { count, .. } => count * (inst::ADD_ANY_MAX + 4) + inst::ADD_ANY_MAX,
@@ -232,7 +240,7 @@ pub fn enter_bound(frame: &Frame) -> u32 {
 /// Writes the frame record, the probe, the saves and the frame's allocation, with the rows
 /// Cranelift's `create_unwind_info_from_insts` makes of the same prologue: the CFA from `sp`
 /// once the record is pushed, from `x29` once the saves begin, and each saved register.
-pub fn enter(buf: &mut Buf, frame: &Frame, rows: &mut Rows) {
+pub(super) fn enter(buf: &mut Buf, frame: &Frame, rows: &mut Rows) {
     buf.put4(inst::stp_pre(FP, LR, SP, -16));
     let at = buf.len();
     rows.push(at, Rule::CfaOffset(16));
@@ -272,8 +280,7 @@ fn write_probe(buf: &mut Buf, probe: Probe) {
             }
             inst::add_any(buf, SP, SP, u64::from(guard * count), false, X16);
         }
-        Probe::Loop { size, guard } => {
-            let (step, shift) = inst::imm12(u64::from(guard)).expect("checked by `probe`");
+        Probe::Loop { size, step, shift } => {
             inst::mov_imm(buf, X16, 0);
             inst::mov_imm(buf, X17, u64::from(size));
             buf.put4(inst::add_imm(X16, X16, step, shift, true));
@@ -285,11 +292,11 @@ fn write_probe(buf: &mut Buf, probe: Probe) {
 }
 
 /// The most bytes [`exit`] writes.
-pub const EXIT_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 8;
+pub(super) const EXIT_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIRS.len()) as u32 + 8;
 
 /// Frees the frame, restores the saved registers and the frame record and returns, as
 /// `gen_epilogue` does. Like Cranelift's, it records no rows: the CFA stays said from `x29`.
-pub fn exit(buf: &mut Buf, frame: &Frame) {
+pub(super) fn exit(buf: &mut Buf, frame: &Frame) {
     if frame.stack > 0 {
         inst::add_any(buf, SP, SP, u64::from(frame.stack), false, X16);
     }
@@ -304,11 +311,11 @@ pub fn exit(buf: &mut Buf, frame: &Frame) {
 }
 
 /// The most bytes [`set_base`] writes.
-pub const BASE_MAX: u32 = inst::ADD_ANY_MAX + 4;
+pub(super) const BASE_MAX: u32 = inst::ADD_ANY_MAX + 4;
 
 /// Points `x20` at the area: `sp + base`, rounded up to the area's alignment when it asks for
 /// more than `sp`'s 16.
-pub fn set_base(buf: &mut Buf, frame: &Frame) {
+pub(super) fn set_base(buf: &mut Buf, frame: &Frame) {
     if frame.align > 16 {
         let up = u64::from(frame.base) + u64::from(frame.align) - 1;
         inst::add_any(buf, inst::X20, SP, up, false, X16);
@@ -321,7 +328,7 @@ pub fn set_base(buf: &mut Buf, frame: &Frame) {
 /// The Windows ARM64 unwind codes of the prologue [`enter`] writes, as Cranelift's
 /// `winarm64::create_unwind_info_from_insts` makes them and `UnwindInfo::emit` writes them:
 /// last code first, each big-endian, padded with zero bytes to whole words.
-pub fn windows_codes(frame: &Frame) -> Vec<u8> {
+pub(super) fn windows_codes(frame: &Frame) -> Vec<u8> {
     // alloc: once per function, the unwind information it hands back.
     let mut codes: Vec<u8> = Vec::with_capacity(32);
     if frame.stack > 0 {
@@ -352,6 +359,6 @@ pub fn windows_codes(frame: &Frame) -> Vec<u8> {
 }
 
 /// Whether the frame's slots are said from `x29` or, realigned, from `x20` itself.
-pub fn slot_base(frame: &Frame) -> (u16, i32) {
+pub(super) fn slot_base(frame: &Frame) -> (u16, i32) {
     if frame.align > 16 { (DWARF_X20, 0) } else { (DWARF_FP, frame.base_from_fp()) }
 }

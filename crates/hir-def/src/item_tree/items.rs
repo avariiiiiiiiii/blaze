@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-use base_db::{Crate, EditionedFileId, SourceDatabase};
+use base_db::{Db, Crate, EditionedFileId};
 use blaze_ids::Domain;
 use hir_expand::{HirFileId, span_map::SpanMap};
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap};
@@ -36,8 +36,13 @@ use crate::{
 mod tests;
 
 /// The tree of a source file, from its items' ([`assemble`]).
-pub(super) fn file_item_tree(db: &dyn SourceDatabase, file: EditionedFileId, krate: Crate) -> ItemTree {
+pub(super) fn file_item_tree(
+    db: &Db,
+    file: EditionedFileId,
+    krate: Crate,
+) -> ItemTree {
     let top = top_attrs(db, file, krate);
+    // alloc: once a run, the list of the file's parts
     let fragments: Vec<&ItemTree> =
         item_sources(db, file, krate).iter().map(|&item| item_fragment(db, item)).collect();
     assemble(top, &fragments)
@@ -60,7 +65,6 @@ pub(super) struct ItemSource<'db> {
 ///
 /// An item kept from an older parse keeps that parse's tree alive, so a file's trees outlive it
 /// until every item of theirs is edited or gone; each is a file's text and words once.
-#[derive(Clone)]
 pub(super) struct ItemSyntax {
     key: ItemKey,
     file: Arc<FileSyntax>,
@@ -124,9 +128,9 @@ fn range(range: Range<usize>) -> Range<u32> {
 }
 
 impl ItemSyntax {
-    fn lower(&self, db: &dyn SourceDatabase, krate: Crate) -> ItemTree {
+    fn lower(&self, db: &Db, krate: Crate) -> ItemTree {
         let file = &*self.file;
-        let root = syntax::Tree::new(file.tree.clone()).root();
+        let root = syntax::Tree::new(file.tree.clone()).root(); // clone: an `Arc`, the cursor's
         let NodeOrToken::Node(node) = root.flat_element(self.at) else {
             panic!("the element of the item {:?} is a token", self.key.ast_id)
         };
@@ -135,7 +139,7 @@ impl ItemSyntax {
         let pairs = slice(&file.anchors, &self.anchors)
             .iter()
             .map(|&[start, id]| (TextSize::new(start), ErasedFileAstId::from_raw(id)))
-            .collect();
+            .collect(); // alloc: the item's span map, once a lowering of a changed item
         let spans = RealSpanMap::from_file(self.key.file, pairs, item_range.len());
         let ids = slice(&file.ids, &self.ids);
         lower::Ctx::for_item(db, krate, ids, &spans, item_range.start()).lower_item(&item)
@@ -165,11 +169,30 @@ impl Hasher for Feed<'_> {
     }
 }
 
+/// The arrays [`item_sources`] fills, empty between runs and keeping their capacity, so a worker
+/// grows none again once it has cut a file as big. A scratch that grew past [`SCRATCH_IDS`]
+/// (a generated file) is dropped, so a worker keeps a bounded amount.
+#[derive(Default)]
+struct Scratch {
+    ids: Vec<[u32; 3]>,
+    anchors: Vec<[u32; 2]>,
+    items: Vec<(ItemKey, u32, Range<u32>, Range<u32>)>,
+    bytes: Vec<u8>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Scratch> = std::cell::Cell::new(Scratch::default());
+}
+
+/// About 200 KiB of a [`Scratch`]'s arrays.
+const SCRATCH_IDS: usize = 1 << 14;
+
 /// The top-level items of `file`, each cut out to lower on its own; one walk of the file's
-/// items, its ids and anchors in two arrays all the items share.
+/// items, its ids and anchors in two arrays all the items share. A run allocates the two
+/// arrays, the `Arc` holding them and the list of items, and nothing for each item.
 #[salsa::tracked(returns(ref))]
 pub(super) fn item_sources<'db>(
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     file: EditionedFileId,
     krate: Crate,
 ) -> Box<[ItemSource<'db>]> {
@@ -182,21 +205,21 @@ pub(super) fn item_sources<'db>(
     };
     let file_id = file.span_file_id(db);
     let (tree, _) = source_file.syntax().flat().expect("a source file is a flat tree's root");
-    let tree = tree.clone();
+    let tree = tree.clone(); // clone: an `Arc`, the file's tree the items keep
 
-    let (mut ids, mut anchors, mut items) = (Vec::new(), Vec::new(), Vec::new());
-    let mut bytes = Vec::new();
+    let mut scratch = SCRATCH.take();
+    let Scratch { ids, anchors, items, bytes } = &mut scratch;
     for item in source_file.items() {
         let node = item.syntax();
         let (_, at) = node.flat().expect("a top-level item is in its file's tree");
         let item_range = node.text_range();
         let ids_from = ids.len();
-        item_ids(&item, ast_id_map, item_range.start(), &mut ids);
+        item_ids(&item, ast_id_map, item_range.start(), ids);
         let anchors_from = anchors.len();
-        item_anchors(span_map, item_range, &ids[ids_from..], &mut anchors);
+        item_anchors(span_map, item_range, &ids[ids_from..], anchors);
 
         bytes.clear();
-        let mut feed = Feed(&mut bytes);
+        let mut feed = Feed(&mut *bytes);
         file_id.hash(&mut feed);
         hash_item(node, &mut feed);
         ids[ids_from..].hash(&mut feed);
@@ -209,13 +232,21 @@ pub(super) fn item_sources<'db>(
         items.push((key, at, range(ids_from..ids.len()), range(anchors_from..anchors.len())));
     }
 
-    let file = Arc::new(FileSyntax { tree, ids: ids.into(), anchors: anchors.into() });
-    items
-        .into_iter()
+    // alloc: once a run, the arrays every item of the file shares
+    let file = Arc::new(FileSyntax { tree, ids: ids[..].into(), anchors: anchors[..].into() });
+    let sources = (items.drain(..))
         .map(|(key, at, ids, anchors)| {
-            ItemSource::new(db, krate, ItemSyntax { key, file: file.clone(), at, ids, anchors })
+            // clone: an `Arc`, the file's syntax each item holds
+            let file = file.clone();
+            ItemSource::new(db, krate, ItemSyntax { key, file, at, ids, anchors })
         })
-        .collect()
+        .collect(); // alloc: the query's value, once a run
+    ids.clear();
+    anchors.clear();
+    if ids.capacity() <= SCRATCH_IDS {
+        SCRATCH.set(scratch);
+    }
+    sources
 }
 
 /// The ids of `item` and the items it is made of, the nodes [`lower::Ctx`] asks the ids of, in
@@ -229,8 +260,7 @@ fn item_ids(item: &ast::Item, map: &AstIdMap, start: TextSize, out: &mut Vec<[u3
             }
         }
         ast::Item::ExternBlock(block) => {
-            for child in block.extern_item_list().into_iter().flat_map(|list| list.extern_items())
-            {
+            for child in block.extern_item_list().into_iter().flat_map(|list| list.extern_items()) {
                 let child = ast::Item::from(child);
                 push_id(out, child.syntax(), start, map.ast_id(&child).erase());
             }
@@ -274,14 +304,15 @@ fn item_anchors(map: &RealSpanMap, item: TextRange, ids: &[[u32; 3]], out: &mut 
 /// moves nothing that is hashed; what it moves in the item ([`item_ids`], [`item_anchors`]) is
 /// hashed with the key.
 fn hash_item(item: &SyntaxNode, state: &mut Feed<'_>) {
+    // clone: a cursor, which allocates nothing; `cast` takes it by value
     let Some(ast) = ast::Item::cast(item.clone()) else { return hash_full(item, state) };
     let (inner, skipped, items) = match &ast {
-        ast::Item::Fn(it) => (it.body().map(|it| it.syntax().clone()), None, None),
-        ast::Item::Impl(it) => (it.assoc_item_list().map(|it| it.syntax().clone()), None, None),
-        ast::Item::Trait(it) => (it.assoc_item_list().map(|it| it.syntax().clone()), None, None),
-        ast::Item::Const(it) => (None, it.body().map(|it| it.syntax().clone()), None),
-        ast::Item::Static(it) => (None, it.body().map(|it| it.syntax().clone()), None),
-        ast::Item::Module(it) => (None, None, it.item_list().map(|it| it.syntax().clone())),
+        ast::Item::Fn(it) => (element(it.body()), None, None),
+        ast::Item::Impl(it) => (element(it.assoc_item_list()), None, None),
+        ast::Item::Trait(it) => (element(it.assoc_item_list()), None, None),
+        ast::Item::Const(it) => (None, element(it.body()), None),
+        ast::Item::Static(it) => (None, element(it.body()), None),
+        ast::Item::Module(it) => (None, None, element(it.item_list())),
         _ => (None, None, None),
     };
     if inner.is_none() && skipped.is_none() && items.is_none() {
@@ -289,11 +320,15 @@ fn hash_item(item: &SyntaxNode, state: &mut Feed<'_>) {
     }
     (NODE, item.kind() as u16).hash(state);
     for child in item.children_with_tokens() {
+        let at = match &child {
+            NodeOrToken::Node(node) => node.flat().map(|(_, at)| at),
+            NodeOrToken::Token(_) => None,
+        };
         match child {
             NodeOrToken::Token(token) => hash_token(&token, state),
-            NodeOrToken::Node(node) if inner.as_ref() == Some(&node) => hash_inner_attrs(&node, state),
-            NodeOrToken::Node(node) if skipped.as_ref() == Some(&node) => SKIPPED.hash(state),
-            NodeOrToken::Node(node) if items.as_ref() == Some(&node) => {
+            NodeOrToken::Node(node) if at == inner => hash_inner_attrs(&node, state),
+            NodeOrToken::Node(_) if at == skipped => SKIPPED.hash(state),
+            NodeOrToken::Node(node) if at == items => {
                 (NODE, node.kind() as u16).hash(state);
                 for child in node.children_with_tokens() {
                     match child {
@@ -326,14 +361,15 @@ fn hash_inner_attrs(node: &SyntaxNode, state: &mut Feed<'_>) {
                 hash_inner_attrs(&node, state)
             }
             NodeOrToken::Node(node) if ast::AnyAttr::can_cast(node.kind()) => {
+                let attr = ast::AnyAttr::cast(node).expect("an attribute");
+                let node = attr.syntax();
                 if !leading {
-                    let attr = ast::AnyAttr::cast(node.clone()).expect("an attribute");
                     if !attr.kind().is_inner() {
                         continue;
                     }
                     u32::from(node.text_range().start() - start).hash(state);
                 }
-                hash_full(&node, state);
+                hash_full(node, state);
             }
             NodeOrToken::Node(_) => leading = false,
             NodeOrToken::Token(token) if leading => hash_token(&token, state),
@@ -341,6 +377,11 @@ fn hash_inner_attrs(node: &SyntaxNode, state: &mut Feed<'_>) {
         }
     }
     END.hash(state);
+}
+
+/// Where `node` is in its file's flat tree.
+fn element(node: Option<impl AstNode>) -> Option<u32> {
+    node?.syntax().flat().map(|(_, at)| at)
 }
 
 const NODE: u8 = 0;
@@ -362,7 +403,7 @@ fn hash_token(token: &SyntaxToken, state: &mut Feed<'_>) {
 /// reads the item's syntax, which is its identity, and the crate's `cfg`s: an edit elsewhere in
 /// the file, or inside a body of the item, does not run it again.
 #[salsa::tracked(returns(ref))]
-pub(super) fn item_fragment<'db>(db: &'db dyn SourceDatabase, item: ItemSource<'db>) -> ItemTree {
+pub(super) fn item_fragment<'db>(db: &'db Db, item: ItemSource<'db>) -> ItemTree {
     let syntax = item.syntax(db);
     let _p = tracing::info_span!("item_fragment", ?syntax).entered();
     syntax.lower(db, item.krate(db))
@@ -371,7 +412,7 @@ pub(super) fn item_fragment<'db>(db: &'db dyn SourceDatabase, item: ItemSource<'
 /// The tree of `file`'s top level's attributes alone: its inner attributes and, for a crate's
 /// root, the crate attributes given on the command line.
 #[salsa::tracked(returns(ref))]
-pub(super) fn top_attrs(db: &dyn SourceDatabase, file: EditionedFileId, krate: Crate) -> ItemTree {
+pub(super) fn top_attrs(db: &Db, file: EditionedFileId, krate: Crate) -> ItemTree {
     let source_file = file.parse(db).tree();
     let root_file_id = krate.root_file_id(db);
     let extra = (file == root_file_id)
@@ -466,13 +507,19 @@ pub(super) fn assemble(top: &ItemTree, fragments: &[&ItemTree]) -> ItemTree {
         children.extend(part.children.iter().map(|&it| base.item(it)));
 
         consts.extend(
-            part.consts.iter().map(|it| Const { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.consts
+                .iter()
+                .map(|it| Const { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         enums.extend(
-            part.enums.iter().map(|it| Enum { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.enums
+                .iter()
+                .map(|it| Enum { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         extern_blocks.extend(
-            part.extern_blocks.iter().map(|it| ExternBlock { children: base.children(it.children) }),
+            part.extern_blocks
+                .iter()
+                .map(|it| ExternBlock { children: base.children(it.children) }),
         );
         extern_crates.extend(part.extern_crates.iter().map(|it| ExternCrate {
             name: base.name(it.name),
@@ -480,18 +527,22 @@ pub(super) fn assemble(top: &ItemTree, fragments: &[&ItemTree]) -> ItemTree {
             visibility: base.vis(it.visibility),
         }));
         functions.extend(
-            part.functions
-                .iter()
-                .map(|it| Function { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.functions.iter().map(|it| Function {
+                name: base.name(it.name),
+                visibility: base.vis(it.visibility),
+            }),
         );
         impls.extend_from_slice(&part.impls);
         macro2s.extend(
-            part.macro2s.iter().map(|it| Macro2 { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.macro2s
+                .iter()
+                .map(|it| Macro2 { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         macro_calls.extend(
             part.macro_calls.iter().map(|it| MacroCall { path: base.path(it.path), ..*it }),
         );
-        macro_rules.extend(part.macro_rules.iter().map(|it| MacroRules { name: base.name(it.name) }));
+        macro_rules
+            .extend(part.macro_rules.iter().map(|it| MacroRules { name: base.name(it.name) }));
         mods.extend(part.mods.iter().map(|it| Mod {
             name: base.name(it.name),
             visibility: base.vis(it.visibility),
@@ -501,7 +552,9 @@ pub(super) fn assemble(top: &ItemTree, fragments: &[&ItemTree]) -> ItemTree {
             },
         }));
         statics.extend(
-            part.statics.iter().map(|it| Static { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.statics
+                .iter()
+                .map(|it| Static { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         structs.extend(part.structs.iter().map(|it| Struct {
             name: base.name(it.name),
@@ -512,15 +565,20 @@ pub(super) fn assemble(top: &ItemTree, fragments: &[&ItemTree]) -> ItemTree {
             },
         }));
         traits.extend(
-            part.traits.iter().map(|it| Trait { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.traits
+                .iter()
+                .map(|it| Trait { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         type_aliases.extend(
-            part.type_aliases
-                .iter()
-                .map(|it| TypeAlias { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.type_aliases.iter().map(|it| TypeAlias {
+                name: base.name(it.name),
+                visibility: base.vis(it.visibility),
+            }),
         );
         unions.extend(
-            part.unions.iter().map(|it| Union { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+            part.unions
+                .iter()
+                .map(|it| Union { name: base.name(it.name), visibility: base.vis(it.visibility) }),
         );
         uses.extend(part.uses.iter().map(|it| Use {
             visibility: base.vis(it.visibility),

@@ -13,6 +13,7 @@ use blaze_live::patch::{
     ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, PatchRef,
 };
 
+use crate::arena::FrameVec;
 use crate::Format;
 use crate::model::Class;
 use crate::stage::{Content, Stage, error};
@@ -69,24 +70,30 @@ impl Stage<'_> {
         let generation = self.new.generation;
         let restart = |why: String| Message::Restart { id, generation, why }.encode();
         if self.full {
+            // alloc: a restart's reason, which the message carries: once per message
             return restart("the image was linked again from scratch".to_owned());
         }
         let old = &self.old.resolved.imports;
         if let Some(new) = self.new.resolved.imports.get(old.len()..).and_then(|it| it.first()) {
+            // alloc: a restart's reason, which the message carries: once per message
             return restart(format!("it imports `{}`, which the loader binds only at start", new.name));
         }
         if self.old.tls != self.new.tls {
+            // alloc: a restart's reason, which the message carries: once per message
             return restart("its thread-local storage changed".to_owned());
         }
+        let arena = self.arena;
         let home = |key: SymKey| self.symbols.find(key).and_then(|it| self.new.home(it)).map(|it| it.0);
         let (cells, descriptor) = (home(SymKey::Cells), home(SymKey::Descriptor));
-        let ids = self.write.sorted();
-        let mut code: Vec<(u64, &[u8])> = Vec::with_capacity(ids.len());
-        let mut data: Vec<(u64, &[u8])> = Vec::with_capacity(ids.len());
-        let mut rebase: Vec<u64> = Vec::new();
-        let mut slots: Vec<(u32, u64)> = Vec::new();
-        let mut frames: Vec<(u64, u64)> = Vec::new();
-        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
+        let mut ids = Vec::with_capacity_in(self.write.len(), arena);
+        ids.extend(self.write.iter());
+        ids.sort_unstable();
+        let mut code: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
+        let mut data: FrameVec<'_, (u64, &[u8])> = Vec::with_capacity_in(ids.len(), arena);
+        let mut rebase: FrameVec<'_, u64> = Vec::new_in(arena);
+        let mut slots: FrameVec<'_, (u32, u64)> = Vec::new_in(arena);
+        let mut frames: FrameVec<'_, (u64, u64)> = Vec::new_in(arena);
+        let mut windows: FrameVec<'_, (u64, u64, u64)> = Vec::new_in(arena);
         for id in ids {
             let Some(piece) = self.new.piece(id) else { continue };
             let space = &self.new.spaces[piece.region as usize];
@@ -94,8 +101,9 @@ impl Stage<'_> {
                 continue;
             }
             if Some(id) == cells {
-                let mut dirty = self.dirty_cells.sorted();
-                dirty.retain(|slot| u64::from(*slot) * 8 + 8 <= piece.size);
+                let mut dirty = Vec::with_capacity_in(self.dirty_cells.len(), arena);
+                dirty.extend(self.dirty_cells.iter().filter(|slot| u64::from(*slot) * 8 + 8 <= piece.size));
+                dirty.sort_unstable();
                 slots.reserve(dirty.len());
                 for slot in dirty {
                     let at = u64::from(slot) * 8;
@@ -118,6 +126,7 @@ impl Stage<'_> {
                 | Class::Table => data.push((piece.addr, piece.bytes_in(self.arena))),
                 Class::Synthetic(_) => continue,
                 class => {
+                    // alloc: a restart's reason, which the message carries: once per message
                     return restart(format!(
                         "{} changed in {class:?}, which a running program can't take",
                         self.symbols.describe(piece.sym)
@@ -126,6 +135,7 @@ impl Stage<'_> {
             }
             rebase.extend(piece.rebase().iter().map(|at| piece.addr + at));
             if !piece.binds().is_empty() {
+                // alloc: a restart's reason, which the message carries: once per message
                 return restart(format!(
                     "{} refers to an import the loader binds only at start",
                     self.symbols.describe(piece.sym)
@@ -148,10 +158,12 @@ impl Stage<'_> {
         }
         if !frames.is_empty() && self.output.format == Format::Elf {
             let Some(space) = self.new.space_of(&Class::EhFrame) else {
+                // alloc: a restart's reason, which the message carries: once per message
                 return restart("its new call frame information has no region".to_owned());
             };
             let region = &self.new.spaces[space].region;
             if region.size + 4 > region.capacity {
+                // alloc: a restart's reason, which the message carries: once per message
                 return restart(format!("its call frame information fills its region ({} bytes)", region.capacity));
             }
             data.push((region.addr + region.size, &EH_FRAME_END));

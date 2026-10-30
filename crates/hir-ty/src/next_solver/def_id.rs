@@ -1,5 +1,6 @@
 //! Definition of `SolverDefId`
 
+use base_db::Db;
 use hir_def::{
     AdtId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId, EnumId,
     EnumVariantId, ExpressionStoreOwnerId, FunctionId, GenericDefId, ImplId, StaticId, StructId,
@@ -57,7 +58,7 @@ impl std::fmt::Debug for SolverDefId<'_> {
 impl SolverDefId<'_> {
     fn fmt_with_names(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         f: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         match *self {

@@ -29,6 +29,10 @@ extern crate rustc_driver as _;
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_lexer;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 mod parsing;
 mod ptr;
 #[allow(unsafe_code)]
@@ -46,6 +50,7 @@ pub mod fuzz;
 pub mod hacks;
 pub mod syntax_editor;
 pub mod utils;
+pub mod view;
 
 use std::marker::PhantomData;
 
@@ -65,8 +70,8 @@ pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
-    Direction, Expand, FlatTree, FlatTreeBuilder, NodeOrToken, SyntaxText, TextRange, TextSize,
-    TokenAtOffset, WalkEvent, api::Preorder,
+    Direction, Expand, FlatTree, FlatTreeBuilder, NodeOrToken, SyntaxText, Text, TextRange,
+    TextSize, TokenAtOffset, WalkEvent, api::Preorder,
 };
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
@@ -132,6 +137,15 @@ impl<T> Parse<T> {
         self.tree.as_ref().unwrap().root()
     }
 
+    pub fn downgrade(&self) -> WeakParse<T> {
+        WeakParse {
+            tree: std::sync::Arc::downgrade(self.tree.as_ref().unwrap().flat()),
+            errors: self.errors.clone(),
+            outline: self.outline,
+            _ty: PhantomData,
+        }
+    }
+
     /// The errors of what is parsed. For a full parse, every error of the text. For an outline,
     /// those of the outline and of the lazy bodies parsed so far, whose parser errors are found
     /// by parsing each again (none is ever parsed here): which bodies that covers depends on
@@ -162,6 +176,27 @@ impl<T> Parse<T> {
             &mut errors,
         );
         errors
+    }
+}
+
+/// A [`Parse`] that does not keep its tree alive.
+pub struct WeakParse<T> {
+    tree: std::sync::Weak<FlatTree>,
+    errors: Option<Arc<[SyntaxError]>>,
+    outline: Option<Edition>,
+    _ty: PhantomData<fn() -> T>,
+}
+
+impl<T> WeakParse<T> {
+    /// The parse, while something else keeps its tree.
+    pub fn upgrade(&self) -> Option<Parse<T>> {
+        let tree = self.tree.upgrade()?;
+        Some(Parse {
+            tree: Some(Tree::new(tree)),
+            errors: self.errors.clone(),
+            outline: self.outline,
+            _ty: PhantomData,
+        })
     }
 }
 
@@ -263,12 +298,27 @@ impl Parse<SourceFile> {
     /// [`SourceFile::parse_shared`] (or, for an outline, [`SourceFile::parse_outline`]) makes
     /// of `text`; several edits since this parse are one edit covering them all. This parse is
     /// one made in `edition`, as for [`Parse::reparse`].
-    pub fn reparse_to(&self, text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+    pub fn reparse_to(&self, text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
+        let text = text.into();
         let tree = self.tree.as_ref().unwrap().flat();
         if **tree.source() == *text && self.outline.is_none_or(|it| it == edition) {
             return self.clone();
         }
         let (delete, _insert) = parsing::edit_between(tree.source(), &text);
+        self.reparse_onto(delete, text, edition)
+    }
+
+    /// The parse of `text`, which is this parse's text with `delete` replaced by the bytes of
+    /// `text` at `delete.start()`: the edit parsed again as [`Parse::reparse`] parses one, and
+    /// the tree shares `text`. The same parse a whole parse of `text` makes.
+    pub fn reparse_onto(
+        &self,
+        delete: TextRange,
+        text: impl Into<Text>,
+        edition: Edition,
+    ) -> Parse<SourceFile> {
+        let text = text.into();
+        let tree = self.tree.as_ref().unwrap().flat();
         let errors = self.errors.as_deref().unwrap_or_default().iter().cloned();
         match parsing::incremental_reparse_onto(tree, delete, &text, errors, edition, self.outline)
         {
@@ -363,13 +413,13 @@ pub use crate::ast::SourceFile;
 impl SourceFile {
     /// A full parse of `text`, over a shared copy of it.
     pub fn parse(text: &str, edition: Edition) -> Parse<SourceFile> {
-        SourceFile::parse_shared(text.into(), edition)
+        SourceFile::parse_shared(Text::from(text), edition)
     }
 
     /// A full parse of `text`, whose tree shares it: the parse costs the tree's arrays only.
-    pub fn parse_shared(text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+    pub fn parse_shared(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse").entered();
-        let (tree, errors) = parsing::parse_text(text, edition, false);
+        let (tree, errors) = parsing::parse_text(text.into(), edition, false);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
@@ -381,9 +431,9 @@ impl SourceFile {
     /// time a cursor walks into it, to exactly the tree a full parse makes there. A body whose
     /// tokens could parse otherwise alone (`parser::lazy_block_len`) is parsed in full here.
     /// Its errors: [`Parse::errors`], [`Parse::errors_with_bodies`].
-    pub fn parse_outline(text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+    pub fn parse_outline(text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse_outline").entered();
-        let (tree, errors) = parsing::parse_text(text, edition, true);
+        let (tree, errors) = parsing::parse_text(text.into(), edition, true);
         let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
@@ -399,10 +449,11 @@ impl SourceFile {
     /// was) changes how long it takes, never what it is.
     pub fn parse_file(
         key: u32,
-        text: std::sync::Arc<str>,
+        text: impl Into<Text>,
         edition: Edition,
         outline: bool,
     ) -> Parse<SourceFile> {
+        let text = text.into();
         let parse = match parsing::kept::take(key).filter(|it| it.is_outline() == outline) {
             Some(previous) => previous.reparse_to(text, edition),
             None => match outline {

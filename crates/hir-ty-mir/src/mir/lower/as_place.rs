@@ -140,7 +140,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             this.lower_expr_to_some_place_without_adjust(expr_id, current)
         };
-        match &self.store[expr_id] {
+        match self.store.expr(expr_id) {
             Expr::Path(p) => {
                 let resolver_guard =
                     self.resolver.update_to_inner_scope(self.db, self.store_owner, expr_id);
@@ -179,19 +179,19 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 }
             }
             Expr::UnaryOp { expr, op: hir_def::hir::UnaryOp::Deref } => {
-                let is_builtin = match self.expr_ty_without_adjust(*expr).kind() {
+                let is_builtin = match self.expr_ty_without_adjust(expr).kind() {
                     TyKind::Ref(..) | TyKind::RawPtr(..) => true,
                     TyKind::Adt(id, _) => id.is_box(),
                     _ => false,
                 };
                 if !is_builtin {
-                    let Some((mut p, current)) = self.lower_expr_as_place(current, *expr, true)?
+                    let Some((mut p, current)) = self.lower_expr_as_place(current, expr, true)?
                     else {
                         return Ok(None);
                     };
                     // Inference borrows the operand itself when the deref is a mutable one, so
                     // the place is that reference and not the value it points to.
-                    let borrowed = self.infer.expr_adjustments.get(expr).is_some_and(|it| {
+                    let borrowed = self.infer.expr_adjustments.get(&expr).is_some_and(|it| {
                         matches!(it.last(), Some(Adjustment { kind: Adjust::Borrow(_), .. }))
                     });
                     if borrowed {
@@ -200,7 +200,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                     return self.lower_overloaded_deref(
                         current,
                         p,
-                        self.expr_ty_without_adjust(*expr),
+                        self.expr_ty_without_adjust(expr),
                         self.expr_ty_without_adjust(expr_id),
                         expr_id.into(),
                         'b: {
@@ -213,7 +213,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                         },
                     );
                 }
-                let Some((mut r, current)) = self.lower_expr_as_place(current, *expr, true)? else {
+                let Some((mut r, current)) = self.lower_expr_as_place(current, expr, true)? else {
                     return Ok(None);
                 };
                 r = r.project(ProjectionElem::Deref);
@@ -221,27 +221,28 @@ impl<'db> MirLowerCtx<'_, 'db> {
             }
             Expr::UnaryOp { .. } => try_rvalue(self),
             Expr::Field { expr, .. } => {
-                let Some((mut r, current)) = self.lower_expr_as_place(current, *expr, true)? else {
+                let Some((mut r, current)) = self.lower_expr_as_place(current, expr, true)? else {
                     return Ok(None);
                 };
                 self.push_field_projection(&mut r, expr_id)?;
                 Ok(Some((r, current)))
             }
             Expr::Index { base, index } => {
-                let base_ty = self.expr_ty_after_adjustments(*base);
-                if !is_builtin_index(self.infer, *base, *index) {
+                let base_ty = self.expr_ty_after_adjustments(base);
+                if !is_builtin_index(self.infer, base, index) {
                     let Some(index_fn) = self.infer.method_resolution(expr_id) else {
                         return Err(MirLowerError::UnresolvedMethod(
+                            // alloc: error path
                             "[overloaded index]".to_owned(),
                         ));
                     };
                     let Some((base_place, current)) =
-                        self.lower_expr_as_place(current, *base, true)?
+                        self.lower_expr_as_place(current, base, true)?
                     else {
                         return Ok(None);
                     };
                     let Some((index_operand, current)) =
-                        self.lower_expr_to_some_operand(*index, current)?
+                        self.lower_expr_to_some_operand(index, current)?
                     else {
                         return Ok(None);
                     };
@@ -258,18 +259,18 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 let adjusts = self
                     .infer
                     .expr_adjustments
-                    .get(base)
+                    .get(&base)
                     .and_then(|it| it.split_last())
                     .map(|it| it.1)
                     .unwrap_or(&[]);
                 let Some((mut p_base, current)) =
-                    self.lower_expr_as_place_with_adjust(current, *base, true, adjusts)?
+                    self.lower_expr_as_place_with_adjust(current, base, true, adjusts)?
                 else {
                     return Ok(None);
                 };
                 let l_index =
-                    self.temp(self.expr_ty_after_adjustments(*index), current, expr_id.into())?;
-                let Some(current) = self.lower_expr_to_place(*index, l_index.into(), current)?
+                    self.temp(self.expr_ty_after_adjustments(index), current, expr_id.into())?;
+                let Some(current) = self.lower_expr_to_place(index, l_index.into(), current)?
                 else {
                     return Ok(None);
                 };

@@ -187,3 +187,44 @@ fn a_slot_holds_three_memos_in_itself_and_more_in_a_list() {
     assert_eq!(shared.as_ref().map(Span::bytes), Some(&b"the key's bytes"[..]), "a shared key outlives its slot");
     assert!(Slot::empty().memos().is_empty());
 }
+
+/// Reading a memo (its line, value, edges, key and where its value is) allocates nothing.
+#[test]
+fn a_store_read_allocates_nothing() {
+    let store = Store::new();
+    let code = store.code(SCHEMA, ContentId([1; 32]));
+    let made = edges(4);
+    let memo = store.make(key(4), Fingerprint(4), code, &made, b"read me");
+    let task = blaze_reclaim::enter();
+    let (fingerprint, inline, bytes, edge_len, at, stored) =
+        blaze_alloc_count::assert_at_most(0, "a store read", || {
+            (
+                store.fingerprint(&task, memo),
+                store.hot(&task, memo).inline().map(|(_, len)| len),
+                store.bytes(&task, memo),
+                store.edges(&task, memo).len(),
+                store.key(&task, memo),
+                store.stored(&task, memo),
+            )
+        });
+    assert_eq!((fingerprint, inline, bytes, edge_len), (Fingerprint(4), Some(7), Some(&b"read me"[..]), 3));
+    assert_eq!((at, stored), (key(4), Stored::Memory));
+}
+
+/// Once a thread has its lane, open segments and a block of rows, making a memo copies into
+/// them and allocates nothing.
+#[test]
+fn a_memo_made_on_a_warm_thread_allocates_nothing() {
+    let store = Store::new();
+    let code = store.code(SCHEMA, ContentId([1; 32]));
+    for n in 0..8 {
+        store.make(key(n), Fingerprint(1), code, &edges(n), &n.to_le_bytes());
+    }
+    let made = edges(8);
+    let memo = blaze_alloc_count::assert_at_most(0, "a memo made on a warm thread", || {
+        store.make(key(8), Fingerprint(1), code, &made, &8u64.to_le_bytes())
+    });
+    let task = blaze_reclaim::enter();
+    assert_eq!(read(store.edges(&task, memo)), read(&made));
+    assert_eq!(store.bytes(&task, memo), Some(&8u64.to_le_bytes()[..]));
+}

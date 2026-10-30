@@ -145,6 +145,7 @@ impl<C: Configuration> Jar for JarImpl<C> {
     fn create_ingredients(
         _zalsa: &mut Zalsa,
         struct_index: crate::zalsa::IngredientIndex,
+    // alloc: setup, once per ingredient when its jar registers
     ) -> Vec<Box<dyn Ingredient>> {
         let struct_ingredient = <IngredientImpl<C>>::new(struct_index);
 
@@ -153,14 +154,17 @@ impl<C: Configuration> Jar for JarImpl<C> {
                 .iter()
                 .copied()
                 .map(|tracked_index| {
+                    // alloc: setup, once per ingredient when its jar registers
                     Box::new(<FieldIngredientImpl<C>>::new(
                         tracked_index,
                         struct_index.successor(tracked_index),
                     )) as _
                 });
 
+        // alloc: setup, once per ingredient when its jar registers
         iter::once(Box::new(struct_ingredient) as _)
             .chain(tracked_field_ingredients)
+            // alloc: setup, once per ingredient when its jar registers
             .collect()
     }
 
@@ -330,9 +334,11 @@ impl IdentityMap {
     #[expect(clippy::type_complexity)]
     pub(crate) fn drain(&mut self) -> (ThinVec<(Identity, Id)>, Vec<(Identity, Id)>) {
         if self.table.is_empty() {
+            // alloc: `ThinVec::new` and `Vec::new` allocate nothing
             return (ThinVec::new(), Vec::new());
         }
 
+        // alloc: `Vec::new` allocates nothing; filled only when an execution stops creating structs it made before
         let mut stale = Vec::new();
         let mut active = ThinVec::with_capacity(self.table.len());
 
@@ -490,6 +496,7 @@ where
             ingredient_index: index,
             phantom: PhantomData,
             free_list: Default::default(),
+            // alloc: setup, once per ingredient when its jar registers
             memo_table_types: Arc::new(MemoTableTypes::default()),
         }
     }
@@ -1071,6 +1078,7 @@ where
             // SAFETY: The memo table belongs to a value that we allocated, so it
             // has the correct type. The caller guarantees exclusive database access.
             .map(|entry| unsafe { entry.value.memory_usage(&self.memo_table_types) })
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect();
 
         Some(memory_usage)
@@ -1094,6 +1102,7 @@ where
     unsafe fn serialize<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        // alloc: the edge: persistence, once per serialized database
         f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
         f(&persistence::SerializeIngredient {

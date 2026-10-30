@@ -2,6 +2,7 @@
 
 use std::fmt::Write;
 
+use base_db::Db;
 use either::Either;
 use hir_def::{
     GenericParamId, ItemContainerId, Lookup,
@@ -27,7 +28,7 @@ impl MirLowerError<'_> {
     fn pretty_print(
         &self,
         f: &mut String,
-        db: &dyn HirDatabase,
+        db: &Db,
         span_formatter: impl Fn(FileId, TextRange) -> String,
         display_target: DisplayTarget,
     ) -> std::result::Result<(), std::fmt::Error> {
@@ -114,7 +115,7 @@ impl MirEvalError<'_> {
     fn pretty_print(
         &self,
         f: &mut String,
-        db: &dyn HirDatabase,
+        db: &Db,
         span_formatter: impl Fn(FileId, TextRange) -> String,
         display_target: DisplayTarget,
     ) -> std::result::Result<(), std::fmt::Error> {
@@ -227,7 +228,7 @@ impl MirEvalError<'_> {
 
 /// The file and range of `span` in the body of `def`.
 fn source_range(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: InferBodyId<'_>,
     span: MirSpan,
 ) -> Option<(FileId, TextRange)> {
@@ -261,7 +262,7 @@ impl ConstEvalError<'_> {
     fn pretty_print(
         &self,
         f: &mut String,
-        db: &dyn HirDatabase,
+        db: &Db,
         span_formatter: impl Fn(span::FileId, span::TextRange) -> String,
         display_target: DisplayTarget,
     ) -> std::result::Result<(), std::fmt::Error> {

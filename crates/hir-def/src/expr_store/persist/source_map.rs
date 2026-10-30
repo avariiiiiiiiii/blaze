@@ -249,6 +249,7 @@ impl BackColumns {
                 let (file_kind, file) = file_bits(file);
                 FileRun { file, file_kind, start }
             })
+            // alloc: the encode's one copy of the column, once per map.
             .collect();
         BackColumns {
             kinds: Column::push(out, &map.kinds),
@@ -371,9 +372,11 @@ impl<'a> BackRef<'a> {
             self.kinds.into(),
             self.starts.into(),
             self.ends.into(),
+            // alloc: the decode's one copy of the column.
             self.runs.iter().map(|run| run.start).collect(),
             (self.runs.iter())
                 .map(|run| file_of(run.file_kind, run.file).expect("checked when the buffer was read"))
+                // alloc: the decode's one copy of the column.
                 .collect(),
         )
     }
@@ -517,8 +520,11 @@ impl SourceMapColumns {
         let (lifetime_map, lifetime_map_ids) = table_columns(lifetime_map, |&lifetime| raw(lifetime));
         let (mut expr_map_back, mut pat_map_back, mut label_map_back) =
             (BackColumns::EMPTY, BackColumns::EMPTY, BackColumns::EMPTY);
+        // alloc: empty unless the map has expressions; then the column's one copy.
         let (mut binding_starts, mut binding_pats) = (Column { at: 0, len: 0 }, Vec::new());
+        // alloc: empty unless the map has expressions; then each is the column's one copy.
         let (mut expr_keys, mut expr_ids, mut pat_keys, mut pat_ids) = (vec![], vec![], vec![], vec![]);
+        // alloc: empty unless the map has expressions; then each is the column's one copy.
         let (mut label_keys, mut label_ids, mut call_keys, mut calls) = (vec![], vec![], vec![], vec![]);
         if let Some(it) = expr_only.as_deref() {
             let ExpressionOnlySourceMap {
@@ -543,6 +549,7 @@ impl SourceMapColumns {
             pat_map_back = BackColumns::write(pats_back, out);
             label_map_back = BackColumns::write(labels_back, out);
             binding_starts = Column::push(out, &binding_definitions.starts);
+            // alloc: the encode's one copy of the column, once per map.
             binding_pats = binding_definitions.pats.iter().map(|&pat| raw(pat)).collect();
             (expr_keys, expr_ids) = table_columns(expr_map, |&id| packed_bits(id));
             (pat_keys, pat_ids) = table_columns(pat_map, |&id| packed_bits(id));
@@ -632,6 +639,7 @@ fn put_template(w: &mut Words, template: Option<&FormatTemplate>) {
 fn get_template(r: &mut Read<'_>, exprs: usize) -> Result<Option<Box<FormatTemplate>>, FormatError> {
     Ok(match r.tag(2, "a template map that is neither 0 nor 1")? {
         0 => None,
+        // alloc: once per decoded map with templates, as `finish` boxes it.
         _ => Some(Box::new(FormatTemplate {
             format_args_to_captures: get_table(r, exprs)?,
             asm_to_captures: get_table(r, exprs)?,
@@ -813,6 +821,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
         let (exprs, pats) = (self.expr_map_back.len(), self.pat_map_back.len());
         let expr_only = match self.has_exprs() {
             false => None,
+            // alloc: once per decoded map, as `finish` boxes it.
             true => Some(Box::new(ExpressionOnlySourceMap {
                 expr_map: source_table(self.expr_map, self.expr_map_ids, buffer, packed_of)?,
                 expr_map_back: self.expr_map_back.decode(),
@@ -822,6 +831,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
                 label_map_back: self.label_map_back.decode(),
                 binding_definitions: BindingPats {
                     starts: self.binding_starts.into(),
+                    // alloc: the decode's one copy of the column.
                     pats: self.binding_pats.iter().map(|&pat| idx(pat)).collect(),
                 },
                 field_map_back: get_table(&mut r, exprs)?,
@@ -917,8 +927,8 @@ impl Persist for BodySourceMap {
     fn write(&self, out: &mut Writer) -> u64 {
         let BodySourceMap { self_param, store } = self;
         let columns = SourceMapColumns::write(store, out);
-        let self_param: Vec<Src> = self_param.iter().map(Src::of).collect();
-        let self_param = Column::push(out, &self_param);
+        let self_param = self_param.as_ref().map(Src::of);
+        let self_param = Column::push(out, self_param.as_slice());
         let at = out.next::<BodySourceMapRoot>();
         let field = |offset: usize| at + offset as u64;
         let root = BodySourceMapRoot {

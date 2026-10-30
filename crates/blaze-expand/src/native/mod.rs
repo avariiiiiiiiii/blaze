@@ -2,14 +2,14 @@
 //! (`proc_macro/`, blaze's WebAssembly guest's with its imports answered in process) and the
 //! host that answers it ([`host`]), for the proc macros that run on blaze's own compiler
 //! (docs/v2/plan/design/compile-time.md, change 20). A macro sees what it sees as a module:
-//! the same spans, numbered the same (the def, call and mixed sites 1, 2 and 3, then the
-//! input's as they first appear), the same answers to what it asks of them, the same text of
-//! a stream, so its output is the module's token for token and span for span. [`difference`]
-//! names the first token where two outputs part.
+//! the same span words (of the def, call and mixed sites' parts, then the input's and the
+//! attribute's as they first appear, as [`wire::Parts`] gives them), the same answers to what
+//! it asks of them, the same text of a stream, so its output is the module's token for token
+//! and span for span. [`difference`] names the first token where two outputs part.
 //!
-//! What it costs: an expansion allocates only what its output keeps. Its spans' table and its
-//! encodings are each thread's, reused, and the output is read straight into rust-analyzer's
-//! flat tree ([`wire::Reader`]).
+//! What it costs: an expansion allocates only what the macro's streams and its output keep.
+//! Its span parts are each thread's, reused; the input is walked straight into the macro's
+//! stream and the output built straight into blaze's tree, with no bytes between.
 
 mod host;
 #[allow(dead_code)]
@@ -22,16 +22,14 @@ mod tests;
 
 use std::cell::Cell;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::proc_macro::ProcMacroExpansionError;
+use native_proc_macro::__native::Failed;
 pub use native_proc_macro::TokenStream;
 use span::Span;
 use tt::{Leaf, TokenTree, TopSubtree};
 
-use self::{
-    host::Host,
-    wire::{Spans, Writer},
-};
+use self::{host::Host, wire::Parts};
 
 /// A macro's entry point, compiled against the bridge's `proc_macro`.
 #[derive(Clone, Copy, Debug)]
@@ -42,72 +40,41 @@ pub enum Expander {
     Two(fn(TokenStream, TokenStream) -> TokenStream),
 }
 
-/// What an expansion on a thread writes and reads, kept for the next one there.
-#[derive(Default)]
-struct Scratch {
-    spans: Spans,
-    input: Vec<u8>,
-    attr: Vec<u8>,
-    output: Vec<u8>,
-}
-
 thread_local! {
-    /// Taken for the length of an expansion: one that a database answer starts on this
-    /// thread (`host.rs`) finds it empty and makes its own.
-    static SCRATCH: Cell<Scratch> = Cell::new(Scratch::default());
+    /// The span parts of an expansion on this thread, kept for the next one there. Taken for
+    /// the length of an expansion: one that a database answer starts on this thread
+    /// (`host.rs`) finds them empty and makes its own.
+    static PARTS: Cell<Parts> = Cell::new(Parts::default());
 }
 
 /// Expands a call of the macro whose entry point is `expander`, as its module would. With no
 /// `db`, what the macro asks of a span is answered as the wasm host answers with none.
 pub fn expand(
     expander: Expander,
-    db: Option<&dyn SourceDatabase>,
+    db: Option<&Db>,
     subtree: &TopSubtree,
     attrs: Option<&TopSubtree>,
     def_site: Span,
     call_site: Span,
     mixed_site: Span,
 ) -> Result<TopSubtree, ProcMacroExpansionError> {
-    let mut scratch = SCRATCH.take();
-    scratch.spans.clear();
-    scratch.output.clear();
-    // As the wasm host numbers them: the sites 1, 2 and 3, the same spans or not, then
-    // the input's as they first appear.
-    for span in [def_site, call_site, mixed_site] {
-        scratch.spans.push(span);
-    }
-    {
-        let Scratch { spans, input, attr, .. } = &mut scratch;
-        input.clear();
-        attr.clear();
-        let mut writer = Writer { out: std::mem::take(input), spans };
-        writer.top(subtree);
-        *input = std::mem::take(&mut writer.out);
-        match attrs {
-            Some(attrs) => {
-                writer.out = std::mem::take(attr);
-                writer.top(attrs);
-                *attr = std::mem::take(&mut writer.out);
-            }
-            // rust-analyzer gives an attribute written without arguments
-            // (`#[tokio::main]`) none, which the macro is given as an empty stream.
-            None => attr.extend_from_slice(&0u32.to_le_bytes()),
-        }
-    }
-    let mut host = Host { db, spans: std::mem::take(&mut scratch.spans), sites: [1, 2, 3] };
-    let (input, attr, output) = (&scratch.input, &scratch.attr, &mut scratch.output);
+    let mut parts = PARTS.take();
+    parts.clear();
+    // As the wasm host gives them out: the sites' first, then the input's and the
+    // attribute's (`expand1` and `expand2`).
+    let sites = [def_site, call_site, mixed_site].map(|span| parts.pack(span));
+    let mut host = Host { db, parts: &mut parts, sites };
+    // rust-analyzer gives an attribute written without arguments (`#[tokio::main]`) none,
+    // which the macro is given as an empty stream.
     let ran = native_proc_macro::__native::with_host(&mut host, || match expander {
-        Expander::One(f) => native_proc_macro::__native::expand1(f, input, output),
-        Expander::Two(f) => native_proc_macro::__native::expand2(f, attr, input, output),
+        Expander::One(f) => native_proc_macro::__native::expand1(f, subtree),
+        Expander::Two(f) => native_proc_macro::__native::expand2(f, attrs, subtree),
     });
-    let read = ran.map(|()| wire::Reader::new(&scratch.output, &host.spans).top(call_site));
-    scratch.spans = host.spans;
-    SCRATCH.set(scratch);
-    match read {
-        Ok(Ok(tree)) => Ok(tree),
-        Ok(Err(e)) => Err(ProcMacroExpansionError::System(e)),
-        Err(panic) => Err(ProcMacroExpansionError::Panic(panic)),
-    }
+    PARTS.set(parts);
+    ran.map_err(|failed| match failed {
+        Failed::Panicked(message) => ProcMacroExpansionError::Panic(message),
+        Failed::Output(why) => ProcMacroExpansionError::System(why),
+    })
 }
 
 /// The first difference of an output of the bridge (`native`) from what the macro gives

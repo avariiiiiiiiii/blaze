@@ -2,6 +2,8 @@
 //! at 5f94df478: `rebuild_only_on_explicit_paths`, `rerun_if_directory`,
 //! `rerun_if_env_changes`, `rerun_if_published_directory`), as data.
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 
 #[test]
@@ -75,23 +77,17 @@ fn what_the_whole_package_leaves_out() {
 /// spellings that compare equal as paths.
 #[test]
 fn kept_once_by_hash_as_by_scan() {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = |bound: u64| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state % bound
-    };
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..2_000 {
-        let len = next(3 * SCAN as u64) as usize;
+        let len = rng.index(3 * SCAN);
         let names: Vec<String> =
-            (0..len).map(|_| format!("V{}", next(len as u64 / 2 + 1))).collect();
+            (0..len).map(|_| format!("V{}", rng.below(len as u64 / 2 + 1))).collect();
         let paths: Vec<String> = (0..len)
-            .map(|_| match next(4) {
-                0 => format!("src/{}.rs", next(8)),
-                1 => format!("./src/{}.rs", next(8)),
-                2 => format!("src//{}.rs", next(8)),
-                _ => format!("/abs/{}", next(8)),
+            .map(|_| match rng.below(4) {
+                0 => format!("src/{}.rs", rng.below(8)),
+                1 => format!("./src/{}.rs", rng.below(8)),
+                2 => format!("src//{}.rs", rng.below(8)),
+                _ => format!("/abs/{}", rng.below(8)),
             })
             .collect();
         let watched = watched_of(&paths, &names, Path::new("/p/foo"));
@@ -148,18 +144,12 @@ fn watched_in_the_output_as_from_the_parsed_output() {
         "  cargo:rerun-if-changed=  spaced  ",
         "cargo::rerun-if-changed",
     ];
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = |bound: usize| {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state % bound as u64) as usize
-    };
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     let mut ok = 0;
     for _ in 0..5_000 {
         let mut stdout = String::new();
-        for _ in 0..next(40) {
-            stdout.push_str(lines[next(lines.len())]);
+        for _ in 0..rng.index(40) {
+            stdout.push_str(lines[rng.index(lines.len())]);
             stdout.push('\n');
         }
         let made =

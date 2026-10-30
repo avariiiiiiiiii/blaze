@@ -47,7 +47,9 @@ impl<A: Accumulator> Jar for JarImpl<A> {
     fn create_ingredients(
         _zalsa: &mut Zalsa,
         first_index: IngredientIndex,
+    // alloc: setup, once per ingredient when its jar registers
     ) -> Vec<Box<dyn Ingredient>> {
+        // alloc: setup, once per ingredient when its jar registers
         vec![Box::new(<IngredientImpl<A>>::new(first_index))]
     }
 

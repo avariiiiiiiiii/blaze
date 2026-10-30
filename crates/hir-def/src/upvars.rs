@@ -1,6 +1,6 @@
 //! A simple query to collect tall locals (upvars) a closure use.
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use blaze_ids::radix;
 use hir_expand::mod_path::{ModPath, PathKind};
 use intern::{Symbol, sym};
@@ -68,7 +68,7 @@ impl UpvarsRef<'_> {
 
 /// Returns a map from `Expr::Closure` to its upvars.
 pub fn upvars_mentioned(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: ExpressionStoreOwnerId,
 ) -> Option<&FxHashMap<ExprId, Upvars>> {
     return match owner {
@@ -79,7 +79,7 @@ pub fn upvars_mentioned(
 
     #[salsa::tracked(returns(as_deref))]
     pub fn signature_upvars_mentioned(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: GenericDefId,
     ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
@@ -87,7 +87,7 @@ pub fn upvars_mentioned(
 
     #[salsa::tracked(returns(as_deref))]
     pub fn body_upvars_mentioned(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: DefWithBodyId,
     ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
@@ -95,7 +95,7 @@ pub fn upvars_mentioned(
 
     #[salsa::tracked(returns(as_deref))]
     pub fn variant_fields_upvars_mentioned(
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: VariantId,
     ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
         upvars_mentioned_impl(db, owner.into())
@@ -103,7 +103,7 @@ pub fn upvars_mentioned(
 }
 
 pub fn upvars_mentioned_impl(
-    db: &dyn SourceDatabase,
+    db: &Db,
     owner: ExpressionStoreOwnerId,
 ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
     let store = ExpressionStore::of(db, owner);
@@ -133,7 +133,7 @@ pub fn upvars_mentioned_impl(
 }
 
 struct UpvarsMentionedVisitor<'db> {
-    db: &'db dyn SourceDatabase,
+    db: &'db Db,
     resolver: Resolver<'db>,
     owner: ExpressionStoreOwnerId,
     store: &'db ExpressionStore,

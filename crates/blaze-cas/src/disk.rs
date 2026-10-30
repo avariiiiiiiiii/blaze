@@ -242,13 +242,10 @@ pub(crate) fn record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_chunks(chunks: &[(Key, u64)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(chunks.len() * CHUNK_REF);
-    for (key, len) in chunks {
-        out.extend_from_slice(&key.0.0);
-        out.extend_from_slice(&len.to_le_bytes());
-    }
-    out
+/// Appends one entry of a list of chunks to `out`: its key, then its length, `CHUNK_REF` bytes.
+pub(crate) fn encode_chunk(out: &mut Vec<u8>, key: Key, len: u64) {
+    out.extend_from_slice(&key.0.0);
+    out.extend_from_slice(&len.to_le_bytes());
 }
 
 pub(crate) fn decode_chunks(payload: &[u8]) -> Result<Vec<(Key, u64)>, &'static str> {

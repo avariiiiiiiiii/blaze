@@ -1,4 +1,4 @@
-use base_db::all_crates;
+use base_db::{Db, all_crates};
 use expect_test::expect;
 
 use itertools::Itertools;
@@ -1898,7 +1898,7 @@ struct HugeExpander;
 impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
     fn expand(
         &self,
-        _: &dyn base_db::SourceDatabase,
+        _: &Db,
         _: &crate::tt::TopSubtree,
         _: Option<&crate::tt::TopSubtree>,
         _: &base_db::Env,

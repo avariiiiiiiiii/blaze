@@ -2,6 +2,7 @@
 
 use std::{marker::PhantomData, num::NonZeroU32, ops::ControlFlow};
 
+use base_db::Db;
 use hir_def::{
     AdtId, HasModule, TypeParamId,
     hir::generics::{GenericParams, TypeOrConstParamData, TypeParamProvenance},
@@ -802,7 +803,7 @@ impl<'db> Ty<'db> {
     }
 
     // FIXME: Should this be here?
-    pub fn impl_trait_bounds(self, db: &'db dyn HirDatabase) -> Option<Vec<Clause<'db>>> {
+    pub fn impl_trait_bounds(self, db: &'db Db) -> Option<Vec<Clause<'db>>> {
         let interner = DbInterner::new_no_crate(db);
 
         match self.kind() {

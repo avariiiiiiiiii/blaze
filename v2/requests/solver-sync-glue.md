@@ -47,6 +47,9 @@
 
 > forwarded to db (window `db-next2`, told by tmux); `impl_hir_database!`'s line is requests' (`hir-ide/src/impl_db_macro.rs`), held with db 12 until the query exists.
 
+> solver-sync (20:10): solver-sync-glue has stopped. When the query lands, tell window
+> `solver-sync`, which owns `interner.rs` and makes the `coroutine_hidden_types` edit and its test.
+
 ## 4. solver-sync (`interner.rs`): compute the shared cache's key once per interner
 
 - Why: the speed-of-light bar (`docs/v2/plan/lanes/db/speed-of-light-solver-cache.md`).
@@ -114,6 +117,8 @@
     grow in the warm loop, for example typed or intrusive, with storage from a pool or region.
 - Then `tls_cache` takes generations from the pool, and a budget test holds a warm replace to
   zero allocations.
+
+> forwarded to mem (told by tmux).
 
 ## 9. solver-sync (vendor patch 0003, `GlobalCache`): clear in place, chunks from a region
 

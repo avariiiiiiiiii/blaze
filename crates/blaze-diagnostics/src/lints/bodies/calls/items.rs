@@ -13,7 +13,7 @@ mod drop_forget_useless;
 mod invalid_atomic_ordering;
 mod invalid_from_utf8;
 
-use hir::db::HirDatabase;
+use base_db::Db;
 use hir_def::FunctionId;
 use rustc_hash::FxHashMap;
 
@@ -41,7 +41,7 @@ impl FnItems {
     }
 
     /// rustc's `get_diagnostic_name` of `def`, when it is one of those looked for.
-    fn of(&mut self, db: &dyn HirDatabase, def: FunctionId) -> Option<&'static str> {
+    fn of(&mut self, db: &Db, def: FunctionId) -> Option<&'static str> {
         let known = self.known;
         *self.seen.entry(def).or_insert_with(|| {
             let name = util::fn_item(db, def)?;

@@ -1,5 +1,6 @@
 //! Utilities for computing drop info about types.
 
+use base_db::Db;
 use hir_def::{AdtId, ImplId, signatures::StructFlags};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
@@ -17,7 +18,7 @@ use crate::{
 };
 
 #[salsa::tracked]
-pub fn destructor(db: &dyn HirDatabase, adt: AdtId) -> Option<ImplId> {
+pub fn destructor(db: &Db, adt: AdtId) -> Option<ImplId> {
     let module = match adt {
         AdtId::EnumId(id) => id.loc(db).container,
         AdtId::StructId(id) => id.loc(db).container,

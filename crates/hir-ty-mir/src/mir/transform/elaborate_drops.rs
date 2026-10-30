@@ -19,6 +19,7 @@ use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 
 use crate::{
+    db::HirDatabase,
     consteval::try_const_usize,
     mir::{
         BasicBlock, BasicBlockId, BorrowKind, FieldIndex, Local, LocalId, MirBody, MirLowerError,
@@ -727,6 +728,7 @@ impl<'db> Elaborator<'_, 'db> {
                     }
                     let discr = db
                         .const_eval_discriminant(variant)
+                        // alloc: error path
                         .map_err(|e| MirLowerError::NotSupported(format!("discriminant: {e:?}")))?;
                     values.push(discr as u128);
                     blocks.push(self.drop_ladder(fields, path, succ, unwind)?.0);

@@ -10,7 +10,7 @@
 
 use std::{any::Any, sync::Arc};
 
-use base_db::{Crate, Env, SourceDatabase, all_crates};
+use base_db::{Db, Crate, Env, all_crates};
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
@@ -82,29 +82,9 @@ pub fn load(root: FileId, text: &str, edition: Edition) -> Vec<ProcMacro> {
         })
         .collect()
 }
-
-/// Lets `db` run const macros: their expander is given the database as a `SourceDatabase`,
-/// and the evaluator needs it as a `HirDatabase`.
-pub fn enable(db: &dyn HirDatabase) {
-    HirDatabase::zalsa_register_downcaster(db);
-}
-
-/// `db` as the `HirDatabase` it is.
-///
-/// # Panics
-///
-/// When [`enable`] was not called on `db`.
-fn hir_db(db: &dyn SourceDatabase) -> &dyn HirDatabase {
-    let caster = salsa::plumbing::views(db).downcaster_for::<dyn HirDatabase>();
-    // SAFETY: `views(db)` is `db`'s own registry, so its caster for `dyn HirDatabase` was
-    // registered for `db`'s concrete type (by `enable`, through `zalsa_register_downcaster`),
-    // which is the type `db.into()` erases; `downcaster_for` panics if none was.
-    unsafe { caster.downcast_unchecked(db.into()) }
-}
-
 impl ConstMacroExpander {
     /// The macro crate and the function that is the macro.
-    pub(crate) fn function(&self, db: &dyn SourceDatabase) -> Result<(Crate, FunctionId), String> {
+    pub(crate) fn function(&self, db: &Db) -> Result<(Crate, FunctionId), String> {
         let krate = all_crates(db)
             .iter()
             .copied()
@@ -133,7 +113,7 @@ impl ConstMacroExpander {
     /// What each parameter of `func`, of the macro crate `krate`, takes.
     fn params(
         &self,
-        db: &dyn HirDatabase,
+        db: &Db,
         krate: Crate,
         func: FunctionId,
     ) -> Result<Vec<Param>, String> {
@@ -174,7 +154,7 @@ enum Param {
 
 /// The `Item` view of the `const_ast` the macro crate `krate` depends on, if it does, which is
 /// blaze's own copy.
-fn const_ast_item(db: &dyn HirDatabase, krate: Crate) -> Result<Option<StructId>, String> {
+fn const_ast_item(db: &Db, krate: Crate) -> Result<Option<StructId>, String> {
     let Some(dep) =
         krate.data(db).dependencies.iter().find(|it| it.name.as_str() == CONST_AST_NAME)
     else {
@@ -248,7 +228,7 @@ fn flat_input(
 impl ProcMacroExpander for ConstMacroExpander {
     fn expand(
         &self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         subtree: &tt::TopSubtree,
         attrs: Option<&tt::TopSubtree>,
         _env: &Env,
@@ -258,7 +238,7 @@ impl ProcMacroExpander for ConstMacroExpander {
         _current_dir: String,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let (krate, func) = self.function(db).map_err(ProcMacroExpansionError::System)?;
-        let hir = hir_db(db);
+        let hir = db;
         let edition = krate.data(db).edition;
         let params = self.params(hir, krate, func).map_err(ProcMacroExpansionError::Panic)?;
         let inputs: Vec<&tt::TopSubtree> = attrs.into_iter().chain([subtree]).collect();

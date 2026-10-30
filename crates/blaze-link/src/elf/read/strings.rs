@@ -44,10 +44,7 @@ impl<'data> Table<'data> {
         let mut before = Vec::with_capacity(words);
         let mut count = 0u32;
         for chunk in bytes.chunks(64) {
-            let mut word = 0u64;
-            for (bit, &byte) in chunk.iter().enumerate() {
-                word |= u64::from(byte == 0) << bit;
-            }
+            let word = nul_mask(chunk);
             nuls.push(word);
             before.push(count);
             count += word.count_ones();
@@ -56,6 +53,7 @@ impl<'data> Table<'data> {
             bytes,
             nuls,
             before,
+            // alloc: once per string table, a slot per string
             strings: vec![UNSEEN; count as usize],
             pushed: Vec::with_capacity(count as usize),
         })
@@ -148,5 +146,82 @@ impl<'data> Table<'data> {
         let word = nul / 64;
         let below = self.nuls[word] & ((1u64 << (nul % 64)) - 1);
         self.before[word] as usize + below.count_ones() as usize
+    }
+}
+
+/// Bit `i` set exactly where `chunk[i]` (at most 64 bytes) is NUL: eight bytes a step, about
+/// 9 integer operations where a byte at a time takes 32.
+fn nul_mask(chunk: &[u8]) -> u64 {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // Bit 8k (k = 0..8) times this lands on bit 56 + k, every other product on a bit of its
+    // own outside 56..64, so nothing carries into the top byte.
+    const GATHER: u64 = 0x0102_0408_1020_4080;
+    debug_assert!(chunk.len() <= 64);
+    let mut word = 0u64;
+    let mut lanes = chunk.chunks_exact(8);
+    for (lane, bytes) in (&mut lanes).enumerate() {
+        let x = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
+        // A byte's high bit ends up set exactly when the byte is 0: its low 7 bits plus 0x7f
+        // reach the high bit unless they are 0, without carrying out of the byte, and `| x`
+        // covers a set high bit.
+        let zero = !((x & LOW7).wrapping_add(LOW7) | x | LOW7);
+        word |= ((zero >> 7).wrapping_mul(GATHER) >> 56) << (8 * lane);
+    }
+    let tail = lanes.remainder();
+    let start = chunk.len() - tail.len();
+    for (bit, &byte) in tail.iter().enumerate() {
+        word |= u64::from(byte == 0) << (start + bit);
+    }
+    word
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nul_mask;
+
+    /// The byte-at-a-time loop the table was built with before.
+    fn reference(chunk: &[u8]) -> u64 {
+        let mut word = 0u64;
+        for (bit, &byte) in chunk.iter().enumerate() {
+            word |= u64::from(byte == 0) << bit;
+        }
+        word
+    }
+
+    #[test]
+    fn the_mask_is_the_byte_loop() {
+        // Every byte value at every place, beside a zero and a 0x80 (the carries' edge cases).
+        for value in 0..=255u8 {
+            for at in 0..64 {
+                for len in [at + 1, 64] {
+                    let mut chunk = [0x80u8; 64];
+                    chunk[at] = value;
+                    if at > 0 {
+                        chunk[at - 1] = 0;
+                    }
+                    let chunk = &chunk[..len];
+                    assert_eq!(nul_mask(chunk), reference(chunk), "{value:#x} at {at}, {len} bytes");
+                }
+            }
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (next() % 65) as usize;
+            let density = next() % 4;
+            let chunk: Vec<u8> = (0..len)
+                .map(|_| {
+                    let it = next();
+                    if it % 4 < density { 0 } else { (it >> 8) as u8 }
+                })
+                .collect();
+            assert_eq!(nul_mask(&chunk), reference(&chunk), "{chunk:?}");
+        }
+        assert_eq!(nul_mask(&[]), 0);
     }
 }

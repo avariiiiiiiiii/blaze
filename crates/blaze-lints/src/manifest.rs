@@ -93,4 +93,22 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn blazes_table_becomes_blaze_flags() {
+        let dir = std::env::temp_dir().join(format!("blaze-lints-blaze-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"m\"\n[lints.blaze]\nhot = \"deny\"\nstd_hashmap = { level = \"warn\", priority = 1 }\n[lints.clippy]\nall = \"warn\"\n",
+        )
+        .unwrap();
+        let found = lints(&manifest, &manifest).unwrap();
+        assert_eq!(
+            flags(&found),
+            ["--deny=blaze::hot", "--warn=clippy::all", "--warn=blaze::std_hashmap"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

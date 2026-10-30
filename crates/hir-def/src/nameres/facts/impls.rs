@@ -9,7 +9,7 @@
 //! their block modules' own lists: a block's def map is its own query, and the crate's buckets
 //! reach it through the bodies the module holds (hir-ty's `impl_holders`).
 
-use base_db::SourceDatabase;
+use base_db::Db;
 
 use crate::{BuiltinDeriveImplId, ImplId, ModuleId};
 
@@ -27,8 +27,7 @@ pub struct ModuleImpls {
 /// scope's own split (`ItemScope::trait_impls`, `ItemScope::inherent_impls`); a
 /// `#[rustc_reservation_impl]` is a trait impl here, left to the trait tables to skip as they do.
 #[salsa::tracked(returns(ref))]
-// dyn: the database type every hir-def query takes until frontend.md item 15 makes it concrete.
-pub fn module_impls(db: &dyn SourceDatabase, module: ModuleId) -> ModuleImpls {
+pub fn module_impls(db: &Db, module: ModuleId) -> ModuleImpls {
     let scope = module.def_map(db).module(db, module).scope(db);
     let all = scope.impls().len();
     let traits = scope.trait_impls().count();

@@ -140,3 +140,39 @@ technique for its part in its lane notes.
 
 > forwarded to db: `docs/v2/plan/lanes/db/` is lane db's notes folder.
 > applied by db: `docs/v2/plan/lanes/db/borrowck.md`, linked from `query-database.md`.
+
+## dedup: `relation.rs`'s counting sorts onto `blaze_ids::radix::Csr`
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_ids::radix::Csr<T>`
+(`crates/blaze-radix/src/csr.rs`) is now the one stable counting sort into compressed sparse rows:
+`Csr::build(rows, pairs)` walks a cloneable iterator of `(row: u32, item)` twice (count, then
+place at each row's cursor), `Csr::graph(nodes, edges)` gives each source's targets ascending
+(two passes, by target then by source), `dedup_rows()` drops repeats within a row, and
+`into_parts()` gives `(starts, items)` (`starts` has `rows + 1` entries). Its tests have the old
+copies as the proptest reference.
+
+`crates/hir-ty-borrowck/src/relation.rs`:
+
+- `Csr::build`'s body becomes
+
+```rust
+        let (start, items) = blaze_ids::radix::Csr::build(nodes, pairs).into_parts();
+        Csr { start, items }
+```
+
+- `Facts::freeze`: replace from `let mut start = vec![0u32; nodes as usize + 1];` through
+  `rewind(&mut start);` with
+
+```rust
+        let (start, items) =
+            blaze_ids::radix::Csr::build(nodes as usize, self.rows.iter().map(|fact| (node(fact) as u32, fact.b)))
+                .into_parts();
+```
+
+- Delete `fn starts` and `fn rewind` (no other users).
+- The module doc's "Freezing is a counting sort in place (count, prefix sum, scatter with the
+  start array as the cursor): two passes, and no allocation but the arrays it returns" becomes
+  "Freezing is `blaze_radix`'s counting sort (count, prefix sum, scatter): two passes, and no
+  allocation but the arrays it returns and its cursors".
+
+Why: one counting sort in the tree.

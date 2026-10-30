@@ -4,6 +4,8 @@
 use std::fmt::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use blaze_ids::rng::SplitMix64;
+
 use super::*;
 use crate::nameres::collector::{RESOLVE_IMPORT_CALLS, RESOLVE_STRATEGY, ResolveStrategy};
 
@@ -93,36 +95,6 @@ fn fixtures_are_found_without_expectations() {
     assert_eq!(fixtures(source).collect::<Vec<_>>(), ["\nuse a::b;\n"]);
 }
 
-/// xorshift64: the same graphs on every run and platform.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn one_in(&mut self, n: usize) -> bool {
-        self.below(n) == 0
-    }
-
-    fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
-        of[self.below(of.len())]
-    }
-}
-
 const TYPES: [&str; 4] = ["A", "B", "C", "E"];
 const FNS: [&str; 2] = ["f", "g"];
 const MACROS: [&str; 2] = ["mk", "mm"];
@@ -136,11 +108,11 @@ struct Module {
 /// A crate of `modules` modules, nested at random, each with items, `use`s (plain, renamed,
 /// globs of modules and enums, re-exports, `super` cycles) and `macro_rules!` that define
 /// items. Paths name modules of this crate and of `deps` and often do not resolve.
-fn random_crate(rng: &mut Rng, deps: &[String], out: &mut String) {
-    let count = 1 + rng.below(6);
+fn random_crate(rng: &mut SplitMix64, deps: &[String], out: &mut String) {
+    let count = 1 + rng.index(6);
     let mut modules = vec![Module { parent: None, children: Vec::new() }];
     for at in 1..count {
-        let parent = rng.below(at);
+        let parent = rng.index(at);
         modules.push(Module { parent: Some(parent), children: Vec::new() });
         modules[parent].children.push(at);
     }
@@ -148,7 +120,7 @@ fn random_crate(rng: &mut Rng, deps: &[String], out: &mut String) {
 }
 
 fn write_module(
-    rng: &mut Rng,
+    rng: &mut SplitMix64,
     deps: &[String],
     modules: &[Module],
     at: usize,
@@ -157,34 +129,34 @@ fn write_module(
 ) {
     let pad = "    ".repeat(depth);
     let in_root = modules[at].parent.is_none();
-    for _ in 0..rng.below(4) {
+    for _ in 0..rng.index(4) {
         let v = visibility(rng, in_root);
-        let written = match rng.below(5) {
-            0 => writeln!(out, "{pad}{v}struct {};", rng.pick(&TYPES)),
-            1 => writeln!(out, "{pad}{v}struct {} {{}}", rng.pick(&TYPES)),
-            2 => writeln!(out, "{pad}{v}enum {} {{ A, B(u8), C {{}} }}", rng.pick(&TYPES)),
-            3 => writeln!(out, "{pad}{v}fn {}() {{}}", rng.pick(&FNS)),
-            _ => writeln!(out, "{pad}{v}trait {} {{}}", rng.pick(&TYPES)),
+        let written = match rng.index(5) {
+            0 => writeln!(out, "{pad}{v}struct {};", rng.pick(&TYPES).unwrap()),
+            1 => writeln!(out, "{pad}{v}struct {} {{}}", rng.pick(&TYPES).unwrap()),
+            2 => writeln!(out, "{pad}{v}enum {} {{ A, B(u8), C {{}} }}", rng.pick(&TYPES).unwrap()),
+            3 => writeln!(out, "{pad}{v}fn {}() {{}}", rng.pick(&FNS).unwrap()),
+            _ => writeln!(out, "{pad}{v}trait {} {{}}", rng.pick(&TYPES).unwrap()),
         };
         written.unwrap();
     }
     if rng.one_in(3) {
-        let name = rng.pick(&MACROS);
+        let name = rng.pick(&MACROS).unwrap();
         if rng.one_in(2) {
             writeln!(out, "{pad}#[macro_export]").unwrap();
         }
-        let item = rng.pick(&TYPES);
+        let item = rng.pick(&TYPES).unwrap();
         writeln!(out, "{pad}macro_rules! {name} {{ () => {{ pub struct {item}; }} }}").unwrap();
         writeln!(out, "{pad}{name}!();").unwrap();
     }
     if rng.one_in(4) {
-        writeln!(out, "{pad}{}!();", rng.pick(&MACROS)).unwrap();
+        writeln!(out, "{pad}{}!();", rng.pick(&MACROS).unwrap()).unwrap();
     }
-    for _ in 0..rng.below(5) {
+    for _ in 0..rng.index(5) {
         let v = visibility(rng, in_root);
         let path = random_path(rng, deps, modules, at);
-        let alias = match rng.below(6) {
-            0 => format!(" as {}", rng.pick(&TYPES)),
+        let alias = match rng.index(6) {
+            0 => format!(" as {}", rng.pick(&TYPES).unwrap()),
             1 => " as _".to_owned(),
             _ => String::new(),
         };
@@ -202,8 +174,8 @@ fn write_module(
     }
 }
 
-fn visibility(rng: &mut Rng, in_root: bool) -> &'static str {
-    match rng.below(if in_root { 3 } else { 5 }) {
+fn visibility(rng: &mut SplitMix64, in_root: bool) -> &'static str {
+    match rng.index(if in_root { 3 } else { 5 }) {
         0 => "",
         1 => "pub ",
         2 => "pub(crate) ",
@@ -214,36 +186,36 @@ fn visibility(rng: &mut Rng, in_root: bool) -> &'static str {
 
 /// A path from module `at`: a start (`crate`, `self`, `super`, a dependency, a plain name),
 /// up to two module names, and an item, a variant or a glob.
-fn random_path(rng: &mut Rng, deps: &[String], modules: &[Module], at: usize) -> String {
-    let mut path = match rng.below(5) {
+fn random_path(rng: &mut SplitMix64, deps: &[String], modules: &[Module], at: usize) -> String {
+    let mut path = match rng.index(5) {
         0 => "crate".to_owned(),
         1 => "self".to_owned(),
         2 if modules[at].parent.is_some() => "super".to_owned(),
-        3 if !deps.is_empty() => deps[rng.below(deps.len())].clone(),
-        _ => format!("m{}", rng.below(modules.len())),
+        3 if !deps.is_empty() => deps[rng.index(deps.len())].clone(),
+        _ => format!("m{}", rng.index(modules.len())),
     };
-    for _ in 0..rng.below(3) {
-        write!(path, "::m{}", rng.below(modules.len())).unwrap();
+    for _ in 0..rng.index(3) {
+        write!(path, "::m{}", rng.index(modules.len())).unwrap();
     }
-    match rng.below(8) {
+    match rng.index(8) {
         0 | 1 => path.push_str("::*"),
-        2 => write!(path, "::{}::*", rng.pick(&TYPES)).unwrap(),
-        3 => write!(path, "::{}::A", rng.pick(&TYPES)).unwrap(),
-        4 => write!(path, "::{}", rng.pick(&FNS)).unwrap(),
-        5 => write!(path, "::{}", rng.pick(&MACROS)).unwrap(),
-        _ => write!(path, "::{}", rng.pick(&TYPES)).unwrap(),
+        2 => write!(path, "::{}::*", rng.pick(&TYPES).unwrap()).unwrap(),
+        3 => write!(path, "::{}::A", rng.pick(&TYPES).unwrap()).unwrap(),
+        4 => write!(path, "::{}", rng.pick(&FNS).unwrap()).unwrap(),
+        5 => write!(path, "::{}", rng.pick(&MACROS).unwrap()).unwrap(),
+        _ => write!(path, "::{}", rng.pick(&TYPES).unwrap()).unwrap(),
     }
     path
 }
 
 /// A fixture of 1-4 crates, each depending on some of the ones before it.
 fn random_graph(seed: u64) -> String {
-    let mut rng = Rng::new(seed);
+    let mut rng = SplitMix64::new(seed);
     let mut out = String::new();
-    let crates = 1 + rng.below(4);
+    let crates = 1 + rng.index(4);
     for at in 0..crates {
         let deps: Vec<String> = (0..at).filter(|_| rng.one_in(2)).map(|it| format!("c{it}")).collect();
-        let edition = match rng.below(4) {
+        let edition = match rng.index(4) {
             0 => " edition:2015",
             1 => " edition:2018",
             _ => " edition:2021",
@@ -254,7 +226,7 @@ fn random_graph(seed: u64) -> String {
         }
         out.push('\n');
         if !deps.is_empty() && rng.one_in(3) {
-            writeln!(out, "#[macro_use] extern crate {};", deps[rng.below(deps.len())]).unwrap();
+            writeln!(out, "#[macro_use] extern crate {};", deps[rng.index(deps.len())]).unwrap();
         }
         random_crate(&mut rng, &deps, &mut out);
     }

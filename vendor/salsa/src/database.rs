@@ -10,6 +10,7 @@ use crate::{Durability, Revision};
 #[repr(transparent)]
 pub struct RawDatabase<'db> {
     pub(crate) ptr: NonNull<()>,
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     _marker: std::marker::PhantomData<&'db dyn Database>,
 }
 
@@ -106,6 +107,16 @@ pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
         zalsa.unwind_if_revision_cancelled(zalsa_local);
     }
 
+    /// How many tasks the current thread runs below the one it runs now: each task has its own
+    /// query stack, and its claims and waits are its own, so a task that asks for a query a
+    /// task below it runs unwinds with [`Cancelled::WouldWaitOnItself`](crate::Cancelled)
+    /// instead of waiting forever. The default, 0, is one task per thread; a database whose
+    /// threads pump other tasks while they wait (blaze's work pool) overrides it.
+    #[inline]
+    fn task_depth(&self) -> u32 {
+        0
+    }
+
     /// Execute `op` with the database in thread-local storage for debug print-outs.
     #[inline(always)]
     fn attach<R>(&self, op: impl FnOnce(&Self) -> R) -> R
@@ -118,13 +129,16 @@ pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
     #[cold]
     #[inline(never)]
     #[doc(hidden)]
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     fn zalsa_register_downcaster(&self) -> &DatabaseDownCaster<dyn Database> {
+        // dyn: the edge: salsa's public database handle, one vtable call per query entry
         self.zalsa().views().downcaster_for::<dyn Database>()
         // The no-op downcaster is special cased in view caster construction.
     }
 
     #[doc(hidden)]
     #[inline(always)]
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     fn downcast(&self) -> &dyn Database
     where
         Self: Sized,
@@ -138,11 +152,13 @@ pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
 ///
 /// Only required because upcasting does not work for unsized generic parameters.
 pub trait AsDynDatabase {
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     fn as_dyn_database(&self) -> &dyn Database;
 }
 
 impl<T: Database> AsDynDatabase for T {
     #[inline(always)]
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     fn as_dyn_database(&self) -> &dyn Database {
         self
     }
@@ -163,6 +179,7 @@ mod persistence {
     use serde::de::{self, DeserializeSeed, SeqAccess};
     use serde::ser::SerializeMap;
 
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     impl dyn Database {
         /// Returns a type implementing [`serde::Serialize`], that can be used to serialize the
         /// current state of the database.
@@ -192,6 +209,7 @@ mod persistence {
 
     impl<'db> SerializeDatabase<'db> {
         /// Acquires exclusive storage access for the lifetime of the serializer.
+        // dyn: the edge: salsa's public database handle, one vtable call per query entry
         fn new(db: &'db mut dyn Database) -> Self {
             let zalsa = db.zalsa_mut();
             Self {
@@ -213,6 +231,7 @@ mod persistence {
             let mut ingredients = zalsa
                 .ingredients()
                 .filter(|ingredient| ingredient.should_serialize(zalsa))
+                // alloc: the edge: persistence, once per serialized database
                 .collect::<Vec<_>>();
 
             // Ensure structs are serialized before tracked functions, as deserializing a
@@ -231,6 +250,7 @@ mod persistence {
         }
     }
 
+    // alloc: the edge: persistence, once per serialized database
     struct SerializeIngredient<'db>(&'db dyn Ingredient, &'db Zalsa);
 
     impl serde::Serialize for SerializeIngredient<'_> {
@@ -379,6 +399,7 @@ mod persistence {
         }
     }
 
+    // alloc: the edge: persistence, once per serialized database
     struct DeserializeIngredient<'db>(&'db mut dyn Ingredient, &'db mut Zalsa);
 
     impl<'de> serde::de::DeserializeSeed<'de> for DeserializeIngredient<'_> {
@@ -409,6 +430,7 @@ mod memory_usage {
 
     use crate::Database;
 
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     impl dyn Database {
         /// Returns memory usage information about ingredients in the database.
         ///
@@ -417,6 +439,7 @@ mod memory_usage {
         pub fn memory_usage(&mut self) -> DatabaseInfo {
 
             let mut queries = HashMap::new();
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             let mut structs = Vec::new();
             let mut page_infos = self.zalsa().table().page_infos();
             let page_capacity = self.zalsa().table().page_capacity();

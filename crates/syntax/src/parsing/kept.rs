@@ -28,10 +28,8 @@ pub(crate) fn take(key: u32) -> Option<Parse<SourceFile>> {
 
 /// Keeps `parse` as the last of `key`, in place of what its slot held.
 pub(crate) fn keep(key: u32, parse: &Parse<SourceFile>) {
-    let replaced = slot(key)
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .replace((key, parse.clone()));
+    let replaced =
+        slot(key).lock().unwrap_or_else(PoisonError::into_inner).replace((key, parse.clone()));
     // Dropped after the lock: a tree let go of goes to the drop thread.
     drop(replaced);
 }
@@ -40,7 +38,7 @@ pub(crate) fn keep(key: u32, parse: &Parse<SourceFile>) {
 mod tests {
     use parser::Edition;
 
-    use crate::SourceFile;
+    use crate::{SourceFile, Text};
 
     /// Each parse of a file made by `parse_file` from the last one is the whole parse of the
     /// text: a run of edits, then a key whose slot another file took, then the kind changed.
@@ -59,9 +57,9 @@ mod tests {
         let key = 7 + super::SLOTS as u32 * 3;
         for outline in [false, true] {
             for text in texts {
-                let made = SourceFile::parse_file(key, text.into(), Edition::CURRENT, outline);
+                let made = SourceFile::parse_file(key, Text::from(text), Edition::CURRENT, outline);
                 let whole = match outline {
-                    true => SourceFile::parse_outline(text.into(), Edition::CURRENT),
+                    true => SourceFile::parse_outline(Text::from(text), Edition::CURRENT),
                     false => SourceFile::parse(text, Edition::CURRENT),
                 };
                 assert_eq!(made.is_outline(), outline);
@@ -75,8 +73,22 @@ mod tests {
             }
             // Another file in the same slot: the next parse of `key` is a whole one.
             let other = key + super::SLOTS as u32;
-            SourceFile::parse_file(other, "fn other() {}".into(), Edition::CURRENT, outline);
+            SourceFile::parse_file(other, "fn other() {}", Edition::CURRENT, outline);
             assert!(super::take(key).is_none());
         }
+    }
+
+    /// Looking a parse up and keeping one allocate nothing: a slot holds the parse's handles.
+    #[test]
+    fn taking_and_keeping_allocate_nothing() {
+        let key = 11 + super::SLOTS as u32 * 5;
+        let parse = SourceFile::parse("fn f() { 1 }\n", Edition::CURRENT);
+        super::keep(key, &parse);
+        let taken =
+            blaze_alloc_count::assert_at_most(0, "a kept parse looked up", || super::take(key));
+        assert!(taken.is_some());
+        blaze_alloc_count::assert_at_most(0, "a parse kept in place of itself", || {
+            super::keep(key, &parse)
+        });
     }
 }

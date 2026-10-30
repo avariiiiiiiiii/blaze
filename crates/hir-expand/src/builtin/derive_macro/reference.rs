@@ -18,12 +18,12 @@ use crate::{
 use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasGenericParams, HasName, HasTypeBounds};
 
 /// Where the old derives read the item from, in the database's place.
-pub(super) trait SourceDatabase {
+pub(super) trait ItemSource {
     fn adt(&self) -> (&ast::Adt, &span::SpanMap);
 }
 
 fn parse_adt(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     _: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
@@ -485,7 +485,7 @@ pub(super) fn name_to_token(
     Ok(name_token)
 }
 pub(super) fn expand_simple_derive(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     invoc_span: Span,
     tt: &tt::TopSubtree,
     trait_path: tt::TopSubtree,
@@ -585,7 +585,7 @@ pub(super) fn expand_simple_derive_with_parsed(
 }
 
 pub(super) fn copy_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -604,7 +604,7 @@ pub(super) fn copy_expand(
 /// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
 /// macro in `core::marker`.
 pub(super) fn const_param_ty_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -620,7 +620,7 @@ pub(super) fn const_param_ty_expand(
     )
 }
 pub(super) fn reborrow_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -634,7 +634,7 @@ pub(super) fn reborrow_expand(
     )
 }
 pub(super) fn expand_reborrow_marker_derive(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
     trait_path: tt::TopSubtree,
@@ -666,7 +666,7 @@ pub(super) fn expand_reborrow_marker_derive(
     ))
 }
 pub(super) fn clone_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -676,7 +676,7 @@ pub(super) fn clone_expand(
 /// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
 /// that has no type parameters.
 pub(super) fn clone_expand_with(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
     copy: bool,
@@ -743,7 +743,7 @@ pub(super) fn eq_eq(span: Span) -> tt::TopSubtree {
 }
 
 pub(super) fn default_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -808,7 +808,7 @@ pub(super) fn default_expand(
 }
 
 pub(super) fn debug_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -897,7 +897,7 @@ pub(super) fn last_by_ref(adt: &BasicAdtInfo, span: Span, last: bool) -> tt::Top
 }
 
 pub(super) fn hash_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -944,7 +944,7 @@ pub(super) fn hash_expand(
 }
 
 pub(super) fn eq_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -961,7 +961,7 @@ pub(super) fn eq_expand(
 }
 
 pub(super) fn partial_eq_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1065,7 +1065,7 @@ pub(super) fn self_and_other_patterns(
 }
 
 pub(super) fn ord_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1120,7 +1120,7 @@ pub(super) fn ord_expand(
 }
 
 pub(super) fn partial_ord_expand(
-    db: &dyn SourceDatabase,
+    db: &dyn ItemSource,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {

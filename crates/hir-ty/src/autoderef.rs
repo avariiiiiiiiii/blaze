@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use base_db::Db;
 use hir_def::{TraitId, TypeAliasId};
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use tracing::debug;
@@ -37,7 +38,7 @@ const AUTODEREF_RECURSION_LIMIT: usize = 20;
 /// - a type won't be yielded more than once; in other words, the returned iterator will stop if it
 ///   detects a cycle in the deref chain.
 pub fn autoderef<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     ty: Canonical<'db, Ty<'db>>,
 ) -> impl Iterator<Item = Ty<'db>> + use<'db> {
@@ -49,7 +50,7 @@ pub fn autoderef<'db>(
     for (ty, _steps) in autoderef {
         // `ty` may contain unresolved inference variables. Since there's no chance they would be
         // resolved, just replace with fallback type.
-        let resolved = infcx.resolve_vars_if_possible(ty).replace_infer_with_error(interner);
+        let resolved = infcx.deeply_resolve_ignoring_regions(ty).replace_infer_with_error(interner);
 
         // If the deref chain contains a cycle (e.g. `A` derefs to `B` and `B` derefs to `A`), we
         // would revisit some already visited types. Stop here to avoid duplication.
@@ -199,7 +200,7 @@ where
         // and Deref, and this has benefits for const and the emitted MIR.
         let (kind, new_ty) =
             if let Some(ty) = self.state.cur_ty.builtin_deref(self.include_raw_pointers) {
-                debug_assert_eq!(ty, self.infcx().resolve_vars_if_possible(ty));
+                debug_assert_eq!(ty, self.infcx().deeply_resolve_ignoring_regions(ty));
                 // NOTE: we may still need to normalize the built-in deref in case
                 // we have some type like `&<Ty as Trait>::Assoc`, since users of
                 // autoderef expect this type to have been structurally normalized.
@@ -280,7 +281,7 @@ where
         GeneralAutoderef {
             state: AutoderefSnapshot {
                 steps: Steps::default(),
-                cur_ty: ctx.infcx().resolve_vars_if_possible(base_ty),
+                cur_ty: ctx.infcx().deeply_resolve_ignoring_regions(base_ty),
                 obligations: PredicateObligations::new(),
                 at_start: true,
                 reached_recursion_limit: false,
@@ -365,7 +366,7 @@ where
         debug!("overloaded_deref_ty({:?}) = ({:?}, {:?})", ty, normalized_ty, obligations);
         self.state.obligations.extend(obligations);
 
-        Some(self.infcx().resolve_vars_if_possible(normalized_ty))
+        Some(self.infcx().deeply_resolve_ignoring_regions(normalized_ty))
     }
 
     /// Returns the final type we ended up with, which may be an unresolved

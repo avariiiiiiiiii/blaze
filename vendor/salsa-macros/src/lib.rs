@@ -18,6 +18,7 @@ macro_rules! parse_quote {
     ($($inp:tt)*) => {
         {
             let tt = quote!{$($inp)*};
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             syn::parse2(tt.clone()).unwrap_or_else(|err| {
                 panic!("failed to parse `{}` at {}:{}:{}: {}", tt, file!(), line!(), column!(), err)
             })
@@ -30,6 +31,7 @@ macro_rules! parse_quote {
 /// with incomplete code.
 macro_rules! parse_macro_input {
     ($tokenstream:ident as $ty:ty) => {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         match syn::parse::<$ty>($tokenstream.clone()) {
             Ok(data) => data,
             Err(err) => {

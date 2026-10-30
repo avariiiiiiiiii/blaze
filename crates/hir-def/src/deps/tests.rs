@@ -1,4 +1,4 @@
-use std::{cell::RefCell, sync::Arc, sync::Mutex};
+use std::{sync::Arc, sync::Mutex};
 
 use base_db::Crate;
 use blaze_format::Aligned;
@@ -39,7 +39,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::derive; } }
 "#;
 
 /// The differences frozen bytes record are the process's: the tests that read them take turns.
-static TURN: Mutex<()> = Mutex::new(());
+pub(super) static TURN: Mutex<()> = Mutex::new(());
 
 const BUILD: ContentId = ContentId([7; 32]);
 
@@ -53,18 +53,18 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.
 #[derive(Default)]
 struct Memory {
-    images: RefCell<FxHashMap<ContentId, Arc<Aligned>>>,
-    gets: RefCell<usize>,
+    images: Mutex<FxHashMap<ContentId, Arc<Aligned>>>,
+    gets: Mutex<usize>,
 }
 
 impl ImageStore for Memory {
     fn get(&self, key: &ContentId) -> Result<Option<Arc<Aligned>>, String> {
-        *self.gets.borrow_mut() += 1;
-        Ok(self.images.borrow().get(key).cloned())
+        *self.gets.lock().unwrap() += 1;
+        Ok(self.images.lock().unwrap().get(key).cloned())
     }
 
     fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
-        let mut images = self.images.borrow_mut();
+        let mut images = self.images.lock().unwrap();
         match images.get(&key) {
             Some(kept) if **kept != *image => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
@@ -275,9 +275,9 @@ fn an_image_written_under_another_key_is_an_error() {
     let lib = crate_named(&db, "lib");
     let key = keys(&db, &[lib], BUILD)[&lib];
     let other = ContentId([3; 32]);
-    let image = memory.images.borrow()[&key].clone();
-    memory.images.borrow_mut().insert(other, image.clone());
-    memory.images.borrow_mut().insert(key, Arc::new(Aligned::copy_from(&write_image(
+    let image = memory.images.lock().unwrap()[&key].clone();
+    memory.images.lock().unwrap().insert(other, image.clone());
+    memory.images.lock().unwrap().insert(key, Arc::new(Aligned::copy_from(&write_image(
         other,
         [b"", b"", b""],
     ))));
@@ -315,9 +315,70 @@ fn a_crate_with_no_outside_input_is_not_refused() {
 fn serving_asks_the_store_once_a_crate() {
     let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
     let (memory, _) = stored(FIXTURE);
-    *memory.gets.borrow_mut() = 0;
+    *memory.gets.lock().unwrap() = 0;
     let mut db = TestDB::with_files(FIXTURE);
     let crates = all(&db);
     serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
-    assert_eq!(*memory.gets.borrow(), 2);
+    assert_eq!(*memory.gets.lock().unwrap(), 2);
+}
+
+/// [`Memory`] whose tasks run on four threads, each taking every fourth.
+#[derive(Default)]
+struct Threads(Memory);
+
+impl ImageStore for Threads {
+    fn get(&self, key: &ContentId) -> Result<Option<Arc<Aligned>>, String> {
+        self.0.get(key)
+    }
+
+    fn put(&self, key: ContentId, image: Vec<u8>) -> Result<(), String> {
+        self.0.put(key, image)
+    }
+
+    fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
+        std::thread::scope(|scope| {
+            for first in 0..4 {
+                scope.spawn(move || (first..count).step_by(4).for_each(task));
+            }
+        });
+    }
+}
+
+#[test]
+fn tasks_on_threads_store_and_serve_as_in_order() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let (memory, _) = stored(FIXTURE);
+    let threads = Threads::default();
+    let mut db = TestDB::with_files(FIXTURE);
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
+    let stored = store(&db, &served, &threads).unwrap();
+    assert_eq!(names(&db, &stored.written), ["core", "lib"]);
+    assert_eq!(contents(&threads.0), contents(&memory));
+    let mut db = TestDB::with_files(FIXTURE);
+    let served = serve(&mut db, &crates, BUILD, &threads, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &served.hits), ["core", "lib"]);
+}
+
+/// A served image's parts are slices of the buffer the store gave, not copies.
+#[test]
+fn served_parts_are_the_store_s_bytes() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    let (memory, _) = stored(FIXTURE);
+    let mut db = TestDB::with_files(FIXTURE);
+    let crates = all(&db);
+    serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let lib = crate_named(&db, "lib");
+    let key = keys(&db, &[lib], BUILD)[&lib];
+    let kept = memory.images.lock().unwrap()[&key].clone();
+    let part = image(&db, lib).unwrap().part(Part::Signatures);
+    assert!(kept.as_ptr_range().contains(&part.as_ptr()) || part.is_empty());
+}
+
+/// What `memory` keeps, by key.
+fn contents(memory: &Memory) -> Vec<(ContentId, Vec<u8>)> {
+    let mut kept: Vec<_> =
+        memory.images.lock().unwrap().iter().map(|(&key, bytes)| (key, bytes.to_vec())).collect();
+    kept.sort();
+    kept
 }

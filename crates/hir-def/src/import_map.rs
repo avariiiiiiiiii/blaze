@@ -2,7 +2,7 @@
 
 use std::{cmp::Ordering, fmt};
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir_expand::name::Name;
 use indexmap::IndexSet;
@@ -77,13 +77,13 @@ enum IsTraitAssocItem {
 #[salsa::tracked]
 impl ImportMap {
     #[salsa::tracked(returns(ref))]
-    pub fn of(db: &dyn SourceDatabase, krate: Crate) -> Self {
+    pub fn of(db: &Db, krate: Crate) -> Self {
         Self::import_map_query_impl(db, krate)
     }
 }
 
 impl ImportMap {
-    pub fn dump(&self, db: &dyn SourceDatabase) -> String {
+    pub fn dump(&self, db: &Db) -> String {
         let mut out = String::new();
         for (row, item) in self.items.iter().enumerate() {
             format_to!(out, "{:?} ({:?}) -> ", item, self.is_trait_assoc_item(row));
@@ -95,7 +95,7 @@ impl ImportMap {
         out
     }
 
-    fn import_map_query_impl(db: &dyn SourceDatabase, krate: Crate) -> Self {
+    fn import_map_query_impl(db: &Db, krate: Crate) -> Self {
         let _p = tracing::info_span!("import_map_query").entered();
 
         let found = Collector::collect(db, krate);
@@ -213,7 +213,7 @@ impl Collector {
         self.infos.push((row as u32, info));
     }
 
-    fn collect(db: &dyn SourceDatabase, krate: Crate) -> Collector {
+    fn collect(db: &Db, krate: Crate) -> Collector {
         let _p = tracing::info_span!("collect_import_map").entered();
 
         let def_map = crate_def_map(db, krate);
@@ -260,7 +260,7 @@ impl Collector {
 
     fn visit(
         &mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         worklist: &mut Vec<ModuleId>,
         name: Name,
         module: ModuleId,
@@ -334,7 +334,7 @@ impl Collector {
 
     fn collect_enum_variants(
         &mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         enum_: EnumId,
         enum_import_info: &ImportInfo,
     ) {
@@ -355,7 +355,7 @@ impl Collector {
 
     fn collect_trait_assoc_items(
         &mut self,
-        db: &dyn SourceDatabase,
+        db: &Db,
         tr: TraitId,
         is_type_in_ns: bool,
         trait_import_info: &ImportInfo,
@@ -562,7 +562,7 @@ impl Query {
 ///
 /// This returns a list of items that could be imported from dependencies of `krate`.
 pub fn search_dependencies(
-    db: &dyn SourceDatabase,
+    db: &Db,
     krate: Crate,
     query: &Query,
 ) -> FxHashSet<(ItemInNs, Complete)> {
@@ -602,7 +602,7 @@ pub fn search_dependencies(
 }
 
 fn search_maps(
-    _db: &dyn SourceDatabase,
+    _db: &Db,
     import_maps: &[&ImportMap],
     mut stream: fst::map::Union<'_>,
     query: &Query,
@@ -642,7 +642,7 @@ mod tests {
     use super::*;
 
     impl ImportMap {
-        fn fmt_for_test(&self, db: &dyn SourceDatabase) -> String {
+        fn fmt_for_test(&self, db: &Db) -> String {
             let mut importable_paths: Vec<_> = self
                 .items
                 .iter()
@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn assoc_item_path(
-        db: &dyn SourceDatabase,
+        db: &Db,
         dependency_imports: &ImportMap,
         dependency: ItemInNs,
     ) -> Option<String> {
@@ -770,7 +770,7 @@ mod tests {
         expect.assert_eq(&actual)
     }
 
-    fn render_path(db: &dyn SourceDatabase, info: &ImportInfo) -> String {
+    fn render_path(db: &Db, info: &ImportInfo) -> String {
         let mut module = info.container;
         let mut segments = vec![&info.name];
 
@@ -1232,7 +1232,7 @@ pub mod fmt {
     /// infos, importables as `(item, index in the SmallVec)`, the FST keys lowercased into a
     /// `String` each. The model the differential test compares with.
     mod reference {
-        use base_db::{Crate, SourceDatabase};
+        use base_db::{Crate, Db};
         use fst::{Automaton, Streamer, raw::IndexedValue};
         use itertools::Itertools;
         use rustc_hash::FxHashSet;
@@ -1256,7 +1256,7 @@ pub mod fmt {
             pub(super) fst: fst::Map<Vec<u8>>,
         }
 
-        pub(super) fn build(db: &dyn SourceDatabase, krate: Crate) -> OldImportMap {
+        pub(super) fn build(db: &Db, krate: Crate) -> OldImportMap {
             let map = collect(db, krate);
             let mut importables: Vec<_> = map
                 .iter()
@@ -1296,7 +1296,7 @@ pub mod fmt {
             OldImportMap { map, fst: builder.into_map(), importables }
         }
 
-        fn collect(db: &dyn SourceDatabase, krate: Crate) -> Index {
+        fn collect(db: &Db, krate: Crate) -> Index {
             let def_map = crate_def_map(db, krate);
             let mut map = FxIndexMap::default();
             let root = def_map.root_module_id();
@@ -1389,7 +1389,7 @@ pub mod fmt {
         }
 
         fn collect_enum_variants(
-            db: &dyn SourceDatabase,
+            db: &Db,
             map: &mut Index,
             enum_: EnumId,
             enum_import_info: &ImportInfo,
@@ -1411,7 +1411,7 @@ pub mod fmt {
         }
 
         fn collect_trait_assoc_items(
-            db: &dyn SourceDatabase,
+            db: &Db,
             map: &mut Index,
             tr: TraitId,
             is_type_in_ns: bool,
@@ -1491,7 +1491,7 @@ pub mod fmt {
         }
 
         pub(super) fn search(
-            db: &dyn SourceDatabase,
+            db: &Db,
             krate: Crate,
             query: &Query,
         ) -> FxHashSet<(ItemInNs, Complete)> {
@@ -1646,15 +1646,15 @@ pub mod fmt {
 
     #[test]
     fn search_mode_against_reference_check() {
-        let mut rng = crate::find_path::tests::Rng::new(7);
+        let mut rng = blaze_ids::rng::SplitMix64::new(7);
         let alphabet = ['a', 'B', 'c', 'D', '_', '1', 'あ', 'é', 'É'];
-        let word = |rng: &mut crate::find_path::tests::Rng, len: usize| -> String {
-            (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect()
+        let word = |rng: &mut blaze_ids::rng::SplitMix64, len: usize| -> String {
+            (0..len).map(|_| alphabet[rng.index(alphabet.len())]).collect()
         };
         for _ in 0..4000 {
-            let query_len = rng.below(4);
+            let query_len = rng.index(4);
             let query = word(&mut rng, query_len);
-            let candidate_len = rng.below(7);
+            let candidate_len = rng.index(7);
             let candidate = word(&mut rng, candidate_len);
             for mode in [SearchMode::Exact, SearchMode::Fuzzy] {
                 for case_sensitive in [false, true] {

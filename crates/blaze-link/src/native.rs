@@ -41,8 +41,8 @@ use smallvec::SmallVec;
 
 use crate::cow::{CowList, CowVec, ListRef};
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Fixup, Import, Library, Name, Names, NativeFile, Object,
-    SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Writer,
+    Apply, Archive, Binding, Class, Data, Directive, Fixup, Formats, Import, Library, Name, Names, NativeFile,
+    Object, SectionKind, Shared, Special, Sym, Symbol, SymbolDef, SymbolKind, Tie, Writer,
 };
 use crate::stage::{Content, Stage, error};
 use crate::state::{Def, Input, PieceId, State, What};
@@ -93,6 +93,19 @@ fn makes_piece(what: &SectionKind) -> bool {
     matches!(what, SectionKind::Alloc(..) | SectionKind::Unwind(_))
 }
 
+/// Whether a section is kept only through another ([`Object::ties`], [`Object::live_support`]):
+/// it is no root, and no `__start_X` keeps it.
+#[inline]
+fn bound(object: &Object, section: u32) -> bool {
+    tie_of(object, section).is_some() || object.live_support.binary_search(&section).is_ok()
+}
+
+/// What `section` is tied to, if it is.
+#[inline]
+fn tie_of(object: &Object, section: u32) -> Option<Tie> {
+    object.ties.binary_search_by_key(&section, |it| it.section).ok().map(|it| object.ties[it])
+}
+
 /// A bitset, copied on write by chunk: a stage that marks a few more sections copies the
 /// words it writes.
 #[derive(Clone, Default)]
@@ -124,7 +137,7 @@ impl Bits {
 /// Names to `u32`s, open-addressed: a name is hashed once, compared only when the whole hash
 /// matches, and the first value given a name keeps it. The names live with the caller (`eq`
 /// compares a stored value's name with the one looked for).
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct Table {
     hashes: Vec<u64>,
     values: Vec<u32>,
@@ -134,6 +147,7 @@ pub(crate) struct Table {
 impl Table {
     fn with_capacity(len: usize) -> Table {
         let room = (len.max(4) * 2).next_power_of_two();
+        // alloc: its two columns, once per table (an archive's index, the exports, a build's groups)
         Table { hashes: vec![0; room], values: vec![NONE; room], len: 0 }
     }
 
@@ -186,6 +200,7 @@ impl Table {
 
     fn grow(&mut self) {
         let room = (self.values.len() * 2).max(8);
+        // alloc: doubling: amortized over the inserts, two columns per growth
         let old = std::mem::replace(self, Table { hashes: vec![0; room], values: vec![NONE; room], len: 0 });
         let mask = room - 1;
         for (hash, value) in old.hashes.into_iter().zip(old.values) {
@@ -226,8 +241,10 @@ struct Csr {
 }
 
 impl Csr {
-    /// From `(row, item)` pairs: each row's items in the pairs' order.
+    /// From `(row, item)` pairs: each row's items in the pairs' order. Two allocations, its
+    /// two columns.
     fn build(rows: usize, pairs: &[(u32, u32)]) -> Csr {
+        // alloc: the row starts, once per index built (an object read, a graph built)
         let mut at = vec![0u32; rows + 1];
         for (row, _) in pairs {
             at[*row as usize + 1] += 1;
@@ -235,19 +252,31 @@ impl Csr {
         for row in 0..rows {
             at[row + 1] += at[row];
         }
-        let mut next = at.clone();
+        // alloc: the items, once per index built
         let mut items = vec![0; pairs.len()];
         for (row, item) in pairs {
-            let slot = &mut next[*row as usize];
+            let slot = &mut at[*row as usize];
             items[*slot as usize] = *item;
             *slot += 1;
         }
+        // Each row's start was advanced to the next row's: shift them back.
+        for row in (1..=rows).rev() {
+            at[row] = at[row - 1];
+        }
+        at[0] = 0;
         Csr { at, items }
     }
 
     #[inline]
     fn get(&self, row: usize) -> &[u32] {
         &self.items[self.at[row] as usize..self.at[row + 1] as usize]
+    }
+
+    /// A row's items, none for a row past the index (one built with no rows when it would be
+    /// all empty).
+    #[inline]
+    fn row(&self, row: usize) -> &[u32] {
+        if row + 1 < self.at.len() { self.get(row) } else { &[] }
     }
 }
 
@@ -266,32 +295,44 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
     let (sections, symbols) = (object.sections.len(), object.symbols.len());
     for (at, section) in object.sections.iter().enumerate() {
         let Some(name) = names.get(section.name) else {
+            // alloc: error path
             return Err(format!("section {at} has a name outside the object's names"));
         };
-        if let Data::Input(range) = &section.data {
-            if range.start > range.end || range.end > len {
+        match &section.data {
+            Data::Input(range) if range.start > range.end || range.end > len => {
+                // alloc: error path
                 return Err(format!("{name}: bytes {range:?}, past the input's {len}"));
             }
+            Data::Made(range) if range.start > range.end || range.end > object.made.len() as u64 => {
+                // alloc: error path
+                return Err(format!("{name}: bytes {range:?}, past the {} the reader made", object.made.len()));
+            }
+            _ => {}
         }
         let fixups = &section.fixups;
         if fixups.start > fixups.end || fixups.end as usize > object.fixups.len() {
+            // alloc: error path
             return Err(format!("{name}: relocations {fixups:?}, past the object's {}", object.fixups.len()));
         }
     }
     for (at, fixup) in object.fixups.iter().enumerate() {
         if fixup.symbol as usize >= symbols || fixup.minus.is_some_and(|it| it as usize >= symbols) {
+            // alloc: error path
             return Err(format!("relocation {at} refers to a symbol past the object's {symbols}"));
         }
     }
     for (at, symbol) in object.symbols.iter().enumerate() {
         let Some(name) = names.get(symbol.name) else {
+            // alloc: error path
             return Err(format!("symbol {at} has a name outside the object's names"));
         };
         match symbol.def {
             SymbolDef::Section { section, .. } if section as usize >= sections => {
+                // alloc: error path
                 return Err(format!("`{name}` is in section {section}, past the object's {sections}"));
             }
             SymbolDef::Fallback { symbol: to, .. } if to as usize >= symbols => {
+                // alloc: error path
                 return Err(format!("`{name}` falls back to symbol {to}, past the object's {symbols}"));
             }
             _ => {}
@@ -299,22 +340,59 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
     }
     for (at, group) in object.groups.iter().enumerate() {
         let Some(name) = names.get(group.name) else {
+            // alloc: error path
             return Err(format!("COMDAT group {at} has a name outside the object's names"));
         };
         let range = &group.sections;
         if range.start > range.end || range.end as usize > object.grouped.len() {
+            // alloc: error path
             return Err(format!("COMDAT group `{name}`: sections {range:?}, past the object's {}", object.grouped.len()));
         }
     }
     if let Some(it) = object.grouped.iter().find(|it| **it as usize >= sections) {
+        // alloc: error path
         return Err(format!("a COMDAT group has section {it}, past the object's {sections}"));
     }
-    for (at, _) in &object.imports {
+    for (at, tie) in object.ties.iter().enumerate() {
+        if tie.section as usize >= sections || tie.to as usize >= sections {
+            // alloc: error path
+            return Err(format!("section {} is tied to section {}, past the object's {sections}", tie.section, tie.to));
+        }
+        if tie.section == tie.to {
+            // alloc: error path
+            return Err(format!("section {} is tied to itself", tie.section));
+        }
+        if at > 0 && object.ties[at - 1].section >= tie.section {
+            // alloc: error path
+            return Err(format!("section {} is tied twice, or the ties are not in section order", tie.section));
+        }
+    }
+    if let Some(it) = object.live_support.iter().find(|it| **it as usize >= sections) {
+        // alloc: error path
+        return Err(format!("live support section {it}, past the object's {sections}"));
+    }
+    if object.live_support.windows(2).any(|it| it[0] >= it[1]) {
+        // alloc: error path
+        return Err("the live support sections are not in section order, or one is listed twice".to_owned());
+    }
+    for (at, import) in &object.imports {
         let Some(symbol) = object.symbols.get(*at as usize) else {
+            // alloc: error path
             return Err(format!("a wasm import of symbol {at}, past the object's {symbols}"));
         };
+        let name = names.at(symbol.name);
         if symbol.def != SymbolDef::Undefined || symbol.kind != SymbolKind::Function {
-            return Err(format!("a wasm import of `{}`, which is not an undefined function", names.at(symbol.name)));
+            // alloc: error path
+            return Err(format!("a wasm import of `{name}`, which is not an undefined function"));
+        }
+        if names.get(import.module).is_none() || names.get(import.field).is_none() {
+            // alloc: error path
+            return Err(format!("the wasm import of `{name}` has a name outside the object's names"));
+        }
+        let ty = &import.ty;
+        if ty.start > ty.end || ty.end > len {
+            // alloc: error path
+            return Err(format!("the wasm import of `{name}`: its type, bytes {ty:?}, past the input's {len}"));
         }
     }
     Ok(())
@@ -323,17 +401,21 @@ fn check_object(object: &Object, len: u64) -> Result<(), String> {
 fn check_archive(archive: &Archive, len: usize) -> Result<(), String> {
     for (at, member) in archive.members.iter().enumerate() {
         let Some(name) = archive.names.get(member.name) else {
+            // alloc: error path
             return Err(format!("member {at} has a name outside the archive's names"));
         };
         if member.bytes.start > member.bytes.end || member.bytes.end > len {
+            // alloc: error path
             return Err(format!("member {name} past the end of the archive"));
         }
     }
     for (name, member) in &archive.index {
         let Some(name) = archive.names.get(*name) else {
+            // alloc: error path
             return Err("the archive's index has a name outside its names".to_owned());
         };
         if *member as usize >= archive.members.len() {
+            // alloc: error path
             return Err(format!("the archive's index puts `{name}` in member {member}, past its {}", archive.members.len()));
         }
     }
@@ -343,9 +425,11 @@ fn check_archive(archive: &Archive, len: usize) -> Result<(), String> {
 fn check_shared(shared: &Shared) -> Result<(), String> {
     for symbol in &shared.symbols {
         let Some(name) = shared.names.get(symbol.name) else {
+            // alloc: error path
             return Err(format!("{}: a symbol with a name outside its names", shared.name));
         };
         if let Some(version) = symbol.version.filter(|it| *it as usize >= shared.versions.len()) {
+            // alloc: error path
             return Err(format!("{}: `{name}` has version {version}, past its {}", shared.name, shared.versions.len()));
         }
     }
@@ -358,6 +442,15 @@ fn check_shared(shared: &Shared) -> Result<(), String> {
 pub(crate) struct Pass<'a> {
     bytes: Vec<&'a [u8]>,
     filled: bool,
+}
+
+impl<'a> Pass<'a> {
+    /// Input `input`'s bytes: as [`Stage::inputs`] filled them, or, when the change named no
+    /// native and the inputs are the image's, `old`'s own.
+    #[inline]
+    fn input(&self, old: &'a State, input: u32) -> &'a [u8] {
+        if self.filled { self.bytes[input as usize] } else { &old.inputs[input as usize].bytes[..] }
+    }
 }
 
 /// A native input as the image keeps it across stages, by [`Obj`].
@@ -400,6 +493,9 @@ pub(crate) struct Parsed {
     defs: Csr,
     /// Of each section, its COMDAT group; NONE for none.
     group_of: Vec<u32>,
+    /// Of each section, the sections tied to it and the one it is tied to ([`Object::ties`]):
+    /// each is kept when the other is. No rows when the object has no ties.
+    ties: Csr,
     /// Sections kept whatever refers to them.
     roots: Vec<u32>,
     /// Unwind sections and the symbol of their first relocation: what each describes.
@@ -425,17 +521,26 @@ impl Parsed {
     ) -> Parsed {
         let NativeFile::Object(object) = &*file else { unreachable!("only objects are parsed") };
         let sections = object.sections.len();
-        let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(object.fixups.len());
-        let mut row: SmallVec<[u32; 32]> = SmallVec::new();
+        let minus = object.fixups.iter().filter(|it| it.minus.is_some()).count();
+        let mut pairs: Vec<(u32, u32)> =
+            Vec::with_capacity((object.fixups.len() + minus).max(object.symbols.len()).max(2 * object.ties.len()));
         for (at, section) in object.sections.iter().enumerate() {
-            row.clear();
+            let start = pairs.len();
             for fixup in object.section_fixups(section) {
-                row.push(fixup.symbol);
-                row.extend(fixup.minus);
+                pairs.push((at as u32, fixup.symbol));
+                if let Some(it) = fixup.minus {
+                    pairs.push((at as u32, it));
+                }
             }
-            row.sort_unstable();
-            row.dedup();
-            pairs.extend(row.iter().map(|it| (at as u32, *it)));
+            pairs[start..].sort_unstable();
+            let mut kept = start;
+            for next in start..pairs.len() {
+                if kept == start || pairs[kept - 1] != pairs[next] {
+                    pairs[kept] = pairs[next];
+                    kept += 1;
+                }
+            }
+            pairs.truncate(kept);
         }
         let refs = Csr::build(sections, &pairs);
         pairs.clear();
@@ -445,6 +550,14 @@ impl Parsed {
             }
         }
         let defs = Csr::build(sections, &pairs);
+        let ties = if object.ties.is_empty() {
+            Csr::default()
+        } else {
+            pairs.clear();
+            pairs.extend(object.ties.iter().flat_map(|it| [(it.to, it.section), (it.section, it.to)]));
+            Csr::build(sections, &pairs)
+        };
+        // alloc: once per object read, kept with it
         let mut group_of = vec![NONE; sections];
         for (at, group) in object.groups.iter().enumerate() {
             for section in object.group_sections(group) {
@@ -454,7 +567,26 @@ impl Parsed {
                 }
             }
         }
-        let (mut roots, mut unwind, mut named_sections) = (Vec::new(), Vec::new(), Vec::new());
+        // A section kept only through another is a root only when it says so itself (lld:
+        // `SHF_GNU_RETAIN` before `SHF_LINK_ORDER`).
+        let root = |at: u32, section: &crate::model::Section| {
+            section.retain
+                || (!bound(object, at)
+                    && (kept_by_name(object.name(section.name))
+                        || matches!(section.what, SectionKind::Alloc(Class::InitArray | Class::FiniArray, _))))
+        };
+        let (mut root_count, mut unwind_count) = (0, 0);
+        for (at, section) in object.sections.iter().enumerate() {
+            match &section.what {
+                SectionKind::Dropped | SectionKind::EhFrame => continue,
+                SectionKind::Unwind(_) => unwind_count += 1,
+                SectionKind::Alloc(..) => {}
+            }
+            root_count += usize::from(root(at as u32, section));
+        }
+        let mut roots = Vec::with_capacity(root_count);
+        let mut unwind = Vec::with_capacity(unwind_count);
+        let mut named_sections = Vec::with_capacity(named.len());
         let mut names = named.iter();
         for (at, section) in object.sections.iter().enumerate() {
             let at = at as u32;
@@ -465,20 +597,24 @@ impl Parsed {
                     unwind.push((at, first.map_or(NONE, |it| it.symbol)));
                 }
                 SectionKind::Alloc(Class::Named { .. }, _) => {
-                    named_sections.push((*names.next().expect("a name per named section"), at));
+                    let name = *names.next().expect("a name per named section");
+                    // `__start_X` keeps no section kept only through another (lld's
+                    // `cNamedSections` leave out `SHF_LINK_ORDER`).
+                    if !bound(object, at) {
+                        named_sections.push((name, at));
+                    }
                 }
                 SectionKind::Alloc(..) => {}
             }
-            let root = section.retain
-                || kept_by_name(object.name(section.name))
-                || matches!(section.what, SectionKind::Alloc(Class::InitArray | Class::FiniArray, _));
-            if root {
+            if root(at, section) {
                 roots.push(at);
             }
         }
-        let mut frames: Vec<Frame> = Vec::new();
-        let mut fixup_pairs: Vec<(u32, u32)> = Vec::new();
-        let mut by_at: Vec<(u64, u32)> = Vec::new();
+        let frame_count: usize = records.iter().map(|(_, it)| it.len()).sum();
+        let frame_relocs = |section: &u32| object.sections[*section as usize].fixups.len();
+        let mut frames: Vec<Frame> = Vec::with_capacity(frame_count);
+        let mut fixup_pairs: Vec<(u32, u32)> = Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).sum());
+        let mut by_at: Vec<(u64, u32)> = Vec::with_capacity(records.iter().map(|(it, _)| frame_relocs(it)).max().unwrap_or(0));
         for (section, records) in records {
             let s = &object.sections[*section as usize];
             by_at.clear();
@@ -524,6 +660,7 @@ impl Parsed {
             refs,
             defs,
             group_of,
+            ties,
             roots,
             unwind,
             named: named_sections,
@@ -597,8 +734,10 @@ struct Export {
 }
 
 impl Exports {
+    /// Once per change of the link's shared libraries: every buffer is sized once, but for the
+    /// flattened list (as deep as the libraries' re-exports) and each distinct version's name.
     fn build(roots: Vec<(Arc<NativeFile>, bool)>) -> Result<Exports, String> {
-        let mut flat: Vec<(&Shared, bool)> = Vec::new();
+        let mut flat: Vec<(&Shared, bool)> = Vec::with_capacity(roots.len());
         for (file, as_needed) in &roots {
             let NativeFile::Shared(shared) = &**file else { continue };
             let mut at = flat.len();
@@ -609,16 +748,19 @@ impl Exports {
                 at += 1;
             }
         }
-        let mut first: FxHashMap<&str, u32> = FxHashMap::default();
-        let canonical: Vec<u32> =
-            flat.iter().enumerate().map(|(at, (it, _))| *first.entry(it.name.as_str()).or_insert(at as u32)).collect();
-        let libraries = flat.iter().map(|(it, as_needed)| Library { name: it.name.clone(), as_needed: *as_needed }).collect();
+        let mut first: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(flat.len(), Default::default());
+        let mut canonical: Vec<u32> = Vec::with_capacity(flat.len());
+        canonical.extend(flat.iter().enumerate().map(|(at, (it, _))| *first.entry(it.name.as_str()).or_insert(at as u32)));
+        let mut libraries = Vec::with_capacity(flat.len());
+        // alloc: each library's own name (the writers' `Library`), once per change of the libraries
+        libraries.extend(flat.iter().map(|(it, as_needed)| Library { name: it.name.clone(), as_needed: *as_needed }));
         let count: usize = flat.iter().map(|it| it.0.symbols.len()).sum();
         let mut names = Names::with_capacity(flat.iter().map(|it| it.0.names.bytes()).sum());
         let mut table = Table::with_capacity(count);
         let mut symbols: Vec<Export> = Vec::with_capacity(count);
-        let mut versions: Vec<String> = Vec::new();
-        let mut version_of: FxHashMap<&str, u32> = FxHashMap::default();
+        let distinct: usize = flat.iter().map(|it| it.0.versions.len()).sum();
+        let mut versions: Vec<String> = Vec::with_capacity(distinct);
+        let mut version_of: FxHashMap<&str, u32> = FxHashMap::with_capacity_and_hasher(distinct, Default::default());
         for (at, (shared, _)) in flat.iter().enumerate() {
             for symbol in &shared.symbols {
                 let name = shared.symbol_name(symbol);
@@ -629,6 +771,7 @@ impl Exports {
                 let version = match shared.version(symbol) {
                     None => NONE,
                     Some(version) => *version_of.entry(version).or_insert_with(|| {
+                        // alloc: each distinct version's name, once per change of the libraries
                         versions.push(version.to_owned());
                         (versions.len() - 1) as u32
                     }),
@@ -649,6 +792,7 @@ impl Exports {
     }
 
     fn version(&self, export: &Export) -> Option<String> {
+        // alloc: the writers' `Import` owns its version: once per import a resolution makes
         (export.version != NONE).then(|| self.versions[export.version as usize].clone())
     }
 
@@ -726,6 +870,9 @@ pub(crate) struct Graph {
     /// Of each flat section, the unwind sections (flat) and FDEs (flat) describing it.
     unwinds: Csr,
     fdes: Csr,
+    /// Of each flat section, the live support sections (flat) referring to it, which are kept
+    /// once it is (ld64's `dontDeadStripIfReferencesLive`).
+    supports: Csr,
     /// `Class::Named` sections (flat) by name, sorted: a name's are a run.
     named: Vec<(NameId, u32)>,
     /// Sections (flat) kept whatever refers to them.
@@ -741,20 +888,28 @@ pub(crate) struct Graph {
 }
 
 impl Graph {
+    /// Empty: nothing is allocated until the graph is loaded; [`Graph::index`] builds the
+    /// indexes collection walks before any walk.
     fn new() -> Graph {
         Graph {
             id: GRAPHS.fetch_add(1, Ordering::Relaxed),
+            // alloc: none (an empty `Vec`); the loads, once per graph built
             loads: Vec::new(),
             by_obj: FxHashMap::default(),
             slot_of: FxHashMap::default(),
+            // alloc: none (an empty `Vec`); the slots, once per graph built
             slots: Vec::new(),
             discarded: Bits::default(),
             sections: 0,
             frames: 0,
-            unwinds: Csr::build(0, &[]),
-            fdes: Csr::build(0, &[]),
+            unwinds: Csr::default(),
+            fdes: Csr::default(),
+            supports: Csr::default(),
+            // alloc: none (an empty `Vec`), replaced by `Graph::index`
             named: Vec::new(),
+            // alloc: none (an empty `Vec`), replaced by `Graph::index`
             roots: Vec::new(),
+            // alloc: none (an empty `Vec`), replaced once per graph built
             archives: Vec::new(),
             exports: Arc::default(),
             asked: Arc::default(),
@@ -873,11 +1028,29 @@ impl Graph {
         None
     }
 
-    /// The indexes collection walks: describers, named sections, roots.
+    /// The indexes collection walks: describers, live support, named sections, roots.
+    /// Once per graph built: each list is sized from the loads, but the live support's (as
+    /// many as its sections' relocations).
     fn index(&mut self) {
-        let (mut unwinds, mut fdes, mut named, mut roots) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let sum = |of: fn(&Parsed) -> usize| self.loads.iter().map(|it| of(&it.parsed)).sum::<usize>();
+        let mut unwinds = Vec::with_capacity(sum(|it| it.unwind.len()));
+        let mut fdes = Vec::with_capacity(sum(|it| it.frames.len()));
+        let mut named = Vec::with_capacity(sum(|it| it.named.len()));
+        let mut roots = Vec::with_capacity(sum(|it| it.roots.len()));
+        // alloc: none without live support; it grows once per graph built
+        let mut supports = Vec::new();
         for (load, it) in self.loads.iter().enumerate() {
             let load = load as u32;
+            for section in &it.parsed.object().live_support {
+                for symbol in it.parsed.refs.get(*section as usize) {
+                    match self.target(load, *symbol) {
+                        Some((l, s)) if (l, s) != (load, *section) => {
+                            supports.push((self.flat(l, s) as u32, it.sections + section));
+                        }
+                        _ => {}
+                    }
+                }
+            }
             for (section, symbol) in &it.parsed.unwind {
                 if *symbol == NONE {
                     continue;
@@ -900,6 +1073,7 @@ impl Graph {
         radix::sort_copy_by_key(&mut named, |&(name, flat)| radix::pack_32(name.0, flat));
         self.unwinds = Csr::build(self.sections as usize, &unwinds);
         self.fdes = Csr::build(self.sections as usize, &fdes);
+        self.supports = if supports.is_empty() { Csr::default() } else { Csr::build(self.sections as usize, &supports) };
         self.named = named;
         self.roots = roots;
     }
@@ -1044,7 +1218,7 @@ impl Marks {
 
 /// What a name keeps as a writer's special: the `Class::Named` sections `__start_X` bounds
 /// (`NAMED | their run`), the definition `__imp_X` is the cell of (X's slot), or NOTHING.
-fn special_mark(graph: &Graph, symbols: &Symbols, writer: &dyn Writer, sym: Sym) -> u32 {
+fn special_mark(graph: &Graph, symbols: &Symbols, writer: &Formats, sym: Sym) -> u32 {
     let Some(name) = symbols.name_of(sym) else { return NOTHING };
     match writer.special(name) {
         Some(Special::Section { name, .. }) => symbols
@@ -1054,9 +1228,11 @@ fn special_mark(graph: &Graph, symbols: &Symbols, writer: &dyn Writer, sym: Sym)
                 graph.named.get(at).is_some_and(|it| it.0 == id).then_some(NAMED | at as u32)
             })
             .unwrap_or(NOTHING),
-        Some(Special::Got(target)) => {
-            symbols.find_sym_name(&target).and_then(|it| graph.slot_of.get(&it).copied()).unwrap_or(NOTHING)
-        }
+        Some(got @ Special::Got { .. }) => got
+            .got_target(name)
+            .and_then(|target| symbols.find_sym_name(target))
+            .and_then(|it| graph.slot_of.get(&it).copied())
+            .unwrap_or(NOTHING),
         _ => NOTHING,
     }
 }
@@ -1067,7 +1243,7 @@ struct Marker<'g> {
     graph: &'g Graph,
     marks: &'g mut Marks,
     symbols: &'g Symbols,
-    writer: &'g dyn Writer,
+    writer: &'g Formats,
     work: Vec<u64>,
     /// What this walk marked: `pack(load, section)`, `pack(load, frame)`.
     sections: Vec<u64>,
@@ -1075,8 +1251,20 @@ struct Marker<'g> {
 }
 
 impl<'g> Marker<'g> {
-    fn new(graph: &'g Graph, marks: &'g mut Marks, symbols: &'g Symbols, writer: &'g dyn Writer) -> Marker<'g> {
-        Marker { graph, marks, symbols, writer, work: Vec::new(), sections: Vec::new(), frames: Vec::new() }
+    /// A walk over `graph`: what it marks has room for every section and frame record of the
+    /// graph, so those two lists are allocated once (untouched room is never paged in); the
+    /// work stack, one entry per edge waiting, grows by doubling past 64Ki entries.
+    fn new(graph: &'g Graph, marks: &'g mut Marks, symbols: &'g Symbols, writer: &'g Formats) -> Marker<'g> {
+        let (sections, frames) = (graph.sections as usize, graph.frames as usize);
+        Marker {
+            graph,
+            marks,
+            symbols,
+            writer,
+            work: Vec::with_capacity(sections.min(1 << 16)),
+            sections: Vec::with_capacity(sections),
+            frames: Vec::with_capacity(frames),
+        }
     }
 
     fn push(&mut self, (load, section): (u32, u32)) {
@@ -1100,10 +1288,17 @@ impl<'g> Marker<'g> {
                     self.work.push(pack(load, *it));
                 }
             }
+            for it in parsed.ties.row(section as usize) {
+                self.work.push(pack(load, *it));
+            }
             for symbol in parsed.refs.get(section as usize) {
                 self.symbol(load, *symbol);
             }
             for it in graph.unwinds.get(flat) {
+                let at = graph.unflat(*it);
+                self.push(at);
+            }
+            for it in graph.supports.row(flat) {
                 let at = graph.unflat(*it);
                 self.push(at);
             }
@@ -1186,8 +1381,9 @@ impl<'g> Marker<'g> {
     }
 }
 
-/// Notes the names what a walk marked refers to; the slots whose note rose, from and to.
-fn note_native(graph: &Graph, marks: &mut Marks, sections: &[u64], frames: &[u64], rose: &mut Vec<(u32, u8, u8)>) {
+/// Notes the names what a walk marked refers to; into `rose`, when given, the slots whose note
+/// rose, from and to.
+fn note_native(graph: &Graph, marks: &mut Marks, sections: &[u64], frames: &[u64], mut rose: Option<&mut Vec<(u32, u8, u8)>>) {
     let mut note = |marks: &mut Marks, load: u32, symbol: u32| {
         let it = &graph.loads[load as usize];
         let slot = it.slots[symbol as usize];
@@ -1198,7 +1394,9 @@ fn note_native(graph: &Graph, marks: &mut Marks, sections: &[u64], frames: &[u64
         let was = marks.native_of(slot);
         if level > was {
             marks.native.set(slot as usize, level, || 0);
-            rose.push((slot, was, level));
+            if let Some(rose) = rose.as_deref_mut() {
+                rose.push((slot, was, level));
+            }
         }
     };
     for (load, section) in sections.iter().map(|it| unpack(*it)) {
@@ -1311,13 +1509,17 @@ impl Build {
     fn new() -> Build {
         Build {
             graph: Graph::new(),
+            // alloc: none (an empty `Vec`); it grows once per graph built
             queue: Vec::new(),
             pulled: FxHashSet::default(),
             groups: Table::default(),
+            // alloc: none (an empty `Vec`); it grows once per graph built
             group_list: Vec::new(),
             mismatches: FxHashMap::default(),
             asked: FxHashSet::default(),
+            // alloc: none (an empty `Vec`); it grows once per graph built
             shared: Vec::new(),
+            // alloc: none (an empty `Vec`); it grows once per graph built
             members: Vec::new(),
             commons: FxHashMap::default(),
         }
@@ -1336,13 +1538,27 @@ impl Build {
         }
     }
 
-    /// Drops a group's sections.
+    /// Drops a group's sections, and the sections tied to one dropped (lld drops a
+    /// `SHF_LINK_ORDER` section whose `sh_link` is dropped).
     fn discard(&mut self, load: u32, group: u32) {
         let Graph { loads, discarded, .. } = &mut self.graph;
         let it = &loads[load as usize];
         let object = it.parsed.object();
-        for section in object.group_sections(&object.groups[group as usize]) {
+        let members = object.group_sections(&object.groups[group as usize]);
+        for section in members {
             discarded.set((it.sections + section) as usize);
+        }
+        if object.ties.is_empty() {
+            return;
+        }
+        let mut work: SmallVec<[u32; 8]> = SmallVec::from_slice(members);
+        while let Some(section) = work.pop() {
+            for tied in it.parsed.ties.row(section as usize) {
+                let dependent = tie_of(object, *tied).is_some_and(|tie| tie.to == section);
+                if dependent && discarded.set((it.sections + tied) as usize) {
+                    work.push(*tied);
+                }
+            }
         }
     }
 
@@ -1370,6 +1586,7 @@ impl Build {
                 let next = graph.loads[load as usize].slots[symbol as usize];
                 if next == slot {
                     let name = symbols.name_of(graph.slots[slot as usize].sym).unwrap_or("?");
+                    // alloc: error path
                     return Err(error(None, format!("the weak external `{name}` falls back to itself")));
                 }
                 if seen.contains(&next) || graph.slots[next as usize].flags & ALIAS == 0 {
@@ -1415,16 +1632,21 @@ impl<'a> Stage<'a> {
                     natives.push(at);
                 }
                 Entry::Occupied(_) if matches!(native.kind, NativeKind::Object) => {
+                    // alloc: error path
                     return Err(error(None, format!("{}: the object is on the link line twice", native.name)));
                 }
                 Entry::Occupied(_) => {}
             }
         }
-        let removed: FxHashSet<blaze_ids::ContentId> = change.removed_natives.iter().copied().collect();
+        let mut removed: FxHashSet<blaze_ids::ContentId> =
+            FxHashSet::with_capacity_and_hasher(change.removed_natives.len(), Default::default());
+        removed.extend(change.removed_natives.iter().copied());
         let inputs = Arc::make_mut(&mut self.new.inputs);
         inputs.retain(|it| !removed.contains(&it.id));
-        let have: FxHashMap<blaze_ids::ContentId, usize> = inputs.iter().enumerate().map(|(at, it)| (it.id, at)).collect();
-        let mut fresh = Vec::new();
+        let mut have: FxHashMap<blaze_ids::ContentId, usize> =
+            FxHashMap::with_capacity_and_hasher(inputs.len(), Default::default());
+        have.extend(inputs.iter().enumerate().map(|(at, it)| (it.id, at)));
+        let mut fresh = Vec::with_capacity(natives.len());
         for at in natives {
             let native = &change.natives[at];
             match have.get(&native.id) {
@@ -1434,16 +1656,21 @@ impl<'a> Stage<'a> {
         }
         let writer = self.writer;
         let listed = &change.natives;
-        let files: Vec<Result<NativeFile, LinkError>> = fresh
+        let mut files: Vec<Result<NativeFile, LinkError>> = Vec::with_capacity(fresh.len());
+        fresh
             .par_iter()
             .map(|at| {
                 let native = &listed[*at];
+                // alloc: error path (the message is made only on `Err`)
                 let file = writer.read(native.name, native.bytes, &native.kind).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
+                // alloc: error path (the message is made only on `Err`)
                 check_file(&file, native.bytes.len()).map_err(|it| error(None, format!("{}: {it}", native.name)))?;
                 Ok(file)
             })
-            .collect();
-        let mut bytes: FxHashMap<blaze_ids::ContentId, &'a [u8]> = FxHashMap::default();
+            .collect_into_vec(&mut files);
+        let mut bytes: FxHashMap<blaze_ids::ContentId, &'a [u8]> =
+            FxHashMap::with_capacity_and_hasher(inputs.len() + fresh.len(), Default::default());
+        inputs.reserve(fresh.len());
         for (at, file) in fresh.iter().zip(files) {
             let native = &change.natives[*at];
             inputs.push(Input {
@@ -1451,13 +1678,16 @@ impl<'a> Stage<'a> {
                 name: native.name.into(),
                 kind: native.kind,
                 order: native.order,
-                bytes: native.bytes.into(),
+                // clone: an `Arc`: the caller's bytes, shared
+                bytes: native.bytes.clone(),
+                // alloc: once per native file read, shared by every state after
                 file: Arc::new(file?),
             });
-            bytes.insert(native.id, native.bytes);
+            bytes.insert(native.id, &native.bytes[..]);
         }
         inputs.sort_by_key(|it| (it.order, it.id));
-        let names: FxHashSet<&str> = inputs.iter().map(|it| &*it.name).collect();
+        let mut names: FxHashSet<&str> = FxHashSet::with_capacity_and_hasher(inputs.len(), Default::default());
+        names.extend(inputs.iter().map(|it| &*it.name));
         for input in inputs.iter() {
             let NativeFile::Shared(shared) = &*input.file else { continue };
             for wanted in &shared.inputs {
@@ -1468,6 +1698,7 @@ impl<'a> Stage<'a> {
                             && it.name.as_bytes()[it.name.len() - wanted.len() - 1] == b'/'
                     });
                 if !found {
+                    // alloc: error path
                     return Err(error(None, format!("{} names {wanted}, which the link line does not have", input.name)));
                 }
             }
@@ -1476,11 +1707,13 @@ impl<'a> Stage<'a> {
         for it in old.inputs.iter() {
             bytes.entry(it.id).or_insert(&it.bytes[..]);
         }
-        self.native.bytes = inputs.iter().map(|it| bytes[&it.id]).collect();
+        self.native.bytes.clear();
+        self.native.bytes.reserve(inputs.len());
+        self.native.bytes.extend(inputs.iter().map(|it| bytes[&it.id]));
         self.native.filled = true;
         if !removed.is_empty() {
-            let gone: FxHashSet<u32> =
-                removed.iter().filter(|it| !given.contains_key(*it)).filter_map(|it| self.symbols.find_id(it)).map(|it| it.0).collect();
+            let mut gone: FxHashSet<u32> = FxHashSet::with_capacity_and_hasher(removed.len(), Default::default());
+            gone.extend(removed.iter().filter(|it| !given.contains_key(*it)).filter_map(|it| self.symbols.find_id(it)).map(|it| it.0));
             if !gone.is_empty() {
                 self.objects.retain(|obj, _| !gone.contains(&obj.native.0));
             }
@@ -1488,32 +1721,32 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
-    /// Each input's bytes, when [`Stage::inputs`] did not fill them: the image's.
-    fn pass(&mut self) {
-        if self.native.filled {
-            return;
-        }
-        let old: &'a State = self.old;
-        debug_assert!(Arc::ptr_eq(&old.inputs, &self.new.inputs));
-        self.native.bytes = old.inputs.iter().map(|it| &it.bytes[..]).collect();
-        self.native.filled = true;
-    }
-
     /// A section's bytes, or `within` them: borrowed from the input, or copied to the arena
     /// when the reader made them; none for zeros.
-    fn content(&self, data: &Data, input: u32, base: usize, within: Range<usize>) -> Content<'a> {
+    fn content(&self, object: &Object, data: &Data, input: u32, base: usize, within: Range<usize>) -> Content<'a> {
         match data {
+            Data::Made(range) => {
+                let arena: &'a blaze_mem::Frame = self.arena;
+                let start = range.start as usize;
+                Content::Bytes(arena.alloc_slice_copy(&object.made[start + within.start..start + within.end]))
+            }
             Data::Input(range) => {
-                let bytes: &'a [u8] = self.native.bytes[input as usize];
+                debug_assert!(self.native.filled || Arc::ptr_eq(&self.old.inputs, &self.new.inputs));
+                let bytes: &'a [u8] = self.native.input(self.old, input);
                 let start = base + range.start as usize;
                 Content::Bytes(&bytes[start + within.start..start + within.end])
             }
             Data::Bytes(bytes) => {
-                let arena: &'a bumpalo::Bump = self.arena;
+                let arena: &'a blaze_mem::Frame = self.arena;
                 Content::Bytes(arena.alloc_slice_copy(&bytes[within]))
             }
             Data::Zero(_) => Content::Zero,
         }
+    }
+
+    /// The name of input `input` (an index into [`State::inputs`]), for an error.
+    fn input_name(&self, input: u32) -> &str {
+        &self.new.inputs[input as usize].name
     }
 
     fn piece_of(&self, sym: Sym) -> Option<PieceId> {
@@ -1532,16 +1765,18 @@ impl<'a> Stage<'a> {
             let id = self.new.inputs[*input as usize].id;
             objs.push(self.symbols.obj(&id, *member));
         }
-        let mut out: Vec<Option<Read>> = objs.iter().map(|it| self.objects.get(it).cloned()).collect();
-        let misses: Vec<usize> = (0..wanted.len()).filter(|it| out[*it].is_none()).collect();
+        let mut misses = Vec::with_capacity(wanted.len());
+        misses.extend((0..wanted.len()).filter(|it| !self.objects.contains_key(&objs[*it])));
         if !misses.is_empty() {
             let fresh = self.read_misses(wanted, &objs, &misses)?;
-            for (at, read) in misses.into_iter().zip(fresh) {
-                self.objects.insert(objs[at], read.clone());
-                out[at] = Some(read);
+            for (at, read) in misses.iter().zip(fresh) {
+                self.objects.insert(objs[*at], read);
             }
         }
-        Ok(out.into_iter().map(|it| it.expect("read")).collect())
+        let mut out = Vec::with_capacity(wanted.len());
+        // clone: a `Read` is one `Arc`: the image keeps each object, and the graph shares it
+        out.extend(objs.iter().map(|it| self.objects[it].clone()));
+        Ok(out)
     }
 
     fn read_misses(&mut self, wanted: &[(u32, u32)], objs: &[Obj], misses: &[usize]) -> Result<Vec<Read>, LinkError> {
@@ -1551,28 +1786,34 @@ impl<'a> Stage<'a> {
             records: Vec<(u32, Vec<unwind::Native>)>,
         }
         let writer = self.writer;
-        let inputs = self.new.inputs.clone();
-        let bytes: &[&'a [u8]] = &self.native.bytes;
-        let got: Vec<Result<Got, LinkError>> = misses
+        let (inputs, native, old): (&[Input], &Pass<'a>, &'a State) = (&self.new.inputs[..], &self.native, self.old);
+        let mut got: Vec<Result<Got, LinkError>> = Vec::with_capacity(misses.len());
+        misses
             .par_iter()
             .map(|at| {
                 let (input, member) = wanted[*at];
                 let it = &inputs[input as usize];
-                let all = bytes[input as usize];
-                let (file, base, name) = if member == 0 {
+                let all = native.input(old, input);
+                let (file, base, member_name) = if member == 0 {
+                    // clone: an `Arc`: the object is the input's own file
                     (it.file.clone(), 0, None)
                 } else {
                     let NativeFile::Archive(archive) = &*it.file else { unreachable!("a member of an archive") };
                     let entry = &archive.members[member as usize - 1];
-                    let name = format!("{}({})", it.name, archive.name(entry.name));
-                    let slice = &all[entry.bytes.clone()];
-                    let file = writer.read(&name, slice, &NativeKind::Object).map_err(|what| error(None, format!("{name}: {what}")))?;
-                    check_file(&file, slice.len()).map_err(|what| error(None, format!("{name}: {what}")))?;
+                    let member_name = archive.name(entry.name);
+                    // alloc: error path
+                    let fail = |what: &str| error(None, format!("{}({member_name}): {what}", it.name));
+                    let slice = &all[entry.bytes.start..entry.bytes.end];
+                    // A reader names the object only in its errors: the archive's name; the member's is added here.
+                    let file = writer.read(&it.name, slice, &NativeKind::Object).map_err(|what| fail(&what))?;
+                    check_file(&file, slice.len()).map_err(|what| fail(&what))?;
                     if matches!(file, NativeFile::Archive(_)) {
-                        return Err(error(None, format!("{name}: an archive in an archive")));
+                        return Err(fail("an archive in an archive"));
                     }
-                    (Arc::new(file), entry.bytes.start, Some(name))
+                    // alloc: once per member read, shared by every stage after
+                    (Arc::new(file), entry.bytes.start, Some(member_name))
                 };
+                // alloc: none for an object without `.eh_frame`; once per object read otherwise
                 let mut records = Vec::new();
                 if let NativeFile::Object(object) = &*file {
                     for (at, section) in object.sections.iter().enumerate() {
@@ -1581,28 +1822,42 @@ impl<'a> Stage<'a> {
                         }
                         let data = match &section.data {
                             Data::Input(range) => &all[base + range.start as usize..base + range.end as usize],
+                            Data::Made(range) => &object.made[range.start as usize..range.end as usize],
                             Data::Bytes(bytes) => &bytes[..],
                             Data::Zero(_) => continue,
                         };
                         let split = unwind::split(data).map_err(|what| {
-                            let name = name.as_deref().unwrap_or(&*it.name);
-                            error(None, format!("{name}: {}: {what}", object.name(section.name)))
+                            let section = object.name(section.name);
+                            // alloc: error path
+                            error(None, match member_name {
+                                Some(member) => format!("{}({member}): {section}: {what}", it.name),
+                                None => format!("{}: {section}: {what}", it.name),
+                            })
                         })?;
                         records.push((at as u32, split));
                     }
                 }
                 Ok(Got { file, base, records })
             })
-            .collect();
+            .collect_into_vec(&mut got);
+        // alloc: one buffer per batch read, the objects of the batch
         let got: Vec<Got> = got.into_iter().collect::<Result<_, _>>()?;
         // One batch for every object's symbols, sections and frame records, and one for the
-        // names of its named sections.
+        // names of its named sections, each sized once.
+        let (mut key_count, mut name_count) = (0, 0);
+        for it in &got {
+            let NativeFile::Object(object) = &*it.file else { continue };
+            key_count += object.symbols.len() + object.sections.len();
+            key_count += it.records.iter().map(|(_, records)| records.len()).sum::<usize>();
+            name_count +=
+                object.sections.iter().filter(|it| matches!(it.what, SectionKind::Alloc(Class::Named { .. }, _))).count();
+        }
         let mut starts = Vec::with_capacity(got.len() + 1);
         let syms;
         let name_ids;
         {
-            let mut keys: Vec<Wide<'_>> = Vec::new();
-            let mut names: Vec<&str> = Vec::new();
+            let mut keys: Vec<Wide<'_>> = Vec::with_capacity(key_count);
+            let mut names: Vec<&str> = Vec::with_capacity(name_count);
             for (it, at) in got.iter().zip(misses) {
                 starts.push((keys.len(), names.len()));
                 let NativeFile::Object(object) = &*it.file else { continue };
@@ -1617,8 +1872,8 @@ impl<'a> Stage<'a> {
             syms = self.symbols.intern_wide(&keys);
             name_ids = self.symbols.names_all(&names);
         }
-        let reads: Vec<Read> = got
-            .into_par_iter()
+        let mut reads: Vec<Read> = Vec::with_capacity(got.len());
+        got.into_par_iter()
             .zip(misses.par_iter())
             .enumerate()
             .map(|(n, (it, at))| {
@@ -1630,43 +1885,47 @@ impl<'a> Stage<'a> {
                     objs[*at],
                     it.file,
                     it.base,
+                    // alloc: the object's own symbols, once per object read, kept with it
                     syms[keys..keys_end].to_vec(),
                     &name_ids[names..names_end],
                     &it.records,
                 );
+                // alloc: once per object read, shared by every stage after
                 Read::Object(Arc::new(parsed))
             })
-            .collect();
+            .collect_into_vec(&mut reads);
         Ok(reads)
     }
 
     /// The indexes of the searched archives, kept ones as they are, the rest built in
     /// parallel.
     fn indexes(&mut self, inputs: &[Input], lazy: &[u32]) -> Vec<(u32, Arc<Table>)> {
-        let objs: Vec<Obj> = lazy.iter().map(|it| self.symbols.obj(&inputs[*it as usize].id, 0)).collect();
-        let kept: Vec<Option<Arc<Table>>> = objs
-            .iter()
-            .map(|obj| match self.objects.get(obj) {
-                Some(Read::Index(it)) => Some(it.clone()),
-                _ => None,
+        let mut objs: Vec<Obj> = Vec::with_capacity(lazy.len());
+        objs.extend(lazy.iter().map(|it| self.symbols.obj(&inputs[*it as usize].id, 0)));
+        let objects = &*self.objects;
+        let mut out: Vec<(u32, Arc<Table>)> = Vec::with_capacity(lazy.len());
+        lazy.par_iter()
+            .zip(objs.par_iter())
+            .map(|(input, obj)| {
+                let table = match objects.get(obj) {
+                    // clone: an `Arc`: the archive's index as the image keeps it
+                    Some(Read::Index(it)) => it.clone(),
+                    _ => {
+                        let NativeFile::Archive(archive) = &*inputs[*input as usize].file else {
+                            unreachable!("searched inputs are archives")
+                        };
+                        // alloc: once per archive searched, kept for the image's life
+                        Arc::new(archive_index(archive))
+                    }
+                };
+                (*input, table)
             })
-            .collect();
-        let built: Vec<Arc<Table>> = lazy
-            .par_iter()
-            .zip(kept.into_par_iter())
-            .map(|(input, kept)| {
-                kept.unwrap_or_else(|| {
-                    let NativeFile::Archive(archive) = &*inputs[*input as usize].file else {
-                        unreachable!("searched inputs are archives")
-                    };
-                    Arc::new(archive_index(archive))
-                })
-            })
-            .collect();
-        for (obj, table) in objs.iter().zip(&built) {
+            .collect_into_vec(&mut out);
+        for (obj, (_, table)) in objs.iter().zip(&out) {
+            // clone: an `Arc`: the image's handle on the index
             self.objects.entry(*obj).or_insert_with(|| Read::Index(table.clone()));
         }
-        lazy.iter().copied().zip(built).collect()
+        out
     }
 
     /// Adds an object to the graph: its groups, directives, imports and globals, in lld's
@@ -1674,6 +1933,7 @@ impl<'a> Stage<'a> {
     fn register(&mut self, b: &mut Build, parsed: Arc<Parsed>, input: u32, pulled: bool) -> Result<(), LinkError> {
         let object = parsed.object();
         let load = b.graph.loads.len() as u32;
+        // alloc: the load's slot of each symbol, once per object per graph built
         let mut slots = vec![NONE; object.symbols.len()];
         for (at, symbol) in object.symbols.iter().enumerate() {
             if !is_local(symbol) {
@@ -1684,8 +1944,8 @@ impl<'a> Stage<'a> {
         b.graph.sections += object.sections.len() as u32;
         b.graph.frames += parsed.frames.len() as u32;
         b.graph.by_obj.insert(parsed.obj, load);
+        // clone: an `Arc`: the load keeps the object while this reads it and the graph grows
         b.graph.loads.push(Load { parsed: parsed.clone(), input, pulled, sections, frames, slots });
-        let name_of = |this: &Self, input: u32| this.new.inputs[input as usize].name.clone();
 
         let size = |graph: &Graph, load: u32, group: u32| -> u64 {
             let object = graph.object(load);
@@ -1727,7 +1987,9 @@ impl<'a> Stage<'a> {
                 Directive::Export { name, symbol, data } => {
                     let slot = b.slot(self.symbols.sym_name(symbol));
                     b.flag(slot, PULL | REQUIRED | ROOT);
+                    // alloc: the set's own name, once per `/EXPORT` directive per graph built
                     if b.asked.insert(name.clone()) {
+                        // alloc: the writers' own names, once per name exported per graph built
                         Arc::make_mut(&mut b.graph.asked).push((name.clone(), symbol.clone(), *data));
                     }
                 }
@@ -1735,15 +1997,17 @@ impl<'a> Stage<'a> {
                     Some((first, by)) if first != value => {
                         return Err(error(
                             None,
+                            // alloc: error path
                             format!(
                                 "`{key}` is `{first}` in {} and `{value}` in {} (/FAILIFMISMATCH)",
-                                name_of(self, *by),
-                                name_of(self, input)
+                                self.input_name(*by),
+                                self.input_name(input)
                             ),
                         ));
                     }
                     Some(_) => {}
                     None => {
+                        // alloc: once per `/FAILIFMISMATCH` key per graph built
                         b.mismatches.insert(key.clone(), (value.clone(), input));
                     }
                 },
@@ -1751,19 +2015,31 @@ impl<'a> Stage<'a> {
             }
         }
 
-        for (at, import) in &object.imports {
+        let all = &self.native.input(self.old, input)[parsed.base..];
+        for (at, it) in &object.imports {
             let sym = parsed.sym(*at);
+            let bad = |what: String| {
+                let name = object.name(object.symbols[*at as usize].name);
+                // alloc: error path
+                error(None, format!("{}: the wasm import of `{name}`: {what}", self.input_name(input)))
+            };
+            let ty = it.type_bytes(all).map_err(bad)?;
+            // alloc: the type's params and results, once per import per graph built; error path
+            let ty = blaze_codegen::wasm::Signature::decode(ty, &mut 0).map_err(|what| bad(what.to_string()))?;
+            // alloc: the graph's own wasm import (module and field names, its type), once per import per graph built
+            let import = blaze_codegen::wasm::Import { module: object.name(it.module).to_owned(), field: object.name(it.field).to_owned(), ty };
             match b.graph.wasm.get(&sym) {
-                Some((by, known)) if known != import => {
+                Some((by, known)) if *known != import => {
                     let name = object.name(object.symbols[*at as usize].name);
                     return Err(error(
                         None,
-                        format!("`{name}` is imported as {known:?} by {} and as {import:?} by {}", name_of(self, *by), name_of(self, input)),
+                        // alloc: error path
+                        format!("`{name}` is imported as {known:?} by {} and as {import:?} by {}", self.input_name(*by), self.input_name(input)),
                     ));
                 }
                 Some(_) => {}
                 None => {
-                    b.graph.wasm.insert(sym, (input, import.clone()));
+                    b.graph.wasm.insert(sym, (input, import));
                 }
             }
         }
@@ -1816,10 +2092,11 @@ impl<'a> Stage<'a> {
                 if strength == 3 {
                     return Err(error(
                         None,
+                        // alloc: error path
                         format!(
                             "duplicate symbol `{}`: Rust code defines it, and so does {}",
                             object.name(symbol.name),
-                            name_of(self, input)
+                            self.input_name(input)
                         ),
                     ));
                 }
@@ -1830,12 +2107,13 @@ impl<'a> Stage<'a> {
                 Some(_) if strength > it.strength => true,
                 Some((l, i)) if strength == 3 && it.strength == 3 => {
                     let first = match b.graph.object(l).symbols[i as usize].def {
-                        SymbolDef::Section { .. } => name_of(self, b.graph.loads[l as usize].input).to_string(),
-                        _ => "an absolute definition".to_owned(),
+                        SymbolDef::Section { .. } => self.input_name(b.graph.loads[l as usize].input),
+                        _ => "an absolute definition",
                     };
                     return Err(error(
                         None,
-                        format!("duplicate symbol `{}`: in {first} and in {}", object.name(symbol.name), name_of(self, input)),
+                        // alloc: error path
+                        format!("duplicate symbol `{}`: in {first} and in {}", object.name(symbol.name), self.input_name(input)),
                     ));
                 }
                 Some(_) => false,
@@ -1858,6 +2136,7 @@ impl<'a> Stage<'a> {
         }
         if let Some(export) = graph.exports.find(name) {
             let import = Import {
+                // alloc: the writers' `Import` owns its name: once per import a resolution makes
                 name: name.to_owned(),
                 library: None,
                 version: graph.exports.version(export),
@@ -1880,6 +2159,7 @@ impl<'a> Stage<'a> {
                 if a != b {
                     return Err(error(
                         None,
+                        // alloc: error path
                         format!("`{name}` is imported as {a:?} by {} and as {b:?} by Rust code", self.new.inputs[*by as usize].name),
                     ));
                 }
@@ -1887,11 +2167,13 @@ impl<'a> Stage<'a> {
             return match native.map(|it| &it.1).or(rust) {
                 Some(it) if !weak => Ok(Decision::Import(
                     Import {
+                        // alloc: the writers' `Import` owns its name: once per import a resolution makes
                         name: name.to_owned(),
                         library: None,
                         version: None,
                         kind: SymbolKind::Function,
                         weak: false,
+                        // clone: the import's own module and field names, once per import made
                         wasm: Some(it.clone()),
                     },
                     NONE,
@@ -1899,6 +2181,7 @@ impl<'a> Stage<'a> {
                 _ if weak => Ok(Decision::Zero),
                 _ => Err(error(
                     None,
+                    // alloc: error path
                     format!("undefined symbol `{name}`{}, which no input says the wasm import of", self.referrer(sym)),
                 )),
             };
@@ -1907,26 +2190,31 @@ impl<'a> Stage<'a> {
             return Ok(Decision::Zero);
         }
         if !executable {
+            // alloc: the writers' `Import` owns its name: once per import a resolution makes
             let import = Import { name: name.to_owned(), library: None, version: None, kind: SymbolKind::Other, weak, wasm: None };
             return Ok(Decision::Import(import, NONE));
         }
         if optional(name) {
             return Ok(Decision::Skip);
         }
+        // alloc: error path
         Err(error(None, format!("undefined symbol `{name}`{}", self.referrer(sym))))
     }
 
-    /// Who refers to an undefined symbol, for its error.
+    /// Who refers to an undefined symbol: only for an undefined symbol's error.
     fn referrer(&self, sym: Sym) -> String {
         let Some(piece) = self.new.refs(sym).find_map(|it| self.new.piece(it)) else {
+            // alloc: none (an empty `String`), error path
             return String::new();
         };
         match piece.what() {
             What::Native { obj, .. } | What::NativeFrame { obj, .. } => {
                 let id = self.symbols.content(obj.native);
                 let name = self.new.inputs.iter().find(|it| it.id == *id).map_or("?", |it| &*it.name);
+                // alloc: error path
                 format!(", referred to by {name}")
             }
+            // alloc: error path
             _ => format!(", referred to by {}", self.symbols.describe(piece.sym)),
         }
     }
@@ -1945,6 +2233,7 @@ impl<'a> Stage<'a> {
         let zeroed = crate::state::zeroed(class);
         if zeroed && !matches!(s.data, Data::Zero(_)) {
             let name = &self.new.inputs[it.input as usize].name;
+            // alloc: error path
             return Err(error(None, format!("{name}: {} has bytes, in a zeroed section", object.name(s.name))));
         }
         scratch.fixups.clear();
@@ -1961,12 +2250,15 @@ impl<'a> Stage<'a> {
         scratch.weak.dedup();
         section_defines(graph, load, section, &mut scratch.defines);
         let content =
-            if zeroed { Content::Zero } else { self.content(&s.data, it.input, parsed.base, 0..s.data.len() as usize) };
+            if zeroed { Content::Zero } else { self.content(object, &s.data, it.input, parsed.base, 0..s.data.len() as usize) };
         let order = self.new.inputs[it.input as usize].order;
         let what = What::Native { obj: parsed.obj, section, unwind };
         let mut piece = self.piece(parsed.section_sym(section), class, s.align, s.data.len(), &scratch.fixups, what);
         piece.rank = rank;
-        piece.order = [order, parsed.obj.member, section];
+        // lld's `SHF_LINK_ORDER`: in the order of the sections tied to, so that parallel
+        // tables (SanitizerCoverage's counters and PCs) stay one entry each per kept function.
+        let placed = tie_of(object, section).filter(|tie| tie.ordered).map_or(section, |tie| tie.to);
+        piece.order = [order, parsed.obj.member, placed];
         piece.zero = zeroed;
         piece.weak = scratch.weak.as_slice();
         piece.defines = scratch.defines.as_slice();
@@ -1982,12 +2274,15 @@ impl<'a> Stage<'a> {
         let record = parsed.frames[frame as usize];
         let s = &object.sections[record.section as usize];
         let (start, end) = (u64::from(record.start), u64::from(record.end));
-        let name = || self.new.inputs[it.input as usize].name.clone();
         if (end - start) % 4 != 0 {
-            return Err(error(None, format!("{}: {}: a frame record not a multiple of 4 long", name(), object.name(s.name))));
+            let name = self.input_name(it.input);
+            // alloc: error path
+            return Err(error(None, format!("{name}: {}: a frame record not a multiple of 4 long", object.name(s.name))));
         }
         if record.fde && record.cie == NONE {
-            return Err(error(None, format!("{}: {}: an FDE at {start:#x} whose CIE is no record", name(), object.name(s.name))));
+            let name = self.input_name(it.input);
+            // alloc: error path
+            return Err(error(None, format!("{name}: {}: an FDE at {start:#x} whose CIE is no record", object.name(s.name))));
         }
         let sym = parsed.frame_sym(frame);
         fixups.clear();
@@ -2007,7 +2302,7 @@ impl<'a> Stage<'a> {
             fixups.push(Fixup { at: 4, apply: Apply::Delta32, target: sym, addend: 4, minus: Some(cie) });
         }
         fixups.sort_by_key(|f| f.at);
-        let content = self.content(&s.data, it.input, parsed.base, start as usize..end as usize);
+        let content = self.content(object, &s.data, it.input, parsed.base, start as usize..end as usize);
         let order = self.new.inputs[it.input as usize].order;
         let what = What::NativeFrame { obj: parsed.obj, section: record.section, fde: record.fde };
         let mut piece = self.piece(sym, &Class::EhFrame, 4, end - start, fixups.as_slice(), what);
@@ -2050,14 +2345,17 @@ impl<'a> Stage<'a> {
     }
 
     /// Counts Rust's references to names from the pieces made and removed since `old`: the
-    /// counts, and the names whose class (none, weak, strong) changed, from and to.
-    fn references(&self, old: &Resolved) -> (Refs, Vec<(Sym, u8, u8)>) {
+    /// counts, and the names whose class (none, weak, strong) changed. Nothing is allocated
+    /// when no piece came or went; otherwise one list, of the names touched.
+    fn references(&self, old: &Resolved) -> (Refs, Vec<Sym>) {
+        // clone: copy-on-write: a reference count per column, copied only where counted
         let mut refs = old.refs.clone();
+        // alloc: none until a piece came or went; then the names touched, once per stage
         let mut touched: Vec<Sym> = Vec::new();
         for id in self.new.removed_since(old.removals) {
             let Some(list) = refs.of.get(id as usize).copied().filter(|it| !it.is_empty()) else { continue };
-            let entries: SmallVec<[u64; 16]> = refs.lists.get(list).iter().copied().collect();
-            for entry in entries {
+            for at in 0..list.len() {
+                let entry = refs.lists.get(list)[at];
                 refs.count(entry, -1);
                 touched.push(Sym(entry as u32));
             }
@@ -2094,18 +2392,15 @@ impl<'a> Stage<'a> {
         }
         radix::sort_copy_by_key(&mut touched, |it| it.0);
         touched.dedup();
-        let changes = touched
-            .into_iter()
-            .filter_map(|sym| {
-                let (before, after) = (old.refs.class(sym), refs.class(sym));
-                (before != after).then_some((sym, before, after))
-            })
-            .collect();
-        (refs, changes)
+        touched.retain(|sym| old.refs.class(*sym) != refs.class(*sym));
+        (refs, touched)
     }
 
-    /// Resolves the natives and the names, reusing what the image's resolution can.
+    /// Resolves the natives and the names, reusing what the image's resolution can. A stage
+    /// that made and removed no piece, on the image's inputs and names, keeps the image's
+    /// resolution as it is and allocates nothing.
     pub fn resolve(&mut self) -> Result<(), LinkError> {
+        // clone: an `Arc`: the image's resolution, read while this stage's is made
         let old = self.new.resolved.clone();
         let (refs, changes) = self.references(&old);
         let same = old.graph.is_some()
@@ -2113,11 +2408,20 @@ impl<'a> Stage<'a> {
             && (Arc::ptr_eq(&old.names, &self.new.names) || *old.names == *self.new.names)
             && (Arc::ptr_eq(&old.wasm, &self.new.wasm_imports) || *old.wasm == *self.new.wasm_imports)
             && !(self.full && old.stale);
+        if same
+            && changes.is_empty()
+            && old.pieces == self.new.piece_count()
+            && old.removals == self.new.removals()
+        {
+            return Ok(());
+        }
+        // alloc: none unless Rust newly refers to names, once per stage
         let mut gained = Vec::new();
         let mut rebuild = !same;
         if same {
-            for (sym, before, after) in &changes {
-                match settled(old.outcome(*sym), *before, *after, self.full) {
+            for sym in &changes {
+                let (before, after) = (old.refs.class(*sym), refs.class(*sym));
+                match settled(old.outcome(*sym), before, after, self.full) {
                     Next::Nothing => {}
                     Next::Gained => gained.push(*sym),
                     Next::Rebuild => {
@@ -2129,6 +2433,7 @@ impl<'a> Stage<'a> {
         }
         let grown = match (rebuild, gained.is_empty()) {
             (true, _) => None,
+            // clone: every field an `Arc` or copy-on-write: reference counts, no allocation
             (false, true) => Some((*old).clone()),
             (false, false) => self.grow(&old, &refs, &gained)?,
         };
@@ -2139,6 +2444,7 @@ impl<'a> Stage<'a> {
         next.refs = refs;
         next.pieces = self.new.piece_count();
         next.removals = self.new.removals();
+        // alloc: one per stage that made or removed pieces: the resolution its state shares
         self.new.resolved = Arc::new(next);
         Ok(())
     }
@@ -2146,10 +2452,12 @@ impl<'a> Stage<'a> {
     /// Resolves names Rust newly refers to against the kept graph, and makes what they newly
     /// reach; `None` when that needs what only building the graph again gives.
     fn grow(&mut self, old: &Resolved, refs: &Refs, gained: &[Sym]) -> Result<Option<Resolved>, LinkError> {
+        // clone: an `Arc`: the kept graph, read while the stage makes what it reaches
         let Some(graph) = old.graph.clone() else { return Ok(None) };
+        // clone: copy-on-write: reference counts, copied only where marked
         let mut marks = old.marks.clone();
-        let mut outcomes: Vec<(Sym, u8)> = Vec::new();
-        let mut undefined: Vec<Sym> = Vec::new();
+        let mut outcomes: Vec<(Sym, u8)> = Vec::with_capacity(gained.len());
+        let mut undefined: Vec<Sym> = Vec::with_capacity(gained.len());
         let (sections, frames) = {
             let symbols: &Symbols = &*self.symbols;
             let mut marker = Marker::new(&graph, &mut marks, symbols, self.writer);
@@ -2191,8 +2499,9 @@ impl<'a> Stage<'a> {
             marker.run();
             (marker.sections, marker.frames)
         };
+        // alloc: none unless a name's note rose, once per grown resolution
         let mut rose = Vec::new();
-        note_native(&graph, &mut marks, &sections, &frames, &mut rose);
+        note_native(&graph, &mut marks, &sections, &frames, Some(&mut rose));
         for (slot, _, level) in rose {
             let it = &graph.slots[slot as usize];
             let outcome = old.outcome(it.sym);
@@ -2225,7 +2534,7 @@ impl<'a> Stage<'a> {
             let bits = if weak { O_WEAK } else { 0 } | if strong { O_STRONG } else { 0 } | if others { O_OTHERS } else { 0 };
             let decision = self.decide(&graph, sym, weak)?;
             let kind = match &decision {
-                Decision::Special(Special::Section { .. } | Special::Got(_)) => return Ok(None),
+                Decision::Special(Special::Section { .. } | Special::Got { .. }) => return Ok(None),
                 Decision::Special(_) | Decision::Zero | Decision::Skip => O_OTHER,
                 Decision::Import(_, library) if *library == NONE => O_IMPORT,
                 Decision::Import(_, library) if old.library_index[*library as usize] == NONE => return Ok(None),
@@ -2236,7 +2545,6 @@ impl<'a> Stage<'a> {
         }
 
         // Nothing below gives up: make and define what was reached and decided.
-        self.pass();
         let mut scratch = Scratch::default();
         let mut sections = sections;
         radix::sort(&mut sections);
@@ -2255,8 +2563,9 @@ impl<'a> Stage<'a> {
                 self.make_frame(&graph, load, frame, &mut scratch.fixups)?;
             }
         }
+        // clone: every field an `Arc` or copy-on-write: reference counts, no allocation
         let mut next = old.clone();
-        let mut imports: Vec<(Sym, Import)> = Vec::new();
+        let mut imports: Vec<(Sym, Import)> = Vec::with_capacity(decisions.len());
         for (sym, decision, outcome) in decisions {
             match decision {
                 Decision::Special(special) => {
@@ -2311,12 +2620,14 @@ impl<'a> Stage<'a> {
     /// Builds the graph again from the kept objects and makes the image's natives and names
     /// what it gives, touching only what differs.
     fn rebuild(&mut self, old: &Resolved, refs: &Refs) -> Result<Resolved, LinkError> {
-        self.pass();
         let output = self.output;
+        // clone: an `Arc`: the inputs, read while the stage defines and makes pieces
         let inputs = self.new.inputs.clone();
+        // clone: an `Arc`: Rust's names, read while the stage defines them
         let names = self.new.names.clone();
         let mut b = Build::new();
-        let rust: Vec<(Sym, Sym)> = names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)).collect();
+        let mut rust: Vec<(Sym, Sym)> = Vec::with_capacity(names.len());
+        rust.extend(names.iter().map(|(name, target)| (self.symbols.intern(SymKey::Name(*name)), *target)));
         for (sym, _) in &rust {
             let slot = b.slot(*sym);
             b.flag(slot, RUST);
@@ -2356,8 +2667,12 @@ impl<'a> Stage<'a> {
 
         // Load: the line's objects and whole archives, then members for what is strongly
         // undefined, round by round.
-        let mut round: Vec<(u32, u32)> = Vec::new();
-        let mut lazy: Vec<u32> = Vec::new();
+        let whole = |input: &Input| match &*input.file {
+            NativeFile::Archive(archive) if matches!(input.kind, NativeKind::Archive { whole: true }) => archive.members.len(),
+            _ => 1,
+        };
+        let mut round: Vec<(u32, u32)> = Vec::with_capacity(inputs.iter().map(whole).sum());
+        let mut lazy: Vec<u32> = Vec::with_capacity(inputs.len());
         for (at, input) in inputs.iter().enumerate() {
             let at = at as u32;
             match &*input.file {
@@ -2367,6 +2682,7 @@ impl<'a> Stage<'a> {
                 }
                 NativeFile::Archive(_) => lazy.push(at),
                 NativeFile::Shared(_) => {
+                    // clone: an `Arc`: the library's file, for the exports
                     b.shared.push((input.file.clone(), matches!(input.kind, NativeKind::Shared { as_needed: true })));
                 }
             }
@@ -2382,6 +2698,7 @@ impl<'a> Stage<'a> {
                     Read::Index(_) => {}
                 }
             }
+            // alloc: none when nothing is pulled; the members pulled, once per pull round
             let mut next: Vec<(u32, u32)> = Vec::new();
             for slot in std::mem::take(&mut b.queue) {
                 if b.graph.slots[slot as usize].flags & RUST != 0 || b.graph.best(slot).is_some() {
@@ -2406,7 +2723,7 @@ impl<'a> Stage<'a> {
             pulled = true;
         }
         b.aliases(&*self.symbols)?;
-        let mut commons: Vec<(Sym, u64, u64)> = Vec::new();
+        let mut commons: Vec<(Sym, u64, u64)> = Vec::with_capacity(b.commons.len());
         for (slot, (size, align)) in &b.commons {
             let Some((load, symbol)) = b.graph.best(*slot) else { continue };
             if matches!(b.graph.object(load).symbols[symbol as usize].def, SymbolDef::Common { .. }) {
@@ -2417,11 +2734,14 @@ impl<'a> Stage<'a> {
         let mut shared = std::mem::take(&mut b.shared);
         shared.extend(b.members.drain(..).map(|it| (it, false)));
         b.graph.exports = match old.graph.as_ref().map(|it| &it.exports) {
+            // clone: an `Arc`: the libraries are the image's, so are their exports
             Some(it) if it.same(&shared) => it.clone(),
+            // alloc: once per change of the link's shared libraries
             _ => Arc::new(Exports::build(shared).map_err(|what| error(None, what))?),
         };
         b.graph.archives = archives;
         b.graph.index();
+        // alloc: once per graph built, shared by the stages after
         let graph = Arc::new(b.graph);
 
         // Collect.
@@ -2440,12 +2760,13 @@ impl<'a> Stage<'a> {
             marker.run();
             (marker.sections, marker.frames)
         };
-        note_native(&graph, &mut marks, &sections, &frames, &mut Vec::new());
+        note_native(&graph, &mut marks, &sections, &frames, None);
 
         // What went: sections, frame records and commons the image has and the graph does not
         // keep. Loads whose sections came or went, or whose globals' winners changed, have
         // their symbols defined again; the rest are as they were.
         let mut affected = Bits::default();
+        // alloc: none when nothing went; what went, once per graph built
         let mut gone: Vec<Sym> = Vec::new();
         if let Some(was) = &old.graph {
             for (l, it) in was.loads.iter().enumerate() {
@@ -2471,7 +2792,7 @@ impl<'a> Stage<'a> {
                 self.unmake(piece);
             }
         }
-        let mut fresh_commons = Vec::new();
+        let mut fresh_commons = Vec::with_capacity(commons.len());
         {
             let (was, now) = (&old.commons[..], &commons[..]);
             let (mut i, mut j) = (0, 0);
@@ -2624,6 +2945,7 @@ impl<'a> Stage<'a> {
             let slot = *graph.slot_of.get(&sym)?;
             graph.defined(slot).then(|| graph.kind(slot))
         };
+        // alloc: the names left to resolve, once per graph built
         let mut wanted: Vec<Sym> = Vec::new();
         for (slot, it) in graph.slots.iter().enumerate() {
             if it.flags & (ROOT | REQUIRED) != 0 || marks.native_of(slot as u32) > 0 || refs.class(it.sym) > 0 {
@@ -2635,16 +2957,26 @@ impl<'a> Stage<'a> {
             if kind_of(*sym).is_some() {
                 continue;
             }
-            let special = self.symbols.name_of(*sym).and_then(|it| self.writer.special(it));
-            if let Some(Special::Got(target)) = special {
-                cells.insert(self.symbols.sym_name(&target));
-            }
+            let Some(name) = self.symbols.name_of(*sym) else { continue };
+            let Some(target) = self.writer.special(name).and_then(|it| it.got_target(name)) else { continue };
+            let target = match self.symbols.find_sym_name(target) {
+                Some(it) => it,
+                None => {
+                    // Copied out of the table it is interned into.
+                    let arena: &'a bumpalo::Bump = self.arena;
+                    let target: &str = arena.alloc_str(target);
+                    self.symbols.sym_name(target)
+                }
+            };
+            cells.insert(target);
         }
         wanted.extend(cells.iter().copied());
         wanted.sort_unstable();
         wanted.dedup();
         let mut outcomes: Vec<(Sym, u8)> = Vec::with_capacity(wanted.len());
+        // alloc: none without imports; the imports decided, once per graph built
         let mut imports: Vec<(Sym, Import, u32)> = Vec::new();
+        // alloc: none without the linker's names; those decided, once per graph built
         let mut specials: Vec<(Sym, Special)> = Vec::new();
         for sym in wanted {
             let slot = graph.slot_of.get(&sym).copied();
@@ -2658,7 +2990,7 @@ impl<'a> Stage<'a> {
                 Some(kind) => kind,
                 None => match self.decide(&graph, sym, weak)? {
                     Decision::Special(special) => {
-                        let kind = if matches!(special, Special::Section { .. } | Special::Got(_)) { O_MARKS } else { O_OTHER };
+                        let kind = if matches!(special, Special::Section { .. } | Special::Got { .. }) { O_MARKS } else { O_OTHER };
                         specials.push((sym, special));
                         kind
                     }
@@ -2688,18 +3020,21 @@ impl<'a> Stage<'a> {
         // The libraries the image needs, and its imports: kept in their order across
         // incremental links so that no bind moves.
         let exports = &graph.exports;
+        // alloc: one flag per shared library, once per graph built
         let mut used = vec![false; exports.libraries.len()];
         for (_, _, library) in &imports {
             if *library != NONE {
                 used[*library as usize] = true;
             }
         }
+        // alloc: one index per shared library, once per graph built; kept as the image's
         let mut index = vec![NONE; exports.libraries.len()];
-        let mut needed: Vec<Library> = Vec::new();
+        let mut needed: Vec<Library> = Vec::with_capacity(exports.libraries.len());
         for (at, library) in exports.libraries.iter().enumerate() {
             if exports.canonical[at] == at as u32 && (!library.as_needed || used[at]) {
                 index[at] = needed.len() as u32;
-                needed.push(library.clone());
+                // clone: the edge: the image's needed list owns its libraries' names, once per graph built
+                needed.push(Library { name: library.name.clone(), as_needed: library.as_needed });
             }
         }
         let mut current: FxHashMap<Sym, Import> = FxHashMap::with_capacity_and_hasher(imports.len(), Default::default());
@@ -2715,6 +3050,7 @@ impl<'a> Stage<'a> {
                 match current.remove(sym) {
                     Some(it) => order.push((*sym, it, true)),
                     None => {
+                        // clone: one per import kept in place, once per graph built
                         let mut stale = import.clone();
                         stale.library = import.library.and_then(|library| {
                             let name = &old.libraries.get(library as usize)?.name;
@@ -2726,7 +3062,8 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        let mut new: Vec<(Sym, Import)> = current.into_iter().collect();
+        let mut new: Vec<(Sym, Import)> = Vec::with_capacity(current.len());
+        new.extend(current);
         new.sort_by(|a, b| a.1.name.cmp(&b.1.name));
         order.extend(new.into_iter().map(|(sym, import)| (sym, import, true)));
         let stale = order.iter().any(|it| !it.2);
@@ -2750,10 +3087,12 @@ impl<'a> Stage<'a> {
         }
         if let Some(entry) = graph.entry {
             if self.new.def(entry) == Def::None {
+                // alloc: error path
                 return Err(error(None, format!("the entry point {} is not defined", self.symbols.describe(entry))));
             }
         }
 
+        // clone: copy-on-write: copied only where an outcome changes
         let mut table = old.outcomes.clone();
         for sym in old.named.iter() {
             table.set(Symbols::dense(*sym), 0, || 0);
@@ -2769,18 +3108,24 @@ impl<'a> Stage<'a> {
         }
         // The same lists keep their identity: the writer rebinds only when they change.
         Ok(Resolved {
-            imports: if *old.imports == imports { old.imports.clone() } else { Arc::new(imports) },
-            import_syms: if *old.import_syms == import_syms { old.import_syms.clone() } else { Arc::new(import_syms) },
-            libraries: if *old.libraries == needed { old.libraries.clone() } else { Arc::new(needed) },
+            imports: keep(&old.imports, imports),
+            import_syms: keep(&old.import_syms, import_syms),
+            libraries: keep(&old.libraries, needed),
+            // clone: an `Arc`
             exports: graph.asked.clone(),
             stale,
             refs: Refs::default(),
             pieces: 0,
             removals: 0,
+            // clone: an `Arc`
             inputs: self.new.inputs.clone(),
+            // clone: an `Arc`
             names: self.new.names.clone(),
+            // clone: an `Arc`
             wasm: self.new.wasm_imports.clone(),
+            // alloc: once per graph built
             library_index: Arc::new(index),
+            // alloc: once per graph built
             commons: Arc::new(commons),
             marks,
             outcomes: table,
@@ -2790,6 +3135,20 @@ impl<'a> Stage<'a> {
         })
     }
 }
+
+/// `was` when it holds `now`, so the list keeps its identity; else `now`.
+fn keep<T: PartialEq>(was: &Arc<Vec<T>>, now: Vec<T>) -> Arc<Vec<T>> {
+    if **was == now {
+        // clone: an `Arc`
+        was.clone()
+    } else {
+        // alloc: once per graph built whose list changed
+        Arc::new(now)
+    }
+}
+
+#[cfg(test)]
+mod ties_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2861,37 +3220,39 @@ mod tests {
 
     #[test]
     fn a_reader_s_ranges_and_indexes_are_checked() {
-        let (names, list) = names(&[".text", "f"]);
-        let good = Object {
-            sections: vec![section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Input(0..16), 0..1)],
-            symbols: vec![symbol(list[1], SymbolDef::Section { section: 0, value: 0, size: 4 }, Binding::Global, SymbolKind::Function)],
-            fixups: vec![crate::model::NativeFixup { at: 0, apply: Apply::Abs64, symbol: 0, addend: 0, minus: None }],
-            names: names.clone(),
-            ..Object::default()
+        let good = || {
+            let (names, list) = names(&[".text", "f"]);
+            Object {
+                sections: vec![section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Input(0..16), 0..1)],
+                symbols: vec![symbol(list[1], SymbolDef::Section { section: 0, value: 0, size: 4 }, Binding::Global, SymbolKind::Function)],
+                fixups: vec![crate::model::NativeFixup { at: 0, apply: Apply::Abs64, symbol: 0, addend: 0, minus: None }],
+                names,
+                ..Object::default()
+            }
         };
-        assert_eq!(check_object(&good, 16), Ok(()));
-        assert!(check_object(&good, 15).unwrap_err().contains("past the input's 15"));
+        assert_eq!(check_object(&good(), 16), Ok(()));
+        assert!(check_object(&good(), 15).unwrap_err().contains("past the input's 15"));
 
-        let mut bad = good.clone();
+        let mut bad = good();
         bad.fixups[0].symbol = 1;
         assert!(check_object(&bad, 16).unwrap_err().contains("past the object's 1"));
 
-        let mut bad = good.clone();
+        let mut bad = good();
         bad.sections[0].fixups = 0..2;
         assert!(check_object(&bad, 16).unwrap_err().contains("relocations"));
 
-        let mut bad = good.clone();
+        let mut bad = good();
         bad.symbols[0].def = SymbolDef::Section { section: 1, value: 0, size: 0 };
         assert!(check_object(&bad, 16).unwrap_err().contains("past the object's 1"));
 
-        let mut bad = good.clone();
-        bad.groups = vec![Group { name: list[1], sections: 0..1, largest: false }];
+        let mut bad = good();
+        bad.groups = vec![Group { name: bad.symbols[0].name, sections: 0..1, largest: false }];
         bad.grouped = vec![4];
         assert!(check_object(&bad, 16).unwrap_err().contains("COMDAT"));
 
         let mut foreign = Names::default();
         foreign.push("a much longer name than any of these").unwrap();
-        let mut bad = good;
+        let mut bad = good();
         bad.symbols[0].name = foreign.push("x").unwrap();
         assert!(check_object(&bad, 16).unwrap_err().contains("outside"));
     }
@@ -2947,6 +3308,47 @@ mod tests {
         assert_eq!(parsed.frame_fixups.get(0), &[] as &[u32]);
         assert_eq!(parsed.frame_fixups.get(1), &[1]);
         assert_eq!(parsed.frame_sym(1), Sym(7));
+    }
+
+    /// An object of `n` text sections, each defining a symbol and referring to the next.
+    fn chain(n: u32) -> Object {
+        let (names, list) = names(&[".text", "f"]);
+        Object {
+            sections: (0..n).map(|it| section(list[0], SectionKind::Alloc(Class::Text, 0), Data::Zero(8), it..it + 1)).collect(),
+            symbols: (0..n)
+                .map(|it| symbol(list[1], SymbolDef::Section { section: it, value: 0, size: 8 }, Binding::Global, SymbolKind::Function))
+                .collect(),
+            fixups: (0..n)
+                .map(|it| crate::model::NativeFixup { at: 0, apply: Apply::Abs64, symbol: (it + 1) % n, addend: 0, minus: None })
+                .collect(),
+            names,
+            ..Object::default()
+        }
+    }
+
+    #[test]
+    fn a_native_read_allocates_per_object_not_per_section_or_symbol() {
+        let obj = Obj { native: IdNo(0), member: 0 };
+        let mut counts = Vec::new();
+        for n in [10, 1000] {
+            let object = chain(n);
+            blaze_alloc_count::assert_at_most(0, "an object checked", || check_object(&object, 0).unwrap());
+            {
+                let mut keys = Vec::with_capacity(2 * n as usize);
+                blaze_alloc_count::assert_at_most(0, "an object's keys into reserved room", || object_keys(obj, &object, &[], &mut keys));
+                assert_eq!(keys.len(), 2 * n as usize);
+            }
+
+            let file = Arc::new(NativeFile::Object(object));
+            let syms: Vec<Sym> = (0..2 * n).map(Sym).collect();
+            // The pairs, two indexes of two lists each and the groups: none per section or symbol.
+            let (parsed, used) = blaze_alloc_count::measure(|| Parsed::new(obj, file, 0, syms, &[], &[]));
+            assert!(used.allocations <= 8, "{n} sections and symbols: {used:?}");
+            assert_eq!(parsed.refs.get(0), &[1]);
+            assert_eq!(parsed.defs.get(n as usize - 1), &[n - 1]);
+            counts.push(used.allocations);
+        }
+        assert_eq!(counts[0], counts[1], "the same count at 10 and 1000");
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub(crate) fn build(db: &RootDatabase, places: &Places) -> Model {
     let by_trait_arg = impls_by_trait_arg(db, places);
     let built: Vec<(CrateDoc, Vec<Warning>)> = (0..places.crates.len())
         .into_par_iter()
-        .map_with(db.clone(), |db, krate| {
+        .map(|krate| {
             hir::attach_db(db, || {
                 let builder = Builder {
                     db,

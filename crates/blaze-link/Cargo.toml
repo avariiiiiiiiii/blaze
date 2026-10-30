@@ -24,6 +24,7 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-live.workspace = true
+blaze-mem.workspace = true
 bumpalo.workspace = true
 gimli.workspace = true
 hashbrown.workspace = true

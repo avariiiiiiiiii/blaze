@@ -4,8 +4,10 @@
 
 use std::sync::Arc;
 
+use syntax_tree::Text;
+
 /// `parts` one after the other, written once into the shared text's allocation.
-pub(crate) fn joined(parts: &[&str]) -> Arc<str> {
+pub(crate) fn joined(parts: &[&str]) -> Text {
     let len = parts.iter().map(|it| it.len()).sum();
     let mut bytes = Arc::<[u8]>::new_uninit_slice(len);
     let out = Arc::get_mut(&mut bytes).expect("a new Arc has no other owner");
@@ -27,7 +29,8 @@ pub(crate) fn joined(parts: &[&str]) -> Arc<str> {
     // SAFETY: the bytes are whole `&str`s one after the other, so valid UTF-8, and `str` has
     // the layout of `[u8]`, so the pointer from `into_raw` is a valid `Arc<str>` allocation.
     // Bytes that were not UTF-8 would break every `str` method on the result.
-    unsafe { Arc::from_raw(Arc::into_raw(bytes) as *const str) }
+    let text: Arc<str> = unsafe { Arc::from_raw(Arc::into_raw(bytes) as *const str) };
+    Text::from(text)
 }
 
 #[cfg(test)]

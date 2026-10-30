@@ -27,23 +27,33 @@ use cranelift_codegen::ir::{
     types,
 };
 
-use super::{Kind, Konst, KonstRef, NONE, Plan, Sel, scan::reset, slots::GLOBAL};
+use super::{
+    Kind, Konst, KonstRef, NONE, Plan, Sel,
+    scan::reset,
+    slots::{GLOBAL, has},
+};
 use crate::{
     Error, Target,
     arch::Glue,
     shape::{Aux, Dst, FloatCc, Info, IntCc, Op, RmwOp, Shape, Src, Ty},
+    table::format::Reader,
 };
 
-pub(super) fn run<A: Glue>(plan: &mut Plan, func: &ir::Function, target: &Target) -> Result<(), Error> {
+pub(super) fn run<A: Glue>(
+    plan: &mut Plan,
+    func: &ir::Function,
+    target: &Target,
+    library: &Reader<'_>,
+) -> Result<(), Error> {
     reset(&mut plan.sels, func.dfg.num_insts(), Sel::default());
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             if plan.dead[inst.as_u32() as usize] {
                 continue;
             }
-            let mut sel = one::<A>(plan, func, target, inst)?;
+            let mut sel = one::<A>(plan, func, target, library, inst)?;
             if sel.kind == Kind::Stencil {
-                fuse(plan, func, inst, &mut sel);
+                fuse(plan, func, library, inst, &mut sel);
             }
             plan.sels[inst.as_u32() as usize] = sel;
         }
@@ -86,7 +96,13 @@ pub(super) fn run<A: Glue>(plan: &mut Plan, func: &ir::Function, target: &Target
 }
 
 /// What writes `inst`, and its base shape if a stencil does.
-fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Inst) -> Result<Sel, Error> {
+fn one<A: Glue>(
+    plan: &Plan,
+    func: &ir::Function,
+    target: &Target,
+    library: &Reader<'_>,
+    inst: ir::Inst,
+) -> Result<Sel, Error> {
     let data = func.dfg.insts[inst];
     let opcode = data.opcode();
     match opcode {
@@ -99,6 +115,7 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
     let Some(op) = op_of(opcode) else {
         return Err(Error::at(
             inst,
+            // alloc: the error's message, once per failed compile.
             format!("`{opcode}` of {}: no stencil is of it and the glue does not write it", type_name(func, inst)),
         ));
     };
@@ -110,6 +127,7 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
     if args.len() != usize::from(info.args) || results.len() != usize::from(info.results) {
         return Err(Error::at(
             inst,
+            // alloc: the error's message, once per failed compile.
             format!(
                 "`{opcode}` with {} operands and {} results, where the `{}` stencils take {} and give {}",
                 args.len(),
@@ -128,6 +146,7 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
     let ty = match ty_value(func, inst, op) {
         Some(ty) => ty_of(ty).ok_or_else(|| no_type(inst, opcode, ty))?,
         None => info.tys.iter().next().ok_or_else(|| {
+            // alloc: the error's message, once per failed compile.
             Error::at(inst, format!("the `{}` stencils are of no type", info.name))
         })?,
     };
@@ -162,6 +181,7 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
             _ => args.first(),
         };
         let source = source.ok_or_else(|| {
+            // alloc: the error's message, once per failed compile.
             Error::at(inst, format!("`{opcode}` has no value its stencil's `aux` type is of"))
         })?;
         let source_ty = func.dfg.value_type(*source);
@@ -174,6 +194,7 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
         _ => data.trap_code(),
     };
     if info.traps && sel.trap.is_none() {
+        // alloc: the error's message, once per failed compile.
         return Err(Error::at(inst, format!("the `{}` stencils trap, and `{opcode}` has no trap code", info.name)));
     }
 
@@ -184,11 +205,12 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
             let (imm, wide) = immediate(konst);
             sel.imm = imm;
             let auxes: [u8; 2] = if wide { [1, 0] } else { [0, 1] };
-            auxes.into_iter().map(|aux| Shape { op, ty, aux, srcs: [Src::None; 3], dst }).find(|it| it.exists())
+            auxes.into_iter().map(|aux| Shape { op, ty, aux, srcs: [Src::None; 3], dst }).find(|it| has(library, *it))
         }
-        _ => base(plan, func, info, Shape { op, ty, aux, srcs: [Src::None; 3], dst }, sel.args()),
+        _ => base(plan, func, library, info, Shape { op, ty, aux, srcs: [Src::None; 3], dst }, sel.args()),
     };
     sel.shape = shape.ok_or_else(|| {
+        // alloc: the error's message, once per failed compile.
         Error::at(inst, format!("`{opcode}` of {}: no stencil of `{}` takes its operands", ty.name(), info.name))
     })?;
     Ok(sel)
@@ -196,7 +218,14 @@ fn one<A: Glue>(plan: &Plan, func: &ir::Function, target: &Target, inst: ir::Ins
 
 /// The shape of `shape`'s op with as many of `args` folded as immediates as one of the set
 /// takes, and every other operand from its slot.
-fn base(plan: &Plan, func: &ir::Function, info: &Info, shape: Shape, args: &[ir::Value]) -> Option<Shape> {
+fn base(
+    plan: &Plan,
+    func: &ir::Function,
+    library: &Reader<'_>,
+    info: &Info,
+    shape: Shape,
+    args: &[ir::Value],
+) -> Option<Shape> {
     let mut foldable = 0u8;
     for (n, &arg) in args.iter().enumerate() {
         if info.imm & (1 << n) != 0 && folds(plan, func, arg) {
@@ -209,7 +238,7 @@ fn base(plan: &Plan, func: &ir::Function, info: &Info, shape: Shape, args: &[ir:
         for n in 0..args.len() {
             it.srcs[n] = if imms & (1 << n) != 0 { Src::Imm } else { Src::Slot };
         }
-        if it.exists() {
+        if has(library, it) {
             return Some(it);
         }
         if imms == 0 {
@@ -228,7 +257,7 @@ fn folds(plan: &Plan, func: &ir::Function, value: ir::Value) -> bool {
 }
 
 /// An `Iconst`/`Fconst` stencil's `Imm0`, and whether it needs all 64 bits.
-fn immediate(konst: Konst) -> (i64, bool) {
+pub(super) fn immediate(konst: Konst) -> (i64, bool) {
     match konst {
         Konst::Int(it) => (it, i32::try_from(it).is_err()),
         Konst::F16(bits) => (i64::from(bits as i16), false),
@@ -240,7 +269,7 @@ fn immediate(konst: Konst) -> (i64, bool) {
 
 /// Fuses `inst` (a `brif` or `select`) with the `icmp` right before it that only it uses,
 /// when the fused shape exists.
-fn fuse(plan: &mut Plan, func: &ir::Function, inst: ir::Inst, sel: &mut Sel) {
+fn fuse(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
     let op = sel.shape.op;
     if !matches!(op, Op::Brif | Op::Select) {
         return;
@@ -276,7 +305,7 @@ fn fuse(plan: &mut Plan, func: &ir::Function, inst: ir::Inst, sel: &mut Sel) {
             (shape, args, cc)
         }
     };
-    let Some(shape) = base(plan, func, fused.op.info(), fused, &args) else { return };
+    let Some(shape) = base(plan, func, library, fused.op.info(), fused, &args) else { return };
     let at = plan.ord[inst.as_u32() as usize];
     for value in args {
         let last = &mut plan.last[value.as_u32() as usize];
@@ -314,13 +343,6 @@ fn by_operand(op: Op) -> bool {
             | Op::VhighBits
             | Op::Extractlane
             | Op::Isplit
-            | Op::Snarrow
-            | Op::Unarrow
-            | Op::Uunarrow
-            | Op::SwidenLow
-            | Op::SwidenHigh
-            | Op::UwidenLow
-            | Op::UwidenHigh
             | Op::Store
             | Op::Istore8
             | Op::Istore16
@@ -333,6 +355,7 @@ fn little_endian(func: &ir::Function, inst: ir::Inst, flags: ir::MemFlags) -> Re
     match func.dfg.mem_flags[flags].explicit_endianness() {
         Some(ir::Endianness::Big) => Err(Error::at(
             inst,
+            // alloc: the error's message, once per failed compile.
             format!("`{}` of big-endian memory: every stencil is little-endian", func.dfg.insts[inst].opcode()),
         )),
         _ => Ok(()),
@@ -340,12 +363,15 @@ fn little_endian(func: &ir::Function, inst: ir::Inst, flags: ir::MemFlags) -> Re
 }
 
 fn no_type(inst: ir::Inst, opcode: Opcode, ty: ir::Type) -> Error {
+    // alloc: the error's message, once per failed compile.
     Error::at(inst, format!("`{opcode}` of {ty}: no stencil is of that type"))
 }
 
 fn type_name(func: &ir::Function, inst: ir::Inst) -> String {
     match func.dfg.inst_results(inst).first().or(func.dfg.inst_args(inst).first()) {
+        // alloc: part of an error's message, once per failed compile.
         Some(value) => func.dfg.value_type(*value).to_string(),
+        // alloc: as above.
         None => "no type".to_owned(),
     }
 }

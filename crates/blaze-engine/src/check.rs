@@ -12,10 +12,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use ide_db::{
-    ChangeWithProcMacros, RootDatabase,
-    base_db::{SourceDatabase as _, TargetKind},
-};
+use ide_db::{ChangeWithProcMacros, RootDatabase, base_db::TargetKind};
 use intern::sym;
 use project_model::ProjectWorkspaceKind;
 use rustc_hash::{FxHashMap, FxHashSet};

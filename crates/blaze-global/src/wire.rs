@@ -366,7 +366,7 @@ pub(crate) fn publish_answer(statuses: &[(Key, Result<(), String>)], out: &mut V
 
 #[cfg(test)]
 mod tests {
-    use blaze_core::sim::Rng;
+    use blaze_ids::rng::SplitMix64 as Rng;
 
     use super::*;
 

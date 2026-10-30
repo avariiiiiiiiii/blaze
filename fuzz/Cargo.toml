@@ -240,6 +240,7 @@ blaze-ids.workspace = true
 # `fuzz_read` and the reference readers the link targets call.
 blaze-link = { workspace = true, features = ["fuzz"] }
 blaze-macro-wasm.workspace = true
+blaze-mem.workspace = true
 # `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.
 blaze-protocol = { workspace = true, features = ["reference"] }
 blaze-query.workspace = true

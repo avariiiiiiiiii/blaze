@@ -120,6 +120,7 @@ impl Reads {
 /// - ran with no active query.
 ///
 /// Frames nest: the reads of a frame inside `f` are reads of this one too.
+// dyn: the edge: salsa's public database handle, one vtable call per query entry
 pub fn capture_reads<R>(db: &dyn Database, f: impl FnOnce() -> R) -> (R, Option<Reads>) {
     let (zalsa, zalsa_local) = db.zalsas();
     // SAFETY: The closure does not access the query stack.
@@ -153,6 +154,7 @@ pub fn capture_reads<R>(db: &dyn Database, f: impl FnOnce() -> R) -> (R, Option<
 /// # Panics
 ///
 /// If `reads` was captured in another revision.
+// dyn: the edge: salsa's public database handle, one vtable call per query entry
 pub fn replay_reads(db: &dyn Database, reads: Reads) {
     let (zalsa, zalsa_local) = db.zalsas();
     let current = zalsa.current_revision();
@@ -179,6 +181,7 @@ pub fn replay_reads(db: &dyn Database, reads: Reads) {
 ///
 /// Frames of the queries below the active one on the task's stack are untouched: they depend on
 /// the active query through its memo's edge, which carries every read it made.
+// dyn: the edge: salsa's public database handle, one vtable call per query entry
 pub fn unshareable_reads(db: &dyn Database) {
     let zalsa_local = db.zalsa_local();
     // SAFETY: The closure does not access the query stack.
@@ -330,7 +333,9 @@ impl Captures {
             }
             None => Frame {
                 base,
+                // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures
                 read: Vec::new(),
+                // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures
                 old: Vec::new(),
                 durability: Durability::MAX,
                 changed_at: Revision::start(),

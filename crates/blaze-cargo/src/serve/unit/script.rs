@@ -75,7 +75,8 @@ pub(crate) fn inert(job: &Job, unit: usize) -> Option<Value> {
 fn work_out_inert(job: &Job, compile: usize) -> Option<Value> {
     let units = job.units();
     let root = units.graph.units.get(compile)?.target.src_path.to_string_lossy().into_owned();
-    let (_, _, bytes) = job.mounted.read(&root)?;
+    // A root file whose bytes fail their check stopped the job as it was lowered.
+    let (_, _, bytes) = job.mounted.read(&root).ok()??;
     let files: BTreeMap<PathBuf, Vec<u8>> = [(PathBuf::from(&root), bytes.to_vec())].into();
     script::inert(Path::new(&root), &files, &units.plans.get(compile)?.rustflags)
 }

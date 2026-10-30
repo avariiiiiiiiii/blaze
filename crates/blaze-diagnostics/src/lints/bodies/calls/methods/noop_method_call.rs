@@ -6,6 +6,7 @@
 //! `compiler/rustc_lint/src/lints.rs` (`NoopMethodCallDiag`, `SuspiciousDoubleRefDerefDiag`,
 //! `SuspiciousDoubleRefCloneDiag`) (MIT or Apache-2.0).
 
+use base_db::Db;
 use either::Either;
 use hir::InFile;
 use hir_def::{AdtId, AttrDefId, HasModule as _, ItemContainerId, Lookup as _, hir::ExprId, src::HasSource as _};
@@ -150,7 +151,7 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 
 /// rustc's `def_span` of an ADT: its header, from its visibility to its generics.
 fn adt_def_span(b: &BodyCx<'_, '_>, adt: AdtId) -> Span {
-    let db: &dyn HirDatabase = b.db();
+    let db: &Db = b.db();
     let node: InFile<SyntaxNode> = match adt {
         AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
         AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),

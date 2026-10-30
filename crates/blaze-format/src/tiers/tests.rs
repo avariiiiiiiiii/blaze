@@ -5,9 +5,9 @@ use blaze_v2_proof::{Rng, columns};
 use super::{
     BufferColumns, COLD_HEADER, CORRUPT, Codec, ColdDictionary, HotColumn, HotRef, Packed,
     WarmColumn, WarmRef, Width, cold_codec, columns_of, compress, decode_cold, decode_cold_bytes,
-    decode_raw, encode_cold, encode_cold_bytes, encode_raw, put_varint, raw_cold,
+    decode_raw, encode_cold, encode_cold_bytes, encode_raw, raw_cold,
 };
-use crate::{Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, open, record, row_words};
+use crate::{Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, leb, open, record, row_words};
 
 const SEEDS: [u64; 4] = [1, 17, 4242, 0x9e37_79b9_7f4a_7c15];
 
@@ -375,7 +375,7 @@ fn a_corrupt_cold_column_is_refused() {
 
     let huge = |codec: Codec| {
         let mut raw = vec![codec as u8];
-        put_varint(&mut raw, 1 << 40);
+        leb::write_u64(&mut raw, 1 << 40);
         raw
     };
     for codec in Codec::ALL {
@@ -383,10 +383,10 @@ fn a_corrupt_cold_column_is_refused() {
         assert_eq!(decode_cold(&compress(&huge(codec), None), None), Err(CORRUPT));
     }
     let mut words = vec![Codec::Plain as u8];
-    put_varint(&mut words, 1 << 31);
-    put_varint(&mut words, 0);
+    leb::write_u64(&mut words, 1 << 31);
+    leb::write_u64(&mut words, 0);
     words.push(32);
-    put_varint(&mut words, 1 << 31);
+    leb::write_u64(&mut words, 1 << 31);
     assert_eq!(decode_raw(&words), Err(CORRUPT));
     assert_eq!(decode_raw(&[9, 0]), Err(CORRUPT));
     assert_eq!(decode_raw(&[]), Err(CORRUPT));

@@ -20,17 +20,20 @@ lines), and blaze-diagnostics' `emit.rs` (memchr).
 
 After:
 
-- **Text is the VFS's bytes.** `blaze_vfs::text_of(Bytes) -> Result<Text, Utf8Error>`
-  (`crates/blaze-vfs/src/text.rs`) checks a file's `Bytes` (a heap file's `Arc<[u8]>` or a range
-  of the mapped image) are UTF-8 once. A `Text` is those bytes, lent as `&str`.
-  `Text::shared()` gives a heap file's `Arc<str>`, the same allocation with one more count.
-  `Reader::text` and `Vfs::text` read a file that way. base-db's view install (`write_view`)
+- **Text is the VFS's bytes.** `text_of(Bytes) -> Result<Text, Utf8Error>`
+  (`crates/blaze-bytes`, re-exported by blaze-vfs and, as `Text`, by `syntax-tree` and `syntax`)
+  checks a file's `Bytes` (a heap file's `Arc<[u8]>`, a range of the mapped image, or a
+  `'static` slice) are UTF-8 once. A `Text` is those bytes, lent as `&str`. `Text::shared()`
+  gives a heap file's `Arc<str>`, the same allocation with one more count, and
+  `Text::from(Arc<str>)` is the reverse, with no copy. `Reader::text` and `Vfs::text`
+  (`crates/blaze-vfs/src/text.rs`) read a file that way. base-db's view install (`write_view`)
   calls it for each file whose content changed, so a text is checked once per content ID and
   never copied.
-- **Not yet for image files.** `FileText` and the parse tree hold an `Arc<str>`, which an image
-  range can't be without a copy. Until both hold a `Text` (requested of the coordinator: move
-  `Bytes` and `Text` below `syntax-tree`), base-db refuses an image file with
-  `ViewError::Mapped` rather than copying it.
+- **The parse tree's source is the same `Text`.** `FlatTree::source()` is a `Text`, and so is
+  each lazy part's (`Expand` builds the part over the file's text with `sourced_range`). The
+  parse functions take `impl Into<Text>`. Once `FileText` and hir-def's `BodySyntax` hold a
+  `Text` (requested of db), a file restored from the image goes from the mapped bytes to the
+  parse with no copy, and nothing has to be refused.
 - **One line index per text, built on first use.** `span::LineIndex`
   (`crates/span/src/lines.rs`) is made by the base-db query `line_index(db, FileText)`, which
   nothing calls on load: only a diagnostic, `line!`/`column!`, a caller location, a proc macro's
@@ -104,6 +107,9 @@ A text of N bytes on one core:
 | Where | What | Request |
 | --- | --- | --- |
 | `crates/blaze-vfs/src/lib.rs` | declare `text` (unsafe allowed), export `text_of` | `v2/requests/frontend-journal.md`, applied |
+| `crates/blaze-vfs` (`store.rs`, `image.rs`, `lib.rs`, `Cargo.toml`) | `Bytes` is `blaze_bytes::Bytes`, image ranges through `Bytes::held`; export `Text`, `TextFile` | `v2/requests/frontend-journal.md` |
+| root `Cargo.toml` | `blaze-bytes` workspace dependency | `v2/requests/frontend.md` |
+| `crates/base-db`, `crates/hir-def` | `FileText` and `BodySyntax` hold a `Text`; two callers of the tree's source | `v2/requests/db.md` |
 | `crates/base-db` | `line_index` query; `ViewFile` carries the tree's `Arc<[u8]>`; `FileText` from `text_of` | `v2/requests/db.md` |
 | `crates/hir-expand` | `line_and_column` on `line_index`, `line_starts` removed | `v2/requests/db.md` |
 | `crates/load-cargo` | `set_files`' `ViewFile`; `line_column` on `line_index` | `v2/requests/cargo.md` |
@@ -129,10 +135,14 @@ In `crates/span/src/lines/tests.rs`:
   `rustcs_columns_by_example`, `columns_need_a_char_boundary`,
   `ascii_display_width_is_char_widths`, `the_index_costs_an_eighth_of_the_text`.
 
-In `crates/blaze-vfs/src/text.rs`:
+In `crates/blaze-bytes/src/tests.rs` and `crates/blaze-vfs/src/text.rs`:
 
 - `text_shares_the_bytes` and `a_tree_file_is_read_as_its_own_bytes`: the text is the tree's
   allocation (same pointer, count moved), through `text_of`, `Reader::text` and `Vfs::text`.
+- `held_bytes_keep_their_owner`, `an_arc_str_is_text_as_it_is`,
+  `static_bytes_are_neither_shared_nor_held`: each kind of owner, and `Arc<str>` both ways.
+- `text_allocates_nothing` and `reading_text_allocates_nothing`: making, cloning, sharing and
+  reading text allocate nothing.
 - `bytes_that_are_not_utf8_say_where`: a refusal reports where the bytes stop being UTF-8 and
   drops its count.
 - `the_check_is_stds`: the ASCII-prefix check gives std's `from_utf8` result, error included,

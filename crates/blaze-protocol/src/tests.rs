@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -328,15 +329,12 @@ fn what_is_not_deterministic_is_refused() {
     assert!(to_vec(&u128::MAX).is_err());
 }
 
-/// A small generator: the same values in every run.
-struct Random(u64);
+/// Values of the protocol from a seed, the same in every run.
+struct Random(SplitMix64);
 
 impl Random {
     fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
+        self.0.next_u64()
     }
 
     fn text(&mut self) -> String {
@@ -366,7 +364,7 @@ impl Random {
 /// same bytes again.
 #[test]
 fn random_values_round_trip_byte_for_byte() {
-    let mut random = Random(0x2545_f491_4f6c_dd1d);
+    let mut random = Random(SplitMix64::new(0x2545_f491_4f6c_dd1d));
     for _ in 0..2000 {
         let message = Message::new(
             random.next(),
@@ -678,7 +676,7 @@ fn a_malformed_record_of_nodes_is_refused() {
 #[test]
 fn random_records_of_nodes_are_read_or_refused() {
     use crate::events::{Event, NodeKind, Order};
-    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let mut random = Random(SplitMix64::new(0x9e37_79b9_7f4a_7c15));
     let mut order = Order::default();
     let (mut read, mut refused, mut out_of_order) = (0, 0, 0);
     for _ in 0..4000 {

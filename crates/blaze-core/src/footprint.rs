@@ -4,23 +4,28 @@
 //! the limit. No resource limit is set: macOS refuses RLIMIT_AS and RLIMIT_DATA below the
 //! address space every process reserves, and setting one would need a `fork` where the
 //! process is started with `posix_spawn`.
+//!
+//! The watched processes sit in a [`Slab`] tagged [`MemTag::Io`], each [`Watch`] naming its
+//! entry by handle: starting and stopping a watch allocates nothing once the slab has grown to
+//! the most watched at once, and a handle to an entry taken out names nothing, even once its
+//! slot is another process's.
 
 use std::{
     io,
-    sync::{
-        Condvar, Mutex, MutexGuard, Once, PoisonError,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Condvar, Mutex, MutexGuard, Once, PoisonError},
     time::Duration,
 };
+
+use blaze_mem::{Slab, Tag as MemTag};
 
 /// How often the footprint is read: a process faulting pages in as fast as it can gets tens of
 /// megabytes past its limit at most before it is killed.
 const INTERVAL: Duration = Duration::from_millis(2);
+/// The most processes watched at once: the slab's reservation, committed only as used.
+const MOST: u32 = 1 << 16;
 
 /// One watched process.
 struct Entry {
-    id: u64,
     pid: libc::pid_t,
     limit: u64,
     /// The most footprint read so far.
@@ -33,20 +38,20 @@ struct Entry {
 /// made with the lock held and the entry in the list, so once [`Watch::stop`] has taken the entry
 /// out, nothing signals its pid.
 struct Sampler {
-    entries: Mutex<Vec<Entry>>,
+    /// Made with the first watch.
+    entries: Mutex<Option<Slab<Entry>>>,
     wake: Condvar,
 }
 
-static SAMPLER: Sampler = Sampler { entries: Mutex::new(Vec::new()), wake: Condvar::new() };
+static SAMPLER: Sampler = Sampler { entries: Mutex::new(None), wake: Condvar::new() };
 static STARTED: Once = Once::new();
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
-fn entries() -> MutexGuard<'static, Vec<Entry>> {
+fn entries() -> MutexGuard<'static, Option<Slab<Entry>>> {
     SAMPLER.entries.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 pub(crate) struct Watch {
-    id: u64,
+    id: blaze_mem::Handle<Entry>,
     pid: libc::pid_t,
 }
 
@@ -54,15 +59,23 @@ impl Watch {
     /// Watches `pid`'s physical footprint (proc_pid_rusage RUSAGE_INFO_V4 ri_phys_footprint)
     /// on the one footprint thread, every few milliseconds, and SIGKILLs it once it passes
     /// `limit`.
+    /// Stops when the slab's room cannot be reserved, or the most processes are watched,
+    /// naming the subsystem.
+    #[track_caller]
     pub(crate) fn start(pid: libc::pid_t, limit: u64) -> Watch {
         STARTED.call_once(|| {
             std::thread::Builder::new()
-                .name("blaze-footprint".into())
+                .name("blaze-footprint".into()) // alloc: setup, once per process.
                 .spawn(sample)
                 .expect("starting the footprint watch");
         });
-        let id = NEXT.fetch_add(1, Ordering::Relaxed);
-        entries().push(Entry { id, pid, limit, seen: 0, done: false });
+        let mut entries = entries();
+        let slab = entries.get_or_insert_with(|| match Slab::new(MOST, MemTag::Io) {
+            Ok(slab) => slab,
+            Err(error) => panic!("{error}"),
+        });
+        let id = slab.insert(Entry { pid, limit, seen: 0, done: false });
+        drop(entries);
         SAMPLER.wake.notify_one();
         Watch { id, pid }
     }
@@ -77,13 +90,10 @@ impl Watch {
         }
     }
 
-    /// Out of the sampler's list: nothing signals the pid once this returns. The most seen.
+    /// Out of the sampler's slab: nothing signals the pid once this returns. The most seen; 0
+    /// once taken out already (its handle stale, the slot maybe another's since).
     fn remove(&self) -> u64 {
-        let mut entries = entries();
-        match entries.iter().position(|it| it.id == self.id) {
-            Some(at) => entries.swap_remove(at).seen,
-            None => 0,
-        }
+        entries().as_mut().and_then(|slab| slab.remove(self.id)).map_or(0, |it| it.seen)
     }
 }
 
@@ -96,11 +106,11 @@ impl Drop for Watch {
 fn sample() {
     let mut entries = entries();
     loop {
-        if entries.iter().all(|it| it.done) {
+        let Some(slab) = entries.as_mut().filter(|slab| slab.iter().any(|(_, it)| !it.done)) else {
             entries = SAMPLER.wake.wait(entries).unwrap_or_else(PoisonError::into_inner);
             continue;
-        }
-        for entry in entries.iter_mut().filter(|it| !it.done) {
+        };
+        for (_, entry) in slab.iter_mut().filter(|(_, it)| !it.done) {
             check(entry);
         }
         entries = SAMPLER
@@ -191,6 +201,24 @@ mod tests {
         assert!(!libc::WIFSIGNALED(status));
         assert_eq!(libc::WEXITSTATUS(status), 3);
         assert!(peak > 0 && peak < 1 << 30, "{peak}");
+    }
+
+    /// A watch's handle once its entry is taken out (a late drop of a copy) takes nothing out:
+    /// not the watch of a process started since, which may hold its slot.
+    #[test]
+    fn a_watch_taken_out_names_nothing_once_its_slot_is_another_s() {
+        let first = spawn("sleep 0.2; exit 0");
+        let watch = Watch::start(first.id() as libc::pid_t, 1 << 30);
+        let late = Watch { id: watch.id, pid: watch.pid };
+        let (status, _) = end(first, watch);
+        assert!(!libc::WIFSIGNALED(status));
+        let second = spawn("sleep 0.2; exit 0");
+        let live = Watch::start(second.id() as libc::pid_t, 1 << 30);
+        assert_eq!(late.remove(), 0, "a stale handle");
+        drop(late);
+        assert!(entries().as_ref().unwrap().contains(live.id), "the live watch is left as it is");
+        let (status, peak) = end(second, live);
+        assert!(!libc::WIFSIGNALED(status) && peak > 0);
     }
 
     /// The one thread holds each process to its own limit.

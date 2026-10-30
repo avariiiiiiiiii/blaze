@@ -9,6 +9,7 @@
 use std::ops::Range;
 
 /// A record's bytes and the places in it the core relocates.
+#[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Record {
     pub bytes: Vec<u8>,
@@ -16,7 +17,7 @@ pub(crate) struct Record {
 }
 
 /// A record's relocated fields, at most three (an FDE's CIE pointer, function and LSDA),
-/// kept inline: making a record allocates only its bytes.
+/// kept inline: making a record allocates nothing but what its bytes outgrow.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Fields {
     items: [(u64, Field); 3],
@@ -59,6 +60,7 @@ const PCREL_SDATA4: u8 = 0x1b;
 const INDIRECT_PCREL_SDATA4: u8 = 0x9b;
 
 /// A CIE: version 1, augmentation `zR`, or `zPLR` for one with a personality.
+#[cfg(test)]
 pub(crate) fn cie(
     code_align: u32,
     data_align: i32,
@@ -66,62 +68,90 @@ pub(crate) fn cie(
     instructions: &[u8],
     personality: bool,
 ) -> Result<Record, String> {
+    let mut bytes = Vec::with_capacity(64);
+    let fixups = cie_into(code_align, data_align, return_address, instructions, personality, &mut bytes)?;
+    Ok(Record { bytes, fixups })
+}
+
+/// An FDE, as [`fde_into`] writes it.
+#[cfg(test)]
+pub(crate) fn fde(size: u64, instructions: &[u8], lsda: bool, has_lsda: bool) -> Result<Record, String> {
+    let mut bytes = Vec::with_capacity(64);
+    let fixups = fde_into(size, instructions, lsda, has_lsda, &mut bytes)?;
+    Ok(Record { bytes, fixups })
+}
+
+/// Writes a CIE over `bytes` (version 1, augmentation `zR`, or `zPLR` for one with a
+/// personality): its fields to relocate. A reused buffer allocates nothing.
+pub(crate) fn cie_into(
+    code_align: u32,
+    data_align: i32,
+    return_address: u16,
+    instructions: &[u8],
+    personality: bool,
+    bytes: &mut Vec<u8>,
+) -> Result<Fields, String> {
     let ra = u8::try_from(return_address)
+        // alloc: error path
         .map_err(|_| format!("return address register {return_address} past CIE version 1's 255"))?;
     // Header 8, version 1, augmentation 6, alignments 5 + 10, register 1, augmentation data
     // 9, then the instructions and at most 7 of padding.
-    let mut bytes = Vec::with_capacity(40 + instructions.len() + 7);
+    bytes.clear();
+    bytes.reserve(40 + instructions.len() + 7);
     bytes.extend_from_slice(&[0; 8]);
     bytes.push(1);
     bytes.extend_from_slice(if personality { b"zPLR\0" } else { b"zR\0" });
-    uleb(&mut bytes, u64::from(code_align));
-    sleb(&mut bytes, i64::from(data_align));
+    uleb(bytes, u64::from(code_align));
+    sleb(bytes, i64::from(data_align));
     bytes.push(ra);
     let mut fixups = Fields::NONE;
     if personality {
-        uleb(&mut bytes, 7);
+        uleb(bytes, 7);
         bytes.push(INDIRECT_PCREL_SDATA4);
         fixups.push(bytes.len() as u64, Field::Personality);
         bytes.extend_from_slice(&[0; 4]);
         bytes.push(PCREL_SDATA4);
         bytes.push(PCREL_SDATA4);
     } else {
-        uleb(&mut bytes, 1);
+        uleb(bytes, 1);
         bytes.push(PCREL_SDATA4);
     }
     bytes.extend_from_slice(instructions);
-    finish(&mut bytes)?;
-    Ok(Record { bytes, fixups })
+    finish(bytes)?;
+    Ok(fixups)
 }
 
-/// An FDE of a function `size` bytes long, its CIE pointer and addresses left to fixups.
-/// `lsda` says whether its CIE has an `L` augmentation (one with a personality does): then
-/// the field is there, relocated when `has_lsda`, 0 (none) otherwise.
-pub(crate) fn fde(
+/// Writes over `bytes` an FDE of a function `size` bytes long, its CIE pointer and
+/// addresses left to fixups: its fields to relocate. `lsda` says whether its CIE has an `L`
+/// augmentation (one with a personality does): then the field is there, relocated when
+/// `has_lsda`, 0 (none) otherwise. A reused buffer allocates nothing.
+pub(crate) fn fde_into(
     size: u64,
     instructions: &[u8],
     lsda: bool,
     has_lsda: bool,
-) -> Result<Record, String> {
+    bytes: &mut Vec<u8>,
+) -> Result<Fields, String> {
     let range = u32::try_from(size).map_err(|_| "a function past 4 GiB in an FDE")?;
-    let mut bytes = Vec::with_capacity(16 + 1 + 4 + instructions.len() + 7);
+    bytes.clear();
+    bytes.reserve(16 + 1 + 4 + instructions.len() + 7);
     bytes.extend_from_slice(&[0; 12]);
     bytes.extend_from_slice(&range.to_le_bytes());
     let mut fixups = Fields::NONE;
     fixups.push(4, Field::CiePointer);
     fixups.push(8, Field::Function);
     if lsda {
-        uleb(&mut bytes, 4);
+        uleb(bytes, 4);
         if has_lsda {
             fixups.push(bytes.len() as u64, Field::Lsda);
         }
         bytes.extend_from_slice(&[0; 4]);
     } else {
-        uleb(&mut bytes, 0);
+        uleb(bytes, 0);
     }
     bytes.extend_from_slice(instructions);
-    finish(&mut bytes)?;
-    Ok(Record { bytes, fixups })
+    finish(bytes)?;
+    Ok(fixups)
 }
 
 /// Pads with `DW_CFA_nop` to a multiple of 8 and writes the length.
@@ -129,6 +159,7 @@ fn finish(bytes: &mut Vec<u8>) -> Result<(), String> {
     bytes.resize(bytes.len().next_multiple_of(8), 0);
     let len = u32::try_from(bytes.len() - 4).map_err(|_| "a frame record past 4 GiB")?;
     if len == u32::MAX {
+        // alloc: error path
         return Err("a frame record as long as the 64-bit length escape".to_owned());
     }
     bytes[..4].copy_from_slice(&len.to_le_bytes());
@@ -169,11 +200,10 @@ pub(crate) struct Native {
 }
 
 /// Splits a native `.eh_frame` into its records, stopping at a terminator. An FDE's CIE is
-/// found among the CIEs before it by binary search (they are met in order).
+/// found among the records before it by binary search (they are met in order).
 pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
     // Compilers' records are mostly 24 to 64 bytes.
-    let mut records = Vec::with_capacity(section.len() / 32);
-    let mut cies: Vec<usize> = Vec::new();
+    let mut records: Vec<Native> = Vec::with_capacity(section.len() / 32);
     let mut at = 0;
     while at + 4 <= section.len() {
         let word = |at: usize| -> Result<u32, String> {
@@ -185,30 +215,55 @@ pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
             break;
         }
         if len == u32::MAX as usize {
+            // alloc: error path
             return Err("an .eh_frame record with a 64-bit length".to_owned());
         }
         let end = at + 4 + len;
         if end > section.len() || len < 4 {
+            // alloc: error path
             return Err(format!("an .eh_frame record at {at:#x} past the section's end"));
         }
         let id = word(at + 4)? as usize;
         let cie = match id {
             0 => None,
             back => Some(
-                (at + 4).checked_sub(back).ok_or(format!("an FDE at {at:#x} before its CIE"))?,
+                // alloc: error path
+                (at + 4).checked_sub(back).ok_or_else(|| format!("an FDE at {at:#x} before its CIE"))?,
             ),
         };
-        match cie {
-            Some(cie) if cies.binary_search(&cie).is_err() => {
+        if let Some(cie) = cie {
+            let found = records.binary_search_by_key(&cie, |it| it.range.start);
+            if !found.is_ok_and(|it| records[it].cie.is_none()) {
+                // alloc: error path
                 return Err(format!("an FDE at {at:#x} whose CIE at {cie:#x} is no CIE before it"));
             }
-            Some(_) => {}
-            None => cies.push(at),
         }
         records.push(Native { range: at..end, cie });
         at = end;
     }
     Ok(records)
+}
+
+/// The offsets in an image's `.eh_frame` (at `section`, `len` bytes) of every `every`th FDE
+/// the core placed, sorted: record starts a walk of the section can begin at, so its pieces are
+/// walked in parallel. None below two pieces' worth of functions.
+pub(crate) fn fde_splits(placed: &crate::model::Placed<'_>, section: u64, len: usize, every: usize) -> Vec<usize> {
+    if placed.functions.len() < 2 * every {
+        // alloc: empty, which allocates nothing
+        return Vec::new();
+    }
+    // alloc: once per image, one offset per `every` functions
+    let mut splits = Vec::with_capacity(placed.functions.len() / every + 1);
+    splits.extend(
+        (placed.functions.iter())
+            .filter_map(|it| it.fde?.checked_sub(section))
+            .filter(|&it| it > 0 && it < len as u64)
+            .step_by(every)
+            .map(|it| it as usize),
+    );
+    splits.sort_unstable();
+    splits.dedup();
+    splits
 }
 
 #[cfg(test)]

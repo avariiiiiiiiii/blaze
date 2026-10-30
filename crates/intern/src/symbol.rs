@@ -105,6 +105,7 @@ pub fn symbols_schema() -> SchemaHash {
 /// here, since every value depends on it, its CRCs and columns split across `jobs` (the
 /// daemon's pool: one core streams a tenth of what the machine's memory can).
 pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>, jobs: Jobs<'_>) -> Result<(), RestoreError> {
+    // alloc: once a restore, so the image outlives every symbol read from it
     let image: &'static Arc<Image<S>> = Box::leak(Box::new(image));
     restore_into(&TABLE, image, jobs)?;
     RESTORED.set(image.hash()).expect("the symbol table is restored once");
@@ -482,21 +483,13 @@ mod tests {
 
     #[test]
     fn cmp_order_matches_str_order_on_random_names() {
-        // A splitmix64 stream: seeded, so a failure reproduces.
-        let mut state = 0x5eed_0f0d_e5u64;
-        let mut next = move || {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x5eed_0f0d_e5);
         // Few letters and lengths around 8 so that many names share an order key.
         let alphabet = ['\0', 'a', 'b', 'é', '_'];
         let names: Vec<String> = (0..400)
             .map(|_| {
-                let len = (next() % 13) as usize;
-                (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect()
+                let len = rng.index(13);
+                (0..len).map(|_| alphabet[rng.index(alphabet.len())]).collect()
             })
             .collect();
         let names: Vec<&str> = names.iter().map(String::as_str).collect();

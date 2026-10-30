@@ -62,7 +62,9 @@ on the corpus's biggest workspace.
 `harness/v2/budgets.py`, budget `restart`, rows `restart-first-answer-clean` and
 `restart-first-answer-kill9`. They run on blaze's own checkout: 2.9M lines of Rust,
 the biggest workspace of the corpus (blaze, nushell, ripgrep, helix and the top crates in
-[proof.md](../proof.md)). Each row runs after blaze's cold build, and `runs` times does:
+[proof.md](../proof.md)). Each row runs after blaze's cold build. Until the first answers
+settle the budget (at least `runs` and at most `most_runs` times; the median's 95% interval
+within 10% of the limit or clear of it, as every timed budget does), it repeats:
 
 1. a warm no-op `blaze check`, timed;
 2. the daemon's pid read from `blaze status` (v2's `pid: N`, v1's `daemon: pid N`);

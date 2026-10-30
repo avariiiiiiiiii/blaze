@@ -12,6 +12,7 @@
 //! `compiler/rustc_middle/src/ty/closure.rs` (`CapturedPlace::to_string`, `get_path_span`)
 //! (MIT or Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use hir::{HasVisibility as _, InFile, ItemInNs};
 use hir_def::{
     AdtId, HasModule as _, ItemContainerId, Lookup as _,
@@ -72,7 +73,7 @@ impl Source {
             match expr {
                 Expr::Block { statements, .. } => {
                     for statement in statements {
-                        let Statement::Let { pat, initializer: Some(init), else_branch, .. } = *statement else {
+                        let Statement::Let { pat, initializer: Some(init), else_branch, .. } = statement else {
                             continue;
                         };
                         match store.pat(pat) {

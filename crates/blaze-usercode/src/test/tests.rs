@@ -1,10 +1,12 @@
 use std::time::Duration;
 
+use blaze_ids::rng::SplitMix64;
+
 use super::{
     Executed, Failure, Finished, Outcome, Reported, Trace, fork_server, report,
     wire::{
-        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View, encode_ended, header,
-        read_region,
+        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View, closed_ranges, encode_ended,
+        header, read_region,
     },
 };
 
@@ -26,49 +28,42 @@ fn frames() -> Vec<Frame> {
     ]
 }
 
-fn xorshift(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 /// A frame of seeded parts: every kind, ends and records of every kind, empty and long
 /// strings and outputs, ids and counts at their edges.
-fn seeded(state: &mut u64) -> Frame {
-    let mut text = |state: &mut u64| -> String {
-        let len = (xorshift(state) % 9) as usize;
-        (0..len).map(|_| ['a', 'é', ':', '\t', '\0', '漢'][(xorshift(state) % 6) as usize]).collect()
+fn seeded(rng: &mut SplitMix64) -> Frame {
+    let mut text = |rng: &mut SplitMix64| -> String {
+        let len = rng.index(9);
+        (0..len).map(|_| ['a', 'é', ':', '\t', '\0', '漢'][rng.index(6)]).collect()
     };
-    let edge = |state: &mut u64| match xorshift(state) % 4 {
+    let edge = |rng: &mut SplitMix64| match rng.below(4) {
         0 => 0,
         1 => u64::MAX,
-        _ => xorshift(state),
+        _ => rng.next_u64(),
     };
-    match xorshift(state) % 5 {
+    match rng.below(5) {
         0 => {
-            let count = (xorshift(state) % 5) as usize;
-            Frame::Hello { version: xorshift(state) as u32, pid: xorshift(state) as u32, tests: (0..count).map(|_| text(state)).collect() }
+            let count = rng.index(5);
+            Frame::Hello { version: rng.next_u32(), pid: rng.next_u32(), tests: (0..count).map(|_| text(rng)).collect() }
         }
         1 => {
-            let end = match xorshift(state) % 3 {
-                0 => End::Exited(xorshift(state) as i32),
-                1 => End::Signaled(xorshift(state) as i32),
-                _ => End::NotStarted(text(state)),
+            let end = match rng.below(3) {
+                0 => End::Exited(rng.next_u64() as i32),
+                1 => End::Signaled(rng.next_u64() as i32),
+                _ => End::NotStarted(text(rng)),
             };
-            let output = (0..xorshift(state) % 300).map(|_| xorshift(state) as u8).collect();
-            let executed = match xorshift(state) % 2 {
+            let output = (0..rng.below(300)).map(|_| rng.next_u64() as u8).collect();
+            let executed = match rng.below(2) {
                 0 => {
-                    let slots = (xorshift(state) % 200) as u32;
-                    let hits = (0..slots).filter(|_| xorshift(state) % 4 == 0).collect();
+                    let slots = rng.below(200) as u32;
+                    let hits = (0..slots).filter(|_| rng.one_in(4)).collect();
                     Executed::Hits { slots, hits }
                 }
-                _ => Executed::Not(text(state)),
+                _ => Executed::Not(text(rng)),
             };
-            Frame::Ended { id: edge(state), end, output, executed }
+            Frame::Ended { id: edge(rng), end, output, executed }
         }
-        2 => Frame::Run { id: edge(state), index: xorshift(state) as u32 },
-        3 => Frame::Kill { id: edge(state) },
+        2 => Frame::Run { id: edge(rng), index: rng.next_u32() },
+        3 => Frame::Kill { id: edge(rng) },
         _ => Frame::Quit,
     }
 }
@@ -92,8 +87,8 @@ fn view_of<'a>(executed: &'a Executed, bytes: &'a [u8]) -> ExecView<'a> {
 
 #[test]
 fn every_frame_round_trips() {
-    let mut state = 0x853c_49e6_748f_ea9bu64;
-    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut state)).collect();
+    let mut rng = SplitMix64::new(0x853c_49e6_748f_ea9b);
+    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut rng)).collect();
     for frame in frames().into_iter().chain(seeded) {
         let bytes = frame.to_bytes();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
@@ -130,8 +125,8 @@ fn frames_come_whole_whatever_the_pieces() {
 
 #[test]
 fn an_end_encoded_from_borrowed_parts_is_the_frame_s_bytes() {
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut state)).collect();
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
+    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut rng)).collect();
     for frame in frames().iter().chain(&seeded) {
         let Some((id, end, output, executed, bytes)) = ended_parts(frame) else { continue };
         let mut borrowed = b"before".to_vec();
@@ -192,13 +187,13 @@ fn frames_read_in_place_as_a_whole_stream_reads() {
         expected.push(Frame::decode(&stream[at + 4..at + 4 + len]).unwrap());
         at += 4 + len;
     }
-    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for _ in 0..200 {
         let mut reader = Frames::new();
         let mut got = Vec::new();
         let mut at = 0;
         while at < stream.len() {
-            xorshift(&mut state);
+            let state = rng.next_u64();
             let needed = reader.needed();
             let had_length = reader.waiting() >= 4;
             assert!(needed > 0);
@@ -336,19 +331,19 @@ fn a_region_that_is_not_a_whole_record_is_refused() {
 /// read as slots, and the hits are what the wire then accepts.
 #[test]
 fn a_region_reads_as_its_bytes_one_by_one() {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     let mut hits = Vec::new();
     for _ in 0..3_000 {
-        let slots = (xorshift(&mut state) % 300) as u32;
-        let density = 1 + xorshift(&mut state) % 16;
+        let slots = rng.below(300) as u32;
+        let density = 1 + rng.below(16);
         let mut bytes = region(slots, &[], slots);
         for byte in &mut bytes[HEADER..] {
-            if xorshift(&mut state) % density == 0 {
-                *byte = xorshift(&mut state) as u8 | 1;
+            if rng.one_in(density) {
+                *byte = rng.next_u64() as u8 | 1;
             }
         }
         let expected: Vec<u32> = (0..slots).filter(|&slot| bytes[HEADER + slot as usize] != 0).collect();
-        let mapped = slots + (xorshift(&mut state) % 3) as u32;
+        let mapped = slots + rng.below(3) as u32;
         assert_eq!(read(&bytes, mapped, Ok(()), &mut hits), Ok(slots));
         let got = Hits::of_bytes(&hits).unwrap();
         assert_eq!(got.to_vec(), expected, "{slots} slots");
@@ -383,6 +378,31 @@ fn a_region_reads_as_its_bytes_one_by_one() {
 }
 
 #[test]
+fn a_child_closes_exactly_what_was_not_open() {
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let (mut open, mut ranges) = (Vec::new(), Vec::new());
+    for _ in 0..500 {
+        open.clear();
+        let count = rng.below(12);
+        for _ in 0..count {
+            open.push(rng.below(40) as u32);
+        }
+        let model: Vec<u32> = open.clone();
+        closed_ranges(&mut open, &mut ranges);
+        assert_eq!(ranges.last().map(|it| it.1), Some(u32::MAX));
+        assert!(ranges.windows(2).all(|it| it[0].1 < it[1].0), "{ranges:?}");
+        assert!(ranges.iter().all(|it| it.0 >= 3 && it.0 <= it.1), "{ranges:?}");
+        for fd in 0..64u32 {
+            let closed = ranges.iter().any(|&(first, last)| first <= fd && fd <= last);
+            assert_eq!(closed, fd >= 3 && !model.contains(&fd), "{fd} with {model:?}: {ranges:?}");
+        }
+    }
+    open.clear();
+    closed_ranges(&mut open, &mut ranges);
+    assert_eq!(ranges, [(3, u32::MAX)], "nothing but 0 to 2 open: one range");
+}
+
+#[test]
 fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
     for record in [true, false] {
         let text = fork_server(record);
@@ -395,6 +415,9 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         assert!(text.contains("pub fn map(&mut self) -> Result<Region, String>"));
         assert!(text.contains("pub fn give(&mut self, "));
         assert!(text.contains("exec.give(child.region, &hits, read.is_ok());"));
+        // A test's child closes the server's descriptors in one call per gap (Linux).
+        assert!(text.contains("close_range"));
+        assert!(text.contains("Kept::now()"));
         assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> !"));
         // Nothing of blaze is named in what the tested crate compiles but the runtime's
         // exports, and those only with slots.
@@ -463,4 +486,28 @@ fn results_are_reported_as_the_api_has_them() {
     let mut whole = finished(Outcome::Passed);
     whole.test = None;
     assert_eq!(report("lib", &whole).unwrap().name, "");
+}
+
+/// Once its buffers have grown, the wire allocates nothing: a frame encoded into a reused
+/// buffer, pushed and read in place, a region read into reused hits, an end encoded.
+#[test]
+fn the_wire_allocates_nothing_once_its_buffers_have_grown() {
+    let frames = frames();
+    let bytes = region(300, &[0, 7, 64, 299], 300);
+    let (mut out, mut stream, mut hits) = (Vec::new(), Frames::new(), Vec::new());
+    let mut round = || {
+        for frame in &frames {
+            out.clear();
+            frame.encode(&mut out);
+            stream.push(&out);
+            while let Some(view) = stream.pop_view().unwrap() {
+                std::hint::black_box(&view);
+            }
+        }
+        assert_eq!(read(&bytes, 300, Ok(()), &mut hits), Ok(300));
+        out.clear();
+        encode_ended(&mut out, 1, End::Exited(0).view(), b"ok", ExecView::Hits { slots: 300, hits: Hits::of_bytes(&hits).unwrap() });
+    };
+    round();
+    blaze_alloc_count::assert_at_most(0, "frames encoded and read in place, a region read, an end encoded", &mut round);
 }

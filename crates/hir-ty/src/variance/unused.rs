@@ -4,6 +4,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir_def::{AdtId, GenericDefId, GenericParamId, VariantId};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
@@ -14,7 +15,7 @@ use smallvec::SmallVec;
 
 use crate::{
     GenericPredicates,
-    db::HirDatabase,
+    db::HirDatabase as _,
     generics::generics,
     next_solver::{ClauseKind, Const, ConstKind, DbInterner, Region, RegionKind, Ty, TyKind},
 };
@@ -23,7 +24,7 @@ use crate::{
 /// of its where clauses constrains, in declaration order (lifetimes first, as rustc's
 /// `own_params`). Empty when a field's type, or that of an ADT it names, has an error (rustc's
 /// `HasErrorDeep`): that error is reported instead.
-pub fn adt_unused_params(db: &dyn HirDatabase, adt: AdtId) -> Vec<GenericParamId> {
+pub fn adt_unused_params(db: &Db, adt: AdtId) -> Vec<GenericParamId> {
     let def = GenericDefId::AdtId(adt);
     let variances = super::variances_of(db, def);
     let params: SmallVec<[GenericParamId; 8]> = generics(db, def).iter_id(false).collect();
@@ -122,9 +123,9 @@ fn parameters_for<'db>(
 
 /// rustc's `HasErrorDeep` over `type_of(adt)`: whether the type of a field of `adt`, or of an
 /// ADT a field names (each once), has an error.
-fn has_error_deep(db: &dyn HirDatabase, adt: AdtId) -> bool {
+fn has_error_deep(db: &Db, adt: AdtId) -> bool {
     struct HasErrorDeep<'db> {
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         seen: FxHashSet<AdtId>,
     }
     impl<'db> HasErrorDeep<'db> {

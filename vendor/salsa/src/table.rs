@@ -180,6 +180,7 @@ impl SlotIndex {
 impl Default for Table {
     fn default() -> Self {
         Self {
+            // alloc: setup, once per database
             pages: boxcar::Vec::new(),
             non_full_pages: Default::default(),
         }
@@ -247,6 +248,7 @@ impl Table {
                 crate::database::PageInfo::from_page_fills(PAGE_LEN, fills)
                     .map(|page_info| (ingredient, page_info))
             })
+            // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect()
     }
 
@@ -284,6 +286,7 @@ impl Table {
             Some(page) => {
                 // Initialize the page if was created using `push_uninit_page`.
                 if page.slot_type_id == TypeId::of::<DummySlot>() {
+                    // alloc: one page and one `Arc` count per 128 slots, when a page fills
                     *page = Page::new::<T>(ingredient, memo_types.clone());
                 }
 
@@ -299,6 +302,7 @@ impl Table {
                     self.push_uninit_page();
                 }
 
+                // alloc: one page and one `Arc` count per 128 slots, when a page fills
                 let allocated_idx = self.push_page::<T>(ingredient, memo_types.clone());
                 assert_eq!(
                     allocated_idx, page_idx,
@@ -326,6 +330,7 @@ impl Table {
         // that were not serialized should be negligible.
         PageIndex::new(self.pages.push(Page::new::<DummySlot>(
             IngredientIndex::new(0),
+            // alloc: one page and one `Arc` count per 128 slots, when a page fills
             Arc::new(MemoTableTypes::default()),
         )))
     }
@@ -592,6 +597,7 @@ impl Page {
     fn new<T: Slot>(ingredient: IngredientIndex, memo_types: Arc<MemoTableTypes>) -> Self {
         #[cfg(not(feature = "shuttle"))]
         let data: Box<PageData<T>> =
+            // alloc: one page and one `Arc` count per 128 slots, when a page fills
             Box::new([const { UnsafeCell::new(MaybeUninit::uninit()) }; PAGE_LEN]);
 
         #[cfg(feature = "shuttle")]

@@ -19,7 +19,7 @@ use std::{
 };
 
 use anyhow::Context as _;
-use ide_db::{ChangeWithProcMacros, RootDatabase, base_db::SourceDatabase as _};
+use ide_db::{ChangeWithProcMacros, RootDatabase};
 use load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
 use project_model::{
     CargoConfig, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,

@@ -10,7 +10,7 @@
 
 #![allow(unsafe_code)]
 
-use std::{fs::File, io, path::Path, sync::OnceLock};
+use std::{io, path::Path, sync::OnceLock};
 
 /// A way to compare, in the order [`fastest`] prefers them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -420,32 +420,132 @@ unsafe fn neon(a: &[u8], b: &[u8]) -> Option<usize> {
     None
 }
 
+/// Inputs at least this long are compared across cores: below it one core streams them in
+/// under 3 ms, about what starting the threads and faulting the pages in from each costs.
+pub const ACROSS_CORES: usize = 64 << 20;
+
+/// What a piece compares between looks at whether an earlier piece has found a difference.
+const BLOCK: usize = 4 << 20;
+
+/// [`first_difference`] with the bytes cut into one piece per core, each compared by
+/// [`fastest`] on a thread of its own: memory-bound on every core at once rather than one. A
+/// piece stops once an earlier one has found a difference; the earliest piece with one never
+/// stops, so the answer is the same offset as on one core.
+pub fn first_difference_across_cores(a: &[u8], b: &[u8]) -> Option<usize> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    first_difference_in(fastest(), a, b, cores, BLOCK)
+}
+
+fn first_difference_in(path: Simd, a: &[u8], b: &[u8], pieces: usize, block: usize) -> Option<usize> {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    let n = a.len().min(b.len());
+    let pieces = pieces.clamp(1, n.div_ceil(block).max(1));
+    if pieces == 1 {
+        return first_difference_with(path, a, b);
+    }
+    let longer = a.len() != b.len();
+    let earliest = AtomicUsize::new(usize::MAX);
+    let piece = |p: usize| -> Option<usize> {
+        let (start, end) = (p * n / pieces, (p + 1) * n / pieces);
+        let mut at = start;
+        while at < end && earliest.load(Relaxed) > p {
+            let to = (at + block).min(end);
+            if let Some(found) = first_difference_with(path, &a[at..to], &b[at..to]) {
+                earliest.fetch_min(p, Relaxed);
+                return Some(at + found);
+            }
+            at = to;
+        }
+        None
+    };
+    let found = std::thread::scope(|scope| {
+        let piece = &piece;
+        let others: Vec<_> = (1..pieces).map(|p| scope.spawn(move || piece(p))).collect();
+        let mut found = vec![piece(0)];
+        found.extend(others.into_iter().map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))));
+        found
+    });
+    found.into_iter().flatten().next().or(longer.then_some(n))
+}
+
 /// A file's bytes, mapped read-only; an empty file maps nothing.
 ///
 /// The file must not change while mapped: what is mapped here are the outputs and traces of
 /// builds that have finished, which nothing writes while they are compared.
-pub struct Mapped(Option<memmap2::Mmap>);
+pub struct Mapped(blaze_core::fs::Mapped);
 
 impl Mapped {
+    /// Mapped and faulted in at once by the kernel (`MAP_POPULATE` on Linux), for bytes one
+    /// thread reads.
     pub fn open(path: &Path) -> io::Result<Mapped> {
-        let file = File::open(path)?;
-        if file.metadata()?.len() == 0 {
-            return Ok(Mapped(None));
-        }
-        // SAFETY: a read-only private map of a file nothing writes while it is mapped (the
-        // type's contract above); `populate` faults it in at once, not a page per fault.
-        let map = unsafe { memmap2::MmapOptions::new().populate().map(&file)? };
-        Ok(Mapped(Some(map)))
+        Mapped::map(path, true)
+    }
+
+    /// Mapped with no page faulted in, for bytes many threads read: each faults in the pages of
+    /// its own piece, so the faults run on every core rather than serially in `mmap`.
+    pub fn open_lazily(path: &Path) -> io::Result<Mapped> {
+        Mapped::map(path, false)
+    }
+
+    fn map(path: &Path, populate: bool) -> io::Result<Mapped> {
+        let options = blaze_core::fs::MapOptions::new().populate(populate);
+        // SAFETY: a read-only map of a file nothing writes while it is mapped (the type's
+        // contract above).
+        Ok(Mapped(unsafe { options.open(path) }?))
     }
 
     pub fn bytes(&self) -> &[u8] {
-        self.0.as_deref().unwrap_or(&[])
+        self.0.bytes()
     }
 }
 
 /// Where two files first differ, or where the shorter ends; `None` when their bytes are the
-/// same. Both are mapped and compared in place by [`fastest`].
+/// same. Both are mapped and compared in place by [`fastest`], across cores from
+/// [`ACROSS_CORES`] bytes on.
 pub fn first_file_difference(a: &Path, b: &Path) -> io::Result<Option<u64>> {
+    let long = |path: &Path| std::fs::metadata(path).map(|m| m.len() >= ACROSS_CORES as u64);
+    if long(a)? && long(b)? {
+        let (a, b) = (Mapped::open_lazily(a)?, Mapped::open_lazily(b)?);
+        return Ok(first_difference_across_cores(a.bytes(), b.bytes()).map(|at| at as u64));
+    }
     let (a, b) = (Mapped::open(a)?, Mapped::open(b)?);
     Ok(first_difference(a.bytes(), b.bytes()).map(|at| at as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Simd, first_difference_in, first_difference_with};
+    use crate::Rng;
+
+    #[test]
+    fn pieces_across_cores_find_the_first_difference_one_core_does() {
+        let mut rng = Rng::new(4242);
+        const BLOCK: usize = 4096;
+        let len = 3 * BLOCK + 1_234;
+        let a: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+        let mut wants = vec![None, Some(0), Some(len - 1), Some(BLOCK), Some(BLOCK - 1)];
+        wants.extend((0..12).map(|_| Some(rng.below(len as u64) as usize)));
+        for want in wants {
+            let mut b = a.clone();
+            if let Some(at) = want {
+                b[at] ^= 1;
+                // A later difference in every later piece: the earliest still wins.
+                for later in (at + 1..len).step_by(BLOCK / 3) {
+                    b[later] ^= 0x80;
+                }
+            }
+            let serial = first_difference_with(Simd::Scalar, &a, &b);
+            assert_eq!(serial, want);
+            for pieces in [1, 2, 3, 4, 5, 8, 64] {
+                assert_eq!(first_difference_in(Simd::Scalar, &a, &b, pieces, BLOCK), want, "{pieces} pieces, {want:?}");
+                assert_eq!(first_difference_in(super::fastest(), &a, &b, pieces, BLOCK), want, "{pieces} pieces, {want:?}");
+            }
+        }
+        let mut longer = a.clone();
+        longer.push(7);
+        for pieces in [1, 3, 8] {
+            assert_eq!(first_difference_in(Simd::Scalar, &a, &longer, pieces, BLOCK), Some(len));
+            assert_eq!(first_difference_in(Simd::Scalar, &longer, &a, pieces, BLOCK), Some(len));
+        }
+    }
 }

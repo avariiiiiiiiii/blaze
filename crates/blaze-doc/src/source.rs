@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use base_db::SourceDatabase;
 use hir::{HirFileId, InFile};
 use ide_db::RootDatabase;
 use rustc_hash::FxHashMap;

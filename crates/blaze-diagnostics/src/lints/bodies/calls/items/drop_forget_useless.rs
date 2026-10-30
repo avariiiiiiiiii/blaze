@@ -69,7 +69,7 @@ impl LatePass for DropForgetUseless {
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, _out: &mut Vec<Found>) {
         self.semi_stmt = match b.store().expr(block) {
             Expr::Block { statements, .. } => match statements.get(index) {
-                Some(Statement::Expr { expr, has_semi: true }) => Some(*expr),
+                Some(Statement::Expr { expr, has_semi: true }) => Some(expr),
                 _ => None,
             },
             _ => None,

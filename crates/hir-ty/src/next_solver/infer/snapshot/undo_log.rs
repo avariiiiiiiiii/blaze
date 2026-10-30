@@ -67,6 +67,10 @@ impl<'db> InferCtxtInner<'db> {
 
         self.type_variable_storage.rollback_to(snapshot.type_variables);
         self.const_unification_storage.rollback_to(snapshot.consts);
+        let consts = self.const_unification_storage.len();
+        while self.const_var_params.last().is_some_and(|&(vid, _)| vid.as_usize() >= consts) {
+            self.const_var_params.pop();
+        }
         self.int_unification_storage.rollback_to(snapshot.ints);
         self.float_unification_storage.rollback_to(snapshot.floats);
         if let Some(region_constraints) = self.region_constraint_storage.as_mut() {

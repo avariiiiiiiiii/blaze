@@ -25,7 +25,7 @@ The input is one JSON object (inline, a file's path, or `-`):
 For each project and profile: two cold builds of the same source at the same path, each with an
 empty home, store and target directory and its own daemon, the first pinned to the first
 `cores_a` of the cores this script may run on and the second to the first `cores_b`; then
-`engine.outputs` of both (every program and library a build delivers, by its sha256). One
+`engine.outputs` of both (every program and library a build delivers, by its BLAKE3 digest). One
 outcome per (project, profile): pass when both builds delivered the same files with the same
 bytes; fail naming each file that differs and where (`engine.first_difference`), or that is in
 one build only, or when a build failed or was not blaze's. `selftest` checks the comparison, the

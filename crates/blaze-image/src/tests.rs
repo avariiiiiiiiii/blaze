@@ -1,25 +1,9 @@
 use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 use blaze_format::schema;
+use blaze_ids::rng::SplitMix64 as Rng;
 
 use super::*;
-
-/// A splitmix64 stream: seeded, so a failure reproduces.
-pub(crate) struct Rng(pub(crate) u64);
-
-impl Rng {
-    pub(crate) fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n.max(1)
-    }
-}
 
 const PAGE: u32 = 12;
 const A: SectionId = SectionId::DB_MEMOS;
@@ -32,8 +16,8 @@ fn schema_a() -> SchemaHash {
 }
 
 fn noise(len: usize, seed: u64) -> Vec<u8> {
-    let mut rng = Rng(seed);
-    (0..len).map(|_| rng.next() as u8).collect()
+    let mut rng = Rng::new(seed);
+    (0..len).map(|_| rng.next_u64() as u8).collect()
 }
 
 /// Sections of 3 groups and a bit, an empty one, one group exactly, and a few bytes.
@@ -63,7 +47,7 @@ fn sections_read_back_whole_and_by_group() {
     let sections = contents();
     let image = open(build(PAGE, &sections));
     assert_eq!(image.sections().len(), sections.len());
-    let mut rng = Rng(10);
+    let mut rng = Rng::new(10);
     for (id, bytes) in &sections {
         let section = image.section(*id, schema_a()).unwrap();
         assert_eq!(section.len, bytes.len() as u64);
@@ -141,7 +125,7 @@ fn every_corrupted_group_is_found_and_named() {
     let sections = contents();
     let good = build(PAGE, &sections);
     let layout = open(good.clone());
-    let mut rng = Rng(11);
+    let mut rng = Rng::new(11);
     for target in layout.sections() {
         for group in 0..target.groups {
             let mut bytes = good.clone();
@@ -311,6 +295,8 @@ fn typed_slices_read_in_place() {
     assert_eq!(*image.value::<u64>(&section, words_at + 2000 * 8).unwrap(), 7);
     let error = image.slice::<u64>(&section, 1, 1).unwrap_err();
     assert_eq!(error.cause, Cause::Misaligned { at: 1, align: 8 });
+    assert_eq!(image.slice::<u64>(&section, 0, 0).unwrap(), &[] as &[u64], "an empty column");
+    assert_eq!(image.slice::<u64>(&section, 1, 0).unwrap(), &[] as &[u64], "anywhere");
 }
 
 /// Threads reading the same unchecked groups at once all get their bytes, each group is
@@ -430,4 +416,28 @@ fn a_finished_image_is_named_by_its_hash() {
     let mut other = bytes;
     other[0] ^= 1;
     assert_eq!(hash_of(&other), None);
+}
+
+/// Reads allocate nothing: finding a section, a group's first read (its CRC) and every read
+/// after, typed or not.
+#[test]
+fn reads_allocate_nothing() {
+    let sections = contents();
+    let bytes = build(PAGE, &sections);
+    blaze_alloc_count::assert_at_most(0, "naming an image's bytes", || hash_of(&bytes).unwrap());
+    let image = open(bytes);
+    for (id, want) in &sections {
+        let section = blaze_alloc_count::assert_at_most(0, "finding a section", || {
+            image.section(*id, schema_a()).unwrap()
+        });
+        let len = section.len;
+        blaze_alloc_count::assert_at_most(0, "a first read", || {
+            assert_eq!(image.range(&section, 0, len).unwrap(), &want[..]);
+        });
+        blaze_alloc_count::assert_at_most(0, "a read of checked groups", || {
+            assert_eq!(image.whole(&section).unwrap(), &want[..]);
+            assert_eq!(image.slice::<u64>(&section, 0, len / 8).unwrap().len() as u64, len / 8);
+            image.check(&section, 0..section.groups).unwrap();
+        });
+    }
 }

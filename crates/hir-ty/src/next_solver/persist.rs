@@ -1657,10 +1657,14 @@ impl<'db> TyTableWriter<'db> {
     }
 
     fn empty() -> Self {
+        // alloc: none until the first value; one writer's buffers per table written.
         TyTableWriter {
             places: FxHashMap::default(),
+            // alloc: as above.
             nodes: Vec::new(),
+            // alloc: as above.
             words: Vec::new(),
+            // alloc: as above.
             pending: Vec::new(),
             _db: PhantomData,
         }
@@ -1848,14 +1852,14 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
 
 /// The `T` at `at` in `buffer`, checked.
 fn record_at<T: Record>(buffer: &[u8], at: u64) -> Result<&T, FormatError> {
-    let bad = FormatError::OutOfBounds { at };
-    let start = usize::try_from(at).map_err(|_| bad.clone())?;
+    let bad = || FormatError::OutOfBounds { at };
+    let start = usize::try_from(at).map_err(|_| bad())?;
     let end = start
         .checked_add(size_of::<T>())
         .filter(|&end| end <= buffer.len() && start >= HEADER_LEN)
-        .ok_or(bad.clone())?;
+        .ok_or_else(bad)?;
     if !(buffer.as_ptr() as usize).wrapping_add(start).is_multiple_of(align_of::<T>()) {
-        return Err(bad);
+        return Err(bad());
     }
     let bytes = &buffer[start..end];
     T::check(bytes, buffer)?;

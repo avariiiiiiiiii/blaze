@@ -1,3 +1,4 @@
+// alloc: proc macro, at expansion time once per annotated item; no query runs this
 use std::collections::HashSet;
 
 use proc_macro2::TokenStream;
@@ -29,6 +30,7 @@ pub(crate) fn salsa_value_derive(input: syn::DeriveInput) -> syn::Result<TokenSt
     let mut declared_lifetimes = input.generics.lifetimes();
     let declared_lifetime = declared_lifetimes
         .next()
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         .map(|parameter| parameter.lifetime.clone());
     if declared_lifetimes.next().is_some() {
         return Err(syn::Error::new_spanned(
@@ -36,6 +38,7 @@ pub(crate) fn salsa_value_derive(input: syn::DeriveInput) -> syn::Result<TokenSt
             "`derive(SalsaValue)` supports at most one lifetime parameter",
         ));
     }
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     let mut checked_fields = Vec::new();
 
     match &input.data {
@@ -56,6 +59,7 @@ pub(crate) fn salsa_value_derive(input: syn::DeriveInput) -> syn::Result<TokenSt
     let derived_type = syn::parse_quote!(#ident #type_generics);
     let zalsa = quote::format_ident!("__salsa_plumbing");
 
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let generics = add_field_bounds(input.generics.clone(), &checked_fields, &derived_type);
     let (impl_generics, _, where_clause) = generics.split_for_impl();
 
@@ -101,6 +105,7 @@ fn add_field_bounds(
 ) -> syn::Generics {
     let type_params = generics
         .type_params()
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         .map(|parameter| parameter.ident.clone())
         .collect::<HashSet<_>>();
 
@@ -210,6 +215,7 @@ pub(crate) fn parse_manual_retention_proof(attr: &Attribute) -> syn::Result<Manu
                 predicates
                     .parse_terminated(syn::WherePredicate::parse, syn::Token![,])?
                     .into_iter()
+                    // alloc: proc macro, at expansion time once per annotated item; no query runs this
                     .collect(),
             )
         } else {
@@ -232,6 +238,7 @@ fn reject_salsa_value_attributes(attrs: &[Attribute], target: &str) -> syn::Resu
         .map(|attr| {
             syn::Error::new(
                 attr.path().span(),
+                // alloc: proc macro, at expansion time once per annotated item; no query runs this
                 format!("unexpected `#[salsa_value]` attribute on {target}"),
             )
         });
@@ -249,6 +256,7 @@ fn replace_self_in_predicate(
     predicate: &syn::WherePredicate,
     self_type: &syn::Type,
 ) -> syn::WherePredicate {
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let mut predicate = predicate.clone();
     syn::visit_mut::VisitMut::visit_where_predicate_mut(
         &mut ChangeSelfPath::new(self_type, None),
@@ -258,6 +266,7 @@ fn replace_self_in_predicate(
 }
 
 fn replace_self_type(ty: &syn::Type, self_type: &syn::Type) -> syn::Type {
+    // clone: proc macro, at expansion time once per annotated item; no query runs this
     let mut ty = ty.clone();
     syn::visit_mut::VisitMut::visit_type_mut(&mut ChangeSelfPath::new(self_type, None), &mut ty);
     ty
@@ -338,6 +347,7 @@ fn assert_tracked_output_is_salsa_value(
         .into_compile_error();
     }
 
+    // alloc: proc macro, at expansion time once per annotated item; no query runs this
     let assertion_lifetime = syn::Lifetime::new(&format!("'{}", db_lt.ident), ty.span());
     let ty = ChangeLt::named_to(db_lt, &assertion_lifetime).in_type(ty);
     let assertion = quote_spanned! {ty.span() =>

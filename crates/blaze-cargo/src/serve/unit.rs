@@ -51,7 +51,7 @@ use base_db::FileId;
 use blaze_api::{ApiError, Artifact, Reach, Table, TestResult, Ub, UnitOf, UnitTarget};
 use blaze_ids::ContentId;
 use blaze_units::{
-    query::{Fetch, Units},
+    query::{BuildConfig, Fetch, Units},
     schema::{Mode, Unit},
 };
 use load_cargo::v2::{Crates, Db, Lower, Lowered, ProcMacroLoadResult, Ran};
@@ -60,8 +60,8 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Reader, Runs, Selection, Source, SourceFile,
-        Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptFront, Library, Reader, Runs, Selection,
+        Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -87,7 +87,7 @@ pub(crate) struct Shared {
 
 impl Real {
     pub fn new(paths: &Paths) -> Result<Real, String> {
-        let fetcher = Fetcher::new()?;
+        let fetcher = Fetcher::new(paths.state.join("fetch"))?;
         let tools = paths.state.join("tools");
         stand_ins(&tools, &paths.launcher)?;
         let shared = Shared {
@@ -131,29 +131,47 @@ impl Steps for Real {
         self.fetcher.fetch(fetch)
     }
 
-    fn library(&self) -> Result<(String, Source), ApiError> {
+    fn library(&self, kept: &[(String, String)]) -> Result<Library, ApiError> {
         let at = || Some("the standard library's sources".to_owned());
         let library = crate::cargo::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
+        let in_dir = |what| ApiError::new(what, Some(library.dir.display().to_string()));
+        let named = blaze_units::stdlib::library_at(&library.commit);
+        let mut hasher = blaze_ids::Hasher::new("blaze v2 serve library fingerprint");
+        hasher.part(library.digest.as_bytes());
+        library_fingerprint(&library.dir, "", &mut hasher).map_err(in_dir)?;
+        let fingerprint = format!("{:x}", hasher.finish());
+        if kept.iter().any(|(it, mounted)| *it == fingerprint && *mounted == named) {
+            return Ok(Library { at: named, fingerprint, source: None });
+        }
         let mut files = Vec::new();
-        library_files(&library.dir, "", &mut files)
-            .map_err(|what| ApiError::new(what, Some(library.dir.display().to_string())))?;
+        library_files(&library.dir, "", &mut files).map_err(in_dir)?;
         blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
-        Ok((blaze_units::stdlib::library_at(&library.commit), Source { files, under: String::new() }))
+        Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
-    fn lower(&self, input: &JobInput) -> Result<FrontEnd, Failed> {
+    fn lower(&self, input: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
         }
-        let writer = cancellable(|| -> Result<UnitWriter, Failed> {
-            let mut lowered = load_cargo::v2::lower(Lower {
+        let kept = kept.and_then(KeptFront::take::<KeptLowered>).filter(|it| {
+            (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units) && it.config == input.config
+        });
+        let writer = cancellable(move || -> Result<UnitWriter, Failed> {
+            let lower = || Lower {
                 units: &input.units,
                 config: &input.config,
                 files: &input.files,
                 root: input.root,
                 host_cpu: self.shared.host_cpu.as_ref(),
-            })
-            .map_err(|error| Failed::Error(lower_error(error)))?;
+            };
+            let failed = |error| Failed::Error(lower_error(error));
+            let mut lowered = match kept {
+                Some(KeptLowered { mut lowered, .. }) => match lowered.refresh(lower()).map_err(failed)? {
+                    true => lowered,
+                    false => load_cargo::v2::lower(lower()).map_err(failed)?,
+                },
+                None => load_cargo::v2::lower(lower()).map_err(failed)?,
+            };
             let job = Arc::new(Job::new(input.clone(), lowered.crates().clone(), self.shared.clone()));
             let waits = graph::Waits::new(&job.graph);
             for unit in 0..job.graph.len() as u32 {
@@ -173,6 +191,14 @@ impl Steps for Real {
 
 fn lower_error(error: load_cargo::v2::LowerError) -> ApiError {
     ApiError::new(error.what, error.at)
+}
+
+/// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
+/// the next build of the head lowers into it only when it lowers the same.
+struct KeptLowered {
+    lowered: Lowered,
+    units: Arc<Units>,
+    config: Arc<BuildConfig>,
 }
 
 /// What a task reads the front end through ([`Reader`]): a shared reference to the job's
@@ -247,6 +273,23 @@ impl Writer for UnitWriter {
         }
         Ok(true)
     }
+
+    fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed> {
+        let Some(lowered) = Arc::get_mut(&mut self.front) else {
+            let what = "the front end's tables are measured with no task reading it, and one still does";
+            return Err(ApiError::new(what, None).into());
+        };
+        cancellable(|| lowered.tables())
+    }
+
+    fn keep(mut self: Box<Self>) -> Option<KeptFront> {
+        if !matches!(self.apply(), Ok(true)) {
+            return None;
+        }
+        let UnitWriter { front, job, .. } = *self;
+        let lowered = Arc::into_inner(front)?;
+        Some(KeptFront::new(KeptLowered { lowered, units: job.input.units.clone(), config: job.input.config.clone() }))
+    }
 }
 
 /// Unit `unit`'s identity set from the front end, once every run of its closure is applied:
@@ -279,6 +322,36 @@ fn library_files(dir: &std::path::Path, prefix: &str, into: &mut Vec<SourceFile>
         let executable = false;
         let mode = if executable { blaze_vfs::Mode::Executable } else { blaze_vfs::Mode::Regular };
         into.push(SourceFile { path, bytes, mode });
+    }
+    Ok(())
+}
+
+/// Every file under the library's `dir` as [`library_files`] reads it, but looked at only:
+/// its path, size, time of its last change and whether it is executable, in name order.
+fn library_fingerprint(dir: &std::path::Path, prefix: &str, into: &mut blaze_ids::Hasher) -> Result<(), String> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))? {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| format!("{}: a name that is not UTF-8", entry.path().display()))?;
+        entries.push((name.to_owned(), entry.path()));
+    }
+    blaze_ids::names::sort_by_name(&mut entries, |it| it.0.as_bytes());
+    for (name, full) in entries {
+        let path = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+        let meta = std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        if meta.is_dir() {
+            library_fingerprint(&full, &path, into)?;
+            continue;
+        }
+        let modified = meta.modified().map_err(|error| format!("{}: {error}", full.display()))?;
+        let since = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        #[cfg(unix)]
+        let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+        #[cfg(not(unix))]
+        let executable = false;
+        into.part(path.as_bytes());
+        into.update(&meta.len().to_le_bytes()).update(&since.as_nanos().to_le_bytes()).update(&[u8::from(executable)]);
     }
     Ok(())
 }
@@ -525,9 +598,10 @@ impl Front for JobFront {
         cancellable(|| compile::codegen_inputs(&self.0))?
     }
 
-    fn tables(&self, reader: Reader, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
-        let reader: UnitReader = reader.take();
-        cancellable(|| tables(reader.db(), images))
+    fn tables(&self, mut writer: Box<dyn Writer>, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+        let mut counted = writer.tables()?;
+        counted.extend_from_slice(images);
+        Ok(summed(counted))
     }
 }
 
@@ -542,11 +616,9 @@ impl Kept for codegen::Linked {
 }
 
 /// The front end's tables (tokens, syntax nodes, HIR expressions, MIR statements, memos and
-/// their edges, each as its owner counts it) and the linker's `images` (relocations and the
-/// rest), summed by name and sorted by it.
-fn tables(db: &Db, images: &[(&'static str, u64, u64)]) -> Vec<Table> {
-    let mut counted = load_cargo::v2::tables(db);
-    counted.extend_from_slice(images);
+/// their edges, each as its owner counts it) and the linker's (relocations and the rest),
+/// summed by name and sorted by it.
+fn summed(mut counted: Vec<(&'static str, u64, u64)>) -> Vec<Table> {
     counted.sort_unstable_by_key(|it| it.0);
     let mut tables: Vec<Table> = Vec::new();
     for (name, elements, bytes) in counted {

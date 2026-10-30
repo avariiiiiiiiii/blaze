@@ -59,7 +59,7 @@ const BASE_PAYLOAD: usize = 32 + 8;
 
 /// Sequence numbers are below this: one more per head move from 0 never reaches it, so a
 /// record at or above it is forged, and the next number never overflows.
-pub(crate) const SEQUENCES: u64 = 1 << 63;
+const SEQUENCES: u64 = 1 << 63;
 
 const APPEND: u64 = 0;
 const SYNC: u64 = 1;
@@ -137,15 +137,14 @@ struct FileBase {
     of: Written,
 }
 
-/// The tree read in place from an image, for [`Journal::restore`] to load the file over.
+/// The tree read in place from an image, for [`Journal::restore`] to load the file over. It
+/// has no heads: the file names every head (a base record is only written by a rewrite, which
+/// records each head), so one removed since the image was written stays removed.
 pub(crate) struct FromImage {
     pub(crate) tree: Tree,
     /// The hash of the image's tree and its node count, as a base record names them.
     pub(crate) name: ContentId,
     pub(crate) nodes: u64,
-    /// Each head, its root and its sequence, as the image holds them.
-    pub(crate) heads: Vec<(Box<str>, ContentId, u64)>,
-    pub(crate) sequence: u64,
     /// The file does not start from this image but from the one it was written over (or
     /// none): the rewrite naming it did not happen, so the whole file is loaded over it and
     /// the next flush rewrites it.
@@ -200,8 +199,8 @@ impl Journal {
         Journal::load(file, tags, bytes, None)
     }
 
-    /// The journal whose file holds `bytes`, loaded over `image`: its heads, then the file's
-    /// records after its base record.
+    /// The journal whose file holds `bytes`, loaded over `image`: the file's records after its
+    /// base record, each node of the image found where it is.
     pub(crate) fn restore(file: FileName, tags: u64, bytes: &[u8], image: FromImage) -> Loaded {
         Journal::load(file, tags, bytes, Some(image))
     }
@@ -211,11 +210,7 @@ impl Journal {
         let mut moves: FxHashMap<Box<str>, Vec<(u64, Option<ContentId>)>> = FxHashMap::default();
         let mut sequence = 0;
         let (mut tree, from) = match image {
-            Some(FromImage { tree, name, nodes, heads, sequence: at, resumed }) => {
-                for (head, root, at) in heads {
-                    moves.entry(head).or_default().push((at, Some(root)));
-                }
-                sequence = at;
+            Some(FromImage { tree, name, nodes, resumed }) => {
                 let of = Written::new(tree.table().base_len() as usize, true);
                 (tree, Some((FileBase { name, nodes, of }, resumed)))
             }
@@ -381,6 +376,7 @@ impl Journal {
                         out.extend_from_slice(&base.name.0);
                         out.extend_from_slice(&base.nodes.to_le_bytes());
                     });
+                    // clone: one bit per node, once per rewrite.
                     let mut written = base.of.clone();
                     written.grow(tree.len());
                     written

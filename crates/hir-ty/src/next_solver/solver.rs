@@ -24,6 +24,7 @@ use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
 use crate::{
+    db::HirDatabase,
     ParamEnvAndCrate, Span,
     consteval::ConstEvalError,
     lower::GenericPredicates,
@@ -411,7 +412,7 @@ impl<'db> SolverDelegate for SolverContext<'db> {
     ) -> Option<Vec<Goal<'db, Predicate<'db>>>> {
         let interner = self.interner;
         let Some(ty) = arg.as_type() else { return Some(Vec::new()) }; // alloc: empty
-        let ty = self.resolve_vars_if_possible(ty);
+        let ty = self.deeply_resolve_ignoring_regions(ty);
         if ty.is_ty_var() {
             return None;
         }

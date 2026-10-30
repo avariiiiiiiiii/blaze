@@ -3,12 +3,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::cell::Cell;
 
 use blaze_ids::ContentId;
 use blaze_query::Tree;
 use blaze_units::query::{Mount, Origin};
-use blaze_vfs::Mode;
+use blaze_vfs::{Bytes, Mode};
 
 use super::LowerError;
 
@@ -20,17 +20,19 @@ pub(crate) struct Mounts<'a> {
     /// The root of `Origin::View` mounts.
     pub(crate) view: ContentId,
     pub(crate) tree: &'a dyn Tree,
+    /// Set as a path is found in an `Origin::View` mount: what read it read the view.
+    pub(crate) read_view: Cell<bool>,
 }
 
 /// A file read for the front end, by its absolute path as cargo names it.
 pub(crate) struct Loaded {
     pub(crate) path: String,
     pub(crate) id: ContentId,
-    pub(crate) bytes: Arc<[u8]>,
+    pub(crate) bytes: Bytes,
 }
 
 enum Node {
-    File(ContentId, Arc<[u8]>),
+    File(ContentId, Bytes),
     Dir(String),
     None,
 }
@@ -59,7 +61,10 @@ impl Mounts<'_> {
             (under, rest) => format!("{under}/{rest}"),
         };
         let root = match mount.origin {
-            Origin::View => self.view,
+            Origin::View => {
+                self.read_view.set(true);
+                self.view
+            }
             Origin::Root(root) => root,
         };
         Ok((root, under))
@@ -71,7 +76,7 @@ impl Mounts<'_> {
     }
 
     /// The bytes of the file at `path`, symlinks followed; none for no file.
-    pub(crate) fn read(&self, path: &str) -> Result<Option<Arc<[u8]>>, LowerError> {
+    pub(crate) fn read(&self, path: &str) -> Result<Option<Bytes>, LowerError> {
         Ok(match self.node(path)? {
             Node::File(_, bytes) => Some(bytes),
             Node::Dir(_) | Node::None => None,
@@ -83,7 +88,11 @@ impl Mounts<'_> {
         let mut path = path.to_owned();
         for _ in 0..=MAX_LINKS {
             let (root, under) = self.locate(&path)?;
-            match self.tree.file(root, &under) {
+            let file = self
+                .tree
+                .file(root, &under)
+                .map_err(|corrupt| LowerError::at(format!("`{path}` can't be read: {corrupt}"), &path))?;
+            match file {
                 Some((_, Mode::Symlink, target)) => {
                     let target = std::str::from_utf8(&target).map_err(|_| {
                         LowerError::at(format!("the symlink `{path}` points to a path that is not UTF-8"), &path)

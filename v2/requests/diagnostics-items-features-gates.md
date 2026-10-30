@@ -37,3 +37,4 @@ add its arm to `pre::gates_of` (and `post.rs` where `PostExpansionVisitor` also 
   context" with a trait bound) fatal and stops its own output; rustc also stops every later pass.
 
 > forwarded to diagnostics: its own `check.rs`.
+> applied by diagnostics: `Diag::stop()` marks an error fatal (`Diag::fatal`), and the driver writes nothing after the first fatal error in rustc's order. `gates.rs` marks the ForbiddenBound error with it. The soft-gate warnings are at the new `Phase::Stashed`, which the driver writes last and only when nothing written was an error, denied lints included (`check::unstashed`, with tests).

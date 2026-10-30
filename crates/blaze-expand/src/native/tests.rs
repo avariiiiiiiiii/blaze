@@ -1,8 +1,13 @@
-use native_proc_macro::{Ident, Span as MacroSpan, TokenTree as MacroTree};
+use native_proc_macro::{
+    Ident, Literal as MacroLiteral, Span as MacroSpan, TokenTree as MacroTree, __native::with_host,
+};
 use span::{EditionedFileId, ErasedFileAstId, SpanAnchor, SyntaxContext, TextRange};
 use tt::{IdentIsRaw, LitKind, Spacing};
 
-use super::{wire::Tree, *};
+use super::{
+    wire::{self, Parts},
+    *,
+};
 
 const GUEST: &str = include_str!("../../../blaze-macro-wasm/guest/proc_macro.rs");
 const WASM_WIRE: &str = include_str!("../../../blaze-macro-wasm/src/wire.rs");
@@ -18,206 +23,280 @@ fn span(start: u32, end: u32) -> Span {
 }
 
 fn tokens(text: &str, at: Span) -> TopSubtree {
-    reference::top_subtree(lex::stream(text, at).expect("the test's text lexes"), at)
+    wire::top_subtree(lex::stream(text, at).expect("the test's text lexes"), at)
 }
 
-/// The wasm host's reading of a module's output (`crates/blaze-macro-wasm/src/wire.rs`,
-/// `Reader` and `top_subtree`): trees, then rust-analyzer's flat tree of them, which
-/// [`wire::Reader`] makes in one pass.
-mod reference {
-    use intern::Symbol;
-    use span::Span;
-    use tt::{DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree};
-
-    use super::wire::{Spans, Tree};
-
-    pub(super) fn read(bytes: &[u8], spans: &Spans, call_site: Span) -> Result<TopSubtree, String> {
-        let mut reader = Reader { bytes, at: 0, spans };
-        Ok(top_subtree(reader.stream()?, call_site))
-    }
-
-    struct Reader<'a> {
-        bytes: &'a [u8],
-        at: usize,
-        spans: &'a Spans,
-    }
-
-    impl<'a> Reader<'a> {
-        fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
-            let end = self.at.checked_add(len).filter(|it| *it <= self.bytes.len());
-            let end = end.ok_or("the module wrote a stream that ends early")?;
-            let it = &self.bytes[self.at..end];
-            self.at = end;
-            Ok(it)
-        }
-
-        fn u8(&mut self) -> Result<u8, String> {
-            Ok(self.take(1)?[0])
-        }
-
-        fn u32(&mut self) -> Result<u32, String> {
-            Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-        }
-
-        fn span(&mut self) -> Result<Span, String> {
-            let number = self.u32()?;
-            self.spans.get(number).ok_or_else(|| format!("the module named span {number}, unknown"))
-        }
-
-        fn text(&mut self) -> Result<&'a str, String> {
-            let len = self.u32()? as usize;
-            std::str::from_utf8(self.take(len)?).map_err(|it| it.to_string())
-        }
-
-        fn stream(&mut self) -> Result<Vec<Tree>, String> {
-            let count = self.u32()? as usize;
-            let mut trees = Vec::with_capacity(count.min(1 << 16));
-            for _ in 0..count {
-                trees.push(self.tree()?);
+/// What the wasm host and its module do with an expansion, in process: the input and the
+/// attribute as the columns the host gives a module (`wire::relative`), read by the guest's
+/// reader, the macro's output written by the guest's writer, with the host's answers to the
+/// guest's imports. The parts of the expansion and the bytes written, which the host reads.
+fn written(
+    expander: Expander,
+    input: &TopSubtree,
+    attr: Option<&TopSubtree>,
+    sites: [Span; 3],
+) -> (Parts, Vec<u8>) {
+    let mut parts = Parts::default();
+    let words = sites.map(|it| parts.pack(it));
+    let mut input_bytes = Vec::new();
+    wire::relative(input, &mut parts, &mut input_bytes);
+    let attr_bytes = attr.map(|it| {
+        let mut bytes = Vec::new();
+        wire::relative(it, &mut parts, &mut bytes);
+        bytes
+    });
+    let mut out = Vec::new();
+    let mut host = host::Host { db: None, parts: &mut parts, sites: words };
+    with_host(&mut host, || {
+        let read = |bytes: &[u8]| match bytes.len() {
+            0 => TokenStream::new(),
+            _ => native_proc_macro::wire::Reader::new(bytes).input(),
+        };
+        let output = match expander {
+            Expander::One(f) => f(read(&input_bytes)),
+            Expander::Two(f) => {
+                let attr = attr_bytes.as_deref().map_or_else(TokenStream::new, read);
+                f(attr, read(&input_bytes))
             }
-            Ok(trees)
-        }
+        };
+        native_proc_macro::wire::write(&output, &mut out);
+    });
+    (parts, out)
+}
 
-        fn tree(&mut self) -> Result<Tree, String> {
-            Ok(match self.u8()? {
-                0 => {
-                    let kind = match self.u8()? {
-                        0 => DelimiterKind::Parenthesis,
-                        1 => DelimiterKind::Brace,
-                        2 => DelimiterKind::Bracket,
-                        _ => DelimiterKind::Invisible,
-                    };
-                    let (open, close, entire) = (self.span()?, self.span()?, self.span()?);
-                    Tree::Group { kind, open, close, entire, trees: self.stream()? }
-                }
-                1 => {
-                    let span = self.span()?;
-                    let is_raw = if self.u8()? == 1 { IdentIsRaw::Yes } else { IdentIsRaw::No };
-                    Tree::Leaf(Leaf::Ident(tt::Ident {
-                        sym: Symbol::intern(self.text()?),
-                        span,
-                        is_raw,
-                    }))
-                }
-                2 => {
-                    let span = self.span()?;
-                    let char = char::from_u32(self.u32()?).ok_or("the module wrote no character")?;
-                    let spacing = if self.u8()? != 0 { Spacing::Joint } else { Spacing::Alone };
-                    Tree::Leaf(Leaf::Punct(tt::Punct { char, spacing, span }))
-                }
-                3 => {
-                    let span = self.span()?;
-                    let (kind, hashes) = (self.u8()?, self.u8()?);
-                    let text = self.text()?;
-                    let suffix = match u32::from_le_bytes(
-                        self.bytes
-                            .get(self.at..self.at + 4)
-                            .ok_or("a literal ends early")?
-                            .try_into()
-                            .unwrap(),
-                    ) {
-                        u32::MAX => {
-                            self.at += 4;
-                            ""
-                        }
-                        _ => self.text()?,
-                    };
-                    let kind = match kind {
-                        0 => LitKind::Byte,
-                        1 => LitKind::Char,
-                        2 => LitKind::Integer,
-                        3 => LitKind::Float,
-                        4 => LitKind::Str,
-                        5 => LitKind::StrRaw(hashes),
-                        6 => LitKind::ByteStr,
-                        7 => LitKind::ByteStrRaw(hashes),
-                        8 => LitKind::CStr,
-                        9 => LitKind::CStrRaw(hashes),
-                        _ => LitKind::Err(()),
-                    };
-                    Tree::Leaf(Leaf::Literal(tt::Literal::new(text, span, kind, suffix)))
-                }
-                other => return Err(format!("the module wrote a tree of kind {other}")),
-            })
-        }
+/// The tree the wasm host makes of an expansion ([`written`]).
+fn through_columns(
+    expander: Expander,
+    input: &TopSubtree,
+    attr: Option<&TopSubtree>,
+    sites: [Span; 3],
+) -> Result<TopSubtree, String> {
+    let (parts, out) = written(expander, input, attr, sites);
+    wire::read(&out, &parts)
+}
+
+/// Expands `input` both natively and as the wasm host does, which are to be the same tree.
+#[track_caller]
+fn both(expander: Expander, input: &TopSubtree, attr: Option<&TopSubtree>, sites: [Span; 3]) -> TopSubtree {
+    let [def, call, mixed] = sites;
+    let native = expand(expander, None, input, attr, def, call, mixed).expect("the native expansion");
+    let wasm = through_columns(expander, input, attr, sites).expect("the host reads what the guest wrote");
+    assert_eq!(difference(&native, &wasm), None);
+    assert!(native == wasm);
+    native
+}
+
+/// A generator of the tests' own: the same numbers for a seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
     }
 
-    pub(super) fn top_subtree(trees: Vec<Tree>, call_site: Span) -> TopSubtree {
-        let mut flat = Vec::new();
-        match <[Tree; 1]>::try_from(trees) {
-            Ok([group @ Tree::Group { .. }]) => flatten(group, &mut flat),
-            Ok([leaf]) => flatten(top_of(vec![leaf], call_site), &mut flat),
-            Err(trees) => flatten(top_of(trees, call_site), &mut flat),
-        }
-        TopSubtree::from_serialized(flat)
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
     }
+}
 
-    fn top_of(trees: Vec<Tree>, call_site: Span) -> Tree {
-        let (open, close, entire) = (call_site, call_site, call_site);
-        Tree::Group { kind: DelimiterKind::Invisible, open, close, entire, trees }
+/// More names than a symbol is looked for among the latest of, each used again.
+const NAMES: [&str; 24] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+    "s", "t", "u", "v", "w", "x",
+];
+
+/// A span of one of `parts` anchors (file 7, an ast id each) and one of two contexts, now and
+/// then longer than a packed span holds.
+fn random_span(rng: &mut Rng, parts: usize) -> Span {
+    let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
+    let edition = if rng.below(4) == 0 { span::Edition::Edition2015 } else { span::Edition::CURRENT };
+    let start = rng.below(1 << 20) as u32;
+    let len = if rng.below(16) == 0 { 0x1_0000 + rng.below(1 << 16) } else { rng.below(64) } as u32;
+    Span {
+        range: TextRange::at(start.into(), len.into()),
+        anchor: SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(rng.below(parts) as u32) },
+        ctx: SyntaxContext::root(edition),
     }
+}
 
-    fn flatten(tree: Tree, flat: &mut Vec<TokenTree>) {
-        match tree {
-            Tree::Leaf(Leaf::Literal(literal))
-                if matches!(literal.kind, LitKind::Integer | LitKind::Float)
-                    && literal.text().starts_with('-') =>
-            {
-                let (text, suffix) = literal.text_and_suffix();
-                let span = literal.span;
-                let minus = tt::Punct { char: '-', spacing: Spacing::Alone, span };
-                let magnitude = tt::Literal::new(&text[1..], span, literal.kind, suffix);
-                flat.push(TokenTree::Leaf(Leaf::Punct(minus)));
-                flat.push(TokenTree::Leaf(Leaf::Literal(magnitude)));
-            }
-            Tree::Leaf(leaf) => flat.push(TokenTree::Leaf(leaf)),
-            Tree::Group { kind, open, close, entire: _, trees } => {
-                let at = flat.len();
-                flat.push(TokenTree::Subtree(Subtree {
-                    delimiter: tt::Delimiter { open, close, kind },
-                    len: 0,
-                }));
-                for tree in trees {
-                    flatten(tree, flat);
-                }
-                let len = (flat.len() - at - 1) as u32;
-                if let TokenTree::Subtree(subtree) = &mut flat[at] {
-                    subtree.len = len;
-                }
-            }
+fn random_leaf(rng: &mut Rng, span: Span) -> Leaf {
+    const LITERALS: [(LitKind, &str); 11] = [
+        (LitKind::Integer, "17"),
+        (LitKind::Float, "2.5"),
+        (LitKind::Str, "s"),
+        (LitKind::StrRaw(2), "raw"),
+        (LitKind::Byte, "b"),
+        (LitKind::Char, "c"),
+        (LitKind::ByteStr, "bs"),
+        (LitKind::ByteStrRaw(1), "rb"),
+        (LitKind::CStr, "cs"),
+        (LitKind::CStrRaw(3), "rc"),
+        (LitKind::Err(()), "err"),
+    ];
+    const SUFFIXES: [&str; 4] = ["", "u8", "f32", "a_suffix"];
+    match rng.below(3) {
+        0 => {
+            let char = ['+', '-', '#', ':', '<', '&'][rng.below(6)];
+            let spacing = if rng.below(2) == 0 { Spacing::Alone } else { Spacing::Joint };
+            Leaf::Punct(tt::Punct { char, spacing, span })
         }
+        1 => {
+            let is_raw = if rng.below(8) == 0 { IdentIsRaw::Yes } else { IdentIsRaw::No };
+            Leaf::Ident(tt::Ident { sym: intern::Symbol::intern(NAMES[rng.below(NAMES.len())]), span, is_raw })
+        }
+        _ => {
+            let (kind, text) = LITERALS[rng.below(LITERALS.len())];
+            Leaf::Literal(tt::Literal::new(text, span, kind, SUFFIXES[rng.below(SUFFIXES.len())]))
+        }
+    }
+}
+
+/// Token trees, at least two in every group so that none is a passed-on fragment and the top
+/// is never one group: a tree an identity macro gives back as it is.
+fn random_trees(rng: &mut Rng, builder: &mut tt::TopSubtreeBuilder, parts: usize, budget: &mut usize, depth: u32) {
+    let count = 2 + rng.below(6);
+    for at in 0..count {
+        if at >= 2 && *budget == 0 {
+            break;
+        }
+        *budget = budget.saturating_sub(1);
+        if depth < 6 && rng.below(5) == 0 {
+            let kind = [
+                tt::DelimiterKind::Parenthesis,
+                tt::DelimiterKind::Brace,
+                tt::DelimiterKind::Bracket,
+                tt::DelimiterKind::Invisible,
+            ][rng.below(4)];
+            builder.open(kind, random_span(rng, parts));
+            random_trees(rng, builder, parts, budget, depth + 1);
+            builder.close(random_span(rng, parts));
+        } else {
+            let span = random_span(rng, parts);
+            builder.push(random_leaf(rng, span));
+        }
+    }
+}
+
+fn random_tree(seed: u64, parts: usize, budget: usize, call_site: Span) -> TopSubtree {
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(call_site));
+    random_trees(&mut rng, &mut builder, parts, &mut { budget }, 0);
+    builder.build()
+}
+
+/// What the test's macros are given and expand to read the same natively and as the wasm host
+/// reads them: blaze's lexed text, of every kind of token.
+const CORPUS: [&str; 10] = [
+    "a::b(1u8, -2, \"s\") { c[0] } 'a",
+    "x",
+    "struct S;",
+    "r#type - 2.5",
+    "{ fn f() {} }",
+    "#[derive(Debug)] struct S<T> { a: [u8; 3], b: (T, \"s\", b'x', r#\"raw\"#, 2.5e3f64) }",
+    "c\"c\" cr#\"cr\"# br\"br\" b\"b\" 'c' 1_000i128 0x1F 1e-3",
+    "a && b || !c ..= d ::< e >> f",
+    "(())",
+    "[a] (b) {c}",
+];
+
+#[test]
+fn an_identity_macro_gives_back_every_tree_as_the_wasm_host_does() {
+    for text in CORPUS {
+        let at = span(0, text.len() as u32);
+        let input = tokens(text, at);
+        let out = both(Expander::One(echo), &input, None, [span(5, 5), at, span(7, 7)]);
+        assert_eq!(difference(&out, &input), None, "{text}");
+    }
+    for seed in 0..64 {
+        let at = span(3, 9);
+        let input = random_tree(seed, 1 + (seed as usize % 40), 200, at);
+        let out = both(Expander::One(echo), &input, None, [span(5, 5), at, span(7, 7)]);
+        assert_eq!(difference(&out, &input), None, "seed {seed}");
+        let attr = random_tree(seed + 1000, 3, 20, span(1000, 1010));
+        both(Expander::Two(attributed), &input, Some(&attr), [span(5, 5), at, span(7, 7)]);
     }
 }
 
 #[test]
-fn the_one_pass_reader_reads_as_the_wasm_host_does() {
-    let at = span(2, 40);
-    let group = |kind, trees| Tree::Group { kind, open: span(1, 2), close: span(8, 9), entire: span(1, 9), trees };
-    let lexed = |text: &str| lex::stream(text, at).unwrap();
-    let negative = |text: &str| Tree::Leaf(Leaf::Literal(lex::literal_from_str(text, at).unwrap()));
-    let streams: Vec<Vec<Tree>> = vec![
-        vec![],
-        lexed("x"),
-        vec![negative("-1i32")],
-        vec![negative("-2.5")],
-        lexed("a::b(1u8, \"s\", r#\"raw\"#) { c[0] } 'a"),
-        vec![group(tt::DelimiterKind::Brace, lexed("struct S { x: i32 }"))],
-        vec![group(tt::DelimiterKind::Parenthesis, vec![negative("-7")]), Tree::Leaf(Leaf::Punct(tt::Punct { char: ';', spacing: Spacing::Alone, span: at }))],
-        vec![group(tt::DelimiterKind::Invisible, lexed("r#type + 1"))],
-    ];
-    for trees in streams {
-        let mut spans = Spans::default();
-        let mut writer = Writer { out: Vec::new(), spans: &mut spans };
-        writer.trees(&trees);
-        let bytes = writer.out;
-        let ours = wire::Reader::new(&bytes, &spans).top(at).unwrap();
-        let theirs = reference::read(&bytes, &spans, at).unwrap();
-        assert_eq!(difference(&ours, &theirs), None);
-        assert!(ours == theirs);
+fn more_parts_than_a_packed_span_names_cross_as_wide_spans() {
+    let at = span(0, 1);
+    let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(at));
+    let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
+    for ast in 0..70_000u32 {
+        let anchor = SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(ast) };
+        let len = if ast % 7 == 0 { 0x2_0000 } else { 3 };
+        let span = Span { range: TextRange::at(ast.into(), len.into()), anchor, ctx: at.ctx };
+        let sym = intern::Symbol::intern(NAMES[ast as usize % NAMES.len()]);
+        builder.push(Leaf::Ident(tt::Ident { sym, span, is_raw: IdentIsRaw::No }));
     }
-    let spans = Spans::default();
-    assert!(wire::Reader::new(&[1, 0, 0, 0], &spans).top(at).is_err());
-    assert!(reference::read(&[1, 0, 0, 0], &spans, at).is_err());
+    let input = builder.build();
+    let out = both(Expander::One(echo), &input, None, [at; 3]);
+    assert_eq!(difference(&out, &input), None);
+}
+
+fn negatives(input: TokenStream) -> TokenStream {
+    let mut out = input;
+    out.extend([
+        MacroTree::from(MacroLiteral::i64_suffixed(-5)),
+        MacroTree::from(MacroLiteral::f64_unsuffixed(-2.5)),
+        MacroTree::from(MacroLiteral::i8_unsuffixed(-1)),
+    ]);
+    out
+}
+
+#[test]
+fn what_the_guest_writes_the_host_reads_as_blazes_builder_makes_it() {
+    for seed in 0..32 {
+        let at = span(3, 9);
+        let input = random_tree(seed, 1 + (seed as usize % 20), 300, at);
+        let out = both(Expander::One(negatives), &input, None, [span(5, 5), at, span(7, 7)]);
+        assert_has(&out, "- 5i64 - 2.5 - 1");
+    }
+}
+
+#[test]
+fn what_the_guest_writes_is_read_whole_or_refused() {
+    let at = span(0, 20);
+    let input = tokens("a (b [c]) \"d\" 1u8", at);
+    let (parts, out) = written(Expander::One(echo), &input, None, [at; 3]);
+    assert!(wire::read(&out, &parts).is_ok());
+    for len in 0..out.len() {
+        assert!(wire::read(&out[..len], &parts).is_err(), "{len} of {} bytes", out.len());
+    }
+    let mut longer = out.clone();
+    longer.extend([0; 4]);
+    assert!(wire::read(&longer, &parts).unwrap_err().contains("bytes after the token tree"));
+    let row = wire::sections(&out).unwrap().parts;
+    let mut past = out.clone();
+    past[row..row + 4].copy_from_slice(&(parts.len() as u32).to_le_bytes());
+    assert!(wire::read(&past, &parts).unwrap_err().contains("span parts"));
+    let mut raw = out.clone();
+    raw[row + 8..row + 12].copy_from_slice(&1u32.to_le_bytes());
+    assert!(wire::read(&raw, &parts).unwrap_err().contains("span parts"));
+}
+
+#[test]
+fn a_warm_expansion_allocates_only_the_macros_streams_and_its_output() {
+    let at = span(0, 10);
+    let input = tokens("a + (b, 1)", at);
+    let run = || expand(Expander::One(echo), None, &input, None, at, at, at).unwrap();
+    // Warms this thread's span parts and the builder's scratch.
+    run();
+    let (out, used) = blaze_alloc_count::measure(run);
+    let rebuild = || TopSubtree::from_token_trees(out.top_subtree().delimiter, out.token_trees());
+    let (_, output) = blaze_alloc_count::measure(rebuild);
+    // The macro's streams: two (the input's and its group's), each an `Rc` of a `Vec`, and
+    // the text of `a`, `b` and `1`, an `Rc<str>` each.
+    let streams = 7;
+    assert!(
+        used.allocations <= output.allocations + streams,
+        "a warm expansion made {} allocations, its output {} and the macro's streams {streams}",
+        used.allocations,
+        output.allocations,
+    );
 }
 
 /// The text from the first `from` to the next `to` after it.
@@ -241,8 +320,7 @@ fn the_proc_macro_is_the_guests_but_for_its_imports_and_exports() {
 #[test]
 fn the_wire_and_the_lexer_are_the_wasm_hosts() {
     let from = |text: &'static str, start: &str| &text[text.find(start).unwrap()..];
-    let numbering = |text: &'static str| between(text, "\nuse intern::Symbol;", "\n/// Reads what the module wrote");
-    assert_eq!(numbering(include_str!("wire.rs")), numbering(WASM_WIRE));
+    assert_eq!(from(include_str!("wire.rs"), "\nuse "), from(WASM_WIRE, "\nuse "));
     let lex = from(include_str!("lex.rs"), "\nuse intern::Symbol;");
     let wasm_lex = from(WASM_LEX, "\nuse intern::Symbol;")
         .replacen("use crate::wire::Tree;", "use super::wire::Tree;", 1);

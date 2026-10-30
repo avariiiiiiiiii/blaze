@@ -57,7 +57,9 @@ from its previous parse`) gives the exact edit to `EditionedFileId::parse`, one 
   ids of the items it is made of (`[start, kind, id]` from its start) and the span anchors
   lowering looks up in it (`[start, id]`, the anchors of an `impl`'s or `trait`'s items left
   out, as no span past their start is looked up). The ids and anchors of all items are two
-  arrays the items share, with the tree, in one `Arc`: no allocation per item.
+  arrays the items share, with the tree, in one `Arc`: no allocation per item. The arrays and
+  the hash buffer are filled in a per-worker scratch that keeps its capacity, so a run
+  allocates the two arrays, the `Arc` and its list of items.
 - `item_fragment(item)` lowers one item (`Ctx::for_item`, `Ctx::lower_item`) from the item's
   node in its tree, its ids by binary search and a `RealSpanMap` made of its anchors. It reads
   nothing tracked but the crate's `cfg`s, so it runs again only when the item's key changes.
@@ -105,6 +107,9 @@ crates/syntax:
   rebuilds the new text, across multi-byte chars and long runs.
 - `a_kept_parse_makes_the_parse_of_the_new_text`: a sequence of texts through `parse_file`, full
   and outline, each the parse of its text; another file in the same slot evicts the kept one.
+- `taking_and_keeping_allocate_nothing`, and `edit_between` in its test: a lookup of the kept
+  table, keeping a parse and finding the edit between two texts allocate nothing
+  (`blaze-alloc-count`).
 
 crates/hir-def/src/item_tree:
 
@@ -121,3 +126,8 @@ crates/hir-def/src/item_tree:
 - `an_edit_of_one_item_lowers_it_alone`: renaming a `fn`, changing a field's visibility, making
   an `impl` a trait impl, adding `pub`, adding an item, changing an inline module's item, adding
   an inner attribute to a `fn` body each run `item_fragment` exactly once.
+- `trees_asked_again_allocate_nothing`: a memo hit of `file_item_tree`, `top_attrs`,
+  `item_sources` and `item_fragment` allocates nothing.
+- `assembly_allocates_once_a_column`: assembling a file of 4 items and one of 64 allocates as
+  many times, and gives the whole-file tree. These two count only once hir-def's test binary
+  installs `blaze_alloc_count::Counting` (requested from db).

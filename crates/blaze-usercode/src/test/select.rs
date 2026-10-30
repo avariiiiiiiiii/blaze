@@ -49,7 +49,7 @@ impl Passes for Store {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub enum ShouldPanic {
     No,
     Yes,
@@ -57,7 +57,7 @@ pub enum ShouldPanic {
 }
 
 /// What of a test's attributes changes what running it means.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub struct Attrs {
     pub ignore: bool,
     pub should_panic: ShouldPanic,
@@ -109,20 +109,22 @@ impl Test {
     /// The test, binary-independent: its name, the set of code hashes it reaches and its
     /// attributes.
     pub fn identity(&self) -> ContentId {
-        let set = sorted(&self.reached);
         let mut hasher = Hasher::new("blaze v2 test identity 1");
         hasher.part(self.name.as_bytes()).id(&self.attrs.id());
-        hasher.update(&(set.len() as u64).to_le_bytes());
-        // 16 KiB an update, not 32 bytes: BLAKE3 hashes the whole 1 KiB chunks of one update
-        // side by side, as many as its widest SIMD (16 with AVX-512), and a 32-byte update at
-        // a time it cannot. On the stack, so no buffer of the set's size.
-        let mut block = [0u8; 32 * 512];
-        for group in set.chunks(512) {
-            for (at, hash) in group.iter().enumerate() {
-                block[32 * at..32 * at + 32].copy_from_slice(&hash.0.0);
+        blaze_mem::scratch::with_u64s(|order| {
+            set_order(&self.reached, order);
+            hasher.update(&(order.len() as u64).to_le_bytes());
+            // 16 KiB an update, not 32 bytes: BLAKE3 hashes the whole 1 KiB chunks of one
+            // update side by side, as many as its widest SIMD (16 with AVX-512), and a 32-byte
+            // update at a time it cannot. On the stack, so no buffer of the set's size.
+            let mut block = [0u8; 32 * 512];
+            for group in order.chunks(512) {
+                for (at, &it) in group.iter().enumerate() {
+                    block[32 * at..32 * at + 32].copy_from_slice(&self.reached[it as u32 as usize].0.0);
+                }
+                hasher.update(&block[..32 * group.len()]);
             }
-            hasher.update(&block[..32 * group.len()]);
-        }
+        });
         hasher.finish()
     }
 
@@ -148,37 +150,45 @@ impl Test {
     }
 }
 
-/// `hashes` sorted, each once.
+/// `hashes` sorted, each once: for an explanation ([`explain`]), the edge.
+fn sorted(hashes: &[CodeHash]) -> Vec<CodeHash> {
+    blaze_mem::scratch::with_u64s(|order| {
+        set_order(hashes, order);
+        let mut set = Vec::with_capacity(order.len());
+        set.extend(order.iter().map(|&it| hashes[it as u32 as usize]));
+        set
+    })
+}
+
+/// The set of `hashes` in order, each once, as indices into `hashes`: each in the low half of
+/// an entry of `order`, which comes empty, a buffer the caller keeps (a worker's scratch). The
+/// radix sort's buffer is the thread's scratch too, so a warm call below
+/// [`radix::PARALLEL`] hashes allocates nothing.
 ///
 /// Code hashes are uniform, so their first four bytes already order all but a few: a radix
-/// sort of each prefix and index, linear where a comparison sort of 32-byte keys is
-/// `n log n` compares, then the rare runs of one prefix by the whole hash.
-fn sorted(hashes: &[CodeHash]) -> Vec<CodeHash> {
-    if hashes.len() < SMALL {
-        let mut set = hashes.to_vec(); // alloc: the set's one buffer and its keys' one: identity's budget
-        set.sort_unstable();
-        set.dedup();
-        return set;
-    }
+/// sort on that prefix, linear where a comparison sort of 32-byte keys is `n log n`
+/// compares, then the rare runs of one prefix by the whole hash.
+fn set_order(hashes: &[CodeHash], order: &mut Vec<u64>) {
     let count = u32::try_from(hashes.len()).expect("a test reaches fewer than 2^32 functions");
-    let mut keyed: Vec<(u32, u32)> = (0..count).map(|at| (prefix(&hashes[at as usize]), at)).collect(); // alloc: the set's one buffer and its keys' one: identity's budget
-    radix::sort_pairs(&mut keyed);
-    let mut set: Vec<CodeHash> = Vec::with_capacity(hashes.len());
-    let mut start = 0;
-    while start < keyed.len() {
-        let mut end = start + 1;
-        while end < keyed.len() && keyed[end].0 == keyed[start].0 {
-            end += 1;
+    order.extend((0..count).map(|at| (u64::from(prefix(&hashes[at as usize])) << 32) | u64::from(at)));
+    let hash = |it: &u64| &hashes[*it as u32 as usize];
+    if order.len() < SMALL {
+        order.sort_unstable_by(|a, b| hash(a).cmp(hash(b)));
+    } else {
+        blaze_mem::scratch::with_u64s(|scratch| radix::sort_copy_by_key_in(order, |it| (*it >> 32) as u32, scratch));
+        let mut start = 0;
+        while start < order.len() {
+            let mut end = start + 1;
+            while end < order.len() && order[end] >> 32 == order[start] >> 32 {
+                end += 1;
+            }
+            if end - start > 1 {
+                order[start..end].sort_unstable_by(|a, b| hash(a).cmp(hash(b)));
+            }
+            start = end;
         }
-        let from = set.len();
-        set.extend(keyed[start..end].iter().map(|&(_, at)| hashes[at as usize]));
-        if end - start > 1 {
-            set[from..].sort_unstable();
-        }
-        start = end;
     }
-    set.dedup();
-    set
+    order.dedup_by(|a, b| hash(a) == hash(b));
 }
 
 /// Below this many hashes a comparison sort beats a radix sort's passes.
@@ -194,7 +204,7 @@ fn prefix(hash: &CodeHash) -> u32 {
 /// target is another test. `context` is the hash of everything outside the reached code that
 /// what the binary does depends on (the target triple, the toolchain, the codegen settings
 /// and panic strategy), made by whoever builds the binary; a key that misses one is a bug.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Suite {
     pub package: String,
     /// The target as cargo names it: `lib`, `test:parse`, `bin:blaze`.
@@ -247,7 +257,7 @@ pub enum Ignored {
 }
 
 /// The names asked for, as libtest takes them.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Filter {
     /// A test is asked for when its name holds any of these (equals one, with `exact`); all
     /// are when there are none.
@@ -300,7 +310,7 @@ pub enum Input {
 }
 
 /// Why a test runs (`--explain`).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Why {
     /// It has never run here.
     New,
@@ -347,7 +357,7 @@ impl fmt::Display for Why {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Decision {
     /// It runs; `expected` is how long it took when it last ran, if it has.
     Run { why: Why, expected: Option<Duration> },
@@ -580,7 +590,10 @@ pub fn record<P: Passes + ?Sized>(
             }
         }
     }
-    let set = encode_reached(&sorted(&test.reached));
+    let set = blaze_mem::scratch::with_u64s(|order| {
+        set_order(&test.reached, order);
+        encode_reached(order.len(), order.iter().map(|&it| &test.reached[it as u32 as usize]))
+    });
     let reached = Key(ContentId::of("blaze v2 test reached set 1", &set));
     if store.get(&reached)?.is_none() {
         tickets.push(store.put(reached, set).map_err(RecordError::Mismatch)?);
@@ -686,10 +699,11 @@ impl<'s> Entry<'s> {
     }
 }
 
-fn encode_reached(set: &[CodeHash]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(REACHED.len() + 8 + 32 * set.len());
+/// The `count` hashes of `set`, in order, as the store keeps a reached set.
+fn encode_reached<'h>(count: usize, set: impl Iterator<Item = &'h CodeHash>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REACHED.len() + 8 + 32 * count);
     out.extend_from_slice(REACHED);
-    out.extend_from_slice(&(set.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(count as u64).to_le_bytes());
     for hash in set {
         out.extend_from_slice(&hash.0.0);
     }

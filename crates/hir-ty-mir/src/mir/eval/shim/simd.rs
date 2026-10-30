@@ -1,5 +1,6 @@
 //! Shim implementation for simd intrinsics
 
+use hir_ty::db::HirDatabase;
 use std::{
     cmp::Ordering,
     ops::{Add, Div, Mul, Range, Rem, Sub},
@@ -160,6 +161,7 @@ lane_float!(f32, u32, 0x7fc0_0000);
 lane_float!(f64, u64, 0x7ff8_0000_0000_0000);
 
 fn simd_args<'db>(op: SimdOp) -> MirEvalError<'db> {
+    // alloc: error path
     MirEvalError::InternalError(format!("{} args are not provided", Intrinsic::Simd(op)).into())
 }
 
@@ -168,6 +170,7 @@ fn check_lanes<'db>(op: SimdOp, expected: usize, got: usize) -> Result<'db, ()> 
         return Ok(());
     }
     Err(MirEvalError::InternalError(
+        // alloc: error path
         format!("{} of vectors of {expected} and {got} lanes", Intrinsic::Simd(op)).into(),
     ))
 }
@@ -179,6 +182,7 @@ fn simd_ty_arg<'db>(
 ) -> Result<'db, Ty<'db>> {
     generic_args.as_slice().get(index).and_then(|it| it.ty()).ok_or_else(|| {
         MirEvalError::InternalError(
+            // alloc: error path
             format!("{} has no type argument {index}", Intrinsic::Simd(op)).into(),
         )
     })
@@ -205,6 +209,7 @@ fn int_op<'db>(op: SimdOp, lane: Lane, index: usize, args: &[u128]) -> Result<'d
     let bits = lane.bits();
     let mask = lane.mask();
     let ub = |what: String| {
+        // alloc: error path
         MirEvalError::UndefinedBehavior(format!(
             "{what} in `{}` in lane {index}",
             Intrinsic::Simd(op)
@@ -233,11 +238,13 @@ fn int_op<'db>(op: SimdOp, lane: Lane, index: usize, args: &[u128]) -> Result<'d
                 a
             }
         }
+        // alloc: error path
         SimdOp::Div | SimdOp::Rem if b == 0 => return Err(ub("division by zero".to_owned())),
         SimdOp::Div | SimdOp::Rem if signed => {
             let (a, b) = (a as i128, b as i128);
             if b == -1 && a == i128::MIN >> (128 - bits) {
                 let sign = if op == SimdOp::Div { "/" } else { "%" };
+                // alloc: error path
                 return Err(ub(format!("overflow of {a} {sign} -1")));
             }
             (if op == SimdOp::Div { a / b } else { a % b }) as u128
@@ -252,6 +259,7 @@ fn int_op<'db>(op: SimdOp, lane: Lane, index: usize, args: &[u128]) -> Result<'d
             };
             if !in_range {
                 let amount = if signed { (b as i128).to_string() } else { b.to_string() };
+                // alloc: error path
                 return Err(ub(format!("overflowing shift by {amount}")));
             }
             let b = b as u32;
@@ -264,6 +272,7 @@ fn int_op<'db>(op: SimdOp, lane: Lane, index: usize, args: &[u128]) -> Result<'d
         SimdOp::FunnelShl | SimdOp::FunnelShr => {
             let (a, b, shift) = (a & mask, b & mask, args[2] & mask);
             if shift >= u128::from(bits) {
+                // alloc: error path
                 return Err(ub(format!("overflowing shift by {shift}")));
             }
             let shift = shift as u32;
@@ -369,6 +378,7 @@ fn cast_lane<'db>(
                 let (low, high) =
                     if signed { (-power(bits - 1), power(bits - 1)) } else { (0.0, power(bits)) };
                 if !(low <= whole && whole < high) {
+                    // alloc: error path
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "`simd_cast` of {float} in lane {index}, which an integer of {bits} bits \
                          cannot hold"
@@ -502,6 +512,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let size = len * self.ptr_size();
         if vector.interval.size != size || destination.size != size {
             return Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!(
                     "{} of a vector of {} bytes to one of {}, of {len} lanes of pointers",
                     Intrinsic::Simd(op),
@@ -526,6 +537,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             .map(|(i, &it)| match it & lane.mask() {
                 0 => Ok(false),
                 it if it == lane.mask() => Ok(true),
+                // alloc: error path
                 _ => Err(MirEvalError::UndefinedBehavior(format!(
                     "lane {i} of the mask of `{}` is neither all zeros nor all ones",
                     Intrinsic::Simd(op)
@@ -579,6 +591,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let mut shadow = M::Shadow::default();
         for &index in indices {
             if index as usize >= lanes.len() {
+                // alloc: error path
                 return Err(MirEvalError::UndefinedBehavior(format!(
                     "`{}` index {index} is out of bounds of two vectors of {} lanes",
                     Intrinsic::Simd(op),
@@ -602,6 +615,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let intrinsic = Intrinsic::Simd(op);
         let Some(align) = generic_args.as_slice().get(3).and_then(|it| it.konst()) else {
             return Err(MirEvalError::InternalError(
+                // alloc: error path
                 format!("{intrinsic} has no alignment argument").into(),
             ));
         };
@@ -616,11 +630,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             [2] => self.size_align_of_sized(vector, locals, "a simd vector")?.1,
             _ => {
                 return Err(MirEvalError::InternalError(
+                    // alloc: error path
                     format!("the alignment argument of {intrinsic} is not a `SimdAlign`").into(),
                 ));
             }
         };
         if !ptr.to_usize().is_multiple_of(align) {
+            // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "`{intrinsic}` of a pointer that is not aligned to {align} bytes"
             )));
@@ -782,6 +798,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 if vector.interval.size != destination.size {
                     return Err(MirEvalError::InternalError(
+                        // alloc: error path
                         format!(
                             "{} of a vector of {} bytes to one of {}",
                             Intrinsic::Simd(op),
@@ -891,6 +908,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let index = from_bytes!(u32, self.read_scalar(index.interval)?) as usize;
                 let len = lanes.len();
                 if index >= len {
+                    // alloc: error path
                     return Err(MirEvalError::UndefinedBehavior(format!(
                         "`{}` index {index} is out of bounds of a vector of {len} lanes",
                         Intrinsic::Simd(op)
@@ -905,6 +923,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     Some(value) => {
                         if value.interval.size != lanes.size {
                             return Err(MirEvalError::InternalError(
+                                // alloc: error path
                                 format!(
                                     "{} of a value of {} bytes into lanes of {}",
                                     Intrinsic::Simd(op),
@@ -951,6 +970,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     Some(init) => lane.read(self.read_scalar(init.interval)?),
                     None => values.next().ok_or_else(|| {
                         MirEvalError::InternalError(
+                            // alloc: error path
                             format!("{} of a vector with no lanes", Intrinsic::Simd(op)).into(),
                         )
                     })?,

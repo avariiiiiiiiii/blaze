@@ -201,6 +201,7 @@ fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
 pub(crate) unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
     let layout = std::alloc::Layout::array::<T>(len).expect("salsa: a graph page fits in memory");
     if layout.size() == 0 {
+        // alloc: one page of the node or edge columns, made when the previous page fills
         return Vec::new().into_boxed_slice();
     }
     // SAFETY: `layout` has a nonzero size.
@@ -217,12 +218,14 @@ pub(crate) unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
 /// `len` zeroed words; shuttle's atomics are not plain words, so they are made one by one.
 #[cfg(feature = "shuttle")]
 pub(crate) fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+    // alloc: one page of the node or edge columns, made when the previous page fills
     (0..len).map(|_| AtomicU32::new(0)).collect()
 }
 
 /// `len` zeroed words, as [`zeroed_u32s`].
 #[cfg(feature = "shuttle")]
 fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
+    // alloc: one page of the node or edge columns, made when the previous page fills
     (0..len).map(|_| AtomicU64::new(0)).collect()
 }
 

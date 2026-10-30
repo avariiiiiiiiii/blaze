@@ -5,6 +5,7 @@
 //! `compiler/rustc_lint/src/lints.rs` (`OverflowingInt`, `OverflowingBinHex`, ..) (MIT or
 //! Apache-2.0).
 
+use hir_ty::db::HirDatabase;
 use hir::InFile;
 use hir_def::{
     HasModule,

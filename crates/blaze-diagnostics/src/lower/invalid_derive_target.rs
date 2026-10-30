@@ -19,7 +19,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidDeriveTarget) -> Vec<Found>
     let message = "`derive` may only be applied to `struct`s, `enum`s and `union`s";
     let Some(attr) = find_node_at_range::<ast::Attr>(&root, d.range.value) else {
         let diag = Diag::error(Some("E0774"), message, cx.span(d.range));
-        return vec![Found::new(diag, Phase::Resolve)];
+        return vec![Found::new(diag, Phase::Expand)];
     };
     let span = cx.span(InFile::new(file, attr.syntax().text_range()));
     let mut diag = Diag::error(Some("E0774"), message, span.clone());
@@ -30,5 +30,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InvalidDeriveTarget) -> Vec<Found>
             "not a `struct`, `enum` or `union`",
         );
     }
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Expand)]
 }

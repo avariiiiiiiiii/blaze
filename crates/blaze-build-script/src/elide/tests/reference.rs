@@ -19,7 +19,7 @@ pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>>
     let source = lex::normalize(source);
     let tokens = lex::lex(&source).ok()?;
     let printed = printed(&tokens)?;
-    directives_only(&printed).then(|| printed.into_bytes())
+    directives_only(printed.as_bytes()).then(|| printed.into_bytes())
 }
 
 fn printed(tokens: &[Token<'_>]) -> Option<String> {

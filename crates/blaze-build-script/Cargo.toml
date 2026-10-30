@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-mem.workspace = true
 jobserver = "0.1.35"
 memchr.workspace = true
 rustc-hash.workspace = true
@@ -26,6 +27,7 @@ libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
 
 [lints]
 workspace = true

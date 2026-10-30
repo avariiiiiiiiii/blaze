@@ -4,10 +4,10 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{Arch, CompiledFunction, Data, Line, Reloc, RelocKind, Target, Unwind};
+use crate::{Arch, CompiledFunction, Covered, Data, Line, Reloc, RelocKind, Target, Unwind};
 
 pub const DATA_DOMAIN: &str = "blaze v2 data 1";
-pub const CODE_DOMAIN: &str = "blaze v2 code 1";
+pub const CODE_DOMAIN: &str = "blaze v2 code 2";
 
 /// The content ID of a read-only data object: its alignment, bytes and relocations. Two
 /// objects with one ID are one object.
@@ -53,7 +53,22 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
         }
     };
     lines_into(&mut hasher, &function.lines);
+    covered_into(&mut hasher, function.coverage.as_ref());
     hasher.finish()
+}
+
+/// A function's SanitizerCoverage arrays and PC table: two functions that count other blocks
+/// are other code.
+pub(crate) fn covered_into(hasher: &mut Hasher, covered: Option<&Covered>) {
+    let Some(Covered { counters, flags, guards, pcs }) = covered else {
+        hasher.update(&[0]);
+        return;
+    };
+    hasher.update(&[1]).update(&counters.to_le_bytes()).update(&flags.to_le_bytes());
+    hasher.update(&guards.to_le_bytes()).update(&(pcs.len() as u64).to_le_bytes());
+    for (at, pc_flags) in pcs {
+        hasher.update(&at.to_le_bytes()).update(&pc_flags.to_le_bytes());
+    }
 }
 
 fn optional_target_into<'h>(hasher: &'h mut Hasher, target: Option<&Target>) -> &'h mut Hasher {
@@ -102,10 +117,11 @@ pub(crate) fn target_into(hasher: &mut Hasher, target: &Target) {
             hasher.update(&[5]).id(anchor).update(&index.to_le_bytes())
         }
         Target::Weak(name) => hasher.update(&[6]).part(name.as_bytes()),
+        Target::Coverage(array) => hasher.update(&[7]).update(&array.to_le_bytes()),
     };
 }
 
-pub const TARGET_DOMAIN: &str = "blaze v2 target 1";
+pub const TARGET_DOMAIN: &str = "blaze v2 target 2";
 
 /// A relocation target's content ID, to set targets apart without comparing them.
 pub fn target_id(target: &Target) -> ContentId {
@@ -213,6 +229,7 @@ mod tests {
             side: None,
             unwind: None,
             lines: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -233,6 +250,19 @@ mod tests {
         c.lines = vec![Line { at: 0, span: SpanRef { anchor: ContentId([1; 32]), index: 0 } }];
         assert_ne!(code_id(&a), code_id(&b));
         assert_ne!(code_id(&a), code_id(&c));
+    }
+
+    #[test]
+    fn what_a_function_counts_is_its_code() {
+        let a = function(&[0xc3], Vec::new());
+        let covered = |pcs| CompiledFunction {
+            coverage: Some(Covered { counters: 1, flags: 0, guards: 0, pcs }),
+            ..a.clone()
+        };
+        let (b, c) = (covered(vec![(0, 1)]), covered(vec![(0, 0)]));
+        assert_ne!(code_id(&a), code_id(&b));
+        assert_ne!(code_id(&b), code_id(&c));
+        assert_ne!(target_id(&Target::Coverage(0)), target_id(&Target::Coverage(1)));
     }
 
     #[test]

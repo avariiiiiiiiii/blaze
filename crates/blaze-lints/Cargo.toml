@@ -1,6 +1,6 @@
 [package]
 name = "blaze-lints"
-description = "clippy's lints, owned by blaze: computed from rust-analyzer's analysis, with clippy's names, levels, groups, configuration and messages"
+description = "clippy's lints and blaze's own, owned by blaze: per-body queries over the front end's database, with clippy's names, levels, groups, configuration and messages"
 publish = false
 
 version.workspace = true
@@ -17,21 +17,27 @@ doctest = false
 # The version rustc 1.101 renders its diagnostics with (`rustc_errors`'s
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as clippy's do.
 annotate-snippets = "=0.12.16"
+base-db.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 cfg.workspace = true
 hir.workspace = true
+hir-def.workspace = true
 hir-expand.workspace = true
-ide-db.workspace = true
+hir-ty.workspace = true
 intern.workspace = true
+memchr.workspace = true
 rustc-hash.workspace = true
+salsa.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 span.workspace = true
 syntax.workspace = true
 toml.workspace = true
+triomphe.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 expect-test.workspace = true
 test-fixture.workspace = true
 

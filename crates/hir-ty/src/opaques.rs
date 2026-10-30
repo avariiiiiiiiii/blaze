@@ -1,6 +1,6 @@
 //! Handling of opaque types, detection of defining scope and hidden type.
 
-use base_db::Crate;
+use base_db::{Db, Crate};
 use hir_def::{
     AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId,
     ModuleDefId, TraitId, TypeAliasId,
@@ -28,7 +28,7 @@ use crate::{
 };
 
 pub(crate) fn opaque_types_defined_by<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def_id: InferBodyId<'_>,
     result: &mut Vec<SolverDefId<'db>>,
 ) {
@@ -90,7 +90,7 @@ pub(crate) fn opaque_types_defined_by<'db>(
     }
 
     fn extend_with_opaques<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         opaques: &[SelfAndAssocBounds],
         mut make_impl_trait: impl FnMut(ImplTraitIdx) -> ImplTraitId,
         result: &mut Vec<SolverDefId<'db>>,
@@ -110,7 +110,7 @@ pub(crate) fn opaque_types_defined_by<'db>(
 impl SelfAndAssocBounds {
     /// How many opaque types (`impl Trait`) the type of `type_alias` defines, numbered
     /// `0..count` by their [`ImplTraitIdx`].
-    pub fn type_alias_opaque_count(db: &dyn HirDatabase, type_alias: TypeAliasId) -> usize {
+    pub fn type_alias_opaque_count(db: &Db, type_alias: TypeAliasId) -> usize {
         SelfAndAssocBounds::type_alias_impl_traits(db, type_alias).len()
     }
 }
@@ -118,13 +118,13 @@ impl SelfAndAssocBounds {
 /// The associated types of an impl, in order: what a body in it reads of its items for the
 /// opaque types it may define. A function or constant added to the impl leaves this equal.
 #[salsa::tracked(returns(deref))]
-fn impl_type_aliases(db: &dyn HirDatabase, impl_id: ImplId) -> Box<[TypeAliasId]> {
+fn impl_type_aliases(db: &Db, impl_id: ImplId) -> Box<[TypeAliasId]> {
     type_aliases_of(&impl_id.impl_items(db).items)
 }
 
 /// As [`impl_type_aliases`], of a trait.
 #[salsa::tracked(returns(deref))]
-fn trait_type_aliases(db: &dyn HirDatabase, trait_id: TraitId) -> Box<[TypeAliasId]> {
+fn trait_type_aliases(db: &Db, trait_id: TraitId) -> Box<[TypeAliasId]> {
     type_aliases_of(&trait_id.trait_items(db).items)
 }
 
@@ -142,7 +142,7 @@ fn type_aliases_of(items: &[(Name, AssocItemId)]) -> Box<[TypeAliasId]> {
 
 #[salsa::tracked(returns(ref))]
 pub fn rpit_hidden_types(
-    db: &dyn HirDatabase,
+    db: &Db,
     function: FunctionId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {
     let infer = InferenceResult::of(db, DefWithBodyId::from(function));
@@ -156,7 +156,7 @@ pub fn rpit_hidden_types(
 
 #[salsa::tracked(returns(ref))]
 pub fn tait_hidden_types(
-    db: &dyn HirDatabase,
+    db: &Db,
     type_alias: TypeAliasId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {
     // Call this first, to not perform redundant work if there are no TAITs.
@@ -229,7 +229,7 @@ pub fn tait_hidden_types(
 
 /// Calls `f` with each body that may define the type alias's opaques, in order.
 fn for_each_defining_body(
-    db: &dyn HirDatabase,
+    db: &Db,
     type_alias: TypeAliasId,
     loc: &AssocItemLoc<ast::TypeAlias>,
     mut f: impl FnMut(DefWithBodyId),
@@ -265,7 +265,7 @@ fn for_each_defining_body(
 /// hidden types read of [`define_opaque_functions`], so another type alias's defining
 /// function added or removed leaves them as they were.
 #[salsa::tracked(returns(deref))]
-fn defining_functions(db: &dyn HirDatabase, type_alias: TypeAliasId) -> Box<[FunctionId]> {
+fn defining_functions(db: &Db, type_alias: TypeAliasId) -> Box<[FunctionId]> {
     define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
         .iter()
         .copied()
@@ -275,7 +275,7 @@ fn defining_functions(db: &dyn HirDatabase, type_alias: TypeAliasId) -> Box<[Fun
 
 /// The type aliases `func` names in its `#[define_opaque(..)]`.
 fn defined_type_aliases(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
 ) -> impl Iterator<Item = TypeAliasId> {
     let paths = AttrFlags::define_opaque(db, func);
@@ -294,14 +294,14 @@ fn defined_type_aliases(
 /// blocks when its text says `define_opaque` or may have it written by a macro or an attribute
 /// ([`may_hold`]), and always when a macro wrote the body itself.
 #[salsa::tracked(returns(deref))]
-fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionId]> {
+fn define_opaque_functions(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let local = krate.data(db).origin.is_local();
     let mut result = Vec::new();
     collect(db, krate, crate_def_map(db, krate), local, &mut result);
     return result.into_boxed_slice();
 
     fn collect(
-        db: &dyn HirDatabase,
+        db: &Db,
         krate: Crate,
         def_map: &DefMap,
         local: bool,
@@ -330,7 +330,7 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
     }
 
     fn holder(
-        db: &dyn HirDatabase,
+        db: &Db,
         krate: Crate,
         owner: DefWithBodyId,
         local: bool,
@@ -351,7 +351,7 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
 
 /// Whether a block of `owner` may have a function with `#[define_opaque]`: its text says
 /// `define_opaque`, or [`may_hold`] finds a macro call or an attribute that may write one.
-fn may_define_opaque(db: &dyn HirDatabase, krate: Crate, owner: DefWithBodyId) -> bool {
+fn may_define_opaque(db: &Db, krate: Crate, owner: DefWithBodyId) -> bool {
     match owner {
         DefWithBodyId::FunctionId(it) => text_may_define_opaque(db, krate, it.loc(db).id),
         DefWithBodyId::ConstId(it) => text_may_define_opaque(db, krate, it.loc(db).id),
@@ -361,7 +361,7 @@ fn may_define_opaque(db: &dyn HirDatabase, krate: Crate, owner: DefWithBodyId) -
 }
 
 fn text_may_define_opaque<N: syntax::AstNode>(
-    db: &dyn HirDatabase,
+    db: &Db,
     krate: Crate,
     id: hir_expand::AstId<N>,
 ) -> bool {
@@ -378,7 +378,7 @@ fn text_may_define_opaque<N: syntax::AstNode>(
 
 /// Where the text of `file` says `define_opaque`.
 #[salsa::tracked(returns(deref))]
-fn define_opaque_at(db: &dyn HirDatabase, file: base_db::EditionedFileId) -> Box<[TextSize]> {
+fn define_opaque_at(db: &Db, file: base_db::EditionedFileId) -> Box<[TextSize]> {
     let text = db.file_text(file.file_id(db)).text(db);
     let found = text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32));
     found.collect()

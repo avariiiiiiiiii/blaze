@@ -105,10 +105,10 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
 }
 
 /// A statement as rustc spans it: an expression statement with its `;`, a `let` with its `;`.
-fn statement_node(b: &BodyCx<'_, '_>, statement: &Statement) -> Option<InFile<SyntaxNodePtr>> {
+fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile<SyntaxNodePtr>> {
     let (node, is_let) = match statement {
-        Statement::Expr { expr, .. } => (b.expr_node(*expr)?, false),
-        Statement::Let { pat, .. } => (b.pat_node(*pat)?, true),
+        Statement::Expr { expr, .. } => (b.expr_node(expr)?, false),
+        Statement::Let { pat, .. } => (b.pat_node(pat)?, true),
         Statement::Item(_) => return None,
     };
     let syntax = b.cx.syntax(node);

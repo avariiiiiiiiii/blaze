@@ -11,7 +11,7 @@
 //! process may write ([`Pool::live`]), read by scope after each answer
 //! ([`crate::trace::assemble`]).
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, fmt::Write as _, path::PathBuf};
 
 use blaze_core::{Address, Command, Completion, Conn, Done, Effect, Exit, FileName, IoError, Sandbox, Tag};
 use blaze_ids::{ContentId, Hasher, radix};
@@ -30,20 +30,23 @@ impl WarmKey {
     /// The key of processes of `code` started as `command` is, with the variables `set`
     /// (those blaze sets: the rest of the command's environment is passed through and traced).
     pub fn of(code: &ContentId, command: &Command, set: &[(OsString, OsString)]) -> WarmKey {
-        let mut hasher = Hasher::new("blaze v2 warm key 1");
+        let mut hasher = Hasher::new(crate::trace::os_domain!("blaze v2 warm key 1"));
         hasher.id(code);
-        hasher.part(crate::trace::os_bytes(command.program.as_os_str()));
+        hasher.part(&crate::trace::os_bytes(command.program.as_os_str()));
         hasher.update(&(command.args.len() as u64).to_le_bytes());
         for arg in &command.args {
-            hasher.part(crate::trace::os_bytes(arg));
+            hasher.part(&crate::trace::os_bytes(arg));
         }
-        hasher.part(crate::trace::os_bytes(command.dir.as_os_str()));
-        let mut set: Vec<&(OsString, OsString)> = set.iter().collect();
-        set.sort_unstable();
-        hasher.update(&(set.len() as u64).to_le_bytes());
-        for (name, value) in set {
-            hasher.part(crate::trace::os_bytes(name)).part(crate::trace::os_bytes(value));
-        }
+        hasher.part(&crate::trace::os_bytes(command.dir.as_os_str()));
+        blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
+            let mut sorted: Vec<&(OsString, OsString), &blaze_mem::Frame> = Vec::with_capacity_in(set.len(), frame);
+            sorted.extend(set);
+            sorted.sort_unstable();
+            hasher.update(&(sorted.len() as u64).to_le_bytes());
+            for (name, value) in sorted.iter() {
+                hasher.part(&crate::trace::os_bytes(name)).part(&crate::trace::os_bytes(value));
+            }
+        });
         match &command.sandbox {
             Sandbox::Off => _ = hasher.update(b"off"),
             Sandbox::On { read, write, network, trace } => {
@@ -51,7 +54,7 @@ impl WarmKey {
                 for list in [read, write] {
                     hasher.update(&(list.len() as u64).to_le_bytes());
                     for path in list {
-                        hasher.part(crate::trace::os_bytes(path.as_os_str()));
+                        hasher.part(&crate::trace::os_bytes(path.as_os_str()));
                     }
                 }
                 hasher.update(&[u8::from(*network), u8::from(*trace)]);
@@ -146,13 +149,22 @@ impl Pool {
     }
 
     fn file(&self, kind: &str, server: Server) -> FileName {
-        FileName::new(&format!("{}/{kind}/{}", self.config.dir, server.0))
-            .expect("the pool's directory is a file name, and so is what is under it")
+        blaze_mem::scratch::with_string(|text| {
+            let _ = write!(text, "{}/{kind}/{}", self.config.dir, server.0);
+            // alloc: the name, which the `FileName` owns.
+            FileName::new(text)
+        })
+        .expect("the pool's directory is a file name, and so is what is under it")
     }
 
     /// The socket `server` connects to, under the driver's root.
     pub fn socket(&self, server: Server) -> FileName {
-        FileName::new(&format!("{}/socket/{}/s", self.config.dir, server.0)).expect("a file name")
+        blaze_mem::scratch::with_string(|text| {
+            let _ = write!(text, "{}/socket/{}/s", self.config.dir, server.0);
+            // alloc: the name, which the `FileName` owns.
+            FileName::new(text)
+        })
+        .expect("a file name")
     }
 
     /// The live record of `server`'s sandbox, under the driver's root: in no directory the
@@ -177,10 +189,12 @@ impl Pool {
         let server = Server(self.count);
         self.count += 1;
         let socket = self.socket(server);
-        let socket_dir = self.config.root.join(format!("{}/socket/{}", self.config.dir, server.0));
+        let socket_path = self.config.root.join(socket.as_str());
+        // alloc: the directory the process may write, which its sandbox's command keeps.
+        let socket_dir = socket_path.parent().expect("a socket's name is under its directory").to_owned();
         let live = self.config.root.join(self.live(server).as_str());
         command.env.retain(|it| it.0 != SOCKET && it.0 != LIVE);
-        command.env.push((SOCKET.into(), self.config.root.join(socket.as_str()).into_os_string()));
+        command.env.push((SOCKET.into(), socket_path.into_os_string()));
         command.env.push((LIVE.into(), live.into_os_string()));
         if let Sandbox::On { write, .. } = &mut command.sandbox {
             write.push(socket_dir);
@@ -188,6 +202,7 @@ impl Pool {
         let listen = self.tag(Asked::Listen(server));
         let spawn = self.tag(Asked::Spawn(server));
         effects.push(Effect::Listen { at: Address::Unix(socket), tag: listen });
+        // alloc: a spawn, at the edge: the effect owns its command.
         effects.push(Effect::Spawn { command: Box::new(command), tag: spawn });
         self.servers.insert(
             server,
@@ -236,6 +251,7 @@ impl Pool {
 
     /// Stops every process: the daemon is ending.
     pub fn stop_all(&mut self, effects: &mut Vec<Effect>) {
+        // alloc: once, as the daemon ends.
         let mut servers: Vec<Server> = self.servers.keys().copied().collect();
         radix::sort_copy_by_key(&mut servers, |it| it.0);
         for server in servers {
@@ -289,6 +305,7 @@ impl Pool {
                 let socket = self.socket(server);
                 if let Some(process) = self.servers.get_mut(&server) {
                     process.listen = None;
+                    // alloc: an error, made once as the process fails.
                     process.failed = Some(IoError(format!(
                         "its socket {socket} could not be listened on: {error}"
                     )));
@@ -313,6 +330,7 @@ impl Pool {
                     (Some(failed), _) => Err(failed),
                     (None, Done::Exited(exit)) => Ok(exit),
                     (None, Done::Failed(error)) => Err(error),
+                    // alloc: an error, made once as the spawn ends.
                     (None, other) => Err(IoError(format!("a spawn completed as {other:?}"))),
                 };
                 Some(Event::Ended { server, exit })
@@ -409,5 +427,20 @@ mod tests {
         pool.give_back(two, &mut effects);
         assert!(effects.contains(&Effect::Kill { tag: spawn_two }));
         assert_eq!(pool.take(key), Some((one, Conn(1))));
+    }
+
+    /// A socket's name is formatted in the thread's string: once that has grown, the
+    /// `FileName` it makes is all it allocates. A warm key is hashed in the task's frame.
+    #[test]
+    fn a_socket_name_allocates_only_itself_and_a_warm_key_nothing() {
+        let pool = Pool::new(config());
+        assert_eq!(pool.socket(Server(7)).as_str(), "pool/socket/7/s");
+        let name = blaze_alloc_count::assert_at_most(1, "a socket's name: the FileName alone", || pool.socket(Server(7)));
+        assert_eq!(name.as_str(), "pool/socket/7/s");
+        let (code, command) = (ContentId::of("blaze v2 test 1", b"srv"), command("/a"));
+        let set = [("CARGO".into(), "c".into()), ("A".into(), "1".into())];
+        let cold = WarmKey::of(&code, &command, &set);
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm key", || WarmKey::of(&code, &command, &set));
+        assert_eq!(warm, cold);
     }
 }

@@ -16,7 +16,6 @@ doctest = false
 cov-mark = "2.0.0"
 crossbeam-channel.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
-rayon.workspace = true
 fst = { version = "0.4.7", default-features = false }
 rustc-hash.workspace = true
 either.workspace = true
@@ -31,7 +30,6 @@ smallvec.workspace = true
 
 # local deps
 base-db.workspace = true
-blaze-graph.workspace = true
 blaze-ids.workspace = true
 parser.workspace = true
 profile.workspace = true

@@ -443,9 +443,7 @@ pub(crate) fn place(db: &RootDatabase, crates: Vec<Documented>, test_only: TestO
     use rayon::prelude::*;
     let placed: Vec<Vec<Placed>> = crates
         .par_iter()
-        .map_with(db.clone(), |db, documented| {
-            hir::attach_db(db, || Walker::new(db, documented).walk())
-        })
+        .map(|documented| hir::attach_db(db, || Walker::new(db, documented).walk()))
         .collect();
     let mut canonical: FxHashMap<ModuleDef, ((u8, usize), (usize, usize))> = FxHashMap::default();
     let mut own: Vec<FxHashMap<ModuleDef, usize>> = vec![];

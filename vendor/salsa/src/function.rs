@@ -187,10 +187,12 @@ pub unsafe trait Configuration: Any {
 /// constructed and used inside salsa.
 #[doc(hidden)]
 pub struct FunctionIngredientRef<'db> {
+    // dyn: one call per function ingredient in LRU eviction and persistence, once per revision, not per memo
     ingredient: &'db dyn FunctionIngredient,
 }
 
 impl<'db> FunctionIngredientRef<'db> {
+    // dyn: one call per function ingredient in LRU eviction and persistence, once per revision, not per memo
     fn new(ingredient: &'db dyn FunctionIngredient) -> Self {
         Self { ingredient }
     }
@@ -332,6 +334,7 @@ where
             view_caster: OnceLock::new(),
             sync_table: SyncTable::new(index),
             value_hasher: None,
+            // alloc: `Vec::new` allocates nothing; the LRU's scratch is reused every revision
             lru_scratch: Vec::new(),
         }
     }
@@ -720,6 +723,7 @@ where
     unsafe fn serialize<'db>(
         &'db self,
         zalsa: &'db Zalsa,
+        // alloc: the edge: persistence, once per serialized database
         f: &mut dyn FnMut(&dyn erased_serde::Serialize),
     ) {
         f(&persistence::SerializeIngredient {
@@ -782,6 +786,7 @@ unsafe fn collect_minimum_serialized_edges(
 }
 
 fn flatten_cycle_head_dependencies(
+    // dyn: one call per function ingredient in LRU eviction and persistence, once per revision, not per memo
     ingredient: &dyn FunctionIngredient,
     zalsa: &Zalsa,
     database_key_index: DatabaseKeyIndex,
@@ -1000,6 +1005,7 @@ mod persistence {
                     let memo = memo.with_origin(flattened_origin);
 
                     // TODO: Group structs by ingredient index into a nested map.
+                    // alloc: the edge: persistence, once per serialized database
                     let key = format!(
                         "{}:{}",
                         entry.ingredient_index().as_u32(),
@@ -1117,17 +1123,10 @@ mod persistence {
 
 #[cfg(test)]
 mod lru_tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::EvictionCutoff;
     use crate::Revision;
-
-    /// splitmix64, so the sequences are seeded and the same on every run.
-    fn next(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
 
     /// The safe reference: sort the slots by (verified-at, slot) and drop the first `excess`.
     fn reference(verified: &[Revision], capacity: usize) -> Vec<bool> {
@@ -1150,13 +1149,13 @@ mod lru_tests {
 
     #[test]
     fn cutoff_matches_sorted_reference() {
-        let mut state = 0x5eed;
+        let mut rng = SplitMix64::new(0x5eed);
         for _ in 0..2000 {
-            let len = (next(&mut state) % 40) as usize;
-            let revisions = 1 + next(&mut state) % 6;
-            let capacity = 1 + (next(&mut state) % 40) as usize;
+            let len = rng.index(40);
+            let revisions = 1 + rng.below(6);
+            let capacity = 1 + rng.index(40);
             let verified: Vec<Revision> = (0..len)
-                .map(|_| Revision::from(1 + (next(&mut state) % revisions) as usize))
+                .map(|_| Revision::from(1 + rng.below(revisions) as usize))
                 .collect();
             let got = evicted(&verified, capacity);
             assert_eq!(got, reference(&verified, capacity), "{verified:?} cap {capacity}");

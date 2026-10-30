@@ -9,7 +9,9 @@ pub(crate) struct Accumulated<A: Accumulator> {
 }
 
 pub(crate) trait AnyAccumulated: Any + Send + Sync {
+    // dyn: accumulators are user types of any kind, reached once per `accumulate` call and per `accumulated` read, off the query hit path
     fn as_dyn_any(&self) -> &dyn Any;
+    // dyn: accumulators are user types of any kind, reached once per `accumulate` call and per `accumulated` read, off the query hit path
     fn as_dyn_any_mut(&mut self) -> &mut dyn Any;
 }
 
@@ -35,15 +37,18 @@ impl<A> AnyAccumulated for Accumulated<A>
 where
     A: Accumulator,
 {
+    // dyn: accumulators are user types of any kind, reached once per `accumulate` call and per `accumulated` read, off the query hit path
     fn as_dyn_any(&self) -> &dyn Any {
         self
     }
 
+    // dyn: accumulators are user types of any kind, reached once per `accumulate` call and per `accumulated` read, off the query hit path
     fn as_dyn_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 }
 
+// dyn: accumulators are user types of any kind, reached once per `accumulate` call and per `accumulated` read, off the query hit path
 impl dyn AnyAccumulated {
     pub fn accumulate<A: Accumulator>(&mut self, value: A) {
         self.as_dyn_any_mut()

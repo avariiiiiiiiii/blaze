@@ -5,6 +5,7 @@ mod incremental;
 mod macros;
 mod mod_resolution;
 mod paths;
+mod uses;
 mod worklist;
 mod batch_order;
 
@@ -13,7 +14,7 @@ use test_fixture::WithFixture;
 
 use crate::{
     nameres::{DefMap, crate_def_map},
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
 };
 
 fn compute_crate_def_map(
@@ -859,7 +860,7 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
-    use base_db::{SourceDatabase as _, salsa::Durability};
+    use base_db::salsa::Durability;
     let mut db = TestDB::with_files(
         r#"
 //- /main.rs

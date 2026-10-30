@@ -5,10 +5,11 @@
 
 use std::ops::Range;
 
+use base_db::Db;
 use rustc_abi::TargetDataLayout;
 
 use super::super::{MirSpan, VTableMap};
-use crate::{InferBodyId, ParamEnvAndCrate, db::HirDatabase, next_solver::Ty};
+use crate::{InferBodyId, ParamEnvAndCrate, next_solver::Ty};
 
 /// The evaluator's error for a stop the machine asked for; what it found the machine keeps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -38,8 +39,10 @@ pub enum MemKind {
     Global,
     /// `const_allocate`.
     ConstHeap,
-    /// The evaluator's own: program arguments, the environment, thread-local storage. Roots of
-    /// the leak check, never freed by the program.
+    /// The evaluator's own: program arguments, the environment, thread-local storage, the
+    /// thread shims' memory (anonymous `mmap`, `errno` cells, dispatch semaphores). Roots of
+    /// the leak check; the program frees only the shims' memory, through `munmap` and
+    /// `dispatch_release`.
     Machine,
 }
 
@@ -83,7 +86,8 @@ pub trait Shadow<P>: Clone + Default + std::fmt::Debug {
     fn pointer(size: usize, prov: Option<P>) -> Self;
     /// Bytes `range` of these.
     fn slice(&self, range: Range<usize>) -> Self;
-    /// `other` put over these at `at`, growing them when it ends past them.
+    /// `other` put over these at `at`, growing them when it ends past them; bytes between
+    /// their old end and `at` are uninitialized.
     fn put(&mut self, at: usize, other: &Self);
     /// The provenance of the pointer that starts at `at`, if a whole one does.
     fn prov_at(&self, at: usize, size: usize) -> Option<P>;
@@ -98,7 +102,7 @@ pub struct Site<'db> {
 
 /// What `typed` needs of the evaluator to read a value at its type.
 pub struct TypedCx<'a, 'db> {
-    pub db: &'db dyn HirDatabase,
+    pub db: &'db Db,
     pub env: ParamEnvAndCrate<'db>,
     pub target: &'db TargetDataLayout,
     /// The type a vtable id (a `dyn` pointer's metadata) stands for.

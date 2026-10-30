@@ -462,7 +462,7 @@ def dep_info(text: str, cwd: Path) -> tuple[list[str], list[tuple[str, str | Non
 
 
 def what_was_read(out: Path, cwd: Path) -> Read | None:
-    """Each file rustc's dep-info in `out` names with its sha256, and each variable with its
+    """Each file rustc's dep-info in `out` names with its digest (`engine.digest`), and each variable with its
     value; None when there is no dep-info (rustc stopped before writing it) or a file it names
     is gone: then nothing can say when its answer would still hold."""
     written = sorted(out.glob("*.d"))
@@ -479,7 +479,7 @@ def what_was_read(out: Path, cwd: Path) -> Read | None:
 
 
 def kept_reference(entry: object, env: dict[str, str], where: str) -> Reference | None:
-    """A kept answer of rustc, when every file it read still has the sha256 it had and every
+    """A kept answer of rustc, when every file it read still has the digest it had and every
     variable its value; else None. An entry not of the shape `reference` writes is a Failed."""
     if entry is None:
         return None

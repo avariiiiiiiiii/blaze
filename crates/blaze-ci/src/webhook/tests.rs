@@ -1,4 +1,4 @@
-use blaze_api::http::HttpRequest;
+use blaze_api::http::{HttpRequest, RequestParser};
 use ring::hmac;
 
 use super::*;
@@ -244,6 +244,65 @@ fn a_signature_of_the_right_length_with_a_non_hex_digit_is_401() {
     let error = verify(b"It's a Secret to Everybody", b"Hello, World!", Some(&bad)).unwrap_err();
     assert_eq!(error.status, 401);
     assert_eq!(hex(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
+}
+
+/// `request` as it comes over the wire.
+fn wire(request: &HttpRequest) -> Vec<u8> {
+    let mut bytes = format!("{} {} HTTP/1.1\r\n", request.method, request.path).into_bytes();
+    for (name, value) in &request.headers {
+        bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+    bytes.extend_from_slice(format!("Content-Length: {}\r\n\r\n", request.body.len()).as_bytes());
+    bytes.extend_from_slice(&request.body);
+    bytes
+}
+
+#[test]
+fn a_request_read_in_place_is_received_as_the_owned_one_is() {
+    let push = push("refs/heads/main", false);
+    let with = |kind: &str, body: &str, change: &dyn Fn(&mut HttpRequest)| {
+        let mut it = request(kind, body);
+        change(&mut it);
+        it
+    };
+    let drop_header = |name: &'static str| move |it: &mut HttpRequest| it.headers.retain(|(at, _)| at != name);
+    let requests = [
+        request("push", &push),
+        request("pull_request", &pull_request("opened", SAME_REPO)),
+        request("pull_request", &pull_request("closed", r#"{"full_name":"someone/blaze"}"#)),
+        request("ping", r#"{"zen":"Keep it logically awesome.","hook_id":1}"#),
+        request("push", "not json"),
+        request("push", ""),
+        with("push", &push, &|it| it.method = "GET".to_owned()),
+        with("push", &push, &drop_header("x-github-event")),
+        with("push", &push, &drop_header("X-GitHub-Delivery")),
+        with("push", &push, &drop_header("X-Hub-Signature-256")),
+        with("push", &push, &|it| it.body[3] ^= 1),
+        with("push", &push, &|it| {
+            it.headers.retain(|(name, _)| name != "Content-Type");
+            it.headers.push(("content-type".to_owned(), "Application/JSON; charset=utf-8".to_owned()));
+        }),
+        with("push", &push, &|it| it.headers.push(("Content-Type".to_owned(), "text/plain".to_owned()))),
+        with("push", &push, &|it| it.headers.insert(0, ("X-GitHub-Event".to_owned(), "ping".to_owned()))),
+    ];
+    for (at, original) in requests.iter().enumerate() {
+        let bytes = wire(original);
+        let mut owned = RequestParser::new(MOST_PAYLOAD);
+        let mut read = None;
+        for piece in bytes.chunks(7) {
+            owned.push(piece);
+            if let Some(request) = owned.next().unwrap() {
+                read = Some(request);
+            }
+        }
+        let read = read.expect("the request is whole");
+        let mut in_place = RequestParser::new(MOST_PAYLOAD);
+        in_place.push(&bytes);
+        let lent = in_place.next_ref().unwrap().expect("the request is whole");
+        let want = receive(SECRET, &read);
+        assert_eq!(receive_ref(SECRET, &lent), want, "request {at}");
+        assert_eq!(receive(SECRET, original), want, "request {at}");
+    }
 }
 
 #[test]

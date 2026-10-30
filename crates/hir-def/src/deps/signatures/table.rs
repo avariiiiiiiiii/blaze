@@ -14,7 +14,7 @@
 //! (a block's plus one, so that no block is 0); read, the index is its id in this database
 //! again, in a copy of the buffer. A store with none is read in place.
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Crate, Db};
 use blaze_format::{Aligned, FormatError, Persist, open_as};
 use hir_expand::MacroCallId;
 use salsa::plumbing::{AsId, FromId};
@@ -40,8 +40,9 @@ fn id<T: FromId>(bits: u64) -> T {
 }
 
 /// The bytes of `table`, empty for an empty table.
-pub(super) fn encode(db: &dyn SourceDatabase, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
+pub(super) fn encode(db: &Db, krate: Crate, table: &Relocation) -> R<Vec<u8>> {
     if table.is_empty() {
+        // alloc: none; an empty `Vec` holds no allocation.
         return Ok(Vec::new());
     }
     let mut enc = Enc::new(db, krate);
@@ -82,7 +83,7 @@ pub(super) fn encode(db: &dyn SourceDatabase, krate: Crate, table: &Relocation) 
 /// Writes `block`, entry `index` of `table`.
 fn block(
     enc: &mut Enc<'_>,
-    db: &dyn SourceDatabase,
+    db: &Db,
     table: &Relocation,
     index: usize,
     block: BlockId,
@@ -94,6 +95,7 @@ fn block(
         return enc.module(ModuleId::from_id(module.as_id()));
     };
     if block_def_map(db, outer).root_module_id().as_id() != module.as_id() {
+        // alloc: the reason of a corrupt image's panic, or of a part that fails.
         return Err("a block in a module of a block other than its root".to_owned());
     }
     let outer = (Kind::Block, outer.as_id().as_bits());
@@ -106,7 +108,7 @@ fn block(
 
 /// The table of `bytes`, [`encode`]'s, each id made again in this database. Run inside the
 /// query whose value holds what the table names: a block is a tracked struct, made here.
-pub(super) fn decode(db: &dyn SourceDatabase, krate: Crate, bytes: &[u8]) -> R<Relocation> {
+pub(super) fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<Relocation> {
     if bytes.is_empty() {
         return Ok(Relocation::new());
     }
@@ -115,6 +117,7 @@ pub(super) fn decode(db: &dyn SourceDatabase, krate: Crate, bytes: &[u8]) -> R<R
     let mut entries: Vec<(Kind, u64)> = Vec::with_capacity(len.min(bytes.len()));
     for _ in 0..len {
         let tag = dec.u8()?;
+        // alloc: the reason of a corrupt image's panic, or of a part that fails.
         let kind = *Kind::ALL.get(usize::from(tag)).ok_or_else(|| format!("id kind {tag}"))?;
         let bits = match kind {
             Kind::Crate => bits(dec.krate()?),
@@ -161,13 +164,14 @@ fn def_bits(kind: Kind, def: ModuleDefId) -> R<u64> {
         (Kind::Macro2, ModuleDefId::MacroId(MacroId::Macro2Id(it))) => bits(it),
         (Kind::MacroRules, ModuleDefId::MacroId(MacroId::MacroRulesId(it))) => bits(it),
         (Kind::ProcMacro, ModuleDefId::MacroId(MacroId::ProcMacroId(it))) => bits(it),
+        // alloc: the reason of a corrupt image's panic, or of a part that fails.
         _ => return Err(format!("an item of another kind than {kind:?}")),
     };
     Ok(found)
 }
 
 /// A block [`block`] wrote, made again; `entries` are those read before it.
-fn read_block(dec: &mut Dec<'_>, db: &dyn SourceDatabase, entries: &[(Kind, u64)]) -> R<u64> {
+fn read_block(dec: &mut Dec<'_>, db: &Db, entries: &[(Kind, u64)]) -> R<u64> {
     let ast_id: AstId<ast::BlockExpr> = dec.ast_id()?;
     let module = match dec.u8()? {
         0 => dec.module()?,
@@ -175,10 +179,12 @@ fn read_block(dec: &mut Dec<'_>, db: &dyn SourceDatabase, entries: &[(Kind, u64)
             let at = dec.u32()? as usize;
             let outer = match entries.get(at) {
                 Some(&(Kind::Block, bits)) => id::<BlockId>(bits),
+                // alloc: the reason of a corrupt image's panic, or of a part that fails.
                 _ => return Err(format!("block {at} of a table, which is no block read before")),
             };
             block_def_map(db, outer).root_module_id()
         }
+        // alloc: the reason of a corrupt image's panic, or of a part that fails.
         tag => return Err(format!("block module tag {tag}")),
     };
     let token = LoweringMode::Analysis.allow_tracked_structs().expect("analysis makes blocks");
@@ -294,11 +300,13 @@ pub(super) fn unrelocate_store<'a>(
         return Ok(StoreBytes::InPlace(bytes));
     }
     let invalid = |at: usize, what| FormatError::Invalid { at: at as u64, what };
+    // alloc: a store naming blocks or contexts is patched in a copy; the record is read-only.
     let mut moved = bytes.to_vec();
     for at in sites.scopes {
         let index = wide(&moved, at).checked_sub(1).and_then(|it| u32::try_from(it).ok());
         let bits = index.and_then(|index| table.get(Kind::Block, index));
-        set_wide(&mut moved, at, bits.ok_or_else(|| invalid(at, "a block scope not in the table"))?);
+        let bits = bits.ok_or_else(|| invalid(at, "a block scope not in the table"))?;
+        set_wide(&mut moved, at, bits);
     }
     for at in sites.blocks {
         match (word(&moved, at), word(&moved, at + 4)) {

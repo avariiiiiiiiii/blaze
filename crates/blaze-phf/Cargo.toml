@@ -13,5 +13,8 @@ repository.workspace = true
 [lib]
 doctest = false
 
+[dev-dependencies]
+blaze-ids.workspace = true
+
 [lints]
 workspace = true

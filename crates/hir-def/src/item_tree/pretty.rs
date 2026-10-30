@@ -2,25 +2,25 @@
 
 use std::fmt::{self, Write};
 
+use base_db::Db;
 use span::{Edition, ErasedFileAstId};
 
 use crate::{
     item_tree::{
         Const, Enum, ExternBlock, ExternCrate, Function, Impl, ItemTree, Macro2, MacroCall,
-        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, SourceDatabase,
-        Static, Struct, Trait, TypeAlias, Union, Use, UseTreeId, UseTreeKind,
+        MacroRules, Mod, ModItemId, ModItemKind, ModKind, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use, UseTreeId, UseTreeKind,
         attrs::AttrsOrCfgRef,
     },
     visibility::RawVisibility,
 };
 
 pub(super) fn print_item_tree(
-    db: &dyn SourceDatabase,
+    db: &Db,
     tree: &ItemTree,
     edition: Edition,
 ) -> String {
-    let mut p =
-        Printer { db, tree, buf: String::new(), indent_level: 0, needs_indent: true, edition };
+    let buf = String::new(); // alloc: a printout for tests and debugging, the edge
+    let mut p = Printer { db, tree, buf, indent_level: 0, needs_indent: true, edition };
 
     if let Some(top_attrs) = tree.top_level_attrs() {
         p.print_attrs(top_attrs, true, "\n");
@@ -53,7 +53,7 @@ macro_rules! wln {
 }
 
 struct Printer<'a> {
-    db: &'a dyn SourceDatabase,
+    db: &'a Db,
     tree: &'a ItemTree,
     buf: String,
     indent_level: usize,
@@ -98,6 +98,7 @@ impl Printer<'_> {
                 "#{}[{}{}]{}",
                 inner,
                 attr.path.display(self.db, self.edition),
+                // alloc: a printout for tests and debugging, the edge
                 attr.input.as_ref().map(|it| it.to_string()).unwrap_or_default(),
                 separated_by,
             );

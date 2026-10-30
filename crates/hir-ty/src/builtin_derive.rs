@@ -2,6 +2,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir_def::{
     AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, TraitId,
     TypeOrConstParamId, TypeParamId,
@@ -84,7 +85,7 @@ pub(crate) fn generics_of<'db>(
     }
 }
 
-pub fn generic_params_count(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> usize {
+pub fn generic_params_count(db: &Db, id: BuiltinDeriveImplId) -> usize {
     let loc = id.loc(db);
     let adt_params = GenericParams::of(db, loc.adt.into());
     let extra_params_count = match loc.trait_ {
@@ -170,7 +171,7 @@ pub fn impl_super_outlives<'db>(
 }
 
 #[salsa::tracked(returns(ref))]
-pub fn predicates(db: &dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPredicates {
+pub fn predicates(db: &Db, impl_: BuiltinDeriveImplId) -> GenericPredicates {
     let loc = impl_.loc(db);
     let generic_params = GenericParams::of(db, loc.adt.into());
     let interner = DbInterner::new_with(db, loc.module(db).krate(db));

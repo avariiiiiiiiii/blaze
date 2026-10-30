@@ -1,3 +1,4 @@
+// alloc: proc macro, at expansion time once per annotated item; no query runs this
 use std::collections::HashSet;
 
 use proc_macro2::TokenStream;
@@ -43,19 +44,24 @@ impl Macro {
         let member_idents: HashSet<_> = member_items
             .iter()
             .filter_map(|item| match item {
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 syn::ImplItem::Const(it) => Some(it.ident.clone()),
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 syn::ImplItem::Fn(it) => Some(it.sig.ident.clone()),
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 syn::ImplItem::Type(it) => Some(it.ident.clone()),
                 syn::ImplItem::Macro(_) => None,
                 syn::ImplItem::Verbatim(_) => None,
                 _ => None,
             })
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect();
         for member_item in &mut member_items {
             self.modify_member(&impl_item, member_item, &member_idents)?;
         }
         impl_item.items = member_items;
         Ok(crate::debug::dump_tokens(
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             format!("impl {:?}", impl_item.self_ty),
             impl_item.into_token_stream(),
         ))
@@ -96,6 +102,7 @@ impl Macro {
             _ => salsa_tracked_attr.parse_args()?,
         };
         let InnerTrait = self.hygiene.ident("InnerTrait");
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let inner_fn_name = self.hygiene.ident(fn_item.sig.ident.to_string());
 
         let AssociatedFunctionArguments {
@@ -117,17 +124,21 @@ impl Macro {
         let skipped_inputs = if self_token.is_some() { 2 } else { 1 };
 
         if args.self_ty.is_none() {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             args.self_ty = Some(body_self_ty.clone());
         }
         salsa_tracked_attr.meta = syn::Meta::List(syn::MetaList {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             path: salsa_tracked_attr.path().clone(),
             delimiter: syn::MacroDelimiter::Paren(syn::token::Paren::default()),
             tokens: quote! {#args},
         });
 
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         let mut inner_fn = fn_item.clone();
         inner_fn.attrs.retain_mut(crate::fn_util::retain_body_attr);
         inner_fn.vis = syn::Visibility::Inherited;
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         inner_fn.sig.ident = inner_fn_name.clone();
         self.normalize_signature_lifetimes(
             &mut inner_fn.sig,
@@ -209,6 +220,7 @@ impl Macro {
             || self.return_type_uses_elided_lifetime(&fn_item.sig.output)
             || self.inputs_use_elided_lifetime(&fn_item.sig, skipped_inputs)
         {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             Some(db_lt.clone())
         } else {
             None
@@ -236,6 +248,7 @@ impl Macro {
     ) -> syn::Result<AssociatedFunctionArguments<'syn>> {
         let explicit_db_lt = self.extract_db_lifetime(impl_item, fn_item)?;
         let db_lt = match explicit_db_lt {
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             Some(db_lt) => db_lt.clone(),
             None => self.conjure_db_lifetime(impl_item, fn_item),
         };
@@ -269,6 +282,7 @@ impl Macro {
         let input_tys = crate::fn_util::input_tys(&fn_item.sig, skipped_inputs)?
             .into_iter()
             .map(|ty| ChangeLt::elided_to(&db_lt).in_type(ty))
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect();
         let output_ty = crate::fn_util::output_ty(Some(&db_lt), &fn_item.sig)?;
 
@@ -357,12 +371,15 @@ impl Macro {
         used.visit_signature(&fn_item.sig);
 
         let span = fn_item.sig.ident.span();
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         let mut name = String::from("db");
         let mut counter = 1;
         while used.0.contains(&name) {
             counter += 1;
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             name = format!("db{counter}");
         }
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         syn::Lifetime::new(&format!("'{name}"), span)
     }
 
@@ -426,6 +443,7 @@ impl Macro {
     }
 
     fn with_db_lifetime(&self, db_ty: &syn::Type, db_lt: &syn::Lifetime) -> syn::Type {
+        // clone: proc macro, at expansion time once per annotated item; no query runs this
         let mut db_ty = db_ty.clone();
         self.set_db_lifetime(&mut db_ty, db_lt);
         db_ty
@@ -462,6 +480,7 @@ impl Macro {
 
         match &reference.lifetime {
             Some(lifetime) if lifetime.ident != "_" => {}
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             _ => reference.lifetime = Some(db_lt.clone()),
         }
     }
@@ -541,9 +560,11 @@ impl Macro {
 
     fn ident_pat(&self, ident: &syn::Ident) -> syn::Pat {
         syn::Pat::Ident(syn::PatIdent {
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             attrs: vec![],
             by_ref: None,
             mutability: None,
+            // clone: proc macro, at expansion time once per annotated item; no query runs this
             ident: ident.clone(),
             subpat: None,
         })
@@ -605,6 +626,7 @@ impl Macro {
                 } else {
                     return Err(syn::Error::new_spanned(
                         returns,
+                        // alloc: proc macro, at expansion time once per annotated item; no query runs this
                         format!("Unknown returns mode `{returns}`"),
                     ));
                 }
@@ -632,6 +654,7 @@ struct UsedLifetimes(HashSet<String>);
 
 impl<'ast> syn::visit::Visit<'ast> for UsedLifetimes {
     fn visit_lifetime(&mut self, i: &'ast syn::Lifetime) {
+        // alloc: proc macro, at expansion time once per annotated item; no query runs this
         self.0.insert(i.ident.to_string());
     }
 }

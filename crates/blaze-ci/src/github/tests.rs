@@ -2,6 +2,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
+use blaze_ids::rng::SplitMix64;
 use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use serde_json::{Value, json};
 
@@ -258,14 +259,12 @@ fn hard_texts() -> Vec<String> {
         texts.push(text);
     }
     texts.push("\u{7f}é—😀\u{1}\u{1f}\u{2028}x".repeat(5));
-    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..200 {
-        let len = (seed % 70) as usize;
+        let len = rng.index(70);
         let text: String = (0..len)
             .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
+                let seed = rng.next_u64();
                 match seed % 6 {
                     0 => char::from((seed >> 8) as u8 % 0x20),
                     1 => ['"', '\\', '/', '\u{7f}'][(seed >> 8) as usize % 4],

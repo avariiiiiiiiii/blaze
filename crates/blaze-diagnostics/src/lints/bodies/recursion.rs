@@ -12,6 +12,7 @@
 //! first), so a call that does not return and has no cleanup block unwinds out of the
 //! function, as rustc's does through its `UnwindResume`.
 
+use base_db::Db;
 use either::Either;
 use hir::InFile;
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup, generics::GenericParams};
@@ -167,7 +168,7 @@ fn returns(terminator: &Terminator, recursive: bool) -> bool {
 
 /// The types of the function's MIR, in its environment.
 struct Types<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     interner: DbInterner<'db>,
     infcx: InferCtxt<'db>,
     env: ParamEnvAndCrate<'db>,

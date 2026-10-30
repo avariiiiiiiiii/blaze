@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+use base_db::Db;
 use hir_ty::TargetFeature;
 
 use super::*;
@@ -1422,7 +1423,7 @@ impl<'db> FunctionCx<'_, 'db> {
 }
 
 fn rustc_inlines_at(
-    db: &dyn HirDatabase,
+    db: &Db,
     caller: Option<FunctionId>,
     callee: FunctionId,
     depth: u32,
@@ -1481,7 +1482,7 @@ fn rustc_inlines_at(
 /// `#[rustc_nounwind]` has its unwinding made unreachable (`AbortUnwindingCalls`), and the
 /// cleanup only that reaches is gone.
 fn inline_cost<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     func: FunctionId,
     body: &MirBody<'db>,
     depth: u32,
@@ -1576,7 +1577,7 @@ fn inline_cost<'db>(
 /// call of no fma that rustc inlines however deep puts none into its caller. A cycle of calls
 /// starts as having none and is iterated to its fixpoint.
 #[salsa::tracked(returns(copy), cycle_initial = |_, _, _| false)]
-fn reaches_fma(db: &dyn HirDatabase, func: FunctionId) -> bool {
+fn reaches_fma(db: &Db, func: FunctionId) -> bool {
     let Ok((body, _)) = root_body(db, func) else { return false };
     for (_, data) in body.basic_blocks.iter() {
         let Some(TerminatorKind::Call { func: callee, intrinsic, .. }) =

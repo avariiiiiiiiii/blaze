@@ -132,6 +132,7 @@ pub(crate) fn of_kind(kind: RelocKind, format: Format, arch: Arch, in_code: bool
         (RelocKind::TpHi12, Elf, A64) => Apply::A64TpHi12,
         (RelocKind::TpLo12, Elf, A64) => Apply::A64TpLo12,
         (RelocKind::SectionRel32, Pe, _) => Apply::SecRel32,
+        // alloc: error path
         (kind, format, arch) => return Err(format!("a {kind:?} relocation in {format:?} {arch:?} code")),
     })
 }

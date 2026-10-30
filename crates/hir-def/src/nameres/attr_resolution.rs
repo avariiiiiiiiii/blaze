@@ -1,6 +1,6 @@
 //! Post-nameres attribute resolution.
 
-use base_db::{Crate, SourceDatabase};
+use base_db::{Db, Crate};
 use hir_expand::{
     AttrMacroAttrIds, MacroCallId, MacroCallKind, MacroDefId,
     attrs::{Attr, AttrId, AttrInput},
@@ -30,7 +30,7 @@ impl DefMap {
     pub(crate) fn resolve_attr_macro(
         &self,
         local_def_map: &LocalDefMap,
-        db: &dyn SourceDatabase,
+        db: &Db,
         original_module: ModuleId,
         ast_id: AstIdWithPath<ast::Item>,
         attr: &Attr,
@@ -110,7 +110,7 @@ impl DefMap {
 }
 
 pub(super) fn attr_macro_as_call_id(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item_attr: &AstIdWithPath<ast::Item>,
     macro_attr: &Attr,
     censored_attr_ids: AttrMacroAttrIds,
@@ -142,7 +142,7 @@ pub(super) fn attr_macro_as_call_id(
 }
 
 pub(super) fn derive_macro_as_call_id(
-    db: &dyn SourceDatabase,
+    db: &Db,
     item_attr: &AstIdWithPath<ast::Adt>,
     derive_attr_index: AttrId,
     derive_pos: u32,

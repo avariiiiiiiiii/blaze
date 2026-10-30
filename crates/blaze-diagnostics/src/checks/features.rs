@@ -174,7 +174,7 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (F
                 diag.note(reason);
             }
             crate_fact(cx, &mut diag);
-            found.push(Found::new(diag, Phase::Resolve));
+            found.push(Found::new(diag, Phase::Expand));
             continue;
         }
         if let Some(lang) = lang.filter(|it| it.kind == table::Kind::Accepted) {
@@ -187,7 +187,7 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (F
             let message = format!("the feature `{name}` is not in the list of allowed features");
             let mut diag = Diag::error(Some("E0725"), message, cx.span(at));
             crate_fact(cx, &mut diag);
-            found.push(Found::new(diag, Phase::Resolve));
+            found.push(Found::new(diag, Phase::Expand));
             continue;
         }
         match lang {

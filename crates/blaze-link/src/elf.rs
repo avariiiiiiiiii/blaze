@@ -20,7 +20,7 @@ mod tests;
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer};
+use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer};
 use crate::{Format, LinkError, NativeKind, Output};
 
 /// The ELF header and the most program headers an image has: `PT_PHDR`, `PT_INTERP`, four
@@ -44,8 +44,7 @@ pub(crate) const EH_FRAME_HDR: &str = ".eh_frame_hdr";
 /// The `Class::Named` section the loader reads before the program starts, so relro.
 const PREINIT_ARRAY: &str = ".preinit_array";
 
-// dyn: once per link, the format the output names (`model::writer`)
-pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
+pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
     if output.format != Format::Elf {
         return Err(error(format!("the ELF writer was asked for a {:?} image", output.format))); // alloc: error path
     }
@@ -53,8 +52,8 @@ pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
         Arch::X86_64 | Arch::Aarch64 => {}
         Arch::Wasm32 => return Err(error("an ELF image for wasm32: wasm is linked as wasm".into())),
     }
-    // clone: once per link, the writer owns its `Output` (the public API's type); alloc: its box
-    Ok(Box::new(Elf { output: output.clone() }))
+    // clone: once per link, the writer owns its `Output` (the public API's type)
+    Ok(Elf { output: output.clone() })
 }
 
 pub(crate) struct Elf {
@@ -213,7 +212,7 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
     } else if under(".text") && !write {
         (Class::Text, 0)
     } else {
-        (Class::Named { name: name.into(), write, exec }, 0)
+        (Class::Named { name: SectionName::new(name), write, exec }, 0)
     };
     Ok(placed)
 }
@@ -354,7 +353,7 @@ impl Writer for Elf {
                     (_, Some(section)) => (section, true),
                     _ => return None,
                 };
-                c_identifier(section).then(|| Special::Section { name: section.into(), end })
+                c_identifier(section).then(|| Special::Section { name: SectionName::new(section), end })
             }
         }
     }

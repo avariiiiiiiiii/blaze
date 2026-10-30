@@ -2,6 +2,7 @@
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir_def::{HasModule, ImplId, TraitId, TypeAliasId};
 use rustc_abi::{Float, HasDataLayout, Integer, IntegerType, Primitive, ReprOptions};
 use rustc_hash::FxHashSet;
@@ -485,7 +486,7 @@ pub(crate) struct ItemBounds {
 impl ItemBounds {
     #[inline]
     pub(crate) fn of_solver_def<'db>(
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         def_id: SolverDefId<'db>,
     ) -> &'db ItemBounds {
         let def_id = match def_id {
@@ -523,7 +524,7 @@ impl ItemBounds {
         reason = "this happens in a Salsa macro, not sure why only here"
     )]
     #[salsa::tracked]
-    fn of(db: &dyn HirDatabase, def_id: ItemWithBounds<'_>) -> ItemBounds {
+    fn of(db: &Db, def_id: ItemWithBounds<'_>) -> ItemBounds {
         let (krate, explicit_bounds) = match def_id {
             ItemWithBounds::TypeAliasId(type_alias) => (
                 type_alias.krate(db),
@@ -561,7 +562,7 @@ impl ItemBounds {
 
 #[salsa::tracked]
 pub(crate) fn impl_super_outlives(
-    db: &dyn HirDatabase,
+    db: &Db,
     impl_: ImplId,
 ) -> StoredEarlyBinder<StoredClauses> {
     let interner = DbInterner::new_with(db, impl_.krate(db));

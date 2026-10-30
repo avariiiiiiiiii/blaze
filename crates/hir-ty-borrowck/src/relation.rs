@@ -199,25 +199,21 @@ impl Relation {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::{Csr, Facts};
 
     #[test]
     fn a_relation_is_its_facts_grouped_in_order() {
-        let mut seed = 0x9e3779b97f4a7c15u64;
-        let mut next = |bound: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % bound
-        };
+        let mut rng = SplitMix64::new(0x9e3779b97f4a7c15);
         for _ in 0..200 {
-            let domains = [1 + next(20) as usize, 1 + next(5) as usize, 1 + next(40) as usize];
+            let domains = [1 + rng.index(20), 1 + rng.index(5), 1 + rng.index(40)];
             let mut rows = Vec::new();
             let mut facts = Facts::default();
-            for _ in 0..next(100) {
-                let kind = next(3) as u8;
-                let a = next(domains[kind as usize] as u64) as usize;
-                let b = next(1000) as usize;
+            for _ in 0..rng.below(100) {
+                let kind = rng.below(3) as u8;
+                let a = rng.index(domains[kind as usize]);
+                let b = rng.index(1000);
                 rows.push((kind, a, b));
                 facts.push(kind, a, b);
             }

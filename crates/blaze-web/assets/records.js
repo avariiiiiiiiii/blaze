@@ -1,9 +1,85 @@
 // A decoded CBOR item checked against blaze_protocol::events::Record (serde's externally
 // tagged enums: a unit variant is its name as text, a struct variant a map of one entry).
 // What does not fit is refused with the path to it, never patched up.
-import { decodeSequence } from "./cbor.js";
+import { CborError, Reader } from "./cbor.js";
+import { halves } from "./keys.js";
+import { HOW_COMPILED, HOW_UNIT, HOW_UNCHANGED, HOW_STORED } from "./snapshot.js";
 
 export class RecordError extends Error {}
+
+const HOW_OF = { Compiled: HOW_COMPILED, Unit: HOW_UNIT, Unchanged: HOW_UNCHANGED, Stored: HOW_STORED };
+
+// A Functions record's functions as columns: a cold build sends hundreds of thousands, and an
+// object and a string per field of each would be most of the page's work. `krate` indexes
+// `crates`, the record's own; `calls` of function k are calls[callsAt[k] .. callsAt[k + 1]].
+export class FnColumns {
+  constructor(capacity) {
+    this.n = 0;
+    this.id = new Uint32Array(capacity);
+    this.keyHi = new Uint32Array(capacity);
+    this.keyLo = new Uint32Array(capacity);
+    this.krate = new Uint32Array(capacity);
+    this.name = new Array(capacity);
+    this.how = new Uint8Array(capacity);
+    this.ns = new Float64Array(capacity);
+    this.callsAt = new Uint32Array(capacity + 1);
+    this.calls = new Uint32Array(Math.max(16, 4 * capacity));
+    this.ncalls = 0;
+    this.crates = [];
+    this.crateIndex = new Map();
+  }
+
+  get length() {
+    return this.n;
+  }
+
+  crate(name) {
+    let c = this.crateIndex.get(name);
+    if (c === undefined) {
+      c = this.crates.length;
+      this.crates.push(name);
+      this.crateIndex.set(name, c);
+    }
+    return c;
+  }
+
+  call(id) {
+    if (this.ncalls === this.calls.length) {
+      const grown = new Uint32Array(2 * this.calls.length);
+      grown.set(this.calls);
+      this.calls = grown;
+    }
+    this.calls[this.ncalls++] = id;
+  }
+
+  // Function `n` written whole: its calls are those since the last one ended.
+  end(id, hi, lo, krate, name, how, ns) {
+    const k = this.n++;
+    this.id[k] = id;
+    this.keyHi[k] = hi;
+    this.keyLo[k] = lo;
+    this.krate[k] = krate;
+    this.name[k] = name;
+    this.how[k] = how;
+    this.ns[k] = ns;
+    this.callsAt[k + 1] = this.ncalls;
+  }
+
+  // One function as `fn` checks it: { id, key, krate, name, calls, how: { type, ns? } }.
+  push(f) {
+    this.ncalls = this.callsAt[this.n];
+    for (const id of f.calls) this.call(id);
+    const [hi, lo] = halves(f.key);
+    const how = HOW_OF[f.how.type];
+    this.end(f.id, hi, lo, this.crate(f.krate), f.name, how, how === HOW_COMPILED ? f.how.ns : 0);
+  }
+
+  static of(fns) {
+    const cols = new FnColumns(fns.length);
+    for (const f of fns) cols.push(f);
+    return cols;
+  }
+}
 
 const STEPS = new Set([
   "LoadWorkspace", "Fetch", "Resolve", "FrontEnd", "Codegen", "Std", "Link", "Check", "Run", "Test",
@@ -83,6 +159,8 @@ const cause = (v, path) => enumOf(v, path, {
 });
 const how = (v, path) => enumOf(v, path, { Compiled: { ns: num }, Unit: null, Unchanged: null, Stored: null });
 const fn = (v, path) => struct(v, path, { id: u32, key: u64, krate: text, name: text, calls: array(u32), how });
+// Read as columns already by a frame (`readFns`), or checked one by one and made columns.
+const fns = (v, path) => (v instanceof FnColumns ? v : FnColumns.of(array(fn)(v, path)));
 const nodeState = (v, path) => enumOf(v, path, {
   Waiting: null, Ready: null, Running: null, Built: null,
   Cached: { remote: bool }, Failed: { why: text }, Skipped: { because: u32 }, Cancelled: null,
@@ -121,7 +199,7 @@ const EVENT = {
   Cores: { busy: u32, of: u32 },
   Compiling: { functions: array(slow) },
   Slowest: { functions: array(slow) },
-  Functions: { object: u32, whole: bool, functions: array(fn) },
+  Functions: { object: u32, whole: bool, functions: fns },
 };
 
 // `at` holds offsets for `len` nodes into `end` entries: `len + 1` of them, from 0 to `end`,
@@ -189,15 +267,198 @@ export function parseRecord(v) {
 }
 
 // A frame of the websocket: a CBOR sequence of records, as many as the server had at once
-// (docs/web.md, "The wire").
+// (docs/web.md, "The wire"). A Functions record's functions are read straight into columns.
 export function parseFrame(bytes) {
-  return decodeSequence(bytes).map((v, i) => {
+  const r = new Reader(bytes);
+  const items = [];
+  while (r.pos < bytes.length) items.push(r.item(0, RECORD));
+  return items.map((v, i) => {
     try {
       return parseRecord(v);
     } catch (e) {
       throw new RecordError(`item ${i}: ${e.message}`);
     }
   });
+}
+
+// The six fields of a function, by their text's bytes.
+const FN_FIELDS = ["id", "key", "krate", "name", "calls", "how"].map((k) => new TextEncoder().encode(k));
+const [ID, KEY, KRATE, NAME, CALLS, HOW] = [0, 1, 2, 3, 4, 5];
+const COMPILED = new TextEncoder().encode("Compiled");
+const NS = new TextEncoder().encode("ns");
+const UNIT_HOWS = [["Unit", HOW_UNIT], ["Unchanged", HOW_UNCHANGED], ["Stored", HOW_STORED]].map(([k, h]) => [new TextEncoder().encode(k), h]);
+// One UTF-16 unit per byte, so a frame decoded with it is indexed by byte offset, and an ASCII
+// name is a substring of it: no decoder call per name.
+const LATIN1 = new TextDecoder("windows-1252");
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
+
+const RECORD = { keys: { __proto__: null, event: { keys: { __proto__: null, Functions: { keys: { __proto__: null, functions: { array: readFns } } } } } } };
+
+// `n` functions read into columns. When one is not as this reader takes it, the whole array is
+// read again as items, and `fns` checks them when the record is: what it refuses, and the error
+// first said, are those of reading without columns.
+function readFns(r, n, depth) {
+  const start = r.pos;
+  const cols = new FnColumns(n);
+  for (let k = 0; k < n; k++) {
+    let read;
+    try {
+      read = readFn(r, cols);
+    } catch (e) {
+      if (!(e instanceof CborError)) throw e;
+      read = false;
+    }
+    if (!read) {
+      r.pos = start;
+      const items = new Array(n);
+      for (let i = 0; i < n; i++) items[i] = r.item(depth);
+      return items;
+    }
+  }
+  return cols;
+}
+
+// A head of major type `major` at the reader, its argument read; null when it is another.
+function head(r, major) {
+  if (r.pos >= r.b.length || r.b[r.pos] >> 5 !== major) return null;
+  const at = r.pos++;
+  return r.arg(r.b[at] & 31, at);
+}
+
+function sameBytes(b, at, want) {
+  for (let i = 0; i < want.length; i++) if (b[at + i] !== want[i]) return false;
+  return true;
+}
+
+// A text whose bytes are `want`; the reader past it when it is.
+function textIs(r, want) {
+  const at = r.pos;
+  const n = head(r, 3);
+  if (n === want.length && r.pos + n <= r.b.length && sameBytes(r.b, r.pos, want)) {
+    r.pos += n;
+    return true;
+  }
+  r.pos = at;
+  return false;
+}
+
+// A text's start, its length in `r.span`, the reader past it; -1 when it is not a text that
+// fits the message.
+function textSpan(r) {
+  const n = head(r, 3);
+  const start = r.pos;
+  if (typeof n !== "number" || n > r.b.length - start) return -1;
+  r.pos += n;
+  r.span = n;
+  return start;
+}
+
+function sameRange(b, a, c, n) {
+  for (let i = 0; i < n; i++) if (b[a + i] !== b[c + i]) return false;
+  return true;
+}
+
+// The text at `start` of `n` bytes as a string; null when it is not UTF-8.
+function textAt(r, start, n) {
+  const b = r.b;
+  let ascii = true;
+  for (let i = start; i < start + n; i++) if (b[i] >= 0x80) { ascii = false; break; }
+  if (ascii) {
+    r.latin1 ??= LATIN1.decode(b);
+    return r.latin1.substring(start, start + n);
+  }
+  try {
+    return UTF8.decode(b.subarray(start, start + n));
+  } catch {
+    return null;
+  }
+}
+
+// An unsigned integer of at most `most`; -1 when it is not one.
+function uint(r, most) {
+  const x = head(r, 0);
+  return typeof x === "number" && x <= most ? x : -1;
+}
+
+function readFn(r, cols) {
+  if (head(r, 5) !== 6) return false;
+  const b = r.b;
+  let seen = 0, id = 0, hi = 0, lo = 0, krate = 0, name = "", how = 0, ns = 0;
+  cols.ncalls = cols.callsAt[cols.n];
+  for (let e = 0; e < 6; e++) {
+    let field = -1;
+    for (let f = 0; f < 6 && field < 0; f++) if (textIs(r, FN_FIELDS[f])) field = f;
+    if (field < 0 || seen & (1 << field)) return false;
+    seen |= 1 << field;
+    switch (field) {
+      case ID:
+        id = uint(r, 0xffffffff);
+        if (id < 0) return false;
+        break;
+      case KEY: {
+        if (r.pos >= b.length || b[r.pos] >> 5 !== 0) return false;
+        if ((b[r.pos] & 31) === 27) {
+          r.need(9, "an 8-byte argument");
+          hi = r.v.getUint32(r.pos + 1);
+          lo = r.v.getUint32(r.pos + 5);
+          r.pos += 9;
+        } else {
+          const x = head(r, 0);
+          [hi, lo] = halves(x);
+        }
+        break;
+      }
+      case KRATE: {
+        const start = textSpan(r);
+        if (start < 0) return false;
+        const n = r.span;
+        if (n === cols.lastCrateLen && sameRange(b, start, cols.lastCrateAt, n)) {
+          krate = cols.lastCrate;
+        } else {
+          const s = textAt(r, start, n);
+          if (s === null) return false;
+          krate = cols.crate(s);
+          cols.lastCrateAt = start;
+          cols.lastCrateLen = n;
+          cols.lastCrate = krate;
+        }
+        break;
+      }
+      case NAME: {
+        const start = textSpan(r);
+        if (start < 0) return false;
+        name = textAt(r, start, r.span);
+        if (name === null) return false;
+        break;
+      }
+      case CALLS: {
+        const n = head(r, 4);
+        if (n === null || n > b.length - r.pos) return false;
+        for (let c = 0; c < n; c++) {
+          const callee = uint(r, 0xffffffff);
+          if (callee < 0) return false;
+          cols.call(callee);
+        }
+        break;
+      }
+      case HOW: {
+        if (r.pos < b.length && b[r.pos] >> 5 === 3) {
+          how = -1;
+          for (const [text, h] of UNIT_HOWS) if (how < 0 && textIs(r, text)) how = h;
+          if (how < 0) return false;
+          ns = 0;
+        } else {
+          if (head(r, 5) !== 1 || !textIs(r, COMPILED) || head(r, 5) !== 1 || !textIs(r, NS)) return false;
+          ns = uint(r, Number.MAX_SAFE_INTEGER);
+          if (ns < 0) return false;
+          how = HOW_COMPILED;
+        }
+        break;
+      }
+    }
+  }
+  cols.end(id, hi, lo, krate, name, how, ns);
+  return true;
 }
 
 // Cause::short, as the terminal says it.

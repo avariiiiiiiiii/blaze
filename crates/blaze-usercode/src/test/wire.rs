@@ -71,7 +71,7 @@ const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const HIGH: u64 = 0x8080_8080_8080_8080;
 
 /// How a test's child ended.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum End {
     /// Its exit code: 0 is a pass, as libtest would judge it; anything else a failure, whose
     /// output says why.
@@ -343,6 +343,25 @@ pub fn encode_ended<'a>(out: &mut Vec<u8>, id: u64, end: EndView<'a>, output: &[
     }
     let len = (out.len() - start - 4) as u32;
     out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+/// The ranges of descriptors at 3 or above that `open` does not name, each `(first, last)` and
+/// ascending, the last ending at `u32::MAX`: what a test's child closes with `close_range`, so it
+/// keeps exactly the descriptors the program had when its server started. Sorts `open`.
+pub fn closed_ranges(open: &mut Vec<u32>, out: &mut Vec<(u32, u32)>) {
+    open.sort_unstable();
+    out.clear();
+    let mut first = 3u32;
+    for &fd in open.iter() {
+        if fd < first {
+            continue;
+        }
+        if fd > first {
+            out.push((first, fd - 1));
+        }
+        first = fd.saturating_add(1);
+    }
+    out.push((first, u32::MAX));
 }
 
 fn put_end<'a>(out: &mut Vec<u8>, end: EndView<'a>) {

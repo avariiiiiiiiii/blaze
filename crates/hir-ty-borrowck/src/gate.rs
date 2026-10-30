@@ -15,8 +15,9 @@
 
 use std::{fmt, marker::PhantomData};
 
+use base_db::Db;
 use hir_def::{DefWithBodyId, ExpressionStoreOwnerId};
-use hir_ty::{InferBodyId, db::HirDatabase};
+use hir_ty::{InferBodyId};
 use hir_ty_mir::mir::{MirBody, MirLowerError};
 
 use crate::{BorrowckDiagnostic, BorrowckResult, NotChecked, borrowck};
@@ -104,14 +105,14 @@ fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused>
 
 /// The build path: `def`'s borrow check, which must pass before any of its code is compiled
 /// for a build or taken from the store into one.
-pub fn checked(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
+pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
     verdict(def, borrowck(db, def))?;
     Ok(Checked { owner: def, _revision: PhantomData })
 }
 
 /// Whether MIR whose `owner` is this is of `def`'s body or of a closure, coroutine or `const`
 /// block in it, which its borrow check covers.
-fn belongs(db: &dyn HirDatabase, owner: InferBodyId<'_>, def: DefWithBodyId) -> bool {
+fn belongs(db: &Db, owner: InferBodyId<'_>, def: DefWithBodyId) -> bool {
     match owner {
         InferBodyId::DefWithBodyId(it) => it == def,
         InferBodyId::AnonConstId(it) => it.loc(db).owner == ExpressionStoreOwnerId::Body(def),
@@ -119,7 +120,7 @@ fn belongs(db: &dyn HirDatabase, owner: InferBodyId<'_>, def: DefWithBodyId) -> 
 }
 
 fn mir_of<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: DefWithBodyId,
     body: Result<&'db MirBody<'db>, MirLowerError<'db>>,
 ) -> Result<&'db MirBody<'db>, Refused> {
@@ -139,7 +140,7 @@ impl<'db> Checked<'db> {
     /// (built, runtime, optimized, monomorphized), for a build's codegen.
     pub fn mir(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         body: Result<&'db MirBody<'db>, MirLowerError<'db>>,
     ) -> Result<CheckedMir<'db>, Refused> {
         Ok(CheckedMir { owner: self, body: mir_of(db, self.owner, body)? })
@@ -193,7 +194,7 @@ impl Unchecked {
     /// live patch's codegen.
     pub fn mir<'db>(
         self,
-        db: &'db dyn HirDatabase,
+        db: &'db Db,
         body: Result<&'db MirBody<'db>, MirLowerError<'db>>,
     ) -> Result<UncheckedMir<'db>, Refused> {
         Ok(UncheckedMir { owner: self, body: mir_of(db, self.owner, body)? })
@@ -240,7 +241,7 @@ impl Pending {
 
     /// Runs the borrow check, or takes its result if it ran: `Err` means the patch must be
     /// rolled back.
-    pub fn finish(self, db: &dyn HirDatabase) -> Result<Checked<'_>, Refused> {
+    pub fn finish(self, db: &Db) -> Result<Checked<'_>, Refused> {
         checked(db, self.owner)
     }
 }

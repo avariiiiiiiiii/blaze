@@ -25,6 +25,7 @@ rustc-hash.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 indexmap.workspace = true
+inventory.workspace = true
 rustc_apfloat = "0.2.3"
 salsa.workspace = true
 bitflags.workspace = true

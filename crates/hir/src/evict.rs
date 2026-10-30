@@ -16,21 +16,22 @@
 //! The borrow check's results stay: they are small, and the live-patch and build gates
 //! ([`hir_ty_borrowck::checked`]) read them on every build.
 
+use base_db::Db;
 use hir_def::DefWithBodyId;
 
-use crate::{db::HirDatabase, mir};
+use crate::mir;
 
 /// After a build stored the code of `compiled`: drops every MIR, every constant's and
 /// static's value and the inference of `compiled`. A workspace body `blaze check` reads again
 /// is better left out of `compiled` when a check follows the build.
-pub fn drop_after_store(db: &mut dyn HirDatabase, compiled: &[DefWithBodyId]) {
+pub fn drop_after_store(db: &mut Db, compiled: &[DefWithBodyId]) {
     drop_mir(db);
     hir_ide::evict::drop_all_const_eval(db);
     hir_ide::evict::drop_inference(db, compiled);
 }
 
 /// Drops every MIR the database holds.
-pub fn drop_mir(db: &mut dyn HirDatabase) {
+pub fn drop_mir(db: &mut Db) {
     mir::mir_body_query::evict_values(db);
     mir::mir_body_for_closure_query::evict_values(db);
     mir::mir_body_for_coroutine_query::evict_values(db);

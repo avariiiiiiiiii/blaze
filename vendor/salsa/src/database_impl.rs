@@ -15,6 +15,7 @@ impl Default for DatabaseImpl {
             // Default behavior: trace events at DEBUG when detailed tracing is enabled.
             storage: Storage::new(
                 if cfg!(feature = "detailed-trace") && tracing::enabled!(Level::DEBUG) {
+                    // alloc: setup: the default database's event callback, once per database
                     Some(Box::new(|event| {
                         crate::tracing::debug!("salsa_event({:?})", event)
                     }))
@@ -38,6 +39,14 @@ impl DatabaseImpl {
 }
 
 impl Database for DatabaseImpl {}
+
+impl crate::views::ConcreteView for DatabaseImpl {
+    #[cold]
+    #[inline(never)]
+    fn zalsa_register_concrete_downcaster(&self) -> &crate::views::DatabaseDownCaster<Self> {
+        crate::zalsa::views(self).add::<Self, Self>(|db| db)
+    }
+}
 
 // SAFETY: The `storage` and `storage_mut` fields return a reference to the same storage field owned by `self`.
 unsafe impl HasStorage for DatabaseImpl {

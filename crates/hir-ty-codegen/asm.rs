@@ -1243,7 +1243,7 @@ const X86_LLVM: [&str; 13] =
 
 /// The machine code of a function, and where in it the operands it names go.
 #[derive(Default)]
-pub(super) struct Assembled {
+pub struct Assembled {
     pub(super) code: Vec<u8>,
     pub(super) relocs: Vec<Named>,
 }
@@ -1349,7 +1349,7 @@ impl Named {
 
 impl Assembled {
     /// The bytes the store keeps.
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = (self.code.len() as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&self.code);
         for named in &self.relocs {
@@ -1364,7 +1364,9 @@ impl Assembled {
         bytes
     }
 
-    fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
+    /// Reads what [`Assembled::to_bytes`] wrote; `None` for any other bytes, which come from
+    /// the store or another machine.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
         let (len, rest) = bytes.split_first_chunk()?;
         let (code, rest) = rest.split_at_checked(u32::from_le_bytes(*len) as usize)?;
         let (records, []) = rest.as_chunks::<21>() else { return None };
@@ -1792,23 +1794,19 @@ mod tests {
     /// relocations, and the bytes with any one of them taken out are refused, not misread.
     #[test]
     fn kept_code_reads_back_and_short_bytes_are_refused() {
+        use blaze_ids::rng::SplitMix64;
+
         use super::{Assembled, Named, RELOCS};
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..200 {
-            let code = (0..next() % 64).map(|_| next() as u8).collect::<Vec<_>>();
-            let relocs = (0..next() % 5)
+            let code = (0..rng.below(64)).map(|_| rng.next_u64() as u8).collect::<Vec<_>>();
+            let relocs = (0..rng.below(5))
                 .map(|_| Named {
-                    offset: next() as u32,
-                    kind: RELOCS[next() as usize % RELOCS.len()],
-                    elf_type: Some(next() as u32).filter(|it| *it != 0),
-                    operand: next() as u32,
-                    addend: next() as i64,
+                    offset: rng.next_u64() as u32,
+                    kind: RELOCS[rng.index(RELOCS.len())],
+                    elf_type: Some(rng.next_u64() as u32).filter(|it| *it != 0),
+                    operand: rng.next_u64() as u32,
+                    addend: rng.next_u64() as i64,
                 })
                 .collect::<Vec<_>>();
             let bytes = Assembled { code: code.clone(), relocs }.to_bytes();

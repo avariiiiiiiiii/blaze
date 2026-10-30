@@ -14,16 +14,17 @@ use std::{
 use blaze_alloc_count::measure;
 
 use crate::{
-    Arena, Built, Column, Frame, Handle, MemError, Pool, Region, RegionVec, Revisions, Slab, Tag,
-    chunks, frame, revision::PublishError, scratch, tag,
+    AppendVec, Arena, Built, Column, Frame, Handle, MemError, Pool, Region, RegionVec, Revisions,
+    Slab, Tag, chunks, frame, pool, revision::PublishError, scratch, tag,
 };
 
-/// xorshift64*: the tests' operations, the same on every run.
-struct Rng(u64);
+/// xorshift64*: the tests' operations, the same on every run. Not `blaze_ids::rng`, since
+/// `blaze-ids` depends on this crate.
+struct Xorshift64Star(u64);
 
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+impl Xorshift64Star {
+    fn new(seed: u64) -> Xorshift64Star {
+        Xorshift64Star(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
     }
 
     fn next(&mut self) -> u64 {
@@ -119,7 +120,7 @@ fn regions_grow_from_many_threads_at_once() {
 
 #[test]
 fn region_vec_matches_vec_on_random_operations() {
-    let mut rng = Rng::new(1);
+    let mut rng = Xorshift64Star::new(1);
     let mut column = RegionVec::<u64>::new(1 << 20, Tag::Other).expect("reserve");
     let mut model = Vec::new();
     for _ in 0..200_000 {
@@ -250,11 +251,89 @@ fn column_reads_allocate_nothing() {
     assert_eq!(used.allocations, 0);
 }
 
+// AppendVec
+
+#[test]
+fn append_vec_matches_vec_and_never_moves() {
+    let mut rng = Xorshift64Star::new(7);
+    let column = AppendVec::<u64>::new(1 << 20, Tag::Vfs).expect("reserve");
+    let mut model = Vec::new();
+    for _ in 0..200_000 {
+        let value = rng.next();
+        assert_eq!(column.append(value) as usize, model.len());
+        model.push(value);
+    }
+    let first = column.as_slice().as_ptr();
+    for i in 0..100_000 {
+        column.append(i);
+        model.push(i);
+    }
+    assert_eq!(column.as_slice().as_ptr(), first, "growth never moves an element");
+    assert_eq!(column.as_slice(), model.as_slice());
+    assert_eq!(column.get(model.len() as u32), None);
+}
+
+#[test]
+fn append_vec_readers_see_a_written_prefix_while_one_writer_appends() {
+    let column = AppendVec::<[u64; 2]>::new(1 << 20, Tag::Vfs).expect("reserve");
+    thread::scope(|scope| {
+        let column = &column;
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut seen = 0;
+                    while seen < 100_000 {
+                        let published = column.as_slice();
+                        assert!(published.len() >= seen, "the length only grows");
+                        for (i, pair) in published.iter().enumerate().skip(seen) {
+                            assert_eq!(*pair, [i as u64, !(i as u64)], "a published value is whole");
+                        }
+                        seen = published.len();
+                    }
+                })
+            })
+            .collect();
+        for i in 0..100_000u64 {
+            column.append([i, !i]);
+        }
+        for reader in readers {
+            reader.join().expect("reader");
+        }
+    });
+}
+
+#[test]
+fn append_vec_full_is_an_error_and_drops_each_value_once() {
+    let drops = Rc::new(Cell::new(0));
+    let column = AppendVec::new(8, Tag::Vfs).expect("reserve");
+    for value in 0..8 {
+        column.try_append(Counted { value, drops: Rc::clone(&drops) }).expect("room");
+    }
+    let refused = column.try_append(Counted { value: 8, drops: Rc::clone(&drops) });
+    assert!(matches!(refused, Err(MemError::Exhausted { tag: Tag::Vfs, .. })));
+    assert_eq!(drops.get(), 1, "the refused value is dropped");
+    drop(column);
+    assert_eq!(drops.get(), 9);
+}
+
+#[test]
+fn append_vec_appends_and_reads_allocate_nothing() {
+    let column = AppendVec::<u64>::new(1 << 22, Tag::Vfs).expect("reserve");
+    let (sum, used) = measure(|| {
+        for i in 0..1_000_000 {
+            column.append(i);
+        }
+        column.iter().sum::<u64>()
+    });
+    assert_eq!(sum, (0..1_000_000).sum());
+    assert_eq!(used.allocations, 0);
+}
+
 // Frame
 
 #[test]
 fn frame_vec_matches_vec_and_grows_in_place() {
-    let mut rng = Rng::new(2);
+    let mut rng = Xorshift64Star::new(2);
     let frame = Frame::new(Tag::Infer).expect("reserve");
     let mut vec: Vec<u32, &Frame> = Vec::new_in(&frame);
     let mut model = Vec::new();
@@ -297,7 +376,7 @@ fn frame_interleaved_vecs_keep_their_contents() {
 #[test]
 fn frame_values_are_aligned_and_disjoint() {
     let frame = Frame::new(Tag::Mir).expect("reserve");
-    let mut rng = Rng::new(3);
+    let mut rng = Xorshift64Star::new(3);
     let mut blocks: Vec<(usize, usize)> = Vec::new();
     for _ in 0..10_000 {
         let size = rng.below(300) as usize;
@@ -449,7 +528,7 @@ fn arena_values_from_many_threads_live_until_reset() {
 fn arena_vec_matches_vec_and_keep_freezes_it() {
     let arena = Arena::new(Tag::Nameres);
     let local = arena.local();
-    let mut rng = Rng::new(4);
+    let mut rng = Xorshift64Star::new(4);
     let mut vec: Vec<u32, _> = Vec::new_in(&local);
     let mut model = Vec::new();
     for _ in 0..100_000 {
@@ -476,18 +555,22 @@ fn arena_gives_chunks_back_and_takes_them_again_warm() {
         }
     }
     let held = first.held();
+    assert!(held > 0);
     first.reset();
-    let carved = chunks::carved_bytes();
+    assert_eq!(first.held(), 0, "a reset gives every chunk back");
+    // Purged chunks come back zeroed and are taken like warm ones.
+    chunks::trim();
     let second = Arena::new(Tag::Vfs);
     let local = second.local();
-    for i in 0..100_000u64 {
-        local.alloc(i);
-    }
-    assert!(second.held() <= held);
-    assert!(
-        chunks::carved_bytes() <= carved + held,
-        "a new request reuses the chunks the last one gave back"
-    );
+    let values: Vec<&u64> = (0..100_000u64)
+        .map(|i| {
+            let value: &u64 = local.alloc(i);
+            value
+        })
+        .collect();
+    assert!(values.iter().enumerate().all(|(i, &&v)| v == i as u64));
+    assert_eq!(second.held(), held, "the same work holds the same chunks");
+    assert!(chunks::carved_bytes() >= held);
 }
 
 #[test]
@@ -521,12 +604,79 @@ impl Built for Names {
 }
 
 fn build_names<'a>(local: &crate::ArenaLocal<'a>, names: &[&str]) -> &'a [&'a str] {
-    let names: Vec<&'a str> = names.iter().map(|name| &*local.alloc_str(name)).collect();
+    let names: Vec<&'a str> = names
+        .iter()
+        .map(|name| {
+            let name: &'a str = local.alloc_str(name);
+            name
+        })
+        .collect();
     local.alloc_slice_copy(&names)
 }
 
+/// One test, so no other test's task guard (the reclaim epoch is process-wide) holds a grace
+/// these publishes and collections wait on.
 #[test]
-fn revisions_publish_and_read_through_a_task_guard() {
+fn graces_revisions_publish_read_wait_for_readers_and_drop_once_and_limbo_waits() {
+    publish_and_read_through_a_task_guard();
+    wait_for_a_task_that_may_read_the_old_one();
+    drop_each_value_once();
+    limbo_keeps_a_retired_object_until_its_readers_end();
+    limbo_matches_a_model_and_allocates_nothing_once_warm();
+}
+
+fn limbo_keeps_a_retired_object_until_its_readers_end() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let pool = Pool::<DropCount>::new(1024, Tag::Infer).expect("reserve");
+    let mut cache = pool.cache();
+    let mut limbo = pool::Limbo::new(&pool).expect("reserve");
+    let first = cache.alloc(DropCount(Arc::clone(&drops)));
+    let index = first.index();
+    let reader = blaze_reclaim::enter();
+    limbo.retire(first);
+    assert_eq!(limbo.collect(), 0, "a task that began before the retirement may still read it");
+    assert_eq!(drops.load(Ordering::Relaxed), 0);
+    drop(reader);
+    assert_eq!(limbo.collect(), 1);
+    assert_eq!(drops.load(Ordering::Relaxed), 1, "dropped once its grace passed");
+    assert!(limbo.is_empty());
+    let second = cache.alloc(DropCount(Arc::clone(&drops)));
+    limbo.retire(second);
+    drop(limbo);
+    assert_eq!(drops.load(Ordering::Relaxed), 2, "a dropped limbo drops what it held");
+    drop(cache);
+    let mut again = pool.cache();
+    let reused = again.alloc(DropCount(Arc::clone(&drops)));
+    assert!(reused.index() <= index + 2 * 128, "collected slots go back to the pool");
+}
+
+fn limbo_matches_a_model_and_allocates_nothing_once_warm() {
+    let pool = Pool::<[u64; 4]>::new(1 << 12, Tag::Infer).expect("reserve");
+    let mut cache = pool.cache();
+    let mut limbo = pool::Limbo::new(&pool).expect("reserve");
+    let mut rng = Xorshift64Star::new(9);
+    let mut round = |cache: &mut crate::Cache<'_, [u64; 4]>, limbo: &mut pool::Limbo<'_, [u64; 4]>| {
+        let mut retired = 0;
+        let mut collected = 0;
+        for _ in 0..20_000 {
+            if rng.below(3) == 0 {
+                collected += limbo.collect();
+            } else {
+                limbo.retire(cache.alloc([rng.next(); 4]));
+                retired += 1;
+            }
+        }
+        collected += limbo.collect();
+        assert_eq!(collected, retired, "with no reader every grace passes");
+        assert!(limbo.is_empty());
+    };
+    round(&mut cache, &mut limbo);
+    let (_, used) = measure(|| round(&mut cache, &mut limbo));
+    assert_eq!(used.allocations, 0, "retiring and collecting reuse the limbo's column");
+    assert!(pool.carved() <= 3 * 128 + 64, "collected slots are reused");
+}
+
+fn publish_and_read_through_a_task_guard() {
     let revisions = Revisions::<Names>::new(Tag::Vfs);
     {
         let guard = blaze_reclaim::enter();
@@ -548,8 +698,7 @@ fn revisions_publish_and_read_through_a_task_guard() {
     assert_eq!(*revisions.read(&guard).expect("published").value, ["d", "e", "f"]);
 }
 
-#[test]
-fn revisions_wait_for_a_task_that_may_read_the_old_one() {
+fn wait_for_a_task_that_may_read_the_old_one() {
     let revisions = Revisions::<Names>::new(Tag::Vfs);
     revisions.publish(|local| build_names(local, &["one"])).expect("publish");
     let reader = blaze_reclaim::enter();
@@ -584,8 +733,7 @@ impl Drop for DropCount {
     }
 }
 
-#[test]
-fn revisions_drop_each_value_once() {
+fn drop_each_value_once() {
     let drops = Arc::new(AtomicUsize::new(0));
     let revisions = Revisions::<Dropping>::new(Tag::Vfs);
     for _ in 0..5 {
@@ -603,15 +751,17 @@ fn revisions_drop_each_value_once() {
 fn pool_matches_box_on_random_operations() {
     let pool = Pool::<[u64; 4]>::new(1 << 16, Tag::Plane).expect("reserve");
     let mut cache = pool.cache();
-    let mut rng = Rng::new(5);
+    let mut rng = Xorshift64Star::new(5);
     let mut live = Vec::new();
     let mut model: Vec<Box<[u64; 4]>> = Vec::new();
+    let mut peak = 0;
     for _ in 0..200_000 {
         match rng.below(6) {
             0..=2 => {
                 let value = [rng.next(); 4];
                 live.push(cache.alloc(value));
                 model.push(Box::new(value));
+                peak = peak.max(live.len());
             }
             3 if !live.is_empty() => {
                 let i = rng.below(live.len() as u64) as usize;
@@ -639,7 +789,7 @@ fn pool_matches_box_on_random_operations() {
     for (pooled, boxed) in live.iter().zip(&model) {
         assert_eq!(**pooled, **boxed);
     }
-    assert!(pool.carved() as usize <= model.len() + 3 * 128 + 64, "freed slots are reused");
+    assert!(pool.carved() as usize <= peak + 2 * 128 + 64, "freed slots are reused");
 }
 
 #[test]
@@ -703,7 +853,7 @@ fn pool_allocates_nothing_once_warm() {
     let pool = Pool::<[u64; 8]>::new(1 << 16, Tag::Plane).expect("reserve");
     let mut cache = pool.cache();
     let mut held = Vec::with_capacity(10_000);
-    let mut round = |cache: &mut crate::Cache<'_, [u64; 8]>| {
+    let mut round = || {
         for i in 0..10_000 {
             held.push(cache.alloc([i; 8]));
         }
@@ -711,8 +861,8 @@ fn pool_allocates_nothing_once_warm() {
             cache.recycle(pooled);
         }
     };
-    round(&mut cache);
-    let (_, used) = measure(|| round(&mut cache));
+    round();
+    let (_, used) = measure(&mut round);
     assert_eq!(used.allocations, 0, "a warm pool recycles its slots");
 }
 
@@ -723,7 +873,7 @@ fn slab_matches_a_model_and_detects_stale_handles() {
     let mut slab = Slab::<u64>::new(1 << 16, Tag::Io).expect("reserve");
     let mut model: Vec<(Handle<u64>, u64)> = Vec::new();
     let mut stale: Vec<Handle<u64>> = Vec::new();
-    let mut rng = Rng::new(6);
+    let mut rng = Xorshift64Star::new(6);
     for _ in 0..200_000 {
         match rng.below(5) {
             0..=1 => {
@@ -866,6 +1016,57 @@ fn scratch_lends_distinct_buffers_when_nested_and_keeps_their_capacity() {
         assert!(buffer.is_empty());
         assert!(buffer.capacity() >= 5, "the thread's buffer keeps what it grew to");
     });
+}
+
+#[test]
+fn scratch_lent_buffers_return_to_the_shelf_of_the_thread_that_drops_them() {
+    let mut lent = scratch::lend_u32s();
+    assert!(lent.is_empty());
+    lent.extend(0..1000);
+    let grown = lent.capacity();
+    let built = thread::spawn(move || {
+        let lent = lent;
+        assert_eq!(lent.len(), 1000, "a lent buffer moves with its owner");
+        drop(lent);
+        scratch::with_u32s(|ids| (ids.is_empty(), ids.capacity()))
+    })
+    .join()
+    .expect("reader");
+    assert_eq!(built, (true, grown), "the dropping thread's shelf keeps it, emptied");
+    let kept = scratch::lend_bytes().into_inner();
+    assert!(kept.is_empty());
+}
+
+#[test]
+fn scratch_paths_are_lent_empty_and_kept_warm() {
+    scratch::with_path(|path| {
+        path.push("/tmp");
+        path.push("blaze");
+        assert!(path.ends_with("blaze"));
+    });
+    let (_, used) = measure(|| {
+        scratch::with_path(|path| {
+            assert!(path.as_os_str().is_empty());
+            path.push("/tmp");
+            path.push("blaze");
+        })
+    });
+    assert_eq!(used.allocations, 0, "a warm path buffer is reused");
+}
+
+#[test]
+fn scratch_lent_allocates_nothing_once_warm() {
+    // Locals drop in reverse, so each buffer goes back where it was taken from.
+    let work = || {
+        let mut tokens = scratch::lend_u32s();
+        let mut checkpoints = scratch::lend_u32s();
+        tokens.extend(0..10_000);
+        checkpoints.extend(0..1_000);
+        tokens.len() + checkpoints.len()
+    };
+    work();
+    let (_, used) = measure(work);
+    assert_eq!(used.allocations, 0, "two lent columns come back warm");
 }
 
 #[test]

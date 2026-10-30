@@ -13,6 +13,13 @@ mod symbol;
 mod sync;
 mod table;
 
+/// Counts allocations so the read paths' tests hold them to a budget.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+pub use blaze_mem::swiss;
+
 pub use self::intern::{InternStorage, Internable, Interned, InternedRef, impl_internable};
 pub use self::intern_slice::{
     HeaderSlice, HeaderWithLength, InternSliceStorage, InternedSlice, InternedSliceRef,

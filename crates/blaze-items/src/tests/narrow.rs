@@ -2,7 +2,7 @@
 //! a query, edits, runs it again and checks what reran. A query that reads a narrow fact reruns
 //! only when that fact changed; the narrow query itself reruns and comes out equal.
 
-use base_db::{Crate, FileId, SourceDatabase, all_crates};
+use base_db::{Crate, FileId, all_crates};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, FunctionId, GenericDefId, ImplId, ModuleDefId, StructId,
@@ -144,11 +144,11 @@ fn destructor_of(db: &TestDB, adt: AdtId) -> Option<ImplId> {
 fn a_drop_impl_for_another_type_leaves_destructor() {
     let (mut db, file) = single_file(DROP);
     let a = AdtId::from(struct_named(&db, "A"));
-    let cold = db.executed(|| assert_eq!(destructor_of(&db, a), None));
+    let cold = db.log_executed(|| assert_eq!(destructor_of(&db, a), None));
     assert!(ran(&cold, "destructor"), "{cold:#?}");
 
     db.set_file_text(file, &format!("{DROP}impl Drop for B {{\n    fn drop(&mut self) {{}}\n}}\n"));
-    let warm = db.executed(|| assert_eq!(destructor_of(&db, a), None));
+    let warm = db.log_executed(|| assert_eq!(destructor_of(&db, a), None));
     assert!(ran(&warm, "::in_crate_for_trait_and_self_ty"), "{warm:#?}");
     assert!(!ran(&warm, "destructor"), "{warm:#?}");
 }
@@ -160,7 +160,7 @@ fn a_drop_impl_for_the_type_reruns_destructor() {
     assert_eq!(destructor_of(&db, a), None);
 
     db.set_file_text(file, &format!("{DROP}impl Drop for A {{\n    fn drop(&mut self) {{}}\n}}\n"));
-    let warm = db.executed(|| assert!(destructor_of(&db, a).is_some()));
+    let warm = db.log_executed(|| assert!(destructor_of(&db, a).is_some()));
     assert!(ran(&warm, "destructor"), "{warm:#?}");
 }
 
@@ -180,7 +180,7 @@ fn method_db() -> (TestDB, FileId, FunctionId) {
 #[test]
 fn a_method_of_another_name_leaves_the_lookup() {
     let (mut db, impl_file, caller) = method_db();
-    let cold = db.executed(|| infer(&db, caller));
+    let cold = db.log_executed(|| infer(&db, caller));
     assert!(ran(&cold, "::for_body"), "{cold:#?}");
     assert!(ran(&cold, "impl_value_item"), "{cold:#?}");
 
@@ -188,7 +188,7 @@ fn a_method_of_another_name_leaves_the_lookup() {
         impl_file,
         "pub struct A;\nimpl A {\n    pub fn m(&self) {}\n    pub fn n(&self) {}\n}\n",
     );
-    let warm = db.executed(|| infer(&db, caller));
+    let warm = db.log_executed(|| infer(&db, caller));
     assert!(ran(&warm, "impl_value_item"), "{warm:#?}");
     assert!(!ran(&warm, "::for_body"), "{warm:#?}");
 }
@@ -199,7 +199,7 @@ fn removing_the_method_reruns_the_lookup() {
     infer(&db, caller);
 
     db.set_file_text(impl_file, "pub struct A;\nimpl A {\n    pub fn k(&self) {}\n}\n");
-    let warm = db.executed(|| infer(&db, caller));
+    let warm = db.log_executed(|| infer(&db, caller));
     assert!(ran(&warm, "::for_body"), "{warm:#?}");
 }
 
@@ -221,11 +221,11 @@ fn impls_of_trait(db: &TestDB, trait_: TraitId) -> usize {
 fn an_impl_of_another_trait_leaves_the_impls_of_a_trait() {
     let (mut db, file) = single_file(SPECIALIZING);
     let tr = trait_named(&db, "Tr");
-    let cold = db.executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
+    let cold = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
     assert!(ran(&cold, "::in_crate_and_deps_for_trait"), "{cold:#?}");
 
     db.set_file_text(file, &format!("{SPECIALIZING}impl Other for S {{}}\n"));
-    let warm = db.executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
+    let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
     assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
     assert!(!ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
 }
@@ -237,7 +237,7 @@ fn an_impl_of_the_trait_reruns_the_impls_of_the_trait() {
     assert_eq!(impls_of_trait(&db, tr), 2);
 
     db.set_file_text(file, &format!("{SPECIALIZING}impl Tr for u32 {{}}\n"));
-    let warm = db.executed(|| assert_eq!(impls_of_trait(&db, tr), 3));
+    let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 3));
     assert!(ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
 }
 
@@ -258,12 +258,12 @@ fn coherence(db: &TestDB) -> (bool, bool) {
 #[test]
 fn an_unrelated_item_leaves_coherence() {
     let (mut db, file) = single_file(COHERENCE);
-    let cold = db.executed(|| assert_eq!(coherence(&db), (true, true)));
+    let cold = db.log_executed(|| assert_eq!(coherence(&db), (true, true)));
     assert!(ran(&cold, "orphan_rules_hold"), "{cold:#?}");
     assert!(ran(&cold, "inherent_impl_coherent"), "{cold:#?}");
 
     db.set_file_text(file, &format!("{COHERENCE}pub fn unrelated() {{}}\n"));
-    let warm = db.executed(|| assert_eq!(coherence(&db), (true, true)));
+    let warm = db.log_executed(|| assert_eq!(coherence(&db), (true, true)));
     assert!(!ran(&warm, "orphan_rules_hold"), "{warm:#?}");
     assert!(!ran(&warm, "inherent_impl_coherent"), "{warm:#?}");
 }
@@ -274,7 +274,7 @@ fn changing_the_impls_reruns_coherence() {
     assert_eq!(coherence(&db), (true, true));
 
     db.set_file_text(file, "pub trait Tr {}\npub struct S;\nimpl Tr for u32 {}\nimpl u32 {}\n");
-    let warm = db.executed(|| assert_eq!(coherence(&db), (true, false)));
+    let warm = db.log_executed(|| assert_eq!(coherence(&db), (true, false)));
     assert!(ran(&warm, "orphan_rules_hold"), "{warm:#?}");
     assert!(ran(&warm, "inherent_impl_coherent"), "{warm:#?}");
 }
@@ -297,11 +297,11 @@ fn size_of_struct(db: &TestDB, name: &str) -> u64 {
 #[test]
 fn renaming_a_field_leaves_the_layout() {
     let (mut db, file) = single_file(LAYOUT);
-    let cold = db.executed(|| assert_eq!(size_of_struct(&db, "S"), 8));
+    let cold = db.log_executed(|| assert_eq!(size_of_struct(&db, "S"), 8));
     assert!(ran(&cold, "layout_of_adt_query"), "{cold:#?}");
 
     db.set_file_text(file, "pub struct S {\n    c: u32,\n    b: u8,\n}\n");
-    let warm = db.executed(|| assert_eq!(size_of_struct(&db, "S"), 8));
+    let warm = db.log_executed(|| assert_eq!(size_of_struct(&db, "S"), 8));
     assert!(ran(&warm, "variant_field_ids"), "{warm:#?}");
     assert!(!ran(&warm, "layout_of_adt_query"), "{warm:#?}");
 }
@@ -312,7 +312,7 @@ fn changing_a_field_type_reruns_the_layout() {
     assert_eq!(size_of_struct(&db, "S"), 8);
 
     db.set_file_text(file, "pub struct S {\n    a: u32,\n    b: u64,\n}\n");
-    let warm = db.executed(|| assert_eq!(size_of_struct(&db, "S"), 16));
+    let warm = db.log_executed(|| assert_eq!(size_of_struct(&db, "S"), 16));
     assert!(ran(&warm, "layout_of_adt_query"), "{warm:#?}");
 }
 
@@ -330,13 +330,13 @@ impl Tr for A {
 fn a_constant_added_to_the_impl_leaves_its_bodies() {
     let (mut db, file) = single_file(&format!("{ATPIT}}}\n"));
     let m = impl_function_named(&db, "m");
-    let cold = db.executed(|| infer(&db, m));
+    let cold = db.log_executed(|| infer(&db, m));
     assert!(ran(&cold, "::for_body"), "{cold:#?}");
     assert!(ran(&cold, "impl_type_aliases"), "{cold:#?}");
 
     db.set_file_text(file, &format!("{ATPIT}    const C: u32 = 0;\n}}\n"));
     let m = impl_function_named(&db, "m");
-    let warm = db.executed(|| infer(&db, m));
+    let warm = db.log_executed(|| infer(&db, m));
     assert!(ran(&warm, "impl_type_aliases"), "{warm:#?}");
     assert!(!ran(&warm, "::for_body"), "{warm:#?}");
 }
@@ -349,7 +349,7 @@ fn an_associated_type_added_to_the_impl_reruns_its_bodies() {
 
     db.set_file_text(file, &format!("{ATPIT}    type X = u32;\n}}\n"));
     let m = impl_function_named(&db, "m");
-    let warm = db.executed(|| infer(&db, m));
+    let warm = db.log_executed(|| infer(&db, m));
     assert!(ran(&warm, "::for_body"), "{warm:#?}");
 }
 
@@ -635,12 +635,12 @@ fn trait_method_db() -> (TestDB, FileId, FunctionId) {
 #[test]
 fn a_trait_method_of_another_name_leaves_the_lookup() {
     let (mut db, trait_file, caller) = trait_method_db();
-    let cold = db.executed(|| infer(&db, caller));
+    let cold = db.log_executed(|| infer(&db, caller));
     assert!(ran(&cold, "in_crate_trait_value_items"), "{cold:#?}");
 
     let added = TRAIT_DEF.replace("fn m(&self);", "fn m(&self);\n    fn n(&self) {}");
     db.set_file_text(trait_file, &added);
-    let warm = db.executed(|| infer(&db, caller));
+    let warm = db.log_executed(|| infer(&db, caller));
     assert!(ran(&warm, "in_crate_trait_value_items"), "{warm:#?}");
     assert!(!ran(&warm, "::for_body"), "{warm:#?}");
 }
@@ -651,7 +651,7 @@ fn removing_the_trait_method_reruns_the_lookup() {
     infer(&db, caller);
 
     db.set_file_text(trait_file, &TRAIT_DEF.replace("fn m(&self);", "fn k(&self);"));
-    let warm = db.executed(|| infer(&db, caller));
+    let warm = db.log_executed(|| infer(&db, caller));
     assert!(ran(&warm, "::for_body"), "{warm:#?}");
 }
 

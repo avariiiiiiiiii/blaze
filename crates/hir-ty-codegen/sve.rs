@@ -19,6 +19,7 @@
 
 use std::fmt::Write;
 
+use base_db::Db;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};
 use hir_def::FunctionId;
 use hir_ty::{
@@ -1271,7 +1272,7 @@ pub(super) fn cast(from: Shape, to: Shape) -> std::result::Result<Option<String>
 /// Whether the signature of `func` with `args` (its own parameters when `None`) has a
 /// scalable vector, which rustc's code passes in SVE registers.
 pub(super) fn passes_scalable(
-    db: &dyn HirDatabase,
+    db: &Db,
     func: FunctionId,
     args: Option<GenericArgs<'_>>,
     env: &StoredParamEnvAndCrate,

@@ -11,7 +11,7 @@ use blake3::{
     platform::{self, Platform},
 };
 
-use crate::ContentId;
+use crate::{ContentId, radix};
 
 /// BLAKE3's block flags.
 const CHUNK_START: u8 = 1;
@@ -28,32 +28,24 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
     let platform = Platform::detect();
     let words = platform::words_from_le_bytes_32(key);
     let mut out = vec![ContentId::default(); inputs.len()];
-    let mut counts = [0usize; CHUNK_LEN / BLOCK_LEN];
-    for input in inputs {
-        if input.len() <= CHUNK_LEN {
-            counts[leading(input.len())] += 1;
-        }
-    }
-    let mut starts = [0usize; CHUNK_LEN / BLOCK_LEN + 1];
-    for (group, count) in counts.iter().enumerate() {
-        starts[group + 1] = starts[group] + count;
-    }
-    let mut order = vec![0u32; starts[counts.len()]];
-    let mut next = starts;
+    let groups = radix::Csr::build(
+        CHUNK_LEN / BLOCK_LEN,
+        inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.len() <= CHUNK_LEN)
+            .map(|(at, input)| (leading(input.len()) as u32, at as u32)),
+    );
     for (at, input) in inputs.iter().enumerate() {
-        if input.len() <= CHUNK_LEN {
-            let group = leading(input.len());
-            order[next[group]] = at as u32;
-            next[group] += 1;
-        } else {
+        if input.len() > CHUNK_LEN {
             let mut hasher = blake3::Hasher::new_from_context_key(key);
             hasher.update(input);
             out[at] = ContentId(*hasher.finalize().as_bytes());
         }
     }
     let mut cvs = Vec::new();
-    for group in 0..counts.len() {
-        let members = &order[starts[group]..starts[group + 1]];
+    for group in 0..groups.rows() {
+        let members = groups.row(group);
         if members.is_empty() {
             continue;
         }

@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    fmt,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -17,141 +16,26 @@ use vfs::{
 
 use crate::{
     BuiltDependency, ContentId, Crate, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin,
-    CrateType, CrateTypes, CrateWorkspaceData, CratesMap, DependencyBuilder, EditionedFileId, Env,
-    FileSourceRootInput, FileText, Files, Nonce, SourceDatabase, SourceRoot, SourceRootId,
-    SourceRootInput, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot, all_crates_content,
-    cfg_options_content, install_plane_hooks,
+    CrateType, CrateTypes, CrateWorkspaceData, Db, DependencyBuilder, EditionedFileId, Env,
+    FileText, SourceRoot, SourceRootId, TargetKind, ViewChange, ViewError, ViewFile, ViewRoot,
+    all_crates_content, cfg_options_content,
     reparse::{
         REPARSED, TextEdit, assert_whole, common_prefix, common_prefix_scalar, common_suffix,
         common_suffix_scalar,
     },
-    run_on_pool, set_all_crates_with_durability,
+    run_on_pool,
     target::{Arch, TargetData},
 };
 
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-#[salsa::db]
-struct TestDb {
-    storage: salsa::Storage<Self>,
-    files: Arc<Files>,
-    crates_map: Arc<CratesMap>,
-    nonce: Nonce,
-}
-
-impl TestDb {
-    fn new() -> TestDb {
-        let mut db = TestDb {
-            storage: salsa::Storage::default(),
-            files: Arc::default(),
-            crates_map: Arc::default(),
-            nonce: Nonce::new(),
-        };
-        set_all_crates_with_durability(&mut db, std::iter::empty(), Durability::HIGH);
-        db
-    }
-
-    fn revision(&self) -> salsa::Revision {
-        self.nonce_and_revision().1
-    }
-}
-
-#[salsa::db]
-impl salsa::Database for TestDb {}
-
-impl fmt::Debug for TestDb {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TestDb").finish()
-    }
-}
-
-#[salsa::db]
-impl SourceDatabase for TestDb {
-    fn file_text(&self, file_id: FileId) -> FileText {
-        self.files.file_text(file_id)
-    }
-
-    fn set_file_text(&mut self, file_id: FileId, text: &str) {
-        let files = Arc::clone(&self.files);
-        files.set_file_text(self, file_id, text);
-    }
-
-    fn has_file_text(&self, file_id: FileId) -> bool {
-        self.files.has_file_text(file_id)
-    }
-
-    fn set_file_text_with_durability(&mut self, file_id: FileId, text: &str, durability: Durability) {
-        let files = Arc::clone(&self.files);
-        files.set_file_text_with_durability(self, file_id, text, durability);
-    }
-
-    fn source_root(&self, id: SourceRootId) -> SourceRootInput {
-        self.files.source_root(id)
-    }
-
-    fn file_source_root(&self, id: FileId) -> FileSourceRootInput {
-        self.files.file_source_root(self, id)
-    }
-
-    fn set_file_source_root_with_durability(
-        &mut self,
-        id: FileId,
-        source_root_id: SourceRootId,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_file_source_root_with_durability(self, id, source_root_id, durability);
-    }
-
-    fn set_source_root_with_durability(
-        &mut self,
-        source_root_id: SourceRootId,
-        source_root: Arc<SourceRoot>,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_source_root_with_durability(self, source_root_id, source_root, durability);
-    }
-
-    fn set_appended_root_module(
-        &mut self,
-        file_id: FileId,
-        module: Option<&'static str>,
-        durability: Durability,
-    ) {
-        let files = Arc::clone(&self.files);
-        files.set_appended_root_module(self, file_id, module, durability);
-    }
-
-    fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
-        let files = Arc::clone(&self.files);
-        files.set_view_root(self, view)
-    }
-
-    fn crates_map(&self) -> Arc<CratesMap> {
-        self.crates_map.clone()
-    }
-
-    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
-        (0..count).for_each(|at| task(self, at));
-    }
-
-    fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
-        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())
-    }
-
-    fn line_column(&self, file: FileId, offset: TextSize) -> Result<(u32, u32), ()> {
-        let text = self.file_text(file).text(self).clone();
-        let before = text.get(..u32::from(offset) as usize).ok_or(())?;
-        let line = before.matches('\n').count() as u32;
-        let column = before.rsplit('\n').next().map_or(0, str::len) as u32;
-        Ok((line, column))
-    }
+fn revision(db: &Db) -> salsa::Revision {
+    db.nonce_and_revision().1
 }
 
 /// Puts `files` (path, text) in source root 0, as file IDs from `first` on.
-fn load(db: &mut TestDb, first: u32, files: &[(&str, &str)]) -> Vec<FileId> {
+fn load(db: &mut Db, first: u32, files: &[(&str, &str)]) -> Vec<FileId> {
     let mut set = FileSet::default();
     let mut ids = Vec::new();
     for (n, (path, text)) in files.iter().enumerate() {
@@ -209,7 +93,7 @@ const FILES: &[(&str, &str)] =
 #[test]
 fn equal_content_gives_equal_ids_across_databases() {
     let ids = |first: u32| {
-        let mut db = TestDb::new();
+        let mut db = Db::for_tests();
         let files = load(&mut db, first, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], cfg(&[flag("unix")]), Env::default());
@@ -230,9 +114,9 @@ fn equal_content_gives_equal_ids_across_databases() {
 
 #[test]
 fn a_file_text_edit_changes_its_id_and_its_source_roots() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
-    let ids = |db: &TestDb| {
+    let ids = |db: &Db| {
         (db.file_text(files[1]).content(db), db.source_root(SourceRootId(0)).content(db))
     };
     let before = ids(&db);
@@ -258,7 +142,7 @@ fn a_file_text_edit_changes_its_id_and_its_source_roots() {
 
 #[test]
 fn a_files_parse_shares_its_text() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let parse = EditionedFileId::new(&db, files[1], Edition::Edition2021).parse(&db);
     let root = parse.syntax_node();
@@ -269,9 +153,9 @@ fn a_files_parse_shares_its_text() {
 /// #1294: a dependency's file is an outline, whose `fn` bodies stay unparsed until reached.
 #[test]
 fn a_library_files_parse_leaves_bodies_unparsed() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, &[("/a/lib.rs", "fn f() { let x = 1 + 1; }")]);
-    let body_is_lazy = |db: &TestDb| {
+    let body_is_lazy = |db: &Db| {
         let parse = EditionedFileId::new(db, files[0], Edition::Edition2021).parse(db);
         let root = parse.syntax_node();
         let function = root.children().next().expect("the `fn`");
@@ -296,7 +180,7 @@ fn the_order_of_cfg_atoms_does_not_change_a_crates_id() {
     assert_ne!(cfg_options_content(&cfg(&atoms)), cfg_options_content(&cfg(&atoms[1..])));
 
     let crate_id = |atoms: &[CfgAtom]| {
-        let mut db = TestDb::new();
+        let mut db = Db::for_tests();
         let files = load(&mut db, 0, FILES);
         let mut graph = CrateGraphBuilder::default();
         let a = add(&mut graph, files[0], cfg(atoms), Env::default());
@@ -308,7 +192,7 @@ fn the_order_of_cfg_atoms_does_not_change_a_crates_id() {
 
 #[test]
 fn a_dependencys_change_changes_its_dependents_ids() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
@@ -317,7 +201,7 @@ fn a_dependencys_change_changes_its_dependents_ids() {
     depend(&mut graph, a, b, "b");
     let crates = graph.set_in_db(&mut db);
     let (a, b, c): (Crate, Crate, Crate) = (crates[&a], crates[&b], crates[&c]);
-    let ids = |db: &TestDb| (a.content(db), b.content(db), c.content(db), all_crates_content(db));
+    let ids = |db: &Db| (a.content(db), b.content(db), c.content(db), all_crates_content(db));
     let before = ids(&db);
 
     let env: Env = [("KEY".to_owned(), "value".to_owned())].into_iter().collect();
@@ -335,7 +219,7 @@ fn a_dependencys_change_changes_its_dependents_ids() {
 
 #[test]
 fn a_crates_types_read_back_and_are_in_its_id() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
@@ -354,7 +238,7 @@ fn a_crates_types_read_back_and_are_in_its_id() {
 
 #[test]
 fn a_dependency_added_outside_the_prelude_says_so() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
@@ -362,7 +246,7 @@ fn a_dependency_added_outside_the_prelude_says_so() {
     let crates = graph.set_in_db(&mut db);
     let (a, b): (Crate, Crate) = (crates[&a], crates[&b]);
     let name = CrateName::new("b").unwrap();
-    let depend_on = |db: &mut TestDb, dependency: BuiltDependency| {
+    let depend_on = |db: &mut Db, dependency: BuiltDependency| {
         let mut data = a.data(&*db).clone();
         data.dependencies = vec![dependency];
         a.set_data(db, data);
@@ -379,7 +263,7 @@ fn a_dependency_added_outside_the_prelude_says_so() {
 }
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
-fn checkout(db: &mut TestDb) -> (AbsPathBuf, FileSetConfig) {
+fn checkout(db: &mut Db) -> (AbsPathBuf, FileSetConfig) {
     let base = AbsPathBuf::assert_utf8(std::env::temp_dir().join("blaze-base-db-view"));
     let mut partition = FileSetConfig::builder();
     partition.add_file_set(vec![VfsPath::from(base.clone())]);
@@ -399,7 +283,7 @@ fn vfs_file(bytes: &[u8]) -> blaze_vfs::File<'_> {
 }
 
 fn set_view(
-    db: &mut TestDb,
+    db: &mut Db,
     base: &AbsPathBuf,
     partition: &FileSetConfig,
     files: &[(&str, &[u8])],
@@ -409,7 +293,7 @@ fn set_view(
     db.set_view_root(ViewRoot { base, built: &[], partition, other: SourceRootId(1), files: &files })
 }
 
-fn file_at(db: &TestDb, base: &AbsPathBuf, path: &str) -> Option<FileId> {
+fn file_at(db: &Db, base: &AbsPathBuf, path: &str) -> Option<FileId> {
     let root = db.source_root(SourceRootId(0)).source_root(db);
     root.file_for_path(&VfsPath::from(base.join(path))).copied()
 }
@@ -419,7 +303,7 @@ const VIEW: &[(&str, &[u8])] =
 
 #[test]
 fn setting_a_view_twice_writes_nothing() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     let first = set_view(&mut db, &base, &partition, VIEW).unwrap();
     assert_eq!(first.added.len(), 3);
@@ -428,17 +312,17 @@ fn setting_a_view_twice_writes_nothing() {
     assert_eq!(&**db.file_text(a).text(&db), "fn f() {}");
     assert_eq!(db.file_source_root(a).source_root_id(&db), SourceRootId(0));
 
-    let revision = db.revision();
+    let revision = revision(&db);
     let root = db.source_root(SourceRootId(0)).content(&db);
     let second = set_view(&mut db, &base, &partition, VIEW).unwrap();
     assert_eq!(second, ViewChange::default());
-    assert_eq!(db.revision(), revision);
+    assert_eq!(revision(&db), revision);
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
 }
 
 #[test]
 fn a_view_with_one_changed_file_sets_that_one() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     let a = file_at(&db, &base, "src/a.rs").unwrap();
@@ -455,7 +339,7 @@ fn a_view_with_one_changed_file_sets_that_one() {
 
 #[test]
 fn a_view_without_a_file_takes_it_out_of_its_source_root() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     set_view(&mut db, &base, &partition, VIEW).unwrap();
     let readme = file_at(&db, &base, "README.md").unwrap();
@@ -473,7 +357,7 @@ fn a_view_without_a_file_takes_it_out_of_its_source_root() {
 
 #[test]
 fn bytes_that_are_not_utf8_are_a_file_without_text() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     let binary: &[(&str, &[u8])] = &[("src/lib.rs", b"mod a;"), ("data.bin", &[0xff, 0xfe])];
     let change = set_view(&mut db, &base, &partition, binary).unwrap();
@@ -494,9 +378,9 @@ fn bytes_that_are_not_utf8_are_a_file_without_text() {
 
 #[test]
 fn a_content_id_that_is_not_its_bytes_is_refused() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
-    let revision = db.revision();
+    let revision = revision(&db);
     let bytes: &[u8] = b"fn main() {}";
     let files = [
         ViewFile { path: "src/lib.rs", file: vfs_file(b"mod a;") },
@@ -513,7 +397,7 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
         ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
     let error = db.set_view_root(view).unwrap_err();
     assert!(matches!(&error, ViewError::Mismatch { path, .. } if path == "src/main.rs"));
-    assert_eq!(db.revision(), revision);
+    assert_eq!(revision(&db), revision);
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
 
@@ -642,7 +526,7 @@ fn a_log_and_a_column_give_back_what_was_put() {
 
 #[test]
 fn what_queries_note_is_kept_once_and_sorted() {
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let mut graph = CrateGraphBuilder::default();
     let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
@@ -695,7 +579,7 @@ fn seeded_view(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
 /// Everything a view's files are as inputs, by path: present, has text, its text ID and
 /// source root; then each source root's content ID.
 fn view_state(
-    db: &TestDb,
+    db: &Db,
     base: &AbsPathBuf,
     paths: &[String],
 ) -> (Vec<Option<(bool, Option<ContentId>, SourceRootId)>>, [ContentId; 2]) {
@@ -715,14 +599,14 @@ fn view_state(
 #[test]
 fn a_view_set_over_others_is_the_view_set_alone() {
     let mut rng = Rng(3);
-    let mut db = TestDb::new();
+    let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     let built = [base.join("target")];
     let mut every_path: Vec<String> = Vec::new();
     let mut before: Vec<(String, Vec<u8>)> = Vec::new();
     for step in 0..40 {
         let view = seeded_view(&mut rng);
-        let id_of = |db: &TestDb, path: &str| file_at(db, &base, path);
+        let id_of = |db: &Db, path: &str| file_at(db, &base, path);
         let ids_before: Vec<(String, Option<FileId>)> =
             before.iter().map(|(path, _)| (path.clone(), id_of(&db, path))).collect();
         let files: Vec<ViewFile<'_>> =
@@ -788,7 +672,7 @@ fn a_view_set_over_others_is_the_view_set_alone() {
                 every_path.push(path.clone());
             }
         }
-        let mut fresh = TestDb::new();
+        let mut fresh = Db::for_tests();
         let (fresh_base, fresh_partition) = checkout(&mut fresh);
         let fresh_files: Vec<(&str, &[u8])> =
             whole.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
@@ -808,12 +692,10 @@ fn two_workers() -> blaze_graph::pool::Pool {
 
 #[test]
 fn a_task_that_waited_on_itself_runs_again() {
-    install_plane_hooks();
-    install_plane_hooks();
-    let db = TestDb::new();
+    let db = Db::for_tests();
     let pool = two_workers();
     let runs: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
-    run_on_pool(&db, &pool, runs.len(), &|_: &dyn SourceDatabase, at: usize| {
+    run_on_pool(&db, &pool, runs.len(), &|_: &Db, at: usize| {
         if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
             std::panic::resume_unwind(Box::new(salsa::Cancelled::WouldWaitOnItself));
         }
@@ -824,11 +706,11 @@ fn a_task_that_waited_on_itself_runs_again() {
 
 #[test]
 fn any_other_panic_of_a_task_reaches_the_caller() {
-    let db = TestDb::new();
+    let db = Db::for_tests();
     let pool = two_workers();
     let ran = AtomicUsize::new(0);
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_on_pool(&db, &pool, 4, &|_: &dyn SourceDatabase, at: usize| {
+        run_on_pool(&db, &pool, 4, &|_: &Db, at: usize| {
             ran.fetch_add(1, Ordering::Relaxed);
             if at == 2 {
                 std::panic::resume_unwind(Box::new("task 2 failed"));
@@ -837,4 +719,315 @@ fn any_other_panic_of_a_task_reaches_the_caller() {
     }));
     assert_eq!(caught.unwrap_err().downcast_ref::<&str>(), Some(&"task 2 failed"));
     assert_eq!(ran.load(Ordering::Relaxed), 4);
+}
+
+#[test]
+fn a_private_dependency_reads_back_private_and_changes_the_id() {
+    let crate_id = |private: bool| {
+        let mut db = Db::for_tests();
+        let files = load(&mut db, 0, FILES);
+        let mut graph = CrateGraphBuilder::default();
+        let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+        let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+        let dependency = DependencyBuilder::new(CrateName::new("c").unwrap(), c).with_private(private);
+        graph.add_dep(a, dependency).unwrap();
+        let a = graph.set_in_db(&mut db)[&a];
+        assert_eq!(a.data(&db).dependencies[0].is_private(), private);
+        a.content(&db)
+    };
+    let public = crate_id(false);
+    assert_ne!(crate_id(true), public);
+    assert_eq!(crate_id(false), public);
+
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    let crates = graph.set_in_db(&mut db);
+    let (a, c): (Crate, Crate) = (crates[&a], crates[&c]);
+    let depend_on = |db: &mut Db, private: bool| {
+        let mut data = a.data(&*db).clone();
+        let name = CrateName::new("c").unwrap();
+        data.dependencies = vec![BuiltDependency::new(name, c).with_private(private)];
+        a.set_data(db, data);
+        (a.data(&*db).dependencies[0].is_private(), a.content(&*db), all_crates_content(&*db))
+    };
+    let (read, public, graph_public) = depend_on(&mut db, false);
+    assert!(!read);
+    let (read, private, graph_private) = depend_on(&mut db, true);
+    assert!(read);
+    assert_ne!(private, public);
+    assert_ne!(graph_private, graph_public);
+    assert_eq!(depend_on(&mut db, false), (false, public, graph_public));
+}
+
+fn arm_target(tuple: &str, has_thumb_interworking: bool) -> TargetData {
+    TargetData {
+        tuple: Symbol::intern(tuple),
+        data_layout: "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64".into(),
+        arch: Arch::Other,
+        has_thumb_interworking,
+    }
+}
+
+#[test]
+fn targets_differing_in_the_tuple_or_thumb_interworking_have_different_ids() {
+    let interworking = arm_target("armv7-unknown-linux-gnueabihf", true);
+    let without = arm_target("armv7-unknown-linux-gnueabihf", false);
+    let other_tuple = arm_target("armv7-unknown-linux-musleabihf", true);
+    assert_ne!(interworking.content(), without.content());
+    assert_ne!(interworking.content(), other_tuple.content());
+    assert_eq!(interworking.content(), arm_target("armv7-unknown-linux-gnueabihf", true).content());
+
+    let workspace = |target: TargetData| {
+        CrateWorkspaceData { target: Ok(target), toolchain: None, const_eval: Default::default() }
+            .content()
+    };
+    assert_ne!(workspace(interworking.clone()), workspace(without.clone()));
+
+    let crate_id = |target: TargetData| {
+        let mut db = Db::for_tests();
+        let files = load(&mut db, 0, FILES);
+        let mut graph = CrateGraphBuilder::default();
+        let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+        let a = graph.set_in_db(&mut db)[&a];
+        let workspace = CrateWorkspaceData {
+            target: Ok(target),
+            toolchain: None,
+            const_eval: Default::default(),
+        };
+        a.set_workspace_data(&mut db, Arc::new(workspace));
+        a.content(&db)
+    };
+    assert_ne!(crate_id(interworking), crate_id(without));
+}
+
+/// Puts `files` (ID, path, text) in source root `root`.
+fn put_root(db: &mut Db, root: u32, files: &[(FileId, &str, &str)]) {
+    let mut set = FileSet::default();
+    for &(id, path, text) in files {
+        db.set_file_text_with_durability(id, text, Durability::LOW);
+        db.set_file_source_root_with_durability(id, SourceRootId(root), Durability::MEDIUM);
+        set.insert(id, VfsPath::new_virtual_path(path.to_owned()));
+    }
+    let set = Arc::new(SourceRoot::new_local(set));
+    db.set_source_root_with_durability(SourceRootId(root), set, Durability::MEDIUM);
+}
+
+thread_local! {
+    static SHARED_MODULE_RUNS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// What a `#[path = "../../shared/m.rs"] mod m;` in `anchor` reads: the file and its text's
+/// length, as a def map would.
+#[salsa::tracked]
+fn shared_module(db: &Db, anchor: EditionedFileId) -> Option<(u32, u32)> {
+    SHARED_MODULE_RUNS.with(|it| it.set(it.get() + 1));
+    let (anchor, _) = anchor.unpack(db);
+    let file = db.resolve_path(AnchoredPath { anchor, path: "../../shared/m.rs" })?;
+    Some((file.index(), db.file_text(file).text(db).len() as u32))
+}
+
+fn shared_module_runs() -> usize {
+    SHARED_MODULE_RUNS.with(Cell::get)
+}
+
+#[test]
+fn a_path_module_outside_its_package_resolves_and_its_edit_reruns_the_reader() {
+    let mut db = Db::for_tests();
+    let (lib, own, m) = (FileId::from_raw(0), FileId::from_raw(1), FileId::from_raw(2));
+    put_root(
+        &mut db,
+        0,
+        &[(lib, "/ws/member/src/lib.rs", "#[path = \"../../shared/m.rs\"] mod m;"), (own, "/ws/member/src/a.rs", "")],
+    );
+    put_root(&mut db, 1, &[(m, "/ws/shared/m.rs", "pub fn f() {}")]);
+
+    // The anchor's own source root first, as before.
+    assert_eq!(db.resolve_path(AnchoredPath { anchor: lib, path: "a.rs" }), Some(own));
+    let anchor = EditionedFileId::new(&db, lib, Edition::Edition2021);
+    let runs = shared_module_runs();
+    assert_eq!(shared_module(&db, anchor), Some((m.index(), 13)));
+    assert_eq!(shared_module_runs(), runs + 1);
+    assert_eq!(shared_module(&db, anchor), Some((m.index(), 13)));
+    assert_eq!(shared_module_runs(), runs + 1);
+
+    // An edit of the file in the other source root runs the reader again.
+    db.set_file_text(m, "pub fn f() { 1 }");
+    assert_eq!(shared_module(&db, anchor), Some((m.index(), 16)));
+    assert_eq!(shared_module_runs(), runs + 2);
+
+    // Taken out of its source root: found in none, and nothing read from disk.
+    put_root(&mut db, 1, &[]);
+    assert_eq!(shared_module(&db, anchor), None);
+    assert_eq!(shared_module_runs(), runs + 3);
+
+    // Named again by another source root, as another file: the miss runs again and finds it.
+    let moved = FileId::from_raw(3);
+    put_root(&mut db, 2, &[(moved, "/ws/shared/m.rs", "pub fn g() {}")]);
+    assert_eq!(shared_module(&db, anchor), Some((moved.index(), 13)));
+    assert_eq!(shared_module_runs(), runs + 4);
+}
+
+#[test]
+fn a_path_no_source_root_names_is_found_once_one_does() {
+    let mut db = Db::for_tests();
+    let lib = FileId::from_raw(0);
+    put_root(&mut db, 0, &[(lib, "/ws/member/src/lib.rs", "")]);
+    let anchor = EditionedFileId::new(&db, lib, Edition::Edition2021);
+    assert_eq!(shared_module(&db, anchor), None);
+    let runs = shared_module_runs();
+
+    // A source root that names the path: the miss runs again.
+    let m = FileId::from_raw(1);
+    put_root(&mut db, 1, &[(m, "/ws/shared/m.rs", "fn m() {}")]);
+    assert_eq!(shared_module(&db, anchor), Some((m.index(), 9)));
+    assert_eq!(shared_module_runs(), runs + 1);
+}
+
+#[test]
+fn the_simd_prefix_and_suffix_equal_their_scalar_reference() {
+    let mut rng = Rng(19);
+    for _ in 0..4_000 {
+        let common = rng.below(160) as usize;
+        let mut a: Vec<u8> = (0..common).map(|_| rng.below(4) as u8).collect();
+        let mut b = a.clone();
+        a.extend((0..rng.below(80)).map(|_| rng.below(4) as u8));
+        b.extend((0..rng.below(80)).map(|_| rng.below(4) as u8));
+        let tail: Vec<u8> = (0..rng.below(160)).map(|_| rng.below(4) as u8).collect();
+        a.extend(&tail);
+        b.extend(&tail);
+        assert_eq!(common_prefix(&a, &b), common_prefix_scalar(&a, &b), "{a:?} {b:?}");
+        assert_eq!(common_suffix(&a, &b), common_suffix_scalar(&a, &b), "{a:?} {b:?}");
+        assert_eq!(common_prefix(&a, &a), a.len());
+        assert_eq!(common_suffix(&b, &b), b.len());
+    }
+}
+
+/// A random edit of `text` at character boundaries: some characters taken out, a snippet put
+/// in, or both.
+fn random_edit(rng: &mut Rng, text: &str) -> String {
+    const SNIPPETS: &[&str] = &[
+        "", "x", " ", "\n", "{", "}", "(", ")", ";", "\"", "'a", "//", "/*", "*/", "é", "fn g() {}",
+        "1 + 2", "struct S;", "let y = 0;", "mod m { }", "#[cfg(test)]",
+    ];
+    let boundaries: Vec<usize> =
+        (0..=text.len()).filter(|&at| text.is_char_boundary(at)).collect();
+    let start = boundaries[rng.below(boundaries.len() as u64) as usize];
+    let end = boundaries
+        .iter()
+        .copied()
+        .filter(|&at| at >= start)
+        .nth(rng.below(9) as usize)
+        .unwrap_or(text.len());
+    let insert = SNIPPETS[rng.below(SNIPPETS.len() as u64) as usize];
+    [&text[..start], insert, &text[end..]].concat()
+}
+
+#[test]
+fn the_edit_between_two_texts_makes_one_the_other() {
+    let mut rng = Rng(23);
+    let mut old = include_str!("target.rs").to_owned();
+    for _ in 0..500 {
+        let new = random_edit(&mut rng, &old);
+        let before = ContentId::of(blaze_vfs::FILE_DOMAIN, old.as_bytes());
+        let edit = TextEdit::between(&old, &new, before);
+        assert_eq!(edit.before, before);
+        let (start, end) = (usize::from(edit.delete.start()), usize::from(edit.delete.end()));
+        let insert = usize::from(edit.insert);
+        assert!(old.is_char_boundary(start) && old.is_char_boundary(end));
+        assert_eq!([&old[..start], &new[start..start + insert], &old[end..]].concat(), new);
+        old = new;
+    }
+    let same = TextEdit::between("fn f() {}", "fn f() {}", ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
+    assert_eq!((same.delete.len(), same.insert), (TextSize::from(0), TextSize::from(0)));
+}
+
+fn reparsed() -> usize {
+    REPARSED.with(Cell::get)
+}
+
+/// The property test of db's decision D8: over random edits of real files, in full and as an
+/// outline, each parse is the one a whole parse of the text makes, and most are reparses.
+#[test]
+fn a_parse_after_random_edits_is_the_whole_parse() {
+    for (seed, source, library) in
+        [(29, include_str!("target.rs"), false), (31, include_str!("change.rs"), false), (37, include_str!("target.rs"), true)]
+    {
+        let mut db = Db::for_tests();
+        let file = FileId::from_raw(0);
+        put_root(&mut db, 0, &[(file, "/a/lib.rs", source)]);
+        if library {
+            let mut set = FileSet::default();
+            set.insert(file, VfsPath::new_virtual_path("/a/lib.rs".to_owned()));
+            let root = Arc::new(SourceRoot::new_library(set));
+            db.set_source_root_with_durability(SourceRootId(0), root, Durability::HIGH);
+        }
+        let id = EditionedFileId::new(&db, file, Edition::Edition2021);
+        assert_eq!(id.parse(&db).is_outline(), library);
+        let mut rng = Rng(seed);
+        let mut text = source.to_owned();
+        let start = reparsed();
+        for step in 0..80 {
+            text = random_edit(&mut rng, &text);
+            db.set_file_text(file, &text);
+            let parse = id.parse(&db);
+            assert_eq!(parse.syntax_node().text().to_string(), text, "step {step}");
+            assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
+        }
+        assert_eq!(reparsed() - start, 80, "seed {seed}: every edit after a kept parse reparses");
+    }
+}
+
+#[test]
+fn a_reparse_is_made_from_the_last_text_that_was_parsed() {
+    let mut db = Db::for_tests();
+    let file = FileId::from_raw(0);
+    put_root(&mut db, 0, &[(file, "/a/lib.rs", "fn f() { 1 }\nstruct S;\n")]);
+    let id = EditionedFileId::new(&db, file, Edition::Edition2021);
+    let _ = id.parse(&db);
+    let parsed = ContentId::of(blaze_vfs::FILE_DOMAIN, b"fn f() { 1 }\nstruct S;\n");
+
+    // Two edits with no parse between: the second is one edit from the text last parsed.
+    db.set_file_text(file, "fn f() { 1 + 2 }\nstruct S;\n");
+    db.set_file_text(file, "fn f() { 1 + 2 }\nstruct S { a: u8 }\n");
+    let edit = db.file_text(file).reparse_field(&db).edit().expect("an edit from the parse");
+    assert_eq!(edit.before, parsed);
+    assert_eq!(edit.delete, TextRange::new(TextSize::from(11), TextSize::from(22)));
+    let start = reparsed();
+    let parse = id.parse(&db);
+    assert_eq!(reparsed(), start + 1);
+    assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, false);
+
+    // A text never parsed before its edit, with none before it: parsed whole.
+    let fresh = FileId::from_raw(1);
+    put_root(&mut db, 0, &[(file, "/a/lib.rs", "fn f() {}"), (fresh, "/a/b.rs", "fn b() {}")]);
+    db.set_file_text(fresh, "fn b() { 2 }");
+    assert_eq!(db.file_text(fresh).reparse_field(&db).edit(), None);
+    let start = reparsed();
+    let fresh_id = EditionedFileId::new(&db, fresh, Edition::Edition2021);
+    assert_eq!(fresh_id.parse(&db).syntax_node().text().to_string(), "fn b() { 2 }");
+    assert_eq!(reparsed(), start);
+
+    // Another edition's parse is not made from this one's.
+    let other = EditionedFileId::new(&db, file, Edition::Edition2018);
+    db.set_file_text(file, "fn f() { 3 }");
+    let start = reparsed();
+    let _ = other.parse(&db);
+    assert_eq!(reparsed(), start);
+}
+
+#[test]
+fn a_cache_hit_of_parse_allocates_nothing() {
+    let mut db = Db::for_tests();
+    let file = FileId::from_raw(0);
+    put_root(&mut db, 0, &[(file, "/a/lib.rs", include_str!("target.rs"))]);
+    let id = EditionedFileId::new(&db, file, Edition::Edition2021);
+    let _ = id.parse(&db);
+    db.set_file_text(file, &[include_str!("target.rs"), "\nfn added() {}\n"].concat());
+    let _ = id.parse(&db);
+    blaze_alloc_count::assert_at_most(0, "a cache hit of `parse` after a reparse", || {
+        id.parse(&db).is_outline()
+    });
 }

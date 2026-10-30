@@ -14,9 +14,11 @@ use rustc_hash::FxHashMap;
 
 use crate::section::Section;
 
-const MAGIC: [u8; 4] = *b"BZD1";
+const MAGIC: [u8; 4] = *b"BZD2";
 
-/// A restored column: `count` names sorted bytewise, each with its end in `names` and its stamp.
+/// A restored column: `count` names sorted bytewise, each with a NUL after it as [`Names`] lays
+/// names out (so a sweep of the whole column is one copy), its end past the NUL in `ends`, and
+/// its stamp.
 struct Base {
     section: Section,
     count: usize,
@@ -32,11 +34,22 @@ impl Base {
         u32::from_le_bytes(bytes[at..at + 4].try_into().expect("checked at open")) as usize
     }
 
+    fn start(&self, at: usize) -> usize {
+        if at == 0 { 0 } else { self.word(self.ends + (at - 1) * 4) }
+    }
+
     fn name(&self, at: usize) -> &str {
-        let start = if at == 0 { 0 } else { self.word(self.ends + (at - 1) * 4) };
-        let end = self.word(self.ends + at * 4);
-        let bytes = &self.section.bytes()[self.names + start..self.names + end];
+        let end = self.word(self.ends + at * 4) - 1;
+        let bytes = &self.section.bytes()[self.names + self.start(at)..self.names + end];
         std::str::from_utf8(bytes).expect("checked at open")
+    }
+
+    /// Every name, as [`Names`] keeps them: one copy of the column's bytes.
+    fn all(&self) -> Names {
+        let mut starts = Vec::with_capacity(self.count);
+        starts.extend((0..self.count).map(|at| self.start(at) as u32));
+        let len = self.start(self.count);
+        Names::from_checked(&self.section.bytes()[self.names..self.names + len], starts)
     }
 
     fn stamp(&self, at: usize) -> Stamp {
@@ -96,6 +109,7 @@ impl Disk {
 
     /// `name` and every name under it gone.
     pub(crate) fn remove_under(&mut self, name: &str) {
+        // alloc: per gone directory, its names under it.
         let mut gone = Vec::new();
         self.under(name, |it, _| gone.push(Box::<str>::from(it)));
         for it in gone {
@@ -110,6 +124,7 @@ impl Disk {
             it.strip_prefix(name).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
         };
         let mut changed: Vec<(&str, Stamp)> =
+            // alloc: what changed since the image under `name`, once per call.
             self.over.iter().filter(|(it, _)| within(it)).map(|(it, stamp)| (&**it, *stamp)).collect();
         changed.sort_unstable_by(|a, b| a.0.cmp(b.0));
         let mut changed = changed.into_iter().peekable();
@@ -164,6 +179,7 @@ impl Disk {
             }
         }
         let Some(base) = &self.base else { return };
+        // alloc: once per relisting.
         let prefix = format!("{dir}/");
         let mut skip = String::with_capacity(prefix.len() + 32);
         let mut at = base.find(&prefix).unwrap_or_else(|it| it);
@@ -188,9 +204,34 @@ impl Disk {
         }
     }
 
+    /// At most how many names, and bytes of them with their NULs, a sweep of the whole column
+    /// takes: its buffers are sized once.
+    pub(crate) fn size(&self) -> (usize, usize) {
+        let (count, bytes) = self.base.as_ref().map_or((0, 0), |base| match base.count {
+            0 => (0, 0),
+            count => (count, base.start(count)),
+        });
+        let over = self.over.keys().map(|it| it.len() + 1).sum::<usize>();
+        (count + self.over.len(), bytes + over)
+    }
+
     /// Every name seen at or under `name` into `names`, in name order, and its stamp into
-    /// `stamps`. Every name the column holds was checked as it was opened or set.
+    /// `stamps`. Every name the column holds was checked as it was opened or set. The whole
+    /// directory of a column with nothing changed since it was mapped (a restart's sweep) is
+    /// one copy of its names; any other sweep of the whole directory sizes its buffers once.
     pub(crate) fn sweep(&self, name: &str, names: &mut Names, stamps: &mut Vec<Stamp>) {
+        if name == self.dir.as_str() && names.is_empty() {
+            let (count, bytes) = self.size();
+            stamps.reserve_exact(count);
+            if let Some(base) = &self.base
+                && self.over.is_empty()
+            {
+                *names = base.all();
+                stamps.extend((0..base.count).map(|at| base.stamp(at)));
+                return;
+            }
+            *names = Names::with_capacity(count, bytes);
+        }
         self.under(name, |it, stamp| {
             names.push_checked(it);
             stamps.push(stamp);
@@ -212,8 +253,10 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) {
 impl Disks {
     /// The disk of `head` watching `dir`: kept if it watched `dir`, else a new one.
     pub(crate) fn of(&mut self, head: &str, dir: &FileName) -> &mut Disk {
+        // clone: once per head.
         let disk = self.by_head.entry(head.into()).or_insert_with(|| Disk::new(dir.clone()));
         if disk.dir != *dir {
+            // clone: once per head.
             *disk = Disk::new(dir.clone());
         }
         disk
@@ -225,12 +268,15 @@ impl Disks {
 
     /// The image's bytes of every disk: `MAGIC`, a count, then per disk (heads in name order)
     /// its head, its directory, its cursor, its root (a byte saying whether, then 32), its count
-    /// of names, its names' length, each name's end, each stamp, the names.
+    /// of names, its names' length, each name's end (past its NUL), each stamp, the names, each
+    /// with a NUL after it.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&MAGIC);
+        // alloc: once per image written.
         let mut heads: Vec<&Box<str>> = self.by_head.keys().collect();
         heads.sort_unstable();
         out.extend_from_slice(&(heads.len() as u32).to_le_bytes());
+        // alloc: once per image written, reused per disk.
         let (mut ends, mut stamps, mut names) = (Vec::new(), Vec::new(), Vec::new());
         for head in heads {
             let disk = &self.by_head[head];
@@ -243,6 +289,7 @@ impl Disks {
             let mut count = 0u32;
             disk.under(disk.dir.as_str(), |name, stamp| {
                 names.extend_from_slice(name.as_bytes());
+                names.push(0);
                 ends.extend_from_slice(&(names.len() as u32).to_le_bytes());
                 stamp.encode(&mut stamps);
                 count += 1;
@@ -259,6 +306,7 @@ impl Disks {
     /// once here (bounds, order, UTF-8), so reads after never fail.
     pub(crate) fn open(section: Section) -> Result<Disks, String> {
         let bytes = section.bytes();
+        // alloc: an error path.
         let bad = |what: &str| format!("the VFS image's disks section: {what}");
         if bytes.get(..4) != Some(&MAGIC[..]) {
             return Err(bad("no magic"));
@@ -295,16 +343,18 @@ impl Disks {
             if end > bytes.len() {
                 return Err(bad("cut short"));
             }
+            // clone: an `Arc` of the mapping, once per disk opened.
             let base = Base { section: section.clone(), count, ends, stamps, names };
             let mut last = 0;
             for n in 0..count {
                 let stop = base.word(ends + n * 4);
-                if stop < last || stop > names_len {
-                    return Err(bad("a name's end out of order"));
+                if stop <= last || stop > names_len || bytes[names + stop - 1] != 0 {
+                    return Err(bad("a name's end out of order or not after its NUL"));
                 }
-                let name = std::str::from_utf8(&bytes[names + last..names + stop])
+                let name = std::str::from_utf8(&bytes[names + last..names + stop - 1])
                     .map_err(|_| bad("a name that is not UTF-8"))?;
-                if FileName::new(name).is_none_or(|it| !it.is_under(&dir))
+                if name.contains('\0')
+                    || FileName::new(name).is_none_or(|it| !it.is_under(&dir))
                     || (n > 0 && base.name(n - 1) >= name)
                 {
                     return Err(bad("names out of order or outside the directory"));
@@ -371,6 +421,47 @@ mod tests {
         assert_eq!(names, want.map(|(it, n)| (it.to_owned(), n)));
         let disks = reopen(&disks);
         assert_eq!(all(&disks.by_head["main"], "w"), want.map(|(it, n)| (it.to_owned(), n)));
+    }
+
+    /// A restart's sweep of a mapped column is one copy of its names, and gives what the
+    /// merging walk gives, name for name and stamp for stamp; so does every sweep after a change.
+    #[test]
+    fn a_sweep_of_a_mapped_column_is_its_names_as_they_are() {
+        let mut disks = Disks::default();
+        let disk = disks.of("main", &name("w"));
+        // Bytewise order: `-` and `.` sort before `/`.
+        let names = ["w", "w/a", "w/a-b", "w/a.c", "w/a/x.rs", "w/b/c/d.rs", "w/z"];
+        for (n, it) in names.into_iter().enumerate() {
+            disk.set(it, stamp(n as u64 + 1));
+        }
+        let walked = |disk: &Disk, under: &str| {
+            let (mut names, mut stamps) = (Names::default(), Vec::new());
+            disk.under(under, |it, stamp| {
+                names.push_checked(it);
+                stamps.push(stamp);
+            });
+            (names, stamps)
+        };
+        let swept = |disk: &Disk, under: &str| {
+            let (mut names, mut stamps) = (Names::default(), Vec::new());
+            disk.sweep(under, &mut names, &mut stamps);
+            (names, stamps)
+        };
+        let mut disk = reopen(&disks).by_head.remove("main").unwrap();
+        assert!(disk.over.is_empty());
+        assert_eq!(disk.size(), (names.len(), names.iter().map(|it| it.len() + 1).sum()));
+        let whole = swept(&disk, "w");
+        assert_eq!(whole, walked(&disk, "w"));
+        assert_eq!(whole.0.iter().collect::<Vec<_>>(), names);
+        assert_eq!(swept(&disk, "w/a"), walked(&disk, "w/a"));
+        disk.set("w/a/new.rs", stamp(9));
+        disk.remove_under("w/b");
+        let changed = swept(&disk, "w");
+        assert_eq!(changed, walked(&disk, "w"));
+        assert!(changed.0.iter().any(|it| it == "w/a/new.rs"));
+        assert!(!changed.0.iter().any(|it| it.starts_with("w/b")));
+        let empty = reopen(&Disks::default());
+        assert!(empty.by_head.is_empty());
     }
 
     #[test]

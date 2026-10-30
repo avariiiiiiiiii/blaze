@@ -2,7 +2,7 @@
 //! consts.
 use std::ops;
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use hir_expand::{HirFileId, InFile, Lookup, span_map::SpanMap};
 use span::{AstIdMap, Edition, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
@@ -113,8 +113,7 @@ impl Body {
     /// [`Body::of`], with the same ids, but lowered again with the map.
     #[salsa::tracked(lru = 512, returns(ref))]
     pub fn with_source_map(
-        // dyn: salsa's database handle, as every query takes it
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: DefWithBodyId,
     ) -> (Arc<Body>, BodySourceMap) {
         let _p = tracing::info_span!("body_with_source_map_query").entered();
@@ -170,8 +169,7 @@ impl Body {
     /// blocks, and checked equal to it.
     #[salsa::tracked(lru = 4096, returns(ref))]
     pub fn relative(
-        // dyn: salsa's database handle, as every query takes it
-        db: &dyn SourceDatabase,
+        db: &Db,
         def: DefWithBodyId,
     ) -> Option<(Arc<Body>, BodySourceMap)> {
         let _p = tracing::info_span!("body_relative_query").entered();
@@ -188,8 +186,7 @@ impl Body {
     /// part of them is written, so their maps are built only when read: [`Body::relative`] and
     /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
     #[salsa::tracked(returns(deref))]
-    // dyn: salsa's database handle, as every query takes it
-    pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
+    pub fn of(db: &Db, def: DefWithBodyId) -> Arc<Body> {
         let _p = tracing::info_span!("body_query").entered();
         let body = match lower_relative(db, def, BodyLowering::Body) {
             Some((body, _)) => body,
@@ -209,8 +206,7 @@ impl Body {
 
     /// Where in its file the anchor of [`body_syntax`] begins, which the source map of
     /// [`Body::relative`] is relative to. `None` for a body a macro writes.
-    // dyn: salsa's database handle, as every query takes it
-    pub fn anchor_offset(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<TextSize> {
+    pub fn anchor_offset(db: &Db, def: DefWithBodyId) -> Option<TextSize> {
         let syntax = body_syntax(db, def).as_ref()?;
         Some(def_syntax(db, def).value.text_range().start() - syntax.item.text_range().start())
     }
@@ -219,8 +215,7 @@ impl Body {
     /// [`Body::with_source_map`] when there is not: for what needs of it only the file or the
     /// expansion each part is written in, and the macro calls, and not where in the file.
     /// It stays the same while edits elsewhere in the file move the body.
-    // dyn: salsa's database handle, as every query takes it
-    pub fn unmoved_source_map(db: &dyn SourceDatabase, def: DefWithBodyId) -> &BodySourceMap {
+    pub fn unmoved_source_map(db: &Db, def: DefWithBodyId) -> &BodySourceMap {
         match Self::relative(db, def) {
             Some((_, source_map)) => source_map,
             None => &Self::with_source_map(db, def).1,
@@ -229,8 +224,7 @@ impl Body {
 }
 
 /// The syntax of the item `def` is the body of.
-// dyn: salsa's database handle, as every query takes it
-fn def_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> InFile<SyntaxNode> {
+fn def_syntax(db: &Db, def: DefWithBodyId) -> InFile<SyntaxNode> {
     match def {
         // clone: a syntax node handle (a refcount), once per query
         DefWithBodyId::FunctionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
@@ -246,8 +240,7 @@ fn def_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> InFile<SyntaxNode>
 /// Lowers the body of `def` from [`body_syntax`], as `lowering` says. `None` when the body is
 /// not written in a file, but by a macro.
 fn lower_relative(
-    // dyn: salsa's database handle, as every query takes it
-    db: &dyn SourceDatabase,
+    db: &Db,
     def: DefWithBodyId,
     lowering: BodyLowering<'_>,
 ) -> Option<(Body, BodySourceMap)> {
@@ -285,8 +278,7 @@ fn lower_relative(
 /// Lowers the body of `def` from the whole file it is in, as `lowering` says. What a body
 /// written by a macro is lowered with, and what [`check_relative`] checks the others against.
 fn lower_in_file(
-    // dyn: salsa's database handle, as every query takes it
-    db: &dyn SourceDatabase,
+    db: &Db,
     def: DefWithBodyId,
     lowering: BodyLowering<'_>,
 ) -> (Body, BodySourceMap) {
@@ -404,8 +396,7 @@ impl std::fmt::Debug for BodySyntax {
 
 impl BodySyntax {
     /// The anchor as the root of a tree of its own.
-    // dyn: salsa's database handle, as every query takes it
-    pub fn root(&self, db: &dyn SourceDatabase) -> SyntaxNode {
+    pub fn root(&self, db: &Db) -> SyntaxNode {
         let kept = trees::get(self.tree).filter(|_| !check_relative());
         kept.unwrap_or_else(|| {
             let root = self.reparse().unwrap_or_else(|| self.from_file(db));
@@ -449,8 +440,7 @@ impl BodySyntax {
     }
 
     /// The anchor from the tree of its file, for one that parses differently alone.
-    // dyn: salsa's database handle, as every query takes it
-    fn from_file(&self, db: &dyn SourceDatabase) -> SyntaxNode {
+    fn from_file(&self, db: &Db) -> SyntaxNode {
         if check_relative() {
             eprintln!(
                 "{:?}: the anchor at {:?} parses differently alone",
@@ -481,8 +471,8 @@ fn holds_lazy(node: &SyntaxNode) -> bool {
 
 /// What the subtree of `node` is made of, as the root of a tree of its own, so that two trees
 /// made of the same are the same. A flat node's is read in place. Every body of a file runs
-/// this on each edit of the file, over its whole anchor (an `impl` or module), so it is one
-/// BLAKE3 pass, SIMD over many chunks for a large anchor.
+/// this on each edit of the file, over its whole anchor (an `impl` or module), so a large
+/// anchor's hash is the one its tree keeps, carried across an edit that doesn't change it.
 fn tree_hash(node: &SyntaxNode) -> u128 {
     let alone;
     let node = match node.flat() {
@@ -496,29 +486,10 @@ fn tree_hash(node: &SyntaxNode) -> u128 {
     subtree_hash(tree, at)
 }
 
-/// [`syntax::FlatTree::hash_subtree`] of `at` as 128 bits of BLAKE3: what a body's or a
-/// signature's tree is compared by.
+/// [`syntax::FlatTree::subtree_hash`] of `at`: what a body's or a signature's tree is compared
+/// by.
 pub(crate) fn subtree_hash(tree: &syntax::FlatTree, at: u32) -> u128 {
-    static TREE: blaze_ids::Domain = blaze_ids::Domain::new("blaze v2 hir-def body tree 1");
-    let mut hasher = Blake3(blaze_ids::Hasher::of(&TREE));
-    tree.hash_subtree(at, &mut hasher);
-    let id = hasher.0.finish();
-    u128::from_le_bytes(id.0[..16].try_into().expect("a BLAKE3 hash is 32 bytes"))
-}
-
-/// [`syntax::FlatTree::hash_subtree`]'s writes into BLAKE3. Its large writes (the text, the
-/// words) are whole slices, which BLAKE3 hashes many chunks at a time.
-struct Blake3(blaze_ids::Hasher);
-
-impl std::hash::Hasher for Blake3 {
-    fn write(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    fn finish(&self) -> u64 {
-        let id = self.0.finish();
-        u64::from_le_bytes(id.0[..8].try_into().expect("a BLAKE3 hash is 32 bytes"))
-    }
+    tree.subtree_hash(at)
 }
 
 /// `anchor` as the root of a tree of its own, with its [`tree_hash`]: the one kept among the
@@ -627,8 +598,7 @@ mod trees {
 
 /// The [`BodySyntax`] of a body written in a file, `None` for one a macro writes.
 #[salsa::tracked(returns(ref))]
-// dyn: salsa's database handle, as every query takes it
-pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySyntax> {
+pub fn body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
     let src = def_syntax(db, def);
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
     let item = src.value;
@@ -691,8 +661,7 @@ impl Body {
 
     pub fn pretty_print(
         &self,
-        // dyn: salsa's database handle, as every query takes it
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         edition: Edition,
     ) -> String {
@@ -701,8 +670,7 @@ impl Body {
 
     pub fn pretty_print_expr(
         &self,
-        // dyn: salsa's database handle, as every query takes it
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: DefWithBodyId,
         expr: ExprId,
         edition: Edition,
@@ -712,8 +680,7 @@ impl Body {
 
     pub fn pretty_print_pat(
         &self,
-        // dyn: salsa's database handle, as every query takes it
-        db: &dyn SourceDatabase,
+        db: &Db,
         owner: ExpressionStoreOwnerId,
         pat: PatId,
         oneline: bool,

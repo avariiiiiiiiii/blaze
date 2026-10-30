@@ -34,8 +34,8 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
-            PathLoweringDiagnostic,
+            ElidedLifetimeSite, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
+            MissingLifetimeKind, PathGenericsSource, PathLoweringDiagnostic,
         },
     },
     next_solver::{
@@ -386,7 +386,7 @@ impl ColdBatch {
 impl Persist for ColdBatch {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ColdBatch"),
-        Part::U64(1),
+        Part::U64(2),
         Part::Schema(<BatchRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ColdBatchRef<'a>;
@@ -786,16 +786,43 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             put_local(w, *source);
             put_path_diagnostic(w, diag);
         }
-        TyLoweringDiagnostic::InferVarsNotAllowed { source } => {
-            w.push(1);
-            put_span(w, *source);
+        TyLoweringDiagnostic::InferVarsNotAllowed { sources } => {
+            w.extend([1, sources.len() as u32]);
+            sources.iter().for_each(|&source| put_span(w, source));
+        }
+        TyLoweringDiagnostic::MissingLifetimes { sites, kind } => {
+            let kind = match kind {
+                MissingLifetimeKind::Missing => 0,
+                MissingLifetimeKind::ElisionFailure => 1,
+                MissingLifetimeKind::NotAllowed => 2,
+            };
+            w.extend([2, kind, sites.len() as u32]);
+            for site in sites {
+                match *site {
+                    ElidedLifetimeSite::Reference(it) => {
+                        w.push(0);
+                        put_local(w, it);
+                    }
+                    ElidedLifetimeSite::Placeholder(it) => {
+                        w.push(1);
+                        put_local(w, it);
+                    }
+                    ElidedLifetimeSite::Path { source, generics_source, def, expected_count } => {
+                        w.push(2);
+                        put_local(w, source);
+                        put_generics_source(w, generics_source);
+                        put_generic_def(w, def);
+                        w.push(expected_count);
+                    }
+                }
+            }
         }
     }
 }
 
 pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDiagnostic) {
     match *diagnostic {
-        PathLoweringDiagnostic::GenericArgsProhibited { segment, reason } => {
+        PathLoweringDiagnostic::GenericArgsProhibited { ref segments, reason } => {
             let reason = match reason {
                 GenericArgsProhibitedReason::Module => 0,
                 GenericArgsProhibitedReason::TyParam => 1,
@@ -806,7 +833,8 @@ pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDia
                 GenericArgsProhibitedReason::LocalVariable => 6,
                 GenericArgsProhibitedReason::EnumVariant => 7,
             };
-            w.extend([0, segment, reason]);
+            w.extend([0, reason, segments.len() as u32]);
+            w.extend_from_slice(segments);
         }
         PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment } => {
             w.extend([1, segment]);
@@ -862,6 +890,18 @@ pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDia
             w.push(expected_count);
         }
         PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment } => w.extend([7, segment]),
+        PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source, def, hard_error } => {
+            w.push(8);
+            put_generics_source(w, generics_source);
+            put_generic_def(w, def);
+            w.push(u32::from(hard_error));
+        }
+        PathLoweringDiagnostic::AmbiguousAssociatedItem { segment, variant, item, impl_ } => {
+            w.extend([9, segment]);
+            put_u64(w, id_bits(variant));
+            put_u64(w, id_bits(item));
+            put_u64(w, id_bits(impl_));
+        }
     }
 }
 
@@ -974,7 +1014,43 @@ impl Words<'_> {
                 source: self.local()?,
                 diag: self.path_diagnostic()?,
             },
-            1 => TyLoweringDiagnostic::InferVarsNotAllowed { source: self.span()? },
+            1 => {
+                let len = self.u32()? as usize;
+                if len > self.words.len() - self.next {
+                    return Err(self.invalid("more placeholders than words"));
+                }
+                // alloc: an error's sites.
+                let sources = (0..len).map(|_| self.span()).collect::<Result<_, _>>()?;
+                TyLoweringDiagnostic::InferVarsNotAllowed { sources }
+            }
+            2 => {
+                let kind = match self.u32()? {
+                    0 => MissingLifetimeKind::Missing,
+                    1 => MissingLifetimeKind::ElisionFailure,
+                    2 => MissingLifetimeKind::NotAllowed,
+                    _ => return Err(self.invalid("a missing lifetime of no kind")),
+                };
+                let len = self.u32()? as usize;
+                if len > self.words.len() - self.next {
+                    return Err(self.invalid("more elided lifetimes than words"));
+                }
+                // alloc: an error's sites.
+                let mut sites = Vec::with_capacity(len);
+                for _ in 0..len {
+                    sites.push(match self.u32()? {
+                        0 => ElidedLifetimeSite::Reference(self.local()?),
+                        1 => ElidedLifetimeSite::Placeholder(self.local()?),
+                        2 => ElidedLifetimeSite::Path {
+                            source: self.local()?,
+                            generics_source: self.generics_source()?,
+                            def: self.generic_def()?,
+                            expected_count: self.u32()?,
+                        },
+                        _ => return Err(self.invalid("an elided lifetime of no kind")),
+                    });
+                }
+                TyLoweringDiagnostic::MissingLifetimes { sites: sites.into_boxed_slice(), kind }
+            }
             _ => return Err(self.invalid("a lowering diagnostic of no kind")),
         })
     }
@@ -982,7 +1058,6 @@ impl Words<'_> {
     pub(crate) fn path_diagnostic(&mut self) -> Result<PathLoweringDiagnostic, FormatError> {
         Ok(match self.u32()? {
             0 => {
-                let segment = self.u32()?;
                 let reason = match self.u32()? {
                     0 => GenericArgsProhibitedReason::Module,
                     1 => GenericArgsProhibitedReason::TyParam,
@@ -994,7 +1069,13 @@ impl Words<'_> {
                     7 => GenericArgsProhibitedReason::EnumVariant,
                     _ => return Err(self.invalid("a prohibition of no reason")),
                 };
-                PathLoweringDiagnostic::GenericArgsProhibited { segment, reason }
+                let len = self.u32()? as usize;
+                if len > self.words.len() - self.next {
+                    return Err(self.invalid("more prohibited segments than words"));
+                }
+                // alloc: an error's segments.
+                let segments = (0..len).map(|_| self.u32()).collect::<Result<_, _>>()?;
+                PathLoweringDiagnostic::GenericArgsProhibited { segments, reason }
             }
             1 => PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait {
                 segment: self.u32()?,
@@ -1038,6 +1119,17 @@ impl Words<'_> {
                 expected_count: self.u32()?,
             },
             7 => PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment: self.u32()? },
+            8 => PathLoweringDiagnostic::LateBoundLifetimeArgs {
+                generics_source: self.generics_source()?,
+                def: self.generic_def()?,
+                hard_error: self.bool()?,
+            },
+            9 => PathLoweringDiagnostic::AmbiguousAssociatedItem {
+                segment: self.u32()?,
+                variant: EnumVariantId::from_id(self.id()?),
+                item: TypeAliasId::from_id(self.id()?),
+                impl_: ImplId::from_id(self.id()?),
+            },
             _ => return Err(self.invalid("a path diagnostic of no kind")),
         })
     }
@@ -1076,8 +1168,12 @@ mod tests {
         let assoc = PathGenericsSource::AssocType { segment: 2, assoc_type: 3 };
         vec![
             path(PathLoweringDiagnostic::GenericArgsProhibited {
-                segment: 4,
+                segments: Box::new([4]),
                 reason: GenericArgsProhibitedReason::EnumVariant,
+            }),
+            path(PathLoweringDiagnostic::GenericArgsProhibited {
+                segments: Box::new([0, 2, 3]),
+                reason: GenericArgsProhibitedReason::PrimitiveTy,
             }),
             path(PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment: 5 }),
             path(PathLoweringDiagnostic::IncorrectGenericsLen {
@@ -1115,10 +1211,45 @@ mod tests {
             path(PathLoweringDiagnostic::ElisionFailure { generics_source: assoc, def, expected_count: 1 }),
             path(PathLoweringDiagnostic::MissingLifetime { generics_source: segment, def: trait_def, expected_count: 3 }),
             path(PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment: 0 }),
-            TyLoweringDiagnostic::InferVarsNotAllowed { source: Span::TypeRefId(source) },
-            TyLoweringDiagnostic::InferVarsNotAllowed { source: Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))) },
-            TyLoweringDiagnostic::InferVarsNotAllowed { source: Span::Dummy },
+            path(PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source: assoc, def, hard_error: true }),
+            path(PathLoweringDiagnostic::LateBoundLifetimeArgs { generics_source: segment, def: adt, hard_error: false }),
+            path(PathLoweringDiagnostic::AmbiguousAssociatedItem {
+                segment: 1,
+                variant: EnumVariantId::from_id(id(13)),
+                item: TypeAliasId::from_id(id(14)),
+                impl_: ImplId::from_id(id(9)),
+            }),
+            TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
+            TyLoweringDiagnostic::InferVarsNotAllowed {
+                sources: Box::new([Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))), Span::TypeRefId(source)]),
+            },
+            TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::Dummy]) },
+            TyLoweringDiagnostic::MissingLifetimes {
+                sites: Box::new([ElidedLifetimeSite::Reference(source)]),
+                kind: MissingLifetimeKind::Missing,
+            },
+            TyLoweringDiagnostic::MissingLifetimes {
+                sites: Box::new([ElidedLifetimeSite::Placeholder(Idx::from_raw(RawIdx::from_u32(4)))]),
+                kind: MissingLifetimeKind::NotAllowed,
+            },
+            TyLoweringDiagnostic::MissingLifetimes {
+                sites: Box::new([
+                    ElidedLifetimeSite::Reference(source),
+                    ElidedLifetimeSite::Path { source, generics_source: assoc, def: adt, expected_count: 2 },
+                    ElidedLifetimeSite::Placeholder(Idx::from_raw(RawIdx::from_u32(0))),
+                ]),
+                kind: MissingLifetimeKind::ElisionFailure,
+            },
         ]
+    }
+
+    #[test]
+    fn a_missing_lifetimes_longer_than_its_words_is_refused() {
+        let mut words = Vec::new();
+        put_diagnostic(&mut words, every_diagnostic().last().unwrap());
+        words[2] = u32::MAX;
+        let mut read = Words { words: &words, next: 0, at: 0 };
+        assert!(read.diagnostic().is_err());
     }
 
     #[test]

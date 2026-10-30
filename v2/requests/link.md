@@ -744,6 +744,16 @@ Once these are in, `crates/blaze-live/Cargo.toml` can take `[lints] workspace = 
 
 > forwarded to link.
 
+> update (speed-link-edge, after speed-link-edge-live-safety finished): the runtime side of 2 and
+> 9 is now done in `crates/blaze-live`. v1 writes jumps only with every other thread stopped
+> (`linux/stop.rs`, `macos/stop.rs`, `windows/stop.rs`, through `apply::write_stopped`). That is
+> never while a pc is inside the bytes; after 20 retries the patch is declined naming the
+> function. `slots` data writes go through atomic `Writes::store`. `[lints] workspace = true` is
+> in. What still stands for link: a and b (they block as described); c only as "a fresh piece
+> rather than in-place" if the program-rule precondition is to go; d's atomic counter adds in the
+> daemon's counter code; and item 15 (the splice refuses a function with a branch target or
+> return address inside its jump's bytes). Report: `/tmp/blaze-lanes/v2-speed-link-edge-live-safety.md`.
+
 ## From safety-fuzz-link
 
 From `safety-fuzz-link` (child of `safety-fuzz`, lane `safety`), who wrote the fuzz targets of
@@ -1127,6 +1137,32 @@ Each refusal names the function (no-fallback). Once v1 moves onto `slots`, neith
     unsafe. blaze-live is speed-link-edge-live's.
 
 > written by lead link (2026-10-29).
+>
+> answered by speed-link-edge (2026-10-29 19:55):
+> - 13: already done in `macho/`. `macho/tbd/reference.rs` and `reference_trie_exports`,
+>   `Owned` and `test_sections` in `macho/dylib.rs` are `#[cfg(any(test, feature = "fuzz"))]`,
+>   and `tbd::differential` and `dylib::trie_differential` are `#[cfg(feature = "fuzz")]`,
+>   re-exported in `macho.rs` for `lib.rs`'s entries (applied by `requests-link-fuzz`).
+> - 14, bug 5's remaining form, in `macho/archive.rs`: the index entries sorted by offset are
+>   grouped by the string they end in. Of one string, every entry starting at a `_` is
+>   `Names::suffix` of the earliest such entry's core name: one push.
+>   An entry not starting at `_` has the core name `\x01` + its tail, which no other entry's name
+>   holds, so it is pushed alone. The arena is summed exactly first, and an archive whose names
+>   would exceed its own size plus one byte per entry is refused before allocating, with an error
+>   naming the archive. No `ranlib` writes that. The fuzz seed `suffixes_of_one_string` (offsets
+>   1 to 639 start at `a`) is that case, so it is refused; `one_name_many_times` reads with one push.
+>   Tests: `offsets_at_underscores_inside_a_string_are_suffixes_of_its_name`,
+>   `offsets_inside_a_string_name_what_each_names_alone` (every start offset of a mixed string
+>   against each name read alone, and the exact arena size) and
+>   `many_offsets_without_underscores_inside_one_string_are_refused`.
+>   To accept even that case in linear memory needs a `Name` that reads as `\x01` + an arena
+>   suffix (for example one bit of `len`). That is a `model.rs` change, proposed and not needed
+>   for any real archive.
+> - "elf/read.rs is not yet on the zero-copy reader contract": it is now.
+>   `speed-link-edge-elf-input` did "### ELF" items 1-9 (report
+>   `/tmp/blaze-lanes/v2-speed-link-edge-elf-input.md`), and `elf/read/strings.rs` already uses
+>   `Names::suffix` for tail-merged `.strtab`s.
+>
 > forwarded: the `fuzz/Cargo.toml` feature to safety-fuzz (window `safety-fuzz-next1`, told by tmux). The reference move and the two entries (item 13; link and speed-link-edge-macho are DONE) are taken by requests, child `requests-link-fuzz`.
 
 ## From safety-fuzz (2026-10-29): drop SanitizerCoverage's entries of the functions the link drops
@@ -1146,3 +1182,662 @@ target linking std, salsa and hir-def, most of the instrumented functions are de
 Keeping them would multiply N, and the engine's time per run with it, and once N outgrows L2
 each scan goes to L3 at half the bandwidth. This is speed, not soundness: the features come out
 the same either way.
+
+> taken by requests (link is DONE): child `requests-link-sancov`; the outcome follows.
+>
+> applied by requests (child requests-link-sancov): a section tied to another is kept exactly
+> when that one is, is no root, and no `__start_X` keeps it; for every section with the flag,
+> not only SanitizerCoverage's. Model: `Tie` and `Object::ties`/`Object::live_support` in
+> `model.rs`. Readers: ELF `SHF_LINK_ORDER` to `sh_link` (`elf/read.rs`), Mach-O
+> `S_ATTR_LIVE_SUPPORT` atoms (`macho/input.rs`), COFF associative COMDATs to their parent
+> (`pe/coff.rs`). Collection in `native.rs`: the marker keeps a section's tied sections with it,
+> a lost COMDAT group drops what is tied to its sections, and Mach-O live support is kept once
+> something it refers to is (ld64 `dontDeadStripIfReferencesLive`). `SHF_LINK_ORDER` pieces are
+> placed in the order of the sections they are tied to (`piece.order`), so `__sancov_cntrs` and
+> `__sancov_pcs` stay one entry each per kept function, in the same order. Tests:
+> `native/ties_tests.rs` (collection, every format's rule), `tests/ties.rs` (a full ELF link),
+> `macho/input.rs` and `pe/tests.rs` (the readers).
+
+## 18. From speed-link-edge-elf-input: `Names::reserve` (`model.rs`)
+
+- **What:** in `crates/blaze-link/src/model.rs`, `impl Names`, add
+  `pub fn reserve(&mut self, bytes: usize) { self.0.reserve(bytes) }`.
+- **Where it is used:** `elf/read/archive.rs`, the path for an archive without a symbol table
+  (lld's). The members' names are pushed first. Then each member's `.strtab` sizes become known
+  (after the parallel `defined` pass), and the arena could be reserved once for all of them.
+- **Why:** without it, that one path grows the arena by doubling (log *n* reallocations and
+  copies). Every other ELF reader path sizes its arena once, with `Names::with_capacity`. The
+  Mach-O and PE archive readers have the same shape. Nothing else changes; the ELF reader will
+  call it once this lands.
+
+> applied by requests (link is DONE): `Names::reserve(&mut self, bytes)` in `model.rs` beside `with_capacity`.
+
+> safety-fuzz (2026-10-29): item 13 taken up. `fuzz/Cargo.toml` turns the `fuzz` feature on;
+> `link_macho_tbd` runs `fuzz_tbd_differential` on every UTF-8 input for both arches and
+> platforms 1, 2 and 6, and `link_macho_trie` runs `fuzz_trie_differential` on every trie,
+> each `Err` a crash. Their tests assert the named seeds and `sample_trie` give `Ok(true)`.
+> Nothing compiled here.
+
+## 19. From speed-link-edge-sol-link: what the ELF and Mach-O writers' speed of light needs from the core (2026-10-29)
+
+For whoever holds the core now (`requests-link-fuzz-core-model-next1`: `model.rs`, `native.rs`,
+`state.rs`; `requests-link-fuzz-core-stage`: `file.rs`, `stage.rs`, `write.rs`). The bounds and
+arithmetic are in `docs/v2/plan/lanes/link/speed-of-light.md`, "ELF writer and readers" and
+"Mach-O writer and readers". Each item is independent. None changes a byte of any output.
+
+1. **Diff a writer's part by block, as synthetic regions are** (`file.rs` `Stage::dirty`). Today
+   a part whose bytes differ at all is rewritten whole: ELF's tail (`.symtab`, `.strtab`, the
+   section headers) and Mach-O's `__LINKEDIT` on every relink that renames or moves a function,
+   which is O(symbol table) bytes written where O(change) differ. Replace the loop over
+   `self.new.parts` with:
+   ```rust
+   for (offset, bytes) in self.new.parts.iter() {
+       let old = old_parts.binary_search_by_key(offset, |it| it.0).ok().map(|at| old_parts[at].1);
+       match old {
+           Some(old) if old == &bytes[..] => {}
+           Some(old) => {
+               for start in (0..bytes.len()).step_by(BLOCK) {
+                   let end = (start + BLOCK).min(bytes.len());
+                   if old.get(start..end) != Some(&bytes[start..end]) {
+                       ranges.push((offset + start as u64, (end - start) as u64));
+                   }
+               }
+           }
+           None => ranges.push((*offset, bytes.len() as u64)),
+       }
+   }
+   ```
+   With it, Mach-O's signature can be one part instead of one `Vec` per 4 KiB page (the
+   `macho.rs` edit is filed in `v2/requests/requests-link-fuzz.md`, item A3).
+
+2. **Debug sections laid out by the core, not copied by the writer** (`model.rs` `File`,
+   `file.rs` `Layout`/`dirty`/`whole`). `File::parts` owns its bytes, so both writers copy every
+   debug section once per link (ELF into the tail, now one part per section; Mach-O into the
+   `__DWARF` part): for a debug build of a large binary 200 MB to 1 GB, 20 to 100 ms on one core,
+   where the bound is 0. Add `pub debug: Vec<(u64, usize)>` to `File`: (file offset, index into
+   `Placed::debug`), laid by the core from the debug sections it made, compared by block with the
+   last link's as item 1 does. The writers then push `(offset, nth)` instead of a copy: in
+   `elf/image.rs` `file`, the loop that builds `copied(data)` parts; in `macho.rs` `image`, the
+   `dwarf` buffer (the signature's `View` borrows `placed.debug[nth].1` directly).
+
+3. **Native inputs shared, not copied** (`output.rs` `Native`, `native.rs` `Stage::inputs`
+   line ~1664). `Input::bytes: native.bytes.into()` copies every new native input into an
+   `Arc<[u8]>`: 50 MB of C archives is 5 ms on one core at page-cache copy speed, on the first
+   link and on every link that adds the input. Make `Native::bytes` an `Arc<[u8]>` (the caller
+   holds the store's bytes already) and take `native.bytes.clone()` (a count) there; `Writer::read`
+   keeps taking `&[u8]`.
+
+4. **Name a pulled member only on error** (`native.rs` `read_misses`, ~line 1781). Each member
+   read makes `format!("{}({})", ..)`, one `String` per member (2,000 members of a C archive, 2,000
+   allocations per pull). The readers use `name` only in errors for objects, so pass the input's
+   name and build `archive(member)` in the `map_err` closures only.
+
+5. **What changed since the writer's last synthesis** (`model.rs` `Placed`, `write.rs`). The
+   writers are pure functions of `Placed`, so every relink rebuilds `.rela.dyn` (24 bytes per slid
+   address), `.symtab`/`.strtab`, `.eh_frame_hdr`, Mach-O's rebase opcodes, symbol table,
+   function starts, `__unwind_info` and compares every page for the signature: O(image) work
+   where the edit changed O(1) entries. `write.rs` already splices each list by one merge, so it
+   knows the change. Add
+   ```rust
+   /// One run of a `Placed` list replaced since the last link: `old` in the last link's list,
+   /// `new` in this one's.
+   #[derive(Clone, Copy, Debug)]
+   pub(crate) struct Splice { pub old: Range<u32>, pub new: Range<u32> }
+
+   /// What changed since the last `synthesize` of this image, when the core knows it.
+   pub(crate) struct Delta<'a> {
+       pub functions: &'a [Splice],
+       pub rebase: &'a [Splice],
+       pub got: &'a [Splice],
+       pub binds: &'a [Splice],
+       /// `imports`, `exports` and `libraries` are the last link's (the same `Arc`s).
+       pub same_names: bool,
+       /// No region moved or changed size.
+       pub same_regions: bool,
+       /// Address ranges of the regions the core wrote since the last link.
+       pub written: &'a [(u64, u64)],
+   }
+   ```
+   and `Placed::delta: Option<&'a Delta<'a>>`: `None` on a full link. Each writer keeps its
+   last tables (as `MachO::cache` keeps the signature's pages) and, when `delta` is `Some` and
+   `same_regions`, patches them: a splice of equal length rewrites only its entries in place
+   (`.rela.dyn`, `.symtab`, `.eh_frame_hdr`, `__unwind_info`'s entries), `same_names` keeps
+   `.dynsym`/`.gnu.hash`/`.dynstr`/the trie/binds whole, and the signature hashes only the pages
+   `written` touches plus the pages of the headers and `__LINKEDIT` that differ. An edit's
+   synthesis is then O(splices + pages written), the bound.
+
+> Told by tmux: requests-link-fuzz-core-model-next1, requests-link-fuzz-core-stage.
+> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+
+## dedup: `blaze-link`'s `align_up` and bump arena onto blaze-mem (from dedup-mem)
+
+`blaze-link` already depends on `blaze-mem`. Holders: `place.rs`, `reloc.rs`, `stage.rs`,
+`lib.rs` (requests-link-fuzz-core-*), `pe/image.rs` (requests-link-fuzz-pe); mem-backend-link
+moves the crate onto blaze-mem and can apply these with its own changes.
+
+1. `crates/blaze-link/src/reloc.rs:228-231`: delete
+   `pub(crate) fn align_up(value: u64, align: u64) -> u64 { debug_assert!(align.is_power_of_two()); (value + align - 1) & !(align - 1) }`.
+   Its uses at lines 223-224 become `align_up_u64(tls.size, align)` and `align_up_u64(16, align)`,
+   with `use blaze_mem::align::align_up_u64;` at the top of `reloc.rs`.
+2. `crates/blaze-link/src/place.rs:25`: `use crate::reloc::align_up;` becomes
+   `use blaze_mem::align::align_up_u64;`, and each `align_up(` in `place.rs` (lines 359, 444,
+   453, 463, 464, 467, 470, 558, 633) becomes `align_up_u64(` (same `u64` arguments: `Region`'s
+   `addr`/`size`, `Plan::page`, `PieceRef::align()` are all `u64`). Same instructions: one add
+   and one mask; a runtime alignment here would be a division with `next_multiple_of`.
+3. `crates/blaze-link/src/pe/image.rs:704-706`: `fn page_of(addr: u64) -> u64 { addr & !(PAGE - 1) }`
+   body becomes `blaze_mem::align::align_down_u64(addr, PAGE)` (or its callers call that and
+   `page_of` goes).
+4. The `bumpalo::Bump` reset per stage (`lib.rs:143,185,205`, `stage.rs:20-21,75,1378`,
+   `place.rs:18,297`, `file.rs:16`, `live.rs:12`, `write.rs:23`, `native.rs:1717`,
+   `state.rs:299`) is a copy of `blaze_mem::Arena` (request arena, `reset(&mut self)`,
+   `ArenaLocal` implements `Allocator`, so `BumpVec<'a, T>` is `Vec<T, &'a ArenaLocal<'a>>` and
+   `bump.alloc_slice_copy` is `local.alloc_slice_copy`), tagged `Tag::Link`. Once no user is
+   left, drop `bumpalo` from `crates/blaze-link/Cargo.toml` and from `crates/hir-ty-codegen/Cargo.toml`
+   (it is listed there and used nowhere in that crate's sources), and the root's `bumpalo`
+   (coordinator).
+
+Why: one implementation per primitive (docs/v2/plan/lanes/dedup.md: `align_up` and friends,
+arenas: `blaze-mem`). The test that held `reloc::align_up` now lives in
+`crates/blaze-mem/src/align/tests.rs` (the copy kept there as the reference).
+
+Status: open
+
+> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+
+## 19. From speed-link-edge-sol-live: a patch writes no read-only page of the image (`place.rs`, `live.rs`)
+
+Status: open, does not block. For lead `link`. See "The live runtime" in
+`docs/v2/plan/lanes/link/speed-of-light.md`.
+
+What a patch writes on Linux, by class: `Class::Patch` goes through the runtime's RW alias of
+the patch code region (0 system calls, 0 TLB shootdowns), `PatchData`, `Data` and `Table` are in
+writable pages (0). But a patch that adds functions also adds FDEs (`EhFrame`) and usually new
+literals (`Rodata`), and sometimes `RelRo`/`Got` words, and those regions are in read-only
+segments: each run of such pages costs the runtime 2 `mprotect` calls and, for the one that takes
+write away, a TLB shootdown on every core running the program (about 0.5 µs + 2 µs per other
+core, per run, per patch). On macOS each such run is a 4-trap page swap with a copy of whole
+16 KiB pages and a shootdown. On a one-function edit that is most of what the apply costs after
+the message read.
+
+1. When a stage is a patch (not `self.full`), place the *new* pieces of read-only classes
+   (`EhFrame`, `Rodata`, and new `RelRo` pieces) in `Class::Patch`, right after the patch's
+   code, and new writable ones in `Class::PatchData`, instead of in their classes' reserves.
+   `Class::Patch` is readable, and on Linux it is mapped from a memory file the runtime writes
+   through a second, writable mapping, so these bytes cost no system call; on macOS they share
+   the code's one page swap per merged run. FDEs read by the unwinder from there are fine:
+   `__register_frame` takes any mapped address.
+2. That also answers item 12 b: each patch's FDE run gets its own zero terminator, placed after
+   its last FDE in the patch code region, in bytes no earlier run ends in.
+3. What stays in place: a word of an existing `RelRo`/`Got` piece the patch changes. In a
+   jump-table image calls go through the stubs, whose cells never move, so these are rare; each
+   is still one `mprotect` pair per run on Linux.
+
+With 1, a one-function edit on Linux is: the message read (`openat`, `statx`, one `read`,
+`close`), 0 system calls for code and data, the cell's release store, and the answer
+(`openat`, `write`, `close`, `rename`), which is the bound of the live runtime section.
+
+> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+
+## 20. From speed-link-edge-sol-live: move v1's users onto `slots` (blaze-engine, `demo/`, `harness/live*`)
+
+Status: open, does not block. For lead `link` (the daemon's live loop in blaze-engine and
+blaze-splice) and the owners of `demo/life`, `demo/lifebench` and `harness/live*`.
+
+v1 (`blaze_live::Live`) writes a jump over each replaced function's entry, so it has to stop
+every other thread for each patch (`apply::write_stopped`): per thread, a `tgkill`, a signal
+delivery, a futex wait and wake, a `cpuid` (a VM exit under a hypervisor) and a `sigreturn`,
+plus two listings of `/proc/self/task` and a read of `/proc/self/maps`, about 3 to 10 µs of the
+patching thread's time per other thread and up to 20 rounds 500 µs apart while a thread sits
+inside the bytes. `blaze_live::slots::Live` stops no thread: the switch is one release store of
+the table cell. Item 15's two blind spots (a branch target or a return address inside the
+bytes a jump covers) don't exist there.
+
+What `slots::Live` lacked against v1 is now in it (speed-link-edge-sol-live, 2026-10-29): the
+macOS sampler that tiering reads (`sample::start`), the directory `blaze_live::tiers()` reads,
+and `apply_as_they_come`. What is left is outside `crates/blaze-live`:
+1. The daemon's live loop links live programs with blaze-link's jump table (`Output::live`)
+   and writes `blaze_live::patch::Message`s (contract change 8), as `blaze-link`'s `live.rs`
+   already encodes them, instead of v1's spliced patches.
+2. `demo/life/src/window.rs`, `demo/lifebench/src/main.rs:128`, `harness/live/src/main.rs:33`,
+   `harness/live-alloc/src/main.rs:70`, `harness/live-types/src/main.rs:80`,
+   `harness/live-bevy/src/main.rs:558`, `harness/live-egui/src/main.rs:544`: `blaze_live::Live`
+   becomes `blaze_live::slots::Live`, and `Outcome::Applied { sequence, took, waited, .. }`
+   becomes `slots::Outcome::Applied { generation, functions, statics }` (the program can time
+   `poll` itself). `Live::guard` is new and optional.
+3. Then v1 goes: `crates/blaze-live/src/{linux,macos,windows,apply}.rs`, `apply/tests.rs`, the
+   three `stop.rs` and v1's part of `format.rs`, and `lib.rs`'s `Live` (blaze-live's owner
+   removes them once 1 and 2 are in; nothing else in the workspace uses them).
+
+> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+
+## dedup: blaze-live's code mappings stay its own (a comment only)
+
+From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). blaze-live maps code itself
+(`src/linux.rs` `Live::map`, `src/slots/linux.rs` `map_twice`, `src/macos.rs`, `src/slots/macos.rs`
+`swap`, `src/windows.rs`, `src/slots/windows.rs`). These differ on purpose from blaze-inproc's
+`sys::View` and from `blaze_core::fs::Mapped`: blaze-live is linked into the user's program with no
+dependencies at all, and it replaces code under running threads in place (`MAP_FIXED` into its
+reserved room, `mremap` over a live region, `mach_vm_remap` swaps). One request, so the next reader
+sees why: above `fn map_twice` in `crates/blaze-live/src/slots/linux.rs`, add
+
+    // Not blaze-inproc's `View`: this crate links into the program with no dependencies, and
+    // the region it maps over is live code that threads may be running.
+
+Status: open
+
+## dedup: bits: blaze-link the linker's bit sets onto `blaze_ids::bits`
+
+From `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). Five hand-rolled bit
+sets of `blaze-link` move onto `blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`), or, for the
+copy-on-write one, keep their storage under a name that is not a bit-set name and use its
+indexing. `blaze-ids` is already a dependency of the crate; no `Cargo.toml` change. Nothing
+here is persisted or hashed; members, iteration order and panics are the same.
+
+### 1. `crates/blaze-link/src/native.rs`: `Bits` over `CowVec<u64>` kept, renamed `CowFlags`
+
+Its words are a `CowVec`'s chunks, shared with the state a stage was cloned from and copied on
+write a chunk at a time, not one slice, so it can't be `blaze_ids::bits` storage. It keeps its
+two methods and takes `locate` for the index math.
+
+Imports (line 37), before / after:
+
+```rust
+use blaze_ids::radix;
+```
+
+```rust
+use blaze_ids::{bits::locate, radix};
+```
+
+The definition (lines 109-135), before:
+
+```rust
+/// A bitset, copied on write by chunk: a stage that marks a few more sections copies the
+/// words it writes.
+#[derive(Clone, Default)]
+pub(crate) struct Bits(CowVec<u64>);
+
+impl Bits {
+    #[inline]
+    fn get(&self, at: usize) -> bool {
+        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
+    }
+
+    /// Sets the bit; whether it was clear.
+    fn set(&mut self, at: usize) -> bool {
+        let (word, bit) = (at / 64, 1u64 << (at % 64));
+        match self.0.get(word) {
+            Some(it) if it & bit != 0 => false,
+            Some(_) => {
+                *self.0.get_mut(word).expect("in range") |= bit;
+                true
+            }
+            None => {
+                self.0.set(word, bit, || 0);
+                true
+            }
+        }
+    }
+}
+```
+
+after:
+
+```rust
+/// Flags by flat index, a bit each, copied on write by chunk: a stage that marks a few more
+/// sections copies the words it writes. Not a `blaze_ids::bits` set, whose words are one
+/// slice: these are a [`CowVec`]'s chunks, shared with the states the stage was cloned from.
+#[derive(Clone, Default)]
+pub(crate) struct CowFlags(CowVec<u64>);
+
+impl CowFlags {
+    #[inline]
+    fn get(&self, at: usize) -> bool {
+        let (word, mask) = locate(at);
+        self.0.get(word).is_some_and(|it| it & mask != 0)
+    }
+
+    /// Sets the flag; whether it was clear.
+    fn set(&mut self, at: usize) -> bool {
+        let (word, mask) = locate(at);
+        match self.0.get(word) {
+            Some(it) if it & mask != 0 => false,
+            Some(_) => {
+                *self.0.get_mut(word).expect("in range") |= mask;
+                true
+            }
+            None => {
+                self.0.set(word, mask, || 0);
+                true
+            }
+        }
+    }
+}
+```
+
+Every other `Bits` in the file becomes `CowFlags`: the fields `discarded: Bits,` (line 867),
+`listed: Bits,` (1148), `sections: Bits,`, `frames: Bits,`, `named: Bits,` (`Marks`, 1198-1201),
+and `Bits::default()` at lines 902, 2765, 3068 and in the test
+`bits_set_once_across_words_and_copies` (3180), which stays as it is otherwise.
+
+### 2. `crates/blaze-link/src/cow.rs`: `IdSet`'s two bit columns become `BitSet<u32>`
+
+`IdSet` keeps its list of first-added members and its count; `bits` and `listed` were two
+`Vec<u64>`s grown together to the word of the largest id inserted, which `insert_growing`
+does for each.
+
+Imports, before / after:
+
+```rust
+use blaze_ids::radix;
+```
+
+```rust
+use blaze_ids::{bits::BitSet, radix};
+```
+
+Before (the struct and its first three methods, lines 216-262):
+
+```rust
+#[derive(Default, Debug)]
+pub(crate) struct IdSet {
+    bits: Vec<u64>,
+    listed: Vec<u64>,
+    list: Vec<u32>,
+    len: usize,
+}
+
+impl IdSet {
+    #[inline]
+    pub fn contains(&self, id: u32) -> bool {
+        let (word, bit) = (id as usize / 64, id % 64);
+        self.bits.get(word).is_some_and(|it| it & (1 << bit) != 0)
+    }
+
+    pub fn insert(&mut self, id: u32) -> bool {
+        let (word, bit) = (id as usize / 64, id % 64);
+        if self.bits.len() <= word {
+            self.bits.resize(word + 1, 0);
+            self.listed.resize(word + 1, 0);
+        }
+        if self.bits[word] & (1 << bit) != 0 {
+            return false;
+        }
+        self.bits[word] |= 1 << bit;
+        self.len += 1;
+        if self.listed[word] & (1 << bit) == 0 {
+            self.listed[word] |= 1 << bit;
+            self.list.push(id);
+        }
+        true
+    }
+
+    pub fn remove(&mut self, id: u32) -> bool {
+        let (word, bit) = (id as usize / 64, id % 64);
+        match self.bits.get_mut(word) {
+            Some(it) if *it & (1 << bit) != 0 => {
+                *it &= !(1 << bit);
+                self.len -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+```
+
+after:
+
+```rust
+#[derive(Default, Debug)]
+pub(crate) struct IdSet {
+    bits: BitSet<u32>,
+    /// Every id ever in `list`, so one removed and added again is not listed twice.
+    listed: BitSet<u32>,
+    list: Vec<u32>,
+    len: usize,
+}
+
+impl IdSet {
+    #[inline]
+    pub fn contains(&self, id: u32) -> bool {
+        self.bits.contains(id)
+    }
+
+    pub fn insert(&mut self, id: u32) -> bool {
+        if !self.bits.insert_growing(id) {
+            return false;
+        }
+        self.len += 1;
+        if self.listed.insert_growing(id) {
+            self.list.push(id);
+        }
+        true
+    }
+
+    pub fn remove(&mut self, id: u32) -> bool {
+        let gone = self.bits.remove(id);
+        self.len -= usize::from(gone);
+        gone
+    }
+```
+
+(The rest of `IdSet`, `SymSet` and the test `id_sets_iterate_members_once_in_order` are
+unchanged. `Debug` of an `IdSet` now shows the members rather than words; nothing reads it.)
+
+### 3. `crates/blaze-link/src/commit.rs`: `Pending::done` becomes a `BitSet`
+
+Imports, before / after:
+
+```rust
+use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_live::patch::message_file;
+```
+
+```rust
+use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_ids::bits::BitSet;
+use blaze_live::patch::message_file;
+```
+
+The field (line 56):
+
+```rust
+    done: Vec<u64>,
+```
+
+```rust
+    done: BitSet,
+```
+
+In `begin` (line 155), the buffer reserved once for the largest step, before / after:
+
+```rust
+            done: Vec::with_capacity(most.div_ceil(64)),
+```
+
+```rust
+            done: BitSet::from_words(Vec::with_capacity(most.div_ceil(64))),
+```
+
+In `next_step` (lines 169-170), the buffer kept:
+
+```rust
+        pending.done.clear();
+        pending.done.resize((count as usize).div_ceil(64), 0);
+```
+
+```rust
+        pending.done.reset(count as usize);
+```
+
+In `in_flight` (line 192), `at` below `pending.count`, the size `reset` gave:
+
+```rust
+        (pending.done[at / 64] & (1 << (at % 64)) == 0).then_some(at)
+```
+
+```rust
+        (!pending.done.contains(at)).then_some(at)
+```
+
+In `complete` (line 206):
+
+```rust
+        pending.done[at / 64] |= 1 << (at % 64);
+```
+
+```rust
+        pending.done.insert(at);
+```
+
+### 4. `crates/blaze-link/src/macho/dylib.rs`: `trie_exports`' `seen` becomes a `BitSet`
+
+Imports, before / after:
+
+```rust
+use blaze_ids::radix;
+```
+
+```rust
+use blaze_ids::{bits::BitSet, radix};
+```
+
+Before (lines 293 and 297-303):
+
+```rust
+    let mut seen = vec![0u64; data.len().div_ceil(64)]; // alloc: one bitset per trie, sized exactly
+```
+
+```rust
+        let (word, bit) = (node / 64, 1u64 << (node % 64));
+        if seen[word] & bit != 0 {
+            // alloc: error path
+            return Err(format!("node {node:#x} is reached twice (a cycle)"));
+        }
+        seen[word] |= bit;
+```
+
+after (`insert` panics past the capacity as the indexing did, for an empty trie's node 0):
+
+```rust
+    let mut seen = BitSet::<usize>::new(data.len()); // alloc: one bitset per trie, sized exactly
+```
+
+```rust
+        if !seen.insert(node) {
+            // alloc: error path
+            return Err(format!("node {node:#x} is reached twice (a cycle)"));
+        }
+```
+
+### 5. `crates/blaze-link/src/elf/read/strings.rs`: the NUL bitset's scans and rank
+
+The table keeps its two columns (`nuls` and the per-word counts `before`, made in the one pass
+over the bytes that finds the NULs, which is why it is not a `Ranked`, whose counts are a
+second pass); `nuls` becomes a `BitSet` and its three hand-written scans become `first_in`,
+`last_in` and `rank_in`.
+
+Imports, before / after:
+
+```rust
+use std::fmt;
+
+use crate::model::{Name, Names};
+```
+
+```rust
+use std::fmt;
+
+use blaze_ids::bits::{BitSet, rank_in};
+
+use crate::model::{Name, Names};
+```
+
+The fields (lines 23-26), before / after:
+
+```rust
+    /// Bit `i % 64` of word `i / 64`: whether byte `i` is a NUL. 1 bit per byte.
+    nuls: Vec<u64>,
+    /// The NULs before each word of `nuls`: 4 bytes per 64 bytes of table.
+    before: Vec<u32>,
+```
+
+```rust
+    /// Whether byte `i` is a NUL. 1 bit per byte.
+    nuls: BitSet,
+    /// The NULs before each word of `nuls` (`blaze_ids::bits::ranks_of`'s counts, made in the
+    /// pass that finds the NULs): 4 bytes per 64 bytes of table.
+    before: Vec<u32>,
+```
+
+In `Table::new` (line 54), before / after:
+
+```rust
+            nuls,
+```
+
+```rust
+            nuls: BitSet::from_words(nuls),
+```
+
+`next_nul`, `previous_nul` and `rank` (lines 115-149), before:
+
+```rust
+    /// The first NUL at or after `at`.
+    fn next_nul(&self, at: usize) -> Option<usize> {
+        if at >= self.bytes.len() {
+            return None;
+        }
+        let mut word = at / 64;
+        let mut bits = self.nuls[word] & (!0u64 << (at % 64));
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + bits.trailing_zeros() as usize);
+            }
+            word += 1;
+            bits = *self.nuls.get(word)?;
+        }
+    }
+
+    /// The last NUL before `at`, which is inside the table.
+    fn previous_nul(&self, at: usize) -> Option<usize> {
+        let mut word = at / 64;
+        let mut bits = self.nuls[word] & ((1u64 << (at % 64)) - 1);
+        loop {
+            if bits != 0 {
+                return Some(word * 64 + 63 - bits.leading_zeros() as usize);
+            }
+            word = word.checked_sub(1)?;
+            bits = self.nuls[word];
+        }
+    }
+
+    /// How many NULs come before the one at `nul`.
+    fn rank(&self, nul: usize) -> usize {
+        let word = nul / 64;
+        let below = self.nuls[word] & ((1u64 << (nul % 64)) - 1);
+        self.before[word] as usize + below.count_ones() as usize
+    }
+```
+
+after:
+
+```rust
+    /// The first NUL at or after `at`.
+    fn next_nul(&self, at: usize) -> Option<usize> {
+        self.nuls.first_in(at..self.bytes.len())
+    }
+
+    /// The last NUL before `at`, which is inside the table.
+    fn previous_nul(&self, at: usize) -> Option<usize> {
+        self.nuls.last_in(0..at)
+    }
+
+    /// How many NULs come before the one at `nul`.
+    fn rank(&self, nul: usize) -> usize {
+        rank_in(self.nuls.words(), &self.before, nul)
+    }
+```
+
+(`first_in` and `last_in` scan a word at a time as these did; the bits past the table's last
+byte are zero, as `nul_mask` leaves them.)

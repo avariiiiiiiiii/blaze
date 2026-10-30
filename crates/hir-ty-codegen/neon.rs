@@ -1337,16 +1337,11 @@ aarch64.neon.facgt.i32.f16: facgt h0, h1, h2 [\"neon\", \"fp16\"]
     /// half is lanes `2i` and `2i + 1` of `a`, of the second half those of `b`.
     #[test]
     fn unzipped_lanes_are_pairwise() {
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for _ in 0..500 {
-            let a: [u8; 16] = std::array::from_fn(|_| next());
-            let b: [u8; 16] = std::array::from_fn(|_| next());
+            let (mut a, mut b) = ([0u8; 16], [0u8; 16]);
+            rng.fill(&mut a);
+            rng.fill(&mut b);
             let both: Vec<u8> = a.iter().chain(&b).copied().collect();
             for lane in [1u8, 2, 4] {
                 let l = lane as usize;

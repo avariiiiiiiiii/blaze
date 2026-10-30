@@ -172,3 +172,38 @@ database mutably (before it is shared), or `Resolver::of` takes `&mut`. The re-e
 > - 9: `blaze-engine` sets the naming rule in `Checkouts::add` (`name_sources`), keyed by
 >   every loaded checkout root: one database builds the programs of several checkouts, so
 >   the rule names a file by the innermost loaded checkout it is in.
+
+## 10. hir-ty `src/mir.rs` (db-ty): `MirEvalError::Aborted(String)`
+
+The evaluator aborts the program (a panic in a cleanup block, a panic while unwinding, a
+panic out of a frame that can't unwind, out of a thread's start or a resumed shim) as
+rustc's `panic_cannot_unwind`/`panic_in_cleanup` do. It reports that now as
+`MirEvalError::NotSupported("the program aborted: ..")`, which is not what it is. Wanted:
+`Aborted(String)` (the message std's abort prints), displayed as "the program aborted: {0}".
+Then `unwind.rs`'s `abort` returns it.
+
+> forwarded to db (hir-ty is db's; db-ty-next2 told).
+
+## 11. hir-def `src/lang_item.rs` (db-def): the `panic_const_*` lang items
+
+A failed `Assert` (overflow, bounds, division by zero, ..) unwinds with the message but
+doesn't call core's `panic_const_add_overflow` and the rest, so std's panic hook and a
+`#[panic_handler]` don't see it. Wanted: the lang items `panic_const_add_overflow`, ..
+(rustc's `AssertKind::panic_function` list) and `panic_bounds_check`,
+`panic_misaligned_pointer_dereference`, `panic_null_pointer_dereference`, so the evaluator
+calls them as rustc's codegen does.
+
+> forwarded to db (hir-def is db's; db-next2 told).
+
+## 12. hir-ty `src/infer.rs` (db-ty): value resolutions and adjustments as columns
+
+For MIR building's speed of light (`docs/v2/plan/lanes/codegen/speed-of-light.md`, section 3).
+Lowering resolves every path expression a second time through the resolver
+(`update_to_inner_scope` + `resolve_path_in_value_ns_fully`, 200 to 500 cycles each), though
+inference already resolved it, and finds each expression's adjustments by a hash probe
+(`expr_adjustments.get(&expr)`). Wanted in `InferenceResult`:
+- the `ValueNs` each path expression and path pattern resolved to, readable by `ExprId` /
+  `PatId` (an `ArenaMap`, as the expression types are);
+- `expr_adjustments` as an `ArenaMap<ExprId, Box<[Adjustment]>>` (or one flat array with
+  per-expression ranges) instead of a hash map.
+Then `lower.rs` reads both by index and its resolver calls for values go.

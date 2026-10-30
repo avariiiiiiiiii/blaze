@@ -60,6 +60,16 @@ impl<'db> ExternalConstraints<'db> {
     pub fn inner(&self) -> &ExternalConstraintsData<'db> {
         EXTERNAL_CONSTRAINTS.get(self.index)
     }
+
+    /// Whether there are no constraints, which every fold maps to the same value: most
+    /// responses.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        let data = self.inner();
+        data.region_constraints.is_empty()
+            && data.opaque_types.is_empty()
+            && data.normalization_nested_goals.is_empty()
+    }
 }
 
 impl<'db> std::ops::Deref for ExternalConstraints<'db> {
@@ -92,36 +102,48 @@ impl<'db> rustc_type_ir::TypeFoldable<DbInterner<'db>> for ExternalConstraints<'
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
+        if self.is_empty() {
+            return Ok(self);
+        }
         Ok(ExternalConstraints::new(
             folder.cx(),
             ExternalConstraintsData {
+                // clone: folding takes the fields owned; only a response with constraints gets here.
                 region_constraints: self.region_constraints.clone().try_fold_with(folder)?,
                 opaque_types: self
                     .opaque_types
                     .iter()
                     .cloned()
                     .map(|opaque| opaque.try_fold_with(folder))
+                    // alloc: the folded copy of a non-empty list, interned below.
                     .collect::<Result<_, F::Error>>()?,
                 normalization_nested_goals: self
                     .normalization_nested_goals
+                    // clone: as above.
                     .clone()
                     .try_fold_with(folder)?,
             },
         ))
     }
     fn fold_with<F: rustc_type_ir::TypeFolder<DbInterner<'db>>>(self, folder: &mut F) -> Self {
+        if self.is_empty() {
+            return self;
+        }
         ExternalConstraints::new(
             folder.cx(),
             ExternalConstraintsData {
+                // clone: folding takes the fields owned; only a response with constraints gets here.
                 region_constraints: self.region_constraints.clone().fold_with(folder),
                 opaque_types: self
                     .opaque_types
                     .iter()
                     .cloned()
                     .map(|opaque| opaque.fold_with(folder))
+                    // alloc: the folded copy of a non-empty list, interned below.
                     .collect(),
                 normalization_nested_goals: self
                     .normalization_nested_goals
+                    // clone: as above.
                     .clone()
                     .fold_with(folder),
             },

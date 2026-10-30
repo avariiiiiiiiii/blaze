@@ -235,6 +235,7 @@ fn path_type_bound(p: &mut Parser<'_>) -> Result<(), ()> {
     // fn f<T: const ?Sized, U: [const] async !Trait, V: async ?Sized>() {}
     if !polarity.is_empty() && !(constness.is_empty() && asyncness.is_empty()) {
         let glue = if !constness.is_empty() && !asyncness.is_empty() { " " } else { "" };
+        // alloc: error path only, rustc's formatted `PolarityAndModifiers` message
         p.error(format!(
             "`{constness}{glue}{asyncness}` trait not allowed with `{polarity}` trait polarity modifier"
         ));

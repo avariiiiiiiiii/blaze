@@ -24,6 +24,7 @@ crate::sync::thread_local! {
 /// to the local-state) must be undone during unwinding.**
 struct Attached {
     /// Pointer to the currently attached database.
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     database: Cell<Option<NonNull<dyn Database>>>,
     /// The depth of the task that attached it: a task pumped above it may attach another one.
     depth: Cell<u32>,
@@ -51,7 +52,8 @@ impl Attached {
 
         impl<'s> DbGuard<'s> {
             #[inline]
-            fn new(attached: &'s Attached, db: &dyn Database) -> Self {
+            // dyn: the edge: salsa's public database handle, one vtable call per query entry
+            fn new(attached: &'s Attached, db: &dyn Database, depth: u32) -> Self {
                 match attached.database.get() {
                     // A database is already attached, make sure it's the same as the new one.
                     Some(current_db) => {
@@ -65,7 +67,7 @@ impl Attached {
                     }
                     // No database is attached, attach the new one.
                     None => {
-                        attached.depth.set(crate::task::current_depth());
+                        attached.depth.set(depth);
                         attached.database.set(Some(NonNull::from(db)));
                         Self {
                             state: Some(attached),
@@ -88,15 +90,16 @@ impl Attached {
             }
         }
 
-        if self.database.get().is_some() && self.depth.get() != crate::task::current_depth() {
-            return self.attach_allow_change(db, op);
+        let depth = db.task_depth();
+        if self.database.get().is_some() && self.depth.get() != depth {
+            return self.attach_allow_change(db, depth, op);
         }
-        let _guard = DbGuard::new(self, db.as_dyn_database());
+        let _guard = DbGuard::new(self, db.as_dyn_database(), depth);
         op()
     }
 
     #[inline]
-    fn attach_allow_change<Db, R>(&self, db: &Db, op: impl FnOnce() -> R) -> R
+    fn attach_allow_change<Db, R>(&self, db: &Db, depth: u32, op: impl FnOnce() -> R) -> R
     where
         Db: ?Sized + Database,
     {
@@ -108,6 +111,7 @@ impl Attached {
             /// The previously attached database that we replaced, if any.
             ///
             /// We need to make sure to rollback and activate it again when we exit the scope.
+            // dyn: the edge: salsa's public database handle, one vtable call per query entry
             prev: Option<NonNull<dyn Database>>,
             /// The depth of the task that attached `prev`.
             prev_depth: u32,
@@ -115,9 +119,10 @@ impl Attached {
 
         impl<'s> DbGuard<'s> {
             #[inline]
-            fn new(attached: &'s Attached, db: &dyn Database) -> Self {
+            // dyn: the edge: salsa's public database handle, one vtable call per query entry
+            fn new(attached: &'s Attached, db: &dyn Database, depth: u32) -> Self {
                 let db = NonNull::from(db);
-                let prev_depth = attached.depth.replace(crate::task::current_depth());
+                let prev_depth = attached.depth.replace(depth);
                 match attached.database.replace(Some(db)) {
                     // A database was already attached by a parent scope.
                     Some(prev) => {
@@ -165,13 +170,14 @@ impl Attached {
             }
         }
 
-        let _guard = DbGuard::new(self, db.as_dyn_database());
+        let _guard = DbGuard::new(self, db.as_dyn_database(), depth);
         op()
     }
 
     /// Access the "attached" database. Returns `None` if no database is attached.
     /// Databases are attached with `attach_database`.
     #[inline]
+    // dyn: the edge: salsa's public database handle, one vtable call per query entry
     fn with<R>(&self, op: impl FnOnce(&dyn Database) -> R) -> Option<R> {
         let db = self.database.get()?;
 
@@ -207,13 +213,14 @@ where
 {
     ATTACHED.with(
         #[inline]
-        |a| a.attach_allow_change(db, op),
+        |a| a.attach_allow_change(db, db.task_depth(), op),
     )
 }
 
 /// Access the "attached" database. Returns `None` if no database is attached.
 /// Databases are attached with `attach_database`.
 #[inline]
+// dyn: the edge: salsa's public database handle, one vtable call per query entry
 pub fn with_attached_database<R>(op: impl FnOnce(&dyn Database) -> R) -> Option<R> {
     ATTACHED.with(
         #[inline]

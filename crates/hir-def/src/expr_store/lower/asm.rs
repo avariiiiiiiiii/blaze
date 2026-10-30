@@ -23,6 +23,7 @@ impl ExprCollector<'_> {
         syntax_ptr: AstPtr<ast::Expr>,
     ) -> ExprId {
         let mut clobber_abis = FxIndexSet::default();
+        // alloc: the operand list, once per `asm!` call; it becomes the boxed slice it stores.
         let mut operands = vec![];
         let mut options = AsmOptions::empty();
 
@@ -73,9 +74,9 @@ impl ExprCollector<'_> {
                 }
                 ast::AsmPiece::AsmOperandNamed(op) => {
                     let name = op.name().map(|name| Symbol::intern(name.text()));
-                    if let Some(name) = &name {
-                        named_args.insert(name.clone(), slot);
-                        named_pos.insert(slot, name.clone());
+                    if let Some(name) = name {
+                        named_args.insert(name, slot);
+                        named_pos.insert(slot, name);
                     }
                     let Some(op) = op.asm_operand() else { continue };
                     (
@@ -193,8 +194,10 @@ impl ExprCollector<'_> {
         }
 
         let record = self.store.record;
+        // alloc: the source-map side table, once per `asm!` call.
         let mut mappings = vec![];
         let mut curarg = 0;
+        // alloc: the template it stores, once per `asm!` call.
         let mut template = Some(Vec::new());
         if options.contains(AsmOptions::RAW) {
             for it in asm.template() {
@@ -206,6 +209,7 @@ impl ExprCollector<'_> {
                     .and_then(|(s, _)| s.value().ok().map(|it| it.into_owned()));
                 match (&mut template, text) {
                     (Some(pieces), Some(text)) => {
+                        // alloc: the stored literal piece, once per raw template string.
                         pieces.push(AsmPiece::Lit(format!("{text}\n").into()))
                     }
                     _ => template = None,
@@ -221,6 +225,7 @@ impl ExprCollector<'_> {
                     if !self.check_cfg(&it) {
                         return None;
                     }
+                    // clone: a syntax node's count bump, once per template string.
                     Some((idx, it.clone(), self.expand_macros_to_string(it)?))
                 })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
@@ -241,7 +246,8 @@ impl ExprCollector<'_> {
                     let mut mappings = mappings.get_mut(idx);
                     let template_snippet = match expr {
                         ast::Expr::Literal(literal) => match literal.kind() {
-                            ast::LiteralKind::String(s) => Some(s.text().to_owned()),
+                            // alloc: the parser takes an owned snippet, once per template string.
+                        ast::LiteralKind::String(s) => Some(s.text().to_owned()),
                             _ => None,
                         },
                         _ => None,
@@ -264,6 +270,7 @@ impl ExprCollector<'_> {
                     );
                     parser.curarg = curarg;
 
+                    // alloc: the parser's pieces, once per template string.
                     let mut unverified_pieces = Vec::new();
                     while let Some(piece) = parser.next() {
                         if !parser.errors.is_empty() {

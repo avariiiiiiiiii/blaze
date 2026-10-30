@@ -2,6 +2,7 @@
 
 use std::cmp;
 
+use base_db::Db;
 use hir_def::{AdtId, VariantId, attrs::AttrFlags, signatures::StructFlags};
 use rustc_abi::{
     BackendRepr, Float, Integer, NicheOptimizations, Primitive, ReprOptions, Scalar,
@@ -25,7 +26,7 @@ use crate::{
 
 #[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone))]
 pub fn layout_of_adt_query(
-    db: &dyn HirDatabase,
+    db: &Db,
     def: AdtId,
     args: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
@@ -128,7 +129,7 @@ pub fn layout_of_adt_query(
 /// Pushes the layout of each field of `variant` onto `out`, in order, reading the variant's
 /// field types once.
 fn variant_field_layouts<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     variant: VariantId,
     args: GenericArgs<'db>,
     trait_env: &StoredParamEnvAndCrate,
@@ -163,7 +164,7 @@ fn variants_of<'a, 'b>(
 }
 
 fn layout_of_adt_cycle_result(
-    _: &dyn HirDatabase,
+    _: &Db,
     _: salsa::Id,
     _def: AdtId,
     _args: StoredGenericArgs,
@@ -217,8 +218,10 @@ fn repr_discr(
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
-    use crate::layout::tests::{Seed, sized_fields, unsized_field};
+    use crate::layout::tests::{sized_fields, unsized_field};
 
     type Variants<'a, 'b> = IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, &'a &'b Layout>>;
 
@@ -259,18 +262,18 @@ mod tests {
         let discr = |min: std::ops::RangeFrom<i128>, max: std::ops::RangeToInclusive<u128>| {
             repr_discr(&dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false))
         };
-        let mut seed = Seed(0x2545_f491_4f6c_dd1d);
+        let mut seed = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for case in 0..400 {
-            let mut field = || &pool[seed.below(pool.len())];
-            let mut seed_len = Seed(case as u64 + 1);
+            let mut field = || &pool[seed.index(pool.len())];
+            let mut seed_len = SplitMix64::new(case as u64);
             let count = match case % 3 {
                 // An enum: up to six variants, a variant without fields among them.
-                0 => seed_len.below(7),
+                0 => seed_len.index(7),
                 // A struct or a union.
                 _ => 1,
             };
             let mut variants: Vec<Vec<&Layout>> = (0..count)
-                .map(|_| (0..seed_len.below(6)).map(|_| field()).collect())
+                .map(|_| (0..seed_len.index(6)).map(|_| field()).collect())
                 .collect();
             let unsized_tail = case % 3 == 2 && seed_len.below(2) == 0;
             if unsized_tail {

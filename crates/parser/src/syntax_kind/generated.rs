@@ -959,6 +959,17 @@ impl SyntaxKind {
     pub fn from_keyword(ident: &str, edition: Edition) -> Option<SyntaxKind> {
         super::keywords::strict(ident, edition)
     }
+    #[doc = r" [`SyntaxKind::from_keyword`] of the identifier `text[start..start + len]`, read with"]
+    #[doc = r" one 8-byte load where `text` has 8 bytes at `start`."]
+    #[inline]
+    pub fn from_keyword_in(
+        text: &[u8],
+        start: usize,
+        len: usize,
+        edition: Edition,
+    ) -> Option<SyntaxKind> {
+        super::keywords::strict_in(text, start, len, edition)
+    }
     #[doc = r" The contextual keyword `ident` is in `edition`: `keywords.rs`'s perfect hash."]
     #[inline]
     pub fn from_contextual_keyword(ident: &str, edition: Edition) -> Option<SyntaxKind> {

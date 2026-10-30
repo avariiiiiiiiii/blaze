@@ -10,7 +10,7 @@
 
 use std::sync::LazyLock;
 
-use base_db::{Crate, FileId};
+use base_db::{Db, Crate, FileId};
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, HasModule, Lookup};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
@@ -31,7 +31,7 @@ use super::{Instance, InstanceDef};
 
 /// The crates the name of an instance mentions.
 struct Mentions<'db> {
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     crates: FxHashSet<Crate>,
     /// The bodies it has the code of or mentions a type of.
     bodies: Vec<DefWithBodyId>,
@@ -53,11 +53,11 @@ struct Mentions<'db> {
 }
 
 impl<'db> Mentions<'db> {
-    fn of(db: &'db dyn HirDatabase, instance: &Instance) -> Mentions<'db> {
+    fn of(db: &'db Db, instance: &Instance) -> Mentions<'db> {
         Mentions::looking(db, instance, false)
     }
 
-    fn looking(db: &'db dyn HirDatabase, instance: &Instance, reveal: bool) -> Mentions<'db> {
+    fn looking(db: &'db Db, instance: &Instance, reveal: bool) -> Mentions<'db> {
         let mut mentions = Mentions {
             db,
             crates: FxHashSet::default(),
@@ -110,7 +110,7 @@ impl<'db> Mentions<'db> {
 /// The crates the name of an instance mentions, or `None` when one of them can't be told. Only
 /// a crate that depends on all of them can have compiled a copy of it.
 pub(super) fn mentioned_crates(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
 ) -> Option<FxHashSet<Crate>> {
     let mentions = Mentions::of(db, instance);
@@ -119,7 +119,7 @@ pub(super) fn mentioned_crates(
 
 /// The function the code of an instance is written in: its own, or the one a closure or an
 /// `async` block is in. The symbol of every copy of the instance has its name.
-pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<FunctionId> {
+pub(super) fn written_in(db: &Db, instance: &Instance) -> Option<FunctionId> {
     let owner = match instance.def {
         InstanceDef::Fn(func) => return Some(func),
         InstanceDef::Closure(id) => InternedClosureId::from_id(id).loc(db).owner,
@@ -141,7 +141,7 @@ pub(super) fn written_in(db: &dyn HirDatabase, instance: &Instance) -> Option<Fu
 /// The files with the bodies an instance has the code of or mentions a type of: those of its
 /// function and of the closures, futures and functions it is instantiated with. `None` when
 /// that can't be told.
-pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[FileId]>> {
+pub fn body_files(db: &Db, instance: &Instance) -> Option<Box<[FileId]>> {
     let mentions = Mentions::of(db, instance);
     if mentions.opaque {
         return None;
@@ -158,7 +158,7 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
 /// in those. A closure or function its name mentions is in it whole, with what the closure
 /// captures. `None` when that can't be told.
 pub(super) fn bodies_of(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
 ) -> Option<(Option<DefWithBodyId>, Vec<DefWithBodyId>)> {
     let mut mentions = Mentions::looking(db, instance, true);
@@ -178,7 +178,7 @@ pub(super) fn bodies_of(
 }
 
 /// The file a body is written in, which for one a macro makes is where the macro is called.
-pub fn body_file(db: &dyn HirDatabase, body: DefWithBodyId) -> FileId {
+pub fn body_file(db: &Db, body: DefWithBodyId) -> FileId {
     let file = match body {
         DefWithBodyId::FunctionId(it) => it.lookup(db).id.file_id,
         DefWithBodyId::ConstId(it) => it.lookup(db).id.file_id,
@@ -276,7 +276,7 @@ impl Homes {
     /// asking for the instance agrees on. Without such a crate, the asking one's.
     pub(super) fn home(
         &mut self,
-        db: &dyn HirDatabase,
+        db: &Db,
         instance: &Instance,
         asked: &StoredParamEnvAndCrate,
     ) -> StoredParamEnvAndCrate {

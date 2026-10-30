@@ -541,12 +541,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                 continue;
             }
             let mut callees = Vec::with_capacity(node.described.built_in.len());
+            // A tiered callee is reached through its slot too, but tiering it up changes its
+            // code, not its MIR: the copy built in stays right.
             for &at in &node.described.built_in {
                 match node.refs.get(at as usize).and_then(callee) {
-                    Some(it) if through_slot.get(&it) == Some(&true) => errors.push(error(
+                    Some(it) if nodes.get(&it).is_some_and(|it| it.patchable) => errors.push(error(
                         *key,
                         node.unit.item,
-                        format!("builds in {it:?}, which is reached through its slot: an edit patches it alone"),
+                        format!("builds in {it:?}, which is patchable: an edit patches it alone"),
                     )),
                     Some(it) => callees.push(it),
                     None => errors.push(error(

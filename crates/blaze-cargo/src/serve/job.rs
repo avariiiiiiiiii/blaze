@@ -14,8 +14,13 @@
 //! 4. The plan's lock file written where cargo writes it, its warnings reported, and its units
 //!    lowered into the front end.
 //!
+//! A checkout's last plan is kept: a build of the same view and config reads its database
+//! view and units, steps 2 and 3 skipped. So is its last front end, which the next build of
+//! the checkout lowers into ([`Steps::lower`]).
+//!
 //! Then its work: every unit a node (compiles on workers, build scripts on the loop), each
-//! reported as it starts, its outputs put into the store and placed where cargo places them,
+//! reported as it starts, its outputs put into the store and placed where cargo places them
+//! (unless the file there is still as the same value was placed),
 //! then `Built`, the tests or the run, and `Work`; or the one answer a reach, a trace, a
 //! verify, the codegen inputs or the tables give. A cancel skips what has not started, kills
 //! what runs, and the job still finishes once, not ok.
@@ -25,7 +30,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -37,7 +42,7 @@ use blaze_api::{
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
-use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_core::{Completion, Done, Effect, FileName, Meta, Tag};
 use blaze_graph::{
     Key, Outcome, Pool, RequestId, RequestStats,
     admission::TaskKind,
@@ -48,7 +53,7 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_protocol::events::NodeKind;
 use blaze_query::{Database, QueryKey};
 use blaze_units::{
-    query::{BuildConfig, Command, Fetch, FetchKind, Invocation, Mount, Origin, Planned},
+    query::{BuildConfig, Command, Fetch, FetchKind, Invocation, LockWrite, Mount, Origin, Planned, Units},
     schema::Mode as UnitMode,
 };
 use blaze_vfs::{Ticket, ViewId, Vfs};
@@ -59,8 +64,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Reader, Readers, Runs, Selection, Source, Steps,
-        Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptFront, Library, Reader, Readers, Runs,
+        Selection, Source, Steps, Writer,
     },
 };
 
@@ -69,7 +74,7 @@ const RUN_TAGS: u64 = 1 << 32;
 
 /// What a thread task of a job hands the loop.
 pub enum Value {
-    Library(Result<(String, Source), ApiError>),
+    Library(Result<Library, ApiError>),
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
@@ -284,9 +289,31 @@ struct Prep {
     opened: Opened,
     root_dir: String,
     config: Arc<BuildConfig>,
+    /// The view's root and its config as one: what [`Jobs::plans`] is matched by.
+    key: ContentId,
     queries: ViewId,
     /// Every fetch's `at` this view's load asked for: asked again once mounted is a loop.
     asked: FxHashSet<String>,
+    /// The units of the head's last plan when it was of this key, asked nothing again.
+    last: Option<(Arc<Units>, Option<LockWrite>)>,
+}
+
+/// An output placed, as the file was once placed: its size and when it last changed. The
+/// driver's look at a file ([`Meta`]) has no inode or mode, so a file replaced by one of the
+/// same size and time, or its mode changed, passes for the placed one.
+struct Placement {
+    key: blaze_cas::Key,
+    executable: bool,
+    meta: Option<Meta>,
+}
+
+/// The last plan of a head's view: a job of the same view and config reads its database
+/// view and its units, the plan neither asked nor verified again.
+struct LastPlan {
+    key: ContentId,
+    queries: ViewId,
+    units: Arc<Units>,
+    lock: Option<LockWrite>,
 }
 
 /// A view made ready: lowered, or planned only for the work that walks the plan.
@@ -369,6 +396,8 @@ struct Job {
     updating: FxHashSet<String>,
     /// Opened by the job and closed as it finishes.
     queries: Vec<ViewId>,
+    /// Views of [`Jobs::plans`] it reads, which the jobs close once none reads them.
+    borrowed: Vec<ViewId>,
     placing: usize,
     /// The first ids of its batches of nodes ([`Jobs::nodes`]).
     batches: Vec<NodeId>,
@@ -398,8 +427,17 @@ pub struct Jobs {
     library: Option<String>,
     library_failed: Option<ApiError>,
     fetch_failed: FxHashMap<String, ApiError>,
-    /// The store's placements: the job, and whether it is executable.
-    placing: FxHashMap<Tag, (JobId, bool)>,
+    /// The store's placements: the job, the value placed, and whether it is executable.
+    placing: FxHashMap<Tag, (JobId, blaze_cas::Key, bool)>,
+    /// What was placed at each path and how the file was after: an output of the same value
+    /// whose file is still so is not placed again.
+    placements: FxHashMap<FileName, Placement>,
+    /// Outputs whose file is looked at before they are placed: the job and the output.
+    looking: FxHashMap<Tag, (JobId, FileName, blaze_cas::Key, bool)>,
+    /// Files placed, looked at for their [`Placement`].
+    recording: FxHashMap<Tag, (FileName, blaze_cas::Key)>,
+    /// The modes of executables placed, by the tag in `own`.
+    moding: FxHashMap<Tag, (FileName, blaze_cas::Key)>,
     /// The job of each lock write and mode of the loop's own.
     own: FxHashMap<Tag, (JobId, String)>,
     next_own: u64,
@@ -414,6 +452,13 @@ pub struct Jobs {
     /// Every image kept linked, by the path cargo writes it at, for the daemon's life: each is
     /// moved into the compile that relinks it and back once it ends ([`Image`]).
     images: FxHashMap<String, Box<dyn Kept>>,
+    /// The last plan of each head, by its root directory.
+    plans: FxHashMap<String, LastPlan>,
+    /// Views of plans replaced in `plans`, closed once no job reads them.
+    retired: Vec<ViewId>,
+    /// The front end of each head's last build, by its root directory, for the next job of
+    /// the head to lower into ([`Steps::lower`]).
+    fronts: FxHashMap<String, KeptFront>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
@@ -444,12 +489,19 @@ impl Jobs {
             library_failed: None,
             fetch_failed: FxHashMap::default(),
             placing: FxHashMap::default(),
+            placements: FxHashMap::default(),
+            looking: FxHashMap::default(),
+            recording: FxHashMap::default(),
+            moding: FxHashMap::default(),
             own: FxHashMap::default(),
             next_own: 0,
             runs: VecDeque::new(),
             runs_from: 0,
             put: None,
             images: FxHashMap::default(),
+            plans: FxHashMap::default(),
+            retired: Vec::new(),
+            fronts: FxHashMap::default(),
             cold: false,
             ended: false,
         }
@@ -458,6 +510,12 @@ impl Jobs {
     /// Whether no job is under way.
     pub fn idle(&self) -> bool {
         self.jobs.is_empty() && self.started.is_empty()
+    }
+
+    /// Whether `root_dir` is one later builds are of again, whose last plan and front end are
+    /// kept: a checkout's, not the directory of one agent's view, which no other view shares.
+    fn lasting(&self, root_dir: &str) -> bool {
+        root_dir.strip_prefix(self.setup.views.as_str()).is_none_or(|rest| !rest.starts_with('/'))
     }
 
     /// The roots the jobs' views read, kept by a collection.
@@ -528,6 +586,7 @@ impl Jobs {
             values: FxHashMap::default(),
             updating: FxHashSet::default(),
             queries: Vec::new(),
+            borrowed: Vec::new(),
             placing: 0,
             batches: Vec::new(),
             runs: 0,
@@ -553,7 +612,8 @@ impl Jobs {
         if self.library.is_none() {
             let job = self.jobs.get_mut(&id).expect("a job being prepared");
             let steps = w.steps.clone();
-            let work = task(&job.cancelled, move |_, _| Ok(steps.library()?), |_, it| Value::Library(it));
+            let kept = w.mounts.libraries(w.vfs);
+            let work = task(&job.cancelled, move |_, _| Ok(steps.library(&kept)?), |_, it| Value::Library(it));
             let name = "the standard library's source";
             let fresh = lone(w.plane, NodeKind::Std, name, Pool::Io, Some(library_key()), kinds::LIBRARY);
             job.stage = Stage::Library(fresh.first());
@@ -566,7 +626,8 @@ impl Jobs {
         self.plan(w, id, prep);
     }
 
-    /// The view opened in the database with its build configuration as the mounts are now.
+    /// The view opened in the database with its build configuration as the mounts are now, or
+    /// the head's last plan when it was of this view and configuration.
     fn open(&mut self, w: &mut World<'_>, id: JobId, opened: Opened, asked: FxHashSet<String>) -> Prep {
         let job = self.jobs.get_mut(&id).expect("a job opening a view");
         let targets = targets_of(&job.work);
@@ -587,12 +648,27 @@ impl Jobs {
             host: self.setup.host.clone(),
             library,
         };
-        let queries = w.db.open_with(opened.view, &config.encode());
+        let encoded = config.encode();
+        let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
+        if reuses_plans(&job.work)
+            && let Some(last) = self.plans.get(&root_dir)
+            && last.key == key
+        {
+            job.borrowed.push(last.queries);
+            let (queries, last) = (last.queries, Some((last.units.clone(), last.lock.clone())));
+            return Prep { opened, root_dir, config: Arc::new(config), key, queries, asked, last };
+        }
+        let queries = w.db.open_with(opened.view, &encoded);
         job.queries.push(queries);
-        Prep { opened, root_dir, config: Arc::new(config), queries, asked }
+        Prep { opened, root_dir, config: Arc::new(config), key, queries, asked, last: None }
     }
 
-    fn plan(&mut self, w: &mut World<'_>, id: JobId, prep: Prep) {
+    /// The view's plan asked, or taken from the head's last one.
+    fn plan(&mut self, w: &mut World<'_>, id: JobId, mut prep: Prep) {
+        if let Some((units, lock)) = prep.last.take() {
+            self.ready(w, id, prep, units, lock);
+            return;
+        }
         let job = self.jobs.get_mut(&id).expect("a job planning");
         let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries);
         let work = task(&job.cancelled, move |_, _| steps.plan(&db, queries), |_, it| Value::Planned(it));
@@ -633,7 +709,7 @@ impl Jobs {
                     true => take_images(&mut self.images, &build.input.units, task.arg as usize),
                     false => Vec::new(),
                 };
-                Some(Readers { this: Some(this), from: None, images })
+                Some(Readers { this: Some(this), images, ..Readers::default() })
             }
             Some(job) if matches!(job.stage, Stage::Answer(_)) => match job.work {
                 Work::Tables => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
@@ -716,12 +792,20 @@ impl Jobs {
 
     fn did(&mut self, w: &mut World<'_>, node: NodeId, value: Value) {
         match value {
-            Value::Library(Ok((at, source))) => match w.mounts.mount(w.vfs, &at, &source) {
-                Ok(_) => self.library = Some(at),
-                Err(why) => {
-                    self.library_failed = Some(ApiError::new(format!("the standard library's source: {why}"), Some(at)));
+            Value::Library(Ok(Library { at, fingerprint, source })) => {
+                let mounted = match &source {
+                    Some(source) => w.mounts.mount_library(w.vfs, &at, &fingerprint, source).map(drop),
+                    None if w.mounts.has(&at) => Ok(()),
+                    None => Err(format!("its files were not read as it was mounted at {at}, and nothing is")),
+                };
+                match mounted {
+                    Ok(()) => self.library = Some(at),
+                    Err(why) => {
+                        self.library_failed =
+                            Some(ApiError::new(format!("the standard library's source: {why}"), Some(at)));
+                    }
                 }
-            },
+            }
             Value::Library(Err(error)) => self.library_failed = Some(error),
             Value::Fetched(fetches, at, Ok(source)) => {
                 let fetch = &fetches[at as usize];
@@ -913,51 +997,76 @@ impl Jobs {
                 self.add(w, id, fresh, Some(work), false);
             }
             Planned::Ready(mut units) => {
+                let lock = units.lock.take();
+                let units = Arc::new(units);
+                let lasting = self.lasting(&prep.root_dir);
                 let job = self.jobs.get_mut(&id).expect("a job planning");
-                if let Some(lock) = units.lock.take() {
-                    match FileName::new(lock.path.trim_start_matches('/')) {
-                        Some(file) => {
-                            let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
-                            self.next_own += 1;
-                            self.own.insert(tag, (id, lock.path));
-                            job.placing += 1;
-                            w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
-                        }
-                        None => {
-                            let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
-                            self.end(w, id, false, Some(error));
-                            return;
-                        }
+                if lasting && reuses_plans(&job.work) {
+                    job.queries.retain(|it| *it != prep.queries);
+                    job.borrowed.push(prep.queries);
+                    let last = LastPlan { key: prep.key, queries: prep.queries, units: units.clone(), lock: lock.clone() };
+                    if let Some(old) = self.plans.insert(prep.root_dir.clone(), last)
+                        && old.queries != prep.queries
+                    {
+                        self.retired.push(old.queries);
                     }
                 }
-                for warning in &units.warnings {
-                    w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
-                }
-                let input = JobInput {
-                    db: w.db.clone(),
-                    queries: prep.queries,
-                    root: prep.opened.view.root,
-                    files: w.vfs.reader(),
-                    config: prep.config,
-                    units: Arc::new(units),
-                    store: w.store.reader(),
-                    color: self.setup.color,
-                    goal: goal_of(&job.work),
-                    cancelled: job.cancelled.clone(),
-                };
-                if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
-                    job.ready.push(Ready { input, front: None, writer: None });
-                    self.next(w, id);
-                    return;
-                }
-                let (steps, lowering) = (w.steps.clone(), input.clone());
-                let work = task(&job.cancelled, move |_, _| steps.lower(&lowering), |_, it| Value::Lowered(it));
-                let name = named("lowering ", &prep.root_dir);
-                let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
-                job.stage = Stage::Lower(fresh.first(), input);
-                self.add(w, id, fresh, Some(work), false);
+                self.ready(w, id, prep, units, lock);
             }
         }
+    }
+
+    /// The view's plan taken: its lock file written, its warnings reported, and its units
+    /// lowered, or for the work that walks the plan, the view ready as it is.
+    fn ready(&mut self, w: &mut World<'_>, id: JobId, prep: Prep, units: Arc<Units>, lock: Option<LockWrite>) {
+        let job = self.jobs.get_mut(&id).expect("a job planning");
+        if let Some(lock) = lock {
+            match FileName::new(lock.path.trim_start_matches('/')) {
+                Some(file) => {
+                    let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
+                    self.next_own += 1;
+                    self.own.insert(tag, (id, lock.path));
+                    job.placing += 1;
+                    w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
+                }
+                None => {
+                    let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
+                    self.end(w, id, false, Some(error));
+                    return;
+                }
+            }
+        }
+        for warning in &units.warnings {
+            w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
+        }
+        let input = JobInput {
+            db: w.db.clone(),
+            queries: prep.queries,
+            root: prep.opened.view.root,
+            files: w.vfs.reader(),
+            config: prep.config,
+            units,
+            store: w.store.reader(),
+            color: self.setup.color,
+            goal: goal_of(&job.work),
+            cancelled: job.cancelled.clone(),
+        };
+        if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
+            job.ready.push(Ready { input, front: None, writer: None });
+            self.next(w, id);
+            return;
+        }
+        let kept = Mutex::new(self.fronts.remove(&prep.root_dir));
+        let (steps, lowering) = (w.steps.clone(), input.clone());
+        let work = task(
+            &job.cancelled,
+            move |_, _| steps.lower(&lowering, kept.lock().unwrap_or_else(|it| it.into_inner()).take()),
+            |_, it| Value::Lowered(it),
+        );
+        let name = named("lowering ", &prep.root_dir);
+        let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
+        job.stage = Stage::Lower(fresh.first(), input);
+        self.add(w, id, fresh, Some(work), false);
     }
 
     /// The next view to make ready, or the work once all are.
@@ -1277,44 +1386,81 @@ impl Jobs {
                 }
             }
         }
-        for output in compiled.outputs {
-            let Some(file) = FileName::new(output.path.trim_start_matches('/')) else {
-                let error = ApiError::new(format!("{} is no path an output can be placed at", output.path), Some(output.path));
-                job.over.get_or_insert((false, Some(error)));
-                continue;
-            };
-            match w.store.place(&output.key, file, w.effects) {
-                Some(tag) => {
-                    self.placing.insert(tag, (id, output.executable));
-                    job.placing += 1;
-                }
-                None => {
-                    let error = ApiError::new(
-                        format!("the store has nothing under {:?} to place at {}", output.key, output.path),
-                        Some(output.path),
-                    );
-                    job.over.get_or_insert((false, Some(error)));
-                }
-            }
-        }
         if let (Some(artifact), Stage::Units(build)) = (compiled.artifact, &mut job.stage) {
             build.artifacts.push(artifact);
         }
+        for output in compiled.outputs {
+            let Some(file) = FileName::new(output.path.trim_start_matches('/')) else {
+                let error = ApiError::new(format!("{} is no path an output can be placed at", output.path), Some(output.path));
+                if let Some(job) = self.jobs.get_mut(&id) {
+                    job.over.get_or_insert((false, Some(error)));
+                }
+                continue;
+            };
+            let placed = self.placements.get(&file).is_some_and(|it| {
+                it.key == output.key && it.executable == output.executable && it.meta.is_some()
+            });
+            if !placed {
+                self.place(w, id, file, output.key, output.executable);
+                continue;
+            }
+            let tag = self.own_tag();
+            self.looking.insert(tag, (id, file.clone(), output.key, output.executable));
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.placing += 1;
+            }
+            w.effects.push(Effect::Stat { file, tag });
+        }
+    }
+
+    /// The store's value of `key` placed at `file` for job `id`.
+    fn place(&mut self, w: &mut World<'_>, id: JobId, file: FileName, key: blaze_cas::Key, executable: bool) {
+        self.placements.remove(&file);
+        let Some(job) = self.jobs.get_mut(&id) else { return };
+        let path = format!("/{file}");
+        match w.store.place(&key, file, w.effects) {
+            Some(tag) => {
+                self.placing.insert(tag, (id, key, executable));
+                job.placing += 1;
+            }
+            None => {
+                let error = ApiError::new(format!("the store has nothing under {key:?} to place at {path}"), Some(path));
+                job.over.get_or_insert((false, Some(error)));
+            }
+        }
+    }
+
+    /// A tag of the loop's own, for a lock write, a mode or a look at a placed file.
+    fn own_tag(&mut self) -> Tag {
+        let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
+        self.next_own += 1;
+        tag
+    }
+
+    /// `file` placed with the value of `key`: what is there now looked at for its record.
+    fn record(&mut self, w: &mut World<'_>, file: FileName, key: blaze_cas::Key, executable: bool) {
+        let tag = self.own_tag();
+        self.placements.insert(file.clone(), Placement { key, executable, meta: None });
+        self.recording.insert(tag, (file.clone(), key));
+        w.effects.push(Effect::Stat { file, tag });
     }
 
     /// What the store placed.
     pub fn placed(&mut self, w: &mut World<'_>, placed: Vec<Placed>) {
         for Placed { tag, to, result } in placed {
-            let Some((id, executable)) = self.placing.remove(&tag) else { continue };
+            let Some((id, key, executable)) = self.placing.remove(&tag) else { continue };
             let Some(job) = self.jobs.get_mut(&id) else { continue };
             match result {
                 Ok(()) if executable => {
-                    let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
-                    self.next_own += 1;
+                    let tag = self.own_tag();
                     self.own.insert(tag, (id, format!("/{to}")));
+                    self.moding.insert(tag, (to.clone(), key));
                     w.effects.push(Effect::Mode { file: to, mode: 0o755, tag });
                 }
-                Ok(()) => job.placing -= 1,
+                Ok(()) => {
+                    job.placing -= 1;
+                    self.record(w, to, key, false);
+                }
                 Err(why) => {
                     job.placing -= 1;
                     job.over.get_or_insert((false, Some(ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}"))))));
@@ -1324,15 +1470,43 @@ impl Jobs {
         self.wind_up(w);
     }
 
-    /// A completion of the jobs' own: a lock write, a mode, or one of user code's runs.
+    /// A completion of the jobs' own: a lock write, a mode, a look at a placed file, or one of
+    /// user code's runs.
     pub fn complete(&mut self, w: &mut World<'_>, completion: Completion) {
         if completion.tag.0.wrapping_sub(self.setup.tags) < 1 << 32 {
-            if let Some((id, path)) = self.own.remove(&completion.tag)
-                && let Some(job) = self.jobs.get_mut(&id)
-            {
-                job.placing -= 1;
-                if let Done::Failed(error) = completion.done {
-                    job.over.get_or_insert((false, Some(ApiError::new(format!("writing {path}: {error}"), Some(path)))));
+            let tag = completion.tag;
+            if let Some((file, key)) = self.recording.remove(&tag) {
+                match (completion.done, self.placements.get_mut(&file)) {
+                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
+                    _ => {
+                        self.placements.remove(&file);
+                    }
+                }
+            } else if let Some((id, file, key, executable)) = self.looking.remove(&tag) {
+                let unchanged = matches!(
+                    (&completion.done, self.placements.get(&file)),
+                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
+                );
+                if let Some(job) = self.jobs.get_mut(&id) {
+                    job.placing -= 1;
+                }
+                if !unchanged {
+                    self.place(w, id, file, key, executable);
+                }
+            } else if let Some((id, path)) = self.own.remove(&tag) {
+                let moded = self.moding.remove(&tag);
+                if let Some(job) = self.jobs.get_mut(&id) {
+                    job.placing -= 1;
+                    match completion.done {
+                        Done::Failed(error) => {
+                            job.over.get_or_insert((false, Some(ApiError::new(format!("writing {path}: {error}"), Some(path)))));
+                        }
+                        _ => {
+                            if let Some((file, key)) = moded {
+                                self.record(w, file, key, true);
+                            }
+                        }
+                    }
                 }
             }
             self.wind_up(w);
@@ -1396,7 +1570,12 @@ impl Jobs {
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
-        let Build { input, front, artifacts, evaluation, .. } = *build;
+        let Build { input, front, writer, artifacts, evaluation, .. } = *build;
+        if self.lasting(&input.config.invocation.root)
+            && let Some(kept) = writer.keep()
+        {
+            self.fronts.insert(input.config.invocation.root.clone(), kept);
+        }
         let profile = input.units.finished.clone();
         if !runs {
             let ok = ok && evaluation.is_none_or(|it| !it.failed);
@@ -1559,6 +1738,16 @@ impl Jobs {
             self.ended = true;
             w.said.push(Said::Finish(id, ok, error));
         }
+        if !self.retired.is_empty() {
+            let jobs = &self.jobs;
+            self.retired.retain(|view| {
+                let read = jobs.values().any(|it| it.borrowed.contains(view));
+                if !read {
+                    w.db.close(*view);
+                }
+                read
+            });
+        }
     }
 
     /// The VFS's tickets that are durable: a snapshot waits for its own.
@@ -1585,6 +1774,12 @@ impl Jobs {
     }
 }
 
+/// Whether `work` builds from the head's last plan when it is of the same view and config. A
+/// trace and a verify look at the plan's own run, so they ask it.
+fn reuses_plans(work: &Work) -> bool {
+    !matches!(work, Work::Trace(_) | Work::Verify(_))
+}
+
 /// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
 fn refuse_held(w: &mut World<'_>, stage: &mut Stage) {
     if let Stage::Units(build) = stage {
@@ -1595,7 +1790,7 @@ fn refuse_held(w: &mut World<'_>, stage: &mut Stage) {
 }
 
 /// The images kept at unit `unit`'s outputs, moved out of `images` for its compile.
-fn take_images(images: &mut FxHashMap<String, Box<dyn Kept>>, units: &blaze_units::query::Units, unit: usize) -> Vec<Image> {
+fn take_images(images: &mut FxHashMap<String, Box<dyn Kept>>, units: &Units, unit: usize) -> Vec<Image> {
     if images.is_empty() {
         return Vec::new();
     }
@@ -1768,6 +1963,7 @@ mod tests {
                 values: FxHashMap::default(),
                 updating: FxHashSet::default(),
                 queries: Vec::new(),
+                borrowed: Vec::new(),
                 placing: 0,
                 batches: Vec::new(),
                 runs: 0,
@@ -1786,5 +1982,14 @@ mod tests {
         jobs.jobs.remove(&JobId(300));
         want.retain(|it| it.0 != 300);
         assert_eq!(jobs.sorted(), want);
+    }
+
+    #[test]
+    fn only_a_checkouts_last_plan_and_front_end_are_kept() {
+        let setup = Setup { views: "/v".into(), host: "h".into(), env: Vec::new(), color: false, tags: 0, runs: 0, runs_end: 0 };
+        let jobs = Jobs::new(setup);
+        assert!(jobs.lasting("/home/u/w"));
+        assert!(jobs.lasting("/very/w"), "a directory beside the views' is a checkout's");
+        assert!(!jobs.lasting("/v/0123abcd"), "an agent's view is placed once");
     }
 }

@@ -188,6 +188,57 @@ pub(super) fn stat_of(fd: c_int) -> Option<libc::stat> {
     (done == 0).then_some(stat)
 }
 
+/// What `stat` says of `path`, or `lstat` when not `follow`, or `None` with `errno` set.
+pub(super) fn stat(path: &CStr, follow: bool) -> Option<libc::stat> {
+    // SAFETY: `libc::stat` is integers only, for which all-zero bytes are a valid value.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is a nul-terminated string borrowed for the call, which only reads it,
+    // and `stat` is a live, exclusive `struct stat` for the call to fill, and nothing else.
+    let done = unsafe {
+        match follow {
+            true => libc::stat(path.as_ptr(), &mut stat),
+            false => libc::lstat(path.as_ptr(), &mut stat),
+        }
+    };
+    (done == 0).then_some(stat)
+}
+
+/// Reads from `fd` into the spare capacity of `into`, which grows by what was read: what
+/// `read` returned.
+pub(super) fn read(fd: BorrowedFd<'_>, into: &mut Vec<u8>) -> isize {
+    let spare = into.spare_capacity_mut();
+    // SAFETY: the spare capacity of `into` is exclusive for the call, which writes at most
+    // `spare.len()` bytes there; `fd` is open while borrowed.
+    let read = unsafe { libc::read(fd.as_raw_fd(), spare.as_mut_ptr().cast(), spare.len()) };
+    if read > 0 {
+        let len = into.len() + read as usize;
+        // SAFETY: the kernel wrote the first `read` bytes of the spare capacity, no more than
+        // it has, so the first `len` bytes of `into` are initialized and within its capacity.
+        unsafe { into.set_len(len) };
+    }
+    read
+}
+
+/// Lists the directory `fd` is open on from where the last call left off, as `struct
+/// linux_dirent64` records, into the spare capacity of `into`, which grows by what was
+/// listed: what `getdents64` returned, 0 at the end.
+pub(super) fn dents(fd: BorrowedFd<'_>, into: &mut Vec<u8>) -> c_long {
+    let spare = into.spare_capacity_mut();
+    // SAFETY: the spare capacity of `into` is exclusive for the call, which writes at most
+    // `spare.len()` bytes there; `fd` is open while borrowed, and the call takes integers and
+    // that pointer alone.
+    let read = unsafe {
+        libc::syscall(libc::SYS_getdents64, fd.as_raw_fd(), spare.as_mut_ptr(), spare.len())
+    };
+    if read > 0 {
+        let len = into.len() + read as usize;
+        // SAFETY: the kernel wrote the first `read` bytes of the spare capacity, no more than
+        // it has, so the first `len` bytes of `into` are initialized and within its capacity.
+        unsafe { into.set_len(len) };
+    }
+    read
+}
+
 /// # Safety
 ///
 /// `fd` is this process's own, and nothing that will use or close it after holds it (an
@@ -321,8 +372,8 @@ pub(super) fn send_descriptor(socket: c_int, fd: c_int) -> isize {
     // SAFETY: `CMSG_SPACE` is arithmetic on its argument and reads no memory.
     let room = unsafe { libc::CMSG_SPACE(size_of::<c_int>() as u32) } as usize;
     let msg = message(&mut iov, &mut space, room);
-    // SAFETY: `msg`'s control buffer is `space`, `room` (24) of its 64 bytes, at least one
-    // `cmsghdr` long, so the first header is at its start and not null.
+    // SAFETY: `msg`'s control buffer is `space`, `room` (24 bytes on 64-bit, 16 on 32-bit) of
+    // its 64, at least one `cmsghdr` long, so the first header is at its start and not null.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
     // SAFETY: `cmsg` is the start of `space`, live, aligned for a `cmsghdr` (`Control`) and
     // that long, and nothing else reads or writes `space` until `sendmsg`.
@@ -335,8 +386,9 @@ pub(super) fn send_descriptor(socket: c_int, fd: c_int) -> isize {
     unsafe { (*cmsg).cmsg_len = len as _ };
     // SAFETY: `CMSG_DATA` is `cmsg` plus the aligned header length, inside `space`.
     let data = unsafe { libc::CMSG_DATA(cmsg) };
-    // SAFETY: `data` is 16 bytes into `space` and the `c_int` ends at 20 of its 64; the data
-    // need not be aligned for a `c_int`, so the write is unaligned.
+    // SAFETY: `data` is the header's aligned size into `space` (16 bytes on 64-bit, 12 on
+    // 32-bit), so the `c_int` ends by 20 of its 64; the data need not be aligned for a
+    // `c_int`, so the write is unaligned.
     unsafe { std::ptr::write_unaligned(data.cast::<c_int>(), fd) };
     // SAFETY: `msg` points at `iov`, `byte` and `space`, all live and unborrowed for the call,
     // which only reads them.
@@ -372,8 +424,9 @@ pub(super) fn received_descriptor(socket: c_int) -> Option<c_int> {
     }
     // SAFETY: `CMSG_DATA` is `cmsg` plus the aligned header length, inside `space`.
     let data = unsafe { libc::CMSG_DATA(cmsg) };
-    // SAFETY: `data` is 16 bytes into `space`, so the `c_int` read ends at 20 of its 64
-    // initialized bytes; the data need not be aligned for a `c_int`.
+    // SAFETY: `data` is the header's aligned size into `space` (16 bytes on 64-bit, 12 on
+    // 32-bit), so the `c_int` read ends by 20 of its 64 initialized bytes; the data need not
+    // be aligned for a `c_int`.
     Some(unsafe { std::ptr::read_unaligned(data.cast::<c_int>()) })
 }
 
@@ -455,9 +508,11 @@ pub(super) fn readlink_into(path: &CStr, into: &mut Vec<u8>) -> isize {
 /// Runs `argv[0]` with `argv` and `env` in place of this process. It returns only where it
 /// couldn't, with `errno` set.
 pub(super) fn execve(argv: &[CString], env: &[CString]) {
-    let mut args: Vec<*const libc::c_char> = argv.iter().map(|it| it.as_ptr()).collect();
+    let mut args: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
+    args.extend(argv.iter().map(|it| it.as_ptr()));
     args.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = env.iter().map(|it| it.as_ptr()).collect();
+    let mut envp: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
+    envp.extend(env.iter().map(|it| it.as_ptr()));
     envp.push(std::ptr::null());
     // SAFETY: `args` and `envp` end with null and each other entry is a nul-terminated string
     // of `argv` or `env`, borrowed for the call; `args[0]` is the program's path, or null with

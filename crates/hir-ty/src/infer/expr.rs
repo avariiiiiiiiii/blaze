@@ -7,14 +7,18 @@ use hir_def::{
     AdtId, FieldId, TupleFieldId, TupleId, VariantId,
     expr_store::path::{GenericArgs as HirGenericArgs, Path},
     hir::{
-        Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId,
+        ArithOp, Array, AsmOperand, AsmOptions, BinaryOp, BindingAnnotation, Expr, ExprId,
         ExprOrPatIdPacked, InlineAsmKind, LabelId, LoopSource, Pat, PatId, RecordLitField,
         RecordSpread, Statement, UnaryOp,
     },
     resolver::ValueNs,
     signatures::VariantFields,
 };
-use hir_def::{FunctionId, hir::ClosureKind};
+use hir_def::{
+    FunctionId,
+    hir::{ClosureKind, CoroutineKind},
+    lang_item::LangItemTarget,
+};
 use hir_expand::name::Name;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
@@ -26,13 +30,14 @@ use stdx::never;
 use tracing::debug;
 
 use crate::{
+    db::HirDatabase,
     Adjust, Adjustment, CallableDefId, Rawness, Span,
     consteval::literal_ty,
     infer::{AllowTwoPhase, BreakableKind, coerce::CoerceMany, find_continuable, pat::PatOrigin},
     lower::lower_mutability,
     method_resolution::{self, CandidateId, MethodCallee, MethodError},
     next_solver::{
-        ClauseKind, FnSig, IsRigid, Ty, TyKind, TypeError,
+        ClauseKind, FnSig, IsRigid, StoredTy, Ty, TyKind, TypeError,
         infer::{
             BoundRegionConversionTime, InferOk,
             traits::{Obligation, ObligationCause},
@@ -43,7 +48,7 @@ use crate::{
 
 use super::{
     BreakableContext, Diverges, Expectation, InferenceContext, InferenceDiagnostic, ReturnKind,
-    cast::CastCheck, find_breakable,
+    Unreachable, UnreachableAt, cast::CastCheck, find_breakable,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,12 +278,12 @@ impl<'db> InferenceContext<'db> {
         }
     }
 
-    pub(crate) fn check_lhs_assignable(&mut self, lhs: ExprId) {
+    pub(crate) fn check_lhs_assignable(&mut self, lhs: ExprId, assign: ExprId, op: Option<ArithOp>) {
         if self.is_syntactic_place_expr(lhs) {
             return;
         }
 
-        self.push_diagnostic(InferenceDiagnostic::InvalidLhsOfAssignment { lhs });
+        self.push_diagnostic(InferenceDiagnostic::InvalidLhsOfAssignment { lhs, assign, op });
     }
 
     fn infer_expr_coerce_never(
@@ -335,6 +340,13 @@ impl<'db> InferenceContext<'db> {
     ) -> Ty<'db> {
         let expr = self.store.expr(tgt_expr);
         tracing::trace!(?expr);
+        // Expressions after siblings that diverged; not inside `.await`'s desugaring, nor of a
+        // `try` block's generated `Try::from_output(())`.
+        if !matches!(expr, Expr::Await { .. }) && !self.is_try_block_output_of_unit(tgt_expr) {
+            self.warn_if_unreachable(UnreachableAt::Expr(tgt_expr));
+        }
+        // Whether a past expression diverged doesn't affect the typing of this one.
+        let old_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
         let ty = match expr {
             Expr::Missing => self.err_ty(),
             Expr::If { condition, then_branch, else_branch } => {
@@ -344,6 +356,7 @@ impl<'db> InferenceContext<'db> {
                     &Expectation::HasType(self.types.types.bool),
                     ExprIsRead::Yes,
                 );
+                self.warn_if_unreachable(UnreachableAt::IfBlock(tgt_expr));
 
                 let condition_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
 
@@ -392,6 +405,8 @@ impl<'db> InferenceContext<'db> {
                 coerce.complete(self)
             }
             Expr::Let { pat, expr } => {
+                // For a `let` statement, `check_stmt` warns of the statement instead.
+                self.warn_if_unreachable(UnreachableAt::LetInit(tgt_expr));
                 self.infer_let(
                     self.table.next_ty_var(tgt_expr.into()),
                     Some(expr),
@@ -404,10 +419,15 @@ impl<'db> InferenceContext<'db> {
                 self.infer_block(tgt_expr, statements, tail, label, expected)
             }
             Expr::Const(id) => {
-                self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-                    this.infer_expr(id, expected, ExprIsRead::Yes)
-                })
-                .1
+                // rustc checks an inline const's body with a `FnCtxt` of its own.
+                let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
+                let ty = self
+                    .with_breakable_ctx(BreakableKind::Border, None, None, |this| {
+                        this.infer_expr(id, expected, ExprIsRead::Yes)
+                    })
+                    .1;
+                self.diverges = prev_diverges;
+                ty
             }
             Expr::Loop { body, label, source } => {
                 let coerce = match source {
@@ -429,7 +449,7 @@ impl<'db> InferenceContext<'db> {
                 if breaks.may_break {
                     self.diverges = Diverges::Maybe;
                 } else {
-                    self.diverges = Diverges::Always;
+                    self.diverges |= Diverges::always(tgt_expr);
                 }
                 breaks.coerce.map(|c| c.complete(self)).unwrap_or(self.types.types.unit)
             }
@@ -470,11 +490,16 @@ impl<'db> InferenceContext<'db> {
                 );
 
                 if arms.is_empty() {
-                    self.diverges = Diverges::Always;
+                    self.diverges |= Diverges::always(tgt_expr);
                     self.types.types.never
                 } else {
+                    // rustc's `warn_arms_when_scrutinee_diverges`.
+                    for index in 0..arms.len() {
+                        let index = index as u32;
+                        self.warn_if_unreachable(UnreachableAt::Arm { match_expr: tgt_expr, index });
+                    }
                     let matchee_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
-                    let mut all_arms_diverge = Diverges::Always;
+                    let mut all_arms_diverge = Diverges::WarnedAlways;
                     for arm in arms.iter() {
                         self.infer_top_pat(arm.pat, input_ty, PatOrigin::MatchArm);
                     }
@@ -489,15 +514,16 @@ impl<'db> InferenceContext<'db> {
                     let mut coerce = CoerceMany::new(result_ty);
 
                     for arm in arms.iter() {
+                        self.diverges = Diverges::Maybe;
                         if let Some(guard_expr) = arm.guard {
-                            self.diverges = Diverges::Maybe;
                             self.infer_expr_coerce_never(
                                 guard_expr,
                                 &Expectation::HasType(self.types.types.bool),
                                 ExprIsRead::Yes,
                             );
                         }
-                        self.diverges = Diverges::Maybe;
+                        // Not reset after the guard: a guard that diverges makes its arm's
+                        // body unreachable, and the arm diverge.
 
                         let arm_ty = self.infer_expr_inner(arm.expr, &expected, ExprIsRead::Yes);
                         all_arms_diverge &= self.diverges;
@@ -510,6 +536,14 @@ impl<'db> InferenceContext<'db> {
                         );
                     }
 
+                    if let Diverges::Always { .. } = all_arms_diverge
+                        && !self.is_desugared_match(expr)
+                    {
+                        all_arms_diverge = Diverges::Always {
+                            span: tgt_expr.into(),
+                            custom_note: Some(Unreachable::ALL_ARMS_DIVERGE),
+                        };
+                    }
                     self.diverges = matchee_diverges | all_arms_diverge;
 
                     coerce.complete(self)
@@ -517,7 +551,12 @@ impl<'db> InferenceContext<'db> {
             }
             Expr::Path(p) => self.infer_expr_path(p, tgt_expr.into(), tgt_expr),
             Expr::Continue { label } => {
-                if find_continuable(&self.breakables, label).is_none() {
+                if label.is_none() && self.in_labeled_block() {
+                    self.push_diagnostic(InferenceDiagnostic::UnlabeledJumpInLabeledBlock {
+                        expr: tgt_expr,
+                        is_break: false,
+                    });
+                } else if find_continuable(&self.breakables, label).is_none() {
                     self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
                         expr: tgt_expr,
                         is_break: false,
@@ -528,16 +567,26 @@ impl<'db> InferenceContext<'db> {
             }
             Expr::Break { expr, label } => {
                 let breakable_idx = find_breakable(&self.breakables, label);
+                // rustc reports only E0695 for it, and types it as a jump to the loop.
+                let in_labeled_block = label.is_none() && self.in_labeled_block();
+                if in_labeled_block {
+                    self.push_diagnostic(InferenceDiagnostic::UnlabeledJumpInLabeledBlock {
+                        expr: tgt_expr,
+                        is_break: true,
+                    });
+                }
                 let val_ty = if let Some(expr) = expr {
                     let opt_coerce_to = match breakable_idx {
                         Some(breakable_idx) => match &self.breakables[breakable_idx].coerce {
                             Some(coerce) => coerce.expected_ty(),
                             None => {
-                                self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
-                                    expr: tgt_expr,
-                                    is_break: true,
-                                    bad_value_break: true,
-                                });
+                                if !in_labeled_block {
+                                    self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
+                                        expr: tgt_expr,
+                                        is_break: true,
+                                        bad_value_break: true,
+                                    });
+                                }
                                 self.err_ty()
                             }
                         },
@@ -573,6 +622,7 @@ impl<'db> InferenceContext<'db> {
                             self.breakables[breakable_idx].coerce = Some(coerce);
                         }
                     }
+                    None if in_labeled_block => {}
                     None => {
                         self.push_diagnostic(InferenceDiagnostic::BreakOutsideOfLoop {
                             expr: tgt_expr,
@@ -586,7 +636,16 @@ impl<'db> InferenceContext<'db> {
             Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
             Expr::Become { expr } => self.infer_expr_become(tgt_expr, expr),
             Expr::Yield { expr } => {
-                if let Some((resume_ty, yield_ty)) = self.resume_yield_tys {
+                if self.coroutine_desugaring == Some(CoroutineKind::Async) {
+                    // rustc lowers it to `{ expr; <error> }`.
+                    if let Some(expr) = expr {
+                        self.infer_expr_no_expect(expr, ExprIsRead::Yes);
+                    }
+                    self.push_diagnostic(InferenceDiagnostic::AsyncCoroutinesNotSupported {
+                        expr: tgt_expr,
+                    });
+                    self.types.types.error
+                } else if let Some((resume_ty, yield_ty)) = self.resume_yield_tys {
                     if let Some(expr) = expr {
                         self.infer_expr_coerce(
                             expr,
@@ -639,9 +698,9 @@ impl<'db> InferenceContext<'db> {
             Expr::UnaryOp { expr, op } => self.infer_unop_expr(op, expr, expected, tgt_expr),
             Expr::BinaryOp { lhs, rhs, op } => match op {
                 Some(BinaryOp::Assignment { op: Some(op) }) => {
-                    self.infer_assign_op_expr(tgt_expr, op, lhs, rhs)
+                    self.infer_assign_op_expr(tgt_expr, op, lhs, rhs, expected)
                 }
-                Some(op) => self.infer_binop_expr(tgt_expr, op, lhs, rhs),
+                Some(op) => self.infer_binop_expr(tgt_expr, op, lhs, rhs, expected),
                 None => self.err_ty(),
             },
             Expr::Assignment { target, value } => {
@@ -662,6 +721,9 @@ impl<'db> InferenceContext<'db> {
                 if let Some(lhs_ty) = lhs_ty {
                     self.write_pat_ty(target, lhs_ty);
                     self.infer_expr_coerce(value, &Expectation::has_type(lhs_ty), ExprIsRead::Yes);
+                    if let Pat::Expr(lhs) = self.store.pat(target) {
+                        self.check_lhs_assignable(lhs, tgt_expr, None);
+                    }
                 } else {
                     // Let the target pattern constrain the RHS coercion target. In particular,
                     // this allows a diverging RHS to coerce to the pattern's type.
@@ -702,9 +764,11 @@ impl<'db> InferenceContext<'db> {
                         trait_element_ty
                     }
                     None => {
+                        let at_error = self.ty_at_error(base_t);
                         self.push_diagnostic(InferenceDiagnostic::CannotIndexInto {
                             expr: tgt_expr,
                             found: base_t.store(),
+                            at_error,
                         });
                         self.types.types.error
                     }
@@ -888,13 +952,32 @@ impl<'db> InferenceContext<'db> {
             }
         };
         let ty = self.insert_type_vars_shallow(ty);
+        // Non-block expressions whose children diverged.
+        match expr {
+            Expr::Block { .. }
+            | Expr::If { .. }
+            | Expr::Let { .. }
+            | Expr::Loop { .. }
+            | Expr::Match { .. } => {}
+            // A cast from `!` is sometimes needed to appease type checking.
+            Expr::Cast { .. } => {}
+            // rustc lowers a destructuring assignment to a block, and `.await` to a `match`.
+            Expr::Assignment { target, .. } if !matches!(self.store.pat(target), Pat::Expr(_)) => {}
+            Expr::Await { .. } => {}
+            Expr::Call { .. } if self.is_try_block_output(tgt_expr) => {}
+            Expr::Call { .. } | Expr::MethodCall { .. } => {
+                self.warn_if_unreachable(UnreachableAt::Call(tgt_expr))
+            }
+            _ => self.warn_if_unreachable(UnreachableAt::Expr(tgt_expr)),
+        }
         self.write_expr_ty(tgt_expr, ty);
         if self.table.resolve_vars_with_obligations(ty).is_never()
             && self.expr_guaranteed_to_constitute_read_for_never(tgt_expr, is_read)
         {
             // Any expression that produces a value of type `!` must have diverged
-            self.diverges = Diverges::Always;
+            self.diverges |= Diverges::always(tgt_expr);
         }
+        self.diverges |= old_diverges;
         ty
     }
 
@@ -1311,9 +1394,11 @@ impl<'db> InferenceContext<'db> {
                 if let Some(ty) = self.lookup_derefing(expr, oprnd, oprnd_t) {
                     oprnd_t = ty;
                 } else {
+                    let at_error = self.ty_at_error(oprnd_t);
                     self.push_diagnostic(InferenceDiagnostic::CannotBeDereferenced {
                         expr,
                         found: oprnd_t.store(),
+                        at_error,
                     });
                     oprnd_t = self.types.types.error;
                 }
@@ -1507,7 +1592,13 @@ impl<'db> InferenceContext<'db> {
 
         let (ctxt, tail_expr_ty) =
             self.with_breakable_ctx(BreakableKind::Block, Some(coerce_ty), label, |this| {
-                for stmt in statements {
+                for (index, stmt) in statements.iter().enumerate() {
+                    if matches!(stmt, Statement::Item(_)) {
+                        continue;
+                    }
+                    // rustc's `check_stmt`: the statement, and the outer divergence hidden.
+                    this.warn_if_unreachable(UnreachableAt::Stmt { block: expr, index: index as u32 });
+                    let old_diverges = mem::replace(&mut this.diverges, Diverges::Maybe);
                     match stmt {
                         Statement::Let { pat, type_ref, initializer, else_branch, .. } => {
                             let decl_ty = type_ref
@@ -1544,6 +1635,7 @@ impl<'db> InferenceContext<'db> {
                         }
                         Statement::Item(_) => (),
                     }
+                    this.diverges |= old_diverges;
                 }
 
                 // check the tail expression **without** holding the
@@ -2158,6 +2250,11 @@ impl<'db> InferenceContext<'db> {
                     skip_indices.next();
                     continue;
                 }
+                // Only in the first pass: a closure can't diverge, but an argument before it
+                // can (`f(panic!(), || {})`).
+                if !check_closures {
+                    self.warn_if_unreachable(UnreachableAt::Expr(*arg));
+                }
 
                 // For this check, we do *not* want to treat async coroutine closures (async blocks)
                 // as proper closures. Doing so would regress type inference when feeding
@@ -2204,6 +2301,69 @@ impl<'db> InferenceContext<'db> {
         let res = cb(self);
         let ctx = self.breakables.pop().expect("breakable stack broken");
         (ctx, res)
+    }
+
+    /// rustc's `require_label_in_labeled_block`: whether the innermost of the labeled blocks,
+    /// loops and closures around an unlabeled `break`/`continue` is a labeled block, E0695. An
+    /// unlabeled block, or a `try` block (whose label is desugared), is not one.
+    fn in_labeled_block(&self) -> bool {
+        self.breakables
+            .iter()
+            .rev()
+            .find_map(|ctx| match ctx.kind {
+                BreakableKind::Block => {
+                    ctx.label.filter(|&label| !self.store[label].name.is_generated()).map(|_| true)
+                }
+                BreakableKind::Loop | BreakableKind::Border => Some(false),
+            })
+            .unwrap_or(false)
+    }
+
+    /// `ty` as inference has it at an error (`types_at_error`, for one type).
+    pub(super) fn ty_at_error(&self, ty: Ty<'db>) -> Option<StoredTy> {
+        self.types_at_error(ty, self.types.types.unit).map(|it| it.0)
+    }
+
+    /// rustc's `warn_if_unreachable`: `what` is unreachable when what came before it in its
+    /// parent diverged. Once per divergence (`WarnedAlways`). The `#[automatically_derived]`
+    /// rule is applied when the body is done (`in_automatically_derived_impl`).
+    pub(super) fn warn_if_unreachable(&mut self, what: UnreachableAt) {
+        let Diverges::Always { span, custom_note } = self.diverges else { return };
+        self.diverges = Diverges::WarnedAlways;
+        self.unreachable.push(Unreachable { what, after: span, note: custom_note });
+    }
+
+    /// The lang item the callee of `call` names, when hir-def wrote it as a lang path: only
+    /// its desugarings (`?`, `for`, `try` blocks, `format_args!`) do.
+    fn lang_callee(&self, call: ExprId) -> Option<LangItemTarget> {
+        let Expr::Call { callee, .. } = self.store.expr(call) else { return None };
+        match self.store.expr(callee) {
+            Expr::Path(Path::LangItem(target, _)) => Some(*target),
+            _ => None,
+        }
+    }
+
+    /// A `try` block's `Try::from_output(..)` of its tail: rustc's call with a `TryBlock`
+    /// desugaring span.
+    fn is_try_block_output(&self, call: ExprId) -> bool {
+        let Some(from_output) = self.lang_items.TryTraitFromOutput else { return false };
+        self.lang_callee(call) == Some(LangItemTarget::FunctionId(from_output))
+    }
+
+    /// A `try` block's `Try::from_output(())` where the block has no tail: hir-def allocates
+    /// that `()` after the callee's path, and a tail that is written before it.
+    fn is_try_block_output_of_unit(&self, call: ExprId) -> bool {
+        let Expr::Call { callee, args: &[arg] } = self.store.expr(call) else { return false };
+        arg > callee
+            && matches!(self.store.expr(arg), Expr::Tuple { exprs: [] })
+            && self.is_try_block_output(call)
+    }
+
+    /// Whether a `match` of `scrutinee` is a desugaring (rustc's `MatchSource` other than
+    /// `Normal`): `?` matches on `Try::branch(..)`, a `for` loop on `IntoIterator::into_iter(..)`
+    /// and `Iterator::next(..)`.
+    fn is_desugared_match(&self, scrutinee: ExprId) -> bool {
+        self.lang_callee(scrutinee).is_some()
     }
 }
 

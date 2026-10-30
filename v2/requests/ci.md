@@ -185,3 +185,12 @@ length or read past the input. One thing to decide, not a crash:
   holds these inputs (`status-by-field-index.hex`, `status-with-an-unknown-field.hex`).
 
 > applied (ci DONE): both decoders (`cbor/de.rs`, `cbor/reference/de.rs`) take a field or variant only as text, refusing its index or its name as bytes ("a field or variant not named as text"), with test `a_field_is_named_only_as_text`. refused for the rest: unknown fields and a missing `Option` stay accepted, since stores read with this decoder (`blaze-query`, `blaze-units`, `blaze-cargo`) lean on `#[serde(default)]` and nothing hashes or records client bytes; an encoded envelope is canonical either way.
+
+## dedup: an intent-deadline scan kept on purpose, said so
+
+From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_core::wheel::Wheel` is the
+one timer queue; `crates/blaze-api/src/session/intent.rs` `Intents::deadline` scans instead, on
+purpose. Its doc `/// The earliest deadline of an open intent.` gains a second line:
+`/// A scan, not a timing wheel: one intent per waiting client, a few at once.`
+
+> applied by requests (ci DONE): the second doc line on `Intents::deadline` in `crates/blaze-api/src/session/intent.rs`.

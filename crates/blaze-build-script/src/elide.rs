@@ -17,8 +17,9 @@
 //! Anything else is `None`, and the script is compiled and run as any other. The tokens are
 //! this crate's own ([`lex`]), so elision depends on no front end. They are read one at a
 //! time as the forms ask for them, so most scripts (which start with `use`) are refused at
-//! their first token, and nothing is allocated per token: one buffer holds a macro call's
-//! arguments and one what is printed, each reused.
+//! their first token, and nothing is allocated per token: a macro call's arguments are held
+//! in the task's frame ([`blaze_mem::Frame`]) and what is printed in the caller's buffer
+//! ([`elide_into`]), each reused.
 
 pub mod lex;
 
@@ -26,6 +27,8 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+
+use blaze_mem::{Frame, Tag, frame, scratch::Lent};
 
 use self::lex::{Kind, Token, Tokens};
 use crate::Error;
@@ -40,15 +43,32 @@ use crate::Error;
 /// The verdict is the source's alone: the flags the script itself is compiled with must be
 /// ones [`flags_allow`] accepts.
 pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>> {
-    let source = files.get(root)?;
+    // alloc: the edge: the printed bytes, owned, which the caller keeps as the run's output.
+    let mut out = Vec::new();
+    elide_into(root, files, &mut out).then_some(out)
+}
+
+/// [`elide`] into the caller's buffer, which it reuses across scripts: whether the script
+/// prints what its source proves, with the bytes written to `out` (emptied first, and left
+/// empty when not). Its temporaries are bumped in the task's frame
+/// ([`blaze_mem::frame::task`]), so a warm read allocates nothing.
+pub fn elide_into(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let Some(source) = files.get(root) else { return false };
     if !may_open_main(source) {
-        return None;
+        return false;
     }
-    let source = std::str::from_utf8(source).ok()?;
+    let Ok(source) = std::str::from_utf8(source) else { return false };
     let len = source.len();
-    let source = lex::normalize(source);
-    let printed = printed(Tokens::new(&source).ok()?, len)?;
-    directives_only(&printed).then(|| printed.into_bytes())
+    let read = frame::task(Tag::Usercode, |frame| {
+        let source = lex::normalize(source, frame);
+        printed(Tokens::new(source).ok()?, len, out, frame)
+    });
+    let kept = read.is_some() && directives_only(out);
+    if !kept {
+        out.clear();
+    }
+    kept
 }
 
 /// Whether `flags`, the flags blaze compiles a build script itself with (not its unit's
@@ -134,9 +154,9 @@ pub fn verify(elided: &[u8], ran: &[u8]) -> Result<(), Error> {
 }
 
 /// Every line a cargo directive, the last ended.
-fn directives_only(printed: &str) -> bool {
-    let Some(lines) = printed.strip_suffix('\n') else { return printed.is_empty() };
-    lines.split('\n').all(|line| line.starts_with("cargo:"))
+fn directives_only(printed: &[u8]) -> bool {
+    let Some(lines) = printed.strip_suffix(b"\n") else { return printed.is_empty() };
+    lines.split(|it| *it == b'\n').all(|line| line.starts_with(b"cargo:"))
 }
 
 /// The next token, or none at the end or at a refusal: either leaves the script unread.
@@ -166,25 +186,26 @@ const PRINTED_PER_BYTE: usize = 16;
 const ARGS: usize = 8;
 
 /// What is printed so far, never longer than `limit` bytes.
-struct Printed {
-    text: String,
+struct Printed<'o> {
+    /// The caller's buffer, empty at the start.
+    text: &'o mut Vec<u8>,
     limit: usize,
 }
 
-impl Printed {
+impl Printed<'_> {
     /// `piece` added, or `None` when that would pass the limit.
     fn push(&mut self, piece: &str) -> Option<()> {
         if self.text.len() + piece.len() > self.limit {
             return None;
         }
-        self.text.push_str(piece);
+        self.text.extend_from_slice(piece.as_bytes());
         Some(())
     }
 }
 
 /// What the script of `tokens`, whose source is `len` bytes, prints, if it is of the forms read
 /// and prints no more than [`PRINTED_PER_BYTE`] bytes per byte of it.
-fn printed(mut tokens: Tokens<'_>, len: usize) -> Option<String> {
+fn printed(mut tokens: Tokens<'_>, len: usize, text: &mut Vec<u8>, frame: &Frame) -> Option<()> {
     let mut token = next(&mut tokens)?;
     while token.kind == Kind::InnerDoc {
         token = next(&mut tokens)?;
@@ -200,11 +221,16 @@ fn printed(mut tokens: Tokens<'_>, len: usize) -> Option<String> {
     if !head_ok {
         return None;
     }
-    // alloc: the printed text, which is the result: a script of directives prints less than it is.
-    let mut out = Printed { text: String::with_capacity(len), limit: PRINTED_PER_BYTE * len };
-    // alloc: setup, once per script read: the arguments of each macro call in turn.
-    let mut args: Vec<Token<'_>> = Vec::with_capacity(ARGS);
-    let mut scratch = Scratch::default();
+    // The caller's buffer grows to its high-water mark once: a script of directives prints
+    // less than it is.
+    text.reserve(len);
+    let mut out = Printed { text, limit: PRINTED_PER_BYTE * len };
+    let mut args: Vec<Token<'_>, &Frame> = Vec::with_capacity_in(ARGS, frame);
+    let mut scratch = Scratch {
+        spec: blaze_mem::scratch::lend_string(),
+        used: Vec::new_in(frame),
+        arg: blaze_mem::scratch::lend_string(),
+    };
     let mut token = next(&mut tokens)?;
     while !token.is_punct('}') {
         let newline = match &token {
@@ -246,18 +272,17 @@ fn printed(mut tokens: Tokens<'_>, len: usize) -> Option<String> {
             }
         }
     }
-    tokens.next().is_none().then_some(out.text)
+    tokens.next().is_none().then_some(())
 }
 
 /// What [`format`] reuses from one macro call to the next.
-#[derive(Default)]
-struct Scratch {
+struct Scratch<'f> {
     /// A format string's value, when an escape made it differ from its text.
-    spec: String,
+    spec: Lent<String>,
     /// Which arguments a placeholder used.
-    used: Vec<bool>,
+    used: Vec<bool, &'f Frame>,
     /// A string argument's value, when an escape made it differ from its text.
-    arg: String,
+    arg: Lent<String>,
 }
 
 /// What `format_args!` (with `println!`'s newline) makes of `args`, added to `out`. The
@@ -266,8 +291,8 @@ struct Scratch {
 fn format(
     args: &[Token<'_>],
     newline: bool,
-    out: &mut Printed,
-    scratch: &mut Scratch,
+    out: &mut Printed<'_>,
+    scratch: &mut Scratch<'_>,
 ) -> Option<()> {
     let (spec, rest) = args.split_first()?;
     let spec: &str = match spec.kind {
@@ -351,7 +376,7 @@ fn displayable(token: &Token<'_>) -> bool {
 
 /// A literal as `Display` shows it, added to `out`: a string's value (decoded into `scratch`
 /// when it has escapes), a character, a number in decimal, `true` or `false`.
-fn write_arg(token: &Token<'_>, out: &mut Printed, scratch: &mut String) -> Option<()> {
+fn write_arg(token: &Token<'_>, out: &mut Printed<'_>, scratch: &mut String) -> Option<()> {
     match token.kind {
         Kind::Str { escaped: false, .. } => out.push(&token.text[1..token.text.len() - 1]),
         Kind::Str { escaped: true, .. } => {

@@ -80,3 +80,39 @@ Questions: window `solver-sync`.
 
 > forwarded to db: db-ty-next1 is its child.
 > applied by db-ty-port-solver: items 2 to 5 (`solver.rs`, `fulfill.rs`, `normalize.rs`, `structural_normalize.rs`, `obligation_ctxt.rs`, `inspect.rs`, `format_proof_tree.rs`); `normalize.rs`/`structural_normalize.rs` need `InferCtxt::next_term_var_of_alias_kind` (v2/requests/db-ty.md, db-ty-port-solver).
+
+## 4. Lane mem and lane db: reserved address ranges for hir-ty's type tables
+
+What: `crates/hir-ty/src/next_solver/interner.rs`'s `table::Column` grows in segments, so every
+row read first loads its segment's base. With a reserved range per column (2^30 rows × the
+row's size of virtual address space, committed a page at a time as rows arrive, never moved or
+freed), a row is at `base + row × size`. That needs:
+- lane mem: blaze-mem's region API usable from a `static` (a `const`-constructible handle
+  that reserves on first use), as salsa's memo columns use it;
+- lane db: `blaze-mem` as a dependency of `crates/hir-ty/Cargo.toml`.
+
+solver-sync then moves `Column` onto it, in its own file.
+
+Why: the speed-of-light bar. It takes an intern hit from about 41 to 33 cycles and a handle
+read from about 15 cycles to the bound of about 6 (with the change in section 2 of
+`docs/v2/plan/lanes/solver-sync/speed-of-light.md`).
+
+## 5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`
+
+What: add `compiler/rustc_transmute` to `/tmp/rust-solver`'s sparse checkout, at the same
+commit (`git -C /tmp/rust-solver sparse-checkout add compiler/rustc_transmute`, which fetches
+its blobs). solver-sync then:
+- vendors it as `vendor/rustc_transmute` with the `rustc` feature off: the layout tree, the
+  DFA/NFA and the query are generic over `Def`/`Ref` traits, and only the `rustc` feature ties
+  them to `rustc_middle`;
+- records its own `PATCHES.md` series and adds it to `tools/v2/solver_sync.py`'s `CRATES`, so
+  it follows each nightly.
+
+Then hir-ty implements the crate's `Def`/`Ref`/`Region`/`Type` traits and builds `Tree`s from
+its own layouts, which ports rustc's `Tree::from_ty`. That is lane db's, in `solver.rs`
+(db-ty-port-solver), whose `is_transmutable` then calls it in place of today's panic. Its owner
+gets a request when the crate is vendored.
+
+Why: `SolverDelegate::is_transmutable` must give rustc's answer to `TransmuteFrom` goals
+(superset-of-rust). Today it stops with an error naming the goal (`solver.rs:618`), which is
+right until the port exists. solver-sync fetches nothing itself.

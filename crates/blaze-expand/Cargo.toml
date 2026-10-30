@@ -35,5 +35,8 @@ proc-macro-api.workspace = true
 span.workspace = true
 tt.workspace = true
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [lints]
 workspace = true

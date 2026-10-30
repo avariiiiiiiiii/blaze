@@ -10,13 +10,14 @@
 //! and harder to understand.
 
 mod builtin_derive_macro;
+mod builtin_errors;
 mod builtin_fn_macro;
 mod mbe;
 mod proc_macros;
 
 use std::{any::TypeId, iter, ops::Range, sync};
 
-use base_db::SourceDatabase;
+use base_db::Db;
 use expect_test::Expect;
 use hir_expand::{
     AstId, ExpansionInfo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind,
@@ -46,7 +47,7 @@ use crate::{
     expr_store::Body,
     nameres::{DefMap, ModuleSource, crate_def_map},
     src::HasSource,
-    test_db::TestDB,
+    test_db::{TestDB, TestDBExt},
     tt::TopSubtree,
 };
 
@@ -259,7 +260,7 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 }
 
 fn resolve_macro_call_id(
-    db: &dyn SourceDatabase,
+    db: &Db,
     def_map: &DefMap,
     ast_id: AstId<ast::MacroCall>,
     ast_ptr: InFile<AstPtr<ast::MacroCall>>,
@@ -389,7 +390,7 @@ struct IdentityWhenValidProcMacroExpander;
 impl ProcMacroExpander for IdentityWhenValidProcMacroExpander {
     fn expand(
         &self,
-        _: &dyn SourceDatabase,
+        _: &Db,
         subtree: &TopSubtree,
         _: Option<&TopSubtree>,
         _: &base_db::Env,

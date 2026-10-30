@@ -5,7 +5,7 @@ use std::{
 
 use super::*;
 
-/// SplitMix64.
+/// SplitMix64, a copy of `blaze_ids::rng::SplitMix64`: `blaze-ids` depends on this crate.
 struct Rng(u64);
 
 impl Rng {
@@ -242,14 +242,84 @@ fn a_large_sort_runs_on_the_ambient_workers() {
 #[test]
 fn digits_every_key_shares_are_skipped() {
     let shifts = |plan: Plan| plan.shifts().to_vec();
-    assert_eq!(shifts(plan(0u64, 1000)), Vec::<u32>::new());
-    assert_eq!(shifts(plan(0xFFu64 << 40, 1000)), [40]);
-    assert_eq!(shifts(plan(0x1_0000_0001u64, 1000)), [0, 32]);
-    assert_eq!(shifts(plan(u32::MAX, 1000)), [0, 8, 16, 24], "8 bits below WIDE");
-    assert_eq!(shifts(plan(u32::MAX, WIDE)), [0, 11, 22], "11 bits from WIDE, a pass fewer");
-    assert_eq!(shifts(plan(0xFFFFu32, WIDE)), [0, 8], "two passes of 8 bits, as many of 11");
-    assert_eq!(plan(u64::MAX, WIDE).len, 6);
-    assert_eq!(plan(u128::MAX, 10).len, 16);
+    let all = usize::MAX;
+    assert_eq!(shifts(plan(0u64, 1000, all)), Vec::<u32>::new());
+    assert_eq!(shifts(plan(0xFFu64 << 40, 1000, all)), [40]);
+    assert_eq!(shifts(plan(0x1_0000_0001u64, 1000, all)), [0, 32]);
+    assert_eq!(shifts(plan(u32::MAX, 1000, all)), [0, 8, 16, 24], "8 bits below WIDE");
+    assert_eq!(shifts(plan(u32::MAX, WIDE, all)), [0, 11, 22], "11 bits from WIDE, a pass fewer");
+    assert_eq!(shifts(plan(0xFFFFu32, WIDE, all)), [0, 8], "two passes of 8 bits, as many of 11");
+    assert_eq!(plan(u64::MAX, WIDE, all).len, 6);
+    assert_eq!(plan(u128::MAX, 10, all).len, 16);
+    assert_eq!(plan(u128::MAX, WIDE, all).len, 12);
+}
+
+#[test]
+fn the_stack_counters_hold_every_plan_they_are_given() {
+    assert_eq!(plan(u64::MAX, WIDE, STACK_COUNTERS).len, 6, "a u64's 11-bit plan fits");
+    assert_eq!(plan(u128::MAX, WIDE, STACK_COUNTERS).mask, 255, "a u128's 12 wide passes don't");
+    assert_eq!(plan(u128::MAX, WIDE, STACK_COUNTERS).len, 16);
+    assert!((MAX_DIGITS + 1) * 256 <= STACK_COUNTERS);
+}
+
+#[test]
+fn sorting_in_a_given_scratch_is_the_same_sort() {
+    let mut rng = Rng(9);
+    let mut scratch = Vec::new();
+    for n in sizes() {
+        for shape in 0..SHAPES {
+            let pairs = pairs_of(&keys(&mut rng, n, shape));
+            let want = stable(&pairs);
+            let mut got = pairs.clone();
+            sort_copy_by_key_in(&mut got, |it| it.0, &mut scratch);
+            assert_eq!(got, want, "n {n}, shape {shape}");
+        }
+    }
+    let wide: Vec<(u128, u32)> =
+        (0..WIDE as u32 + 7).map(|at| (((rng.next() as u128) << 64) | rng.next() as u128, at)).collect();
+    let mut want = wide.clone();
+    want.sort_by_key(|it| it.0);
+    let mut got = wide;
+    sort_copy_by_key_in(&mut got, |it| it.0, &mut scratch);
+    assert_eq!(got, want, "u128 keys from WIDE take 8-bit digits on the stack");
+}
+
+/// A scratch left longer than the next sort, from the serial or the parallel path, is reused
+/// by both.
+#[test]
+fn a_reused_scratch_sorts_the_same_on_workers() {
+    let mut rng = Rng(12);
+    let mut scratch = Vec::new();
+    for n in [PARALLEL + 777, 5000, PARALLEL, SMALL + 1] {
+        for shape in [0, 1, 6] {
+            let pairs = pairs_of(&keys(&mut rng, n, shape));
+            let want = stable(&pairs);
+            for workers in [&Serial as &dyn Workers, &Pretend(5), &Threads(4)] {
+                let mut got = pairs.clone();
+                on(workers).sort_copy_by_key_in(&mut got, |it| it.0, &mut scratch);
+                assert_eq!(got, want, "n {n}, shape {shape}, {} threads", workers.threads());
+            }
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[test]
+fn a_sort_in_a_scratch_with_room_allocates_nothing() {
+    let mut rng = Rng(10);
+    for n in [SMALL + 1, 5000, WIDE + 3] {
+        let items: Vec<u64> = keys(&mut rng, n, 0);
+        let mut scratch = Vec::with_capacity(n);
+        let mut got = items.clone();
+        let ((), used) =
+            blaze_alloc_count::measure(|| sort_copy_by_key_in(&mut got, |it| *it, &mut scratch));
+        assert_eq!(used.allocations, 0, "n {n}");
+        let mut want = items;
+        want.sort();
+        assert_eq!(got, want, "n {n}");
+    }
 }
 
 #[test]

@@ -10,11 +10,15 @@
 //! Positions the program observes (`line!()`, `Location`) and debug info are filled here
 //! from the span side tables, so a reformat compiles nothing.
 
+#![feature(allocator_api)]
+
+mod arena;
 mod commit;
 mod cow;
 mod dwarf;
 mod elf;
 mod file;
+mod intern;
 mod live;
 mod macho;
 mod model;
@@ -46,8 +50,7 @@ use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
-use bumpalo::Bump;
-use bumpalo::collections::Vec as BumpVec;
+use blaze_mem::Frame;
 use rustc_hash::FxHashMap;
 
 pub use output::{Debug, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
@@ -140,7 +143,7 @@ pub struct Image {
     generations: u64,
     /// Each stage's scratch, reset when the next begins: a stage like the last one finds its
     /// room already there.
-    arena: Bump,
+    arena: Frame,
     /// Bytes reused for keys written out to be hashed, across stages.
     scratch: Vec<u8>,
 }
@@ -175,14 +178,16 @@ impl Image {
             output,
             writer,
             plan,
-            symbols: Symbols::default(),
+            // alloc: error path
+            symbols: Symbols::new().map_err(|error| fail(error.to_string()))?,
             objects: FxHashMap::default(),
             state: State::new(),
             history: VecDeque::with_capacity(commit::HISTORY + 1),
             pending: None,
             tags: 0,
             generations: blaze_live::patch::FIRST_GENERATION,
-            arena: Bump::new(),
+            // alloc: error path
+            arena: arena::stage_frame().map_err(|error| fail(error.to_string()))?,
             scratch: Vec::with_capacity(64),
         })
     }
@@ -196,7 +201,7 @@ impl Image {
         }
         let full = !self.state.laid_out || !self.output.incremental;
         let table = has_table(&self.output, self.plan.indexed_code);
-        // clone: O(1), every column chunk and page shared until written (state.rs)
+        // clone: reference counts and the regions list; columns and pages are shared until written (state.rs)
         let mut new = self.state.clone();
         new.generation = self.generations + 1;
         if new.wants_compaction() {
@@ -204,7 +209,7 @@ impl Image {
         }
         self.arena.reset();
         let arena = &self.arena;
-        let contents = Contents::new(new.piece_count());
+        let contents = Contents::new(new.piece_count(), arena);
         let mut stage = Stage {
             output: &self.output,
             writer: &self.writer,
@@ -217,19 +222,19 @@ impl Image {
             name: &self.name,
             arena,
             contents,
-            fresh: Default::default(),
-            write: Default::default(),
-            changed: Default::default(),
-            dirty_cells: Default::default(),
-            removed: BumpVec::new_in(arena),
-            emptied: BumpVec::new_in(arena),
-            touched: BumpVec::new_in(arena),
-            counted: BumpVec::new_in(arena),
+            fresh: cow::IdSet::new_in(arena),
+            write: cow::IdSet::new_in(arena),
+            changed: cow::SymSet::new_in(arena),
+            dirty_cells: cow::IdSet::new_in(arena),
+            removed: Vec::new_in(arena),
+            emptied: Vec::new_in(arena),
+            touched: Vec::new_in(arena),
+            counted: Vec::new_in(arena),
             full,
             table,
             functions: 0,
             statics: 0,
-            owned: BumpVec::new_in(arena),
+            owned: Vec::new_in(arena),
             scratch: &mut self.scratch,
             spans_changed: false,
         };

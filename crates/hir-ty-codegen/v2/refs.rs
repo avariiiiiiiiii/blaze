@@ -13,6 +13,7 @@
 
 use std::{borrow::Cow, hash::BuildHasher};
 
+use base_db::Db;
 use blaze_codegen::backend::FrontRef;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hashbrown::{HashTable, hash_table::Entry};
@@ -30,7 +31,7 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
-    AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, MirBody, MirPhase, MirSpan, Operand,
+    AssertKind, BasicBlockId, BinOp, CastKind, InlineAsm, InlinedBody, MirBody, MirPhase, Operand,
     OperandKind, PlaceTy, Rvalue, StatementKind, StoredPlace, TerminatorKind, interpret_mir,
     is_by_move_coroutine,
     location::{located_concats, track_caller},
@@ -38,7 +39,7 @@ use hir_ty_mir::mir::{
 };
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use salsa::plumbing::AsId;
 use smallvec::{SmallVec, smallvec};
@@ -65,46 +66,54 @@ mod tests;
 pub(super) type Tys<'db> = SmallVec<[Ty<'db>; 8]>;
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
-/// owned.
+/// owned. `inlined` is whether a unit of it MIR-inlines bodies of crates other than the
+/// library's (`Spec::mir_inline`), whose code then asks for what they call.
 pub(crate) fn walk(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &HirInstance,
+    inlined: bool,
     _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
-    listed(db, instance).map(Cow::into_owned)
+    listed(db, instance, inlined).map(Cow::into_owned)
 }
 
 /// [`walk`], borrowed from the database's memo where it has one: what `prepare` places the
 /// IR's requests by, with nothing copied.
 pub(crate) fn listed<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &HirInstance,
+    inlined: bool,
 ) -> Result<Cow<'db, [Ref]>, String> {
     match &instance.0 {
         Kind::Allocator(forward) => Ok(Cow::Owned(super::allocator::walk(forward))),
-        _ => walked(db, instance).map(Cow::Borrowed),
+        _ => walked(db, instance, inlined).map(Cow::Borrowed),
     }
 }
 
 /// Everything the IR of `instance` can request, each once, in the order of its MIR, walked once
 /// a revision ([`code_walk`], [`start_walk`]) as rustc's collector has `items_of_instance`: a
 /// second asker (`describe`, then `prepare`) gets the list of the first and allocates nothing.
+/// The list for `inlined` starts with the one without, and is the same walk where the
+/// instance's body has nothing inlined.
 pub(crate) fn walked<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &HirInstance,
+    inlined: bool,
 ) -> Result<&'db [Ref], String> {
-    memo(db, instance).map(|it| it.map_or(&[][..], |it| &it.refs))
+    memo(db, instance, inlined).map(|it| it.map_or(&[][..], |it| &it.refs))
 }
 
 /// The places among [`walked`] of the callees whose bodies the IR of `instance` builds in, in
-/// the order found: [`blaze_codegen::backend::Described::built_in`].
+/// the order found: [`blaze_codegen::backend::Described::built_in`]. Those the MIR optimizer
+/// inlined, and those the IR builder builds in itself (`declare_inlined`).
 pub(crate) fn built_in<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &HirInstance,
+    inlined: bool,
 ) -> Result<&'db [u32], String> {
     match &instance.0 {
         Kind::Allocator(_) => Ok(&[]),
-        _ => memo(db, instance).map(|it| it.map_or(&[][..], |it| &it.built_in)),
+        _ => memo(db, instance, inlined).map(|it| it.map_or(&[][..], |it| &it.built_in)),
     }
 }
 
@@ -117,18 +126,28 @@ pub(crate) struct Walked {
 
 /// The walk of `instance`; `None` for one that names nothing.
 fn memo<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: &HirInstance,
+    inlined: bool,
 ) -> Result<Option<&'db Walked>, String> {
     let walked = match &instance.0 {
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
         // assembly function with a relocation.
         Kind::Asm(_) => return Ok(None),
+        // `lang_start` is the library's, and its bodies are inlined in every unit.
         Kind::Start(main) => start_walk(db, *main),
         Kind::Allocator(forward) => {
             return Err(format!("{forward:?}: an allocator entry, whose references are listed"));
         }
-        Kind::Code(code, env) => code_walk(db, code.clone(), env.clone()),
+        Kind::Code(code, env) => {
+            // One walk where the inliner changes nothing: a shim's, a coroutine's, and a body
+            // of the library's, which is inlined in every unit.
+            let inlined = inlined
+                && matches!(code.def, InstanceDef::Fn(_) | InstanceDef::Closure(_))
+                && super::frontend::crate_of(db, &instance.0)
+                    .is_some_and(|it| !it.data(db).origin.is_lang());
+            code_walk(db, code.clone(), env.clone(), inlined)
+        }
     };
     match walked {
         Ok(walked) => Ok(Some(walked)),
@@ -140,24 +159,26 @@ fn memo<'db>(
 // fewer revisions), so they stay interned and are never verified.
 #[salsa::tracked(returns(ref), revisions = usize::MAX)]
 fn code_walk<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     instance: Instance,
     env: StoredParamEnvAndCrate,
+    inlined: bool,
 ) -> Result<Walked, String> {
-    code_refs(db, &instance, &env)
+    code_refs(db, &instance, &env, inlined)
 }
 
 #[salsa::tracked(returns(ref))]
-fn start_walk<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Walked, String> {
+fn start_walk<'db>(db: &'db Db, main: FunctionId) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, None, false, |walk| walk.start_shim(main))
 }
 
 /// The walk of a function, closure, `async` body or shim, as `instance_code` builds each.
 fn code_refs(
-    db: &dyn HirDatabase,
+    db: &Db,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
+    inlined: bool,
 ) -> Result<Walked, String> {
     let ty = || instance.args.as_ref().type_at(0);
     let shim_env = env.as_ref(db);
@@ -192,76 +213,128 @@ fn code_refs(
         }
         _ => (false, ExternAbi::Rust, false),
     };
-    let args = instance.args.clone();
-    scratch(db, env.as_ref(db), Some(body), tracked, |walk| {
+    // A body of the library's is inlined under `WALK` already, as in every unit; a coroutine
+    // has nothing inlined into it (`hir-ty-mir` `inline.rs`).
+    let written = body.owner.module(db).krate(db);
+    let inlined = match inlined && !written.data(db).origin.is_lang() && body.coroutine.is_none()
+    {
+        true => Some(
+            crate::instance_body(db, instance, env.clone(), Some(Build::WALK_INLINED))
+                .map_err(told)?,
+        ),
+        false => None,
+    };
+    let inlined = inlined.as_deref().filter(|it| !it.inlined.callees.is_empty());
+    let mut found = Found::new(env.clone(), Some(body));
+    let env = env.as_ref(db);
+    pass(db, env, Some(body), tracked, (Build::WALK, &mut found), |walk| {
         walk.fx.abi = abi;
         walk.fx.variadic = variadic;
-        walk.fx.args = Some(args);
+        walk.fx.args = Some(instance.args.clone());
+        walk.outside()?;
         walk.body(body)
-    })
+    })?;
+    if let Some(inlined) = inlined {
+        pass(db, env, Some(inlined), tracked, (Build::WALK_INLINED, &mut found), |walk| {
+            walk.fx.abi = abi;
+            walk.fx.variadic = variadic;
+            walk.fx.args = Some(instance.args.clone());
+            walk.body(inlined)
+        })?;
+    }
+    Ok(found.walked())
 }
 
-/// Runs `work` on a [`FunctionCx`] for `body` in `env` whose function is never built: what
-/// its resolvers ask for is all that is kept of it.
+/// Runs `work` on a [`FunctionCx`] for `body` in `env` whose function is never built, with
+/// what any function names ([`Walk::outside`]): what its resolvers ask for is all that is kept
+/// of it.
 fn scratch<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
     work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
 ) -> Result<Walked, String> {
+    let mut found = Found::new(env.store(), body);
+    pass(db, env, body, tracked, (Build::WALK, &mut found), |walk| {
+        walk.outside()?;
+        work(walk)
+    })?;
+    Ok(found.walked())
+}
+
+/// One walk of `body` built as `build` would build it, adding to `found`.
+fn pass<'db>(
+    db: &'db Db,
+    env: ParamEnvAndCrate<'db>,
+    body: Option<&'db MirBody<'db>>,
+    tracked: bool,
+    (build, found): (Build, &mut Found<'db>),
+    work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
+) -> Result<(), String> {
     let isa = &**crate::target().map_err(told)?;
     let target = crate::selected_target().map_err(told)?;
     let mut cg = Recorder::new(db, isa, target, true);
     // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
-    cg.unit = Some(Build::WALK);
-    // About one reference a block, and the few of `outside`.
-    let capacity = body.map_or(0, |it| it.basic_blocks.len()) + 8;
-    let mut walked = None;
+    cg.unit = Some(build);
+    let mut done = None;
     crate::build(&mut cg, env, body, tracked, |fx| {
         // The union of what the settings of a unit compile.
         fx.aborts = false;
         fx.debug_assertions = true;
         fx.ub_checks = true;
-        let mut walk = Walk {
-            fx,
-            homes: Homes::default(),
-            env: env.store(),
-            listed: Listed::with_capacity(capacity),
-            called: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
-            built_in: Vec::new(),
-            drained: (0, 0),
-        };
-        let done = walk.outside().and_then(|()| work(&mut walk)).and_then(|()| walk.drain());
-        walked = Some(done.map(|()| {
-            let mut refs = walk.listed.refs;
-            refs.shrink_to_fit();
-            Walked { refs, built_in: walk.built_in }
-        }));
+        let mut walk = Walk { fx, found: &mut *found, drained: (0, 0) };
+        done = Some(work(&mut walk).and_then(|()| walk.drain()));
         Ok(())
     })
     .map_err(told)?;
-    walked.expect("the walk ran")
+    done.expect("the walk ran")
 }
 
 fn told(error: CodegenError) -> String {
     error.to_string()
 }
 
-/// A walk of one instance.
+/// A walk of one body.
 pub(super) struct Walk<'w, 'cx, 'db> {
     fx: &'w mut FunctionCx<'cx, 'db>,
+    found: &'w mut Found<'db>,
+    /// How many of the function and data requests of `fx.cg` are in `found.listed`.
+    drained: (usize, usize),
+}
+
+/// What the walks of an instance's bodies found.
+struct Found<'db> {
     homes: Homes,
-    /// `fx.env`, as the requests hold it.
+    /// The walk's `fx.env`, as the requests hold it.
     env: StoredParamEnvAndCrate,
     listed: Listed,
-    /// The calls listed already, by their interned definition and arguments: a call made
-    /// again costs a hash of two ids and no homing (`places::call_ref`).
-    called: FxHashSet<(InstanceDef, GenericArgs<'db>)>,
-    /// The places in `listed` of the callees whose bodies are built in ([`Walked::built_in`]).
+    /// The calls listed already, by their interned definition and arguments, and the place of
+    /// each: a call made again costs a hash of two ids and no homing (`places::call_ref`).
+    called: FxHashMap<(InstanceDef, GenericArgs<'db>), u32>,
+    /// The places in `listed` of the callees whose bodies are built in ([`Walked::built_in`]),
+    /// each once.
     built_in: Vec<u32>,
-    /// How many of the function and data requests of `fx.cg` are in `listed`.
-    drained: (usize, usize),
+}
+
+impl<'db> Found<'db> {
+    fn new(env: StoredParamEnvAndCrate, body: Option<&MirBody<'_>>) -> Self {
+        // About one reference a block, and the few of `outside`.
+        let capacity = body.map_or(0, |it| it.basic_blocks.len()) + 8;
+        Found {
+            homes: Homes::default(),
+            env,
+            listed: Listed::with_capacity(capacity),
+            called: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            built_in: Vec::new(),
+        }
+    }
+
+    fn walked(self) -> Walked {
+        let mut refs = self.listed.refs;
+        refs.shrink_to_fit();
+        Walked { refs, built_in: self.built_in }
+    }
 }
 
 /// The references found so far, each once, in the order found, as rustc's collector keeps the
@@ -371,7 +444,7 @@ impl Blocks {
 }
 
 impl<'cx, 'db> Walk<'_, 'cx, 'db> {
-    pub(super) fn db(&self) -> &'db dyn HirDatabase {
+    pub(super) fn db(&self) -> &'db Db {
         self.fx.cg.db
     }
 
@@ -379,7 +452,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// builder's requests are placed: a function by its target, a static as itself or its
     /// symbol, with what Cranelift calls to reach a thread-local one.
     fn drain(&mut self) -> Result<(), String> {
-        let Walk { fx, homes, listed, drained, .. } = self;
+        let Walk { fx, found, drained } = self;
+        let Found { homes, listed, .. } = &mut **found;
         let db = fx.cg.db;
         let requests = &fx.cg.wants.requests;
         for request in &requests.funcs[drained.0..] {
@@ -413,7 +487,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     pub(super) fn add(&mut self, it: Ref) -> Result<(), String> {
         self.drain()?;
-        self.listed.add(it);
+        self.found.listed.add(it);
         Ok(())
     }
 
@@ -429,11 +503,50 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         args: GenericArgs<'db>,
     ) -> Result<Option<u32>, String> {
         self.drain()?;
-        if !self.called.insert((def, args)) {
+        if self.found.called.contains_key(&(def, args)) {
             return Ok(None);
         }
-        let it = places::call_ref(self.fx.cg.db, &mut self.homes, def, args, &self.env)?;
-        Ok(Some(self.listed.add(it)))
+        self.call_place(def, args).map(Some)
+    }
+
+    /// The place of the callee `def` with `args`, listed where it is not yet.
+    fn call_place(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<u32, String> {
+        let db = self.fx.cg.db;
+        let Found { homes, env, listed, called, .. } = &mut *self.found;
+        if let Some(&at) = called.get(&(def, args)) {
+            return Ok(at);
+        }
+        let at = listed.add(places::call_ref(db, homes, def, args, env)?);
+        called.insert((def, args), at);
+        Ok(at)
+    }
+
+    /// Lists the callee at `at` as one whose body is built in, once.
+    fn build_in(&mut self, at: u32) {
+        if !self.found.built_in.contains(&at) {
+            self.found.built_in.push(at);
+        }
+    }
+
+    /// The callees the MIR optimizer inlined into `body` (`MirBody::inlined`), whose code is
+    /// built in: a unit's key holds theirs ([`super::frontend::inlined`]). Their bodies'
+    /// requests are of `body`, which the walk of its blocks lists.
+    fn inlined_callees(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
+        for callee in &body.inlined.callees {
+            let def = match callee.body {
+                InlinedBody::Fn(func) => InstanceDef::Fn(func),
+                InlinedBody::Closure(closure) => InstanceDef::Closure(closure.as_id()),
+            };
+            let at = self.call_place(def, callee.args.as_ref())?;
+            if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
+                return Err(format!(
+                    "{def:?} is inlined, but its callers name it as {:?}",
+                    self.found.listed.refs[at as usize]
+                ));
+            }
+            self.build_in(at);
+        }
+        Ok(())
     }
 
     /// A call `call_as` makes of an instance, whose body the IR of a v2 unit builds in where
@@ -445,28 +558,28 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let Some((instance, body)) = self.fx.always_inlinable_callee(def, args) else {
             return Ok(());
         };
-        if !matches!(self.listed.refs[at as usize], FrontRef::Function(_)) {
+        if !matches!(self.found.listed.refs[at as usize], FrontRef::Function(_)) {
             return Err(format!(
                 "{instance:?} is built in, but its callers name it as {:?}",
-                self.listed.refs[at as usize]
+                self.found.listed.refs[at as usize]
             ));
         }
         self.fx.cg.declare_inlined(&instance, body, self.fx.builder.func);
-        self.built_in.push(at);
+        self.build_in(at);
         self.drain()
     }
 
     /// A function of no crate of the build, by its symbol: `Recorder::import`.
     pub(super) fn symbol(&mut self, name: &str) -> Result<(), String> {
         self.drain()?;
-        self.listed.symbol(Cow::Borrowed(name));
+        self.found.listed.symbol(Cow::Borrowed(name));
         Ok(())
     }
 
     /// A routine Cranelift calls itself, which no request names.
     pub(super) fn libcall(&mut self, libcall: ir::LibCall) -> Result<(), String> {
         self.drain()?;
-        self.listed.libcall(libcall);
+        self.found.listed.libcall(libcall);
         Ok(())
     }
 
@@ -559,12 +672,10 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// expanded to, which `builtin_location` makes of where it is: data that points nowhere
     /// else, a literal's when it does not.
     fn located(&self, operand: &Operand) -> bool {
-        let (Some(MirSpan::ExprId(expr)), Some(body)) = (operand.span(), self.fx.body) else {
-            return false;
-        };
-        let InferBodyId::DefWithBodyId(owner) = body.owner else { return false };
-        self.fx.location_macro(body, expr).is_some()
-            || located_concats(self.db(), owner).contains_key(&expr)
+        let Some((owner, expr)) = self.fx.written_expr(operand.span()) else { return false };
+        let InferBodyId::DefWithBodyId(def) = owner else { return false };
+        self.fx.location_macro(owner, expr).is_some()
+            || located_concats(self.db(), def).contains_key(&expr)
     }
 
     pub(super) fn static_(&mut self, id: StaticId) -> Result<(), String> {
@@ -788,7 +899,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                 self.terminator(&terminator.kind)?;
             }
         }
-        Ok(())
+        self.inlined_callees(body)
     }
 
     /// The blocks `codegen` compiles with every check on and unwinding, which are all that it
@@ -863,18 +974,20 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     /// the blocks lists too.
     fn promoted(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
         let db = self.db();
-        for &(local, expr) in &body.promoted_locals {
+        for promoted in crate::promoted_constants(db, body) {
+            let local = promoted.local;
             let Ok(layout) = self.fx.layout(body.locals[local].ty.as_ref()) else { continue };
-            if layout.size.bytes() == 0 || self.fx.mentions_location(body, expr) {
+            if layout.size.bytes() == 0 || self.fx.mentions_location(promoted.owner, promoted.expr)
+            {
                 continue;
             }
             let env = self.fx.env;
             let allocation = (|| {
                 let constant = monomorphized_promoted_mir_body_query(
                     db,
-                    body.owner,
-                    expr,
-                    self.fx.args.clone()?,
+                    promoted.owner,
+                    promoted.expr,
+                    promoted.args(body, self.fx.args.as_ref())?,
                     env.store(),
                 )
                 .ok()?;

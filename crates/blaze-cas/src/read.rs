@@ -238,8 +238,8 @@ impl Spot {
     }
 
     /// It, at `place`.
-    pub(crate) fn at(&self, place: Place) -> Box<Spot> {
-        Box::new(Spot::new(self.key, self.content, place, self.ticket))
+    pub(crate) fn at(&self, place: Place) -> Spot {
+        Spot::new(self.key, self.content, place, self.ticket)
     }
 }
 
@@ -297,7 +297,8 @@ impl Owned {
     /// Publishes `bytes` as the value made whole at `id`, or gives the one published first.
     fn keep<'a>(&'a self, held: Held<'a>, id: (u64, u64), content: ContentId, bytes: Vec<u8>) -> &'a [u8] {
         let len = bytes.len() as u64;
-        let decoded = Box::new(Decoded { id, content, bytes: bytes.into_boxed_slice() });
+        // alloc: the bytes made whole are the value itself, kept until the table is let go
+        let decoded = Decoded { id, content, bytes: bytes.into_boxed_slice() };
         match self.table.insert(held, decoded) {
             Ok((_, it)) => {
                 self.bytes.fetch_add(len, Ordering::Relaxed);

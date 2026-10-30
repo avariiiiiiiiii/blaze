@@ -120,8 +120,10 @@ impl Macro {
 
         let (db_lt_arg, cfg, interior_lt) = if has_lifetime {
             (
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 Some(db_lt.clone()),
                 quote!(#struct_ident<'static>),
+                // clone: proc macro, at expansion time once per annotated item; no query runs this
                 db_lt.clone(),
             )
         } else {
@@ -163,6 +165,7 @@ impl Macro {
                     )
                 }
             })
+            // alloc: proc macro, at expansion time once per annotated item; no query runs this
             .collect();
 
         Ok(crate::debug::dump_tokens(

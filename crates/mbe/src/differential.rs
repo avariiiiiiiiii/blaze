@@ -8,6 +8,8 @@
 
 use std::fmt::Write;
 
+use blaze_ids::rng::SplitMix64;
+
 use span::{
     Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext,
 };
@@ -348,34 +350,6 @@ fn benchmark_macros() {
     }
 }
 
-/// xorshift64*, for inputs that are the same on every run.
-struct Rng(u64);
-
-impl Rng {
-    fn new(seed: u64) -> Rng {
-        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
-    }
-
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-
-    fn chance(&mut self, percent: u64) -> bool {
-        self.next() % 100 < percent
-    }
-
-    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
-        items[self.below(items.len())]
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Ident,
@@ -483,40 +457,44 @@ enum Pat {
 }
 
 struct Gen {
-    rng: Rng,
+    rng: SplitMix64,
     vars: u32,
 }
 
 impl Gen {
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        *self.rng.pick(items).expect("a list to pick from is never empty")
+    }
+
     fn pattern(&mut self, len: usize, depth: u32, repeated: bool) -> Vec<Pat> {
         let mut out = Vec::with_capacity(len + 1);
         for _ in 0..len {
-            let roll = self.rng.below(100);
+            let roll = self.rng.index(100);
             let pat = if roll < 35 {
-                Pat::Token(self.rng.pick(&TOKENS))
+                Pat::Token(self.pick(&TOKENS))
             } else if roll < 75 {
                 let kind = if repeated {
-                    self.rng.pick(&REPEATED_KINDS)
+                    self.pick(&REPEATED_KINDS)
                 } else {
-                    self.rng.pick(&KINDS)
+                    self.pick(&KINDS)
                 };
                 self.vars += 1;
                 Pat::Var(self.vars - 1, kind)
             } else if roll < 87 && depth < 3 {
-                let len = 1 + self.rng.below(3);
-                Pat::Group(self.rng.below(DELIMITERS.len()), self.pattern(len, depth + 1, repeated))
+                let len = 1 + self.rng.index(3);
+                Pat::Group(self.rng.index(DELIMITERS.len()), self.pattern(len, depth + 1, repeated))
             } else if depth < 3 {
-                let len = 1 + self.rng.below(3);
+                let len = 1 + self.rng.index(3);
                 let body = self.pattern(len, depth + 1, true);
-                let separator = self.rng.chance(50).then(|| self.rng.pick(&SEPARATORS));
-                Pat::Rep { body, separator, op: self.rng.pick(&["*", "+", "?"]) }
+                let separator = (self.rng.index(100) < 50).then(|| self.pick(&SEPARATORS));
+                Pat::Rep { body, separator, op: self.pick(&["*", "+", "?"]) }
             } else {
-                Pat::Token(self.rng.pick(&TOKENS))
+                Pat::Token(self.pick(&TOKENS))
             };
             out.push(pat);
         }
         if repeated && out.iter().all(|it| matches!(it, Pat::Rep { .. })) {
-            out.push(Pat::Token(self.rng.pick(&TOKENS)));
+            out.push(Pat::Token(self.pick(&TOKENS)));
         }
         out
     }
@@ -526,12 +504,12 @@ impl Gen {
     /// variable at the wrong depth.
     fn template(&mut self, pats: &[Pat], nesting: u32, vars: &[u32], out: &mut String) {
         for pat in pats {
-            if self.rng.chance(10) {
+            if self.rng.index(100) < 10 {
                 out.push_str("0 ");
             }
             match pat {
                 Pat::Token(token) => {
-                    if self.rng.chance(70) {
+                    if self.rng.index(100) < 70 {
                         out.push_str(token);
                         out.push(' ');
                     }
@@ -549,11 +527,11 @@ impl Gen {
                     out.push_str("$( ");
                     self.template(body, nesting + 1, vars, out);
                     if !own.is_empty() {
-                        if self.rng.chance(20) {
+                        if self.rng.index(100) < 20 {
                             out.push_str("${index()} ");
                         }
-                        if self.rng.chance(15) {
-                            write!(out, "${{ignore($v{})}} ", self.rng.pick(&own)).unwrap();
+                        if self.rng.index(100) < 15 {
+                            write!(out, "${{ignore($v{})}} ", self.pick(&own)).unwrap();
                         }
                     }
                     out.push_str(") ");
@@ -567,18 +545,18 @@ impl Gen {
         // At the top only: inside a repetition, a variable bound outside it never ends the
         // repetition, which then runs to the transcriber's limit.
         if nesting == 0 && !vars.is_empty() {
-            if self.rng.chance(20) {
-                let depth = self.rng.below(3);
-                write!(out, "${{count($v{}, {depth})}} ", self.rng.pick(vars)).unwrap();
+            if self.rng.index(100) < 20 {
+                let depth = self.rng.index(3);
+                write!(out, "${{count($v{}, {depth})}} ", self.pick(vars)).unwrap();
             }
-            if self.rng.chance(15) {
-                write!(out, "$v{} ", self.rng.pick(vars)).unwrap();
+            if self.rng.index(100) < 15 {
+                write!(out, "$v{} ", self.pick(vars)).unwrap();
             }
-            if self.rng.chance(5) {
-                write!(out, "${{concat(x, $v{})}} ", self.rng.pick(vars)).unwrap();
+            if self.rng.index(100) < 5 {
+                write!(out, "${{concat(x, $v{})}} ", self.pick(vars)).unwrap();
             }
         }
-        if nesting == 0 && self.rng.chance(5) {
+        if nesting == 0 && self.rng.index(100) < 5 {
             out.push_str("$$ $zz ");
         }
     }
@@ -588,7 +566,7 @@ impl Gen {
             match pat {
                 Pat::Token(token) => out.push(*token),
                 Pat::Var(_, kind) => {
-                    let sample = self.rng.pick(kind.samples());
+                    let sample = self.pick(kind.samples());
                     if !sample.is_empty() {
                         out.push(sample);
                     }
@@ -601,9 +579,9 @@ impl Gen {
                 }
                 Pat::Rep { body, separator, op } => {
                     let times = match *op {
-                        "?" => self.rng.below(2),
-                        "+" => 1 + self.rng.below(3),
-                        _ => self.rng.below(4),
+                        "?" => self.rng.index(2),
+                        "+" => 1 + self.rng.index(3),
+                        _ => self.rng.index(4),
                     };
                     for time in 0..times {
                         if time > 0
@@ -620,19 +598,19 @@ impl Gen {
 
     /// Drops, adds or doubles a token now and then, never a delimiter.
     fn mutate(&mut self, pieces: &mut Vec<&'static str>) {
-        if !self.rng.chance(35) {
+        if self.rng.index(100) >= 35 {
             return;
         }
-        let at = self.rng.below(pieces.len() + 1);
+        let at = self.rng.index(pieces.len() + 1);
         let is_delimiter =
             |piece: &str| DELIMITERS.iter().any(|&(open, close)| piece == open || piece == close);
         let token = at < pieces.len() && !is_delimiter(pieces[at]);
-        match self.rng.below(3) {
+        match self.rng.index(3) {
             0 if token => {
                 pieces.remove(at);
             }
             1 if token => pieces.insert(at, pieces[at]),
-            _ => pieces.insert(at, self.rng.pick(&TOKENS)),
+            _ => pieces.insert(at, self.pick(&TOKENS)),
         }
     }
 }
@@ -696,17 +674,17 @@ fn random_macros() {
     let seeds = if test_utils::skip_slow_tests() { SEEDS } else { SLOW_SEEDS };
     let mut checked = 0;
     for seed in 0..seeds {
-        let mut generator = Gen { rng: Rng::new(seed), vars: 0 };
-        let def_edition = generator.rng.pick(&EDITIONS);
-        let call_edition = generator.rng.pick(&EDITIONS);
+        let mut generator = Gen { rng: SplitMix64::new(seed), vars: 0 };
+        let def_edition = generator.pick(&EDITIONS);
+        let call_edition = generator.pick(&EDITIONS);
         let mut decl = String::new();
         let mut patterns = Vec::new();
-        for _ in 0..1 + generator.rng.below(3) {
-            let len = 1 + generator.rng.below(5);
+        for _ in 0..1 + generator.rng.index(3) {
+            let len = 1 + generator.rng.index(5);
             let pattern = generator.pattern(len, 0, false);
             let mut vars = Vec::new();
             all_vars(&pattern, &mut vars);
-            match generator.rng.below(12) {
+            match generator.rng.index(12) {
                 0 => decl.push_str("attr() "),
                 1 => decl.push_str("derive() "),
                 _ => {}
@@ -721,7 +699,7 @@ fn random_macros() {
         let Some(def) = token_tree(0, def_edition, &decl) else { continue };
         let mac = DeclarativeMacro::parse_macro_rules(&def, |_| def_edition);
         for input_idx in 0..INPUTS_PER_MACRO {
-            let pattern = &patterns[generator.rng.below(patterns.len())];
+            let pattern = &patterns[generator.rng.index(patterns.len())];
             let mut pieces = Vec::new();
             generator.input(pattern, &mut pieces);
             generator.mutate(&mut pieces);

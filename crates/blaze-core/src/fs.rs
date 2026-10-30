@@ -1,5 +1,10 @@
 //! The blocking calls behind the effects, for [`crate::threads::Threads`]'s threads and for what
-//! [`crate::uring::Uring`] does where it is submitted.
+//! [`crate::uring::Uring`] does where it is submitted; and [`Mapped`], every crate's read-only
+//! file mapping.
+
+mod mapped;
+
+pub use mapped::{Advice, MapOptions, Mapped};
 
 #[cfg(unix)]
 use std::{fs::File, io::Write as _};
@@ -113,7 +118,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-pub(crate) use crate::iocp::files::{clone, map, rename, set_mode, write_atomically};
+pub(crate) use crate::iocp::files::{clone, rename, set_mode, write_atomically};
 
 #[cfg(unix)]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
@@ -255,68 +260,14 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// The file mapped read-only and shared. The store and the image replace a file only by
-/// renaming another over it, so the pages under a mapping are never written while it lives.
-#[cfg(unix)]
+/// The file mapped read-only and shared, for [`crate::Effect::Map`], as one [`Mapped`] that the
+/// last [`crate::Mapping`] of it unmaps.
 pub(crate) fn map(path: &Path) -> io::Result<crate::Mapping> {
-    use std::os::fd::AsRawFd as _;
-    let file = File::open(path)?;
-    let len = usize::try_from(file.metadata()?.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a file larger than memory"))?;
-    if len == 0 {
-        return Ok(crate::Mapping(std::sync::Arc::new(Vec::<u8>::new())));
-    }
-    // SAFETY: a shared read-only mapping of an open file's whole length; the descriptor may
-    // close after, the mapping keeps the file.
-    let at = unsafe {
-        libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
-    };
-    if at == libc::MAP_FAILED {
-        return Err(io::Error::last_os_error());
-    }
-    // Page-cache huge pages for a file of 2 MiB or more, where the file system makes them:
-    // the TLB covers a pack in hundreds of entries rather than hundreds of thousands. Only
-    // advice; the bytes read are the same either way.
-    #[cfg(target_os = "linux")]
-    if len >= 2 << 20 {
-        // SAFETY: the mapping made above, its whole length.
-        unsafe { libc::madvise(at, len, libc::MADV_HUGEPAGE) };
-    }
-    Ok(crate::Mapping(std::sync::Arc::new(Mapped { at: at.cast(), len })))
-}
-
-/// Pages mapped by [`map`], unmapped when the last [`crate::Mapping`] of them goes.
-#[cfg(unix)]
-struct Mapped {
-    at: *const u8,
-    len: usize,
-}
-
-// SAFETY: read-only pages no one writes while they are mapped: `Effect::Map`'s contract bars
-// in-place writes and truncates of a mapped file (the store and the image replace a file only
-// by renaming another over it), so threads share them as they would a `&[u8]`.
-#[cfg(unix)]
-unsafe impl Send for Mapped {}
-// SAFETY: as above.
-#[cfg(unix)]
-unsafe impl Sync for Mapped {}
-
-#[cfg(unix)]
-impl AsRef<[u8]> for Mapped {
-    fn as_ref(&self) -> &[u8] {
-        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives, never written or cut
-        // short meanwhile by `Effect::Map`'s contract; if they were, this slice would see a
-        // data race or fault.
-        unsafe { std::slice::from_raw_parts(self.at, self.len) }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Mapped {
-    fn drop(&mut self) {
-        // SAFETY: the mapping `map` made, unmapped once.
-        unsafe { libc::munmap(self.at.cast_mut().cast(), self.len) };
-    }
+    // SAFETY: `Effect::Map`'s contract: while any `Mapping` of the file lives, no effect writes,
+    // appends to or truncates it in place; the store and the image replace a file only by
+    // renaming another over it.
+    let mapped = unsafe { Mapped::open(path) }?;
+    Ok(crate::Mapping(std::sync::Arc::new(mapped))) // alloc: one per file mapped, at open
 }
 
 /// The [`Stamp`] of a `stat` of a name, not followed through a symlink.

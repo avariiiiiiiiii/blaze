@@ -17,9 +17,20 @@ use std::{
 
 use blaze_core::{Traced, Untraceable};
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{Frame, Tag, frame, scratch};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-const LISTING_DOMAIN: &str = "blaze v2 traced listing 1";
+/// The hash domain `$domain` of something [`os_bytes`] encodes names into: as it is where a
+/// name is its bytes, and another on Windows, where a name is its UTF-16 units, so what an
+/// older blaze keyed by other bytes there misses rather than being read as these.
+macro_rules! os_domain {
+    ($domain:literal) => {
+        if cfg!(windows) { concat!($domain, " utf-16le") } else { $domain }
+    };
+}
+pub(crate) use os_domain;
+
+const LISTING_DOMAIN: &str = os_domain!("blaze v2 traced listing 1");
 
 /// What a line says was seen.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -187,13 +198,90 @@ pub trait Inputs {
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
     /// The [`listing`] hash of the directory's names, `None` for no directory there.
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Self::Error>;
-    fn env(&mut self, name: &OsStr) -> Option<OsString>;
+    /// The variable's value, lent: a check hashes it where it is.
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr>;
     /// The whole environment, for a run that read all of it: sorted by name, each name once,
     /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
     fn env_all(&mut self) -> &[(OsString, OsString)];
-    /// The names in the directory, each with whether it is a directory, sorted; `None` for
-    /// no directory there. What [`package`] walks.
-    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Self::Error>;
+    /// The names in the directory, each with whether it is a directory, pushed to `out` (given
+    /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`package`]
+    /// walks.
+    fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Self::Error>;
+}
+
+/// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it
+/// is a directory: on Unix a name is its bytes, all of them packed in one buffer; elsewhere an
+/// `OsString` each, as [`os_in`] has them there.
+pub struct Names<'f> {
+    #[cfg(unix)]
+    bytes: Vec<u8, &'f Frame>,
+    /// Each name's `start..end` in `bytes`, and whether it is a directory.
+    #[cfg(unix)]
+    spans: Vec<(usize, usize, bool), &'f Frame>,
+    #[cfg(not(unix))]
+    names: Vec<(OsString, bool), &'f Frame>,
+}
+
+impl<'f> Names<'f> {
+    pub fn new_in(frame: &'f Frame) -> Names<'f> {
+        #[cfg(unix)]
+        let names = Names { bytes: Vec::new_in(frame), spans: Vec::new_in(frame) };
+        #[cfg(not(unix))]
+        let names = Names { names: Vec::new_in(frame) };
+        names
+    }
+
+    pub fn push(&mut self, name: &OsStr, dir: bool) {
+        #[cfg(unix)]
+        {
+            let start = self.bytes.len();
+            self.bytes.extend_from_slice(name.as_encoded_bytes());
+            self.spans.push((start, self.bytes.len(), dir));
+        }
+        #[cfg(not(unix))]
+        self.names.push((name.to_owned(), dir)); // alloc: a name off Unix, where no safe view of packed bytes gives it back.
+    }
+
+    /// In the order of the names' bytes, which is [`OsStr`]'s.
+    pub fn sort(&mut self) {
+        #[cfg(unix)]
+        {
+            let bytes = &self.bytes;
+            self.spans.sort_unstable_by(|a, b| bytes[a.0..a.1].cmp(&bytes[b.0..b.1]));
+        }
+        #[cfg(not(unix))]
+        self.names.sort_unstable();
+    }
+
+    pub fn len(&self) -> usize {
+        #[cfg(unix)]
+        let len = self.spans.len();
+        #[cfg(not(unix))]
+        let len = self.names.len();
+        len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, at: usize) -> (&OsStr, bool) {
+        #[cfg(unix)]
+        let got = {
+            let (start, end, dir) = self.spans[at];
+            (std::os::unix::ffi::OsStrExt::from_bytes(&self.bytes[start..end]), dir)
+        };
+        #[cfg(not(unix))]
+        let got = {
+            let (name, dir) = &self.names[at];
+            (name.as_os_str(), *dir)
+        };
+        got
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&OsStr, bool)> + '_ {
+        (0..self.len()).map(|at| self.get(at))
+    }
 }
 
 /// What a [`Traced`] names a package's whole tree by, below the package's directory: the
@@ -238,45 +326,57 @@ pub fn walk<I: Inputs + ?Sized>(
     dir: &Path,
     package: bool,
 ) -> Result<Option<[u8; 32]>, I::Error> {
-    let Some(top) = inputs.names(dir)? else { return Ok(None) };
-    let mut hasher = Hasher::new(match package {
-        true => "blaze v2 package tree 1",
-        false => "blaze v2 tree 1",
-    });
-    let mut whole = dir.to_path_buf();
-    walk_in(inputs, dir, &mut whole, top, (package, true), &mut hasher)?;
-    Ok(Some(hasher.finish().0))
+    frame::task(Tag::Usercode, |frame| {
+        let mut top = Names::new_in(frame);
+        if !inputs.names(dir, &mut top)? {
+            return Ok(None);
+        }
+        let mut hasher = Hasher::new(match package {
+            true => os_domain!("blaze v2 package tree 1"),
+            false => os_domain!("blaze v2 tree 1"),
+        });
+        scratch::with_path(|whole| {
+            whole.push(dir);
+            walk_in(inputs, dir, whole, &mut top, (package, true), &mut hasher, frame)
+        })?;
+        Ok(Some(hasher.finish().0))
+    })
 }
 
 /// One directory of [`walk`], at `whole` below `dir` (`top` for `dir` itself): its names in
 /// order, then each of its directories the same way, so the walk's order is the paths'.
-/// `whole` is the one path buffer of the walk, pushed and popped, never joined anew.
-fn walk_in<I: Inputs + ?Sized>(
+/// `whole` is the one path buffer of the walk, pushed and popped, never joined anew; every
+/// listing is in the walk's frame, freed when the walk ends.
+fn walk_in<'f, I: Inputs + ?Sized>(
     inputs: &mut I,
     dir: &Path,
     whole: &mut PathBuf,
-    mut names: Vec<(OsString, bool)>,
+    names: &mut Names<'f>,
     (package, top): (bool, bool),
     hasher: &mut Hasher,
+    frame: &'f Frame,
 ) -> Result<(), I::Error> {
-    names.sort_unstable();
-    let mut deeper = Vec::new();
-    for (name, is_dir) in names {
-        if package && (os_bytes(&name).starts_with(b".") || (top && name == "target")) {
+    names.sort();
+    let names: &Names<'f> = names;
+    let mut deeper: Vec<(&OsStr, Names<'f>), &'f Frame> = Vec::new_in(frame);
+    for (name, is_dir) in names.iter() {
+        // ASCII is itself in every platform's encoded bytes, and only there.
+        if package && (name.as_encoded_bytes().starts_with(b".") || (top && name == "target")) {
             continue;
         }
-        whole.push(&name);
+        whole.push(name);
         let rel = os_bytes(whole.strip_prefix(dir).unwrap_or(whole.as_path()).as_os_str());
         match is_dir {
             true => {
-                if let Some(inner) = inputs.names(whole)? {
-                    hasher.part(rel).part(b"d");
+                let mut inner = Names::new_in(frame);
+                if inputs.names(whole, &mut inner)? {
+                    hasher.part(&rel).part(b"d");
                     deeper.push((name, inner));
                 }
             }
             false => {
                 let hash = inputs.file(whole)?;
-                hasher.part(rel);
+                hasher.part(&rel);
                 match hash {
                     Some(hash) => _ = hasher.part(&hash),
                     None => _ = hasher.part(b"-"),
@@ -285,9 +385,9 @@ fn walk_in<I: Inputs + ?Sized>(
         }
         whole.pop();
     }
-    for (name, inner) in deeper {
-        whole.push(&name);
-        walk_in(inputs, dir, whole, inner, (package, false), hasher)?;
+    for (name, inner) in deeper.iter_mut() {
+        whole.push(*name);
+        walk_in(inputs, dir, whole, inner, (package, false), hasher, frame)?;
         whole.pop();
     }
     Ok(())
@@ -299,14 +399,17 @@ pub const DIRECTORY: [u8; 32] = *b"blaze v2 traced: a directory\0\0\0\0";
 
 /// The hash of a directory's listing: its names, sorted by their bytes, each framed.
 pub fn listing<'a>(names: impl IntoIterator<Item = &'a OsStr>) -> [u8; 32] {
-    let mut names: Vec<&[u8]> = names.into_iter().map(os_bytes).collect();
-    names.sort_unstable();
-    names.dedup();
-    let mut hasher = Hasher::new(LISTING_DOMAIN);
-    for name in names {
-        hasher.part(name);
-    }
-    hasher.finish().0
+    frame::task(Tag::Usercode, |frame| {
+        let mut sorted: Vec<Cow<'_, [u8]>, &Frame> = Vec::new_in(frame);
+        sorted.extend(names.into_iter().map(os_bytes));
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut hasher = Hasher::new(LISTING_DOMAIN);
+        for name in sorted.iter() {
+            hasher.part(name);
+        }
+        hasher.finish().0
+    })
 }
 
 /// The lines of `scope` (all of them for `None`), with what they read as `inputs` has it now:
@@ -384,7 +487,7 @@ pub fn assemble_seen<'a, I: Inputs>(
         }
     }
     for name in env {
-        let value = inputs.env(&name);
+        let value = inputs.env(&name).map(OsStr::to_owned);
         values.entry(name).or_insert(value);
     }
     traced.env = values.into_iter().collect();
@@ -406,7 +509,7 @@ pub(crate) fn names_hex(all: &[(OsString, OsString)]) -> [u8; 64] {
         true => {
             let mut hasher = Hasher::new(LISTING_DOMAIN);
             for (name, _) in all {
-                hasher.part(os_bytes(name));
+                hasher.part(&os_bytes(name));
             }
             hasher.finish().0
         }
@@ -424,58 +527,125 @@ pub(crate) fn names_hex(all: &[(OsString, OsString)]) -> [u8; 64] {
 /// normalized [`Traced`]'s files, then its directories, its variables and what it could not
 /// trace, in that order, each entry tagged and each name framed. A cache check hashes a
 /// shape's inputs straight into one ([`crate::index::find`]) and builds no [`Traced`].
-pub(crate) struct Keyer(Hasher);
+///
+/// The entries are gathered into a buffer on the stack and given to BLAKE3 [`KEYER_BATCH`]
+/// bytes at a time: given a piece of several chunks, it hashes them side by side in SIMD lanes,
+/// where one tiny update per tag and name would compress one block at a time. The hash is the
+/// same either way.
+pub(crate) struct Keyer {
+    hasher: Hasher,
+    batch: [u8; KEYER_BATCH],
+    len: usize,
+}
+
+/// Eight BLAKE3 chunks: as many as AVX2 hashes at once.
+const KEYER_BATCH: usize = 8 * 1024;
 
 impl Keyer {
     pub(crate) fn new(run: &crate::RunKey) -> Keyer {
         let mut hasher = Hasher::new(crate::RunKey::DOMAIN);
         hasher.id(&run.code).id(&run.given);
-        Keyer(hasher)
+        Keyer { hasher, batch: [0; KEYER_BATCH], len: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        if self.len + bytes.len() > KEYER_BATCH {
+            self.hasher.update(&self.batch[..self.len]);
+            self.len = 0;
+            if bytes.len() > KEYER_BATCH {
+                self.hasher.update(bytes);
+                return;
+            }
+        }
+        self.batch[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+
+    /// As [`Hasher::part`]: length-prefixed.
+    fn part(&mut self, bytes: &[u8]) {
+        self.put(&(bytes.len() as u64).to_le_bytes());
+        self.put(bytes);
     }
 
     pub(crate) fn file(&mut self, path: &[u8], hash: Option<&[u8; 32]>) {
-        self.0.update(b"f").part(path);
+        self.put(b"f");
+        self.part(path);
         match hash {
-            Some(hash) => _ = self.0.update(&[1]).update(hash),
-            None => _ = self.0.update(&[0]),
+            Some(hash) => {
+                self.put(&[1]);
+                self.put(hash);
+            }
+            None => self.put(&[0]),
         }
     }
 
     pub(crate) fn dir(&mut self, path: &[u8], hash: &[u8; 32]) {
-        self.0.update(b"d").part(path).update(hash);
+        self.put(b"d");
+        self.part(path);
+        self.put(hash);
     }
 
     pub(crate) fn env(&mut self, name: &[u8], value: Option<&[u8]>) {
-        self.0.update(b"e").part(name);
+        self.put(b"e");
+        self.part(name);
         match value {
-            Some(value) => _ = self.0.update(&[1]).part(value),
-            None => _ = self.0.update(&[0]),
+            Some(value) => {
+                self.put(&[1]);
+                self.part(value);
+            }
+            None => self.put(&[0]),
         }
     }
 
     pub(crate) fn untraceable(&mut self, name: &[u8]) {
-        self.0.update(b"u").part(name);
+        self.put(b"u");
+        self.part(name);
     }
 
-    /// The key of `traced`, which is normalized.
+    /// The key of `traced` as [`normalize`] leaves it: one not normal is sorted by reference,
+    /// in a frame, and never copied.
     pub(crate) fn traced(mut self, traced: &Traced) -> ContentId {
-        for (path, hash) in &traced.files {
-            self.file(os_bytes(path.as_os_str()), hash.as_ref());
+        if normal(traced) {
+            self.entries(&traced.files, &traced.dirs, &traced.env, &traced.untraceable);
+            return self.finish();
         }
-        for (path, hash) in &traced.dirs {
-            self.dir(os_bytes(path.as_os_str()), hash);
-        }
-        for (name, value) in &traced.env {
-            self.env(os_bytes(name), value.as_deref().map(os_bytes));
-        }
-        for it in &traced.untraceable {
-            self.untraceable(untraceable_name(*it).as_bytes());
-        }
+        frame::task(Tag::Usercode, |frame| {
+            self.entries(
+                sorted_in(&traced.files, frame),
+                sorted_in(&traced.dirs, frame),
+                sorted_in(&traced.env, frame),
+                sorted_in(&traced.untraceable, frame),
+            );
+        });
         self.finish()
     }
 
-    pub(crate) fn finish(&self) -> ContentId {
-        self.0.finish()
+    fn entries<'t>(
+        &mut self,
+        files: impl IntoIterator<Item = &'t (PathBuf, Option<[u8; 32]>)>,
+        dirs: impl IntoIterator<Item = &'t (PathBuf, [u8; 32])>,
+        env: impl IntoIterator<Item = &'t (OsString, Option<OsString>)>,
+        untraceable: impl IntoIterator<Item = &'t Untraceable>,
+    ) {
+        for (path, hash) in files {
+            self.file(&os_bytes(path.as_os_str()), hash.as_ref());
+        }
+        for (path, hash) in dirs {
+            self.dir(&os_bytes(path.as_os_str()), hash);
+        }
+        for (name, value) in env {
+            let value = value.as_deref().map(os_bytes);
+            self.env(&os_bytes(name), value.as_deref());
+        }
+        for it in untraceable {
+            self.untraceable(untraceable_name(*it).as_bytes());
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> ContentId {
+        self.hasher.update(&self.batch[..self.len]);
+        self.len = 0;
+        self.hasher.finish()
     }
 }
 
@@ -485,6 +655,15 @@ pub(crate) fn normal(traced: &Traced) -> bool {
         && traced.dirs.is_sorted_by(|a, b| a < b)
         && traced.env.is_sorted_by(|a, b| a < b)
         && traced.untraceable.is_sorted_by(|a, b| a < b)
+}
+
+/// `items` by reference, sorted and each once, as [`normalize`] leaves them.
+pub(crate) fn sorted_in<'t, 'f, T: Ord>(items: &'t [T], frame: &'f Frame) -> Vec<&'t T, &'f Frame> {
+    let mut sorted = Vec::with_capacity_in(items.len(), frame);
+    sorted.extend(items);
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
 }
 
 /// `traced` sorted and each entry once: what [`assemble`] makes, for a [`Traced`] made
@@ -500,15 +679,25 @@ pub fn normalize(traced: &mut Traced) {
     traced.untraceable.dedup();
 }
 
-/// The bytes of `name` as the program had them.
-pub fn os_bytes(name: &OsStr) -> &[u8] {
+/// The bytes of `name` as the program had them: borrowed where a name is bytes, and on
+/// Windows its UTF-16 units, little-endian, which every even run of bytes is, so
+/// [`os_from`] reads back any it is given. What hashes these is under an [`os_domain!`].
+pub fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
     #[cfg(unix)]
     {
-        std::os::unix::ffi::OsStrExt::as_bytes(name)
+        Cow::Borrowed(std::os::unix::ffi::OsStrExt::as_bytes(name))
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "wasi")]
     {
-        name.as_encoded_bytes()
+        Cow::Borrowed(std::os::wasi::ffi::OsStrExt::as_bytes(name))
+    }
+    #[cfg(windows)]
+    {
+        Cow::Owned(le_of_wide(std::os::windows::ffi::OsStrExt::encode_wide(name), name.len()))
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    {
+        Cow::Borrowed(name.as_encoded_bytes())
     }
 }
 
@@ -525,7 +714,7 @@ pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     }
     #[cfg(windows)]
     {
-        Ok(std::os::windows::ffi::OsStringExt::from_wide(&wide_of_wtf8(bytes)?))
+        Ok(std::os::windows::ffi::OsStringExt::from_wide(&wide_of_le(bytes)?))
     }
     #[cfg(not(any(unix, windows, target_os = "wasi")))]
     {
@@ -555,44 +744,26 @@ pub(crate) fn path_in(bytes: &[u8]) -> Result<Cow<'_, Path>, String> {
     })
 }
 
-/// The UTF-16 units of WTF-8 `bytes` (UTF-8 that may also hold a lone surrogate), which is
-/// what [`OsStr::as_encoded_bytes`] gives on Windows.
+/// The bytes of a Windows name's UTF-16 `units`, little-endian: what [`os_bytes`] gives
+/// there. `hint` is the name's encoded length, about its unit count.
 #[cfg(any(windows, test))]
-fn wide_of_wtf8(bytes: &[u8]) -> Result<Vec<u16>, String> {
-    let bad = || "a name is not WTF-8".to_owned();
-    let mut wide = Vec::with_capacity(bytes.len());
-    let mut at = 0;
-    while at < bytes.len() {
-        let lead = bytes[at];
-        let (len, min, init) = match lead {
-            0x00..=0x7f => (1, 0, u32::from(lead)),
-            0xc2..=0xdf => (2, 0x80, u32::from(lead & 0x1f)),
-            0xe0..=0xef => (3, 0x800, u32::from(lead & 0x0f)),
-            0xf0..=0xf4 => (4, 0x1_0000, u32::from(lead & 0x07)),
-            _ => return Err(bad()),
-        };
-        let tail = bytes.get(at + 1..at + len).ok_or_else(bad)?;
-        let mut point = init;
-        for &byte in tail {
-            if byte & 0xc0 != 0x80 {
-                return Err(bad());
-            }
-            point = (point << 6) | u32::from(byte & 0x3f);
-        }
-        if point < min || point > 0x10_ffff {
-            return Err(bad());
-        }
-        match point {
-            0x1_0000.. => {
-                let high = point - 0x1_0000;
-                wide.push(0xd800 | (high >> 10) as u16);
-                wide.push(0xdc00 | (high & 0x3ff) as u16);
-            }
-            _ => wide.push(point as u16),
-        }
-        at += len;
+fn le_of_wide(units: impl Iterator<Item = u16>, hint: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(2 * hint);
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    Ok(wide)
+    bytes
+}
+
+/// The UTF-16 units [`le_of_wide`] gave `bytes` of. A Windows name is any units, lone
+/// surrogates too, so any even number of bytes is one.
+#[cfg(any(windows, test))]
+fn wide_of_le(bytes: &[u8]) -> Result<Vec<u16>, String> {
+    let units = bytes.chunks_exact(2);
+    if !units.remainder().is_empty() {
+        return Err("a name is an odd number of bytes, not UTF-16 units".to_owned());
+    }
+    Ok(units.map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect())
 }
 
 /// What a sandbox's launcher leaves for the driver that ran it ([`encode`]).
@@ -604,7 +775,9 @@ pub enum Report {
     NotMade(String),
 }
 
-const MAGIC: &[u8; 16] = b"blaze v2 report1";
+/// Another on Windows, whose names are [`os_bytes`]' UTF-16 units: a report of an older
+/// blaze's bytes there is not one.
+const MAGIC: &[u8; 16] = if cfg!(windows) { b"blaze v2 report2" } else { b"blaze v2 report1" };
 
 /// `report` as bytes: the magic, then each part length-prefixed, little-endian. Equal reports
 /// are equal bytes.
@@ -624,7 +797,7 @@ pub fn encode(report: &Report) -> Vec<u8> {
             out.push(2);
             out.extend_from_slice(&(traced.files.len() as u64).to_le_bytes());
             for (path, hash) in &traced.files {
-                part(&mut out, os_bytes(path.as_os_str()));
+                part(&mut out, &os_bytes(path.as_os_str()));
                 match hash {
                     Some(hash) => {
                         out.push(1);
@@ -635,16 +808,16 @@ pub fn encode(report: &Report) -> Vec<u8> {
             }
             out.extend_from_slice(&(traced.dirs.len() as u64).to_le_bytes());
             for (path, hash) in &traced.dirs {
-                part(&mut out, os_bytes(path.as_os_str()));
+                part(&mut out, &os_bytes(path.as_os_str()));
                 out.extend_from_slice(hash);
             }
             out.extend_from_slice(&(traced.env.len() as u64).to_le_bytes());
             for (name, value) in &traced.env {
-                part(&mut out, os_bytes(name));
+                part(&mut out, &os_bytes(name));
                 match value {
                     Some(value) => {
                         out.push(1);
-                        part(&mut out, os_bytes(value));
+                        part(&mut out, &os_bytes(value));
                     }
                     None => out.push(0),
                 }
@@ -749,6 +922,37 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_batched_key_is_the_key_of_one_update_per_piece() {
+        let run = crate::RunKey {
+            code: ContentId::of("blaze v2 test 1", b"code"),
+            given: ContentId::of("blaze v2 test 1", b"given"),
+        };
+        let paths: Vec<Vec<u8>> = (0..400).map(|n| format!("/usr/include/x86_64/header-{n}.h").into_bytes()).collect();
+        let huge = vec![b'v'; KEYER_BATCH + 17];
+        let mut batched = Keyer::new(&run);
+        let mut reference = Hasher::new(crate::RunKey::DOMAIN);
+        reference.id(&run.code).id(&run.given);
+        for (n, path) in paths.iter().enumerate() {
+            let hash = [n as u8; 32];
+            batched.file(path, (n % 3 != 0).then_some(&hash));
+            reference.update(b"f").part(path);
+            match n % 3 != 0 {
+                true => _ = reference.update(&[1]).update(&hash),
+                false => _ = reference.update(&[0]),
+            }
+        }
+        batched.dir(b"/src", &[9; 32]);
+        reference.update(b"d").part(b"/src").update(&[9; 32]);
+        batched.env(b"HUGE", Some(&huge));
+        reference.update(b"e").part(b"HUGE").update(&[1]).part(&huge);
+        batched.env(b"GONE", None);
+        reference.update(b"e").part(b"GONE").update(&[0]);
+        batched.untraceable(b"clock");
+        reference.update(b"u").part(b"clock");
+        assert_eq!(batched.finish(), reference.finish());
+    }
+
     struct Fixed {
         files: BTreeMap<PathBuf, [u8; 32]>,
         dirs: BTreeMap<PathBuf, Vec<&'static str>>,
@@ -766,21 +970,20 @@ mod tests {
         fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             Ok(self.dirs.get(path).map(|names| listing(names.iter().map(OsStr::new))))
         }
-        fn env(&mut self, name: &OsStr) -> Option<OsString> {
-            self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+        fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+            self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
         }
         fn env_all(&mut self) -> &[(OsString, OsString)] {
             self.env.sort();
             &self.env
         }
-        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-            let Some(names) = self.dirs.get(path) else { return Ok(None) };
-            let mut out: Vec<(OsString, bool)> = names
-                .iter()
-                .map(|name| (OsString::from(name), self.dirs.contains_key(&path.join(name))))
-                .collect();
+        fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, String> {
+            let Some(names) = self.dirs.get(path) else { return Ok(false) };
+            for name in names {
+                out.push(OsStr::new(name), self.dirs.contains_key(&path.join(name)));
+            }
             out.sort();
-            Ok(Some(out))
+            Ok(true)
         }
     }
 
@@ -897,7 +1100,7 @@ mod tests {
             self.1.push(format!("dir {}", path.display()));
             self.0.dir(path)
         }
-        fn env(&mut self, name: &OsStr) -> Option<OsString> {
+        fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
             self.1.push(format!("env {}", name.display()));
             self.0.env(name)
         }
@@ -905,8 +1108,8 @@ mod tests {
             self.1.push("env_all".into());
             self.0.env_all()
         }
-        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-            self.0.names(path)
+        fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, String> {
+            self.0.names(path, out)
         }
     }
 
@@ -962,6 +1165,51 @@ mod tests {
         assert_ne!(listing(["ab"].map(OsStr::new)), listing(["a", "b"].map(OsStr::new)));
     }
 
+    /// A walk of a package allocates nothing once the thread's frame and path buffer have
+    /// grown: each listing is packed in the walk's frame, the path pushed and popped.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_walk_allocates_nothing() {
+        struct Tree(BTreeMap<PathBuf, Vec<(&'static str, bool)>>);
+        impl Inputs for Tree {
+            type Error = String;
+            fn file(&mut self, _: &Path) -> Result<Option<[u8; 32]>, String> {
+                Ok(Some([7; 32]))
+            }
+            fn dir(&mut self, _: &Path) -> Result<Option<[u8; 32]>, String> {
+                Ok(None)
+            }
+            fn env(&mut self, _: &OsStr) -> Option<&OsStr> {
+                None
+            }
+            fn env_all(&mut self) -> &[(OsString, OsString)] {
+                &[]
+            }
+            fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, String> {
+                let Some(names) = self.0.get(path) else { return Ok(false) };
+                for (name, dir) in names {
+                    out.push(OsStr::new(name), *dir);
+                }
+                out.sort();
+                Ok(true)
+            }
+        }
+        let mut tree = Tree(BTreeMap::from([
+            ("/p".into(), vec![("src", true), ("build.rs", false), (".git", true), ("target", true)]),
+            ("/p/src".into(), vec![("lib.rs", false), ("deep", true)]),
+            ("/p/src/deep".into(), vec![("a.rs", false)]),
+        ]));
+        let cold = walk(&mut tree, Path::new("/p"), true).unwrap();
+        let warm = blaze_alloc_count::assert_at_most(0, "a package walked, warm", || {
+            walk(&mut tree, Path::new("/p"), true).unwrap()
+        });
+        assert_eq!(warm, cold);
+        let listed = blaze_alloc_count::assert_at_most(0, "a listing hashed", || {
+            listing(["b", "a", "a"].map(OsStr::new))
+        });
+        assert_eq!(listed, listing(["a", "b"].map(OsStr::new)));
+    }
+
     #[test]
     fn reports_round_trip() {
         let lines = [
@@ -981,18 +1229,34 @@ mod tests {
             assert_eq!(decode(&bytes), Ok(report));
             assert!(decode(&bytes[..bytes.len() - 1]).is_err());
         }
-        assert!(decode(b"blaze v2 report1\x02\xff\xff\xff\xff\xff\xff\xff\xff").is_err());
+        let mut counts_past_its_end = MAGIC.to_vec();
+        counts_past_its_end.extend_from_slice(b"\x02\xff\xff\xff\xff\xff\xff\xff\xff");
+        assert!(decode(&counts_past_its_end).is_err());
     }
 
     #[test]
-    fn wtf8_reads_as_windows_writes_it() {
-        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
-        for text in ["", "a.rs", "é/ß", "日本", "🦀/x"] {
-            assert_eq!(wide_of_wtf8(text.as_bytes()), Ok(wide(text)));
+    fn windows_names_round_trip_as_their_units() {
+        let lone: [u16; 5] = [0x61, 0xd800, 0xdc00, 0xdfff, 0x2e];
+        for units in [vec![], "a.rs".encode_utf16().collect(), "日本/🦀".encode_utf16().collect(), lone.to_vec()] {
+            let bytes = le_of_wide(units.iter().copied(), units.len());
+            assert_eq!(bytes.len(), 2 * units.len());
+            assert_eq!(wide_of_le(&bytes), Ok(units));
         }
-        assert_eq!(wide_of_wtf8(b"a\xed\xa0\x80"), Ok(vec![0x61, 0xd800]));
-        for bad in [&b"\xc0\x80"[..], b"\xe0\x80\x80", b"\xf4\x90\x80\x80", b"\xe6\x97", b"\x80", b"\xff"] {
-            assert!(wide_of_wtf8(bad).is_err(), "{bad:?}");
+        assert_eq!(le_of_wide([0x012e].into_iter(), 1), [0x2e, 0x01]);
+        for odd in [&b"a"[..], b"abc"] {
+            assert!(wide_of_le(odd).is_err(), "{odd:?}");
         }
+    }
+
+    #[test]
+    fn os_bytes_and_os_from_agree() {
+        for name in ["", "a.rs", "é/ß", "\0*"] {
+            let bytes = os_bytes(OsStr::new(name));
+            assert_eq!(os_from(&bytes).as_deref(), Ok(OsStr::new(name)));
+            assert_eq!(os_in(&bytes).as_deref(), Ok(OsStr::new(name)));
+            assert_eq!(path_in(&bytes).as_deref(), Ok(Path::new(name)));
+        }
+        #[cfg(unix)]
+        assert!(matches!(os_bytes(OsStr::new("a")), Cow::Borrowed(b"a")));
     }
 }

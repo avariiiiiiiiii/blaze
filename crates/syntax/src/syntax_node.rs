@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use syntax_tree::{FlatTree, FlatTreeBuilder, Language};
+use syntax_tree::{FlatTree, FlatTreeBuilder, Language, Text};
 
-use crate::{Parse, SyntaxError, SyntaxKind, TextSize};
+use crate::{Parse, SyntaxError, SyntaxKind, TextRange, TextSize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RustLanguage {}
@@ -67,10 +67,19 @@ impl Default for SyntaxTreeBuilder {
 
 impl SyntaxTreeBuilder {
     /// A builder whose tokens are consecutive slices of `source`, which the tree shares.
-    pub(crate) fn sourced(source: Arc<str>) -> SyntaxTreeBuilder {
+    pub(crate) fn sourced(source: Text) -> SyntaxTreeBuilder {
         SyntaxTreeBuilder {
             errors: Vec::new(),
             inner: FlatTreeBuilder::sourced(source),
+            lazy: false,
+        }
+    }
+
+    /// [`Self::sourced`] over `range` of `source` only, as a lazy node's part is.
+    pub(crate) fn sourced_range(source: Text, range: TextRange) -> SyntaxTreeBuilder {
+        SyntaxTreeBuilder {
+            errors: Vec::new(),
+            inner: FlatTreeBuilder::sourced_range(source, range),
             lazy: false,
         }
     }

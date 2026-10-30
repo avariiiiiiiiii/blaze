@@ -24,7 +24,7 @@ use std::{cell::RefCell, io::Cursor, mem::offset_of};
 use blaze_ids::{ContentId, radix};
 use zstd::zstd_safe::{self, CCtx, CDict, DCtx, DDict};
 
-use crate::{FormatError, Slice, Writer, record};
+use crate::{FormatError, Slice, Writer, leb, record};
 
 /// How wide a hot column's values are.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -180,6 +180,7 @@ impl HotRef<'_> {
     }
 
     pub fn to_vec(&self) -> Vec<u32> {
+        // alloc: an owned copy, asked for by name
         let mut out = vec![0; self.len()];
         self.unpack(0, &mut out);
         out
@@ -281,6 +282,7 @@ impl Packed {
             _ => min,
         };
         let len = values.len();
+        // alloc: once a column packed
         let mut words = vec![0u32; words_for(len, bits)];
         if bits > 0 {
             let full = len / BLOCK_VALUES * BLOCK_VALUES;
@@ -301,6 +303,7 @@ impl Packed {
     }
 
     pub fn unpack(&self) -> Vec<u32> {
+        // alloc: an owned copy, asked for by name
         self.as_ref().to_vec()
     }
 }
@@ -452,6 +455,7 @@ impl WarmRef<'_> {
     }
 
     pub fn to_vec(&self) -> Vec<u32> {
+        // alloc: an owned copy, asked for by name
         let mut out = vec![0; self.len];
         self.unpack(0, &mut out);
         out
@@ -488,6 +492,7 @@ pub struct ColdDictionary {
 
 impl Clone for ColdDictionary {
     fn clone(&self) -> ColdDictionary {
+        // clone: this is `Clone` itself
         ColdDictionary::new(self.bytes.clone())
     }
 }
@@ -538,22 +543,6 @@ thread_local! {
         RefCell::new((CCtx::create(), DCtx::create()));
 }
 
-fn varint_len(value: u64) -> usize {
-    (u64::BITS - (value | 1).leading_zeros()).div_ceil(7) as usize
-}
-
-fn put_varint(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
 /// The frame [`Packed::pack`] gives a column of `len` values from `min` to `max`.
 fn frame(min: u32, max: u32, len: usize) -> (u32, u32) {
     let (min, max) = match len {
@@ -567,14 +556,14 @@ fn frame(min: u32, max: u32, len: usize) -> (u32, u32) {
 /// The bytes [`put_packed`] writes for `len` values from `min` to `max`.
 fn packed_len(min: u32, max: u32, len: usize) -> usize {
     let (min, bits) = frame(min, max, len);
-    varint_len(min as u64) + 1 + varint_len(len as u64) + 4 * words_for(len, bits)
+    leb::len_u64(min as u64) + 1 + leb::len_u64(len as u64) + 4 * words_for(len, bits)
 }
 
 fn put_packed(out: &mut Vec<u8>, values: &[u32]) {
     let packed = Packed::pack(values);
-    put_varint(out, packed.min as u64);
+    leb::write_u64(out, packed.min as u64);
     out.push(packed.bits as u8);
-    put_varint(out, packed.len as u64);
+    leb::write_u64(out, packed.len as u64);
     out.reserve(packed.words.len() * 4);
     out.extend(packed.words.iter().flat_map(|word| word.to_le_bytes()));
 }
@@ -599,15 +588,7 @@ impl Bytes<'_> {
     }
 
     fn varint(&mut self) -> Result<u64, FormatError> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.byte()?;
-            value |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(CORRUPT)
+        leb::read_u64(self.bytes, &mut self.at).map_err(|_| CORRUPT)
     }
 
     fn u32(&mut self) -> Result<u32, FormatError> {
@@ -632,8 +613,10 @@ impl Bytes<'_> {
         let words: Vec<u32> = self.bytes[self.at..end]
             .chunks_exact(4)
             .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            // alloc: once a column decoded from its tier
             .collect();
         self.at = end;
+        // alloc: as the words
         Ok(WarmRef { min, bits, len, words: &words }.to_vec())
     }
 }
@@ -692,6 +675,7 @@ impl Shape {
             true => steps(values),
             false => (0, 0),
         };
+        // alloc: once a column encoded
         let mut distinct = values.to_vec();
         radix::sort(&mut distinct);
         distinct.dedup();
@@ -714,7 +698,7 @@ impl Shape {
     /// The bytes [`encode_raw`] writes for a column of `len` in `codec`, `None` when the codec
     /// can't hold it.
     fn size(&self, len: usize, codec: Codec) -> Option<usize> {
-        let head = 1 + varint_len(len as u64);
+        let head = 1 + leb::len_u64(len as u64);
         let body = match codec {
             Codec::Plain => packed_len(self.min, self.max, len),
             Codec::Runs => {
@@ -724,13 +708,13 @@ impl Shape {
             Codec::Deltas if !self.sorted => return None,
             Codec::Deltas => {
                 let first = if len == 0 { 0 } else { self.min };
-                varint_len(first as u64)
+                leb::len_u64(first as u64)
                     + packed_len(self.least_step, self.most_step, len.saturating_sub(1))
             }
             Codec::Dictionary => {
                 let count = self.distinct.len();
-                varint_len(count as u64)
-                    + varint_len(self.distinct.first().copied().unwrap_or(0) as u64)
+                leb::len_u64(count as u64)
+                    + leb::len_u64(self.distinct.first().copied().unwrap_or(0) as u64)
                     + packed_len(self.least_gap, self.most_gap, count.saturating_sub(1))
                     + packed_len(0, count.saturating_sub(1) as u32, len)
             }
@@ -743,11 +727,13 @@ impl Shape {
 /// column that decreases). `distinct` is the column's distinct values, ascending.
 fn encode_with(values: &[u32], codec: Codec, distinct: &[u32]) -> Option<Vec<u8>> {
     assert!(values.len() as u64 <= MOST_VALUES, "a column of {} values", values.len());
+    // alloc: once a column encoded
     let mut out = vec![codec as u8];
-    put_varint(&mut out, values.len() as u64);
+    leb::write_u64(&mut out, values.len() as u64);
     match codec {
         Codec::Plain => put_packed(&mut out, values),
         Codec::Runs => {
+            // alloc: once a column encoded
             let (mut runs, mut lengths) = (Vec::new(), Vec::new());
             for &value in values {
                 match runs.last() {
@@ -765,18 +751,21 @@ fn encode_with(values: &[u32], codec: Codec, distinct: &[u32]) -> Option<Vec<u8>
             if values.windows(2).any(|pair| pair[1] < pair[0]) {
                 return None;
             }
+            // alloc: once a column encoded
             let deltas: Vec<u32> = values.windows(2).map(|pair| pair[1] - pair[0]).collect();
-            put_varint(&mut out, values.first().copied().unwrap_or(0) as u64);
+            leb::write_u64(&mut out, values.first().copied().unwrap_or(0) as u64);
             put_packed(&mut out, &deltas);
         }
         Codec::Dictionary => {
+            // alloc: once a column encoded
             let gaps: Vec<u32> = distinct.windows(2).map(|pair| pair[1] - pair[0]).collect();
             let indices: Vec<u32> = values
                 .iter()
                 .map(|value| distinct.binary_search(value).expect("a value among the distinct") as u32)
+                // alloc: once a column encoded
                 .collect();
-            put_varint(&mut out, distinct.len() as u64);
-            put_varint(&mut out, distinct.first().copied().unwrap_or(0) as u64);
+            leb::write_u64(&mut out, distinct.len() as u64);
+            leb::write_u64(&mut out, distinct.first().copied().unwrap_or(0) as u64);
             put_packed(&mut out, &gaps);
             put_packed(&mut out, &indices);
         }

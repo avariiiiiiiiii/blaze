@@ -7,7 +7,7 @@
 //! a run is never kept for longer than either would keep it.
 
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
@@ -17,7 +17,7 @@ use blaze_core::Traced;
 use crate::trace::{self, Inputs, PACKAGE, TREE};
 
 /// What cargo watches of a run.
-#[derive(Clone, PartialEq, Eq, Default, Debug)]
+#[derive(PartialEq, Eq, Default, Debug)]
 pub struct CargoRule {
     /// The paths `rerun-if-changed` named, made whole against the package's directory.
     pub paths: Vec<PathBuf>,
@@ -34,16 +34,19 @@ pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -
         return Ok(());
     }
     for path in &rule.paths {
-        match inputs.names(path)? {
+        let is_dir = blaze_mem::frame::task(blaze_mem::Tag::Usercode, |frame| {
+            inputs.names(path, &mut trace::Names::new_in(frame))
+        })?;
+        match is_dir {
             // Cargo watches a directory's every file, at any depth.
-            Some(_) => {
-                let at = path.join(TREE);
+            true => {
                 if let Some(hash) = trace::walk(inputs, path, false)? {
-                    traced.dirs.push((at, hash));
+                    traced.dirs.push((path.join(TREE), hash));
                 }
             }
-            None => {
+            false => {
                 let hash = inputs.file(path)?;
+                // clone: once per run kept: the entry is the result's own.
                 traced.files.push((path.clone(), hash));
             }
         }
@@ -55,7 +58,9 @@ pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -
         }
     }
     for name in &rule.env {
-        let value = inputs.env(name);
+        // alloc: once per run kept: the value is the result's own.
+        let value = inputs.env(name).map(OsStr::to_owned);
+        // clone: as above, the name.
         traced.env.push((name.clone(), value));
     }
     trace::normalize(traced);
@@ -68,22 +73,24 @@ pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -
 impl CargoRule {
     /// The rule of what cargo [`watched`](blaze_build_script::watched) of a script.
     pub fn of(watched: Watched) -> CargoRule {
+        // alloc: the rule owns its names, made once as a run ends.
         let env = watched.env.into_iter().map(OsString::from).collect();
         if watched.whole_package {
-            return CargoRule { paths: Vec::new(), package: watched.paths.into_iter().next(), env };
+            return CargoRule { paths: Vec::new(), package: watched.paths.into_iter().next(), env }; // alloc: none, an empty list
         }
         CargoRule { paths: watched.paths, package: None, env }
     }
 
     /// The whole package at `package_dir`.
     pub fn package(package_dir: &Path) -> CargoRule {
+        // alloc: the rule owns its directory, made once as a run ends; the lists are empty.
         CargoRule { paths: Vec::new(), package: Some(package_dir.to_owned()), env: Vec::new() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, ffi::OsStr};
+    use std::collections::BTreeMap;
 
     use blaze_build_script::{Output, watched};
     use blaze_core::Untraceable;
@@ -118,21 +125,20 @@ mod tests {
         fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             Ok(self.dirs.get(path).map(|names| trace::listing(names.iter().map(OsStr::new))))
         }
-        fn env(&mut self, name: &OsStr) -> Option<OsString> {
-            self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+        fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+            self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
         }
         fn env_all(&mut self) -> &[(OsString, OsString)] {
             self.env.sort();
             &self.env
         }
-        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
-            let Some(names) = self.dirs.get(path) else { return Ok(None) };
-            let mut out: Vec<(OsString, bool)> = names
-                .iter()
-                .map(|name| (OsString::from(name), self.dirs.contains_key(&path.join(name))))
-                .collect();
+        fn names(&mut self, path: &Path, out: &mut trace::Names<'_>) -> Result<bool, String> {
+            let Some(names) = self.dirs.get(path) else { return Ok(false) };
+            for name in names {
+                out.push(OsStr::new(name), self.dirs.contains_key(&path.join(name)));
+            }
             out.sort();
-            Ok(Some(out))
+            Ok(true)
         }
     }
 

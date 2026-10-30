@@ -9,6 +9,7 @@
 //! too. Where a lowering decides by the code around the call (the fused multiply-adds of
 //! `fma.rs`), every form it may take is listed.
 
+use hir_ty::db::HirDatabase;
 use std::fmt;
 
 use cranelift_codegen::ir::{self, types};

@@ -38,7 +38,7 @@ use hir_expand::{
 use la_arena::Idx;
 
 use crate::{
-    expr_store::{ExpressionStore, ExpressionStoreBuilder},
+    expr_store::{ExpressionStore, ExpressionStoreBuilder, ListMark},
     hir::{
         ExprId, PatId,
         columns::{Checked, below, entry, idx, len, list, raw, take_exact},
@@ -47,8 +47,9 @@ use crate::{
     type_ref::{ConstRef, LifetimeRefId, PathId, TypeBound, TypeRefId, UseArgRef},
 };
 
-/// A path of a store's [`PathColumns`].
-pub(crate) type PathIdx = Idx<Path<'static>>;
+/// A path of a store's [`PathColumns`], read with [`ExpressionStore::path_at`]: what an
+/// `asm!` `sym` operand holds.
+pub type PathIdx = Idx<Path<'static>>;
 /// A row of generic arguments of a store's [`PathColumns`].
 pub(crate) type GenericArgsIdx = Idx<GenericArgs<'static>>;
 
@@ -436,8 +437,15 @@ impl PathColumns {
         })
     }
 
+    /// The arguments a [`slot`] word names, `None` for 0: how an expression keeps a method
+    /// call's turbofish.
     #[inline]
-    fn decode_args(&self, at: u32) -> Checked<GenericArgs<'_>> {
+    pub(crate) fn decode_slot(&self, word: u32) -> Checked<Option<GenericArgs<'_>>> {
+        word.checked_sub(1).map(|at| self.decode_args(at)).transpose()
+    }
+
+    #[inline]
+    pub(crate) fn decode_args(&self, at: u32) -> Checked<GenericArgs<'_>> {
         let row = entry(&self.generic_args, at, GENERIC_ARGS)?;
         Ok(GenericArgs {
             args: list(&self.args, row.args[0], row.args[1], ARGS)?,
@@ -592,6 +600,7 @@ impl PathColumns {
             let bounds = binding.bounds.iter().map(|&bound| self.copy_bound(from, bound));
             // alloc: copying a view across stores is a test and repair path, never lowering's.
             let bounds: Vec<TypeBound> = bounds.collect();
+            // clone: the name moves to these columns' table; a test and repair path.
             let row = self.binding(binding.name.clone(), nested, binding.type_ref, bounds);
             self.bindings[first + at] = row;
         }
@@ -733,6 +742,21 @@ impl PathColumns {
         Ok(())
     }
 
+    /// A word of other columns naming a path of these ([`PathIdx`]) in range.
+    #[inline]
+    pub(crate) fn check_path_word(&self, word: u32) -> Checked {
+        below(word, self.len(), PATH_ID)
+    }
+
+    /// A [`slot`] word of other columns in range.
+    #[inline]
+    pub(crate) fn check_slot_word(&self, word: u32) -> Checked {
+        match word as usize <= self.generic_args.len() {
+            true => Ok(()),
+            false => Err(SLOT),
+        }
+    }
+
     /// `bound`'s runs in these columns and its ids in range.
     pub(crate) fn check_bound(
         &self,
@@ -751,12 +775,23 @@ impl PathColumns {
             TypeBound::Error => Ok(()),
         }
     }
+
+    /// A run of names held outside the columns (a where predicate's `for<..>`) inside them.
+    pub(crate) fn check_names(&self, names: Names) -> Checked {
+        list(&self.names, names.start, names.len, NAMES).map(drop)
+    }
 }
 
 /// The slot word of a segment with `args`: 0 for none, its row plus one.
 #[inline]
 pub(crate) fn slot(args: Option<GenericArgsIdx>) -> u32 {
     opt(args)
+}
+
+/// The arguments a slot word names.
+#[inline]
+pub(crate) fn unslot(word: u32) -> Option<GenericArgsIdx> {
+    unopt(word)
 }
 
 impl<'a> Path<'a> {
@@ -942,6 +977,12 @@ impl<'a> PathGenericArgs<'a> {
         self.get(self.len().checked_sub(1)?)
     }
 
+    /// The slot words ([`slot`]), for lowering to copy a trait path's into a `<T as Trait>`.
+    #[inline]
+    pub(crate) fn slot_words(&self) -> &'a [u32] {
+        self.slots
+    }
+
     /// All but the last segment's.
     #[inline]
     pub fn strip_last(&self) -> PathGenericArgs<'a> {
@@ -1062,6 +1103,12 @@ impl<'a> Bindings<'a> {
     #[inline]
     pub fn iter(&self) -> BindingsIter<'a> {
         BindingsIter { bindings: *self, rows: self.rows.iter() }
+    }
+
+    /// The columns these bindings (and their bounds' runs) are read from.
+    #[inline]
+    pub(crate) fn columns(&self) -> &'a PathColumns {
+        self.columns
     }
 }
 
@@ -1222,6 +1269,12 @@ impl ExpressionStore {
         self.types.path(id)
     }
 
+    /// The path `id` of this store's columns.
+    #[inline]
+    pub fn path_at(&self, id: PathIdx) -> Path<'_> {
+        self.types.paths.get(id)
+    }
+
     /// The names of a bound's `for<..>` binder or a where predicate's.
     #[inline]
     pub fn names(&self, names: Names) -> &[Name] {
@@ -1276,6 +1329,18 @@ impl ExpressionStoreBuilder {
     #[inline]
     pub(crate) fn push_lang_path(&mut self, target: LangItemTarget, name: Option<Name>) -> PathIdx {
         self.types.paths.push_lang_item(target, name)
+    }
+
+    /// The row of an associated type binding whose bounds are on the list stack above `bounds`,
+    /// moved off it into the paths' bounds.
+    pub(crate) fn binding_with_bounds(
+        &mut self,
+        name: Name,
+        args: Option<GenericArgsIdx>,
+        type_ref: Option<TypeRefId>,
+        bounds: ListMark,
+    ) -> BindingRow {
+        self.types.paths.binding(name, args, type_ref, self.lists.bounds.drain(bounds.bounds as usize..))
     }
 }
 

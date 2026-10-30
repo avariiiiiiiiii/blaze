@@ -8,8 +8,8 @@
 //!
 //! where parent follows the same scheme.
 
+use base_db::Db;
 use arrayvec::ArrayVec;
-use base_db::SourceDatabase;
 use hir_def::{
     ConstParamId, GenericDefId, GenericParamId, ItemContainerId, LifetimeParamId, Lookup,
     TypeOrConstParamId, TypeParamId,
@@ -20,7 +20,7 @@ use hir_def::{
     },
 };
 
-pub fn generics(db: &dyn SourceDatabase, def: GenericDefId) -> Generics<'_> {
+pub fn generics(db: &Db, def: GenericDefId) -> Generics<'_> {
     let mut chain = ArrayVec::new();
     let mut parent_params_len = 0;
     if let Some(parent_def) = parent_generic_def(db, def) {
@@ -440,7 +440,7 @@ pub struct ProvenanceSplit {
     pub lifetimes: usize,
 }
 
-fn parent_generic_def(db: &dyn SourceDatabase, def: GenericDefId) -> Option<GenericDefId> {
+fn parent_generic_def(db: &Db, def: GenericDefId) -> Option<GenericDefId> {
     let container = match def {
         GenericDefId::FunctionId(it) => it.lookup(db).container,
         GenericDefId::TypeAliasId(it) => it.lookup(db).container,

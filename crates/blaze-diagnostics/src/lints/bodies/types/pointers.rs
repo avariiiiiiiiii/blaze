@@ -18,6 +18,7 @@ mod reference_casting;
 
 use std::ops::ControlFlow;
 
+use base_db::Db;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup,
@@ -76,7 +77,7 @@ pub(super) fn ty_text(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
 /// Whether the function has the attribute `#[name]` (`rustc_as_ptr`,
 /// `rustc_no_implicit_autorefs`, `rustc_never_returns_null_ptr`), its `cfg_attr`s expanded:
 /// rustc's `find_attr!` of it.
-pub(super) fn has_attr(db: &dyn HirDatabase, def: FunctionId, name: &str) -> bool {
+pub(super) fn has_attr(db: &Db, def: FunctionId, name: &str) -> bool {
     let krate = def.krate(db);
     let attrs = def.lookup(db).source(db).value.attrs();
     let cfg = krate.cfg_options(db);
@@ -144,9 +145,9 @@ impl Inits {
                     Expr::Block { statements, .. } => {
                         for statement in statements {
                             if let Statement::Let { pat, initializer: Some(init), .. } = statement
-                                && let Some(id) = binding(*pat)
+                                && let Some(id) = binding(pat)
                             {
-                                self.map.insert(id, *init);
+                                self.map.insert(id, init);
                             }
                         }
                     }

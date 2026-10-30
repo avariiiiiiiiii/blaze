@@ -94,6 +94,7 @@ fn ub_results_print_as_libtest_prints_them() {
         outcome: TestOutcome::Failed,
         output: b"undefined behavior: a write through a reference that was retagged as shared\nseed: 7".to_vec(),
         millis: 0,
+        cached: None,
     };
     let passed = TestResult { name: "tests::fine".to_owned(), outcome: TestOutcome::Passed, output: Vec::new(), ..failed.clone() };
     let mut api = FakeApi::answering(vec![Response::TestResult(passed), Response::TestResult(failed), Response::Done { ok: true }]);
@@ -156,7 +157,7 @@ fn foo_compiling() -> Response {
 fn tests_built() -> Vec<Response> {
     vec![
         foo_compiling(),
-        Response::Built { artifacts: built(), profile: "`test` profile [unoptimized + debuginfo]".to_owned() },
+        Response::Built { members: 1, artifacts: built(), profile: "`test` profile [unoptimized + debuginfo]".to_owned() },
         Response::Done { ok: true },
     ]
 }
@@ -212,7 +213,7 @@ fn a_failed_build_runs_nothing() {
 #[test]
 fn run_becomes_its_program() {
     let foo = crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo"));
-    let built = Response::Built { artifacts: vec![foo], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
+    let built = Response::Built { members: 1, artifacts: vec![foo], profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
     let mut api = FakeApi::answering(vec![built, Response::Done { ok: true }]);
     let (then, _, err) = driven(&mut api, &["blaze", "run", "--release", "a", "--", "b"], &mut Fake::default());
     let Then::Exec(exec) = then else { panic!("{then:?}") };
@@ -225,7 +226,7 @@ fn run_becomes_its_program() {
         crate::cli::run::tests::artifact("foo", "bin", "foo", false, Some("foo")),
         crate::cli::run::tests::artifact("foo", "bin", "bar", false, Some("bar")),
     ];
-    let built = Response::Built { artifacts: two.to_vec(), profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
+    let built = Response::Built { members: 1, artifacts: two.to_vec(), profile: "`dev` profile [unoptimized + debuginfo]".to_owned() };
     let mut api = FakeApi::answering(vec![built, Response::Done { ok: true }]);
     let (then, _, err) = driven(&mut api, &["blaze", "run", "-q"], &mut Fake::default());
     assert_eq!(then, Then::Exit(101));

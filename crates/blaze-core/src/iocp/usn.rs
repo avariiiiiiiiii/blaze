@@ -707,9 +707,12 @@ pub(super) struct Journal {
     caught_up: bool,
     /// The cursor's USN of the last batch told.
     told: i64,
-    /// The request the kernel reads while a read is in flight (`METHOD_NEITHER`: in place).
-    input: Box<READ_USN_JOURNAL_DATA_V1>,
-    /// Where the kernel writes records: `u64`s, as they are 8-aligned.
+    /// The request the kernel reads while a read is in flight (`METHOD_NEITHER`: in place), in
+    /// the boxed journal, which stays where it is while the request holds it.
+    input: READ_USN_JOURNAL_DATA_V1,
+    /// Where the kernel writes records: `u64`s, as they are 8-aligned. The watch's own, made
+    /// once as it starts (256 KiB, four of the driver's buffers, which a watch that lives as
+    /// long as the daemon would only hold the same way).
     buffer: Box<[u64]>,
     records: Vec<Record>,
 }
@@ -796,7 +799,7 @@ impl Journal {
             target: now,
             caught_up: next >= now,
             told: next,
-            input: Box::default(),
+            input: READ_USN_JOURNAL_DATA_V1::default(),
             // alloc: setup, the one buffer every read of the watch fills.
             buffer: vec![0u64; BUFFER / 8].into_boxed_slice(),
             records: Vec::with_capacity(BUFFER / 64),
@@ -814,7 +817,7 @@ impl Journal {
     /// and the buffer stay where they are until that completion is dequeued (the driver keeps
     /// the journal in the request until then).
     pub(super) fn read(&mut self, overlapped: *mut OVERLAPPED) -> io::Result<()> {
-        *self.input = READ_USN_JOURNAL_DATA_V1 {
+        self.input = READ_USN_JOURNAL_DATA_V1 {
             StartUsn: self.next,
             ReasonMask: REASONS,
             ReturnOnlyOnClose: 0,
@@ -833,7 +836,7 @@ impl Journal {
             DeviceIoControl(
                 self.reader.as_raw_handle(),
                 FSCTL_READ_UNPRIVILEGED_USN_JOURNAL,
-                (&raw const *self.input).cast(),
+                (&raw const self.input).cast(),
                 size_of::<READ_USN_JOURNAL_DATA_V1>() as u32,
                 self.buffer.as_mut_ptr().cast(),
                 (self.buffer.len() * 8) as u32,

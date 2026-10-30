@@ -6,6 +6,7 @@
 //! so each part is walked once: the cleanups ask for nothing the way without unwinding does
 //! not. Resuming the unwinding is `outside`'s.
 
+use hir_ty::db::HirDatabase;
 use hir_def::{
     AdtId, CallableDefId, FunctionId, VariantId,
     layout::Variants,

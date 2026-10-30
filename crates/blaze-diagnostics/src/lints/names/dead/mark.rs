@@ -8,11 +8,14 @@
 //! impls of `#[derive(Clone)]` and `#[derive(Debug)]` read nothing. On the way, an assignment of
 //! a variable or a field to itself is linted.
 //!
-//! The walk is over the syntax of each definition (as rustc's `intravisit` walks its HIR), its
-//! macro calls expanded, names resolved through `hir::Semantics` and inference, a trait impl's
-//! item named through a trait mapped back to the trait's item as typeck has it. Each node is
-//! dispatched on its `SyntaxKind` before any cast; each path is resolved once; what is live and
-//! what was walked are bitsets over the definitions.
+//! A body (of a function, a constant or a static) is walked as the front end lowered it
+//! ([`body`]): each name read from what inference recorded, or resolved with one resolver kept
+//! at the scope being walked. A signature, and what is in it (an enum's discriminants, the
+//! constants in its types), is walked over its syntax, as rustc's `intravisit` walks its HIR,
+//! its macro calls expanded and names resolved through `hir::Semantics`. Either way a trait
+//! impl's item named through a trait is mapped back to the trait's item as typeck has it, each
+//! path is resolved once, and what is live and what was walked are bitsets over the
+//! definitions.
 //!
 //! Follows `compiler/rustc_passes/src/dead.rs` (`MarkSymbolVisitor`, `mark_live_symbols`,
 //! `check_impl_or_impl_item_live`, `live_symbols_and_ignored_derived_traits`,
@@ -20,18 +23,23 @@
 //! `compiler/rustc_builtin_macros/src/deriving/` (what each derive's method reads)
 //! (MIT or Apache-2.0).
 
+mod body;
+
 use either::Either;
 use hir::{Adjust, HirFileId, InFile, ModuleDef, PathResolution};
-use hir_def::{AdtId, AttrDefId, FieldId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplTrait};
+use hir_def::{
+    AdtId, AttrDefId, DefWithBodyId, FieldId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplTrait,
+    expr_store::Body,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr,
+    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
     ast::{self, BinaryOp, HasArgList, RangeItem},
 };
 
 use super::{
-    defs::{Bits, DefIdx, Id, Kind, Parent, is_anon},
+    defs::{Bits, DefIdx, Id, Kind, Parent, anon_key, cast, is_anon},
     res::Res,
     seed::{Crate, Seeds, Unsolved, WorkItem},
 };
@@ -41,7 +49,7 @@ use crate::{
 };
 
 /// What is live at one point of the pass.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(super) struct Live {
     live: Bits,
     /// The closures and anonymous constants walked, which items in them have as their parent.
@@ -52,6 +60,15 @@ pub(super) struct Live {
 }
 
 impl Live {
+    /// A copy, for rustc's `pre_deferred_seeding`: taken once per crate.
+    fn snapshot(&self) -> Live {
+        Live {
+            live: self.live.snapshot(),
+            anon: self.anon.clone(), // clone: once per crate, rustc's pre-deferred summary
+            ignored: self.ignored.clone(), // clone: once per crate, rustc's pre-deferred summary
+        }
+    }
+
     pub(super) fn contains(&self, def: DefIdx) -> bool {
         self.live.get(def)
     }
@@ -82,15 +99,15 @@ pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>
         live: Live { live: Bits::new(len), ..Live::default() },
         propagated: false,
         in_pat: false,
-        ignore_variants: Vec::new(),
+        ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
         repr_all_live: false,
         repr_simd: false,
         self_assigns: FxHashSet::default(),
-        found: Vec::new(),
+        found: Vec::new(), // alloc: the pass's output, once per crate
     };
     let mut unsolved = seeds.unsolved;
     m.mark_with_unsolved(&mut unsolved);
-    let pre_deferred = m.live.clone();
+    let pre_deferred = m.live.snapshot();
     m.worklist.extend(seeds.deferred);
     m.mark_with_unsolved(&mut unsolved);
     (Liveness { pre_deferred, last: m.live }, m.found)
@@ -161,7 +178,7 @@ impl Mark<'_, '_, '_, '_> {
     /// their items whose trait and self type are live, until none is left that is.
     fn mark_with_unsolved(&mut self, unsolved: &mut Vec<Unsolved>) {
         self.mark_live_symbols();
-        let mut to_check = Vec::new();
+        let mut to_check = Vec::new(); // alloc: setup, one buffer per fixpoint, reused each round
         self.extract_live(unsolved, &mut to_check);
         while !to_check.is_empty() {
             self.worklist.extend(to_check.drain(..).map(|id| WorkItem::new(id, false)));
@@ -252,8 +269,57 @@ impl Mark<'_, '_, '_, '_> {
             }
         }
         let node = k.cx.syntax(ptr);
-        self.walk(node.file_id, &node.value, true);
+        if let Some(owner) = self.signature(node.file_id, &node.value, d.id) {
+            self.body(owner);
+        }
         (self.repr_all_live, self.repr_simd) = saved;
+    }
+
+    /// The walk of a definition's signature, over its syntax. The body of a function, a
+    /// constant or a static, when one is written, is left out and its owner given, for
+    /// [`Mark::body`].
+    fn signature(&mut self, file: HirFileId, node: &SyntaxNode, id: Id) -> Option<DefWithBodyId> {
+        let written = |kind: fn(SyntaxKind) -> bool| node.children().find(|it| kind(it.kind()));
+        let found = match id {
+            Id::Fn(it) => {
+                written(|kind| kind == SyntaxKind::BLOCK_EXPR).map(|body| (DefWithBodyId::FunctionId(it), body))
+            }
+            Id::Const(it) => written(ast::Expr::can_cast).map(|body| (DefWithBodyId::ConstId(it), body)),
+            Id::Static(it) => written(ast::Expr::can_cast).map(|body| (DefWithBodyId::StaticId(it), body)),
+            _ => None,
+        };
+        let Some((owner, body)) = found else {
+            self.walk(file, node, true);
+            return None;
+        };
+        for child in node.children() {
+            if child == body {
+                continue;
+            }
+            if child.kind() != SyntaxKind::PARAM_LIST {
+                stdx::ensure_sufficient_stack(|| self.walk(file, &child, false));
+                continue;
+            }
+            for param in child.children() {
+                if param.kind() != SyntaxKind::PARAM {
+                    self.walk(file, &param, false);
+                    continue;
+                }
+                for part in param.children() {
+                    if !ast::Pat::can_cast(part.kind()) {
+                        stdx::ensure_sufficient_stack(|| self.walk(file, &part, false));
+                    }
+                }
+            }
+        }
+        Some(owner)
+    }
+
+    /// The walk of a body as the front end lowered it ([`body::Walk`]).
+    fn body(&mut self, owner: DefWithBodyId) {
+        let (body, source_map) = Body::with_source_map(self.k.cx.db, owner);
+        let body: &Body = body;
+        body::Walk::new(self, owner, body, source_map).run(body);
     }
 
     /// An inherent impl's item makes its self type live: an ADT, a foreign type, the principal
@@ -354,7 +420,7 @@ impl Mark<'_, '_, '_, '_> {
                 if in_item_list && !root {
                     return;
                 }
-                if let Some(call) = ast::MacroCall::cast(node.clone())
+                if let Some(call) = cast::<ast::MacroCall>(node)
                     && let Some(expansion) = self.k.cx.sema.expand_macro_call(&call)
                 {
                     stdx::ensure_sufficient_stack(|| self.walk(expansion.file_id, &expansion.value, false));
@@ -374,29 +440,29 @@ impl Mark<'_, '_, '_, '_> {
         }
         match kind {
             SyntaxKind::PATH => {
-                if let Some(path) = ast::Path::cast(node.clone()) {
+                if let Some(path) = cast::<ast::Path>(node) {
                     self.path(&path);
                 }
             }
             SyntaxKind::METHOD_CALL_EXPR => {
-                if let Some(call) = ast::MethodCallExpr::cast(node.clone())
+                if let Some(call) = cast::<ast::MethodCallExpr>(node)
                     && let Some(function) = self.k.cx.sema.resolve_method_call(&call)
                 {
                     self.handle_res(Res::function(self.k.defs, function));
                 }
             }
             SyntaxKind::FIELD_EXPR => {
-                if let Some(field) = ast::FieldExpr::cast(node.clone()) {
+                if let Some(field) = cast::<ast::FieldExpr>(node) {
                     self.field_read(&field);
                 }
             }
             SyntaxKind::RECORD_EXPR => {
-                if let Some(expr) = ast::RecordExpr::cast(node.clone()) {
-                    self.union_fields(&expr);
+                if let Some(expr) = cast::<ast::RecordExpr>(node) {
+                    self.union_fields(expr);
                 }
             }
             SyntaxKind::OFFSET_OF_EXPR => {
-                if let Some(expr) = ast::OffsetOfExpr::cast(node.clone()) {
+                if let Some(expr) = cast::<ast::OffsetOfExpr>(node) {
                     for name in expr.fields() {
                         if let Some((Either::Right(field), _)) = self.k.cx.sema.resolve_offset_of_field(&name)
                             && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
@@ -407,7 +473,7 @@ impl Mark<'_, '_, '_, '_> {
                 }
             }
             SyntaxKind::BIN_EXPR => {
-                if let Some(expr) = ast::BinExpr::cast(node.clone())
+                if let Some(expr) = cast::<ast::BinExpr>(node)
                     && let Some(BinaryOp::Assignment { op: None }) = expr.op_kind()
                 {
                     self.assign(file, &expr);
@@ -416,7 +482,7 @@ impl Mark<'_, '_, '_, '_> {
             }
             SyntaxKind::MATCH_ARM => {
                 let len = self.ignore_variants.len();
-                if let Some(pat) = ast::MatchArm::cast(node.clone()).and_then(|it| it.pat()) {
+                if let Some(pat) = cast::<ast::MatchArm>(node).and_then(|it| it.pat()) {
                     let mut stack = std::mem::take(&mut self.ignore_variants);
                     self.necessary_variants(pat.syntax(), &mut stack, len);
                     self.ignore_variants = stack;
@@ -441,14 +507,16 @@ impl Mark<'_, '_, '_, '_> {
     fn anon(&mut self, file: HirFileId, node: &SyntaxNode) {
         let closure = match node.kind() {
             SyntaxKind::CLOSURE_EXPR => true,
-            SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_none()),
+            SyntaxKind::BLOCK_EXPR => !node.children_with_tokens().any(|it| it.kind() == T![const]),
             _ => false,
         };
-        let own = closure
-            && self.propagated
-            && self.k.levels.at(self.k.cx, &InFile::new(file, node.clone())).is_allow_or_expect();
-        if !own {
-            self.live.anon.insert(InFile::new(file, SyntaxNodePtr::new(node)));
+        if self.k.defs.in_anon {
+            let own = closure
+                && self.propagated
+                && self.k.levels.at(self.k.cx, InFile::new(file, node)).is_allow_or_expect();
+            if !own {
+                self.live.anon.insert(anon_key(file, node));
+            }
         }
         let in_pat = std::mem::replace(&mut self.in_pat, false);
         self.children(file, node);
@@ -485,13 +553,13 @@ impl Mark<'_, '_, '_, '_> {
 
     /// rustc's `mark_as_used_if_union`: the fields a union expression names, of a union of
     /// more than one field, are read. A literal naming no field is no union's, and is not typed.
-    fn union_fields(&mut self, expr: &ast::RecordExpr) {
+    fn union_fields(&mut self, expr: ast::RecordExpr) {
         let cx = self.k.cx;
         let Some(list) = expr.record_expr_field_list() else { return };
         if list.fields().next().is_none() {
             return;
         }
-        let Some(ty) = cx.sema.type_of_expr(&ast::Expr::RecordExpr(expr.clone())) else { return };
+        let Some(ty) = cx.sema.type_of_expr(&ast::Expr::RecordExpr(expr)) else { return };
         let Some(hir::Adt::Union(union)) = ty.original.as_adt() else { return };
         if union.fields(cx.db).len() <= 1 {
             return;
@@ -509,7 +577,7 @@ impl Mark<'_, '_, '_, '_> {
     fn pat(&mut self, file: HirFileId, node: &SyntaxNode) {
         let cx = self.k.cx;
         self.in_pat = true;
-        let Some(pat) = ast::Pat::cast(node.clone()) else {
+        let Some(pat) = cast::<ast::Pat>(node) else {
             self.children(file, node);
             self.in_pat = false;
             return;
@@ -537,11 +605,15 @@ impl Mark<'_, '_, '_, '_> {
             ast::Pat::TupleStructPat(it) => {
                 let adt = self.pat_adt(&pat);
                 let res = it.path().map_or(Res::None, |path| self.path(&path));
-                let subpats: SmallVec<[ast::Pat; 4]> = it.fields().collect();
+                let subpats: SmallVec<[ast::Pat; 4]> = it.fields().collect(); // alloc: inline up to 4
                 if let Some(variant) = self.variant_of(res, adt) {
-                    let wildcard = subpats.iter().map(|it| matches!(it, ast::Pat::WildcardPat(_)));
                     let rest = subpats.iter().position(|it| matches!(it, ast::Pat::RestPat(_)));
-                    self.tuple_fields(variant, wildcard, rest);
+                    let bound = subpats.len() - usize::from(rest.is_some());
+                    let wildcard = subpats
+                        .iter()
+                        .filter(|it| !matches!(it, ast::Pat::RestPat(_)))
+                        .map(|it| matches!(it, ast::Pat::WildcardPat(_)));
+                    self.tuple_fields(variant, wildcard, bound, rest);
                 }
                 for sub in subpats {
                     stdx::ensure_sufficient_stack(|| self.walk(file, sub.syntax(), false));
@@ -575,16 +647,14 @@ impl Mark<'_, '_, '_, '_> {
         }
     }
 
-    /// The fields of `variant` that the subpatterns of a tuple pattern bind (whether each is a
-    /// `_`, in order, without the `..` at `rest`), past its `..`.
-    fn tuple_fields(&mut self, variant: DefIdx, wildcard: impl Iterator<Item = bool> + Clone, rest: Option<usize>) {
+    /// The fields of `variant` that the subpatterns of a tuple pattern bind: whether each of its
+    /// `bound` subpatterns other than `..` is a `_`, in order, and how many come before its `..`.
+    fn tuple_fields(&mut self, variant: DefIdx, wildcard: impl Iterator<Item = bool>, bound: usize, dotdot: Option<usize>) {
         let defs = self.k.defs;
         let fields = defs.children(variant);
-        let bound = wildcard.clone().count() - usize::from(rest.is_some());
-        let dotdot = rest.unwrap_or(bound);
+        let dotdot = dotdot.unwrap_or(bound);
         let missing = fields.len().saturating_sub(bound);
-        let subpats = wildcard.enumerate().filter(|&(at, _)| Some(at) != rest).map(|(_, it)| it);
-        for (index, is_wildcard) in subpats.enumerate() {
+        for (index, is_wildcard) in wildcard.enumerate() {
             if is_wildcard {
                 continue;
             }
@@ -611,11 +681,11 @@ impl Mark<'_, '_, '_, '_> {
         let cx = self.k.cx;
         let path = match node.kind() {
             SyntaxKind::OR_PAT => return,
-            SyntaxKind::PATH_PAT => ast::PathPat::cast(node.clone()).and_then(|it| it.path()),
-            SyntaxKind::TUPLE_STRUCT_PAT => ast::TupleStructPat::cast(node.clone()).and_then(|it| it.path()),
-            SyntaxKind::RECORD_PAT => ast::RecordPat::cast(node.clone()).and_then(|it| it.path()),
+            SyntaxKind::PATH_PAT => cast::<ast::PathPat>(node).and_then(|it| it.path()),
+            SyntaxKind::TUPLE_STRUCT_PAT => cast::<ast::TupleStructPat>(node).and_then(|it| it.path()),
+            SyntaxKind::RECORD_PAT => cast::<ast::RecordPat>(node).and_then(|it| it.path()),
             SyntaxKind::IDENT_PAT => {
-                if let Some(pat) = ast::IdentPat::cast(node.clone())
+                if let Some(pat) = cast::<ast::IdentPat>(node)
                     && let Some(ModuleDef::EnumVariant(it)) = cx.sema.resolve_bind_pat_to_const(&pat)
                     && let Some(variant) = self.k.defs.get(Id::Variant(it.into()))
                     && !out[from..].contains(&variant)
@@ -763,11 +833,14 @@ impl Mark<'_, '_, '_, '_> {
                 self.in_pat = true;
                 let res = self.path(&path);
                 self.in_pat = false;
+                // alloc: inline up to 4
                 let args: SmallVec<[ast::Expr; 4]> = it.arg_list().into_iter().flat_map(|it| it.args()).collect();
                 if let Some(variant) = self.variant_of(res, adt) {
-                    let wildcard = args.iter().map(|it| matches!(it, ast::Expr::UnderscoreExpr(_)));
                     let rest = args.iter().position(is_rest);
-                    self.tuple_fields(variant, wildcard, rest);
+                    let bound = args.len() - usize::from(rest.is_some());
+                    let wildcard =
+                        args.iter().filter(|it| !is_rest(it)).map(|it| matches!(it, ast::Expr::UnderscoreExpr(_)));
+                    self.tuple_fields(variant, wildcard, bound, rest);
                 }
                 for arg in &args {
                     self.assign_pattern(file, arg);
@@ -818,6 +891,7 @@ impl Mark<'_, '_, '_, '_> {
             ast::Expr::FieldExpr(_) => "field",
             _ => "variable",
         };
+        // alloc: the edge, a lint that fires
         let message = format!("useless assignment of {what} of type `{}` to itself", cx.ty(&ty.original));
         let mut diag = Diag::lint("dead_code", message, cx.span_of(at));
         crate::lints::code_fact(cx, &mut diag, at);
@@ -845,8 +919,9 @@ fn is_rest(expr: &ast::Expr) -> bool {
 
 fn unparen(expr: &ast::Expr) -> ast::Expr {
     match expr {
+        // clone: a refcount, for an assignment in a signature's constant (bodies use the store).
         ast::Expr::ParenExpr(it) => it.expr().map_or_else(|| expr.clone(), |it| unparen(&it)),
-        _ => expr.clone(),
+        _ => expr.clone(), // clone: as above
     }
 }
 

@@ -1,6 +1,6 @@
 //! What Linux and macOS share: the channel's Unix socket with file descriptors passed by
 //! `SCM_RIGHTS`, the listener and its peer checks, stack walks through the system unwinder,
-//! context synchronization, randomness and page protection.
+//! context synchronization, randomness and the protection of an access.
 
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
@@ -48,10 +48,12 @@ impl Stream {
         Ok(Stream { fd, fds: VecDeque::new() })
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn raw(&self) -> i64 {
         i64::from(self.fd.as_raw_fd())
     }
 
+    #[cfg(all(test, unix))]
     pub(crate) fn from_raw(raw: i64) -> Result<Stream, Error> {
         let fd = RawFd::try_from(raw).map_err(|_| Error::new(format!("a channel fd of {raw}")))?;
         // SAFETY: a zeroed `stat` is a valid one: plain integers.
@@ -63,8 +65,8 @@ impl Stream {
         if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
             return Err(Error::new(format!("the channel fd {fd} is not a socket")));
         }
-        // SAFETY: the loader left this socket open for the program's runtime and owns it no
-        // more (`load::start` forgets its stream); the runtime adopts it once (`OnceLock`).
+        // SAFETY: a test hands over a socket of a `socketpair` it made and owns nothing else
+        // of it.
         Stream::new(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
@@ -270,7 +272,7 @@ impl Listener {
     /// The next connection, from a process of this user, and its process ID.
     pub(crate) fn accept(&self) -> Result<(Stream, u32), Error> {
         loop {
-            let (stream, _) = self.listener.accept().map_err(|it| Error::new(format!("accepting a loader: {it}")))?;
+            let (stream, _) = self.listener.accept().map_err(|it| Error::new(format!("accepting a run process: {it}")))?;
             let fd = OwnedFd::from(stream);
             match peer(&fd) {
                 Ok(pid) => return Ok((Stream::new(fd)?, pid)),
@@ -294,7 +296,7 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
             libc::getsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&raw mut cred).cast(), &raw mut len)
         };
         if got != 0 {
-            return Err(os("reading a loader's credentials"));
+            return Err(os("reading a run process's credentials"));
         }
         if cred.uid != me {
             return Err(Error::new(format!("a connection from process {} of user {}, refused", cred.pid, cred.uid)));
@@ -308,7 +310,7 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
         let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
         // SAFETY: `fd` is a connected Unix socket; `uid` and `gid` are live and writable.
         if unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
-            return Err(os("reading a loader's user"));
+            return Err(os("reading a run process's user"));
         }
         if uid != me {
             return Err(Error::new(format!("a connection from user {uid}, refused")));
@@ -318,7 +320,7 @@ fn peer(fd: &OwnedFd) -> Result<u32, Error> {
         // SAFETY: as above; `pid` and `len` are live and writable.
         let got = unsafe { libc::getsockopt(fd.as_raw_fd(), SOL_LOCAL, LOCAL_PEERPID, (&raw mut pid).cast(), &raw mut len) };
         if got != 0 {
-            return Err(os("reading a loader's process"));
+            return Err(os("reading a run process's process"));
         }
         Ok(pid as u32)
     }
@@ -343,18 +345,6 @@ pub(crate) fn protection(access: Access) -> c_int {
         Access::Read => libc::PROT_READ,
         Access::Copy | Access::Shared => libc::PROT_READ | libc::PROT_WRITE,
     }
-}
-
-pub(crate) fn protect(at: u64, len: u64, access: Access) -> Result<(), Error> {
-    if access == Access::Execute {
-        return Err(Error::new(format!("making {len:#x} bytes at {at:#x} executable: code is only ever mapped so")));
-    }
-    // SAFETY: the loader asks only for pages of a private copy it mapped itself (an ELF RELRO
-    // segment), which nothing borrows; a bad range fails with an error.
-    if unsafe { libc::mprotect(at as *mut c_void, len as usize, protection(access)) } != 0 {
-        return Err(os(&format!("mprotect of {len:#x} bytes at {at:#x}")));
-    }
-    Ok(())
 }
 
 pub(crate) fn serialize() {

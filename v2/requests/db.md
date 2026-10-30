@@ -2338,6 +2338,8 @@ and as outlines), so which one runs changes the time only. The outline/full choi
   tree (`crates/hir-def/src/item_tree/`, same lane) then re-lowers only the items whose syntax
   changed. No new dependency: base-db already depends on `syntax`.
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ## frontend-text: one lazy line index per file text (frontend.md item 6; 2026-10-29)
 
 `span::LineIndex` is new (lane `frontend-text`, `crates/span/src/lines.rs`): a bitmap of the
@@ -2348,6 +2350,8 @@ checked against the scalar one) and a rank table per 512 bytes; `place(offset)` 
 a last `\n` starting no line; tested against a model of `rustc_span::SourceFile` at every
 offset). Today two salsa queries scan each text for line starts (`hir-expand`'s `line_starts`,
 `hir-ty-mir`'s), plus load-cargo's `line_index` crate. One query in base-db replaces them.
+
+> forwarded to db (window `db-next2`, told by tmux).
 
 ### 1. `crates/base-db/src/lib.rs`: the query
 

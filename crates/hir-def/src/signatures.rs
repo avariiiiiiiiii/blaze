@@ -171,13 +171,14 @@ impl SignatureSyntax {
                 let in_whole = SyntaxNodePtr::from_parts(node.kind(), range).to_node(&whole);
                 let (_, at) = in_whole.flat().expect("a node of a flat tree");
                 let source = whole_tree.source();
-                let text = [&source[..usize::from(range.start())], &source[usize::from(range.end())..]]
-                    .concat();
+                let (start, end) = (usize::from(range.start()), usize::from(range.end()));
+                let text = [&source[..start], &source[end..]].concat();
                 let mut empty = FlatTreeBuilder::new();
                 empty.start_node(whole_tree.kind(at));
                 empty.finish_node();
                 let tree = whole_tree.replace_subtree(at, &empty.finish(), text.into());
-                let placeholder = SyntaxNodePtr::from_parts(node.kind(), TextRange::empty(range.start()));
+                let placeholder =
+                    SyntaxNodePtr::from_parts(node.kind(), TextRange::empty(range.start()));
                 (std::sync::Arc::new(tree), Some(placeholder), node.text_range().start())
             }
         };
@@ -233,7 +234,9 @@ impl SignatureSyntax {
         let to = |ptr: SyntaxNodePtr| {
             let range = match self.elided {
                 _ if ptr == self.item => return SyntaxNodePtr::from_parts(ptr.kind(), file),
-                Some(elided) if ptr == elided => TextRange::at(elided.text_range().start(), removed),
+                Some(elided) if ptr == elided => {
+                    TextRange::at(elided.text_range().start(), removed)
+                }
                 Some(elided) if ptr.text_range().start() >= elided.text_range().start() => {
                     ptr.text_range() + removed
                 }
@@ -2259,9 +2262,10 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
                         match it {
                             AdtId::StructId(it) => variants.push(it.into()),
                             AdtId::UnionId(it) => variants.push(it.into()),
-                            AdtId::EnumId(it) => variants.extend(
-                                EnumVariants::of(db, it).0.variants.values().map(|&(v, _)| v.into()),
-                            ),
+                            AdtId::EnumId(it) => {
+                                let of = EnumVariants::of(db, it).0.variants.values();
+                                variants.extend(of.map(|&(v, _)| VariantId::from(v)));
+                            }
                         }
                     }
                     _ => {}
@@ -2356,7 +2360,8 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
             ($db:ident, $Signature:ident, $id:expr) => {{
                 let id = $id;
                 let (signature, map) = $Signature::with_source_map(&$db, id);
-                let (whole, whole_map) = $Signature::lower(&$db, id, id.lookup(&$db).source(&$db), None);
+                let source = id.lookup(&$db).source(&$db);
+                let (whole, whole_map) = $Signature::lower(&$db, id, source, None);
                 assert_eq!(**signature, *whole, "{id:?}");
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }};

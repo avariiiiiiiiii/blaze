@@ -15,7 +15,51 @@ On a cold build, each item's signature is lowered once: fn, struct, union, enum,
 trait, impl and type alias, plus every variant's `VariantFields` and every enum's
 `EnumVariants`. hir-ty then reads the signature for every use of the item. A read is
 `X::of(db, id)`, which is `returns(deref)`: one salsa memo lookup giving `&X`, with no `Arc`
-clone and no lock. `of` clones the `Arc` out of `with_source_map` once, when the memo is filled.
+clone and no lock. `of` clones the `Arc` out of `X::relative` once, when the memo is filled.
+
+## Lowered from the item, not the file
+
+Every `with_source_map` used to read its item from the file (`loc.source(db)`: the file's tree,
+span map and ast id map, all absolute). So any edit of a file, a body edit included, ran every
+signature lowering of that file again. The results then backdated, but the work was wasted.
+
+Now each signature is lowered from a `SignatureSyntax`, as bodies are from `BodySyntax`. The
+`signature_syntax(db, GenericDefId)` query makes it. It is the item as a flat tree of its own,
+its text starting at the item. The part no signature reads is replaced by an empty node of its
+kind: the body of a fn, const or static; the item list of an impl or trait; the variant list of
+an enum. It also holds the tree's span map (`RealSpanMap::within`) and ast id map
+(`AstIdMap::relative_without`, from frontend-text), and it compares by a hash of the tree. So it
+backdates whenever the item's outline text is unchanged, wherever the item moved.
+
+- `X::relative(db, id)` lowers from it with those maps (`ExprCollector::with_maps`, from
+  speed-hir-store). This is the only query that lowers.
+- `X::of` reads `relative`.
+- `X::with_source_map` (`lru = 1024`) moves `relative`'s source map to the file. A pointer at or
+  after the empty node moves on by the length left out, the empty node becomes what it replaced,
+  and the item gets its file range. This re-runs on every edit of the file, but it only
+  rewrites pointers.
+- `variants_syntax(db, EnumId)` is the whole enum, with nothing left out. `EnumVariants::of`
+  and the `VariantFields` of an enum's variants read it. A struct's or union's `VariantFields`
+  reads its `signature_syntax`.
+- An item a macro writes has no syntax of its own (`None`, as with bodies). It is lowered from
+  its file, as before.
+
+| edit | before | after |
+|---|---|---|
+| a body (fn, const, static, assoc fn, trait default) | every signature, `VariantFields` and `EnumVariants` of the file lowered again | none |
+| another item's signature, moving this one | all of the file's | only the edited item's |
+| an enum discriminant | all of the file's | that enum's `EnumVariants` and variant fields, not its `EnumSignature` |
+
+The limit: an item whose spans are counted from an item around it is lowered from that whole
+item, with nothing left out. That covers an item in a body, or one in an `impl`, trait or module
+that has attributes (`RealSpanMap::anchor_at`). Any edit inside the enclosing item lowers it
+again, because its spans hold offsets from the enclosing item's start. Bodies have the same
+limit.
+
+Memory: a `SignatureSyntax` keeps its own copy of the outline tree, not the file's. This differs
+from `BodySyntax`, which keeps the file's text and parses again. The copy is the outline only,
+so it is small. The exception is an item anchored at an enclosing one, which keeps a copy of
+that whole enclosing item.
 
 ## Benchmark: rustc's `rustc_hir_analysis::collect`
 
@@ -62,9 +106,9 @@ rustc. This was diagnostics' request 6 (`v2/requests/diagnostics.md`).
   layout (lane db) and the item tree's columns (format), not this file.
 - **The source map is built for every signature.** A second lowering without it can't be
   shared. `collect_block_` makes a tracked `BlockId` for a block in a const argument
-  (`[u8; { .. }]`), so two lowerings give unequal stores. `of` therefore stays a projection of
-  `with_source_map`. It keeps the signature when the source map is evicted, and it backdates
-  when only pointers move. The source map costs what speed-hir-store's sorted tables cost.
+  (`[u8; { .. }]`), so two lowerings give unequal stores. `of` is therefore a projection of
+  `relative`, the one lowering, and `with_source_map` only moves `relative`'s map. The source
+  map costs what speed-hir-store's sorted tables cost.
 - **Keywords are read from syntax.** rustc's parser sets them on HIR. Matching that means the
   item tree storing a per-item keyword byte (format/items). `child_tokens` is already one pass
   over a `u16` column.
@@ -85,5 +129,15 @@ rustc. This was diagnostics' request 6 (`v2/requests/diagnostics.md`).
 - `variant_bits_as_bools`: the bitset against a `Vec<bool>` model across the 64-bit word
   boundaries (0, 1, 63, 64, 65, 127–129, 200, 1000), including `truncate`, and inline storage
   up to 64 variants.
+- `relative_tests` (`TestDB::log_executed`), over a fixture with every kind of signature, a
+  `macro_rules!` type in signatures, and an attributed impl:
+  - `a_body_edit_lowers_no_signature`: every body is edited at once. No `relative` or
+    `EnumVariants::of` runs, and every signature is the same memo as before.
+  - `an_edit_of_another_item_lowers_none_of_this_one`: a field is added to the first struct,
+    moving every item after it. Exactly that struct's signature and fields are lowered again.
+  - `a_discriminant_edit_lowers_the_variants_not_the_enum`.
+  - `moved_source_maps_are_the_files`: before and after the body edits, each signature and
+    `VariantFields`, moved from the item's tree, equals the lowering from the whole file (store
+    and source map).
 - The `signatures_lower_no_body` test in `nameres/demand_tests.rs` (db-expand-split) still holds:
   no signature query reads a body. `HAS_BODY` and `explicit_discriminant` are read off the syntax.

@@ -13,6 +13,9 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-format.workspace = true
+blaze-ids.workspace = true
+blaze-image.workspace = true
 rustc-hash.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

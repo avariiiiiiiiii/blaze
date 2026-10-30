@@ -63,7 +63,8 @@ again.
 ## Values: memory, disk, evicted
 
 - A value is its bytes in the zero-copy format (`Persist`), at a 16-byte boundary, read in
-  place. Its default fingerprint is the first 128 bits of the hash of those bytes.
+  place. Its default fingerprint is the first 128 bits of the hash of those bytes, which
+  `Query::fingerprint` is given as written, so a run writes its value once.
 - `collect(kept, effects)` keeps what an open view or a kept key reaches (an edge reaches the
   memos of its key with the fingerprint it saw) and drops the rest. Reached values no open view
   uses are written to a cold pack (`<dir>/cold/<n>`, one atomic write), mapped, checked value by
@@ -73,10 +74,97 @@ again.
   and must have its fingerprint, or the query is named as not deterministic.
 - Nothing a reader may hold is freed under it. Every reference the database hands out borrows a
   task's `blaze_reclaim::Guard`: `Cx` carries its task's guard, and outside a query
-  `Database::pin()` gives a `Pinned` that holds one. A buffer, entry, memo or view let go of goes
-  to a `blaze_reclaim::Limbo` and is freed once every task that could have loaded it has ended.
-  `collect` sweeps the limbos, and `&mut Database` (`reclaim`, `settle`) frees everything at
-  once.
+  `Database::pin()` gives a `Pinned` that holds one. A row, table, value, memo or view let go of
+  is retired with a `blaze_reclaim::Grace` and freed (or its row reused) once every task that
+  could have loaded it has ended. `collect` sweeps what is past its grace, and `&mut Database`
+  (`reclaim`, `settle`) frees everything at once.
+
+## Memory: rows, segments, no allocation on a hit
+
+Everything is a `u32` row of a column whose chunks never move (`table::Rows`: chunk `k` holds
+`64 << k` rows), so a row's address is arithmetic on its index and nothing is boxed per entry.
+
+| Table | Row | Per element | Lookup |
+| --- | --- | --- | --- |
+| A map on query keys (`table::Map`: slots, inputs, `born`, a view's results, inputs, reruns) | `Entry { key, value }` | the row (40 bytes for a view's result), at most 16 bytes of places, a live bit | shard table pointer, ~1.5 place loads, one row read; no hash computed |
+| Memo, hot (`memo::MemoHot`) | fingerprint, value word, edge range, code | 40 bytes | one indexed load |
+| Memo, cold (`memo::MemoCold`) | key, the edge segment it holds | 48 bytes | one indexed load, writers only |
+| Value (`memo::ValueRow`) | bytes, length, segment, content ID | 64 bytes + 4 of generation + its bytes | one indexed load after the word |
+| Edge (`table::EdgeRecord`, also the image's layout) | kind, input, fingerprint seen | 56 bytes in its memo's range | read in place, sequentially |
+| Slot (`memo::Slot`) | key bytes span, up to 3 memo IDs inline or a list span | 64 bytes, + 4 a memo past 3 | in a map, as above |
+
+- A map's place is one `u64`: a 32-bit tag (bits 64..96 of the key's input, mixed with the
+  kind) and the row + 1. The shard is picked by bits 0..32. A `QueryKey`'s input is a content
+  hash, so the key is indexed by its own bits and never hashed again. A replaced or removed
+  entry's row is retired to its shard's free list and handed out again only after its grace.
+- A memo's value location is one word: the value row and that row's generation, bumped each
+  time the row is claimed. Evicting, refilling and moving to a cold pack are compare-and-swaps
+  of the word, so a cold write that copied a value swaps it only if the word still names that
+  very value, however often the row was reused since. Readers take no count.
+- Edges, values (at `blaze_format::ALIGN`), key bytes and long memo lists are copied once into
+  a segment of the thread that made them (`segment::Segments`: per-lane bump segments, 16 KiB
+  growing to 1 MiB for edges, 4 MiB for values). A query's edges go onto its thread's edge stack
+  as it reads them and are copied with its result as one range; a run's key stack is the same
+  thread-local stack, so asking from outside a query allocates no run. A segment is freed whole
+  at `collect` (or `&mut`) once it is sealed and no row holds a span of it: never per memo.
+- Memos are freed in two graces: unlinked from their slots at one `collect`, checked against
+  the open views at a later one (a view's results name memos by ID), and freed after a grace
+  begun at that check. A memo a cold write will swap is pinned until the pack is mapped.
+- A warm hit (`Pinned::get` or `Cx::get` of a key the view resolved) is: the kind's entry, the
+  view's column slot, one map lookup, the memo's hot row, its value word and value row. It
+  allocates nothing (`tests::a_warm_hit_allocates_nothing` counts with a test allocator):
+  the key's bytes are encoded and an input's path is copied only on a miss.
+- Verifying a memo walks its edge range in order, stopping at the first edge whose fingerprint
+  differs. Each edge is one lookup in the view's results (or inputs), made before anything
+  else.
+
+## The benchmark: the fastest known way to do each piece
+
+Nothing has been built or measured yet. These are design comparisons, to be checked by
+`blaze-query`'s benchmarks once the tree builds.
+
+- **Incremental verification.** The fastest known are rustc's red-green dependency graph
+  (`try_mark_green`: a node's dependencies, a range of one flat `u32` edge array, walked in
+  order, stopping at the first red) and salsa (`deep_verify_memo`: inputs walked in order,
+  skipped wholesale by durability). blaze-query matches rustc's walk: one contiguous range
+  per memo, in read order, stopping at the first difference. It beats both on what can be
+  reused. Every memo of a key is kept (constructive traces), so going back to an earlier
+  edit, or to another view, reuses its results where rustc and salsa recompute. Views share
+  memos without a revision, and every edge carries the fingerprint it saw, so cutoff happens at
+  every edge, not only at a node's result.
+  Where it falls short: a rustc edge is a 4-byte `DepNodeIndex`, resolved through a
+  previous-to-current index map once per session; a blaze edge is 56 bytes, a content-hashed
+  key plus its fingerprint, and each edge costs one hash-table probe in the view's results. To
+  match: intern query keys to dense `u32` key IDs per database (an append-only table like
+  `blaze_ids::Sharded`). An edge becomes `(key ID, fingerprint)`, 24 bytes, and a view's
+  results become a dense column by key ID, one indexed load an edge. The image would keep
+  content keys and map them to IDs as it reads them in.
+- **The lock-free table.** The fastest known are papaya (Rust; lock-free reads and writes,
+  incremental resize, `seize` reclamation), folly's `ConcurrentHashMap` (lock-free reads with
+  hazard pointers, writers locking a segment) and Cliff Click's `NonBlockingHashMap` (open
+  addressing, compare-and-swap on each slot, cooperative resize). blaze-query matches folly's
+  model: wait-free reads, writers sharded by a short lock. It beats folly's read path, because a
+  read here publishes nothing: folly writes a hazard pointer per read, while here one guard
+  covers a whole task. A probe is one load of a tagged word, as in Swiss tables' metadata
+  bytes. Where it falls short of Click and papaya: writer progress. A writer descheduled while
+  holding a shard's lock stalls that shard's writers, though there are 4× the cores of shards
+  and the lock is held only for a few stores. To match: insert and replace by compare-and-swap
+  of the place, which is already one `u64`, and grow cooperatively with a forwarding mark in
+  the place, Click's "prime" state.
+- **Allocation.** The fastest known are bump arenas (rustc's `DroplessArena`, `bumpalo`) and
+  mimalloc's per-thread segments and pages with free lists sharded by thread. blaze-query
+  matches a bump arena's alloc path: a thread-local load, a bump, a `memcpy` and one relaxed
+  add on the segment's hold count. Its rows are reused from per-shard free lists claimed 64 at
+  a time, as mimalloc's pages are. Where it falls short of mimalloc: fragmentation. A segment
+  stays while one memo in it lives, and nothing is compacted. To match: a compacting `collect`
+  under `&mut` (at `settle`, or when a segment's live fraction drops) that copies live memos'
+  edges and values into a fresh segment and rewrites their hot rows.
+- What is still slower than it could be, on the miss path only: `blaze_format::Writer::new`
+  allocates a buffer for every run, which the store then copies into its segment, so a value is
+  written once and copied once. Writing straight into the segment needs a `Writer` over a
+  caller's buffer (`v2/requests/db-query.md`). `QueryKey::task_key` hashes the key for the
+  plane's single flight, once per miss. An input's `Tree::file` gives an `Arc` per file per
+  view (`v2/requests/vfs.md` item 8).
 
 ## The daemon image and the settle swap
 

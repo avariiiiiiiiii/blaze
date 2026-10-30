@@ -67,19 +67,30 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
     if exported && !has_doc(cx, node, inner.as_ref()) {
         found.push(lint(cx, item.syntax(), desc));
     }
+    if !matches!(node, ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_)) {
+        return found;
+    }
     for own in &item.nodes[1..] {
-        if let Some(variant) = ast::Variant::cast(own.value.clone()) {
-            let def = cx.sema.to_def2(own.with_value(&variant));
-            let exported = def.is_some_and(|it| effective.is_exported(Def::Item(hir::ModuleDef::EnumVariant(it))));
-            if exported && !has_doc(cx, &variant, None) {
-                found.push(lint(cx, own.clone(), ("a", "variant")));
+        match own.value.kind() {
+            // A variant `pub use` names is exported without its enum.
+            SyntaxKind::VARIANT => {
+                let Some(variant) = ast::Variant::cast(own.value.clone()) else { continue };
+                let def = cx.sema.to_def2(own.with_value(&variant));
+                let exported = def.is_some_and(|it| effective.is_exported(Def::Item(hir::ModuleDef::EnumVariant(it))));
+                if exported && !has_doc(cx, &variant, None) {
+                    found.push(lint(cx, own.clone(), ("a", "variant")));
+                }
             }
-        } else if let Some(field) = ast::RecordField::cast(own.value.clone()) {
-            let def = cx.sema.to_def2(own.with_value(&field));
-            let exported = def.is_some_and(|it| effective.is_exported(Def::Field(it)));
-            if exported && !has_doc(cx, &field, None) {
-                found.push(lint(cx, own.clone(), ("a", "struct field")));
+            // A field is exported only with the type it is of.
+            SyntaxKind::RECORD_FIELD if exported => {
+                let Some(field) = ast::RecordField::cast(own.value.clone()) else { continue };
+                let def = cx.sema.to_def2(own.with_value(&field));
+                let exported = def.is_some_and(|it| effective.is_exported(Def::Field(it)));
+                if exported && !has_doc(cx, &field, None) {
+                    found.push(lint(cx, own.clone(), ("a", "struct field")));
+                }
             }
+            _ => {}
         }
     }
     found

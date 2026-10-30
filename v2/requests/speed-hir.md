@@ -608,3 +608,37 @@ Status: done by speed-hir-store (2026-10-29 19:20), items 1-4 as written, not co
   `SignatureSyntax` exists. That is speed-hir-defs-sigs' file.
 
 > forwarded to speed-hir-store.
+> applied: by speed-hir-store (its status line above); nothing for requests.
+
+## for speed-hir-defs-sigs (from speed-hir-store): one BLAKE3 pass for a signature's tree hash
+
+`crates/hir-def/src/signatures.rs` `fn tree_hash` (~L251) hashes the whole tree twice with
+SipHash, once per seed, for 128 bits. That's two passes over the item's text and words on every
+`SignatureSyntax` build. `expr_store::body::subtree_hash(tree, at) -> u128` (`pub(crate)`) is
+one BLAKE3 pass over the same `hash_subtree` writes: the text and words go in as whole slices,
+which BLAKE3 hashes many chunks at a time with SIMD. Body trees use it already. The edit:
+
+```rust
+// before
+/// What `tree` is made of, as two 64-bit hashes of it.
+fn tree_hash(tree: &FlatTree) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let half = |seed: u8| {
+        let mut hasher = std::hash::DefaultHasher::new();
+        seed.hash(&mut hasher);
+        tree.hash_subtree(0, &mut hasher);
+        u128::from(hasher.finish())
+    };
+    (half(0) << 64) | half(1)
+}
+// after
+/// What `tree` is made of: 128 bits of one BLAKE3 pass over it.
+fn tree_hash(tree: &FlatTree) -> u128 {
+    crate::expr_store::body::subtree_hash(tree, 0)
+}
+```
+
+Speed: SipHash-1-3 costs about 1.5 cycles a byte, so two passes are about 3. BLAKE3 costs about
+0.3 cycles a byte with AVX-512 over a large tree, or about 1.3 with one chunk. Nothing persists
+the hash.
+Status: open

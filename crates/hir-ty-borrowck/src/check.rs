@@ -8,7 +8,7 @@ use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClauseKind, OutlivesClause, RegionKind,
-    inherent::{GenericArgs as _, IntoKind, Region as _},
+    inherent::{GenericArgs as _, IntoKind},
 };
 use smallvec::SmallVec;
 

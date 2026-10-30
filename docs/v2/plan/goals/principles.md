@@ -131,5 +131,22 @@ while any remain in its paths. v2 lands complete or not at all.
     back to bytes only on a tie. Never `to_string()` or `clone()` inside a sort key.
   - **Ordered maps for determinism become hash maps sorted once** where the output is written.
     Timers use a hierarchical timing wheel, not a `BTreeMap`.
+- **Allocation, `dyn` and clones are controlled mechanically**, not by care alone:
+  - **By construction.** Big types in hot crates don't implement `Clone`. IDs are `Copy`.
+    Shared big values are interned and referred to by ID. Hot APIs take borrowed views
+    (`&[T]`, `&str` from mapped bytes) and write into buffers the caller passes.
+  - **Statically.** `tools/v2/hot_lint.py` flags `.clone()`, `dyn`, string and `Vec`
+    allocation, `collect()`, per-value boxes and SipHash maps in the hot crates. A line is
+    exempt only with a `// alloc:`, `// dyn:` or `// clone:` comment naming why the cost is
+    needed there (an error path, setup, the edge). From the first compile, clippy's
+    `redundant_clone`, `clone_on_ref_ptr`, `implicit_clone`, `unnecessary_to_owned`,
+    `inefficient_to_string`, `format_collect`, `needless_pass_by_value`,
+    `large_types_passed_by_value`, `box_collection`, `vec_box`, `rc_buffer` and
+    `large_enum_variant` are errors in v2's crates.
+  - **By test.** Every hot path has an allocation-budget test using `blaze-alloc-count`'s
+    counting allocator: a memo hit, an interner hit, a store read, a VFS lookup, a name
+    resolution, a stencil emit and a radix pass allocate nothing. A parse, a lowering or an
+    inference allocates at most a stated, constant number of buffers. Going over budget fails
+    the test.
 - **Every hot structure states its cost**: a comment or a `const` assertion giving its size
   per element and its lookup cost. `proof`'s budgets hold each lane to them.

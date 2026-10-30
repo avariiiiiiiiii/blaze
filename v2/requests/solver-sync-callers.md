@@ -1283,8 +1283,12 @@ Besides the sites below:
 
 ## Added 2026-10-29 19:25 (new sites only; earlier lines unchanged)
 
+> forwarded: each site to its section's owner, as above.
+
 ### fastcompile-ident-share
 
 - `crates/hir-ty-share/src/walk.rs` L36: `next_solver::{AllocationData, Const, ConstKind, GenericArgs, Ty, TyKind, UnevaluatedConst},` → `next_solver::{AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId, GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind},`. R7.
 - `crates/hir-ty-share/src/walk.rs` L217: `let ConstKind::Unevaluated(UnevaluatedConst { def, args }) = konst.kind() else {` → `let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {`. R7. Then the match below becomes `match kind { AliasConstKind::Projection { def_id: TraitAssocConstId(id) } | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) } | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => { let (id, args) = lookup_impl_const(&cx.infcx, cx.env.param_env, id, args); db.const_eval(id, args, Some(cx.env)) } AliasConstKind::Anon { def_id } => db.anon_const_eval(def_id.0, args, Some(cx.env)), AliasConstKind::InherentSelf { .. } => return Err(Unshared::ConstEval(format!("`{konst:?}`: an inherent const in Self form after type check"))) }`. The `StaticId` arm goes, as in hir-ty-codegen's `eval_const`, which this mirrors.
 - `crates/hir-ty-share/src/walk.rs` L867: `TyKind::FnDef(def, fn_args) => match def.0 {` → `TyKind::FnDef(def, fn_args) => match def.0 {`. R4: pattern unchanged; read `fn_args` as `fn_args.no_bound_vars().unwrap()` (once, `let fn_args = fn_args.no_bound_vars().unwrap();`), or pass it on unchanged where it is put back into a `FnDef`.
+
+> forwarded to fastcompile-ident-share (window `fastcompile-ident-share-next2`, told by tmux): `crates/hir-ty-share/` is its.

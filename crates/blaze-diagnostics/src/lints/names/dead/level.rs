@@ -4,6 +4,10 @@
 //! naming `dead_code`, a group with it or `warnings`; a `forbid` not lowered; then a `warn` that
 //! `warnings` changes.
 //!
+//! What the attributes set is memoized at each node that has attributes and at each file's root
+//! (what is set above it), as rustc's `ShallowLintLevelMap` keeps it per owner: a query walks up
+//! only to the nearest node already seen, and each owner's attributes are read once.
+//!
 //! Follows `compiler/rustc_lint/src/levels.rs` (`LintLevelsBuilder::add`, `push`),
 //! `compiler/rustc_middle/src/lint.rs` (`reveal_actual_level`) (MIT or Apache-2.0).
 
@@ -12,6 +16,7 @@ use std::cell::RefCell;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 
 use crate::{
@@ -36,72 +41,87 @@ impl LevelPlus {
     }
 }
 
-/// The levels asked for, each node once.
-pub(super) struct Levels {
-    at: RefCell<FxHashMap<InFile<SyntaxNodePtr>, LevelPlus>>,
-}
-
-impl Levels {
-    pub(super) fn new() -> Levels {
-        Levels { at: RefCell::new(FxHashMap::default()) }
-    }
-
-    /// The level of `dead_code` at `node`.
-    pub(super) fn at(&self, cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> LevelPlus {
-        let key = node.as_ref().map(SyntaxNodePtr::new);
-        if let Some(it) = self.at.borrow().get(&key) {
-            return *it;
-        }
-        let level = level_at(cx, node);
-        self.at.borrow_mut().insert(key, level);
-        level
-    }
-}
-
 /// What the attributes set so far: of `dead_code`, and of `warnings`.
+#[derive(Clone, Copy, Debug, Default)]
 struct State {
     dead_code: Option<LevelPlus>,
     warnings: Option<LevelPlus>,
 }
 
-fn level_at(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> LevelPlus {
-    let chain = chain(cx, node);
-    let mut state = State { dead_code: None, warnings: None };
-    for owner in chain.iter().rev() {
-        apply(cx, owner, &mut state);
+/// The states asked for: one FxHash probe per node with attributes walked through, and one per
+/// file.
+pub(super) struct Levels {
+    /// After the attributes of each node that has some.
+    owners: RefCell<FxHashMap<InFile<SyntaxNodePtr>, State>>,
+    /// Above the root of each file: what its macro call or module declaration has.
+    files: RefCell<FxHashMap<HirFileId, State>>,
+}
+
+impl Levels {
+    pub(super) fn new() -> Levels {
+        Levels { owners: RefCell::default(), files: RefCell::default() }
     }
-    let level = state.dead_code.unwrap_or(LevelPlus { level: default_level(), expect: None });
-    if level.level == Level::Warn
-        && let Some(warnings) = state.warnings
-        && warnings.level != Level::Warn
-    {
-        return warnings;
+
+    /// The level of `dead_code` at `node`.
+    pub(super) fn at(&self, cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> LevelPlus {
+        let state = self.state(cx, node);
+        let level = state.dead_code.unwrap_or(LevelPlus { level: default_level(), expect: None });
+        if level.level == Level::Warn
+            && let Some(warnings) = state.warnings
+            && warnings.level != Level::Warn
+        {
+            return warnings;
+        }
+        level
     }
-    level
+
+    /// What is set at `node`: the state of the nearest memoized node above it, then the
+    /// attributes of the nodes with attributes between, outermost first, each memoized.
+    fn state(&self, cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> State {
+        let mut pending: SmallVec<[(SyntaxNodePtr, ast::AnyHasAttrs); 4]> = SmallVec::new();
+        let mut base = None;
+        let mut top = node.value.clone();
+        for ancestor in node.value.ancestors() {
+            if ast::AnyHasAttrs::can_cast(ancestor.kind())
+                && let Some(owner) = ast::AnyHasAttrs::cast(ancestor.clone())
+                && ast::attrs_including_inner(&owner).next().is_some()
+            {
+                let ptr = SyntaxNodePtr::new(&ancestor);
+                if let Some(&state) = self.owners.borrow().get(&node.with_value(ptr)) {
+                    base = Some(state);
+                    break;
+                }
+                pending.push((ptr, owner));
+            }
+            top = ancestor;
+        }
+        let mut state = match base {
+            Some(it) => it,
+            None => self.above_file(cx, node.file_id, &top),
+        };
+        for (ptr, owner) in pending.into_iter().rev() {
+            apply(cx, &node.with_value(owner), ptr, &mut state);
+            self.owners.borrow_mut().insert(node.with_value(ptr), state);
+        }
+        state
+    }
+
+    /// What is set above the root `top` of `file`.
+    fn above_file(&self, cx: &Cx<'_, '_>, file: HirFileId, top: &SyntaxNode) -> State {
+        if let Some(&state) = self.files.borrow().get(&file) {
+            return state;
+        }
+        let state = match above(cx, file, top) {
+            Some(node) => self.state(cx, &node),
+            None => State::default(),
+        };
+        self.files.borrow_mut().insert(file, state);
+        state
+    }
 }
 
 fn default_level() -> Level {
     LintId::DEAD_CODE.lint().default_level
-}
-
-/// The nodes whose attributes set the level at `node`, innermost first: `node`, its ancestors,
-/// the calls of the macros it was expanded from, the declarations of the modules it is in.
-fn chain(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<InFile<ast::AnyHasAttrs>> {
-    let mut chain = Vec::new();
-    let mut at = Some(node.clone());
-    while let Some(node) = at.take() {
-        let mut top = node.value.clone();
-        for ancestor in node.value.ancestors() {
-            if let Some(owner) = ast::AnyHasAttrs::cast(ancestor.clone())
-                && ast::attrs_including_inner(&owner).next().is_some()
-            {
-                chain.push(node.with_value(owner));
-            }
-            top = ancestor;
-        }
-        at = above(cx, node.file_id, &top);
-    }
-    chain
 }
 
 /// Where the levels at the root `top` of `file` come from: the macro call it was expanded from
@@ -130,10 +150,11 @@ fn above(cx: &Cx<'_, '_>, file: HirFileId, top: &SyntaxNode) -> Option<InFile<Sy
     Some(declaration.map(|it| it.syntax().clone()))
 }
 
-/// The lint attributes of `owner`, in order, as they set `dead_code` and `warnings`.
-fn apply(cx: &Cx<'_, '_>, owner: &InFile<ast::AnyHasAttrs>, state: &mut State) {
+/// The lint attributes of `owner` (whose node is `ptr`), in order, as they set `dead_code` and
+/// `warnings`.
+fn apply(cx: &Cx<'_, '_>, owner: &InFile<ast::AnyHasAttrs>, ptr: SyntaxNodePtr, state: &mut State) {
     let file = owner.file_id.original_file(cx.db).file_id(cx.db);
-    let ptr = owner.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
+    let ptr = owner.with_value(ptr);
     for (index, (attr, name)) in cx.sema.lint_attrs(file, cx.krate, owner.value.clone()).enumerate() {
         let level = match attr {
             hir::LintAttr::Allow => Level::Allow,

@@ -662,3 +662,17 @@ script reads hundreds of headers, so that is hundreds of syscalls per cache hit.
 and Bazel's `--watchfs` answer the same question from the watcher with no syscall.
 
 > forwarded to requests-outside (child of `requests`; vfs and core are DONE): the table in blaze-vfs, its sans-io watch driver, and `Effect::Flush` in blaze-core so a request can drain queued events before trusting a generation (events arrive after the change). usercode's `Files` and cargo's per-request flush come back as its requests.
+
+## 12. cargo (whoever calls `blaze_expand::install`): expansions read the store with no lock
+
+What: `blaze_expand::Expansions.store` is now a `blaze_cas::Reader` (`store.reader()`), not
+`Arc<RwLock<Store>>`. Build it as `Expansions { store: store.reader(), toolchain, environment }`.
+Expansions still never write: the store's owner calls `blaze_expand::publish(&mut store,
+blaze_expand::take_puts())` as before.
+
+Why: every proc-macro expansion's cache check took the store's read lock, the one lock on
+that path. A reader takes no lock and writes nothing shared. Each check takes
+`blaze_cas::enter()` for its one `index::find`, and asks the database nothing while the guard
+lives.
+
+> forwarded to cargo (told by tmux).

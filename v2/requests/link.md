@@ -1114,3 +1114,4 @@ Each refusal names the function (no-fallback). Once v1 moves onto `slots`, neith
     unsafe. blaze-live is speed-link-edge-live's.
 
 > written by lead link (2026-10-29).
+> forwarded: the `fuzz/Cargo.toml` feature to safety-fuzz (window `safety-fuzz-next1`, told by tmux). The reference move and the two entries (item 13; link and speed-link-edge-macho are DONE) are taken by requests, child `requests-link-fuzz`.

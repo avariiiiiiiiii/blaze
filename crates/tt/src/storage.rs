@@ -32,6 +32,9 @@ use crate::{
 
 #[cfg(test)]
 mod tests;
+mod wire;
+
+pub use wire::{WireError, WirePart};
 #[cfg(test)]
 mod varint;
 

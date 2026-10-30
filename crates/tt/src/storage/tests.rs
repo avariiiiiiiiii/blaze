@@ -394,7 +394,47 @@ fn check(tokens: &[TokenTree], rng: &mut Rng) -> TopSubtree {
     assert!(all.try_into_subtree().is_some());
     assert_eq!(TopSubtree::from_subtree(tree.view()), tree);
     assert_eq!(TopSubtree::from_token_trees(tree.top_subtree().delimiter, inner), tree);
+    // Damaging every byte costs a read a byte; a lexed file is checked whole only.
+    check_wire(&tree, tokens.len() <= DAMAGED_TREES_UP_TO);
     tree
+}
+
+const DAMAGED_TREES_UP_TO: usize = 300;
+
+/// Writes `tree` to the wire and reads it back as the same tree; with `damage`, also reads every
+/// prefix of its bytes as an error, and each byte with a bit flipped as an error or as a tree
+/// that writes exactly those bytes, so a tree read is always the builder's.
+fn check_wire(tree: &TopSubtree, damage: bool) {
+    let mut bytes = Vec::new();
+    tree.write_wire(&mut bytes);
+    assert_eq!(bytes.len() % 4, 0);
+    let parts = wire::parts_of(tree);
+    let mut resolve = |part: WirePart| {
+        parts
+            .iter()
+            .find(|(it, _)| *it == part)
+            .map(|&(_, it)| it)
+            .ok_or_else(|| "a part the tree didn't have".to_owned())
+    };
+    let (read, used) = TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
+    assert_eq!(used, bytes.len());
+    assert!(read == *tree, "read back");
+    assert_eq!(flat(&read), flat(tree));
+    if !damage {
+        return;
+    }
+    for len in 0..bytes.len() {
+        assert!(TopSubtree::read_wire(&bytes[..len], &mut resolve).is_err(), "a prefix of {len}");
+    }
+    for at in 0..bytes.len() {
+        let mut damaged = bytes.clone();
+        damaged[at] ^= 1 << (at % 8);
+        if let Ok((read, used)) = TopSubtree::read_wire(&damaged, &mut resolve) {
+            let mut again = Vec::new();
+            read.write_wire(&mut again);
+            assert_eq!(again, damaged[..used], "byte {at} flipped");
+        }
+    }
 }
 
 #[test]

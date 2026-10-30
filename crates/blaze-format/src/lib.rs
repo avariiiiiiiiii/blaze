@@ -580,7 +580,14 @@ fn align_up(at: usize, align: usize) -> usize {
 
 impl Writer {
     pub fn new(schema: SchemaHash) -> Writer {
-        let mut bytes = Vec::with_capacity(4096);
+        Writer::with_buffer(schema, Vec::with_capacity(4096))
+    }
+
+    /// [`Writer::new`] over `bytes`, cleared and keeping its capacity: a caller that writes
+    /// many values hands each [`Writer::finish`]'s buffer back, and once it has grown a write
+    /// allocates nothing.
+    pub fn with_buffer(schema: SchemaHash, mut bytes: Vec<u8>) -> Writer {
+        bytes.clear();
         bytes.extend_from_slice(&MAGIC);
         bytes.extend_from_slice(&schema.0.0);
         bytes.extend_from_slice(&[0; 16]);

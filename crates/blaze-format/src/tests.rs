@@ -71,7 +71,10 @@ record! {
 }
 
 fn written(flag: u8) -> Vec<u8> {
-    let mut out = Writer::new(Root::SCHEMA);
+    written_by(Writer::new(Root::SCHEMA), flag)
+}
+
+fn written_by(mut out: Writer, flag: u8) -> Vec<u8> {
     let leaf = out.push(&Leaf { value: 7, flag: true, pad: [0; 7] });
     let numbers = out.push_slice(&[1u32, 2, 3]);
     let name = out.push_str("blaze");
@@ -112,6 +115,16 @@ fn a_buffer_reads_in_place() {
 #[test]
 fn equal_values_are_equal_bytes() {
     assert_eq!(written(1), written(1));
+}
+
+#[test]
+fn a_reused_buffer_writes_the_same_bytes_in_its_own_allocation() {
+    let mut used = written(1);
+    used.extend_from_slice(&[0xff; 4096]);
+    let (at, capacity) = (used.as_ptr(), used.capacity());
+    let again = written_by(Writer::with_buffer(Root::SCHEMA, used), 1);
+    assert_eq!(again, written(1));
+    assert_eq!((again.as_ptr(), again.capacity()), (at, capacity));
 }
 
 #[test]

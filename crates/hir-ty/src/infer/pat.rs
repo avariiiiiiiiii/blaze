@@ -33,7 +33,7 @@ use crate::{
         expr::ExprIsRead,
     },
     next_solver::{
-        Const, IsRigid, TraitRef, Ty, TyKind, Tys,
+        Const, ConstExt, IsRigid, TraitRef, Ty, TyKind, Tys,
         infer::{
             InferOk,
             traits::{Obligation, ObligationCause},

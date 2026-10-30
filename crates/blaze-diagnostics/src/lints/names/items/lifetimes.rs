@@ -18,12 +18,13 @@
 
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, T,
+    AstNode, NodeOrToken, SmolStr, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, T,
     ast::{self, HasGenericArgs, HasGenericParams, HasTypeBounds},
 };
 
-use super::walk::{self, Item};
+use super::walk::{Item, Order, Orders};
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -38,10 +39,11 @@ enum Binder {
     Where,
 }
 
-/// What a lifetime in a function's parameters stands for, for elision.
+/// What a lifetime in a function's parameters stands for, for elision: a name, inline up to
+/// 23 bytes.
 #[derive(Clone, PartialEq, Eq)]
 enum Res {
-    Named(String),
+    Named(SmolStr),
     /// An elided lifetime, each its own.
     Fresh(u32),
 }
@@ -52,41 +54,46 @@ type Elision = Option<Res>;
 
 pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
     let anonymous_in_impl_trait = super::feature(cx, "anonymous_lifetime_in_impl_trait");
-    let mut found: Vec<(Vec<u32>, Found)> = Vec::new();
-    let mut lints = Lints { cx, anonymous_in_impl_trait, found: &mut found };
+    let mut found: Vec<(Order, Found)> = Vec::new();
+    let mut lints = Lints { cx, anonymous_in_impl_trait, orders: Orders::default(), found: &mut found };
     for item in items {
-        let derived = item.node.file_id.macro_file().is_some_and(|it| it.loc(cx.db).def.is_derive());
-        let order = walk::module_order(cx, item.module);
         let node = item.node.as_ref();
         match node.value {
             ast::Item::Fn(f) => {
                 if let Some(params) = f.generic_param_list() {
                     let span = params.syntax().text_range();
-                    lints.binder(item, &order, derived, &Binder::Fn(f.clone()), f.syntax(), &params, span);
+                    lints.binder(item, item.node.file_id, &Binder::Fn(f.clone()), f.syntax(), &params, span);
                 }
             }
             ast::Item::Impl(imp) => {
                 if let Some(params) = imp.generic_param_list() {
                     let span = params.syntax().text_range();
-                    lints.binder(item, &order, derived, &Binder::Impl(imp.clone()), imp.syntax(), &params, span);
+                    lints.binder(item, item.node.file_id, &Binder::Impl(imp.clone()), imp.syntax(), &params, span);
                 }
             }
             _ => {}
         }
         for own in &item.nodes {
-            let derived = own.file_id.macro_file().is_some_and(|it| it.loc(cx.db).def.is_derive());
-            if let Some(ty) = ast::ForType::cast(own.value.clone())
-                && let Some(ast::Type::FnPtrType(ptr)) = ty.ty()
-                && let Some(params) = ty.for_binder().and_then(|it| it.generic_param_list())
-            {
-                let span = TextRange::new(ty.syntax().text_range().start(), ptr.syntax().text_range().start());
-                lints.binder_in(item, own.file_id, &order, derived, &Binder::FnPtr(ptr.clone()), ty.syntax(), &params, span);
-            } else if let Some(pred) = ast::WherePred::cast(own.value.clone())
-                && let Some(params) = pred.for_binder().and_then(|it| it.generic_param_list())
-                && let Some(bounded) = pred.ty()
-            {
-                let span = TextRange::new(pred.syntax().text_range().start(), bounded.syntax().text_range().start());
-                lints.binder_in(item, own.file_id, &order, derived, &Binder::Where, pred.syntax(), &params, span);
+            match own.value.kind() {
+                SyntaxKind::FOR_TYPE => {
+                    if let Some(ty) = ast::ForType::cast(own.value.clone())
+                        && let Some(ast::Type::FnPtrType(ptr)) = ty.ty()
+                        && let Some(params) = ty.for_binder().and_then(|it| it.generic_param_list())
+                    {
+                        let span = TextRange::new(ty.syntax().text_range().start(), ptr.syntax().text_range().start());
+                        lints.binder(item, own.file_id, &Binder::FnPtr(ptr.clone()), ty.syntax(), &params, span);
+                    }
+                }
+                SyntaxKind::WHERE_PRED => {
+                    if let Some(pred) = ast::WherePred::cast(own.value.clone())
+                        && let Some(params) = pred.for_binder().and_then(|it| it.generic_param_list())
+                        && let Some(bounded) = pred.ty()
+                    {
+                        let span = TextRange::new(pred.syntax().text_range().start(), bounded.syntax().text_range().start());
+                        lints.binder(item, own.file_id, &Binder::Where, pred.syntax(), &params, span);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -97,74 +104,68 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
 struct Lints<'c, 'a, 'db, 'f> {
     cx: &'c Cx<'a, 'db>,
     anonymous_in_impl_trait: bool,
-    found: &'f mut Vec<(Vec<u32>, Found)>,
+    orders: Orders,
+    found: &'f mut Vec<(Order, Found)>,
 }
 
 impl Lints<'_, '_, '_, '_> {
-    #[allow(clippy::too_many_arguments)]
+    /// The lints of the lifetime parameters of `params`, which `binder` introduces for `scope`.
+    /// A binder with none of its own (most have only types) costs one pass over `params`.
     fn binder(
         &mut self,
         item: &Item,
-        order: &[u32],
-        derived: bool,
-        binder: &Binder,
-        scope: &SyntaxNode,
-        params: &ast::GenericParamList,
-        generics_span: TextRange,
-    ) {
-        self.binder_in(item, item.node.file_id, order, derived, binder, scope, params, generics_span);
-    }
-
-    /// The lints of the lifetime parameters of `params`, which `binder` introduces for `scope`.
-    #[allow(clippy::too_many_arguments)]
-    fn binder_in(
-        &mut self,
-        item: &Item,
         file: hir::HirFileId,
-        order: &[u32],
-        derived: bool,
         binder: &Binder,
         scope: &SyntaxNode,
         params: &ast::GenericParamList,
         generics_span: TextRange,
     ) {
         let cx = self.cx;
-        let all: Vec<ast::GenericParam> = params.generic_params().collect();
+        let all: SmallVec<[ast::GenericParam; 4]> = params.generic_params().collect();
+        let linted = |param: &ast::GenericParam| match param {
+            ast::GenericParam::LifetimeParam(it) => it.lifetime().is_some_and(|it| !matches!(it.text(), "'_" | "'static")),
+            _ => false,
+        };
+        if !all.iter().any(linted) {
+            return;
+        }
+        let derived = file.macro_file().is_some_and(|it| it.loc(cx.db).def.is_derive());
         let uses = uses(scope, binder);
         let mut elision: Option<Elision> = None;
         for (index, param) in all.iter().enumerate() {
             let ast::GenericParam::LifetimeParam(param) = param else { continue };
             let Some(lifetime) = param.lifetime() else { continue };
-            let name = lifetime.text().to_owned();
+            let name = lifetime.text();
             if name == "'_" || name == "'static" {
                 continue;
             }
-            let named: Vec<&SyntaxToken> = uses.iter().filter(|it| it.text() == name).collect();
-            let deletion = deletion_span(&all, index, generics_span);
+            let mut named = uses.iter().filter(|it| it.text() == name);
+            let (first, second) = (named.next(), named.next());
             let span = |range: TextRange| cx.span(InFile::new(file, range));
-            let param_span = span(lifetime.syntax().text_range());
             let at = InFile::new(file, SyntaxNodePtr::new(param.syntax()));
-            let diag = match named.as_slice() {
-                [] => {
+            let diag = match (first, second) {
+                (None, _) => {
                     if derived {
                         continue;
                     }
-                    let mut diag =
-                        Diag::lint("unused_lifetimes", format!("lifetime parameter `{name}` never used"), param_span.clone());
-                    if let Some(deletion) = deletion {
+                    let param_span = span(lifetime.syntax().text_range());
+                    let mut diag = Diag::lint("unused_lifetimes", format!("lifetime parameter `{name}` never used"), param_span);
+                    if let Some(deletion) = deletion_span(&all, index, generics_span) {
                         diag.suggestion(span(deletion), "elide the unused lifetime", "", Applicability::MachineApplicable);
                     }
                     diag
                 }
-                [token] => {
+                (Some(token), None) => {
                     let bounded = param.type_bound_list().is_some_and(|it| it.bounds().next().is_some());
                     if bounded {
                         continue;
                     }
                     let elision = elision.get_or_insert_with(|| self.elision(binder));
-                    if !self.single(binder, token, scope, &name, elision) {
+                    if !self.single(binder, token, scope, name, elision) {
                         continue;
                     }
+                    let param_span = span(lifetime.syntax().text_range());
+                    let deletion = deletion_span(&all, index, generics_span);
                     let (use_range, replace) = match is_ref(token) {
                         true => (extended_over_whitespace(token), ""),
                         false => (token.text_range(), "'_"),
@@ -183,14 +184,14 @@ impl Lints<'_, '_, '_, '_> {
                     }
                     diag
                 }
-                _ => continue,
+                (Some(_), Some(_)) => continue,
             };
             let mut diag = diag;
             if let Some((id, item_name)) = super::item_id(cx, item) {
                 diag.fact(Fact::Signature(cx.key(id)), format!("the generics of `{item_name}`"));
             }
             crate::lints::code_fact(cx, &mut diag, item.ptr());
-            let key = walk::source_order(order, cx.span(InFile::new(file, param.syntax().text_range())).lo);
+            let key = self.orders.key(cx, item.module, cx.span(InFile::new(file, param.syntax().text_range())).lo);
             self.found.push((key, Found::lint(diag, Phase::Resolve, at)));
         }
     }
@@ -224,7 +225,7 @@ impl Lints<'_, '_, '_, '_> {
         }
         let within = |node: Option<&SyntaxNode>| node.is_some_and(|it| it.text_range().contains_range(lifetime.text_range()));
         let returns = |ret: Option<ast::RetType>| {
-            within(ret.as_ref().map(AstNode::syntax)) && *elision == Some(Res::Named(name.to_owned()))
+            within(ret.as_ref().map(AstNode::syntax)) && matches!(elision, Some(Res::Named(it)) if it == name)
         };
         match binder {
             Binder::Fn(f) => within(f.param_list().as_ref().map(AstNode::syntax)) || returns(f.ret_type()),
@@ -369,7 +370,7 @@ impl Lints<'_, '_, '_, '_> {
 fn named(lifetime: &ast::Lifetime, fresh: &mut u32) -> Res {
     match lifetime.text() {
         "'_" => fresh_res(fresh),
-        name => Res::Named(name.to_owned()),
+        name => Res::Named(SmolStr::new(name)),
     }
 }
 

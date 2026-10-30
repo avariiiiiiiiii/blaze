@@ -960,3 +960,195 @@ fn link_attrs_read_as_the_string_match_did() {
         assert_eq!(parse_link_tt(&tt), old_parse_link_tt(&tt), "{attr}");
     }
 }
+
+mod stability {
+    use hir_expand::Lookup;
+    use intern::Symbol;
+    use test_fixture::WithFixture;
+
+    use crate::{
+        AdtId, AttrDefId, DefWithBodyId, FieldId, ModuleDefId, ModuleId, VariantId,
+        attrs::stability::{
+            DeprecatedSince, RustcVersion, Stability, StabilityDef, StabilityLevel, StableSince,
+            deprecation_entry, stability,
+        },
+        expr_store::Body,
+        nameres::crate_def_map,
+        test_db::TestDB,
+    };
+
+    fn attr_def(def: ModuleDefId) -> AttrDefId {
+        match def {
+            ModuleDefId::ModuleId(it) => it.into(),
+            ModuleDefId::FunctionId(it) => it.into(),
+            ModuleDefId::AdtId(it) => it.into(),
+            ModuleDefId::EnumVariantId(it) => it.into(),
+            ModuleDefId::ConstId(it) => it.into(),
+            ModuleDefId::StaticId(it) => it.into(),
+            ModuleDefId::TraitId(it) => it.into(),
+            ModuleDefId::TypeAliasId(it) => it.into(),
+            ModuleDefId::MacroId(it) => it.into(),
+            ModuleDefId::BuiltinType(_) => panic!("a builtin type has no attributes"),
+        }
+    }
+
+    /// What `name` is in `module`'s scope, a type before a value.
+    fn in_scope(db: &TestDB, module: ModuleId, name: &str) -> ModuleDefId {
+        let scope = module.def_map(db).module(db, module).scope(db);
+        let (_, per_ns) = scope
+            .entries()
+            .find(|(it, _)| it.as_str() == name)
+            .unwrap_or_else(|| panic!("no `{name}` in the scope"));
+        per_ns.take_types().or(per_ns.take_values()).unwrap()
+    }
+
+    /// The definition `path` names from the crate root, `::`-separated.
+    fn def(db: &TestDB, path: &str) -> StabilityDef {
+        let def_map = crate_def_map(db, db.fetch_test_crate());
+        let mut module = def_map.root;
+        let mut segments = path.split("::").peekable();
+        loop {
+            let found = in_scope(db, module, segments.next().unwrap());
+            if segments.peek().is_none() {
+                return attr_def(found).into();
+            }
+            match found {
+                ModuleDefId::ModuleId(it) => module = it,
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                    let name = segments.next().unwrap();
+                    let mut variants = it.enum_variants(db).variants.values();
+                    let (variant, _) =
+                        variants.find(|(v, _)| v.lookup(db).name.as_str() == name).unwrap();
+                    return AttrDefId::EnumVariantId(*variant).into();
+                }
+                _ => panic!("`{path}` goes through something that is not a module or an enum"),
+            }
+        }
+    }
+
+    fn first_field(def: StabilityDef) -> StabilityDef {
+        let StabilityDef::Def(AttrDefId::AdtId(AdtId::StructId(it))) = def else {
+            panic!("not a struct")
+        };
+        let local_id = la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(0));
+        FieldId { parent: VariantId::StructId(it), local_id }.into()
+    }
+
+    /// The item `name` declared in the block of `function`'s body.
+    fn in_body(db: &TestDB, function: StabilityDef, name: &str) -> StabilityDef {
+        let StabilityDef::Def(AttrDefId::FunctionId(function)) = function else {
+            panic!("not a function")
+        };
+        let body = Body::of(db, DefWithBodyId::FunctionId(function));
+        let (_, def_map) = body.blocks(db).next().expect("a block with items");
+        attr_def(in_scope(db, def_map.root, name)).into()
+    }
+
+    fn origin(db: &TestDB, def: StabilityDef) -> Option<StabilityDef> {
+        deprecation_entry(db, def).map(|it| it.origin)
+    }
+
+    #[test]
+    fn deprecation_is_inherited_from_the_definition_an_item_is_in() {
+        let db = TestDB::with_files(
+            r#"
+#[deprecated(note = "old")]
+pub mod m {
+    pub struct S { pub f: u8 }
+    pub fn g() { pub struct InG; }
+    #[deprecated(since = "TBD")]
+    pub fn h() {}
+    pub enum E { V }
+}
+#[deprecated = "fn"]
+pub fn k() { pub struct InK; }
+pub struct T { #[deprecated(since = "2.0", note = "field")] pub f: u8 }
+pub struct U;
+"#,
+        );
+        let m = def(&db, "m");
+        let s = def(&db, "m::S");
+        let entry = deprecation_entry(&db, s).unwrap();
+        assert_eq!(entry.origin, m);
+        assert_eq!(entry.deprecation.note, Some(Symbol::intern("old")));
+        assert_eq!(entry.deprecation.since, DeprecatedSince::Unspecified);
+        assert_eq!(origin(&db, first_field(s)), Some(m));
+        assert_eq!(origin(&db, def(&db, "m::E::V")), Some(m));
+        assert_eq!(origin(&db, in_body(&db, def(&db, "m::g"), "InG")), Some(m));
+
+        let h = def(&db, "m::h");
+        let entry = deprecation_entry(&db, h).unwrap();
+        assert_eq!((entry.origin, &entry.deprecation.since), (h, &DeprecatedSince::Future));
+        assert!(!entry.deprecation.is_in_effect(RustcVersion { major: 1, minor: 101, patch: 0 }));
+
+        let k = def(&db, "k");
+        assert_eq!(origin(&db, in_body(&db, k, "InK")), Some(k));
+        assert_eq!(deprecation_entry(&db, k).unwrap().deprecation.note, Some(Symbol::intern("fn")));
+
+        let t = def(&db, "T");
+        assert_eq!(origin(&db, t), None);
+        let field = deprecation_entry(&db, first_field(t)).unwrap();
+        assert_eq!(field.origin, first_field(t));
+        assert_eq!(field.deprecation.since, DeprecatedSince::NonStandard(Symbol::intern("2.0")));
+        assert_eq!(origin(&db, def(&db, "U")), None);
+        assert_eq!(stability(&db, t), None, "a crate without `staged_api` has none");
+    }
+
+    fn feature(db: &TestDB, def: StabilityDef) -> Option<&str> {
+        stability(db, def).map(|it| it.feature.as_str())
+    }
+
+    #[test]
+    fn stability_is_inherited_when_unstable_or_by_a_field_or_variant() {
+        let db = TestDB::with_files(
+            r#"
+#![feature(staged_api)]
+#![stable(feature = "root", since = "1.0.0")]
+#[unstable(feature = "m", issue = "none", soft)]
+pub mod m {
+    pub struct S;
+}
+#[stable(feature = "t", since = "1.2")]
+pub struct T { pub f: u8 }
+pub struct U;
+#[stable(feature = "e", since = "CURRENT_RUSTC_VERSION")]
+pub enum E { V }
+#[unstable(feature = "zero", issue = "0")]
+pub struct Zero;
+#[deprecated(since = "1.5.0", note = "n")]
+#[stable(feature = "d", since = "1.0.0")]
+#[rustc_allowed_through_unstable_modules = "through"]
+pub fn d() {}
+#[deprecated(since = "1.5.0")]
+pub fn without_note() {}
+"#,
+        );
+        let m = stability(&db, def(&db, "m")).unwrap();
+        let StabilityLevel::Unstable { issue, is_soft, .. } = &m.level else { panic!("{m:?}") };
+        assert_eq!((m.feature.as_str(), *issue, *is_soft), ("m", None, true));
+        assert_eq!(feature(&db, def(&db, "m::S")), Some("m"));
+
+        let t = def(&db, "T");
+        let Some(Stability { level: StabilityLevel::Stable { since, .. }, .. }) = stability(&db, t)
+        else {
+            panic!("`T` is stable")
+        };
+        assert_eq!(*since, StableSince::Version(RustcVersion { major: 1, minor: 2, patch: 0 }));
+        assert_eq!(feature(&db, first_field(t)), Some("t"));
+        assert_eq!(feature(&db, def(&db, "U")), None, "a stable parent is not inherited");
+        assert_eq!(feature(&db, def(&db, "E::V")), Some("e"));
+        assert_eq!(feature(&db, def(&db, "Zero")), None, "issue 0 is malformed");
+
+        let d = def(&db, "d");
+        let Some(StabilityLevel::Stable { allowed_through_unstable_modules, .. }) =
+            stability(&db, d).map(|it| &it.level)
+        else {
+            panic!("`d` is stable")
+        };
+        assert_eq!(*allowed_through_unstable_modules, Some(Symbol::intern("through")));
+        let since = &deprecation_entry(&db, d).unwrap().deprecation.since;
+        let version = RustcVersion { major: 1, minor: 5, patch: 0 };
+        assert_eq!(*since, DeprecatedSince::RustcVersion(version));
+        assert_eq!(origin(&db, def(&db, "without_note")), None, "a staged crate's needs a note");
+    }
+}

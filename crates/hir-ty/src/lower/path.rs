@@ -20,7 +20,7 @@ use hir_def::{
 use hir_expand::name::Name;
 use rustc_type_ir::{
     AliasTerm, AliasTy, AliasTyKind,
-    inherent::{GenericArgs as _, Region as _, Ty as _},
+    inherent::{GenericArgs as _, Ty as _},
 };
 use smallvec::SmallVec;
 
@@ -36,7 +36,7 @@ use crate::{
     },
     next_solver::{
         AliasTermKind, Binder, Clause, Const, DbInterner, EarlyBinder, ErrorGuaranteed, GenericArg,
-        GenericArgs, Predicate, ProjectionPredicate, Region, TraitRef, Ty,
+        GenericArgs, IsRigid, Predicate, ProjectionClause, Region, TraitRef, Ty,
     },
 };
 
@@ -231,6 +231,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                 );
                                 Ty::new_alias(
                                     self.ctx.interner,
+                                    IsRigid::No,
                                     AliasTy::new_from_args(
                                         self.ctx.interner,
                                         AliasTyKind::Projection { def_id: associated_ty.into() },
@@ -554,7 +555,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     .skip_binder();
                 (
                     assoc_type,
-                    EarlyBinder::bind(trait_args)
+                    EarlyBinder::bind(interner, trait_args)
                         .instantiate(interner, impl_trait.args)
                         .skip_norm_wip(),
                 )
@@ -572,7 +573,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             trait_args.iter().chain(substs.iter().skip(trait_args.len())),
         );
 
-        Ty::new_projection_from_args(interner, assoc_type.into(), substs)
+        Ty::new_projection_from_args(interner, IsRigid::No, assoc_type.into(), substs)
     }
 
     /// `Type::Name` of a type alias in an inherent impl of the struct, enum or union `ty`, as
@@ -1043,7 +1044,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                     Binder::bind_with_vars(
                                         rustc_type_ir::PredicateKind::Clause(
                                             rustc_type_ir::ClauseKind::Projection(
-                                                ProjectionPredicate {
+                                                ProjectionClause {
                                                     projection_term,
                                                     term: ty.into(),
                                                 },
@@ -1065,6 +1066,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                                 bound,
                                 Ty::new_alias(
                                     self.ctx.interner,
+                                    IsRigid::No,
                                     AliasTy::new_from_args(
                                         self.ctx.interner,
                                         AliasTyKind::Projection { def_id: associated_ty.into() },

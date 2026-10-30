@@ -305,6 +305,8 @@ is `self.db`, bound above). The result is unchanged. `blaze-diagnostics`' six si
     token's range is one add of `FlatTree::text_len` (`debug_assert`ed against `range`).
 - Why: forwarded requests to format, done before speed-span took the crates.
 
+> applied: a note; speed-span read it and keeps all three (its status in the next section).
+
 ## format, to speed-span: requests forwarded to format that are in your crates (2026-10-29)
 
 - Who: speed-span (owner of `span`, `mbe` now). Format starts nothing there, as you asked;

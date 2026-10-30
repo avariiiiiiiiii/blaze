@@ -714,7 +714,7 @@ impl Walk<'_, '_, '_> {
                     id: Id::DeriveMethod(derive),
                     kind: Kind::AssocFn { method: !matches!(trait_, BuiltinDeriveImplTrait::Default) },
                     node: None,
-                    name: Some(method.name()),
+                    name: Some(Name::new_symbol_root(method.name())),
                     parent: Parent::Def(index),
                     foreign: false,
                 });
@@ -760,12 +760,6 @@ pub(super) fn is_anon(node: &SyntaxNode) -> bool {
             None => false,
         },
     }
-}
-
-/// The node of `node` or of its nearest ancestor that [`is_anon`].
-pub(super) fn anon_of(node: &InFile<SyntaxNode>) -> Option<InFile<SyntaxNodePtr>> {
-    let found = node.value.ancestors().find(is_anon)?;
-    Some(node.with_value(SyntaxNodePtr::new(&found)))
 }
 
 /// Whether the `cfg`s of `node`, an attribute owner, keep it, its `cfg_attr`s expanded. A node's

@@ -13,7 +13,7 @@
 //! constant times the bytes it is given, so their length bounds it.
 
 use intern::Symbol;
-use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
+use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 
 use super::{
     CompressedSpanPart, Encoder, IDENT, LITERAL, NARROW_LIMIT, Node, PUNCT, PackedSpan, SUBTREE,
@@ -129,11 +129,13 @@ impl TopSubtree {
             word(len(end));
         }
         for span in [self.top_open, self.top_close] {
-            word(span.range.start().into());
-            word(span.range.len().into());
-            word(WirePart::of(CompressedSpanPart::from_span(&span)).file_id);
-            word(span.anchor.ast_id.into_raw());
-            word(span.ctx.into_u32());
+            let part = WirePart::of(CompressedSpanPart::from_span(&span));
+            for it in [span.range.start().into(), span.range.len().into()] {
+                word(it);
+            }
+            for it in [part.file_id, part.ast_id, part.ctx] {
+                word(it);
+            }
         }
         for symbol in &self.symbols {
             out.extend_from_slice(symbol.as_str().as_bytes());
@@ -211,8 +213,9 @@ impl TopSubtree {
             let Some(end) = start.checked_add(len) else {
                 return malformed("a top span ending past 4 GiB", at);
             };
-            let part = resolve(part, WirePart { file_id, ast_id, ctx }, parts_len + at)?;
-            *slot = Some(part.recombine(TextRange::new(TextSize::new(start), TextSize::new(end))));
+            let resolved = resolve(part, WirePart { file_id, ast_id, ctx }, parts_len + at)?;
+            let range = TextRange::new(TextSize::new(start), TextSize::new(end));
+            *slot = Some(resolved.recombine(range));
         }
         let [Some(top_open), Some(top_close)] = top else {
             unreachable!("both top spans are read above")
@@ -241,6 +244,7 @@ impl TopSubtree {
             top_open,
             top_close,
         };
+        check_literals(&tree)?;
         check_canonical(&tree)?;
         Ok((tree, words.at))
     }
@@ -262,7 +266,10 @@ fn resolve(
 /// aside.
 fn check_nodes(nodes: &[Node], symbols: usize) -> Result<usize, WireError> {
     let top = nodes[0];
-    if top.tag() != SUBTREE || top.ordinal() != 0 || top.data as usize != nodes.len() - 1 {
+    if top.tag() != SUBTREE
+        || top != Node::subtree(top.delimiter_kind(), 0, top.data)
+        || top.data as usize != nodes.len() - 1
+    {
         return malformed("a top subtree not holding the whole tree", 0);
     }
     // Where each open subtree ends, the innermost last.
@@ -325,11 +332,29 @@ fn check_spans(spans: &[PackedSpan], wide: usize, parts: usize) -> Result<(), Wi
             continue;
         }
         let (len, part) = (span.len_part & NARROW_LIMIT, span.len_part >> 16);
-        if len == NARROW_LIMIT || part as usize >= parts {
+        if len == NARROW_LIMIT {
+            return malformed("a packed span as long as only a wide one is", at);
+        }
+        if part as usize >= parts {
             return malformed("a span's part past the parts", at);
         }
         if span.start.checked_add(len).is_none() {
             return malformed("a span ending past 4 GiB", at);
+        }
+    }
+    Ok(())
+}
+
+/// Checks each literal's suffix is a tail of its text, as a literal's methods slice it.
+fn check_literals(tree: &TopSubtree) -> Result<(), WireError> {
+    for (at, node) in tree.nodes.iter().enumerate() {
+        if node.tag() != LITERAL {
+            continue;
+        }
+        let text = tree.symbols[node.data as usize].as_str();
+        let suffix = node.suffix_len() as usize;
+        if suffix > text.len() || !text.is_char_boundary(text.len() - suffix) {
+            return malformed("a literal's suffix longer than its text or inside a char", at);
         }
     }
     Ok(())
@@ -364,7 +389,7 @@ fn check_canonical(tree: &TopSubtree) -> Result<(), WireError> {
     if encoder.parts.list.len() != tree.parts.len() {
         return Err(WireError::NotCanonical { what: "a part no span uses", at: tree.parts.len() });
     }
-    if encoder.wide != *tree.wide {
+    if encoder.wide[..] != tree.wide[..] {
         return Err(WireError::NotCanonical { what: "the wide spans", at: 0 });
     }
     if encoder.symbols.list.len() != tree.symbols.len() {
@@ -385,7 +410,7 @@ impl<'a> Words<'a> {
         let needed = words.saturating_mul(4);
         match self.bytes.len() - self.at >= needed {
             true => Ok(()),
-            false => Err(WireError::Truncated { at: self.bytes.len(), needed }),
+            false => Err(WireError::Truncated { at: self.at, needed }),
         }
     }
 
@@ -395,7 +420,7 @@ impl<'a> Words<'a> {
                 self.at += len;
                 Ok(it)
             }
-            None => Err(WireError::Truncated { at: self.bytes.len(), needed: len }),
+            None => Err(WireError::Truncated { at: self.at, needed: len }),
         }
     }
 
@@ -427,17 +452,4 @@ pub(super) fn parts_of(tree: &TopSubtree) -> Vec<(WirePart, (SpanAnchor, SyntaxC
         .chain([tree.top_open, tree.top_close].map(|it| CompressedSpanPart::from_span(&it)).iter())
         .map(|&it| (WirePart::of(it), (it.anchor, it.ctx)))
         .collect()
-}
-
-/// Keeps the unused imports of the header honest: the anchor's parts are what [`WirePart`]
-/// carries.
-#[cfg(test)]
-#[allow(dead_code)]
-fn anchor_of(part: WirePart) -> (EditionedFileId, ErasedFileAstId) {
-    (EditionedFileId::from_raw(part.file_id), ErasedFileAstId::from_raw(part.ast_id))
-}
-
-#[allow(dead_code)]
-fn span_of(part: CompressedSpanPart, range: TextRange) -> Span {
-    part.recombine(range)
 }

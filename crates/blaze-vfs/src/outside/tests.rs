@@ -324,6 +324,7 @@ fn a_directory_is_wanted_once_and_found_past_growth() {
     assert!(dirs.find(b"/tc", super::tag(b"/tc")).is_some());
 }
 
+#[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn reads_race_with_wants_and_find_every_published_directory() {
     let dirs = Dirs::new();
@@ -347,6 +348,35 @@ fn reads_race_with_wants_and_find_every_published_directory() {
                 }
             });
         }
+    });
+}
+
+/// A check on another thread while the driver adds a directory, confirms it and ends a round:
+/// under every interleaving and every value a load may read, it finds the directory whole or
+/// not at all, and vouches only for a generation read after the confirmation.
+#[cfg(blaze_check)]
+#[test]
+fn model_a_check_sees_a_directory_whole_and_vouches_only_after_it_is_confirmed() {
+    use std::sync::Arc;
+
+    blaze_check::model(|| {
+        let dirs = Arc::new(Dirs::new());
+        let reader = {
+            let dirs = dirs.clone();
+            crate::sync::thread::spawn(move || {
+                let generation = dirs.generation();
+                if let Some(dir) = dirs.find(b"/tc", super::tag(b"/tc")) {
+                    assert_eq!(dir.path(), Path::new("/tc"));
+                }
+                if dirs.unchanged_since(path("/tc/a.h"), generation) {
+                    assert!(generation >= 1, "vouched for a generation before the confirmation");
+                }
+            })
+        };
+        dirs.want(path("/tc"));
+        dirs.dir(0).since.store(dirs.bump(), crate::sync::atomic::Ordering::Release);
+        dirs.settle(true);
+        reader.join().unwrap();
     });
 }
 

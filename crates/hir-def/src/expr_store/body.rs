@@ -461,9 +461,10 @@ fn holds_lazy(node: &SyntaxNode) -> bool {
 }
 
 /// What the subtree of `node` is made of, as the root of a tree of its own, so that two trees
-/// made of the same are the same. A flat node's is read in place.
+/// made of the same are the same. A flat node's is read in place. Every body of a file runs
+/// this on each edit of the file, over its whole anchor (an `impl` or module), so it is one
+/// BLAKE3 pass, SIMD over many chunks for a large anchor.
 fn tree_hash(node: &SyntaxNode) -> u128 {
-    use std::hash::{Hash, Hasher};
     let alone;
     let node = match node.flat() {
         Some(_) => node,
@@ -473,13 +474,32 @@ fn tree_hash(node: &SyntaxNode) -> u128 {
         }
     };
     let (tree, at) = node.flat().expect("a flat tree");
-    let half = |seed: u8| {
-        let mut hasher = std::hash::DefaultHasher::new();
-        seed.hash(&mut hasher);
-        tree.hash_subtree(at, &mut hasher);
-        hasher.finish() as u128
-    };
-    half(0) << 64 | half(1)
+    subtree_hash(tree, at)
+}
+
+/// [`syntax::FlatTree::hash_subtree`] of `at` as 128 bits of BLAKE3: what a body's or a
+/// signature's tree is compared by.
+pub(crate) fn subtree_hash(tree: &syntax::FlatTree, at: u32) -> u128 {
+    static TREE: blaze_ids::Domain = blaze_ids::Domain::new("blaze v2 hir-def body tree 1");
+    let mut hasher = Blake3(blaze_ids::Hasher::of(&TREE));
+    tree.hash_subtree(at, &mut hasher);
+    let id = hasher.0.finish();
+    u128::from_le_bytes(id.0[..16].try_into().expect("a BLAKE3 hash is 32 bytes"))
+}
+
+/// [`syntax::FlatTree::hash_subtree`]'s writes into BLAKE3. Its large writes (the text, the
+/// words) are whole slices, which BLAKE3 hashes many chunks at a time.
+struct Blake3(blaze_ids::Hasher);
+
+impl std::hash::Hasher for Blake3 {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        let id = self.0.finish();
+        u64::from_le_bytes(id.0[..8].try_into().expect("a BLAKE3 hash is 32 bytes"))
+    }
 }
 
 /// `anchor` as the root of a tree of its own, with its [`tree_hash`]: the one kept among the

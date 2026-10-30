@@ -29,11 +29,14 @@ use hir_def::{
 };
 use hir_ty::{
     InferBodyId, MemoryMap, PointerCast,
-    db::{GeneralConstId, HirDatabase, InternedClosureId, InternedCoroutineId},
+    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::{is_dyn_method, lookup_impl_const},
     mir::MirOptLevel,
-    next_solver::{AllocationData, Const, ConstKind, GenericArgs, Ty, TyKind, UnevaluatedConst},
+    next_solver::{
+        AliasConst, AliasConstKind, AllocationData, Const, ConstKind, FreeConstAliasId,
+        GenericArgs, InherentAssocConstId, TraitAssocConstId, Ty, TyKind,
+    },
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::{
@@ -214,17 +217,23 @@ fn has_params<'db>(ty: Ty<'db>) -> bool {
 /// The value of a constant of the monomorphized body: a value's identity, or what an
 /// unevaluated one evaluates to, as the code generator's `eval_const` evaluates it.
 pub(crate) fn value<'db>(cx: &Cx<'db>, konst: Const<'db>) -> Result<ContentId, Unshared> {
-    let ConstKind::Unevaluated(UnevaluatedConst { def, args }) = konst.kind() else {
+    let ConstKind::Alias(_, AliasConst { kind, args, .. }) = konst.kind() else {
         return identity::konst(cx.db, konst);
     };
     let db = cx.db;
-    let allocation = match def.0 {
-        GeneralConstId::ConstId(id) => {
+    let allocation = match kind {
+        AliasConstKind::Projection { def_id: TraitAssocConstId(id) }
+        | AliasConstKind::InherentImpl { def_id: InherentAssocConstId(id) }
+        | AliasConstKind::Free { def_id: FreeConstAliasId(id) } => {
             let (id, args) = lookup_impl_const(&cx.infcx, cx.env.param_env, id, args);
             db.const_eval(id, args, Some(cx.env))
         }
-        GeneralConstId::StaticId(id) => db.const_eval_static(id),
-        GeneralConstId::AnonConstId(id) => db.anon_const_eval(id, args, Some(cx.env)),
+        AliasConstKind::Anon { def_id } => db.anon_const_eval(def_id.0, args, Some(cx.env)),
+        AliasConstKind::InherentSelf { .. } => {
+            return Err(Unshared::ConstEval(format!(
+                "`{konst:?}`: an inherent const in Self form after type check"
+            )));
+        }
     }
     .map_err(|error| Unshared::ConstEval(format!("`{konst:?}`: {error:?}")))?;
     allocation_value(&allocation)
@@ -727,12 +736,15 @@ impl<'a, 'db> Walk<'a, 'db> {
         match fn_ty.kind() {
             // Called through the pointer, whose type's fact its place has.
             TyKind::FnPtr(..) => Ok(ContentId::of(CALLEE_DOMAIN, &[tag::CALLEE_POINTER])),
-            TyKind::FnDef(def, args) => match def.0 {
-                CallableDefId::FunctionId(func) => self.call_fn(fn_ty, func, args, intrinsic),
-                CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
-                    self.identity_callee(fn_ty)
+            TyKind::FnDef(def, args) => {
+                let args = args.no_bound_vars().unwrap();
+                match def.0 {
+                    CallableDefId::FunctionId(func) => self.call_fn(fn_ty, func, args, intrinsic),
+                    CallableDefId::StructId(_) | CallableDefId::EnumVariantId(_) => {
+                        self.identity_callee(fn_ty)
+                    }
                 }
-            },
+            }
             _ => self.identity_callee(fn_ty),
         }
     }
@@ -864,12 +876,17 @@ impl<'a, 'db> Walk<'a, 'db> {
                 // A closure passed by value to a body that borrows it is the caller's to drop.
                 h.id(&drop::key(self.cx, self_ty)?);
             }
-            TyKind::FnDef(def, fn_args) => match def.0 {
-                CallableDefId::FunctionId(func) if intrinsic_of(db, func).ok().flatten().is_none() => {
-                    h.id(&self.call_fn(self_ty, func, fn_args, None)?);
+            TyKind::FnDef(def, fn_args) => {
+                let fn_args = fn_args.no_bound_vars().unwrap();
+                match def.0 {
+                    CallableDefId::FunctionId(func)
+                        if intrinsic_of(db, func).ok().flatten().is_none() =>
+                    {
+                        h.id(&self.call_fn(self_ty, func, fn_args, None)?);
+                    }
+                    _ => return self.identity_callee(fn_ty),
                 }
-                _ => return self.identity_callee(fn_ty),
-            },
+            }
             _ => return self.identity_callee(fn_ty),
         }
         Ok(h.finish())

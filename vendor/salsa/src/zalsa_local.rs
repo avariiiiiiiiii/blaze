@@ -2,7 +2,6 @@ use std::cell::{RefCell, UnsafeCell};
 use std::fmt;
 use std::fmt::Formatter;
 use std::panic::UnwindSafe;
-use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -12,7 +11,7 @@ use thin_vec::ThinVec;
 #[cfg(feature = "accumulator")]
 use crate::accumulator::{
     Accumulator,
-    accumulated_map::{AccumulatedMap, AtomicInputAccumulatedValues},
+    accumulated_map::{AccumulatedMap, InputAccumulatedValues},
 };
 use crate::active_query::{CompletedQuery, DetachedInputOutputs, QueryCompletion, QueryStack};
 use crate::cycle::{AtomicIterationStamp, CycleHeads, IterationStamp, empty_cycle_heads};
@@ -21,7 +20,7 @@ use crate::fingerprint::Fingerprint;
 use crate::graph::{self, EdgeSpan, Graph, Relocation, TaskGraph};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
-use crate::sync::atomic::{AtomicBool, AtomicU32};
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use crate::table::{PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
 use crate::zalsa::{IngredientIndex, Zalsa};
@@ -352,7 +351,7 @@ impl ZalsaLocal {
         fingerprint: Fingerprint,
         cycle_heads: &CycleHeads,
         #[cfg(feature = "accumulator")] has_accumulated: bool,
-        #[cfg(feature = "accumulator")] accumulated_inputs: &AtomicInputAccumulatedValues,
+        #[cfg(feature = "accumulator")] accumulated_inputs: InputAccumulatedValues,
     ) {
         crate::tracing::debug!(
             "report_tracked_read(input={:?}, durability={:?}, changed_at={:?}, fingerprint={:?})",
@@ -520,40 +519,39 @@ impl ZalsaLocal {
 impl std::panic::RefUnwindSafe for ZalsaLocal {}
 
 /// Summarizes "all the inputs that a query used" and "all the outputs it has written to".
-#[derive(Debug)]
+///
+/// 16 bytes, so a memo header is 24 (data.md: "a memo 24 plus 4 per edge").
 // #[derive(Clone)] cloning this is expensive, so we don't derive
 pub(crate) struct QueryRevisions {
-    /// The most revision in which some input changed.
-    pub(crate) changed_at: Revision,
+    /// The revision in which some input last changed in the low 56 bits ([`Self::changed_at`]);
+    /// above it the minimum durability of the inputs (2 bits), whether the cycle heads are
+    /// verified to not be provisional anymore ([`Self::VERIFIED_FINAL`]), and whether any input
+    /// read had direct or indirect accumulated values ([`Self::ACCUMULATED_INPUTS`]).
+    /// `changed_at` and durability are written only through `&mut`; the two flags change on a
+    /// shared memo, so the word is atomic.
+    stamp: AtomicU64,
 
-    /// Minimum durability of the inputs to this query.
-    pub(crate) durability: Durability,
+    /// The query origin, and optional data for tracked structs, cycles, accumulators and the
+    /// value fingerprints the inputs had when this query read them. The fingerprints are those
+    /// of the inputs that have one, sorted by the input's position in the origin's edges; an
+    /// input without an entry is compared by revision alone. Then, at [`EdgeFingerprint::VALUE`],
+    /// the hash of the memo's own value, kept when the value is evicted; there is none when the
+    /// function's output has no stable hash or the value is provisional. Most memos have
+    /// neither, and then there is no box.
+    origin_and_extra: OriginAndExtra,
+}
 
-    /// The query origin and optional data for tracked structs, cycles, and accumulators.
-    pub(crate) origin_and_extra: OriginAndExtra,
-
-    /// [`InputAccumulatedValues::Empty`] if any input read during the query's execution
-    /// has any direct or indirect accumulated values.
-    ///
-    /// Note that this field could be in `QueryRevisionsExtra` as it is only relevant
-    /// for accumulators, but we get it for free anyways due to padding.
-    #[cfg(feature = "accumulator")]
-    pub(super) accumulated_inputs: AtomicInputAccumulatedValues,
-
-    /// Are the `cycle_heads` verified to not be provisional anymore?
-    ///
-    /// Note that this field could be in `QueryRevisionsExtra` as it is only
-    /// relevant for queries that participate in a cycle, but we get it for
-    /// free anyways due to padding.
-    pub(super) verified_final: AtomicBool,
-
-    /// The value fingerprints the inputs had when this query read them, for the inputs that
-    /// have one, sorted by the input's position in the origin's edges; an input without an entry
-    /// is compared by revision alone. Then, at [`EdgeFingerprint::VALUE`], the hash of the memo's
-    /// own value, kept when the value is evicted; there is none when the function's output has
-    /// no stable hash or the value is provisional. Most memos have neither, and an empty
-    /// `ThinVec` does not allocate.
-    pub(crate) fingerprints: ThinVec<EdgeFingerprint>,
+impl std::fmt::Debug for QueryRevisions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("QueryRevisions");
+        f.field("changed_at", &self.changed_at())
+            .field("durability", &self.durability())
+            .field("origin_and_extra", &self.origin_and_extra)
+            .field("verified_final", &self.verified_final(Ordering::Relaxed));
+        #[cfg(feature = "accumulator")]
+        f.field("accumulated_inputs", &self.accumulated_inputs());
+        f.finish()
+    }
 }
 
 /// The value fingerprint a dependency had when it was read.
@@ -571,10 +569,125 @@ impl EdgeFingerprint {
 }
 
 impl QueryRevisions {
+    const CHANGED_AT_MASK: u64 = (1 << 56) - 1;
+    const DURABILITY_SHIFT: u32 = 56;
+    const DURABILITY_MASK: u64 = 0b11 << Self::DURABILITY_SHIFT;
+    const VERIFIED_FINAL: u64 = 1 << 58;
+    #[cfg(feature = "accumulator")]
+    const ACCUMULATED_INPUTS: u64 = 1 << 59;
+
+    pub(crate) fn new(
+        changed_at: Revision,
+        durability: Durability,
+        origin_and_extra: OriginAndExtra,
+        verified_final: bool,
+        #[cfg(feature = "accumulator")] accumulated_inputs: InputAccumulatedValues,
+        fingerprints: ThinVec<EdgeFingerprint>,
+    ) -> Self {
+        let mut revisions = QueryRevisions {
+            stamp: AtomicU64::new(Self::stamp_bits(changed_at, durability)),
+            origin_and_extra,
+        };
+        revisions.set_verified_final(verified_final);
+        #[cfg(feature = "accumulator")]
+        revisions.store_accumulated_inputs(accumulated_inputs);
+        if !fingerprints.is_empty() {
+            *revisions.origin_and_extra.fingerprints_mut() = fingerprints;
+        }
+        revisions
+    }
+
+    fn stamp_bits(changed_at: Revision, durability: Durability) -> u64 {
+        let changed_at = changed_at.as_usize() as u64;
+        assert!(
+            changed_at <= Self::CHANGED_AT_MASK,
+            "salsa: more than 2^56 revisions"
+        );
+        changed_at | ((durability.index() as u64) << Self::DURABILITY_SHIFT)
+    }
+
+    /// The revision in which some input last changed.
+    #[inline]
+    pub(crate) fn changed_at(&self) -> Revision {
+        // Relaxed: written before the memo was published, which ordered it before our read.
+        Revision::from((self.stamp.load(Ordering::Relaxed) & Self::CHANGED_AT_MASK) as usize)
+    }
+
+    /// The minimum durability of the inputs.
+    #[inline]
+    pub(crate) fn durability(&self) -> Durability {
+        let bits = (self.stamp.load(Ordering::Relaxed) & Self::DURABILITY_MASK)
+            >> Self::DURABILITY_SHIFT;
+        Durability::from_index(bits as u8)
+    }
+
+    pub(crate) fn set_changed_at(&mut self, changed_at: Revision) {
+        let durability = self.durability();
+        self.set_stamp(changed_at, durability);
+    }
+
+    pub(crate) fn set_durability(&mut self, durability: Durability) {
+        let changed_at = self.changed_at();
+        self.set_stamp(changed_at, durability);
+    }
+
+    fn set_stamp(&mut self, changed_at: Revision, durability: Durability) {
+        let flags = self.stamp.load(Ordering::Relaxed)
+            & !(Self::CHANGED_AT_MASK | Self::DURABILITY_MASK);
+        // Relaxed: `&mut`, so no other task sees the memo.
+        self.stamp
+            .store(flags | Self::stamp_bits(changed_at, durability), Ordering::Relaxed);
+    }
+
+    /// Are the cycle heads verified to not be provisional anymore?
+    #[inline]
+    pub(crate) fn verified_final(&self, order: Ordering) -> bool {
+        self.stamp.load(order) & Self::VERIFIED_FINAL != 0
+    }
+
+    /// Marks the cycle heads verified final on a shared memo.
+    pub(crate) fn mark_verified_final(&self, order: Ordering) {
+        self.stamp.fetch_or(Self::VERIFIED_FINAL, order);
+    }
+
+    pub(crate) fn set_verified_final(&mut self, verified_final: bool) {
+        // Relaxed: `&mut`, so no other task sees the memo.
+        let stamp = self.stamp.load(Ordering::Relaxed);
+        let stamp = if verified_final {
+            stamp | Self::VERIFIED_FINAL
+        } else {
+            stamp & !Self::VERIFIED_FINAL
+        };
+        self.stamp.store(stamp, Ordering::Relaxed);
+    }
+
+    /// [`InputAccumulatedValues::Any`] if any input read during the query's execution has any
+    /// direct or indirect accumulated values.
+    #[cfg(feature = "accumulator")]
+    #[inline]
+    pub(crate) fn accumulated_inputs(&self) -> InputAccumulatedValues {
+        if self.stamp.load(Ordering::Acquire) & Self::ACCUMULATED_INPUTS != 0 {
+            InputAccumulatedValues::Any
+        } else {
+            InputAccumulatedValues::Empty
+        }
+    }
+
+    #[cfg(feature = "accumulator")]
+    pub(crate) fn store_accumulated_inputs(&self, accumulated: InputAccumulatedValues) {
+        if accumulated.is_any() {
+            self.stamp
+                .fetch_or(Self::ACCUMULATED_INPUTS, Ordering::Release);
+        } else {
+            self.stamp
+                .fetch_and(!Self::ACCUMULATED_INPUTS, Ordering::Release);
+        }
+    }
+
     /// The hash of the memo's value, or [`Fingerprint::NONE`] if it has none.
     #[inline]
     pub(crate) fn value_fingerprint(&self) -> Fingerprint {
-        match self.fingerprints.last() {
+        match self.origin_and_extra.fingerprints().last() {
             Some(last) if last.edge == EdgeFingerprint::VALUE => last.fingerprint,
             _ => Fingerprint::NONE,
         }
@@ -583,18 +696,20 @@ impl QueryRevisions {
     /// Sets the hash of the memo's value; [`Fingerprint::NONE`] removes it.
     pub(crate) fn set_value_fingerprint(&mut self, fingerprint: Fingerprint) {
         let has_value = self
-            .fingerprints
+            .origin_and_extra
+            .fingerprints()
             .last()
             .is_some_and(|last| last.edge == EdgeFingerprint::VALUE);
         match (has_value, fingerprint.is_value()) {
             (true, true) => {
-                let last = self.fingerprints.len() - 1;
-                self.fingerprints[last].fingerprint = fingerprint;
+                let fingerprints = self.origin_and_extra.fingerprints_mut();
+                let last = fingerprints.len() - 1;
+                fingerprints[last].fingerprint = fingerprint;
             }
             (true, false) => {
-                self.fingerprints.pop();
+                self.origin_and_extra.fingerprints_mut().pop();
             }
-            (false, true) => self.fingerprints.push(EdgeFingerprint {
+            (false, true) => self.origin_and_extra.fingerprints_mut().push(EdgeFingerprint {
                 edge: EdgeFingerprint::VALUE,
                 fingerprint,
             }),
@@ -608,11 +723,11 @@ impl QueryRevisions {
         let edge = u32::try_from(edge)
             .ok()
             .filter(|&edge| edge != EdgeFingerprint::VALUE)?;
-        let position = self
-            .fingerprints
+        let fingerprints = self.origin_and_extra.fingerprints();
+        let position = fingerprints
             .binary_search_by_key(&edge, |entry| entry.edge)
             .ok()?;
-        Some(self.fingerprints[position].fingerprint)
+        Some(fingerprints[position].fingerprint)
     }
 
     /// Returns the semantic origin of this query, its edges read from `graph`.
@@ -645,7 +760,7 @@ impl QueryRevisions {
     /// by that execution.
     #[cfg(not(feature = "persistence"))]
     pub(crate) fn discard_edges_if_never_change(&mut self) {
-        if self.durability != Durability::NEVER_CHANGE
+        if self.durability() != Durability::NEVER_CHANGE
             || !self.is_derived()
             || self.is_derived_untracked()
             || !self.cycle_heads().is_empty()
@@ -654,34 +769,21 @@ impl QueryRevisions {
         }
 
         #[cfg(feature = "accumulator")]
-        if self.accumulated_inputs.load().is_any() {
+        if self.accumulated_inputs().is_any() {
             return;
         }
 
         self.origin_and_extra.clear_edges();
         let value = self.value_fingerprint();
-        self.fingerprints = ThinVec::new();
+        if !self.origin_and_extra.fingerprints().is_empty() {
+            *self.origin_and_extra.fingerprints_mut() = ThinVec::new();
+        }
         self.set_value_fingerprint(value);
     }
 
     #[cfg(feature = "salsa_unstable")]
     pub(crate) fn allocation_size(&self) -> usize {
-        let QueryRevisions {
-            changed_at: _,
-            durability: _,
-            verified_final: _,
-            origin_and_extra,
-            #[cfg(feature = "accumulator")]
-                accumulated_inputs: _,
-            fingerprints,
-        } = self;
-
-        let fingerprints = if fingerprints.is_empty() {
-            0
-        } else {
-            2 * std::mem::size_of::<usize>() + std::mem::size_of_val(fingerprints.as_slice())
-        };
-        origin_and_extra.allocation_size() + fingerprints
+        self.origin_and_extra.allocation_size()
     }
 }
 
@@ -852,8 +954,7 @@ impl fmt::Debug for QueryRevisionsExtraInner {
 }
 
 #[cfg(not(feature = "shuttle"))]
-#[cfg(target_pointer_width = "64")]
-const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); std::mem::size_of::<[usize; 4]>()];
+const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); 16];
 
 const _: [(); std::mem::size_of::<EdgeFingerprint>()] = [(); 20];
 
@@ -864,10 +965,10 @@ const _: [(); std::mem::size_of::<QueryRevisionsExtraInner>()] =
 
 impl QueryRevisions {
     pub(crate) fn fixpoint_initial(query: DatabaseKeyIndex, iteration: IterationStamp) -> Self {
-        Self {
-            changed_at: Revision::start(),
-            durability: Durability::MAX,
-            origin_and_extra: OriginAndExtra::derived(
+        Self::new(
+            Revision::start(),
+            Durability::MAX,
+            OriginAndExtra::derived(
                 EdgeSpan::EMPTY,
                 QueryRevisionsExtra::new(
                     #[cfg(feature = "accumulator")]
@@ -878,11 +979,11 @@ impl QueryRevisions {
                     false,
                 ),
             ),
+            false,
             #[cfg(feature = "accumulator")]
-            accumulated_inputs: Default::default(),
-            verified_final: AtomicBool::new(false),
-            fingerprints: ThinVec::new(),
-        }
+            InputAccumulatedValues::Empty,
+            ThinVec::new(),
+        )
     }
 
     /// Returns a reference to the `AccumulatedMap` for this query, or `None` if the map is empty.
@@ -909,14 +1010,14 @@ impl QueryRevisions {
         extra.iteration = iteration.into();
     }
 
-    pub(crate) const fn cycle_converged(&self) -> bool {
+    pub(crate) fn cycle_converged(&self) -> bool {
         match self.origin_and_extra.extra() {
             Some(extra) => extra.cycle_converged,
             None => false,
         }
     }
 
-    pub(crate) const fn set_cycle_converged(&mut self, cycle_converged: bool) {
+    pub(crate) fn set_cycle_converged(&mut self, cycle_converged: bool) {
         if let Some(extra) = self.origin_and_extra.extra_mut() {
             extra.cycle_converged = cycle_converged
         }
@@ -946,7 +1047,7 @@ impl QueryRevisions {
             .update_iteration_count(database_key_index, iteration);
     }
 
-    const fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
+    fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
         self.origin_and_extra.extra()
     }
 
@@ -1034,49 +1135,51 @@ enum QueryOriginKind {
     DerivedUntracked = 0b10,
 }
 
-/// Stores a query origin and optional revision data in one packed value.
+/// A query origin and its optional revision data in one 8-byte word.
 ///
-/// The tag determines how `payload` and `metadata` must be interpreted:
+/// The low three bits are the tag: the [`QueryOriginKind`] in bits 0 and 1, and in bit 2 whether
+/// the rest is a box. The word is either:
 ///
-/// | Origin   | Extra | `payload`                         | `metadata`          |
-/// |----------|-------|-----------------------------------|---------------------|
-/// | Assigned | No    | Assigning query's [`Id`]          | [`IngredientIndex`] |
-/// | Assigned | Yes   | `Box<WithExtra<Id>>`              | [`IngredientIndex`] |
-/// | Derived  | No    | The edges' [`EdgeSpan`]           | 0                   |
-/// | Derived  | Yes   | `Box<WithExtra<EdgeSpan>>`        | 0                   |
+/// | form   | bits 3 and up                                                    | used for                                     |
+/// |--------|------------------------------------------------------------------|----------------------------------------------|
+/// | inline | the edges' [`EdgeSpan`]: `len` in bits 3 to 31, `start` in 32 to 63 | a derived origin with no extra data          |
+/// | boxed  | the address of a `WithExtra<T>` (aligned to 8, so its low bits are free) | everything else: extra data, fingerprints, an assigned origin's key (`T` = [`DatabaseKeyIndex`]), or a span too long to inline (`T` = [`EdgeSpan`]) |
 ///
 /// A derived origin's edges are a range of the database's edge array ([`Graph`]), 4 bytes an
 /// edge, so a memo without extra data owns no allocation at all.
 ///
-/// These combinations are invariants of the type: all accesses to the payload rely on the tag
-/// accurately describing the initialized representation.
-#[repr(Rust, packed)]
+/// The tag describes the word's form; all accesses rely on it. The box's address is stored with
+/// its provenance exposed and read back through it.
 pub(crate) struct OriginAndExtra {
-    tag: OriginAndExtraTag,
-    payload: OriginAndExtraPayload,
-    metadata: u32,
+    word: u64,
 }
 
-const _: [(); std::mem::size_of::<OriginAndExtra>()] = [(); 13];
+const _: [(); std::mem::size_of::<OriginAndExtra>()] = [(); 8];
 
-/// SAFETY: [`OriginAndExtra`] uses its tag to maintain the active payload field. Its only owned
-/// allocation is a `Box<WithExtra<_>>` of `Send` data.
+/// SAFETY: [`OriginAndExtra`] uses its tag to know its form. Its only owned allocation is a
+/// `Box<WithExtra<_>>` of `Send` data.
 unsafe impl Send for OriginAndExtra
 where
-    Id: Send,
     QueryRevisionsExtraInner: Send,
+    EdgeFingerprint: Send,
 {
 }
 
-/// SAFETY: Same as above, and shared access to the boxed extra data is `Sync`.
+/// SAFETY: Same as above, and shared access to the boxed data is `Sync`.
 unsafe impl Sync for OriginAndExtra
 where
-    Id: Sync,
     QueryRevisionsExtraInner: Sync,
+    EdgeFingerprint: Sync,
 {
 }
 
 impl OriginAndExtra {
+    const KIND_MASK: u64 = 0b011;
+    const BOXED: u64 = 0b100;
+    const TAG_MASK: u64 = 0b111;
+    /// The longest span the inline form holds; a longer one is boxed.
+    const INLINE_LEN: u32 = (1 << 29) - 1;
+
     #[inline]
     pub(crate) fn derived(edges: EdgeSpan, extra: QueryRevisionsExtra) -> Self {
         Self::new_derived(edges, QueryOriginKind::Derived, extra)
@@ -1087,131 +1190,131 @@ impl OriginAndExtra {
         Self::new_derived(edges, QueryOriginKind::DerivedUntracked, extra)
     }
 
-    pub(crate) const fn assigned(key: DatabaseKeyIndex) -> Self {
-        Self {
-            tag: OriginAndExtraTag::new(QueryOriginKind::Assigned, false),
-            payload: OriginAndExtraPayload {
-                index: key.key_index(),
-            },
-            metadata: key.ingredient_index().as_u32(),
-        }
+    pub(crate) fn assigned(key: DatabaseKeyIndex) -> Self {
+        Self::boxed(QueryOriginKind::Assigned, WithExtra::new(None, key))
     }
 
     fn assigned_with_extra(key: DatabaseKeyIndex, extra: QueryRevisionsExtraInner) -> Self {
-        Self {
-            tag: OriginAndExtraTag::new(QueryOriginKind::Assigned, true),
-            payload: OriginAndExtraPayload {
-                allocation: WithExtra::boxed(extra, key.key_index()),
-            },
-            metadata: key.ingredient_index().as_u32(),
-        }
+        Self::boxed(QueryOriginKind::Assigned, WithExtra::new(Some(extra), key))
     }
 
     #[inline]
     fn new_derived(edges: EdgeSpan, kind: QueryOriginKind, extra: QueryRevisionsExtra) -> Self {
         match extra.0 {
-            Some(extra) => Self {
-                tag: OriginAndExtraTag::new(kind, true),
-                payload: OriginAndExtraPayload {
-                    allocation: WithExtra::boxed(extra, edges),
-                },
-                metadata: 0,
+            None if edges.len <= Self::INLINE_LEN => Self {
+                word: (u64::from(edges.start) << 32) | (u64::from(edges.len) << 3) | kind as u64,
             },
-            None => Self {
-                tag: OriginAndExtraTag::new(kind, false),
-                payload: OriginAndExtraPayload { span: edges },
-                metadata: 0,
-            },
+            extra => Self::boxed(kind, WithExtra::new(extra, edges)),
         }
     }
 
-    const fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
-        if self.tag.has_extra() {
-            // `WithExtra` is `repr(C)` with the extra data first.
-            // SAFETY: `payload.allocation` points to the live `WithExtra` owned by `self`.
-            Some(unsafe {
-                self.payload
-                    .allocation
-                    .cast::<QueryRevisionsExtraInner>()
-                    .as_ref()
-            })
-        } else {
-            None
+    fn boxed<T>(kind: QueryOriginKind, with_extra: WithExtra<T>) -> Self {
+        let address = Box::into_raw(Box::new(with_extra)).expose_provenance() as u64;
+        debug_assert_eq!(address & Self::TAG_MASK, 0);
+        Self {
+            word: address | Self::BOXED | kind as u64,
         }
     }
 
-    const fn extra_mut(&mut self) -> Option<&mut QueryRevisionsExtraInner> {
-        if self.tag.has_extra() {
-            // SAFETY: As in `extra`, and the allocation is uniquely borrowed through `self`.
-            Some(unsafe {
-                self.payload
-                    .allocation
-                    .cast::<QueryRevisionsExtraInner>()
-                    .as_mut()
-            })
-        } else {
-            None
+    #[inline]
+    const fn kind(&self) -> QueryOriginKind {
+        match self.word & Self::KIND_MASK {
+            0b01 => QueryOriginKind::Assigned,
+            0b11 => QueryOriginKind::Derived,
+            0b10 => QueryOriginKind::DerivedUntracked,
+            _ => panic!("invalid query origin kind"),
         }
+    }
+
+    #[inline]
+    const fn is_boxed(&self) -> bool {
+        self.word & Self::BOXED != 0
+    }
+
+    /// The box's address with its provenance; only meaningful when [`Self::is_boxed`].
+    #[inline]
+    fn allocation<T>(&self) -> *mut WithExtra<T> {
+        std::ptr::with_exposed_provenance_mut((self.word & !Self::TAG_MASK) as usize)
+    }
+
+    /// The box's parts common to every `T`.
+    #[inline]
+    fn head(&self) -> Option<&WithExtraHead> {
+        if !self.is_boxed() {
+            return None;
+        }
+        // `WithExtra` is `repr(C)` with its head first.
+        // SAFETY: A boxed origin owns a live `WithExtra`, borrowed here through `self`.
+        Some(unsafe { &*self.allocation::<()>().cast::<WithExtraHead>() })
+    }
+
+    #[inline]
+    fn head_mut(&mut self) -> Option<&mut WithExtraHead> {
+        if !self.is_boxed() {
+            return None;
+        }
+        // SAFETY: As in `head`, and the box is uniquely borrowed through `self`.
+        Some(unsafe { &mut *self.allocation::<()>().cast::<WithExtraHead>() })
+    }
+
+    fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
+        self.head()?.extra.as_ref()
+    }
+
+    fn extra_mut(&mut self) -> Option<&mut QueryRevisionsExtraInner> {
+        self.head_mut()?.extra.as_mut()
+    }
+
+    /// The box, made now for an inline origin (which is always derived).
+    fn head_or_box(&mut self) -> &mut WithExtraHead {
+        if !self.is_boxed() {
+            let span = self.span().expect("salsa: an inline origin is derived");
+            let kind = self.kind();
+            // The inline form owns nothing, so dropping it here frees nothing.
+            *self = Self::boxed(kind, WithExtra::new(None, span));
+        }
+        self.head_mut().expect("salsa: the origin was just boxed")
     }
 
     fn get_or_insert_extra(&mut self) -> &mut QueryRevisionsExtraInner {
-        if !self.tag.has_extra() {
-            let extra = QueryRevisionsExtraInner::empty();
-            let allocation = if self.is_derived() {
-                // SAFETY: Derived origins without extra data initialize `payload.span`.
-                let span = unsafe { self.payload.span };
-                WithExtra::boxed(extra, span)
-            } else {
-                // SAFETY: Assigned origins without extra data initialize `payload.index`.
-                let index = unsafe { self.payload.index };
-                WithExtra::boxed(extra, index)
-            };
-            self.payload = OriginAndExtraPayload { allocation };
-            self.tag = OriginAndExtraTag::new(self.tag.kind(), true);
-        }
+        self.head_or_box()
+            .extra
+            .get_or_insert_with(QueryRevisionsExtraInner::empty)
+    }
 
-        self.extra_mut().unwrap()
+    /// The value fingerprints the inputs had when read; see [`QueryRevisions::edge_fingerprint`].
+    #[inline]
+    fn fingerprints(&self) -> &[EdgeFingerprint] {
+        self.head().map_or(&[], |head| &head.fingerprints)
+    }
+
+    /// The fingerprints, boxing the origin if they are written.
+    fn fingerprints_mut(&mut self) -> &mut ThinVec<EdgeFingerprint> {
+        &mut self.head_or_box().fingerprints
     }
 
     /// The edges of a derived origin.
     #[inline]
-    pub(crate) const fn span(&self) -> Option<EdgeSpan> {
-        match self.tag.kind() {
-            QueryOriginKind::Assigned => None,
-            QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked => {
-                Some(if self.tag.has_extra() {
-                    // SAFETY: Derived origins with extra data own a `WithExtra<EdgeSpan>`.
-                    unsafe {
-                        self.payload
-                            .allocation
-                            .cast::<WithExtra<EdgeSpan>>()
-                            .as_ref()
-                            .origin
-                    }
-                } else {
-                    // SAFETY: Derived origins without extra data initialize `payload.span`.
-                    unsafe { self.payload.span }
-                })
-            }
+    pub(crate) fn span(&self) -> Option<EdgeSpan> {
+        match (self.kind(), self.is_boxed()) {
+            (QueryOriginKind::Assigned, _) => None,
+            // SAFETY: A boxed derived origin owns a `WithExtra<EdgeSpan>`.
+            (_, true) => Some(unsafe { (*self.allocation::<EdgeSpan>()).origin }),
+            (_, false) => Some(EdgeSpan {
+                start: (self.word >> 32) as u32,
+                len: ((self.word >> 3) & u64::from(Self::INLINE_LEN)) as u32,
+            }),
         }
     }
 
     /// Replaces a derived origin's edges; an assigned origin has none.
     fn set_span(&mut self, edges: EdgeSpan) {
-        match (self.tag.kind(), self.tag.has_extra()) {
+        match (self.kind(), self.is_boxed()) {
             (QueryOriginKind::Assigned, _) => {}
-            (_, true) => {
-                // SAFETY: Derived origins with extra data own a `WithExtra<EdgeSpan>`, uniquely
-                // borrowed through `self`.
-                unsafe {
-                    self.payload
-                        .allocation
-                        .cast::<WithExtra<EdgeSpan>>()
-                        .as_mut()
-                        .origin = edges;
-                }
-            }
-            (_, false) => self.payload = OriginAndExtraPayload { span: edges },
+            // SAFETY: A boxed derived origin owns a `WithExtra<EdgeSpan>`, uniquely borrowed
+            // through `self`.
+            (_, true) => unsafe { (*self.allocation::<EdgeSpan>()).origin = edges },
+            (kind, false) => *self = Self::new_derived(edges, kind, QueryRevisionsExtra(None)),
         }
     }
 
@@ -1230,16 +1333,16 @@ impl OriginAndExtra {
 
     #[inline]
     const fn is_derived(&self) -> bool {
-        !matches!(self.tag.kind(), QueryOriginKind::Assigned)
+        !matches!(self.kind(), QueryOriginKind::Assigned)
     }
 
     const fn is_derived_untracked(&self) -> bool {
-        matches!(self.tag.kind(), QueryOriginKind::DerivedUntracked)
+        matches!(self.kind(), QueryOriginKind::DerivedUntracked)
     }
 
     #[inline]
     fn origin<'a>(&'a self, graph: &'a Graph) -> QueryOriginRef<'a> {
-        match self.tag.kind() {
+        match self.kind() {
             QueryOriginKind::Assigned => QueryOriginRef::Assigned(self.assigned_key()),
             kind => {
                 let span = self
@@ -1255,61 +1358,58 @@ impl OriginAndExtra {
         }
     }
 
-    const fn assigned_key(&self) -> DatabaseKeyIndex {
-        let index = if self.tag.has_extra() {
-            // SAFETY: Assigned origins with extra data own a `WithExtra<Id>`.
-            unsafe {
-                self.payload
-                    .allocation
-                    .cast::<WithExtra<Id>>()
-                    .as_ref()
-                    .origin
-            }
-        } else {
-            // SAFETY: Assigned origins without extra data initialize `payload.index`.
-            unsafe { self.payload.index }
-        };
-        // SAFETY: Assigned origins initialize metadata from a valid ingredient index.
-        let ingredient = unsafe { IngredientIndex::new_unchecked(self.metadata) };
-        DatabaseKeyIndex::new(ingredient, index)
+    fn assigned_key(&self) -> DatabaseKeyIndex {
+        assert!(
+            matches!(self.kind(), QueryOriginKind::Assigned) && self.is_boxed(),
+            "salsa: only an assigned origin has an assigning key"
+        );
+        // SAFETY: An assigned origin is always boxed, as a `WithExtra<DatabaseKeyIndex>`.
+        unsafe { (*self.allocation::<DatabaseKeyIndex>()).origin }
     }
 
-    /// The bytes this origin owns or uses: its extra box, and its share of the edge array.
+    /// The bytes this origin owns or uses: its box and what hangs off it, and its share of the
+    /// edge array.
     #[cfg(any(test, feature = "salsa_unstable"))]
     fn allocation_size(&self) -> usize {
         let edges = self
             .span()
             .map_or(0, |span| span.len as usize * size_of::<u32>());
-        let boxed = match (self.tag.kind(), self.tag.has_extra()) {
-            (_, false) => 0,
-            (QueryOriginKind::Assigned, true) => size_of::<WithExtra<Id>>(),
-            (_, true) => size_of::<WithExtra<EdgeSpan>>(),
+        let Some(head) = self.head() else {
+            return edges;
+        };
+        let boxed = match self.kind() {
+            QueryOriginKind::Assigned => size_of::<WithExtra<DatabaseKeyIndex>>(),
+            _ => size_of::<WithExtra<EdgeSpan>>(),
+        };
+        let fingerprints = if head.fingerprints.is_empty() {
+            0
+        } else {
+            2 * size_of::<usize>() + size_of_val(head.fingerprints.as_slice())
         };
 
         #[cfg(feature = "salsa_unstable")]
-        if let Some(extra) = self.extra() {
-            return edges + boxed + extra.allocation_size();
+        if let Some(extra) = &head.extra {
+            return edges + boxed + fingerprints + extra.allocation_size();
         }
 
-        edges + boxed
+        edges + boxed + fingerprints
     }
 }
 
 impl Drop for OriginAndExtra {
     fn drop(&mut self) {
-        if !self.tag.has_extra() {
+        if !self.is_boxed() {
             return;
         }
-        // SAFETY: Origins with extra data own the `WithExtra` that `WithExtra::boxed` made, of
-        // the type the kind names; `Drop` runs once.
+        // SAFETY: A boxed origin owns the `WithExtra` that `OriginAndExtra::boxed` made, of the
+        // type its kind names; `Drop` runs once.
         unsafe {
-            let allocation = self.payload.allocation;
-            match self.tag.kind() {
+            match self.kind() {
                 QueryOriginKind::Assigned => {
-                    drop(Box::from_raw(allocation.cast::<WithExtra<Id>>().as_ptr()))
+                    drop(Box::from_raw(self.allocation::<DatabaseKeyIndex>()))
                 }
                 QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked => {
-                    drop(Box::from_raw(allocation.cast::<WithExtra<EdgeSpan>>().as_ptr()))
+                    drop(Box::from_raw(self.allocation::<EdgeSpan>()))
                 }
             }
         }
@@ -1319,7 +1419,7 @@ impl Drop for OriginAndExtra {
 impl std::fmt::Debug for OriginAndExtra {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut f = f.debug_struct("OriginAndExtra");
-        match self.tag.kind() {
+        match self.kind() {
             QueryOriginKind::Assigned => f.field("assigned", &self.assigned_key()),
             QueryOriginKind::Derived => f.field("derived", &self.span()),
             QueryOriginKind::DerivedUntracked => f.field("derived_untracked", &self.span()),
@@ -1327,61 +1427,39 @@ impl std::fmt::Debug for OriginAndExtra {
         if let Some(extra) = self.extra() {
             f.field("extra", extra);
         }
+        if !self.fingerprints().is_empty() {
+            f.field("fingerprints", &self.fingerprints());
+        }
         f.finish()
     }
 }
 
-/// The origin kind in the low two bits, and whether the payload is a `WithExtra` box.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct OriginAndExtraTag(u8);
-
-impl OriginAndExtraTag {
-    const KIND_MASK: u8 = 0b011;
-    const WITH_EXTRA: u8 = 0b100;
-
-    const fn new(kind: QueryOriginKind, extra: bool) -> Self {
-        OriginAndExtraTag(kind as u8 | if extra { Self::WITH_EXTRA } else { 0 })
-    }
-
-    const fn has_extra(self) -> bool {
-        self.0 & Self::WITH_EXTRA != 0
-    }
-
-    const fn kind(self) -> QueryOriginKind {
-        match self.0 & Self::KIND_MASK {
-            0b01 => QueryOriginKind::Assigned,
-            0b11 => QueryOriginKind::Derived,
-            0b10 => QueryOriginKind::DerivedUntracked,
-            _ => panic!("invalid query origin kind"),
-        }
-    }
-}
-
-/// The payload of [`OriginAndExtra`].
-#[derive(Clone, Copy)]
-union OriginAndExtraPayload {
-    /// A `WithExtra` box, for origins with extra data.
-    allocation: NonNull<()>,
-
-    /// The identity of the assigning query for a directly stored assigned origin.
-    index: Id,
-
-    /// The edges of a directly stored derived origin.
-    span: EdgeSpan,
-}
-
-/// Extra revision data and the origin's own payload, in one box. The extra data comes first, so
-/// [`OriginAndExtra::extra`] reads it without knowing the kind.
+/// What a boxed origin holds besides its own payload: the extra data most memos don't have
+/// (`None` when the box holds only fingerprints, a key or a long span) and the input
+/// fingerprints.
 #[repr(C)]
+struct WithExtraHead {
+    extra: Option<QueryRevisionsExtraInner>,
+    fingerprints: ThinVec<EdgeFingerprint>,
+}
+
+/// A boxed origin: the head, then the origin's own payload. Aligned to 8 so its address leaves
+/// the tag's three bits free.
+#[repr(C, align(8))]
 struct WithExtra<T> {
-    extra: QueryRevisionsExtraInner,
+    head: WithExtraHead,
     origin: T,
 }
 
 impl<T> WithExtra<T> {
-    fn boxed(extra: QueryRevisionsExtraInner, origin: T) -> NonNull<()> {
-        NonNull::from(Box::leak(Box::new(WithExtra { extra, origin }))).cast()
+    fn new(extra: Option<QueryRevisionsExtraInner>, origin: T) -> Self {
+        WithExtra {
+            head: WithExtraHead {
+                extra,
+                fingerprints: ThinVec::new(),
+            },
+            origin,
+        }
     }
 }
 

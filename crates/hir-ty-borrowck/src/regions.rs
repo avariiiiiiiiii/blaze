@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     AliasConstKind, ClauseKind, OutlivesClause, RegionKind, Variance,
     inherent::{
-        GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _, Term as _, Ty as _,
+        GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _, Term as _, Ty as _,
     },
 };
 

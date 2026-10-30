@@ -72,7 +72,7 @@ impl<'db> Cx<'db> {
     pub(crate) fn new(db: &'db dyn HirDatabase, stored: &StoredParamEnvAndCrate) -> Cx<'db> {
         let env = stored.as_ref(db);
         let interner = DbInterner::new_with(db, env.krate);
-        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
         Cx { db, interner, infcx, env, stored: stored.clone() }
     }
 

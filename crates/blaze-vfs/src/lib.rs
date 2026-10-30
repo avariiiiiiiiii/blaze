@@ -14,6 +14,8 @@
 //!   [`blaze_core::Effect`]s, with group commit and recovery from a torn tail.
 //! - Watching: changes a driver reports ([`blaze_core::Done::Changed`]) become ops on the
 //!   workspace's head ([`Watcher`]).
+//! - Outside every view: the directories user code reads that no view holds, watched so a
+//!   check asks a lock-free table whether anything under a path changed ([`outside`]).
 //!
 //! Unsafe code is only in `store` and `text` (docs/v2/plan/design/unsafe.md), whose APIs
 //! are safe.
@@ -22,6 +24,7 @@
 
 mod disk;
 mod journal;
+pub mod outside;
 mod reader;
 mod rebase;
 mod section;
@@ -45,6 +48,7 @@ use crate::{
     tree::{NodeId, Tree},
 };
 pub use crate::{
+    outside::{Outside, generation, unchanged_since, want},
     reader::{Pinned, Reader},
     section::Section,
     text::text_of,

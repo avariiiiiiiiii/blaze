@@ -1627,6 +1627,8 @@ is now `Option<Unix>`, and `Config` lost `Clone`), `units` (the launchd plist an
 asked of frontend-journal in `v2/requests/frontend-journal.md`. Notes:
 `docs/v2/plan/lanes/frontend/activate.md`. Each edit below is complete once both land.
 
+> forwarded to cargo (told by tmux): `crates/blaze-cargo/` is its.
+
 ### 1. `crates/blaze-cargo/src/serve.rs`: `--activated`
 
 Old:

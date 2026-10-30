@@ -3804,6 +3804,38 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// docs/v2/plan/design/restore.md's budget: a warm sweep of 100 000 tracked names in 50 ms,
+    /// beside the reference sweep's time on threads for the same names.
+    #[test]
+    #[ignore = "a benchmark: makes 100 000 files and times sweeps of them"]
+    fn a_sweep_of_100k_names_is_within_the_restart_budget() {
+        let root = dir("uring-stamp-bench");
+        let names = sweep_tree(&root, 100_000);
+        let mut driver = Uring::new(&root).unwrap();
+        let mut best = Duration::MAX;
+        for round in 0..6 {
+            let began = Instant::now();
+            let mut effects = vec![Effect::Stamp { files: names.clone(), tag: Tag(round) }];
+            let mut stamped = 0;
+            run_until_idle(&mut driver, &mut effects, |done, _| match done.done {
+                Done::Stamped(stamps) => stamped = stamps.len(),
+                other => panic!("{other:?}"),
+            });
+            assert_eq!(stamped, names.len());
+            // The first warms the caches, as a daemon's earlier life has.
+            if round > 0 {
+                best = best.min(began.elapsed());
+            }
+        }
+        let began = Instant::now();
+        crate::fs::stamps(&root, &names).unwrap();
+        let threads = began.elapsed();
+        eprintln!("100 000 names: the ring {best:?}, the reference on threads {threads:?}");
+        assert!(best < Duration::from_millis(50), "{best:?}");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     /// A journal on Linux first says the changes since a saved cursor are lost (and nothing is
     /// for no cursor), then tells a file written as a live batch, before a flush asked after
     /// it; it ends at an unwatch, as a watch does.

@@ -305,7 +305,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
     fn requires_unsafe(&mut self, node: impl Into<ExprOrPatIdPacked>, reason: UnsafetyReason) {
         let first = self.context == Context::UnsafeFn
             && mem::replace(&mut self.suggest_unsafe_block, false);
-        let event = Event { node: node.into(), reason, deprecated: false, context: self.context, first };
+        let event =
+            Event { node: node.into(), reason, deprecated: false, context: self.context, first };
         self.sink.push(event);
     }
 
@@ -450,7 +451,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                 }
             },
             Expr::Block { statements, tail, unsafe_, .. } => {
-                let edition = store.block_edition(current).map(|it| mem::replace(&mut self.edition, it));
+                let edition =
+                    store.block_edition(current).map(|it| mem::replace(&mut self.edition, it));
                 let context = match unsafe_ {
                     Unsafe::Yes => mem::replace(&mut self.context, Context::UnsafeBlock),
                     Unsafe::No => self.context,
@@ -575,8 +577,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
                     let fields = self.variant_fields(variant);
                     if has_unsafe_field(fields) {
                         for arg in args {
-                            if fields.field(&arg.name).is_some_and(|it| fields.fields()[it].is_unsafe)
-                            {
+                            let field = fields.field(&arg.name);
+                            if field.is_some_and(|it| fields.fields()[it].is_unsafe) {
                                 self.requires_unsafe(arg.pat, UnsafetyReason::UseOfUnsafeField);
                             }
                         }
@@ -635,7 +637,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
 
     /// The places of a destructuring assignment, in order, each the left side of a `=`.
     fn walk_places(&mut self, current: PatId) {
-        match self.store.pat(current) {
+        let store = self.store;
+        match store.pat(current) {
             Pat::Expr(place) => {
                 self.assigning = true;
                 self.walk_expr(place);
@@ -720,7 +723,8 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         let flags = StaticSignature::of(db, id).flags;
         if flags.contains(StaticFlags::MUTABLE) {
             self.requires_unsafe(current, UnsafetyReason::MutableStatic);
-        } else if flags.contains(StaticFlags::EXTERN) && !flags.contains(StaticFlags::EXPLICIT_SAFE) {
+        } else if flags.contains(StaticFlags::EXTERN) && !flags.contains(StaticFlags::EXPLICIT_SAFE)
+        {
             self.requires_unsafe(current, UnsafetyReason::ExternStatic);
         }
     }

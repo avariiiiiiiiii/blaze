@@ -6,9 +6,9 @@ use blaze_ids::radix;
 use hir_def::{AdtId, attrs::AttrFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClauseKind, OutlivesPredicate, RegionKind,
+    ClauseKind, OutlivesClause, RegionKind,
     inherent::{
-        AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _,
+        AdtDef as _, GenericArgs as _, IntoKind, ParamEnv as _, SliceLike as _,
     },
 };
 use salsa::SalsaValue;
@@ -20,7 +20,8 @@ use hir_ty::{
         TerminatorKind,
     },
     next_solver::{
-        Clause, DbInterner, GenericArgKind, GenericArgs, Region, StoredRegion, StoredTy, Ty, TyKind,
+        Clause, DbInterner, GenericArgKind, GenericArgs, Region, RegionExt as _, StoredRegion,
+        StoredTy, Ty, TyKind,
     },
 };
 
@@ -613,19 +614,19 @@ fn expand<'db>(
             let interner = ctx.infcx.interner;
             let constraint = drop_constraint(ctx.db, adt);
             for region in &constraint.regions {
-                let region = rustc_type_ir::EarlyBinder::bind(region.as_ref())
+                let region = rustc_type_ir::EarlyBinder::bind(interner, region.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip();
                 found.extend(super::regions::rv_of(region));
             }
             for whole in &constraint.whole {
-                let whole = rustc_type_ir::EarlyBinder::bind(whole.as_ref())
+                let whole = rustc_type_ir::EarlyBinder::bind(interner, whole.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip();
                 regions_of(whole, found);
             }
             children.extend(constraint.tys.iter().map(|it| {
-                rustc_type_ir::EarlyBinder::bind(it.as_ref())
+                rustc_type_ir::EarlyBinder::bind(interner, it.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip()
             }));
@@ -642,11 +643,11 @@ fn expand<'db>(
         TyKind::Dynamic(..) => regions_of(ty, found),
         // A projection is what it normalizes to, `NoisyDrop<T>` of `<T as Associator>::As`;
         // another alias holds what its bounds and captures let it, as for liveness.
-        TyKind::Alias(alias) => {
+        TyKind::Alias(_, alias) => {
             let normalized = match alias.kind {
                 rustc_type_ir::AliasTyKind::Projection { .. } => {
                     super::regions::normalize(ctx, ty)
-                        .filter(|it| !matches!(it.kind(), TyKind::Alias(_) | TyKind::Infer(_)))
+                        .filter(|it| !matches!(it.kind(), TyKind::Alias(_, _) | TyKind::Infer(_)))
                 }
                 _ => None,
             };
@@ -741,12 +742,12 @@ fn take_apart<'db>(
         TyKind::Adt(def, args) => {
             let constraint = drop_constraint(db, def.def_id());
             let instantiate = |ty: &StoredTy| {
-                rustc_type_ir::EarlyBinder::bind(ty.as_ref())
+                rustc_type_ir::EarlyBinder::bind(interner, ty.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip()
             };
             regions.extend(constraint.regions.iter().map(|it| {
-                rustc_type_ir::EarlyBinder::bind(it.as_ref())
+                rustc_type_ir::EarlyBinder::bind(interner, it.as_ref())
                     .instantiate(interner, args)
                     .skip_norm_wip()
             }));
@@ -763,7 +764,7 @@ fn take_apart<'db>(
         }
         TyKind::Dynamic(..) => whole.push(ty),
         TyKind::Param(_)
-        | TyKind::Alias(_)
+        | TyKind::Alias(_, _)
         | TyKind::Closure(..)
         | TyKind::CoroutineClosure(..)
         | TyKind::Coroutine(..) => tys.push(ty),
@@ -818,7 +819,7 @@ fn live_regions_of<'db>(
             }
         }
         fn visit_ty(&mut self, ty: Ty<'db>) {
-            if let TyKind::Alias(alias) = ty.kind() {
+            if let TyKind::Alias(_, alias) = ty.kind() {
                 match alias_bound(self.ctx, self.regions, ty, alias) {
                     Some(None) => return,
                     Some(Some(rv)) => {
@@ -828,12 +829,9 @@ fn live_regions_of<'db>(
                     None => (),
                 }
                 // What an `impl Trait` does not capture need not be live.
-                if let rustc_type_ir::AliasTyKind::Opaque { .. } = alias.kind
-                    && let Some(captured) = super::regions::opaque_captures(
-                        self.ctx.db,
-                        alias.kind.def_id(),
-                        alias.args.len(),
-                    )
+                if let rustc_type_ir::AliasTyKind::Opaque { def_id } = alias.kind
+                    && let Some(captured) =
+                        super::regions::opaque_captures(self.ctx.db, def_id, alias.args.len())
                 {
                     for (arg, captured) in alias.args.iter().zip(captured) {
                         if captured {
@@ -878,13 +876,13 @@ fn alias_bound<'db>(
     };
     let erased = erase(ty);
     let item_bounds: Vec<Clause<'db>> =
-        rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
+        rustc_type_ir::Interner::item_bounds(interner, super::regions::alias_def_id(alias.kind))
             .iter_instantiated(interner, alias.args)
             .map(|it| it.skip_norm_wip())
             .collect();
     let mut found: Option<Option<Rv>> = None;
-    for clause in item_bounds.into_iter().chain(ctx.env.caller_bounds().iter()) {
-        let ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region)) =
+    for clause in item_bounds.into_iter().chain(ctx.env.caller_bounds()) {
+        let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =
             clause.kind().skip_binder()
         else {
             continue;

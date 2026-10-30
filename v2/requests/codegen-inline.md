@@ -72,6 +72,8 @@ on the code of each body inlined into it.
   2 or 3, not incremental). `MirOptions::at` sets it `false`: rustc's CTFE MIR is not inlined,
   and the interpreter does not read `Inlined`.
 
+> forwarded to db (db-ty; window `db-next2`, told by tmux).
+
 ## 2. hir-def `src/attrs.rs` (db): the attributes the inliner reads
 
 Why: rustc's `is_inline_valid_on_fn` and `check_codegen_attributes` refuse on each. Five new
@@ -87,6 +89,8 @@ Why: rustc's `is_inline_valid_on_fn` and `check_codegen_attributes` refuse on ea
 The inliner refuses a callee with either of the last two, or a caller with `HAS_SANITIZE`,
 where rustc compares the sets: blaze reads neither attribute's arguments yet.
 
+> forwarded to db (window `db-next2`, told by tmux).
+
 ## 3. Exhaustive `MirSpan` matches (each crate's owner)
 
 `MirSpan::Inlined(n)` is a span of another body: where a match maps a span to source, it goes
@@ -100,6 +104,8 @@ it; where it only compares or hashes, `Inlined(n)` is its own value. Arms at:
 `blaze-diagnostics/src/lints/bodies.rs:237`, `hir-ty-borrowck/src/check.rs:192`,
 `hir-ty-borrowck/src/regions.rs:4174`. `v2/hashes.rs` hashes `body.inlined` whole with the
 body (the scopes, spans, bindings and promoted are what the inlined code means).
+
+> forwarded: `hir/`, `hir-ty-borrowck` to db; `hir-ty-codegen`, `hir-ty-mir` to codegen; `blaze-diagnostics` to diagnostics; `hir-ty-ub` to safety (each told by tmux). `hir-ide/src/mir_pretty/errors.rs:244` and `blaze-items/src/form.rs:343` (items is DONE) are requests': their arms go in once 1 adds `MirSpan::Inlined`, which is not in `hir-ty/src/mir.rs` yet.
 
 ## 4. hir-ty-codegen (codegen, codegen-adapter)
 
@@ -132,3 +138,5 @@ body (the scopes, spans, bindings and promoted are what the inlined code means).
   stale when an inlined callee's source moves (spans, `Location` lines) or changes. A callee
   listed once already as called (`listed_call` gives `None`) still needs its place in
   `built_in`: keep the place of each `(def, args)` in `called` so it can be found.
+
+> forwarded to codegen (window `codegen-next1`, told by tmux).

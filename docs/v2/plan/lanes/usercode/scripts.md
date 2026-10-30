@@ -17,8 +17,8 @@ them is under [What is not done](#what-is-not-done).
 ## What a script prints (`output.rs`)
 
 cargo's `BuildOutput::parse` (`src/core/compiler/custom_build.rs`), the baseline, splits the
-output with `lines()`, makes a `String` per line, and dispatches each key by a chain of
-string comparisons, owning every value it keeps.
+output on `\n` a byte at a time, reads each line as text, and matches each key with a string
+`match` (a chain of comparisons, one per key until one agrees), owning every value it keeps.
 
 blaze reads it in one pass ([`output::read`]): line breaks are found by memchr (SIMD, 16 or
 32 bytes a step), a line that does not start `cargo:` is passed over without being read as
@@ -36,8 +36,8 @@ SIMD already.
 
 ## The environment (`env.rs`)
 
-cargo builds the environment in a `HashMap` of owned strings, a `format!` per derived
-variable, then sorts for the process.
+cargo builds the environment in a `ProcessBuilder`'s `BTreeMap` of owned strings: a node
+and a key allocated per variable, and a `format!` per derived value.
 
 blaze presizes one vector for the fixed variables, the unit's and the inherited ones; builds
 each value at its exact length without `format!` (`prefixed`, `decimal`, `concat`); takes the

@@ -17,12 +17,14 @@
 //! `NonUpperCaseGlobals`) and `compiler/rustc_lint/src/lints.rs` (`NonSnakeCaseDiag`,
 //! `NonUpperCaseGlobal`) (MIT or Apache-2.0).
 
+use std::cell::OnceCell;
+
 use base_db::TargetKind;
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
 use span::Edition;
 use syntax::{
-    AstNode, SyntaxNodePtr, TextRange, TextSize,
+    AstNode, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     ast::{self, HasGenericArgs, HasName},
 };
 
@@ -269,40 +271,38 @@ fn snake(
             diag.suggestion(span, "convert the identifier to snake case", sc, Applicability::MaybeIncorrect);
         }
     }
-    for (fact, what) in read {
-        diag.fact(*fact, what.clone());
+    for (fact, what) in read() {
+        diag.fact(fact, what);
     }
     Some(Found::lint(diag, Phase::Late, at))
 }
 
 /// rustc's `check_upper_case`: the lint of `name`, of the kind `sort`, when it is not upper
-/// case; `can_change_usages` when it is not exported, and then the paths naming it renamed too.
-#[allow(clippy::too_many_arguments)]
+/// case; with `usages` when it is not exported, and then the paths naming it renamed too.
 fn upper(
     cx: &Cx<'_, '_>,
     sort: &str,
     name: &str,
-    span: Span,
-    can_change_usages: bool,
-    usages: Vec<Span>,
+    range: InFile<TextRange>,
+    usages: Option<impl FnOnce() -> Vec<Span>>,
     at: InFile<SyntaxNodePtr>,
-    read: &Read,
+    read: impl FnOnce() -> Read,
 ) -> Option<Found> {
-    let _ = cx;
-    if name.chars().all(|c| c.to_uppercase().eq([c])) {
+    if is_upper_case(name) {
         return None;
     }
+    let span = cx.span(range);
     let uc = to_snake_case(name).to_uppercase();
     let message = format!("{sort} `{name}` should have an upper case name");
     let mut diag = Diag::lint("non_upper_case_globals", message, span.clone());
     if name != uc {
-        let applicability = match can_change_usages {
+        let applicability = match usages.is_some() {
             true => Applicability::MachineApplicable,
             false => Applicability::MaybeIncorrect,
         };
         diag.suggestion(span, "convert the identifier to upper case", uc.clone(), applicability);
-        if can_change_usages {
-            for usage in usages {
+        if let Some(usages) = usages {
+            for usage in usages() {
                 diag.suggestion_with_style(
                     vec![(usage, uc.clone())],
                     "convert the identifier to upper case",
@@ -314,10 +314,15 @@ fn upper(
     } else {
         diag.span_label(span, "should have an UPPER_CASE name");
     }
-    for (fact, what) in read {
-        diag.fact(*fact, what.clone());
+    for (fact, what) in read() {
+        diag.fact(fact, what);
     }
     Some(Found::lint(diag, Phase::Late, at))
+}
+
+/// The test of rustc's `check_upper_case`: no character changes when upper-cased.
+fn is_upper_case(name: &str) -> bool {
+    name.chars().all(|c| c.to_uppercase().eq([c]))
 }
 
 /// rustc's `is_snake_case` of `NonSnakeCase::check_snake_case`.

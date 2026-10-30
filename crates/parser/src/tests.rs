@@ -130,6 +130,96 @@ fn parse(entry: TopEntryPoint, text: &str, edition: Edition) -> (String, bool) {
     (buf, has_errors)
 }
 
+/// The tree's lines without their indentation, and the errors.
+fn parse_lines(text: &str, edition: Edition) -> (Vec<String>, Vec<String>) {
+    let (out, _) = parse(TopEntryPoint::SourceFile, text, edition);
+    let (errors, tree): (Vec<_>, Vec<_>) =
+        out.lines().map(|it| it.trim_start().to_owned()).partition(|it| it.starts_with("error "));
+    (tree, errors)
+}
+
+fn has_run(lines: &[String], run: &[&str]) -> bool {
+    lines.windows(run.len()).any(|window| window.iter().zip(run).all(|(a, b)| a == b))
+}
+
+const LABELED_LOOP_IN_BREAK: &str =
+    "parentheses are required around this expression to avoid confusion with a labeled break expression";
+
+/// rustc's `parse_expr_break`: the labeled loop is the value of an unlabeled `break`, with
+/// `LabeledLoopInBreak` where the loop ends.
+#[test]
+fn a_break_of_a_labeled_loop_takes_it_as_its_value() {
+    let text = "fn f() -> u32 { loop { break 'a: loop { break 'a 42; }; } }";
+    let (tree, errors) = parse_lines(text, Edition::CURRENT);
+    assert!(
+        has_run(
+            &tree,
+            &[
+                "BREAK_EXPR",
+                "BREAK_KW \"break\"",
+                "WHITESPACE \" \"",
+                "LOOP_EXPR",
+                "LABEL",
+                "LIFETIME",
+                "LIFETIME_IDENT \"'a\"",
+                "COLON \":\"",
+            ],
+        ),
+        "{tree:#?}"
+    );
+    assert!(
+        has_run(&tree, &["BREAK_EXPR", "BREAK_KW \"break\"", "WHITESPACE \" \"", "LIFETIME"]),
+        "the inner `break 'a 42` keeps its label: {tree:#?}"
+    );
+    let end = text.find("42; }").unwrap() + "42; }".len();
+    assert_eq!(errors, [format!("error {end}: {LABELED_LOOP_IN_BREAK}")]);
+}
+
+/// Each loop and a block after the label, in every edition; a label before anything else is
+/// the label's own error, not this one; a labeled break with a labeled value is no error.
+#[test]
+fn every_labeled_value_of_a_break_is_parenthesized() {
+    for edition in Edition::iter() {
+        for value in ["'a: loop {}", "'a: while x {}", "'a: for x in y {}", "'a: {}"] {
+            let text = format!("fn f() {{ loop {{ break {value}; }} }}");
+            let (tree, errors) = parse_lines(&text, edition);
+            let end = text.find(value).unwrap() + value.len();
+            assert_eq!(errors, [format!("error {end}: {LABELED_LOOP_IN_BREAK}")], "{value}");
+            assert!(!tree.iter().any(|it| it == "ERROR"), "{value}: {tree:#?}");
+        }
+        let (_, errors) = parse_lines("fn f() { loop { break 'a: 1; } }", edition);
+        assert!(errors.iter().any(|it| it.ends_with("expected a loop or block")), "{errors:?}");
+        assert!(!errors.iter().any(|it| it.ends_with(LABELED_LOOP_IN_BREAK)), "{errors:?}");
+        let (_, errors) =
+            parse_lines("fn f() { 'b: loop { break 'b 'a: loop {}; } }", edition);
+        assert_eq!(errors, Vec::<String>::new());
+    }
+}
+
+/// rustc's lexer before 2021 gives a `macro_rules!` matcher `'r`, `#`, `lt` for `'r#lt` and
+/// `c`, `"x"` for `c"x"` (tests/ui/lifetimes/raw/three-tokens.rs); the tree has them as tokens.
+#[test]
+fn a_raw_lifetime_and_a_c_string_are_split_before_2021() {
+    let text = "macro_rules! m { ('r # lt) => {}; (c \"x\") => {}; }\nm!('r#lt);\nm!(c\"x\");\n";
+    for edition in [Edition::Edition2015, Edition::Edition2018] {
+        let (tree, errors) = parse_lines(text, edition);
+        assert_eq!(errors, Vec::<String>::new(), "{edition:?}");
+        assert!(
+            has_run(&tree, &["L_PAREN \"(\"", "LIFETIME_IDENT \"'r\"", "POUND \"#\"", "IDENT \"lt\""]),
+            "{edition:?}: {tree:#?}"
+        );
+        assert!(
+            has_run(&tree, &["L_PAREN \"(\"", "IDENT \"c\"", "STRING \"\\\"x\\\"\""]),
+            "{edition:?}: {tree:#?}"
+        );
+    }
+    for edition in [Edition::Edition2021, Edition::Edition2024] {
+        let (tree, _) = parse_lines(text, edition);
+        assert!(tree.iter().any(|it| it == "LIFETIME_IDENT \"'r#lt\""), "{edition:?}");
+        assert!(tree.iter().any(|it| it == "C_STRING \"c\\\"x\\\"\""), "{edition:?}");
+    }
+}
+
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct TestCase {
     rs: PathBuf,

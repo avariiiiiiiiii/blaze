@@ -687,7 +687,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
     /// modulo regions, which drop glue does not depend on.
     pub(crate) fn drop_glue(&self, ty: Ty<'db>) -> hir_ty::drop::DropGlue {
         use hir_ty::drop::DropGlue;
-        use rustc_type_ir::{TypeVisitableExt as _, inherent::Region as _};
+        use rustc_type_ir::TypeVisitableExt as _;
         let interner = self.infcx.interner;
         let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
         if let Some(&known) = self.glue.borrow().get(&ty) {
@@ -717,7 +717,6 @@ impl<'a, 'db> Ctx<'a, 'db> {
     pub(crate) fn is_copy(&self, ty: Ty<'db>) -> bool {
         // Modulo regions, so asked once per type whatever its free regions are: each local's
         // type has region variables of its own.
-        use rustc_type_ir::inherent::Region as _;
         let interner = self.infcx.interner;
         let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
         if let Some(&known) = self.copy.borrow().get(&ty) {

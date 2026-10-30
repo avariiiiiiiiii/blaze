@@ -1,30 +1,110 @@
 use std::time::Duration;
 
 use super::{
-    FORK_SERVER, Failure, Finished, Outcome, Reported, Trace, report,
-    wire::{End, Frame, Frames, LONGEST, encode_ended},
+    Executed, Failure, Finished, Outcome, Reported, Trace, fork_server, report,
+    wire::{
+        End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View, encode_ended, header,
+        read_region,
+    },
 };
 
 fn frames() -> Vec<Frame> {
     vec![
-        Frame::Hello { version: 1, pid: 42, tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()] },
-        Frame::Ended { id: 7, end: End::Exited(0), output: b"ok\n".to_vec() },
-        Frame::Ended { id: u64::MAX, end: End::Exited(-1), output: Vec::new() },
-        Frame::Ended { id: 8, end: End::Signaled(9), output: vec![0, 255, 10] },
-        Frame::Ended { id: 9, end: End::NotStarted("fork: no memory".into()), output: Vec::new() },
+        Frame::Hello { version: VERSION, pid: 42, tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()] },
+        Frame::Ended { id: 7, end: End::Exited(0), output: b"ok\n".to_vec(), executed: Executed::Hits { slots: 10, hits: vec![0, 3, 9] } },
+        Frame::Ended { id: u64::MAX, end: End::Exited(-1), output: Vec::new(), executed: Executed::Hits { slots: 0, hits: Vec::new() } },
+        Frame::Ended { id: 8, end: End::Signaled(9), output: vec![0, 255, 10], executed: Executed::Not("it was killed".into()) },
+        Frame::Ended {
+            id: 9,
+            end: End::NotStarted("fork: no memory".into()),
+            output: Vec::new(),
+            executed: Executed::Not(UNRECORDED.into()),
+        },
         Frame::Run { id: 3, index: 2 },
         Frame::Kill { id: 3 },
         Frame::Quit,
     ]
 }
 
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// A frame of seeded parts: every kind, ends and records of every kind, empty and long
+/// strings and outputs, ids and counts at their edges.
+fn seeded(state: &mut u64) -> Frame {
+    let mut text = |state: &mut u64| -> String {
+        let len = (xorshift(state) % 9) as usize;
+        (0..len).map(|_| ['a', 'é', ':', '\t', '\0', '漢'][(xorshift(state) % 6) as usize]).collect()
+    };
+    let edge = |state: &mut u64| match xorshift(state) % 4 {
+        0 => 0,
+        1 => u64::MAX,
+        _ => xorshift(state),
+    };
+    match xorshift(state) % 5 {
+        0 => {
+            let count = (xorshift(state) % 5) as usize;
+            Frame::Hello { version: xorshift(state) as u32, pid: xorshift(state) as u32, tests: (0..count).map(|_| text(state)).collect() }
+        }
+        1 => {
+            let end = match xorshift(state) % 3 {
+                0 => End::Exited(xorshift(state) as i32),
+                1 => End::Signaled(xorshift(state) as i32),
+                _ => End::NotStarted(text(state)),
+            };
+            let output = (0..xorshift(state) % 300).map(|_| xorshift(state) as u8).collect();
+            let executed = match xorshift(state) % 2 {
+                0 => {
+                    let slots = (xorshift(state) % 200) as u32;
+                    let hits = (0..slots).filter(|_| xorshift(state) % 4 == 0).collect();
+                    Executed::Hits { slots, hits }
+                }
+                _ => Executed::Not(text(state)),
+            };
+            Frame::Ended { id: edge(state), end, output, executed }
+        }
+        2 => Frame::Run { id: edge(state), index: xorshift(state) as u32 },
+        3 => Frame::Kill { id: edge(state) },
+        _ => Frame::Quit,
+    }
+}
+
+/// The parts of an end, borrowed, with the hits as the wire has them.
+fn ended_parts(frame: &Frame) -> Option<(u64, &End, &[u8], &Executed, Vec<u8>)> {
+    let Frame::Ended { id, end, output, executed } = frame else { return None };
+    let bytes = match executed {
+        Executed::Hits { hits, .. } => hits.iter().flat_map(|it| it.to_le_bytes()).collect(),
+        Executed::Not(_) => Vec::new(),
+    };
+    Some((*id, end, output, executed, bytes))
+}
+
+fn view_of<'a>(executed: &'a Executed, bytes: &'a [u8]) -> ExecView<'a> {
+    match executed {
+        Executed::Hits { slots, .. } => ExecView::Hits { slots: *slots, hits: Hits::of_bytes(bytes).unwrap() },
+        Executed::Not(why) => ExecView::Not(why),
+    }
+}
+
 #[test]
 fn every_frame_round_trips() {
-    for frame in frames() {
+    let mut state = 0x853c_49e6_748f_ea9bu64;
+    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut state)).collect();
+    for frame in frames().into_iter().chain(seeded) {
         let bytes = frame.to_bytes();
         let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
         assert_eq!(len, bytes.len() - 4, "{frame:?}");
-        assert_eq!(Frame::decode(&bytes[4..]), Ok(frame));
+        assert_eq!(Frame::decode(&bytes[4..]), Ok(frame.clone()));
+        let view = View::decode(&bytes[4..]).unwrap();
+        assert_eq!(view.to_frame(), frame);
+        if let (View::Hello { tests, .. }, Frame::Hello { tests: names, .. }) = (view, &frame) {
+            assert_eq!(tests.len(), names.len());
+            assert!(tests.iter().eq(names.iter().map(String::as_str)));
+        }
     }
 }
 
@@ -50,13 +130,47 @@ fn frames_come_whole_whatever_the_pieces() {
 
 #[test]
 fn an_end_encoded_from_borrowed_parts_is_the_frame_s_bytes() {
-    for frame in frames() {
-        let Frame::Ended { id, end, output } = &frame else { continue };
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let seeded: Vec<Frame> = (0..2_000).map(|_| seeded(&mut state)).collect();
+    for frame in frames().iter().chain(&seeded) {
+        let Some((id, end, output, executed, bytes)) = ended_parts(frame) else { continue };
         let mut borrowed = b"before".to_vec();
-        encode_ended(&mut borrowed, *id, end, output);
+        encode_ended(&mut borrowed, id, end.view(), output, view_of(executed, &bytes));
         let mut owned = b"before".to_vec();
         frame.encode(&mut owned);
         assert_eq!(borrowed, owned, "{frame:?}");
+    }
+}
+
+/// Encoding into a buffer that is cleared and reused, and reading a steady stream through one
+/// [`Frames`], grow nothing once the largest frame has been seen.
+#[test]
+fn a_steady_stream_reuses_its_buffers() {
+    let frames = frames();
+    let mut out = Vec::new();
+    let mut reader = Frames::new();
+    let mut high = None;
+    for round in 0..200 {
+        for frame in &frames {
+            out.clear();
+            match ended_parts(frame) {
+                Some((id, end, output, executed, bytes)) => encode_ended(&mut out, id, end.view(), output, view_of(executed, &bytes)),
+                None => frame.encode(&mut out),
+            }
+            for piece in out.chunks(5) {
+                reader.push(piece);
+                while let Some(view) = reader.pop_view().unwrap() {
+                    assert_eq!(&view.to_frame(), frame);
+                }
+            }
+        }
+        let now = (out.capacity(), reader.capacity());
+        if round == 1 {
+            high = Some(now);
+        }
+        if let Some(high) = high {
+            assert_eq!(now, high, "round {round}");
+        }
     }
 }
 
@@ -84,9 +198,7 @@ fn frames_read_in_place_as_a_whole_stream_reads() {
         let mut got = Vec::new();
         let mut at = 0;
         while at < stream.len() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
+            xorshift(&mut state);
             let needed = reader.needed();
             let had_length = reader.waiting() >= 4;
             assert!(needed > 0);
@@ -143,32 +255,168 @@ fn a_frame_that_is_not_one_is_refused() {
     assert!(Frame::decode(&lying).is_err());
 }
 
+/// An end's record must be what a region reader makes: hits strictly increasing, each below
+/// the slots, and as many as it says.
 #[test]
-fn the_harness_text_is_one_module_with_the_protocol_and_the_server() {
-    assert!(FORK_SERVER.trim_start().starts_with("pub mod fork_server {"));
-    assert!(FORK_SERVER.contains("pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";"));
-    assert!(FORK_SERVER.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> !"));
-    // Nothing of blaze is named in what the tested crate compiles.
-    let code: Vec<&str> = FORK_SERVER.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
-    assert!(code.iter().all(|it| !it.contains("crate::") && !it.contains("blaze_")), "{code:#?}");
-    // An inner doc comment only where a module starts: the protocol's, first.
-    let after_open = FORK_SERVER.trim_start().trim_start_matches("pub mod fork_server {").trim_start();
-    assert!(after_open.starts_with("//!"));
-    let past_docs: String = after_open.lines().skip_while(|it| it.starts_with("//!")).collect::<Vec<_>>().join("\n");
-    assert!(!past_docs.contains("//!"));
-    // No test of blaze's in it, which the tested crate's harness would run as its own.
-    // A child's end wakes the server (a pidfd, or a kqueue): it never waits on a clock.
-    assert!(FORK_SERVER.contains("const PIDFD_OPEN: ::core::ffi::c_long = 434;"));
-    assert!(FORK_SERVER.contains("fn kqueue() -> Int;"));
-    assert!(FORK_SERVER.contains("let timeout = if now { 0 } else { -1 };"));
-    assert!(!FORK_SERVER.contains("#[test]"));
-    assert!(!FORK_SERVER.contains("#[cfg(test)]"));
-    let (open, close) = FORK_SERVER.chars().fold((0, 0), |(open, close), it| match it {
-        '{' => (open + 1, close),
-        '}' => (open, close + 1),
-        _ => (open, close),
-    });
-    assert_eq!(open, close);
+fn an_execution_record_out_of_order_or_past_its_slots_is_refused() {
+    let ended = |slots: u32, hits: Vec<u32>| Frame::Ended { id: 1, end: End::Exited(0), output: Vec::new(), executed: Executed::Hits { slots, hits } };
+    for (slots, hits) in [(10, vec![3, 3]), (10, vec![4, 2]), (10, vec![10]), (0, vec![0]), (u32::MAX, vec![u32::MAX])] {
+        let bytes = ended(slots, hits.clone()).to_bytes();
+        let why = Frame::decode(&bytes[4..]).unwrap_err();
+        assert!(why.contains("out of order or past"), "{slots} {hits:?}: {why}");
+    }
+    assert!(Frame::decode(&ended(u32::MAX, vec![0, u32::MAX - 1]).to_bytes()[4..]).is_ok());
+    // A count past the hits there: ends early.
+    let mut short = ended(10, vec![1, 2]).to_bytes()[4..].to_vec();
+    short.truncate(short.len() - 1);
+    assert!(Frame::decode(&short).unwrap_err().contains("ends early"));
+    let mut huge = ended(10, Vec::new()).to_bytes()[4..].to_vec();
+    let at = huge.len() - 4;
+    huge[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(Frame::decode(&huge).is_err());
+    // An unknown kind of record.
+    let mut kind = ended(10, Vec::new()).to_bytes()[4..].to_vec();
+    let at = kind.len() - 9;
+    kind[at] = 2;
+    assert!(Frame::decode(&kind).unwrap_err().contains("no execution record is of kind 2"));
+}
+
+/// A region as a server maps it: the header, then a byte per slot, padded to whole words.
+fn region(slots: u32, set: &[u32], armed: u32) -> Vec<u8> {
+    let mut bytes = header(slots).to_vec();
+    bytes[12..16].copy_from_slice(&armed.to_le_bytes());
+    bytes.resize(HEADER + (slots as usize).div_ceil(8) * 8, 0);
+    for &slot in set {
+        bytes[HEADER + slot as usize] = 1;
+    }
+    bytes
+}
+
+fn read(bytes: &[u8], mapped: u32, ended: Result<(), &str>, hits: &mut Vec<u8>) -> Result<u32, String> {
+    let head: [u8; HEADER] = bytes[..HEADER].try_into().unwrap();
+    read_region(head, mapped, ended, |n| u64::from_le_bytes(bytes[HEADER + 8 * n..HEADER + 8 * n + 8].try_into().unwrap()), hits)
+}
+
+/// Each refusal of `blaze_testsel::record::Record::of_region`, in its order: not exited,
+/// not blaze's header, not armed whole, more slots than mapped. A refusal leaves no hits.
+#[test]
+fn a_region_that_is_not_a_whole_record_is_refused() {
+    let mut hits = vec![9, 9, 9];
+    let whole = region(20, &[1, 19], 20);
+    let why = read(&whole, 20, Err("it was killed by signal 9"), &mut hits).unwrap_err();
+    assert!(why.contains("not whole") && why.contains("signal 9"), "{why}");
+    assert!(hits.is_empty());
+
+    let mut bad = whole.clone();
+    bad[0] ^= 1;
+    assert!(read(&bad, 20, Ok(()), &mut hits).unwrap_err().contains("magic"));
+    // A bad magic is said before the arming, as `of_region` checks it first.
+    let mut both = region(20, &[], 0);
+    both[..8].copy_from_slice(b"notblaze");
+    assert!(read(&both, 20, Ok(()), &mut hits).unwrap_err().contains("magic"));
+
+    let unarmed = region(20, &[1], 0);
+    assert!(read(&unarmed, 20, Ok(()), &mut hits).unwrap_err().contains("armed 0 of its 20"));
+    let partly = region(20, &[1], 19);
+    assert!(read(&partly, 20, Ok(()), &mut hits).unwrap_err().contains("armed 19 of its 20"));
+
+    let mut grown = header(30).to_vec();
+    grown[12..16].copy_from_slice(&30u32.to_le_bytes());
+    grown.resize(HEADER + 24, 0);
+    assert!(read(&grown, 20, Ok(()), &mut hits).unwrap_err().contains("fewer than its 30"));
+    assert!(hits.is_empty());
+
+    assert_eq!(read(&whole, 20, Ok(()), &mut hits), Ok(20));
+    assert_eq!(Hits::of_bytes(&hits).unwrap().to_vec(), [1, 19]);
+    assert_eq!(MAGIC, *b"blzexec1");
+}
+
+/// The word-at-a-time reader against a byte-at-a-time one, over seeded regions: any non-zero
+/// byte is a hit (a runtime may write any), bytes past the last slot in its word are never
+/// read as slots, and the hits are what the wire then accepts.
+#[test]
+fn a_region_reads_as_its_bytes_one_by_one() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut hits = Vec::new();
+    for _ in 0..3_000 {
+        let slots = (xorshift(&mut state) % 300) as u32;
+        let density = 1 + xorshift(&mut state) % 16;
+        let mut bytes = region(slots, &[], slots);
+        for byte in &mut bytes[HEADER..] {
+            if xorshift(&mut state) % density == 0 {
+                *byte = xorshift(&mut state) as u8 | 1;
+            }
+        }
+        let expected: Vec<u32> = (0..slots).filter(|&slot| bytes[HEADER + slot as usize] != 0).collect();
+        let mapped = slots + (xorshift(&mut state) % 3) as u32;
+        assert_eq!(read(&bytes, mapped, Ok(()), &mut hits), Ok(slots));
+        let got = Hits::of_bytes(&hits).unwrap();
+        assert_eq!(got.to_vec(), expected, "{slots} slots");
+        assert_eq!(got.len(), expected.len());
+        let mut out = Vec::new();
+        encode_ended(&mut out, 1, End::Exited(0).view(), &[], ExecView::Hits { slots, hits: got });
+        let Ok(Frame::Ended { executed, .. }) = Frame::decode(&out[4..]) else { panic!("{slots}") };
+        assert_eq!(executed, Executed::Hits { slots, hits: expected });
+    }
+    // Every byte of every value, alone in its word.
+    for at in 0..8u32 {
+        for value in 1..=255u8 {
+            let mut bytes = region(8, &[], 8);
+            bytes[HEADER + at as usize] = value;
+            assert_eq!(read(&bytes, 8, Ok(()), &mut hits), Ok(8));
+            assert_eq!(Hits::of_bytes(&hits).unwrap().to_vec(), [at]);
+        }
+    }
+}
+
+#[test]
+fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
+    for record in [true, false] {
+        let text = fork_server(record);
+        assert!(std::ptr::eq(text, fork_server(record)), "made once");
+        let opened = text.trim_start().trim_start_matches("#[allow(dead_code)]").trim_start();
+        assert!(opened.starts_with("pub mod fork_server {"));
+        assert!(text.contains("pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";"));
+        assert!(text.contains("pub const VERSION: u32 = 2;"));
+        assert!(text.contains("pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::std::ffi::OsString) -> !"));
+        // Nothing of blaze is named in what the tested crate compiles but the runtime's
+        // exports, and those only with slots.
+        let code: Vec<&str> = text.lines().filter(|it| !it.trim_start().starts_with("//")).collect();
+        let named = |it: &str| it.replace("__blaze_exec_slots", "").replace("__blaze_exec_arm", "");
+        assert!(code.iter().all(|it| !it.contains("crate::") && !named(it).contains("blaze_")), "{code:#?}");
+        assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_slots() -> u32;")), record);
+        assert_eq!(code.iter().any(|it| it.contains("fn __blaze_exec_arm(")), record);
+        assert_eq!(code.iter().any(|it| it.contains("MAP_SHARED | MAP_ANONYMOUS")), record);
+        // Nothing an older edition reads otherwise.
+        assert!(code.iter().all(|it| !it.contains("'_")), "{code:#?}");
+        // An inner doc comment only where a module starts: the protocol's, first.
+        let after_open = opened.trim_start_matches("pub mod fork_server {").trim_start();
+        assert!(after_open.starts_with("//!"));
+        let past_docs: String = after_open.lines().skip_while(|it| it.starts_with("//!")).collect::<Vec<_>>().join("\n");
+        assert!(!past_docs.contains("//!"));
+        // Every unsafe block says why it is sound.
+        let lines: Vec<&str> = text.lines().collect();
+        for (at, line) in lines.iter().enumerate() {
+            if line.contains("unsafe {") || line.trim_start().starts_with("unsafe {") {
+                let before = lines[..at].iter().rev().take(12).any(|it| it.contains("SAFETY:"));
+                assert!(before, "an unsafe block with no SAFETY comment above it: {line}");
+            }
+        }
+        // A child's end wakes the server (a pidfd, or a kqueue): it never waits on a clock.
+        assert!(text.contains("const PIDFD_OPEN: ::core::ffi::c_long = 434;"));
+        assert!(text.contains("fn kqueue() -> Int;"));
+        assert!(text.contains("let timeout = if now { 0 } else { -1 };"));
+        // No test of blaze's in it, which the tested crate's harness would run as its own.
+        assert!(!text.contains("#[test]"));
+        assert!(!text.contains("#[cfg(test)]"));
+        let (open, close) = text.chars().fold((0, 0), |(open, close), it| match it {
+            '{' => (open + 1, close),
+            '}' => (open, close + 1),
+            _ => (open, close),
+        });
+        assert_eq!(open, close);
+    }
+    assert!(fork_server(false).contains(UNRECORDED));
 }
 
 fn finished(outcome: Outcome) -> Finished {
@@ -180,6 +428,7 @@ fn finished(outcome: Outcome) -> Finished {
         output: b"out".to_vec(),
         took: Duration::from_millis(1500),
         trace: Trace::Unknown("not traced".into()),
+        executed: Executed::Not(UNRECORDED.into()),
     }
 }
 

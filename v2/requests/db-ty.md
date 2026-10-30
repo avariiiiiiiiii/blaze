@@ -308,3 +308,27 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
 
 > forwarded to db: `crates/hir-ty/src/db.rs` is lane db's.
 > applied (db-ty-next1, checked): the line is in `db.rs` (886).
+
+## db-ty-port-infer-relate
+
+- `crates/hir-ty/src/next_solver/generic_arg.rs`: delete `pub enum TermVid` and its two `From`
+  impls. Its only user was `infer/relate/generalize.rs`, which now has rustc's private `Copy`
+  `TermVid`.
+- `crates/hir-ty/src/next_solver/util.rs`: `MaxUniverse` is no longer used by `infer/relate/`
+  (replaced by `rustc_type_ir::max_universe_of_placeholders`, as in rustc); delete it if nothing
+  else uses it.
+
+> forwarded to db (db-ty; window `db-next2`, told by tmux).
+
+## db-ty-port-infer-errors
+
+- New module (suggest `crates/hir-ty/src/next_solver/wf.rs`, owner db-ty): a port of rustc
+  16d1ffac `compiler/rustc_trait_selection/src/traits/wf.rs`, at least
+  `unnormalized_obligations(infcx, param_env, term, span) -> Option<PredicateObligations<'db>>`.
+  Why: `BestObligation::visit_well_formed_goal` in `next_solver/infer/errors.rs` must walk the
+  nested WF obligations of a failing `WellFormed(term)` goal as rustc's `derive_errors.rs:241-277`
+  does. hir-ty has no WF obligation builder, so today it reports the `WellFormed` goal itself
+  instead of the leaf obligation that fails (diagnostic precision only; the solver's answer is
+  unaffected). Once it exists, errors.rs's FIXME block becomes rustc's loop verbatim.
+
+> forwarded to db (db-ty; window `db-next2`, told by tmux).

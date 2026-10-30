@@ -7,7 +7,7 @@ use crate::capture::{Captures, Reads};
 #[cfg(feature = "accumulator")]
 use crate::accumulator::{
     Accumulator,
-    accumulated_map::{AccumulatedMap, AtomicInputAccumulatedValues, InputAccumulatedValues},
+    accumulated_map::{AccumulatedMap, InputAccumulatedValues},
 };
 use crate::fingerprint::Fingerprint;
 use crate::graph::Graph;
@@ -128,7 +128,7 @@ impl ActiveQuery {
         fingerprint: Fingerprint,
         cycle_heads: &CycleHeads,
         #[cfg(feature = "accumulator")] has_accumulated: bool,
-        #[cfg(feature = "accumulator")] accumulated_inputs: &AtomicInputAccumulatedValues,
+        #[cfg(feature = "accumulator")] accumulated_inputs: InputAccumulatedValues,
     ) {
         self.durability = self.durability.min(durability);
         self.changed_at = self.changed_at.max(changed_at);
@@ -136,7 +136,7 @@ impl ActiveQuery {
         #[cfg(feature = "accumulator")]
         let accumulated_inputs = match has_accumulated {
             true => InputAccumulatedValues::Any,
-            false => accumulated_inputs.load(),
+            false => accumulated_inputs,
         };
 
         #[cfg(feature = "persistence")]
@@ -353,8 +353,6 @@ impl ActiveQuery {
 
         disambiguator_map.clear();
 
-        #[cfg(feature = "accumulator")]
-        let accumulated_inputs = AtomicInputAccumulatedValues::new(accumulated_inputs);
         let verified_final = cycle_heads.is_empty();
         let (active_tracked_structs, stale_tracked_structs) = tracked_struct_ids.drain();
 
@@ -592,7 +590,7 @@ pub(crate) struct QueryCompletion {
     extra: QueryRevisionsExtra,
     edge_fingerprints: ThinVec<EdgeFingerprint>,
     #[cfg(feature = "accumulator")]
-    accumulated_inputs: AtomicInputAccumulatedValues,
+    accumulated_inputs: InputAccumulatedValues,
     verified_final: bool,
     stale_tracked_structs: Vec<(Identity, Id)>,
 }
@@ -624,15 +622,15 @@ impl QueryCompletion {
             OriginAndExtra::derived(edges, self.extra)
         };
         CompletedQuery {
-            revisions: QueryRevisions {
-                changed_at: self.changed_at,
-                durability: self.durability,
+            revisions: QueryRevisions::new(
+                self.changed_at,
+                self.durability,
                 origin_and_extra,
+                self.verified_final,
                 #[cfg(feature = "accumulator")]
-                accumulated_inputs: self.accumulated_inputs,
-                verified_final: AtomicBool::new(self.verified_final),
-                fingerprints: self.edge_fingerprints,
-            },
+                self.accumulated_inputs,
+                self.edge_fingerprints,
+            ),
             stale_tracked_structs: self.stale_tracked_structs,
         }
     }

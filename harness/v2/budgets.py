@@ -23,6 +23,8 @@ The input is one JSON object (inline, a file's path, or `-`):
                     changed (4.0)
     noise           how far over 1.0 a code-speed ratio may be and still pass (0.05)
     critical_slack  the cold build of blaze takes at most this many times its critical path (1.25)
+    restart_slack_ms  the restart budget: the first answer after a restart at most this many ms
+                    over the warm answer, beyond the Linux statx sweep (5.0)
     self_edit       the body edit of the CI budget: `file` of this checkout and `opening`, the
                     line that opens a function, after which a statement is added
     self_test       the arguments of `blaze test` in the CI budget (none: the workspace's default)
@@ -61,6 +63,12 @@ their pinned revisions, except blaze, which is the files of this checkout as the
     ci             blaze, warm after the cold build and one `blaze test`: `self_edit`, then
                    `blaze build` and `blaze test` with BLAZE_TESTS=affected: under 120 s, every
                    test it runs passing
+    restart        blaze (the corpus's biggest workspace), warm after its cold build: the daemon
+                   stopped cleanly (`blaze stop`), or its process group sent SIGKILL, then the
+                   time from a `blaze check` with nothing changed to its result: at most the
+                   median warm no-op check plus `restart_slack_ms`, plus on Linux the statx
+                   sweep of the workspace's files at 0.5 us a file (docs/v2/plan/design/restore.md:
+                   about 50 ms for 100k); each run's warm check is timed just before its restart
     memory         (also) nushell: the cold peak per thousand lines of the workspace's .rs files,
                    at most cargo's
     layout         nushell after its cold build: bytes per element of each table
@@ -107,12 +115,18 @@ import memory
 SCRIPT = "budgets.py"
 Budget = Literal[
     "body", "signature", "format", "comment", "rename", "move", "memory", "warm-start", "noop", "dev-speed",
-    "release-speed", "big-crate", "cold-blaze", "ci", "layout", "cache-misses",
+    "release-speed", "big-crate", "cold-blaze", "ci", "restart", "layout", "cache-misses",
 ]
+type Restart = Literal["clean", "kill9"]
 Project = Literal["nushell", "ripgrep", "ruff", "blaze"]
 type Change = tuple[str, str | None, str]
 COLD_BLAZE_SECS = 4 * 3600
 RUN_SECS = 600
+# docs/v2/plan/design/restore.md: Linux's one batched statx sweep, about 50 ms for 100k files.
+STATX_US_PER_FILE = 0.5
+GONE_SECS = 60.0
+# `blaze status`: v2's first line (blaze_cargo::cli::daemon::status_lines), v1's `daemon:` line.
+DAEMON_PID = re.compile(r"^(?:pid: |daemon: pid )(\d+)\b", re.M)
 
 PROJECTS: dict[str, dict[str, Any]] = getattr(bench, "PROJECTS")
 LET: str = getattr(bench, "LET")
@@ -161,6 +175,7 @@ class Input:
     slack: float = 4.0
     noise: float = 0.05
     critical_slack: float = 1.25
+    restart_slack_ms: float = 5.0
     self_edit: SelfEdit = SelfEdit()
     self_test: tuple[str, ...] = ()
     keep: bool = False

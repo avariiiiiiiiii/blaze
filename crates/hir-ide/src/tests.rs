@@ -14,6 +14,7 @@ mod macros;
 mod method_resolution;
 mod mir;
 mod never_type;
+mod next_solver_items;
 mod opaque_types;
 mod patterns;
 mod regression;

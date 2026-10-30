@@ -634,8 +634,9 @@ fn aarch64(r_type: u32) -> Result<How, &'static str> {
 }
 
 /// The local and undefined symbols an object's relocations add after its ELF ones.
-#[derive(Default)]
 struct Added {
+    /// The name of the unnamed ones.
+    empty: Name,
     module: Option<u32>,
     got: Option<u32>,
     /// By the ELF symbol whose size each holds.
@@ -643,15 +644,20 @@ struct Added {
 }
 
 impl Added {
+    fn new(empty: Name) -> Added {
+        Added { empty, module: None, got: None, sizes: FxHashMap::default() }
+    }
+
     fn push(symbols: &mut Vec<Symbol>, symbol: Symbol) -> u32 {
         symbols.push(symbol);
         (symbols.len() - 1) as u32
     }
 
     fn module(&mut self, symbols: &mut Vec<Symbol>) -> u32 {
+        let empty = self.empty;
         *self.module.get_or_insert_with(|| {
             Self::push(symbols, Symbol {
-                name: String::new(),
+                name: empty,
                 def: SymbolDef::Absolute(0),
                 binding: Binding::Local,
                 kind: SymbolKind::Tls,
@@ -660,24 +666,29 @@ impl Added {
         })
     }
 
-    fn got(&mut self, symbols: &mut Vec<Symbol>) -> u32 {
-        *self.got.get_or_insert_with(|| {
-            Self::push(symbols, Symbol {
-                name: "_GLOBAL_OFFSET_TABLE_".to_owned(),
-                def: SymbolDef::Undefined,
-                binding: Binding::Global,
-                kind: SymbolKind::Other,
-                hidden: false,
-            })
-        })
+    fn got(&mut self, symbols: &mut Vec<Symbol>, names: &mut Names) -> Result<u32, String> {
+        if let Some(got) = self.got {
+            return Ok(got);
+        }
+        let got = Self::push(symbols, Symbol {
+            name: names.push(GOT)?,
+            def: SymbolDef::Undefined,
+            binding: Binding::Global,
+            kind: SymbolKind::Other,
+            hidden: false,
+        });
+        self.got = Some(got);
+        Ok(got)
     }
 
-    /// A symbol whose value is the size of ELF symbol `target`, which must be this object's and
-    /// final: a weak or common one may be replaced by a bigger one elsewhere.
+    /// A symbol whose value is the size of ELF symbol `target` (`elf` is the object's ELF
+    /// symbols), which must be this object's and final: a weak or common one may be replaced
+    /// by a bigger one elsewhere.
     fn size(
         &mut self,
         symbols: &mut Vec<Symbol>,
-        sizes: &[u64],
+        names: &Names,
+        elf: &[Sym],
         target: u32,
     ) -> Result<u32, String> {
         let entry = match self.sizes.entry(target) {
@@ -689,26 +700,26 @@ impl Added {
             (SymbolDef::Undefined, _) => {
                 return Err(format!(
                     "the size of {}, which the object does not define",
-                    of.name
+                    names.at(of.name)
                 ));
             }
             (SymbolDef::Common { .. }, _) => {
                 return Err(format!(
                     "the size of common symbol {}, which is known only once the link merges it",
-                    of.name
+                    names.at(of.name)
                 ));
             }
             (_, Binding::Weak) => {
                 return Err(format!(
                     "the size of weak symbol {}, which another object may replace",
-                    of.name
+                    names.at(of.name)
                 ));
             }
             _ => {}
         }
         let symbol = Self::push(symbols, Symbol {
-            name: String::new(),
-            def: SymbolDef::Absolute(sizes[target as usize]),
+            name: self.empty,
+            def: SymbolDef::Absolute(elf[target as usize].st_size(ENDIAN)),
             binding: Binding::Local,
             kind: SymbolKind::Other,
             hidden: true,

@@ -30,7 +30,9 @@ use span::SyntaxContext;
 pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
-pub use self::storage::{SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder};
+pub use self::storage::{
+    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, WireError, WirePart,
+};
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
 

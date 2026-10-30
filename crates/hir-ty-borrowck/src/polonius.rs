@@ -268,10 +268,10 @@ fn record_variances<'db>(
                 }
             }
         }
-        TyKind::Alias(alias) => {
+        TyKind::Alias(_, alias) => {
             let variances = match alias.kind {
-                rustc_type_ir::AliasTyKind::Opaque { .. } => {
-                    super::regions::opaque_captures(ctx.db, alias.kind.def_id(), alias.args.len())
+                rustc_type_ir::AliasTyKind::Opaque { def_id } => {
+                    super::regions::opaque_captures(ctx.db, def_id, alias.args.len())
                         .map(|it| {
                             it.into_iter()
                                 .map(|captured| match captured {
@@ -294,10 +294,16 @@ fn record_variances<'db>(
         TyKind::Closure(_, args)
         | TyKind::CoroutineClosure(_, args)
         | TyKind::Coroutine(_, args)
-        | TyKind::CoroutineWitness(_, args)
-        | TyKind::FnDef(_, args) => {
+        | TyKind::CoroutineWitness(_, args) => {
             record_args(ctx, args, None, variance.xform(Variance::Invariant), directions)
         }
+        TyKind::FnDef(_, args) => record_args(
+            ctx,
+            args.no_bound_vars().unwrap(),
+            None,
+            variance.xform(Variance::Invariant),
+            directions,
+        ),
         _ => (),
     }
 }

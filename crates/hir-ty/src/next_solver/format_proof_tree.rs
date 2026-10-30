@@ -26,7 +26,7 @@ pub fn dump_proof_tree_structured<'db>(
     _span: Span,
     infcx: &InferCtxt<'db>,
 ) -> ProofTreeData {
-    let goal_eval = InspectGoal::new(infcx, 0, proof_tree, None, GoalSource::Misc);
+    let goal_eval = InspectGoal::new(infcx, 0, proof_tree, GoalSource::Misc);
     let mut serializer = ProofTreeSerializer::new(infcx);
     serializer.serialize_goal(&goal_eval)
 }

@@ -50,7 +50,7 @@ impl TokenStream<Span> {
     /// subtree, else an invisible top at `call_site` holding it. A negative number is a `-` and
     /// its magnitude, as rustc's parser takes the literal a macro makes of one.
     pub fn write_wire(&self, call_site: Span, out: &mut Vec<u8>) -> Result<(), String> {
-        let (top, contents) = match self.as_single_group() {
+        let (top, items) = match self.as_single_group() {
             Some(group) => (delimiter(group), contents(group)),
             None => (tt::Delimiter::invisible_spanned(call_site), &self.0[..]),
         };
@@ -59,7 +59,7 @@ impl TokenStream<Span> {
         frame::task(Tag::Expand, |frame| {
             let mut open: Vec<(std::slice::Iter<'_, TokenTree<Span>>, Span), &Frame> =
                 Vec::new_in(frame);
-            let mut trees = contents.iter();
+            let mut trees = items.iter();
             loop {
                 let Some(tree) = trees.next() else {
                     let Some((outer, close)) = open.pop() else { break };

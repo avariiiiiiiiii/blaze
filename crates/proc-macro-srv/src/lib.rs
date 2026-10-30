@@ -10,6 +10,7 @@
 
 #![feature(
     allocator_api,
+    allocator_ext,
     proc_macro_internals,
     proc_macro_diagnostic,
     proc_macro_span

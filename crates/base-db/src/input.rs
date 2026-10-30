@@ -725,7 +725,7 @@ pub struct Crate {
     #[returns(ref)]
     #[get(attr_files_field)]
     #[set(set_attr_files_field)]
-    attr_files: Box<[FileId]>,
+    pub(crate) attr_files: Box<[FileId]>,
     /// The lint flags its compile is given: rustc's `-A`/`-W`/`--force-warn`/`-D`/`-F` in order
     /// and `--cap-lints` (rustc_session's `lint_opts` and `lint_cap`). Read only by
     /// `hir_lint_levels`' level queries; in its content ID, which persisted results are keyed by.

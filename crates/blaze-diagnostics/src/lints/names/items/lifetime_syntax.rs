@@ -18,8 +18,9 @@
 use blaze_items::Fact;
 use hir::{InFile, ModuleDef, PathResolution};
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    AstNode, SmolStr, SyntaxKind, SyntaxNode, TextRange, TextSize,
     ast::{self, HasGenericArgs, HasName},
 };
 
@@ -30,11 +31,15 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
-/// What a lifetime resolves to: a name, or one elided lifetime (or one a nested binder owns).
+/// What a lifetime resolves to: a name (inline up to 23 bytes), or one elided lifetime (or one a
+/// nested binder owns).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 enum Res {
-    Named(String),
+    Named(SmolStr),
     Fresh(u32),
+    /// An elided lifetime of the return type outside a nested binder: what elision gives it,
+    /// known once the parameters are walked.
+    Target,
 }
 
 /// rustc's `LifetimeSyntax`.
@@ -74,7 +79,7 @@ enum Category {
 #[derive(Clone, Debug)]
 struct Info {
     res: Res,
-    name: String,
+    name: SmolStr,
     syntax: Syntax,
     source: Source,
     /// The lifetime's own span: where an implicit one would be written.
@@ -248,8 +253,9 @@ fn check(cx: &Cx<'_, '_>, item: &Item, f: &ast::Fn, anonymous_in_impl_trait: boo
 /// lifetimes, if there is one.
 fn elision(candidates: &[Vec<Res>]) -> Option<Res> {
     let mut elision: Option<Option<Res>> = None;
+    let mut distinct: SmallVec<[&Res; 4]> = SmallVec::new();
     for param in candidates {
-        let mut distinct: Vec<&Res> = Vec::new();
+        distinct.clear();
         for res in param {
             if !distinct.contains(&res) {
                 distinct.push(res);
@@ -267,27 +273,27 @@ fn elision(candidates: &[Vec<Res>]) -> Option<Res> {
 }
 
 /// Whether `ty`, a reference's referent in `self`'s type, names `Self` or the impl's self type
-/// (rustc's `find_lifetime_for_self`).
+/// (rustc's `find_lifetime_for_self`). A path is resolved only when it is not `Self` and the
+/// impl's self type names a definition.
 fn names_self(cx: &Cx<'_, '_>, ty: &SyntaxNode, impl_self: Option<&ast::Type>) -> bool {
     let impl_def = impl_self.and_then(|it| match it {
         ast::Type::PathType(p) => p.path().and_then(|p| cx.sema.resolve_path(&p)),
         _ => None,
     });
-    std::iter::once(ty.clone()).chain(ty.descendants()).filter_map(ast::PathType::cast).filter_map(|it| it.path()).any(|path| {
+    let paths = ty.descendants().filter(|it| it.kind() == SyntaxKind::PATH_TYPE).filter_map(ast::PathType::cast);
+    paths.filter_map(|it| it.path()).any(|path| {
         if path.qualifier().is_none() && path.segment().is_some_and(|it| it.self_type_token().is_some()) {
             return true;
         }
-        match (&impl_def, cx.sema.resolve_path(&path)) {
-            (Some(PathResolution::Def(a)), Some(PathResolution::Def(b))) => *a == b,
-            _ => false,
-        }
+        let Some(PathResolution::Def(def)) = &impl_def else { return false };
+        matches!(cx.sema.resolve_path(&path), Some(PathResolution::Def(it)) if it == *def)
     })
 }
 
-/// The lifetimes binders inside a type own, and whether elision is its own there.
-#[derive(Clone, Default)]
+/// Whether elision is its own where a type is, and that type: a copy per node (the lifetimes
+/// `for<..>` binders own are on [`Walk::bound`]).
+#[derive(Clone, Copy, Default)]
 struct Scope {
-    bound: Vec<String>,
     /// In a `fn` type or `Fn(..)` sugar, which elide on their own.
     nested: bool,
     /// In an `impl Trait` of a parameter, whose elided lifetimes elision does not count.
@@ -301,7 +307,7 @@ struct Scope {
 struct Walked {
     infos: Vec<Info>,
     candidates: Vec<Res>,
-    /// Each reference's referent and lifetime.
+    /// Each reference's referent and lifetime, when [`Walk::refs`] asks for them.
     refs: Vec<(SyntaxNode, Res)>,
 }
 
@@ -309,9 +315,13 @@ struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     fresh: u32,
     anonymous_in_impl_trait: bool,
-    /// What the return type's elided lifetimes resolve to.
-    target: Option<Res>,
+    /// The lifetimes the `for<..>` binders around the node being walked own, innermost last.
+    bound: Vec<SmolStr>,
+    /// Walking the return type: its elided lifetimes outside a nested binder are
+    /// [`Res::Target`].
     output: bool,
+    /// Recording each reference's referent: only `self`'s type needs them.
+    refs: bool,
 }
 
 impl Walk<'_, '_, '_> {
@@ -321,23 +331,23 @@ impl Walk<'_, '_, '_> {
     }
 
     /// What an elided lifetime resolves to at `scope`: its own, or in the return type outside
-    /// a nested binder what elision gives (none when it fails: E0106).
+    /// a nested binder what elision gives.
     fn elided(&mut self, scope: &Scope) -> Option<Res> {
         if self.output && !scope.nested {
-            return self.target.clone();
+            return Some(Res::Target);
         }
         self.fresh()
     }
 
     fn named(&mut self, lifetime: &ast::Lifetime, scope: &Scope) -> Option<Res> {
-        let name = lifetime.text().to_string();
+        let name = lifetime.text();
         if name == "'_" {
             return self.elided(scope);
         }
-        if scope.bound.contains(&name) {
+        if self.bound.iter().any(|it| it == name) {
             return self.fresh();
         }
-        Some(Res::Named(name))
+        Some(Res::Named(SmolStr::new(name)))
     }
 
     /// Whether elision counts `res` written at `scope` as a lifetime of its parameter.

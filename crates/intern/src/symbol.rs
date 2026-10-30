@@ -72,6 +72,7 @@ fn shape() -> Shape {
         static_bytes: |id| symbols::TEXTS[id as usize - 1].str.as_bytes(),
         key: order_key,
         align: 1,
+        size: 1,
         text: true,
     }
 }
@@ -108,13 +109,7 @@ pub fn restore_symbols<S: Stable>(image: Arc<Image<S>>) -> Result<(), RestoreErr
 }
 
 fn restore_into<S: Stable>(cell: &OnceLock<Table>, image: &'static Image<S>) -> Result<(), RestoreError> {
-    let started = RestoreError::Started { section: SectionId::SYMBOLS };
-    if cell.get().is_some() {
-        return Err(started);
-    }
-    let section = image.section(SectionId::SYMBOLS, symbols_schema())?;
-    let table = Table::restore(shape(), image, &section)?;
-    cell.set(table).map_err(|_| started)
+    Table::restore_into(cell, shape(), image, SectionId::SYMBOLS, symbols_schema())
 }
 
 /// Writes the symbol section into `builder`: every symbol `live` marks at its ID, every other

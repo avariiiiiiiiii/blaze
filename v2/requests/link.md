@@ -933,6 +933,19 @@ switch both targets' reads to them, each platform in {1, 2, 6} for `.tbd`.
 > (`suffixes_of_one_string`: 640 entries naming one 4096-byte string from offsets 0 to 639),
 > so its allocation check reports it until item 14.
 
+> applied by requests (child requests-link-fuzz): the `.tbd` reference reader is
+> `crates/blaze-link/src/macho/tbd/reference.rs` (with `Owned` and `owned`), the trie walk
+> `reference_trie_exports`, `Owned` and `test_sections` are beside `trie_exports` in
+> `macho/dylib.rs`, all `#[cfg(any(test, feature = "fuzz"))]`, and `macho::core_name` is too.
+> `lib.rs` has `fuzz_tbd_differential` and `fuzz_trie_differential` beside `fuzz_read`
+> (`#[cfg(feature = "fuzz")]`, `#[doc(hidden)]`, item 13's signatures and doc comments), calling
+> `macho/tbd.rs` `differential` and `macho/dylib.rs` `trie_differential`. The `.tbd` entry returns
+> `Ok(false)` without running the reference when the reader refuses nesting past `DEPTH` (256),
+> because the reference recurses once per level with no bound. It checks the arena with a
+> non-panicking `arena_exact` (each name in the arena, no versions, bytes equal). The trie entry
+> returns `Ok(false)` for an empty trie, which `read_dylib` never walks and which would index
+> `trie_exports`'s `seen` out of bounds. Nothing has been compiled.
+
 ## 14. From speed-link-edge-macho: a suffix of a pushed name (`model.rs` `Names`)
 
 Status: open, does not block. For lead `link`.

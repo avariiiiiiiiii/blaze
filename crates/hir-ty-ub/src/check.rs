@@ -159,7 +159,7 @@ impl Default for Config {
 }
 
 /// What a test did under the checker.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     /// Every schedule ran to the end with no undefined behavior.
     Passed { schedules: u32 },
@@ -221,13 +221,16 @@ impl<'db> Checker<'db> {
             at: SiteId::START,
             thread: ThreadId::MAIN,
             main_exited: false,
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             made_at: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             freed_at: Vec::new(),
             leaks: config.leaks,
             loaded: None,
             overwrote_init: false,
             found: None,
             unsupported: None,
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             runnable: Vec::new(),
         }
     }
@@ -585,6 +588,7 @@ impl<'db> Machine<'db> for Checker<'db> {
     fn spawn(&mut self, thread: EvalThread) -> MResult<()> {
         let child = self.races.spawn();
         if child != ThreadId(thread) {
+            // alloc: error path: the message of a failure.
             return Err(self.stop_unsupported(format!(
                 "the evaluator numbered a new thread {thread}, the race detector {}: both count \
                  threads in creation order from the main thread's 0",
@@ -660,10 +664,12 @@ impl<'db> Machine<'db> for Checker<'db> {
 
 /// Runs the test `test` (a `fn()`) under the checker, once per schedule of `config`, and says
 /// what the first schedule that did not pass found.
+// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
 pub fn run_test<'db>(db: &'db dyn HirDatabase, test: FunctionId, config: &Config) -> Outcome {
     let krate = test.krate(db);
     let ptr_size = match db.target_data_layout(krate) {
         Ok(target) => target.pointer_size().bytes(),
+        // alloc: the edge: the outcome of a run.
         Err(e) => return Outcome::Error { message: format!("no target data layout: {e:?}"), seed: config.seed },
     };
     let schedules = config.schedules.max(1);
@@ -682,12 +688,15 @@ pub fn run_test<'db>(db: &'db dyn HirDatabase, test: FunctionId, config: &Config
 
 /// The outcome of one schedule; `None` when it passed.
 fn outcome<'db>(
+    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
     db: &'db dyn HirDatabase,
     checker: &Checker<'db>,
     result: Result<(), MirEvalError<'db>>,
     seed: u64,
 ) -> Option<Outcome> {
+    // clone: the edge: the outcome of a run.
     let found = checker.found.clone();
+    // alloc: the edge: the outcome of a run.
     let mut stack = Vec::new();
     let error = match &result {
         Ok(()) => None,
@@ -698,18 +707,24 @@ fn outcome<'db>(
         return Some(Outcome::Ub { found, report, seed });
     }
     if let Some(what) = &checker.unsupported {
+        // clone: the edge: the outcome of a run.
         return Some(Outcome::Unsupported { what: what.clone() });
     }
     Some(match error? {
+        // clone: the edge: the outcome of a run.
         MirEvalError::Panic(message) => Outcome::Failed { message: message.clone(), seed },
+        // clone: the edge: the outcome of a run.
         MirEvalError::NotSupported(what) => Outcome::Unsupported { what: what.clone() },
         MirEvalError::MachineStop => Outcome::Error {
+            // alloc: the edge: the outcome of a run.
             message: "the evaluator stopped for the checker, which recorded nothing".to_owned(),
             seed,
         },
         MirEvalError::UndefinedBehavior(what) => {
+            // alloc: the edge: the outcome of a run.
             Outcome::Error { message: format!("Undefined Behavior (found by the evaluator): {what}"), seed }
         }
+        // alloc: the edge: the outcome of a run.
         other => Outcome::Error { message: format!("{other:?}"), seed },
     })
 }
@@ -719,6 +734,7 @@ pub(crate) type Frame<'db> = (either::Either<FunctionId, hir_ty::db::InternedClo
 
 /// The error under `InFunction`s, with their frames innermost first in `stack`.
 fn innermost<'e, 'db>(mut error: &'e MirEvalError<'db>, stack: &mut Vec<Frame<'db>>) -> &'e MirEvalError<'db> {
+    // alloc: the edge: the outcome of a run.
     let mut levels = Vec::new();
     while let MirEvalError::InFunction(inner, frames) = error {
         levels.push(frames);

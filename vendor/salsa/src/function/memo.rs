@@ -223,6 +223,10 @@ pub(super) struct MemoHeader {
     pub(super) revisions: QueryRevisions,
 }
 
+/// data.md's memo budget: 24 bytes, plus 4 an edge in the graph's edge array.
+#[cfg(all(not(feature = "shuttle"), target_pointer_width = "64"))]
+const _: () = assert!(size_of::<MemoHeader>() == 24);
+
 impl MemoHeader {
     fn new(revision_now: Revision, revisions: QueryRevisions) -> Self {
         debug_assert!(

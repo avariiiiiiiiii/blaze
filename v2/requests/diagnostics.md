@@ -459,6 +459,7 @@ The lints are found by `lints/syntax/early/lexer.rs` from the text, so they don'
 these fixes; the hard errors and macro matching do.
 
 > forwarded to format: `crates/parser/src/lexed_str.rs` is lane format's; lane format is still running.
+> applied: by format-lexer in `crates/parser/src/lexed_str.rs` (`Converter::extend_token`, once per token; the SIMD fast path in `lexed_str/scan.rs` already hands every prefixed, quoted and `'` token to `rustc_lexer`, so it is unchanged). 1: `UnknownPrefix` / `UnknownPrefixLifetime` give rustc's "prefix `z` is unknown" (`'foo` for a lifetime) only from 2021, and the prefix is the token it spells in every edition (`if"x"` is `if` then the string, as rustc's `self.ident`); r-a's "unknown literal prefix … (note: check for unterminated string literal)" heuristic is gone. 2: before 2021 `c"…"` is `IDENT c` and `cr"…"`/`cr#"…"#` is `IDENT cr`, then the rest lexed again (`#"…"#` is `#`, the string, `#`, as rustc). 3: before 2021 `'r#a` is `'r`, `#`, `a`; from 2021 the raw lifetime gets rustc's "character literal may only contain one codepoint" (a `'` right after it) and "`_` cannot be a raw lifetime", and a raw identifier "`self` cannot be a raw identifier" (`can_be_raw`). `LexedStr::single_token` is `None` when an edition splits the text. Tests: `lexed_str.rs` `unknown_prefixes_are_errors_from_2021`, `c_strings_are_split_before_2021`, `raw_lifetimes_are_split_before_2021`, `path_keywords_cannot_be_raw_identifiers`; `test_data/lexer/ok/prefixes_edition_2018.rs`, `test_data/lexer/err/prefixes_edition_2021.rs`; `crates/parser/src/tests.rs` `a_raw_lifetime_and_a_c_string_are_split_before_2021` (three-tokens.rs's matcher in the tree). The new messages reach `lower/parse.rs` `lexer_error`'s pass-through arm as rustc's text; its note and suggestion (`UnknownPrefixSugg`) are diagnostics'.
 
 ## diagnostics-lints-syntax-early-lexer: identifiers made by `${concat(..)}` (db, `crates/hir-expand` mbe)
 
@@ -796,6 +797,7 @@ Also: the table is from the July checkout, not `nightly-2026-10-27`; regenerate 
      `a_labeled_break_of_an_unlabeled_loop_is_linted_after_the_parse_errors`.
 
 > forwarded to diagnostics: 1, 2 and 4 are its own (`lower/incorrect_case.rs`, the parent's assignments). > forwarded to db: 3 (`crates/hir-expand/`). > forwarded to format: 4's `LabeledLoopInBreak` (`crates/parser`).
+> applied: by format-lexer, 4's `LabeledLoopInBreak`, in `crates/parser/src/grammar/expressions/atom.rs` `break_expr` (rustc's `parse_expr_break`): `break 'a: loop {}` (and `while`, `for`, a block) is an unlabeled `BREAK_EXPR` whose value is the labeled `LOOP_EXPR`/`WHILE_EXPR`/`FOR_EXPR`/`BLOCK_EXPR` (the label arm of `atom_expr` is now `labeled_expr`, shared), with the parser error "parentheses are required around this expression to avoid confusion with a labeled break expression" at the end of that value. Lowering it to rustc's span (the `BREAK_EXPR`'s value, which ends at the error's offset), the "wrap the expression in parentheses" suggestion and recovery (rustc goes on) is a `parser_error` arm in `lower/parse.rs`, diagnostics'. Tests: `crates/parser/src/tests.rs` `a_break_of_a_labeled_loop_takes_it_as_its_value`, `every_labeled_value_of_a_break_is_parenthesized`.
 
 ## diagnostics-lints-mir-matches: what match checking gives, as rustc gives it (db, `crates/hir-ide/src/diagnostics/expr.rs`, `match_check.rs`, `match_check/pat_analysis.rs`, `crates/hir/src/diagnostics.rs`)
 
@@ -1980,6 +1982,7 @@ and matches how `rustc_skip_during_method_dispatch` is read. Optional: the lint 
 without it.
 
 > forwarded to db (`hir-def/src/attrs.rs`).
+> applied by db-expand: `AttrFlags::RUSTC_INSIGNIFICANT_DTOR` (bit 73), set for the one-segment word, `cfg_attr` expanded. Test `rustc_words_are_flags` (`attrs/tests.rs`).
 
 ## diagnostics-lints-levels: a lint's `LintId` on `Found` (`lower/mod.rs`, `diagnostics`)
 
@@ -2023,6 +2026,7 @@ pointer against symbols each pass interns once. The reverse map is still wanted.
 
 > for: db (1, 2), diagnostics (3).
 > forwarded to db: the asks are of `crates/hir-def/` attrs and type checking (lane db).
+> applied by db-expand: item 2. `AttrFlags::{RUSTC_AS_PTR, RUSTC_NO_IMPLICIT_AUTOREFS, RUSTC_NEVER_RETURNS_NULL_PTR}` (bits 74-76), one-segment words as `pointers::has_attr` reads them. Test `rustc_words_are_flags`. Item 1 (`expr_store/scope.rs`) is format's file.
 
 ## diagnostics-lints-names-imports: what name resolution's lints need recorded (crates/hir-def `nameres`, `item_scope.rs`; crates/blaze-diagnostics `model.rs`, `lints/syntax.rs`)
 
@@ -2082,6 +2086,7 @@ below replaces a guess with a record, or lets a lint that is now never emitted b
 > forwarded to db: `crates/hir-def` `nameres` and `item_scope` are lane db's.
 > applied (6), diagnostics-lints-syntax: `Walk::place(cx, at, pass)` is `pub(crate)`; `Places` in
 > `lints/names/imports.rs` can call it and be removed.
+> applied by db-expand: item 4. `ModuleId::prelude(db) -> Option<(ModuleId, Option<UseId>)>`, `ModuleId::extern_prelude(db)` (name, crate root, `extern crate`) and `ModuleId::macro_use_prelude(db)`: the crate's, as the resolver reads them for any of its modules, blocks included. Items 1, 2, 3 and 7 are dispatch task 12's other parts, still open.
 
 ## diagnostics-items-features: what `checks/features*` needs from its siblings, the driver and hir
 
@@ -2418,6 +2423,7 @@ foreign function whose symbol the crate defines, in the crates enabling `rustc_a
 makes that a bit test with no parse.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's.
+> applied by db-expand: `AttrFlags::RUSTC_CANONICAL_SYMBOL` (bit 77), the one-segment word. It is read through `AttrFlags::query(db, FunctionId.into())`, the foreign function's own attributes. Test `rustc_words_are_flags`.
 
 ## diagnostics-items-attrs: the signature of a proc macro function (hir-ty, `crates/hir`)
 
@@ -2564,3 +2570,90 @@ impl's `unconditional_recursion` run on every body, not only on those of consts.
   `run`'s true (from cargo's `--emit`, if `CommandLine::parse` is given rustc's arguments).
 
 > forwarded to diagnostics (the parent, `src/tests.rs`).
+
+## frontend-text: `emit.rs`'s line starts on `span::LineIndex` (frontend.md item 6; 2026-10-29)
+
+`span::LineIndex` is new (lane `frontend-text`, `crates/span/src/lines.rs`, exported from
+`span`): a bitmap of a text's `\n` bytes made with SIMD (AVX-512BW/AVX2/SSE2/NEON, chosen at run
+time, each checked against the scalar path) and a rank table per 512 bytes. `line(at)` is one
+rank (a table load and at most eight popcounts of one cache line), `line_start(line)` one select;
+a text ending in `\n` has no line after it, as rustc's `analyze_source_file` and `File::new`
+here have it. It is the front end's one line index (base-db's `line_index` query, hir-expand's
+`line!`/`column!`, hir-ty-mir's caller locations); this moves emit's `File` onto it so every
+place a line is found is the same code. `blaze-diagnostics` already depends on `span`.
+
+File: `crates/blaze-diagnostics/src/emit.rs`.
+
+- `struct File`: `lines: Vec<u32>,` -> `lines: span::LineIndex,`, and in its doc comment
+  "4 bytes a line and 8 a `\r\n` besides; placing a byte is a binary search of the lines" ->
+  "an eighth of a byte per byte of text for its lines ([`span::LineIndex`]) and 8 bytes a
+  `\r\n`; placing a byte is a rank of the newline bitmap".
+- `File::new`: replace
+
+  ```rust
+        let bytes = text.as_bytes();
+        let mut lines = Vec::with_capacity(memchr::memchr_iter(b'\n', bytes).count() + 1);
+        lines.push(0);
+        lines.extend(
+            memchr::memchr_iter(b'\n', bytes)
+                .map(|at| at as u32 + 1)
+                .filter(|it| (*it as usize) < bytes.len()),
+        );
+        let ascii = text.is_ascii();
+  ```
+
+  with
+
+  ```rust
+        let lines = span::LineIndex::new(&text);
+        let ascii = text.is_ascii();
+  ```
+
+- `line_of`:
+
+  ```rust
+    fn line_of(&self, at: usize) -> usize {
+        let at = span::TextSize::new(at.min(self.text.len()) as u32);
+        self.lines.line(at).expect("an offset up to the text's end") as usize
+    }
+  ```
+
+- `line_bounds`:
+
+  ```rust
+    fn line_bounds(&self, line: usize) -> std::ops::Range<usize> {
+        let start_of = |line: usize| {
+            u32::try_from(line)
+                .ok()
+                .and_then(|line| self.lines.line_start(line))
+                .map_or(self.text.len(), usize::from)
+        };
+        start_of(line)..start_of(line + 1)
+    }
+  ```
+
+- `position`: `let start = self.lines[line] as usize;` -> `let start = self.line_bounds(line).start;`
+- Tests: in `a_file_is_measured_as_rustc_has_it_without_its_bom_and_crs` and
+  `a_trailing_newline_starts_no_line`, `assert_eq!(file.lines, [..])` ->
+  `assert_eq!(starts(&file), [..])` with, in `mod tests`,
+
+  ```rust
+    fn starts(file: &File) -> Vec<u32> {
+        (0..file.lines.line_count()).map(|line| file.lines.line_start(line).unwrap().into()).collect()
+    }
+  ```
+
+- Module doc: "its `analyze_source_file` finds lines 16 bytes at a time with SSE2, where
+  `memchr` picks AVX2, SSE2 or NEON at run time" -> "its `analyze_source_file` finds lines 16
+  bytes at a time with SSE2, where `span::LineIndex` makes its newline bitmap 64 bytes at a time
+  with AVX-512BW, AVX2, SSE2 or NEON, picked at run time". `memchr` stays (the `\r\n` search).
+
+Same lines everywhere: `line_count` is one more than the newlines less one for a final `\n`,
+which is the old `Vec`'s length (it dropped a start at the text's end); `line(at)` is the newlines
+before `at`, but the text's end after a final `\n` is on the line that `\n` ends, which is the
+old `partition_point(..) - 1`; `line_start(n)` is `None` exactly where `self.lines.get(n)` was,
+so `line_bounds` is unchanged. `norm` already clamps to the text's length, and `line_of`'s
+`min` keeps any other caller in range, so the `expect` cannot fire. The text has had its byte
+order mark and `\r`s taken out, so none of `LineIndex::place`'s rustc rules apply here, and
+`line`/`line_start` don't use them.
+Status: open

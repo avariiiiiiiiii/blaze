@@ -255,6 +255,13 @@ impl Effect {
 pub enum Address {
     /// A Unix socket under the driver's root, made with mode 0600.
     Unix(FileName),
+    /// The listening Unix socket a service manager (systemd, launchd) passed the process as
+    /// `fd`, bound at `at` under the driver's root. Listened on through a close-on-exec copy
+    /// of the descriptor once it is a listening stream socket bound there; else the listen
+    /// fails naming what it is. `fd` stays its passer's, and the socket's file the manager's:
+    /// it is never removed. Listened on only: a connect to it fails (connect to
+    /// [`Address::Unix`] of `at`).
+    Inherited { fd: i32, at: FileName },
     Tcp(std::net::SocketAddr),
 }
 

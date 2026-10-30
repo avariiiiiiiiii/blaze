@@ -97,6 +97,25 @@ Work: S schedules of a test, each a full run of time T.
   schedules, splitting the seeds is the runner's job (`blaze test --ub`, lane cargo), and
   the call above is how it does it.
 
+### Memory by lifetime ([memory.md](../../design/memory.md))
+
+The checker's warm loop is the hooks above, and they make no allocation once an allocation's
+columns, a type's plan and a site exist (`tests/ub/budget.rs`). What it does allocate, by
+lifetime:
+
+- **A schedule** (one `Checker`): the per-allocation columns (`made_at`, `freed_at`), the
+  runnable list, and the parts' tables. These grow to the run's high-water mark and are
+  dropped with the checker. They belong in the request arena of the test run, with its own
+  tag (`ub`).
+- **A test** (one `run_test`): `Plans` and its scratch buffers, kept across the test's
+  schedules. They also belong in the test run's request arena. They can't outlive the
+  database revision, because they hold `Ty<'db>`.
+- **A failure:** the report's strings and the `Outcome`. These come from the general-purpose
+  allocator, once per failing test, at the edge.
+
+When `blaze-mem` lands, these columns move onto its arena and pool types. Until then they
+are `Vec`s grown by doubling, which allocate O(log n) times per run.
+
 ### What `proof` should measure
 
 - ns per `step`, per access, and per typed copy against the bounds above;

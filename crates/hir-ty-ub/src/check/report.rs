@@ -22,8 +22,10 @@ use crate::{
     ub::{Found, Ub},
 };
 
+// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
 pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, found: &Found, stack: &[Frame<'db>]) -> String {
     let r = Report { db, checker };
+    // alloc: the edge: the report of a failure.
     let mut out = String::new();
     let _ = writeln!(out, "error: {}", found.ub);
     r.at(&mut out, found.at);
@@ -68,7 +70,9 @@ pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, foun
         let _ = writeln!(out, "   = note: BACKTRACE on thread `{}`:", checker.races.thread_display_name(found.thread));
         for &(func, span, owner) in stack {
             let name = match func {
+                // alloc: the edge: the report of a failure.
                 Either::Left(func) => FunctionSignature::of(db, func).name.as_str().to_owned(),
+                // alloc: the edge: the report of a failure.
                 Either::Right(_) => "closure".to_owned(),
             };
             match r.place(owner, span) {
@@ -91,6 +95,7 @@ fn site_of(column: &[SiteId], alloc: AllocId) -> SiteId {
 }
 
 struct Report<'a, 'db> {
+    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
     db: &'db dyn HirDatabase,
     checker: &'a Checker<'db>,
 }
@@ -129,13 +134,16 @@ impl<'db> Report<'_, 'db> {
         let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
         let root = db.source_root(db.file_source_root(file).source_root_id(db));
         Some(match root.source_root_ref(db).path_for_file(&file) {
+            // alloc: the edge: the report of a failure.
             Some(path) => format!("{path}:{line}:{column}"),
+            // alloc: the edge: the report of a failure.
             None => format!("{file:?}:{line}:{column}"),
         })
     }
 }
 
 /// The file and range of `span` in the body of `def` (as hir-ide's `mir_pretty::errors`).
+// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
 fn source_range(db: &dyn HirDatabase, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId, TextRange)> {
     let (source_map, self_param_syntax) = match def {
         InferBodyId::DefWithBodyId(def) => {

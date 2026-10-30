@@ -74,10 +74,16 @@ pub struct Obligation<'db, T> {
     /// If this goes over a certain threshold, we abort compilation --
     /// in such cases, we can not say whether or not the predicate
     /// holds for certain. Stupid halting problem; such a drag.
+    ///
+    /// `u32`: fulfillment stops an obligation once this passes the crate's `recursion_limit`,
+    /// itself a `u32`.
     #[type_foldable(identity)]
     #[type_visitable(ignore)]
-    pub recursion_depth: usize,
+    pub recursion_depth: u32,
 }
+
+// `PredicateObligation` is moved per nested goal. Make sure it doesn't unintentionally get bigger.
+const _: () = assert!(size_of::<PredicateObligation<'static>>() == 20);
 
 /// A callback that can be provided to `inspect_typeck`. Invoked on evaluation
 /// of root obligations.
@@ -187,14 +193,14 @@ impl<'db, O> Obligation<'db, O> {
     ///
     /// To deal with this evaluate and fulfill explicitly update the depth
     /// of nested obligations using this function.
-    pub fn set_depth_from_parent(&mut self, parent_depth: usize) {
+    pub fn set_depth_from_parent(&mut self, parent_depth: u32) {
         self.recursion_depth = cmp::max(parent_depth + 1, self.recursion_depth);
     }
 
     pub fn with_depth(
         interner: DbInterner<'db>,
         cause: ObligationCause,
-        recursion_depth: usize,
+        recursion_depth: u32,
         param_env: ParamEnv<'db>,
         predicate: impl Upcast<DbInterner<'db>, O>,
     ) -> Obligation<'db, O> {

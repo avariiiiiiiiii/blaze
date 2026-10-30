@@ -1,3 +1,4 @@
+mod alloc;
 mod body;
 mod invalidation;
 mod outline;

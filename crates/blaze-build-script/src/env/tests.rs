@@ -578,9 +578,14 @@ fn the_sorted_environment_is_the_one_built_before() {
                 _ => "/p/foo/target/debug/x".into(),
             })
             .collect();
-        let inherited: Vec<(OsString, OsString)> = (0..next(9))
+        let mut inherited: Vec<(OsString, OsString)> = (0..next(9))
             .map(|_| (names[next(names.len())].into(), values[next(values.len())].into()))
             .collect();
+        // Half the time as a caller that sorts it once passes it: by name, each name once.
+        if next(2) == 0 {
+            inherited.sort_by(|a, b| a.0.cmp(&b.0));
+            inherited.dedup_by(|later, first| later.0 == first.0);
+        }
         match (env(&unit, &inherited), reference::env(&unit, &inherited)) {
             (Ok(new), Ok((vars, from_unit))) => {
                 assert_eq!(

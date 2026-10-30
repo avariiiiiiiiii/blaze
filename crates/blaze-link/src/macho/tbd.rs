@@ -23,6 +23,9 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
 
+#[cfg(any(test, feature = "fuzz"))]
+mod reference;
+
 /// A text-based stub (`.tbd`, as the macOS SDK ships `libSystem.tbd`) for `arch` on
 /// `platform` (`LC_BUILD_VERSION`'s number: 1 macOS, 2 iOS, 3 tvOS, 4 watchOS, 6 Mac
 /// Catalyst, 7 iOS simulator, 8 tvOS simulator, 9 watchOS simulator, 11 visionOS,
@@ -1624,6 +1627,56 @@ impl Flow<'_> {
         (self.piece, self.at) = (piece, at);
         char::from_u32(code).ok_or_else(|| self.error("an escape of no character"))
     }
+}
+
+/// [`read`] against the reference reader (`crate::fuzz_tbd_differential`).
+#[cfg(feature = "fuzz")]
+pub(crate) fn differential(text: &str, arch: Arch, platform: u32) -> Result<bool, String> {
+    let new = read("t.tbd", text, arch, platform);
+    // The reference recurses once per level with no bound: past the reader's it is not run.
+    let nested = format!("collections nested deeper than {DEPTH}");
+    if matches!(&new, Err(what) if what.contains(&nested)) {
+        return Ok(false);
+    }
+    let old = reference::read("t.tbd", text, arch, platform).map(|it| (it.symbols, it.name, it.inputs));
+    let new = match new {
+        Ok(shared) => {
+            if let Err(what) = arena_exact(&shared) {
+                return Err(format!(
+                    "{arch:?} platform {platform}: the reader's arena is not exact ({what}): {shared:?}\n\
+                     the reference: {old:?}"
+                ));
+            }
+            Ok((reference::owned(&shared), shared.name, shared.inputs))
+        }
+        Err(what) => Err(what),
+    };
+    if new == old {
+        Ok(new.is_ok())
+    } else {
+        Err(format!("{arch:?} platform {platform}: the reader: {new:?}\nthe reference: {old:?}"))
+    }
+}
+
+/// Every name of `shared` is one [`Names::push`] of the arena, back to back: the arena holds
+/// each kept name's bytes once and nothing else, and no symbol has a version.
+#[cfg(feature = "fuzz")]
+fn arena_exact(shared: &Shared) -> Result<(), String> {
+    let mut bytes = 0;
+    for symbol in &shared.symbols {
+        let name = shared.names.get(symbol.name).ok_or_else(|| format!("{:?} is not a name of the arena", symbol.name))?;
+        if symbol.version.is_some() {
+            return Err(format!("`{name}` has a version"));
+        }
+        bytes += name.len();
+    }
+    if shared.names.bytes() != bytes {
+        return Err(format!("the arena holds {} bytes and its names {bytes}", shared.names.bytes()));
+    }
+    if !shared.versions.is_empty() {
+        return Err(format!("versions {:?}", shared.versions));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

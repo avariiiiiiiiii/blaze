@@ -773,9 +773,27 @@ mod tests {
     #[test]
     fn small_cache_does_not_allocate() {
         let mut cache = GeneralizeCache::<u32, u32>::default();
-        for i in 0..CACHE_INLINE as u32 {
+        blaze_alloc_count::assert_at_most(0, "generalize cache below the spill", || {
+            for i in 0..CACHE_INLINE as u32 {
+                assert_eq!(cache.get(&i), None);
+                cache.insert(i, i);
+                assert_eq!(cache.get(&i), Some(i));
+            }
+        });
+        assert_eq!(cache.spill.capacity(), 0);
+    }
+
+    #[test]
+    fn cache_hits_after_spill_do_not_allocate() {
+        let mut cache = GeneralizeCache::<u32, u32>::default();
+        let n = CACHE_INLINE as u32 * 4;
+        for i in 0..n {
             cache.insert(i, i);
         }
-        assert_eq!(cache.spill.capacity(), 0);
+        blaze_alloc_count::assert_at_most(0, "generalize cache hits", || {
+            for i in 0..n {
+                assert_eq!(cache.get(&i), Some(i));
+            }
+        });
     }
 }

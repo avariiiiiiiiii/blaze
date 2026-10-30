@@ -2,25 +2,27 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::range::RangeInclusive;
 use std::sync::Arc;
 
 pub use BoundRegionConversionTime::*;
 use hir_def::{GenericParamId, TraitId};
 use opaque_types::{OpaqueHiddenType, OpaqueTypeStorage};
-use region_constraints::{RegionConstraintCollector, RegionConstraintStorage};
+use region_constraints::{
+    RegionConstraintCollector, RegionConstraintStorage, SolverRegionConstraint,
+};
 use rustc_next_trait_solver::solve::{GoalEvaluation, SolverDelegateEvalExt};
 use rustc_type_ir::{
-    ClosureKind, ConstVid, FloatVarValue, FloatVid, GenericArgKind, InferConst, InferTy,
-    IntVarValue, IntVid, OutlivesPredicate, RegionVid, TermKind, TyVid, TypeFoldable, TypeFolder,
-    TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    AliasTermKind, CanonicalizerState, ClosureKind, ConstVid, FloatVarValue, FloatVid, InferConst,
+    InferTy, IntVarValue, IntVid, OutlivesClause, RegionVid, TermKind, TyVid, TypeFoldable,
+    TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
     error::{ExpectedFound, TypeError},
-    inherent::{
-        Const as _, GenericArg as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _,
-    },
+    inherent::{GenericArg as _, GenericArgs as _, IntoKind, SliceLike, Term as _, Ty as _},
+    region_constraint::Assumptions,
 };
 use rustc_type_ir::{
     Upcast,
-    solve::{NoSolution, VisibleForLeakCheck, inspect},
+    solve::{NoSolution, TyOrConstInferVar, VisibleForLeakCheck, inspect},
 };
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
@@ -32,8 +34,8 @@ pub use crate::next_solver::infer::traits::ObligationInspector;
 use crate::{
     Span,
     next_solver::{
-        ArgOutlivesPredicate, BoundConst, BoundRegion, BoundTy, BoundVariableKind, Goal, Predicate,
-        SolverContext,
+        ArgOutlivesClause, BoundConst, BoundRegion, BoundTy, BoundVariableKind, FxIndexMap, Goal,
+        NextSolverOverflow, Predicate, SolverContext,
         fold::BoundVarReplacerDelegate,
         infer::{at::ToTrace, select::EvaluationResult, traits::PredicateObligation},
         obligation_ctxt::ObligationCtxt,
@@ -43,7 +45,7 @@ use crate::{
 use super::{
     AliasTerm, Binder, CanonicalQueryInput, CanonicalVarValues, Const, ConstKind, DbInterner,
     ErrorGuaranteed, GenericArg, GenericArgs, OpaqueTypeKey, ParamEnv, PolyCoercePredicate,
-    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesPredicate,
+    PolyExistentialProjection, PolyExistentialTraitRef, PolyFnSig, PolyRegionOutlivesClause,
     PolySubtypePredicate, Region, SolverDefId, SubtypePredicate, Term, TraitRef, Ty, TyKind,
     TypingMode,
 };
@@ -151,7 +153,7 @@ pub struct InferCtxtInner<'db> {
     /// are deduced from the well-formedness of the witness's types, and are
     /// necessary because of the way we anonymize the regions in a coroutine,
     /// which may cause types to no longer be considered well-formed.
-    region_assumptions: Vec<ArgOutlivesPredicate<'db>>,
+    region_assumptions: Vec<ArgOutlivesClause<'db>>,
 
     /// Caches for opaque type inference.
     pub(crate) opaque_type_storage: OpaqueTypeStorage<'db>,
@@ -223,7 +225,6 @@ impl<'db> InferCtxtInner<'db> {
     }
 }
 
-#[derive(Clone)]
 pub struct InferCtxt<'db> {
     pub interner: DbInterner<'db>,
 
@@ -253,7 +254,30 @@ pub struct InferCtxt<'db> {
     /// bound.
     universe: Cell<UniverseIndex>,
 
+    /// The assumed well-formedness facts of each universe entered for a binder, from which the
+    /// solver derives the implied bounds of a `for<...>` (rustc's
+    /// `placeholder_assumptions_for_next_solver`). Like `universe`, not rolled back by snapshots.
+    placeholder_assumptions: RefCell<FxIndexMap<UniverseIndex, Assumptions<DbInterner<'db>>>>,
+
+    /// Whether a root goal that overflows is evaluated again with twice the recursion limit,
+    /// reporting rustc's `recursion_depth_exceeding_limit` warning when that holds. Off while such
+    /// a warning is being built, so it does not trigger itself.
+    enable_next_solver_overflow_fcw: Cell<bool>,
+
+    /// The goals that held only with the doubled recursion limit, for the caller to report.
+    next_solver_overflows: RefCell<Vec<NextSolverOverflow<'db>>>,
+
     obligation_inspector: Cell<Option<ObligationInspector<'db>>>,
+
+    /// Reused by each new canonicalizer, then cleared but not freed, so canonicalizing does not
+    /// allocate its tables anew each time.
+    pub(crate) canonicalizer_state: RefCell<CanonicalizerState<DbInterner<'db>>>,
+}
+
+impl<'db> Clone for InferCtxt<'db> {
+    fn clone(&self) -> Self {
+        self.fork()
+    }
 }
 
 /// See the `error_reporting` module for more details.
@@ -313,6 +337,7 @@ pub struct TypeOutlivesConstraint<'db> {
 /// Used to configure inference contexts before their creation.
 pub struct InferCtxtBuilder<'db> {
     interner: DbInterner<'db>,
+    enable_next_solver_overflow_fcw: bool,
 }
 
 pub trait DbInternerInferExt<'db> {
@@ -321,11 +346,17 @@ pub trait DbInternerInferExt<'db> {
 
 impl<'db> DbInternerInferExt<'db> for DbInterner<'db> {
     fn infer_ctxt(self) -> InferCtxtBuilder<'db> {
-        InferCtxtBuilder { interner: self }
+        InferCtxtBuilder { interner: self, enable_next_solver_overflow_fcw: true }
     }
 }
 
 impl<'db> InferCtxtBuilder<'db> {
+    /// Coherence turns this off: a spurious answer there must not change with the limit.
+    pub fn enable_next_solver_overflow_fcw(mut self, enable_next_solver_overflow_fcw: bool) -> Self {
+        self.enable_next_solver_overflow_fcw = enable_next_solver_overflow_fcw;
+        self
+    }
+
     /// Given a canonical value `C` as a starting point, create an
     /// inference context that contains each of the bound values
     /// within instantiated as a fresh variable. The `f` closure is
@@ -349,14 +380,18 @@ impl<'db> InferCtxtBuilder<'db> {
     pub fn build(&mut self, typing_mode: TypingMode<'db>) -> InferCtxt<'db> {
         // Solving needs the crate's trait environment and solver cache.
         self.interner.expect_crate();
-        let InferCtxtBuilder { interner } = *self;
+        let InferCtxtBuilder { interner, enable_next_solver_overflow_fcw } = *self;
         InferCtxt {
             interner,
             typing_mode,
             inner: RefCell::new(InferCtxtInner::new()),
             tainted_by_errors: Cell::new(None),
             universe: Cell::new(UniverseIndex::ROOT),
+            placeholder_assumptions: RefCell::new(Default::default()),
+            enable_next_solver_overflow_fcw: Cell::new(enable_next_solver_overflow_fcw),
+            next_solver_overflows: RefCell::new(Vec::new()),
             obligation_inspector: Cell::new(None),
+            canonicalizer_state: Default::default(),
         }
     }
 }
@@ -693,9 +728,9 @@ impl<'db> InferCtxt<'db> {
 
         self.enter_forall(predicate, |SubtypePredicate { a_is_expected, a, b }| {
             if a_is_expected {
-                Ok(self.at(cause, param_env).sub(a, b))
+                Ok(self.sub_raw(cause, param_env, a, b))
             } else {
-                Ok(self.at(cause, param_env).sup(b, a))
+                Ok(self.sup_raw(cause, param_env, b, a))
             }
         })
     }
@@ -703,9 +738,9 @@ impl<'db> InferCtxt<'db> {
     pub fn region_outlives_predicate(
         &self,
         _cause: &traits::ObligationCause,
-        predicate: PolyRegionOutlivesPredicate<'db>,
+        predicate: PolyRegionOutlivesClause<'db>,
     ) {
-        self.enter_forall(predicate, |OutlivesPredicate(r_a, r_b)| {
+        self.enter_forall(predicate, |OutlivesClause(r_a, r_b)| {
             self.sub_regions(r_b, r_a); // `b : a` ==> `a <= b`
         })
     }

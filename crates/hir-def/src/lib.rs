@@ -759,6 +759,32 @@ impl ModuleId {
         // `_db` is the caller's, per `# Safety` above.
         unsafe { std::mem::transmute(self) }
     }
+
+    /// The prelude a name not in scope in this module is looked up in, and the
+    /// `#[prelude_import]` naming it if one does: its crate's, which the resolver reads for a
+    /// block's modules too.
+    pub fn prelude(self, db: &dyn SourceDatabase) -> Option<(ModuleId, Option<UseId>)> {
+        crate_def_map(db, self.krate(db)).prelude()
+    }
+
+    /// The extern prelude of this module's crate, in the order its crates were added: each
+    /// name, the root of the crate it names and the `extern crate` that added it, if one did.
+    pub fn extern_prelude<'db>(
+        self,
+        db: &'db dyn SourceDatabase,
+    ) -> impl DoubleEndedIterator<Item = (&'db Name, (ModuleId, Option<ExternCrateId>))> + 'db
+    {
+        crate_local_def_map(db, self.krate(db)).local(db).extern_prelude()
+    }
+
+    /// The `#[macro_use]` prelude of this module's crate: each macro name, the macro and the
+    /// `extern crate` it is imported through (none for one of the standard prelude).
+    pub fn macro_use_prelude(
+        self,
+        db: &dyn SourceDatabase,
+    ) -> &rustc_hash::FxHashMap<Name, (MacroId, Option<ExternCrateId>)> {
+        crate_def_map(db, self.krate(db)).macro_use_prelude()
+    }
 }
 
 impl HasModule for ModuleId {

@@ -119,6 +119,11 @@ impl Durability {
     pub(crate) fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// The durability whose [`Durability::index`] is `index`.
+    pub(crate) fn from_index(index: u8) -> Durability {
+        Durability(DurabilityVal::from(index))
+    }
 }
 
 impl Default for Durability {

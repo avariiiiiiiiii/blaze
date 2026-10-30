@@ -7,14 +7,14 @@ use std::mem::{align_of, size_of, size_of_val};
 use blaze_format::Record;
 
 /// The bytes of `values`.
-pub(crate) fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
+pub fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
     // SAFETY: `T: Record` has no padding (its contract), so every one of the
     // `size_of_val(values)` bytes is initialized, and they live as long as `values`.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
 /// `bytes` as `T`s, `None` when they are not aligned for `T` or not a whole number of them.
-pub(crate) fn cast<T: Record>(bytes: &[u8]) -> Option<&[T]> {
+pub fn cast<T: Record>(bytes: &[u8]) -> Option<&[T]> {
     const { assert!(T::PLAIN, "only a plain record is read from an image in place") };
     if size_of::<T>() == 0
         || !bytes.len().is_multiple_of(size_of::<T>())

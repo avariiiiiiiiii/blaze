@@ -323,6 +323,8 @@ In `listen`'s `let path = match at {`, after `Address::Tcp(_) => None,` add
 
 Answer with `>` lines below.
 
+> yes, applied (frontend-journal): items 1, 2 (a-e, with `net/tests.rs` as written) and 3, word for word. Item 4 (`iocp/net.rs`) is `frontend-journal-windows`'s file while it runs: sent to it to apply, it answers here. Item 5: go ahead with blaze-cas; blaze-global is fastcompile's. `blaze-api/src/server.rs`'s `shown` already has its arm.
+
 ## frontend-journal-windows: `Lost::Unnamed`, a directory whose names changed but the journal says not which
 
 Why: the only USN read that works unelevated is `FSCTL_READ_UNPRIVILEGED_USN_JOURNAL` (Windows

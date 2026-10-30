@@ -368,6 +368,25 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
     model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())
 }
 
+/// `macho::tbd::read("t.tbd", text, arch, platform)` against the reference reader: `Ok` with
+/// whether it accepted when both give the same symbols, inputs and install name or the same
+/// error (or the reference refuses nesting past 256), and the arena is exact
+/// (`arena_is_exact`); `Err` naming both answers otherwise.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_tbd_differential(text: &str, arch: blaze_codegen::Arch, platform: u32) -> Result<bool, String> {
+    macho::tbd_differential(text, arch, platform)
+}
+
+/// `trie_exports(trie, 0, sections)` against the reference walk, `sections` being
+/// `dylib::tests::test_sections`: `Ok` with whether it accepted when the exports or the errors
+/// are equal, `Err` naming both answers otherwise.
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub fn fuzz_trie_differential(trie: &[u8]) -> Result<bool, String> {
+    macho::trie_differential(trie)
+}
+
 /// The default libraries the objects among `natives` ask for (COFF `/DEFAULTLIB`, Mach-O
 /// `LC_LINKER_OPTION`), in order and once each, without those any of them takes out with
 /// `/NODEFAULTLIB`: the caller finds them on its library path and passes them as natives too.

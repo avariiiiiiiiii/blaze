@@ -47,6 +47,7 @@ use blaze_ids::ContentId;
 pub use crate::build::{Builder, SectionWriter, TooLarge};
 pub use crate::crc::crc32c;
 pub use crate::image::{Image, Stable};
+pub use crate::raw::{bytes_of, cast};
 pub use crate::spine::{
     DEFAULT_GROUP_SHIFT, HEADER, LAYOUT, MAGIC, MAX_GROUP_SHIFT, MIN_GROUP_SHIFT, SECTION_ENTRY,
 };

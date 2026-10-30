@@ -916,7 +916,7 @@ impl Field {
     pub fn ty<'db>(&self, db: &'db dyn HirDatabase) -> Type<'db> {
         let var_id = self.parent.into();
         let ty = db.field_types(var_id)[self.id].ty().instantiate_identity().skip_norm_wip();
-        Type::new(var_id.adt_id(db).into(), ty)
+        Type::new(db, var_id.adt_id(db).into(), ty)
     }
 
     pub fn layout<'db>(&self, db: &'db dyn HirDatabase) -> Result<Layout<'db>, LayoutError> {
@@ -1083,6 +1083,7 @@ impl Enum {
     pub fn variant_body_ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
         Type::no_params(
+            db,
             Type::builtin_type_crate(db),
             match EnumSignature::variant_body_type(db, self.id) {
                 layout::IntegerType::Pointer(sign) => match sign {
@@ -1505,7 +1506,7 @@ impl DefWithBody {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
 
-            infer.expression_types().map(move |(_, ty)| Type::new(def_id, ty))
+            infer.expression_types().map(move |(_, ty)| Type::new(db, def_id, ty))
         })
     }
 
@@ -1515,7 +1516,7 @@ impl DefWithBody {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
 
-            infer.pattern_types().map(move |(_, ty)| Type::new(def_id, ty))
+            infer.pattern_types().map(move |(_, ty)| Type::new(db, def_id, ty))
         })
     }
 
@@ -1525,7 +1526,7 @@ impl DefWithBody {
             let infer = InferenceResult::of(db, def_id);
             let def_id = def_id.generic_def(db);
 
-            infer.binding_types().map(move |(_, ty)| Type::new(def_id, ty))
+            infer.binding_types().map(move |(_, ty)| Type::new(db, def_id, ty))
         })
     }
 }
@@ -1608,7 +1609,7 @@ impl Function {
                 let callable_sig =
                     db.callable_item_signature(id.into()).instantiate_identity().skip_norm_wip();
                 let ty = Ty::new_fn_ptr(interner, callable_sig);
-                Type::new(id.into(), ty)
+                Type::new(db, id.into(), ty)
             }
             AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ } => {
                 // Get the type for the trait function, as we can't get the type for the impl function
@@ -1639,7 +1640,7 @@ impl Function {
     /// Get this function's return type
     pub fn ret_type(self, db: &dyn HirDatabase) -> Type<'_> {
         let (owner, sig) = self.erased_fn_sig(db);
-        Type { owner, ty: EarlyBinder::bind(sig.output()) }
+        Type { owner, ty: EarlyBinder::bind(DbInterner::new_no_crate(db), sig.output()) }
     }
 
     pub fn async_ret_type<'db>(self, db: &'db dyn HirDatabase) -> Option<Type<'db>> {
@@ -1657,7 +1658,7 @@ impl Function {
             if let ClauseKind::Projection(projection) = clause
                 && let Some(output_ty) = projection.term.as_type()
             {
-                return Some(Type::new(id.into(), output_ty));
+                return Some(Type::new(db, id.into(), output_ty));
             }
         }
         None
@@ -1684,6 +1685,7 @@ impl Function {
 
     pub fn assoc_fn_params(self, db: &dyn HirDatabase) -> Vec<Param<'_>> {
         let (owner, sig) = self.erased_fn_sig(db);
+        let interner = DbInterner::new_no_crate(db);
         let func = match self.id {
             AnyFunctionId::FunctionId(id) => Callee::Def(CallableDefId::FunctionId(id)),
             AnyFunctionId::BuiltinDeriveImplMethod { method, impl_ } => {
@@ -1695,7 +1697,7 @@ impl Function {
             .enumerate()
             .map(|(idx, &ty)| Param {
                 func: func.clone(),
-                ty: Type { owner, ty: EarlyBinder::bind(ty) },
+                ty: Type { owner, ty: EarlyBinder::bind(interner, ty) },
                 idx,
             })
             .collect()
@@ -2082,7 +2084,7 @@ impl SelfParam {
 
     pub fn ty<'db>(&self, db: &'db dyn HirDatabase) -> Type<'db> {
         let (owner, sig) = self.func.erased_fn_sig(db);
-        Type { owner, ty: EarlyBinder::bind(sig.inputs()[0]) }
+        Type { owner, ty: EarlyBinder::bind(DbInterner::new_no_crate(db), sig.inputs()[0]) }
     }
 }
 
@@ -2488,7 +2490,8 @@ impl BuiltinType {
 
     pub fn ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
-        Type::no_params(Type::builtin_type_crate(db), Ty::from_builtin_type(interner, self.inner))
+        let ty = Ty::from_builtin_type(interner, self.inner);
+        Type::no_params(db, Type::builtin_type_crate(db), ty)
     }
 
     pub fn name(self) -> Name {
@@ -3261,11 +3264,12 @@ impl<'db> GenericSubstitution<'db> {
 
     /// Returns type arguments with type parameter names.
     pub fn types(&self, db: &'db dyn HirDatabase) -> Vec<(Symbol, Type<'db>)> {
+        let interner = DbInterner::new_no_crate(db);
         self.types_impl(db)
             .filter_map(|(ty, name)| {
                 Some((
                     name?.symbol().clone(),
-                    Type { ty: EarlyBinder::bind(ty), owner: self.owner },
+                    Type { ty: EarlyBinder::bind(interner, ty), owner: self.owner },
                 ))
             })
             .collect()
@@ -3278,8 +3282,9 @@ impl<'db> GenericSubstitution<'db> {
     // Note: this method is not used by rust-analyzer itself as of writing, but is
     // used by external tools, so please do not remove it even if it appears unused.
     pub fn all_types(&self, db: &'db dyn HirDatabase) -> Vec<Type<'db>> {
+        let interner = DbInterner::new_no_crate(db);
         self.types_impl(db)
-            .map(|(ty, _)| Type { ty: EarlyBinder::bind(ty), owner: self.owner })
+            .map(|(ty, _)| Type { ty: EarlyBinder::bind(interner, ty), owner: self.owner })
             .collect()
     }
 }
@@ -3695,7 +3700,7 @@ impl TypeParam {
         let interner = DbInterner::new_no_crate(db);
         let index = hir_ide::type_or_const_param_idx(db, self.id.into());
         let ty = Ty::new_param(interner, self.id, index);
-        Type::new(self.id.parent(), ty)
+        Type::new(db, self.id.parent(), ty)
     }
 
     /// FIXME: this only lists trait bounds from the item defining the type
@@ -3716,12 +3721,14 @@ impl TypeParam {
 
     /// [`TypeParam::trait_bounds`] with the bounds' generic arguments, for blaze's lints.
     pub fn trait_refs(self, db: &dyn HirDatabase) -> Vec<TraitRef<'_>> {
+        let interner = DbInterner::new_no_crate(db);
+        let owner = TypeOwnerId::GenericDefId(self.id.parent());
         let self_ty = self.ty(db).ty.instantiate_identity().skip_norm_wip();
         GenericPredicates::query_explicit(db, self.id.parent())
             .iter_identity()
             .filter_map(|pred| match &pred.kind().skip_binder() {
                 ClauseKind::Trait(trait_ref) if trait_ref.self_ty() == self_ty => {
-                    Some(TraitRef::new(self.id.parent(), trait_ref.trait_ref))
+                    Some(TraitRef::new(interner, owner, trait_ref.trait_ref))
                 }
                 _ => None,
             })
@@ -3732,7 +3739,7 @@ impl TypeParam {
         let ty = generic_arg_from_param(db, self.id.into())?;
         match ty.kind() {
             rustc_type_ir::GenericArgKind::Type(it) if !it.is_ty_error() => {
-                Some(Type::new(self.id.parent(), it))
+                Some(Type::new(db, self.id.parent(), it))
             }
             _ => None,
         }
@@ -3793,7 +3800,7 @@ impl ConstParam {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
-        Type::new(self.id.parent(), db.const_param_ty(self.id))
+        Type::new(db, self.id.parent(), db.const_param_ty(self.id))
     }
 
     pub fn default(self, db: &dyn HirDatabase, display_target: DisplayTarget) -> Option<String> {
@@ -3999,7 +4006,8 @@ impl Impl {
         match self.id {
             AnyImplId::ImplId(id) => {
                 let trait_ref = db.impl_trait(id)?.instantiate_identity().skip_norm_wip();
-                Some(TraitRef::new(id.into(), trait_ref))
+                let owner = TypeOwnerId::GenericDefId(id.into());
+                Some(TraitRef::new(DbInterner::new_no_crate(db), owner, trait_ref))
             }
             AnyImplId::BuiltinDeriveImplId(id) => {
                 let loc = id.loc(db);
@@ -4008,7 +4016,7 @@ impl Impl {
                 let trait_ref = hir_ide::builtin_derive::impl_trait(interner, id)
                     .instantiate_identity()
                     .skip_norm_wip();
-                Some(TraitRef { owner: TypeOwnerId::BuiltinDeriveImplId(id), trait_ref })
+                Some(TraitRef::new(interner, TypeOwnerId::BuiltinDeriveImplId(id), trait_ref))
             }
         }
     }
@@ -4017,7 +4025,7 @@ impl Impl {
         match self.id {
             AnyImplId::ImplId(id) => {
                 let ty = db.impl_self_ty(id).instantiate_identity().skip_norm_wip();
-                Type::new(id.into(), ty)
+                Type::new(db, id.into(), ty)
             }
             AnyImplId::BuiltinDeriveImplId(id) => {
                 let loc = id.loc(db);
@@ -4081,12 +4089,18 @@ impl Impl {
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct TraitRef<'db> {
     owner: TypeOwnerId,
+    /// Holds no rigid aliases, so that its types can be bound without an interner.
     trait_ref: hir_ide::next_solver::TraitRef<'db>,
 }
 
 impl<'db> TraitRef<'db> {
-    fn new(owner: GenericDefId, trait_ref: hir_ide::next_solver::TraitRef<'db>) -> Self {
-        Self { owner: TypeOwnerId::GenericDefId(owner), trait_ref }
+    fn new(
+        interner: DbInterner<'db>,
+        owner: TypeOwnerId,
+        trait_ref: hir_ide::next_solver::TraitRef<'db>,
+    ) -> Self {
+        let trait_ref = rustc_type_ir::set_aliases_to_non_rigid(interner, trait_ref);
+        Self { owner, trait_ref: trait_ref.skip_normalization() }
     }
 
     pub fn trait_(&self) -> Trait {
@@ -4095,7 +4109,7 @@ impl<'db> TraitRef<'db> {
 
     pub fn self_ty(&self) -> Type<'_> {
         let ty = self.trait_ref.self_ty();
-        Type { owner: self.owner, ty: EarlyBinder::bind(ty) }
+        Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) }
     }
 
     /// Returns `idx`-th argument of this trait reference if it is a type argument. Note that the
@@ -4106,7 +4120,7 @@ impl<'db> TraitRef<'db> {
             .as_slice()
             .get(idx)
             .and_then(|arg| arg.ty())
-            .map(|ty| Type { owner: self.owner, ty: EarlyBinder::bind(ty) })
+            .map(|ty| Type { owner: self.owner, ty: EarlyBinder::bind_no_rigid_aliases(ty) })
     }
 }
 
@@ -4570,16 +4584,18 @@ impl<'db> PartialEq for Type<'db> {
 impl<'db> Eq for Type<'db> {}
 
 impl<'db> Type<'db> {
-    fn new(owner: GenericDefId, ty: Ty<'db>) -> Self {
-        Type { owner: TypeOwnerId::GenericDefId(owner), ty: EarlyBinder::bind(ty) }
+    fn new(db: &'db dyn HirDatabase, owner: GenericDefId, ty: Ty<'db>) -> Self {
+        let ty = EarlyBinder::bind(DbInterner::new_no_crate(db), ty);
+        Type { owner: TypeOwnerId::GenericDefId(owner), ty }
     }
 
-    fn new_body(db: &dyn HirDatabase, owner: ExpressionStoreOwnerId, ty: Ty<'db>) -> Self {
-        Self::new(owner.generic_def(db), ty)
+    fn new_body(db: &'db dyn HirDatabase, owner: ExpressionStoreOwnerId, ty: Ty<'db>) -> Self {
+        Self::new(db, owner.generic_def(db), ty)
     }
 
-    fn no_params(krate: base_db::Crate, ty: Ty<'db>) -> Self {
-        Type { owner: TypeOwnerId::NoParams(krate), ty: EarlyBinder::bind(ty) }
+    fn no_params(db: &'db dyn HirDatabase, krate: base_db::Crate, ty: Ty<'db>) -> Self {
+        let ty = EarlyBinder::bind(DbInterner::new_no_crate(db), ty);
+        Type { owner: TypeOwnerId::NoParams(krate), ty }
     }
 
     fn builtin_type_crate(db: &'db dyn HirDatabase) -> base_db::Crate {
@@ -4621,10 +4637,10 @@ impl<'db> Type<'db> {
                 GenericDefId::AdtId(AdtId::EnumId(it.lookup(db).parent))
             }
             ValueTyDefId::StaticId(it) => {
-                return Type::no_params(hir_def::HasModule::krate(&it, db), ty.skip_binder());
+                return Type::no_params(db, hir_def::HasModule::krate(&it, db), ty.skip_binder());
             }
         };
-        Type::new(def, ty.instantiate_identity().skip_norm_wip())
+        Type::new(db, def, ty.instantiate_identity().skip_norm_wip())
     }
 
     /// Replace any generic parameters with error types.
@@ -4638,7 +4654,7 @@ impl<'db> Type<'db> {
             }
             TypeOwnerId::NoParams(_) => GenericArgs::empty(),
         };
-        Type::no_params(krate, self.ty.instantiate(interner, args).skip_norm_wip())
+        Type::no_params(db, krate, self.ty.instantiate(interner, args).skip_norm_wip())
     }
 
     // FIXME: Find some way with const params, maybe even lifetimes?
@@ -4655,7 +4671,8 @@ impl<'db> Type<'db> {
             }
             TypeOwnerId::NoParams(krate) => (GenericArgs::empty(), TypeOwnerId::NoParams(krate)),
         };
-        Type { owner, ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()) }
+        let ty = self.ty.instantiate(interner, args).skip_norm_wip();
+        Type { owner, ty: EarlyBinder::bind(interner, ty) }
     }
 
     /// The type with its type parameters filled from `args`, in order, and its lifetime and const
@@ -4677,10 +4694,8 @@ impl<'db> Type<'db> {
             },
             _ => hir_ide::next_solver::mk_param(interner, index, id),
         });
-        Type {
-            owner: self.owner,
-            ty: EarlyBinder::bind(self.ty.instantiate(interner, args).skip_norm_wip()),
-        }
+        let ty = self.ty.instantiate(interner, args).skip_norm_wip();
+        Type { owner: self.owner, ty: EarlyBinder::bind(interner, ty) }
     }
 
     /// Instantiates multiple types with infer vars, keeping the same infer vars for the same owners.
@@ -4755,7 +4770,7 @@ impl<'db> Type<'db> {
 
     pub fn unknown(db: &'db dyn HirDatabase) -> Self {
         let interner = DbInterner::new_no_crate(db);
-        Type::no_params(Self::builtin_type_crate(db), Ty::new_error(interner, ErrorGuaranteed))
+        Type::no_params(db, Self::builtin_type_crate(db), Ty::new_error(interner, ErrorGuaranteed))
     }
 
     pub fn new_slice(db: &'db dyn HirDatabase, ty: Self) -> Self {
@@ -4769,7 +4784,7 @@ impl<'db> Type<'db> {
     ) -> Self {
         let interner = DbInterner::new_no_crate(db);
         let mut owner = None::<TypeOwnerId>;
-        let ty = EarlyBinder::bind(Ty::new_tup_from_iter(
+        let ty = Ty::new_tup_from_iter(
             interner,
             tys.into_iter().map(|ty| {
                 let ty = ty.borrow();
@@ -4781,14 +4796,15 @@ impl<'db> Type<'db> {
 
                 ty.ty.skip_binder()
             }),
-        ));
+        );
         let owner =
             owner.unwrap_or_else(|| TypeOwnerId::NoParams(Self::builtin_type_crate(interner.db())));
-        Type { owner, ty }
+        Type { owner, ty: EarlyBinder::bind(interner, ty) }
     }
 
     pub fn new_unit(db: &'db dyn HirDatabase) -> Self {
-        Type::no_params(Self::builtin_type_crate(db), Ty::new_unit(DbInterner::new_no_crate(db)))
+        let interner = DbInterner::new_no_crate(db);
+        Type::no_params(db, Self::builtin_type_crate(db), Ty::new_unit(interner))
     }
 
     pub fn is_unit(&self) -> bool {
@@ -5170,6 +5186,7 @@ impl<'db> Type<'db> {
         // FIXME: We don't handle GATs yet.
         let projection = Ty::new_alias(
             interner,
+            rustc_type_ir::IsRigid::No,
             AliasTy::new_from_args(
                 interner,
                 AliasTyKind::Projection { def_id: alias.id.into() },
@@ -5179,7 +5196,11 @@ impl<'db> Type<'db> {
 
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         let ty = structurally_normalize_ty(&infcx, projection, env.param_env);
-        if ty.is_ty_error() { None } else { Some(Type { owner, ty: EarlyBinder::bind(ty) }) }
+        if ty.is_ty_error() {
+            None
+        } else {
+            Some(Type { owner, ty: EarlyBinder::bind(interner, ty) })
+        }
     }
 
     pub fn is_copy(&self, db: &'db dyn HirDatabase) -> bool {
@@ -6303,11 +6324,21 @@ pub enum ClausePolarity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitClause<'db> {
+    /// Holds no rigid aliases, like [`TraitRef`]'s.
     inner: hir_ide::next_solver::TraitClause<'db>,
     owner: TypeOwnerId,
 }
 
 impl<'db> TraitClause<'db> {
+    fn new(
+        interner: DbInterner<'db>,
+        owner: TypeOwnerId,
+        inner: hir_ide::next_solver::TraitClause<'db>,
+    ) -> Self {
+        let inner = rustc_type_ir::set_aliases_to_non_rigid(interner, inner).skip_normalization();
+        Self { inner, owner }
+    }
+
     pub fn polarity(&self) -> ClausePolarity {
         match self.inner.polarity {
             rustc_type_ir::ClausePolarity::Positive => ClausePolarity::Positive,

@@ -369,3 +369,12 @@ RUSTC_RESERVATION_IMPL)` for each impl. Why: the item scope keeps the bit beside
 (dispatch task 9), so the filter costs a bit test rather than a query per impl.
 
 > forwarded to items.
+
+## db-expand: a binding's hygiene in `ExprScopes` (format, `crates/hir-def/src/expr_store/scope.rs`)
+
+What: `ScopeEntry::hygiene` public, or `ExprScopes::resolve_local(scope, name, hygiene) ->
+Option<BindingId>`. This is item 1 of diagnostics' "the per-item diagnostic item is in use;
+three more for speed". Why: `util::path_value` builds a `Resolver` for every one-segment path
+a local shares a name with, because only the hygiene tells the binding from an item.
+
+> forwarded to format: `expr_store/` is format's.

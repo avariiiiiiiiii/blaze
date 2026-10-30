@@ -291,8 +291,33 @@ impl Entries<'_> {
     }
 }
 
-/// Every name, interned once: a span of one byte column each.
+/// The hash a name is found by, in the tree's index of names and in the image's: FxHash's
+/// multiply and rotate over little-endian words, then the high bits folded down, since a
+/// place is the low bits. Fixed here, not taken from a crate, as the image keeps its places.
+pub(crate) fn name_hash(bytes: &[u8]) -> u64 {
+    const K: u64 = 0xf135_7aea_2e62_a9c5;
+    let mut hash = bytes.len() as u64;
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let word = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        hash = (hash.rotate_left(26) ^ word).wrapping_mul(K);
+    }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut word = [0; 8];
+        word[..rest.len()].copy_from_slice(rest);
+        hash = (hash.rotate_left(26) ^ u64::from_le_bytes(word)).wrapping_mul(K);
+    }
+    hash ^ (hash >> 32)
+}
+
+/// Every name, interned once: a span of one byte column each, after the base's.
 pub(crate) struct Names {
+    /// The base's spans, bytes and index of names (by [`name_hash`], a name plus one a place,
+    /// 0 empty): the image's, borrowed for as long as the table holding these names holds it.
+    base_spans: &'static [[u32; 2]],
+    base_bytes: &'static [u8],
+    base_index: &'static [u32],
     spans: Column<Span>,
     bytes: Column<u8>,
 }
@@ -309,18 +334,36 @@ const _: () = assert!(size_of::<Span>() == 8);
 
 impl Names {
     fn new() -> Names {
-        Names { spans: Column::new(), bytes: Column::new() }
+        Names {
+            base_spans: &[],
+            base_bytes: &[],
+            base_index: &[],
+            spans: Column::new(),
+            bytes: Column::new(),
+        }
+    }
+
+    fn base_len(&self) -> u32 {
+        self.base_spans.len() as u32
     }
 
     /// How many names there are.
     pub(crate) fn len(&self) -> u32 {
-        self.spans.len()
+        self.base_len() + self.spans.len()
     }
 
     /// The bytes of `name`; panics for a name not interned.
     pub(crate) fn get(&self, name: u32) -> &[u8] {
-        let span = *self.spans.get(name);
-        self.bytes.slice(span.start, span.len)
+        match name.checked_sub(self.base_len()) {
+            None => {
+                let [start, len] = self.base_spans[name as usize];
+                &self.base_bytes[start as usize..start as usize + len as usize]
+            }
+            Some(at) => {
+                let span = *self.spans.get(at);
+                self.bytes.slice(span.start, span.len)
+            }
+        }
     }
 
     /// `name` as the `&str` it was interned from.
@@ -328,8 +371,24 @@ impl Names {
         let bytes = self.get(name);
         debug_assert!(std::str::from_utf8(bytes).is_ok());
         // SAFETY: spans are pushed only by `intern`, each right after the bytes of a `&str`,
-        // and cover exactly them; pushed values never change. So these bytes are valid UTF-8.
+        // and cover exactly them; pushed values never change. A base's spans were each checked
+        // to be UTF-8 by `Base::check` before the base was taken. So these bytes are UTF-8.
         unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+
+    /// The base's name whose bytes are `name` and whose [`name_hash`] is `hash`.
+    pub(crate) fn find_base(&self, hash: u64, name: &[u8]) -> Option<u32> {
+        let places = self.base_index;
+        let mask = places.len().checked_sub(1)?;
+        let mut at = hash as usize & mask;
+        for _ in 0..places.len() {
+            match places[at] {
+                0 => return None,
+                plus_one if self.get(plus_one - 1) == name => return Some(plus_one - 1),
+                _ => at = (at + 1) & mask,
+            }
+        }
+        None
     }
 
     /// Interns `name`, new; returns its number.
@@ -342,7 +401,202 @@ impl Names {
         // SAFETY: the caller is the one writer.
         let start = unsafe { self.bytes.push_run(len, 0, name.bytes()) };
         // SAFETY: as above.
-        unsafe { self.spans.push(Span { start, len }) }
+        let at = unsafe { self.spans.push(Span { start, len }) };
+        self.base_len().checked_add(at).expect("fewer than 2^32 names")
+    }
+
+    /// The same names with the same numbers, for the next generation: the base's borrowed
+    /// again (the next table holds the same image), the rest copied.
+    fn carry(&self) -> Names {
+        let next = Names {
+            base_spans: self.base_spans,
+            base_bytes: self.base_bytes,
+            base_index: self.base_index,
+            ..Names::new()
+        };
+        for at in 0..self.spans.len() {
+            let span = *self.spans.get(at);
+            let bytes = self.bytes.slice(span.start, span.len);
+            // SAFETY: `next` is new and only this thread has it.
+            let start = unsafe { next.bytes.push_run(span.len, 0, bytes.iter().copied()) };
+            // SAFETY: as above.
+            unsafe { next.spans.push(Span { start, len: span.len }) };
+        }
+        next
+    }
+}
+
+/// The daemon's image a table was restored from: what keeps its base's bytes mapped, and where
+/// its files' bytes are. Shared by every generation that has a node of it, and by every
+/// [`Bytes`] lent from it.
+pub(crate) struct Mapped {
+    pub(crate) image: Arc<Image<Mapping>>,
+    pub(crate) blobs: Section,
+    /// The first group of `blobs` a read found corrupt: what [`crate::Vfs::corrupt`] names.
+    corrupt: OnceLock<Corrupt>,
+}
+
+impl Mapped {
+    pub(crate) fn new(image: Arc<Image<Mapping>>, blobs: Section) -> Mapped {
+        Mapped { image, blobs, corrupt: OnceLock::new() }
+    }
+
+    /// `len` bytes at `at` of the blobs section, each page group they fall in checked by its
+    /// CRC32C the first time it is read; a group that fails is never read, and is kept as the
+    /// image's first corruption.
+    pub(crate) fn read(&self, at: u64, len: u64) -> Result<&[u8], Corrupt> {
+        self.image.range(&self.blobs, at, len).inspect_err(|corrupt| {
+            let _ = self.corrupt.set(*corrupt);
+        })
+    }
+
+    pub(crate) fn corrupt(&self) -> Option<Corrupt> {
+        self.corrupt.get().copied()
+    }
+}
+
+/// The first generation's columns, read in place from a mapped image: what [`Writer::restore`]
+/// starts a table with. Node `n` of the base is `ids[n]` and `shapes[n]` (`[start, len]`); a
+/// directory's entries are `[start, start + len)` of the entry columns, a file is `files[start]`
+/// (where its bytes are in the blobs section, and how many). `index` holds a node plus one at
+/// the place its ID's [`home`] probes to, linearly; `name_index` a name plus one by
+/// [`name_hash`]; both are a power of two long and at most half full.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Base<'a> {
+    pub(crate) ids: &'a [ContentId],
+    pub(crate) shapes: &'a [[u32; 2]],
+    pub(crate) entry_names: &'a [u32],
+    pub(crate) entry_nodes: &'a [u32],
+    pub(crate) entry_modes: &'a [u8],
+    pub(crate) files: &'a [[u64; 2]],
+    pub(crate) index: &'a [u32],
+    pub(crate) spans: &'a [[u32; 2]],
+    pub(crate) name_bytes: &'a [u8],
+    pub(crate) name_index: &'a [u32],
+}
+
+impl Base<'_> {
+    /// Whether every read of the base stays in it and every walk of it ends: each name a path
+    /// component of UTF-8 its span holds; each directory's entries in range, sorted by name
+    /// and naming only nodes before it, of a mode that is the child's kind; each file's bytes
+    /// in the blobs section (`blobs` long); each node found by the index where it is. The
+    /// image's CRCs say its bytes are those written; this says the writer wrote a tree.
+    pub(crate) fn check(&self, blobs: u64) -> Result<(), &'static str> {
+        let (nodes, entries) = (self.ids.len(), self.entry_names.len());
+        if nodes == 0 || nodes >= FILE as usize || entries >= FILE as usize {
+            return Err("a base of no nodes, or of 2^32");
+        }
+        if self.shapes.len() != nodes
+            || self.entry_nodes.len() != entries
+            || self.entry_modes.len() != entries
+        {
+            return Err("node or entry columns of different lengths");
+        }
+        let half_full = |places: &[u32], count: usize| {
+            places.len().is_power_of_two() && places.len() >= 2 * (count + 1)
+        };
+        if !half_full(self.index, nodes) || !half_full(self.name_index, self.spans.len()) {
+            return Err("an index that is not a power of two at most half full");
+        }
+        for &[start, len] in self.spans {
+            let name = (start as usize)
+                .checked_add(len as usize)
+                .and_then(|end| self.name_bytes.get(start as usize..end))
+                .ok_or("a name past the name bytes")?;
+            let name = std::str::from_utf8(name).map_err(|_| "a name that is not UTF-8")?;
+            if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                return Err("a name that is not one path component");
+            }
+        }
+        let name = |name: u32| -> &[u8] {
+            let [start, len] = self.spans[name as usize];
+            &self.name_bytes[start as usize..start as usize + len as usize]
+        };
+        for (node, &[start, len]) in self.shapes.iter().enumerate() {
+            if len == FILE {
+                let &[at, len] =
+                    self.files.get(start as usize).ok_or("a file past the file column")?;
+                if at.checked_add(len).is_none_or(|end| end > blobs) {
+                    return Err("a file past the blobs section");
+                }
+                continue;
+            }
+            let range = start as usize..start as usize + len as usize;
+            if range.end > entries {
+                return Err("a directory's entries past the entry columns");
+            }
+            for at in range.clone() {
+                let (child, mode, label) =
+                    (self.entry_nodes[at], self.entry_modes[at], self.entry_names[at]);
+                if child as usize >= node {
+                    return Err("an entry naming a node not before its directory");
+                }
+                if label as usize >= self.spans.len() {
+                    return Err("an entry of a name the base does not have");
+                }
+                let child_is_dir = self.shapes[child as usize][1] != FILE;
+                if mode > DIR || (mode == DIR) != child_is_dir {
+                    return Err("an entry whose mode is not its node's kind");
+                }
+                if at > range.start && name(self.entry_names[at - 1]) >= name(label) {
+                    return Err("a directory's entries not sorted by name, or a name twice");
+                }
+            }
+        }
+        if self.index.iter().any(|&plus_one| plus_one as usize > nodes) {
+            return Err("an index place naming a node the base does not have");
+        }
+        if self.name_index.iter().any(|&plus_one| plus_one as usize > self.spans.len()) {
+            return Err("a name index place naming a name the base does not have");
+        }
+        let used = |places: &[u32]| places.iter().filter(|&&it| it != 0).count();
+        if used(self.index) > nodes || used(self.name_index) > self.spans.len() {
+            return Err("an index fuller than its nodes or names");
+        }
+        // At most half full, as checked: every probe meets an empty place, so these loops end.
+        let mask = self.index.len() - 1;
+        for id in self.ids {
+            let mut at = home(id) & mask;
+            loop {
+                match self.index[at] {
+                    0 => return Err("a node its index does not find"),
+                    plus_one if self.ids[plus_one as usize - 1] == *id => break,
+                    _ => at = (at + 1) & mask,
+                }
+            }
+        }
+        let mask = self.name_index.len() - 1;
+        for label in 0..self.spans.len() as u32 {
+            let bytes = name(label);
+            let mut at = name_hash(bytes) as usize & mask;
+            loop {
+                match self.name_index[at] {
+                    0 => return Err("a name its index does not find"),
+                    plus_one if name(plus_one - 1) == bytes => break,
+                    _ => at = (at + 1) & mask,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every slice of the base lies in `bytes`.
+    fn within(&self, bytes: &[u8]) -> bool {
+        let (start, end) = (bytes.as_ptr() as usize, bytes.as_ptr() as usize + bytes.len());
+        let inside = |at: *const u8, len: usize| {
+            let at = at as usize;
+            len == 0 || (at >= start && at.checked_add(len).is_some_and(|it| it <= end))
+        };
+        inside(self.ids.as_ptr().cast(), size_of_val(self.ids))
+            && inside(self.shapes.as_ptr().cast(), size_of_val(self.shapes))
+            && inside(self.entry_names.as_ptr().cast(), size_of_val(self.entry_names))
+            && inside(self.entry_nodes.as_ptr().cast(), size_of_val(self.entry_nodes))
+            && inside(self.entry_modes.as_ptr(), self.entry_modes.len())
+            && inside(self.files.as_ptr().cast(), size_of_val(self.files))
+            && inside(self.index.as_ptr().cast(), size_of_val(self.index))
+            && inside(self.spans.as_ptr().cast(), size_of_val(self.spans))
+            && inside(self.name_bytes.as_ptr(), self.name_bytes.len())
+            && inside(self.name_index.as_ptr().cast(), size_of_val(self.name_index))
     }
 }
 
@@ -360,7 +614,7 @@ fn places(len: usize) -> *mut AtomicU32 {
 }
 
 /// Where `id`'s probe starts: its own first 64 bits, uniform as a BLAKE3 hash is.
-fn home(id: &ContentId) -> usize {
+pub(crate) fn home(id: &ContentId) -> usize {
     let mut word = [0; 8];
     word.copy_from_slice(&id.0[..8]);
     u64::from_le_bytes(word) as usize
@@ -405,21 +659,50 @@ impl Drop for Index {
     }
 }
 
-/// One generation of nodes.
+/// Where a file node made after the base keeps its bytes: its own, or the range of the
+/// image's blobs section a base file had before a collection renumbered it.
+enum Blob {
+    Heap(Arc<[u8]>),
+    Mapped { at: u64, len: u64 },
+}
+
+/// Where [`Table::blob_at`] found a file's bytes: a base file's place, or the column's value.
+enum BlobAt<'a> {
+    Base(&'a u64, &'a u64),
+    Column(&'a Blob),
+}
+
+/// Where a file's bytes are, without reading them: for the image's writer, which copies them.
+pub(crate) enum Source<'a> {
+    Heap(&'a [u8]),
+    /// `len` bytes at `at` of the blobs section of [`Table::mapped`].
+    Mapped { at: u64, len: u64 },
+}
+
+/// One generation of nodes: a base (empty unless restored from an image), then the columns.
+/// Node `n` is the base's below `base.ids.len()`, else the columns' `n - base.ids.len()`; a
+/// shape's `start` counts the base's entries (or files) first the same way.
 pub(crate) struct Table {
+    /// Borrowed from `mapped`'s image, which this table holds for as long as it lives.
+    base: Base<'static>,
+    names: Names,
     ids: Column<ContentId>,
     shapes: Column<Shape>,
-    blobs: Column<Arc<[u8]>>,
+    blobs: Column<Blob>,
     entry_names: Column<u32>,
     entry_nodes: Column<u32>,
     entry_modes: Column<u8>,
+    /// The nodes after the base's.
     index: Index,
+    mapped: Option<Arc<Mapped>>,
 }
 
 impl Table {
     /// A table whose index holds `count` nodes without growing.
     fn new(count: usize) -> Table {
         Table {
+            base: Base::default(),
+            names: Names::new(),
             ids: Column::new(),
             shapes: Column::new(),
             blobs: Column::new(),
@@ -427,12 +710,39 @@ impl Table {
             entry_nodes: Column::new(),
             entry_modes: Column::new(),
             index: Index::new(count),
+            mapped: None,
         }
+    }
+
+    fn base_nodes(&self) -> u32 {
+        self.base.ids.len() as u32
+    }
+
+    fn base_entries(&self) -> u32 {
+        self.base.entry_names.len() as u32
+    }
+
+    fn base_files(&self) -> u32 {
+        self.base.files.len() as u32
     }
 
     /// How many nodes it holds.
     pub(crate) fn len(&self) -> u32 {
-        self.ids.len()
+        self.base_nodes() + self.ids.len()
+    }
+
+    /// How many of its nodes are the base's: those below are read from the image.
+    pub(crate) fn base_len(&self) -> u32 {
+        self.base_nodes()
+    }
+
+    pub(crate) fn names(&self) -> &Names {
+        &self.names
+    }
+
+    /// The image its base and its mapped files are in.
+    pub(crate) fn mapped(&self) -> Option<&Arc<Mapped>> {
+        self.mapped.as_ref()
     }
 
     /// The node whose content ID is `id`.
@@ -442,64 +752,154 @@ impl Table {
 
     /// The node whose content ID is `id`; else its free place in the level in use.
     fn probe(&self, id: &ContentId) -> Result<u32, usize> {
+        if let Some(node) = self.probe_base(id) {
+            return Ok(node);
+        }
         let places = self.index.places(self.index.level.load(Ordering::Acquire));
-        Self::probe_in(&self.ids, places, id)
+        self.probe_in(places, id)
     }
 
-    fn probe_in(
-        ids: &Column<ContentId>,
-        places: &[AtomicU32],
-        id: &ContentId,
-    ) -> Result<u32, usize> {
+    /// The base's node whose content ID is `id`: plain loads of the image's places, which
+    /// [`Base::check`] found at most half full, so the probe meets an empty one.
+    fn probe_base(&self, id: &ContentId) -> Option<u32> {
+        let places = self.base.index;
+        let mask = places.len().checked_sub(1)?;
+        let mut at = home(id) & mask;
+        loop {
+            match places[at] {
+                0 => return None,
+                plus_one if self.base.ids[plus_one as usize - 1] == *id => {
+                    return Some(plus_one - 1);
+                }
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    fn probe_in(&self, places: &[AtomicU32], id: &ContentId) -> Result<u32, usize> {
         let mask = places.len() - 1;
         let mut at = home(id) & mask;
         loop {
             match places[at].load(Ordering::Acquire) {
                 0 => return Err(at),
-                plus_one if ids.get(plus_one - 1) == id => return Ok(plus_one - 1),
+                plus_one if self.id(plus_one - 1) == id => return Ok(plus_one - 1),
                 _ => at = (at + 1) & mask,
             }
         }
     }
 
     pub(crate) fn id(&self, node: u32) -> &ContentId {
-        self.ids.get(node)
+        match node.checked_sub(self.base_nodes()) {
+            None => &self.base.ids[node as usize],
+            Some(at) => self.ids.get(at),
+        }
     }
 
     pub(crate) fn shape(&self, node: u32) -> Shape {
-        *self.shapes.get(node)
+        match node.checked_sub(self.base_nodes()) {
+            None => {
+                let [start, len] = self.base.shapes[node as usize];
+                Shape { start, len }
+            }
+            Some(at) => *self.shapes.get(at),
+        }
     }
 
     /// The entries of a directory's shape; panics for a file's.
     pub(crate) fn entries(&self, shape: Shape) -> Entries<'_> {
         assert!(shape.is_dir(), "a file has no entries");
-        Entries {
-            names: self.entry_names.slice(shape.start, shape.len),
-            nodes: self.entry_nodes.slice(shape.start, shape.len),
-            modes: self.entry_modes.slice(shape.start, shape.len),
+        match shape.start.checked_sub(self.base_entries()) {
+            // A base directory's entries are all in the base, as `Base::check` found.
+            None => {
+                let range = shape.start as usize..shape.start as usize + shape.len as usize;
+                Entries {
+                    names: &self.base.entry_names[range.clone()],
+                    nodes: &self.base.entry_nodes[range.clone()],
+                    modes: &self.base.entry_modes[range],
+                }
+            }
+            Some(start) => Entries {
+                names: self.entry_names.slice(start, shape.len),
+                nodes: self.entry_nodes.slice(start, shape.len),
+                modes: self.entry_modes.slice(start, shape.len),
+            },
         }
     }
 
-    /// The bytes of a file's shape; panics for a directory's.
-    pub(crate) fn blob(&self, shape: Shape) -> &Arc<[u8]> {
-        assert!(!shape.is_dir(), "a directory has no bytes");
-        self.blobs.get(shape.start)
+    /// The bytes of a file's shape, read in place; panics for a directory's. A file of the
+    /// image is read only once the page groups it is in match their CRC32C.
+    pub(crate) fn blob(&self, shape: Shape) -> Result<&[u8], Corrupt> {
+        match self.source(shape) {
+            Source::Heap(bytes) => Ok(bytes),
+            Source::Mapped { at, len } => self.mapped_ref().read(at, len),
+        }
     }
 
-    /// The node of the file `id` with `bytes`, added if it is new.
+    /// The bytes of a file's shape as [`Table::blob`] reads them, held: one count of the
+    /// file's `Arc` or of the image's.
+    pub(crate) fn bytes(&self, shape: Shape) -> Result<Bytes, Corrupt> {
+        match self.blob_at(shape) {
+            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
+                let mapped = self.mapped_ref();
+                mapped.read(at, len)?;
+                Ok(Bytes::mapped(mapped.clone(), at, len))
+            }
+            BlobAt::Column(Blob::Heap(bytes)) => Ok(Bytes::from(bytes.clone())),
+        }
+    }
+
+    /// Where a file's bytes are, read or not; panics for a directory.
+    pub(crate) fn source(&self, shape: Shape) -> Source<'_> {
+        match self.blob_at(shape) {
+            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
+                Source::Mapped { at, len }
+            }
+            BlobAt::Column(Blob::Heap(bytes)) => Source::Heap(bytes),
+        }
+    }
+
+    /// How many bytes a file has, without reading them.
+    pub(crate) fn file_len(&self, shape: Shape) -> u64 {
+        match self.source(shape) {
+            Source::Heap(bytes) => bytes.len() as u64,
+            Source::Mapped { len, .. } => len,
+        }
+    }
+
+    fn blob_at(&self, shape: Shape) -> BlobAt<'_> {
+        assert!(!shape.is_dir(), "a directory has no bytes");
+        match shape.start.checked_sub(self.base_files()) {
+            None => {
+                let [at, len] = &self.base.files[shape.start as usize];
+                BlobAt::Base(at, len)
+            }
+            Some(at) => BlobAt::Column(self.blobs.get(at)),
+        }
+    }
+
+    fn mapped_ref(&self) -> &Arc<Mapped> {
+        self.mapped.as_ref().expect("a table with a file of an image holds the image")
+    }
+
+    /// The node of the file `id` whose bytes are `blob`, added if it is new.
     ///
     /// # Safety
     ///
     /// As [`Column::push`]: the caller is the table's one writer.
-    unsafe fn add_file(&self, id: ContentId, bytes: Arc<[u8]>) -> u32 {
+    unsafe fn add_file(&self, id: ContentId, blob: Blob) -> u32 {
         let place = match self.probe(&id) {
             Ok(node) => return node,
             Err(place) => place,
         };
+        if matches!(blob, Blob::Mapped { .. }) {
+            assert!(self.mapped.is_some(), "a file of an image in a table without it");
+        }
         // SAFETY: the caller is the one writer.
-        let blob = unsafe { self.blobs.push(bytes) };
+        let at = unsafe { self.blobs.push(blob) };
+        let start = self.base_files().checked_add(at).filter(|&it| it != FILE);
+        let start = start.expect("fewer than 2^32 - 1 files");
         // SAFETY: as above.
-        unsafe { self.add(id, Shape { start: blob, len: FILE }, place) }
+        unsafe { self.add(id, Shape { start, len: FILE }, place) }
     }
 
     /// The node of the directory `id` with `entries` (name, node, mode byte), added if it is
@@ -522,6 +922,8 @@ impl Table {
         // SAFETY: as above.
         let modes = unsafe { self.entry_modes.push_run(len, 0, entries.iter().map(|it| it.2)) };
         assert!(start == nodes && start == modes, "the entry columns are pushed together");
+        let start = self.base_entries().checked_add(start);
+        let start = start.filter(|it| it.checked_add(len).is_some()).expect("2^32 entries");
         // SAFETY: as above.
         unsafe { self.add(id, Shape { start, len }, place) }
     }
@@ -534,22 +936,23 @@ impl Table {
     /// As [`Column::push`].
     unsafe fn add(&self, id: ContentId, shape: Shape, place: usize) -> u32 {
         // SAFETY: the caller is the one writer.
-        let node = unsafe { self.shapes.push(shape) };
+        let at = unsafe { self.shapes.push(shape) };
         // SAFETY: as above.
-        let at = unsafe { self.ids.push(id) };
-        assert_eq!(node, at, "the node columns are pushed together");
+        let pushed = unsafe { self.ids.push(id) };
+        assert_eq!(at, pushed, "the node columns are pushed together");
+        let node = self.base_nodes().checked_add(at).expect("fewer than 2^32 nodes");
         self.index(&id, node, place);
         node
     }
 
-    /// Stores `node` at `place` of the level in use, after growing the index if `node` would
-    /// fill it past half. The one writer's.
+    /// Stores `node` at `place` of the level in use, after growing the index if the nodes
+    /// after the base would fill it past half. The one writer's.
     fn index(&self, id: &ContentId, node: u32, place: usize) {
         let mut level = self.index.level.load(Ordering::Relaxed);
         let mut place = place;
-        if (node as usize + 1) * 2 > PLACES << level {
+        if ((node - self.base_nodes()) as usize + 1) * 2 > PLACES << level {
             level = self.grow(level);
-            let Err(free) = Self::probe_in(&self.ids, self.index.places(level), id) else {
+            let Err(free) = self.probe_in(self.index.places(level), id) else {
                 unreachable!("a node indexed twice")
             };
             place = free;
@@ -571,7 +974,7 @@ impl Table {
             if plus_one == 0 {
                 continue;
             }
-            let mut at = home(self.ids.get(plus_one - 1)) & mask;
+            let mut at = home(self.id(plus_one - 1)) & mask;
             while new[at].load(Ordering::Relaxed) != 0 {
                 at = (at + 1) & mask;
             }
@@ -582,10 +985,9 @@ impl Table {
     }
 }
 
-/// What the tree and every reader share. Made only by [`Writer::new`].
+/// What the tree and every reader share. Made only by [`Writer::new`] and [`Writer::restore`].
 pub(crate) struct Shared {
     table: AtomicPtr<Table>,
-    names: Names,
     /// The tables replaced by collections, until no reader's task can be in them. Locked by
     /// the writer alone (readers never touch it), so never contended.
     retired: Mutex<Limbo>,
@@ -601,15 +1003,19 @@ impl Shared {
         // the load) to end; the `Snapshot` holds the task, and lends the table only for as
         // long as it lives.
         let table = unsafe { &*table };
-        Snapshot { table, names: &self.names, _task: task }
+        Snapshot { table, _task: task }
     }
 }
 
 impl Drop for Shared {
     fn drop(&mut self) {
         let table = *self.table.get_mut();
+        if table.is_null() {
+            return;
+        }
         // SAFETY: the last owner: no reader or writer is left, so nobody reads the published
-        // `Box` (the limbo drops the retired tables with it, for the same reason).
+        // `Box` (the limbo drops the retired tables with it, for the same reason). Only
+        // `Writer::into_table` leaves it null, having taken the `Box`.
         drop(unsafe { Box::from_raw(table) });
     }
 }
@@ -617,7 +1023,6 @@ impl Drop for Shared {
 /// The tree as it was when [`Shared::read`] was called. Not `Send`: its task is the thread's.
 pub(crate) struct Snapshot<'a> {
     table: &'a Table,
-    names: &'a Names,
     _task: Guard,
 }
 
@@ -627,7 +1032,7 @@ impl Snapshot<'_> {
     }
 
     pub(crate) fn names(&self) -> &Names {
-        self.names
+        &self.table.names
     }
 }
 
@@ -639,13 +1044,36 @@ pub(crate) struct Writer {
 
 impl Writer {
     pub(crate) fn new() -> Writer {
-        let table = Box::into_raw(Box::new(Table::new(0)));
-        let shared = Shared {
-            table: AtomicPtr::new(table),
-            names: Names::new(),
-            retired: Mutex::new(Limbo::new()),
-        };
+        Writer::publish(Table::new(0))
+    }
+
+    fn publish(table: Table) -> Writer {
+        let table = Box::into_raw(Box::new(table));
+        let shared = Shared { table: AtomicPtr::new(table), retired: Mutex::new(Limbo::new()) };
         Writer { shared: Arc::new(shared) }
+    }
+
+    /// A tree whose first generation is `base`, read in place from `mapped`'s image. `base`
+    /// must lie in the image's bytes (else `Err`, and nothing is borrowed) and be a tree
+    /// ([`Base::check`]).
+    pub(crate) fn restore(mapped: Arc<Mapped>, base: Base<'_>) -> Result<Writer, &'static str> {
+        if !base.within(mapped.image.owner().bytes()) {
+            return Err("a base that is not in its image's bytes");
+        }
+        base.check(mapped.blobs.len)?;
+        // SAFETY: every slice of `base` lies in the image's bytes (checked above), which stay
+        // at one address, unwritten, for as long as the image lives (`Stable`'s contract). The
+        // table holds the image through `mapped` for its whole life, and lends the base only
+        // through `&self`, so no borrow outlives it.
+        let base: Base<'static> = unsafe { std::mem::transmute::<Base<'_>, Base<'static>>(base) };
+        let names = Names {
+            base_spans: base.spans,
+            base_bytes: base.name_bytes,
+            base_index: base.name_index,
+            ..Names::new()
+        };
+        let table = Table { base, names, mapped: Some(mapped), ..Table::new(0) };
+        Ok(Writer::publish(table))
     }
 
     /// A handle for readers.
@@ -662,19 +1090,19 @@ impl Writer {
     }
 
     pub(crate) fn names(&self) -> &Names {
-        &self.shared.names
+        &self.table().names
     }
 
     /// Interns `name`, which is not interned yet; returns its number.
     pub(crate) fn intern(&mut self, name: &str) -> u32 {
         // SAFETY: `&mut self`: the one writer.
-        unsafe { self.shared.names.intern(name) }
+        unsafe { self.table().names.intern(name) }
     }
 
     /// The node of the file `id` with `bytes`, added if it is new.
     pub(crate) fn file(&mut self, id: ContentId, bytes: Arc<[u8]>) -> u32 {
         // SAFETY: `&mut self`: the one writer.
-        unsafe { self.table().add_file(id, bytes) }
+        unsafe { self.table().add_file(id, Blob::Heap(bytes)) }
     }
 
     /// The node of the directory `id` with `entries` (name, node, mode byte), added if new.
@@ -703,6 +1131,16 @@ impl Writer {
         retired.collect();
         retired.len()
     }
+
+    /// Its table, to publish in another tree's place ([`Writer::replace`]); `None` when a
+    /// reader has a handle on it, which would then read nothing.
+    pub(crate) fn into_table(self) -> Option<Building> {
+        let mut shared = Arc::try_unwrap(self.shared).ok()?;
+        let table = std::mem::replace(shared.table.get_mut(), ptr::null_mut());
+        // SAFETY: `table` is the published `Box`, unlinked above; with the `Arc` unwrapped
+        // nobody else can load it, and `Shared`'s drop skips the null left in its place.
+        Some(Building(*unsafe { Box::from_raw(table) }))
+    }
 }
 
 /// The next generation, filled by a collection before [`Writer::replace`] publishes it.
@@ -714,9 +1152,29 @@ impl Building {
         Building(Table::new(count))
     }
 
+    /// A table for `count` nodes after `from`: its names with their numbers, and its image, so
+    /// a file of the image stays where it is ([`Building::file_of`]).
+    pub(crate) fn after(from: &Table, count: usize) -> Building {
+        let (names, mapped) = (from.names.carry(), from.mapped.clone());
+        Building(Table { names, mapped, ..Table::new(count) })
+    }
+
     pub(crate) fn file(&mut self, id: ContentId, bytes: Arc<[u8]>) -> u32 {
         // SAFETY: `&mut self` on a table nobody else has yet.
-        unsafe { self.0.add_file(id, bytes) }
+        unsafe { self.0.add_file(id, Blob::Heap(bytes)) }
+    }
+
+    /// The file `id` whose bytes are those of the file `shape` of `from`, the table this one
+    /// is [`Building::after`]: the same `Arc`, or the same range of the image, unread.
+    pub(crate) fn file_of(&mut self, id: ContentId, from: &Table, shape: Shape) -> u32 {
+        let blob = match from.blob_at(shape) {
+            BlobAt::Base(&at, &len) | BlobAt::Column(&Blob::Mapped { at, len }) => {
+                Blob::Mapped { at, len }
+            }
+            BlobAt::Column(Blob::Heap(bytes)) => Blob::Heap(bytes.clone()),
+        };
+        // SAFETY: as above.
+        unsafe { self.0.add_file(id, blob) }
     }
 
     pub(crate) fn dir(&mut self, id: ContentId, entries: &[(u32, u32, u8)]) -> u32 {

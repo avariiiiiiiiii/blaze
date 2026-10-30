@@ -769,10 +769,6 @@ mod tests {
     }
 
     fn read(query: &mut ActiveQuery, input: DatabaseKeyIndex, fingerprint: Fingerprint) {
-        #[cfg(feature = "accumulator")]
-        let accumulated = crate::accumulator::accumulated_map::AtomicInputAccumulatedValues::new(
-            Default::default(),
-        );
         query.add_read(
             input,
             Durability::LOW,
@@ -782,7 +778,7 @@ mod tests {
             #[cfg(feature = "accumulator")]
             false,
             #[cfg(feature = "accumulator")]
-            &accumulated,
+            crate::accumulator::accumulated_map::InputAccumulatedValues::Empty,
         );
     }
 

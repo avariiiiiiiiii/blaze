@@ -25,6 +25,9 @@ The input is one JSON object (inline, a file's path, or `-`):
     critical_slack  the cold build of blaze takes at most this many times its critical path (1.25)
     restart_slack_ms  the restart budget: the first answer after a restart at most this many ms
                     over the warm answer, beyond the Linux statx sweep (5.0)
+    activation      the restart budget with the daemon socket-activated: `blaze daemon install`
+                    in the harness's environment before it and `blaze daemon uninstall` after,
+                    which replaces the user's own units (false: the command line starts it)
     self_edit       the body edit of the CI budget: `file` of this checkout and `opening`, the
                     line that opens a function, after which a statement is added
     self_test       the arguments of `blaze test` in the CI budget (none: the workspace's default)
@@ -177,6 +180,7 @@ class Input:
     noise: float = 0.05
     critical_slack: float = 1.25
     restart_slack_ms: float = 5.0
+    activation: bool = False
     self_edit: SelfEdit = SelfEdit()
     self_test: tuple[str, ...] = ()
     keep: bool = False
@@ -1231,29 +1235,39 @@ def restart(eng: engine.Engine, args: Input, ws: Path, env: dict[str, str], how:
         served(eng, step, eng.build(step, ws, env, [], "check"))
         return (time.monotonic() - began) * 1000
 
+    def units(verb: str) -> None:
+        eng.command(f"`blaze daemon {verb}`", "daemon", [verb], ws, env, 300).checked(f"`blaze daemon {verb}`")
+
     said = {"clean": "a clean stop", "kill9": "kill -9 of the daemon's process group"}[how]
-    check("the no-op check that warms up")
+    if args.activation:
+        units("install")
     warm: list[float] = []
     first: list[float] = []
-    for n in range(args.runs):
-        warm.append(check(f"warm no-op check {n + 1}"))
-        status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
-        pid = daemon_pid(status.stdout)
-        if how == "clean":
-            eng.stop(ws, env)
-            until_gone(f"the daemon {pid} after `blaze stop`", lambda: alive(pid))
-        else:
-            group = kill_group(pid)
-            until_gone(f"the process group {group} of the daemon {pid} after SIGKILL", lambda: group_runs(group))
-        first.append(check(f"the first answer after {said} {n + 1}"))
+    try:
+        check("the no-op check that warms up")
+        for n in range(args.runs):
+            warm.append(check(f"warm no-op check {n + 1}"))
+            status = eng.command("the daemon's status", "status", [], ws, env, 300).checked("the daemon's status")
+            pid = daemon_pid(status.stdout)
+            if how == "clean":
+                eng.stop(ws, env)
+                until_gone(f"the daemon {pid} after `blaze stop`", lambda: alive(pid))
+            else:
+                group = kill_group(pid)
+                until_gone(f"the process group {group} of the daemon {pid} after SIGKILL", lambda: group_runs(group))
+            first.append(check(f"the first answer after {said} {n + 1}"))
+    finally:
+        if args.activation:
+            units("uninstall")
     files = source_files(ws)
     sweeps = sys.platform == "linux"
     warm_ms = statistics.median(warm)
     limit = restart_limit(warm_ms, files, args.restart_slack_ms, sweeps)
     got = timed(first, "ms", warm_median_ms=round(warm_ms, 3), warm_samples_ms=samples(warm), files=files,
-                slack_ms=args.restart_slack_ms, **spread(warm, "ms", "warm_"))
+                slack_ms=args.restart_slack_ms, activated=args.activation, **spread(warm, "ms", "warm_"))
     sweep = f" + the statx sweep of {files} files at {STATX_US_PER_FILE} us each" if sweeps else ""
-    return Measured(got.value, limit, f"after {said}: the warm no-op check's median {warm_ms:.4g} ms + "
+    started = "socket-activated" if args.activation else "started by the command line"
+    return Measured(got.value, limit, f"after {said}, {started}: the warm no-op check's median {warm_ms:.4g} ms + "
                     f"{args.restart_slack_ms:.4g} ms{sweep}", got.numbers, got.interval)
 
 
@@ -1432,8 +1446,10 @@ def selftest() -> None:
     spec = '{"engine": {"kind": "v2", "blaze": "blaze"}, "out": "o.json"'
     given = parse(Input, spec + ', "budgets": ["restart"], "restart_slack_ms": 3.5}', SCRIPT)
     expect(given.budgets == ("restart",) and given.restart_slack_ms == 3.5, f"the restart input: {given}")
-    expect(parse(Input, spec + "}", SCRIPT).restart_slack_ms == 5.0, "the restart slack is 5 ms unless given")
-    for bad in (', "restart_slack_ms": 5}', ', "budgets": ["restart-clean"]}'):
+    plain = parse(Input, spec + "}", SCRIPT)
+    expect(plain.restart_slack_ms == 5.0 and not plain.activation, "5 ms of slack and no activation unless given")
+    expect(parse(Input, spec + ', "activation": true}', SCRIPT).activation, "the restart budget socket-activated")
+    for bad in (', "restart_slack_ms": 5}', ', "budgets": ["restart-clean"]}', ', "activation": 1}'):
         try:
             parse(Input, spec + bad, SCRIPT)
             expect(False, f"the input {bad!r} is refused")

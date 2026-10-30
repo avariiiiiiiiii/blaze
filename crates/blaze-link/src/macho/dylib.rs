@@ -305,6 +305,100 @@ fn trie_exports(
     Ok(out)
 }
 
+/// An export as the reader held it before names moved into the arena: the form the tests
+/// and the reference walk compare in.
+#[cfg(any(test, feature = "fuzz"))]
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Owned {
+    name: String,
+    kind: SymbolKind,
+    weak: bool,
+}
+
+/// The walk as it was before the one-buffer walk: a stack of owned prefixes, a hash set
+/// of the nodes seen, the model `trie_exports` is checked against.
+#[cfg(any(test, feature = "fuzz"))]
+fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Owned>, String> {
+    let classify = |offset: u64| -> SymbolKind {
+        let addr = base.wrapping_add(offset);
+        match sections.iter().find(|it| it.contains(addr)) {
+            Some(section) if section.code() => SymbolKind::Function,
+            _ => SymbolKind::Data,
+        }
+    };
+    let mut out = Vec::new();
+    let mut visited = rustc_hash::FxHashSet::default();
+    let mut stack = vec![(0usize, Vec::new())];
+    while let Some((node, prefix)) = stack.pop() {
+        if !visited.insert(node) {
+            return Err(format!("node {node:#x} is reached twice (a cycle)"));
+        }
+        let mut at = node;
+        let terminal = uleb(data, &mut at)?;
+        if terminal != 0 {
+            let end = usize::try_from(terminal)
+                .ok()
+                .and_then(|it| at.checked_add(it))
+                .filter(|&it| it <= data.len())
+                .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
+            let (kind, weak) =
+                export(&data[at..end], &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
+            out.push(Owned { name: super::core_name(&prefix)?, kind, weak });
+            at = end;
+        }
+        let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
+        at += 1;
+        let mut children = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let label = cstring(data, &mut at)?;
+            let child = uleb(data, &mut at)?;
+            let child = usize::try_from(child)
+                .ok()
+                .filter(|&it| it < data.len())
+                .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
+            let mut name = prefix.clone();
+            name.extend_from_slice(label);
+            children.push((child, name));
+        }
+        stack.extend(children.into_iter().rev());
+    }
+    Ok(out)
+}
+
+#[cfg(any(test, feature = "fuzz"))]
+fn test_sections() -> Vec<Section> {
+    let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+    vec![
+        Section { addr: 0x4000, size: 0x100, flags: 0 },
+        Section { addr: 0x1000, size: 0x100, flags: code },
+        Section { addr: 0x4100, size: 0x30, flags: macho::S_THREAD_LOCAL_VARIABLES },
+        Section { addr: 0x2000, size: 0, flags: code },
+    ]
+}
+
+/// [`trie_exports`] against [`reference_trie_exports`] (`crate::fuzz_trie_differential`).
+#[cfg(feature = "fuzz")]
+pub(crate) fn trie_differential(trie: &[u8]) -> Result<bool, String> {
+    // A library with a zero-sized trie has none: `read_dylib` never walks an empty one.
+    if trie.is_empty() {
+        return Ok(false);
+    }
+    let sections = test_sections();
+    let mut names = Names::default();
+    let new = trie_exports(trie, 0, &sections, &mut names).map(|symbols| {
+        symbols
+            .iter()
+            .map(|it| Owned { name: names.at(it.name).to_owned(), kind: it.kind, weak: it.weak })
+            .collect::<Vec<_>>()
+    });
+    let old = reference_trie_exports(trie, 0, &sections);
+    if new == old {
+        Ok(new.is_ok())
+    } else {
+        Err(format!("trie_exports: {new:?}\nthe reference: {old:?}"))
+    }
+}
+
 /// What a terminal node's export info says: the symbol's kind and whether it is weak.
 fn export(info: &[u8], classify: &dyn Fn(u64) -> SymbolKind) -> Result<(SymbolKind, bool), String> {
     let known = u64::from(
@@ -614,15 +708,6 @@ mod tests {
         out
     }
 
-    /// An export as the reader held it before names moved into the arena: the form the tests
-    /// and the reference walk compare in.
-    #[derive(Clone, PartialEq, Eq, Debug)]
-    struct Owned {
-        name: String,
-        kind: SymbolKind,
-        weak: bool,
-    }
-
     fn sym(name: &str, kind: SymbolKind, weak: bool) -> Owned {
         Owned { name: name.to_owned(), kind, weak }
     }
@@ -828,55 +913,6 @@ mod tests {
         }
     }
 
-    /// The walk as it was before the one-buffer walk: a stack of owned prefixes, a hash set
-    /// of the nodes seen, the model `trie_exports` is checked against.
-    fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Owned>, String> {
-        let classify = |offset: u64| -> SymbolKind {
-            let addr = base.wrapping_add(offset);
-            match sections.iter().find(|it| it.contains(addr)) {
-                Some(section) if section.code() => SymbolKind::Function,
-                _ => SymbolKind::Data,
-            }
-        };
-        let mut out = Vec::new();
-        let mut visited = rustc_hash::FxHashSet::default();
-        let mut stack = vec![(0usize, Vec::new())];
-        while let Some((node, prefix)) = stack.pop() {
-            if !visited.insert(node) {
-                return Err(format!("node {node:#x} is reached twice (a cycle)"));
-            }
-            let mut at = node;
-            let terminal = uleb(data, &mut at)?;
-            if terminal != 0 {
-                let end = usize::try_from(terminal)
-                    .ok()
-                    .and_then(|it| at.checked_add(it))
-                    .filter(|&it| it <= data.len())
-                    .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
-                let (kind, weak) =
-                    export(&data[at..end], &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
-                out.push(Owned { name: super::super::core_name(&prefix)?, kind, weak });
-                at = end;
-            }
-            let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
-            at += 1;
-            let mut children = Vec::with_capacity(usize::from(count));
-            for _ in 0..count {
-                let label = cstring(data, &mut at)?;
-                let child = uleb(data, &mut at)?;
-                let child = usize::try_from(child)
-                    .ok()
-                    .filter(|&it| it < data.len())
-                    .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
-                let mut name = prefix.clone();
-                name.extend_from_slice(label);
-                children.push((child, name));
-            }
-            stack.extend(children.into_iter().rev());
-        }
-        Ok(out)
-    }
-
     struct Rng(u64);
 
     impl Rng {
@@ -914,16 +950,6 @@ mod tests {
             terminal: random_info(rng),
             children: (0..children).map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1))).collect(),
         }
-    }
-
-    fn test_sections() -> Vec<Section> {
-        let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
-        vec![
-            Section { addr: 0x4000, size: 0x100, flags: 0 },
-            Section { addr: 0x1000, size: 0x100, flags: code },
-            Section { addr: 0x4100, size: 0x30, flags: macho::S_THREAD_LOCAL_VARIABLES },
-            Section { addr: 0x2000, size: 0, flags: code },
-        ]
     }
 
     /// The one-buffer walk against the reference over seeded tries, and over the same tries

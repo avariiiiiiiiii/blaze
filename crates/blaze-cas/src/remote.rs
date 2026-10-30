@@ -284,6 +284,7 @@ fn owed(buffer: &[u8]) -> usize {
 fn place(at: &Address) -> String {
     match at {
         Address::Unix(name) => format!("unix:{name}"),
+        Address::Inherited { fd, at } => format!("unix:{at} (fd {fd})"),
         Address::Tcp(addr) => format!("tcp:{addr}"),
     }
 }

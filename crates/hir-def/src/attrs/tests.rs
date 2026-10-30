@@ -961,6 +961,55 @@ fn link_attrs_read_as_the_string_match_did() {
     }
 }
 
+#[test]
+fn rustc_words_are_flags() {
+    let db = TestDB::with_files(
+        r#"
+#[rustc_insignificant_dtor]
+pub struct Insignificant;
+#[cfg_attr(all(), rustc_insignificant_dtor)]
+pub struct InsignificantByCfgAttr;
+#[cfg_attr(any(), rustc_insignificant_dtor)]
+pub struct NotInsignificant;
+#[rustc_as_ptr]
+pub fn as_ptr() {}
+#[rustc_no_implicit_autorefs]
+pub fn no_implicit_autorefs() {}
+#[rustc_never_returns_null_ptr]
+pub fn never_returns_null_ptr() {}
+extern "C" {
+    #[rustc_canonical_symbol]
+    pub fn memcpy();
+}
+#[a::rustc_as_ptr]
+pub fn two_segments() {}
+"#,
+    );
+    let def_map = crate_def_map(&db, db.fetch_test_crate());
+    let scope = def_map.module(&db, def_map.root).scope(&db);
+    let flags = |name: &str| {
+        let (_, per_ns) = scope.entries().find(|(it, _)| it.as_str() == name).unwrap();
+        let def = match per_ns.take_types().or(per_ns.take_values()).unwrap() {
+            ModuleDefId::AdtId(it) => AttrDefId::AdtId(it),
+            ModuleDefId::FunctionId(it) => AttrDefId::FunctionId(it),
+            it => panic!("{it:?}"),
+        };
+        AttrFlags::query(&db, def)
+    };
+    for (name, flag) in [
+        ("Insignificant", AttrFlags::RUSTC_INSIGNIFICANT_DTOR),
+        ("InsignificantByCfgAttr", AttrFlags::RUSTC_INSIGNIFICANT_DTOR),
+        ("as_ptr", AttrFlags::RUSTC_AS_PTR),
+        ("no_implicit_autorefs", AttrFlags::RUSTC_NO_IMPLICIT_AUTOREFS),
+        ("never_returns_null_ptr", AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR),
+        ("memcpy", AttrFlags::RUSTC_CANONICAL_SYMBOL),
+    ] {
+        assert!(flags(name).contains(flag), "{name}");
+    }
+    assert!(!flags("NotInsignificant").contains(AttrFlags::RUSTC_INSIGNIFICANT_DTOR));
+    assert!(!flags("two_segments").contains(AttrFlags::RUSTC_AS_PTR));
+}
+
 mod stability {
     use hir_expand::Lookup;
     use intern::Symbol;

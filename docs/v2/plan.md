@@ -30,6 +30,7 @@ plan/
     model.md             one warm VM, branches as views
     data.md              data-oriented layout, compression tiers
     hardware.md          SIMD, huge pages, io_uring, no GPU
+    prior-art.md         Flecs, ECS and game-engine techniques and where each lands
     memory.md            game-engine memory: allocators by lifetime, reserved regions, pools, handles, budgets
     concurrency.md       reads never lock, immutable values, task-boundary reclamation, no build lock
     frontend.md          rust-analyzer's design choices that cost a compiler, and v2's fixes

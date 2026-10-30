@@ -370,10 +370,11 @@ impl<'a> Checked<'a> {
                 return Err(refused(format!("{what} {text} is not an absolute path")));
             }
             plain(what, text)?;
-            if manager == Manager::Systemd && what != "blaze's executable" {
-                if let Some(bad) = text.chars().find(|it| it.is_whitespace() || *it == '\\') {
-                    return Err(refused(format!("{what} {text:?} holds {bad:?}, which a systemd unit cannot name it with")));
-                }
+            if manager == Manager::Systemd
+                && what != "blaze's executable"
+                && let Some(bad) = text.chars().find(|it| it.is_whitespace() || *it == '\\')
+            {
+                return Err(refused(format!("{what} {text:?} holds {bad:?}, which a systemd unit cannot name it with")));
             }
             Ok(text)
         };

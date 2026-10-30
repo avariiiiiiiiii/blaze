@@ -151,6 +151,14 @@ build's view is the checkout as saved: a CLI request names the head of its check
 holds it until the head's watcher has seen every change made before the request (a cookie file
 written by the daemon in the checkout's `target/` and waited for, as watchman does).
 
+The front end's database is shared by reference, never cloned (decisions.md): the loop owns each
+job's lowered front end, and a task that reads it holds a shared reference for its run. A build
+script's output or a proc macro's load is a write, applied once the readers posted before it
+have returned and before any reader is posted after it. Every write ready at that point is applied
+as one, so a wave of build scripts is one stop; tasks that don't read the front end keep running.
+A git fetch clones into a directory of its own under the daemon's state and is removed once read:
+no lock, nothing written to the user's `$CARGO_HOME`.
+
 ## 7. The CLI
 
 `blaze build|run|test|check|bench` and `cargo blaze <same>`: parse as cargo does (v1's

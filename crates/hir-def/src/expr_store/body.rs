@@ -113,6 +113,7 @@ impl Body {
     /// [`Body::of`], with the same ids, but lowered again with the map.
     #[salsa::tracked(lru = 512, returns(ref))]
     pub fn with_source_map(
+        // dyn: salsa's database handle, as every query takes it
         db: &dyn SourceDatabase,
         def: DefWithBodyId,
     ) -> (Arc<Body>, BodySourceMap) {
@@ -121,6 +122,7 @@ impl Body {
             let of = Self::of(db, def);
             let (body, source_map) = lower_in_file(db, def, of.lowering_with_source_map());
             assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
+            // alloc: the query's value, one per lowered body
             return (Arc::new(body), source_map);
         };
         let syntax = body_syntax(db, def).as_ref().expect("lowered without its syntax");
@@ -155,6 +157,7 @@ impl Body {
             assert_eq!(in_file, source_map, "{def:?}: the source map lowered alone, moved");
             assert_eq!(whole.params.len(), body.params.len());
         }
+        // clone: an `Arc`, shared with `Body::relative`'s value
         (body.clone(), source_map)
     }
 
@@ -167,6 +170,7 @@ impl Body {
     /// blocks, and checked equal to it.
     #[salsa::tracked(lru = 4096, returns(ref))]
     pub fn relative(
+        // dyn: salsa's database handle, as every query takes it
         db: &dyn SourceDatabase,
         def: DefWithBodyId,
     ) -> Option<(Arc<Body>, BodySourceMap)> {
@@ -175,6 +179,7 @@ impl Body {
         let of = Self::of(db, def);
         let (body, source_map) = lower_relative(db, def, of.lowering_with_source_map())?;
         assert_eq!(body, *of, "{def:?}: the body lowered with its source map");
+        // alloc: the query's value, one per lowered body
         Some((Arc::new(body), source_map))
     }
 
@@ -183,12 +188,14 @@ impl Body {
     /// part of them is written, so their maps are built only when read: [`Body::relative`] and
     /// [`Body::with_source_map`] lower the body again, with the map and this body's blocks.
     #[salsa::tracked(returns(deref))]
+    // dyn: salsa's database handle, as every query takes it
     pub fn of(db: &dyn SourceDatabase, def: DefWithBodyId) -> Arc<Body> {
         let _p = tracing::info_span!("body_query").entered();
         let body = match lower_relative(db, def, BodyLowering::Body) {
             Some((body, _)) => body,
             None => lower_in_file(db, def, BodyLowering::Body).0,
         };
+        // alloc: the query's value, one per lowered body
         Arc::new(body)
     }
 }
@@ -202,6 +209,7 @@ impl Body {
 
     /// Where in its file the anchor of [`body_syntax`] begins, which the source map of
     /// [`Body::relative`] is relative to. `None` for a body a macro writes.
+    // dyn: salsa's database handle, as every query takes it
     pub fn anchor_offset(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<TextSize> {
         let syntax = body_syntax(db, def).as_ref()?;
         Some(def_syntax(db, def).value.text_range().start() - syntax.item.text_range().start())
@@ -211,6 +219,7 @@ impl Body {
     /// [`Body::with_source_map`] when there is not: for what needs of it only the file or the
     /// expansion each part is written in, and the macro calls, and not where in the file.
     /// It stays the same while edits elsewhere in the file move the body.
+    // dyn: salsa's database handle, as every query takes it
     pub fn unmoved_source_map(db: &dyn SourceDatabase, def: DefWithBodyId) -> &BodySourceMap {
         match Self::relative(db, def) {
             Some((_, source_map)) => source_map,
@@ -220,11 +229,16 @@ impl Body {
 }
 
 /// The syntax of the item `def` is the body of.
+// dyn: salsa's database handle, as every query takes it
 fn def_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> InFile<SyntaxNode> {
     match def {
+        // clone: a syntax node handle (a refcount), once per query
         DefWithBodyId::FunctionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        // clone: a syntax node handle (a refcount), once per query
         DefWithBodyId::ConstId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        // clone: a syntax node handle (a refcount), once per query
         DefWithBodyId::StaticId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        // clone: a syntax node handle (a refcount), once per query
         DefWithBodyId::VariantId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
     }
 }
@@ -232,6 +246,7 @@ fn def_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> InFile<SyntaxNode>
 /// Lowers the body of `def` from [`body_syntax`], as `lowering` says. `None` when the body is
 /// not written in a file, but by a macro.
 fn lower_relative(
+    // dyn: salsa's database handle, as every query takes it
     db: &dyn SourceDatabase,
     def: DefWithBodyId,
     lowering: BodyLowering<'_>,
@@ -241,15 +256,15 @@ fn lower_relative(
     let (mut params, mut is_async_fn, mut is_gen_fn) = (None, false, false);
     let body = match def {
         DefWithBodyId::FunctionId(_) => {
-            let it = ast::Fn::cast(node.clone())?;
+            let it = ast::Fn::cast(node)?;
             params = it.param_list();
             is_async_fn = it.async_token().is_some();
             is_gen_fn = it.gen_token().is_some();
             it.body().map(ast::Expr::from)
         }
-        DefWithBodyId::ConstId(_) => ast::Const::cast(node.clone())?.body(),
-        DefWithBodyId::StaticId(_) => ast::Static::cast(node.clone())?.body(),
-        DefWithBodyId::VariantId(_) => ast::Variant::cast(node.clone())?.const_arg()?.expr(),
+        DefWithBodyId::ConstId(_) => ast::Const::cast(node)?.body(),
+        DefWithBodyId::StaticId(_) => ast::Static::cast(node)?.body(),
+        DefWithBodyId::VariantId(_) => ast::Variant::cast(node)?.const_arg()?.expr(),
     };
     let maps = Some((&*syntax.span_map, &*syntax.ast_id_map));
     Some(lower_body(
@@ -270,6 +285,7 @@ fn lower_relative(
 /// Lowers the body of `def` from the whole file it is in, as `lowering` says. What a body
 /// written by a macro is lowered with, and what [`check_relative`] checks the others against.
 fn lower_in_file(
+    // dyn: salsa's database handle, as every query takes it
     db: &dyn SourceDatabase,
     def: DefWithBodyId,
     lowering: BodyLowering<'_>,
@@ -388,10 +404,12 @@ impl std::fmt::Debug for BodySyntax {
 
 impl BodySyntax {
     /// The anchor as the root of a tree of its own.
+    // dyn: salsa's database handle, as every query takes it
     pub fn root(&self, db: &dyn SourceDatabase) -> SyntaxNode {
         let kept = trees::get(self.tree).filter(|_| !check_relative());
         kept.unwrap_or_else(|| {
             let root = self.reparse().unwrap_or_else(|| self.from_file(db));
+            // clone: a syntax node handle (a refcount) for this thread's tree cache
             trees::put(self.tree, root.clone(), None);
             root
         })
@@ -431,6 +449,7 @@ impl BodySyntax {
     }
 
     /// The anchor from the tree of its file, for one that parses differently alone.
+    // dyn: salsa's database handle, as every query takes it
     fn from_file(&self, db: &dyn SourceDatabase) -> SyntaxNode {
         if check_relative() {
             eprintln!(
@@ -512,6 +531,7 @@ fn kept(anchor: &SyntaxNode) -> (u128, SyntaxNode) {
     }
     let tree = tree_hash(anchor);
     let root = trees::get(tree).unwrap_or_else(|| anchor.clone_subtree());
+    // clone: a syntax node handle (a refcount) for this thread's tree cache
     trees::put(tree, root.clone(), Some(anchor));
     (tree, root)
 }
@@ -558,10 +578,12 @@ mod trees {
         let of = |it: &&KeptMaps| {
             it.1 == at && it.2 == file_id && std::ptr::eq(it.0.as_ptr(), Arc::as_ptr(file))
         };
+        // clone: `Arc`s of an anchor's maps, shared by its bodies
         if let Some(found) = MAPS.with_borrow(|maps| maps.iter().find(of).map(|it| it.3.clone())) {
             return found;
         }
         let made = make();
+        // clone: `Arc`s of an anchor's maps, shared by its bodies
         let kept = (Arc::downgrade(file), at, file_id, made.clone());
         MAPS.with_borrow_mut(|maps| {
             if maps.len() == KEPT_MAPS {
@@ -573,6 +595,7 @@ mod trees {
     }
 
     pub(super) fn get(tree: u128) -> Option<SyntaxNode> {
+        // clone: a syntax node handle (a refcount) from this thread's tree cache
         TREES.with_borrow(|trees| trees.iter().find(|it| it.0 == tree).map(|it| it.1.clone()))
     }
 
@@ -585,6 +608,7 @@ mod trees {
                     *of_at == at && std::ptr::eq(of.as_ptr(), Arc::as_ptr(file))
                 })
             };
+            // clone: a syntax node handle (a refcount) from this thread's tree cache
             trees.iter().find(of).map(|it| (it.0, it.1.clone()))
         })
     }
@@ -603,6 +627,7 @@ mod trees {
 
 /// The [`BodySyntax`] of a body written in a file, `None` for one a macro writes.
 #[salsa::tracked(returns(ref))]
+// dyn: salsa's database handle, as every query takes it
 pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySyntax> {
     let src = def_syntax(db, def);
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
@@ -627,7 +652,9 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     let (file, edition) = src.file_id.file_id()?.unpack(db);
     let AnchorMaps { ast_id_map, span_map, outline } = trees::maps(&anchor, src.file_id, || {
         AnchorMaps {
+            // alloc: one per anchor, shared by its bodies
             ast_id_map: Arc::new(ast_id_map.relative_to(&anchor, &root)),
+            // alloc: one per anchor, shared by its bodies
             span_map: Arc::new(span_map.within(anchor.text_range())),
             outline: holds_lazy(&anchor),
         }
@@ -635,6 +662,7 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
     Some(BodySyntax {
         file_id: src.file_id,
         tree,
+        // clone: an `Arc<str>` of the file's text (a refcount)
         text: db.file_text(file).text(db).clone(),
         range: anchor.text_range(),
         kind: anchor.kind(),
@@ -663,6 +691,7 @@ impl Body {
 
     pub fn pretty_print(
         &self,
+        // dyn: salsa's database handle, as every query takes it
         db: &dyn SourceDatabase,
         owner: DefWithBodyId,
         edition: Edition,
@@ -672,6 +701,7 @@ impl Body {
 
     pub fn pretty_print_expr(
         &self,
+        // dyn: salsa's database handle, as every query takes it
         db: &dyn SourceDatabase,
         owner: DefWithBodyId,
         expr: ExprId,
@@ -682,6 +712,7 @@ impl Body {
 
     pub fn pretty_print_pat(
         &self,
+        // dyn: salsa's database handle, as every query takes it
         db: &dyn SourceDatabase,
         owner: ExpressionStoreOwnerId,
         pat: PatId,

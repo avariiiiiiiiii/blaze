@@ -40,7 +40,11 @@ use crate::Error;
 /// The verdict is the source's alone: the flags the script itself is compiled with must be
 /// ones [`flags_allow`] accepts.
 pub fn elide(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>) -> Option<Vec<u8>> {
-    let source = std::str::from_utf8(files.get(root)?).ok()?;
+    let source = files.get(root)?;
+    if !may_open_main(source) {
+        return None;
+    }
+    let source = std::str::from_utf8(source).ok()?;
     let limit = PRINTED_PER_BYTE * source.len();
     let source = lex::normalize(source);
     let printed = printed(Tokens::new(&source).ok()?, limit)?;
@@ -135,6 +139,17 @@ fn directives_only(printed: &str) -> bool {
 /// The next token, or none at the end or at a refusal: either leaves the script unread.
 fn next<'a>(tokens: &mut Tokens<'a>) -> Option<Token<'a>> {
     tokens.next()?.ok()
+}
+
+/// Whether the root file's first token may open the forms read: a comment or doc comment
+/// (`/`) or `fn` (`f`), after a byte order mark and white space. Most scripts start with
+/// `use` and are refused here, at their first bytes, before the file is validated, normalized
+/// or lexed. A byte that is not ASCII may be white space Rust reads (U+200E and the rest), so
+/// it is left to the lexer.
+fn may_open_main(source: &[u8]) -> bool {
+    let source = source.strip_prefix(b"\xef\xbb\xbf").unwrap_or(source);
+    let first = source.iter().find(|it| !matches!(it, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c));
+    first.is_none_or(|it| matches!(it, b'/' | b'f') || !it.is_ascii())
 }
 
 /// What a script may print per byte of its root file for elision to read it. A placeholder

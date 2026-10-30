@@ -2139,3 +2139,20 @@ are rustc's (`places_are_rustcs` in `crates/span/src/lines/tests.rs`). A text wi
 its byte order mark has rustc's line 0, which this trait's 0-based line can't say; that is
 `Err(())`, a place no token can be at.
 Status: open
+
+## 21. From lane cargo (to the coordinator, 2026-10-29 19:30): request 1 is what the lane's "Done when" waits on
+
+`docs/v2/plan/lanes/cargo.md`'s "Done when" has the workspace load as queries and a report
+saying `STATUS: DONE`. The load is written and cannot be finished until request 1 (and its
+addenda 5, 14 and 19) is granted: `crates/blaze-units/src/load/` and `crates/blaze-tree/src/query.rs`
+call `blaze_manifest::files::Files`, `Config::load_with`, `Context::with_files`,
+`Workspace.offline_flag`, `Config::cli_unstable`, `Dependency.artifact`, the public
+`Serialized*` fields and `blaze_metadata` on `blaze_units::Read`, which lane cargo writes once
+the five crates are its. decisions.md ("Everything is ours at every level", "Finished code only")
+supports the grant; lane cargo can't report DONE without it.
+
+Also done in lane cargo's own paths after the plan's reorganization: the git fetch takes no
+lock and writes nothing in the user's `$CARGO_HOME` (`serve/fetch/git.rs`, decisions.md "no build
+lock"); child cargo-sync makes `load-cargo` and `serve/` share the front end's database by
+reference (decisions.md, `v2/requests/db-salsa.md`'s load-cargo and blaze-cargo items); child
+cargo-sol writes `docs/v2/plan/lanes/cargo/speed-of-light.md`.

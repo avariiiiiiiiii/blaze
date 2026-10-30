@@ -15,6 +15,7 @@
 
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Command,
@@ -602,24 +603,19 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     Ok(merged(inherited, cmd))
 }
 
-/// A variable of the environment before it is sorted: inherited (borrowed) or set by cargo.
-struct Entry<'i> {
+/// A variable cargo sets (or takes away), before it is sorted.
+struct Entry {
     /// The name's first eight bytes, big-endian: most comparisons of names end here.
     order: u64,
-    name: Cow<'i, OsStr>,
-    value: Option<Cow<'i, OsStr>>,
+    name: OsString,
+    value: Option<OsString>,
     from_unit: bool,
     /// Which word on its name it is: a later one wins.
     seq: u32,
 }
 
-impl<'i> Entry<'i> {
-    fn new(
-        name: Cow<'i, OsStr>,
-        value: Option<Cow<'i, OsStr>>,
-        from_unit: bool,
-        seq: usize,
-    ) -> Self {
+impl Entry {
+    fn new(name: OsString, value: Option<OsString>, from_unit: bool, seq: usize) -> Self {
         let bytes = name.as_encoded_bytes();
         let mut first = [0u8; 8];
         let len = bytes.len().min(8);
@@ -628,38 +624,61 @@ impl<'i> Entry<'i> {
     }
 }
 
-/// What cargo inherits with what it sets over it: sorted once, the last word on each name
-/// kept, and what is taken away left out.
+/// What cargo inherits with what it sets over it, sorted by name, the last word on each name
+/// kept and what is taken away left out. What cargo sets is sorted; what is inherited is
+/// the same for every script of a build, so a caller that passes it sorted (each name once)
+/// pays one pass to check that, not a sort; otherwise its indices are sorted. The two are
+/// then merged, what cargo sets winning, and an inherited variable is copied only where kept.
 fn merged(inherited: &[(OsString, OsString)], cmd: Explicit) -> Env {
-    let mut entries: Vec<Entry<'_>> = Vec::with_capacity(inherited.len() + cmd.vars.len());
-    for (name, value) in inherited {
-        let seq = entries.len();
-        entries.push(Entry::new(
-            Cow::Borrowed(name.as_os_str()),
-            Some(Cow::Borrowed(value.as_os_str())),
-            false,
-            seq,
-        ));
-    }
-    for (name, value) in cmd.vars {
-        let seq = entries.len();
+    let mut own: Vec<Entry> = Vec::with_capacity(cmd.vars.len());
+    for (seq, (name, value)) in cmd.vars.into_iter().enumerate() {
         let from_unit = value.is_some();
-        let name = OsString::from(name.into_owned());
-        entries.push(Entry::new(Cow::Owned(name), value.map(Cow::Owned), from_unit, seq));
+        own.push(Entry::new(OsString::from(name.into_owned()), value, from_unit, seq));
     }
-    entries.sort_unstable_by(|a, b| {
-        a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)).then(a.seq.cmp(&b.seq))
+    own.sort_unstable_by(|a, b| {
+        a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)).then(b.seq.cmp(&a.seq))
     });
-    let mut vars = Vec::with_capacity(entries.len());
-    let mut from_unit = Vec::with_capacity(entries.len());
-    let mut entries = entries.into_iter().peekable();
-    while let Some(entry) = entries.next() {
-        if entries.peek().is_some_and(|next| next.name == entry.name) {
-            continue;
+    own.dedup_by(|later, first| later.name == first.name);
+
+    let order: Option<Vec<u32>> = (!inherited.is_sorted_by(|a, b| a.0 < b.0)).then(|| {
+        let mut order: Vec<u32> = (0..inherited.len() as u32).collect();
+        order.sort_unstable_by(|a, b| {
+            inherited[*a as usize].0.cmp(&inherited[*b as usize].0).then(b.cmp(a))
+        });
+        order.dedup_by(|later, first| inherited[*later as usize].0 == inherited[*first as usize].0);
+        order
+    });
+    let kept = order.as_ref().map_or(inherited.len(), Vec::len);
+    let inherited_at = |at: usize| match &order {
+        Some(order) => order.get(at).map(|it| &inherited[*it as usize]),
+        None => inherited.get(at),
+    };
+
+    let mut vars = Vec::with_capacity(kept + own.len());
+    let mut from_unit = Vec::with_capacity(kept + own.len());
+    let mut own = own.into_iter().peekable();
+    let mut at = 0;
+    loop {
+        let next_inherited = inherited_at(at);
+        let next = match (own.peek(), next_inherited) {
+            (None, None) => break,
+            (Some(set), Some((name, _))) => set.name.cmp(name),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+        };
+        if next != Ordering::Less
+            && let Some((name, value)) = next_inherited
+        {
+            at += 1;
+            if next == Ordering::Greater {
+                vars.push((name.clone(), value.clone()));
+                from_unit.push(false);
+                continue;
+            }
         }
-        if let Some(value) = entry.value {
-            vars.push((entry.name.into_owned(), value.into_owned()));
-            from_unit.push(entry.from_unit);
+        if let Some(Entry { name, value: Some(value), from_unit: set_from_unit, .. }) = own.next() {
+            vars.push((name, value));
+            from_unit.push(set_from_unit);
         }
     }
     Env { vars, from_unit }

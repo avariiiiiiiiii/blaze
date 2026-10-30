@@ -27,6 +27,7 @@
 
 use std::{alloc::Layout, fmt, ptr::NonNull};
 
+use blaze_format::SchemaHash;
 use blaze_image::{Corrupt, Image, Refused, Section, SectionId, SectionWriter, Stable};
 
 use crate::{
@@ -42,9 +43,10 @@ pub(crate) struct Shape {
     pub(crate) static_bytes: fn(u32) -> &'static [u8],
     /// The order key of a value's bytes.
     pub(crate) key: fn(&[u8]) -> u64,
-    /// The alignment of a value's bytes, at most [`MAX_ALIGN`]; every value's length is a
-    /// multiple of it.
+    /// The alignment of a value's bytes, at most [`MAX_ALIGN`].
     pub(crate) align: usize,
+    /// Every value's length is a multiple of this, itself a nonzero multiple of `align`.
+    pub(crate) size: usize,
     /// Whether every value is UTF-8, checked when an image is restored.
     pub(crate) text: bool,
 }
@@ -131,7 +133,7 @@ pub(crate) const LAYOUT: &str = "intern table 1: Root at 0; starts u32, keys u64
      free u32 ascending, bytes; value_hash multiply-rotate with murmur3 finalizer";
 
 /// [`Root`]'s record schema.
-pub(crate) const ROOT: blaze_format::SchemaHash = <Root as blaze_format::Record>::SCHEMA;
+pub(crate) const ROOT: SchemaHash = <Root as blaze_format::Record>::SCHEMA;
 
 /// The table's part in the image this process restored, read in place; empty for a fresh one.
 #[derive(Default)]
@@ -410,6 +412,28 @@ impl Table {
         Ok(table)
     }
 
+    /// Makes `cell`'s table the one `image`'s section `id` holds. Refused once `cell` has one:
+    /// its IDs may be the image's.
+    pub(crate) fn restore_into<S: Stable>(
+        cell: &std::sync::OnceLock<Table>,
+        shape: Shape,
+        image: &'static Image<S>,
+        id: SectionId,
+        schema: SchemaHash,
+    ) -> Result<(), RestoreError> {
+        let started = RestoreError::Started { section: id };
+        if cell.get().is_some() {
+            return Err(started);
+        }
+        let section = image.section(id, schema)?;
+        let table = Table::restore(shape, image, &section)?;
+        cell.set(table).map_err(|_| started)
+    }
+
+    /// The checks that make every read of the restored columns in bounds, in O(IDs + slots)
+    /// with no value hashed. That the index reaches every live value under its own hash is
+    /// the section's CRC's to guard: a slot that does not costs a second ID for that value,
+    /// never a wrong value.
     fn validate(&self) -> Result<(), &'static str> {
         let base = &self.base;
         let count = (base.end - self.first) as usize;
@@ -422,7 +446,7 @@ impl Table {
         }
         for index in 0..count {
             let (start, end) = (base.starts[index] as usize, base.starts[index + 1] as usize);
-            if end < start || !start.is_multiple_of(align) || !(end - start).is_multiple_of(align) {
+            if end < start || !start.is_multiple_of(align) || !(end - start).is_multiple_of(self.shape.size) {
                 return Err("a value's bytes out of order or misaligned");
             }
             match base.is_live(index) {
@@ -694,3 +718,6 @@ impl Table {
         out.patch_value(root, &at);
     }
 }
+
+#[cfg(test)]
+mod tests;

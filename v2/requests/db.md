@@ -2485,3 +2485,28 @@ same heading).
 
 Why: frontend.md item 6 ("v2 maps files from the VFS, read in place"): today every file's text
 is copied once on load and kept, as much memory again as the VFS holds.
+
+## speed-hir-store: one counting allocator for hir-def's tests, from `blaze-alloc-count`
+
+What: hir-def's allocation-budget tests share one `#[global_allocator]`. A binary can only have
+one, and today it is a private copy in `nameres/tests/paths.rs`.
+1. Root `Cargo.toml`, `[workspace.dependencies]`, beside the other `blaze-*` path deps:
+   `blaze-alloc-count = { path = "crates/blaze-alloc-count" }`, the form of
+   `blaze-ids` at ~L123.
+2. `crates/hir-def/Cargo.toml`, under `[dev-dependencies]`: `blaze-alloc-count.workspace = true`.
+3. `crates/hir-def/src/lib.rs`, at the end:
+   ```rust
+   #[cfg(test)]
+   #[global_allocator]
+   static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+   ```
+4. `crates/hir-def/src/nameres/tests/paths.rs`:
+   - Delete `#[global_allocator] static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;`
+     (~L745) and the whole `mod alloc_count { .. }` (~L748-805).
+   - At its one use (~L740): `let (res, allocations) = alloc_count::count(resolve);` becomes
+     `let (res, used) = blaze_alloc_count::measure(resolve);`, and
+     `assert_eq!(allocations, 0);` becomes `assert_eq!(used.allocations, 0);`.
+Why: the coordinator's rule 3 (allocation budgets with `blaze-alloc-count`).
+`expr_store/tests/alloc.rs` (new, speed-hir-store) uses `blaze_alloc_count::assert_at_most` for
+store reads, `Body::of`/`ExprScopes::of` memo hits and scope lookups, all with a budget of 0. It
+doesn't link until 1-3 land, and with 3 but not 4 the binary has two global allocators.

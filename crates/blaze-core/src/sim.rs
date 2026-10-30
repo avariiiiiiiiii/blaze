@@ -794,6 +794,10 @@ impl Driver for Sim {
                     continue;
                 }
                 Effect::Listen { at, tag } => {
+                    let at = match at {
+                        Address::Inherited { at, .. } => Address::Unix(at),
+                        at => at,
+                    };
                     match self.listening_at(&at) {
                         Some(_) => self.tell(
                             tag,

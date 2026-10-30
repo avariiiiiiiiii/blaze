@@ -332,3 +332,38 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   unaffected). Once it exists, errors.rs's FIXME block becomes rustc's loop verbatim.
 
 > forwarded to db (db-ty; window `db-next2`, told by tmux).
+- `crates/hir-ty/src/next_solver/fulfill.rs` (db-ty-port-solver): `Obligation::recursion_depth`
+  is now `u32` (infer/traits.rs; `PredicateObligation` 24 -> 20 bytes, asserted). In `Pending`,
+  `recursion_depth: Vec<usize>` -> `Vec<u32>`; the overflow check becomes
+  `obligation.recursion_depth as usize > recursion_limit`, and the increment
+  `obligation.recursion_depth = obligation.recursion_depth.saturating_add(1)` (a limit of
+  `u32::MAX` must not overflow). `obligation_ctxt.rs:58`, `util.rs:819`, `infer/mod.rs:530`
+  (`recursion_depth: 0`) need no change.
+- `crates/hir-ty/src/next_solver/inspect.rs` (db-ty-port-solver), for speed:
+  `BestObligation::non_trivial_candidates` (errors.rs, rustc's rule) only needs nested goals whose
+  `GoalSource` is `Normalization`, but `instantiate_nested_goals` builds a proof tree for every
+  nested goal of every candidate (one uncached root evaluation each). Wanted:
+  `InspectCandidate::instantiate_nested_goals_from(span, keep: impl Fn(GoalSource) -> bool)`
+  that still instantiates every step's canonical state in order (orig_values must advance) but
+  calls `instantiate_proof_tree_for_nested_goal` only where `keep(source)`. errors.rs then uses
+  it with `|s| s == GoalSource::Normalization`.
+- `crates/hir-ty/src/infer/unify.rs` (db-ty-port-ty), for speed: `has_trait_errors` runs
+  `into_fulfillment_error` (a proof-tree leaf search, one uncached evaluation per tree level) on
+  every pending trait error each time it is called, and `emit_trait_errors` runs it again. Compute
+  each `FulfillmentError` once: store `trait_errors` as the converted errors (or memoize the
+  `Option<SolverDiagnostic>` per error) so each error's search runs exactly once per body.
+- Root `Cargo.toml` (coordinator decision): the workspace `tracing` has no compile-time level cap,
+  so every disabled `#[instrument]` span still costs a callsite check (about 1 to 2 ns) in
+  release. Adding `release_max_level_info` (or `_off`) to the workspace `tracing` features makes
+  them free in release builds. I removed the per-node spans from `infer/relate/` either way; see
+  `docs/v2/plan/lanes/db/speed-of-light-infer-relate.md`.
+- `crates/hir-ty/Cargo.toml`: add `blaze-alloc-count.workspace = true` under
+  `[dev-dependencies]` (needs the workspace entry in `v2/requests/coordinator.md`). The
+  allocation-budget tests in `next_solver/infer/relate/generalize.rs` use it.
+- `crates/hir-ty/src/lib.rs`: install the counting allocator for hir-ty's test binary, once:
+  `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;`.
+  Without it, `measure` sees no allocations and every budget test in hir-ty passes vacuously.
+- Blocked: a budget test for a whole generalization (zero allocations for `instantiate_ty_var`
+  on a small type once the variable tables have capacity) needs an `InferCtxt` over a test
+  database, and hir-ty has no `TestDB` in v2. Whoever restores hir-ty's test database: tell me
+  and I'll add it.

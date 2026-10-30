@@ -276,22 +276,35 @@ pub(crate) struct Plans<'db> {
 impl<'db> Default for Plans<'db> {
     fn default() -> Self {
         Plans {
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             plans: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             ops: Vec::new(),
             by_ty: FxHashMap::default(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             enums: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             variants: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             paths: vec![PathNode { parent: 0, elem: Elem::Root }],
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             pointees: Vec::new(),
             pointee_by_ty: FxHashMap::default(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             cells: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             levels: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             unions: Vec::new(),
             layouts: FxHashMap::default(),
             infcx: None,
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             data: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             entered: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             cell_buf: Vec::new(),
+            // alloc: setup, once per run: an empty `Vec` allocates nothing until used.
             order: Vec::new(),
         }
     }
@@ -371,6 +384,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 let at = base + at;
                 let v = self.scalar(at, 1, Expected::Bool, path)?;
                 if v > 1 {
+                    // alloc: error path: the message of a failure.
                     return Err(self.invalid(path, format!("encountered {}, but expected a boolean", hex(v, 1))));
                 }
                 self.data(at, 1, true);
@@ -381,6 +395,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 if char::from_u32(v as u32).is_none() {
                     return Err(self.invalid(
                         path,
+                        // alloc: error path: the message of a failure.
                         format!(
                             "encountered {}, but expected a valid unicode scalar value (in `0..=0x10FFFF` but not in `0xD800..=0xDFFF`)",
                             hex(v, 4)
@@ -401,6 +416,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 if let Err(bad) = self.first_uninit(at, len) {
                     let index = (bad - at) / elem;
                     self.plans.entered.push((path, Entered::Index(index)));
+                    // alloc: error path: the message of a failure.
                     return Err(self.invalid(0, format!("encountered uninitialized memory, but {}", expected.as_str())));
                 }
                 self.data(at, len, true);
@@ -422,6 +438,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 let at = base + at;
                 let v = self.scalar(at, self.ptr, Expected::FnPtr, path)?;
                 if v == 0 {
+                    // alloc: error path: the message of a failure.
                     return Err(self.invalid(path, "encountered a null function pointer".to_owned()));
                 }
                 let keep = self.shadow.prov_at(at as usize, self.ptr as usize).is_some();
@@ -429,10 +446,12 @@ impl<'db> Run<'_, '_, '_, 'db> {
             }
             Op::Safe { at, kind, pointee, path, .. } => self.safe_pointer(base + at, kind, pointee, path)?,
             Op::Never { path } => {
+                // alloc: error path: the message of a failure.
                 return Err(self.invalid(path, "encountered a value of the never type `!`".to_owned()));
             }
             Op::Variantless { ty, path } => {
                 let ty = type_name(self.cx.db, ty);
+                // alloc: error path: the message of a failure.
                 return Err(self.invalid(path, format!("encountered a value of zero-variant enum `{ty}`")));
             }
             Op::Union { at, data } => {
@@ -462,6 +481,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
 
     fn require_init(&mut self, at: u64, size: u64, expected: Expected, path: u32) -> R {
         if self.shadow.require_init(at as usize..(at + size) as usize).is_err() {
+            // alloc: error path: the message of a failure.
             return Err(self.invalid(path, format!("encountered uninitialized memory, but {}", expected.as_str())));
         }
         Ok(())
@@ -508,6 +528,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 if addr == 0 {
                     return Err(self.invalid(
                         path,
+                        // alloc: error path: the message of a failure.
                         "encountered a maybe-null pointer, but expected something that is definitely non-zero".to_owned(),
                     ));
                 }
@@ -518,6 +539,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
             }
             return Err(self.invalid(
                 path,
+                // alloc: error path: the message of a failure.
                 format!(
                     "encountered a pointer with unknown absolute address, but expected something that is definitely {}",
                     fmt_range(start, end, max)
@@ -528,6 +550,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         if contains(bits) {
             Ok(())
         } else {
+            // alloc: error path: the message of a failure.
             Err(self.invalid(path, format!("encountered {bits}, but expected something {}", fmt_range(start, end, max))))
         }
     }
@@ -542,6 +565,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 let Some(size) = (meta as u64).checked_mul(elem_size) else {
                     return Err(self.invalid(
                         path,
+                        // alloc: error path: the message of a failure.
                         format!("encountered invalid {noun} metadata: slice is bigger than largest supported object"),
                     ));
                 };
@@ -553,6 +577,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 let Ok(concrete) = self.cx.vtables.ty(meta as usize) else {
                     return Err(self.invalid(
                         path,
+                        // alloc: error path: the message of a failure.
                         format!("encountered {:#x}[noalloc], but expected a vtable pointer", meta),
                     ));
                 };
@@ -571,6 +596,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         if size >= limit {
             return Err(self.invalid(
                 path,
+                // alloc: error path: the message of a failure.
                 format!("encountered invalid {noun} metadata: total size is bigger than largest supported object"),
             ));
         }
@@ -627,14 +653,17 @@ impl<'db> Run<'_, '_, '_, 'db> {
             let has = 1u64 << addr.trailing_zeros().min(29);
             return Err(self.invalid(
                 path,
+                // alloc: error path: the message of a failure.
                 format!("encountered an unaligned {noun} (required {align} byte alignment but found {has})"),
             ));
         }
         if addr == 0 {
+            // alloc: error path: the message of a failure.
             return Err(self.invalid(path, format!("encountered a null {noun}")));
         }
         if !info.inhabited {
             let ty = type_name(self.cx.db, info.ty);
+            // alloc: error path: the message of a failure.
             return Err(self.invalid(path, format!("encountered a {noun} pointing to uninhabited type `{ty}`")));
         }
         Ok(())
@@ -643,13 +672,17 @@ impl<'db> Run<'_, '_, '_, 'db> {
     /// The validity message for a pointer `check_ptr_access` refused.
     fn deref_error(&mut self, e: MemError, noun: &str, addr: u64, path: u32) -> Fail {
         let msg = match &e {
+            // alloc: error path: the message of a failure.
             MemError::DanglingInt { addr: 0, .. } => format!("encountered a null {noun}"),
             MemError::DanglingInt { .. } => {
+                // alloc: error path: the message of a failure.
                 format!("encountered a dangling {noun} ({addr:#x}[noalloc] has no provenance)")
             }
             MemError::OutOfBounds { .. } => {
+                // alloc: error path: the message of a failure.
                 format!("encountered a dangling {noun} (going beyond the bounds of its allocation)")
             }
+            // alloc: error path: the message of a failure.
             MemError::UseAfterFree { .. } => format!("encountered a dangling {noun} (use-after-free)"),
             _ => return Fail::Ub(Ub::Memory(e)),
         };
@@ -756,6 +789,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         self.data(tag_at, size, !keep);
         let variants = range(e.variants);
         let invalid_tag = |this: &mut Self| {
+            // alloc: error path: the message of a failure.
             this.invalid(tag_path, format!("encountered {}, but expected a valid enum tag", hex(bits, size)))
         };
         let contains = |v: u128| {
@@ -802,6 +836,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
         };
         let variant = self.plans.variants[variants.start + index as usize];
         if !variant.inhabited {
+            // alloc: error path: the message of a failure.
             return Err(self.invalid(tag_path, "encountered an uninhabited enum variant".to_owned()));
         }
         self.plans.entered.push((path, Entered::Variant(variant.id)));
@@ -835,14 +870,17 @@ impl<'db> Run<'_, '_, '_, 'db> {
     /// A validity error at `path` (in the innermost sub-plan entered), with the path from the
     /// value's root rendered as rustc's `write_path`.
     fn invalid(&mut self, path: u32, msg: String) -> Fail {
+        // alloc: error path: the message of a failure.
         let mut out = String::new();
         let entered = std::mem::take(&mut self.plans.entered);
         for &(p, how) in &entered {
             self.plans.write_path(self.cx.db, &mut out, p);
             match how {
+                // alloc: error path: the message of a failure.
                 Entered::Index(i) => out.push_str(&format!("[{i}]")),
                 Entered::Variant(v) => {
                     let name = variant_name(self.cx.db, v);
+                    // alloc: error path: the message of a failure.
                     out.push_str(&format!(".<enum-variant({name})>"));
                 }
             }
@@ -872,13 +910,14 @@ impl<'db> Plans<'db> {
     /// The size and alignment of `ty`, read from the cached layout without cloning it: a
     /// `dyn` pointee's concrete type is looked up on every typed copy of the pointer.
     fn size_align(&mut self, cx: &TypedCx<'_, 'db>, ty: Ty<'db>) -> R<(u64, u64)> {
-        let layout = match self.layouts.get(&ty) {
-            Some(it) => it,
-            None => &self.layout(cx, ty)?,
-        };
+        if let Some(it) = self.layouts.get(&ty) {
+            return Ok((it.size.bytes(), it.align.abi.bytes()));
+        }
+        let layout = self.layout(cx, ty)?;
         Ok((layout.size.bytes(), layout.align.abi.bytes()))
     }
 
+    // dyn: setup, once per crate.
     fn infcx(&mut self, env: ParamEnvAndCrate<'db>, db: &'db dyn HirDatabase) -> &InferCtxt<'db> {
         if self.infcx.as_ref().is_none_or(|(krate, _)| *krate != env.krate) {
             let infcx = DbInterner::new_with(db, env.krate).infer_ctxt().build(TypingMode::PostAnalysis);
@@ -892,6 +931,7 @@ impl<'db> Plans<'db> {
         (self.paths.len() - 1) as u32
     }
 
+    // dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
     fn write_path(&self, db: &dyn HirDatabase, out: &mut String, mut path: u32) {
         let mut elems: SmallVec<[Elem; 8]> = SmallVec::new();
         while path != 0 {
@@ -905,11 +945,15 @@ impl<'db> Plans<'db> {
                 Elem::Field(variant, i) => {
                     let fields = VariantFields::of(db, variant);
                     match fields.fields().iter().nth(i as usize) {
+                        // alloc: error path: the message of a failure.
                         Some((_, field)) => out.push_str(&format!(".{}", field.name.as_str())),
+                        // alloc: error path: the message of a failure.
                         None => out.push_str(&format!(".{i}")),
                     }
                 }
+                // alloc: error path: the message of a failure.
                 Elem::Tuple(i) => out.push_str(&format!(".{i}")),
+                // alloc: error path: the message of a failure.
                 Elem::Captured(i) => out.push_str(&format!(".<captured-var({i})>")),
                 Elem::EnumTag => out.push_str(".<enum-tag>"),
             }
@@ -922,11 +966,13 @@ impl<'db> Plans<'db> {
             return Ok(it);
         }
         let layout = self.layout(cx, ty)?;
+        // alloc: plan building, once per type.
         let mut ops = Vec::new();
         let mut dense = true;
         self.compile(cx, ty, &layout, 0, 0, &mut ops, &mut dense)?;
         // Padding: bytes not covered by any op's data.
         if dense {
+            // alloc: plan building, once per type.
             let mut covered: Vec<(u64, u64)> = Vec::new();
             for op in &ops {
                 op_data(op, cx.target.pointer_size().bytes(), &mut covered);
@@ -1009,6 +1055,7 @@ impl<'db> Plans<'db> {
             }
             TyKind::Array(elem, len) => {
                 let Some(count) = try_const_usize(db, len) else {
+                    // alloc: plan building, once per type (unsupported: an error).
                     return Err(Fail::Unsupported(format!(
                         "an array of no evaluated length, `{}`",
                         type_name(db, ty)
@@ -1096,12 +1143,14 @@ impl<'db> Plans<'db> {
                 AdtId::EnumId(e) => self.enum_ops(cx, ty, e, args, layout, at, path, ops, dense)?,
             },
             TyKind::Coroutine(..) | TyKind::CoroutineClosure(..) | TyKind::CoroutineWitness(..) => {
+                // alloc: plan building, once per type (unsupported: an error).
                 return Err(Fail::Unsupported(format!(
                     "the validity of a coroutine value, `{}`",
                     type_name(db, ty)
                 )));
             }
             TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..) => {
+                // alloc: plan building, once per type (unsupported: an error).
                 return Err(Fail::Unsupported(format!(
                     "a typed copy of an unsized value, `{}`",
                     type_name(db, ty)
@@ -1114,6 +1163,7 @@ impl<'db> Plans<'db> {
             | TyKind::Placeholder(_)
             | TyKind::Infer(_)
             | TyKind::Error(_) => {
+                // alloc: plan building, once per type (unsupported: an error).
                 return Err(Fail::Unsupported(format!(
                     "a value of a type not concrete at run time, `{}`",
                     type_name(db, ty)
@@ -1209,6 +1259,7 @@ impl<'db> Plans<'db> {
             Variants::Empty => ops.push(Op::Variantless { ty, path }),
             Variants::Single { index } => {
                 let Some(&(vid, _)) = variants.get_index(index.0).map(|(_, v)| v) else {
+                    // alloc: plan building, once per type.
                     return Err(Fail::Unsupported(format!("variant {} of `{}`", index.0, type_name(db, ty))));
                 };
                 self.fields(cx, VariantId::EnumVariantId(vid), args, layout, &layout.fields, at, path, ops, dense)?;
@@ -1234,11 +1285,14 @@ impl<'db> Plans<'db> {
                     let idx = hir_ty::layout::RustcEnumVariantIdx(i);
                     let vl = Layout::for_variant(layout, idx);
                     let discr = db.const_eval_discriminant(vid).map_err(|err| {
+                        // alloc: plan building, once per type.
                         Fail::Unsupported(format!("the discriminant of a variant of `{}`: {err:?}", type_name(db, ty)))
                     })?;
+                    // alloc: plan building, once per type.
                     let mut vops = Vec::new();
                     let mut vdense = true;
                     let shape = FieldsShape::Arbitrary {
+                        // clone: plan building, once per type.
                         offsets: layouts[idx].field_offsets.clone(),
                         in_memory_order: Default::default(),
                     };
@@ -1283,9 +1337,11 @@ impl<'db> Plans<'db> {
         let field_tys: SmallVec<[Ty<'db>; 8]> = match ty.kind() {
             TyKind::Adt(def, args) => match def.def_id() {
                 AdtId::StructId(id) => {
+                    // alloc: plan building, once per type.
                     db.field_types(id.into()).iter().map(|(_, f)| f.ty().instantiate(interner, args).skip_norm_wip()).collect()
                 }
                 AdtId::UnionId(id) => {
+                    // alloc: plan building, once per type.
                     db.field_types(id.into()).iter().map(|(_, f)| f.ty().instantiate(interner, args).skip_norm_wip()).collect()
                 }
                 AdtId::EnumId(e) => {
@@ -1315,10 +1371,13 @@ impl<'db> Plans<'db> {
                     db.field_types(VariantId::EnumVariantId(vid))
                         .iter()
                         .map(|(_, f)| f.ty().instantiate(interner, args).skip_norm_wip())
+                        // alloc: plan building, once per type.
                         .collect()
                 }
             },
+            // alloc: plan building, once per type.
             TyKind::Tuple(fields) => fields.iter().collect(),
+            // alloc: plan building, once per type.
             TyKind::Closure(_, args) => args.as_closure().tupled_upvars_ty().tuple_fields().iter().collect(),
             TyKind::Array(elem, _) => {
                 if let FieldsShape::Array { stride, count } = layout.fields {
@@ -1503,9 +1562,12 @@ impl<'db> Plans<'db> {
                         VariantId::EnumVariantId(vid)
                     }
                 };
+                // alloc: plan building, once per type.
                 db.field_types(variant).iter().map(|(_, f)| f.ty().instantiate(interner, args).skip_norm_wip()).collect()
             }
+            // alloc: plan building, once per type.
             TyKind::Tuple(fields) => fields.iter().collect(),
+            // alloc: plan building, once per type.
             TyKind::Closure(_, args) => args.as_closure().tupled_upvars_ty().tuple_fields().iter().collect(),
             TyKind::Pat(base_ty, _) => {
                 let bl = self.layout(cx, base_ty)?;
@@ -1547,6 +1609,7 @@ fn op_data(op: &Op<'_>, ptr: u64, out: &mut Vec<(u64, u64)>) {
 
 /// Whether a `Box<T, A>` is of the global allocator (Miri `is_box_global`): `A` is `alloc`'s
 /// `Global`, or there is no `A`.
+// dyn: plan building, once per type.
 fn box_is_global<'db>(db: &'db dyn HirDatabase, args: hir_ty::next_solver::GenericArgs<'db>) -> bool {
     let Some(alloc) = args.as_slice().get(1).and_then(|it| it.ty()) else { return true };
     let TyKind::Adt(def, _) = alloc.kind() else { return false };
@@ -1583,33 +1646,44 @@ fn le(bytes: &[u8]) -> u128 {
 
 /// A scalar as rustc's `{:x}` of a `Scalar` prints it: `0x` and two digits per byte.
 pub(crate) fn hex(v: u128, size: u64) -> String {
+    // alloc: error path: the message of a failure.
     format!("{:#0width$x}", v, width = 2 + 2 * size as usize)
 }
 
 /// validity.rs `fmt_range`.
 pub(crate) fn fmt_range(lo: u128, hi: u128, max_hi: u128) -> String {
     if lo > hi {
+        // alloc: error path: the message of a failure.
         format!("less or equal to {hi}, or greater or equal to {lo}")
     } else if lo == hi {
+        // alloc: error path: the message of a failure.
         format!("equal to {lo}")
     } else if lo == 0 {
+        // alloc: error path: the message of a failure.
         format!("less or equal to {hi}")
     } else if hi == max_hi {
+        // alloc: error path: the message of a failure.
         format!("greater or equal to {lo}")
     } else {
+        // alloc: error path: the message of a failure.
         format!("in the range {lo}..={hi}")
     }
 }
 
+// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
 pub(crate) fn type_name<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>) -> String {
+    // alloc: error path: the message of a failure.
     hir_ty_mir::mir::type_name::rustc_type_name(db, ty).unwrap_or_else(|| format!("{ty:?}"))
 }
 
+// dyn: the edge: salsa's database is `dyn HirDatabase` throughout the front end.
 fn variant_name(db: &dyn HirDatabase, v: EnumVariantId) -> String {
     let parent = v.lookup(db).parent;
     parent
         .enum_variants(db)
         .variant_name_by_id(v)
+        // alloc: error path: the message of a failure.
         .map(|name| name.as_str().to_owned())
+        // alloc: error path: the message of a failure.
         .unwrap_or_else(|| format!("{v:?}"))
 }

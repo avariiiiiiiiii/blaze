@@ -20,7 +20,8 @@ use std::{
 use crate::Address;
 
 pub(crate) enum Listener {
-    Unix { listener: UnixListener, path: PathBuf },
+    /// `path` is the file it made, removed when it is dropped; `None` for an inherited one.
+    Unix { listener: UnixListener, path: Option<PathBuf> },
     Tcp(TcpListener),
 }
 
@@ -65,7 +66,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Listener::Unix { path, .. } = self {
+        if let Listener::Unix { path: Some(path), .. } = self {
             _ = std::fs::remove_file(&*path);
         }
     }
@@ -96,10 +97,77 @@ pub(crate) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
                 _ = std::fs::remove_file(&temporary);
                 return Err(error);
             }
-            Ok(Listener::Unix { listener, path })
+            Ok(Listener::Unix { listener, path: Some(path) })
         }
+        Address::Inherited { fd, at } => inherited(root, *fd, at),
         Address::Tcp(address) => Ok(Listener::Tcp(TcpListener::bind(address)?)),
     }
+}
+
+/// The listening socket a service manager passed as `fd`, for [`Address::Inherited`]: a
+/// close-on-exec copy of it, once it is a listening stream socket bound at `at`.
+fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listener> {
+    let path = root.join(at.as_str());
+    let refused = |what: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("the socket passed as fd {fd} for {}: {what}", path.display()),
+        )
+    };
+    // SAFETY: no pointers; a new descriptor of its own, or -1.
+    let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(refused(format!("not open ({})", io::Error::last_os_error())));
+    }
+    // SAFETY: `copy` is the descriptor the call just made, owned by nothing else.
+    let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+    let option = |name: libc::c_int| -> io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `len` are valid for writes of the sizes `len` says.
+        let got = unsafe {
+            libc::getsockopt(copy.as_raw_fd(), libc::SOL_SOCKET, name, (&raw mut value).cast(), &raw mut len)
+        };
+        if got < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(value)
+    };
+    match option(libc::SO_TYPE) {
+        Ok(kind) if kind == libc::SOCK_STREAM => {}
+        Ok(_) => return Err(refused("not a stream socket".to_owned())),
+        Err(error) => return Err(refused(format!("not a socket ({error})"))),
+    }
+    if option(libc::SO_ACCEPTCONN).map_err(|error| refused(error.to_string()))? == 0 {
+        return Err(refused("not listening".to_owned()));
+    }
+    // SAFETY: all zeros is a valid `sockaddr_storage`.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: `storage` and `len` are valid for writes of the sizes `len` says.
+    if unsafe { libc::getsockname(copy.as_raw_fd(), (&raw mut storage).cast(), &raw mut len) } < 0 {
+        return Err(refused(io::Error::last_os_error().to_string()));
+    }
+    if libc::c_int::from(storage.ss_family) != libc::AF_UNIX {
+        return Err(refused("not a Unix socket".to_owned()));
+    }
+    // SAFETY: the system wrote a `sockaddr_un` (its family is AF_UNIX), which `storage` holds.
+    let un = unsafe { &*(&raw const storage).cast::<libc::sockaddr_un>() };
+    let named = (len as usize)
+        .saturating_sub(std::mem::offset_of!(libc::sockaddr_un, sun_path))
+        .min(un.sun_path.len());
+    let bound: Vec<u8> = un.sun_path[..named].iter().map(|&it| it as u8).take_while(|&it| it != 0).collect();
+    if bound != path.as_os_str().as_bytes() {
+        return Err(refused(format!("bound at {:?}, not there", String::from_utf8_lossy(&bound))));
+    }
+    Ok(Listener::Unix { listener: UnixListener::from(copy), path: None })
+}
+
+fn not_connectable(at: &Address) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{at:?}: an inherited socket is listened on, never connected to; connect to its name"),
+    )
 }
 
 pub(crate) enum Socket {
@@ -181,6 +249,7 @@ impl Socket {
 pub(crate) fn connect(root: &Path, at: &Address) -> io::Result<Socket> {
     match at {
         Address::Unix(name) => Ok(Socket::Unix(UnixStream::connect(root.join(name.as_str()))?)),
+        Address::Inherited { .. } => Err(not_connectable(at)),
         Address::Tcp(address) => {
             let stream = TcpStream::connect(address)?;
             stream.set_nodelay(true)?;
@@ -218,6 +287,7 @@ pub(crate) fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
             (len, libc::AF_UNIX)
         }
+        Address::Inherited { .. } => return Err(not_connectable(at)),
         Address::Tcp(SocketAddr::V4(address)) => {
             // SAFETY: as above.
             let in4 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
@@ -270,3 +340,6 @@ pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

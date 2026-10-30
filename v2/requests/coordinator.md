@@ -11,3 +11,11 @@
 - Where: root `Cargo.toml`.
 - Why: `docs/v2/plan/goals/principles.md`, "Allocation, `dyn` and clones are controlled
   mechanically".
+
+## tools/v2/hot_lint.py crashes when given `crates` (from db-ty-port-infer-relate)
+
+- What: `{"root": ".", "crates": ["hir-ty"]}` fails with `typed_input: crates has a type it does
+  not read: list[str]`. `python/typed-input` does not read `list[str]` fields, so either it
+  learns lists or `Input.crates` becomes a type it does read (a `tuple[str, ...]`, if supported).
+- Where: `tools/v2/hot_lint.py` (`Input`) or `python/typed-input/src/typed_input/__init__.py`.
+- Why: the brief's command doesn't run. Without `crates` it works (all hot crates).

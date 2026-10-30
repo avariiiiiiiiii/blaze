@@ -420,11 +420,12 @@ your current part.
 
 > forwarded to db: a plan for the salsa owner.
 
-> Status: edges done by speed-salsa (10-29), memo header not: edges are `u32` words in one
-> database-wide array (`src/graph/`), a memo holds an `EdgeSpan`, and deep verify runs without a
-> claim (`deep_verify_unclaimed`, `tests/unclaimed_verify.rs`). The 24-byte header and memos as
-> columns (`table/memo.rs`) are left, as they need a build to do safely; costs and what is left
-> are in the notes, "Before and after (10-29)". Not built or run.
+> Status: done by speed-salsa (10-29): edges are `u32` words in one database-wide array
+> (`src/graph/`), a memo holds an `EdgeSpan`, deep verify runs without a claim
+> (`deep_verify_unclaimed`, `tests/unclaimed_verify.rs`), and `MemoHeader` is 24 bytes (an
+> `AtomicU64` stamp and an 8-byte origin word). Still per memo: its box and the `MemoEntry`
+> pointer per sibling function, which memos as columns (`table/memo.rs`) would remove. Costs are
+> in the notes, "Before and after (10-29)". Not built or run.
 
 ## blaze-query: `Database::get` is now `Database::pin().get` (10-29; blaze-cargo, blaze-units, blaze-tree; lane db's doc)
 

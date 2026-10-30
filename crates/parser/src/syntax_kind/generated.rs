@@ -142,6 +142,7 @@ pub enum SyntaxKind {
     OPTIONS_KW,
     OUT_KW,
     PATTERN_TYPE_KW,
+    PIN_KW,
     PRESERVES_FLAGS_KW,
     PURE_KW,
     RAW_KW,
@@ -225,6 +226,7 @@ pub enum SyntaxKind {
     FOR_TYPE,
     GENERIC_ARG_LIST,
     GENERIC_PARAM_LIST,
+    GUARD_PAT,
     IDENT_PAT,
     IF_EXPR,
     IMPL,
@@ -415,6 +417,7 @@ impl SyntaxKind {
             | FOR_TYPE
             | GENERIC_ARG_LIST
             | GENERIC_PARAM_LIST
+            | GUARD_PAT
             | IDENT_PAT
             | IF_EXPR
             | IMPL
@@ -669,6 +672,7 @@ impl SyntaxKind {
             OPTIONS_KW => "options",
             OUT_KW => "out",
             PATTERN_TYPE_KW => "pattern_type",
+            PIN_KW => "pin",
             PRESERVES_FLAGS_KW => "preserves_flags",
             PURE_KW => "pure",
             RAW_KW => "raw",
@@ -779,6 +783,7 @@ impl SyntaxKind {
             OPTIONS_KW => true,
             OUT_KW => true,
             PATTERN_TYPE_KW => true,
+            PIN_KW => true,
             PRESERVES_FLAGS_KW => true,
             PURE_KW => true,
             RAW_KW => true,
@@ -877,6 +882,7 @@ impl SyntaxKind {
             OPTIONS_KW => true,
             OUT_KW => true,
             PATTERN_TYPE_KW => true,
+            PIN_KW => true,
             PRESERVES_FLAGS_KW => true,
             PURE_KW => true,
             RAW_KW => true,
@@ -1125,6 +1131,7 @@ macro_rules ! T_ {
     [options] => { $ crate :: SyntaxKind :: OPTIONS_KW };
     [out] => { $ crate :: SyntaxKind :: OUT_KW };
     [pattern_type] => { $ crate :: SyntaxKind :: PATTERN_TYPE_KW };
+    [pin] => { $ crate :: SyntaxKind :: PIN_KW };
     [preserves_flags] => { $ crate :: SyntaxKind :: PRESERVES_FLAGS_KW };
     [pure] => { $ crate :: SyntaxKind :: PURE_KW };
     [raw] => { $ crate :: SyntaxKind :: RAW_KW };

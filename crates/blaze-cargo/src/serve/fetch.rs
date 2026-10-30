@@ -10,7 +10,7 @@ mod git;
 #[cfg(test)]
 mod tests;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use blaze_api::ApiError;
 use blaze_registry::http::{Http, HttpNotSuccessful, HyperHttp, Response, Retry};
@@ -28,18 +28,23 @@ const NOT_IN_INDEX: [u16; 3] = [404, 410, 451];
 pub struct Fetcher {
     http: Arc<dyn Http>,
     retry: Retry,
+    /// The daemon's own directory for git's work: each fetch clones into a directory of its
+    /// own under it, removed once the tree is read. Never the user's `$CARGO_HOME`, so no
+    /// lock is shared with cargo or another fetch.
+    scratch: PathBuf,
 }
 
 impl Fetcher {
-    /// A fetcher over blaze-registry's HTTP client (`HyperHttp`), with cargo's retries.
-    pub fn new() -> Result<Fetcher, String> {
+    /// A fetcher over blaze-registry's HTTP client (`HyperHttp`), with cargo's retries, doing
+    /// git's work under `scratch`.
+    pub fn new(scratch: PathBuf) -> Result<Fetcher, String> {
         let http = HyperHttp::shared().map_err(|e| redact(&format!("{e:#}")))?;
-        Ok(Fetcher::with_http(http))
+        Ok(Fetcher::with_http(http, scratch))
     }
 
     /// The same over any `Http` (tests use a fake).
-    pub fn with_http(http: Arc<dyn Http>) -> Fetcher {
-        Fetcher { http, retry: Retry { quiet: true, ..Retry::default() } }
+    pub fn with_http(http: Arc<dyn Http>, scratch: PathBuf) -> Fetcher {
+        Fetcher { http, retry: Retry { quiet: true, ..Retry::default() }, scratch }
     }
 
     /// The same, tried again as `retry` says (cargo's `net.retry`); never said on stderr, which

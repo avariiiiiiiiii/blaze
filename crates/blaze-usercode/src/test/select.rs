@@ -13,9 +13,10 @@
 //! long it took and, for a kept pass, what it read. The latest entry gives the expected
 //! duration ([`super::queue`] runs the longest first) and the explanation of a rerun ([`Why`]).
 //! The store never replaces a value, so the chain only grows; its end is found by doubling
-//! and halving, a few gets however long it is.
+//! and halving, a few gets however long it is. An entry is read in place ([`Entry`]): what a
+//! kept pass read is decoded only to explain a rerun, never for a test that is skipped.
 
-use std::{convert::Infallible, ffi::OsString, fmt, path::PathBuf, time::Duration};
+use std::{borrow::Cow, convert::Infallible, ffi::OsString, fmt, path::PathBuf, time::Duration};
 
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
@@ -348,14 +349,8 @@ pub fn select<P: Passes + ?Sized, I: Inputs>(
     all: bool,
     inputs: &mut I,
 ) -> Result<Decision, SelectError<I::Error>> {
-    let last = last(store, given, &test.name)
-        .map_err(|error| match error {
-            SelectError::Corrupt(it) => SelectError::Corrupt(it),
-            SelectError::NotOurs { key, why } => SelectError::NotOurs { key, why },
-            SelectError::Inputs(never) => match never {},
-        })?
-        .map(|it| it.1);
-    let expected = last.as_ref().map(|it| it.took);
+    let last = last(store, given, &test.name).map_err(widen)?.map(|(_, key, entry)| (key, entry));
+    let expected = last.as_ref().map(|(_, it)| it.took);
     if test.outside {
         return Ok(Decision::Run { why: Why::Outside, expected });
     }
@@ -366,8 +361,16 @@ pub fn select<P: Passes + ?Sized, I: Inputs>(
     if find(store, &run, inputs)? {
         return Ok(Decision::Skip { took: expected });
     }
-    let why = explain(store, test, last.as_ref(), inputs)?;
+    let why = explain(store, test, last, inputs)?;
     Ok(Decision::Run { why, expected })
+}
+
+fn widen<E>(error: SelectError<Infallible>) -> SelectError<E> {
+    match error {
+        SelectError::Corrupt(it) => SelectError::Corrupt(it),
+        SelectError::NotOurs { key, why } => SelectError::NotOurs { key, why },
+        SelectError::Inputs(never) => match never {},
+    }
 }
 
 /// Whether a pass of `run` is kept for its inputs as they are now: [`index::find`]'s search,
@@ -394,13 +397,14 @@ fn find<P: Passes + ?Sized, I: Inputs>(
     }
 }
 
+/// Why `test` runs, against its history's last entry (under `key`).
 fn explain<P: Passes + ?Sized, I: Inputs>(
     store: &P,
     test: &Test,
-    last: Option<&History>,
+    last: Option<(Key, Entry<'_>)>,
     inputs: &mut I,
 ) -> Result<Why, SelectError<I::Error>> {
-    let Some(last) = last else { return Ok(Why::New) };
+    let Some((key, last)) = last else { return Ok(Why::New) };
     if !last.passed || !last.kept {
         return Ok(Why::NoPass);
     }
@@ -416,9 +420,9 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
     if let Some(hash) = before.iter().find(|it| now.binary_search(*it).is_err()) {
         return Ok(Why::Dropped(*hash));
     }
-    let Some(traced) = &last.traced else { return Ok(Why::NoPass) };
-    let now = Shape::of(traced).values(inputs).map_err(SelectError::Inputs)?;
-    Ok(changed_input(traced, &now).map_or(Why::NoPass, Why::Read))
+    let Some(traced) = last.traced().map_err(|why| SelectError::NotOurs { key, why })? else { return Ok(Why::NoPass) };
+    let now = Shape::of(&traced).values(inputs).map_err(SelectError::Inputs)?;
+    Ok(changed_input(&traced, &now).map_or(Why::NoPass, Why::Read))
 }
 
 /// The first input of `before` whose value `now` does not have.
@@ -505,13 +509,16 @@ pub fn record<P: Passes + ?Sized>(
     ran: &Ran<'_>,
 ) -> Result<Vec<Ticket>, RecordError> {
     let mut tickets = Vec::new();
-    let traced = ran.traced.map(|it| {
-        let mut it = it.clone();
-        trace::normalize(&mut it);
-        it
+    let traced: Option<Cow<'_, Traced>> = ran.traced.map(|it| match trace::normal(it) {
+        true => Cow::Borrowed(it),
+        false => {
+            let mut it = it.clone();
+            trace::normalize(&mut it);
+            Cow::Owned(it)
+        }
     });
-    let kept = ran.passed && !test.outside && traced.as_ref().is_some_and(keepable);
-    if kept && let Some(traced) = &traced {
+    let kept = ran.passed && !test.outside && traced.as_deref().is_some_and(keepable);
+    if kept && let Some(traced) = traced.as_deref() {
         let run = RunKey { code: test.identity(), given };
         tickets.push(store.put(index::result_key(&run, traced), PASS.to_vec()).map_err(RecordError::Mismatch)?);
         let shape = Shape::of(traced).encode();
@@ -537,16 +544,12 @@ pub fn record<P: Passes + ?Sized>(
     if store.get(&reached)?.is_none() {
         tickets.push(store.put(reached, set).map_err(RecordError::Mismatch)?);
     }
-    let entry = History {
-        passed: ran.passed,
-        kept,
-        attrs: test.attrs.id(),
-        reached,
-        took: ran.took,
-        traced: traced.filter(|_| kept),
-    }
-    .encode();
-    let mut n = last(store, given, &test.name)
+    let report = match (kept, traced) {
+        (true, Some(traced)) => trace::encode(&Report::Ran(Some(traced.into_owned()))),
+        _ => Vec::new(),
+    };
+    let entry = Entry { passed: ran.passed, kept, attrs: test.attrs.id(), reached, took: ran.took, traced: &report }.encode();
+    let mut n = last(&*store, given, &test.name)
         .map_err(|error| match error {
             SelectError::Corrupt(it) => RecordError::Corrupt(it),
             SelectError::NotOurs { key, why } => RecordError::NotOurs { key, why },
@@ -576,9 +579,9 @@ const PASS: &[u8] = b"blaze v2 test pass 1";
 const HISTORY: &[u8] = b"blaze v2 test history 1";
 const REACHED: &[u8] = b"blaze v2 test reached 1";
 
-/// One recorded run of a test.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct History {
+/// One recorded run of a test, read in place from the store's bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Entry<'s> {
     passed: bool,
     /// A pass was kept for it.
     kept: bool,
@@ -586,27 +589,35 @@ struct History {
     /// The key of the set of code hashes it reached.
     reached: Key,
     took: Duration,
-    /// What it read, for a kept pass.
-    traced: Option<Traced>,
+    /// What it read, for a kept pass, as [`trace::encode`] wrote it; empty for none.
+    traced: &'s [u8],
 }
 
-impl History {
+impl<'s> Entry<'s> {
     fn encode(&self) -> Vec<u8> {
-        let mut out = HISTORY.to_vec();
+        let mut out = Vec::with_capacity(HISTORY.len() + 1 + 32 + 32 + 8 + 8 + self.traced.len());
+        out.extend_from_slice(HISTORY);
         out.push(u8::from(self.passed) | (u8::from(self.kept) << 1));
         out.extend_from_slice(&self.attrs.0);
         out.extend_from_slice(&self.reached.0.0);
         out.extend_from_slice(&(self.took.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
-        let traced = match &self.traced {
-            Some(traced) => trace::encode(&Report::Ran(Some(traced.clone()))),
-            None => Vec::new(),
-        };
-        out.extend_from_slice(&(traced.len() as u64).to_le_bytes());
-        out.extend_from_slice(&traced);
+        out.extend_from_slice(&(self.traced.len() as u64).to_le_bytes());
+        out.extend_from_slice(self.traced);
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<History, String> {
+    /// What a kept pass read, decoded.
+    fn traced(&self) -> Result<Option<Traced>, String> {
+        if self.traced.is_empty() {
+            return Ok(None);
+        }
+        match trace::decode(self.traced)? {
+            Report::Ran(Some(traced)) => Ok(Some(traced)),
+            _ => Err("a test's history holds a report with no record".to_owned()),
+        }
+    }
+
+    fn decode(bytes: &'s [u8]) -> Result<Entry<'s>, String> {
         let rest = bytes.strip_prefix(HISTORY).ok_or_else(|| "not a test's history".to_owned())?;
         if rest.len() < 1 + 32 + 32 + 8 + 8 {
             return Err("a test's history ends early".to_owned());
@@ -619,14 +630,7 @@ impl History {
         if traced.len() as u64 != len {
             return Err("a test's history has a record of another length than it says".to_owned());
         }
-        let traced = match traced.is_empty() {
-            true => None,
-            false => match trace::decode(traced)? {
-                Report::Ran(Some(traced)) => Some(traced),
-                _ => return Err("a test's history holds a report with no record".to_owned()),
-            },
-        };
-        Ok(History {
+        Ok(Entry {
             passed: flags & 1 != 0,
             kept: flags & 2 != 0,
             attrs: id(1),
@@ -668,21 +672,20 @@ fn history_slot(given: ContentId, name: &str, n: u32) -> Key {
         .finish())
 }
 
-/// The last entry of a test's history and its slot. Slots are filled from 0 with no gap (an
-/// entry is put only in the first free one), so the end is found by doubling then halving.
-fn last<P: Passes + ?Sized>(
-    store: &P,
+/// The last entry of a test's history, its slot and its key. Slots are filled from 0 with no
+/// gap (an entry is put only in the first free one), so the end is found by doubling then
+/// halving; the last slot found filled is read where it was got.
+fn last<'s, P: Passes + ?Sized>(
+    store: &'s P,
     given: ContentId,
     name: &str,
-) -> Result<Option<(u32, History)>, SelectError<Infallible>> {
-    let filled = |n: u32| -> Result<bool, Corrupt> { Ok(store.get(&history_slot(given, name, n))?.is_some()) };
-    if !filled(0)? {
-        return Ok(None);
-    }
-    // `low` is filled; `high` is empty, or `u32::MAX` and filled.
+) -> Result<Option<(u32, Key, Entry<'s>)>, SelectError<Infallible>> {
+    let get = move |n: u32| store.get(&history_slot(given, name, n));
+    let Some(mut held) = get(0)? else { return Ok(None) };
+    // `low` is filled, its bytes `held`; `high` is empty, or `u32::MAX` and filled.
     let (mut low, mut high) = (0u32, 1u32);
-    while filled(high)? {
-        low = high;
+    while let Some(bytes) = get(high)? {
+        (low, held) = (high, bytes);
         if high == u32::MAX {
             break;
         }
@@ -690,15 +693,14 @@ fn last<P: Passes + ?Sized>(
     }
     while high - low > 1 {
         let middle = low + (high - low) / 2;
-        match filled(middle)? {
-            true => low = middle,
-            false => high = middle,
+        match get(middle)? {
+            Some(bytes) => (low, held) = (middle, bytes),
+            None => high = middle,
         }
     }
     let key = history_slot(given, name, low);
-    let Some(bytes) = store.get(&key)? else { return Ok(None) };
-    let history = History::decode(bytes).map_err(|why| SelectError::NotOurs { key, why })?;
-    Ok(Some((low, history)))
+    let entry = Entry::decode(held).map_err(|why| SelectError::NotOurs { key, why })?;
+    Ok(Some((low, key, entry)))
 }
 
 #[cfg(test)]

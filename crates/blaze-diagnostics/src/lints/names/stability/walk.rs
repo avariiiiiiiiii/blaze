@@ -1,6 +1,7 @@
-//! The crate walked as rustc's stability checks walk it: each item-like (rustc's HIR owner:
-//! an item, a trait item, an impl item, a foreign item) in the crate's order with the module
-//! it is of, and in each the uses the checks look at, as the node they are at.
+//! The crate walked once as rustc's stability checks walk it, each use checked as the walk
+//! comes to it: each item-like (rustc's HIR owner: an item, a trait item, an impl item, a
+//! foreign item) in the crate's order with the module it is of, and in each the uses the
+//! checks look at, as the node they are at.
 //!
 //! - paths resolved by name resolution: `Checker::visit_path`, `visit_use` (one check of a
 //!   constructor imported with its struct), the parent segments (stability alone);
@@ -10,6 +11,13 @@
 //! - macro calls, derives and attribute macros: resolution's
 //!   `check_stability_and_deprecation`;
 //! - each `#[deprecated]` with its target, and each `#[macro_escape]` of a `mod`.
+//!
+//! A use lives on the stack: it is a probe of the [`Index`] and is gone. Only what is
+//! reported is kept, with a `u64` key of where rustc's checks come to it, and sorted once at
+//! the end. Each node's attributes are looked at once, for its `#[cfg]`s and its
+//! `#[deprecated]`s together. The parent segments of a path are resolved only when the path
+//! itself was allowed and names another crate's definition: a definition of this crate is
+//! reached only through this crate's modules, whose uses rustc doesn't check.
 //!
 //! Follows `compiler/rustc_passes/src/stability.rs` (`Checker`, `is_unstable_reexport`),
 //! `compiler/rustc_hir/src/intravisit.rs` (`walk_use`), `compiler/rustc_middle/src/hir/map.rs`
@@ -26,98 +34,95 @@ use std::ops::ControlFlow;
 
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
-use hir::{Adt, HasVisibility as _, InFile, ModuleDef, ModuleSource, PathResolution};
-use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, TextRange, ast};
+use hir::{Adt, HasVisibility as _, HirFileId, InFile, ModuleDef, ModuleSource, PathResolution};
+use hir_expand::name::AsName as _;
+use smallvec::SmallVec;
+use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
 
 use super::{
-    attr,
+    Site,
+    attr::{self, Stability},
     def::{Def, trait_item},
-    target::{Attribute, GenericParamKind, MethodKind, Target},
+    lookup::{Id, Index},
+    target::{self, Attribute, GenericParamKind, MethodKind, Target},
 };
-use crate::{cx::Cx, lower::Phase};
+use crate::{
+    cx::Cx,
+    lower::{Found, Phase},
+};
 
 /// What an item-like is in: rustc's `hir_module_items` lists a module's items, trait items,
 /// impl items and foreign items, in that order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Container {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
     Free,
     Trait,
     Impl { of_trait: bool },
     Foreign,
 }
 
-/// An item-like, rustc's HIR owner: what `hir_get_parent_item` of a use in it is.
-pub(super) struct Owner {
-    pub(super) node: InFile<SyntaxNode>,
-    /// The module it is listed in, by where rustc's walk of modules comes to it.
-    pub(super) module: usize,
-    pub(super) container: Container,
+impl Container {
+    /// Which of `hir_module_items`' lists an item-like written in `self` is in.
+    fn list(self) -> u8 {
+        match self {
+            Container::Free => 0,
+            Container::Trait => 1,
+            Container::Impl { .. } => 2,
+            Container::Foreign => 3,
+        }
+    }
 }
 
-/// A use of a definition the stability checks look at.
-pub(super) struct Use {
-    pub(super) def: Def,
-    /// The item-like it is in; `None` at the crate root.
-    pub(super) owner: Option<usize>,
+/// The item-like of what is outside every item: the crate root.
+const ROOT: u32 = u32::MAX;
+
+/// How many item-likes the order keys hold: the item-like takes the low 29 bits of a key.
+const OWNERS: usize = 1 << 29;
+
+/// An item-like, rustc's HIR owner: what `hir_get_parent_item` of a use in it is.
+#[derive(Clone, Copy)]
+struct Owner {
+    node: InFile<SyntaxNodePtr>,
+    /// The module it is listed in, by where rustc's walk of modules comes to it.
+    module: u32,
+    /// Which of the module's lists it is in ([`Container::list`]).
+    list: u8,
+    /// A `use` item, which may be an unstable re-export.
+    is_use: bool,
+}
+
+/// A use of a definition the checks look at, checked where it is found and not kept.
+#[derive(Clone, Copy)]
+struct Use {
+    def: Def,
+    /// The item-like it is in, or [`ROOT`].
+    owner: u32,
     /// The node of the use, where the lint's level is decided.
-    pub(super) at: InFile<SyntaxNodePtr>,
+    at: InFile<SyntaxNodePtr>,
     /// Where a deprecation is reported: `method_span.unwrap_or(span)`.
-    pub(super) span: InFile<TextRange>,
+    span: TextRange,
     /// Where an unstable use is reported: `span`.
-    pub(super) whole: InFile<TextRange>,
+    whole: TextRange,
+    phase: Phase,
     /// The use's node is an expression: a deprecation's suggestion is given.
-    pub(super) expr: bool,
-    pub(super) phase: Phase,
+    expr: bool,
     /// A parent segment of a path or the trait of a `<Type as Trait>`: checked for stability
     /// alone (`check_stability` with no `id`).
-    pub(super) stability_only: bool,
-    /// For a parent segment, the use of what the whole path resolves to, which is checked
-    /// first and decides whether the segments are.
-    pub(super) segment_of: Option<usize>,
+    stability_only: bool,
     /// In what a derive made (`Span::in_derive_expansion`): no deprecation is reported.
-    pub(super) derive: bool,
+    derive: bool,
 }
 
-/// A macro called, derived or used as an attribute, as written.
-pub(super) struct MacroUse {
-    pub(super) mac: hir::Macro,
-    /// The path as `pprust::path_to_string` prints it.
-    pub(super) path: String,
-    pub(super) span: InFile<TextRange>,
-    pub(super) at: InFile<SyntaxNodePtr>,
-    pub(super) derive: bool,
-}
-
-/// A `#[macro_escape]` of a `mod`.
-pub(super) struct Escape {
-    pub(super) range: InFile<TextRange>,
-    pub(super) inner: bool,
-    pub(super) at: InFile<SyntaxNodePtr>,
-}
-
-/// What the walk found, each in the order rustc comes to it.
-#[derive(Default)]
-pub(super) struct Walked {
-    pub(super) owners: Vec<Owner>,
-    pub(super) uses: Vec<Use>,
-    pub(super) macros: Vec<MacroUse>,
-    pub(super) attrs: Vec<Deprecated>,
-    pub(super) escapes: Vec<Escape>,
-}
-
-/// A `#[deprecated]`.
-pub(super) struct Deprecated {
-    pub(super) attr: Attribute,
-    /// The item-like it is in, or is of.
-    pub(super) owner: Option<usize>,
-    /// On an item of a trait impl.
-    pub(super) of_trait_impl: bool,
+impl Use {
+    fn site(&self, range: TextRange) -> Site {
+        Site { at: self.at, span: InFile::new(self.at.file_id, range), phase: self.phase }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Ctx {
-    owner: Option<usize>,
-    module: usize,
+    owner: u32,
+    module: u32,
     /// What the items written here are in.
     container: Container,
     /// In a body (rustc's typeck lowers what is in it): in an expression or a pattern.
@@ -125,39 +130,128 @@ struct Ctx {
     derive: bool,
 }
 
+/// A node's `#[deprecated]`s, with the attribute each is written in.
+type Deprecated = SmallVec<[(ast::Meta, ast::Attr); 1]>;
+
+/// What one look at a node's attributes found.
+#[derive(Default)]
+struct Scan {
+    /// It has an attribute (one an attribute macro may be).
+    any: bool,
+    deprecated: Deprecated,
+}
+
 struct Walker<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
     cfg: &'db CfgOptions,
-    modules: usize,
-    walked: Walked,
+    index: Index<'a, 'b, 'db>,
+    owners: Vec<Owner>,
+    modules: u32,
+    /// The crate root, the item-like [`ROOT`] stands for.
+    root: InFile<SyntaxNodePtr>,
+    /// Whether the crate enables `extern_types`, read the first time a help needs it.
+    extern_types: Option<bool>,
+    escapes: Vec<Found>,
+    macro_unstable: Vec<Found>,
+    macro_deprecated: Vec<Found>,
+    /// `check_mod_attrs`' and `check_mod_unstable_api_usage`'s, by [`Walker::item_key`].
+    items: Vec<(u64, Found)>,
+    useless: Vec<Found>,
+    /// Typeck's, by the item-like they are in.
+    bodies: Vec<(u32, Found)>,
 }
 
-/// The crate's item-likes and uses, in rustc's order.
-pub(super) fn walk(cx: &Cx<'_, '_>) -> Walked {
+/// The stability checks of the crate, in rustc's order: what resolution reports of macros,
+/// each module's `check_mod_attrs` then `check_mod_unstable_api_usage`, the attribute
+/// parser's delayed lints, then typeck's.
+pub(super) fn walk(cx: &Cx<'_, '_>) -> Vec<Found> {
     let db = cx.db;
-    let mut walker = Walker { cx, cfg: cx.krate.cfg(db), modules: 1, walked: Walked::default() };
     let file = cx.krate.root_module(db).definition_source(db).file_id;
     let root = InFile::new(file, cx.sema.parse_or_expand(file));
-    let ctx = Ctx { owner: None, module: 0, container: Container::Free, body: false, derive: false };
-    walker.attributes(&root, Some(Target::Crate), None, false);
+    let mut walker = Walker {
+        cx,
+        cfg: cx.krate.cfg(db),
+        index: Index::new(cx),
+        owners: Vec::new(),
+        modules: 1,
+        root: root.as_ref().map(SyntaxNodePtr::new),
+        extern_types: None,
+        escapes: Vec::new(),
+        macro_unstable: Vec::new(),
+        macro_deprecated: Vec::new(),
+        items: Vec::new(),
+        useless: Vec::new(),
+        bodies: Vec::new(),
+    };
+    let ctx = Ctx { owner: ROOT, module: 0, container: Container::Free, body: false, derive: false };
+    if let Some(scan) = walker.scan(&root.value, false) {
+        for (meta, written) in &scan.deprecated {
+            walker.deprecated_attr(Target::Crate, root.as_ref(), meta, written, ROOT, false);
+        }
+    }
     walker.children(&root, ctx);
-    walker.walked
+    walker.finish()
 }
 
-impl Walker<'_, '_, '_> {
-    /// Whether `cfg` keeps `node`: each of its `#[cfg]`s holds.
-    fn on(&self, node: &SyntaxNode) -> bool {
-        let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return true };
-        let cfg = self.cfg;
-        hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, |meta, _| match meta {
-            ast::Meta::CfgMeta(meta)
-                if meta.cfg_predicate().is_some_and(|it| cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false)) =>
-            {
-                ControlFlow::Break(())
+impl<'a, 'b, 'db> Walker<'a, 'b, 'db> {
+    fn finish(self) -> Vec<Found> {
+        let Walker { escapes, macro_unstable, macro_deprecated, mut items, useless, mut bodies, .. } = self;
+        items.sort_by_key(|(key, _)| *key);
+        bodies.sort_by_key(|(key, _)| *key);
+        let count =
+            escapes.len() + macro_unstable.len() + macro_deprecated.len() + items.len() + useless.len() + bodies.len();
+        let mut found = Vec::with_capacity(count);
+        found.extend(escapes);
+        found.extend(macro_unstable);
+        found.extend(macro_deprecated);
+        found.extend(items.into_iter().map(|(_, it)| it));
+        found.extend(useless);
+        found.extend(bodies.into_iter().map(|(_, it)| it));
+        found
+    }
+
+    /// Where rustc's checks of the module an item-like is in come to what is reported of it:
+    /// the module, `check_mod_attrs` (`0`) before `check_mod_unstable_api_usage` (`1`), the
+    /// item-like's list in `hir_module_items`, the item-like.
+    fn item_key(&self, owner: u32, check: u64) -> u64 {
+        if owner == ROOT {
+            return check << 31;
+        }
+        let it = self.owners[owner as usize];
+        (u64::from(it.module) << 32) | (check << 31) | (u64::from(it.list) << 29) | u64::from(owner + 1)
+    }
+
+    /// Keeps what the check of `used` found, by the pass that reports it.
+    fn emit(&mut self, used: &Use, found: Found) {
+        match used.phase {
+            Phase::Bodies => self.bodies.push((used.owner.wrapping_add(1), found)),
+            _ => {
+                let key = self.item_key(used.owner, 1);
+                self.items.push((key, found));
             }
-            _ => ControlFlow::Continue(()),
-        })
-        .is_none()
+        }
+    }
+
+    /// The attributes of `node` once `cfg_attr` is expanded: `None` when a `#[cfg]` removes
+    /// it (and `stop`), else whether it has any and its `#[deprecated]`s.
+    fn scan(&self, node: &SyntaxNode, stop: bool) -> Option<Scan> {
+        let mut scan = Scan::default();
+        if !ast::AnyHasAttrs::can_cast(node.kind()) {
+            return Some(scan);
+        }
+        let cfg = self.cfg;
+        let removed = attr::each(node, cfg, |meta, written| {
+            scan.any = true;
+            if let ast::Meta::CfgMeta(it) = &meta {
+                if stop && it.cfg_predicate().is_some_and(|it| cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false)) {
+                    return ControlFlow::Break(());
+                }
+            } else if attr::is(&meta, "deprecated") {
+                scan.deprecated.push((meta, written));
+            }
+            ControlFlow::Continue(())
+        });
+        removed.is_none().then_some(scan)
     }
 
     fn children(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx) {
@@ -166,73 +260,106 @@ impl Walker<'_, '_, '_> {
         }
     }
 
+    /// Visits the children of `node`: the list of kind `list_kind` with `list`, the rest with
+    /// `ctx`.
+    fn children_in(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx, list_kind: SyntaxKind, list: Ctx) {
+        for child in node.value.children() {
+            let ctx = if child.kind() == list_kind { list } else { ctx };
+            self.visit(node.with_value(child), ctx);
+        }
+    }
+
     fn visit(&mut self, node: InFile<SyntaxNode>, ctx: Ctx) {
-        if !self.on(&node.value) || ast::Attr::can_cast(node.value.kind()) {
+        let kind = node.value.kind();
+        if kind == SyntaxKind::ATTR {
             return;
         }
-        if let Some(call) = ast::MacroCall::cast(node.value.clone()) {
-            self.macro_call(&node, &call, ctx);
+        let Some(scan) = self.scan(&node.value, true) else { return };
+        if kind == SyntaxKind::MACRO_CALL {
+            if let Some(call) = ast::MacroCall::cast(node.value.clone()) {
+                self.macro_call(&node, &call, ctx);
+            }
             return;
         }
-        if let Some(item) = ast::Item::cast(node.value.clone()) {
-            if let Some(expanded) = self.cx.sema.expand_attr_macro(&item) {
+        if ast::Item::can_cast(kind)
+            && let Some(item) = ast::Item::cast(node.value.clone())
+        {
+            if scan.any
+                && let Some(expanded) = self.cx.sema.expand_attr_macro(&item)
+            {
                 self.attr_macro(&node, &item, ctx);
                 self.visit(expanded.value, ctx);
                 return;
             }
-            self.item(node, item, ctx);
+            self.item(node, item, ctx, &scan.deprecated);
             return;
         }
-        let target = other_target(&node.value);
-        self.attributes(&node, target, ctx.owner, false);
-        let kind = node.value.kind();
-        let inner = Ctx { body: ctx.body || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind), ..ctx };
-        // typeck checks a method or field after the expression it is of.
-        if ast::MethodCallExpr::can_cast(kind) || ast::FieldExpr::can_cast(kind) {
-            self.children(&node, inner);
-            self.uses_at(&node, ctx);
-            return;
-        }
-        self.uses_at(&node, ctx);
-        match ast::LetStmt::cast(node.value.clone()) {
-            // `check_decl_local`: the type, the initializer, the pattern, the `else`.
-            Some(stmt) => {
-                let ty = stmt.ty().map(|it| it.syntax().clone());
-                let init = stmt.initializer().map(|it| it.syntax().clone());
-                let pat = stmt.pat().map(|it| it.syntax().clone());
-                let other = node.value.children().filter(|it| Some(it) != ty.as_ref() && Some(it) != init.as_ref() && Some(it) != pat.as_ref());
-                let order: Vec<SyntaxNode> = ty.clone().into_iter().chain(init.clone()).chain(pat.clone()).chain(other).collect();
-                for child in order {
-                    self.visit(node.with_value(child), inner);
-                }
+        if let Some(target) = other_target(kind) {
+            for (meta, written) in &scan.deprecated {
+                self.deprecated_attr(target, node.as_ref(), meta, written, ctx.owner, false);
             }
-            None => self.children(&node, inner),
+        }
+        let inner = Ctx { body: ctx.body || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind), ..ctx };
+        match kind {
+            // typeck checks a method or field after the expression it is of.
+            SyntaxKind::METHOD_CALL_EXPR | SyntaxKind::FIELD_EXPR => {
+                self.children(&node, inner);
+                self.uses_at(&node, ctx);
+            }
+            SyntaxKind::LET_STMT => self.let_stmt(&node, inner),
+            _ => {
+                self.uses_at(&node, ctx);
+                self.children(&node, inner);
+            }
         }
     }
 
-    fn owner(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx) -> usize {
-        self.walked.owners.push(Owner { node: node.clone(), module: ctx.module, container: ctx.container });
-        self.walked.owners.len() - 1
+    /// `check_decl_local`'s order: the type, the initializer, the pattern, then the rest.
+    fn let_stmt(&mut self, node: &InFile<SyntaxNode>, inner: Ctx) {
+        let Some(stmt) = ast::LetStmt::cast(node.value.clone()) else { return };
+        let ty = stmt.ty().map(|it| it.syntax().clone());
+        let init = stmt.initializer().map(|it| it.syntax().clone());
+        let pat = stmt.pat().map(|it| it.syntax().clone());
+        for it in [&ty, &init, &pat].into_iter().flatten() {
+            self.visit(node.with_value(it.clone()), inner);
+        }
+        for child in node.value.children() {
+            if Some(&child) != ty.as_ref() && Some(&child) != init.as_ref() && Some(&child) != pat.as_ref() {
+                self.visit(node.with_value(child), inner);
+            }
+        }
     }
 
-    fn item(&mut self, node: InFile<SyntaxNode>, item: ast::Item, ctx: Ctx) {
-        let owner = self.owner(&node, ctx);
-        let inner = Ctx { owner: Some(owner), container: Container::Free, body: false, ..ctx };
+    fn owner(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx, is_use: bool) -> u32 {
+        let id = self.owners.len();
+        assert!(id < OWNERS, "more item-likes in one crate than the stability checks' order keys hold");
+        let node = node.as_ref().map(SyntaxNodePtr::new);
+        self.owners.push(Owner { node, module: ctx.module, list: ctx.container.list(), is_use });
+        id as u32
+    }
+
+    fn item(&mut self, node: InFile<SyntaxNode>, item: ast::Item, ctx: Ctx, deprecated: &Deprecated) {
+        let owner = self.owner(&node, ctx, matches!(item, ast::Item::Use(_)));
+        let inner = Ctx { owner, container: Container::Free, body: false, ..ctx };
         let of_trait_impl = ctx.container == Container::Impl { of_trait: true };
-        self.attributes(&node, item_target(&item, ctx.container), Some(owner), of_trait_impl);
+        if let Some(target) = item_target(&item, ctx.container) {
+            for (meta, written) in deprecated {
+                self.deprecated_attr(target, node.as_ref(), meta, written, owner, of_trait_impl);
+            }
+        }
         match &item {
             ast::Item::Module(module) => self.module(&node, module, inner),
             ast::Item::Impl(imp) => {
                 let list = Ctx { container: Container::Impl { of_trait: imp.trait_().is_some() }, ..inner };
-                self.children_with(&node, inner, |it| ast::AssocItemList::can_cast(it.kind()).then_some(list));
+                self.children_in(&node, inner, SyntaxKind::ASSOC_ITEM_LIST, list);
             }
             ast::Item::Trait(_) => {
                 let list = Ctx { container: Container::Trait, ..inner };
-                self.children_with(&node, inner, |it| ast::AssocItemList::can_cast(it.kind()).then_some(list));
+                self.children_in(&node, inner, SyntaxKind::ASSOC_ITEM_LIST, list);
             }
             ast::Item::ExternBlock(_) => {
                 let list = Ctx { container: Container::Foreign, ..inner };
-                self.children_with(&node, inner, |it| ast::ExternItemList::can_cast(it.kind()).then_some(list));
+                self.children_in(&node, inner, SyntaxKind::EXTERN_ITEM_LIST, list);
             }
             ast::Item::Struct(_) | ast::Item::Enum(_) | ast::Item::Union(_) => {
                 self.children(&node, inner);
@@ -242,19 +369,11 @@ impl Walker<'_, '_, '_> {
         }
     }
 
-    /// Visits the children of `node`, each with the context `pick` gives it, else `ctx`.
-    fn children_with(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx, pick: impl Fn(&SyntaxNode) -> Option<Ctx>) {
-        for child in node.value.children() {
-            let ctx = pick(&child).unwrap_or(ctx);
-            self.visit(node.with_value(child), ctx);
-        }
-    }
-
     fn module(&mut self, node: &InFile<SyntaxNode>, module: &ast::Module, inner: Ctx) {
         let cx = self.cx;
         let contents = Ctx { module: self.modules, ..inner };
         self.modules += 1;
-        let mut attrs = attr::attrs(&node.value, self.cfg);
+        let mut file_root = None;
         match module.item_list() {
             Some(_) => self.children(node, contents),
             None => {
@@ -264,52 +383,77 @@ impl Walker<'_, '_, '_> {
                     && let ModuleSource::SourceFile(_) = source.value
                 {
                     let root = InFile::new(source.file_id, cx.sema.parse_or_expand(source.file_id));
-                    if self.on(&root.value) {
-                        attrs.extend(attr::attrs(&root.value, self.cfg));
-                        self.attributes(&root, Some(Target::Mod), inner.owner, false);
+                    if let Some(scan) = self.scan(&root.value, true) {
+                        for (meta, written) in &scan.deprecated {
+                            self.deprecated_attr(Target::Mod, root.as_ref(), meta, written, inner.owner, false);
+                        }
                         self.children(&root, contents);
+                        file_root = Some(root);
                     }
                 }
             }
         }
-        let first = attrs.iter().find(|(meta, _)| attr::is(meta, "macro_use") || attr::is(meta, "macro_escape"));
-        if let Some((meta, attr)) = first
-            && attr::is(meta, "macro_escape")
+        let first = self.macro_use(&node.value).or_else(|| file_root.and_then(|root| self.macro_use(&root.value)));
+        if let Some((meta, written)) = first
+            && attr::is(&meta, "macro_escape")
         {
-            let file = cx.sema.hir_file_for(attr.syntax());
-            let range = match attr.meta() {
-                Some(it) if it.syntax() == meta.syntax() => attr.syntax().text_range(),
+            let file = cx.sema.hir_file_for(written.syntax());
+            let range = match written.meta() {
+                Some(it) if it.syntax() == meta.syntax() => written.syntax().text_range(),
                 _ => meta.syntax().text_range(),
             };
-            let inner = attr.kind().is_inner();
-            self.walked.escapes.push(Escape {
-                range: InFile::new(file, range),
-                inner,
-                at: node.map(|it| SyntaxNodePtr::new(&it)),
-            });
+            let at = node.as_ref().map(SyntaxNodePtr::new);
+            let found = super::macro_escape(cx, InFile::new(file, range), written.kind().is_inner(), at);
+            self.escapes.push(found);
         }
     }
 
-    /// The `#[deprecated]`s of `node`, on `target`, in the item-like `owner`.
-    fn attributes(&mut self, node: &InFile<SyntaxNode>, target: Option<Target>, owner: Option<usize>, of_trait_impl: bool) {
-        let Some(target) = target else { return };
-        for (meta, written) in attr::attrs(&node.value, self.cfg) {
-            if attr::is(&meta, "deprecated")
-                && let Some(attr) = Attribute::new(target, node.as_ref(), &meta, &written)
-            {
-                self.walked.attrs.push(Deprecated { attr, owner, of_trait_impl });
+    /// The first `#[macro_use]` or `#[macro_escape]` of `node`.
+    fn macro_use(&self, node: &SyntaxNode) -> Option<(ast::Meta, ast::Attr)> {
+        attr::each(node, self.cfg, |meta, written| {
+            if attr::is(&meta, "macro_use") || attr::is(&meta, "macro_escape") {
+                ControlFlow::Break((meta, written))
+            } else {
+                ControlFlow::Continue(())
             }
+        })
+    }
+
+    /// A `#[deprecated]` `meta` written in `written` on `on`, a `target` in the item-like
+    /// `owner`: the lints of the attribute checks and of the attribute parser's target check.
+    fn deprecated_attr(
+        &mut self,
+        target: Target,
+        on: InFile<&SyntaxNode>,
+        meta: &ast::Meta,
+        written: &ast::Attr,
+        owner: u32,
+        of_trait_impl: bool,
+    ) {
+        let useless = target::is_useless(target);
+        if !useless && !target::may_have_no_effect(target, of_trait_impl) {
+            return;
+        }
+        let Some(attr) = Attribute::new(target, on, meta, written) else { return };
+        let cx = self.cx;
+        if let Some(found) = target::no_effect(cx, &attr, of_trait_impl) {
+            let key = self.item_key(owner, 0);
+            self.items.push((key, found));
+        }
+        if useless {
+            let extern_types = *self.extern_types.get_or_insert_with(|| target::extern_types(cx));
+            self.useless.extend(target::useless(cx, &attr, extern_types));
         }
     }
 
     fn macro_call(&mut self, node: &InFile<SyntaxNode>, call: &ast::MacroCall, ctx: Ctx) {
         let cx = self.cx;
-        if let Some(mac) = cx.sema.resolve_macro_call(call)
-            && let Some(path) = call.path()
+        if let Some(path) = call.path()
+            && let Some(mac) = cx.sema.resolve_macro_call(call)
         {
-            let at = node.map(|it| SyntaxNodePtr::new(&it));
             let span = node.with_value(path.syntax().text_range());
-            self.walked.macros.push(MacroUse { mac, path: written(path.syntax()), span, at, derive: ctx.derive });
+            let at = node.as_ref().map(SyntaxNodePtr::new);
+            self.check_macro(mac, span, at, ctx.derive, || written(path.syntax()));
         }
         if let Some(expanded) = cx.sema.expand_macro_call(call) {
             self.visit(expanded, ctx);
@@ -321,189 +465,351 @@ impl Walker<'_, '_, '_> {
         let Some(mac) = cx.sema.resolve_attr_macro_call(item) else { return };
         let name = mac.name(cx.db);
         let name = name.as_str();
-        let found = attr::attrs(&node.value, self.cfg).into_iter().find_map(|(meta, _)| {
-            let path = meta.path()?;
-            (path.segment()?.name_ref()?.text() == name).then_some(path)
+        let found = attr::each(&node.value, self.cfg, |meta, _| {
+            match meta.path().filter(|it| it.segment().and_then(|it| it.name_ref()).is_some_and(|it| it.text() == name)) {
+                Some(path) => ControlFlow::Break(path),
+                None => ControlFlow::Continue(()),
+            }
         });
         if let Some(path) = found {
-            let at = node.map(|it| SyntaxNodePtr::new(&it));
             let span = node.with_value(path.syntax().text_range());
-            self.walked.macros.push(MacroUse { mac, path: written(path.syntax()), span, at, derive: ctx.derive });
+            let at = node.as_ref().map(SyntaxNodePtr::new);
+            self.check_macro(mac, span, at, ctx.derive, || written(path.syntax()));
         }
     }
 
     /// The derives of the ADT at `node`: each derive macro, then what each made.
     fn derives(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx) {
+        let cfg = self.cfg;
+        attr::each::<()>(&node.value, cfg, |meta, written| {
+            if attr::is(&meta, "derive") {
+                self.derive(node, &meta, &written, ctx);
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
+    fn derive(&mut self, node: &InFile<SyntaxNode>, meta: &ast::Meta, written: &ast::Attr, ctx: Ctx) {
         let cx = self.cx;
-        let at = node.map(|it| SyntaxNodePtr::new(&it));
-        for (meta, written_attr) in attr::attrs(&node.value, self.cfg) {
-            if !attr::is(&meta, "derive") {
-                continue;
-            }
-            let macros = cx.sema.resolve_derive_macro(&meta).unwrap_or_default();
-            let paths = match written_attr.meta() {
-                Some(it) if it.syntax() == meta.syntax() => crate::cx::derive_paths(&written_attr),
-                _ => Vec::new(),
+        let macros = cx.sema.resolve_derive_macro(meta).unwrap_or_default();
+        if macros.iter().any(Option::is_some) {
+            let ranges = match written.meta() {
+                Some(it) if it.syntax() == meta.syntax() => derive_ranges(written),
+                _ => SmallVec::new(),
             };
-            for (mac, (range, path)) in macros.into_iter().zip(paths) {
+            let at = node.as_ref().map(SyntaxNodePtr::new);
+            for (mac, range) in macros.into_iter().zip(ranges) {
                 if let Some(mac) = mac {
-                    let span = node.with_value(range);
-                    self.walked.macros.push(MacroUse { mac, path, span, at, derive: ctx.derive });
+                    self.check_macro(mac, node.with_value(range), at, ctx.derive, || derive_text(written, range));
                 }
             }
-            let Some(derived) = cx.sema.expand_derive_macro(&meta) else { continue };
-            for root in derived.into_iter().flatten() {
-                let file = cx.sema.hir_file_for(&root.value);
-                if file.is_macro() {
-                    let ctx = Ctx { derive: true, body: false, container: Container::Free, ..ctx };
-                    self.visit(InFile::new(file, root.value), ctx);
-                }
+        }
+        let Some(derived) = cx.sema.expand_derive_macro(meta) else { return };
+        for root in derived.into_iter().flatten() {
+            let file = cx.sema.hir_file_for(&root.value);
+            if file.is_macro() {
+                let ctx = Ctx { derive: true, body: false, container: Container::Free, ..ctx };
+                self.visit(InFile::new(file, root.value), ctx);
             }
         }
     }
 
-    fn push(&mut self, ctx: Ctx, def: Def, at: &SyntaxNode, file: hir::HirFileId, span: TextRange, whole: TextRange) -> &mut Use {
-        self.walked.uses.push(Use {
-            def,
-            owner: ctx.owner,
-            at: InFile::new(file, SyntaxNodePtr::new(at)),
-            span: InFile::new(file, span),
-            whole: InFile::new(file, whole),
-            expr: false,
-            phase: Phase::Items,
-            stability_only: false,
-            segment_of: None,
-            derive: ctx.derive,
-        });
-        self.walked.uses.last_mut().expect("just pushed")
+    /// `check_stability_and_deprecation` of the macro `mac` used at `span`: its own
+    /// stability, checked in every crate, then its own deprecation, outside derives. `path`
+    /// prints the path as written (`pprust::path_to_string`), only for what is reported.
+    fn check_macro(
+        &mut self,
+        mac: hir::Macro,
+        span: InFile<TextRange>,
+        at: InFile<SyntaxNodePtr>,
+        derive: bool,
+        path: impl Fn() -> String,
+    ) {
+        let cx = self.cx;
+        let site = Site { at, span, phase: Phase::Resolve };
+        let mut text = None;
+        if let Some(id) = self.index.macro_stability(mac)
+            && self.index.macro_denied(id, span.file_id, span.value)
+        {
+            let path: &str = text.get_or_insert_with(&path);
+            let def = Def::Item(ModuleDef::Macro(mac));
+            let found = super::unstable(cx, def, Some(path), &self.index.stabilities[id as usize], site);
+            self.macro_unstable.extend(found);
+        }
+        if !derive && let Some(id) = self.index.macro_deprecation(mac) {
+            let path: &str = text.get_or_insert_with(&path);
+            let found = super::deprecated_macro(cx, mac, &self.index.entries[id as usize].depr, path, site);
+            self.macro_deprecated.push(found);
+        }
     }
 
     fn uses_at(&mut self, node: &InFile<SyntaxNode>, ctx: Ctx) {
+        let cx = self.cx;
+        let db = cx.db;
+        let file = node.file_id;
         let value = &node.value;
-        if let Some(path) = ast::Path::cast(value.clone()) {
-            let in_use = path.syntax().parent().is_some_and(|it| ast::UseTree::can_cast(it.kind()));
-            if path.parent_path().is_none() && !in_use {
-                let anchor_trait = is_anchor_trait(&path);
-                self.path(node.with_value(&path), ctx, anchor_trait);
+        match value.kind() {
+            SyntaxKind::PATH => {
+                if value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::PATH | SyntaxKind::USE_TREE)) {
+                    return;
+                }
+                if let Some(path) = ast::Path::cast(value.clone()) {
+                    let anchor_trait = is_anchor_trait(&path);
+                    self.path(file, &path, ctx, anchor_trait, None);
+                }
             }
-        } else if let Some(tree) = ast::UseTree::cast(value.clone()) {
-            self.use_tree(node.with_value(&tree), ctx);
-        } else if let Some(call) = ast::MethodCallExpr::cast(value.clone()) {
-            self.method_call(node.with_value(&call), ctx);
-        } else if let Some(field) = ast::FieldExpr::cast(value.clone()) {
-            self.field(node.with_value(&field), ctx);
-        } else if let Some(field) = ast::RecordExprField::cast(value.clone()) {
-            let Some((def, _, _)) = self.cx.sema.resolve_record_field(&field) else { return };
-            if matches!(def.parent_def(self.cx.db), hir::Variant::EnumVariant(_)) {
-                return;
+            SyntaxKind::USE_TREE => {
+                if let Some(tree) = ast::UseTree::cast(value.clone()) {
+                    self.use_tree(file, &tree, ctx);
+                }
             }
-            let range = value.text_range();
-            let found = self.push(ctx, Def::Field(def), value, node.file_id, range, range);
-            found.phase = Phase::Bodies;
-        } else if let Some(field) = ast::RecordPatField::cast(value.clone()) {
-            let Some((def, _)) = self.cx.sema.resolve_record_pat_field(&field) else { return };
-            let range = value.text_range();
-            let found = self.push(ctx, Def::Field(def), value, node.file_id, range, range);
-            found.phase = Phase::Bodies;
-        } else if let Some(pat) = ast::TupleStructPat::cast(value.clone()) {
-            self.tuple_struct_pat(node.with_value(&pat), ctx);
-        } else if let Some(arg) = ast::AssocTypeArg::cast(value.clone()) {
-            self.constraint(node.with_value(&arg), ctx);
+            SyntaxKind::METHOD_CALL_EXPR => {
+                if let Some(call) = ast::MethodCallExpr::cast(value.clone()) {
+                    self.method_call(file, &call, ctx);
+                }
+            }
+            SyntaxKind::FIELD_EXPR => {
+                if let Some(field) = ast::FieldExpr::cast(value.clone()) {
+                    self.field(file, &field, ctx);
+                }
+            }
+            SyntaxKind::RECORD_EXPR_FIELD => {
+                let Some(field) = ast::RecordExprField::cast(value.clone()) else { return };
+                let Some((def, _, _)) = cx.sema.resolve_record_field(&field) else { return };
+                if matches!(def.parent_def(db), hir::Variant::EnumVariant(_)) {
+                    return;
+                }
+                self.field_use(file, value, Def::Field(def), ctx);
+            }
+            SyntaxKind::RECORD_PAT_FIELD => {
+                let Some(field) = ast::RecordPatField::cast(value.clone()) else { return };
+                let Some((def, _)) = cx.sema.resolve_record_pat_field(&field) else { return };
+                self.field_use(file, value, Def::Field(def), ctx);
+            }
+            SyntaxKind::TUPLE_STRUCT_PAT => {
+                if let Some(pat) = ast::TupleStructPat::cast(value.clone()) {
+                    self.tuple_struct_pat(file, &pat, ctx);
+                }
+            }
+            SyntaxKind::ASSOC_TYPE_ARG => {
+                if let Some(arg) = ast::AssocTypeArg::cast(value.clone()) {
+                    self.constraint(file, &arg, ctx);
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// `check_stability_allow_unstable` of `used`: its deprecation (but in a definition
+    /// deprecated by the same attribute), then its stability. Whether it was allowed.
+    fn check(&mut self, used: &Use) -> bool {
+        let cx = self.cx;
+        if !used.stability_only
+            && !used.derive
+            && let Some(id) = self.index.deprecation(used.def)
+        {
+            let mut report = self.index.entries[id as usize].depr.is_since_rustc_version();
+            if !report {
+                let parent = self.owner_deprecation(used.owner);
+                report = !parent.is_some_and(|it| self.index.same_origin(id, it));
+            }
+            if report {
+                let suggestion = used.expr.then(|| InFile::new(used.at.file_id, used.span));
+                let depr = &self.index.entries[id as usize].depr;
+                if let Some(found) = super::deprecated(cx, used.def, depr, used.site(used.span), suggestion) {
+                    self.emit(used, found);
+                }
+            }
+        }
+        let Some(stability) = self.unstable(used) else { return true };
+        let stability = &self.index.stabilities[stability as usize];
+        if let Some(found) = super::unstable(cx, used.def, None, stability, used.site(used.whole)) {
+            self.emit(used, found);
+        }
+        false
+    }
+
+    /// `lookup_deprecation_entry` of the item-like `owner`, as `hir_get_parent_item` of a use.
+    fn owner_deprecation(&mut self, owner: u32) -> Option<Id> {
+        let node = match owner {
+            ROOT => self.root,
+            it => self.owners[it as usize].node,
+        };
+        self.index.local_deprecation(node)
+    }
+
+    /// The stability of what `used` names when `eval_stability_allow_unstable` denies it: a
+    /// public definition of a dependency compiled with `#![feature(staged_api)]`, unstable,
+    /// its feature not enabled nor allowed where it is used, nor the `use` it is in an
+    /// unstable re-export.
+    fn unstable(&mut self, used: &Use) -> Option<Id> {
+        let id = self.index.foreign_stability(used.def)?;
+        if !self.index.denied(id, used.at.file_id, used.whole) || self.is_unstable_reexport(used.owner) {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// `is_unstable_reexport`: the item-like is a `use` that is itself unstable.
+    fn is_unstable_reexport(&mut self, owner: u32) -> bool {
+        if owner == ROOT || !self.owners[owner as usize].is_use || !self.index.staged(self.cx.krate) {
+            return false;
+        }
+        let stability = self.index.local_stability(self.owners[owner as usize].node);
+        stability.is_some_and(|it| self.index.stabilities[it as usize].is_unstable())
+    }
+
+    /// Whether a use of `def` can be reported: it is deprecated or has a stability rustc
+    /// checks.
+    fn may_report(&mut self, def: Def) -> bool {
+        self.index.deprecation(def).is_some() || self.index.foreign_stability(def).is_some()
     }
 
     /// A path as rustc's HIR has it: resolved by name resolution (`Checker::visit_path`, the
     /// parent segments for stability alone), or type-relative (typeck's or `hir_ty_lowering`'s
-    /// check of what it resolves to, the type before it a path of its own).
-    fn path(&mut self, path: InFile<&ast::Path>, ctx: Ctx, stability_only: bool) {
+    /// check of what it resolves to, the type before it a path of its own). `res` is what it
+    /// resolves to, when that is known.
+    fn path(
+        &mut self,
+        file: HirFileId,
+        path: &ast::Path,
+        ctx: Ctx,
+        stability_only: bool,
+        res: Option<PathResolution<'db>>,
+    ) {
         let cx = self.cx;
         let db = cx.db;
-        let value = path.value;
-        let parent = value.syntax().parent();
-        if value.qualifier().is_none()
-            && value.segment().and_then(|it| it.kind()).is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
+        let qualifier = path.qualifier();
+        if qualifier.is_none()
+            && path.segment().and_then(|it| it.kind()).is_some_and(|it| matches!(it, ast::PathSegmentKind::SelfTypeKw))
         {
             return;
         }
-        let Some(res) = cx.sema.resolve_path(value) else { return };
-        let relative = type_relative(cx, value, &res);
+        let Some(res) = res.or_else(|| cx.sema.resolve_path(path)) else { return };
+        let (relative, qualifier_res) = match &qualifier {
+            Some(qualifier) => type_relative(cx, qualifier, &res),
+            None => (false, None),
+        };
+        let parent = path.syntax().parent();
+        let parent_kind = parent.as_ref().map(SyntaxNode::kind);
         let def = match res {
             PathResolution::Def(ModuleDef::BuiltinType(_)) => None,
             PathResolution::Def(def) => {
                 let def = trait_item(db, def);
-                let value_ns = parent.as_ref().is_some_and(|it| {
-                    ast::PathExpr::can_cast(it.kind())
-                        || ast::PathPat::can_cast(it.kind())
-                        || ast::TupleStructPat::can_cast(it.kind())
-                });
+                let value_ns = matches!(
+                    parent_kind,
+                    Some(SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT)
+                );
                 Some(if value_ns { Def::value(db, def) } else { Def::Item(def) })
             }
             _ => None,
         };
-        let whole = value.syntax().text_range();
-        let last = value.segment().and_then(|it| it.name_ref()).map_or(whole, |it| it.syntax().text_range());
-        let at = parent.clone().unwrap_or_else(|| value.syntax().clone());
-        let expr = parent.as_ref().is_some_and(|it| ast::PathExpr::can_cast(it.kind()) || ast::RecordExpr::can_cast(it.kind()));
-        let main = def.map(|def| {
-            let in_type = parent.as_ref().is_some_and(|it| ast::PathType::can_cast(it.kind()));
-            let span = match relative && in_type {
-                true => whole,
-                false => last,
-            };
-            let phase = if relative && ctx.body { Phase::Bodies } else { Phase::Items };
-            let found = self.push(ctx, def, &at, path.file_id, span, whole);
-            found.expr = expr;
-            found.phase = phase;
-            found.stability_only = stability_only;
-            self.walked.uses.len() - 1
-        });
-        let Some(qualifier) = value.qualifier() else { return };
+        let main = match def {
+            Some(def) => {
+                let whole = path.syntax().text_range();
+                let last = path.segment().and_then(|it| it.name_ref()).map_or(whole, |it| it.syntax().text_range());
+                let at = parent.as_ref().unwrap_or(path.syntax());
+                let used = Use {
+                    def,
+                    owner: ctx.owner,
+                    at: InFile::new(file, SyntaxNodePtr::new(at)),
+                    span: if relative && parent_kind == Some(SyntaxKind::PATH_TYPE) { whole } else { last },
+                    whole,
+                    phase: if relative && ctx.body { Phase::Bodies } else { Phase::Items },
+                    expr: matches!(parent_kind, Some(SyntaxKind::PATH_EXPR | SyntaxKind::RECORD_EXPR)),
+                    stability_only,
+                    derive: ctx.derive,
+                };
+                Some((used, self.check(&used)))
+            }
+            None => None,
+        };
+        let Some(qualifier) = qualifier else { return };
         if relative {
-            if !matches!(qualifier.segment().and_then(|it| it.kind()), Some(ast::PathSegmentKind::Type { .. })) {
-                self.path(path.with_value(&qualifier), ctx, stability_only);
+            if !matches!(qualifier.segment().and_then(|it| it.kind()), Some(ast::PathSegmentKind::Type { .. }))
+                && !matches!(qualifier_res, Some(None))
+            {
+                self.path(file, &qualifier, ctx, stability_only, qualifier_res.flatten());
             }
             return;
         }
-        let Some(main) = main else { return };
+        let Some((main, true)) = main else { return };
+        if self.index.is_local(main.def) {
+            return;
+        }
+        let through = self.index.through(main.def);
+        let mut resolved = qualifier_res;
         let mut segment = Some(qualifier);
         while let Some(qualifier) = segment {
-            self.segment(ctx, &qualifier, &at, path.file_id, main);
+            let res = resolved.take().unwrap_or_else(|| cx.sema.resolve_path(&qualifier));
+            self.segment(&qualifier, res, &main, through, ctx);
             segment = qualifier.qualifier();
         }
     }
 
-    /// The check of the parent segment `qualifier` of the path checked as `main`.
-    fn segment(&mut self, ctx: Ctx, qualifier: &ast::Path, at: &SyntaxNode, file: hir::HirFileId, main: usize) {
-        if let Some(PathResolution::Def(def)) = self.cx.sema.resolve_path(qualifier)
-            && !matches!(def, ModuleDef::BuiltinType(_))
-        {
-            let segment = qualifier.segment();
-            let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
-            let range = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(qualifier.syntax().text_range());
-            let found = self.push(ctx, Def::Item(def), at, file, range, range);
-            found.stability_only = true;
-            found.segment_of = Some(main);
+    /// The check of the parent segment `qualifier`, resolving to `res`, of the path checked
+    /// as `main`, which was allowed: an error when the segment is unstable, or for an item
+    /// allowed through unstable modules (`through`), its deprecation with the item's message.
+    fn segment(
+        &mut self,
+        qualifier: &ast::Path,
+        res: Option<PathResolution<'db>>,
+        main: &Use,
+        through: Option<Id>,
+        ctx: Ctx,
+    ) {
+        let Some(PathResolution::Def(def)) = res else { return };
+        if matches!(def, ModuleDef::BuiltinType(_)) {
+            return;
+        }
+        let segment = qualifier.segment();
+        let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
+        let range = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(qualifier.syntax().text_range());
+        let used = Use {
+            def: Def::Item(def),
+            owner: ctx.owner,
+            at: main.at,
+            span: range,
+            whole: range,
+            phase: Phase::Items,
+            expr: false,
+            stability_only: true,
+            derive: ctx.derive,
+        };
+        let Some(stability) = self.unstable(&used) else { return };
+        let cx = self.cx;
+        let stabilities = &self.index.stabilities;
+        let message = through.and_then(|id| match &stabilities[id as usize] {
+            Stability::Stable { allowed_through_unstable_modules: Some(it) } => Some(it.as_str()),
+            _ => None,
+        });
+        let found = match message {
+            Some(message) => super::deprecated_through(cx, used.def, message, main.site(main.span)),
+            None => super::unstable(cx, used.def, None, &stabilities[stability as usize], used.site(range)),
+        };
+        if let Some(found) = found {
+            self.emit(&used, found);
         }
     }
 
     /// A use tree as `lower_use_tree` makes items of it: a single import checked in each
     /// namespace it imports in (a constructor and its struct once), a glob by what it imports
     /// from, a list by nothing unless it is empty.
-    fn use_tree(&mut self, tree: InFile<&ast::UseTree>, ctx: Ctx) {
+    fn use_tree(&mut self, file: HirFileId, tree: &ast::UseTree, ctx: Ctx) {
         let cx = self.cx;
         let db = cx.db;
-        let value = tree.value;
-        let Some(path) = value.path() else { return };
-        if let Some(list) = value.use_tree_list() {
-            let root_only = path.qualifier().is_none() && path.segment().is_some_and(|it| it.coloncolon_token().is_some() && it.name_ref().is_none());
+        let Some(path) = tree.path() else { return };
+        if let Some(list) = tree.use_tree_list() {
+            let root_only = path.qualifier().is_none()
+                && path.segment().is_some_and(|it| it.coloncolon_token().is_some() && it.name_ref().is_none());
             if list.use_trees().next().is_none() && !root_only {
-                self.use_path(tree, &path, None, ctx);
+                self.use_path(file, tree, &path, None, ctx);
             }
             return;
         }
-        if value.star_token().is_some() {
+        if tree.star_token().is_some() {
             if let Some(PathResolution::Def(def)) = cx.sema.resolve_path(&path) {
-                self.use_path(tree, &path, Some(Def::Item(def)), ctx);
+                self.use_path(file, tree, &path, Some(Def::Item(def)), ctx);
             }
             return;
         }
@@ -513,7 +819,7 @@ impl Walker<'_, '_, '_> {
             _ => None,
         };
         let (types, values, macros) = (def_of(per_ns.type_ns), def_of(per_ns.value_ns), def_of(per_ns.macro_ns));
-        let mut defs = Vec::new();
+        let mut defs: SmallVec<[Def; 3]> = SmallVec::new();
         match (types, values) {
             (Some(ty), Some(val)) if ty == val && matches!(Def::value(db, val), Def::Ctor(_)) => {
                 defs.push(Def::value(db, val));
@@ -525,81 +831,127 @@ impl Walker<'_, '_, '_> {
         }
         defs.extend(macros.map(Def::Item));
         for def in defs {
-            self.use_path(tree, &path, Some(def), ctx);
+            self.use_path(file, tree, &path, Some(def), ctx);
         }
     }
 
     /// The check of a `use` path resolving to `def` (when it is checked), and of its parent
-    /// segments, those of the trees it is nested in first.
-    fn use_path(&mut self, tree: InFile<&ast::UseTree>, path: &ast::Path, def: Option<Def>, ctx: Ctx) {
+    /// segments, those of the trees it is nested in after its own.
+    fn use_path(&mut self, file: HirFileId, tree: &ast::UseTree, path: &ast::Path, def: Option<Def>, ctx: Ctx) {
         let cx = self.cx;
-        let file = tree.file_id;
-        let at = tree.value.syntax().clone();
+        let def = match def {
+            Some(def) => def,
+            None => match cx.sema.resolve_path(path) {
+                Some(PathResolution::Def(def)) => Def::Item(def),
+                _ => return,
+            },
+        };
         let whole = path.syntax().text_range();
         let segment = path.segment();
         let name = segment.as_ref().and_then(|it| it.name_ref()).map(|it| it.syntax().text_range());
         let last = name.or(segment.map(|it| it.syntax().text_range())).unwrap_or(whole);
-        let def = match def {
-            Some(def) => Some(def),
-            None => match cx.sema.resolve_path(path) {
-                Some(PathResolution::Def(def)) => Some(Def::Item(def)),
-                _ => None,
-            },
+        let main = Use {
+            def: trait_item_def(cx, def),
+            owner: ctx.owner,
+            at: InFile::new(file, SyntaxNodePtr::new(tree.syntax())),
+            span: last,
+            whole,
+            phase: Phase::Items,
+            expr: false,
+            stability_only: false,
+            derive: ctx.derive,
         };
-        let Some(def) = def else { return };
-        self.push(ctx, trait_item_def(cx, def), &at, file, last, whole);
-        let main = self.walked.uses.len() - 1;
-        let mut parents = Vec::new();
-        let mut segment = path.qualifier();
-        while let Some(qualifier) = segment {
-            segment = qualifier.qualifier();
-            parents.push(qualifier);
+        if !self.check(&main) || self.index.is_local(main.def) {
+            return;
         }
-        for outer in tree.value.syntax().ancestors().skip(1).filter_map(ast::UseTree::cast) {
-            let Some(path) = outer.path() else { continue };
-            let mut segment = Some(path);
+        let through = self.index.through(main.def);
+        let outer = tree
+            .syntax()
+            .ancestors()
+            .skip(1)
+            .take_while(|it| it.kind() != SyntaxKind::USE)
+            .filter(|it| it.kind() == SyntaxKind::USE_TREE)
+            .filter_map(ast::UseTree::cast)
+            .filter_map(|it| it.path());
+        for start in path.qualifier().into_iter().chain(outer) {
+            let mut segment = Some(start);
             while let Some(qualifier) = segment {
+                let res = cx.sema.resolve_path(&qualifier);
+                self.segment(&qualifier, res, &main, through, ctx);
                 segment = qualifier.qualifier();
-                parents.push(qualifier);
             }
-        }
-        for parent in parents {
-            self.segment(ctx, &parent, &at, file, main);
         }
     }
 
     /// `lookup_method`'s check of the method picked, at its name.
-    fn method_call(&mut self, call: InFile<&ast::MethodCallExpr>, ctx: Ctx) {
+    fn method_call(&mut self, file: HirFileId, call: &ast::MethodCallExpr, ctx: Ctx) {
         let cx = self.cx;
-        let Some(function) = cx.sema.resolve_method_call(call.value) else { return };
-        let Some(name) = call.value.name_ref() else { return };
-        let def = Def::Item(trait_item(cx.db, ModuleDef::Function(function)));
+        let Some(name) = call.name_ref() else { return };
+        let Some(function) = cx.sema.resolve_method_call(call) else { return };
         let range = name.syntax().text_range();
-        let found = self.push(ctx, def, call.value.syntax(), call.file_id, range, range);
-        found.expr = true;
-        found.phase = Phase::Bodies;
+        let used = Use {
+            def: Def::Item(trait_item(cx.db, ModuleDef::Function(function))),
+            owner: ctx.owner,
+            at: InFile::new(file, SyntaxNodePtr::new(call.syntax())),
+            span: range,
+            whole: range,
+            phase: Phase::Bodies,
+            expr: true,
+            stability_only: false,
+            derive: ctx.derive,
+        };
+        self.check(&used);
     }
 
     /// `check_expr_field`'s check of a field it can access, at the whole expression.
-    fn field(&mut self, field: InFile<&ast::FieldExpr>, ctx: Ctx) {
+    fn field(&mut self, file: HirFileId, field: &ast::FieldExpr, ctx: Ctx) {
         let cx = self.cx;
-        let Some(Either::Left(def)) = cx.sema.resolve_field(field.value) else { return };
-        let Some(scope) = cx.sema.scope(field.value.syntax()) else { return };
+        let Some(Either::Left(def)) = cx.sema.resolve_field(field) else { return };
+        if !self.may_report(Def::Field(def)) {
+            return;
+        }
+        let Some(scope) = cx.sema.scope(field.syntax()) else { return };
         if !def.is_visible_from(cx.db, scope.module()) {
             return;
         }
-        let range = field.value.syntax().text_range();
-        let found = self.push(ctx, Def::Field(def), field.value.syntax(), field.file_id, range, range);
-        found.expr = true;
-        found.phase = Phase::Bodies;
+        let range = field.syntax().text_range();
+        let used = Use {
+            def: Def::Field(def),
+            owner: ctx.owner,
+            at: InFile::new(file, SyntaxNodePtr::new(field.syntax())),
+            span: range,
+            whole: range,
+            phase: Phase::Bodies,
+            expr: true,
+            stability_only: false,
+            derive: ctx.derive,
+        };
+        self.check(&used);
+    }
+
+    /// The check of a struct field named in an expression or a pattern, at `node`.
+    fn field_use(&mut self, file: HirFileId, node: &SyntaxNode, def: Def, ctx: Ctx) {
+        let range = node.text_range();
+        let used = Use {
+            def,
+            owner: ctx.owner,
+            at: InFile::new(file, SyntaxNodePtr::new(node)),
+            span: range,
+            whole: range,
+            phase: Phase::Bodies,
+            expr: false,
+            stability_only: false,
+            derive: ctx.derive,
+        };
+        self.check(&used);
     }
 
     /// `check_pat_tuple_struct`'s check of the field each subpattern is of
     /// (`enumerate_and_adjust` past a `..`), when their number fits.
-    fn tuple_struct_pat(&mut self, pat: InFile<&ast::TupleStructPat>, ctx: Ctx) {
+    fn tuple_struct_pat(&mut self, file: HirFileId, pat: &ast::TupleStructPat, ctx: Ctx) {
         let cx = self.cx;
-        let Some(fields) = cx.sema.resolve_tuple_struct_pat_fields(pat.value) else { return };
-        let subpats: Vec<ast::Pat> = pat.value.fields().collect();
+        let Some(fields) = cx.sema.resolve_tuple_struct_pat_fields(pat) else { return };
+        let subpats: SmallVec<[ast::Pat; 8]> = pat.fields().collect();
         let rest = subpats.iter().position(|it| matches!(it, ast::Pat::RestPat(_)));
         let count = subpats.len() - usize::from(rest.is_some());
         if count > fields.len() || (count < fields.len() && rest.is_none()) {
@@ -611,31 +963,41 @@ impl Walker<'_, '_, '_> {
                 Some(rest) if index > rest => index - 1 + (fields.len() - count),
                 _ => index,
             };
-            let range = subpat.syntax().text_range();
-            let found = self.push(ctx, Def::Field(fields[field].0), subpat.syntax(), pat.file_id, range, range);
-            found.phase = Phase::Bodies;
+            self.field_use(file, subpat.syntax(), Def::Field(fields[field].0), ctx);
         }
     }
 
     /// `lower_assoc_item_constraint`'s check of the associated type a constraint names, at
     /// the whole constraint.
-    fn constraint(&mut self, arg: InFile<&ast::AssocTypeArg>, ctx: Ctx) {
+    fn constraint(&mut self, file: HirFileId, arg: &ast::AssocTypeArg, ctx: Ctx) {
         let cx = self.cx;
         let db = cx.db;
-        let Some(name) = arg.value.name_ref() else { return };
-        let Some(path) = arg.value.syntax().ancestors().skip(1).find_map(ast::Path::cast) else { return };
+        let Some(name) = arg.name_ref() else { return };
+        let Some(path) =
+            arg.syntax().ancestors().skip(1).find(|it| it.kind() == SyntaxKind::PATH).and_then(ast::Path::cast)
+        else {
+            return;
+        };
         let Some(PathResolution::Def(ModuleDef::Trait(trait_))) = cx.sema.resolve_path(&path) else { return };
+        let name = name.as_name();
         let found = trait_.items_with_supertraits(db).into_iter().find_map(|it| match it {
-            hir::AssocItem::TypeAlias(it) if it.name(db).as_str() == name.text().trim_start_matches("r#") => Some(it),
+            hir::AssocItem::TypeAlias(it) if it.name(db) == name => Some(it),
             _ => None,
         });
         let Some(alias) = found else { return };
-        let range = arg.value.syntax().text_range();
-        let def = Def::Item(ModuleDef::TypeAlias(alias));
-        let found = self.push(ctx, def, arg.value.syntax(), arg.file_id, range, range);
-        if ctx.body {
-            found.phase = Phase::Bodies;
-        }
+        let range = arg.syntax().text_range();
+        let used = Use {
+            def: Def::Item(ModuleDef::TypeAlias(alias)),
+            owner: ctx.owner,
+            at: InFile::new(file, SyntaxNodePtr::new(arg.syntax())),
+            span: range,
+            whole: range,
+            phase: if ctx.body { Phase::Bodies } else { Phase::Items },
+            expr: false,
+            stability_only: false,
+            derive: ctx.derive,
+        };
+        self.check(&used);
     }
 }
 
@@ -647,25 +1009,33 @@ fn trait_item_def(cx: &Cx<'_, '_>, def: Def) -> Def {
     }
 }
 
-/// Whether rustc resolves `path` in typeck rather than in name resolution: its qualifier is
-/// a type (`Type::item`, `<Type>::item`, `Self::item`, `T::Assoc`, an enum's associated item),
-/// not a module, a trait or `<Type as Trait>`.
-fn type_relative(cx: &Cx<'_, '_>, path: &ast::Path, res: &PathResolution<'_>) -> bool {
-    let Some(qualifier) = path.qualifier() else { return false };
+/// Whether rustc resolves the path `qualifier` qualifies, resolving to `res`, in typeck
+/// rather than in name resolution: `qualifier` is a type (`Type::item`, `<Type>::item`,
+/// `Self::item`, `T::Assoc`, an enum's associated item), not a module, a trait or
+/// `<Type as Trait>`. With what `qualifier` resolves to, when it was resolved to tell.
+fn type_relative<'db>(
+    cx: &Cx<'_, 'db>,
+    qualifier: &ast::Path,
+    res: &PathResolution<'db>,
+) -> (bool, Option<Option<PathResolution<'db>>>) {
     match qualifier.segment().and_then(|it| it.kind()) {
-        Some(ast::PathSegmentKind::Type { trait_ref, .. }) => trait_ref.is_none(),
-        Some(ast::PathSegmentKind::SelfTypeKw) if qualifier.qualifier().is_none() => true,
-        _ => match cx.sema.resolve_path(&qualifier) {
-            Some(PathResolution::Def(ModuleDef::Module(_) | ModuleDef::Trait(_))) => false,
-            Some(PathResolution::Def(ModuleDef::Adt(Adt::Enum(_)))) => {
-                !matches!(res, PathResolution::Def(ModuleDef::EnumVariant(_)))
-            }
-            Some(PathResolution::Def(
-                ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
-            ))
-            | Some(PathResolution::SelfType(_) | PathResolution::TypeParam(_)) => true,
-            _ => false,
-        },
+        Some(ast::PathSegmentKind::Type { trait_ref, .. }) => (trait_ref.is_none(), None),
+        Some(ast::PathSegmentKind::SelfTypeKw) if qualifier.qualifier().is_none() => (true, None),
+        _ => {
+            let resolved = cx.sema.resolve_path(qualifier);
+            let relative = match resolved {
+                Some(PathResolution::Def(ModuleDef::Module(_) | ModuleDef::Trait(_))) => false,
+                Some(PathResolution::Def(ModuleDef::Adt(Adt::Enum(_)))) => {
+                    !matches!(res, PathResolution::Def(ModuleDef::EnumVariant(_)))
+                }
+                Some(PathResolution::Def(
+                    ModuleDef::Adt(_) | ModuleDef::TypeAlias(_) | ModuleDef::BuiltinType(_),
+                ))
+                | Some(PathResolution::SelfType(_) | PathResolution::TypeParam(_)) => true,
+                _ => false,
+            };
+            (relative, Some(resolved))
+        }
     }
 }
 
@@ -681,11 +1051,46 @@ fn is_anchor_trait(path: &ast::Path) -> bool {
 
 /// A path as `pprust::path_to_string` prints it: its tokens with no space.
 fn written(node: &SyntaxNode) -> String {
-    node.descendants_with_tokens()
-        .filter_map(|it| it.into_token())
-        .filter(|it| !it.kind().is_trivia())
-        .map(|it| it.text().to_owned())
-        .collect()
+    let mut text = String::new();
+    for token in node.descendants_with_tokens().filter_map(NodeOrToken::into_token) {
+        if !token.kind().is_trivia() {
+            text.push_str(token.text());
+        }
+    }
+    text
+}
+
+/// Where each path of a `#[derive(...)]` is: `crate::cx::derive_paths` without the text.
+fn derive_ranges(attr: &ast::Attr) -> SmallVec<[TextRange; 4]> {
+    let mut ranges = SmallVec::new();
+    let Some((_, tt)) = attr.as_simple_call() else { return ranges };
+    let mut current: Option<TextRange> = None;
+    for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
+        match token.kind() {
+            SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => {
+                let range = token.text_range();
+                current = Some(current.map_or(range, |it| it.cover(range)));
+            }
+            SyntaxKind::COMMA | SyntaxKind::R_PAREN => ranges.extend(current.take()),
+            _ => {}
+        }
+    }
+    ranges.extend(current);
+    ranges
+}
+
+/// The path of the derive at `range` in `attr`, as `crate::cx::derive_paths` prints it.
+fn derive_text(attr: &ast::Attr, range: TextRange) -> String {
+    let mut text = String::new();
+    let Some((_, tt)) = attr.as_simple_call() else { return text };
+    for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
+        if matches!(token.kind(), SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON)
+            && range.contains_range(token.text_range())
+        {
+            text.push_str(token.text());
+        }
+    }
+    text
 }
 
 /// rustc's `Target` of an item written in `container`.
@@ -726,9 +1131,8 @@ fn item_target(item: &ast::Item, container: Container) -> Option<Target> {
     })
 }
 
-/// rustc's `Target` of a node that is no item.
-fn other_target(node: &SyntaxNode) -> Option<Target> {
-    let kind = node.kind();
+/// rustc's `Target` of a node of kind `kind` that is no item.
+fn other_target(kind: SyntaxKind) -> Option<Target> {
     Some(if ast::Variant::can_cast(kind) {
         Target::Variant
     } else if ast::RecordField::can_cast(kind) || ast::TupleField::can_cast(kind) {

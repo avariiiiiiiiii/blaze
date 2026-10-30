@@ -25,7 +25,7 @@
 //! `statx` says no alignment for writes that bypass the cache, so none does.
 
 use std::{
-    cell::RefCell,
+    cell::{RefCell, UnsafeCell},
     collections::VecDeque,
     ffi::CString,
     io,
@@ -38,7 +38,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU16, AtomicU32, Ordering, fence},
+        atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering, fence},
         mpsc,
     },
     time::{Duration, Instant},
@@ -58,7 +58,6 @@ const OP_POLL_ADD: u8 = 6;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
 const OP_CONNECT: u8 = 16;
-const OP_STATX: u8 = 21;
 const OP_READ: u8 = 22;
 const OP_WRITE: u8 = 23;
 const OP_SEND: u8 = 26;
@@ -137,13 +136,9 @@ const STATX_STAMP: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
 /// `statx`'s flag to answer from what the kernel has, never asking a network file system's
 /// server first.
 const AT_STATX_DONT_SYNC: i32 = 0x4000;
-
-/// In a `user_data`: the request is a name of a sweep ([`Effect::Stamp`]), its sweep's slot in
-/// bits 48 to 62, its `statx` buffer in bits 32 to 47 and the name's index in the low 32. Every
-/// other request's `user_data` is [`data`] of an id below 2^61, or [`NOBODY`].
-const STAMP: u64 = 1 << 63;
-/// Sweeps in flight at once: their slots fit in 15 bits, short of the one [`NOBODY`] has.
-const SWEEPS: u32 = (1 << 15) - 1;
+/// Names a stamper claims at once: enough to make the claim's atomic add nothing beside them
+/// (512 `statx`es are ~300 µs), few enough that the last chunk leaves no core idle for long.
+const STAMP_CHUNK: usize = 512;
 
 /// Requests the ring holds at once, enough to keep an NVMe queue full; more wait in the
 /// driver until there is room.
@@ -794,34 +789,6 @@ impl Ring {
         true
     }
 
-    /// Writes up to `n` requests to the ring, `make(k)` the `k`th, as many as it has room for,
-    /// published to the kernel with one store of the tail. How many it wrote; `make` is called
-    /// for each of those and no other.
-    fn push_each(&mut self, n: usize, mut make: impl FnMut(usize) -> Sqe) -> usize {
-        // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
-        // lives; the kernel moves it, so only atomic loads.
-        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
-        // SAFETY: `sq_tail` as above; only this thread writes it.
-        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
-        let n = n.min(self.sq_entries as usize - tail.wrapping_sub(head) as usize);
-        for k in 0..n {
-            let at = tail.wrapping_add(k as u32) & self.sq_mask;
-            // SAFETY: `at` is masked by `sq_mask`, so below `sq_entries`, the length of the SQE
-            // array.
-            let slot = unsafe { self.sqes.add(at as usize) };
-            let sqe = make(k);
-            // SAFETY: slots from `tail` are not the kernel's until the tail store below moves
-            // past them; if it read one early it would see a torn request.
-            unsafe { slot.write(sqe) };
-        }
-        if n > 0 {
-            // SAFETY: as above; the release publishes the entries with the tail.
-            unsafe { (*self.sq_tail).store(tail.wrapping_add(n as u32), Ordering::Release) };
-            self.unsubmitted += n as u32;
-        }
-        n
-    }
-
     /// The submission ring's flags, read after every write of it is visible to the kernel's
     /// thread (the full fence pairs with the one the thread makes before it sleeps).
     fn flags(&self) -> u32 {
@@ -1179,54 +1146,218 @@ struct Connection {
     ended: Option<Result<(), String>>,
 }
 
-/// An [`Effect::Stamp`] in flight: one `statx` request per name, relative to the root's
-/// directory opened for it. The names and the directory are not let go while the kernel may
-/// still be given a request of them: a request reads its name's bytes, and resolves it against
-/// the descriptor's number when it runs.
-struct Sweep {
+/// An [`Effect::Stamp`] on the [`Stampers`]: its names claimed [`STAMP_CHUNK`] at a time, each
+/// chunk's stamps written into `out` by the stamper that claimed it. The stamper that finishes
+/// the last chunk sends the completion and wakes the ring.
+struct Job {
     tag: Tag,
+    root: OwnedFd,
     names: Names,
-    dir: OwnedFd,
-    /// One per name, each written as its completion comes in.
-    out: Vec<Stamp>,
-    /// Names asked of the ring, from the first.
-    asked: u32,
-    /// Names whose completion is in.
-    told: u32,
+    chunks: usize,
+    /// The next chunk to claim.
+    next: AtomicUsize,
+    /// Chunks whose stamps are all written.
+    finished: AtomicUsize,
+    /// One stamp per name, written through `base`.
+    out: UnsafeCell<Vec<Stamp>>,
+    base: *mut Stamp,
+    sender: mpsc::Sender<Completion>,
+    wake: Arc<OwnedFd>,
 }
 
-/// The sweeps in flight and the `statx` buffers their requests are lent, one per request the
-/// submission ring holds: thousands of names in flight together, in a MiB however many there
-/// are.
-#[derive(Default)]
-struct Sweeps {
-    /// By the slot a request's `user_data` names.
-    slots: Vec<Option<Sweep>>,
-    free: Vec<u32>,
-    /// Sweeps with names not yet asked, in the order they were submitted.
-    queue: VecDeque<u32>,
-    /// `Statx`es, mapped once for the first sweep: the kernel writes a request's buffer until
-    /// its completion is reaped, so no Rust reference covers them. Never unmapped while one
-    /// may still be written (see `Drop for Uring`).
-    buffers: Option<Map>,
-    free_buffers: Vec<u16>,
-    /// Buffers mapped.
-    mapped: usize,
-    /// Why the ring failed, after which a completion of a sweep's may be of buffers let go:
-    /// none is taken, and no sweep starts.
-    failed: Option<String>,
+// SAFETY: `out` is written through `base` at disjoint chunks, each only by the one thread whose
+// `fetch_add` on `next` claimed it, and taken whole only by the thread whose `fetch_add` on
+// `finished` counted the last chunk, after every writer's release (`Job::run`). Every other
+// field is `Sync`.
+unsafe impl Sync for Job {}
+// SAFETY: as above; `base` points into `out`'s heap buffer, which no move of the job moves.
+unsafe impl Send for Job {}
+
+impl Job {
+    fn new(tag: Tag, root: OwnedFd, names: Names, offload: &Offload) -> Job {
+        let mut out = vec![Stamp::UNKNOWN; names.len()];
+        let base = out.as_mut_ptr();
+        Job {
+            tag,
+            root,
+            chunks: names.len().div_ceil(STAMP_CHUNK),
+            names,
+            next: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+            out: UnsafeCell::new(out),
+            base,
+            sender: offload.sender.clone(),
+            wake: Arc::clone(&offload.wake),
+        }
+    }
+
+    /// Claims chunks until none is left, stamping each; whoever finishes the last completes
+    /// the job. `parent` is the caller's buffer for a directory's name.
+    fn run(&self, parent: &mut Vec<u8>) {
+        loop {
+            let chunk = self.next.fetch_add(1, Ordering::Relaxed);
+            if chunk >= self.chunks {
+                return;
+            }
+            let from = chunk * STAMP_CHUNK;
+            let to = (from + STAMP_CHUNK).min(self.names.len());
+            stamp_names(self.root.as_raw_fd(), &self.names, from..to, parent, |at, stamp| {
+                // SAFETY: `at` is below `names.len()`, the length of `out`'s buffer.
+                let slot = unsafe { self.base.add(at) };
+                // SAFETY: `at` is in the chunk this thread alone claimed.
+                unsafe { slot.write(stamp) };
+            });
+            if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.chunks {
+                // SAFETY: every chunk is finished, each writer's release before this acquire,
+                // and no thread writes or reads `out` after.
+                let out = std::mem::take(unsafe { &mut *self.out.get() });
+                if self.sender.send(Completion { tag: self.tag, done: Done::Stamped(out) }).is_ok() {
+                    wake_ring(&self.wake);
+                }
+            }
+        }
+    }
 }
 
-impl Sweeps {
-    /// Requests of sweeps the kernel holds.
-    fn in_flight(&self) -> usize {
-        self.mapped - self.free_buffers.len()
+/// Threads, one per core, that stamp [`Effect::Stamp`]'s names with `statx` calls of their own.
+/// The ring would prepare each `IORING_OP_STATX` on its one submission thread and run it on a
+/// worker after, two handoffs per name that take longer than the `statx` itself
+/// (docs/v2/plan/lanes/frontend/journal/linux.md, "Speed of light"). A job reaches stamper 0,
+/// and stamper `i` hands it on to `2i + 1` and `2i + 2` before it starts, as far as the job has
+/// chunks for: every core is at work after log2 of them wake-ups, none from the ring's thread
+/// but the first.
+struct Stampers {
+    inboxes: Arc<[crossbeam_channel::Sender<Option<Arc<Job>>>]>,
+}
+
+impl Stampers {
+    fn new() -> io::Result<Stampers> {
+        let count = std::thread::available_parallelism().map_or(1, |it| it.get());
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..count).map(|_| crossbeam_channel::unbounded()).unzip();
+        let stampers = Stampers { inboxes: senders.into() };
+        for (me, inbox) in receivers.into_iter().enumerate() {
+            let inboxes = Arc::clone(&stampers.inboxes);
+            // Dropping `stampers` on a failure ends those already started.
+            std::thread::Builder::new()
+                .name(format!("blaze-stamp-{me}"))
+                .spawn(move || stamper(me, &inbox, &inboxes))?;
+        }
+        Ok(stampers)
     }
 
-    /// Buffer `buffer`.
-    fn buffer(buffers: &Map, buffer: u16) -> *mut Statx {
-        buffers.at(u32::from(buffer) * size_of::<Statx>() as u32)
+    fn start(&self, job: Arc<Job>) {
+        _ = self.inboxes[0].send(Some(job));
     }
+}
+
+impl Drop for Stampers {
+    /// Each stamper ends once it has passed the end on, after the jobs before it.
+    fn drop(&mut self) {
+        _ = self.inboxes[0].send(None);
+    }
+}
+
+fn stamper(me: usize, inbox: &crossbeam_channel::Receiver<Option<Arc<Job>>>, inboxes: &[crossbeam_channel::Sender<Option<Arc<Job>>>]) {
+    let mut parent = Vec::new();
+    while let Ok(job) = inbox.recv() {
+        let wanted = job.as_ref().map_or(usize::MAX, |it| it.chunks);
+        for next in [2 * me + 1, 2 * me + 2] {
+            if next < wanted
+                && let Some(it) = inboxes.get(next)
+            {
+                _ = it.send(job.clone());
+            }
+        }
+        let Some(job) = job else { return };
+        job.run(&mut parent);
+    }
+}
+
+/// The stamps of `names[range]`, each handed to `put` with its index. Each is a `statx` of the
+/// name's last part relative to its directory, opened once for each run of names in the same
+/// one with `O_PATH`, which needs only the search permission a walk of the whole name would.
+/// A directory that cannot be opened gives each of its names the stamp a `statx` of the whole
+/// name would: gone for `ENOENT` and `ENOTDIR`, unknown otherwise.
+fn stamp_names(
+    root: RawFd,
+    names: &Names,
+    range: std::ops::Range<usize>,
+    parent: &mut Vec<u8>,
+    mut put: impl FnMut(usize, Stamp),
+) {
+    // The directory open, by its name and a NUL; `parent` empty before the first.
+    parent.clear();
+    let mut dir: Result<Option<OwnedFd>, Stamp> = Ok(None);
+    for at in range {
+        let name = names.with_nul(at);
+        let (up, leaf) = match name.iter().rposition(|&it| it == b'/') {
+            Some(slash) => (&name[..slash], &name[slash + 1..]),
+            None => (&name[..0], name),
+        };
+        if parent.is_empty() || parent[..parent.len() - 1] != *up {
+            parent.clear();
+            parent.extend_from_slice(up);
+            parent.push(0);
+            dir = match up.is_empty() {
+                true => Ok(None),
+                false => open_path(root, parent).map(Some).map_err(stamp_of_error),
+            };
+        }
+        let stamp = match &dir {
+            Ok(None) => statx_at(root, leaf),
+            Ok(Some(fd)) => statx_at(fd.as_raw_fd(), leaf),
+            Err(stamp) => *stamp,
+        };
+        put(at, stamp);
+    }
+}
+
+/// The last error of a call of this thread's, as a ring's result is: negative.
+fn errno() -> i32 {
+    -io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+}
+
+/// The directory `name` (with its NUL) under `dir`, opened only to name it in calls relative
+/// to it; the error as a negative errno.
+fn open_path(dir: RawFd, name: &[u8]) -> Result<OwnedFd, i32> {
+    debug_assert_eq!(name.last(), Some(&0));
+    // SAFETY: an open directory and a NUL-terminated name; the result is a descriptor of its
+    // own or -1.
+    let fd = unsafe { libc::openat(dir, name.as_ptr().cast(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(errno());
+    }
+    // SAFETY: the call returned a descriptor of its own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The stamp of `leaf` (with its NUL) under `dir`, not followed through a symlink.
+fn statx_at(dir: RawFd, leaf: &[u8]) -> Stamp {
+    debug_assert_eq!(leaf.last(), Some(&0));
+    let mut statx = std::mem::MaybeUninit::<Statx>::uninit();
+    // SAFETY: an open directory, a NUL-terminated name, and room for a `struct statx`.
+    let got = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            dir,
+            leaf.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
+            STATX_STAMP,
+            statx.as_mut_ptr(),
+        )
+    };
+    if got != 0 {
+        return stamp_of_error(errno());
+    }
+    // SAFETY: the call succeeded, so it filled the `statx`.
+    unsafe { statx.assume_init_ref() }.stamp()
+}
+
+/// Tells the ring's wait that work off the ring has sent its completion.
+fn wake_ring(wake: &OwnedFd) {
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: eight bytes, which an eventfd write takes, of an open eventfd.
+    unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
 }
 
 pub struct Uring {
@@ -1268,9 +1399,8 @@ pub struct Uring {
     /// Requests the kernel may still hold after the ring failed: kept, never freed, so it
     /// writes into nothing else.
     abandoned: Vec<Pending>,
-    sweeps: Sweeps,
-    /// Sweeps the kernel may still hold after the ring failed, never freed.
-    abandoned_sweeps: Vec<Sweep>,
+    /// Made for the first [`Effect::Stamp`].
+    stampers: Option<Stampers>,
     offload: Offload,
     in_flight: usize,
 }
@@ -1306,8 +1436,7 @@ impl Uring {
             timers: Wheel::new(),
             confine: None,
             abandoned: Vec::new(),
-            sweeps: Sweeps::default(),
-            abandoned_sweeps: Vec::new(),
+            stampers: None,
             offload: Offload::new()?,
             in_flight: 0,
         })
@@ -1677,57 +1806,41 @@ impl Uring {
         std::thread::Builder::new().name("blaze-uring-off".into()).spawn(move || {
             let done = work(&root).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
             // A driver dropped meanwhile takes nothing.
+            // The descriptor is kept open by this thread's `Arc`.
             if sender.send(Completion { tag, done }).is_ok() {
-                let one = 1u64.to_ne_bytes();
-                // SAFETY: eight bytes, which an eventfd write takes; the descriptor is kept
-                // open by this thread's `Arc`.
-                unsafe { libc::write(wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+                wake_ring(&wake);
             }
         })?;
+        self.offloaded(tag);
+        Ok(())
+    }
+
+    /// Work for the effect `tag` was handed off the ring: the ring reads its wake until every
+    /// such work's completion is in.
+    fn offloaded(&mut self, tag: Tag) {
         self.offload.out += 1;
         if self.offload.reading.is_none() {
             let fd = self.offload.wake.as_raw_fd();
             let id = self.start(tag, Op::Wake { fd, count: Box::new([0; 8]) });
             self.offload.reading = Some(id);
         }
-        Ok(())
     }
 
-    /// Starts the sweep of [`Effect::Stamp`] `tag` over `names`: its requests are written to the
-    /// ring by [`Uring::feed_sweeps`], after every sweep before it. Fails only where the root
-    /// cannot be opened or no slot is left.
+    /// Starts the sweep of [`Effect::Stamp`] `tag` over `names` on the [`Stampers`], made for
+    /// the first. Fails only where the root cannot be opened or the stampers cannot start.
     fn sweep(&mut self, tag: Tag, names: Names) -> io::Result<()> {
-        if let Some(why) = &self.sweeps.failed {
-            return Err(io::Error::other(format!("no sweep runs on this ring since it failed: {why}")));
-        }
-        let dir = open_dir(&self.root)
+        let root = open_dir(&self.root)
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", self.root.display())))?;
         if names.is_empty() {
             self.ready.push(Completion { tag, done: Done::Stamped(Vec::new()) });
             return Ok(());
         }
-        if u32::try_from(names.len()).is_err() {
-            return Err(io::Error::other(format!("a sweep of {} names: at most 2^32 at once", names.len())));
+        if self.stampers.is_none() {
+            self.stampers = Some(Stampers::new()?);
         }
-        if self.sweeps.buffers.is_none() {
-            let lent = self.ring.sq_entries.min(u32::from(u16::MAX)) as usize;
-            self.sweeps.buffers = Some(anonymous(lent * size_of::<Statx>())?);
-            self.sweeps.free_buffers = (0..lent as u16).rev().collect();
-            self.sweeps.mapped = lent;
-        }
-        let slot = match self.sweeps.free.pop() {
-            Some(slot) => slot,
-            None if (self.sweeps.slots.len() as u32) < SWEEPS => {
-                self.sweeps.slots.push(None);
-                self.sweeps.slots.len() as u32 - 1
-            }
-            None => {
-                return Err(io::Error::other(format!("{SWEEPS} sweeps are in flight already: no slot left for another")));
-            }
-        };
-        let out = vec![Stamp::UNKNOWN; names.len()];
-        self.sweeps.slots[slot as usize] = Some(Sweep { tag, names, dir, out, asked: 0, told: 0 });
-        self.sweeps.queue.push_back(slot);
+        let job = Arc::new(Job::new(tag, root, names, &self.offload));
+        self.offloaded(tag);
+        self.stampers.as_ref().expect("made above").start(job);
         Ok(())
     }
 

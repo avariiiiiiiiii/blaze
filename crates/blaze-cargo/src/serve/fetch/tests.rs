@@ -49,7 +49,7 @@ impl Http for Fake {
 }
 
 fn fetcher(fake: &Arc<Fake>) -> Fetcher {
-    Fetcher::with_http(fake.clone()).retrying(Retry {
+    Fetcher::with_http(fake.clone(), std::env::temp_dir().join("blaze-fetch-tests")).retrying(Retry {
         retries: 3,
         quiet: true,
         fixed_sleep_ms: Some(0),

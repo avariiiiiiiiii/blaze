@@ -1,9 +1,10 @@
-//! The columns an expression store keeps its expressions and patterns in
+//! The columns an expression store keeps its expressions, patterns and statements in
 //! (`docs/v2/plan/design/data.md`): a `u8` kind and a `u32` data word per node, the words of the
 //! variants that need more than one in the shared `extra` column, lists as `(start, len)` ranges
 //! into one array per element type, and cold values (names, paths, literals, generic arguments,
-//! `offset_of!`, `asm!`) in side tables by index. [`Expr`] and [`Pat`] are views decoded from
-//! them on the fly.
+//! `offset_of!`, `asm!`, macro definitions) in side tables by index. [`Expr`], [`Pat`] and
+//! [`Statement`] are views decoded from them on the fly; a block's statements are a run of
+//! statement rows, read through [`Statements`].
 //!
 //! In the tables, `e` is a data word holding the index in `extra` of the node's words, written
 //! `[a, b, ..]`. `x+1` is an optional id, index or count as its value plus one, 0 for `None`. A
@@ -16,7 +17,7 @@
 //! | `Path(path)` | `paths` t | |
 //! | `If` | e | `[condition, then_branch, else_branch+1]` |
 //! | `Let` | e | `[pat, expr]` |
-//! | `Block` | e | `[id low, id high, statements start, statements len, tail+1, label+1 <<1 \| unsafe_]` (an id of low word 0 is `None`) |
+//! | `Block` | e | `[id low, id high, statements start, statements len, tail+1, label+1 <<1 \| unsafe_]` (an id of low word 0 is `None`; the statements a run of statement rows) |
 //! | `Const(expr)` | expr | |
 //! | `Loop` | e | `[body, label+1 <<2 \| source]` |
 //! | `Call` | e | `[callee, args start, args len]` (`expr_lists`) |
@@ -56,9 +57,19 @@
 //! | `Ref` | e | `[pat, mutability]` |
 //! | `Box`, `Deref` | inner | |
 //!
-//! [`EXPR_WORDS`] and [`PAT_WORDS`] give the number of `extra` words of each kind. A node
-//! replaced by one of its own kind ([`HirColumns::set_expr`]) keeps its words, list ranges that
-//! are long enough and side-table entries, so columns only grow when a node grows.
+//! Statements are rows of `stmt_kind` and `stmt_data`, their words in the same `extra`:
+//!
+//! | statement | data | `extra` |
+//! |---|---|---|
+//! | `Let` | e | `[pat <<4 \| flags, type_ref, initializer, else_branch]`, flags bit 0 `is_super`, bits 1 to 3 whether each of the three is there; only those that are take a word, in that order (Zig's trailing optionals) |
+//! | `Expr` | expr <<1 \| has_semi | |
+//! | `Item(MacroDef)` | `macro_defs` t | |
+//! | `Item(Other)` | 0 | |
+//!
+//! [`EXPR_WORDS`] and [`PAT_WORDS`] give the number of `extra` words of each kind; a `let`
+//! takes 1 to [`LET_WORDS`], `let x = e;` two. A node replaced by one of its own kind
+//! ([`HirColumns::set_expr`]) keeps its words, list ranges and statement runs that are long
+//! enough and side-table entries, so columns only grow when a node grows.
 
 #![forbid(unsafe_code)]
 
@@ -72,17 +83,20 @@ use crate::{
     expr_store::path::{GenericArgs, Path},
     hir::{
         Array, AsmOperand, BindingId, CaptureBy, ClosureKind, CoroutineKind, CoroutineSource, Expr,
-        ExprId, InlineAsm, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf, Pat,
-        PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Unsafe,
+        ExprId, InlineAsm, Item, LabelId, Literal, LoopSource, MatchArm, Movability, OffsetOf,
+        Pat, PatId, RecordFieldPat, RecordLitField, RecordSpread, Statement, Statements, Unsafe,
     },
     type_ref::{Mutability, Rawness, TypeRefId},
 };
-use hir_expand::name::Name;
+use hir_expand::{MacroDefId, name::Name};
 use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
 
 /// What a column of [`HirColumns`] is: a `Vec` while a store is built, a boxed slice after.
-pub(crate) trait ColumnVec {
+pub(crate) trait ColumnVec: Sized {
     type Of<T>: Deref<Target = [T]>;
+
+    /// The statement rows of `columns`, for a block's [`Statements`] to read.
+    fn rows(columns: &HirColumns<Self>) -> Rows<'_>;
 }
 
 /// The builder's columns, which grow.
@@ -95,10 +109,42 @@ pub(crate) struct Frozen;
 
 impl ColumnVec for Growing {
     type Of<T> = Vec<T>;
+
+    #[inline]
+    fn rows(columns: &HirColumns<Growing>) -> Rows<'_> {
+        Rows::Growing(columns)
+    }
 }
 
 impl ColumnVec for Frozen {
     type Of<T> = Box<[T]>;
+
+    #[inline]
+    fn rows(columns: &HirColumns<Frozen>) -> Rows<'_> {
+        Rows::Frozen(columns)
+    }
+}
+
+/// The columns a block's [`Statements`] are rows of: a store's (growing while it is built) or
+/// none, for a block without statements.
+#[derive(Clone, Copy)]
+pub(crate) enum Rows<'a> {
+    Empty,
+    Growing(&'a HirColumns<Growing>),
+    Frozen(&'a HirColumns<Frozen>),
+}
+
+impl<'a> Rows<'a> {
+    /// The statement in row `at`, which the [`Statements`] holding these rows checked is in
+    /// its run.
+    #[inline]
+    pub(crate) fn get(self, at: u32) -> Statement<'a> {
+        match self {
+            Rows::Growing(columns) => columns.statement(at),
+            Rows::Frozen(columns) => columns.statement(at),
+            Rows::Empty => bad_store(STATEMENTS, at),
+        }
+    }
 }
 
 /// Every column of an expression store's bodies.
@@ -113,7 +159,9 @@ pub(crate) struct HirColumns<V: ColumnVec = Frozen> {
     // CSR targets: a list is a `(start, len)` pair of words in `extra` pointing into one of these.
     pub(crate) expr_lists: V::Of<ExprId>,
     pub(crate) pat_lists: V::Of<PatId>,
-    pub(crate) statements: V::Of<Statement>,
+    // A block's statements are a `(start, len)` run of these rows.
+    pub(crate) stmt_kind: V::Of<u8>,
+    pub(crate) stmt_data: V::Of<u32>,
     pub(crate) arms: V::Of<MatchArm>,
     pub(crate) record_fields: V::Of<RecordLitField>,
     pub(crate) field_pats: V::Of<RecordFieldPat>,
@@ -125,6 +173,7 @@ pub(crate) struct HirColumns<V: ColumnVec = Frozen> {
     pub(crate) generic_args: V::Of<GenericArgs>,
     pub(crate) offset_ofs: V::Of<OffsetOf>,
     pub(crate) asms: V::Of<InlineAsm>,
+    pub(crate) macro_defs: V::Of<MacroDefId>,
 }
 
 /// The bytes of the columns of one expression (`expr_kind` and `expr_data`); `extra`, the lists
@@ -132,10 +181,17 @@ pub(crate) struct HirColumns<V: ColumnVec = Frozen> {
 pub(crate) const EXPR_BYTES: usize = size_of::<u8>() + size_of::<u32>();
 /// The bytes of the columns of one pattern (`pat_kind` and `pat_data`).
 pub(crate) const PAT_BYTES: usize = size_of::<u8>() + size_of::<u32>();
+/// The bytes of the columns of one statement (`stmt_kind` and `stmt_data`); a `let` adds 1 to
+/// [`LET_WORDS`] words of `extra`, a macro definition its entry in `macro_defs`.
+pub(crate) const STATEMENT_BYTES: usize = size_of::<u8>() + size_of::<u32>();
+/// The most `extra` words a `let` takes: its head and its three optional ids.
+pub(crate) const LET_WORDS: usize = 4;
 
 const _: () = {
     assert!(EXPR_BYTES <= 12);
     assert!(PAT_BYTES <= 12);
+    assert!(STATEMENT_BYTES == 5);
+    assert!(STATEMENT_BYTES + LET_WORDS * size_of::<u32>() == 21);
     assert!(size_of::<ExprId>() == size_of::<u32>());
     assert!(size_of::<PatId>() == size_of::<u32>());
 };
@@ -200,6 +256,31 @@ pub(crate) enum PatKind {
     Deref,
     NotNull,
     Expr,
+}
+
+/// Which variant of [`Statement`] a statement row is, `Item`'s two split.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum StatementKind {
+    Let,
+    Expr,
+    MacroDef,
+    Item,
+}
+
+impl StatementKind {
+    /// Every kind, at the index of its value.
+    pub(crate) const ALL: [StatementKind; 4] =
+        [StatementKind::Let, StatementKind::Expr, StatementKind::MacroDef, StatementKind::Item];
+
+    pub(crate) fn of(statement: &Statement<'_>) -> StatementKind {
+        match statement {
+            Statement::Let { .. } => StatementKind::Let,
+            Statement::Expr { .. } => StatementKind::Expr,
+            Statement::Item(Item::MacroDef(_)) => StatementKind::MacroDef,
+            Statement::Item(Item::Other) => StatementKind::Item,
+        }
+    }
 }
 
 impl ExprKind {

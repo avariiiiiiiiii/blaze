@@ -87,6 +87,39 @@ pub(crate) enum Kind {
     SpanFile,
 }
 
+impl Kind {
+    /// Every kind, each at its number.
+    pub(crate) const ALL: [Kind; 19] = [
+        Kind::Crate,
+        Kind::File,
+        Kind::MacroCall,
+        Kind::Block,
+        Kind::Function,
+        Kind::Struct,
+        Kind::Union,
+        Kind::Enum,
+        Kind::Const,
+        Kind::Static,
+        Kind::Trait,
+        Kind::TypeAlias,
+        Kind::Impl,
+        Kind::EnumVariant,
+        Kind::Macro2,
+        Kind::MacroRules,
+        Kind::ProcMacro,
+        Kind::Context,
+        Kind::SpanFile,
+    ];
+}
+
+const _: () = {
+    let mut at = 0;
+    while at < Kind::ALL.len() {
+        assert!(Kind::ALL[at] as usize == at, "Kind::ALL is not in the order of the kinds");
+        at += 1;
+    }
+};
+
 /// A salsa id type [`salsa_ids`] writes, by the kind its table entries are.
 pub(crate) trait Relocate {
     const KIND: Kind;

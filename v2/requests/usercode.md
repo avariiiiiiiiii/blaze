@@ -673,6 +673,7 @@ script reads hundreds of headers, so that is hundreds of syscalls per cache hit.
 and Bazel's `--watchfs` answer the same question from the watcher with no syscall.
 
 > forwarded to requests-outside (child of `requests`; vfs and core are DONE): the table in blaze-vfs, its sans-io watch driver, and `Effect::Flush` in blaze-core so a request can drain queued events before trusting a generation (events arrive after the change). usercode's `Files` and cargo's per-request flush come back as its requests.
+> applied: by requests-outside: `blaze_vfs::{generation, unchanged_since, want, Outside}` (crates/blaze-vfs/src/outside.rs, lock-free table of watched directories plus its sans-IO watch driver, tests in outside/tests.rs) and `Effect::Flush`/`Done::Flushed` in every blaze-core driver and the simulation; what `Files::file` and the daemon must call is in v2/requests/requests-outside.md (items 1 and 2).
 
 ## 12. cargo (whoever calls `blaze_expand::install`): expansions read the store with no lock
 

@@ -207,11 +207,9 @@ fn h(_: N<{ 1 + 1 }>) {}
         let named: [(SolverDefId<'_>, &str); 5] =
             [(s.into(), "S"), (f.into(), "f"), (c.into(), "C"), (tr.into(), "Tr"), (variant.into(), "V")];
         for (def, name) in named {
-            assert_eq!(interner.item_name(def).0.as_str(), name, "the name of {def:?}");
-            assert_eq!(
-                BoundRegionKind::Named(def).get_name(interner).map(|it| it.0.as_str().to_owned()),
-                Some(name.to_owned()),
-            );
+            let item_name = interner.item_name(def);
+            assert_eq!(item_name.0.as_str(), name, "the name of {def:?}");
+            assert_eq!(BoundRegionKind::Named(def).get_name(interner), Some(item_name));
         }
 
         let body = Body::of(&db, f.into());
@@ -352,6 +350,7 @@ fn h(_: N<{ 1 + 1 }>) {}
         for (def, expected) in cases {
             let ty = interner.type_of(def).instantiate_identity().skip_norm_wip();
             assert_eq!(
+                // alloc: the printed type is what the test compares, once per case.
                 ty.display_test(&db, display_target).to_string(),
                 expected,
                 "the type of {def:?}"

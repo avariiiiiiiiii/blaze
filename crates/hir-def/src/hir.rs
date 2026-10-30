@@ -20,7 +20,7 @@ pub mod generics;
 pub(crate) mod persist;
 pub mod type_ref;
 
-use std::{fmt, mem};
+use std::{fmt, iter::FusedIterator, mem};
 
 use hir_expand::{MacroDefId, name::Name};
 use intern::Symbol;
@@ -162,14 +162,15 @@ pub type LabelId = Idx<Label>;
 
 // The flat arrays' elements, on 64-bit (`docs/v2/plan/design/data.md`'s budgets). An
 // `Option<ExprId>` is 8 bytes because `la_arena::Idx` has no niche: with one, `MatchArm` would
-// be 12 and `Statement` 24.
+// be 12. Statements are columns (`columns::STATEMENT_BYTES`); a block's handle on its run of
+// them is 24 bytes.
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(mem::size_of::<Label>() == 8);
     assert!(mem::size_of::<MatchArm>() == 16);
     assert!(mem::size_of::<RecordLitField>() == 16);
     assert!(mem::size_of::<RecordFieldPat>() == 16);
-    assert!(mem::size_of::<Statement>() == 32);
+    assert!(mem::size_of::<Statements<'static>>() == 24);
     assert!(mem::size_of::<Binding>() == 16);
 };
 
@@ -322,7 +323,7 @@ pub enum Expr<'a> {
     },
     Block {
         id: Option<BlockId>,
-        statements: &'a [Statement],
+        statements: Statements<'a>,
         tail: Option<ExprId>,
         label: Option<LabelId>,
         unsafe_: Unsafe,
@@ -715,8 +716,9 @@ pub struct RecordLitField {
     pub expr: ExprId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Statement {
+/// A statement of a block, decoded from the store's statement columns as [`Expr`] is.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Statement<'a> {
     Let {
         pat: PatId,
         type_ref: Option<TypeRefId>,
@@ -729,14 +731,136 @@ pub enum Statement {
         expr: ExprId,
         has_semi: bool,
     },
-    Item(Item),
+    Item(Item<'a>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Item {
-    MacroDef(Box<MacroDefId>),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item<'a> {
+    MacroDef(&'a MacroDefId),
     Other,
 }
+
+/// The statements of a block: a run of rows of the store's statement columns, each decoded
+/// when it is read.
+#[derive(Clone, Copy)]
+pub struct Statements<'a> {
+    rows: columns::Rows<'a>,
+    start: u32,
+    len: u32,
+}
+
+impl Statements<'static> {
+    /// No statements, for a block lowering makes without any.
+    pub const EMPTY: Self = Statements { rows: columns::Rows::Empty, start: 0, len: 0 };
+}
+
+impl<'a> Statements<'a> {
+    #[inline]
+    pub fn len(self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// The statement at `index` of the block, `None` past its last.
+    #[inline]
+    pub fn get(self, index: usize) -> Option<Statement<'a>> {
+        (index < self.len()).then(|| self.rows.get(self.start + index as u32))
+    }
+
+    #[inline]
+    pub fn first(self) -> Option<Statement<'a>> {
+        self.get(0)
+    }
+
+    #[inline]
+    pub fn last(self) -> Option<Statement<'a>> {
+        self.len().checked_sub(1).and_then(|index| self.get(index))
+    }
+
+    #[inline]
+    pub fn iter(self) -> StatementIter<'a> {
+        StatementIter { rows: self.rows, at: self.start, end: self.start + self.len }
+    }
+}
+
+impl PartialEq for Statements<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.iter().eq(other.iter())
+    }
+}
+
+impl Eq for Statements<'_> {}
+
+impl fmt::Debug for Statements<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for Statements<'a> {
+    type Item = Statement<'a>;
+    type IntoIter = StatementIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> StatementIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &Statements<'a> {
+    type Item = Statement<'a>;
+    type IntoIter = StatementIter<'a>;
+
+    #[inline]
+    fn into_iter(self) -> StatementIter<'a> {
+        self.iter()
+    }
+}
+
+/// The statements of a block in order ([`Statements::iter`]).
+#[derive(Clone)]
+pub struct StatementIter<'a> {
+    rows: columns::Rows<'a>,
+    at: u32,
+    end: u32,
+}
+
+impl<'a> Iterator for StatementIter<'a> {
+    type Item = Statement<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Statement<'a>> {
+        (self.at < self.end).then(|| {
+            let statement = self.rows.get(self.at);
+            self.at += 1;
+            statement
+        })
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = (self.end - self.at) as usize;
+        (left, Some(left))
+    }
+}
+
+impl DoubleEndedIterator for StatementIter<'_> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        (self.at < self.end).then(|| {
+            self.end -= 1;
+            self.rows.get(self.end)
+        })
+    }
+}
+
+impl ExactSizeIterator for StatementIter<'_> {}
+
+impl FusedIterator for StatementIter<'_> {}
 
 /// Explicit binding annotations given in the HIR for a binding. Note
 /// that this is not the final binding *mode* that we infer after type

@@ -1222,3 +1222,15 @@ length) for the largest allocation of `read` plus `decode`. That rests on `Read:
 every count by the words left, and on each value being at least one word.
 
 > forwarded to format: `hir-def`'s `item_tree`/`expr_store` are its (told by tmux).
+
+## speed-hir-store: subtree hashes carried by the flat tree (to speed-syntax)
+
+What: `FlatTree` keeps a 128-bit hash per node (or per node above a size), computed bottom-up
+while the tree is built, with the same content `hash_subtree` covers: text, kinds and shape
+numbered from the node. An incremental reparse keeps the hashes of the subtrees it reuses.
+`hash_subtree` (or a new `subtree_hash(at) -> u128`) then answers with one load.
+Why: `hir-def` `expr_store/body.rs` `tree_hash` runs for every body of a file on each edit of the
+file and hashes each anchor (an `impl` or module) whole, so an edit costs O(file size) of hashing,
+about 70 µs for a 400 KB file with one BLAKE3 pass. With the hash carried by the parse, an edit
+costs the reparse plus the edited body (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit").
+`signatures.rs` hashes each item's tree the same way.

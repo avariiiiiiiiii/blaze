@@ -101,9 +101,10 @@ type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
 /// item instead, nothing left out, so any edit inside that one lowers it again.
 pub struct SignatureSyntax {
     pub file_id: HirFileId,
+    /// Compared by its content, not a hash of it: salsa compares a new value with the old one
+    /// only when the query runs again, and a compare of the columns reads each byte once where
+    /// hashing them costs more and can collide.
     tree: std::sync::Arc<FlatTree>,
-    /// What the tree is made of ([`FlatTree::hash_subtree`]): what it is compared by.
-    hash: u128,
     /// The item in the tree.
     item: SyntaxNodePtr,
     /// The empty node in place of what is left out, when something is.
@@ -115,11 +116,11 @@ pub struct SignatureSyntax {
 impl PartialEq for SignatureSyntax {
     fn eq(&self, other: &Self) -> bool {
         self.file_id == other.file_id
-            && self.hash == other.hash
             && self.item == other.item
             && self.elided == other.elided
-            && self.ast_id_map == other.ast_id_map
             && self.span_map == other.span_map
+            && self.ast_id_map == other.ast_id_map
+            && *self.tree == *other.tree
     }
 }
 
@@ -129,7 +130,6 @@ impl std::fmt::Debug for SignatureSyntax {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SignatureSyntax")
             .field("file_id", &self.file_id)
-            .field("hash", &self.hash)
             .field("item", &self.item)
             .field("elided", &self.elided)
             .finish_non_exhaustive()
@@ -196,7 +196,6 @@ impl SignatureSyntax {
         };
         Some(SignatureSyntax {
             file_id: src.file_id,
-            hash: tree_hash(&tree),
             tree,
             item: item_ptr,
             elided: placeholder,
@@ -246,18 +245,6 @@ impl SignatureSyntax {
         };
         source_map.moved(&Move { file: self.file_id, to: &to })
     }
-}
-
-/// What `tree` is made of, as two 64-bit hashes of it.
-fn tree_hash(tree: &FlatTree) -> u128 {
-    use std::hash::{Hash, Hasher};
-    let half = |seed: u8| {
-        let mut hasher = std::hash::DefaultHasher::new();
-        seed.hash(&mut hasher);
-        tree.hash_subtree(0, &mut hasher);
-        u128::from(hasher.finish())
-    };
-    (half(0) << 64) | half(1)
 }
 
 /// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.

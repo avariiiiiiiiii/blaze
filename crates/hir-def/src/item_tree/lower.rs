@@ -2,6 +2,7 @@
 
 use std::{
     cell::{Cell, OnceCell},
+    hash::Hash,
     mem,
 };
 
@@ -17,10 +18,11 @@ use hir_expand::{
 };
 use la_arena::Arena;
 use span::{
-    AstIdMap, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext,
+    AstIdMap, AstIdNode, ErasedFileAstId, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER,
+    RealSpanMap, Span, SpanAnchor, SyntaxContext,
 };
 use syntax::{
-    AstNode, SourceFile, TextRange,
+    AstNode, SourceFile, TextRange, TextSize,
     ast::{self, HasModuleItem, HasName, StructKind},
 };
 
@@ -101,16 +103,56 @@ struct TreeBuilder {
     use_tree_lists: Vec<UseTreeId>,
     ctor_vis: Vec<RawVisibilityId>,
 
-    names: FxIndexSet<Name>,
-    paths: FxIndexSet<ModPath>,
-    vis: FxIndexSet<RawVisibility>,
+    names: Scoped<Name>,
+    paths: Scoped<ModPath>,
+    vis: Scoped<RawVisibility>,
 
     attr_owners: Vec<AttrOwner>,
     attrs: Vec<Attr>,
     cfgs: Vec<CfgExpr>,
 }
 
+/// A table of a tree whose values are deduplicated within each top-level item only, so the
+/// tree of a file is its items' trees one after the other, each one's ids moved by where it
+/// starts ([`super::items::assemble`]), and the same whether it is lowered whole or per item.
+struct Scoped<T> {
+    /// The values of the items sealed.
+    done: Vec<T>,
+    /// The values of the item being lowered, after `done`'s.
+    scope: FxIndexSet<T>,
+}
+
+impl<T> Default for Scoped<T> {
+    fn default() -> Self {
+        Scoped { done: Vec::new(), scope: FxIndexSet::default() }
+    }
+}
+
+impl<T: Hash + Eq> Scoped<T> {
+    fn id(&mut self, value: T) -> u32 {
+        let (at, _) = self.scope.insert_full(value);
+        id(self.done.len() + at)
+    }
+
+    /// Ends the item being lowered: no later value is deduplicated against its.
+    fn seal(&mut self) {
+        self.done.extend(self.scope.drain(..));
+    }
+
+    fn finish(&mut self) -> Box<[T]> {
+        self.seal();
+        self.done.drain(..).collect()
+    }
+}
+
 impl TreeBuilder {
+    /// Ends the top-level item being lowered ([`Scoped`]).
+    fn seal(&mut self) {
+        self.names.seal();
+        self.paths.seal();
+        self.vis.seal();
+    }
+
     /// The tree built, the pending items its top level; leaves the builder empty, its capacity
     /// kept.
     fn finish(&mut self) -> ItemTree {
@@ -141,9 +183,9 @@ impl TreeBuilder {
             use_trees: column(&mut self.use_trees),
             use_tree_lists: column(&mut self.use_tree_lists),
             ctor_vis: column(&mut self.ctor_vis),
-            names: self.names.drain(..).collect(),
-            paths: self.paths.drain(..).collect(),
-            vis: self.vis.drain(..).collect(),
+            names: self.names.finish(),
+            paths: self.paths.finish(),
+            vis: self.vis.finish(),
             attr_owners: column(&mut self.attr_owners),
             attrs: column(&mut self.attrs),
             cfgs: column(&mut self.cfgs),
@@ -160,11 +202,11 @@ impl TreeBuilder {
     }
 
     fn name(&mut self, name: Name) -> NameId {
-        NameId { raw: id(self.names.insert_full(name).0) }
+        NameId { raw: self.names.id(name) }
     }
 
     fn path(&mut self, path: ModPath) -> PathId {
-        PathId { raw: id(self.paths.insert_full(path).0) }
+        PathId { raw: self.paths.id(path) }
     }
 
     fn alias(&mut self, alias: Option<ImportAlias>) -> AliasId {
@@ -185,7 +227,7 @@ impl TreeBuilder {
                 RawVisibilityId::PRIV_IMPLICIT
             }
             RawVisibility::PubCrate => RawVisibilityId::PUB_CRATE,
-            _ => RawVisibilityId { raw: id(self.vis.insert_full(vis).0) },
+            _ => RawVisibilityId { raw: self.vis.id(vis) },
         }
     }
 
@@ -234,12 +276,67 @@ impl TreeBuilder {
     }
 }
 
+/// Where the ast ids of the nodes lowered come from.
+#[derive(Copy, Clone)]
+enum Ids<'a> {
+    /// The map of the whole file.
+    File(&'a AstIdMap),
+    /// One item's ids ([`super::items::ItemSyntax`]): `[start, end, kind, id]` per node, its
+    /// range from `start`, ordered by where the nodes start.
+    Item { ids: &'a [[u32; 4]], start: TextSize },
+}
+
+impl Ids<'_> {
+    fn ast_id<N: AstIdNode>(self, node: &N) -> FileAstId<N> {
+        match self {
+            Ids::File(map) => map.ast_id(node),
+            Ids::Item { ids, start } => {
+                let node = node.syntax();
+                let range = node.text_range() - start;
+                let key = [u32::from(range.start()), u32::from(range.end()), node.kind() as u32];
+                let from = ids.partition_point(|it| it[0] < key[0]);
+                let Some(&[.., raw]) =
+                    ids[from..].iter().take_while(|it| it[0] == key[0]).find(|it| it[..3] == key)
+                else {
+                    panic!("no ast id for the {:?} at {range:?} of the item", node.kind())
+                };
+                FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw))
+            }
+        }
+    }
+}
+
+/// Where the spans of the nodes lowered come from.
+#[derive(Copy, Clone)]
+pub(super) enum Spans<'a> {
+    /// The map of the whole file.
+    File(SpanMap<'a>),
+    /// One item's map, as [`RealSpanMap::within`] the item, its offsets from `start`.
+    Item { map: &'a RealSpanMap, start: TextSize },
+}
+
+impl Spans<'_> {
+    pub(super) fn span_for_range(self, range: TextRange) -> Span {
+        match self {
+            Spans::File(map) => map.span_for_range(range),
+            Spans::Item { map, start } => map.span_for_range(range - start),
+        }
+    }
+}
+
+impl syntax_bridge::SpanMapper for Spans<'_> {
+    fn span_for(&self, range: TextRange) -> Span {
+        self.span_for_range(range)
+    }
+}
+
 pub(super) struct Ctx<'db> {
     pub(super) db: &'db dyn SourceDatabase,
     tree: TreeBuilder,
-    source_ast_id_map: &'db AstIdMap,
-    span_map: OnceCell<SpanMap<'db>>,
-    file: HirFileId,
+    ids: Ids<'db>,
+    span_map: OnceCell<Spans<'db>>,
+    /// The file lowered whole, whose span map is read when first wanted; none for an item.
+    file: Option<HirFileId>,
     cfg_options: OnceCell<&'db CfgOptions>,
     krate: Crate,
 }
@@ -249,16 +346,39 @@ impl<'db> Ctx<'db> {
         Self {
             db,
             tree: SCRATCH.take(),
-            source_ast_id_map: file.ast_id_map(db),
-            file,
+            ids: Ids::File(file.ast_id_map(db)),
+            file: Some(file),
             cfg_options: OnceCell::new(),
             span_map: OnceCell::new(),
             krate,
         }
     }
 
-    pub(super) fn span_map(&self) -> SpanMap<'db> {
-        *self.span_map.get_or_init(|| self.file.span_map(self.db))
+    /// A context lowering one item of a file, at `start` of it: `ids` and `spans` its own, as
+    /// [`super::items::ItemSyntax`] keeps them, so it reads nothing of the file's.
+    pub(super) fn for_item(
+        db: &'db dyn SourceDatabase,
+        krate: Crate,
+        ids: &'db [[u32; 4]],
+        spans: &'db RealSpanMap,
+        start: TextSize,
+    ) -> Self {
+        Self {
+            db,
+            tree: SCRATCH.take(),
+            ids: Ids::Item { ids, start },
+            file: None,
+            cfg_options: OnceCell::new(),
+            span_map: OnceCell::from(Spans::Item { map: spans, start }),
+            krate,
+        }
+    }
+
+    pub(super) fn span_map(&self) -> Spans<'db> {
+        *self.span_map.get_or_init(|| {
+            let file = self.file.expect("an item's context is made with its spans");
+            Spans::File(file.span_map(self.db))
+        })
     }
 
     /// Lowers `node`'s attributes into the tree's, and returns where they start and the `cfg`
@@ -332,10 +452,33 @@ impl<'db> Ctx<'db> {
         }
     }
 
+    /// Lowers `item` as a top-level item: [`Self::pend`], then sealed ([`Scoped`]).
+    fn pend_top(&mut self, item: &ast::Item) {
+        self.pend(item);
+        self.tree.seal();
+    }
+
     pub(super) fn lower_module_items(mut self, item_owner: &dyn HasModuleItem) -> ItemTree {
         for item in item_owner.items() {
-            self.pend(&item);
+            self.pend_top(&item);
         }
+        self.finish()
+    }
+
+    /// The tree of one top-level item of a file: the file's tree is the trees of its top
+    /// level's attributes ([`Self::lower_top`]) and of its items, assembled.
+    pub(super) fn lower_item(mut self, item: &ast::Item) -> ItemTree {
+        self.pend_top(item);
+        self.finish()
+    }
+
+    /// The tree of a source file's top level's attributes alone ([`Self::lower_top_attrs`]).
+    pub(super) fn lower_top(
+        mut self,
+        file: &SourceFile,
+        extra: Option<(SourceFile, span::EditionedFileId)>,
+    ) -> ItemTree {
+        self.lower_top_attrs(file, extra);
         self.finish()
     }
 
@@ -355,14 +498,14 @@ impl<'db> Ctx<'db> {
                 },
                 _ => continue,
             };
-            self.pend(&item);
+            self.pend_top(&item);
         }
 
         if let Some(ast::Expr::MacroExpr(tail_macro)) = stmts.expr()
             && let Some(call) = tail_macro.macro_call()
         {
             cov_mark::hit!(macro_stmt_with_trailing_macro_expr);
-            self.pend(&call.into());
+            self.pend_top(&call.into());
         }
 
         self.finish()
@@ -384,6 +527,7 @@ impl<'db> Ctx<'db> {
             if let Some(id) = id {
                 self.tree.pending_items.push(id);
             }
+            self.tree.seal();
         }
         if let Some(ast::Expr::MacroExpr(expr)) = block.tail_expr()
             && let Some(mod_item) = self.lower_macro_stmt(&expr)
@@ -433,7 +577,7 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility_from_ast(strukt);
         let visibility_id = self.tree.visibility(visibility.clone());
         let name = strukt.name()?.as_name();
-        let ast_id = self.source_ast_id_map.ast_id(strukt);
+        let ast_id = self.ids.ast_id(strukt);
         let value_ns_ctor = match strukt.kind() {
             StructKind::Record(_) => IdRange::EMPTY,
             StructKind::Unit => self.tree.ctor_vis([visibility]),
@@ -502,7 +646,7 @@ impl<'db> Ctx<'db> {
     fn lower_union(&mut self, union: &ast::Union) -> Option<ModItemId> {
         let visibility = self.lower_visibility(union);
         let name = union.name()?.as_name();
-        let ast_id = self.source_ast_id_map.ast_id(union);
+        let ast_id = self.ids.ast_id(union);
         let res = Union { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.unions, res);
         Some(self.tree.item(ItemKind::Union, ast_id.upcast(), data))
@@ -511,7 +655,7 @@ impl<'db> Ctx<'db> {
     fn lower_enum(&mut self, enum_: &ast::Enum) -> Option<ModItemId> {
         let visibility = self.lower_visibility(enum_);
         let name = enum_.name()?.as_name();
-        let ast_id = self.source_ast_id_map.ast_id(enum_);
+        let ast_id = self.ids.ast_id(enum_);
         let res = Enum { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.enums, res);
         Some(self.tree.item(ItemKind::Enum, ast_id.upcast(), data))
@@ -521,7 +665,7 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility(func);
         let name = func.name()?.as_name();
 
-        let ast_id = self.source_ast_id_map.ast_id(func);
+        let ast_id = self.ids.ast_id(func);
 
         let res = Function { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.functions, res);
@@ -531,7 +675,7 @@ impl<'db> Ctx<'db> {
     fn lower_type_alias(&mut self, type_alias: &ast::TypeAlias) -> Option<ModItemId> {
         let name = type_alias.name()?.as_name();
         let visibility = self.lower_visibility(type_alias);
-        let ast_id = self.source_ast_id_map.ast_id(type_alias);
+        let ast_id = self.ids.ast_id(type_alias);
         let res = TypeAlias { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.type_aliases, res);
         Some(self.tree.item(ItemKind::TypeAlias, ast_id.upcast(), data))
@@ -540,7 +684,7 @@ impl<'db> Ctx<'db> {
     fn lower_static(&mut self, static_: &ast::Static) -> Option<ModItemId> {
         let name = static_.name()?.as_name();
         let visibility = self.lower_visibility(static_);
-        let ast_id = self.source_ast_id_map.ast_id(static_);
+        let ast_id = self.ids.ast_id(static_);
         let res = Static { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.statics, res);
         Some(self.tree.item(ItemKind::Static, ast_id.upcast(), data))
@@ -552,7 +696,7 @@ impl<'db> Ctx<'db> {
             None => NameId::NONE,
         };
         let visibility = self.lower_visibility(konst);
-        let ast_id = self.source_ast_id_map.ast_id(konst);
+        let ast_id = self.ids.ast_id(konst);
         let data = push(&mut self.tree.consts, Const { name, visibility });
         self.tree.item(ItemKind::Const, ast_id.upcast(), data)
     }
@@ -576,7 +720,7 @@ impl<'db> Ctx<'db> {
             }
             self.tree.items_since(mark)
         };
-        let ast_id = self.source_ast_id_map.ast_id(module);
+        let ast_id = self.ids.ast_id(module);
         let res = Mod { name: self.tree.name(name), visibility, items };
         let data = push(&mut self.tree.mods, res);
         Some(self.tree.item(ItemKind::Mod, ast_id.upcast(), data))
@@ -585,7 +729,7 @@ impl<'db> Ctx<'db> {
     fn lower_trait(&mut self, trait_def: &ast::Trait) -> Option<ModItemId> {
         let name = trait_def.name()?.as_name();
         let visibility = self.lower_visibility(trait_def);
-        let ast_id = self.source_ast_id_map.ast_id(trait_def);
+        let ast_id = self.ids.ast_id(trait_def);
 
         let def = Trait { name: self.tree.name(name), visibility };
         let data = push(&mut self.tree.traits, def);
@@ -593,7 +737,7 @@ impl<'db> Ctx<'db> {
     }
 
     fn lower_impl(&mut self, impl_def: &ast::Impl) -> ModItemId {
-        let ast_id = self.source_ast_id_map.ast_id(impl_def);
+        let ast_id = self.ids.ast_id(impl_def);
         // Note that trait impls don't get implicit `Self` unlike traits, because here they are a
         // type alias rather than a type parameter, so this is handled by the resolver.
         let res = Impl { is_trait_impl: impl_def.trait_().is_some() };
@@ -603,7 +747,7 @@ impl<'db> Ctx<'db> {
 
     fn lower_use(&mut self, use_item: &ast::Use) -> Option<ModItemId> {
         let visibility = self.lower_visibility(use_item);
-        let ast_id = self.source_ast_id_map.ast_id(use_item);
+        let ast_id = self.ids.ast_id(use_item);
         let span_map = self.span_map();
         let mut lowering = UseTreeLowering { db: self.db, mapping: None, tree: &mut self.tree };
         let use_tree = lowering.lower_use_tree(use_item.use_tree()?, &mut |range| {
@@ -620,7 +764,7 @@ impl<'db> Ctx<'db> {
             a.name().map(|it| it.as_name()).map_or(ImportAlias::Underscore, ImportAlias::Alias)
         });
         let visibility = self.lower_visibility(extern_crate);
-        let ast_id = self.source_ast_id_map.ast_id(extern_crate);
+        let ast_id = self.ids.ast_id(extern_crate);
 
         let res = ExternCrate {
             name: self.tree.name(name),
@@ -637,7 +781,7 @@ impl<'db> Ctx<'db> {
         let range = path.syntax().text_range();
         let path =
             ModPath::from_src(self.db, path, &mut |range| span_map.span_for_range(range).ctx)?;
-        let ast_id = self.source_ast_id_map.ast_id(m);
+        let ast_id = self.ids.ast_id(m);
         let expand_to = hir_expand::ExpandTo::from_call_site(m);
         let res = MacroCall {
             path: self.tree.path(path),
@@ -650,7 +794,7 @@ impl<'db> Ctx<'db> {
 
     fn lower_macro_rules(&mut self, m: &ast::MacroRules) -> Option<ModItemId> {
         let name = m.name()?;
-        let ast_id = self.source_ast_id_map.ast_id(m);
+        let ast_id = self.ids.ast_id(m);
 
         let res = MacroRules { name: self.tree.name(name.as_name()) };
         let data = push(&mut self.tree.macro_rules, res);
@@ -660,7 +804,7 @@ impl<'db> Ctx<'db> {
     fn lower_macro_def(&mut self, m: &ast::MacroDef) -> Option<ModItemId> {
         let name = m.name()?;
 
-        let ast_id = self.source_ast_id_map.ast_id(m);
+        let ast_id = self.ids.ast_id(m);
         let visibility = self.lower_visibility(m);
 
         let res = Macro2 { name: self.tree.name(name.as_name()), visibility };
@@ -669,7 +813,7 @@ impl<'db> Ctx<'db> {
     }
 
     fn lower_extern_block(&mut self, block: &ast::ExternBlock) -> ModItemId {
-        let ast_id = self.source_ast_id_map.ast_id(block);
+        let ast_id = self.ids.ast_id(block);
         let mark = self.tree.pending_items.len();
         for item in block.extern_item_list().into_iter().flat_map(|list| list.extern_items()) {
             // Note: All items in an `extern` block need to be lowered as if they're outside of one

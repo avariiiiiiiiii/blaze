@@ -60,6 +60,9 @@ debug = 2
 [profile.dist]
 inherits = "release"
 lto = "thin"
+# One unit per crate, so LLVM inlines and lays out across all of it; only the release train
+# builds `dist`, so its longer build delays no edit.
+codegen-units = 1
 
 [patch.'crates-io']
 # The incremental engine.

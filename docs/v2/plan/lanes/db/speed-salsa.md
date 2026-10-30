@@ -7,7 +7,8 @@ date: 2026-10-29
 
 The changes were filed in `v2/requests/db-salsa.md` under "From speed-salsa" while `db-salsa`
 held `vendor/salsa*`, then applied on 10-29: S1, S3 and S4 by speed-salsa, S2 by
-speed-salsa-interned, and S5 (the edges, not yet the 24-byte memo) by speed-salsa. "How salsa
+speed-salsa-interned, and S5 (the edges, claim-free verify and the 24-byte memo header) by
+speed-salsa. "How salsa
 compares today" is the state before them; "Before and after" is what changed. Costs come from
 reading the code, not from measurements: nothing was built or run.
 
@@ -88,11 +89,11 @@ level, so readers never wait: this meets concurrency.md.
 | recording a read | FxHash and an `FxIndexSet` probe per read | a read of the same key as the last one is skipped before hashing (S4); the rest as before, in the task's own frame | a push, deduplicated by a scan |
 | edge record (query finishes) | one heap allocation per memo, 8 bytes an edge copied in | per edge, a probe of the task's 1024-entry node cache (L1 on a repeat key, the shared node table's lock-free probe otherwise) and one `Relaxed` store into the task's reserved chunk; one CAS per 256 edges; no allocation; published by the memo's own `Release` store | an `EdgesVec` moved into the graph |
 | deep verify | a claim per memo walked (a shard `Mutex` plus a `hashbrown` insert and remove), then a `dyn Ingredient` call per edge | no claim for a memo that ran no cycle, has no outputs and isn't provisional: an iterative walk, per edge one decode (the node's key: one page load and two column loads) then the hit check; a claim only for a memo that must run | one color load per edge, no lock |
-| memo at rest | 48 boxed + 8 an edge in a second allocation (rounded to its size class) + 8 per sibling function | 48 boxed + 4 an edge in the shared array, no second allocation, + 8 per sibling function; a memo with cycle, tracked-struct, accumulator or fingerprint data has them in one 64-byte box beside its edge range | 1 to 4 bytes an edge, a range per node |
+| memo at rest | header 40 + value, boxed; + 8 an edge in a second allocation (rounded to its size class); + 8 per sibling function | header 24 + value, boxed; + 4 an edge in the shared array, no second allocation; + 8 per sibling function. A memo with cycle, tracked-struct, accumulator or fingerprint data, or an assigned one, has them in one 72-byte box | 1 to 4 bytes an edge, a range per node |
 
-`tests/memory-usage.rs` moves with it: an interned argument's three memos 168 to 144 bytes, a
-tracked function's two 256 to 264 (their tracked-struct lists sit in the 64-byte box), the
-tuple 152 to 156.
+`tests/memory-usage.rs` moves with it: an interned argument's three memos 168 to 96 bytes, each
+`String` memo 40 to 24, a tracked function's two 256 to 248 (their tracked-struct lists sit in
+the 72-byte box), the tuple 152 to 148.
 
 **What the edges cost against #734's 0.8 GB.** nushell's 0.8 GB is about 100M edges at 8
 bytes. The edge array holds them in 0.4 GB. Dead ranges of replaced memos stay until the array
@@ -107,14 +108,22 @@ size-class rounding, which #734 counts under memos, are gone. Matching rustc's 0
 variable width (3 bytes under 16M nodes), which an atomic word array can't express; it would
 come with the frozen, persisted graph, not the live one.
 
-**Not done: the 24-byte memo.** The header is still 40 bytes (`verified_at` 8 and
-`QueryRevisions` 32: changed-at 8, the 13-byte origin, durability, `verified_final`,
-accumulated-inputs and padding), boxed per memo, plus an 8-byte `MemoEntry` pointer per function
-keyed on the struct. data.md's 24 needs changed-at and the flags packed into one `AtomicU64` and
-memos as columns of each function ingredient (rows by slot, no box, no per-sibling pointer). That
-rewrites `table/memo.rs`'s unsafe memo table and every ingredient's use of it, `evict_values`,
-`memory_usage` and memo persistence; it needs a build and the salsa tests run under it, so it
-was not done blind.
+**The 24-byte memo header.** `MemoHeader` is `verified_at` (8) and `QueryRevisions` (16), held
+by a `const` assertion:
+
+- one `AtomicU64` stamp: changed-at in the low 56 bits, durability in 2, and the
+  `verified_final` and accumulated-inputs flags. Changed-at and durability are written only
+  through `&mut`, before the memo is published; the flags change on a shared memo with one
+  `fetch_or` or `fetch_and`, which leaves the other bits alone.
+- one 8-byte origin word with a 3-bit tag: a derived memo with no extra data holds its edge span
+  inline (start 32 bits, length 29); anything else is a box aligned to 8, its address in the
+  rest. The box holds the extra data, the input and value fingerprints (moved out of the header:
+  they exist only after an eviction), an assigned memo's 12-byte key, or a span longer than 2^29.
+
+Still per memo: the memo's own box (header and value together) and the 8-byte `MemoEntry`
+pointer per function keyed on the struct. Removing those means memos as columns of each
+function ingredient (rows by slot), which rewrites `table/memo.rs`'s type-erased memo table
+and every ingredient's use of it; it is the next step past data.md's budget, not part of it.
 
 ## What is filed (v2/requests/db-salsa.md, "From speed-salsa")
 
@@ -195,12 +204,12 @@ cold fingerprints to `Edge::saw`.
   One array for the database rather than one per memo table: rustc's `SerializedDepGraph` keeps
   one edge list for the whole graph; one array means one reservation per task (not one per
   function it ran), and one compaction pass.
-- **Origin** (`zalsa_local.rs`, applied): the 13-byte packed origin holds a kind tag and, in a
-  union, the edge span, an assigning query's key, or a box of the extra data with the span or
-  key beside it (`WithExtra`). The extra is what most memos don't have: cycle heads, iteration
+- **Origin** (`zalsa_local.rs`, applied): one 8-byte word, a kind tag in its low bits and either
+  the edge span inline or the address of a box (`WithExtra`) of the extra data and
+  fingerprints with the span or an assigning query's key beside them. The extra is what most memos don't have: cycle heads, iteration
   and convergence, tracked struct IDs, accumulated values and the edge fingerprints.
-- **Memo header** (`function/memo.rs`, not done): `verified_at`, the packed changed-at and
-  flags word, and the origin, at 24 bytes; see "Not done: the 24-byte memo".
+- **Memo header** (`function/memo.rs`, applied): `verified_at`, the packed changed-at and
+  flags word, and the 8-byte origin, at 24 bytes; see "The 24-byte memo header".
 - **Deep verify without a claim** (`function/maybe_changed_after.rs`, `fetch.rs`): a memo that
   isn't provisional, took no part in a cycle and has no outputs is verified before any claim is
   taken: its edges are checked in order, each dependency by the same claim-free check, which

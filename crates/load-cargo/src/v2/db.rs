@@ -12,15 +12,12 @@ use salsa::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
 
-/// The database of a [`crate::v2::Lowered`], and each worker's handle on it.
+/// The database of a [`crate::v2::Lowered`], `Sync` and shared by reference.
 ///
-/// A handle ([`crate::v2::Lowered::snapshot`], or a clone of one) shares the storage and the
-/// inputs and has its own query stack. While one is alive, a write to the database
-/// ([`crate::v2::Lowered::ran`], [`crate::v2::Lowered::macros`]) sets salsa's cancellation
-/// flag, so the query its reader is in (or its next one) unwinds with [`salsa::Cancelled`],
-/// which the worker turns into `Failed::Again`; the write goes on once every handle is
-/// dropped. The loop makes a task's handle as it posts the task and is the only writer; a
-/// task drops its handle when it ends or before it waits on anything.
+/// There is one per lowered build and no handle on it: every task reads it through `&Db`
+/// ([`crate::v2::Lowered::db`]), each with its own query stack (salsa's per-task state), and
+/// nothing clones it. A write ([`crate::v2::Lowered::ran`], [`crate::v2::Lowered::macros`])
+/// takes `&mut`, so it happens only once no reader holds `&Db`; salsa cancels no reader.
 #[salsa::db]
 pub struct Db {
     storage: salsa::Storage<Db>,
@@ -29,15 +26,12 @@ pub struct Db {
     nonce: Nonce,
 }
 
-/// What [`crate::v2::Lowered::snapshot`] gives a worker: a handle on the database, a
-/// `hir::db::HirDatabase` (`Box::new(snapshot) as Box<dyn HirDatabase + Send>` is what
-/// `hir_ty_codegen::v2::Databases::new` takes).
-pub type Snapshot = Db;
-
 impl Db {
     /// A database with no crate, no source root and proc-macro attributes expanded as rustc
-    /// expands them.
+    /// expands them. Installs salsa's task-depth hook ([`base_db::install_plane_hooks`]): its
+    /// queries run as tasks of the process's pool.
     pub(crate) fn new() -> Db {
+        base_db::install_plane_hooks();
         let mut db = Db {
             storage: salsa::Storage::new(None),
             files: Default::default(),
@@ -48,17 +42,6 @@ impl Db {
         hir::ProcMacros::init_default(&db, Durability::HIGH);
         hir::db::set_expand_proc_attr_macros(&mut db, true);
         db
-    }
-}
-
-impl Clone for Db {
-    fn clone(&self) -> Db {
-        Db {
-            storage: self.storage.clone(),
-            files: self.files.clone(),
-            crates_map: self.crates_map.clone(),
-            nonce: self.nonce,
-        }
     }
 }
 
@@ -141,34 +124,14 @@ impl SourceDatabase for Db {
     }
 
     /// Each task is a job of the process's worker pool (`blaze_graph::exec::shared`, the
-    /// daemon's one pool), near this thread's group, reading this database by reference; the
-    /// calling thread pump-waits for the batch (`Pool::scope`). The first panic of a task,
-    /// salsa's cancellation included, goes on from here once the batch is over.
+    /// daemon's one pool) reading this database by reference ([`base_db::run_on_pool`]): one
+    /// that unwinds with `salsa::Cancelled::WouldWaitOnItself` runs again, any other panic goes
+    /// on from here.
     fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
         if count == 0 {
             return;
         }
-        let pool = blaze_graph::exec::shared();
-        let near = blaze_graph::pool::group();
-        let panicked = std::sync::Mutex::new(None);
-        pool.scope(|scope| {
-            for at in 0..count {
-                let panicked = &panicked;
-                scope.submit(
-                    near,
-                    move || task(self, at),
-                    move |ran| {
-                        if let Err(panic) = ran {
-                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
-                            first.get_or_insert(panic);
-                        }
-                    },
-                );
-            }
-        });
-        if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
-            panic::resume_unwind(panic);
-        }
+        base_db::run_on_pool(self, blaze_graph::exec::shared(), count, task);
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {

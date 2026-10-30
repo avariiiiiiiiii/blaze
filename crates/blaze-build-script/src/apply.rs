@@ -286,6 +286,30 @@ impl Rerun {
     }
 }
 
+/// Which directory a walk is in, for visiting each once however links reach it: its device
+/// and inode on Unix, from the metadata already read (no call to the system); elsewhere its
+/// canonical path. A directory reached twice adds no time, so either gives the same newest.
+#[derive(PartialEq, Eq, Hash)]
+enum DirId {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    #[cfg(not(unix))]
+    Path(PathBuf),
+}
+
+impl DirId {
+    #[cfg(unix)]
+    fn of(_: &Path, meta: &std::fs::Metadata) -> Option<DirId> {
+        use std::os::unix::fs::MetadataExt;
+        Some(DirId::Inode(meta.dev(), meta.ino()))
+    }
+
+    #[cfg(not(unix))]
+    fn of(path: &Path, _: &std::fs::Metadata) -> Option<DirId> {
+        std::fs::canonicalize(path).ok().map(DirId::Path)
+    }
+}
+
 /// The newest time of the file at `path`, or of the directory there and everything below
 /// it, as cargo's `mtime_recursive` takes it: links followed, a link's own time and its
 /// target's, what cannot be read left out. An entry's own time is read from its directory
@@ -296,7 +320,8 @@ fn newest(path: &Path) -> Option<SystemTime> {
     if !meta.is_dir() {
         return Some(newest);
     }
-    let mut visited: FxHashSet<PathBuf> = std::fs::canonicalize(path).into_iter().collect();
+    let mut visited = FxHashSet::default();
+    visited.extend(DirId::of(path, &meta));
     let mut pending = vec![path.to_owned()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -318,7 +343,7 @@ fn newest(path: &Path) -> Option<SystemTime> {
             if is_link && let Ok(it) = target.modified() {
                 newest = newest.max(it);
             }
-            if target.is_dir() && std::fs::canonicalize(&path).is_ok_and(|it| visited.insert(it)) {
+            if target.is_dir() && DirId::of(&path, &target).is_some_and(|it| visited.insert(it)) {
                 pending.push(path);
             }
         }

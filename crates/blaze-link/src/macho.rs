@@ -31,6 +31,11 @@ mod tbd;
 mod tests;
 mod unwind;
 
+#[cfg(feature = "fuzz")]
+pub(crate) use dylib::trie_differential;
+#[cfg(feature = "fuzz")]
+pub(crate) use tbd::differential as tbd_differential;
+
 use std::cmp::Ordering;
 use std::sync::Mutex;
 
@@ -89,7 +94,7 @@ struct MachO {
 }
 
 /// [`push_core_name`] as a `String`: the readers' tests compare against it.
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzz"))]
 pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
     let name = std::str::from_utf8(name)
         .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;

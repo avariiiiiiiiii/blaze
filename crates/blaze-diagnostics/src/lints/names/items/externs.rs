@@ -21,7 +21,7 @@ use std::str::FromStr;
 
 use blaze_items::{Fact, ItemId};
 use hir::{InFile, ModuleDef};
-use intern::sym;
+use intern::{Symbol, sym};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, EnumId, FunctionId, GenericDefId, HasModule as _, Lookup, VariantId,
     attrs::AttrFlags, item_tree::FieldsShape, nameres::crate_def_map, signatures::FunctionSignature,
@@ -47,8 +47,8 @@ use syntax::{
 };
 
 use super::{
-    def_span,
-    walk::{self, Container, Item},
+    Krate, def_span,
+    walk::{self, Container, Item, Orders},
 };
 use crate::{
     cx::{Cx, item_range},
@@ -804,13 +804,9 @@ impl<'db> Pass<'_, '_, 'db> {
         self.fnptrs(&mut types, &site, state, item.node.with_value(&hir_ty), ty, CItemKind::Definition);
     }
 
-    /// rustc's `check_struct_for_power_alignment`.
+    /// rustc's `check_struct_for_power_alignment`, on AIX.
     fn power_alignment(&mut self, item: &Item) {
         let cx = self.cx;
-        let db = cx.db;
-        if !cx.krate.cfg(db).get_cfg_values("target_os").any(|it| it.as_str() == "aix") {
-            return;
-        }
         let Some(adt) = ast::Adt::cast(item.node.value.syntax().clone()) else { return };
         let Some(def) = cx.sema.to_def2(item.node.with_value(&adt)) else { return };
         let id = AdtId::from(def);
@@ -947,7 +943,7 @@ fn counted(node: &SyntaxNode) -> bool {
 
 /// rustc's `ImproperCTypesLint` at an item itself: `check_foreign_item`, and `check_item` of a
 /// static, a const, a type alias or a `repr(C)` struct.
-pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
+pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
     let mut pass = Pass { cx, found: Vec::new() };
     let db = cx.db;
     match (&item.node.value, &item.container) {
@@ -979,7 +975,7 @@ pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
                 pass.typed(item, GenericDefId::TypeAliasId(id), def.ty(db), ty, t.ty());
             }
         }
-        (ast::Item::Struct(_), _) => pass.power_alignment(item),
+        (ast::Item::Struct(_), _) if krate.aix => pass.power_alignment(item),
         _ => {}
     }
     pass.found
@@ -998,13 +994,19 @@ pub(super) fn ctypes_nested(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
     pass.found
 }
 
-/// rustc's `SymbolName`: the symbol an `extern` function links against, and the span of the
-/// `#[link_name]` that names it, if one does.
-fn symbol(cx: &Cx<'_, '_>, id: FunctionId, f: &ast::Fn) -> (String, Option<TextRange>) {
+/// rustc's `SymbolName`: the symbol an `extern` function links against, interned.
+fn symbol(cx: &Cx<'_, '_>, id: FunctionId) -> Symbol {
     match AttrFlags::link_name(cx.db, AttrDefId::FunctionId(id)) {
-        Some(name) => (name.as_str().to_owned(), walk::attr(cx, f, "link_name").map(|(_, range)| range)),
-        None => (FunctionSignature::of(cx.db, id).name.as_str().to_owned(), None),
+        Some(name) => name,
+        None => FunctionSignature::of(cx.db, id).name.symbol().clone(),
     }
+}
+
+/// The span of the `#[link_name]` that names an `extern` function's symbol, if one does; read
+/// only for a lint that fires.
+fn link_name(cx: &Cx<'_, '_>, id: FunctionId, f: &ast::Fn) -> Option<TextRange> {
+    AttrFlags::link_name(cx.db, AttrDefId::FunctionId(id))?;
+    walk::attr(cx, f, "link_name").map(|(_, range)| range)
 }
 
 /// rustc's `structurally_same_type`.
@@ -1107,23 +1109,26 @@ impl<'db> Same<'_, '_, '_, 'db> {
 pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
     let db = cx.db;
     let mut decls = Vec::new();
+    let mut orders = Orders::default();
     for item in items {
         let (ast::Item::Fn(f), Container::Extern(_)) = (&item.node.value, &item.container) else { continue };
         let Some(def) = cx.sema.to_def2(item.node.with_value(f)) else { continue };
         let Ok(id) = FunctionId::try_from(def) else { continue };
         let lo = cx.span(item.node.as_ref().map(|it| item_range(it.syntax()))).lo;
-        decls.push((walk::source_order(&walk::module_order(cx, item.module), lo), item, f, def, id));
+        decls.push((orders.key(cx, item.module, lo), item, f, def, id));
+    }
+    if decls.len() < 2 {
+        return Vec::new();
     }
     decls.sort_by(|a, b| a.0.cmp(&b.0));
     let mut found = Vec::new();
-    let mut seen: FxHashMap<String, usize> = FxHashMap::default();
+    let mut seen: FxHashMap<Symbol, usize> = FxHashMap::with_capacity_and_hasher(decls.len(), Default::default());
     for index in 0..decls.len() {
         let (_, item, f, def, id) = &decls[index];
-        let (name, _) = symbol(cx, *id, f);
-        let first = match seen.get(&name).copied() {
-            Some(first) => first,
-            None => {
-                seen.insert(name, index);
+        let first = match seen.entry(symbol(cx, *id)) {
+            std::collections::hash_map::Entry::Occupied(it) => *it.get(),
+            std::collections::hash_map::Entry::Vacant(it) => {
+                it.insert(index);
                 continue;
             }
         };
@@ -1141,8 +1146,9 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
             continue;
         }
         let this = FunctionSignature::of(db, *id).name.as_str().to_owned();
-        let (orig, orig_link) = symbol(cx, *first_id, first_f);
-        let (_, this_link) = symbol(cx, *id, f);
+        let orig = symbol(cx, *first_id);
+        let orig = orig.as_str();
+        let (orig_link, this_link) = (link_name(cx, *first_id, first_f), link_name(cx, *id, f));
         let relevant = |item: &Item, link: Option<TextRange>| {
             cx.span(item.node.as_ref().map(|it| link.unwrap_or_else(|| item_range(it.syntax()))))
         };

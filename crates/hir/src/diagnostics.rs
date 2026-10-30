@@ -2317,15 +2317,12 @@ impl<'db> AnyDiagnostic<'db> {
                 trait_predicate,
                 parent_trait_predicates,
             } => {
-                let trait_predicate = crate::TraitClause {
-                    inner: trait_predicate.get(interner),
-                    owner: type_owner,
-                };
+                let trait_predicate =
+                    crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner));
                 let parent_trait_predicates = parent_trait_predicates
                     .iter()
-                    .map(|trait_predicate| crate::TraitClause {
-                        inner: trait_predicate.get(interner),
-                        owner: type_owner,
+                    .map(|trait_predicate| {
+                        crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner))
                     })
                     .collect();
                 UnimplementedTrait { span, trait_predicate, parent_trait_predicates }.into()

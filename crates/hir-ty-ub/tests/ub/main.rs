@@ -4,6 +4,9 @@
 
 mod db;
 
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use base_db::relevant_crates;
 use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_expand::EditionedFileId;
@@ -83,6 +86,8 @@ macro_rules! program {
         concat!("//- minicore: ", $minicore, "\n", prelude!(), $body)
     };
 }
+
+mod budget;
 
 fn main_of(db: &TestDB, file: EditionedFileId) -> FunctionId {
     let file_id = file.file_id(db);

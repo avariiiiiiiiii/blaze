@@ -77,6 +77,10 @@ impl Inputs for World {
         self.env.sort();
         &self.env
     }
+
+    fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
+        Ok(None)
+    }
 }
 
 fn code(n: u8) -> CodeHash {
@@ -253,22 +257,51 @@ fn the_history_s_end_is_its_latest_entry() {
 
 #[test]
 fn a_history_entry_round_trips() {
-    let entry = History {
+    let traced = Traced { env: vec![("FOO".into(), Some("1".into()))], ..Traced::default() };
+    let report = trace::encode(&Report::Ran(Some(traced.clone())));
+    let entry = Entry {
         passed: true,
         kept: true,
         attrs: Attrs::default().id(),
         reached: Key(ContentId::of("blaze v2 test 1", b"set")),
         took: Duration::from_micros(1234),
-        traced: Some(Traced { env: vec![("FOO".into(), Some("1".into()))], ..Traced::default() }),
+        traced: &report,
     };
-    assert_eq!(History::decode(&entry.encode()), Ok(entry.clone()));
-    let bare = History { traced: None, kept: false, ..entry };
-    assert_eq!(History::decode(&bare.encode()), Ok(bare.clone()));
+    let bytes = entry.encode();
+    assert_eq!(Entry::decode(&bytes), Ok(entry));
+    assert_eq!(entry.traced(), Ok(Some(traced)));
+    let bare = Entry { traced: &[], kept: false, ..entry };
     let bytes = bare.encode();
-    assert!(History::decode(&bytes[..bytes.len() - 1]).is_err());
+    assert_eq!(Entry::decode(&bytes), Ok(bare));
+    assert_eq!(bare.traced(), Ok(None));
+    assert!(Entry::decode(&bytes[..bytes.len() - 1]).is_err());
+    // What a kept pass read is checked when it is read, to explain a rerun: a report with no
+    // record is not one.
+    let empty = trace::encode(&Report::Ran(None));
+    assert!(Entry { traced: &empty, ..entry }.traced().is_err());
     let set = [code(1), code(2)];
     assert_eq!(decode_reached(&encode_reached(&set)), Ok(set.to_vec()));
     assert!(decode_reached(&encode_reached(&set)[..40]).is_err());
+}
+
+/// A record not in normal order keeps what its normal order keeps: the order is fixed before
+/// anything is keyed, whether the record came normal (and is borrowed) or not (and is sorted).
+#[test]
+fn a_pass_is_kept_by_what_it_read_in_normal_order() {
+    let mut world = World::with(1, "1");
+    let given = suite().given();
+    let a = test("tests::a", &[1]);
+    let normal = reads(&mut world);
+    assert!(trace::normal(&normal));
+    let mut shuffled = normal.clone();
+    shuffled.files.reverse();
+    shuffled.files.push(shuffled.files[0].clone());
+    assert!(!trace::normal(&shuffled));
+    let (mut one, mut two) = (Mem::default(), Mem::default());
+    pass(&mut one, given, &a, &normal, 1);
+    pass(&mut two, given, &a, &shuffled, 1);
+    assert_eq!(one.values, two.values);
+    assert_eq!(decide(&two, given, &a, &mut world), Decision::Skip { took: Some(Duration::from_millis(1)) });
 }
 
 #[test]

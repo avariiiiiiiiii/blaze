@@ -396,6 +396,9 @@ fn own<T>(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, read: impl Fn(&SyntaxNode)
     if let Some(found) = read(&node.value) {
         return Some(found);
     }
+    if node.value.kind() != SyntaxKind::MODULE {
+        return None;
+    }
     let module = ast::Module::cast(node.value.clone())?;
     if module.item_list().is_some() {
         return None;

@@ -526,7 +526,7 @@ pub(crate) struct QueryRevisions {
     /// The revision in which some input last changed in the low 56 bits ([`Self::changed_at`]);
     /// above it the minimum durability of the inputs (2 bits), whether the cycle heads are
     /// verified to not be provisional anymore ([`Self::VERIFIED_FINAL`]), and whether any input
-    /// read had direct or indirect accumulated values ([`Self::ACCUMULATED_INPUTS`]).
+    /// read had direct or indirect accumulated values (`ACCUMULATED_INPUTS`).
     /// `changed_at` and durability are written only through `&mut`; the two flags change on a
     /// shared memo, so the word is atomic.
     stamp: AtomicU64,
@@ -2096,9 +2096,17 @@ mod tests {
     use super::persistence::PersistentQueryOrigin;
     #[cfg(not(feature = "shuttle"))]
     use super::{QueryRevisionsExtra, QueryRevisionsExtraInner, WithExtra};
-    use super::{OriginAndExtra, QueryEdge, QueryOriginRef};
+    use std::sync::atomic::Ordering;
+
+    use thin_vec::ThinVec;
+
+    #[cfg(feature = "accumulator")]
+    use super::InputAccumulatedValues;
+    use super::{OriginAndExtra, QueryEdge, QueryOriginRef, QueryRevisions};
+    use crate::durability::Durability;
+    use crate::fingerprint::Fingerprint;
     use crate::graph::{EdgeSpan, Graph, TaskGraph};
-    use crate::{DatabaseKeyIndex, Id, IngredientIndex};
+    use crate::{DatabaseKeyIndex, Id, IngredientIndex, Revision};
 
     fn record(graph: &Graph, edges: &[QueryEdge]) -> EdgeSpan {
         graph.record(&TaskGraph::default(), edges.iter().copied())
@@ -2201,13 +2209,110 @@ mod tests {
         let mut origin = OriginAndExtra::assigned(key);
         origin.get_or_insert_extra().cycle_converged = true;
 
-        assert_eq!(origin.allocation_size(), size_of::<WithExtra<Id>>());
+        assert_eq!(origin.allocation_size(), size_of::<WithExtra<DatabaseKeyIndex>>());
         assert!(origin.extra().unwrap().cycle_converged);
         let QueryOriginRef::Assigned(stored_key) = origin.origin(&graph) else {
             panic!("expected assigned origin");
         };
         assert_eq!(stored_key, key);
         assert_eq!(origin.span(), None);
+    }
+
+    #[test]
+    fn inline_and_boxed_origins_read_the_same() {
+        let span = EdgeSpan {
+            start: 0xdead_beef,
+            len: OriginAndExtra::INLINE_LEN,
+        };
+        let inline = OriginAndExtra::derived(span, Default::default());
+        assert!(!inline.is_boxed());
+        assert_eq!(inline.span(), Some(span));
+        assert!(inline.extra().is_none());
+
+        let long = EdgeSpan {
+            start: 7,
+            len: OriginAndExtra::INLINE_LEN + 1,
+        };
+        let boxed = OriginAndExtra::derived_untracked(long, Default::default());
+        assert!(boxed.is_boxed() && boxed.is_derived_untracked());
+        assert_eq!(boxed.span(), Some(long));
+        assert!(boxed.extra().is_none());
+
+        let mut relocated = OriginAndExtra::derived(span, Default::default());
+        relocated.set_span(long);
+        assert_eq!(relocated.span(), Some(long));
+        relocated.set_span(EdgeSpan::EMPTY);
+        assert_eq!(relocated.span(), Some(EdgeSpan::EMPTY));
+        assert!(relocated.is_derived() && !relocated.is_derived_untracked());
+    }
+
+    #[test]
+    fn fingerprints_box_the_origin_without_extra() {
+        let span = EdgeSpan { start: 3, len: 2 };
+        let mut revisions = QueryRevisions::new(
+            Revision::from(5),
+            Durability::HIGH,
+            OriginAndExtra::derived(span, Default::default()),
+            false,
+            #[cfg(feature = "accumulator")]
+            InputAccumulatedValues::Empty,
+            ThinVec::new(),
+        );
+        assert!(!revisions.origin_and_extra.is_boxed());
+        let fingerprint = Fingerprint::of_value(&1u32);
+        revisions.set_value_fingerprint(fingerprint);
+        assert_eq!(revisions.value_fingerprint(), fingerprint);
+        assert!(revisions.origin_and_extra.is_boxed());
+        assert!(revisions.origin_and_extra.extra().is_none());
+        assert_eq!(revisions.origin_and_extra.span(), Some(span));
+        revisions.set_value_fingerprint(Fingerprint::NONE);
+        assert_eq!(revisions.value_fingerprint(), Fingerprint::NONE);
+    }
+
+    #[test]
+    fn the_stamp_keeps_changed_at_durability_and_flags_apart() {
+        let revisions = QueryRevisions::new(
+            Revision::from((1 << 56) - 1),
+            Durability::NEVER_CHANGE,
+            OriginAndExtra::derived(EdgeSpan::EMPTY, Default::default()),
+            true,
+            #[cfg(feature = "accumulator")]
+            InputAccumulatedValues::Any,
+            ThinVec::new(),
+        );
+        assert_eq!(revisions.changed_at(), Revision::from((1 << 56) - 1));
+        assert_eq!(revisions.durability(), Durability::NEVER_CHANGE);
+        assert!(revisions.verified_final(Ordering::Relaxed));
+        #[cfg(feature = "accumulator")]
+        assert!(revisions.accumulated_inputs().is_any());
+
+        let mut revisions = QueryRevisions::new(
+            Revision::from(9),
+            Durability::LOW,
+            OriginAndExtra::derived(EdgeSpan::EMPTY, Default::default()),
+            false,
+            #[cfg(feature = "accumulator")]
+            InputAccumulatedValues::Empty,
+            ThinVec::new(),
+        );
+        assert!(!revisions.verified_final(Ordering::Relaxed));
+        revisions.mark_verified_final(Ordering::Release);
+        #[cfg(feature = "accumulator")]
+        {
+            assert!(revisions.accumulated_inputs().is_empty());
+            revisions.store_accumulated_inputs(InputAccumulatedValues::Any);
+            assert!(revisions.accumulated_inputs().is_any());
+            revisions.store_accumulated_inputs(InputAccumulatedValues::Empty);
+            assert!(revisions.accumulated_inputs().is_empty());
+        }
+        revisions.set_changed_at(Revision::from(12));
+        revisions.set_durability(Durability::MEDIUM);
+        assert_eq!(revisions.changed_at(), Revision::from(12));
+        assert_eq!(revisions.durability(), Durability::MEDIUM);
+        assert!(revisions.verified_final(Ordering::Relaxed));
+        revisions.set_verified_final(false);
+        assert!(!revisions.verified_final(Ordering::Relaxed));
+        assert_eq!(revisions.changed_at(), Revision::from(12));
     }
 
     /// A model of memos over compactions: the origins keep reading the edges they were given.

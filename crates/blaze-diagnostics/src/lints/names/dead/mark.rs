@@ -10,7 +10,9 @@
 //!
 //! The walk is over the syntax of each definition (as rustc's `intravisit` walks its HIR), its
 //! macro calls expanded, names resolved through `hir::Semantics` and inference, a trait impl's
-//! item named through a trait mapped back to the trait's item as typeck has it.
+//! item named through a trait mapped back to the trait's item as typeck has it. Each node is
+//! dispatched on its `SyntaxKind` before any cast; each path is resolved once; what is live and
+//! what was walked are bitsets over the definitions.
 //!
 //! Follows `compiler/rustc_passes/src/dead.rs` (`MarkSymbolVisitor`, `mark_live_symbols`,
 //! `check_impl_or_impl_item_live`, `live_symbols_and_ignored_derived_traits`,
@@ -18,21 +20,20 @@
 //! `compiler/rustc_builtin_macros/src/deriving/` (what each derive's method reads)
 //! (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
-
 use either::Either;
 use hir::{Adjust, HirFileId, InFile, ModuleDef, PathResolution};
-use hir_def::{AdtId, FieldId, builtin_derive::BuiltinDeriveImplTrait};
+use hir_def::{AdtId, AttrDefId, FieldId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplTrait};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr,
-    ast::{self, BinaryOp, HasArgList, HasAttrs, RangeItem},
+    ast::{self, BinaryOp, HasArgList, RangeItem},
 };
 
 use super::{
-    defs::{DefIdx, Id, Kind, Parent, is_anon},
+    defs::{Bits, DefIdx, Id, Kind, Parent, is_anon},
     res::Res,
-    seed::{Crate, Seeds, WorkItem},
+    seed::{Crate, Seeds, Unsolved, WorkItem},
 };
 use crate::{
     lower::{Found, Phase},
@@ -42,23 +43,23 @@ use crate::{
 /// What is live at one point of the pass.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Live {
-    live: Vec<bool>,
+    live: Bits,
     /// The closures and anonymous constants walked, which items in them have as their parent.
     anon: FxHashSet<InFile<SyntaxNodePtr>>,
     /// rustc's `ignored_derived_traits`: of each ADT, the traits of the derives whose impls
     /// were not walked, in the order they were met.
-    pub(super) ignored: FxHashMap<DefIdx, Vec<&'static str>>,
+    pub(super) ignored: FxHashMap<DefIdx, SmallVec<[&'static str; 2]>>,
 }
 
 impl Live {
     pub(super) fn contains(&self, def: DefIdx) -> bool {
-        self.live[def]
+        self.live.get(def)
     }
 
     pub(super) fn parent_live(&self, parent: Parent) -> bool {
         match parent {
             Parent::Module => true,
-            Parent::Def(it) => self.live[it],
+            Parent::Def(it) => self.live.get(it),
             Parent::Anon(it) => self.anon.contains(&it),
         }
     }
@@ -73,12 +74,12 @@ pub(super) struct Liveness {
 
 /// rustc's `live_symbols_and_ignored_derived_traits`, with the self-assignments it lints.
 pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>) {
+    let len = k.defs.len();
     let mut m = Mark {
         k,
         worklist: seeds.worklist,
-        scanned: FxHashSet::default(),
-        live: Live { live: vec![false; k.defs.len()], ..Live::default() },
-        allow: vec![None; k.defs.len()],
+        scanned: [Bits::new(len), Bits::new(len)],
+        live: Live { live: Bits::new(len), ..Live::default() },
         propagated: false,
         in_pat: false,
         ignore_variants: Vec::new(),
@@ -98,10 +99,9 @@ pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>
 struct Mark<'k, 'c, 'a, 'db> {
     k: &'k Crate<'c, 'a, 'db>,
     worklist: Vec<WorkItem>,
-    scanned: FxHashSet<(DefIdx, bool)>,
+    /// rustc's `scanned` of `(id, comes_from_allow)`: one bitset for each `comes_from_allow`.
+    scanned: [Bits; 2],
     live: Live,
-    /// `has_allow_dead_code_or_lang_attr` of each definition, once asked.
-    allow: Vec<Option<Option<bool>>>,
     propagated: bool,
     in_pat: bool,
     ignore_variants: Vec<DefIdx>,
@@ -112,18 +112,9 @@ struct Mark<'k, 'c, 'a, 'db> {
 }
 
 impl Mark<'_, '_, '_, '_> {
-    fn allow_or_lang(&mut self, def: DefIdx) -> Option<bool> {
-        if let Some(it) = self.allow[def] {
-            return it;
-        }
-        let it = self.k.allow_or_lang(def);
-        self.allow[def] = Some(it);
-        it
-    }
-
     /// rustc's `own_comes_from_allow_expect`.
-    fn own(&mut self, def: DefIdx) -> bool {
-        self.propagated && self.allow_or_lang(def) == Some(true)
+    fn own(&self, def: DefIdx) -> bool {
+        self.propagated && self.k.allow_or_lang(def) == Some(true)
     }
 
     fn check_def_id(&mut self, def: DefIdx) {
@@ -132,13 +123,13 @@ impl Mark<'_, '_, '_, '_> {
             self.worklist.push(WorkItem { id: def, propagated: self.propagated, own });
         }
         if !own {
-            self.live.live[def] = true;
+            self.live.live.insert(def);
         }
     }
 
     fn insert_def_id(&mut self, def: DefIdx) {
         if !self.own(def) {
-            self.live.live[def] = true;
+            self.live.live.insert(def);
         }
     }
 
@@ -168,51 +159,37 @@ impl Mark<'_, '_, '_, '_> {
 
     /// `mark_live_symbols_and_ignored_derived_traits`: the worklist, then the trait impls and
     /// their items whose trait and self type are live, until none is left that is.
-    fn mark_with_unsolved(&mut self, unsolved: &mut Vec<DefIdx>) {
+    fn mark_with_unsolved(&mut self, unsolved: &mut Vec<Unsolved>) {
         self.mark_live_symbols();
-        let mut to_check = self.extract_live(unsolved);
+        let mut to_check = Vec::new();
+        self.extract_live(unsolved, &mut to_check);
         while !to_check.is_empty() {
             self.worklist.extend(to_check.drain(..).map(|id| WorkItem::new(id, false)));
             self.mark_live_symbols();
-            to_check.extend(self.extract_live(unsolved));
+            self.extract_live(unsolved, &mut to_check);
         }
     }
 
-    fn extract_live(&self, unsolved: &mut Vec<DefIdx>) -> Vec<DefIdx> {
-        let mut live = Vec::new();
-        unsolved.retain(|&it| {
-            let is_live = self.impl_or_impl_item_live(it);
+    /// rustc's `check_impl_or_impl_item_live` of each unsolved item, the live ones moved to
+    /// `out`: two bit tests each.
+    fn extract_live(&self, unsolved: &mut Vec<Unsolved>, out: &mut Vec<DefIdx>) {
+        let live = &self.live.live;
+        unsolved.retain(|it| {
+            let is_live = it.trait_def.is_none_or(|it| live.get(it)) && it.self_adt.is_none_or(|it| live.get(it));
             if is_live {
-                live.push(it);
+                out.push(it.def);
             }
             !is_live
         });
-        live
-    }
-
-    /// rustc's `check_impl_or_impl_item_live`.
-    fn impl_or_impl_item_live(&self, def: DefIdx) -> bool {
-        let defs = self.k.defs;
-        let (impl_, trait_def) = match defs[def].kind {
-            Kind::AssocFn { .. } | Kind::AssocConst | Kind::AssocTy => {
-                let Parent::Def(impl_) = defs[def].parent else { return false };
-                (impl_, self.k.trait_item_of(def))
-            }
-            _ => (def, self.k.impl_trait(def)),
-        };
-        if trait_def.is_some_and(|it| !self.live.live[it]) {
-            return false;
-        }
-        self.k.impl_self_adt(impl_).is_none_or(|it| self.live.live[it])
     }
 
     fn mark_live_symbols(&mut self) {
         while let Some(work) = self.worklist.pop() {
             self.propagated = work.propagated;
             if !work.own {
-                self.live.live[work.id] = true;
+                self.live.live.insert(work.id);
             }
-            if !self.scanned.insert((work.id, work.propagated)) {
+            if !self.scanned[work.propagated as usize].insert(work.id) {
                 continue;
             }
             self.visit(work.id);
@@ -232,8 +209,8 @@ impl Mark<'_, '_, '_, '_> {
                 self.derived(adt, loc.trait_);
                 return;
             }
-            Id::Derive(derive) => {
-                if let Some(adt) = defs.get(Id::Adt(derive.loc(db).adt)) {
+            Id::Derive(_) => {
+                if let Some(adt) = defs.impl_of(def).and_then(|it| it.self_adt) {
                     self.check_def_id(adt);
                 }
                 return;
@@ -242,24 +219,24 @@ impl Mark<'_, '_, '_, '_> {
             _ => {}
         }
         let Some(ptr) = d.node else { return };
-        let node = k.cx.syntax(ptr);
         let saved = (self.repr_all_live, self.repr_simd);
         self.repr_all_live = false;
         self.repr_simd = false;
-        match d.kind {
-            Kind::Struct | Kind::Union => {
-                let (all, simd) = repr(k, &node.value);
-                self.repr_all_live = all;
-                self.repr_simd = simd;
+        match (d.kind, d.id) {
+            (Kind::Struct | Kind::Union, Id::Adt(adt)) => {
+                if let Some(repr) = AttrFlags::repr(db, adt) {
+                    self.repr_all_live = repr.c() || repr.transparent();
+                    self.repr_simd = repr.simd();
+                }
                 self.variant_data(def, def);
             }
-            Kind::Enum => {
-                for &variant in &d.children {
+            (Kind::Enum, _) => {
+                for &variant in defs.children(def) {
                     self.variant_data(def, variant);
                 }
             }
-            Kind::Trait => {
-                for &item in &d.children {
+            (Kind::Trait, _) => {
+                for &item in defs.children(def) {
                     if defs[item].kind == Kind::AssocTy {
                         self.check_def_id(item);
                     }
@@ -274,6 +251,7 @@ impl Mark<'_, '_, '_, '_> {
                 _ => {}
             }
         }
+        let node = k.cx.syntax(ptr);
         self.walk(node.file_id, &node.value, true);
         (self.repr_all_live, self.repr_simd) = saved;
     }
@@ -281,15 +259,9 @@ impl Mark<'_, '_, '_, '_> {
     /// An inherent impl's item makes its self type live: an ADT, a foreign type, the principal
     /// trait of a `dyn`.
     fn inherent_self_ty(&mut self, impl_: DefIdx) {
-        let k = self.k;
-        let Id::Impl(id) = k.defs[impl_].id else { return };
-        let self_ty = hir::Impl::from(id).self_ty(k.cx.db);
-        let named = match (self_ty.as_adt(), self_ty.as_dyn_trait()) {
-            (Some(adt), _) => k.defs.get(Id::Adt(AdtId::from(adt))),
-            (None, Some(trait_)) => k.defs.get(Id::Trait(trait_.into())),
-            (None, None) => None,
-        };
-        if let Some(it) = named {
+        if let Some(of) = self.k.defs.impl_of(impl_)
+            && let Some(it) = of.self_adt.or(of.self_dyn)
+        {
             self.check_def_id(it);
         }
     }
@@ -299,13 +271,12 @@ impl Mark<'_, '_, '_, '_> {
     /// `repr(simd)` type's, the public ones of a public type's.
     fn variant_data(&mut self, adt: DefIdx, variant: DefIdx) {
         let defs = self.k.defs;
-        for &field in &defs[variant].children {
-            let positional = defs[field].name.as_deref().is_some_and(|it| it.starts_with(|c: char| c.is_ascii_digit()));
+        for &field in defs.children(variant) {
             let live = self.repr_all_live
-                || (positional && self.repr_simd)
+                || (self.repr_simd && defs[field].is_positional())
                 || (self.k.reach.is_reachable(adt) && self.k.reach.is_reachable(field));
             if live {
-                self.live.live[field] = true;
+                self.live.live.insert(field);
             }
         }
     }
@@ -330,24 +301,25 @@ impl Mark<'_, '_, '_, '_> {
             BuiltinDeriveImplTrait::PartialEq
             | BuiltinDeriveImplTrait::PartialOrd
             | BuiltinDeriveImplTrait::Ord
-            | BuiltinDeriveImplTrait::Hash => {
-                let fields: Vec<DefIdx> = match defs[adt].kind {
-                    Kind::Enum => defs[adt].children.iter().flat_map(|&it| defs[it].children.iter().copied()).collect(),
-                    _ => defs[adt].children.clone(),
-                };
-                for field in fields {
-                    self.insert_def_id(field);
+            | BuiltinDeriveImplTrait::Hash => match defs[adt].kind {
+                Kind::Enum => {
+                    for &variant in defs.children(adt) {
+                        for &field in defs.children(variant) {
+                            self.insert_def_id(field);
+                        }
+                    }
                 }
-            }
+                _ => {
+                    for &field in defs.children(adt) {
+                        self.insert_def_id(field);
+                    }
+                }
+            },
             BuiltinDeriveImplTrait::Default => {
-                let default = defs[adt].children.iter().copied().find(|&variant| {
-                    defs[variant].kind == Kind::Variant
-                        && defs[variant].node.is_some_and(|it| {
-                            let node = self.k.cx.syntax(it);
-                            ast::Variant::cast(node.value).is_some_and(|it| {
-                                it.attrs().any(|attr| attr.simple_name().is_some_and(|it| it == "default"))
-                            })
-                        })
+                let db = self.k.cx.db;
+                let default = defs.children(adt).iter().copied().find(|&variant| match defs[variant].id {
+                    Id::Variant(id) => AttrFlags::has_word(db, AttrDefId::EnumVariantId(id), "default"),
+                    _ => false,
                 });
                 match default {
                     Some(variant) => self.handle_res(Res::Variant(variant)),
@@ -367,32 +339,31 @@ impl Mark<'_, '_, '_, '_> {
     /// they expand to.
     fn walk(&mut self, file: HirFileId, node: &SyntaxNode, root: bool) {
         let kind = node.kind();
-        if kind == SyntaxKind::ATTR {
-            return;
-        }
-        if kind == SyntaxKind::MACRO_CALL {
-            let in_item_list = node.parent().is_some_and(|it| {
-                matches!(
-                    it.kind(),
-                    SyntaxKind::SOURCE_FILE
-                        | SyntaxKind::ITEM_LIST
-                        | SyntaxKind::ASSOC_ITEM_LIST
-                        | SyntaxKind::EXTERN_ITEM_LIST
-                        | SyntaxKind::MACRO_ITEMS
-                )
-            });
-            if in_item_list && !root {
+        match kind {
+            SyntaxKind::ATTR => return,
+            SyntaxKind::MACRO_CALL => {
+                let in_item_list = node.parent().is_some_and(|it| {
+                    matches!(
+                        it.kind(),
+                        SyntaxKind::SOURCE_FILE
+                            | SyntaxKind::ITEM_LIST
+                            | SyntaxKind::ASSOC_ITEM_LIST
+                            | SyntaxKind::EXTERN_ITEM_LIST
+                            | SyntaxKind::MACRO_ITEMS
+                    )
+                });
+                if in_item_list && !root {
+                    return;
+                }
+                if let Some(call) = ast::MacroCall::cast(node.clone())
+                    && let Some(expansion) = self.k.cx.sema.expand_macro_call(&call)
+                {
+                    stdx::ensure_sufficient_stack(|| self.walk(expansion.file_id, &expansion.value, false));
+                }
                 return;
             }
-            if let Some(call) = ast::MacroCall::cast(node.clone())
-                && let Some(expansion) = self.k.cx.sema.expand_macro_call(&call)
-            {
-                stdx::ensure_sufficient_stack(|| self.walk(expansion.file_id, &expansion.value, false));
-            }
-            return;
-        }
-        if !root && ast::Item::can_cast(kind) {
-            return;
+            _ if !root && ast::Item::can_cast(kind) => return,
+            _ => {}
         }
         if is_anon(node) {
             self.anon(file, node);
@@ -404,52 +375,52 @@ impl Mark<'_, '_, '_, '_> {
         }
         match kind {
             SyntaxKind::PATH => {
-                let path = ast::Path::cast(node.clone()).expect("a path");
-                self.path(&path);
+                if let Some(path) = ast::Path::cast(node.clone()) {
+                    self.path(&path);
+                }
             }
             SyntaxKind::METHOD_CALL_EXPR => {
-                let call = ast::MethodCallExpr::cast(node.clone()).expect("a method call");
-                if let Some(function) = self.k.cx.sema.resolve_method_call(&call) {
-                    let res = Res::function(self.k.cx, self.k.defs, function);
-                    self.handle_res(res);
+                if let Some(call) = ast::MethodCallExpr::cast(node.clone())
+                    && let Some(function) = self.k.cx.sema.resolve_method_call(&call)
+                {
+                    self.handle_res(Res::function(self.k.defs, function));
                 }
             }
             SyntaxKind::FIELD_EXPR => {
-                let field = ast::FieldExpr::cast(node.clone()).expect("a field expression");
-                self.field_read(&field);
+                if let Some(field) = ast::FieldExpr::cast(node.clone()) {
+                    self.field_read(&field);
+                }
             }
             SyntaxKind::RECORD_EXPR => {
-                let expr = ast::RecordExpr::cast(node.clone()).expect("a record expression");
-                self.union_fields(&expr);
+                if let Some(expr) = ast::RecordExpr::cast(node.clone()) {
+                    self.union_fields(&expr);
+                }
             }
             SyntaxKind::OFFSET_OF_EXPR => {
-                let expr = ast::OffsetOfExpr::cast(node.clone()).expect("an `offset_of!`");
-                for name in expr.fields() {
-                    if let Some((Either::Right(field), _)) = self.k.cx.sema.resolve_offset_of_field(&name)
-                        && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
-                    {
-                        self.insert_def_id(field);
+                if let Some(expr) = ast::OffsetOfExpr::cast(node.clone()) {
+                    for name in expr.fields() {
+                        if let Some((Either::Right(field), _)) = self.k.cx.sema.resolve_offset_of_field(&name)
+                            && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
+                        {
+                            self.insert_def_id(field);
+                        }
                     }
                 }
             }
             SyntaxKind::BIN_EXPR => {
-                let expr = ast::BinExpr::cast(node.clone()).expect("a binary expression");
-                if let Some(BinaryOp::Assignment { op: None }) = expr.op_kind() {
+                if let Some(expr) = ast::BinExpr::cast(node.clone())
+                    && let Some(BinaryOp::Assignment { op: None }) = expr.op_kind()
+                {
                     self.assign(file, &expr);
                     return;
                 }
             }
             SyntaxKind::MATCH_ARM => {
-                let arm = ast::MatchArm::cast(node.clone()).expect("a match arm");
                 let len = self.ignore_variants.len();
-                if let Some(pat) = arm.pat() {
-                    let mut needed = Vec::new();
-                    self.necessary_variants(pat.syntax(), &mut needed);
-                    for variant in needed {
-                        if !self.ignore_variants[len..].contains(&variant) {
-                            self.ignore_variants.push(variant);
-                        }
-                    }
+                if let Some(pat) = ast::MatchArm::cast(node.clone()).and_then(|it| it.pat()) {
+                    let mut stack = std::mem::take(&mut self.ignore_variants);
+                    self.necessary_variants(pat.syntax(), &mut stack, len);
+                    self.ignore_variants = stack;
                 }
                 self.children(file, node);
                 self.ignore_variants.truncate(len);
@@ -469,7 +440,6 @@ impl Mark<'_, '_, '_, '_> {
     /// A closure (live unless an `allow` it has came with what reached it) or an anonymous
     /// constant (live), walked out of any pattern it is in.
     fn anon(&mut self, file: HirFileId, node: &SyntaxNode) {
-        let ptr = InFile::new(file, SyntaxNodePtr::new(node));
         let closure = match node.kind() {
             SyntaxKind::CLOSURE_EXPR => true,
             SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_none()),
@@ -479,7 +449,7 @@ impl Mark<'_, '_, '_, '_> {
             && self.propagated
             && self.k.levels.at(self.k.cx, &InFile::new(file, node.clone())).is_allow_or_expect();
         if !own {
-            self.live.anon.insert(ptr);
+            self.live.anon.insert(InFile::new(file, SyntaxNodePtr::new(node)));
         }
         let in_pat = std::mem::replace(&mut self.in_pat, false);
         self.children(file, node);
@@ -487,14 +457,14 @@ impl Mark<'_, '_, '_, '_> {
     }
 
     /// rustc's `visit_path` (and `visit_expr` of a type-relative path): what `path` resolves
-    /// to is live.
-    fn path(&mut self, path: &ast::Path) {
+    /// to is live. Gives what it resolved to, for the pattern that has it.
+    fn path(&mut self, path: &ast::Path) -> Res {
         let cx = self.k.cx;
         let parent = path.syntax().parent().map(|it| it.kind());
         if matches!(parent, Some(SyntaxKind::MACRO_CALL | SyntaxKind::META)) {
-            return;
+            return Res::None;
         }
-        let Some(res) = cx.sema.resolve_path(path) else { return };
+        let Some(res) = cx.sema.resolve_path(path) else { return Res::None };
         let value_or_pat = matches!(
             parent,
             Some(SyntaxKind::PATH_EXPR | SyntaxKind::PATH_PAT | SyntaxKind::TUPLE_STRUCT_PAT)
@@ -502,6 +472,7 @@ impl Mark<'_, '_, '_, '_> {
         let self_ctor = value_or_pat && path.qualifier().is_none() && is_self(path);
         let res = Res::path(cx, self.k.defs, res, self_ctor);
         self.handle_res(res);
+        res
     }
 
     /// rustc's `handle_field_access`: a field of a struct or a union read.
@@ -514,15 +485,19 @@ impl Mark<'_, '_, '_, '_> {
     }
 
     /// rustc's `mark_as_used_if_union`: the fields a union expression names, of a union of
-    /// more than one field, are read.
+    /// more than one field, are read. A literal naming no field is no union's, and is not typed.
     fn union_fields(&mut self, expr: &ast::RecordExpr) {
         let cx = self.k.cx;
+        let Some(list) = expr.record_expr_field_list() else { return };
+        if list.fields().next().is_none() {
+            return;
+        }
         let Some(ty) = cx.sema.type_of_expr(&ast::Expr::RecordExpr(expr.clone())) else { return };
         let Some(hir::Adt::Union(union)) = ty.original.as_adt() else { return };
         if union.fields(cx.db).len() <= 1 {
             return;
         }
-        for field in expr.record_expr_field_list().into_iter().flat_map(|it| it.fields()) {
+        for field in list.fields() {
             if let Some((field, _, _)) = cx.sema.resolve_record_field(&field)
                 && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
             {
@@ -535,54 +510,53 @@ impl Mark<'_, '_, '_, '_> {
     fn pat(&mut self, file: HirFileId, node: &SyntaxNode) {
         let cx = self.k.cx;
         self.in_pat = true;
-        match ast::Pat::cast(node.clone()) {
-            Some(ast::Pat::RecordPat(pat)) => {
-                self.pat_adt(&ast::Pat::RecordPat(pat.clone()));
-                if let Some(path) = pat.path() {
+        let Some(pat) = ast::Pat::cast(node.clone()) else {
+            self.children(file, node);
+            self.in_pat = false;
+            return;
+        };
+        match &pat {
+            ast::Pat::RecordPat(it) => {
+                self.pat_adt(&pat);
+                if let Some(path) = it.path() {
                     self.path(&path);
                 }
-                for field in pat.record_pat_field_list().into_iter().flat_map(|it| it.fields()) {
-                    if matches!(field.pat(), Some(ast::Pat::WildcardPat(_))) {
-                        continue;
+                if let Some(list) = it.record_pat_field_list() {
+                    for field in list.fields() {
+                        if matches!(field.pat(), Some(ast::Pat::WildcardPat(_))) {
+                            continue;
+                        }
+                        if let Some((field, _)) = cx.sema.resolve_record_pat_field(&field)
+                            && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
+                        {
+                            self.insert_def_id(field);
+                        }
                     }
-                    if let Some((field, _)) = cx.sema.resolve_record_pat_field(&field)
-                        && let Some(field) = self.k.defs.get(Id::Field(FieldId::from(field)))
-                    {
-                        self.insert_def_id(field);
-                    }
-                }
-                if let Some(list) = pat.record_pat_field_list() {
                     self.children(file, list.syntax());
                 }
             }
-            Some(ast::Pat::TupleStructPat(pat)) => {
-                self.pat_adt(&ast::Pat::TupleStructPat(pat.clone()));
-                let variant = pat.path().and_then(|path| {
-                    self.path(&path);
-                    let res = Res::path(cx, self.k.defs, cx.sema.resolve_path(&path)?, false);
-                    match res {
-                        Res::Def(it) | Res::Variant(it) => Some(it),
-                        Res::SelfCtor | Res::None => None,
-                    }
-                });
-                let subpats: Vec<ast::Pat> = pat.fields().collect();
-                if let Some(variant) = variant {
-                    self.tuple_fields(variant, &subpats);
+            ast::Pat::TupleStructPat(it) => {
+                let adt = self.pat_adt(&pat);
+                let res = it.path().map_or(Res::None, |path| self.path(&path));
+                let subpats: SmallVec<[ast::Pat; 4]> = it.fields().collect();
+                if let Some(variant) = self.variant_of(res, adt) {
+                    let wildcard = subpats.iter().map(|it| matches!(it, ast::Pat::WildcardPat(_)));
+                    let rest = subpats.iter().position(|it| matches!(it, ast::Pat::RestPat(_)));
+                    self.tuple_fields(variant, wildcard, rest);
                 }
                 for sub in subpats {
                     stdx::ensure_sufficient_stack(|| self.walk(file, sub.syntax(), false));
                     self.in_pat = true;
                 }
             }
-            Some(pat @ ast::Pat::PathPat(_)) => {
+            ast::Pat::PathPat(_) => {
                 self.pat_adt(&pat);
                 self.children(file, node);
             }
-            Some(ast::Pat::IdentPat(pat)) => {
-                if let Some(def) = cx.sema.resolve_bind_pat_to_const(&pat) {
-                    self.pat_adt(&ast::Pat::IdentPat(pat.clone()));
-                    let res = Res::def(cx, self.k.defs, def);
-                    self.handle_res(res);
+            ast::Pat::IdentPat(it) => {
+                if let Some(def) = cx.sema.resolve_bind_pat_to_const(it) {
+                    self.pat_adt(&pat);
+                    self.handle_res(Res::def(self.k.defs, def));
                 }
                 self.children(file, node);
             }
@@ -591,16 +565,27 @@ impl Mark<'_, '_, '_, '_> {
         self.in_pat = false;
     }
 
-    /// The fields a tuple struct pattern's subpatterns bind (not `_`), past its `..`.
-    fn tuple_fields(&mut self, variant: DefIdx, subpats: &[ast::Pat]) {
-        let defs = self.k.defs;
-        let fields = &defs[variant].children;
-        let dotdot = subpats.iter().position(|it| matches!(it, ast::Pat::RestPat(_)));
-        let pats: Vec<&ast::Pat> = subpats.iter().filter(|it| !matches!(it, ast::Pat::RestPat(_))).collect();
-        let dotdot = dotdot.unwrap_or(pats.len());
-        let missing = fields.len().saturating_sub(pats.len());
-        for (index, pat) in pats.iter().enumerate() {
-            if matches!(pat, ast::Pat::WildcardPat(_)) {
+    /// The variant a tuple struct pattern (or the call a destructuring assignment lowers to one)
+    /// binds the fields of: rustc's `adt.variant_of_res(res)` of the pattern's type, the variant
+    /// its path names, else the struct (also for `Self`).
+    fn variant_of(&self, res: Res, adt: Option<DefIdx>) -> Option<DefIdx> {
+        match res {
+            Res::Variant(it) => Some(it),
+            Res::Def(_) | Res::SelfCtor => adt.filter(|&it| self.k.defs[it].kind == Kind::Struct),
+            Res::None => None,
+        }
+    }
+
+    /// The fields of `variant` that the subpatterns of a tuple pattern bind (whether each is a
+    /// `_`, in order, without the `..` at `rest`), past its `..`.
+    fn tuple_fields(&mut self, variant: DefIdx, wildcard: impl Iterator<Item = bool> + Clone, rest: Option<usize>) {
+        let fields = self.k.defs.children(variant);
+        let bound = wildcard.clone().count() - usize::from(rest.is_some());
+        let dotdot = rest.unwrap_or(bound);
+        let missing = fields.len().saturating_sub(bound);
+        let subpats = wildcard.enumerate().filter(|&(at, _)| Some(at) != rest).map(|(_, it)| it);
+        for (index, is_wildcard) in subpats.enumerate() {
+            if is_wildcard {
                 continue;
             }
             let index = if index < dotdot { index } else { index + missing };
@@ -612,18 +597,17 @@ impl Mark<'_, '_, '_, '_> {
 
     /// The ADT a pattern is of is live (rustc's `check_def_id(adt.did())` of a struct, tuple
     /// struct or path pattern).
-    fn pat_adt(&mut self, pat: &ast::Pat) {
-        let Some(ty) = self.k.cx.sema.type_of_pat(pat) else { return };
-        if let Some(adt) = ty.original.as_adt()
-            && let Some(def) = self.k.defs.get(Id::Adt(AdtId::from(adt)))
-        {
-            self.check_def_id(def);
-        }
+    fn pat_adt(&mut self, pat: &ast::Pat) -> Option<DefIdx> {
+        let ty = self.k.cx.sema.type_of_pat(pat)?;
+        let def = self.k.defs.get(Id::Adt(AdtId::from(ty.original.as_adt()?)))?;
+        self.check_def_id(def);
+        Some(def)
     }
 
     /// rustc's `necessary_variants` of a match arm's pattern: the variants its paths name
-    /// (resolved, not through a type), outside `|` patterns.
-    fn necessary_variants(&self, node: &SyntaxNode, out: &mut Vec<DefIdx>) {
+    /// (resolved, not through a type), outside `|` patterns, added to `out` past `from` once
+    /// each.
+    fn necessary_variants(&self, node: &SyntaxNode, out: &mut Vec<DefIdx>, from: usize) {
         let cx = self.k.cx;
         let path = match node.kind() {
             SyntaxKind::OR_PAT => return,
@@ -634,7 +618,7 @@ impl Mark<'_, '_, '_, '_> {
                 if let Some(pat) = ast::IdentPat::cast(node.clone())
                     && let Some(ModuleDef::EnumVariant(it)) = cx.sema.resolve_bind_pat_to_const(&pat)
                     && let Some(variant) = self.k.defs.get(Id::Variant(it.into()))
-                    && !out.contains(&variant)
+                    && !out[from..].contains(&variant)
                 {
                     out.push(variant);
                 }
@@ -646,16 +630,17 @@ impl Mark<'_, '_, '_, '_> {
             && self.is_resolved(&path)
             && let Some(res) = cx.sema.resolve_path(&path)
             && let Res::Variant(variant) = Res::path(cx, self.k.defs, res, false)
-            && !out.contains(&variant)
+            && !out[from..].contains(&variant)
         {
             out.push(variant);
         }
         for child in node.children() {
-            if ast::Pat::can_cast(child.kind()) || child.kind() == SyntaxKind::RECORD_PAT_FIELD_LIST {
-                self.necessary_variants(&child, out);
-            } else if child.kind() == SyntaxKind::RECORD_PAT_FIELD {
+            let kind = child.kind();
+            if ast::Pat::can_cast(kind) || kind == SyntaxKind::RECORD_PAT_FIELD_LIST {
+                self.necessary_variants(&child, out, from);
+            } else if kind == SyntaxKind::RECORD_PAT_FIELD {
                 for it in child.children() {
-                    self.necessary_variants(&it, out);
+                    self.necessary_variants(&it, out, from);
                 }
             }
         }
@@ -665,42 +650,47 @@ impl Mark<'_, '_, '_, '_> {
     /// a type (`QPath::TypeRelative`: `Self::A`, `Alias::A`, `<E>::A`).
     fn is_resolved(&self, path: &ast::Path) -> bool {
         let Some(qualifier) = path.qualifier() else { return true };
-        if qualifier.segments().any(|it| it.type_anchor().is_some()) {
+        if is_self(&qualifier) || qualifier.segments().any(|it| it.type_anchor().is_some()) {
             return false;
         }
         matches!(
             self.k.cx.sema.resolve_path(&qualifier),
             Some(PathResolution::Def(ModuleDef::Module(_) | ModuleDef::Adt(hir::Adt::Enum(_))))
-        ) && !is_self(&qualifier)
+        )
     }
 
     /// `lhs = rhs`: rustc's `handle_assign` of the place written (its fields not read), or the
     /// pattern a destructuring assignment is lowered to; then `rhs`, and the self-assignment
     /// lint.
     fn assign(&mut self, file: HirFileId, expr: &ast::BinExpr) {
-        if let Some(lhs) = expr.lhs() {
-            match destructures(&lhs) {
-                true => self.assign_pattern(file, &lhs),
-                false => self.handle_assign(file, &lhs),
-            }
+        let Some(lhs) = expr.lhs() else {
             if let Some(rhs) = expr.rhs() {
-                if !destructures(&lhs) {
-                    self.self_assign(file, expr, &lhs, &rhs);
-                }
-                stdx::ensure_sufficient_stack(|| self.walk(file, rhs.syntax(), false));
+                self.walk(file, rhs.syntax(), false);
             }
-        } else if let Some(rhs) = expr.rhs() {
-            self.walk(file, rhs.syntax(), false);
+            return;
+        };
+        let destructuring = destructures(&lhs);
+        match destructuring {
+            true => self.assign_pattern(file, &lhs),
+            false => self.handle_assign(file, &lhs),
+        }
+        if let Some(rhs) = expr.rhs() {
+            if !destructuring {
+                self.self_assign(file, expr, &lhs, &rhs);
+            }
+            stdx::ensure_sufficient_stack(|| self.walk(file, rhs.syntax(), false));
         }
     }
 
     fn handle_assign(&mut self, file: HirFileId, place: &ast::Expr) {
-        let derefs = self
-            .k
-            .cx
-            .sema
-            .expr_adjustments(place)
-            .is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))));
+        let through_field = matches!(place, ast::Expr::FieldExpr(_) | ast::Expr::ParenExpr(_));
+        let derefs = through_field
+            && self
+                .k
+                .cx
+                .sema
+                .expr_adjustments(place)
+                .is_some_and(|it| it.iter().any(|it| matches!(it.kind, Adjust::Deref(_))));
         match place {
             ast::Expr::FieldExpr(field) if !derefs => {
                 if let Some(base) = field.expr() {
@@ -769,41 +759,26 @@ impl Mark<'_, '_, '_, '_> {
                     self.handle_assign(file, lhs);
                     return;
                 };
-                self.expr_adt(lhs);
+                let adt = self.expr_adt(lhs);
                 self.in_pat = true;
-                self.path(&path);
+                let res = self.path(&path);
                 self.in_pat = false;
-                let res = cx.sema.resolve_path(&path).map(|it| Res::path(cx, self.k.defs, it, false));
-                let args: Vec<ast::Expr> = it.arg_list().into_iter().flat_map(|it| it.args()).collect();
-                if let Some(Res::Def(variant) | Res::Variant(variant)) = res {
-                    let defs = self.k.defs;
-                    let fields = &defs[variant].children;
-                    let is_rest = |it: &ast::Expr| {
-                        matches!(it, ast::Expr::RangeExpr(it) if it.start().is_none() && it.end().is_none())
-                    };
-                    let dotdot = args.iter().position(is_rest);
-                    let pats: Vec<&ast::Expr> = args.iter().filter(|it| !is_rest(it)).collect();
-                    let dotdot = dotdot.unwrap_or(pats.len());
-                    let missing = fields.len().saturating_sub(pats.len());
-                    for (index, pat) in pats.iter().enumerate() {
-                        if matches!(pat, ast::Expr::UnderscoreExpr(_)) {
-                            continue;
-                        }
-                        let index = if index < dotdot { index } else { index + missing };
-                        if let Some(&field) = fields.get(index) {
-                            self.insert_def_id(field);
-                        }
-                    }
+                let args: SmallVec<[ast::Expr; 4]> = it.arg_list().into_iter().flat_map(|it| it.args()).collect();
+                if let Some(variant) = self.variant_of(res, adt) {
+                    let wildcard = args.iter().map(|it| matches!(it, ast::Expr::UnderscoreExpr(_)));
+                    let rest = args.iter().position(is_rest);
+                    self.tuple_fields(variant, wildcard, rest);
                 }
                 for arg in &args {
                     self.assign_pattern(file, arg);
                 }
             }
             ast::Expr::PathExpr(it) => {
-                let constructs = it.path().and_then(|path| cx.sema.resolve_path(&path)).is_some_and(|it| {
+                let path = it.path();
+                let constructs = path.as_ref().and_then(|path| cx.sema.resolve_path(path)).is_some_and(|it| {
                     matches!(it, PathResolution::Def(ModuleDef::Adt(_) | ModuleDef::EnumVariant(_)))
                 });
-                match (constructs, it.path()) {
+                match (constructs, path) {
                     (true, Some(path)) => {
                         self.expr_adt(lhs);
                         self.in_pat = true;
@@ -817,16 +792,15 @@ impl Mark<'_, '_, '_, '_> {
         }
     }
 
-    fn expr_adt(&mut self, expr: &ast::Expr) {
-        let Some(ty) = self.k.cx.sema.type_of_expr(expr) else { return };
-        if let Some(adt) = ty.original.as_adt()
-            && let Some(def) = self.k.defs.get(Id::Adt(AdtId::from(adt)))
-        {
-            self.check_def_id(def);
-        }
+    fn expr_adt(&mut self, expr: &ast::Expr) -> Option<DefIdx> {
+        let ty = self.k.cx.sema.type_of_expr(expr)?;
+        let def = self.k.defs.get(Id::Adt(AdtId::from(ty.original.as_adt()?)))?;
+        self.check_def_id(def);
+        Some(def)
     }
 
     /// rustc's `check_for_self_assign`: `x = x` or `a.b = a.b`, not from a macro's expansion.
+    /// The two sides' shapes and names are compared before anything is resolved.
     fn self_assign(&mut self, file: HirFileId, expr: &ast::BinExpr, lhs: &ast::Expr, rhs: &ast::Expr) {
         let cx = self.k.cx;
         if !same_place(cx, lhs, rhs) {
@@ -864,6 +838,11 @@ fn destructures(lhs: &ast::Expr) -> bool {
     }
 }
 
+/// `..` as an argument of a destructuring assignment.
+fn is_rest(expr: &ast::Expr) -> bool {
+    matches!(expr, ast::Expr::RangeExpr(it) if it.start().is_none() && it.end().is_none())
+}
+
 fn unparen(expr: &ast::Expr) -> ast::Expr {
     match expr {
         ast::Expr::ParenExpr(it) => it.expr().map_or_else(|| expr.clone(), |it| unparen(&it)),
@@ -871,20 +850,29 @@ fn unparen(expr: &ast::Expr) -> ast::Expr {
     }
 }
 
-/// `check_for_self_assign_helper`: the same local, or the same field of the same place.
+/// `check_for_self_assign_helper`: the same local (a one-segment path on each side with the same
+/// name, resolved only then), or the same field of the same place.
 fn same_place(cx: &crate::cx::Cx<'_, '_>, lhs: &ast::Expr, rhs: &ast::Expr) -> bool {
     match (unparen(lhs), unparen(rhs)) {
         (ast::Expr::PathExpr(l), ast::Expr::PathExpr(r)) => {
-            let local = |it: &ast::PathExpr| match cx.sema.resolve_path(&it.path()?)? {
+            let (Some(l), Some(r)) = (l.path(), r.path()) else { return false };
+            let same_name = match (l.as_single_name_ref(), r.as_single_name_ref()) {
+                (Some(a), Some(b)) => a.text() == b.text(),
+                _ => false,
+            };
+            let local = |it: &ast::Path| match cx.sema.resolve_path(it)? {
                 PathResolution::Local(it) => Some(it),
                 _ => None,
             };
-            matches!((local(&l), local(&r)), (Some(l), Some(r)) if l == r)
+            same_name && matches!((local(&l), local(&r)), (Some(l), Some(r)) if l == r)
         }
         (ast::Expr::FieldExpr(l), ast::Expr::FieldExpr(r)) => {
-            let name = |it: &ast::FieldExpr| it.name_ref().map(|it| it.text().to_string());
-            match (name(&l), name(&r), l.expr(), r.expr()) {
-                (Some(a), Some(b), Some(l), Some(r)) if a == b => same_place(cx, &l, &r),
+            let same_name = match (l.name_ref(), r.name_ref()) {
+                (Some(a), Some(b)) => a.text() == b.text(),
+                _ => false,
+            };
+            match (l.expr(), r.expr()) {
+                (Some(l), Some(r)) if same_name => same_place(cx, &l, &r),
                 _ => false,
             }
         }
@@ -895,29 +883,4 @@ fn same_place(cx: &crate::cx::Cx<'_, '_>, lhs: &ast::Expr, rhs: &ast::Expr) -> b
 /// Whether `path` is the one segment `Self`.
 fn is_self(path: &ast::Path) -> bool {
     path.segment().is_some_and(|it| it.self_type_token().is_some())
-}
-
-/// What the `#[repr]`s of a struct or a union make live: all its fields (`C`, `transparent`),
-/// and its positional ones (`simd`).
-fn repr(k: &Crate<'_, '_, '_>, node: &SyntaxNode) -> (bool, bool) {
-    let cx = k.cx;
-    let (mut all, mut simd) = (false, false);
-    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return (false, false) };
-    let cfg = cx.krate.cfg(cx.db);
-    hir_expand::attrs::expand_cfg_attr::<()>(owner.attrs(), || cfg, |meta, _| {
-        if meta.simple_name().is_some_and(|it| it == "repr")
-            && let ast::Meta::TokenTreeMeta(meta) = meta
-            && let Some(tt) = meta.token_tree()
-        {
-            for token in tt.syntax().descendants_with_tokens().filter_map(|it| it.into_token()) {
-                match token.text() {
-                    "C" | "transparent" => all = true,
-                    "simd" => simd = true,
-                    _ => {}
-                }
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    (all, simd)
 }

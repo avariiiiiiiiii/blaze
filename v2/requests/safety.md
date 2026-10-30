@@ -213,6 +213,15 @@ privately and its `pub use eval::{..}` list leaves it out. `hir_ty_ub::check::ru
 `tests/ub/main.rs` call `hir_ty_mir::mir::run_function`. Wanted: add `run_function` and
 `MirOutput` to that `pub use eval::{..}` list.
 
+### C9. To safety (parent): the allocation-budget tests' dev-dependency
+
+`crates/hir-ty-ub/tests/ub/budget.rs` holds the checker's hooks to zero allocations with
+`blaze_alloc_count`, and `tests/ub/main.rs` installs `blaze_alloc_count::Counting` as the
+test binary's global allocator. Wanted in `crates/hir-ty-ub/Cargo.toml`, under
+`[dev-dependencies]`: `blaze-alloc-count.workspace = true`. The root `Cargo.toml` has no
+`[workspace.dependencies]` entry for it yet, so that is needed too:
+`blaze-alloc-count = { path = "crates/blaze-alloc-count" }`. No crate depends on it yet.
+
 ## From safety-model
 
 > applied: M1 2, `"cfg(blaze_check)"` in the root `unexpected_cfgs` `check-cfg`. M1 1 (`blaze-check` workspace dependency) goes in once `crates/blaze-check/` exists (a missing path stops the workspace loading); `blaze-check` is a lock addition then. > forwarded to coordinator: M1 3 (`crates.md`).

@@ -4,7 +4,8 @@ Every script under harness/v2 takes, in its typed input, an `engine`:
 
     {"kind": "v1", "blaze": "target/release/blaze", "backend": "cranelift"}
 
-and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
+(v2 also takes `"dev_backend": "stencil"` or `"cranelift"`, forcing the dev tier's backend
+for every function, `"default"` leaving it to blaze), and does everything through `Engine`. Builds, runs and tests go through the `blaze` command
 line (`blaze build`, `run`, `test`, `check`, `status`, `stop`), which v1 and v2 both have, so a
 script is the same for both. What only an engine's insides can say (what an edit recompiled,
 the codegen inputs of a build, the critical path of a cold build) is a method here:
@@ -83,6 +84,16 @@ WORK_COUNTS = ("reran", "green", "compiled", "found", "critical_path_us")
 
 type Kind = Literal["v1", "v2"]
 type Backend = Literal["cranelift", "llvm"]
+type DevBackend = Literal["default", "stencil", "cranelift"]
+DEV_BACKENDS: tuple[DevBackend, ...] = ("default", "stencil", "cranelift")
+# What the v2 daemon lacks for a forced dev backend; `Engine.__init__` refuses one until it has it.
+DEV_BACKEND_MISSING = (
+    "the v2 daemon has no setting for the dev tier's backend yet: cargo's `codegen-backend` profile key "
+    "(`-Zcodegen-backend --config 'profile.dev.codegen-backend=\"stencil\"'`) is parsed by blaze-manifest and "
+    "not read into `blaze_codegen::plan::Policy`, which compiles opt-level 0 and 1 with Cranelift whatever it says; "
+    "requested in v2/requests/requests-backend-axis.md (codegen: `Profile::codegen_backend` in plan.rs; cargo: "
+    "`serve/unit/codegen.rs::policy` reading it; coordinator: blaze-manifest's `-Zcodegen-backend` gate)"
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +104,13 @@ class EngineSpec:
     # The `blaze` command line client (v1: the `blaze` beside `blaze-engine`).
     blaze: str
     backend: Backend = "cranelift"
+    # The backend of every function the dev tier compiles (opt-level 0 and 1, and the first
+    # tier of a tiered one): "default" leaves it to blaze, the others force it.
+    dev_backend: DevBackend = "default"
+
+    def __post_init__(self) -> None:
+        if self.dev_backend not in DEV_BACKENDS:
+            raise Failed(f"engine.dev_backend: one of {', '.join(DEV_BACKENDS)}, not {self.dev_backend!r}")
 
 
 class Unmeasurable(Exception):
@@ -374,6 +392,14 @@ class Engine(ABC):
         self.blaze = Path(spec.blaze).resolve()
         if not self.blaze.is_file():
             raise Failed(f"engine.blaze: no file {self.blaze}")
+        if spec.dev_backend != "default":
+            if spec.kind == "v1":
+                raise Failed(f"engine.dev_backend {spec.dev_backend!r}: v1 has no stencil backend and no setting "
+                             "for the dev tier's; the backend axis is v2's")
+            if spec.backend != "cranelift":
+                raise Failed(f"engine.dev_backend {spec.dev_backend!r} with engine.backend {spec.backend!r}: "
+                             "BLAZE_BACKEND=llvm compiles every function with LLVM, so there is no dev tier to force")
+            raise Failed(f"engine.dev_backend {spec.dev_backend!r}: {DEV_BACKEND_MISSING}")
 
     @staticmethod
     def of(spec: EngineSpec) -> "Engine":
@@ -574,6 +600,7 @@ class V2(Engine):
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
+        args = dev_backend_args(self.spec.dev_backend, command, args)
         ran = self.command(step, command, list(args), ws, env, timeout)
         if command in WORKING:
             label = f"{step} (`{' '.join(['blaze', command, *args])}`)"
@@ -637,6 +664,33 @@ class V2(Engine):
         self.command("the trace", "trace", ["--out", str(to)], ws, env, 600).checked("the trace")
         if not to.is_file():
             raise Failed(f"`blaze trace --out {to}` exited 0 and wrote no file")
+
+
+def profile_of(command: str, args: Sequence[str]) -> str:
+    """The cargo profile `blaze COMMAND ARGS` builds with, as cargo picks it: `--profile`,
+    `--release`, else `test` for `test` and `bench` for `bench`, else `dev`."""
+    named: str | None = None
+    words = list(args[:args.index("--")] if "--" in args else args)
+    for at, word in enumerate(words):
+        if word in ("--release", "-r"):
+            named = named or "release"
+        elif word == "--profile" and at + 1 < len(words):
+            named = words[at + 1]
+        elif word.startswith("--profile="):
+            named = word.removeprefix("--profile=")
+    return named or {"test": "test", "bench": "bench"}.get(command, "dev")
+
+
+def dev_backend_args(dev_backend: DevBackend, command: str, args: Sequence[str]) -> tuple[str, ...]:
+    """`args` of `blaze COMMAND`, with the dev tier forced to `dev_backend` through cargo's own
+    setting (`-Zcodegen-backend` and the profile's `codegen-backend`), before any `--`;
+    "default" and a command that compiles nothing (`check`, `status`) leave them as they are."""
+    if dev_backend == "default" or command not in WORKING:
+        return tuple(args)
+    profile = profile_of(command, args)
+    forced = ("-Zcodegen-backend", "--config", f'profile.{profile}.codegen-backend="{dev_backend}"')
+    at = args.index("--") if "--" in args else len(args)
+    return (*args[:at], *forced, *args[at:])
 
 
 def json_answer(step: str, ran: Ran) -> object:
